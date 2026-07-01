@@ -1321,3 +1321,19 @@ ALTER TABLE public.resources ADD COLUMN infra_id uuid;
 ALTER TABLE ONLY public.resources
     ADD CONSTRAINT resources_infra_id_fkey FOREIGN KEY (infra_id) REFERENCES public.infra(id) ON DELETE SET NULL;
 CREATE INDEX resources_infra_id_idx ON public.resources (infra_id) WHERE infra_id IS NOT NULL;
+
+-- =====================================================================
+-- Seed data (folded in from the squashed migrations 010/011/012).
+-- pg_dump captured schema only; these INSERTs seeded runtime config rows
+-- (Todoist sync watermark + GTD kill-switches/timezone). Idempotent.
+-- =====================================================================
+
+INSERT INTO public.todoist_sync_state (key, sync_token) VALUES ('main', '*')
+    ON CONFLICT (key) DO NOTHING;
+
+INSERT INTO public.settings (key, value) VALUES
+    ('todoist_capture_enabled', 'true'::jsonb),
+    ('gtd_clarify_enabled',     'true'::jsonb),
+    ('gtd_2min_rule_enabled',   'true'::jsonb),
+    ('user_timezone',           '"Asia/Kolkata"'::jsonb)
+    ON CONFLICT (key) DO NOTHING;
