@@ -516,13 +516,6 @@ CREATE SEQUENCE public.review_digest_log_id_seq
 
 ALTER SEQUENCE public.review_digest_log_id_seq OWNED BY public.review_digest_log.id;
 
--- Name: schema_migrations; Type: TABLE; Schema: public; Owner: -
-
-CREATE TABLE public.schema_migrations (
-    filename text NOT NULL,
-    applied_at timestamp with time zone DEFAULT now() NOT NULL
-);
-
 -- Name: settings; Type: TABLE; Schema: public; Owner: -
 
 CREATE TABLE public.settings (
@@ -907,11 +900,6 @@ ALTER TABLE ONLY public.resources
 
 ALTER TABLE ONLY public.review_digest_log
     ADD CONSTRAINT review_digest_log_pkey PRIMARY KEY (id);
-
--- Name: schema_migrations schema_migrations_pkey; Type: CONSTRAINT; Schema: public; Owner: -
-
-ALTER TABLE ONLY public.schema_migrations
-    ADD CONSTRAINT schema_migrations_pkey PRIMARY KEY (filename);
 
 -- Name: settings settings_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 
