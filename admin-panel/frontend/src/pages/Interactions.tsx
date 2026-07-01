@@ -142,7 +142,7 @@ export default function Interactions() {
             <div style={{ flex: 1, minWidth: 0 }}>
               <div style={{ display: 'flex', gap: 8, alignItems: 'center', fontSize: 13, marginBottom: 4, flexWrap: 'wrap' }}>
                 <strong>{agentName(r.agent_id)}</strong>
-                <span className={`badge badge-${r.kind}`} style={{ background: '#e8f4fd', color: '#2980b9' }}>{r.kind}</span>
+                <span className="badge badge-type">{r.kind}</span>
                 <span className="meta-tag">{r.origin}</span>
                 <span className="meta" style={{ marginLeft: 'auto' }}>{relTime(r.created_at)}</span>
               </div>

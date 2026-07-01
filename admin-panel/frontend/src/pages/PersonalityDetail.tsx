@@ -115,7 +115,7 @@ export default function PersonalityDetail() {
         </div>
         {([['soul', 'Identity (SOUL)'], ['operating_notes', 'Operational boundaries (AGENTS)'], ['user_context', 'User context (USER)']] as const).map(([k, label]) => (
           <div key={k} style={{ marginBottom: 8 }}>
-            <label style={{ fontSize: 13, color: '#aaa' }}>{label}</label>
+            <label style={{ fontSize: 13, color: 'var(--text-muted)' }}>{label}</label>
             <textarea style={{ width: '100%' }} rows={5} value={(persona as any)[k]}
               onChange={e => setPersona({ ...persona, [k]: e.target.value })} />
           </div>
@@ -123,7 +123,7 @@ export default function PersonalityDetail() {
         <button className="btn btn-primary" disabled={savingP} onClick={savePersona}>
           {savingP ? 'Saving…' : 'Save persona'}
         </button>
-        {pmsg && <span style={{ marginLeft: 10, color: '#4caf50' }}>{pmsg}</span>}
+        {pmsg && <span style={{ marginLeft: 10, color: 'var(--success-text)' }}>{pmsg}</span>}
       </div>
 
       <div className="grid">

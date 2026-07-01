@@ -1,25 +1,47 @@
 import { useState } from 'react';
 import { Link, Outlet, useLocation } from 'react-router-dom';
 
-const NAV = [
-  { path: '/', label: 'Overview' },
-  { path: '/interactions', label: 'Interactions' },
-  { path: '/workflows', label: 'Workflows' },
-  { path: '/flows', label: 'Flows & Config' },
-  { path: '/models', label: 'Models & Providers' },
-  { path: '/integrations', label: 'Integrations' },
-  { path: '/resources', label: 'Resources' },
-  { path: '/personalities', label: 'Personalities' },
-  { path: '/market', label: 'Market' },
-  { path: '/chat', label: 'Chat' },
-  { path: '/knowledge', label: 'Knowledge' },
-  { path: '/references', label: 'References' },
-  { path: '/content', label: 'Content' },
-  { path: '/infra', label: 'Infrastructure' },
-  { path: '/audit', label: 'Audit Log' },
-  { path: '/admin/homelab', label: 'Homelab' },
-  { path: '/admin/money', label: 'Money' },
-  { path: '/admin/todoist', label: 'Todoist' },
+// Grouped navigation. Labels are display-only; routes are unchanged.
+const NAV: { section: string; items: { path: string; label: string }[] }[] = [
+  {
+    section: 'Operate',
+    items: [
+      { path: '/', label: 'Overview' },
+      { path: '/interactions', label: 'Interactions' },
+      { path: '/workflows', label: 'Workflows' },
+      { path: '/chat', label: 'Chat' },
+    ],
+  },
+  {
+    section: 'Knowledge & Data',
+    items: [
+      { path: '/knowledge', label: 'Knowledge' },
+      { path: '/references', label: 'References' },
+      { path: '/content', label: 'Content' },
+      { path: '/market', label: 'Market' },
+      { path: '/admin/money', label: 'Money' },
+    ],
+  },
+  {
+    section: 'Configure',
+    items: [
+      { path: '/personalities', label: 'Personalities' },
+      { path: '/flows', label: 'Flows' },
+      { path: '/models', label: 'Models' },
+      { path: '/integrations', label: 'Integrations' },
+      { path: '/resources', label: 'Resources' },
+    ],
+  },
+  {
+    section: 'System',
+    items: [
+      { path: '/infra', label: 'Infrastructure' },
+      { path: '/admin/homelab', label: 'Homelab' },
+      { path: '/admin/todoist', label: 'Todoist' },
+      { path: '/audit', label: 'Audit' },
+      { path: '/settings', label: 'Settings' },
+    ],
+  },
 ];
 
 export default function Layout() {
@@ -27,12 +49,14 @@ export default function Layout() {
   const [sidebarOpen, setSidebarOpen] = useState(false);
 
   const closeSidebar = () => setSidebarOpen(false);
+  const isActive = (path: string) =>
+    path === '/' ? location.pathname === '/' : location.pathname.startsWith(path);
 
   return (
     <>
       <div className="mobile-header">
         <button className="hamburger" onClick={() => setSidebarOpen(!sidebarOpen)}>☰</button>
-        <span style={{ fontWeight: 600 }}>AEGIS v3</span>
+        <span style={{ fontWeight: 700 }}>AEGIS</span>
         <span />
       </div>
 
@@ -41,17 +65,23 @@ export default function Layout() {
       <div className="app-layout">
         <nav className={`sidebar ${sidebarOpen ? 'open' : ''}`}>
           <div className="sidebar-header">
-            <h2>AEGIS v3</h2>
+            <span className="brand-dot" />
+            <h2>AEGIS</h2>
           </div>
-          {NAV.map(({ path, label }) => (
-            <Link
-              key={path}
-              to={path}
-              className={path === '/' ? (location.pathname === '/' ? 'active' : '') : location.pathname.startsWith(path) ? 'active' : ''}
-              onClick={closeSidebar}
-            >
-              {label}
-            </Link>
+          {NAV.map(({ section, items }) => (
+            <div className="nav-section" key={section}>
+              <div className="nav-section-label">{section}</div>
+              {items.map(({ path, label }) => (
+                <Link
+                  key={path}
+                  to={path}
+                  className={isActive(path) ? 'active' : ''}
+                  onClick={closeSidebar}
+                >
+                  {label}
+                </Link>
+              ))}
+            </div>
           ))}
         </nav>
 

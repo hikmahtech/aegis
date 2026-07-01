@@ -42,7 +42,7 @@ export default function Market() {
                   <div key={k} className="card">
                     <h3>{k.replace(/_/g, ' ')}</h3>
                     <p><strong>{r.regime || r.regime_label || '—'}</strong></p>
-                    <p style={{ fontSize: 12, color: '#666' }}>
+                    <p style={{ fontSize: 12, color: 'var(--text-muted)' }}>
                       {r.date && new Date(r.date).toLocaleDateString()}
                       {r.close != null && <> · close {r.close}</>}
                     </p>
@@ -97,7 +97,7 @@ export default function Market() {
           )}
 
           <details style={{ marginTop: 24 }}>
-            <summary style={{ cursor: 'pointer', fontSize: 12, color: '#666' }}>Raw response</summary>
+            <summary style={{ cursor: 'pointer', fontSize: 12, color: 'var(--text-muted)' }}>Raw response</summary>
             <JsonViewer data={data} />
           </details>
         </>

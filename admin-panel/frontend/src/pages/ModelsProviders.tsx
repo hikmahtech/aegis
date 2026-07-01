@@ -85,7 +85,7 @@ export default function ModelsProviders() {
           <input type="password" value={apiKey} onChange={e => setApiKey(e.target.value)}
             placeholder={keySet ? '•••••••• (set — leave blank to keep)' : 'not set (leave blank for local/no-auth)'} />
         </div>
-        <fieldset style={{ border: '1px solid #333', borderRadius: 6, padding: 10 }}>
+        <fieldset style={{ border: '1px solid var(--border)', borderRadius: 6, padding: 10 }}>
           <legend>Model per tier</legend>
           {(['fast', 'balanced', 'smart'] as const).map(t => (
             <div key={t} className="cfg-row">

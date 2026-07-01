@@ -6,10 +6,9 @@ const API_BASE = import.meta.env.VITE_API_URL || '';
 
 function ScopeBadge({ on, label }: { on: boolean; label: string }) {
   return (
-    <span style={{
-      padding: '1px 6px', borderRadius: 4, fontSize: 11, marginRight: 4,
-      background: on ? '#1b5e20' : '#444', color: on ? '#a5d6a7' : '#999',
-    }}>{label}{on ? ' ✓' : ' ✗'}</span>
+    <span className={`badge ${on ? 'badge-success' : 'badge-neutral'}`} style={{ marginRight: 4 }}>
+      {label}{on ? ' ✓' : ' ✗'}
+    </span>
   );
 }
 
@@ -37,10 +36,10 @@ function ConfigFields({ value, onChange }: { value: any; onChange: (v: any) => v
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
-      {entries.length === 0 && <span style={{ fontSize: 11, color: '#888' }}>No config.</span>}
+      {entries.length === 0 && <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>No config.</span>}
       {entries.map(([k, v]) => (
         <label key={k} style={{ display: 'flex', gap: 6, alignItems: 'center', fontSize: 12 }}>
-          <span style={{ minWidth: 130, color: '#aaa' }}>{k}</span>
+          <span style={{ minWidth: 130, color: 'var(--text-muted)' }}>{k}</span>
           {typeof v === 'boolean' ? (
             <input type="checkbox" checked={v} onChange={e => setKey(k, e.target.checked)} />
           ) : typeof v === 'number' ? (
@@ -80,8 +79,8 @@ function FlowRow({ act, onSaved, onError }: { act: any; onSaved: (m: string) => 
     <tr>
       <td style={{ verticalAlign: 'top' }}>
         <strong>{act.slug}</strong><br />
-        <span style={{ fontSize: 11, color: '#888' }}>{act.workflow_type} · {act.agent_id}</span><br />
-        <span style={{ fontSize: 11, color: '#888' }}>last run: {(act.last_run || '—').toString().slice(0, 16)}</span>
+        <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>{act.workflow_type} · {act.agent_id}</span><br />
+        <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>last run: {(act.last_run || '—').toString().slice(0, 16)}</span>
       </td>
       <td style={{ verticalAlign: 'top', textAlign: 'center' }}>
         <input type="checkbox" checked={active} onChange={e => setActive(e.target.checked)} />
@@ -134,7 +133,7 @@ export default function Flows() {
       <h1 className="page-title">Flows & Integrations</h1>
       <p className="page-subtitle">Configure scheduled flows and Google accounts. Flow edits are durable and reconciled to Temporal within ~5 minutes.</p>
       <ErrorBanner error={error} onDismiss={() => setError(null)} />
-      {msg && <p style={{ color: '#4caf50' }}>{msg}</p>}
+      {msg && <p style={{ color: 'var(--success-text)' }}>{msg}</p>}
 
       <div className="card" style={{ marginBottom: 16 }}>
         <h3>Google OAuth app</h3>
@@ -149,7 +148,7 @@ export default function Flows() {
             placeholder={gStatus?.configured ? '•••••••• (set — leave blank to keep)' : 'Client secret'} />
           <button className="btn" disabled={savingG || !gClientId.trim()} onClick={saveGoogle}>Save</button>
         </div>
-        <p style={{ fontSize: 12, color: '#888', margin: 0 }}>
+        <p style={{ fontSize: 12, color: 'var(--text-muted)', margin: 0 }}>
           Add <code>{'{your-base-url}/api/admin/gmail/reauth/{label}/callback'}</code> as an authorized redirect URI in your Google app.
         </p>
       </div>
@@ -162,11 +161,11 @@ export default function Flows() {
           <tbody>
             {accounts.map(a => (
               <tr key={a.label}>
-                <td><strong>{a.label}</strong><br /><span style={{ fontSize: 11, color: '#888' }}>{a.email}</span></td>
+                <td><strong>{a.label}</strong><br /><span style={{ fontSize: 11, color: 'var(--text-muted)' }}>{a.email}</span></td>
                 <td style={{ textAlign: 'center' }}>
                   {a.has_token
                     ? <><ScopeBadge on={a.has_gmail} label="gmail" /><ScopeBadge on={a.has_calendar} label="calendar" /><ScopeBadge on={a.has_drive} label="drive" /></>
-                    : <span style={{ color: '#e57373' }}>no token</span>}
+                    : <span style={{ color: 'var(--danger-text)' }}>no token</span>}
                 </td>
                 <td style={{ textAlign: 'center' }}>
                   <a className="btn" href={`${API_BASE}/api/admin/gmail/reauth/${a.label}/initiate`} target="_blank" rel="noreferrer">Re-authorize</a>

@@ -3,141 +3,138 @@ import { Link } from 'react-router-dom';
 import { api } from '../api/client';
 import ErrorBanner from '../components/ErrorBanner';
 
+// Prompts can carry Telegram-style HTML; the card shows plain-text snippets.
+function stripHtml(raw: string): string {
+  if (!raw) return '';
+  const doc = new DOMParser().parseFromString(raw, 'text/html');
+  return doc.body.textContent || '';
+}
+
+function relTime(iso: string): string {
+  const then = new Date(iso).getTime();
+  if (!then) return '';
+  const s = Math.floor(Math.max(0, Date.now() - then) / 1000);
+  if (s < 60) return `${s}s ago`;
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m}m ago`;
+  const h = Math.floor(m / 60);
+  if (h < 24) return `${h}h ago`;
+  return `${Math.floor(h / 24)}d ago`;
+}
+
 export default function Overview() {
   const [brief, setBrief] = useState<any>(null);
   const [status, setStatus] = useState<any>(null);
   const [info, setInfo] = useState<any>(null);
-  const [settings, setSettings] = useState<any[]>([]);
   const [agents, setAgents] = useState<any[]>([]);
   const [config, setConfig] = useState<any>({});
+  const [pending, setPending] = useState<any[]>([]);
   const [error, setError] = useState<Error | null>(null);
-  const [edits, setEdits] = useState<Record<string, string>>({});
-  const [loading, setLoading] = useState(true);
 
   async function load() {
-    setError(null); setLoading(true);
+    setError(null);
     try {
-      const [b, s, i, set, ag, cfg] = await Promise.all([
+      const [b, s, i, ag, cfg, pend] = await Promise.all([
         api.overviewBrief(),
         api.overviewStatus(),
         api.systemInfo(),
-        api.listSettings(),
         api.listAgents(),
         api.getTemporalConfig(),
+        api.listInteractions({ status: 'pending', limit: 6 }),
       ]);
-      setBrief(b); setStatus(s); setInfo(i); setSettings(set); setAgents(ag); setConfig(cfg);
+      setBrief(b); setStatus(s); setInfo(i); setAgents(ag); setConfig(cfg); setPending(pend || []);
     } catch (e: any) { setError(e); }
-    finally { setLoading(false); }
   }
   useEffect(() => { void load(); }, []);
 
-  async function saveSetting(key: string) {
-    try {
-      const raw = edits[key];
-      let value: any = raw;
-      // Try to parse as JSON; if that fails, store as string.
-      try { value = JSON.parse(raw); } catch { /* keep as string */ }
-      await api.updateSetting(key, value);
-      setEdits(e => { const n = { ...e }; delete n[key]; return n; });
-      await load();
-    } catch (e: any) { setError(e); }
-  }
+  const agentName = (id: string) => agents.find(a => a.id === id)?.name || id;
+  const uptime = info?.uptime_seconds != null ? `${Math.round(info.uptime_seconds / 60)}m` : '—';
 
   return (
     <div>
       <h1 className="page-title">Overview</h1>
-      <p className="page-subtitle">What's happening right now?</p>
+      <p className="page-subtitle">What needs you right now, and how the system is doing.</p>
       <ErrorBanner error={error} onDismiss={() => setError(null)} />
 
+      <div className="stats-bar">
+        <div className="stat-item">
+          <span className="stat-value">{brief?.pending_interactions ?? '—'}</span>
+          <span className="stat-label">Pending decisions</span>
+        </div>
+        <div className="stat-item">
+          <span className="stat-value">{brief?.recent_alerts_24h ?? '—'}</span>
+          <span className="stat-label">Alerts · 24h</span>
+        </div>
+        <div className="stat-item">
+          <span className="stat-value">{agents.length || '—'}</span>
+          <span className="stat-label">Agents</span>
+        </div>
+        <div className="stat-item">
+          <span className="stat-value">{uptime}</span>
+          <span className="stat-label">Uptime</span>
+        </div>
+      </div>
+
+      {/* Decision-first: the whole point of AEGIS is surfacing what needs a human. */}
+      <div className="section">
+        <div className="section-header-row">
+          <h2 className="section-title">
+            Needs your decision
+            {pending.length > 0 && <span className="count-badge">{pending.length}</span>}
+          </h2>
+          {pending.length > 0 && <Link to="/interactions" className="btn btn-sm">View all →</Link>}
+        </div>
+        {pending.length === 0 ? (
+          <div className="empty">All clear — nothing needs you right now.</div>
+        ) : (
+          <div className="decision-list">
+            {pending.map(p => (
+              <Link key={p.id} to={`/interactions/${p.id}`} className="decision-item">
+                <div className="decision-body">
+                  <div className="decision-title">{stripHtml(p.prompt) || p.kind}</div>
+                  <div className="decision-meta">
+                    {agentName(p.agent_id)} · {p.kind} · {relTime(p.created_at)}
+                  </div>
+                </div>
+                <span className="decision-arrow">→</span>
+              </Link>
+            ))}
+          </div>
+        )}
+      </div>
+
       <div className="grid">
-        <div className="card" style={{ borderTop: '3px solid var(--primary)' }}>
+        <div className="card">
           <h3>System</h3>
-          <p>Version: {info?.version ?? '—'}</p>
+          <p>Version: <strong>{info?.version ?? '—'}</strong></p>
           <p>Build: <code>{info?.git_sha ?? '—'}</code></p>
-          <p>Uptime: {info?.uptime_seconds != null ? `${Math.round(info.uptime_seconds / 60)} min` : '—'}</p>
+          <p>Uptime: <strong>{uptime}</strong></p>
         </div>
 
-        <div className="card" style={{ borderTop: '3px solid var(--warning)' }}>
-          <h3>Pending work</h3>
-          <p>Interactions: <strong>{brief?.pending_interactions ?? '—'}</strong></p>
-          <p>Alerts (24h): <strong>{brief?.recent_alerts_24h ?? '—'}</strong></p>
-        </div>
-
-        <div className="card" style={{ borderTop: '3px solid var(--purple)' }}>
+        <div className="card">
           <h3>Agents ({agents.length})</h3>
+          {agents.length === 0 && <p className="empty" style={{ padding: '0.5rem 0' }}>No agents yet.</p>}
           {agents.map(a => (
             <p key={a.id}><Link to={`/personalities/${a.id}`}><strong>{a.name}</strong></Link> — {a.role}</p>
           ))}
         </div>
 
-        <div className="card" style={{ borderTop: '3px solid var(--info)' }}>
-          <h3>Last workflow runs</h3>
+        <div className="card">
+          <h3>Recent workflow runs</h3>
           {status?.last_workflow_runs?.length ? status.last_workflow_runs.slice(0, 5).map((r: any) => (
-            <p key={r.workflow_type} style={{ fontSize: 13 }}>
+            <p key={r.workflow_type}>
               <strong>{r.workflow_type}</strong> — {r.last_run ? new Date(r.last_run).toLocaleString() : '—'}
             </p>
-          )) : <p className="empty">No runs recorded yet.</p>}
+          )) : <p className="empty" style={{ padding: '0.5rem 0' }}>No runs recorded yet.</p>}
         </div>
 
-        <div className="card" style={{ borderTop: '3px solid var(--success)' }}>
+        <div className="card">
           <h3>Quick links</h3>
-          {config.temporal_ui_url && <p><a href={config.temporal_ui_url} target="_blank" rel="noopener">Temporal UI</a></p>}
-          {config.n8n_ui_url && <p><a href={config.n8n_ui_url} target="_blank" rel="noopener">n8n</a></p>}
-          <p><a href="https://litellm.example.com" target="_blank" rel="noopener">LiteLLM Dashboard</a></p>
+          {config.temporal_ui_url && <p><a href={config.temporal_ui_url} target="_blank" rel="noopener">Temporal UI ↗</a></p>}
+          {config.n8n_ui_url && <p><a href={config.n8n_ui_url} target="_blank" rel="noopener">n8n ↗</a></p>}
           <p><Link to="/knowledge">Knowledge</Link></p>
+          <p><Link to="/settings">Settings</Link></p>
         </div>
-      </div>
-
-      <h2 style={{ marginTop: 24 }}>Settings</h2>
-      {loading && <p>Loading…</p>}
-      <div className="table-scroll">
-        <table className="data-table">
-          <thead>
-            <tr>
-              <th style={{ width: '20%' }}>Key</th>
-              <th>Value</th>
-              <th style={{ width: 180 }}>Updated</th>
-              <th style={{ width: 80 }}></th>
-            </tr>
-          </thead>
-          <tbody>
-            {settings.map(s => {
-              const raw = typeof s.value === 'string' ? s.value : JSON.stringify(s.value, null, 2);
-              const current = edits[s.key] ?? raw;
-              const dirty = edits[s.key] !== undefined && edits[s.key] !== raw;
-              // Use a textarea for anything long enough to benefit from multi-line
-              // editing — single-line inputs hide most of the JSON body.
-              const useTextarea = current.length > 60 || current.includes('\n');
-              return (
-                <tr key={s.key}>
-                  <td><code style={{ wordBreak: 'break-all' }}>{s.key}</code></td>
-                  <td>
-                    {useTextarea ? (
-                      <textarea
-                        value={current}
-                        onChange={e => setEdits(x => ({ ...x, [s.key]: e.target.value }))}
-                        rows={Math.min(8, Math.max(2, current.split('\n').length))}
-                        style={{ width: '100%', fontFamily: 'monospace', fontSize: 12, padding: 6 }}
-                      />
-                    ) : (
-                      <input
-                        type="text"
-                        value={current}
-                        onChange={e => setEdits(x => ({ ...x, [s.key]: e.target.value }))}
-                        style={{ width: '100%' }}
-                      />
-                    )}
-                  </td>
-                  <td style={{ fontSize: 12, color: '#666' }}>
-                    {s.updated_at ? new Date(s.updated_at).toLocaleString() : '—'}
-                  </td>
-                  <td>{dirty && <button className="btn btn-sm btn-primary" onClick={() => void saveSetting(s.key)}>Save</button>}</td>
-                </tr>
-              );
-            })}
-            {!loading && settings.length === 0 && <tr><td colSpan={4} className="empty">No settings configured.</td></tr>}
-          </tbody>
-        </table>
       </div>
     </div>
   );

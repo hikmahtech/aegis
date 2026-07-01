@@ -41,7 +41,7 @@ export default function Integrations() {
           {items.filter(i => i.group === g).map(i => (
             <div key={i.key} className="cfg-row">
               <span className="cfg-label">
-                {i.label} <span style={{ color: '#888', fontSize: 11 }}>({i.source})</span>
+                {i.label} <span style={{ color: 'var(--text-muted)', fontSize: 11 }}>({i.source})</span>
               </span>
               <input
                 type={i.secret ? 'password' : 'text'}

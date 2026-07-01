@@ -20,6 +20,7 @@ import PersonalityDetail from './pages/PersonalityDetail';
 import Personalities from './pages/Personalities';
 import References from './pages/References';
 import Resources from './pages/Resources';
+import Settings from './pages/Settings';
 import Workflows from './pages/Workflows';
 
 export default function App() {
@@ -44,6 +45,7 @@ export default function App() {
           <Route path="/content/:id" element={<ContentDetail />} />
           <Route path="/references" element={<References />} />
           <Route path="/audit" element={<AuditLog />} />
+          <Route path="/settings" element={<Settings />} />
           <Route path="/infra" element={<Infra />} />
           <Route path="/admin/homelab" element={<Homelab />} />
           <Route path="/admin/money" element={<Money />} />

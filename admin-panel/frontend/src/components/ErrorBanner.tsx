@@ -12,13 +12,13 @@ export default function ErrorBanner({ error, onDismiss }: Props) {
   const msg = typeof error === 'string' ? error : (error.message || 'Unknown error');
   return (
     <div style={{
-      background: '#fee', border: '1px solid #f88', color: '#900',
-      padding: '10px 14px', margin: '8px 0', borderRadius: 4,
-      display: 'flex', justifyContent: 'space-between', alignItems: 'center'
+      background: 'var(--danger-tint)', border: '1px solid #fecdca', color: 'var(--danger-text)',
+      padding: '10px 14px', margin: '8px 0', borderRadius: 'var(--radius-sm)',
+      display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 12,
     }}>
       <span>{msg}</span>
       <button onClick={() => { setVisible(false); onDismiss?.(); }}
-        style={{ background: 'transparent', border: 'none', color: '#900', cursor: 'pointer', fontSize: 18 }}>×</button>
+        style={{ background: 'transparent', border: 'none', color: 'var(--danger-text)', cursor: 'pointer', fontSize: 18, lineHeight: 1 }}>×</button>
     </div>
   );
 }

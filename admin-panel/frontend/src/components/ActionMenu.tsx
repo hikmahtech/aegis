@@ -21,8 +21,8 @@ export default function ActionMenu({ items }: Props) {
   return (
     <div style={{ position: 'relative', display: 'inline-block' }}>
       <button
+        className="btn-icon"
         onClick={() => setOpen(o => !o)}
-        style={{ background: 'transparent', border: '1px solid #ccc', borderRadius: 4, padding: '2px 8px', cursor: 'pointer' }}
       >⋮</button>
       {open && (
         <>
@@ -31,15 +31,15 @@ export default function ActionMenu({ items }: Props) {
             style={{ position: 'fixed', inset: 0, zIndex: 9 }}
           />
           <div style={{
-            position: 'absolute', right: 0, top: '100%', background: '#fff',
-            border: '1px solid #ccc', borderRadius: 4, zIndex: 10, minWidth: 180,
-            boxShadow: '0 2px 6px rgba(0,0,0,0.1)',
+            position: 'absolute', right: 0, top: '100%', background: 'var(--surface)',
+            border: '1px solid var(--border)', borderRadius: 'var(--radius-sm)', zIndex: 10, minWidth: 180,
+            boxShadow: 'var(--shadow-md)', overflow: 'hidden', marginTop: 4,
           }}>
             {items.map((it, i) => (
               <button key={i} onClick={() => run(it)} style={{
-                display: 'block', width: '100%', textAlign: 'left', padding: '6px 12px',
-                background: 'transparent', border: 'none',
-                color: it.destructive ? '#c00' : 'inherit', cursor: 'pointer',
+                display: 'block', width: '100%', textAlign: 'left', padding: '8px 12px',
+                background: 'transparent', border: 'none', fontSize: '0.85rem',
+                color: it.destructive ? 'var(--danger-text)' : 'var(--text)', cursor: 'pointer',
               }}>{it.label}</button>
             ))}
           </div>

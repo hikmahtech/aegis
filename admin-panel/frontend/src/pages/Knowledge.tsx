@@ -131,7 +131,7 @@ export default function Knowledge() {
             placeholder="/data/docs (server path)" />
           <button className="btn" disabled={seeding || !folder.trim()} onClick={() => seed('folder')}>Ingest folder</button>
         </div>
-        {seedMsg && <p style={{ marginTop: 8, color: '#4caf50' }}>{seedMsg}</p>}
+        {seedMsg && <p style={{ marginTop: 8, color: 'var(--success-text)' }}>{seedMsg}</p>}
       </div>
 
       <div className="card" style={{ marginTop: 16 }}>
@@ -164,20 +164,20 @@ export default function Knowledge() {
             {folders.map((f, i) => (
               <tr key={f.id}>
                 <td>{f.name || f.id}</td>
-                <td style={{ fontSize: 11, color: '#888' }}><code>{f.id}</code></td>
+                <td style={{ fontSize: 11, color: 'var(--text-muted)' }}><code>{f.id}</code></td>
                 <td style={{ textAlign: 'right' }}>
                   <button className="btn" onClick={() => setFolders(folders.filter((_, j) => j !== i))}>Remove</button>
                 </td>
               </tr>
             ))}
-            {folders.length === 0 && <tr><td colSpan={3} style={{ color: '#888' }}>No folders watched yet.</td></tr>}
+            {folders.length === 0 && <tr><td colSpan={3} style={{ color: 'var(--text-muted)' }}>No folders watched yet.</td></tr>}
           </tbody>
         </table>
         </div>
         <button className="btn" style={{ marginTop: 8 }} disabled={savingDrive || !driveAct} onClick={saveDrive}>
           {savingDrive ? 'Saving…' : 'Save watched folders'}
         </button>
-        {driveMsg && <p style={{ marginTop: 8, color: '#4caf50' }}>{driveMsg}</p>}
+        {driveMsg && <p style={{ marginTop: 8, color: 'var(--success-text)' }}>{driveMsg}</p>}
       </div>
 
       <form onSubmit={ask} className="card" style={{ marginTop: 16, display: 'flex', flexDirection: 'column', gap: 8 }}>

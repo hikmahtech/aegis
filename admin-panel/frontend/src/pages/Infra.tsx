@@ -122,7 +122,7 @@ export default function Infra() {
                 return (
                   <tr key={i}>
                     <td><strong>{name}</strong></td>
-                    <td style={{ fontSize: 12, color: '#666' }}>{detail || '—'}</td>
+                    <td style={{ fontSize: 12, color: 'var(--text-muted)' }}>{detail || '—'}</td>
                     <td><ActionMenu items={rowActions(row)} /></td>
                   </tr>
                 );
