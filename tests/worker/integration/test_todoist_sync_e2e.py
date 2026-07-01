@@ -114,9 +114,15 @@ async def test_two_runs_bootstrap_once(db_pool):
     async with db_pool.acquire() as conn:
         row = await conn.fetchrow("SELECT value FROM settings WHERE key = 'todoist_managed_project_ids'")
     assert row is not None
-    assert set(row["value"].keys()) == {"inbox", "next", "someday"}
+    # Todoist restructure (2026-07): Next/Someday are @next / @someday
+    # labels now, not managed projects — the seed's managed_projects list
+    # is empty, so bootstrap only adopts the native Inbox.
+    assert set(row["value"].keys()) == {"inbox"}
 
-    # First run: 1 sync (bootstrap probe) + 1 sync (fetch) + 1 commands (bootstrap creates)
+    # First run: 1 sync (bootstrap probe) + 1 sync (fetch) + 1 commands
+    # (bootstrap still creates the seed LABELS + FILTERS in one batch; no
+    # managed projects are created — Next/Someday are @next / @someday
+    # labels now, inbox is adopted).
     # Second run: 0 sync for bootstrap (skipped) + 1 sync (fetch) + 0 commands
     # So total: 3 sync calls, 1 commands call
     assert stub.sync_call_count >= 3

@@ -695,7 +695,11 @@ async def test_classify_one_user_hint_propagates_into_prompt(db_pool) -> None:
 
 
 def _seed_managed_projects(db_pool):
-    """Return an async helper that seeds the canonical managed-project ids."""
+    """Return an async helper that seeds the canonical managed-project ids.
+
+    Next/Someday are @next / @someday labels now, not managed projects
+    (Todoist restructure, 2026-07) — only Inbox remains a managed project id.
+    """
 
     async def _seed():
         async with db_pool.acquire() as conn:
@@ -705,8 +709,6 @@ def _seed_managed_projects(db_pool):
                 "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
                 {
                     "inbox": "P_INBOX",
-                    "next": "P_NEXT",
-                    "someday": "P_SOMEDAY",
                 },
             )
 
@@ -774,9 +776,9 @@ async def test_apply_outcome_reference_adds_label_no_move(db_pool) -> None:
 
 
 @pytest.mark.asyncio
-async def test_apply_outcome_someday_moves_to_project(db_pool) -> None:
-    """Someday classification: move the task into the Someday project; the
-    @someday label is gone under the project-as-source-of-truth model."""
+async def test_apply_outcome_someday_adds_label_no_move(db_pool) -> None:
+    """Someday classification: add @someday to labels, do NOT item_move
+    (mirrors the reference branch under the state-as-label model)."""
     await _seed_managed_projects(db_pool)()
     connector = AsyncMock()
     connector.commands = AsyncMock(
@@ -796,13 +798,12 @@ async def test_apply_outcome_someday_moves_to_project(db_pool) -> None:
     assert out["applied"] is True
     sent = connector.commands.await_args.args[0]
     types = [c["type"] for c in sent]
-    assert "item_move" in types
-    move = next(c for c in sent if c["type"] == "item_move")
-    assert move["args"]["project_id"] == "P_SOMEDAY"
-    # No @someday label added anywhere.
-    assert not any(
-        "@someday" in (c.get("args", {}).get("labels") or []) for c in sent
-    )
+    # No project move under the state-as-label model
+    assert "item_move" not in types
+    # State label landed on the item_update
+    upd = next(c for c in sent if c["type"] == "item_update")
+    assert "@someday" in upd["args"]["labels"]
+    assert "@me" in upd["args"]["labels"]
 
 
 async def _override_user_timezone(db_pool, tz: str) -> str:
@@ -1420,14 +1421,11 @@ async def test_apply_clarify_resolution_low_conf_confirm(db_pool, _resolution_ta
     )
     assert out["applied"] is True
     sent = connector.commands.await_args.args[0]
-    # someday → move into the Someday project, no @someday label
+    # someday → @someday label, no item_move
     types = [c["type"] for c in sent]
-    assert "item_move" in types
-    move = next(c for c in sent if c["type"] == "item_move")
-    assert move["args"]["project_id"] == "P_SOMEDAY"
-    assert not any(
-        "@someday" in (c.get("args", {}).get("labels") or []) for c in sent
-    )
+    assert "item_move" not in types
+    upd = next(c for c in sent if c["type"] == "item_update")
+    assert "@someday" in upd["args"]["labels"]
 
 
 @pytest.mark.asyncio

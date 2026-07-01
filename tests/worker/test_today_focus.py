@@ -32,10 +32,11 @@ async def test_today_focus_ranks_and_excludes(db_pool):
             "INSERT INTO todoist_tasks (id, project_id, content, labels, assignee_label, is_completed, raw) "
             "VALUES ('F_WAIT','P_NXT_F','blocked','{@me,@waiting}','@me',false,'{}'::jsonb)"
         )
-        # someday project — excluded
+        # @someday label — excluded (Todoist restructure, 2026-07: Someday
+        # is a state label now, not a managed project)
         await conn.execute(
             "INSERT INTO todoist_tasks (id, project_id, content, labels, assignee_label, is_completed, raw) "
-            "VALUES ('F_SOM','P_SOM_F','later','{@me}','@me',false,'{}'::jsonb)"
+            "VALUES ('F_SOM','P_SOM_F','later','{@me,@someday}','@me',false,'{}'::jsonb)"
         )
     items = await ReviewActivities(db_pool=db_pool).gather_today_focus()
     ids = [i["task_id"] for i in items]

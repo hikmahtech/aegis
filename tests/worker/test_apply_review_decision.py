@@ -58,14 +58,16 @@ async def test_slipping_tomorrow_updates_due():
 
 
 @pytest.mark.asyncio
-async def test_someday_activate_moves_to_next(db_pool):
+async def test_someday_activate_swaps_someday_label_for_next(db_pool):
+    """'activate' on a someday_resurface item swaps @someday -> @next on
+    the task's label set via item_update — Next/Someday are labels now,
+    not managed projects (Todoist restructure, 2026-07), so no item_move."""
     await run_migrations(db_pool)
     async with db_pool.acquire() as conn:
+        await conn.execute("DELETE FROM todoist_tasks WHERE id='T_SM'")
         await conn.execute(
-            "INSERT INTO settings (key, value) VALUES "
-            "('todoist_managed_project_ids', $1) "
-            "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
-            {"inbox": "P_I", "next": "P_NEXT_ACT", "someday": "P_S"},
+            "INSERT INTO todoist_tasks (id, content, labels, is_completed, raw) "
+            "VALUES ('T_SM', 'learn violin', ARRAY['@someday','@me'], false, '{}'::jsonb)"
         )
     fake = _FakeTodoist()
     acts = ReviewActivities(db_pool=db_pool, todoist_connector=fake)
@@ -74,5 +76,8 @@ async def test_someday_activate_moves_to_next(db_pool):
         {"signal": "someday_resurface", "task_id": "T_SM"})
     assert out["applied"] is True
     cmd = fake.batches[0][0]
-    assert cmd["type"] == "item_move"
-    assert cmd["args"]["project_id"] == "P_NEXT_ACT"
+    assert cmd["type"] == "item_update"
+    assert cmd["args"]["id"] == "T_SM"
+    assert "@next" in cmd["args"]["labels"]
+    assert "@someday" not in cmd["args"]["labels"]
+    assert "@me" in cmd["args"]["labels"]

@@ -19,7 +19,8 @@ async def _review_seeded(db_pool):
     Lays down:
       - P_INBOX_R (inbox), with 2 unclassified source-tagged tasks
       - P_NEXT_R (next), with active tasks incl. a stale project/*-labelled one
-      - P_SOMEDAY_R (someday), with 2 resting tasks
+      - 2 resting tasks carrying the @someday label (Someday/Later is a
+        label now, not a managed project — Todoist restructure, 2026-07)
     """
     await run_migrations(db_pool)
     async with db_pool.acquire() as conn:
@@ -91,12 +92,13 @@ async def _review_seeded(db_pool):
             "'{@me,project/bcp}','@me',"
             "false, now() - interval '20 days','{}'::jsonb)"
         )
-        # 2 resting tasks in the Someday / Later project
+        # 2 resting tasks carrying the @someday label (Todoist restructure,
+        # 2026-07: Someday/Later is a label now, not a managed project).
         await conn.execute(
             "INSERT INTO todoist_tasks "
             "(id, project_id, content, labels, is_completed, raw) VALUES "
-            "('T_SOM_R1','P_SOMEDAY_R','Learn the violin','{@me}',false,'{}'::jsonb), "
-            "('T_SOM_R2','P_SOMEDAY_R','Read Sapiens','{@me}',false,'{}'::jsonb)"
+            "('T_SOM_R1','P_SOMEDAY_R','Learn the violin','{@me,@someday}',false,'{}'::jsonb), "
+            "('T_SOM_R2','P_SOMEDAY_R','Read Sapiens','{@me,@someday}',false,'{}'::jsonb)"
         )
         # 1 task completed within last 7d
         await conn.execute(
@@ -238,15 +240,17 @@ async def test_gather_weekly_digest_counts(db_pool, _review_seeded) -> None:
     digest = await acts.gather_weekly_digest()
     # T_STALE_R carries project/bcp and is 20d old → counts as a stale next action
     assert digest["stale_next_actions_count"] >= 1
-    # T_SOM_R1 + T_SOM_R2 rest in the Someday / Later project
-    assert digest["someday_count"] == 2
+    # T_SOM_R1 + T_SOM_R2 carry the @someday label. someday_count is now a
+    # global count (state-as-label model, not scoped to a managed project),
+    # so other test files' @someday-labelled rows can add to it — use >=.
+    assert digest["someday_count"] >= 2
     # T_WAIT_R has @waiting label but is only 5d old → does NOT cross 7d threshold
     assert digest["waiting_stale_7d_count"] >= 0
     # T_DONE_R completed 2d ago
     assert digest["completed_7d_count"] >= 1
     body = format_weekly_preview(digest)
     assert "Weekly review" in body
-    assert "Someday / Later: 2" in body
+    assert "Someday / Later:" in body
 
 
 @pytest.mark.asyncio

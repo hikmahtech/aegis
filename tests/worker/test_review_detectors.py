@@ -60,10 +60,12 @@ async def _seeded(db_pool):
             "('T_TR1','P_NXT_D','read A',ARRAY['@to-read'],false,'{}'::jsonb), "
             "('T_TR2','P_NXT_D','read B',ARRAY['@to-read'],false,'{}'::jsonb)"
         )
-        # SOMEDAY resurface: old + untouched > 90d
+        # SOMEDAY resurface: old + untouched > 90d. Carries the @someday
+        # label (Todoist restructure, 2026-07: Someday/Later is a label
+        # now, not a managed project).
         await conn.execute(
-            "INSERT INTO todoist_tasks (id, project_id, content, is_completed, updated_at, raw) "
-            "VALUES ('T_SM1','P_SOM_D','learn violin',false,now()-interval '120 days',"
+            "INSERT INTO todoist_tasks (id, project_id, content, labels, is_completed, updated_at, raw) "
+            "VALUES ('T_SM1','P_SOM_D','learn violin',ARRAY['@someday'],false,now()-interval '120 days',"
             "'{\"added_at\":\"2026-01-01T00:00:00Z\"}'::jsonb)"
         )
 

@@ -317,14 +317,17 @@ async def test_bootstrap_creates_managed_projects_when_account_empty(db_pool):
     env = ActivityEnvironment()
     result = await env.run(activities.bootstrap_if_empty)
     assert result["bootstrapped"] is True
-    assert result["projects_created"] == 2  # 2 created via API; inbox is adopted
+    # Todoist restructure (2026-07): Next/Someday are @next / @someday
+    # labels now, not managed projects — the seed's managed_projects list
+    # is empty, so bootstrap creates nothing via the API; inbox is adopted.
+    assert result["projects_created"] == 0
     assert result["inbox_adopted_id"] == "inbox-default-id"
 
-    # Settings row has 3 keys including the adopted inbox
+    # Settings row has only the adopted inbox key
     async with db_pool.acquire() as conn:
         row = await conn.fetchrow("SELECT value FROM settings WHERE key = 'todoist_managed_project_ids'")
     assert row is not None
-    assert set(row["value"].keys()) == {"inbox", "next", "someday"}
+    assert set(row["value"].keys()) == {"inbox"}
     assert row["value"]["inbox"] == "inbox-default-id"
 
 
@@ -417,7 +420,9 @@ async def test_bootstrap_proceeds_alongside_user_projects(db_pool):
     env = ActivityEnvironment()
     result = await env.run(activities.bootstrap_if_empty)
     assert result["bootstrapped"] is True
-    assert result["projects_created"] == 2
+    # Todoist restructure (2026-07): no managed projects left in the seed
+    # to create — Next/Someday are labels now.
+    assert result["projects_created"] == 0
     assert result["inbox_adopted_id"] == "inbox-id"
     # The user's 'User project' is NOT in the managed-ids map.
     async with db_pool.acquire() as conn:
@@ -440,10 +445,13 @@ async def test_bootstrap_recovers_from_partial_failure(db_pool):
             raise AssertionError("commands must not be called during recovery")
 
     activities = TodoistActivities(db_pool=db_pool, connector=NoOpConnector())
-    # Clean state: no settings row, but 3 managed projection rows — 2 named
-    # to match the seed YAML, plus 1 row representing the adopted default
-    # Inbox (name not in the seed; recovery falls back to "the row whose
-    # name isn't in managed_projects is the inbox").
+    # Clean state: no settings row, but 1 managed projection row — the
+    # adopted default Inbox (name not in the seed; recovery falls back to
+    # "the sole row whose name isn't in managed_projects is the inbox").
+    # Todoist restructure (2026-07): the seed's managed_projects list is
+    # now empty (Next/Someday are @next / @someday labels, not projects),
+    # so a partial bootstrap can only ever have left behind the adopted
+    # Inbox row.
     async with db_pool.acquire() as conn:
         await conn.execute("DELETE FROM settings WHERE key = 'todoist_managed_project_ids'")
         await conn.execute(
@@ -462,18 +470,13 @@ async def test_bootstrap_recovers_from_partial_failure(db_pool):
             "WHERE parent_id IN (SELECT id FROM todoist_projects WHERE is_managed = true)"
         )
         await conn.execute("DELETE FROM todoist_projects WHERE is_managed = true")
-        for pid, name in [
-            ("5001", "Inbox"),  # the adopted default Inbox
-            ("5002", "Next"),
-            ("5003", "Someday / Later"),
-        ]:
-            await conn.execute(
-                "INSERT INTO todoist_projects (id, name, is_managed, raw) "
-                "VALUES ($1, $2, true, '{}'::jsonb) ON CONFLICT (id) DO UPDATE "
-                "SET name = EXCLUDED.name, is_managed = true",
-                pid,
-                name,
-            )
+        await conn.execute(
+            "INSERT INTO todoist_projects (id, name, is_managed, raw) "
+            "VALUES ($1, $2, true, '{}'::jsonb) ON CONFLICT (id) DO UPDATE "
+            "SET name = EXCLUDED.name, is_managed = true",
+            "5001",
+            "Inbox",  # the adopted default Inbox
+        )
 
     env = ActivityEnvironment()
     result = await env.run(activities.bootstrap_if_empty)
@@ -483,11 +486,7 @@ async def test_bootstrap_recovers_from_partial_failure(db_pool):
     async with db_pool.acquire() as conn:
         row = await conn.fetchrow("SELECT value FROM settings WHERE key = 'todoist_managed_project_ids'")
     assert row is not None
-    assert row["value"] == {
-        "inbox": "5001",
-        "next": "5002",
-        "someday": "5003",
-    }
+    assert row["value"] == {"inbox": "5001"}
 
 
 @pytest.mark.asyncio

@@ -14,25 +14,20 @@ def _load_seed() -> dict:
     return yaml.safe_load(_SEED_PATH.read_text())
 
 
-def test_todoist_seed_includes_area_labels():
-    """The 6 curated @area/* labels must be present for the migration."""
+def test_todoist_seed_area_labels_are_now_projects():
+    """After the GTD restructure, life-areas/work-streams are real Todoist
+    projects, not labels — so only @area/acme remains as a label (the pandora
+    investigation flow still tags Jira-linked tasks with it)."""
     data = _load_seed()
-    # Area labels moved to dedicated 'areas' group in GTD restructure
     all_label_names = {
         entry["name"]
         for group in data["labels"].values()
         for entry in group
     }
-    expected_areas = {
-        "@area/acme",
-        "@area/business",
-        "@area/aegis",
-        "@area/finance",
-        "@area/family",
-        "@area/admin",
-    }
-    missing = expected_areas - all_label_names
-    assert not missing, f"missing area labels in seed YAML: {missing}"
+    assert "@area/acme" in all_label_names
+    # The rest became projects and must no longer be seeded as labels.
+    retired = {"@area/business", "@area/aegis", "@area/finance", "@area/family", "@area/admin"}
+    assert not (retired & all_label_names), f"area labels that should be projects now: {retired & all_label_names}"
 
 
 def test_todoist_seed_preserves_existing_context_labels():
@@ -48,21 +43,18 @@ def test_todoist_seed_preserves_existing_context_labels():
     assert not missing, f"existing context labels lost: {missing}"
 
 
-def test_managed_projects_are_next_and_someday_only():
-    """Projects-as-workstreams removed: containers are next + someday only
-    (inbox is adopted natively, not listed here)."""
+def test_managed_projects_are_empty():
+    """Todoist restructure (2026-07): Next/Someday are now the @next /
+    @someday LABELS, not managed projects — AEGIS only adopts the native
+    Inbox (not listed here), so there are no AEGIS-created managed
+    projects at all."""
     data = _load_seed()
-    keys = {p["key"] for p in data["managed_projects"]}
-    assert keys == {"next", "someday"}
-    names = {p["name"] for p in data["managed_projects"]}
-    assert "Next" in names
-    assert "Someday / Later" in names
-    # Old project-container keys are gone.
-    assert "projects" not in keys
-    assert "single_actions" not in keys
+    assert data["managed_projects"] == []
 
 
-def test_someday_label_removed_other_state_labels_present():
+def test_someday_and_next_labels_present_other_state_labels_present():
+    """@next / @someday are GTD-state labels now (replacing the old
+    Next / Someday-Later managed projects)."""
     data = _load_seed()
     all_label_names = {
         L["name"]
@@ -71,7 +63,8 @@ def test_someday_label_removed_other_state_labels_present():
     }
     assert "@waiting" in all_label_names      # delegation state, kept
     assert "@reference" in all_label_names    # kept
-    assert "@someday" not in all_label_names  # Someday is now a project
+    assert "@someday" in all_label_names      # Someday is now a label
+    assert "@next" in all_label_names         # Next is now a label
 
 
 def test_someday_maybe_filter_removed():
