@@ -27,7 +27,19 @@ def settings():
 def app(settings):
     app = create_app(run_lifespan=False)
     app.dependency_overrides[get_settings] = lambda: settings
-    app.state.db_pool = AsyncMock()
+    pool = AsyncMock()
+
+    # The tools route now resolves the agent from the DB first (to prefer
+    # metadata.tool_set), so stub fetchrow: known agent → a row with empty
+    # metadata (falls back to AGENT_TOOL_SETS); unknown agent → None → 404.
+    async def _fetchrow(_query, *args):
+        agent_id = args[0] if args else None
+        if agent_id == "sebas":
+            return {"id": "sebas", "name": "Sebastian", "role": "chief", "metadata": {}}
+        return None
+
+    pool.fetchrow = _fetchrow
+    app.state.db_pool = pool
     app.state.settings = settings
     return app
 

@@ -104,6 +104,6 @@ async def test_001_v3_recorded_in_schema_migrations(db_pool):
     await run_migrations(db_pool)
     async with db_pool.acquire() as conn:
         row = await conn.fetchrow(
-            "SELECT filename FROM schema_migrations WHERE filename='001_v3_schema.sql'"
+            "SELECT filename FROM schema_migrations WHERE filename='001_baseline.sql'"
         )
     assert row is not None

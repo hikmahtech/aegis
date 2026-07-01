@@ -30,13 +30,17 @@ async def test_load_seeds_populates_agents(db_pool):
 
 @pytest.mark.asyncio
 async def test_load_seeds_populates_channels(db_pool):
+    import yaml
+
     await run_migrations(db_pool)
     await load_seeds(db_pool, SEED_DIR)
+    seed = yaml.safe_load((SEED_DIR / "channels.yaml").read_text())
+    expected = {c["identifier"] for c in seed["channels"] if c["kind"] == "email"}
     async with db_pool.acquire() as conn:
         rows = await conn.fetch("SELECT identifier FROM channels WHERE kind='email'")
     identifiers = {r["identifier"] for r in rows}
-    # 4 Gmail accounts per spec §15
-    assert len(identifiers) == 4
+    # No cap on Gmail accounts — the seed may carry any number; assert they all load.
+    assert identifiers == expected
 
 
 @pytest.mark.asyncio
