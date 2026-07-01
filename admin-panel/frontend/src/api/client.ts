@@ -43,9 +43,6 @@ export async function apiFetch<T>(path: string, options?: RequestInit): Promise<
 }
 
 export const api = {
-  // Health
-  health: () => apiFetch<any>('/health'),
-
   // Agents
   listAgents: () => apiFetch<any[]>('/api/agents'),
   createAgent: (data: { id: string; name: string; role: string; model_tier?: string; capabilities?: string[]; metadata?: any }) =>
@@ -56,15 +53,6 @@ export const api = {
     apiFetch<any>(`/api/agents/${id}`, { method: 'PATCH', body: JSON.stringify(patch) }),
   draftPersona: (id: string, description: string) =>
     apiFetch<any>(`/api/agents/${id}/draft`, { method: 'POST', body: JSON.stringify({ description }) }),
-
-  // Work Management — Projects (used by Resources page to resolve project names)
-  listProjects: (areaId?: string, status?: string) => {
-    const params = new URLSearchParams();
-    if (areaId) params.set('area_id', areaId);
-    if (status !== undefined) params.set('status', status);
-    const qs = params.toString();
-    return apiFetch<any[]>(`/api/work/projects${qs ? `?${qs}` : ''}`);
-  },
 
   // Resources (v3 — connectors, runbooks, repositories, etc.)
   listResources: (kind?: string) =>
@@ -95,10 +83,6 @@ export const api = {
   knowledgeIngestUrl: (url: string, source_type = 'content', tags?: string[]) =>
     apiFetch<any>('/api/knowledge/ingest', {
       method: 'POST', body: JSON.stringify({ url, source_type, tags }),
-    }),
-  knowledgeIngestDrive: (folder_id: string, account: string, source_type = 'drive', tags?: string[]) =>
-    apiFetch<any>('/api/knowledge/ingest-drive', {
-      method: 'POST', body: JSON.stringify({ folder_id, account, source_type, tags }),
     }),
   knowledgeIngestFolder: (path: string, source_type = 'upload', tags?: string[]) =>
     apiFetch<any>('/api/knowledge/ingest-folder', {
@@ -132,8 +116,6 @@ export const api = {
   },
   listReferenceFailures: (limit?: number) =>
     apiFetch<any[]>(`/api/references/failures${limit ? `?limit=${limit}` : ''}`),
-  getReference: (id: string) =>
-    apiFetch<{ content: any; chunks: any[] }>(`/api/references/${encodeURIComponent(id)}`),
 
   // Chat
   sendMessage: (agentId: string, message: string, tier?: string, threadId?: string) =>
@@ -306,15 +288,7 @@ export const api = {
     return apiFetch<any[]>(`/api/observability/workflow-runs${qs ? `?${qs}` : ''}`);
   },
 
-  // Observability — connector-call reader + stats (used by PersonalityDetail)
-  listConnectorCalls: (params?: { connector?: string; agent_id?: string; limit?: number }) => {
-    const q = new URLSearchParams();
-    if (params?.connector) q.set('connector', params.connector);
-    if (params?.agent_id) q.set('agent_id', params.agent_id);
-    if (params?.limit) q.set('limit', String(params.limit));
-    const qs = q.toString();
-    return apiFetch<any[]>(`/api/observability/connector-calls${qs ? `?${qs}` : ''}`);
-  },
+  // Observability — connector-call stats (used by AgentDetail)
   getConnectorStats: (params?: { connector?: string; agent_id?: string }) => {
     const q = new URLSearchParams();
     if (params?.connector) q.set('connector', params.connector);
