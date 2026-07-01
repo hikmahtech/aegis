@@ -86,8 +86,8 @@ def test_homelab_settings_defaults(monkeypatch):
     # homelab_enabled defaults to False — operators must opt in after
     # configuring the 4 URL/key env vars.
     assert s.homelab_enabled is False
-    assert s.homelab_docker_context == "swarm"
-    assert s.homelab_restore_drill_host == "node-b"
+    assert s.homelab_docker_context == ""
+    assert s.homelab_restore_drill_host == ""
     assert s.homelab_public_domains == ["a.example.com", "b.example.com"]
     assert s.homelab_dagster_graphql_url == "http://d/g"
 

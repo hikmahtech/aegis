@@ -3,19 +3,38 @@
  */
 
 const API_BASE = import.meta.env.VITE_API_URL || '';
-const API_USER = import.meta.env.VITE_API_USER || 'admin';
-const API_PASS = import.meta.env.VITE_API_PASS || 'admin';
+const AUTH_KEY = 'aegis_auth';
 
-const headers = (): HeadersInit => ({
-  'Content-Type': 'application/json',
-  'Authorization': `Basic ${btoa(`${API_USER}:${API_PASS}`)}`,
-});
+// Credentials are entered at runtime via the Login page and stored as a
+// base64 `user:pass` token — never baked into the JS bundle at build time.
+export const setCredentials = (user: string, pass: string): void =>
+  localStorage.setItem(AUTH_KEY, btoa(`${user}:${pass}`));
+export const clearCredentials = (): void => localStorage.removeItem(AUTH_KEY);
+export const hasCredentials = (): boolean => !!localStorage.getItem(AUTH_KEY);
+const authToken = (): string | null => localStorage.getItem(AUTH_KEY);
+
+const headers = (): HeadersInit => {
+  const token = authToken();
+  return {
+    'Content-Type': 'application/json',
+    ...(token ? { Authorization: `Basic ${token}` } : {}),
+  };
+};
+
+// A 401 means the stored creds are wrong/stale (e.g. AEGIS_ADMIN_PASSWORD
+// changed) — drop them and bounce back to the login screen.
+function onUnauthorized(): never {
+  clearCredentials();
+  window.location.reload();
+  throw new Error('API 401: Unauthorized');
+}
 
 export async function apiFetch<T>(path: string, options?: RequestInit): Promise<T> {
   const resp = await fetch(`${API_BASE}${path}`, {
     ...options,
     headers: { ...headers(), ...(options?.headers || {}) },
   });
+  if (resp.status === 401) onUnauthorized();
   if (!resp.ok) throw new Error(`API ${resp.status}: ${resp.statusText}`);
   return resp.json();
 }
@@ -86,11 +105,13 @@ export const api = {
     fd.append('file', file);
     fd.append('source_type', source_type);
     fd.append('tags', tags);
+    const token = authToken();
     const resp = await fetch(`${API_BASE}/api/knowledge/upload`, {
       method: 'POST',
-      headers: { Authorization: `Basic ${btoa(`${API_USER}:${API_PASS}`)}` },
+      headers: token ? { Authorization: `Basic ${token}` } : {},
       body: fd,
     });
+    if (resp.status === 401) onUnauthorized();
     if (!resp.ok) throw new Error(`API ${resp.status}: ${resp.statusText}`);
     return resp.json();
   },

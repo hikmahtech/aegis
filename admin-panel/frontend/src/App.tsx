@@ -1,5 +1,8 @@
+import { useState } from 'react';
 import { BrowserRouter, Route, Routes } from 'react-router-dom';
+import { hasCredentials } from './api/client';
 import Layout from './components/Layout';
+import Login from './pages/Login';
 import AuditLog from './pages/AuditLog';
 import Chat from './pages/Chat';
 import Content from './pages/Content';
@@ -23,6 +26,8 @@ import Resources from './pages/Resources';
 import Workflows from './pages/Workflows';
 
 export default function App() {
+  const [authed, setAuthed] = useState(hasCredentials());
+  if (!authed) return <Login onSuccess={() => setAuthed(true)} />;
   return (
     <BrowserRouter>
       <Routes>

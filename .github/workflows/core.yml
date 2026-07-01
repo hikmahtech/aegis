@@ -63,14 +63,7 @@ jobs:
           node-version: "20"
 
       - name: Build admin panel
-        env:
-          VITE_API_USER: ${{ secrets.AEGIS_ADMIN_USERNAME }}
-          VITE_API_PASS: ${{ secrets.AEGIS_ADMIN_PASSWORD }}
         run: |
-          if [ -z "$VITE_API_USER" ] || [ -z "$VITE_API_PASS" ]; then
-            echo "::error::AEGIS_ADMIN_USERNAME / AEGIS_ADMIN_PASSWORD secrets must be set"
-            exit 1
-          fi
           cd admin-panel/frontend
           npm ci
           npm run build
