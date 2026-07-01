@@ -5,20 +5,19 @@
 
 # 'inbox' is intentionally absent from this list: AEGIS adopts Todoist's
 # built-in Inbox (the project Todoist returns with inbox_project=true) so
-# we don't duplicate Todoist's special-status default. The remaining two
-# managed projects are created at bootstrap.
-managed_projects:
-  - key: next
-    name: "Next"
-  - key: someday
-    name: "Someday / Later"
+# we don't duplicate Todoist's special-status default.
+# NOTE: Next / Someply-Later are NO LONGER managed projects — they are the
+# @next / @someday LABELS (see gtd_state below). Work-areas are now real
+# Todoist projects created/owned by the user, not AEGIS-managed. So there are
+# no AEGIS-created managed projects: bootstrap only adopts the native Inbox.
+managed_projects: []
 
 # Labels: assignee labels are mutually exclusive (per spec §2 invariant 3);
 # context labels can compose freely on a single task. State labels
 # (@waiting, @reference) are mutually exclusive in practice but unenforced —
-# the clarify worker and chat tools are the single writers. "Someday" is no
-# longer a label — it is the "Someday / Later" project (single source of
-# truth); work-streams are project/<name> labels created on demand.
+# the clarify worker and chat tools are the single writers. @next / @someday
+# are the GTD-state labels (replacing the old Next / Someday-Later projects);
+# work-streams and areas are now real Todoist projects owned by the user.
 labels:
   assignees:
     - name: "@me"
@@ -27,6 +26,8 @@ labels:
     - name: "@maou"
     - name: "@pandora"
   gtd_state:
+    - name: "@next"
+    - name: "@someday"
     - name: "@waiting"
     - name: "@reference"
   contexts:
@@ -39,13 +40,11 @@ labels:
     - name: "@home"
     - name: "@office"
     - name: "@reading"
+  # Areas are now real Todoist projects (Stockopedia/Hikmah/Personal/Admin/...),
+  # not labels. Only @area/acme remains — the pandora investigation flow still
+  # tags Jira-linked tasks with it.
   areas:
     - name: "@area/acme"
-    - name: "@area/business"
-    - name: "@area/aegis"
-    - name: "@area/finance"
-    - name: "@area/family"
-    - name: "@area/admin"
 
 # Pre-seeded Todoist filters (visible in the user's filter sidebar).
 # Queries use Todoist's filter syntax. Label refs in filter queries need
