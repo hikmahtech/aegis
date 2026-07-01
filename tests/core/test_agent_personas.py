@@ -39,8 +39,10 @@ def test_persona_tools_appended():
 def test_read_persona_files_reads_shipped_sebas():
     from aegis.seed import _read_persona_files
 
-    soul, ops, usr = _read_persona_files("sebas")
-    assert soul and ops and usr  # the shipped example personas exist
+    soul, _ops, usr = _read_persona_files("sebas")
+    # The shipped example personas include SOUL.md + USER.md; AGENTS.md
+    # (operating notes) is intentionally omitted from the public examples.
+    assert soul and usr
 
 
 @pytest_asyncio.fixture(loop_scope="function")

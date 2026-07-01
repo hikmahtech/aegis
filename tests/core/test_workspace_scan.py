@@ -33,10 +33,11 @@ def test_parse_scan_basic_lines():
         "personal/aegis|git@github.com:youruser/aegis.git\n"
         "local-only|\n"
     )
+    # _parse_workspace_scan returns entries sorted by path.
     assert out == [
+        {"path": "acme/bcp", "origin_url": "git@github.com:acme/bcp.git"},
         {"path": "local-only", "origin_url": ""},
         {"path": "personal/aegis", "origin_url": "git@github.com:youruser/aegis.git"},
-        {"path": "acme/bcp", "origin_url": "git@github.com:acme/bcp.git"},
     ]
 
 

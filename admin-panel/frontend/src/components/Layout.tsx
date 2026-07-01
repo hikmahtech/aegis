@@ -1,5 +1,8 @@
 import { useState } from 'react';
 import { Link, Outlet, useLocation } from 'react-router-dom';
+import { clearCredentials } from '../api/client';
+
+const logout = () => { clearCredentials(); window.location.reload(); };
 
 // Grouped navigation. Labels are display-only; routes are unchanged.
 const NAV: { section: string; items: { path: string; label: string }[] }[] = [
@@ -83,6 +86,9 @@ export default function Layout() {
               ))}
             </div>
           ))}
+          <a onClick={() => { closeSidebar(); logout(); }} style={{ cursor: 'pointer', marginTop: 'auto' }}>
+            Log out
+          </a>
         </nav>
 
         <main className="main-content">
