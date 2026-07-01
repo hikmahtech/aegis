@@ -1,5 +1,8 @@
 import { useState } from 'react';
 import { Link, Outlet, useLocation } from 'react-router-dom';
+import { clearCredentials } from '../api/client';
+
+const logout = () => { clearCredentials(); window.location.reload(); };
 
 const NAV = [
   { path: '/', label: 'Overview' },
@@ -53,6 +56,9 @@ export default function Layout() {
               {label}
             </Link>
           ))}
+          <a onClick={() => { closeSidebar(); logout(); }} style={{ cursor: 'pointer', marginTop: 'auto' }}>
+            Log out
+          </a>
         </nav>
 
         <main className="main-content">
