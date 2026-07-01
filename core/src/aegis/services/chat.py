@@ -2318,17 +2318,22 @@ async def _exec_whats_next(pool: asyncpg.Pool, args: dict, ctx: ToolContext) -> 
     where = [
         "NOT t.is_completed",
         "(t.assignee_label='@me' OR t.assignee_label IS NULL)",
-        # State labels mirror aegis_worker.activities.review._STATE_LABELS (cross-package; keep in sync).
-        "NOT (t.labels && ARRAY['@waiting','@reference','@to-read'])",
+        # State labels mirror aegis_worker.activities.review._STATE_LABELS
+        # (cross-package; keep in sync). @someday is included here now that
+        # Someday/Later is a label, not a managed project (Todoist
+        # restructure, 2026-07).
+        "NOT (t.labels && ARRAY['@waiting','@reference','@to-read','@someday'])",
     ]
     params: list = []
     async with pool.acquire() as conn:
         managed = await conn.fetchval(
             "SELECT value FROM settings WHERE key='todoist_managed_project_ids'"
         )
+        # Someday is excluded via the @someday state label above; only Inbox
+        # is still a managed-project id to exclude.
         exclude = []
         if isinstance(managed, dict):
-            exclude = [e for e in (managed.get("inbox"), managed.get("someday")) if e]
+            exclude = [e for e in (managed.get("inbox"),) if e]
         if exclude:
             params.append(exclude)
             where.append(

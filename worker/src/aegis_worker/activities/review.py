@@ -26,8 +26,15 @@ _REVIEW_DEFAULTS = {
     "someday_resurface_days": 90,
     "top_n": 5,
 }
+# GTD state labels (Todoist restructure, 2026-07): Someday/Later and Next
+# used to be managed projects; Someday is now the @someday label (Next is
+# @next — see apply_review_decision). Mirrors
+# aegis_worker.activities.clarify._LABEL_SOMEDAY / _LABEL_NEXT and
+# core.aegis.services.chat._exec_whats_next (cross-package; keep in sync).
+_LABEL_SOMEDAY = "@someday"
+_LABEL_NEXT = "@next"
 # State labels mark a task non-actionable (parked/delegated/reference).
-_STATE_LABELS = ["@waiting", "@reference", "@to-read"]
+_STATE_LABELS = ["@waiting", "@reference", "@to-read", _LABEL_SOMEDAY]
 
 
 @dataclass
@@ -158,7 +165,6 @@ class ReviewActivities:
             if not isinstance(managed, dict):
                 return empty
             inbox_id = managed.get("inbox")
-            someday_id = managed.get("someday")
             # Stale next-actions: open tasks carrying a project/* work-stream
             # label, untouched for 14 days.
             stale_next_count = await conn.fetchval(
@@ -178,15 +184,13 @@ class ReviewActivities:
                     "ORDER BY t.updated_at ASC LIMIT 3"
                 )
             ]
-            # Someday/Later is a project now; count its open tasks (the weekly
-            # review's primary resurface surface).
-            someday_count = 0
-            if someday_id:
-                someday_count = await conn.fetchval(
-                    "SELECT count(*) FROM todoist_tasks "
-                    "WHERE project_id=$1 AND NOT is_completed",
-                    someday_id,
-                )
+            # Someday/Later is now the @someday label (Todoist restructure,
+            # 2026-07); count open tasks carrying it (the weekly review's
+            # primary resurface surface).
+            someday_count = await conn.fetchval(
+                "SELECT count(*) FROM todoist_tasks "
+                "WHERE '@someday' = ANY(labels) AND NOT is_completed"
+            )
             waiting_stale = await conn.fetchval(
                 "SELECT count(*) FROM todoist_tasks "
                 "WHERE '@waiting' = ANY(labels) AND NOT is_completed "
@@ -226,12 +230,13 @@ class ReviewActivities:
                 "SELECT count(*) FROM todoist_tasks "
                 "WHERE is_completed AND completed_at > now() - interval '7 days'"
             )
-            # Never-clarified backlog across ALL managed projects
-            # (inbox + next + someday). ClarifyFlow only scans Inbox, so
-            # tasks that migrated to Next/Someday before clarification are
-            # silently missed. Age is measured from raw->>'added_at' (the
-            # Todoist creation timestamp) rather than updated_at, which the
-            # 5-min sync bumps on every projection upsert.
+            # Never-clarified backlog across ALL managed projects. Post-2026-07
+            # GTD restructure, Next/Someday are labels, not managed projects,
+            # so this is effectively just Inbox — kept generic (iterates
+            # whatever `managed` holds) so it stays correct if more managed
+            # projects are added later. Age is measured from raw->>'added_at'
+            # (the Todoist creation timestamp) rather than updated_at, which
+            # the 5-min sync bumps on every projection upsert.
             all_managed_ids = [
                 v for v in managed.values() if isinstance(v, str) and v
             ]
@@ -300,10 +305,6 @@ class ReviewActivities:
             cfg = {**_REVIEW_DEFAULTS,
                    **(cfg_raw if isinstance(cfg_raw, dict) else {})}
             base["_top_n"] = int(cfg["top_n"])
-            managed = await conn.fetchval(
-                "SELECT value FROM settings WHERE key='todoist_managed_project_ids'"
-            )
-            someday_id = managed.get("someday") if isinstance(managed, dict) else None
 
             # Stalled: non-managed, non-archived project with open tasks but
             # NO actionable task (every open task carries a state label).
@@ -357,23 +358,24 @@ class ReviewActivities:
                 "WHERE '@to-read' = ANY(labels) AND NOT is_completed"
             ) or 0)
             # Someday resurface: oldest few, untouched past threshold.
-            if someday_id:
-                rows = await conn.fetch(
-                    "SELECT id, content, raw->>'added_at' AS added_at "
-                    "FROM todoist_tasks WHERE project_id=$1 AND NOT is_completed "
-                    "AND updated_at < now() - make_interval(days => $2) "
-                    "ORDER BY raw->>'added_at' ASC NULLS LAST LIMIT 3",
-                    someday_id, int(cfg["someday_resurface_days"]),
+            # Someday/Later is the @someday label now (Todoist restructure,
+            # 2026-07), not a managed project.
+            rows = await conn.fetch(
+                "SELECT id, content, raw->>'added_at' AS added_at "
+                "FROM todoist_tasks WHERE '@someday' = ANY(labels) AND NOT is_completed "
+                "AND updated_at < now() - make_interval(days => $1) "
+                "ORDER BY raw->>'added_at' ASC NULLS LAST LIMIT 3",
+                int(cfg["someday_resurface_days"]),
+            )
+            for r in rows:
+                try:
+                    added = dt.date.fromisoformat(str(r["added_at"])[:10])
+                    age = (dt.date.today() - added).days
+                except (ValueError, TypeError):
+                    age = 0
+                base["someday_resurface_items"].append(
+                    {"task_id": r["id"], "content": r["content"], "age_days": age}
                 )
-                for r in rows:
-                    try:
-                        added = dt.date.fromisoformat(str(r["added_at"])[:10])
-                        age = (dt.date.today() - added).days
-                    except (ValueError, TypeError):
-                        age = 0
-                    base["someday_resurface_items"].append(
-                        {"task_id": r["id"], "content": r["content"], "age_days": age}
-                    )
         return base
 
     def _build_decisions(self, snapshot: dict) -> list[dict]:
@@ -497,17 +499,19 @@ class ReviewActivities:
             if choice == "drop":
                 cmds = [TodoistConnector.build_item_complete_command(task_id)]
             elif choice == "activate":
-                next_id = None
+                # Todoist GTD restructure (2026-07): Next is the @next label
+                # now, not a managed project — swap @someday -> @next on the
+                # task's current label set instead of an item_move.
+                existing_labels: list[str] = []
                 if self.db_pool is not None:
                     async with self.db_pool.acquire() as conn:
-                        managed = await conn.fetchval(
-                            "SELECT value FROM settings "
-                            "WHERE key='todoist_managed_project_ids'"
+                        row_labels = await conn.fetchval(
+                            "SELECT labels FROM todoist_tasks WHERE id=$1", task_id
                         )
-                    if isinstance(managed, dict):
-                        next_id = managed.get("next")
-                if next_id:
-                    cmds = [TodoistConnector.build_item_move_command(task_id, next_id)]
+                    existing_labels = list(row_labels or [])
+                new_labels = [lab for lab in existing_labels if lab != _LABEL_SOMEDAY]
+                new_labels = list({*new_labels, _LABEL_NEXT})
+                cmds = [TodoistConnector.build_item_update_command(task_id, labels=new_labels)]
 
         if not cmds:
             return {"applied": False, "reason": f"unhandled:{signal}/{choice}"}
@@ -536,8 +540,8 @@ class ReviewActivities:
     @activity.defn
     async def gather_today_focus(self) -> list[dict]:
         """Ranked 'my next actions' for today: open, @me (or unassigned),
-        not parked (state labels), not in inbox/someday. Overdue/due first,
-        then priority. ponytail: no calendar free-time sizing in v1 —
+        not parked (state labels, incl. @someday), not in inbox. Overdue/due
+        first, then priority. ponytail: no calendar free-time sizing in v1 —
         ranks by due+priority; add calendar sizing if this falls short."""
         if self.db_pool is None:
             return []
@@ -545,10 +549,12 @@ class ReviewActivities:
             managed = await conn.fetchval(
                 "SELECT value FROM settings WHERE key='todoist_managed_project_ids'"
             )
+            # Someday is the @someday label now (Todoist restructure, 2026-07),
+            # already covered by the _STATE_LABELS exclusion below — only
+            # Inbox is still a managed-project id to exclude.
             exclude = []
             if isinstance(managed, dict):
-                exclude = [managed.get("inbox"), managed.get("someday")]
-                exclude = [e for e in exclude if e]
+                exclude = [e for e in (managed.get("inbox"),) if e]
             where = [
                 "NOT t.is_completed",
                 "(t.assignee_label='@me' OR t.assignee_label IS NULL)",

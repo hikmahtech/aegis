@@ -113,6 +113,13 @@ _ADDRESSABLE_AGENTS: list[tuple[str, str]] = [
     ("@maou", "maou_followup"),
 ]
 
+# GTD state labels (Todoist restructure, 2026-07): Someday/Later and Next
+# used to be managed projects; both are now labels applied in apply_outcome
+# instead of an item_move. Mirrors aegis_worker.activities.review._STATE_LABELS
+# / _LABEL_SOMEDAY / _LABEL_NEXT (cross-package; keep in sync).
+_LABEL_SOMEDAY = "@someday"
+_LABEL_NEXT = "@next"
+
 
 import asyncpg  # noqa: E402
 from aegis.clarify_note import (  # noqa: E402
@@ -919,13 +926,6 @@ class ClarifyActivities:
         assignee = decision.get("assignee") or "@me"
         contexts = list(decision.get("contexts") or [])
 
-        # Managed-project ids
-        async with self.db_pool.acquire() as conn:
-            managed = await conn.fetchval(
-                "SELECT value FROM settings WHERE key='todoist_managed_project_ids'"
-            )
-        managed = managed or {}
-
         # Low-confidence → NEEDS REVIEW note + signal interaction.
         # The note is best-effort: if Todoist rejects it (envelope-ok +
         # per-command ITEM_NOT_FOUND on a stale projection row), we still
@@ -1092,14 +1092,15 @@ class ClarifyActivities:
             # No item_move — @reference is the permanent home signal.
 
         elif classification == "someday":
-            # Someday/Later is a real project and the single source of truth;
-            # move the task there. There is no @someday label under this model.
-            someday_id = managed.get("someday")
+            # Todoist GTD restructure (2026-07): Someday/Later is now the
+            # @someday LABEL, not a managed project (the project is being
+            # retired). Label-only, mirrors the `reference` branch above —
+            # no item_move.
+            labels_with_state = list({*merged_labels, _LABEL_SOMEDAY})
             commands.append(
-                TodoistConnector.build_item_update_command(item_id, labels=merged_labels)
+                TodoistConnector.build_item_update_command(item_id, labels=labels_with_state)
             )
-            if someday_id:
-                commands.append(TodoistConnector.build_item_move_command(item_id, someday_id))
+            # No item_move — @someday is the permanent home signal now.
 
         elif classification == "2_min":
             tz_name = await self._settings_str("user_timezone", "UTC")
@@ -1124,17 +1125,21 @@ class ClarifyActivities:
                 commands.append(TodoistConnector.build_item_update_command(item_id, labels=demoted))
 
         elif classification == "next_action":
+            # Todoist GTD restructure (2026-07): Next is now the @next
+            # LABEL, not a managed project — this branch never moved
+            # projects, so the only change is adding the state label.
+            labels_with_state = list({*merged_labels, _LABEL_NEXT})
             # Optional due-date passthrough (used by 'defer_1d' resolution).
             due_string = decision.get("_due_string")
             if due_string:
                 commands.append(
                     TodoistConnector.build_item_update_command(
-                        item_id, labels=merged_labels, due={"string": due_string}
+                        item_id, labels=labels_with_state, due={"string": due_string}
                     )
                 )
             else:
                 commands.append(
-                    TodoistConnector.build_item_update_command(item_id, labels=merged_labels)
+                    TodoistConnector.build_item_update_command(item_id, labels=labels_with_state)
                 )
 
         elif classification == "leave":
