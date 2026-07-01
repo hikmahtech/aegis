@@ -4,6 +4,23 @@ import ErrorBanner from '../components/ErrorBanner';
 
 const TIERS = ['fast', 'balanced', 'smart'] as const;
 
+// Models sometimes wrap their answer as {"response": "..."} — unwrap that common
+// shape for display; otherwise show the text verbatim.
+function displayContent(raw: string): string {
+  if (typeof raw !== 'string') return String(raw ?? '');
+  const s = raw.trim();
+  if (s.startsWith('{') && s.endsWith('}')) {
+    try {
+      const o = JSON.parse(s);
+      const single = o && typeof o === 'object' ? (o.response ?? o.reply ?? o.answer ?? o.text ?? o.content) : null;
+      if (typeof single === 'string') return single;
+    } catch { /* not JSON — fall through */ }
+  }
+  return raw;
+}
+
+const initial = (s: string) => (s || '?').trim().charAt(0).toUpperCase();
+
 export default function Chat() {
   const [agents, setAgents] = useState<any[]>([]);
   const [threads, setThreads] = useState<any[]>([]);
@@ -17,10 +34,11 @@ export default function Chat() {
   const [msg, setMsg] = useState('');
   const [sending, setSending] = useState(false);
   const [messages, setMessages] = useState<any[]>([]);
-  const [threadsOpen, setThreadsOpen] = useState(false);
   const [threadLoading, setThreadLoading] = useState(false);
+  const [sidebarOpen, setSidebarOpen] = useState(false);
 
-  const messagesEndRef = useRef<HTMLDivElement>(null);
+  const scrollRef = useRef<HTMLDivElement>(null);
+  const taRef = useRef<HTMLTextAreaElement>(null);
 
   useEffect(() => {
     Promise.all([
@@ -43,14 +61,24 @@ export default function Chat() {
     }).catch(err => { setError(err); setLoading(false); });
   }, []);
 
+  // Keep the transcript pinned to the newest message.
   useEffect(() => {
-    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [messages]);
+    scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: 'smooth' });
+  }, [messages, sending, threadLoading]);
 
+  // Auto-grow the composer up to a cap.
+  useEffect(() => {
+    const ta = taRef.current;
+    if (!ta) return;
+    ta.style.height = 'auto';
+    ta.style.height = `${Math.min(ta.scrollHeight, 160)}px`;
+  }, [msg]);
+
+  const agent = agents.find(a => a.id === agentId);
   const getAgentName = (id: string) => agents.find(a => a.id === id)?.name || id;
 
   async function loadThread(t: any) {
-    setThreadsOpen(false);
+    setSidebarOpen(false);
     setThreadLoading(true);
     setError(null);
     try {
@@ -69,6 +97,7 @@ export default function Chat() {
     setThreadId(undefined);
     setMessages([]);
     setError(null);
+    taRef.current?.focus();
   }
 
   async function send(e: React.FormEvent) {
@@ -82,13 +111,14 @@ export default function Chat() {
     try {
       const r = await api.sendMessage(agentId, text, tier, threadId);
       const replyText = r.response ?? r.reply ?? r.message ?? JSON.stringify(r);
-      setMessages(m => [...m, { role: 'assistant', content: replyText, created_at: new Date().toISOString() }]);
+      setMessages(m => [...m, { role: 'assistant', content: replyText, created_at: new Date().toISOString(), tool_calls: r.tool_calls }]);
       if (r.thread_id) setThreadId(r.thread_id);
     } catch (err: any) {
       setError(err);
-      setMessages(m => [...m, { role: 'assistant', content: `[error: ${err.message}]`, created_at: new Date().toISOString() }]);
+      setMessages(m => [...m, { role: 'assistant', content: `[error: ${err.message}]`, created_at: new Date().toISOString(), isError: true }]);
     } finally {
       setSending(false);
+      taRef.current?.focus();
     }
   }
 
@@ -101,102 +131,128 @@ export default function Chat() {
 
   if (loading) return <div className="loading">Loading chat…</div>;
 
+  if (agents.length === 0) {
+    return (
+      <div>
+        <h1 className="page-title">Chat</h1>
+        <ErrorBanner error={error} onDismiss={() => setError(null)} />
+        <div className="empty">No agents configured yet. Create one on the Agents page.</div>
+      </div>
+    );
+  }
+
+  const toolCount = (m: any) => Array.isArray(m.tool_calls) ? m.tool_calls.length : 0;
+
   return (
-    <div>
-      <h1 className="page-title">Chat</h1>
-      <p className="page-subtitle">Talk to an agent, or browse a past conversation</p>
+    <div className="chat-page">
       <ErrorBanner error={error} onDismiss={() => setError(null)} />
 
-      {agents.length === 0 ? (
-        <div className="empty">No agents configured yet.</div>
-      ) : (
-        <>
-          <div className="card" style={{ marginBottom: 16 }}>
-            <div className="cfg-row" style={{ marginBottom: 0 }}>
-              <select value={agentId} onChange={e => { setAgentId(e.target.value); newConversation(); }}>
-                {agents.map(a => <option key={a.id} value={a.id}>{a.name}</option>)}
-              </select>
-              <select value={tier} onChange={e => setTier(e.target.value)}>
-                {TIERS.map(t => (
-                  <option key={t} value={t}>
-                    {t}{tierModels[t] ? ` — ${tierModels[t]}` : ''}
-                  </option>
-                ))}
-              </select>
-              <button type="button" className="btn btn-sm" onClick={newConversation}>
-                New conversation
-              </button>
-              <button type="button" className="btn btn-sm" onClick={() => setThreadsOpen(o => !o)}>
-                {threadsOpen ? 'Hide' : 'Show'} recent threads ({threads.length})
-              </button>
-              {threadId && (
-                <span className="meta mono" style={{ marginLeft: 'auto' }}>thread: {threadId}</span>
-              )}
-            </div>
+      <div className={`chat-shell ${sidebarOpen ? 'sidebar-open' : ''}`}>
+        {/* Sidebar: new chat + recent conversations */}
+        <aside className="chat-sidebar">
+          <div className="chat-sidebar-head">
+            <button className="btn btn-primary" style={{ width: '100%' }} onClick={newConversation}>+ New chat</button>
           </div>
-
-          {threadsOpen && (
-            <div className="card" style={{ marginBottom: 16, maxHeight: 260, overflowY: 'auto' }}>
-              {threads.length === 0 && <div className="empty">No threads found</div>}
-              {threads.map(t => (
-                <div
+          <div className="chat-thread-list">
+            <div className="chat-thread-label">Recent</div>
+            {threads.length === 0 && <div className="meta" style={{ padding: '8px 4px' }}>No conversations yet.</div>}
+            {threads.map(t => {
+              const active = threadId === t.thread_id && agentId === t.agent_id;
+              return (
+                <button
                   key={`${t.agent_id}-${t.thread_id}`}
-                  className={`thread-item ${threadId === t.thread_id && agentId === t.agent_id ? 'active' : ''}`}
+                  className={`chat-thread ${active ? 'active' : ''}`}
                   onClick={() => loadThread(t)}
                 >
-                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                    <strong style={{ fontSize: '0.85rem' }}>{getAgentName(t.agent_id)}</strong>
-                    <span className="meta">{t.message_count} msgs</span>
-                  </div>
-                  <div className="meta" style={{ marginTop: '0.2rem' }}>
-                    {t.last_message ? new Date(t.last_message).toLocaleString() : ''}
-                  </div>
-                  <div className="mono" style={{ fontSize: '0.7rem', color: 'var(--text-muted)', marginTop: '0.1rem', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                    {t.thread_id}
+                  <span className="msg-avatar assistant" aria-hidden>{initial(getAgentName(t.agent_id))}</span>
+                  <span className="chat-thread-body">
+                    <span className="chat-thread-top">
+                      <strong>{getAgentName(t.agent_id)}</strong>
+                      <span className="meta">{t.message_count ?? ''}{t.message_count ? ' msgs' : ''}</span>
+                    </span>
+                    <span className="meta chat-thread-time">
+                      {t.last_message ? new Date(t.last_message).toLocaleString() : ''}
+                    </span>
+                  </span>
+                </button>
+              );
+            })}
+          </div>
+        </aside>
+
+        {/* Main conversation pane */}
+        <section className="chat-main">
+          <header className="chat-main-head">
+            <button className="btn btn-sm chat-sidebar-toggle" onClick={() => setSidebarOpen(o => !o)} aria-label="Conversations">☰</button>
+            <span className="msg-avatar assistant" aria-hidden>{initial(agent?.name || agentId)}</span>
+            <div className="chat-head-agent">
+              <select className="chat-agent-select" value={agentId} onChange={e => { setAgentId(e.target.value); newConversation(); }}>
+                {agents.map(a => <option key={a.id} value={a.id}>{a.name}</option>)}
+              </select>
+              {agent?.role && <span className="meta">{agent.role}</span>}
+            </div>
+            <div className="chat-head-model">
+              <span className="meta">Model</span>
+              <select value={tier} onChange={e => setTier(e.target.value)} title={tierModels[tier] || tier}>
+                {TIERS.map(t => (
+                  <option key={t} value={t}>{t}{tierModels[t] ? ` · ${tierModels[t]}` : ''}</option>
+                ))}
+              </select>
+            </div>
+          </header>
+
+          <div className="chat-scroll" ref={scrollRef}>
+            {threadLoading ? (
+              <div className="loading">Loading messages…</div>
+            ) : messages.length === 0 ? (
+              <div className="chat-empty">
+                <span className="msg-avatar assistant" style={{ width: 44, height: 44, fontSize: 18 }} aria-hidden>{initial(agent?.name || agentId)}</span>
+                <p><strong>{getAgentName(agentId)}</strong></p>
+                <p className="meta">{agent?.role || 'Send a message to start the conversation.'}</p>
+              </div>
+            ) : (
+              messages.map((m, i) => (
+                <div key={i} className={`msg-row ${m.role === 'user' ? 'user' : 'assistant'}`}>
+                  <span className={`msg-avatar ${m.role === 'user' ? 'user' : 'assistant'}`} aria-hidden>
+                    {m.role === 'user' ? 'You'.charAt(0) : initial(agent?.name || agentId)}
+                  </span>
+                  <div className="msg-content">
+                    <div className={`msg-bubble ${m.isError ? 'error' : ''}`}>{displayContent(m.content)}</div>
+                    {toolCount(m) > 0 && (
+                      <div className="msg-tools">🔧 {toolCount(m)} tool call{toolCount(m) > 1 ? 's' : ''}</div>
+                    )}
+                    <div className="msg-time">{m.created_at ? new Date(m.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : ''}</div>
                   </div>
                 </div>
-              ))}
-            </div>
-          )}
-
-          <div className="card" style={{ padding: '1rem' }}>
-            <div className="chat-messages" style={{ maxHeight: '52vh' }}>
-              {threadLoading ? (
-                <div className="loading">Loading messages…</div>
-              ) : messages.length === 0 ? (
-                <div className="empty">Send a message to {getAgentName(agentId)} to start.</div>
-              ) : (
-                <>
-                  {messages.map((m, i) => (
-                    <div key={i} className={`chat-bubble ${m.role}`}>
-                      <span style={{ wordBreak: 'break-word', whiteSpace: 'pre-wrap' }}>{m.content}</span>
-                      <div className="meta" style={{ fontSize: '0.7rem', marginTop: '0.2rem' }}>
-                        {m.created_at ? new Date(m.created_at).toLocaleString() : ''}
-                      </div>
-                    </div>
-                  ))}
-                  <div ref={messagesEndRef} />
-                </>
-              )}
-            </div>
-
-            <form onSubmit={send} className="chat-input" style={{ marginTop: '0.75rem' }}>
-              <textarea
-                rows={1}
-                value={msg}
-                onChange={e => setMsg(e.target.value)}
-                onKeyDown={onKeyDown}
-                placeholder={`Message ${getAgentName(agentId)}… (Enter to send, Shift+Enter for newline)`}
-                disabled={sending}
-                style={{ resize: 'none' }}
-              />
-              <button type="submit" className="btn btn-primary" disabled={sending || !msg.trim() || !agentId}>
-                {sending ? 'Sending…' : 'Send'}
-              </button>
-            </form>
+              ))
+            )}
+            {sending && (
+              <div className="msg-row assistant">
+                <span className="msg-avatar assistant" aria-hidden>{initial(agent?.name || agentId)}</span>
+                <div className="msg-content">
+                  <div className="msg-bubble"><span className="typing-dots"><span /><span /><span /></span></div>
+                </div>
+              </div>
+            )}
           </div>
-        </>
-      )}
+
+          <form onSubmit={send} className="chat-composer">
+            <textarea
+              ref={taRef}
+              rows={1}
+              value={msg}
+              onChange={e => setMsg(e.target.value)}
+              onKeyDown={onKeyDown}
+              placeholder={`Message ${getAgentName(agentId)}…`}
+              disabled={sending}
+            />
+            <button type="submit" className="btn btn-primary chat-send" disabled={sending || !msg.trim() || !agentId} aria-label="Send">
+              {sending ? '…' : '↑'}
+            </button>
+          </form>
+          <div className="chat-hint meta">Enter to send · Shift+Enter for a new line{threadId ? ` · thread ${threadId.slice(0, 8)}…` : ' · new conversation'}</div>
+        </section>
+      </div>
     </div>
   );
 }
