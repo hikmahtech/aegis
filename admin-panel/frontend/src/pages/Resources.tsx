@@ -19,6 +19,7 @@ interface ResourceFormData {
   content: string;
   tags: string;
   metadata: string;
+  infra_id: string;
 }
 
 const emptyForm: ResourceFormData = {
@@ -29,10 +30,12 @@ const emptyForm: ResourceFormData = {
   content: '',
   tags: '',
   metadata: '{}',
+  infra_id: '',
 };
 
 export default function Resources() {
   const [resources, setResources] = useState<any[]>([]);
+  const [infra, setInfra] = useState<any[]>([]);
   const [loading, setLoading] = useState(true);
   const [filterKind, setFilterKind] = useState<string>('');
   const [showForm, setShowForm] = useState(false);
@@ -50,7 +53,10 @@ export default function Resources() {
     }).catch(() => setLoading(false));
   };
 
-  useEffect(load, []);
+  useEffect(() => {
+    load();
+    api.listInfra().then(setInfra).catch(() => setInfra([]));
+  }, []);
 
   const filtered = filterKind ? resources.filter(r => r.kind === filterKind) : resources;
 
@@ -78,6 +84,7 @@ export default function Resources() {
       content: r.content || '',
       tags: (r.tags || []).join(', '),
       metadata: JSON.stringify(r.metadata || {}, null, 2),
+      infra_id: r.infra_id || '',
     });
     setShowForm(true);
     setError('');
@@ -93,7 +100,7 @@ export default function Resources() {
     setSaving(true);
     setError('');
     try {
-      const payload = { ...form, tags, metadata: meta };
+      const payload = { ...form, tags, metadata: meta, infra_id: form.infra_id || null };
       if (editingId) {
         await api.updateResource(editingId, payload);
       } else {
@@ -170,6 +177,13 @@ export default function Resources() {
               <div className="form-group">
                 <label>URL</label>
                 <input value={form.url} onChange={e => setForm({ ...form, url: e.target.value })} placeholder="https://github.com/..." />
+              </div>
+              <div className="form-group">
+                <label>Infrastructure (optional)</label>
+                <select value={form.infra_id} onChange={e => setForm({ ...form, infra_id: e.target.value })}>
+                  <option value="">— none —</option>
+                  {infra.map(i => <option key={i.id} value={i.id}>{i.name} ({i.kind})</option>)}
+                </select>
               </div>
               <div className="form-group">
                 <label>Tags (comma-separated)</label>

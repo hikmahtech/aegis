@@ -198,6 +198,7 @@ async def chat(request: Request, body: dict[str, Any]) -> dict[str, Any]:
         vercel_connector=getattr(request.app.state, "vercel_connector", None),
         background_tasks=getattr(request.app.state, "background_tasks", None),
         user_metadata=user_metadata,
+        tier_override=(body.get("tier") or None),
     )
     if result.get("error"):
         raise HTTPException(status_code=500, detail=result["error"])

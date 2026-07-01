@@ -36,7 +36,10 @@ export async function apiFetch<T>(path: string, options?: RequestInit): Promise<
   });
   if (resp.status === 401) onUnauthorized();
   if (!resp.ok) throw new Error(`API ${resp.status}: ${resp.statusText}`);
-  return resp.json();
+  // 204 / empty body (e.g. DELETE) → resp.json() would throw on empty input.
+  if (resp.status === 204) return undefined as T;
+  const text = await resp.text();
+  return (text ? JSON.parse(text) : undefined) as T;
 }
 
 export const api = {
@@ -45,6 +48,8 @@ export const api = {
 
   // Agents
   listAgents: () => apiFetch<any[]>('/api/agents'),
+  createAgent: (data: { id: string; name: string; role: string; model_tier?: string; capabilities?: string[]; metadata?: any }) =>
+    apiFetch<any>('/api/agents', { method: 'POST', body: JSON.stringify(data) }),
   getAgent: (id: string) => apiFetch<any>(`/api/agents/${id}`),
   getAgentTools: (id: string) => apiFetch<any[]>(`/api/agents/${id}/tools`),
   updateAgent: (id: string, patch: any) =>
@@ -131,8 +136,16 @@ export const api = {
     apiFetch<{ content: any; chunks: any[] }>(`/api/references/${encodeURIComponent(id)}`),
 
   // Chat
-  sendMessage: (agentId: string, message: string) =>
-    apiFetch<any>('/api/chat', { method: 'POST', body: JSON.stringify({ agent_id: agentId, message }) }),
+  sendMessage: (agentId: string, message: string, tier?: string, threadId?: string) =>
+    apiFetch<any>('/api/chat', {
+      method: 'POST',
+      body: JSON.stringify({
+        agent_id: agentId,
+        message,
+        ...(tier ? { tier } : {}),
+        ...(threadId ? { thread_id: threadId } : {}),
+      }),
+    }),
 
   // Chat History
   listThreads: (params?: string) => apiFetch<any[]>(`/api/chat/threads${params ? `?${params}` : ''}`),
@@ -171,6 +184,21 @@ export const api = {
   infraSyncArgocd: (name: string, context = 'acme-prod') =>
     apiFetch<any>(`/api/infra/argocd/apps/${name}/sync?context=${context}`, { method: 'POST' }),
 
+  // Infrastructure registry (dynamic hosts + provisioning)
+  listInfra: () => apiFetch<any[]>('/api/admin/infra'),
+  getInfra: (id: string) => apiFetch<any>(`/api/admin/infra/${id}`),
+  createInfra: (data: any) =>
+    apiFetch<any>('/api/admin/infra', { method: 'POST', body: JSON.stringify(data) }),
+  updateInfra: (id: string, data: any) =>
+    apiFetch<any>(`/api/admin/infra/${id}`, { method: 'PUT', body: JSON.stringify(data) }),
+  deleteInfra: (id: string) =>
+    apiFetch<any>(`/api/admin/infra/${id}`, { method: 'DELETE' }),
+  provisionInfra: (id: string) =>
+    apiFetch<any>(`/api/admin/infra/${id}/provision`, { method: 'POST' }),
+
+  // System monitoring (AEGIS's own stack status)
+  systemStatus: () => apiFetch<any>('/api/admin/system/status'),
+
   // Flows config (scheduled activities) + Google integrations
   listActivities: () => apiFetch<any[]>('/api/admin/activities'),
   updateActivity: (slug: string, patch: { active?: boolean; schedule_cron?: string; config?: any }) =>
@@ -204,6 +232,26 @@ export const api = {
   getGtdRules: () => apiFetch<any>('/api/admin/todoist/gtd-rules'),
   saveGtdRules: (body: any) =>
     apiFetch<any>('/api/admin/todoist/gtd-rules', { method: 'PUT', body: JSON.stringify(body) }),
+  // Workbench: tasks, project picker, and clarify-decision visibility
+  todoistTasks: (params?: { project_id?: string; status?: string; assignee?: string; limit?: number }) => {
+    const q = new URLSearchParams();
+    if (params?.project_id) q.set('project_id', params.project_id);
+    if (params?.status) q.set('status', params.status);
+    if (params?.assignee) q.set('assignee', params.assignee);
+    if (params?.limit) q.set('limit', String(params.limit));
+    const qs = q.toString();
+    return apiFetch<any[]>(`/api/admin/todoist/tasks${qs ? `?${qs}` : ''}`);
+  },
+  todoistProjects: () => apiFetch<any[]>('/api/admin/todoist/projects'),
+  todoistClarifyLog: (params?: { limit?: number; applied?: boolean }) => {
+    const q = new URLSearchParams();
+    if (params?.limit) q.set('limit', String(params.limit));
+    if (params?.applied !== undefined) q.set('applied', String(params.applied));
+    const qs = q.toString();
+    return apiFetch<any[]>(`/api/admin/todoist/clarify-log${qs ? `?${qs}` : ''}`);
+  },
+  todoistReclarify: (taskId: string) =>
+    apiFetch<any>(`/api/admin/todoist/tasks/${encodeURIComponent(taskId)}/reclarify`, { method: 'POST' }),
 
   // Money Hygiene (Maou)
   moneyState: () => apiFetch<any>('/api/admin/money/state'),

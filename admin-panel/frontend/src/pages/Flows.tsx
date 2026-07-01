@@ -107,6 +107,18 @@ export default function Flows() {
   const [gClientSecret, setGClientSecret] = useState('');
   const [gStatus, setGStatus] = useState<any>(null);
   const [savingG, setSavingG] = useState(false);
+  const [newLabel, setNewLabel] = useState('');
+
+  // Kick off Google consent for a brand-new account label. The reauth backend is
+  // label-agnostic and writes config/{label}.json on callback, after which the
+  // account shows up in the list below automatically.
+  function connectAccount() {
+    const label = newLabel.trim().toLowerCase().replace(/[^a-z0-9_-]+/g, '-').replace(/^-+|-+$/g, '');
+    if (!label) return;
+    window.open(`${API_BASE}/api/admin/gmail/reauth/${label}/initiate`, '_blank', 'noopener');
+    setNewLabel('');
+    setMsg(`Opened Google consent for "${label}". After you approve, click Reload to see it.`);
+  }
 
   async function load() {
     try {
@@ -155,7 +167,20 @@ export default function Flows() {
 
       <div className="card" style={{ marginBottom: 16 }}>
         <h3>Google accounts</h3>
-        <p className="page-subtitle">Re-authorize to add scopes (e.g. Drive). Opens Google consent in a new tab.</p>
+        <p className="page-subtitle">Connect a new account or re-authorize an existing one to add scopes (e.g. Drive). Opens Google consent in a new tab.</p>
+        <div className="cfg-row" style={{ marginBottom: 12 }}>
+          <input
+            value={newLabel}
+            onChange={e => setNewLabel(e.target.value)}
+            placeholder="account label (e.g. work, personal)"
+            onKeyDown={e => { if (e.key === 'Enter') connectAccount(); }}
+          />
+          <button className="btn btn-primary" disabled={!newLabel.trim() || !gStatus?.configured} onClick={connectAccount}>Connect account</button>
+          <button className="btn" onClick={load}>Reload</button>
+        </div>
+        {!gStatus?.configured && (
+          <p style={{ fontSize: 12, color: 'var(--text-muted)', marginTop: 0 }}>Configure the Google OAuth app above first.</p>
+        )}
         <div className="table-scroll"><table style={{ width: '100%' }}>
           <thead><tr><th style={{ textAlign: 'left' }}>Account</th><th>Scopes</th><th></th></tr></thead>
           <tbody>

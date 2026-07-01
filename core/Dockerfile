@@ -28,6 +28,10 @@ ENV PATH="/opt/venv/bin:$PATH"
 
 COPY migrations/ migrations/
 COPY personalities/ personalities/
+# Seed data (agents/channels/resources/activities/todoist) — without this the
+# startup seeding silently no-ops (seed_dir_not_found) and the DB ships empty,
+# so Flows/Agents/Resources all render blank. No secrets live here.
+COPY config/seed/ config/seed/
 COPY admin-panel/frontend/dist/ admin-panel/frontend/dist/
 
 RUN useradd --create-home --shell /bin/bash aegis \

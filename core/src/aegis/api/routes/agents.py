@@ -4,9 +4,11 @@ from __future__ import annotations
 
 from typing import Any
 
+import asyncpg
 from fastapi import APIRouter, Depends, HTTPException, Request
 
 from aegis.api.auth import verify_auth
+from aegis.services.agents import create_agent as _create_agent
 from aegis.services.agents import get_agent as _get_agent
 from aegis.services.agents import list_agents as _list_agents
 from aegis.services.agents import update_agent as _update_agent
@@ -18,6 +20,19 @@ router = APIRouter(prefix="/api/agents", dependencies=[Depends(verify_auth)])
 async def list_agents(request: Request, active: bool = True) -> list[dict[str, Any]]:
     """List all agents."""
     return await _list_agents(request.app.state.db_pool, active_only=active)
+
+
+@router.post("", status_code=201)
+async def create_agent(request: Request, body: dict[str, Any]) -> dict[str, Any]:
+    """Create a new agent. Body: {id, name, role, model_tier?, capabilities?, metadata?}."""
+    try:
+        return await _create_agent(request.app.state.db_pool, body)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    except asyncpg.UniqueViolationError as e:
+        raise HTTPException(
+            status_code=409, detail=f"Agent '{body.get('id')}' already exists"
+        ) from e
 
 
 @router.get("/{agent_id}")
@@ -86,13 +101,18 @@ async def draft_persona(agent_id: str, request: Request, body: dict[str, Any]) -
 
 
 @router.get("/{agent_id}/tools")
-async def get_agent_tools(agent_id: str) -> list[dict[str, str]]:
-    """Return the tool set this agent has access to, joined with tool descriptions."""
+async def get_agent_tools(agent_id: str, request: Request) -> list[dict[str, str]]:
+    """Return the tool set this agent has access to, joined with tool descriptions.
+
+    Prefers the agent's DB metadata.tool_set (so UI-created agents work), falling
+    back to the hardcoded AGENT_TOOL_SETS — mirrors chat.py's _get_agent_tools.
+    """
     from aegis.services.chat import AGENT_TOOL_SETS, CHAT_TOOLS
 
-    tool_names = AGENT_TOOL_SETS.get(agent_id)
-    if tool_names is None:
-        raise HTTPException(status_code=404, detail=f"Agent '{agent_id}' has no tool set")
+    agent = await _get_agent(request.app.state.db_pool, agent_id)
+    if agent is None:
+        raise HTTPException(status_code=404, detail=f"Agent '{agent_id}' not found")
+    tool_names = (agent.get("metadata") or {}).get("tool_set") or AGENT_TOOL_SETS.get(agent_id) or []
 
     descriptions: dict[str, str] = {}
     for spec in CHAT_TOOLS:

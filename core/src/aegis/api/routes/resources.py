@@ -21,6 +21,7 @@ class ResourceCreate(BaseModel):
     content: str | None = None
     tags: list[str] = []
     metadata: dict[str, Any] = {}
+    infra_id: UUID | None = None
 
 
 class ResourceUpdate(BaseModel):
@@ -29,6 +30,7 @@ class ResourceUpdate(BaseModel):
     content: str | None = None
     tags: list[str] | None = None
     metadata: dict[str, Any] | None = None
+    infra_id: UUID | None = None
 
 
 @router.get("")
@@ -36,13 +38,13 @@ async def list_resources(request: Request, kind: str | None = None) -> list[dict
     pool = request.app.state.db_pool
     if kind:
         rows = await pool.fetch(
-            "SELECT id, kind, slug, title, url, content, tags, metadata, created_at, updated_at "
+            "SELECT id, kind, slug, title, url, content, tags, metadata, infra_id, created_at, updated_at "
             "FROM resources WHERE kind = $1 ORDER BY kind, title",
             kind,
         )
     else:
         rows = await pool.fetch(
-            "SELECT id, kind, slug, title, url, content, tags, metadata, created_at, updated_at "
+            "SELECT id, kind, slug, title, url, content, tags, metadata, infra_id, created_at, updated_at "
             "FROM resources ORDER BY kind, title"
         )
     return [dict(r) for r in rows]
@@ -52,7 +54,7 @@ async def list_resources(request: Request, kind: str | None = None) -> list[dict
 async def get_resource(request: Request, resource_id: UUID) -> dict:
     pool = request.app.state.db_pool
     row = await pool.fetchrow(
-        "SELECT id, kind, slug, title, url, content, tags, metadata, created_at, updated_at "
+        "SELECT id, kind, slug, title, url, content, tags, metadata, infra_id, created_at, updated_at "
         "FROM resources WHERE id = $1",
         resource_id,
     )
@@ -65,8 +67,9 @@ async def get_resource(request: Request, resource_id: UUID) -> dict:
 async def create_resource(request: Request, body: ResourceCreate) -> dict:
     pool = request.app.state.db_pool
     row = await pool.fetchrow(
-        "INSERT INTO resources (kind, slug, title, url, content, tags, metadata) "
-        "VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id, kind, slug, title, url, content, tags, metadata, created_at, updated_at",
+        "INSERT INTO resources (kind, slug, title, url, content, tags, metadata, infra_id) "
+        "VALUES ($1, $2, $3, $4, $5, $6, $7, $8) "
+        "RETURNING id, kind, slug, title, url, content, tags, metadata, infra_id, created_at, updated_at",
         body.kind,
         body.slug,
         body.title,
@@ -74,6 +77,7 @@ async def create_resource(request: Request, body: ResourceCreate) -> dict:
         body.content,
         body.tags,
         body.metadata,
+        body.infra_id,
     )
     return dict(row)
 
@@ -91,15 +95,17 @@ async def update_resource(request: Request, resource_id: UUID, body: ResourceUpd
         "  content = COALESCE($4, content), "
         "  tags = COALESCE($5, tags), "
         "  metadata = COALESCE($6, metadata), "
+        "  infra_id = COALESCE($7, infra_id), "
         "  updated_at = now() "
         "WHERE id = $1 "
-        "RETURNING id, kind, slug, title, url, content, tags, metadata, created_at, updated_at",
+        "RETURNING id, kind, slug, title, url, content, tags, metadata, infra_id, created_at, updated_at",
         resource_id,
         body.title,
         body.url,
         body.content,
         body.tags,
         body.metadata,
+        body.infra_id,
     )
     return dict(row)
 

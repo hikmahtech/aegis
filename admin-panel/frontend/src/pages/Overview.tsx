@@ -115,7 +115,7 @@ export default function Overview() {
           <h3>Agents ({agents.length})</h3>
           {agents.length === 0 && <p className="empty" style={{ padding: '0.5rem 0' }}>No agents yet.</p>}
           {agents.map(a => (
-            <p key={a.id}><Link to={`/personalities/${a.id}`}><strong>{a.name}</strong></Link> — {a.role}</p>
+            <p key={a.id}><Link to={`/agents/${a.id}`}><strong>{a.name}</strong></Link> — {a.role}</p>
           ))}
         </div>
 

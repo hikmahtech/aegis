@@ -10,11 +10,13 @@ from __future__ import annotations
 
 from typing import Any
 
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 
 from aegis.api.auth import verify_auth
 from aegis.api.deps import get_settings
+from aegis.api.sql_filters import build_where
 from aegis.config import Settings
+from aegis.observability import log_audit
 
 router = APIRouter(
     prefix="/api/admin/todoist",
@@ -114,3 +116,102 @@ async def todoist_state(request: Request) -> dict:
         },
         "managed_projects": managed if isinstance(managed, dict) else None,
     }
+
+
+@router.get("/tasks")
+async def list_tasks(
+    request: Request,
+    project_id: str | None = None,
+    status: str | None = None,
+    assignee: str | None = None,
+    limit: int = Query(100, ge=1, le=500),
+) -> list[dict[str, Any]]:
+    """List Todoist tasks with optional filters — powers the inbox/task list view.
+
+    ``status`` is one of open|completed (maps to is_completed); any other
+    value is ignored (no filter). ``assignee`` filters on assignee_label.
+    """
+    pool = request.app.state.db_pool
+    where, params = build_where({"project_id": project_id, "assignee_label": assignee})
+    if status in ("open", "completed"):
+        conj = "AND" if where else "WHERE"
+        where = f"{where} {conj} is_completed = ${len(params) + 1}"
+        params.append(status == "completed")
+    idx = len(params) + 1
+    params.append(limit)
+    rows = await pool.fetch(
+        "SELECT id, content, description, project_id, due_date, priority, labels, "
+        "is_completed, assignee_label, source_tag, last_clarified_at "
+        f"FROM todoist_tasks{where} ORDER BY updated_at DESC LIMIT ${idx}",
+        *params,
+    )
+    return [dict(r) for r in rows]
+
+
+@router.get("/projects")
+async def list_projects(request: Request) -> list[dict[str, Any]]:
+    """List Todoist projects — powers a project picker (replaces raw project-id inputs)."""
+    pool = request.app.state.db_pool
+    rows = await pool.fetch(
+        "SELECT id, name, parent_id, is_managed, is_archived, order_idx "
+        "FROM todoist_projects ORDER BY order_idx NULLS LAST, name"
+    )
+    return [dict(r) for r in rows]
+
+
+@router.get("/clarify-log")
+async def list_clarify_log(
+    request: Request,
+    limit: int = Query(50, ge=1, le=200),
+    applied: bool | None = None,
+) -> list[dict[str, Any]]:
+    """Recent GTD clarify decisions (most recent first), joined to task content."""
+    pool = request.app.state.db_pool
+    where = " WHERE l.applied = $1" if applied is not None else ""
+    params: list[Any] = [applied] if applied is not None else []
+    idx = len(params) + 1
+    params.append(limit)
+    rows = await pool.fetch(
+        "SELECT l.id, l.todoist_task_id, l.pass, l.source_tag, l.classification, "
+        "l.confidence, l.assignee, l.contexts, l.reason, l.user_hint, l.llm_model, "
+        "l.applied, l.created_at, t.content AS task_content "
+        "FROM gtd_clarify_log l LEFT JOIN todoist_tasks t ON t.id = l.todoist_task_id"
+        f"{where} ORDER BY l.created_at DESC LIMIT ${idx}",
+        *params,
+    )
+    return [dict(r) for r in rows]
+
+
+@router.get("/clarify-log/{log_id}")
+async def get_clarify_log_detail(log_id: int, request: Request) -> dict[str, Any]:
+    """Single clarify decision, all columns, joined to task content."""
+    pool = request.app.state.db_pool
+    row = await pool.fetchrow(
+        "SELECT l.*, t.content AS task_content FROM gtd_clarify_log l "
+        "LEFT JOIN todoist_tasks t ON t.id = l.todoist_task_id WHERE l.id = $1",
+        log_id,
+    )
+    if not row:
+        raise HTTPException(status_code=404, detail="Clarify log entry not found")
+    return dict(row)
+
+
+@router.post("/tasks/{task_id}/reclarify")
+async def reclarify_task(task_id: str, request: Request) -> dict[str, Any]:
+    """Null out last_clarified_at so the next ClarifyFlow run reclassifies this task."""
+    pool = request.app.state.db_pool
+    row = await pool.fetchrow(
+        "UPDATE todoist_tasks SET last_clarified_at = NULL WHERE id = $1 "
+        "RETURNING id, content, last_clarified_at",
+        task_id,
+    )
+    if not row:
+        raise HTTPException(status_code=404, detail="Task not found")
+    await log_audit(
+        pool,
+        actor="api:todoist",
+        action="task_reclarify_requested",
+        target_type="todoist_task",
+        target_id=task_id,
+    )
+    return dict(row)

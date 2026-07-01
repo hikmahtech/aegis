@@ -8,7 +8,7 @@ import Chat from './pages/Chat';
 import Content from './pages/Content';
 import ContentDetail from './pages/ContentDetail';
 import Flows from './pages/Flows';
-import Homelab from './pages/Homelab';
+import SystemMonitoring from './pages/SystemMonitoring';
 import Infra from './pages/Infra';
 import Integrations from './pages/Integrations';
 import InteractionDetail from './pages/InteractionDetail';
@@ -19,8 +19,8 @@ import Market from './pages/Market';
 import Money from './pages/Money';
 import Todoist from './pages/Todoist';
 import Overview from './pages/Overview';
-import PersonalityDetail from './pages/PersonalityDetail';
-import Personalities from './pages/Personalities';
+import AgentDetail from './pages/AgentDetail';
+import Agents from './pages/Agents';
 import References from './pages/References';
 import Resources from './pages/Resources';
 import Settings from './pages/Settings';
@@ -41,8 +41,8 @@ export default function App() {
           <Route path="/models" element={<ModelsProviders />} />
           <Route path="/integrations" element={<Integrations />} />
           <Route path="/resources" element={<Resources />} />
-          <Route path="/personalities" element={<Personalities />} />
-          <Route path="/personalities/:id" element={<PersonalityDetail />} />
+          <Route path="/agents" element={<Agents />} />
+          <Route path="/agents/:id" element={<AgentDetail />} />
           <Route path="/market" element={<Market />} />
           <Route path="/chat" element={<Chat />} />
           <Route path="/knowledge" element={<Knowledge />} />
@@ -52,7 +52,7 @@ export default function App() {
           <Route path="/audit" element={<AuditLog />} />
           <Route path="/settings" element={<Settings />} />
           <Route path="/infra" element={<Infra />} />
-          <Route path="/admin/homelab" element={<Homelab />} />
+          <Route path="/system" element={<SystemMonitoring />} />
           <Route path="/admin/money" element={<Money />} />
           <Route path="/admin/todoist" element={<Todoist />} />
         </Route>

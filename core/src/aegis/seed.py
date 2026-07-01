@@ -133,16 +133,10 @@ async def _load_agents(pool: asyncpg.Pool, path: Path) -> None:
                 operating_notes,
                 user_context,
             )
-        # Deactivate agents no longer in the YAML (FK constraints prevent deletion).
-        yaml_ids = [r["id"] for r in rows]
-        status = await conn.execute(
-            "UPDATE agents SET active=FALSE WHERE id <> ALL($1::text[]) AND active=TRUE",
-            yaml_ids,
-        )
-        # status is "UPDATE N"
-        n = int(status.split()[-1]) if status else 0
-        if n:
-            logger.info("seeds_deactivated_orphans", kind="agents", count=n)
+        # NOTE: agents present in the DB but not in the YAML are left untouched —
+        # they are created from the admin UI (POST /api/agents) and own their own
+        # `active` state via PATCH. (Previously such rows were force-deactivated on
+        # every startup, which silently killed any UI-created agent.)
     logger.info("seeds_loaded", kind="agents", count=len(rows))
 
 

@@ -101,13 +101,25 @@ async def put_google_oauth(
 
 @router.get("/google")
 async def google_accounts(settings: Settings = Depends(get_settings)) -> list[dict[str, Any]]:
-    """Configured Google accounts + each token's scope status."""
+    """Configured Google accounts + each token's scope status.
+
+    Labels come from the AEGIS_GMAIL_ACCOUNTS env var AND from any {label}.json
+    token file already present in the token dir — so an account connected from
+    the admin UI (which writes a fresh token file) shows up immediately without
+    an env edit + restart.
+    """
     out: list[dict[str, Any]] = []
-    accounts = [a for a in (settings.gmail_accounts or "").split(",") if a.strip()]
     token_dir = Path(settings.gmail_token_dir)
-    for entry in accounts:
+    # label -> email (env accounts carry an email; disk-discovered ones don't)
+    labels: dict[str, str] = {}
+    for entry in (a for a in (settings.gmail_accounts or "").split(",") if a.strip()):
         label, _, email = entry.partition(":")
-        label = label.strip()
+        if label.strip():
+            labels.setdefault(label.strip(), email.strip())
+    if token_dir.exists():
+        for tp in sorted(token_dir.glob("*.json")):
+            labels.setdefault(tp.stem, "")
+    for label, email in labels.items():
         tp = token_dir / f"{label}.json"
         info: dict[str, Any] = {
             "label": label,

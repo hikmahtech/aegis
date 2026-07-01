@@ -196,6 +196,7 @@ def create_app(run_lifespan: bool = True) -> FastAPI:
         health,
         homelab,
         infra,
+        infra_admin,
         integrations,
         interactions,
         knowledge,
@@ -208,6 +209,7 @@ def create_app(run_lifespan: bool = True) -> FastAPI:
         references,
         resources,
         settings,
+        system_status,
         temporal,
         todoist,
         webhooks,
@@ -255,6 +257,8 @@ def create_app(run_lifespan: bool = True) -> FastAPI:
     app.include_router(homelab.router)
     app.include_router(money.router)
     app.include_router(infra.router)
+    app.include_router(infra_admin.router)
+    app.include_router(system_status.router)
     app.include_router(resources.router)
     app.include_router(todoist.router)
 

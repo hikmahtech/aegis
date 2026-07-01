@@ -171,7 +171,7 @@ function HistoryTab() {
       <ErrorBanner error={error} onDismiss={() => setError(null)} />
       <div className="filter-bar">
         <select value={agentFilter} onChange={e => setAgentFilter(e.target.value)}>
-          <option value="">All personalities</option>
+          <option value="">All agents</option>
           {agents.map(a => <option key={a.id} value={a.id}>{a.name}</option>)}
         </select>
         <input

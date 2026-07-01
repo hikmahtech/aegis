@@ -28,7 +28,7 @@ const NAV: { section: string; items: { path: string; label: string }[] }[] = [
   {
     section: 'Configure',
     items: [
-      { path: '/personalities', label: 'Personalities' },
+      { path: '/agents', label: 'Agents' },
       { path: '/flows', label: 'Flows' },
       { path: '/models', label: 'Models' },
       { path: '/integrations', label: 'Integrations' },
@@ -39,7 +39,7 @@ const NAV: { section: string; items: { path: string; label: string }[] }[] = [
     section: 'System',
     items: [
       { path: '/infra', label: 'Infrastructure' },
-      { path: '/admin/homelab', label: 'Homelab' },
+      { path: '/system', label: 'System monitoring' },
       { path: '/admin/todoist', label: 'Todoist' },
       { path: '/audit', label: 'Audit' },
       { path: '/settings', label: 'Settings' },

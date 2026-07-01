@@ -3485,6 +3485,7 @@ async def send_message(
     vercel_connector: Any = None,
     background_tasks: set[asyncio.Task] | None = None,
     user_metadata: dict | None = None,
+    tier_override: str | None = None,
 ) -> dict[str, Any]:
     """Send a message to an agent with tool calling support.
 
@@ -3555,8 +3556,20 @@ async def send_message(
 
     # Config
     # Resolve per-agent model via `agents.model_tier` → config/models.yaml.
-    # Falls back to 'balanced' tier for unknown agents.
-    model = await resolve_model_for_agent(pool, agent_id) if pool else "qwen3:14b"
+    # Falls back to 'balanced' tier for unknown agents. A per-message
+    # `tier_override` (fast/balanced/smart) from the chat UI wins when valid;
+    # an unknown tier is ignored and we fall back to the agent's default.
+    model = None
+    if tier_override:
+        try:
+            from aegis.llm.tier import tier_to_model
+
+            model = tier_to_model(tier_override)
+        except KeyError:
+            logger.warning("chat_tier_override_unknown", tier=tier_override)
+            model = None
+    if model is None:
+        model = await resolve_model_for_agent(pool, agent_id) if pool else "qwen3:14b"
     tools_enabled = getattr(settings, "tool_calling_enabled", True) if settings else True
     max_iter = getattr(settings, "tool_max_iterations", 5) if settings else 5
     max_bytes = getattr(settings, "tool_result_max_bytes", 4096) if settings else 4096

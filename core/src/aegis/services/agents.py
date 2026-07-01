@@ -23,6 +23,41 @@ async def get_agent(pool: asyncpg.Pool, agent_id: str) -> dict[str, Any] | None:
     return dict(row) if row else None
 
 
+async def create_agent(pool: asyncpg.Pool, data: dict[str, Any]) -> dict[str, Any]:
+    """Insert a new agent. Requires id, name, role; sensible defaults for the rest.
+
+    system_prompt_path is vestigial (persona is DB-first via soul/operating_notes/
+    user_context) but NOT NULL, so it defaults to ''. Raises asyncpg.UniqueViolationError
+    if the id already exists — the route maps that to 409.
+    """
+    agent_id = (data.get("id") or "").strip()
+    name = (data.get("name") or "").strip()
+    role = (data.get("role") or "").strip()
+    if not agent_id or not name or not role:
+        raise ValueError("id, name and role are required")
+
+    row = await pool.fetchrow(
+        """
+        INSERT INTO agents (
+            id, name, role, system_prompt_path, capabilities, model_tier,
+            metadata, soul, operating_notes, user_context, active
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, TRUE)
+        RETURNING *
+        """,
+        agent_id,
+        name,
+        role,
+        data.get("system_prompt_path", ""),
+        data.get("capabilities", []),
+        data.get("model_tier", "balanced"),
+        data.get("metadata", {}),
+        data.get("soul"),
+        data.get("operating_notes"),
+        data.get("user_context"),
+    )
+    return dict(row)
+
+
 async def update_agent(
     pool: asyncpg.Pool, agent_id: str, updates: dict[str, Any]
 ) -> dict[str, Any] | None:
@@ -30,12 +65,11 @@ async def update_agent(
     allowed = {
         "name",
         "role",
-        "description",
         "system_prompt_path",
-        "avatar_url",
         "capabilities",
         "active",
         "model_tier",
+        "metadata",
         "soul",
         "operating_notes",
         "user_context",

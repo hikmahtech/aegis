@@ -3,7 +3,7 @@ import { Link, useParams } from 'react-router-dom';
 import { api } from '../api/client';
 import ErrorBanner from '../components/ErrorBanner';
 
-export default function PersonalityDetail() {
+export default function AgentDetail() {
   const { id = '' } = useParams();
   const [agent, setAgent] = useState<any>(null);
   const [tools, setTools] = useState<any[]>([]);
@@ -84,11 +84,11 @@ export default function PersonalityDetail() {
   }
 
   if (loading) return <div className="loading">Loading personality…</div>;
-  if (!agent) return <p>Personality not found.</p>;
+  if (!agent) return <p>Agent not found.</p>;
 
   return (
     <div>
-      <Link to="/personalities" className="back-link">&larr; All personalities</Link>
+      <Link to="/agents" className="back-link">&larr; All agents</Link>
       <h1 className="page-title">{agent.name}</h1>
       <p className="page-subtitle">{agent.role} — {agent.description}</p>
       <ErrorBanner error={error} onDismiss={() => setError(null)} />
