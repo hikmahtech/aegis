@@ -1,0 +1,3 @@
+# OtelCollectorRefusingSpans
+
+TODO: fill in

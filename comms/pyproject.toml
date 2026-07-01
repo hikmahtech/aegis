@@ -1,0 +1,44 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "aegis-comms"
+version = "2.0.0"
+description = "AEGIS comms — channel-adapter bot + delivery server"
+requires-python = ">=3.12"
+license = {text = "MIT"}
+authors = [{name = "the owner Ansari"}]
+dependencies = [
+    "httpx>=0.28.0",
+    "pdfminer.six>=20231228",
+    "pydantic>=2.10.0",
+    "pydantic-settings>=2.6.0",
+    "structlog>=24.4.0",
+    "uvicorn[standard]>=0.32.0",
+    "fastapi>=0.115.0",
+    "opentelemetry-distro",
+    "opentelemetry-exporter-otlp-proto-http",
+    "opentelemetry-instrumentation-asyncpg",
+    "opentelemetry-instrumentation-redis",
+    "opentelemetry-instrumentation-httpx",
+    "opentelemetry-instrumentation-requests",
+    "opentelemetry-instrumentation-fastapi",
+    "slack-bolt>=1.21",
+    "slack-sdk>=3.33",
+    # slack-sdk's AsyncWebClient + slack-bolt's Socket Mode handler need aiohttp.
+    # It used to arrive transitively via aiogram; PR #329 removed aiogram, so it
+    # must be declared directly or the comms image crashes at boot (no aiohttp).
+    "aiohttp>=3.10",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24",
+    "pytest-cov>=6.0.0",
+    "ruff>=0.8",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/aegis_comms"]

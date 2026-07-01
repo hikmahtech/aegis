@@ -1,0 +1,42 @@
+display_information:
+  name: AEGIS
+  description: AEGIS personal AI orchestration (sebas, raphael, maou, pandora)
+  background_color: "#1a1a2e"
+features:
+  bot_user:
+    display_name: AEGIS
+    always_online: true
+  slash_commands:
+    - command: /capture
+      description: Capture a thought to your GTD inbox
+      usage_hint: "[text]"
+      should_escape: false
+    - command: /status
+      description: Show AEGIS system status
+oauth_config:
+  scopes:
+    bot:
+      - chat:write
+      - chat:write.customize
+      - files:write
+      - channels:read
+      - channels:history
+      - channels:manage
+      - groups:read
+      - app_mentions:read
+      - commands
+      - im:history
+      - im:read
+      - users:read
+settings:
+  event_subscriptions:
+    bot_events:
+      - message.channels
+      - message.im
+      - app_mention
+      - file_shared
+  interactivity:
+    is_enabled: true
+  socket_mode_enabled: true
+  org_deploy_enabled: false
+  token_rotation_enabled: false

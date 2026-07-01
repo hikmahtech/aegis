@@ -1,0 +1,25 @@
+name: ci-grep-guard
+on:
+  pull_request:
+  push:
+    branches: [main, rewrite/v3]
+
+jobs:
+  no-n8n-residuals:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Fail if n8n residuals present
+        run: |
+          set -e
+          if [ -d n8n ]; then echo "n8n/ directory must be deleted"; exit 1; fi
+          if [ -f n8n-sync.sh ]; then echo "n8n-sync.sh must be deleted"; exit 1; fi
+          if [ -f core/src/aegis/api/routes/ingest.py ]; then echo "ingest.py must be deleted"; exit 1; fi
+          if [ -f core/src/aegis/api/routes/n8n.py ]; then echo "n8n.py route must be deleted"; exit 1; fi
+          if grep -rn "AEGIS_N8N_" core/src worker/src comms/src 2>/dev/null | grep -v "HOMELAB_N8N_"; then
+            echo "Found AEGIS_N8N_ references (must be deleted)"; exit 1
+          fi
+          if grep -rn "N8N_WEBHOOK_MAP\|_exec_trigger_data_refresh\|_exec_subscribe_feed" core/src worker/src comms/src 2>/dev/null; then
+            echo "Found deleted chat-tool references"; exit 1
+          fi
+          echo "n8n residuals grep clean"

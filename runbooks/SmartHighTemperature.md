@@ -1,0 +1,3 @@
+# SmartHighTemperature
+
+TODO: fill in

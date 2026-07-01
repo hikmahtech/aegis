@@ -1,0 +1,78 @@
+# First-run bootstrap definitions for Todoist Pro account.
+# Used ONLY when the projection has no managed projects AND the settings
+# row 'todoist_managed_project_ids' does not exist AND the Todoist account
+# is empty. See bootstrap_if_empty activity for the safety check.
+
+# 'inbox' is intentionally absent from this list: AEGIS adopts Todoist's
+# built-in Inbox (the project Todoist returns with inbox_project=true) so
+# we don't duplicate Todoist's special-status default. The remaining two
+# managed projects are created at bootstrap.
+managed_projects:
+  - key: next
+    name: "Next"
+  - key: someday
+    name: "Someday / Later"
+
+# Labels: assignee labels are mutually exclusive (per spec §2 invariant 3);
+# context labels can compose freely on a single task. State labels
+# (@waiting, @reference) are mutually exclusive in practice but unenforced —
+# the clarify worker and chat tools are the single writers. "Someday" is no
+# longer a label — it is the "Someday / Later" project (single source of
+# truth); work-streams are project/<name> labels created on demand.
+labels:
+  assignees:
+    - name: "@me"
+    - name: "@sebas"
+    - name: "@raphael"
+    - name: "@maou"
+    - name: "@pandora"
+  gtd_state:
+    - name: "@waiting"
+    - name: "@reference"
+  contexts:
+    - name: "@5min"
+    - name: "@deep"
+    - name: "@email"
+    - name: "@phone"
+    - name: "@code"
+    - name: "@errand"
+    - name: "@home"
+    - name: "@office"
+    - name: "@reading"
+  areas:
+    - name: "@area/acme"
+    - name: "@area/business"
+    - name: "@area/aegis"
+    - name: "@area/finance"
+    - name: "@area/family"
+    - name: "@area/admin"
+
+# Pre-seeded Todoist filters (visible in the user's filter sidebar).
+# Queries use Todoist's filter syntax. Label refs in filter queries need
+# `@@<name>` because our label NAMES include a literal leading `@` —
+# `@<name>` is the filter-language operator for "tasks with label
+# <name>", and our label is called `@waiting` (not `waiting`), so the
+# query is `@@waiting`. Same for every other label.
+filters:
+  - name: "📥 To clarify"
+    query: "#Inbox & no labels"
+  - name: "🎯 Today (mine)"
+    query: "today & @@me"
+  - name: "🎯 Next actions @me"
+    query: "@@me & !@@waiting & !@@reference & !#Inbox"
+  - name: "⏱️ Scheduled"
+    query: "(!@@reference) & (today | overdue | due before: +90 days)"
+  - name: "⏳ Waiting For"
+    query: "@@waiting"
+  - name: "🔖 Reference"
+    query: "@@reference"
+  - name: "🤖 Sebas"
+    query: "@@sebas"
+  - name: "🤖 Raphael"
+    query: "@@raphael"
+  - name: "🤖 Maou"
+    query: "@@maou"
+  - name: "🤖 Pandora"
+    query: "@@pandora"
+  - name: "⏳ Waiting on me to chase"
+    query: "@@waiting & today"

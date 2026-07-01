@@ -1,0 +1,39 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "aegis-worker"
+version = "2.0.0"
+description = "AEGIS v2 Worker — Temporal flows and activities"
+requires-python = ">=3.12"
+license = {text = "MIT"}
+authors = [{name = "the owner Ansari"}]
+dependencies = [
+    "aegis-core",
+    "temporalio>=1.7.0",
+    "httpx>=0.28.0",
+    "pydantic>=2.10.0",
+    "pydantic-settings>=2.6.0",
+    "structlog>=24.4.0",
+    "youtube-transcript-api>=1.0.0",
+    "google-api-python-client>=2.100.0",
+    "google-auth>=2.23.0",
+    "google-auth-oauthlib>=1.1.0",
+    "feedparser>=6.0.10",
+    "opentelemetry-distro",
+    "opentelemetry-exporter-otlp-proto-http",
+    "opentelemetry-instrumentation-asyncpg",
+    "opentelemetry-instrumentation-redis",
+    "opentelemetry-instrumentation-httpx",
+    "opentelemetry-instrumentation-requests",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24",
+    "pytest-cov>=6.0.0",
+    "respx>=0.22",
+    "ruff>=0.8",
+]

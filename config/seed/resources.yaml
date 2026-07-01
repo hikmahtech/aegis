@@ -1,0 +1,40 @@
+# v3 resources seed. Loader upserts by slug.
+# kind ∈ {connector, runbook, endpoint, mcp_server} — no 'credential' (spec §8).
+
+resources:
+  # Knowledge is now a native pgvector subsystem in AEGIS's own Postgres, not an
+  # external connector — no resource row.
+  - kind: connector
+    slug: clickhouse-trading
+    title: ClickHouse — Trading System
+    url: clickhouse://clickhouse:8123/trading_system
+    tags: [trading, market, maou]
+    metadata:
+      env_keys: [AEGIS_CLICKHOUSE_HOST, AEGIS_CLICKHOUSE_PORT, AEGIS_CLICKHOUSE_USER, AEGIS_CLICKHOUSE_PASSWORD]
+
+  - kind: runbook
+    slug: homelab-service-restart
+    title: How to restart a homelab service safely
+    content: |
+      1. Check replicas: `docker --context swarm service ls --filter name=<svc>`
+      2. If 0/1, force update: `docker --context swarm service update --force <svc>`
+      3. If 1/1 but unhealthy, inspect logs: `docker --context swarm service logs --tail 100 <svc>`
+      4. Escalate via InteractionFlow if root cause unclear after 5 minutes.
+    tags: [homelab, restart, pandoras-actor]
+
+  - kind: mcp_server
+    slug: example-mcp
+    title: Example MCP server (placeholder — replace with real one before Phase 5)
+    metadata:
+      transport: stdio
+      command: /usr/local/bin/example-mcp
+      args: []
+      env_keys: []
+    tags: [mcp, placeholder]
+
+  # Code repositories (kind: repository) are NOT seeded here — they are owned
+  # end-to-end by WorkspaceRepoSyncFlow, which scans the canonical workspace
+  # host's ~/Workspace hierarchy daily: a repo is a resource iff it is checked
+  # out there, with metadata.path carrying the workspace-relative path (e.g.
+  # "acme/bcp"). Alerts for unknown GitHub repos still auto-register a
+  # PATHLESS row on first sight (resolve_alert_resource).

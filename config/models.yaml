@@ -1,0 +1,15 @@
+# v3 LLM tier → Ollama model mapping. Read by the chat pipeline and by every
+# flow that calls LiteLLM. Model tags must exist on the homelab Ollama library
+# before deploy — Phase 1 checklist: `curl http://ollama:11434/api/tags | jq`.
+
+tiers:
+  fast:     "gemma4:e2b"              # quick chat, tight-loop classification
+  balanced: "gpt-oss:20b"             # default chat + most flows (qwen3:14b retired)
+  smart:    "claude-sonnet"           # LiteLLM proxy alias (maps to openai/claude-sonnet-4)
+
+litellm:
+  # base_url is set by env: AEGIS_LITELLM_URL
+  # Prefer http://litellm:4000 inside the swarm network; fall back to
+  # https://litellm.example.com/v1 if the internal address isn't reachable.
+  keep_alive: "10m"                   # keep KV cache warm between calls
+  request_timeout: 120                # seconds; long-context can take 60-90s

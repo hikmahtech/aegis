@@ -1,0 +1,33 @@
+# SearXNG settings for AEGIS
+# Docs: https://docs.searxng.org/admin/settings/settings.html
+
+use_default_settings: true
+
+general:
+  instance_name: "aegis-search"
+
+search:
+  safe_search: 0
+  default_lang: "en"
+  formats:
+    - html
+    - json
+
+server:
+  secret_key: "aegis-searxng-dev-key"
+  limiter: false
+  image_proxy: false
+
+engines:
+  # Avoid Google (actively blocks SearXNG instances)
+  - name: google
+    disabled: true
+  # Reliable engines that don't aggressively rate-limit
+  - name: duckduckgo
+    disabled: false
+  - name: brave
+    disabled: false
+  - name: wikipedia
+    disabled: false
+  - name: bing
+    disabled: false

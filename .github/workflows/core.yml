@@ -1,0 +1,131 @@
+name: "Core — Test, Build & Deploy"
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "core/**"
+      - "admin-panel/frontend/src/**"
+      - "tests/core/**"
+      - "migrations/**"
+      - "personalities/**"
+      - "pyproject.toml"
+      - ".github/workflows/core.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "core/**"
+      - "admin-panel/frontend/src/**"
+      - "tests/core/**"
+      - "migrations/**"
+      - "personalities/**"
+      - "pyproject.toml"
+      - ".github/workflows/core.yml"
+
+env:
+  DOCKER_HUB_USERNAME: ${{ vars.DOCKERHUB_USERNAME }}
+  IMAGE: ${{ vars.DOCKERHUB_USERNAME }}/aegis-core
+
+jobs:
+  test:
+    name: Lint & Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: core/pyproject.toml
+
+      - name: Install packages
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e "core[dev]"
+
+      - name: Lint
+        run: ruff check core/src/ tests/core/
+
+      - name: Test
+        run: pytest tests/core/ -v --tb=short --cov=core/src/aegis --cov-report=term-missing --cov-report=xml
+
+  build:
+    name: Build & Push
+    needs: [test]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && vars.DEPLOY_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Build admin panel
+        env:
+          VITE_API_USER: ${{ secrets.AEGIS_ADMIN_USERNAME }}
+          VITE_API_PASS: ${{ secrets.AEGIS_ADMIN_PASSWORD }}
+        run: |
+          if [ -z "$VITE_API_USER" ] || [ -z "$VITE_API_PASS" ]; then
+            echo "::error::AEGIS_ADMIN_USERNAME / AEGIS_ADMIN_PASSWORD secrets must be set"
+            exit 1
+          fi
+          cd admin-panel/frontend
+          npm ci
+          npm run build
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          username: ${{ env.DOCKER_HUB_USERNAME }}
+          password: ${{ secrets.DOCKER_HUB_TOKEN }}
+
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=raw,value=latest
+            type=sha,prefix=
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: core/Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=core
+          cache-to: type=gha,mode=max,scope=core
+
+  deploy:
+    name: Deploy to Swarm
+    needs: [build]
+    runs-on: [self-hosted, swarm, linux, x64]
+    if: github.ref == 'refs/heads/main' && vars.DEPLOY_ENABLED == 'true'
+    steps:
+      - name: Update aegis_core service
+        env:
+          IMAGE_TAG: ${{ github.sha }}
+          SWARM_MANAGER_HOST: ${{ secrets.SWARM_MANAGER_HOST }}
+          SWARM_MANAGER_USER: ${{ secrets.SWARM_MANAGER_USER }}
+          SSH_PRIVATE_KEY: ${{ secrets.SWARM_SSH_PRIVATE_KEY }}
+        run: |
+          SHORT_SHA="${IMAGE_TAG:0:7}"
+          mkdir -p ~/.ssh
+          echo "$SSH_PRIVATE_KEY" > ~/.ssh/swarm_key
+          chmod 600 ~/.ssh/swarm_key
+          ssh-keyscan -H "$SWARM_MANAGER_HOST" >> ~/.ssh/known_hosts 2>/dev/null || true
+
+          echo "Deploying aegis_core:${SHORT_SHA}..."
+          ssh -i ~/.ssh/swarm_key -o StrictHostKeyChecking=no \
+            "${SWARM_MANAGER_USER}@${SWARM_MANAGER_HOST}" \
+            "docker pull ${{ vars.DOCKERHUB_USERNAME }}/aegis-core:${SHORT_SHA} && \
+             docker service update --with-registry-auth \
+              --image ${{ vars.DOCKERHUB_USERNAME }}/aegis-core:${SHORT_SHA} \
+              --env-add GIT_SHA=${SHORT_SHA} \
+              --force aegis_core"
+
+          rm -f ~/.ssh/swarm_key

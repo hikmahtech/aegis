@@ -1,0 +1,51 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+dist/
+
+# Node
+node_modules/
+admin-panel/frontend/dist/
+
+# IDE
+.vscode/
+.idea/
+
+# Environment
+config/.env
+.env
+.env.*
+
+# OS
+.DS_Store
+
+# Claude Code
+.claude/
+.claire/
+
+# Worktrees
+.worktrees/
+
+# Playwright MCP session artifacts
+.playwright-mcp/
+
+# Pytest
+.pytest_cache/
+
+# uv
+uv.lock
+
+config/credentials/*.json
+config/credentials/server_ssh_key
+config/tokens/*.json
+.env.jarvis
+seed_data/
+.env.claude
+
+# scripts/migrate_to_todoist.py operational artifacts (per-machine state).
+# These hold the source-id → todoist-id mapping for the one-shot migration
+# and a JSONL audit log of every write; both are local-only.
+scripts/.migration-state.json
+scripts/migration-audit.jsonl

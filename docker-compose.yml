@@ -1,0 +1,164 @@
+# AEGIS v2 — Full Stack
+# Dev infra:  docker compose up -d postgres redis temporal temporal-ui
+# Full stack: docker compose up -d
+
+services:
+  # ─── AEGIS Services ─────────────────────────────────
+  core:
+    build:
+      context: .
+      dockerfile: core/Dockerfile
+    container_name: aegis-core
+    env_file: config/.env
+    environment:
+      AEGIS_DATABASE_URL: postgresql://aegis:${POSTGRES_PASSWORD:-aegis_dev}@postgres:5432/aegis
+      AEGIS_TEMPORAL_HOST: temporal:7233
+      # Default channel = web (human-in-the-loop cards land in the admin inbox).
+      # Set AEGIS_CHANNEL=slack + `docker compose --profile slack up` for Slack.
+      AEGIS_CHANNEL: ${AEGIS_CHANNEL:-web}
+      AEGIS_TELEGRAM_SERVICE_URL: http://comms:8081
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    depends_on:
+      postgres: { condition: service_healthy }
+    networks: [aegis-net]
+
+  worker:
+    build:
+      context: .
+      dockerfile: worker/Dockerfile
+    container_name: aegis-worker
+    env_file: config/.env
+    environment:
+      AEGIS_DATABASE_URL: postgresql://aegis:${POSTGRES_PASSWORD:-aegis_dev}@postgres:5432/aegis
+      AEGIS_TEMPORAL_HOST: temporal:7233
+      AEGIS_CHANNEL: ${AEGIS_CHANNEL:-web}
+      AEGIS_TELEGRAM_SERVICE_URL: http://comms:8081
+    depends_on:
+      core: { condition: service_healthy }
+      temporal: { condition: service_healthy }
+    networks: [aegis-net]
+
+  comms:
+    # Optional — only needed for Slack. Start with `docker compose --profile slack up`.
+    profiles: ["slack"]
+    build:
+      context: .
+      dockerfile: comms/Dockerfile
+    container_name: aegis-comms
+    env_file: config/.env
+    environment:
+      AEGIS_CORE_URL: http://core:8080
+      # Channel adapter: slack (prod) | telegram. Driven by AEGIS_CHANNEL +
+      # AEGIS_SLACK_* / AEGIS_TELEGRAM_* tokens in config/.env.
+    ports:
+      - "8081:8081"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8081/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    depends_on:
+      core: { condition: service_healthy }
+    networks: [aegis-net]
+
+  # Optional local LLM. Start with `docker compose --profile local-llm up`,
+  # then `docker exec aegis-ollama ollama pull <model>` and point the admin
+  # "Models & Providers" page at http://ollama:11434/v1. Omit to use a hosted
+  # provider (Claude/OpenAI/OpenRouter) configured in the UI instead.
+  ollama:
+    profiles: ["local-llm"]
+    image: ollama/ollama:latest
+    container_name: aegis-ollama
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama-data:/root/.ollama
+    networks: [aegis-net]
+
+  # ─── Infrastructure ─────────────────────────────────
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: aegis-postgres
+    environment:
+      POSTGRES_DB: aegis
+      POSTGRES_USER: aegis
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-aegis_dev}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./deploy/init-extra-dbs.sh:/docker-entrypoint-initdb.d/init-extra-dbs.sh:ro
+    ports:
+      - "25432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U aegis -d aegis"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    networks: [aegis-net]
+
+  redis:
+    image: redis:7-alpine
+    container_name: aegis-redis
+    command: redis-server --appendonly yes
+    volumes:
+      - redis-data:/data
+    ports:
+      - "26379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    networks: [aegis-net]
+
+  temporal:
+    image: temporalio/auto-setup:latest
+    container_name: aegis-temporal
+    environment:
+      DB: postgres12
+      DB_PORT: 5432
+      POSTGRES_USER: aegis
+      POSTGRES_PWD: ${POSTGRES_PASSWORD:-aegis_dev}
+      POSTGRES_SEEDS: postgres
+      DYNAMIC_CONFIG_FILE_PATH: /etc/temporal/config/dynamicconfig.yaml
+    volumes:
+      - ./deploy/temporal-dynamic-config.yaml:/etc/temporal/config/dynamicconfig.yaml:ro
+    ports:
+      - "7233:7233"
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "temporal operator cluster health --address $$(hostname -i):7233",
+        ]
+      interval: 15s
+      timeout: 10s
+      retries: 20
+      start_period: 60s
+    depends_on:
+      postgres: { condition: service_healthy }
+    networks: [aegis-net]
+
+  temporal-ui:
+    image: temporalio/ui:latest
+    container_name: aegis-temporal-ui
+    environment:
+      TEMPORAL_ADDRESS: temporal:7233
+    ports:
+      - "8233:8080"
+    depends_on: [temporal]
+    networks: [aegis-net]
+
+volumes:
+  postgres-data:
+  redis-data:
+  ollama-data:
+
+networks:
+  aegis-net:
+    driver: bridge

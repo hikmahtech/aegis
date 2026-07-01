@@ -1,0 +1,259 @@
+# v3 activities seed. Loader upserts by slug.
+
+activities:
+  # Sebas — email & calendar ingestion
+  - slug: gmail-ingest-hourly
+    workflow_type: GmailIngestFlow
+    agent_id: sebas
+    schedule_cron: "0 * * * *"
+    config: {}
+    active: true
+
+  - slug: calendar-ingest-daily
+    workflow_type: CalendarIngestFlow
+    agent_id: sebas
+    schedule_cron: "0 6 * * *"
+    config:
+      horizon_days: 30
+    active: true
+
+  # GTD layer — Phase 1 (Todoist sync only)
+  - slug: todoist-sync-5min
+    workflow_type: TodoistSyncFlow
+    agent_id: sebas
+    schedule_cron: "*/5 * * * *"
+    config: {}
+    active: true
+
+  # GTD layer — Phase 3 (Clarify)
+  - slug: gtd-clarify-15min
+    workflow_type: ClarifyFlow
+    agent_id: sebas
+    schedule_cron: "*/15 * * * *"
+    config:
+      max_items: 20
+    active: true
+
+  # GTD layer — Phase 5 (Reviews). Crons in UTC; IST = UTC+5:30.
+  #   daily : 02:30 UTC = 08:00 IST every day
+  #   weekly: 03:30 UTC Sunday = 09:00 IST Sunday
+  - slug: gtd-daily-review
+    workflow_type: DailyReviewFlow
+    agent_id: sebas
+    schedule_cron: "30 2 * * *"
+    config: {}
+    active: true
+
+  - slug: gtd-weekly-review
+    workflow_type: WeeklyReviewFlow
+    agent_id: sebas
+    schedule_cron: "30 3 * * 0"
+    config: {}
+    active: true
+
+  # Maou — weekly receipt safety-net. Per-message money hygiene is owned by
+  # GmailIngestFlow's tag-based fan-out (financial/payments → MoneyProcessFlow).
+  # This run only catches anything the hourly triage missed. The receipt-shaped
+  # sender filter is hardcoded in the flow; only the time window is configurable.
+  - slug: receipt-ingest-weekly
+    workflow_type: ReceiptIngestFlow
+    agent_id: maou
+    schedule_cron: "0 5 * * 0"
+    config:
+      query_window: "newer_than:14d"
+    active: true
+
+  # Daily recurring-charge sweep (merged cancellation-scan + renewal-radar:
+  # both ran daily off the same recurring_charge table). 09:00 UTC = 14:30 IST.
+  - slug: money-hygiene-daily
+    workflow_type: MoneyHygieneDailyFlow
+    agent_id: maou
+    schedule_cron: "0 9 * * *"
+    config:
+      threshold_multiplier: 2.0
+      thresholds_days: [30, 14, 7, 0]
+    active: true
+
+  - slug: subscription-audit-monthly
+    workflow_type: SubscriptionAuditFlow
+    agent_id: maou
+    schedule_cron: "0 10 1 * *"
+    config: {}
+    active: true
+
+  # Raphael — daily briefing (carries the "References filed" digest for
+  # #research / #email reference closure per the references-as-knowledge
+  # spec; per-message Telegrams only fire for user-initiated #chat / #manual
+  # sources, so this digest is the only signal the user gets for automated
+  # ingest closure). Cron 04:30 UTC = 10:00 IST.
+  - slug: daily-briefing-raphael
+    workflow_type: DailyBriefingFlow
+    agent_id: raphael
+    schedule_cron: "30 4 * * *"
+    config: {}
+    active: true
+
+  # Raphael — knowledge ingestion (raindrop + rss + intel scans)
+  - slug: raindrop-ingest-2h
+    workflow_type: RaindropIngestFlow
+    agent_id: raphael
+    schedule_cron: "0 */2 * * *"
+    config: {}
+    active: true
+
+  - slug: rss-ingest-hourly
+    workflow_type: RssIngestFlow
+    agent_id: raphael
+    schedule_cron: "30 * * * *"
+    config: {}
+    active: true
+
+  # Watches ONE designated Google Drive folder, incrementally ingesting new/
+  # changed docs (skip-unchanged by Drive modifiedTime). folder_id is empty by
+  # default → the flow no-ops until a folder is designated. account = the gmail
+  # OAuth label whose token (with drive.readonly) to use.
+  - slug: drive-sync-raphael
+    workflow_type: DriveSyncFlow
+    agent_id: raphael
+    schedule_cron: "15 */4 * * *"
+    config: {account: "primary", folder_id: "", recurse: true, source_type: "drive"}
+    active: true
+
+  # Phase 4 — nightly per-agent memory consolidation (caps each agent's
+  # agent_memory at `keep` rows; the learning loop writes corrections live).
+  - slug: memory-reflection-nightly
+    workflow_type: MemoryReflectionFlow
+    agent_id: sebas
+    schedule_cron: "0 3 * * *"
+    config: {keep: 50}
+    active: true
+
+  # significance_threshold: the LLM scorer rates 1–5; only items >= this ingest.
+  # Was 5 (top-tier-only, since the 2026-05-19 over-volume). Lowered to 4 on
+  # 2026-06-18 alongside the gemma4:e2b scorer swap (PR #320) — gemma4 scores a
+  # touch more conservatively than gpt-oss, so 5 risks ingesting nothing.
+  # NOTE: the runtime value comes from this config (the schedule_sync mapper
+  # reads activities.config); the IntelligenceScanInput dataclass default is a
+  # dead fallback. Tune per-source if needed.
+  - slug: intel-scan-hn
+    workflow_type: IntelligenceScanFlow
+    agent_id: raphael
+    schedule_cron: "0 7 * * *"
+    config:
+      source: hn
+      topics: [ai, systems, startups]
+      significance_threshold: 4
+    active: true
+
+  - slug: intel-scan-news
+    workflow_type: IntelligenceScanFlow
+    agent_id: raphael
+    schedule_cron: "30 7 * * *"
+    config:
+      source: news
+      topics: [world, tech]
+      significance_threshold: 4
+    active: true
+
+  - slug: intel-scan-finance
+    workflow_type: IntelligenceScanFlow
+    agent_id: raphael
+    schedule_cron: "0 8 * * *"
+    config:
+      source: finance
+      topics: [equities, macro, crypto]
+      significance_threshold: 4
+    active: true
+
+  # Pandora — Sentry poll safety-net (webhook is the fast path)
+  - slug: sentry-poll-30m
+    workflow_type: SentryPollFlow
+    agent_id: pandoras-actor
+    schedule_cron: "*/30 * * * *"
+    config:
+      mode: poll
+    active: true
+
+  # Pandora — proactive homelab monitoring (drift, backups, schedules, certs)
+  # Secondary AEGIS-side drift check (alertmanager DockerServiceDown/NodeDown
+  # is the primary, fast path). Slowed hourly → 4h: it has found zero drift in
+  # practice and the real alerting covers the urgent cases.
+  - slug: service-drift-4h
+    workflow_type: ServiceDriftFlow
+    agent_id: pandoras-actor
+    schedule_cron: "0 */4 * * *"
+    config: {}
+    active: true
+
+  - slug: backup-audit-daily
+    workflow_type: BackupAuditFlow
+    agent_id: pandoras-actor
+    schedule_cron: "0 6 * * *"
+    config:
+      mode: freshness
+    active: true
+
+  - slug: schedule-health-4h
+    workflow_type: ScheduleHealthFlow
+    agent_id: pandoras-actor
+    schedule_cron: "0 */4 * * *"
+    config: {}
+    active: true
+
+  # Catches silently-undelivered interaction cards. Slowed 15min → hourly: it
+  # has found zero undelivered in practice, so a worst-case ~1h detection lag on
+  # a genuinely stuck card is an acceptable trade for 4× fewer runs.
+  - slug: delivery-watchdog-hourly
+    workflow_type: DeliveryWatchdogFlow
+    agent_id: pandoras-actor
+    schedule_cron: "0 * * * *"
+    config: {}
+    active: true
+
+  - slug: cert-radar-daily
+    workflow_type: CertRadarFlow
+    agent_id: pandoras-actor
+    schedule_cron: "0 7 * * *"
+    config:
+      domains:
+        - example.com
+        - example.com
+        - example.com
+        - example.com
+        - example.com
+        - example.com
+        - example.com
+    active: true
+
+  # Pandora — nightly retention prune for unbounded ops tables.
+  # Defaults from worker/src/aegis_worker/flows/cleanup.py::_DEFAULT_RETENTIONS.
+  # Override per-table via config.retentions if needed.
+  - slug: cleanup-daily
+    workflow_type: CleanupFlow
+    agent_id: pandoras-actor
+    schedule_cron: "0 4 * * *"
+    config: {}
+    active: true
+
+  # Resource-inventory syncs — keep `resources` mirroring the canonical
+  # workspace hierarchy (the workspace host's ~/Workspace) and Vercel projects so alert
+  # investigation has the right candidate set. Daily at 05:00 UTC, staggered
+  # 15 min apart. WorkspaceRepoSyncFlow also mirrors missing checkouts onto
+  # the base host (node-a) at the same relative paths.
+  - slug: workspace-repo-sync-daily
+    workflow_type: WorkspaceRepoSyncFlow
+    agent_id: pandoras-actor
+    schedule_cron: "0 5 * * *"
+    config:
+      min_repos: 5
+    active: true
+
+  - slug: vercel-project-sync-daily
+    workflow_type: VercelProjectSyncFlow
+    agent_id: pandoras-actor
+    schedule_cron: "15 5 * * *"
+    config:
+      include_personal: true
+      team_ids:
+        - your-vercel-team-id
+    active: true

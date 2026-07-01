@@ -1,0 +1,22 @@
+# Python virtual environments
+.venv/
+venv/
+
+# Python build artifacts
+__pycache__/
+*.egg-info/
+dist/
+build/
+
+# Dependencies (admin panel)
+node_modules/
+
+# Lock files
+uv.lock
+
+# Environment
+.env
+.env.*
+
+# IDE / OS
+.DS_Store

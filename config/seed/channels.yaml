@@ -1,0 +1,36 @@
+# v3 channels seed. Loader upserts by (kind, identifier).
+# Replace the example email account with your own; authorize each Gmail account
+# via the admin panel's "Google accounts" re-auth flow (writes the token to
+# config/credentials/<label>.json).
+
+channels:
+  - kind: email
+    identifier: you@example.com
+    config:
+      label: primary
+      token_path: config/credentials/primary.json
+      agent_id: sebas
+    active: false
+
+  - kind: raindrop
+    identifier: default
+    config:
+      last_cursor: null
+      agent_id: raphael
+    active: true
+
+  - kind: rss
+    identifier: https://hnrss.org/frontpage
+    config:
+      last_cursor: null
+      agent_id: raphael
+      label: hn-frontpage
+    active: true
+
+  - kind: rss
+    identifier: https://arxiv.org/rss/cs.AI
+    config:
+      last_cursor: null
+      agent_id: raphael
+      label: arxiv-ai
+    active: true
