@@ -19,6 +19,10 @@ interface InfraFormData {
   ssh_user: string;
   ssh_port: string;
   ssh_key_ref: string;
+  // Write-only: sent only when non-empty; server never returns the values,
+  // only has_ssh_key / has_kubeconfig booleans.
+  ssh_private_key: string;
+  kubeconfig: string;
   docker_context: string;
   hosts_aegis: boolean;
   setup_command: string;
@@ -32,6 +36,8 @@ const emptyForm: InfraFormData = {
   ssh_user: '',
   ssh_port: '22',
   ssh_key_ref: '',
+  ssh_private_key: '',
+  kubeconfig: '',
   docker_context: '',
   hosts_aegis: false,
   setup_command: '',
@@ -188,6 +194,7 @@ export default function Infra() {
 
   const [showForm, setShowForm] = useState(false);
   const [editingId, setEditingId] = useState<string | null>(null);
+  const [editingSecrets, setEditingSecrets] = useState({ hasSshKey: false, hasKubeconfig: false });
   const [form, setForm] = useState<InfraFormData>({ ...emptyForm });
   const [formError, setFormError] = useState('');
   const [saving, setSaving] = useState(false);
@@ -210,6 +217,7 @@ export default function Infra() {
 
   const openCreate = () => {
     setEditingId(null);
+    setEditingSecrets({ hasSshKey: false, hasKubeconfig: false });
     setForm({ ...emptyForm });
     setFormError('');
     setShowForm(true);
@@ -217,6 +225,7 @@ export default function Infra() {
 
   const openEdit = (row: any) => {
     setEditingId(row.id);
+    setEditingSecrets({ hasSshKey: !!row.has_ssh_key, hasKubeconfig: !!row.has_kubeconfig });
     setForm({
       name: row.name || '',
       kind: row.kind || 'ssh_host',
@@ -224,6 +233,8 @@ export default function Infra() {
       ssh_user: row.ssh_user || '',
       ssh_port: row.ssh_port != null ? String(row.ssh_port) : '22',
       ssh_key_ref: row.ssh_key_ref || '',
+      ssh_private_key: '',
+      kubeconfig: '',
       docker_context: row.docker_context || '',
       hosts_aegis: !!row.hosts_aegis,
       setup_command: row.setup_command || '',
@@ -266,6 +277,8 @@ export default function Infra() {
         payload.ssh_port = port;
       }
       if (form.ssh_key_ref.trim()) payload.ssh_key_ref = form.ssh_key_ref.trim();
+      if (form.ssh_private_key.trim()) payload.ssh_private_key = form.ssh_private_key;
+      if (form.kubeconfig.trim()) payload.kubeconfig = form.kubeconfig;
       if (form.docker_context.trim()) payload.docker_context = form.docker_context.trim();
       if (form.setup_command.trim()) payload.setup_command = form.setup_command.trim();
       payload.setup_files = form.setup_files
@@ -368,9 +381,37 @@ export default function Infra() {
               </div>
 
               <div className="form-group">
-                <label>SSH key ref</label>
+                <label>SSH private key (stored encrypted)</label>
+                <textarea
+                  rows={4}
+                  value={form.ssh_private_key}
+                  onChange={e => setForm({ ...form, ssh_private_key: e.target.value })}
+                  className="mono"
+                  placeholder={editingSecrets.hasSshKey
+                    ? 'set — paste to replace, leave blank to keep'
+                    : '-----BEGIN OPENSSH PRIVATE KEY-----'}
+                />
+              </div>
+
+              <div className="form-group">
+                <label>SSH key ref (optional if key pasted above)</label>
                 <input value={form.ssh_key_ref} onChange={e => setForm({ ...form, ssh_key_ref: e.target.value })} placeholder="path to private key on core host" className="mono" />
               </div>
+
+              {form.kind === 'k8s' && (
+                <div className="form-group">
+                  <label>Kubeconfig (stored encrypted)</label>
+                  <textarea
+                    rows={4}
+                    value={form.kubeconfig}
+                    onChange={e => setForm({ ...form, kubeconfig: e.target.value })}
+                    className="mono"
+                    placeholder={editingSecrets.hasKubeconfig
+                      ? 'set — paste to replace, leave blank to keep'
+                      : 'apiVersion: v1\nkind: Config\n...'}
+                  />
+                </div>
+              )}
 
               <div className="form-group">
                 <label>Docker context (optional)</label>
@@ -459,7 +500,10 @@ export default function Infra() {
                       <div className="meta mono">{row.slug}</div>
                     </td>
                     <td>{row.kind}</td>
-                    <td className="mono">{row.host}{row.ssh_port ? `:${row.ssh_port}` : ''}</td>
+                    <td className="mono">
+                      {row.host}{row.ssh_port ? `:${row.ssh_port}` : ''}
+                      {row.has_ssh_key && <span title="SSH key stored" style={{ marginLeft: 4 }}>&#128273;</span>}
+                    </td>
                     <td>
                       <span className={statusBadgeClass(row.status)}>{row.status}</span>
                       {row.status === 'error' && row.last_error && (

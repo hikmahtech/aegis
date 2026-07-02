@@ -15,6 +15,8 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 
 from aegis.api.auth import verify_auth
+from aegis.api.deps import get_settings
+from aegis.config import Settings
 from aegis.observability import log_audit
 from aegis.services import infra as infra_service
 
@@ -35,6 +37,10 @@ class InfraCreate(BaseModel):
     ssh_user: str | None = None
     ssh_port: int = 22
     ssh_key_ref: str | None = None
+    # Write-only secrets — encrypted into infra.credentials, never returned
+    # (responses carry has_ssh_key / has_kubeconfig booleans instead).
+    ssh_private_key: str | None = None
+    kubeconfig: str | None = None
     docker_context: str | None = None
     hosts_aegis: bool = False
     setup_files: list[SetupFile] = []
@@ -49,6 +55,9 @@ class InfraUpdate(BaseModel):
     ssh_user: str | None = None
     ssh_port: int | None = None
     ssh_key_ref: str | None = None
+    # Write-only; blank/omitted keeps the stored secret (slack_config convention).
+    ssh_private_key: str | None = None
+    kubeconfig: str | None = None
     docker_context: str | None = None
     hosts_aegis: bool | None = None
     setup_files: list[SetupFile] | None = None
@@ -78,11 +87,13 @@ async def get_infra(request: Request, infra_id: UUID) -> dict:
 
 
 @router.post("", status_code=201)
-async def create_infra(request: Request, body: InfraCreate) -> dict:
+async def create_infra(
+    request: Request, body: InfraCreate, settings: Settings = Depends(get_settings)
+) -> dict:
     pool = request.app.state.db_pool
     data = body.model_dump()
     data["setup_files"] = _dump_setup_files(body.setup_files)
-    row = await infra_service.create_infra(pool, data)
+    row = await infra_service.create_infra(pool, data, settings.secret_key)
     await log_audit(
         pool,
         actor="api:infra_admin",
@@ -95,12 +106,14 @@ async def create_infra(request: Request, body: InfraCreate) -> dict:
 
 
 @router.put("/{infra_id}")
-async def update_infra(request: Request, infra_id: UUID, body: InfraUpdate) -> dict:
+async def update_infra(
+    request: Request, infra_id: UUID, body: InfraUpdate, settings: Settings = Depends(get_settings)
+) -> dict:
     pool = request.app.state.db_pool
     data = body.model_dump(exclude_unset=True)
     if "setup_files" in data:
         data["setup_files"] = _dump_setup_files(body.setup_files)
-    row = await infra_service.update_infra(pool, infra_id, data)
+    row = await infra_service.update_infra(pool, infra_id, data, settings.secret_key)
     if not row:
         raise HTTPException(404, "Infra entry not found")
     await log_audit(
@@ -130,12 +143,14 @@ async def delete_infra(request: Request, infra_id: UUID) -> None:
 
 
 @router.post("/{infra_id}/provision")
-async def provision_infra(request: Request, infra_id: UUID) -> dict:
+async def provision_infra(
+    request: Request, infra_id: UUID, settings: Settings = Depends(get_settings)
+) -> dict:
     pool = request.app.state.db_pool
     existing = await infra_service.get_infra(pool, infra_id)
     if not existing:
         raise HTTPException(404, "Infra entry not found")
-    result = await infra_service.provision_infra(pool, infra_id)
+    result = await infra_service.provision_infra(pool, infra_id, settings.secret_key)
     await log_audit(
         pool,
         actor="api:infra_admin",

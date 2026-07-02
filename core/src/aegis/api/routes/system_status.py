@@ -21,7 +21,7 @@ from aegis.api.deps import get_settings
 from aegis.config import Settings
 from aegis.connectors._ssh import build_ssh_args
 from aegis.connectors._subprocess import kill_and_wait
-from aegis.services.infra import get_aegis_host
+from aegis.services.infra import get_aegis_host, ssh_key_file
 
 logger = structlog.get_logger()
 
@@ -74,7 +74,9 @@ async def _list_docker_services_via_context(docker_context: str) -> dict[str, An
     return {"status": "ok", "services": _parse_service_lines(out.decode())}
 
 
-async def _list_docker_services_via_ssh(host: str, user: str, key_file: str, port: int) -> dict[str, Any]:
+async def _list_docker_services_via_ssh(
+    host: str, user: str, key_file: str, port: int
+) -> dict[str, Any]:
     remote_cmd = "docker service ls --format '{{.Name}} {{.Replicas}} {{.Image}}'"
     args = build_ssh_args(host, user, key_file, remote_cmd, connect_timeout=10)
     if port and port != 22:
@@ -109,7 +111,7 @@ def _parse_service_lines(output: str) -> list[dict]:
     return services
 
 
-async def _probe_services(pool) -> dict[str, Any]:
+async def _probe_services(pool, settings: Settings) -> dict[str, Any]:
     try:
         aegis_host = await get_aegis_host(pool)
     except Exception as exc:
@@ -125,13 +127,20 @@ async def _probe_services(pool) -> dict[str, Any]:
     try:
         if aegis_host.get("docker_context"):
             result = await _list_docker_services_via_context(aegis_host["docker_context"])
-        elif aegis_host.get("host") and aegis_host.get("ssh_user") and aegis_host.get("ssh_key_ref"):
-            result = await _list_docker_services_via_ssh(
-                aegis_host["host"],
-                aegis_host["ssh_user"],
-                aegis_host["ssh_key_ref"],
-                aegis_host.get("ssh_port") or 22,
-            )
+        elif aegis_host.get("host") and aegis_host.get("ssh_user"):
+            with ssh_key_file(aegis_host, settings.secret_key) as key_file:
+                if not key_file:
+                    return {
+                        "status": "unconfigured",
+                        "services": [],
+                        "note": "hosts_aegis entry has no SSH key (stored or ssh_key_ref)",
+                    }
+                result = await _list_docker_services_via_ssh(
+                    aegis_host["host"],
+                    aegis_host["ssh_user"],
+                    key_file,
+                    aegis_host.get("ssh_port") or 22,
+                )
         else:
             return {
                 "status": "unconfigured",
@@ -146,12 +155,14 @@ async def _probe_services(pool) -> dict[str, Any]:
 
 
 @router.get("/status")
-async def system_status(request: Request, settings: Settings = Depends(get_settings)) -> dict[str, Any]:
+async def system_status(
+    request: Request, settings: Settings = Depends(get_settings)
+) -> dict[str, Any]:
     pool = request.app.state.db_pool
 
     db_result, services_result, temporal_result = await asyncio.gather(
         _probe_db(pool),
-        _probe_services(pool),
+        _probe_services(pool, settings),
         _probe_temporal(settings),
         return_exceptions=True,
     )

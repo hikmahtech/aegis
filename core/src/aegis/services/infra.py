@@ -17,8 +17,12 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
+import os
 import re
 import shlex
+import tempfile
+from collections.abc import Iterator
 from typing import Any
 from uuid import UUID
 
@@ -27,13 +31,14 @@ import structlog
 
 from aegis.connectors._ssh import build_ssh_args
 from aegis.connectors._subprocess import kill_and_wait
+from aegis.crypto import decrypt_secret, encrypt_secret
 
 logger = structlog.get_logger()
 
 _SELECT_COLS = (
     "id, slug, name, kind, host, ssh_user, ssh_port, ssh_key_ref, docker_context, "
     "hosts_aegis, setup_files, setup_command, status, last_provisioned_at, "
-    "last_error, metadata, created_at, updated_at"
+    "last_error, metadata, credentials, created_at, updated_at"
 )
 
 # Fields an operator may set directly via create/update. `status`,
@@ -66,6 +71,51 @@ def _slugify(name: str) -> str:
     return slug or "infra"
 
 
+def public_infra(row: dict) -> dict:
+    """Strip `credentials` from a row, replacing it with has_* booleans.
+
+    Every dict that leaves this module through an admin-facing route goes
+    through here — key material never reaches the API, only its presence.
+    """
+    out = dict(row)
+    creds = out.pop("credentials", None) or {}
+    out["has_ssh_key"] = bool((creds.get("ssh_private_key_enc") or {}).get("value"))
+    out["has_kubeconfig"] = bool((creds.get("kubeconfig_enc") or {}).get("value"))
+    return out
+
+
+def _merged_credentials(existing: dict | None, data: dict[str, Any], secret_key: str) -> dict:
+    """Fold write-only `ssh_private_key` / `kubeconfig` inputs into the stored
+    credentials dict. Blank/absent keeps the existing value (slack_config
+    convention: a blank admin-UI field never wipes a saved secret)."""
+    creds = dict(existing or {})
+    if data.get("ssh_private_key"):
+        creds["ssh_private_key_enc"] = encrypt_secret(data["ssh_private_key"], secret_key)
+    if data.get("kubeconfig"):
+        creds["kubeconfig_enc"] = encrypt_secret(data["kubeconfig"], secret_key)
+    return creds
+
+
+@contextlib.contextmanager
+def ssh_key_file(infra: dict, secret_key: str) -> Iterator[str | None]:
+    """Yield a private-key path for `infra`: the DB-stored key (decrypted,
+    materialized to a mode-0600 temp file that is removed on exit) when set,
+    else `ssh_key_ref`, else None. DB key wins when both exist."""
+    key = decrypt_secret((infra.get("credentials") or {}).get("ssh_private_key_enc"), secret_key)
+    if not key:
+        yield infra.get("ssh_key_ref")
+        return
+    fd, path = tempfile.mkstemp(prefix="aegis-infra-key-")  # mkstemp => mode 0600
+    try:
+        # OpenSSH rejects a PEM key without a trailing newline; textarea pastes
+        # often lose it.
+        os.write(fd, (key.rstrip("\n") + "\n").encode())
+        os.close(fd)
+        yield path
+    finally:
+        os.unlink(path)
+
+
 async def _unique_slug(pool: asyncpg.Pool, base: str) -> str:
     slug = base
     n = 2
@@ -77,12 +127,18 @@ async def _unique_slug(pool: asyncpg.Pool, base: str) -> str:
 
 async def list_infra(pool: asyncpg.Pool) -> list[dict]:
     rows = await pool.fetch(f"SELECT {_SELECT_COLS} FROM infra ORDER BY name")
-    return [dict(r) for r in rows]
+    return [public_infra(dict(r)) for r in rows]
 
 
-async def get_infra(pool: asyncpg.Pool, infra_id: UUID | str) -> dict | None:
+async def get_infra(
+    pool: asyncpg.Pool, infra_id: UUID | str, *, include_credentials: bool = False
+) -> dict | None:
+    """Fetch one row. Only server-side callers (provisioning, probes) may pass
+    ``include_credentials=True`` — never a route that returns the result."""
     row = await pool.fetchrow(f"SELECT {_SELECT_COLS} FROM infra WHERE id = $1", infra_id)
-    return dict(row) if row else None
+    if not row:
+        return None
+    return dict(row) if include_credentials else public_infra(dict(row))
 
 
 async def get_aegis_host(pool: asyncpg.Pool) -> dict | None:
@@ -93,7 +149,7 @@ async def get_aegis_host(pool: asyncpg.Pool) -> dict | None:
     return dict(row) if row else None
 
 
-async def create_infra(pool: asyncpg.Pool, data: dict[str, Any]) -> dict:
+async def create_infra(pool: asyncpg.Pool, data: dict[str, Any], secret_key: str = "") -> dict:
     name = (data.get("name") or "").strip()
     if not name:
         raise ValueError("name is required")
@@ -103,8 +159,8 @@ async def create_infra(pool: asyncpg.Pool, data: dict[str, Any]) -> dict:
     row = await pool.fetchrow(
         f"INSERT INTO infra "
         "(slug, name, kind, host, ssh_user, ssh_port, ssh_key_ref, docker_context, "
-        " hosts_aegis, setup_files, setup_command, metadata) "
-        "VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) "
+        " hosts_aegis, setup_files, setup_command, metadata, credentials) "
+        "VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) "
         f"RETURNING {_SELECT_COLS}",
         slug,
         name,
@@ -118,18 +174,23 @@ async def create_infra(pool: asyncpg.Pool, data: dict[str, Any]) -> dict:
         data.get("setup_files") or [],
         data.get("setup_command"),
         data.get("metadata") or {},
+        _merged_credentials(None, data, secret_key),
     )
-    return dict(row)
+    return public_infra(dict(row))
 
 
-async def update_infra(pool: asyncpg.Pool, infra_id: UUID | str, data: dict[str, Any]) -> dict | None:
-    existing = await get_infra(pool, infra_id)
+async def update_infra(
+    pool: asyncpg.Pool, infra_id: UUID | str, data: dict[str, Any], secret_key: str = ""
+) -> dict | None:
+    existing = await get_infra(pool, infra_id, include_credentials=True)
     if not existing:
         return None
 
     fields = {k: v for k, v in data.items() if k in _EDITABLE_FIELDS and v is not None}
+    if data.get("ssh_private_key") or data.get("kubeconfig"):
+        fields["credentials"] = _merged_credentials(existing.get("credentials"), data, secret_key)
     if not fields:
-        return existing
+        return public_infra(existing)
 
     set_clauses = []
     values: list[Any] = [infra_id]
@@ -142,7 +203,7 @@ async def update_infra(pool: asyncpg.Pool, infra_id: UUID | str, data: dict[str,
         f"UPDATE infra SET {set_sql}, updated_at = now() WHERE id = $1 RETURNING {_SELECT_COLS}",
         *values,
     )
-    return dict(row) if row else None
+    return public_infra(dict(row)) if row else None
 
 
 async def delete_infra(pool: asyncpg.Pool, infra_id: UUID | str) -> bool:
@@ -150,7 +211,9 @@ async def delete_infra(pool: asyncpg.Pool, infra_id: UUID | str) -> bool:
     return result != "DELETE 0"
 
 
-async def _run_ssh(ssh_args: list[str], timeout: int = _SSH_TIMEOUT, stdin: bytes | None = None) -> dict:
+async def _run_ssh(
+    ssh_args: list[str], timeout: int = _SSH_TIMEOUT, stdin: bytes | None = None
+) -> dict:
     """Run an ssh command, optionally piping `stdin`, and capture the result."""
     proc = await asyncio.create_subprocess_exec(
         *ssh_args,
@@ -189,26 +252,36 @@ def _write_file_remote_cmd(path: str, mode: str | None) -> str:
     return cmd
 
 
-async def provision_infra(pool: asyncpg.Pool, infra_id: UUID | str) -> dict:
+async def provision_infra(pool: asyncpg.Pool, infra_id: UUID | str, secret_key: str = "") -> dict:
     """Push setup_files + run setup_command on the target host over SSH.
 
     Returns the updated infra row plus a `log` list of per-step results.
     Never raises — all failures are captured into status='error'/last_error
     so the caller (route) can just serialize the return value.
     """
-    infra = await get_infra(pool, infra_id)
+    infra = await get_infra(pool, infra_id, include_credentials=True)
     if not infra:
         return {"error": "infra not found"}
 
-    if not infra.get("host") or not infra.get("ssh_user") or not infra.get("ssh_key_ref"):
-        error = "host, ssh_user, and ssh_key_ref are all required to provision"
+    has_stored_key = bool(
+        ((infra.get("credentials") or {}).get("ssh_private_key_enc") or {}).get("value")
+    )
+    if (
+        not infra.get("host")
+        or not infra.get("ssh_user")
+        or not (infra.get("ssh_key_ref") or has_stored_key)
+    ):
+        error = "host, ssh_user, and an SSH key (stored or ssh_key_ref) are required to provision"
         row = await pool.fetchrow(
             "UPDATE infra SET status = 'error', last_error = $2, updated_at = now() "
             f"WHERE id = $1 RETURNING {_SELECT_COLS}",
             infra_id,
             error,
         )
-        return {**dict(row), "log": [{"step": "preflight", "ok": False, "error": error}]}
+        return {
+            **public_infra(dict(row)),
+            "log": [{"step": "preflight", "ok": False, "error": error}],
+        }
 
     await pool.execute(
         "UPDATE infra SET status = 'provisioning', updated_at = now() WHERE id = $1", infra_id
@@ -216,41 +289,48 @@ async def provision_infra(pool: asyncpg.Pool, infra_id: UUID | str) -> dict:
 
     host = infra["host"]
     user = infra["ssh_user"]
-    key_file = infra["ssh_key_ref"]
     port = infra.get("ssh_port") or 22
-
-    def ssh_args(remote_cmd: str) -> list[str]:
-        args = build_ssh_args(host, user, key_file, remote_cmd, connect_timeout=10)
-        # build_ssh_args doesn't take a port; splice `-p <port>` in before the
-        # destination (second-to-last element).
-        if port and port != 22:
-            args = args[:-2] + ["-p", str(port)] + args[-2:]
-        return args
 
     log: list[dict] = []
     setup_files = infra.get("setup_files") or []
     error: str | None = None
 
-    for entry in setup_files:
-        path = entry.get("path") if isinstance(entry, dict) else None
-        content = entry.get("content", "") if isinstance(entry, dict) else None
-        mode = entry.get("mode") if isinstance(entry, dict) else None
-        if not path:
-            log.append({"step": "write_file", "ok": False, "error": "missing path"})
-            error = error or "a setup_files entry is missing 'path'"
-            continue
-        encoded = base64.b64encode((content or "").encode()).decode()
-        result = await _run_ssh(ssh_args(_write_file_remote_cmd(path, mode)), stdin=encoded.encode())
-        log.append({"step": f"write_file:{path}", "ok": result["ok"], **result})
-        if not result["ok"]:
-            error = error or f"failed writing {path}: {result['stderr'][:200]}"
-            break
+    with ssh_key_file(infra, secret_key) as key_file:
+        if not key_file:
+            error = "stored SSH key could not be decrypted (wrong AEGIS_SECRET_KEY?)"
+            log.append({"step": "preflight", "ok": False, "error": error})
+            setup_files = []
 
-    if error is None and infra.get("setup_command"):
-        result = await _run_ssh(ssh_args(infra["setup_command"]), timeout=300)
-        log.append({"step": "setup_command", "ok": result["ok"], **result})
-        if not result["ok"]:
-            error = f"setup_command failed: {result['stderr'][:200]}"
+        def ssh_args(remote_cmd: str) -> list[str]:
+            args = build_ssh_args(host, user, key_file, remote_cmd, connect_timeout=10)
+            # build_ssh_args doesn't take a port; splice `-p <port>` in before the
+            # destination (second-to-last element).
+            if port and port != 22:
+                args = args[:-2] + ["-p", str(port)] + args[-2:]
+            return args
+
+        for entry in setup_files:
+            path = entry.get("path") if isinstance(entry, dict) else None
+            content = entry.get("content", "") if isinstance(entry, dict) else None
+            mode = entry.get("mode") if isinstance(entry, dict) else None
+            if not path:
+                log.append({"step": "write_file", "ok": False, "error": "missing path"})
+                error = error or "a setup_files entry is missing 'path'"
+                continue
+            encoded = base64.b64encode((content or "").encode()).decode()
+            result = await _run_ssh(
+                ssh_args(_write_file_remote_cmd(path, mode)), stdin=encoded.encode()
+            )
+            log.append({"step": f"write_file:{path}", "ok": result["ok"], **result})
+            if not result["ok"]:
+                error = error or f"failed writing {path}: {result['stderr'][:200]}"
+                break
+
+        if error is None and infra.get("setup_command"):
+            result = await _run_ssh(ssh_args(infra["setup_command"]), timeout=300)
+            log.append({"step": "setup_command", "ok": result["ok"], **result})
+            if not result["ok"]:
+                error = f"setup_command failed: {result['stderr'][:200]}"
 
     if error is None:
         row = await pool.fetchrow(
@@ -268,4 +348,4 @@ async def provision_infra(pool: asyncpg.Pool, infra_id: UUID | str) -> dict:
         )
         logger.warning("infra_provision_failed", infra_id=str(infra_id), error=error)
 
-    return {**dict(row), "log": log}
+    return {**public_infra(dict(row)), "log": log}
