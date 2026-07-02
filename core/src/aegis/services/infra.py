@@ -67,6 +67,12 @@ _SSH_TIMEOUT = 30
 _KUBECTL_TIMEOUT = 30
 _PROVISION_STDOUT_CAP = 16 * 1024
 _PROVISION_STDERR_CAP = 4 * 1024
+# kubectl `get ... -o json` on a real cluster is megabytes; a truncated JSON
+# body is unparseable, so kubectl calls get their own generous cap.
+_KUBECTL_STDOUT_CAP = 32 * 1024 * 1024
+
+# Write-only API inputs folded into infra.credentials by _merged_credentials.
+_SECRET_INPUT_FIELDS = ("ssh_private_key", "kubeconfig", "auth_env", "aws_credentials_file")
 
 # RFC-1123-ish: what kubectl accepts for namespaces/pod/deployment names.
 # Validated even though we exec (no shell) so a name can't smuggle in a flag.
@@ -257,7 +263,7 @@ async def update_infra(
         return None
 
     fields = {k: v for k, v in data.items() if k in _EDITABLE_FIELDS and v is not None}
-    if data.get("ssh_private_key") or data.get("kubeconfig"):
+    if any(data.get(k) for k in _SECRET_INPUT_FIELDS):
         fields["credentials"] = _merged_credentials(existing.get("credentials"), data, secret_key)
     if not fields:
         return public_infra(existing)
@@ -286,9 +292,12 @@ async def _run_ssh(
     timeout: int = _SSH_TIMEOUT,
     stdin: bytes | None = None,
     env: dict | None = None,
+    stdout_cap: int = _PROVISION_STDOUT_CAP,
 ) -> dict:
     """Run a command argv (ssh, kubectl, ...), optionally piping `stdin` and
-    overriding the environment, and capture the result."""
+    overriding the environment, and capture the result. `stdout_cap` keeps the
+    LAST N bytes — the provisioning default (16 KiB) is far too small for
+    kubectl `-o json` on a real cluster, so kubectl callers pass a larger cap."""
     proc = await asyncio.create_subprocess_exec(
         *ssh_args,
         stdin=asyncio.subprocess.PIPE if stdin is not None else None,
@@ -301,7 +310,7 @@ async def _run_ssh(
         return {
             "ok": proc.returncode == 0,
             "exit_code": proc.returncode,
-            "stdout": stdout.decode("utf-8", "replace")[-_PROVISION_STDOUT_CAP:],
+            "stdout": stdout.decode("utf-8", "replace")[-stdout_cap:],
             "stderr": stderr.decode("utf-8", "replace")[-_PROVISION_STDERR_CAP:],
         }
     except TimeoutError:
@@ -479,6 +488,7 @@ async def _provision_k8s(pool: asyncpg.Pool, infra: dict, secret_key: str) -> di
                 ["kubectl", "--kubeconfig", cfg, "get", "nodes", "-o", "name"],
                 timeout=_KUBECTL_TIMEOUT,
                 env=env,
+                stdout_cap=_KUBECTL_STDOUT_CAP,
             )
             nodes = [line for line in result["stdout"].splitlines() if line.strip()]
             log.append(
@@ -534,7 +544,12 @@ async def _kubectl(
     with kubeconfig_file(infra, secret_key) as cfg, k8s_auth_env(infra, secret_key) as env:
         if not cfg:
             return _k8s_error(400, "no kubeconfig stored for this entry")
-        result = await _run_ssh(["kubectl", "--kubeconfig", cfg, *args], timeout=timeout, env=env)
+        result = await _run_ssh(
+            ["kubectl", "--kubeconfig", cfg, *args],
+            timeout=timeout,
+            env=env,
+            stdout_cap=_KUBECTL_STDOUT_CAP,
+        )
     if not result["ok"]:
         return _k8s_error(502, (result["stderr"] or result["stdout"] or "kubectl failed")[:300])
     return {"ok": True, "stdout": result["stdout"]}
