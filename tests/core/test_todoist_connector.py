@@ -207,11 +207,8 @@ async def test_upload_file_no_api_key():
     assert result["error"] == "no_api_key"
 
 
-def test_build_item_move_command_shape() -> None:
-    cmd = TodoistConnector.build_item_move_command("ITEM123", "PROJ456")
-    assert cmd["type"] == "item_move"
-    assert cmd["args"] == {"id": "ITEM123", "project_id": "PROJ456"}
-    assert "temp_id" not in cmd  # update commands have no temp_id
+# build_item_move_command was removed — GTD filing is label-only, AEGIS never
+# relocates tasks between projects (users file into projects manually).
 
 
 def test_build_item_update_command_passthrough() -> None:
