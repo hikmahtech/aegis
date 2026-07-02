@@ -113,7 +113,7 @@ async def test_provision_uses_stored_key(db_pool):
     row = await _create(db_pool, setup_command="echo ok")
     seen: list[list[str]] = []
 
-    async def fake_run_ssh(ssh_args, timeout=30, stdin=None, env=None):
+    async def fake_run_ssh(ssh_args, timeout=30, stdin=None, env=None, stdout_cap=0):
         seen.append(ssh_args)
         key_path = ssh_args[ssh_args.index("-i") + 1]
         assert pathlib.Path(key_path).read_text() == FAKE_SSH_KEY + "\n"
@@ -211,7 +211,7 @@ async def test_k8s_list_pods_parses_and_uses_kubeconfig(db_pool):
     row = await _create_k8s(db_pool)
     seen: list[list[str]] = []
 
-    async def fake_run(args, timeout=30, stdin=None, env=None):
+    async def fake_run(args, timeout=30, stdin=None, env=None, stdout_cap=0):
         seen.append(args)
         assert args[0] == "kubectl" and args[1] == "--kubeconfig"
         assert pathlib.Path(args[2]).read_text() == FAKE_KUBECONFIG
@@ -261,7 +261,7 @@ async def test_k8s_restart_deployment_argv_and_validation(db_pool):
     row = await _create_k8s(db_pool)
     seen: list[list[str]] = []
 
-    async def fake_run(args, timeout=30, stdin=None, env=None):
+    async def fake_run(args, timeout=30, stdin=None, env=None, stdout_cap=0):
         seen.append(args)
         return {"ok": True, "exit_code": 0, "stdout": "deployment.apps/web restarted", "stderr": ""}
 
@@ -380,7 +380,7 @@ async def test_chat_list_pods_dispatches_to_registry_cluster(db_pool):
     row = await _create_k8s(db_pool)
     seen: list[list[str]] = []
 
-    async def fake_run(args, timeout=30, stdin=None, env=None):
+    async def fake_run(args, timeout=30, stdin=None, env=None, stdout_cap=0):
         seen.append(args)
         return {"ok": True, "exit_code": 0, "stdout": json.dumps(_POD_JSON), "stderr": ""}
 
@@ -564,7 +564,7 @@ async def test_k8s_auth_env_injected_into_kubectl(db_pool):
     row = await _create_k8s(db_pool, auth_env=FAKE_AUTH_ENV, aws_credentials_file=FAKE_AWS_CREDS)
     seen: dict = {}
 
-    async def fake_run(args, timeout=30, stdin=None, env=None):
+    async def fake_run(args, timeout=30, stdin=None, env=None, stdout_cap=0):
         seen["env"] = env
         seen["creds_path"] = env.get("AWS_SHARED_CREDENTIALS_FILE") if env else None
         if seen["creds_path"]:
@@ -589,7 +589,7 @@ async def test_k8s_auth_env_absent_inherits_process_env(db_pool):
     row = await _create_k8s(db_pool)  # kubeconfig only, no auth material
     seen: dict = {"env": "unset"}
 
-    async def fake_run(args, timeout=30, stdin=None, env=None):
+    async def fake_run(args, timeout=30, stdin=None, env=None, stdout_cap=0):
         seen["env"] = env
         return {"ok": True, "exit_code": 0, "stdout": json.dumps(_POD_JSON), "stderr": ""}
 
@@ -603,7 +603,7 @@ async def test_k8s_provision_uses_auth_env(db_pool):
     row = await _create_k8s(db_pool, auth_env=FAKE_AUTH_ENV)
     seen: dict = {}
 
-    async def fake_run(args, timeout=30, stdin=None, env=None):
+    async def fake_run(args, timeout=30, stdin=None, env=None, stdout_cap=0):
         seen["env"] = env
         return {"ok": True, "exit_code": 0, "stdout": "node/a\n", "stderr": ""}
 
@@ -611,3 +611,73 @@ async def test_k8s_provision_uses_auth_env(db_pool):
         result = await infra_service.provision_infra(db_pool, row["id"], SECRET_KEY)
     assert result["status"] == "ready"
     assert seen["env"]["AWS_ACCESS_KEY_ID"] == "AKIATEST"
+
+
+# ── regressions: update-only-secret-fields no-op + kubectl stdout cap ───────
+
+
+async def test_update_with_only_aws_credentials_replaces_stored(db_pool):
+    """PUT with ONLY auth_env/aws_credentials_file must persist (regression:
+    the credentials merge used to trigger only on ssh_private_key/kubeconfig,
+    silently no-opping such updates)."""
+    await _prepare(db_pool)
+    row = await _create_k8s(db_pool, aws_credentials_file="[old]\nx = 1")
+
+    updated = await infra_service.update_infra(
+        db_pool, row["id"], {"aws_credentials_file": "[new]\ny = 2"}, SECRET_KEY
+    )
+    assert updated["has_aws_credentials"] is True
+    full = await infra_service.get_infra(db_pool, row["id"], include_credentials=True)
+    seen: dict = {}
+
+    async def fake_run(args, timeout=30, stdin=None, env=None, stdout_cap=0):
+        seen["creds"] = pathlib.Path(env["AWS_SHARED_CREDENTIALS_FILE"]).read_text()
+        return {"ok": True, "exit_code": 0, "stdout": json.dumps(_POD_JSON), "stderr": ""}
+
+    with patch.object(infra_service, "_run_ssh", new=AsyncMock(side_effect=fake_run)):
+        await infra_service.k8s_list_pods(db_pool, full["id"], SECRET_KEY, "default")
+    assert seen["creds"] == "[new]\ny = 2"
+
+    # Same for auth_env alone.
+    updated = await infra_service.update_infra(
+        db_pool, row["id"], {"auth_env": {"K": "V"}}, SECRET_KEY
+    )
+    assert updated["has_auth_env"] is True
+
+
+async def test_kubectl_output_not_truncated_at_provision_cap(db_pool):
+    """kubectl -o json on a real cluster is megabytes; the 16 KiB provisioning
+    stdout cap must not apply (regression: truncated JSON -> 'unparseable')."""
+    await _prepare(db_pool)
+    row = await _create_k8s(db_pool)
+
+    big = {
+        "items": [
+            {
+                "metadata": {"name": f"pod-{i}", "namespace": "default"},
+                "spec": {"nodeName": "n"},
+                "status": {"phase": "Running", "containerStatuses": []},
+            }
+            for i in range(2000)
+        ]
+    }
+    payload = json.dumps(big)
+    assert len(payload) > 16 * 1024  # would have been truncated by the old cap
+
+    async def fake_exec(*args, stdin=None, stdout=None, stderr=None, env=None):
+        class P:
+            returncode = 0
+
+            async def communicate(self, input=None):
+                return payload.encode(), b""
+
+        return P()
+
+    with (
+        patch.object(infra_service.asyncio, "create_subprocess_exec", new=fake_exec),
+        patch.object(infra_service, "kill_and_wait", new=AsyncMock()),
+    ):
+        result = await infra_service.k8s_list_pods(db_pool, row["id"], SECRET_KEY, "default")
+
+    assert result["ok"] is True
+    assert len(result["pods"]) == 2000
