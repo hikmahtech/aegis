@@ -643,7 +643,8 @@ CHAT_TOOLS = [
             "name": "restart_service",
             "description": (
                 "Force-update (rolling restart) a Docker Swarm service. "
-                "Mutating action — executes immediately."
+                "Mutating action — executes immediately; refused when the matching "
+                "infrastructure entry is marked read-only."
             ),
             "parameters": {
                 "type": "object",
@@ -1340,6 +1341,24 @@ async def _registry_k8s_id(pool: asyncpg.Pool | None, slug: str) -> Any | None:
         return None
 
 
+async def _swarm_context_read_only(pool: asyncpg.Pool | None, context: str) -> bool:
+    """True when a registered swarm/docker infra entry mapping to `context`
+    (by slug or docker_context) is marked read_only — mutating swarm ops are
+    refused for it. Unregistered contexts are unaffected."""
+    if pool is None or not context:
+        return False
+    try:
+        return bool(
+            await pool.fetchval(
+                "SELECT bool_or(read_only) FROM infra WHERE kind IN ('swarm', 'docker') "
+                "AND (slug = $1 OR docker_context = $1)",
+                context,
+            )
+        )
+    except Exception:  # noqa: BLE001 — fail open: unregistered/unreachable registry
+        return False
+
+
 async def _exec_registry_k8s(
     tool: str, pool: asyncpg.Pool, args: dict, ctx: ToolContext, infra_id: Any
 ) -> str:
@@ -1399,6 +1418,13 @@ async def _exec_infra(tool: str, pool: asyncpg.Pool, args: dict, ctx: ToolContex
         if ctx_err == "for_tool":
             return json.dumps({"error": f"Unsupported context for {tool}: {context}"})
         return json.dumps({"error": f"Unsupported context: {context}"})
+    if tool == "restart_service" and await _swarm_context_read_only(pool, context):
+        return json.dumps(
+            {
+                "error": f"context {context!r} is read-only — restart_service is disabled "
+                "(infra registry read_only flag)"
+            }
+        )
     script_args = [context]
     for field, kind in arg_fields:
         if kind == "tail":

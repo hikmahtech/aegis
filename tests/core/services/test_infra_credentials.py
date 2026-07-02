@@ -474,3 +474,62 @@ async def test_chat_restart_deployment_and_read_only(db_pool):
         db_pool, {"context": "ghost", "namespace": "default", "deployment_name": "web"}, _chat_ctx()
     )
     assert "Unknown k8s cluster" in json.loads(raw)["error"]
+
+
+async def test_chat_restart_service_blocked_by_read_only_registry_entry(db_pool):
+    from unittest.mock import MagicMock
+
+    from aegis.services.chat import ToolContext, _exec_restart_service
+
+    await _prepare(db_pool)
+    # A registered swarm entry mapping to the 'swarm' context via docker_context.
+    await _create(db_pool, docker_context="swarm", read_only=True)
+
+    connector = MagicMock()
+    connector.run_script = AsyncMock()
+    ctx = ToolContext(remote_script_connector=connector)
+
+    raw = await _exec_restart_service(
+        db_pool, {"context": "swarm", "service_name": "aegis_core"}, ctx
+    )
+    assert "read-only" in json.loads(raw)["error"]
+    connector.run_script.assert_not_awaited()
+
+
+async def test_chat_restart_service_allowed_when_not_read_only(db_pool):
+    from unittest.mock import MagicMock
+
+    from aegis.services.chat import ToolContext, _exec_restart_service
+
+    await _prepare(db_pool)
+    await _create(db_pool, docker_context="swarm", read_only=False)
+
+    connector = MagicMock()
+    connector.run_script = AsyncMock(
+        return_value={"status": "succeeded", "exit_code": 0, "stdout": "ok", "stderr": ""}
+    )
+    ctx = ToolContext(remote_script_connector=connector)
+
+    raw = await _exec_restart_service(
+        db_pool, {"context": "swarm", "service_name": "aegis_core"}, ctx
+    )
+    assert raw == "ok"
+    connector.run_script.assert_awaited_once()
+
+
+async def test_chat_list_services_unaffected_by_read_only(db_pool):
+    from unittest.mock import MagicMock
+
+    from aegis.services.chat import ToolContext, _exec_list_services
+
+    await _prepare(db_pool)
+    await _create(db_pool, docker_context="swarm", read_only=True)
+
+    connector = MagicMock()
+    connector.run_script = AsyncMock(
+        return_value={"status": "succeeded", "exit_code": 0, "stdout": "[]", "stderr": ""}
+    )
+    ctx = ToolContext(remote_script_connector=connector)
+
+    await _exec_list_services(db_pool, {"context": "swarm"}, ctx)
+    connector.run_script.assert_awaited_once()
