@@ -309,3 +309,168 @@ async def test_k8s_provision_fails_without_kubeconfig(db_pool):
     result = await infra_service.provision_infra(db_pool, row["id"], SECRET_KEY)
     assert result["status"] == "error"
     assert "kubeconfig" in result["last_error"]
+
+
+# ── read_only gate + chat-tool dispatch to registry clusters ────────────────
+
+
+async def test_read_only_blocks_restart_but_not_reads(db_pool):
+    await _prepare(db_pool)
+    row = await _create_k8s(db_pool, read_only=True)
+
+    blocked = await infra_service.k8s_restart_deployment(
+        db_pool, row["id"], SECRET_KEY, "default", "web"
+    )
+    assert blocked["ok"] is False and blocked["status_code"] == 403
+    assert "read-only" in blocked["error"]
+
+    with patch.object(
+        infra_service,
+        "_run_ssh",
+        new=AsyncMock(
+            return_value={
+                "ok": True,
+                "exit_code": 0,
+                "stdout": json.dumps(_POD_JSON),
+                "stderr": "",
+            }
+        ),
+    ):
+        reads = await infra_service.k8s_list_pods(db_pool, row["id"], SECRET_KEY, "default")
+    assert reads["ok"] is True
+
+
+async def test_read_only_blocks_ssh_provision(db_pool):
+    await _prepare(db_pool)
+    row = await _create(db_pool, read_only=True)
+    with patch.object(infra_service, "_run_ssh", new=AsyncMock()) as run:
+        result = await infra_service.provision_infra(db_pool, row["id"], SECRET_KEY)
+    assert result["status"] == "error"
+    assert "read-only" in result["last_error"]
+    run.assert_not_awaited()
+
+
+async def test_k8s_provision_allowed_when_read_only(db_pool):
+    # k8s provisioning is only a connectivity check — read_only must not block it.
+    await _prepare(db_pool)
+    row = await _create_k8s(db_pool, read_only=True)
+    with patch.object(
+        infra_service,
+        "_run_ssh",
+        new=AsyncMock(
+            return_value={"ok": True, "exit_code": 0, "stdout": "node/a\n", "stderr": ""}
+        ),
+    ):
+        result = await infra_service.provision_infra(db_pool, row["id"], SECRET_KEY)
+    assert result["status"] == "ready"
+
+
+def _chat_ctx():
+    from types import SimpleNamespace
+
+    from aegis.services.chat import ToolContext
+
+    return ToolContext(settings=SimpleNamespace(secret_key=SECRET_KEY))
+
+
+async def test_chat_list_pods_dispatches_to_registry_cluster(db_pool):
+    from aegis.services.chat import _exec_list_pods
+
+    await _prepare(db_pool)
+    row = await _create_k8s(db_pool)
+    seen: list[list[str]] = []
+
+    async def fake_run(args, timeout=30, stdin=None):
+        seen.append(args)
+        return {"ok": True, "exit_code": 0, "stdout": json.dumps(_POD_JSON), "stderr": ""}
+
+    with patch.object(infra_service, "_run_ssh", new=AsyncMock(side_effect=fake_run)):
+        raw = await _exec_list_pods(db_pool, {"context": row["slug"]}, _chat_ctx())
+
+    payload = json.loads(raw)
+    assert payload["pods"][0]["name"] == "web-1"
+    assert seen[0][0] == "kubectl"
+    # omitted namespace => all namespaces
+    assert "--all-namespaces" in seen[0]
+
+
+async def test_chat_list_pods_status_filter(db_pool):
+    from aegis.services.chat import _exec_list_pods
+
+    await _prepare(db_pool)
+    row = await _create_k8s(db_pool)
+    with patch.object(
+        infra_service,
+        "_run_ssh",
+        new=AsyncMock(
+            return_value={
+                "ok": True,
+                "exit_code": 0,
+                "stdout": json.dumps(_POD_JSON),
+                "stderr": "",
+            }
+        ),
+    ):
+        raw = await _exec_list_pods(
+            db_pool, {"context": row["slug"], "status": "Pending"}, _chat_ctx()
+        )
+    assert json.loads(raw)["pods"] == []
+
+
+async def test_chat_unknown_context_still_errors(db_pool):
+    from aegis.services.chat import _exec_list_pods
+
+    await _prepare(db_pool)
+    raw = await _exec_list_pods(db_pool, {"context": "nope-cluster"}, _chat_ctx())
+    assert "Unsupported context" in json.loads(raw)["error"]
+
+
+async def test_chat_argocd_rejected_for_registry_cluster(db_pool):
+    from aegis.services.chat import _exec_list_argocd_apps
+
+    await _prepare(db_pool)
+    row = await _create_k8s(db_pool)
+    raw = await _exec_list_argocd_apps(db_pool, {"context": row["slug"]}, _chat_ctx())
+    assert "not available for registry k8s clusters" in json.loads(raw)["error"]
+
+
+async def test_chat_restart_deployment_and_read_only(db_pool):
+    from aegis.services.chat import _exec_restart_deployment
+
+    await _prepare(db_pool)
+    row = await _create_k8s(db_pool)
+    with patch.object(
+        infra_service,
+        "_run_ssh",
+        new=AsyncMock(
+            return_value={
+                "ok": True,
+                "exit_code": 0,
+                "stdout": "deployment.apps/web restarted",
+                "stderr": "",
+            }
+        ),
+    ):
+        raw = await _exec_restart_deployment(
+            db_pool,
+            {"context": row["slug"], "namespace": "default", "deployment_name": "web"},
+            _chat_ctx(),
+        )
+    assert "restarted" in json.loads(raw)["output"]
+
+    # read-only entry refuses via chat as well
+    ro = await _create_k8s(
+        db_pool, name="test-cred-cluster-ro", slug="test-cred-ro", read_only=True
+    )
+    raw = await _exec_restart_deployment(
+        db_pool,
+        {"context": ro["slug"], "namespace": "default", "deployment_name": "web"},
+        _chat_ctx(),
+    )
+    assert "read-only" in json.loads(raw)["error"]
+
+    # unknown slug
+    raw = await _exec_restart_deployment(
+        db_pool, {"context": "ghost", "namespace": "default", "deployment_name": "web"}, _chat_ctx()
+    )
+    assert "Unknown k8s cluster" in json.loads(raw)["error"]

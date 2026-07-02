@@ -38,7 +38,7 @@ logger = structlog.get_logger()
 
 _SELECT_COLS = (
     "id, slug, name, kind, host, ssh_user, ssh_port, ssh_key_ref, docker_context, "
-    "hosts_aegis, setup_files, setup_command, status, last_provisioned_at, "
+    "hosts_aegis, read_only, setup_files, setup_command, status, last_provisioned_at, "
     "last_error, metadata, credentials, created_at, updated_at"
 )
 
@@ -55,6 +55,7 @@ _EDITABLE_FIELDS = (
     "ssh_key_ref",
     "docker_context",
     "hosts_aegis",
+    "read_only",
     "setup_files",
     "setup_command",
     "metadata",
@@ -182,8 +183,8 @@ async def create_infra(pool: asyncpg.Pool, data: dict[str, Any], secret_key: str
     row = await pool.fetchrow(
         f"INSERT INTO infra "
         "(slug, name, kind, host, ssh_user, ssh_port, ssh_key_ref, docker_context, "
-        " hosts_aegis, setup_files, setup_command, metadata, credentials) "
-        "VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) "
+        " hosts_aegis, read_only, setup_files, setup_command, metadata, credentials) "
+        "VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) "
         f"RETURNING {_SELECT_COLS}",
         slug,
         name,
@@ -194,6 +195,7 @@ async def create_infra(pool: asyncpg.Pool, data: dict[str, Any], secret_key: str
         data.get("ssh_key_ref"),
         data.get("docker_context"),
         bool(data.get("hosts_aegis", False)),
+        bool(data.get("read_only", False)),
         data.get("setup_files") or [],
         data.get("setup_command"),
         data.get("metadata") or {},
@@ -287,7 +289,22 @@ async def provision_infra(pool: asyncpg.Pool, infra_id: UUID | str, secret_key: 
         return {"error": "infra not found"}
 
     if infra.get("kind") == "k8s":
+        # k8s provisioning is a pure connectivity check — allowed even on
+        # read-only entries.
         return await _provision_k8s(pool, infra, secret_key)
+
+    if infra.get("read_only"):
+        error = "entry is read-only — SSH provisioning writes files/runs commands on the host"
+        row = await pool.fetchrow(
+            "UPDATE infra SET status = 'error', last_error = $2, updated_at = now() "
+            f"WHERE id = $1 RETURNING {_SELECT_COLS}",
+            infra_id,
+            error,
+        )
+        return {
+            **public_infra(dict(row)),
+            "log": [{"step": "preflight", "ok": False, "error": error}],
+        }
 
     has_stored_key = bool(
         ((infra.get("credentials") or {}).get("ssh_private_key_enc") or {}).get("value")
@@ -454,12 +471,15 @@ async def _kubectl(
     secret_key: str,
     args: list[str],
     timeout: int = _KUBECTL_TIMEOUT,
+    mutating: bool = False,
 ) -> dict:
     infra = await get_infra(pool, infra_id, include_credentials=True)
     if not infra:
         return _k8s_error(404, "infra not found")
     if infra.get("kind") != "k8s":
         return _k8s_error(400, "not a k8s infra entry")
+    if mutating and infra.get("read_only"):
+        return _k8s_error(403, "entry is read-only — mutating operations are disabled for it")
     with kubeconfig_file(infra, secret_key) as cfg:
         if not cfg:
             return _k8s_error(400, "no kubeconfig stored for this entry")
@@ -476,14 +496,22 @@ def _parse_kubectl_items(stdout: str) -> list[dict] | None:
         return None
 
 
+def _namespace_args(namespace: str) -> list[str] | dict:
+    """kubectl namespace args; empty namespace means all namespaces."""
+    if not namespace:
+        return ["--all-namespaces"]
+    if err := _validate_k8s_name(namespace, "namespace"):
+        return err
+    return ["-n", namespace]
+
+
 async def k8s_list_pods(
     pool: asyncpg.Pool, infra_id: UUID | str, secret_key: str, namespace: str = "default"
 ) -> dict:
-    if err := _validate_k8s_name(namespace, "namespace"):
-        return err
-    result = await _kubectl(
-        pool, infra_id, secret_key, ["get", "pods", "-n", namespace, "-o", "json"]
-    )
+    ns_args = _namespace_args(namespace)
+    if isinstance(ns_args, dict):
+        return ns_args
+    result = await _kubectl(pool, infra_id, secret_key, ["get", "pods", *ns_args, "-o", "json"])
     if not result["ok"]:
         return result
     items = _parse_kubectl_items(result["stdout"])
@@ -508,10 +536,11 @@ async def k8s_list_pods(
 async def k8s_list_deployments(
     pool: asyncpg.Pool, infra_id: UUID | str, secret_key: str, namespace: str = "default"
 ) -> dict:
-    if err := _validate_k8s_name(namespace, "namespace"):
-        return err
+    ns_args = _namespace_args(namespace)
+    if isinstance(ns_args, dict):
+        return ns_args
     result = await _kubectl(
-        pool, infra_id, secret_key, ["get", "deployments", "-n", namespace, "-o", "json"]
+        pool, infra_id, secret_key, ["get", "deployments", *ns_args, "-o", "json"]
     )
     if not result["ok"]:
         return result
@@ -541,14 +570,17 @@ async def k8s_pod_logs(
     namespace: str,
     pod: str,
     tail: int = 200,
+    container: str | None = None,
 ) -> dict:
     for value, field in ((namespace, "namespace"), (pod, "pod")):
         if err := _validate_k8s_name(value, field):
             return err
-    tail = max(1, min(int(tail), 500))
-    result = await _kubectl(
-        pool, infra_id, secret_key, ["logs", "-n", namespace, pod, "--tail", str(tail)], timeout=60
-    )
+    args = ["logs", "-n", namespace, pod, "--tail", str(max(1, min(int(tail), 500)))]
+    if container:
+        if err := _validate_k8s_name(container, "container"):
+            return err
+        args += ["-c", container]
+    result = await _kubectl(pool, infra_id, secret_key, args, timeout=60)
     if not result["ok"]:
         return result
     return {"ok": True, "logs": result["stdout"]}
@@ -566,6 +598,7 @@ async def k8s_restart_deployment(
         secret_key,
         ["rollout", "restart", f"deployment/{name}", "-n", namespace],
         timeout=60,
+        mutating=True,
     )
     if not result["ok"]:
         return result

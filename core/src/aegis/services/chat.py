@@ -660,7 +660,7 @@ CHAT_TOOLS = [
         "function": {
             "name": "list_pods",
             "description": (
-                "List Kubernetes pods on Acme EKS. Optionally filter by namespace "
+                "List Kubernetes pods. Optionally filter by namespace "
                 "and status (e.g. 'CrashLoopBackOff', 'Running', 'Pending')."
             ),
             "parameters": {
@@ -668,7 +668,10 @@ CHAT_TOOLS = [
                 "properties": {
                     "context": {
                         "type": "string",
-                        "enum": ["acme-prod", "acme-test"],
+                        "description": (
+                            "Cluster: 'acme-prod' / 'acme-test' (script-host) or the "
+                            "slug of a registered k8s infrastructure entry"
+                        ),
                     },
                     "namespace": {
                         "type": "string",
@@ -687,11 +690,17 @@ CHAT_TOOLS = [
         "type": "function",
         "function": {
             "name": "list_deployments",
-            "description": "List Kubernetes deployments on Acme EKS with replica status.",
+            "description": "List Kubernetes deployments with replica status.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "context": {"type": "string", "enum": ["acme-prod", "acme-test"]},
+                    "context": {
+                        "type": "string",
+                        "description": (
+                            "Cluster: 'acme-prod' / 'acme-test' (script-host) or the "
+                            "slug of a registered k8s infrastructure entry"
+                        ),
+                    },
                     "namespace": {
                         "type": "string",
                         "description": "Kubernetes namespace (omit for all)",
@@ -705,11 +714,17 @@ CHAT_TOOLS = [
         "type": "function",
         "function": {
             "name": "get_pod_logs",
-            "description": "Tail recent logs from a Kubernetes pod on Acme EKS.",
+            "description": "Tail recent logs from a Kubernetes pod.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "context": {"type": "string", "enum": ["acme-prod", "acme-test"]},
+                    "context": {
+                        "type": "string",
+                        "description": (
+                            "Cluster: 'acme-prod' / 'acme-test' (script-host) or the "
+                            "slug of a registered k8s infrastructure entry"
+                        ),
+                    },
                     "namespace": {"type": "string"},
                     "pod_name": {"type": "string"},
                     "tail": {
@@ -720,6 +735,29 @@ CHAT_TOOLS = [
                     "container": {"type": "string", "description": "Optional container name"},
                 },
                 "required": ["context", "namespace", "pod_name"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "restart_deployment",
+            "description": (
+                "Rolling-restart a Kubernetes deployment (kubectl rollout restart) on a "
+                "registered k8s infrastructure entry. Mutating action — executes "
+                "immediately; refused when the entry is marked read-only."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "context": {
+                        "type": "string",
+                        "description": "Slug of a registered k8s infrastructure entry",
+                    },
+                    "namespace": {"type": "string"},
+                    "deployment_name": {"type": "string"},
+                },
+                "required": ["context", "namespace", "deployment_name"],
             },
         },
     },
@@ -1292,11 +1330,72 @@ _INFRA_SPECS: dict[str, tuple] = {
 }
 
 
+async def _registry_k8s_id(pool: asyncpg.Pool | None, slug: str) -> Any | None:
+    """id of a registered kind=k8s infra entry matching `slug`, else None."""
+    if pool is None or not slug:
+        return None
+    try:
+        return await pool.fetchval("SELECT id FROM infra WHERE slug = $1 AND kind = 'k8s'", slug)
+    except Exception:  # noqa: BLE001 — fall back to the script-host path
+        return None
+
+
+async def _exec_registry_k8s(
+    tool: str, pool: asyncpg.Pool, args: dict, ctx: ToolContext, infra_id: Any
+) -> str:
+    """Run a k8s chat tool directly against a registry entry's stored
+    kubeconfig (services/infra.py) instead of the remote script host."""
+    from aegis.services import infra as infra_service
+
+    secret_key = getattr(ctx.settings, "secret_key", "") or ""
+    namespace = args.get("namespace") or ""
+
+    if tool == "list_pods":
+        result = await infra_service.k8s_list_pods(pool, infra_id, secret_key, namespace)
+        if result.get("ok") and args.get("status"):
+            want = str(args["status"]).lower()
+            result["pods"] = [p for p in result["pods"] if want in p["phase"].lower()]
+    elif tool == "list_deployments":
+        result = await infra_service.k8s_list_deployments(pool, infra_id, secret_key, namespace)
+    elif tool == "get_pod_logs":
+        result = await infra_service.k8s_pod_logs(
+            pool,
+            infra_id,
+            secret_key,
+            namespace,
+            args.get("pod_name", ""),
+            tail=int(args.get("tail", 50) or 50),
+            container=args.get("container") or None,
+        )
+    elif tool == "restart_deployment":
+        result = await infra_service.k8s_restart_deployment(
+            pool, infra_id, secret_key, namespace, args.get("deployment_name", "")
+        )
+    else:
+        # argocd tools need the argocd CLI on the script host — not available
+        # through a bare kubeconfig.
+        return json.dumps(
+            {"error": f"{tool} is not available for registry k8s clusters (script-host only)"}
+        )
+
+    if not result.get("ok"):
+        return json.dumps({"error": result.get("error", "k8s op failed")})
+    result.pop("ok", None)
+    result.pop("status_code", None)
+    return json.dumps(result, default=str)
+
+
 async def _exec_infra(tool: str, pool: asyncpg.Pool, args: dict, ctx: ToolContext) -> str:
     """Shared driver for the data-described infra executors (`_INFRA_SPECS`)."""
     script, contexts, ctx_default, ctx_err, timeout, arg_fields = _INFRA_SPECS[tool]
     context = args.get("context", ctx_default)
     if context not in contexts:
+        # A k8s context that isn't a script-host one may be the slug of a
+        # registered kind=k8s infra entry — run kubectl directly for those.
+        if contexts is _INFRA_CONTEXTS_K8S:
+            infra_id = await _registry_k8s_id(pool, context)
+            if infra_id is not None:
+                return await _exec_registry_k8s(tool, pool, args, ctx, infra_id)
         if ctx_err == "for_tool":
             return json.dumps({"error": f"Unsupported context for {tool}: {context}"})
         return json.dumps({"error": f"Unsupported context: {context}"})
@@ -1329,6 +1428,21 @@ _exec_list_deployments = functools.partial(_exec_infra, "list_deployments")
 _exec_get_pod_logs = functools.partial(_exec_infra, "get_pod_logs")
 _exec_list_argocd_apps = functools.partial(_exec_infra, "list_argocd_apps")
 _exec_sync_argocd_app = functools.partial(_exec_infra, "sync_argocd_app")
+
+
+async def _exec_restart_deployment(pool: asyncpg.Pool, args: dict, ctx: ToolContext) -> str:
+    """Registry-only k8s tool (no script-host equivalent): rolling-restart a
+    deployment on a registered kind=k8s entry. Read-only entries refuse it."""
+    context = args.get("context", "")
+    infra_id = await _registry_k8s_id(pool, context)
+    if infra_id is None:
+        return json.dumps(
+            {
+                "error": f"Unknown k8s cluster: {context!r} — register it as a kind=k8s "
+                "infrastructure entry first"
+            }
+        )
+    return await _exec_registry_k8s("restart_deployment", pool, args, ctx, infra_id)
 
 
 _KIMI_STATUS_RE_CHAT = re.compile(r"^STATUS:\s*\S+", re.MULTILINE)
@@ -2840,6 +2954,7 @@ TOOL_EXECUTORS: dict[str, Any] = {
     "list_pods": _exec_list_pods,
     "list_deployments": _exec_list_deployments,
     "get_pod_logs": _exec_get_pod_logs,
+    "restart_deployment": _exec_restart_deployment,
     "list_argocd_apps": _exec_list_argocd_apps,
     "sync_argocd_app": _exec_sync_argocd_app,
     "run_infra_script": _exec_run_infra_script,
@@ -2915,6 +3030,7 @@ AGENT_TOOL_SETS: dict[str, set[str]] = {
         "list_pods",
         "list_deployments",
         "get_pod_logs",
+        "restart_deployment",
         "list_argocd_apps",
         "sync_argocd_app",
         "run_infra_script",

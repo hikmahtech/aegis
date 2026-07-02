@@ -25,6 +25,7 @@ interface InfraFormData {
   kubeconfig: string;
   docker_context: string;
   hosts_aegis: boolean;
+  read_only: boolean;
   setup_command: string;
   setup_files: SetupFile[];
 }
@@ -40,6 +41,7 @@ const emptyForm: InfraFormData = {
   kubeconfig: '',
   docker_context: '',
   hosts_aegis: false,
+  read_only: false,
   setup_command: '',
   setup_files: [],
 };
@@ -188,7 +190,7 @@ function LiveInspector() {
 }
 
 // ── Per-entry k8s cluster panel (kind=k8s rows with a stored kubeconfig) ───
-function K8sClusterPanel({ infraId }: { infraId: string }) {
+function K8sClusterPanel({ infraId, readOnly }: { infraId: string; readOnly: boolean }) {
   const [namespace, setNamespace] = useState('default');
   const [pods, setPods] = useState<any[]>([]);
   const [deployments, setDeployments] = useState<any[]>([]);
@@ -253,7 +255,7 @@ function K8sClusterPanel({ infraId }: { infraId: string }) {
                 <td className="mono">{d.name}</td>
                 <td>{d.ready}</td>
                 <td className="mono" style={{ fontSize: 12 }}>{(d.images || []).join(', ')}</td>
-                <td><button className="btn btn-sm" onClick={() => void restart(d.name)}>Restart</button></td>
+                <td>{!readOnly && <button className="btn btn-sm" onClick={() => void restart(d.name)}>Restart</button>}</td>
               </tr>
             ))}
           </tbody>
@@ -340,6 +342,7 @@ export default function Infra() {
       kubeconfig: '',
       docker_context: row.docker_context || '',
       hosts_aegis: !!row.hosts_aegis,
+      read_only: !!row.read_only,
       setup_command: row.setup_command || '',
       setup_files: Array.isArray(row.setup_files)
         ? row.setup_files.map((f: any) => ({ path: f.path || '', content: f.content || '', mode: f.mode || '' }))
@@ -372,6 +375,7 @@ export default function Infra() {
         kind: form.kind,
         host: form.host.trim(),
         hosts_aegis: form.hosts_aegis,
+        read_only: form.read_only,
       };
       if (form.ssh_user.trim()) payload.ssh_user = form.ssh_user.trim();
       if (form.ssh_port.trim()) {
@@ -534,6 +538,18 @@ export default function Infra() {
               </div>
 
               <div className="form-group">
+                <label>
+                  <input
+                    type="checkbox"
+                    checked={form.read_only}
+                    onChange={e => setForm({ ...form, read_only: e.target.checked })}
+                    style={{ width: 'auto', marginRight: '0.4rem' }}
+                  />
+                  Read-only — block mutating operations (k8s restarts, SSH provisioning)
+                </label>
+              </div>
+
+              <div className="form-group">
                 <label>Setup command (optional)</label>
                 <textarea rows={3} value={form.setup_command} onChange={e => setForm({ ...form, setup_command: e.target.value })} className="mono" placeholder="e.g. bash /opt/aegis/setup.sh" />
               </div>
@@ -606,6 +622,7 @@ export default function Infra() {
                     <td className="mono">
                       {row.host}{row.ssh_port ? `:${row.ssh_port}` : ''}
                       {row.has_ssh_key && <span title="SSH key stored" style={{ marginLeft: 4 }}>&#128273;</span>}
+                      {row.read_only && <span className="badge badge-neutral" title="Mutating operations blocked" style={{ marginLeft: 4 }}>read-only</span>}
                     </td>
                     <td>
                       <span className={statusBadgeClass(row.status)}>{row.status}</span>
@@ -633,7 +650,7 @@ export default function Infra() {
                         <button className="btn-icon" title="Edit" onClick={() => openEdit(row)}>&#9998;</button>
                         <button className="btn-icon btn-icon-danger" title="Delete" onClick={() => handleDelete(row.id, row.name)}>&times;</button>
                       </div>
-                      {expandedK8sId === row.id && <K8sClusterPanel infraId={row.id} />}
+                      {expandedK8sId === row.id && <K8sClusterPanel infraId={row.id} readOnly={!!row.read_only} />}
                       {isExpanded && log && (
                         <div style={{ marginTop: 8 }}>
                           {log.length === 0 ? (

@@ -43,6 +43,8 @@ class InfraCreate(BaseModel):
     kubeconfig: str | None = None
     docker_context: str | None = None
     hosts_aegis: bool = False
+    # When true, mutating ops (k8s restarts, SSH provisioning) are refused.
+    read_only: bool = False
     setup_files: list[SetupFile] = []
     setup_command: str | None = None
     metadata: dict[str, Any] = {}
@@ -60,6 +62,7 @@ class InfraUpdate(BaseModel):
     kubeconfig: str | None = None
     docker_context: str | None = None
     hosts_aegis: bool | None = None
+    read_only: bool | None = None
     setup_files: list[SetupFile] | None = None
     setup_command: str | None = None
     metadata: dict[str, Any] | None = None
