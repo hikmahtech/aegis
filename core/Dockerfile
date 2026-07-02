@@ -22,6 +22,14 @@ FROM python:3.12-slim
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl openssh-client && rm -rf /var/lib/apt/lists/*
 
+# kubectl: infra registry k8s ops (services/infra.py runs it against the
+# per-entry kubeconfig stored encrypted in the DB).
+ARG TARGETARCH=amd64
+ARG KUBECTL_VERSION=v1.31.4
+RUN curl -fsSL -o /usr/local/bin/kubectl \
+    "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/${TARGETARCH}/kubectl" \
+    && chmod +x /usr/local/bin/kubectl
+
 WORKDIR /app
 COPY --from=builder /opt/venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"

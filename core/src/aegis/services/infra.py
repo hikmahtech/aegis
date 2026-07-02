@@ -17,8 +17,13 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
+import json
+import os
 import re
 import shlex
+import tempfile
+from collections.abc import Iterator
 from typing import Any
 from uuid import UUID
 
@@ -27,13 +32,14 @@ import structlog
 
 from aegis.connectors._ssh import build_ssh_args
 from aegis.connectors._subprocess import kill_and_wait
+from aegis.crypto import decrypt_secret, encrypt_secret
 
 logger = structlog.get_logger()
 
 _SELECT_COLS = (
     "id, slug, name, kind, host, ssh_user, ssh_port, ssh_key_ref, docker_context, "
-    "hosts_aegis, setup_files, setup_command, status, last_provisioned_at, "
-    "last_error, metadata, created_at, updated_at"
+    "hosts_aegis, read_only, setup_files, setup_command, status, last_provisioned_at, "
+    "last_error, metadata, credentials, created_at, updated_at"
 )
 
 # Fields an operator may set directly via create/update. `status`,
@@ -49,6 +55,7 @@ _EDITABLE_FIELDS = (
     "ssh_key_ref",
     "docker_context",
     "hosts_aegis",
+    "read_only",
     "setup_files",
     "setup_command",
     "metadata",
@@ -57,13 +64,80 @@ _EDITABLE_FIELDS = (
 _SLUG_RE = re.compile(r"[^a-z0-9]+")
 
 _SSH_TIMEOUT = 30
+_KUBECTL_TIMEOUT = 30
 _PROVISION_STDOUT_CAP = 16 * 1024
 _PROVISION_STDERR_CAP = 4 * 1024
+
+# RFC-1123-ish: what kubectl accepts for namespaces/pod/deployment names.
+# Validated even though we exec (no shell) so a name can't smuggle in a flag.
+_K8S_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9.-]{0,252}$")
 
 
 def _slugify(name: str) -> str:
     slug = _SLUG_RE.sub("-", name.strip().lower()).strip("-")
     return slug or "infra"
+
+
+def public_infra(row: dict) -> dict:
+    """Strip `credentials` from a row, replacing it with has_* booleans.
+
+    Every dict that leaves this module through an admin-facing route goes
+    through here — key material never reaches the API, only its presence.
+    """
+    out = dict(row)
+    creds = out.pop("credentials", None) or {}
+    out["has_ssh_key"] = bool((creds.get("ssh_private_key_enc") or {}).get("value"))
+    out["has_kubeconfig"] = bool((creds.get("kubeconfig_enc") or {}).get("value"))
+    return out
+
+
+def _merged_credentials(existing: dict | None, data: dict[str, Any], secret_key: str) -> dict:
+    """Fold write-only `ssh_private_key` / `kubeconfig` inputs into the stored
+    credentials dict. Blank/absent keeps the existing value (slack_config
+    convention: a blank admin-UI field never wipes a saved secret)."""
+    creds = dict(existing or {})
+    if data.get("ssh_private_key"):
+        creds["ssh_private_key_enc"] = encrypt_secret(data["ssh_private_key"], secret_key)
+    if data.get("kubeconfig"):
+        creds["kubeconfig_enc"] = encrypt_secret(data["kubeconfig"], secret_key)
+    return creds
+
+
+@contextlib.contextmanager
+def ssh_key_file(infra: dict, secret_key: str) -> Iterator[str | None]:
+    """Yield a private-key path for `infra`: the DB-stored key (decrypted,
+    materialized to a mode-0600 temp file that is removed on exit) when set,
+    else `ssh_key_ref`, else None. DB key wins when both exist."""
+    key = decrypt_secret((infra.get("credentials") or {}).get("ssh_private_key_enc"), secret_key)
+    if not key:
+        yield infra.get("ssh_key_ref")
+        return
+    fd, path = tempfile.mkstemp(prefix="aegis-infra-key-")  # mkstemp => mode 0600
+    try:
+        # OpenSSH rejects a PEM key without a trailing newline; textarea pastes
+        # often lose it.
+        os.write(fd, (key.rstrip("\n") + "\n").encode())
+        os.close(fd)
+        yield path
+    finally:
+        os.unlink(path)
+
+
+@contextlib.contextmanager
+def kubeconfig_file(infra: dict, secret_key: str) -> Iterator[str | None]:
+    """Yield the stored kubeconfig materialized to a mode-0600 temp file
+    (removed on exit), or None when the entry has none."""
+    cfg = decrypt_secret((infra.get("credentials") or {}).get("kubeconfig_enc"), secret_key)
+    if not cfg:
+        yield None
+        return
+    fd, path = tempfile.mkstemp(prefix="aegis-infra-kubeconfig-")  # mkstemp => mode 0600
+    try:
+        os.write(fd, cfg.encode())
+        os.close(fd)
+        yield path
+    finally:
+        os.unlink(path)
 
 
 async def _unique_slug(pool: asyncpg.Pool, base: str) -> str:
@@ -77,12 +151,18 @@ async def _unique_slug(pool: asyncpg.Pool, base: str) -> str:
 
 async def list_infra(pool: asyncpg.Pool) -> list[dict]:
     rows = await pool.fetch(f"SELECT {_SELECT_COLS} FROM infra ORDER BY name")
-    return [dict(r) for r in rows]
+    return [public_infra(dict(r)) for r in rows]
 
 
-async def get_infra(pool: asyncpg.Pool, infra_id: UUID | str) -> dict | None:
+async def get_infra(
+    pool: asyncpg.Pool, infra_id: UUID | str, *, include_credentials: bool = False
+) -> dict | None:
+    """Fetch one row. Only server-side callers (provisioning, probes) may pass
+    ``include_credentials=True`` — never a route that returns the result."""
     row = await pool.fetchrow(f"SELECT {_SELECT_COLS} FROM infra WHERE id = $1", infra_id)
-    return dict(row) if row else None
+    if not row:
+        return None
+    return dict(row) if include_credentials else public_infra(dict(row))
 
 
 async def get_aegis_host(pool: asyncpg.Pool) -> dict | None:
@@ -93,7 +173,7 @@ async def get_aegis_host(pool: asyncpg.Pool) -> dict | None:
     return dict(row) if row else None
 
 
-async def create_infra(pool: asyncpg.Pool, data: dict[str, Any]) -> dict:
+async def create_infra(pool: asyncpg.Pool, data: dict[str, Any], secret_key: str = "") -> dict:
     name = (data.get("name") or "").strip()
     if not name:
         raise ValueError("name is required")
@@ -103,8 +183,8 @@ async def create_infra(pool: asyncpg.Pool, data: dict[str, Any]) -> dict:
     row = await pool.fetchrow(
         f"INSERT INTO infra "
         "(slug, name, kind, host, ssh_user, ssh_port, ssh_key_ref, docker_context, "
-        " hosts_aegis, setup_files, setup_command, metadata) "
-        "VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) "
+        " hosts_aegis, read_only, setup_files, setup_command, metadata, credentials) "
+        "VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) "
         f"RETURNING {_SELECT_COLS}",
         slug,
         name,
@@ -115,21 +195,27 @@ async def create_infra(pool: asyncpg.Pool, data: dict[str, Any]) -> dict:
         data.get("ssh_key_ref"),
         data.get("docker_context"),
         bool(data.get("hosts_aegis", False)),
+        bool(data.get("read_only", False)),
         data.get("setup_files") or [],
         data.get("setup_command"),
         data.get("metadata") or {},
+        _merged_credentials(None, data, secret_key),
     )
-    return dict(row)
+    return public_infra(dict(row))
 
 
-async def update_infra(pool: asyncpg.Pool, infra_id: UUID | str, data: dict[str, Any]) -> dict | None:
-    existing = await get_infra(pool, infra_id)
+async def update_infra(
+    pool: asyncpg.Pool, infra_id: UUID | str, data: dict[str, Any], secret_key: str = ""
+) -> dict | None:
+    existing = await get_infra(pool, infra_id, include_credentials=True)
     if not existing:
         return None
 
     fields = {k: v for k, v in data.items() if k in _EDITABLE_FIELDS and v is not None}
+    if data.get("ssh_private_key") or data.get("kubeconfig"):
+        fields["credentials"] = _merged_credentials(existing.get("credentials"), data, secret_key)
     if not fields:
-        return existing
+        return public_infra(existing)
 
     set_clauses = []
     values: list[Any] = [infra_id]
@@ -142,7 +228,7 @@ async def update_infra(pool: asyncpg.Pool, infra_id: UUID | str, data: dict[str,
         f"UPDATE infra SET {set_sql}, updated_at = now() WHERE id = $1 RETURNING {_SELECT_COLS}",
         *values,
     )
-    return dict(row) if row else None
+    return public_infra(dict(row)) if row else None
 
 
 async def delete_infra(pool: asyncpg.Pool, infra_id: UUID | str) -> bool:
@@ -150,7 +236,9 @@ async def delete_infra(pool: asyncpg.Pool, infra_id: UUID | str) -> bool:
     return result != "DELETE 0"
 
 
-async def _run_ssh(ssh_args: list[str], timeout: int = _SSH_TIMEOUT, stdin: bytes | None = None) -> dict:
+async def _run_ssh(
+    ssh_args: list[str], timeout: int = _SSH_TIMEOUT, stdin: bytes | None = None
+) -> dict:
     """Run an ssh command, optionally piping `stdin`, and capture the result."""
     proc = await asyncio.create_subprocess_exec(
         *ssh_args,
@@ -189,26 +277,54 @@ def _write_file_remote_cmd(path: str, mode: str | None) -> str:
     return cmd
 
 
-async def provision_infra(pool: asyncpg.Pool, infra_id: UUID | str) -> dict:
+async def provision_infra(pool: asyncpg.Pool, infra_id: UUID | str, secret_key: str = "") -> dict:
     """Push setup_files + run setup_command on the target host over SSH.
 
     Returns the updated infra row plus a `log` list of per-step results.
     Never raises — all failures are captured into status='error'/last_error
     so the caller (route) can just serialize the return value.
     """
-    infra = await get_infra(pool, infra_id)
+    infra = await get_infra(pool, infra_id, include_credentials=True)
     if not infra:
         return {"error": "infra not found"}
 
-    if not infra.get("host") or not infra.get("ssh_user") or not infra.get("ssh_key_ref"):
-        error = "host, ssh_user, and ssh_key_ref are all required to provision"
+    if infra.get("kind") == "k8s":
+        # k8s provisioning is a pure connectivity check — allowed even on
+        # read-only entries.
+        return await _provision_k8s(pool, infra, secret_key)
+
+    if infra.get("read_only"):
+        error = "entry is read-only — SSH provisioning writes files/runs commands on the host"
         row = await pool.fetchrow(
             "UPDATE infra SET status = 'error', last_error = $2, updated_at = now() "
             f"WHERE id = $1 RETURNING {_SELECT_COLS}",
             infra_id,
             error,
         )
-        return {**dict(row), "log": [{"step": "preflight", "ok": False, "error": error}]}
+        return {
+            **public_infra(dict(row)),
+            "log": [{"step": "preflight", "ok": False, "error": error}],
+        }
+
+    has_stored_key = bool(
+        ((infra.get("credentials") or {}).get("ssh_private_key_enc") or {}).get("value")
+    )
+    if (
+        not infra.get("host")
+        or not infra.get("ssh_user")
+        or not (infra.get("ssh_key_ref") or has_stored_key)
+    ):
+        error = "host, ssh_user, and an SSH key (stored or ssh_key_ref) are required to provision"
+        row = await pool.fetchrow(
+            "UPDATE infra SET status = 'error', last_error = $2, updated_at = now() "
+            f"WHERE id = $1 RETURNING {_SELECT_COLS}",
+            infra_id,
+            error,
+        )
+        return {
+            **public_infra(dict(row)),
+            "log": [{"step": "preflight", "ok": False, "error": error}],
+        }
 
     await pool.execute(
         "UPDATE infra SET status = 'provisioning', updated_at = now() WHERE id = $1", infra_id
@@ -216,49 +332,63 @@ async def provision_infra(pool: asyncpg.Pool, infra_id: UUID | str) -> dict:
 
     host = infra["host"]
     user = infra["ssh_user"]
-    key_file = infra["ssh_key_ref"]
     port = infra.get("ssh_port") or 22
-
-    def ssh_args(remote_cmd: str) -> list[str]:
-        args = build_ssh_args(host, user, key_file, remote_cmd, connect_timeout=10)
-        # build_ssh_args doesn't take a port; splice `-p <port>` in before the
-        # destination (second-to-last element).
-        if port and port != 22:
-            args = args[:-2] + ["-p", str(port)] + args[-2:]
-        return args
 
     log: list[dict] = []
     setup_files = infra.get("setup_files") or []
     error: str | None = None
 
-    for entry in setup_files:
-        path = entry.get("path") if isinstance(entry, dict) else None
-        content = entry.get("content", "") if isinstance(entry, dict) else None
-        mode = entry.get("mode") if isinstance(entry, dict) else None
-        if not path:
-            log.append({"step": "write_file", "ok": False, "error": "missing path"})
-            error = error or "a setup_files entry is missing 'path'"
-            continue
-        encoded = base64.b64encode((content or "").encode()).decode()
-        result = await _run_ssh(ssh_args(_write_file_remote_cmd(path, mode)), stdin=encoded.encode())
-        log.append({"step": f"write_file:{path}", "ok": result["ok"], **result})
-        if not result["ok"]:
-            error = error or f"failed writing {path}: {result['stderr'][:200]}"
-            break
+    with ssh_key_file(infra, secret_key) as key_file:
+        if not key_file:
+            error = "stored SSH key could not be decrypted (wrong AEGIS_SECRET_KEY?)"
+            log.append({"step": "preflight", "ok": False, "error": error})
+            setup_files = []
 
-    if error is None and infra.get("setup_command"):
-        result = await _run_ssh(ssh_args(infra["setup_command"]), timeout=300)
-        log.append({"step": "setup_command", "ok": result["ok"], **result})
-        if not result["ok"]:
-            error = f"setup_command failed: {result['stderr'][:200]}"
+        def ssh_args(remote_cmd: str) -> list[str]:
+            args = build_ssh_args(host, user, key_file, remote_cmd, connect_timeout=10)
+            # build_ssh_args doesn't take a port; splice `-p <port>` in before the
+            # destination (second-to-last element).
+            if port and port != 22:
+                args = args[:-2] + ["-p", str(port)] + args[-2:]
+            return args
 
+        for entry in setup_files:
+            path = entry.get("path") if isinstance(entry, dict) else None
+            content = entry.get("content", "") if isinstance(entry, dict) else None
+            mode = entry.get("mode") if isinstance(entry, dict) else None
+            if not path:
+                log.append({"step": "write_file", "ok": False, "error": "missing path"})
+                error = error or "a setup_files entry is missing 'path'"
+                continue
+            encoded = base64.b64encode((content or "").encode()).decode()
+            result = await _run_ssh(
+                ssh_args(_write_file_remote_cmd(path, mode)), stdin=encoded.encode()
+            )
+            log.append({"step": f"write_file:{path}", "ok": result["ok"], **result})
+            if not result["ok"]:
+                error = error or f"failed writing {path}: {result['stderr'][:200]}"
+                break
+
+        if error is None and infra.get("setup_command"):
+            result = await _run_ssh(ssh_args(infra["setup_command"]), timeout=300)
+            log.append({"step": "setup_command", "ok": result["ok"], **result})
+            if not result["ok"]:
+                error = f"setup_command failed: {result['stderr'][:200]}"
+
+    return await _finish_provision(pool, infra_id, infra["slug"], error, log)
+
+
+async def _finish_provision(
+    pool: asyncpg.Pool, infra_id: UUID | str, slug: str, error: str | None, log: list[dict]
+) -> dict:
+    """Record the provision outcome (shared by the SSH and k8s paths)."""
     if error is None:
         row = await pool.fetchrow(
             "UPDATE infra SET status = 'ready', last_provisioned_at = now(), "
             f"last_error = NULL, updated_at = now() WHERE id = $1 RETURNING {_SELECT_COLS}",
             infra_id,
         )
-        logger.info("infra_provisioned", infra_id=str(infra_id), slug=infra["slug"])
+        logger.info("infra_provisioned", infra_id=str(infra_id), slug=slug)
     else:
         row = await pool.fetchrow(
             "UPDATE infra SET status = 'error', last_error = $2, updated_at = now() "
@@ -268,4 +398,208 @@ async def provision_infra(pool: asyncpg.Pool, infra_id: UUID | str) -> dict:
         )
         logger.warning("infra_provision_failed", infra_id=str(infra_id), error=error)
 
-    return {**dict(row), "log": log}
+    return {**public_infra(dict(row)), "log": log}
+
+
+async def _provision_k8s(pool: asyncpg.Pool, infra: dict, secret_key: str) -> dict:
+    """Provisioning for kind=k8s: verify the stored kubeconfig can reach the
+    cluster (`kubectl get nodes`). setup_files/setup_command are SSH-only."""
+    infra_id = infra["id"]
+    await pool.execute(
+        "UPDATE infra SET status = 'provisioning', updated_at = now() WHERE id = $1", infra_id
+    )
+
+    log: list[dict] = []
+    error: str | None = None
+    if infra.get("setup_files") or infra.get("setup_command"):
+        log.append(
+            {
+                "step": "note",
+                "ok": True,
+                "stdout": "setup_files/setup_command are SSH-only; skipped for a k8s entry",
+            }
+        )
+
+    with kubeconfig_file(infra, secret_key) as cfg:
+        if not cfg:
+            error = "a kubeconfig is required to provision a k8s entry"
+            log.append({"step": "preflight", "ok": False, "error": error})
+        else:
+            result = await _run_ssh(
+                ["kubectl", "--kubeconfig", cfg, "get", "nodes", "-o", "name"],
+                timeout=_KUBECTL_TIMEOUT,
+            )
+            nodes = [line for line in result["stdout"].splitlines() if line.strip()]
+            log.append(
+                {
+                    "step": "kubectl_get_nodes",
+                    "ok": result["ok"],
+                    "exit_code": result["exit_code"],
+                    "stdout": f"{len(nodes)} node(s) reachable"
+                    if result["ok"]
+                    else result["stdout"],
+                    "stderr": result["stderr"],
+                }
+            )
+            if not result["ok"]:
+                error = f"kubectl get nodes failed: {(result['stderr'] or 'unknown')[:200]}"
+
+    return await _finish_provision(pool, infra_id, infra["slug"], error, log)
+
+
+# ── k8s operations (kind=k8s entries with a stored kubeconfig) ──────────────
+#
+# Mirrors the swarm surface: list/inspect/logs/restart. Each op fetches the
+# entry, materializes the kubeconfig, and execs kubectl (no shell). Errors
+# come back as {"ok": False, "status_code", "error"} so the route can map
+# them onto HTTP without parsing strings.
+
+
+def _k8s_error(status_code: int, error: str) -> dict:
+    return {"ok": False, "status_code": status_code, "error": error}
+
+
+def _validate_k8s_name(value: str, field: str) -> dict | None:
+    if not value or not _K8S_NAME_RE.match(value):
+        return _k8s_error(400, f"invalid {field}: {value!r}")
+    return None
+
+
+async def _kubectl(
+    pool: asyncpg.Pool,
+    infra_id: UUID | str,
+    secret_key: str,
+    args: list[str],
+    timeout: int = _KUBECTL_TIMEOUT,
+    mutating: bool = False,
+) -> dict:
+    infra = await get_infra(pool, infra_id, include_credentials=True)
+    if not infra:
+        return _k8s_error(404, "infra not found")
+    if infra.get("kind") != "k8s":
+        return _k8s_error(400, "not a k8s infra entry")
+    if mutating and infra.get("read_only"):
+        return _k8s_error(403, "entry is read-only — mutating operations are disabled for it")
+    with kubeconfig_file(infra, secret_key) as cfg:
+        if not cfg:
+            return _k8s_error(400, "no kubeconfig stored for this entry")
+        result = await _run_ssh(["kubectl", "--kubeconfig", cfg, *args], timeout=timeout)
+    if not result["ok"]:
+        return _k8s_error(502, (result["stderr"] or result["stdout"] or "kubectl failed")[:300])
+    return {"ok": True, "stdout": result["stdout"]}
+
+
+def _parse_kubectl_items(stdout: str) -> list[dict] | None:
+    try:
+        return json.loads(stdout).get("items", [])
+    except (ValueError, AttributeError):
+        return None
+
+
+def _namespace_args(namespace: str) -> list[str] | dict:
+    """kubectl namespace args; empty namespace means all namespaces."""
+    if not namespace:
+        return ["--all-namespaces"]
+    if err := _validate_k8s_name(namespace, "namespace"):
+        return err
+    return ["-n", namespace]
+
+
+async def k8s_list_pods(
+    pool: asyncpg.Pool, infra_id: UUID | str, secret_key: str, namespace: str = "default"
+) -> dict:
+    ns_args = _namespace_args(namespace)
+    if isinstance(ns_args, dict):
+        return ns_args
+    result = await _kubectl(pool, infra_id, secret_key, ["get", "pods", *ns_args, "-o", "json"])
+    if not result["ok"]:
+        return result
+    items = _parse_kubectl_items(result["stdout"])
+    if items is None:
+        return _k8s_error(502, "kubectl returned unparseable output")
+    pods = []
+    for it in items:
+        statuses = it.get("status", {}).get("containerStatuses") or []
+        pods.append(
+            {
+                "name": it.get("metadata", {}).get("name", ""),
+                "namespace": it.get("metadata", {}).get("namespace", namespace),
+                "phase": it.get("status", {}).get("phase", ""),
+                "ready": f"{sum(1 for c in statuses if c.get('ready'))}/{len(statuses)}",
+                "restarts": sum(c.get("restartCount", 0) for c in statuses),
+                "node": it.get("spec", {}).get("nodeName", ""),
+            }
+        )
+    return {"ok": True, "pods": pods}
+
+
+async def k8s_list_deployments(
+    pool: asyncpg.Pool, infra_id: UUID | str, secret_key: str, namespace: str = "default"
+) -> dict:
+    ns_args = _namespace_args(namespace)
+    if isinstance(ns_args, dict):
+        return ns_args
+    result = await _kubectl(
+        pool, infra_id, secret_key, ["get", "deployments", *ns_args, "-o", "json"]
+    )
+    if not result["ok"]:
+        return result
+    items = _parse_kubectl_items(result["stdout"])
+    if items is None:
+        return _k8s_error(502, "kubectl returned unparseable output")
+    deployments = []
+    for it in items:
+        spec = it.get("spec", {})
+        status = it.get("status", {})
+        containers = spec.get("template", {}).get("spec", {}).get("containers") or []
+        deployments.append(
+            {
+                "name": it.get("metadata", {}).get("name", ""),
+                "namespace": it.get("metadata", {}).get("namespace", namespace),
+                "ready": f"{status.get('readyReplicas') or 0}/{spec.get('replicas') or 0}",
+                "images": [c.get("image", "") for c in containers],
+            }
+        )
+    return {"ok": True, "deployments": deployments}
+
+
+async def k8s_pod_logs(
+    pool: asyncpg.Pool,
+    infra_id: UUID | str,
+    secret_key: str,
+    namespace: str,
+    pod: str,
+    tail: int = 200,
+    container: str | None = None,
+) -> dict:
+    for value, field in ((namespace, "namespace"), (pod, "pod")):
+        if err := _validate_k8s_name(value, field):
+            return err
+    args = ["logs", "-n", namespace, pod, "--tail", str(max(1, min(int(tail), 500)))]
+    if container:
+        if err := _validate_k8s_name(container, "container"):
+            return err
+        args += ["-c", container]
+    result = await _kubectl(pool, infra_id, secret_key, args, timeout=60)
+    if not result["ok"]:
+        return result
+    return {"ok": True, "logs": result["stdout"]}
+
+
+async def k8s_restart_deployment(
+    pool: asyncpg.Pool, infra_id: UUID | str, secret_key: str, namespace: str, name: str
+) -> dict:
+    for value, field in ((namespace, "namespace"), (name, "deployment")):
+        if err := _validate_k8s_name(value, field):
+            return err
+    result = await _kubectl(
+        pool,
+        infra_id,
+        secret_key,
+        ["rollout", "restart", f"deployment/{name}", "-n", namespace],
+        timeout=60,
+        mutating=True,
+    )
+    if not result["ok"]:
+        return result
+    return {"ok": True, "output": result["stdout"].strip()}

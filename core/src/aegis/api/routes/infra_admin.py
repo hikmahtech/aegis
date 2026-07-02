@@ -15,6 +15,8 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 
 from aegis.api.auth import verify_auth
+from aegis.api.deps import get_settings
+from aegis.config import Settings
 from aegis.observability import log_audit
 from aegis.services import infra as infra_service
 
@@ -35,8 +37,14 @@ class InfraCreate(BaseModel):
     ssh_user: str | None = None
     ssh_port: int = 22
     ssh_key_ref: str | None = None
+    # Write-only secrets — encrypted into infra.credentials, never returned
+    # (responses carry has_ssh_key / has_kubeconfig booleans instead).
+    ssh_private_key: str | None = None
+    kubeconfig: str | None = None
     docker_context: str | None = None
     hosts_aegis: bool = False
+    # When true, mutating ops (k8s restarts, SSH provisioning) are refused.
+    read_only: bool = False
     setup_files: list[SetupFile] = []
     setup_command: str | None = None
     metadata: dict[str, Any] = {}
@@ -49,8 +57,12 @@ class InfraUpdate(BaseModel):
     ssh_user: str | None = None
     ssh_port: int | None = None
     ssh_key_ref: str | None = None
+    # Write-only; blank/omitted keeps the stored secret (slack_config convention).
+    ssh_private_key: str | None = None
+    kubeconfig: str | None = None
     docker_context: str | None = None
     hosts_aegis: bool | None = None
+    read_only: bool | None = None
     setup_files: list[SetupFile] | None = None
     setup_command: str | None = None
     metadata: dict[str, Any] | None = None
@@ -78,11 +90,13 @@ async def get_infra(request: Request, infra_id: UUID) -> dict:
 
 
 @router.post("", status_code=201)
-async def create_infra(request: Request, body: InfraCreate) -> dict:
+async def create_infra(
+    request: Request, body: InfraCreate, settings: Settings = Depends(get_settings)
+) -> dict:
     pool = request.app.state.db_pool
     data = body.model_dump()
     data["setup_files"] = _dump_setup_files(body.setup_files)
-    row = await infra_service.create_infra(pool, data)
+    row = await infra_service.create_infra(pool, data, settings.secret_key)
     await log_audit(
         pool,
         actor="api:infra_admin",
@@ -95,12 +109,14 @@ async def create_infra(request: Request, body: InfraCreate) -> dict:
 
 
 @router.put("/{infra_id}")
-async def update_infra(request: Request, infra_id: UUID, body: InfraUpdate) -> dict:
+async def update_infra(
+    request: Request, infra_id: UUID, body: InfraUpdate, settings: Settings = Depends(get_settings)
+) -> dict:
     pool = request.app.state.db_pool
     data = body.model_dump(exclude_unset=True)
     if "setup_files" in data:
         data["setup_files"] = _dump_setup_files(body.setup_files)
-    row = await infra_service.update_infra(pool, infra_id, data)
+    row = await infra_service.update_infra(pool, infra_id, data, settings.secret_key)
     if not row:
         raise HTTPException(404, "Infra entry not found")
     await log_audit(
@@ -129,13 +145,90 @@ async def delete_infra(request: Request, infra_id: UUID) -> None:
     )
 
 
+# ── k8s ops (kind=k8s entries; kubectl against the stored kubeconfig) ───────
+
+
+def _k8s_result(result: dict) -> dict:
+    if not result.get("ok"):
+        raise HTTPException(result.get("status_code", 502), result.get("error", "k8s op failed"))
+    return result
+
+
+@router.get("/{infra_id}/k8s/pods")
+async def k8s_pods(
+    request: Request,
+    infra_id: UUID,
+    namespace: str = "default",
+    settings: Settings = Depends(get_settings),
+) -> dict:
+    pool = request.app.state.db_pool
+    return _k8s_result(
+        await infra_service.k8s_list_pods(pool, infra_id, settings.secret_key, namespace)
+    )
+
+
+@router.get("/{infra_id}/k8s/deployments")
+async def k8s_deployments(
+    request: Request,
+    infra_id: UUID,
+    namespace: str = "default",
+    settings: Settings = Depends(get_settings),
+) -> dict:
+    pool = request.app.state.db_pool
+    return _k8s_result(
+        await infra_service.k8s_list_deployments(pool, infra_id, settings.secret_key, namespace)
+    )
+
+
+@router.get("/{infra_id}/k8s/pods/{namespace}/{pod}/logs")
+async def k8s_pod_logs(
+    request: Request,
+    infra_id: UUID,
+    namespace: str,
+    pod: str,
+    tail: int = 200,
+    settings: Settings = Depends(get_settings),
+) -> dict:
+    pool = request.app.state.db_pool
+    return _k8s_result(
+        await infra_service.k8s_pod_logs(pool, infra_id, settings.secret_key, namespace, pod, tail)
+    )
+
+
+@router.post("/{infra_id}/k8s/deployments/{namespace}/{name}/restart")
+async def k8s_restart_deployment(
+    request: Request,
+    infra_id: UUID,
+    namespace: str,
+    name: str,
+    settings: Settings = Depends(get_settings),
+) -> dict:
+    pool = request.app.state.db_pool
+    result = _k8s_result(
+        await infra_service.k8s_restart_deployment(
+            pool, infra_id, settings.secret_key, namespace, name
+        )
+    )
+    await log_audit(
+        pool,
+        actor="api:infra_admin",
+        action="k8s_deployment_restarted",
+        target_type="infra",
+        target_id=str(infra_id),
+        details={"namespace": namespace, "deployment": name},
+    )
+    return result
+
+
 @router.post("/{infra_id}/provision")
-async def provision_infra(request: Request, infra_id: UUID) -> dict:
+async def provision_infra(
+    request: Request, infra_id: UUID, settings: Settings = Depends(get_settings)
+) -> dict:
     pool = request.app.state.db_pool
     existing = await infra_service.get_infra(pool, infra_id)
     if not existing:
         raise HTTPException(404, "Infra entry not found")
-    result = await infra_service.provision_infra(pool, infra_id)
+    result = await infra_service.provision_infra(pool, infra_id, settings.secret_key)
     await log_audit(
         pool,
         actor="api:infra_admin",

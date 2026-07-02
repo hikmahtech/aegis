@@ -19,8 +19,13 @@ interface InfraFormData {
   ssh_user: string;
   ssh_port: string;
   ssh_key_ref: string;
+  // Write-only: sent only when non-empty; server never returns the values,
+  // only has_ssh_key / has_kubeconfig booleans.
+  ssh_private_key: string;
+  kubeconfig: string;
   docker_context: string;
   hosts_aegis: boolean;
+  read_only: boolean;
   setup_command: string;
   setup_files: SetupFile[];
 }
@@ -32,8 +37,11 @@ const emptyForm: InfraFormData = {
   ssh_user: '',
   ssh_port: '22',
   ssh_key_ref: '',
+  ssh_private_key: '',
+  kubeconfig: '',
   docker_context: '',
   hosts_aegis: false,
+  read_only: false,
   setup_command: '',
   setup_files: [],
 };
@@ -181,6 +189,108 @@ function LiveInspector() {
   );
 }
 
+// ── Per-entry k8s cluster panel (kind=k8s rows with a stored kubeconfig) ───
+function K8sClusterPanel({ infraId, readOnly }: { infraId: string; readOnly: boolean }) {
+  const [namespace, setNamespace] = useState('default');
+  const [pods, setPods] = useState<any[]>([]);
+  const [deployments, setDeployments] = useState<any[]>([]);
+  const [logs, setLogs] = useState<{ pod: string; text: string } | null>(null);
+  const [error, setError] = useState('');
+  const [loading, setLoading] = useState(false);
+  const [msg, setMsg] = useState('');
+
+  const load = async () => {
+    setLoading(true); setError(''); setMsg(''); setLogs(null);
+    try {
+      const [p, d] = await Promise.all([
+        api.infraK8sPods(infraId, namespace),
+        api.infraK8sDeployments(infraId, namespace),
+      ]);
+      setPods(p?.pods || []);
+      setDeployments(d?.deployments || []);
+    } catch (e: any) { setError(e.message || 'load failed'); }
+    finally { setLoading(false); }
+  };
+
+  useEffect(() => { void load(); /* eslint-disable-next-line react-hooks/exhaustive-deps */ }, [infraId]);
+
+  const showLogs = async (pod: string) => {
+    setError('');
+    try {
+      const r = await api.infraK8sPodLogs(infraId, namespace, pod, 200);
+      setLogs({ pod, text: r?.logs || '(no output)' });
+    } catch (e: any) { setError(e.message || 'logs failed'); }
+  };
+
+  const restart = async (name: string) => {
+    if (!confirm(`Restart deployment ${name} in ${namespace}?`)) return;
+    setError(''); setMsg('');
+    try {
+      const r = await api.infraK8sRestartDeployment(infraId, namespace, name);
+      setMsg(r?.output || 'restart submitted');
+    } catch (e: any) { setError(e.message || 'restart failed'); }
+  };
+
+  return (
+    <div className="card" style={{ marginTop: 8, padding: '0.75rem' }}>
+      <div className="filter-bar" style={{ alignItems: 'flex-end' }}>
+        <label style={{ display: 'flex', flexDirection: 'column', fontSize: 12 }}>
+          <span>Namespace</span>
+          <input value={namespace} onChange={e => setNamespace(e.target.value)} className="mono" />
+        </label>
+        <button className="btn btn-sm" disabled={loading} onClick={() => void load()}>
+          {loading ? 'Loading…' : '⟳ Refresh'}
+        </button>
+      </div>
+      {error && <div className="msg-error" style={{ marginTop: 6 }}>{error}</div>}
+      {msg && <p className="msg-success" style={{ marginTop: 6 }}>{msg}</p>}
+
+      <h4 style={{ margin: '0.6rem 0 0.3rem' }}>Deployments</h4>
+      {deployments.length === 0 ? <p className="meta">None in this namespace.</p> : (
+        <table className="data-table">
+          <thead><tr><th>Name</th><th>Ready</th><th>Images</th><th /></tr></thead>
+          <tbody>
+            {deployments.map(d => (
+              <tr key={d.name}>
+                <td className="mono">{d.name}</td>
+                <td>{d.ready}</td>
+                <td className="mono" style={{ fontSize: 12 }}>{(d.images || []).join(', ')}</td>
+                <td>{!readOnly && <button className="btn btn-sm" onClick={() => void restart(d.name)}>Restart</button>}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      )}
+
+      <h4 style={{ margin: '0.6rem 0 0.3rem' }}>Pods</h4>
+      {pods.length === 0 ? <p className="meta">None in this namespace.</p> : (
+        <table className="data-table">
+          <thead><tr><th>Name</th><th>Phase</th><th>Ready</th><th>Restarts</th><th>Node</th><th /></tr></thead>
+          <tbody>
+            {pods.map(p => (
+              <tr key={p.name}>
+                <td className="mono">{p.name}</td>
+                <td>{p.phase}</td>
+                <td>{p.ready}</td>
+                <td>{p.restarts}</td>
+                <td className="mono" style={{ fontSize: 12 }}>{p.node}</td>
+                <td><button className="btn btn-sm" onClick={() => void showLogs(p.name)}>Logs</button></td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      )}
+
+      {logs && (
+        <div style={{ marginTop: 8 }}>
+          <h4 style={{ margin: '0 0 0.3rem' }}>Logs — {logs.pod}</h4>
+          <pre style={{ fontSize: '0.72rem', maxHeight: 300, overflow: 'auto', whiteSpace: 'pre-wrap' }}>{logs.text}</pre>
+        </div>
+      )}
+    </div>
+  );
+}
+
 export default function Infra() {
   const [rows, setRows] = useState<any[]>([]);
   const [loading, setLoading] = useState(true);
@@ -188,6 +298,7 @@ export default function Infra() {
 
   const [showForm, setShowForm] = useState(false);
   const [editingId, setEditingId] = useState<string | null>(null);
+  const [editingSecrets, setEditingSecrets] = useState({ hasSshKey: false, hasKubeconfig: false });
   const [form, setForm] = useState<InfraFormData>({ ...emptyForm });
   const [formError, setFormError] = useState('');
   const [saving, setSaving] = useState(false);
@@ -195,6 +306,7 @@ export default function Infra() {
   const [provisioningId, setProvisioningId] = useState<string | null>(null);
   const [provisionLogs, setProvisionLogs] = useState<Record<string, any[]>>({});
   const [expandedLogId, setExpandedLogId] = useState<string | null>(null);
+  const [expandedK8sId, setExpandedK8sId] = useState<string | null>(null);
 
   const [showLiveInspector, setShowLiveInspector] = useState(false);
 
@@ -210,6 +322,7 @@ export default function Infra() {
 
   const openCreate = () => {
     setEditingId(null);
+    setEditingSecrets({ hasSshKey: false, hasKubeconfig: false });
     setForm({ ...emptyForm });
     setFormError('');
     setShowForm(true);
@@ -217,6 +330,7 @@ export default function Infra() {
 
   const openEdit = (row: any) => {
     setEditingId(row.id);
+    setEditingSecrets({ hasSshKey: !!row.has_ssh_key, hasKubeconfig: !!row.has_kubeconfig });
     setForm({
       name: row.name || '',
       kind: row.kind || 'ssh_host',
@@ -224,8 +338,11 @@ export default function Infra() {
       ssh_user: row.ssh_user || '',
       ssh_port: row.ssh_port != null ? String(row.ssh_port) : '22',
       ssh_key_ref: row.ssh_key_ref || '',
+      ssh_private_key: '',
+      kubeconfig: '',
       docker_context: row.docker_context || '',
       hosts_aegis: !!row.hosts_aegis,
+      read_only: !!row.read_only,
       setup_command: row.setup_command || '',
       setup_files: Array.isArray(row.setup_files)
         ? row.setup_files.map((f: any) => ({ path: f.path || '', content: f.content || '', mode: f.mode || '' }))
@@ -258,6 +375,7 @@ export default function Infra() {
         kind: form.kind,
         host: form.host.trim(),
         hosts_aegis: form.hosts_aegis,
+        read_only: form.read_only,
       };
       if (form.ssh_user.trim()) payload.ssh_user = form.ssh_user.trim();
       if (form.ssh_port.trim()) {
@@ -266,6 +384,8 @@ export default function Infra() {
         payload.ssh_port = port;
       }
       if (form.ssh_key_ref.trim()) payload.ssh_key_ref = form.ssh_key_ref.trim();
+      if (form.ssh_private_key.trim()) payload.ssh_private_key = form.ssh_private_key;
+      if (form.kubeconfig.trim()) payload.kubeconfig = form.kubeconfig;
       if (form.docker_context.trim()) payload.docker_context = form.docker_context.trim();
       if (form.setup_command.trim()) payload.setup_command = form.setup_command.trim();
       payload.setup_files = form.setup_files
@@ -368,9 +488,37 @@ export default function Infra() {
               </div>
 
               <div className="form-group">
-                <label>SSH key ref</label>
+                <label>SSH private key (stored encrypted)</label>
+                <textarea
+                  rows={4}
+                  value={form.ssh_private_key}
+                  onChange={e => setForm({ ...form, ssh_private_key: e.target.value })}
+                  className="mono"
+                  placeholder={editingSecrets.hasSshKey
+                    ? 'set — paste to replace, leave blank to keep'
+                    : '-----BEGIN OPENSSH PRIVATE KEY-----'}
+                />
+              </div>
+
+              <div className="form-group">
+                <label>SSH key ref (optional if key pasted above)</label>
                 <input value={form.ssh_key_ref} onChange={e => setForm({ ...form, ssh_key_ref: e.target.value })} placeholder="path to private key on core host" className="mono" />
               </div>
+
+              {form.kind === 'k8s' && (
+                <div className="form-group">
+                  <label>Kubeconfig (stored encrypted)</label>
+                  <textarea
+                    rows={4}
+                    value={form.kubeconfig}
+                    onChange={e => setForm({ ...form, kubeconfig: e.target.value })}
+                    className="mono"
+                    placeholder={editingSecrets.hasKubeconfig
+                      ? 'set — paste to replace, leave blank to keep'
+                      : 'apiVersion: v1\nkind: Config\n...'}
+                  />
+                </div>
+              )}
 
               <div className="form-group">
                 <label>Docker context (optional)</label>
@@ -386,6 +534,18 @@ export default function Infra() {
                     style={{ width: 'auto', marginRight: '0.4rem' }}
                   />
                   This host runs AEGIS itself
+                </label>
+              </div>
+
+              <div className="form-group">
+                <label>
+                  <input
+                    type="checkbox"
+                    checked={form.read_only}
+                    onChange={e => setForm({ ...form, read_only: e.target.checked })}
+                    style={{ width: 'auto', marginRight: '0.4rem' }}
+                  />
+                  Read-only — block mutating operations (k8s restarts, SSH provisioning)
                 </label>
               </div>
 
@@ -459,7 +619,11 @@ export default function Infra() {
                       <div className="meta mono">{row.slug}</div>
                     </td>
                     <td>{row.kind}</td>
-                    <td className="mono">{row.host}{row.ssh_port ? `:${row.ssh_port}` : ''}</td>
+                    <td className="mono">
+                      {row.host}{row.ssh_port ? `:${row.ssh_port}` : ''}
+                      {row.has_ssh_key && <span title="SSH key stored" style={{ marginLeft: 4 }}>&#128273;</span>}
+                      {row.read_only && <span className="badge badge-neutral" title="Mutating operations blocked" style={{ marginLeft: 4 }}>read-only</span>}
+                    </td>
                     <td>
                       <span className={statusBadgeClass(row.status)}>{row.status}</span>
                       {row.status === 'error' && row.last_error && (
@@ -478,9 +642,15 @@ export default function Infra() {
                             {isExpanded ? 'Hide log' : 'View log'}
                           </button>
                         )}
+                        {row.kind === 'k8s' && row.has_kubeconfig && (
+                          <button className="btn btn-sm" onClick={() => setExpandedK8sId(expandedK8sId === row.id ? null : row.id)}>
+                            {expandedK8sId === row.id ? 'Hide cluster' : 'Cluster'}
+                          </button>
+                        )}
                         <button className="btn-icon" title="Edit" onClick={() => openEdit(row)}>&#9998;</button>
                         <button className="btn-icon btn-icon-danger" title="Delete" onClick={() => handleDelete(row.id, row.name)}>&times;</button>
                       </div>
+                      {expandedK8sId === row.id && <K8sClusterPanel infraId={row.id} readOnly={!!row.read_only} />}
                       {isExpanded && log && (
                         <div style={{ marginTop: 8 }}>
                           {log.length === 0 ? (
