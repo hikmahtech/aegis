@@ -2,6 +2,8 @@
 
 Operational protocol every Todoist Sync API caller in AEGIS must follow. This document describes the invariants that hold across the whole GTD layer — see [`overview.md`](overview.md#todoist-comment-channel) for the higher-level routing flow.
 
+> **GTD-model update (2026-07):** the sync/envelope invariants below are unchanged, but the GTD *shape* has moved to a **label-first** model. **Next** and **Someday/Later** are no longer managed projects — they are the `@next` / `@someday` **labels** (alongside `@waiting` / `@reference`). AEGIS creates **no** managed projects: `bootstrap_if_empty` adopts only the native Todoist **Inbox** (seed `managed_projects: []`), and areas/work-streams are **real, user-owned nested projects**, not `@area/*` / `project/*` labels. Clarify is label-only — it never `item_move`s a task between projects (filing into a project is manual). Sections that still refer to Next/Someday as projects, or to `project/*`/`@area/*` labels as the work-stream taxonomy, describe the pre-2026-07 model.
+
 ## 1. Envelope vs per-command status
 
 `TodoistConnector.commands(commands)` wraps Todoist's `/api/v1/sync` response in the standard AEGIS envelope `{ok, data, error, retryable, external_ref}`. `ok=True` only means the HTTP call returned 200; individual commands inside the batch can still be rejected. Per-command status lives at `data.sync_status[uuid]` — either the literal string `"ok"` or a dict like `{"error": "Item not found", "error_code": 22, "error_tag": "ITEM_NOT_FOUND", "http_code": 404}`.

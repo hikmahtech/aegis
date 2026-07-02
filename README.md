@@ -61,12 +61,14 @@ Then open **http://localhost:8080** (the admin panel) and:
    OpenRouter) or a local one. For fully-local, run `docker compose --profile
    local-llm up -d ollama` then `docker exec aegis-ollama ollama pull <model>` and
    point the base URL at `http://ollama:11434/v1`.
-2. **Personalities** → tweak the agents (or use **Draft with AI**).
-3. **Flows & Config** → enable the scheduled flows you want.
+2. **Agents** → tweak the agents, or create new ones (with **Draft with AI**).
+3. **Flows** → enable the scheduled flows you want.
 
 Cards that need a decision land in the **Interactions** inbox — no chat app
-required. Slack is optional: set `AEGIS_CHANNEL=slack` + the `AEGIS_SLACK_*`
-tokens and `docker compose --profile slack up -d`.
+required. Slack is optional and configured in the admin panel under
+**Configure → Slack** (tokens are encrypted in the DB); the comms service runs
+with or without it, idling as a no-op until it's configured. For local dev you
+can still pass `AEGIS_SLACK_*` env vars and `docker compose --profile slack up -d`.
 
 For Python development (running the services from source) see
 [`AGENTS.md`](AGENTS.md).
@@ -94,11 +96,21 @@ ruff check .
 
 ## Deployment
 
-CI/CD is wired for the maintainer's Docker Swarm (GitHub Actions build + deploy
-on merge to `main`). The deploy jobs are gated to the upstream repository, so a
-**fork's CI only builds and tests** — it won't try to deploy to infrastructure
-you don't have. Point the workflows at your own registry/runner to deploy your
-fork. Infra/ops runbook: [`docs/production.md`](docs/production.md).
+This repo's CI is **test-only** — lint + tests on every push/PR, no image build
+and no deploy. So a fork's CI just validates your changes and never touches
+infrastructure you don't have.
+
+Image build + deploy are kept in a **separate, private infra repo** (Ansible),
+so nothing about the maintainer's registry or cluster lives in the open-source
+repo. That side builds the three images from a checkout of this repo
+(`core/`, `worker/`, `comms/` Dockerfiles — the core image needs the admin panel
+built first, `cd admin-panel/frontend && npm ci && npm run build`) and rolls them
+onto a Docker Swarm (`docker stack deploy`, then `docker service update --force`
+to pick up a freshly-pushed `:latest`).
+
+To deploy your own fork, wire those same two halves however you like. Integration
+secrets (Slack, Todoist, GitHub, …) are entered in the admin panel and stored
+encrypted in the DB — they are **not** baked into images or committed to config.
 
 ## License
 
