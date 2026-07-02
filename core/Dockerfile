@@ -30,6 +30,25 @@ RUN curl -fsSL -o /usr/local/bin/kubectl \
     "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/${TARGETARCH}/kubectl" \
     && chmod +x /usr/local/bin/kubectl
 
+# Optional cloud CLIs — needed only when a registered kubeconfig authenticates
+# via an exec plugin (EKS: `aws eks get-token`, GKE: gke-gcloud-auth-plugin).
+# Space-separated list; supported: "aws". Default empty keeps the image slim.
+#   docker build --build-arg EXTRA_CLOUD_CLIS=aws ...
+# See docs/infrastructure.md ("Cloud CLIs for exec-plugin kubeconfigs").
+ARG EXTRA_CLOUD_CLIS=""
+RUN set -e; for cli in ${EXTRA_CLOUD_CLIS}; do \
+      case "$cli" in \
+        aws) \
+          apt-get update && apt-get install -y --no-install-recommends unzip \
+          && curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-$(uname -m).zip" -o /tmp/awscli.zip \
+          && unzip -q /tmp/awscli.zip -d /tmp \
+          && /tmp/aws/install \
+          && rm -rf /tmp/aws /tmp/awscli.zip /var/lib/apt/lists/* \
+          && aws --version ;; \
+        *) echo "Unsupported EXTRA_CLOUD_CLIS entry: $cli (supported: aws)"; exit 1 ;; \
+      esac; \
+    done
+
 WORKDIR /app
 COPY --from=builder /opt/venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"

@@ -113,7 +113,7 @@ async def test_provision_uses_stored_key(db_pool):
     row = await _create(db_pool, setup_command="echo ok")
     seen: list[list[str]] = []
 
-    async def fake_run_ssh(ssh_args, timeout=30, stdin=None):
+    async def fake_run_ssh(ssh_args, timeout=30, stdin=None, env=None):
         seen.append(ssh_args)
         key_path = ssh_args[ssh_args.index("-i") + 1]
         assert pathlib.Path(key_path).read_text() == FAKE_SSH_KEY + "\n"
@@ -211,7 +211,7 @@ async def test_k8s_list_pods_parses_and_uses_kubeconfig(db_pool):
     row = await _create_k8s(db_pool)
     seen: list[list[str]] = []
 
-    async def fake_run(args, timeout=30, stdin=None):
+    async def fake_run(args, timeout=30, stdin=None, env=None):
         seen.append(args)
         assert args[0] == "kubectl" and args[1] == "--kubeconfig"
         assert pathlib.Path(args[2]).read_text() == FAKE_KUBECONFIG
@@ -261,7 +261,7 @@ async def test_k8s_restart_deployment_argv_and_validation(db_pool):
     row = await _create_k8s(db_pool)
     seen: list[list[str]] = []
 
-    async def fake_run(args, timeout=30, stdin=None):
+    async def fake_run(args, timeout=30, stdin=None, env=None):
         seen.append(args)
         return {"ok": True, "exit_code": 0, "stdout": "deployment.apps/web restarted", "stderr": ""}
 
@@ -380,7 +380,7 @@ async def test_chat_list_pods_dispatches_to_registry_cluster(db_pool):
     row = await _create_k8s(db_pool)
     seen: list[list[str]] = []
 
-    async def fake_run(args, timeout=30, stdin=None):
+    async def fake_run(args, timeout=30, stdin=None, env=None):
         seen.append(args)
         return {"ok": True, "exit_code": 0, "stdout": json.dumps(_POD_JSON), "stderr": ""}
 
@@ -533,3 +533,81 @@ async def test_chat_list_services_unaffected_by_read_only(db_pool):
 
     await _exec_list_services(db_pool, {"context": "swarm"}, ctx)
     connector.run_script.assert_awaited_once()
+
+
+# ── auth env + AWS credentials file (exec-plugin kubeconfigs, e.g. EKS) ─────
+
+FAKE_AUTH_ENV = {"AWS_ACCESS_KEY_ID": "AKIATEST", "AWS_SECRET_ACCESS_KEY": "shhh-secret"}
+FAKE_AWS_CREDS = "[myprofile]\naws_access_key_id = AKIATEST\naws_secret_access_key = shhh-secret"
+
+
+async def test_auth_env_stored_encrypted_and_flagged(db_pool):
+    await _prepare(db_pool)
+    row = await _create_k8s(db_pool, auth_env=FAKE_AUTH_ENV, aws_credentials_file=FAKE_AWS_CREDS)
+
+    assert row["has_auth_env"] is True
+    assert row["has_aws_credentials"] is True
+    assert "shhh-secret" not in str(row)
+
+    stored = await db_pool.fetchval("SELECT credentials FROM infra WHERE id = $1", row["id"])
+    assert stored["auth_env_enc"]["encrypted"] is True
+    assert stored["aws_credentials_file_enc"]["encrypted"] is True
+    assert "shhh-secret" not in str(stored)
+
+    # Blank update keeps both.
+    updated = await infra_service.update_infra(db_pool, row["id"], {"name": "renamed"}, SECRET_KEY)
+    assert updated["has_auth_env"] is True and updated["has_aws_credentials"] is True
+
+
+async def test_k8s_auth_env_injected_into_kubectl(db_pool):
+    await _prepare(db_pool)
+    row = await _create_k8s(db_pool, auth_env=FAKE_AUTH_ENV, aws_credentials_file=FAKE_AWS_CREDS)
+    seen: dict = {}
+
+    async def fake_run(args, timeout=30, stdin=None, env=None):
+        seen["env"] = env
+        seen["creds_path"] = env.get("AWS_SHARED_CREDENTIALS_FILE") if env else None
+        if seen["creds_path"]:
+            seen["creds_content"] = pathlib.Path(seen["creds_path"]).read_text()
+            seen["creds_mode"] = oct(os.stat(seen["creds_path"]).st_mode & 0o777)
+        return {"ok": True, "exit_code": 0, "stdout": json.dumps(_POD_JSON), "stderr": ""}
+
+    with patch.object(infra_service, "_run_ssh", new=AsyncMock(side_effect=fake_run)):
+        result = await infra_service.k8s_list_pods(db_pool, row["id"], SECRET_KEY, "default")
+
+    assert result["ok"] is True
+    assert seen["env"]["AWS_ACCESS_KEY_ID"] == "AKIATEST"
+    assert seen["env"]["AWS_SECRET_ACCESS_KEY"] == "shhh-secret"
+    assert seen["env"].get("PATH")  # os.environ inherited, exec plugin can find binaries
+    assert seen["creds_content"] == FAKE_AWS_CREDS
+    assert seen["creds_mode"] == "0o600"
+    assert not os.path.exists(seen["creds_path"])  # cleaned up after the call
+
+
+async def test_k8s_auth_env_absent_inherits_process_env(db_pool):
+    await _prepare(db_pool)
+    row = await _create_k8s(db_pool)  # kubeconfig only, no auth material
+    seen: dict = {"env": "unset"}
+
+    async def fake_run(args, timeout=30, stdin=None, env=None):
+        seen["env"] = env
+        return {"ok": True, "exit_code": 0, "stdout": json.dumps(_POD_JSON), "stderr": ""}
+
+    with patch.object(infra_service, "_run_ssh", new=AsyncMock(side_effect=fake_run)):
+        await infra_service.k8s_list_pods(db_pool, row["id"], SECRET_KEY, "default")
+    assert seen["env"] is None  # inherit — no override needed
+
+
+async def test_k8s_provision_uses_auth_env(db_pool):
+    await _prepare(db_pool)
+    row = await _create_k8s(db_pool, auth_env=FAKE_AUTH_ENV)
+    seen: dict = {}
+
+    async def fake_run(args, timeout=30, stdin=None, env=None):
+        seen["env"] = env
+        return {"ok": True, "exit_code": 0, "stdout": "node/a\n", "stderr": ""}
+
+    with patch.object(infra_service, "_run_ssh", new=AsyncMock(side_effect=fake_run)):
+        result = await infra_service.provision_infra(db_pool, row["id"], SECRET_KEY)
+    assert result["status"] == "ready"
+    assert seen["env"]["AWS_ACCESS_KEY_ID"] == "AKIATEST"
