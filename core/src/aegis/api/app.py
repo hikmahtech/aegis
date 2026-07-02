@@ -209,6 +209,7 @@ def create_app(run_lifespan: bool = True) -> FastAPI:
         references,
         resources,
         settings,
+        slack,
         system_status,
         temporal,
         todoist,
@@ -248,6 +249,8 @@ def create_app(run_lifespan: bool = True) -> FastAPI:
     app.include_router(activities.router)
     app.include_router(integrations.router)
     app.include_router(llm_backend.router)
+    app.include_router(slack.router)
+    app.include_router(slack.internal_router)
     app.include_router(interactions.router)
     app.include_router(webhooks.router)
     app.include_router(capture.router)

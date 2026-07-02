@@ -209,6 +209,11 @@ def create_delivery_app(adapter: SlackAdapter, settings: TelegramSettings) -> Fa
             "service": "aegis-comms",
             "version": "2.0.0",
             "channel": settings.channel,
+            # True once Slack is fully configured (bot token + app token,
+            # DB-or-env resolved). Lets a watchdog tell "intentionally idle,
+            # never configured" apart from "should be connected but isn't"
+            # (which the `inbound` block below already covers).
+            "configured": bool(settings.slack_bot_token and settings.slack_app_token),
         }
 
         # The generic `inbound` block carries the Socket Mode liveness signal.
@@ -368,18 +373,69 @@ def create_delivery_app(adapter: SlackAdapter, settings: TelegramSettings) -> Fa
 
 
 def _startup_error(settings: TelegramSettings) -> str | None:
-    """Return an error string if the channel is not ready to boot, else None.
+    """Return a reason string if Slack is not configured, else None.
 
     Pure helper — no side effects — so it can be tested independently. Slack is
-    the only channel.
+    the only channel. Historically this gated whether `run()` booted at all;
+    it no longer does (comms must stay up with or without Slack) — it is now
+    used only to produce a human-readable reason for the `slack_disabled` log.
     """
     if not settings.slack_bot_token or not settings.slack_app_token:
-        return "slack_tokens_missing (need AEGIS_SLACK_BOT_TOKEN + AEGIS_SLACK_APP_TOKEN)"
+        return "slack_tokens_missing (need AEGIS_SLACK_BOT_TOKEN + AEGIS_SLACK_APP_TOKEN, env or DB)"
     return None
 
 
+async def _fetch_resolved_slack_config(settings: TelegramSettings) -> dict[str, Any] | None:
+    """GET the DB-resolved Slack config from core: `{configured, bot_token,
+    app_token, signing_secret, channel}` (core itself already falls back to
+    its own env vars, so this is cleartext-resolved either way).
+
+    Comms has no DB access of its own — this is the only way it learns about
+    tokens set via the admin UI. Returns None on ANY failure (core down, 404,
+    network, bad body) so the caller falls back to comms' own env-sourced
+    settings. Mirrors the existing agent-fetch httpx pattern in
+    `adapters/slack.py`. Never raises.
+    """
+    if not settings.core_url:
+        return None
+    url = f"{settings.core_url.rstrip('/')}/api/internal/slack-config"
+    headers = {"X-API-Key": settings.api_key} if settings.api_key else {}
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.get(url, headers=headers)
+            resp.raise_for_status()
+            return resp.json()
+    except Exception as exc:  # noqa: BLE001 — fall back to env config on any error
+        logger.warning("slack_config_fetch_failed", error=str(exc)[:200])
+        return None
+
+
+def _merge_slack_config(settings: TelegramSettings, db_config: dict[str, Any] | None) -> None:
+    """Merge the DB-resolved Slack config onto `settings` in place.
+
+    DB value wins when present (non-empty); otherwise the env-sourced value
+    pydantic-settings already loaded onto `settings` is kept untouched. A
+    None `db_config` (fetch failed, or core has nothing) is a no-op — pure
+    env fallback.
+    """
+    if not db_config:
+        return
+    settings.slack_bot_token = db_config.get("bot_token") or settings.slack_bot_token
+    settings.slack_app_token = db_config.get("app_token") or settings.slack_app_token
+    settings.slack_signing_secret = db_config.get("signing_secret") or settings.slack_signing_secret
+    settings.channel = db_config.get("channel") or settings.channel
+
+
 async def run() -> None:
-    """Start the Slack adapter (Socket Mode inbound) + delivery server."""
+    """Start the delivery server (always) + Slack Socket Mode inbound (only
+    when Slack ends up configured, via DB or env).
+
+    comms must be resilient to running with or without Slack: `/api/health`
+    and `/api/deliver/*` need to be reachable regardless, so core/worker and
+    the watchdog never see comms as "down" just because nobody has wired up
+    Slack yet. This function must never exit/return before the delivery
+    server is up, and never `return` early because Slack isn't configured.
+    """
     from aegis_comms.telemetry import setup_telemetry
 
     setup_telemetry()
@@ -398,27 +454,34 @@ async def run() -> None:
         cache_logger_on_first_use=True,
     )
 
-    err = _startup_error(settings)
-    if err is not None:
-        logger.error("startup_error", reason=err)
-        return
+    db_config = await _fetch_resolved_slack_config(settings)
+    _merge_slack_config(settings, db_config)
 
-    logger.info("slack_starting", core_url=settings.core_url)
+    slack_ready = bool(settings.slack_bot_token and settings.slack_app_token)
 
+    # Always build the delivery app + server — /api/health and /api/deliver/*
+    # must be up whether or not Slack is configured.
     adapter = SlackAdapter(settings)
     app = create_delivery_app(adapter, settings)
     config = uvicorn.Config(app, host=settings.host, port=settings.port, log_level="info")
     server = uvicorn.Server(config)
 
-    try:
-        await asyncio.gather(
-            adapter.start_listener(),
-            server.serve(),
-            _run_slack_socket_probe(adapter),
-        )
-    finally:
-        await adapter.stop()
-        logger.info("slack_stopped")
+    if slack_ready:
+        logger.info("slack_starting", core_url=settings.core_url)
+        try:
+            await asyncio.gather(
+                adapter.start_listener(),
+                server.serve(),
+                _run_slack_socket_probe(adapter),
+            )
+        finally:
+            await adapter.stop()
+            logger.info("slack_stopped")
+    else:
+        # Expected/idle state, not an error — log at info once and just serve
+        # the delivery app (no Socket Mode listener, no liveness probe).
+        logger.info("slack_disabled", reason=_startup_error(settings))
+        await server.serve()
 
 
 if __name__ == "__main__":

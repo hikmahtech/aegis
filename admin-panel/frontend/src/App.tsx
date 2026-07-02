@@ -24,6 +24,7 @@ import Agents from './pages/Agents';
 import References from './pages/References';
 import Resources from './pages/Resources';
 import Settings from './pages/Settings';
+import SlackConfig from './pages/SlackConfig';
 import Workflows from './pages/Workflows';
 
 export default function App() {
@@ -40,6 +41,7 @@ export default function App() {
           <Route path="/flows" element={<Flows />} />
           <Route path="/models" element={<ModelsProviders />} />
           <Route path="/integrations" element={<Integrations />} />
+          <Route path="/slack" element={<SlackConfig />} />
           <Route path="/resources" element={<Resources />} />
           <Route path="/agents" element={<Agents />} />
           <Route path="/agents/:id" element={<AgentDetail />} />

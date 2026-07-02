@@ -202,6 +202,11 @@ export const api = {
   testLlmBackend: (body: any) =>
     apiFetch<any>('/api/admin/llm-backend/test', { method: 'POST', body: JSON.stringify(body) }),
 
+  // Slack (DB-backed, write-only secrets)
+  getSlackConfig: () => apiFetch<any>('/api/admin/slack-config'),
+  saveSlackConfig: (body: any) =>
+    apiFetch<any>('/api/admin/slack-config', { method: 'PUT', body: JSON.stringify(body) }),
+
   // Homelab Guardian
   homelabState: () => apiFetch<any>('/api/admin/homelab/state'),
   homelabRunFlow: (flow: string) => apiFetch<any>(`/api/admin/homelab/${flow}/run`, { method: 'POST' }),

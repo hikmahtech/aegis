@@ -32,6 +32,7 @@ const NAV: { section: string; items: { path: string; label: string }[] }[] = [
       { path: '/flows', label: 'Flows' },
       { path: '/models', label: 'Models' },
       { path: '/integrations', label: 'Integrations' },
+      { path: '/slack', label: 'Slack' },
       { path: '/resources', label: 'Resources' },
     ],
   },

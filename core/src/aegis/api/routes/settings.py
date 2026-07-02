@@ -15,7 +15,7 @@ router = APIRouter(prefix="/api/settings", dependencies=[Depends(verify_auth)])
 # and MUST NOT be exposed through this generic key/value editor — their values
 # hold API keys / OAuth secrets (stored plaintext when AEGIS_SECRET_KEY is unset).
 # Hidden here so they never leave the server via the generic endpoint.
-_HIDDEN_KEYS = {"llm_backend", "google_oauth", "todoist_api_key"}
+_HIDDEN_KEYS = {"llm_backend", "google_oauth", "todoist_api_key", "slack"}
 _HIDDEN_PREFIXES = ("integration:",)
 
 
