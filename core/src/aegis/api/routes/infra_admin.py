@@ -38,9 +38,14 @@ class InfraCreate(BaseModel):
     ssh_port: int = 22
     ssh_key_ref: str | None = None
     # Write-only secrets — encrypted into infra.credentials, never returned
-    # (responses carry has_ssh_key / has_kubeconfig booleans instead).
+    # (responses carry has_* booleans instead). auth_env is an env-var map
+    # injected into kubectl calls (exec-plugin kubeconfigs, e.g. EKS);
+    # aws_credentials_file is a ~/.aws/credentials-style ini for profile users,
+    # materialized as AWS_SHARED_CREDENTIALS_FILE per call.
     ssh_private_key: str | None = None
     kubeconfig: str | None = None
+    auth_env: dict[str, str] | None = None
+    aws_credentials_file: str | None = None
     docker_context: str | None = None
     hosts_aegis: bool = False
     # When true, mutating ops (k8s restarts, SSH provisioning) are refused.
@@ -60,6 +65,8 @@ class InfraUpdate(BaseModel):
     # Write-only; blank/omitted keeps the stored secret (slack_config convention).
     ssh_private_key: str | None = None
     kubeconfig: str | None = None
+    auth_env: dict[str, str] | None = None
+    aws_credentials_file: str | None = None
     docker_context: str | None = None
     hosts_aegis: bool | None = None
     read_only: bool | None = None

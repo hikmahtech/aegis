@@ -165,7 +165,7 @@ When a `todoist_task_id` is on the alert (pandora APP-<n>: clarify path), the fl
 | **KnowledgeConnector** (`knowledge.py`) | HTTP client for knowledge-service and router across Gmail/Drive/Notion native search + searxng. Reads: `search` (semantic chunk retrieval), `ask` (multi-doc synthesis), `list_content_items`, `get_content_status`, `get_content_chunks`, `get_stats`, `get_recent_jobs`. Writes: `ingest_content` (fetch → chunk → embed). |
 | **TodoistConnector** (`todoist.py`) | Todoist Sync API client + outbox + per-command status checks (`check_sync_status`) — see [`todoist-sync-protocol.md`](todoist-sync-protocol.md). |
 | **RemoteScriptConnector** (`remote_script.py`) | SSH to the configured host. Runs predefined infra scripts and the Kimi CLI for alert investigations against fixed checkouts under `AEGIS_REMOTE_SCRIPT_REPO_BASE` (workspace-relative `metadata.path`, no JIT cloning). When `AEGIS_REMOTE_SCRIPT_KIMI_HOST` is set and reachable (node-b), kimi runs are wrapped in a live-attachable `tmux` session there; otherwise they fall back to the base host (node-a). |
-| **HomelabConnector** (`homelab.py`) | Docker Swarm + Kubernetes commands via SSH. Gated by the `homelab_enabled` setting. Backs Pandora's infra chat tools. |
+| **HomelabConnector** (`homelab.py`) | Docker Swarm + Kubernetes commands via SSH. Gated by the `homelab_enabled` setting. Backs worker flows; Pandora's infra chat tools run via RemoteScriptConnector, or directly through the infrastructure registry for registered k8s clusters (`services/infra.py` — see [`infrastructure.md`](../infrastructure.md)). |
 | **SearchConnector** (`search.py`) | SearxNG HTTP client. Used by the `research_topic` chat tool. |
 | **ClickHouseConnector** (`clickhouse.py`) | Read-only market data queries. Powers Maou's market tools. |
 
@@ -195,11 +195,11 @@ Before every LLM call, `_gather_knowledge_context()` runs a semantic chunk searc
 
 19 route modules in `core/src/aegis/api/routes/`. All `/api/*` routes require Basic auth or `X-API-Key`. Exceptions: `GET /health` and webhook paths under `/api/webhooks/*` (HMAC-verified).
 
-Route modules: `agents`, `audit`, `capture`, `chat`, `gmail_reauth`, `health`, `homelab`, `infra`, `interactions`, `knowledge`, `market`, `mcp`, `money`, `observability`, `overview`, `references`, `resources`, `settings`, `temporal`, `webhooks`.
+Route modules: `agents`, `audit`, `capture`, `chat`, `gmail_reauth`, `health`, `homelab`, `infra`, `infra_admin` (infrastructure registry CRUD + provisioning + k8s ops — see [`infrastructure.md`](../infrastructure.md)), `interactions`, `knowledge`, `market`, `mcp`, `money`, `observability`, `overview`, `references`, `resources`, `settings`, `slack`, `system_status`, `temporal`, `todoist`, `webhooks`.
 
 ## Admin UI
 
-React SPA served by Core at `/`. Top-level pages include: Overview, Interactions, Workflows, Personalities + Personality detail, Chat, Knowledge / Entities / Content / Content detail, Resources, AuditLog, Money, Homelab, Infra, Market, References.
+React SPA served by Core at `/`. Top-level pages include: Overview, Interactions, Workflows, Personalities + Personality detail, Chat, Knowledge / Entities / Content / Content detail, Resources, AuditLog, Money, Homelab, Infra (the infrastructure registry — register SSH hosts / the swarm / k8s clusters with encrypted pasted credentials; see [`infrastructure.md`](../infrastructure.md)), Market, References.
 
 ## Comms (Slack)
 

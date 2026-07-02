@@ -20,9 +20,11 @@ interface InfraFormData {
   ssh_port: string;
   ssh_key_ref: string;
   // Write-only: sent only when non-empty; server never returns the values,
-  // only has_ssh_key / has_kubeconfig booleans.
+  // only has_* booleans.
   ssh_private_key: string;
   kubeconfig: string;
+  auth_env: string; // KEY=value lines, parsed to a dict on save
+  aws_credentials_file: string;
   docker_context: string;
   hosts_aegis: boolean;
   read_only: boolean;
@@ -39,6 +41,8 @@ const emptyForm: InfraFormData = {
   ssh_key_ref: '',
   ssh_private_key: '',
   kubeconfig: '',
+  auth_env: '',
+  aws_credentials_file: '',
   docker_context: '',
   hosts_aegis: false,
   read_only: false,
@@ -298,7 +302,9 @@ export default function Infra() {
 
   const [showForm, setShowForm] = useState(false);
   const [editingId, setEditingId] = useState<string | null>(null);
-  const [editingSecrets, setEditingSecrets] = useState({ hasSshKey: false, hasKubeconfig: false });
+  const [editingSecrets, setEditingSecrets] = useState({
+    hasSshKey: false, hasKubeconfig: false, hasAuthEnv: false, hasAwsCredentials: false,
+  });
   const [form, setForm] = useState<InfraFormData>({ ...emptyForm });
   const [formError, setFormError] = useState('');
   const [saving, setSaving] = useState(false);
@@ -322,7 +328,7 @@ export default function Infra() {
 
   const openCreate = () => {
     setEditingId(null);
-    setEditingSecrets({ hasSshKey: false, hasKubeconfig: false });
+    setEditingSecrets({ hasSshKey: false, hasKubeconfig: false, hasAuthEnv: false, hasAwsCredentials: false });
     setForm({ ...emptyForm });
     setFormError('');
     setShowForm(true);
@@ -330,7 +336,12 @@ export default function Infra() {
 
   const openEdit = (row: any) => {
     setEditingId(row.id);
-    setEditingSecrets({ hasSshKey: !!row.has_ssh_key, hasKubeconfig: !!row.has_kubeconfig });
+    setEditingSecrets({
+      hasSshKey: !!row.has_ssh_key,
+      hasKubeconfig: !!row.has_kubeconfig,
+      hasAuthEnv: !!row.has_auth_env,
+      hasAwsCredentials: !!row.has_aws_credentials,
+    });
     setForm({
       name: row.name || '',
       kind: row.kind || 'ssh_host',
@@ -340,6 +351,8 @@ export default function Infra() {
       ssh_key_ref: row.ssh_key_ref || '',
       ssh_private_key: '',
       kubeconfig: '',
+      auth_env: '',
+      aws_credentials_file: '',
       docker_context: row.docker_context || '',
       hosts_aegis: !!row.hosts_aegis,
       read_only: !!row.read_only,
@@ -386,6 +399,18 @@ export default function Infra() {
       if (form.ssh_key_ref.trim()) payload.ssh_key_ref = form.ssh_key_ref.trim();
       if (form.ssh_private_key.trim()) payload.ssh_private_key = form.ssh_private_key;
       if (form.kubeconfig.trim()) payload.kubeconfig = form.kubeconfig;
+      if (form.auth_env.trim()) {
+        const env: Record<string, string> = {};
+        for (const line of form.auth_env.split('\n')) {
+          const t = line.trim();
+          if (!t || t.startsWith('#')) continue;
+          const eq = t.indexOf('=');
+          if (eq <= 0) { setFormError(`Auth env: expected KEY=value, got "${t}"`); setSaving(false); return; }
+          env[t.slice(0, eq).trim()] = t.slice(eq + 1).trim();
+        }
+        if (Object.keys(env).length) payload.auth_env = env;
+      }
+      if (form.aws_credentials_file.trim()) payload.aws_credentials_file = form.aws_credentials_file;
       if (form.docker_context.trim()) payload.docker_context = form.docker_context.trim();
       if (form.setup_command.trim()) payload.setup_command = form.setup_command.trim();
       payload.setup_files = form.setup_files
@@ -506,18 +531,46 @@ export default function Infra() {
               </div>
 
               {form.kind === 'k8s' && (
-                <div className="form-group">
-                  <label>Kubeconfig (stored encrypted)</label>
-                  <textarea
-                    rows={4}
-                    value={form.kubeconfig}
-                    onChange={e => setForm({ ...form, kubeconfig: e.target.value })}
-                    className="mono"
-                    placeholder={editingSecrets.hasKubeconfig
-                      ? 'set — paste to replace, leave blank to keep'
-                      : 'apiVersion: v1\nkind: Config\n...'}
-                  />
-                </div>
+                <>
+                  <div className="form-group">
+                    <label>Kubeconfig (stored encrypted)</label>
+                    <textarea
+                      rows={4}
+                      value={form.kubeconfig}
+                      onChange={e => setForm({ ...form, kubeconfig: e.target.value })}
+                      className="mono"
+                      placeholder={editingSecrets.hasKubeconfig
+                        ? 'set — paste to replace, leave blank to keep'
+                        : 'apiVersion: v1\nkind: Config\n...'}
+                    />
+                  </div>
+
+                  <div className="form-group">
+                    <label>Auth env (KEY=value per line, stored encrypted — for exec-plugin kubeconfigs)</label>
+                    <textarea
+                      rows={3}
+                      value={form.auth_env}
+                      onChange={e => setForm({ ...form, auth_env: e.target.value })}
+                      className="mono"
+                      placeholder={editingSecrets.hasAuthEnv
+                        ? 'set — paste to replace, leave blank to keep'
+                        : 'AWS_ACCESS_KEY_ID=...\nAWS_SECRET_ACCESS_KEY=...\n# or AWS_PROFILE=myprofile with a credentials file below'}
+                    />
+                  </div>
+
+                  <div className="form-group">
+                    <label>AWS credentials file (optional, stored encrypted — for AWS_PROFILE users)</label>
+                    <textarea
+                      rows={3}
+                      value={form.aws_credentials_file}
+                      onChange={e => setForm({ ...form, aws_credentials_file: e.target.value })}
+                      className="mono"
+                      placeholder={editingSecrets.hasAwsCredentials
+                        ? 'set — paste to replace, leave blank to keep'
+                        : '[myprofile]\naws_access_key_id = ...\naws_secret_access_key = ...'}
+                    />
+                  </div>
+                </>
               )}
 
               <div className="form-group">

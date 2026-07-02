@@ -88,18 +88,25 @@ def public_infra(row: dict) -> dict:
     creds = out.pop("credentials", None) or {}
     out["has_ssh_key"] = bool((creds.get("ssh_private_key_enc") or {}).get("value"))
     out["has_kubeconfig"] = bool((creds.get("kubeconfig_enc") or {}).get("value"))
+    out["has_auth_env"] = bool((creds.get("auth_env_enc") or {}).get("value"))
+    out["has_aws_credentials"] = bool((creds.get("aws_credentials_file_enc") or {}).get("value"))
     return out
 
 
 def _merged_credentials(existing: dict | None, data: dict[str, Any], secret_key: str) -> dict:
-    """Fold write-only `ssh_private_key` / `kubeconfig` inputs into the stored
-    credentials dict. Blank/absent keeps the existing value (slack_config
-    convention: a blank admin-UI field never wipes a saved secret)."""
+    """Fold the write-only secret inputs (`ssh_private_key`, `kubeconfig`,
+    `auth_env`, `aws_credentials_file`) into the stored credentials dict.
+    Blank/absent keeps the existing value (slack_config convention: a blank
+    admin-UI field never wipes a saved secret)."""
     creds = dict(existing or {})
     if data.get("ssh_private_key"):
         creds["ssh_private_key_enc"] = encrypt_secret(data["ssh_private_key"], secret_key)
     if data.get("kubeconfig"):
         creds["kubeconfig_enc"] = encrypt_secret(data["kubeconfig"], secret_key)
+    if data.get("auth_env"):
+        creds["auth_env_enc"] = encrypt_secret(json.dumps(data["auth_env"]), secret_key)
+    if data.get("aws_credentials_file"):
+        creds["aws_credentials_file_enc"] = encrypt_secret(data["aws_credentials_file"], secret_key)
     return creds
 
 
@@ -136,6 +143,44 @@ def kubeconfig_file(infra: dict, secret_key: str) -> Iterator[str | None]:
         os.write(fd, cfg.encode())
         os.close(fd)
         yield path
+    finally:
+        os.unlink(path)
+
+
+@contextlib.contextmanager
+def k8s_auth_env(infra: dict, secret_key: str) -> Iterator[dict | None]:
+    """Yield the environment for kubectl subprocesses on this entry, or None
+    when the entry has no stored auth material (inherit the process env).
+
+    Exec-plugin kubeconfigs (EKS `aws eks get-token`, GKE) read cloud
+    credentials from the environment: the stored `auth_env` map is layered on
+    top of os.environ, and a stored AWS credentials file (ini, for profile
+    users) is materialized to a mode-0600 temp file exposed as
+    AWS_SHARED_CREDENTIALS_FILE for the duration of the call.
+    """
+    creds = infra.get("credentials") or {}
+    auth_env_raw = decrypt_secret(creds.get("auth_env_enc"), secret_key)
+    aws_file = decrypt_secret(creds.get("aws_credentials_file_enc"), secret_key)
+    if not auth_env_raw and not aws_file:
+        yield None
+        return
+
+    env = dict(os.environ)
+    if auth_env_raw:
+        try:
+            env.update({str(k): str(v) for k, v in json.loads(auth_env_raw).items()})
+        except (ValueError, AttributeError):
+            logger.warning("infra_auth_env_unparseable", slug=infra.get("slug"))
+    if not aws_file:
+        yield env
+        return
+
+    fd, path = tempfile.mkstemp(prefix="aegis-infra-awscreds-")  # mkstemp => mode 0600
+    try:
+        os.write(fd, aws_file.encode())
+        os.close(fd)
+        env["AWS_SHARED_CREDENTIALS_FILE"] = path
+        yield env
     finally:
         os.unlink(path)
 
@@ -237,14 +282,19 @@ async def delete_infra(pool: asyncpg.Pool, infra_id: UUID | str) -> bool:
 
 
 async def _run_ssh(
-    ssh_args: list[str], timeout: int = _SSH_TIMEOUT, stdin: bytes | None = None
+    ssh_args: list[str],
+    timeout: int = _SSH_TIMEOUT,
+    stdin: bytes | None = None,
+    env: dict | None = None,
 ) -> dict:
-    """Run an ssh command, optionally piping `stdin`, and capture the result."""
+    """Run a command argv (ssh, kubectl, ...), optionally piping `stdin` and
+    overriding the environment, and capture the result."""
     proc = await asyncio.create_subprocess_exec(
         *ssh_args,
         stdin=asyncio.subprocess.PIPE if stdin is not None else None,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
+        env=env,
     )
     try:
         stdout, stderr = await asyncio.wait_for(proc.communicate(input=stdin), timeout=timeout)
@@ -420,7 +470,7 @@ async def _provision_k8s(pool: asyncpg.Pool, infra: dict, secret_key: str) -> di
             }
         )
 
-    with kubeconfig_file(infra, secret_key) as cfg:
+    with kubeconfig_file(infra, secret_key) as cfg, k8s_auth_env(infra, secret_key) as env:
         if not cfg:
             error = "a kubeconfig is required to provision a k8s entry"
             log.append({"step": "preflight", "ok": False, "error": error})
@@ -428,6 +478,7 @@ async def _provision_k8s(pool: asyncpg.Pool, infra: dict, secret_key: str) -> di
             result = await _run_ssh(
                 ["kubectl", "--kubeconfig", cfg, "get", "nodes", "-o", "name"],
                 timeout=_KUBECTL_TIMEOUT,
+                env=env,
             )
             nodes = [line for line in result["stdout"].splitlines() if line.strip()]
             log.append(
@@ -480,10 +531,10 @@ async def _kubectl(
         return _k8s_error(400, "not a k8s infra entry")
     if mutating and infra.get("read_only"):
         return _k8s_error(403, "entry is read-only — mutating operations are disabled for it")
-    with kubeconfig_file(infra, secret_key) as cfg:
+    with kubeconfig_file(infra, secret_key) as cfg, k8s_auth_env(infra, secret_key) as env:
         if not cfg:
             return _k8s_error(400, "no kubeconfig stored for this entry")
-        result = await _run_ssh(["kubectl", "--kubeconfig", cfg, *args], timeout=timeout)
+        result = await _run_ssh(["kubectl", "--kubeconfig", cfg, *args], timeout=timeout, env=env)
     if not result["ok"]:
         return _k8s_error(502, (result["stderr"] or result["stdout"] or "kubectl failed")[:300])
     return {"ok": True, "stdout": result["stdout"]}
