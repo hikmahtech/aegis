@@ -187,6 +187,108 @@ function LiveInspector() {
   );
 }
 
+// ── Per-entry k8s cluster panel (kind=k8s rows with a stored kubeconfig) ───
+function K8sClusterPanel({ infraId }: { infraId: string }) {
+  const [namespace, setNamespace] = useState('default');
+  const [pods, setPods] = useState<any[]>([]);
+  const [deployments, setDeployments] = useState<any[]>([]);
+  const [logs, setLogs] = useState<{ pod: string; text: string } | null>(null);
+  const [error, setError] = useState('');
+  const [loading, setLoading] = useState(false);
+  const [msg, setMsg] = useState('');
+
+  const load = async () => {
+    setLoading(true); setError(''); setMsg(''); setLogs(null);
+    try {
+      const [p, d] = await Promise.all([
+        api.infraK8sPods(infraId, namespace),
+        api.infraK8sDeployments(infraId, namespace),
+      ]);
+      setPods(p?.pods || []);
+      setDeployments(d?.deployments || []);
+    } catch (e: any) { setError(e.message || 'load failed'); }
+    finally { setLoading(false); }
+  };
+
+  useEffect(() => { void load(); /* eslint-disable-next-line react-hooks/exhaustive-deps */ }, [infraId]);
+
+  const showLogs = async (pod: string) => {
+    setError('');
+    try {
+      const r = await api.infraK8sPodLogs(infraId, namespace, pod, 200);
+      setLogs({ pod, text: r?.logs || '(no output)' });
+    } catch (e: any) { setError(e.message || 'logs failed'); }
+  };
+
+  const restart = async (name: string) => {
+    if (!confirm(`Restart deployment ${name} in ${namespace}?`)) return;
+    setError(''); setMsg('');
+    try {
+      const r = await api.infraK8sRestartDeployment(infraId, namespace, name);
+      setMsg(r?.output || 'restart submitted');
+    } catch (e: any) { setError(e.message || 'restart failed'); }
+  };
+
+  return (
+    <div className="card" style={{ marginTop: 8, padding: '0.75rem' }}>
+      <div className="filter-bar" style={{ alignItems: 'flex-end' }}>
+        <label style={{ display: 'flex', flexDirection: 'column', fontSize: 12 }}>
+          <span>Namespace</span>
+          <input value={namespace} onChange={e => setNamespace(e.target.value)} className="mono" />
+        </label>
+        <button className="btn btn-sm" disabled={loading} onClick={() => void load()}>
+          {loading ? 'Loading…' : '⟳ Refresh'}
+        </button>
+      </div>
+      {error && <div className="msg-error" style={{ marginTop: 6 }}>{error}</div>}
+      {msg && <p className="msg-success" style={{ marginTop: 6 }}>{msg}</p>}
+
+      <h4 style={{ margin: '0.6rem 0 0.3rem' }}>Deployments</h4>
+      {deployments.length === 0 ? <p className="meta">None in this namespace.</p> : (
+        <table className="data-table">
+          <thead><tr><th>Name</th><th>Ready</th><th>Images</th><th /></tr></thead>
+          <tbody>
+            {deployments.map(d => (
+              <tr key={d.name}>
+                <td className="mono">{d.name}</td>
+                <td>{d.ready}</td>
+                <td className="mono" style={{ fontSize: 12 }}>{(d.images || []).join(', ')}</td>
+                <td><button className="btn btn-sm" onClick={() => void restart(d.name)}>Restart</button></td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      )}
+
+      <h4 style={{ margin: '0.6rem 0 0.3rem' }}>Pods</h4>
+      {pods.length === 0 ? <p className="meta">None in this namespace.</p> : (
+        <table className="data-table">
+          <thead><tr><th>Name</th><th>Phase</th><th>Ready</th><th>Restarts</th><th>Node</th><th /></tr></thead>
+          <tbody>
+            {pods.map(p => (
+              <tr key={p.name}>
+                <td className="mono">{p.name}</td>
+                <td>{p.phase}</td>
+                <td>{p.ready}</td>
+                <td>{p.restarts}</td>
+                <td className="mono" style={{ fontSize: 12 }}>{p.node}</td>
+                <td><button className="btn btn-sm" onClick={() => void showLogs(p.name)}>Logs</button></td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      )}
+
+      {logs && (
+        <div style={{ marginTop: 8 }}>
+          <h4 style={{ margin: '0 0 0.3rem' }}>Logs — {logs.pod}</h4>
+          <pre style={{ fontSize: '0.72rem', maxHeight: 300, overflow: 'auto', whiteSpace: 'pre-wrap' }}>{logs.text}</pre>
+        </div>
+      )}
+    </div>
+  );
+}
+
 export default function Infra() {
   const [rows, setRows] = useState<any[]>([]);
   const [loading, setLoading] = useState(true);
@@ -202,6 +304,7 @@ export default function Infra() {
   const [provisioningId, setProvisioningId] = useState<string | null>(null);
   const [provisionLogs, setProvisionLogs] = useState<Record<string, any[]>>({});
   const [expandedLogId, setExpandedLogId] = useState<string | null>(null);
+  const [expandedK8sId, setExpandedK8sId] = useState<string | null>(null);
 
   const [showLiveInspector, setShowLiveInspector] = useState(false);
 
@@ -522,9 +625,15 @@ export default function Infra() {
                             {isExpanded ? 'Hide log' : 'View log'}
                           </button>
                         )}
+                        {row.kind === 'k8s' && row.has_kubeconfig && (
+                          <button className="btn btn-sm" onClick={() => setExpandedK8sId(expandedK8sId === row.id ? null : row.id)}>
+                            {expandedK8sId === row.id ? 'Hide cluster' : 'Cluster'}
+                          </button>
+                        )}
                         <button className="btn-icon" title="Edit" onClick={() => openEdit(row)}>&#9998;</button>
                         <button className="btn-icon btn-icon-danger" title="Delete" onClick={() => handleDelete(row.id, row.name)}>&times;</button>
                       </div>
+                      {expandedK8sId === row.id && <K8sClusterPanel infraId={row.id} />}
                       {isExpanded && log && (
                         <div style={{ marginTop: 8 }}>
                           {log.length === 0 ? (

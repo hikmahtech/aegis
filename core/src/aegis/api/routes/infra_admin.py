@@ -142,6 +142,81 @@ async def delete_infra(request: Request, infra_id: UUID) -> None:
     )
 
 
+# ── k8s ops (kind=k8s entries; kubectl against the stored kubeconfig) ───────
+
+
+def _k8s_result(result: dict) -> dict:
+    if not result.get("ok"):
+        raise HTTPException(result.get("status_code", 502), result.get("error", "k8s op failed"))
+    return result
+
+
+@router.get("/{infra_id}/k8s/pods")
+async def k8s_pods(
+    request: Request,
+    infra_id: UUID,
+    namespace: str = "default",
+    settings: Settings = Depends(get_settings),
+) -> dict:
+    pool = request.app.state.db_pool
+    return _k8s_result(
+        await infra_service.k8s_list_pods(pool, infra_id, settings.secret_key, namespace)
+    )
+
+
+@router.get("/{infra_id}/k8s/deployments")
+async def k8s_deployments(
+    request: Request,
+    infra_id: UUID,
+    namespace: str = "default",
+    settings: Settings = Depends(get_settings),
+) -> dict:
+    pool = request.app.state.db_pool
+    return _k8s_result(
+        await infra_service.k8s_list_deployments(pool, infra_id, settings.secret_key, namespace)
+    )
+
+
+@router.get("/{infra_id}/k8s/pods/{namespace}/{pod}/logs")
+async def k8s_pod_logs(
+    request: Request,
+    infra_id: UUID,
+    namespace: str,
+    pod: str,
+    tail: int = 200,
+    settings: Settings = Depends(get_settings),
+) -> dict:
+    pool = request.app.state.db_pool
+    return _k8s_result(
+        await infra_service.k8s_pod_logs(pool, infra_id, settings.secret_key, namespace, pod, tail)
+    )
+
+
+@router.post("/{infra_id}/k8s/deployments/{namespace}/{name}/restart")
+async def k8s_restart_deployment(
+    request: Request,
+    infra_id: UUID,
+    namespace: str,
+    name: str,
+    settings: Settings = Depends(get_settings),
+) -> dict:
+    pool = request.app.state.db_pool
+    result = _k8s_result(
+        await infra_service.k8s_restart_deployment(
+            pool, infra_id, settings.secret_key, namespace, name
+        )
+    )
+    await log_audit(
+        pool,
+        actor="api:infra_admin",
+        action="k8s_deployment_restarted",
+        target_type="infra",
+        target_id=str(infra_id),
+        details={"namespace": namespace, "deployment": name},
+    )
+    return result
+
+
 @router.post("/{infra_id}/provision")
 async def provision_infra(
     request: Request, infra_id: UUID, settings: Settings = Depends(get_settings)

@@ -7,6 +7,7 @@ exactly what mocks would hide.
 
 from __future__ import annotations
 
+import json
 import os
 import pathlib
 from unittest.mock import AsyncMock, patch
@@ -146,3 +147,165 @@ async def test_provision_preflight_fails_without_any_key(db_pool):
     result = await infra_service.provision_infra(db_pool, row["id"], SECRET_KEY)
     assert result["status"] == "error"
     assert "SSH key" in result["last_error"]
+
+
+# ── k8s: kubeconfig materialization, ops, provisioning ──────────────────────
+
+
+def test_kubeconfig_file_materializes_and_cleans_up():
+    from aegis.crypto import encrypt_secret
+
+    infra = {"credentials": {"kubeconfig_enc": encrypt_secret(FAKE_KUBECONFIG, SECRET_KEY)}}
+    with infra_service.kubeconfig_file(infra, SECRET_KEY) as path:
+        assert pathlib.Path(path).read_text() == FAKE_KUBECONFIG
+        assert oct(os.stat(path).st_mode & 0o777) == "0o600"
+    assert not os.path.exists(path)
+
+    with infra_service.kubeconfig_file({}, SECRET_KEY) as path:
+        assert path is None
+
+
+async def _create_k8s(db_pool, **overrides):
+    data = {
+        "name": "test-cred-cluster",
+        "slug": "test-cred-cluster",
+        "kind": "k8s",
+        "host": None,
+        "ssh_user": None,
+        "ssh_private_key": None,
+        "kubeconfig": FAKE_KUBECONFIG,
+        **overrides,
+    }
+    return await _create(db_pool, **data)
+
+
+_POD_JSON = {
+    "items": [
+        {
+            "metadata": {"name": "web-1", "namespace": "default"},
+            "spec": {"nodeName": "node-a"},
+            "status": {
+                "phase": "Running",
+                "containerStatuses": [{"ready": True, "restartCount": 3}],
+            },
+        }
+    ]
+}
+
+_DEPLOY_JSON = {
+    "items": [
+        {
+            "metadata": {"name": "web", "namespace": "default"},
+            "spec": {
+                "replicas": 2,
+                "template": {"spec": {"containers": [{"image": "nginx:1"}]}},
+            },
+            "status": {"readyReplicas": 2},
+        }
+    ]
+}
+
+
+async def test_k8s_list_pods_parses_and_uses_kubeconfig(db_pool):
+    await _prepare(db_pool)
+    row = await _create_k8s(db_pool)
+    seen: list[list[str]] = []
+
+    async def fake_run(args, timeout=30, stdin=None):
+        seen.append(args)
+        assert args[0] == "kubectl" and args[1] == "--kubeconfig"
+        assert pathlib.Path(args[2]).read_text() == FAKE_KUBECONFIG
+        return {"ok": True, "exit_code": 0, "stdout": json.dumps(_POD_JSON), "stderr": ""}
+
+    with patch.object(infra_service, "_run_ssh", new=AsyncMock(side_effect=fake_run)):
+        result = await infra_service.k8s_list_pods(db_pool, row["id"], SECRET_KEY, "default")
+
+    assert result["ok"] is True
+    assert result["pods"] == [
+        {
+            "name": "web-1",
+            "namespace": "default",
+            "phase": "Running",
+            "ready": "1/1",
+            "restarts": 3,
+            "node": "node-a",
+        }
+    ]
+    assert seen[0][3:] == ["get", "pods", "-n", "default", "-o", "json"]
+
+
+async def test_k8s_list_deployments_parses(db_pool):
+    await _prepare(db_pool)
+    row = await _create_k8s(db_pool)
+    with patch.object(
+        infra_service,
+        "_run_ssh",
+        new=AsyncMock(
+            return_value={
+                "ok": True,
+                "exit_code": 0,
+                "stdout": json.dumps(_DEPLOY_JSON),
+                "stderr": "",
+            }
+        ),
+    ):
+        result = await infra_service.k8s_list_deployments(db_pool, row["id"], SECRET_KEY)
+    assert result["ok"] is True
+    assert result["deployments"] == [
+        {"name": "web", "namespace": "default", "ready": "2/2", "images": ["nginx:1"]}
+    ]
+
+
+async def test_k8s_restart_deployment_argv_and_validation(db_pool):
+    await _prepare(db_pool)
+    row = await _create_k8s(db_pool)
+    seen: list[list[str]] = []
+
+    async def fake_run(args, timeout=30, stdin=None):
+        seen.append(args)
+        return {"ok": True, "exit_code": 0, "stdout": "deployment.apps/web restarted", "stderr": ""}
+
+    with patch.object(infra_service, "_run_ssh", new=AsyncMock(side_effect=fake_run)):
+        result = await infra_service.k8s_restart_deployment(
+            db_pool, row["id"], SECRET_KEY, "default", "web"
+        )
+        assert result["ok"] is True
+        assert seen[0][3:] == ["rollout", "restart", "deployment/web", "-n", "default"]
+
+        # Flag-injection attempt is rejected before any exec.
+        bad = await infra_service.k8s_restart_deployment(
+            db_pool, row["id"], SECRET_KEY, "default", "--all"
+        )
+    assert bad["ok"] is False and bad["status_code"] == 400
+    assert len(seen) == 1
+
+
+async def test_k8s_ops_reject_non_k8s_entry(db_pool):
+    await _prepare(db_pool)
+    row = await _create(db_pool)  # kind=swarm
+    result = await infra_service.k8s_list_pods(db_pool, row["id"], SECRET_KEY)
+    assert result["ok"] is False and result["status_code"] == 400
+
+
+async def test_k8s_provision_checks_cluster_connectivity(db_pool):
+    await _prepare(db_pool)
+    row = await _create_k8s(db_pool)
+    with patch.object(
+        infra_service,
+        "_run_ssh",
+        new=AsyncMock(
+            return_value={"ok": True, "exit_code": 0, "stdout": "node/a\nnode/b\n", "stderr": ""}
+        ),
+    ):
+        result = await infra_service.provision_infra(db_pool, row["id"], SECRET_KEY)
+    assert result["status"] == "ready"
+    steps = {s["step"]: s for s in result["log"]}
+    assert steps["kubectl_get_nodes"]["stdout"] == "2 node(s) reachable"
+
+
+async def test_k8s_provision_fails_without_kubeconfig(db_pool):
+    await _prepare(db_pool)
+    row = await _create_k8s(db_pool, kubeconfig=None)
+    result = await infra_service.provision_infra(db_pool, row["id"], SECRET_KEY)
+    assert result["status"] == "error"
+    assert "kubeconfig" in result["last_error"]

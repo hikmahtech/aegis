@@ -177,6 +177,14 @@ export const api = {
     apiFetch<any>(`/api/admin/infra/${id}`, { method: 'DELETE' }),
   provisionInfra: (id: string) =>
     apiFetch<any>(`/api/admin/infra/${id}/provision`, { method: 'POST' }),
+  infraK8sPods: (id: string, namespace = 'default') =>
+    apiFetch<any>(`/api/admin/infra/${id}/k8s/pods?namespace=${namespace}`),
+  infraK8sDeployments: (id: string, namespace = 'default') =>
+    apiFetch<any>(`/api/admin/infra/${id}/k8s/deployments?namespace=${namespace}`),
+  infraK8sPodLogs: (id: string, namespace: string, pod: string, tail = 200) =>
+    apiFetch<any>(`/api/admin/infra/${id}/k8s/pods/${namespace}/${pod}/logs?tail=${tail}`),
+  infraK8sRestartDeployment: (id: string, namespace: string, name: string) =>
+    apiFetch<any>(`/api/admin/infra/${id}/k8s/deployments/${namespace}/${name}/restart`, { method: 'POST' }),
 
   // System monitoring (AEGIS's own stack status)
   systemStatus: () => apiFetch<any>('/api/admin/system/status'),

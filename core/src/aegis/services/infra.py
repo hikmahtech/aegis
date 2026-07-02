@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import contextlib
+import json
 import os
 import re
 import shlex
@@ -62,8 +63,13 @@ _EDITABLE_FIELDS = (
 _SLUG_RE = re.compile(r"[^a-z0-9]+")
 
 _SSH_TIMEOUT = 30
+_KUBECTL_TIMEOUT = 30
 _PROVISION_STDOUT_CAP = 16 * 1024
 _PROVISION_STDERR_CAP = 4 * 1024
+
+# RFC-1123-ish: what kubectl accepts for namespaces/pod/deployment names.
+# Validated even though we exec (no shell) so a name can't smuggle in a flag.
+_K8S_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9.-]{0,252}$")
 
 
 def _slugify(name: str) -> str:
@@ -110,6 +116,23 @@ def ssh_key_file(infra: dict, secret_key: str) -> Iterator[str | None]:
         # OpenSSH rejects a PEM key without a trailing newline; textarea pastes
         # often lose it.
         os.write(fd, (key.rstrip("\n") + "\n").encode())
+        os.close(fd)
+        yield path
+    finally:
+        os.unlink(path)
+
+
+@contextlib.contextmanager
+def kubeconfig_file(infra: dict, secret_key: str) -> Iterator[str | None]:
+    """Yield the stored kubeconfig materialized to a mode-0600 temp file
+    (removed on exit), or None when the entry has none."""
+    cfg = decrypt_secret((infra.get("credentials") or {}).get("kubeconfig_enc"), secret_key)
+    if not cfg:
+        yield None
+        return
+    fd, path = tempfile.mkstemp(prefix="aegis-infra-kubeconfig-")  # mkstemp => mode 0600
+    try:
+        os.write(fd, cfg.encode())
         os.close(fd)
         yield path
     finally:
@@ -263,6 +286,9 @@ async def provision_infra(pool: asyncpg.Pool, infra_id: UUID | str, secret_key: 
     if not infra:
         return {"error": "infra not found"}
 
+    if infra.get("kind") == "k8s":
+        return await _provision_k8s(pool, infra, secret_key)
+
     has_stored_key = bool(
         ((infra.get("credentials") or {}).get("ssh_private_key_enc") or {}).get("value")
     )
@@ -332,13 +358,20 @@ async def provision_infra(pool: asyncpg.Pool, infra_id: UUID | str, secret_key: 
             if not result["ok"]:
                 error = f"setup_command failed: {result['stderr'][:200]}"
 
+    return await _finish_provision(pool, infra_id, infra["slug"], error, log)
+
+
+async def _finish_provision(
+    pool: asyncpg.Pool, infra_id: UUID | str, slug: str, error: str | None, log: list[dict]
+) -> dict:
+    """Record the provision outcome (shared by the SSH and k8s paths)."""
     if error is None:
         row = await pool.fetchrow(
             "UPDATE infra SET status = 'ready', last_provisioned_at = now(), "
             f"last_error = NULL, updated_at = now() WHERE id = $1 RETURNING {_SELECT_COLS}",
             infra_id,
         )
-        logger.info("infra_provisioned", infra_id=str(infra_id), slug=infra["slug"])
+        logger.info("infra_provisioned", infra_id=str(infra_id), slug=slug)
     else:
         row = await pool.fetchrow(
             "UPDATE infra SET status = 'error', last_error = $2, updated_at = now() "
@@ -349,3 +382,191 @@ async def provision_infra(pool: asyncpg.Pool, infra_id: UUID | str, secret_key: 
         logger.warning("infra_provision_failed", infra_id=str(infra_id), error=error)
 
     return {**public_infra(dict(row)), "log": log}
+
+
+async def _provision_k8s(pool: asyncpg.Pool, infra: dict, secret_key: str) -> dict:
+    """Provisioning for kind=k8s: verify the stored kubeconfig can reach the
+    cluster (`kubectl get nodes`). setup_files/setup_command are SSH-only."""
+    infra_id = infra["id"]
+    await pool.execute(
+        "UPDATE infra SET status = 'provisioning', updated_at = now() WHERE id = $1", infra_id
+    )
+
+    log: list[dict] = []
+    error: str | None = None
+    if infra.get("setup_files") or infra.get("setup_command"):
+        log.append(
+            {
+                "step": "note",
+                "ok": True,
+                "stdout": "setup_files/setup_command are SSH-only; skipped for a k8s entry",
+            }
+        )
+
+    with kubeconfig_file(infra, secret_key) as cfg:
+        if not cfg:
+            error = "a kubeconfig is required to provision a k8s entry"
+            log.append({"step": "preflight", "ok": False, "error": error})
+        else:
+            result = await _run_ssh(
+                ["kubectl", "--kubeconfig", cfg, "get", "nodes", "-o", "name"],
+                timeout=_KUBECTL_TIMEOUT,
+            )
+            nodes = [line for line in result["stdout"].splitlines() if line.strip()]
+            log.append(
+                {
+                    "step": "kubectl_get_nodes",
+                    "ok": result["ok"],
+                    "exit_code": result["exit_code"],
+                    "stdout": f"{len(nodes)} node(s) reachable"
+                    if result["ok"]
+                    else result["stdout"],
+                    "stderr": result["stderr"],
+                }
+            )
+            if not result["ok"]:
+                error = f"kubectl get nodes failed: {(result['stderr'] or 'unknown')[:200]}"
+
+    return await _finish_provision(pool, infra_id, infra["slug"], error, log)
+
+
+# ── k8s operations (kind=k8s entries with a stored kubeconfig) ──────────────
+#
+# Mirrors the swarm surface: list/inspect/logs/restart. Each op fetches the
+# entry, materializes the kubeconfig, and execs kubectl (no shell). Errors
+# come back as {"ok": False, "status_code", "error"} so the route can map
+# them onto HTTP without parsing strings.
+
+
+def _k8s_error(status_code: int, error: str) -> dict:
+    return {"ok": False, "status_code": status_code, "error": error}
+
+
+def _validate_k8s_name(value: str, field: str) -> dict | None:
+    if not value or not _K8S_NAME_RE.match(value):
+        return _k8s_error(400, f"invalid {field}: {value!r}")
+    return None
+
+
+async def _kubectl(
+    pool: asyncpg.Pool,
+    infra_id: UUID | str,
+    secret_key: str,
+    args: list[str],
+    timeout: int = _KUBECTL_TIMEOUT,
+) -> dict:
+    infra = await get_infra(pool, infra_id, include_credentials=True)
+    if not infra:
+        return _k8s_error(404, "infra not found")
+    if infra.get("kind") != "k8s":
+        return _k8s_error(400, "not a k8s infra entry")
+    with kubeconfig_file(infra, secret_key) as cfg:
+        if not cfg:
+            return _k8s_error(400, "no kubeconfig stored for this entry")
+        result = await _run_ssh(["kubectl", "--kubeconfig", cfg, *args], timeout=timeout)
+    if not result["ok"]:
+        return _k8s_error(502, (result["stderr"] or result["stdout"] or "kubectl failed")[:300])
+    return {"ok": True, "stdout": result["stdout"]}
+
+
+def _parse_kubectl_items(stdout: str) -> list[dict] | None:
+    try:
+        return json.loads(stdout).get("items", [])
+    except (ValueError, AttributeError):
+        return None
+
+
+async def k8s_list_pods(
+    pool: asyncpg.Pool, infra_id: UUID | str, secret_key: str, namespace: str = "default"
+) -> dict:
+    if err := _validate_k8s_name(namespace, "namespace"):
+        return err
+    result = await _kubectl(
+        pool, infra_id, secret_key, ["get", "pods", "-n", namespace, "-o", "json"]
+    )
+    if not result["ok"]:
+        return result
+    items = _parse_kubectl_items(result["stdout"])
+    if items is None:
+        return _k8s_error(502, "kubectl returned unparseable output")
+    pods = []
+    for it in items:
+        statuses = it.get("status", {}).get("containerStatuses") or []
+        pods.append(
+            {
+                "name": it.get("metadata", {}).get("name", ""),
+                "namespace": it.get("metadata", {}).get("namespace", namespace),
+                "phase": it.get("status", {}).get("phase", ""),
+                "ready": f"{sum(1 for c in statuses if c.get('ready'))}/{len(statuses)}",
+                "restarts": sum(c.get("restartCount", 0) for c in statuses),
+                "node": it.get("spec", {}).get("nodeName", ""),
+            }
+        )
+    return {"ok": True, "pods": pods}
+
+
+async def k8s_list_deployments(
+    pool: asyncpg.Pool, infra_id: UUID | str, secret_key: str, namespace: str = "default"
+) -> dict:
+    if err := _validate_k8s_name(namespace, "namespace"):
+        return err
+    result = await _kubectl(
+        pool, infra_id, secret_key, ["get", "deployments", "-n", namespace, "-o", "json"]
+    )
+    if not result["ok"]:
+        return result
+    items = _parse_kubectl_items(result["stdout"])
+    if items is None:
+        return _k8s_error(502, "kubectl returned unparseable output")
+    deployments = []
+    for it in items:
+        spec = it.get("spec", {})
+        status = it.get("status", {})
+        containers = spec.get("template", {}).get("spec", {}).get("containers") or []
+        deployments.append(
+            {
+                "name": it.get("metadata", {}).get("name", ""),
+                "namespace": it.get("metadata", {}).get("namespace", namespace),
+                "ready": f"{status.get('readyReplicas') or 0}/{spec.get('replicas') or 0}",
+                "images": [c.get("image", "") for c in containers],
+            }
+        )
+    return {"ok": True, "deployments": deployments}
+
+
+async def k8s_pod_logs(
+    pool: asyncpg.Pool,
+    infra_id: UUID | str,
+    secret_key: str,
+    namespace: str,
+    pod: str,
+    tail: int = 200,
+) -> dict:
+    for value, field in ((namespace, "namespace"), (pod, "pod")):
+        if err := _validate_k8s_name(value, field):
+            return err
+    tail = max(1, min(int(tail), 500))
+    result = await _kubectl(
+        pool, infra_id, secret_key, ["logs", "-n", namespace, pod, "--tail", str(tail)], timeout=60
+    )
+    if not result["ok"]:
+        return result
+    return {"ok": True, "logs": result["stdout"]}
+
+
+async def k8s_restart_deployment(
+    pool: asyncpg.Pool, infra_id: UUID | str, secret_key: str, namespace: str, name: str
+) -> dict:
+    for value, field in ((namespace, "namespace"), (name, "deployment")):
+        if err := _validate_k8s_name(value, field):
+            return err
+    result = await _kubectl(
+        pool,
+        infra_id,
+        secret_key,
+        ["rollout", "restart", f"deployment/{name}", "-n", namespace],
+        timeout=60,
+    )
+    if not result["ok"]:
+        return result
+    return {"ok": True, "output": result["stdout"].strip()}
