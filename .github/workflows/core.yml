@@ -1,4 +1,8 @@
-name: "Core — Test, Build & Deploy"
+name: "Core — Test"
+
+# Public repo: test only. Image build + swarm deploy live in the private
+# homelab-gitops infra repo (ansible), not here — so forks/clones never build
+# or deploy, and no infra/registry details leak into the open-source repo.
 
 on:
   push:
@@ -21,10 +25,6 @@ on:
       - "personalities/**"
       - "pyproject.toml"
       - ".github/workflows/core.yml"
-
-env:
-  DOCKER_HUB_USERNAME: ${{ vars.DOCKERHUB_USERNAME }}
-  IMAGE: ${{ vars.DOCKERHUB_USERNAME }}/aegis-core
 
 jobs:
   test:
@@ -49,76 +49,3 @@ jobs:
 
       - name: Test
         run: pytest tests/core/ -v --tb=short --cov=core/src/aegis --cov-report=term-missing --cov-report=xml
-
-  build:
-    name: Build & Push
-    needs: [test]
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && vars.DEPLOY_ENABLED == 'true'
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-node@v4
-        with:
-          node-version: "20"
-
-      - name: Build admin panel
-        run: |
-          cd admin-panel/frontend
-          npm ci
-          npm run build
-
-      - uses: docker/setup-buildx-action@v3
-
-      - uses: docker/login-action@v3
-        with:
-          username: ${{ env.DOCKER_HUB_USERNAME }}
-          password: ${{ secrets.DOCKER_HUB_TOKEN }}
-
-      - id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ${{ env.IMAGE }}
-          tags: |
-            type=raw,value=latest
-            type=sha,prefix=
-
-      - uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: core/Dockerfile
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha,scope=core
-          cache-to: type=gha,mode=max,scope=core
-
-  deploy:
-    name: Deploy to Swarm
-    needs: [build]
-    runs-on: [self-hosted, swarm, linux, x64]
-    if: github.ref == 'refs/heads/main' && vars.DEPLOY_ENABLED == 'true'
-    steps:
-      - name: Update aegis_core service
-        env:
-          IMAGE_TAG: ${{ github.sha }}
-          SWARM_MANAGER_HOST: ${{ secrets.SWARM_MANAGER_HOST }}
-          SWARM_MANAGER_USER: ${{ secrets.SWARM_MANAGER_USER }}
-          SSH_PRIVATE_KEY: ${{ secrets.SWARM_SSH_PRIVATE_KEY }}
-        run: |
-          SHORT_SHA="${IMAGE_TAG:0:7}"
-          mkdir -p ~/.ssh
-          echo "$SSH_PRIVATE_KEY" > ~/.ssh/swarm_key
-          chmod 600 ~/.ssh/swarm_key
-          ssh-keyscan -H "$SWARM_MANAGER_HOST" >> ~/.ssh/known_hosts 2>/dev/null || true
-
-          echo "Deploying aegis_core:${SHORT_SHA}..."
-          ssh -i ~/.ssh/swarm_key -o StrictHostKeyChecking=no \
-            "${SWARM_MANAGER_USER}@${SWARM_MANAGER_HOST}" \
-            "docker pull ${{ vars.DOCKERHUB_USERNAME }}/aegis-core:${SHORT_SHA} && \
-             docker service update --with-registry-auth \
-              --image ${{ vars.DOCKERHUB_USERNAME }}/aegis-core:${SHORT_SHA} \
-              --env-add GIT_SHA=${SHORT_SHA} \
-              --force aegis_core"
-
-          rm -f ~/.ssh/swarm_key
