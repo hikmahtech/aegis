@@ -225,6 +225,7 @@ export const api = {
     return apiFetch<any[]>(`/api/admin/todoist/tasks${qs ? `?${qs}` : ''}`);
   },
   todoistProjects: () => apiFetch<any[]>('/api/admin/todoist/projects'),
+  todoistLabels: () => apiFetch<any[]>('/api/admin/todoist/labels'),
   todoistClarifyLog: (params?: { limit?: number; applied?: boolean }) => {
     const q = new URLSearchParams();
     if (params?.limit) q.set('limit', String(params.limit));

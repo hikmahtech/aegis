@@ -11,8 +11,8 @@ Five base GTD outcomes from `classify_one`:
 
 - ``trash``       — label `#trash` + complete
 - ``reference``   — add `@reference` label (state-as-label, no item_move)
-- ``someday``     — move task into the Someday/Later project (single source
-                  of truth; no `@someday` label)
+- ``someday``     — add `@someday` label (state-as-label, no item_move),
+                  mirroring `reference`/`@reference`
 - ``2_min``       — in-window: spawn Telegram card (Do now / Defer / Trash);
                   out-of-window: add `@5min` label
 - ``next_action`` — label update (optional `due.string="tomorrow"` from defer).

@@ -165,20 +165,24 @@ class ReviewActivities:
             if not isinstance(managed, dict):
                 return empty
             inbox_id = managed.get("inbox")
-            # Stale next-actions: open tasks carrying a project/* work-stream
-            # label, untouched for 14 days.
+            # Stale next-actions: open tasks living in a leaf work-stream
+            # project (real nested Todoist project with a parent AREA
+            # project — excludes AREA projects and the Inbox), untouched
+            # for 14 days. Todoist restructure (2026-07): project/* labels
+            # are retired; work-stream membership is now the project's
+            # parent_id being set.
             stale_next_count = await conn.fetchval(
                 "SELECT count(*) FROM todoist_tasks t "
-                "WHERE EXISTS (SELECT 1 FROM unnest(t.labels) lab "
-                "             WHERE lab LIKE 'project/%') "
+                "JOIN todoist_projects p ON p.id = t.project_id "
+                "WHERE p.parent_id IS NOT NULL "
                 "AND NOT t.is_completed "
                 "AND t.updated_at < now() - interval '14 days'"
             )
             stale_top3 = [
                 r["content"] for r in await conn.fetch(
-                    "SELECT content FROM todoist_tasks t "
-                    "WHERE EXISTS (SELECT 1 FROM unnest(t.labels) lab "
-                    "             WHERE lab LIKE 'project/%') "
+                    "SELECT t.content FROM todoist_tasks t "
+                    "JOIN todoist_projects p ON p.id = t.project_id "
+                    "WHERE p.parent_id IS NOT NULL "
                     "AND NOT t.is_completed "
                     "AND t.updated_at < now() - interval '14 days' "
                     "ORDER BY t.updated_at ASC LIMIT 3"
@@ -306,14 +310,19 @@ class ReviewActivities:
                    **(cfg_raw if isinstance(cfg_raw, dict) else {})}
             base["_top_n"] = int(cfg["top_n"])
 
-            # Stalled: non-managed, non-archived project with open tasks but
-            # NO actionable task (every open task carries a state label).
+            # Stalled: leaf work-stream project (has a parent AREA project;
+            # excludes top-level AREA projects and the Inbox) with open
+            # tasks but NO actionable task (every open task carries a state
+            # label). Todoist restructure (2026-07): areas/work-streams are
+            # real nested projects — parent_id IS NULL for AREA projects,
+            # NOT NULL for leaf work-streams — so only leaves are eligible.
             base["stalled_projects"] = [
                 {"project_id": r["id"], "name": r["name"], "url": r["url"]}
                 for r in await conn.fetch(
                     "SELECT p.id, p.name, p.raw->>'url' AS url "
                     "FROM todoist_projects p "
                     "WHERE NOT p.is_managed AND NOT p.is_archived "
+                    "AND p.parent_id IS NOT NULL "
                     "AND EXISTS (SELECT 1 FROM todoist_tasks t "
                     "  WHERE t.project_id=p.id AND NOT t.is_completed) "
                     "AND NOT EXISTS (SELECT 1 FROM todoist_tasks t "
@@ -337,19 +346,22 @@ class ReviewActivities:
                     int(cfg["waiting_days"]),
                 )
             ]
-            # Slipping: overdue OR a project/* next-action stale past threshold.
+            # Slipping: overdue OR a leaf work-stream-project next-action
+            # stale past threshold (project/* labels retired — see
+            # stale_next_actions_count above for the same join pattern).
             base["slipping_items"] = [
                 {"task_id": r["id"], "content": r["content"],
                  "due_date": r["due_date"].isoformat() if r["due_date"] else None,
                  "url": r["url"]}
                 for r in await conn.fetch(
-                    "SELECT id, content, due_date, raw->>'url' AS url "
-                    "FROM todoist_tasks t WHERE NOT is_completed AND ( "
-                    "  (due_date IS NOT NULL AND due_date < CURRENT_DATE) "
-                    "  OR (EXISTS (SELECT 1 FROM unnest(t.labels) lab "
-                    "        WHERE lab LIKE 'project/%') "
-                    "      AND updated_at < now() - make_interval(days => $1)) "
-                    ") ORDER BY due_date ASC NULLS LAST, updated_at ASC LIMIT 5",
+                    "SELECT t.id, t.content, t.due_date, t.raw->>'url' AS url "
+                    "FROM todoist_tasks t "
+                    "LEFT JOIN todoist_projects p ON p.id = t.project_id "
+                    "WHERE NOT t.is_completed AND ( "
+                    "  (t.due_date IS NOT NULL AND t.due_date < CURRENT_DATE) "
+                    "  OR (p.parent_id IS NOT NULL "
+                    "      AND t.updated_at < now() - make_interval(days => $1)) "
+                    ") ORDER BY t.due_date ASC NULLS LAST, t.updated_at ASC LIMIT 5",
                     int(cfg["next_actions_days"]),
                 )
             ]

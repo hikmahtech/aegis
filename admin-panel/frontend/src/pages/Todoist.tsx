@@ -22,6 +22,13 @@ type TodoistProject = {
   order_idx?: number;
 };
 
+type TodoistLabel = {
+  id: string;
+  name: string;
+  color?: string | null;
+  raw?: any;
+};
+
 type TodoistTask = {
   id: string;
   content: string;
@@ -78,7 +85,46 @@ function truncate(s: string, n: number): string {
   return s.length > n ? `${s.slice(0, n)}…` : s;
 }
 
-const _PROJECT_KEYS = ['inbox', 'next', 'someday'] as const;
+// AEGIS only manages the native Inbox project as a GTD bucket now — Next/Someday
+// moved to @next/@someday labels, and Areas/work-streams are the user's own
+// nested Todoist projects (parent_id links child work-stream -> parent area).
+const _PROJECT_KEYS = ['inbox'] as const;
+
+// Label grouping for the read-only Labels panel — matches the GTD label scheme
+// documented in CLAUDE.md (personalities, GTD state, contexts, everything else).
+const _LABEL_GROUPS: { title: string; names: string[] }[] = [
+  { title: 'Personalities / assignees', names: ['@me', '@sebas', '@raphael', '@maou', '@pandora'] },
+  { title: 'GTD state', names: ['@next', '@someday', '@waiting', '@reference'] },
+  { title: 'Contexts', names: ['@5min', '@deep', '@code', '@email', '@phone', '@errand', '@reading', '@home', '@office'] },
+];
+
+function groupLabels(labels: TodoistLabel[]): { title: string; labels: TodoistLabel[] }[] {
+  const used = new Set<string>();
+  const groups = _LABEL_GROUPS.map(g => {
+    const names = new Set(g.names);
+    const matched = labels.filter(l => names.has(l.name));
+    matched.forEach(l => used.add(l.id));
+    return { title: g.title, labels: matched };
+  });
+  const other = labels.filter(l => !used.has(l.id));
+  return [...groups, { title: 'Other', labels: other }].filter(g => g.labels.length > 0);
+}
+
+// Nest projects by parent_id — top-level Areas with their child work-streams indented.
+function buildProjectTree(projects: TodoistProject[]): { project: TodoistProject; children: TodoistProject[] }[] {
+  const byParent = new Map<string, TodoistProject[]>();
+  const roots: TodoistProject[] = [];
+  for (const p of projects) {
+    if (p.parent_id) {
+      const list = byParent.get(p.parent_id) || [];
+      list.push(p);
+      byParent.set(p.parent_id, list);
+    } else {
+      roots.push(p);
+    }
+  }
+  return roots.map(project => ({ project, children: byParent.get(project.id) || [] }));
+}
 
 export default function Todoist() {
   const [data, setData] = useState<TodoistState | null>(null);
@@ -86,7 +132,7 @@ export default function Todoist() {
   const [error, setError] = useState<Error | null>(null);
   const [cfg, setCfg] = useState<any>(null);
   const [apiKey, setApiKey] = useState('');
-  const [projects, setProjects] = useState<Record<string, string>>({ inbox: '', next: '', someday: '' });
+  const [projects, setProjects] = useState<Record<string, string>>({ inbox: '' });
   const [savingCfg, setSavingCfg] = useState(false);
   const [cfgMsg, setCfgMsg] = useState('');
   const [gtd, setGtd] = useState<any>(null);
@@ -95,6 +141,9 @@ export default function Todoist() {
 
   // Project picker (shared by Configure + Tasks filter bar)
   const [allProjects, setAllProjects] = useState<TodoistProject[]>([]);
+  // Read-only structure panels — projects tree (Areas -> work-streams) + labels.
+  const [labels, setLabels] = useState<TodoistLabel[]>([]);
+  const [labelsLoading, setLabelsLoading] = useState(true);
 
   // Tasks workbench
   const [tasks, setTasks] = useState<TodoistTask[]>([]);
@@ -117,7 +166,7 @@ export default function Todoist() {
       setData(await api.todoistState());
       const c = await api.getTodoistConfig();
       setCfg(c);
-      setProjects({ inbox: '', next: '', someday: '', ...(c.projects || {}) });
+      setProjects({ inbox: '', ...(c.projects || {}) });
       setApiKey('');
       setGtd(await api.getGtdRules());
       const p = await api.todoistProjects();
@@ -126,6 +175,18 @@ export default function Todoist() {
       setError(e);
     } finally {
       setLoading(false);
+    }
+  }
+
+  async function loadLabels() {
+    setLabelsLoading(true);
+    try {
+      const l = await api.todoistLabels();
+      setLabels(l || []);
+    } catch (e: any) {
+      setError(e);
+    } finally {
+      setLabelsLoading(false);
     }
   }
 
@@ -204,7 +265,7 @@ export default function Todoist() {
     });
   }
 
-  useEffect(() => { void load(); }, []);
+  useEffect(() => { void load(); void loadLabels(); }, []);
   useEffect(() => { void loadTasks(); }, [taskProjectFilter, taskStatusFilter, taskAssigneeFilter]);
   useEffect(() => { void loadClarifyLog(); }, [appliedFilter]);
 
@@ -235,8 +296,12 @@ export default function Todoist() {
       <div className="card" style={{ marginTop: 16 }}>
         <h3>Configure Todoist</h3>
         <p className="page-subtitle">
-          Your Todoist API token + the projects AEGIS manages as GTD buckets.
+          Your Todoist API token + the native Inbox project AEGIS adopts as its one managed GTD bucket.
           {cfg ? ` API key: ${cfg.api_key_set ? `set (${cfg.source})` : 'not set'}.` : ''}
+        </p>
+        <p className="meta" style={{ marginBottom: 8 }}>
+          Next/Someday are no longer AEGIS-managed projects — they're the <code>@next</code> / <code>@someday</code> labels.
+          Areas and work-streams are your own nested Todoist projects (see the Projects tree below), not something AEGIS picks here.
         </p>
         <div className="cfg-row">
           <span className="cfg-label">API token</span>
@@ -245,7 +310,7 @@ export default function Todoist() {
         </div>
         {_PROJECT_KEYS.map(k => (
           <div key={k} className="cfg-row">
-            <span className="cfg-label" style={{ textTransform: 'capitalize' }}>{k} project</span>
+            <span className="cfg-label">Inbox project</span>
             <select value={projects[k] || ''} onChange={e => setProjects({ ...projects, [k]: e.target.value })}>
               <option value="">— none —</option>
               {bucketOptions(projects[k] || '').map(p => (
@@ -256,6 +321,55 @@ export default function Todoist() {
         ))}
         <button className="btn" disabled={savingCfg} onClick={saveConfig}>{savingCfg ? 'Saving…' : 'Save Todoist config'}</button>
         {cfgMsg && <span className="msg-success" style={{ marginLeft: 10 }}>{cfgMsg}</span>}
+      </div>
+
+      {/* Projects tree — read-only view of the real Todoist structure (Areas -> work-streams) */}
+      <div className="card" style={{ marginTop: 16 }}>
+        <h3>Projects</h3>
+        <p className="page-subtitle">
+          Areas / work-streams are your own nested Todoist projects — AEGIS just reads this structure, it doesn't manage it.
+        </p>
+        {allProjects.length === 0 && <div className="empty">No projects found.</div>}
+        {allProjects.length > 0 && (
+          <ul style={{ listStyle: 'none', margin: 0, padding: 0 }}>
+            {buildProjectTree(allProjects).map(({ project, children }) => (
+              <li key={project.id} style={{ marginBottom: 6 }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                  <strong>{project.name}</strong>
+                  {project.is_managed && <span className="badge badge-success">managed</span>}
+                  {project.is_archived && <span className="badge badge-neutral">archived</span>}
+                </div>
+                {children.length > 0 && (
+                  <ul style={{ listStyle: 'none', margin: '4px 0 0 20px', padding: 0, borderLeft: '2px solid var(--border, #e5e5e5)' }}>
+                    {children.map(child => (
+                      <li key={child.id} style={{ padding: '2px 0 2px 12px', display: 'flex', alignItems: 'center', gap: 8 }}>
+                        {child.name}
+                        {child.is_managed && <span className="badge badge-success">managed</span>}
+                        {child.is_archived && <span className="badge badge-neutral">archived</span>}
+                      </li>
+                    ))}
+                  </ul>
+                )}
+              </li>
+            ))}
+          </ul>
+        )}
+      </div>
+
+      {/* Labels — read-only view of the label scheme (assignees, GTD state, contexts, other) */}
+      <div className="card" style={{ marginTop: 16 }}>
+        <h3>Labels</h3>
+        <p className="page-subtitle">Read-only — Next/Someday state and GTD contexts live here now, not as projects.</p>
+        {labelsLoading && <div className="loading">Loading labels…</div>}
+        {!labelsLoading && labels.length === 0 && <div className="empty">No labels found.</div>}
+        {!labelsLoading && labels.length > 0 && groupLabels(labels).map(g => (
+          <div key={g.title} style={{ marginBottom: 10 }}>
+            <div className="cfg-label" style={{ marginBottom: 4 }}>{g.title}</div>
+            <div className="meta-tags-row">
+              {g.labels.map(l => <span key={l.id} className="meta-tag">{l.name}</span>)}
+            </div>
+          </div>
+        ))}
       </div>
 
       {gtd && (

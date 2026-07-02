@@ -3,8 +3,11 @@ the settings table and edited from the admin UI.
 
 The API key is read DB-first with the env (``settings.todoist_api_key``) as the
 fallback, so existing deployments keep working until the key is set in the UI.
-The managed project ids (inbox/next/someday) already live in the settings table
-(``todoist_managed_project_ids``); this just adds an edit surface.
+Only the native ``inbox`` project id is still "managed" this way (Next/Someday
+are now the ``@next``/``@someday`` labels, and areas/work-streams are
+user-owned nested Todoist projects, not managed ids). The managed project ids
+already live in the settings table (``todoist_managed_project_ids``); this
+just adds an edit surface.
 """
 
 from __future__ import annotations

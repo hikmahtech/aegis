@@ -159,6 +159,14 @@ async def list_projects(request: Request) -> list[dict[str, Any]]:
     return [dict(r) for r in rows]
 
 
+@router.get("/labels")
+async def list_labels(request: Request) -> list[dict[str, Any]]:
+    """List Todoist labels — powers a label picker."""
+    pool = request.app.state.db_pool
+    rows = await pool.fetch("SELECT id, name, color, raw FROM todoist_labels ORDER BY name")
+    return [dict(r) for r in rows]
+
+
 @router.get("/clarify-log")
 async def list_clarify_log(
     request: Request,

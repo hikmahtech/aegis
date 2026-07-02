@@ -399,17 +399,8 @@ class TodoistConnector(HTTPConnector):
             "args": args,
         }
 
-    @staticmethod
-    def build_item_move_command(item_id: str, project_id: str) -> dict:
-        """item_move — relocate a task to a different project.
-
-        Update commands take an existing id; no temp_id is needed.
-        """
-        return {
-            "type": "item_move",
-            "uuid": str(uuid.uuid4()),
-            "args": {"id": item_id, "project_id": project_id},
-        }
+    # (build_item_move_command removed — GTD filing is label-only; AEGIS never
+    # relocates tasks between projects. Users file into projects manually.)
 
     @staticmethod
     def build_item_update_command(item_id: str, **fields) -> dict:

@@ -884,7 +884,7 @@ CHAT_TOOLS = [
         "type": "function",
         "function": {
             "name": "list_next_actions",
-            "description": "Read open (incomplete) Next Action tasks from the Todoist projection. Optional filters: assignee label, context label, due window.",
+            "description": "Read open (incomplete), actionable Next Action tasks from the Todoist projection (excludes @waiting/@reference/@someday/@to-read parked tasks). Optional filters: assignee label, context label, due window.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -941,7 +941,7 @@ CHAT_TOOLS = [
         "type": "function",
         "function": {
             "name": "list_projects",
-            "description": "List work-stream project/* labels with their open-task counts.",
+            "description": "List work-stream projects with open task counts.",
             "parameters": {"type": "object", "properties": {}},
         },
     },
@@ -2267,7 +2267,13 @@ async def _exec_list_next_actions(pool: asyncpg.Pool, args: dict, ctx: ToolConte
     assignee = args.get("assignee")
     context = args.get("context")
     limit = int(args.get("limit") or 25)
-    where = ["NOT t.is_completed"]
+    where = [
+        "NOT t.is_completed",
+        # State labels mirror aegis_worker.activities.review._STATE_LABELS
+        # (cross-package; keep in sync) and _exec_whats_next below — a task
+        # parked as @waiting/@reference/@someday/@to-read isn't a next action.
+        "NOT (t.labels && ARRAY['@waiting','@reference','@to-read','@someday'])",
+    ]
     params: list[object] = []
     if assignee:
         params.append(assignee)
@@ -2361,21 +2367,29 @@ async def _exec_whats_next(pool: asyncpg.Pool, args: dict, ctx: ToolContext) -> 
 
 
 async def _exec_list_projects(pool: asyncpg.Pool, args: dict, ctx: ToolContext) -> str:
-    """List work-stream `project/*` labels with open-task counts."""
+    """List leaf work-stream projects (nested under an area project) with
+    open-task counts.
+
+    Post-restructure, areas/work-streams are real nested Todoist projects
+    (parent AREA project has parent_id IS NULL, leaf WORK-STREAM has
+    parent_id IS NOT NULL) — the old `project/*` label convention is
+    retired.
+    """
     if pool is None:
         return "No DB pool"
     async with pool.acquire() as conn:
         rows = await conn.fetch(
-            "SELECT l.name, "
-            "  (SELECT count(*) FROM todoist_tasks t "
-            "   WHERE l.name = ANY(t.labels) AND NOT t.is_completed) AS open_n "
-            "FROM todoist_labels l "
-            "WHERE l.name LIKE 'project/%' "
-            "ORDER BY l.name"
+            "SELECT p.id, p.name, "
+            "  count(t.id) FILTER (WHERE NOT t.is_completed) AS open_n "
+            "FROM todoist_projects p "
+            "LEFT JOIN todoist_tasks t ON t.project_id = p.id "
+            "WHERE p.parent_id IS NOT NULL AND NOT p.is_archived "
+            "GROUP BY p.id, p.name "
+            "ORDER BY p.name"
         )
     if not rows:
-        return "No project labels."
-    return "\n".join(f"- {r['name']} ({r['open_n']})" for r in rows)
+        return "No work-stream projects."
+    return "\n".join(f"- [{r['id']}] {r['name']} ({r['open_n']} open)" for r in rows)
 
 
 async def _stage_chat_tool_outbox(
