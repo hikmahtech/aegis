@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { clearCredentials, setCredentials } from '../api/client';
 
 // Runtime login: creds are entered here and stored as a base64 token, then
@@ -8,6 +8,17 @@ export default function Login({ onSuccess }: { onSuccess: () => void }) {
   const [pass, setPass] = useState('');
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+
+  // AEGIS_AUTH_DISABLED deployments (behind Cloudflare Access) accept
+  // credential-less requests — probe once and skip the prompt if so.
+  useEffect(() => {
+    fetch('/api/agents')
+      .then(resp => {
+        if (resp.ok) onSuccess();
+      })
+      .catch(() => {});
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   const submit = async (e: React.FormEvent) => {
     e.preventDefault();

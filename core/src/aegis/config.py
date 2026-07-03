@@ -3,7 +3,8 @@
 All secrets via environment variables with AEGIS_ prefix.
 
 Required (no defaults — must be set via env or .env):
-    - database_url, admin_username, admin_password
+    - database_url
+    - admin_username, admin_password (unless auth_disabled=true — see below)
 
 The LLM backend (litellm_url/key/models) is configured from the admin UI
 (Phase A) and optional here; temporal_ui_url is just a UI link with a default.
@@ -62,9 +63,14 @@ class Settings(BaseSettings):
     # Telegram
     telegram_service_url: str = ""
 
-    # Auth (REQUIRED — no defaults; admin/admin is unsafe and must not ship)
-    admin_username: str = Field(...)
-    admin_password: str = Field(...)
+    # Auth (REQUIRED unless auth_disabled — no defaults; admin/admin is unsafe
+    # and must not ship). Set AEGIS_AUTH_DISABLED=true ONLY when the API is
+    # fronted by an authenticating proxy (e.g. Cloudflare Access) and port 8080
+    # is not otherwise reachable — it turns off basic auth + API-key checks
+    # entirely (webhook HMAC verification is separate and stays on).
+    auth_disabled: bool = False
+    admin_username: str = ""
+    admin_password: str = ""
     api_key: str = ""
 
     # Timezone
@@ -221,6 +227,17 @@ class Settings(BaseSettings):
     money_hygiene_alert_thresholds_days: Annotated[list[int], NoDecode] = Field(
         default_factory=lambda: [30, 14, 7, 0]
     )
+
+    @model_validator(mode="after")
+    def _require_admin_credentials(self) -> "Settings":
+        """admin_username/admin_password are required unless auth_disabled."""
+        if not self.auth_disabled and not (self.admin_username and self.admin_password):
+            raise ValueError(
+                "admin_username and admin_password are required "
+                "(set AEGIS_ADMIN_USERNAME / AEGIS_ADMIN_PASSWORD), "
+                "unless AEGIS_AUTH_DISABLED=true"
+            )
+        return self
 
     @model_validator(mode="before")
     @classmethod
