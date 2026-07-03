@@ -28,6 +28,7 @@ _TASK = {
     "text": "hello world",
     "link": "https://example.com",
     "platforms": ["x"],
+    "post_at": "2026-07-10T09:30:00+00:00",
 }
 
 
@@ -128,6 +129,7 @@ async def test_due_task_cards_then_approval_reaches_hook(temporal_env):
         assert response == {"value": "approve"}
         assert metadata["task_id"] == "42"
         assert metadata["platforms"] == ["x"]
+        assert metadata["post_at"] == "2026-07-10T09:30:00+00:00"
 
 
 async def test_open_card_is_not_duplicated_by_next_tick(temporal_env):

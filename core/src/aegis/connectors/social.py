@@ -160,10 +160,22 @@ class SocialConnector(HTTPConnector):
                 "Integrations page"
             )
         text = _render_text(payload)
+        # A payload carrying schedule_at (the Todoist due time) becomes a
+        # SCHEDULED Postiz post for that moment; anything else — past due
+        # times included (approval arrived late) — publishes immediately.
+        post_type, post_date = "now", datetime.now(UTC)
+        schedule_at = (payload.get("schedule_at") or "").strip()
+        if schedule_at:
+            try:
+                when = datetime.fromisoformat(schedule_at)
+                if when > datetime.now(UTC) + timedelta(minutes=2):
+                    post_type, post_date = "schedule", when.astimezone(UTC)
+            except (ValueError, TypeError):  # unparseable or naive datetime
+                logger.warning("postiz_schedule_at_unparseable", value=schedule_at[:40])
         body = {
-            "type": "now",
+            "type": post_type,
             "shortLink": False,
-            "date": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S.000Z"),
+            "date": post_date.strftime("%Y-%m-%dT%H:%M:%S.000Z"),
             "tags": [],
             "posts": [
                 {
