@@ -99,6 +99,18 @@ imports each file into its kind *only when that kind has no DB row yet*. After
 that the DB owns the content — editing the files has no effect on an existing
 install. `AEGIS_PERSONALITY_DIR` overrides where the starter files are read from.
 
+### Ingestion channels
+
+Channels (`email` / `rss` / `raindrop` ingestion sources) live in the `channels`
+table and are managed from the admin panel's **Channels** page (CRUD API:
+`/api/admin/channels`, route: `core/src/aegis/api/routes/channels.py`).
+`config/seed/channels.yaml` follows the same import-on-first-boot pattern as
+personalities: the seed loader inserts a yaml row only when no `(kind, identifier)`
+row exists yet, and never updates or deletes existing rows — after first boot the
+DB owns the channels, so UI edits, deactivations, and operator-added channels
+(e.g. a new Gmail account) survive Core restarts. Email channels additionally need
+the account authorized via the Google accounts re-auth flow (Flows page).
+
 ### Authentication (required for non-proxied deployments)
 
 If your deployment is **NOT** behind an authenticating proxy (Cloudflare Access, an

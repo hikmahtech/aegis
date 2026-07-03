@@ -197,6 +197,7 @@ def create_app(run_lifespan: bool = True) -> FastAPI:
         api_key,
         audit,
         capture,
+        channels,
         chat,
         gmail_reauth,
         health,
@@ -256,6 +257,7 @@ def create_app(run_lifespan: bool = True) -> FastAPI:
     app.include_router(temporal.router)
     app.include_router(settings.router)
     app.include_router(activities.router)
+    app.include_router(channels.router)
     app.include_router(integrations.router)
     app.include_router(api_key.router)
     app.include_router(llm_backend.router)

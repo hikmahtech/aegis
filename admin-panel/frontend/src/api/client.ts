@@ -70,6 +70,16 @@ export const api = {
   deleteResource: (id: string) =>
     apiFetch<any>(`/api/admin/resources/${id}`, { method: 'DELETE' }),
 
+  // Channels (email / rss / raindrop ingestion — DB-owned, UI-managed)
+  listChannels: (kind?: string) =>
+    apiFetch<any[]>(`/api/admin/channels${kind ? `?kind=${encodeURIComponent(kind)}` : ''}`),
+  createChannel: (data: { kind: string; identifier: string; config?: any; active?: boolean }) =>
+    apiFetch<any>('/api/admin/channels', { method: 'POST', body: JSON.stringify(data) }),
+  updateChannel: (id: string, patch: { identifier?: string; config?: any; active?: boolean }) =>
+    apiFetch<any>(`/api/admin/channels/${id}`, { method: 'PATCH', body: JSON.stringify(patch) }),
+  deleteChannel: (id: string) =>
+    apiFetch<any>(`/api/admin/channels/${id}`, { method: 'DELETE' }),
+
   // Knowledge
   knowledgeAsk: (question: string) =>
     apiFetch<{ answer: string; sources: any[] }>('/api/knowledge/ask', {

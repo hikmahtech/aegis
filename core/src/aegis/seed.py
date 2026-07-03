@@ -111,6 +111,14 @@ async def _load_agents(pool: asyncpg.Pool, path: Path) -> None:
 
 
 async def _load_channels(pool: asyncpg.Pool, path: Path) -> None:
+    """Channels are first-boot starter examples only (personalities pattern).
+
+    The YAML inserts a row only when (kind, identifier) doesn't exist yet;
+    after that the DB owns the row — channels are created/edited/deactivated/
+    deleted from the admin UI (/api/admin/channels). The loader must never
+    UPDATE (would clobber UI-edited config / resurrect a deactivated channel)
+    and never DELETE (would wipe operator-added channels on every restart).
+    """
     rows = _read_yaml(path, "channels")
     if not rows:
         return
@@ -120,31 +128,13 @@ async def _load_channels(pool: asyncpg.Pool, path: Path) -> None:
                 """
                 INSERT INTO channels (kind, identifier, config, active)
                 VALUES ($1, $2, $3, $4)
-                ON CONFLICT (kind, identifier) DO UPDATE SET
-                    config = EXCLUDED.config,
-                    active = EXCLUDED.active
+                ON CONFLICT (kind, identifier) DO NOTHING
                 """,
                 r["kind"],
                 r["identifier"],
                 r.get("config", {}),
                 r.get("active", True),
             )
-        # Delete channels no longer in the YAML (no FK references).
-        yaml_kinds = [r["kind"] for r in rows]
-        yaml_identifiers = [r["identifier"] for r in rows]
-        status = await conn.execute(
-            """
-            DELETE FROM channels
-            WHERE (kind, identifier) NOT IN (
-                SELECT unnest($1::text[]), unnest($2::text[])
-            )
-            """,
-            yaml_kinds,
-            yaml_identifiers,
-        )
-        n = int(status.split()[-1]) if status else 0
-        if n:
-            logger.info("seeds_deleted_orphans", kind="channels", count=n)
     logger.info("seeds_loaded", kind="channels", count=len(rows))
 
 
