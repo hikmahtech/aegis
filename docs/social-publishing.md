@@ -37,6 +37,14 @@ whose account has `meta.postiz_integration_id` set through Postiz's public API i
 of X's native API. Native and Postiz accounts coexist (mixed mode): the native X path
 via `/api/admin/social/{platform}/connect` still works for accounts connected that way.
 
+**Scheduling:** on approval, Postiz-routed posts are created with `type: "schedule"` at
+the task's Todoist due time (`payload.schedule_at`, threaded from `find_due_posts` →
+card metadata → outbox payload) — the post sits in Postiz's queue and Postiz publishes
+it at exactly the due moment. A due time already in the past when approval lands
+publishes immediately (`type: "now"`; date-only tasks resolve to `default_post_hour`
+local and follow the same rule). The Todoist task completes at approval/handoff —
+Postiz owns delivery from there.
+
 - **Config:** set `postiz_url` (base URL, e.g. `https://postiz.example.com`) and
   `postiz_api_key` on the admin **Integrations** page, under the "Postiz" group.
 - **Sync:** `POST /api/admin/social/postiz/sync` (also a "Sync Postiz channels" button

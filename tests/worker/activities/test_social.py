@@ -211,6 +211,9 @@ async def test_find_due_posts_selects_due_and_skips_rest(social_env):
     assert set(by_id) == {"soctest-due", "soctest-dateonly"}
     assert by_id["soctest-due"]["platforms"] == ["x"]
     assert by_id["soctest-due"]["link"] == "https://example.com"
+    # post_at is the resolved due time (ISO, aware) — Postiz scheduling uses it.
+    resolved = datetime.fromisoformat(by_id["soctest-due"]["post_at"])
+    assert abs((resolved - (now - timedelta(minutes=5))).total_seconds()) < 60
 
 
 # ------------------------------------------------------- enqueue / drain / complete
@@ -449,6 +452,37 @@ async def test_post_routes_postiz_account_with_raw_auth_header_no_x_calls(social
         content = body["posts"][0]["value"][0]["content"]
         assert "hello world" in content
         assert "https://example.com" in content
+    finally:
+        await connector.close()
+
+
+@respx.mock
+async def test_post_postiz_future_schedule_at_schedules_instead_of_now(social_env):
+    """A payload with a future schedule_at (the Todoist due time) must become a
+    Postiz SCHEDULED post at exactly that moment; a past one posts now."""
+    account_id = await _seed_postiz_account(social_env, platform="mastodon", integration_id="int-9")
+    posts_route = respx.post("https://postiz.example.com/api/public/v1/posts").respond(
+        200, json=[{"postId": "pz-sched", "integration": "int-9"}]
+    )
+    future = datetime.now(UTC) + timedelta(hours=3)
+    connector = SocialConnector(db_pool=social_env, settings=_settings_with_postiz())
+    try:
+        ref = await connector.post(
+            account_id,
+            {"text": "later", "link": "", "schedule_at": future.isoformat()},
+        )
+        assert ref == "pz-sched"
+        body = json.loads(posts_route.calls[0].request.content)
+        assert body["type"] == "schedule"
+        assert body["date"] == future.strftime("%Y-%m-%dT%H:%M:%S.000Z")
+
+        # Past schedule_at (late approval) → immediate post.
+        past = datetime.now(UTC) - timedelta(minutes=30)
+        await connector.post(
+            account_id, {"text": "late", "link": "", "schedule_at": past.isoformat()}
+        )
+        body2 = json.loads(posts_route.calls[1].request.content)
+        assert body2["type"] == "now"
     finally:
         await connector.close()
 

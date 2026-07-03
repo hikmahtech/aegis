@@ -78,6 +78,7 @@ class SocialPublishFlow:
                                 "platforms": task["platforms"],
                                 "text": task["text"],
                                 "link": task["link"],
+                                "post_at": task.get("post_at", ""),
                             },
                             post_resolve_activity="apply_social_approval",
                         ),

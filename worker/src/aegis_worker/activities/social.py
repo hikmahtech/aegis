@@ -58,24 +58,27 @@ class SocialActivities:
 
         rows = await self.db_pool.fetch(
             """
-            SELECT t.id, t.content, t.description, t.labels
-            FROM todoist_tasks t
-            WHERE NOT t.is_completed
-              AND $1 = ANY(t.labels)
-              AND CASE
-                    WHEN t.raw->'due'->>'datetime' IS NOT NULL THEN
-                      CASE WHEN t.raw->'due'->>'datetime' LIKE '%Z'
-                           THEN (t.raw->'due'->>'datetime')::timestamptz
-                           ELSE ((t.raw->'due'->>'datetime')::timestamp AT TIME ZONE $2)
-                      END
-                    WHEN t.due_date IS NOT NULL THEN
-                      ((t.due_date::timestamp + make_interval(hours => $3))
-                        AT TIME ZONE $2)
-                  END <= now() + make_interval(mins => $4)
-              AND NOT EXISTS (
-                    SELECT 1 FROM social_outbox o WHERE o.todoist_task_id = t.id
-                  )
-            ORDER BY t.due_date NULLS LAST, t.id
+            SELECT id, content, description, labels, post_at FROM (
+              SELECT t.id, t.content, t.description, t.labels,
+                CASE
+                  WHEN t.raw->'due'->>'datetime' IS NOT NULL THEN
+                    CASE WHEN t.raw->'due'->>'datetime' LIKE '%Z'
+                         THEN (t.raw->'due'->>'datetime')::timestamptz
+                         ELSE ((t.raw->'due'->>'datetime')::timestamp AT TIME ZONE $2)
+                    END
+                  WHEN t.due_date IS NOT NULL THEN
+                    ((t.due_date::timestamp + make_interval(hours => $3))
+                      AT TIME ZONE $2)
+                END AS post_at
+              FROM todoist_tasks t
+              WHERE NOT t.is_completed
+                AND $1 = ANY(t.labels)
+                AND NOT EXISTS (
+                      SELECT 1 FROM social_outbox o WHERE o.todoist_task_id = t.id
+                    )
+            ) s
+            WHERE s.post_at <= now() + make_interval(mins => $4)
+            ORDER BY s.post_at, s.id
             """,
             publish_label,
             user_tz,
@@ -98,14 +101,24 @@ class SocialActivities:
                     "text": r["content"],
                     "link": (r["description"] or "").strip(),
                     "platforms": platforms,
+                    # The Todoist due time — Postiz-transport posts are
+                    # scheduled in Postiz for exactly this moment.
+                    "post_at": r["post_at"].isoformat(),
                 }
             )
         activity.logger.info("social_find_due_posts found=%d", len(due))
         return due
 
     @activity.defn
-    async def enqueue_outbox(self, task_id: str, platforms: list[str], text: str, link: str) -> dict:
-        """One social_outbox row per platform; idempotent per (task, account)."""
+    async def enqueue_outbox(
+        self, task_id: str, platforms: list[str], text: str, link: str, post_at: str = ""
+    ) -> dict:
+        """One social_outbox row per platform; idempotent per (task, account).
+
+        post_at (ISO, from the Todoist due time) rides in the payload as
+        schedule_at — the Postiz transport schedules the post for that moment
+        instead of publishing immediately.
+        """
         if self.db_pool is None:
             return {"queued": 0, "missing_accounts": []}
         queued, missing = 0, []
@@ -129,7 +142,7 @@ class SocialActivities:
                 "DO NOTHING",
                 task_id,
                 account_id,
-                {"text": text, "link": link},
+                {"text": text, "link": link, "schedule_at": post_at},
             )
             queued += int(result.endswith("1"))
         activity.logger.info(
@@ -265,6 +278,7 @@ class SocialActivities:
                 list(metadata.get("platforms") or []),
                 str(metadata.get("text") or ""),
                 str(metadata.get("link") or ""),
+                str(metadata.get("post_at") or ""),
             )
             await self.drain_social_outbox()
             await self.complete_posted_tasks()
