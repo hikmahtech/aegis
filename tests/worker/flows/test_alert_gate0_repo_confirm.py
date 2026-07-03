@@ -192,8 +192,8 @@ async def stub_send_system_event(msg: str) -> None:
     pass
 
 
-@activity.defn(name="send_telegram")
-async def stub_send_telegram(
+@activity.defn(name="send_message")
+async def stub_send_message(
     agent_id: str, msg: str, chat_id: int, reply_markup: dict | None = None
 ) -> None:
     pass
@@ -296,7 +296,7 @@ ALL_ACTIVITIES = [
     stub_record_verdict_to_kg,
     stub_log_alert,
     stub_send_system_event,
-    stub_send_telegram,
+    stub_send_message,
     stub_accumulate_digest_item,
     stub_capture_to_inbox,
     stub_post_task_note,
@@ -370,7 +370,7 @@ async def test_gate0_user_picks_repo_runs_investigation_on_pick():
                 continue
             if desc.status is not None and desc.status.name == "RUNNING":
                 # Pick by INDEX (TSP is candidates[0]) — keys are indices, not
-                # resource UUIDs, so Telegram callback_data stays under 64 bytes.
+                # resource UUIDs, keeping callback payloads compact.
                 await child.signal(InteractionFlow.submit_response, {"value": "0"})
                 signalled = True
                 break
@@ -380,7 +380,7 @@ async def test_gate0_user_picks_repo_runs_investigation_on_pick():
         result = await handle.result()
 
     # Regression guard: the card's option keys must keep callback_data
-    # (`interaction:{36-char-uuid}:{key}`) within Telegram's 64-byte cap —
+    # (`interaction:{36-char-uuid}:{key}`) compact —
     # resource UUIDs as keys (85 bytes) silently fail with BUTTON_DATA_INVALID.
     opts = _state.get("card_options")
     assert opts, "Gate-0 card was never sent"

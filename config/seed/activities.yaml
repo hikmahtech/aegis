@@ -93,7 +93,7 @@ activities:
 
   # Raphael — daily briefing (carries the "References filed" digest for
   # #research / #email reference closure per the references-as-knowledge
-  # spec; per-message Telegrams only fire for user-initiated #chat / #manual
+  # spec; per-message chat notifications only fire for user-initiated #chat / #manual
   # sources, so this digest is the only signal the user gets for automated
   # ingest closure). Cron 04:30 UTC = 10:00 IST.
   - slug: daily-briefing-raphael

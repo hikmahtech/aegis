@@ -6,7 +6,7 @@ so tests exercise the logic directly without a live socket. The bolt handlers
 (registered in `SlackAdapter.start_listener`) are thin wrappers that extract
 fields from the bolt kwargs and call the matching `on_*` method.
 
-Routing mirrors the Telegram bot (`bot.py::_message`):
+Routing:
   (a) explicit `@<agent>` mention anywhere → async (AgentChatReplyFlow),
       mention stripped before the LLM sees it;
   (b) the bot itself @app_mention'd → async to the channel's agent;
@@ -157,9 +157,8 @@ def parse_action(value: str) -> tuple[str, str]:
 class SlackCoreClient:
     """Async httpx client for the Core API calls the Slack inbound makes.
 
-    Request bodies + response keys mirror the Telegram bot's calls so the core
-    routes are identical. Auth follows the bot: HTTP basic (admin user/pass)
-    plus the `X-API-Key` header when an api key is configured.
+    Auth: HTTP basic (admin user/pass) plus the `X-API-Key` header when an
+    api key is configured.
     """
 
     def __init__(self, settings) -> None:
@@ -286,8 +285,8 @@ class SlackCoreClient:
     async def attach_delivery_ref(self, *, message_id: str, delivery_ref: dict) -> dict | None:
         """POST /api/chat/messages/{id}/delivery-ref — attach the reply ref.
 
-        The core route is POST (mirrors the /telegram-id convention); using
-        PATCH returns 405 and silently drops the ref.
+        The core route is POST; using PATCH returns 405 and silently drops
+        the ref.
         """
         return await self._post(
             f"/api/chat/messages/{message_id}/delivery-ref",

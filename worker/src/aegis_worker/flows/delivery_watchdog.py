@@ -1,15 +1,15 @@
-"""DeliveryWatchdogFlow — catch silently-undelivered Telegram interaction cards
-and detect Telegram-API polling outages.
+"""DeliveryWatchdogFlow — catch silently-undelivered interaction cards
+and detect comms inbound-channel outages.
 
-Interaction rows are created BEFORE the Telegram card is dispatched, so a row
-whose `telegram_message_id` stays NULL past a grace window was never delivered
-(e.g. BUTTON_DATA_INVALID when callback_data exceeds Telegram's 64-byte cap).
+Interaction rows are created BEFORE the card is dispatched, so a row with
+neither `telegram_message_id` (legacy column) nor `delivery_ref` set past a
+grace window was never delivered.
 Previously the only way to notice was a manual SQL query; this flow surfaces it
 automatically.
 
-Additionally, each 15-min run checks the Telegram service's /api/health endpoint
-for the `telegram_api.reachable` flag.  When it is False the flow creates a
-Todoist Inbox task (via Todoist, not Telegram — which is the thing that's down)
+Additionally, each 15-min run checks the comms service's /api/health endpoint
+for the `inbound.healthy` flag.  When it is False the flow creates a Todoist
+Inbox task (via Todoist, not the chat channel — which is the thing that's down)
 so the outage is visible without relying on the broken channel.  A 12-hour dedup
 window prevents task spam during a sustained outage.
 """
@@ -30,7 +30,7 @@ class DeliveryWatchdogConfig:
     silent: bool = False  # if True, detect but don't notify
     threshold_seconds: int = 120  # grace period before a NULL id counts as undelivered
     window_hours: int = 24  # ignore older rows (retired origins)
-    telegram_url: str = ""  # passed to check_telegram_polling_health
+    comms_url: str = ""  # passed to check_comms_inbound_health
 
 
 @workflow.defn
@@ -51,17 +51,17 @@ class DeliveryWatchdogFlow:
                 retry_policy=NO_RETRY,
             )
 
-        # Best-effort Telegram polling health check — never fails the watchdog run.
+        # Best-effort comms inbound health check — never fails the watchdog run.
         try:
             health = await workflow.execute_activity_method(
-                HomelabActivities.check_telegram_polling_health,
-                args=[config.telegram_url],
+                HomelabActivities.check_comms_inbound_health,
+                args=[config.comms_url],
                 start_to_close_timeout=TIMEOUT_FAST,
                 retry_policy=NO_RETRY,
             )
             if health.get("status") == "down":
                 await workflow.execute_activity_method(
-                    HomelabActivities.alert_telegram_polling_down,
+                    HomelabActivities.alert_comms_inbound_down,
                     args=[health.get("last_ok_seconds_ago"), health.get("last_error")],
                     start_to_close_timeout=TIMEOUT_FAST,
                     retry_policy=NO_RETRY,

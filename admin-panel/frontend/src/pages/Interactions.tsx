@@ -20,7 +20,7 @@ type Interaction = {
 
 type Agent = { id: string; name: string };
 
-// Telegram-style HTML lives in prompts. The card shows only a 3-line snippet,
+// Light chat HTML lives in prompts. The card shows only a 3-line snippet,
 // so strip tags + decode entities to plain text (full HTML rendering is on the
 // detail page).
 function stripHtml(raw: string): string {

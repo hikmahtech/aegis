@@ -23,9 +23,9 @@ def app(fake_adapter, monkeypatch):
     monkeypatch.setenv("AEGIS_SLACK_BOT_TOKEN", "xoxb-test")
     monkeypatch.setenv("AEGIS_SLACK_APP_TOKEN", "xapp-test")
 
-    from aegis_comms.config import TelegramSettings
+    from aegis_comms.config import CommsSettings
 
-    settings = TelegramSettings(_env_file=None)
+    settings = CommsSettings(_env_file=None)
 
     from aegis_comms.__main__ import create_delivery_app
 

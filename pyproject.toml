@@ -1,5 +1,5 @@
 # AEGIS v2 — Root-level tooling config
-# Package configs in core/, worker/, telegram/
+# Package configs in core/, worker/, comms/
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

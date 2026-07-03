@@ -80,10 +80,10 @@ def test_core_client_passes_explicit_timeout_through_to_httpx():
     )
 
 
-def test_chat_reply_timeout_matches_telegram_chat_path():
+def test_chat_reply_timeout_matches_chat_path():
     """Pin: TIMEOUT_CHAT_REPLY (used by AgentChatReplyFlow.synthesize_reply)
-    must be 600s — matching the Telegram chat httpx timeout from PR #248
-    (`telegram/src/aegis_telegram/bot.py`). They cover the same workload
+    must be 600s — matching the chat httpx timeout from PR #248. They
+    cover the same workload
     (smart-tier LLM + tool orchestration); divergent values surface as
     one entry point silently dropping replies while the other works.
     """

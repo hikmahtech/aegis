@@ -60,8 +60,9 @@ class Settings(BaseSettings):
     # "slack" routes cards/notifications through the aegis_comms service.
     channel: str = "web"
 
-    # Telegram
-    telegram_service_url: str = ""
+    # Comms delivery server (aegis-comms) base URL, e.g. http://comms:8081.
+    # Empty = no external chat delivery (web channel only).
+    comms_url: str = ""
 
     # Auth (REQUIRED unless auth_disabled — no defaults; admin/admin is unsafe
     # and must not ship). Set AEGIS_AUTH_DISABLED=true ONLY when the API is
@@ -197,7 +198,7 @@ class Settings(BaseSettings):
     # flows that explicitly call send_voice still no-op unless this is true.
     tts_enabled: bool = False
 
-    # AEGIS admin UI base URL (used for reauth links in Telegram cards)
+    # AEGIS admin UI base URL (used for reauth links in chat cards)
     aegis_ui_url: str = Field(default="", validation_alias="AEGIS_UI_URL")
 
     # Knowledge auto-extraction

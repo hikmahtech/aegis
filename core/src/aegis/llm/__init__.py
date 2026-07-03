@@ -167,7 +167,7 @@ class LLMClient:
         )
         # Per-model semaphores. Used to throttle models that share a single
         # busy GPU (e.g. gemma4:e2b on node-a's RTX 2070 alongside postgres,
-        # core, worker, telegram and redis). Bursts of concurrent calls
+        # core, worker, comms and redis). Bursts of concurrent calls
         # otherwise serialize through ollama and compound latency.
         self._concurrency_limits = dict(concurrency_limits or {})
         self._semaphores: dict[str, asyncio.Semaphore] = {}

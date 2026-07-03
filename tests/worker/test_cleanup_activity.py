@@ -154,7 +154,7 @@ async def test_archive_orphans_bad_input_falls_back_to_default():
     assert result["threshold_days"] == 7
 
 
-# --- cleanup_old_telegram_dispatches ---
+# --- cleanup_old_dispatches ---
 
 COMMS_URL = "http://comms-service:8081"
 
@@ -166,7 +166,7 @@ async def test_cleanup_dispatches_delivery_ref_row_posts_ref_and_db_deletes():
     import json
 
     row_id = uuid4()
-    delivery_ref = {"adapter": "telegram", "chat_id": -100123, "message_id": 4242}
+    delivery_ref = {"adapter": "slack", "channel": "C100123", "ts": "4242.0"}
     pool = AsyncMock()
     pool.fetch = AsyncMock(
         return_value=[
@@ -181,7 +181,7 @@ async def test_cleanup_dispatches_delivery_ref_row_posts_ref_and_db_deletes():
 
     activities = CleanupActivities(db_pool=pool, comms_url=COMMS_URL, api_key="test-key")
     env = ActivityEnvironment()
-    result = await env.run(activities.cleanup_old_telegram_dispatches, 30)
+    result = await env.run(activities.cleanup_old_dispatches, 30)
 
     assert delete_route.call_count == 1
     sent_ref = delete_route.calls[0].request.content
@@ -201,7 +201,7 @@ async def test_cleanup_dispatches_channel_error_leaves_row_in_db():
     pool = AsyncMock()
     pool.fetch = AsyncMock(
         return_value=[
-            {"id": row_id, "metadata": {"delivery_ref": {"adapter": "telegram", "chat_id": 1, "message_id": 2}}},
+            {"id": row_id, "metadata": {"delivery_ref": {"adapter": "slack", "channel": "C1", "ts": "2.0"}}},
         ]
     )
     pool.execute = AsyncMock(return_value="DELETE 0")
@@ -212,7 +212,7 @@ async def test_cleanup_dispatches_channel_error_leaves_row_in_db():
 
     activities = CleanupActivities(db_pool=pool, comms_url=COMMS_URL)
     env = ActivityEnvironment()
-    result = await env.run(activities.cleanup_old_telegram_dispatches, 30)
+    result = await env.run(activities.cleanup_old_dispatches, 30)
 
     assert result["channel_errors"] == 1
     assert result["deleted_from_db"] == 0
@@ -223,12 +223,12 @@ async def test_cleanup_dispatches_aborts_when_comms_url_missing():
     """Without comms_url we cannot call the delete endpoint, so abort and
     return status='aborted_no_comms_url' without touching the DB."""
     pool = AsyncMock()
-    pool.fetch = AsyncMock(return_value=[{"id": uuid4(), "metadata": {"delivery_ref": {"adapter": "telegram"}}}])
+    pool.fetch = AsyncMock(return_value=[{"id": uuid4(), "metadata": {"delivery_ref": {"adapter": "slack"}}}])
     pool.execute = AsyncMock(return_value="DELETE 0")
 
     activities = CleanupActivities(db_pool=pool, comms_url="")
     env = ActivityEnvironment()
-    result = await env.run(activities.cleanup_old_telegram_dispatches, 30)
+    result = await env.run(activities.cleanup_old_dispatches, 30)
 
     assert result["status"] == "aborted_no_comms_url"
     assert result["deleted_from_db"] == 0
@@ -245,7 +245,7 @@ async def test_cleanup_dispatches_query_filters_on_delivery_ref():
 
     activities = CleanupActivities(db_pool=pool, comms_url=COMMS_URL)
     env = ActivityEnvironment()
-    await env.run(activities.cleanup_old_telegram_dispatches, 30)
+    await env.run(activities.cleanup_old_dispatches, 30)
 
     sql = pool.fetch.await_args.args[0]
     assert "metadata ? 'delivery_ref'" in sql

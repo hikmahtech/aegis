@@ -1,4 +1,4 @@
-"""Telegram delivery activities."""
+"""Comms delivery activities (HTTP client for the aegis-comms delivery server)."""
 
 from __future__ import annotations
 
@@ -12,8 +12,8 @@ from temporalio import activity
 _logger = structlog.get_logger()
 
 
-async def safe_send_telegram(delivery: Any, *, agent_id: str, message: str, log_event: str) -> None:
-    """Best-effort wrapper around `DeliveryActivities.send_telegram` for
+async def safe_send_message(delivery: Any, *, agent_id: str, message: str, log_event: str) -> None:
+    """Best-effort wrapper around `DeliveryActivities.send_message` for
     fire-and-forget notification call sites. Logs *both* raised exceptions
     and `{ok: false}` dict returns under `log_event` so a future failure
     can't hide the way the dict-vs-str 422 bug did pre-PR #257.
@@ -50,7 +50,7 @@ async def safe_send_telegram(delivery: Any, *, agent_id: str, message: str, log_
             _logger.warning("notification_budget_check_failed", error=str(exc)[:200])
 
     try:
-        result = await delivery.send_telegram(agent_id=agent_id, message=message, chat_id=0)
+        result = await delivery.send_message(agent_id=agent_id, message=message, chat_id=0)
     except Exception as exc:  # noqa: BLE001 — boundary, must not propagate
         _logger.warning(log_event, error=str(exc)[:200], reason="raised")
         return
@@ -71,7 +71,7 @@ async def safe_send_telegram(delivery: Any, *, agent_id: str, message: str, log_
 
 @dataclass
 class DeliveryActivities:
-    """Activities for delivering messages via Telegram.
+    """Activities for delivering messages via the comms service.
 
     Uses a pooled httpx.AsyncClient across all activity invocations. Delivery
     fires on every workflow notification (task result, triage item, alert,
@@ -79,7 +79,7 @@ class DeliveryActivities:
     avoidable TCP handshakes.
     """
 
-    telegram_url: str = ""
+    comms_url: str = ""
     api_key: str = ""
     tts_enabled: bool = False
     db_pool: Any = None  # for the notification budget (Phase 5)
@@ -91,7 +91,7 @@ class DeliveryActivities:
     def _ensure_client(self) -> httpx.AsyncClient:
         if self._client is None or self._client.is_closed:
             self._client = httpx.AsyncClient(
-                base_url=self.telegram_url,
+                base_url=self.comms_url,
                 headers={"X-API-Key": self.api_key} if self.api_key else {},
                 # 30s covers both the text-message (15s original) and the
                 # document-attachment (30s original) paths.
@@ -100,20 +100,20 @@ class DeliveryActivities:
         return self._client
 
     @activity.defn
-    async def send_telegram(
+    async def send_message(
         self, agent_id: str, message: str, chat_id: int = 0, keyboard: dict | None = None
     ) -> dict:
-        """Send a message to an agent's Telegram topic."""
-        if not self.telegram_url:
-            activity.logger.warning("telegram_url_not_configured")
-            return {"ok": False, "error": "telegram_url not configured"}
+        """Send a message to an agent's channel."""
+        if not self.comms_url:
+            activity.logger.warning("comms_url_not_configured")
+            return {"ok": False, "error": "comms_url not configured"}
 
         body: dict = {"text": message, "chat_id": chat_id, "agent_id": agent_id}
         if keyboard:
             body["reply_markup"] = keyboard
 
         client = self._ensure_client()
-        resp = await client.post("/api/deliver/telegram", json=body)
+        resp = await client.post("/api/deliver/message", json=body)
         return resp.json()
 
     @activity.defn
@@ -127,7 +127,7 @@ class DeliveryActivities:
         """
         if not self.tts_enabled:
             return {"ok": False, "skipped": "tts_disabled"}
-        if not self.telegram_url:
+        if not self.comms_url:
             return {"ok": False, "error": "comms_url not configured"}
         try:
             client = self._ensure_client()
@@ -140,7 +140,7 @@ class DeliveryActivities:
             return {"ok": False, "error": str(exc)[:200]}
 
     @activity.defn
-    async def send_telegram_document(
+    async def send_document(
         self,
         agent_id: str,
         documents: list[dict],
@@ -153,9 +153,9 @@ class DeliveryActivities:
         Each document dict must have keys: filename, content.
         Caption and keyboard (inline buttons) attach to the first document only.
         """
-        if not self.telegram_url:
-            activity.logger.warning("telegram_url_not_configured")
-            return {"ok": False, "error": "telegram_url not configured"}
+        if not self.comms_url:
+            activity.logger.warning("comms_url_not_configured")
+            return {"ok": False, "error": "comms_url not configured"}
 
         body: dict = {
             "documents": documents,
@@ -167,19 +167,19 @@ class DeliveryActivities:
             body["reply_markup"] = keyboard
 
         client = self._ensure_client()
-        resp = await client.post("/api/deliver/telegram/document", json=body)
+        resp = await client.post("/api/deliver/document", json=body)
         return resp.json()
 
     @activity.defn
     async def send_system_event(self, message: str, chat_id: int = 0) -> dict:
         """Send a system event to the General topic (workflow lifecycle, errors, etc.)."""
-        if not self.telegram_url:
-            activity.logger.warning("telegram_url_not_configured")
-            return {"ok": False, "error": "telegram_url not configured"}
+        if not self.comms_url:
+            activity.logger.warning("comms_url_not_configured")
+            return {"ok": False, "error": "comms_url not configured"}
 
         client = self._ensure_client()
         resp = await client.post(
-            "/api/deliver/telegram",
+            "/api/deliver/message",
             json={"text": message, "chat_id": chat_id, "system_event": True},
         )
         return resp.json()
@@ -205,7 +205,7 @@ class DeliveryActivities:
         callers escape user-controlled substrings per project convention. The
         adapter routes to the agent's channel (no chat/topic override).
         """
-        if self.channel != "slack" or not self.telegram_url:
+        if self.channel != "slack" or not self.comms_url:
             # Web channel (the OSS default): the interaction row IS the delivery —
             # it shows up in the admin inbox and is resolved there. Mark it
             # delivered with a web ref so the DeliveryWatchdog stays quiet.

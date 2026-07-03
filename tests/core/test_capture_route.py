@@ -1,4 +1,4 @@
-"""Tests for POST /api/admin/capture (Telegram /capture backend)."""
+"""Tests for POST /api/admin/capture (chat /capture backend)."""
 
 from __future__ import annotations
 
@@ -45,14 +45,14 @@ def test_capture_route_returns_task_ref(app_client, monkeypatch):
     )
     r = app_client.post(
         "/api/admin/capture",
-        json={"text": "buy milk", "source": "telegram"},
+        json={"text": "buy milk", "source": "chat"},
     )
     assert r.status_code == 200, r.text
     body = r.json()
     assert body["task_ref"] == "TASK-CAPTURE-1"
-    assert body["source_tag"] == "#telegram"
+    assert body["source_tag"] == "#chat"
     # Default external_id is hash-based
-    assert body["external_id"].startswith("telegram:")
+    assert body["external_id"].startswith("chat:")
 
 
 def test_capture_route_honors_explicit_external_id(app_client, monkeypatch):
@@ -67,10 +67,10 @@ def test_capture_route_honors_explicit_external_id(app_client, monkeypatch):
     )
     r = app_client.post(
         "/api/admin/capture",
-        json={"text": "x", "source": "telegram", "external_id": "tg:12345:abc"},
+        json={"text": "x", "source": "chat", "external_id": "chat:12345:abc"},
     )
     assert r.status_code == 200
-    assert captured["ext_id"] == "tg:12345:abc"
+    assert captured["ext_id"] == "chat:12345:abc"
 
 
 def test_capture_route_503_when_impl_returns_none(app_client, monkeypatch):

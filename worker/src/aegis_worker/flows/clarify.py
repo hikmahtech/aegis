@@ -13,7 +13,7 @@ Five base GTD outcomes from `classify_one`:
 - ``reference``   — add `@reference` label (state-as-label, no item_move)
 - ``someday``     — add `@someday` label (state-as-label, no item_move),
                   mirroring `reference`/`@reference`
-- ``2_min``       — in-window: spawn Telegram card (Do now / Defer / Trash);
+- ``2_min``       — in-window: spawn chat card (Do now / Defer / Trash);
                   out-of-window: add `@5min` label
 - ``next_action`` — label update (optional `due.string="tomorrow"` from defer).
                   Multi-step work uses Todoist subtasks, not sub-projects.
@@ -76,7 +76,7 @@ async def _dispatch_reference_verdict(task: dict, verdict: dict) -> None:
     inline path can reuse it without duplicating the dispatch logic.
 
     If Todoist rejects ``complete_reference_task`` permanently we fall through
-    to the demotion path so the user sees the failure on Telegram + a
+    to the demotion path so the user sees the failure in chat + a
     @to-read lane in Library — without this fallback the task stays open with
     the @reference label forever (KS has the content; Todoist doesn't).
     Transient (retryable) Todoist failures are surfaced as exceptions so
@@ -185,7 +185,7 @@ class ClarifyFlow:
                 #   - apply failed BUT outbox compensation was queued
                 #     (drain_outbox will retry), OR
                 #   - a NON-pandora interaction was spawned (low_conf /
-                #     2_min: the Telegram card is the authoritative state,
+                #     2_min: the chat card is the authoritative state,
                 #     so we bump even if the paper-trail note failed).
                 #
                 # Pandora interactions are different: the spawn is gated on

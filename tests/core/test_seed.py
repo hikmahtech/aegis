@@ -198,7 +198,6 @@ _MINIMAL_AGENT_SEED = [
         "capabilities": ["email"],
         "model_tier": "smart",
         "interaction_timeout_default": "archive",
-        "telegram_topic_id": 2753,
         "slack_channel_id": "",
         "active": True,
     }
@@ -218,9 +217,9 @@ async def test_seed_preserves_provisioned_slack_channel_id(db_pool):
             """
             INSERT INTO agents (
                 id, name, role, system_prompt_path, capabilities,
-                model_tier, interaction_timeout_default, telegram_topic_id,
+                model_tier, interaction_timeout_default,
                 slack_channel_id, active
-            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
             ON CONFLICT (id) DO UPDATE SET slack_channel_id = EXCLUDED.slack_channel_id
             """,
             "sebas",
@@ -230,7 +229,6 @@ async def test_seed_preserves_provisioned_slack_channel_id(db_pool):
             ["email"],
             "smart",
             "archive",
-            2753,
             "C123",
             True,
         )
@@ -265,9 +263,9 @@ async def test_seed_writes_nonempty_slack_channel_id(db_pool):
             """
             INSERT INTO agents (
                 id, name, role, system_prompt_path, capabilities,
-                model_tier, interaction_timeout_default, telegram_topic_id,
+                model_tier, interaction_timeout_default,
                 slack_channel_id, active
-            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
             ON CONFLICT (id) DO UPDATE SET slack_channel_id = NULL
             """,
             "raphael",
@@ -277,7 +275,6 @@ async def test_seed_writes_nonempty_slack_channel_id(db_pool):
             ["knowledge_search"],
             "smart",
             "hold",
-            2754,
             None,
             True,
         )
@@ -296,7 +293,6 @@ async def test_seed_writes_nonempty_slack_channel_id(db_pool):
             "capabilities": ["knowledge_search"],
             "model_tier": "smart",
             "interaction_timeout_default": "hold",
-            "telegram_topic_id": 2754,
             "slack_channel_id": "C456",
             "active": True,
         }
@@ -326,9 +322,9 @@ async def test_seed_preserves_provisioned_elevenlabs_voice_id(db_pool):
             """
             INSERT INTO agents (
                 id, name, role, system_prompt_path, capabilities,
-                model_tier, interaction_timeout_default, telegram_topic_id,
+                model_tier, interaction_timeout_default,
                 slack_channel_id, elevenlabs_voice_id, active
-            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
             ON CONFLICT (id) DO UPDATE SET elevenlabs_voice_id = EXCLUDED.elevenlabs_voice_id
             """,
             "sebas",
@@ -338,7 +334,6 @@ async def test_seed_preserves_provisioned_elevenlabs_voice_id(db_pool):
             ["email"],
             "smart",
             "archive",
-            2753,
             "C123",
             "VOICE_SEBAS",
             True,

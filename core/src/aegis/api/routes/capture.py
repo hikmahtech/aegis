@@ -1,7 +1,7 @@
-"""Phase 5 polish: POST /api/admin/capture for Telegram /capture command.
+"""Phase 5 polish: POST /api/admin/capture for chat /capture commands.
 
 A tiny wrapper around the same _capture_to_inbox_impl helper that the
-capture_to_inbox chat tool uses. Lets the Telegram bot (which has no
+capture_to_inbox chat tool uses. Lets a chat bot (which has no
 direct DB access) drop a task into the Todoist Inbox by HTTP.
 """
 
@@ -25,7 +25,7 @@ router = APIRouter(
 
 class CaptureRequest(BaseModel):
     text: str = Field(..., min_length=1, max_length=2000)
-    source: str = Field(default="telegram", pattern=r"^[a-z_]{1,32}$")
+    source: str = Field(default="chat", pattern=r"^[a-z_]{1,32}$")
     description: str | None = Field(default=None, max_length=8000)
     # Optional explicit external_id (for idempotent re-tries from the bot).
     # If omitted, a hash of (source + text) is used.

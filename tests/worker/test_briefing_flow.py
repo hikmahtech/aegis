@@ -27,10 +27,10 @@ def _stubs(sent, committed, fail_send=False):
     async def frame(changes):
         return "narrative body"
 
-    @activity.defn(name="send_telegram")
+    @activity.defn(name="send_message")
     async def send_tg(agent_id, message, chat_id=0, keyboard=None):
         if fail_send and agent_id != "pandoras-actor":
-            raise RuntimeError("telegram down")
+            raise RuntimeError("comms down")
         sent.append((agent_id, message))
         return {"ok": True}
 

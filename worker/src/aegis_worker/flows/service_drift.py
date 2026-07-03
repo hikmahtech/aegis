@@ -70,7 +70,7 @@ class ServiceDriftFlow:
             )
             if not config.silent:
                 for d in drifts:
-                    # notify_drift uses safe_send_telegram internally and
+                    # notify_drift uses safe_send_message internally and
                     # never raises — no wrapping try/except needed.
                     await workflow.execute_activity_method(
                         HomelabActivities.notify_drift,

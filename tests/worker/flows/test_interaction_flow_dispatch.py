@@ -1,4 +1,4 @@
-"""InteractionFlow now dispatches a Telegram card before waiting."""
+"""InteractionFlow now dispatches a chat card before waiting."""
 
 from __future__ import annotations
 
@@ -183,7 +183,7 @@ async def test_interaction_flow_tolerates_card_failure():
         allow_hint: bool = False,
     ) -> dict:
         fail_count.append(1)
-        raise RuntimeError("telegram service down")
+        raise RuntimeError("comms service down")
 
     async with (
         await WorkflowEnvironment.start_time_skipping() as env,

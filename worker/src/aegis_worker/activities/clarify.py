@@ -131,7 +131,7 @@ from aegis.clarify_note import (  # noqa: E402
 )
 from temporalio import activity  # noqa: E402, F401  # used by appended methods in Tasks 8-11
 
-from aegis_worker.activities.delivery import safe_send_telegram  # noqa: E402
+from aegis_worker.activities.delivery import safe_send_message  # noqa: E402
 
 
 @dataclass
@@ -146,8 +146,8 @@ class ClarifyActivities:
     # Phase 5 reference store: knowledge-service connector, wired by
     # worker boot. None in unit tests that don't exercise ingest.
     knowledge_connector: object | None = None
-    # references-as-knowledge: raphael's per-message Telegram path uses
-    # DeliveryActivities to talk to the Telegram delivery server. Wired
+    # references-as-knowledge: raphael's per-message chat path uses
+    # DeliveryActivities to talk to the comms delivery server. Wired
     # in worker boot; None in unit tests that don't exercise notifications.
     delivery_connector: object | None = None
     sonnet_model: str = "claude-sonnet"
@@ -670,7 +670,7 @@ class ClarifyActivities:
             f"🎩 Sebas to Master — I am uncertain about this one. "
             f"Best guess: **{classification}** ({contexts}), "
             f"confidence {confidence:.2f}.\n"
-            f"A choice card awaits in Telegram; alternatively, reply here.\n"
+            f"A choice card awaits in chat; alternatively, reply here.\n"
             f"Model: {decision.get('llm_model')}"
         )
 
@@ -929,7 +929,7 @@ class ClarifyActivities:
         # Low-confidence → NEEDS REVIEW note + signal interaction.
         # The note is best-effort: if Todoist rejects it (envelope-ok +
         # per-command ITEM_NOT_FOUND on a stale projection row), we still
-        # spawn the user interaction since the Telegram card is the real
+        # spawn the user interaction since the chat card is the real
         # signal. Log the rejection so it surfaces in observability.
         if confidence < self.escalation_threshold and not force_apply:
             note_cmd = TodoistConnector.build_note_add_command(
@@ -1045,7 +1045,7 @@ class ClarifyActivities:
             # 2026-05-27). Builds the synthetic chat turn for
             # AgentChatReplyFlow and returns a spawn payload. No Todoist
             # commands are sent here — the spawned workflow does all
-            # writes (Telegram + Todoist comment).
+            # writes (chat + Todoist comment).
             #
             # Agent id mapping is mostly classification.replace("_followup", "")
             # except for pandora — the personality directory + agents.id
@@ -1320,7 +1320,7 @@ class ClarifyActivities:
 
         resolved_decision = dict(original_decision)
         resolved_decision["llm_model"] = "user_resolution"
-        resolved_decision["reason"] = f"resolved via Telegram: flavor={flavor} choice={choice}"
+        resolved_decision["reason"] = f"resolved via chat: flavor={flavor} choice={choice}"
 
         if flavor == "2_min":
             if choice == "do_now":
@@ -1367,7 +1367,7 @@ class ClarifyActivities:
             decision={**resolved_decision, "source_tag": original_decision.get("source_tag")},
             applied=outcome.get("applied", False),
             pass_n=pass_n,
-            user_hint=f"telegram:{choice}",
+            user_hint=f"chat:{choice}",
         )
         # references-as-knowledge: if the resolution lands on 'reference'
         # and Todoist accepted the labels, inline-ingest + dispatch the
@@ -1697,7 +1697,7 @@ class ClarifyActivities:
 
     # Source tags considered "automated" (raphael surfaces these via the
     # daily briefing digest, not per-message). Everything else is treated
-    # as user-initiated and gets an immediate Telegram confirmation.
+    # as user-initiated and gets an immediate chat confirmation.
     _AUTOMATED_REFERENCE_SOURCES = {"#research", "#email"}
 
     @activity.defn
@@ -1714,7 +1714,7 @@ class ClarifyActivities:
         Posts a short ClarifyFlow note ("filed in knowledge service") so
         the audit trail explains why the task closed without user action,
         then issues item_complete. For user-initiated sources (chat /
-        manual) raphael sends a per-message Telegram confirmation; for
+        manual) raphael sends a per-message chat confirmation; for
         automated sources (raindrop / RSS / intel-scan / email) the
         confirmation lands in the daily briefing instead.
         """
@@ -1749,14 +1749,14 @@ class ClarifyActivities:
                 "retryable": status["retryable"] or status["rejected_retryable"],
             }
 
-        telegram_sent = False
+        notify_sent = False
         if source_tag not in self._AUTOMATED_REFERENCE_SOURCES:
-            telegram_sent = await self._notify_reference_filed(
+            notify_sent = await self._notify_reference_filed(
                 title=title, content_id=content_id, url=url
             )
         return {
             "completed": True,
-            "telegram_sent": telegram_sent,
+            "notify_sent": notify_sent,
             "automated_source": source_tag in self._AUTOMATED_REFERENCE_SOURCES,
         }
 
@@ -1772,7 +1772,7 @@ class ClarifyActivities:
         """Demote a reference task to a reading task after KS gave up.
 
         Strips ``@reference`` from the label set, adds ``@to-read``, posts
-        a comment with the failure reason, and sends an immediate Telegram
+        a comment with the failure reason, and sends an immediate chat
         from raphael (regardless of source — the user needs to act).
         """
         from aegis.connectors.todoist import TodoistConnector
@@ -1809,11 +1809,11 @@ class ClarifyActivities:
                 "retryable": status["retryable"] or status["rejected_retryable"],
             }
 
-        telegram_sent = await self._notify_reference_demoted(title=title, reason=reason)
+        notify_sent = await self._notify_reference_demoted(title=title, reason=reason)
         return {
             "reclassified": True,
             "labels": new_labels,
-            "telegram_sent": telegram_sent,
+            "notify_sent": notify_sent,
         }
 
     @activity.defn
@@ -1823,7 +1823,7 @@ class ClarifyActivities:
         agent_id: str,
         reply_text: str,
         tool_trace_summary: str,
-        telegram_message_id: int | None,
+        message_id: int | None,
     ) -> dict:
         """Mirror an AgentChatReplyFlow reply as a Todoist comment.
 
@@ -1831,7 +1831,7 @@ class ClarifyActivities:
           - the webhook receiver's is_clarify_own check trips,
           - find_unclassified_items' SQL filter excludes it from
             latest_user_note extraction.
-        Failure does NOT raise — Telegram is the primary surface, and a
+        Failure does NOT raise — chat is the primary surface, and a
         Todoist-side rejection here just leaves the user without the
         in-task anchor (acceptable degradation).
         """
@@ -1844,8 +1844,8 @@ class ClarifyActivities:
         trailer_parts: list[str] = []
         if tool_trace_summary:
             trailer_parts.append(f"(tools: {tool_trace_summary})")
-        if telegram_message_id is not None:
-            trailer_parts.append(f"(telegram message_id={telegram_message_id})")
+        if message_id is not None:
+            trailer_parts.append(f"(chat message_id={message_id})")
         trailer = "\n\n" + "\n".join(trailer_parts) if trailer_parts else ""
         body = f"{AGENT_REPLY_PREFIX}{ts} agent={agent_id}]\n{reply_text}{trailer}"
 
@@ -1947,9 +1947,9 @@ class ClarifyActivities:
     async def _notify_reference_filed(
         self, title: str, content_id: str | None, url: str | None
     ) -> bool:
-        """Send a raphael-voiced Telegram confirming a filed reference.
+        """Send a raphael-voiced chat message confirming a filed reference.
 
-        Returns True when the send was dispatched via `safe_send_telegram`
+        Returns True when the send was dispatched via `safe_send_message`
         (failures are logged via the helper under
         `reference_filed_notify_failed`, never raised). Returns False only
         when there's no delivery connector wired (test path).
@@ -1968,7 +1968,7 @@ class ClarifyActivities:
         message = (
             f"📚 Filed: <b>{safe_title}</b>\n<i>Added to your reference library.</i>{link_html}"
         )
-        await safe_send_telegram(
+        await safe_send_message(
             delivery,
             agent_id="raphael",
             message=message,
@@ -1977,10 +1977,10 @@ class ClarifyActivities:
         return True
 
     async def _notify_reference_demoted(self, title: str, reason: str) -> bool:
-        """Send a raphael-voiced Telegram that a reference couldn't be filed.
+        """Send a raphael-voiced chat message that a reference couldn't be filed.
 
         Always per-message — the user has a new reading task to act on.
-        Returns True when the send was dispatched via `safe_send_telegram`
+        Returns True when the send was dispatched via `safe_send_message`
         (failures are logged via the helper under
         `reference_demoted_notify_failed`, never raised). Returns False only
         when there's no delivery connector wired (test path).
@@ -1997,7 +1997,7 @@ class ClarifyActivities:
             f"<i>Reason: {safe_reason}</i>\n"
             f"Added to your reading list."
         )
-        await safe_send_telegram(
+        await safe_send_message(
             delivery,
             agent_id="raphael",
             message=message,

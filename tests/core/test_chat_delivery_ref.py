@@ -1,7 +1,7 @@
 """Tests for channel-neutral delivery_ref on chat routes (Slice 5a).
 
-All changes are additive — the existing telegram paths are verified
-to keep working unchanged (dormant fallback channel).
+The dispatch route keeps its legacy top-level keys (topic_id/chat_id/
+message_id) for callers that don't send delivery_ref.
 """
 
 from __future__ import annotations
@@ -69,10 +69,10 @@ async def test_log_dispatch_with_delivery_ref_stores_it_in_metadata(
     assert "kind" in metadata
 
 
-async def test_log_dispatch_without_delivery_ref_keeps_telegram_shape(
+async def test_log_dispatch_without_delivery_ref_keeps_legacy_shape(
     app, auth_headers, mock_db_pool
 ):
-    """Telegram callers don't send delivery_ref — metadata shape unchanged."""
+    """Callers that don't send delivery_ref keep the legacy metadata shape."""
     payload = {
         "agent_id": "pandoras-actor",
         "topic_id": 2755,
@@ -130,7 +130,7 @@ async def test_chat_with_delivery_ref_stores_it_on_user_row(
 ):
     """POST /api/chat with a delivery_ref block stores it in the user row's metadata.
 
-    The Slack inbound path supplies delivery_ref instead of the telegram block.
+    The Slack inbound path supplies delivery_ref.
     The user chat_history row's metadata must carry delivery_ref so the
     assistant can later reference the original message for reactions/replies.
     """
@@ -173,88 +173,6 @@ async def test_chat_with_delivery_ref_stores_it_on_user_row(
     assert user_metadata is not None, "user row must have metadata (delivery_ref path)"
     assert user_metadata.get("delivery_ref") == delivery_ref
     assert user_metadata.get("kind") == "user_message"
-
-
-async def test_chat_with_telegram_block_keeps_legacy_shape(
-    chat_app, auth_headers, mock_db_pool
-):
-    """Telegram callers use the telegram:{chat_id,message_id} block — unchanged."""
-    mock_db_pool.fetchrow.return_value = {
-        "id": "sebas",
-        "name": "Sebas",
-        "system_prompt_path": "personalities/sebas/SOUL.md",
-        "role": "executive-assistant",
-    }
-    mock_db_pool.fetch.return_value = []
-
-    async with AsyncClient(transport=ASGITransport(app=chat_app), base_url="http://test") as client:
-        resp = await client.post(
-            "/api/chat",
-            headers=auth_headers,
-            json={
-                "agent_id": "sebas",
-                "message": "Hello",
-                "telegram": {"chat_id": -1003528071837, "message_id": 1234},
-            },
-        )
-    assert resp.status_code == 200
-
-    user_insert_calls = [
-        call
-        for call in mock_db_pool.execute.call_args_list
-        if len(call[0]) >= 4
-        and "INSERT INTO chat_history" in call[0][0]
-        and call[0][3] == "user"
-    ]
-    assert user_insert_calls, "no user row INSERT found"
-    call_args = user_insert_calls[0][0]
-    user_metadata = call_args[5] if len(call_args) > 5 else None
-    assert user_metadata is not None, "user row must carry telegram metadata"
-    assert user_metadata.get("telegram_message_id") == 1234
-    assert user_metadata.get("chat_id") == -1003528071837
-    assert "delivery_ref" not in user_metadata
-
-
-async def test_chat_delivery_ref_takes_precedence_over_telegram(
-    chat_app, auth_headers, mock_db_pool
-):
-    """If both delivery_ref and telegram are supplied, delivery_ref wins."""
-    mock_db_pool.fetchrow.return_value = {
-        "id": "sebas",
-        "name": "Sebas",
-        "system_prompt_path": "personalities/sebas/SOUL.md",
-        "role": "executive-assistant",
-    }
-    mock_db_pool.fetch.return_value = []
-
-    delivery_ref = {"adapter": "slack", "channel": "C9999", "ts": "9.0"}
-    async with AsyncClient(transport=ASGITransport(app=chat_app), base_url="http://test") as client:
-        resp = await client.post(
-            "/api/chat",
-            headers=auth_headers,
-            json={
-                "agent_id": "sebas",
-                "message": "Both blocks",
-                "delivery_ref": delivery_ref,
-                "telegram": {"chat_id": -1, "message_id": 999},
-            },
-        )
-    assert resp.status_code == 200
-
-    user_insert_calls = [
-        call
-        for call in mock_db_pool.execute.call_args_list
-        if len(call[0]) >= 4
-        and "INSERT INTO chat_history" in call[0][0]
-        and call[0][3] == "user"
-    ]
-    assert user_insert_calls, "no user row INSERT found"
-    call_args = user_insert_calls[0][0]
-    user_metadata = call_args[5] if len(call_args) > 5 else None
-    assert user_metadata is not None, "delivery_ref path must set user_metadata"
-    assert user_metadata["delivery_ref"] == delivery_ref
-    # telegram keys must NOT be present when delivery_ref won
-    assert "telegram_message_id" not in user_metadata
 
 
 # ---------------------------------------------------------------------------

@@ -72,12 +72,12 @@ class TodoistSyncFlow:
         # drain_outbox marks a command 'failed' only once (permanent rejection
         # or attempt cap), so failed>0 here means NEW permanent losses this
         # run — alert immediately instead of letting the row rot unseen.
-        # Best-effort: a Telegram hiccup must not fail the sync flow.
+        # Best-effort: a delivery hiccup must not fail the sync flow.
         failed = int(drain_result.get("failed") or 0)
         if failed:
             try:
                 await workflow.execute_activity_method(
-                    DeliveryActivities.send_telegram,
+                    DeliveryActivities.send_message,
                     args=[
                         config.agent_id,
                         (

@@ -12,9 +12,9 @@ async def test_log_dispatch_forwards_neutral_delivery_ref(monkeypatch):
     result into the /api/chat/dispatches POST body (Slack ref), alongside the
     legacy top-level keys when present."""
     import aegis_comms.__main__ as bot_main
-    from aegis_comms.config import TelegramSettings
+    from aegis_comms.config import CommsSettings
 
-    settings = TelegramSettings(
+    settings = CommsSettings(
         _env_file=None,
         core_url="http://core.test",
         api_key="k",

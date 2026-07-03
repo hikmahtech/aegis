@@ -193,8 +193,8 @@ _E2E_CARD: list = []
 _E2E_CAPTURES: list = []  # (source_tag, external_id, title)
 
 
-@activity.defn(name="send_telegram")
-async def _stub_telegram(agent_id: str, message: str, chat_id: int, keyboard) -> dict:
+@activity.defn(name="send_message")
+async def _stub_delivery(agent_id: str, message: str, chat_id: int, keyboard) -> dict:
     return {"ok": True, "message_id": 1}
 
 
@@ -330,7 +330,7 @@ async def test_gmail_ingest_e2e(e2e_channels, token_dir, db_pool, monkeypatch):
         channel_act.list_active_channels,
         channel_act.update_channel_config_key,
         channel_act.ingest_idempotency_claim,
-        _stub_telegram,
+        _stub_delivery,
         _stub_card,
         _stub_update_msg,
         _stub_insert,
@@ -453,7 +453,7 @@ async def test_gmail_ingest_e2e_idempotent_rerun(e2e_channels, token_dir, db_poo
         channel_act.list_active_channels,
         channel_act.update_channel_config_key,
         channel_act.ingest_idempotency_claim,
-        _stub_telegram,
+        _stub_delivery,
         _stub_card,
         _stub_update_msg,
         _stub_insert,

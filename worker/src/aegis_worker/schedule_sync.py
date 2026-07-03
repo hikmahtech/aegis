@@ -85,7 +85,7 @@ _ACTIVITY_TYPE_MAP = {
             silent=bool(act["config"].get("silent", False)),
             threshold_seconds=int(act["config"].get("threshold_seconds", 120)),
             window_hours=int(act["config"].get("window_hours", 24)),
-            telegram_url=act["_settings"].get("telegram_service_url", ""),
+            comms_url=act["_settings"].get("comms_url", ""),
         ),
     ),
     "CertRadarFlow": lambda act: (
@@ -301,8 +301,8 @@ async def sync_schedules(
         # comms service URL). Mappers read via act["_settings"].get(...).
         act["_settings"] = {
             "aegis_ui_url": getattr(settings, "aegis_ui_url", "") if settings else "",
-            "telegram_service_url": (
-                getattr(settings, "telegram_service_url", "") if settings else ""
+            "comms_url": (
+                getattr(settings, "comms_url", "") if settings else ""
             ),
         }
 

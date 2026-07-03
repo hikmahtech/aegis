@@ -1,9 +1,9 @@
 from aegis_comms.adapters.base import CardSpec, DeliveryRef, SendResult
 
 
-def test_delivery_ref_roundtrips_telegram():
-    ref = DeliveryRef(adapter="telegram", data={"chat_id": -100, "message_id": 5})
-    assert ref.to_dict() == {"adapter": "telegram", "chat_id": -100, "message_id": 5}
+def test_delivery_ref_roundtrips():
+    ref = DeliveryRef(adapter="web", data={"chat_id": -100, "message_id": 5})
+    assert ref.to_dict() == {"adapter": "web", "chat_id": -100, "message_id": 5}
     assert DeliveryRef.from_dict(ref.to_dict()) == ref
 
 

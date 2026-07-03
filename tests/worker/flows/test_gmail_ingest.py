@@ -28,7 +28,7 @@ _calls: dict[str, list] = {
     "fetch": [],
     "classify": [],
     "apply_label": [],
-    "send_telegram": [],
+    "send_message": [],
     "cursor_update": [],
     "idem": [],
     "insert_ia": [],
@@ -114,9 +114,9 @@ async def stub_apply_label(account_label: str, msg_id: str, label: str) -> dict:
     return {"ok": True, "id": msg_id}
 
 
-@activity.defn(name="send_telegram")
-async def stub_send_telegram(agent_id: str, msg: str, chat_id: int, keyboard) -> dict:
-    _calls["send_telegram"].append((agent_id, msg[:60]))
+@activity.defn(name="send_message")
+async def stub_send_message(agent_id: str, msg: str, chat_id: int, keyboard) -> dict:
+    _calls["send_message"].append((agent_id, msg[:60]))
     return {"ok": True, "message_id": 1}
 
 
@@ -186,7 +186,7 @@ ALL_STUBS = [
     stub_classify,
     stub_fetch_thread,
     stub_apply_label,
-    stub_send_telegram,
+    stub_send_message,
     stub_cursor,
     stub_idem,
     stub_insert_ia,
@@ -271,7 +271,7 @@ async def test_classifies_and_routes_important_action():
         stub_classify,
         stub_fetch_thread,
         stub_apply_label,
-        stub_send_telegram,
+        stub_send_message,
         stub_cursor,
         stub_idem,
         stub_insert_ia,
@@ -371,7 +371,7 @@ async def test_auth_expired_pauses_via_interaction_flow():
         stub_classify,
         stub_fetch_thread,
         stub_apply_label,
-        stub_send_telegram,
+        stub_send_message,
         stub_cursor,
         stub_idem,
         stub_insert_ia,
@@ -413,7 +413,7 @@ async def test_auth_expired_pauses_via_interaction_flow():
         assert _calls["insert_ia"][0][0] == "ack"
         assert _calls["insert_ia"][0][1] == "gmail_reauth"
         # options must carry a URL template with {interaction_id} placeholder
-        # so the Telegram card renders a clickable reauth button.
+        # so the chat card renders a clickable reauth button.
         reauth_opts = _calls["insert_ia_options"][0]
         assert reauth_opts and "url" in reauth_opts, f"reauth options missing url: {reauth_opts}"
         assert "{interaction_id}" in reauth_opts["url"]
@@ -464,7 +464,7 @@ async def test_cursor_advances_on_success():
         stub_classify,
         stub_fetch_thread,
         stub_apply_label,
-        stub_send_telegram,
+        stub_send_message,
         stub_cursor,
         stub_idem,
         stub_insert_ia,
@@ -611,7 +611,7 @@ async def test_financial_tags_trigger_money_process_fanout():
         stub_classify_financial,
         stub_fetch_thread,
         stub_apply_label,
-        stub_send_telegram,
+        stub_send_message,
         stub_cursor,
         stub_idem,
         stub_insert_ia,
@@ -741,7 +741,7 @@ async def test_forwarded_lane_surfaces_in_todoist_description():
         stub_classify_preserves_lane,
         stub_fetch_thread,
         stub_apply_label,
-        stub_send_telegram,
+        stub_send_message,
         stub_cursor,
         stub_idem,
         stub_insert_ia,
@@ -805,7 +805,7 @@ async def test_apply_label_ok_false_returns_label_failed_for_useless():
         stub_classify,
         stub_fetch_thread,
         stub_apply_label_failed,
-        stub_send_telegram,
+        stub_send_message,
         stub_cursor,
         stub_idem,
         stub_insert_ia,
@@ -862,7 +862,7 @@ async def test_own_lane_omits_forwarded_line_from_description():
                 stub_classify,
                 stub_fetch_thread,
                 stub_apply_label,
-                stub_send_telegram,
+                stub_send_message,
                 stub_cursor,
                 stub_idem,
                 stub_insert_ia,
@@ -894,7 +894,7 @@ async def test_own_lane_omits_forwarded_line_from_description():
 
 
 # ---------------------------------------------------------------------------
-# Test: important_read → Gmail IMPORTANT label, kept unread, NO Telegram ping
+# Test: important_read → Gmail IMPORTANT label, kept unread, NO chat ping
 # (2026-05-30 redesign)
 # ---------------------------------------------------------------------------
 
@@ -920,7 +920,7 @@ async def stub_fetch_receipt_redesign(inp) -> FetchEmailsResult:
 @pytest.mark.asyncio
 async def test_important_read_labels_important_and_skips_ping():
     """receipt subject → important_read → apply_label IMPORTANT, NOT READ, and
-    no per-email Telegram ping."""
+    no per-email chat ping."""
     _reset()
     async with (
         await WorkflowEnvironment.start_time_skipping() as env,
@@ -934,7 +934,7 @@ async def test_important_read_labels_important_and_skips_ping():
                 stub_classify,
                 stub_fetch_thread,
                 stub_apply_label,
-                stub_send_telegram,
+                stub_send_message,
                 stub_cursor,
                 stub_idem,
                 stub_capture_to_inbox,
@@ -953,7 +953,7 @@ async def test_important_read_labels_important_and_skips_ping():
     labels = [c[2] for c in _calls["apply_label"]]
     assert "IMPORTANT" in labels, f"expected IMPORTANT label, got {labels}"
     assert "READ" not in labels, f"important_read must stay unread, got {labels}"
-    assert _calls["send_telegram"] == [], "important_read must not ping Telegram anymore"
+    assert _calls["send_message"] == [], "important_read must not send a chat ping anymore"
 
 
 # ---------------------------------------------------------------------------
@@ -995,7 +995,7 @@ async def test_informational_is_marked_read():
                 stub_classify,
                 stub_fetch_thread,
                 stub_apply_label,
-                stub_send_telegram,
+                stub_send_message,
                 stub_cursor,
                 stub_idem,
                 stub_capture_to_inbox,

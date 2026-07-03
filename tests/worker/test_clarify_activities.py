@@ -1345,7 +1345,7 @@ async def test_apply_clarify_resolution_2min_do_now(db_pool, _resolution_task) -
     assert row["pass"] == 2
     assert row["llm_model"] == "user_resolution"
     assert row["applied"] is True
-    assert row["user_hint"] == "telegram:do_now"
+    assert row["user_hint"] == "chat:do_now"
 
 
 @pytest.mark.asyncio
@@ -2290,8 +2290,8 @@ async def test_apply_outcome_pandora_followup_builds_followup_alert(db_pool) -> 
 
 
 @pytest.mark.asyncio
-async def test_complete_reference_task_issues_complete_and_skips_telegram_for_automated() -> None:
-    """Automated source (#research) → completes task, no per-message Telegram."""
+async def test_complete_reference_task_issues_complete_and_skips_notify_for_automated() -> None:
+    """Automated source (#research) → completes task, no per-message chat notification."""
     connector = AsyncMock()
     connector.commands = AsyncMock(
         return_value={"ok": True, "data": {"sync_status": {}, "temp_id_mapping": {}}}
@@ -2312,17 +2312,17 @@ async def test_complete_reference_task_issues_complete_and_skips_telegram_for_au
         url="https://example.com/x",
     )
     assert out["completed"] is True
-    assert out["telegram_sent"] is False
+    assert out["notify_sent"] is False
     assert out["automated_source"] is True
     sent = connector.commands.await_args.args[0]
     types = [c["type"] for c in sent]
     assert "note_add" in types
     assert "item_complete" in types
-    delivery.send_telegram.assert_not_called()
+    delivery.send_message.assert_not_called()
 
 
 @pytest.mark.asyncio
-async def test_complete_reference_task_sends_telegram_for_user_initiated() -> None:
+async def test_complete_reference_task_sends_notify_for_user_initiated() -> None:
     """User-initiated source (#chat) → per-message confirmation from raphael."""
     connector = AsyncMock()
     connector.commands = AsyncMock(
@@ -2330,7 +2330,7 @@ async def test_complete_reference_task_sends_telegram_for_user_initiated() -> No
     )
     delivery = AsyncMock()
     delivery.channel = "slack"
-    delivery.send_telegram = AsyncMock(return_value={"ok": True})
+    delivery.send_message = AsyncMock(return_value={"ok": True})
     acts = ClarifyActivities(
         db_pool=None,
         todoist_connector=connector,
@@ -2345,9 +2345,9 @@ async def test_complete_reference_task_sends_telegram_for_user_initiated() -> No
         url=None,
     )
     assert out["completed"] is True
-    assert out["telegram_sent"] is True
-    delivery.send_telegram.assert_awaited_once()
-    kwargs = delivery.send_telegram.await_args.kwargs
+    assert out["notify_sent"] is True
+    delivery.send_message.assert_awaited_once()
+    kwargs = delivery.send_message.await_args.kwargs
     assert kwargs["agent_id"] == "raphael"
     assert "Filed" in kwargs["message"]
     assert "Article shared in chat" in kwargs["message"]
@@ -2379,14 +2379,14 @@ async def test_complete_reference_task_returns_retryable_on_5xx() -> None:
 
 @pytest.mark.asyncio
 async def test_reclassify_reference_to_reading_swaps_labels_and_notifies() -> None:
-    """Permanent ingest failure → strip @reference, add @to-read, telegram raphael."""
+    """Permanent ingest failure → strip @reference, add @to-read, raphael notifies in chat."""
     connector = AsyncMock()
     connector.commands = AsyncMock(
         return_value={"ok": True, "data": {"sync_status": {}, "temp_id_mapping": {}}}
     )
     delivery = AsyncMock()
     delivery.channel = "slack"
-    delivery.send_telegram = AsyncMock(return_value={"ok": True})
+    delivery.send_message = AsyncMock(return_value={"ok": True})
     acts = ClarifyActivities(
         db_pool=None,
         todoist_connector=connector,
@@ -2404,9 +2404,9 @@ async def test_reclassify_reference_to_reading_swaps_labels_and_notifies() -> No
     assert "@to-read" in out["labels"]
     assert "@reference" not in out["labels"]
     # Always notifies on demote — the user has a new reading task to act on.
-    assert out["telegram_sent"] is True
-    delivery.send_telegram.assert_awaited_once()
-    msg = delivery.send_telegram.await_args.kwargs["message"]
+    assert out["notify_sent"] is True
+    delivery.send_message.assert_awaited_once()
+    msg = delivery.send_message.await_args.kwargs["message"]
     assert "Couldn't file" in msg
     assert "http_404" in msg
     # Note added with the reason
@@ -2418,7 +2418,7 @@ async def test_reclassify_reference_to_reading_swaps_labels_and_notifies() -> No
 
 @pytest.mark.asyncio
 async def test_reclassify_handles_missing_delivery_connector() -> None:
-    """No delivery wired (unit test mode) → reclassify still succeeds; telegram is no-op."""
+    """No delivery wired (unit test mode) → reclassify still succeeds; notify is a no-op."""
     connector = AsyncMock()
     connector.commands = AsyncMock(
         return_value={"ok": True, "data": {"sync_status": {}, "temp_id_mapping": {}}}
@@ -2437,18 +2437,18 @@ async def test_reclassify_handles_missing_delivery_connector() -> None:
         reason="http_404",
     )
     assert out["reclassified"] is True
-    assert out["telegram_sent"] is False
+    assert out["notify_sent"] is False
 
 
-# --- Bundle B sub-fix #3: safe_send_telegram for notify paths ---
+# --- Bundle B sub-fix #3: safe_send_message for notify paths ---
 
 
 @pytest.mark.asyncio
-async def test_notify_reference_filed_uses_safe_send_telegram_swallows_failure() -> None:
+async def test_notify_reference_filed_uses_safe_send_message_swallows_failure() -> None:
     """Pin (2026-05-28): _notify_reference_filed routes through
-    safe_send_telegram so an exception in send_telegram does NOT bubble
+    safe_send_message so an exception in send_message does NOT bubble
     out of the activity. The reclassify path still completes. We assert
-    by making send_telegram raise — pre-fix this would have raised out
+    by making send_message raise — pre-fix this would have raised out
     of the activity (the wrapping try/except returned False); post-fix
     the helper swallows it and we return True (dispatch happened)."""
     connector = AsyncMock()
@@ -2457,7 +2457,7 @@ async def test_notify_reference_filed_uses_safe_send_telegram_swallows_failure()
     )
     delivery = AsyncMock()
     delivery.channel = "slack"
-    delivery.send_telegram = AsyncMock(side_effect=RuntimeError("simulated network glitch"))
+    delivery.send_message = AsyncMock(side_effect=RuntimeError("simulated network glitch"))
     acts = ClarifyActivities(
         db_pool=None,
         todoist_connector=connector,
@@ -2473,13 +2473,13 @@ async def test_notify_reference_filed_uses_safe_send_telegram_swallows_failure()
         url=None,
     )
     assert out["completed"] is True
-    # safe_send_telegram is non-raising; we dispatched the send (return True).
-    assert out["telegram_sent"] is True
-    delivery.send_telegram.assert_awaited_once()
+    # safe_send_message is non-raising; we dispatched the send (return True).
+    assert out["notify_sent"] is True
+    delivery.send_message.assert_awaited_once()
 
 
 @pytest.mark.asyncio
-async def test_notify_reference_demoted_uses_safe_send_telegram_swallows_failure() -> None:
+async def test_notify_reference_demoted_uses_safe_send_message_swallows_failure() -> None:
     """Companion for the demote path."""
     connector = AsyncMock()
     connector.commands = AsyncMock(
@@ -2487,7 +2487,7 @@ async def test_notify_reference_demoted_uses_safe_send_telegram_swallows_failure
     )
     delivery = AsyncMock()
     delivery.channel = "slack"
-    delivery.send_telegram = AsyncMock(side_effect=RuntimeError("boom"))
+    delivery.send_message = AsyncMock(side_effect=RuntimeError("boom"))
     acts = ClarifyActivities(
         db_pool=None,
         todoist_connector=connector,
@@ -2502,8 +2502,8 @@ async def test_notify_reference_demoted_uses_safe_send_telegram_swallows_failure
         reason="http_404",
     )
     assert out["reclassified"] is True
-    assert out["telegram_sent"] is True
-    delivery.send_telegram.assert_awaited_once()
+    assert out["notify_sent"] is True
+    delivery.send_message.assert_awaited_once()
 
 
 # --- Bundle B sub-fix #4: KS-ingest retry loop in apply_clarify_resolution ---

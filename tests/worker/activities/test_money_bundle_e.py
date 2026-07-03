@@ -2,9 +2,9 @@
 
 Covers:
   1. evaluate_renewal_alerts past-due 14d guard
-  2. notify_renewal_alert Telegram-level 7d dedup
+  2. notify_renewal_alert send-level 7d dedup
   3. detect_cancellations cadence IN (...) filter
-  4. notify_cancellation Telegram send
+  4. notify_cancellation chat send
   5. upsert_charges cadence preservation (real → unknown keeps real)
 
 Schema dependency: requires migration 019 (renewal_alert.last_notified_at).
@@ -145,7 +145,7 @@ async def test_notify_renewal_alert_skips_within_7d(db_pool):
     """Second notify for same (charge_id, threshold_days) within 7d → no send."""
     delivery = AsyncMock()
     delivery.channel = "slack"
-    delivery.send_telegram = AsyncMock(return_value={"ok": True})
+    delivery.send_message = AsyncMock(return_value={"ok": True})
     act = _make_act(db_pool, delivery=delivery)
 
     async with db_pool.acquire() as conn:
@@ -179,11 +179,11 @@ async def test_notify_renewal_alert_skips_within_7d(db_pool):
 
     env = ActivityEnvironment()
     await env.run(act.notify_renewal_alert, base_alert)
-    assert delivery.send_telegram.await_count == 1
+    assert delivery.send_message.await_count == 1
 
     # Second invocation within 7d → should be silent.
     await env.run(act.notify_renewal_alert, base_alert)
-    assert delivery.send_telegram.await_count == 1
+    assert delivery.send_message.await_count == 1
 
 
 @pytest.mark.asyncio
@@ -191,7 +191,7 @@ async def test_notify_renewal_alert_sends_when_no_prior(db_pool):
     """Fresh alert with no prior last_notified_at → send fires once and stamps row."""
     delivery = AsyncMock()
     delivery.channel = "slack"
-    delivery.send_telegram = AsyncMock(return_value={"ok": True})
+    delivery.send_message = AsyncMock(return_value={"ok": True})
     act = _make_act(db_pool, delivery=delivery)
 
     async with db_pool.acquire() as conn:
@@ -226,7 +226,7 @@ async def test_notify_renewal_alert_sends_when_no_prior(db_pool):
             "next_due_at": "2026-06-22T00:00:00",
         },
     )
-    assert delivery.send_telegram.await_count == 1
+    assert delivery.send_message.await_count == 1
     async with db_pool.acquire() as conn:
         stamped = await conn.fetchval(
             "SELECT last_notified_at FROM maou.renewal_alert WHERE id=$1::uuid",
@@ -300,7 +300,7 @@ async def test_detect_cancellations_flags_stale_monthly(db_pool):
 
 
 @pytest.mark.asyncio
-async def test_notify_cancellation_calls_safe_send_telegram():
+async def test_notify_cancellation_calls_safe_send_message():
     captured: list[dict] = []
 
     async def fake_send(*, agent_id, message, chat_id=0, keyboard=None):
@@ -309,7 +309,7 @@ async def test_notify_cancellation_calls_safe_send_telegram():
 
     delivery = AsyncMock()
     delivery.channel = "slack"
-    delivery.send_telegram = fake_send
+    delivery.send_message = fake_send
     act = MoneyActivities(db_pool=None, llm=None, delivery=delivery, fx_rates=_FX_RATES)
     env = ActivityEnvironment()
     await env.run(
@@ -341,7 +341,7 @@ async def test_notify_cancellation_html_escapes_vendor():
 
     delivery = AsyncMock()
     delivery.channel = "slack"
-    delivery.send_telegram = fake_send
+    delivery.send_message = fake_send
     act = MoneyActivities(db_pool=None, llm=None, delivery=delivery, fx_rates=_FX_RATES)
     env = ActivityEnvironment()
     await env.run(

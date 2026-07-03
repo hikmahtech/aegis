@@ -3396,14 +3396,13 @@ async def send_message(
     """Send a message to an agent with tool calling support.
 
     `user_metadata` (optional): JSON-serialisable dict written to the
-    user chat_history row's metadata column — used by the Telegram bot
-    to record `chat_id` + `telegram_message_id` on the user's incoming
-    turn so the 30-day cleanup activity can deleteMessage from
-    Telegram later.
+    user chat_history row's metadata column — used by chat channels to
+    record the incoming message ref (e.g. `delivery_ref`) so the 30-day
+    cleanup activity can channel-delete it later.
 
     Response includes `assistant_message_id` so the caller can patch the
-    assistant row's metadata with the OUTGOING Telegram message_id
-    after the reply lands.
+    assistant row's metadata with the outgoing message ref after the
+    reply lands.
     """
     # v3 chat_history.thread_id is NOT NULL. Callers that don't pass one (e.g.
     # ad-hoc curl, unauthenticated pings) get an ephemeral thread.
@@ -3429,9 +3428,9 @@ async def send_message(
     # `system_prompt`, so appending here would be discarded.
     injected_items: list[dict] = []
 
-    # Load recent history. role='dispatch' rows are outbound Telegram
+    # Load recent history. role='dispatch' rows are outbound chat
     # messages the user saw (briefings, interaction cards, alert notices)
-    # — fold them in as assistant turns with a [Sent to you on Telegram]
+    # — fold them in as assistant turns with a [Sent to you in chat]
     # prefix so the model can reason about them when the user replies
     # referring to something they were shown. The OpenAI chat spec only
     # accepts system/user/assistant/tool, so the synthetic prefix is the
@@ -3452,7 +3451,7 @@ async def send_message(
             history.append(
                 {
                     "role": "assistant",
-                    "content": f"[Sent to you on Telegram]\n{content}",
+                    "content": f"[Sent to you in chat]\n{content}",
                 }
             )
         elif role in {"user", "assistant", "system", "tool"}:
@@ -3792,8 +3791,8 @@ async def send_message(
         logger.error("chat_llm_failed", error=str(exc))
         return {"error": str(exc), "response": ""}
 
-    # Save to history. User row may carry the incoming Telegram message_id
-    # via `user_metadata` so the cleanup activity can deleteMessage it later.
+    # Save to history. User row may carry the incoming message ref
+    # via `user_metadata` so the cleanup activity can channel-delete it later.
     # Assistant row id is returned to the caller so it can be patched once
     # the reply's outgoing message_id is known.
     await pool.execute(
@@ -3859,16 +3858,16 @@ async def synthesize_agent_reply(
     temporal_client: Any = None,
     remote_script_connector: Any = None,
 ) -> dict:
-    """Non-Telegram chat entry point for two surfaces:
+    """Chat entry point for two surfaces:
 
     - Todoist comment channel (task_id is set) — invoked by AgentChatReplyFlow
       after ClarifyFlow's per-agent short-circuit fires.
-    - Telegram DM @mention (task_id is None) — invoked by the bot via the
-      `/api/chat/agent-reply/trigger` route. Same agent, same tools, no
-      Todoist anchor.
+    - chat DM @mention (task_id is None) — invoked by the comms bot via
+      the `/api/chat/agent-reply/trigger` route. Same agent, same tools,
+      no Todoist anchor.
 
     Reuses send_message so the agent personality, tool surface, and
-    chat-history persistence all behave identically to a Telegram chat —
+    chat-history persistence all behave identically to a web chat —
     only the surface tag in metadata differs.
 
     Returns:
@@ -3887,7 +3886,7 @@ async def synthesize_agent_reply(
         activity retries per its STANDARD policy.
     """
     user_metadata: dict[str, Any] = {
-        "surface": "telegram_dm" if task_id is None else "todoist_comment",
+        "surface": "chat_dm" if task_id is None else "todoist_comment",
     }
     if task_id is not None:
         user_metadata["task_id"] = task_id

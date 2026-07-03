@@ -16,7 +16,7 @@ services:
       # Default channel = web (human-in-the-loop cards land in the admin inbox).
       # Set AEGIS_CHANNEL=slack + `docker compose --profile slack up` for Slack.
       AEGIS_CHANNEL: ${AEGIS_CHANNEL:-web}
-      AEGIS_TELEGRAM_SERVICE_URL: http://comms:8081
+      AEGIS_COMMS_URL: http://comms:8081
     ports:
       - "8080:8080"
     healthcheck:
@@ -38,7 +38,7 @@ services:
       AEGIS_DATABASE_URL: postgresql://aegis:${POSTGRES_PASSWORD:-aegis_dev}@postgres:5432/aegis
       AEGIS_TEMPORAL_HOST: temporal:7233
       AEGIS_CHANNEL: ${AEGIS_CHANNEL:-web}
-      AEGIS_TELEGRAM_SERVICE_URL: http://comms:8081
+      AEGIS_COMMS_URL: http://comms:8081
     depends_on:
       core: { condition: service_healthy }
       temporal: { condition: service_healthy }
@@ -54,8 +54,8 @@ services:
     env_file: config/.env
     environment:
       AEGIS_CORE_URL: http://core:8080
-      # Channel adapter: slack (prod) | telegram. Driven by AEGIS_CHANNEL +
-      # AEGIS_SLACK_* / AEGIS_TELEGRAM_* tokens in config/.env.
+      # Channel adapter: slack. Driven by AEGIS_CHANNEL +
+      # AEGIS_SLACK_* tokens in config/.env.
     ports:
       - "8081:8081"
     healthcheck:

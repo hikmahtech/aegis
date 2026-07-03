@@ -5,14 +5,14 @@ import { api } from '../api/client';
 import ErrorBanner from '../components/ErrorBanner';
 import JsonViewer from '../components/JsonViewer';
 
-// Render Telegram-style HTML (<b>, <i>, <a>, <br>, <code>, <pre>) as React
+// Render light chat HTML (<b>, <i>, <a>, <br>, <code>, <pre>) as React
 // nodes via an allowlisted DOM walk — no dangerouslySetInnerHTML, no XSS
 // surface even though the prompts come from our own server.
 const ALLOWED_TAGS: Record<string, string> = {
   B: 'b', STRONG: 'strong', I: 'i', EM: 'em', U: 'u',
   BR: 'br', CODE: 'code', PRE: 'pre',
 };
-function renderTelegramHtml(raw: string): ReactNode {
+function renderChatHtml(raw: string): ReactNode {
   if (!raw) return null;
   const doc = new DOMParser().parseFromString(`<div>${raw}</div>`, 'text/html');
   const root = doc.body.firstElementChild;
@@ -116,7 +116,7 @@ export default function InteractionDetail() {
       <div className="card" style={{ marginBottom: 12 }}>
         <h3>Prompt</h3>
         <div style={{ whiteSpace: 'pre-wrap', wordBreak: 'break-word', fontSize: 13 }}>
-          {renderTelegramHtml(interaction.prompt || '')}
+          {renderChatHtml(interaction.prompt || '')}
         </div>
       </div>
 

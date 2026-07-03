@@ -343,7 +343,7 @@ async def test_send_message_injection_log_uses_v3_columns(mock_pool, mock_llm, s
 
 async def test_send_message_returns_assistant_message_id(mock_pool, mock_llm, settings):
     """send_message returns the UUID of the assistant row it inserted so the
-    Telegram bot can patch it with the reply's outgoing telegram_message_id
+    comms bot can patch it with the reply's outgoing message ref
     once `_send_with_html_fallback` returns. Without this id round-trip the
     chat-reply cleanup gap stays open."""
     mock_pool.fetchval = AsyncMock(
@@ -355,8 +355,8 @@ async def test_send_message_returns_assistant_message_id(mock_pool, mock_llm, se
 
 async def test_send_message_stores_user_metadata(mock_pool, mock_llm, settings):
     """Passing user_metadata causes the user chat_history row's INSERT to
-    use the 5-column form including metadata — required so the Telegram
-    bot can stash the incoming Telegram message_id on the user turn."""
+    use the 5-column form including metadata — required so the comms
+    bot can stash the incoming message ref on the user turn."""
     mock_pool.fetchval = AsyncMock(return_value="00000000-0000-0000-0000-000000000abc")
     meta = {"kind": "user_message", "chat_id": -100, "telegram_message_id": 9876}
     await send_message(

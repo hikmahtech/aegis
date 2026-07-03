@@ -10,7 +10,7 @@ This document is the canonical reference for what the running system does today.
 |---------|---------|------|---------|
 | Core API | `aegis-core` | 8080 | REST API, personalities, chat, connectors, admin panel SPA |
 | Worker | `aegis-worker` | — | Temporal workflows (27 flows), activities, schedule sync |
-| Comms | `aegis-comms` | 8081 | Channel adapter — **Slack** (Socket Mode) active, Telegram dormant; FastAPI delivery server + interaction cards |
+| Comms | `aegis-comms` | 8081 | Channel adapter — **Slack** (Socket Mode); FastAPI delivery server + interaction cards |
 | Knowledge | `knowledge-service` | 8000 | Semantic chunk search, query-time RAG synthesis |
 | Postgres | pgvector/pg16 | 25432 | Primary database (migrations 001 → 021) |
 | Redis | redis:7-alpine | 26379 | Caching, rate limiting |
@@ -98,7 +98,7 @@ user comment on @<agent>-labelled Inbox task
           └─ apply_outcome → spawn_kind="agent_chat_reply"
               └─ AgentChatReplyFlow (abandoned child)
                   ├─ ChatActivities.synthesize_reply → POST /api/chat/agent-reply (core)
-                  ├─ DeliveryActivities.send_telegram → agent's topic
+                  ├─ DeliveryActivities.send_message → agent's channel
                   └─ ClarifyActivities.post_agent_reply_comment → "[Agent reply @ HH:MM UTC agent=<id>]"
 ```
 
@@ -203,13 +203,12 @@ React SPA served by Core at `/`. Top-level pages include: Overview, Interactions
 
 ## Comms (Slack)
 
-aiogram 3 + FastAPI delivery server (port 8081). Multi-topic forum group — one topic per personality.
+Slack Socket Mode (`slack_sdk`) + FastAPI delivery server (port 8081). One Slack channel per personality.
 
-- Agent→channel mapping populated from `agents.slack_channel_id`; the Telegram adapter (dormant) used `agents.telegram_topic_id`.
-- Owner middleware drops messages from non-owner chats.
-- Parse mode is HTML; all user-controlled strings pass through `_safe()` (`html.escape()`). The send helpers fall back to plain text on parse-entity errors.
-- Callback prefix is uniform: `interaction:{id}:{value}` — resolved by `/api/interactions/{id}/resolve`. Comment-channel reply callbacks use a separate `agent-chat-reply-…` workflow id namespace.
-- Commands: `/start`, `/status`, `/capture`.
+- Agent→channel mapping populated from `agents.slack_channel_id` (falls back to resolving `#aegis-<short>` by name).
+- Message bodies are authored in a light HTML dialect and converted to Slack mrkdwn (`html_to_mrkdwn`); all user-controlled strings pass through `_safe()` (`html.escape()`).
+- Interaction cards render as Block Kit with the uniform callback identity `interaction:{id}:{value}` — resolved by `/api/interactions/{id}/resolve`. Comment-channel reply callbacks use a separate `agent-chat-reply-…` workflow id namespace.
+- The delivery server exposes `/api/deliver/message`, `/api/deliver/document`, `/api/deliver/voice`, `/api/deliver/card`, `/api/comms/delete` and `/api/health` (inbound Socket Mode liveness).
 
 ## Database
 

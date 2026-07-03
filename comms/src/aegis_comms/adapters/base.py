@@ -17,7 +17,7 @@ from typing import Any
 class DeliveryRef:
     """Channel-neutral handle to a sent message (for edit/delete)."""
 
-    adapter: str  # "slack" | "telegram"
+    adapter: str  # e.g. "slack" | "web"
     data: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:

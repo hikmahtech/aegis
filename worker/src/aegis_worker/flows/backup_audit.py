@@ -58,7 +58,7 @@ class BackupAuditFlow:
                         if issue:
                             stale += 1
                             if not config.silent:
-                                # notify_backup_issue uses safe_send_telegram
+                                # notify_backup_issue uses safe_send_message
                                 # internally and never raises — no wrapping
                                 # try/except needed.
                                 await workflow.execute_activity_method(
@@ -83,7 +83,7 @@ class BackupAuditFlow:
                     )
                     all_ok = all_ok and result["ok"]
                     if not result["ok"] and not config.silent:
-                        # notify_backup_issue uses safe_send_telegram
+                        # notify_backup_issue uses safe_send_message
                         # internally and never raises — no wrapping
                         # try/except needed.
                         await workflow.execute_activity_method(

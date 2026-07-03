@@ -1,4 +1,4 @@
-"""synthesize_agent_reply: non-Telegram chat entry point used by
+"""synthesize_agent_reply: chat entry point used by
 AgentChatReplyFlow (Todoist comment channel).
 
 Contract (per spec):

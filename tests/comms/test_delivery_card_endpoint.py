@@ -10,11 +10,11 @@ from httpx import ASGITransport, AsyncClient
 @pytest.fixture
 def fake_adapter():
     adapter = AsyncMock()
-    adapter.name = "telegram"
+    adapter.name = "slack"
     adapter.send_card = AsyncMock(
         return_value=SendResult(
             ok=True,
-            ref=DeliveryRef("telegram", {"chat_id": 12345, "message_id": 99, "topic_id": 2755}),
+            ref=DeliveryRef("slack", {"channel": "C12345", "ts": "123.456"}),
         )
     )
     return adapter
@@ -22,13 +22,11 @@ def fake_adapter():
 
 @pytest.fixture
 def app(fake_adapter, monkeypatch):
-    monkeypatch.setenv("AEGIS_TELEGRAM_CHAT_ID", "12345")
     monkeypatch.setenv("AEGIS_API_KEY", "test-key")
-    monkeypatch.setenv("AEGIS_TELEGRAM_BOT_TOKEN", "test:token")
 
-    from aegis_comms.config import TelegramSettings
+    from aegis_comms.config import CommsSettings
 
-    settings = TelegramSettings(_env_file=None)
+    settings = CommsSettings(_env_file=None)
 
     from aegis_comms.__main__ import create_delivery_app
 
@@ -56,8 +54,8 @@ async def test_card_endpoint_builds_cardspec(app, fake_adapter, monkeypatch):
     assert resp.status_code == 200
     body = resp.json()
     assert body["ok"] is True
-    # back-compat mirror still surfaces the message id for the worker
-    assert body["message_id"] == 99
+    # the channel-neutral delivery_ref is surfaced for the worker
+    assert body["delivery_ref"] == {"adapter": "slack", "channel": "C12345", "ts": "123.456"}
 
     fake_adapter.send_card.assert_awaited_once()
     spec = fake_adapter.send_card.await_args.args[0]

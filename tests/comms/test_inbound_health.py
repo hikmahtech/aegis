@@ -1,9 +1,8 @@
 """Channel-aware /api/health + Slack Socket Mode liveness probe.
 
-Blocker A of the Telegram→Slack cutover: under the Slack channel the health
-endpoint must NOT report the (never-run) Telegram probe as `reachable=False`
-(that false-alarms the DeliveryWatchdog), and it must expose a real signal for
-the Socket Mode inbound connection so a dead socket is monitored.
+The health endpoint must expose a real signal for the Socket Mode inbound
+connection so a dead socket is monitored (the DeliveryWatchdog reads the
+generic `inbound` block).
 
 The health endpoint reads module-global probe state, so tests manipulate
 `_slack_socket_state` directly.
@@ -19,17 +18,17 @@ from httpx import ASGITransport, AsyncClient
 def _build_app(channel: str, monkeypatch):
     """Build the delivery app for the Slack channel.
 
-    TelegramSettings fields use validation_alias env vars (no populate_by_name),
+    CommsSettings fields use validation_alias env vars (no populate_by_name),
     so the channel/tokens must be set via the environment, not __init__ kwargs.
     """
     from aegis_comms.__main__ import create_delivery_app
-    from aegis_comms.config import TelegramSettings
+    from aegis_comms.config import CommsSettings
 
     monkeypatch.setenv("AEGIS_CHANNEL", channel)
     monkeypatch.setenv("AEGIS_API_KEY", "test-key")
     monkeypatch.setenv("AEGIS_SLACK_BOT_TOKEN", "xoxb-test")
     monkeypatch.setenv("AEGIS_SLACK_APP_TOKEN", "xapp-test")
-    settings = TelegramSettings(_env_file=None)
+    settings = CommsSettings(_env_file=None)
     from aegis_comms.adapters.slack import SlackAdapter
 
     adapter = SlackAdapter(settings)
@@ -49,9 +48,8 @@ async def _get_health(app) -> dict:
 # ---------------------------------------------------------------------------
 
 
-async def test_slack_health_omits_telegram_api_and_reports_inbound(monkeypatch):
-    """Under the slack channel: no telegram_api block (the false-alarm source);
-    a generic `inbound` block reports the socket as healthy when fresh."""
+async def test_slack_health_reports_inbound(monkeypatch):
+    """A generic `inbound` block reports the socket as healthy when fresh."""
     import aegis_comms.__main__ as _main
 
     state = _main._SlackSocketState()
@@ -61,7 +59,6 @@ async def test_slack_health_omits_telegram_api_and_reports_inbound(monkeypatch):
 
     body = await _get_health(_build_app("slack", monkeypatch))
 
-    assert "telegram_api" not in body
     assert body["channel"] == "slack"
     inbound = body["inbound"]
     assert inbound["channel"] == "slack"
@@ -78,7 +75,6 @@ async def test_slack_health_unhealthy_when_never_connected(monkeypatch):
 
     body = await _get_health(_build_app("slack", monkeypatch))
 
-    assert "telegram_api" not in body
     inbound = body["inbound"]
     assert inbound["healthy"] is False
     assert inbound["last_ok_seconds_ago"] is None
@@ -165,20 +161,20 @@ async def test_probe_once_none_leaves_state_untouched(monkeypatch):
 
 async def test_slack_adapter_is_connected_none_before_listener():
     from aegis_comms.adapters.slack import SlackAdapter
-    from aegis_comms.config import TelegramSettings
+    from aegis_comms.config import CommsSettings
 
     adapter = SlackAdapter(
-        TelegramSettings(_env_file=None, channel="slack", slack_bot_token="xoxb-x")
+        CommsSettings(_env_file=None, channel="slack", slack_bot_token="xoxb-x")
     )
     assert await adapter.is_connected() is None
 
 
 async def test_slack_adapter_is_connected_polls_handler_client():
     from aegis_comms.adapters.slack import SlackAdapter
-    from aegis_comms.config import TelegramSettings
+    from aegis_comms.config import CommsSettings
 
     adapter = SlackAdapter(
-        TelegramSettings(_env_file=None, channel="slack", slack_bot_token="xoxb-x")
+        CommsSettings(_env_file=None, channel="slack", slack_bot_token="xoxb-x")
     )
 
     class _Client:

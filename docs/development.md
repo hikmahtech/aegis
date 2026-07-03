@@ -48,7 +48,7 @@ docker compose logs worker --tail 50 -f
 | Service | Local Dev | Docker |
 |---------|-----------|--------|
 | Core API | 8080 (or 8090 if 8080 busy) | 8080 |
-| Telegram | 8081 | 8081 |
+| Comms | 8081 | 8081 |
 | Knowledge | 8000 | 8000 |
 | Postgres | 25432 | 25432 |
 | Redis | 26379 | 26379 |
@@ -61,7 +61,7 @@ docker compose logs worker --tail 50 -f
 pytest                    # full suite (asyncio_mode=auto)
 pytest tests/core/        # core only
 pytest tests/worker/      # worker only
-pytest tests/telegram/    # telegram only
+pytest tests/comms/       # comms only
 pytest -x                 # stop on first failure
 ruff check .              # lint
 ruff format .             # format
@@ -81,7 +81,7 @@ cp config/.env.example config/.env
 Key settings:
 - `AEGIS_DATABASE_URL` — PostgreSQL connection
 - `AEGIS_LITELLM_URL` + `AEGIS_LITELLM_API_KEY` — LLM gateway
-- `AEGIS_TELEGRAM_BOT_TOKEN` + `AEGIS_TELEGRAM_CHAT_ID` — Telegram. The dev vs prod bot handles + tokens live in the infra-gitops Ansible vault. **Warning:** if these env vars are set in your shell, they override the Ansible default during deploys.
+- `AEGIS_SLACK_BOT_TOKEN` + `AEGIS_SLACK_APP_TOKEN` — Slack (comms); can also be set from the admin UI (stored encrypted in the DB)
 - `AEGIS_GITHUB_TOKEN` — GitHub API
 - `AEGIS_GMAIL_ACCOUNTS` — Gmail OAuth (format: `name:email,name:email`)
 
@@ -99,7 +99,26 @@ imports each file into its kind *only when that kind has no DB row yet*. After
 that the DB owns the content — editing the files has no effect on an existing
 install. `AEGIS_PERSONALITY_DIR` overrides where the starter files are read from.
 
-### Disabling built-in auth (authenticating-proxy deployments)
+### Authentication (required for non-proxied deployments)
+
+If your deployment is **NOT** behind an authenticating proxy (Cloudflare Access, an
+OAuth2 proxy, Tailscale-only access, etc.), basic auth **MUST stay on** — it is the only
+thing standing between the internet/LAN and full admin access to your data, credentials
+and infrastructure registry. Keep `AEGIS_AUTH_DISABLED` unset (or `false`) and set both:
+
+```bash
+# config/.env
+AEGIS_ADMIN_USERNAME=<pick-a-username>
+AEGIS_ADMIN_PASSWORD=<long-random-password>   # e.g. `openssl rand -base64 24`
+```
+
+There are no defaults — Core refuses to boot when they're unset (unless
+`AEGIS_AUTH_DISABLED=true`), precisely so an unprotected instance never ships. The admin
+SPA prompts for these credentials; API clients can send them as HTTP basic auth or use
+an API key via the `X-API-Key` header (generate one from the admin **Integrations**
+page, or set `AEGIS_API_KEY` in the env).
+
+### Disabling built-in auth (authenticating-proxy deployments ONLY)
 
 `AEGIS_AUTH_DISABLED=true` turns off the API's basic-auth / `X-API-Key` checks and makes
 `AEGIS_ADMIN_USERNAME` / `AEGIS_ADMIN_PASSWORD` optional; the admin SPA detects this and

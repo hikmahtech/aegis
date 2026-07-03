@@ -6,7 +6,7 @@ from pydantic import AliasChoices, Field
 from pydantic_settings import BaseSettings
 
 
-class TelegramSettings(BaseSettings):
+class CommsSettings(BaseSettings):
     """Settings for the comms bot + delivery service (Slack)."""
 
     model_config = {"env_file": "config/.env", "extra": "ignore"}
@@ -27,7 +27,7 @@ class TelegramSettings(BaseSettings):
     host: str = "0.0.0.0"
     port: int = 8081
 
-    # Comms channel — Slack only (Telegram retired). Surfaced in /api/health.
+    # Comms channel — Slack only. Surfaced in /api/health.
     channel: str = Field(default="slack", validation_alias=AliasChoices("AEGIS_CHANNEL"))
 
     # Slack credentials.

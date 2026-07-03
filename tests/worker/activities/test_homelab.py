@@ -22,7 +22,7 @@ def _make_homelab_act(delivery):
 async def test_notify_drift_sends_str_message_to_pandora_topic():
     """Regression for PR #25x: notify_drift used to pass a dict to send_system_event,
     which serialized into `{"text": {...}}` and failed pydantic validation
-    server-side with 422. The fix routes through send_telegram(agent_id="pandoras-actor",
+    server-side with 422. The fix routes through send_message(agent_id="pandoras-actor",
     message=str)."""
     delivery = AsyncMock()
     delivery.channel = "slack"
@@ -37,8 +37,8 @@ async def test_notify_drift_sends_str_message_to_pandora_topic():
             "detected_at": "2026-05-25T20:00:00+00:00",
         }
     )
-    delivery.send_telegram.assert_awaited_once()
-    kwargs = delivery.send_telegram.await_args.kwargs
+    delivery.send_message.assert_awaited_once()
+    kwargs = delivery.send_message.await_args.kwargs
     assert kwargs["agent_id"] == "pandoras-actor"
     assert isinstance(kwargs["message"], str)
     assert "aegis_core" in kwargs["message"]
@@ -46,11 +46,11 @@ async def test_notify_drift_sends_str_message_to_pandora_topic():
 
 @pytest.mark.asyncio
 async def test_notify_payloads_validate_against_delivery_request_schema():
-    """Pydantic validation of the actual JSON body sent to /api/deliver/telegram.
+    """Pydantic validation of the actual JSON body sent to /api/deliver/message.
     Catches the class of bugs where a dict gets passed where a str is required.
 
-    The schema is a local mirror of aegis_telegram.__main__.DeliveryRequest —
-    the worker test CI installs core+worker only, not telegram, so we can't
+    The schema is a local mirror of aegis_comms.__main__.DeliveryRequest —
+    the worker test CI installs core+worker only, not comms, so we can't
     import the real class. Keep the fields in sync if the receiver changes.
     """
     from pydantic import BaseModel
@@ -65,7 +65,7 @@ async def test_notify_payloads_validate_against_delivery_request_schema():
 
     captured_bodies: list[dict] = []
 
-    async def fake_send_telegram(*, agent_id, message, chat_id=0, keyboard=None):
+    async def fake_send_message(*, agent_id, message, chat_id=0, keyboard=None):
         body = {"text": message, "chat_id": chat_id, "agent_id": agent_id}
         if keyboard:
             body["reply_markup"] = keyboard
@@ -73,7 +73,7 @@ async def test_notify_payloads_validate_against_delivery_request_schema():
 
     delivery = AsyncMock(side_effect=None)
     delivery.channel = "slack"
-    delivery.send_telegram = fake_send_telegram
+    delivery.send_message = fake_send_message
 
     act = _make_homelab_act(delivery)
     await act.notify_drift(

@@ -56,9 +56,9 @@ async def _load_agents(pool: asyncpg.Pool, path: Path) -> None:
                 """
                 INSERT INTO agents (
                     id, name, role, system_prompt_path, capabilities,
-                    model_tier, interaction_timeout_default, telegram_topic_id,
+                    model_tier, interaction_timeout_default,
                     slack_channel_id, elevenlabs_voice_id, active, metadata
-                ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+                ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
                 ON CONFLICT (id) DO UPDATE SET
                     name = EXCLUDED.name,
                     role = EXCLUDED.role,
@@ -68,7 +68,6 @@ async def _load_agents(pool: asyncpg.Pool, path: Path) -> None:
                     -- the yaml only seeds an empty value.
                     model_tier = COALESCE(NULLIF(agents.model_tier, ''), EXCLUDED.model_tier),
                     interaction_timeout_default = EXCLUDED.interaction_timeout_default,
-                    telegram_topic_id = EXCLUDED.telegram_topic_id,
                     slack_channel_id = COALESCE(
                         NULLIF(EXCLUDED.slack_channel_id, ''),
                         agents.slack_channel_id
@@ -90,7 +89,6 @@ async def _load_agents(pool: asyncpg.Pool, path: Path) -> None:
                 r.get("capabilities", []),
                 r.get("model_tier", "balanced"),
                 r.get("interaction_timeout_default", "archive"),
-                r.get("telegram_topic_id"),
                 r.get("slack_channel_id") or None,
                 r.get("elevenlabs_voice_id") or None,
                 r.get("active", True),

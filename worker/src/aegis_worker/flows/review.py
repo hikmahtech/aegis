@@ -1,6 +1,6 @@
 """DailyReviewFlow + WeeklyReviewFlow — Phase 5 GTD reviews.
 
-Each tick: gather counts → format Telegram-safe body → send → spawn an
+Each tick: gather counts → format channel-safe body → send → spawn an
 InteractionFlow child (ABANDONED) for acknowledgement → log digest.
 
 See docs/superpowers/specs/2026-05-20-gtd-todoist-phase5-reviews-design.md.
@@ -58,7 +58,7 @@ async def _spawn_review_interaction(
                 agent_id="sebas",
                 kind="choice",
                 origin=f"gtd_{kind}_review",
-                # Cap the prompt — Telegram has its own length limit, and the
+                # Cap the prompt — chat channels have their own length limits, and the
                 # full preview already went out as the main message.
                 prompt=preview[:600],
                 options=options,
@@ -93,17 +93,17 @@ class DailyReviewFlow:
                 retry_policy=NO_RETRY,
             )
             preview = format_daily_preview(digest)
-            step = "send_telegram"
+            step = "send_message"
             try:
                 await workflow.execute_activity_method(
-                    DeliveryActivities.send_telegram,
+                    DeliveryActivities.send_message,
                     args=["sebas", preview],
                     start_to_close_timeout=TIMEOUT_FAST,
                     retry_policy=NO_RETRY,
                 )
             except Exception as exc:  # noqa: BLE001
                 workflow.logger.warning(
-                    "daily_review_telegram_failed err=%s", str(exc)[:200]
+                    "daily_review_delivery_failed err=%s", str(exc)[:200]
                 )
             step = "today_focus"
             try:
@@ -113,7 +113,7 @@ class DailyReviewFlow:
                     retry_policy=NO_RETRY,
                 )
                 await workflow.execute_activity_method(
-                    DeliveryActivities.send_telegram,
+                    DeliveryActivities.send_message,
                     args=["sebas", format_today_focus(focus)],
                     start_to_close_timeout=TIMEOUT_FAST,
                     retry_policy=NO_RETRY,
@@ -197,17 +197,17 @@ class WeeklyReviewFlow:
             )
             narrative = framed.get("narrative") or format_weekly_preview(snapshot)
             decisions = framed.get("decisions") or []
-            step = "send_telegram"
+            step = "send_message"
             try:
                 await workflow.execute_activity_method(
-                    DeliveryActivities.send_telegram,
+                    DeliveryActivities.send_message,
                     args=["sebas", narrative],
                     start_to_close_timeout=TIMEOUT_FAST,
                     retry_policy=NO_RETRY,
                 )
             except Exception as exc:  # noqa: BLE001
                 workflow.logger.warning(
-                    "weekly_review_telegram_failed err=%s", str(exc)[:200]
+                    "weekly_review_delivery_failed err=%s", str(exc)[:200]
                 )
             step = "spawn_decisions"
             for i, decision in enumerate(decisions):

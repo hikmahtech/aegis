@@ -35,8 +35,8 @@ async def test_weekly_flow_frames_and_spawns_decisions():
             ],
         }
 
-    @activity.defn(name="send_telegram")
-    async def send_telegram(agent_id: str, message: str, chat_id: int = 0, keyboard=None):
+    @activity.defn(name="send_message")
+    async def send_message(agent_id: str, message: str, chat_id: int = 0, keyboard=None):
         sent.append(message)
         return {"ok": True}
 
@@ -75,7 +75,7 @@ async def test_weekly_flow_frames_and_spawns_decisions():
             client,
             task_queue="aegis-weekly-copilot-test",
             workflows=[WeeklyReviewFlow, InteractionFlow],
-            activities=[gather, frame, send_telegram, log, insert, card, upd,
+            activities=[gather, frame, send_message, log, insert, card, upd,
                         resolve, to, apply_dec],
         ):
             result = await client.execute_workflow(

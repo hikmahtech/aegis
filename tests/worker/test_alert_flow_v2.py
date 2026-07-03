@@ -163,8 +163,8 @@ async def stub_send_system_event(msg: str) -> None:
     pass
 
 
-@activity.defn(name="send_telegram")
-async def stub_send_telegram(
+@activity.defn(name="send_message")
+async def stub_send_message(
     agent_id: str, msg: str, chat_id: int, reply_markup: dict | None = None
 ) -> None:
     pass
@@ -304,7 +304,7 @@ ALL_ACTIVITIES = [
     stub_assess_investigation,
     stub_log_alert,
     stub_send_system_event,
-    stub_send_telegram,
+    stub_send_message,
     stub_accumulate_digest_item,
     stub_capture_to_inbox,
     stub_post_task_note,

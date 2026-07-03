@@ -2,7 +2,7 @@
 
 When a Gmail token refresh fails, GmailActivities raises GmailAuthExpiredError
 which the flow translates into an InteractionFlow(kind='ack', timeout_policy='hold').
-The Telegram card embeds a link to /api/admin/gmail/reauth/{label}/initiate.
+The chat card embeds a link to /api/admin/gmail/reauth/{label}/initiate.
 The callback saves the new token at config/gmail_tokens/{label}.json AND
 resolves the pending interaction so the flow resumes.
 """
@@ -128,7 +128,7 @@ async def callback_reauth(
     logger.info("gmail_reauth_token_saved", label=label, path=str(token_path))
 
     if interaction_id:
-        # Resolve via HTTP POST to ourself — uses the same choke-point as Telegram
+        # Resolve via HTTP POST to ourself — uses the same choke-point as chat
         # callbacks, which signals the waiting workflow. Keeps one resolve path.
         base_url = str(request.base_url).rstrip("/")
         async with httpx.AsyncClient(timeout=10.0) as client:

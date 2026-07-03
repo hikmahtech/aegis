@@ -17,7 +17,7 @@ _STARTED_AT = time.time()
 
 @router.get("/overview/brief")
 async def get_brief(request: Request) -> dict[str, Any]:
-    """Consolidated daily-brief counts (mirrors the Telegram /brief command)."""
+    """Consolidated daily-brief counts (the daily-brief summary)."""
     pool = request.app.state.db_pool
     pending_interactions = await pool.fetchval(
         "SELECT count(*) FROM interactions WHERE status = 'pending'"

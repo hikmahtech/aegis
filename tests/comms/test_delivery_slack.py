@@ -3,7 +3,7 @@
 FIX 1 regression lock: SlackAdapter.send_message and send_document now accept an
 optional reply_markup kwarg (accepted-and-ignored; Slack renders buttons via Block
 Kit send_card).  Before the fix, every non-system delivery under AEGIS_CHANNEL=slack
-raised a TypeError because the /api/deliver/telegram endpoint always passes
+raised a TypeError because the /api/deliver/message endpoint always passes
 reply_markup= from the request body.
 """
 
@@ -38,9 +38,9 @@ def slack_app(monkeypatch, slack_send_result):
     monkeypatch.setenv("AEGIS_SLACK_APP_TOKEN", "xapp-test")
     monkeypatch.setenv("AEGIS_API_KEY", "test-key")
 
-    from aegis_comms.config import TelegramSettings
+    from aegis_comms.config import CommsSettings
 
-    settings = TelegramSettings(_env_file=None)
+    settings = CommsSettings(_env_file=None)
 
     from aegis_comms.__main__ import create_delivery_app
     from aegis_comms.adapters.slack import SlackAdapter
@@ -79,7 +79,7 @@ async def test_slack_deliver_without_reply_markup(slack_app):
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as client:
         resp = await client.post(
-            "/api/deliver/telegram",
+            "/api/deliver/message",
             json={"text": "Hello from workflow", "agent_id": "sebas"},
             headers={"X-API-Key": "test-key"},
         )
@@ -102,7 +102,7 @@ async def test_slack_deliver_with_reply_markup_does_not_crash(slack_app):
     }
     async with AsyncClient(transport=transport, base_url="http://test") as client:
         resp = await client.post(
-            "/api/deliver/telegram",
+            "/api/deliver/message",
             json={
                 "text": "Approve the fix?",
                 "agent_id": "pandoras-actor",
@@ -126,7 +126,7 @@ async def test_slack_document_deliver_with_reply_markup_does_not_crash(slack_app
     }
     async with AsyncClient(transport=transport, base_url="http://test") as client:
         resp = await client.post(
-            "/api/deliver/telegram/document",
+            "/api/deliver/document",
             json={
                 "agent_id": "pandoras-actor",
                 "caption": "Investigation complete",

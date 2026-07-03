@@ -54,8 +54,8 @@ async def fake_drain_outbox() -> dict:
     return {"committed": 0, "failed": _drain_failed}
 
 
-@activity.defn(name="send_telegram")
-async def fake_send_telegram(
+@activity.defn(name="send_message")
+async def fake_send_message(
     agent_id: str, message: str, chat_id: int = 0, keyboard: dict | None = None
 ) -> dict:
     _calls.append(("alert", agent_id, message))
@@ -67,7 +67,7 @@ ALL_FAKES = [
     fake_fetch_sync,
     fake_apply_sync_diff,
     fake_drain_outbox,
-    fake_send_telegram,
+    fake_send_message,
 ]
 
 
@@ -106,7 +106,7 @@ async def test_sync_flow_runs_bootstrap_then_sync_then_drain():
 @pytest.mark.asyncio
 async def test_sync_flow_alerts_on_permanently_failed_outbox_commands():
     """failed>0 from drain_outbox means captured work was permanently lost —
-    the flow must fire a Telegram alert (and still complete)."""
+    the flow must fire a chat alert (and still complete)."""
     _reset(drain_failed=2)
     from aegis_worker.flows.todoist_sync import TodoistSyncConfig, TodoistSyncFlow
 

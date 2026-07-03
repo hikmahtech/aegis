@@ -54,8 +54,8 @@ def _build_stubs(digest: dict, kind: str):
     async def gather_weekly():
         return digest
 
-    @activity.defn(name="send_telegram")
-    async def send_telegram(
+    @activity.defn(name="send_message")
+    async def send_message(
         agent_id: str, message: str, chat_id: int = 0, keyboard=None
     ):
         sent_messages.append(message)
@@ -101,7 +101,7 @@ def _build_stubs(digest: dict, kind: str):
 
     return (
         [
-            gather_daily, gather_weekly, send_telegram, log_review_digest,
+            gather_daily, gather_weekly, send_message, log_review_digest,
             insert_interaction, send_card, update_msg, resolve, timeout,
             apply_ack, gather_today_focus,
         ],
@@ -130,7 +130,7 @@ async def test_daily_review_flow_sends_digest_and_logs() -> None:
             assert result["kind"] == "daily"
             # Counts threaded through unchanged
             assert result["counts"]["inbox_count"] == 3
-            # Telegram got the daily preview and today's focus shortlist
+            # The chat channel got the daily preview and today's focus shortlist
             assert len(sent) == 2
             assert "Daily review" in sent[0]
             assert "Today's focus" in sent[1]
@@ -155,8 +155,8 @@ async def test_weekly_review_flow_sends_digest_and_logs() -> None:
     async def frame_review(snapshot):
         return {"narrative": "Weekly review ...", "decisions": []}
 
-    @activity.defn(name="send_telegram")
-    async def send_telegram(agent_id: str, message: str, chat_id: int = 0, keyboard=None):
+    @activity.defn(name="send_message")
+    async def send_message(agent_id: str, message: str, chat_id: int = 0, keyboard=None):
         sent.append(message)
         return {"ok": True}
 
@@ -197,7 +197,7 @@ async def test_weekly_review_flow_sends_digest_and_logs() -> None:
             task_queue="aegis-review-weekly-test",
             workflows=[WeeklyReviewFlow, InteractionFlow],
             activities=[
-                gather_weekly_state, frame_review, send_telegram, log_review_digest,
+                gather_weekly_state, frame_review, send_message, log_review_digest,
                 insert_interaction, send_card, update_msg, resolve, timeout, apply_dec,
             ],
         ):
@@ -216,8 +216,8 @@ async def test_weekly_review_flow_sends_digest_and_logs() -> None:
 
 
 @pytest.mark.asyncio
-async def test_daily_review_flow_continues_when_telegram_fails() -> None:
-    """Telegram error shouldn't abort the flow — interaction + log still
+async def test_daily_review_flow_continues_when_delivery_fails() -> None:
+    """Delivery error shouldn't abort the flow — interaction + log still
     happen so the audit row is preserved."""
     async with await WorkflowEnvironment.start_time_skipping() as env:
         client = env.client
@@ -228,10 +228,10 @@ async def test_daily_review_flow_continues_when_telegram_fails() -> None:
         async def gather():
             return _stub_digest_daily()
 
-        @activity.defn(name="send_telegram")
-        async def send_telegram(*a, **kw):
+        @activity.defn(name="send_message")
+        async def send_message(*a, **kw):
             sent.append(a)
-            raise RuntimeError("simulated telegram outage")
+            raise RuntimeError("simulated delivery outage")
 
         @activity.defn(name="log_review_digest")
         async def log(kind, counts, preview, interaction_id):
@@ -271,7 +271,7 @@ async def test_daily_review_flow_continues_when_telegram_fails() -> None:
             task_queue="aegis-review-tg-fail",
             workflows=[DailyReviewFlow, InteractionFlow],
             activities=[
-                gather, send_telegram, log, insert, card, upd, resolve, to, ack,
+                gather, send_message, log, insert, card, upd, resolve, to, ack,
                 gather_focus,
             ],
         ):

@@ -103,7 +103,7 @@ These settings rows are seeded by migrations 011 + 012 and are read by the GTD p
 | `todoist_capture_enabled` | 011 | `true` | Kill switch for every `capture_to_inbox` call |
 | `todoist_managed_project_ids` | runtime | `{}` | Created by `bootstrap_if_empty`; maps `inbox / reference / someday / projects / ...` keys to Todoist project ids |
 | `gtd_clarify_enabled` | 012 | `true` | Kill switch for `ClarifyFlow.find_unclassified_items` |
-| `gtd_2min_rule_enabled` | 012 | `true` | Gate for the 2-min in-window comms card spawn (Slack/Telegram) |
+| `gtd_2min_rule_enabled` | 012 | `true` | Gate for the 2-min in-window comms card spawn (Slack) |
 | `user_timezone` | 012 | `UTC` | Used by the in-window check for the 2-min rule |
 
 The worker bootstrap at `worker/.../__main__.py` logs a `todoist_settings_missing` warning if any of these keys are absent at boot — flags a failed migration before the silent defaults engage.

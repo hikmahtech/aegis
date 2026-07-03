@@ -128,7 +128,7 @@ class InteractionFlow:
                 start_to_close_timeout=_ACT_TIMEOUT,
             )
             # Record how the card was delivered so the DeliveryWatchdog knows it
-            # landed. Telegram returns a numeric message_id; Slack (and any
+            # landed. Legacy channels returned a numeric message_id; Slack (and any
             # channel-neutral adapter) returns a delivery_ref {adapter,channel,ts}
             # with no message_id — persist whichever is present.
             if isinstance(card_result, dict):
