@@ -137,31 +137,19 @@ async def bootstrap(settings: Settings | None = None) -> WorkerDeps:
         timeout=60.0,
     )
 
-    # Homelab Guardian connector — only when fully configured.
-    # Dagster URL is optional: ScheduleHealthFlow errors cleanly at call time if unset.
+    # Homelab Guardian connector (Docker Swarm drift + TLS cert radar).
+    # An empty docker_context relies on the DOCKER_HOST env var (preferred
+    # inside the worker container where no local contexts exist).
     if getattr(settings, "homelab_enabled", False):
-        if not settings.homelab_traefik_api_url:
-            logger.warning(
-                "homelab_init_skipped_missing_settings",
-                missing=["traefik_api_url"],
-                hint="set AEGIS_HOMELAB_TRAEFIK_API_URL or flip AEGIS_HOMELAB_ENABLED=false",
-            )
-        else:
-            try:
-                from aegis.connectors.homelab import HomelabConnector
+        try:
+            from aegis.connectors.homelab import HomelabConnector
 
-                connectors["homelab"] = HomelabConnector(
-                    docker_context=settings.homelab_docker_context,
-                    dagster_graphql_url=settings.homelab_dagster_graphql_url,
-                    traefik_api_url=settings.homelab_traefik_api_url,
-                    ssh_host=getattr(settings, "remote_script_host", ""),
-                    ssh_user=getattr(settings, "remote_script_user", "deploy"),
-                    ssh_key_file=getattr(settings, "remote_script_key_file", "~/.ssh/id_ed25519"),
-                    http_client=http_client,
-                )
-                logger.info("connector_ready", connector="homelab")
-            except Exception as exc:
-                logger.warning("homelab_init_failed", error=str(exc))
+            connectors["homelab"] = HomelabConnector(
+                docker_context=settings.homelab_docker_context,
+            )
+            logger.info("connector_ready", connector="homelab")
+        except Exception as exc:
+            logger.warning("homelab_init_failed", error=str(exc))
 
     logger.info("worker_bootstrap_complete", connectors=list(connectors.keys()))
     return WorkerDeps(

@@ -6,11 +6,9 @@ dataclass. Guards against drift between seed rows and the mapper table.
 
 from __future__ import annotations
 
-from aegis_worker.flows.backup_audit import BackupAuditConfig, BackupAuditFlow
 from aegis_worker.flows.cert_radar import CertRadarConfig, CertRadarFlow
 from aegis_worker.flows.daily_briefing import DailyBriefingConfig, DailyBriefingFlow
 from aegis_worker.flows.money_hygiene import MoneyHygieneConfig, MoneyHygieneDailyFlow
-from aegis_worker.flows.schedule_health import ScheduleHealthConfig, ScheduleHealthFlow
 from aegis_worker.flows.service_drift import ServiceDriftConfig, ServiceDriftFlow
 from aegis_worker.flows.subscription_audit import (
     SubscriptionAuditConfig,
@@ -76,13 +74,6 @@ def test_service_drift_flow_mapper_resolves():
     assert cfg.silent is False
 
 
-def test_schedule_health_flow_mapper_resolves():
-    mapper = _ACTIVITY_TYPE_MAP["ScheduleHealthFlow"]
-    workflow_cls, cfg = mapper(_act("schedule-health-4h", "ScheduleHealthFlow", {}))
-    assert workflow_cls is ScheduleHealthFlow
-    assert isinstance(cfg, ScheduleHealthConfig)
-
-
 def test_cert_radar_flow_mapper_resolves():
     domains = ["example.com", "aegis-api.example.com"]
     mapper = _ACTIVITY_TYPE_MAP["CertRadarFlow"]
@@ -92,16 +83,6 @@ def test_cert_radar_flow_mapper_resolves():
     assert workflow_cls is CertRadarFlow
     assert isinstance(cfg, CertRadarConfig)
     assert cfg.domains == domains
-
-
-def test_backup_audit_flow_mapper_resolves():
-    mapper = _ACTIVITY_TYPE_MAP["BackupAuditFlow"]
-    workflow_cls, cfg = mapper(
-        _act("backup-audit-daily", "BackupAuditFlow", {"mode": "freshness"})
-    )
-    assert workflow_cls is BackupAuditFlow
-    assert isinstance(cfg, BackupAuditConfig)
-    assert cfg.mode == "freshness"
 
 
 def test_daily_briefing_flow_mapper_resolves() -> None:

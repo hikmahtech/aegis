@@ -373,8 +373,6 @@ class TestConfigWiring:
             litellm_url="https://litellm.example.com/v1",
             temporal_ui_url="https://temporal.example.com",
             admin_username="admin",
-            homelab_dagster_graphql_url="https://dagster.test/graphql",
-            homelab_traefik_api_url="https://traefik.test:8080",
         )
         assert s.elevenlabs_api_key == ""
         assert s.elevenlabs_stt_model == "scribe_v1"

@@ -17,7 +17,6 @@ from temporalio.client import (
     ScheduleUpdateInput,
 )
 
-from aegis_worker.flows.backup_audit import BackupAuditConfig, BackupAuditFlow
 from aegis_worker.flows.calendar_ingest import CalendarIngestFlow, CalendarIngestInput
 from aegis_worker.flows.cert_radar import CertRadarConfig, CertRadarFlow
 from aegis_worker.flows.clarify import ClarifyConfig, ClarifyFlow
@@ -38,7 +37,6 @@ from aegis_worker.flows.review import (
     WeeklyReviewFlow,
 )
 from aegis_worker.flows.rss_ingest import RssIngestFlow, RssIngestInput
-from aegis_worker.flows.schedule_health import ScheduleHealthConfig, ScheduleHealthFlow
 from aegis_worker.flows.sentry_poll import SentryPollFlow, SentryPollInput
 from aegis_worker.flows.service_drift import ServiceDriftConfig, ServiceDriftFlow
 from aegis_worker.flows.social_publish import SocialPublishConfig, SocialPublishFlow
@@ -73,12 +71,6 @@ _ACTIVITY_TYPE_MAP = {
             recheck_delay_seconds=int(act["config"].get("recheck_delay_seconds", 120)),
         ),
     ),
-    "ScheduleHealthFlow": lambda act: (
-        ScheduleHealthFlow,
-        ScheduleHealthConfig(
-            silent=bool(act["config"].get("silent", False)),
-        ),
-    ),
     "DeliveryWatchdogFlow": lambda act: (
         DeliveryWatchdogFlow,
         DeliveryWatchdogConfig(
@@ -93,16 +85,6 @@ _ACTIVITY_TYPE_MAP = {
         CertRadarConfig(
             silent=bool(act["config"].get("silent", False)),
             domains=act["config"].get("domains", []),
-        ),
-    ),
-    "BackupAuditFlow": lambda act: (
-        BackupAuditFlow,
-        BackupAuditConfig(
-            mode=act["config"].get("mode", "freshness"),
-            backup_sets=act["config"].get("backup_sets", ["postgresql", "clickhouse"]),
-            drill_host=act["config"].get("drill_host", "node-b"),
-            dry_run=bool(act["config"].get("dry_run", False)),
-            silent=bool(act["config"].get("silent", False)),
         ),
     ),
     # v3 Phase 3 — ingest flows + learning loop.

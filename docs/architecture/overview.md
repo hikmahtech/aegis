@@ -1,6 +1,6 @@
 # AEGIS v3 Architecture
 
-AEGIS v3 is a flow-first personal AI orchestration platform. It coordinates 4 named personalities over 26 Temporal flows, a chat surface with 40 tools gated per-personality, native ingest connectors, and a knowledge-service for semantic search and query-time RAG.
+AEGIS v3 is a flow-first personal AI orchestration platform. It coordinates 4 named personalities over 28 Temporal flows, a chat surface with 40 tools gated per-personality, native ingest connectors, and a knowledge-service for semantic search and query-time RAG.
 
 This document is the canonical reference for what the running system does today. For commands and setup, see [`development.md`](../development.md). For deployment, see [`production.md`](../production.md). For where the architecture is **going** — a kernel + SDK + capability-plugin redesign for productization — see [`productization.md`](productization.md).
 
@@ -9,7 +9,7 @@ This document is the canonical reference for what the running system does today.
 | Service | Package | Port | Purpose |
 |---------|---------|------|---------|
 | Core API | `aegis-core` | 8080 | REST API, personalities, chat, connectors, admin panel SPA |
-| Worker | `aegis-worker` | — | Temporal workflows (27 flows), activities, schedule sync |
+| Worker | `aegis-worker` | — | Temporal workflows (28 flows), activities, schedule sync |
 | Comms | `aegis-comms` | 8081 | Channel adapter — **Slack** (Socket Mode); FastAPI delivery server + interaction cards |
 | Knowledge | `knowledge-service` | 8000 | Semantic chunk search, query-time RAG synthesis |
 | Postgres | pgvector/pg16 | 25432 | Primary database (migrations 001 → 021) |
@@ -29,7 +29,7 @@ Production runs on Docker Swarm via the `swarm` context; Core/Worker are pinned 
 | **Sebas** | Executive assistant | `smart` | `GmailIngestFlow`, `CalendarIngestFlow`, `TodoistSyncFlow`, `ClarifyFlow`, `DailyBriefingFlow`, `ReviewFlow` (daily + weekly), `SocialPublishFlow` |
 | **Raphael** | Research + knowledge | `smart` | `IntelligenceScanFlow`, `RaindropIngestFlow`, `RssIngestFlow` |
 | **Maou** | Finance | `smart` | `MoneyProcessFlow`, `MoneyHygieneDailyFlow`, `ReceiptIngestFlow`, `SubscriptionAuditFlow` |
-| **Pandora's Actor** | Infrastructure | `smart` | `ServiceDriftFlow`, `BackupAuditFlow`, `CertRadarFlow`, `ScheduleHealthFlow`, `SentryPollFlow`, `CleanupFlow`, `GitHubAlertFlow` (PR notifier) |
+| **Pandora's Actor** | Infrastructure | `smart` | `ServiceDriftFlow`, `CertRadarFlow`, `SentryPollFlow`, `CleanupFlow`, `GitHubAlertFlow` (PR notifier) |
 
 **Utility flows (driven by their callers, not owner-scheduled):**
 - `InteractionFlow` — man-in-the-middle handoff; any flow spawns this as a child to wait for a human response.
@@ -118,7 +118,7 @@ Cross-agent handoff via agent-written `@<other>` labels is **out of scope for v1
 
 ## Flows
 
-26 Temporal workflows on task queue `aegis-main`. Flow code lives in `worker/src/aegis_worker/flows/`. Most scheduled flows carry `agent_id` in their config dataclass so `WorkflowRunRecorderInterceptor` can populate `workflow_runs.agent_id`; utility flows (`InteractionFlow`, `AlertInvestigationFlow`, `AgentChatReplyFlow`) take it from their caller.
+28 Temporal workflows on task queue `aegis-main`. Flow code lives in `worker/src/aegis_worker/flows/`. Most scheduled flows carry `agent_id` in their config dataclass so `WorkflowRunRecorderInterceptor` can populate `workflow_runs.agent_id`; utility flows (`InteractionFlow`, `AlertInvestigationFlow`, `AgentChatReplyFlow`) take it from their caller.
 
 Owner-scheduled flows are listed in the Personalities table above. The remaining named flows:
 
@@ -224,7 +224,7 @@ PostgreSQL 16 + pgvector. Migrations 001 → 021 in `migrations/`; auto-apply on
 
 **Maou (finance)** — `maou.recurring_charge`, `maou.receipt_email`, `maou.renewal_alert`, `maou.subscription_digest`.
 
-**Pandora's Actor (infra)** — `pandoras_actor.homelab_drift`, `pandoras_actor.backup_health`, `pandoras_actor.schedule_health`, `pandoras_actor.cert_expiry`.
+**Pandora's Actor (infra)** — `pandoras_actor.homelab_drift`, `pandoras_actor.cert_expiry`.
 
 **Alert governance** — `alert_mutes`, `pending_prs`, `alert_dedup_index` (Sentry signature dedup).
 

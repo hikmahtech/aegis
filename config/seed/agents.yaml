@@ -53,7 +53,7 @@ agents:
     name: Pandora's Actor
     role: Infrastructure
     system_prompt_path: personalities/pandoras-actor
-    capabilities: [homelab, k8s, argocd, backups, certs, drift]
+    capabilities: [homelab, k8s, argocd, certs, drift]
     model_tier: smart
     interaction_timeout_default: auto_reject
     slack_channel_id: ""

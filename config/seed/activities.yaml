@@ -184,27 +184,12 @@ activities:
       mode: poll
     active: true
 
-  # Pandora — proactive homelab monitoring (drift, backups, schedules, certs)
+  # Pandora — proactive homelab monitoring (drift, certs)
   # Secondary AEGIS-side drift check (alertmanager DockerServiceDown/NodeDown
   # is the primary, fast path). Slowed hourly → 4h: it has found zero drift in
   # practice and the real alerting covers the urgent cases.
   - slug: service-drift-4h
     workflow_type: ServiceDriftFlow
-    agent_id: pandoras-actor
-    schedule_cron: "0 */4 * * *"
-    config: {}
-    active: true
-
-  - slug: backup-audit-daily
-    workflow_type: BackupAuditFlow
-    agent_id: pandoras-actor
-    schedule_cron: "0 6 * * *"
-    config:
-      mode: freshness
-    active: true
-
-  - slug: schedule-health-4h
-    workflow_type: ScheduleHealthFlow
     agent_id: pandoras-actor
     schedule_cron: "0 */4 * * *"
     config: {}
