@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import re
 import secrets
 import time
 from urllib.parse import urlencode
@@ -173,6 +174,62 @@ async def list_accounts(request: Request):
             "expires_at": r["expires_at"].isoformat() if r["expires_at"] else None,
             "updated_at": r["updated_at"].isoformat() if r["updated_at"] else None,
             "scope": (r["meta"] or {}).get("scope", ""),
+            "via": (r["meta"] or {}).get("via", "native"),
         }
         for r in rows
     ]
+
+
+def _slugify_label(name: str) -> str:
+    slug = re.sub(r"[^a-z0-9_-]+", "-", (name or "").strip().lower())
+    return slug.strip("-")
+
+
+@router.post("/postiz/sync")
+async def sync_postiz(request: Request, settings: Settings = Depends(get_settings)):
+    """Mirror the self-hosted Postiz instance's connected channels into
+    social_accounts. Postiz holds the platform OAuth and does the actual
+    posting — mirrored rows carry no tokens, just `meta.postiz_integration_id`
+    so SocialConnector.post() knows to route through Postiz."""
+    if not settings.postiz_url or not settings.postiz_api_key:
+        raise HTTPException(status_code=503, detail="postiz_not_configured")
+
+    base = settings.postiz_url.rstrip("/")
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        resp = await client.get(
+            f"{base}/api/public/v1/integrations",
+            headers={"Authorization": settings.postiz_api_key},
+        )
+    if resp.status_code != 200:
+        logger.warning("postiz_sync_failed", status=resp.status_code, body=resp.text[:200])
+        raise HTTPException(status_code=502, detail=f"postiz_sync_failed:{resp.status_code}")
+
+    integrations = resp.json()
+    synced = 0
+    skipped_disabled = 0
+    for item in integrations:
+        if item.get("disabled"):
+            skipped_disabled += 1
+            continue
+        platform = item.get("identifier") or ""
+        label = _slugify_label(item.get("name") or "") or str(item.get("id"))
+        meta = {
+            "postiz_integration_id": item.get("id"),
+            "via": "postiz",
+            "profile": item.get("profile") or "",
+            "picture": item.get("picture") or "",
+        }
+        await request.app.state.db_pool.execute(
+            """
+            INSERT INTO social_accounts (platform, label, meta, updated_at)
+            VALUES ($1, $2, $3, now())
+            ON CONFLICT (platform, label) DO UPDATE
+              SET meta = EXCLUDED.meta, updated_at = now()
+            """,
+            platform,
+            label,
+            meta,
+        )
+        synced += 1
+    logger.info("postiz_sync_completed", synced=synced, skipped_disabled=skipped_disabled)
+    return {"synced": synced, "skipped_disabled": skipped_disabled}

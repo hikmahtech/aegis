@@ -213,6 +213,9 @@ export const api = {
     }),
   listGoogleAccounts: () => apiFetch<any[]>('/api/admin/integrations/google'),
   listSocialAccounts: () => apiFetch<any[]>('/api/admin/social/accounts'),
+  syncPostizAccounts: () => apiFetch<{ synced: number; skipped_disabled: number }>(
+    '/api/admin/social/postiz/sync', { method: 'POST' },
+  ),
   getIntegrations: () => apiFetch<any[]>('/api/admin/integrations/config'),
   saveIntegration: (key: string, value: string) =>
     apiFetch<any[]>('/api/admin/integrations/config', { method: 'PUT', body: JSON.stringify({ key, value }) }),

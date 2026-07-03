@@ -45,6 +45,8 @@ CONFIG_REGISTRY: list[ConfigKey] = [
     ConfigKey("todoist_webhook_secret", "Webhook secret", "Todoist", True),
     ConfigKey("x_client_id", "OAuth client id", "X (Twitter)", False),
     ConfigKey("x_client_secret", "OAuth client secret", "X (Twitter)", True),
+    ConfigKey("postiz_url", "Base URL", "Postiz", False),
+    ConfigKey("postiz_api_key", "API key", "Postiz", True),
     ConfigKey("vercel_token", "API token", "Vercel", True),
     ConfigKey("vercel_team_id", "Team id", "Vercel", False),
     ConfigKey("elevenlabs_api_key", "API key", "Voice (ElevenLabs)", True),

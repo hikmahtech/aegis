@@ -27,6 +27,40 @@ Implementation deviations from the plan below (each for a concrete reason):
   update) instead of doing nothing — a plain "do nothing" would re-card the still-due
   task every 5 minutes. Re-adding the label re-arms the post.
 
+## Postiz mode
+
+An alternate transport for accounts you'd rather not run native OAuth for: a
+self-hosted [Postiz](https://postiz.com) instance holds the platform OAuth and does
+the actual posting on your behalf. The aegis pipeline is unchanged — Todoist task →
+approval card → `social_outbox` row → `SocialConnector.post()` — it just routes rows
+whose account has `meta.postiz_integration_id` set through Postiz's public API instead
+of X's native API. Native and Postiz accounts coexist (mixed mode): the native X path
+via `/api/admin/social/{platform}/connect` still works for accounts connected that way.
+
+- **Config:** set `postiz_url` (base URL, e.g. `https://postiz.example.com`) and
+  `postiz_api_key` on the admin **Integrations** page, under the "Postiz" group.
+- **Sync:** `POST /api/admin/social/postiz/sync` (also a "Sync Postiz channels" button
+  on the admin **Flows & Integrations** page, next to the Social accounts Reload
+  button) calls Postiz's `GET /api/public/v1/integrations`, and upserts one
+  `social_accounts` row per non-disabled channel — `platform` = the Postiz
+  `identifier` (e.g. `x`, `linkedin-page`, `mastodon`, `bluesky`, `threads`,
+  `youtube`, `reddit`, `telegram`…), `label` = the channel name slugified, and
+  `meta = {postiz_integration_id, via: "postiz", profile, picture}`. No tokens are
+  stored — Postiz holds them. Connect/manage the actual channels in the Postiz UI
+  itself; the aegis-side sync only mirrors what's already connected there. Re-running
+  the sync is idempotent (upsert on `(platform, label)`).
+- **Platform labels:** `find_due_posts` still matches Todoist labels to platforms via
+  the `social_platform_labels` settings row (`{"x":"x","linkedin":"linkedin",...}`) —
+  extend that row (from the Settings page) with entries for any Postiz-only platform
+  you sync, e.g. `{"bluesky":"bluesky","mastodon":"mastodon"}`, using the same
+  `identifier` values Postiz reports.
+- **Posting:** `SocialConnector.post()` checks `account.meta.postiz_integration_id`
+  BEFORE any token-refresh attempt (Postiz-mirrored accounts carry no tokens to
+  refresh) and, when set, POSTs to `{postiz_url}/api/public/v1/posts` with
+  `Authorization: <raw api key>` (no `Bearer` prefix) and
+  `settings.__type` = the account's `platform` (must equal the integration's Postiz
+  `identifier`).
+
 ## What it does (target behavior)
 
 1. You create a Todoist task: content = the post text, description = link/long text,

@@ -1,10 +1,18 @@
-"""SocialConnector — publish posts to social platforms (MVP: X/Twitter).
+"""SocialConnector — publish posts to social platforms.
 
-Tokens live in the `social_accounts` table (Fernet stored-secret dicts via
-aegis.crypto). `post()` loads the account fresh, refreshes the token when it
-is near expiry, and — critically for X, which rotates the refresh token on
-EVERY refresh — persists the rotated tokens BEFORE first use, so a crash
-mid-post never strands the account with a dead refresh token.
+Two transports:
+
+- **Native X** (MVP): tokens live in the `social_accounts` table (Fernet
+  stored-secret dicts via aegis.crypto). `post()` loads the account fresh,
+  refreshes the token when it is near expiry, and — critically for X, which
+  rotates the refresh token on EVERY refresh — persists the rotated tokens
+  BEFORE first use, so a crash mid-post never strands the account with a
+  dead refresh token.
+- **Postiz**: a self-hosted Postiz instance holds the platform OAuth and
+  does the actual posting; aegis mirrors its channels into `social_accounts`
+  (see `routes/social_auth.py::sync_postiz`) with no tokens of its own —
+  just `meta.postiz_integration_id` — and posts through Postiz's public API.
+  Accounts with that meta key skip token refresh entirely.
 """
 
 from __future__ import annotations
@@ -23,6 +31,15 @@ logger = structlog.get_logger()
 X_TOKEN_URL = "https://api.x.com/2/oauth2/token"
 X_TWEETS_URL = "https://api.x.com/2/tweets"
 _REFRESH_MARGIN = timedelta(minutes=5)
+
+
+def _render_text(payload: dict) -> str:
+    """Compose post text from {text, link} — shared by every transport."""
+    text = (payload.get("text") or "").strip()
+    link = (payload.get("link") or "").strip()
+    if link:
+        text = f"{text}\n\n{link}" if text else link
+    return text
 
 
 class SocialAuthError(RuntimeError):
@@ -44,6 +61,10 @@ class SocialConnector(HTTPConnector):
     async def post(self, account_id: int, payload: dict) -> str:
         """Publish payload to the account's platform; returns the platform post ref."""
         account = await self._load_account(account_id)
+        # Postiz-mirrored accounts hold no OAuth tokens of their own — Postiz
+        # does the posting — so route them BEFORE any token refresh attempt.
+        if account["meta"].get("postiz_integration_id"):
+            return await self._post_postiz(account, payload)
         access_token = await self._refresh_if_needed(account)
         if account["platform"] == "x":
             return await self._post_x(access_token, payload)
@@ -51,7 +72,7 @@ class SocialConnector(HTTPConnector):
 
     async def _load_account(self, account_id: int) -> dict:
         row = await self._db_pool.fetchrow(
-            "SELECT id, platform, label, access_token_enc, refresh_token_enc, expires_at "
+            "SELECT id, platform, label, access_token_enc, refresh_token_enc, expires_at, meta "
             "FROM social_accounts WHERE id = $1",
             account_id,
         )
@@ -114,10 +135,7 @@ class SocialConnector(HTTPConnector):
         return new_access
 
     async def _post_x(self, access_token: str, payload: dict) -> str:
-        text = (payload.get("text") or "").strip()
-        link = (payload.get("link") or "").strip()
-        if link:
-            text = f"{text}\n\n{link}" if text else link
+        text = _render_text(payload)
         client = await self._ensure_client()
         t0 = time.monotonic()
         resp = await client.post(
@@ -131,3 +149,40 @@ class SocialConnector(HTTPConnector):
             raise RuntimeError(f"x post failed: {resp.status_code} {resp.text[:200]}")
         await self._record("post_x", "ok", latency_ms)
         return str(resp.json()["data"]["id"])
+
+    async def _post_postiz(self, account: dict, payload: dict) -> str:
+        postiz_url = self._settings.postiz_url
+        api_key = self._settings.postiz_api_key
+        if not postiz_url or not api_key:
+            raise RuntimeError(
+                f"postiz account {account['platform']}/{account['label']} is synced but "
+                "postiz_url/postiz_api_key are not configured — set them on the "
+                "Integrations page"
+            )
+        text = _render_text(payload)
+        body = {
+            "type": "now",
+            "shortLink": False,
+            "date": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S.000Z"),
+            "tags": [],
+            "posts": [
+                {
+                    "integration": {"id": account["meta"]["postiz_integration_id"]},
+                    "value": [{"content": text, "image": []}],
+                    "settings": {"__type": account["platform"]},
+                }
+            ],
+        }
+        client = await self._ensure_client()
+        t0 = time.monotonic()
+        resp = await client.post(
+            f"{postiz_url.rstrip('/')}/api/public/v1/posts",
+            json=body,
+            headers={"Authorization": api_key},
+        )
+        latency_ms = int((time.monotonic() - t0) * 1000)
+        if resp.status_code not in (200, 201):
+            await self._record("post_postiz", "error", latency_ms, error=resp.text[:200])
+            raise RuntimeError(f"postiz post failed: {resp.status_code} {resp.text[:200]}")
+        await self._record("post_postiz", "ok", latency_ms)
+        return str(resp.json()[0]["postId"])

@@ -123,6 +123,12 @@ class Settings(BaseSettings):
     # and wouldn't authorize forkers. Editable from the admin Integrations page.
     x_client_id: str = ""
     x_client_secret: str = ""
+    # Self-hosted Postiz instance — an alternate posting backend that holds the
+    # platform OAuth itself; aegis mirrors its channels and posts through its
+    # public API instead of doing native per-platform OAuth (mixed mode: native
+    # X above keeps working for accounts connected via /connect).
+    postiz_url: str = ""
+    postiz_api_key: str = ""
     # Kimi CLI — the remote coding-CLI used by alert_investigation for auto-fix proposals.
     kimi_cli_binary_path: str = "/usr/local/bin/kimi"
     # Claude CLI on remote_script_host — used instead of kimi for repos whose
