@@ -1,4 +1,4 @@
-"""Tests for market summary endpoint."""
+"""Tests for the market summary endpoint (FinanceConnector-backed)."""
 
 from unittest.mock import AsyncMock
 
@@ -7,6 +7,25 @@ from aegis.api.app import create_app
 from aegis.api.deps import get_settings
 from aegis.config import Settings
 from fastapi.testclient import TestClient
+
+QUOTES = [
+    {
+        "symbol": "^GSPC",
+        "price": 5500.25,
+        "change": 12.5,
+        "change_percent": 0.23,
+        "currency": "USD",
+        "as_of": "2026-07-02T20:00:00+00:00",
+    },
+    {
+        "symbol": "^NSEI",
+        "price": 24100.0,
+        "change": -80.0,
+        "change_percent": -0.33,
+        "currency": "INR",
+        "as_of": "2026-07-02T10:00:00+00:00",
+    },
+]
 
 
 @pytest.fixture
@@ -20,7 +39,6 @@ def settings():
         admin_password="admin",
         n8n_webhook_secret="test-secret",
         api_key="test-key",
-        clickhouse_host="localhost",
     )
 
 
@@ -29,9 +47,9 @@ def app(settings):
     app = create_app(run_lifespan=False)
     app.dependency_overrides[get_settings] = lambda: settings
 
-    mock_ch = AsyncMock()
-    mock_ch.query = AsyncMock(return_value=[])
-    app.state.clickhouse_connector = mock_ch
+    mock_fin = AsyncMock()
+    mock_fin.get_overview = AsyncMock(return_value=QUOTES)
+    app.state.finance_connector = mock_fin
     app.state.db_pool = AsyncMock()
     app.state.settings = settings
     return app
@@ -42,88 +60,40 @@ def client(app):
     return TestClient(app, headers={"X-API-Key": "test-key"})
 
 
-def test_market_summary_returns_structure(client, app):
-    ch = app.state.clickhouse_connector
-    ch.query = AsyncMock(
-        side_effect=[
-            [{"date": "2026-03-28", "close": 22500, "regime_label": "BULL_TREND"}],
-            [
-                {
-                    "date": "2026-03-28",
-                    "fgi_value": 45,
-                    "fgi_classification": "Fear",
-                    "total_market_cap_usd": 2.5e12,
-                }
-            ],
-            [
-                {
-                    "symbol": "INFY",
-                    "combined_forecast": 7.5,
-                    "confidence": 0.8,
-                    "is_halal": 1,
-                    "close_price": 1500,
-                }
-            ],
-            [
-                {
-                    "symbol": "BTCUSDT",
-                    "combined_forecast": 5.0,
-                    "confidence": 0.7,
-                    "close_price": 65000,
-                }
-            ],
-            [
-                {
-                    "symbol": "TCS",
-                    "current_forecast": 8.0,
-                    "prior_forecast": 2.0,
-                    "change": 6.0,
-                }
-            ],
-            [{"max_date": "2026-03-28"}],
-            [
-                {
-                    "symbol": "INFY",
-                    "direction": "LONG",
-                    "target_weight": 0.05,
-                    "combined_forecast": 7.5,
-                }
-            ],
-            [
-                {
-                    "sector": "IT",
-                    "momentum_signal": "BULLISH",
-                    "sector_rank": 1,
-                    "mean_z_score_20d": 0.5,
-                }
-            ],
-        ]
-    )
+def test_market_summary_returns_indices(client):
     resp = client.get("/api/market/summary")
     assert resp.status_code == 200
     data = resp.json()
     assert data["available"] is True
-    assert "equity_regime" in data
-    assert "crypto" in data
-    assert "top_equity_signals" in data
-    assert "top_crypto_signals" in data
-    assert "notable_changes" in data
-    assert "trade_decisions" in data
-    assert "sectors" in data
+    assert data["indices"] == QUOTES
 
 
-def test_market_summary_no_clickhouse(client, app):
-    app.state.clickhouse_connector = None
-    resp = client.get("/api/market/summary")
-    assert resp.status_code == 200
-    data = resp.json()
+def test_market_summary_drops_errored_quotes(client, app):
+    app.state.finance_connector.get_overview = AsyncMock(
+        return_value=[QUOTES[0], {"symbol": "^BAD", "error": "timeout"}]
+    )
+    data = client.get("/api/market/summary").json()
+    assert data["available"] is True
+    assert data["indices"] == [QUOTES[0]]
+
+
+def test_market_summary_no_connector(client, app):
+    app.state.finance_connector = None
+    data = client.get("/api/market/summary").json()
     assert data["available"] is False
 
 
-def test_market_summary_clickhouse_error(client, app):
-    ch = app.state.clickhouse_connector
-    ch.query = AsyncMock(side_effect=Exception("connection refused"))
-    resp = client.get("/api/market/summary")
-    assert resp.status_code == 200
-    data = resp.json()
+def test_market_summary_all_errors(client, app):
+    app.state.finance_connector.get_overview = AsyncMock(
+        return_value=[{"symbol": "^GSPC", "error": "HTTP 503"}]
+    )
+    data = client.get("/api/market/summary").json()
+    assert data["available"] is False
+
+
+def test_market_summary_connector_exception(client, app):
+    app.state.finance_connector.get_overview = AsyncMock(
+        side_effect=Exception("provider down")
+    )
+    data = client.get("/api/market/summary").json()
     assert data["available"] is False

@@ -1,6 +1,6 @@
 """Shared plumbing for HTTP-based connectors.
 
-Every HTTP connector (vercel, todoist, knowledge, clickhouse, search) needs
+Every HTTP connector (vercel, todoist, knowledge, finance, search) needs
 the same three things: a lazily-created pooled `httpx.AsyncClient`, a
 `close()` for app shutdown, and a best-effort `connector_calls` audit row.
 This base collapses that boilerplate. Subclasses set `connector_name` and

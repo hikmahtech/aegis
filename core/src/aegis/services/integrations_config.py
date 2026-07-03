@@ -52,10 +52,9 @@ CONFIG_REGISTRY: list[ConfigKey] = [
     ConfigKey("miniflux_url", "Base URL", "RSS (Miniflux)", False),
     ConfigKey("miniflux_api_key", "API key", "RSS (Miniflux)", True),
     ConfigKey("searxng_url", "Base URL", "Search (SearXNG)", False),
-    ConfigKey("clickhouse_host", "Host", "ClickHouse", False),
-    ConfigKey("clickhouse_user", "User", "ClickHouse", False),
-    ConfigKey("clickhouse_password", "Password", "ClickHouse", True),
-    ConfigKey("clickhouse_database", "Database", "ClickHouse", False),
+    ConfigKey("finance_provider", "Provider (yahoo | stooq)", "Finance", False),
+    ConfigKey("finance_api_key", "API key (optional, future providers)", "Finance", True),
+    ConfigKey("finance_indices", "Overview indices (comma-sep symbols)", "Finance", False),
 ]
 _BY_KEY = {c.key: c for c in CONFIG_REGISTRY}
 

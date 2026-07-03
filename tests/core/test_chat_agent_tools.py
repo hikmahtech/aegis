@@ -19,7 +19,7 @@ def test_sebas_has_operational_tools():
     tools = AGENT_TOOL_SETS["sebas"]
     assert "trigger_workflow" in tools
     assert "query_activities" in tools
-    assert "get_market_regime" not in tools
+    assert "get_quote" not in tools
 
 
 def test_raphael_has_research_tools():
@@ -45,14 +45,15 @@ def test_pandoras_actor_has_infra_tools():
     assert "list_argocd_apps" in tools
     assert "sync_argocd_app" in tools
     # Out-of-domain tools must NOT be in pandora's set:
-    assert "get_market_regime" not in tools
+    assert "get_quote" not in tools
     assert "research_topic" not in tools
 
 
 def test_maou_has_finance_tools():
     tools = AGENT_TOOL_SETS["maou"]
-    assert "get_market_regime" in tools
-    assert "get_top_forecasts" in tools
+    assert "get_quote" in tools
+    assert "get_market_overview" in tools
+    assert "get_finance_news" in tools
     assert "trigger_workflow" not in tools
 
 

@@ -5,12 +5,12 @@ resources:
   # Knowledge is now a native pgvector subsystem in AEGIS's own Postgres, not an
   # external connector — no resource row.
   - kind: connector
-    slug: clickhouse-trading
-    title: ClickHouse — Trading System
-    url: clickhouse://clickhouse:8123/trading_system
-    tags: [trading, market, maou]
+    slug: finance-web
+    title: Finance — Web market data (yahoo / stooq)
+    url: https://query1.finance.yahoo.com/v8/finance/chart/
+    tags: [finance, market, maou]
     metadata:
-      env_keys: [AEGIS_CLICKHOUSE_HOST, AEGIS_CLICKHOUSE_PORT, AEGIS_CLICKHOUSE_USER, AEGIS_CLICKHOUSE_PASSWORD]
+      env_keys: [AEGIS_FINANCE_PROVIDER, AEGIS_FINANCE_API_KEY, AEGIS_FINANCE_INDICES]
 
   - kind: runbook
     slug: homelab-service-restart

@@ -9,51 +9,23 @@ from temporalio.testing import ActivityEnvironment
 
 MOCK_SUMMARY = {
     "available": True,
-    "equity_regime": {"regime": "BULL_TREND", "close": 22500, "date": "2026-03-28"},
-    "crypto": {
-        "fear_greed": 13,
-        "fear_greed_label": "Extreme Fear",
-        "market_cap_usd": 2.06e12,
-        "date": "2026-03-28",
-    },
-    "top_equity_signals": [
+    "indices": [
         {
-            "symbol": "AUROPHARMA",
-            "combined_forecast": 7.5,
-            "confidence": 0.8,
-            "close_price": 1200,
-            "is_halal": 1,
+            "symbol": "^GSPC",
+            "price": 5500.25,
+            "change": 12.5,
+            "change_percent": 0.23,
+            "currency": "USD",
+            "as_of": "2026-07-02T20:00:00+00:00",
         },
         {
-            "symbol": "HDFCBANK",
-            "combined_forecast": -5.2,
-            "confidence": 0.7,
-            "close_price": 1600,
-            "is_halal": 1,
+            "symbol": "^NSEI",
+            "price": 24100.0,
+            "change": -80.0,
+            "change_percent": -0.33,
+            "currency": "INR",
+            "as_of": "2026-07-02T10:00:00+00:00",
         },
-    ],
-    "top_crypto_signals": [
-        {
-            "symbol": "BTCUSDT",
-            "combined_forecast": 5.0,
-            "confidence": 0.7,
-            "close_price": 65000,
-        },
-    ],
-    "notable_changes": [
-        {"symbol": "TCS", "current_forecast": 8.0, "prior_forecast": 2.0, "change": 6.0},
-    ],
-    "trade_decisions": [
-        {
-            "symbol": "CTKUSDT",
-            "direction": "LONG",
-            "target_weight": 0.1,
-            "combined_forecast": 2.3,
-            "asset_class": "crypto",
-        },
-    ],
-    "sectors": [
-        {"sector": "IT", "momentum_signal": "BULLISH", "sector_rank": 1, "mean_z_score_20d": 0.5},
     ],
 }
 
@@ -84,7 +56,7 @@ async def test_gather_market_data_ok():
         result = await env.run(act.gather_market_data)
 
     assert result["available"] is True
-    assert result["equity_regime"]["regime"] == "BULL_TREND"
+    assert result["indices"][0]["symbol"] == "^GSPC"
 
 
 @pytest.mark.asyncio
@@ -128,14 +100,12 @@ async def test_format_market_section():
     env = ActivityEnvironment()
     act = BriefingActivities(db_pool=None, llm_client=None, knowledge_connector=None)
     result = await env.run(act.format_market_section, MOCK_SUMMARY)
-    assert "<b>Market Intelligence</b>" in result
-    assert "BULL_TREND" in result
-    assert "Extreme Fear" in result
-    assert "AUROPHARMA" in result
-    assert "BTCUSDT" in result
-    assert "TCS" in result
-    assert "CTKUSDT" in result
-    assert "IT" in result
+    assert "<b>Markets</b>" in result
+    assert "^GSPC" in result
+    assert "5,500.25" in result
+    assert "(+0.23%)" in result
+    assert "^NSEI" in result
+    assert "(-0.33%)" in result
 
 
 @pytest.mark.asyncio
@@ -143,4 +113,15 @@ async def test_format_market_section_unavailable():
     env = ActivityEnvironment()
     act = BriefingActivities(db_pool=None, llm_client=None, knowledge_connector=None)
     result = await env.run(act.format_market_section, {"available": False})
+    assert result == ""
+
+
+@pytest.mark.asyncio
+async def test_format_market_section_no_usable_quotes():
+    env = ActivityEnvironment()
+    act = BriefingActivities(db_pool=None, llm_client=None, knowledge_connector=None)
+    result = await env.run(
+        act.format_market_section,
+        {"available": True, "indices": [{"symbol": "^GSPC", "error": "timeout"}]},
+    )
     assert result == ""

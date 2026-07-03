@@ -146,12 +146,13 @@ class Settings(BaseSettings):
     embedding_model: str = "nomic-embed-text"
     knowledge_ui_url: str = ""  # admin-panel link target (now the in-app /admin/knowledge page)
 
-    # ClickHouse (trading system)
-    clickhouse_host: str = ""
-    clickhouse_port: int = 8123
-    clickhouse_user: str = ""
-    clickhouse_password: str = ""
-    clickhouse_database: str = "trading_system"
+    # Web finance data (FinanceConnector) — provider-agnostic quotes for Maou's
+    # market tools. Built-in keyless providers: "yahoo" (default) and "stooq".
+    # finance_api_key is unused by the built-ins; it's the seam for future
+    # API-key providers. finance_indices drives get_market_overview.
+    finance_provider: str = "yahoo"
+    finance_api_key: str = ""
+    finance_indices: str = "^GSPC,^IXIC,^NSEI"
 
     # Chat tool-calling
     tool_calling_enabled: bool = True

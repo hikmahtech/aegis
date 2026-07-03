@@ -49,7 +49,7 @@ agents:
     metadata:
       intent_keywords: [money, bill, invoice, subscription, payment, receipt, spend, cost, budget, renew, charge, refund, expense, price, market, stock, crypto, portfolio]
       knowledge_domains: [market, finance, trade]
-      tool_set: [get_market_regime, get_top_forecasts, get_trade_decisions, get_instrument_detail, get_sector_overview, get_forecast_changes, search_knowledge, remember_this, list_interactions, capture_to_inbox, list_next_actions, list_projects, complete_task, defer_task, mark_waiting, handoff_task]
+      tool_set: [get_quote, get_market_overview, get_finance_news, search_knowledge, remember_this, list_interactions, capture_to_inbox, list_next_actions, list_projects, complete_task, defer_task, mark_waiting, handoff_task]
     active: true
 
   - id: pandoras-actor

@@ -87,19 +87,16 @@ async def lifespan(app: FastAPI):
     )
     app.state.knowledge_connector = knowledge_connector
 
-    # ClickHouse connector (optional — skip if host not configured)
-    if settings.clickhouse_host:
-        from aegis.connectors.clickhouse import ClickHouseConnector
+    # Finance connector — web market data (keyless providers, always available).
+    from aegis.connectors.finance import FinanceConnector
 
-        clickhouse_connector = ClickHouseConnector(
-            host=settings.clickhouse_host,
-            port=settings.clickhouse_port,
-            user=settings.clickhouse_user,
-            password=settings.clickhouse_password,
-            database=settings.clickhouse_database,
-            db_pool=pool,
-        )
-        app.state.clickhouse_connector = clickhouse_connector
+    finance_connector = FinanceConnector(
+        provider=settings.finance_provider,
+        api_key=settings.finance_api_key,
+        indices=settings.finance_indices,
+        db_pool=pool,
+    )
+    app.state.finance_connector = finance_connector
 
     search_connector = SearchConnector(base_url=settings.searxng_url)
     app.state.search_connector = search_connector
@@ -182,9 +179,7 @@ async def lifespan(app: FastAPI):
 
     await knowledge_connector.close()
     await vercel_connector.close()
-    ch = getattr(app.state, "clickhouse_connector", None)
-    if ch:
-        await ch.close()
+    await finance_connector.close()
     sc = getattr(app.state, "search_connector", None)
     if sc:
         await sc.close()
