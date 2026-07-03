@@ -47,6 +47,7 @@ CONFIG_REGISTRY: list[ConfigKey] = [
     ConfigKey("x_client_secret", "OAuth client secret", "X (Twitter)", True),
     ConfigKey("postiz_url", "Base URL", "Postiz", False),
     ConfigKey("postiz_api_key", "API key", "Postiz", True),
+    ConfigKey("postiz_public_url", "Web UI URL (browser-facing)", "Postiz", False),
     ConfigKey("vercel_token", "API token", "Vercel", True),
     ConfigKey("vercel_team_id", "Team id", "Vercel", False),
     ConfigKey("elevenlabs_api_key", "API key", "Voice (ElevenLabs)", True),
