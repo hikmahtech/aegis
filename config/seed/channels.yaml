@@ -1,4 +1,7 @@
-# v3 channels seed. Loader upserts by (kind, identifier).
+# v3 channels seed — first-boot starter examples only. The loader inserts a row
+# only when no channels row with the same (kind, identifier) exists; it never
+# updates or deletes existing rows. After first boot channels are DB-owned and
+# managed from the admin panel's Channels page.
 # Replace the example email account with your own; authorize each Gmail account
 # via the admin panel's "Google accounts" re-auth flow (writes the token to
 # config/credentials/<label>.json).

@@ -4,6 +4,7 @@ import { hasCredentials } from './api/client';
 import Layout from './components/Layout';
 import Login from './pages/Login';
 import AuditLog from './pages/AuditLog';
+import Channels from './pages/Channels';
 import Chat from './pages/Chat';
 import Content from './pages/Content';
 import ContentDetail from './pages/ContentDetail';
@@ -41,6 +42,7 @@ export default function App() {
           <Route path="/flows" element={<Flows />} />
           <Route path="/models" element={<ModelsProviders />} />
           <Route path="/integrations" element={<Integrations />} />
+          <Route path="/channels" element={<Channels />} />
           <Route path="/slack" element={<SlackConfig />} />
           <Route path="/resources" element={<Resources />} />
           <Route path="/agents" element={<Agents />} />

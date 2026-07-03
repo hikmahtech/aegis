@@ -40,7 +40,9 @@ async def test_load_seeds_populates_channels(db_pool):
         rows = await conn.fetch("SELECT identifier FROM channels WHERE kind='email'")
     identifiers = {r["identifier"] for r in rows}
     # No cap on Gmail accounts — the seed may carry any number; assert they all load.
-    assert identifiers == expected
+    # Superset (not equality): channels are DB-owned after first boot, so
+    # operator-added rows may legitimately coexist with the seeded ones.
+    assert expected <= identifiers
 
 
 @pytest.mark.asyncio
@@ -178,7 +180,8 @@ async def test_phase3_channels_loaded(db_pool):
         )
 
     assert raindrop is not None, "raindrop/default channel row missing"
-    assert raindrop["active"] is True
+    # No `active` assertion: the row is DB-owned after first insert — a UI
+    # deactivation must survive re-seeds, so active may legitimately be False.
 
     rss_urls = {r["identifier"] for r in rss}
     assert "https://hnrss.org/frontpage" in rss_urls
@@ -354,3 +357,113 @@ async def test_seed_preserves_provisioned_elevenlabs_voice_id(db_pool):
     async with db_pool.acquire() as conn:
         val = await conn.fetchval("SELECT elevenlabs_voice_id FROM agents WHERE id = 'sebas'")
     assert val == "VOICE_SEBAS", f"Expected 'VOICE_SEBAS', got {val!r}"
+
+
+# ---------------------------------------------------------------------------
+# Channels seed — first-boot starter examples only (insert-when-missing;
+# never UPDATE a UI-edited row, never DELETE an operator-added row).
+# ---------------------------------------------------------------------------
+
+
+async def _run_channels_loader(db_pool, channels: list[dict]) -> None:
+    """Run _load_channels against a temp yaml containing exactly `channels`."""
+    import tempfile
+
+    import yaml as _yaml
+    from aegis.seed import _load_channels
+
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "channels.yaml"
+        path.write_text(_yaml.dump({"channels": channels}))
+        await _load_channels(db_pool, path)
+
+
+@pytest.mark.asyncio
+async def test_channels_seed_inserts_when_missing(db_pool):
+    await run_migrations(db_pool)
+    identifier = "https://seed-test.example/feed"
+    await db_pool.execute("DELETE FROM channels WHERE identifier = $1", identifier)
+    try:
+        await _run_channels_loader(
+            db_pool,
+            [
+                {
+                    "kind": "rss",
+                    "identifier": identifier,
+                    "config": {"label": "seed-test", "agent_id": "raphael"},
+                    "active": True,
+                }
+            ],
+        )
+        row = await db_pool.fetchrow(
+            "SELECT config, active FROM channels WHERE kind = 'rss' AND identifier = $1",
+            identifier,
+        )
+        assert row is not None, "seed loader must insert a missing channel"
+        assert row["config"]["label"] == "seed-test"
+        assert row["active"] is True
+    finally:
+        await db_pool.execute("DELETE FROM channels WHERE identifier = $1", identifier)
+
+
+@pytest.mark.asyncio
+async def test_channels_seed_does_not_clobber_existing_row(db_pool):
+    """A UI-edited config and a UI-deactivated channel must survive a re-seed —
+    the yaml must never overwrite an existing (kind, identifier) row."""
+    await run_migrations(db_pool)
+    identifier = "https://seed-clobber-test.example/feed"
+    await db_pool.execute("DELETE FROM channels WHERE identifier = $1", identifier)
+    try:
+        # Operator state: edited config + deactivated from the admin UI.
+        await db_pool.execute(
+            "INSERT INTO channels (kind, identifier, config, active) VALUES ('rss', $1, $2, false)",
+            identifier,
+            {"label": "ui-edited", "agent_id": "sebas"},
+        )
+        # Re-seed with the same (kind, identifier) but different config/active.
+        await _run_channels_loader(
+            db_pool,
+            [
+                {
+                    "kind": "rss",
+                    "identifier": identifier,
+                    "config": {"label": "yaml-clobber", "agent_id": "raphael"},
+                    "active": True,
+                }
+            ],
+        )
+        row = await db_pool.fetchrow(
+            "SELECT config, active FROM channels WHERE kind = 'rss' AND identifier = $1",
+            identifier,
+        )
+        assert row["config"] == {"label": "ui-edited", "agent_id": "sebas"}
+        assert row["active"] is False, "re-seed must not resurrect a deactivated channel"
+    finally:
+        await db_pool.execute("DELETE FROM channels WHERE identifier = $1", identifier)
+
+
+@pytest.mark.asyncio
+async def test_channels_seed_does_not_prune_operator_rows(db_pool):
+    """Regression for the live incident: a channel added directly by the
+    operator (not present in the yaml) must survive the next Core boot."""
+    await run_migrations(db_pool)
+    operator_identifier = "operator-added@example.com"
+    await db_pool.execute("DELETE FROM channels WHERE identifier = $1", operator_identifier)
+    try:
+        await db_pool.execute(
+            "INSERT INTO channels (kind, identifier, config, active) VALUES ('email', $1, $2, true)",
+            operator_identifier,
+            {"label": "operator", "token_path": "config/credentials/operator.json"},
+        )
+        # Seed yaml knows nothing about the operator's channel.
+        await _run_channels_loader(
+            db_pool,
+            [{"kind": "raindrop", "identifier": "default", "config": {}, "active": True}],
+        )
+        survives = await db_pool.fetchval(
+            "SELECT 1 FROM channels WHERE kind = 'email' AND identifier = $1",
+            operator_identifier,
+        )
+        assert survives == 1, "seed loader must never delete rows missing from the yaml"
+    finally:
+        await db_pool.execute("DELETE FROM channels WHERE identifier = $1", operator_identifier)
