@@ -352,8 +352,26 @@ CHAT_TOOLS = [
     {
         "type": "function",
         "function": {
-            "name": "get_market_regime",
-            "description": "Get current market regime for equities (NIFTY 50) and crypto including fear/greed index.",
+            "name": "get_quote",
+            "description": "Get the current price and day change for one or more ticker symbols (stocks, ETFs, indices, crypto — provider-dependent). Max 10 symbols per call.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "symbols": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Ticker symbols, e.g. [\"AAPL\", \"^NSEI\", \"BTC-USD\"]. Max 10.",
+                    },
+                },
+                "required": ["symbols"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_market_overview",
+            "description": "Get current quotes for the configured market-overview indices (e.g. S&P 500, NASDAQ, NIFTY 50).",
             "parameters": {
                 "type": "object",
                 "properties": {},
@@ -363,103 +381,21 @@ CHAT_TOOLS = [
     {
         "type": "function",
         "function": {
-            "name": "get_top_forecasts",
-            "description": "Get the strongest trading signals (top forecasts) for a given asset class.",
+            "name": "get_finance_news",
+            "description": "Search recent finance/market news on a topic, company, or ticker via web search.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "asset_class": {
+                    "query": {
                         "type": "string",
-                        "enum": ["equity", "crypto", "etf"],
-                        "description": "Asset class to query",
+                        "description": "What to look up, e.g. a company, ticker, or market theme.",
                     },
-                    "halal_only": {
-                        "type": "boolean",
-                        "description": "Filter to halal-screened assets only",
-                        "default": False,
-                    },
-                    "direction": {
-                        "type": "string",
-                        "enum": ["long", "short"],
-                        "description": "Optional filter: long (positive forecast) or short (negative forecast)",
-                    },
-                    "count": {
+                    "limit": {
                         "type": "integer",
-                        "description": "Number of results (max 50)",
-                        "default": 10,
+                        "description": "Number of results (default 10, max 20).",
                     },
                 },
-                "required": ["asset_class"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "get_trade_decisions",
-            "description": "Get execution-ready trade signals, ordered by conviction. Defaults to the latest available date.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "date": {
-                        "type": "string",
-                        "description": "Date to query (YYYY-MM-DD). Defaults to latest available.",
-                    },
-                },
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "get_instrument_detail",
-            "description": "Get a full picture of one instrument including forecasts, price stats, institutional signals, and halal status. Works for both equities (NSE symbols) and crypto.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "symbol": {
-                        "type": "string",
-                        "description": "Instrument symbol, e.g. RELIANCE for equity or BTC for crypto.",
-                    },
-                },
-                "required": ["symbol"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "get_sector_overview",
-            "description": "Get sector-level momentum and average forecasts for all sectors as of the latest available date.",
-            "parameters": {
-                "type": "object",
-                "properties": {},
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "get_forecast_changes",
-            "description": "Get instruments whose combined forecast changed significantly over a given lookback period. Useful for spotting momentum shifts.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "asset_class": {
-                        "type": "string",
-                        "enum": ["equity", "crypto"],
-                        "description": "Asset class to query.",
-                    },
-                    "days": {
-                        "type": "integer",
-                        "description": "Lookback period in days (default 5, max 30).",
-                    },
-                    "threshold": {
-                        "type": "number",
-                        "description": "Minimum absolute forecast change percentage to include (default 5.0).",
-                    },
-                },
-                "required": ["asset_class"],
+                "required": ["query"],
             },
         },
     },
@@ -1224,7 +1160,7 @@ class ToolContext:
     agent_id: str | None = None
     task_id: str | None = None
     knowledge_connector: Any | None = None
-    clickhouse_connector: Any | None = None
+    finance_connector: Any | None = None
     chat_context: dict | None = None
     settings: Any = None
     temporal_client: Any = None
@@ -1832,222 +1768,51 @@ async def _exec_trigger_workflow(pool: asyncpg.Pool, args: dict, ctx: ToolContex
 
 
 
-async def _exec_get_market_regime(pool: asyncpg.Pool, args: dict, ctx: ToolContext) -> str:
-    if not ctx.clickhouse_connector:
-        return json.dumps({"error": "Market data not configured"})
-    ch = ctx.clickhouse_connector
-
-    equity_rows = await ch.query(
-        "SELECT date, close, regime_label FROM index_statistics FINAL"
-        " WHERE index_name = 'Nifty 50' ORDER BY date DESC LIMIT 1",
-        {},
-    )
-    crypto_rows = await ch.query(
-        "SELECT date, fgi_value, fgi_classification, total_market_cap_usd"
-        " FROM crypto_global_market FINAL ORDER BY date DESC LIMIT 1",
-        {},
-    )
-
-    equity = None
-    if equity_rows:
-        r = equity_rows[0]
-        equity = {
-            "regime": r.get("regime_label"),
-            "index": "NIFTY 50",
-            "date": r.get("date"),
-            "close": r.get("close"),
-        }
-
-    crypto = None
-    if crypto_rows:
-        r = crypto_rows[0]
-        crypto = {
-            "fear_greed": r.get("fgi_value"),
-            "fear_greed_label": r.get("fgi_classification"),
-            "market_cap_usd": r.get("total_market_cap_usd"),
-            "date": r.get("date"),
-        }
-
-    return json.dumps({"equity": equity, "crypto": crypto}, default=str)
+async def _exec_get_quote(pool: asyncpg.Pool, args: dict, ctx: ToolContext) -> str:
+    if not ctx.finance_connector:
+        return json.dumps({"error": "Finance connector not available"})
+    symbols = args.get("symbols") or []
+    if isinstance(symbols, str):
+        symbols = symbols.split(",")
+    symbols = [str(s).strip() for s in symbols if str(s).strip()]
+    if not symbols:
+        return json.dumps({"error": "symbols is required"})
+    try:
+        quotes = await ctx.finance_connector.get_quotes(symbols)
+    except Exception as exc:
+        logger.warning("get_quote_failed", error=str(exc))
+        return json.dumps({"error": f"quote lookup failed: {str(exc)[:200]}"})
+    return json.dumps(quotes, default=str)
 
 
-async def _exec_get_top_forecasts(pool: asyncpg.Pool, args: dict, ctx: ToolContext) -> str:
-    if not ctx.clickhouse_connector:
-        return json.dumps({"error": "Market data not configured"})
+async def _exec_get_market_overview(pool: asyncpg.Pool, args: dict, ctx: ToolContext) -> str:
+    if not ctx.finance_connector:
+        return json.dumps({"error": "Finance connector not available"})
+    try:
+        quotes = await ctx.finance_connector.get_overview()
+    except Exception as exc:
+        logger.warning("get_market_overview_failed", error=str(exc))
+        return json.dumps({"error": f"market overview failed: {str(exc)[:200]}"})
+    return json.dumps(quotes, default=str)
 
-    asset_class = args.get("asset_class", "")
-    if asset_class not in ("equity", "crypto", "etf"):
-        return json.dumps({"error": "asset_class must be one of: equity, crypto, etf"})
 
-    halal_only = args.get("halal_only", False)
-    direction = args.get("direction")
-    count = min(int(args.get("count", 10)), 50)
-
-    # Build SQL from hardcoded fragments — no user input interpolated into SQL
-    dir_where = (
-        "AND f.combined_forecast > 0"
-        if direction == "long"
-        else "AND f.combined_forecast < 0"
-        if direction == "short"
-        else ""
-    )
-
-    if asset_class == "equity":
-        halal_where = "AND f.is_halal = 1" if halal_only else ""
-        sql = (
-            "SELECT f.nse_symbol AS symbol, f.date, f.combined_forecast, f.confidence,"
-            " f.signal_agreement, f.close_price, f.vol_mixed AS volatility,"
-            " f.target_weight, p.sharpe_21d"
-            " FROM equity_forecasts AS f FINAL"
-            " LEFT JOIN price_statistics AS p FINAL ON f.nse_symbol = p.nse_symbol AND f.date = p.date"
-            " WHERE f.date = (SELECT max(date) FROM equity_forecasts)"
-            f" {dir_where} {halal_where}"
-            " ORDER BY abs(f.combined_forecast) DESC LIMIT {count:UInt32}"
+async def _exec_get_finance_news(pool: asyncpg.Pool, args: dict, ctx: ToolContext) -> str:
+    """Finance-tuned web news search over the same SearXNG SearchConnector that
+    backs `research_topic`."""
+    if not ctx.search_connector:
+        return json.dumps({"error": "Search connector not available"})
+    query = str(args.get("query", "")).strip()
+    if not query:
+        return json.dumps({"error": "query is required"})
+    limit = min(int(args.get("limit", 10) or 10), 20)
+    try:
+        results = await ctx.search_connector.search(
+            f"{query} stock market finance", categories="news", limit=limit
         )
-    elif asset_class == "crypto":
-        sql = (
-            "SELECT f.symbol, f.date, f.combined_forecast, f.prediction_confidence AS confidence,"
-            " f.close_price, f.vol_mixed AS volatility, f.liquidity_risk_score,"
-            " f.target_weight"
-            " FROM crypto_forecasts AS f FINAL"
-            " WHERE f.date = (SELECT max(date) FROM crypto_forecasts)"
-            f" {dir_where}"
-            " ORDER BY abs(f.combined_forecast) DESC LIMIT {count:UInt32}"
-        )
-    else:  # etf
-        sql = (
-            "SELECT f.symbol, f.date, f.combined_forecast, f.confidence,"
-            " p.close AS last_close, p.vol_mixed AS volatility"
-            " FROM etf_forecasts AS f FINAL"
-            " LEFT JOIN etf_price_statistics AS p FINAL ON f.symbol = p.symbol AND f.date = p.date"
-            " WHERE f.date = (SELECT max(date) FROM etf_forecasts)"
-            f" {dir_where}"
-            " ORDER BY abs(f.combined_forecast) DESC LIMIT {count:UInt32}"
-        )
-
-    rows = await ctx.clickhouse_connector.query(sql, {"count": count})
-    return json.dumps(rows, default=str)
-
-
-async def _exec_get_trade_decisions(pool: asyncpg.Pool, args: dict, ctx: ToolContext) -> str:
-    if not ctx.clickhouse_connector:
-        return json.dumps({"error": "Market data not configured"})
-    ch = ctx.clickhouse_connector
-
-    date = args.get("date")
-    if not date:
-        date_rows = await ch.query("SELECT max(data_date) AS max_date FROM trade_decisions", {})
-        if date_rows and date_rows[0].get("max_date"):
-            date = str(date_rows[0]["max_date"])
-        else:
-            return json.dumps([])
-
-    rows = await ch.query(
-        "SELECT symbol, asset_class, data_date, direction, target_weight,"
-        " combined_forecast, confidence, selection_score, halal_status,"
-        " regime_label, decision_status"
-        " FROM trade_decisions FINAL"
-        " WHERE data_date = {date:String}"
-        " ORDER BY abs(combined_forecast) DESC",
-        {"date": date},
-    )
-    return json.dumps(rows, default=str)
-
-
-async def _exec_get_instrument_detail(pool: asyncpg.Pool, args: dict, ctx: ToolContext) -> str:
-    if not ctx.clickhouse_connector:
-        return json.dumps({"error": "Market data not configured"})
-    symbol = args.get("symbol", "").strip().upper()
-    if not symbol:
-        return json.dumps({"error": "symbol is required"})
-    ch = ctx.clickhouse_connector
-
-    equity_rows = await ch.query(
-        "SELECT f.nse_symbol, f.date, f.combined_forecast, f.confidence,"
-        " f.signal_agreement, f.close_price, f.vol_mixed, f.target_weight,"
-        " f.is_halal, f.regime_label, f.sector, f.industry,"
-        " p.sharpe_21d, p.ewmac_16_64, p.ewmac_32_128, p.rsi_14d,"
-        " i.accumulation_intensity, i.delivery_pct_zscore,"
-        " fm.market_cap, fm.company_name"
-        " FROM equity_forecasts AS f FINAL"
-        " LEFT JOIN price_statistics AS p FINAL ON f.nse_symbol = p.nse_symbol AND f.date = p.date"
-        " LEFT JOIN institutional_signals AS i FINAL ON f.nse_symbol = i.symbol AND f.date = i.date"
-        " LEFT JOIN screener_fundamentals_meta AS fm FINAL ON f.nse_symbol = fm.nse_code"
-        " WHERE f.nse_symbol = {symbol:String}"
-        " ORDER BY f.date DESC LIMIT 1",
-        {"symbol": symbol},
-    )
-    if equity_rows:
-        return json.dumps(equity_rows[0], default=str)
-
-    crypto_rows = await ch.query(
-        "SELECT f.symbol, f.date, f.combined_forecast, f.prediction_confidence AS confidence,"
-        " f.close_price, f.vol_mixed, f.liquidity_risk_score,"
-        " f.target_weight, f.regime_label"
-        " FROM crypto_forecasts AS f FINAL"
-        " WHERE f.symbol = {symbol:String}"
-        " ORDER BY f.date DESC LIMIT 1",
-        {"symbol": symbol},
-    )
-    if crypto_rows:
-        return json.dumps(crypto_rows[0], default=str)
-
-    return json.dumps({"error": f"Instrument '{symbol}' not found in equity or crypto data"})
-
-
-async def _exec_get_sector_overview(pool: asyncpg.Pool, args: dict, ctx: ToolContext) -> str:
-    if not ctx.clickhouse_connector:
-        return json.dumps({"error": "Market data not configured"})
-    ch = ctx.clickhouse_connector
-    rows = await ch.query(
-        "SELECT sector, date, mean_z_score_20d, momentum_signal,"
-        " mean_sharpe_21d, n_stocks, sector_rank"
-        " FROM sector_statistics FINAL"
-        " WHERE date = (SELECT max(date) FROM sector_statistics)"
-        " ORDER BY sector_rank ASC",
-        {},
-    )
-    return json.dumps(rows, default=str)
-
-
-async def _exec_get_forecast_changes(pool: asyncpg.Pool, args: dict, ctx: ToolContext) -> str:
-    if not ctx.clickhouse_connector:
-        return json.dumps({"error": "Market data not configured"})
-    asset_class = args.get("asset_class", "").strip().lower()
-    if asset_class not in ("equity", "crypto"):
-        return json.dumps({"error": "asset_class must be 'equity' or 'crypto'"})
-
-    days = min(int(args.get("days", 5)), 30)
-    threshold = float(args.get("threshold", 5.0))
-
-    if asset_class == "equity":
-        symbol_col = "nse_symbol"
-        table = "equity_forecasts"
-    else:
-        symbol_col = "symbol"
-        table = "crypto_forecasts"
-
-    ch = ctx.clickhouse_connector
-    rows = await ch.query(
-        f"WITH latest AS ("
-        f"  SELECT {symbol_col}, date, combined_forecast"
-        f"  FROM {table} FINAL"
-        f"  WHERE date = (SELECT max(date) FROM {table})"
-        f"), prior AS ("
-        f"  SELECT {symbol_col}, date, combined_forecast"
-        f"  FROM {table} FINAL"
-        f"  WHERE date = (SELECT max(date) FROM {table} WHERE date <= today() - {{days:UInt32}})"
-        f") SELECT l.{symbol_col} AS symbol,"
-        f"  l.combined_forecast AS current_forecast,"
-        f"  p.combined_forecast AS prior_forecast,"
-        f"  l.combined_forecast - p.combined_forecast AS change,"
-        f"  l.date AS current_date, p.date AS prior_date"
-        f" FROM latest l JOIN prior p ON l.{symbol_col} = p.{symbol_col}"
-        f" WHERE abs(l.combined_forecast - p.combined_forecast) >= {{threshold:Float64}}"
-        f" ORDER BY abs(l.combined_forecast - p.combined_forecast) DESC LIMIT 20",
-        {"days": days, "threshold": threshold},
-    )
-    return json.dumps(rows, default=str)
+    except Exception as exc:
+        logger.warning("get_finance_news_failed", error=str(exc))
+        return json.dumps({"error": f"news search failed: {str(exc)[:200]}"})
+    return json.dumps({"query": query, "results": results})
 
 
 async def _exec_research_topic(pool: asyncpg.Pool, args: dict, ctx: ToolContext) -> str:
@@ -2970,12 +2735,9 @@ TOOL_EXECUTORS: dict[str, Any] = {
     "remember_this": _exec_remember_this,
     "query_activities": _exec_query_activities,
     "trigger_workflow": _exec_trigger_workflow,
-    "get_market_regime": _exec_get_market_regime,
-    "get_top_forecasts": _exec_get_top_forecasts,
-    "get_trade_decisions": _exec_get_trade_decisions,
-    "get_instrument_detail": _exec_get_instrument_detail,
-    "get_sector_overview": _exec_get_sector_overview,
-    "get_forecast_changes": _exec_get_forecast_changes,
+    "get_quote": _exec_get_quote,
+    "get_market_overview": _exec_get_market_overview,
+    "get_finance_news": _exec_get_finance_news,
     "research_topic": _exec_research_topic,
     "track_topic": _exec_track_topic,
     "configure_triage": _exec_configure_triage,
@@ -3092,12 +2854,9 @@ AGENT_TOOL_SETS: dict[str, set[str]] = {
         "handoff_task",
     },
     "maou": {
-        "get_market_regime",
-        "get_top_forecasts",
-        "get_trade_decisions",
-        "get_instrument_detail",
-        "get_sector_overview",
-        "get_forecast_changes",
+        "get_quote",
+        "get_market_overview",
+        "get_finance_news",
         "search_knowledge",
         "remember_this",
         "list_interactions",  # NEW (Phase 5 PR 1)
@@ -3648,7 +3407,7 @@ async def send_message(
     knowledge_connector: Any = None,
     settings: Any = None,
     temporal_client: Any = None,
-    clickhouse_connector: Any = None,
+    finance_connector: Any = None,
     search_connector: Any = None,
     remote_script_connector: Any = None,
     vercel_connector: Any = None,
@@ -3831,7 +3590,7 @@ async def send_message(
         agent_id=agent_id,
         task_id=(user_metadata or {}).get("task_id"),
         knowledge_connector=knowledge_connector,
-        clickhouse_connector=clickhouse_connector,
+        finance_connector=finance_connector,
         chat_context={"user_message": message, "thread_id": thread_id},
         settings=settings,
         temporal_client=temporal_client,

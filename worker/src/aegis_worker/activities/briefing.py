@@ -85,87 +85,24 @@ class BriefingActivities:
 
     @activity.defn
     async def format_market_section(self, market: dict) -> str:
-        """Format market data into HTML for Telegram briefing."""
+        """Format index quotes (FinanceConnector overview) into briefing HTML."""
         if not market.get("available"):
             return ""
 
-        sections = ["<b>Market Intelligence</b>"]
-
-        # Regime
-        regime_parts = []
-        eq = market.get("equity_regime")
-        if eq:
-            close = eq.get("close")
-            if isinstance(close, (int, float)):
-                regime_parts.append(f"  Equity: {eq['regime']} (NIFTY {close:,.0f})")
-            else:
-                regime_parts.append(f"  Equity: {eq['regime']}")
-        cr = market.get("crypto")
-        if cr:
-            fgi = cr.get("fear_greed", "?")
-            label = cr.get("fear_greed_label", "")
-            cap = cr.get("market_cap_usd", 0)
-            cap_str = f"${cap / 1e12:.2f}T" if cap else ""
-            regime_parts.append(f"  Crypto: F&G {fgi} ({label}), {cap_str} cap")
-        if regime_parts:
-            sections.append("<b>Regime</b>\n" + "\n".join(regime_parts))
-
-        # Top halal signals
-        signals = market.get("top_equity_signals", [])
-        if signals:
-            lines = []
-            for s in signals[:5]:
-                arrow = "\U0001f4c8" if s.get("combined_forecast", 0) > 0 else "\U0001f4c9"
-                conf = s.get("confidence", 0)
-                lines.append(
-                    f"  {arrow} {s['symbol']} {s['combined_forecast']:+.1f} ({conf:.0%} conf)"
-                )
-            sections.append("<b>Top Halal Signals</b>\n" + "\n".join(lines))
-
-        # Top crypto signals
-        crypto_signals = market.get("top_crypto_signals", [])
-        if crypto_signals:
-            lines = []
-            for s in crypto_signals[:5]:
-                arrow = "\U0001f4c8" if s.get("combined_forecast", 0) > 0 else "\U0001f4c9"
-                lines.append(f"  {arrow} {s['symbol']} {s['combined_forecast']:+.1f}")
-            sections.append("<b>Top Crypto</b>\n" + "\n".join(lines))
-
-        # Notable changes
-        changes = market.get("notable_changes", [])
-        if changes:
-            lines = []
-            for c in changes[:5]:
-                arrow = "\u2b06\ufe0f" if c.get("change", 0) > 0 else "\u2b07\ufe0f"
-                prior = c.get("prior_forecast")
-                current = c.get("current_forecast")
-                detail = (
-                    f" (was {prior:+.1f}, now {current:+.1f})"
-                    if prior is not None and current is not None
-                    else ""
-                )
-                lines.append(f"  {arrow} {c['symbol']} {c['change']:+.1f}{detail}")
-            sections.append("<b>Notable Changes (5d)</b>\n" + "\n".join(lines))
-
-        # Trade decisions
-        decisions = market.get("trade_decisions", [])
-        if decisions:
-            lines = []
-            for d in decisions[:5]:
-                weight = d.get("target_weight", 0)
-                lines.append(f"  {d['direction']} {d['symbol']} @ {weight:.0%}")
-            sections.append("<b>Active Decisions</b>\n" + "\n".join(lines))
-
-        # Sectors
-        sector_list = market.get("sectors", [])
-        if sector_list:
-            lines = [
-                f"  {s['sector_rank']}. {s['sector']} ({s['momentum_signal']})"
-                for s in sector_list[:5]
-            ]
-            sections.append("<b>Sectors</b>\n" + "\n".join(lines))
-
-        return "\n\n".join(sections)
+        indices = market.get("indices") or []
+        lines = []
+        for q in indices[:10]:
+            symbol = q.get("symbol")
+            price = q.get("price")
+            if not symbol or not isinstance(price, (int, float)):
+                continue
+            pct = q.get("change_percent")
+            arrow = "\U0001f4c9" if isinstance(pct, (int, float)) and pct < 0 else "\U0001f4c8"
+            pct_str = f" ({pct:+.2f}%)" if isinstance(pct, (int, float)) else ""
+            lines.append(f"  {arrow} {_esc(str(symbol))} {price:,.2f}{pct_str}")
+        if not lines:
+            return ""
+        return "<b>Markets</b>\n" + "\n".join(lines)
 
     @activity.defn
     async def gather_intelligence_summary(self, hours: int = 24) -> list[dict]:

@@ -1,6 +1,6 @@
 # AEGIS v3 Architecture
 
-AEGIS v3 is a flow-first personal AI orchestration platform. It coordinates 4 named personalities over 26 Temporal flows, a chat surface with 38 tools gated per-personality, native ingest connectors, and a knowledge-service for semantic search and query-time RAG.
+AEGIS v3 is a flow-first personal AI orchestration platform. It coordinates 4 named personalities over 26 Temporal flows, a chat surface with 40 tools gated per-personality, native ingest connectors, and a knowledge-service for semantic search and query-time RAG.
 
 This document is the canonical reference for what the running system does today. For commands and setup, see [`development.md`](../development.md). For deployment, see [`production.md`](../production.md). For where the architecture is **going** — a kernel + SDK + capability-plugin redesign for productization — see [`productization.md`](productization.md).
 
@@ -167,11 +167,11 @@ When a `todoist_task_id` is on the alert (pandora APP-<n>: clarify path), the fl
 | **RemoteScriptConnector** (`remote_script.py`) | SSH to the configured host. Runs predefined infra scripts and the Kimi CLI for alert investigations against fixed checkouts under `AEGIS_REMOTE_SCRIPT_REPO_BASE` (workspace-relative `metadata.path`, no JIT cloning). When `AEGIS_REMOTE_SCRIPT_KIMI_HOST` is set and reachable (node-b), kimi runs are wrapped in a live-attachable `tmux` session there; otherwise they fall back to the base host (node-a). |
 | **HomelabConnector** (`homelab.py`) | Docker Swarm + Kubernetes commands via SSH. Gated by the `homelab_enabled` setting. Backs worker flows; Pandora's infra chat tools run via RemoteScriptConnector, or directly through the infrastructure registry for registered k8s clusters (`services/infra.py` — see [`infrastructure.md`](../infrastructure.md)). |
 | **SearchConnector** (`search.py`) | SearxNG HTTP client. Used by the `research_topic` chat tool. |
-| **ClickHouseConnector** (`clickhouse.py`) | Read-only market data queries. Powers Maou's market tools. |
+| **FinanceConnector** (`finance.py`) | Provider-agnostic web market data (keyless `yahoo` / `stooq` quote providers, selected via the Finance integration config). Powers Maou's `get_quote` / `get_market_overview` tools and the `/api/market/summary` briefing section; `get_finance_news` rides SearchConnector. |
 
 ## Chat with Tool Calling
 
-`POST /api/chat` (non-streaming) and `POST /api/chat/stream` (SSE). 38 tools in `CHAT_TOOLS`, gated per-personality via `AGENT_TOOL_SETS` in `core/src/aegis/services/chat.py`.
+`POST /api/chat` (non-streaming) and `POST /api/chat/stream` (SSE). 40 tools in `CHAT_TOOLS`, gated per-personality via `AGENT_TOOL_SETS` in `core/src/aegis/services/chat.py`.
 
 Tool loop: max iterations bounded by the service config; per-tool timeout via `asyncio.wait_for`; result truncation per `max_bytes`. Every tool call recorded to `chat_tool_calls`.
 
@@ -180,9 +180,9 @@ Per-personality tool counts (authoritative — counted from `AGENT_TOOL_SETS`):
 | Personality | Tools |
 |-------------|------:|
 | Sebas | 15 |
-| Raphael | 13 |
-| Maou | 17 |
-| Pandora's Actor | 24 |
+| Raphael | 11 |
+| Maou | 13 |
+| Pandora's Actor | 30 |
 
 Worker startup validator: refuses to boot if a personality references a tool that isn't in `CHAT_TOOLS`. (Validation runs at Core boot via `_validate_agent_tool_sets`.)
 

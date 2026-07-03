@@ -192,7 +192,7 @@ async def chat(request: Request, body: dict[str, Any]) -> dict[str, Any]:
         knowledge_connector=getattr(request.app.state, "knowledge_connector", None),
         settings=getattr(request.app.state, "settings", None),
         temporal_client=getattr(request.app.state, "temporal_client", None),
-        clickhouse_connector=getattr(request.app.state, "clickhouse_connector", None),
+        finance_connector=getattr(request.app.state, "finance_connector", None),
         search_connector=getattr(request.app.state, "search_connector", None),
         remote_script_connector=getattr(request.app.state, "remote_script_connector", None),
         vercel_connector=getattr(request.app.state, "vercel_connector", None),

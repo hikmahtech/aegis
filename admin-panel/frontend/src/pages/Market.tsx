@@ -16,85 +16,43 @@ export default function Market() {
   }
   useEffect(() => { void load(); }, []);
 
-  const regimeCards = ['equity_regime', 'bond_regime', 'commodity_regime', 'crypto_regime']
-    .filter(k => data && data[k]);
+  const indices: any[] = Array.isArray(data?.indices) ? data.indices : [];
 
   return (
     <div>
       <h1 className="page-title">Market</h1>
-      <p className="page-subtitle">Regimes, trades, forecasts.</p>
+      <p className="page-subtitle">Index quotes from the configured finance provider.</p>
       <ErrorBanner error={error} onDismiss={() => setError(null)} />
       <button className="btn" onClick={() => void load()} disabled={loading}>
         {loading ? 'Refreshing…' : '↻ Refresh'}
       </button>
 
       {data && !data.available && (
-        <p className="empty" style={{ marginTop: 12 }}>Market data service is offline.</p>
+        <p className="empty" style={{ marginTop: 12 }}>Market data is unavailable (provider unreachable or no indices configured).</p>
       )}
 
-      {data?.available && (
+      {data?.available && indices.length > 0 && (
         <>
-          {regimeCards.length > 0 && (
-            <div className="grid" style={{ marginTop: 12 }}>
-              {regimeCards.map(k => {
-                const r = data[k];
-                return (
-                  <div key={k} className="card">
-                    <h3>{k.replace(/_/g, ' ')}</h3>
-                    <p><strong>{r.regime || r.regime_label || '—'}</strong></p>
-                    <p style={{ fontSize: 12, color: 'var(--text-muted)' }}>
-                      {r.date && new Date(r.date).toLocaleDateString()}
-                      {r.close != null && <> · close {r.close}</>}
-                    </p>
-                  </div>
-                );
-              })}
-            </div>
-          )}
-
-          {Array.isArray(data.top_trades) && data.top_trades.length > 0 && (
-            <>
-              <h2 style={{ marginTop: 24 }}>Top trades</h2>
-              <div className="table-scroll">
-                <table className="data-table">
-                  <thead><tr><th>Symbol</th><th>Signal</th><th>Confidence</th><th>Entry</th><th>Stop</th><th>Target</th></tr></thead>
-                  <tbody>
-                    {data.top_trades.map((t: any, i: number) => (
-                      <tr key={i}>
-                        <td><strong>{t.symbol}</strong></td>
-                        <td>{t.signal || t.combined_forecast != null ? (t.combined_forecast > 0 ? 'BUY' : 'SELL') : '—'}</td>
-                        <td>{t.confidence?.toFixed?.(2) ?? '—'}</td>
-                        <td>{t.entry ?? t.close_price ?? '—'}</td>
-                        <td>{t.stop ?? '—'}</td>
-                        <td>{t.target ?? '—'}</td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-            </>
-          )}
-
-          {Array.isArray(data.forecasts) && data.forecasts.length > 0 && (
-            <>
-              <h2 style={{ marginTop: 24 }}>Forecasts</h2>
-              <div className="table-scroll">
-                <table className="data-table">
-                  <thead><tr><th>Symbol</th><th>Window</th><th>Return</th><th>Confidence</th></tr></thead>
-                  <tbody>
-                    {data.forecasts.map((f: any, i: number) => (
-                      <tr key={i}>
-                        <td><strong>{f.symbol}</strong></td>
-                        <td>{f.window || f.horizon || '—'}</td>
-                        <td>{f.return != null ? `${(f.return * 100).toFixed(2)}%` : f.combined_forecast != null ? `${f.combined_forecast.toFixed(2)}%` : '—'}</td>
-                        <td>{f.confidence?.toFixed?.(2) ?? '—'}</td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-            </>
-          )}
+          <h2 style={{ marginTop: 24 }}>Indices</h2>
+          <div className="table-scroll">
+            <table className="data-table">
+              <thead><tr><th>Symbol</th><th>Price</th><th>Change</th><th>Change %</th><th>Currency</th><th>As of</th></tr></thead>
+              <tbody>
+                {indices.map((q: any, i: number) => (
+                  <tr key={i}>
+                    <td><strong>{q.symbol}</strong></td>
+                    <td>{q.price != null ? q.price.toLocaleString?.() ?? q.price : '—'}</td>
+                    <td style={{ color: q.change != null ? (q.change < 0 ? 'var(--danger, #c00)' : 'var(--success, #080)') : undefined }}>
+                      {q.change != null ? q.change.toFixed?.(2) ?? q.change : '—'}
+                    </td>
+                    <td>{q.change_percent != null ? `${q.change_percent > 0 ? '+' : ''}${q.change_percent}%` : '—'}</td>
+                    <td>{q.currency ?? '—'}</td>
+                    <td>{q.as_of ?? '—'}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
 
           <details style={{ marginTop: 24 }}>
             <summary style={{ cursor: 'pointer', fontSize: 12, color: 'var(--text-muted)' }}>Raw response</summary>

@@ -61,8 +61,8 @@ def test_prompt_includes_tool_descriptions():
             prompt = _build_agent_system_prompt(
                 "maou",
                 fallback="fallback",
-                tool_descriptions="You have: get_market_regime, get_top_forecasts",
+                tool_descriptions="You have: get_quote, get_market_overview",
             )
 
     assert "## Available Tools" in prompt
-    assert "get_market_regime" in prompt
+    assert "get_quote" in prompt
