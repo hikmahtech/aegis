@@ -80,7 +80,7 @@ The system is seeded from plain YAML + Markdown — edit these, not code:
 - `config/seed/agents.yaml` — your agents (names, model tier, routing metadata, channel)
 - `config/seed/activities.yaml` — the scheduled flows (cron, agent, config) — also editable live from the admin panel at `/admin/flows`
 - `config/seed/{channels,resources,todoist}.yaml` — channels, tracked resources, task projects
-- `personalities/<agent>/{SOUL,AGENTS,USER,MEMORY}.md` — each agent's persona and what it knows about you
+- `personalities/<agent>/{SOUL,AGENTS,USER,MEMORY}.md` — starter persona examples, imported once on first boot; afterwards each agent's persona is edited live in the admin panel and stored in the database
 - `config/.env` — secrets and endpoints (gitignored; never commit real keys)
 
 The admin panel (served by core at `/`) is the visibility surface: flows,

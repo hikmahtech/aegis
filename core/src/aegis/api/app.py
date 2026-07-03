@@ -244,6 +244,7 @@ def create_app(run_lifespan: bool = True) -> FastAPI:
 
     # Authenticated routes
     app.include_router(agents.router)
+    app.include_router(agents.admin_router)
     app.include_router(gmail_reauth.router)
     app.include_router(social_auth.router)
     app.include_router(chat.router)

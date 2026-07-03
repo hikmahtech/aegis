@@ -26,9 +26,10 @@ async def get_agent(pool: asyncpg.Pool, agent_id: str) -> dict[str, Any] | None:
 async def create_agent(pool: asyncpg.Pool, data: dict[str, Any]) -> dict[str, Any]:
     """Insert a new agent. Requires id, name, role; sensible defaults for the rest.
 
-    system_prompt_path is vestigial (persona is DB-first via soul/operating_notes/
-    user_context) but NOT NULL, so it defaults to ''. Raises asyncpg.UniqueViolationError
-    if the id already exists — the route maps that to 409.
+    system_prompt_path is vestigial (the persona lives in agent_personalities —
+    see aegis.services.personalities) but NOT NULL, so it defaults to ''.
+    Raises asyncpg.UniqueViolationError if the id already exists — the route
+    maps that to 409.
     """
     agent_id = (data.get("id") or "").strip()
     name = (data.get("name") or "").strip()
@@ -40,8 +41,8 @@ async def create_agent(pool: asyncpg.Pool, data: dict[str, Any]) -> dict[str, An
         """
         INSERT INTO agents (
             id, name, role, system_prompt_path, capabilities, model_tier,
-            metadata, soul, operating_notes, user_context, active
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, TRUE)
+            metadata, active
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, TRUE)
         RETURNING *
         """,
         agent_id,
@@ -51,9 +52,6 @@ async def create_agent(pool: asyncpg.Pool, data: dict[str, Any]) -> dict[str, An
         data.get("capabilities", []),
         data.get("model_tier", "balanced"),
         data.get("metadata", {}),
-        data.get("soul"),
-        data.get("operating_notes"),
-        data.get("user_context"),
     )
     return dict(row)
 
@@ -70,9 +68,6 @@ async def update_agent(
         "active",
         "model_tier",
         "metadata",
-        "soul",
-        "operating_notes",
-        "user_context",
     }
     filtered = {k: v for k, v in updates.items() if k in allowed}
     if not filtered:

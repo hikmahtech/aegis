@@ -16,9 +16,8 @@ export default function AgentDetail() {
   const [history, setHistory] = useState<{ role: string; content: string }[]>([]);
   const [sending, setSending] = useState(false);
   const [loading, setLoading] = useState(true);
-  const [persona, setPersona] = useState({
-    name: '', role: '', model_tier: 'balanced', soul: '', operating_notes: '', user_context: '',
-  });
+  const [persona, setPersona] = useState({ name: '', role: '', model_tier: 'balanced' });
+  const [kinds, setKinds] = useState({ soul: '', agents: '', user: '', memory: '' });
   const [savingP, setSavingP] = useState(false);
   const [pmsg, setPmsg] = useState('');
   const [draftDesc, setDraftDesc] = useState('');
@@ -27,19 +26,22 @@ export default function AgentDetail() {
   async function load() {
     setError(null); setLoading(true);
     try {
-      const [a, t, th, st, cs, rr] = await Promise.all([
+      const [a, t, th, st, cs, rr, pk] = await Promise.all([
         api.getAgent(id),
         api.getAgentTools(id).catch(() => []),
         api.listThreads(`agent_id=${id}`).catch(() => []),
         api.getLLMStats(`agent_id=${id}`).catch(() => null),
         api.getConnectorStats({ agent_id: id }).catch(() => null),
         api.listWorkflowRuns({ agent_id: id, limit: 10 }).catch(() => []),
+        api.getPersonality(id).catch(() => ({} as Record<string, string>)),
       ]);
       setAgent(a); setTools(t); setThreads(th);
       setLlmStats(st); setConnectorStats(cs); setRuns(rr);
       setPersona({
         name: a.name || '', role: a.role || '', model_tier: a.model_tier || 'balanced',
-        soul: a.soul || '', operating_notes: a.operating_notes || '', user_context: a.user_context || '',
+      });
+      setKinds({
+        soul: pk.soul || '', agents: pk.agents || '', user: pk.user || '', memory: pk.memory || '',
       });
     } catch (e: any) { setError(e); }
     finally { setLoading(false); }
@@ -47,7 +49,11 @@ export default function AgentDetail() {
 
   async function savePersona() {
     setSavingP(true); setPmsg(''); setError(null);
-    try { await api.updateAgent(id, persona); setPmsg('Saved.'); await load(); }
+    try {
+      await api.updateAgent(id, persona);
+      await api.putPersonality(id, kinds);
+      setPmsg('Saved.'); await load();
+    }
     catch (e: any) { setError(e); } finally { setSavingP(false); }
   }
 
@@ -56,11 +62,11 @@ export default function AgentDetail() {
     setDrafting(true); setError(null);
     try {
       const d = await api.draftPersona(id, draftDesc.trim());
-      setPersona(p => ({
-        ...p,
-        soul: d.soul || p.soul,
-        operating_notes: d.operating_notes || p.operating_notes,
-        user_context: d.user_context || p.user_context,
+      setKinds(k => ({
+        ...k,
+        soul: d.soul || k.soul,
+        agents: d.operating_notes || k.agents,
+        user: d.user_context || k.user,
       }));
       setPmsg('Drafted — review and Save.');
     } catch (e: any) { setError(e); } finally { setDrafting(false); }
@@ -113,11 +119,16 @@ export default function AgentDetail() {
             {drafting ? 'Drafting…' : 'Draft with AI'}
           </button>
         </div>
-        {([['soul', 'Identity (SOUL)'], ['operating_notes', 'Operational boundaries (AGENTS)'], ['user_context', 'User context (USER)']] as const).map(([k, label]) => (
+        {([
+          ['soul', 'Identity (SOUL)'],
+          ['agents', 'Operational boundaries (AGENTS)'],
+          ['user', 'User context (USER)'],
+          ['memory', 'Long-term memory (MEMORY)'],
+        ] as const).map(([k, label]) => (
           <div key={k} style={{ marginBottom: 8 }}>
             <label style={{ fontSize: 13, color: 'var(--text-muted)' }}>{label}</label>
-            <textarea style={{ width: '100%' }} rows={5} value={(persona as any)[k]}
-              onChange={e => setPersona({ ...persona, [k]: e.target.value })} />
+            <textarea style={{ width: '100%' }} rows={5} value={(kinds as any)[k]}
+              onChange={e => setKinds({ ...kinds, [k]: e.target.value })} />
           </div>
         ))}
         <button className="btn btn-primary" disabled={savingP} onClick={savePersona}>
