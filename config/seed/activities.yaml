@@ -81,6 +81,16 @@ activities:
     config: {}
     active: true
 
+  # Social publishing — a Todoist task (@publish + platform labels, due time =
+  # post time) becomes a post after an approval card. Ships inert: the
+  # social_publishing_enabled settings row (migration 005) defaults to false.
+  - slug: social-publish-5min
+    workflow_type: SocialPublishFlow
+    agent_id: sebas
+    schedule_cron: "*/5 * * * *"
+    config: {}
+    active: true
+
   # Raphael — daily briefing (carries the "References filed" digest for
   # #research / #email reference closure per the references-as-knowledge
   # spec; per-message Telegrams only fire for user-initiated #chat / #manual

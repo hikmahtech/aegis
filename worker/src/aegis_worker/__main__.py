@@ -41,6 +41,7 @@ from aegis_worker.activities.review import ReviewActivities
 from aegis_worker.activities.rss import RssActivities
 from aegis_worker.activities.runs_v3 import RunRecorderActivities
 from aegis_worker.activities.sentry_ingest import SentryIngestActivities
+from aegis_worker.activities.social import SocialActivities
 from aegis_worker.activities.todoist import TodoistActivities
 from aegis_worker.bootstrap import bootstrap
 from aegis_worker.flows.agent_chat_reply import AgentChatReplyFlow
@@ -67,6 +68,7 @@ from aegis_worker.flows.rss_ingest import RssIngestFlow
 from aegis_worker.flows.schedule_health import ScheduleHealthFlow
 from aegis_worker.flows.sentry_poll import SentryPollFlow
 from aegis_worker.flows.service_drift import ServiceDriftFlow
+from aegis_worker.flows.social_publish import SocialPublishFlow
 from aegis_worker.flows.subscription_audit import SubscriptionAuditFlow
 from aegis_worker.flows.todoist_sync import TodoistSyncFlow
 from aegis_worker.flows.vercel_project_sync import VercelProjectSyncFlow
@@ -95,6 +97,7 @@ TASK_QUEUE = "aegis-main"
 # method object, not to the dependency values).
 _stub_chat_act = ChatActivities(client=None)  # type: ignore[arg-type]
 _stub_clarify_act = ClarifyActivities(db_pool=None)
+_stub_social_act = SocialActivities(db_pool=None)
 
 WORKFLOWS: list = [
     AgentChatReplyFlow,
@@ -115,6 +118,7 @@ WORKFLOWS: list = [
     ClarifyFlow,
     DailyReviewFlow,
     WeeklyReviewFlow,
+    SocialPublishFlow,
 ]
 
 ACTIVITIES: list = [
@@ -122,6 +126,12 @@ ACTIVITIES: list = [
     _stub_clarify_act.post_agent_reply_comment,
     _stub_clarify_act.post_agent_reply_error_comment,
     _stub_clarify_act.clear_clarify_watermark,
+    _stub_social_act.find_due_posts,
+    _stub_social_act.enqueue_outbox,
+    _stub_social_act.drain_social_outbox,
+    _stub_social_act.complete_posted_tasks,
+    _stub_social_act.unpublish_task,
+    _stub_social_act.apply_social_approval,
 ]
 
 
@@ -377,6 +387,10 @@ async def main():
         db_pool=deps.pool,
         connector=todoist_connector,
     )
+    social_act = SocialActivities(
+        db_pool=deps.pool,
+        connector=connectors.get("social"),
+    )
     # AlertInvestigationFlow posts start- and final-comments on the Todoist
     # track-task via alert_act.post_task_note. The dataclass declared
     # todoist_connector=None upstream; wire the live connector now.
@@ -499,6 +513,12 @@ async def main():
         todoist_act.apply_sync_diff,
         todoist_act.drain_outbox,
         capture_act.capture_to_inbox,
+        social_act.find_due_posts,
+        social_act.enqueue_outbox,
+        social_act.drain_social_outbox,
+        social_act.complete_posted_tasks,
+        social_act.unpublish_task,
+        social_act.apply_social_approval,
         clarify_act.find_unclassified_items,
         clarify_act.classify_one,
         clarify_act.apply_outcome,
@@ -583,6 +603,7 @@ async def main():
         WeeklyReviewFlow,
         WorkspaceRepoSyncFlow,
         VercelProjectSyncFlow,
+        SocialPublishFlow,
     ]
 
     if settings.homelab_enabled:

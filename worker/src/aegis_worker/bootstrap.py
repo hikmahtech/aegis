@@ -115,6 +115,13 @@ async def bootstrap(settings: Settings | None = None) -> WorkerDeps:
     )
     logger.info("connector_ready", connector="knowledge")
 
+    # Social publishing — always constructed; it only acts when social_accounts
+    # rows exist (connected from the admin page) and the settings kill switch is on.
+    from aegis.connectors.social import SocialConnector
+
+    connectors["social"] = SocialConnector(db_pool=pool, settings=settings)
+    logger.info("connector_ready", connector="social")
+
     import httpx
 
     http_client = httpx.AsyncClient(

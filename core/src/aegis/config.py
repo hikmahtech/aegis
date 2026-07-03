@@ -105,6 +105,11 @@ class Settings(BaseSettings):
     # Todoist (GTD task management)
     todoist_api_key: str = ""
     todoist_webhook_secret: str = ""
+    # Social publishing — BYO X (Twitter) OAuth 2.0 app (developer.x.com), same
+    # rationale as the Google client: the maintainer's app can't be committed
+    # and wouldn't authorize forkers. Editable from the admin Integrations page.
+    x_client_id: str = ""
+    x_client_secret: str = ""
     # Kimi CLI — the remote coding-CLI used by alert_investigation for auto-fix proposals.
     kimi_cli_binary_path: str = "/usr/local/bin/kimi"
     # Claude CLI on remote_script_host — used instead of kimi for repos whose

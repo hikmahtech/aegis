@@ -49,3 +49,37 @@ def test_post_agent_reply_error_comment_activity_registered():
 
 def test_clear_clarify_watermark_activity_registered():
     assert "clear_clarify_watermark" in _activity_names()
+
+
+def test_social_publish_flow_registered():
+    from aegis_worker.flows.social_publish import SocialPublishFlow
+
+    assert SocialPublishFlow in worker_main.WORKFLOWS, (
+        "SocialPublishFlow must be registered in worker/__main__.py WORKFLOWS list"
+    )
+
+
+def test_social_activities_registered():
+    names = _activity_names()
+    for expected in (
+        "find_due_posts",
+        "enqueue_outbox",
+        "drain_social_outbox",
+        "complete_posted_tasks",
+        "unpublish_task",
+        # post_resolve hook executed BY NAME from InteractionFlow — an
+        # unregistered hook fails silently at resolve time.
+        "apply_social_approval",
+    ):
+        assert expected in names, f"{expected} must be in __main__.ACTIVITIES list"
+
+
+def test_social_publish_flow_in_schedule_map():
+    from aegis_worker.schedule_sync import _ACTIVITY_TYPE_MAP
+
+    assert "SocialPublishFlow" in _ACTIVITY_TYPE_MAP
+    _cls, config = _ACTIVITY_TYPE_MAP["SocialPublishFlow"](
+        {"agent_id": "sebas", "config": {"lookahead_minutes": 15}}
+    )
+    assert config.agent_id == "sebas"
+    assert config.lookahead_minutes == 15

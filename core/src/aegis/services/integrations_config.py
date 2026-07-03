@@ -43,6 +43,8 @@ CONFIG_REGISTRY: list[ConfigKey] = [
     ConfigKey("sentry_projects", "Project ids (comma-sep, blank = all)", "Sentry", False),
     ConfigKey("sentry_webhook_secret", "Webhook secret", "Sentry", True),
     ConfigKey("todoist_webhook_secret", "Webhook secret", "Todoist", True),
+    ConfigKey("x_client_id", "OAuth client id", "X (Twitter)", False),
+    ConfigKey("x_client_secret", "OAuth client secret", "X (Twitter)", True),
     ConfigKey("vercel_token", "API token", "Vercel", True),
     ConfigKey("vercel_team_id", "Team id", "Vercel", False),
     ConfigKey("elevenlabs_api_key", "API key", "Voice (ElevenLabs)", True),
