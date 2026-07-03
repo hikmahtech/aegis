@@ -86,26 +86,32 @@ async def bootstrap(settings: Settings | None = None) -> WorkerDeps:
         connectors["search"] = SearchConnector(base_url=searxng_url)
         logger.info("connector_ready", connector="search")
 
-    # RemoteScript (needs SSH config)
-    remote_host = getattr(settings, "remote_script_host", "")
-    if remote_host:
-        try:
-            from aegis.connectors.remote_script import RemoteScriptConnector
+    # RemoteScript — always constructed: config resolves DB-first from the
+    # infra registry (coding.enabled entry), with the env settings as fallback,
+    # so the coding host can be configured entirely from the admin UI.
+    try:
+        from aegis.connectors.remote_script import RemoteScriptConnector
 
-            connectors["remote_script"] = RemoteScriptConnector(
-                host=remote_host,
-                user=getattr(settings, "remote_script_user", "deploy"),
-                key_file=getattr(settings, "remote_script_key_file", "~/.ssh/id_ed25519"),
-                repo_base=getattr(settings, "remote_script_repo_base", ""),
-                kimi_host=getattr(settings, "remote_script_kimi_host", ""),
-                tmux_session=getattr(settings, "remote_script_tmux_session", "remote"),
-                tmux_window_cap=getattr(settings, "remote_script_tmux_window_cap", 10),
-                claude_orgs=getattr(settings, "remote_script_claude_orgs", ""),
-                claude_binary=getattr(settings, "claude_cli_binary_path", ""),
-            )
-            logger.info("connector_ready", connector="remote_script")
-        except Exception as exc:
-            logger.warning("remote_script_init_failed", error=str(exc))
+        connectors["remote_script"] = RemoteScriptConnector(
+            host=getattr(settings, "remote_script_host", ""),
+            user=getattr(settings, "remote_script_user", "deploy"),
+            key_file=getattr(settings, "remote_script_key_file", "~/.ssh/id_ed25519"),
+            repo_base=getattr(settings, "remote_script_repo_base", ""),
+            known_hosts=getattr(settings, "remote_script_known_hosts", None),
+            kimi_host=getattr(settings, "remote_script_kimi_host", ""),
+            tmux_session=getattr(settings, "remote_script_tmux_session", "remote"),
+            tmux_window_cap=getattr(settings, "remote_script_tmux_window_cap", 10),
+            claude_orgs=getattr(settings, "remote_script_claude_orgs", ""),
+            claude_binary=getattr(settings, "claude_cli_binary_path", ""),
+            kimi_binary=getattr(settings, "kimi_cli_binary_path", ""),
+            self_repo_path=getattr(settings, "aegis_self_repo_path", ""),
+            runbooks_dir=getattr(settings, "runbooks_dir", ""),
+            db_pool=pool,
+            secret_key=getattr(settings, "secret_key", ""),
+        )
+        logger.info("connector_ready", connector="remote_script")
+    except Exception as exc:
+        logger.warning("remote_script_init_failed", error=str(exc))
 
     # Knowledge subsystem — native pgvector over our own pool, always available.
     from aegis.services.knowledge import KnowledgeStore

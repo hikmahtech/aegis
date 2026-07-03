@@ -12,6 +12,125 @@ interface SetupFile {
   mode: string;
 }
 
+// Coding agent (remote script) block — non-secret; the SSH identity (host,
+// user, port, encrypted key) comes from the entry's own fields.
+interface CodingAccount {
+  label: string;
+  config_dir: string;
+}
+
+interface CodingRoute {
+  org: string;
+  engine: string;
+  account: string;
+}
+
+interface CodingFormData {
+  enabled: boolean;
+  repo_base: string;
+  claude_binary: string;
+  kimi_binary: string;
+  accounts: CodingAccount[];
+  default_account: string;
+  routes: CodingRoute[];
+  default_engine: string;
+  tmux_session: string;
+  tmux_window_cap: string;
+  kimi_host_slug: string;
+  self_repo_path: string;
+  runbooks_dir: string;
+}
+
+const emptyCoding: CodingFormData = {
+  enabled: false,
+  repo_base: '',
+  claude_binary: '',
+  kimi_binary: '',
+  accounts: [],
+  default_account: '',
+  routes: [],
+  default_engine: 'kimi',
+  tmux_session: 'remote',
+  tmux_window_cap: '10',
+  kimi_host_slug: '',
+  self_repo_path: '',
+  runbooks_dir: '',
+};
+
+function codingFromRow(coding: any): CodingFormData {
+  if (!coding || typeof coding !== 'object' || Object.keys(coding).length === 0) {
+    return { ...emptyCoding };
+  }
+  const claude = coding.engines?.claude || {};
+  const kimi = coding.engines?.kimi || {};
+  const routing = coding.routing || {};
+  const tmux = coding.tmux || {};
+  return {
+    enabled: !!coding.enabled,
+    repo_base: coding.repo_base || '',
+    claude_binary: claude.binary_path || '',
+    kimi_binary: kimi.binary_path || '',
+    accounts: Object.entries(claude.config_dirs || {}).map(([label, dir]) => ({
+      label,
+      config_dir: String(dir),
+    })),
+    default_account: claude.default_account || '',
+    routes: Object.entries(routing.orgs || {}).map(([org, r]: [string, any]) => ({
+      org,
+      engine: r?.engine || 'claude',
+      account: r?.account || '',
+    })),
+    default_engine: routing.default_engine || 'kimi',
+    tmux_session: tmux.session || 'remote',
+    tmux_window_cap: tmux.window_cap != null ? String(tmux.window_cap) : '10',
+    kimi_host_slug: coding.kimi_host_slug || '',
+    self_repo_path: coding.self_repo_path || '',
+    runbooks_dir: coding.runbooks_dir || '',
+  };
+}
+
+function codingToPayload(c: CodingFormData): Record<string, any> {
+  const config_dirs: Record<string, string> = {};
+  for (const a of c.accounts) {
+    if (a.label.trim()) config_dirs[a.label.trim()] = a.config_dir.trim();
+  }
+  const orgs: Record<string, any> = {};
+  for (const r of c.routes) {
+    if (r.org.trim()) orgs[r.org.trim()] = { engine: r.engine, account: r.account.trim() };
+  }
+  return {
+    enabled: c.enabled,
+    repo_base: c.repo_base.trim(),
+    engines: {
+      claude: {
+        binary_path: c.claude_binary.trim(),
+        config_dirs,
+        default_account: c.default_account.trim(),
+      },
+      kimi: { binary_path: c.kimi_binary.trim() },
+    },
+    routing: { orgs, default_engine: c.default_engine },
+    tmux: { session: c.tmux_session.trim() || 'remote', window_cap: Number(c.tmux_window_cap) || 10 },
+    kimi_host_slug: c.kimi_host_slug.trim() || null,
+    self_repo_path: c.self_repo_path.trim(),
+    runbooks_dir: c.runbooks_dir.trim(),
+  };
+}
+
+function codingTouched(c: CodingFormData): boolean {
+  return (
+    c.enabled ||
+    !!(c.repo_base.trim() || c.claude_binary.trim() || c.kimi_binary.trim() ||
+       c.kimi_host_slug.trim() || c.self_repo_path.trim() || c.runbooks_dir.trim() ||
+       c.default_account.trim()) ||
+    c.accounts.length > 0 ||
+    c.routes.length > 0 ||
+    c.default_engine !== 'kimi' ||
+    c.tmux_session !== 'remote' ||
+    c.tmux_window_cap !== '10'
+  );
+}
+
 interface InfraFormData {
   name: string;
   kind: string;
@@ -31,6 +150,7 @@ interface InfraFormData {
   read_only: boolean;
   setup_command: string;
   setup_files: SetupFile[];
+  coding: CodingFormData;
 }
 
 const emptyForm: InfraFormData = {
@@ -50,6 +170,7 @@ const emptyForm: InfraFormData = {
   read_only: false,
   setup_command: '',
   setup_files: [],
+  coding: { ...emptyCoding },
 };
 
 function statusBadgeClass(status: string) {
@@ -311,6 +432,8 @@ export default function Infra() {
   const [formError, setFormError] = useState('');
   const [saving, setSaving] = useState(false);
 
+  const [showCoding, setShowCoding] = useState(false);
+  const [editingHadCoding, setEditingHadCoding] = useState(false);
   const [provisioningId, setProvisioningId] = useState<string | null>(null);
   const [provisionLogs, setProvisionLogs] = useState<Record<string, any[]>>({});
   const [expandedLogId, setExpandedLogId] = useState<string | null>(null);
@@ -331,7 +454,9 @@ export default function Infra() {
   const openCreate = () => {
     setEditingId(null);
     setEditingSecrets({ hasSshKey: false, hasKubeconfig: false, hasAuthEnv: false, hasAwsCredentials: false, hasGcpServiceAccount: false });
-    setForm({ ...emptyForm });
+    setForm({ ...emptyForm, coding: { ...emptyCoding } });
+    setShowCoding(false);
+    setEditingHadCoding(false);
     setFormError('');
     setShowForm(true);
   };
@@ -364,9 +489,16 @@ export default function Infra() {
       setup_files: Array.isArray(row.setup_files)
         ? row.setup_files.map((f: any) => ({ path: f.path || '', content: f.content || '', mode: f.mode || '' }))
         : [],
+      coding: codingFromRow(row.coding),
     });
+    setShowCoding(!!row.coding?.enabled);
+    setEditingHadCoding(!!row.coding && Object.keys(row.coding).length > 0);
     setFormError('');
     setShowForm(true);
+  };
+
+  const setCoding = (patch: Partial<CodingFormData>) => {
+    setForm(f => ({ ...f, coding: { ...f.coding, ...patch } }));
   };
 
   const addSetupFile = () => {
@@ -418,6 +550,12 @@ export default function Infra() {
       if (form.gcp_service_account_json.trim()) payload.gcp_service_account_json = form.gcp_service_account_json;
       if (form.docker_context.trim()) payload.docker_context = form.docker_context.trim();
       if (form.setup_command.trim()) payload.setup_command = form.setup_command.trim();
+      if (form.kind !== 'k8s' && (codingTouched(form.coding) || editingHadCoding)) {
+        if (form.coding.tmux_window_cap.trim() && Number.isNaN(Number(form.coding.tmux_window_cap))) {
+          setFormError('tmux window cap must be a number'); setSaving(false); return;
+        }
+        payload.coding = codingToPayload(form.coding);
+      }
       payload.setup_files = form.setup_files
         .filter(f => f.path.trim())
         .map(f => ({
@@ -620,6 +758,131 @@ export default function Infra() {
                 </label>
               </div>
 
+              {form.kind !== 'k8s' && (
+                <div className="card" style={{ marginBottom: '0.75rem', padding: '0.75rem' }}>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                    <strong>Coding agent (remote script)</strong>
+                    <button className="btn btn-sm" onClick={() => setShowCoding(v => !v)}>
+                      {showCoding ? 'Hide' : 'Configure'}
+                    </button>
+                  </div>
+                  <p className="meta" style={{ margin: '0.3rem 0 0' }}>
+                    Marks this entry as the host coding-CLI runs (kimi/claude) execute on.
+                    Uses this entry&apos;s SSH host/user/port and stored key — at most one entry can be enabled.
+                  </p>
+                  {showCoding && (
+                    <div style={{ marginTop: '0.6rem' }}>
+                      <div className="form-group">
+                        <label>
+                          <input
+                            type="checkbox"
+                            checked={form.coding.enabled}
+                            onChange={e => setCoding({ enabled: e.target.checked })}
+                            style={{ width: 'auto', marginRight: '0.4rem' }}
+                          />
+                          Enabled — this entry is the remote-script / coding host
+                        </label>
+                      </div>
+
+                      <div className="form-group">
+                        <label>Repo base (workspace root on the host)</label>
+                        <input value={form.coding.repo_base} onChange={e => setCoding({ repo_base: e.target.value })} placeholder="/home/deploy/Workspace" className="mono" />
+                      </div>
+
+                      <div className="form-row">
+                        <div className="form-group">
+                          <label>Claude binary path</label>
+                          <input value={form.coding.claude_binary} onChange={e => setCoding({ claude_binary: e.target.value })} placeholder="/usr/local/bin/claude" className="mono" />
+                        </div>
+                        <div className="form-group">
+                          <label>Kimi binary path</label>
+                          <input value={form.coding.kimi_binary} onChange={e => setCoding({ kimi_binary: e.target.value })} placeholder="/usr/local/bin/kimi" className="mono" />
+                        </div>
+                      </div>
+
+                      <div className="form-group">
+                        <label>Claude accounts (label &rarr; CLAUDE_CONFIG_DIR on the host)</label>
+                        {form.coding.accounts.map((a, idx) => (
+                          <div key={idx} style={{ display: 'flex', gap: '0.4rem', marginBottom: '0.35rem' }}>
+                            <input value={a.label} onChange={e => setCoding({ accounts: form.coding.accounts.map((x, i) => i === idx ? { ...x, label: e.target.value } : x) })} placeholder="label (e.g. personal)" style={{ maxWidth: 160 }} />
+                            <input value={a.config_dir} onChange={e => setCoding({ accounts: form.coding.accounts.map((x, i) => i === idx ? { ...x, config_dir: e.target.value } : x) })} placeholder="/home/deploy/.claude-personal" className="mono" style={{ flex: 1 }} />
+                            <button className="btn btn-sm btn-icon-danger" onClick={() => setCoding({ accounts: form.coding.accounts.filter((_, i) => i !== idx) })}>&times;</button>
+                          </div>
+                        ))}
+                        <button className="btn btn-sm" onClick={() => setCoding({ accounts: [...form.coding.accounts, { label: '', config_dir: '' }] })}>+ Add account</button>
+                      </div>
+
+                      <div className="form-group">
+                        <label>Default Claude account (fallback runs; empty = host default ~/.claude)</label>
+                        <select value={form.coding.default_account} onChange={e => setCoding({ default_account: e.target.value })}>
+                          <option value="">(host default)</option>
+                          {form.coding.accounts.filter(a => a.label.trim()).map(a => (
+                            <option key={a.label} value={a.label.trim()}>{a.label.trim()}</option>
+                          ))}
+                        </select>
+                      </div>
+
+                      <div className="form-group">
+                        <label>Org routing (GitHub org &rarr; engine + account)</label>
+                        {form.coding.routes.map((r, idx) => (
+                          <div key={idx} style={{ display: 'flex', gap: '0.4rem', marginBottom: '0.35rem' }}>
+                            <input value={r.org} onChange={e => setCoding({ routes: form.coding.routes.map((x, i) => i === idx ? { ...x, org: e.target.value } : x) })} placeholder="github-org" style={{ maxWidth: 160 }} />
+                            <select value={r.engine} onChange={e => setCoding({ routes: form.coding.routes.map((x, i) => i === idx ? { ...x, engine: e.target.value } : x) })}>
+                              <option value="claude">claude</option>
+                              <option value="kimi">kimi</option>
+                            </select>
+                            <select value={r.account} onChange={e => setCoding({ routes: form.coding.routes.map((x, i) => i === idx ? { ...x, account: e.target.value } : x) })} disabled={r.engine !== 'claude'}>
+                              <option value="">(default account)</option>
+                              {form.coding.accounts.filter(a => a.label.trim()).map(a => (
+                                <option key={a.label} value={a.label.trim()}>{a.label.trim()}</option>
+                              ))}
+                            </select>
+                            <button className="btn btn-sm btn-icon-danger" onClick={() => setCoding({ routes: form.coding.routes.filter((_, i) => i !== idx) })}>&times;</button>
+                          </div>
+                        ))}
+                        <button className="btn btn-sm" onClick={() => setCoding({ routes: [...form.coding.routes, { org: '', engine: 'claude', account: '' }] })}>+ Add routing rule</button>
+                      </div>
+
+                      <div className="form-row">
+                        <div className="form-group">
+                          <label>Default engine (unrouted orgs)</label>
+                          <select value={form.coding.default_engine} onChange={e => setCoding({ default_engine: e.target.value })}>
+                            <option value="kimi">kimi</option>
+                            <option value="claude">claude</option>
+                          </select>
+                        </div>
+                        <div className="form-group">
+                          <label>Kimi host (infra slug, optional)</label>
+                          <input value={form.coding.kimi_host_slug} onChange={e => setCoding({ kimi_host_slug: e.target.value })} placeholder="slug of another entry" className="mono" />
+                        </div>
+                      </div>
+
+                      <div className="form-row">
+                        <div className="form-group">
+                          <label>tmux session</label>
+                          <input value={form.coding.tmux_session} onChange={e => setCoding({ tmux_session: e.target.value })} placeholder="remote" className="mono" />
+                        </div>
+                        <div className="form-group">
+                          <label>tmux window cap</label>
+                          <input value={form.coding.tmux_window_cap} onChange={e => setCoding({ tmux_window_cap: e.target.value })} placeholder="10" />
+                        </div>
+                      </div>
+
+                      <div className="form-row">
+                        <div className="form-group">
+                          <label>AEGIS self-repo path (under repo base)</label>
+                          <input value={form.coding.self_repo_path} onChange={e => setCoding({ self_repo_path: e.target.value })} placeholder="personal/aegis" className="mono" />
+                        </div>
+                        <div className="form-group">
+                          <label>Runbooks dir (worker-local)</label>
+                          <input value={form.coding.runbooks_dir} onChange={e => setCoding({ runbooks_dir: e.target.value })} placeholder="/app/runbooks" className="mono" />
+                        </div>
+                      </div>
+                    </div>
+                  )}
+                </div>
+              )}
+
               <div className="form-group">
                 <label>Setup command (optional)</label>
                 <textarea rows={3} value={form.setup_command} onChange={e => setForm({ ...form, setup_command: e.target.value })} className="mono" placeholder="e.g. bash /opt/aegis/setup.sh" />
@@ -694,6 +957,7 @@ export default function Infra() {
                       {row.host}{row.ssh_port ? `:${row.ssh_port}` : ''}
                       {row.has_ssh_key && <span title="SSH key stored" style={{ marginLeft: 4 }}>&#128273;</span>}
                       {row.read_only && <span className="badge badge-neutral" title="Mutating operations blocked" style={{ marginLeft: 4 }}>read-only</span>}
+                      {row.coding?.enabled && <span className="badge badge-success" title="Remote-script / coding-agent host" style={{ marginLeft: 4 }}>coding host</span>}
                     </td>
                     <td>
                       <span className={statusBadgeClass(row.status)}>{row.status}</span>

@@ -6,14 +6,12 @@ before Gate 1 fires. Mute keys follow "<source>:<service>:<subkey>".
 
 from __future__ import annotations
 
-import asyncio
 import datetime as _dt
 import shlex
 from dataclasses import dataclass
 from typing import Any
 
 import structlog
-from aegis.connectors._subprocess import kill_and_wait
 from temporalio import activity
 
 logger = structlog.get_logger()
@@ -148,6 +146,8 @@ class AlertGovernanceActivities:
         rel_path = input.repo_path or (
             input.repo.rsplit("/", 1)[-1] if "/" in input.repo else input.repo
         )
+        # DB-first connector config may have changed since bootstrap.
+        await self.remote_script.ensure_config()
         repo_path = (
             f"{self.remote_script._repo_base}/{rel_path}"
             if self.remote_script._repo_base
@@ -155,37 +155,29 @@ class AlertGovernanceActivities:
         )
 
         # Push the branch kimi created locally so GitHub knows about it.
-        push_args = self.remote_script._ssh_args_host(
-            input.host or self.remote_script._host,
+        push = await self.remote_script.run_on_host(
+            input.host,
             f"cd {shlex.quote(repo_path)} && git push -u origin {shlex.quote(branch)}",
+            timeout=60,
         )
-        proc = await asyncio.create_subprocess_exec(
-            *push_args,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        try:
-            _, push_err = await asyncio.wait_for(proc.communicate(), timeout=60)
-            if proc.returncode != 0:
-                err_msg = push_err.decode()[:500]
-                activity.logger.warning(
-                    f"create_github_pr_push_failed repo={input.repo} error={err_msg}"
+        if push["exit_code"] == -1:  # ssh error/timeout
+            activity.logger.error(f"create_github_pr_push_error error={push['stderr']}")
+            return {"pr_url": "", "status": "failed", "error": push["stderr"][:300]}
+        if push["exit_code"] != 0:
+            err_msg = push["stderr"][:500]
+            activity.logger.warning(
+                f"create_github_pr_push_failed repo={input.repo} error={err_msg}"
+            )
+            async with self.db_pool.acquire() as conn:
+                await conn.execute(
+                    "UPDATE pending_prs SET status = 'failed' WHERE id = $1",
+                    input.pending_pr_id,
                 )
-                async with self.db_pool.acquire() as conn:
-                    await conn.execute(
-                        "UPDATE pending_prs SET status = 'failed' WHERE id = $1",
-                        input.pending_pr_id,
-                    )
-                return {
-                    "pr_url": "",
-                    "status": "failed",
-                    "error": f"git push failed: {err_msg}",
-                }
-        except Exception as exc:
-            activity.logger.error(f"create_github_pr_push_error error={exc}")
-            return {"pr_url": "", "status": "failed", "error": str(exc)[:300]}
-        finally:
-            await kill_and_wait(proc)
+            return {
+                "pr_url": "",
+                "status": "failed",
+                "error": f"git push failed: {err_msg}",
+            }
 
         pr_cmd = (
             f"cd {shlex.quote(repo_path)} && "
@@ -197,22 +189,13 @@ class AlertGovernanceActivities:
             f"--body {shlex.quote(body[:4000])} "
             f"--draft"
         )
-        ssh_args = self.remote_script._ssh_args_host(input.host or self.remote_script._host, pr_cmd)
-        proc = await asyncio.create_subprocess_exec(
-            *ssh_args,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        try:
-            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=60)
-        except Exception as exc:
-            activity.logger.error(f"create_github_pr_error error={exc}")
-            return {"pr_url": "", "status": "failed", "error": str(exc)[:300]}
-        finally:
-            await kill_and_wait(proc)
+        pr = await self.remote_script.run_on_host(input.host, pr_cmd, timeout=60)
+        if pr["exit_code"] == -1:  # ssh error/timeout
+            activity.logger.error(f"create_github_pr_error error={pr['stderr']}")
+            return {"pr_url": "", "status": "failed", "error": pr["stderr"][:300]}
 
-        if proc.returncode != 0:
-            err_msg = stderr.decode()[:500]
+        if pr["exit_code"] != 0:
+            err_msg = pr["stderr"][:500]
             activity.logger.warning(f"create_github_pr_failed repo={input.repo} error={err_msg}")
             async with self.db_pool.acquire() as conn:
                 await conn.execute(
@@ -221,7 +204,7 @@ class AlertGovernanceActivities:
                 )
             return {"pr_url": "", "status": "failed", "error": err_msg}
 
-        pr_url = stdout.decode().strip().splitlines()[-1].strip() if stdout else ""
+        pr_url = pr["stdout"].strip().splitlines()[-1].strip() if pr["stdout"] else ""
         async with self.db_pool.acquire() as conn:
             await conn.execute(
                 "UPDATE pending_prs SET status = 'opened', pr_url = $2 WHERE id = $1",

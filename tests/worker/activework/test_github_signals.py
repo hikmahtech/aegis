@@ -19,11 +19,11 @@ class _FakeConnector:
     async def _resolve_kimi_host(self):
         return ("node-b", True)
 
-    def _ssh_args_host(self, host, cmd):
-        self.last_cmd = cmd
-        return ["ssh", host, cmd]
+    async def ensure_config(self):
+        pass
 
-    async def _run_capture(self, ssh_args, timeout):
+    async def run_on_host(self, host, cmd, timeout=30, stdin=None):
+        self.last_cmd = cmd
         return self._capture_result
 
 

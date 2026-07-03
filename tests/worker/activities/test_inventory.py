@@ -40,6 +40,9 @@ class FakeRemoteScript:
     def workspace_scan_host(self):
         return self._scan_host
 
+    async def ensure_config(self):
+        pass
+
     async def list_workspace_repos(self, host=""):
         if isinstance(self._scan, Exception):
             raise self._scan

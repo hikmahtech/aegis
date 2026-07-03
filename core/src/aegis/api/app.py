@@ -115,24 +115,34 @@ async def lifespan(app: FastAPI):
     )
     app.state.vercel_connector = vercel_connector
 
-    # Remote script connector (SSH to node-a — used by infra chat tools)
-    remote_script_connector = None
-    if settings.remote_script_host:
-        from aegis.connectors.remote_script import RemoteScriptConnector
+    # Remote script connector (SSH to the coding host — used by infra chat
+    # tools and coding-agent runs). Config is DB-first: an infra registry row
+    # with coding.enabled overrides the env settings at call time, so the
+    # connector is always constructed (env values are the fallback).
+    from aegis.connectors.remote_script import RemoteScriptConnector
 
-        remote_script_connector = RemoteScriptConnector(
-            host=settings.remote_script_host,
-            user=settings.remote_script_user,
-            key_file=settings.remote_script_key_file,
-            repo_base=settings.remote_script_repo_base,
-            known_hosts=getattr(settings, "remote_script_known_hosts", None),
-            kimi_host=getattr(settings, "remote_script_kimi_host", ""),
-            tmux_session=getattr(settings, "remote_script_tmux_session", "remote"),
-            tmux_window_cap=getattr(settings, "remote_script_tmux_window_cap", 10),
-            claude_orgs=getattr(settings, "remote_script_claude_orgs", ""),
-            claude_binary=getattr(settings, "claude_cli_binary_path", ""),
-        )
-        logger.info("remote_script_connector_ready", host=settings.remote_script_host)
+    remote_script_connector = RemoteScriptConnector(
+        host=settings.remote_script_host,
+        user=settings.remote_script_user,
+        key_file=settings.remote_script_key_file,
+        repo_base=settings.remote_script_repo_base,
+        known_hosts=getattr(settings, "remote_script_known_hosts", None),
+        kimi_host=getattr(settings, "remote_script_kimi_host", ""),
+        tmux_session=getattr(settings, "remote_script_tmux_session", "remote"),
+        tmux_window_cap=getattr(settings, "remote_script_tmux_window_cap", 10),
+        claude_orgs=getattr(settings, "remote_script_claude_orgs", ""),
+        claude_binary=getattr(settings, "claude_cli_binary_path", ""),
+        kimi_binary=getattr(settings, "kimi_cli_binary_path", ""),
+        self_repo_path=getattr(settings, "aegis_self_repo_path", ""),
+        runbooks_dir=getattr(settings, "runbooks_dir", ""),
+        db_pool=pool,
+        secret_key=settings.secret_key,
+    )
+    logger.info(
+        "remote_script_connector_ready",
+        env_host=settings.remote_script_host or None,
+        db_first=True,
+    )
     app.state.remote_script_connector = remote_script_connector
 
     mcp_manager = MCPManager(server_configs=settings.mcp_servers or {})

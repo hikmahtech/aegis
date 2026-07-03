@@ -159,6 +159,9 @@ class InventoryActivities:
         """
         if not self.remote_script:
             raise RuntimeError("remote_script connector not configured")
+        # DB-first config: refresh before comparing hosts (they may have been
+        # edited on the admin Infra page since the last call).
+        await self.remote_script.ensure_config()
         if self.remote_script.workspace_scan_host() == self.remote_script._host:
             return {"skipped": "canonical host is base host", "present": 0, "cloned": 0}
 

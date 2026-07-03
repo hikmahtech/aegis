@@ -1545,8 +1545,16 @@ async def _exec_aegis_self_diagnose(pool: asyncpg.Pool, args: dict, ctx: ToolCon
         return json.dumps({"error": "settings not threaded into ToolContext"})
 
     settings = ctx.settings
-    repo = settings.aegis_self_repo_path or "personal/aegis"
-    kimi_binary = settings.kimi_cli_binary_path
+    # DB-first coding config (infra registry row with coding.enabled) wins over
+    # env settings; the try/except keeps plain test doubles (MagicMock
+    # connectors without an awaitable coding_settings) working.
+    coding: dict = {}
+    try:
+        coding = await ctx.remote_script_connector.coding_settings()
+    except Exception:  # noqa: BLE001 — connector without the accessor
+        coding = {}
+    repo = coding.get("self_repo_path") or settings.aegis_self_repo_path or "personal/aegis"
+    kimi_binary = coding.get("kimi_binary") or settings.kimi_cli_binary_path
     fix_branch = f"aegis-fix/{_slugify_issue(issue)}"
     prompt = _build_aegis_self_diagnose_prompt(issue, mode, fix_branch)
 

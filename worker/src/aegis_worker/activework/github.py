@@ -24,6 +24,7 @@ def _parse_ts(ts: str) -> datetime:
 
 async def _host_for(connector, repo: str) -> str:
     """Pick the host whose gh auth covers this repo's org."""
+    await connector.ensure_config()  # DB-first config may have changed the hosts
     if connector._engine_for(repo) == "claude":
         return connector._host
     host, _ = await connector._resolve_kimi_host()
@@ -36,8 +37,7 @@ async def _gh(connector, repo: str, cmd: str) -> list | None:
         return None
     try:
         host = await _host_for(connector, repo)
-        ssh_args = connector._ssh_args_host(host, cmd)
-        result = await connector._run_capture(ssh_args, _TIMEOUT)
+        result = await connector.run_on_host(host, cmd, timeout=_TIMEOUT)
         if result.get("status") != "succeeded":
             logger.warning("activework_gh_failed repo=%s status=%s", repo, result.get("status"))
             return None

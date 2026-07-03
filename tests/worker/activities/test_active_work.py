@@ -17,20 +17,18 @@ class _FakeConnector:
     async def _resolve_kimi_host(self):
         return ("node-b", True)
 
-    def _ssh_args_host(self, host, cmd):
-        self._last = cmd
-        return ["ssh", host, cmd]
+    async def ensure_config(self):
+        pass
 
-    async def _run_capture(self, ssh_args, timeout):
-        cmd = self._last
+    async def run_on_host(self, host, cmd, timeout=30, stdin=None):
         stdout = self._prs_json if "gh pr list" in cmd else self._events_json
         return {"status": "succeeded", "exit_code": 0, "stdout": stdout, "stderr": ""}
 
 
 class _RaisingConnector(_FakeConnector):
-    """A connector whose _run_capture always raises, simulating a GitHub collector failure."""
+    """A connector whose run_on_host always raises, simulating a GitHub collector failure."""
 
-    async def _run_capture(self, ssh_args, timeout):
+    async def run_on_host(self, host, cmd, timeout=30, stdin=None):
         raise RuntimeError("simulated gh failure")
 
 

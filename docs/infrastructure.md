@@ -215,6 +215,64 @@ kubectl config view --minify --flatten --context=<gke-ctx> > /tmp/aegis-kubeconf
 # 4. Provision → "N node(s) reachable"
 ```
 
+## Remote script / coding agents
+
+The remote-script subsystem (chat's `run_script` infra tools, coding-CLI runs
+via kimi/claude, workspace scans/mirrors, `gh pr create`) SSHes into one
+designated host. That host is configured **from the admin UI**: any
+`ssh_host`/`swarm`/`docker` entry has a collapsible **Coding agent (remote
+script)** section, and the entry whose **Enabled** box is checked becomes the
+remote-script host (the service layer enforces at most one). The
+`RemoteScriptConnector` re-reads this configuration every ~30 s, so edits
+apply without restarting core or the worker.
+
+**SSH identity** comes from the entry itself: host, SSH user/port, and the
+pasted (encrypted) **SSH private key** — decrypted and materialized to a
+mode-0600 temp file per SSH invocation and deleted immediately after, exactly
+like the kubeconfig/cloud credentials. No key file needs to live on any
+volume. (`ssh_key_ref` still works as a bring-your-own-file fallback when no
+key is pasted.)
+
+### How-to: register the coding host
+
+1. Create/edit the infra entry for the machine where your repos live
+   (kind `ssh_host`), paste its SSH private key, and **Provision** to verify
+   connectivity.
+2. Open **Coding agent (remote script)** → **Configure** and fill in:
+   - **Enabled** — makes this entry the remote-script host.
+   - **Repo base** — the workspace root the fixed checkouts live under
+     (e.g. `/home/deploy/Workspace`; repos are addressed as paths under it,
+     like `acme/bcp`).
+   - **Engine binary paths** — `claude` and/or `kimi` CLI paths on the host.
+   - **Claude accounts** — named `CLAUDE_CONFIG_DIR`s for multiple Claude
+     logins on the same host (e.g. `work → /home/deploy/.claude-work`,
+     `personal → /home/deploy/.claude-personal`). **Default Claude account**
+     is used by fallback (`engine_override`) runs; empty means the host's
+     default `~/.claude`.
+   - **Org routing** — rows of GitHub org → engine (+ account for claude).
+     A repo whose org matches runs on that engine/account; everything else
+     uses the **Default engine** (usually `kimi`). This replaces the old
+     `AEGIS_REMOTE_SCRIPT_CLAUDE_ORGS` csv.
+   - **tmux session / window cap** — live-attachable windows for agent runs.
+   - **Kimi host (infra slug)** — optional: the slug of *another* infra entry
+     whose machine runs kimi jobs (the canonical workspace host). It is
+     probed before each run and **fails closed** to the base host when
+     unreachable. Leave empty to run kimi on the base host.
+   - **AEGIS self-repo path** / **Runbooks dir** — used by the
+     `aegis_self_diagnose` chat tool and alert runbooks; usually fine left
+     empty (env/image defaults apply).
+3. Save. The entry shows a **coding host** badge; runs pick the config up
+   within ~30 s.
+
+### Env fallback
+
+When **no** entry has the coding block enabled, the connector behaves exactly
+as before using the `AEGIS_REMOTE_SCRIPT_*` / `AEGIS_KIMI_CLI_BINARY_PATH` /
+`AEGIS_CLAUDE_CLI_BINARY_PATH` env settings (including the env key-file path)
+— existing deployments keep working unchanged. Once you enable a row, the row
+wins wholesale for the SSH identity and coding settings; disable it to fall
+back to env again.
+
 ## Chat
 
 Pandora's infra tools work against registry clusters by slug:
