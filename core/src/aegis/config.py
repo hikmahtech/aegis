@@ -149,6 +149,11 @@ class Settings(BaseSettings):
     aegis_self_repo_path: str = "aegis"
     # Per-alert runbook directory — baked into the worker image at /app/runbooks.
     runbooks_dir: str = "/app/runbooks"
+    # Swarm stack name AEGIS itself is deployed as. The System Monitoring page
+    # filters `docker service ls` to this stack (com.docker.stack.namespace
+    # label) so it shows AEGIS's own services, not every stack on the swarm.
+    # Blank = no filter (show all services). Editable from the admin UI.
+    aegis_stack_name: str = "aegis"
 
     # Knowledge subsystem (native pgvector — no external service).
     # embedding_model must be served by litellm_url's /embeddings; its vector dim

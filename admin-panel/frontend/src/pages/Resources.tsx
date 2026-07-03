@@ -18,6 +18,8 @@ interface ResourceFormData {
   url: string;
   content: string;
   tags: string;
+  workspace_path: string;
+  github_repo: string;
   metadata: string;
   infra_id: string;
 }
@@ -29,6 +31,8 @@ const emptyForm: ResourceFormData = {
   url: '',
   content: '',
   tags: '',
+  workspace_path: '',
+  github_repo: '',
   metadata: '{}',
   infra_id: '',
 };
@@ -76,6 +80,9 @@ export default function Resources() {
 
   const openEdit = (r: any) => {
     setEditingId(r.id);
+    // path + github_repo are edited via their own fields; keep the rest in the
+    // raw "additional metadata" box so both aren't editable in two places.
+    const { path, github_repo, ...restMeta } = r.metadata || {};
     setForm({
       kind: r.kind || 'repository',
       slug: r.slug || '',
@@ -83,7 +90,9 @@ export default function Resources() {
       url: r.url || '',
       content: r.content || '',
       tags: (r.tags || []).join(', '),
-      metadata: JSON.stringify(r.metadata || {}, null, 2),
+      workspace_path: path || '',
+      github_repo: github_repo || '',
+      metadata: JSON.stringify(restMeta, null, 2),
       infra_id: r.infra_id || '',
     });
     setShowForm(true);
@@ -93,14 +102,18 @@ export default function Resources() {
   const handleSave = async () => {
     if (!form.title.trim()) { setError('Title is required'); return; }
     if (!form.slug.trim()) { setError('Slug is required'); return; }
-    let meta = {};
+    let meta: Record<string, any> = {};
     let tags: string[] = [];
     try { meta = JSON.parse(form.metadata || '{}'); } catch { setError('Invalid JSON in metadata'); return; }
+    // Merge the first-class coding-agent fields back into metadata.
+    if (form.workspace_path.trim()) meta.path = form.workspace_path.trim();
+    if (form.github_repo.trim()) meta.github_repo = form.github_repo.trim();
     tags = form.tags.split(',').map(t => t.trim()).filter(Boolean);
     setSaving(true);
     setError('');
     try {
-      const payload = { ...form, tags, metadata: meta, infra_id: form.infra_id || null };
+      const { workspace_path, github_repo, ...rest } = form;
+      const payload = { ...rest, tags, metadata: meta, infra_id: form.infra_id || null };
       if (editingId) {
         await api.updateResource(editingId, payload);
       } else {
@@ -185,6 +198,20 @@ export default function Resources() {
                   {infra.map(i => <option key={i.id} value={i.id}>{i.name} ({i.kind})</option>)}
                 </select>
               </div>
+              {form.kind === 'repository' && (
+                <div className="form-row">
+                  <div className="form-group">
+                    <label>Workspace path</label>
+                    <input value={form.workspace_path} onChange={e => setForm({ ...form, workspace_path: e.target.value })} placeholder="dir under repo base, e.g. aegis" className="mono" />
+                    <p className="meta" style={{ margin: '0.25rem 0 0' }}>Where the coding agent (claude/kimi) checks out & runs, relative to the coding host&apos;s repo base.</p>
+                  </div>
+                  <div className="form-group">
+                    <label>GitHub repo</label>
+                    <input value={form.github_repo} onChange={e => setForm({ ...form, github_repo: e.target.value })} placeholder="owner/repo" className="mono" />
+                    <p className="meta" style={{ margin: '0.25rem 0 0' }}>Drives engine routing (which org → claude/kimi) and alert-investigation repo matching.</p>
+                  </div>
+                </div>
+              )}
               <div className="form-group">
                 <label>Tags (comma-separated)</label>
                 <input value={form.tags} onChange={e => setForm({ ...form, tags: e.target.value })} placeholder="aegis, python, pandoras-actor" />
@@ -194,8 +221,8 @@ export default function Resources() {
                 <textarea rows={4} value={form.content} onChange={e => setForm({ ...form, content: e.target.value })} placeholder="Runbook steps, description..." />
               </div>
               <div className="form-group">
-                <label>Metadata (JSON)</label>
-                <textarea rows={4} value={form.metadata} onChange={e => setForm({ ...form, metadata: e.target.value })} className="mono" placeholder='{"path": "aegis", "github_repo": "youruser/aegis"}' />
+                <label>Additional metadata (JSON)</label>
+                <textarea rows={3} value={form.metadata} onChange={e => setForm({ ...form, metadata: e.target.value })} className="mono" placeholder='{"branch": "main"}' />
               </div>
             </div>
             <div className="modal-footer">
