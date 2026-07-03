@@ -18,8 +18,6 @@ def settings():
         admin_username="admin",
         admin_password="admin",
         api_key="test-key",
-        homelab_dagster_graphql_url="http://dagster.test/graphql",
-        homelab_traefik_api_url="http://traefik.test/api",
         homelab_public_domains=["example.com", "api.example.com"],
     )
 
@@ -56,7 +54,7 @@ def client(app):
 
 
 def test_homelab_state_returns_latest_rows(app, client):
-    """GET /state calls all four tables and returns them in the response body."""
+    """GET /state queries the drift + cert tables and returns them in the body."""
     # The conn mock is the one injected via _make_pool; get it from state.
     # We re-create a fresh pool with a conn that returns our test data.
     conn = AsyncMock()
@@ -75,10 +73,6 @@ def test_homelab_state_returns_latest_rows(app, client):
                     "actual": "{}",
                 }
             ],
-            # backups
-            [],
-            # schedules
-            [],
             # certs
             [
                 {
@@ -102,8 +96,8 @@ def test_homelab_state_returns_latest_rows(app, client):
     assert body["drift"][0]["service_name"] == "aegis_core"
     assert len(body["certs"]) == 1
     assert body["certs"][0]["domain"] == "example.com"
-    assert "backups" in body
-    assert "schedules" in body
+    assert "backups" not in body
+    assert "schedules" not in body
 
 
 def test_homelab_trigger_run_queues_workflow(app, client, monkeypatch):

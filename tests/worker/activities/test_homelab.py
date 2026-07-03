@@ -1,12 +1,4 @@
 # tests/worker/activities/test_homelab.py
-#
-# NOTE: Phase 1 of v3 reshaped `pandoras_actor.homelab_drift` and
-# `pandoras_actor.backup_health` (dropped alert_key, service_name,
-# drift_type, backup_set — replaced with service/observed/severity/series).
-# DB-bound tests (audit_backup_set_groups_by_series,
-# persist_drift_idempotent_on_alert_key) were deleted; they will be
-# reintroduced in Phase 3/4 alongside the rewritten HomelabActivities.
-import time
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -85,23 +77,11 @@ async def test_notify_payloads_validate_against_delivery_request_schema():
             "severity": "critical",
         }
     )
-    await act.notify_schedule_issue(
-        {
-            "source": "dagster",
-            "name": "equities_pipeline",
-            "expected": "RUNNING",
-            "actual": "STOPPED",
-            "consecutive_failures": 3,
-        }
-    )
     await act.notify_cert_alert(
         {"domain": "example.com", "threshold": 7, "days": 5, "not_after": "2026-06-01T00:00:00"}
     )
-    await act.notify_backup_issue(
-        {"backup_set": "postgresql/db", "error": "no backups", "stale": True}
-    )
 
-    assert len(captured_bodies) == 4
+    assert len(captured_bodies) == 2
     for body in captured_bodies:
         DeliveryRequest.model_validate(body)
 
@@ -118,53 +98,6 @@ def _audit_pool(prev_size=None):
     pool = MagicMock()
     pool.acquire = MagicMock(return_value=ctx)  # asyncpg: acquire() sync-returns an async CM
     return pool, conn
-
-
-@pytest.mark.asyncio
-async def test_audit_backup_set_looks_in_daily_and_passes_when_fresh():
-    homelab = AsyncMock()
-    homelab.list_backups.return_value = {
-        "ok": True,
-        "data": [
-            {"name": "postgres_all_databases.sql", "size_bytes": 1000, "mtime_epoch": time.time() - 3600},
-            {"name": "postgres_db_umami.dump", "size_bytes": 200, "mtime_epoch": time.time() - 1800},
-        ],
-    }
-    pool, conn = _audit_pool(prev_size=None)
-    act = HomelabActivities(db_pool=pool, homelab=homelab, delivery=None)
-    out = await act.audit_backup_set("postgresql", "/nfs/swarm-backups")
-    # freshness is checked under <set>/daily, not the set root
-    homelab.list_backups.assert_awaited_once_with("/nfs/swarm-backups/postgresql/daily")
-    assert len(out) == 1
-    s = out[0]
-    assert s["backup_set"] == "postgresql"
-    assert s["stale"] is False
-    assert s["size_bytes"] == 1200  # summed across the set
-    conn.execute.assert_awaited()  # health row recorded
-
-
-@pytest.mark.asyncio
-async def test_audit_backup_set_stale_when_newest_is_old():
-    homelab = AsyncMock()
-    homelab.list_backups.return_value = {
-        "ok": True,
-        # clickhouse-style nested per-table file, 40h old
-        "data": [{"name": "trading_system/corp_actions.native", "size_bytes": 10, "mtime_epoch": time.time() - 40 * 3600}],
-    }
-    pool, _ = _audit_pool()
-    act = HomelabActivities(db_pool=pool, homelab=homelab, delivery=None)
-    out = await act.audit_backup_set("clickhouse", "/nfs/swarm-backups")
-    assert out[0]["stale"] is True
-
-
-@pytest.mark.asyncio
-async def test_audit_backup_set_no_backups_is_stale():
-    homelab = AsyncMock()
-    homelab.list_backups.return_value = {"ok": True, "data": []}
-    act = HomelabActivities(db_pool=AsyncMock(), homelab=homelab, delivery=None)
-    out = await act.audit_backup_set("clickhouse", "/nfs/swarm-backups")
-    assert out[0]["stale"] is True
-    assert out[0]["error"] == "no backups"
 
 
 @pytest.mark.asyncio

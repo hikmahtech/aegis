@@ -78,41 +78,44 @@ def test_homelab_settings_defaults(monkeypatch):
     monkeypatch.setenv("AEGIS_TEMPORAL_UI_URL", "http://x")
     monkeypatch.setenv("AEGIS_ADMIN_USERNAME", "u")
     monkeypatch.setenv("AEGIS_ADMIN_PASSWORD", "p")
-    monkeypatch.setenv("AEGIS_HOMELAB_DAGSTER_GRAPHQL_URL", "http://d/g")
-    monkeypatch.setenv("AEGIS_HOMELAB_TRAEFIK_API_URL", "http://t:8080")
     monkeypatch.setenv("AEGIS_HOMELAB_PUBLIC_DOMAINS", "a.example.com,b.example.com")
 
     s = Settings()
-    # homelab_enabled defaults to False — operators must opt in after
-    # configuring the 4 URL/key env vars.
+    # homelab_enabled defaults to False — operators must opt in.
     assert s.homelab_enabled is False
     assert s.homelab_docker_context == ""
-    assert s.homelab_restore_drill_host == ""
     assert s.homelab_public_domains == ["a.example.com", "b.example.com"]
-    assert s.homelab_dagster_graphql_url == "http://d/g"
+
+
+def test_homelab_probe_fields_deleted():
+    """The owner-specific monitoring probes (Dagster GraphQL, Traefik API,
+    NFS backup audit + restore drill) were stripped for OSS — their config
+    knobs must no longer exist. Docker-swarm ops + cert radar stay."""
+    s = Settings(**_REQUIRED)
+    for gone in (
+        "homelab_nfs_base_path",
+        "homelab_dagster_graphql_url",
+        "homelab_traefik_api_url",
+        "homelab_restore_drill_host",
+        "homelab_restore_drill_disk_min_gb",
+        "homelab_drift_sustained_minutes",
+        "chat_auto_extract_enabled",
+        "money_hygiene_haiku_batch",
+        "money_hygiene_cancellation_threshold_multiplier",
+        "money_hygiene_alert_thresholds_days",
+    ):
+        assert not hasattr(s, gone), f"{gone} should have been deleted"
 
 
 def test_money_hygiene_settings_defaults():
     """Money Hygiene settings load with the spec'd defaults."""
     s = Settings(**_REQUIRED)
     assert s.money_hygiene_enabled is False
-    assert s.money_hygiene_haiku_batch == 10
     assert "USD" in s.money_hygiene_inr_fallback_rates
     assert s.money_hygiene_inr_fallback_rates["USD"] == 84.5
     assert s.money_hygiene_inr_fallback_rates["EUR"] == 92.0
     assert s.money_hygiene_inr_fallback_rates["GBP"] == 108.0
     assert s.money_hygiene_inr_fallback_rates["SGD"] == 63.0
-    assert s.money_hygiene_alert_thresholds_days == [30, 14, 7, 0]
-    assert s.money_hygiene_cancellation_threshold_multiplier == 2.0
-
-
-def test_money_hygiene_alert_thresholds_days_comma_env(monkeypatch):
-    """AEGIS_MONEY_HYGIENE_ALERT_THRESHOLDS_DAYS accepts comma-separated env."""
-    for k, v in _REQUIRED.items():
-        monkeypatch.setenv(f"AEGIS_{k.upper()}", v)
-    monkeypatch.setenv("AEGIS_MONEY_HYGIENE_ALERT_THRESHOLDS_DAYS", "60,30,7")
-    s = Settings()
-    assert s.money_hygiene_alert_thresholds_days == [60, 30, 7]
 
 
 def test_comma_separated_list_fields_parse_from_env(monkeypatch):
@@ -120,16 +123,13 @@ def test_comma_separated_list_fields_parse_from_env(monkeypatch):
 
     Regression guard for the config.py change that replaced the bespoke
     _CustomEnvSource with NoDecode + the model_validator(mode="before")
-    splitters. Both list fields must parse plain comma-separated env
-    strings — feeding JSON-list strings here would raise.
+    splitter — feeding JSON-list strings here would raise.
     """
     for k, v in _REQUIRED.items():
         monkeypatch.setenv(f"AEGIS_{k.upper()}", v)
     monkeypatch.setenv("AEGIS_HOMELAB_PUBLIC_DOMAINS", "a.com,b.com, c.com")
-    monkeypatch.setenv("AEGIS_MONEY_HYGIENE_ALERT_THRESHOLDS_DAYS", "30,14, 7,0")
     s = Settings()
     assert s.homelab_public_domains == ["a.com", "b.com", "c.com"]
-    assert s.money_hygiene_alert_thresholds_days == [30, 14, 7, 0]
 
 
 def test_settings_default_todoist_fields_empty(monkeypatch):

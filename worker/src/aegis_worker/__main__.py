@@ -46,7 +46,6 @@ from aegis_worker.activities.todoist import TodoistActivities
 from aegis_worker.bootstrap import bootstrap
 from aegis_worker.flows.agent_chat_reply import AgentChatReplyFlow
 from aegis_worker.flows.alert_investigation import AlertInvestigationFlow
-from aegis_worker.flows.backup_audit import BackupAuditFlow
 from aegis_worker.flows.calendar_ingest import CalendarIngestFlow
 from aegis_worker.flows.cert_radar import CertRadarFlow
 from aegis_worker.flows.clarify import ClarifyFlow
@@ -65,7 +64,6 @@ from aegis_worker.flows.raindrop_ingest import RaindropIngestFlow
 from aegis_worker.flows.receipt_ingest import ReceiptIngestFlow
 from aegis_worker.flows.review import DailyReviewFlow, WeeklyReviewFlow
 from aegis_worker.flows.rss_ingest import RssIngestFlow
-from aegis_worker.flows.schedule_health import ScheduleHealthFlow
 from aegis_worker.flows.sentry_poll import SentryPollFlow
 from aegis_worker.flows.service_drift import ServiceDriftFlow
 from aegis_worker.flows.social_publish import SocialPublishFlow
@@ -557,14 +555,8 @@ async def main():
             homelab_act.check_comms_inbound_health,
             homelab_act.alert_comms_inbound_down,
             homelab_act.collect_services,
-            homelab_act.collect_schedules,
-            homelab_act.upsert_schedule_health,
-            homelab_act.notify_schedule_issue,
             homelab_act.probe_and_upsert_cert,
             homelab_act.notify_cert_alert,
-            homelab_act.audit_backup_set,
-            homelab_act.notify_backup_issue,
-            homelab_act.run_restore_drill,
         ]
 
     if money_act:
@@ -609,9 +601,7 @@ async def main():
     if settings.homelab_enabled:
         workflows += [
             ServiceDriftFlow,
-            ScheduleHealthFlow,
             CertRadarFlow,
-            BackupAuditFlow,
             DeliveryWatchdogFlow,
         ]
 

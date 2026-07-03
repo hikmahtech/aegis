@@ -3,21 +3,12 @@ import json
 from unittest.mock import AsyncMock, patch
 
 import pytest
-import respx
 from aegis.connectors.homelab import HomelabConnector
-from httpx import AsyncClient, Response
 
 
 @pytest.mark.asyncio
 async def test_list_services_returns_envelope():
-    conn = HomelabConnector(
-        docker_context="swarm",
-        dagster_graphql_url="http://d/g",
-        traefik_api_url="http://t:8080",
-        ssh_host="",
-        ssh_user="deploy",
-        ssh_key_file="/x",
-    )
+    conn = HomelabConnector(docker_context="swarm")
     fake_stdout = (
         json.dumps(
             {
@@ -44,14 +35,7 @@ async def test_list_services_returns_envelope():
 
 @pytest.mark.asyncio
 async def test_list_services_failure_retryable():
-    conn = HomelabConnector(
-        docker_context="x",
-        dagster_graphql_url="",
-        traefik_api_url="",
-        ssh_host="",
-        ssh_user="",
-        ssh_key_file="",
-    )
+    conn = HomelabConnector(docker_context="x")
     with patch("aegis.connectors.homelab.asyncio.create_subprocess_exec") as m:
         proc = AsyncMock()
         proc.communicate.return_value = (b"", b"context not found")
@@ -63,60 +47,8 @@ async def test_list_services_failure_retryable():
 
 
 @pytest.mark.asyncio
-@respx.mock
-async def test_list_dagster_schedules_parses_status():
-    respx.post("http://d/g").mock(
-        return_value=Response(
-            200,
-            json={
-                "data": {
-                    "schedulesOrError": {
-                        "results": [
-                            {
-                                "name": "daily_credibility_scores",
-                                "scheduleState": {"status": "STOPPED"},
-                                "ticks": [{"timestamp": 1712000000, "status": "SUCCESS"}],
-                            },
-                            {
-                                "name": "nightly_pipeline",
-                                "scheduleState": {"status": "RUNNING"},
-                                "ticks": [{"timestamp": 1712100000, "status": "FAILURE"}],
-                            },
-                        ]
-                    }
-                }
-            },
-        )
-    )
-    async with AsyncClient() as client:
-        conn = HomelabConnector(
-            docker_context="x",
-            dagster_graphql_url="http://d/g",
-            traefik_api_url="",
-            ssh_host="",
-            ssh_user="",
-            ssh_key_file="",
-            http_client=client,
-        )
-        env = await conn.list_dagster_schedules()
-    assert env["ok"] is True
-    names = [s["name"] for s in env["data"]]
-    assert "daily_credibility_scores" in names
-    stopped = next(s for s in env["data"] if s["name"] == "daily_credibility_scores")
-    assert stopped["status"] == "STOPPED"
-    assert stopped["last_run_ok"] is True
-
-
-@pytest.mark.asyncio
 async def test_tls_probe_parses_expiry():
-    conn = HomelabConnector(
-        docker_context="x",
-        dagster_graphql_url="",
-        traefik_api_url="",
-        ssh_host="",
-        ssh_user="",
-        ssh_key_file="",
-    )
+    conn = HomelabConnector(docker_context="x")
     fake = b"notAfter=Nov 15 12:34:56 2026 GMT\nserial=0123456789ABCDEF\n"
     with patch("aegis.connectors.homelab.asyncio.create_subprocess_exec") as m:
         proc = AsyncMock()

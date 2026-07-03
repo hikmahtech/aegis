@@ -19,9 +19,7 @@ router = APIRouter(
 
 _FLOW_NAMES = {
     "service_drift": "ServiceDriftFlow",
-    "schedule_health": "ScheduleHealthFlow",
     "cert_radar": "CertRadarFlow",
-    "backup_audit": "BackupAuditFlow",
 }
 
 
@@ -34,30 +32,19 @@ def _default_cfg(flow: str, settings: Settings) -> dict:
 
 
 async def _start_workflow(flow: str, cfg: dict, temporal_client: TemporalClient):
-    # All 4 Config dataclasses have full defaults — passing {} is safe.
+    # Both Config dataclasses have full defaults — passing {} is safe.
     return await start_named_workflow(flow, cfg, temporal_client, _FLOW_NAMES)
 
 
 @router.get("/state")
 async def homelab_state(request: Request) -> dict:
-    """Return latest rows from the four homelab monitoring tables."""
+    """Return latest rows from the homelab monitoring tables."""
     pool = request.app.state.db_pool
     async with pool.acquire() as conn:
         drift = await conn.fetch(
             "SELECT id, service_name, stack_name, drift_type, severity, "
             "detected_at, resolved_at, actual "
             "FROM pandoras_actor.homelab_drift ORDER BY detected_at DESC LIMIT 50"
-        )
-        backups = await conn.fetch(
-            "SELECT DISTINCT ON (backup_set) backup_set, last_backup_at, "
-            "size_bytes, size_delta_pct, restore_drill_at, restore_drill_ok, "
-            "notes, checked_at "
-            "FROM pandoras_actor.backup_health ORDER BY backup_set, checked_at DESC"
-        )
-        schedules = await conn.fetch(
-            "SELECT source, schedule_name, expected_status, actual_status, "
-            "last_run_at, last_run_ok, consecutive_failures, checked_at "
-            "FROM pandoras_actor.schedule_health ORDER BY source, schedule_name"
         )
         certs = await conn.fetch(
             "SELECT DISTINCT ON (domain) domain, cert_serial, not_after, "
@@ -66,8 +53,6 @@ async def homelab_state(request: Request) -> dict:
         )
     return {
         "drift": [dict(r) for r in drift],
-        "backups": [dict(r) for r in backups],
-        "schedules": [dict(r) for r in schedules],
         "certs": [dict(r) for r in certs],
     }
 

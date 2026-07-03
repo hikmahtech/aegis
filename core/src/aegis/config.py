@@ -201,39 +201,22 @@ class Settings(BaseSettings):
     # AEGIS admin UI base URL (used for reauth links in chat cards)
     aegis_ui_url: str = Field(default="", validation_alias="AEGIS_UI_URL")
 
-    # Knowledge auto-extraction
-    chat_auto_extract_enabled: bool = True
-
     # v3 seed directory (YAML files for agents, channels, resources, activities)
     seed_dir: str = "./config/seed"
 
-    # Homelab Guardian
-    # NOTE: URL/key fields default to "" so the app can boot with
-    # homelab_enabled=False. Bootstrap instantiates HomelabConnector only
-    # when homelab_enabled=True AND required URLs are non-empty.
+    # Homelab Guardian (Docker Swarm drift + TLS cert radar). When enabled,
+    # the worker builds a HomelabConnector; an empty docker_context relies on
+    # the DOCKER_HOST env var inside the worker container.
     homelab_enabled: bool = False
     homelab_docker_context: str = ""
-    homelab_nfs_base_path: str = "/mnt/General/NFS/swarm-backups"
-    homelab_dagster_graphql_url: str = ""
-    homelab_traefik_api_url: str = ""
-    homelab_restore_drill_host: str = ""
-    homelab_restore_drill_disk_min_gb: int = 50
     # NoDecode: skip pydantic-settings' JSON decoding so the raw env/dotenv
     # string reaches _parse_homelab_domains, which splits it on commas.
     homelab_public_domains: Annotated[list[str], NoDecode] = Field(default_factory=list)
-    homelab_drift_sustained_minutes: int = 30
 
     # Money Hygiene (Maou)
     money_hygiene_enabled: bool = False
-    money_hygiene_haiku_batch: int = 10
     money_hygiene_inr_fallback_rates: dict[str, float] = Field(
         default_factory=lambda: {"USD": 84.5, "EUR": 92.0, "GBP": 108.0, "SGD": 63.0}
-    )
-    money_hygiene_cancellation_threshold_multiplier: float = 2.0
-    # NoDecode: see homelab_public_domains — raw string is comma-split by
-    # _parse_money_hygiene_thresholds.
-    money_hygiene_alert_thresholds_days: Annotated[list[int], NoDecode] = Field(
-        default_factory=lambda: [30, 14, 7, 0]
     )
 
     @model_validator(mode="after")
@@ -259,14 +242,3 @@ class Settings(BaseSettings):
                 ]
         return data
 
-    @model_validator(mode="before")
-    @classmethod
-    def _parse_money_hygiene_thresholds(cls, data: Any) -> Any:
-        """Parse comma-separated money_hygiene_alert_thresholds_days into list[int]."""
-        if isinstance(data, dict) and "money_hygiene_alert_thresholds_days" in data:
-            value = data["money_hygiene_alert_thresholds_days"]
-            if isinstance(value, str):
-                data["money_hygiene_alert_thresholds_days"] = [
-                    int(s.strip()) for s in value.split(",") if s.strip()
-                ]
-        return data
