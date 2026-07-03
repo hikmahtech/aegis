@@ -3,10 +3,8 @@
 from __future__ import annotations
 
 import html as _html
-import os
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
-from pathlib import Path
 from typing import Any
 
 import structlog
@@ -18,41 +16,17 @@ from aegis_worker.activities.delivery import safe_send_telegram
 _ONE_DAY = timedelta(days=1)
 
 
-_computed_personality_dir = os.environ.get("AEGIS_PERSONALITY_DIR") or str(
-    Path(__file__).resolve().parents[4] / "personalities"
-)
-_PERSONALITY_DIR = (
-    _computed_personality_dir
-    if Path(_computed_personality_dir).is_dir()
-    else "/app/personalities"
-)
+def _format_agent_persona(persona: dict) -> str | None:
+    """Render soul + user kinds from a get_personality() dict, or None if empty.
 
-
-def _load_agent_persona(
-    agent_id: str, soul: str | None = None, user_context: str | None = None
-) -> str | None:
-    """Return SOUL + USER markdown for `agent_id`, or None if missing.
-
-    DB-first (the agents.soul / agents.user_context columns passed in) with the
-    personalities/<id>/{SOUL,USER}.md files as fallback. Kept narrow: only voice +
-    user context to steer extraction, not AGENTS.md operational boundaries
-    (receipt parsing doesn't call tools).
+    Kept narrow: only voice + user context to steer extraction, not the
+    'agents' operational boundaries (receipt parsing doesn't call tools).
     """
-    if not agent_id:
-        return None
-    agent_dir = Path(_PERSONALITY_DIR) / agent_id
-
-    def _sec(db_val: str | None, filename: str) -> str | None:
-        if db_val and db_val.strip():
-            return db_val.strip()
-        f = agent_dir / filename
-        return f.read_text().strip() if f.exists() else None
-
     parts: list[str] = []
-    s = _sec(soul, "SOUL.md")
+    s = (persona.get("soul") or "").strip()
     if s:
         parts.append(f"## Identity\n\n{s}")
-    u = _sec(user_context, "USER.md")
+    u = (persona.get("user") or "").strip()
     if u:
         parts.append(f"## User Context\n\n{u}")
     return "\n\n".join(parts) if parts else None
@@ -190,10 +164,10 @@ class MoneyActivities:
     ) -> list[dict]:
         """Single LLM batch call → one extraction per receipt.
 
-        `agent_id` — when set, loads SOUL.md + USER.md from the
-        personality dir and passes them as system context so the
-        extractor reflects that agent's voice/policy (e.g. maou for
-        subscription classification).
+        `agent_id` — when set, loads the agent's persona (soul + user
+        kinds, DB-first via aegis.services.personalities) and passes it
+        as system context so the extractor reflects that agent's
+        voice/policy (e.g. maou for subscription classification).
 
         Returns list of dicts with the receipt's `id` echoed as
         `receipt_id` so upsert_charges can correlate the extraction
@@ -201,14 +175,12 @@ class MoneyActivities:
         """
         if not receipts:
             return []
-        soul = user_context = None
+        system_prompt = None
         if agent_id:
-            row = await self.db_pool.fetchrow(
-                "SELECT soul, user_context FROM agents WHERE id = $1", agent_id
-            )
-            if row:
-                soul, user_context = row["soul"], row["user_context"]
-        system_prompt = _load_agent_persona(agent_id, soul, user_context) if agent_id else None
+            from aegis.services.personalities import get_personality
+
+            persona = await get_personality(self.db_pool, agent_id)
+            system_prompt = _format_agent_persona(persona)
         extractions = await self.llm.extract_receipts_batch(
             receipts, system_prompt=system_prompt, db_pool=self.db_pool
         )

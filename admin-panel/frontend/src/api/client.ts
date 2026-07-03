@@ -53,6 +53,12 @@ export const api = {
     apiFetch<any>(`/api/agents/${id}`, { method: 'PATCH', body: JSON.stringify(patch) }),
   draftPersona: (id: string, description: string) =>
     apiFetch<any>(`/api/agents/${id}/draft`, { method: 'POST', body: JSON.stringify({ description }) }),
+  getPersonality: (id: string) =>
+    apiFetch<Record<string, string>>(`/api/admin/agents/${id}/personality`),
+  putPersonality: (id: string, kinds: Record<string, string>) =>
+    apiFetch<Record<string, string>>(`/api/admin/agents/${id}/personality`, {
+      method: 'PUT', body: JSON.stringify(kinds),
+    }),
 
   // Resources (v3 — connectors, runbooks, repositories, etc.)
   listResources: (kind?: string) =>

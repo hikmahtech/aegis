@@ -6,13 +6,11 @@ import asyncio
 import functools
 import hashlib
 import json
-import os
 import re
 import time
 from dataclasses import dataclass
 from datetime import date, datetime
 from decimal import Decimal
-from pathlib import Path
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -2908,25 +2906,6 @@ def _validate_agent_tool_sets() -> None:
         logger.warning("chat_tool_unused", tool=name)
 
 
-_computed_personality_dir = os.environ.get("AEGIS_PERSONALITY_DIR") or str(
-    Path(__file__).resolve().parents[4] / "personalities"
-)
-PERSONALITY_DIR = (
-    _computed_personality_dir if Path(_computed_personality_dir).is_dir() else "/app/personalities"
-)
-
-
-def _persona_section(db_value: str | None, agent_dir: Path, filename: str) -> str:
-    """A persona section, DB-first (agents column) with the .md file as fallback
-    (the file is the first-boot seed; DB wins once populated / UI-edited)."""
-    if db_value and db_value.strip():
-        return db_value.strip()
-    f = agent_dir / filename
-    if f.exists():
-        return f.read_text().strip()
-    return ""
-
-
 def _build_agent_system_prompt(
     agent_id: str,
     fallback: str,
@@ -2935,24 +2914,23 @@ def _build_agent_system_prompt(
 ) -> str:
     """Build a structured system prompt from the agent's persona.
 
-    Persona prose is read DB-first (the agents.{soul,operating_notes,user_context}
-    columns via `persona`) and falls back to personalities/<id>/{SOUL,AGENTS,USER}.md.
-    Returns `fallback` (the DB system_prompt) when nothing is available.
+    `persona` is the kind→content dict from
+    `aegis.services.personalities.get_personality` (DB-first; starter .md files
+    only when the agent has no rows yet). Returns `fallback` (the DB
+    system_prompt) when every kind is empty.
     """
     persona = persona or {}
-    agent_dir = Path(PERSONALITY_DIR) / agent_id
-
-    soul = _persona_section(persona.get("soul"), agent_dir, "SOUL.md")
-    ops = _persona_section(persona.get("operating_notes"), agent_dir, "AGENTS.md")
-    usr = _persona_section(persona.get("user_context"), agent_dir, "USER.md")
 
     sections: list[str] = []
-    if soul:
-        sections.append(f"## Identity\n\n{soul}")
-    if ops:
-        sections.append(f"## Operational Boundaries\n\n{ops}")
-    if usr:
-        sections.append(f"## User Context\n\n{usr}")
+    for kind, heading in (
+        ("soul", "Identity"),
+        ("agents", "Operational Boundaries"),
+        ("user", "User Context"),
+        ("memory", "Memory"),
+    ):
+        content = (persona.get(kind) or "").strip()
+        if content:
+            sections.append(f"## {heading}\n\n{content}")
 
     if not sections:
         return fallback
@@ -3440,9 +3418,10 @@ async def send_message(
     # agents.metadata, with the shipped defaults as fallback (see chat dicts).
     agent_meta = dict(agent.get("metadata") or {})
 
-    # v3 agents table has `system_prompt_path` (file path); personality files
-    # are loaded by `_build_agent_system_prompt` below. Empty fallback is only
-    # used if the personality dir is missing on disk.
+    # The persona lives in the agent_personalities table (admin-UI-managed;
+    # see aegis.services.personalities) and is rendered into the system prompt
+    # by `_build_agent_system_prompt` below. Empty fallback is only used when
+    # the agent has no persona content at all.
     system_prompt = ""
 
     # Proactive knowledge context is injected once, after the personality
@@ -3531,15 +3510,18 @@ async def send_message(
     ]
     tool_desc = "\n".join(tool_desc_lines) if tool_desc_lines else None
 
+    from aegis.services.personalities import get_personality, read_personality_files
+
+    try:
+        persona = await get_personality(pool, agent_id)
+    except Exception:  # noqa: BLE001 — persona read must never break chat
+        logger.warning("agent_persona_load_failed", agent_id=agent_id)
+        persona = read_personality_files(agent_id)
     system_prompt = _build_agent_system_prompt(
         agent_id,
         fallback=system_prompt,
         tool_descriptions=tool_desc,
-        persona={
-            "soul": agent.get("soul"),
-            "operating_notes": agent.get("operating_notes"),
-            "user_context": agent.get("user_context"),
-        },
+        persona=persona,
     )
 
     # Learning loop (Phase 4): surface the agent's durable lessons from past

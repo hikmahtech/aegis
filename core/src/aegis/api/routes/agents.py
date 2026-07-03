@@ -12,8 +12,38 @@ from aegis.services.agents import create_agent as _create_agent
 from aegis.services.agents import get_agent as _get_agent
 from aegis.services.agents import list_agents as _list_agents
 from aegis.services.agents import update_agent as _update_agent
+from aegis.services.personalities import get_personality, set_personality
 
 router = APIRouter(prefix="/api/agents", dependencies=[Depends(verify_auth)])
+
+# Persona editor endpoints (admin UI) — separate prefix, same auth.
+admin_router = APIRouter(prefix="/api/admin/agents", dependencies=[Depends(verify_auth)])
+
+
+@admin_router.get("/{agent_id}/personality")
+async def get_agent_personality(agent_id: str, request: Request) -> dict[str, str]:
+    """The agent's persona — all four kinds (soul/agents/user/memory), DB-first."""
+    pool = request.app.state.db_pool
+    if not await _get_agent(pool, agent_id):
+        raise HTTPException(status_code=404, detail=f"Agent '{agent_id}' not found")
+    return await get_personality(pool, agent_id, use_cache=False)
+
+
+@admin_router.put("/{agent_id}/personality")
+async def put_agent_personality(
+    agent_id: str, request: Request, body: dict[str, Any]
+) -> dict[str, str]:
+    """Upsert persona kinds. Body: any subset of {soul, agents, user, memory}.
+
+    Returns the full updated persona (all four kinds).
+    """
+    pool = request.app.state.db_pool
+    if not await _get_agent(pool, agent_id):
+        raise HTTPException(status_code=404, detail=f"Agent '{agent_id}' not found")
+    try:
+        return await set_personality(pool, agent_id, body)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
 
 
 @router.get("")

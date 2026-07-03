@@ -22,7 +22,7 @@ Production runs on Docker Swarm via the `swarm` context; Core/Worker are pinned 
 
 ## Personalities
 
-4 named AI personalities. Loaded from the `agents` table; personality files at `personalities/<id>/{SOUL,AGENTS,USER,MEMORY}.md`.
+4 named AI personalities. Loaded from the `agents` table; persona content (kinds `soul`/`agents`/`user`/`memory`) lives in the `agent_personalities` table and is edited from the admin UI. The files at `personalities/<id>/{SOUL,AGENTS,USER,MEMORY}.md` are import-on-first-boot starter examples only.
 
 | Personality | Role | Model tier | Workflows owned |
 |-------------|------|------------|-----------------|
@@ -268,5 +268,5 @@ References-as-knowledge: a Todoist task classified `@reference` is captured via 
 - `config/.env` — secrets (copy from `.env.example`); pydantic-settings adds `AEGIS_` prefix
 - `config/seed/{agents,activities,channels,resources,todoist,workflows}.yaml` — v3 seed data loaded via FastAPI lifespan
 - `config/models.yaml` — LiteLLM model tier mapping (lives in Docker named volume `aegis_aegis_config` in production)
-- `personalities/<agent>/{SOUL,AGENTS,USER,MEMORY}.md` — personality content (baked into Core image)
+- `personalities/<agent>/{SOUL,AGENTS,USER,MEMORY}.md` — starter persona examples, imported into the `agent_personalities` table on first boot (DB/admin-UI-managed afterwards)
 - `runbooks/<AlertName>.md` — per-alert runbooks (baked into worker image); stubs containing `TODO: fill in` are treated as absent

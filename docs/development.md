@@ -85,6 +85,20 @@ Key settings:
 - `AEGIS_GITHUB_TOKEN` — GitHub API
 - `AEGIS_GMAIL_ACCOUNTS` — Gmail OAuth (format: `name:email,name:email`)
 
+### Agent personalities
+
+Personas live in the `agent_personalities` table — four markdown "kinds" per agent
+(`soul` identity, `agents` operational boundaries, `user` user context, `memory`
+long-term memory) — and are edited from the admin panel's agent detail page
+(GET/PUT `/api/admin/agents/{id}/personality`; service:
+`core/src/aegis/services/personalities.py`).
+
+The files under `personalities/<agent>/{SOUL,AGENTS,USER,MEMORY}.md` are
+**import-on-first-boot starter examples only**: on Core startup the seed loader
+imports each file into its kind *only when that kind has no DB row yet*. After
+that the DB owns the content — editing the files has no effect on an existing
+install. `AEGIS_PERSONALITY_DIR` overrides where the starter files are read from.
+
 ### Disabling built-in auth (authenticating-proxy deployments)
 
 `AEGIS_AUTH_DISABLED=true` turns off the API's basic-auth / `X-API-Key` checks and makes

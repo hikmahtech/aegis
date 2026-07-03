@@ -46,53 +46,26 @@ def _read_yaml(path: Path, top_key: str) -> list[dict[str, Any]]:
     return data.get(top_key, []) or []
 
 
-def _persona_base() -> Path:
-    """Where personalities/<id>/ live — env override, repo dir, or container path."""
-    import os
-
-    env = os.environ.get("AEGIS_PERSONALITY_DIR")
-    if env and Path(env).is_dir():
-        return Path(env)
-    repo = Path(__file__).resolve().parents[3] / "personalities"
-    if repo.is_dir():
-        return repo
-    return Path("/app/personalities")
-
-
-def _read_persona_files(agent_id: str) -> tuple[str | None, str | None, str | None]:
-    """Read (SOUL, AGENTS, USER).md for an agent — the first-boot seed for the
-    soul/operating_notes/user_context columns. Returns None per missing file."""
-    agent_dir = _persona_base() / agent_id
-
-    def _rd(name: str) -> str | None:
-        f = agent_dir / name
-        return f.read_text().strip() if f.exists() else None
-
-    return _rd("SOUL.md"), _rd("AGENTS.md"), _rd("USER.md")
-
-
 async def _load_agents(pool: asyncpg.Pool, path: Path) -> None:
     rows = _read_yaml(path, "agents")
     if not rows:
         return
     async with pool.acquire() as conn:
         for r in rows:
-            soul, operating_notes, user_context = _read_persona_files(r["id"])
             await conn.execute(
                 """
                 INSERT INTO agents (
                     id, name, role, system_prompt_path, capabilities,
                     model_tier, interaction_timeout_default, telegram_topic_id,
-                    slack_channel_id, elevenlabs_voice_id, active, metadata,
-                    soul, operating_notes, user_context
-                ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
+                    slack_channel_id, elevenlabs_voice_id, active, metadata
+                ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
                 ON CONFLICT (id) DO UPDATE SET
                     name = EXCLUDED.name,
                     role = EXCLUDED.role,
                     system_prompt_path = EXCLUDED.system_prompt_path,
                     capabilities = EXCLUDED.capabilities,
-                    -- model_tier + persona are DB-owned once set (edited in the
-                    -- admin UI); the yaml/.md files only seed an empty value.
+                    -- model_tier is DB-owned once set (edited in the admin UI);
+                    -- the yaml only seeds an empty value.
                     model_tier = COALESCE(NULLIF(agents.model_tier, ''), EXCLUDED.model_tier),
                     interaction_timeout_default = EXCLUDED.interaction_timeout_default,
                     telegram_topic_id = EXCLUDED.telegram_topic_id,
@@ -108,13 +81,6 @@ async def _load_agents(pool: asyncpg.Pool, path: Path) -> None:
                     -- agent metadata (routing config) is seed-owned for now — no
                     -- UI editor yet, so the yaml is the source of truth.
                     metadata = EXCLUDED.metadata,
-                    soul = COALESCE(NULLIF(agents.soul, ''), EXCLUDED.soul),
-                    operating_notes = COALESCE(
-                        NULLIF(agents.operating_notes, ''), EXCLUDED.operating_notes
-                    ),
-                    user_context = COALESCE(
-                        NULLIF(agents.user_context, ''), EXCLUDED.user_context
-                    ),
                     updated_at = now()
                 """,
                 r["id"],
@@ -129,14 +95,20 @@ async def _load_agents(pool: asyncpg.Pool, path: Path) -> None:
                 r.get("elevenlabs_voice_id") or None,
                 r.get("active", True),
                 r.get("metadata", {}),
-                soul,
-                operating_notes,
-                user_context,
             )
-        # NOTE: agents present in the DB but not in the YAML are left untouched —
-        # they are created from the admin UI (POST /api/agents) and own their own
-        # `active` state via PATCH. (Previously such rows were force-deactivated on
-        # every startup, which silently killed any UI-created agent.)
+    # Persona starter import (outside the acquire block — it grabs its own
+    # connection): personalities/<id>/*.md only fill kinds that have no
+    # agent_personalities row yet; the DB owns the content afterwards.
+    from aegis.services.personalities import import_personality_files
+
+    for r in rows:
+        imported = await import_personality_files(pool, r["id"])
+        if imported:
+            logger.info("personality_files_imported", agent_id=r["id"], kinds=imported)
+    # NOTE: agents present in the DB but not in the YAML are left untouched —
+    # they are created from the admin UI (POST /api/agents) and own their own
+    # `active` state via PATCH. (Previously such rows were force-deactivated on
+    # every startup, which silently killed any UI-created agent.)
     logger.info("seeds_loaded", kind="agents", count=len(rows))
 
 
