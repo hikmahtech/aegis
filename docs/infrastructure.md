@@ -149,8 +149,8 @@ docker build --build-arg EXTRA_CLOUD_CLIS="aws gcloud" -f core/Dockerfile .
 Supported values live in the `EXTRA_CLOUD_CLIS` step of `core/Dockerfile`
 (currently `aws` and `gcloud` — the latter installs the Google Cloud CLI plus
 `gke-gcloud-auth-plugin` from Google's apt repo); adding another CLI is one
-new `case` arm. Forks that build their own images (see the deployment docs)
-pass the arg from their build pipeline.
+new `case` arm. Forks that build their own images (see
+[`production.md`](production.md)) pass the arg from their build pipeline.
 
 **(b) The credentials** — per entry, in the **Auth env** field. For EKS:
 

@@ -1,7 +1,7 @@
 # SDK stubs (reference)
 
-**Non-running reference stubs** for the target `aegis-sdk` package described in
-[`../productization.md`](../productization.md). They define the plugin contract and
+**Non-running reference stubs** for a target `aegis-sdk` package — a possible
+kernel + SDK + capability-plugin redesign. They define the plugin contract and
 the provider ports that capabilities code against — implementation-free on purpose
 (the real package is carved out in migration step 1).
 

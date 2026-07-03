@@ -29,6 +29,18 @@ extra horsepower.
 - **Your knowledge, local.** A native Postgres + pgvector RAG store. Seed it
   from URLs, uploads, server folders, or a watched Drive folder. Embeddings run
   on a free local model — no per-token cost.
+- **Your infrastructure, registered.** An infrastructure registry holds SSH
+  hosts, your Docker Swarm, Kubernetes clusters, cloud accounts (AWS / GCP),
+  and the coding-agent host — credentials pasted in the admin UI, encrypted in
+  the DB, with per-entry read-only gating for the ops the agents may run.
+- **Market data without a vendor contract.** A provider-agnostic finance
+  connector (keyless Yahoo / Stooq) backs the money agent's quotes, market
+  overview, and finance news.
+- **Configured in the UI, not in YAML.** Agents, personalities, channels,
+  schedules, integration secrets, the LLM backend, and infrastructure are all
+  DB-owned and edited in the admin panel; seed files and env vars are
+  first-boot bootstrap only. Slack (Socket Mode) is the optional chat channel —
+  the web Interactions inbox always works.
 
 ## Architecture
 
@@ -71,7 +83,7 @@ with or without it, idling as a no-op until it's configured. For local dev you
 can still pass `AEGIS_SLACK_*` env vars and `docker compose --profile slack up -d`.
 
 For Python development (running the services from source) see
-[`AGENTS.md`](AGENTS.md).
+[`docs/development.md`](docs/development.md).
 
 ## Configure it for yourself
 
@@ -108,9 +120,11 @@ built first, `cd admin-panel/frontend && npm ci && npm run build`) and rolls the
 onto a Docker Swarm (`docker stack deploy`, then `docker service update --force`
 to pick up a freshly-pushed `:latest`).
 
-To deploy your own fork, wire those same two halves however you like. Integration
-secrets (Slack, Todoist, GitHub, …) are entered in the admin panel and stored
-encrypted in the DB — they are **not** baked into images or committed to config.
+To deploy your own fork, wire those same two halves however you like — the
+specifics (build args like `EXTRA_CLOUD_CLIS`, migrations, config plane) are in
+[`docs/production.md`](docs/production.md). Integration secrets (Slack, Todoist,
+GitHub, …) are entered in the admin panel and stored encrypted in the DB — they
+are **not** baked into images or committed to config.
 
 ## License
 

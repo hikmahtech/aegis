@@ -69,7 +69,7 @@ class ToolContext:
     read_models: ReadModels
     lens: str | None = None       # active lens (drives voice); was agent_id
     task_id: str | None = None    # set only on the comment-channel surface
-    surface: str = "api"          # "telegram" | "todoist_comment" | "api" | "flow"
+    surface: str = "api"          # "slack" | "todoist_comment" | "api" | "flow"
     # the trust tier the CALLER is allowed to exercise (productization.md §9); the
     # kernel pre-filters tools, this lets an executor double-check before a mutation.
     granted_tier: str = "autonomous"  # "autonomous" | "approval" | "forbidden"

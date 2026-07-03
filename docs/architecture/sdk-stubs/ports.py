@@ -143,10 +143,10 @@ class MarketData(Protocol):
 
 
 class SurfaceRef(Protocol):
-    """An addressable inbound/outbound surface (Telegram topic, web thread, comment
+    """An addressable inbound/outbound surface (Slack channel, web thread, comment
     channel, API). Symmetric: the same ref the kernel resolves an INBOUND message from
-    is what a capability replies to — so DeliveryChannel never hardcodes 'telegram'."""
+    is what a capability replies to — so DeliveryChannel never hardcodes 'slack'."""
 
-    kind: str   # "telegram" | "web" | "todoist_comment" | "api"
+    kind: str   # "slack" | "web" | "todoist_comment" | "api"
     lens: str   # voice/scope label (was: agent_id)
     ref: str    # channel-specific address (topic id, thread id, task id)

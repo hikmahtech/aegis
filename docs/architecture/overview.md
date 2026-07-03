@@ -1,8 +1,8 @@
 # AEGIS v3 Architecture
 
-AEGIS v3 is a flow-first personal AI orchestration platform. It coordinates 4 named personalities over 28 Temporal flows, a chat surface with 40 tools gated per-personality, native ingest connectors, and a knowledge-service for semantic search and query-time RAG.
+AEGIS v3 is a flow-first personal AI orchestration platform. It coordinates 4 named personalities over 28 Temporal flows, a chat surface with 42 tools gated per-personality, native ingest connectors, and a native Postgres+pgvector knowledge store for semantic search and query-time RAG.
 
-This document is the canonical reference for what the running system does today. For commands and setup, see [`development.md`](../development.md). For deployment, see [`production.md`](../production.md). For where the architecture is **going** — a kernel + SDK + capability-plugin redesign for productization — see [`productization.md`](productization.md).
+This document is the canonical reference for what the running system does today. For commands and setup, see [`development.md`](../development.md). For deployment, see [`production.md`](../production.md). For where the architecture is **going** — a kernel + SDK + capability-plugin redesign for productization — see the reference stubs in [`sdk-stubs/`](sdk-stubs/README.md).
 
 ## Services
 
@@ -10,26 +10,26 @@ This document is the canonical reference for what the running system does today.
 |---------|---------|------|---------|
 | Core API | `aegis-core` | 8080 | REST API, personalities, chat, connectors, admin panel SPA |
 | Worker | `aegis-worker` | — | Temporal workflows (28 flows), activities, schedule sync |
-| Comms | `aegis-comms` | 8081 | Channel adapter — **Slack** (Socket Mode); FastAPI delivery server + interaction cards |
-| Knowledge | `knowledge-service` | 8000 | Semantic chunk search, query-time RAG synthesis |
-| Postgres | pgvector/pg16 | 25432 | Primary database (migrations 001 → 021) |
+| Comms | `aegis-comms` | 8081 | Channel adapter — **Slack** (Socket Mode); FastAPI delivery server + interaction cards. Core reaches it via `AEGIS_COMMS_URL`; idles as a no-op until Slack is configured |
+| Postgres | pgvector/pg16 | 25432 | Primary database (migrations 001 → 008) |
 | Redis | redis:7-alpine | 26379 | Caching, rate limiting |
 | Temporal | auto-setup | 7233 | Workflow orchestration (task queue `aegis-main`) |
 | Temporal UI | temporalio/ui | 8233 | Workflow debugging |
+| Ollama | `--profile local-llm` | 11434 | Optional bundled local model server (point the LLM backend at it for fully-local) |
 | ElevenLabs | hosted vendor | api.elevenlabs.io | Media transcription (Scribe STT) + per-persona voice notes (TTS) |
 
-Production runs on Docker Swarm via the `swarm` context; Core/Worker are pinned to `node-a`; Comms (`aegis_comms`) runs on any non-`node-b` node. ElevenLabs is a hosted vendor (no in-cluster GPU service).
+Knowledge is **native to Core** (Postgres + pgvector, `services/knowledge.py`) — there is no separate knowledge service. Deployment is a fork-owned concern: this repo's CI is test-only, and images are built/deployed by your own infrastructure — see [`production.md`](../production.md). ElevenLabs is a hosted vendor (no in-cluster GPU service).
 
 ## Personalities
 
 4 named AI personalities. Loaded from the `agents` table; persona content (kinds `soul`/`agents`/`user`/`memory`) lives in the `agent_personalities` table and is edited from the admin UI. The files at `personalities/<id>/{SOUL,AGENTS,USER,MEMORY}.md` are import-on-first-boot starter examples only.
 
-| Personality | Role | Model tier | Workflows owned |
+| Personality | Role | Model tier | Workflows owned (per `config/seed/activities.yaml`) |
 |-------------|------|------------|-----------------|
-| **Sebas** | Executive assistant | `smart` | `GmailIngestFlow`, `CalendarIngestFlow`, `TodoistSyncFlow`, `ClarifyFlow`, `DailyBriefingFlow`, `ReviewFlow` (daily + weekly), `SocialPublishFlow` |
-| **Raphael** | Research + knowledge | `smart` | `IntelligenceScanFlow`, `RaindropIngestFlow`, `RssIngestFlow` |
+| **Sebas** | Executive assistant | `smart` | `GmailIngestFlow`, `CalendarIngestFlow`, `TodoistSyncFlow`, `ClarifyFlow`, `DailyReviewFlow` + `WeeklyReviewFlow`, `SocialPublishFlow`, `MemoryReflectionFlow` |
+| **Raphael** | Research + knowledge | `smart` | `DailyBriefingFlow`, `IntelligenceScanFlow` (×3 sources), `RaindropIngestFlow`, `RssIngestFlow`, `DriveSyncFlow` |
 | **Maou** | Finance | `smart` | `MoneyProcessFlow`, `MoneyHygieneDailyFlow`, `ReceiptIngestFlow`, `SubscriptionAuditFlow` |
-| **Pandora's Actor** | Infrastructure | `smart` | `ServiceDriftFlow`, `CertRadarFlow`, `SentryPollFlow`, `CleanupFlow`, `GitHubAlertFlow` (PR notifier) |
+| **Pandora's Actor** | Infrastructure | `smart` | `ServiceDriftFlow`, `CertRadarFlow`, `SentryPollFlow`, `DeliveryWatchdogFlow`, `CleanupFlow`, `WorkspaceRepoSyncFlow`, `VercelProjectSyncFlow`, `GitHubAlertFlow` (PR notifier, webhook-driven) |
 
 **Utility flows (driven by their callers, not owner-scheduled):**
 - `InteractionFlow` — man-in-the-middle handoff; any flow spawns this as a child to wait for a human response.
@@ -37,7 +37,7 @@ Production runs on Docker Swarm via the `swarm` context; Core/Worker are pinned 
 - `GitHubAlertFlow` — webhook-driven PR notifier (`pandoras-actor`). On `pull_request` `opened`/`reopened`/`ready_for_review` for a repo tracked in `resources`, posts a Slack card via `HomelabActivities.notify_pr_event`. No longer investigates issues (repurposed 2026-06-27).
 - `AgentChatReplyFlow` — synthesizes a personality reply for a Todoist task comment; spawned by `ClarifyFlow` for `@sebas`/`@raphael`/`@maou`/`@pandora` followups.
 
-**Model tiers**: resolved from `config/models.yaml` via the LiteLLM proxy. Current mapping: `fast` → `gemma4:e2b`, `balanced` → `qwen3:14b`, `smart` → `claude-sonnet` (LiteLLM alias). Activities also call Claude Haiku directly via the proxy for short structured calls. No `ollama/` prefix — the proxy serves bare names.
+**Model tiers**: `agents.model_tier` is `fast` | `balanced` | `smart`, resolved from `config/models.yaml` against whatever LLM backend you configure on the admin **Models & Providers** page — a LiteLLM proxy, a hosted key (Claude / OpenAI / OpenRouter), or a local Ollama. Point the tiers at any models you like; no `ollama/` prefix — proxies serve bare names.
 
 ## Interactions Primitive
 
@@ -123,8 +123,13 @@ Cross-agent handoff via agent-written `@<other>` labels is **out of scope for v1
 Owner-scheduled flows are listed in the Personalities table above. The remaining named flows:
 
 - `TodoistSyncFlow` — 5-min Sync API tick: incremental sync from Todoist, drains the outbox.
-- `DailyBriefingFlow` (Sebas, daily) — gathers interactions/activity/knowledge → synthesizes → the active comms channel (Slack).
-- `ReviewFlow` (Sebas) — daily + weekly digests; logs to `review_digest_log`, spawns acknowledgement InteractionFlow.
+- `DailyBriefingFlow` (Raphael, daily) — gathers interactions/activity/knowledge → synthesizes → the active comms channel (Slack).
+- `DailyReviewFlow` / `WeeklyReviewFlow` (Sebas) — daily + weekly digests; logs to `review_digest_log`, spawns acknowledgement InteractionFlow.
+- `MemoryReflectionFlow` (Sebas, nightly) — per-agent memory consolidation: caps `agent_memory` (prunes oldest/lowest-importance beyond `keep`).
+- `DriveSyncFlow` (Raphael) — incremental ingest of a tracked Google Drive folder into the knowledge store; no-ops until a folder is configured.
+- `DeliveryWatchdogFlow` (Pandora's Actor, 15-min) — catches interaction cards that were never delivered and checks comms `/api/health` inbound liveness; on outage captures a Todoist Inbox task (the chat channel is the thing that's down).
+- `WorkspaceRepoSyncFlow` (Pandora's Actor, daily) — scans the coding host's workspace for git checkouts and makes the `resources` table mirror it (one `kind='repository'` row per checkout).
+- `VercelProjectSyncFlow` (Pandora's Actor, daily) — mirrors Vercel personal + team projects into `resources` (`kind='vercel_project'`), linking GitHub repos for alert investigations.
 - `MoneyProcessFlow` (Maou, child) — single-email money hygiene: `store_receipt_email` → `load_receipts` → `classify_and_extract` → `upsert_charges`. Spawned by `GmailIngestFlow` on `financial`/`payments` tags and by the weekly `ReceiptIngestFlow` safety-net. `ParentClosePolicy.ABANDON`; idempotent on `message_id` at the `store_receipt_email` step.
 
 ### Email Triage Tag Fan-out
@@ -149,7 +154,7 @@ Specialist flows subscribe to tag subsets and run as abandoned children:
 6. **Verification delay** — per-severity sleep + `check_alert_resolved` recheck.
 7. **Resource resolution** — deterministic service-match then LLM picks the owning repo from the `resources` table. `metadata.path` is the repo's workspace-relative checkout path (e.g. `acme/bcp`), maintained by `WorkspaceRepoSyncFlow` — there is no per-run JIT clone; a missing checkout fails the kimi path and falls back to the LLM-only investigation.
 8. **Knowledge context** — `gather_alert_knowledge` prepends `runbooks/<AlertName>.md` (if present and non-stub), then appends prior-incident context from KS.
-9. **Investigation** — Kimi CLI via `run_investigation` when a `resource_path` is available; LLM fallback otherwise. The kimi run executes on the effective host (node-b when reachable, else node-a); that host is threaded back through the read-back poll, worktree cleanup, and PR push so they all happen where the branch was made.
+9. **Investigation** — coding-CLI (kimi/claude) via `run_investigation` when a `resource_path` is available; LLM fallback otherwise. The run executes on the effective host (the configured kimi host when reachable, else the base coding host — see [`infrastructure.md`](../infrastructure.md)); that host is threaded back through the read-back poll, worktree cleanup, and PR push so they all happen where the branch was made.
 10. **Haiku assessment** → structured verdict: `resolved` / `not_actionable` / `actionable` / `inconclusive`.
 11. **Gate 2** (non-Jira, non-self-resolved verdicts) — Open PR(s) / Mute 24h / Acknowledge / Discard via Slack. Jira-source runs (`source=='todoist-jira'`) bypass Gate 2 by contract.
 12. Comms notification (Slack) + Todoist task comment + audit log write.
@@ -158,20 +163,21 @@ When a `todoist_task_id` is on the alert (pandora APP-<n>: clarify path), the fl
 
 ## Connectors
 
-7 public connectors in `core/src/aegis/connectors/` (plus `_ssh.py` and `_subprocess.py` private helpers).
+7 public connectors in `core/src/aegis/connectors/` (plus `_base.py`, `_ssh.py` and `_subprocess.py` private helpers). Knowledge is not a connector anymore — it is the native Core service `services/knowledge.py` (see [Knowledge](#knowledge-native-rag) below).
 
 | Connector | Role |
 |-----------|------|
-| **KnowledgeConnector** (`knowledge.py`) | HTTP client for knowledge-service and router across Gmail/Drive/Notion native search + searxng. Reads: `search` (semantic chunk retrieval), `ask` (multi-doc synthesis), `list_content_items`, `get_content_status`, `get_content_chunks`, `get_stats`, `get_recent_jobs`. Writes: `ingest_content` (fetch → chunk → embed). |
 | **TodoistConnector** (`todoist.py`) | Todoist Sync API client + outbox + per-command status checks (`check_sync_status`) — see [`todoist-sync-protocol.md`](todoist-sync-protocol.md). |
-| **RemoteScriptConnector** (`remote_script.py`) | SSH to the configured host. Runs predefined infra scripts and the Kimi CLI for alert investigations against fixed checkouts under `AEGIS_REMOTE_SCRIPT_REPO_BASE` (workspace-relative `metadata.path`, no JIT cloning). When `AEGIS_REMOTE_SCRIPT_KIMI_HOST` is set and reachable (node-b), kimi runs are wrapped in a live-attachable `tmux` session there; otherwise they fall back to the base host (node-a). |
-| **HomelabConnector** (`homelab.py`) | Docker Swarm + Kubernetes commands via SSH. Gated by the `homelab_enabled` setting. Backs worker flows; Pandora's infra chat tools run via RemoteScriptConnector, or directly through the infrastructure registry for registered k8s clusters (`services/infra.py` — see [`infrastructure.md`](../infrastructure.md)). |
+| **RemoteScriptConnector** (`remote_script.py`) | SSH to the designated coding host. Runs predefined infra scripts and coding-CLI (kimi/claude) runs for alert investigations against fixed checkouts under the configured repo base (workspace-relative `metadata.path`, no JIT cloning). The host, SSH key, engines, accounts, org routing, and optional separate kimi host are configured on an infra registry entry's **Coding agent** block (env `AEGIS_REMOTE_SCRIPT_*` is the fallback) — see [`infrastructure.md`](../infrastructure.md). |
+| **HomelabConnector** (`homelab.py`) | Docker Swarm ops over SSH (`list_services`, `service_ps`, `restart_service`) + `probe_tls` cert checks. Gated by the `homelab_enabled` setting. Kubernetes ops go through the infrastructure registry instead (`services/infra.py` — see [`infrastructure.md`](../infrastructure.md)). |
 | **SearchConnector** (`search.py`) | SearxNG HTTP client. Used by the `research_topic` chat tool. |
-| **FinanceConnector** (`finance.py`) | Provider-agnostic web market data (keyless `yahoo` / `stooq` quote providers, selected via the Finance integration config). Powers Maou's `get_quote` / `get_market_overview` tools and the `/api/market/summary` briefing section; `get_finance_news` rides SearchConnector. |
+| **FinanceConnector** (`finance.py`) | Provider-agnostic web market data (keyless `yahoo` / `stooq` quote providers, selected via the Finance integration config: `finance_provider` / `finance_api_key` / `finance_indices`). Powers Maou's `get_quote` / `get_market_overview` tools and the `/api/market/summary` briefing section; `get_finance_news` rides SearchConnector. |
+| **SocialConnector** (`social.py`) | Social posting for `SocialPublishFlow` — native X/Twitter OAuth or a self-hosted Postiz transport — see [`social-publishing.md`](../social-publishing.md). |
+| **VercelConnector** (`vercel.py`) | Vercel REST client — project inventory (`VercelProjectSyncFlow`) and Pandora's deployment chat tools. |
 
 ## Chat with Tool Calling
 
-`POST /api/chat` (non-streaming) and `POST /api/chat/stream` (SSE). 40 tools in `CHAT_TOOLS`, gated per-personality via `AGENT_TOOL_SETS` in `core/src/aegis/services/chat.py`.
+`POST /api/chat` (non-streaming) and `POST /api/chat/stream` (SSE). 42 tools in `CHAT_TOOLS`, gated per-personality via `AGENT_TOOL_SETS` in `core/src/aegis/services/chat.py`.
 
 Tool loop: max iterations bounded by the service config; per-tool timeout via `asyncio.wait_for`; result truncation per `max_bytes`. Every tool call recorded to `chat_tool_calls`.
 
@@ -182,28 +188,28 @@ Per-personality tool counts (authoritative — counted from `AGENT_TOOL_SETS`):
 | Sebas | 15 |
 | Raphael | 11 |
 | Maou | 13 |
-| Pandora's Actor | 30 |
+| Pandora's Actor | 32 |
 
 Worker startup validator: refuses to boot if a personality references a tool that isn't in `CHAT_TOOLS`. (Validation runs at Core boot via `_validate_agent_tool_sets`.)
 
 ### Proactive knowledge context
 
-Before every LLM call, `_gather_knowledge_context()` runs a semantic chunk search via `KnowledgeConnector.search`. Results are boosted per-personality domain affinity, capped at 2000 chars injected into the system prompt. 5s timeout (`knowledge_context_timeout_seconds`) — never blocks chat. Each result that survives the threshold is logged to `knowledge_injection_log`.
+Before every LLM call, `_gather_knowledge_context()` runs a semantic chunk search via the native `KnowledgeService.search`. Results are boosted per-personality domain affinity, capped at 2000 chars injected into the system prompt. 5s timeout (`knowledge_context_timeout_seconds`) — never blocks chat. Each result that survives the threshold is logged to `knowledge_injection_log`.
 
 
 ## API
 
-19 route modules in `core/src/aegis/api/routes/`. All `/api/*` routes require Basic auth or `X-API-Key`. Exceptions: `GET /health` and webhook paths under `/api/webhooks/*` (HMAC-verified).
+30 route modules in `core/src/aegis/api/routes/`. All `/api/*` routes require Basic auth or `X-API-Key` (API keys are generated from the admin **Integrations** page and stored encrypted in the DB; `AEGIS_API_KEY` is the env fallback). Auth can be switched off entirely with `AEGIS_AUTH_DISABLED=true` — for deployments fronted by an authenticating proxy only. Exceptions: `GET /health` and webhook paths under `/api/webhooks/*` (HMAC-verified).
 
-Route modules: `agents`, `audit`, `capture`, `chat`, `gmail_reauth`, `health`, `homelab`, `infra`, `infra_admin` (infrastructure registry CRUD + provisioning + k8s ops — see [`infrastructure.md`](../infrastructure.md)), `interactions`, `knowledge`, `market`, `mcp`, `money`, `observability`, `overview`, `references`, `resources`, `settings`, `slack`, `system_status`, `temporal`, `todoist`, `webhooks`.
+Route modules: `activities`, `agents`, `api_key`, `audit`, `capture`, `channels`, `chat`, `gmail_reauth`, `health`, `homelab`, `infra`, `infra_admin` (infrastructure registry CRUD + provisioning + k8s/cloud ops — see [`infrastructure.md`](../infrastructure.md)), `integrations`, `interactions`, `knowledge`, `llm_backend`, `market`, `mcp`, `money`, `observability`, `overview`, `references`, `resources`, `settings`, `slack`, `social_auth`, `system_status`, `temporal`, `todoist`, `webhooks`.
 
 ## Admin UI
 
-React SPA served by Core at `/`. Top-level pages include: Overview, Interactions, Workflows, Personalities + Personality detail, Chat, Knowledge / Entities / Content / Content detail, Resources, AuditLog, Money, Homelab, Infra (the infrastructure registry — register SSH hosts / the swarm / k8s clusters with encrypted pasted credentials; see [`infrastructure.md`](../infrastructure.md)), Market, References.
+React SPA served by Core at `/`. Top-level pages include: Overview, Interactions, Workflows, Agents + Agent detail (incl. the personality editor), Chat, Knowledge / Content / Content detail, Channels, Flows & Integrations, Models & Providers, Todoist, Resources, AuditLog, Money, Market, References, System Monitoring, Settings, Slack config, and Infra (the infrastructure registry — register SSH hosts / the swarm / k8s clusters / cloud accounts with encrypted pasted credentials; see [`infrastructure.md`](../infrastructure.md)). The admin UI is the primary configuration surface: agents, personalities, channels, schedules, integration secrets, the LLM backend, and infrastructure are all DB-owned and edited here — seed YAML and env vars are first-boot/bootstrap inputs, not the ongoing source of truth.
 
 ## Comms (Slack)
 
-Slack Socket Mode (`slack_sdk`) + FastAPI delivery server (port 8081). One Slack channel per personality.
+Slack Socket Mode (`slack_sdk`) + FastAPI delivery server (port 8081). One Slack channel per personality. Slack is optional: tokens are configured from the admin **Slack** page (stored encrypted in the DB; `AEGIS_SLACK_*` env is the dev fallback) and comms idles as a no-op until they exist — interaction cards always land in the admin UI's **Interactions** inbox (web) regardless. Core reaches the delivery server via `AEGIS_COMMS_URL`.
 
 - Agent→channel mapping populated from `agents.slack_channel_id` (falls back to resolving `#aegis-<short>` by name).
 - Message bodies are authored in a light HTML dialect and converted to Slack mrkdwn (`html_to_mrkdwn`); all user-controlled strings pass through `_safe()` (`html.escape()`).
@@ -212,27 +218,29 @@ Slack Socket Mode (`slack_sdk`) + FastAPI delivery server (port 8081). One Slack
 
 ## Database
 
-PostgreSQL 16 + pgvector. Migrations 001 → 021 in `migrations/`; auto-apply on Core startup, tracked in `schema_migrations`. See [`production.md`](../production.md) for the migration table.
+PostgreSQL 16 + pgvector. Migrations 001 → 008 in `migrations/` (001 is the squashed baseline); auto-apply on Core startup, tracked in `schema_migrations`.
 
-**Core primitives** — `agents`, `activities`, `interactions`, `workflow_runs`, `resources`, `channels`, `settings`.
+**Core primitives** — `agents`, `agent_personalities`, `agent_memory`, `activities`, `interactions`, `workflow_runs`, `resources`, `channels`, `settings`, `infra`.
 
 **Chat** — `chat_history`, `chat_tool_calls`.
 
-**Todoist GTD layer** — `todoist_projects`, `todoist_tasks`, `todoist_notes`, `todoist_labels`, `todoist_outbox`, `todoist_sync_state`, `gtd_clarify_log`.
+**Todoist GTD layer** — `todoist_projects`, `todoist_tasks`, `todoist_notes`, `todoist_labels`, `todoist_outbox`, `todoist_sync_state`, `todoist_webhook_events`, `todoist_capture_idempotency`, `gtd_clarify_log`.
 
 **Triage feedback** — `triage_state`, `triage_accuracy`.
+
+**Knowledge (native RAG)** — `knowledge_content`, `knowledge_chunks` (pgvector embeddings), `knowledge_source_quality`, `knowledge_injection_log`.
 
 **Maou (finance)** — `maou.recurring_charge`, `maou.receipt_email`, `maou.renewal_alert`, `maou.subscription_digest`.
 
 **Pandora's Actor (infra)** — `pandoras_actor.homelab_drift`, `pandoras_actor.cert_expiry`.
 
+**Social publishing** — `social_accounts`, `social_outbox`.
+
 **Alert governance** — `alert_mutes`, `pending_prs`, `alert_dedup_index` (Sentry signature dedup).
 
-**Reviews** — `review_digest_log`.
+**Reviews / notifications** — `review_digest_log`, `notification_log`.
 
 **Observability** — `llm_calls`, `connector_calls`, `audit_log`.
-
-**Knowledge feedback** — `knowledge_injection_log`.
 
 **Idempotency** — `ingest_idempotency`.
 
@@ -252,20 +260,16 @@ The `activities` table drives Temporal schedules. Worker on startup queries acti
 
 Distributed tracing: OTel SDK + JSON-formatted logs with `trace_id`/`span_id` injected from the active span. Per-package `telemetry.py` + `logging_config.py` modules. Gated on `OTEL_ENABLED=true`. Auto-instrumentation covers FastAPI, asyncpg, redis, httpx, requests. The Worker registers `temporalio.contrib.opentelemetry.TracingInterceptor` so trace context flows through workflow headers automatically.
 
-## Knowledge Service Integration
+## Knowledge (native RAG)
 
-Knowledge-service is a chunk store + query-time RAG engine. It captures ephemeral content streams (RSS, Raindrop, HN/news/finance scans, calendar, GTD references) into a chunk store via ingest flows. `search` does semantic chunk retrieval; `ask` synthesizes an answer across retrieved chunks. No knowledge graph.
+Knowledge is a native Core service (`core/src/aegis/services/knowledge.py`, replacing the old external knowledge-service): ingested content is chunked and embedded into Postgres + pgvector (`knowledge_content` / `knowledge_chunks`), with embeddings produced by the configured `embedding_model` (default `nomic-embed-text`) through the LLM backend. It captures ephemeral content streams (RSS, Raindrop, HN/news/finance scans, Drive folders, GTD references, URL/upload/folder seeds) via ingest flows. `search` does semantic chunk retrieval; `ask` synthesizes an answer across retrieved chunks with the local LLM. No knowledge graph.
 
-`KnowledgeConnector` is the router: it fans queries across the KS chunk store, Gmail/Drive/Notion native search (existing AEGIS connectors + MCP), and searxng (live web), then merges ranked results.
-
-`ingest_content` writes are sync HTTP and return immediately — the endpoint may return 202 with a `job_id` which the caller can poll via `get_content_status(content_id)`. Per-call timeouts: `ask` → 60s (synthesis + downstream LLM), `search` / other reads → 10s, `ingest_content` → 600s. Transport layer uses `httpx.AsyncHTTPTransport(retries=2)` for transient DNS.
-
-References-as-knowledge: a Todoist task classified `@reference` is captured via `ingest_reference_to_ks` (raises on transient failures, returns a verdict on permanent ones); the verdict is dispatched by `_dispatch_reference_verdict` in `ClarifyFlow` to either complete the task (success) or demote to `@to-read` (permanent failure). The `/api/references` route is KS-backed and surfaces the live library; `/api/references/failures` is the `@to-read` lane from the Todoist projection.
+References-as-knowledge: a Todoist task classified `@reference` is captured via `ingest_reference_to_ks` (raises on transient failures, returns a verdict on permanent ones); the verdict is dispatched by `_dispatch_reference_verdict` in `ClarifyFlow` to either complete the task (success) or demote to `@to-read` (permanent failure). The `/api/references` route surfaces the live library from the knowledge store; `/api/references/failures` is the `@to-read` lane from the Todoist projection.
 
 ## Config
 
-- `config/.env` — secrets (copy from `.env.example`); pydantic-settings adds `AEGIS_` prefix
-- `config/seed/{agents,activities,channels,resources,todoist,workflows}.yaml` — v3 seed data loaded via FastAPI lifespan (`channels.yaml` is first-boot starter examples only — channels are DB-owned and managed from the admin panel's Channels page / `/api/admin/channels` afterwards)
-- `config/models.yaml` — LiteLLM model tier mapping (lives in Docker named volume `aegis_aegis_config` in production)
+- `config/.env` — bootstrap secrets and endpoints (copy from `.env.example`); pydantic-settings adds the `AEGIS_` prefix. Integration secrets (Slack, Todoist, GitHub, API keys, infra credentials, …) are entered in the admin UI and stored **encrypted in the DB** — env vars are the fallback, not the primary store.
+- `config/seed/{agents,activities,channels,resources,todoist}.yaml` — seed data loaded via FastAPI lifespan (`channels.yaml` is first-boot starter examples only — channels are DB-owned and managed from the admin panel's Channels page / `/api/admin/channels` afterwards)
+- `config/models.yaml` — model tier mapping resolved against the configured LLM backend
 - `personalities/<agent>/{SOUL,AGENTS,USER,MEMORY}.md` — starter persona examples, imported into the `agent_personalities` table on first boot (DB/admin-UI-managed afterwards)
 - `runbooks/<AlertName>.md` — per-alert runbooks (baked into worker image); stubs containing `TODO: fill in` are treated as absent
