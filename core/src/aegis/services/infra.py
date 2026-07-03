@@ -22,6 +22,7 @@ import json
 import os
 import re
 import shlex
+import shutil
 import tempfile
 from collections.abc import Iterator
 from typing import Any
@@ -39,8 +40,10 @@ logger = structlog.get_logger()
 _SELECT_COLS = (
     "id, slug, name, kind, host, ssh_user, ssh_port, ssh_key_ref, docker_context, "
     "hosts_aegis, read_only, setup_files, setup_command, status, last_provisioned_at, "
-    "last_error, metadata, coding, credentials, created_at, updated_at"
+    "last_error, metadata, coding, cloud, credentials, created_at, updated_at"
 )
+
+_INFRA_KINDS = ("ssh_host", "swarm", "docker", "k8s", "cloud")
 
 # Fields an operator may set directly via create/update. `status`,
 # `last_provisioned_at`, and `last_error` are deliberately excluded — those
@@ -60,6 +63,7 @@ _EDITABLE_FIELDS = (
     "setup_command",
     "metadata",
     "coding",
+    "cloud",
 )
 
 _SLUG_RE = re.compile(r"[^a-z0-9]+")
@@ -225,6 +229,116 @@ async def get_coding_host(pool: asyncpg.Pool) -> dict | None:
     return dict(row) if row else None
 
 
+# ── cloud provider account config block ─────────────────────────────────────
+#
+# Non-secret JSON on the infra row (`cloud` column). Two uses:
+#   kind=cloud — the row IS a cloud provider account (one row per AWS account
+#     or GCP project): {"provider", "default_profile", "region", "project",
+#     "identity"}. The credentials live encrypted in infra.credentials
+#     (aws_credentials_file / gcp_service_account_json — same fields k8s
+#     entries already use inline). `identity` is written by provision_infra
+#     (sts / ADC identity check), never by operators.
+#   kind=k8s — an optional reference to a cloud account: {"cloud_slug",
+#     "profile"}. kubectl calls then pull exec-plugin credentials from the
+#     referenced account, with AWS_PROFILE = the entry's profile or the
+#     account's default_profile.
+# See migrations/008_infra_cloud.sql for the full shape.
+
+_CLOUD_PROVIDERS = ("aws", "gcp")
+_CLOUD_CLI = {"aws": "aws", "gcp": "gcloud"}
+_CLOUD_CLI_HINT = {
+    "aws": "aws CLI not in image — build with --build-arg EXTRA_CLOUD_CLIS=aws",
+    "gcp": "gcloud CLI not in image — build with --build-arg EXTRA_CLOUD_CLIS=gcloud",
+}
+_AWS_PROFILE_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
+
+
+def _cloud_cli_path(binary: str) -> str | None:
+    """Seam for CLI availability (tests patch this; shutil.which in prod)."""
+    return shutil.which(binary)
+
+
+def _clean_profile(value: Any, field: str) -> str:
+    profile = str(value or "").strip()
+    if profile and not _AWS_PROFILE_RE.match(profile):
+        raise ValueError(f"{field} must match [A-Za-z0-9_.-]{{1,64}}")
+    return profile
+
+
+def validate_cloud(cloud: Any, kind: str = "") -> dict:
+    """Validate + normalize a cloud block for `kind`. Raises ValueError.
+
+    kind=cloud requires a provider; kind=k8s allows a cloud-account reference;
+    any other kind must not carry a cloud block. Operator input never sets
+    `identity` — that is provision-owned (create/update preserve it separately).
+    """
+    if cloud is None:
+        cloud = {}
+    if not isinstance(cloud, dict):
+        raise ValueError("cloud must be an object")
+
+    if kind == "cloud":
+        provider = str(cloud.get("provider") or "").strip().lower()
+        if provider not in _CLOUD_PROVIDERS:
+            raise ValueError(
+                f"cloud.provider must be one of {list(_CLOUD_PROVIDERS)} for a kind=cloud entry"
+            )
+        out: dict[str, Any] = {"provider": provider}
+        if provider == "aws":
+            out["default_profile"] = _clean_profile(
+                cloud.get("default_profile"), "cloud.default_profile"
+            )
+            out["region"] = str(cloud.get("region") or "").strip()
+        else:
+            out["project"] = str(cloud.get("project") or "").strip()
+        return out
+
+    if kind == "k8s":
+        cloud_slug = str(cloud.get("cloud_slug") or "").strip()
+        profile = _clean_profile(cloud.get("profile"), "cloud.profile")
+        if profile and not cloud_slug:
+            raise ValueError("cloud.profile requires cloud.cloud_slug")
+        if not cloud_slug:
+            return {}
+        return {"cloud_slug": cloud_slug, "profile": profile}
+
+    if cloud:
+        raise ValueError(f"a cloud block is not valid for a kind={kind or 'ssh_host'} entry")
+    return {}
+
+
+async def _assert_cloud_ref(pool: asyncpg.Pool, cloud: dict) -> None:
+    """A k8s entry's cloud_slug must reference an existing kind=cloud row."""
+    slug = cloud.get("cloud_slug")
+    if not slug:
+        return
+    kind = await pool.fetchval("SELECT kind FROM infra WHERE slug = $1", slug)
+    if kind != "cloud":
+        raise ValueError(f"cloud_slug {slug!r} does not reference a kind=cloud infra entry")
+
+
+async def resolve_cloud_account(pool: asyncpg.Pool, infra: dict) -> tuple[dict | None, str | None]:
+    """Resolve a k8s entry's referenced cloud account.
+
+    Returns (account_row_with_credentials, aws_profile) — (None, None) when
+    the entry has no cloud_slug. Raises ValueError on a dangling/non-cloud
+    reference (the account was deleted or repurposed after the k8s entry was
+    saved; create/update validate the reference up front).
+    """
+    cloud_cfg = infra.get("cloud") or {}
+    slug = (cloud_cfg.get("cloud_slug") or "").strip()
+    if not slug:
+        return None, None
+    account = await get_infra_by_slug(pool, slug, include_credentials=True)
+    if not account or account.get("kind") != "cloud":
+        raise ValueError(f"cloud_slug {slug!r} does not reference a kind=cloud infra entry")
+    account_cfg = account.get("cloud") or {}
+    profile: str | None = None
+    if account_cfg.get("provider") == "aws":
+        profile = cloud_cfg.get("profile") or account_cfg.get("default_profile") or None
+    return account, profile
+
+
 async def get_infra_by_slug(
     pool: asyncpg.Pool, slug: str, *, include_credentials: bool = False
 ) -> dict | None:
@@ -311,24 +425,42 @@ def kubeconfig_file(infra: dict, secret_key: str) -> Iterator[str | None]:
 
 
 @contextlib.contextmanager
-def k8s_auth_env(infra: dict, secret_key: str) -> Iterator[dict | None]:
-    """Yield the environment for kubectl subprocesses on this entry, or None
-    when the entry has no stored auth material (inherit the process env).
+def cloud_auth_env(
+    infra: dict,
+    secret_key: str,
+    *,
+    cloud_account: dict | None = None,
+    aws_profile: str | None = None,
+) -> Iterator[dict | None]:
+    """Yield the environment for cloud-CLI subprocesses (kubectl exec plugins,
+    `aws`, `gcloud`) on this entry, or None when there is no stored auth
+    material to inject (inherit the process env).
 
     Exec-plugin kubeconfigs (EKS `aws eks get-token`, GKE
     `gke-gcloud-auth-plugin`) read cloud credentials from the environment: the
-    stored `auth_env` map is layered on top of os.environ, a stored AWS
+    entry's stored `auth_env` map is layered on top of os.environ, a stored AWS
     credentials file (ini, for profile users) is materialized to a mode-0600
     temp file exposed as AWS_SHARED_CREDENTIALS_FILE, and a stored GCP service
     account JSON key likewise becomes GOOGLE_APPLICATION_CREDENTIALS (with
     CLOUDSDK_CORE_DISABLE_PROMPTS=1 so gcloud never blocks on a prompt) — all
     for the duration of the call.
+
+    When `cloud_account` (a kind=cloud row with credentials, resolved via
+    `resolve_cloud_account`) is given, its AWS credentials file / GCP service
+    account key take precedence over the entry's inline copies (which remain
+    the fallback). `aws_profile` sets AWS_PROFILE last, so it wins over any
+    profile in the entry's auth_env.
     """
     creds = infra.get("credentials") or {}
+    account_creds = (cloud_account or {}).get("credentials") or {}
     auth_env_raw = decrypt_secret(creds.get("auth_env_enc"), secret_key)
-    aws_file = decrypt_secret(creds.get("aws_credentials_file_enc"), secret_key)
-    gcp_json = decrypt_secret(creds.get("gcp_service_account_json_enc"), secret_key)
-    if not auth_env_raw and not aws_file and not gcp_json:
+    aws_file = decrypt_secret(
+        account_creds.get("aws_credentials_file_enc"), secret_key
+    ) or decrypt_secret(creds.get("aws_credentials_file_enc"), secret_key)
+    gcp_json = decrypt_secret(
+        account_creds.get("gcp_service_account_json_enc"), secret_key
+    ) or decrypt_secret(creds.get("gcp_service_account_json_enc"), secret_key)
+    if not auth_env_raw and not aws_file and not gcp_json and not aws_profile:
         yield None
         return
 
@@ -356,10 +488,16 @@ def k8s_auth_env(infra: dict, secret_key: str) -> Iterator[dict | None]:
             paths.append(path)
             env["GOOGLE_APPLICATION_CREDENTIALS"] = path
             env["CLOUDSDK_CORE_DISABLE_PROMPTS"] = "1"
+        if aws_profile:
+            env["AWS_PROFILE"] = aws_profile
         yield env
     finally:
         for path in paths:
             os.unlink(path)
+
+
+# Former name; kubectl callers predate the cloud-account generalization.
+k8s_auth_env = cloud_auth_env
 
 
 async def _unique_slug(pool: asyncpg.Pool, base: str) -> str:
@@ -402,14 +540,19 @@ async def create_infra(pool: asyncpg.Pool, data: dict[str, Any], secret_key: str
     slug = (data.get("slug") or "").strip()
     slug = await _unique_slug(pool, _slugify(slug or name))
     kind = data.get("kind") or "ssh_host"
+    if kind not in _INFRA_KINDS:
+        raise ValueError(f"unknown kind {kind!r}; expected one of {list(_INFRA_KINDS)}")
     coding = validate_coding(data.get("coding"), kind)
     await _assert_single_coding_host(pool, coding)
+    cloud = validate_cloud(data.get("cloud"), kind)
+    await _assert_cloud_ref(pool, cloud)
 
     row = await pool.fetchrow(
         f"INSERT INTO infra "
         "(slug, name, kind, host, ssh_user, ssh_port, ssh_key_ref, docker_context, "
-        " hosts_aegis, read_only, setup_files, setup_command, metadata, coding, credentials) "
-        "VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15) "
+        " hosts_aegis, read_only, setup_files, setup_command, metadata, coding, cloud, "
+        " credentials) "
+        "VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16) "
         f"RETURNING {_SELECT_COLS}",
         slug,
         name,
@@ -425,6 +568,7 @@ async def create_infra(pool: asyncpg.Pool, data: dict[str, Any], secret_key: str
         data.get("setup_command"),
         data.get("metadata") or {},
         coding,
+        cloud,
         _merged_credentials(None, data, secret_key),
     )
     return public_infra(dict(row))
@@ -438,11 +582,27 @@ async def update_infra(
         return None
 
     fields = {k: v for k, v in data.items() if k in _EDITABLE_FIELDS and v is not None}
+    effective_kind = fields.get("kind") or existing.get("kind") or ""
+    if "kind" in fields and fields["kind"] not in _INFRA_KINDS:
+        raise ValueError(f"unknown kind {fields['kind']!r}; expected one of {list(_INFRA_KINDS)}")
     if "coding" in fields:
-        fields["coding"] = validate_coding(
-            fields["coding"], fields.get("kind") or existing.get("kind") or ""
-        )
+        fields["coding"] = validate_coding(fields["coding"], effective_kind)
         await _assert_single_coding_host(pool, fields["coding"], exclude_id=infra_id)
+    if "cloud" in fields or ("kind" in fields and (existing.get("cloud") or {})):
+        # Re-validate on kind change too, so e.g. a cloud row flipped to
+        # ssh_host can't keep a stale provider block.
+        new_cloud = validate_cloud(fields.get("cloud", existing.get("cloud")), effective_kind)
+        await _assert_cloud_ref(pool, new_cloud)
+        # `identity` is provision-owned; carry it across operator edits as
+        # long as the row stays the same provider's account.
+        old_cloud = existing.get("cloud") or {}
+        if (
+            effective_kind == "cloud"
+            and old_cloud.get("identity")
+            and old_cloud.get("provider") == new_cloud.get("provider")
+        ):
+            new_cloud["identity"] = old_cloud["identity"]
+        fields["cloud"] = new_cloud
     if any(data.get(k) for k in _SECRET_INPUT_FIELDS):
         fields["credentials"] = _merged_credentials(existing.get("credentials"), data, secret_key)
     if not fields:
@@ -531,6 +691,11 @@ async def provision_infra(pool: asyncpg.Pool, infra_id: UUID | str, secret_key: 
         # k8s provisioning is a pure connectivity check — allowed even on
         # read-only entries.
         return await _provision_k8s(pool, infra, secret_key)
+
+    if infra.get("kind") == "cloud":
+        # cloud provisioning is a pure identity check — allowed even on
+        # read-only entries.
+        return await _provision_cloud(pool, infra, secret_key)
 
     if infra.get("read_only"):
         error = "entry is read-only — SSH provisioning writes files/runs commands on the host"
@@ -659,7 +824,18 @@ async def _provision_k8s(pool: asyncpg.Pool, infra: dict, secret_key: str) -> di
             }
         )
 
-    with kubeconfig_file(infra, secret_key) as cfg, k8s_auth_env(infra, secret_key) as env:
+    try:
+        cloud_account, aws_profile = await resolve_cloud_account(pool, infra)
+    except ValueError as exc:
+        log.append({"step": "preflight", "ok": False, "error": str(exc)})
+        return await _finish_provision(pool, infra_id, infra["slug"], str(exc), log)
+
+    with (
+        kubeconfig_file(infra, secret_key) as cfg,
+        cloud_auth_env(
+            infra, secret_key, cloud_account=cloud_account, aws_profile=aws_profile
+        ) as env,
+    ):
         if not cfg:
             error = "a kubeconfig is required to provision a k8s entry"
             log.append({"step": "preflight", "ok": False, "error": error})
@@ -686,6 +862,169 @@ async def _provision_k8s(pool: asyncpg.Pool, infra: dict, secret_key: str) -> di
                 error = f"kubectl get nodes failed: {(result['stderr'] or 'unknown')[:200]}"
 
     return await _finish_provision(pool, infra_id, infra["slug"], error, log)
+
+
+# ── cloud accounts (kind=cloud entries) ─────────────────────────────────────
+#
+# Provision = a pure identity check: `aws sts get-caller-identity` for AWS,
+# `gcloud auth application-default print-access-token` for GCP (the ADC
+# variant is the one that honors GOOGLE_APPLICATION_CREDENTIALS). The result
+# is stored in the row's cloud.identity so the admin UI and chat can show
+# which account/principal a slug maps to without re-running the CLI.
+
+_CLOUD_TIMEOUT = 30
+
+
+async def cloud_identity_check(infra: dict, secret_key: str, profile: str | None = None) -> dict:
+    """Run the provider identity check for a kind=cloud row (credentials
+    included). Returns {"ok", "provider", "identity", "detail"} or
+    {"ok": False, "error"} — never raises, never includes secret material
+    (the GCP check's stdout IS an access token and is deliberately dropped).
+    """
+    cloud = infra.get("cloud") or {}
+    provider = cloud.get("provider")
+    if provider not in _CLOUD_PROVIDERS:
+        return {"ok": False, "error": "not a cloud account entry (no provider configured)"}
+
+    binary = _CLOUD_CLI[provider]
+    if not _cloud_cli_path(binary):
+        return {"ok": False, "error": _CLOUD_CLI_HINT[provider]}
+
+    creds = infra.get("credentials") or {}
+    if provider == "aws":
+        if not (creds.get("aws_credentials_file_enc") or {}).get("value") and not (
+            creds.get("auth_env_enc") or {}
+        ).get("value"):
+            return {
+                "ok": False,
+                "error": "no AWS credentials stored — paste a credentials file or auth env",
+            }
+        try:
+            resolved_profile = _clean_profile(
+                profile if profile is not None else cloud.get("default_profile"), "profile"
+            )
+        except ValueError as exc:
+            return {"ok": False, "error": str(exc)}
+        with cloud_auth_env(infra, secret_key, aws_profile=resolved_profile or None) as env:
+            env = env if env is not None else dict(os.environ)
+            # sts needs a signing region even though the identity is global.
+            env.setdefault("AWS_DEFAULT_REGION", cloud.get("region") or "us-east-1")
+            result = await _run_ssh(
+                ["aws", "sts", "get-caller-identity", "--output", "json"],
+                timeout=_CLOUD_TIMEOUT,
+                env=env,
+            )
+        if not result["ok"]:
+            return {
+                "ok": False,
+                "error": (result["stderr"] or result["stdout"] or "aws sts failed")[:300],
+            }
+        try:
+            payload = json.loads(result["stdout"])
+        except ValueError:
+            return {"ok": False, "error": "aws sts returned unparseable output"}
+        identity = {
+            "account_id": payload.get("Account", ""),
+            "arn": payload.get("Arn", ""),
+            "user_id": payload.get("UserId", ""),
+            "profile": resolved_profile or None,
+        }
+        detail = f"account {identity['account_id']} — {identity['arn']}"
+        return {"ok": True, "provider": provider, "identity": identity, "detail": detail}
+
+    # gcp
+    sa_json = decrypt_secret(creds.get("gcp_service_account_json_enc"), secret_key)
+    if not sa_json:
+        return {"ok": False, "error": "no GCP service account JSON stored for this entry"}
+    try:
+        sa = json.loads(sa_json)
+    except ValueError:
+        sa = {}
+    with cloud_auth_env(infra, secret_key) as env:
+        result = await _run_ssh(
+            ["gcloud", "auth", "application-default", "print-access-token"],
+            timeout=_CLOUD_TIMEOUT,
+            env=env,
+        )
+    if not result["ok"]:
+        return {
+            "ok": False,
+            "error": (result["stderr"] or "gcloud access-token check failed")[:300],
+        }
+    identity = {
+        "project": cloud.get("project") or sa.get("project_id", ""),
+        "service_account": sa.get("client_email", ""),
+    }
+    detail = (
+        f"access token acquired for {identity['service_account'] or 'service account'} "
+        f"(project {identity['project'] or 'unknown'})"
+    )
+    return {"ok": True, "provider": provider, "identity": identity, "detail": detail}
+
+
+async def _provision_cloud(pool: asyncpg.Pool, infra: dict, secret_key: str) -> dict:
+    """Provisioning for kind=cloud: verify the stored credentials resolve to a
+    real principal, and record who that is in cloud.identity."""
+    infra_id = infra["id"]
+    await pool.execute(
+        "UPDATE infra SET status = 'provisioning', updated_at = now() WHERE id = $1", infra_id
+    )
+
+    log: list[dict] = []
+    if infra.get("setup_files") or infra.get("setup_command"):
+        log.append(
+            {
+                "step": "note",
+                "ok": True,
+                "stdout": "setup_files/setup_command are SSH-only; skipped for a cloud entry",
+            }
+        )
+
+    provider = (infra.get("cloud") or {}).get("provider", "cloud")
+    result = await cloud_identity_check(infra, secret_key)
+    step = f"{provider}_identity_check"
+    error: str | None = None
+    if result["ok"]:
+        log.append({"step": step, "ok": True, "stdout": result["detail"]})
+        await pool.execute(
+            "UPDATE infra SET cloud = jsonb_set(cloud, '{identity}', $2::jsonb), "
+            "updated_at = now() WHERE id = $1",
+            infra_id,
+            result["identity"],
+        )
+    else:
+        error = result["error"]
+        log.append({"step": step, "ok": False, "error": error})
+
+    return await _finish_provision(pool, infra_id, infra["slug"], error, log)
+
+
+async def list_cloud_accounts(pool: asyncpg.Pool) -> list[dict]:
+    """Compact, secret-free listing of kind=cloud entries (chat/UI surface)."""
+    rows = await pool.fetch(f"SELECT {_SELECT_COLS} FROM infra WHERE kind = 'cloud' ORDER BY slug")
+    out = []
+    for r in rows:
+        row = public_infra(dict(r))
+        cloud = row.get("cloud") or {}
+        out.append(
+            {
+                "slug": row["slug"],
+                "name": row["name"],
+                "provider": cloud.get("provider"),
+                "status": row["status"],
+                "default_profile": cloud.get("default_profile") or None,
+                "region": cloud.get("region") or None,
+                "project": cloud.get("project") or None,
+                "identity": cloud.get("identity") or None,
+                "has_credentials": bool(
+                    row.get("has_aws_credentials")
+                    or row.get("has_gcp_service_account")
+                    or row.get("has_auth_env")
+                ),
+                "last_provisioned_at": row.get("last_provisioned_at"),
+            }
+        )
+    return out
 
 
 # ── k8s operations (kind=k8s entries with a stored kubeconfig) ──────────────
@@ -721,7 +1060,16 @@ async def _kubectl(
         return _k8s_error(400, "not a k8s infra entry")
     if mutating and infra.get("read_only"):
         return _k8s_error(403, "entry is read-only — mutating operations are disabled for it")
-    with kubeconfig_file(infra, secret_key) as cfg, k8s_auth_env(infra, secret_key) as env:
+    try:
+        cloud_account, aws_profile = await resolve_cloud_account(pool, infra)
+    except ValueError as exc:
+        return _k8s_error(400, str(exc))
+    with (
+        kubeconfig_file(infra, secret_key) as cfg,
+        cloud_auth_env(
+            infra, secret_key, cloud_account=cloud_account, aws_profile=aws_profile
+        ) as env,
+    ):
         if not cfg:
             return _k8s_error(400, "no kubeconfig stored for this entry")
         result = await _run_ssh(

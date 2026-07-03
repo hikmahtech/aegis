@@ -13,6 +13,7 @@ never requires mounting files into containers or redeploying.
 | `swarm` | A Docker Swarm manager, reached over SSH | Provisioning; the `hosts_aegis` service probe; maps chat's `swarm` context onto the read-only gate |
 | `docker` | A plain Docker host | Same as `swarm` |
 | `k8s` | A Kubernetes cluster, reached via kubeconfig | Provision = connectivity check; list pods/deployments, pod logs, rolling restart — from the UI **and** chat |
+| `cloud` | A cloud provider account (one row per AWS account / GCP project) | Provision = identity check (`aws sts get-caller-identity` / GCP ADC token); lends exec-plugin credentials to `k8s` entries; `list_cloud_accounts` / `cloud_identity` in chat |
 
 ## Credentials — how secrets are handled
 
@@ -41,12 +42,12 @@ Per-entry secret fields:
 - **Auth env** (`kind=k8s`) — `KEY=value` lines injected into the environment
   of every kubectl call for this entry. This is how exec-plugin kubeconfigs
   (EKS, GKE) get their cloud credentials.
-- **AWS credentials file** (`kind=k8s`) — a `~/.aws/credentials`-style ini for
-  profile users; materialized per call and exposed as
-  `AWS_SHARED_CREDENTIALS_FILE`.
-- **GCP service account JSON** (`kind=k8s`) — a service-account key file;
-  materialized per call and exposed as `GOOGLE_APPLICATION_CREDENTIALS`
-  (honored by `gke-gcloud-auth-plugin`), with
+- **AWS credentials file** (`kind=k8s`, `kind=cloud`) — a
+  `~/.aws/credentials`-style ini for profile users; materialized per call and
+  exposed as `AWS_SHARED_CREDENTIALS_FILE`.
+- **GCP service account JSON** (`kind=k8s`, `kind=cloud`) — a service-account
+  key file; materialized per call and exposed as
+  `GOOGLE_APPLICATION_CREDENTIALS` (honored by `gke-gcloud-auth-plugin`), with
   `CLOUDSDK_CORE_DISABLE_PROMPTS=1` set so gcloud never blocks on a prompt.
 
 ## The read-only flag
@@ -215,6 +216,84 @@ kubectl config view --minify --flatten --context=<gke-ctx> > /tmp/aegis-kubeconf
 # 4. Provision → "N node(s) reachable"
 ```
 
+## Cloud accounts (`kind=cloud`)
+
+A **Cloud account** entry represents one AWS account or one GCP project as a
+first-class registry row — independent of any cluster. Use one row per
+account: `aws-hikmah`, `aws-stockopedia`, `gcp-main`, … Each row carries its
+own encrypted credentials plus a little non-secret config:
+
+| Provider | Secret (write-only, encrypted) | Non-secret config |
+|---|---|---|
+| `aws` | **AWS credentials file** (multi-profile ini) and/or **Auth env** (`AWS_ACCESS_KEY_ID=…` lines) | **Default profile** (used as `AWS_PROFILE` when nothing more specific is given), **Region** |
+| `gcp` | **GCP service account JSON** | **Project** |
+
+The AWS ini is the full `~/.aws/credentials` shape, so one account row can
+hold several profiles — including role-assumption ones (remember the
+`[default]` source-profile rule above):
+
+```ini
+[default]
+aws_access_key_id = AKIA...
+aws_secret_access_key = ...
+
+[prod]
+role_arn = arn:aws:iam::111111111111:role/aegis-ops
+source_profile = default
+
+[staging]
+role_arn = arn:aws:iam::222222222222:role/aegis-ops
+source_profile = default
+```
+
+**Provision** runs a pure identity check (allowed even on read-only entries,
+like the k8s connectivity check):
+
+- `aws` → `aws sts get-caller-identity` with `AWS_PROFILE` set to the default
+  profile (when configured) and `AWS_DEFAULT_REGION` from the region field —
+  the resulting account id / ARN are stored on the row (`cloud.identity`) and
+  shown in the UI and `list_cloud_accounts`.
+- `gcp` → `gcloud auth application-default print-access-token` with
+  `GOOGLE_APPLICATION_CREDENTIALS` pointing at the materialized key (that is
+  the gcloud variant that honors ADC); the token itself is discarded — only
+  the project + service-account email are recorded.
+
+Both require the matching CLI in the image. When it is missing, provisioning
+(and the chat tools) fail with an explicit
+`aws CLI not in image — build with --build-arg EXTRA_CLOUD_CLIS=aws`
+(or `…=gcloud`) instead of a confusing exec error.
+
+### k8s entries referencing a cloud account
+
+A `k8s` entry can point at a cloud account instead of carrying its own copy
+of the cloud credentials: pick it in the **Cloud account** dropdown (stored
+as `cloud.cloud_slug`), optionally with an **AWS profile override** for that
+cluster. Every kubectl call (and the provision connectivity check) then
+resolves the account row's credentials at execution time, with
+
+- `AWS_PROFILE` = the k8s entry's profile override, else the account's
+  default profile;
+- the account's credentials file / SA key winning over any inline copies the
+  k8s entry still has (inline remains the fallback, so existing entries keep
+  working unchanged — referencing an account is opt-in).
+
+One AWS account row with `[prod]`/`[staging]` profiles can therefore back
+several EKS clusters, each selecting its profile — rotate the keys in one
+place. A dangling reference (account deleted later) fails the call with a
+clear 400; the API refuses to save an unknown/non-cloud `cloud_slug` up
+front.
+
+### Chat
+
+Pandora gets two read-only tools:
+
+- `list_cloud_accounts` — slugs, provider, status, default profile / project,
+  and the identity recorded at the last provision.
+- `cloud_identity` — runs the identity check live for one slug (optional
+  `profile` override), e.g. "which principal is `aws-hikmah`'s `staging`
+  profile?". Errors (missing CLI, bad credentials, unknown slug) come back as
+  plain tool errors, never crashes.
+
 ## Remote script / coding agents
 
 The remote-script subsystem (chat's `run_script` infra tools, coding-CLI runs
@@ -285,12 +364,15 @@ Pandora's infra tools work against registry clusters by slug:
   read-only.
 - ArgoCD tools are script-host only (they need the `argocd` CLI, not just a
   kubeconfig).
+- `list_cloud_accounts` / `cloud_identity` — registered cloud accounts (see
+  the Cloud accounts section above).
 
 ## Troubleshooting
 
 | Symptom | Cause |
 |---|---|
 | Provision error `exec plugin: executable aws not found` | Image built without `EXTRA_CLOUD_CLIS=aws` |
+| `aws CLI not in image — build with --build-arg EXTRA_CLOUD_CLIS=aws` (cloud entry / chat) | Same cause — the cloud-account gate reports it up front |
 | Provision error `exec plugin: executable gke-gcloud-auth-plugin not found` | Image built without `gcloud` in `EXTRA_CLOUD_CLIS` |
 | Provision error mentioning `getting credentials` / `ExpiredToken` | Auth env keys missing/wrong for this entry |
 | Provision error `Unable to connect to the server` | API endpoint not reachable from the core container (VPN-only endpoint?) |

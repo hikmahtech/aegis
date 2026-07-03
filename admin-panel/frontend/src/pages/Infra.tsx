@@ -4,7 +4,7 @@ import ErrorBanner from '../components/ErrorBanner';
 import ActionMenu from '../components/ActionMenu';
 import JsonViewer from '../components/JsonViewer';
 
-const INFRA_KINDS = ['ssh_host', 'swarm', 'docker', 'k8s'];
+const INFRA_KINDS = ['ssh_host', 'swarm', 'docker', 'k8s', 'cloud'];
 
 interface SetupFile {
   path: string;
@@ -151,6 +151,15 @@ interface InfraFormData {
   setup_command: string;
   setup_files: SetupFile[];
   coding: CodingFormData;
+  // Cloud account block (kind=cloud) — non-secret; the credentials reuse the
+  // aws_credentials_file / gcp_service_account_json write-only fields above.
+  cloud_provider: string;
+  cloud_default_profile: string;
+  cloud_region: string;
+  cloud_project: string;
+  // Cloud account reference (kind=k8s).
+  cloud_slug: string;
+  cloud_profile: string;
 }
 
 const emptyForm: InfraFormData = {
@@ -171,6 +180,12 @@ const emptyForm: InfraFormData = {
   setup_command: '',
   setup_files: [],
   coding: { ...emptyCoding },
+  cloud_provider: 'aws',
+  cloud_default_profile: '',
+  cloud_region: '',
+  cloud_project: '',
+  cloud_slug: '',
+  cloud_profile: '',
 };
 
 function statusBadgeClass(status: string) {
@@ -490,6 +505,12 @@ export default function Infra() {
         ? row.setup_files.map((f: any) => ({ path: f.path || '', content: f.content || '', mode: f.mode || '' }))
         : [],
       coding: codingFromRow(row.coding),
+      cloud_provider: row.cloud?.provider || 'aws',
+      cloud_default_profile: row.cloud?.default_profile || '',
+      cloud_region: row.cloud?.region || '',
+      cloud_project: row.cloud?.project || '',
+      cloud_slug: row.cloud?.cloud_slug || '',
+      cloud_profile: row.cloud?.profile || '',
     });
     setShowCoding(!!row.coding?.enabled);
     setEditingHadCoding(!!row.coding && Object.keys(row.coding).length > 0);
@@ -550,7 +571,16 @@ export default function Infra() {
       if (form.gcp_service_account_json.trim()) payload.gcp_service_account_json = form.gcp_service_account_json;
       if (form.docker_context.trim()) payload.docker_context = form.docker_context.trim();
       if (form.setup_command.trim()) payload.setup_command = form.setup_command.trim();
-      if (form.kind !== 'k8s' && (codingTouched(form.coding) || editingHadCoding)) {
+      if (form.kind === 'cloud') {
+        payload.cloud = form.cloud_provider === 'aws'
+          ? { provider: 'aws', default_profile: form.cloud_default_profile.trim(), region: form.cloud_region.trim() }
+          : { provider: 'gcp', project: form.cloud_project.trim() };
+      } else if (form.kind === 'k8s') {
+        payload.cloud = form.cloud_slug
+          ? { cloud_slug: form.cloud_slug, profile: form.cloud_profile.trim() }
+          : {};
+      }
+      if (form.kind !== 'k8s' && form.kind !== 'cloud' && (codingTouched(form.coding) || editingHadCoding)) {
         if (form.coding.tmux_window_cap.trim() && Number.isNaN(Number(form.coding.tmux_window_cap))) {
           setFormError('tmux window cap must be a number'); setSaving(false); return;
         }
@@ -639,42 +669,132 @@ export default function Infra() {
                 </div>
               </div>
 
-              <div className="form-group">
-                <label>Host</label>
-                <input value={form.host} onChange={e => setForm({ ...form, host: e.target.value })} placeholder="hostname or IP" className="mono" />
-              </div>
+              {form.kind !== 'cloud' && (
+                <>
+                  <div className="form-group">
+                    <label>Host</label>
+                    <input value={form.host} onChange={e => setForm({ ...form, host: e.target.value })} placeholder="hostname or IP" className="mono" />
+                  </div>
 
-              <div className="form-row">
-                <div className="form-group">
-                  <label>SSH user</label>
-                  <input value={form.ssh_user} onChange={e => setForm({ ...form, ssh_user: e.target.value })} placeholder="e.g. ubuntu" />
-                </div>
-                <div className="form-group">
-                  <label>SSH port</label>
-                  <input value={form.ssh_port} onChange={e => setForm({ ...form, ssh_port: e.target.value })} placeholder="22" />
-                </div>
-              </div>
+                  <div className="form-row">
+                    <div className="form-group">
+                      <label>SSH user</label>
+                      <input value={form.ssh_user} onChange={e => setForm({ ...form, ssh_user: e.target.value })} placeholder="e.g. ubuntu" />
+                    </div>
+                    <div className="form-group">
+                      <label>SSH port</label>
+                      <input value={form.ssh_port} onChange={e => setForm({ ...form, ssh_port: e.target.value })} placeholder="22" />
+                    </div>
+                  </div>
 
-              <div className="form-group">
-                <label>SSH private key (stored encrypted)</label>
-                <textarea
-                  rows={4}
-                  value={form.ssh_private_key}
-                  onChange={e => setForm({ ...form, ssh_private_key: e.target.value })}
-                  className="mono"
-                  placeholder={editingSecrets.hasSshKey
-                    ? 'set — paste to replace, leave blank to keep'
-                    : '-----BEGIN OPENSSH PRIVATE KEY-----'}
-                />
-              </div>
+                  <div className="form-group">
+                    <label>SSH private key (stored encrypted)</label>
+                    <textarea
+                      rows={4}
+                      value={form.ssh_private_key}
+                      onChange={e => setForm({ ...form, ssh_private_key: e.target.value })}
+                      className="mono"
+                      placeholder={editingSecrets.hasSshKey
+                        ? 'set — paste to replace, leave blank to keep'
+                        : '-----BEGIN OPENSSH PRIVATE KEY-----'}
+                    />
+                  </div>
 
-              <div className="form-group">
-                <label>SSH key ref (optional if key pasted above)</label>
-                <input value={form.ssh_key_ref} onChange={e => setForm({ ...form, ssh_key_ref: e.target.value })} placeholder="path to private key on core host" className="mono" />
-              </div>
+                  <div className="form-group">
+                    <label>SSH key ref (optional if key pasted above)</label>
+                    <input value={form.ssh_key_ref} onChange={e => setForm({ ...form, ssh_key_ref: e.target.value })} placeholder="path to private key on core host" className="mono" />
+                  </div>
+                </>
+              )}
+
+              {form.kind === 'cloud' && (
+                <>
+                  <div className="form-group">
+                    <label>Provider</label>
+                    <select value={form.cloud_provider} onChange={e => setForm({ ...form, cloud_provider: e.target.value })}>
+                      <option value="aws">aws</option>
+                      <option value="gcp">gcp</option>
+                    </select>
+                  </div>
+
+                  {form.cloud_provider === 'aws' ? (
+                    <>
+                      <div className="form-group">
+                        <label>AWS credentials file (stored encrypted — multi-profile ini)</label>
+                        <textarea
+                          rows={5}
+                          value={form.aws_credentials_file}
+                          onChange={e => setForm({ ...form, aws_credentials_file: e.target.value })}
+                          className="mono"
+                          placeholder={editingSecrets.hasAwsCredentials
+                            ? 'set — paste to replace, leave blank to keep'
+                            : '[default]\naws_access_key_id = ...\naws_secret_access_key = ...\n[prod]\nrole_arn = ...\nsource_profile = default'}
+                        />
+                      </div>
+                      <div className="form-group">
+                        <label>Auth env (KEY=value per line, stored encrypted — alternative to the file)</label>
+                        <textarea
+                          rows={2}
+                          value={form.auth_env}
+                          onChange={e => setForm({ ...form, auth_env: e.target.value })}
+                          className="mono"
+                          placeholder={editingSecrets.hasAuthEnv
+                            ? 'set — paste to replace, leave blank to keep'
+                            : 'AWS_ACCESS_KEY_ID=...\nAWS_SECRET_ACCESS_KEY=...'}
+                        />
+                      </div>
+                      <div className="form-row">
+                        <div className="form-group">
+                          <label>Default profile (AWS_PROFILE when none given)</label>
+                          <input value={form.cloud_default_profile} onChange={e => setForm({ ...form, cloud_default_profile: e.target.value })} placeholder="e.g. prod" className="mono" />
+                        </div>
+                        <div className="form-group">
+                          <label>Region</label>
+                          <input value={form.cloud_region} onChange={e => setForm({ ...form, cloud_region: e.target.value })} placeholder="e.g. eu-west-2" className="mono" />
+                        </div>
+                      </div>
+                    </>
+                  ) : (
+                    <>
+                      <div className="form-group">
+                        <label>GCP service account JSON (stored encrypted)</label>
+                        <textarea
+                          rows={5}
+                          value={form.gcp_service_account_json}
+                          onChange={e => setForm({ ...form, gcp_service_account_json: e.target.value })}
+                          className="mono"
+                          placeholder={editingSecrets.hasGcpServiceAccount
+                            ? 'set — paste to replace, leave blank to keep'
+                            : '{\n  "type": "service_account",\n  "project_id": "...",\n  ...\n}'}
+                        />
+                      </div>
+                      <div className="form-group">
+                        <label>Project</label>
+                        <input value={form.cloud_project} onChange={e => setForm({ ...form, cloud_project: e.target.value })} placeholder="gcp project id" className="mono" />
+                      </div>
+                    </>
+                  )}
+                </>
+              )}
 
               {form.kind === 'k8s' && (
                 <>
+                  <div className="form-row">
+                    <div className="form-group">
+                      <label>Cloud account (optional — pulls exec-plugin credentials)</label>
+                      <select value={form.cloud_slug} onChange={e => setForm({ ...form, cloud_slug: e.target.value })}>
+                        <option value="">(none — inline credentials below)</option>
+                        {rows.filter(r => r.kind === 'cloud').map(r => (
+                          <option key={r.slug} value={r.slug}>{r.slug} ({r.cloud?.provider})</option>
+                        ))}
+                      </select>
+                    </div>
+                    <div className="form-group">
+                      <label>AWS profile override (else account default)</label>
+                      <input value={form.cloud_profile} onChange={e => setForm({ ...form, cloud_profile: e.target.value })} placeholder="e.g. prod" className="mono" disabled={!form.cloud_slug} />
+                    </div>
+                  </div>
+
                   <div className="form-group">
                     <label>Kubeconfig (stored encrypted)</label>
                     <textarea
@@ -729,36 +849,40 @@ export default function Infra() {
                 </>
               )}
 
-              <div className="form-group">
-                <label>Docker context (optional)</label>
-                <input value={form.docker_context} onChange={e => setForm({ ...form, docker_context: e.target.value })} placeholder="e.g. swarm" className="mono" />
-              </div>
+              {form.kind !== 'cloud' && (
+                <>
+                  <div className="form-group">
+                    <label>Docker context (optional)</label>
+                    <input value={form.docker_context} onChange={e => setForm({ ...form, docker_context: e.target.value })} placeholder="e.g. swarm" className="mono" />
+                  </div>
 
-              <div className="form-group">
-                <label>
-                  <input
-                    type="checkbox"
-                    checked={form.hosts_aegis}
-                    onChange={e => setForm({ ...form, hosts_aegis: e.target.checked })}
-                    style={{ width: 'auto', marginRight: '0.4rem' }}
-                  />
-                  This host runs AEGIS itself
-                </label>
-              </div>
+                  <div className="form-group">
+                    <label>
+                      <input
+                        type="checkbox"
+                        checked={form.hosts_aegis}
+                        onChange={e => setForm({ ...form, hosts_aegis: e.target.checked })}
+                        style={{ width: 'auto', marginRight: '0.4rem' }}
+                      />
+                      This host runs AEGIS itself
+                    </label>
+                  </div>
 
-              <div className="form-group">
-                <label>
-                  <input
-                    type="checkbox"
-                    checked={form.read_only}
-                    onChange={e => setForm({ ...form, read_only: e.target.checked })}
-                    style={{ width: 'auto', marginRight: '0.4rem' }}
-                  />
-                  Read-only — block mutating operations (k8s restarts, SSH provisioning)
-                </label>
-              </div>
+                  <div className="form-group">
+                    <label>
+                      <input
+                        type="checkbox"
+                        checked={form.read_only}
+                        onChange={e => setForm({ ...form, read_only: e.target.checked })}
+                        style={{ width: 'auto', marginRight: '0.4rem' }}
+                      />
+                      Read-only — block mutating operations (k8s restarts, SSH provisioning)
+                    </label>
+                  </div>
+                </>
+              )}
 
-              {form.kind !== 'k8s' && (
+              {form.kind !== 'k8s' && form.kind !== 'cloud' && (
                 <div className="card" style={{ marginBottom: '0.75rem', padding: '0.75rem' }}>
                   <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
                     <strong>Coding agent (remote script)</strong>
@@ -883,6 +1007,8 @@ export default function Infra() {
                 </div>
               )}
 
+              {form.kind !== 'cloud' && (
+              <>
               <div className="form-group">
                 <label>Setup command (optional)</label>
                 <textarea rows={3} value={form.setup_command} onChange={e => setForm({ ...form, setup_command: e.target.value })} className="mono" placeholder="e.g. bash /opt/aegis/setup.sh" />
@@ -912,6 +1038,8 @@ export default function Infra() {
                 ))}
                 <button className="btn btn-sm" onClick={addSetupFile}>+ Add setup file</button>
               </div>
+              </>
+              )}
             </div>
             <div className="modal-footer">
               <button className="btn" onClick={() => setShowForm(false)}>Cancel</button>
@@ -954,7 +1082,19 @@ export default function Infra() {
                     </td>
                     <td>{row.kind}</td>
                     <td className="mono">
-                      {row.host}{row.ssh_port ? `:${row.ssh_port}` : ''}
+                      {row.kind === 'cloud' ? (
+                        <>
+                          {row.cloud?.provider}
+                          {(row.has_aws_credentials || row.has_gcp_service_account || row.has_auth_env) && <span title="Credentials stored" style={{ marginLeft: 4 }}>&#128273;</span>}
+                          <div className="meta">
+                            {row.cloud?.identity?.account_id || row.cloud?.identity?.project || row.cloud?.project || (row.cloud?.provider === 'aws' ? 'not yet provisioned' : '')}
+                            {row.cloud?.default_profile ? ` · ${row.cloud.default_profile}` : ''}
+                          </div>
+                        </>
+                      ) : (
+                        <>{row.host}{row.ssh_port ? `:${row.ssh_port}` : ''}</>
+                      )}
+                      {row.kind === 'k8s' && row.cloud?.cloud_slug && <span className="badge badge-neutral" title="Credentials from cloud account" style={{ marginLeft: 4 }}>{row.cloud.cloud_slug}</span>}
                       {row.has_ssh_key && <span title="SSH key stored" style={{ marginLeft: 4 }}>&#128273;</span>}
                       {row.read_only && <span className="badge badge-neutral" title="Mutating operations blocked" style={{ marginLeft: 4 }}>read-only</span>}
                       {row.coding?.enabled && <span className="badge badge-success" title="Remote-script / coding-agent host" style={{ marginLeft: 4 }}>coding host</span>}

@@ -734,6 +734,45 @@ CHAT_TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "list_cloud_accounts",
+            "description": (
+                "List registered cloud provider accounts (AWS accounts, GCP projects) "
+                "from the infrastructure registry: slug, provider, status, and the "
+                "account id / project recorded at the last provision. Read-only."
+            ),
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "cloud_identity",
+            "description": (
+                "Run a live identity check for a registered cloud account "
+                "(`aws sts get-caller-identity` / GCP access-token check) and report "
+                "which principal the stored credentials resolve to. Read-only."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "slug": {
+                        "type": "string",
+                        "description": "Slug of a registered cloud account (kind=cloud)",
+                    },
+                    "profile": {
+                        "type": "string",
+                        "description": (
+                            "AWS profile override; omit to use the account's default profile"
+                        ),
+                    },
+                },
+                "required": ["slug"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "run_infra_script",
             "description": (
                 "Run an infrastructure script from the predefined scripts/infra/ "
@@ -1403,6 +1442,49 @@ async def _exec_restart_deployment(pool: asyncpg.Pool, args: dict, ctx: ToolCont
             }
         )
     return await _exec_registry_k8s("restart_deployment", pool, args, ctx, infra_id)
+
+
+async def _exec_list_cloud_accounts(pool: asyncpg.Pool, args: dict, ctx: ToolContext) -> str:
+    """Read-only listing of registered cloud accounts (kind=cloud entries)."""
+    from aegis.services import infra as infra_service
+
+    if pool is None:
+        return json.dumps({"error": "database not available"})
+    accounts = await infra_service.list_cloud_accounts(pool)
+    if not accounts:
+        return json.dumps(
+            {
+                "accounts": [],
+                "note": "no cloud accounts registered — add a kind=cloud infrastructure entry",
+            }
+        )
+    return json.dumps({"accounts": accounts}, default=str)
+
+
+async def _exec_cloud_identity(pool: asyncpg.Pool, args: dict, ctx: ToolContext) -> str:
+    """Live identity check for one registered cloud account. Read-only; all
+    failure modes (unknown slug, missing CLI, bad credentials) come back as a
+    clear error envelope, never an exception."""
+    from aegis.services import infra as infra_service
+
+    if pool is None:
+        return json.dumps({"error": "database not available"})
+    slug = (args.get("slug") or "").strip()
+    if err := _validate_infra_name(slug, "slug"):
+        return json.dumps({"error": err})
+    row = await infra_service.get_infra_by_slug(pool, slug, include_credentials=True)
+    if not row or row.get("kind") != "cloud":
+        return json.dumps(
+            {"error": f"Unknown cloud account: {slug!r} — see list_cloud_accounts"}
+        )
+    secret_key = getattr(ctx.settings, "secret_key", "") or ""
+    profile = (args.get("profile") or "").strip() or None
+    result = await infra_service.cloud_identity_check(row, secret_key, profile=profile)
+    if not result.get("ok"):
+        return json.dumps({"error": result.get("error", "identity check failed")})
+    return json.dumps(
+        {"slug": slug, "provider": result["provider"], "identity": result["identity"]}
+    )
 
 
 _KIMI_STATUS_RE_CHAT = re.compile(r"^STATUS:\s*\S+", re.MULTILINE)
@@ -2751,6 +2833,8 @@ TOOL_EXECUTORS: dict[str, Any] = {
     "restart_deployment": _exec_restart_deployment,
     "list_argocd_apps": _exec_list_argocd_apps,
     "sync_argocd_app": _exec_sync_argocd_app,
+    "list_cloud_accounts": _exec_list_cloud_accounts,
+    "cloud_identity": _exec_cloud_identity,
     "run_infra_script": _exec_run_infra_script,
     "aegis_self_diagnose": _exec_aegis_self_diagnose,
     "investigate_resource": _exec_investigate_resource,
@@ -2827,6 +2911,10 @@ AGENT_TOOL_SETS: dict[str, set[str]] = {
         "restart_deployment",
         "list_argocd_apps",
         "sync_argocd_app",
+        # Cloud accounts (read-only): registry listing + live sts/ADC identity
+        # check for kind=cloud entries. Gated on CLI availability in the image.
+        "list_cloud_accounts",
+        "cloud_identity",
         "run_infra_script",
         # AEGIS self-healing — drives kimi over SSH against the AEGIS source
         # clone on node-a. Used when the user asks pandora about AEGIS's own
