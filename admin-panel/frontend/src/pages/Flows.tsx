@@ -110,6 +110,7 @@ export default function Flows() {
   const [newLabel, setNewLabel] = useState('');
   const [socialAccounts, setSocialAccounts] = useState<any[]>([]);
   const [newSocialLabel, setNewSocialLabel] = useState('');
+  const [syncingPostiz, setSyncingPostiz] = useState(false);
 
   // Kick off Google consent for a brand-new account label. The reauth backend is
   // label-agnostic and writes config/{label}.json on callback, after which the
@@ -130,6 +131,17 @@ export default function Flows() {
     window.open(`${API_BASE}/api/admin/social/x/connect?label=${encodeURIComponent(label)}`, '_blank', 'noopener');
     setNewSocialLabel('');
     setMsg(`Opened X consent for "${label}". After you approve, click Reload to see it.`);
+  }
+
+  // Mirror channels connected in a self-hosted Postiz instance (postiz_url/
+  // postiz_api_key on the Integrations page) into social_accounts.
+  async function syncPostiz() {
+    setSyncingPostiz(true); setMsg(''); setError(null);
+    try {
+      const r = await api.syncPostizAccounts();
+      setMsg(`Synced ${r.synced} channel${r.synced === 1 ? '' : 's'} from Postiz.`);
+      setSocialAccounts(await api.listSocialAccounts());
+    } catch (e: any) { setError(e); } finally { setSyncingPostiz(false); }
   }
 
   async function load() {
@@ -218,7 +230,10 @@ export default function Flows() {
       <div className="card" style={{ marginBottom: 16 }}>
         <h3>Social accounts</h3>
         <p className="page-subtitle">
-          Set the X (Twitter) OAuth client id/secret on the Integrations page first; posting stays off until
+          Two ways to connect a channel: connect natively below (X only, needs the X OAuth
+          client id/secret on the Integrations page), or run your own <strong>Postiz</strong> instance,
+          connect channels there, and sync them here (needs <code>postiz_url</code>/<code>postiz_api_key</code> on
+          the Integrations page). Posting stays off either way until
           <code> social_publishing_enabled</code> is flipped on the Settings page.
         </p>
         <div className="cfg-row" style={{ marginBottom: 12 }}>
@@ -229,26 +244,30 @@ export default function Flows() {
             onKeyDown={e => { if (e.key === 'Enter') connectSocialAccount(); }}
           />
           <button className="btn btn-primary" disabled={!newSocialLabel.trim()} onClick={connectSocialAccount}>Connect X account</button>
+          <button className="btn" disabled={syncingPostiz} onClick={syncPostiz}>{syncingPostiz ? 'Syncing…' : 'Sync Postiz channels'}</button>
           <button className="btn" onClick={load}>Reload</button>
         </div>
         <div className="table-scroll"><table style={{ width: '100%' }}>
           <thead><tr>
-            <th style={{ textAlign: 'left' }}>Platform</th><th style={{ textAlign: 'left' }}>Label</th><th>Scope</th><th>Expires</th><th>Updated</th><th></th>
+            <th style={{ textAlign: 'left' }}>Platform</th><th style={{ textAlign: 'left' }}>Label</th><th>Via</th><th>Scope</th><th>Expires</th><th>Updated</th><th></th>
           </tr></thead>
           <tbody>
             {socialAccounts.map(a => (
               <tr key={a.id}>
                 <td><strong>{a.platform}</strong></td>
                 <td>{a.label}</td>
+                <td style={{ textAlign: 'center' }}>{a.via || 'native'}</td>
                 <td style={{ fontSize: 11, color: 'var(--text-muted)' }}>{a.scope || '—'}</td>
                 <td style={{ textAlign: 'center' }}>{(a.expires_at || '—').toString().slice(0, 16)}</td>
                 <td style={{ textAlign: 'center' }}>{(a.updated_at || '—').toString().slice(0, 16)}</td>
                 <td style={{ textAlign: 'center' }}>
-                  <a className="btn" href={`${API_BASE}/api/admin/social/x/connect?label=${encodeURIComponent(a.label)}`} target="_blank" rel="noreferrer">Re-connect</a>
+                  {a.via === 'postiz'
+                    ? <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>manage in Postiz</span>
+                    : <a className="btn" href={`${API_BASE}/api/admin/social/x/connect?label=${encodeURIComponent(a.label)}`} target="_blank" rel="noreferrer">Re-connect</a>}
                 </td>
               </tr>
             ))}
-            {socialAccounts.length === 0 && <tr><td colSpan={6}>No social accounts configured.</td></tr>}
+            {socialAccounts.length === 0 && <tr><td colSpan={7}>No social accounts configured.</td></tr>}
           </tbody>
         </table></div>
       </div>

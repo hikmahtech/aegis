@@ -43,6 +43,17 @@ def _settings() -> Settings:
     )
 
 
+def _settings_with_postiz() -> Settings:
+    return Settings(
+        **_TEST_REQUIRED_SETTINGS,
+        x_client_id="x-cid",
+        x_client_secret="x-cs",
+        secret_key="",
+        postiz_url="https://postiz.example.com",
+        postiz_api_key="pz-key",
+    )
+
+
 @pytest_asyncio.fixture(loop_scope="function")
 async def social_env(db_pool):
     """Seed social settings (saving originals), clean tables before/after."""
@@ -123,6 +134,21 @@ async def _seed_account(
         encrypt_secret(access, ""),
         encrypt_secret(refresh, ""),
         expires_in_seconds,
+    )
+
+
+async def _seed_postiz_account(
+    pool,
+    platform: str = "mastodon",
+    label: str = "postiz-test",
+    integration_id: str = "int-1",
+) -> int:
+    """Postiz-mirrored account: no tokens of its own, NULL access/refresh/expires_at."""
+    return await pool.fetchval(
+        "INSERT INTO social_accounts (platform, label, meta) VALUES ($1, $2, $3) RETURNING id",
+        platform,
+        label,
+        {"postiz_integration_id": integration_id, "via": "postiz"},
     )
 
 
@@ -390,5 +416,74 @@ async def test_post_x_skips_refresh_when_token_fresh(social_env):
     try:
         assert await connector.post(account_id, {"text": "hi", "link": ""}) == "9"
         assert not token_route.called
+    finally:
+        await connector.close()
+
+
+# ------------------------------------------------------------------- postiz
+
+
+@respx.mock
+async def test_post_routes_postiz_account_with_raw_auth_header_no_x_calls(social_env):
+    """Postiz-mirrored accounts have no OAuth tokens — post() must skip refresh
+    entirely and never touch x.com. respx's default assert_all_mocked means an
+    unmocked call to any x.com route would fail this test outright."""
+    account_id = await _seed_postiz_account(social_env, platform="mastodon", integration_id="int-1")
+    posts_route = respx.post("https://postiz.example.com/api/public/v1/posts").respond(
+        200, json=[{"postId": "pz-1", "integration": "int-1"}]
+    )
+
+    connector = SocialConnector(db_pool=social_env, settings=_settings_with_postiz())
+    try:
+        ref = await connector.post(
+            account_id, {"text": "hello world", "link": "https://example.com"}
+        )
+        assert ref == "pz-1"
+
+        req = posts_route.calls[0].request
+        assert req.headers["authorization"] == "pz-key"  # raw key, no "Bearer " prefix
+        body = json.loads(req.content)
+        assert body["type"] == "now"
+        assert body["posts"][0]["integration"]["id"] == "int-1"
+        assert body["posts"][0]["settings"]["__type"] == "mastodon"
+        content = body["posts"][0]["value"][0]["content"]
+        assert "hello world" in content
+        assert "https://example.com" in content
+    finally:
+        await connector.close()
+
+
+@respx.mock
+async def test_post_postiz_missing_config_raises(social_env):
+    account_id = await _seed_postiz_account(social_env)
+    connector = SocialConnector(db_pool=social_env, settings=_settings())  # no postiz_url/key
+    try:
+        with pytest.raises(RuntimeError):
+            await connector.post(account_id, {"text": "hi", "link": ""})
+    finally:
+        await connector.close()
+
+
+@respx.mock
+async def test_drain_social_outbox_posts_via_postiz_end_to_end(social_env):
+    account_id = await _seed_postiz_account(social_env, label="drain-postiz")
+    await social_env.execute(
+        "INSERT INTO social_outbox (todoist_task_id, account_id, payload) "
+        "VALUES ('soctest-postiz', $1, $2)",
+        account_id,
+        {"text": "hi", "link": ""},
+    )
+    respx.post("https://postiz.example.com/api/public/v1/posts").respond(
+        200, json=[{"postId": "pz-2", "integration": "int-1"}]
+    )
+    connector = SocialConnector(db_pool=social_env, settings=_settings_with_postiz())
+    act = SocialActivities(db_pool=social_env, connector=connector)
+    try:
+        result = await ActivityEnvironment().run(act.drain_social_outbox)
+        assert result == {"posted": 1, "failed": 0}
+        row = await social_env.fetchrow(
+            "SELECT status, posted_ref FROM social_outbox WHERE todoist_task_id = 'soctest-postiz'"
+        )
+        assert (row["status"], row["posted_ref"]) == ("posted", "pz-2")
     finally:
         await connector.close()

@@ -131,3 +131,82 @@ async def test_callback_unknown_state_400(client):
         "/api/admin/social/x/callback?code=c&state=bogus", headers={"X-API-Key": "k"}
     )
     assert resp.status_code == 400
+
+
+# --------------------------------------------------------------- postiz sync
+
+
+async def test_sync_postiz_without_config_503(client):
+    resp = await client.post("/api/admin/social/postiz/sync", headers={"X-API-Key": "k"})
+    assert resp.status_code == 503
+    assert resp.json()["detail"] == "postiz_not_configured"
+
+
+@respx.mock
+async def test_sync_postiz_upserts_non_disabled_and_is_idempotent(client, settings, db_pool):
+    settings.postiz_url = "https://postiz.example.com"
+    settings.postiz_api_key = "pz-key"
+
+    integrations_route = respx.get(
+        "https://postiz.example.com/api/public/v1/integrations"
+    ).respond(
+        200,
+        json=[
+            {
+                "id": "int-1",
+                "name": "My Mastodon",
+                "identifier": "mastodon",
+                "picture": "https://example.com/pic.png",
+                "disabled": False,
+                "profile": "me@mastodon.social",
+            },
+            {
+                "id": "int-2",
+                "name": "Disabled Channel",
+                "identifier": "bluesky",
+                "picture": "",
+                "disabled": True,
+                "profile": "",
+            },
+        ],
+    )
+
+    resp = await client.post("/api/admin/social/postiz/sync", headers={"X-API-Key": "k"})
+    assert resp.status_code == 200
+    assert resp.json() == {"synced": 1, "skipped_disabled": 1}
+    assert integrations_route.calls[0].request.headers["authorization"] == "pz-key"
+
+    row = await db_pool.fetchrow(
+        "SELECT platform, label, meta, access_token_enc, refresh_token_enc "
+        "FROM social_accounts WHERE platform = 'mastodon'"
+    )
+    assert row is not None
+    assert row["label"] == "my-mastodon"
+    assert row["meta"]["postiz_integration_id"] == "int-1"
+    assert row["meta"]["via"] == "postiz"
+    assert row["access_token_enc"] is None
+    assert row["refresh_token_enc"] is None
+
+    accounts = (
+        await client.get("/api/admin/social/accounts", headers={"X-API-Key": "k"})
+    ).json()
+    assert len(accounts) == 1
+    assert accounts[0]["via"] == "postiz"
+
+    # Re-running the sync upserts in place — no duplicate row.
+    resp2 = await client.post("/api/admin/social/postiz/sync", headers={"X-API-Key": "k"})
+    assert resp2.status_code == 200
+    assert resp2.json() == {"synced": 1, "skipped_disabled": 1}
+    count = await db_pool.fetchval("SELECT count(*) FROM social_accounts")
+    assert count == 1
+
+
+@respx.mock
+async def test_sync_postiz_upstream_error_502(client, settings):
+    settings.postiz_url = "https://postiz.example.com"
+    settings.postiz_api_key = "pz-key"
+    respx.get("https://postiz.example.com/api/public/v1/integrations").respond(
+        500, json={"error": "boom"}
+    )
+    resp = await client.post("/api/admin/social/postiz/sync", headers={"X-API-Key": "k"})
+    assert resp.status_code == 502
