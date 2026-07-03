@@ -2,7 +2,7 @@
 
 Todoist-scheduled social media posting with human approval. A Todoist task *is* a post:
 labels pick the platforms, the due datetime is the publish time, and nothing goes out
-until the user approves a card in the comms channel (Slack/Telegram).
+until the user approves a card in the comms channel (Slack / the web Interactions inbox).
 
 This doc is the implementation plan. It reuses aegis primitives everywhere it can —
 the only genuinely new things are a `social_accounts` token table, one connector, and

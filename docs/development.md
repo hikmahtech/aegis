@@ -49,7 +49,6 @@ docker compose logs worker --tail 50 -f
 |---------|-----------|--------|
 | Core API | 8080 (or 8090 if 8080 busy) | 8080 |
 | Comms | 8081 | 8081 |
-| Knowledge | 8000 | 8000 |
 | Postgres | 25432 | 25432 |
 | Redis | 26379 | 26379 |
 | Temporal | 7233 | 7233 |
@@ -80,10 +79,17 @@ cp config/.env.example config/.env
 
 Key settings:
 - `AEGIS_DATABASE_URL` — PostgreSQL connection
-- `AEGIS_LITELLM_URL` + `AEGIS_LITELLM_API_KEY` — LLM gateway
+- `AEGIS_ADMIN_USERNAME` + `AEGIS_ADMIN_PASSWORD` — admin credentials (required unless `AEGIS_AUTH_DISABLED=true`; see the auth section below)
+- `AEGIS_SECRET_KEY` — Fernet key encrypting DB-stored secrets (integration tokens, infra credentials, API keys); unset = plaintext-with-flag, fine for local dev only
+- `AEGIS_LITELLM_URL` + `AEGIS_LITELLM_API_KEY` — LLM gateway (or configure the backend from the admin **Models & Providers** page)
+- `AEGIS_COMMS_URL` — how Core reaches the comms delivery server (e.g. `http://localhost:8081`)
 - `AEGIS_SLACK_BOT_TOKEN` + `AEGIS_SLACK_APP_TOKEN` — Slack (comms); can also be set from the admin UI (stored encrypted in the DB)
 - `AEGIS_GITHUB_TOKEN` — GitHub API
 - `AEGIS_GMAIL_ACCOUNTS` — Gmail OAuth (format: `name:email,name:email`)
+
+Most integration secrets (Todoist, Slack, Postiz, finance provider keys, infra/cloud
+credentials, API keys) are entered in the admin UI and stored encrypted in the DB —
+env vars exist as bootstrap/fallback for local dev, not as the primary store.
 
 ### Agent personalities
 
@@ -244,7 +250,7 @@ For local development against the real Todoist API:
 
 ### Phase 2 — local dev
 
-The capture helper reads two `settings` rows: `todoist_capture_enabled` (boolean) and `todoist_managed_project_ids` (JSONB dict with at least `inbox` key). Both are populated by migration 011 + the Phase 1 bootstrap.
+The capture helper reads two `settings` rows: `todoist_capture_enabled` (boolean) and `todoist_managed_project_ids` (JSONB dict with at least `inbox` key). Both are populated by the baseline migration + the Todoist bootstrap.
 
 To exercise the capture path locally without going through a full ingest flow:
 
