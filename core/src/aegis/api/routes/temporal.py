@@ -39,4 +39,6 @@ async def temporal_config(settings: Settings = Depends(get_settings)) -> dict[st
     return {
         "temporal_ui_url": settings.temporal_ui_url,
         "knowledge_ui_url": settings.knowledge_ui_url,
+        # Browser-facing Postiz URL (postiz_url is the server-side/internal one).
+        "postiz_ui_url": settings.postiz_public_url,
     }

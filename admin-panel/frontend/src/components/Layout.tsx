@@ -1,6 +1,6 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { Link, Outlet, useLocation } from 'react-router-dom';
-import { clearCredentials } from '../api/client';
+import { api, clearCredentials } from '../api/client';
 
 const logout = () => { clearCredentials(); window.location.reload(); };
 
@@ -52,6 +52,9 @@ const NAV: { section: string; items: { path: string; label: string }[] }[] = [
 export default function Layout() {
   const location = useLocation();
   const [sidebarOpen, setSidebarOpen] = useState(false);
+  // Browser-facing URLs for external service links (Postiz etc.).
+  const [extLinks, setExtLinks] = useState<any>({});
+  useEffect(() => { api.getTemporalConfig().then(setExtLinks).catch(() => {}); }, []);
 
   const closeSidebar = () => setSidebarOpen(false);
   const isActive = (path: string) =>
@@ -86,6 +89,16 @@ export default function Layout() {
                   {label}
                 </Link>
               ))}
+              {section === 'Configure' && extLinks.postiz_ui_url && (
+                <a
+                  href={extLinks.postiz_ui_url}
+                  target="_blank"
+                  rel="noopener"
+                  onClick={closeSidebar}
+                >
+                  Postiz ↗
+                </a>
+              )}
             </div>
           ))}
           <a onClick={() => { closeSidebar(); logout(); }} style={{ cursor: 'pointer', marginTop: 'auto' }}>

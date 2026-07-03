@@ -131,6 +131,7 @@ export default function Overview() {
         <div className="card">
           <h3>Quick links</h3>
           {config.temporal_ui_url && <p><a href={config.temporal_ui_url} target="_blank" rel="noopener">Temporal UI ↗</a></p>}
+          {config.postiz_ui_url && <p><a href={config.postiz_ui_url} target="_blank" rel="noopener">Postiz ↗</a></p>}
           {config.n8n_ui_url && <p><a href={config.n8n_ui_url} target="_blank" rel="noopener">n8n ↗</a></p>}
           <p><Link to="/knowledge">Knowledge</Link></p>
           <p><Link to="/settings">Settings</Link></p>
