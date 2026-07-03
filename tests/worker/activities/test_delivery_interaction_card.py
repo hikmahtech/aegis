@@ -1,7 +1,7 @@
 """send_interaction_card POSTs a channel-neutral CardSpec to /api/deliver/card.
 
 Keyboard/Block-Kit rendering moved OUT of the worker and into the comms
-package (covered by tests/telegram/test_cards_telegram.py). This activity now
+package (covered by the comms card tests). This activity now
 just forwards the neutral spec; these tests assert the neutral POST body +
 endpoint, plus the unconfigured-url guard.
 """
@@ -19,13 +19,13 @@ from temporalio.testing import ActivityEnvironment
 
 @pytest.fixture
 def delivery():
-    return DeliveryActivities(telegram_url="http://telegram:9000", api_key="test-key", channel="slack")
+    return DeliveryActivities(comms_url="http://comms:9000", api_key="test-key", channel="slack")
 
 
 @pytest.mark.asyncio
 @respx.mock
 async def test_card_posts_neutral_spec_to_card_endpoint(delivery):
-    route = respx.post("http://telegram:9000/api/deliver/card").mock(
+    route = respx.post("http://comms:9000/api/deliver/card").mock(
         return_value=Response(200, json={"ok": True, "message_id": 42})
     )
     env = ActivityEnvironment()
@@ -53,7 +53,7 @@ async def test_card_posts_neutral_spec_to_card_endpoint(delivery):
 @pytest.mark.asyncio
 @respx.mock
 async def test_card_forwards_options_and_kind(delivery):
-    route = respx.post("http://telegram:9000/api/deliver/card").mock(
+    route = respx.post("http://comms:9000/api/deliver/card").mock(
         return_value=Response(200, json={"ok": True, "message_id": 43})
     )
     env = ActivityEnvironment()
@@ -76,7 +76,7 @@ async def test_card_forwards_options_and_kind(delivery):
 async def test_card_body_omits_chat_and_topic(delivery):
     """The neutral CardSpec no longer carries chat_id/topic_id — the active
     adapter routes by the agent's channel."""
-    route = respx.post("http://telegram:9000/api/deliver/card").mock(
+    route = respx.post("http://comms:9000/api/deliver/card").mock(
         return_value=Response(200, json={"ok": True, "message_id": 44})
     )
     env = ActivityEnvironment()
@@ -99,7 +99,7 @@ async def test_card_body_omits_chat_and_topic(delivery):
 async def test_card_prompt_passed_through_unmodified(delivery):
     """Composed HTML (e.g. <b>label</b>) must reach the service unmodified —
     the channel applies its own markup; the worker no longer touches it."""
-    route = respx.post("http://telegram:9000/api/deliver/card").mock(
+    route = respx.post("http://comms:9000/api/deliver/card").mock(
         return_value=Response(200, json={"ok": True, "message_id": 45})
     )
     env = ActivityEnvironment()
@@ -119,7 +119,7 @@ async def test_card_prompt_passed_through_unmodified(delivery):
 async def test_no_comms_returns_web_ref():
     # Web channel (default) / no comms URL → the card lands in the admin inbox;
     # the activity returns a web delivery_ref rather than an error.
-    d = DeliveryActivities(telegram_url="", api_key="")
+    d = DeliveryActivities(comms_url="", api_key="")
     env = ActivityEnvironment()
     result = await env.run(
         d.send_interaction_card,

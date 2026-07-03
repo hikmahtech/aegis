@@ -3,7 +3,7 @@
 A single hourly snapshot catches services mid-rollout / mid-restart
 (momentarily 0 replicas) and batch jobs that just finished. The flow now
 re-checks after a delay and keeps only drifts that are STILL present, so
-transient blips never reach Telegram.
+transient blips never reach the chat channel.
 """
 
 from __future__ import annotations
@@ -99,7 +99,7 @@ async def _run(collect_stub, config: ServiceDriftConfig, wf_id: str) -> dict:
 @pytest.mark.asyncio
 async def test_transient_drift_is_rechecked_and_not_notified():
     """Service down on first snapshot, healthy on the re-check → suppressed.
-    No Telegram card, nothing persisted."""
+    No chat card, nothing persisted."""
     _reset()
     snapshots = [
         _collected(_service("monitoring_prometheus", 1, 0)),  # drifted

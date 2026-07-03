@@ -11,7 +11,7 @@ import structlog
 from aegis.services.fx import to_monthly_inr
 from temporalio import activity
 
-from aegis_worker.activities.delivery import safe_send_telegram
+from aegis_worker.activities.delivery import safe_send_message
 
 _ONE_DAY = timedelta(days=1)
 
@@ -402,14 +402,14 @@ class MoneyActivities:
 
     @activity.defn
     async def notify_renewal_alert(self, alert: dict) -> None:
-        """Send Telegram card to Maou topic. Best-effort — every user-controlled
+        """Send chat card to Maou's channel. Best-effort — every user-controlled
         string is HTML-escaped because parse_mode=HTML treats raw <,>,& as
         markup and a single bad char fails the send.
 
-        Telegram-level dedup: skip the send if the same
+        Send-level dedup: skip the send if the same
         (charge_id, threshold_days) was notified within the last 7 days.
         The DB-level partial unique index already dedups the Inbox capture
-        side per UTC day; this 7-day window is the Telegram-only guard so
+        side per UTC day; this 7-day window is the send-only guard so
         the user doesn't get pinged for the same upcoming renewal multiple
         days in a row when evaluate_renewal_alerts re-inserts the row for
         a new threshold band or after a past-due slip.
@@ -448,7 +448,7 @@ class MoneyActivities:
         # Title is internal-only ("[RENEWAL][30d] vendor") so it joins the
         # already-escaped body without further escaping. Body content is
         # vendor-supplied — escaping happens above where each field is built.
-        await safe_send_telegram(
+        await safe_send_message(
             self.delivery,
             agent_id=self.agent_id,
             message=f"<b>{title}</b>\n{body}",
@@ -456,8 +456,8 @@ class MoneyActivities:
         )
 
         # Stamp the row so the next 7d window of evaluate runs short-circuits.
-        # Best-effort: an unsuccessful telegram send still benefits from this
-        # stamp because safe_send_telegram swallows failures — the caller's
+        # Best-effort: an unsuccessful send still benefits from this
+        # stamp because safe_send_message swallows failures — the caller's
         # capture-to-inbox path is the durable record either way.
         if alert_id and self.db_pool is not None:
             async with self.db_pool.acquire() as conn:
@@ -469,7 +469,7 @@ class MoneyActivities:
 
     @activity.defn
     async def notify_cancellation(self, cancellation: dict) -> None:
-        """Send Telegram card to Maou topic for a silently-cancelled charge.
+        """Send chat card to Maou's channel for a silently-cancelled charge.
         Best-effort; all vendor-supplied fields HTML-escaped before
         interpolation since parse_mode=HTML treats raw <,>,& as markup."""
         vendor = _html.escape(str(cancellation.get("vendor_name") or "subscription"))
@@ -487,7 +487,7 @@ class MoneyActivities:
             f"Last seen: {last_date}\n"
             f"Account: {account}"
         )
-        await safe_send_telegram(
+        await safe_send_message(
             self.delivery,
             agent_id=self.agent_id,
             message=f"<b>{title}</b>\n{body}",
@@ -590,7 +590,7 @@ class MoneyActivities:
 
     @activity.defn
     async def notify_subscription_digest(self, digest: dict) -> None:
-        """Send Telegram digest to Maou topic. Best-effort.
+        """Send chat digest to Maou's channel. Best-effort.
 
         Every user-controlled string (vendor names, categories) is
         HTML-escaped because parse_mode=HTML treats raw <,>,& as markup.
@@ -636,7 +636,7 @@ class MoneyActivities:
             lines.append(f"<b>Cancelled this month:</b> {len(cancelled_this)}")
 
         body = "\n".join(lines)
-        await safe_send_telegram(
+        await safe_send_message(
             self.delivery,
             agent_id=self.agent_id,
             message=f"<b>Monthly money digest</b>\n{body}",

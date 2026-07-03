@@ -2,9 +2,9 @@
 
 _startup_error is a pure helper that returns None when the channel is ready
 to boot, or an error string when it is not.  It replaces the old flat
-`if not telegram_bot_token: return` guard in run() and makes startup channel-aware.
+`if not bot_token: return` guard in run() and makes startup channel-aware.
 
-Note: TelegramSettings uses pydantic-settings AliasChoices; field values must be
+Note: CommsSettings uses pydantic-settings AliasChoices; field values must be
 supplied via environment variables (monkeypatch.setenv) rather than constructor
 kwargs, which are ignored for aliased fields.
 """
@@ -13,16 +13,16 @@ from __future__ import annotations
 
 
 def _settings(monkeypatch, **env_vars):
-    """Build a TelegramSettings using env vars (the only reliable way with pydantic-settings)."""
+    """Build a CommsSettings using env vars (the only reliable way with pydantic-settings)."""
     # Clear Slack tokens by default so tests are isolated
     monkeypatch.delenv("AEGIS_SLACK_BOT_TOKEN", raising=False)
     monkeypatch.delenv("AEGIS_SLACK_APP_TOKEN", raising=False)
     monkeypatch.delenv("AEGIS_CHANNEL", raising=False)
     for k, v in env_vars.items():
         monkeypatch.setenv(k, v)
-    from aegis_comms.config import TelegramSettings
+    from aegis_comms.config import CommsSettings
 
-    return TelegramSettings(_env_file=None)
+    return CommsSettings(_env_file=None)
 
 
 # ---------------------------------------------------------------------------
@@ -222,7 +222,7 @@ async def test_run_starts_slack_listener_when_configured(monkeypatch):
 async def test_merge_slack_config_db_wins_over_env(monkeypatch):
     """DB value wins when present; env-sourced settings are the fallback.
 
-    TelegramSettings' fields use validation_alias env vars — constructor
+    CommsSettings' fields use validation_alias env vars — constructor
     kwargs are silently ignored for them (see the module docstring above),
     so the env-sourced starting point must come from monkeypatch.setenv,
     same as `_settings()`.

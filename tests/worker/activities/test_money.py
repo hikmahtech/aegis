@@ -5,7 +5,7 @@ NOTE: Phase 1 of v3 reshaped `maou.recurring_charge` and `maou.receipt_email`
 The DB-bound tests that asserted the v2 schema were deleted; they will be
 reintroduced in Phase 3/4 alongside the rewritten MoneyActivities. The tests
 below are the schema-agnostic ones that still exercise real behaviour
-(LLM-batch wiring + Telegram escape).
+(LLM-batch wiring + HTML escape).
 """
 
 from __future__ import annotations
@@ -144,7 +144,7 @@ async def test_classify_and_extract_empty_returns_empty(db_pool):
 
 @pytest.mark.asyncio
 async def test_notify_renewal_alert_sends_str_to_maou():
-    """Regression: notify_renewal_alert routes through send_telegram(agent_id='maou',
+    """Regression: notify_renewal_alert routes through send_message(agent_id='maou',
     message=str). Pre-PR #257 it called send_system_event with a dict and 422'd."""
     from pydantic import BaseModel
 
@@ -165,7 +165,7 @@ async def test_notify_renewal_alert_sends_str_to_maou():
 
     delivery = AsyncMock()
     delivery.channel = "slack"
-    delivery.send_telegram = fake_send
+    delivery.send_message = fake_send
     act = MoneyActivities(db_pool=None, llm=None, delivery=delivery, fx_rates={"USD": 84.5})
     await act.notify_renewal_alert(
         {
@@ -188,7 +188,7 @@ async def test_notify_renewal_alert_sends_str_to_maou():
 
 
 @pytest.mark.asyncio
-async def test_notify_subscription_digest_sends_telegram(db_pool):
+async def test_notify_subscription_digest_sends_message(db_pool):
     delivery = AsyncMock()
     delivery.channel = "slack"
     act = MoneyActivities(
@@ -211,8 +211,8 @@ async def test_notify_subscription_digest_sends_telegram(db_pool):
         ],
     }
     await act.notify_subscription_digest(digest)
-    delivery.send_telegram.assert_awaited_once()
-    kwargs = delivery.send_telegram.await_args.kwargs
+    delivery.send_message.assert_awaited_once()
+    kwargs = delivery.send_message.await_args.kwargs
     assert kwargs["agent_id"] == "maou"
     message = kwargs["message"]
     assert isinstance(message, str)

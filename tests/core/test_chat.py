@@ -80,9 +80,9 @@ async def test_chat_missing_fields(app, auth_headers):
 async def test_chat_surfaces_dispatch_rows_as_assistant_turns(
     app, auth_headers, mock_db_pool, mock_llm
 ):
-    """role='dispatch' rows are messages the user saw on Telegram (briefings,
+    """role='dispatch' rows are messages the user saw in chat (briefings,
     interaction cards, alert verdicts). The chat loader must surface them
-    to the LLM as assistant turns with a "[Sent to you on Telegram]"
+    to the LLM as assistant turns with a "[Sent to you in chat]"
     prefix so the model can reason about what the user is referring to
     even when the reference wasn't part of the conversation proper.
     """
@@ -113,9 +113,9 @@ async def test_chat_surfaces_dispatch_rows_as_assistant_turns(
 
     messages = mock_llm.chat.call_args.kwargs["messages"]
     # message[0] is system. The history should include the dispatch as an
-    # assistant turn with the [Sent to you on Telegram] prefix.
+    # assistant turn with the [Sent to you in chat] prefix.
     assistant_contents = [m["content"] for m in messages if m["role"] == "assistant"]
-    dispatched = [c for c in assistant_contents if "[Sent to you on Telegram]" in c]
+    dispatched = [c for c in assistant_contents if "[Sent to you in chat]" in c]
     assert dispatched, f"dispatch never surfaced to LLM: {assistant_contents!r}"
     assert "Morning briefing" in dispatched[0]
     # Original user/assistant turns still present, role unchanged.

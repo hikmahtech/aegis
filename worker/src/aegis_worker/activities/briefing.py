@@ -149,7 +149,7 @@ class BriefingActivities:
         """Return references filed into KS in the last `hours`.
 
         Used by raphael's daily briefing to surface a "References filed"
-        section in place of the per-message Telegram noise that automated
+        section in place of the per-message chat noise that automated
         ingest flows (raindrop / RSS / intel-scan / email) would otherwise
         produce. The digest covers BOTH `source_type='reference'`
         (raindrop / chat / manual reference closure) AND

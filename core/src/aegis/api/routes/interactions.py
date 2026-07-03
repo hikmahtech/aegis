@@ -2,7 +2,7 @@
 
 GET /api/interactions — list (paginated, filterable)
 GET /api/interactions/{id} — single
-POST /api/interactions/{id}/resolve — resolve from UI or Telegram
+POST /api/interactions/{id}/resolve — resolve from UI or chat
 
 The resolve endpoint is the single choke-point for every human response.
 It updates the DB row AND sends a Temporal signal to the InteractionFlow
@@ -79,7 +79,7 @@ async def resolve_interaction(
 
         # Guard with `AND status='pending'` even though the SELECT above just
         # observed pending — a concurrent /resolve POST (from a duplicate
-        # Telegram callback tap) or the workflow's own apply_interaction_timeout
+        # chat callback tap) or the workflow's own apply_interaction_timeout
         # can flip the row between the SELECT and the UPDATE. RETURNING id
         # gives us the row-count to decide whether the signal needs to fire.
         updated = await conn.fetchrow(

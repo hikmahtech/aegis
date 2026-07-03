@@ -17,7 +17,7 @@ _DEFAULT_RETENTIONS: dict[str, int] = {
     "connector_calls": 90,
     "chat_tool_calls": 90,
     # 30d chat_history retention: dispatch rows that carry a delivery_ref (or
-    # legacy telegram_message_id) get channel-deleted via `cleanup_old_telegram_dispatches`
+    # legacy telegram_message_id) get channel-deleted via `cleanup_old_dispatches`
     # BEFORE this generic prune sweeps them; user/assistant rows past 30d
     # are pruned here in DB-only mode.
     "chat_history": 30,
@@ -46,7 +46,7 @@ class CleanupConfig:
     # 30-day retention for channel dispatches — rows with delivery_ref (or legacy
     # telegram_message_id) get channel-deleted via the comms adapter before the
     # DB row is dropped. Set to 0 to skip channel cleanup (DB prune still runs).
-    telegram_dispatch_days: int = 30
+    dispatch_days: int = 30
 
 
 @workflow.defn
@@ -66,20 +66,20 @@ class CleanupFlow:
         # before the DB row is dropped — preserving the audit trail on failure.
         # Expired chat_history rows left behind (no ref, or non-dispatch turns)
         # are picked up by prune_old_records below.
-        if config.telegram_dispatch_days > 0:
+        if config.dispatch_days > 0:
             try:
                 dispatch_result = await workflow.execute_activity_method(
-                    CleanupActivities.cleanup_old_telegram_dispatches,
-                    args=[config.telegram_dispatch_days],
+                    CleanupActivities.cleanup_old_dispatches,
+                    args=[config.dispatch_days],
                     start_to_close_timeout=TIMEOUT_LONG,
                     retry_policy=NO_RETRY,
                 )
-                result["telegram_dispatches"] = dispatch_result
+                result["dispatches"] = dispatch_result
             except Exception as exc:
                 workflow.logger.error(
-                    "telegram_dispatch_cleanup_failed error=%s", str(exc)[:200]
+                    "dispatch_cleanup_failed error=%s", str(exc)[:200]
                 )
-                result["telegram_dispatches"] = {"status": "failed"}
+                result["dispatches"] = {"status": "failed"}
 
         try:
             prune_result = await workflow.execute_activity_method(

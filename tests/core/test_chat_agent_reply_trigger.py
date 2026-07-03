@@ -28,7 +28,7 @@ def auth_headers():
 async def test_agent_reply_trigger_captures_task_and_anchors_workflow(
     app, auth_headers, monkeypatch
 ):
-    """POST /api/chat/agent-reply/trigger captures the ask as a `#telegram`
+    """POST /api/chat/agent-reply/trigger captures the ask as a `#chat`
     Todoist task owned by the agent, then starts AgentChatReplyFlow anchored to
     that task id (so the reply + any spawned workflow land on it)."""
     captured: dict = {}
@@ -64,7 +64,7 @@ async def test_agent_reply_trigger_captures_task_and_anchors_workflow(
             json={
                 "target_agent": "pandoras-actor",
                 "message": "why is gmail-ingest dropping emails?",
-                "thread_id": "telegram-12345-pandoras-actor",
+                "thread_id": "chat-12345-pandoras-actor",
                 "reply_chat_id": 12345,
             },
         )
@@ -75,12 +75,12 @@ async def test_agent_reply_trigger_captures_task_and_anchors_workflow(
     assert body["workflow_id"].startswith("agent-chat-reply-dm-pandoras-actor-")
     assert body["task_id"] == "real-task-123"
 
-    # Capture tagged the task #telegram + owned by the agent, keyed on the DM
+    # Capture tagged the task #chat + owned by the agent, keyed on the DM
     # thread so a multi-turn conversation maps to one task.
-    assert captured["source_tag"] == "#telegram"
+    assert captured["source_tag"] == "#chat"
     assert captured["extra_labels"] == ["@pandora"]
     assert captured["title"] == "why is gmail-ingest dropping emails?"
-    assert captured["external_id"] == "tg-chat:telegram-12345-pandoras-actor"
+    assert captured["external_id"] == "tg-chat:chat-12345-pandoras-actor"
 
     # Workflow anchored to the captured task.
     call = fake_temporal.start_workflow.call_args
@@ -89,7 +89,7 @@ async def test_agent_reply_trigger_captures_task_and_anchors_workflow(
     assert payload["target_agent"] == "pandoras-actor"
     assert payload["task_id"] == "real-task-123"
     assert payload["reply_chat_id"] == 12345
-    assert payload["thread_id"] == "telegram-12345-pandoras-actor"
+    assert payload["thread_id"] == "chat-12345-pandoras-actor"
     assert call.kwargs["task_queue"] == "aegis-main"
 
 
@@ -115,7 +115,7 @@ async def test_agent_reply_trigger_taskless_when_capture_unavailable(
             json={
                 "target_agent": "sebas",
                 "message": "remind me later",
-                "thread_id": "telegram-9-sebas",
+                "thread_id": "chat-9-sebas",
                 "reply_chat_id": 9,
             },
         )
@@ -187,7 +187,7 @@ async def test_agent_reply_trigger_recaptures_when_thread_task_completed(app, au
             json={
                 "target_agent": "pandoras-actor",
                 "message": "back again",
-                "thread_id": "telegram-7-pandoras-actor",
+                "thread_id": "chat-7-pandoras-actor",
                 "reply_chat_id": 7,
             },
         )
@@ -195,8 +195,8 @@ async def test_agent_reply_trigger_recaptures_when_thread_task_completed(app, au
     assert resp.status_code == 200, resp.text
     assert resp.json()["task_id"] == "fresh-task-2"
     # Thread key first, then a uniquely-suffixed key for the fresh task.
-    assert external_ids[0] == "tg-chat:telegram-7-pandoras-actor"
-    assert external_ids[1].startswith("tg-chat:telegram-7-pandoras-actor:")
+    assert external_ids[0] == "tg-chat:chat-7-pandoras-actor"
+    assert external_ids[1].startswith("tg-chat:chat-7-pandoras-actor:")
     assert fake_temporal.start_workflow.call_args.args[1]["task_id"] == "fresh-task-2"
 
 
@@ -226,7 +226,7 @@ async def test_agent_reply_trigger_503_when_temporal_unavailable(app, auth_heade
 async def test_agent_reply_accepts_taskless_payload():
     """`/api/chat/agent-reply` (the existing worker→core endpoint) must accept
     a body with task_id=None (DM path); user_metadata.surface flips to
-    `telegram_dm` and the task_id key is omitted."""
+    `chat_dm` and the task_id key is omitted."""
     from aegis.services.chat import synthesize_agent_reply
 
     captured: dict = {}
@@ -260,7 +260,7 @@ async def test_agent_reply_accepts_taskless_payload():
         chat_mod.send_message = original
 
     assert result["reply_text"] == "Hello."
-    assert captured["user_metadata"]["surface"] == "telegram_dm"
+    assert captured["user_metadata"]["surface"] == "chat_dm"
     assert "task_id" not in captured["user_metadata"], (
         "DM path must NOT carry a task_id in user_metadata"
     )

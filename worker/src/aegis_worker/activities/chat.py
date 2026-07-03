@@ -35,7 +35,7 @@ class ChatActivities:
         or LLM refusal) and is NOT retried — caller composes apology.
 
         ``task_id`` may be None on the DM (taskless) path — surface tag in
-        user_metadata switches from `todoist_comment` to `telegram_dm` on
+        user_metadata switches from `todoist_comment` to `chat_dm` on
         the core side.
         """
         resp = await self.client.post(

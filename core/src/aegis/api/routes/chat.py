@@ -19,7 +19,7 @@ from aegis.services.chat import (
 
 router = APIRouter(prefix="/api/chat", dependencies=[Depends(verify_auth)])
 
-# Agent id → Todoist label, used to tag the task captured from a Telegram chat
+# Agent id → Todoist label, used to tag the task captured from a chat ask
 # ask so it's owned by the right agent and anchors that agent's downstream
 # workflows. Agents absent here (none today) skip capture and stay taskless.
 _AGENT_TODOIST_LABEL = {
@@ -49,7 +49,7 @@ async def _task_is_completed(pool: Any, task_id: str) -> bool:
 async def _capture_chat_ask_as_task(
     pool: Any, target_agent: str, message: str, thread_id: str
 ) -> str | None:
-    """Capture a Telegram chat ask as a Todoist task owned by `target_agent`.
+    """Capture a chat ask as a Todoist task owned by `target_agent`.
 
     Returns the real Todoist task id to anchor the reply (and any workflow the
     agent spawns) to, or None to stay in taskless DM mode. Best-effort: any
@@ -76,7 +76,7 @@ async def _capture_chat_ask_as_task(
     try:
         ref = await _capture_to_inbox_impl(
             pool=pool,
-            source_tag="#telegram",
+            source_tag="#chat",
             external_id=f"tg-chat:{base_key}",
             title=title,
             description=description,
@@ -85,7 +85,7 @@ async def _capture_chat_ask_as_task(
         if ref and not ref.startswith("item-") and await _task_is_completed(pool, ref):
             ref = await _capture_to_inbox_impl(
                 pool=pool,
-                source_tag="#telegram",
+                source_tag="#chat",
                 external_id=f"tg-chat:{base_key}:{uuid4().hex[:8]}",
                 title=title,
                 description=description,
@@ -104,8 +104,8 @@ async def _capture_chat_ask_as_task(
 async def log_dispatch(request: Request, body: dict[str, Any]) -> dict[str, Any]:
     """Record an outbound message into chat_history.
 
-    Called by the Telegram bot's delivery server (and, when Slack is active,
-    by the Slack delivery adapter) after a successful send.
+    Called by the comms delivery server (Slack adapter) after a
+    successful send.
     Persists as role='dispatch' so the same agent's chat-context loader
     (`send_message`) surfaces these alongside user/assistant turns — closes
     the gap where the user could refer to a briefing or interaction card
@@ -113,11 +113,10 @@ async def log_dispatch(request: Request, body: dict[str, Any]) -> dict[str, Any]
 
     Body shape:
       agent_id     — target agent (or "system" for general-topic events)
-      topic_id     — Telegram topic_id; used as chat_history.thread_id
-      chat_id      — Telegram group chat_id (stored in metadata for cleanup)
-      message_id   — Telegram message_id (stored in metadata for cleanup
-                     via Bot API deleteMessage; may be None if the bot
-                     doesn't expose it for this kind)
+      topic_id     — legacy numeric topic id; used as chat_history.thread_id
+      chat_id      — legacy chat id (stored in metadata for cleanup)
+      message_id   — legacy numeric message id (stored in metadata under
+                     the legacy `telegram_message_id` key; may be None)
       content      — the actual text the user saw
       kind         — short tag (deliver, interaction_card, system_event,
                      document) used to filter for context shaping
@@ -125,8 +124,7 @@ async def log_dispatch(request: Request, body: dict[str, Any]) -> dict[str, Any]
       delivery_ref — (optional) channel-neutral handle for cleanup/reactions,
                      e.g. {"adapter":"slack","channel":"C..","ts":".."}
                      When present, stored in metadata.delivery_ref in addition
-                     to the existing telegram keys (Slack callers omit the
-                     telegram keys; telegram callers omit delivery_ref).
+                     to the legacy keys above.
     """
     pool = request.app.state.db_pool
     agent_id = body.get("agent_id") or "system"
@@ -159,8 +157,8 @@ async def log_dispatch(request: Request, body: dict[str, Any]) -> dict[str, Any]
 async def chat(request: Request, body: dict[str, Any]) -> dict[str, Any]:
     """Send a message to an agent.
 
-    Optional `telegram: {chat_id, message_id}` block stores the user's
-    incoming Telegram message_id on the user chat_history row's metadata.
+    Optional `delivery_ref` block stores the channel-neutral handle of the
+    user's incoming message on the user chat_history row's metadata.
     """
     agent_id = body.get("agent_id")
     message = body.get("message")
@@ -168,18 +166,11 @@ async def chat(request: Request, body: dict[str, Any]) -> dict[str, Any]:
         raise HTTPException(status_code=400, detail="agent_id and message are required")
 
     delivery_ref = body.get("delivery_ref") or None
-    telegram_meta = body.get("telegram") or None
     user_metadata: dict | None = None
     if delivery_ref is not None:
         user_metadata = {
             "kind": "user_message",
             "delivery_ref": delivery_ref,
-        }
-    elif telegram_meta:
-        user_metadata = {
-            "kind": "user_message",
-            "chat_id": telegram_meta.get("chat_id"),
-            "telegram_message_id": telegram_meta.get("message_id"),
         }
 
     llm = getattr(request.app.state, "llm", None)
@@ -315,7 +306,7 @@ class AgentReplyRequest(BaseModel):
     the worker can call core via HTTP without importing core's chat module.
 
     `task_id` is None on the DM (taskless) path — surface tag in
-    user_metadata switches from `todoist_comment` to `telegram_dm`.
+    user_metadata switches from `todoist_comment` to `chat_dm`.
     """
 
     agent_id: str
@@ -360,14 +351,14 @@ async def post_agent_reply(
 class AgentReplyTriggerRequest(BaseModel):
     """Body for POST /api/chat/agent-reply/trigger (bot → core → temporal).
 
-    The Telegram bot's DM @mention handler hits this endpoint to spawn
+    The chat DM @mention handler hits this endpoint to spawn
     `AgentChatReplyFlow` for the named agent. The endpoint captures the ask as
-    a `#telegram` Todoist task owned by the agent and anchors the flow to it
+    a `#chat` Todoist task owned by the agent and anchors the flow to it
     (so the reply is mirrored there and any spawned workflow lands its links +
     logs on the same task); it falls back to taskless mode — Todoist-mirror
     step skipped — only when capture can't produce a usable task id.
 
-    `reply_chat_id` is the Telegram chat to reply into (positive for DMs,
+    `reply_chat_id` is the legacy chat id to reply into (positive for DMs,
     negative for groups). `thread_id` is the conversation grouping key used
     by `chat_history`; the bot synthesizes a stable per-(user,agent) value
     so successive DM turns share context.
@@ -387,7 +378,7 @@ async def post_agent_reply_trigger(
     """Capture the chat ask as a Todoist task, then spawn AgentChatReplyFlow
     anchored to it.
 
-    The ask becomes a `#telegram`-tagged task owned by the target agent so
+    The ask becomes a `#chat`-tagged task owned by the target agent so
     Todoist is the hub for every workflow: the reply is mirrored to the task as
     a comment AND any workflow the agent spawns (e.g. `investigate_resource` →
     AlertInvestigationFlow) anchors to the same task, landing its Temporal links
@@ -395,7 +386,7 @@ async def post_agent_reply_trigger(
     falls back to taskless DM mode (reply still delivered).
 
     Returns 202 on accept with `{workflow_id, target_agent, task_id}`. The reply
-    lands in Telegram asynchronously (Temporal handles durability + the 600s
+    lands in chat asynchronously (Temporal handles durability + the 600s
     synthesize ceiling). If the Temporal client isn't wired in app state,
     returns 503 — the bot's caller treats this as "service down, fall back to
     sync /api/chat".

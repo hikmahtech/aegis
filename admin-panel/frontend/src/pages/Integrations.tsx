@@ -8,9 +8,14 @@ export default function Integrations() {
   const [error, setError] = useState<Error | null>(null);
   const [msg, setMsg] = useState('');
   const [savingKey, setSavingKey] = useState('');
+  const [keyStatus, setKeyStatus] = useState<{ configured: boolean; source: string } | null>(null);
+  const [newKey, setNewKey] = useState('');
+  const [generating, setGenerating] = useState(false);
+  const [copied, setCopied] = useState(false);
 
   async function load() {
     try { setItems(await api.getIntegrations()); } catch (e: any) { setError(e); }
+    try { setKeyStatus(await api.getApiKeyStatus()); } catch { /* status is best-effort */ }
   }
   useEffect(() => { load(); /* eslint-disable-next-line */ }, []);
 
@@ -21,6 +26,26 @@ export default function Integrations() {
       setEdits(e => { const n = { ...e }; delete n[key]; return n; });
       setMsg(`Saved ${key}.`);
     } catch (e: any) { setError(e); } finally { setSavingKey(''); }
+  }
+
+  async function generateKey() {
+    if (keyStatus?.source === 'db' &&
+        !window.confirm('Generate a new API key? The previously generated key stops working immediately.')) {
+      return;
+    }
+    setGenerating(true); setError(null); setCopied(false);
+    try {
+      const res = await api.generateApiKey();
+      setNewKey(res.api_key);
+      setKeyStatus({ configured: true, source: 'db' });
+    } catch (e: any) { setError(e); } finally { setGenerating(false); }
+  }
+
+  async function copyKey() {
+    try {
+      await navigator.clipboard.writeText(newKey);
+      setCopied(true);
+    } catch { /* clipboard unavailable — user can select the text */ }
   }
 
   const groups = Array.from(new Set(items.map(i => i.group)));
@@ -34,6 +59,34 @@ export default function Integrations() {
       </p>
       <ErrorBanner error={error} onDismiss={() => setError(null)} />
       {msg && <p className="msg-success">{msg}</p>}
+
+      <div className="card" style={{ marginBottom: 12 }}>
+        <h3>API Key</h3>
+        <p style={{ color: 'var(--text-muted)', fontSize: 13, margin: '4px 0 10px' }}>
+          Key for programmatic access to the AEGIS API (sent as <code>X-API-Key</code>).
+          Generated server-side and stored encrypted; applies within seconds, no restart needed.
+          {keyStatus && (
+            <> Currently: <strong>{keyStatus.configured ? `configured (${keyStatus.source})` : 'not configured'}</strong>.</>
+          )}
+        </p>
+        <button className="btn" disabled={generating} onClick={() => void generateKey()}>
+          {generating ? 'Generating…' : 'Generate API key'}
+        </button>
+        {newKey && (
+          <div style={{ marginTop: 10 }}>
+            <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+              <code data-testid="new-api-key" style={{ wordBreak: 'break-all', padding: '6px 8px', background: 'var(--bg-inset, rgba(128,128,128,0.12))', borderRadius: 4 }}>
+                {newKey}
+              </code>
+              <button className="btn btn-sm" onClick={() => void copyKey()}>{copied ? 'Copied ✓' : 'Copy'}</button>
+            </div>
+            <p style={{ color: 'var(--warning, #b58900)', fontSize: 12, marginTop: 6 }}>
+              Copy it now — this key is shown only once and cannot be retrieved again.
+              Generating a new key replaces this one.
+            </p>
+          </div>
+        )}
+      </div>
 
       {groups.map(g => (
         <div key={g} className="card" style={{ marginBottom: 12 }}>

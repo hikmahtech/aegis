@@ -4,19 +4,19 @@ Triggered by either:
 
   - ClarifyFlow when the per-agent short-circuit fires
     (@sebas/@raphael/@maou + fresh user comment on a Todoist task)
-  - Telegram bot DM @mention path (no task) via the
+  - chat DM @mention path (no task) via the
     `/api/chat/agent-reply/trigger` route
 
 Orchestrates:
 
   1. ChatActivities.synthesize_reply  (HTTP wrapper → core)
-  2. DeliveryActivities.send_telegram (existing PR #248 path)
+  2. DeliveryActivities.send_message (existing PR #248 path)
   3. ClarifyActivities.post_agent_reply_comment (Todoist mirror — TASK PATH ONLY)
 
 On failure (synthesize or post errors): if a task is present, runs
 ClarifyActivities.post_agent_reply_error_comment so the user always
-sees something on the originating Todoist task. Telegram-only failures
-degrade to telegram_message_id=None and still post the Todoist comment
+sees something on the originating Todoist task. Delivery-only failures
+degrade to message_id=None and still post the Todoist comment
 (or degrade silently on the DM path).
 
 TASKLESS MODE: when `task_id is None`, the Todoist mirror + error-comment
@@ -80,7 +80,7 @@ class AgentChatReplyFlow:
         # Step 1 — synthesize the reply. Smart-tier agents (pandoras-actor on
         # claude-sonnet) routinely take 3-6 min when invoking heavy tools
         # (remote_script kimi SSH, deep KS search). Use TIMEOUT_CHAT_REPLY
-        # (600s) to match the Telegram chat path (PR #248). RETRY_ONCE
+        # (600s) to match the chat path (PR #248). RETRY_ONCE
         # instead of STANDARD: a single retry covers transient 5xx without
         # compounding the LLM cost on legitimate slow runs.
         try:
@@ -112,12 +112,12 @@ class AgentChatReplyFlow:
             return {
                 "status": "error",
                 "reason": err_msg,
-                "telegram_message_id": None,
+                "message_id": None,
                 "agent_id": inp.target_agent,
             }
 
         # Permanent error in synth (agent-not-found / refusal) → compose
-        # apology and deliver via Telegram + Todoist (if task is present).
+        # apology and deliver via chat + Todoist (if task is present).
         if synth.get("error"):
             apology_prefix = (
                 "I couldn't reply on the Todoist task"
@@ -133,25 +133,25 @@ class AgentChatReplyFlow:
             permanent_error = False
 
         # Step 2 — deliver the reply. Failure here degrades to
-        # telegram_message_id=None but DOES NOT short-circuit Step 3. The
+        # message_id=None but DOES NOT short-circuit Step 3. The
         # active comms adapter (Slack) routes by the agent's channel.
-        telegram_message_id: int | None = None
-        telegram_failed = False
+        message_id: int | None = None
+        delivery_failed = False
         try:
             tg = await workflow.execute_activity_method(
-                DeliveryActivities.send_telegram,
+                DeliveryActivities.send_message,
                 args=[inp.target_agent, reply_text],
                 start_to_close_timeout=TIMEOUT_FAST,
                 retry_policy=STANDARD,
             )
-            telegram_message_id = (tg or {}).get("message_id")
+            message_id = (tg or {}).get("message_id")
         except Exception as exc:  # noqa: BLE001
             workflow.logger.warning(
-                "agent_chat_reply_telegram_failed task_id=%s err=%s",
+                "agent_chat_reply_delivery_failed task_id=%s err=%s",
                 inp.task_id,
                 _err_str(exc),
             )
-            telegram_failed = True
+            delivery_failed = True
 
         # Step 3 — Todoist comment mirror. SKIPPED on the DM (taskless) path.
         # Failure raises (post itself uses outbox for retryable; permanent
@@ -165,7 +165,7 @@ class AgentChatReplyFlow:
                         inp.target_agent,
                         reply_text,
                         tool_trace_summary,
-                        telegram_message_id,
+                        message_id,
                     ],
                     start_to_close_timeout=TIMEOUT_FAST,
                     retry_policy=NO_RETRY,
@@ -181,7 +181,7 @@ class AgentChatReplyFlow:
                 # which is not exceptional).
                 raise
 
-        status = "error" if permanent_error else ("degraded" if telegram_failed else "ok")
+        status = "error" if permanent_error else ("degraded" if delivery_failed else "ok")
         # Permanent-error replies carry the upstream synth error as the
         # `reason`; happy + degraded paths leave it None so the shape is
         # uniform across all return points.
@@ -191,6 +191,6 @@ class AgentChatReplyFlow:
         return {
             "status": status,
             "reason": reason,
-            "telegram_message_id": telegram_message_id,
+            "message_id": message_id,
             "agent_id": inp.target_agent,
         }

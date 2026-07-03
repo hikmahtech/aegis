@@ -71,7 +71,7 @@ def _instrumentors():
         ("opentelemetry.instrumentation.redis", "RedisInstrumentor"),
         ("opentelemetry.instrumentation.httpx", "HTTPXClientInstrumentor"),
         ("opentelemetry.instrumentation.requests", "RequestsInstrumentor"),
-        # FastAPI is present in core (and telegram); absent in worker. Import is
+        # FastAPI is present in core (and comms); absent in worker. Import is
         # attempted; failure is logged-and-swallowed by the caller above.
         ("opentelemetry.instrumentation.fastapi", "FastAPIInstrumentor"),
     ]

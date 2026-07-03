@@ -21,7 +21,7 @@ Pipeline:
 8.   Apply verdict (label task, mute, stage PR — depending on verdict shape)
 8.5. Post `[Pandora] Investigation complete — <verdict>` final-comment on
      the track-task via `AlertActivities.post_task_note`
-9.   Notify via Telegram (links to the Todoist task)
+9.   Notify via chat (links to the Todoist task)
 10.  Log investigation to `audit_log`
 
 Start-comment (`[Pandora] Investigation started`) is posted between
@@ -168,21 +168,21 @@ class AlertInvestigationFlow:
         except Exception:
             pass
 
-    async def _safe_send_telegram(
+    async def _safe_send_message(
         self,
         agent_id: str,
         message: str,
         log_event: str,
     ) -> None:
-        """Workflow-side equivalent of `activities.delivery.safe_send_telegram`:
-        fire-and-forget Telegram send that logs *both* raised exceptions and
+        """Workflow-side equivalent of `activities.delivery.safe_send_message`:
+        fire-and-forget chat send that logs *both* raised exceptions and
         `{ok: false}` dict returns under `log_event`. The activity-side helper
         can't be called directly from workflows (it needs a DeliveryActivities
         instance), so we mirror the same behaviour over `execute_activity_method`.
         """
         try:
             result = await workflow.execute_activity_method(
-                DeliveryActivities.send_telegram,
+                DeliveryActivities.send_message,
                 args=[agent_id, message, 0],
                 start_to_close_timeout=TIMEOUT_FAST,
                 retry_policy=NO_RETRY,
@@ -632,7 +632,7 @@ class AlertInvestigationFlow:
                 # _MAX_HINT_ROUNDS rounds), re-run Gate-0 resolution with the
                 # hint folded in and re-present. Otherwise honour their pick /
                 # cancel. The card option keys are the candidate INDEX (not the
-                # resource UUID): Telegram callback_data is
+                # resource UUID): legacy callback_data was
                 # `interaction:{id}:{key}` and is capped at 64 bytes — two UUIDs
                 # blow past it (85B) and the card silently fails to send
                 # (BUTTON_DATA_INVALID).
@@ -999,7 +999,7 @@ class AlertInvestigationFlow:
         # that case is self-contradicting: the user saw both "1 PR staged" and
         # "the evidence is too thin to call" on the same run. Promote the
         # status to "actionable" so the Gate-2 prompt, the final track-task
-        # comment (Step 8.5) and the Telegram ping (Step 9) all render an
+        # comment (Step 8.5) and the chat ping (Step 9) all render an
         # actionable / PR outcome consistent with the staged fix.
         if (inv_result.get("branches") or {}) and verdict_status in (
             "inconclusive",
@@ -1034,20 +1034,20 @@ class AlertInvestigationFlow:
         # just the kimi-with-branches case the gate started life as
         # (2026-05-01 shape). Once kimi stopped reliably producing branches
         # — qwen3:14b assess timeouts, conservative grounding rule — the
-        # user got "comments after comments on Todoist" with no Telegram
+        # user got "comments after comments on Todoist" with no chat
         # prompt to approve action. Bringing the gate back broadly
-        # restores Telegram as the decision surface; Todoist remains the
+        # restores chat as the decision surface; Todoist remains the
         # record (2026-05-22 user ask).
         #
         # Options vary by context:
         #   • If kimi committed fixes (branches present): "Open PR(s)"
         #     is offered first + "Discard" is offered.
         #   • Always: "Mute 24h" and "Acknowledge" so the user can
-        #     dispose of the alert without leaving Telegram.
+        #     dispose of the alert without leaving chat.
         #
         # Source-gated: `todoist-jira` runs are scoping-only by contract
         # (the prompt says "Do NOT commit fixes. Do NOT create branches");
-        # they go straight to the Todoist verdict comment + lean Telegram
+        # they go straight to the Todoist verdict comment + lean chat
         # info ping. No action gate for them.
         branches = inv_result.get("branches") or {}
         gate_skipped = is_jira or verdict_status == "resolved"
@@ -1109,7 +1109,7 @@ class AlertInvestigationFlow:
             # Mirror Gate-1's archived-treatment: a 48h-ignored Gate-2 means
             # the user never decided. Don't fall through to the regular
             # verdict ping — drop a skip-comment on the track-task and short
-            # out so we don't surface a "verdict complete" Telegram for an
+            # out so we don't surface a "verdict complete" ping for an
             # archived decision the operator hasn't engaged with.
             if getattr(g2, "status", None) == "archived":
                 workflow.logger.info(
@@ -1152,7 +1152,7 @@ class AlertInvestigationFlow:
                 }
             if v2 == "mute_24h":
                 # Mute the alert family for 24h, then fall through to the
-                # normal verdict-comment + Telegram-info path so the user
+                # normal verdict-comment + chat-info path so the user
                 # still has the full verdict on Todoist.
                 if mute_key:
                     try:
@@ -1253,19 +1253,19 @@ class AlertInvestigationFlow:
                         f"  • <a href='{u}'>{_html_escape(u)}</a>" for u in pr_urls
                     )
                     voice_head = voice_line(_PANDORA, "pr_opened", count=n)
-                    # _safe_send_telegram logs raised exceptions AND ok=false
+                    # _safe_send_message logs raised exceptions AND ok=false
                     # body returns (HTML parse, rate-limit, bot offline). The
                     # `_safe_event` below is the operator-visible fallback so
                     # we don't entirely lose the signal.
-                    await self._safe_send_telegram(
+                    await self._safe_send_message(
                         agent_id=_PANDORA,
                         message=f"<b>{_html_escape(voice_head)}</b>\n{links_html}",
-                        log_event="pr_opened_telegram_failed",
+                        log_event="pr_opened_notify_failed",
                     )
                     await self._safe_event(f"📝 {n} PR(s) opened for: {_html_escape(title)}")
                     # Close the loop: stamp the track-task with the PR URLs
                     # so the user sees the outcome on the Todoist task that
-                    # spawned the investigation, not only in Telegram.
+                    # spawned the investigation, not only in chat.
                     if track_task_id and not track_task_id.startswith("item-"):
                         links_plain = "\n".join(f"  • {u}" for u in pr_urls)
                         await self._safe_post_note(
@@ -1302,7 +1302,7 @@ class AlertInvestigationFlow:
         # comment summarising the verdict so the user can drive the next
         # action from inside Todoist. Full text — Todoist comments cap
         # at 16k chars, well above any verdict shape we produce, so we
-        # do NOT truncate root_cause / suggested_fix here. The Telegram
+        # do NOT truncate root_cause / suggested_fix here. The chat
         # message in Step 9 is the slim version; this is the full one.
         kimi_attachment: dict | None = None
         kimi_attachment_name: str = ""
@@ -1363,10 +1363,10 @@ class AlertInvestigationFlow:
                 final_msg = f"{final_msg}\n\n📎 Transcript: {kimi_attachment_name}"
             await self._safe_post_note(track_task_id, final_msg, file_attachment=kimi_attachment)
 
-        # ── Step 9: Telegram notification ──
+        # ── Step 9: chat notification ──
         # Lean format: title + status + 1-line preview + Todoist link.
         # The full verdict (root_cause + suggested_fix) lives untruncated
-        # on the Todoist task comment (Step 8.5) — Telegram is a ping,
+        # on the Todoist task comment (Step 8.5) — the chat message is a ping,
         # not the artifact. A short preview (~160 chars) lets the user
         # decide whether to open the task without scrolling.
         kind_prefix = "scoping" if is_jira else "investigation"
@@ -1399,15 +1399,15 @@ class AlertInvestigationFlow:
             task_url = f"https://app.todoist.com/app/task/{track_task_id}"
             msg = f"{msg}\n\n<a href='{task_url}'>Full verdict on Todoist →</a>"
 
-        await self._safe_send_telegram(
+        await self._safe_send_message(
             agent_id="pandoras-actor",
             message=msg,
-            log_event="alert_verdict_telegram_failed",
+            log_event="alert_verdict_notify_failed",
         )
 
         # ── Step 9.5: Additive voice note (no-op unless AEGIS_TTS_ENABLED) ──
         # Pandora reads the verdict aloud. Plain spoken text, not HTML; the full
-        # verdict still lives on Telegram + the Todoist task.
+        # verdict still lives in chat + the Todoist task.
         voice_text = f"Investigation complete for {title}. Status: {final_status}."
         if preview_src:
             voice_text += f" {preview_src[:600]}"

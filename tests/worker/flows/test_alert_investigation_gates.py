@@ -198,8 +198,8 @@ async def stub_send_system_event(msg: str) -> None:
     pass
 
 
-@activity.defn(name="send_telegram")
-async def stub_send_telegram(
+@activity.defn(name="send_message")
+async def stub_send_message(
     agent_id: str, msg: str, chat_id: int, reply_markup: dict | None = None
 ) -> None:
     pass
@@ -276,7 +276,7 @@ ALL_STUBS = [
     stub_assess_investigation,
     stub_log_alert,
     stub_send_system_event,
-    stub_send_telegram,
+    stub_send_message,
     stub_accumulate_digest,
     stub_insert_interaction,
     stub_send_card,
@@ -679,7 +679,7 @@ async def test_gate2_mute_24h_writes_alert_mute():
 @pytest.mark.asyncio
 async def test_gate2_ack_logs_acknowledgement_without_pr():
     """Gate 2 `ack` choice falls through to the normal verdict-comment +
-    Telegram-info path. No PRs created, no mute written."""
+    chat-info path. No PRs created, no mute written."""
     _reset(muted=False)
 
     async with (
@@ -713,10 +713,10 @@ async def test_gate2_ack_logs_acknowledgement_without_pr():
 async def test_alertmanager_kimi_no_branches_still_fires_gate2_for_decision():
     """When Kimi returns empty branches (no code fix), Gate 2 still fires —
     it just omits the `open_all_prs` option and offers Mute / Acknowledge
-    so the user can dispose of the alert from Telegram.
+    so the user can dispose of the alert from chat.
 
     Updated 2026-05-22 — pre-fix the gate skipped this case entirely, which
-    is what triggered the "comments after comments, no Telegram approval
+    is what triggered the "comments after comments, no chat approval
     prompt" feedback from the user.
     """
     _reset(muted=False)
@@ -914,7 +914,7 @@ async def test_inconclusive_verdict_sets_inconclusive_status():
         )
 
         # Post-2026-05-22: inconclusive verdicts still fire Gate 2 so the
-        # user can Mute/Ack via Telegram. Send `ack` to let the flow
+        # user can Mute/Ack via chat. Send `ack` to let the flow
         # finish; final_status must remain `inconclusive`.
         for _ in range(200):
             await asyncio.sleep(0.05)

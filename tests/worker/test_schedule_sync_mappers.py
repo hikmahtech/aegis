@@ -31,7 +31,7 @@ def _act(slug: str, workflow_type: str, config: dict) -> dict:
         "agent_id": "maou",
         "schedule_cron": "0 0 * * *",
         "config": config,
-        "_settings": {"aegis_ui_url": "", "telegram_chat_id": 0},
+        "_settings": {"aegis_ui_url": ""},
     }
 
 
@@ -118,7 +118,7 @@ def test_daily_briefing_flow_mapper_resolves() -> None:
             "agent_id": "raphael",
             "schedule_cron": "30 4 * * *",
             "config": {},
-            "_settings": {"aegis_ui_url": "", "telegram_chat_id": 0},
+            "_settings": {"aegis_ui_url": ""},
         }
     )
     assert workflow_cls is DailyBriefingFlow
@@ -126,9 +126,9 @@ def test_daily_briefing_flow_mapper_resolves() -> None:
     assert cfg.agent_id == "raphael"
 
 
-def test_delivery_watchdog_mapper_threads_telegram_url():
-    """Regression: without telegram_service_url threaded from settings, the
-    watchdog's polling-health check runs with telegram_url="" and is
+def test_delivery_watchdog_mapper_threads_comms_url():
+    """Regression: without comms_url threaded from settings, the
+    watchdog's polling-health check runs with comms_url="" and is
     permanently disabled in prod."""
     from aegis_worker.flows.delivery_watchdog import (
         DeliveryWatchdogConfig,
@@ -137,11 +137,11 @@ def test_delivery_watchdog_mapper_threads_telegram_url():
 
     mapper = _ACTIVITY_TYPE_MAP["DeliveryWatchdogFlow"]
     act = _act("delivery-watchdog-hourly", "DeliveryWatchdogFlow", {})
-    act["_settings"]["telegram_service_url"] = "http://aegis_telegram:8081"
+    act["_settings"]["comms_url"] = "http://aegis_comms:8081"
     workflow_cls, cfg = mapper(act)
     assert workflow_cls is DeliveryWatchdogFlow
     assert isinstance(cfg, DeliveryWatchdogConfig)
-    assert cfg.telegram_url == "http://aegis_telegram:8081"
+    assert cfg.comms_url == "http://aegis_comms:8081"
 
 
 def test_workspace_repo_sync_flow_mapper_resolves():

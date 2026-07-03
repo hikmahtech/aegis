@@ -1,8 +1,8 @@
 """End-to-end: Todoist webhook -> ClarifyFlow -> AgentChatReplyFlow ->
-Telegram dispatch + Todoist comment mirror.
+chat dispatch + Todoist comment mirror.
 
 Real Postgres (asyncpg via db_pool fixture). HTTP stubbed via respx
-(core /api/chat/agent-reply, Telegram delivery, Todoist Sync API).
+(core /api/chat/agent-reply, comms delivery, Todoist Sync API).
 
 This e2e variant pins the webhook -> DB-bump boundary. The Temporal-driven
 ClarifyFlow + AgentChatReplyFlow lifecycle (spawn, child-workflow chain)
@@ -76,7 +76,7 @@ async def test_user_comment_to_raphael_full_flow(db_pool, test_settings, _seeded
 
     NOTE: this test pins the webhook -> DB-bump boundary. The remainder of
     the lifecycle (ClarifyFlow tick -> spawn -> AgentChatReplyFlow -> core
-    /api/chat/agent-reply -> Telegram dispatch + post_agent_reply_comment)
+    /api/chat/agent-reply -> chat dispatch + post_agent_reply_comment)
     requires a running Temporal worker, which is exercised by the
     per-component workflow tests, not this e2e.
     """

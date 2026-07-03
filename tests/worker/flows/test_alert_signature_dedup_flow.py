@@ -161,8 +161,8 @@ async def stub_send_system_event(msg: str) -> None:
     _calls.setdefault("system_events", []).append(msg)
 
 
-@activity.defn(name="send_telegram")
-async def stub_send_telegram(
+@activity.defn(name="send_message")
+async def stub_send_message(
     agent_id: str, msg: str, chat_id: int, reply_markup: dict | None = None
 ) -> None:
     pass
@@ -222,7 +222,7 @@ ALL_STUBS = [
     stub_investigate,
     stub_assess_investigation,
     stub_send_system_event,
-    stub_send_telegram,
+    stub_send_message,
     stub_accumulate_digest,
     stub_record_verdict_to_kg,
     stub_insert_interaction,

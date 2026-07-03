@@ -13,11 +13,11 @@ import httpx
 import respx
 from aegis_comms.adapters.base import CardSpec, DeliveryRef
 from aegis_comms.adapters.slack import SlackAdapter
-from aegis_comms.config import TelegramSettings
+from aegis_comms.config import CommsSettings
 from slack_sdk.errors import SlackApiError
 
 
-def _settings(**over) -> TelegramSettings:
+def _settings(**over) -> CommsSettings:
     base = {
         "AEGIS_CHANNEL": "slack",
         "AEGIS_SLACK_BOT_TOKEN": "xoxb-test",
@@ -25,7 +25,7 @@ def _settings(**over) -> TelegramSettings:
         "AEGIS_API_KEY": "k",
     }
     base.update(over)
-    return TelegramSettings(**base)
+    return CommsSettings(**base)
 
 
 def _adapter(

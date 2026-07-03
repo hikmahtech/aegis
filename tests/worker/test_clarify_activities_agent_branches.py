@@ -459,7 +459,7 @@ async def test_post_agent_reply_comment_uses_prefix_and_tool_trailer(db_pool):
             agent_id="raphael",
             reply_text="Tigris is an S3-compatible store.",
             tool_trace_summary="search_knowledge",
-            telegram_message_id=987,
+            message_id=987,
         )
     finally:
         TodoistConnector.check_sync_status = real_check
@@ -501,7 +501,7 @@ async def test_post_agent_reply_comment_outbox_on_retryable_failure(db_pool):
             agent_id="sebas",
             reply_text="ok",
             tool_trace_summary="",
-            telegram_message_id=None,
+            message_id=None,
         )
     finally:
         TodoistConnector.check_sync_status = real_check
@@ -548,10 +548,10 @@ async def test_post_agent_reply_error_comment_also_uses_prefix(db_pool):
 
 
 @pytest.mark.asyncio
-async def test_post_agent_reply_comment_includes_telegram_message_id_anchor(db_pool):
-    """When telegram_message_id is provided, the Todoist comment includes
-    a `(telegram message_id=<id>)` anchor line so the user can cross-link
-    from the Todoist comment to the rich Telegram reply.
+async def test_post_agent_reply_comment_includes_message_id_anchor(db_pool):
+    """When message_id is provided, the Todoist comment includes
+    a `(chat message_id=<id>)` anchor line so the user can cross-link
+    from the Todoist comment to the rich chat reply.
     """
     todoist = AsyncMock()
     todoist.commands = AsyncMock(return_value={"ok": True, "sync_status": {}})
@@ -575,13 +575,13 @@ async def test_post_agent_reply_comment_includes_telegram_message_id_anchor(db_p
             agent_id="raphael",
             reply_text="Reply body",
             tool_trace_summary="",
-            telegram_message_id=12345,
+            message_id=12345,
         )
     finally:
         TodoistConnector.check_sync_status = real_check
 
     content = todoist.commands.call_args.args[0][0]["args"]["content"]
-    assert "(telegram message_id=12345)" in content
+    assert "(chat message_id=12345)" in content
 
 
 @pytest.mark.asyncio

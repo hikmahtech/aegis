@@ -1,7 +1,7 @@
 """Slack inbound tests — pure routing + SlackInbound.on_* methods.
 
 No live Slack: the SlackCoreClient and SlackAdapter are AsyncMocks, so the
-on_* methods are exercised directly without a socket. Mirrors the Telegram
+on_* methods are exercised directly without a socket. Mirrors the original
 bot's routing + core-call contracts (bot.py::_message / _send_chat /
 _dispatch_agent_reply / handle_capture_command / handle_interaction_callback).
 """

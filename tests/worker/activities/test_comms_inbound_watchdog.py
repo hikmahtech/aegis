@@ -1,5 +1,5 @@
-"""Tests for HomelabActivities.check_telegram_polling_health and
-alert_telegram_polling_down (Fix 3 — dead-polling watchdog via Todoist).
+"""Tests for HomelabActivities.check_comms_inbound_health and
+alert_comms_inbound_down (comms inbound watchdog via Todoist).
 
 Uses ActivityEnvironment + respx per the worker testing convention.
 DB-touching tests (dedup, audit_log write) run against real Postgres via the
@@ -23,7 +23,7 @@ from temporalio.testing import ActivityEnvironment
 
 def _make_act(db_pool=None, todoist_connector=None):
     delivery = AsyncMock()
-    delivery.send_telegram = AsyncMock(return_value={"ok": True})
+    delivery.send_message = AsyncMock(return_value={"ok": True})
     return HomelabActivities(
         db_pool=db_pool,
         homelab=None,
@@ -33,91 +33,49 @@ def _make_act(db_pool=None, todoist_connector=None):
 
 
 # ---------------------------------------------------------------------------
-# check_telegram_polling_health — no-DB tests
+# check_comms_inbound_health — no-DB tests
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
 @respx.mock
-async def test_health_ok_returns_ok():
-    """Healthy endpoint → status='ok'."""
-    respx.get("http://telegram.test/api/health").mock(
-        return_value=Response(
-            200,
-            json={
-                "status": "ok",
-                "service": "aegis-telegram",
-                "telegram_api": {
-                    "reachable": True,
-                    "last_ok_seconds_ago": 30,
-                    "last_error": None,
-                },
-            },
-        )
-    )
-    act = _make_act()
-    env = ActivityEnvironment()
-    result = await env.run(act.check_telegram_polling_health, "http://telegram.test")
-    assert result == {"status": "ok"}
-
-
-@pytest.mark.asyncio
-@respx.mock
-async def test_health_down_returns_down():
-    """Endpoint reports reachable=False → status='down' with details."""
-    respx.get("http://telegram.test/api/health").mock(
-        return_value=Response(
-            200,
-            json={
-                "status": "ok",
-                "service": "aegis-telegram",
-                "telegram_api": {
-                    "reachable": False,
-                    "last_ok_seconds_ago": 900,
-                    "last_error": "Network unreachable",
-                },
-            },
-        )
-    )
-    act = _make_act()
-    env = ActivityEnvironment()
-    result = await env.run(act.check_telegram_polling_health, "http://telegram.test")
-    assert result["status"] == "down"
-    assert result["last_ok_seconds_ago"] == 900
-    assert result["last_error"] == "Network unreachable"
-
-
-@pytest.mark.asyncio
-@respx.mock
 async def test_health_unreachable_endpoint_returns_unknown():
-    """HTTP error reaching the telegram service → status='unknown' (backward compat)."""
-    respx.get("http://telegram.test/api/health").mock(side_effect=Exception("Connection refused"))
+    """HTTP error reaching the comms service → status='unknown' (backward compat)."""
+    respx.get("http://comms.test/api/health").mock(side_effect=Exception("Connection refused"))
     act = _make_act()
     env = ActivityEnvironment()
-    result = await env.run(act.check_telegram_polling_health, "http://telegram.test")
+    result = await env.run(act.check_comms_inbound_health, "http://comms.test")
     assert result == {"status": "unknown"}
 
 
 @pytest.mark.asyncio
 @respx.mock
-async def test_health_old_image_no_telegram_api_field_returns_unknown():
-    """Old image: no telegram_api field in response → status='unknown' (do nothing)."""
-    respx.get("http://telegram.test/api/health").mock(
+async def test_health_no_inbound_field_returns_unknown():
+    """No `inbound` block in the health body → status='unknown' (do nothing).
+
+    Also covers the removed legacy `telegram_api` fallback: a body carrying
+    only that block is treated as unknown now that Telegram is gone.
+    """
+    respx.get("http://comms.test/api/health").mock(
         return_value=Response(
             200,
-            json={"status": "ok", "service": "aegis-telegram"},
+            json={
+                "status": "ok",
+                "service": "aegis-comms",
+                "telegram_api": {"reachable": True, "last_ok_seconds_ago": 30},
+            },
         )
     )
     act = _make_act()
     env = ActivityEnvironment()
-    result = await env.run(act.check_telegram_polling_health, "http://telegram.test")
+    result = await env.run(act.check_comms_inbound_health, "http://comms.test")
     assert result == {"status": "unknown"}
 
 
 @pytest.mark.asyncio
 @respx.mock
 async def test_health_slack_inbound_healthy_returns_ok():
-    """Slack body: generic `inbound` block healthy, no telegram_api → status='ok'."""
+    """Slack body: generic `inbound` block healthy → status='ok'."""
     respx.get("http://comms.test/api/health").mock(
         return_value=Response(
             200,
@@ -135,7 +93,7 @@ async def test_health_slack_inbound_healthy_returns_ok():
     )
     act = _make_act()
     env = ActivityEnvironment()
-    result = await env.run(act.check_telegram_polling_health, "http://comms.test")
+    result = await env.run(act.check_comms_inbound_health, "http://comms.test")
     assert result == {"status": "ok"}
 
 
@@ -160,54 +118,23 @@ async def test_health_slack_inbound_unhealthy_returns_down():
     )
     act = _make_act()
     env = ActivityEnvironment()
-    result = await env.run(act.check_telegram_polling_health, "http://comms.test")
+    result = await env.run(act.check_comms_inbound_health, "http://comms.test")
     assert result["status"] == "down"
     assert result["last_ok_seconds_ago"] == 900
     assert result["last_error"] == "socket_not_connected"
 
 
 @pytest.mark.asyncio
-@respx.mock
-async def test_health_inbound_block_preferred_over_telegram_api():
-    """When both blocks are present (telegram channel), the generic `inbound`
-    block is the source of truth — proven by an inbound=healthy verdict."""
-    respx.get("http://comms.test/api/health").mock(
-        return_value=Response(
-            200,
-            json={
-                "status": "ok",
-                "channel": "telegram",
-                "telegram_api": {
-                    "reachable": True,
-                    "last_ok_seconds_ago": 5,
-                    "last_error": None,
-                },
-                "inbound": {
-                    "channel": "telegram",
-                    "healthy": True,
-                    "last_ok_seconds_ago": 5,
-                    "last_error": None,
-                },
-            },
-        )
-    )
-    act = _make_act()
-    env = ActivityEnvironment()
-    result = await env.run(act.check_telegram_polling_health, "http://comms.test")
-    assert result == {"status": "ok"}
-
-
-@pytest.mark.asyncio
 async def test_health_empty_url_returns_unknown():
-    """No telegram_url configured → status='unknown'."""
+    """No comms_url configured → status='unknown'."""
     act = _make_act()
     env = ActivityEnvironment()
-    result = await env.run(act.check_telegram_polling_health, "")
+    result = await env.run(act.check_comms_inbound_health, "")
     assert result == {"status": "unknown"}
 
 
 # ---------------------------------------------------------------------------
-# alert_telegram_polling_down — DB tests (real Postgres via db_pool fixture)
+# alert_comms_inbound_down — DB tests (real Postgres via db_pool fixture)
 # ---------------------------------------------------------------------------
 
 
@@ -228,7 +155,7 @@ async def test_alert_polling_down_no_dedup_creates_task(db_pool):
         )
         # Clean up any prior audit rows for this test
         await conn.execute(
-            "DELETE FROM audit_log WHERE action = 'telegram_polling_alert'"
+            "DELETE FROM audit_log WHERE action = 'comms_inbound_alert'"
         )
 
     # Mock todoist connector that records the command
@@ -243,7 +170,7 @@ async def test_alert_polling_down_no_dedup_creates_task(db_pool):
 
     act = _make_act(db_pool=db_pool, todoist_connector=todoist)
     env = ActivityEnvironment()
-    created = await env.run(act.alert_telegram_polling_down, 900, "Network unreachable")
+    created = await env.run(act.alert_comms_inbound_down, 900, "Network unreachable")
 
     assert created is True
     assert len(commands_called) == 1
@@ -257,13 +184,13 @@ async def test_alert_polling_down_no_dedup_creates_task(db_pool):
     # audit_log row must exist
     async with db_pool.acquire() as conn:
         row = await conn.fetchrow(
-            "SELECT id FROM audit_log WHERE action = 'telegram_polling_alert'"
+            "SELECT id FROM audit_log WHERE action = 'comms_inbound_alert'"
         )
     assert row is not None
 
     # Cleanup
     async with db_pool.acquire() as conn:
-        await conn.execute("DELETE FROM audit_log WHERE action = 'telegram_polling_alert'")
+        await conn.execute("DELETE FROM audit_log WHERE action = 'comms_inbound_alert'")
 
 
 @pytest.mark.asyncio
@@ -282,11 +209,11 @@ async def test_alert_polling_down_dedup_skips_second_task(db_pool):
         )
         # Seed an audit_log row representing a recent prior alert
         await conn.execute(
-            "DELETE FROM audit_log WHERE action = 'telegram_polling_alert'"
+            "DELETE FROM audit_log WHERE action = 'comms_inbound_alert'"
         )
         await conn.execute(
             "INSERT INTO audit_log (actor, action, target_type, target_id, details) "
-            "VALUES ('delivery-watchdog', 'telegram_polling_alert', 'telegram', 'polling', '{}')"
+            "VALUES ('delivery-watchdog', 'comms_inbound_alert', 'comms', 'inbound', '{}')"
         )
 
     todoist = MagicMock()
@@ -300,22 +227,22 @@ async def test_alert_polling_down_dedup_skips_second_task(db_pool):
 
     act = _make_act(db_pool=db_pool, todoist_connector=todoist)
     env = ActivityEnvironment()
-    created = await env.run(act.alert_telegram_polling_down, 900, None)
+    created = await env.run(act.alert_comms_inbound_down, 900, None)
 
     assert created is False
     assert len(commands_called) == 0
 
     # Cleanup
     async with db_pool.acquire() as conn:
-        await conn.execute("DELETE FROM audit_log WHERE action = 'telegram_polling_alert'")
+        await conn.execute("DELETE FROM audit_log WHERE action = 'comms_inbound_alert'")
 
 
 async def test_alert_rejected_create_does_not_write_dedup_audit(db_pool):
     """A rejected Todoist create must return False and NOT write the
-    telegram_polling_alert audit row — otherwise the alert is silently
+    comms_inbound_alert audit row — otherwise the alert is silently
     deduped away for 12h after a single transient rejection."""
     async with db_pool.acquire() as conn:
-        await conn.execute("DELETE FROM audit_log WHERE action = 'telegram_polling_alert'")
+        await conn.execute("DELETE FROM audit_log WHERE action = 'comms_inbound_alert'")
 
     todoist = MagicMock()
 
@@ -329,11 +256,11 @@ async def test_alert_rejected_create_does_not_write_dedup_audit(db_pool):
 
     act = _make_act(db_pool=db_pool, todoist_connector=todoist)
     env = ActivityEnvironment()
-    created = await env.run(act.alert_telegram_polling_down, 900, None)
+    created = await env.run(act.alert_comms_inbound_down, 900, None)
 
     assert created is False
     async with db_pool.acquire() as conn:
         row = await conn.fetchval(
-            "SELECT 1 FROM audit_log WHERE action = 'telegram_polling_alert' LIMIT 1"
+            "SELECT 1 FROM audit_log WHERE action = 'comms_inbound_alert' LIMIT 1"
         )
     assert row is None

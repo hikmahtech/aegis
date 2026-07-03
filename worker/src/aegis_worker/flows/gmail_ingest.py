@@ -295,7 +295,7 @@ class GmailIngestFlow:
         if category == "important_action":
             # Phase 2: replace the InteractionFlow approval card with a
             # Todoist Inbox capture. Urgent security/payments emails ALSO
-            # get a fire-and-forget Telegram notification.
+            # get a fire-and-forget chat notification.
             cl = classification or {}
             tags_set = set(cl.get("tags") or [])
             msg_id = msg["id"]
@@ -365,7 +365,7 @@ class GmailIngestFlow:
             if capture_failed or capture_ref is None:
                 return "capture_failed"
 
-            # Telegram escalation for high-confidence security/payments
+            # Chat escalation for high-confidence security/payments
             confidence = float(cl.get("confidence") or 0.0)
             if confidence > 0.9 and ("security" in tags_set or "payments" in tags_set):
                 try:
@@ -400,7 +400,7 @@ class GmailIngestFlow:
 
         if category == "important_read":
             # Surface via Gmail's IMPORTANT label and KEEP UNREAD. No per-email
-            # Telegram ping — the label is the surface now (pinging every
+            # chat ping — the label is the surface now (pinging every
             # receipt/GitHub notice is noise; 2026-05-30 redesign).
             label_result = await workflow.execute_activity(
                 "apply_label",

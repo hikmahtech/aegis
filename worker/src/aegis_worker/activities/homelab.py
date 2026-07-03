@@ -16,13 +16,13 @@ import httpx
 import structlog
 from temporalio import activity
 
-from aegis_worker.activities.delivery import safe_send_telegram
+from aegis_worker.activities.delivery import safe_send_message
 
 logger = structlog.get_logger()
 
 
 def _format_card(title: str, body: str) -> str:
-    """Render a homelab notification as a Telegram HTML card.
+    """Render a homelab notification as a light-HTML chat card.
 
     The title is bolded and escaped; the body is escaped (callers that need
     embedded markup should escape selectively and pass HTML through, but
@@ -50,10 +50,10 @@ class HomelabActivities:
     todoist_connector: Any = None  # TodoistConnector; wired in __main__ when available
 
     async def _notify_card(self, agent_id: str, title: str, body: str, log_event: str) -> None:
-        """Fire-and-forget Telegram-card send shared by the notify_* activities.
+        """Fire-and-forget chat-card send shared by the notify_* activities.
 
         (notify_cert_alert deliberately bypasses this — see its body.)"""
-        await safe_send_telegram(
+        await safe_send_message(
             self.delivery,
             agent_id=agent_id,
             message=_format_card(title, body),
@@ -142,7 +142,7 @@ class HomelabActivities:
 
     @activity.defn
     async def notify_drift(self, payload: dict) -> None:
-        """Send Telegram card with [DRIFT] prefix. Fire-and-forget safe."""
+        """Send chat card with [DRIFT] prefix. Fire-and-forget safe."""
         title = f"[DRIFT][{payload['severity'].upper()}] {payload['service_name']}"
         body = (
             f"Type: {payload['drift_type']}\n"
@@ -159,7 +159,7 @@ class HomelabActivities:
         """Delivery watchdog: interaction rows are created BEFORE the card is
         dispatched, so a row whose delivery is unrecorded after a grace period
         was silently never delivered. A card counts as delivered if EITHER
-        `telegram_message_id` (Telegram) OR `delivery_ref` (Slack / any
+        `telegram_message_id` (legacy column) OR `delivery_ref` (Slack / any
         channel-neutral adapter) is set — checking only `telegram_message_id`
         would false-alarm on every Slack card post-cutover. Returns recent
         undelivered rows so the next silent-undelivery regression is caught
@@ -213,83 +213,66 @@ class HomelabActivities:
         await self._notify_card(self.agent_id, title, body, "homelab_notify_undelivered_failed")
 
     # ------------------------------------------------------------------
-    # Telegram polling health check
+    # Comms inbound-channel health check
     # ------------------------------------------------------------------
 
     _POLLING_ALERT_DEDUP_HOURS = 12  # do not re-alert within this window
-    _POLLING_ALERT_ACTION = "telegram_polling_alert"
+    _POLLING_ALERT_ACTION = "comms_inbound_alert"
 
     @activity.defn
-    async def check_telegram_polling_health(self, telegram_url: str) -> dict:
+    async def check_comms_inbound_health(self, comms_url: str) -> dict:
         """GET <comms_url>/api/health and inspect inbound-channel liveness.
 
-        Prefers the channel-neutral `inbound` block (works for both Telegram and
-        Slack); falls back to the legacy `telegram_api` block for old comms
-        images. Under the Slack channel there is no `telegram_api` block, so its
-        absence here is exactly what stops a false "down" alarm.
+        Reads the channel-neutral `inbound` block (the comms service's source
+        of truth for inbound liveness — the Slack Socket Mode probe).
 
         Returns:
           {"status": "ok"}                       — inbound healthy, no action needed
           {"status": "down", "last_ok_seconds_ago": <int|None>, "last_error": <str|None>}
                                                  — inbound is down, caller should alert
           {"status": "unknown"}                  — endpoint unreachable or old image
-                                                   (no inbound/telegram_api field); do nothing
+                                                   (no inbound field); do nothing
 
         Never raises — all exceptions are caught and returned as "unknown".
         """
-        if not telegram_url:
+        if not comms_url:
             return {"status": "unknown"}
         try:
             async with httpx.AsyncClient(timeout=10.0) as client:
-                resp = await client.get(f"{telegram_url.rstrip('/')}/api/health")
+                resp = await client.get(f"{comms_url.rstrip('/')}/api/health")
                 if resp.status_code != 200:
                     return {"status": "unknown"}
                 body = resp.json()
         except Exception as exc:
             activity.logger.warning(
-                "check_telegram_polling_health_request_failed error=%s", str(exc)[:200]
+                "check_comms_inbound_health_request_failed error=%s", str(exc)[:200]
             )
             return {"status": "unknown"}
 
-        # Prefer the channel-neutral `inbound` block (the comms service's source
-        # of truth for inbound liveness — telegram reachability or slack socket).
         inbound = body.get("inbound")
-        if isinstance(inbound, dict):
-            if inbound.get("healthy"):
-                return {"status": "ok"}
-            return {
-                "status": "down",
-                "last_ok_seconds_ago": inbound.get("last_ok_seconds_ago"),
-                "last_error": inbound.get("last_error"),
-            }
-
-        # Fall back to the legacy telegram_api block for old comms images.
-        tg_api = body.get("telegram_api")
-        if not isinstance(tg_api, dict):
-            # Old image — neither block present; treat as unknown (backward compatible)
+        if not isinstance(inbound, dict):
+            # No inbound block; treat as unknown (backward compatible).
             return {"status": "unknown"}
-
-        if tg_api.get("reachable"):
+        if inbound.get("healthy"):
             return {"status": "ok"}
-
         return {
             "status": "down",
-            "last_ok_seconds_ago": tg_api.get("last_ok_seconds_ago"),
-            "last_error": tg_api.get("last_error"),
+            "last_ok_seconds_ago": inbound.get("last_ok_seconds_ago"),
+            "last_error": inbound.get("last_error"),
         }
 
     @activity.defn
-    async def alert_telegram_polling_down(
+    async def alert_comms_inbound_down(
         self, last_ok_seconds_ago: int | None, last_error: str | None
     ) -> bool:
-        """Create a Todoist Inbox task alerting that Telegram inbound polling is down.
+        """Create a Todoist Inbox task alerting that the comms inbound channel is down.
 
         Deduplicates via audit_log: will not create more than one task per
         _POLLING_ALERT_DEDUP_HOURS window. Returns True if a task was created,
         False if deduped or if capture is unavailable.
 
-        Uses Todoist (not Telegram) as the alert channel because Telegram itself
-        is the thing that's down.
+        Uses Todoist (not the chat channel) as the alert surface because the
+        chat channel itself is the thing that's down.
         """
         if not self.db_pool:
             return False
@@ -305,7 +288,7 @@ class HomelabActivities:
             )
         if recent is not None:
             activity.logger.info(
-                "telegram_polling_alert_deduped within_%dh", self._POLLING_ALERT_DEDUP_HOURS
+                "comms_inbound_alert_deduped within_%dh", self._POLLING_ALERT_DEDUP_HOURS
             )
             return False
 
@@ -330,13 +313,13 @@ class HomelabActivities:
             )
         inbox_id = (managed or {}).get("inbox") if isinstance(managed, dict) else None
         if kill is False or (isinstance(kill, dict) and kill.get("value") is False):
-            activity.logger.warning("telegram_polling_alert_capture_disabled")
+            activity.logger.warning("comms_inbound_alert_capture_disabled")
             return False
         if not inbox_id:
-            activity.logger.warning("telegram_polling_alert_no_inbox_id")
+            activity.logger.warning("comms_inbound_alert_no_inbox_id")
             return False
         if self.todoist_connector is None:
-            activity.logger.warning("telegram_polling_alert_no_todoist_connector")
+            activity.logger.warning("comms_inbound_alert_no_todoist_connector")
             return False
 
         title = (
@@ -355,7 +338,7 @@ class HomelabActivities:
             # Don't write the dedup audit row on failure — the next watchdog
             # tick (15 min) retries instead of going silent for 12 hours.
             activity.logger.warning(
-                "telegram_polling_alert_create_failed status=%s", str(status)[:200]
+                "comms_inbound_alert_create_failed status=%s", str(status)[:200]
             )
             return False
 
@@ -363,11 +346,11 @@ class HomelabActivities:
             self.db_pool,
             actor="delivery-watchdog",
             action=self._POLLING_ALERT_ACTION,
-            target_type="telegram",
+            target_type="comms",
             target_id="polling",
             details={"last_ok_seconds_ago": last_ok_seconds_ago, "last_error": last_error},
         )
-        activity.logger.info("telegram_polling_alert_created last_ok=%s", okstr)
+        activity.logger.info("comms_inbound_alert_created last_ok=%s", okstr)
         return True
 
     @activity.defn
@@ -530,24 +513,24 @@ class HomelabActivities:
     @activity.defn
     async def notify_cert_alert(self, alert: dict) -> None:
         # ----------------------------------------------------------------
-        # Intentional bypass of safe_send_telegram.
+        # Intentional bypass of safe_send_message.
         #
         # Why:
         #   probe_and_upsert_cert COMMITS `last_alert_threshold` BEFORE this
         #   activity runs. Once committed, the next probe will NOT re-fire
-        #   the same threshold (it's been "alerted"). If the Telegram send
+        #   the same threshold (it's been "alerted"). If the chat send
         #   silently fails (raised exception OR {"ok": false} body), the
         #   user never sees the warning and there's no retry path on the
         #   next tick.
         #
         # What this gives us instead:
-        #   - ERROR-level log (NOT WARN like safe_send_telegram) carrying
+        #   - ERROR-level log (NOT WARN like safe_send_message) carrying
         #     domain + threshold so the ops triage filter picks it up.
         #   - Inline handling of BOTH raise-paths AND {"ok": false} bodies,
-        #     mirroring safe_send_telegram's two-branch shape but with the
+        #     mirroring safe_send_message's two-branch shape but with the
         #     stickier ERROR level.
         #
-        # If someone wants to consolidate this into safe_send_telegram:
+        # If someone wants to consolidate this into safe_send_message:
         #   the helper would need to grow a `sticky=True` mode that escalates
         #   the log level when the caller has already committed irreversible
         #   state. Don't do it now — single-caller surface, low ROI.
@@ -559,7 +542,7 @@ class HomelabActivities:
             title = f"[CERT][T-{alert['threshold']}d] {alert['domain']}"
             body = f"Days until expiry: {alert['days']}\nNot after: {alert['not_after']}"
         try:
-            result = await self.delivery.send_telegram(
+            result = await self.delivery.send_message(
                 agent_id=self.agent_id, message=_format_card(title, body), chat_id=0
             )
         except Exception as exc:

@@ -100,11 +100,11 @@ async def test_get_thread_history_missing_thread_id(app, auth_headers):
 
 
 async def test_log_dispatch_inserts_role_dispatch_row(app, auth_headers, mock_db_pool):
-    """POST /api/chat/dispatches persists an outbound Telegram message as
+    """POST /api/chat/dispatches persists an outbound chat message as
     a chat_history row with role='dispatch'. Closes the gap where the
-    user could see a briefing on Telegram that the agent's chat
+    user could see a briefing in chat that the agent's chat
     context didn't know about. The metadata carries the
-    telegram_message_id + chat_id needed by the cleanup activity to
+    legacy telegram_message_id + chat_id keys used by the cleanup activity to
     later deleteMessage via Bot API."""
     payload = {
         "agent_id": "pandoras-actor",

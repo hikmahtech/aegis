@@ -1,7 +1,7 @@
 """ReviewActivities — Phase 5 GTD daily + weekly review digests.
 
 DailyReviewFlow + WeeklyReviewFlow gather projection counts, format a
-Telegram-safe digest, send via DeliveryActivities, optionally spawn an
+channel-safe digest, send via DeliveryActivities, optionally spawn an
 InteractionFlow child for acknowledgement, and log to
 review_digest_log (migration 014).
 
@@ -683,11 +683,11 @@ class ReviewActivities:
         }
 
 
-# --- Telegram preview formatting (workflow-side, not an activity) ---
+# --- Chat preview formatting (workflow-side, not an activity) ---
 
 
 def format_daily_preview(digest: dict, today: dt.date | None = None) -> str:
-    """Build the daily Telegram message body. Plain text + light HTML."""
+    """Build the daily chat message body. Plain text + light HTML."""
     today = today or dt.date.today()
     weekday = today.strftime("%a %d %b")
     lines: list[str] = [f"☀ <b>Daily review</b> — {weekday}", ""]

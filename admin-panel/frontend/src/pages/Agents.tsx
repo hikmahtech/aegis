@@ -10,7 +10,6 @@ type Agent = {
   capabilities?: string[];
   model_tier?: string;
   active?: boolean;
-  telegram_topic_id?: number | null;
 };
 
 const slugify = (s: string) =>

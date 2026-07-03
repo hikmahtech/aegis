@@ -50,7 +50,7 @@ def render_slack_blocks(spec: CardSpec) -> list[dict]:
 
     Always emits a leading `section` block with the mrkdwn-converted prompt,
     followed (for button kinds) by an `actions` block. Callback-button identity
-    matches the Telegram path so the resolve route is identical:
+    is stable so the resolve route stays identical:
     `value=interaction:{id}:{v}` and `action_id=interaction_{v}`.
     """
     interaction_id = spec.interaction_id

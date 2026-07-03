@@ -6,7 +6,7 @@ Bug A — self-contradicting verdict. When kimi produced a fix branch but
 assess_investigation returned `inconclusive`/`not_actionable`, the same run
 posted BOTH "1 PR staged" AND "the evidence is too thin to call". The flow
 must promote the verdict to `actionable` when branches exist, so the final
-track-task comment + Telegram ping render a PR/actionable outcome and never
+track-task comment + chat ping render a PR/actionable outcome and never
 the "inconclusive"/"too thin" wording.
 
 Bug B — silent strand on investigation failure. When kimi failed AND the LLM

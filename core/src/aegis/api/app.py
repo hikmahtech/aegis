@@ -194,6 +194,7 @@ def create_app(run_lifespan: bool = True) -> FastAPI:
     from aegis.api.routes import (
         activities,
         agents,
+        api_key,
         audit,
         capture,
         chat,
@@ -256,6 +257,7 @@ def create_app(run_lifespan: bool = True) -> FastAPI:
     app.include_router(settings.router)
     app.include_router(activities.router)
     app.include_router(integrations.router)
+    app.include_router(api_key.router)
     app.include_router(llm_backend.router)
     app.include_router(slack.router)
     app.include_router(slack.internal_router)

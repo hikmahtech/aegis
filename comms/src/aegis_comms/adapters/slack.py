@@ -3,9 +3,9 @@
 OUTBOUND ONLY (Slice 4). Resolves an agent to its Slack channel + persona
 (username/icon) via the core `/api/agents/{id}` lookup (cached), falling back to
 resolving `#aegis-<short>` by name through `conversations_list`. Message bodies
-are converted from Telegram-HTML to Slack mrkdwn (`html_to_mrkdwn`); interaction
-cards render as Block Kit (`render_slack_blocks`) with callback-button identity
-matching the Telegram path so the resolve route is identical.
+are converted from light HTML to Slack mrkdwn (`html_to_mrkdwn`); interaction
+cards render as Block Kit (`render_slack_blocks`) with a stable callback-button
+identity so the resolve route is identical across channels.
 
 Inbound (Socket Mode) lands in `start_listener`: it builds an `AsyncApp`, the
 `slack_channel_id -> agent_id` map, and a `SlackInbound` (in `slack_inbound.py`)

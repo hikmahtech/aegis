@@ -124,7 +124,7 @@ class CleanupActivities:
         return {"archived": archived, "threshold_days": days_int}
 
     @activity.defn
-    async def cleanup_old_telegram_dispatches(self, days: int = 30) -> dict:
+    async def cleanup_old_dispatches(self, days: int = 30) -> dict:
         """Prune chat_history rows older than `days` that carry a delivery_ref,
         calling the comms service DELETE endpoint for each so the message is
         removed from the channel too.

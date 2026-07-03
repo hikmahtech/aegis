@@ -228,10 +228,10 @@ async def main():
     effective_channel = (
         settings.channel
         if os.environ.get("AEGIS_CHANNEL")
-        else ("slack" if settings.telegram_service_url else "web")
+        else ("slack" if settings.comms_url else "web")
     )
     delivery_act = DeliveryActivities(
-        telegram_url=settings.telegram_service_url,
+        comms_url=settings.comms_url,
         api_key=settings.api_key,
         tts_enabled=getattr(settings, "tts_enabled", False),
         db_pool=deps.pool,
@@ -255,7 +255,7 @@ async def main():
     )
     cleanup_act = CleanupActivities(
         db_pool=deps.pool,
-        comms_url=settings.telegram_service_url,
+        comms_url=settings.comms_url,
         api_key=settings.api_key,
     )
     interaction_act = InteractionActivities(db_pool=deps.pool)
@@ -395,7 +395,7 @@ async def main():
     # track-task via alert_act.post_task_note. The dataclass declared
     # todoist_connector=None upstream; wire the live connector now.
     alert_act.todoist_connector = todoist_connector
-    # HomelabActivities.alert_telegram_polling_down creates Todoist tasks;
+    # HomelabActivities.alert_comms_inbound_down creates Todoist tasks;
     # wire the connector now (after it's been instantiated above).
     if homelab_act is not None:
         homelab_act.todoist_connector = todoist_connector
@@ -404,8 +404,8 @@ async def main():
         todoist_connector=todoist_connector,
         llm_client=deps.llm,
         knowledge_connector=connectors.get("knowledge"),
-        # references-as-knowledge: raphael's per-message Telegram path
-        # (filed / demoted) talks to the Telegram delivery server via
+        # references-as-knowledge: raphael's per-message chat path
+        # (filed / demoted) talks to the comms delivery server via
         # DeliveryActivities.
         delivery_connector=delivery_act,
         primary_model=model_balanced,
@@ -425,8 +425,8 @@ async def main():
             # (pandoras-actor on claude-sonnet) with heavy tool calls —
             # remote_script kimi SSH, deep KS search — that legitimately
             # take 3-6 min wall time. Aligns below the activity-level
-            # TIMEOUT_CHAT_REPLY (600s) with headroom; PR #248's Telegram
-            # chat path uses the same 600s ceiling.
+            # TIMEOUT_CHAT_REPLY (600s) with headroom; the chat-reply
+            # path uses the same 600s ceiling.
             timeout=550,
         )
     )
@@ -468,8 +468,8 @@ async def main():
         briefing_act.gather_briefing_changes,
         briefing_act.frame_briefing,
         briefing_act.commit_briefing_state,
-        delivery_act.send_telegram,
-        delivery_act.send_telegram_document,
+        delivery_act.send_message,
+        delivery_act.send_document,
         delivery_act.send_system_event,
         delivery_act.send_voice,
         delivery_act.send_interaction_card,
@@ -480,7 +480,7 @@ async def main():
         intel_act.ingest_intelligence,
         cleanup_act.prune_old_records,
         cleanup_act.archive_orphan_interactions,
-        cleanup_act.cleanup_old_telegram_dispatches,
+        cleanup_act.cleanup_old_dispatches,
         interaction_act.insert_interaction,
         interaction_act.resolve_interaction,
         interaction_act.apply_interaction_timeout,
@@ -554,8 +554,8 @@ async def main():
             homelab_act.notify_pr_event,
             homelab_act.find_undelivered_interactions,
             homelab_act.notify_undelivered_interactions,
-            homelab_act.check_telegram_polling_health,
-            homelab_act.alert_telegram_polling_down,
+            homelab_act.check_comms_inbound_health,
+            homelab_act.alert_comms_inbound_down,
             homelab_act.collect_services,
             homelab_act.collect_schedules,
             homelab_act.upsert_schedule_health,
@@ -639,9 +639,6 @@ async def main():
     except Exception as exc:
         logger.warning("schedule_sync_failed", error=str(exc))
 
-    # (Removed: the Telegram startup notification — dead since the Slack cutover,
-    # telegram_service_url is always empty so it never fired.)
-
     # Background periodic schedule_sync — kills cold-boot race per cmemory lesson 096fe6e2
     asyncio.create_task(
         run_periodic_schedule_sync(
@@ -656,7 +653,7 @@ async def main():
 
     # Start worker
     # TracingInterceptor propagates OTel context across workflow/activity
-    # boundaries so a Telegram → Core → Worker waterfall stays connected.
+    # boundaries so a Comms → Core → Worker waterfall stays connected.
     #
     # max_concurrent_activities=10: backstop against infra-alert storms.
     # alertmanager mints a fresh fingerprint per (alertname, instance), so a

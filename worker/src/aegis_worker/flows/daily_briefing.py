@@ -1,8 +1,8 @@
-"""DailyBriefingFlow — morning summary delivered to Telegram.
+"""DailyBriefingFlow — morning summary delivered to the agent's channel.
 
 Gathers pending interactions, calendar events, knowledge stats,
 intelligence items, and (for Maou) market data, then delivers a
-concise briefing to the agent's Telegram topic.
+concise briefing to the agent's channel.
 
 Scheduled daily (10:00 IST / 04:30 UTC) — cron `30 4 * * *` in
 `config/seed/activities.yaml`.
@@ -34,7 +34,7 @@ class DailyBriefingConfig:
     NOTE: `chat_id` was dropped (2026-05-28) — the scheduled-path
     builder in `schedule_sync._ACTIVITY_TYPE_MAP["DailyBriefingFlow"]` never
     threaded a chat_id through, so the field always rode at 0 and
-    `send_telegram(chat_id=0)` already resolves to the agent's
+    `send_message(chat_id=0)` already resolves to the agent's
     default topic via the bot's routing. Removing the field stops
     pretending it's a useful knob.
     """
@@ -91,13 +91,13 @@ class DailyBriefingFlow:
         sent_ok = False
         try:
             await workflow.execute_activity_method(
-                DeliveryActivities.send_telegram,
+                DeliveryActivities.send_message,
                 args=[config.agent_id, msg, 0],
                 start_to_close_timeout=TIMEOUT_FAST, retry_policy=RETRY_ONCE,
             )
             sent_ok = True
         except Exception:
-            workflow.logger.warning("briefing_telegram_failed")
+            workflow.logger.warning("briefing_delivery_failed")
 
         # Additive per-persona voice note (no-op unless AEGIS_TTS_ENABLED). Reads
         # the plain narrative, not the HTML message. Capped so a long briefing
@@ -121,7 +121,7 @@ class DailyBriefingFlow:
             )
             if digest.get("count", 0) > 0:
                 await workflow.execute_activity_method(
-                    DeliveryActivities.send_telegram,
+                    DeliveryActivities.send_message,
                     args=["pandoras-actor", digest["message"], 0],
                     start_to_close_timeout=TIMEOUT_FAST, retry_policy=NO_RETRY,
                 )

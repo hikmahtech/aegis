@@ -37,7 +37,7 @@ class CertRadarFlow:
                     continue
                 alerts += 1
                 # notify_cert_alert intentionally does NOT use
-                # safe_send_telegram (see homelab.py:notify_cert_alert);
+                # safe_send_message (see homelab.py:notify_cert_alert);
                 # it manages a sticky `last_alert_threshold` and emits its
                 # own ERROR log. It CAN still raise on activity-runtime
                 # issues, so keep this try/except as a backstop.

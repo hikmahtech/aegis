@@ -206,6 +206,8 @@ export const api = {
   getIntegrations: () => apiFetch<any[]>('/api/admin/integrations/config'),
   saveIntegration: (key: string, value: string) =>
     apiFetch<any[]>('/api/admin/integrations/config', { method: 'PUT', body: JSON.stringify({ key, value }) }),
+  getApiKeyStatus: () => apiFetch<{ configured: boolean; source: string }>('/api/admin/api-key'),
+  generateApiKey: () => apiFetch<{ api_key: string; configured: boolean }>('/api/admin/api-key/generate', { method: 'POST' }),
   getGoogleOauth: () => apiFetch<any>('/api/admin/integrations/google-oauth'),
   saveGoogleOauth: (body: { client_id: string; client_secret?: string }) =>
     apiFetch<any>('/api/admin/integrations/google-oauth', { method: 'PUT', body: JSON.stringify(body) }),

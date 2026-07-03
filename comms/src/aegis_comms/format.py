@@ -1,6 +1,6 @@
 """HTML→Slack-mrkdwn conversion.
 
-AEGIS message bodies are authored for Telegram `parse_mode=HTML` (a small set
+AEGIS message bodies are authored in a light HTML dialect (a small set
 of light tags). Slack uses its own `mrkdwn` flavour. `html_to_mrkdwn` converts
 the tags AEGIS actually emits and strips everything else, so the same message
 body can be posted to either channel.
@@ -79,7 +79,7 @@ class _MrkdwnParser(HTMLParser):
 
 
 def html_to_mrkdwn(text: str) -> str:
-    """Convert a Telegram-HTML message body to Slack mrkdwn."""
+    """Convert a light-HTML message body to Slack mrkdwn."""
     if not text:
         return ""
     parser = _MrkdwnParser()

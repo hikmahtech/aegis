@@ -19,7 +19,7 @@ from pydantic import BaseModel
 
 from aegis_comms.adapters.base import CardSpec, DeliveryRef
 from aegis_comms.adapters.slack import SlackAdapter
-from aegis_comms.config import TelegramSettings
+from aegis_comms.config import CommsSettings
 
 logger = structlog.get_logger()
 
@@ -73,7 +73,7 @@ async def _run_slack_socket_probe(adapter) -> None:
 
 
 async def _log_dispatch(
-    settings: TelegramSettings,
+    settings: CommsSettings,
     *,
     agent_id: str,
     content: str,
@@ -81,7 +81,7 @@ async def _log_dispatch(
     kind: str,
 ) -> None:
     """Fire-and-forget POST to core /api/chat/dispatches so every outbound
-    Telegram message lands as a role='dispatch' row in chat_history. This
+    message lands as a role='dispatch' row in chat_history. This
     closes a long-standing gap where briefings, interaction cards, alert
     notifications etc. were shown to the user but the chat had no record
     of them — so when the user replied referring to one, the assistant
@@ -97,8 +97,7 @@ async def _log_dispatch(
     # Prefer the channel-neutral delivery_ref; fall back to the legacy
     # top-level keys (which SendResult.to_response() still mirrors). Forward the
     # whole neutral ref block so a Slack dispatch is logged with its
-    # {adapter,channel,ts} (the core 5a route stores it); keep the legacy
-    # telegram keys when present so the Telegram path is unchanged.
+    # {adapter,channel,ts} (the core 5a route stores it).
     ref = send_result.get("delivery_ref") or {}
     payload = {
         "agent_id": agent_id,
@@ -189,7 +188,7 @@ class DeleteRequest(BaseModel):
     delivery_ref: dict
 
 
-def create_delivery_app(adapter: SlackAdapter, settings: TelegramSettings) -> FastAPI:
+def create_delivery_app(adapter: SlackAdapter, settings: CommsSettings) -> FastAPI:
     """Create FastAPI app for delivery endpoint + health.
 
     Routes outbound delivery through the `SlackAdapter` over a channel-neutral
@@ -217,8 +216,6 @@ def create_delivery_app(adapter: SlackAdapter, settings: TelegramSettings) -> Fa
         }
 
         # The generic `inbound` block carries the Socket Mode liveness signal.
-        # No telegram_api block — its absence keeps an un-updated watchdog from
-        # false-alarming on a never-run Telegram probe.
         last_ok_at = _slack_socket_state.last_connected_at
         if last_ok_at is None:
             last_ok_seconds_ago = None
@@ -234,7 +231,7 @@ def create_delivery_app(adapter: SlackAdapter, settings: TelegramSettings) -> Fa
         }
         return body
 
-    @router.post("/api/deliver/telegram")
+    @router.post("/api/deliver/message")
     async def deliver(
         req: DeliveryRequest,
         x_api_key: str | None = Header(default=None, alias="X-API-Key"),
@@ -276,7 +273,7 @@ def create_delivery_app(adapter: SlackAdapter, settings: TelegramSettings) -> Fa
         )
         return {"ok": result.get("ok", False), "agent_id": req.agent_id, **result}
 
-    @router.post("/api/deliver/telegram/document")
+    @router.post("/api/deliver/document")
     async def deliver_document(
         req: DocumentDeliveryRequest,
         x_api_key: str | None = Header(default=None, alias="X-API-Key"),
@@ -372,7 +369,7 @@ def create_delivery_app(adapter: SlackAdapter, settings: TelegramSettings) -> Fa
     return app
 
 
-def _startup_error(settings: TelegramSettings) -> str | None:
+def _startup_error(settings: CommsSettings) -> str | None:
     """Return a reason string if Slack is not configured, else None.
 
     Pure helper — no side effects — so it can be tested independently. Slack is
@@ -385,7 +382,7 @@ def _startup_error(settings: TelegramSettings) -> str | None:
     return None
 
 
-async def _fetch_resolved_slack_config(settings: TelegramSettings) -> dict[str, Any] | None:
+async def _fetch_resolved_slack_config(settings: CommsSettings) -> dict[str, Any] | None:
     """GET the DB-resolved Slack config from core: `{configured, bot_token,
     app_token, signing_secret, channel}` (core itself already falls back to
     its own env vars, so this is cleartext-resolved either way).
@@ -410,7 +407,7 @@ async def _fetch_resolved_slack_config(settings: TelegramSettings) -> dict[str, 
         return None
 
 
-def _merge_slack_config(settings: TelegramSettings, db_config: dict[str, Any] | None) -> None:
+def _merge_slack_config(settings: CommsSettings, db_config: dict[str, Any] | None) -> None:
     """Merge the DB-resolved Slack config onto `settings` in place.
 
     DB value wins when present (non-empty); otherwise the env-sourced value
@@ -440,7 +437,7 @@ async def run() -> None:
 
     setup_telemetry()
 
-    settings = TelegramSettings()
+    settings = CommsSettings()
 
     structlog.configure(
         processors=[

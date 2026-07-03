@@ -3,7 +3,7 @@ import { Link } from 'react-router-dom';
 import { api } from '../api/client';
 import ErrorBanner from '../components/ErrorBanner';
 
-// Prompts can carry Telegram-style HTML; the card shows plain-text snippets.
+// Prompts can carry light chat HTML; the card shows plain-text snippets.
 function stripHtml(raw: string): string {
   if (!raw) return '';
   const doc = new DOMParser().parseFromString(raw, 'text/html');

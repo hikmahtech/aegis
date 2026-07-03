@@ -1,7 +1,7 @@
 """Notification budget (Phase 5) — cap the daily volume of proactive FYI pushes.
 
 Every proactive notification (drift / cert / backup / renewal / digest) goes
-through `safe_send_telegram`, which consults this gate. While `enabled` is False
+through `safe_send_message`, which consults this gate. While `enabled` is False
 the gate only RECORDS (so you can measure the volume); flip it on to actually
 defer over-budget pushes to the daily digest (the design's "3-5/day" cap).
 """

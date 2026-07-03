@@ -61,8 +61,8 @@ async def temporal_env():
 async def seeded_agent(db_pool):
     async with db_pool.acquire() as conn:
         await conn.execute(
-            "INSERT INTO agents (id, name, role, system_prompt_path, telegram_topic_id, active) "
-            "VALUES ('sebas', 'S', 'a', 'p', 2753, TRUE) ON CONFLICT DO NOTHING"
+            "INSERT INTO agents (id, name, role, system_prompt_path, active) "
+            "VALUES ('sebas', 'S', 'a', 'p', TRUE) ON CONFLICT DO NOTHING"
         )
     yield
     async with db_pool.acquire() as conn:

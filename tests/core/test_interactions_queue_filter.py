@@ -47,8 +47,8 @@ async def app_fixture(db_pool, settings):
     # Ensure agent exists
     async with db_pool.acquire() as conn:
         await conn.execute(
-            "INSERT INTO agents (id, name, role, system_prompt_path, telegram_topic_id, active) "
-            "VALUES ('sebas', 'Sebas', 'assistant', 'personalities/sebas', 2753, TRUE) "
+            "INSERT INTO agents (id, name, role, system_prompt_path, active) "
+            "VALUES ('sebas', 'Sebas', 'assistant', 'personalities/sebas', TRUE) "
             "ON CONFLICT (id) DO NOTHING"
         )
         # Seed two interactions with distinct origins

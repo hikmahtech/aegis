@@ -11,7 +11,6 @@ agents:
     capabilities: [email, calendar, github_alerts, daily_brief]
     model_tier: smart
     interaction_timeout_default: archive
-    telegram_topic_id: null
     slack_channel_id: ""
     elevenlabs_voice_id: ""
     metadata:
@@ -27,7 +26,6 @@ agents:
     capabilities: [knowledge_search, research, ingest, rss, raindrop]
     model_tier: smart
     interaction_timeout_default: hold
-    telegram_topic_id: null
     slack_channel_id: ""
     elevenlabs_voice_id: ""
     metadata:
@@ -43,7 +41,6 @@ agents:
     capabilities: [finance, receipts, subscriptions, market]
     model_tier: smart
     interaction_timeout_default: archive
-    telegram_topic_id: null
     slack_channel_id: ""
     elevenlabs_voice_id: ""
     metadata:
@@ -59,7 +56,6 @@ agents:
     capabilities: [homelab, k8s, argocd, backups, certs, drift]
     model_tier: smart
     interaction_timeout_default: auto_reject
-    telegram_topic_id: null
     slack_channel_id: ""
     elevenlabs_voice_id: ""
     metadata:
@@ -68,11 +64,11 @@ agents:
       tool_set: [trigger_workflow, search_knowledge, update_runbook, configure_triage, remember_this, list_interactions, list_nodes, list_services, inspect_service, get_service_logs, restart_service, list_pods, list_deployments, get_pod_logs, list_argocd_apps, sync_argocd_app, run_infra_script, aegis_self_diagnose, investigate_resource, vercel_get_project, vercel_list_deployments, vercel_get_deployment, vercel_get_build_logs, capture_to_inbox, list_next_actions, list_projects, complete_task, defer_task, handoff_task]
     active: true
 
-  # Virtual placeholder for general-topic Telegram dispatches and system events.
+  # Virtual placeholder for general-topic dispatches and system events.
   # Never participates in chat — only exists to satisfy the FK on
   # chat_history.agent_id for role='dispatch' rows where the dispatch isn't
-  # tied to a specific personality (e.g. system-level Telegram messages from
-  # telegram/__main__.py with agent_id='system', or log_dispatch's default
+  # tied to a specific personality (e.g. system-level messages from
+  # aegis_comms.__main__ with agent_id='system', or log_dispatch's default
   # fallback in core/api/routes/chat.py).
   - id: system
     name: System
@@ -81,6 +77,5 @@ agents:
     capabilities: []
     model_tier: balanced
     interaction_timeout_default: archive
-    telegram_topic_id: null
     slack_channel_id: ""
     active: false
