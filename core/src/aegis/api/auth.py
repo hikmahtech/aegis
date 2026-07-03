@@ -21,7 +21,16 @@ async def verify_auth(
     credentials: HTTPBasicCredentials | None = Depends(security),
     settings: Settings = Depends(get_settings),
 ) -> bool:
-    """Verify authentication via API key or Basic auth."""
+    """Verify authentication via API key or Basic auth.
+
+    ``auth_disabled=true`` (AEGIS_AUTH_DISABLED) bypasses both checks — for
+    deployments fronted by an authenticating proxy (e.g. Cloudflare Access).
+    Webhook HMAC verification (api/routes/webhooks.py) is separate and
+    unaffected by this flag.
+    """
+    if settings.auth_disabled:
+        return True
+
     api_key = request.headers.get("X-API-Key")
     if api_key and settings.api_key and secrets.compare_digest(api_key, settings.api_key):
         return True

@@ -85,6 +85,17 @@ Key settings:
 - `AEGIS_GITHUB_TOKEN` — GitHub API
 - `AEGIS_GMAIL_ACCOUNTS` — Gmail OAuth (format: `name:email,name:email`)
 
+### Disabling built-in auth (authenticating-proxy deployments)
+
+`AEGIS_AUTH_DISABLED=true` turns off the API's basic-auth / `X-API-Key` checks and makes
+`AEGIS_ADMIN_USERNAME` / `AEGIS_ADMIN_PASSWORD` optional; the admin SPA detects this and
+skips its login prompt. It exists for deployments where the public hostname is already
+fronted by an authenticating proxy (e.g. Cloudflare Access with email verification), so a
+second basic-auth prompt is redundant. Webhook HMAC verification is unaffected.
+**Warning:** with this flag set, *anyone who can reach port 8080* (e.g. any device on the
+LAN, or the internet if the port is exposed) has full admin access. Only enable it when the
+port is reachable exclusively through the authenticating proxy — no direct port exposure.
+
 ## Admin Panel Development
 
 ```bash
