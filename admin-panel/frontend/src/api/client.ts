@@ -196,6 +196,7 @@ export const api = {
       method: 'PATCH', body: JSON.stringify(patch),
     }),
   listGoogleAccounts: () => apiFetch<any[]>('/api/admin/integrations/google'),
+  listSocialAccounts: () => apiFetch<any[]>('/api/admin/social/accounts'),
   getIntegrations: () => apiFetch<any[]>('/api/admin/integrations/config'),
   saveIntegration: (key: string, value: string) =>
     apiFetch<any[]>('/api/admin/integrations/config', { method: 'PUT', body: JSON.stringify({ key, value }) }),

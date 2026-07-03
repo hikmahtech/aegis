@@ -202,7 +202,7 @@ Workflow steps (activities in `worker/src/aegis_worker/activities/social.py`):
    due date. Skip tasks that already have `social_outbox` rows (idempotency).
 2. For each due task: spawn `InteractionFlow` as a child workflow
    (`worker/src/aegis_worker/flows/interaction.py`, `InteractionFlowInput(agent_id,
-   kind="decision", origin="social_publish", prompt=<preview>, options={approve/skip},
+   kind="choice", origin="social_publish", prompt=<preview>, options={approve/skip},
    timeout_policy="archive")`) and await the result. Skipped or timed-out → do
    nothing (task stays until its labels change or it's completed by hand).
 3. On approve: `enqueue_outbox` — one `social_outbox` row per platform label,

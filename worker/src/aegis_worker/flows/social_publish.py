@@ -64,7 +64,10 @@ class SocialPublishFlow:
                         InteractionFlow.run,
                         InteractionFlowInput(
                             agent_id=config.agent_id,
-                            kind="decision",
+                            # "choice" is one of the closed set of card kinds the
+                            # Slack renderer + admin panel know how to draw buttons
+                            # for (approval|choice|ack|input|draft_review).
+                            kind="choice",
                             origin="social_publish",
                             prompt=_preview(task),
                             options={"approve": "✅ Post", "skip": "⏭️ Skip"},

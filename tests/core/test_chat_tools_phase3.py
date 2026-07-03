@@ -116,39 +116,63 @@ async def test_exec_list_next_actions_reads_projection(db_pool) -> None:
 
 @pytest.mark.asyncio
 async def test_exec_list_projects_returns_project_labels(db_pool) -> None:
-    """list_projects now enumerates project/* labels with open-task counts.
+    """list_projects now enumerates leaf work-stream projects (real Todoist
+    projects nested under an AREA project via parent_id) with open-task
+    counts — the retired project/* label convention is gone (Todoist
+    restructure, 2026-07). AREA projects themselves (parent_id IS NULL)
+    are not work-streams and must not appear.
 
-    Uses unique label names so the assertion is independent of other tests'
-    project/* data left in the shared DB."""
+    Uses unique project ids so the assertion is independent of other tests'
+    nested-project data left in the shared DB."""
     from aegis.services.chat import ToolContext, _exec_list_projects
 
-    label_open = "project/uitest-alpha"
-    label_empty = "project/uitest-beta"
+    area_id = "P_UITEST_AREA"
+    ws_open_id = "P_UITEST_WSA"
+    ws_empty_id = "P_UITEST_WSB"
     async with db_pool.acquire() as conn:
-        await conn.execute(
-            "INSERT INTO todoist_labels (id, name, raw) VALUES "
-            "('L_UA',$1,'{}'::jsonb), ('L_UB',$2,'{}'::jsonb) "
-            "ON CONFLICT (id) DO NOTHING",
-            label_open,
-            label_empty,
-        )
-        await conn.execute(
-            "INSERT INTO todoist_projects (id, name, is_managed, raw) "
-            "VALUES ('P_NEXT','Next',true,'{}'::jsonb) ON CONFLICT (id) DO NOTHING"
-        )
         await conn.execute("DELETE FROM todoist_tasks WHERE id IN ('T_UA1','T_UA2')")
+        await conn.execute(
+            "DELETE FROM todoist_projects WHERE id IN ($1,$2,$3)",
+            ws_open_id, ws_empty_id, area_id,
+        )
+        # Parent AREA project (parent_id IS NULL) — must be excluded from
+        # list_projects' output; only leaf work-streams are listed.
+        await conn.execute(
+            "INSERT INTO todoist_projects (id, name, parent_id, is_managed, is_archived, raw) "
+            "VALUES ($1, 'UITest Area', NULL, false, false, '{}'::jsonb) "
+            "ON CONFLICT (id) DO NOTHING",
+            area_id,
+        )
+        # Two leaf work-stream projects nested under the area.
+        await conn.execute(
+            "INSERT INTO todoist_projects (id, name, parent_id, is_managed, is_archived, raw) "
+            "VALUES ($1, 'UITest Alpha', $3, false, false, '{}'::jsonb), "
+            "       ($2, 'UITest Beta', $3, false, false, '{}'::jsonb) "
+            "ON CONFLICT (id) DO NOTHING",
+            ws_open_id, ws_empty_id, area_id,
+        )
         await conn.execute(
             "INSERT INTO todoist_tasks (id, project_id, content, labels, is_completed, raw) "
             "VALUES "
-            "('T_UA1','P_NEXT','open',ARRAY[$1,'@me'],false,'{}'::jsonb), "
-            "('T_UA2','P_NEXT','done',ARRAY[$1],true,'{}'::jsonb)",
-            label_open,
+            "('T_UA1',$1,'open',ARRAY['@me'],false,'{}'::jsonb), "
+            "('T_UA2',$1,'done',ARRAY['@me'],true,'{}'::jsonb)",
+            ws_open_id,
         )
-    ctx = ToolContext(agent_id="sebas")
-    out = await _exec_list_projects(pool=db_pool, args={}, ctx=ctx)
-    # one OPEN task on alpha (the completed one is excluded); beta has none
-    assert f"{label_open} (1)" in out
-    assert f"{label_empty} (0)" in out
+    try:
+        ctx = ToolContext(agent_id="sebas")
+        out = await _exec_list_projects(pool=db_pool, args={}, ctx=ctx)
+        # one OPEN task on alpha (the completed one is excluded); beta has none
+        assert f"- [{ws_open_id}] UITest Alpha (1 open)" in out
+        assert f"- [{ws_empty_id}] UITest Beta (0 open)" in out
+        # the AREA project itself must not be listed as a work-stream
+        assert area_id not in out
+    finally:
+        async with db_pool.acquire() as conn:
+            await conn.execute("DELETE FROM todoist_tasks WHERE id IN ('T_UA1','T_UA2')")
+            await conn.execute(
+                "DELETE FROM todoist_projects WHERE id IN ($1,$2,$3)",
+                ws_open_id, ws_empty_id, area_id,
+            )
 
 
 # --- Phase 5: find_reference now queries KS with source_type filter ---

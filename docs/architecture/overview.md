@@ -1,6 +1,6 @@
 # AEGIS v3 Architecture
 
-AEGIS v3 is a flow-first personal AI orchestration platform. It coordinates 4 named personalities over 25 Temporal flows, a chat surface with 38 tools gated per-personality, native ingest connectors, and a knowledge-service for semantic search and query-time RAG.
+AEGIS v3 is a flow-first personal AI orchestration platform. It coordinates 4 named personalities over 26 Temporal flows, a chat surface with 38 tools gated per-personality, native ingest connectors, and a knowledge-service for semantic search and query-time RAG.
 
 This document is the canonical reference for what the running system does today. For commands and setup, see [`development.md`](../development.md). For deployment, see [`production.md`](../production.md). For where the architecture is **going** — a kernel + SDK + capability-plugin redesign for productization — see [`productization.md`](productization.md).
 
@@ -26,7 +26,7 @@ Production runs on Docker Swarm via the `swarm` context; Core/Worker are pinned 
 
 | Personality | Role | Model tier | Workflows owned |
 |-------------|------|------------|-----------------|
-| **Sebas** | Executive assistant | `smart` | `GmailIngestFlow`, `CalendarIngestFlow`, `TodoistSyncFlow`, `ClarifyFlow`, `DailyBriefingFlow`, `ReviewFlow` (daily + weekly) |
+| **Sebas** | Executive assistant | `smart` | `GmailIngestFlow`, `CalendarIngestFlow`, `TodoistSyncFlow`, `ClarifyFlow`, `DailyBriefingFlow`, `ReviewFlow` (daily + weekly), `SocialPublishFlow` |
 | **Raphael** | Research + knowledge | `smart` | `IntelligenceScanFlow`, `RaindropIngestFlow`, `RssIngestFlow` |
 | **Maou** | Finance | `smart` | `MoneyProcessFlow`, `MoneyHygieneDailyFlow`, `ReceiptIngestFlow`, `SubscriptionAuditFlow` |
 | **Pandora's Actor** | Infrastructure | `smart` | `ServiceDriftFlow`, `BackupAuditFlow`, `CertRadarFlow`, `ScheduleHealthFlow`, `SentryPollFlow`, `CleanupFlow`, `GitHubAlertFlow` (PR notifier) |
@@ -118,7 +118,7 @@ Cross-agent handoff via agent-written `@<other>` labels is **out of scope for v1
 
 ## Flows
 
-25 Temporal workflows on task queue `aegis-main`. Flow code lives in `worker/src/aegis_worker/flows/`. Most scheduled flows carry `agent_id` in their config dataclass so `WorkflowRunRecorderInterceptor` can populate `workflow_runs.agent_id`; utility flows (`InteractionFlow`, `AlertInvestigationFlow`, `AgentChatReplyFlow`) take it from their caller.
+26 Temporal workflows on task queue `aegis-main`. Flow code lives in `worker/src/aegis_worker/flows/`. Most scheduled flows carry `agent_id` in their config dataclass so `WorkflowRunRecorderInterceptor` can populate `workflow_runs.agent_id`; utility flows (`InteractionFlow`, `AlertInvestigationFlow`, `AgentChatReplyFlow`) take it from their caller.
 
 Owner-scheduled flows are listed in the Personalities table above. The remaining named flows:
 
@@ -158,7 +158,7 @@ When a `todoist_task_id` is on the alert (pandora APP-<n>: clarify path), the fl
 
 ## Connectors
 
-6 public connectors in `core/src/aegis/connectors/` (plus `_ssh.py` and `_subprocess.py` private helpers).
+7 public connectors in `core/src/aegis/connectors/` (plus `_ssh.py` and `_subprocess.py` private helpers).
 
 | Connector | Role |
 |-----------|------|

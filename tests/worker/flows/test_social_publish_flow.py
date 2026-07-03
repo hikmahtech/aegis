@@ -33,7 +33,7 @@ _TASK = {
 
 def _make_stubs(due: list[dict]):
     """Stub activity set + call recorder for one worker instance."""
-    calls: dict[str, list] = {"hook": [], "drain": [], "complete": []}
+    calls: dict[str, list] = {"hook": [], "drain": [], "complete": [], "card_kind": []}
 
     @activity.defn(name="find_due_posts")
     async def find_due_posts(lookahead_minutes: int = 10, default_post_hour: int = 9):
@@ -56,6 +56,7 @@ def _make_stubs(due: list[dict]):
 
     @activity.defn(name="insert_interaction")
     async def insert_interaction(inp: InsertInteractionInput) -> InsertInteractionResult:
+        calls["card_kind"].append(inp.kind)
         return InsertInteractionResult(interaction_id=f"ia-{uuid4().hex[:8]}")
 
     @activity.defn(name="send_interaction_card")
@@ -100,20 +101,28 @@ async def test_due_task_cards_then_approval_reaches_hook(temporal_env):
         workflows=[SocialPublishFlow, InteractionFlow],
         activities=stubs,
     ):
-        result = await temporal_env.client.execute_workflow(
-            SocialPublishFlow.run,
-            SocialPublishConfig(agent_id="sebas"),
-            id=f"social-publish-{uuid4()}",
-            task_queue=tq,
-        )
-        assert result["due"] == 1
-        assert result["carded"] == 1
-        assert calls["drain"] and calls["complete"]
+        # Freeze auto time-skipping: otherwise awaiting the parent's result can
+        # fast-forward past the abandoned card's 24h timeout, archiving it
+        # before we get to signal.
+        with temporal_env.auto_time_skipping_disabled():
+            result = await temporal_env.client.execute_workflow(
+                SocialPublishFlow.run,
+                SocialPublishConfig(agent_id="sebas"),
+                id=f"social-publish-{uuid4()}",
+                task_queue=tq,
+            )
+            assert result["due"] == 1
+            assert result["carded"] == 1
+            assert calls["drain"] and calls["complete"]
+            # The card kind must stay in the closed set the Slack renderer and
+            # admin panel draw buttons for — "decision" regressed to a
+            # button-less card once already.
+            assert calls["card_kind"] == ["choice"]
 
-        # Approve on the abandoned card → post_resolve hook fires with metadata.
-        child = temporal_env.client.get_workflow_handle("social-approve-42")
-        await child.signal(InteractionFlow.submit_response, {"value": "approve"})
-        await child.result()
+            # Approve on the abandoned card → post_resolve hook fires with metadata.
+            child = temporal_env.client.get_workflow_handle("social-approve-42")
+            await child.signal(InteractionFlow.submit_response, {"value": "approve"})
+            await child.result()
         assert len(calls["hook"]) == 1
         _, response, metadata = calls["hook"][0]
         assert response == {"value": "approve"}
@@ -130,24 +139,28 @@ async def test_open_card_is_not_duplicated_by_next_tick(temporal_env):
         workflows=[SocialPublishFlow, InteractionFlow],
         activities=stubs,
     ):
-        first = await temporal_env.client.execute_workflow(
-            SocialPublishFlow.run,
-            SocialPublishConfig(agent_id="sebas"),
-            id=f"social-publish-{uuid4()}",
-            task_queue=tq,
-        )
-        assert first["carded"] == 1
-        # Same task still due, card still open → second tick must not re-card.
-        second = await temporal_env.client.execute_workflow(
-            SocialPublishFlow.run,
-            SocialPublishConfig(agent_id="sebas"),
-            id=f"social-publish-{uuid4()}",
-            task_queue=tq,
-        )
-        assert second["carded"] == 0
-        child = temporal_env.client.get_workflow_handle("social-approve-42")
-        await child.signal(InteractionFlow.submit_response, {"value": "skip"})
-        await child.result()
+        # Without this, the env can skip past the first card's 24h timeout
+        # between the two ticks — the card archives, the second tick re-cards
+        # legitimately, and the assertion below flakes.
+        with temporal_env.auto_time_skipping_disabled():
+            first = await temporal_env.client.execute_workflow(
+                SocialPublishFlow.run,
+                SocialPublishConfig(agent_id="sebas"),
+                id=f"social-publish-{uuid4()}",
+                task_queue=tq,
+            )
+            assert first["carded"] == 1
+            # Same task still due, card still open → second tick must not re-card.
+            second = await temporal_env.client.execute_workflow(
+                SocialPublishFlow.run,
+                SocialPublishConfig(agent_id="sebas"),
+                id=f"social-publish-{uuid4()}",
+                task_queue=tq,
+            )
+            assert second["carded"] == 0
+            child = temporal_env.client.get_workflow_handle("social-approve-42")
+            await child.signal(InteractionFlow.submit_response, {"value": "skip"})
+            await child.result()
         assert calls["hook"][0][1] == {"value": "skip"}
 
 
