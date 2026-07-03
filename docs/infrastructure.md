@@ -150,12 +150,27 @@ AWS_ACCESS_KEY_ID=AKIA...
 AWS_SECRET_ACCESS_KEY=...
 ```
 
-or, if you use **profiles**, set `AWS_PROFILE=myprofile` in Auth env and paste
-the relevant section of your `~/.aws/credentials` into the **AWS credentials
-file** field — it is materialized per call as `AWS_SHARED_CREDENTIALS_FILE`.
-The IAM principal must be mapped in the cluster's `aws-auth` ConfigMap (it is,
-if `kubectl` works for you locally with the same credentials). The region
-comes from the exec block's `--region` arg in the kubeconfig itself.
+or, if you use **profiles**, set `AWS_PROFILE=myprofile` in Auth env (or leave
+it to the kubeconfig — EKS exec blocks often carry `env: AWS_PROFILE=...`
+themselves) and paste the relevant section of your `~/.aws/credentials` into
+the **AWS credentials file** field — it is materialized per call as
+`AWS_SHARED_CREDENTIALS_FILE`. The IAM principal must be mapped in the
+cluster's `aws-auth` ConfigMap (it is, if `kubectl` works for you locally with
+the same credentials). The region comes from the exec block's `--region` arg
+in the kubeconfig itself.
+
+> **Role-assumption profiles:** if your profile looks like
+>
+> ```ini
+> [prod]
+> role_arn = arn:aws:iam::...:role/...
+> source_profile = default
+> ```
+>
+> you must paste the **`[default]` section too** (it holds the actual keys) —
+> the materialized file is the *only* credentials file the CLI sees, so a
+> role profile alone fails with
+> `The source_profile "default" referenced in the profile "prod" does not exist`.
 
 Full EKS recipe:
 
