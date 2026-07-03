@@ -61,7 +61,7 @@ agents:
     metadata:
       intent_keywords: [server, docker, swarm, k8s, kubernetes, deploy, infra, drift, backup, cert, argocd, pod, container, node, homelab, restart, logs, grafana, prometheus]
       knowledge_domains: [alert, sentry, github, task_outcome]
-      tool_set: [trigger_workflow, search_knowledge, update_runbook, configure_triage, remember_this, list_interactions, list_nodes, list_services, inspect_service, get_service_logs, restart_service, list_pods, list_deployments, get_pod_logs, list_argocd_apps, sync_argocd_app, run_infra_script, aegis_self_diagnose, investigate_resource, vercel_get_project, vercel_list_deployments, vercel_get_deployment, vercel_get_build_logs, capture_to_inbox, list_next_actions, list_projects, complete_task, defer_task, handoff_task]
+      tool_set: [trigger_workflow, search_knowledge, update_runbook, configure_triage, remember_this, list_interactions, list_nodes, list_services, inspect_service, get_service_logs, restart_service, list_pods, list_deployments, get_pod_logs, list_argocd_apps, sync_argocd_app, list_cloud_accounts, cloud_identity, run_infra_script, aegis_self_diagnose, investigate_resource, vercel_get_project, vercel_list_deployments, vercel_get_deployment, vercel_get_build_logs, capture_to_inbox, list_next_actions, list_projects, complete_task, defer_task, handoff_task]
     active: true
 
   # Virtual placeholder for general-topic dispatches and system events.

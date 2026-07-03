@@ -1,0 +1,21 @@
+-- Cloud provider accounts as first-class infra entries (kind=cloud) and
+-- cloud-account references on k8s entries. Non-secret JSON, validated in
+-- services/infra.py::validate_cloud; the secrets themselves (AWS credentials
+-- ini, GCP service-account JSON) stay encrypted in infra.credentials.
+--
+-- Shape for kind=cloud rows:
+--   {
+--     "provider": "aws" | "gcp",
+--     "default_profile": "prod",          -- aws: AWS_PROFILE when none given
+--     "region": "eu-west-2",              -- aws: AWS_DEFAULT_REGION for CLI calls
+--     "project": "my-gcp-project",        -- gcp
+--     "identity": {...}                    -- written by provision (sts/ADC check),
+--   }                                      --   never by operators
+--
+-- Shape for kind=k8s rows (both optional):
+--   {
+--     "cloud_slug": "aws-hikmah",         -- slug of a kind=cloud entry to pull
+--                                         --   exec-plugin credentials from
+--     "profile": "prod"                   -- AWS_PROFILE override for this cluster
+--   }
+ALTER TABLE infra ADD COLUMN cloud jsonb NOT NULL DEFAULT '{}'::jsonb;

@@ -60,6 +60,11 @@ class InfraCreate(BaseModel):
     # in the service layer (see services/infra.py::validate_coding). At most
     # one entry may have coding.enabled=true.
     coding: dict[str, Any] | None = None
+    # Cloud block — non-secret, validated in services/infra.py::validate_cloud.
+    # kind=cloud: {"provider": "aws"|"gcp", "default_profile", "region",
+    # "project"}; kind=k8s: {"cloud_slug", "profile"} referencing a kind=cloud
+    # entry for exec-plugin credentials.
+    cloud: dict[str, Any] | None = None
 
 
 class InfraUpdate(BaseModel):
@@ -82,6 +87,7 @@ class InfraUpdate(BaseModel):
     setup_command: str | None = None
     metadata: dict[str, Any] | None = None
     coding: dict[str, Any] | None = None
+    cloud: dict[str, Any] | None = None
 
 
 def _dump_setup_files(files: list[SetupFile] | None) -> list[dict] | None:
