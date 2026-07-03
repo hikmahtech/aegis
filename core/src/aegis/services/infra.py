@@ -39,7 +39,7 @@ logger = structlog.get_logger()
 _SELECT_COLS = (
     "id, slug, name, kind, host, ssh_user, ssh_port, ssh_key_ref, docker_context, "
     "hosts_aegis, read_only, setup_files, setup_command, status, last_provisioned_at, "
-    "last_error, metadata, credentials, created_at, updated_at"
+    "last_error, metadata, coding, credentials, created_at, updated_at"
 )
 
 # Fields an operator may set directly via create/update. `status`,
@@ -59,6 +59,7 @@ _EDITABLE_FIELDS = (
     "setup_files",
     "setup_command",
     "metadata",
+    "coding",
 )
 
 _SLUG_RE = re.compile(r"[^a-z0-9]+")
@@ -88,6 +89,149 @@ _K8S_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9.-]{0,252}$")
 def _slugify(name: str) -> str:
     slug = _SLUG_RE.sub("-", name.strip().lower()).strip("-")
     return slug or "infra"
+
+
+# ── coding-agent (remote script) config block ────────────────────────────────
+#
+# Non-secret JSON on the infra row (`coding` column) marking one SSH-able
+# entry as THE remote-script / coding-agent host and carrying everything the
+# RemoteScriptConnector needs beyond the row's SSH identity. See
+# migrations/006_infra_coding.sql for the full shape.
+
+_CODING_ENGINES = ("claude", "kimi")
+
+
+def _expect(value: Any, typ: type, field: str) -> Any:
+    if not isinstance(value, typ):
+        raise ValueError(f"coding.{field} must be a {typ.__name__}")
+    return value
+
+
+def validate_coding(coding: Any, kind: str = "") -> dict:
+    """Validate + normalize a coding block. Raises ValueError on bad shape.
+
+    Org keys are lowercased (routing matches case-insensitively); unknown
+    engines are rejected so a typo can't silently disable routing.
+    """
+    if coding is None:
+        return {}
+    if not isinstance(coding, dict):
+        raise ValueError("coding must be an object")
+    if not coding:
+        return {}
+    out: dict[str, Any] = {"enabled": bool(coding.get("enabled", False))}
+    if out["enabled"] and kind == "k8s":
+        raise ValueError("coding.enabled requires an SSH-able entry, not kind=k8s")
+    out["repo_base"] = _expect(coding.get("repo_base", ""), str, "repo_base")
+
+    engines_in = _expect(coding.get("engines", {}), dict, "engines")
+    engines: dict[str, Any] = {}
+    for name, spec in engines_in.items():
+        if name not in _CODING_ENGINES:
+            raise ValueError(f"coding.engines: unknown engine {name!r}")
+        spec = _expect(spec or {}, dict, f"engines.{name}")
+        entry: dict[str, Any] = {
+            "binary_path": _expect(spec.get("binary_path", ""), str, f"engines.{name}.binary_path")
+        }
+        if name == "claude":
+            dirs = _expect(spec.get("config_dirs", {}), dict, "engines.claude.config_dirs")
+            entry["config_dirs"] = {str(k): str(v) for k, v in dirs.items()}
+            entry["default_account"] = _expect(
+                spec.get("default_account", ""), str, "engines.claude.default_account"
+            )
+            if entry["default_account"] and entry["default_account"] not in entry["config_dirs"]:
+                raise ValueError(
+                    "coding.engines.claude.default_account must name a config_dirs entry"
+                )
+        engines[name] = entry
+    out["engines"] = engines
+
+    routing_in = _expect(coding.get("routing", {}), dict, "routing")
+    orgs: dict[str, Any] = {}
+    for org, route in _expect(routing_in.get("orgs", {}), dict, "routing.orgs").items():
+        route = _expect(route or {}, dict, f"routing.orgs.{org}")
+        engine = route.get("engine") or "claude"
+        if engine not in _CODING_ENGINES:
+            raise ValueError(f"coding.routing.orgs.{org}: unknown engine {engine!r}")
+        account = _expect(route.get("account", ""), str, f"routing.orgs.{org}.account")
+        if engine == "claude" and account:
+            claude_dirs = (engines.get("claude") or {}).get("config_dirs") or {}
+            if account not in claude_dirs:
+                raise ValueError(
+                    f"coding.routing.orgs.{org}.account {account!r} "
+                    "is not in engines.claude.config_dirs"
+                )
+        orgs[str(org).strip().lower()] = {"engine": engine, "account": account}
+    default_engine = routing_in.get("default_engine") or "kimi"
+    if default_engine not in _CODING_ENGINES:
+        raise ValueError(f"coding.routing.default_engine: unknown engine {default_engine!r}")
+    out["routing"] = {"orgs": orgs, "default_engine": default_engine}
+
+    tmux_in = _expect(coding.get("tmux", {}), dict, "tmux")
+    session = _expect(tmux_in.get("session", "remote") or "remote", str, "tmux.session")
+    raw_cap = tmux_in.get("window_cap", 10)
+    if raw_cap in (None, ""):
+        raw_cap = 10
+    try:
+        window_cap = int(raw_cap)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("coding.tmux.window_cap must be an integer") from exc
+    if window_cap < 1:
+        raise ValueError("coding.tmux.window_cap must be >= 1")
+    out["tmux"] = {"session": session, "window_cap": window_cap}
+
+    kimi_host_slug = coding.get("kimi_host_slug")
+    if kimi_host_slug is not None and not isinstance(kimi_host_slug, str):
+        raise ValueError("coding.kimi_host_slug must be a string or null")
+    out["kimi_host_slug"] = (kimi_host_slug or "").strip() or None
+
+    out["self_repo_path"] = _expect(coding.get("self_repo_path", ""), str, "self_repo_path")
+    out["runbooks_dir"] = _expect(coding.get("runbooks_dir", ""), str, "runbooks_dir")
+    return out
+
+
+async def _assert_single_coding_host(
+    pool: asyncpg.Pool, coding: dict, exclude_id: UUID | str | None = None
+) -> None:
+    """At most one infra row may have coding.enabled — the connector resolves
+    'the' remote-script host, so two enabled rows would be ambiguous."""
+    if not coding.get("enabled"):
+        return
+    if exclude_id is not None:
+        other = await pool.fetchval(
+            "SELECT slug FROM infra WHERE (coding->>'enabled') = 'true' AND id <> $1 LIMIT 1",
+            exclude_id,
+        )
+    else:
+        other = await pool.fetchval(
+            "SELECT slug FROM infra WHERE (coding->>'enabled') = 'true' LIMIT 1"
+        )
+    if other:
+        raise ValueError(
+            f"infra entry '{other}' is already the coding host — disable its coding block first"
+        )
+
+
+async def get_coding_host(pool: asyncpg.Pool) -> dict | None:
+    """Return the infra row with coding.enabled=true, credentials INCLUDED.
+
+    Server-side callers only (RemoteScriptConnector config resolution) — never
+    return this through a route.
+    """
+    row = await pool.fetchrow(
+        f"SELECT {_SELECT_COLS} FROM infra WHERE (coding->>'enabled') = 'true' "
+        "ORDER BY updated_at DESC LIMIT 1"
+    )
+    return dict(row) if row else None
+
+
+async def get_infra_by_slug(
+    pool: asyncpg.Pool, slug: str, *, include_credentials: bool = False
+) -> dict | None:
+    row = await pool.fetchrow(f"SELECT {_SELECT_COLS} FROM infra WHERE slug = $1", slug)
+    if not row:
+        return None
+    return dict(row) if include_credentials else public_infra(dict(row))
 
 
 def public_infra(row: dict) -> dict:
@@ -257,16 +401,19 @@ async def create_infra(pool: asyncpg.Pool, data: dict[str, Any], secret_key: str
         raise ValueError("name is required")
     slug = (data.get("slug") or "").strip()
     slug = await _unique_slug(pool, _slugify(slug or name))
+    kind = data.get("kind") or "ssh_host"
+    coding = validate_coding(data.get("coding"), kind)
+    await _assert_single_coding_host(pool, coding)
 
     row = await pool.fetchrow(
         f"INSERT INTO infra "
         "(slug, name, kind, host, ssh_user, ssh_port, ssh_key_ref, docker_context, "
-        " hosts_aegis, read_only, setup_files, setup_command, metadata, credentials) "
-        "VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) "
+        " hosts_aegis, read_only, setup_files, setup_command, metadata, coding, credentials) "
+        "VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15) "
         f"RETURNING {_SELECT_COLS}",
         slug,
         name,
-        data.get("kind") or "ssh_host",
+        kind,
         data.get("host"),
         data.get("ssh_user"),
         data.get("ssh_port") or 22,
@@ -277,6 +424,7 @@ async def create_infra(pool: asyncpg.Pool, data: dict[str, Any], secret_key: str
         data.get("setup_files") or [],
         data.get("setup_command"),
         data.get("metadata") or {},
+        coding,
         _merged_credentials(None, data, secret_key),
     )
     return public_infra(dict(row))
@@ -290,6 +438,11 @@ async def update_infra(
         return None
 
     fields = {k: v for k, v in data.items() if k in _EDITABLE_FIELDS and v is not None}
+    if "coding" in fields:
+        fields["coding"] = validate_coding(
+            fields["coding"], fields.get("kind") or existing.get("kind") or ""
+        )
+        await _assert_single_coding_host(pool, fields["coding"], exclude_id=infra_id)
     if any(data.get(k) for k in _SECRET_INPUT_FIELDS):
         fields["credentials"] = _merged_credentials(existing.get("credentials"), data, secret_key)
     if not fields:

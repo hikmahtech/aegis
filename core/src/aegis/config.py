@@ -90,6 +90,12 @@ class Settings(BaseSettings):
     gmail_accounts: str = ""  # "name1:email1,name2:email2"
     gmail_credentials_file: str = "config/google_credentials.json"
     gmail_token_dir: str = "config/"
+    # Remote script / coding agents — ENV FALLBACK ONLY. The preferred way to
+    # configure the coding host is the admin Infra page: an infra registry row
+    # with a `coding` block (enabled=true) supplies the SSH identity (host,
+    # user, port, encrypted key — materialized to a temp file per call, no key
+    # file on any volume) plus repo_base/engines/routing/tmux/kimi-host. These
+    # env settings apply only while no such row exists. See docs/infrastructure.md.
     remote_script_host: str = ""
     remote_script_user: str = "deploy"
     remote_script_key_file: str = "~/.ssh/id_ed25519"

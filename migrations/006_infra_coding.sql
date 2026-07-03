@@ -1,0 +1,21 @@
+-- Per-entry coding-agent (remote script) configuration — non-secret JSON,
+-- edited from the admin Infra page. The entry with coding->>'enabled' = 'true'
+-- is THE remote-script host (service layer enforces at most one). Shape:
+--   {
+--     "enabled": true,
+--     "repo_base": "/home/user/Workspace",
+--     "engines": {
+--       "claude": {"binary_path": "...", "config_dirs": {"label": "/path"},
+--                   "default_account": "label"},
+--       "kimi":   {"binary_path": "..."}
+--     },
+--     "routing": {"orgs": {"github-org": {"engine": "claude", "account": "label"}},
+--                  "default_engine": "kimi"},
+--     "tmux": {"session": "remote", "window_cap": 10},
+--     "kimi_host_slug": "other-infra-slug",
+--     "self_repo_path": "personal/aegis",
+--     "runbooks_dir": "/app/runbooks"
+--   }
+-- The SSH identity (host, user, port, encrypted private key) comes from the
+-- row's existing columns/credentials — no key file on any volume.
+ALTER TABLE infra ADD COLUMN coding jsonb NOT NULL DEFAULT '{}'::jsonb;

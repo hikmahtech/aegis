@@ -450,11 +450,25 @@ class AlertActivities:
     temporal_ui_url: str = ""
     temporal_namespace: str = "default"
 
-    def _read_runbook(self, alert_name: str) -> str:
+    async def _effective_runbooks_dir(self) -> str:
+        """Runbooks dir, DB-first: the infra coding block (via the connector)
+        wins over the env-populated dataclass field. Defensive around test
+        doubles/mocks without an awaitable coding_settings."""
+        if self.remote_script is not None:
+            try:
+                dir_ = (await self.remote_script.coding_settings()).get("runbooks_dir")
+                if dir_:
+                    return dir_
+            except Exception:  # noqa: BLE001 — mock/legacy connector
+                pass
+        return self.runbooks_dir
+
+    def _read_runbook(self, alert_name: str, runbooks_dir: str | None = None) -> str:
         """Return the runbook Markdown for alert_name, or '' if absent/stub."""
-        if not self.runbooks_dir or not alert_name:
+        runbooks_dir = self.runbooks_dir if runbooks_dir is None else runbooks_dir
+        if not runbooks_dir or not alert_name:
             return ""
-        base = Path(self.runbooks_dir)
+        base = Path(runbooks_dir)
         # Try exact case first, then lowercase
         for candidate in (alert_name, alert_name.lower()):
             path = base / f"{candidate}.md"
@@ -816,7 +830,7 @@ class AlertActivities:
         """
         parts: list[str] = []
 
-        runbook = self._read_runbook(alert_name)
+        runbook = self._read_runbook(alert_name, await self._effective_runbooks_dir())
         if runbook:
             parts.append(f"Runbook:\n{runbook}")
 

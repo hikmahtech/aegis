@@ -56,6 +56,10 @@ class InfraCreate(BaseModel):
     setup_files: list[SetupFile] = []
     setup_command: str | None = None
     metadata: dict[str, Any] = {}
+    # Coding-agent (remote script) block — non-secret, validated + normalized
+    # in the service layer (see services/infra.py::validate_coding). At most
+    # one entry may have coding.enabled=true.
+    coding: dict[str, Any] | None = None
 
 
 class InfraUpdate(BaseModel):
@@ -77,6 +81,7 @@ class InfraUpdate(BaseModel):
     setup_files: list[SetupFile] | None = None
     setup_command: str | None = None
     metadata: dict[str, Any] | None = None
+    coding: dict[str, Any] | None = None
 
 
 def _dump_setup_files(files: list[SetupFile] | None) -> list[dict] | None:
@@ -107,7 +112,10 @@ async def create_infra(
     pool = request.app.state.db_pool
     data = body.model_dump()
     data["setup_files"] = _dump_setup_files(body.setup_files)
-    row = await infra_service.create_infra(pool, data, settings.secret_key)
+    try:
+        row = await infra_service.create_infra(pool, data, settings.secret_key)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
     await log_audit(
         pool,
         actor="api:infra_admin",
@@ -127,7 +135,10 @@ async def update_infra(
     data = body.model_dump(exclude_unset=True)
     if "setup_files" in data:
         data["setup_files"] = _dump_setup_files(body.setup_files)
-    row = await infra_service.update_infra(pool, infra_id, data, settings.secret_key)
+    try:
+        row = await infra_service.update_infra(pool, infra_id, data, settings.secret_key)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
     if not row:
         raise HTTPException(404, "Infra entry not found")
     await log_audit(
