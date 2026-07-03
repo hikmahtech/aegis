@@ -41,6 +41,7 @@ from aegis_worker.flows.rss_ingest import RssIngestFlow, RssIngestInput
 from aegis_worker.flows.schedule_health import ScheduleHealthConfig, ScheduleHealthFlow
 from aegis_worker.flows.sentry_poll import SentryPollFlow, SentryPollInput
 from aegis_worker.flows.service_drift import ServiceDriftConfig, ServiceDriftFlow
+from aegis_worker.flows.social_publish import SocialPublishConfig, SocialPublishFlow
 from aegis_worker.flows.subscription_audit import SubscriptionAuditConfig, SubscriptionAuditFlow
 from aegis_worker.flows.todoist_sync import TodoistSyncConfig, TodoistSyncFlow
 from aegis_worker.flows.vercel_project_sync import VercelProjectSyncFlow, VercelProjectSyncInput
@@ -217,6 +218,14 @@ _ACTIVITY_TYPE_MAP = {
         WeeklyReviewFlow,
         WeeklyReviewConfig(
             agent_id=act["agent_id"],
+        ),
+    ),
+    "SocialPublishFlow": lambda act: (
+        SocialPublishFlow,
+        SocialPublishConfig(
+            agent_id=act["agent_id"],
+            lookahead_minutes=int(act["config"].get("lookahead_minutes", 10)),
+            default_post_hour=int(act["config"].get("default_post_hour", 9)),
         ),
     ),
     "WorkspaceRepoSyncFlow": lambda act: (

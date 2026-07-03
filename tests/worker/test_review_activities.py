@@ -236,21 +236,66 @@ async def test_weekly_digest_counts_waiting_by_label(db_pool) -> None:
 
 @pytest.mark.asyncio
 async def test_gather_weekly_digest_counts(db_pool, _review_seeded) -> None:
-    acts = ReviewActivities(db_pool=db_pool)
-    digest = await acts.gather_weekly_digest()
-    # T_STALE_R carries project/bcp and is 20d old → counts as a stale next action
-    assert digest["stale_next_actions_count"] >= 1
-    # T_SOM_R1 + T_SOM_R2 carry the @someday label. someday_count is now a
-    # global count (state-as-label model, not scoped to a managed project),
-    # so other test files' @someday-labelled rows can add to it — use >=.
-    assert digest["someday_count"] >= 2
-    # T_WAIT_R has @waiting label but is only 5d old → does NOT cross 7d threshold
-    assert digest["waiting_stale_7d_count"] >= 0
-    # T_DONE_R completed 2d ago
-    assert digest["completed_7d_count"] >= 1
-    body = format_weekly_preview(digest)
-    assert "Weekly review" in body
-    assert "Someday / Later:" in body
+    """stale_next_actions_count now requires the task to live in a LEAF
+    work-stream project (a real Todoist project with parent_id IS NOT NULL,
+    nested under an AREA project) — project/* labels (e.g. T_STALE_R's
+    'project/bcp', planted by _review_seeded) are retired and no longer
+    drive staleness. Plant a nested AREA + work-stream project pair here so
+    the metric has something to actually count under the current model.
+    """
+    area_id = "P_AREA_R"
+    ws_id = "P_WS_R"
+    stale_task_id = "T_STALE_WS_R"
+    async with db_pool.acquire() as conn:
+        await conn.execute("DELETE FROM todoist_tasks WHERE id = $1", stale_task_id)
+        await conn.execute(
+            "DELETE FROM todoist_projects WHERE id IN ($1,$2)", ws_id, area_id
+        )
+        # AREA project (parent_id IS NULL) — not itself a work-stream.
+        await conn.execute(
+            "INSERT INTO todoist_projects (id, name, parent_id, is_managed, is_archived, raw) "
+            "VALUES ($1, 'Area R', NULL, false, false, '{}'::jsonb) "
+            "ON CONFLICT (id) DO NOTHING",
+            area_id,
+        )
+        # Leaf work-stream project nested under the area.
+        await conn.execute(
+            "INSERT INTO todoist_projects (id, name, parent_id, is_managed, is_archived, raw) "
+            "VALUES ($1, 'Work-stream R', $2, false, false, '{}'::jsonb) "
+            "ON CONFLICT (id) DO NOTHING",
+            ws_id, area_id,
+        )
+        # Stale (>14d untouched) open task living in the leaf work-stream.
+        await conn.execute(
+            "INSERT INTO todoist_tasks "
+            "(id, project_id, content, labels, is_completed, updated_at, raw) "
+            "VALUES ($1, $2, 'Stale work-stream action', '{@me}', false, "
+            "now() - interval '20 days', '{}'::jsonb)",
+            stale_task_id, ws_id,
+        )
+    try:
+        acts = ReviewActivities(db_pool=db_pool)
+        digest = await acts.gather_weekly_digest()
+        # T_STALE_WS_R lives in a leaf work-stream project (parent_id set)
+        # and is 20d old → counts as a stale next action.
+        assert digest["stale_next_actions_count"] >= 1
+        # T_SOM_R1 + T_SOM_R2 carry the @someday label. someday_count is now a
+        # global count (state-as-label model, not scoped to a managed project),
+        # so other test files' @someday-labelled rows can add to it — use >=.
+        assert digest["someday_count"] >= 2
+        # T_WAIT_R has @waiting label but is only 5d old → does NOT cross 7d threshold
+        assert digest["waiting_stale_7d_count"] >= 0
+        # T_DONE_R completed 2d ago
+        assert digest["completed_7d_count"] >= 1
+        body = format_weekly_preview(digest)
+        assert "Weekly review" in body
+        assert "Someday / Later:" in body
+    finally:
+        async with db_pool.acquire() as conn:
+            await conn.execute("DELETE FROM todoist_tasks WHERE id = $1", stale_task_id)
+            await conn.execute(
+                "DELETE FROM todoist_projects WHERE id IN ($1,$2)", ws_id, area_id
+            )
 
 
 @pytest.mark.asyncio

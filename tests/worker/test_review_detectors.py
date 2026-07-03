@@ -72,14 +72,42 @@ async def _seeded(db_pool):
 
 @pytest.mark.asyncio
 async def test_detectors_fire_on_planted(db_pool, _seeded):
-    snap = await ReviewActivities(db_pool=db_pool).gather_weekly_state()
-    assert any(p["project_id"] == "P_STALL_D" for p in snap["stalled_projects"])
-    assert not any(p["project_id"] == "P_OK_D" for p in snap["stalled_projects"])
-    assert any(i["task_id"] == "T_W8" and i["days"] >= 7 for i in snap["aging_waiting_items"])
-    assert any(i["task_id"] == "T_OVD" for i in snap["slipping_items"])
-    assert snap["to_read_count"] >= 2
-    assert any(i["task_id"] == "T_SM1" for i in snap["someday_resurface_items"])
-    assert snap["_top_n"] == 5
+    """Stalled-project detection now requires a LEAF work-stream project —
+    a real Todoist project with parent_id IS NOT NULL, nested under an AREA
+    project (Todoist restructure, 2026-07: project/* labels are retired).
+    _seeded plants P_STALL_D / P_OK_D as top-level projects (parent_id
+    NULL), so nest them under a freshly-inserted AREA project here before
+    running the detectors — otherwise neither is eligible for the
+    'stalled' check regardless of task state.
+    """
+    area_id = "P_AREA_D"
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO todoist_projects (id, name, parent_id, is_managed, is_archived, raw) "
+            "VALUES ($1, 'Area D', NULL, false, false, '{}'::jsonb) "
+            "ON CONFLICT (id) DO NOTHING",
+            area_id,
+        )
+        await conn.execute(
+            "UPDATE todoist_projects SET parent_id=$1 WHERE id IN ('P_STALL_D','P_OK_D')",
+            area_id,
+        )
+    try:
+        snap = await ReviewActivities(db_pool=db_pool).gather_weekly_state()
+        assert any(p["project_id"] == "P_STALL_D" for p in snap["stalled_projects"])
+        assert not any(p["project_id"] == "P_OK_D" for p in snap["stalled_projects"])
+        assert any(i["task_id"] == "T_W8" and i["days"] >= 7 for i in snap["aging_waiting_items"])
+        assert any(i["task_id"] == "T_OVD" for i in snap["slipping_items"])
+        assert snap["to_read_count"] >= 2
+        assert any(i["task_id"] == "T_SM1" for i in snap["someday_resurface_items"])
+        assert snap["_top_n"] == 5
+    finally:
+        async with db_pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE todoist_projects SET parent_id=NULL "
+                "WHERE id IN ('P_STALL_D','P_OK_D')"
+            )
+            await conn.execute("DELETE FROM todoist_projects WHERE id=$1", area_id)
 
 
 @pytest.mark.asyncio

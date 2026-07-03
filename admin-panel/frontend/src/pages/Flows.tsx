@@ -108,6 +108,8 @@ export default function Flows() {
   const [gStatus, setGStatus] = useState<any>(null);
   const [savingG, setSavingG] = useState(false);
   const [newLabel, setNewLabel] = useState('');
+  const [socialAccounts, setSocialAccounts] = useState<any[]>([]);
+  const [newSocialLabel, setNewSocialLabel] = useState('');
 
   // Kick off Google consent for a brand-new account label. The reauth backend is
   // label-agnostic and writes config/{label}.json on callback, after which the
@@ -120,12 +122,23 @@ export default function Flows() {
     setMsg(`Opened Google consent for "${label}". After you approve, click Reload to see it.`);
   }
 
+  // Kick off X (Twitter) consent for a brand-new account label, same pattern as
+  // the Google reauth flow — opens the backend OAuth initiate URL in a new tab.
+  function connectSocialAccount() {
+    const label = newSocialLabel.trim().toLowerCase().replace(/[^a-z0-9_-]+/g, '-').replace(/^-+|-+$/g, '');
+    if (!label) return;
+    window.open(`${API_BASE}/api/admin/social/x/connect?label=${encodeURIComponent(label)}`, '_blank', 'noopener');
+    setNewSocialLabel('');
+    setMsg(`Opened X consent for "${label}". After you approve, click Reload to see it.`);
+  }
+
   async function load() {
     try {
       setActs(await api.listActivities());
       setAccounts(await api.listGoogleAccounts());
       const gs = await api.getGoogleOauth();
       setGStatus(gs); setGClientId(gs.client_id || '');
+      setSocialAccounts(await api.listSocialAccounts());
     } catch (e: any) { setError(e); }
   }
   useEffect(() => { load(); /* eslint-disable-next-line */ }, []);
@@ -198,6 +211,44 @@ export default function Flows() {
               </tr>
             ))}
             {accounts.length === 0 && <tr><td colSpan={3}>No Google accounts configured.</td></tr>}
+          </tbody>
+        </table></div>
+      </div>
+
+      <div className="card" style={{ marginBottom: 16 }}>
+        <h3>Social accounts</h3>
+        <p className="page-subtitle">
+          Set the X (Twitter) OAuth client id/secret on the Integrations page first; posting stays off until
+          <code> social_publishing_enabled</code> is flipped on the Settings page.
+        </p>
+        <div className="cfg-row" style={{ marginBottom: 12 }}>
+          <input
+            value={newSocialLabel}
+            onChange={e => setNewSocialLabel(e.target.value)}
+            placeholder="account label (e.g. hikmah)"
+            onKeyDown={e => { if (e.key === 'Enter') connectSocialAccount(); }}
+          />
+          <button className="btn btn-primary" disabled={!newSocialLabel.trim()} onClick={connectSocialAccount}>Connect X account</button>
+          <button className="btn" onClick={load}>Reload</button>
+        </div>
+        <div className="table-scroll"><table style={{ width: '100%' }}>
+          <thead><tr>
+            <th style={{ textAlign: 'left' }}>Platform</th><th style={{ textAlign: 'left' }}>Label</th><th>Scope</th><th>Expires</th><th>Updated</th><th></th>
+          </tr></thead>
+          <tbody>
+            {socialAccounts.map(a => (
+              <tr key={a.id}>
+                <td><strong>{a.platform}</strong></td>
+                <td>{a.label}</td>
+                <td style={{ fontSize: 11, color: 'var(--text-muted)' }}>{a.scope || '—'}</td>
+                <td style={{ textAlign: 'center' }}>{(a.expires_at || '—').toString().slice(0, 16)}</td>
+                <td style={{ textAlign: 'center' }}>{(a.updated_at || '—').toString().slice(0, 16)}</td>
+                <td style={{ textAlign: 'center' }}>
+                  <a className="btn" href={`${API_BASE}/api/admin/social/x/connect?label=${encodeURIComponent(a.label)}`} target="_blank" rel="noreferrer">Re-connect</a>
+                </td>
+              </tr>
+            ))}
+            {socialAccounts.length === 0 && <tr><td colSpan={6}>No social accounts configured.</td></tr>}
           </tbody>
         </table></div>
       </div>

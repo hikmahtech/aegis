@@ -134,7 +134,7 @@ Kill switches:
 4. If scheduled, add a `_ACTIVITY_TYPE_MAP` entry in `worker/src/aegis_worker/schedule_sync.py` keyed by the PascalCase class name (e.g. `"CleanupFlow"`).
 5. Insert a seed row in `config/seed/activities.yaml`; `schedule_sync` registers the Temporal schedule on next worker startup.
 6. Write tests in `tests/worker/test_{name}.py`. Use `WorkflowEnvironment.start_time_skipping()` + `Worker` for workflow tests; `ActivityEnvironment` + `respx` for activity tests.
-7. For human-in-the-loop steps, spawn `InteractionFlow` as a child workflow rather than building custom callback logic.
+7. For human-in-the-loop steps, spawn `InteractionFlow` as a child workflow rather than building custom callback logic. Valid card kinds are `approval | choice | ack | input | draft_review` (rendered by comms and the admin panel; anything else renders with no action buttons).
 
 ## Adding a New Chat Tool
 
