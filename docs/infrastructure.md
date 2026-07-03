@@ -19,13 +19,14 @@ never requires mounting files into containers or redeploying.
 All per-entry secrets are **write-only**: you paste them in the form, they are
 encrypted with `AEGIS_SECRET_KEY` (Fernet; see `core/src/aegis/crypto.py`) into
 the `infra.credentials` jsonb column, and the API only ever returns
-`has_ssh_key` / `has_kubeconfig` / `has_auth_env` / `has_aws_credentials`
-booleans. When editing, a blank secret field **keeps** the stored value;
+`has_ssh_key` / `has_kubeconfig` / `has_auth_env` / `has_aws_credentials` /
+`has_gcp_service_account` booleans. When editing, a blank secret field **keeps** the stored value;
 pasting new material replaces it.
 
 At execution time secrets are decrypted and materialized to mode-0600 temp
-files (SSH key, kubeconfig, AWS credentials file) that are deleted as soon as
-the call finishes — nothing secret persists on disk.
+files (SSH key, kubeconfig, AWS credentials file, GCP service account JSON)
+that are deleted as soon as the call finishes — nothing secret persists on
+disk.
 
 > If `AEGIS_SECRET_KEY` is unset, values are stored plaintext with an
 > `encrypted: false` flag (the single-user self-hosted default). Set the key in
@@ -43,6 +44,10 @@ Per-entry secret fields:
 - **AWS credentials file** (`kind=k8s`) — a `~/.aws/credentials`-style ini for
   profile users; materialized per call and exposed as
   `AWS_SHARED_CREDENTIALS_FILE`.
+- **GCP service account JSON** (`kind=k8s`) — a service-account key file;
+  materialized per call and exposed as `GOOGLE_APPLICATION_CREDENTIALS`
+  (honored by `gke-gcloud-auth-plugin`), with
+  `CLOUDSDK_CORE_DISABLE_PROMPTS=1` set so gcloud never blocks on a prompt.
 
 ## The read-only flag
 
@@ -136,12 +141,15 @@ CLI binary in the core image and (b) cloud credentials in the environment.
 
 ```bash
 docker build --build-arg EXTRA_CLOUD_CLIS=aws -f core/Dockerfile .
+# or both:
+docker build --build-arg EXTRA_CLOUD_CLIS="aws gcloud" -f core/Dockerfile .
 ```
 
 Supported values live in the `EXTRA_CLOUD_CLIS` step of `core/Dockerfile`
-(currently `aws`); adding another CLI is one new `case` arm. Forks that build
-their own images (see the deployment docs) pass the arg from their build
-pipeline.
+(currently `aws` and `gcloud` — the latter installs the Google Cloud CLI plus
+`gke-gcloud-auth-plugin` from Google's apt repo); adding another CLI is one
+new `case` arm. Forks that build their own images (see the deployment docs)
+pass the arg from their build pipeline.
 
 **(b) The credentials** — per entry, in the **Auth env** field. For EKS:
 
@@ -181,6 +189,32 @@ kubectl config view --minify --flatten --context=<eks-ctx> > /tmp/aegis-kubeconf
 # 3. Provision → "N node(s) reachable"
 ```
 
+For **GKE**, paste a **service account JSON key** into the **GCP service
+account JSON** field instead — it is materialized per call as
+`GOOGLE_APPLICATION_CREDENTIALS`, which `gke-gcloud-auth-plugin` honors
+directly (no `gcloud auth login` needed; `CLOUDSDK_CORE_DISABLE_PROMPTS=1` is
+set so nothing ever blocks on a prompt). The service account needs at least
+`roles/container.viewer` on the cluster's project (plus RBAC inside the
+cluster for what AEGIS should do). Requires the image built with
+`--build-arg EXTRA_CLOUD_CLIS="aws gcloud"` (or just `gcloud`).
+
+Full GKE recipe:
+
+```bash
+# 1. service account + key
+gcloud iam service-accounts create aegis-infra --project <project>
+gcloud projects add-iam-policy-binding <project> \
+  --member serviceAccount:aegis-infra@<project>.iam.gserviceaccount.com \
+  --role roles/container.viewer
+gcloud iam service-accounts keys create /tmp/aegis-gke-key.json \
+  --iam-account aegis-infra@<project>.iam.gserviceaccount.com
+# 2. self-contained kubeconfig (the gke-gcloud-auth-plugin exec block comes along)
+gcloud container clusters get-credentials <cluster> --region <region> --project <project>
+kubectl config view --minify --flatten --context=<gke-ctx> > /tmp/aegis-kubeconfig.yaml
+# 3. add a k8s entry: paste the kubeconfig + the JSON key; delete both temp files
+# 4. Provision → "N node(s) reachable"
+```
+
 ## Chat
 
 Pandora's infra tools work against registry clusters by slug:
@@ -199,6 +233,7 @@ Pandora's infra tools work against registry clusters by slug:
 | Symptom | Cause |
 |---|---|
 | Provision error `exec plugin: executable aws not found` | Image built without `EXTRA_CLOUD_CLIS=aws` |
+| Provision error `exec plugin: executable gke-gcloud-auth-plugin not found` | Image built without `gcloud` in `EXTRA_CLOUD_CLIS` |
 | Provision error mentioning `getting credentials` / `ExpiredToken` | Auth env keys missing/wrong for this entry |
 | Provision error `Unable to connect to the server` | API endpoint not reachable from the core container (VPN-only endpoint?) |
 | `hosts_aegis` probe says `docker --context` failed | The entry has `docker_context` set — clear it so the probe uses SSH |

@@ -539,6 +539,9 @@ async def test_chat_list_services_unaffected_by_read_only(db_pool):
 
 FAKE_AUTH_ENV = {"AWS_ACCESS_KEY_ID": "AKIATEST", "AWS_SECRET_ACCESS_KEY": "shhh-secret"}
 FAKE_AWS_CREDS = "[myprofile]\naws_access_key_id = AKIATEST\naws_secret_access_key = shhh-secret"
+FAKE_GCP_SA = json.dumps(
+    {"type": "service_account", "project_id": "test-proj", "private_key": "gcp-shhh-secret"}
+)
 
 
 async def test_auth_env_stored_encrypted_and_flagged(db_pool):
@@ -582,6 +585,68 @@ async def test_k8s_auth_env_injected_into_kubectl(db_pool):
     assert seen["creds_content"] == FAKE_AWS_CREDS
     assert seen["creds_mode"] == "0o600"
     assert not os.path.exists(seen["creds_path"])  # cleaned up after the call
+
+
+async def test_gcp_service_account_stored_encrypted_and_flagged(db_pool):
+    await _prepare(db_pool)
+    row = await _create_k8s(db_pool, gcp_service_account_json=FAKE_GCP_SA)
+
+    assert row["has_gcp_service_account"] is True
+    assert "gcp-shhh-secret" not in str(row)
+
+    stored = await db_pool.fetchval("SELECT credentials FROM infra WHERE id = $1", row["id"])
+    assert stored["gcp_service_account_json_enc"]["encrypted"] is True
+    assert "gcp-shhh-secret" not in str(stored)
+
+    # Blank update keeps it.
+    updated = await infra_service.update_infra(db_pool, row["id"], {"name": "renamed"}, SECRET_KEY)
+    assert updated["has_gcp_service_account"] is True
+
+
+async def test_gcp_credentials_injected_into_kubectl(db_pool):
+    await _prepare(db_pool)
+    row = await _create_k8s(db_pool, gcp_service_account_json=FAKE_GCP_SA)
+    seen: dict = {}
+
+    async def fake_run(args, timeout=30, stdin=None, env=None, stdout_cap=0):
+        seen["env"] = env
+        seen["key_path"] = env.get("GOOGLE_APPLICATION_CREDENTIALS") if env else None
+        if seen["key_path"]:
+            seen["key_content"] = pathlib.Path(seen["key_path"]).read_text()
+            seen["key_mode"] = oct(os.stat(seen["key_path"]).st_mode & 0o777)
+        return {"ok": True, "exit_code": 0, "stdout": json.dumps(_POD_JSON), "stderr": ""}
+
+    with patch.object(infra_service, "_run_ssh", new=AsyncMock(side_effect=fake_run)):
+        result = await infra_service.k8s_list_pods(db_pool, row["id"], SECRET_KEY, "default")
+
+    assert result["ok"] is True
+    assert seen["env"]["CLOUDSDK_CORE_DISABLE_PROMPTS"] == "1"
+    assert seen["env"].get("PATH")  # os.environ inherited, exec plugin can find binaries
+    assert seen["key_content"] == FAKE_GCP_SA
+    assert seen["key_mode"] == "0o600"
+    assert not os.path.exists(seen["key_path"])  # cleaned up after the call
+
+
+async def test_aws_and_gcp_credentials_coexist(db_pool):
+    await _prepare(db_pool)
+    row = await _create_k8s(
+        db_pool, aws_credentials_file=FAKE_AWS_CREDS, gcp_service_account_json=FAKE_GCP_SA
+    )
+    seen: dict = {}
+
+    async def fake_run(args, timeout=30, stdin=None, env=None, stdout_cap=0):
+        seen["aws"] = pathlib.Path(env["AWS_SHARED_CREDENTIALS_FILE"]).read_text()
+        seen["gcp"] = pathlib.Path(env["GOOGLE_APPLICATION_CREDENTIALS"]).read_text()
+        seen["paths"] = (env["AWS_SHARED_CREDENTIALS_FILE"], env["GOOGLE_APPLICATION_CREDENTIALS"])
+        return {"ok": True, "exit_code": 0, "stdout": json.dumps(_POD_JSON), "stderr": ""}
+
+    with patch.object(infra_service, "_run_ssh", new=AsyncMock(side_effect=fake_run)):
+        result = await infra_service.k8s_list_pods(db_pool, row["id"], SECRET_KEY, "default")
+
+    assert result["ok"] is True
+    assert seen["aws"] == FAKE_AWS_CREDS
+    assert seen["gcp"] == FAKE_GCP_SA
+    assert all(not os.path.exists(p) for p in seen["paths"])  # both cleaned up
 
 
 async def test_k8s_auth_env_absent_inherits_process_env(db_pool):
@@ -643,6 +708,28 @@ async def test_update_with_only_aws_credentials_replaces_stored(db_pool):
         db_pool, row["id"], {"auth_env": {"K": "V"}}, SECRET_KEY
     )
     assert updated["has_auth_env"] is True
+
+
+async def test_update_with_only_gcp_service_account_replaces_stored(db_pool):
+    """PUT with ONLY gcp_service_account_json must persist (same regression
+    path as auth_env/aws_credentials_file — the new field must be in
+    _SECRET_INPUT_FIELDS so the credentials merge triggers)."""
+    await _prepare(db_pool)
+    row = await _create_k8s(db_pool, gcp_service_account_json='{"old": 1}')
+
+    updated = await infra_service.update_infra(
+        db_pool, row["id"], {"gcp_service_account_json": '{"new": 2}'}, SECRET_KEY
+    )
+    assert updated["has_gcp_service_account"] is True
+    seen: dict = {}
+
+    async def fake_run(args, timeout=30, stdin=None, env=None, stdout_cap=0):
+        seen["key"] = pathlib.Path(env["GOOGLE_APPLICATION_CREDENTIALS"]).read_text()
+        return {"ok": True, "exit_code": 0, "stdout": json.dumps(_POD_JSON), "stderr": ""}
+
+    with patch.object(infra_service, "_run_ssh", new=AsyncMock(side_effect=fake_run)):
+        await infra_service.k8s_list_pods(db_pool, row["id"], SECRET_KEY, "default")
+    assert seen["key"] == '{"new": 2}'
 
 
 async def test_kubectl_output_not_truncated_at_provision_cap(db_pool):

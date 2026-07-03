@@ -32,8 +32,8 @@ RUN curl -fsSL -o /usr/local/bin/kubectl \
 
 # Optional cloud CLIs — needed only when a registered kubeconfig authenticates
 # via an exec plugin (EKS: `aws eks get-token`, GKE: gke-gcloud-auth-plugin).
-# Space-separated list; supported: "aws". Default empty keeps the image slim.
-#   docker build --build-arg EXTRA_CLOUD_CLIS=aws ...
+# Space-separated list; supported: "aws gcloud". Default empty keeps the image slim.
+#   docker build --build-arg EXTRA_CLOUD_CLIS="aws gcloud" ...
 # See docs/infrastructure.md ("Cloud CLIs for exec-plugin kubeconfigs").
 ARG EXTRA_CLOUD_CLIS=""
 RUN set -e; for cli in ${EXTRA_CLOUD_CLIS}; do \
@@ -45,7 +45,17 @@ RUN set -e; for cli in ${EXTRA_CLOUD_CLIS}; do \
           && /tmp/aws/install \
           && rm -rf /tmp/aws /tmp/awscli.zip /var/lib/apt/lists/* \
           && aws --version ;; \
-        *) echo "Unsupported EXTRA_CLOUD_CLIS entry: $cli (supported: aws)"; exit 1 ;; \
+        gcloud) \
+          apt-get update && apt-get install -y --no-install-recommends gnupg \
+          && curl -fsSL https://packages.cloud.google.com/apt/doc/apt-key.gpg \
+             | gpg --dearmor -o /usr/share/keyrings/cloud.google.gpg \
+          && echo "deb [signed-by=/usr/share/keyrings/cloud.google.gpg] https://packages.cloud.google.com/apt cloud-sdk main" \
+             > /etc/apt/sources.list.d/google-cloud-sdk.list \
+          && apt-get update && apt-get install -y --no-install-recommends \
+             google-cloud-cli google-cloud-cli-gke-gcloud-auth-plugin \
+          && rm -rf /var/lib/apt/lists/* \
+          && gcloud --version && gke-gcloud-auth-plugin --version ;; \
+        *) echo "Unsupported EXTRA_CLOUD_CLIS entry: $cli (supported: aws gcloud)"; exit 1 ;; \
       esac; \
     done
 
