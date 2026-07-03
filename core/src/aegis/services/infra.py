@@ -72,7 +72,13 @@ _PROVISION_STDERR_CAP = 4 * 1024
 _KUBECTL_STDOUT_CAP = 32 * 1024 * 1024
 
 # Write-only API inputs folded into infra.credentials by _merged_credentials.
-_SECRET_INPUT_FIELDS = ("ssh_private_key", "kubeconfig", "auth_env", "aws_credentials_file")
+_SECRET_INPUT_FIELDS = (
+    "ssh_private_key",
+    "kubeconfig",
+    "auth_env",
+    "aws_credentials_file",
+    "gcp_service_account_json",
+)
 
 # RFC-1123-ish: what kubectl accepts for namespaces/pod/deployment names.
 # Validated even though we exec (no shell) so a name can't smuggle in a flag.
@@ -96,14 +102,17 @@ def public_infra(row: dict) -> dict:
     out["has_kubeconfig"] = bool((creds.get("kubeconfig_enc") or {}).get("value"))
     out["has_auth_env"] = bool((creds.get("auth_env_enc") or {}).get("value"))
     out["has_aws_credentials"] = bool((creds.get("aws_credentials_file_enc") or {}).get("value"))
+    out["has_gcp_service_account"] = bool(
+        (creds.get("gcp_service_account_json_enc") or {}).get("value")
+    )
     return out
 
 
 def _merged_credentials(existing: dict | None, data: dict[str, Any], secret_key: str) -> dict:
-    """Fold the write-only secret inputs (`ssh_private_key`, `kubeconfig`,
-    `auth_env`, `aws_credentials_file`) into the stored credentials dict.
-    Blank/absent keeps the existing value (slack_config convention: a blank
-    admin-UI field never wipes a saved secret)."""
+    """Fold the write-only secret inputs (`_SECRET_INPUT_FIELDS`) into the
+    stored credentials dict. Blank/absent keeps the existing value
+    (slack_config convention: a blank admin-UI field never wipes a saved
+    secret)."""
     creds = dict(existing or {})
     if data.get("ssh_private_key"):
         creds["ssh_private_key_enc"] = encrypt_secret(data["ssh_private_key"], secret_key)
@@ -113,6 +122,10 @@ def _merged_credentials(existing: dict | None, data: dict[str, Any], secret_key:
         creds["auth_env_enc"] = encrypt_secret(json.dumps(data["auth_env"]), secret_key)
     if data.get("aws_credentials_file"):
         creds["aws_credentials_file_enc"] = encrypt_secret(data["aws_credentials_file"], secret_key)
+    if data.get("gcp_service_account_json"):
+        creds["gcp_service_account_json_enc"] = encrypt_secret(
+            data["gcp_service_account_json"], secret_key
+        )
     return creds
 
 
@@ -158,16 +171,20 @@ def k8s_auth_env(infra: dict, secret_key: str) -> Iterator[dict | None]:
     """Yield the environment for kubectl subprocesses on this entry, or None
     when the entry has no stored auth material (inherit the process env).
 
-    Exec-plugin kubeconfigs (EKS `aws eks get-token`, GKE) read cloud
-    credentials from the environment: the stored `auth_env` map is layered on
-    top of os.environ, and a stored AWS credentials file (ini, for profile
-    users) is materialized to a mode-0600 temp file exposed as
-    AWS_SHARED_CREDENTIALS_FILE for the duration of the call.
+    Exec-plugin kubeconfigs (EKS `aws eks get-token`, GKE
+    `gke-gcloud-auth-plugin`) read cloud credentials from the environment: the
+    stored `auth_env` map is layered on top of os.environ, a stored AWS
+    credentials file (ini, for profile users) is materialized to a mode-0600
+    temp file exposed as AWS_SHARED_CREDENTIALS_FILE, and a stored GCP service
+    account JSON key likewise becomes GOOGLE_APPLICATION_CREDENTIALS (with
+    CLOUDSDK_CORE_DISABLE_PROMPTS=1 so gcloud never blocks on a prompt) — all
+    for the duration of the call.
     """
     creds = infra.get("credentials") or {}
     auth_env_raw = decrypt_secret(creds.get("auth_env_enc"), secret_key)
     aws_file = decrypt_secret(creds.get("aws_credentials_file_enc"), secret_key)
-    if not auth_env_raw and not aws_file:
+    gcp_json = decrypt_secret(creds.get("gcp_service_account_json_enc"), secret_key)
+    if not auth_env_raw and not aws_file and not gcp_json:
         yield None
         return
 
@@ -177,18 +194,28 @@ def k8s_auth_env(infra: dict, secret_key: str) -> Iterator[dict | None]:
             env.update({str(k): str(v) for k, v in json.loads(auth_env_raw).items()})
         except (ValueError, AttributeError):
             logger.warning("infra_auth_env_unparseable", slug=infra.get("slug"))
-    if not aws_file:
-        yield env
-        return
 
-    fd, path = tempfile.mkstemp(prefix="aegis-infra-awscreds-")  # mkstemp => mode 0600
-    try:
-        os.write(fd, aws_file.encode())
+    def _materialize(content: str, prefix: str) -> str:
+        fd, path = tempfile.mkstemp(prefix=prefix)  # mkstemp => mode 0600
+        os.write(fd, content.encode())
         os.close(fd)
-        env["AWS_SHARED_CREDENTIALS_FILE"] = path
+        return path
+
+    paths: list[str] = []
+    try:
+        if aws_file:
+            path = _materialize(aws_file, "aegis-infra-awscreds-")
+            paths.append(path)
+            env["AWS_SHARED_CREDENTIALS_FILE"] = path
+        if gcp_json:
+            path = _materialize(gcp_json, "aegis-infra-gcpcreds-")
+            paths.append(path)
+            env["GOOGLE_APPLICATION_CREDENTIALS"] = path
+            env["CLOUDSDK_CORE_DISABLE_PROMPTS"] = "1"
         yield env
     finally:
-        os.unlink(path)
+        for path in paths:
+            os.unlink(path)
 
 
 async def _unique_slug(pool: asyncpg.Pool, base: str) -> str:

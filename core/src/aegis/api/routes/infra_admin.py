@@ -39,13 +39,16 @@ class InfraCreate(BaseModel):
     ssh_key_ref: str | None = None
     # Write-only secrets — encrypted into infra.credentials, never returned
     # (responses carry has_* booleans instead). auth_env is an env-var map
-    # injected into kubectl calls (exec-plugin kubeconfigs, e.g. EKS);
+    # injected into kubectl calls (exec-plugin kubeconfigs, e.g. EKS/GKE);
     # aws_credentials_file is a ~/.aws/credentials-style ini for profile users,
-    # materialized as AWS_SHARED_CREDENTIALS_FILE per call.
+    # materialized as AWS_SHARED_CREDENTIALS_FILE per call;
+    # gcp_service_account_json is a GCP service-account JSON key, materialized
+    # as GOOGLE_APPLICATION_CREDENTIALS per call (GKE gke-gcloud-auth-plugin).
     ssh_private_key: str | None = None
     kubeconfig: str | None = None
     auth_env: dict[str, str] | None = None
     aws_credentials_file: str | None = None
+    gcp_service_account_json: str | None = None
     docker_context: str | None = None
     hosts_aegis: bool = False
     # When true, mutating ops (k8s restarts, SSH provisioning) are refused.
@@ -67,6 +70,7 @@ class InfraUpdate(BaseModel):
     kubeconfig: str | None = None
     auth_env: dict[str, str] | None = None
     aws_credentials_file: str | None = None
+    gcp_service_account_json: str | None = None
     docker_context: str | None = None
     hosts_aegis: bool | None = None
     read_only: bool | None = None

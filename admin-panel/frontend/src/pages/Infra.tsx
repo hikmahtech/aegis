@@ -25,6 +25,7 @@ interface InfraFormData {
   kubeconfig: string;
   auth_env: string; // KEY=value lines, parsed to a dict on save
   aws_credentials_file: string;
+  gcp_service_account_json: string;
   docker_context: string;
   hosts_aegis: boolean;
   read_only: boolean;
@@ -43,6 +44,7 @@ const emptyForm: InfraFormData = {
   kubeconfig: '',
   auth_env: '',
   aws_credentials_file: '',
+  gcp_service_account_json: '',
   docker_context: '',
   hosts_aegis: false,
   read_only: false,
@@ -303,7 +305,7 @@ export default function Infra() {
   const [showForm, setShowForm] = useState(false);
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editingSecrets, setEditingSecrets] = useState({
-    hasSshKey: false, hasKubeconfig: false, hasAuthEnv: false, hasAwsCredentials: false,
+    hasSshKey: false, hasKubeconfig: false, hasAuthEnv: false, hasAwsCredentials: false, hasGcpServiceAccount: false,
   });
   const [form, setForm] = useState<InfraFormData>({ ...emptyForm });
   const [formError, setFormError] = useState('');
@@ -328,7 +330,7 @@ export default function Infra() {
 
   const openCreate = () => {
     setEditingId(null);
-    setEditingSecrets({ hasSshKey: false, hasKubeconfig: false, hasAuthEnv: false, hasAwsCredentials: false });
+    setEditingSecrets({ hasSshKey: false, hasKubeconfig: false, hasAuthEnv: false, hasAwsCredentials: false, hasGcpServiceAccount: false });
     setForm({ ...emptyForm });
     setFormError('');
     setShowForm(true);
@@ -341,6 +343,7 @@ export default function Infra() {
       hasKubeconfig: !!row.has_kubeconfig,
       hasAuthEnv: !!row.has_auth_env,
       hasAwsCredentials: !!row.has_aws_credentials,
+      hasGcpServiceAccount: !!row.has_gcp_service_account,
     });
     setForm({
       name: row.name || '',
@@ -353,6 +356,7 @@ export default function Infra() {
       kubeconfig: '',
       auth_env: '',
       aws_credentials_file: '',
+      gcp_service_account_json: '',
       docker_context: row.docker_context || '',
       hosts_aegis: !!row.hosts_aegis,
       read_only: !!row.read_only,
@@ -411,6 +415,7 @@ export default function Infra() {
         if (Object.keys(env).length) payload.auth_env = env;
       }
       if (form.aws_credentials_file.trim()) payload.aws_credentials_file = form.aws_credentials_file;
+      if (form.gcp_service_account_json.trim()) payload.gcp_service_account_json = form.gcp_service_account_json;
       if (form.docker_context.trim()) payload.docker_context = form.docker_context.trim();
       if (form.setup_command.trim()) payload.setup_command = form.setup_command.trim();
       payload.setup_files = form.setup_files
@@ -568,6 +573,19 @@ export default function Infra() {
                       placeholder={editingSecrets.hasAwsCredentials
                         ? 'set — paste to replace, leave blank to keep'
                         : '[myprofile]\naws_access_key_id = ...\naws_secret_access_key = ...'}
+                    />
+                  </div>
+
+                  <div className="form-group">
+                    <label>GCP service account JSON (optional, stored encrypted — for GKE gke-gcloud-auth-plugin)</label>
+                    <textarea
+                      rows={3}
+                      value={form.gcp_service_account_json}
+                      onChange={e => setForm({ ...form, gcp_service_account_json: e.target.value })}
+                      className="mono"
+                      placeholder={editingSecrets.hasGcpServiceAccount
+                        ? 'set — paste to replace, leave blank to keep'
+                        : '{\n  "type": "service_account",\n  "project_id": "...",\n  ...\n}'}
                     />
                   </div>
                 </>
