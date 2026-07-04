@@ -235,6 +235,35 @@ _ACTIVITY_TYPE_MAP = {
     ),
 }
 
+# Activity types whose owning flow is only registered on the worker behind a
+# feature flag (see worker/__main__.py). Their seed rows ship active=true, so
+# without this gate schedule_sync would create Temporal schedules that fire
+# against a workflow type the worker never registered. Keyed by the settings
+# flag → the types it guards. When the flag is off we skip the row (and, since
+# it never enters expected_ids, the prune pass deletes any stale schedule —
+# so toggling a flag off cleans up too).
+_FEATURE_FLAGGED_TYPES = {
+    "homelab_enabled": {"ServiceDriftFlow", "DeliveryWatchdogFlow", "CertRadarFlow"},
+    "money_hygiene_enabled": {
+        "ReceiptIngestFlow",
+        "MoneyHygieneDailyFlow",
+        "SubscriptionAuditFlow",
+    },
+}
+
+
+def _disabled_by_feature_flag(act_type: str, settings: object | None) -> str | None:
+    """Return the settings flag name gating `act_type` if it's off, else None.
+
+    settings=None (e.g. some tests) means "don't gate" — behaves as before.
+    """
+    if settings is None:
+        return None
+    for flag, types in _FEATURE_FLAGGED_TYPES.items():
+        if act_type in types and not getattr(settings, flag, False):
+            return flag
+    return None
+
 
 async def sync_schedules(
     client: Client,
@@ -267,6 +296,18 @@ async def sync_schedules(
         act_name = act["slug"]
         act_type = act["workflow_type"]
         cron = act["schedule_cron"]
+
+        # Skip flows whose owning feature flag is off — the worker didn't
+        # register the workflow type, so a schedule for it would only error.
+        gated_off = _disabled_by_feature_flag(act_type, settings)
+        if gated_off:
+            logger.info(
+                "schedule_skipped_feature_off",
+                activity=act_name,
+                type=act_type,
+                flag=gated_off,
+            )
+            continue
 
         # Parse config
         config = act.get("config")
