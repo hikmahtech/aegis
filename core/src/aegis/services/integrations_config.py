@@ -30,6 +30,8 @@ class ConfigKey:
     label: str
     group: str
     secret: bool
+    boolean: bool = False  # render as an on/off toggle; stored as "true"/"false"
+    help: str = ""  # prerequisite config / caveats shown under the field
 
 
 # The user-facing integration config. Infra/bootstrap fields (db/temporal/admin/
@@ -59,6 +61,45 @@ CONFIG_REGISTRY: list[ConfigKey] = [
     ConfigKey("finance_api_key", "API key (optional, future providers)", "Finance", True),
     ConfigKey("finance_indices", "Overview indices (comma-sep symbols)", "Finance", False),
     ConfigKey("aegis_stack_name", "Swarm stack name (blank = show all services)", "System Monitoring", False),
+    # Feature flags — enable/disable whole subsystems. Off by default unless noted.
+    # `help` names the extra config a feature needs to actually work.
+    ConfigKey(
+        "homelab_enabled", "Homelab Guardian (swarm drift + cert radar)", "Features", False,
+        boolean=True,
+        help="Needs an infra registry entry for your Docker Swarm (Infra page) and, for cert-radar, "
+        "public domains (Sentry/Finance-style config or homelab_public_domains). Restart the worker after enabling.",
+    ),
+    ConfigKey(
+        "money_hygiene_enabled", "Money Hygiene (Maou: receipts, subscriptions)", "Features", False,
+        boolean=True,
+        help="Needs a connected Gmail account (Integrations → Google) for receipt ingestion. "
+        "Restart the worker after enabling.",
+    ),
+    ConfigKey(
+        "tts_enabled", "Voice notes (per-persona TTS)", "Features", False,
+        boolean=True,
+        help="Needs an ElevenLabs API key (Voice section above).",
+    ),
+    ConfigKey(
+        "notification_budget_enabled", "Notification budget (cap proactive pushes)", "Features", False,
+        boolean=True,
+        help="Uses notification_daily_budget (default 8). Off = record-only, no suppression.",
+    ),
+    ConfigKey(
+        "content_extraction_enabled", "Content extraction (article/bookmark bodies)", "Features", False,
+        boolean=True,
+        help="For Raindrop bookmarks, also set the Raindrop API token above.",
+    ),
+    ConfigKey(
+        "knowledge_context_enabled", "Proactive knowledge context in chat", "Features", False,
+        boolean=True,
+        help="Injects relevant knowledge into replies. No extra config. On by default.",
+    ),
+    ConfigKey(
+        "tool_calling_enabled", "Agent tool-calling in chat", "Features", False,
+        boolean=True,
+        help="Lets agents run tools mid-chat. No extra config. On by default.",
+    ),
 ]
 _BY_KEY = {c.key: c for c in CONFIG_REGISTRY}
 
@@ -88,6 +129,11 @@ async def apply_config_overrides(settings: Any, pool: Any) -> Any:
         spec = _BY_KEY.get(field)
         if not spec or not r["value"]:
             continue
+        if spec.boolean:
+            # Always set (even "false") so a DB toggle can override an env True.
+            raw = str((r["value"] or {}).get("val") or "").lower()
+            setattr(settings, field, raw == "true")
+            continue
         val = _resolve(spec, r["value"], getattr(settings, "secret_key", ""))
         if val:
             setattr(settings, field, val)
@@ -101,21 +147,30 @@ async def get_integrations(pool: Any, settings: Any) -> list[dict]:
     out: list[dict] = []
     for spec in CONFIG_REGISTRY:
         in_db = spec.key in db
-        env_val = getattr(settings, spec.key, "") or ""
-        if spec.secret:
+        base = {
+            "key": spec.key, "label": spec.label, "group": spec.group,
+            "boolean": spec.boolean, "help": spec.help,
+        }
+        if spec.boolean:
+            if in_db:
+                cur = str(db[spec.key].get("val") or "").lower() == "true"
+                source = "db"
+            else:
+                cur = bool(getattr(settings, spec.key, False))
+                source = "env"
+            out.append({**base, "secret": False, "set": cur, "value": cur, "source": source})
+        elif spec.secret:
+            env_val = getattr(settings, spec.key, "") or ""
             db_has = in_db and bool(decrypt_secret(db[spec.key].get("enc"), settings.secret_key))
-            out.append({
-                "key": spec.key, "label": spec.label, "group": spec.group, "secret": True,
+            out.append({**base, "secret": True,
                 "set": db_has or bool(env_val), "value": None,
-                "source": "db" if db_has else ("env" if env_val else "none"),
-            })
+                "source": "db" if db_has else ("env" if env_val else "none")})
         else:
+            env_val = getattr(settings, spec.key, "") or ""
             display = (db[spec.key].get("val") if in_db else "") or env_val or ""
-            out.append({
-                "key": spec.key, "label": spec.label, "group": spec.group, "secret": False,
+            out.append({**base, "secret": False,
                 "set": bool(display), "value": display,
-                "source": "db" if in_db else ("env" if env_val else "none"),
-            })
+                "source": "db" if in_db else ("env" if env_val else "none")})
     return out
 
 
@@ -123,7 +178,12 @@ async def save_integration(pool: Any, settings: Any, key: str, value: str) -> No
     spec = _BY_KEY.get(key)
     if spec is None:
         raise ValueError(f"unknown integration key: {key}")
-    stored = {"enc": encrypt_secret(value, settings.secret_key)} if spec.secret else {"val": value}
+    if spec.boolean:
+        stored = {"val": "true" if str(value).lower() in ("true", "1", "on", "yes") else "false"}
+    elif spec.secret:
+        stored = {"enc": encrypt_secret(value, settings.secret_key)}
+    else:
+        stored = {"val": value}
     await pool.execute(
         "INSERT INTO settings (key, value, updated_at) VALUES ($1, $2, NOW()) "
         "ON CONFLICT (key) DO UPDATE SET value = $2, updated_at = NOW()",

@@ -28,6 +28,14 @@ export default function Integrations() {
     } catch (e: any) { setError(e); } finally { setSavingKey(''); }
   }
 
+  async function saveBool(key: string, on: boolean) {
+    setSavingKey(key); setMsg(''); setError(null);
+    try {
+      setItems(await api.saveIntegration(key, on ? 'true' : 'false'));
+      setMsg(`${on ? 'Enabled' : 'Disabled'} ${key}.`);
+    } catch (e: any) { setError(e); } finally { setSavingKey(''); }
+  }
+
   async function generateKey() {
     if (keyStatus?.source === 'db' &&
         !window.confirm('Generate a new API key? The previously generated key stops working immediately.')) {
@@ -54,8 +62,9 @@ export default function Integrations() {
     <div>
       <h1 className="page-title">Integrations &amp; Secrets</h1>
       <p className="page-subtitle">
-        Connector tokens + webhook secrets, stored encrypted in the DB (your env vars are the fallback).
-        Token changes apply on the next worker restart; webhook secrets go live on save.
+        Connector tokens + webhook secrets + feature toggles, stored in the DB (secrets encrypted; your env vars are the fallback).
+        Token changes apply on the next worker restart; webhook secrets go live on save. The <strong>Features</strong> section
+        turns whole subsystems on/off — each note lists the extra config it needs; homelab/money features need a worker restart to take effect.
       </p>
       <ErrorBanner error={error} onDismiss={() => setError(null)} />
       {msg && <p className="msg-success">{msg}</p>}
@@ -92,18 +101,37 @@ export default function Integrations() {
         <div key={g} className="card" style={{ marginBottom: 12 }}>
           <h3>{g}</h3>
           {items.filter(i => i.group === g).map(i => (
-            <div key={i.key} className="cfg-row">
-              <span className="cfg-label">
-                {i.label} <span style={{ color: 'var(--text-muted)', fontSize: 11 }}>({i.source})</span>
-              </span>
-              <input
-                type={i.secret ? 'password' : 'text'}
-                value={i.secret ? (edits[i.key] ?? '') : (edits[i.key] ?? i.value ?? '')}
-                onChange={e => setEdits(ed => ({ ...ed, [i.key]: e.target.value }))}
-                placeholder={i.secret ? (i.set ? '•••••••• (set — enter to replace)' : 'not set') : ''}
-              />
-              <button className="btn" disabled={savingKey === i.key || edits[i.key] === undefined}
-                onClick={() => save(i.key)}>Save</button>
+            <div key={i.key}>
+              <div className="cfg-row">
+                <span className="cfg-label">
+                  {i.label} <span style={{ color: 'var(--text-muted)', fontSize: 11 }}>({i.source})</span>
+                </span>
+                {i.boolean ? (
+                  <label style={{ display: 'flex', alignItems: 'center', gap: 8, cursor: 'pointer' }}>
+                    <input type="checkbox" checked={!!i.value} disabled={savingKey === i.key}
+                      onChange={e => saveBool(i.key, e.target.checked)} />
+                    <span style={{ fontSize: 13, color: 'var(--text-muted)' }}>
+                      {i.value ? 'Enabled' : 'Disabled'}
+                    </span>
+                  </label>
+                ) : (
+                  <>
+                    <input
+                      type={i.secret ? 'password' : 'text'}
+                      value={i.secret ? (edits[i.key] ?? '') : (edits[i.key] ?? i.value ?? '')}
+                      onChange={e => setEdits(ed => ({ ...ed, [i.key]: e.target.value }))}
+                      placeholder={i.secret ? (i.set ? '•••••••• (set — enter to replace)' : 'not set') : ''}
+                    />
+                    <button className="btn" disabled={savingKey === i.key || edits[i.key] === undefined}
+                      onClick={() => save(i.key)}>Save</button>
+                  </>
+                )}
+              </div>
+              {i.help && (
+                <p style={{ color: 'var(--text-muted)', fontSize: 12, margin: '0 0 8px', maxWidth: 640 }}>
+                  {i.help}
+                </p>
+              )}
             </div>
           ))}
         </div>
