@@ -13,6 +13,11 @@ Two transports:
   (see `routes/social_auth.py::sync_postiz`) with no tokens of its own —
   just `meta.postiz_integration_id` — and posts through Postiz's public API.
   Accounts with that meta key skip token refresh entirely.
+
+Also exposes `get_post_metrics()` / `list_posts_window()` — Postiz's read-side
+analytics API, used by `SocialMetricsFlow` (`activities/social.py::refresh_post_metrics`)
+to cache each post's engagement series + delivery state onto its
+`social_outbox` row.
 """
 
 from __future__ import annotations
@@ -198,3 +203,81 @@ class SocialConnector(HTTPConnector):
             raise RuntimeError(f"postiz post failed: {resp.status_code} {resp.text[:200]}")
         await self._record("post_postiz", "ok", latency_ms)
         return str(resp.json()[0]["postId"])
+
+    async def get_post_metrics(self, post_ref: str, days: int = 7) -> dict:
+        """Postiz per-post analytics, normalized to {"series": {label: latest total}}.
+
+        Postiz returns a list of `{label, data: [{total, date}, ...],
+        percentageChange}` entries — one per metric (Likes, Comments, …). We
+        take each series' most recent `total` (best-effort int, else float) and
+        key it by the lowercased label. A fresh post with no analytics yet
+        returns an empty array — that's not an error, just an empty series.
+        """
+        postiz_url = self._settings.postiz_url
+        api_key = self._settings.postiz_api_key
+        if not postiz_url or not api_key:
+            raise RuntimeError(
+                f"postiz not configured — cannot fetch metrics for post {post_ref}: "
+                "set postiz_url/postiz_api_key on the Integrations page"
+            )
+        client = await self._ensure_client()
+        t0 = time.monotonic()
+        resp = await client.get(
+            f"{postiz_url.rstrip('/')}/api/public/v1/analytics/post/{post_ref}",
+            params={"date": days},
+            headers={"Authorization": api_key},
+        )
+        latency_ms = int((time.monotonic() - t0) * 1000)
+        if resp.status_code not in (200, 201):
+            await self._record("metrics_postiz", "error", latency_ms, error=resp.text[:200])
+            raise RuntimeError(f"postiz metrics failed: {resp.status_code} {resp.text[:200]}")
+        await self._record("metrics_postiz", "ok", latency_ms)
+        raw = resp.json()
+        if not raw:
+            return {"series": {}}
+        series: dict[str, float | int] = {}
+        raw_labels: list[str] = []
+        for entry in raw:
+            label = str(entry.get("label") or "").strip()
+            if not label:
+                continue
+            raw_labels.append(label)
+            points = entry.get("data") or []
+            if not points:
+                continue
+            latest = points[-1].get("total")
+            try:
+                value: float | int = int(latest)
+            except (TypeError, ValueError):
+                try:
+                    value = float(latest)
+                except (TypeError, ValueError):
+                    continue
+            series[label.lower()] = value
+        return {"series": series, "raw_labels": raw_labels}
+
+    async def list_posts_window(self, start_iso: str, end_iso: str) -> list[dict]:
+        """Postiz posts due/published within [start_iso, end_iso] (ISO datetimes)."""
+        postiz_url = self._settings.postiz_url
+        api_key = self._settings.postiz_api_key
+        if not postiz_url or not api_key:
+            raise RuntimeError(
+                "postiz not configured — cannot list posts: set postiz_url/postiz_api_key "
+                "on the Integrations page"
+            )
+        client = await self._ensure_client()
+        t0 = time.monotonic()
+        resp = await client.get(
+            f"{postiz_url.rstrip('/')}/api/public/v1/posts",
+            params={"startDate": start_iso, "endDate": end_iso},
+            headers={"Authorization": api_key},
+        )
+        latency_ms = int((time.monotonic() - t0) * 1000)
+        if resp.status_code not in (200, 201):
+            await self._record("list_posts_postiz", "error", latency_ms, error=resp.text[:200])
+            raise RuntimeError(f"postiz list posts failed: {resp.status_code} {resp.text[:200]}")
+        await self._record("list_posts_postiz", "ok", latency_ms)
+        body = resp.json()
+        if isinstance(body, dict):
+            return list(body.get("posts") or [])
+        return list(body or [])

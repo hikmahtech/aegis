@@ -91,6 +91,15 @@ activities:
     config: {}
     active: true
 
+  # Daily Postiz analytics pull into social_outbox.metrics (Postiz-routed
+  # accounts only). Harmless while social_publishing_enabled is false.
+  - slug: social-metrics-daily
+    workflow_type: SocialMetricsFlow
+    agent_id: sebas
+    schedule_cron: "30 3 * * *"
+    config: {}
+    active: true
+
   # Raphael — daily briefing (carries the "References filed" digest for
   # #research / #email reference closure per the references-as-knowledge
   # spec; per-message chat notifications only fire for user-initiated #chat / #manual

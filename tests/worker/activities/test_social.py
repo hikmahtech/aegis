@@ -539,6 +539,193 @@ async def test_post_postiz_missing_config_raises(social_env):
         await connector.close()
 
 
+# ------------------------------------------------------------ metrics: connector
+
+
+@respx.mock
+async def test_get_post_metrics_normalizes_series_and_handles_empty(social_env):
+    respx.get("https://postiz.example.com/api/public/v1/analytics/post/pz-1").respond(
+        200,
+        json=[
+            {"label": "Likes", "data": [{"total": "150", "date": "2025-01-01"}], "percentageChange": 16.7}
+        ],
+    )
+    respx.get("https://postiz.example.com/api/public/v1/analytics/post/pz-2").respond(200, json=[])
+    connector = SocialConnector(db_pool=social_env, settings=_settings_with_postiz())
+    try:
+        result = await connector.get_post_metrics("pz-1")
+        assert result["series"] == {"likes": 150}
+        assert result["raw_labels"] == ["Likes"]
+        assert await connector.get_post_metrics("pz-2") == {"series": {}}
+    finally:
+        await connector.close()
+
+
+async def test_get_post_metrics_missing_config_raises(social_env):
+    connector = SocialConnector(db_pool=social_env, settings=_settings())
+    try:
+        with pytest.raises(RuntimeError):
+            await connector.get_post_metrics("pz-1")
+    finally:
+        await connector.close()
+
+
+@respx.mock
+async def test_list_posts_window_tolerates_dict_shape(social_env):
+    respx.get("https://postiz.example.com/api/public/v1/posts").respond(
+        200, json={"posts": [{"id": "1"}]}
+    )
+    connector = SocialConnector(db_pool=social_env, settings=_settings_with_postiz())
+    try:
+        assert await connector.list_posts_window("2026-01-01", "2026-01-02") == [{"id": "1"}]
+    finally:
+        await connector.close()
+
+
+@respx.mock
+async def test_list_posts_window_tolerates_bare_array_shape(social_env):
+    respx.get("https://postiz.example.com/api/public/v1/posts").respond(
+        200, json=[{"id": "2"}]
+    )
+    connector = SocialConnector(db_pool=social_env, settings=_settings_with_postiz())
+    try:
+        assert await connector.list_posts_window("2026-01-01", "2026-01-02") == [{"id": "2"}]
+    finally:
+        await connector.close()
+
+
+async def test_list_posts_window_missing_config_raises(social_env):
+    connector = SocialConnector(db_pool=social_env, settings=_settings())
+    try:
+        with pytest.raises(RuntimeError):
+            await connector.list_posts_window("2026-01-01", "2026-01-02")
+    finally:
+        await connector.close()
+
+
+# ------------------------------------------------------ metrics: refresh_post_metrics
+
+
+async def test_refresh_post_metrics_no_deps_returns_zero():
+    act = SocialActivities(db_pool=None)
+    assert await ActivityEnvironment().run(act.refresh_post_metrics, 14) == {
+        "refreshed": 0,
+        "failed": 0,
+    }
+
+
+@respx.mock
+async def test_refresh_post_metrics_updates_state_release_url_series(social_env):
+    account_id = await _seed_postiz_account(social_env, platform="mastodon", integration_id="int-1")
+    await social_env.execute(
+        "INSERT INTO social_outbox (todoist_task_id, account_id, payload, status, posted_ref) "
+        "VALUES ('soctest-metrics-ok', $1, $2, 'posted', 'pz-100')",
+        account_id,
+        {"text": "hi", "link": ""},
+    )
+    respx.get("https://postiz.example.com/api/public/v1/posts").respond(
+        200,
+        json={
+            "posts": [
+                {
+                    "id": "pz-100",
+                    "state": "PUBLISHED",
+                    "releaseURL": "https://mastodon.social/@me/100",
+                    "publishDate": "2026-07-01T10:00:00.000Z",
+                }
+            ]
+        },
+    )
+    respx.get("https://postiz.example.com/api/public/v1/analytics/post/pz-100").respond(
+        200,
+        json=[
+            {"label": "Likes", "data": [{"total": "150", "date": "2026-07-01"}], "percentageChange": 16.7},
+            {"label": "Comments", "data": [{"total": "3", "date": "2026-07-01"}], "percentageChange": 0},
+        ],
+    )
+
+    connector = SocialConnector(db_pool=social_env, settings=_settings_with_postiz())
+    act = SocialActivities(db_pool=social_env, connector=connector)
+    try:
+        result = await ActivityEnvironment().run(act.refresh_post_metrics, 14)
+        assert result == {"refreshed": 1, "failed": 0}
+        row = await social_env.fetchrow(
+            "SELECT metrics, metrics_at FROM social_outbox WHERE todoist_task_id = 'soctest-metrics-ok'"
+        )
+        assert row["metrics_at"] is not None
+        metrics = row["metrics"]
+        assert metrics["state"] == "PUBLISHED"
+        assert metrics["release_url"] == "https://mastodon.social/@me/100"
+        assert metrics["series"] == {"likes": 150, "comments": 3}
+    finally:
+        await connector.close()
+
+
+@respx.mock
+async def test_refresh_post_metrics_one_failure_does_not_block_others(social_env):
+    account_id = await _seed_postiz_account(social_env, platform="mastodon", integration_id="int-1")
+    await social_env.execute(
+        "INSERT INTO social_outbox (todoist_task_id, account_id, payload, status, posted_ref) "
+        "VALUES ('soctest-metrics-bad', $1, $2, 'posted', 'pz-bad'), "
+        "       ('soctest-metrics-good', $1, $2, 'posted', 'pz-good')",
+        account_id,
+        {"text": "hi", "link": ""},
+    )
+    respx.get("https://postiz.example.com/api/public/v1/posts").respond(200, json={"posts": []})
+    respx.get("https://postiz.example.com/api/public/v1/analytics/post/pz-bad").respond(
+        500, json={"error": "boom"}
+    )
+    respx.get("https://postiz.example.com/api/public/v1/analytics/post/pz-good").respond(
+        200, json=[{"label": "Likes", "data": [{"total": "5", "date": "2026-07-01"}]}]
+    )
+
+    connector = SocialConnector(db_pool=social_env, settings=_settings_with_postiz())
+    act = SocialActivities(db_pool=social_env, connector=connector)
+    try:
+        result = await ActivityEnvironment().run(act.refresh_post_metrics, 14)
+        assert result == {"refreshed": 1, "failed": 1}
+        good_metrics = await social_env.fetchval(
+            "SELECT metrics FROM social_outbox WHERE todoist_task_id = 'soctest-metrics-good'"
+        )
+        assert good_metrics["series"] == {"likes": 5}
+        assert good_metrics["state"] == "unknown"  # not present in list_posts_window's empty map
+        bad_metrics = await social_env.fetchval(
+            "SELECT metrics FROM social_outbox WHERE todoist_task_id = 'soctest-metrics-bad'"
+        )
+        assert bad_metrics == {}  # never updated — the row's failure didn't block the good one
+    finally:
+        await connector.close()
+
+
+@respx.mock
+async def test_refresh_post_metrics_list_posts_failure_continues_with_empty_map(social_env):
+    """A failed list_posts_window call must not abort the pass — per-post
+    analytics is the core value; state/release_url just stay unknown."""
+    account_id = await _seed_postiz_account(social_env)
+    await social_env.execute(
+        "INSERT INTO social_outbox (todoist_task_id, account_id, payload, status, posted_ref) "
+        "VALUES ('soctest-metrics-nolist', $1, $2, 'posted', 'pz-77')",
+        account_id,
+        {"text": "hi", "link": ""},
+    )
+    respx.get("https://postiz.example.com/api/public/v1/posts").respond(500, json={"error": "boom"})
+    respx.get("https://postiz.example.com/api/public/v1/analytics/post/pz-77").respond(
+        200, json=[{"label": "Likes", "data": [{"total": "9", "date": "2026-07-01"}]}]
+    )
+    connector = SocialConnector(db_pool=social_env, settings=_settings_with_postiz())
+    act = SocialActivities(db_pool=social_env, connector=connector)
+    try:
+        result = await ActivityEnvironment().run(act.refresh_post_metrics, 14)
+        assert result == {"refreshed": 1, "failed": 0}
+        metrics = await social_env.fetchval(
+            "SELECT metrics FROM social_outbox WHERE todoist_task_id = 'soctest-metrics-nolist'"
+        )
+        assert metrics["state"] == "unknown"
+        assert metrics["series"] == {"likes": 9}
+    finally:
+        await connector.close()
+
+
 @respx.mock
 async def test_drain_social_outbox_posts_via_postiz_end_to_end(social_env):
     account_id = await _seed_postiz_account(social_env, label="drain-postiz")
