@@ -32,7 +32,14 @@ extra horsepower.
 - **Your infrastructure, registered.** An infrastructure registry holds SSH
   hosts, your Docker Swarm, Kubernetes clusters, cloud accounts (AWS / GCP),
   and the coding-agent host — credentials pasted in the admin UI, encrypted in
-  the DB, with per-entry read-only gating for the ops the agents may run.
+  the DB, with per-entry read-only gating for the ops the agents may run. A
+  **System monitoring** page shows the health of AEGIS's own services (scoped
+  to its own stack, so a shared swarm stays legible).
+- **Agents that write code.** Register your repos and a coding host in the UI —
+  SSH identity plus **Claude Code / Kimi** engines, named Claude accounts, and
+  per-GitHub-org routing. The ops agent SSHes in and runs the CLI on the right
+  repo, on the right account, to investigate alerts and propose fixes; Sentry /
+  alertmanager issues resolve to the matching repo automatically.
 - **Market data without a vendor contract.** A provider-agnostic finance
   connector (keyless Yahoo / Stooq) backs the money agent's quotes, market
   overview, and finance news.
