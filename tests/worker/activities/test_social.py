@@ -357,6 +357,28 @@ async def test_apply_social_approval_approve_posts_and_completes(social_env):
     ) == 1
 
 
+async def test_apply_social_approval_rereads_current_due_over_stale_snapshot(social_env):
+    """The card snapshots post_at at creation; the due can move before approval
+    (reschedule, or sync landing after a same-instant social tick). Approval
+    must schedule at the CURRENT mirrored due, not the snapshot."""
+    await _seed_account(social_env)
+    current_due = (datetime.now(UTC) + timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M:%S")
+    await _seed_task(social_env, "soctest-moved", ["publish", "x"], due_datetime=current_due)
+    stale = (datetime.now(UTC) - timedelta(hours=1)).isoformat()
+    fake = _FakeConnector(ref="tweet-88")
+    act = SocialActivities(db_pool=social_env, connector=fake)
+    result = await ActivityEnvironment().run(
+        act.apply_social_approval,
+        "ia-3",
+        {"value": "approve"},
+        {"task_id": "soctest-moved", "platforms": ["x"], "text": "hi", "link": "",
+         "post_at": stale},
+    )
+    assert result == {"applied": "approved"}
+    payload = fake.calls[0][1]
+    assert payload["schedule_at"] == f"{current_due}+00:00"  # user_tz=UTC in fixture
+
+
 async def test_apply_social_approval_skip_strips_publish_label(social_env):
     await _seed_task(social_env, "soctest-skip", ["publish", "x"])
     act = SocialActivities(db_pool=social_env)
