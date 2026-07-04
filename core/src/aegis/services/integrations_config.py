@@ -58,6 +58,7 @@ CONFIG_REGISTRY: list[ConfigKey] = [
     ConfigKey("finance_provider", "Provider (yahoo | stooq)", "Finance", False),
     ConfigKey("finance_api_key", "API key (optional, future providers)", "Finance", True),
     ConfigKey("finance_indices", "Overview indices (comma-sep symbols)", "Finance", False),
+    ConfigKey("aegis_stack_name", "Swarm stack name (blank = show all services)", "System Monitoring", False),
 ]
 _BY_KEY = {c.key: c for c in CONFIG_REGISTRY}
 

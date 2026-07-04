@@ -10,6 +10,7 @@ whole endpoint.
 from __future__ import annotations
 
 import asyncio
+import shlex
 from typing import Any
 
 import httpx
@@ -54,11 +55,23 @@ async def _probe_temporal(settings: Settings) -> dict[str, Any]:
         return {"status": "error", "error": str(exc)[:300]}
 
 
-async def _list_docker_services_via_context(docker_context: str) -> dict[str, Any]:
+def _stack_filter_args(stack: str) -> list[str]:
+    """`docker service ls` filter args scoping output to one swarm stack.
+
+    Matches the label `docker stack deploy` stamps on every service it creates,
+    so the System Monitoring page shows AEGIS's own services rather than every
+    stack on the swarm. Empty stack ⇒ no filter (show all).
+    """
+    if not stack:
+        return []
+    return ["--filter", f"label=com.docker.stack.namespace={stack}"]
+
+
+async def _list_docker_services_via_context(docker_context: str, stack: str) -> dict[str, Any]:
     cmd = ["docker"]
     if docker_context:
         cmd += ["--context", docker_context]
-    cmd += ["service", "ls", "--format", "{{.Name}} {{.Replicas}} {{.Image}}"]
+    cmd += ["service", "ls", *_stack_filter_args(stack), "--format", "{{.Name}} {{.Replicas}} {{.Image}}"]
     proc = await asyncio.create_subprocess_exec(
         *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
     )
@@ -75,9 +88,14 @@ async def _list_docker_services_via_context(docker_context: str) -> dict[str, An
 
 
 async def _list_docker_services_via_ssh(
-    host: str, user: str, key_file: str, port: int
+    host: str, user: str, key_file: str, port: int, stack: str
 ) -> dict[str, Any]:
-    remote_cmd = "docker service ls --format '{{.Name}} {{.Replicas}} {{.Image}}'"
+    stack_filter = (
+        f"--filter label=com.docker.stack.namespace={shlex.quote(stack)} " if stack else ""
+    )
+    remote_cmd = (
+        f"docker service ls {stack_filter}--format '{{{{.Name}}}} {{{{.Replicas}}}} {{{{.Image}}}}'"
+    )
     args = build_ssh_args(host, user, key_file, remote_cmd, connect_timeout=10)
     if port and port != 22:
         args = args[:-2] + ["-p", str(port)] + args[-2:]
@@ -124,9 +142,10 @@ async def _probe_services(pool, settings: Settings) -> dict[str, Any]:
             "note": "configure an infrastructure entry with 'hosts_aegis' to see running services",
         }
 
+    stack = (settings.aegis_stack_name or "").strip()
     try:
         if aegis_host.get("docker_context"):
-            result = await _list_docker_services_via_context(aegis_host["docker_context"])
+            result = await _list_docker_services_via_context(aegis_host["docker_context"], stack)
         elif aegis_host.get("host") and aegis_host.get("ssh_user"):
             with ssh_key_file(aegis_host, settings.secret_key) as key_file:
                 if not key_file:
@@ -140,6 +159,7 @@ async def _probe_services(pool, settings: Settings) -> dict[str, Any]:
                     aegis_host["ssh_user"],
                     key_file,
                     aegis_host.get("ssh_port") or 22,
+                    stack,
                 )
         else:
             return {
