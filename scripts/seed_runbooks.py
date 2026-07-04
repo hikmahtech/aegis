@@ -85,7 +85,7 @@ RUNBOOKS = [
                 "predicate": "has_context",
                 "object": (
                     "Homelab GitOps manages Docker Swarm infrastructure via Ansible. "
-                    "Primary manager: mgr-1 (10.20.0.11), services on node-a (10.20.0.20). "
+                    "Primary manager: mgr-1, services on node-a. "
                     "Stack file: aegis-stack.yml.j2. Deploy via ansible-playbook with aegis role. "
                     "Secrets in group_vars/all.yml (vault-encrypted)."
                 ),

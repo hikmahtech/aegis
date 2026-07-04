@@ -17,6 +17,8 @@ admin-panel/frontend/dist/
 config/.env
 .env
 .env.*
+# ...but keep the fork-and-run template tracked
+!config/.env.example
 
 # OS
 .DS_Store
