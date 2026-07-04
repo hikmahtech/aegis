@@ -24,7 +24,7 @@ SAMPLE_RESOURCES = [
         "title": "aegis-core",
         "kind": "repository",
         "url": "https://github.com/org/aegis",
-        "metadata": {"path": "aegis", "github_repo": "youruser/aegis"},
+        "metadata": {"path": "aegis", "github_repo": "youruser/aegis", "coding_enabled": True},
     },
     {
         "id": "res-002",
@@ -38,7 +38,7 @@ SAMPLE_RESOURCES = [
         "title": "Homelab GitOps — infrastructure Ansible + Swarm config",
         "kind": "repository",
         "url": "https://github.com/example/infra-gitops",
-        "metadata": {"path": "infra-gitops", "github_repo": "example/infra-gitops"},
+        "metadata": {"path": "infra-gitops", "github_repo": "example/infra-gitops", "coding_enabled": True},
     },
 ]
 
@@ -125,7 +125,7 @@ async def test_resolve_resource_kg_cache_hit():
     mock_db.fetchrow.return_value = {
         "id": "res-001",
         "title": "aegis-core",
-        "metadata": {"path": "personal/aegis", "github_repo": "youruser/aegis"},
+        "metadata": {"path": "personal/aegis", "github_repo": "youruser/aegis", "coding_enabled": True},
     }
 
     mock_kg = AsyncMock()
@@ -432,6 +432,97 @@ async def test_investigate_fallback_uses_balanced_model_not_gemma():
     await env.run(act.investigate, {"title": "x", "source": "todoist-jira"})
 
     assert mock_llm.think.call_args.kwargs["model"] == "gpt-oss:20b"
+
+
+async def test_kg_hit_on_disabled_resource_falls_through():
+    """A cached alert→resource link whose resource is NOT coding_enabled must
+    be ignored (allow-list) — it falls through to the live tiers instead of
+    firing a coding run on a disabled repo."""
+    mock_db = AsyncMock()
+    mock_db.fetch.return_value = SAMPLE_RESOURCES
+    mock_db.fetchrow.return_value = {
+        "id": "res-001",
+        "title": "aegis-core",
+        "metadata": {"path": "aegis", "github_repo": "youruser/aegis"},  # no coding_enabled
+    }
+    mock_kg = AsyncMock()
+    mock_kg.search.return_value = [
+        {"content": "relates_to resource:res-001", "score": 0.95,
+         "metadata": {"resource_id": "res-001"}},
+    ]
+    mock_kg.ingest_claims = AsyncMock()
+    mock_llm = AsyncMock()
+    mock_llm.think.return_value = {
+        "response": json.dumps({"resources": []}),
+        "model": "gpt-oss:20b", "prompt_tokens": 1, "completion_tokens": 1,
+    }
+    act = AlertActivities(db_pool=mock_db, llm_client=mock_llm, knowledge_connector=mock_kg,
+                          model_balanced="gpt-oss:20b")
+    result = await ActivityEnvironment().run(act.resolve_alert_resource, SAMPLE_ALERT)
+    assert result["source"] != "knowledge"  # disabled repo not served from cache
+    mock_llm.think.assert_called_once()
+
+
+async def test_sentry_project_deterministic_match_carries_routing():
+    """A resource pinning metadata.sentry_project matches a Sentry issue's
+    project slug deterministically (before the LLM), and the match carries the
+    resource-scoped engine + claude_account routing."""
+    rows = [
+        {"id": "res-x", "title": "My App", "kind": "repository",
+         "url": "https://github.com/acme/app",
+         "metadata": {"path": "acme/app", "github_repo": "acme/app",
+                      "coding_enabled": True, "sentry_project": "my-app",
+                      "engine": "claude", "claude_account": "work"}},
+    ]
+    mock_db = AsyncMock()
+    mock_db.fetch.return_value = rows
+    mock_kg = AsyncMock()
+    mock_kg.search.return_value = []
+    mock_llm = AsyncMock()  # must not be consulted
+    alert = {"title": "err", "source": "sentry", "fingerprint": "fp-s", "service": "my-app"}
+    act = AlertActivities(db_pool=mock_db, llm_client=mock_llm, knowledge_connector=mock_kg)
+    result = await ActivityEnvironment().run(act.resolve_alert_resource, alert)
+    assert result["source"] == "sentry_project"
+    assert result["resource_id"] == "res-x"
+    assert result["resources"][0]["engine"] == "claude"
+    assert result["resources"][0]["claude_account"] == "work"
+    mock_llm.think.assert_not_called()
+
+
+async def test_allow_list_excludes_non_coding_enabled_repos(db_pool):
+    """End-to-end SQL: only kind='repository' AND coding_enabled='true' resources
+    are candidates. A service that matches a NON-enabled repo resolves to none."""
+    await db_pool.execute("DELETE FROM resources WHERE slug LIKE 'test-al-%'")
+    await db_pool.execute(
+        "INSERT INTO resources (kind, slug, title, url, tags, metadata) VALUES "
+        "('repository','test-al-on','On repo','', ARRAY[]::text[], $1::jsonb),"
+        "('repository','test-al-off','Off repo','', ARRAY[]::text[], $2::jsonb)",
+        json.dumps({"path": "onrepo", "github_repo": "o/onrepo", "coding_enabled": True}),
+        json.dumps({"path": "offrepo", "github_repo": "o/offrepo", "coding_enabled": False}),
+    )
+    mock_kg = AsyncMock()
+    mock_kg.search.return_value = []
+    mock_llm = AsyncMock()
+    mock_llm.think.return_value = {
+        "response": json.dumps({"resources": []}),
+        "model": "m", "prompt_tokens": 0, "completion_tokens": 0,
+    }
+    act = AlertActivities(db_pool=db_pool, llm_client=mock_llm, knowledge_connector=mock_kg,
+                          model_balanced="m")
+    env = ActivityEnvironment()
+    try:
+        # service matches the DISABLED repo basename → excluded → no resolution
+        off = await env.run(act.resolve_alert_resource,
+                            {"title": "x", "source": "sentry", "fingerprint": "f1",
+                             "service": "offrepo", "description": ""})
+        assert off["resource_id"] is None
+        # service matches the ENABLED repo → deterministic service_match
+        on = await env.run(act.resolve_alert_resource,
+                           {"title": "x", "source": "sentry", "fingerprint": "f2",
+                            "service": "onrepo", "description": ""})
+        assert on["source"] == "service_match" and on["github_repo"] == "o/onrepo"
+    finally:
+        await db_pool.execute("DELETE FROM resources WHERE slug LIKE 'test-al-%'")
 
 
 async def test_resolve_resource_llm_returns_multiple():

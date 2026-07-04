@@ -413,6 +413,25 @@ def _decode_metadata(row: Any) -> dict:
     return m or {}
 
 
+def _coding_match(rid: Any, title: Any, meta: dict, confidence: float) -> dict:
+    """Build a resource-match dict carrying resource-scoped coding routing.
+
+    `engine` ('claude'|'kimi'|'') and `claude_account` (a CLAUDE_CONFIG_DIR
+    account label; kimi ignores it) come from the resource's metadata and let
+    the caller pin the coding run's engine + profile per repo.
+    """
+    meta = meta if isinstance(meta, dict) else {}
+    return {
+        "resource_id": str(rid),
+        "resource_title": title,
+        "resource_path": meta.get("path"),
+        "github_repo": (meta.get("github_repo") or "").strip(),
+        "engine": (meta.get("engine") or "").strip().lower(),
+        "claude_account": (meta.get("claude_account") or "").strip(),
+        "confidence": confidence,
+    }
+
+
 @dataclass
 class AlertActivities:
     """Activities for alert investigation."""
@@ -1061,13 +1080,11 @@ class AlertActivities:
                             continue
                         row_meta = row.get("metadata") or {}
                         row_meta = row_meta if isinstance(row_meta, dict) else {}
-                        matched = {
-                            "resource_id": str(row["id"]),
-                            "resource_title": row["title"],
-                            "resource_path": row_meta.get("path"),
-                            "github_repo": row_meta.get("github_repo", ""),
-                            "confidence": score,
-                        }
+                        # Respect the allow-list: a cached alert→resource link
+                        # must not fire a coding run on a since-disabled repo.
+                        if str(row_meta.get("coding_enabled") or "").lower() != "true":
+                            continue
+                        matched = _coding_match(row["id"], row["title"], row_meta, score)
                         return {**matched, "source": "knowledge", "resources": [matched]}
             except Exception as exc:
                 # Tier-1 KG cache miss for resource resolution — fall through
@@ -1081,16 +1098,22 @@ class AlertActivities:
         # Jira tickets), restrict candidates to resources whose `tags`
         # overlap the filter — otherwise the LLM gets dragged into picking
         # between every personality's repo.
+        # ALLOW-LIST: alert investigation only ever acts on resources the user
+        # has explicitly opted in for coding — kind='repository' AND
+        # metadata.coding_enabled='true'. This keeps the LLM/service matcher
+        # from dragging an auto-registered or unrelated resource into a live
+        # shell+PR coding run. Mark a repo on the admin Resources page.
+        coding_gate = "kind = 'repository' AND metadata->>'coding_enabled' = 'true'"
         tag_filter = alert.get("resource_tag_filter") or []
         if tag_filter:
             rows = await self.db_pool.fetch(
                 "SELECT id, title, kind, url, metadata FROM resources "
-                "WHERE tags && $1::text[] ORDER BY title",
+                f"WHERE ({coding_gate}) AND tags && $1::text[] ORDER BY title",
                 tag_filter,
             )
         else:
             rows = await self.db_pool.fetch(
-                "SELECT id, title, kind, url, metadata FROM resources ORDER BY title"
+                f"SELECT id, title, kind, url, metadata FROM resources WHERE {coding_gate} ORDER BY title"
             )
 
         # Tier 1.5: deterministic service → resource match. Sentry/alert
@@ -1104,6 +1127,18 @@ class AlertActivities:
         service = (alert.get("service") or "").strip()
         service_base = service.rsplit("/", 1)[-1].lower()
         if service_base:
+            # Tier 1.4: explicit Sentry project → resource. A Sentry issue's
+            # `service` is the project slug; a resource can pin it via
+            # metadata.sentry_project for deterministic routing (no LLM guess).
+            for row in rows:
+                meta = row.get("metadata") or {}
+                if not isinstance(meta, dict):
+                    continue
+                sentry_project = str(meta.get("sentry_project") or "").strip().lower()
+                if sentry_project and sentry_project == service.lower():
+                    matched = _coding_match(row["id"], row["title"], meta, 1.0)
+                    return {**matched, "source": "sentry_project", "resources": [matched]}
+            # Tier 1.5: deterministic service basename → path/github_repo match.
             for row in rows:
                 meta = row.get("metadata") or {}
                 if not isinstance(meta, dict):
@@ -1115,13 +1150,7 @@ class AlertActivities:
                 github_repo = str(meta.get("github_repo") or "").strip()
                 repo_base = github_repo.rsplit("/", 1)[-1].lower()
                 if service_base in {path_base, repo_base} or service.lower() == github_repo.lower():
-                    matched = {
-                        "resource_id": str(row["id"]),
-                        "resource_title": row["title"],
-                        "resource_path": meta.get("path"),
-                        "github_repo": github_repo,
-                        "confidence": 1.0,
-                    }
+                    matched = _coding_match(row["id"], row["title"], meta, 1.0)
                     return {**matched, "source": "service_match", "resources": [matched]}
 
         if not self.llm_client:
@@ -1218,12 +1247,11 @@ class AlertActivities:
             resolution_source = "llm_unconfirmed"
 
         if not raw_resources:
-            # Auto-register new GitHub repos seen for the first time —
-            # WITHOUT a path: only WorkspaceRepoSyncFlow may claim a checkout
-            # exists. Pathless ⇒ run_investigation degrades to the LLM-only
-            # path instead of failing on a directory that isn't there; the
-            # next workspace sync fills in the real path if the repo gets
-            # checked out (same slug, metadata merge).
+            # Auto-register new GitHub repos seen for the first time so they
+            # SHOW UP on the Resources page — but coding_enabled=false, so the
+            # allow-list keeps them out of live coding runs until the user opts
+            # in. We return null_result (no actionable match): an unlisted repo
+            # never triggers a shell+PR run; the flow degrades to LLM-only.
             if source == "github" and service:
                 repo_name = service.rsplit("/", 1)[-1]
                 slug = f"repo-{repo_name}"
@@ -1232,32 +1260,22 @@ class AlertActivities:
                         "SELECT id FROM resources WHERE slug = $1", slug
                     )
                     if not existing_id:
-                        existing_id = await conn.fetchval(
+                        await conn.execute(
                             "INSERT INTO resources (kind, slug, title, url, tags, metadata) "
-                            "VALUES ($1, $2, $3, $4, $5, $6::jsonb) RETURNING id",
+                            "VALUES ($1, $2, $3, $4, $5, $6::jsonb)",
                             "repository",
                             slug,
                             service,
                             f"https://github.com/{service}",
                             ["github", "repository", "pandoras-actor"],
-                            json.dumps({"github_repo": service}),
+                            json.dumps({"github_repo": service, "coding_enabled": False}),
                         )
                         activity.logger.info(
-                            "alert_resource_auto_registered slug=%s service=%s", slug, service
+                            "alert_resource_auto_registered_disabled slug=%s service=%s "
+                            "(mark coding_enabled to allow investigation)",
+                            slug,
+                            service,
                         )
-                    if existing_id:
-                        matched = {
-                            "resource_id": str(existing_id),
-                            "resource_title": service,
-                            "resource_path": None,
-                            "github_repo": service,
-                            "confidence": 1.0,
-                        }
-                        return {
-                            **matched,
-                            "source": "auto_registered",
-                            "resources": [matched],
-                        }
             return null_result
 
         # Build enriched resource list from DB rows
@@ -1272,12 +1290,10 @@ class AlertActivities:
             meta = meta if isinstance(meta, dict) else {}
             enriched.append(
                 {
-                    "resource_id": rid,
-                    "resource_title": r.get("resource_title") or row["title"],
+                    **_coding_match(rid, r.get("resource_title") or row["title"], meta,
+                                    float(r.get("confidence", 0.0))),
                     "resource_path": meta.get("path") or "",
-                    "github_repo": meta.get("github_repo") or "",
                     "kind": row.get("kind", ""),
-                    "confidence": float(r.get("confidence", 0.0)),
                 }
             )
 
@@ -1599,6 +1615,14 @@ class AlertActivities:
         repo_key = repo.rsplit("/", 1)[-1]
         primary_github_repo = primary.get("github_repo") or ""
 
+        # Resource-scoped routing: a repo can pin its engine (claude|kimi) and,
+        # for claude, its CLAUDE_CONFIG_DIR account label. The resource engine
+        # wins over the caller's engine_override (the kimi→claude fallback);
+        # kimi ignores the account. Falls through to org routing when unset.
+        res_engine = (primary.get("engine") or "").strip().lower()
+        effective_engine_override = res_engine if res_engine in ("claude", "kimi") else engine_override
+        res_claude_account = primary.get("claude_account") or ""
+
         worktree_path = ""
         inv_host = ""
         try:
@@ -1607,9 +1631,14 @@ class AlertActivities:
                 prompt,
                 kimi_binary=self.kimi_binary,
                 github_repo=primary_github_repo,
-                engine_override=engine_override,
+                engine_override=effective_engine_override,
+                claude_account=res_claude_account,
                 claude_config_dir=(
-                    self.claude_personal_config_dir if engine_override == "claude" else ""
+                    # Only the fallback path supplies an explicit dir; a
+                    # resource-pinned account takes the claude_account route.
+                    self.claude_personal_config_dir
+                    if effective_engine_override == "claude" and not res_claude_account
+                    else ""
                 ),
             )
             if run_result.get("status") == "failed":

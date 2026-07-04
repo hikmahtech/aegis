@@ -620,6 +620,7 @@ class RemoteScriptConnector:
         github_repo: str = "",
         engine_override: str = "",
         claude_config_dir: str = "",
+        claude_account: str = "",
     ) -> dict:
         """Start a coding-CLI run (kimi or claude) on the effective host.
 
@@ -636,10 +637,13 @@ class RemoteScriptConnector:
         kimi: the preferred `kimi_host` when set and reachable, otherwise the
         base host with a detached `nohup` launch.
 
-        `engine_override` ("claude") forces the claude CLI regardless of org —
-        the kimi→claude fallback path uses this for a non-org repo, passing
-        `claude_config_dir` (CLAUDE_CONFIG_DIR) so the run uses the personal
-        login rather than the default ~/.claude (which belongs to an org).
+        `engine_override` ("claude" | "kimi") forces the engine regardless of
+        org routing — used both by the kimi→claude fallback (passing
+        `claude_config_dir` for the personal login) and by resource-scoped
+        routing (a resource pins its own engine). `claude_account` is a
+        resource-scoped CLAUDE_CONFIG_DIR account *label* (resolved against the
+        coding block's config_dirs); it wins over org routing but not over an
+        explicit `claude_config_dir`. (Kimi ignores both — no profile.)
 
         Reachable-host runs are wrapped in a tmux window for live attach.
         Output is always captured to `output_file` (via `tee` in tmux mode) so
@@ -663,13 +667,20 @@ class RemoteScriptConnector:
                 return {"run_id": run_id, "status": "failed", "error": error}
             host, use_tmux = self._host, True
             binary = self._claude_binary
-            # Explicit param wins; otherwise the routed account's config dir,
-            # or the default account for override (fallback) runs whose org
-            # isn't routed to claude. Empty ⇒ the host's default ~/.claude.
-            if route_engine == "claude":
-                config_dir = claude_config_dir or route_config_dir
+            # Precedence for CLAUDE_CONFIG_DIR (empty ⇒ host's default ~/.claude):
+            #   1. explicit claude_config_dir param (the kimi→claude fallback path)
+            #   2. per-resource claude_account label (resource-scoped routing)
+            #   3. the org-routed account's dir (route table)
+            #   4. the default account (forced-claude on a non-claude-routed org)
+            account_dir = self._claude_config_dir_for(claude_account) if claude_account else ""
+            if claude_config_dir:
+                config_dir = claude_config_dir
+            elif account_dir:
+                config_dir = account_dir
+            elif route_engine == "claude":
+                config_dir = route_config_dir
             else:
-                config_dir = claude_config_dir or self._claude_config_dir_for("")
+                config_dir = self._claude_config_dir_for("")
         else:
             host, use_tmux = await self._resolve_kimi_host()
             # DB-configured kimi binary wins over the caller's env-derived path.
