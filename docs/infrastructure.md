@@ -294,6 +294,23 @@ Pandora gets two read-only tools:
   profile?". Errors (missing CLI, bad credentials, unknown slug) come back as
   plain tool errors, never crashes.
 
+## System monitoring (`hosts_aegis`)
+
+The admin **System monitoring** page shows the live health of AEGIS's *own*
+deployment — database latency, Temporal reachability, and the running container
+services — so it needs to know where AEGIS itself runs. Flag the infra entry
+for that machine with **This host runs AEGIS itself** (`hosts_aegis`). The page
+lists services from that host, via its `docker_context` if set, otherwise over
+SSH using its stored key.
+
+On a shared Docker Swarm the host runs many stacks, so the service list is
+**scoped to AEGIS's own stack** — it filters `docker service ls` by the
+`com.docker.stack.namespace` label. The stack name comes from
+**`aegis_stack_name`** (default `aegis`), editable under **Integrations →
+System Monitoring**; leave it blank to show every service on the host (the
+escape hatch). If AEGIS is deployed under a stack name other than `aegis`, set
+this or the page will show nothing.
+
 ## Remote script / coding agents
 
 The remote-script subsystem (chat's `run_script` infra tools, coding-CLI runs
@@ -342,6 +359,50 @@ key is pasted.)
      empty (env/image defaults apply).
 3. Save. The entry shows a **coding host** badge; runs pick the config up
    within ~30 s.
+4. **Register the repos the agent works on.** On the **Resources** page add a
+   `repository` resource per repo, and fill its two first-class fields:
+   - **Workspace path** — the checkout's path *relative to the coding host's
+     repo base* (e.g. `acme/bcp` for `/home/deploy/Workspace/acme/bcp`). This
+     is the directory the CLI `cd`s into and runs.
+   - **GitHub repo** — `owner/repo`. Its **org** is matched against the coding
+     block's **Org routing** rules to pick the engine/account (claude vs kimi),
+     and it is what **alert investigation** resolves an incoming Sentry/alert
+     issue to. (Both still live under `metadata.path` / `metadata.github_repo`
+     — the fields just save you hand-editing the JSON.)
+
+   The fixed checkouts under the repo base are provisioned/mirrored by
+   `WorkspaceRepoSyncFlow`, never cloned per-run — a missing path is a hard
+   error, not a silent clone. Sentry alerts are additionally narrowed by the
+   `sentry_projects` setting (**Integrations → Sentry**, comma-separated project
+   ids; blank = all).
+
+### Verify the coding host
+
+Drive the live connector from inside the running worker — it uses the same
+DB-resolved config, decrypted key material, and SSH path as real agent runs:
+
+```bash
+docker exec -i <aegis_worker_container> python - <<'PY'
+import asyncio, os
+from aegis.db import create_pool          # registers the jsonb->dict codec the connector needs
+from aegis.connectors.remote_script import RemoteScriptConnector
+
+async def main():
+    pool = await create_pool(os.environ["AEGIS_DATABASE_URL"].replace("+asyncpg", ""))
+    c = RemoteScriptConnector(db_pool=pool, secret_key=os.environ["AEGIS_SECRET_KEY"])
+    await c.ensure_config()
+    print(await c.coding_settings())                    # -> source=db:<slug>, host, repo_base, binaries
+    print(await c.run_on_host("", "whoami; hostname"))  # SSH reachability + key materialization
+    print(await c.run_on_host("", "claude --version; kimi --version"))
+asyncio.run(main())
+PY
+```
+
+A healthy host prints `source: db:<slug>`, lands as the SSH user you configured,
+and returns both CLI versions. `source: env` with an empty host means no entry
+has the coding block enabled — or (when scripting your own check) that you used
+a raw `asyncpg` pool instead of `aegis.db.create_pool`, which returns the
+`coding` jsonb as a string and makes the connector silently fall back to env.
 
 ### Env fallback
 
