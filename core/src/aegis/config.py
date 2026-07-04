@@ -74,9 +74,6 @@ class Settings(BaseSettings):
     admin_password: str = ""
     api_key: str = ""
 
-    # Timezone
-    timezone: str = "Asia/Kolkata"
-
     # Connectors
     github_token: str = ""
     vercel_token: str = ""

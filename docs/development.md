@@ -209,17 +209,9 @@ Kill switches:
 
 ## Adding Intelligence Topics
 
-Intelligence monitoring topics are stored in `settings` key `intelligence_topics`. Manage them via the `track_topic` chat tool (Raphael), or directly:
+The topics `IntelligenceScanFlow` (Raphael) scans are set **per source** in the flow config: the `topics` list on each `intelligence-scan-*` row in `config/seed/activities.yaml`, also editable live at `/admin/flows`. Change the config and `schedule_sync` propagates it without a redeploy.
 
-```sql
--- View current topics
-SELECT value FROM settings WHERE key = 'intelligence_topics';
-
--- Update via API
-PUT /api/settings/intelligence_topics
-```
-
-`IntelligenceScanFlow` (Raphael, scheduled per source) reads this config when scanning `hn`, `news`, or `finance` sources.
+> The `track_topic` chat tool writes a separate `settings.intelligence_topics` key that the scan flow does **not** currently read — it has no effect on scanning yet.
 
 ## Todoist (local dev)
 
@@ -228,7 +220,6 @@ For local development against the real Todoist API:
 1. Personal API key in `config/.env`:
    ```
    AEGIS_TODOIST_API_KEY=<your key>
-   AEGIS_TODOIST_EMAIL=<your email>
    AEGIS_TODOIST_WEBHOOK_SECRET=<any string for local — webhooks won't reach localhost anyway>
    ```
 2. Boot Core + worker as usual. `TodoistSyncFlow` will fire every 5 minutes against your real Todoist account.
