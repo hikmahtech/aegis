@@ -360,21 +360,41 @@ key is pasted.)
 3. Save. The entry shows a **coding host** badge; runs pick the config up
    within ~30 s.
 4. **Register the repos the agent works on.** On the **Resources** page add a
-   `repository` resource per repo, and fill its two first-class fields:
+   `repository` resource per repo. Its first-class fields (all saved under
+   `metadata`, so no hand-editing JSON):
    - **Workspace path** — the checkout's path *relative to the coding host's
      repo base* (e.g. `acme/bcp` for `/home/deploy/Workspace/acme/bcp`). This
      is the directory the CLI `cd`s into and runs.
-   - **GitHub repo** — `owner/repo`. Its **org** is matched against the coding
-     block's **Org routing** rules to pick the engine/account (claude vs kimi),
-     and it is what **alert investigation** resolves an incoming Sentry/alert
-     issue to. (Both still live under `metadata.path` / `metadata.github_repo`
-     — the fields just save you hand-editing the JSON.)
+   - **GitHub repo** — `owner/repo`. Its **org** is the default engine/account
+     selector (matched against the coding block's **Org routing**) and what
+     alert investigation matches an incoming issue to.
+   - **Coding-agent routing** (repository resources only):
+     - **Enable alert / Sentry investigation** — the **allow-list gate**. Alert
+       investigation only ever runs a coding agent on repos with this checked;
+       everything else is ignored (an unknown GitHub repo seen in an alert is
+       auto-added here *disabled*, for you to review and opt in). This is what
+       "only the listed repos are included" means.
+     - **Engine override** — pin this repo to `claude` or `kimi`, regardless of
+       org routing. Blank = decide by org.
+     - **Claude account** — a `CLAUDE_CONFIG_DIR` account label from the coding
+       block's `engines.claude.config_dirs`; the claude run for this repo uses
+       that profile. Wins over org routing. **Kimi ignores it** (no profile).
+     - **Sentry project slug** — maps a Sentry issue (by its project slug)
+       straight to this repo, deterministically, before any LLM guess.
 
    The fixed checkouts under the repo base are provisioned/mirrored by
    `WorkspaceRepoSyncFlow`, never cloned per-run — a missing path is a hard
-   error, not a silent clone. Sentry alerts are additionally narrowed by the
-   `sentry_projects` setting (**Integrations → Sentry**, comma-separated project
-   ids; blank = all).
+   error, not a silent clone. Sentry alerts are additionally narrowed at fetch
+   time by the `sentry_projects` setting (**Integrations → Sentry**,
+   comma-separated project ids; blank = all) — that controls which issues are
+   *pulled*; the per-resource **Sentry project slug** controls which repo an
+   issue *routes to*.
+
+   > Upgrading an existing deployment: mark your active repos
+   > **Enable alert / Sentry investigation**, or alert investigation resolves
+   > nothing (the allow-list starts closed). One-shot for the repos that already
+   > have a workspace checkout:
+   > `UPDATE resources SET metadata = jsonb_set(metadata,'{coding_enabled}','true') WHERE kind='repository' AND metadata->>'path' IS NOT NULL;`
 
 ### Verify the coding host
 

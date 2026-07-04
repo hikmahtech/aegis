@@ -630,6 +630,44 @@ async def test_engine_override_forces_personal_claude_on_base_host(conn_claude):
 
 
 @pytest.mark.asyncio
+async def test_claude_account_selects_resource_config_dir(conn_claude):
+    """Resource-scoped routing: `claude_account` resolves to that account's
+    CLAUDE_CONFIG_DIR and wins over org routing; an explicit claude_config_dir
+    still wins over the account."""
+    conn_claude._claude_config_dirs = {"work": "/cfg/work", "personal": "/cfg/personal"}
+
+    # account label → its config dir (repo would otherwise be kimi; force claude)
+    procs = _make_proc_sequence([0, 0, 0, 0, 0, 0])
+    procs[4].communicate = AsyncMock(return_value=(b"@0:bash:0\n", b""))
+    with (
+        patch.object(conn_claude, "_probe_host", AsyncMock(return_value=True)),
+        patch("asyncio.create_subprocess_exec", side_effect=procs) as mock_exec,
+    ):
+        await conn_claude.start_kimi_run(
+            repo="aegis", prompt="x", kimi_binary="/k",
+            github_repo="youruser/aegis", engine_override="claude",
+            claude_account="work",
+        )
+    launch = " ".join(str(a) for a in mock_exec.call_args_list[-1].args)
+    assert "CLAUDE_CONFIG_DIR=/cfg/work" in launch
+
+    # explicit claude_config_dir beats the account
+    procs2 = _make_proc_sequence([0, 0, 0, 0, 0, 0])
+    procs2[4].communicate = AsyncMock(return_value=(b"@0:bash:0\n", b""))
+    with (
+        patch.object(conn_claude, "_probe_host", AsyncMock(return_value=True)),
+        patch("asyncio.create_subprocess_exec", side_effect=procs2) as mock_exec2,
+    ):
+        await conn_claude.start_kimi_run(
+            repo="aegis", prompt="x", kimi_binary="/k",
+            github_repo="youruser/aegis", engine_override="claude",
+            claude_account="work", claude_config_dir="/explicit",
+        )
+    launch2 = " ".join(str(a) for a in mock_exec2.call_args_list[-1].args)
+    assert "CLAUDE_CONFIG_DIR=/explicit" in launch2
+
+
+@pytest.mark.asyncio
 async def test_start_kimi_run_claude_tmux_all_live_falls_back_to_nohup_on_base(conn_claude):
     live = "\n".join(f"@{i}:claude-bcp-{i:04d}:0" for i in range(10))
     procs = _make_proc_sequence([0, 0, 0, 0, 0, 0])
