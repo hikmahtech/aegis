@@ -61,16 +61,27 @@ class SocialActivities:
             SELECT id, content, description, labels, post_at FROM (
               SELECT t.id, t.content, t.description, t.labels,
                 CASE
-                  WHEN t.raw->'due'->>'datetime' IS NOT NULL THEN
-                    CASE WHEN t.raw->'due'->>'datetime' LIKE '%Z'
-                         THEN (t.raw->'due'->>'datetime')::timestamptz
-                         ELSE ((t.raw->'due'->>'datetime')::timestamp AT TIME ZONE $2)
+                  WHEN d.due_dt IS NOT NULL THEN
+                    CASE WHEN d.due_dt LIKE '%Z'
+                         THEN d.due_dt::timestamptz
+                         ELSE (d.due_dt::timestamp AT TIME ZONE $2)
                     END
                   WHEN t.due_date IS NOT NULL THEN
                     ((t.due_date::timestamp + make_interval(hours => $3))
                       AT TIME ZONE $2)
                 END AS post_at
               FROM todoist_tasks t
+              -- Todoist's SYNC API carries a timed due inside due.date
+              -- ("YYYY-MM-DDTHH:MM:SS", floating local; "...Z" when the due
+              -- has a fixed timezone). due.datetime only exists in REST-API
+              -- payloads — kept as a fallback for rows mirrored that way.
+              CROSS JOIN LATERAL (
+                SELECT COALESCE(
+                         t.raw->'due'->>'datetime',
+                         CASE WHEN t.raw->'due'->>'date' LIKE '%T%'
+                              THEN t.raw->'due'->>'date' END
+                       ) AS due_dt
+              ) d
               WHERE NOT t.is_completed
                 AND $1 = ANY(t.labels)
                 AND NOT EXISTS (

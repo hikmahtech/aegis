@@ -240,7 +240,7 @@ Workflow steps (activities in `worker/src/aegis_worker/activities/social.py`):
 1. `find_due_posts` — SELECT from `todoist_tasks` WHERE not completed, labels
    contain the publish label, and due time ≤ now + lookahead. **Note:**
    `todoist_tasks.due_date` is a `date` column; the post *time* comes from
-   `raw->'due'->>'datetime'` when present, else default to a configured hour of the
+   `raw->'due'->>'date' (Sync API; timed dues carry the time in due.date — due.datetime is REST-only)` when present, else default to a configured hour of the
    due date. Skip tasks that already have `social_outbox` rows (idempotency).
 2. For each due task: spawn `InteractionFlow` as a child workflow
    (`worker/src/aegis_worker/flows/interaction.py`, `InteractionFlowInput(agent_id,
