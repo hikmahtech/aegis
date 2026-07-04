@@ -66,6 +66,7 @@ from aegis_worker.flows.review import DailyReviewFlow, WeeklyReviewFlow
 from aegis_worker.flows.rss_ingest import RssIngestFlow
 from aegis_worker.flows.sentry_poll import SentryPollFlow
 from aegis_worker.flows.service_drift import ServiceDriftFlow
+from aegis_worker.flows.social_metrics import SocialMetricsFlow
 from aegis_worker.flows.social_publish import SocialPublishFlow
 from aegis_worker.flows.subscription_audit import SubscriptionAuditFlow
 from aegis_worker.flows.todoist_sync import TodoistSyncFlow
@@ -117,6 +118,7 @@ WORKFLOWS: list = [
     DailyReviewFlow,
     WeeklyReviewFlow,
     SocialPublishFlow,
+    SocialMetricsFlow,
 ]
 
 ACTIVITIES: list = [
@@ -130,6 +132,7 @@ ACTIVITIES: list = [
     _stub_social_act.complete_posted_tasks,
     _stub_social_act.unpublish_task,
     _stub_social_act.apply_social_approval,
+    _stub_social_act.refresh_post_metrics,
 ]
 
 
@@ -517,6 +520,7 @@ async def main():
         social_act.complete_posted_tasks,
         social_act.unpublish_task,
         social_act.apply_social_approval,
+        social_act.refresh_post_metrics,
         clarify_act.find_unclassified_items,
         clarify_act.classify_one,
         clarify_act.apply_outcome,
@@ -596,6 +600,7 @@ async def main():
         WorkspaceRepoSyncFlow,
         VercelProjectSyncFlow,
         SocialPublishFlow,
+        SocialMetricsFlow,
     ]
 
     if settings.homelab_enabled:

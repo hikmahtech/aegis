@@ -210,3 +210,38 @@ async def test_sync_postiz_upstream_error_502(client, settings):
     )
     resp = await client.post("/api/admin/social/postiz/sync", headers={"X-API-Key": "k"})
     assert resp.status_code == 502
+
+
+# --------------------------------------------------------------- recent posts
+
+
+async def test_list_posts_returns_seeded_row_shape(client, db_pool):
+    account_id = await db_pool.fetchval(
+        "INSERT INTO social_accounts (platform, label, meta) VALUES ($1, $2, $3) RETURNING id",
+        "mastodon",
+        "posts-test",
+        {"postiz_integration_id": "int-1", "via": "postiz"},
+    )
+    await db_pool.execute(
+        "INSERT INTO social_outbox "
+        "(todoist_task_id, account_id, payload, status, posted_ref, metrics, metrics_at) "
+        "VALUES ($1, $2, $3, 'posted', 'pz-1', $4, now())",
+        "soctest-postslist",
+        account_id,
+        {"text": "hello world " * 20, "link": "https://example.com", "schedule_at": "2026-07-01T09:00:00+00:00"},
+        {"state": "PUBLISHED", "release_url": "https://mastodon.social/@me/1", "series": {"likes": 5}},
+    )
+    resp = await client.get("/api/admin/social/posts?days=14", headers={"X-API-Key": "k"})
+    assert resp.status_code == 200
+    rows = resp.json()
+    row = next(r for r in rows if r["posted_ref"] == "pz-1")
+    assert row["platform"] == "mastodon"
+    assert row["label"] == "posts-test"
+    assert row["status"] == "posted"
+    assert row["state"] == "PUBLISHED"
+    assert row["release_url"] == "https://mastodon.social/@me/1"
+    assert row["series"] == {"likes": 5}
+    assert row["schedule_at"] == "2026-07-01T09:00:00+00:00"
+    assert len(row["text"]) <= 120
+    assert row["metrics_at"] is not None
+    assert row["created_at"] is not None

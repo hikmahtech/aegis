@@ -216,6 +216,7 @@ export const api = {
   syncPostizAccounts: () => apiFetch<{ synced: number; skipped_disabled: number }>(
     '/api/admin/social/postiz/sync', { method: 'POST' },
   ),
+  listSocialPosts: (days = 14) => apiFetch<any[]>(`/api/admin/social/posts?days=${days}`),
   getIntegrations: () => apiFetch<any[]>('/api/admin/integrations/config'),
   saveIntegration: (key: string, value: string) =>
     apiFetch<any[]>('/api/admin/integrations/config', { method: 'PUT', body: JSON.stringify({ key, value }) }),

@@ -59,6 +59,13 @@ function ConfigFields({ value, onChange }: { value: any; onChange: (v: any) => v
   );
 }
 
+// Compact "label: total" summary of a post's cached analytics series — the
+// admin table shows one line rather than a column per possible metric.
+function seriesSummary(series: any): string {
+  if (!series || typeof series !== 'object' || Object.keys(series).length === 0) return '—';
+  return Object.entries(series).map(([k, v]) => `${k}: ${v}`).join(', ');
+}
+
 function FlowRow({ act, onSaved, onError }: { act: any; onSaved: (m: string) => void; onError: (e: Error) => void }) {
   const [active, setActive] = useState<boolean>(act.active);
   const [cron, setCron] = useState<string>(act.schedule_cron || '');
@@ -111,6 +118,7 @@ export default function Flows() {
   const [socialAccounts, setSocialAccounts] = useState<any[]>([]);
   const [newSocialLabel, setNewSocialLabel] = useState('');
   const [syncingPostiz, setSyncingPostiz] = useState(false);
+  const [socialPosts, setSocialPosts] = useState<any[]>([]);
 
   // Kick off Google consent for a brand-new account label. The reauth backend is
   // label-agnostic and writes config/{label}.json on callback, after which the
@@ -151,6 +159,7 @@ export default function Flows() {
       const gs = await api.getGoogleOauth();
       setGStatus(gs); setGClientId(gs.client_id || '');
       setSocialAccounts(await api.listSocialAccounts());
+      setSocialPosts(await api.listSocialPosts());
     } catch (e: any) { setError(e); }
   }
   useEffect(() => { load(); /* eslint-disable-next-line */ }, []);
@@ -268,6 +277,40 @@ export default function Flows() {
               </tr>
             ))}
             {socialAccounts.length === 0 && <tr><td colSpan={7}>No social accounts configured.</td></tr>}
+          </tbody>
+        </table></div>
+
+        <h3 style={{ marginTop: 24 }}>Recent posts</h3>
+        <p className="page-subtitle">
+          Last 14 days of <code>social_outbox</code> rows. State/link/series come from the daily
+          Postiz analytics refresh (<code>SocialMetricsFlow</code>) and stay blank until the first
+          pass runs for a post.
+        </p>
+        <div className="table-scroll"><table style={{ width: '100%' }}>
+          <thead><tr>
+            <th style={{ textAlign: 'left' }}>Platform</th><th style={{ textAlign: 'left' }}>Text</th>
+            <th>Status</th><th>State</th><th style={{ textAlign: 'left' }}>Likes/series</th>
+            <th>Published</th><th>Metrics refreshed</th>
+          </tr></thead>
+          <tbody>
+            {socialPosts.map(p => (
+              <tr key={p.id}>
+                <td><strong>{p.platform}</strong><br /><span style={{ fontSize: 11, color: 'var(--text-muted)' }}>{p.label}</span></td>
+                <td style={{ fontSize: 12 }}>{p.text || '—'}</td>
+                <td style={{ textAlign: 'center' }}>{p.status}</td>
+                <td style={{ textAlign: 'center' }}>{p.state || '—'}</td>
+                <td style={{ fontSize: 11 }}>{seriesSummary(p.series)}</td>
+                <td style={{ textAlign: 'center' }}>
+                  {p.release_url
+                    ? <a href={p.release_url} target="_blank" rel="noreferrer">open ↗</a>
+                    : '—'}
+                </td>
+                <td style={{ textAlign: 'center', fontSize: 11, color: 'var(--text-muted)' }}>
+                  {(p.metrics_at || '—').toString().slice(0, 16)}
+                </td>
+              </tr>
+            ))}
+            {socialPosts.length === 0 && <tr><td colSpan={7}>No posts yet.</td></tr>}
           </tbody>
         </table></div>
       </div>

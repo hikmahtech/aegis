@@ -83,3 +83,28 @@ def test_social_publish_flow_in_schedule_map():
     )
     assert config.agent_id == "sebas"
     assert config.lookahead_minutes == 15
+
+
+def test_social_metrics_flow_registered():
+    from aegis_worker.flows.social_metrics import SocialMetricsFlow
+
+    assert SocialMetricsFlow in worker_main.WORKFLOWS, (
+        "SocialMetricsFlow must be registered in worker/__main__.py WORKFLOWS list"
+    )
+
+
+def test_refresh_post_metrics_activity_registered():
+    assert "refresh_post_metrics" in _activity_names(), (
+        "SocialActivities.refresh_post_metrics must be in __main__.ACTIVITIES list"
+    )
+
+
+def test_social_metrics_flow_in_schedule_map():
+    from aegis_worker.schedule_sync import _ACTIVITY_TYPE_MAP
+
+    assert "SocialMetricsFlow" in _ACTIVITY_TYPE_MAP
+    _cls, config = _ACTIVITY_TYPE_MAP["SocialMetricsFlow"](
+        {"agent_id": "sebas", "config": {"window_days": 21}}
+    )
+    assert config.agent_id == "sebas"
+    assert config.window_days == 21

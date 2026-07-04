@@ -69,6 +69,28 @@ Postiz owns delivery from there.
   `settings.__type` = the account's `platform` (must equal the integration's Postiz
   `identifier`).
 
+### Metrics
+
+`SocialMetricsFlow` (daily, `worker/src/aegis_worker/flows/social_metrics.py`) pulls
+Postiz analytics for recently-posted, Postiz-routed `social_outbox` rows and caches
+them on the row:
+
+- **What's stored:** `social_outbox.metrics` (jsonb) — `state` (Postiz's QUEUE /
+  PUBLISHED / ERROR / DRAFT, from `GET /posts`), `release_url` (`releaseURL`),
+  `publish_date`, and `series` (each analytics label lowercased → its latest total,
+  e.g. `{"likes": 150, "comments": 3}`, from `GET /analytics/post/{postId}`) — plus
+  `metrics_at`, the refresh timestamp. A fresh post with no analytics yet gets an
+  empty `series`; a failed per-post analytics call is logged and skipped without
+  blocking the rest of the batch.
+- **Admin:** the Flows & Integrations page's Social accounts card has a "Recent
+  posts" table (`GET /api/admin/social/posts?days=14`) showing platform, text,
+  status, state, series summary, a "open ↗" link to `release_url`, and when metrics
+  were last refreshed.
+- **Knobs:** `window_days` (default 14, seed slug `social-metrics-daily`, 03:30 UTC
+  = 09:00 IST) controls both how far back `find`-eligible outbox rows go and the
+  `GET /posts` lookup window. No gate on `social_publishing_enabled` — refreshing
+  metrics on already-posted rows is harmless even while publishing is off.
+
 ## What it does (target behavior)
 
 1. You create a Todoist task: content = the post text, description = link/long text,

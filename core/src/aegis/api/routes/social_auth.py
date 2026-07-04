@@ -180,6 +180,50 @@ async def list_accounts(request: Request):
     ]
 
 
+@router.get("/posts")
+async def list_posts(request: Request, days: int = Query(default=14)):
+    """Recent social_outbox rows for the admin panel — never returns token values.
+
+    `state`/`release_url`/`series` come from the cached `metrics` jsonb
+    (populated by the daily SocialMetricsFlow); `metrics` itself stays empty
+    until the first refresh pass runs for a given row.
+    """
+    rows = await request.app.state.db_pool.fetch(
+        """
+        SELECT o.id, a.platform, a.label, o.payload, o.status, o.posted_ref,
+               o.metrics, o.metrics_at, o.created_at
+        FROM social_outbox o
+        JOIN social_accounts a ON a.id = o.account_id
+        WHERE o.created_at > now() - make_interval(days => $1)
+        ORDER BY o.created_at DESC
+        LIMIT 50
+        """,
+        days,
+    )
+    posts = []
+    for r in rows:
+        payload = r["payload"] or {}
+        metrics = r["metrics"] or {}
+        text = (payload.get("text") or "").strip()
+        posts.append(
+            {
+                "id": r["id"],
+                "platform": r["platform"],
+                "label": r["label"],
+                "text": text[:120],
+                "status": r["status"],
+                "posted_ref": r["posted_ref"],
+                "schedule_at": payload.get("schedule_at"),
+                "state": metrics.get("state"),
+                "release_url": metrics.get("release_url"),
+                "series": metrics.get("series") or {},
+                "metrics_at": r["metrics_at"].isoformat() if r["metrics_at"] else None,
+                "created_at": r["created_at"].isoformat() if r["created_at"] else None,
+            }
+        )
+    return posts
+
+
 def _slugify_label(name: str) -> str:
     slug = re.sub(r"[^a-z0-9_-]+", "-", (name or "").strip().lower())
     return slug.strip("-")

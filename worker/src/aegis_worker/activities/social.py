@@ -10,6 +10,7 @@ safety net for anything the hook attempt left behind.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import asyncpg
@@ -336,3 +337,83 @@ class SocialActivities:
             "social_approval_no_action interaction_id=%s choice=%s", interaction_id, choice
         )
         return {"applied": "none"}
+
+    @activity.defn
+    async def refresh_post_metrics(self, window_days: int = 14) -> dict:
+        """Pull Postiz analytics for recently-posted rows into social_outbox.metrics.
+
+        Only Postiz-routed accounts are touched (native X posts have no
+        equivalent analytics call here). Harmless when
+        social_publishing_enabled is false — this only refreshes metrics on
+        rows that are ALREADY posted, it doesn't gate on the publishing kill
+        switch, so SocialMetricsFlow needs no such gate either.
+        """
+        if self.db_pool is None or self.connector is None:
+            return {"refreshed": 0, "failed": 0}
+
+        now = datetime.now(UTC)
+        posts_by_ref: dict[str, dict] = {}
+        try:
+            posts = await self.connector.list_posts_window(
+                (now - timedelta(days=window_days)).isoformat(),
+                (now + timedelta(days=1)).isoformat(),
+            )
+            for p in posts:
+                pid = str(p.get("id") or "")
+                if not pid:
+                    continue
+                posts_by_ref[pid] = {
+                    "state": p.get("state"),
+                    "release_url": p.get("releaseURL"),
+                    "publish_date": p.get("publishDate"),
+                }
+        except Exception as exc:  # noqa: BLE001 — per-post analytics is the core
+            # value; a failed list call just means state/release_url stay
+            # unknown for this pass, not that we skip the pass entirely.
+            activity.logger.warning("social_list_posts_window_failed err=%s", str(exc)[:200])
+
+        rows = await self.db_pool.fetch(
+            """
+            SELECT o.id, o.posted_ref
+            FROM social_outbox o
+            JOIN social_accounts a ON a.id = o.account_id
+            WHERE o.status = 'posted'
+              AND o.posted_ref IS NOT NULL
+              AND o.created_at > now() - make_interval(days => $1)
+              AND a.meta ? 'postiz_integration_id'
+            ORDER BY o.created_at DESC
+            LIMIT 50
+            """,
+            window_days,
+        )
+
+        refreshed = failed = 0
+        for r in rows:
+            post_ref = r["posted_ref"]
+            try:
+                analytics = await self.connector.get_post_metrics(post_ref)
+                info = posts_by_ref.get(str(post_ref), {})
+                metrics = {
+                    "state": info.get("state") or "unknown",
+                    "release_url": info.get("release_url"),
+                    "publish_date": info.get("publish_date"),
+                    "series": analytics.get("series", {}),
+                }
+                await self.db_pool.execute(
+                    "UPDATE social_outbox SET metrics = $1, metrics_at = now() WHERE id = $2",
+                    metrics,
+                    r["id"],
+                )
+                refreshed += 1
+            except Exception as exc:  # noqa: BLE001 — one bad row must not block the rest
+                failed += 1
+                activity.logger.warning(
+                    "social_refresh_post_metrics_failed id=%s posted_ref=%s err=%s",
+                    r["id"],
+                    post_ref,
+                    str(exc)[:200],
+                )
+        activity.logger.info(
+            "social_refresh_post_metrics refreshed=%d failed=%d", refreshed, failed
+        )
+        return {"refreshed": refreshed, "failed": failed}
