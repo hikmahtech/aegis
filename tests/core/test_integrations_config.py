@@ -62,3 +62,23 @@ async def test_non_secret_value_shown(clean_int):
 async def test_unknown_key_raises(clean_int):
     with pytest.raises(ValueError):
         await save_integration(clean_int, _settings(), "not_a_key", "x")
+
+
+async def test_boolean_flag_overlay_coerces_and_overrides_env(clean_int):
+    # env says enabled, DB says "false" → overlay must yield a real bool False.
+    s = _settings(homelab_enabled=True)
+    await save_integration(clean_int, s, "homelab_enabled", "false")
+    await apply_config_overrides(s, clean_int)
+    assert s.homelab_enabled is False
+    # flip on
+    await save_integration(clean_int, s, "homelab_enabled", "true")
+    await apply_config_overrides(s, clean_int)
+    assert s.homelab_enabled is True
+
+
+async def test_boolean_flag_get_state(clean_int):
+    s = _settings()
+    await save_integration(clean_int, s, "tts_enabled", "true")
+    items = await get_integrations(clean_int, s)
+    t = next(i for i in items if i["key"] == "tts_enabled")
+    assert t["boolean"] is True and t["value"] is True and t["source"] == "db"
