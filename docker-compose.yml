@@ -91,7 +91,6 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-aegis_dev}
     volumes:
       - postgres-data:/var/lib/postgresql/data
-      - ./deploy/init-extra-dbs.sh:/docker-entrypoint-initdb.d/init-extra-dbs.sh:ro
     ports:
       - "25432:5432"
     healthcheck:

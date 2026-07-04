@@ -92,7 +92,7 @@ bump_watermark = bool(
 )
 ```
 
-The pandora carve-out: when `spawn_kind == "pandora_investigation"` and `applied=False` (typically a non-retryable rejection from a stale projection), the spawn is skipped in `flows/clarify.py:147-151`. Bumping the watermark there would silently consume the user's followup comment and never re-investigate. Migration 016 was added to repair watermarks poisoned by the original unconditional bump.
+The pandora carve-out: when `spawn_kind == "pandora_investigation"` and `applied=False` (typically a non-retryable rejection from a stale projection), the spawn is skipped in `flows/clarify.py:147-151`. Bumping the watermark there would silently consume the user's followup comment and never re-investigate. A one-time watermark repair (folded into `001_baseline.sql`) fixed watermarks poisoned by the original unconditional bump.
 
 ## 6. Settings invariants
 
@@ -104,12 +104,12 @@ These settings rows are seeded by migrations 011 + 012 and are read by the GTD p
 | `todoist_managed_project_ids` | runtime | `{}` | Created by `bootstrap_if_empty`; maps `inbox / reference / someday / projects / ...` keys to Todoist project ids |
 | `gtd_clarify_enabled` | 012 | `true` | Kill switch for `ClarifyFlow.find_unclassified_items` |
 | `gtd_2min_rule_enabled` | 012 | `true` | Gate for the 2-min in-window comms card spawn (Slack) |
-| `user_timezone` | 012 | `UTC` | Used by the in-window check for the 2-min rule |
+| `user_timezone` | 001 | `Asia/Kolkata` | Used by the in-window check for the 2-min rule |
 
 The worker bootstrap at `worker/.../__main__.py` logs a `todoist_settings_missing` warning if any of these keys are absent at boot — flags a failed migration before the silent defaults engage.
 
 ## 7. Label projection
 
-The `todoist_labels` projection had a `UNIQUE(name)` index until migration 018. The unique constraint was a sync-token poison pill: a Todoist delta containing a rename collision (label A id=X name="Old" already in our projection; label B id=Y name="Old" arrives in the same diff) made the `INSERT ... ON CONFLICT (id) DO UPDATE` violate the name-unique index because the INSERT path matches by id, not name. The transaction aborted, sync_token never advanced, and every subsequent tick re-polled the same poison diff.
+The `todoist_labels` projection has no `UNIQUE(name)` index (an earlier one was dropped, folded into `001_baseline.sql`). Such a unique constraint was a sync-token poison pill: a Todoist delta containing a rename collision (label A id=X name="Old" already in our projection; label B id=Y name="Old" arrives in the same diff) made the `INSERT ... ON CONFLICT (id) DO UPDATE` violate the name-unique index because the INSERT path matches by id, not name. The transaction aborted, sync_token never advanced, and every subsequent tick re-polled the same poison diff.
 
 No runtime code reads `todoist_labels` by name (the seed loader uses ids; chat-tool reads come off the `todoist_tasks.labels` text-array column), so dropping the index is safe. Migration 018 drops it. The defensive empty-name skip in `apply_sync_diff:194` remains in place.
