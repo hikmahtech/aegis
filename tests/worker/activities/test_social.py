@@ -104,7 +104,10 @@ async def _seed_task(
     content: str = "hello world",
     description: str = "",
 ):
-    raw = {"due": {"datetime": due_datetime}} if due_datetime else {}
+    # Sync-API shape: a timed due lives in due.date ("YYYY-MM-DDTHH:MM:SS",
+    # "...Z" for fixed-tz dues). due.datetime is the REST-API shape, covered
+    # separately by test_find_due_posts_rest_api_datetime_fallback.
+    raw = {"due": {"date": due_datetime, "timezone": None}} if due_datetime else {}
     await pool.execute(
         "INSERT INTO todoist_tasks (id, content, description, due_date, labels, raw) "
         "VALUES ($1, $2, $3, $4, $5, $6)",
@@ -214,6 +217,22 @@ async def test_find_due_posts_selects_due_and_skips_rest(social_env):
     # post_at is the resolved due time (ISO, aware) — Postiz scheduling uses it.
     resolved = datetime.fromisoformat(by_id["soctest-due"]["post_at"])
     assert abs((resolved - (now - timedelta(minutes=5))).total_seconds()) < 60
+
+
+async def test_find_due_posts_rest_api_datetime_fallback(social_env):
+    """Rows whose raw due carries the REST-API `datetime` key (instead of the
+    Sync API's timed `date`) must still resolve a post_at."""
+    past = (datetime.now(UTC) - timedelta(minutes=5)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    await social_env.execute(
+        "INSERT INTO todoist_tasks (id, content, labels, raw) VALUES ($1, $2, $3, $4)",
+        "soctest-restshape",
+        "rest shape",
+        ["publish", "x"],
+        {"due": {"datetime": past}},
+    )
+    act = SocialActivities(db_pool=social_env)
+    due = await ActivityEnvironment().run(act.find_due_posts, 10, 9)
+    assert [d["task_id"] for d in due] == ["soctest-restshape"]
 
 
 # ------------------------------------------------------- enqueue / drain / complete
