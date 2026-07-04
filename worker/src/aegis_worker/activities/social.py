@@ -269,6 +269,41 @@ class SocialActivities:
         activity.logger.info("social_unpublish_task task_id=%s", task_id)
         return {"unpublished": True}
 
+    async def _current_post_at(self, task_id: str) -> str:
+        """The task's CURRENT mirrored due time, at approval time.
+
+        The card's metadata snapshots post_at at card-creation; the due can
+        move afterwards (user reschedule, or the sync flow landing the update
+        a beat after the same-instant social tick). Approval is the moment
+        that matters — re-read the mirror and prefer it over the snapshot.
+        """
+        if self.db_pool is None:
+            return ""
+        user_tz = await self._setting("user_timezone", "UTC")
+        if not isinstance(user_tz, str) or not user_tz:
+            user_tz = "UTC"
+        val = await self.db_pool.fetchval(
+            """
+            SELECT CASE
+              WHEN d.due_dt IS NOT NULL THEN
+                CASE WHEN d.due_dt LIKE '%Z' THEN d.due_dt::timestamptz
+                     ELSE (d.due_dt::timestamp AT TIME ZONE $2) END
+            END
+            FROM todoist_tasks t
+            CROSS JOIN LATERAL (
+              SELECT COALESCE(
+                       t.raw->'due'->>'datetime',
+                       CASE WHEN t.raw->'due'->>'date' LIKE '%T%'
+                            THEN t.raw->'due'->>'date' END
+                     ) AS due_dt
+            ) d
+            WHERE t.id = $1
+            """,
+            task_id,
+            user_tz,
+        )
+        return val.isoformat() if val else ""
+
     @activity.defn
     async def apply_social_approval(
         self, interaction_id: str, response: dict, metadata: dict
@@ -289,7 +324,7 @@ class SocialActivities:
                 list(metadata.get("platforms") or []),
                 str(metadata.get("text") or ""),
                 str(metadata.get("link") or ""),
-                str(metadata.get("post_at") or ""),
+                await self._current_post_at(task_id) or str(metadata.get("post_at") or ""),
             )
             await self.drain_social_outbox()
             await self.complete_posted_tasks()
