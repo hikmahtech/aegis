@@ -380,7 +380,7 @@ class ClarifyFlow:
                             await workflow.start_child_workflow(
                                 InteractionFlow.run,
                                 InteractionFlowInput(
-                                    agent_id="sebas",
+                                    agent_id=config.agent_id,
                                     kind="choice",
                                     origin=f"gtd_clarify_{payload['flavor']}",
                                     prompt=payload["prompt"],

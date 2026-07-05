@@ -278,7 +278,15 @@ async def stub_create_github_pr(inp) -> dict:
     return {"pr_url": "", "status": "opened", "error": ""}
 
 
+@activity.defn(name="resolve_agents")
+async def stub_resolve_agents(tags):
+    # Seed mapping — infra → pandoras-actor (behavior unchanged).
+    seed = {"finance": "maou", "infra": "pandoras-actor", "gtd": "sebas", "research": "raphael"}
+    return {t: seed.get(t) for t in tags}
+
+
 ALL_ACTIVITIES = [
+    stub_resolve_agents,
     stub_check_alert_mute,
     stub_write_alert_mute,
     stub_check_dedup,

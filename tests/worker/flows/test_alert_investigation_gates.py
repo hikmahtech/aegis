@@ -258,7 +258,15 @@ async def stub_create_github_pr(inp) -> dict:
     return {"pr_url": "https://github.com/test/repo/pull/1", "status": "opened", "error": ""}
 
 
+@activity.defn(name="resolve_agents")
+async def stub_resolve_agents(tags):
+    # Seed mapping: infra → pandoras-actor, so behavior is unchanged. Imported
+    # by the verdict/claude-fallback tests via ALL_STUBS.
+    return {t: {"infra": "pandoras-actor"}.get(t) for t in tags}
+
+
 ALL_STUBS = [
+    stub_resolve_agents,
     stub_check_alert_mute,
     stub_write_alert_mute,
     stub_check_dedup,

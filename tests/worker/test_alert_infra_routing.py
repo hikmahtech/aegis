@@ -186,12 +186,11 @@ def mock_db_pool():
 async def test_resolve_infra_resource_found(mock_db_pool):
     """Returns infra-gitops resource when row exists."""
     import json
+
     mock_db_pool.fetchrow.return_value = {
         "id": "aaaabbbb-cccc-dddd-eeee-111122223333",
         "title": "infra-gitops",
-        "metadata": json.dumps(
-            {"path": "infra-gitops", "github_repo": "example/infra-gitops"}
-        ),
+        "metadata": json.dumps({"path": "infra-gitops", "github_repo": "example/infra-gitops"}),
     }
     activities = AlertActivities(db_pool=mock_db_pool)
     env = ActivityEnvironment()
@@ -398,7 +397,7 @@ async def _stub_send_system_event(msg: str) -> None:
 async def _stub_send_message(
     agent_id: str, msg: str, chat_id: int, reply_markup: dict | None = None
 ) -> None:
-    pass
+    _flow_state.setdefault("sends", []).append(agent_id)
 
 
 @activity.defn(name="check_alert_mute")
@@ -463,6 +462,7 @@ async def _stub_send_card(
     options,
     allow_hint: bool = False,
 ) -> dict:
+    _flow_state.setdefault("card_agents", []).append(agent_id)
     return {"ok": True, "message_id": 1}
 
 
@@ -481,7 +481,16 @@ async def _stub_apply_timeout(inp: ApplyTimeoutInput) -> None:
     return None
 
 
+@activity.defn(name="resolve_agents")
+async def _stub_resolve_agents(tags):
+    # Default seed mapping (infra → pandoras-actor); a test can override the
+    # resolution via _flow_state["infra_map"] (e.g. {} for the no-holder case).
+    mapping = _flow_state.get("infra_map", {"infra": "pandoras-actor"})
+    return {t: mapping.get(t) for t in tags}
+
+
 _ALL_FLOW_ACTIVITIES = [
+    _stub_resolve_agents,
     _stub_check_alert_mute,
     _stub_write_alert_mute,
     _stub_check_dedup,
@@ -636,3 +645,60 @@ async def test_app_alert_still_uses_llm_resolve():
 
     assert _flow_state.get("resolve_alert_resource_called") is True
     assert _flow_state.get("resolve_infra_called") is not True
+
+
+# ── Issue #36: infra behavior-tag resolution (replaces the _PANDORA literal) ──
+
+
+async def test_no_infra_agent_skips_investigation():
+    """When no active agent holds the `infra` tag, the flow skips cleanly
+    instead of driving the pipeline as a hardcoded 'pandoras-actor'."""
+    _reset_flow(infra_map={})
+    async with (
+        await WorkflowEnvironment.start_time_skipping() as env,
+        Worker(
+            env.client,
+            task_queue="test-noinfra-q",
+            workflows=[AlertInvestigationFlow, InteractionFlow],
+            activities=_ALL_FLOW_ACTIVITIES,
+        ),
+    ):
+        result = await env.client.execute_workflow(
+            AlertInvestigationFlow.run,
+            _make_infra_alert(),
+            id="test-no-infra-agent-skip",
+            task_queue="test-noinfra-q",
+        )
+
+    assert result["status"] == "skipped_no_infra_agent"
+    # Nothing was investigated or delivered.
+    assert _flow_state.get("run_investigation_called") is not True
+    assert _flow_state.get("sends", []) == []
+
+
+async def test_custom_infra_agent_receives_delivery():
+    """A renamed infra agent (not 'pandoras-actor') owns the pipeline: all
+    chat delivery is addressed to whichever id holds the `infra` tag."""
+    _reset_flow(infra_map={"infra": "custom-ops"})
+    async with (
+        await WorkflowEnvironment.start_time_skipping() as env,
+        Worker(
+            env.client,
+            task_queue="test-custominfra-q",
+            workflows=[AlertInvestigationFlow, InteractionFlow],
+            activities=_ALL_FLOW_ACTIVITIES,
+        ),
+    ):
+        await env.client.execute_workflow(
+            AlertInvestigationFlow.run,
+            _make_infra_alert(),
+            id="test-custom-infra-agent",
+            task_queue="test-custominfra-q",
+        )
+
+    # Every agent-addressed action (chat sends + interaction cards) goes to the
+    # resolved infra agent, never the old 'pandoras-actor' literal.
+    addressed = _flow_state.get("sends", []) + _flow_state.get("card_agents", [])
+    assert addressed, "expected at least one agent-addressed action"
+    assert all(a == "custom-ops" for a in addressed)
+    assert "pandoras-actor" not in addressed

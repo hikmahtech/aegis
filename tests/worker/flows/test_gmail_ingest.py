@@ -180,7 +180,15 @@ async def stub_send_system_event(message: str, chat_id: int = 0) -> dict:
     return {"ok": True}
 
 
+@activity.defn(name="resolve_agents")
+async def stub_resolve_agents(tags):
+    # Seed mapping — finance → maou, so the money fan-out still targets maou.
+    seed = {"finance": "maou", "infra": "pandoras-actor", "gtd": "sebas", "research": "raphael"}
+    return {t: seed.get(t) for t in tags}
+
+
 ALL_STUBS = [
+    stub_resolve_agents,
     stub_list,
     stub_fetch,
     stub_classify,
@@ -606,6 +614,7 @@ async def test_financial_tags_trigger_money_process_fanout():
     _reset()
 
     stubs = [
+        stub_resolve_agents,
         stub_list,
         stub_fetch_receipt,
         stub_classify_financial,

@@ -36,6 +36,7 @@ class WeeklyReviewConfig:
 
 
 async def _spawn_review_interaction(
+    agent_id: str,
     kind: str,
     preview: str,
     parent_id: str,
@@ -55,7 +56,7 @@ async def _spawn_review_interaction(
         await workflow.start_child_workflow(
             InteractionFlow.run,
             InteractionFlowInput(
-                agent_id="sebas",
+                agent_id=agent_id,
                 kind="choice",
                 origin=f"gtd_{kind}_review",
                 # Cap the prompt — chat channels have their own length limits, and the
@@ -97,7 +98,7 @@ class DailyReviewFlow:
             try:
                 await workflow.execute_activity_method(
                     DeliveryActivities.send_message,
-                    args=["sebas", preview],
+                    args=[config.agent_id, preview],
                     start_to_close_timeout=TIMEOUT_FAST,
                     retry_policy=NO_RETRY,
                 )
@@ -114,7 +115,7 @@ class DailyReviewFlow:
                 )
                 await workflow.execute_activity_method(
                     DeliveryActivities.send_message,
-                    args=["sebas", format_today_focus(focus)],
+                    args=[config.agent_id, format_today_focus(focus)],
                     start_to_close_timeout=TIMEOUT_FAST,
                     retry_policy=NO_RETRY,
                 )
@@ -124,7 +125,7 @@ class DailyReviewFlow:
                 )
             step = "spawn_review_interaction"
             interaction_id = await _spawn_review_interaction(
-                "daily", preview, workflow.info().workflow_id
+                config.agent_id, "daily", preview, workflow.info().workflow_id
             )
             step = "log_review_digest"
             await workflow.execute_activity_method(
@@ -143,7 +144,9 @@ class DailyReviewFlow:
         return {"kind": "daily", "counts": digest, "interaction_id": interaction_id}
 
 
-async def _spawn_decision_card(decision: dict, parent_id: str, idx: int) -> bool:
+async def _spawn_decision_card(
+    agent_id: str, decision: dict, parent_id: str, idx: int
+) -> bool:
     """Spawn one abandoned InteractionFlow decision card. Returns True on
     successful spawn. apply_review_decision applies the tapped choice."""
     child_id = f"gtd-weekly-decision-{parent_id}-{idx}"
@@ -151,7 +154,7 @@ async def _spawn_decision_card(decision: dict, parent_id: str, idx: int) -> bool
         await workflow.start_child_workflow(
             InteractionFlow.run,
             InteractionFlowInput(
-                agent_id="sebas",
+                agent_id=agent_id,
                 kind="choice",
                 origin="gtd_weekly_decision",
                 prompt=str(decision.get("prompt") or "")[:600],
@@ -201,7 +204,7 @@ class WeeklyReviewFlow:
             try:
                 await workflow.execute_activity_method(
                     DeliveryActivities.send_message,
-                    args=["sebas", narrative],
+                    args=[config.agent_id, narrative],
                     start_to_close_timeout=TIMEOUT_FAST,
                     retry_policy=NO_RETRY,
                 )
@@ -212,7 +215,7 @@ class WeeklyReviewFlow:
             step = "spawn_decisions"
             for i, decision in enumerate(decisions):
                 if await _spawn_decision_card(
-                    decision, workflow.info().workflow_id, i
+                    config.agent_id, decision, workflow.info().workflow_id, i
                 ):
                     spawned += 1
             step = "log_review_digest"

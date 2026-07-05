@@ -41,6 +41,7 @@ with workflow.unsafe.imports_passed_through():
     from aegis.personalities import voice_line
 
     from aegis_worker.activities.active_work import ActiveWorkActivities
+    from aegis_worker.activities.agent_registry import AgentRegistryActivities
     from aegis_worker.activities.alert_governance import (
         AlertGovernanceActivities,
         CheckMuteInput,
@@ -67,7 +68,9 @@ with workflow.unsafe.imports_passed_through():
         TIMEOUT_STANDARD,
     )
 
-_PANDORA = "pandoras-actor"
+# The investigation pipeline is owned by whichever agent holds the `infra`
+# behavior tag (issue #36), resolved once per run() — no literal id. With the
+# default seeds that resolves to `pandoras-actor`, so behavior is unchanged.
 _MAX_HINT_ROUNDS = 3
 
 
@@ -130,9 +133,7 @@ def _build_repo_confirm_prompt(
         lines.append("")
         for i, c in enumerate(candidates):
             friendly = (c.get("resource_title") or c.get("label") or "").strip()
-            ident = (
-                c.get("github_repo") or c.get("resource_path") or c.get("label") or ""
-            ).strip()
+            ident = (c.get("github_repo") or c.get("resource_path") or c.get("label") or "").strip()
             score = float(c.get("score") or 0.0)
             strength = (
                 "strong match"
@@ -313,6 +314,21 @@ class AlertInvestigationFlow:
         fingerprint = alert.get("fingerprint", "")
         severity = alert.get("severity", "unknown")
         source = alert.get("source", "unknown")
+
+        # Owner of the alert pipeline = whoever holds the `infra` behavior tag
+        # (issue #36). Every delivery/attribution/child-interaction below is
+        # addressed to this agent instead of a literal id. No infra agent =>
+        # no channel to drive the confirm/approve steps, so skip cleanly.
+        resolved = await workflow.execute_activity_method(
+            AgentRegistryActivities.resolve_agents,
+            args=[["infra"]],
+            start_to_close_timeout=TIMEOUT_FAST,
+            retry_policy=NO_RETRY,
+        )
+        agent_id = resolved.get("infra")
+        if agent_id is None:
+            workflow.logger.warning("alert_investigation_skipped_no_infra_agent title=%s", title)
+            return {"status": "skipped_no_infra_agent", "task_id": None}
 
         workflow.logger.info("alert_investigation_starting title=%s severity=%s", title, severity)
         await self._safe_event(
@@ -501,7 +517,7 @@ class AlertInvestigationFlow:
                 )
                 await self._safe_post_note(
                     track_task_id or "",
-                    voice_line(_PANDORA, "investigation_self_resolved"),
+                    voice_line(agent_id, "investigation_self_resolved"),
                 )
                 try:
                     await workflow.execute_activity_method(
@@ -661,7 +677,7 @@ class AlertInvestigationFlow:
                     picked = await workflow.execute_child_workflow(
                         InteractionFlow.run,
                         InteractionFlowInput(
-                            agent_id="pandoras-actor",
+                            agent_id=agent_id,
                             kind="choice",
                             origin="alert_confirm_repo",
                             prompt=confirm_prompt,
@@ -683,7 +699,7 @@ class AlertInvestigationFlow:
                         round_n += 1
                         rel = await workflow.execute_activity_method(
                             AlertActivities.reresolve_with_hint,
-                            args=[alert, picked_val[len("hint:"):]],
+                            args=[alert, picked_val[len("hint:") :]],
                             start_to_close_timeout=TIMEOUT_STANDARD,
                             retry_policy=FAST,
                         )
@@ -691,7 +707,11 @@ class AlertInvestigationFlow:
                     if picked_val.isdigit() and int(picked_val) < len(top):
                         chosen_rid = top[int(picked_val)].get("resource_id") or ""
                         chosen_c = next(
-                            (c for c in (rel.get("candidates") or []) if c["resource_id"] == chosen_rid),
+                            (
+                                c
+                                for c in (rel.get("candidates") or [])
+                                if c["resource_id"] == chosen_rid
+                            ),
                             None,
                         )
                     break
@@ -740,7 +760,9 @@ class AlertInvestigationFlow:
         # never a false skip).
         guard_repo = ""
         if resources_list:
-            guard_repo = resources_list[0].get("github_repo") or resources_list[0].get("resource_path") or ""
+            guard_repo = (
+                resources_list[0].get("github_repo") or resources_list[0].get("resource_path") or ""
+            )
         if guard_repo and not _repo_from_human:
             aw = await self._safe_check_active_work(alert, guard_repo)
             if aw.get("active"):
@@ -773,7 +795,7 @@ class AlertInvestigationFlow:
         if track_task_id and not track_task_id.startswith("item-"):
             is_jira_src = source == "todoist-jira"
             start_event = "scoping_started" if is_jira_src else "investigation_started"
-            start_msg = voice_line(_PANDORA, start_event, resource=resource_title or "auto")
+            start_msg = voice_line(agent_id, start_event, resource=resource_title or "auto")
             await self._safe_post_note(track_task_id, start_msg)
 
         # ── Step 5: Gather knowledge context (runbook + prior incidents) ──
@@ -1096,7 +1118,7 @@ class AlertInvestigationFlow:
             g2 = await workflow.execute_child_workflow(
                 InteractionFlow.run,
                 InteractionFlowInput(
-                    agent_id="pandoras-actor",
+                    agent_id=agent_id,
                     kind="choice",
                     origin="alert_approve_pr",
                     prompt=prompt,
@@ -1129,7 +1151,7 @@ class AlertInvestigationFlow:
             if v2 == "discard":
                 await self._safe_post_note(
                     track_task_id or "",
-                    voice_line(_PANDORA, "fix_discarded"),
+                    voice_line(agent_id, "fix_discarded"),
                 )
                 # The discard branch returned without logging — meaning the
                 # alert never landed in audit_log, so a re-fire would not
@@ -1252,13 +1274,13 @@ class AlertInvestigationFlow:
                     links_html = "\n".join(
                         f"  • <a href='{u}'>{_html_escape(u)}</a>" for u in pr_urls
                     )
-                    voice_head = voice_line(_PANDORA, "pr_opened", count=n)
+                    voice_head = voice_line(agent_id, "pr_opened", count=n)
                     # _safe_send_message logs raised exceptions AND ok=false
                     # body returns (HTML parse, rate-limit, bot offline). The
                     # `_safe_event` below is the operator-visible fallback so
                     # we don't entirely lose the signal.
                     await self._safe_send_message(
-                        agent_id=_PANDORA,
+                        agent_id=agent_id,
                         message=f"<b>{_html_escape(voice_head)}</b>\n{links_html}",
                         log_event="pr_opened_notify_failed",
                     )
@@ -1344,15 +1366,15 @@ class AlertInvestigationFlow:
             # Map (kind, final_status) → voice event key.
             kind_prefix = "scoping" if is_jira else "investigation"
             if final_status == "resolved":
-                final_msg = voice_line(_PANDORA, "investigation_self_resolved")
+                final_msg = voice_line(agent_id, "investigation_self_resolved")
             elif final_status == "not_actionable":
-                head = voice_line(_PANDORA, f"{kind_prefix}_not_actionable")
+                head = voice_line(agent_id, f"{kind_prefix}_not_actionable")
                 final_msg = f"{head}\n\nReason: {root_cause_full}"
             elif final_status == "inconclusive":
-                head = voice_line(_PANDORA, f"{kind_prefix}_inconclusive")
+                head = voice_line(agent_id, f"{kind_prefix}_inconclusive")
                 final_msg = head
             else:
-                head = voice_line(_PANDORA, f"{kind_prefix}_actionable")
+                head = voice_line(agent_id, f"{kind_prefix}_actionable")
                 head_with_partial = f"{head}{partial_suffix}" if partial_suffix else head
                 final_msg = (
                     f"{head_with_partial}\n\n"
@@ -1374,13 +1396,13 @@ class AlertInvestigationFlow:
         preview = _html_escape(preview_src[:160]) + ("…" if len(preview_src) > 160 else "")
 
         if final_status == "resolved":
-            head = _html_escape(voice_line(_PANDORA, "investigation_self_resolved"))
+            head = _html_escape(voice_line(agent_id, "investigation_self_resolved"))
         elif final_status == "not_actionable":
-            head = _html_escape(voice_line(_PANDORA, f"{kind_prefix}_not_actionable"))
+            head = _html_escape(voice_line(agent_id, f"{kind_prefix}_not_actionable"))
         elif final_status == "inconclusive":
-            head = _html_escape(voice_line(_PANDORA, f"{kind_prefix}_inconclusive"))
+            head = _html_escape(voice_line(agent_id, f"{kind_prefix}_inconclusive"))
         else:
-            head_raw = voice_line(_PANDORA, f"{kind_prefix}_actionable")
+            head_raw = voice_line(agent_id, f"{kind_prefix}_actionable")
             partial_label = " [partial]" if partial_suffix else ""
             head = _html_escape(f"{head_raw}{partial_label}")
 
@@ -1400,7 +1422,7 @@ class AlertInvestigationFlow:
             msg = f"{msg}\n\n<a href='{task_url}'>Full verdict on Todoist →</a>"
 
         await self._safe_send_message(
-            agent_id="pandoras-actor",
+            agent_id=agent_id,
             message=msg,
             log_event="alert_verdict_notify_failed",
         )
@@ -1414,7 +1436,7 @@ class AlertInvestigationFlow:
         try:
             await workflow.execute_activity_method(
                 DeliveryActivities.send_voice,
-                args=["pandoras-actor", voice_text],
+                args=[agent_id, voice_text],
                 start_to_close_timeout=TIMEOUT_FAST,
                 retry_policy=NO_RETRY,
             )

@@ -55,19 +55,14 @@ def _build_stubs(digest: dict, kind: str):
         return digest
 
     @activity.defn(name="send_message")
-    async def send_message(
-        agent_id: str, message: str, chat_id: int = 0, keyboard=None
-    ):
+    async def send_message(agent_id: str, message: str, chat_id: int = 0, keyboard=None):
         sent_messages.append(message)
         return {"ok": True}
 
     @activity.defn(name="log_review_digest")
-    async def log_review_digest(
-        kind: str, counts: dict, preview: str, interaction_id
-    ):
+    async def log_review_digest(kind: str, counts: dict, preview: str, interaction_id):
         log_calls.append(
-            {"kind": kind, "counts": counts, "preview": preview,
-             "interaction_id": interaction_id}
+            {"kind": kind, "counts": counts, "preview": preview, "interaction_id": interaction_id}
         )
         return 42
 
@@ -101,9 +96,17 @@ def _build_stubs(digest: dict, kind: str):
 
     return (
         [
-            gather_daily, gather_weekly, send_message, log_review_digest,
-            insert_interaction, send_card, update_msg, resolve, timeout,
-            apply_ack, gather_today_focus,
+            gather_daily,
+            gather_weekly,
+            send_message,
+            log_review_digest,
+            insert_interaction,
+            send_card,
+            update_msg,
+            resolve,
+            timeout,
+            apply_ack,
+            gather_today_focus,
         ],
         sent_messages,
         log_calls,
@@ -162,8 +165,9 @@ async def test_weekly_review_flow_sends_digest_and_logs() -> None:
 
     @activity.defn(name="log_review_digest")
     async def log_review_digest(kind: str, counts: dict, preview: str, interaction_id):
-        logs.append({"kind": kind, "counts": counts, "preview": preview,
-                     "interaction_id": interaction_id})
+        logs.append(
+            {"kind": kind, "counts": counts, "preview": preview, "interaction_id": interaction_id}
+        )
         return 42
 
     @activity.defn(name="insert_interaction")
@@ -197,8 +201,16 @@ async def test_weekly_review_flow_sends_digest_and_logs() -> None:
             task_queue="aegis-review-weekly-test",
             workflows=[WeeklyReviewFlow, InteractionFlow],
             activities=[
-                gather_weekly_state, frame_review, send_message, log_review_digest,
-                insert_interaction, send_card, update_msg, resolve, timeout, apply_dec,
+                gather_weekly_state,
+                frame_review,
+                send_message,
+                log_review_digest,
+                insert_interaction,
+                send_card,
+                update_msg,
+                resolve,
+                timeout,
+                apply_dec,
             ],
         ):
             result = await client.execute_workflow(
@@ -271,7 +283,15 @@ async def test_daily_review_flow_continues_when_delivery_fails() -> None:
             task_queue="aegis-review-tg-fail",
             workflows=[DailyReviewFlow, InteractionFlow],
             activities=[
-                gather, send_message, log, insert, card, upd, resolve, to, ack,
+                gather,
+                send_message,
+                log,
+                insert,
+                card,
+                upd,
+                resolve,
+                to,
+                ack,
                 gather_focus,
             ],
         ):
@@ -284,3 +304,86 @@ async def test_daily_review_flow_continues_when_delivery_fails() -> None:
             assert result["kind"] == "daily"
             assert len(log_calls) == 1
             assert log_calls[0]["kind"] == "daily"
+
+
+# ── Issue #36: review flows send as their own config.agent_id, not "sebas" ──
+
+
+@pytest.mark.asyncio
+async def test_daily_review_addresses_config_agent_id() -> None:
+    """DailyReviewFlow delivers as its owning agent (config.agent_id), so a
+    renamed GTD owner no longer sends everything as the literal 'sebas'."""
+    sent_agents: list[str] = []
+
+    @activity.defn(name="gather_daily_digest")
+    async def gather_daily():
+        return _stub_digest_daily()
+
+    @activity.defn(name="send_message")
+    async def send_message(agent_id: str, message: str, chat_id: int = 0, keyboard=None):
+        sent_agents.append(agent_id)
+        return {"ok": True}
+
+    @activity.defn(name="log_review_digest")
+    async def log_review_digest(kind, counts, preview, interaction_id):
+        return 42
+
+    @activity.defn(name="insert_interaction")
+    async def insert_interaction(input):
+        return {"interaction_id": "11111111-1111-1111-1111-111111111111"}
+
+    @activity.defn(name="send_interaction_card")
+    async def send_card(interaction_id, agent_id, kind, prompt, options, allow_hint=False):
+        sent_agents.append(agent_id)
+        return {"ok": True, "message_id": 0}
+
+    @activity.defn(name="update_interaction_message_id")
+    async def update_msg(*a, **kw):
+        return None
+
+    @activity.defn(name="resolve_interaction")
+    async def resolve(*a, **kw):
+        return {"already_resolved": False}
+
+    @activity.defn(name="apply_interaction_timeout")
+    async def timeout(*a, **kw):
+        return None
+
+    @activity.defn(name="apply_review_acknowledgement")
+    async def apply_ack(*a, **kw):
+        return {"acknowledged": True}
+
+    @activity.defn(name="gather_today_focus")
+    async def gather_today_focus():
+        return [{"task_id": "X", "content": "do x", "due_date": None}]
+
+    async with (
+        await WorkflowEnvironment.start_time_skipping() as env,
+        Worker(
+            env.client,
+            task_queue="aegis-review-agentid-test",
+            workflows=[DailyReviewFlow, InteractionFlow],
+            activities=[
+                gather_daily,
+                send_message,
+                log_review_digest,
+                insert_interaction,
+                send_card,
+                update_msg,
+                resolve,
+                timeout,
+                apply_ack,
+                gather_today_focus,
+            ],
+        ),
+    ):
+        await env.client.execute_workflow(
+            DailyReviewFlow.run,
+            DailyReviewConfig(agent_id="custom-gtd"),
+            id=f"daily-review-{uuid.uuid4()}",
+            task_queue="aegis-review-agentid-test",
+        )
+
+    assert sent_agents, "expected at least one agent-addressed action"
+    assert all(a == "custom-gtd" for a in sent_agents)
+    assert "sebas" not in sent_agents

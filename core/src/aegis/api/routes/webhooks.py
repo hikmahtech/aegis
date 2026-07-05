@@ -27,6 +27,7 @@ from aegis.api.deps import get_settings
 from aegis.api.routes.interactions import get_workflow_client
 from aegis.clarify_note import AGENT_REPLY_PREFIX, CLARIFY_NOTE_PREFIX
 from aegis.config import Settings
+from aegis.services.agents import resolve_tag
 
 logger = structlog.get_logger()
 
@@ -109,10 +110,15 @@ async def github_webhook(
 
     payload = _safe_json(body)
 
+    agent_id = await resolve_tag(pool, "infra")
+    if agent_id is None:
+        logger.warning("github_webhook_no_infra_agent", delivery_id=delivery_id)
+        return {"accepted": True, "skipped": "no_infra_agent", "delivery_id": delivery_id}
+
     handle = await temporal.start_workflow(
         "GitHubAlertFlow",
         {
-            "agent_id": "pandoras-actor",
+            "agent_id": agent_id,
             "event": x_github_event or "",
             "delivery_id": delivery_id,
             "payload": payload,
@@ -170,10 +176,15 @@ async def sentry_webhook(
         logger.info("sentry_webhook_duplicate_skipped", issue_id=issue_id)
         return {"accepted": True, "duplicate": True, "issue_id": issue_id}
 
+    agent_id = await resolve_tag(pool, "infra")
+    if agent_id is None:
+        logger.warning("sentry_webhook_no_infra_agent", issue_id=issue_id)
+        return {"accepted": True, "skipped": "no_infra_agent", "issue_id": issue_id}
+
     handle = await temporal.start_workflow(
         "SentryPollFlow",
         {
-            "agent_id": "pandoras-actor",
+            "agent_id": agent_id,
             "mode": "webhook",
             "issue": issue,
         },
@@ -365,18 +376,22 @@ async def todoist_webhook(
 
                     from temporalio.client import Client as _Client
 
-                    client = await _Client.connect(settings.temporal_host)
-                    await client.start_workflow(
-                        "ClarifyFlow",
-                        {
-                            "agent_id": "sebas",
-                            "max_items": 20,
-                            "activity_name": "gtd-clarify-webhook",
-                        },
-                        id=f"clarify-webhook-{_uuid.uuid4()}",
-                        task_queue="aegis-main",
-                        execution_timeout=_td(minutes=10),
-                    )
+                    gtd_agent = await resolve_tag(pool, "gtd")
+                    if gtd_agent is None:
+                        logger.warning("todoist_webhook_clarify_skipped_no_gtd_agent")
+                    else:
+                        client = await _Client.connect(settings.temporal_host)
+                        await client.start_workflow(
+                            "ClarifyFlow",
+                            {
+                                "agent_id": gtd_agent,
+                                "max_items": 20,
+                                "activity_name": "gtd-clarify-webhook",
+                            },
+                            id=f"clarify-webhook-{_uuid.uuid4()}",
+                            task_queue="aegis-main",
+                            execution_timeout=_td(minutes=10),
+                        )
                 except Exception as exc:
                     logger.warning(
                         "todoist_webhook_clarify_trigger_failed",

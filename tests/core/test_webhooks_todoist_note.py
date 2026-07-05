@@ -62,6 +62,9 @@ def _mock_pool(executed: list[tuple]):
 
     pool = MagicMock()
     pool.acquire = _acquire
+    # resolve_tag("gtd") → sebas (seed mapping), so the clarify trigger still
+    # fires with today's agent id.
+    pool.fetch = AsyncMock(return_value=[{"id": "sebas"}])
     return pool
 
 

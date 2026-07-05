@@ -60,6 +60,9 @@ def _mock_pool(fetchval_return=None):
 
     pool = MagicMock()
     pool.acquire = _acquire
+    # resolve_tag("infra") → pandoras-actor (seed mapping), so the workflow
+    # still starts with today's agent id.
+    pool.fetch = AsyncMock(return_value=[{"id": "pandoras-actor"}])
     return pool, conn
 
 
@@ -164,6 +167,18 @@ async def test_github_webhook_fallback_delivery_id_when_header_missing(github_cl
 
 @pytest_asyncio.fixture(loop_scope="function")
 async def github_client_real_db(db_pool, settings, temporal_stub):
+    # Ensure some active agent holds the `infra` tag so resolve_tag("infra")
+    # succeeds and the (non-duplicate) first delivery starts its workflow —
+    # independent of whatever the shared dev DB's seed agents carry.
+    await db_pool.execute(
+        """
+        INSERT INTO agents (id, name, role, system_prompt_path, capabilities,
+                            model_tier, metadata, active)
+        VALUES ('tagtest-webhook-infra', 'tagtest-webhook-infra', 'test', '',
+                '["infra"]'::jsonb, 'balanced', '{}'::jsonb, TRUE)
+        ON CONFLICT (id) DO NOTHING
+        """
+    )
     app = create_app(run_lifespan=False)
     app.state.db_pool = db_pool
     app.dependency_overrides[get_settings] = lambda: settings
@@ -175,6 +190,7 @@ async def github_client_real_db(db_pool, settings, temporal_stub):
         await conn.execute(
             "DELETE FROM ingest_idempotency WHERE source_type IN ('github', 'sentry')"
         )
+        await conn.execute("DELETE FROM agents WHERE id = 'tagtest-webhook-infra'")
 
 
 async def test_github_webhook_duplicate_delivery_returns_200_noop(github_client_real_db):
