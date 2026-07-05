@@ -105,6 +105,31 @@ imports each file into its kind *only when that kind has no DB row yet*. After
 that the DB owns the content — editing the files has no effect on an existing
 install. `AEGIS_PERSONALITY_DIR` overrides where the starter files are read from.
 
+### Agent behavior (tags, tools, routing)
+
+Behavior is data, not code (issue #36). An agent's `capabilities` (JSONB) holds
+its behavior tags — closed vocab `gtd` / `finance` / `research` / `infra` from
+`core/src/aegis/agent_tags.py` — and `metadata` (JSONB) holds routing knobs:
+`tool_set`, `intent_keywords`, `intent_description`, `mention_aliases`,
+`async_dispatch`, `knowledge_domains`, `voice_lines`. Flows/routes resolve *who
+does X* by tag (`services/agents.py::resolve_tag` in core, the
+`AgentRegistryActivities.resolve_agents` activity in the worker), never by a
+literal id.
+
+Edit all of this from the admin panel's agent detail **Behavior** tab
+(`PATCH /api/agents/{id}`; the tag/tool vocab comes from
+`GET /api/agents/meta/options`). `seed.py` treats `capabilities`/`metadata` as
+**DB-owned once non-empty** — `config/seed/agents.yaml` only seeds first boot and
+merges *new* metadata keys on upgrade, so UI edits survive restarts. Note: a new
+capability tag added to the yaml will **not** retroactively apply to an existing
+deployment — tick it in the Behavior tab once.
+
+**Adding a new agent:** create it (Agents page or `POST /api/agents`), write its
+persona, then check the capability tag(s) that describe its role and pick its tool
+set on the Behavior tab. No code changes — every tag-driven feature (GTD reviews,
+briefings, money processing, alerts, Slack @-addressing, chat routing) follows the
+tags automatically.
+
 ### Ingestion channels
 
 Channels (`email` / `rss` / `raindrop` ingestion sources) live in the `channels`
@@ -203,7 +228,7 @@ Kill switches:
 1. Add tool schema to `CHAT_TOOLS` list in `core/src/aegis/services/chat.py` (OpenAI function-calling format)
 2. Create executor function: `async def _exec_tool_name(pool, args, ctx: ToolContext) -> str`
 3. Add to `TOOL_EXECUTORS` dict
-4. Gate per-personality in `AGENT_TOOL_SETS` — Core's `_validate_agent_tool_sets` refuses to boot if a personality references a tool not in `CHAT_TOOLS`
+4. Grant it to agents via their `metadata.tool_set` — set it on the admin **Behavior** tab (runtime source of truth) and/or in `config/seed/agents.yaml`. The shipped `AGENT_TOOL_SETS` dict is now only a seed-time default for the four example agents; an agent's DB `metadata.tool_set` overrides it, and an unconfigured agent falls back to a small read-only `_FALLBACK_TOOL_SET` (not Sebas's full surface). `_validate_agent_tool_sets` refuses to boot on a tool name with no executor, and Core additionally warns at startup on any DB `metadata.tool_set` entry that references a missing executor.
 5. If the tool needs new connectors on `ToolContext`, add the field and wire it in `send_message()`
 6. Write tests in `tests/core/test_{tool_name}_tool.py`
 
