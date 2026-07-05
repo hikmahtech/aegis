@@ -21,13 +21,11 @@ from provision_slack_channels import DEFAULT_TARGET_MAP, provision
 # Helpers
 # ---------------------------------------------------------------------------
 
+
 def _make_list_response(*channel_names: str) -> dict:
     """Build a fake conversations_list response with the given channel names."""
     return {
-        "channels": [
-            {"name": name, "id": f"C_{name.upper()}"}
-            for name in channel_names
-        ],
+        "channels": [{"name": name, "id": f"C_{name.upper()}"} for name in channel_names],
         "response_metadata": {"next_cursor": ""},
     }
 
@@ -39,6 +37,7 @@ def _make_create_response(name: str) -> dict:
 # ---------------------------------------------------------------------------
 # Core behaviour tests
 # ---------------------------------------------------------------------------
+
 
 def test_provision_creates_missing_channels():
     """When only aegis-sebas exists, the other 4 must be created."""
@@ -146,3 +145,26 @@ def test_provision_handles_name_taken_gracefully():
     assert set(result.keys()) == set(DEFAULT_TARGET_MAP.keys())
     # After name_taken we re-listed: aegis-general id comes from the second list.
     assert result["system"] == "C_AEGIS-GENERAL"
+
+
+# --- Issue #36: agent-derived target map ------------------------------------
+
+from provision_slack_channels import target_map_from_agents  # noqa: E402
+
+
+def test_target_map_from_agents_uses_mention_alias_stem():
+    agents = [
+        {"id": "sebas", "metadata": {}},
+        {"id": "pandoras-actor", "metadata": {"mention_aliases": ["pandora"]}},
+        {"id": "jeeves", "metadata": {"mention_aliases": ["jeeves"]}},
+    ]
+    m = target_map_from_agents(agents)
+    assert m["sebas"] == "aegis-sebas"
+    assert m["pandoras-actor"] == "aegis-pandora"  # stem from alias, matches adapter
+    assert m["jeeves"] == "aegis-jeeves"
+
+
+def test_target_map_from_agents_empty_falls_back():
+    from provision_slack_channels import DEFAULT_TARGET_MAP
+
+    assert target_map_from_agents([]) == DEFAULT_TARGET_MAP

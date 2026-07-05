@@ -41,3 +41,35 @@ def test_voice_line_unknown_event_returns_event_name() -> None:
     """An event we haven't defined falls back to the event name string."""
     line = voice_line("pandoras-actor", "made_up_event_for_testing")
     assert line  # non-empty
+
+
+# --- Issue #36: metadata-supplied voice overrides ---------------------------
+
+
+def test_voice_line_overrides_take_precedence() -> None:
+    """A caller-supplied per-agent override (metadata.voice_lines) wins over
+    the shipped defaults and formats with kwargs."""
+    out = voice_line(
+        "custom-infra",
+        "pr_opened",
+        overrides={"pr_opened": "🤖 {count} PR(s) up for review."},
+        count=3,
+    )
+    assert out == "🤖 3 PR(s) up for review."
+
+
+def test_voice_line_falls_back_to_static_defaults_without_override() -> None:
+    """No override → the shipped _VOICE_LINES default still renders (unchanged)."""
+    out = voice_line("pandoras-actor", "investigation_started", resource="node-a")
+    assert "the owner-sama" in out and "node-a" in out
+
+
+def test_voice_line_override_missing_event_uses_default() -> None:
+    """An overrides dict lacking the event falls back to the static default."""
+    out = voice_line(
+        "pandoras-actor",
+        "investigation_started",
+        overrides={"some_other_event": "x"},
+        resource="node-b",
+    )
+    assert "the owner-sama" in out and "node-b" in out

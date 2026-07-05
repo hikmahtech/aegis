@@ -18,7 +18,9 @@ import os
 from slack_sdk import WebClient
 from slack_sdk.errors import SlackApiError
 
-# Maps agent_id → Slack channel name (without #).
+# Maps agent_id → Slack channel name (without #). Fallback for when the core
+# API isn't reachable; the live map is derived from the actual agent set via
+# `target_map_from_agents` so a from-scratch/renamed fleet provisions itself.
 DEFAULT_TARGET_MAP: dict[str, str] = {
     "system": "aegis-general",
     "sebas": "aegis-sebas",
@@ -26,6 +28,37 @@ DEFAULT_TARGET_MAP: dict[str, str] = {
     "maou": "aegis-maou",
     "pandoras-actor": "aegis-pandora",
 }
+
+
+def _channel_stem(agent: dict) -> str:
+    """`aegis-<stem>` channel stem for an agent: its first mention_alias (so
+    pandoras-actor → `pandora`, matching the adapter), else its id."""
+    aliases = (agent.get("metadata") or {}).get("mention_aliases") or []
+    return str(aliases[0]) if aliases else str(agent.get("id"))
+
+
+def target_map_from_agents(agents: list[dict]) -> dict[str, str]:
+    """Build {agent_id: channel_name} from a `GET /api/agents` payload, so a
+    custom agent set provisions without editing this script."""
+    out: dict[str, str] = {}
+    for a in agents or []:
+        aid = a.get("id")
+        if aid:
+            out[aid] = f"aegis-{_channel_stem(a)}"
+    return out or dict(DEFAULT_TARGET_MAP)
+
+
+def _fetch_agents(core_url: str, api_key: str) -> list[dict]:
+    """GET /api/agents from the core API (best-effort; empty list on failure)."""
+    import httpx
+
+    headers = {"X-API-Key": api_key} if api_key else {}
+    try:
+        resp = httpx.get(f"{core_url.rstrip('/')}/api/agents", headers=headers, timeout=15)
+        resp.raise_for_status()
+        return resp.json() or []
+    except Exception:  # noqa: BLE001 — fall back to DEFAULT_TARGET_MAP
+        return []
 
 
 def _list_all_channels(client: WebClient) -> dict[str, str]:
@@ -87,8 +120,7 @@ def _sql_block(agent_channel_map: dict[str, str]) -> str:
     lines = ["-- Run against prod DB after provisioning:"]
     for agent_id, channel_id in agent_channel_map.items():
         lines.append(
-            f"UPDATE agents SET slack_channel_id = '{channel_id}'"
-            f" WHERE id = '{agent_id}';"
+            f"UPDATE agents SET slack_channel_id = '{channel_id}' WHERE id = '{agent_id}';"
         )
     return "\n".join(lines)
 
@@ -98,8 +130,16 @@ if __name__ == "__main__":
     if not token:
         raise SystemExit("AEGIS_SLACK_BOT_TOKEN is not set")
 
+    # Prefer the live agent set when a core URL is given; else the shipped map.
+    core_url = os.environ.get("AEGIS_CORE_URL")
+    if core_url:
+        agents = _fetch_agents(core_url, os.environ.get("AEGIS_API_KEY", ""))
+        target_map = target_map_from_agents(agents)
+    else:
+        target_map = DEFAULT_TARGET_MAP
+
     web_client = WebClient(token=token)
-    mapping = provision(web_client, DEFAULT_TARGET_MAP)
+    mapping = provision(web_client, target_map)
 
     print(json.dumps(mapping, indent=2))
     print()

@@ -33,10 +33,16 @@ _CHANNEL_MAP = {
 
 def _settings():
     """Minimal settings stub for SlackCoreClient (reused across tests)."""
-    return type("S", (), {
-        "core_url": "http://core", "api_key": "",
-        "admin_username": "admin", "admin_password": "admin",
-    })()
+    return type(
+        "S",
+        (),
+        {
+            "core_url": "http://core",
+            "api_key": "",
+            "admin_username": "admin",
+            "admin_password": "admin",
+        },
+    )()
 
 
 # --- pure routing helpers ---------------------------------------------------
@@ -144,9 +150,7 @@ async def test_on_message_sync_path_chats_then_posts_then_patches_ref():
     reply_ref = DeliveryRef("slack", {"channel": "CSEBAS", "ts": "9.9"})
     adapter.send_message.return_value = SendResult(ok=True, ref=reply_ref, used_html=False)
 
-    await inbound.on_message(
-        channel_id="CSEBAS", text="hello", user_id="UME"
-    )
+    await inbound.on_message(channel_id="CSEBAS", text="hello", user_id="UME")
 
     # 1) core.chat called with the channel's agent + a slack thread id.
     core.chat.assert_awaited_once()
@@ -174,18 +178,20 @@ async def test_on_message_sync_path_ordering():
     """chat → send_message → attach_delivery_ref, in that order."""
     inbound, core, adapter = _inbound()
     calls: list[str] = []
-    core.chat.side_effect = lambda **k: calls.append("chat") or {
-        "response": "r",
-        "assistant_message_id": "row-1",
-    }
-    adapter.send_message.side_effect = lambda **k: calls.append("send") or SendResult(
-        ok=True, ref=DeliveryRef("slack", {"channel": "CSEBAS", "ts": "2.2"})
+    core.chat.side_effect = lambda **k: (
+        calls.append("chat")
+        or {
+            "response": "r",
+            "assistant_message_id": "row-1",
+        }
+    )
+    adapter.send_message.side_effect = lambda **k: (
+        calls.append("send")
+        or SendResult(ok=True, ref=DeliveryRef("slack", {"channel": "CSEBAS", "ts": "2.2"}))
     )
     core.attach_delivery_ref.side_effect = lambda **k: calls.append("patch") or {}
 
-    await inbound.on_message(
-        channel_id="CSEBAS", text="hi", user_id="UME"
-    )
+    await inbound.on_message(channel_id="CSEBAS", text="hi", user_id="UME")
     assert calls == ["chat", "send", "patch"]
 
 
@@ -193,9 +199,7 @@ async def test_on_message_async_path_triggers_and_acks():
     inbound, core, adapter = _inbound()
     core.agent_reply_trigger.return_value = {"workflow_id": "wf-1"}
 
-    await inbound.on_message(
-        channel_id="CPANDORA", text="check swarm", user_id="UME"
-    )
+    await inbound.on_message(channel_id="CPANDORA", text="check swarm", user_id="UME")
 
     core.agent_reply_trigger.assert_awaited_once()
     tkw = core.agent_reply_trigger.await_args.kwargs
@@ -222,9 +226,7 @@ async def test_on_message_async_trigger_failure_falls_back_to_sync():
     core.chat.return_value = {"response": "sync reply", "assistant_message_id": "row-9"}
     adapter.send_message.return_value = SendResult(ok=True, ref=None, used_html=False)
 
-    await inbound.on_message(
-        channel_id="CPANDORA", text="check swarm", user_id="UME"
-    )
+    await inbound.on_message(channel_id="CPANDORA", text="check swarm", user_id="UME")
 
     # Trigger was attempted.
     core.agent_reply_trigger.assert_awaited_once()
@@ -242,9 +244,7 @@ async def test_on_message_async_trigger_failure_falls_back_to_sync():
 async def test_on_message_ignores_bot_own_messages():
     inbound, core, adapter = _inbound()
     # bot_id present (event came from a bot) → ignore.
-    await inbound.on_message(
-        channel_id="CSEBAS", text="echo", user_id=None, bot_id="B0"
-    )
+    await inbound.on_message(channel_id="CSEBAS", text="echo", user_id=None, bot_id="B0")
     core.chat.assert_not_awaited()
     core.agent_reply_trigger.assert_not_awaited()
     adapter.send_message.assert_not_awaited()
@@ -253,9 +253,7 @@ async def test_on_message_ignores_bot_own_messages():
 async def test_on_message_ignores_own_user_id():
     inbound, core, adapter = _inbound()
     # user_id equals our bot user id → ignore (avoids loops).
-    await inbound.on_message(
-        channel_id="CSEBAS", text="echo", user_id="U0BOT"
-    )
+    await inbound.on_message(channel_id="CSEBAS", text="echo", user_id="U0BOT")
     core.chat.assert_not_awaited()
     adapter.send_message.assert_not_awaited()
 
@@ -264,13 +262,9 @@ async def test_on_action_resolves_then_stamps_card():
     inbound, core, adapter = _inbound()
     core.resolve_interaction.return_value = {"status": "resolved"}
 
-    await inbound.on_action(
-        value="interaction:i1:approve", channel_id="CSEBAS", message_ts="3.3"
-    )
+    await inbound.on_action(value="interaction:i1:approve", channel_id="CSEBAS", message_ts="3.3")
 
-    core.resolve_interaction.assert_awaited_once_with(
-        interaction_id="i1", value="approve"
-    )
+    core.resolve_interaction.assert_awaited_once_with(interaction_id="i1", value="approve")
     adapter.edit_card.assert_awaited_once()
     ekw = adapter.edit_card.await_args.kwargs
     assert ekw["ref"] == DeliveryRef("slack", {"channel": "CSEBAS", "ts": "3.3"})
@@ -282,9 +276,7 @@ async def test_on_action_already_resolved_also_stamps_card():
     inbound, core, adapter = _inbound()
     core.resolve_interaction.return_value = {"status": "already_resolved"}
 
-    await inbound.on_action(
-        value="interaction:i2:reject", channel_id="CSEBAS", message_ts="4.4"
-    )
+    await inbound.on_action(value="interaction:i2:reject", channel_id="CSEBAS", message_ts="4.4")
 
     adapter.edit_card.assert_awaited_once()
 
@@ -295,9 +287,7 @@ async def test_on_action_failed_resolve_does_not_stamp_card():
     # Simulate persistent transport failure (all 3 attempts return None).
     core.resolve_interaction.return_value = None
 
-    await inbound.on_action(
-        value="interaction:i3:approve", channel_id="CSEBAS", message_ts="5.5"
-    )
+    await inbound.on_action(value="interaction:i3:approve", channel_id="CSEBAS", message_ts="5.5")
 
     # Retried 3 times.
     assert core.resolve_interaction.await_count == 3
@@ -310,9 +300,7 @@ async def test_on_action_error_status_does_not_stamp_card():
     inbound, core, adapter = _inbound()
     core.resolve_interaction.return_value = {"status": "error", "detail": "timeout"}
 
-    await inbound.on_action(
-        value="interaction:i4:approve", channel_id="CSEBAS", message_ts="6.6"
-    )
+    await inbound.on_action(value="interaction:i4:approve", channel_id="CSEBAS", message_ts="6.6")
 
     adapter.edit_card.assert_not_awaited()
 
@@ -423,10 +411,11 @@ async def test_on_message_route_dispatches_as_classified_agent():
 
 def test_sticky_get_set_and_ttl():
     from aegis_comms.slack_inbound import _STICKY_TTL_SECONDS
+
     inbound = SlackInbound(adapter=AsyncMock(), core=AsyncMock(), channel_agent_map={})
     assert inbound._sticky_get("C", now=100.0) is None
     inbound._sticky_set("C", "maou", now=100.0)
-    assert inbound._sticky_get("C", now=200.0) == "maou"                     # fresh
+    assert inbound._sticky_get("C", now=200.0) == "maou"  # fresh
     assert inbound._sticky_get("C", now=100.0 + _STICKY_TTL_SECONDS + 1) is None  # expired
 
 
@@ -518,9 +507,7 @@ async def test_on_file_audio_transcribes_and_routes_in_bound_channel():
     assert core.chat.await_args.kwargs["message"] == "remind me to call bob"
     assert core.chat.await_args.kwargs["agent_id"] == "sebas"
     # The "heard" echo was posted so STT mishears are visible.
-    echoed = any(
-        "🎤" in (c.kwargs.get("text") or "") for c in adapter.send_message.await_args_list
-    )
+    echoed = any("🎤" in (c.kwargs.get("text") or "") for c in adapter.send_message.await_args_list)
     assert echoed
 
 
@@ -544,3 +531,79 @@ async def test_on_file_audio_without_key_warns_and_skips():
     core.chat.assert_not_awaited()
     adapter.send_message.assert_awaited_once()
     assert "ElevenLabs" in adapter.send_message.await_args.kwargs["text"]
+
+
+# --- Issue #36: metadata-derived mention map + async dispatch ---------------
+
+from aegis_comms.slack_inbound import (  # noqa: E402
+    _derive_async_agents,
+    _derive_mention_map,
+)
+
+_AGENTS_PAYLOAD = [
+    {"id": "sebas", "metadata": {}},
+    {"id": "raphael", "metadata": {}},
+    {"id": "maou", "metadata": {}},
+    {"id": "pandoras-actor", "metadata": {"mention_aliases": ["pandora"], "async_dispatch": True}},
+]
+
+
+def test_derive_mention_map_matches_shipped_defaults():
+    """Seed agents derive the same mention map as the hardcoded fallback."""
+    m = _derive_mention_map(_AGENTS_PAYLOAD)
+    assert m["pandora"] == "pandoras-actor"
+    assert m["pandoras-actor"] == "pandoras-actor"
+    assert m["sebas"] == "sebas"
+
+
+def test_derive_async_agents_from_metadata():
+    assert _derive_async_agents(_AGENTS_PAYLOAD) == {"pandoras-actor"}
+
+
+def test_derive_custom_agent_alias_and_async():
+    """A renamed 5th agent contributes its own alias + async flag."""
+    payload = _AGENTS_PAYLOAD + [
+        {"id": "jeeves", "metadata": {"mention_aliases": ["jeeves", "j"], "async_dispatch": True}}
+    ]
+    m = _derive_mention_map(payload)
+    assert m["j"] == "jeeves" and m["jeeves"] == "jeeves"
+    assert _derive_async_agents(payload) == {"pandoras-actor", "jeeves"}
+
+
+def test_route_message_custom_async_agent_via_param():
+    """A custom agent bound to a channel dispatches async when in async_agents."""
+    mode, agent, _ = route_message(
+        "CJEEVES", "do it", {"CJEEVES": "jeeves"}, async_agents={"jeeves"}
+    )
+    assert mode == "async" and agent == "jeeves"
+
+
+def test_route_message_custom_mention_via_param():
+    """`@j` resolves to jeeves when the derived mention map is passed in."""
+    mode, agent, text = route_message(
+        "CSEBAS",
+        "@j fix the box",
+        _CHANNEL_MAP,
+        mention_map={"j": "jeeves"},
+        async_agents={"jeeves"},
+    )
+    assert mode == "async" and agent == "jeeves" and text == "fix the box"
+
+
+async def test_routing_config_degrades_when_agents_fetch_fails():
+    """A non-list/raising /api/agents fetch falls back to shipped constants."""
+    inbound, core, _ = _inbound()
+    core.agents.side_effect = RuntimeError("core down")
+    mention_map, async_agents = await inbound._routing_config()
+    assert mention_map["pandora"] == "pandoras-actor"
+    assert async_agents == {"pandoras-actor"}
+
+
+async def test_routing_config_uses_metadata_when_available():
+    inbound, core, _ = _inbound()
+    core.agents.return_value = _AGENTS_PAYLOAD + [
+        {"id": "jeeves", "metadata": {"mention_aliases": ["jeeves"], "async_dispatch": True}}
+    ]
+    mention_map, async_agents = await inbound._routing_config()
+    assert mention_map["jeeves"] == "jeeves"
+    assert "jeeves" in async_agents
