@@ -1053,15 +1053,17 @@ CHAT_TOOLS = [
         "type": "function",
         "function": {
             "name": "handoff_task",
-            "description": "Reassign a task to a different personality assignee (e.g. @raphael).",
+            "description": (
+                "Reassign a task to a different personality assignee, given as "
+                "an @label (e.g. @me, @raphael, @pandora). Valid labels are the "
+                "active agents' mention aliases plus @me; an invalid one is "
+                "rejected with the list of valid labels."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "task_id": {"type": "string"},
-                    "to_assignee": {
-                        "type": "string",
-                        "enum": ["@me", "@sebas", "@raphael", "@maou", "@pandora"],
-                    },
+                    "to_assignee": {"type": "string"},
                 },
                 "required": ["task_id", "to_assignee"],
             },
@@ -2564,14 +2566,36 @@ async def _exec_mark_waiting(pool: asyncpg.Pool, args: dict, ctx: ToolContext) -
     return f"Marked {task_id} waiting on {who}"
 
 
+async def _assignee_labels(pool: asyncpg.Pool | None) -> list[str]:
+    """Valid handoff assignee labels: @me plus every active agent's mention
+    aliases (metadata.mention_aliases, default [id]) — issue #36. Falls back to
+    the shipped 4-agent set without a pool or on read failure."""
+    fallback = ["@me", "@sebas", "@raphael", "@maou", "@pandora"]
+    if pool is None:
+        return fallback
+    try:
+        rows = await pool.fetch("SELECT id, metadata FROM agents WHERE active = TRUE")
+        labels = ["@me"]
+        for r in rows:
+            aliases = (r["metadata"] or {}).get("mention_aliases") or [r["id"]]
+            labels.extend(f"@{str(a).lstrip('@')}" for a in aliases)
+        return labels or fallback
+    except Exception as exc:  # noqa: BLE001 — never break the tool on a config read
+        logger.warning("handoff_assignee_labels_failed", error=str(exc)[:200])
+        return fallback
+
+
 async def _exec_handoff_task(pool: asyncpg.Pool, args: dict, ctx: ToolContext) -> str:
     from aegis.config import Settings
     from aegis.connectors.todoist import TodoistConnector
 
     task_id = (args.get("task_id") or "").strip()
     to_assignee = (args.get("to_assignee") or "").strip()
-    if not task_id or to_assignee not in {"@me", "@sebas", "@raphael", "@maou", "@pandora"}:
+    if not task_id:
         return "Refused: valid task_id + to_assignee required"
+    valid_assignees = await _assignee_labels(pool)
+    if to_assignee not in valid_assignees:
+        return f"Refused: to_assignee must be one of {', '.join(valid_assignees)}"
     if pool is None:
         return "No DB pool"
     async with pool.acquire() as conn:
@@ -2581,11 +2605,7 @@ async def _exec_handoff_task(pool: asyncpg.Pool, args: dict, ctx: ToolContext) -
     if existing_labels is None:
         return f"Unknown task {task_id}"
     # Strip any existing @assignee, add the new one
-    kept = [
-        lab
-        for lab in (existing_labels or [])
-        if lab not in {"@me", "@sebas", "@raphael", "@maou", "@pandora"}
-    ]
+    kept = [lab for lab in (existing_labels or []) if lab not in valid_assignees]
     new_labels = [*kept, to_assignee]
     settings = Settings()
     _tk = await resolve_todoist_api_key(pool, settings)

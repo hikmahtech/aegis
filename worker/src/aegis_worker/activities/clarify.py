@@ -98,6 +98,7 @@ async def get_gtd_ruleset(pool) -> _RuleSet:
     _gtd_cache.update(rs=rs, ts=now)
     return rs
 
+
 # Per-agent addressable labels. classify_one's per-agent short-circuit
 # (added 2026-05-26) routes user comments on @<agent>-labelled tasks to
 # the matching personality. Iteration order is documented + deterministic:
@@ -107,11 +108,84 @@ async def get_gtd_ruleset(pool) -> _RuleSet:
 # routing, including the non-APP `pandora_chat_followup` branch added
 # 2026-05-27 so user comments on manual @pandora-labelled tasks reach
 # pandoras-actor instead of dead-ending in pandora_owned).
-_ADDRESSABLE_AGENTS: list[tuple[str, str]] = [
-    ("@sebas", "sebas_followup"),
-    ("@raphael", "raphael_followup"),
-    ("@maou", "maou_followup"),
-]
+#
+# The addressable list + assignee vocabulary + context-hook gating are all
+# DERIVED from the active agents (issue #36): mention_aliases give the labels,
+# capabilities give the behavior tag that picks the context pre-fetch. The
+# literals below are the shipped-seed fallback when there's no DB / the read
+# fails — behavior stays identical for the default 4-agent set.
+_DEFAULT_AGENT_REG: dict[str, dict] = {
+    "sebas": {"aliases": ["@sebas"], "caps": {"gtd"}},
+    "raphael": {"aliases": ["@raphael"], "caps": {"research"}},
+    "maou": {"aliases": ["@maou"], "caps": {"finance"}},
+    "pandoras-actor": {"aliases": ["@pandora"], "caps": {"infra"}},
+}
+
+_agent_reg_cache: dict = {"reg": None, "ts": 0.0}
+
+
+def _decode_jsonish(value, empty):
+    """asyncpg returns jsonb as a Python object when the codec is registered,
+    else a raw string. Accept both; fall back to `empty` on anything odd."""
+    if value is None:
+        return empty
+    if isinstance(value, (dict, list)):
+        return value
+    try:
+        import json
+
+        return json.loads(value)
+    except Exception:  # noqa: BLE001
+        return empty
+
+
+async def get_agent_registry(pool) -> dict[str, dict]:
+    """Active agents as {id: {"aliases": [@label...], "caps": {tag...}}}, 30s
+    cached. Aliases come from metadata.mention_aliases (default [id]); caps from
+    the capabilities column. Falls back to the shipped defaults without a pool
+    or on read failure — routing must never break."""
+    if pool is None:
+        return _DEFAULT_AGENT_REG
+    import time
+
+    now = time.monotonic()
+    if _agent_reg_cache["reg"] is not None and now - _agent_reg_cache["ts"] < 30.0:
+        return _agent_reg_cache["reg"]
+    try:
+        rows = await pool.fetch("SELECT id, capabilities, metadata FROM agents WHERE active = TRUE")
+        reg: dict[str, dict] = {}
+        for r in rows:
+            md = _decode_jsonish(r["metadata"], {})
+            caps = set(_decode_jsonish(r["capabilities"], []))
+            raw_aliases = md.get("mention_aliases") or [r["id"]]
+            aliases = [f"@{str(a).lstrip('@')}" for a in raw_aliases]
+            reg[r["id"]] = {"aliases": aliases, "caps": caps}
+        reg = reg or _DEFAULT_AGENT_REG
+    except Exception:  # noqa: BLE001 — never let a config read break classification
+        reg = _DEFAULT_AGENT_REG
+    _agent_reg_cache.update(reg=reg, ts=now)
+    return reg
+
+
+def _addressable_agents(reg: dict[str, dict]) -> list[tuple[str, str]]:
+    """(@label, "<id>_followup") pairs from the registry. Ordered gtd-owner
+    first, then by id, so the GTD owner wins co-occurrence (preserves the old
+    '@sebas wins' guarantee). @pandora-labelled tasks bypass this list upstream,
+    so including the infra agent here is inert."""
+    out: list[tuple[str, str]] = []
+    for aid in sorted(reg, key=lambda a: (0 if "gtd" in reg[a]["caps"] else 1, a)):
+        for label in reg[aid]["aliases"]:
+            out.append((label, f"{aid}_followup"))
+    return out
+
+
+def _assignee_labels(reg: dict[str, dict]) -> list[str]:
+    """Valid classifier assignee labels: @me plus every agent alias."""
+    labels = ["@me"]
+    for info in reg.values():
+        labels.extend(info["aliases"])
+    return labels
+
 
 # GTD state labels (Todoist restructure, 2026-07): Someday/Later and Next
 # used to be managed projects; both are now labels applied in apply_outcome
@@ -370,7 +444,9 @@ class ClarifyActivities:
                 return v
         return default
 
-    def _build_classify_prompt(self, task: dict, rules: _RuleSet) -> str:
+    def _build_classify_prompt(
+        self, task: dict, rules: _RuleSet, assignees: list[str] | None = None
+    ) -> str:
         """Compose the JSON-output prompt for qwen3:14b / Sonnet."""
         source_tag = task.get("source_tag")
         rule_assignee = rules.default_assignee(source_tag)
@@ -403,7 +479,7 @@ class ClarifyActivities:
             "classification ∈ {trash, reference, someday, 2_min, "
             "next_action}\n"
             "confidence ∈ [0.0, 1.0]\n"
-            "assignee ∈ {@me, @sebas, @raphael, @maou, @pandora}\n"
+            f"assignee ∈ {{{', '.join(assignees or ['@me', '@sebas', '@raphael', '@maou', '@pandora'])}}}\n"
             "contexts ⊆ {@5min, @deep, @email, @phone, @code, @errand, "
             "@home, @office, @reading, @waiting, @reference}"
         )
@@ -446,6 +522,7 @@ class ClarifyActivities:
 
         source_tag = task.get("source_tag")
         rules = await get_gtd_ruleset(self.db_pool)
+        reg = await get_agent_registry(self.db_pool)
 
         # Pandora ownership short-circuit. AlertInvestigationFlow may
         # create inbox tasks with @pandora pre-applied; clarify must not
@@ -479,7 +556,7 @@ class ClarifyActivities:
             and "@pandora" not in existing_labels
             and not _APP_JIRA_PATTERN.match(content_for_branch)
         ):
-            for label, branch in _ADDRESSABLE_AGENTS:
+            for label, branch in _addressable_agents(reg):
                 if label in existing_labels:
                     return {
                         "classification": branch,
@@ -585,7 +662,7 @@ class ClarifyActivities:
                 "llm_model": "none",
             }
 
-        prompt = self._build_classify_prompt(task, rules)
+        prompt = self._build_classify_prompt(task, rules, _assignee_labels(reg))
 
         # Primary classifier. LLMClient.think() returns a dict
         # {response, model, prompt_tokens, completion_tokens} — extract
@@ -962,6 +1039,11 @@ class ClarifyActivities:
         interaction_spawned = False
         interaction_payload: dict | None = None
 
+        # Active-agent registry (aliases + behavior tags) for the per-agent
+        # follow-up branch below — derived, not hardcoded (issue #36).
+        reg = await get_agent_registry(self.db_pool)
+        followup_classifications = {f"{aid}_followup" for aid in reg} | {"pandora_chat_followup"}
+
         # Pandora-owned task — no side effects at all. classify_one
         # already identified this case; we only need log_classification
         # to bump last_clarified_at so the watermark advances.
@@ -1035,12 +1117,7 @@ class ClarifyActivities:
             # explicitly synthesize an empty success below so apply_outcome
             # returns applied=True and the ClarifyFlow spawn gate passes.
 
-        elif classification in {
-            "sebas_followup",
-            "raphael_followup",
-            "maou_followup",
-            "pandora_chat_followup",
-        }:
+        elif classification in followup_classifications:
             # Per-agent comment-channel branch (2026-05-26; pandora added
             # 2026-05-27). Builds the synthetic chat turn for
             # AgentChatReplyFlow and returns a spawn payload. No Todoist
@@ -1061,12 +1138,15 @@ class ClarifyActivities:
             synthetic_input = self._build_agent_synthetic_input(
                 task, target_agent, recent_notes=recent_notes
             )
-            # Per-agent pre-fetch hooks — best-effort, failures fall through.
-            # Sebas + pandora have no hook: their context IS the task;
-            # their tool sets fetch what they need.
-            if target_agent == "raphael":
+            # Per-agent pre-fetch hooks, gated on the target's behavior tag
+            # (issue #36) rather than its id: a `research` agent gets the
+            # knowledge context, a `finance` agent gets the transaction
+            # context. gtd/infra agents have no hook — their context IS the
+            # task and their tool sets fetch what they need.
+            target_caps = reg.get(target_agent, {}).get("caps", set())
+            if "research" in target_caps:
                 synthetic_input = await self._maybe_attach_ks_context(synthetic_input, task)
-            elif target_agent == "maou":
+            elif "finance" in target_caps:
                 synthetic_input = await self._maybe_attach_transaction_context(
                     synthetic_input, task
                 )
