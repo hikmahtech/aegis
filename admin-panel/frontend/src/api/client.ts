@@ -49,6 +49,7 @@ export const api = {
     apiFetch<any>('/api/agents', { method: 'POST', body: JSON.stringify(data) }),
   getAgent: (id: string) => apiFetch<any>(`/api/agents/${id}`),
   getAgentTools: (id: string) => apiFetch<any[]>(`/api/agents/${id}/tools`),
+  getAgentOptions: () => apiFetch<any>('/api/agents/meta/options'),
   updateAgent: (id: string, patch: any) =>
     apiFetch<any>(`/api/agents/${id}`, { method: 'PATCH', body: JSON.stringify(patch) }),
   draftPersona: (id: string, description: string) =>

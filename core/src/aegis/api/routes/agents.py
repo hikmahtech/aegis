@@ -52,6 +52,58 @@ async def list_agents(request: Request, active: bool = True) -> list[dict[str, A
     return await _list_agents(request.app.state.db_pool, active_only=active)
 
 
+@router.get("/meta/options")
+async def get_agent_options() -> dict[str, Any]:
+    """Vocabulary for the admin Behavior tab: behavior tags, chat tools, tiers."""
+    from aegis.agent_tags import BEHAVIOR_TAGS
+    from aegis.services.chat import CHAT_TOOLS
+
+    tools = []
+    for spec in CHAT_TOOLS:
+        fn = spec.get("function", {})
+        if fn.get("name"):
+            tools.append({"name": fn["name"], "description": fn.get("description", "")})
+    return {
+        "tags": [{"id": t, "description": d} for t, d in BEHAVIOR_TAGS.items()],
+        "tools": sorted(tools, key=lambda t: t["name"]),
+        "model_tiers": ["fast", "balanced", "smart"],
+    }
+
+
+def _validate_agent_patch(body: dict[str, Any]) -> None:
+    """400 on malformed Behavior fields — a tool_set typo would otherwise be
+    saved and silently never fire (issue #36 item 4)."""
+    capabilities = body.get("capabilities")
+    if capabilities is not None and (
+        not isinstance(capabilities, list) or not all(isinstance(c, str) for c in capabilities)
+    ):
+        raise HTTPException(status_code=400, detail="capabilities must be a list of strings")
+
+    metadata = body.get("metadata")
+    if metadata is None:
+        return
+    if not isinstance(metadata, dict):
+        raise HTTPException(status_code=400, detail="metadata must be an object")
+
+    tool_set = metadata.get("tool_set")
+    if tool_set is not None:
+        if not isinstance(tool_set, list) or not all(isinstance(t, str) for t in tool_set):
+            raise HTTPException(
+                status_code=400, detail="metadata.tool_set must be a list of strings"
+            )
+        from aegis.services.chat import TOOL_EXECUTORS
+
+        unknown = sorted(set(tool_set) - set(TOOL_EXECUTORS))
+        if unknown:
+            raise HTTPException(
+                status_code=400, detail=f"unknown tools in tool_set: {', '.join(unknown)}"
+            )
+
+    async_dispatch = metadata.get("async_dispatch")
+    if async_dispatch is not None and not isinstance(async_dispatch, bool):
+        raise HTTPException(status_code=400, detail="metadata.async_dispatch must be a boolean")
+
+
 @router.post("", status_code=201)
 async def create_agent(request: Request, body: dict[str, Any]) -> dict[str, Any]:
     """Create a new agent. Body: {id, name, role, model_tier?, capabilities?, metadata?}."""
@@ -77,6 +129,7 @@ async def get_agent(agent_id: str, request: Request) -> dict[str, Any]:
 @router.patch("/{agent_id}")
 async def update_agent(agent_id: str, request: Request, body: dict[str, Any]) -> dict[str, Any]:
     """Update an agent's configuration."""
+    _validate_agent_patch(body)
     agent = await _update_agent(request.app.state.db_pool, agent_id, body)
     if not agent:
         raise HTTPException(status_code=404, detail=f"Agent '{agent_id}' not found")
@@ -142,7 +195,9 @@ async def get_agent_tools(agent_id: str, request: Request) -> list[dict[str, str
     agent = await _get_agent(request.app.state.db_pool, agent_id)
     if agent is None:
         raise HTTPException(status_code=404, detail=f"Agent '{agent_id}' not found")
-    tool_names = (agent.get("metadata") or {}).get("tool_set") or AGENT_TOOL_SETS.get(agent_id) or []
+    tool_names = (
+        (agent.get("metadata") or {}).get("tool_set") or AGENT_TOOL_SETS.get(agent_id) or []
+    )
 
     descriptions: dict[str, str] = {}
     for spec in CHAT_TOOLS:

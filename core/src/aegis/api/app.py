@@ -53,6 +53,12 @@ async def lifespan(app: FastAPI):
 
     await load_seeds(pool, settings.seed_dir)
 
+    # Warn (never crash) on DB agents whose tool_set references a missing
+    # executor — a typo there would otherwise fail silently at chat time.
+    from aegis.services.agents import warn_unknown_tool_refs
+
+    await warn_unknown_tool_refs(pool)
+
     try:
         from aegis.services.rss_seeder import seed_rss_from_miniflux
 
