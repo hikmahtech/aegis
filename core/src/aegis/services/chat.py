@@ -45,8 +45,21 @@ _INTENT_KEYWORDS: dict[str, list[str]] = {
               "next action", "calendar", "email", "waiting", "schedule",
               "follow up"],
 }
-# Tie-break: specific domains before the generalist.
+# Tie-break: specific domains before the generalist. Shipped ordering for the
+# seed agents; any other active agent tie-breaks after these, in id order
+# (deterministic — see `_keyword_route`). Not a closed list.
 _INTENT_PRECEDENCE = ["maou", "pandoras-actor", "raphael", "sebas"]
+
+# One-line intent descriptions shown to the LLM router (`_build_intent_prompt`).
+# Shipped fallback for the seed agents; the live prompt is built from each
+# active agent's metadata.intent_description (data-driven) so a renamed/added
+# agent is reachable via LLM routing, not just keyword/@mention.
+_INTENT_DESCRIPTIONS: dict[str, str] = {
+    "maou": "finance, money, subscriptions, receipts, market",
+    "pandoras-actor": "infrastructure, servers, deploys, homelab, logs",
+    "raphael": "research, knowledge, learning, summarizing",
+    "sebas": "tasks, GTD, calendar, email, general (the default)",
+}
 
 
 def _keyword_route(message: str, keyword_map: dict[str, list[str]] | None = None) -> str | None:
@@ -65,7 +78,7 @@ def _keyword_route(message: str, keyword_map: dict[str, list[str]] | None = None
     best = max(scores.values())
     if best == 0:
         return None
-    order = _INTENT_PRECEDENCE + [a for a in keyword_map if a not in _INTENT_PRECEDENCE]
+    order = _INTENT_PRECEDENCE + sorted(a for a in keyword_map if a not in _INTENT_PRECEDENCE)
     for agent in order:
         if scores.get(agent) == best:
             return agent
@@ -90,14 +103,39 @@ async def _agent_keyword_map(pool) -> dict[str, list[str]]:
         return dict(_INTENT_KEYWORDS)
 
 
-def _build_intent_prompt(message: str) -> str:
+async def _agent_intent_descriptions(pool) -> dict[str, str]:
+    """Per-agent one-line intent descriptions for the LLM router prompt, from
+    agents.metadata.intent_description (data-driven), shipped _INTENT_DESCRIPTIONS
+    as fallback. Agents with neither are omitted (e.g. the virtual `system`
+    agent), so they never become a routing target. Never raises."""
+    if pool is None:
+        return dict(_INTENT_DESCRIPTIONS)
+    try:
+        rows = await pool.fetch("SELECT id, metadata FROM agents WHERE active = TRUE")
+        out: dict[str, str] = {}
+        for r in rows:
+            desc = (r["metadata"] or {}).get("intent_description") or _INTENT_DESCRIPTIONS.get(
+                r["id"]
+            )
+            if desc:
+                out[r["id"]] = desc
+        return out or dict(_INTENT_DESCRIPTIONS)
+    except Exception as exc:  # noqa: BLE001 — routing must never break the front door
+        logger.warning("agent_intent_descriptions_failed", error=str(exc)[:200])
+        return dict(_INTENT_DESCRIPTIONS)
+
+
+def _build_intent_prompt(message: str, descriptions: dict[str, str] | None = None) -> str:
+    """Prompt the fast LLM to pick the best agent. The agent list is built from
+    `descriptions` (per-agent intent_description) — ordered by _INTENT_PRECEDENCE
+    then remaining ids sorted — so custom/renamed agents are offered too."""
+    descriptions = descriptions or dict(_INTENT_DESCRIPTIONS)
+    order = _INTENT_PRECEDENCE + sorted(a for a in descriptions if a not in _INTENT_PRECEDENCE)
+    lines = "\n".join(f"- {aid}: {descriptions[aid]}" for aid in order if aid in descriptions)
     return (
         "Route this message to the single best AEGIS agent. Reply with STRICT "
         'JSON {"agent_id": "<id>", "reason": "<short>"}. Agents:\n'
-        "- maou: finance, money, subscriptions, receipts, market\n"
-        "- pandoras-actor: infrastructure, servers, deploys, homelab, logs\n"
-        "- raphael: research, knowledge, learning, summarizing\n"
-        "- sebas: tasks, GTD, calendar, email, general (the default)\n\n"
+        f"{lines}\n\n"
         f"Message: {message[:500]}"
     )
 
@@ -115,15 +153,20 @@ async def classify_intent(message: str, llm, settings, pool=None) -> dict:
     if llm is None:
         return {"agent_id": "sebas", "reason": "no_llm", "method": "default"}
     model = getattr(settings, "model_fast", "gemma4:e2b") if settings else "gemma4:e2b"
+    descriptions = await _agent_intent_descriptions(pool)
+    # Accept any routable active agent the LLM names — keyword map OR intent
+    # description — so a custom agent reachable only via intent_description isn't
+    # silently rejected.
+    routable = set(keyword_map) | set(descriptions)
     try:
         result = await llm.think(
-            _build_intent_prompt(message), model=model, max_tokens=300,
+            _build_intent_prompt(message, descriptions), model=model, max_tokens=300,
             purpose="intent_route",
         )
         raw = result.get("response", "") if isinstance(result, dict) else (result or "")
         parsed = parse_llm_json(raw) or {}
         agent = parsed.get("agent_id") or parsed.get("agent")
-        if agent in keyword_map:
+        if agent in routable:
             return {"agent_id": agent, "reason": str(parsed.get("reason", ""))[:200], "method": "llm"}
     except Exception as exc:  # noqa: BLE001 — routing must never break the front door
         logger.warning("intent_route_llm_failed", error=str(exc)[:200])
@@ -2959,15 +3002,26 @@ AGENT_TOOL_SETS: dict[str, set[str]] = {
 }
 
 
+# Minimal safe surface for an agent with no configured tool set. Deliberately
+# NOT Sebas's full GTD surface — a custom/unknown agent should get a small
+# read-mostly starter set (search + capture), not silently inherit the
+# coordinator's tools. Configure the real set via agents.metadata.tool_set
+# (admin Behavior tab). Every name here must exist in TOOL_EXECUTORS.
+_FALLBACK_TOOL_SET: frozenset[str] = frozenset(
+    {"search_knowledge", "capture_to_inbox", "list_next_actions"}
+)
+
+
 def _get_agent_tools(agent_id: str, metadata: dict | None = None) -> list[dict]:
     """Return CHAT_TOOLS filtered to the agent's allowed tool set.
 
     Tool set is data-driven from agents.metadata.tool_set when present, falling
-    back to the shipped AGENT_TOOL_SETS (then sebas) for the example agents.
+    back to the shipped AGENT_TOOL_SETS for the seed agents, then to a tiny safe
+    default (_FALLBACK_TOOL_SET) for anyone unconfigured — never Sebas's full set.
     """
     allowed = (metadata or {}).get("tool_set")
     if not allowed:
-        allowed = AGENT_TOOL_SETS.get(agent_id) or AGENT_TOOL_SETS["sebas"]
+        allowed = AGENT_TOOL_SETS.get(agent_id) or _FALLBACK_TOOL_SET
     allowed = set(allowed)
     return [t for t in CHAT_TOOLS if t["function"]["name"] in allowed]
 
@@ -2980,7 +3034,7 @@ def _validate_agent_tool_sets() -> None:
     are soft-dead (kept for future use or in-flight deprecation).
     """
     declared: set[str] = set()
-    for agent_id, tools in AGENT_TOOL_SETS.items():
+    for agent_id, tools in {**AGENT_TOOL_SETS, "_fallback": _FALLBACK_TOOL_SET}.items():
         for tool_name in tools:
             if tool_name not in TOOL_EXECUTORS:
                 raise RuntimeError(
@@ -3054,6 +3108,12 @@ async def _execute_tool(
 
 
 
+# Seed-agent hints for the lightweight `_extract_query_entities` heuristic below.
+# The LIVE knowledge-boost path is already data-driven — `_gather_knowledge_context`
+# receives `agent_meta.knowledge_domains` from the DB (see the caller), and
+# AGENT_KNOWLEDGE_DOMAINS is only its fallback for the seed agents. A custom
+# agent that sets metadata.knowledge_domains is boosted; one that doesn't simply
+# gets no boost (graceful) rather than a wrong one.
 _KNOWN_AGENT_IDS = {"sebas", "raphael", "pandoras-actor", "maou"}
 
 AGENT_KNOWLEDGE_DOMAINS: dict[str, list[str]] = {

@@ -1,11 +1,17 @@
 """Tests for per-agent tool set filtering."""
 
-from aegis.services.chat import AGENT_TOOL_SETS, TOOL_EXECUTORS, _get_agent_tools
+from aegis.services.chat import (
+    _FALLBACK_TOOL_SET,
+    AGENT_TOOL_SETS,
+    TOOL_EXECUTORS,
+    _get_agent_tools,
+)
 
 
-def test_agent_tool_sets_defined_for_all_agents():
-    """All 4 agents have tool set definitions."""
-    assert set(AGENT_TOOL_SETS.keys()) == {"sebas", "raphael", "pandoras-actor", "maou"}
+def test_seed_agents_have_tool_sets_defined():
+    """The 4 seed agents ship with tool sets — but the dict is NOT locked to
+    only them (a DB-created agent supplies its own via metadata.tool_set)."""
+    assert {"sebas", "raphael", "pandoras-actor", "maou"} <= set(AGENT_TOOL_SETS.keys())
 
 
 def test_agent_tool_sets_are_subsets_of_executors():
@@ -64,11 +70,25 @@ def test_get_agent_tools_filters_chat_tools():
     assert tool_names == AGENT_TOOL_SETS["maou"]
 
 
-def test_get_agent_tools_unknown_agent_falls_back_to_sebas():
-    """Unknown agent_id gets Sebas's tool set (coordinator = catch-all)."""
-    tools = _get_agent_tools("unknown-agent")
-    sebas_tools = _get_agent_tools("sebas")
-    assert {t["function"]["name"] for t in tools} == {t["function"]["name"] for t in sebas_tools}
+def test_get_agent_tools_unknown_agent_gets_minimal_safe_set():
+    """An unconfigured/unknown agent gets the tiny safe fallback set — NOT
+    Sebas's full GTD surface (issue #36 #1)."""
+    tools = {t["function"]["name"] for t in _get_agent_tools("unknown-agent")}
+    assert tools == set(_FALLBACK_TOOL_SET)
+    # It must be a strict, small subset of Sebas's tools, not equal to them.
+    sebas_tools = {t["function"]["name"] for t in _get_agent_tools("sebas")}
+    assert tools < sebas_tools
+
+
+def test_get_agent_tools_db_tool_set_wins_over_fallback():
+    """A DB agent's metadata.tool_set is used verbatim, bypassing the fallback."""
+    tools = {t["function"]["name"] for t in _get_agent_tools("custom", {"tool_set": ["get_quote"]})}
+    assert tools == {"get_quote"}
+
+
+def test_fallback_tool_set_all_have_executors():
+    """Every tool in the safe fallback set must have an executor."""
+    assert set(_FALLBACK_TOOL_SET) <= set(TOOL_EXECUTORS.keys())
 
 
 def test_each_agent_has_remember_this():
