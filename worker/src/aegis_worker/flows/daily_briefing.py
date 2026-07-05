@@ -1,8 +1,8 @@
 """DailyBriefingFlow — morning summary delivered to the agent's channel.
 
 Gathers pending interactions, calendar events, knowledge stats,
-intelligence items, and (for Maou) market data, then delivers a
-concise briefing to the agent's channel.
+intelligence items, and (for the finance-tagged agent) market data,
+then delivers a concise briefing to the agent's channel.
 
 Scheduled daily (10:00 IST / 04:30 UTC) — cron `30 4 * * *` in
 `config/seed/activities.yaml`.
@@ -16,6 +16,7 @@ from datetime import timedelta
 from temporalio import workflow
 
 with workflow.unsafe.imports_passed_through():
+    from aegis_worker.activities.agent_registry import AgentRegistryActivities
     from aegis_worker.activities.alerts import AlertActivities
     from aegis_worker.activities.briefing import BriefingActivities
     from aegis_worker.activities.delivery import DeliveryActivities
@@ -69,8 +70,22 @@ class DailyBriefingFlow:
             start_to_close_timeout=TIMEOUT_LLM, retry_policy=NO_RETRY,
         )
 
-        # maou market appends to the same message (kept behavior)
-        if config.agent_id == "maou":
+        # Behavior-tag resolution (issue #36): the market section belongs to
+        # whichever agent holds `finance`, the alert digest to `infra` — no
+        # literal ids. Unresolved/failed lookups degrade to skipping those
+        # sections, never failing the briefing.
+        try:
+            resolved = await workflow.execute_activity_method(
+                AgentRegistryActivities.resolve_agents,
+                args=[["finance", "infra"]],
+                start_to_close_timeout=TIMEOUT_FAST, retry_policy=NO_RETRY,
+            )
+        except Exception:
+            workflow.logger.warning("briefing_tag_resolve_failed")
+            resolved = {}
+
+        # the finance agent's market data appends to the same message (kept behavior)
+        if resolved.get("finance") == config.agent_id:
             try:
                 market = await workflow.execute_activity_method(
                     BriefingActivities.gather_market_data,
@@ -113,18 +128,22 @@ class DailyBriefingFlow:
             except Exception:
                 workflow.logger.warning("briefing_voice_failed")
 
-        # pandora alert digest (kept)
+        # infra alert digest (kept)
         try:
             digest = await workflow.execute_activity_method(
                 AlertActivities.build_alert_digest,
                 start_to_close_timeout=TIMEOUT_FAST, retry_policy=NO_RETRY,
             )
             if digest.get("count", 0) > 0:
-                await workflow.execute_activity_method(
-                    DeliveryActivities.send_message,
-                    args=["pandoras-actor", digest["message"], 0],
-                    start_to_close_timeout=TIMEOUT_FAST, retry_policy=NO_RETRY,
-                )
+                infra_agent = resolved.get("infra")
+                if infra_agent:
+                    await workflow.execute_activity_method(
+                        DeliveryActivities.send_message,
+                        args=[infra_agent, digest["message"], 0],
+                        start_to_close_timeout=TIMEOUT_FAST, retry_policy=NO_RETRY,
+                    )
+                else:
+                    workflow.logger.warning("briefing_alert_digest_skipped_no_infra_agent")
         except Exception:
             pass
 

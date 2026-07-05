@@ -287,7 +287,14 @@ async def stub_timeout_v2(inp: ApplyTimeoutInput) -> None:
     return None
 
 
+@activity.defn(name="resolve_agents")
+async def stub_resolve_agents(tags):
+    # Seed mapping: infra → pandoras-actor, so behavior is unchanged.
+    return {t: {"infra": "pandoras-actor"}.get(t) for t in tags}
+
+
 ALL_ACTIVITIES = [
+    stub_resolve_agents,
     stub_check_alert_mute_v2,
     stub_write_alert_mute_v2,
     stub_check_dedup,

@@ -50,6 +50,8 @@ def _mock_pool():
 
     pool = MagicMock()
     pool.acquire = _acquire
+    # resolve_tag("infra") → pandoras-actor (seed mapping).
+    pool.fetch = AsyncMock(return_value=[{"id": "pandoras-actor"}])
     return pool
 
 

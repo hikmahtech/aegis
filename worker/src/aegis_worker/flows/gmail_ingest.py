@@ -20,6 +20,7 @@ from temporalio.common import RetryPolicy
 from temporalio.workflow import ParentClosePolicy
 
 with workflow.unsafe.imports_passed_through():
+    from aegis_worker.activities.agent_registry import AgentRegistryActivities
     from aegis_worker.activities.capture import CaptureActivities
     from aegis_worker.activities.delivery import DeliveryActivities
     from aegis_worker.activities.gmail import (
@@ -61,6 +62,21 @@ class GmailIngestFlow:
         by_category: dict[str, int] = {}
         by_source: dict[str, int] = {}
         per_account: list[dict] = []
+
+        # Financial fan-out belongs to whichever agent holds the `finance`
+        # behavior tag (issue #36), resolved once per run — no literal id. If
+        # nothing holds it, the MoneyProcessFlow fan-out is skipped.
+        try:
+            _resolved = await workflow.execute_activity_method(
+                AgentRegistryActivities.resolve_agents,
+                args=[["finance"]],
+                start_to_close_timeout=TIMEOUT_FAST,
+                retry_policy=NO_RETRY,
+            )
+            finance_agent = _resolved.get("finance")
+        except Exception:
+            workflow.logger.warning("gmail_ingest_finance_resolve_failed")
+            finance_agent = None
 
         for ch in channels:
             identifier = ch["identifier"]
@@ -131,12 +147,12 @@ class GmailIngestFlow:
                 # ParentClosePolicy.ABANDON so child failures don't bubble into
                 # the triage run.
                 tag_set = {t for t in (classification.get("tags") or []) if isinstance(t, str)}
-                if tag_set & {"financial", "payments"}:
+                if tag_set & {"financial", "payments"} and finance_agent:
                     try:
                         await workflow.start_child_workflow(
                             MoneyProcessFlow.run,
                             MoneyProcessInput(
-                                agent_id="maou",
+                                agent_id=finance_agent,
                                 msg=msg,
                                 account_label=label,
                             ),

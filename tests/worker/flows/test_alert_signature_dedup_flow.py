@@ -206,7 +206,15 @@ async def stub_apply_timeout(inp: ApplyTimeoutInput) -> None:
     pass
 
 
+@activity.defn(name="resolve_agents")
+async def stub_resolve_agents(tags):
+    # Seed mapping — infra → pandoras-actor (behavior unchanged).
+    seed = {"finance": "maou", "infra": "pandoras-actor", "gtd": "sebas", "research": "raphael"}
+    return {t: seed.get(t) for t in tags}
+
+
 ALL_STUBS = [
+    stub_resolve_agents,
     stub_find_open_task,
     stub_record_recurrence,
     stub_record_new_task,
