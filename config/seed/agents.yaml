@@ -8,12 +8,14 @@ agents:
     name: Sebas Tian
     role: Executive assistant
     system_prompt_path: personalities/sebas
-    capabilities: [email, calendar, github_alerts, daily_brief]
+    # `gtd` is a behavior tag (aegis.agent_tags) — routing keys on it, not on the id.
+    capabilities: [gtd, email, calendar, github_alerts, daily_brief]
     model_tier: smart
     interaction_timeout_default: archive
     slack_channel_id: ""
     elevenlabs_voice_id: ""
     metadata:
+      intent_description: Tasks, GTD, email, calendar, scheduling and day-to-day coordination.
       intent_keywords: [task, todo, inbox, remind, defer, project, "next action", calendar, email, waiting, schedule, "follow up"]
       knowledge_domains: [task, decision, briefing, digest, calendar, task_outcome]
       tool_set: [query_activities, trigger_workflow, search_knowledge, configure_triage, remember_this, list_interactions, capture_to_inbox, list_next_actions, whats_next, list_projects, complete_task, defer_task, mark_waiting, handoff_task, find_reference]
@@ -29,6 +31,7 @@ agents:
     slack_channel_id: ""
     elevenlabs_voice_id: ""
     metadata:
+      intent_description: Research, knowledge lookups, articles, papers and topic tracking.
       intent_keywords: [research, knowledge, learn, paper, article, summari, remember, recall, explain]
       knowledge_domains: [article, feed, email, research]
       tool_set: [search_knowledge, ask_knowledge, research_topic, track_topic, remember_this, capture_to_inbox, list_next_actions, list_projects, complete_task, handoff_task, find_reference]
@@ -44,6 +47,7 @@ agents:
     slack_channel_id: ""
     elevenlabs_voice_id: ""
     metadata:
+      intent_description: Money — bills, receipts, subscriptions, budgets and market data.
       intent_keywords: [money, bill, invoice, subscription, payment, receipt, spend, cost, budget, renew, charge, refund, expense, price, market, stock, crypto, portfolio]
       knowledge_domains: [market, finance, trade]
       tool_set: [get_quote, get_market_overview, get_finance_news, search_knowledge, remember_this, list_interactions, capture_to_inbox, list_next_actions, list_projects, complete_task, defer_task, mark_waiting, handoff_task]
@@ -53,13 +57,17 @@ agents:
     name: Pandora's Actor
     role: Infrastructure
     system_prompt_path: personalities/pandoras-actor
-    capabilities: [homelab, k8s, argocd, certs, drift]
+    # `infra` is a behavior tag (aegis.agent_tags) — routing keys on it, not on the id.
+    capabilities: [infra, homelab, k8s, argocd, certs, drift]
     model_tier: smart
     interaction_timeout_default: auto_reject
     slack_channel_id: ""
     elevenlabs_voice_id: ""
     metadata:
+      intent_description: Infrastructure — homelab, Docker swarm, Kubernetes, deployments and alerts.
       intent_keywords: [server, docker, swarm, k8s, kubernetes, deploy, infra, drift, backup, cert, argocd, pod, container, node, homelab, restart, logs, grafana, prometheus]
+      mention_aliases: [pandora]
+      async_dispatch: true
       knowledge_domains: [alert, sentry, github, task_outcome]
       tool_set: [trigger_workflow, search_knowledge, update_runbook, configure_triage, remember_this, list_interactions, list_nodes, list_services, inspect_service, get_service_logs, restart_service, list_pods, list_deployments, restart_deployment, get_pod_logs, list_argocd_apps, sync_argocd_app, list_cloud_accounts, cloud_identity, run_infra_script, aegis_self_diagnose, investigate_resource, vercel_get_project, vercel_list_deployments, vercel_get_deployment, vercel_get_build_logs, capture_to_inbox, list_next_actions, list_projects, complete_task, defer_task, handoff_task]
     active: true

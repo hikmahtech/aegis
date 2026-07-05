@@ -15,6 +15,7 @@ from temporalio.contrib.opentelemetry import TracingInterceptor
 from temporalio.worker import Worker
 
 from aegis_worker.activities.active_work import ActiveWorkActivities
+from aegis_worker.activities.agent_registry import AgentRegistryActivities
 from aegis_worker.activities.alert_governance import AlertGovernanceActivities
 from aegis_worker.activities.alerts import AlertActivities
 from aegis_worker.activities.briefing import BriefingActivities
@@ -97,6 +98,7 @@ TASK_QUEUE = "aegis-main"
 _stub_chat_act = ChatActivities(client=None)  # type: ignore[arg-type]
 _stub_clarify_act = ClarifyActivities(db_pool=None)
 _stub_social_act = SocialActivities(db_pool=None)
+_stub_agent_registry_act = AgentRegistryActivities(db_pool=None)
 
 WORKFLOWS: list = [
     AgentChatReplyFlow,
@@ -122,6 +124,7 @@ WORKFLOWS: list = [
 ]
 
 ACTIVITIES: list = [
+    _stub_agent_registry_act.resolve_agents,
     _stub_chat_act.synthesize_reply,
     _stub_clarify_act.post_agent_reply_comment,
     _stub_clarify_act.post_agent_reply_error_comment,
@@ -261,6 +264,7 @@ async def main():
     )
     interaction_act = InteractionActivities(db_pool=deps.pool)
     run_recorder_act = RunRecorderActivities(db_pool=deps.pool)
+    agent_registry_act = AgentRegistryActivities(db_pool=deps.pool)
 
     homelab_act = None
     if settings.homelab_enabled:
@@ -435,6 +439,7 @@ async def main():
     # All activities
     activities = [
         active_work_act.check_active_work,
+        agent_registry_act.resolve_agents,
         alert_governance_act.check_alert_mute,
         alert_governance_act.write_alert_mute,
         alert_governance_act.stage_pending_pr,

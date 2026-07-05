@@ -22,11 +22,18 @@ export default function AgentDetail() {
   const [pmsg, setPmsg] = useState('');
   const [draftDesc, setDraftDesc] = useState('');
   const [drafting, setDrafting] = useState(false);
+  const [options, setOptions] = useState<any>(null);
+  const [beh, setBeh] = useState({
+    capabilities: [] as string[], tool_set: [] as string[],
+    intent_keywords: '', mention_aliases: '', intent_description: '', async_dispatch: false,
+  });
+  const [savingB, setSavingB] = useState(false);
+  const [bmsg, setBmsg] = useState('');
 
   async function load() {
     setError(null); setLoading(true);
     try {
-      const [a, t, th, st, cs, rr, pk] = await Promise.all([
+      const [a, t, th, st, cs, rr, pk, opts] = await Promise.all([
         api.getAgent(id),
         api.getAgentTools(id).catch(() => []),
         api.listThreads(`agent_id=${id}`).catch(() => []),
@@ -34,11 +41,21 @@ export default function AgentDetail() {
         api.getConnectorStats({ agent_id: id }).catch(() => null),
         api.listWorkflowRuns({ agent_id: id, limit: 10 }).catch(() => []),
         api.getPersonality(id).catch(() => ({} as Record<string, string>)),
+        api.getAgentOptions().catch(() => null),
       ]);
       setAgent(a); setTools(t); setThreads(th);
-      setLlmStats(st); setConnectorStats(cs); setRuns(rr);
+      setLlmStats(st); setConnectorStats(cs); setRuns(rr); setOptions(opts);
       setPersona({
         name: a.name || '', role: a.role || '', model_tier: a.model_tier || 'balanced',
+      });
+      const md = a.metadata || {};
+      setBeh({
+        capabilities: a.capabilities || [],
+        tool_set: md.tool_set || t.map((x: any) => x.name),
+        intent_keywords: (md.intent_keywords || []).join(', '),
+        mention_aliases: (md.mention_aliases || []).join(', '),
+        intent_description: md.intent_description || '',
+        async_dispatch: !!md.async_dispatch,
       });
       setKinds({
         soul: pk.soul || '', agents: pk.agents || '', user: pk.user || '', memory: pk.memory || '',
@@ -56,6 +73,29 @@ export default function AgentDetail() {
     }
     catch (e: any) { setError(e); } finally { setSavingP(false); }
   }
+
+  const csv = (s: string) => s.split(',').map(x => x.trim()).filter(Boolean);
+
+  async function saveBehavior() {
+    setSavingB(true); setBmsg(''); setError(null);
+    try {
+      await api.updateAgent(id, {
+        capabilities: beh.capabilities,
+        metadata: {
+          ...(agent.metadata || {}),
+          tool_set: beh.tool_set,
+          intent_keywords: csv(beh.intent_keywords),
+          mention_aliases: csv(beh.mention_aliases),
+          intent_description: beh.intent_description,
+          async_dispatch: beh.async_dispatch,
+        },
+      });
+      setBmsg('Saved.'); await load();
+    } catch (e: any) { setError(e); } finally { setSavingB(false); }
+  }
+
+  const toggleIn = (list: string[], v: string) =>
+    list.includes(v) ? list.filter(x => x !== v) : [...list, v];
 
   async function draft() {
     if (!draftDesc.trim()) return;
@@ -135,6 +175,55 @@ export default function AgentDetail() {
           {savingP ? 'Saving…' : 'Save persona'}
         </button>
         {pmsg && <span style={{ marginLeft: 10, color: 'var(--success-text)' }}>{pmsg}</span>}
+      </div>
+
+      <div className="card" style={{ marginBottom: 16 }}>
+        <h3>Behavior</h3>
+        {!options && <p className="empty">Behavior options unavailable.</p>}
+        {options && <>
+          <label style={{ fontSize: 13, color: 'var(--text-muted)' }}>Behavior tags</label>
+          <div style={{ display: 'flex', gap: 14, flexWrap: 'wrap', margin: '4px 0 10px' }}>
+            {(options.tags || []).map((t: any) => (
+              <label key={t.id} title={t.description} style={{ fontSize: 13 }}>
+                <input type="checkbox" checked={beh.capabilities.includes(t.id)}
+                  onChange={() => setBeh({ ...beh, capabilities: toggleIn(beh.capabilities, t.id) })} />
+                {' '}{t.id}
+              </label>
+            ))}
+          </div>
+          <label style={{ fontSize: 13, color: 'var(--text-muted)' }}>Tools ({beh.tool_set.length})</label>
+          <div style={{ maxHeight: 200, overflowY: 'auto', margin: '4px 0 10px' }}>
+            {(options.tools || []).map((t: any) => (
+              <div key={t.name} style={{ fontSize: 13, margin: '2px 0' }}>
+                <label>
+                  <input type="checkbox" checked={beh.tool_set.includes(t.name)}
+                    onChange={() => setBeh({ ...beh, tool_set: toggleIn(beh.tool_set, t.name) })} />
+                  {' '}<code>{t.name}</code>{' '}
+                  <span style={{ color: 'var(--text-muted)' }}>{t.description}</span>
+                </label>
+              </div>
+            ))}
+          </div>
+          <div className="cfg-row" style={{ marginBottom: 8 }}>
+            <input value={beh.intent_keywords} placeholder="intent keywords (comma-separated)"
+              onChange={e => setBeh({ ...beh, intent_keywords: e.target.value })} />
+            <input value={beh.mention_aliases} placeholder="mention aliases (comma-separated)"
+              onChange={e => setBeh({ ...beh, mention_aliases: e.target.value })} />
+          </div>
+          <div className="cfg-row" style={{ marginBottom: 8 }}>
+            <input value={beh.intent_description} placeholder="one-line intent description for the LLM router"
+              onChange={e => setBeh({ ...beh, intent_description: e.target.value })} />
+            <label style={{ fontSize: 13, whiteSpace: 'nowrap' }}>
+              <input type="checkbox" checked={beh.async_dispatch}
+                onChange={e => setBeh({ ...beh, async_dispatch: e.target.checked })} />
+              {' '}async dispatch
+            </label>
+          </div>
+          <button className="btn btn-primary" disabled={savingB} onClick={saveBehavior}>
+            {savingB ? 'Saving…' : 'Save behavior'}
+          </button>
+          {bmsg && <span style={{ marginLeft: 10, color: 'var(--success-text)' }}>{bmsg}</span>}
+        </>}
       </div>
 
       <div className="grid">

@@ -63,7 +63,14 @@ async def _load_agents(pool: asyncpg.Pool, path: Path) -> None:
                     name = EXCLUDED.name,
                     role = EXCLUDED.role,
                     system_prompt_path = EXCLUDED.system_prompt_path,
-                    capabilities = EXCLUDED.capabilities,
+                    -- capabilities are UI-edited (admin Behavior tab): DB-owned
+                    -- once non-empty; the yaml only fills first boot.
+                    capabilities = CASE
+                        WHEN agents.capabilities IS NOT NULL
+                             AND agents.capabilities != '[]'::jsonb
+                        THEN agents.capabilities
+                        ELSE EXCLUDED.capabilities
+                    END,
                     -- model_tier is DB-owned once set (edited in the admin UI);
                     -- the yaml only seeds an empty value.
                     model_tier = COALESCE(NULLIF(agents.model_tier, ''), EXCLUDED.model_tier),
@@ -77,9 +84,10 @@ async def _load_agents(pool: asyncpg.Pool, path: Path) -> None:
                         agents.elevenlabs_voice_id
                     ),
                     active = EXCLUDED.active,
-                    -- agent metadata (routing config) is seed-owned for now — no
-                    -- UI editor yet, so the yaml is the source of truth.
-                    metadata = EXCLUDED.metadata,
+                    -- agent metadata (routing config) is UI-edited per key
+                    -- (admin Behavior tab): DB values win, but keys newly added
+                    -- to the yaml still arrive on upgrade.
+                    metadata = EXCLUDED.metadata || agents.metadata,
                     updated_at = now()
                 """,
                 r["id"],
@@ -174,8 +182,7 @@ async def _load_resources(pool: asyncpg.Pool, path: Path) -> None:
         yaml_slugs = [r["slug"] for r in rows]
         yaml_managed_kinds = ("connector", "runbook", "endpoint", "mcp_server")
         status = await conn.execute(
-            "DELETE FROM resources WHERE slug <> ALL($1::text[]) "
-            "AND kind = ANY($2::text[])",
+            "DELETE FROM resources WHERE slug <> ALL($1::text[]) AND kind = ANY($2::text[])",
             yaml_slugs,
             list(yaml_managed_kinds),
         )

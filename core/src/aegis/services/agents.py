@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 import asyncpg
+
+logger = logging.getLogger(__name__)
 
 
 async def list_agents(pool: asyncpg.Pool, active_only: bool = True) -> list[dict[str, Any]]:
@@ -15,6 +18,55 @@ async def list_agents(pool: asyncpg.Pool, active_only: bool = True) -> list[dict
     query += " ORDER BY id"
     rows = await pool.fetch(query)
     return [dict(r) for r in rows]
+
+
+async def agents_by_tag(pool: asyncpg.Pool, tag: str) -> list[dict[str, Any]]:
+    """Active agents whose capabilities contain the behavior tag, ordered by id."""
+    rows = await pool.fetch(
+        """
+        SELECT * FROM agents
+        WHERE active = TRUE AND capabilities @> jsonb_build_array($1::text)
+        ORDER BY id
+        """,
+        tag,
+    )
+    return [dict(r) for r in rows]
+
+
+async def resolve_tag(pool: asyncpg.Pool, tag: str) -> str | None:
+    """Resolve a behavior tag to the single agent that owns it.
+
+    Zero holders → None (callers skip the feature, mirroring the
+    feature-flag skip pattern); multiple holders → deterministic first
+    by id. Both anomalies are logged.
+    """
+    agents = await agents_by_tag(pool, tag)
+    if not agents:
+        logger.warning("no active agent holds behavior tag %r", tag)
+        return None
+    if len(agents) > 1:
+        logger.warning(
+            "behavior tag %r held by %s — using %r",
+            tag,
+            [a["id"] for a in agents],
+            agents[0]["id"],
+        )
+    return agents[0]["id"]
+
+
+async def warn_unknown_tool_refs(pool: asyncpg.Pool) -> None:
+    """Boot-time check: warn on DB agents whose metadata.tool_set references a
+    tool with no executor — that tool would silently never reach the agent.
+    Never raises; user data must not brick startup.
+    """
+    from aegis.services.chat import TOOL_EXECUTORS
+
+    for agent in await list_agents(pool):
+        tool_set = (agent.get("metadata") or {}).get("tool_set") or []
+        for name in sorted(set(tool_set) - set(TOOL_EXECUTORS)):
+            logger.warning(
+                "agent %r metadata.tool_set references unknown tool %r", agent["id"], name
+            )
 
 
 async def get_agent(pool: asyncpg.Pool, agent_id: str) -> dict[str, Any] | None:
