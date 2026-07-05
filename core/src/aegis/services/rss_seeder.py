@@ -34,6 +34,13 @@ async def seed_rss_from_miniflux(pool: Any, miniflux_url: str, miniflux_api_key:
         logger.warning("miniflux_fetch_failed", error=str(exc)[:300])
         return 0
 
+    # RSS ingest is owned by whichever agent holds the `research` behavior tag
+    # (issue #36), not a literal id. Falls back to "raphael" (the seed research
+    # agent) only if no agent currently holds the tag.
+    from aegis.services.agents import resolve_tag
+
+    research_agent = await resolve_tag(pool, "research") or "raphael"
+
     upserted = 0
     async with pool.acquire() as conn:
         for f in feeds:
@@ -42,7 +49,7 @@ async def seed_rss_from_miniflux(pool: Any, miniflux_url: str, miniflux_api_key:
                 continue
             config = {
                 "label": f.get("title", ""),
-                "agent_id": "raphael",
+                "agent_id": research_agent,
                 "miniflux_id": f.get("id"),
                 "last_cursor": None,
             }
