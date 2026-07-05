@@ -59,13 +59,29 @@ _VOICE_LINES: dict[tuple[str, str], str] = {
 }
 
 
-def voice_line(agent_id: str | None, event: str, **kwargs) -> str:
+def voice_line(
+    agent_id: str | None,
+    event: str,
+    overrides: dict[str, str] | None = None,
+    **kwargs,
+) -> str:
     """Render an agent-flavoured one-liner for an event.
 
-    Falls back to the bare event name when the (agent, event) combo
-    isn't defined, so callers never crash on an unknown event.
+    Resolution order: caller-supplied ``overrides`` (an agent's
+    ``metadata.voice_lines`` — ``{event: template}``) → the shipped
+    ``_VOICE_LINES`` defaults → the bare event name. Stays pure and sync so the
+    alert-investigation workflow can call it (no DB access in a workflow).
+
+    # ponytail: static defaults are the source of truth; threading
+    # metadata.voice_lines from the DB into the flow (via an activity that
+    # returns them alongside the resolved agent) is deferred until a second
+    # agent actually needs flow-side flavour — YAGNI until then.
     """
-    template = _VOICE_LINES.get((agent_id or "", event), event)
+    template = event
+    if overrides and event in overrides:
+        template = overrides[event]
+    else:
+        template = _VOICE_LINES.get((agent_id or "", event), event)
     try:
         return template.format(**kwargs)
     except (KeyError, IndexError):

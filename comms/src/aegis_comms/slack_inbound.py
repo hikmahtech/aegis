@@ -47,14 +47,22 @@ def _is_audio_file(name: str, mimetype: str) -> bool:
         return True
     return name.lower().endswith(_AUDIO_EXTENSIONS)
 
+
 # Front-door conversation stickiness window. An ambiguous follow-up within this
 # many seconds stays with the conversation's last agent.
 # ponytail: fixed 30-min TTL; per-user tuning only if it ever matters.
 _STICKY_TTL_SECONDS = 1800.0
 
-# Slack-label → downstream agent-id. The label `pandora` maps to agent id
-# `pandoras-actor` everywhere downstream (personality dir + agents table),
-# mirroring bot.py::_AGENT_MENTION_MAP.
+# How long the derived (mention_map, async_agents) routing config is cached
+# before re-fetching GET /api/agents. Short so admin Behavior-tab edits apply
+# within a minute without a comms restart.
+_ROUTING_CFG_TTL_SECONDS = 60.0
+
+# Slack-label → downstream agent-id. Fallback only — the live map is derived
+# per-request from each active agent's `metadata.mention_aliases` (default
+# `[agent.id]`) via `_derive_mention_map`. This hardcoded copy is used when the
+# `GET /api/agents` fetch fails, so an inbound message never crashes. The label
+# `pandora` maps to agent id `pandoras-actor` (its seed mention_aliases).
 _AGENT_MENTION_MAP = {
     "pandora": "pandoras-actor",
     "pandoras-actor": "pandoras-actor",
@@ -63,29 +71,75 @@ _AGENT_MENTION_MAP = {
     "maou": "maou",
 }
 
-_AGENT_MENTION_RE = re.compile(
-    r"(?<![\w])@("
-    + "|".join(re.escape(n) for n in sorted(_AGENT_MENTION_MAP, key=len, reverse=True))
-    + r")\b[:,]?",
-    re.IGNORECASE,
-)
+# Fallback set of agent ids dispatched async (kimi tools run minutes). Live set
+# is derived from `metadata.async_dispatch` via `_derive_async_agents`.
+_ASYNC_AGENTS = frozenset({"pandoras-actor"})
 
 
-def _parse_agent_mention(text: str) -> tuple[str | None, str]:
+def _build_mention_re(mention_map: dict[str, str]) -> re.Pattern[str]:
+    """Compile the `@<alias>` matcher for a given label→agent map."""
+    return re.compile(
+        r"(?<![\w])@("
+        + "|".join(re.escape(n) for n in sorted(mention_map, key=len, reverse=True))
+        + r")\b[:,]?",
+        re.IGNORECASE,
+    )
+
+
+_AGENT_MENTION_RE = _build_mention_re(_AGENT_MENTION_MAP)
+
+
+def _derive_mention_map(agents: list[dict] | None) -> dict[str, str]:
+    """Build the Slack-label → agent-id map from active agents' metadata.
+
+    Each agent contributes its `metadata.mention_aliases` (default `[agent.id]`)
+    plus its own id, all lowercased. Returns {} when there's no usable data so
+    the caller can fall back to `_AGENT_MENTION_MAP`.
+    """
+    out: dict[str, str] = {}
+    for a in agents or []:
+        aid = a.get("id")
+        if not aid:
+            continue
+        aliases = (a.get("metadata") or {}).get("mention_aliases") or [aid]
+        for alias in aliases:
+            if alias:
+                out[str(alias).lower()] = aid
+        out.setdefault(str(aid).lower(), aid)  # id itself is always addressable
+    return out
+
+
+def _derive_async_agents(agents: list[dict] | None) -> set[str]:
+    """Agent ids whose `metadata.async_dispatch` is truthy (slow/SSH agents)."""
+    return {
+        a["id"]
+        for a in (agents or [])
+        if a.get("id") and (a.get("metadata") or {}).get("async_dispatch")
+    }
+
+
+def _parse_agent_mention(
+    text: str, mention_map: dict[str, str] | None = None
+) -> tuple[str | None, str]:
     """Detect an `@<agent>` token anywhere in `text` (ported from bot.py).
 
     Returns `(target_agent, stripped_text)` when a known agent is mentioned;
     the mention is removed and surrounding whitespace collapsed so the LLM
     doesn't see a self-reference. First-found wins; `info@mail.com` does not
-    false-positive (word-boundary match).
+    false-positive (word-boundary match). `mention_map` defaults to the shipped
+    `_AGENT_MENTION_MAP`; callers pass the DB-derived map to reach custom agents.
     """
     if not text:
         return None, text
-    match = _AGENT_MENTION_RE.search(text)
+    if mention_map is None:
+        mention_map, mention_re = _AGENT_MENTION_MAP, _AGENT_MENTION_RE
+    else:
+        mention_re = _build_mention_re(mention_map)
+    match = mention_re.search(text)
     if match is None:
         return None, text
     name = match.group(1).lower()
-    target = _AGENT_MENTION_MAP.get(name)
+    target = mention_map.get(name)
     if target is None:
         return None, text
     cleaned = (text[: match.start()] + " " + text[match.end() :]).strip()
@@ -106,6 +160,8 @@ def route_message(
     text: str,
     channel_agent_map: dict[str, str],
     mention_bot_id: str | None = None,
+    mention_map: dict[str, str] | None = None,
+    async_agents: set[str] | frozenset[str] | None = None,
 ) -> tuple[str, str, str]:
     """Decide how to route an inbound Slack message (pure; mirrors bot._message).
 
@@ -115,10 +171,16 @@ def route_message(
         the caller resolves the agent via the front-door intent classifier
         (bot @mention token stripped so the classifier sees clean text);
       - bound channel + bot @app_mention'd → ("async", channel's agent, stripped);
-      - bound channel maps to pandoras-actor → ("async", "pandoras-actor", text);
+      - bound channel maps to an async-dispatch agent → ("async", agent, text);
       - bound channel otherwise → ("sync", channel's agent, text).
+
+    `mention_map` (Slack-label → agent-id) and `async_agents` (ids that dispatch
+    async) default to the shipped constants; callers pass the DB-derived values
+    so custom/renamed agents route correctly.
     """
-    mentioned_agent, stripped = _parse_agent_mention(text)
+    if async_agents is None:
+        async_agents = _ASYNC_AGENTS
+    mentioned_agent, stripped = _parse_agent_mention(text, mention_map)
     if mentioned_agent is not None:
         return "async", mentioned_agent, stripped
 
@@ -135,7 +197,7 @@ def route_message(
     if mention_bot_id and f"<@{mention_bot_id}" in text:
         return "async", channel_agent, _strip_bot_mention(text, mention_bot_id)
 
-    if channel_agent == "pandoras-actor":
+    if channel_agent in async_agents:
         return "async", channel_agent, text
 
     return "sync", channel_agent, text
@@ -350,6 +412,30 @@ class SlackInbound:
         self._elevenlabs_stt_model = elevenlabs_stt_model
         # channel_id -> (agent_id, monotonic_ts); ephemeral conversation context.
         self._sticky: dict[str, tuple[str, float]] = {}
+        # Cached (mention_map, async_agents) derived from GET /api/agents.
+        self._routing_cfg: tuple[dict[str, str], set[str]] | None = None
+        self._routing_cfg_ts: float = 0.0
+
+    async def _routing_config(self) -> tuple[dict[str, str], set[str]]:
+        """(_mention_map, async_agents) derived from active agents' metadata,
+        cached for `_ROUTING_CFG_TTL_SECONDS`. Degrades to the shipped constants
+        if `GET /api/agents` fails, so routing never crashes."""
+        now = time.monotonic()
+        if self._routing_cfg is not None and now - self._routing_cfg_ts < _ROUTING_CFG_TTL_SECONDS:
+            return self._routing_cfg
+        try:
+            agents = await self._core.agents()
+        except Exception as exc:  # noqa: BLE001 — routing must never break inbound
+            logger.warning("slack_routing_config_fetch_failed", error=str(exc)[:200])
+            agents = None
+        if isinstance(agents, list) and agents:
+            mention_map = _derive_mention_map(agents) or dict(_AGENT_MENTION_MAP)
+            async_agents = _derive_async_agents(agents)
+        else:
+            mention_map, async_agents = dict(_AGENT_MENTION_MAP), set(_ASYNC_AGENTS)
+        self._routing_cfg = (mention_map, async_agents)
+        self._routing_cfg_ts = now
+        return self._routing_cfg
 
     def _sticky_get(self, channel_id: str, now: float) -> str | None:
         """Return the channel's sticky agent if set and within the TTL, else None."""
@@ -429,8 +515,14 @@ class SlackInbound:
         exactly like a typed message: @mention parsing, sticky-agent, and the
         sync/async split all apply identically.
         """
+        mention_map, async_agents = await self._routing_config()
         mode, agent_id, clean_text = route_message(
-            channel_id, text, self._channel_agent_map, self._bot_user_id
+            channel_id,
+            text,
+            self._channel_agent_map,
+            self._bot_user_id,
+            mention_map=mention_map,
+            async_agents=async_agents,
         )
         now = time.monotonic()
 
@@ -442,7 +534,7 @@ class SlackInbound:
             # Clear keyword → route by content. Ambiguous (llm/default) + a fresh
             # sticky agent → stay with the conversation's agent.
             agent_id = sticky if (method != "keyword" and sticky is not None) else routed_agent
-            mode = "async" if agent_id == "pandoras-actor" else "sync"
+            mode = "async" if agent_id in async_agents else "sync"
 
         # Remember the resolved agent as this channel's conversation context so the
         # next ambiguous follow-up sticks (including after an explicit @mention).
@@ -497,9 +589,7 @@ class SlackInbound:
 
         result = None
         for attempt in range(1, 4):
-            result = await self._core.resolve_interaction(
-                interaction_id=interaction_id, value=val
-            )
+            result = await self._core.resolve_interaction(interaction_id=interaction_id, value=val)
             if result is not None:
                 break
             if attempt < 3:
@@ -553,9 +643,7 @@ class SlackInbound:
             lines.append(f"Agents: {names}")
         return "\n".join(lines)
 
-    async def on_file(
-        self, *, file_id: str, channel_id: str, caption: str, client
-    ) -> None:
+    async def on_file(self, *, file_id: str, channel_id: str, caption: str, client) -> None:
         """Handle a shared file: audio → transcribe+route, PDF → extract+ingest.
 
         Audio (Slack voice notes / uploads) is transcribed via ElevenLabs Scribe

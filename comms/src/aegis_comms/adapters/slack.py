@@ -127,9 +127,7 @@ class SlackAdapter:
 
     async def _fetch_agent(self, agent_id: str) -> dict:
         headers = {"X-API-Key": self._api_key} if self._api_key else {}
-        resp = await self._httpx().get(
-            f"{self._core_url}/api/agents/{agent_id}", headers=headers
-        )
+        resp = await self._httpx().get(f"{self._core_url}/api/agents/{agent_id}", headers=headers)
         resp.raise_for_status()
         return resp.json()
 
@@ -159,17 +157,26 @@ class SlackAdapter:
         username = agent_id
         channel: str | None = None
         voice_id = ""
+        # Channel-name stem + icon are metadata-overridable; fall back to the
+        # shipped constants (so a custom agent isn't stuck with the robot icon
+        # or an id-based channel name).
+        stem = _short_agent(agent_id)
         try:
             cfg = await self._fetch_agent(agent_id)
             username = cfg.get("name") or agent_id
             channel = cfg.get("slack_channel_id") or None
             voice_id = cfg.get("elevenlabs_voice_id") or ""
+            meta = cfg.get("metadata") or {}
+            icon = meta.get("slack_icon") or _AGENT_ICON.get(agent_id, _DEFAULT_ICON)
+            aliases = meta.get("mention_aliases") or []
+            if aliases:
+                stem = str(aliases[0])
         except Exception as exc:  # noqa: BLE001 — best-effort; fall back to name lookup
             _logger.warning("slack_agent_lookup_failed", agent_id=agent_id, error=str(exc))
 
         if not channel:
             try:
-                channel = await self._resolve_channel_by_name(f"aegis-{_short_agent(agent_id)}")
+                channel = await self._resolve_channel_by_name(f"aegis-{stem}")
             except SlackApiError as exc:
                 _logger.warning(
                     "slack_channel_name_lookup_failed", agent_id=agent_id, error=str(exc)
@@ -194,7 +201,8 @@ class SlackAdapter:
         agent_id: str,
         text: str,
         target: dict | None = None,
-        reply_markup: dict | None = None,  # accepted for seam uniformity; Slack uses Block Kit send_card instead
+        reply_markup: dict
+        | None = None,  # accepted for seam uniformity; Slack uses Block Kit send_card instead
     ) -> SendResult:
         if reply_markup is not None:
             _logger.debug("slack_reply_markup_ignored", agent_id=agent_id)
@@ -212,9 +220,7 @@ class SlackAdapter:
                     icon_emoji=icon,
                 )
                 if first_ref is None:
-                    first_ref = DeliveryRef(
-                        "slack", {"channel": resp["channel"], "ts": resp["ts"]}
-                    )
+                    first_ref = DeliveryRef("slack", {"channel": resp["channel"], "ts": resp["ts"]})
         except SlackApiError as exc:
             return SendResult(ok=False, used_html=False, error=str(exc))
         return SendResult(ok=True, ref=first_ref, used_html=False)
@@ -250,7 +256,8 @@ class SlackAdapter:
         documents: list[dict],
         caption: str,
         target: dict | None = None,
-        reply_markup: dict | None = None,  # accepted for seam uniformity; Slack uses Block Kit send_card instead
+        reply_markup: dict
+        | None = None,  # accepted for seam uniformity; Slack uses Block Kit send_card instead
     ) -> SendResult:
         if reply_markup is not None:
             _logger.debug("slack_reply_markup_ignored", agent_id=agent_id)
