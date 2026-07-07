@@ -402,9 +402,10 @@ async def test_classify_one_first_match_wins_sebas_then_raphael(db_pool):
 
 
 @pytest.mark.asyncio
-async def test_classify_one_raphael_on_app_jira_title_yields_pandora(db_pool):
-    """When the title is APP-<n>: AND @raphael is present, pandora's
-    pandora_investigation branch wins — Jira routing is sacred.
+async def test_classify_one_raphael_on_app_jira_title_yields_pandora_gate(db_pool):
+    """When the title is APP-<n>: AND @raphael is present, the Jira route
+    still wins over the per-agent reply branch — but as the pandora_gate
+    choice card (no @pandora yet), not a silent investigation. (inbox gate.)
     """
     from unittest.mock import AsyncMock
 
@@ -420,13 +421,11 @@ async def test_classify_one_raphael_on_app_jira_title_yields_pandora(db_pool):
 
     decision = await acts.classify_one(task)
 
-    # @raphael is present but @pandora is NOT in labels. The new per-agent
-    # block is skipped because content matches _APP_JIRA_PATTERN (the third
-    # guard). Then the standalone APP-<n>: branch fires and returns
-    # pandora_investigation. Tightened to == so a misfire to a different
-    # pandora branch (e.g. pandora_owned via a bug in the guard order)
-    # would be caught.
-    assert decision["classification"] == "pandora_investigation"
+    # @raphael is present but @pandora is NOT in labels. The per-agent block is
+    # skipped because content matches _APP_JIRA_PATTERN (the third guard). Then
+    # the standalone APP-<n>: branch fires → pandora_gate. Tightened to == so a
+    # misfire to a different branch would be caught.
+    assert decision["classification"] == "pandora_gate"
 
 
 @pytest.mark.asyncio

@@ -21,6 +21,14 @@ Two pandora-track classifications added 2026-05-20:
   ticket synced from Acme). apply_outcome labels the task
   @area/acme + @pandora and returns a spawn flag; ClarifyFlow
   fires AlertInvestigationFlow with the existing task_id.
+
+Inbox gate (2026-07): a *fresh* APP-<n>: ticket (no @pandora yet) no longer
+auto-fires. classify_one returns `pandora_gate` → apply_outcome spawns a
+two-option choice card ("🔍 Pandora, investigate" / "🙋 I've got it").
+apply_clarify_resolution then either stamps @pandora and clears the watermark
+(so the next tick's @pandora retry branch fires the real investigation) or
+stamps @me. Any task carrying @me — set on the card or by hand — is skipped by
+find_unclassified_items entirely: the user's "hands off, I'm on it" signal.
 """
 
 from __future__ import annotations
@@ -390,6 +398,21 @@ class ClarifyActivities:
                               AND content NOT LIKE '%Workflow run:%'
                         ), 'epoch'::timestamptz)
                   )
+                  -- Hands-off signal (inbox gate): a task the user has claimed
+                  -- with @me — and hasn't addressed to an agent — is theirs to
+                  -- handle. Clarify ignores it entirely so aegis won't
+                  -- auto-classify or auto-investigate. This is the escape
+                  -- hatch: label a task @me in Todoist (or click "I've got it"
+                  -- on the gate card) and it drops out here. Agent-addressed
+                  -- tasks (@sebas/@raphael/@maou/@pandora) still pass so the
+                  -- comment-channel reply path keeps firing even if @me
+                  -- co-occurs. @me is never auto-applied by Jira sync (labels
+                  -- come verbatim from Todoist), so fresh APP-<n>: tickets have
+                  -- none and still reach the gate.
+                  AND NOT (
+                      '@me' = ANY(t.labels)
+                      AND NOT (t.labels && ARRAY['@sebas','@raphael','@maou','@pandora'])
+                  )
                 ORDER BY t.last_note_at DESC NULLS LAST, t.updated_at
                 LIMIT $2
                 """,
@@ -627,16 +650,21 @@ class ClarifyActivities:
                 "llm_model": "rules",
             }
 
-        # APP-<n>: Jira-prefix branch — route Acme tickets to
-        # Pandora's investigation pipeline before the LLM gets a vote.
+        # APP-<n>: Jira-prefix branch. First encounter (no @pandora label yet —
+        # that case returned in the @pandora block above): DON'T auto-fire an
+        # investigation. Ask first via a choice card (pandora_gate). Picking
+        # "investigate" applies @pandora, which re-enters the @pandora retry
+        # branch above on the next tick and fires the real AlertInvestigationFlow;
+        # picking "I've got it" applies @me and clarify leaves the task alone.
+        # (inbox gate — replaces the old silent auto-dispatch.)
         content = task.get("content") or ""
         if _APP_JIRA_PATTERN.match(content):
             return {
-                "classification": "pandora_investigation",
+                "classification": "pandora_gate",
                 "confidence": 1.0,
                 "assignee": "@pandora",
                 "contexts": ["@deep", "@code"],
-                "reason": "detected APP-<n>: jira-key prefix",
+                "reason": "APP-<n>: jira ticket — ask before investigating",
                 "llm_model": "rules",
             }
 
@@ -977,6 +1005,28 @@ class ClarifyActivities:
             "pass_n": pass_n,
         }
 
+    def _build_gate_interaction_payload(self, task: dict, decision: dict, pass_n: int) -> dict:
+        """Choice card shown before any agent runs on an Inbox work ticket
+        (APP-<n>: Jira). Two options — hand it to Pandora, or claim it
+        yourself. Ignoring the card (24h timeout → archive) leaves the task
+        untouched in Inbox. No spawn_kind, so ClarifyFlow routes this through
+        InteractionFlow (not AlertInvestigationFlow). (inbox gate)
+        """
+        title = (task.get("content") or "").strip()[:120]
+        return {
+            "flavor": "pandora_gate",
+            "prompt": (
+                f"🎫 New ticket in Inbox:\n{title}\n\n"
+                "Want Pandora to investigate, or are you on it?"
+            ),
+            "options": {
+                "investigate": "🔍 Pandora, investigate",
+                "mine": "🙋 I've got it",
+            },
+            "decision": decision,
+            "pass_n": pass_n,
+        }
+
     @activity.defn
     async def apply_outcome(
         self,
@@ -1069,6 +1119,22 @@ class ClarifyActivities:
                     "args": {"id": item_id},
                 }
             )
+
+        elif classification == "pandora_gate":
+            # Ask-before-acting gate for Inbox work tickets (inbox gate).
+            # Apply NO labels/commands — just spawn the choice card. The flow
+            # bumps the watermark (an interaction spawned) so we don't re-card
+            # every tick; apply_clarify_resolution applies the chosen decision.
+            # No spawn_kind → ClarifyFlow routes this to InteractionFlow.
+            return {
+                "applied": False,
+                "interaction_spawned": True,
+                "interaction_payload": self._build_gate_interaction_payload(
+                    task, decision, pass_n
+                ),
+                "commands_sent": 0,
+                "outbox_queued": 0,
+            }
 
         elif classification == "pandora_investigation":
             # Acme Jira ticket route. Stamp the task with the area
@@ -1221,6 +1287,15 @@ class ClarifyActivities:
                 commands.append(
                     TodoistConnector.build_item_update_command(item_id, labels=labels_with_state)
                 )
+
+        elif classification == "mine":
+            # Hands-off resolution: user claimed the task with @me (via the
+            # gate card's "I've got it", or manually). find_unclassified_items
+            # excludes @me tasks, so stamping the label is terminal. (inbox gate)
+            mine_labels = list({*existing_labels, "@me"})
+            commands.append(
+                TodoistConnector.build_item_update_command(item_id, labels=mine_labels)
+            )
 
         elif classification == "leave":
             # Low-conf 'Leave for later' resolution: add @review label,
@@ -1427,6 +1502,26 @@ class ClarifyActivities:
                 resolved_decision["classification"] = "leave"
             else:
                 return {"applied": False, "reason": f"unknown_low_conf_choice:{choice}"}
+
+        elif flavor == "pandora_gate":
+            # Inbox work-ticket gate resolution (inbox gate).
+            if choice == "investigate":
+                # Approve Pandora. Route through pandora_investigation so
+                # apply_outcome stamps @pandora + @area/acme; its spawn payload
+                # is ignored here (activities can't start workflows). We clear
+                # the watermark AFTER logging (below) so the next ClarifyFlow
+                # tick re-surfaces the task, hits the @pandora retry branch, and
+                # fires AlertInvestigationFlow from the flow.
+                # ponytail: ~15-min latency to investigation start — fine for
+                # async triage; upgrade path is a Temporal client on this
+                # activity if instant start is ever needed.
+                resolved_decision["classification"] = "pandora_investigation"
+                resolved_decision["assignee"] = "@pandora"
+                resolved_decision["contexts"] = ["@deep", "@code"]
+            elif choice == "mine":
+                resolved_decision["classification"] = "mine"
+            else:
+                return {"applied": False, "reason": f"unknown_gate_choice:{choice}"}
         else:
             return {"applied": False, "reason": f"unknown_flavor:{flavor}"}
 
@@ -1449,6 +1544,11 @@ class ClarifyActivities:
             pass_n=pass_n,
             user_hint=f"chat:{choice}",
         )
+        # Gate "investigate" needs the task to re-enter find_unclassified_items
+        # so the @pandora retry branch fires AlertInvestigationFlow from the
+        # flow. log_classification just bumped the watermark — undo it. (inbox gate)
+        if flavor == "pandora_gate" and choice == "investigate":
+            await self.clear_clarify_watermark(task_id)
         # references-as-knowledge: if the resolution lands on 'reference'
         # and Todoist accepted the labels, inline-ingest + dispatch the
         # verdict (no Temporal scheduling — we're inside an activity).
