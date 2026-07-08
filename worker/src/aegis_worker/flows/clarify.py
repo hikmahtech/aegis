@@ -18,10 +18,15 @@ Five base GTD outcomes from `classify_one`:
 - ``next_action`` — label update (optional `due.string="tomorrow"` from defer).
                   Multi-step work uses Todoist subtasks, not sub-projects.
 
-Three pandora short-circuits (added 2026-05-20):
+Pandora short-circuits (added 2026-05-20):
 
+- ``pandora_gate``          — fresh `^APP-\\d+:` Jira ticket (no @pandora yet):
+                            spawn a choice card instead of auto-investigating.
+                            Resolution stamps @pandora (→ investigation next
+                            tick) or @me (hands off). (inbox gate, 2026-07)
 - ``pandora_owned``         — task already labelled `@pandora`; no-op apply
-- ``pandora_investigation`` — title matches `^APP-\\d+:` Acme Jira key
+- ``pandora_investigation`` — @pandora `^APP-\\d+:` task with no completed run
+                            (gate-approved or a crashed prior attempt)
 - ``pandora_followup``      — user comment on existing `@pandora` APP-task
                             triggers a fresh investigation with the comment
                             appended as alert context
