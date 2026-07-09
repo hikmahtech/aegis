@@ -77,7 +77,7 @@ def test_system_info(client):
     resp = client.get("/api/system/info")
     assert resp.status_code == 200
     body = resp.json()
-    assert body["version"] == "2.0.0"
+    assert body["version"] == "0.1.0"
     assert "git_sha" in body
     assert isinstance(body["uptime_seconds"], int)
 
