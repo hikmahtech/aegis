@@ -251,6 +251,13 @@ export const api = {
   getGtdRules: () => apiFetch<any>('/api/admin/todoist/gtd-rules'),
   saveGtdRules: (body: any) =>
     apiFetch<any>('/api/admin/todoist/gtd-rules', { method: 'PUT', body: JSON.stringify(body) }),
+  getContentRoutes: () => apiFetch<any>('/api/admin/todoist/content-routes'),
+  saveContentRoutes: (body: { routes: any[] }) =>
+    apiFetch<any>('/api/admin/todoist/content-routes', { method: 'PUT', body: JSON.stringify(body) }),
+  previewContentRoute: (body: { match: string; value: string }) =>
+    apiFetch<any>('/api/admin/todoist/content-routes/preview', { method: 'POST', body: JSON.stringify(body) }),
+  suggestContentRoute: (body: { examples: string[] }) =>
+    apiFetch<any>('/api/admin/todoist/content-routes/suggest', { method: 'POST', body: JSON.stringify(body) }),
   // Workbench: tasks, project picker, and clarify-decision visibility
   todoistTasks: (params?: { project_id?: string; status?: string; assignee?: string; limit?: number }) => {
     const q = new URLSearchParams();

@@ -11,6 +11,13 @@ import pytest_asyncio
 from aegis_worker.activities.clarify import ClarifyActivities
 
 
+@pytest_asyncio.fixture(autouse=True, loop_scope="function")
+async def _auto_content_route(seed_app_route):
+    """Every test here classifies APP-<n>: tasks via the seeded content route
+    (config-driven replacement for the old hardcoded ^APP-\\d+: pattern)."""
+    yield
+
+
 @pytest_asyncio.fixture(loop_scope="function")
 async def _inbox_seeded(db_pool):
     """Seed inbox-project setting + one source-tagged task."""
@@ -452,6 +459,37 @@ async def test_find_unclassified_pandora_cooldown_doesnt_block_first_investigati
         rows = await acts.find_unclassified_items(max_items=20)
         ids = [r["id"] for r in rows]
         assert task_id in ids
+    finally:
+        async with db_pool.acquire() as conn:
+            await conn.execute("DELETE FROM todoist_tasks WHERE id = $1", task_id)
+
+
+@pytest.mark.asyncio
+async def test_find_unclassified_no_routes_admits_no_app_tasks(db_pool, _inbox_seeded) -> None:
+    """With NO content routes configured (the OSS default), an APP-<n>: task that
+    has no source_tag and no agent label is NOT admitted — and the query doesn't
+    crash on the empty `t.content ~ ANY('{}')` filter."""
+    from aegis.services.content_routes import save_content_routes
+    from aegis_worker.activities import clarify as _cl
+
+    await save_content_routes(db_pool, [])  # clear routes the autouse fixture seeded
+    _cl._routes_cache.update(routes=None, ts=0.0)
+    task_id = "T_NOROUTE_APP"
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO todoist_tasks (id, project_id, content, labels, is_completed, raw) "
+            "VALUES ($1,'P_INBOX','APP-424242: no route configured', "
+            " ARRAY[]::text[], false, '{}'::jsonb) "
+            "ON CONFLICT (id) DO UPDATE SET labels=EXCLUDED.labels, last_clarified_at=NULL",
+            task_id,
+        )
+    try:
+        acts = ClarifyActivities(
+            db_pool=db_pool, todoist_connector=AsyncMock(), llm_client=AsyncMock()
+        )
+        rows = await acts.find_unclassified_items(max_items=20)
+        assert isinstance(rows, list)
+        assert task_id not in [r["id"] for r in rows]
     finally:
         async with db_pool.acquire() as conn:
             await conn.execute("DELETE FROM todoist_tasks WHERE id = $1", task_id)
@@ -1575,8 +1613,13 @@ async def test_apply_clarify_resolution_pandora_gate_investigate(db_pool, _resol
     )
     acts = ClarifyActivities(db_pool=db_pool, todoist_connector=connector, llm_client=AsyncMock())
     # Pre-bump the watermark so a passing NULL assertion proves the clear ran.
+    # Give the task an APP-<n>: title so it matches the seeded content route —
+    # the route's area_label (@area/acme) is what gets stamped on investigate.
     async with db_pool.acquire() as conn:
-        await conn.execute("UPDATE todoist_tasks SET last_clarified_at = now() WHERE id='T_RES'")
+        await conn.execute(
+            "UPDATE todoist_tasks SET content='APP-500: vendor issue', "
+            "last_clarified_at = now() WHERE id='T_RES'"
+        )
     metadata = {
         "source": "gtd_clarify",
         "flavor": "pandora_gate",
@@ -2048,6 +2091,50 @@ async def test_classify_one_app_prefix_requires_colon(db_pool) -> None:
 
 
 @pytest.mark.asyncio
+async def test_classify_one_gate_false_route_applies_labels_directly(db_pool) -> None:
+    """A content route with gate:false routes by content to `route_apply` — the
+    route's assignee + contexts (+ area_label) are applied directly, no choice
+    card and no agent run. Proves routing is config-driven, not hardcoded to
+    APP-/@pandora: here a `contains "[bug]"` route hands the task to @raphael."""
+    from aegis.services.content_routes import save_content_routes
+    from aegis_worker.activities import clarify as _cl
+
+    await save_content_routes(
+        db_pool,
+        [
+            {
+                "key": "bug",
+                "match": "contains",
+                "value": "[bug]",
+                "gate": False,
+                "assignee": "@raphael",
+                "contexts": ["@reading"],
+                "area_label": "@area/oss",
+            }
+        ],
+    )
+    _cl._routes_cache.update(routes=None, ts=0.0)
+    connector = AsyncMock()
+    connector.commands = AsyncMock(
+        return_value={"ok": True, "data": {"sync_status": {}, "temp_id_mapping": {}}}
+    )
+    acts = ClarifyActivities(db_pool=db_pool, todoist_connector=connector, llm_client=AsyncMock())
+    task = {"id": "T_BUG", "content": "urgent [bug] in parser", "labels": [], "source_tag": None}
+
+    decision = await acts.classify_one(task)
+    assert decision["classification"] == "route_apply"
+    assert decision["assignee"] == "@raphael"
+
+    out = await acts.apply_outcome(task, decision)
+    assert out["applied"] is True
+    assert out["interaction_spawned"] is False
+    sent = connector.commands.await_args.args[0]
+    upd = next(c for c in sent if c["type"] == "item_update")
+    assert {"@raphael", "@reading", "@area/oss"} <= set(upd["args"]["labels"])
+    assert not any(c["type"] == "item_complete" for c in sent)
+
+
+@pytest.mark.asyncio
 async def test_classify_one_pandora_label_short_circuits(db_pool) -> None:
     """Tasks already carrying @pandora bypass classification entirely."""
     acts = ClarifyActivities(db_pool=db_pool, todoist_connector=AsyncMock(), llm_client=AsyncMock())
@@ -2221,7 +2308,7 @@ async def test_apply_outcome_pandora_investigation_labels_and_signal(db_pool) ->
     assert alert["resource_tag_filter"] == ["acme"]
     assert alert["requires_approval"] is False
     assert alert["source"] == "todoist-jira"
-    assert alert["fingerprint"] == "jira-T_APP"
+    assert alert["fingerprint"] == "route-T_APP"
     # item_update was sent with both labels
     sent = connector.commands.await_args.args[0]
     upd = next(c for c in sent if c["type"] == "item_update")
@@ -2474,8 +2561,8 @@ async def test_apply_outcome_pandora_followup_builds_followup_alert(db_pool) -> 
     alert = out["interaction_payload"]["alert"]
     assert alert["todoist_task_id"] == "T_FU"
     # Fingerprint includes a token derived from last_note_at (per-comment)
-    assert alert["fingerprint"].startswith("jira-T_FU-followup-")
-    assert alert["fingerprint"] != "jira-T_FU"
+    assert alert["fingerprint"].startswith("route-T_FU-followup-")
+    assert alert["fingerprint"] != "route-T_FU"
     # User comment carried into description
     assert "Also affects production" in alert["description"]
     assert "User followup comment" in alert["description"]

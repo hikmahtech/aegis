@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { Fragment, useEffect, useState } from 'react';
 import { api } from '../api/client';
 import ErrorBanner from '../components/ErrorBanner';
 
@@ -139,6 +139,15 @@ export default function Todoist() {
   const [savingGtd, setSavingGtd] = useState(false);
   const [gtdMsg, setGtdMsg] = useState('');
 
+  // Content routes (regex/prefix/contains on task title → assignee/labels/gate)
+  const [routes, setRoutes] = useState<any[]>([]);
+  const [matchModes, setMatchModes] = useState<string[]>(['prefix', 'contains', 'regex']);
+  const [savingRoutes, setSavingRoutes] = useState(false);
+  const [routesMsg, setRoutesMsg] = useState('');
+  const [previews, setPreviews] = useState<Record<number, any>>({});
+  const [suggestExamples, setSuggestExamples] = useState('');
+  const [suggesting, setSuggesting] = useState(false);
+
   // Project picker (shared by Configure + Tasks filter bar)
   const [allProjects, setAllProjects] = useState<TodoistProject[]>([]);
   // Read-only structure panels — projects tree (Areas -> work-streams) + labels.
@@ -169,6 +178,10 @@ export default function Todoist() {
       setProjects({ inbox: '', ...(c.projects || {}) });
       setApiKey('');
       setGtd(await api.getGtdRules());
+      const cr = await api.getContentRoutes();
+      setRoutes(cr.routes || []);
+      setMatchModes(cr.match_modes || ['prefix', 'contains', 'regex']);
+      setPreviews({});
       const p = await api.todoistProjects();
       setAllProjects(p || []);
     } catch (e: any) {
@@ -231,6 +244,68 @@ export default function Todoist() {
       setGtd(r);
       setGtdMsg('Saved — applies within ~30s.');
     } catch (e: any) { setError(e); } finally { setSavingGtd(false); }
+  }
+
+  function updateRoute(i: number, patch: any) {
+    setRoutes(rs => rs.map((r, idx) => (idx === i ? { ...r, ...patch } : r)));
+  }
+  function addRoute() {
+    setRoutes(rs => [...rs, {
+      key: '', match: 'prefix', value: '', assignee: '@pandora', contexts: [],
+      area_label: null, gate: true, service: null, resource_tags: [],
+    }]);
+  }
+  function removeRoute(i: number) {
+    setRoutes(rs => rs.filter((_, idx) => idx !== i));
+    setPreviews(prev => { const n = { ...prev }; delete n[i]; return n; });
+  }
+  function moveRoute(i: number, dir: number) {
+    setRoutes(rs => {
+      const j = i + dir;
+      if (j < 0 || j >= rs.length) return rs;
+      const n = [...rs];
+      [n[i], n[j]] = [n[j], n[i]];
+      return n;
+    });
+    setPreviews({});
+  }
+  async function saveRoutes() {
+    setSavingRoutes(true); setRoutesMsg(''); setError(null);
+    try {
+      const r = await api.saveContentRoutes({ routes });
+      setRoutes(r.routes || []);
+      setRoutesMsg('Saved — applies within ~30s.');
+    } catch (e: any) { setError(e); } finally { setSavingRoutes(false); }
+  }
+  async function previewRoute(i: number) {
+    const r = routes[i];
+    try {
+      const p = await api.previewContentRoute({ match: r.match, value: r.value });
+      setPreviews(prev => ({ ...prev, [i]: p }));
+    } catch (e: any) {
+      setPreviews(prev => ({ ...prev, [i]: { error: e?.message || String(e) } }));
+    }
+  }
+  async function suggestPattern() {
+    const examples = suggestExamples.split(/[\n,]/).map(s => s.trim()).filter(Boolean);
+    if (!examples.length) return;
+    setSuggesting(true); setRoutesMsg(''); setError(null);
+    try {
+      const s = await api.suggestContentRoute({ examples });
+      if (s.pattern) {
+        // Never auto-applied — add a new editable row pre-filled with the draft
+        // (regex mode). The user edits + previews before Save.
+        setRoutes(rs => [...rs, {
+          key: '', match: 'regex', value: s.pattern, assignee: '@pandora', contexts: [],
+          area_label: null, gate: true, service: null, resource_tags: [],
+        }]);
+        setRoutesMsg(s.all_examples_match
+          ? '✨ Added a suggested pattern matching all examples — review + preview before saving.'
+          : '✨ Added a suggested pattern (not all examples matched) — edit + preview before saving.');
+      } else {
+        setRoutesMsg('Suggest failed: ' + (s.error || 'no pattern derived'));
+      }
+    } catch (e: any) { setError(e); } finally { setSuggesting(false); }
   }
 
   async function saveConfig() {
@@ -406,6 +481,97 @@ export default function Todoist() {
           {gtdMsg && <span className="msg-success" style={{ marginLeft: 10 }}>{gtdMsg}</span>}
         </div>
       )}
+
+      {/* Content routes */}
+      <div className="card" style={{ marginTop: 16 }}>
+        <h3>Content routes</h3>
+        <p className="page-subtitle">
+          Route Inbox tasks by their <em>title</em> (complements GTD rules, which route by source
+          tag). Ordered — first match wins. <strong>gate</strong> on → asks via a Slack card
+          ("investigate / I've got it") before an agent runs; <strong>gate</strong> off → applies
+          the assignee + contexts directly. Ships empty; add your own rows.
+        </p>
+
+        <div style={{ display: 'flex', gap: 8, alignItems: 'flex-start', marginBottom: 12, flexWrap: 'wrap' }}>
+          <textarea
+            style={{ minWidth: 280, flex: 1, minHeight: 44, fontSize: 13 }}
+            placeholder="✨ Suggest a pattern — paste example titles (one per line), e.g.&#10;APP-1234: something broke&#10;BUG-42: crash"
+            value={suggestExamples}
+            onChange={e => setSuggestExamples(e.target.value)}
+          />
+          <button className="btn" disabled={suggesting || !suggestExamples.trim()} onClick={suggestPattern}>
+            {suggesting ? 'Suggesting…' : '✨ Suggest'}
+          </button>
+        </div>
+
+        <div className="table-scroll">
+        <table style={{ width: '100%', fontSize: 13 }}>
+          <thead><tr>
+            <th style={{ textAlign: 'left' }}>Order</th>
+            <th>Key</th><th>Match</th><th>Value</th><th>Assignee</th>
+            <th>Contexts</th><th>Gate</th><th>Area</th><th>Service</th><th>Res. tags</th><th></th>
+          </tr></thead>
+          <tbody>
+            {routes.map((r: any, i: number) => (
+              <Fragment key={`route${i}`}>
+                <tr>
+                  <td style={{ whiteSpace: 'nowrap' }}>
+                    <button className="btn btn-sm" disabled={i === 0} onClick={() => moveRoute(i, -1)}>↑</button>
+                    <button className="btn btn-sm" disabled={i === routes.length - 1} onClick={() => moveRoute(i, 1)}>↓</button>
+                  </td>
+                  <td><input style={{ width: 90 }} value={r.key || ''}
+                    onChange={e => updateRoute(i, { key: e.target.value })} /></td>
+                  <td><select value={r.match} onChange={e => updateRoute(i, { match: e.target.value })}>
+                    {matchModes.map(m => <option key={m} value={m}>{m}</option>)}
+                  </select></td>
+                  <td style={{ whiteSpace: 'nowrap' }}>
+                    <input style={{ width: 160 }} value={r.value || ''}
+                      onChange={e => updateRoute(i, { value: e.target.value })} />
+                    <button className="btn btn-sm" style={{ marginLeft: 4 }} onClick={() => previewRoute(i)}>Preview</button>
+                  </td>
+                  <td><input style={{ width: 80 }} value={r.assignee || ''}
+                    onChange={e => updateRoute(i, { assignee: e.target.value })} /></td>
+                  <td><input style={{ width: 110 }} value={(r.contexts || []).join(', ')}
+                    onChange={e => updateRoute(i, { contexts: e.target.value.split(',').map((s: string) => s.trim()).filter(Boolean) })} /></td>
+                  <td style={{ textAlign: 'center' }}><input type="checkbox" checked={!!r.gate}
+                    onChange={e => updateRoute(i, { gate: e.target.checked })} /></td>
+                  <td><input style={{ width: 90 }} placeholder="(none)" value={r.area_label || ''}
+                    onChange={e => updateRoute(i, { area_label: e.target.value })} /></td>
+                  <td><input style={{ width: 70 }} placeholder="(none)" value={r.service || ''}
+                    onChange={e => updateRoute(i, { service: e.target.value })} /></td>
+                  <td><input style={{ width: 90 }} value={(r.resource_tags || []).join(', ')}
+                    onChange={e => updateRoute(i, { resource_tags: e.target.value.split(',').map((s: string) => s.trim()).filter(Boolean) })} /></td>
+                  <td><button className="btn btn-sm" onClick={() => removeRoute(i)}>✕</button></td>
+                </tr>
+                {previews[i] && (
+                  <tr key={`p${i}`}>
+                    <td colSpan={11} style={{ fontSize: 12, background: 'var(--bg-subtle, #f6f6f6)' }}>
+                      {previews[i].error
+                        ? <span className="msg-error">Preview error: {previews[i].error}</span>
+                        : <span>
+                            Matches <strong>{previews[i].match_count}</strong> of your current Inbox tasks
+                            {previews[i].matches?.length > 0 && (
+                              <>: <code>{previews[i].matches.slice(0, 5).join('  ·  ')}</code>
+                                {previews[i].match_count > 5 && <em> …and {previews[i].match_count - 5} more</em>}</>
+                            )}
+                          </span>}
+                    </td>
+                  </tr>
+                )}
+              </Fragment>
+            ))}
+            {routes.length === 0 && (
+              <tr><td colSpan={11} style={{ color: 'var(--text-muted, #888)' }}>No routes — add one, or ✨ suggest from examples.</td></tr>
+            )}
+          </tbody>
+        </table>
+        </div>
+        <button className="btn" style={{ marginTop: 8 }} onClick={addRoute}>+ Add route</button>
+        <button className="btn btn-primary" style={{ marginTop: 8, marginLeft: 8 }} disabled={savingRoutes} onClick={saveRoutes}>
+          {savingRoutes ? 'Saving…' : 'Save content routes'}
+        </button>
+        {routesMsg && <span className="msg-success" style={{ marginLeft: 10 }}>{routesMsg}</span>}
+      </div>
 
       {/* Tasks workbench */}
       <section style={{ marginTop: 24 }}>

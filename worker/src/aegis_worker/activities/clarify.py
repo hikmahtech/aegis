@@ -6,28 +6,36 @@ ClarifyFlow walks Inbox tasks tagged with Phase 2 source tags
 
     trash | reference | someday | 2_min | next_action
 
-Rule lookups (skip_inbox / default_assignee / default_contexts)
-live in the `_RuleSet` Python class below.
+Rule lookups (skip_inbox / default_assignee / default_contexts) live in
+the `_RuleSet` Python class below, keyed on source_tag (where a task came
+from). A second, complementary axis routes by task CONTENT: `content_routes`
+(aegis.services.content_routes) is an admin-configured, ordered list of
+regex/prefix/contains rules — the old hardcoded Acme `^APP-\\d+:` → @pandora
+investigation is now just one such row. First match wins; ships empty.
 
-Two pandora-track classifications added 2026-05-20:
+Content-route classifications:
 
-- `pandora_owned` — task already carries the @pandora label (claimed by
-  a prior AlertInvestigationFlow run, either spawned via the APP-<n>:
-  branch below or created directly by an alert-webhook investigation).
-  apply_outcome is a no-op; log_classification still bumps
-  last_clarified_at so the task drops out of find_unclassified_items.
+- `pandora_gate` — a *fresh* task matching a `gate: true` content route (no
+  @pandora yet). Doesn't auto-fire: classify_one returns `pandora_gate` →
+  apply_outcome spawns a two-option choice card ("🔍 investigate" / "🙋 I've
+  got it"). apply_clarify_resolution then either stamps the route's assignee
+  (@pandora) + clears the watermark — so the next tick's retry branch fires
+  the real AlertInvestigationFlow, scoped by the route's service/resource_tags
+  — or stamps @me.
 
-- `pandora_investigation` — task content matches `^APP-\\d+:` (a Jira
-  ticket synced from Acme). apply_outcome labels the task
-  @area/acme + @pandora and returns a spawn flag; ClarifyFlow
-  fires AlertInvestigationFlow with the existing task_id.
+- `pandora_investigation` — a @pandora task matching a content route with no
+  completed investigation (the retry surface, or the gate's approved path).
+  apply_outcome stamps the route's assignee + area_label and returns a spawn
+  flag; ClarifyFlow fires AlertInvestigationFlow with the existing task_id.
 
-Inbox gate (2026-07): a *fresh* APP-<n>: ticket (no @pandora yet) no longer
-auto-fires. classify_one returns `pandora_gate` → apply_outcome spawns a
-two-option choice card ("🔍 Pandora, investigate" / "🙋 I've got it").
-apply_clarify_resolution then either stamps @pandora and clears the watermark
-(so the next tick's @pandora retry branch fires the real investigation) or
-stamps @me. Any task carrying @me — set on the card or by hand — is skipped by
+- `route_apply` — a task matching a `gate: false` content route: apply the
+  route's assignee + contexts (+ area_label) directly, no card, no agent run.
+
+- `pandora_owned` — task already carries the @pandora label (claimed by a
+  prior AlertInvestigationFlow run). apply_outcome is a no-op; log_classification
+  still bumps last_clarified_at so the task drops out of find_unclassified_items.
+
+Any task carrying @me — set on a gate card or by hand — is skipped by
 find_unclassified_items entirely: the user's "hands off, I'm on it" signal.
 """
 
@@ -41,18 +49,17 @@ from datetime import datetime, time
 from zoneinfo import ZoneInfo
 
 from aegis.llm import parse_llm_json
+from aegis.services.content_routes import (
+    active_patterns,
+    match_route,
+)
+from aegis.services.content_routes import get_content_routes as _get_content_routes_db
 from aegis.services.gtd_rules import (
     DEFAULT_ASSIGNEE,
     DEFAULT_CONTEXTS,
     DEFAULT_SKIP_INBOX,
     get_gtd_rules,
 )
-
-# Strict, case-sensitive Jira-key prefix. Acme Jira issues use the
-# APP project key, so any task starting with `APP-<digits>:` is treated
-# as a Pandora investigation candidate. The colon is required so plain
-# mentions ("APP-1234 broke yesterday") don't trigger the branch.
-_APP_JIRA_PATTERN = re.compile(r"^APP-\d+:")
 
 
 class _RuleSet:
@@ -105,6 +112,27 @@ async def get_gtd_ruleset(pool) -> _RuleSet:
         rs = _RULES
     _gtd_cache.update(rs=rs, ts=now)
     return rs
+
+
+# 30s-cached content routes (regex/prefix/contains on task title → assignee /
+# labels / gate). Ships empty; each deployment configures its own from the admin
+# UI. Empty list without a pool or on read failure — routing must never break
+# classification.
+_routes_cache: dict = {"routes": None, "ts": 0.0}
+
+
+async def get_content_routes(pool) -> list[dict]:
+    """Effective content routes, 30s cache. [] without a pool or on read failure."""
+    if pool is None:
+        return []
+    import time
+
+    now = time.monotonic()
+    if _routes_cache["routes"] is not None and now - _routes_cache["ts"] < 30.0:
+        return _routes_cache["routes"]
+    routes = await _get_content_routes_db(pool)
+    _routes_cache.update(routes=routes, ts=now)
+    return routes
 
 
 # Per-agent addressable labels. classify_one's per-agent short-circuit
@@ -261,17 +289,22 @@ class ClarifyActivities:
             return []
         if not await self._settings_bool("gtd_clarify_enabled", True):
             return []
+        # Content-route patterns for the eligibility filter ($6). Fetched outside
+        # the connection block; empty when no routes are configured, in which
+        # case `t.content ~ ANY('{}')` admits nothing extra (only source-tagged +
+        # agent-labelled tasks reach the classifier — preserving old behavior).
+        patterns = active_patterns(await get_content_routes(self.db_pool))
         async with self.db_pool.acquire() as conn:
             inbox_id = await conn.fetchval(
                 "SELECT value->>'inbox' FROM settings WHERE key = 'todoist_managed_project_ids'"
             )
             if not inbox_id:
                 return []
-            # Source-tagged tasks are the standard clarify input. APP-<n>:
-            # Jira tickets (synced via Todoist's native Jira integration,
-            # not AEGIS capture) arrive without any source_tag — the
-            # second branch lets the pandora_investigation classifier
-            # see them so the spy/screener/bcp/data routing still fires.
+            # Source-tagged tasks are the standard clarify input. Tasks whose
+            # title matches a content route (e.g. issue-tracker tickets synced by
+            # Todoist's native integration, not AEGIS capture) arrive without any
+            # source_tag — the `t.content ~ ANY($6)` branch below lets the
+            # content-route classifier see them so routing still fires.
             rows = await conn.fetch(
                 """
                 SELECT
@@ -332,20 +365,20 @@ class ClarifyActivities:
                       -- failing investigation doesn't loop every tick.
                       OR (
                           '@pandora' = ANY(t.labels)
-                          AND t.content ~ '^APP-[0-9]+:'
+                          AND t.content ~ ANY($6)
                           AND COALESCE(t.last_clarified_at, 'epoch'::timestamptz)
                               < NOW() - INTERVAL '1 hour'
                           AND NOT EXISTS (
                               SELECT 1 FROM workflow_runs wr
                               WHERE wr.workflow_type = 'AlertInvestigationFlow'
                                 AND wr.status = 'completed'
-                                AND wr.workflow_id LIKE 'pandora-jira-' || t.id || '-%'
+                                AND wr.workflow_id LIKE '%' || t.id || '%'
                           )
                       )
                   )
                   AND (
                       t.source_tag IS NOT NULL
-                      OR t.content ~ '^APP-[0-9]+:'
+                      OR t.content ~ ANY($6)
                       -- Comment-channel (2026-05-26): user-created Todoist
                       -- tasks labelled with an addressable agent need to be
                       -- eligible too, otherwise the @sebas/@raphael/@maou
@@ -368,11 +401,11 @@ class ClarifyActivities:
                   -- concurrent sibling.
                   AND NOT (
                       '@pandora' = ANY(t.labels)
-                      AND t.content ~ '^APP-[0-9]+:'
+                      AND t.content ~ ANY($6)
                       AND EXISTS (
                           SELECT 1 FROM workflow_runs wr
                           WHERE wr.workflow_type = 'AlertInvestigationFlow'
-                            AND wr.workflow_id LIKE 'pandora-jira-' || t.id || '-%'
+                            AND wr.workflow_id LIKE '%' || t.id || '%'
                             AND wr.started_at > NOW() - INTERVAL '30 minutes'
                       )
                   )
@@ -421,6 +454,7 @@ class ClarifyActivities:
                 CLARIFY_NOTE_SQL_LIKE,
                 AGENT_REPLY_SQL_LIKE,
                 AGENT_REPLY_ERROR_SQL_LIKE,
+                patterns,
             )
         return [dict(r) for r in rows]
 
@@ -446,7 +480,9 @@ class ClarifyActivities:
                       AND workflow_id LIKE $1
                     LIMIT 1
                     """,
-                    f"pandora-jira-{task_id}-%",
+                    # Match both the legacy `pandora-jira-<id>-…` and the new
+                    # `investigation-<id>-…` workflow-id schemes by task id.
+                    f"%{task_id}%",
                 )
             return row is not None
         except Exception:
@@ -546,6 +582,7 @@ class ClarifyActivities:
         source_tag = task.get("source_tag")
         rules = await get_gtd_ruleset(self.db_pool)
         reg = await get_agent_registry(self.db_pool)
+        routes = await get_content_routes(self.db_pool)
 
         # Pandora ownership short-circuit. AlertInvestigationFlow may
         # create inbox tasks with @pandora pre-applied; clarify must not
@@ -570,14 +607,14 @@ class ClarifyActivities:
         # Fires only when:
         #   - a fresh user comment is present (latest_user_note non-empty),
         #   - @pandora is NOT in labels (pandora keeps priority for its
-        #     APP-<n>: workflow + own pipeline),
-        #   - content does NOT match APP-<n>: (Jira routing wins).
+        #     content-route workflow + own pipeline),
+        #   - content does NOT match a content route (content routing wins).
         # The classification result spawns AgentChatReplyFlow downstream.
         latest_note_for_branch = (task.get("latest_user_note") or "").strip()
         if (
             latest_note_for_branch
             and "@pandora" not in existing_labels
-            and not _APP_JIRA_PATTERN.match(content_for_branch)
+            and match_route(content_for_branch, routes) is None
         ):
             for label, branch in _addressable_agents(reg):
                 if label in existing_labels:
@@ -593,16 +630,16 @@ class ClarifyActivities:
         if "@pandora" in existing_labels:
             latest_note = (task.get("latest_user_note") or "").strip()
             content = task.get("content") or ""
-            if latest_note and _APP_JIRA_PATTERN.match(content):
+            if latest_note and match_route(content, routes) is not None:
                 return {
                     "classification": "pandora_followup",
                     "confidence": 1.0,
                     "assignee": "@pandora",
                     "contexts": ["@deep", "@code"],
-                    "reason": "user comment on @pandora APP-<n>: task",
+                    "reason": "user comment on @pandora content-route task",
                     "llm_model": "rules",
                 }
-            # Retry branch (2026-05-21): an APP-<n>: task labelled @pandora
+            # Retry branch (2026-05-21): a content-route task labelled @pandora
             # with NO successful AlertInvestigationFlow completion in its
             # history means a prior investigation crashed (most commonly
             # qwen3:14b LLM timeouts during assess_investigation). Without
@@ -613,7 +650,7 @@ class ClarifyActivities:
             # dedup keys on `audit_log.alert_investigated` which is only
             # written on success, so re-running a failed investigation isn't
             # blocked.
-            if _APP_JIRA_PATTERN.match(content):
+            if match_route(content, routes) is not None:
                 investigated = await self._has_completed_pandora_investigation(task["id"])
                 if not investigated:
                     return {
@@ -621,7 +658,7 @@ class ClarifyActivities:
                         "confidence": 1.0,
                         "assignee": "@pandora",
                         "contexts": ["@deep", "@code"],
-                        "reason": "@pandora APP-<n>: task with no successful prior investigation — retrying",
+                        "reason": "@pandora content-route task with no successful prior investigation — retrying",
                         "llm_model": "rules",
                     }
             # Comment-channel branch (2026-05-27): a manual @pandora-labelled
@@ -650,21 +687,34 @@ class ClarifyActivities:
                 "llm_model": "rules",
             }
 
-        # APP-<n>: Jira-prefix branch. First encounter (no @pandora label yet —
-        # that case returned in the @pandora block above): DON'T auto-fire an
-        # investigation. Ask first via a choice card (pandora_gate). Picking
-        # "investigate" applies @pandora, which re-enters the @pandora retry
-        # branch above on the next tick and fires the real AlertInvestigationFlow;
-        # picking "I've got it" applies @me and clarify leaves the task alone.
-        # (inbox gate — replaces the old silent auto-dispatch.)
+        # Content-route branch. First encounter (no @pandora label yet — that
+        # case returned in the @pandora block above). A `gate: true` route
+        # DOESN'T auto-fire an investigation: ask first via a choice card
+        # (pandora_gate). Picking "investigate" applies the route's assignee,
+        # which re-enters the @pandora retry branch above on the next tick and
+        # fires the real AlertInvestigationFlow; "I've got it" applies @me and
+        # clarify leaves the task alone. A `gate: false` route just applies the
+        # route's assignee + contexts directly (route_apply) — plain label
+        # routing, no card, no agent run. (inbox gate — replaces the old
+        # hardcoded Acme APP-<n>: auto-dispatch.)
         content = task.get("content") or ""
-        if _APP_JIRA_PATTERN.match(content):
+        matched = match_route(content, routes)
+        if matched is not None:
+            if matched.get("gate", True):
+                return {
+                    "classification": "pandora_gate",
+                    "confidence": 1.0,
+                    "assignee": matched.get("assignee") or "@pandora",
+                    "contexts": list(matched.get("contexts") or ["@deep", "@code"]),
+                    "reason": f"content route {matched.get('key')!r} — ask before investigating",
+                    "llm_model": "rules",
+                }
             return {
-                "classification": "pandora_gate",
+                "classification": "route_apply",
                 "confidence": 1.0,
-                "assignee": "@pandora",
-                "contexts": ["@deep", "@code"],
-                "reason": "APP-<n>: jira ticket — ask before investigating",
+                "assignee": matched.get("assignee") or "@me",
+                "contexts": list(matched.get("contexts") or []),
+                "reason": f"content route {matched.get('key')!r} — apply labels",
                 "llm_model": "rules",
             }
 
@@ -797,31 +847,41 @@ class ClarifyActivities:
 
     @staticmethod
     def _pandora_alert_payload(
-        content: str, description: str, fingerprint: str, item_id: str
+        content: str,
+        description: str,
+        fingerprint: str,
+        item_id: str,
+        *,
+        service: str | None = None,
+        resource_tags: list[str] | None = None,
     ) -> dict:
-        """Build the AlertInvestigationFlow spawn payload for a @pandora
-        Acme Jira investigation. Shared by the
-        pandora_investigation and pandora_followup branches — they differ
-        only in the `description` and `fingerprint` passed in.
+        """Build the AlertInvestigationFlow spawn payload for a content-route
+        investigation. Shared by the pandora_investigation and pandora_followup
+        branches — they differ only in `description`/`fingerprint`; `service`
+        and `resource_tags` come from the matched content route (both optional —
+        omit to let the investigation repo-match unscoped).
+
+        `source` stays "todoist-jira": AlertInvestigationFlow treats that value
+        as a scoping-only contract (investigate + comment, never an autonomous
+        PR) — the right default for a gated inbox work ticket.
         """
-        return {
-            "spawn_kind": "pandora_investigation",
-            "alert": {
-                "title": content[:200],
-                "description": description[:2000],
-                "source": "todoist-jira",
-                "service": "acme",
-                "severity": "normal",
-                "fingerprint": fingerprint,
-                "labels": {
-                    "alertname": content[:100],
-                    "service": "acme",
-                },
-                "requires_approval": False,
-                "todoist_task_id": item_id,
-                "resource_tag_filter": ["acme"],
-            },
+        labels: dict = {"alertname": content[:100]}
+        alert: dict = {
+            "title": content[:200],
+            "description": description[:2000],
+            "source": "todoist-jira",
+            "severity": "normal",
+            "fingerprint": fingerprint,
+            "labels": labels,
+            "requires_approval": False,
+            "todoist_task_id": item_id,
         }
+        if service:
+            alert["service"] = service
+            labels["service"] = service
+        if resource_tags:
+            alert["resource_tag_filter"] = list(resource_tags)
+        return {"spawn_kind": "pandora_investigation", "alert": alert}
 
     def _build_agent_synthetic_input(
         self, task: dict, agent_id: str, recent_notes: list[dict] | None = None
@@ -1013,14 +1073,18 @@ class ClarifyActivities:
         InteractionFlow (not AlertInvestigationFlow). (inbox gate)
         """
         title = (task.get("content") or "").strip()[:120]
+        # Name the investigating agent from the matched route's assignee
+        # (@pandora → "Pandora"), so the card isn't hardcoded to one deployment.
+        handle = (decision.get("assignee") or "@pandora").lstrip("@")
+        who = (handle[:1].upper() + handle[1:]) if handle else "the agent"
         return {
             "flavor": "pandora_gate",
             "prompt": (
                 f"🎫 New ticket in Inbox:\n{title}\n\n"
-                "Want Pandora to investigate, or are you on it?"
+                f"Want {who} to investigate, or are you on it?"
             ),
             "options": {
-                "investigate": "🔍 Pandora, investigate",
+                "investigate": f"🔍 {who}, investigate",
                 "mine": "🙋 I've got it",
             },
             "decision": decision,
@@ -1093,6 +1157,13 @@ class ClarifyActivities:
         # follow-up branch below — derived, not hardcoded (issue #36).
         reg = await get_agent_registry(self.db_pool)
         followup_classifications = {f"{aid}_followup" for aid in reg} | {"pandora_chat_followup"}
+        # Content route matched by this task's title — drives the label set +
+        # investigation scoping for the route classifications below. None when
+        # no route matches (e.g. the pandora_investigation retry raced a config
+        # edit); the branches fall back to sane defaults.
+        matched_route = match_route(
+            task.get("content") or "", await get_content_routes(self.db_pool)
+        )
 
         # Pandora-owned task — no side effects at all. classify_one
         # already identified this case; we only need log_classification
@@ -1137,20 +1208,43 @@ class ClarifyActivities:
             }
 
         elif classification == "pandora_investigation":
-            # Acme Jira ticket route. Stamp the task with the area
-            # label + @pandora ownership and signal the caller to spawn
-            # AlertInvestigationFlow as an abandoned child.
-            pandora_labels = list({*existing_labels, "@area/acme", "@pandora", *contexts})
+            # Content-route investigation. Stamp @pandora ownership (the label
+            # the investigation machinery — pandora_owned short-circuit, retry,
+            # cooldown SQL — keys on) plus the route's assignee + optional
+            # area_label, and signal the caller to spawn AlertInvestigationFlow
+            # as an abandoned child, scoped by the route's service/resource_tags.
+            route = matched_route or {}
+            label_set = {*existing_labels, "@pandora", route.get("assignee") or "@pandora", *contexts}
+            area = route.get("area_label")
+            if area:
+                label_set.add(area)
             commands.append(
-                TodoistConnector.build_item_update_command(item_id, labels=pandora_labels)
+                TodoistConnector.build_item_update_command(item_id, labels=list(label_set))
             )
             content = task.get("content") or ""
             description = task.get("description") or ""
-            fingerprint = f"jira-{item_id}"
+            fingerprint = f"route-{item_id}"
             interaction_payload = self._pandora_alert_payload(
-                content, description, fingerprint, item_id
+                content,
+                description,
+                fingerprint,
+                item_id,
+                service=route.get("service"),
+                resource_tags=route.get("resource_tags"),
             )
             interaction_spawned = True
+
+        elif classification == "route_apply":
+            # Content route with gate:false — apply the route's assignee +
+            # contexts (+ optional area_label) directly. No card, no agent run.
+            route = matched_route or {}
+            label_set = {*existing_labels, assignee, *contexts}
+            area = route.get("area_label")
+            if area:
+                label_set.add(area)
+            commands.append(
+                TodoistConnector.build_item_update_command(item_id, labels=list(label_set))
+            )
 
         elif classification == "pandora_followup":
             # User commented on an existing @pandora task — fire a fresh
@@ -1171,12 +1265,18 @@ class ClarifyActivities:
                 note_token = str(last_note_at)[:19].replace(":", "").replace(" ", "T")
             elif latest_note:
                 note_token = str(abs(hash(latest_note)))[:12]
-            fingerprint = f"jira-{item_id}-followup-{note_token}"
+            fingerprint = f"route-{item_id}-followup-{note_token}"
             followup_desc = (
                 f"{description[:1500]}\n\n--- User followup comment ---\n{latest_note[:1500]}"
             )
+            _route = matched_route or {}
             interaction_payload = self._pandora_alert_payload(
-                content, followup_desc, fingerprint, item_id
+                content,
+                followup_desc,
+                fingerprint,
+                item_id,
+                service=_route.get("service"),
+                resource_tags=_route.get("resource_tags"),
             )
             interaction_spawned = True
             # No commands to send — labels already include @pandora. We
@@ -1506,18 +1606,19 @@ class ClarifyActivities:
         elif flavor == "pandora_gate":
             # Inbox work-ticket gate resolution (inbox gate).
             if choice == "investigate":
-                # Approve Pandora. Route through pandora_investigation so
-                # apply_outcome stamps @pandora + @area/acme; its spawn payload
-                # is ignored here (activities can't start workflows). We clear
-                # the watermark AFTER logging (below) so the next ClarifyFlow
-                # tick re-surfaces the task, hits the @pandora retry branch, and
-                # fires AlertInvestigationFlow from the flow.
+                # Approve investigation. Route through pandora_investigation so
+                # apply_outcome stamps @pandora + the route's assignee/area; its
+                # spawn payload is ignored here (activities can't start
+                # workflows). We clear the watermark AFTER logging (below) so the
+                # next ClarifyFlow tick re-surfaces the task, hits the @pandora
+                # retry branch, and fires AlertInvestigationFlow from the flow.
                 # ponytail: ~15-min latency to investigation start — fine for
                 # async triage; upgrade path is a Temporal client on this
                 # activity if instant start is ever needed.
+                _route = match_route(task_content, await get_content_routes(self.db_pool)) or {}
                 resolved_decision["classification"] = "pandora_investigation"
-                resolved_decision["assignee"] = "@pandora"
-                resolved_decision["contexts"] = ["@deep", "@code"]
+                resolved_decision["assignee"] = _route.get("assignee") or "@pandora"
+                resolved_decision["contexts"] = list(_route.get("contexts") or ["@deep", "@code"])
             elif choice == "mine":
                 resolved_decision["classification"] = "mine"
             else:
