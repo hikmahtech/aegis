@@ -444,9 +444,29 @@ Pandora's infra tools work against registry clusters by slug:
 - `restart_service` (swarm) — refused when the matching registry entry is
   read-only.
 - ArgoCD tools are script-host only (they need the `argocd` CLI, not just a
-  kubeconfig).
+  kubeconfig) — `context` must be one of the names configured in
+  `AEGIS_SCRIPT_HOST_K8S_CONTEXTS`.
 - `list_cloud_accounts` / `cloud_identity` — registered cloud accounts (see
   the Cloud accounts section above).
+
+### Script-host k8s contexts
+
+`list_pods` / `list_deployments` / `get_pod_logs` / `run_infra_script` and the
+ArgoCD tools accept a `context` that is either the slug of a registered
+`kind=k8s` infra entry (routed through the registry, no script-host setup
+needed) **or** the name of a "context" that exists on the remote script host
+— i.e. a `kubectl config get-contexts` entry the `scripts/infra/*.sh` scripts
+know how to map, on the host `AEGIS_REMOTE_SCRIPT_HOST` SSHes into. The
+script-host names are not auto-discovered; declare them via
+`AEGIS_SCRIPT_HOST_K8S_CONTEXTS` (comma-separated, e.g.
+`AEGIS_SCRIPT_HOST_K8S_CONTEXTS=prod,staging`). Blank (the default) means no
+script-host k8s contexts exist — pod/deployment/log tools then only resolve
+via registered `kind=k8s` slugs, and the ArgoCD tools have no valid context
+until you configure at least one (they only run against the argocd CLI on the
+script host, never a bare kubeconfig). When adding a name here, also update
+the matching `case` branches in `scripts/infra/*.sh` (e.g.
+`infra_list_pods.sh`, `infra_list_argocd_apps.sh`) so the script host actually
+knows how to route that context name.
 
 ## Troubleshooting
 

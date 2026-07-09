@@ -157,6 +157,11 @@ class Settings(BaseSettings):
     # label) so it shows AEGIS's own services, not every stack on the swarm.
     # Blank = no filter (show all services). Editable from the admin UI.
     aegis_stack_name: str = "aegis"
+    # Comma-separated k8s "context" names that exist on the remote script host
+    # (the host that runs scripts/infra/*.sh + the argocd CLI). Blank ⇒ none;
+    # k8s pod/deployment/log ops then resolve only via registered kind=k8s
+    # infra entries (by slug), and argocd tools require one of these contexts.
+    script_host_k8s_contexts: str = ""
 
     # Knowledge subsystem (native pgvector — no external service).
     # embedding_model must be served by litellm_url's /embeddings; its vector dim

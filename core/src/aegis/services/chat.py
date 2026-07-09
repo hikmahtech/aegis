@@ -6,6 +6,7 @@ import asyncio
 import functools
 import hashlib
 import json
+import os
 import re
 import time
 from dataclasses import dataclass
@@ -647,8 +648,8 @@ CHAT_TOOLS = [
                     "context": {
                         "type": "string",
                         "description": (
-                            "Cluster: 'acme-prod' / 'acme-test' (script-host) or the "
-                            "slug of a registered k8s infrastructure entry"
+                            "Cluster: a script-host context (AEGIS_SCRIPT_HOST_K8S_CONTEXTS) "
+                            "or the slug of a registered kind=k8s infrastructure entry"
                         ),
                     },
                     "namespace": {
@@ -675,8 +676,8 @@ CHAT_TOOLS = [
                     "context": {
                         "type": "string",
                         "description": (
-                            "Cluster: 'acme-prod' / 'acme-test' (script-host) or the "
-                            "slug of a registered k8s infrastructure entry"
+                            "Cluster: a script-host context (AEGIS_SCRIPT_HOST_K8S_CONTEXTS) "
+                            "or the slug of a registered kind=k8s infrastructure entry"
                         ),
                     },
                     "namespace": {
@@ -699,8 +700,8 @@ CHAT_TOOLS = [
                     "context": {
                         "type": "string",
                         "description": (
-                            "Cluster: 'acme-prod' / 'acme-test' (script-host) or the "
-                            "slug of a registered k8s infrastructure entry"
+                            "Cluster: a script-host context (AEGIS_SCRIPT_HOST_K8S_CONTEXTS) "
+                            "or the slug of a registered kind=k8s infrastructure entry"
                         ),
                     },
                     "namespace": {"type": "string"},
@@ -750,7 +751,13 @@ CHAT_TOOLS = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "context": {"type": "string", "enum": ["acme-prod", "acme-test"]},
+                    "context": {
+                        "type": "string",
+                        "description": (
+                            "k8s cluster context: a configured script-host context "
+                            "(AEGIS_SCRIPT_HOST_K8S_CONTEXTS) with the argocd CLI"
+                        ),
+                    },
                     "filter": {"type": "string", "description": "Optional status filter"},
                 },
                 "required": ["context"],
@@ -767,7 +774,13 @@ CHAT_TOOLS = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "context": {"type": "string", "enum": ["acme-prod", "acme-test"]},
+                    "context": {
+                        "type": "string",
+                        "description": (
+                            "k8s cluster context: a configured script-host context "
+                            "(AEGIS_SCRIPT_HOST_K8S_CONTEXTS) with the argocd CLI"
+                        ),
+                    },
                     "app_name": {"type": "string"},
                 },
                 "required": ["context", "app_name"],
@@ -828,7 +841,7 @@ CHAT_TOOLS = [
                 "properties": {
                     "context": {
                         "type": "string",
-                        "enum": ["swarm", "acme-prod", "acme-test"],
+                        "description": "'swarm', or a configured script-host k8s context",
                     },
                     "script_name": {
                         "type": "string",
@@ -1258,7 +1271,16 @@ class ToolContext:
 # --- Infrastructure tool helpers ---
 
 _INFRA_CONTEXTS_SWARM = {"swarm"}
-_INFRA_CONTEXTS_K8S = {"acme-prod", "acme-test"}
+# k8s "context" names that exist on the remote script host (the host that
+# runs scripts/infra/*.sh + the argocd CLI), read once at import from
+# AEGIS_SCRIPT_HOST_K8S_CONTEXTS (mirrors Settings.script_host_k8s_contexts).
+# Blank ⇒ empty set: script-host k8s/argocd tools then have no valid context
+# and pod/deployment/log ops resolve only via registered kind=k8s infra
+# entries (by slug). Read via os.getenv rather than Settings() so importing
+# this module never requires a full (DB-bearing) settings object.
+_INFRA_CONTEXTS_K8S = {
+    c.strip() for c in os.getenv("AEGIS_SCRIPT_HOST_K8S_CONTEXTS", "").split(",") if c.strip()
+}
 _INFRA_CONTEXTS_ALL = _INFRA_CONTEXTS_SWARM | _INFRA_CONTEXTS_K8S
 
 _INFRA_SAFE_NAME = re.compile(r"^[a-zA-Z0-9_\-\.]+$")
@@ -1412,7 +1434,13 @@ async def _exec_registry_k8s(
         # argocd tools need the argocd CLI on the script host — not available
         # through a bare kubeconfig.
         return json.dumps(
-            {"error": f"{tool} is not available for registry k8s clusters (script-host only)"}
+            {
+                "error": (
+                    f"{tool} is not available for registry k8s clusters (script-host only); "
+                    "configure AEGIS_SCRIPT_HOST_K8S_CONTEXTS with a context that has the "
+                    "argocd CLI"
+                )
+            }
         )
 
     if not result.get("ok"):

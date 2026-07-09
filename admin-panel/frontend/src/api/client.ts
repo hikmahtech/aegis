@@ -172,15 +172,15 @@ export const api = {
     apiFetch<any>(`/api/infra/services/${name}/logs?context=${context}&tail=${tail}`),
   infraRestartService: (name: string, context = 'swarm') =>
     apiFetch<any>(`/api/infra/services/${name}/restart?context=${context}`, { method: 'POST' }),
-  infraListPods: (context = 'acme-prod', namespace = 'default') =>
+  infraListPods: (context = '', namespace = 'default') =>
     apiFetch<any>(`/api/infra/pods?context=${context}&namespace=${namespace}`),
-  infraPodLogs: (ns: string, name: string, tail = 200, context = 'acme-prod') =>
+  infraPodLogs: (ns: string, name: string, tail = 200, context = '') =>
     apiFetch<any>(`/api/infra/pods/${ns}/${name}/logs?context=${context}&tail=${tail}`),
-  infraListDeployments: (context = 'acme-prod', namespace = 'default') =>
+  infraListDeployments: (context = '', namespace = 'default') =>
     apiFetch<any>(`/api/infra/deployments?context=${context}&namespace=${namespace}`),
-  infraListArgocd: (context = 'acme-prod') =>
+  infraListArgocd: (context = '') =>
     apiFetch<any>(`/api/infra/argocd/apps?context=${context}`),
-  infraSyncArgocd: (name: string, context = 'acme-prod') =>
+  infraSyncArgocd: (name: string, context = '') =>
     apiFetch<any>(`/api/infra/argocd/apps/${name}/sync?context=${context}`, { method: 'POST' }),
 
   // Infrastructure registry (dynamic hosts + provisioning)
