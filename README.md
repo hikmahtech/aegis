@@ -1,6 +1,12 @@
 # AEGIS
 
-**A flow-first, self-hosted personal AI orchestration platform.** A small fleet
+[![Core CI](https://github.com/hikmahtech/aegis/actions/workflows/core.yml/badge.svg)](https://github.com/hikmahtech/aegis/actions/workflows/core.yml)
+[![Worker CI](https://github.com/hikmahtech/aegis/actions/workflows/worker.yml/badge.svg)](https://github.com/hikmahtech/aegis/actions/workflows/worker.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Python 3.12](https://img.shields.io/badge/python-3.12-blue.svg)](https://www.python.org/)
+
+**Autonomous Executive Guild Intelligence System** — a flow-first, self-hosted
+personal AI orchestration platform. A small fleet
 of named agents run scheduled and event-driven workflows over your own data —
 GTD/tasks, money, knowledge, homelab alerts — and ask you for a decision only
 when they actually need one. Local-LLM-first: it runs against your own models
@@ -48,6 +54,20 @@ extra horsepower.
   DB-owned and edited in the admin panel; seed files and env vars are
   first-boot bootstrap only. Slack (Socket Mode) is the optional chat channel —
   the web Interactions inbox always works.
+
+## Screenshots
+
+The admin panel is where you configure and operate everything — no config files
+to hand-edit. Shown below with the shipped example agents and seed data.
+
+| Overview | Agents |
+|---|---|
+| ![Overview dashboard](docs/images/admin-overview.png) | ![Agents fleet](docs/images/admin-agents.png) |
+
+Each agent's behavior is data-driven — capability tags and its tool set are
+ticked in the UI, not hardcoded:
+
+![Agent behavior configuration](docs/images/admin-agent-behavior.png)
 
 ## Architecture
 

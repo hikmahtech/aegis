@@ -8,7 +8,7 @@ router = APIRouter()
 @router.get("/health")
 async def health(request: Request):
     """Health check. Returns DB status if pool is available."""
-    result = {"status": "ok", "version": "3.0.0"}
+    result = {"status": "ok", "version": "0.1.0"}
 
     if hasattr(request.app.state, "db_pool") and request.app.state.db_pool:
         from aegis.db import check_health

@@ -4,8 +4,8 @@ build-backend = "hatchling.build"
 
 [project]
 name = "aegis-core"
-version = "2.0.0"
-description = "AEGIS v2 Core — agents, knowledge, connectors, API"
+version = "0.1.0"
+description = "AEGIS Core — agents, knowledge, connectors, API"
 requires-python = ">=3.12"
 license = {text = "MIT"}
 authors = [{name = "Arshad Ansari"}]

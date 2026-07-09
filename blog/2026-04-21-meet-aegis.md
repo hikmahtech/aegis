@@ -8,13 +8,15 @@ The question I actually care about is smaller:
 
 > Can software learn the shape of one person's life well enough to interrupt less, act more carefully, and make an ordinary day feel quieter?
 
-AEGIS stands for *Autonomous Executive Guild Intelligence System* — a deliberately serious name for a deeply personal system held together by FastAPI, Temporal, Postgres, Telegram, and stubbornness. It sits between me and the systems that keep asking for attention. Instead of me checking ten places, it watches them and decides what's worth surfacing.
+AEGIS stands for *Autonomous Executive Guild Intelligence System* — a deliberately serious name for a deeply personal system held together by FastAPI, Temporal, Postgres, Slack, and stubbornness. It sits between me and the systems that keep asking for attention. Instead of me checking ten places, it watches them and decides what's worth surfacing.
+
+*(This started life on Slack; the chat channel is Slack now. I've updated the references below, but this post is otherwise the original 2026-04 origin story.)*
 
 When something is worth surfacing, the rule is simple: don't just notify me. Bring a proposed next step.
 
 ## Four Personalities, Not One Agent
 
-"One agent that can do everything" is a bad interface. AEGIS has four, each with its own tools, model tier, memory, tone, and Telegram topic:
+"One agent that can do everything" is a bad interface. AEGIS has four, each with its own tools, model tier, memory, tone, and Slack channel:
 
 - **Sebas** — executive assistant. Owns Gmail, GitHub, Calendar, daily brief.
 - **Raphael** — research. Owns RSS, Raindrop, knowledge ingestion, topic tracking.
@@ -29,8 +31,8 @@ Three Python services and a knowledge layer:
 
 - `aegis-core` — FastAPI. API, Postgres, connectors, admin UI, chat.
 - `aegis-worker` — Temporal. Anything that retries, schedules, waits for signals, or gates on approval becomes a workflow.
-- `aegis-telegram` — aiogram bot + delivery server. One forum topic per personality.
-- `knowledge-service` — the semantic memory. RAG, fact storage, contradiction checks.
+- `aegis-comms` — Slack bot (Socket Mode) + delivery server. One channel per personality.
+- knowledge layer — the semantic memory: a native Postgres + pgvector RAG store (originally a separate `knowledge-service`, since folded into core). Fact storage, contradiction checks.
 
 Around that: LiteLLM for model routing, local Ollama (qwen3:14b, gemma4) where it fits, Claude Haiku/Sonnet/Opus when it doesn't, SearXNG for search, pgvector for embeddings. Production is a small Docker Swarm cluster at home — three nodes, not a VPC.
 
@@ -41,7 +43,7 @@ Every older half-pattern — decisions, pending claims, ad-hoc callbacks, state 
 An `interaction` is:
 
 - a row in Postgres,
-- a card in Telegram or the admin UI,
+- a card in Slack or the admin UI,
 - a Temporal workflow waiting on a signal.
 
 Five kinds cover everything: `approval`, `choice`, `input`, `draft_review`, `ack`. Callbacks are uniform (`interaction:{id}:{value}`). Timeouts are declarative — archive, auto-reject, auto-approve, or hold.
@@ -52,7 +54,7 @@ If AEGIS needs me, it creates an interaction. If it doesn't, it stays quiet. Tha
 
 23 Temporal workflows on one task queue. A sample of what runs on a given day:
 
-- **GmailIngestFlow** — hourly per account. Classifies each email as noise, transactional, or needs-me. Most vanish into the record. The few that matter become Telegram cards I can approve, dismiss, or turn into a reply.
+- **GmailIngestFlow** — hourly per account. Classifies each email as noise, transactional, or needs-me. Most vanish into the record. The few that matter become Slack cards I can approve, dismiss, or turn into a reply.
 - **GitHubAlertFlow** — webhook. Routes through `AlertInvestigationFlow` which knows what kind of repo it came from and when to ask before spending tokens on code.
 - **SentryPollFlow** — hourly. Waits long enough to avoid chasing blips, deduplicates against prior investigations, pulls the relevant runbook, asks before acting.
 - **ReceiptIngestFlow / RenewalRadarFlow** — extract structured data from receipts, flag subscriptions about to renew.

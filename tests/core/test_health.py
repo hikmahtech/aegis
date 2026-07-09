@@ -21,4 +21,4 @@ async def test_health_unauthenticated(app):
         assert resp.status_code == 200
         data = resp.json()
         assert data["status"] == "ok"
-        assert data["version"] == "3.0.0"
+        assert data["version"] == "0.1.0"
