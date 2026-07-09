@@ -237,9 +237,18 @@ class Settings(BaseSettings):
 
     # Money Hygiene (Maou)
     money_hygiene_enabled: bool = False
-    money_hygiene_inr_fallback_rates: dict[str, float] = Field(
+    # Currency all Money-Hygiene charges normalize to; drives the digest
+    # symbol. A self-hoster sets this AND matching fx rates below.
+    home_currency: str = "INR"
+    # Fallback FX rates, foreign currency -> home_currency.
+    money_hygiene_fx_rates: dict[str, float] = Field(
         default_factory=lambda: {"USD": 84.5, "EUR": 92.0, "GBP": 108.0, "SGD": 63.0}
     )
+    # Deterministic bank-alert guard (belt-and-suspenders behind the LLM
+    # prompt hardening) — comma-separated bank alert-sender domains whose
+    # mail must never be minted into a recurring charge. Default empty; add
+    # your bank's alert domains (e.g. "alerts@yourbank.com,yourbank.com").
+    bank_alert_senders: str = ""
 
     @model_validator(mode="after")
     def _require_admin_credentials(self) -> "Settings":

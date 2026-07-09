@@ -280,7 +280,8 @@ async def main():
             db_pool=deps.pool,
             llm=deps.llm,
             delivery=delivery_act,
-            fx_rates=getattr(settings, "money_hygiene_inr_fallback_rates", {}),
+            fx_rates=getattr(settings, "money_hygiene_fx_rates", {}),
+            home_currency=getattr(settings, "home_currency", "INR"),
         )
 
     channel_act = ChannelActivities(db_pool=deps.pool)

@@ -28,13 +28,13 @@ async def _start_workflow(flow: str, cfg: dict, temporal_client: TemporalClient)
 
 
 @router.get("/state")
-async def money_state(request: Request) -> dict:
+async def money_state(request: Request, settings: Settings = Depends(get_settings)) -> dict:
     """Return active recurring charges + most recent renewal alerts."""
     pool = request.app.state.db_pool
     async with pool.acquire() as conn:
         charges = await conn.fetch(
             "SELECT id, account, vendor_name, category, amount_cents, currency, "
-            "       monthly_inr_equivalent, cadence, next_due_at, status, "
+            "       monthly_home_equivalent, cadence, next_due_at, status, "
             "       last_seen_at, first_seen_at "
             "FROM maou.recurring_charge "
             "ORDER BY status, next_due_at NULLS LAST"
@@ -49,6 +49,7 @@ async def money_state(request: Request) -> dict:
     return {
         "charges": [dict(r) for r in charges],
         "upcoming_alerts": [dict(r) for r in upcoming],
+        "home_currency": settings.home_currency,
     }
 
 

@@ -70,7 +70,7 @@ def test_money_state_returns_charges_and_alerts(app, client):
                     "category": "domain",
                     "amount_cents": 1299,
                     "currency": "USD",
-                    "monthly_inr_equivalent": 91.45,
+                    "monthly_home_equivalent": 91.45,
                     "cadence": "yearly",
                     "next_due_at": "2027-04-15T00:00:00Z",
                     "status": "active",

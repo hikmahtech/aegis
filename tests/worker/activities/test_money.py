@@ -13,6 +13,7 @@ from __future__ import annotations
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from aegis_worker.activities import money as money_module
 from aegis_worker.activities.money import MoneyActivities, _is_bank_alert_sender
 
 
@@ -30,7 +31,18 @@ def _recording_pool():
     return pool, conn
 
 
-def test_is_bank_alert_sender_matches_substring():
+def test_is_bank_alert_sender_default_empty_is_noop():
+    """AEGIS_BANK_ALERT_SENDERS unset ⇒ _BANK_ALERT_SENDERS is empty and the
+    guard never matches — a clean no-op until a self-hoster configures it."""
+    assert not money_module._BANK_ALERT_SENDERS
+    assert not _is_bank_alert_sender("alerts@axis.bank.in")
+    assert not _is_bank_alert_sender("", "")
+
+
+def test_is_bank_alert_sender_matches_substring(monkeypatch):
+    monkeypatch.setattr(
+        money_module, "_BANK_ALERT_SENDERS", frozenset({"axis.bank.in", "axisbank.com"})
+    )
     assert _is_bank_alert_sender("alerts@axis.bank.in")
     assert _is_bank_alert_sender("", "ALERTS@AXISBANK.COM")  # case-insensitive
     assert not _is_bank_alert_sender("billing@namecheap.com", "namecheap.com")
@@ -38,10 +50,14 @@ def test_is_bank_alert_sender_matches_substring():
 
 
 @pytest.mark.asyncio
-async def test_upsert_charges_skips_bank_alert_sender():
-    """A receipt whose sender is a bank/card-alert domain must NOT be upserted
-    as a recurring charge (the prod offenders: axis autopay reminders minting
-    Google/AWS charges). A normal vendor receipt in the same batch IS written."""
+async def test_upsert_charges_skips_bank_alert_sender(monkeypatch):
+    """A receipt whose sender is a configured bank/card-alert domain must NOT
+    be upserted as a recurring charge (the prod offenders: autopay reminders
+    minting fake Google/AWS charges). A normal vendor receipt in the same
+    batch IS written."""
+    monkeypatch.setattr(
+        money_module, "_BANK_ALERT_SENDERS", frozenset({"axis.bank.in"})
+    )
     pool, conn = _recording_pool()
     act = MoneyActivities(db_pool=pool, llm=None, delivery=None, fx_rates={"USD": 84.5})
 
@@ -166,7 +182,9 @@ async def test_notify_renewal_alert_sends_str_to_maou():
     delivery = AsyncMock()
     delivery.channel = "slack"
     delivery.send_message = fake_send
-    act = MoneyActivities(db_pool=None, llm=None, delivery=delivery, fx_rates={"USD": 84.5})
+    act = MoneyActivities(
+        db_pool=None, llm=None, delivery=delivery, fx_rates={"USD": 84.5}, home_currency="INR"
+    )
     await act.notify_renewal_alert(
         {
             "vendor_name": "Namecheap <example>",
@@ -175,7 +193,7 @@ async def test_notify_renewal_alert_sends_str_to_maou():
             "account": "personal",
             "threshold_days": 14,
             "amount_cents": 1299,
-            "monthly_inr_equivalent": 91.45,
+            "monthly_home_equivalent": 91.45,
             "days_left": 12,
             "next_due_at": "2026-06-06T00:00:00",
         }
@@ -192,7 +210,11 @@ async def test_notify_subscription_digest_sends_message(db_pool):
     delivery = AsyncMock()
     delivery.channel = "slack"
     act = MoneyActivities(
-        db_pool=db_pool, llm=None, delivery=delivery, fx_rates={"USD": 84.5}
+        db_pool=db_pool,
+        llm=None,
+        delivery=delivery,
+        fx_rates={"USD": 84.5},
+        home_currency="INR",
     )
     digest = {
         "period_start": "2026-03-01",
@@ -203,11 +225,11 @@ async def test_notify_subscription_digest_sends_message(db_pool):
             "domain": {"total_inr": 91.45, "count": 1},
             "infra": {"total_inr": 169.0, "count": 1},
         },
-        "new_this_month": [{"vendor_name": "Notion", "monthly_inr_equivalent": 84.5}],
+        "new_this_month": [{"vendor_name": "Notion", "monthly_home_equivalent": 84.5}],
         "cancelled_this_month": [],
         "top_spenders": [
-            {"vendor_name": "DigitalOcean", "monthly_inr_equivalent": 169.0},
-            {"vendor_name": "<script>", "monthly_inr_equivalent": 91.45},
+            {"vendor_name": "DigitalOcean", "monthly_home_equivalent": 169.0},
+            {"vendor_name": "<script>", "monthly_home_equivalent": 91.45},
         ],
     }
     await act.notify_subscription_digest(digest)
@@ -219,3 +241,34 @@ async def test_notify_subscription_digest_sends_message(db_pool):
     # HTML escape — vendor name with <script> must be escaped in body
     assert "<script>" not in message
     assert "&lt;script&gt;" in message
+    # Default home_currency=INR ⇒ digest renders the ₹ symbol.
+    assert "₹" in message
+
+
+@pytest.mark.asyncio
+async def test_notify_subscription_digest_renders_non_inr_home_symbol(db_pool):
+    """A non-INR home_currency renders its own symbol, not ₹."""
+    delivery = AsyncMock()
+    delivery.channel = "slack"
+    act = MoneyActivities(
+        db_pool=db_pool,
+        llm=None,
+        delivery=delivery,
+        fx_rates={"USD": 84.5},
+        home_currency="USD",
+    )
+    digest = {
+        "period_start": "2026-03-01",
+        "period_end": "2026-03-31",
+        "total_monthly_inr": 344.95,
+        "active_count": 3,
+        "by_category": {"domain": {"total_inr": 91.45, "count": 1}},
+        "new_this_month": [],
+        "cancelled_this_month": [],
+        "top_spenders": [{"vendor_name": "DigitalOcean", "monthly_home_equivalent": 169.0}],
+    }
+    await act.notify_subscription_digest(digest)
+    kwargs = delivery.send_message.await_args.kwargs
+    message = kwargs["message"]
+    assert "$" in message
+    assert "₹" not in message
