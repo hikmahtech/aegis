@@ -197,16 +197,18 @@ function statusBadgeClass(status: string) {
 // ── Legacy live service/pod inspector (collapsible, secondary section) ─────
 type LiveResource = 'services' | 'pods' | 'deployments' | 'argocd';
 
-const LIVE_DEFAULT_CONTEXT: Record<LiveResource, string> = {
-  services: 'swarm',
-  pods: 'acme-prod',
-  deployments: 'acme-prod',
-  argocd: 'acme-prod',
-};
+// `infraEntries` is the already-loaded infra registry (from the parent's
+// api.listInfra()) — used to populate the k8s context options with
+// registered kind=k8s slugs instead of hardcoded cluster names.
+function LiveInspector({ infraEntries }: { infraEntries: any[] }) {
+  const k8sSlugs = infraEntries.filter(e => e.kind === 'k8s').map(e => e.slug);
 
-function LiveInspector() {
+  function defaultContextFor(r: LiveResource): string {
+    return r === 'services' ? 'swarm' : (k8sSlugs[0] || '');
+  }
+
   const [resource, setResource] = useState<LiveResource>('services');
-  const [context, setContext] = useState<string>(LIVE_DEFAULT_CONTEXT.services);
+  const [context, setContext] = useState<string>('swarm');
   const [namespace, setNamespace] = useState<string>('default');
   const [data, setData] = useState<any>(null);
   const [selected, setSelected] = useState<any>(null);
@@ -224,7 +226,7 @@ function LiveInspector() {
     finally { setLoading(false); }
   }
 
-  useEffect(() => { setContext(LIVE_DEFAULT_CONTEXT[resource]); }, [resource]);
+  useEffect(() => { setContext(defaultContextFor(resource)); }, [resource, infraEntries]); // eslint-disable-line react-hooks/exhaustive-deps
   useEffect(() => { void load(); /* eslint-disable-next-line react-hooks/exhaustive-deps */ }, [resource, context, namespace]);
 
   function safeDo(fn: () => Promise<any>) {
@@ -278,8 +280,9 @@ function LiveInspector() {
           <span>Context</span>
           <select value={context} onChange={e => setContext(e.target.value)}>
             <option value="swarm">swarm (swarm)</option>
-            <option value="acme-prod">acme-prod (k8s)</option>
-            <option value="acme-test">acme-test (k8s)</option>
+            {k8sSlugs.map(slug => (
+              <option key={slug} value={slug}>{slug} (k8s)</option>
+            ))}
           </select>
         </label>
         {(resource === 'pods' || resource === 'deployments') && (
@@ -1165,7 +1168,7 @@ export default function Infra() {
             {showLiveInspector ? 'Hide' : 'Show'}
           </button>
         </div>
-        {showLiveInspector && <LiveInspector />}
+        {showLiveInspector && <LiveInspector infraEntries={rows} />}
       </section>
     </div>
   );

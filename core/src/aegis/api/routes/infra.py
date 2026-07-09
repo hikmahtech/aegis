@@ -2,8 +2,10 @@
 
 Each route delegates to the same executor function used by the chat tool,
 so the UI and chat share one implementation. Context defaults to ``swarm``
-(Swarm) for service routes and ``acme-prod`` (K8s) for pod/argocd
-routes, but can be overridden via the ``context`` query param.
+(Swarm) for service routes and blank for pod/argocd routes — callers must
+pass an explicit ``context`` query param, either a configured script-host
+k8s context (``AEGIS_SCRIPT_HOST_K8S_CONTEXTS``) or the slug of a registered
+``kind=k8s`` infra entry.
 """
 
 from __future__ import annotations
@@ -79,7 +81,7 @@ async def restart_service(request: Request, name: str, context: str = "swarm") -
 
 @router.get("/pods")
 async def list_pods(
-    request: Request, context: str = "acme-prod", namespace: str = "default"
+    request: Request, context: str = "", namespace: str = "default"
 ) -> Any:
     from aegis.services.chat import _exec_list_pods
 
@@ -88,7 +90,7 @@ async def list_pods(
 
 @router.get("/deployments")
 async def list_deployments(
-    request: Request, context: str = "acme-prod", namespace: str = "default"
+    request: Request, context: str = "", namespace: str = "default"
 ) -> Any:
     from aegis.services.chat import _exec_list_deployments
 
@@ -102,7 +104,7 @@ async def pod_logs(
     request: Request,
     namespace: str,
     name: str,
-    context: str = "acme-prod",
+    context: str = "",
     tail: int = 200,
 ) -> Any:
     from aegis.services.chat import _exec_get_pod_logs
@@ -121,7 +123,7 @@ async def pod_logs(
 
 @router.get("/argocd/apps")
 async def list_argocd_apps(
-    request: Request, context: str = "acme-prod", filter: str = ""
+    request: Request, context: str = "", filter: str = ""
 ) -> Any:
     from aegis.services.chat import _exec_list_argocd_apps
 
@@ -129,7 +131,7 @@ async def list_argocd_apps(
 
 
 @router.post("/argocd/apps/{name}/sync")
-async def sync_argocd_app(request: Request, name: str, context: str = "acme-prod") -> Any:
+async def sync_argocd_app(request: Request, name: str, context: str = "") -> Any:
     # sync_argocd_app may not be wired as an executor — surface useful error.
     from aegis.services.chat import TOOL_EXECUTORS
 

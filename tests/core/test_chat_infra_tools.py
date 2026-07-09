@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import asyncpg  # noqa: F401  (type hint)
 import pytest
+from aegis.services import chat
 from aegis.services.chat import (
     AGENT_TOOL_SETS,
     CHAT_TOOLS,
@@ -24,6 +25,22 @@ from aegis.services.chat import (
     _exec_run_infra_script,
     _exec_sync_argocd_app,
 )
+
+
+@pytest.fixture(autouse=True)
+def _acme_script_host_contexts():
+    """These tests use 'acme-prod'/'acme-test' as stand-in script-host k8s
+    context names (issue #51 made the real set configurable via
+    AEGIS_SCRIPT_HOST_K8S_CONTEXTS, default empty). Mutate the module-level
+    set IN PLACE — not reassign — so the reference `_INFRA_SPECS` captured at
+    import time and the `contexts is _INFRA_CONTEXTS_K8S` identity check in
+    `_exec_infra` still line up."""
+    added = {"acme-prod", "acme-test"} - chat._INFRA_CONTEXTS_K8S
+    chat._INFRA_CONTEXTS_K8S.update(added)
+    try:
+        yield
+    finally:
+        chat._INFRA_CONTEXTS_K8S.difference_update(added)
 
 
 def test_tool_context_has_remote_script_connector_field():
@@ -503,3 +520,22 @@ def test_all_infra_tools_have_schema_definitions():
     schema_names = {t["function"]["name"] for t in CHAT_TOOLS if t["type"] == "function"}
     missing = expected - schema_names
     assert not missing, f"Missing tool schemas: {missing}"
+
+
+def test_k8s_tool_schemas_have_no_hardcoded_context_enum():
+    """issue #51: k8s/argocd cluster context names are self-hoster-configurable
+    (AEGIS_SCRIPT_HOST_K8S_CONTEXTS) plus registered kind=k8s infra slugs, so
+    the tool schemas must not pin `context` to a fixed enum (previously
+    ["acme-prod", "acme-test"] / ["swarm", "acme-prod", "acme-test"])."""
+    k8s_tools = {
+        "list_pods",
+        "list_deployments",
+        "get_pod_logs",
+        "list_argocd_apps",
+        "sync_argocd_app",
+        "run_infra_script",
+    }
+    by_name = {t["function"]["name"]: t["function"] for t in CHAT_TOOLS if t["type"] == "function"}
+    for name in k8s_tools:
+        context_schema = by_name[name]["parameters"]["properties"]["context"]
+        assert "enum" not in context_schema, f"{name}'s context schema still has a hardcoded enum"
