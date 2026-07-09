@@ -26,8 +26,8 @@ FAKE_AWS_INI = (
 FAKE_GCP_SA = json.dumps(
     {
         "type": "service_account",
-        "project_id": "hikmah-main",
-        "client_email": "aegis@hikmah-main.iam.gserviceaccount.com",
+        "project_id": "acme-main",
+        "client_email": "aegis@acme-main.iam.gserviceaccount.com",
         "private_key": "gcp-shhh-secret",
     }
 )
@@ -66,7 +66,7 @@ async def _create_gcp(db_pool, **overrides):
         "name": "test-cloud-gcp",
         "slug": "test-cloud-gcp",
         "kind": "cloud",
-        "cloud": {"provider": "gcp", "project": "hikmah-main"},
+        "cloud": {"provider": "gcp", "project": "acme-main"},
         "gcp_service_account_json": FAKE_GCP_SA,
         **overrides,
     }
@@ -97,7 +97,7 @@ async def test_create_aws_account_normalizes_and_sanitizes(db_pool):
 async def test_create_gcp_account(db_pool):
     await _prepare(db_pool)
     row = await _create_gcp(db_pool)
-    assert row["cloud"] == {"provider": "gcp", "project": "hikmah-main"}
+    assert row["cloud"] == {"provider": "gcp", "project": "acme-main"}
     assert row["has_gcp_service_account"] is True
     assert "gcp-shhh-secret" not in str(row)
 
@@ -269,8 +269,8 @@ async def test_provision_gcp_checks_adc_token_and_never_leaks_it(db_pool):
 
     stored = await db_pool.fetchval("SELECT cloud FROM infra WHERE id = $1", row["id"])
     assert stored["identity"] == {
-        "project": "hikmah-main",
-        "service_account": "aegis@hikmah-main.iam.gserviceaccount.com",
+        "project": "acme-main",
+        "service_account": "aegis@acme-main.iam.gserviceaccount.com",
     }
 
 
@@ -470,7 +470,7 @@ async def test_chat_list_cloud_accounts(db_pool):
     assert accounts["test-cloud-aws"]["default_profile"] == "prod"
     assert accounts["test-cloud-aws"]["has_credentials"] is True
     assert accounts["test-cloud-gcp"]["provider"] == "gcp"
-    assert accounts["test-cloud-gcp"]["project"] == "hikmah-main"
+    assert accounts["test-cloud-gcp"]["project"] == "acme-main"
     assert "shhh" not in json.dumps(payload)
 
 

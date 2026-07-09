@@ -1335,5 +1335,5 @@ INSERT INTO public.settings (key, value) VALUES
     ('todoist_capture_enabled', 'true'::jsonb),
     ('gtd_clarify_enabled',     'true'::jsonb),
     ('gtd_2min_rule_enabled',   'true'::jsonb),
-    ('user_timezone',           '"Asia/Kolkata"'::jsonb)
+    ('user_timezone',           '"UTC"'::jsonb)
     ON CONFLICT (key) DO NOTHING;

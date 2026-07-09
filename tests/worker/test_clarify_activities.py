@@ -860,7 +860,7 @@ async def _override_user_timezone(db_pool, tz: str) -> str:
             "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
             tz,
         )
-    return prev if isinstance(prev, str) else "Asia/Kolkata"
+    return prev if isinstance(prev, str) else "UTC"
 
 
 async def _restore_user_timezone(db_pool, tz: str) -> None:

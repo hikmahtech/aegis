@@ -17,8 +17,8 @@ from aegis.services.chat import (
 
 
 def test_normalize_vercel_project_strips_slug_prefix():
-    assert _normalize_vercel_project("vercel-drwhome") == "drwhome"
-    assert _normalize_vercel_project("drwhome") == "drwhome"
+    assert _normalize_vercel_project("vercel-example-site") == "example-site"
+    assert _normalize_vercel_project("example-site") == "example-site"
     assert _normalize_vercel_project("  vercel-foo  ") == "foo"
     assert _normalize_vercel_project("") == ""
 
@@ -26,7 +26,7 @@ def test_normalize_vercel_project_strips_slug_prefix():
 @pytest.mark.asyncio
 async def test_vercel_get_project_without_connector_returns_error():
     ctx = ToolContext(vercel_connector=None)
-    out = json.loads(await _exec_vercel_get_project(None, {"project": "drwhome"}, ctx))
+    out = json.loads(await _exec_vercel_get_project(None, {"project": "example-site"}, ctx))
     assert out == {"error": "vercel_connector_not_configured"}
 
 
@@ -40,13 +40,13 @@ async def test_vercel_get_project_requires_project_arg():
 @pytest.mark.asyncio
 async def test_vercel_get_project_dispatches_normalized_name():
     conn = AsyncMock()
-    conn.get_project.return_value = {"id": "prj_x", "name": "drwhome"}
+    conn.get_project.return_value = {"id": "prj_x", "name": "example-site"}
     ctx = ToolContext(vercel_connector=conn)
     out = json.loads(
-        await _exec_vercel_get_project(None, {"project": "vercel-drwhome"}, ctx)
+        await _exec_vercel_get_project(None, {"project": "vercel-example-site"}, ctx)
     )
-    conn.get_project.assert_awaited_once_with("drwhome")
-    assert out == {"id": "prj_x", "name": "drwhome"}
+    conn.get_project.assert_awaited_once_with("example-site")
+    assert out == {"id": "prj_x", "name": "example-site"}
 
 
 @pytest.mark.asyncio
@@ -57,7 +57,7 @@ async def test_vercel_list_deployments_passes_filters_through():
     await _exec_vercel_list_deployments(
         None,
         {
-            "project": "vercel-drwhome",
+            "project": "vercel-example-site",
             "limit": 25,
             "since_hours": 24,
             "state": "ERROR",
@@ -65,7 +65,7 @@ async def test_vercel_list_deployments_passes_filters_through():
         ctx,
     )
     conn.list_deployments.assert_awaited_once_with(
-        "drwhome", limit=25, since_hours=24, state="ERROR"
+        "example-site", limit=25, since_hours=24, state="ERROR"
     )
 
 
@@ -75,7 +75,7 @@ async def test_vercel_list_deployments_rejects_bad_since_hours():
     out = json.loads(
         await _exec_vercel_list_deployments(
             None,
-            {"project": "drwhome", "since_hours": "not-a-number"},
+            {"project": "example-site", "since_hours": "not-a-number"},
             ctx,
         )
     )

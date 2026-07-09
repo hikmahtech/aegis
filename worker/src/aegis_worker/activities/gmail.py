@@ -151,8 +151,8 @@ Also produce two free-text fields:
   ask, dates/amounts/links if present, and what action (if any) is
   needed. When the body excerpt is empty, infer from sender + subject.
 
-If the email header includes ``Forwarded from: <lane>`` (e.g. acme,
-ansaar, outlook-personal), it arrived in the primary inbox via a forwarding
+If the email header includes ``Forwarded from: <lane>`` (e.g. work,
+freelance, personal), it arrived in the primary inbox via a forwarding
 rule from another mailbox identity. Treat the lane as additional context
 (work-vs-personal, which org sent it) when judging importance.
 

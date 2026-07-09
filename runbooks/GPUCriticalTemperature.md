@@ -1,6 +1,6 @@
 # GPUCriticalTemperature
 
-A GPU has exceeded 95°C — thermal shutdown or hardware damage is imminent. The RTX 2070 SUPER on `node-a` has a rated max of 89°C; the RTX 5060 Ti on `node-b` should stay below 90°C under load.
+A GPU has exceeded 95°C — thermal shutdown or hardware damage is imminent. The GPU on `node-a` has a rated max of 89°C; the GPU on `node-b` should stay below 90°C under load.
 
 ## Most Likely Cause
 

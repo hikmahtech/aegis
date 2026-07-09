@@ -33,19 +33,19 @@ async def stub_list(input: ListVercelProjectsInput):
     return [
         {
             "id": "prj_abc",
-            "name": "drwhome",
+            "name": "example-site",
             "framework": "nextjs",
-            "github_repo": "example/drwhome",
-            "production_domain": "drwho.me",
+            "github_repo": "example/example-site",
+            "production_domain": "example.com",
             "scope": "team",
             "team_id": "team_example",
         },
         {
             "id": "prj_def",
-            "name": "ansaar-marketing",
+            "name": "acme-marketing",
             "framework": "astro",
             "github_repo": "",
-            "production_domain": "ansaar-marketing.vercel.app",
+            "production_domain": "acme-marketing.vercel.app",
             "scope": "personal",
             "team_id": "",
         },
@@ -86,26 +86,26 @@ async def test_vercel_project_sync_builds_correct_items():
     items = _upsert_calls[0]
     assert len(items) == 2
 
-    drwhome = next(i for i in items if i["slug"] == "vercel-drwhome")
-    assert drwhome["kind"] == "vercel_project"
-    assert drwhome["title"] == "drwhome"
-    assert drwhome["url"] == "https://drwho.me"
-    assert "vercel" in drwhome["tags"]
-    assert "deployment" in drwhome["tags"]
-    assert "pandoras-actor" in drwhome["tags"]
-    assert "team_example" in drwhome["tags"]
-    assert drwhome["metadata"] == {
+    example_site = next(i for i in items if i["slug"] == "vercel-example-site")
+    assert example_site["kind"] == "vercel_project"
+    assert example_site["title"] == "example-site"
+    assert example_site["url"] == "https://example.com"
+    assert "vercel" in example_site["tags"]
+    assert "deployment" in example_site["tags"]
+    assert "pandoras-actor" in example_site["tags"]
+    assert "team_example" in example_site["tags"]
+    assert example_site["metadata"] == {
         "project_id": "prj_abc",
         "team_id": "team_example",
         "framework": "nextjs",
-        "production_domain": "drwho.me",
-        "github_repo": "example/drwhome",
+        "production_domain": "example.com",
+        "github_repo": "example/example-site",
     }
 
-    ansaar = next(i for i in items if i["slug"] == "vercel-ansaar-marketing")
-    assert ansaar["url"] == "https://ansaar-marketing.vercel.app"
-    assert ansaar["metadata"]["github_repo"] == ""
-    assert "personal" in ansaar["tags"]
+    acme = next(i for i in items if i["slug"] == "vercel-acme-marketing")
+    assert acme["url"] == "https://acme-marketing.vercel.app"
+    assert acme["metadata"]["github_repo"] == ""
+    assert "personal" in acme["tags"]
 
     assert result == {"listed": 2, "inserted": 2, "updated": 0, "total": 2}
 

@@ -249,7 +249,7 @@ export default function Flows() {
           <input
             value={newSocialLabel}
             onChange={e => setNewSocialLabel(e.target.value)}
-            placeholder="account label (e.g. hikmah)"
+            placeholder="account label (e.g. work)"
             onKeyDown={e => { if (e.key === 'Enter') connectSocialAccount(); }}
           />
           <button className="btn btn-primary" disabled={!newSocialLabel.trim()} onClick={connectSocialAccount}>Connect X account</button>

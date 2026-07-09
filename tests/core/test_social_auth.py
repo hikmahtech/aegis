@@ -53,7 +53,7 @@ async def client(settings, db_pool):
 
 async def test_connect_redirects_with_pkce(client):
     resp = await client.get(
-        "/api/admin/social/x/connect?label=hikmah", headers={"X-API-Key": "k"}
+        "/api/admin/social/x/connect?label=work", headers={"X-API-Key": "k"}
     )
     assert resp.status_code == 302
     loc = urlparse(resp.headers["location"])
@@ -83,7 +83,7 @@ async def test_connect_without_client_config_503(client, settings):
 async def test_callback_exchanges_and_upserts_account(client, settings, db_pool):
     # Initiate first so a PKCE state exists.
     initiate = await client.get(
-        "/api/admin/social/x/connect?label=hikmah", headers={"X-API-Key": "k"}
+        "/api/admin/social/x/connect?label=work", headers={"X-API-Key": "k"}
     )
     state = parse_qs(urlparse(initiate.headers["location"]).query)["state"][0]
 
@@ -110,7 +110,7 @@ async def test_callback_exchanges_and_upserts_account(client, settings, db_pool)
     assert sent["code_verifier"]
 
     row = await db_pool.fetchrow(
-        "SELECT * FROM social_accounts WHERE platform = 'x' AND label = 'hikmah'"
+        "SELECT * FROM social_accounts WHERE platform = 'x' AND label = 'work'"
     )
     assert row is not None
     assert decrypt_secret(row["access_token_enc"], settings.secret_key) == "acc-1"
@@ -121,7 +121,7 @@ async def test_callback_exchanges_and_upserts_account(client, settings, db_pool)
     accounts = (
         await client.get("/api/admin/social/accounts", headers={"X-API-Key": "k"})
     ).json()
-    assert [(a["platform"], a["label"]) for a in accounts] == [("x", "hikmah")]
+    assert [(a["platform"], a["label"]) for a in accounts] == [("x", "work")]
     assert "acc-1" not in str(accounts)
     assert "ref-1" not in str(accounts)
 

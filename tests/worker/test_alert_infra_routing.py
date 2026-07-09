@@ -115,25 +115,25 @@ def test_is_infra_alert_dagster_pipeline_failure():
 
 def test_build_signature_infra_alert_collapses_by_cluster_alertname():
     """NodeDown across different instances should map to one signature."""
-    alert_asif = {
+    alert_a = {
         "source": "alertmanager",
         "service": "node-b",
         "labels": {"alertname": "NodeDown", "cluster": "homelab-swarm", "instance": "node-b"},
     }
-    alert_meem = {
+    alert_b = {
         "source": "alertmanager",
         "service": "node-a",
         "labels": {"alertname": "NodeDown", "cluster": "homelab-swarm", "instance": "node-a"},
     }
-    sig_asif = build_alert_signature(alert_asif)
-    sig_meem = build_alert_signature(alert_meem)
+    sig_a = build_alert_signature(alert_a)
+    sig_b = build_alert_signature(alert_b)
     # Both collapse to the same signature (cluster, not instance)
-    assert sig_asif == sig_meem
-    assert "nodedown" in sig_asif
-    assert "homelab-swarm" in sig_asif
+    assert sig_a == sig_b
+    assert "nodedown" in sig_a
+    assert "homelab-swarm" in sig_a
     # instance/service NOT in the key
-    assert "node-b" not in sig_asif
-    assert "node-a" not in sig_meem
+    assert "node-b" not in sig_a
+    assert "node-a" not in sig_b
 
 
 def test_build_signature_infra_alert_different_alertname_different_sig():

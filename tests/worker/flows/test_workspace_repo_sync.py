@@ -32,9 +32,9 @@ _SCAN = [
         "github_repo": "example/infra-gitops",
     },
     {
-        "path": "swarm/drwho",
-        "origin_url": "git@github.com:example/drwhome.git",
-        "github_repo": "example/drwhome",
+        "path": "personal/example-site",
+        "origin_url": "git@github.com:example/example-site.git",
+        "github_repo": "example/example-site",
     },
     {
         "path": "trading/trading-system-pipeline",
@@ -62,7 +62,7 @@ async def stub_reconcile(input: WorkspaceReposInput):
 @activity.defn(name="mirror_workspace_repos")
 async def stub_mirror(input: WorkspaceReposInput):
     _mirror_calls.append(list(input.items))
-    return {"present": len(input.items) - 1, "cloned": 1, "cloned_paths": ["swarm/drwho"], "failed": []}
+    return {"present": len(input.items) - 1, "cloned": 1, "cloned_paths": ["personal/example-site"], "failed": []}
 
 
 def _reset(scan):

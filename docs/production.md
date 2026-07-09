@@ -9,12 +9,12 @@ private Ansible repo); this page describes what that side needs to do.
 ## Building the images
 
 Three images, one Dockerfile each: `core/Dockerfile`, `worker/Dockerfile`,
-`comms/Dockerfile`, all built from the repo root as context.
+`comms/Dockerfile`, all built from the repo root as context. The core image
+serves the admin SPA — `core/Dockerfile` builds it itself in a Node stage
+(`admin-panel/frontend`, `npm ci && npm run build`), so no separate frontend
+build step is needed before building images.
 
 ```bash
-# The core image serves the admin SPA — build it first
-cd admin-panel/frontend && npm ci && npm run build && cd ../..
-
 docker build -f core/Dockerfile   -t <registry>/aegis-core:latest .
 docker build -f worker/Dockerfile -t <registry>/aegis-worker:latest .
 docker build -f comms/Dockerfile  -t <registry>/aegis-comms:latest .

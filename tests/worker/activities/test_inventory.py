@@ -64,9 +64,11 @@ class FakeRemoteScript:
 
 def test_origin_to_github_repo_parses_common_forms():
     assert origin_to_github_repo("git@github.com:acme/bcp.git") == "acme/bcp"
-    assert origin_to_github_repo("https://github.com/example/drwhome") == "example/drwhome"
-    assert origin_to_github_repo("https://github.com/example/drwhome.git") == (
-        "example/drwhome"
+    assert origin_to_github_repo("https://github.com/example/example-site") == (
+        "example/example-site"
+    )
+    assert origin_to_github_repo("https://github.com/example/example-site.git") == (
+        "example/example-site"
     )
     assert origin_to_github_repo("ssh://git@github.com/org/name.git") == "org/name"
     assert origin_to_github_repo("git@gitlab.com:org/name.git") == ""
@@ -180,24 +182,24 @@ async def test_list_vercel_projects_personal_extracts_github_link():
                 "projects": [
                     {
                         "id": "prj_abc",
-                        "name": "drwhome",
+                        "name": "example-site",
                         "framework": "nextjs",
                         "link": {
                             "type": "github",
                             "org": "example",
-                            "repo": "drwhome",
+                            "repo": "example-site",
                             "productionBranch": "main",
                         },
                         "targets": {
-                            "production": {"alias": ["drwho.me", "drwhome.vercel.app"]}
+                            "production": {"alias": ["example.com", "example-site.vercel.app"]}
                         },
                     },
                     {
                         "id": "prj_def",
-                        "name": "ansaar-marketing",
+                        "name": "acme-marketing",
                         "framework": "astro",
                         "link": {"type": "gitlab", "projectId": "12345"},
-                        "targets": {"production": {"alias": ["ansaar-marketing.vercel.app"]}},
+                        "targets": {"production": {"alias": ["acme-marketing.vercel.app"]}},
                     },
                     {
                         "id": "prj_ghi",
@@ -217,12 +219,12 @@ async def test_list_vercel_projects_personal_extracts_github_link():
         ListVercelProjectsInput(include_personal=True, team_ids=[]),
     )
     assert len(projects) == 3
-    drwhome = next(p for p in projects if p["name"] == "drwhome")
-    assert drwhome["github_repo"] == "example/drwhome"
-    assert drwhome["production_domain"] == "drwho.me"
-    assert drwhome["scope"] == "personal"
-    ansaar = next(p for p in projects if p["name"] == "ansaar-marketing")
-    assert ansaar["github_repo"] == ""
+    example_site = next(p for p in projects if p["name"] == "example-site")
+    assert example_site["github_repo"] == "example/example-site"
+    assert example_site["production_domain"] == "example.com"
+    assert example_site["scope"] == "personal"
+    acme = next(p for p in projects if p["name"] == "acme-marketing")
+    assert acme["github_repo"] == ""
     no_git = next(p for p in projects if p["name"] == "no-git-project")
     assert no_git["github_repo"] == ""
 
