@@ -18,17 +18,19 @@ Five base GTD outcomes from `classify_one`:
 - ``next_action`` — label update (optional `due.string="tomorrow"` from defer).
                   Multi-step work uses Todoist subtasks, not sub-projects.
 
-Pandora short-circuits (added 2026-05-20):
+Content-route short-circuits (added 2026-05-20; config-driven 2026-07):
 
-- ``pandora_gate``          — fresh `^APP-\\d+:` Jira ticket (no @pandora yet):
-                            spawn a choice card instead of auto-investigating.
-                            Resolution stamps @pandora (→ investigation next
-                            tick) or @me (hands off). (inbox gate, 2026-07)
+- ``pandora_gate``          — fresh task matching a `gate:true` content route
+                            (no @pandora yet): spawn a choice card instead of
+                            auto-investigating. Resolution stamps @pandora (→
+                            investigation next tick) or @me (hands off).
+- ``route_apply``           — task matching a `gate:false` content route: apply
+                            the route's assignee + contexts directly, no card.
 - ``pandora_owned``         — task already labelled `@pandora`; no-op apply
-- ``pandora_investigation`` — @pandora `^APP-\\d+:` task with no completed run
+- ``pandora_investigation`` — @pandora content-route task with no completed run
                             (gate-approved or a crashed prior attempt)
-- ``pandora_followup``      — user comment on existing `@pandora` APP-task
-                            triggers a fresh investigation with the comment
+- ``pandora_followup``      — user comment on existing `@pandora` content-route
+                            task triggers a fresh investigation with the comment
                             appended as alert context
 
 ## Interaction spawn (Phase 4)
@@ -291,7 +293,7 @@ class ClarifyFlow:
                             )
                         else:
                             alert_dict = payload["alert"]
-                            child_id = f"pandora-jira-{safe_task_id}-{workflow.info().workflow_id}"
+                            child_id = f"investigation-{safe_task_id}-{workflow.info().workflow_id}"
                             try:
                                 await workflow.start_child_workflow(
                                     AlertInvestigationFlow.run,

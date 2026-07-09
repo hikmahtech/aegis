@@ -8,6 +8,7 @@ anywhere (a permanently failed write silently lost the captured task).
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
@@ -63,6 +64,112 @@ async def put_gtd_rules_route(request: Request, body: dict[str, Any]) -> dict[st
     from aegis.services.gtd_rules import SOURCE_TAGS, save_gtd_rules
 
     return {"source_tags": SOURCE_TAGS, **await save_gtd_rules(request.app.state.db_pool, body)}
+
+
+@router.get("/content-routes")
+async def get_content_routes_route(request: Request) -> dict[str, Any]:
+    """Content-routing rules: regex/prefix/contains on the task title → assignee /
+    contexts / gate. Complements gtd-rules (which routes by source_tag)."""
+    from aegis.services.content_routes import MATCH_MODES, get_content_routes
+
+    routes = await get_content_routes(request.app.state.db_pool)
+    return {"match_modes": list(MATCH_MODES), "routes": routes}
+
+
+@router.put("/content-routes")
+async def put_content_routes_route(request: Request, body: dict[str, Any]) -> dict[str, Any]:
+    """Replace the ordered content-routing rules. 400 on a malformed rule/regex."""
+    from aegis.services.content_routes import MATCH_MODES, save_content_routes
+
+    try:
+        routes = await save_content_routes(request.app.state.db_pool, body.get("routes") or [])
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"match_modes": list(MATCH_MODES), "routes": routes}
+
+
+@router.post("/content-routes/preview")
+async def preview_content_route(request: Request, body: dict[str, Any]) -> dict[str, Any]:
+    """Given a single {match, value}, return the current Inbox task titles it
+    matches — the live safety-net shown before a rule is saved. Matching is done
+    in Python (inbox is small) to sidestep cross-engine regex surprises."""
+    from aegis.services.content_routes import compile_pattern
+
+    try:
+        pattern = compile_pattern(str(body.get("match") or ""), str(body.get("value") or ""))
+        rx = re.compile(pattern)
+    except (ValueError, re.error) as exc:
+        raise HTTPException(status_code=400, detail=f"invalid pattern: {exc}") from exc
+
+    pool = request.app.state.db_pool
+    async with pool.acquire() as conn:
+        inbox_id = await conn.fetchval(
+            "SELECT value->>'inbox' FROM settings WHERE key='todoist_managed_project_ids'"
+        )
+        rows = []
+        if inbox_id:
+            rows = await conn.fetch(
+                "SELECT content FROM todoist_tasks "
+                "WHERE project_id=$1 AND NOT is_completed "
+                "ORDER BY updated_at DESC LIMIT 500",
+                inbox_id,
+            )
+    matches = [r["content"] for r in rows if r["content"] and rx.search(r["content"])]
+    return {"pattern": pattern, "matches": matches[:50], "match_count": len(matches)}
+
+
+@router.post("/content-routes/suggest")
+async def suggest_content_route(request: Request, body: dict[str, Any]) -> dict[str, Any]:
+    """Draft a regex from example task titles (LLM). A convenience: the returned
+    pattern is a SUGGESTION the user edits + previews before saving — never
+    auto-applied. Returns {pattern: null, error} instead of 500 on any LLM issue."""
+    examples = [str(e).strip() for e in (body.get("examples") or []) if str(e).strip()]
+    if not examples:
+        raise HTTPException(status_code=400, detail="at least one example is required")
+    llm = getattr(request.app.state, "llm", None)
+    if llm is None:
+        return {"pattern": None, "error": "LLM backend not configured"}
+
+    from aegis.llm import parse_llm_json, tier_to_model
+
+    try:
+        model = tier_to_model("fast")
+    except KeyError:
+        try:
+            model = tier_to_model("balanced")
+        except KeyError:
+            model = "gemma4:e2b"
+
+    joined = "\n".join(f"- {e}" for e in examples[:20])
+    prompt = (
+        "You write POSIX/PCRE-compatible regular expressions for matching task "
+        "titles. Given these example titles that should ALL match:\n"
+        f"{joined}\n\n"
+        'Return JSON ONLY: {"pattern": "<a single regex>"}. Keep it as simple and '
+        "specific as possible; prefer an anchored prefix (^) when the examples "
+        "share a leading token. No explanation."
+    )
+    try:
+        result = await llm.think(
+            prompt, model=model, max_tokens=200, purpose="content_route_suggest"
+        )
+    except Exception as exc:  # noqa: BLE001 — convenience endpoint, never 500
+        return {"pattern": None, "error": f"LLM error: {str(exc)[:200]}"}
+    raw = result.get("response", "") if isinstance(result, dict) else str(result)
+    pattern = str((parse_llm_json(raw) or {}).get("pattern") or "").strip()
+    if not pattern:
+        return {"pattern": None, "error": "could not derive a pattern"}
+    try:
+        rx = re.compile(pattern)
+    except re.error as exc:
+        return {"pattern": None, "error": f"LLM produced an invalid regex: {exc}"}
+    matched = [e for e in examples if rx.search(e)]
+    return {
+        "pattern": pattern,
+        "match": "regex",
+        "matches_examples": matched,
+        "all_examples_match": len(matched) == len(examples),
+    }
 
 
 @router.get("/state")

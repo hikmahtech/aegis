@@ -11,6 +11,13 @@ from aegis.clarify_note import AGENT_REPLY_PREFIX
 from aegis_worker.activities.clarify import ClarifyActivities
 
 
+@pytest_asyncio.fixture(autouse=True, loop_scope="function")
+async def _auto_content_route(seed_app_route):
+    """Every test here classifies APP-<n>: tasks via the seeded content route
+    (config-driven replacement for the old hardcoded ^APP-\\d+: pattern)."""
+    yield
+
+
 @pytest_asyncio.fixture(loop_scope="function")
 async def _inbox_seeded(db_pool):
     async with db_pool.acquire() as conn:
@@ -422,8 +429,8 @@ async def test_classify_one_raphael_on_app_jira_title_yields_pandora_gate(db_poo
     decision = await acts.classify_one(task)
 
     # @raphael is present but @pandora is NOT in labels. The per-agent block is
-    # skipped because content matches _APP_JIRA_PATTERN (the third guard). Then
-    # the standalone APP-<n>: branch fires → pandora_gate. Tightened to == so a
+    # skipped because content matches a content route (the third guard). Then
+    # the content-route branch fires → pandora_gate. Tightened to == so a
     # misfire to a different branch would be caught.
     assert decision["classification"] == "pandora_gate"
 
