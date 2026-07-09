@@ -157,6 +157,25 @@ class SocialActivities:
                 {"text": text, "link": link, "schedule_at": post_at},
             )
             queued += int(result.endswith("1"))
+        if missing:
+            # Surface the gap: a labeled platform with no connected account is
+            # NOT silently dropped. Comment on the task so the user notices, and
+            # complete_posted_tasks keeps the task open until every labeled
+            # platform posts. Deterministic temp_id → idempotent across retries.
+            note = TodoistConnector.build_note_add_command(
+                task_id,
+                "⚠️ AEGIS could not publish to: "
+                + ", ".join(missing)
+                + " — no connected account. Connect it on the admin Social page "
+                "(or remove the label). This task stays open until every labeled "
+                "platform posts.",
+            )
+            await self.db_pool.execute(
+                "INSERT INTO todoist_outbox (temp_id, command, status) "
+                "VALUES ($1, $2, 'pending') ON CONFLICT (temp_id) DO NOTHING",
+                f"social-missing-{task_id}-{'.'.join(sorted(missing))}",
+                note,
+            )
         activity.logger.info(
             "social_enqueue_outbox task_id=%s queued=%d missing=%s", task_id, queued, missing
         )
@@ -165,6 +184,13 @@ class SocialActivities:
     @activity.defn
     async def drain_social_outbox(self) -> dict:
         """Post pending rows; mark posted, or bump attempt_count (failed at cap)."""
+        # ponytail: at-least-once ceiling. If the connector POSTs successfully
+        # but this worker dies (or the activity times out) before the row flips
+        # to 'posted', the retry re-POSTs → a possible duplicate. Postiz's public
+        # CreatePostDto has NO idempotency/dedup key (body is {type, shortLink,
+        # date, tags, posts:[...]}), so there is no clean way to make the POST
+        # exactly-once here. Accepted for now — the window is a mid-post crash,
+        # not the common path. Revisit if Postiz adds a client-supplied key.
         if self.db_pool is None or self.connector is None:
             return {"posted": 0, "failed": 0}
         rows = await self.db_pool.fetch(
@@ -206,7 +232,15 @@ class SocialActivities:
 
     @activity.defn
     async def complete_posted_tasks(self) -> dict:
-        """Enqueue item_complete (via todoist_outbox) for tasks fully posted.
+        """Enqueue item_complete (via todoist_outbox) for tasks whose EVERY
+        labeled platform has posted.
+
+        A task completes only when (a) all its outbox rows are 'posted' AND
+        (b) every platform its labels ask for actually has a posted row. A
+        labeled platform with no connected account — hence no outbox row —
+        would otherwise be invisible to the all-rows-posted check and let the
+        task complete while that platform never went out. Such a task is left
+        open so the user notices (enqueue_outbox comments the gap).
 
         Idempotent: the deterministic temp_id social-complete-<task_id> makes
         re-runs no-ops until the 5-min TodoistSyncFlow drains the command and
@@ -214,18 +248,31 @@ class SocialActivities:
         """
         if self.db_pool is None:
             return {"completed": 0}
+        platform_labels: dict = await self._setting("social_platform_labels", {"x": "x"})
         rows = await self.db_pool.fetch(
             """
-            SELECT o.todoist_task_id AS task_id
+            SELECT o.todoist_task_id AS task_id, t.labels AS labels,
+                   array_agg(DISTINCT a.platform) AS posted_platforms
             FROM social_outbox o
             JOIN todoist_tasks t ON t.id = o.todoist_task_id
+            JOIN social_accounts a ON a.id = o.account_id
             WHERE o.todoist_task_id IS NOT NULL AND NOT t.is_completed
-            GROUP BY o.todoist_task_id
+            GROUP BY o.todoist_task_id, t.labels
             HAVING count(*) FILTER (WHERE o.status <> 'posted') = 0
             """
         )
         completed = 0
         for r in rows:
+            labels = set(r["labels"] or [])
+            intended = {p for p, lab in platform_labels.items() if lab in labels}
+            missing = intended - set(r["posted_platforms"] or [])
+            if missing:
+                activity.logger.warning(
+                    "social_complete_skipped_missing_platform task_id=%s missing=%s",
+                    r["task_id"],
+                    sorted(missing),
+                )
+                continue
             cmd = TodoistConnector.build_item_complete_command(r["task_id"])
             result = await self.db_pool.execute(
                 "INSERT INTO todoist_outbox (temp_id, command, status) "

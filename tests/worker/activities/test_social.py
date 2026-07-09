@@ -31,6 +31,11 @@ _SETTINGS_KEYS = [
     "social_publish_label",
     "social_platform_labels",
     "user_timezone",
+    # The connector now reads Postiz creds FRESH from these keys — clear any
+    # ambient dev-DB config during tests so the fresh-read falls back to the
+    # env/settings snapshot (restored on teardown).
+    "integration:postiz_url",
+    "integration:postiz_api_key",
 ]
 
 
@@ -80,6 +85,10 @@ async def social_env(db_pool):
         await conn.execute("DELETE FROM social_accounts")
         await conn.execute("DELETE FROM todoist_outbox WHERE temp_id LIKE 'social-%'")
         await conn.execute("DELETE FROM todoist_tasks WHERE id LIKE 'soctest-%'")
+        await conn.execute(
+            "DELETE FROM settings WHERE key = ANY($1::text[])",
+            ["integration:postiz_url", "integration:postiz_api_key"],
+        )
     yield db_pool
     async with db_pool.acquire() as conn:
         await conn.execute("DELETE FROM social_outbox")
@@ -89,7 +98,10 @@ async def social_env(db_pool):
         for key in _SETTINGS_KEYS:
             if key in originals:
                 await conn.execute(
-                    "UPDATE settings SET value = $2 WHERE key = $1", key, originals[key]
+                    "INSERT INTO settings (key, value) VALUES ($1, $2) "
+                    "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+                    key,
+                    originals[key],
                 )
             else:
                 await conn.execute("DELETE FROM settings WHERE key = $1", key)
@@ -398,6 +410,38 @@ async def test_apply_social_approval_skip_strips_publish_label(social_env):
     assert cmd["args"]["labels"] == ["x"]
 
 
+async def test_apply_social_approval_missing_account_does_not_complete(social_env):
+    """Fix #3: a labeled platform with no connected account must NOT complete
+    the task — it stays open (visible) and the gap is surfaced as a comment."""
+    await _seed_account(social_env, platform="x")  # only x connected; linkedin absent
+    await _seed_task(social_env, "soctest-miss", ["publish", "x", "linkedin"])
+    fake = _FakeConnector(ref="tweet-x")
+    act = SocialActivities(db_pool=social_env, connector=fake)
+    result = await ActivityEnvironment().run(
+        act.apply_social_approval,
+        "ia-miss",
+        {"value": "approve"},
+        {"task_id": "soctest-miss", "platforms": ["x", "linkedin"], "text": "hi", "link": ""},
+    )
+    assert result == {"applied": "approved"}
+    # x still posted…
+    assert await social_env.fetchval(
+        "SELECT status FROM social_outbox WHERE todoist_task_id = 'soctest-miss'"
+    ) == "posted"
+    # …but the task is NOT completed (linkedin never went out).
+    assert await social_env.fetchval(
+        "SELECT count(*) FROM todoist_outbox WHERE temp_id = 'social-complete-soctest-miss'"
+    ) == 0
+    # gap surfaced as a Todoist comment
+    note = await social_env.fetchrow(
+        "SELECT command FROM todoist_outbox WHERE temp_id = 'social-missing-soctest-miss-linkedin'"
+    )
+    assert note is not None
+    cmd = note["command"] if isinstance(note["command"], dict) else json.loads(note["command"])
+    assert cmd["type"] == "note_add"
+    assert "linkedin" in cmd["args"]["content"]
+
+
 # ------------------------------------------------------------- connector refresh
 
 
@@ -535,6 +579,118 @@ async def test_post_postiz_missing_config_raises(social_env):
     try:
         with pytest.raises(RuntimeError):
             await connector.post(account_id, {"text": "hi", "link": ""})
+    finally:
+        await connector.close()
+
+
+# ------------------------------------------------- postiz per-platform settings
+
+
+async def _post_via_postiz(social_env, platform: str, meta: dict, text: str = "hi") -> dict:
+    """Route one post through the real connector, respx-mocking Postiz, and
+    return the `settings` object it sent."""
+    account_id = await social_env.fetchval(
+        "INSERT INTO social_accounts (platform, label, meta) VALUES ($1, $2, $3) RETURNING id",
+        platform,
+        f"{platform}-acct",
+        {"postiz_integration_id": f"int-{platform}", **meta},
+    )
+    route = respx.post("https://postiz.example.com/api/public/v1/posts").respond(
+        200, json=[{"postId": "pz-1", "integration": f"int-{platform}"}]
+    )
+    connector = SocialConnector(db_pool=social_env, settings=_settings_with_postiz())
+    try:
+        await connector.post(account_id, {"text": text, "link": ""})
+        return json.loads(route.calls[0].request.content)["posts"][0]["settings"]
+    finally:
+        await connector.close()
+
+
+@respx.mock
+async def test_post_postiz_x_includes_required_who_can_reply_post(social_env):
+    """XDto.who_can_reply_post is required (non-@IsOptional) — omitting it 400s."""
+    settings = await _post_via_postiz(social_env, "x", {})
+    assert settings["__type"] == "x"
+    assert settings["who_can_reply_post"] == "everyone"
+
+
+@respx.mock
+@pytest.mark.parametrize("platform", ["facebook", "linkedin", "mastodon"])
+async def test_post_postiz_all_optional_platforms_send_only_type(social_env, platform):
+    """DTOs with only @IsOptional fields must keep validating on `__type` alone
+    — this is the already-connected LinkedIn/Facebook contract; don't break it."""
+    settings = await _post_via_postiz(social_env, platform, {})
+    assert settings == {"__type": platform}
+
+
+@respx.mock
+async def test_post_postiz_youtube_sets_required_title_and_type(social_env):
+    """YoutubeSettingsDto requires title (>=2 chars) and type (@IsIn)."""
+    text = "A reasonably long YouTube description that exceeds the ninety char title cap " * 2
+    settings = await _post_via_postiz(social_env, "youtube", {}, text=text)
+    assert settings["__type"] == "youtube"
+    assert settings["type"] == "public"
+    assert settings["title"] == text.strip()[:90]
+    assert 2 <= len(settings["title"]) <= 100
+
+
+@respx.mock
+async def test_post_postiz_meta_override_wins_over_defaults(social_env):
+    """meta.postiz_settings pins/overrides per-account settings."""
+    settings = await _post_via_postiz(
+        social_env, "x", {"postiz_settings": {"who_can_reply_post": "verified"}}
+    )
+    assert settings["who_can_reply_post"] == "verified"
+
+
+async def test_post_postiz_reddit_without_subreddit_raises(social_env):
+    """Reddit needs an operator-supplied subreddit array we can't synthesize —
+    raise a clear error (caught per-row by drain) rather than send a 400 body."""
+    account_id = await _seed_postiz_account(social_env, platform="reddit", integration_id="int-r")
+    connector = SocialConnector(db_pool=social_env, settings=_settings_with_postiz())
+    try:
+        with pytest.raises(RuntimeError, match="subreddit"):
+            await connector.post(account_id, {"text": "hi", "link": ""})
+    finally:
+        await connector.close()
+
+
+@respx.mock
+async def test_post_postiz_reddit_with_meta_subreddit_posts(social_env):
+    subreddit = [
+        {"value": {"subreddit": "/r/test", "title": "hi", "type": "self",
+                   "is_flair_required": False}}
+    ]
+    settings = await _post_via_postiz(
+        social_env, "reddit", {"postiz_settings": {"subreddit": subreddit}}
+    )
+    assert settings["__type"] == "reddit"
+    assert settings["subreddit"] == subreddit
+
+
+@respx.mock
+async def test_postiz_creds_read_fresh_from_db_over_settings_snapshot(social_env):
+    """Fix #2: admin-UI Postiz credential edits land in the settings table; the
+    connector must read them FRESH per call, not the boot-time settings snapshot
+    (which pins whatever was configured at worker startup)."""
+    account_id = await _seed_postiz_account(social_env, platform="mastodon", integration_id="int-1")
+    # DB config points at a DIFFERENT host + key than the settings snapshot.
+    await social_env.execute(
+        "INSERT INTO settings (key, value) VALUES ('integration:postiz_url', $1), "
+        "('integration:postiz_api_key', $2) "
+        "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+        {"val": "https://db-postiz.example.com"},
+        {"enc": encrypt_secret("db-key", "")},  # settings.secret_key="" → plaintext mode
+    )
+    route = respx.post("https://db-postiz.example.com/api/public/v1/posts").respond(
+        200, json=[{"postId": "pz-db", "integration": "int-1"}]
+    )
+    # The snapshot still has the OLD postiz.example.com host — a stale read would
+    # POST there and this test's db-postiz route would never be called.
+    connector = SocialConnector(db_pool=social_env, settings=_settings_with_postiz())
+    try:
+        assert await connector.post(account_id, {"text": "hi", "link": ""}) == "pz-db"
+        assert route.calls[0].request.headers["authorization"] == "db-key"
     finally:
         await connector.close()
 
