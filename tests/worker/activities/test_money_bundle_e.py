@@ -29,6 +29,7 @@ def _make_act(db_pool, delivery=None):
         llm=None,
         delivery=delivery,
         fx_rates=_FX_RATES,
+        home_currency="INR",
     )
 
 
@@ -60,7 +61,7 @@ async def _insert_active_charge(
     amount_cents: int,
     currency: str = "USD",
     cadence: str = "monthly",
-    monthly_inr: float = 100.0,
+    monthly_home: float = 100.0,
 ) -> str:
     """Minimal helper. Caller bumps next_due_at / last_seen_at as needed
     after the row is created (interval arithmetic is awkward to pass through
@@ -69,7 +70,7 @@ async def _insert_active_charge(
         """
         INSERT INTO maou.recurring_charge
           (account, sender_label, vendor_name, category, amount_cents,
-           currency, monthly_inr_equivalent, cadence, status)
+           currency, monthly_home_equivalent, cadence, status)
         VALUES ($1, $2, $3, 'saas', $4, $5, $6, $7, 'active')
         RETURNING id
         """,
@@ -78,7 +79,7 @@ async def _insert_active_charge(
         sender_label,
         amount_cents,
         currency,
-        monthly_inr,
+        monthly_home,
         cadence,
     )
     return str(row["id"])
@@ -172,7 +173,7 @@ async def test_notify_renewal_alert_skips_within_7d(db_pool):
         "currency": "USD",
         "account": "acct-dedup",
         "amount_cents": 1299,
-        "monthly_inr_equivalent": 109.7,
+        "monthly_home_equivalent": 109.7,
         "days_left": 5,
         "next_due_at": "2026-06-15T00:00:00",
     }
@@ -221,7 +222,7 @@ async def test_notify_renewal_alert_sends_when_no_prior(db_pool):
             "currency": "USD",
             "account": "acct-fresh",
             "amount_cents": 499,
-            "monthly_inr_equivalent": 42.0,
+            "monthly_home_equivalent": 42.0,
             "days_left": 25,
             "next_due_at": "2026-06-22T00:00:00",
         },

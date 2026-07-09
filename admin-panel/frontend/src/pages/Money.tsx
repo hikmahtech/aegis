@@ -9,7 +9,7 @@ type Charge = {
   category: string;
   amount_cents: number;
   currency: string;
-  monthly_inr_equivalent: number;
+  monthly_home_equivalent: number;
   cadence: string;
   next_due_at: string | null;
   status: string;
@@ -30,13 +30,22 @@ type RenewalAlert = {
 type MoneyState = {
   charges: Charge[];
   upcoming_alerts: RenewalAlert[];
+  home_currency?: string;
 };
+
+const CURRENCY_SYMBOL: Record<string, string> = {
+  INR: '₹', USD: '$', EUR: '€', GBP: '£', JPY: '¥', SGD: 'S$', AUD: 'A$', CAD: 'C$',
+};
+function currencySymbol(code: string | undefined): string {
+  if (!code) return '₹';
+  return CURRENCY_SYMBOL[code] ?? `${code} `;
+}
 
 type DigestSummary = {
   total_monthly_inr?: number;
   active_count?: number;
   by_category?: Record<string, { total_inr: number; count: number }>;
-  top_spenders?: Array<{ vendor_name: string; monthly_inr_equivalent: number }>;
+  top_spenders?: Array<{ vendor_name: string; monthly_home_equivalent: number }>;
   new_this_month?: any[];
   cancelled_this_month?: any[];
 };
@@ -120,6 +129,7 @@ export default function Money() {
 
   const charges = data?.charges ?? [];
   const alerts = data?.upcoming_alerts ?? [];
+  const sym = currencySymbol(data?.home_currency);
   const summary = digest?.summary ?? null;
   const byCategory = summary?.by_category ?? {};
   const categoryRows = Object.entries(byCategory).sort(
@@ -156,7 +166,7 @@ export default function Money() {
                 <th>Vendor</th>
                 <th>Category</th>
                 <th>Amount</th>
-                <th>₹/mo</th>
+                <th>{sym}/mo</th>
                 <th>Cadence</th>
                 <th>Next due</th>
                 <th>Status</th>
@@ -171,7 +181,7 @@ export default function Money() {
                   <td><strong>{c.vendor_name}</strong></td>
                   <td>{c.category}</td>
                   <td className="mono">{formatAmount(c.amount_cents, c.currency)}</td>
-                  <td className="mono">₹{Number(c.monthly_inr_equivalent ?? 0).toFixed(0)}</td>
+                  <td className="mono">{sym}{Number(c.monthly_home_equivalent ?? 0).toFixed(0)}</td>
                   <td>{c.cadence}</td>
                   <td>{c.next_due_at ? new Date(c.next_due_at).toLocaleDateString() : '—'}</td>
                   <td>
@@ -262,7 +272,7 @@ export default function Money() {
               <strong>Active charges:</strong> {summary.active_count ?? 0}
             </p>
             <p style={{ margin: '4px 0' }}>
-              <strong>Total monthly burn:</strong> ₹
+              <strong>Total monthly burn:</strong> {sym}
               {Number(summary.total_monthly_inr ?? 0).toFixed(0)}
             </p>
 
@@ -274,7 +284,7 @@ export default function Money() {
                     <thead>
                       <tr>
                         <th>Category</th>
-                        <th>Total ₹/mo</th>
+                        <th>Total {sym}/mo</th>
                         <th>Charges</th>
                       </tr>
                     </thead>
@@ -282,7 +292,7 @@ export default function Money() {
                       {categoryRows.map(([cat, info]) => (
                         <tr key={cat}>
                           <td><strong>{cat}</strong></td>
-                          <td className="mono">₹{info.total_inr.toFixed(0)}</td>
+                          <td className="mono">{sym}{info.total_inr.toFixed(0)}</td>
                           <td className="mono">{info.count}</td>
                         </tr>
                       ))}
@@ -300,14 +310,14 @@ export default function Money() {
                     <thead>
                       <tr>
                         <th>Vendor</th>
-                        <th>₹/mo</th>
+                        <th>{sym}/mo</th>
                       </tr>
                     </thead>
                     <tbody>
                       {summary.top_spenders.map((s, i) => (
                         <tr key={`${s.vendor_name}-${i}`}>
                           <td><strong>{s.vendor_name}</strong></td>
-                          <td className="mono">₹{Number(s.monthly_inr_equivalent ?? 0).toFixed(0)}</td>
+                          <td className="mono">{sym}{Number(s.monthly_home_equivalent ?? 0).toFixed(0)}</td>
                         </tr>
                       ))}
                     </tbody>

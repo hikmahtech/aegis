@@ -3,17 +3,36 @@
 from __future__ import annotations
 
 import html as _html
+import os
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from typing import Any
 
 import structlog
-from aegis.services.fx import to_monthly_inr
+from aegis.services.fx import to_monthly_home
 from temporalio import activity
 
 from aegis_worker.activities.delivery import safe_send_message
 
 _ONE_DAY = timedelta(days=1)
+
+# Display symbol for digest rendering, keyed by ISO currency code. Unknown
+# codes fall back to "<CODE> " (e.g. "CHF ") via _symbol() below.
+_CURRENCY_SYMBOL = {
+    "INR": "₹",
+    "USD": "$",
+    "EUR": "€",
+    "GBP": "£",
+    "JPY": "¥",
+    "SGD": "S$",
+    "AUD": "A$",
+    "CAD": "C$",
+}
+
+
+def _symbol(code: str) -> str:
+    """Digest currency symbol for `code`, or "<CODE> " if unmapped."""
+    return _CURRENCY_SYMBOL.get(code, f"{code} ")
 
 
 def _format_agent_persona(persona: dict) -> str | None:
@@ -52,22 +71,16 @@ logger = structlog.get_logger()
 # Bank / card-alert sender domains. Mail from these addresses is transactional
 # *alerts* (autopay reminders, failed-payment notices, credit-card statements),
 # NOT vendor receipts — yet they quote figures the extractor can mistake for a
-# recurring charge (verified prod offenders: axis.bank.in autopay reminders
-# minting Google/AWS charges, a ₹67,824 card-statement "Axis Bank" charge, a
-# failed razorpay payment). The LLM prompt hardening is best-effort; this is the
-# belt-and-suspenders deterministic guard. Match is case-insensitive substring.
+# recurring charge (verified prod offenders: an autopay reminder or card
+# statement minting a fake recurring charge, a failed payment-gateway notice).
+# The LLM prompt hardening is best-effort; this is the belt-and-suspenders
+# deterministic guard. Match is case-insensitive substring. Configured via
+# AEGIS_BANK_ALERT_SENDERS (comma-separated domains); default empty means the
+# guard is a clean no-op until a self-hoster adds their own bank's domains.
 _BANK_ALERT_SENDERS = frozenset(
-    {
-        "axis.bank.in",
-        "axisbank.com",
-        "alerts@axisbank.com",
-        "alerts@hdfcbank.net",
-        "hdfcbank.net",
-        "alerts.icicibank.com",
-        "icicibank.com",
-        "sbi.co.in",
-        "kotak.com",
-    }
+    s.strip().lower()
+    for s in os.getenv("AEGIS_BANK_ALERT_SENDERS", "").split(",")
+    if s.strip()
 )
 
 
@@ -89,6 +102,7 @@ class MoneyActivities:
     delivery: Any  # DeliveryActivities
     fx_rates: dict[str, float]
     agent_id: str = "maou"
+    home_currency: str = "INR"
 
     @activity.defn
     async def store_receipt_email(self, msg: dict, account: str) -> str:
@@ -243,13 +257,14 @@ class MoneyActivities:
 
                 amount = e.get("amount") or 0
                 amount_cents = int(round(amount * 100))
-                currency = (e.get("currency") or "INR").upper()
+                currency = (e.get("currency") or self.home_currency).upper()
                 cadence = e.get("cadence") or "unknown"
-                monthly_inr = to_monthly_inr(
+                monthly_home = to_monthly_home(
                     amount,
                     currency,
                     cadence,
                     self.fx_rates,
+                    self.home_currency,
                 )
 
                 next_due_raw = e.get("next_due_at")
@@ -270,7 +285,7 @@ class MoneyActivities:
                 charge_row = await conn.fetchrow(
                     "INSERT INTO maou.recurring_charge "
                     "(account, sender_label, vendor_name, category, amount_cents, "
-                    " currency, monthly_inr_equivalent, cadence, "
+                    " currency, monthly_home_equivalent, cadence, "
                     " first_seen_at, last_seen_at, next_due_at) "
                     "VALUES ($1,$2,$3,$4,$5,$6,$7,$8,NOW(),NOW(),$9) "
                     "ON CONFLICT (account, sender_label, amount_cents, currency) "
@@ -285,7 +300,7 @@ class MoneyActivities:
                     "         THEN maou.recurring_charge.cadence "
                     "    ELSE EXCLUDED.cadence "
                     "  END, "
-                    "  monthly_inr_equivalent = EXCLUDED.monthly_inr_equivalent, "
+                    "  monthly_home_equivalent = EXCLUDED.monthly_home_equivalent, "
                     "  status = CASE WHEN maou.recurring_charge.status='cancelled' "
                     "                THEN 'active' "
                     "                ELSE maou.recurring_charge.status END, "
@@ -297,7 +312,7 @@ class MoneyActivities:
                     e.get("category", "other"),
                     amount_cents,
                     currency,
-                    monthly_inr,
+                    monthly_home,
                     cadence,
                     next_due_at,
                 )
@@ -362,7 +377,7 @@ class MoneyActivities:
             # due date and then drops the row out of the eligible set.
             charges = await conn.fetch(
                 "SELECT id, account, vendor_name, category, amount_cents, "
-                "currency, monthly_inr_equivalent, next_due_at, "
+                "currency, monthly_home_equivalent, next_due_at, "
                 "EXTRACT(EPOCH FROM (next_due_at - NOW())) / 86400 AS days_left "
                 "FROM maou.recurring_charge "
                 "WHERE status = 'active' AND next_due_at IS NOT NULL "
@@ -392,7 +407,7 @@ class MoneyActivities:
                                 "category": c["category"],
                                 "amount_cents": c["amount_cents"],
                                 "currency": c["currency"],
-                                "monthly_inr_equivalent": float(c["monthly_inr_equivalent"]),
+                                "monthly_home_equivalent": float(c["monthly_home_equivalent"]),
                                 "days_left": round(days_left, 1),
                                 "next_due_at": c["next_due_at"].isoformat(),
                                 "account": c["account"],
@@ -440,7 +455,8 @@ class MoneyActivities:
         body = (
             f"<b>{vendor}</b> ({category})\n"
             f"Amount: {amount:.2f} {currency}\n"
-            f"Monthly INR equiv: ₹{alert['monthly_inr_equivalent']:.0f}\n"
+            f"Monthly {self.home_currency} equiv: "
+            f"{_symbol(self.home_currency)}{alert['monthly_home_equivalent']:.0f}\n"
             f"Renews in: <b>{alert['days_left']:.0f} days</b> "
             f"({alert['next_due_at'][:10]})\n"
             f"Account: {account}"
@@ -508,19 +524,19 @@ class MoneyActivities:
         async with self.db_pool.acquire() as conn:
             active = await conn.fetch(
                 "SELECT vendor_name, category, currency, amount_cents, "
-                "       monthly_inr_equivalent, last_seen_at, first_seen_at, "
+                "       monthly_home_equivalent, last_seen_at, first_seen_at, "
                 "       status "
                 "FROM maou.recurring_charge WHERE status = 'active'"
             )
             new_this = await conn.fetch(
-                "SELECT vendor_name, monthly_inr_equivalent "
+                "SELECT vendor_name, monthly_home_equivalent "
                 "FROM maou.recurring_charge "
                 "WHERE first_seen_at >= $1 AND first_seen_at < $2",
                 period_start,
                 period_end,
             )
             cancelled_this = await conn.fetch(
-                "SELECT vendor_name, monthly_inr_equivalent "
+                "SELECT vendor_name, monthly_home_equivalent "
                 "FROM maou.recurring_charge "
                 "WHERE status='cancelled' "
                 "  AND updated_at >= $1 AND updated_at < $2",
@@ -531,7 +547,7 @@ class MoneyActivities:
         by_category: dict[str, dict] = {}
         total = 0.0
         for r in active:
-            inr = float(r["monthly_inr_equivalent"])
+            inr = float(r["monthly_home_equivalent"])
             total += inr
             cat = r["category"] or "other"
             slot = by_category.setdefault(cat, {"total_inr": 0.0, "count": 0})
@@ -542,11 +558,11 @@ class MoneyActivities:
             (
                 {
                     "vendor_name": r["vendor_name"],
-                    "monthly_inr_equivalent": float(r["monthly_inr_equivalent"]),
+                    "monthly_home_equivalent": float(r["monthly_home_equivalent"]),
                 }
                 for r in active
             ),
-            key=lambda x: x["monthly_inr_equivalent"],
+            key=lambda x: x["monthly_home_equivalent"],
             reverse=True,
         )[:10]
 
@@ -562,14 +578,14 @@ class MoneyActivities:
             "new_this_month": [
                 {
                     "vendor_name": r["vendor_name"],
-                    "monthly_inr_equivalent": float(r["monthly_inr_equivalent"]),
+                    "monthly_home_equivalent": float(r["monthly_home_equivalent"]),
                 }
                 for r in new_this
             ],
             "cancelled_this_month": [
                 {
                     "vendor_name": r["vendor_name"],
-                    "monthly_inr_equivalent": float(r["monthly_inr_equivalent"]),
+                    "monthly_home_equivalent": float(r["monthly_home_equivalent"]),
                 }
                 for r in cancelled_this
             ],
@@ -599,11 +615,12 @@ class MoneyActivities:
         period_end = _html.escape(str(digest.get("period_end", "")))
         total = float(digest.get("total_monthly_inr", 0.0))
         active_count = int(digest.get("active_count", 0))
+        sym = _symbol(self.home_currency)
 
         lines = [
             f"<b>Monthly subscription audit</b> ({period_start} → {period_end})",
             f"Active charges: <b>{active_count}</b>",
-            f"Total monthly burn: <b>₹{total:.0f}</b>",
+            f"Total monthly burn: <b>{sym}{total:.0f}</b>",
             "",
             "<b>By category:</b>",
         ]
@@ -614,7 +631,7 @@ class MoneyActivities:
             reverse=True,
         ):
             lines.append(
-                f"  {_html.escape(str(cat))}: ₹{info['total_inr']:.0f} ({info['count']} charges)"
+                f"  {_html.escape(str(cat))}: {sym}{info['total_inr']:.0f} ({info['count']} charges)"
             )
 
         top = digest.get("top_spenders") or []
@@ -624,7 +641,7 @@ class MoneyActivities:
             for s in top[:10]:
                 lines.append(
                     f"  {_html.escape(str(s['vendor_name']))}: "
-                    f"₹{float(s['monthly_inr_equivalent']):.0f}"
+                    f"{sym}{float(s['monthly_home_equivalent']):.0f}"
                 )
 
         new_this = digest.get("new_this_month") or []
