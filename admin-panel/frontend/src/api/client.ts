@@ -316,6 +316,10 @@ export const api = {
   // Workflows
   listTemporalWorkflows: (pageSize = 30) =>
     apiFetch<any>(`/api/temporal/workflows?page_size=${pageSize}`),
+  getWorkflow: (id: string, runId?: string) =>
+    apiFetch<any>(
+      `/api/temporal/workflows/${encodeURIComponent(id)}${runId ? `?run_id=${encodeURIComponent(runId)}` : ''}`,
+    ),
   listWorkflowRuns: (params?: {
     agent_id?: string;
     workflow_type?: string;

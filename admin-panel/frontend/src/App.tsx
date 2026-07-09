@@ -27,6 +27,7 @@ import Resources from './pages/Resources';
 import Settings from './pages/Settings';
 import SlackConfig from './pages/SlackConfig';
 import Workflows from './pages/Workflows';
+import WorkflowDetail from './pages/WorkflowDetail';
 
 export default function App() {
   const [authed, setAuthed] = useState(hasCredentials());
@@ -39,6 +40,7 @@ export default function App() {
           <Route path="/interactions" element={<Interactions />} />
           <Route path="/interactions/:id" element={<InteractionDetail />} />
           <Route path="/workflows" element={<Workflows />} />
+          <Route path="/workflows/:id" element={<WorkflowDetail />} />
           <Route path="/flows" element={<Flows />} />
           <Route path="/models" element={<ModelsProviders />} />
           <Route path="/integrations" element={<Integrations />} />

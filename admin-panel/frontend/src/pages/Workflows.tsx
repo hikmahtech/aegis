@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
+import { Link } from 'react-router-dom';
 import { api } from '../api/client';
 import ErrorBanner from '../components/ErrorBanner';
 
@@ -92,7 +93,11 @@ function LiveTab() {
               const start = e?.startTime ?? e?.start_time;
               return (
                 <tr key={`${wfId}-${runId}`}>
-                  <td className="mono" title={wfId} style={{ maxWidth: 260, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{wfId}</td>
+                  <td className="mono" title={wfId} style={{ maxWidth: 260, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                    {wfId !== '?'
+                      ? <Link to={`/workflows/${encodeURIComponent(wfId)}?run=${encodeURIComponent(runId)}`}>{wfId}</Link>
+                      : wfId}
+                  </td>
                   <td>{type}</td>
                   <td><span className={`badge badge-${status}`}>{status}</span></td>
                   <td>{start ? new Date(start).toLocaleString() : '—'}</td>
@@ -208,7 +213,9 @@ function HistoryTab() {
             {rows.map(r => (
               <tr key={r.run_id}>
                 <td className="mono" title={r.run_id} style={{ maxWidth: 160, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                  {(r.run_id ?? '').slice(0, 8)}…
+                  {r.workflow_id
+                    ? <Link to={`/workflows/${encodeURIComponent(r.workflow_id)}?run=${encodeURIComponent(r.run_id ?? '')}`}>{(r.run_id ?? '').slice(0, 8)}…</Link>
+                    : `${(r.run_id ?? '').slice(0, 8)}…`}
                 </td>
                 <td>{r.workflow_type}</td>
                 <td>{r.agent_id || '—'}</td>
