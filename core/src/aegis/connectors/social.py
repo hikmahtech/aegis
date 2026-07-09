@@ -37,6 +37,23 @@ X_TOKEN_URL = "https://api.x.com/2/oauth2/token"
 X_TWEETS_URL = "https://api.x.com/2/tweets"
 _REFRESH_MARGIN = timedelta(minutes=5)
 
+# ponytail: THIS is the extension point for Postiz per-platform required
+# settings. Postiz runs class-validator with skipMissingProperties:false on
+# every non-draft post, so any provider whose settings DTO has a REQUIRED
+# (non-@IsOptional) field returns HTTP 400 unless we send it. Add a platform
+# here when its DTO gains a required field. All-optional providers
+# (facebook / linkedin / linkedin-page / threads / mastodon / bluesky /
+# telegram / nostr / vk / kick) need NO entry — `{"__type": platform}` alone
+# validates. Any account can pin/override these via meta.postiz_settings.
+# YouTube's `title` and Reddit's `subreddit` are data-derived, handled below.
+_POSTIZ_REQUIRED_SETTINGS: dict[str, dict] = {
+    # XDto.who_can_reply_post — @IsIn(...), not @IsOptional.
+    "x": {"who_can_reply_post": "everyone"},
+    # YoutubeSettingsDto.type — @IsIn(public|private|unlisted), @IsDefined
+    # (`title` is required too, derived from the post text below).
+    "youtube": {"type": "public"},
+}
+
 
 def _render_text(payload: dict) -> str:
     """Compose post text from {text, link} — shared by every transport."""
@@ -45,6 +62,29 @@ def _render_text(payload: dict) -> str:
     if link:
         text = f"{text}\n\n{link}" if text else link
     return text
+
+
+def _build_postiz_settings(platform: str, text: str, meta: dict) -> dict:
+    """The Postiz per-post `settings` object for one platform.
+
+    Merge order (lowest → highest priority): ``__type`` + the static required
+    defaults from ``_POSTIZ_REQUIRED_SETTINGS``, then data-derived required
+    fields (YouTube ``title``), then per-account overrides from
+    ``meta.postiz_settings``. Reddit needs an operator-supplied ``subreddit``
+    array we can't synthesize — raise a clear error rather than let Postiz
+    reject a malformed body with a cryptic 400 (caught per-row by the outbox
+    drain, so it never crashes the flow)."""
+    settings: dict = {"__type": platform, **_POSTIZ_REQUIRED_SETTINGS.get(platform, {})}
+    if platform == "youtube":
+        title = text.strip()[:90]
+        settings["title"] = title if len(title) >= 2 else "Untitled"
+    settings.update((meta or {}).get("postiz_settings") or {})
+    if platform == "reddit" and not settings.get("subreddit"):
+        raise RuntimeError(
+            "postiz reddit requires a 'subreddit' settings array (RedditSettingsDto) — "
+            "pin it per-account via meta.postiz_settings.subreddit; skipping post"
+        )
+    return settings
 
 
 class SocialAuthError(RuntimeError):
@@ -155,9 +195,29 @@ class SocialConnector(HTTPConnector):
         await self._record("post_x", "ok", latency_ms)
         return str(resp.json()["data"]["id"])
 
-    async def _post_postiz(self, account: dict, payload: dict) -> str:
-        postiz_url = self._settings.postiz_url
+    async def _postiz_creds(self) -> tuple[str, str]:
+        """Postiz base URL + API key, read FRESH from the settings table on
+        every call (DB-first, boot-time settings snapshot as fallback) so
+        admin-UI credential edits take effect without a worker restart — the
+        connector is built once at bootstrap and would otherwise pin the
+        startup snapshot. Storage shape mirrors services/integrations_config:
+        key `integration:<field>`, plain in `val`, secrets encrypted in `enc`."""
+        url = self._settings.postiz_url
         api_key = self._settings.postiz_api_key
+        if self._db_pool is not None:
+            rows = await self._db_pool.fetch(
+                "SELECT key, value FROM settings WHERE key = ANY($1::text[])",
+                ["integration:postiz_url", "integration:postiz_api_key"],
+            )
+            by_key = {r["key"]: (r["value"] or {}) for r in rows}
+            url = by_key.get("integration:postiz_url", {}).get("val") or url
+            enc = by_key.get("integration:postiz_api_key", {}).get("enc")
+            if enc:
+                api_key = decrypt_secret(enc, self._settings.secret_key) or api_key
+        return url, api_key
+
+    async def _post_postiz(self, account: dict, payload: dict) -> str:
+        postiz_url, api_key = await self._postiz_creds()
         if not postiz_url or not api_key:
             raise RuntimeError(
                 f"postiz account {account['platform']}/{account['label']} is synced but "
@@ -177,6 +237,7 @@ class SocialConnector(HTTPConnector):
                     post_type, post_date = "schedule", when.astimezone(UTC)
             except (ValueError, TypeError):  # unparseable or naive datetime
                 logger.warning("postiz_schedule_at_unparseable", value=schedule_at[:40])
+        settings = _build_postiz_settings(account["platform"], text, account["meta"] or {})
         body = {
             "type": post_type,
             "shortLink": False,
@@ -186,7 +247,7 @@ class SocialConnector(HTTPConnector):
                 {
                     "integration": {"id": account["meta"]["postiz_integration_id"]},
                     "value": [{"content": text, "image": []}],
-                    "settings": {"__type": account["platform"]},
+                    "settings": settings,
                 }
             ],
         }
@@ -213,8 +274,7 @@ class SocialConnector(HTTPConnector):
         key it by the lowercased label. A fresh post with no analytics yet
         returns an empty array — that's not an error, just an empty series.
         """
-        postiz_url = self._settings.postiz_url
-        api_key = self._settings.postiz_api_key
+        postiz_url, api_key = await self._postiz_creds()
         if not postiz_url or not api_key:
             raise RuntimeError(
                 f"postiz not configured — cannot fetch metrics for post {post_ref}: "
@@ -258,8 +318,7 @@ class SocialConnector(HTTPConnector):
 
     async def list_posts_window(self, start_iso: str, end_iso: str) -> list[dict]:
         """Postiz posts due/published within [start_iso, end_iso] (ISO datetimes)."""
-        postiz_url = self._settings.postiz_url
-        api_key = self._settings.postiz_api_key
+        postiz_url, api_key = await self._postiz_creds()
         if not postiz_url or not api_key:
             raise RuntimeError(
                 "postiz not configured — cannot list posts: set postiz_url/postiz_api_key "
