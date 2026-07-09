@@ -4,6 +4,7 @@
 [![Worker CI](https://github.com/hikmahtech/aegis/actions/workflows/worker.yml/badge.svg)](https://github.com/hikmahtech/aegis/actions/workflows/worker.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Python 3.12](https://img.shields.io/badge/python-3.12-blue.svg)](https://www.python.org/)
+[![Project home](https://img.shields.io/badge/home-hikmahtechnologies.com%2Faegis-b87333)](https://hikmahtechnologies.com/aegis)
 
 **Autonomous Executive Guild Intelligence System** — a flow-first, self-hosted
 personal AI orchestration platform. A small fleet
@@ -17,6 +18,9 @@ extra horsepower.
 > life** — not a multi-tenant SaaS. The shipped agents, schedules, and
 > personalities are the maintainer's working example; you replace them with
 > yours. MIT licensed.
+
+**Project home & story:** [**hikmahtechnologies.com/aegis**](https://hikmahtechnologies.com/aegis)
+— an overview of how AEGIS works, plus a series of essays on how it was built.
 
 ## What it does
 
