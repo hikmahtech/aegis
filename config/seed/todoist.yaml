@@ -40,7 +40,7 @@ labels:
     - name: "@home"
     - name: "@office"
     - name: "@reading"
-  # Areas are now real Todoist projects (Stockopedia/Hikmah/Personal/Admin/...),
+  # Areas are now real Todoist projects (Work/Personal/Admin/...),
   # not labels. Only @area/acme remains — the pandora investigation flow still
   # tags Jira-linked tasks with it.
   areas:

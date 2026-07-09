@@ -15,18 +15,18 @@ def _make(token: str = "vcp_test", team: str = "team_abc"):
 @pytest.mark.asyncio
 @respx.mock
 async def test_get_project_success():
-    route = respx.get(f"{BASE}/v9/projects/drwhome").mock(
+    route = respx.get(f"{BASE}/v9/projects/example-site").mock(
         return_value=Response(
             200,
-            json={"id": "prj_abc", "name": "drwhome", "framework": "nextjs"},
+            json={"id": "prj_abc", "name": "example-site", "framework": "nextjs"},
         )
     )
     c = _make()
-    result = await c.get_project("drwhome")
+    result = await c.get_project("example-site")
     assert route.call_count == 1
     assert "teamId=team_abc" in str(route.calls[0].request.url)
     assert result["id"] == "prj_abc"
-    assert result["name"] == "drwhome"
+    assert result["name"] == "example-site"
     await c.close()
 
 
@@ -46,7 +46,7 @@ async def test_get_project_404_returns_error_dict():
 @pytest.mark.asyncio
 async def test_get_project_no_token_short_circuits():
     c = _make(token="")
-    result = await c.get_project("drwhome")
+    result = await c.get_project("example-site")
     assert result == {"error": "vercel_token_not_configured"}
 
 
@@ -60,8 +60,8 @@ async def test_list_deployments_uses_app_param_for_name():
                 "deployments": [
                     {
                         "uid": "dpl_1",
-                        "name": "drwhome",
-                        "url": "drwhome-abc.vercel.app",
+                        "name": "example-site",
+                        "url": "example-site-abc.vercel.app",
                         "state": "READY",
                         "created": 1779000000000,
                         "meta": {"githubCommitRef": "main", "githubCommitSha": "abc123def456"},
@@ -71,10 +71,10 @@ async def test_list_deployments_uses_app_param_for_name():
         )
     )
     c = _make()
-    result = await c.list_deployments("drwhome", limit=5)
+    result = await c.list_deployments("example-site", limit=5)
     assert route.call_count == 1
     qs = str(route.calls[0].request.url)
-    assert "app=drwhome" in qs
+    assert "app=example-site" in qs
     assert "limit=5" in qs
     assert "projectId" not in qs
     assert result["count"] == 1
@@ -110,7 +110,7 @@ async def test_list_deployments_state_filter_normalizes_case():
         return_value=Response(200, json={"deployments": []})
     )
     c = _make()
-    await c.list_deployments("drwhome", state="error")  # lowercase
+    await c.list_deployments("example-site", state="error")  # lowercase
     qs = str(route.calls[0].request.url)
     assert "state=ERROR" in qs
     await c.close()
@@ -119,7 +119,7 @@ async def test_list_deployments_state_filter_normalizes_case():
 @pytest.mark.asyncio
 async def test_list_deployments_rejects_unknown_state():
     c = _make()
-    result = await c.list_deployments("drwhome", state="WEIRD")
+    result = await c.list_deployments("example-site", state="WEIRD")
     assert result["error"].startswith("invalid_state")
     assert "READY" in result["allowed"]
 
@@ -131,7 +131,7 @@ async def test_list_deployments_since_hours_sets_epoch_ms():
         return_value=Response(200, json={"deployments": []})
     )
     c = _make()
-    await c.list_deployments("drwhome", since_hours=24)
+    await c.list_deployments("example-site", since_hours=24)
     qs = str(route.calls[0].request.url)
     assert "since=" in qs
     # Confirm the since value is a recent epoch ms (within last day or so)
@@ -155,8 +155,8 @@ async def test_get_deployment_surfaces_error_fields():
             200,
             json={
                 "id": "dpl_err",
-                "name": "drwhome",
-                "url": "drwhome-x.vercel.app",
+                "name": "example-site",
+                "url": "example-site-x.vercel.app",
                 "readyState": "ERROR",
                 "createdAt": 1779000000000,
                 "errorCode": "BUILD_FAILED",

@@ -6,6 +6,7 @@ docs/
 scripts/
 node_modules/
 admin-panel/frontend/node_modules/
+admin-panel/frontend/dist/
 seed_data/
 *.pyc
 __pycache__/

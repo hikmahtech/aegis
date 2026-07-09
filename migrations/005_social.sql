@@ -7,7 +7,7 @@
 CREATE TABLE IF NOT EXISTS social_accounts (
     id                bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     platform          text NOT NULL,   -- 'x' | 'linkedin' | 'facebook' | 'youtube'
-    label             text NOT NULL,   -- e.g. 'hikmah' | 'personal' — multiple accounts per platform
+    label             text NOT NULL,   -- e.g. 'work' | 'personal' — multiple accounts per platform
     access_token_enc  jsonb,           -- {value, encrypted} via aegis.crypto
     refresh_token_enc jsonb,
     expires_at        timestamptz,

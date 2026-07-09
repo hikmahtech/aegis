@@ -4,7 +4,7 @@ A Swarm cluster node has stopped responding to heartbeats from the managers and 
 
 ## Most Likely Cause
 
-Machine restart or network partition. In this homelab (mgr-1/mgr-2/mgr-3=managers, node-c=db, node-d=logs, node-a+node-b=GPU, pop-think-os=general) the most common trigger is a node rebooting after an unattended-upgrades restart.
+Machine restart or network partition. In this homelab (mgr-1/mgr-2/mgr-3=managers, node-c=db, node-d=logs, node-a+node-b=GPU, node-e=general) the most common trigger is a node rebooting after an unattended-upgrades restart.
 
 ## Diagnostic Steps
 

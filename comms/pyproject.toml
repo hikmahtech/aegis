@@ -8,7 +8,7 @@ version = "2.0.0"
 description = "AEGIS comms — channel-adapter bot + delivery server"
 requires-python = ">=3.12"
 license = {text = "MIT"}
-authors = [{name = "the owner Ansari"}]
+authors = [{name = "Arshad Ansari"}]
 dependencies = [
     "httpx>=0.28.0",
     "pdfminer.six>=20231228",
@@ -31,6 +31,11 @@ dependencies = [
     # must be declared directly or the comms image crashes at boot (no aiohttp).
     "aiohttp>=3.10",
 ]
+
+[project.urls]
+Homepage = "https://github.com/hikmahtech/aegis"
+Repository = "https://github.com/hikmahtech/aegis"
+Issues = "https://github.com/hikmahtech/aegis/issues"
 
 [project.optional-dependencies]
 dev = [

@@ -1,4 +1,12 @@
 # AEGIS v2 Core API
+FROM node:22-alpine AS frontend-build
+
+WORKDIR /build/admin-panel/frontend
+COPY admin-panel/frontend/package*.json ./
+RUN npm ci
+COPY admin-panel/frontend/ ./
+RUN npm run build
+
 FROM python:3.12-slim AS builder
 
 WORKDIR /build
@@ -69,7 +77,7 @@ COPY personalities/ personalities/
 # startup seeding silently no-ops (seed_dir_not_found) and the DB ships empty,
 # so Flows/Agents/Resources all render blank. No secrets live here.
 COPY config/seed/ config/seed/
-COPY admin-panel/frontend/dist/ admin-panel/frontend/dist/
+COPY --from=frontend-build /build/admin-panel/frontend/dist/ admin-panel/frontend/dist/
 
 RUN useradd --create-home --shell /bin/bash aegis \
     && chown -R aegis:aegis /app

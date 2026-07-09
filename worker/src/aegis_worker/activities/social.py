@@ -136,7 +136,7 @@ class SocialActivities:
         queued, missing = 0, []
         for platform in platforms:
             # ponytail: first account per platform; a per-task account label
-            # (e.g. @x:hikmah) is the upgrade path when multi-account matters.
+            # (e.g. @x:work) is the upgrade path when multi-account matters.
             account_id = await self.db_pool.fetchval(
                 "SELECT id FROM social_accounts WHERE platform = $1 ORDER BY id LIMIT 1",
                 platform,

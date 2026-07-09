@@ -166,7 +166,7 @@ class LLMClient:
             timeout=timeout,
         )
         # Per-model semaphores. Used to throttle models that share a single
-        # busy GPU (e.g. gemma4:e2b on node-a's RTX 2070 alongside postgres,
+        # busy GPU (e.g. gemma4:e2b on node-a's GPU alongside postgres,
         # core, worker, comms and redis). Bursts of concurrent calls
         # otherwise serialize through ollama and compound latency.
         self._concurrency_limits = dict(concurrency_limits or {})

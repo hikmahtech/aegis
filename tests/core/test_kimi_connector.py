@@ -257,7 +257,7 @@ async def test_remove_worktree_noop_on_empty_path(conn):
 
 
 @pytest.fixture
-def conn_asif():
+def conn_b():
     """Connector with a preferred kimi_host so the probe path is exercised."""
     return RemoteScriptConnector(
         host="node-a",
@@ -278,14 +278,14 @@ def test_ssh_args_host_targets_explicit_host(conn):
 
 
 @pytest.mark.asyncio
-async def test_probe_host_uses_fast_batch_ssh_and_returns_true_on_rc0(conn_asif):
+async def test_probe_host_uses_fast_batch_ssh_and_returns_true_on_rc0(conn_b):
     proc = AsyncMock()
     proc.communicate = AsyncMock(return_value=(b"", b""))
     proc.returncode = 0
     proc.kill = MagicMock()
     proc.wait = AsyncMock(return_value=0)
     with patch("asyncio.create_subprocess_exec", AsyncMock(return_value=proc)) as mock_exec:
-        ok = await conn_asif._probe_host("node-b")
+        ok = await conn_b._probe_host("node-b")
     assert ok is True
     argv = " ".join(str(a) for a in mock_exec.call_args.args)
     assert "ConnectTimeout=3" in argv
@@ -294,29 +294,29 @@ async def test_probe_host_uses_fast_batch_ssh_and_returns_true_on_rc0(conn_asif)
 
 
 @pytest.mark.asyncio
-async def test_probe_host_returns_false_on_nonzero(conn_asif):
+async def test_probe_host_returns_false_on_nonzero(conn_b):
     proc = AsyncMock()
     proc.communicate = AsyncMock(return_value=(b"", b""))
     proc.returncode = 255
     proc.kill = MagicMock()
     proc.wait = AsyncMock(return_value=255)
     with patch("asyncio.create_subprocess_exec", AsyncMock(return_value=proc)):
-        ok = await conn_asif._probe_host("node-b")
+        ok = await conn_b._probe_host("node-b")
     assert ok is False
 
 
 @pytest.mark.asyncio
-async def test_resolve_kimi_host_prefers_reachable_kimi_host(conn_asif):
-    with patch.object(conn_asif, "_probe_host", AsyncMock(return_value=True)):
-        host, use_tmux = await conn_asif._resolve_kimi_host()
+async def test_resolve_kimi_host_prefers_reachable_kimi_host(conn_b):
+    with patch.object(conn_b, "_probe_host", AsyncMock(return_value=True)):
+        host, use_tmux = await conn_b._resolve_kimi_host()
     assert host == "node-b"
     assert use_tmux is True
 
 
 @pytest.mark.asyncio
-async def test_resolve_kimi_host_falls_back_when_probe_fails(conn_asif):
-    with patch.object(conn_asif, "_probe_host", AsyncMock(return_value=False)):
-        host, use_tmux = await conn_asif._resolve_kimi_host()
+async def test_resolve_kimi_host_falls_back_when_probe_fails(conn_b):
+    with patch.object(conn_b, "_probe_host", AsyncMock(return_value=False)):
+        host, use_tmux = await conn_b._resolve_kimi_host()
     assert host == "node-a"
     assert use_tmux is False
 
@@ -408,17 +408,17 @@ async def test_start_kimi_run_unset_kimi_host_uses_nohup_on_base_host(conn):
 
 
 @pytest.mark.asyncio
-async def test_start_kimi_run_tmux_mode_launches_window_with_tee(conn_asif):
+async def test_start_kimi_run_tmux_mode_launches_window_with_tee(conn_b):
     """kimi_host reachable + under cap → tmux new-window with tee + remain-on-exit on node-b."""
     # _probe_host is patched (no subprocess), so the ssh calls are:
     #   0 test-d, 1 pull, 2 worktree, 3 prompt, 4 ensure+list, 5 new-window launch
     procs = _make_proc_sequence([0, 0, 0, 0, 0, 0])
     procs[4].communicate = AsyncMock(return_value=(b"@0:bash:0\n", b""))  # list-windows output
     with (
-        patch.object(conn_asif, "_probe_host", AsyncMock(return_value=True)),
+        patch.object(conn_b, "_probe_host", AsyncMock(return_value=True)),
         patch("asyncio.create_subprocess_exec", side_effect=procs) as mock_exec,
     ):
-        result = await conn_asif.start_kimi_run(
+        result = await conn_b.start_kimi_run(
             repo="youruser/bcp", prompt="investigate", kimi_binary="/usr/local/bin/kimi"
         )
     assert result["status"] == "running"
@@ -438,7 +438,7 @@ async def test_start_kimi_run_tmux_mode_launches_window_with_tee(conn_asif):
 
 
 @pytest.mark.asyncio
-async def test_start_kimi_run_tmux_all_live_falls_back_to_detached(conn_asif):
+async def test_start_kimi_run_tmux_all_live_falls_back_to_detached(conn_b):
     """kimi_host reachable but all 10 windows live → detached nohup on node-b, in_tmux False."""
     live = "\n".join(f"@{i}:kimi-bcp-{i:04d}:0" for i in range(10))
     # _probe_host patched; ssh calls: 0 test-d, 1 pull, 2 worktree, 3 prompt,
@@ -446,10 +446,10 @@ async def test_start_kimi_run_tmux_all_live_falls_back_to_detached(conn_asif):
     procs = _make_proc_sequence([0, 0, 0, 0, 0, 0])
     procs[4].communicate = AsyncMock(return_value=(live.encode(), b""))
     with (
-        patch.object(conn_asif, "_probe_host", AsyncMock(return_value=True)),
+        patch.object(conn_b, "_probe_host", AsyncMock(return_value=True)),
         patch("asyncio.create_subprocess_exec", side_effect=procs) as mock_exec,
     ):
-        result = await conn_asif.start_kimi_run(
+        result = await conn_b.start_kimi_run(
             repo="youruser/bcp", prompt="investigate", kimi_binary="/usr/local/bin/kimi"
         )
     assert result["status"] == "running"
@@ -462,14 +462,14 @@ async def test_start_kimi_run_tmux_all_live_falls_back_to_detached(conn_asif):
 
 
 @pytest.mark.asyncio
-async def test_start_kimi_run_probe_fail_uses_meem_nohup(conn_asif):
+async def test_start_kimi_run_probe_fail_uses_base_nohup(conn_b):
     """kimi_host set but unreachable → node-a nohup, host=node-a, no probe-driven tmux."""
     procs = _make_proc_sequence([0, 0, 0, 0, 0])
     with (
-        patch.object(conn_asif, "_probe_host", AsyncMock(return_value=False)),
+        patch.object(conn_b, "_probe_host", AsyncMock(return_value=False)),
         patch("asyncio.create_subprocess_exec", side_effect=procs) as mock_exec,
     ):
-        result = await conn_asif.start_kimi_run(
+        result = await conn_b.start_kimi_run(
             repo="youruser/bcp", prompt="x", kimi_binary="/usr/local/bin/kimi"
         )
     assert result["host"] == "node-a"
@@ -550,8 +550,8 @@ def test_engine_for_matches_org_case_insensitively(conn_claude):
     assert conn_claude._engine_for("bcp") == "kimi"
 
 
-def test_engine_for_unset_orgs_always_kimi(conn_asif):
-    assert conn_asif._engine_for("Acme/bcp") == "kimi"
+def test_engine_for_unset_orgs_always_kimi(conn_b):
+    assert conn_b._engine_for("Acme/bcp") == "kimi"
 
 
 @pytest.mark.asyncio
@@ -715,15 +715,15 @@ async def test_start_kimi_run_non_org_repo_still_prefers_kimi_host(conn_claude):
 
 
 @pytest.mark.asyncio
-async def test_start_kimi_run_org_repo_without_claude_orgs_stays_kimi(conn_asif):
+async def test_start_kimi_run_org_repo_without_claude_orgs_stays_kimi(conn_b):
     """Dormant default: no claude_orgs configured → org repos keep today's kimi path."""
     procs = _make_proc_sequence([0, 0, 0, 0, 0, 0])
     procs[4].communicate = AsyncMock(return_value=(b"@0:bash:0\n", b""))
     with (
-        patch.object(conn_asif, "_probe_host", AsyncMock(return_value=True)),
+        patch.object(conn_b, "_probe_host", AsyncMock(return_value=True)),
         patch("asyncio.create_subprocess_exec", side_effect=procs),
     ):
-        result = await conn_asif.start_kimi_run(
+        result = await conn_b.start_kimi_run(
             repo="bcp",
             prompt="x",
             kimi_binary="/usr/local/bin/kimi",
@@ -734,7 +734,7 @@ async def test_start_kimi_run_org_repo_without_claude_orgs_stays_kimi(conn_asif)
 
 
 @pytest.mark.asyncio
-async def test_start_kimi_run_claude_binary_missing_fails_fast(conn_asif):
+async def test_start_kimi_run_claude_binary_missing_fails_fast(conn_b):
     """claude routing selected but no claude binary configured → explicit failure."""
     conn = RemoteScriptConnector(
         host="node-a",

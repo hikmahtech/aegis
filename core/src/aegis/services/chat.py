@@ -177,7 +177,7 @@ async def classify_intent(message: str, llm, settings, pool=None) -> dict:
 # has tools to call, swap the resolved model for `_TOOL_FALLBACK_MODEL` so the
 # request actually carries tool definitions to a model that supports them.
 # gpt-oss:20b (OpenAI open-weight) is OpenAI's tool-use-tuned release — MXFP4
-# quant fits in ~12 GB on node-b's RTX 5060 Ti (16 GB) with comfortable headroom
+# quant fits in ~12 GB on node-b's GPU (16 GB) with comfortable headroom
 # and the Harmony format produces stronger structured tool calls than the
 # previous fallback (qwen3:14b). LiteLLM exposes it as `gpt-oss:20b` →
 # `ollama_chat/gpt-oss:20b` with `supports_function_calling: true`
@@ -1085,8 +1085,8 @@ CHAT_TOOLS = [
         },
     },
     # --- Vercel read-only (Pandora) ---
-    # Project arg accepts either the bare Vercel project name (e.g. "drwhome")
-    # or the resources-table slug ("vercel-drwhome"); the executor strips the
+    # Project arg accepts either the bare Vercel project name (e.g. "example-site")
+    # or the resources-table slug ("vercel-example-site"); the executor strips the
     # slug prefix before calling the connector.
     {
         "type": "function",
@@ -1103,8 +1103,8 @@ CHAT_TOOLS = [
                     "project": {
                         "type": "string",
                         "description": (
-                            "Vercel project name (e.g. 'drwhome') or resources "
-                            "slug (e.g. 'vercel-drwhome')."
+                            "Vercel project name (e.g. 'example-site') or resources "
+                            "slug (e.g. 'vercel-example-site')."
                         ),
                     },
                 },

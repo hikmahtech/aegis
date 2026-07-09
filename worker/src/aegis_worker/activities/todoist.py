@@ -178,7 +178,7 @@ class TodoistActivities:
                 # same diff that reference these projects must be DELETE'd first
                 # or the FK constraint todoist_tasks.project_id_fkey blows up
                 # the entire transaction — caught 2026-05-25 when a user
-                # deleted the drwho-marketing project (134 tasks); sync jammed
+                # deleted a managed project (134 tasks); sync jammed
                 # for 6 hours until manual unblock.
 
                 # Labels. Skip is_deleted=true entries AND empty-name

@@ -164,7 +164,7 @@ async def test_fetch_emails_derives_lane_from_forwarded_label(gmail, monkeypatch
     """An email carrying a `forwarded/<lane>` label resolves to that lane.
 
     Locks the lane-derivation contract for the user's Gmail filter setup
-    (e.g. `forwarded/acme`, `forwarded/ansaar`) so the downstream
+    (e.g. `forwarded/acme`, `forwarded/freelance`) so the downstream
     classifier + Todoist description can surface forwarding provenance.
     """
     fake_service = _FakeGmailService(
@@ -234,7 +234,7 @@ async def test_fetch_emails_first_forwarded_label_wins(gmail, monkeypatch):
             },
         ],
         labels=[
-            {"id": "Label_a", "name": "forwarded/ansaar"},
+            {"id": "Label_a", "name": "forwarded/freelance"},
             {"id": "Label_b", "name": "forwarded/acme"},
         ],
     )
@@ -252,7 +252,7 @@ async def test_fetch_emails_first_forwarded_label_wins(gmail, monkeypatch):
             max_results=10,
         ),
     )
-    assert result.messages[0]["lane"] == "ansaar"
+    assert result.messages[0]["lane"] == "freelance"
 
 
 @pytest.mark.asyncio

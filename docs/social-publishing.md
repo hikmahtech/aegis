@@ -155,7 +155,7 @@ Idempotent SQL, modeled on `todoist_outbox` (baseline:559) and the `infra` table
 CREATE TABLE IF NOT EXISTS social_accounts (
     id           bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     platform     text NOT NULL,              -- 'x' | 'linkedin' | 'facebook' | 'youtube'
-    label        text NOT NULL,              -- 'hikmah' | 'personal' — supports multiple accounts per platform
+    label        text NOT NULL,              -- 'work' | 'personal' — supports multiple accounts per platform
     access_token_enc  text,                  -- Fernet via aegis.crypto (settings.secret_key)
     refresh_token_enc text,
     expires_at   timestamptz,
@@ -214,7 +214,7 @@ add the YouTube upload scope during reauth.
 `core/src/aegis/api/routes/social_auth.py`, modeled on
 `core/src/aegis/api/routes/gmail_reauth.py`:
 
-- `GET /api/admin/social/{platform}/connect?label=hikmah` → build the platform's
+- `GET /api/admin/social/{platform}/connect?label=work` → build the platform's
   authorize URL (PKCE for X), stash state, redirect.
 - `GET /api/admin/social/{platform}/callback` → exchange code, encrypt tokens with
   `aegis.crypto.encrypt_secret`, upsert into `social_accounts`. **Unlike Gmail's

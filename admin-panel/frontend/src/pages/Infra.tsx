@@ -659,7 +659,7 @@ export default function Infra() {
               <div className="form-row">
                 <div className="form-group">
                   <label>Name</label>
-                  <input value={form.name} onChange={e => setForm({ ...form, name: e.target.value })} placeholder="e.g. baa (swarm leader)" />
+                  <input value={form.name} onChange={e => setForm({ ...form, name: e.target.value })} placeholder="e.g. mgr-1 (swarm leader)" />
                 </div>
                 <div className="form-group">
                   <label>Kind</label>

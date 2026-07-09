@@ -8,7 +8,7 @@ version = "2.0.0"
 description = "AEGIS v2 Core — agents, knowledge, connectors, API"
 requires-python = ">=3.12"
 license = {text = "MIT"}
-authors = [{name = "the owner Ansari"}]
+authors = [{name = "Arshad Ansari"}]
 dependencies = [
     "fastapi>=0.115.0",
     "uvicorn[standard]>=0.32.0",
@@ -32,6 +32,11 @@ dependencies = [
     "opentelemetry-instrumentation-requests",
     "opentelemetry-instrumentation-fastapi",
 ]
+
+[project.urls]
+Homepage = "https://github.com/hikmahtech/aegis"
+Repository = "https://github.com/hikmahtech/aegis"
+Issues = "https://github.com/hikmahtech/aegis/issues"
 
 [project.optional-dependencies]
 dev = [

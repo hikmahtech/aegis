@@ -220,7 +220,7 @@ kubectl config view --minify --flatten --context=<gke-ctx> > /tmp/aegis-kubeconf
 
 A **Cloud account** entry represents one AWS account or one GCP project as a
 first-class registry row — independent of any cluster. Use one row per
-account: `aws-hikmah`, `aws-stockopedia`, `gcp-main`, … Each row carries its
+account: `aws-prod`, `aws-staging`, `gcp-main`, … Each row carries its
 own encrypted credentials plus a little non-secret config:
 
 | Provider | Secret (write-only, encrypted) | Non-secret config |
@@ -290,7 +290,7 @@ Pandora gets two read-only tools:
 - `list_cloud_accounts` — slugs, provider, status, default profile / project,
   and the identity recorded at the last provision.
 - `cloud_identity` — runs the identity check live for one slug (optional
-  `profile` override), e.g. "which principal is `aws-hikmah`'s `staging`
+  `profile` override), e.g. "which principal is `aws-prod`'s `staging`
   profile?". Errors (missing CLI, bad credentials, unknown slug) come back as
   plain tool errors, never crashes.
 

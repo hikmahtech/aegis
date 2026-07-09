@@ -14,7 +14,7 @@
 --
 -- Shape for kind=k8s rows (both optional):
 --   {
---     "cloud_slug": "aws-hikmah",         -- slug of a kind=cloud entry to pull
+--     "cloud_slug": "aws-prod",           -- slug of a kind=cloud entry to pull
 --                                         --   exec-plugin credentials from
 --     "profile": "prod"                   -- AWS_PROFILE override for this cluster
 --   }

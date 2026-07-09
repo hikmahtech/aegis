@@ -122,10 +122,10 @@ infrastructure you don't have.
 Image build + deploy are kept in a **separate, private infra repo** (Ansible),
 so nothing about the maintainer's registry or cluster lives in the open-source
 repo. That side builds the three images from a checkout of this repo
-(`core/`, `worker/`, `comms/` Dockerfiles — the core image needs the admin panel
-built first, `cd admin-panel/frontend && npm ci && npm run build`) and rolls them
-onto a Docker Swarm (`docker stack deploy`, then `docker service update --force`
-to pick up a freshly-pushed `:latest`).
+(`core/`, `worker/`, `comms/` Dockerfiles — the core image builds the admin
+panel itself in a Node stage, no separate pre-build step needed) and rolls
+them onto a Docker Swarm (`docker stack deploy`, then `docker service update
+--force` to pick up a freshly-pushed `:latest`).
 
 To deploy your own fork, wire those same two halves however you like — the
 specifics (build args like `EXTRA_CLOUD_CLIS`, migrations, config plane) are in

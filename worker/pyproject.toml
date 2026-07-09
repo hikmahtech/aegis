@@ -8,7 +8,7 @@ version = "2.0.0"
 description = "AEGIS v2 Worker — Temporal flows and activities"
 requires-python = ">=3.12"
 license = {text = "MIT"}
-authors = [{name = "the owner Ansari"}]
+authors = [{name = "Arshad Ansari"}]
 dependencies = [
     "aegis-core",
     "temporalio>=1.7.0",
@@ -28,6 +28,11 @@ dependencies = [
     "opentelemetry-instrumentation-httpx",
     "opentelemetry-instrumentation-requests",
 ]
+
+[project.urls]
+Homepage = "https://github.com/hikmahtech/aegis"
+Repository = "https://github.com/hikmahtech/aegis"
+Issues = "https://github.com/hikmahtech/aegis/issues"
 
 [project.optional-dependencies]
 dev = [
