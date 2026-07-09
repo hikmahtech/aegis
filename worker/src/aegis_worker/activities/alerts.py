@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import re
 import time
 from collections import Counter
@@ -67,8 +68,11 @@ INFRA_ALERTNAMES: frozenset[str] = frozenset(
     }
 )
 
-# Cluster label value that always identifies homelab swarm alerts.
-_INFRA_CLUSTER = "homelab-swarm"
+# Cluster label value that identifies infra/swarm alerts, read once at import
+# from AEGIS_INFRA_CLUSTER (mirrors Settings.infra_cluster; default blank →
+# cluster-label matching is off). Read via os.getenv rather than Settings() so
+# importing this module never requires a full (DB-bearing) settings object.
+_INFRA_CLUSTER = os.getenv("AEGIS_INFRA_CLUSTER", "")
 
 # Slug / github_repo of the resource that infra alerts route to.
 _HOMELAB_GITOPS_SLUG = "repo-infra-gitops"
@@ -87,19 +91,21 @@ _REMEDIATE_POLL_INTERVAL_S = 5
 _HINT_REPO_RE = re.compile(r"^[\w.-]+/[\w.-]+$")
 
 
-def is_infra_alert(alert: dict) -> bool:
-    """Return True when the alert is a homelab infrastructure / swarm alert.
+def is_infra_alert(alert: dict, infra_cluster: str | None = None) -> bool:
+    """Return True when the alert is an infrastructure / swarm alert.
 
     Matches on alertname (checked against INFRA_ALERTNAMES) OR on the
-    `cluster` label being the homelab-swarm cluster. Infra alerts have no
-    application code repo and should be routed directly to infra-gitops
+    `cluster` label equalling the configured infra cluster
+    (AEGIS_INFRA_CLUSTER; blank ⇒ cluster matching is off). Infra alerts have
+    no application code repo and should be routed directly to infra-gitops
     instead of going through the LLM repo-match.
     """
+    match_cluster = _INFRA_CLUSTER if infra_cluster is None else infra_cluster
     labels = alert.get("labels") or {}
     if not isinstance(labels, dict):
         labels = {}
     cluster = (labels.get("cluster") or "").strip()
-    if cluster == _INFRA_CLUSTER:
+    if match_cluster and cluster == match_cluster:
         return True
     alertname = (labels.get("alertname") or "").strip().lower()
     return alertname in INFRA_ALERTNAMES

@@ -62,9 +62,9 @@ async def bootstrap(settings: Settings | None = None) -> WorkerDeps:
     await apply_config_overrides(settings, pool)
 
     # LLM client + tier map from the configurable backend (DB → env fallback).
-    # Cap gemma4:e2b at 2 concurrent calls — it shares node-a's GPU with
-    # everything else aegis hosts on that node, and bursts serialise through
-    # ollama compounding tail latency.
+    # Cap the fast tier at 2 concurrent calls — it typically shares a GPU with
+    # everything else aegis hosts, and bursts serialise through ollama
+    # compounding tail latency.
     from aegis.llm import set_model_tiers
     from aegis.services.llm_backend import get_llm_backend
 
@@ -74,7 +74,7 @@ async def bootstrap(settings: Settings | None = None) -> WorkerDeps:
         base_url=backend["base_url"],
         api_key=backend["api_key"],
         timeout=settings.litellm_timeout,
-        concurrency_limits={"gemma4:e2b": 2},
+        concurrency_limits={settings.model_fast: 2},
     )
 
     # Connectors (created if configured, None if not)

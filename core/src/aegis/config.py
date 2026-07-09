@@ -144,6 +144,12 @@ class Settings(BaseSettings):
     # investigate / propose fixes to AEGIS itself. The checkout is part of
     # the fixed workspace hierarchy maintained by WorkspaceRepoSyncFlow.
     aegis_self_repo_path: str = "aegis"
+    # Prometheus/Alertmanager `cluster` label value that marks an alert as an
+    # infra/swarm alert (routed straight to infra-gitops, skipping the LLM
+    # repo-match). Blank ⇒ the cluster-label fast path is off; alertname
+    # matching (INFRA_ALERTNAMES) still classifies infra alerts. Set this to
+    # your own cluster label to also route by cluster.
+    infra_cluster: str = ""
     # Per-alert runbook directory — baked into the worker image at /app/runbooks.
     runbooks_dir: str = "/app/runbooks"
     # Swarm stack name AEGIS itself is deployed as. The System Monitoring page

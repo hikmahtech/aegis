@@ -53,12 +53,22 @@ def test_is_infra_alert_dockerservicedown():
 
 
 def test_is_infra_alert_cluster_label_alone():
-    """cluster=homelab-swarm is sufficient even with unknown alertname."""
+    """A configured cluster label is sufficient even with an unknown alertname."""
     alert = {
         "source": "alertmanager",
-        "labels": {"alertname": "SomeUnknownAlert", "cluster": "homelab-swarm"},
+        "labels": {"alertname": "SomeUnknownAlert", "cluster": "my-swarm"},
     }
-    assert is_infra_alert(alert) is True
+    assert is_infra_alert(alert, infra_cluster="my-swarm") is True
+
+
+def test_is_infra_alert_cluster_label_off_by_default():
+    """With no configured cluster (default blank), a cluster label alone does
+    NOT classify an alert as infra — only alertname matching does."""
+    alert = {
+        "source": "alertmanager",
+        "labels": {"alertname": "SomeUnknownAlert", "cluster": "my-swarm"},
+    }
+    assert is_infra_alert(alert, infra_cluster="") is False
 
 
 def test_is_infra_alert_lokidown():
