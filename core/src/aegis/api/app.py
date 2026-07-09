@@ -231,8 +231,8 @@ def create_app(run_lifespan: bool = True) -> FastAPI:
     )
 
     app = FastAPI(
-        title="AEGIS v2",
-        version="2.0.0",
+        title="AEGIS",
+        version="0.1.0",
         lifespan=lifespan if run_lifespan else None,
     )
 

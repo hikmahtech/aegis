@@ -56,7 +56,7 @@ async def get_status(request: Request) -> dict[str, Any]:
 async def get_system_info() -> dict[str, Any]:
     """Basic system info — version, build SHA, uptime."""
     return {
-        "version": "2.0.0",
+        "version": "0.1.0",
         "git_sha": os.environ.get("GIT_SHA", "dev"),
         "uptime_seconds": int(time.time() - _STARTED_AT),
     }

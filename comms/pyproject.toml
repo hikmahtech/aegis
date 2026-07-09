@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "aegis-comms"
-version = "2.0.0"
+version = "0.1.0"
 description = "AEGIS comms — channel-adapter bot + delivery server"
 requires-python = ">=3.12"
 license = {text = "MIT"}

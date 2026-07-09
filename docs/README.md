@@ -1,4 +1,4 @@
-# AEGIS v3 Documentation
+# AEGIS Documentation
 
 **Autonomous Executive Guild Intelligence System** — a flow-first personal AI orchestration platform.
 
