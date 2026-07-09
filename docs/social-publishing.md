@@ -94,9 +94,18 @@ them on the row:
 ## What it does (target behavior)
 
 1. You create a Todoist task: content = the post text, description = link/long text,
-   labels = `@publish` + platform labels (`@x`, `@linkedin`, `@facebook`, `@youtube`),
-   due datetime = when it should go out.
-2. `SocialPublishFlow` (scheduled every 5 min) finds due `@publish` tasks in the
+   labels = the publish label + platform labels, due datetime = when it should go out.
+   **Label names are BARE and must equal `social_publish_label` (default `publish`)
+   and the values in `social_platform_labels` (default `x`, `linkedin`, `facebook`,
+   `youtube`) verbatim — NOT `@`-prefixed.** `find_due_posts` matches label strings
+   literally (`'publish' = ANY(t.labels)`), so a Todoist label named `@publish` /
+   `@linkedin` (as GTD setups often store them) will NOT match — the post is silently
+   skipped (no card, no outbox row). Either name the labels bare, or add the `@` form
+   to the settings. For LinkedIn, the platform value is whatever Postiz reports as the
+   channel `identifier`: `linkedin-page` = a company page, `linkedin` = a personal
+   profile (so e.g. `social_platform_labels` maps a bare `linkedin` label → the
+   `linkedin-page` account when that's the channel you connected).
+2. `SocialPublishFlow` (scheduled every 5 min) finds due publish-labeled tasks in the
    already-mirrored `todoist_tasks` table.
 3. For each, it spawns an `InteractionFlow` card: post preview + [Approve] [Skip].
 4. On approve, the post is queued in `social_outbox` and published to each labeled
@@ -129,7 +138,7 @@ with `expires_at` + refresh-at-use — not in env vars.
 ## Architecture (all existing seams)
 
 ```
-Todoist task (@publish + @x, due 9:00)
+Todoist task (labels: publish + x, due 9:00)
         │  (already mirrored by TodoistSyncFlow every 5 min → todoist_tasks)
         ▼
 SocialPublishFlow (cron */5)                          worker/flows/social_publish.py
@@ -316,7 +325,7 @@ platform endpoints; assert refresh-token rotation is persisted before use),
 2. X developer app (manual, your side) + connect/callback routes; verify a
    `social_accounts` row appears with `expires_at`.
 3. `SocialConnector._post_x` + refresh; prove one post from a script/test.
-4. Flow + registration; prove: Todoist task `@publish @x` due now → Slack card →
+4. Flow + registration; prove: Todoist task labeled `publish` + `x` due now → Slack card →
    approve → tweet → task completed.
 5. Then, in order of API sanity: Facebook Page → YouTube (reuse google client) →
    LinkedIn (start its app-approval paperwork on day 1 — it's the slowest).
