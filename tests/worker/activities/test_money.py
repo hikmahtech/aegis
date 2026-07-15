@@ -1,6 +1,6 @@
 """Tests for MoneyActivities (Maou — Money Hygiene).
 
-NOTE: Phase 1 of v3 reshaped `maou.recurring_charge` and `maou.receipt_email`
+NOTE: Phase 1 of v3 reshaped `finance.recurring_charge` and `finance.receipt_email`
 (identity_hash unique index, dropped sender_label/body_plain/parsed_at/etc).
 The DB-bound tests that asserted the v2 schema were deleted; they will be
 reintroduced in Phase 3/4 alongside the rewritten MoneyActivities. The tests
@@ -92,7 +92,7 @@ async def test_upsert_charges_skips_bank_alert_sender(monkeypatch):
     assert processed == 2
     # ...but only the legit vendor receipt hit the recurring_charge INSERT.
     insert_calls = [
-        c for c in conn.fetchrow.await_args_list if "INSERT INTO maou.recurring_charge" in c.args[0]
+        c for c in conn.fetchrow.await_args_list if "INSERT INTO finance.recurring_charge" in c.args[0]
     ]
     assert len(insert_calls) == 1
     # INSERT args: (sql, account, sender_label, vendor_name, ...).

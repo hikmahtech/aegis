@@ -38,17 +38,17 @@ async def _clean(conn, sender_label_like: str) -> None:
     require this order: renewal_alert + receipt_email both reference
     recurring_charge.id."""
     await conn.execute(
-        "DELETE FROM maou.renewal_alert WHERE charge_id IN "
-        "(SELECT id FROM maou.recurring_charge WHERE sender_label LIKE $1)",
+        "DELETE FROM finance.renewal_alert WHERE charge_id IN "
+        "(SELECT id FROM finance.recurring_charge WHERE sender_label LIKE $1)",
         sender_label_like,
     )
     await conn.execute(
-        "UPDATE maou.receipt_email SET charge_id = NULL WHERE charge_id IN "
-        "(SELECT id FROM maou.recurring_charge WHERE sender_label LIKE $1)",
+        "UPDATE finance.receipt_email SET charge_id = NULL WHERE charge_id IN "
+        "(SELECT id FROM finance.recurring_charge WHERE sender_label LIKE $1)",
         sender_label_like,
     )
     await conn.execute(
-        "DELETE FROM maou.recurring_charge WHERE sender_label LIKE $1",
+        "DELETE FROM finance.recurring_charge WHERE sender_label LIKE $1",
         sender_label_like,
     )
 
@@ -68,7 +68,7 @@ async def _insert_active_charge(
     asyncpg's parameter substitution)."""
     row = await conn.fetchrow(
         """
-        INSERT INTO maou.recurring_charge
+        INSERT INTO finance.recurring_charge
           (account, sender_label, vendor_name, category, amount_cents,
            currency, monthly_home_equivalent, cadence, status)
         VALUES ($1, $2, $3, 'saas', $4, $5, $6, $7, 'active')
@@ -102,7 +102,7 @@ async def test_evaluate_renewal_alerts_includes_recent_past_due(db_pool):
             amount_cents=999,
         )
         await conn.execute(
-            "UPDATE maou.recurring_charge SET next_due_at = NOW() - INTERVAL '3 days' "
+            "UPDATE finance.recurring_charge SET next_due_at = NOW() - INTERVAL '3 days' "
             "WHERE id = $1::uuid",
             charge_id,
         )
@@ -127,7 +127,7 @@ async def test_evaluate_renewal_alerts_excludes_long_past_due(db_pool):
             amount_cents=1999,
         )
         await conn.execute(
-            "UPDATE maou.recurring_charge SET next_due_at = NOW() - INTERVAL '20 days' "
+            "UPDATE finance.recurring_charge SET next_due_at = NOW() - INTERVAL '20 days' "
             "WHERE id = $1::uuid",
             charge_id,
         )
@@ -158,7 +158,7 @@ async def test_notify_renewal_alert_skips_within_7d(db_pool):
             amount_cents=1299,
         )
         alert_row = await conn.fetchrow(
-            "INSERT INTO maou.renewal_alert (charge_id, threshold_days) "
+            "INSERT INTO finance.renewal_alert (charge_id, threshold_days) "
             "VALUES ($1::uuid, 7) RETURNING id",
             charge_id,
         )
@@ -204,7 +204,7 @@ async def test_notify_renewal_alert_sends_when_no_prior(db_pool):
             amount_cents=499,
         )
         alert_row = await conn.fetchrow(
-            "INSERT INTO maou.renewal_alert (charge_id, threshold_days) "
+            "INSERT INTO finance.renewal_alert (charge_id, threshold_days) "
             "VALUES ($1::uuid, 30) RETURNING id",
             charge_id,
         )
@@ -230,7 +230,7 @@ async def test_notify_renewal_alert_sends_when_no_prior(db_pool):
     assert delivery.send_message.await_count == 1
     async with db_pool.acquire() as conn:
         stamped = await conn.fetchval(
-            "SELECT last_notified_at FROM maou.renewal_alert WHERE id=$1::uuid",
+            "SELECT last_notified_at FROM finance.renewal_alert WHERE id=$1::uuid",
             alert_id,
         )
     assert stamped is not None
@@ -255,7 +255,7 @@ async def test_detect_cancellations_skips_non_standard_cadence(db_pool):
         )
         # Force last_seen_at far in the past.
         await conn.execute(
-            "UPDATE maou.recurring_charge SET last_seen_at = NOW() - INTERVAL '24 months' "
+            "UPDATE finance.recurring_charge SET last_seen_at = NOW() - INTERVAL '24 months' "
             "WHERE id = $1::uuid",
             unknown_id,
         )
@@ -266,7 +266,7 @@ async def test_detect_cancellations_skips_non_standard_cadence(db_pool):
     assert unknown_id not in ids
     async with db_pool.acquire() as conn:
         status = await conn.fetchval(
-            "SELECT status FROM maou.recurring_charge WHERE id=$1::uuid",
+            "SELECT status FROM finance.recurring_charge WHERE id=$1::uuid",
             unknown_id,
         )
     assert status == "active"
@@ -286,7 +286,7 @@ async def test_detect_cancellations_flags_stale_monthly(db_pool):
             cadence="monthly",
         )
         await conn.execute(
-            "UPDATE maou.recurring_charge SET last_seen_at = NOW() - INTERVAL '4 months' "
+            "UPDATE finance.recurring_charge SET last_seen_at = NOW() - INTERVAL '4 months' "
             "WHERE id = $1::uuid",
             monthly_id,
         )
@@ -379,7 +379,7 @@ async def test_upsert_charges_preserves_real_cadence_on_unknown(db_pool):
         await _clean(conn, "bundle-e-cad-merge")
         for rid in (receipt_id_1, receipt_id_2):
             await conn.execute(
-                "INSERT INTO maou.receipt_email "
+                "INSERT INTO finance.receipt_email "
                 "(id, message_id, account, sender, subject, received_at, parsed) "
                 "VALUES ($1::uuid, $2, 'acct-merge', 'a@b.com', 's', NOW(), '{}'::jsonb) "
                 "ON CONFLICT (message_id) DO NOTHING",
@@ -422,7 +422,7 @@ async def test_upsert_charges_preserves_real_cadence_on_unknown(db_pool):
     )
     async with db_pool.acquire() as conn:
         cadence = await conn.fetchval(
-            "SELECT cadence FROM maou.recurring_charge WHERE sender_label='bundle-e-cad-merge'"
+            "SELECT cadence FROM finance.recurring_charge WHERE sender_label='bundle-e-cad-merge'"
         )
     assert cadence == "yearly"
 
@@ -441,7 +441,7 @@ async def test_upsert_charges_upgrades_unknown_to_real(db_pool):
         await _clean(conn, "bundle-e-cad-upgrade")
         for rid in (receipt_id_1, receipt_id_2):
             await conn.execute(
-                "INSERT INTO maou.receipt_email "
+                "INSERT INTO finance.receipt_email "
                 "(id, message_id, account, sender, subject, received_at, parsed) "
                 "VALUES ($1::uuid, $2, 'acct-upg', 'a@b.com', 's', NOW(), '{}'::jsonb) "
                 "ON CONFLICT (message_id) DO NOTHING",
@@ -484,6 +484,6 @@ async def test_upsert_charges_upgrades_unknown_to_real(db_pool):
     )
     async with db_pool.acquire() as conn:
         cadence = await conn.fetchval(
-            "SELECT cadence FROM maou.recurring_charge WHERE sender_label='bundle-e-cad-upgrade'"
+            "SELECT cadence FROM finance.recurring_charge WHERE sender_label='bundle-e-cad-upgrade'"
         )
     assert cadence == "monthly"

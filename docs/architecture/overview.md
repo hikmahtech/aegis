@@ -119,7 +119,7 @@ user comment on @<agent>-labelled Inbox task
 4. **Activity timeout** for `synthesize_reply` is `TIMEOUT_CHAT_REPLY=600s` + `RETRY_ONCE`; CoreClient httpx ceiling for `ChatActivities` is `550s`. Smart-tier agents with heavy tools (kimi SSH, deep KS search) legitimately run 3-6 min.
 5. **Recent-thread transcript** in the synthetic input — `_build_agent_synthetic_input` includes the last 15 notes on the task (user + prior agent replies, oldest first) so the agent sees its own past turns and doesn't repeat itself.
 
-Per-agent pre-fetch hooks are gated on the target's **behavior tag**, not its id: a `research` agent gets KS context (`KnowledgeConnector.search`); a `finance` agent gets recent receipts from the `maou.receipt_email` schema (see #43 for the pending schema rename); agents without those tags have no hook (their context IS the task; their tool sets fetch the rest).
+Per-agent pre-fetch hooks are gated on the target's **behavior tag**, not its id: a `research` agent gets KS context (`KnowledgeConnector.search`); a `finance` agent gets recent receipts from the `finance.receipt_email` schema; agents without those tags have no hook (their context IS the task; their tool sets fetch the rest).
 
 Self-loop guarded by the `AGENT_REPLY_PREFIX = "[Agent reply @ "` constant — webhooks.py recognises it just like `CLARIFY_NOTE_PREFIX`.
 
@@ -240,7 +240,7 @@ PostgreSQL 16 + pgvector. Migrations 001 → 008 in `migrations/` (001 is the sq
 
 **Knowledge (native RAG)** — `knowledge_content`, `knowledge_chunks` (pgvector embeddings), `knowledge_source_quality`, `knowledge_injection_log`.
 
-**Maou (finance)** — `maou.recurring_charge`, `maou.receipt_email`, `maou.renewal_alert`, `maou.subscription_digest`.
+**Maou (finance)** — `finance.recurring_charge`, `finance.receipt_email`, `finance.renewal_alert`, `finance.subscription_digest`.
 
 **Pandora's Actor (infra)** — `pandoras_actor.homelab_drift`, `pandoras_actor.cert_expiry`.
 

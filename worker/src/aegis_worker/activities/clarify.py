@@ -1008,7 +1008,7 @@ class ClarifyActivities:
     async def _maybe_attach_transaction_context(self, synthetic_input: str, task: dict) -> str:
         """Maou pre-fetch hook. Best-effort: failures fall through to the
         bare synthetic input. Fires on '#receipt' source_tag tasks; pulls
-        the 5 most recent receipts from maou.receipt_email so the agent
+        the 5 most recent receipts from finance.receipt_email so the agent
         can correlate the new task with what's already in the receipt
         history (vendor, amount, date).
         """
@@ -1024,7 +1024,7 @@ class ClarifyActivities:
                            sender,
                            COALESCE(parsed->>'amount', '?') AS amount,
                            COALESCE(parsed->>'currency', '?') AS currency
-                    FROM maou.receipt_email
+                    FROM finance.receipt_email
                     ORDER BY received_at DESC
                     LIMIT 5
                     """

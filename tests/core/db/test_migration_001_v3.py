@@ -31,7 +31,7 @@ EXPECTED_PUBLIC_TABLES = {
     "ingest_idempotency",
 }
 
-EXPECTED_MAOU_TABLES = {
+EXPECTED_FINANCE_TABLES = {
     "recurring_charge",
     "receipt_email",
     "renewal_alert",
@@ -57,13 +57,13 @@ async def test_all_public_tables_created(db_pool):
 
 
 @pytest.mark.asyncio
-async def test_maou_schema_and_tables(db_pool):
+async def test_finance_schema_and_tables(db_pool):
     await run_migrations(db_pool)
     async with db_pool.acquire() as conn:
-        rows = await conn.fetch("SELECT tablename FROM pg_tables WHERE schemaname='maou'")
+        rows = await conn.fetch("SELECT tablename FROM pg_tables WHERE schemaname='finance'")
     found = {r["tablename"] for r in rows}
-    missing = EXPECTED_MAOU_TABLES - found
-    assert not missing, f"missing maou tables: {missing}"
+    missing = EXPECTED_FINANCE_TABLES - found
+    assert not missing, f"missing finance tables: {missing}"
 
 
 @pytest.mark.asyncio

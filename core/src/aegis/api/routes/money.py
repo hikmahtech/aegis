@@ -36,14 +36,14 @@ async def money_state(request: Request, settings: Settings = Depends(get_setting
             "SELECT id, account, vendor_name, category, amount_cents, currency, "
             "       monthly_home_equivalent, cadence, next_due_at, status, "
             "       last_seen_at, first_seen_at "
-            "FROM maou.recurring_charge "
+            "FROM finance.recurring_charge "
             "ORDER BY status, next_due_at NULLS LAST"
         )
         upcoming = await conn.fetch(
             "SELECT a.charge_id, a.threshold_days, a.fired_at, "
             "       c.vendor_name, c.amount_cents, c.currency, c.next_due_at "
-            "FROM maou.renewal_alert a "
-            "JOIN maou.recurring_charge c ON c.id = a.charge_id "
+            "FROM finance.renewal_alert a "
+            "JOIN finance.recurring_charge c ON c.id = a.charge_id "
             "ORDER BY a.fired_at DESC LIMIT 50"
         )
     return {
@@ -60,7 +60,7 @@ async def money_digest(request: Request) -> dict:
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
             "SELECT period_start, period_end, summary, sent_at "
-            "FROM maou.subscription_digest "
+            "FROM finance.subscription_digest "
             "ORDER BY period_end DESC LIMIT 1"
         )
     if row is None:

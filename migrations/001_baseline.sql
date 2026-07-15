@@ -10,9 +10,9 @@
 -- 001..027 rows and never see it (runner tracks by filename).
 
 
--- Name: maou; Type: SCHEMA; Schema: -; Owner: -
+-- Name: finance; Type: SCHEMA; Schema: -; Owner: -
 
-CREATE SCHEMA maou;
+CREATE SCHEMA finance;
 
 -- Name: pandoras_actor; Type: SCHEMA; Schema: -; Owner: -
 
@@ -26,9 +26,9 @@ CREATE EXTENSION IF NOT EXISTS vector WITH SCHEMA public;
 
 COMMENT ON EXTENSION vector IS 'vector data type and ivfflat and hnsw access methods';
 
--- Name: receipt_email; Type: TABLE; Schema: maou; Owner: -
+-- Name: receipt_email; Type: TABLE; Schema: finance; Owner: -
 
-CREATE TABLE maou.receipt_email (
+CREATE TABLE finance.receipt_email (
     id uuid DEFAULT gen_random_uuid() NOT NULL,
     message_id text NOT NULL,
     account text NOT NULL,
@@ -40,9 +40,9 @@ CREATE TABLE maou.receipt_email (
     created_at timestamp with time zone DEFAULT now() NOT NULL
 );
 
--- Name: recurring_charge; Type: TABLE; Schema: maou; Owner: -
+-- Name: recurring_charge; Type: TABLE; Schema: finance; Owner: -
 
-CREATE TABLE maou.recurring_charge (
+CREATE TABLE finance.recurring_charge (
     id uuid DEFAULT gen_random_uuid() NOT NULL,
     account text NOT NULL,
     sender_label text NOT NULL,
@@ -60,9 +60,9 @@ CREATE TABLE maou.recurring_charge (
     updated_at timestamp with time zone DEFAULT now() NOT NULL
 );
 
--- Name: renewal_alert; Type: TABLE; Schema: maou; Owner: -
+-- Name: renewal_alert; Type: TABLE; Schema: finance; Owner: -
 
-CREATE TABLE maou.renewal_alert (
+CREATE TABLE finance.renewal_alert (
     id uuid DEFAULT gen_random_uuid() NOT NULL,
     charge_id uuid NOT NULL,
     threshold_days integer NOT NULL,
@@ -71,9 +71,9 @@ CREATE TABLE maou.renewal_alert (
     last_notified_at timestamp with time zone
 );
 
--- Name: subscription_digest; Type: TABLE; Schema: maou; Owner: -
+-- Name: subscription_digest; Type: TABLE; Schema: finance; Owner: -
 
-CREATE TABLE maou.subscription_digest (
+CREATE TABLE finance.subscription_digest (
     id uuid DEFAULT gen_random_uuid() NOT NULL,
     period_start date NOT NULL,
     period_end date NOT NULL,
@@ -711,39 +711,39 @@ ALTER TABLE ONLY public.todoist_outbox ALTER COLUMN id SET DEFAULT nextval('publ
 
 ALTER TABLE ONLY public.todoist_webhook_events ALTER COLUMN id SET DEFAULT nextval('public.todoist_webhook_events_id_seq'::regclass);
 
--- Name: receipt_email receipt_email_message_id_key; Type: CONSTRAINT; Schema: maou; Owner: -
+-- Name: receipt_email receipt_email_message_id_key; Type: CONSTRAINT; Schema: finance; Owner: -
 
-ALTER TABLE ONLY maou.receipt_email
+ALTER TABLE ONLY finance.receipt_email
     ADD CONSTRAINT receipt_email_message_id_key UNIQUE (message_id);
 
--- Name: receipt_email receipt_email_pkey; Type: CONSTRAINT; Schema: maou; Owner: -
+-- Name: receipt_email receipt_email_pkey; Type: CONSTRAINT; Schema: finance; Owner: -
 
-ALTER TABLE ONLY maou.receipt_email
+ALTER TABLE ONLY finance.receipt_email
     ADD CONSTRAINT receipt_email_pkey PRIMARY KEY (id);
 
--- Name: recurring_charge recurring_charge_account_sender_label_amount_cents_currency_key; Type: CONSTRAINT; Schema: maou; Owner: -
+-- Name: recurring_charge recurring_charge_account_sender_label_amount_cents_currency_key; Type: CONSTRAINT; Schema: finance; Owner: -
 
-ALTER TABLE ONLY maou.recurring_charge
+ALTER TABLE ONLY finance.recurring_charge
     ADD CONSTRAINT recurring_charge_account_sender_label_amount_cents_currency_key UNIQUE (account, sender_label, amount_cents, currency);
 
--- Name: recurring_charge recurring_charge_pkey; Type: CONSTRAINT; Schema: maou; Owner: -
+-- Name: recurring_charge recurring_charge_pkey; Type: CONSTRAINT; Schema: finance; Owner: -
 
-ALTER TABLE ONLY maou.recurring_charge
+ALTER TABLE ONLY finance.recurring_charge
     ADD CONSTRAINT recurring_charge_pkey PRIMARY KEY (id);
 
--- Name: renewal_alert renewal_alert_pkey; Type: CONSTRAINT; Schema: maou; Owner: -
+-- Name: renewal_alert renewal_alert_pkey; Type: CONSTRAINT; Schema: finance; Owner: -
 
-ALTER TABLE ONLY maou.renewal_alert
+ALTER TABLE ONLY finance.renewal_alert
     ADD CONSTRAINT renewal_alert_pkey PRIMARY KEY (id);
 
--- Name: subscription_digest subscription_digest_period_start_period_end_key; Type: CONSTRAINT; Schema: maou; Owner: -
+-- Name: subscription_digest subscription_digest_period_start_period_end_key; Type: CONSTRAINT; Schema: finance; Owner: -
 
-ALTER TABLE ONLY maou.subscription_digest
+ALTER TABLE ONLY finance.subscription_digest
     ADD CONSTRAINT subscription_digest_period_start_period_end_key UNIQUE (period_start, period_end);
 
--- Name: subscription_digest subscription_digest_pkey; Type: CONSTRAINT; Schema: maou; Owner: -
+-- Name: subscription_digest subscription_digest_pkey; Type: CONSTRAINT; Schema: finance; Owner: -
 
-ALTER TABLE ONLY maou.subscription_digest
+ALTER TABLE ONLY finance.subscription_digest
     ADD CONSTRAINT subscription_digest_pkey PRIMARY KEY (id);
 
 -- Name: backup_health backup_health_pkey; Type: CONSTRAINT; Schema: pandoras_actor; Owner: -
@@ -966,17 +966,17 @@ ALTER TABLE ONLY public.triage_state
 ALTER TABLE ONLY public.workflow_runs
     ADD CONSTRAINT workflow_runs_pkey PRIMARY KEY (run_id);
 
--- Name: receipt_email_charge_id_idx; Type: INDEX; Schema: maou; Owner: -
+-- Name: receipt_email_charge_id_idx; Type: INDEX; Schema: finance; Owner: -
 
-CREATE INDEX receipt_email_charge_id_idx ON maou.receipt_email USING btree (charge_id);
+CREATE INDEX receipt_email_charge_id_idx ON finance.receipt_email USING btree (charge_id);
 
--- Name: renewal_alert_daily_dedup; Type: INDEX; Schema: maou; Owner: -
+-- Name: renewal_alert_daily_dedup; Type: INDEX; Schema: finance; Owner: -
 
-CREATE UNIQUE INDEX renewal_alert_daily_dedup ON maou.renewal_alert USING btree (charge_id, threshold_days, (((fired_at AT TIME ZONE 'UTC'::text))::date));
+CREATE UNIQUE INDEX renewal_alert_daily_dedup ON finance.renewal_alert USING btree (charge_id, threshold_days, (((fired_at AT TIME ZONE 'UTC'::text))::date));
 
--- Name: renewal_alert_notify_lookup_idx; Type: INDEX; Schema: maou; Owner: -
+-- Name: renewal_alert_notify_lookup_idx; Type: INDEX; Schema: finance; Owner: -
 
-CREATE INDEX renewal_alert_notify_lookup_idx ON maou.renewal_alert USING btree (charge_id, threshold_days, last_notified_at);
+CREATE INDEX renewal_alert_notify_lookup_idx ON finance.renewal_alert USING btree (charge_id, threshold_days, last_notified_at);
 
 -- Name: backup_health_set_checked_idx; Type: INDEX; Schema: pandoras_actor; Owner: -
 
@@ -1186,15 +1186,15 @@ CREATE INDEX workflow_runs_todoist_task_ref_idx ON public.workflow_runs USING bt
 
 CREATE INDEX workflow_runs_workflow_type_started_at_idx ON public.workflow_runs USING btree (workflow_type, started_at DESC);
 
--- Name: receipt_email receipt_email_charge_id_fkey; Type: FK CONSTRAINT; Schema: maou; Owner: -
+-- Name: receipt_email receipt_email_charge_id_fkey; Type: FK CONSTRAINT; Schema: finance; Owner: -
 
-ALTER TABLE ONLY maou.receipt_email
-    ADD CONSTRAINT receipt_email_charge_id_fkey FOREIGN KEY (charge_id) REFERENCES maou.recurring_charge(id);
+ALTER TABLE ONLY finance.receipt_email
+    ADD CONSTRAINT receipt_email_charge_id_fkey FOREIGN KEY (charge_id) REFERENCES finance.recurring_charge(id);
 
--- Name: renewal_alert renewal_alert_charge_id_fkey; Type: FK CONSTRAINT; Schema: maou; Owner: -
+-- Name: renewal_alert renewal_alert_charge_id_fkey; Type: FK CONSTRAINT; Schema: finance; Owner: -
 
-ALTER TABLE ONLY maou.renewal_alert
-    ADD CONSTRAINT renewal_alert_charge_id_fkey FOREIGN KEY (charge_id) REFERENCES maou.recurring_charge(id);
+ALTER TABLE ONLY finance.renewal_alert
+    ADD CONSTRAINT renewal_alert_charge_id_fkey FOREIGN KEY (charge_id) REFERENCES finance.recurring_charge(id);
 
 -- Name: activities activities_agent_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 

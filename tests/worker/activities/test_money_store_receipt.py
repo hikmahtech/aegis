@@ -20,7 +20,7 @@ def _make_act(db_pool):
 async def test_store_receipt_email_inserts_and_returns_id(db_pool):
     act = _make_act(db_pool)
     async with db_pool.acquire() as conn:
-        await conn.execute("DELETE FROM maou.receipt_email WHERE message_id LIKE 'rt-%'")
+        await conn.execute("DELETE FROM finance.receipt_email WHERE message_id LIKE 'rt-%'")
 
     msg = {
         "id": "rt-1",
@@ -39,7 +39,7 @@ async def test_store_receipt_email_inserts_and_returns_id(db_pool):
 
     async with db_pool.acquire() as conn:
         row = await conn.fetchrow(
-            "SELECT account, sender FROM maou.receipt_email WHERE message_id='rt-1'"
+            "SELECT account, sender FROM finance.receipt_email WHERE message_id='rt-1'"
         )
     assert row is not None
     assert row["account"] == "sebas"
@@ -51,7 +51,7 @@ async def test_store_receipt_email_idempotent(db_pool):
     """Second insert on same message_id returns empty string (conflict)."""
     act = _make_act(db_pool)
     async with db_pool.acquire() as conn:
-        await conn.execute("DELETE FROM maou.receipt_email WHERE message_id LIKE 'rt-%'")
+        await conn.execute("DELETE FROM finance.receipt_email WHERE message_id LIKE 'rt-%'")
 
     msg = {
         "id": "rt-2",
