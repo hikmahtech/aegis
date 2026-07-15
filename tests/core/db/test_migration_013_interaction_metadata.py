@@ -53,6 +53,11 @@ async def test_interactions_metadata_default_is_empty_dict(db_pool: asyncpg.Pool
     """A newly-inserted interaction without metadata should land with {}."""
     await run_migrations(db_pool)
     async with db_pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO agents (id, name, role, system_prompt_path, active) "
+            "VALUES ('sebas', 'Sebas', 'assistant', 'personalities/sebas', TRUE) "
+            "ON CONFLICT (id) DO NOTHING"
+        )
         await conn.execute("DELETE FROM interactions WHERE flow_run_id='M013_TEST'")
         await conn.execute(
             "INSERT INTO interactions "

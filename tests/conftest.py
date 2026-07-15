@@ -1,9 +1,58 @@
 """Shared test fixtures for AEGIS v2."""
 
+import asyncio
+import os
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from aegis.config import Settings
+
+# Postgres server from `docker compose up -d postgres`. Tests get their own
+# database on it (below) — never the long-lived `aegis` dev database.
+_PG_SERVER = "postgresql://aegis:aegis_dev@localhost:25432"
+_TEST_DB = "aegis_test"
+_MIGRATIONS_DIR = Path(__file__).resolve().parent.parent / "migrations"
+
+
+@pytest.fixture(scope="session")
+def test_db_url() -> str | None:
+    """URL of a freshly-created, freshly-migrated session-scoped test database.
+
+    `TEST_DATABASE_URL` overrides everything (caller-managed: no drop/create,
+    no migrate). Otherwise `aegis_test` is dropped, recreated, and migrated
+    from this checkout's migrations/ once per session — sharing the dev
+    `aegis` database broke the suite whenever a parallel branch applied a
+    divergent migration to it (e.g. the maou→finance schema rename).
+
+    Returns None when no Postgres is reachable; db_pool fixtures then skip.
+    """
+    override = os.getenv("TEST_DATABASE_URL")
+    if override:
+        return override
+
+    async def _prepare() -> str:
+        import asyncpg
+        from aegis.db import create_pool, run_migrations
+
+        admin = await asyncpg.connect(f"{_PG_SERVER}/aegis")
+        try:
+            await admin.execute(f"DROP DATABASE IF EXISTS {_TEST_DB} WITH (FORCE)")
+            await admin.execute(f"CREATE DATABASE {_TEST_DB}")
+        finally:
+            await admin.close()
+        url = f"{_PG_SERVER}/{_TEST_DB}"
+        pool = await create_pool(url, min_size=1, max_size=2)
+        try:
+            await run_migrations(pool, _MIGRATIONS_DIR)
+        finally:
+            await pool.close()
+        return url
+
+    try:
+        return asyncio.run(_prepare())
+    except OSError:
+        return None
 
 # Defaults for Settings fields that are now REQUIRED (no production default)
 # but still need a value to instantiate the model in tests.

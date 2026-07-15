@@ -2,29 +2,25 @@
 
 from __future__ import annotations
 
-import os
-
 import pytest
 import pytest_asyncio
 from aegis.db import create_pool
 
-TEST_DATABASE_URL = os.getenv(
-    "TEST_DATABASE_URL",
-    "postgresql://aegis:aegis_dev@localhost:25432/aegis",
-)
-
 
 @pytest_asyncio.fixture(loop_scope="function")
-async def db_pool():
-    """Real asyncpg pool connected to the local dev Postgres instance.
+async def db_pool(test_db_url):
+    """Real asyncpg pool on the session's fresh, migrated test database
+    (see the root conftest's `test_db_url`).
 
     Skips the test when no Postgres is reachable (e.g. in CI without a
-    postgres service). Set TEST_DATABASE_URL to point at a test DB.
+    postgres service). Set TEST_DATABASE_URL to point at a managed test DB.
     """
+    if test_db_url is None:
+        pytest.skip("no Postgres reachable for the test database")
     try:
-        pool = await create_pool(TEST_DATABASE_URL, min_size=1, max_size=5)
+        pool = await create_pool(test_db_url, min_size=1, max_size=5)
     except OSError as exc:
-        pytest.skip(f"no Postgres at {TEST_DATABASE_URL}: {exc}")
+        pytest.skip(f"no Postgres at {test_db_url}: {exc}")
     try:
         yield pool
     finally:
