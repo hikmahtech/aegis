@@ -497,8 +497,11 @@ async def test_allow_list_excludes_non_coding_enabled_repos(db_pool):
         "INSERT INTO resources (kind, slug, title, url, tags, metadata) VALUES "
         "('repository','test-al-on','On repo','', ARRAY[]::text[], $1::jsonb),"
         "('repository','test-al-off','Off repo','', ARRAY[]::text[], $2::jsonb)",
-        json.dumps({"path": "onrepo", "github_repo": "o/onrepo", "coding_enabled": True}),
-        json.dumps({"path": "offrepo", "github_repo": "o/offrepo", "coding_enabled": False}),
+        # Pass dicts, not json.dumps strings — the pool's jsonb codec already
+        # applies json.dumps, so pre-stringifying double-encodes and stores a
+        # JSONB string primitive that never matches metadata->>'coding_enabled'.
+        {"path": "onrepo", "github_repo": "o/onrepo", "coding_enabled": True},
+        {"path": "offrepo", "github_repo": "o/offrepo", "coding_enabled": False},
     )
     mock_kg = AsyncMock()
     mock_kg.search.return_value = []
