@@ -38,7 +38,15 @@ class SocialActivities:
     async def find_due_posts(
         self, lookahead_minutes: int = 10, default_post_hour: int = 9
     ) -> list[dict]:
-        """Open @publish tasks due within the lookahead, without outbox rows yet.
+        """Open @publish tasks ready to card, without outbox rows yet.
+
+        Native-transport platforms post immediately on approval, so they card
+        just-in-time (post_at within the lookahead). A task whose labeled
+        platforms are ALL Postiz-mirrored cards as soon as it exists, however
+        far out post_at is — Postiz itself holds the post until schedule_at,
+        so an approved launch calendar can load days ahead (#60). Dedup is the
+        outbox row + deterministic approval-child id, so the unbounded window
+        can't re-card.
 
         Post time = raw->'due'->>'datetime' when present (naive values are the
         user's local time; 'Z' values are UTC), else due_date at
@@ -89,14 +97,27 @@ class SocialActivities:
                       SELECT 1 FROM social_outbox o WHERE o.todoist_task_id = t.id
                     )
             ) s
-            WHERE s.post_at <= now() + make_interval(mins => $4)
+            WHERE s.post_at IS NOT NULL
             ORDER BY s.post_at, s.id
             """,
             publish_label,
             user_tz,
             default_post_hour,
-            lookahead_minutes,
         )
+
+        # Platforms whose FIRST account (the one enqueue_outbox will pick) is
+        # Postiz-mirrored — those posts are scheduled in Postiz, not published
+        # on approval, so their card-eligibility ignores the lookahead.
+        postiz_platforms = {
+            r["platform"]
+            for r in await self.db_pool.fetch(
+                "SELECT DISTINCT ON (platform) platform, "
+                "(meta ? 'postiz_integration_id') AS postiz "
+                "FROM social_accounts ORDER BY platform, id"
+            )
+            if r["postiz"]
+        }
+        cutoff = datetime.now(UTC) + timedelta(minutes=lookahead_minutes)
 
         due: list[dict] = []
         for r in rows:
@@ -106,6 +127,11 @@ class SocialActivities:
                 activity.logger.warning(
                     "social_find_due_no_platform_label task_id=%s labels=%s", r["id"], labels
                 )
+                continue
+            all_postiz = all(p in postiz_platforms for p in platforms)
+            if not all_postiz and r["post_at"] > cutoff:
+                # At least one platform posts natively (immediately on
+                # approval) — keep the just-in-time window for the whole task.
                 continue
             due.append(
                 {

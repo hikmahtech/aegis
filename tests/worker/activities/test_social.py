@@ -247,6 +247,41 @@ async def test_find_due_posts_rest_api_datetime_fallback(social_env):
     assert [d["task_id"] for d in due] == ["soctest-restshape"]
 
 
+async def test_find_due_posts_postiz_platforms_card_immediately(social_env):
+    """A task whose labeled platforms are ALL Postiz-mirrored ignores the
+    lookahead — Postiz holds the schedule, so it cards on creation (#60)."""
+    future = (datetime.now(UTC) + timedelta(days=3)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    await _seed_postiz_account(social_env, platform="x")
+    await _seed_task(social_env, "soctest-postiz-far", ["publish", "x"], due_datetime=future)
+
+    act = SocialActivities(db_pool=social_env)
+    due = await ActivityEnvironment().run(act.find_due_posts, 10, 9)
+    assert [d["task_id"] for d in due] == ["soctest-postiz-far"]
+    # post_at survives untouched — Postiz schedules for exactly this moment
+    resolved = datetime.fromisoformat(due[0]["post_at"])
+    assert abs((resolved - (datetime.now(UTC) + timedelta(days=3))).total_seconds()) < 60
+
+
+async def test_find_due_posts_mixed_platforms_stay_just_in_time(social_env):
+    """One native platform in the label set keeps the whole task on the
+    just-in-time window — native transports post immediately on approval."""
+    now = datetime.now(UTC)
+    future = (now + timedelta(days=3)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    near = (now + timedelta(minutes=5)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    await _seed_postiz_account(social_env, platform="x")
+    await _seed_account(social_env, platform="linkedin")  # native tokens
+    await _seed_task(
+        social_env, "soctest-mixed-far", ["publish", "x", "linkedin"], due_datetime=future
+    )
+    await _seed_task(
+        social_env, "soctest-mixed-near", ["publish", "x", "linkedin"], due_datetime=near
+    )
+
+    act = SocialActivities(db_pool=social_env)
+    due = await ActivityEnvironment().run(act.find_due_posts, 10, 9)
+    assert [d["task_id"] for d in due] == ["soctest-mixed-near"]
+
+
 # ------------------------------------------------------- enqueue / drain / complete
 
 
