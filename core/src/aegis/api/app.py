@@ -62,7 +62,7 @@ async def lifespan(app: FastAPI):
     try:
         from aegis.services.rss_seeder import seed_rss_from_miniflux
 
-        count = await seed_rss_from_miniflux(pool, settings.miniflux_url, settings.miniflux_api_key)
+        count = await seed_rss_from_miniflux(pool, settings)
         logger.info("miniflux_rss_seed_complete", count=count)
     except Exception as exc:
         logger.warning("miniflux_seed_failed", error=str(exc)[:200])
