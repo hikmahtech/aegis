@@ -70,7 +70,7 @@ class TestYouTubeCaptionExtraction:
 
     async def test_extract_youtube_id_formats(self):
         """All YouTube URL formats produce correct video IDs."""
-        from aegis_worker.activities.content import _extract_youtube_id
+        from aegis.services.content_extract import extract_youtube_id as _extract_youtube_id
 
         assert _extract_youtube_id("https://www.youtube.com/watch?v=dQw4w9WgXcQ") == "dQw4w9WgXcQ"
         assert _extract_youtube_id("https://youtu.be/dQw4w9WgXcQ") == "dQw4w9WgXcQ"

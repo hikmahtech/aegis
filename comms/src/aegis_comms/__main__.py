@@ -152,6 +152,8 @@ class DocumentDeliveryRequest(BaseModel):
     caption: str = ""
     agent_id: str = "sebas"
     reply_markup: dict | None = None
+    # Optional explicit destination ({"channel": ...}); None = agent's bound channel.
+    target: dict | None = None
 
 
 class VoiceDeliveryRequest(BaseModel):
@@ -287,7 +289,7 @@ def create_delivery_app(adapter: SlackAdapter, settings: CommsSettings) -> FastA
             agent_id=req.agent_id,
             documents=docs,
             caption=req.caption,
-            target=None,
+            target=req.target,
             reply_markup=req.reply_markup,
         )
         ok = send_result.ok

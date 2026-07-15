@@ -8,7 +8,6 @@ have no local OCR, so an image URL with no caller-supplied excerpt is skipped.
 
 from __future__ import annotations
 
-import asyncio
 import os
 import re
 import tempfile
@@ -19,7 +18,12 @@ from urllib.parse import urlparse
 
 import httpx
 import structlog
-from aegis.services.content_extract import extract_html, fetch_and_extract
+from aegis.services.content_extract import (
+    extract_html,
+    extract_youtube_id,
+    fetch_and_extract,
+    fetch_youtube_transcript,
+)
 from temporalio import activity
 
 logger = structlog.get_logger()
@@ -172,15 +176,7 @@ async def _download_file(
 
 # --- Media transcription ---
 
-_YOUTUBE_ID_RE = re.compile(r"(?:v=|youtu\.be/|embed/)([a-zA-Z0-9_-]{11})")
 _MAX_MEDIA_BYTES = 500 * 1024 * 1024  # 500MB
-
-
-def _extract_youtube_id(url: str) -> str | None:
-    """Extract YouTube video ID from URL."""
-    m = _YOUTUBE_ID_RE.search(url)
-    return m.group(1) if m else None
-
 
 _ELEVENLABS_STT_URL = "https://api.elevenlabs.io/v1/speech-to-text"
 
@@ -189,24 +185,16 @@ async def _transcribe_media(
     url: str, elevenlabs_api_key: str = "", stt_model: str = "scribe_v1"
 ) -> ContentResult | None:
     """Transcribe media. YouTube captions first, then ElevenLabs Scribe fallback."""
-    video_id = _extract_youtube_id(url)
-    if video_id:
-        try:
-            from youtube_transcript_api import YouTubeTranscriptApi
-
-            ytt_api = YouTubeTranscriptApi()
-            transcript = await asyncio.to_thread(ytt_api.fetch, video_id)
-            text = " ".join(snippet.text for snippet in transcript)
-            if text and len(text) >= _MIN_CONTENT_LENGTH:
-                return ContentResult(
-                    text=text,
-                    title="",
-                    word_count=len(text.split()),
-                    extraction_method="youtube_captions",
-                    metadata={"video_id": video_id, "segments": len(transcript)},
-                )
-        except Exception as exc:
-            logger.warning("youtube_captions_failed", video_id=video_id, error=str(exc))
+    if extract_youtube_id(url):
+        text, meta = await fetch_youtube_transcript(url)
+        if text and len(text) >= _MIN_CONTENT_LENGTH:
+            return ContentResult(
+                text=text,
+                title="",
+                word_count=len(text.split()),
+                extraction_method="youtube_captions",
+                metadata=meta,
+            )
 
     # ElevenLabs Scribe fallback (empty key = kill switch)
     if elevenlabs_api_key:
