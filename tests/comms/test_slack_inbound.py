@@ -265,7 +265,9 @@ async def test_on_action_resolves_then_stamps_card():
 
     await inbound.on_action(value="interaction:i1:approve", channel_id="CSEBAS", message_ts="3.3")
 
-    core.resolve_interaction.assert_awaited_once_with(interaction_id="i1", value="approve")
+    core.resolve_interaction.assert_awaited_once_with(
+        interaction_id="i1", value="approve", note=""
+    )
     adapter.edit_card.assert_awaited_once()
     ekw = adapter.edit_card.await_args.kwargs
     assert ekw["ref"] == DeliveryRef("slack", {"channel": "CSEBAS", "ts": "3.3"})

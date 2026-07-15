@@ -101,6 +101,18 @@ async def handle_hint_submit(core, body) -> None:
     await core.resolve_interaction(interaction_id=interaction_id, value=f"hint:{text}")
 
 
+def _note_from_state(body: dict) -> str:
+    """Optional free-text typed into the card's `correction_note` input.
+
+    Slack includes the message's input-block state in every block_actions
+    payload from that message, so the note (when present) rides along with
+    the button tap and becomes `response.note` — which the core learning
+    loop records as a durable agent lesson."""
+    state = (body.get("state") or {}).get("values") or {}
+    block = state.get("correction_note") or {}
+    return str(((block.get("note") or {}).get("value")) or "").strip()
+
+
 class SlackAdapter:
     """AEGIS's comms channel backed by a Slack `AsyncWebClient`."""
 
@@ -457,6 +469,7 @@ class SlackAdapter:
                 value=action.get("value", ""),
                 channel_id=channel,
                 message_ts=message_ts,
+                note=_note_from_state(body),
             )
 
         @app.action("hint_open")

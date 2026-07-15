@@ -336,11 +336,20 @@ class SlackCoreClient:
         payload = {"text": text[:2000], "source": "slack", "external_id": external_id}
         return await self._post("/api/admin/capture", payload, timeout=30)
 
-    async def resolve_interaction(self, *, interaction_id: str, value: str) -> dict | None:
-        """POST /api/interactions/{id}/resolve — record a button choice."""
+    async def resolve_interaction(
+        self, *, interaction_id: str, value: str, note: str = ""
+    ) -> dict | None:
+        """POST /api/interactions/{id}/resolve — record a button choice.
+
+        `note` — optional human reason typed into the card's note input; the
+        core learning loop (record_correction_from_interaction) turns it into
+        a durable agent_memory lesson."""
+        response: dict = {"value": value}
+        if note:
+            response["note"] = note[:500]
         return await self._post(
             f"/api/interactions/{interaction_id}/resolve",
-            {"response": {"value": value}},
+            {"response": response},
             timeout=30,
         )
 
@@ -574,11 +583,15 @@ class SlackInbound:
             channel_id=channel_id,
         )
 
-    async def on_action(self, *, value: str, channel_id: str, message_ts: str) -> None:
+    async def on_action(
+        self, *, value: str, channel_id: str, message_ts: str, note: str = ""
+    ) -> None:
         """Resolve an interaction button, then stamp the card ONLY on success.
 
-        `value` is the button payload `interaction:{id}:{v}`. Retries up to 3×
-        on transport failure (mirrors bot.py::handle_interaction_callback). The
+        `value` is the button payload `interaction:{id}:{v}`. `note` is the
+        optional free-text from the card's note input — passed through so a
+        correction becomes a durable agent lesson. Retries up to 3× on
+        transport failure (mirrors bot.py::handle_interaction_callback). The
         card is edited (buttons cleared) ONLY when the result status is
         `resolved` or `already_resolved`; on failure the buttons are left intact
         so the user can re-click.
@@ -589,7 +602,9 @@ class SlackInbound:
 
         result = None
         for attempt in range(1, 4):
-            result = await self._core.resolve_interaction(interaction_id=interaction_id, value=val)
+            result = await self._core.resolve_interaction(
+                interaction_id=interaction_id, value=val, note=note
+            )
             if result is not None:
                 break
             if attempt < 3:

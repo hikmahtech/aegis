@@ -104,5 +104,30 @@ def render_slack_blocks(spec: CardSpec) -> list[dict]:
         )
 
     if elements:
+        if kind in ("approval", "choice", "ack"):
+            # Optional free-text note that rides along with whichever button
+            # is tapped (Slack includes the message's input-block state in
+            # every block_actions payload). A non-empty note lands in
+            # response.note, which the core learning loop records as a durable
+            # agent_memory lesson — bare taps stay one-click.
+            blocks.append(
+                {
+                    "type": "input",
+                    "block_id": "correction_note",
+                    "optional": True,
+                    "label": {
+                        "type": "plain_text",
+                        "text": "Why? (optional — teaches the agent)",
+                    },
+                    "element": {
+                        "type": "plain_text_input",
+                        "action_id": "note",
+                        "placeholder": {
+                            "type": "plain_text",
+                            "text": "Add a reason and it becomes a durable lesson",
+                        },
+                    },
+                }
+            )
         blocks.append({"type": "actions", "elements": elements})
     return blocks
