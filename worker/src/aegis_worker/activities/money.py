@@ -110,7 +110,7 @@ class MoneyActivities:
 
     @activity.defn
     async def store_receipt_email(self, msg: dict, account: str) -> str:
-        """Insert raw email into maou.receipt_email; return UUID id.
+        """Insert raw email into finance.receipt_email; return UUID id.
 
         Idempotent: ON CONFLICT (message_id) DO NOTHING. Returns empty string
         on conflict (caller treats as "already stored").
@@ -123,7 +123,7 @@ class MoneyActivities:
         async with self.db_pool.acquire() as conn:
             row = await conn.fetchrow(
                 """
-                INSERT INTO maou.receipt_email
+                INSERT INTO finance.receipt_email
                   (message_id, account, sender, subject, received_at, parsed)
                 VALUES (
                     $1, $2, $3, $4,
@@ -160,7 +160,7 @@ class MoneyActivities:
             rows = await conn.fetch(
                 "SELECT id, account, message_id, sender, subject, "
                 "parsed->>'snippet' AS body_plain, received_at "
-                "FROM maou.receipt_email WHERE id = ANY($1::uuid[])",
+                "FROM finance.receipt_email WHERE id = ANY($1::uuid[])",
                 receipt_ids,
             )
         return [
@@ -215,8 +215,8 @@ class MoneyActivities:
 
     @activity.defn
     async def upsert_charges(self, account: str, extractions: list[dict]) -> int:
-        """For each extraction, link `maou.receipt_email` and (when
-        is_receipt=True) upsert `maou.recurring_charge` keyed on
+        """For each extraction, link `finance.receipt_email` and (when
+        is_receipt=True) upsert `finance.recurring_charge` keyed on
         (account, sender_label, amount_cents, currency).
 
         Cadence is upgrade-only ('unknown' may be replaced; explicit
@@ -235,7 +235,7 @@ class MoneyActivities:
                     # Mark as parsed so we don't re-LLM it.
                     # v3 schema: no is_receipt/parsed_at columns; use parsed jsonb only.
                     await conn.execute(
-                        "UPDATE maou.receipt_email SET parsed=$2 WHERE id=$1::uuid",
+                        "UPDATE finance.receipt_email SET parsed=$2 WHERE id=$1::uuid",
                         receipt_id,
                         e,
                     )
@@ -255,7 +255,7 @@ class MoneyActivities:
                         vendor_name=e.get("vendor_name", ""),
                     )
                     await conn.execute(
-                        "UPDATE maou.receipt_email SET parsed=$2 WHERE id=$1::uuid",
+                        "UPDATE finance.receipt_email SET parsed=$2 WHERE id=$1::uuid",
                         receipt_id,
                         e,
                     )
@@ -290,7 +290,7 @@ class MoneyActivities:
                 # sequence preserves the real cadence the same way unknown→
                 # real upgrades it.
                 charge_row = await conn.fetchrow(
-                    "INSERT INTO maou.recurring_charge "
+                    "INSERT INTO finance.recurring_charge "
                     "(account, sender_label, vendor_name, category, amount_cents, "
                     " currency, monthly_home_equivalent, cadence, "
                     " first_seen_at, last_seen_at, next_due_at) "
@@ -299,18 +299,18 @@ class MoneyActivities:
                     "DO UPDATE SET "
                     "  last_seen_at = NOW(), "
                     "  next_due_at = COALESCE(EXCLUDED.next_due_at, "
-                    "                          maou.recurring_charge.next_due_at), "
+                    "                          finance.recurring_charge.next_due_at), "
                     "  cadence = CASE "
-                    "    WHEN maou.recurring_charge.cadence='unknown' "
+                    "    WHEN finance.recurring_charge.cadence='unknown' "
                     "         AND EXCLUDED.cadence != 'unknown' THEN EXCLUDED.cadence "
-                    "    WHEN maou.recurring_charge.cadence != 'unknown' "
-                    "         THEN maou.recurring_charge.cadence "
+                    "    WHEN finance.recurring_charge.cadence != 'unknown' "
+                    "         THEN finance.recurring_charge.cadence "
                     "    ELSE EXCLUDED.cadence "
                     "  END, "
                     "  monthly_home_equivalent = EXCLUDED.monthly_home_equivalent, "
-                    "  status = CASE WHEN maou.recurring_charge.status='cancelled' "
+                    "  status = CASE WHEN finance.recurring_charge.status='cancelled' "
                     "                THEN 'active' "
-                    "                ELSE maou.recurring_charge.status END, "
+                    "                ELSE finance.recurring_charge.status END, "
                     "  updated_at = NOW() "
                     "RETURNING id",
                     account,
@@ -325,7 +325,7 @@ class MoneyActivities:
                 )
 
                 await conn.execute(
-                    "UPDATE maou.receipt_email SET parsed=$2, charge_id=$3 WHERE id=$1::uuid",
+                    "UPDATE finance.receipt_email SET parsed=$2, charge_id=$3 WHERE id=$1::uuid",
                     receipt_id,
                     e,
                     charge_row["id"],
@@ -347,7 +347,7 @@ class MoneyActivities:
         async with self.db_pool.acquire() as conn:
             rows = await conn.fetch(
                 """
-                UPDATE maou.recurring_charge
+                UPDATE finance.recurring_charge
                 SET status = 'cancelled', updated_at = NOW()
                 WHERE status = 'active'
                   AND cadence IN ('monthly', 'quarterly', 'yearly')
@@ -386,7 +386,7 @@ class MoneyActivities:
                 "SELECT id, account, vendor_name, category, amount_cents, "
                 "currency, monthly_home_equivalent, next_due_at, "
                 "EXTRACT(EPOCH FROM (next_due_at - NOW())) / 86400 AS days_left "
-                "FROM maou.recurring_charge "
+                "FROM finance.recurring_charge "
                 "WHERE status = 'active' AND next_due_at IS NOT NULL "
                 "  AND next_due_at >= NOW() - INTERVAL '14 days'"
             )
@@ -396,7 +396,7 @@ class MoneyActivities:
                     if days_left > t:
                         continue
                     row = await conn.fetchrow(
-                        "INSERT INTO maou.renewal_alert "
+                        "INSERT INTO finance.renewal_alert "
                         "(charge_id, threshold_days) VALUES ($1, $2) "
                         "ON CONFLICT (charge_id, threshold_days, "
                         "             ((fired_at AT TIME ZONE 'UTC')::date)) "
@@ -442,7 +442,7 @@ class MoneyActivities:
         if charge_id and self.db_pool is not None:
             async with self.db_pool.acquire() as conn:
                 recent = await conn.fetchval(
-                    "SELECT 1 FROM maou.renewal_alert "
+                    "SELECT 1 FROM finance.renewal_alert "
                     "WHERE charge_id = $1::uuid AND threshold_days = $2 "
                     "  AND last_notified_at IS NOT NULL "
                     "  AND last_notified_at > NOW() - INTERVAL '7 days' "
@@ -485,7 +485,7 @@ class MoneyActivities:
         if alert_id and self.db_pool is not None:
             async with self.db_pool.acquire() as conn:
                 await conn.execute(
-                    "UPDATE maou.renewal_alert SET last_notified_at = NOW() "
+                    "UPDATE finance.renewal_alert SET last_notified_at = NOW() "
                     "WHERE id = $1::uuid",
                     str(alert_id),
                 )
@@ -533,18 +533,18 @@ class MoneyActivities:
                 "SELECT vendor_name, category, currency, amount_cents, "
                 "       monthly_home_equivalent, last_seen_at, first_seen_at, "
                 "       status "
-                "FROM maou.recurring_charge WHERE status = 'active'"
+                "FROM finance.recurring_charge WHERE status = 'active'"
             )
             new_this = await conn.fetch(
                 "SELECT vendor_name, monthly_home_equivalent "
-                "FROM maou.recurring_charge "
+                "FROM finance.recurring_charge "
                 "WHERE first_seen_at >= $1 AND first_seen_at < $2",
                 period_start,
                 period_end,
             )
             cancelled_this = await conn.fetch(
                 "SELECT vendor_name, monthly_home_equivalent "
-                "FROM maou.recurring_charge "
+                "FROM finance.recurring_charge "
                 "WHERE status='cancelled' "
                 "  AND updated_at >= $1 AND updated_at < $2",
                 period_start,
@@ -601,7 +601,7 @@ class MoneyActivities:
 
         async with self.db_pool.acquire() as conn:
             await conn.execute(
-                "INSERT INTO maou.subscription_digest "
+                "INSERT INTO finance.subscription_digest "
                 "(period_start, period_end, summary) VALUES ($1,$2,$3) "
                 "ON CONFLICT (period_start, period_end) DO UPDATE SET "
                 "  summary = EXCLUDED.summary, sent_at = NOW()",

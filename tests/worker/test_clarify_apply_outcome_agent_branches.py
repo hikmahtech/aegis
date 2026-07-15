@@ -272,7 +272,7 @@ async def test_apply_outcome_sebas_has_no_prefetch_hook(db_pool):
 
 @pytest.mark.asyncio
 async def test_apply_outcome_maou_real_hook_returns_unchanged_when_no_receipts():
-    """When maou.receipt_email returns no rows, the real hook returns the
+    """When finance.receipt_email returns no rows, the real hook returns the
     synthetic_input unchanged (no 'Recent receipts:' section). Uses a
     mock pool whose connection returns an empty list so the test is
     independent of real DB state.
