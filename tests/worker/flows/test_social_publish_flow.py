@@ -184,8 +184,8 @@ async def test_no_due_posts_does_nothing(temporal_env):
         assert result == {
             "due": 0,
             "carded": 0,
-            "posted": 0,
-            "post_failed": 0,
+            "drain_posted": 0,
+            "drain_failed": 0,
             "completed": 0,
         }
         assert not calls["hook"]
