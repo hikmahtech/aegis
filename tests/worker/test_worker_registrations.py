@@ -106,3 +106,51 @@ def test_social_metrics_flow_in_schedule_map():
     )
     assert config.agent_id == "sebas"
     assert config.window_days == 21
+
+
+def test_every_registered_activity_is_decorated():
+    """Every method referenced in an activities list anywhere in __main__.py —
+    including the REAL list inside main(), which no test instantiates — must
+    carry @activity.defn. An undecorated entry crashes the worker at boot
+    ("missing attributes, was it decorated with @activity.defn?"), which unit
+    tests never see because main() only runs against live Temporal.
+    """
+    import ast
+    import inspect
+
+    from temporalio import activity
+
+    src = inspect.getsource(worker_main)
+    tree = ast.parse(src)
+
+    # instance name -> Activities class name, from `x_act = SomeActivities(...)`
+    instances: dict[str, str] = {}
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Assign)
+            and len(node.targets) == 1
+            and isinstance(node.targets[0], ast.Name)
+            and isinstance(node.value, ast.Call)
+            and isinstance(node.value.func, ast.Name)
+        ):
+            instances[node.targets[0].id] = node.value.func.id
+
+    checked = 0
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.List):
+            continue
+        for elt in node.elts:
+            if (
+                isinstance(elt, ast.Attribute)
+                and isinstance(elt.value, ast.Name)
+                and elt.value.id in instances
+            ):
+                cls = getattr(worker_main, instances[elt.value.id])
+                fn = inspect.getattr_static(cls, elt.attr)
+                assert activity._Definition.from_callable(fn) is not None, (
+                    f"{instances[elt.value.id]}.{elt.attr} is registered in "
+                    "worker/__main__.py but not decorated with @activity.defn — "
+                    "the worker would crash at boot"
+                )
+                checked += 1
+    assert checked > 50, f"AST scan found only {checked} registrations — scan is broken"

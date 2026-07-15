@@ -533,7 +533,6 @@ async def main():
         clarify_act.clear_clarify_watermark,
         chat_act.synthesize_reply,
         review_act.gather_daily_digest,
-        review_act.gather_weekly_digest,
         review_act.log_review_digest,
         review_act.apply_review_acknowledgement,
         review_act.gather_weekly_state,
