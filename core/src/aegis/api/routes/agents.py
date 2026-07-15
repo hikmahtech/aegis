@@ -9,8 +9,10 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 
 from aegis.api.auth import verify_auth
 from aegis.services.agents import create_agent as _create_agent
+from aegis.services.agents import delete_agent as _delete_agent
 from aegis.services.agents import get_agent as _get_agent
 from aegis.services.agents import list_agents as _list_agents
+from aegis.services.agents import reassign_agent_rows as _reassign_agent_rows
 from aegis.services.agents import update_agent as _update_agent
 from aegis.services.personalities import get_personality, set_personality
 
@@ -134,6 +136,43 @@ async def update_agent(agent_id: str, request: Request, body: dict[str, Any]) ->
     if not agent:
         raise HTTPException(status_code=404, detail=f"Agent '{agent_id}' not found")
     return agent
+
+
+@router.post("/{agent_id}/reassign")
+async def reassign_agent(agent_id: str, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+    """Move every FK-owned row (activities, runs, history, …) to another agent.
+
+    Body: {"to": "<agent-id>"}. Run this before DELETE — the DB keeps
+    RESTRICT FKs as the safety net, so a delete while rows remain is a 409.
+    """
+    to_id = str(body.get("to") or "").strip()
+    if not to_id:
+        raise HTTPException(status_code=400, detail="body.to (target agent id) is required")
+    if to_id == agent_id:
+        raise HTTPException(status_code=400, detail="target agent must differ from source")
+    pool = request.app.state.db_pool
+    for aid in (agent_id, to_id):
+        if not await _get_agent(pool, aid):
+            raise HTTPException(status_code=404, detail=f"Agent '{aid}' not found")
+    counts = await _reassign_agent_rows(pool, agent_id, to_id)
+    return {"reassigned": counts, "total": sum(counts.values())}
+
+
+@router.delete("/{agent_id}", status_code=204)
+async def delete_agent(agent_id: str, request: Request) -> None:
+    """Delete an agent. Reserved 'system' agent is not deletable (#36)."""
+    if agent_id == "system":
+        raise HTTPException(status_code=400, detail="the 'system' agent is reserved")
+    try:
+        deleted = await _delete_agent(request.app.state.db_pool, agent_id)
+    except asyncpg.ForeignKeyViolationError as e:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Agent '{agent_id}' still owns rows — reassign them first "
+            f"(POST /api/agents/{agent_id}/reassign)",
+        ) from e
+    if not deleted:
+        raise HTTPException(status_code=404, detail=f"Agent '{agent_id}' not found")
 
 
 _DRAFT_PROMPT = """You are helping configure an AI agent persona for a personal \
