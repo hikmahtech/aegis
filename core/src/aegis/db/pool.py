@@ -13,11 +13,49 @@ import structlog
 logger = structlog.get_logger()
 
 
+def _encode_jsonb(value: Any) -> str:
+    """Encode a Python object as jsonb, rejecting already-serialized dict/list strings.
+
+    jsonb columns legitimately store bare Python strings as JSON string scalars
+    (e.g. `settings.value = "UTC"`, `social_publish_label = "publish"` — the
+    generic `settings` key/value store and several call sites depend on this).
+    That is NOT the bug.
+
+    The actual recurring bug (issue #37 / PR #79): a caller pre-serializes a
+    dict/list with `json.dumps` and passes the resulting string here, which
+    this codec's encoder then encodes *again*, landing as a jsonb string
+    scalar containing escaped JSON text instead of a jsonb object/array
+    (`col->>'key'` then returns NULL). Detect that specific mistake — a string
+    that itself parses as a JSON object or array is almost certainly a
+    pre-dumped payload, not an intentional scalar value — and fail loudly at
+    the call site instead of silently corrupting data. bytes/bytearray have no
+    legitimate jsonb use here, so those are always rejected.
+    """
+    if isinstance(value, (bytes, bytearray)):
+        raise TypeError(
+            "jsonb parameters must be Python objects (dict/list/str/...), not bytes — "
+            "the pool codec applies json.dumps itself"
+        )
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except ValueError:
+            parsed = None
+        if isinstance(parsed, (dict, list)):
+            raise TypeError(
+                "jsonb parameter looks pre-dumped (a JSON object/array encoded as a "
+                "string) — the pool codec applies json.dumps; pass the dict/list "
+                "directly instead of a json.dumps(...) string, which would double-"
+                "encode it into a jsonb string scalar"
+            )
+    return json.dumps(value)
+
+
 async def _init_connection(conn: asyncpg.Connection) -> None:
     """Set up JSONB codec so asyncpg returns Python objects, not strings."""
     await conn.set_type_codec(
         "jsonb",
-        encoder=json.dumps,
+        encoder=_encode_jsonb,
         decoder=json.loads,
         schema="pg_catalog",
     )

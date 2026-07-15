@@ -1274,7 +1274,11 @@ class AlertActivities:
                             service,
                             f"https://github.com/{service}",
                             ["github", "repository", "pandoras-actor"],
-                            json.dumps({"github_repo": service, "coding_enabled": False}),
+                            # Pass a dict, not json.dumps(...) — the pool's jsonb codec
+                            # already applies json.dumps; pre-stringifying double-encodes
+                            # it into a JSONB string scalar (metadata->>'coding_enabled'
+                            # would then read NULL).
+                            {"github_repo": service, "coding_enabled": False},
                         )
                         activity.logger.info(
                             "alert_resource_auto_registered_disabled slug=%s service=%s "
