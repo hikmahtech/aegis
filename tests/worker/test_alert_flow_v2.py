@@ -272,11 +272,6 @@ async def stub_send_card_v2(
     return {"ok": True, "message_id": 1}
 
 
-@activity.defn(name="update_interaction_message_id")
-async def stub_update_msg_v2(interaction_id: str, telegram_message_id: int) -> None:
-    pass
-
-
 @activity.defn(name="resolve_interaction")
 async def stub_resolve_v2(inp: ResolveInteractionInput) -> ResolveInteractionResult:
     return ResolveInteractionResult(already_resolved=False)
@@ -318,7 +313,6 @@ ALL_ACTIVITIES = [
     stub_upload_kimi_log,
     stub_insert_interaction_v2,
     stub_send_card_v2,
-    stub_update_msg_v2,
     stub_resolve_v2,
     stub_timeout_v2,
 ]

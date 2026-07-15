@@ -248,10 +248,6 @@ async def test_calendar_auth_expired_spawns_interaction_flow_and_retries():
     ) -> dict:
         return {"ok": True, "message_id": 7}
 
-    @activity.defn(name="update_interaction_message_id")
-    async def update_msg(interaction_id: str, telegram_message_id: int) -> None:
-        return None
-
     @activity.defn(name="resolve_interaction")
     async def resolve(inp: ResolveInteractionInput) -> ResolveInteractionResult:
         return ResolveInteractionResult(already_resolved=False)
@@ -274,7 +270,6 @@ async def test_calendar_auth_expired_spawns_interaction_flow_and_retries():
                 stub_cursor,
                 insert_ia,
                 send_card,
-                update_msg,
                 resolve,
                 timeout,
             ],

@@ -53,10 +53,6 @@ async def test_weekly_flow_frames_and_spawns_decisions():
     async def card(*a, **kw):
         return {"ok": True, "message_id": 0}
 
-    @activity.defn(name="update_interaction_message_id")
-    async def upd(*a, **kw):
-        return None
-
     @activity.defn(name="resolve_interaction")
     async def resolve(*a, **kw):
         return {"already_resolved": False}
@@ -75,7 +71,7 @@ async def test_weekly_flow_frames_and_spawns_decisions():
             client,
             task_queue="aegis-weekly-copilot-test",
             workflows=[WeeklyReviewFlow, InteractionFlow],
-            activities=[gather, frame, send_message, log, insert, card, upd,
+            activities=[gather, frame, send_message, log, insert, card,
                         resolve, to, apply_dec],
         ):
             result = await client.execute_workflow(

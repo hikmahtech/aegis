@@ -121,7 +121,6 @@ class SocialActivities:
         activity.logger.info("social_find_due_posts found=%d", len(due))
         return due
 
-    @activity.defn
     async def enqueue_outbox(
         self, task_id: str, platforms: list[str], text: str, link: str, post_at: str = ""
     ) -> dict:
@@ -285,7 +284,6 @@ class SocialActivities:
             activity.logger.info("social_complete_posted_tasks enqueued=%d", completed)
         return {"completed": completed}
 
-    @activity.defn
     async def unpublish_task(self, task_id: str) -> dict:
         """Skip = revoke publish intent: strip the publish label off the task.
 

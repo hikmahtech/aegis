@@ -140,7 +140,6 @@ class ReviewActivities:
             "outbox_failed_7d_count": int(outbox_failed_7d or 0),
         }
 
-    @activity.defn
     async def gather_weekly_digest(self) -> dict:
         """Pull weekly-review counts: stale next actions, inactive projects,
         old waiting-for, never-clarified inbox, last-7d completion stats.

@@ -58,9 +58,9 @@ class InteractionResult:
     response: dict[str, Any] | None
 
 
-# 2 attempts (was 1): used by both `update_interaction_message_id` (the
-# best-effort bridge that lets the bot edit-in-place after a user clicks a
-# callback) and `post_resolve_activity` (which often does Todoist label
+# 2 attempts (was 1): used by both `update_interaction_delivery_ref` (the
+# best-effort write that records how the card was delivered) and
+# `post_resolve_activity` (which often does Todoist label
 # updates that hit transient 5xx). One retry is cheap insurance; the
 # exception-swallow path in the flow still catches a persistent failure.
 _BEST_EFFORT_RETRY = RetryPolicy(maximum_attempts=2)
@@ -128,24 +128,14 @@ class InteractionFlow:
                 start_to_close_timeout=_ACT_TIMEOUT,
             )
             # Record how the card was delivered so the DeliveryWatchdog knows it
-            # landed. Legacy channels returned a numeric message_id; Slack (and any
-            # channel-neutral adapter) returns a delivery_ref {adapter,channel,ts}
-            # with no message_id — persist whichever is present.
-            if isinstance(card_result, dict):
-                if card_result.get("message_id"):
-                    await workflow.execute_activity(
-                        "update_interaction_message_id",
-                        args=[interaction_id, int(card_result["message_id"])],
-                        retry_policy=_BEST_EFFORT_RETRY,
-                        start_to_close_timeout=_ACT_TIMEOUT,
-                    )
-                elif card_result.get("delivery_ref"):
-                    await workflow.execute_activity(
-                        "update_interaction_delivery_ref",
-                        args=[interaction_id, card_result["delivery_ref"]],
-                        retry_policy=_BEST_EFFORT_RETRY,
-                        start_to_close_timeout=_ACT_TIMEOUT,
-                    )
+            # landed — the adapter returns a delivery_ref {adapter,channel,ts}.
+            if isinstance(card_result, dict) and card_result.get("delivery_ref"):
+                await workflow.execute_activity(
+                    "update_interaction_delivery_ref",
+                    args=[interaction_id, card_result["delivery_ref"]],
+                    retry_policy=_BEST_EFFORT_RETRY,
+                    start_to_close_timeout=_ACT_TIMEOUT,
+                )
         except Exception as exc:
             workflow.logger.warning("interaction_card_dispatch_failed: %s", str(exc)[:200])
 

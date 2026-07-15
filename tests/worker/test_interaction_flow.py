@@ -34,10 +34,6 @@ async def _stub_send_card(
     return {"ok": True, "message_id": 0}
 
 
-@activity.defn(name="update_interaction_message_id")
-async def _stub_update_msg(interaction_id: str, telegram_message_id: int) -> None:
-    return None
-
 
 @pytest_asyncio.fixture(loop_scope="function")
 async def temporal_env():
@@ -73,7 +69,6 @@ async def test_interaction_flow_resolves_on_signal(
             acts.resolve_interaction,
             acts.apply_interaction_timeout,
             _stub_send_card,
-            _stub_update_msg,
         ],
     ):
         handle = await temporal_env.client.start_workflow(
@@ -134,7 +129,6 @@ async def test_interaction_flow_applies_timeout_policy(
             acts.resolve_interaction,
             acts.apply_interaction_timeout,
             _stub_send_card,
-            _stub_update_msg,
         ],
     ):
         handle = await temporal_env.client.start_workflow(
@@ -191,7 +185,6 @@ async def test_interaction_flow_hold_ignores_timeout(temporal_env, db_pool, seed
             acts.resolve_interaction,
             acts.apply_interaction_timeout,
             _stub_send_card,
-            _stub_update_msg,
         ],
     ):
         handle = await temporal_env.client.start_workflow(
@@ -251,7 +244,6 @@ async def test_interaction_flow_post_resolve_activity_called(
             acts.resolve_interaction,
             acts.apply_interaction_timeout,
             _stub_send_card,
-            _stub_update_msg,
             _stub_resolve,
         ],
     ):
@@ -324,7 +316,6 @@ async def test_interaction_flow_no_post_resolve_when_not_set(
             acts.resolve_interaction,
             acts.apply_interaction_timeout,
             _stub_send_card,
-            _stub_update_msg,
             _never,
         ],
     ):
