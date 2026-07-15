@@ -12,7 +12,6 @@ This document is the canonical reference for what the running system does today.
 | Worker | `aegis-worker` | — | Temporal workflows (28 flows), activities, schedule sync |
 | Comms | `aegis-comms` | 8081 | Channel adapter — **Slack** (Socket Mode); FastAPI delivery server + interaction cards. Core reaches it via `AEGIS_COMMS_URL`; idles as a no-op until Slack is configured |
 | Postgres | pgvector/pg16 | 25432 | Primary database (migrations 001 → 008) |
-| Redis | redis:7-alpine | 26379 | Caching, rate limiting |
 | Temporal | auto-setup | 7233 | Workflow orchestration (task queue `aegis-main`) |
 | Temporal UI | temporalio/ui | 8233 | Workflow debugging |
 | Ollama | `--profile local-llm` | 11434 | Optional bundled local model server (point the LLM backend at it for fully-local) |
@@ -180,7 +179,7 @@ When a `todoist_task_id` is on the alert (pandora APP-<n>: clarify path), the fl
 | **RemoteScriptConnector** (`remote_script.py`) | SSH to the designated coding host. Runs predefined infra scripts and coding-CLI (kimi/claude) runs for alert investigations against fixed checkouts under the configured repo base (workspace-relative `metadata.path`, no JIT cloning). The host, SSH key, engines, accounts, org routing, and optional separate kimi host are configured on an infra registry entry's **Coding agent** block (env `AEGIS_REMOTE_SCRIPT_*` is the fallback) — see [`infrastructure.md`](../infrastructure.md). |
 | **HomelabConnector** (`homelab.py`) | Docker Swarm ops over SSH (`list_services`, `service_ps`, `restart_service`) + `probe_tls` cert checks. Gated by the `homelab_enabled` setting. Kubernetes ops go through the infrastructure registry instead (`services/infra.py` — see [`infrastructure.md`](../infrastructure.md)). |
 | **SearchConnector** (`search.py`) | SearxNG HTTP client. Used by the `research_topic` chat tool. |
-| **FinanceConnector** (`finance.py`) | Provider-agnostic web market data (keyless `yahoo` / `stooq` quote providers, selected via the Finance integration config: `finance_provider` / `finance_api_key` / `finance_indices`). Powers Maou's `get_quote` / `get_market_overview` tools and the `/api/market/summary` briefing section; `get_finance_news` rides SearchConnector. |
+| **FinanceConnector** (`finance.py`) | Provider-agnostic web market data (keyless `yahoo` / `stooq` quote providers, selected via the Finance integration config: `finance_provider` / `finance_indices`). Powers Maou's `get_quote` / `get_market_overview` tools and the `/api/market/summary` briefing section; `get_finance_news` rides SearchConnector. |
 | **SocialConnector** (`social.py`) | Social posting for `SocialPublishFlow` — native X/Twitter OAuth or a self-hosted Postiz transport — see [`social-publishing.md`](../social-publishing.md). |
 | **VercelConnector** (`vercel.py`) | Vercel REST client — project inventory (`VercelProjectSyncFlow`) and Pandora's deployment chat tools. |
 
@@ -268,7 +267,7 @@ The `activities` table drives Temporal schedules. Worker on startup queries acti
 | `chat_tool_calls` | Every tool call during a chat turn |
 | `workflow_runs` | Temporal workflow start / complete / fail via `WorkflowRunRecorderInterceptor` |
 
-Distributed tracing: OTel SDK + JSON-formatted logs with `trace_id`/`span_id` injected from the active span. Per-package `telemetry.py` + `logging_config.py` modules. Gated on `OTEL_ENABLED=true`. Auto-instrumentation covers FastAPI, asyncpg, redis, httpx, requests. The Worker registers `temporalio.contrib.opentelemetry.TracingInterceptor` so trace context flows through workflow headers automatically.
+Distributed tracing: OTel SDK + JSON-formatted logs with `trace_id`/`span_id` injected from the active span. Per-package `telemetry.py` + `logging_config.py` modules. Gated on `OTEL_ENABLED=true`. Auto-instrumentation covers FastAPI, asyncpg, httpx, requests. The Worker registers `temporalio.contrib.opentelemetry.TracingInterceptor` so trace context flows through workflow headers automatically.
 
 ## Knowledge (native RAG)
 

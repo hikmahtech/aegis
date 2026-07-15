@@ -564,7 +564,6 @@ class LLMClient:
 
 # Imported after LLMClient to avoid intra-package circular imports.
 from aegis.llm.tier import (  # noqa: E402
-    load_model_tiers,
     resolve_model_for_agent,
     set_model_tiers,
     tier_to_model,
@@ -573,7 +572,6 @@ from aegis.llm.tier import (  # noqa: E402
 __all__ = [
     "LLMClient",
     "LLMTruncationError",
-    "load_model_tiers",
     "parse_llm_json",
     "resolve_model_for_agent",
     "set_model_tiers",

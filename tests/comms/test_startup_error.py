@@ -118,7 +118,6 @@ async def test_run_boots_delivery_app_when_slack_unconfigured(monkeypatch):
     for key in (
         "AEGIS_SLACK_BOT_TOKEN",
         "AEGIS_SLACK_APP_TOKEN",
-        "AEGIS_SLACK_SIGNING_SECRET",
         "AEGIS_CHANNEL",
     ):
         monkeypatch.delenv(key, raising=False)
@@ -233,7 +232,6 @@ async def test_merge_slack_config_db_wins_over_env(monkeypatch):
         monkeypatch,
         AEGIS_SLACK_BOT_TOKEN="env-bot",
         AEGIS_SLACK_APP_TOKEN="env-app",
-        AEGIS_SLACK_SIGNING_SECRET="env-secret",
         AEGIS_CHANNEL="slack",
     )
     assert settings.slack_bot_token == "env-bot"  # sanity: env fallback actually took
@@ -244,13 +242,11 @@ async def test_merge_slack_config_db_wins_over_env(monkeypatch):
             "configured": True,
             "bot_token": "db-bot",
             "app_token": "db-app",
-            "signing_secret": "db-secret",
             "channel": "db-channel",
         },
     )
     assert settings.slack_bot_token == "db-bot"
     assert settings.slack_app_token == "db-app"
-    assert settings.slack_signing_secret == "db-secret"
     assert settings.channel == "db-channel"
 
 
@@ -310,7 +306,6 @@ async def test_fetch_resolved_slack_config_returns_json_on_success(monkeypatch):
         "configured": True,
         "bot_token": "db-bot",
         "app_token": "db-app",
-        "signing_secret": "db-secret",
         "channel": "slack",
     }
 

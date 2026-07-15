@@ -112,7 +112,6 @@ def test_money_hygiene_settings_defaults():
     s = Settings(**_REQUIRED)
     assert s.money_hygiene_enabled is False
     assert s.home_currency == "INR"
-    assert s.bank_alert_senders == ""
     assert "USD" in s.money_hygiene_fx_rates
     assert s.money_hygiene_fx_rates["USD"] == 84.5
     assert s.money_hygiene_fx_rates["EUR"] == 92.0

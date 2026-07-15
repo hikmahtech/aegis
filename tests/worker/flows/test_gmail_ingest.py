@@ -151,11 +151,6 @@ async def stub_send_card(
     return {"ok": True, "message_id": 42}
 
 
-@activity.defn(name="update_interaction_message_id")
-async def stub_update_msg(interaction_id: str, telegram_message_id: int) -> None:
-    pass
-
-
 @activity.defn(name="resolve_interaction")
 async def stub_resolve(inp: ResolveInteractionInput) -> ResolveInteractionResult:
     return ResolveInteractionResult(already_resolved=False)
@@ -199,7 +194,6 @@ ALL_STUBS = [
     stub_idem,
     stub_insert_ia,
     stub_send_card,
-    stub_update_msg,
     stub_resolve,
     stub_timeout,
     stub_capture_to_inbox,
@@ -284,7 +278,6 @@ async def test_classifies_and_routes_important_action():
         stub_idem,
         stub_insert_ia,
         stub_send_card,
-        stub_update_msg,
         stub_resolve,
         stub_timeout,
         stub_capture_to_inbox,
@@ -384,7 +377,6 @@ async def test_auth_expired_pauses_via_interaction_flow():
         stub_idem,
         stub_insert_ia,
         stub_send_card,
-        stub_update_msg,
         stub_resolve,
         stub_timeout,
     ]
@@ -477,7 +469,6 @@ async def test_cursor_advances_on_success():
         stub_idem,
         stub_insert_ia,
         stub_send_card,
-        stub_update_msg,
         stub_resolve,
         stub_timeout,
     ]
@@ -625,7 +616,6 @@ async def test_financial_tags_trigger_money_process_fanout():
         stub_idem,
         stub_insert_ia,
         stub_send_card,
-        stub_update_msg,
         stub_resolve,
         stub_timeout,
         stub_store,
@@ -755,7 +745,6 @@ async def test_forwarded_lane_surfaces_in_todoist_description():
         stub_idem,
         stub_insert_ia,
         stub_send_card,
-        stub_update_msg,
         stub_resolve,
         stub_timeout,
         stub_capture_to_inbox,
@@ -819,7 +808,6 @@ async def test_apply_label_ok_false_returns_label_failed_for_useless():
         stub_idem,
         stub_insert_ia,
         stub_send_card,
-        stub_update_msg,
         stub_resolve,
         stub_timeout,
         stub_capture_to_inbox,
@@ -876,7 +864,6 @@ async def test_own_lane_omits_forwarded_line_from_description():
                 stub_idem,
                 stub_insert_ia,
                 stub_send_card,
-                stub_update_msg,
                 stub_resolve,
                 stub_timeout,
                 stub_capture_to_inbox,

@@ -482,18 +482,6 @@ class HomelabActivities:
             )
 
 
-def _extract_image_sha(image: str) -> str:
-    if ":" in image:
-        return image.rsplit(":", 1)[1]
-    return ""
-
-
-def _extract_repo(image: str) -> str:
-    if ":" in image:
-        return image.rsplit(":", 1)[0]
-    return image
-
-
 def _parse_rowcount(status: str) -> int:
     if not status:
         return 0

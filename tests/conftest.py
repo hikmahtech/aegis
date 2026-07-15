@@ -1,9 +1,62 @@
 """Shared test fixtures for AEGIS v2."""
 
+import asyncio
+import os
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from aegis.config import Settings
+
+# Postgres server from `docker compose up -d postgres`. Tests get their own
+# database on it (below) — never the long-lived `aegis` dev database.
+_PG_SERVER = "postgresql://aegis:aegis_dev@localhost:25432"
+_TEST_DB = "aegis_test"
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+
+
+@pytest.fixture(scope="session")
+def test_db_url() -> str | None:
+    """URL of a freshly-created, freshly-migrated + seeded session-scoped
+    test database.
+
+    `TEST_DATABASE_URL` overrides everything (caller-managed: no drop/create,
+    no migrate). Otherwise `aegis_test` is dropped, recreated, migrated from
+    this checkout's migrations/, and seeded from config/seed/ (same as core
+    boot) once per session — sharing the dev `aegis` database broke the suite
+    whenever a parallel branch applied a divergent migration to it (e.g. the
+    maou→finance schema rename).
+
+    Returns None when no Postgres is reachable; db_pool fixtures then skip.
+    """
+    override = os.getenv("TEST_DATABASE_URL")
+    if override:
+        return override
+
+    async def _prepare() -> str:
+        import asyncpg
+        from aegis.db import create_pool, run_migrations
+        from aegis.seed import load_seeds
+
+        admin = await asyncpg.connect(f"{_PG_SERVER}/aegis")
+        try:
+            await admin.execute(f"DROP DATABASE IF EXISTS {_TEST_DB} WITH (FORCE)")
+            await admin.execute(f"CREATE DATABASE {_TEST_DB}")
+        finally:
+            await admin.close()
+        url = f"{_PG_SERVER}/{_TEST_DB}"
+        pool = await create_pool(url, min_size=1, max_size=2)
+        try:
+            await run_migrations(pool, _REPO_ROOT / "migrations")
+            await load_seeds(pool, _REPO_ROOT / "config" / "seed")
+        finally:
+            await pool.close()
+        return url
+
+    try:
+        return asyncio.run(_prepare())
+    except OSError:
+        return None
 
 # Defaults for Settings fields that are now REQUIRED (no production default)
 # but still need a value to instantiate the model in tests.
@@ -54,16 +107,13 @@ def mock_db_pool():
 
 
 @pytest.fixture(autouse=True, scope="session")
-def _load_model_tiers_for_tests(tmp_path_factory: pytest.TempPathFactory) -> None:
+def _load_model_tiers_for_tests() -> None:
     """Ensure the tier map is populated for all tests.
 
     Tests that use send_message (or resolve_model_for_agent) need _TIERS populated
-    or the 'balanced' fallback will KeyError. This fixture loads a minimal map once
+    or the 'balanced' fallback will KeyError. This fixture sets a minimal map once
     per session so all tests start with a working tier resolver.
     """
-    from aegis.llm.tier import load_model_tiers
+    from aegis.llm.tier import set_model_tiers
 
-    tmp = tmp_path_factory.mktemp("tiers")
-    yml = tmp / "models.yaml"
-    yml.write_text("tiers:\n  fast: gemma4:e2b\n  balanced: qwen3:14b\n  smart: qwen3:32b\n")
-    load_model_tiers(yml)
+    set_model_tiers({"fast": "gemma4:e2b", "balanced": "qwen3:14b", "smart": "qwen3:32b"})

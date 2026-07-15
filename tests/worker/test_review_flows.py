@@ -74,10 +74,6 @@ def _build_stubs(digest: dict, kind: str):
     async def send_card(*a, **kw):
         return {"ok": True, "message_id": 0}
 
-    @activity.defn(name="update_interaction_message_id")
-    async def update_msg(*a, **kw):
-        return None
-
     @activity.defn(name="resolve_interaction")
     async def resolve(*a, **kw):
         return {"already_resolved": False}
@@ -102,7 +98,6 @@ def _build_stubs(digest: dict, kind: str):
             log_review_digest,
             insert_interaction,
             send_card,
-            update_msg,
             resolve,
             timeout,
             apply_ack,
@@ -178,10 +173,6 @@ async def test_weekly_review_flow_sends_digest_and_logs() -> None:
     async def send_card(*a, **kw):
         return {"ok": True, "message_id": 0}
 
-    @activity.defn(name="update_interaction_message_id")
-    async def update_msg(*a, **kw):
-        return None
-
     @activity.defn(name="resolve_interaction")
     async def resolve(*a, **kw):
         return {"already_resolved": False}
@@ -207,7 +198,6 @@ async def test_weekly_review_flow_sends_digest_and_logs() -> None:
                 log_review_digest,
                 insert_interaction,
                 send_card,
-                update_msg,
                 resolve,
                 timeout,
                 apply_dec,
@@ -258,10 +248,6 @@ async def test_daily_review_flow_continues_when_delivery_fails() -> None:
         async def card(*a, **kw):
             return {"ok": True, "message_id": 0}
 
-        @activity.defn(name="update_interaction_message_id")
-        async def upd(*a, **kw):
-            return None
-
         @activity.defn(name="resolve_interaction")
         async def resolve(*a, **kw):
             return {"already_resolved": False}
@@ -288,7 +274,6 @@ async def test_daily_review_flow_continues_when_delivery_fails() -> None:
                 log,
                 insert,
                 card,
-                upd,
                 resolve,
                 to,
                 ack,
@@ -337,10 +322,6 @@ async def test_daily_review_addresses_config_agent_id() -> None:
         sent_agents.append(agent_id)
         return {"ok": True, "message_id": 0}
 
-    @activity.defn(name="update_interaction_message_id")
-    async def update_msg(*a, **kw):
-        return None
-
     @activity.defn(name="resolve_interaction")
     async def resolve(*a, **kw):
         return {"already_resolved": False}
@@ -369,7 +350,6 @@ async def test_daily_review_addresses_config_agent_id() -> None:
                 log_review_digest,
                 insert_interaction,
                 send_card,
-                update_msg,
                 resolve,
                 timeout,
                 apply_ack,

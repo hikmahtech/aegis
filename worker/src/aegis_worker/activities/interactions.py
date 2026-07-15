@@ -138,25 +138,6 @@ class InteractionActivities:
                 UUID(input.interaction_id),
             )
 
-    @activity.defn(name="update_interaction_message_id")
-    async def update_interaction_message_id(
-        self, interaction_id: str, telegram_message_id: int
-    ) -> None:
-        """Best-effort write that bridges send_interaction_card → bot
-        edit-in-place when the user clicks a callback. Status-guarded with
-        `AND status='pending'` so a fast resolve-then-card-late race can't
-        clobber the resolved row's `telegram_message_id`. Caller retries up
-        to 2 attempts (`_BEST_EFFORT_RETRY` in flows/interaction.py); on
-        persistent failure the flow logs and continues — the interaction is
-        still functional, just without the edit-in-place hook."""
-        async with self._pool.acquire() as conn:
-            await conn.execute(
-                "UPDATE interactions SET telegram_message_id = $2 "
-                "WHERE id = $1 AND status = 'pending'",
-                UUID(interaction_id),
-                telegram_message_id,
-            )
-
     @activity.defn(name="update_interaction_delivery_ref")
     async def update_interaction_delivery_ref(
         self, interaction_id: str, delivery_ref: dict
@@ -166,8 +147,8 @@ class InteractionActivities:
         cards have no numeric `telegram_message_id`, so this is the only record
         that the card was delivered — the DeliveryWatchdog treats a row with
         BOTH `telegram_message_id` and `delivery_ref` NULL as undelivered.
-        Status-guarded with `AND status='pending'` (same fast-resolve / late-card
-        race guard as `update_interaction_message_id`). Best-effort: the caller
+        Status-guarded with `AND status='pending'` so a fast-resolve / late-card
+        race can't clobber the resolved row. Best-effort: the caller
         retries twice, then logs and continues."""
         async with self._pool.acquire() as conn:
             await conn.execute(

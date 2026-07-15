@@ -1,9 +1,9 @@
-"""BYO Slack config — bot/app tokens + signing secret (encrypted) + channel,
+"""BYO Slack config — bot/app tokens (encrypted) + channel,
 stored in the settings table and edited from the admin UI.
 
 Slack has no dedicated fields on ``Settings`` today (unlike the LLM backend or
 Todoist), so the env fallback reads ``os.environ`` directly: ``AEGIS_SLACK_BOT_TOKEN``
-/ ``AEGIS_SLACK_APP_TOKEN`` / ``AEGIS_SLACK_SIGNING_SECRET`` / ``AEGIS_CHANNEL``
+/ ``AEGIS_SLACK_APP_TOKEN`` / ``AEGIS_CHANNEL``
 (these match comms' own ``aegis_comms.config`` aliases). DB-first, so existing
 deployments keep working via env until the tokens are set in the UI.
 
@@ -34,7 +34,6 @@ async def resolve_slack_config(pool: Any, settings: Any) -> dict[str, Any]:
     """
     bot_token = ""
     app_token = ""
-    signing_secret = ""
     channel = ""
     try:
         row = await pool.fetchrow("SELECT value FROM settings WHERE key = $1", SETTINGS_KEY)
@@ -42,7 +41,6 @@ async def resolve_slack_config(pool: Any, settings: Any) -> dict[str, Any]:
             v = row["value"]
             bot_token = decrypt_secret(v.get("bot_token_enc"), settings.secret_key)
             app_token = decrypt_secret(v.get("app_token_enc"), settings.secret_key)
-            signing_secret = decrypt_secret(v.get("signing_secret_enc"), settings.secret_key)
             channel = v.get("channel") or ""
     except Exception as exc:  # noqa: BLE001 — fall back to env on any read error
         logger.warning("slack_config_read_failed", error=str(exc)[:200])
@@ -51,8 +49,6 @@ async def resolve_slack_config(pool: Any, settings: Any) -> dict[str, Any]:
         bot_token = os.environ.get("AEGIS_SLACK_BOT_TOKEN", "")
     if not app_token:
         app_token = os.environ.get("AEGIS_SLACK_APP_TOKEN", "")
-    if not signing_secret:
-        signing_secret = os.environ.get("AEGIS_SLACK_SIGNING_SECRET", "")
     if not channel:
         channel = os.environ.get("AEGIS_CHANNEL", "")
 
@@ -60,7 +56,6 @@ async def resolve_slack_config(pool: Any, settings: Any) -> dict[str, Any]:
         "configured": bool(bot_token and app_token),
         "bot_token": bot_token,
         "app_token": app_token,
-        "signing_secret": signing_secret,
         "channel": channel,
     }
 
@@ -71,7 +66,6 @@ async def save_slack_config(
     *,
     bot_token: str | None = None,
     app_token: str | None = None,
-    signing_secret: str | None = None,
     channel: str | None = None,
 ) -> dict[str, Any]:
     """Upsert the Slack config. Write-only fields: ``None`` or ``""`` keeps the
@@ -89,10 +83,6 @@ async def save_slack_config(
     if app_token:
         app_token_enc = encrypt_secret(app_token, settings.secret_key)
 
-    signing_secret_enc = existing.get("signing_secret_enc")
-    if signing_secret:
-        signing_secret_enc = encrypt_secret(signing_secret, settings.secret_key)
-
     new_channel = existing.get("channel")
     if channel:
         new_channel = channel
@@ -100,7 +90,6 @@ async def save_slack_config(
     value = {
         "bot_token_enc": bot_token_enc or {"value": "", "encrypted": False},
         "app_token_enc": app_token_enc or {"value": "", "encrypted": False},
-        "signing_secret_enc": signing_secret_enc or {"value": "", "encrypted": False},
         "channel": new_channel,
     }
     await pool.execute(
@@ -125,7 +114,6 @@ async def slack_config_status(pool: Any, settings: Any) -> dict[str, Any]:
     return {
         "bot_token_set": bool(resolved["bot_token"]),
         "app_token_set": bool(resolved["app_token"]),
-        "signing_secret_set": bool(resolved["signing_secret"]),
         "channel": resolved["channel"] or None,
         "configured": resolved["configured"],
         "source": source,

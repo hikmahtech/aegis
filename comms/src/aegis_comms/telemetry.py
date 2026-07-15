@@ -67,10 +67,7 @@ def setup_telemetry(service_name: str | None = None) -> None:
 def _instrumentors():
     """Return list of (module_path, class_name) — each is independent."""
     base = [
-        ("opentelemetry.instrumentation.asyncpg", "AsyncPGInstrumentor"),
-        ("opentelemetry.instrumentation.redis", "RedisInstrumentor"),
         ("opentelemetry.instrumentation.httpx", "HTTPXClientInstrumentor"),
-        ("opentelemetry.instrumentation.requests", "RequestsInstrumentor"),
         ("opentelemetry.instrumentation.fastapi", "FastAPIInstrumentor"),
     ]
     return base

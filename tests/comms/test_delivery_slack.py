@@ -1,11 +1,4 @@
-"""Tests: Slack deliver endpoint — reply_markup must not crash SlackAdapter.
-
-FIX 1 regression lock: SlackAdapter.send_message and send_document now accept an
-optional reply_markup kwarg (accepted-and-ignored; Slack renders buttons via Block
-Kit send_card).  Before the fix, every non-system delivery under AEGIS_CHANNEL=slack
-raised a TypeError because the /api/deliver/message endpoint always passes
-reply_markup= from the request body.
-"""
+"""Tests: Slack deliver endpoints (message + document) under SlackAdapter."""
 
 from __future__ import annotations
 
@@ -73,8 +66,8 @@ def slack_app(monkeypatch, slack_send_result):
 # ---------------------------------------------------------------------------
 
 
-async def test_slack_deliver_without_reply_markup(slack_app):
-    """Normal delivery (no reply_markup) succeeds under SlackAdapter."""
+async def test_slack_deliver_message(slack_app):
+    """Normal delivery succeeds under SlackAdapter."""
     app, adapter = slack_app
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as client:
@@ -86,44 +79,13 @@ async def test_slack_deliver_without_reply_markup(slack_app):
     assert resp.status_code == 200, resp.text
     body = resp.json()
     assert body["ok"] is True
-
-
-async def test_slack_deliver_with_reply_markup_does_not_crash(slack_app):
-    """Delivery WITH reply_markup must NOT raise TypeError under SlackAdapter.
-
-    This is the regression that FIX 1 addresses: the deliver endpoint always
-    passes reply_markup= to adapter.send_message; before the fix, SlackAdapter
-    rejected the unexpected kwarg and every interaction-card delivery 500'd.
-    """
-    app, adapter = slack_app
-    transport = ASGITransport(app=app)
-    reply_markup = {
-        "inline_keyboard": [[{"text": "Approve", "callback_data": "interaction_approve:abc"}]]
-    }
-    async with AsyncClient(transport=transport, base_url="http://test") as client:
-        resp = await client.post(
-            "/api/deliver/message",
-            json={
-                "text": "Approve the fix?",
-                "agent_id": "pandoras-actor",
-                "reply_markup": reply_markup,
-            },
-            headers={"X-API-Key": "test-key"},
-        )
-    assert resp.status_code == 200, resp.text
-    body = resp.json()
-    assert body["ok"] is True
-    # Slack ignores the keyboard; the message is still sent via chat_postMessage
     adapter._client.chat_postMessage.assert_called_once()
 
 
-async def test_slack_document_deliver_with_reply_markup_does_not_crash(slack_app):
-    """Document delivery WITH reply_markup must NOT raise TypeError under SlackAdapter."""
+async def test_slack_deliver_document(slack_app):
+    """Document delivery uploads via files_upload_v2."""
     app, adapter = slack_app
     transport = ASGITransport(app=app)
-    reply_markup = {
-        "inline_keyboard": [[{"text": "✅ Approve", "callback_data": "task:approve_fix:abc"}]]
-    }
     async with AsyncClient(transport=transport, base_url="http://test") as client:
         resp = await client.post(
             "/api/deliver/document",
@@ -131,7 +93,6 @@ async def test_slack_document_deliver_with_reply_markup_does_not_crash(slack_app
                 "agent_id": "pandoras-actor",
                 "caption": "Investigation complete",
                 "documents": [{"filename": "fix.md", "content": "# Fix\n\nChanged Y"}],
-                "reply_markup": reply_markup,
             },
             headers={"X-API-Key": "test-key"},
         )
@@ -139,7 +100,6 @@ async def test_slack_document_deliver_with_reply_markup_does_not_crash(slack_app
     body = resp.json()
     assert body["ok"] is True
     assert body["count"] == 1
-    # Slack ignores the keyboard; file upload is still called
     adapter._client.files_upload_v2.assert_called_once()
 
 

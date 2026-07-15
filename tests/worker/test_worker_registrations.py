@@ -63,10 +63,8 @@ def test_social_activities_registered():
     names = _activity_names()
     for expected in (
         "find_due_posts",
-        "enqueue_outbox",
         "drain_social_outbox",
         "complete_posted_tasks",
-        "unpublish_task",
         # post_resolve hook executed BY NAME from InteractionFlow — an
         # unregistered hook fails silently at resolve time.
         "apply_social_approval",

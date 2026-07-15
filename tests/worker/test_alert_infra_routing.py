@@ -476,10 +476,6 @@ async def _stub_send_card(
     return {"ok": True, "message_id": 1}
 
 
-@activity.defn(name="update_interaction_message_id")
-async def _stub_update_msg(interaction_id: str, telegram_message_id: int) -> None:
-    pass
-
 
 @activity.defn(name="resolve_interaction")
 async def _stub_resolve_interaction(inp: ResolveInteractionInput) -> ResolveInteractionResult:
@@ -526,7 +522,6 @@ _ALL_FLOW_ACTIVITIES = [
     _stub_record_verdict_to_kg,
     _stub_insert_interaction,
     _stub_send_card,
-    _stub_update_msg,
     _stub_resolve_interaction,
     _stub_apply_timeout,
 ]

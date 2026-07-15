@@ -5,7 +5,6 @@ import ErrorBanner from '../components/ErrorBanner';
 type SlackConfigResponse = {
   bot_token_set: boolean;
   app_token_set: boolean;
-  signing_secret_set: boolean;
   channel: string | null;
   configured: boolean;
   source: 'db' | 'env' | 'none';
@@ -14,7 +13,6 @@ type SlackConfigResponse = {
 export default function SlackConfig() {
   const [botToken, setBotToken] = useState('');
   const [appToken, setAppToken] = useState('');
-  const [signingSecret, setSigningSecret] = useState('');
   const [channel, setChannel] = useState('');
   const [status, setStatus] = useState<SlackConfigResponse | null>(null);
   const [error, setError] = useState<Error | null>(null);
@@ -28,7 +26,6 @@ export default function SlackConfig() {
       setChannel(s.channel || '');
       setBotToken('');
       setAppToken('');
-      setSigningSecret('');
     } catch (e: any) { setError(e); }
   }
   useEffect(() => { load(); /* eslint-disable-next-line */ }, []);
@@ -39,7 +36,6 @@ export default function SlackConfig() {
       const body: any = {};
       if (botToken) body.bot_token = botToken;
       if (appToken) body.app_token = appToken;
-      if (signingSecret) body.signing_secret = signingSecret;
       if (channel) body.channel = channel;
       await api.saveSlackConfig(body);
       setMsg('Saved.');
@@ -66,11 +62,6 @@ export default function SlackConfig() {
           <span className="cfg-label">App token</span>
           <input type="password" value={appToken} onChange={e => setAppToken(e.target.value)}
             placeholder={status?.app_token_set ? '•••••••• (set — leave blank to keep)' : 'not set'} />
-        </div>
-        <div className="cfg-row">
-          <span className="cfg-label">Signing secret</span>
-          <input type="password" value={signingSecret} onChange={e => setSigningSecret(e.target.value)}
-            placeholder={status?.signing_secret_set ? '•••••••• (set — leave blank to keep)' : 'not set'} />
         </div>
         <div className="cfg-row">
           <span className="cfg-label">Channel</span>

@@ -188,10 +188,6 @@ async def test_clarify_flow_spawns_interaction_when_payload_returned() -> None:
         async def send_interaction_card(*a, **kw):
             return {"ok": True, "message_id": 0}
 
-        @activity.defn(name="update_interaction_message_id")
-        async def update_interaction_message_id(*a, **kw):
-            return None
-
         @activity.defn(name="resolve_interaction")
         async def resolve_interaction(input):
             return {"already_resolved": False}
@@ -257,7 +253,6 @@ async def test_clarify_flow_spawns_interaction_when_payload_returned() -> None:
                 log_classification,
                 insert_interaction,
                 send_interaction_card,
-                update_interaction_message_id,
                 resolve_interaction,
                 apply_interaction_timeout,
             ],
@@ -296,10 +291,6 @@ async def test_clarify_flow_no_spawn_when_applied_true() -> None:
         @activity.defn(name="send_interaction_card")
         async def send_card(*a, **kw):
             return {"ok": True, "message_id": 0}
-
-        @activity.defn(name="update_interaction_message_id")
-        async def update_msg(*a, **kw):
-            return None
 
         @activity.defn(name="resolve_interaction")
         async def resolve(*a, **kw):
@@ -360,7 +351,6 @@ async def test_clarify_flow_no_spawn_when_applied_true() -> None:
                 log,
                 insert_interaction,
                 send_card,
-                update_msg,
                 resolve,
                 timeout,
             ],

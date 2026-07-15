@@ -100,17 +100,13 @@ class DeliveryActivities:
         return self._client
 
     @activity.defn
-    async def send_message(
-        self, agent_id: str, message: str, chat_id: int = 0, keyboard: dict | None = None
-    ) -> dict:
+    async def send_message(self, agent_id: str, message: str, chat_id: int = 0) -> dict:
         """Send a message to an agent's channel."""
         if not self.comms_url:
             activity.logger.warning("comms_url_not_configured")
             return {"ok": False, "error": "comms_url not configured"}
 
-        body: dict = {"text": message, "chat_id": chat_id, "agent_id": agent_id}
-        if keyboard:
-            body["reply_markup"] = keyboard
+        body: dict = {"text": message, "agent_id": agent_id}
 
         client = self._ensure_client()
         resp = await client.post("/api/deliver/message", json=body)
@@ -138,37 +134,6 @@ class DeliveryActivities:
         except Exception as exc:  # noqa: BLE001 — voice is additive, never fatal
             activity.logger.warning("send_voice_failed: %s", str(exc)[:200])
             return {"ok": False, "error": str(exc)[:200]}
-
-    @activity.defn
-    async def send_document(
-        self,
-        agent_id: str,
-        documents: list[dict],
-        caption: str = "",
-        chat_id: int = 0,
-        keyboard: dict | None = None,
-    ) -> dict:
-        """Send one or more markdown document attachments to an agent's topic.
-
-        Each document dict must have keys: filename, content.
-        Caption and keyboard (inline buttons) attach to the first document only.
-        """
-        if not self.comms_url:
-            activity.logger.warning("comms_url_not_configured")
-            return {"ok": False, "error": "comms_url not configured"}
-
-        body: dict = {
-            "documents": documents,
-            "caption": caption,
-            "chat_id": chat_id,
-            "agent_id": agent_id,
-        }
-        if keyboard:
-            body["reply_markup"] = keyboard
-
-        client = self._ensure_client()
-        resp = await client.post("/api/deliver/document", json=body)
-        return resp.json()
 
     @activity.defn
     async def send_system_event(self, message: str, chat_id: int = 0) -> dict:

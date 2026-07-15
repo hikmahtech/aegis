@@ -1311,7 +1311,7 @@ class ToolContext:
 _INFRA_CONTEXTS_SWARM = {"swarm"}
 # k8s "context" names that exist on the remote script host (the host that
 # runs scripts/infra/*.sh + the argocd CLI), read once at import from
-# AEGIS_SCRIPT_HOST_K8S_CONTEXTS (mirrors Settings.script_host_k8s_contexts).
+# AEGIS_SCRIPT_HOST_K8S_CONTEXTS.
 # Blank ⇒ empty set: script-host k8s/argocd tools then have no valid context
 # and pod/deployment/log ops resolve only via registered kind=k8s infra
 # entries (by slug). Read via os.getenv rather than Settings() so importing

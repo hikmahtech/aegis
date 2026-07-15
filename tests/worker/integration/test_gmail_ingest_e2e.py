@@ -206,11 +206,6 @@ async def _stub_card(
     return {"ok": True, "message_id": 99}
 
 
-@activity.defn(name="update_interaction_message_id")
-async def _stub_update_msg(iid: str, mid: int) -> None:
-    pass
-
-
 @activity.defn(name="insert_interaction")
 async def _stub_insert(inp: InsertInteractionInput) -> InsertInteractionResult:
     _E2E_INSERT_IA.append((inp.kind, inp.origin, inp.prompt[:60]))
@@ -332,7 +327,6 @@ async def test_gmail_ingest_e2e(e2e_channels, token_dir, db_pool, monkeypatch):
         channel_act.ingest_idempotency_claim,
         _stub_delivery,
         _stub_card,
-        _stub_update_msg,
         _stub_insert,
         _stub_resolve,
         _stub_timeout,
@@ -455,7 +449,6 @@ async def test_gmail_ingest_e2e_idempotent_rerun(e2e_channels, token_dir, db_poo
         channel_act.ingest_idempotency_claim,
         _stub_delivery,
         _stub_card,
-        _stub_update_msg,
         _stub_insert,
         _stub_resolve,
         _stub_timeout,

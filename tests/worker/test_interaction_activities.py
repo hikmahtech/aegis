@@ -245,46 +245,6 @@ async def test_insert_interaction_stores_timeout_at(activities, db_pool):
     assert row["timeout_at"] == deadline
 
 
-async def test_update_message_id_skips_resolved_row(activities, db_pool):
-    """The best-effort bridge must NOT overwrite telegram_message_id once the
-    row has resolved — guards against a fast-resolve / late-card race
-    clobbering the message the user actually saw."""
-    env = ActivityEnvironment()
-    inserted = await env.run(
-        activities.insert_interaction,
-        InsertInteractionInput(
-            flow_run_id="run-msg-guard",
-            agent_id="sebas",
-            kind="approval",
-            origin="t",
-            prompt="x",
-            options=None,
-            timeout_policy="archive",
-            timeout_at=None,
-        ),
-    )
-    # Resolve the row first
-    await env.run(
-        activities.resolve_interaction,
-        ResolveInteractionInput(
-            interaction_id=inserted.interaction_id, response={"v": 1}
-        ),
-    )
-    # Now attempt the bridge write — must be a no-op
-    await env.run(
-        activities.update_interaction_message_id,
-        inserted.interaction_id,
-        9999,
-    )
-    async with db_pool.acquire() as conn:
-        row = await conn.fetchrow(
-            "SELECT telegram_message_id, status FROM interactions WHERE id = $1",
-            UUID(inserted.interaction_id),
-        )
-    assert row["status"] == "resolved"
-    assert row["telegram_message_id"] is None
-
-
 async def test_update_delivery_ref_writes_and_skips_resolved(activities, db_pool):
     """update_interaction_delivery_ref persists the channel-neutral ref on a
     pending row (Slack delivery has no numeric message_id), and — like the

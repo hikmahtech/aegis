@@ -40,7 +40,6 @@ class BriefingActivities:
     api_key: str = ""
     frame_model: str = "gpt-oss:20b"
 
-    @activity.defn
     async def gather_calendar_events(self) -> dict:
         """Read calendar events from settings KV (populated by n8n Calendar Fetcher)."""
         if not self.db_pool:
@@ -104,7 +103,6 @@ class BriefingActivities:
             return ""
         return "<b>Markets</b>\n" + "\n".join(lines)
 
-    @activity.defn
     async def gather_intelligence_summary(self, hours: int = 24) -> list[dict]:
         """Gather recent intelligence items for the daily briefing.
 
@@ -144,7 +142,6 @@ class BriefingActivities:
             filtered.append(r)
         return filtered
 
-    @activity.defn
     async def gather_references_filed(self, hours: int = 24) -> list[dict]:
         """Return references filed into KS in the last `hours`.
 

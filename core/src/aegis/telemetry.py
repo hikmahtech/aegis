@@ -68,7 +68,6 @@ def _instrumentors():
     """Return list of (module_path, class_name) — each is independent."""
     base = [
         ("opentelemetry.instrumentation.asyncpg", "AsyncPGInstrumentor"),
-        ("opentelemetry.instrumentation.redis", "RedisInstrumentor"),
         ("opentelemetry.instrumentation.httpx", "HTTPXClientInstrumentor"),
         ("opentelemetry.instrumentation.requests", "RequestsInstrumentor"),
         # FastAPI is present in core (and comms); absent in worker. Import is

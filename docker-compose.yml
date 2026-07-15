@@ -1,5 +1,5 @@
 # AEGIS v2 — Full Stack
-# Dev infra:  docker compose up -d postgres redis temporal temporal-ui
+# Dev infra:  docker compose up -d postgres temporal temporal-ui
 # Full stack: docker compose up -d
 
 services:
@@ -100,21 +100,6 @@ services:
       retries: 5
     networks: [aegis-net]
 
-  redis:
-    image: redis:7-alpine
-    container_name: aegis-redis
-    command: redis-server --appendonly yes
-    volumes:
-      - redis-data:/data
-    ports:
-      - "26379:6379"
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 5s
-      timeout: 3s
-      retries: 5
-    networks: [aegis-net]
-
   temporal:
     image: temporalio/auto-setup:latest
     container_name: aegis-temporal
@@ -155,7 +140,6 @@ services:
 
 volumes:
   postgres-data:
-  redis-data:
   ollama-data:
 
 networks:

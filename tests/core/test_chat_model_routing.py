@@ -2,18 +2,15 @@
 
 from __future__ import annotations
 
-from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from aegis.llm.tier import load_model_tiers, resolve_model_for_agent
+from aegis.llm.tier import resolve_model_for_agent, set_model_tiers
 
 
 @pytest.fixture(autouse=True)
-def _load_tiers(tmp_path: Path) -> None:
-    yml = tmp_path / "models.yaml"
-    yml.write_text("tiers:\n  fast: gemma4:e2b\n  balanced: qwen3:14b\n  smart: qwen3:32b\n")
-    load_model_tiers(yml)
+def _load_tiers() -> None:
+    set_model_tiers({"fast": "gemma4:e2b", "balanced": "qwen3:14b", "smart": "qwen3:32b"})
 
 
 @pytest.mark.asyncio

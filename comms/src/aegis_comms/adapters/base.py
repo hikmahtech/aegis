@@ -55,5 +55,4 @@ class CardSpec:
     kind: str  # approval|choice|ack|input|draft_review
     prompt: str
     options: dict[str, Any] | None
-    target: dict[str, Any] | None = None  # {chat_id,topic_id} | {channel}
     allow_hint: bool = False

@@ -65,7 +65,6 @@ async def test_card_endpoint_builds_cardspec(app, fake_adapter, monkeypatch):
     assert spec.kind == "approval"
     assert spec.prompt == "Reply to proceed"
     assert spec.options is None
-    assert spec.target is None
 
 
 async def test_card_endpoint_requires_auth(app):
