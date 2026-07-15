@@ -182,11 +182,26 @@ class GmailIngestFlow:
                     retry_policy=ACT_RETRY,
                 )
 
+            # Feedback loop (#74): score recent unscored predictions against
+            # the emails' CURRENT Gmail labels. Runs even on quiet inboxes —
+            # corrections come from old emails, not new ones. Fire-and-forget.
+            triage_recheck: dict = {}
+            try:
+                triage_recheck = await workflow.execute_activity(
+                    "recheck_triage_outcomes",
+                    args=[label],
+                    start_to_close_timeout=_ACT_TIMEOUT,
+                    retry_policy=NO_RETRY,
+                )
+            except Exception:
+                workflow.logger.warning("recheck_triage_outcomes_skipped account=%s", label)
+
             per_account.append(
                 {
                     "account": label,
                     "processed": processed_here,
                     "fetched": len(fetched.messages),
+                    "triage_recheck": triage_recheck,
                 }
             )
 

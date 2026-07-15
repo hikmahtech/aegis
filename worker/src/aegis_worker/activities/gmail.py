@@ -222,11 +222,12 @@ _TRIAGE_IMPORTANT = {"important_action", "important_read"}
 
 
 def assess_triage_correction(predicted: str, labels: list[str]) -> str | None:
-    """Compare AEGIS's prediction to the email's CURRENT Gmail labels on a
-    re-observation, returning the user's correction signal or None.
+    """Compare AEGIS's prediction to the email's CURRENT Gmail labels,
+    returning the user's correction signal or None.
 
-    AEGIS re-fetches by `after:` timestamp, so an email it already actioned is
-    re-seen with whatever the user has since done to it:
+    The ingest fetch (`is:unread` + forward cursor) never re-observes an
+    actioned email, so recheck_triage_outcomes re-reads labels explicitly
+    (#74) and sees whatever the user has since done to the email:
       - predicted unimportant (AEGIS marked READ, no IMPORTANT) but the user
         added IMPORTANT or STARRED → mis-triaged → "important".
       - predicted important (AEGIS added IMPORTANT, kept unread) but the user
@@ -522,6 +523,105 @@ class GmailActivities:
                 "record_triage_outcome_failed email_id=%s err=%s", email_id, str(exc)[:200]
             )
             return {"recorded": False, "outcome": "error"}
+
+    @activity.defn
+    async def recheck_triage_outcomes(self, account_label: str, limit: int = 50) -> dict:
+        """Close the triage feedback loop (#74): score unscored predictions
+        against the email's CURRENT Gmail labels.
+
+        record_triage_outcome's correction branch assumed actioned emails get
+        re-observed by the ingest fetch — false in practice (`is:unread` + a
+        forward-moving `after:` cursor), so predictions never got an `actual`.
+        This actively re-reads labels for unscored predictions 1h–7d old
+        (round-robin via last_checked_at so every row cycles within the window):
+          - labels contradict the prediction → actual + corrected_by='user_gmail'
+          - consistent → stamp last_checked_at and keep cycling
+          - unscored rows past the 7d window that were checked at least once →
+            silence is agreement: actual = predicted, corrected_by='implicit'.
+        Rows never successfully observed (deleted mail, or another account's —
+        predictions don't record their account) stay NULL rather than lie.
+        Fire-and-forget: never raises.
+        """
+        empty = {"checked": 0, "corrected": 0, "confirmed": 0}
+        if not self.db_pool:
+            return empty
+        try:
+            rows = await self.db_pool.fetch(
+                "SELECT id, email_id, predicted FROM triage_accuracy "
+                "WHERE actual IS NULL "
+                "  AND created_at > now() - interval '7 days' "
+                "  AND created_at < now() - interval '1 hour' "
+                "ORDER BY last_checked_at ASC NULLS FIRST, created_at ASC LIMIT $1",
+                limit,
+            )
+            checked = corrected = 0
+            if rows:
+                token_path = Path(self.gmail_token_dir) / f"{account_label}.json"
+
+                def _sync_labels() -> dict[str, list[str] | None]:
+                    svc = _build_gmail_service(self.gmail_credentials_file, token_path)
+                    out: dict[str, list[str] | None] = {}
+                    for r in rows:
+                        try:
+                            m = (
+                                svc.users()
+                                .messages()
+                                .get(userId="me", id=r["email_id"], format="minimal")
+                                .execute()
+                            )
+                            # System labels (IMPORTANT/STARRED/UNREAD) have
+                            # id == name, so labelIds feed assess directly.
+                            out[r["email_id"]] = m.get("labelIds") or []
+                        except Exception:  # noqa: BLE001 — gone/foreign message
+                            out[r["email_id"]] = None
+                    return out
+
+                labels_by_id = await asyncio.to_thread(_sync_labels)
+                for r in rows:
+                    labels = labels_by_id.get(r["email_id"])
+                    if labels is None:
+                        # ponytail: unobservable rows (deleted mail / another
+                        # account's) keep queue-front priority until they age
+                        # out of the 7d window; >limit of them per account
+                        # would starve a run. Track-per-account is the upgrade
+                        # path if that ever happens.
+                        continue
+                    checked += 1
+                    correction = assess_triage_correction(r["predicted"], labels)
+                    if correction:
+                        corrected += 1
+                        await self.db_pool.execute(
+                            "UPDATE triage_accuracy SET actual=$2, "
+                            "corrected_by='user_gmail', last_checked_at=now() WHERE id=$1",
+                            r["id"],
+                            correction,
+                        )
+                    else:
+                        await self.db_pool.execute(
+                            "UPDATE triage_accuracy SET last_checked_at=now() WHERE id=$1",
+                            r["id"],
+                        )
+            result = await self.db_pool.execute(
+                "UPDATE triage_accuracy SET actual=predicted, corrected_by='implicit' "
+                "WHERE actual IS NULL "
+                "  AND created_at <= now() - interval '7 days' "
+                "  AND last_checked_at IS NOT NULL"
+            )
+            confirmed = int(result.split()[-1])
+            if checked or confirmed:
+                activity.logger.info(
+                    "recheck_triage_outcomes account=%s checked=%d corrected=%d confirmed=%d",
+                    account_label,
+                    checked,
+                    corrected,
+                    confirmed,
+                )
+            return {"checked": checked, "corrected": corrected, "confirmed": confirmed}
+        except Exception as exc:  # noqa: BLE001 — feedback must never block ingest
+            activity.logger.warning(
+                "recheck_triage_outcomes_failed account=%s err=%s", account_label, str(exc)[:200]
+            )
+            return empty
 
     @activity.defn
     async def ingest_email_to_kg(
