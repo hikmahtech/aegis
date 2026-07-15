@@ -12,7 +12,6 @@ This document is the canonical reference for what the running system does today.
 | Worker | `aegis-worker` | — | Temporal workflows (28 flows), activities, schedule sync |
 | Comms | `aegis-comms` | 8081 | Channel adapter — **Slack** (Socket Mode); FastAPI delivery server + interaction cards. Core reaches it via `AEGIS_COMMS_URL`; idles as a no-op until Slack is configured |
 | Postgres | pgvector/pg16 | 25432 | Primary database (migrations 001 → 008) |
-| Redis | redis:7-alpine | 26379 | Caching, rate limiting |
 | Temporal | auto-setup | 7233 | Workflow orchestration (task queue `aegis-main`) |
 | Temporal UI | temporalio/ui | 8233 | Workflow debugging |
 | Ollama | `--profile local-llm` | 11434 | Optional bundled local model server (point the LLM backend at it for fully-local) |
@@ -268,7 +267,7 @@ The `activities` table drives Temporal schedules. Worker on startup queries acti
 | `chat_tool_calls` | Every tool call during a chat turn |
 | `workflow_runs` | Temporal workflow start / complete / fail via `WorkflowRunRecorderInterceptor` |
 
-Distributed tracing: OTel SDK + JSON-formatted logs with `trace_id`/`span_id` injected from the active span. Per-package `telemetry.py` + `logging_config.py` modules. Gated on `OTEL_ENABLED=true`. Auto-instrumentation covers FastAPI, asyncpg, redis, httpx, requests. The Worker registers `temporalio.contrib.opentelemetry.TracingInterceptor` so trace context flows through workflow headers automatically.
+Distributed tracing: OTel SDK + JSON-formatted logs with `trace_id`/`span_id` injected from the active span. Per-package `telemetry.py` + `logging_config.py` modules. Gated on `OTEL_ENABLED=true`. Auto-instrumentation covers FastAPI, asyncpg, httpx, requests. The Worker registers `temporalio.contrib.opentelemetry.TracingInterceptor` so trace context flows through workflow headers automatically.
 
 ## Knowledge (native RAG)
 

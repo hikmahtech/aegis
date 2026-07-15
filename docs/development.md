@@ -14,7 +14,7 @@ python -m venv .venv && source .venv/bin/activate
 pip install -e "core[dev]" -e "worker[dev]" -e "comms[dev]"
 
 # 2. Start infrastructure
-docker compose up -d postgres redis temporal temporal-ui
+docker compose up -d postgres temporal temporal-ui
 
 # 3. Start Core API (runs migrations + serves admin panel)
 python -m aegis
