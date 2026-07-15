@@ -115,10 +115,14 @@ class SocialPublishFlow:
                 non_retryable=True,
             ) from exc
 
+        # NOTE: happy-path posts happen in the approval card's post_resolve
+        # (InteractionFlow), not here — drain_social_outbox is only the retry
+        # net, so its count is ~always 0 while real posts still flow. The keys
+        # say so explicitly; `completed` reflects tasks closed for posted rows.
         return {
             "due": len(due),
             "carded": carded,
-            "posted": drained.get("posted", 0),
-            "post_failed": drained.get("failed", 0),
+            "drain_posted": drained.get("posted", 0),
+            "drain_failed": drained.get("failed", 0),
             "completed": completed.get("completed", 0),
         }
