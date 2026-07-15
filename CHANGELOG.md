@@ -6,6 +6,37 @@ to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **Learning-loop input on Slack cards** (#71): approval/choice/ack interaction
+  cards carry an optional "Why?" free-text input; a note typed with a button
+  tap lands as `response.note` and becomes a durable `agent_memory` lesson.
+- **Per-tool chat executor timeouts** (#73): `_TOOL_TIMEOUT_OVERRIDES` in
+  `services/chat.py` lets long-running tools exceed the 30s default —
+  `aegis_self_diagnose` (remote coding-CLI run, up to 8 min) could previously
+  never complete and each retry orphaned another run on the coding host.
+
+### Changed
+
+- **`schedule_sync` converges** (#72, fixes #11): schedules are rewritten only
+  when their config fingerprint changes (embedded in the action id
+  `scheduled-<slug>--v<fp>`), instead of unconditionally every ~5-min tick.
+- Default `smart` tier example points at a tool-calling-capable proxy alias
+  (`claude-sonnet-5`); receipt extraction (`MoneyActivities.extract_model`) now
+  runs on the smart tier instead of the fast local model (#69).
+- Gmail classification token budget raised 768 → 2048 (reasoning-token
+  truncation) (#69).
+- `SocialPublishFlow` summary keys renamed `posted`/`post_failed` →
+  `drain_posted`/`drain_failed` — the flow's drain step is only the retry net,
+  so the old key read as "nothing posted" while approval-path posts flowed (#69).
+
+### Fixed
+
+- **Google Calendar 410 poison loop** (#69): a quiet calendar's cursor
+  (max event `updated`) ages past Google's `updatedMin` horizon and every daily
+  fetch 410s without advancing it. On 410 the fetch now retries the full window
+  and bumps the cursor to fetch time.
+
 ## [0.1.0] — 2026-07-10
 
 First public release. AEGIS has been running as the maintainer's private

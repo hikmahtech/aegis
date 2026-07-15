@@ -136,7 +136,7 @@ Owner-scheduled flows are listed in the Personalities table above. The remaining
 - `DailyReviewFlow` / `WeeklyReviewFlow` (Sebas) — daily + weekly digests; logs to `review_digest_log`, spawns acknowledgement InteractionFlow.
 - `MemoryReflectionFlow` (Sebas, nightly) — per-agent memory consolidation: caps `agent_memory` (prunes oldest/lowest-importance beyond `keep`).
 - `DriveSyncFlow` (Raphael) — incremental ingest of a tracked Google Drive folder into the knowledge store; no-ops until a folder is configured.
-- `DeliveryWatchdogFlow` (Pandora's Actor, 15-min) — catches interaction cards that were never delivered and checks comms `/api/health` inbound liveness; on outage captures a Todoist Inbox task (the chat channel is the thing that's down).
+- `DeliveryWatchdogFlow` (Pandora's Actor, hourly) — catches interaction cards that were never delivered and checks comms `/api/health` inbound liveness; on outage captures a Todoist Inbox task (the chat channel is the thing that's down).
 - `WorkspaceRepoSyncFlow` (Pandora's Actor, daily) — scans the coding host's workspace for git checkouts and makes the `resources` table mirror it (one `kind='repository'` row per checkout).
 - `VercelProjectSyncFlow` (Pandora's Actor, daily) — mirrors Vercel personal + team projects into `resources` (`kind='vercel_project'`), linking GitHub repos for alert investigations.
 - `MoneyProcessFlow` (Maou, child) — single-email money hygiene: `store_receipt_email` → `load_receipts` → `classify_and_extract` → `upsert_charges`. Spawned by `GmailIngestFlow` on `financial`/`payments` tags and by the weekly `ReceiptIngestFlow` safety-net. `ParentClosePolicy.ABANDON`; idempotent on `message_id` at the `store_receipt_email` step.
@@ -188,7 +188,7 @@ When a `todoist_task_id` is on the alert (pandora APP-<n>: clarify path), the fl
 
 `POST /api/chat` (non-streaming) and `POST /api/chat/stream` (SSE). 42 tools in `CHAT_TOOLS`, gated per-personality via `AGENT_TOOL_SETS` in `core/src/aegis/services/chat.py`.
 
-Tool loop: max iterations bounded by the service config; per-tool timeout via `asyncio.wait_for`; result truncation per `max_bytes`. Every tool call recorded to `chat_tool_calls`.
+Tool loop: max iterations bounded by the service config; per-tool timeout via `asyncio.wait_for` (default `tool_timeout_seconds`, with per-tool overrides in `_TOOL_TIMEOUT_OVERRIDES` for long-running tools like `aegis_self_diagnose`); result truncation per `max_bytes`. Every tool call recorded to `chat_tool_calls`.
 
 Per-personality tool counts (authoritative — counted from `AGENT_TOOL_SETS`):
 
@@ -223,6 +223,7 @@ Slack Socket Mode (`slack_sdk`) + FastAPI delivery server (port 8081). One Slack
 - Agent→channel mapping populated from `agents.slack_channel_id` (falls back to resolving `#aegis-<short>` by name).
 - Message bodies are authored in a light HTML dialect and converted to Slack mrkdwn (`html_to_mrkdwn`); all user-controlled strings pass through `_safe()` (`html.escape()`).
 - Interaction cards render as Block Kit with the uniform callback identity `interaction:{id}:{value}` — resolved by `/api/interactions/{id}/resolve`. Comment-channel reply callbacks use a separate `agent-chat-reply-…` workflow id namespace.
+- Approval/choice/ack cards also carry an optional free-text note input (`correction_note`). Slack includes the message's input state with every button tap, so a typed note rides along as `response.note` — which core records as a durable `agent_memory` lesson (the learning loop).
 - The delivery server exposes `/api/deliver/message`, `/api/deliver/document`, `/api/deliver/voice`, `/api/deliver/card`, `/api/comms/delete` and `/api/health` (inbound Socket Mode liveness).
 
 ## Database

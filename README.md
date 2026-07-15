@@ -33,9 +33,9 @@ extra horsepower.
 - **Human-in-the-loop, budgeted.** When an agent needs a decision it sends a
   card to your chat channel; you Approve / Edit / Reject. A daily
   **notification budget** keeps proactive pings from becoming noise.
-- **Memory that learns.** When you correct an agent (resolve a card with a
-  reason), that correction becomes a durable lesson surfaced in the agent's
-  next prompt.
+- **Memory that learns.** Every decision card carries an optional "Why?" note
+  field — type a reason along with your tap and the correction becomes a
+  durable lesson surfaced in that agent's next prompt.
 - **Your knowledge, local.** A native Postgres + pgvector RAG store. Seed it
   from URLs, uploads, server folders, or a watched Drive folder. Embeddings run
   on a free local model — no per-token cost.

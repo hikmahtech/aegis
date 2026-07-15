@@ -5,7 +5,7 @@
 tiers:
   fast:     "gemma4:e2b"              # quick chat, tight-loop classification
   balanced: "gpt-oss:20b"             # default chat + most flows (qwen3:14b retired)
-  smart:    "claude-sonnet-5"         # LiteLLM proxy alias (anthropic/claude-sonnet-5 via API key — tool-calling capable, unlike the max-proxy bridge aliases)
+  smart:    "claude-sonnet-5"         # LiteLLM proxy alias — point at a strong, tool-calling-capable model (e.g. anthropic/claude-sonnet-5); chat tool-calling needs the alias to pass tools through
 
 litellm:
   # base_url is set by env: AEGIS_LITELLM_URL
