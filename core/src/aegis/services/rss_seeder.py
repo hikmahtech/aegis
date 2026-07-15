@@ -10,12 +10,16 @@ import structlog
 logger = structlog.get_logger()
 
 
-async def seed_rss_from_miniflux(pool: Any, miniflux_url: str, miniflux_api_key: str) -> int:
+async def seed_rss_from_miniflux(pool: Any, settings: Any) -> int:
     """Fetch feeds from Miniflux, upsert into channels.
 
     Returns number of rows upserted. Safe to call on every startup — idempotent.
     If miniflux_url is empty or Miniflux is unreachable, logs and returns 0.
     """
+    from aegis.services.connector_health import record_connector_health
+
+    miniflux_url = settings.miniflux_url
+    miniflux_api_key = settings.miniflux_api_key
     if not miniflux_url:
         logger.info("miniflux_url_not_configured", detail="skipping RSS seed from Miniflux")
         return 0
@@ -32,7 +36,14 @@ async def seed_rss_from_miniflux(pool: Any, miniflux_url: str, miniflux_api_key:
             feeds = resp.json()
     except Exception as exc:
         logger.warning("miniflux_fetch_failed", error=str(exc)[:300])
+        # Boot-time fetch — threshold=1: the next retry is a restart away,
+        # and the alerted flag stops a repeat alert on every boot (#76).
+        await record_connector_health(
+            pool, settings, "miniflux", ok=False, error=str(exc)[:300], threshold=1
+        )
         return 0
+
+    await record_connector_health(pool, settings, "miniflux", ok=True)
 
     # RSS ingest is owned by whichever agent holds the `research` behavior tag
     # (issue #36), not a literal id. Falls back to "raphael" (the seed research
