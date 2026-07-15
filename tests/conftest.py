@@ -12,18 +12,20 @@ from aegis.config import Settings
 # database on it (below) — never the long-lived `aegis` dev database.
 _PG_SERVER = "postgresql://aegis:aegis_dev@localhost:25432"
 _TEST_DB = "aegis_test"
-_MIGRATIONS_DIR = Path(__file__).resolve().parent.parent / "migrations"
+_REPO_ROOT = Path(__file__).resolve().parent.parent
 
 
 @pytest.fixture(scope="session")
 def test_db_url() -> str | None:
-    """URL of a freshly-created, freshly-migrated session-scoped test database.
+    """URL of a freshly-created, freshly-migrated + seeded session-scoped
+    test database.
 
     `TEST_DATABASE_URL` overrides everything (caller-managed: no drop/create,
-    no migrate). Otherwise `aegis_test` is dropped, recreated, and migrated
-    from this checkout's migrations/ once per session — sharing the dev
-    `aegis` database broke the suite whenever a parallel branch applied a
-    divergent migration to it (e.g. the maou→finance schema rename).
+    no migrate). Otherwise `aegis_test` is dropped, recreated, migrated from
+    this checkout's migrations/, and seeded from config/seed/ (same as core
+    boot) once per session — sharing the dev `aegis` database broke the suite
+    whenever a parallel branch applied a divergent migration to it (e.g. the
+    maou→finance schema rename).
 
     Returns None when no Postgres is reachable; db_pool fixtures then skip.
     """
@@ -34,6 +36,7 @@ def test_db_url() -> str | None:
     async def _prepare() -> str:
         import asyncpg
         from aegis.db import create_pool, run_migrations
+        from aegis.seed import load_seeds
 
         admin = await asyncpg.connect(f"{_PG_SERVER}/aegis")
         try:
@@ -44,7 +47,8 @@ def test_db_url() -> str | None:
         url = f"{_PG_SERVER}/{_TEST_DB}"
         pool = await create_pool(url, min_size=1, max_size=2)
         try:
-            await run_migrations(pool, _MIGRATIONS_DIR)
+            await run_migrations(pool, _REPO_ROOT / "migrations")
+            await load_seeds(pool, _REPO_ROOT / "config" / "seed")
         finally:
             await pool.close()
         return url
