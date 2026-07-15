@@ -280,6 +280,8 @@ async def sync_schedules(
     settings.homelab_public_domains so a freshly-seeded activity row with
     an empty config still probes the right domains.
     """
+    import dataclasses
+    import hashlib
     import json
 
     # Fetch active activities with cron schedules (v3 schema)
@@ -347,20 +349,41 @@ async def sync_schedules(
         schedule_id = act_name
         expected_ids.add(schedule_id)
 
+        # Fingerprint of everything the schedule is built from, embedded in
+        # the action's workflow-id prefix. describe() hands that prefix back,
+        # so an unchanged schedule is skipped instead of rewritten — before
+        # this, every ~5-min tick rewrote all schedules unconditionally
+        # (issue #11: schedule_updated log spam + Temporal history churn).
+        fp = hashlib.sha1(
+            json.dumps(
+                {
+                    "cron": cron,
+                    "wf": workflow_cls.__name__,
+                    "cfg": dataclasses.asdict(flow_config),
+                },
+                sort_keys=True,
+                default=str,
+            ).encode()
+        ).hexdigest()[:10]
+        action_id = f"scheduled-{schedule_id}--v{fp}"
+
         schedule = Schedule(
             action=ScheduleActionStartWorkflow(
                 workflow_cls.run,
                 args=[flow_config],
                 task_queue=task_queue,
-                id=f"scheduled-{schedule_id}",
+                id=action_id,
             ),
             spec=ScheduleSpec(cron_expressions=[cron]),
         )
 
         try:
-            # Try to update existing schedule
+            # Try to update existing schedule — skip when nothing changed.
             handle = client.get_schedule_handle(schedule_id)
-            await handle.describe()
+            desc = await handle.describe()
+            if getattr(desc.schedule.action, "id", None) == action_id:
+                registered += 1
+                continue
 
             async def _updater(_input: ScheduleUpdateInput, s=schedule) -> ScheduleUpdate:
                 return ScheduleUpdate(schedule=s)
