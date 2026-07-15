@@ -1603,6 +1603,15 @@ _AEGIS_SELF_DIAGNOSE_MAX_WAIT = 480  # 8 minutes; leaves headroom under synthesi
 _AEGIS_SELF_DIAGNOSE_POLL = 15  # poll interval in seconds
 _AEGIS_SELF_DIAGNOSE_OUTPUT_CAP = 8 * 1024  # last N chars returned to the LLM
 
+# Per-tool executor-timeout overrides (seconds). The default chat tool timeout
+# (settings.tool_timeout_seconds, 30s) guillotines legitimately long-running
+# tools: aegis_self_diagnose waits on a remote coding-CLI run for up to
+# _AEGIS_SELF_DIAGNOSE_MAX_WAIT, so it could NEVER finish inside 30s — and each
+# LLM retry then orphaned another kimi run on the coding host.
+_TOOL_TIMEOUT_OVERRIDES: dict[str, int] = {
+    "aegis_self_diagnose": _AEGIS_SELF_DIAGNOSE_MAX_WAIT + 60,
+}
+
 
 def _slugify_issue(text: str, max_len: int = 32) -> str:
     """Stable slug for `aegis-fix/<slug>` branch names. Lowercase a-z0-9-, capped."""
@@ -4030,7 +4039,7 @@ async def send_message(
                 ) -> str:
                     return await asyncio.wait_for(
                         _execute_tool(_pool, _name, _args, _ctx),
-                        timeout=timeout,
+                        timeout=_TOOL_TIMEOUT_OVERRIDES.get(_name, timeout),
                     )
 
                 try:
