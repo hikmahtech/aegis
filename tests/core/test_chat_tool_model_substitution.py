@@ -14,12 +14,11 @@ substitute the model with `_TOOL_FALLBACK_MODEL` (qwen3:14b, which has
 
 from __future__ import annotations
 
-from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from aegis.config import Settings
-from aegis.llm.tier import load_model_tiers
+from aegis.llm.tier import set_model_tiers
 from aegis.services.chat import (
     _TOOL_FALLBACK_MODEL,
     _TOOL_INCAPABLE_MODELS,
@@ -28,15 +27,8 @@ from aegis.services.chat import (
 
 
 @pytest.fixture(autouse=True)
-def _load_tiers(tmp_path: Path) -> None:
-    yml = tmp_path / "models.yaml"
-    yml.write_text(
-        "tiers:\n"
-        "  fast: gemma4:e2b\n"
-        "  balanced: qwen3:14b\n"
-        "  smart: claude-sonnet\n"
-    )
-    load_model_tiers(yml)
+def _load_tiers() -> None:
+    set_model_tiers({"fast": "gemma4:e2b", "balanced": "qwen3:14b", "smart": "claude-sonnet"})
 
 
 def test_tool_incapable_models_includes_all_max_proxy_aliases() -> None:

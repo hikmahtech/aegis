@@ -37,6 +37,24 @@ to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   fetch 410s without advancing it. On 410 the fetch now retries the full window
   and bumps the cursor to fetch time.
 
+### Removed
+
+- **Dead-code cleanup (repo-wide over-engineering audit).** Telegram-era seams
+  that survived the Slack migration: `reply_markup`/`parse_mode` delivery
+  plumbing, `CardSpec.target`, the worker `send_document` activity and
+  `update_interaction_message_id` (cards record `delivery_ref` only). The
+  never-consumed Slack signing-secret config (comms authenticates via Socket
+  Mode bot+app tokens) was dropped end-to-end (admin UI field, encrypted
+  storage, internal API). Also removed: `preview_retention`, six
+  `@activity.defn` registrations only ever called in-process,
+  `load_model_tiers` (superseded by `set_model_tiers` + the LLM backend
+  resolver), the unused `finance_api_key` seam, two Settings fields shadowed
+  by direct env reads, the speculative `arch-guard` CI job for a package
+  layout that doesn't exist yet, the dev docker-compose `redis` service
+  nothing connects to, and unused dependencies (redis/asyncpg/requests OTel
+  instrumentations, `google-auth-oauthlib` in worker, `google-auth-httplib2`,
+  transitively-satisfied `pydantic`/`pydantic-settings` in worker).
+
 ## [0.1.0] — 2026-07-10
 
 First public release. AEGIS has been running as the maintainer's private

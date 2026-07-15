@@ -6,9 +6,8 @@ Ships two keyless built-in providers:
 - ``stooq`` — Stooq quote CSV endpoint, one request per symbol.
 
 The provider seam is the module-level ``_PROVIDERS`` registry: each entry is
-an async function ``(client, symbol, api_key) -> quote dict``. Adding a new
-(possibly API-key) provider is one function + one registry entry — the
-``finance_api_key`` setting is already threaded through for it.
+an async function ``(client, symbol) -> quote dict``. Adding a new provider
+is one function + one registry entry.
 
 Every quote is a small envelope so partial failures degrade per-symbol:
 
@@ -48,7 +47,7 @@ def _pct(change: float | None, base: float | None) -> float | None:
     return round(change / base * 100, 2)
 
 
-async def _quote_yahoo(client: httpx.AsyncClient, symbol: str, api_key: str) -> dict:
+async def _quote_yahoo(client: httpx.AsyncClient, symbol: str) -> dict:
     """Quote via the Yahoo Finance v8 chart endpoint (keyless JSON)."""
     resp = await client.get(
         _YAHOO_CHART_URL.format(symbol=symbol),
@@ -82,7 +81,7 @@ async def _quote_yahoo(client: httpx.AsyncClient, symbol: str, api_key: str) -> 
     }
 
 
-async def _quote_stooq(client: httpx.AsyncClient, symbol: str, api_key: str) -> dict:
+async def _quote_stooq(client: httpx.AsyncClient, symbol: str) -> dict:
     """Quote via the Stooq CSV endpoint (keyless).
 
     ``f=sd2t2ohlcv`` → Symbol,Date,Time,Open,High,Low,Close,Volume. Stooq has
@@ -138,14 +137,12 @@ class FinanceConnector(HTTPConnector):
     def __init__(
         self,
         provider: str = "yahoo",
-        api_key: str = "",
         indices: str = DEFAULT_INDICES,
         timeout: float = 10.0,
         db_pool=None,
     ):
         super().__init__(timeout=timeout, db_pool=db_pool)
         self._provider = (provider or "yahoo").strip().lower()
-        self._api_key = api_key or ""
         self._indices = indices or DEFAULT_INDICES
 
     def _build_client(self) -> httpx.AsyncClient:
@@ -186,7 +183,7 @@ class FinanceConnector(HTTPConnector):
 
     async def _one_quote(self, fetch, client: httpx.AsyncClient, symbol: str) -> dict:
         try:
-            return await fetch(client, symbol, self._api_key)
+            return await fetch(client, symbol)
         except httpx.TimeoutException:
             return {"symbol": symbol, "error": "timeout"}
         except Exception as exc:  # noqa: BLE001 — one bad symbol must not sink the batch

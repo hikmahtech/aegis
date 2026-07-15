@@ -54,16 +54,13 @@ def mock_db_pool():
 
 
 @pytest.fixture(autouse=True, scope="session")
-def _load_model_tiers_for_tests(tmp_path_factory: pytest.TempPathFactory) -> None:
+def _load_model_tiers_for_tests() -> None:
     """Ensure the tier map is populated for all tests.
 
     Tests that use send_message (or resolve_model_for_agent) need _TIERS populated
-    or the 'balanced' fallback will KeyError. This fixture loads a minimal map once
+    or the 'balanced' fallback will KeyError. This fixture sets a minimal map once
     per session so all tests start with a working tier resolver.
     """
-    from aegis.llm.tier import load_model_tiers
+    from aegis.llm.tier import set_model_tiers
 
-    tmp = tmp_path_factory.mktemp("tiers")
-    yml = tmp / "models.yaml"
-    yml.write_text("tiers:\n  fast: gemma4:e2b\n  balanced: qwen3:14b\n  smart: qwen3:32b\n")
-    load_model_tiers(yml)
+    set_model_tiers({"fast": "gemma4:e2b", "balanced": "qwen3:14b", "smart": "qwen3:32b"})

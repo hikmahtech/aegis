@@ -98,7 +98,6 @@ async def lifespan(app: FastAPI):
 
     finance_connector = FinanceConnector(
         provider=settings.finance_provider,
-        api_key=settings.finance_api_key,
         indices=settings.finance_indices,
         db_pool=pool,
     )

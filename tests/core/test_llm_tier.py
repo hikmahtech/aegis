@@ -2,12 +2,9 @@
 
 from __future__ import annotations
 
-from pathlib import Path
-from textwrap import dedent
-
 import aegis.llm.tier as _tier_mod
 import pytest
-from aegis.llm.tier import load_model_tiers, resolve_model_for_agent, tier_to_model
+from aegis.llm.tier import resolve_model_for_agent, set_model_tiers, tier_to_model
 
 
 @pytest.fixture(autouse=True)
@@ -23,60 +20,27 @@ def _clear_tiers():
     _tier_mod._TIERS.update(saved)
 
 
-def test_load_model_tiers_reads_yaml(tmp_path: Path) -> None:
-    yml = tmp_path / "models.yaml"
-    yml.write_text(
-        dedent(
-            """
-            tiers:
-              fast:     "ollama/gemma3:4b"
-              balanced: "ollama/qwen3:14b"
-              smart:    "ollama/qwen3:32b"
-            """
-        )
-    )
-    tiers = load_model_tiers(yml)
-    assert tiers == {
-        "fast": "ollama/gemma3:4b",
-        "balanced": "ollama/qwen3:14b",
-        "smart": "ollama/qwen3:32b",
-    }
+def test_set_model_tiers_replaces_map() -> None:
+    set_model_tiers({"fast": "ollama/gemma3:4b", "balanced": "ollama/qwen3:14b"})
+    tiers = set_model_tiers({"fast": "a", "balanced": "b", "smart": "c"})
+    assert tiers == {"fast": "a", "balanced": "b", "smart": "c"}
+    assert tier_to_model("smart") == "c"
 
 
-def test_load_model_tiers_missing_file_raises(tmp_path: Path) -> None:
-    with pytest.raises(FileNotFoundError):
-        load_model_tiers(tmp_path / "does-not-exist.yaml")
-
-
-def test_load_model_tiers_missing_tiers_key_raises(tmp_path: Path) -> None:
-    yml = tmp_path / "models.yaml"
-    yml.write_text("litellm: {keep_alive: 10m}\n")
-    with pytest.raises(ValueError, match="tiers"):
-        load_model_tiers(yml)
-
-
-def test_tier_to_model_known_tier(tmp_path: Path) -> None:
-    yml = tmp_path / "models.yaml"
-    yml.write_text("tiers: {fast: 'ollama/x', balanced: 'ollama/y', smart: 'ollama/z'}\n")
-    load_model_tiers(yml)
+def test_tier_to_model_known_tier() -> None:
+    set_model_tiers({"fast": "ollama/x", "balanced": "ollama/y", "smart": "ollama/z"})
     assert tier_to_model("balanced") == "ollama/y"
 
 
-def test_tier_to_model_unknown_tier_raises(tmp_path: Path) -> None:
-    yml = tmp_path / "models.yaml"
-    yml.write_text("tiers: {fast: 'a', balanced: 'b', smart: 'c'}\n")
-    load_model_tiers(yml)
+def test_tier_to_model_unknown_tier_raises() -> None:
+    set_model_tiers({"fast": "a", "balanced": "b", "smart": "c"})
     with pytest.raises(KeyError, match="mystery"):
         tier_to_model("mystery")
 
 
 @pytest.mark.asyncio
-async def test_resolve_model_for_agent_maps_tier(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    yml = tmp_path / "models.yaml"
-    yml.write_text("tiers: {fast: 'ollama/fast', balanced: 'ollama/bal', smart: 'ollama/smart'}\n")
-    load_model_tiers(yml)
+async def test_resolve_model_for_agent_maps_tier() -> None:
+    set_model_tiers({"fast": "ollama/fast", "balanced": "ollama/bal", "smart": "ollama/smart"})
 
     class FakeConn:
         async def fetchval(self, sql: str, *args):
@@ -100,10 +64,8 @@ async def test_resolve_model_for_agent_maps_tier(
 
 
 @pytest.mark.asyncio
-async def test_resolve_model_for_agent_unknown_agent_uses_balanced(tmp_path: Path) -> None:
-    yml = tmp_path / "models.yaml"
-    yml.write_text("tiers: {fast: 'ollama/fast', balanced: 'ollama/bal', smart: 'ollama/smart'}\n")
-    load_model_tiers(yml)
+async def test_resolve_model_for_agent_unknown_agent_uses_balanced() -> None:
+    set_model_tiers({"fast": "ollama/fast", "balanced": "ollama/bal", "smart": "ollama/smart"})
 
     class FakeConn:
         async def fetchval(self, sql: str, *args):
@@ -125,10 +87,8 @@ async def test_resolve_model_for_agent_unknown_agent_uses_balanced(tmp_path: Pat
 
 
 @pytest.mark.asyncio
-async def test_resolve_model_for_agent_unknown_tier_falls_back_to_balanced(tmp_path: Path) -> None:
-    yml = tmp_path / "models.yaml"
-    yml.write_text("tiers: {fast: 'ollama/fast', balanced: 'ollama/bal', smart: 'ollama/smart'}\n")
-    load_model_tiers(yml)
+async def test_resolve_model_for_agent_unknown_tier_falls_back_to_balanced() -> None:
+    set_model_tiers({"fast": "ollama/fast", "balanced": "ollama/bal", "smart": "ollama/smart"})
 
     class FakeConn:
         async def fetchval(self, sql: str, *args):

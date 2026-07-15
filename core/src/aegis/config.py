@@ -157,12 +157,6 @@ class Settings(BaseSettings):
     # label) so it shows AEGIS's own services, not every stack on the swarm.
     # Blank = no filter (show all services). Editable from the admin UI.
     aegis_stack_name: str = "aegis"
-    # Comma-separated k8s "context" names that exist on the remote script host
-    # (the host that runs scripts/infra/*.sh + the argocd CLI). Blank ⇒ none;
-    # k8s pod/deployment/log ops then resolve only via registered kind=k8s
-    # infra entries (by slug), and argocd tools require one of these contexts.
-    script_host_k8s_contexts: str = ""
-
     # Knowledge subsystem (native pgvector — no external service).
     # embedding_model must be served by litellm_url's /embeddings; its vector dim
     # must match the knowledge_chunks.embedding column (768 for nomic-embed-text).
@@ -171,10 +165,8 @@ class Settings(BaseSettings):
 
     # Web finance data (FinanceConnector) — provider-agnostic quotes for Maou's
     # market tools. Built-in keyless providers: "yahoo" (default) and "stooq".
-    # finance_api_key is unused by the built-ins; it's the seam for future
-    # API-key providers. finance_indices drives get_market_overview.
+    # finance_indices drives get_market_overview.
     finance_provider: str = "yahoo"
-    finance_api_key: str = ""
     finance_indices: str = "^GSPC,^IXIC,^NSEI"
 
     # Chat tool-calling
@@ -244,12 +236,6 @@ class Settings(BaseSettings):
     money_hygiene_fx_rates: dict[str, float] = Field(
         default_factory=lambda: {"USD": 84.5, "EUR": 92.0, "GBP": 108.0, "SGD": 63.0}
     )
-    # Deterministic bank-alert guard (belt-and-suspenders behind the LLM
-    # prompt hardening) — comma-separated bank alert-sender domains whose
-    # mail must never be minted into a recurring charge. Default empty; add
-    # your bank's alert domains (e.g. "alerts@yourbank.com,yourbank.com").
-    bank_alert_senders: str = ""
-
     @model_validator(mode="after")
     def _require_admin_credentials(self) -> "Settings":
         """admin_username/admin_password are required unless auth_disabled."""

@@ -58,7 +58,6 @@ CONFIG_REGISTRY: list[ConfigKey] = [
     ConfigKey("miniflux_api_key", "API key", "RSS (Miniflux)", True),
     ConfigKey("searxng_url", "Base URL", "Search (SearXNG)", False),
     ConfigKey("finance_provider", "Provider (yahoo | stooq)", "Finance", False),
-    ConfigKey("finance_api_key", "API key (optional, future providers)", "Finance", True),
     ConfigKey("finance_indices", "Overview indices (comma-sep symbols)", "Finance", False),
     ConfigKey("aegis_stack_name", "Swarm stack name (blank = show all services)", "System Monitoring", False),
     # Feature flags — enable/disable whole subsystems. Off by default unless noted.
