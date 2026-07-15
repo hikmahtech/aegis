@@ -213,11 +213,7 @@ class SlackAdapter:
         agent_id: str,
         text: str,
         target: dict | None = None,
-        reply_markup: dict
-        | None = None,  # accepted for seam uniformity; Slack uses Block Kit send_card instead
     ) -> SendResult:
-        if reply_markup is not None:
-            _logger.debug("slack_reply_markup_ignored", agent_id=agent_id)
         channel, username, icon, _voice_id = await self._resolve(agent_id)
         channel = self._target_channel(channel, target)
         body = html_to_mrkdwn(text)
@@ -268,11 +264,7 @@ class SlackAdapter:
         documents: list[dict],
         caption: str,
         target: dict | None = None,
-        reply_markup: dict
-        | None = None,  # accepted for seam uniformity; Slack uses Block Kit send_card instead
     ) -> SendResult:
-        if reply_markup is not None:
-            _logger.debug("slack_reply_markup_ignored", agent_id=agent_id)
         channel, _username, _icon, _voice_id = await self._resolve(agent_id)
         channel = self._target_channel(channel, target)
         first_ref: DeliveryRef | None = None
@@ -341,7 +333,6 @@ class SlackAdapter:
 
     async def send_card(self, spec: CardSpec) -> SendResult:
         channel, username, icon, _voice_id = await self._resolve(spec.agent_id)
-        channel = self._target_channel(channel, spec.target)
         blocks = render_slack_blocks(spec)
         try:
             resp = await self._client.chat_postMessage(

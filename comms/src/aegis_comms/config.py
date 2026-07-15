@@ -33,9 +33,6 @@ class CommsSettings(BaseSettings):
     # Slack credentials.
     slack_bot_token: str = Field(default="", validation_alias=AliasChoices("AEGIS_SLACK_BOT_TOKEN"))
     slack_app_token: str = Field(default="", validation_alias=AliasChoices("AEGIS_SLACK_APP_TOKEN"))
-    slack_signing_secret: str = Field(
-        default="", validation_alias=AliasChoices("AEGIS_SLACK_SIGNING_SECRET")
-    )
 
     # ElevenLabs (hosted vendor — NOT the LiteLLM proxy). Drives inbound voice-note
     # transcription (Scribe STT) and outbound per-persona voice notes (TTS).

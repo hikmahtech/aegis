@@ -134,8 +134,6 @@ class DeliveryRequest(BaseModel):
     text: str
     agent_id: str = "sebas"
     system_event: bool = False  # If true, send to General topic instead of agent topic
-    parse_mode: str = "HTML"
-    reply_markup: dict | None = None
 
 
 class DocumentAttachment(BaseModel):
@@ -151,7 +149,6 @@ class DocumentDeliveryRequest(BaseModel):
     documents: list[DocumentAttachment]
     caption: str = ""
     agent_id: str = "sebas"
-    reply_markup: dict | None = None
     # Optional explicit destination ({"channel": ...}); None = agent's bound channel.
     target: dict | None = None
 
@@ -171,9 +168,8 @@ class VoiceDeliveryRequest(BaseModel):
 class CardDeliveryRequest(BaseModel):
     """Channel-neutral interaction-card delivery request.
 
-    The worker POSTs this instead of building a per-channel `reply_markup`;
-    the active adapter renders the card for its channel and routes it to the
-    agent's channel.
+    The worker POSTs this neutral spec; the active adapter renders the card
+    for its channel and routes it to the agent's channel.
     """
 
     interaction_id: str
@@ -259,19 +255,14 @@ def create_delivery_app(adapter: SlackAdapter, settings: CommsSettings) -> FastA
             )
             return {"ok": result.get("ok", False), "type": "system_event", **result}
 
-        send_result = await adapter.send_message(
-            agent_id=req.agent_id,
-            text=req.text,
-            target=None,
-            reply_markup=req.reply_markup,
-        )
+        send_result = await adapter.send_message(agent_id=req.agent_id, text=req.text)
         result = send_result.to_response()
         await _log_dispatch(
             settings,
             agent_id=req.agent_id,
             content=req.text,
             send_result=result,
-            kind="deliver" if not req.reply_markup else "interaction_card",
+            kind="deliver",
         )
         return {"ok": result.get("ok", False), "agent_id": req.agent_id, **result}
 
@@ -290,7 +281,6 @@ def create_delivery_app(adapter: SlackAdapter, settings: CommsSettings) -> FastA
             documents=docs,
             caption=req.caption,
             target=req.target,
-            reply_markup=req.reply_markup,
         )
         ok = send_result.ok
         if ok and req.caption:
@@ -338,7 +328,6 @@ def create_delivery_app(adapter: SlackAdapter, settings: CommsSettings) -> FastA
             kind=req.kind,
             prompt=req.prompt,
             options=req.options,
-            target=None,
             allow_hint=req.allow_hint,
         )
         send_result = await adapter.send_card(spec)
@@ -386,8 +375,8 @@ def _startup_error(settings: CommsSettings) -> str | None:
 
 async def _fetch_resolved_slack_config(settings: CommsSettings) -> dict[str, Any] | None:
     """GET the DB-resolved Slack config from core: `{configured, bot_token,
-    app_token, signing_secret, channel}` (core itself already falls back to
-    its own env vars, so this is cleartext-resolved either way).
+    app_token, channel}` (core itself already falls back to its own env vars,
+    so this is cleartext-resolved either way).
 
     Comms has no DB access of its own — this is the only way it learns about
     tokens set via the admin UI. Returns None on ANY failure (core down, 404,
@@ -421,7 +410,6 @@ def _merge_slack_config(settings: CommsSettings, db_config: dict[str, Any] | Non
         return
     settings.slack_bot_token = db_config.get("bot_token") or settings.slack_bot_token
     settings.slack_app_token = db_config.get("app_token") or settings.slack_app_token
-    settings.slack_signing_secret = db_config.get("signing_secret") or settings.slack_signing_secret
     settings.channel = db_config.get("channel") or settings.channel
 
 

@@ -477,7 +477,6 @@ async def main():
         briefing_act.frame_briefing,
         briefing_act.commit_briefing_state,
         delivery_act.send_message,
-        delivery_act.send_document,
         delivery_act.send_system_event,
         delivery_act.send_voice,
         delivery_act.send_interaction_card,

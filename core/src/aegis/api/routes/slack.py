@@ -4,7 +4,7 @@ Admin: GET/PUT under ``/api/admin/slack-config``. Never returns secret values,
 only ``*_set`` booleans — mirrors ``routes/llm_backend.py`` / ``routes/todoist.py``.
 
 Internal: GET under ``/api/internal/slack-config``. Returns the resolved
-cleartext tokens — comms needs the raw bot/app tokens + signing secret for
+cleartext tokens — comms needs the raw bot/app tokens for
 Socket Mode. This is the ONLY endpoint in AEGIS that returns decrypted Slack
 secrets; it's gated by ``verify_auth`` (X-API-Key), same as every other route,
 so it must only ever be called server-to-server (comms -> core), never from
@@ -50,7 +50,6 @@ async def put_slack_config(
         settings,
         bot_token=body.get("bot_token"),
         app_token=body.get("app_token"),
-        signing_secret=body.get("signing_secret"),
         channel=body.get("channel"),
     )
     await log_audit(
