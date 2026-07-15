@@ -52,6 +52,11 @@ export const api = {
   getAgentOptions: () => apiFetch<any>('/api/agents/meta/options'),
   updateAgent: (id: string, patch: any) =>
     apiFetch<any>(`/api/agents/${id}`, { method: 'PATCH', body: JSON.stringify(patch) }),
+  reassignAgent: (id: string, to: string) =>
+    apiFetch<{ reassigned: Record<string, number>; total: number }>(
+      `/api/agents/${id}/reassign`, { method: 'POST', body: JSON.stringify({ to }) }),
+  deleteAgent: (id: string) =>
+    apiFetch<void>(`/api/agents/${id}`, { method: 'DELETE' }),
   draftPersona: (id: string, description: string) =>
     apiFetch<any>(`/api/agents/${id}/draft`, { method: 'POST', body: JSON.stringify({ description }) }),
   getPersonality: (id: string) =>

@@ -129,3 +129,49 @@ async def update_agent(
     values = [agent_id, *filtered.values()]
     row = await pool.fetchrow(f"UPDATE agents SET {set_clauses} WHERE id = $1 RETURNING *", *values)
     return dict(row) if row else None
+
+
+async def reassign_agent_rows(pool: asyncpg.Pool, from_id: str, to_id: str) -> dict[str, int]:
+    """Move every FK-owned row from one agent to another. Returns per-table counts.
+
+    Tables are introspected from pg_constraint (FKs referencing agents(id) with
+    NO ACTION) so future migrations can't rot a hardcoded list. CASCADE FKs
+    (agent_personalities) are skipped — personas die with their agent rather
+    than transfer. Runs in a single transaction.
+    """
+    fks = await pool.fetch(
+        """
+        SELECT con.conrelid::regclass::text AS table_name, att.attname AS column_name
+        FROM pg_constraint con
+        JOIN pg_attribute att ON att.attrelid = con.conrelid AND att.attnum = ANY(con.conkey)
+        WHERE con.contype = 'f'
+          AND con.confrelid = 'public.agents'::regclass
+          AND con.confdeltype = 'a'
+        ORDER BY 1
+        """
+    )
+    counts: dict[str, int] = {}
+    async with pool.acquire() as conn, conn.transaction():
+        for fk in fks:
+            # identifiers come from pg_catalog, not user input — safe to interpolate
+            result = await conn.execute(
+                f"UPDATE {fk['table_name']} SET {fk['column_name']} = $2 "
+                f"WHERE {fk['column_name']} = $1",
+                from_id,
+                to_id,
+            )
+            moved = int(result.split()[-1])
+            if moved:
+                counts[fk["table_name"]] = moved
+    logger.info("agent_rows_reassigned from=%s to=%s counts=%s", from_id, to_id, counts)
+    return counts
+
+
+async def delete_agent(pool: asyncpg.Pool, agent_id: str) -> bool:
+    """Delete an agent row. Returns False when the agent doesn't exist.
+
+    Raises asyncpg.ForeignKeyViolationError while the agent still owns rows —
+    callers surface that as "reassign first". agent_personalities cascades.
+    """
+    result = await pool.execute("DELETE FROM agents WHERE id = $1", agent_id)
+    return result.split()[-1] == "1"

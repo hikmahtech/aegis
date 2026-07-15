@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { Link, useParams } from 'react-router-dom';
+import { Link, useNavigate, useParams } from 'react-router-dom';
 import { api } from '../api/client';
 import ErrorBanner from '../components/ErrorBanner';
 
@@ -29,6 +29,11 @@ export default function AgentDetail() {
   });
   const [savingB, setSavingB] = useState(false);
   const [bmsg, setBmsg] = useState('');
+  const navigate = useNavigate();
+  const [allAgents, setAllAgents] = useState<any[]>([]);
+  const [reassignTo, setReassignTo] = useState('');
+  const [lifecycleBusy, setLifecycleBusy] = useState(false);
+  const [lmsg, setLmsg] = useState('');
 
   async function load() {
     setError(null); setLoading(true);
@@ -43,6 +48,7 @@ export default function AgentDetail() {
         api.getPersonality(id).catch(() => ({} as Record<string, string>)),
         api.getAgentOptions().catch(() => null),
       ]);
+      api.listAgents().then(setAllAgents).catch(() => setAllAgents([]));
       setAgent(a); setTools(t); setThreads(th);
       setLlmStats(st); setConnectorStats(cs); setRuns(rr); setOptions(opts);
       setPersona({
@@ -112,6 +118,29 @@ export default function AgentDetail() {
     } catch (e: any) { setError(e); } finally { setDrafting(false); }
   }
   useEffect(() => { void load(); /* eslint-disable-next-line react-hooks/exhaustive-deps */ }, [id]);
+
+  async function reassign() {
+    if (!reassignTo) return;
+    setLifecycleBusy(true); setLmsg(''); setError(null);
+    try {
+      const r = await api.reassignAgent(id, reassignTo);
+      const parts = Object.entries(r.reassigned).map(([t, n]) => `${t}: ${n}`);
+      setLmsg(`Moved ${r.total} row(s)${parts.length ? ` (${parts.join(', ')})` : ''} to ${reassignTo}.`);
+    } catch (e: any) { setError(e); } finally { setLifecycleBusy(false); }
+  }
+
+  async function removeAgent() {
+    if (!confirm(`Delete agent "${agent.name}"? Reassign its rows first — delete fails while it still owns any.`)) return;
+    setLifecycleBusy(true); setLmsg(''); setError(null);
+    try {
+      await api.deleteAgent(id);
+      navigate('/agents');
+    } catch (e: any) {
+      setError(e);
+      setLmsg('Delete failed — a 409 means rows still point here; reassign them first.');
+      setLifecycleBusy(false);
+    }
+  }
 
   async function send(e: React.FormEvent) {
     e.preventDefault();
@@ -224,6 +253,31 @@ export default function AgentDetail() {
           </button>
           {bmsg && <span style={{ marginLeft: 10, color: 'var(--success-text)' }}>{bmsg}</span>}
         </>}
+      </div>
+
+      <div className="card" style={{ marginBottom: 16 }}>
+        <h3>Danger zone</h3>
+        <p style={{ fontSize: 13, color: 'var(--text-muted)' }}>
+          To remove this agent: reassign everything it owns (activities, workflow runs,
+          chat history, …) to another agent, then delete. To rename: create the new agent,
+          reassign, delete this one.
+        </p>
+        <div className="cfg-row" style={{ marginBottom: 8 }}>
+          <select value={reassignTo} onChange={e => setReassignTo(e.target.value)}>
+            <option value="">Reassign owned rows to…</option>
+            {allAgents.filter(a => a.id !== id).map(a => (
+              <option key={a.id} value={a.id}>{a.name} ({a.id})</option>
+            ))}
+          </select>
+          <button className="btn" disabled={lifecycleBusy || !reassignTo} onClick={reassign}>
+            {lifecycleBusy ? 'Working…' : 'Reassign'}
+          </button>
+          <button className="btn" style={{ color: 'var(--error-text, #c00)' }}
+            disabled={lifecycleBusy} onClick={removeAgent}>
+            Delete agent
+          </button>
+        </div>
+        {lmsg && <span style={{ fontSize: 13 }}>{lmsg}</span>}
       </div>
 
       <div className="grid">
