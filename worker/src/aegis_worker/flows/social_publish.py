@@ -1,7 +1,8 @@
 """SocialPublishFlow — a Todoist task is a social post, gated by an approval card.
 
 Every 5 min:
-1. find_due_posts — open @publish tasks due within the lookahead.
+1. find_due_posts — open @publish tasks due within the lookahead, plus
+   fully-Postiz-routed tasks however far out (Postiz holds the schedule, #60).
 2. Spawn one InteractionFlow card per task, ABANDONED with a deterministic
    id (social-approve-<task_id>) so overlapping ticks can't double-card, and
    a post_resolve hook (apply_social_approval) that applies the choice:
