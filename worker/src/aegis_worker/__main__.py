@@ -497,6 +497,7 @@ async def main():
         gmail_act.fetch_thread,
         gmail_act.classify_email,
         gmail_act.record_triage_outcome,
+        gmail_act.recheck_triage_outcomes,
         gmail_act.ingest_email_to_kg,
         gmail_act.gather_email_context,
         gmail_act.apply_label,
