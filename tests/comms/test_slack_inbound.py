@@ -158,7 +158,8 @@ async def test_on_message_sync_path_chats_then_posts_then_patches_ref():
     assert ckw["agent_id"] == "sebas"
     assert ckw["message"] == "hello"
     assert ckw["thread_id"] == "slack-CSEBAS-sebas"
-    assert ckw["delivery_ref"] is None
+    # The INCOMING channel rides along so core tools can target attachments.
+    assert ckw["delivery_ref"] == {"adapter": "slack", "channel": "CSEBAS"}
 
     # 2) reply posted via the adapter to the same channel.
     adapter.send_message.assert_awaited_once()
@@ -607,3 +608,39 @@ async def test_routing_config_uses_metadata_when_available():
     mention_map, async_agents = await inbound._routing_config()
     assert mention_map["jeeves"] == "jeeves"
     assert "jeeves" in async_agents
+
+
+# --- on_file PDF → extract → attach .txt back + summarize -------------------
+
+
+async def test_on_file_pdf_attaches_extracted_text_and_summarizes():
+    inbound, core, adapter = _inbound()
+    core.chat.return_value = {"response": "summary", "assistant_message_id": None}
+    core.knowledge_ingest.return_value = "content-1"
+    adapter.send_message.return_value = SendResult(ok=True, ref=None, used_html=False)
+    adapter.send_document.return_value = SendResult(ok=True, ref=None, used_html=False)
+    inbound._download_and_extract_pdf = AsyncMock(return_value="EXTRACTED PDF TEXT")
+
+    client = AsyncMock()
+    client.files_info.return_value = {
+        "file": {
+            "name": "contract.pdf",
+            "url_private": "https://files.slack.test/contract.pdf",
+            "mimetype": "application/pdf",
+        }
+    }
+    await inbound.on_file(file_id="F1", channel_id="CSEBAS", caption="", client=client)
+
+    # Full extracted text comes back as a .txt attachment in the same channel.
+    adapter.send_document.assert_awaited_once()
+    dkw = adapter.send_document.await_args.kwargs
+    assert dkw["documents"] == [{"filename": "contract.txt", "content": "EXTRACTED PDF TEXT"}]
+    assert dkw["target"] == {"channel": "CSEBAS"}
+
+    # The existing ingest + summarize flow still runs, with the channel ref.
+    core.knowledge_ingest.assert_awaited_once()
+    core.chat.assert_awaited_once()
+    assert core.chat.await_args.kwargs["delivery_ref"] == {
+        "adapter": "slack",
+        "channel": "CSEBAS",
+    }

@@ -1245,6 +1245,44 @@ CHAT_TOOLS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "youtube_transcript",
+            "description": (
+                "Fetch the caption transcript of a YouTube video and deliver it to the "
+                "user's channel as a text-file attachment. Returns a short confirmation "
+                "with a preview — the full transcript is in the attachment, so do NOT "
+                "try to reproduce it in your reply."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "url": {"type": "string", "description": "The YouTube video URL"},
+                },
+                "required": ["url"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "pdf_to_text",
+            "description": (
+                "Download a PDF from a URL, extract its text, and deliver it to the "
+                "user's channel as a text-file attachment. Returns a short confirmation "
+                "with a preview — the full text is in the attachment, so do NOT try to "
+                "reproduce it in your reply."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "url": {"type": "string", "description": "Direct http(s) URL to the PDF"},
+                },
+                "required": ["url"],
+            },
+        },
+    },
 ]
 
 
@@ -2898,6 +2936,110 @@ async def _exec_vercel_get_build_logs(pool: asyncpg.Pool, args: dict, ctx: ToolC
     return json.dumps(result)
 
 
+# --- Document-attachment tools (YouTube transcript / PDF → text) ---
+
+
+async def _deliver_documents(ctx: ToolContext, documents: list[dict], caption: str) -> dict:
+    """POST text attachments to the comms delivery server (/api/deliver/document).
+
+    Targets the channel the user's message came from (chat_context.delivery_ref)
+    when known; otherwise comms falls back to the agent's bound channel.
+    """
+    comms_url = (getattr(ctx.settings, "comms_url", "") or "").rstrip("/")
+    if not comms_url:
+        return {"ok": False, "error": "comms_url not configured"}
+    import httpx
+
+    api_key = getattr(ctx.settings, "api_key", "") or ""
+    headers = {"X-API-Key": api_key} if api_key else {}
+    ref = (ctx.chat_context or {}).get("delivery_ref") or {}
+    body = {
+        "documents": documents,
+        "caption": caption,
+        "agent_id": ctx.agent_id or "sebas",
+        "target": {"channel": ref["channel"]} if ref.get("channel") else None,
+    }
+    try:
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            resp = await client.post(
+                f"{comms_url}/api/deliver/document", json=body, headers=headers
+            )
+        if resp.status_code == 200 and (resp.json() or {}).get("ok"):
+            return {"ok": True}
+        return {"ok": False, "error": f"comms status {resp.status_code}"}
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": str(exc)[:200]}
+
+
+async def _exec_youtube_transcript(pool: asyncpg.Pool, args: dict, ctx: ToolContext) -> str:
+    """Fetch a YouTube caption transcript and attach it to the channel as .txt."""
+    from aegis.services.content_extract import extract_youtube_id, fetch_youtube_transcript
+
+    url = (args.get("url") or "").strip()
+    video_id = extract_youtube_id(url)
+    if not video_id:
+        return json.dumps({"error": "Not a recognizable YouTube URL"})
+    text, meta = await fetch_youtube_transcript(url)
+    if not text:
+        return json.dumps(
+            {"error": "No transcript available (video has no captions or the fetch failed)"}
+        )
+    delivery = await _deliver_documents(
+        ctx,
+        documents=[{"filename": f"youtube-{video_id}-transcript.txt", "content": text}],
+        caption=f"Transcript for {url}",
+    )
+    if not delivery.get("ok"):
+        return json.dumps(
+            {"error": f"Transcript fetched but delivery failed: {delivery.get('error')}"}
+        )
+    return json.dumps(
+        {
+            "ok": True,
+            "video_id": video_id,
+            "segments": meta.get("segments"),
+            "words": len(text.split()),
+            "note": "Full transcript delivered to the channel as a file attachment.",
+            "preview": text[:300],
+        }
+    )
+
+
+async def _exec_pdf_to_text(pool: asyncpg.Pool, args: dict, ctx: ToolContext) -> str:
+    """Extract the text of a PDF URL and attach it to the channel as .txt."""
+    from pathlib import PurePosixPath
+    from urllib.parse import urlparse
+
+    from aegis.services.content_extract import fetch_and_extract
+
+    url = (args.get("url") or "").strip()
+    if not url.startswith(("http://", "https://")):
+        return json.dumps({"error": "A full http(s) URL to a PDF is required"})
+    text, _title = await fetch_and_extract(url, max_chars=2_000_000)
+    if not text:
+        return json.dumps(
+            {"error": "Could not extract text (fetch failed, not a PDF, or scanned/image-only)"}
+        )
+    stem = PurePosixPath(urlparse(url).path).stem or "document"
+    delivery = await _deliver_documents(
+        ctx,
+        documents=[{"filename": f"{stem}.txt", "content": text}],
+        caption=f"Extracted text from {url}",
+    )
+    if not delivery.get("ok"):
+        return json.dumps(
+            {"error": f"Text extracted but delivery failed: {delivery.get('error')}"}
+        )
+    return json.dumps(
+        {
+            "ok": True,
+            "chars": len(text),
+            "note": "Full text delivered to the channel as a file attachment.",
+            "preview": text[:300],
+        }
+    )
+
+
 # --- Dispatch dict mapping tool names to executor functions ---
 
 TOOL_EXECUTORS: dict[str, Any] = {
@@ -2944,6 +3086,8 @@ TOOL_EXECUTORS: dict[str, Any] = {
     "vercel_list_deployments": _exec_vercel_list_deployments,
     "vercel_get_deployment": _exec_vercel_get_deployment,
     "vercel_get_build_logs": _exec_vercel_get_build_logs,
+    "youtube_transcript": _exec_youtube_transcript,
+    "pdf_to_text": _exec_pdf_to_text,
 }
 
 # --- Per-agent tool sets ---
@@ -2968,6 +3112,9 @@ AGENT_TOOL_SETS: dict[str, set[str]] = {
         "mark_waiting",
         "handoff_task",
         "find_reference",
+        # Document-attachment tools
+        "youtube_transcript",
+        "pdf_to_text",
     },
     "raphael": {
         "search_knowledge",
@@ -2982,6 +3129,9 @@ AGENT_TOOL_SETS: dict[str, set[str]] = {
         "complete_task",
         "handoff_task",
         "find_reference",
+        # Document-attachment tools
+        "youtube_transcript",
+        "pdf_to_text",
     },
     "pandoras-actor": {
         "trigger_workflow",
@@ -3768,7 +3918,11 @@ async def send_message(
         task_id=(user_metadata or {}).get("task_id"),
         knowledge_connector=knowledge_connector,
         finance_connector=finance_connector,
-        chat_context={"user_message": message, "thread_id": thread_id},
+        chat_context={
+            "user_message": message,
+            "thread_id": thread_id,
+            "delivery_ref": (user_metadata or {}).get("delivery_ref"),
+        },
         settings=settings,
         temporal_client=temporal_client,
         search_connector=search_connector,

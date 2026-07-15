@@ -395,22 +395,22 @@ class TestExtractYoutubeId:
     """Test YouTube video ID extraction."""
 
     def test_standard_url(self):
-        from aegis_worker.activities.content import _extract_youtube_id
+        from aegis.services.content_extract import extract_youtube_id as _extract_youtube_id
 
         assert _extract_youtube_id("https://www.youtube.com/watch?v=dQw4w9WgXcQ") == "dQw4w9WgXcQ"
 
     def test_short_url(self):
-        from aegis_worker.activities.content import _extract_youtube_id
+        from aegis.services.content_extract import extract_youtube_id as _extract_youtube_id
 
         assert _extract_youtube_id("https://youtu.be/dQw4w9WgXcQ") == "dQw4w9WgXcQ"
 
     def test_embed_url(self):
-        from aegis_worker.activities.content import _extract_youtube_id
+        from aegis.services.content_extract import extract_youtube_id as _extract_youtube_id
 
         assert _extract_youtube_id("https://www.youtube.com/embed/dQw4w9WgXcQ") == "dQw4w9WgXcQ"
 
     def test_non_youtube_returns_none(self):
-        from aegis_worker.activities.content import _extract_youtube_id
+        from aegis.services.content_extract import extract_youtube_id as _extract_youtube_id
 
         assert _extract_youtube_id("https://example.com/article") is None
 

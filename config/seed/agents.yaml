@@ -18,7 +18,7 @@ agents:
       intent_description: Tasks, GTD, email, calendar, scheduling and day-to-day coordination.
       intent_keywords: [task, todo, inbox, remind, defer, project, "next action", calendar, email, waiting, schedule, "follow up"]
       knowledge_domains: [task, decision, briefing, digest, calendar, task_outcome]
-      tool_set: [query_activities, trigger_workflow, search_knowledge, configure_triage, remember_this, list_interactions, capture_to_inbox, list_next_actions, whats_next, list_projects, complete_task, defer_task, mark_waiting, handoff_task, find_reference]
+      tool_set: [query_activities, trigger_workflow, search_knowledge, configure_triage, remember_this, list_interactions, capture_to_inbox, list_next_actions, whats_next, list_projects, complete_task, defer_task, mark_waiting, handoff_task, find_reference, youtube_transcript, pdf_to_text]
     active: true
 
   - id: raphael
@@ -34,7 +34,7 @@ agents:
       intent_description: Research, knowledge lookups, articles, papers and topic tracking.
       intent_keywords: [research, knowledge, learn, paper, article, summari, remember, recall, explain]
       knowledge_domains: [article, feed, email, research]
-      tool_set: [search_knowledge, ask_knowledge, research_topic, track_topic, remember_this, capture_to_inbox, list_next_actions, list_projects, complete_task, handoff_task, find_reference]
+      tool_set: [search_knowledge, ask_knowledge, research_topic, track_topic, remember_this, capture_to_inbox, list_next_actions, list_projects, complete_task, handoff_task, find_reference, youtube_transcript, pdf_to_text]
     active: true
 
   - id: maou

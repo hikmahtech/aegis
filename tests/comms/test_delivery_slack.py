@@ -141,3 +141,25 @@ async def test_slack_document_deliver_with_reply_markup_does_not_crash(slack_app
     assert body["count"] == 1
     # Slack ignores the keyboard; file upload is still called
     adapter._client.files_upload_v2.assert_called_once()
+
+
+async def test_slack_document_deliver_targets_explicit_channel(slack_app):
+    """A target channel in the request overrides the agent's bound channel."""
+    app, adapter = slack_app
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.post(
+            "/api/deliver/document",
+            json={
+                "agent_id": "sebas",
+                "caption": "Transcript",
+                "documents": [{"filename": "t.txt", "content": "hello"}],
+                "target": {"channel": "C999"},
+            },
+            headers={"X-API-Key": "test-key"},
+        )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["ok"] is True
+    upload = adapter._client.files_upload_v2
+    upload.assert_called_once()
+    assert upload.call_args.kwargs["channel"] == "C999"

@@ -464,7 +464,7 @@ class SlackInbound:
             agent_id=agent_id,
             message=clean_text,
             thread_id=thread_id,
-            delivery_ref=None,
+            delivery_ref={"adapter": "slack", "channel": channel_id},
         )
         reply_text = result.get("response", "No response from agent.")
         assistant_message_id = result.get("assistant_message_id")
@@ -681,6 +681,16 @@ class SlackInbound:
             )
             return
 
+        # Attach the full extracted text back as a .txt so the user has the
+        # complete document, not just the summary below.
+        txt_name = (name.rsplit(".", 1)[0] or "document") + ".txt"
+        await self._adapter.send_document(
+            agent_id=agent_id,
+            documents=[{"filename": txt_name, "content": extracted}],
+            caption=f"Extracted text from {name}",
+            target={"channel": channel_id},
+        )
+
         content_id = await self._core.knowledge_ingest(
             url=f"slack://document/{name}",
             title=name,
@@ -708,7 +718,7 @@ class SlackInbound:
             agent_id=agent_id,
             message=text,
             thread_id=f"slack-{channel_id}-{agent_id}",
-            delivery_ref=None,
+            delivery_ref={"adapter": "slack", "channel": channel_id},
         )
         reply = result.get("response", "No response from agent.")
         await self._adapter.send_message(
