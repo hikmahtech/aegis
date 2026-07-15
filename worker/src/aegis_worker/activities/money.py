@@ -103,6 +103,10 @@ class MoneyActivities:
     fx_rates: dict[str, float]
     agent_id: str = "maou"
     home_currency: str = "INR"
+    # Receipt extraction needs reliable structured JSON. The local fast model
+    # (gemma4:e2b) parse-failed ~81% of receipt-shaped mail in prod — wire the
+    # smart tier here (worker __main__) so money data stops silently dropping.
+    extract_model: str = "gemma4:e2b"
 
     @activity.defn
     async def store_receipt_email(self, msg: dict, account: str) -> str:
@@ -196,7 +200,10 @@ class MoneyActivities:
             persona = await get_personality(self.db_pool, agent_id)
             system_prompt = _format_agent_persona(persona)
         extractions = await self.llm.extract_receipts_batch(
-            receipts, system_prompt=system_prompt, db_pool=self.db_pool
+            receipts,
+            model=self.extract_model,
+            system_prompt=system_prompt,
+            db_pool=self.db_pool,
         )
         for r, e in zip(receipts, extractions, strict=False):
             e["receipt_id"] = r["id"]

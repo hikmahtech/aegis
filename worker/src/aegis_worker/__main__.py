@@ -282,6 +282,7 @@ async def main():
             delivery=delivery_act,
             fx_rates=getattr(settings, "money_hygiene_fx_rates", {}),
             home_currency=getattr(settings, "home_currency", "INR"),
+            extract_model=deps.model_tiers.get("smart") or settings.model_smart,
         )
 
     channel_act = ChannelActivities(db_pool=deps.pool)
