@@ -58,6 +58,7 @@ class CalendarActivities:
 
         def _sync_fetch() -> FetchEventsResult:
             from google.auth.exceptions import RefreshError
+            from googleapiclient.errors import HttpError
 
             try:
                 svc = _build_calendar_service(self.gmail_credentials_file, token_path)
@@ -76,7 +77,22 @@ class CalendarActivities:
                 if input.since_cursor_ts is not None:
                     list_kwargs["updatedMin"] = input.since_cursor_ts
 
-                response = svc.events().list(**list_kwargs).execute()
+                healed_410 = False
+                try:
+                    response = svc.events().list(**list_kwargs).execute()
+                except HttpError as exc:
+                    # Google returns 410 Gone when updatedMin is older than its
+                    # retention horizon. A quiet calendar poisons itself: the
+                    # cursor is max(event.updated), nothing gets edited, the
+                    # cursor ages past the horizon, and every subsequent run
+                    # 410s without ever advancing it. Self-heal: refetch the
+                    # full window and bump the cursor to fetch time below.
+                    if exc.resp.status == 410 and "updatedMin" in list_kwargs:
+                        del list_kwargs["updatedMin"]
+                        healed_410 = True
+                        response = svc.events().list(**list_kwargs).execute()
+                    else:
+                        raise
                 raw_events = response.get("items") or []
 
                 events: list[dict] = []
@@ -100,6 +116,12 @@ class CalendarActivities:
                 latest_updated_ts: str | None = None
                 if events:
                     latest_updated_ts = max(ev["updated"] for ev in events)
+                if healed_410:
+                    # Advance past the stale cursor even when the newest event
+                    # edit is ancient, or the poison loop resumes tomorrow.
+                    # time_min was captured before the fetch, so nothing updated
+                    # after it can be missed by the next incremental run.
+                    latest_updated_ts = max(latest_updated_ts or "", time_min)
 
                 return FetchEventsResult(events=events, latest_updated_ts=latest_updated_ts)
 

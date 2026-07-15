@@ -427,12 +427,12 @@ class GmailActivities:
                 prompt=prompt,
                 model=self.model_balanced,
                 system_prompt=_CLASSIFY_SYSTEM,
-                # 768 tokens: gpt-oss:20b (a reasoning model) bills hidden
-                # reasoning_content against max_tokens.  At 256 the budget was
-                # exhausted before visible content appeared → finish_reason=length
-                # + empty content → LLMTruncationError → fallback below.
-                # 768 leaves ~512 for reasoning and ~256 for the JSON payload.
-                max_tokens=768,
+                # gpt-oss:20b (a reasoning model) bills hidden reasoning_content
+                # against max_tokens. 256 truncated always; 768 still truncated
+                # intermittently in prod (llm_truncated + classify_email_llm_failed
+                # on long-reasoning emails). 2048 leaves ample reasoning headroom
+                # with ~256 for the JSON payload.
+                max_tokens=2048,
                 db_pool=self.db_pool,
                 purpose="gmail_classification",
             )
