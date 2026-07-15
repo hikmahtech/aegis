@@ -219,7 +219,7 @@ Kill switches:
 2. Create activities in `worker/src/aegis_worker/activities/{name}.py`.
 3. Register in `worker/src/aegis_worker/__main__.py` (workflows + activities lists) — both lists are explicit; nothing is auto-discovered.
 4. If scheduled, add a `_ACTIVITY_TYPE_MAP` entry in `worker/src/aegis_worker/schedule_sync.py` keyed by the PascalCase class name (e.g. `"CleanupFlow"`).
-5. Insert a seed row in `config/seed/activities.yaml`; `schedule_sync` registers the Temporal schedule on next worker startup.
+5. Insert a seed row in `config/seed/activities.yaml`; `schedule_sync` registers the Temporal schedule on next worker startup and reconciles every ~5 min. Schedules are only rewritten when their config fingerprint changes — the fingerprint is embedded in the schedule's action id (`scheduled-<slug>--v<fp>`) — so a DB `activities.config` edit propagates within one tick without churning unchanged schedules.
 6. Write tests in `tests/worker/test_{name}.py`. Use `WorkflowEnvironment.start_time_skipping()` + `Worker` for workflow tests; `ActivityEnvironment` + `respx` for activity tests.
 7. For human-in-the-loop steps, spawn `InteractionFlow` as a child workflow rather than building custom callback logic. Valid card kinds are `approval | choice | ack | input | draft_review` (rendered by comms and the admin panel; anything else renders with no action buttons).
 
@@ -231,6 +231,7 @@ Kill switches:
 4. Grant it to agents via their `metadata.tool_set` — set it on the admin **Behavior** tab (runtime source of truth) and/or in `config/seed/agents.yaml`. The shipped `AGENT_TOOL_SETS` dict is now only a seed-time default for the four example agents; an agent's DB `metadata.tool_set` overrides it, and an unconfigured agent falls back to a small read-only `_FALLBACK_TOOL_SET` (not Sebas's full surface). `_validate_agent_tool_sets` refuses to boot on a tool name with no executor, and Core additionally warns at startup on any DB `metadata.tool_set` entry that references a missing executor.
 5. If the tool needs new connectors on `ToolContext`, add the field and wire it in `send_message()`
 6. Write tests in `tests/core/test_{tool_name}_tool.py`
+7. If the tool can legitimately run longer than `tool_timeout_seconds` (default 30s), add an entry to `_TOOL_TIMEOUT_OVERRIDES` in `chat.py` — otherwise the executor cancels it mid-flight and the model retries, orphaning whatever the tool started (e.g. `aegis_self_diagnose` gets its full remote coding-run budget there).
 
 ## Adding Intelligence Topics
 
