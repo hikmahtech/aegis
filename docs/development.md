@@ -172,6 +172,21 @@ second basic-auth prompt is redundant. Webhook HMAC verification is unaffected.
 LAN, or the internet if the port is exposed) has full admin access. Only enable it when the
 port is reachable exclusively through the authenticating proxy — no direct port exposure.
 
+Because that mistake is invisible from the outside (the API just answers), an auth-disabled
+deployment announces itself in two places:
+
+- **Boot log:** a `CRITICAL` `auth_disabled_active` event on every Core startup
+  (`docker service logs aegis_core | grep auth_disabled_active`).
+- **Admin UI:** a red *"Authentication is disabled"* banner on the **System monitoring**
+  page, driven by `auth_mode` in `GET /api/admin/system/status`
+  (`disabled` | `basic` | `api_key` | `basic+api_key`).
+
+To confirm auth is actually on, an anonymous request must be rejected:
+
+```bash
+curl -s -o /dev/null -w '%{http_code}\n' http://<host>:8080/api/agents   # expect 401
+```
+
 ## Admin Panel Development
 
 ```bash

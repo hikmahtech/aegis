@@ -8,6 +8,21 @@ to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Auth-disabled deployments are no longer silent** (#88): `AEGIS_AUTH_DISABLED=true`
+  now logs a `CRITICAL` `auth_disabled_active` event on every Core boot and shows a
+  red banner on the admin System-monitoring page (`auth_mode` in
+  `GET /api/admin/system/status`: `disabled` | `basic` | `api_key` | `basic+api_key`).
+  The flag is only safe behind a proxy that fully fronts port 8080 — combined with a
+  host-published port it grants full admin access to anyone on the network.
+- **Route auth-coverage regression test** (#88):
+  `tests/core/test_route_auth_coverage.py` walks every registered `/api` route and
+  fails if one answers an anonymous request, so a new router can't forget
+  `dependencies=[Depends(verify_auth)]`. Only `/health` and `/api/webhooks/*` are
+  allowlisted.
+- **Optional `X-Alert-Token` on `/api/webhooks/alert`** (#88): Alertmanager/Grafana
+  don't sign payloads, so this route had no verification at all. Setting
+  `AEGIS_ALERT_WEBHOOK_SECRET` now requires a matching header (constant-time compare);
+  unset keeps the previous open behaviour.
 - **Learning-loop input on Slack cards** (#71): approval/choice/ack interaction
   cards carry an optional "Why?" free-text input; a note typed with a button
   tap lands as `response.note` and becomes a durable `agent_memory` lesson.
