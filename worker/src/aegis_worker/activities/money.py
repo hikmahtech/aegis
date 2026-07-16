@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import html as _html
-import os
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from typing import Any
@@ -75,22 +74,22 @@ logger = structlog.get_logger()
 # statement minting a fake recurring charge, a failed payment-gateway notice).
 # The LLM prompt hardening is best-effort; this is the belt-and-suspenders
 # deterministic guard. Match is case-insensitive substring. Configured via
-# AEGIS_BANK_ALERT_SENDERS (comma-separated domains); default empty means the
-# guard is a clean no-op until a self-hoster adds their own bank's domains.
-_BANK_ALERT_SENDERS = frozenset(
-    s.strip().lower()
-    for s in os.getenv("AEGIS_BANK_ALERT_SENDERS", "").split(",")
-    if s.strip()
-)
+# Settings.bank_alert_senders (admin Integrations page; AEGIS_BANK_ALERT_SENDERS
+# env fallback), injected into MoneyActivities at worker bootstrap — default
+# empty means the guard is a clean no-op until a self-hoster adds their own
+# bank's domains.
+def parse_bank_alert_senders(raw: str) -> frozenset[str]:
+    """Comma-separated domains -> normalized frozenset (lowercased, stripped)."""
+    return frozenset(s.strip().lower() for s in (raw or "").split(",") if s.strip())
 
 
-def _is_bank_alert_sender(*candidates: str) -> bool:
+def _is_bank_alert_sender(*candidates: str, senders: frozenset[str]) -> bool:
     """True if any candidate sender string contains a known bank-alert domain."""
     for cand in candidates:
         if not cand:
             continue
         low = cand.lower()
-        if any(domain in low for domain in _BANK_ALERT_SENDERS):
+        if any(domain in low for domain in senders):
             return True
     return False
 
@@ -107,6 +106,10 @@ class MoneyActivities:
     # (gemma4:e2b) parse-failed ~81% of receipt-shaped mail in prod — wire the
     # smart tier here (worker __main__) so money data stops silently dropping.
     extract_model: str = "gemma4:e2b"
+    # Bank/card alert sender domains — deterministic guard; see
+    # parse_bank_alert_senders. Injected from Settings.bank_alert_senders
+    # (admin Integrations page, env AEGIS_BANK_ALERT_SENDERS fallback).
+    bank_alert_senders: frozenset[str] = frozenset()
 
     @activity.defn
     async def store_receipt_email(self, msg: dict, account: str) -> str:
@@ -246,7 +249,9 @@ class MoneyActivities:
                 # charge from a bank/card alert sender (autopay reminders,
                 # failed-payment notices, card statements). Belt-and-suspenders
                 # behind the LLM prompt hardening. Mark parsed so we don't re-LLM.
-                if _is_bank_alert_sender(e.get("sender", ""), e.get("sender_label", "")):
+                if _is_bank_alert_sender(
+                    e.get("sender", ""), e.get("sender_label", ""), senders=self.bank_alert_senders
+                ):
                     logger.info(
                         "money_skip_bank_alert_sender",
                         receipt_id=receipt_id,

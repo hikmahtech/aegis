@@ -13,8 +13,11 @@ from __future__ import annotations
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from aegis_worker.activities import money as money_module
-from aegis_worker.activities.money import MoneyActivities, _is_bank_alert_sender
+from aegis_worker.activities.money import (
+    MoneyActivities,
+    _is_bank_alert_sender,
+    parse_bank_alert_senders,
+)
 
 
 def _recording_pool():
@@ -31,35 +34,42 @@ def _recording_pool():
     return pool, conn
 
 
-def test_is_bank_alert_sender_default_empty_is_noop():
-    """AEGIS_BANK_ALERT_SENDERS unset ⇒ _BANK_ALERT_SENDERS is empty and the
-    guard never matches — a clean no-op until a self-hoster configures it."""
-    assert not money_module._BANK_ALERT_SENDERS
-    assert not _is_bank_alert_sender("alerts@axis.bank.in")
-    assert not _is_bank_alert_sender("", "")
-
-
-def test_is_bank_alert_sender_matches_substring(monkeypatch):
-    monkeypatch.setattr(
-        money_module, "_BANK_ALERT_SENDERS", frozenset({"axis.bank.in", "axisbank.com"})
+def test_parse_bank_alert_senders():
+    assert parse_bank_alert_senders("") == frozenset()
+    assert parse_bank_alert_senders(" Axis.Bank.in ,axisbank.com,, ") == frozenset(
+        {"axis.bank.in", "axisbank.com"}
     )
-    assert _is_bank_alert_sender("alerts@axis.bank.in")
-    assert _is_bank_alert_sender("", "ALERTS@AXISBANK.COM")  # case-insensitive
-    assert not _is_bank_alert_sender("billing@namecheap.com", "namecheap.com")
-    assert not _is_bank_alert_sender("", "")
+
+
+def test_is_bank_alert_sender_empty_set_is_noop():
+    """Empty senders set ⇒ the guard never matches — a clean no-op until a
+    self-hoster configures AEGIS_BANK_ALERT_SENDERS / the admin UI field."""
+    assert not _is_bank_alert_sender("alerts@axis.bank.in", senders=frozenset())
+    assert not _is_bank_alert_sender("", "", senders=frozenset())
+
+
+def test_is_bank_alert_sender_matches_substring():
+    senders = frozenset({"axis.bank.in", "axisbank.com"})
+    assert _is_bank_alert_sender("alerts@axis.bank.in", senders=senders)
+    assert _is_bank_alert_sender("", "ALERTS@AXISBANK.COM", senders=senders)  # case-insensitive
+    assert not _is_bank_alert_sender("billing@namecheap.com", "namecheap.com", senders=senders)
+    assert not _is_bank_alert_sender("", "", senders=senders)
 
 
 @pytest.mark.asyncio
-async def test_upsert_charges_skips_bank_alert_sender(monkeypatch):
+async def test_upsert_charges_skips_bank_alert_sender():
     """A receipt whose sender is a configured bank/card-alert domain must NOT
     be upserted as a recurring charge (the prod offenders: autopay reminders
     minting fake Google/AWS charges). A normal vendor receipt in the same
     batch IS written."""
-    monkeypatch.setattr(
-        money_module, "_BANK_ALERT_SENDERS", frozenset({"axis.bank.in"})
-    )
     pool, conn = _recording_pool()
-    act = MoneyActivities(db_pool=pool, llm=None, delivery=None, fx_rates={"USD": 84.5})
+    act = MoneyActivities(
+        db_pool=pool,
+        llm=None,
+        delivery=None,
+        fx_rates={"USD": 84.5},
+        bank_alert_senders=frozenset({"axis.bank.in"}),
+    )
 
     extractions = [
         {

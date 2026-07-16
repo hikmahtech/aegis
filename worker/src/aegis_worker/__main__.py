@@ -36,7 +36,7 @@ from aegis_worker.activities.intelligence import IntelligenceActivities
 from aegis_worker.activities.interactions import InteractionActivities
 from aegis_worker.activities.inventory import InventoryActivities
 from aegis_worker.activities.memory import MemoryActivities
-from aegis_worker.activities.money import MoneyActivities
+from aegis_worker.activities.money import MoneyActivities, parse_bank_alert_senders
 from aegis_worker.activities.raindrop import RaindropActivities
 from aegis_worker.activities.review import ReviewActivities
 from aegis_worker.activities.rss import RssActivities
@@ -281,6 +281,9 @@ async def main():
             fx_rates=getattr(settings, "money_hygiene_fx_rates", {}),
             home_currency=getattr(settings, "home_currency", "INR"),
             extract_model=deps.model_tiers.get("smart") or settings.model_smart,
+            bank_alert_senders=parse_bank_alert_senders(
+                getattr(settings, "bank_alert_senders", "")
+            ),
         )
 
     channel_act = ChannelActivities(db_pool=deps.pool)
