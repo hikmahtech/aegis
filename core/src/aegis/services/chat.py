@@ -22,7 +22,7 @@ from jsonschema.exceptions import ValidationError as JSONSchemaValidationError
 
 from aegis.llm import parse_llm_json
 from aegis.llm.tier import resolve_model_for_agent
-from aegis.observability import record_llm_call, record_tool_call
+from aegis.observability import log_audit, record_llm_call, record_tool_call
 from aegis.services.todoist_config import resolve_todoist_api_key
 
 logger = structlog.get_logger()
@@ -388,6 +388,39 @@ CHAT_TOOLS = [
                     "params": {"type": "object", "description": "Optional workflow parameters"},
                 },
                 "required": ["workflow_type"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "create_schedule",
+            "description": (
+                "Create a new recurring schedule for an existing flow type. "
+                "Use when the user asks to run something on a cadence "
+                "(e.g. 'also run the daily briefing at 7am'). Takes effect within ~5 minutes."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "workflow_type": {
+                        "type": "string",
+                        "description": "An existing flow class name, e.g. DailyBriefingFlow. Use query_activities to see valid types.",
+                    },
+                    "cron": {
+                        "type": "string",
+                        "description": "5-field UTC cron, e.g. '30 2 * * *' (= 08:00 IST). Minimum interval 5 minutes.",
+                    },
+                    "slug": {
+                        "type": "string",
+                        "description": "Optional unique short name; auto-derived when omitted.",
+                    },
+                    "config": {
+                        "type": "object",
+                        "description": "Optional flow tuning knobs (same keys as the existing activity of this type).",
+                    },
+                },
+                "required": ["workflow_type", "cron"],
             },
         },
     },
@@ -1962,6 +1995,56 @@ async def _exec_trigger_workflow(pool: asyncpg.Pool, args: dict, ctx: ToolContex
     return json.dumps(result, default=str)
 
 
+async def _exec_create_schedule(pool: asyncpg.Pool, args: dict, ctx: ToolContext) -> str:
+    """Insert an activities row from NL-filled tool args; schedule_sync reconciles it
+    into a live Temporal schedule on its ~300s tick — no worker restart needed."""
+    workflow_type = (args.get("workflow_type") or "").strip()
+    cron = (args.get("cron") or "").strip()
+    valid_rows = await pool.fetch("SELECT DISTINCT workflow_type FROM activities ORDER BY 1")
+    valid = [r["workflow_type"] for r in valid_rows]
+    if workflow_type not in valid:
+        return json.dumps(
+            {"error": f"unknown workflow_type '{workflow_type}'; valid types: {', '.join(valid)}"}
+        )
+    fields = cron.split()
+    if len(fields) != 5:
+        return json.dumps({"error": "cron must have exactly 5 fields (min hour dom mon dow), UTC"})
+    minute = fields[0]
+    if minute == "*" or (minute.startswith("*/") and minute[2:].isdigit() and int(minute[2:]) < 5):
+        return json.dumps({"error": "schedules more frequent than every 5 minutes are not allowed"})
+    slug = (args.get("slug") or "").strip() or f"nl-{workflow_type.lower()}-{uuid4().hex[:4]}"
+    config = dict(args.get("config") or {})
+    config["created_by"] = "chat"
+    agent_id = ctx.agent_id or "sebas"
+    try:
+        row = await pool.fetchrow(
+            "INSERT INTO activities (slug, workflow_type, agent_id, schedule_cron, config, active) "
+            "VALUES ($1,$2,$3,$4,$5,TRUE) "
+            "RETURNING slug, workflow_type, agent_id, schedule_cron",
+            slug,
+            workflow_type,
+            agent_id,
+            cron,
+            config,
+        )
+    except asyncpg.UniqueViolationError:
+        return json.dumps({"error": f"slug '{slug}' already exists — pick another"})
+    except asyncpg.ForeignKeyViolationError:
+        return json.dumps({"error": f"agent '{agent_id}' not found"})
+    await log_audit(
+        pool,
+        actor=f"chat:{agent_id}",
+        action="activity_created",
+        target_type="activity",
+        target_id=slug,
+        details={"workflow_type": workflow_type, "cron": cron},
+    )
+    return json.dumps(
+        {
+            "created": dict(row),
+            "note": "live within ~5 minutes (schedule_sync tick); manage it on the admin Flows page",
+        }
+    )
 
 
 async def _exec_get_quote(pool: asyncpg.Pool, args: dict, ctx: ToolContext) -> str:
@@ -3053,6 +3136,7 @@ TOOL_EXECUTORS: dict[str, Any] = {
     "remember_this": _exec_remember_this,
     "query_activities": _exec_query_activities,
     "trigger_workflow": _exec_trigger_workflow,
+    "create_schedule": _exec_create_schedule,
     "get_quote": _exec_get_quote,
     "get_market_overview": _exec_get_market_overview,
     "get_finance_news": _exec_get_finance_news,
