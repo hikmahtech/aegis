@@ -164,6 +164,68 @@ async def test_check_llm_budget_under_budget_with_no_switch_is_quiet(db_pool):
         g.invalidate_kill_cache()
 
 
+# --- flow (edge-triggered alerting) -------------------------------------------
+
+
+async def _run_flow(budget_result: dict) -> list[str]:
+    """Run LLMSpendGuardFlow against a stubbed activity; return alerts sent."""
+    import uuid
+
+    from aegis_worker.flows.llm_spend_guard import LLMSpendGuardConfig, LLMSpendGuardFlow
+    from temporalio import activity
+    from temporalio.testing import WorkflowEnvironment
+    from temporalio.worker import Worker
+
+    sent: list[str] = []
+
+    @activity.defn(name="check_llm_budget")
+    async def check_llm_budget() -> dict:
+        return budget_result
+
+    @activity.defn(name="send_system_event")
+    async def send_system_event(message: str, chat_id: int = 0) -> dict:
+        sent.append(message)
+        return {"ok": True}
+
+    async with await WorkflowEnvironment.start_time_skipping() as env:
+        task_queue = f"tq-{uuid.uuid4().hex[:8]}"
+        async with Worker(
+            env.client,
+            task_queue=task_queue,
+            workflows=[LLMSpendGuardFlow],
+            activities=[check_llm_budget, send_system_event],
+        ):
+            await env.client.execute_workflow(
+                LLMSpendGuardFlow.run,
+                LLMSpendGuardConfig(agent_id="pandoras-actor"),
+                id=f"wf-{uuid.uuid4().hex[:8]}",
+                task_queue=task_queue,
+            )
+    return sent
+
+
+async def test_flow_alerts_on_breach():
+    sent = await _run_flow(
+        {"breached": True, "cleared": False, "tokens": 9, "budget": 1, "message": "over budget"}
+    )
+    assert sent == ["over budget"]
+
+
+async def test_flow_alerts_on_clear():
+    sent = await _run_flow(
+        {"breached": False, "cleared": True, "tokens": 1, "budget": 9, "message": "recovered"}
+    )
+    assert sent == ["recovered"]
+
+
+async def test_flow_is_silent_when_nothing_changed():
+    """The 15-min tick must not post anything on a normal, quiet run."""
+    sent = await _run_flow(
+        {"breached": False, "cleared": False, "tokens": 1, "budget": 9, "message": ""}
+    )
+    assert sent == []
+
+
 # --- registration (the four-place ritual) -------------------------------------
 
 
