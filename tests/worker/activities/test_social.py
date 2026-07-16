@@ -618,6 +618,105 @@ async def test_post_postiz_missing_config_raises(social_env):
         await connector.close()
 
 
+# --------------------------------------- postiz linkedin first-comment (#83)
+
+
+@respx.mock
+async def test_postiz_linkedin_link_becomes_first_comment(social_env):
+    """LinkedIn penalizes in-body links — text and link ship as two `value`
+    items so Postiz's LinkedIn provider posts the link as a first comment."""
+    account_id = await _seed_postiz_account(social_env, platform="linkedin", integration_id="int-li")
+    route = respx.post("https://postiz.example.com/api/public/v1/posts").respond(
+        200, json=[{"postId": "pz-1", "integration": "int-li"}]
+    )
+    connector = SocialConnector(db_pool=social_env, settings=_settings_with_postiz())
+    try:
+        ref = await connector.post(
+            account_id, {"text": "Big launch today", "link": "https://example.com/post"}
+        )
+        assert ref == "pz-1"
+        body = json.loads(route.calls[0].request.content)
+        assert body["posts"][0]["value"] == [
+            {"content": "Big launch today", "image": []},
+            {"content": "https://example.com/post", "image": []},
+        ]
+    finally:
+        await connector.close()
+
+
+@respx.mock
+async def test_postiz_linkedin_page_also_splits(social_env):
+    """The `linkedin-page` identifier (company pages) gets the same treatment
+    as personal `linkedin` accounts."""
+    account_id = await _seed_postiz_account(
+        social_env, platform="linkedin-page", integration_id="int-lip"
+    )
+    route = respx.post("https://postiz.example.com/api/public/v1/posts").respond(
+        200, json=[{"postId": "pz-2", "integration": "int-lip"}]
+    )
+    connector = SocialConnector(db_pool=social_env, settings=_settings_with_postiz())
+    try:
+        await connector.post(account_id, {"text": "hi", "link": "https://l.example"})
+        body = json.loads(route.calls[0].request.content)
+        assert body["posts"][0]["value"] == [
+            {"content": "hi", "image": []},
+            {"content": "https://l.example", "image": []},
+        ]
+    finally:
+        await connector.close()
+
+
+@respx.mock
+async def test_postiz_linkedin_no_link_single_item(social_env):
+    """No link at all → unchanged single-item body, same as every other platform."""
+    account_id = await _seed_postiz_account(social_env, platform="linkedin", integration_id="int-li2")
+    route = respx.post("https://postiz.example.com/api/public/v1/posts").respond(
+        200, json=[{"postId": "pz-3", "integration": "int-li2"}]
+    )
+    connector = SocialConnector(db_pool=social_env, settings=_settings_with_postiz())
+    try:
+        await connector.post(account_id, {"text": "no link here", "link": ""})
+        body = json.loads(route.calls[0].request.content)
+        assert body["posts"][0]["value"] == [{"content": "no link here", "image": []}]
+    finally:
+        await connector.close()
+
+
+@respx.mock
+async def test_postiz_linkedin_link_only_stays_in_body(social_env):
+    """A link with no body text can't become a first comment on nothing — it
+    stays as the sole (in-body) value item, matching _render_text."""
+    account_id = await _seed_postiz_account(social_env, platform="linkedin", integration_id="int-li3")
+    route = respx.post("https://postiz.example.com/api/public/v1/posts").respond(
+        200, json=[{"postId": "pz-4", "integration": "int-li3"}]
+    )
+    connector = SocialConnector(db_pool=social_env, settings=_settings_with_postiz())
+    try:
+        await connector.post(account_id, {"text": "", "link": "https://only.example"})
+        body = json.loads(route.calls[0].request.content)
+        assert body["posts"][0]["value"] == [{"content": "https://only.example", "image": []}]
+    finally:
+        await connector.close()
+
+
+@respx.mock
+async def test_postiz_non_linkedin_keeps_link_in_body(social_env):
+    """Non-LinkedIn platforms are unaffected — link stays appended in-body."""
+    account_id = await _seed_postiz_account(social_env, platform="x", integration_id="int-x")
+    route = respx.post("https://postiz.example.com/api/public/v1/posts").respond(
+        200, json=[{"postId": "pz-5", "integration": "int-x"}]
+    )
+    connector = SocialConnector(db_pool=social_env, settings=_settings_with_postiz())
+    try:
+        await connector.post(account_id, {"text": "tweet", "link": "https://t.example"})
+        body = json.loads(route.calls[0].request.content)
+        assert body["posts"][0]["value"] == [
+            {"content": "tweet\n\nhttps://t.example", "image": []}
+        ]
+    finally:
+        await connector.close()
+
+
 # ------------------------------------------------- postiz per-platform settings
 
 
