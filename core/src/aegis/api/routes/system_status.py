@@ -174,6 +174,29 @@ async def _probe_services(pool, settings: Settings) -> dict[str, Any]:
     return result
 
 
+def _auth_mode(settings: Settings) -> str:
+    """How the API authenticates callers — surfaced so an auth-disabled
+    deployment is visible in the admin UI rather than only in the boot log (#88).
+
+    Reflects the env-configured credentials only. An admin-generated API key
+    lives encrypted in the settings table (services/api_key.py) and also works
+    in every mode except "disabled"; it is deliberately not probed here.
+
+    "disabled" means verify_auth accepts anonymous requests on every route.
+    """
+    if settings.auth_disabled:
+        return "disabled"
+    has_basic = bool(settings.admin_username and settings.admin_password)
+    has_key = bool(settings.api_key)
+    if has_basic and has_key:
+        return "basic+api_key"
+    if has_key:
+        return "api_key"
+    if has_basic:
+        return "basic"
+    return "none"
+
+
 @router.get("/status")
 async def system_status(
     request: Request, settings: Settings = Depends(get_settings)
@@ -205,6 +228,7 @@ async def system_status(
 
     return {
         "status": overall,
+        "auth_mode": _auth_mode(settings),
         "db": db,
         "services": services,
         "temporal": temporal,

@@ -31,6 +31,21 @@ async def lifespan(app: FastAPI):
     settings = get_settings()
     logger.info("aegis_v2_starting")
 
+    # An auth-disabled deployment must never be silent (#88): every /api route
+    # accepts anonymous requests in this mode, so it is only safe when an
+    # authenticating proxy fully fronts port 8080. Logged at CRITICAL on every
+    # boot so it is visible in `docker service logs` / Loki.
+    if settings.auth_disabled:
+        logger.critical(
+            "auth_disabled_active",
+            detail=(
+                "AEGIS_AUTH_DISABLED=true — every /api route accepts anonymous "
+                "requests. This is only safe behind an authenticating proxy that "
+                "fully fronts port 8080. If 8080 is host-published, anyone who "
+                "can reach it has full admin access. See SECURITY.md."
+            ),
+        )
+
     # Fail fast if any agent's tool set references a missing executor.
     _validate_agent_tool_sets()
 

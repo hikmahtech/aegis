@@ -244,3 +244,79 @@ async def test_duplicate_fingerprint_real_db(alert_client_real_db):
     assert r2.json()["started"] == 0
     assert r2.json()["skipped"] == 1
     assert temporal.start_workflow.await_count == 1
+
+
+# ---------------------------------------------------------------------------
+# Optional X-Alert-Token shared secret (#88)
+#
+# Alertmanager/Grafana don't sign payloads, so this endpoint has no vendor HMAC.
+# Setting AEGIS_ALERT_WEBHOOK_SECRET requires a matching header; unset keeps the
+# legacy open behaviour.
+# ---------------------------------------------------------------------------
+
+
+@pytest_asyncio.fixture(loop_scope="function")
+async def token_client(temporal_stub):
+    """Client factory parametrised by the configured secret."""
+
+    @asynccontextmanager
+    async def _build(secret: str):
+        settings = Settings(**{**_TEST_SETTINGS, "alert_webhook_secret": secret})
+        pool, _ = _mock_pool(fetchval_return="tok-1")
+        app = create_app(run_lifespan=False)
+        app.state.db_pool = pool
+        app.dependency_overrides[get_settings] = lambda: settings
+        app.dependency_overrides[get_workflow_client] = lambda: temporal_stub
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+            yield c
+
+    return _build
+
+
+_FIRING = json.dumps(
+    {
+        "alerts": [
+            {
+                "status": "firing",
+                "labels": {"alertname": "TokenTest", "instance": "node-a"},
+                "annotations": {"summary": "token test"},
+                "fingerprint": "tok-1",
+            }
+        ]
+    }
+).encode()
+
+
+async def test_alert_webhook_rejects_missing_token(token_client, temporal_stub):
+    async with token_client("s3cret") as c:
+        resp = await c.post("/api/webhooks/alert", content=_FIRING)
+    assert resp.status_code == 401
+    # Rejected before any flow is spawned — that's the whole point.
+    temporal_stub.start_workflow.assert_not_awaited()
+
+
+async def test_alert_webhook_rejects_wrong_token(token_client, temporal_stub):
+    async with token_client("s3cret") as c:
+        resp = await c.post(
+            "/api/webhooks/alert", content=_FIRING, headers={"X-Alert-Token": "wrong"}
+        )
+    assert resp.status_code == 401
+    temporal_stub.start_workflow.assert_not_awaited()
+
+
+async def test_alert_webhook_accepts_good_token(token_client, temporal_stub):
+    async with token_client("s3cret") as c:
+        resp = await c.post(
+            "/api/webhooks/alert", content=_FIRING, headers={"X-Alert-Token": "s3cret"}
+        )
+    assert resp.status_code == 200
+    assert resp.json()["started"] == 1
+    temporal_stub.start_workflow.assert_awaited()
+
+
+async def test_alert_webhook_open_when_secret_unset(token_client):
+    """Backward compatible: no secret configured = no token required."""
+    async with token_client("") as c:
+        resp = await c.post("/api/webhooks/alert", content=_FIRING)
+    assert resp.status_code == 200
+    assert resp.json()["started"] == 1

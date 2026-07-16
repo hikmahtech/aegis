@@ -32,6 +32,7 @@ interface TemporalStatus {
 
 interface SystemStatus {
   status?: 'ok' | 'degraded';
+  auth_mode?: 'disabled' | 'basic' | 'api_key' | 'basic+api_key' | 'none';
   db?: DbStatus;
   services?: ServicesStatus;
   temporal?: TemporalStatus;
@@ -103,6 +104,28 @@ export default function SystemMonitoring() {
       </div>
 
       <ErrorBanner error={error} onDismiss={() => setError(null)} />
+
+      {data?.auth_mode === 'disabled' && (
+        <div
+          style={{
+            background: 'var(--danger-tint)',
+            border: '1px solid #fecdca',
+            color: 'var(--danger-text)',
+            padding: '10px 14px',
+            margin: '8px 0 1rem',
+            borderRadius: 'var(--radius-sm)',
+          }}
+        >
+          <strong>⚠ Authentication is disabled</strong>
+          <p style={{ margin: '0.4rem 0 0', fontSize: '0.9rem' }}>
+            <code>AEGIS_AUTH_DISABLED=true</code> — every <code>/api</code> route accepts
+            anonymous requests. This is only safe when an authenticating proxy fully fronts
+            port 8080. If that port is published on the host, anyone who can reach it has
+            full admin access. Set <code>AEGIS_ADMIN_USERNAME</code> /{' '}
+            <code>AEGIS_ADMIN_PASSWORD</code> and remove the flag.
+          </p>
+        </div>
+      )}
 
       <div className="card-grid" style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(280px, 1fr))', gap: '1rem' }}>
         {/* Database */}
