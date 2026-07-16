@@ -57,8 +57,14 @@ async def put_backend(
     # Live-reload core's client + tier map (the worker picks up on next restart).
     backend = await get_llm_backend(pool, settings, use_cache=False)
     set_model_tiers(backend["tiers"])
+    # db_pool=pool keeps the spend-governor kill switch wired through a
+    # live backend swap — without it, saving a backend would silently
+    # replace app.state.llm with an ungoverned client until the next restart.
     request.app.state.llm = LLMClient(
-        base_url=backend["base_url"], api_key=backend["api_key"], timeout=settings.litellm_timeout
+        base_url=backend["base_url"],
+        api_key=backend["api_key"],
+        timeout=settings.litellm_timeout,
+        db_pool=pool,
     )
     request.app.state.llm_backend = backend
     return {"ok": True, "tiers": backend["tiers"], "api_key_set": bool(backend["api_key"])}
@@ -75,6 +81,9 @@ async def test_backend(
     model = tiers.get("fast") or tiers.get("balanced") or next(iter(tiers.values()), "")
     if not base_url or not model:
         return {"ok": False, "error": "missing base_url or a tier model"}
+    # Deliberately ungoverned (no db_pool): this is a one-shot ops
+    # connectivity check worth ~50 tokens, and it must stay usable while the
+    # spend kill switch is active so you can verify a backend before clearing.
     client = LLMClient(base_url=base_url, api_key=api_key, timeout=30)
     try:
         result = await client.think(

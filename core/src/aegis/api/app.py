@@ -95,6 +95,7 @@ async def lifespan(app: FastAPI):
         base_url=backend["base_url"],
         api_key=backend["api_key"],
         timeout=settings.litellm_timeout,
+        db_pool=pool,
     )
     app.state.llm = llm
 

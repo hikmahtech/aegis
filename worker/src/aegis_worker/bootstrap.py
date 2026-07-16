@@ -75,6 +75,7 @@ async def bootstrap(settings: Settings | None = None) -> WorkerDeps:
         api_key=backend["api_key"],
         timeout=settings.litellm_timeout,
         concurrency_limits={settings.model_fast: 2},
+        db_pool=pool,
     )
 
     # Connectors (created if configured, None if not)
