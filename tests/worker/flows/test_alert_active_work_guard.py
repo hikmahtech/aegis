@@ -280,8 +280,14 @@ async def stub_resolve_agents(tags):
     return {t: seed.get(t) for t in tags}
 
 
+@activity.defn(name="get_alert_routing_config")
+async def stub_get_alert_routing_config() -> dict:
+    return {"infra_cluster": ""}
+
+
 ALL_ACTIVITIES = [
     stub_resolve_agents,
+    stub_get_alert_routing_config,
     stub_check_alert_mute,
     stub_write_alert_mute,
     stub_check_dedup,

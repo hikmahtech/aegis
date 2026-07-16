@@ -36,7 +36,7 @@ from aegis_worker.activities.intelligence import IntelligenceActivities
 from aegis_worker.activities.interactions import InteractionActivities
 from aegis_worker.activities.inventory import InventoryActivities
 from aegis_worker.activities.memory import MemoryActivities
-from aegis_worker.activities.money import MoneyActivities
+from aegis_worker.activities.money import MoneyActivities, parse_bank_alert_senders
 from aegis_worker.activities.raindrop import RaindropActivities
 from aegis_worker.activities.review import ReviewActivities
 from aegis_worker.activities.rss import RssActivities
@@ -214,6 +214,7 @@ async def main():
         # temporal_namespace defaults to "default" on the dataclass — the worker
         # client connects to the "default" namespace too (see Client.connect
         # below). Wire a settings field here if a non-default namespace is added.
+        infra_cluster=getattr(settings, "infra_cluster", "") or "",
     )
     briefing_act = BriefingActivities(
         db_pool=deps.pool,
@@ -281,6 +282,9 @@ async def main():
             fx_rates=getattr(settings, "money_hygiene_fx_rates", {}),
             home_currency=getattr(settings, "home_currency", "INR"),
             extract_model=deps.model_tiers.get("smart") or settings.model_smart,
+            bank_alert_senders=parse_bank_alert_senders(
+                getattr(settings, "bank_alert_senders", "")
+            ),
         )
 
     channel_act = ChannelActivities(db_pool=deps.pool)
@@ -465,6 +469,7 @@ async def main():
         alert_act.post_task_note,
         alert_act.record_verdict_to_kg,
         alert_act.upload_kimi_log,
+        alert_act.get_alert_routing_config,
         briefing_act.ingest_briefing,
         briefing_act.gather_market_data,
         briefing_act.format_market_section,

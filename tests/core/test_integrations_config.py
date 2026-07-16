@@ -82,3 +82,21 @@ async def test_boolean_flag_get_state(clean_int):
     items = await get_integrations(clean_int, s)
     t = next(i for i in items if i["key"] == "tts_enabled")
     assert t["boolean"] is True and t["value"] is True and t["source"] == "db"
+
+
+async def test_infra_cluster_and_bank_alert_senders_overlay(clean_int):
+    """#91 — infra_cluster + bank_alert_senders are now registry-backed:
+    a DB value overrides the env default, an unset DB row keeps the env."""
+    s = _settings(infra_cluster="env-cluster", bank_alert_senders="")
+    await save_integration(clean_int, s, "infra_cluster", "homelab-swarm")
+    await save_integration(clean_int, s, "bank_alert_senders", "axisbank.com, hdfcbank.net")
+    await apply_config_overrides(s, clean_int)
+    assert s.infra_cluster == "homelab-swarm"
+    assert s.bank_alert_senders == "axisbank.com, hdfcbank.net"
+
+
+async def test_infra_cluster_empty_db_value_keeps_env(clean_int):
+    s = _settings(infra_cluster="env-cluster")
+    await save_integration(clean_int, s, "infra_cluster", "")
+    await apply_config_overrides(s, clean_int)
+    assert s.infra_cluster == "env-cluster"

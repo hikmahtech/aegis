@@ -208,8 +208,14 @@ async def stub_resolve_agents(tags):
     return {t: seed.get(t) for t in tags}
 
 
+@activity.defn(name="get_alert_routing_config")
+async def stub_get_alert_routing_config() -> dict:
+    return {"infra_cluster": ""}
+
+
 ALL_STUBS = [
     stub_resolve_agents,
+    stub_get_alert_routing_config,
     stub_find_open_task,
     stub_record_recurrence,
     stub_record_new_task,

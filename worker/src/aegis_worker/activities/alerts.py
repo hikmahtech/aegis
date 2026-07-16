@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import os
 import re
 import time
 from collections import Counter
@@ -68,12 +67,6 @@ INFRA_ALERTNAMES: frozenset[str] = frozenset(
     }
 )
 
-# Cluster label value that identifies infra/swarm alerts, read once at import
-# from AEGIS_INFRA_CLUSTER (mirrors Settings.infra_cluster; default blank →
-# cluster-label matching is off). Read via os.getenv rather than Settings() so
-# importing this module never requires a full (DB-bearing) settings object.
-_INFRA_CLUSTER = os.getenv("AEGIS_INFRA_CLUSTER", "")
-
 # Slug / github_repo of the resource that infra alerts route to.
 _HOMELAB_GITOPS_SLUG = "repo-infra-gitops"
 _HOMELAB_GITOPS_REPO = "example/infra-gitops"
@@ -91,27 +84,29 @@ _REMEDIATE_POLL_INTERVAL_S = 5
 _HINT_REPO_RE = re.compile(r"^[\w.-]+/[\w.-]+$")
 
 
-def is_infra_alert(alert: dict, infra_cluster: str | None = None) -> bool:
+def is_infra_alert(alert: dict, infra_cluster: str = "") -> bool:
     """Return True when the alert is an infrastructure / swarm alert.
 
     Matches on alertname (checked against INFRA_ALERTNAMES) OR on the
-    `cluster` label equalling the configured infra cluster
-    (AEGIS_INFRA_CLUSTER; blank ⇒ cluster matching is off). Infra alerts have
-    no application code repo and should be routed directly to infra-gitops
-    instead of going through the LLM repo-match.
+    `cluster` label equalling `infra_cluster` (Settings.infra_cluster — admin
+    Integrations page, AEGIS_INFRA_CLUSTER env fallback; blank ⇒ cluster
+    matching is off). Callers pass the value explicitly — workflows fetch it
+    once via AlertActivities.get_alert_routing_config since they can't read
+    Settings/DB directly. Infra alerts have no application code repo and
+    should be routed directly to infra-gitops instead of going through the
+    LLM repo-match.
     """
-    match_cluster = _INFRA_CLUSTER if infra_cluster is None else infra_cluster
     labels = alert.get("labels") or {}
     if not isinstance(labels, dict):
         labels = {}
     cluster = (labels.get("cluster") or "").strip()
-    if match_cluster and cluster == match_cluster:
+    if infra_cluster and cluster == infra_cluster:
         return True
     alertname = (labels.get("alertname") or "").strip().lower()
     return alertname in INFRA_ALERTNAMES
 
 
-def build_alert_signature(alert: dict) -> str:
+def build_alert_signature(alert: dict, infra_cluster: str = "") -> str:
     """Derive a coarse cluster key for related alerts (beyond fingerprint).
 
     Sentry mints a fresh issue id for every stack-frame variation of the
@@ -155,7 +150,7 @@ def build_alert_signature(alert: dict) -> str:
 
         # Infra/swarm storm collapse: key on cluster+alertname, NOT instance/service,
         # so one outage (N nodes down) maps to ONE signature and one open task.
-        if is_infra_alert(alert):
+        if is_infra_alert(alert, infra_cluster):
             cluster = (labels.get("cluster") or "").strip() if isinstance(labels, dict) else ""
             subkey = alertname.lower()
             if not subkey:
@@ -474,6 +469,16 @@ class AlertActivities:
     # empty url => the footer degrades to the plain (non-clickable) marker.
     temporal_ui_url: str = ""
     temporal_namespace: str = "default"
+    # Prometheus `cluster` label that marks infra/swarm alerts. Injected from
+    # Settings.infra_cluster (admin Integrations page; AEGIS_INFRA_CLUSTER
+    # env fallback). Blank = cluster-label matching off.
+    infra_cluster: str = ""
+
+    @activity.defn
+    async def get_alert_routing_config(self) -> dict:
+        """Settings-derived routing knobs for the flow (workflows can't read
+        Settings/DB — mirror of the AgentRegistryActivities pattern)."""
+        return {"infra_cluster": self.infra_cluster}
 
     async def _effective_runbooks_dir(self) -> str:
         """Runbooks dir, DB-first: the infra coding block (via the connector)

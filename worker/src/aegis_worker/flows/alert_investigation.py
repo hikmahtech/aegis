@@ -368,6 +368,21 @@ class AlertInvestigationFlow:
                 await self._safe_event(f"🔕 Muted: {_html_escape(title)}")
                 return {"status": "muted", "task_id": None}
 
+        # ── Step 2.65: Routing config — infra_cluster (#91) ──
+        # is_infra_alert/build_alert_signature can't read Settings/DB from
+        # workflow code, so fetch the configured cluster label once here via
+        # a tiny activity. workflow.patched guards in-flight runs started
+        # before this change so they keep replaying the pre-patch (env-only)
+        # behavior instead of non-deterministically diverging mid-history.
+        infra_cluster = ""
+        if workflow.patched("infra-cluster-from-settings"):
+            routing = await workflow.execute_activity_method(
+                AlertActivities.get_alert_routing_config,
+                start_to_close_timeout=TIMEOUT_FAST,
+                retry_policy=FAST,
+            )
+            infra_cluster = routing.get("infra_cluster") or ""
+
         # ── Step 2.7: Signature dedup — attach to existing open task ──
         # Sentry mints a new issue id per stack-frame variation, so
         # check_dedup (fingerprint-exact) lets each variation through.
@@ -377,7 +392,7 @@ class AlertInvestigationFlow:
         # note and skip a duplicate investigation. Caller-supplied
         # todoist_task_id (clarify-APP path) bypasses signature dedup —
         # the caller has explicitly anchored to a specific task.
-        signature = build_alert_signature(alert)
+        signature = build_alert_signature(alert, infra_cluster)
         if signature and not alert.get("todoist_task_id"):
             existing_task_id = await workflow.execute_activity_method(
                 AlertActivities.find_open_task_for_signature,
@@ -553,7 +568,7 @@ class AlertInvestigationFlow:
         # Infra/swarm alerts (NodeDown, DockerServiceDown, cluster=homelab-swarm, ...)
         # have no application code repo. Resolve them deterministically to
         # infra-gitops, skipping the LLM repo-match entirely.
-        _is_infra = is_infra_alert(alert)
+        _is_infra = is_infra_alert(alert, infra_cluster)
         if _is_infra:
             # ── Step 4.0: Auto-remediation (force-restart) ──
             # A swarm service below desired replicas is usually a stuck/unplaced

@@ -59,7 +59,21 @@ CONFIG_REGISTRY: list[ConfigKey] = [
     ConfigKey("searxng_url", "Base URL", "Search (SearXNG)", False),
     ConfigKey("finance_provider", "Provider (yahoo | stooq)", "Finance", False),
     ConfigKey("finance_indices", "Overview indices (comma-sep symbols)", "Finance", False),
+    ConfigKey(
+        "bank_alert_senders", "Bank/card alert sender domains (comma-sep)",
+        "Finance", False,
+        help="Mail from these domains is treated as bank ALERTS (statements, autopay "
+        "reminders), never as receipts — stops fake recurring charges. "
+        "Worker restart required.",
+    ),
     ConfigKey("aegis_stack_name", "Swarm stack name (blank = show all services)", "System Monitoring", False),
+    ConfigKey(
+        "infra_cluster", "Infra cluster label (Prometheus `cluster` label)",
+        "System Monitoring", False,
+        help="Alerts whose cluster label equals this value route straight to infra-gitops, "
+        "skipping the LLM repo-match. Blank = alertname matching only. "
+        "Worker restart required; a set env var can only be overridden, not blanked, from here.",
+    ),
     # Feature flags — enable/disable whole subsystems. Off by default unless noted.
     # `help` names the extra config a feature needs to actually work.
     ConfigKey(

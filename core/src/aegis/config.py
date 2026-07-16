@@ -148,8 +148,14 @@ class Settings(BaseSettings):
     # infra/swarm alert (routed straight to infra-gitops, skipping the LLM
     # repo-match). Blank ⇒ the cluster-label fast path is off; alertname
     # matching (INFRA_ALERTNAMES) still classifies infra alerts. Set this to
-    # your own cluster label to also route by cluster.
+    # your own cluster label to also route by cluster. Editable from the
+    # admin Integrations page.
     infra_cluster: str = ""
+    # Bank / card-alert sender domains (comma-separated, case-insensitive
+    # substring match). Deterministic guard in Money Hygiene that stops bank
+    # statements / autopay reminders from minting fake recurring charges.
+    # Empty = guard off. Editable from the admin Integrations page.
+    bank_alert_senders: str = ""
     # Per-alert runbook directory — baked into the worker image at /app/runbooks.
     runbooks_dir: str = "/app/runbooks"
     # Swarm stack name AEGIS itself is deployed as. The System Monitoring page

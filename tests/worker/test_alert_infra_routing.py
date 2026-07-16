@@ -168,6 +168,22 @@ def test_build_signature_sentry_alert_unchanged():
     assert build_alert_signature(alert) == "sentry-class:bcp:KeyError"
 
 
+def test_build_alert_signature_infra_cluster_param():
+    alert = {
+        "source": "alertmanager",
+        "labels": {"alertname": "SomeAppAlert", "cluster": "my-swarm", "instance": "node-a"},
+    }
+    # cluster match only via the explicit param now
+    assert build_alert_signature(alert, infra_cluster="my-swarm").startswith("alertmanager-class:")
+    assert build_alert_signature(alert) != build_alert_signature(alert, infra_cluster="my-swarm")
+
+
+async def test_get_alert_routing_config_activity():
+    act = AlertActivities(infra_cluster="homelab-swarm")
+    env = ActivityEnvironment()
+    assert await env.run(act.get_alert_routing_config) == {"infra_cluster": "homelab-swarm"}
+
+
 def test_build_signature_non_infra_alertmanager_uses_service():
     """Non-infra alertmanager alerts still key on service."""
     alert = {
@@ -458,6 +474,11 @@ async def _stub_record_verdict_to_kg(alert: dict, verdict: dict, investigation_o
     return {"ingested": False, "reason": "stub"}
 
 
+@activity.defn(name="get_alert_routing_config")
+async def _stub_get_alert_routing_config() -> dict:
+    return {"infra_cluster": _flow_state.get("infra_cluster", "")}
+
+
 @activity.defn(name="insert_interaction")
 async def _stub_insert_interaction(inp: InsertInteractionInput) -> InsertInteractionResult:
     return InsertInteractionResult(interaction_id="ia-infra-test")
@@ -520,6 +541,7 @@ _ALL_FLOW_ACTIVITIES = [
     _stub_post_task_note,
     _stub_upload_kimi_log,
     _stub_record_verdict_to_kg,
+    _stub_get_alert_routing_config,
     _stub_insert_interaction,
     _stub_send_card,
     _stub_resolve_interaction,
