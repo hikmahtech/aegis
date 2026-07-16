@@ -207,14 +207,27 @@ async def alert_webhook(
 ):
     """Generic alert webhook (Alertmanager/Grafana).
 
-    Unsigned — rely on Traefik IP-whitelist for access control
-    (internal network only, same as the deleted n8n route it replaces).
+    Alertmanager and Grafana don't sign their payloads, so there is no vendor
+    HMAC to verify here. Set ``AEGIS_ALERT_WEBHOOK_SECRET`` to require a
+    matching ``X-Alert-Token`` header; leaving it empty keeps the endpoint
+    unauthenticated (the legacy default, kept for backward compatibility).
+
+    An unauthenticated alert endpoint lets anyone who can reach the port mint
+    fake alerts, each spawning an AlertInvestigationFlow that burns LLM budget
+    and posts to Todoist/Slack — so set the secret whenever port 8080 is not
+    fully fronted by an authenticating proxy (#88).
 
     Body: Alertmanager v2 or Grafana Unified Alerting JSON. Each alert
     in the payload spawns one AlertInvestigationFlow child. Dedup'd via
     ingest_idempotency on the alert's fingerprint (or a derived one if
     missing).
     """
+    if settings.alert_webhook_secret:
+        token = request.headers.get("X-Alert-Token") or ""
+        if not hmac.compare_digest(token, settings.alert_webhook_secret):
+            logger.warning("alert_webhook_bad_token")
+            raise HTTPException(status_code=401, detail="bad_token")
+
     body = await request.body()
     try:
         payload = _json.loads(body)

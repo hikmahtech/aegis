@@ -192,6 +192,11 @@ class Settings(BaseSettings):
     # Kept as env vars (not settings table) per spec §15 resolution.
     github_webhook_secret: str = ""  # X-Hub-Signature-256
     sentry_webhook_secret: str = ""  # Sentry's HMAC header
+    # /api/webhooks/alert has no vendor HMAC to verify (Alertmanager/Grafana
+    # don't sign). Set this to require an X-Alert-Token header matching it;
+    # empty = unauthenticated (legacy default — anyone who can reach the port
+    # can mint alerts and spawn investigation flows).
+    alert_webhook_secret: str = ""  # X-Alert-Token
 
     # MCP
     mcp_servers: dict = {}
