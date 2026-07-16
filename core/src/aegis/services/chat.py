@@ -1940,18 +1940,14 @@ async def _exec_remember_this(pool: asyncpg.Pool, args: dict, ctx: ToolContext) 
 async def _exec_query_activities(pool: asyncpg.Pool, args: dict, ctx: ToolContext) -> str:
     active_only = args.get("active_only", True)
     limit = args.get("limit", 20)
-    if active_only:
-        rows = await pool.fetch(
-            "SELECT id, name, schedule_cron, active, last_run_at, agent_id "
-            "FROM activities WHERE active = TRUE ORDER BY name LIMIT $1",
-            limit,
-        )
-    else:
-        rows = await pool.fetch(
-            "SELECT id, name, schedule_cron, active, last_run_at, agent_id "
-            "FROM activities ORDER BY name LIMIT $1",
-            limit,
-        )
+    where = "WHERE a.active = TRUE" if active_only else ""
+    rows = await pool.fetch(
+        f"SELECT a.slug, a.workflow_type, a.schedule_cron, a.active, a.agent_id, "
+        f"(SELECT max(started_at) FROM workflow_runs r "
+        f" WHERE r.workflow_type = a.workflow_type) AS last_run "
+        f"FROM activities a {where} ORDER BY a.slug LIMIT $1",
+        limit,
+    )
     return json.dumps([dict(r) for r in rows], default=str)
 
 
