@@ -193,6 +193,18 @@ activities:
       mode: poll
     active: true
 
+  # Pandora — LLM spend guard. Ships ACTIVE but INERT: the rolling-24h token
+  # budget lives in settings.llm_governor.daily_token_budget, which defaults
+  # to 0 = disabled, so this is a no-op until a budget is set on the admin
+  # Settings page (same ship-active-but-inert pattern as the social kill
+  # switch). Over budget ⇒ flips settings.llm_kill_switch + system event.
+  - slug: llm-spend-guard-15min
+    workflow_type: LLMSpendGuardFlow
+    agent_id: pandoras-actor
+    schedule_cron: "*/15 * * * *"
+    config: {}
+    active: true
+
   # Pandora — proactive homelab monitoring (drift, certs)
   # Secondary AEGIS-side drift check (alertmanager DockerServiceDown/NodeDown
   # is the primary, fast path). Slowed hourly → 4h: it has found zero drift in

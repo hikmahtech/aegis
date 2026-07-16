@@ -28,6 +28,18 @@ to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   of appending it in-body — Postiz's LinkedIn provider posts `value[1:]` as a
   comment on the main post, avoiding LinkedIn's reach penalty for in-body
   links. Other platforms are unaffected.
+- **LLM spend governor + kill switch**: `LLMSpendGuardFlow` (every 15 min) sums
+  the rolling-24h `llm_calls` token usage and trips a DB kill switch when it
+  exceeds `settings.llm_governor.daily_token_budget`, posting a Slack system
+  event. While `settings.llm_kill_switch.active` is true, `LLMClient.think` /
+  `chat` (and `extract_receipts_batch` via `think`) raise `LLMKillSwitchError`
+  instead of calling the model — embeddings stay exempt so knowledge search
+  keeps working. Ships **active but inert**: the budget defaults to `0`
+  (disabled), so it is a no-op until configured on the admin Settings page.
+  `model_filter` (comma-separated substrings, e.g. `claude`) scopes the budget
+  to the paid models. The governor auto-clears only a switch it set itself
+  (`set_by == "governor"`); a manual kill stays until manually cleared, and
+  alerts fire only on a state transition, never on every tick.
 - **Learning-loop input on Slack cards** (#71): approval/choice/ack interaction
   cards carry an optional "Why?" free-text input; a note typed with a button
   tap lands as `response.note` and becomes a durable `agent_memory` lesson.

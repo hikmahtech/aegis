@@ -74,6 +74,20 @@ class LLMTruncationError(RuntimeError):
     """
 
 
+class LLMKillSwitchError(RuntimeError):
+    """Raised when LLM generation is disabled by the spend-governor kill switch.
+
+    The switch is a `settings` row (`llm_kill_switch`) flipped either by
+    `LLMSpendGuardFlow` on a rolling-24h token-budget breach, or by hand from
+    the admin Settings page. It gates generation only — `embed()` is exempt so
+    knowledge search keeps working while spend is frozen.
+
+    See `aegis.services.llm_governor`. Clear it by setting
+    `llm_kill_switch.active = false` (the governor auto-clears only switches it
+    set itself, i.e. `set_by == "governor"`).
+    """
+
+
 def _classify_llm_error(exc: BaseException) -> str:
     """Map an exception to a status string for `llm_calls.status`.
 
@@ -159,18 +173,46 @@ class LLMClient:
         api_key: str = "",
         timeout: int = 300,
         concurrency_limits: dict[str, int] | None = None,
+        db_pool: Any = None,
     ):
         self._client = AsyncOpenAI(
             base_url=base_url,
             api_key=api_key or "not-needed",
             timeout=timeout,
         )
+        # Optional — enables the spend-governor kill switch on generation calls
+        # (`think`/`chat`, and `extract_receipts_batch` via `think`). When None
+        # the client is ungoverned, which is what comms and the ad-hoc
+        # backend-connectivity test client want.
+        self._db_pool = db_pool
         # Per-model semaphores. Used to throttle models that share a single
         # busy GPU (e.g. gemma4:e2b on node-a's GPU alongside postgres,
         # core, worker, comms and redis). Bursts of concurrent calls
         # otherwise serialize through ollama and compound latency.
         self._concurrency_limits = dict(concurrency_limits or {})
         self._semaphores: dict[str, asyncio.Semaphore] = {}
+
+    async def _check_kill_switch(self) -> None:
+        """Refuse generation while the spend-governor kill switch is active.
+
+        No pool ⇒ ungoverned, return immediately. `get_kill_switch` never
+        raises (any DB error resolves to "inactive"), so this guard fails
+        OPEN by construction — it sits in front of every generation call in
+        AEGIS and must never be able to take the system down itself.
+        """
+        if self._db_pool is None:
+            return
+        # Local import: aegis.services.llm_governor imports nothing from
+        # aegis.llm, so there is no cycle — but keep it lazy anyway so the
+        # LLM package stays importable without the services package.
+        from aegis.services.llm_governor import get_kill_switch
+
+        ks = await get_kill_switch(self._db_pool)
+        if ks.get("active"):
+            raise LLMKillSwitchError(
+                f"llm kill switch active: {ks.get('reason') or 'unset'} "
+                f"(set_by={ks.get('set_by') or 'unknown'})"
+            )
 
     def _semaphore_for(self, model: str) -> asyncio.Semaphore | None:
         limit = self._concurrency_limits.get(model)
@@ -199,6 +241,8 @@ class LLMClient:
         can measure the real failure rate (success rows are still
         written by the caller — that path is unchanged).
         """
+        await self._check_kill_switch()
+
         import time
 
         messages = []
@@ -339,6 +383,8 @@ class LLMClient:
             {response, tool_calls, model, usage}
             tool_calls is a list of {id, name, arguments} if the model wants to call tools.
         """
+        await self._check_kill_switch()
+
         import time
 
         kwargs: dict[str, Any] = {
@@ -443,6 +489,13 @@ class LLMClient:
         `system_prompt` — optional persona context prepended to the
         extraction instruction so downstream agents (maou) can steer
         the classifier's voice/policy without changing the schema.
+
+        The spend-governor kill switch applies here transitively: this
+        delegates to `think()`, whose guard raises `LLMKillSwitchError`
+        before any HTTP call. That error is NOT converted to
+        `_parse_failed` stubs — only `LLMTruncationError` is — so a
+        spend freeze surfaces as a real failure rather than silently
+        marking every receipt unparseable.
         """
         import time
 
@@ -571,6 +624,7 @@ from aegis.llm.tier import (  # noqa: E402
 
 __all__ = [
     "LLMClient",
+    "LLMKillSwitchError",
     "LLMTruncationError",
     "parse_llm_json",
     "resolve_model_for_agent",

@@ -35,6 +35,7 @@ from aegis_worker.activities.intel_scan import IntelScanActivities
 from aegis_worker.activities.intelligence import IntelligenceActivities
 from aegis_worker.activities.interactions import InteractionActivities
 from aegis_worker.activities.inventory import InventoryActivities
+from aegis_worker.activities.llm_governor import LLMGovernorActivities
 from aegis_worker.activities.memory import MemoryActivities
 from aegis_worker.activities.money import MoneyActivities, parse_bank_alert_senders
 from aegis_worker.activities.raindrop import RaindropActivities
@@ -58,6 +59,7 @@ from aegis_worker.flows.github_alert import GitHubAlertFlow
 from aegis_worker.flows.gmail_ingest import GmailIngestFlow
 from aegis_worker.flows.intelligence_scan import IntelligenceScanFlow
 from aegis_worker.flows.interaction import InteractionFlow
+from aegis_worker.flows.llm_spend_guard import LLMSpendGuardFlow
 from aegis_worker.flows.memory_reflection import MemoryReflectionFlow
 from aegis_worker.flows.money_hygiene import MoneyHygieneDailyFlow
 from aegis_worker.flows.money_process import MoneyProcessFlow
@@ -99,6 +101,7 @@ _stub_chat_act = ChatActivities(client=None)  # type: ignore[arg-type]
 _stub_clarify_act = ClarifyActivities(db_pool=None)
 _stub_social_act = SocialActivities(db_pool=None)
 _stub_agent_registry_act = AgentRegistryActivities(db_pool=None)
+_stub_llm_governor_act = LLMGovernorActivities(db_pool=None)
 
 WORKFLOWS: list = [
     AgentChatReplyFlow,
@@ -112,6 +115,7 @@ WORKFLOWS: list = [
     RaindropIngestFlow,
     RssIngestFlow,
     DriveSyncFlow,
+    LLMSpendGuardFlow,
     MemoryReflectionFlow,
     IntelligenceScanFlow,
     SentryPollFlow,
@@ -125,6 +129,7 @@ WORKFLOWS: list = [
 
 ACTIVITIES: list = [
     _stub_agent_registry_act.resolve_agents,
+    _stub_llm_governor_act.check_llm_budget,
     _stub_chat_act.synthesize_reply,
     _stub_clarify_act.post_agent_reply_comment,
     _stub_clarify_act.post_agent_reply_error_comment,
@@ -264,6 +269,7 @@ async def main():
     interaction_act = InteractionActivities(db_pool=deps.pool)
     run_recorder_act = RunRecorderActivities(db_pool=deps.pool)
     agent_registry_act = AgentRegistryActivities(db_pool=deps.pool)
+    llm_governor_act = LLMGovernorActivities(db_pool=deps.pool)
 
     homelab_act = None
     if settings.homelab_enabled:
@@ -488,6 +494,7 @@ async def main():
         cleanup_act.prune_old_records,
         cleanup_act.archive_orphan_interactions,
         cleanup_act.cleanup_old_dispatches,
+        llm_governor_act.check_llm_budget,
         interaction_act.insert_interaction,
         interaction_act.resolve_interaction,
         interaction_act.apply_interaction_timeout,
@@ -593,6 +600,7 @@ async def main():
         RaindropIngestFlow,
         RssIngestFlow,
         DriveSyncFlow,
+        LLMSpendGuardFlow,
         MemoryReflectionFlow,
         IntelligenceScanFlow,
         SentryPollFlow,
