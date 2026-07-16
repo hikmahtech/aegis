@@ -8,6 +8,26 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from aegis.config import Settings
 
+
+def pytest_sessionstart(session):
+    """Fail loudly when the imported aegis package doesn't live under rootdir.
+
+    Editable installs (pip install -e core -e worker -e comms) resolve their
+    path hooks to the **main checkout**. Running pytest from a git worktree
+    therefore imports aegis.* from main while collecting the worktree's test
+    files — a silent wrong-code test run. This guard catches that state.
+    """
+    import aegis
+
+    pkg = Path(aegis.__file__).resolve()
+    root = Path(session.config.rootdir).resolve()
+    if root not in pkg.parents:
+        raise pytest.UsageError(
+            f"aegis imported from {pkg}, which is outside rootdir {root}.\n"
+            f"You are testing the WRONG checkout (editable install points at main).\n"
+            f"Fix: PYTHONPATH=core/src:worker/src:comms/src pytest ..."
+        )
+
 # Postgres server from `docker compose up -d postgres`. Tests get their own
 # database on it (below) — never the long-lived `aegis` dev database.
 _PG_SERVER = "postgresql://aegis:aegis_dev@localhost:25432"

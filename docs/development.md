@@ -68,6 +68,18 @@ ruff format .             # format
 
 pytest config lives in the root `pyproject.toml` (not under `core/`) because rootdir is the project root.
 
+### Git worktree caveat
+
+The `.venv` holds editable installs (`pip install -e core -e worker -e comms`)
+whose path hooks resolve to the **main checkout**. Running `pytest` from a git
+worktree will therefore import `aegis.*` from main — not from the worktree — a
+silent wrong-code test run. A guard in `tests/conftest.py` (`pytest_sessionstart`)
+catches this and raises `pytest.UsageError` immediately. Workaround:
+
+```bash
+PYTHONPATH=core/src:worker/src:comms/src pytest
+```
+
 ## Configuration
 
 Copy `config/.env.example` to `config/.env` and fill in secrets:
