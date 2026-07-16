@@ -29,7 +29,9 @@ async def test_kill_switch_roundtrip_and_cache(db_pool):
         g.invalidate_kill_cache()
 
         # Missing row ⇒ inactive (an unconfigured deploy must be a no-op).
-        assert (await db_pool.fetchrow("SELECT 1 FROM settings WHERE key='llm_kill_switch'")) is None
+        assert (
+            await db_pool.fetchrow("SELECT 1 FROM settings WHERE key='llm_kill_switch'")
+        ) is None
         assert (await g.get_kill_switch(db_pool))["active"] is False
 
         # set_kill_switch invalidates the cache, so the flip is visible at once.

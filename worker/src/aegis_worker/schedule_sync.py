@@ -26,6 +26,7 @@ from aegis_worker.flows.delivery_watchdog import DeliveryWatchdogConfig, Deliver
 from aegis_worker.flows.drive_sync import DriveSyncFlow, DriveSyncInput
 from aegis_worker.flows.gmail_ingest import GmailIngestFlow, GmailIngestInput
 from aegis_worker.flows.intelligence_scan import IntelligenceScanFlow, IntelligenceScanInput
+from aegis_worker.flows.llm_spend_guard import LLMSpendGuardConfig, LLMSpendGuardFlow
 from aegis_worker.flows.memory_reflection import MemoryReflectionFlow, MemoryReflectionInput
 from aegis_worker.flows.money_hygiene import MoneyHygieneConfig, MoneyHygieneDailyFlow
 from aegis_worker.flows.raindrop_ingest import RaindropIngestFlow, RaindropIngestInput
@@ -63,6 +64,15 @@ _ACTIVITY_TYPE_MAP = {
         CleanupFlow,
         CleanupConfig(
             retentions=act["config"].get("retentions") or {},
+        ),
+    ),
+    # Inert until settings.llm_governor.daily_token_budget > 0 — the budget
+    # lives in the settings table, not the activity config, so it can be
+    # changed from the admin Settings page without touching the schedule.
+    "LLMSpendGuardFlow": lambda act: (
+        LLMSpendGuardFlow,
+        LLMSpendGuardConfig(
+            agent_id=act["agent_id"],
         ),
     ),
     "ServiceDriftFlow": lambda act: (
