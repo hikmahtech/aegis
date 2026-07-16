@@ -224,7 +224,20 @@ class SocialConnector(HTTPConnector):
                 "postiz_url/postiz_api_key are not configured — set them on the "
                 "Integrations page"
             )
-        text = _render_text(payload)
+        platform = account["platform"]
+        body_text = (payload.get("text") or "").strip()
+        link = (payload.get("link") or "").strip()
+        # LinkedIn penalizes reach for posts with an in-body external link —
+        # send the link as a second `value` item instead; Postiz's LinkedIn
+        # provider posts value[1:] as comments on the main post (orchestrator
+        # postComment lifecycle). Every other platform keeps the link in-body
+        # via the shared _render_text (#83).
+        if platform.startswith("linkedin") and body_text and link:
+            text = body_text
+            value = [{"content": body_text, "image": []}, {"content": link, "image": []}]
+        else:
+            text = _render_text(payload)
+            value = [{"content": text, "image": []}]
         # A payload carrying schedule_at (the Todoist due time) becomes a
         # SCHEDULED Postiz post for that moment; anything else — past due
         # times included (approval arrived late) — publishes immediately.
@@ -237,7 +250,7 @@ class SocialConnector(HTTPConnector):
                     post_type, post_date = "schedule", when.astimezone(UTC)
             except (ValueError, TypeError):  # unparseable or naive datetime
                 logger.warning("postiz_schedule_at_unparseable", value=schedule_at[:40])
-        settings = _build_postiz_settings(account["platform"], text, account["meta"] or {})
+        settings = _build_postiz_settings(platform, text, account["meta"] or {})
         body = {
             "type": post_type,
             "shortLink": False,
@@ -246,7 +259,7 @@ class SocialConnector(HTTPConnector):
             "posts": [
                 {
                     "integration": {"id": account["meta"]["postiz_integration_id"]},
-                    "value": [{"content": text, "image": []}],
+                    "value": value,
                     "settings": settings,
                 }
             ],

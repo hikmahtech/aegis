@@ -23,6 +23,11 @@ to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   don't sign payloads, so this route had no verification at all. Setting
   `AEGIS_ALERT_WEBHOOK_SECRET` now requires a matching header (constant-time compare);
   unset keeps the previous open behaviour.
+- **LinkedIn first-comment link support** (#83): `SocialConnector._post_postiz`
+  now sends a LinkedIn post's external link as a second `value` item instead
+  of appending it in-body — Postiz's LinkedIn provider posts `value[1:]` as a
+  comment on the main post, avoiding LinkedIn's reach penalty for in-body
+  links. Other platforms are unaffected.
 - **Learning-loop input on Slack cards** (#71): approval/choice/ack interaction
   cards carry an optional "Why?" free-text input; a note typed with a button
   tap lands as `response.note` and becomes a durable `agent_memory` lesson.
