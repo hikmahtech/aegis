@@ -1634,6 +1634,9 @@ async def _exec_cloud_identity(pool: asyncpg.Pool, args: dict, ctx: ToolContext)
 _KIMI_STATUS_RE_CHAT = re.compile(r"^STATUS:\s*\S+", re.MULTILINE)
 _AEGIS_SELF_DIAGNOSE_MAX_WAIT = 480  # 8 minutes; leaves headroom under synthesize_reply's 600s
 _AEGIS_SELF_DIAGNOSE_POLL = 15  # poll interval in seconds
+# Hard per-fetch cap so a hung SSH `cat` can't stall the poll loop past the
+# deadline; above the connector's internal 15s so a normal read isn't preempted.
+_AEGIS_SELF_DIAGNOSE_FETCH_TIMEOUT = 20
 _AEGIS_SELF_DIAGNOSE_OUTPUT_CAP = 8 * 1024  # last N chars returned to the LLM
 
 # Per-tool executor-timeout overrides (seconds). The default chat tool timeout
@@ -1727,6 +1730,15 @@ async def _exec_aegis_self_diagnose(pool: asyncpg.Pool, args: dict, ctx: ToolCon
     fix_branch = f"aegis-fix/{_slugify_issue(issue)}"
     prompt = _build_aegis_self_diagnose_prompt(issue, mode, fix_branch)
 
+    # Single wall-clock deadline covering BOTH launch (start_kimi_run's SSH
+    # round-trips) AND the poll loop, so the executor's TOTAL runtime stays
+    # under the outer tool-timeout guillotine (_TOOL_TIMEOUT_OVERRIDES). The old
+    # code started this clock only after launch, so slow SSH setup plus the
+    # loop's terminal poll could overshoot the override — the tool then timed
+    # out and the run_id was lost (3/3 prod timeouts, agent=pandoras-actor,
+    # 2026-07-15).
+    deadline = time.monotonic() + _AEGIS_SELF_DIAGNOSE_MAX_WAIT
+
     try:
         run_result = await ctx.remote_script_connector.start_kimi_run(
             repo, prompt, kimi_binary=kimi_binary
@@ -1740,12 +1752,23 @@ async def _exec_aegis_self_diagnose(pool: asyncpg.Pool, args: dict, ctx: ToolCon
 
     output_file = run_result.get("output_file", "")
     run_id = run_result.get("run_id", "")
-    deadline = time.monotonic() + _AEGIS_SELF_DIAGNOSE_MAX_WAIT
     latest_raw = ""
-    while time.monotonic() < deadline:
-        raw = await ctx.remote_script_connector.fetch_kimi_run_output(
-            output_file, host=run_result.get("host", "")
-        )
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        # Hard-bound the fetch so one hung SSH `cat` degrades to a skipped poll
+        # instead of blocking the loop past the deadline (and the guillotine).
+        try:
+            raw = await asyncio.wait_for(
+                ctx.remote_script_connector.fetch_kimi_run_output(
+                    output_file, host=run_result.get("host", "")
+                ),
+                timeout=_AEGIS_SELF_DIAGNOSE_FETCH_TIMEOUT,
+            )
+        except Exception as exc:  # noqa: BLE001 — a probe failure is a skipped poll, not a tool timeout
+            logger.warning("aegis_self_diagnose_fetch_failed", run_id=run_id, error=str(exc))
+            raw = None
         if raw:
             latest_raw = raw
             if _KIMI_STATUS_RE_CHAT.search(raw):
@@ -1758,7 +1781,10 @@ async def _exec_aegis_self_diagnose(pool: asyncpg.Pool, args: dict, ctx: ToolCon
                         "fix_branch": fix_branch if mode == "fix" else None,
                     }
                 )
-        await asyncio.sleep(_AEGIS_SELF_DIAGNOSE_POLL)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        await asyncio.sleep(min(_AEGIS_SELF_DIAGNOSE_POLL, remaining))
     return json.dumps(
         {
             "status": "still_running",
@@ -4147,8 +4173,9 @@ async def send_message(
                     )
                     continue
                 except TimeoutError:
+                    _applied_timeout = _TOOL_TIMEOUT_OVERRIDES.get(_tc_name, timeout)
                     tool_result = json.dumps(
-                        {"error": f"Tool '{_tc_name}' timed out after {timeout}s"}
+                        {"error": f"Tool '{_tc_name}' timed out after {_applied_timeout}s"}
                     )
                     tool_status = "timeout"
                 except Exception as exc:
