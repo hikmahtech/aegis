@@ -108,6 +108,49 @@ def test_social_metrics_flow_in_schedule_map():
     assert config.window_days == 21
 
 
+def test_module_stub_workflows_covers_runtime_base_list():
+    """The module-level WORKFLOWS stub (import-time; used by registration
+    tests that never boot the worker) must include every workflow class in
+    main()'s unconditional `workflows = [...]` base list.
+
+    main() also appends settings-gated extras (homelab_enabled,
+    money_hygiene_enabled) via `workflows += [...]`, which the stub is not
+    expected to mirror — only the unconditional base list. This is an
+    AST cross-check (like test_every_registered_activity_is_decorated
+    above) so it catches drift, e.g. a flow added to main()'s base list
+    but forgotten in the stub, without needing to run main() itself.
+    """
+    import ast
+    import inspect
+
+    src = inspect.getsource(worker_main)
+    tree = ast.parse(src)
+
+    runtime_names: set[str] = set()
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Assign)
+            and len(node.targets) == 1
+            and isinstance(node.targets[0], ast.Name)
+            and node.targets[0].id == "workflows"
+            and isinstance(node.value, ast.List)
+        ):
+            for elt in node.value.elts:
+                assert isinstance(elt, ast.Name), (
+                    f"unexpected non-name element in runtime workflows list: {elt}"
+                )
+                runtime_names.add(elt.id)
+
+    assert runtime_names, "could not find the runtime `workflows = [...]` base list via AST"
+
+    stub_names = {cls.__name__ for cls in worker_main.WORKFLOWS}
+    missing = runtime_names - stub_names
+    assert not missing, (
+        f"module-level WORKFLOWS stub is missing {sorted(missing)}, present in "
+        "main()'s unconditional runtime workflows list"
+    )
+
+
 def test_every_registered_activity_is_decorated():
     """Every method referenced in an activities list anywhere in __main__.py —
     including the REAL list inside main(), which no test instantiates — must

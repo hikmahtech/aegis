@@ -1,4 +1,5 @@
-"""Schema assertions for migration 021 (slack_channel_id + delivery_ref)."""
+"""Schema assertions for agents.slack_channel_id + interactions.delivery_ref,
+created in migrations/001_baseline.sql — not a standalone numbered migration."""
 
 from __future__ import annotations
 
@@ -19,7 +20,7 @@ async def _column_data_type(
 
 
 @pytest.mark.asyncio
-async def test_migration_021_columns(db_pool: asyncpg.Pool) -> None:
+async def test_slack_delivery_columns(db_pool: asyncpg.Pool) -> None:
     await run_migrations(db_pool)
     async with db_pool.acquire() as conn:
         slack_type = await _column_data_type(conn, "agents", "slack_channel_id")

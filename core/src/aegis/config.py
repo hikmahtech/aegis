@@ -75,7 +75,6 @@ class Settings(BaseSettings):
     api_key: str = ""
 
     # Connectors
-    github_token: str = ""
     vercel_token: str = ""
     vercel_team_id: str = ""
     sentry_url: str = ""

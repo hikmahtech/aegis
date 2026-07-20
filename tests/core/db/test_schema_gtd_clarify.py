@@ -1,4 +1,5 @@
-"""Schema-level assertions for migration 012 (Phase 3 clarify)."""
+"""Schema-level assertions for the GTD clarify feature (Phase 3), seeded in
+migrations/001_baseline.sql — not a standalone numbered migration."""
 
 from __future__ import annotations
 
