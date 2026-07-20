@@ -22,6 +22,10 @@ class IntelligenceActivities:
     # 1-5 significance score is a lightweight judgment a small model handles.
     model_light: str = "gemma4:e2b"
     db_pool: Any = None
+    # Owning agent — matches IntelligenceScanFlow's config default. Threaded
+    # into llm_calls rows so intel_score_significance stops recording NULL
+    # agent_id (same pattern as MoneyActivities.agent_id).
+    agent_id: str = "raphael"
 
     @activity.defn
     async def dedup_items(self, items: list[dict]) -> list[dict]:
@@ -78,6 +82,7 @@ class IntelligenceActivities:
             max_tokens=1500,
             db_pool=self.db_pool,
             purpose="intel_score_significance",
+            agent_id=self.agent_id,
         )
         await record_llm_call(
             self.db_pool,
@@ -86,6 +91,7 @@ class IntelligenceActivities:
             completion_tokens=result.get("completion_tokens", 0),
             latency_ms=int((time.monotonic() - _t0) * 1000),
             purpose="intel_score_significance",
+            agent_id=self.agent_id,
         )
         scores = parse_llm_json(result["response"])
         try:

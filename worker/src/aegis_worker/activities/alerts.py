@@ -1212,6 +1212,7 @@ class AlertActivities:
             completion_tokens=llm_result.get("completion_tokens", 0),
             latency_ms=latency_ms,
             purpose="alert_resource_resolution",
+            agent_id=alert.get("agent_id"),
         )
 
         response_text = llm_result.get("response", "")

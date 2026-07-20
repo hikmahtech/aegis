@@ -467,6 +467,7 @@ class LLMClient:
         model: str = "gemma4:e2b",
         system_prompt: str | None = None,
         db_pool: Any = None,
+        agent_id: str | None = None,
     ) -> list[dict]:
         """Classify + extract structured fields for a batch of receipts.
 
@@ -489,6 +490,10 @@ class LLMClient:
         `system_prompt` — optional persona context prepended to the
         extraction instruction so downstream agents (maou) can steer
         the classifier's voice/policy without changing the schema.
+
+        `agent_id` — owning agent (e.g. "maou"), threaded through to the
+        `llm_calls` row so per-agent spend/usage stays attributable (issue:
+        95% of worker-side llm_calls rows had NULL agent_id).
 
         The spend-governor kill switch applies here transitively: this
         delegates to `think()`, whose guard raises `LLMKillSwitchError`
@@ -513,6 +518,7 @@ class LLMClient:
                 max_tokens=4000,
                 db_pool=db_pool,
                 purpose="money_receipt_extraction",
+                agent_id=agent_id,
             )
             if db_pool is not None:
                 from aegis.observability import record_llm_call
@@ -524,6 +530,7 @@ class LLMClient:
                     completion_tokens=result.get("completion_tokens", 0),
                     latency_ms=int((time.monotonic() - _t0) * 1000),
                     purpose="money_receipt_extraction",
+                    agent_id=agent_id,
                 )
             parsed = parse_llm_json(result.get("response", ""))
             if not isinstance(parsed, list):

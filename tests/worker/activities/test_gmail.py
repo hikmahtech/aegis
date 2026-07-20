@@ -537,3 +537,65 @@ async def test_classify_email_uses_higher_max_tokens(tmp_path):
         f"max_tokens={kwargs.get('max_tokens')} is too low for a reasoning model; "
         "reasoning_content will crowd out the JSON payload"
     )
+
+
+@pytest.mark.asyncio
+async def test_classify_email_records_agent_id_on_llm_call(tmp_path):
+    """gmail_classification is the highest-volume worker-side LLM call
+    (hourly triage across every account) and was one of the call sites
+    contributing to the 95% of llm_calls rows with NULL agent_id — this
+    guards that both the think() call and the llm_calls insert now carry
+    GmailActivities.agent_id (default 'sebas', matching GmailIngestFlow's
+    config default)."""
+    from unittest.mock import AsyncMock
+
+    class _FakeDbPool:
+        """Only `execute` (the record_llm_call insert) is exercised here.
+        `_triage_lookup`/`_triage_upsert` also call `.acquire()`, but both are
+        best-effort (try/except) — raising synchronously keeps this fake
+        pool minimal without leaving unawaited-coroutine warnings."""
+
+        def __init__(self):
+            self.execute = AsyncMock()
+
+        def acquire(self):
+            raise RuntimeError("_FakeDbPool.acquire is not implemented in this test")
+
+    llm = AsyncMock()
+    llm.think = AsyncMock(
+        return_value={
+            "response": (
+                '{"category": "informational", "confidence": 0.6, '
+                '"reason": "digest", "summary": "Low value.", "tags": []}'
+            ),
+            "model": "gpt-oss:20b",
+            "prompt_tokens": 30,
+            "completion_tokens": 20,
+        }
+    )
+    acts = _make_gmail_with_llm(tmp_path, llm)
+    db_pool = _FakeDbPool()
+    acts.db_pool = db_pool
+    msg = {
+        "id": "msg-agent",
+        "sender": "digest@example.com",
+        "subject": "Weekly digest",
+        "snippet": "...",
+        "labels": [],
+        "lane": "own",
+    }
+    env = ActivityEnvironment()
+    await env.run(acts.classify_email, msg)
+
+    # think() itself gets agent_id (so a failure row would attribute too).
+    _, think_kwargs = llm.think.call_args
+    assert think_kwargs.get("agent_id") == "sebas"
+
+    # The success-path llm_calls insert also carries agent_id — this is the
+    # column the 95%-NULL finding is about.
+    assert db_pool.execute.called
+    call = db_pool.execute.call_args
+    sql = call.args[0]
+    assert "INSERT INTO llm_calls" in sql
+    # (sql, model, input_tokens, output_tokens, latency_ms, purpose, agent_id, status, error)
+    assert call.args[6] == "sebas"
