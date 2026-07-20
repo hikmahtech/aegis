@@ -25,7 +25,6 @@ EXPECTED_PUBLIC_TABLES = {
     "audit_log",
     "chat_history",
     "knowledge_injection_log",
-    "knowledge_source_quality",
     "triage_state",
     "triage_accuracy",
     "ingest_idempotency",
@@ -107,3 +106,12 @@ async def test_001_v3_recorded_in_schema_migrations(db_pool):
             "SELECT filename FROM schema_migrations WHERE filename='001_baseline.sql'"
         )
     assert row is not None
+
+
+@pytest.mark.asyncio
+async def test_knowledge_source_quality_dropped(db_pool):
+    """Migration 012 drops the inert (no-producer, always-empty) table."""
+    await run_migrations(db_pool)
+    async with db_pool.acquire() as conn:
+        exists = await conn.fetchval("SELECT to_regclass('public.knowledge_source_quality')")
+    assert exists is None

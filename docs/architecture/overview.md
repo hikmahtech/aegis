@@ -237,7 +237,7 @@ PostgreSQL 16 + pgvector. Migrations 001 → 008 in `migrations/` (001 is the sq
 
 **Triage feedback** — `triage_state`, `triage_accuracy`.
 
-**Knowledge (native RAG)** — `knowledge_content`, `knowledge_chunks` (pgvector embeddings), `knowledge_source_quality`, `knowledge_injection_log`.
+**Knowledge (native RAG)** — `knowledge_content`, `knowledge_chunks` (pgvector embeddings), `knowledge_injection_log`.
 
 **Maou (finance)** — `finance.recurring_charge`, `finance.receipt_email`, `finance.renewal_alert`, `finance.subscription_digest`.
 

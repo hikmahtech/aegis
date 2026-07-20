@@ -272,14 +272,11 @@ async def knowledge_health(request: Request) -> dict[str, Any]:
         except Exception:
             kg_stats = {"error": "unavailable"}
 
-    source_rows = await pool.fetch("SELECT * FROM knowledge_source_quality ORDER BY source_type")
-    source_quality = [dict(r) for r in source_rows]
     injection_stats = await pool.fetchval(
         "SELECT COUNT(*) FROM knowledge_injection_log WHERE created_at > now() - interval '30 days'"
     )
 
     return {
         "kg_stats": kg_stats,
-        "source_quality": source_quality,
         "injection_log_30d": injection_stats or 0,
     }

@@ -39,10 +39,6 @@ def mock_db_pool_health():
         return 0
 
     pool.fetchval.side_effect = fetchval_side_effect
-    pool.fetch.return_value = [
-        {"source_type": "email", "reference_rate": 0.72, "adjusted_threshold": 0.6},
-        {"source_type": "feed", "reference_rate": 0.45, "adjusted_threshold": 0.5},
-    ]
     pool.fetchrow.return_value = None
     pool.execute.return_value = "OK"
     pool.close = AsyncMock()
@@ -83,7 +79,6 @@ async def test_health_endpoint_returns_all_keys(app_with_health, auth_headers):
     data = resp.json()
     expected_keys = {
         "kg_stats",
-        "source_quality",
         "injection_log_30d",
     }
     assert expected_keys == set(data.keys())
@@ -100,18 +95,6 @@ async def test_health_kg_stats(app_with_health, auth_headers, mock_knowledge):
     assert data["kg_stats"]["entities"] == 300
     assert data["kg_stats"]["content"] == 42
     mock_knowledge.get_stats.assert_called_once()
-
-
-async def test_health_source_quality(app_with_health, auth_headers):
-    """Source quality list is returned from DB."""
-    transport = ASGITransport(app=app_with_health)
-    async with AsyncClient(transport=transport, base_url="http://test") as client:
-        resp = await client.get("/api/knowledge/health", headers=auth_headers)
-
-    sq = resp.json()["source_quality"]
-    assert len(sq) == 2
-    assert sq[0]["source_type"] == "email"
-    assert sq[1]["source_type"] == "feed"
 
 
 async def test_health_injection_log(app_with_health, auth_headers):
