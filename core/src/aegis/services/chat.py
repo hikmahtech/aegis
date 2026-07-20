@@ -3704,7 +3704,6 @@ async def _gather_knowledge_context(
     max_results: int = 5,
     max_chars: int = 2000,
     timeout: float = 5.0,
-    db_pool: Any = None,
 ) -> tuple[str | None, list[dict]]:
     """Search knowledge base for context relevant to the user's message.
 
@@ -3737,24 +3736,11 @@ async def _gather_knowledge_context(
         # Apply time-based decay (sets effective_score)
         results = _apply_knowledge_decay(results)
 
-        # Load per-source thresholds from DB
-        source_thresholds: dict[str, float] = {}
-        if db_pool:
-            try:
-                rows = await db_pool.fetch(
-                    "SELECT source_type, auto_confidence FROM knowledge_source_quality"
-                )
-                source_thresholds = {r["source_type"]: r["auto_confidence"] for r in rows}
-            except Exception as exc:
-                logger.warning("knowledge_source_quality_lookup_failed", error=str(exc))
-
-        # Filter by per-source threshold (fallback to score_threshold).
+        # Filter by score threshold.
         filtered = []
         for r in results:
-            st = r.get("source_type", "unknown")
-            threshold = source_thresholds.get(st, score_threshold)
             score = r.get("effective_score") or r.get("_score") or r.get("similarity") or 0
-            if score >= threshold:
+            if score >= score_threshold:
                 filtered.append(r)
         results = filtered
 
@@ -3989,7 +3975,6 @@ async def send_message(
             max_results=getattr(settings, "knowledge_context_max_results", 5),
             max_chars=getattr(settings, "knowledge_context_max_chars", 2000),
             timeout=getattr(settings, "knowledge_context_timeout_seconds", 5.0),
-            db_pool=pool,
         )
         if knowledge_context:
             system_prompt = system_prompt + "\n\n## Relevant Knowledge\n" + knowledge_context
