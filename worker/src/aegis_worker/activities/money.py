@@ -207,6 +207,7 @@ class MoneyActivities:
             model=self.extract_model,
             system_prompt=system_prompt,
             db_pool=self.db_pool,
+            agent_id=agent_id or None,
         )
         for r, e in zip(receipts, extractions, strict=False):
             e["receipt_id"] = r["id"]

@@ -251,6 +251,10 @@ class GmailActivities:
     llm_client: Any = None
     model_balanced: str = "qwen3:14b"
     db_pool: Any = None
+    # Owning agent for triage — matches GmailIngestFlow's config default.
+    # Threaded into llm_calls rows so gmail_classification stops recording
+    # NULL agent_id (see MoneyActivities.agent_id for the same pattern).
+    agent_id: str = "sebas"
     # Wired post-construction in worker/__main__ so important emails
     # land in the knowledge graph and become searchable later via
     # Raphael's `search_knowledge` / `ask_knowledge` tools.
@@ -436,6 +440,7 @@ class GmailActivities:
                 max_tokens=2048,
                 db_pool=self.db_pool,
                 purpose="gmail_classification",
+                agent_id=self.agent_id,
             )
             await record_llm_call(
                 self.db_pool,
@@ -444,6 +449,7 @@ class GmailActivities:
                 completion_tokens=raw.get("completion_tokens", 0),
                 latency_ms=int((time.monotonic() - _t0) * 1000),
                 purpose="gmail_classification",
+                agent_id=self.agent_id,
             )
             # think() returns {"response": str, "model": str, ...}
             text = (raw.get("response") or "").strip()
