@@ -8,6 +8,41 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from aegis.config import Settings
 
+
+def pytest_sessionstart(session: pytest.Session) -> None:
+    """Guard against aegis#96: wrong-checkout tests running silently green (or red).
+
+    This repo's `.venv` is built from editable installs
+    (`pip install -e core -e worker -e comms`), so the interpreter's
+    site-packages `.pth` entries point at wherever that `pip install` was run
+    from — normally the main checkout. A bare `pytest` invoked from a git
+    worktree still finds those `.pth` entries first and imports `aegis` (and
+    `aegis_worker` / `aegis_comms`) from the MAIN checkout's `core/src/`, not
+    from the worktree whose tests are being collected. The suite then
+    exercises unmodified main code while running the worktree's test files —
+    a false green for the change under test, or a confusing false red.
+
+    Detect it here rather than let it happen quietly: the already-imported
+    `aegis` package must resolve to a path under this session's rootdir.
+    """
+    import aegis
+
+    pkg_file = getattr(aegis, "__file__", None)
+    if not pkg_file:
+        return  # namespace package with no __file__: nothing to check
+    pkg_path = Path(pkg_file).resolve()
+    rootdir = Path(str(session.config.rootdir)).resolve()
+
+    if rootdir != pkg_path and rootdir not in pkg_path.parents:
+        pytest.exit(
+            f"aegis#96 guard: `aegis` package imported from {pkg_path}, which "
+            f"is outside the pytest rootdir {rootdir}. This checkout's editable "
+            "install resolves to a DIFFERENT clone (likely the main checkout) — "
+            "the suite would silently test that code, not this one.\n"
+            "Fix: PYTHONPATH=core/src:worker/src:comms/src pytest ...",
+            returncode=1,
+        )
+
 # Postgres server from `docker compose up -d postgres`. Tests get their own
 # database on it (below) — never the long-lived `aegis` dev database.
 _PG_SERVER = "postgresql://aegis:aegis_dev@localhost:25432"

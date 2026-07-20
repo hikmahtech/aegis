@@ -84,7 +84,6 @@ Key settings:
 - `AEGIS_LITELLM_URL` + `AEGIS_LITELLM_API_KEY` — LLM gateway (or configure the backend from the admin **Models & Providers** page)
 - `AEGIS_COMMS_URL` — how Core reaches the comms delivery server (e.g. `http://localhost:8081`)
 - `AEGIS_SLACK_BOT_TOKEN` + `AEGIS_SLACK_APP_TOKEN` — Slack (comms); can also be set from the admin UI (stored encrypted in the DB)
-- `AEGIS_GITHUB_TOKEN` — GitHub API
 - `AEGIS_GMAIL_ACCOUNTS` — Gmail OAuth (format: `name:email,name:email`)
 
 Most integration secrets (Todoist, Slack, Postiz, finance provider keys, infra/cloud

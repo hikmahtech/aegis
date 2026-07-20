@@ -1,4 +1,5 @@
-"""Schema assertions for migration 013 (Phase 4 interaction metadata)."""
+"""Schema assertions for interactions.metadata (Phase 4), seeded in
+migrations/001_baseline.sql — not a standalone numbered migration."""
 
 from __future__ import annotations
 

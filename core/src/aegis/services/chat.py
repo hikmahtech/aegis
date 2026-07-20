@@ -3224,6 +3224,7 @@ AGENT_TOOL_SETS: dict[str, set[str]] = {
     },
     "pandoras-actor": {
         "trigger_workflow",
+        "create_schedule",
         "search_knowledge",
         "update_runbook",
         "configure_triage",

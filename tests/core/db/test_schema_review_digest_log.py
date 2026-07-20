@@ -1,4 +1,5 @@
-"""Schema assertions for migration 014 (Phase 5 review_digest_log)."""
+"""Schema assertions for review_digest_log (Phase 5), seeded in
+migrations/001_baseline.sql — not a standalone numbered migration."""
 
 from __future__ import annotations
 

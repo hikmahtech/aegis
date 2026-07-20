@@ -123,6 +123,8 @@ WORKFLOWS: list = [
     ClarifyFlow,
     DailyReviewFlow,
     WeeklyReviewFlow,
+    WorkspaceRepoSyncFlow,
+    VercelProjectSyncFlow,
     SocialPublishFlow,
     SocialMetricsFlow,
 ]
@@ -353,8 +355,8 @@ async def main():
 
     # Settings-row invariant check: the GTD pipeline (capture → clarify) reads
     # several kill switches + ids from the `settings` table that are seeded
-    # via migrations 011/012. A failed migration leaves them absent and the
-    # `_settings_bool(..., default=True)` calls silently engage defaults.
+    # via migration 001_baseline.sql. A failed migration leaves them absent and
+    # the `_settings_bool(..., default=True)` calls silently engage defaults.
     # Warn loudly at boot so the operator can spot it.
     async with deps.pool.acquire() as _conn:
         _seeded = await _conn.fetch(
@@ -380,7 +382,7 @@ async def main():
         structlog.get_logger().warning(
             "todoist_settings_missing",
             keys=sorted(_missing_keys),
-            note="defaults will engage; expected migrations 011/012 to seed them",
+            note="defaults will engage; expected migration 001_baseline.sql to seed them",
         )
 
     # timeout=10.0 keeps the httpx budget inside the activity's TIMEOUT_FAST=15s

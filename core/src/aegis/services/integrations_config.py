@@ -37,7 +37,6 @@ class ConfigKey:
 # The user-facing integration config. Infra/bootstrap fields (db/temporal/admin/
 # paths/homelab/remote-script) are deliberately NOT here — they're env-only.
 CONFIG_REGISTRY: list[ConfigKey] = [
-    ConfigKey("github_token", "API token", "GitHub", True),
     ConfigKey("github_webhook_secret", "Webhook secret", "GitHub", True),
     ConfigKey("sentry_url", "Base URL", "Sentry", False),
     ConfigKey("sentry_token", "API token", "Sentry", True),

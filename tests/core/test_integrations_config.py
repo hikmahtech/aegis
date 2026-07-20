@@ -31,16 +31,16 @@ async def clean_int(db_pool):
 
 
 async def test_save_and_overlay_secret(clean_int):
-    await save_integration(clean_int, _settings(secret_key="k"), "github_token", "ghp_x")
+    await save_integration(clean_int, _settings(secret_key="k"), "vercel_token", "vc_x")
     s2 = _settings(secret_key="k")  # env blank
     await apply_config_overrides(s2, clean_int)
-    assert s2.github_token == "ghp_x"  # overlaid from DB (decrypted)
+    assert s2.vercel_token == "vc_x"  # overlaid from DB (decrypted)
 
 
 async def test_env_fallback_when_no_db(clean_int):
-    s = _settings(github_token="env-token")
+    s = _settings(vercel_token="env-token")
     await apply_config_overrides(s, clean_int)  # no DB rows → unchanged
-    assert s.github_token == "env-token"
+    assert s.vercel_token == "env-token"
 
 
 async def test_get_integrations_secret_never_returns_value(clean_int):
