@@ -416,7 +416,13 @@ class ContentActivities:
             status = "duplicate" if exc.response.status_code == 409 else "error"
             await self._record(url, content_type, status, t0)
             return {"status": status}
-        except Exception:
+        except Exception as exc:
+            logger.warning(
+                "process_content_ingest_failed",
+                url=url[:200],
+                content_type=content_type,
+                error=str(exc)[:300],
+            )
             await self._record(url, content_type, "error", t0)
             return {"status": "error"}
 

@@ -109,3 +109,25 @@ async def test_reingest_same_url_replaces_chunks(store):
 async def test_empty_body_is_skipped(store):
     res = await store.ingest_content(url="aegis://test/empty", title="", source_type="x")
     assert res["status"] == "empty" and res["chunks_total"] == 0
+
+
+async def test_nul_bytes_in_extracted_text_are_stripped(store):
+    """PDF/other extractors can emit NUL bytes; Postgres rejects them outright
+    (`invalid byte sequence for encoding "UTF8": 0x00`). Confirms ingest_content
+    sanitizes title/raw_text before the INSERT instead of the write failing."""
+    url = "aegis://test/nul-bytes"
+    res = await store.ingest_content(
+        url=url,
+        title="Doc\x00 With NUL",
+        source_type="article",
+        raw_text="alpha\x00beta\x00 gamma delta",
+    )
+    assert res["status"] == "ok"
+    cid = res["content_id"]
+
+    chunks = await store.get_content_chunks(cid)
+    assert chunks and "\x00" not in chunks[0]["chunk_text"]
+    assert chunks[0]["chunk_text"] == "alphabeta gamma delta"
+
+    status = await store.get_content_status(cid)
+    assert status["title"] == "Doc With NUL"

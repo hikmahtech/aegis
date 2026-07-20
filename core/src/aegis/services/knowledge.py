@@ -33,6 +33,20 @@ def _content_id_for(url: str) -> str:
     return hashlib.sha1(url.encode("utf-8")).hexdigest()  # noqa: S324  (id, not security)
 
 
+def _strip_nul(text: str | None) -> str | None:
+    """Drop NUL bytes Postgres' UTF8 encoding rejects outright.
+
+    PDF extraction (pdfminer) and other extractors occasionally emit `\\x00`
+    from malformed source bytes. Postgres raises
+    `invalid byte sequence for encoding "UTF8": 0x00` on any text column
+    write containing one — asyncpg surfaces this as a DataError on the
+    INSERT. Applied once here (the common choke point every ingestion
+    source funnels through) so PDFs, HTML, uploads, transcripts, etc. are
+    all covered without touching each extractor.
+    """
+    return text.replace("\x00", "") if text else text
+
+
 def _chunk(text: str, size: int = _CHUNK_SIZE, overlap: int = _CHUNK_OVERLAP) -> list[str]:
     """Naive fixed-size char chunking with overlap.
 
@@ -95,6 +109,9 @@ class KnowledgeStore:
         "empty" when there's no embeddable text.
         """
         content_id = _content_id_for(url)
+        title = _strip_nul(title) or ""
+        summary = _strip_nul(summary)
+        raw_text = _strip_nul(raw_text)
         body = raw_text or summary or title or ""
         chunks = _chunk(body)
         if not chunks:
