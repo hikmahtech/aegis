@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
+import time
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -181,6 +183,59 @@ async def test_exec_returns_still_running_on_polling_timeout(monkeypatch):
     # fix mode promises a branch slug back to the user regardless of completion.
     assert out["fix_branch"] is not None
     assert out["fix_branch"].startswith("aegis-fix/")
+
+
+@pytest.mark.asyncio
+async def test_exec_returns_within_budget_when_fetch_hangs(monkeypatch):
+    """Regression for the 3/3 prod timeouts (agent=pandoras-actor, 2026-07-15).
+
+    A hung SSH `cat` in the poll loop must NOT block the executor past its
+    deadline — the per-fetch hard timeout degrades the hang to a skipped poll,
+    the deadline bounds the loop, and the tool still returns `still_running`
+    (preserving run_id/output_file) well inside its budget rather than being
+    guillotined by the outer tool-timeout (which loses the run_id).
+    """
+    import aegis.services.chat as chat_mod
+
+    monkeypatch.setattr(chat_mod, "_AEGIS_SELF_DIAGNOSE_MAX_WAIT", 0.5)
+    monkeypatch.setattr(chat_mod, "_AEGIS_SELF_DIAGNOSE_POLL", 0.1)
+    monkeypatch.setattr(chat_mod, "_AEGIS_SELF_DIAGNOSE_FETCH_TIMEOUT", 0.15)
+
+    mock_connector = MagicMock()
+    mock_connector.start_kimi_run = AsyncMock(
+        return_value={
+            "status": "running",
+            "run_id": "run-hang",
+            "output_file": "/tmp/aegis-kimi-run-run-hang.jsonl",
+        }
+    )
+
+    # Every fetch hangs far longer than the whole budget — the old unbounded
+    # `await fetch(...)` would have blocked here until the outer guillotine.
+    async def _hanging_fetch(*_args, **_kwargs):
+        await asyncio.sleep(30)
+        return "never reached\nSTATUS: investigated\n"
+
+    mock_connector.fetch_kimi_run_output = _hanging_fetch
+    ctx = ToolContext(settings=_settings(), remote_script_connector=mock_connector)
+
+    started = time.monotonic()
+    out = json.loads(
+        await _exec_aegis_self_diagnose(
+            MagicMock(), {"issue": "anything", "mode": "investigate"}, ctx
+        )
+    )
+    elapsed = time.monotonic() - started
+
+    # Returned gracefully instead of hanging on the 30s fetch or timing out.
+    assert out["status"] == "still_running"
+    assert out["run_id"] == "run-hang"
+    assert out["output_file"] == "/tmp/aegis-kimi-run-run-hang.jsonl"
+    # No output was ever collected (fetch always preempted) → placeholder note.
+    assert "no output yet" in out["transcript"]
+    # Hard bound: MAX_WAIT (0.5s) + one preempted fetch (0.15s) + slack — nowhere
+    # near the 30s hang. A regression (unbounded fetch) would blow this.
+    assert elapsed < 5.0
 
 
 @pytest.mark.asyncio
