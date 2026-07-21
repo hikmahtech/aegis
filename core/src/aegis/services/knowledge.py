@@ -165,30 +165,66 @@ class KnowledgeStore:
         tags: list[str] | None = None,
         content_id: str | None = None,
     ) -> list[dict]:
-        """Semantic search over ingested content. One best chunk per document."""
+        """Semantic search over ingested content. One best chunk per document.
+
+        Two-stage "ANN candidates, then filter" (the standard pgvector
+        pattern): an inner subquery orders by raw vector distance and takes
+        the closest `oversample` chunks — that ORDER BY ... LIMIT is what
+        lets the planner use the `knowledge_chunks_embedding_idx` HNSW index
+        instead of a full-table scan. The outer query then joins content,
+        applies source_type/tags/content_id filters, and DISTINCT ON
+        (content_id) keeps the nearest chunk per document, ordered by
+        similarity. A single-stage `ORDER BY content_id, distance` (the old
+        shape) can't use the vector index at all — Postgres has to compute
+        the distance for every chunk in the table before it can sort/dedupe,
+        which degraded to a full scan of all 193k+ chunks in prod and blew
+        past the activity timeout (issue: IntelligenceScanFlow dedup_items).
+        """
         qvec = await self._embed_one(query)
         if not qvec:
             return []
+        # ponytail: oversampling (limit * 20, floor 200) is a fixed guess at
+        # how many ANN candidates survive the source_type/tags/content_id
+        # filters. A very selective filter can still legitimately return
+        # fewer than `limit` matches even though more exist further out in
+        # the corpus. If that ever matters in practice, upgrade to iterative
+        # widening (re-run with 2x/4x oversample when the filtered result is
+        # short) instead of raising the fixed multiplier for everyone.
+        oversample = max(limit * 20, 200)
         rows = await self._pool.fetch(
             """
             SELECT * FROM (
                 SELECT DISTINCT ON (c.content_id)
                     c.content_id, c.title, c.url, c.source_type, c.tags,
                     c.metadata, c.summary, c.ingested_at,
-                    k.chunk_text AS content,
-                    1 - (k.embedding <=> $1::vector) AS similarity
-                FROM knowledge_chunks k
-                JOIN knowledge_content c ON c.content_id = k.content_id
+                    cand.chunk_text AS content,
+                    1 - cand.dist AS similarity
+                FROM (
+                    -- content_id (single-doc search) is filtered here, inside
+                    -- the ANN stage, not left to the outer WHERE: an equality
+                    -- filter on one document is highly selective, so Postgres
+                    -- plans it as a cheap content_id-index bitmap scan over
+                    -- that doc's handful of chunks (confirmed via EXPLAIN),
+                    -- skipping the vector index entirely rather than fighting
+                    -- it — correct either way since DISTINCT ON downstream
+                    -- collapses to the single matching content_id regardless.
+                    SELECT k.content_id, k.chunk_text,
+                           k.embedding <=> $1::vector AS dist
+                    FROM knowledge_chunks k
+                    WHERE ($3::text IS NULL OR k.content_id = $3)
+                    ORDER BY k.embedding <=> $1::vector
+                    LIMIT $6
+                ) cand
+                JOIN knowledge_content c ON c.content_id = cand.content_id
                 WHERE ($2::text IS NULL OR c.source_type = $2)
-                  AND ($3::text IS NULL OR c.content_id = $3)
                   AND ($4::text[] IS NULL OR c.tags && $4::text[])
-                ORDER BY c.content_id, k.embedding <=> $1::vector
+                ORDER BY c.content_id, cand.dist
             ) s
             ORDER BY s.similarity DESC
             LIMIT $5
             """,
             _vec_literal(qvec), source_type, content_id,
-            list(tags) if tags else None, limit,
+            list(tags) if tags else None, limit, oversample,
         )
         return [self._row_to_result(r) for r in rows]
 
