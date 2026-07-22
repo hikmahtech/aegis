@@ -11,7 +11,7 @@ import respx
 from aegis.config import Settings
 from aegis.connectors.social import SocialConnector
 from aegis.crypto import decrypt_secret, encrypt_secret
-from aegis_worker.activities.social import SocialActivities
+from aegis_worker.activities.social import SocialActivities, _normalize_link
 from httpx import Response
 from temporalio.testing import ActivityEnvironment
 
@@ -280,6 +280,83 @@ async def test_find_due_posts_mixed_platforms_stay_just_in_time(social_env):
     act = SocialActivities(db_pool=social_env)
     due = await ActivityEnvironment().run(act.find_due_posts, 10, 9)
     assert [d["task_id"] for d in due] == ["soctest-mixed-near"]
+
+
+# ---------------------------------------------------- link normalization (#114)
+
+
+def test_normalize_link_reduces_markdown_link_field_to_bare_url():
+    """Prod shape (a): 15/24 posts have `link` populated as full markdown."""
+    text, link = _normalize_link(
+        "Big launch today", "[Read the announcement](https://example.com/launch)"
+    )
+    assert text == "Big launch today"
+    assert link == "https://example.com/launch"
+
+
+def test_normalize_link_extracts_markdown_link_from_body_when_link_empty():
+    """Prod shape (b): 9/24 posts have `link=""` and the markdown link
+    embedded in the body text instead."""
+    text, link = _normalize_link(
+        "Big news! [Read the announcement](https://example.com/launch) — check it out.",
+        "",
+    )
+    assert link == "https://example.com/launch"
+    assert text == "Big news! Read the announcement — check it out."
+
+
+def test_normalize_link_leaves_bare_url_link_field_untouched():
+    assert _normalize_link("hello", "https://example.com") == ("hello", "https://example.com")
+
+
+def test_normalize_link_leaves_bare_url_in_body_untouched_when_link_empty():
+    assert _normalize_link("Check https://example.com/foo out", "") == (
+        "Check https://example.com/foo out",
+        "",
+    )
+
+
+def test_normalize_link_no_link_anywhere_is_noop():
+    assert _normalize_link("just text", "") == ("just text", "")
+
+
+async def test_find_due_posts_normalizes_markdown_link_field(social_env):
+    """Ingest-side fix for prod shape (a) via find_due_posts (#114)."""
+    past = (datetime.now(UTC) - timedelta(minutes=5)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    await _seed_task(
+        social_env,
+        "soctest-md-link",
+        ["publish", "x"],
+        due_datetime=past,
+        content="Big launch today",
+        description="[Read the announcement](https://example.com/launch)",
+    )
+    act = SocialActivities(db_pool=social_env)
+    due = await ActivityEnvironment().run(act.find_due_posts, 10, 9)
+    by_id = {d["task_id"]: d for d in due}
+    assert by_id["soctest-md-link"]["link"] == "https://example.com/launch"
+    assert by_id["soctest-md-link"]["text"] == "Big launch today"
+
+
+async def test_find_due_posts_extracts_markdown_link_from_body(social_env):
+    """Ingest-side fix for prod shape (b) via find_due_posts (#114)."""
+    past = (datetime.now(UTC) - timedelta(minutes=5)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    await _seed_task(
+        social_env,
+        "soctest-md-body",
+        ["publish", "x"],
+        due_datetime=past,
+        content="Big news! [Read the announcement](https://example.com/launch) — check it out.",
+        description="",
+    )
+    act = SocialActivities(db_pool=social_env)
+    due = await ActivityEnvironment().run(act.find_due_posts, 10, 9)
+    by_id = {d["task_id"]: d for d in due}
+    assert by_id["soctest-md-body"]["link"] == "https://example.com/launch"
+    assert (
+        by_id["soctest-md-body"]["text"]
+        == "Big news! Read the announcement — check it out."
+    )
 
 
 # ------------------------------------------------------- enqueue / drain / complete

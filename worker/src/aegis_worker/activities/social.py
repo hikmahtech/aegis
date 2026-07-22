@@ -9,6 +9,7 @@ safety net for anything the hook attempt left behind.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -18,6 +19,38 @@ from aegis.connectors.todoist import TodoistConnector
 from temporalio import activity
 
 _MAX_ATTEMPTS = 5  # mirror todoist_outbox semantics
+
+# Upstream (Todoist task authorship) sometimes writes a markdown link
+# `[Title](https://…)` instead of a bare URL — either into the description
+# (mapped to `link` below) or inline in the task content (`text`). LinkedIn
+# comments don't render markdown, so `_post_postiz`'s first-comment branch
+# needs a real URL. Normalize once here, at ingest, so every downstream
+# transport sees a bare link (#114).
+_MD_LINK_RE = re.compile(r"\[([^\]]+)\]\((https?://\S+?)\)")
+
+
+def _normalize_link(text: str, link: str) -> tuple[str, str]:
+    """Reduce a markdown `link` to its bare URL, or — when `link` is empty
+    but `text` embeds a markdown link — lift the first URL into `link` and
+    replace each inline `[title](url)` with just its title. Bare URLs
+    already in `text` or `link` are left untouched."""
+    link = link.strip()
+    in_link = _MD_LINK_RE.search(link)
+    if in_link:
+        return text, in_link.group(2)
+    if not link:
+        first_url = ""
+
+        def _strip(match: re.Match) -> str:
+            nonlocal first_url
+            if not first_url:
+                first_url = match.group(2)
+            return match.group(1)
+
+        new_text = _MD_LINK_RE.sub(_strip, text)
+        if first_url:
+            return new_text, first_url
+    return text, link
 
 
 @dataclass
@@ -133,11 +166,12 @@ class SocialActivities:
                 # At least one platform posts natively (immediately on
                 # approval) — keep the just-in-time window for the whole task.
                 continue
+            text, link = _normalize_link(r["content"], (r["description"] or "").strip())
             due.append(
                 {
                     "task_id": r["id"],
-                    "text": r["content"],
-                    "link": (r["description"] or "").strip(),
+                    "text": text,
+                    "link": link,
                     "platforms": platforms,
                     # The Todoist due time — Postiz-transport posts are
                     # scheduled in Postiz for exactly this moment.
