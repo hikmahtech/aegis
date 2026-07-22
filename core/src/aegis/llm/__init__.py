@@ -64,6 +64,20 @@ def parse_llm_json(raw: str) -> Any | None:
         return None
 
 
+_REASONING_MIN_TOKENS = 2048
+
+
+def _reasoning_floor(model: str, max_tokens: int) -> int:
+    """Reasoning models (kimi) bill hidden reasoning_content against max_tokens,
+    so tight caller budgets (512-1000) truncate to empty visible content.
+
+    # ponytail: floor the budget here instead of touching every call site.
+    """
+    if "kimi" in model and max_tokens < _REASONING_MIN_TOKENS:
+        return _REASONING_MIN_TOKENS
+    return max_tokens
+
+
 class LLMTruncationError(RuntimeError):
     """Raised when the model returns an empty content string with finish_reason='length'.
 
@@ -242,6 +256,7 @@ class LLMClient:
         written by the caller — that path is unchanged).
         """
         await self._check_kill_switch()
+        max_tokens = _reasoning_floor(model, max_tokens)
 
         import time
 
@@ -384,6 +399,7 @@ class LLMClient:
             tool_calls is a list of {id, name, arguments} if the model wants to call tools.
         """
         await self._check_kill_switch()
+        max_tokens = _reasoning_floor(model, max_tokens)
 
         import time
 

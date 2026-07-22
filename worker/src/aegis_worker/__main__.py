@@ -187,7 +187,6 @@ async def main():
     settings = deps.settings
     # Model names from the configurable backend (Phase A), env settings as fallback.
     model_balanced = deps.model_tiers.get("balanced") or settings.model_balanced
-    model_fast = deps.model_tiers.get("fast") or settings.model_fast
 
     # Connect to Temporal
     temporal_host = getattr(settings, "temporal_host", "localhost:7233")
@@ -260,7 +259,7 @@ async def main():
     intel_act = IntelligenceActivities(
         knowledge_connector=connectors.get("knowledge"),
         llm_client=deps.llm,
-        model_light=model_fast,
+        model_light=model_balanced,
         db_pool=deps.pool,
     )
     cleanup_act = CleanupActivities(
@@ -289,7 +288,8 @@ async def main():
             delivery=delivery_act,
             fx_rates=getattr(settings, "money_hygiene_fx_rates", {}),
             home_currency=getattr(settings, "home_currency", "INR"),
-            extract_model=deps.model_tiers.get("smart") or settings.model_smart,
+            # balanced (kimi) — the Anthropic API smart tier is reserved for chat
+            extract_model=model_balanced,
             bank_alert_senders=parse_bank_alert_senders(
                 getattr(settings, "bank_alert_senders", "")
             ),
