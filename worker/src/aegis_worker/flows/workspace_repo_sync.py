@@ -16,6 +16,12 @@ from `start_kimi_run`).
 Safety: an SSH failure raises (never "empty workspace"), and a scan
 returning fewer than `min_repos` aborts before the destructive
 reconcile — a half-broken scan must not mass-delete the table.
+
+A final, best-effort step checks that each tracked repo still has AEGIS's
+GitHub webhook registered (`check_github_webhooks`, detection only — see
+aegis#118) and folds `missing_webhooks` into this flow's result_summary. A
+failure here never fails the flow: the reconcile/mirror steps above are
+the load-bearing part of this daily run.
 """
 
 from __future__ import annotations
@@ -27,7 +33,7 @@ from temporalio import workflow
 
 with workflow.unsafe.imports_passed_through():
     from aegis_worker.activities.inventory import WorkspaceReposInput
-    from aegis_worker.shared.retry import RETRY_ONCE
+    from aegis_worker.shared.retry import NO_RETRY, RETRY_ONCE
 
 
 _SCAN_TIMEOUT = timedelta(seconds=180)
@@ -36,6 +42,9 @@ _RECONCILE_TIMEOUT = timedelta(seconds=60)
 # heartbeat per repo); steady-state it's one `test -d` per repo.
 _MIRROR_TIMEOUT = timedelta(minutes=60)
 _MIRROR_HEARTBEAT = timedelta(minutes=10)
+# One `gh api` SSH round-trip per tracked repo (sequential, heartbeat per repo).
+_WEBHOOK_CHECK_TIMEOUT = timedelta(minutes=10)
+_WEBHOOK_CHECK_HEARTBEAT = timedelta(minutes=2)
 
 
 @dataclass
@@ -75,4 +84,27 @@ class WorkspaceRepoSyncFlow:
             retry_policy=RETRY_ONCE,
         )
 
-        return {"scanned": len(repos), "status": "ok", **reconcile, "mirror": mirror}
+        # Detection-only webhook reconciliation — never fails the flow.
+        try:
+            webhook_check = await workflow.execute_activity(
+                "check_github_webhooks",
+                start_to_close_timeout=_WEBHOOK_CHECK_TIMEOUT,
+                heartbeat_timeout=_WEBHOOK_CHECK_HEARTBEAT,
+                retry_policy=NO_RETRY,
+            )
+            if webhook_check.get("missing_webhooks"):
+                workflow.logger.warning(
+                    "workspace_repo_sync_missing_webhooks repos=%s",
+                    webhook_check["missing_webhooks"],
+                )
+        except Exception as exc:
+            workflow.logger.error("github_webhook_check_failed error=%s", str(exc)[:200])
+            webhook_check = {"missing_webhooks": [], "webhook_check_status": "failed"}
+
+        return {
+            "scanned": len(repos),
+            "status": "ok",
+            **reconcile,
+            "mirror": mirror,
+            **webhook_check,
+        }

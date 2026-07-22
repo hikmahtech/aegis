@@ -37,7 +37,7 @@ To add or repurpose an agent, create it and check the capability tags that descr
 | **Sebas** | Executive assistant | `smart` | `GmailIngestFlow`, `CalendarIngestFlow`, `TodoistSyncFlow`, `ClarifyFlow`, `DailyReviewFlow` + `WeeklyReviewFlow`, `SocialPublishFlow`, `MemoryReflectionFlow` |
 | **Raphael** | Research + knowledge | `smart` | `DailyBriefingFlow`, `IntelligenceScanFlow` (×3 sources), `RaindropIngestFlow`, `RssIngestFlow`, `DriveSyncFlow` |
 | **Maou** | Finance | `smart` | `MoneyProcessFlow`, `MoneyHygieneDailyFlow`, `ReceiptIngestFlow`, `SubscriptionAuditFlow` |
-| **Pandora's Actor** | Infrastructure | `smart` | `ServiceDriftFlow`, `CertRadarFlow`, `SentryPollFlow`, `DeliveryWatchdogFlow`, `CleanupFlow`, `WorkspaceRepoSyncFlow`, `VercelProjectSyncFlow`, `GitHubAlertFlow` (PR notifier, webhook-driven) |
+| **Pandora's Actor** | Infrastructure | `smart` | `ServiceDriftFlow`, `CertRadarFlow`, `SentryPollFlow`, `DeliveryWatchdogFlow`, `CleanupFlow`, `WorkspaceRepoSyncFlow`, `GitHubAlertFlow` (PR notifier, webhook-driven) |
 
 **Utility flows (driven by their callers, not owner-scheduled):**
 - `InteractionFlow` — man-in-the-middle handoff; any flow spawns this as a child to wait for a human response.
@@ -136,8 +136,7 @@ Owner-scheduled flows are listed in the Personalities table above. The remaining
 - `MemoryReflectionFlow` (Sebas, nightly) — per-agent memory consolidation: caps `agent_memory` (prunes oldest/lowest-importance beyond `keep`).
 - `DriveSyncFlow` (Raphael) — incremental ingest of a tracked Google Drive folder into the knowledge store; no-ops until a folder is configured.
 - `DeliveryWatchdogFlow` (Pandora's Actor, hourly) — catches interaction cards that were never delivered and checks comms `/api/health` inbound liveness; on outage captures a Todoist Inbox task (the chat channel is the thing that's down).
-- `WorkspaceRepoSyncFlow` (Pandora's Actor, daily) — scans the coding host's workspace for git checkouts and makes the `resources` table mirror it (one `kind='repository'` row per checkout).
-- `VercelProjectSyncFlow` (Pandora's Actor, daily) — mirrors Vercel personal + team projects into `resources` (`kind='vercel_project'`), linking GitHub repos for alert investigations.
+- `WorkspaceRepoSyncFlow` (Pandora's Actor, daily) — scans the coding host's workspace for git checkouts and makes the `resources` table mirror it (one `kind='repository'` row per checkout); also flags tracked GitHub repos whose AEGIS webhook is missing/dead (`check_github_webhooks`, detection only — result_summary.missing_webhooks).
 - `MoneyProcessFlow` (Maou, child) — single-email money hygiene: `store_receipt_email` → `load_receipts` → `classify_and_extract` → `upsert_charges`. Spawned by `GmailIngestFlow` on `financial`/`payments` tags and by the weekly `ReceiptIngestFlow` safety-net. `ParentClosePolicy.ABANDON`; idempotent on `message_id` at the `store_receipt_email` step.
 
 ### Email Triage Tag Fan-out
@@ -181,7 +180,7 @@ When a `todoist_task_id` is on the alert (pandora APP-<n>: clarify path), the fl
 | **SearchConnector** (`search.py`) | SearxNG HTTP client. Used by the `research_topic` chat tool. |
 | **FinanceConnector** (`finance.py`) | Provider-agnostic web market data (keyless `yahoo` / `stooq` quote providers, selected via the Finance integration config: `finance_provider` / `finance_indices`). Powers Maou's `get_quote` / `get_market_overview` tools and the `/api/market/summary` briefing section; `get_finance_news` rides SearchConnector. |
 | **SocialConnector** (`social.py`) | Social posting for `SocialPublishFlow` — native X/Twitter OAuth or a self-hosted Postiz transport — see [`social-publishing.md`](../social-publishing.md). |
-| **VercelConnector** (`vercel.py`) | Vercel REST client — project inventory (`VercelProjectSyncFlow`) and Pandora's deployment chat tools. |
+| **VercelConnector** (`vercel.py`) | Vercel REST client — backs Pandora's read-only deployment chat tools (`vercel_get_project` et al). |
 
 ## Chat with Tool Calling
 

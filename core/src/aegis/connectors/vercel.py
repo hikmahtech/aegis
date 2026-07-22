@@ -1,8 +1,7 @@
 """Vercel REST connector — read-only project + deployment + build-log queries.
 
-Backs the four `vercel_*` chat tools available to Pandora. Built against
-the same API surface VercelProjectSyncFlow uses for the inventory sync
-(`team_id` defaults to the example team via settings).
+Backs the four `vercel_*` chat tools available to Pandora (`team_id`
+defaults to the example team via settings).
 
 API endpoints exercised here:
   * GET /v9/projects/{id_or_name}              — project metadata

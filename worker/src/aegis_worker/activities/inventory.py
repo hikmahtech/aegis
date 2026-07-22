@@ -11,29 +11,32 @@ Currently covers:
     that no longer exist on disk, and a mirror step clones missing repos
     onto the base host (node-a) at the same relative paths so both hosts
     share one hierarchy.
-  * Vercel projects (personal + team via REST `/v9/projects`).
+  * GitHub webhook reconciliation — for each tracked repo (a `resources`
+    row of kind='repository' with `metadata.github_repo` set), checks
+    that AEGIS's own GitHub webhook is registered and flags the ones
+    that aren't. Detection only; see `check_github_webhooks`.
 
 `upsert_resources_batch` inserts new rows and union-merges tags /
 shallow-merges metadata on existing rows. Title and URL are insert-only
 so hand-curated values survive a sync tick.
-
-Vercel projects with `link.type == "github"` carry the linked
-`github_repo` ("owner/name") in `metadata.github_repo`, indexed by
-migration 020 so a GitHub-side alert can find its Vercel siblings
-(see `worker/.../activities/alerts.py::resolve_alert_resource`).
 """
 
 from __future__ import annotations
 
+import json
 import re
+import shlex
 from dataclasses import dataclass, field
 from typing import Any
 
-import httpx
 import structlog
 from temporalio import activity
 
 logger = structlog.get_logger()
+
+# Path segment identifying AEGIS's GitHub webhook receiver — see
+# `core/src/aegis/api/routes/webhooks.py`.
+_AEGIS_WEBHOOK_PATH = "/api/webhooks/github"
 
 
 # =====================================================================
@@ -44,12 +47,6 @@ logger = structlog.get_logger()
 @dataclass
 class WorkspaceReposInput:
     items: list[dict] = field(default_factory=list)  # [{"path", "origin_url"}]
-
-
-@dataclass
-class ListVercelProjectsInput:
-    include_personal: bool = True
-    team_ids: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -65,10 +62,7 @@ class UpsertResourcesBatchInput:
 @dataclass
 class InventoryActivities:
     db_pool: Any
-    remote_script: Any = None  # RemoteScriptConnector — workspace scan + mirror
-    vercel_token: str = ""
-    vercel_team_id: str = ""
-    http_client: httpx.AsyncClient | None = None
+    remote_script: Any = None  # RemoteScriptConnector — workspace scan + mirror + gh exec
 
     # ------------------------------------------------------------------
     # Workspace repositories
@@ -189,92 +183,73 @@ class InventoryActivities:
         }
 
     # ------------------------------------------------------------------
-    # Vercel
+    # GitHub webhook reconciliation
     # ------------------------------------------------------------------
 
+    # ponytail: detection only — flags repos with a missing/dead webhook so a
+    # human can re-run the GitHub App / webhook setup; does not create or
+    # repair anything itself (aegis#118 checkbox 3).
     @activity.defn
-    async def list_vercel_projects(
-        self, input: ListVercelProjectsInput
-    ) -> list[dict]:
-        """Return one dict per project across personal + team scopes.
+    async def check_github_webhooks(self) -> dict:
+        """Flag tracked GitHub repos whose AEGIS webhook is missing/dead.
 
-        Dict shape: {id, name, framework, github_repo, production_domain,
-        scope, team_id}. `github_repo` is the linked GitHub repo when
-        link.type == "github", else "". `production_domain` is the first
-        alias under targets.production; "" when none. `scope` is "personal"
-        or "team". `team_id` is the resolving team id ("" for personal).
+        "Tracked" mirrors `HomelabActivities.notify_pr_event`'s definition:
+        a `resources` row of kind='repository' with `metadata.github_repo`
+        set. For each one, runs `gh api repos/<repo>/hooks` on the workspace
+        host (the same SSH exec path `scan_workspace_repos` uses) and checks
+        whether any hook URL points at our `/api/webhooks/github` endpoint.
+
+        Soft-fails per repo: a repo where `gh` errors (missing binary, 404,
+        auth failure, timeout, ...) is skipped with a debug log rather than
+        counted as missing — an inconclusive check must never look like a
+        confirmed gap. Returns {missing_webhooks: [...], checked: N, skipped: N}.
         """
-        if not self.vercel_token:
-            logger.info("inventory_vercel_no_token_skip")
-            return []
+        if not self.remote_script:
+            logger.debug("github_webhook_check_no_remote_script")
+            return {"missing_webhooks": [], "checked": 0, "skipped": 0}
 
-        client = self.http_client or httpx.AsyncClient(timeout=30.0)
-        owns_client = self.http_client is None
-        try:
-            out: list[dict] = []
-            if input.include_personal:
-                out.extend(await self._vercel_list_for_scope(client, team_id=""))
-            for team_id in input.team_ids:
-                try:
-                    out.extend(
-                        await self._vercel_list_for_scope(client, team_id=team_id)
-                    )
-                except httpx.HTTPStatusError as exc:
-                    logger.warning(
-                        "inventory_vercel_team_failed",
-                        team_id=team_id,
-                        status=exc.response.status_code,
-                    )
-                    continue
-            return out
-        finally:
-            if owns_client:
-                await client.aclose()
-
-    async def _vercel_list_for_scope(
-        self, client: httpx.AsyncClient, *, team_id: str
-    ) -> list[dict]:
-        scope = "team" if team_id else "personal"
-        params: dict[str, Any] = {"limit": 100}
-        if team_id:
-            params["teamId"] = team_id
-        headers = {"Authorization": f"Bearer {self.vercel_token}"}
-        out: list[dict] = []
-        while True:
-            resp = await client.get(
-                "https://api.vercel.com/v9/projects",
-                params=params,
-                headers=headers,
+        async with self.db_pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT DISTINCT metadata->>'github_repo' AS repo FROM resources "
+                "WHERE kind = 'repository' AND COALESCE(metadata->>'github_repo', '') <> ''"
             )
-            resp.raise_for_status()
-            body = resp.json()
-            for proj in body.get("projects", []):
-                link = proj.get("link") or {}
-                github_repo = ""
-                if link.get("type") == "github":
-                    org = link.get("org") or link.get("orgName") or ""
-                    repo = link.get("repo") or link.get("repoName") or ""
-                    if org and repo:
-                        github_repo = f"{org}/{repo}"
-                production = (proj.get("targets") or {}).get("production") or {}
-                aliases = production.get("alias") or []
-                production_domain = aliases[0] if aliases else ""
-                out.append(
-                    {
-                        "id": proj.get("id", ""),
-                        "name": proj.get("name", ""),
-                        "framework": proj.get("framework") or "",
-                        "github_repo": github_repo,
-                        "production_domain": production_domain,
-                        "scope": scope,
-                        "team_id": team_id,
-                    }
+        repos = sorted({r["repo"] for r in rows if r["repo"]})
+        if not repos:
+            return {"missing_webhooks": [], "checked": 0, "skipped": 0}
+
+        await self.remote_script.ensure_config()
+        host = self.remote_script.workspace_scan_host()
+
+        missing: list[str] = []
+        checked = 0
+        skipped = 0
+        for repo in repos:
+            activity.heartbeat(repo)
+            result = await self.remote_script.run_on_host(
+                host,
+                f"gh api repos/{shlex.quote(repo)}/hooks --jq '[.[].config.url]'",
+                timeout=20,
+            )
+            if result.get("status") != "succeeded":
+                logger.debug(
+                    "github_webhook_check_skip_repo",
+                    repo=repo,
+                    error=(result.get("stderr") or "")[:200],
                 )
-            nxt = (body.get("pagination") or {}).get("next")
-            if not nxt:
-                break
-            params["until"] = nxt
-        return out
+                skipped += 1
+                continue
+            present = _aegis_webhook_present(result.get("stdout", ""))
+            if present is None:
+                logger.debug("github_webhook_check_unparseable", repo=repo)
+                skipped += 1
+                continue
+            checked += 1
+            if not present:
+                missing.append(repo)
+
+        if missing:
+            logger.warning("github_webhooks_missing", repos=missing, count=len(missing))
+        return {"missing_webhooks": missing, "checked": checked, "skipped": skipped}
 
     # ------------------------------------------------------------------
     # Upsert
@@ -346,6 +321,23 @@ def origin_to_github_repo(origin_url: str) -> str:
     """Parse "owner/name" out of a GitHub origin URL ("" for non-GitHub)."""
     m = _GITHUB_ORIGIN_RE.match((origin_url or "").strip())
     return m.group("repo") if m else ""
+
+
+def _aegis_webhook_present(hooks_json: str) -> bool | None:
+    """Does `hooks_json` (stdout of `gh api .../hooks --jq '[.[].config.url]'`)
+    include AEGIS's own webhook URL?
+
+    Returns True/False when `hooks_json` parses as a JSON list, or None when
+    it doesn't (truncated SSH output, an error message instead of JSON, ...)
+    — callers must treat None as "inconclusive, skip" rather than "missing".
+    """
+    try:
+        parsed = json.loads((hooks_json or "").strip() or "[]")
+    except (json.JSONDecodeError, ValueError):
+        return None
+    if not isinstance(parsed, list):
+        return None
+    return any(_AEGIS_WEBHOOK_PATH in str(url) for url in parsed if url)
 
 
 def dedupe_workspace_repos(items: list[dict]) -> list[dict]:

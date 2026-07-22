@@ -14,10 +14,6 @@ from aegis_worker.flows.subscription_audit import (
     SubscriptionAuditConfig,
     SubscriptionAuditFlow,
 )
-from aegis_worker.flows.vercel_project_sync import (
-    VercelProjectSyncFlow,
-    VercelProjectSyncInput,
-)
 from aegis_worker.flows.workspace_repo_sync import WorkspaceRepoSyncFlow, WorkspaceRepoSyncInput
 from aegis_worker.schedule_sync import _ACTIVITY_TYPE_MAP
 
@@ -143,25 +139,3 @@ def test_workspace_repo_sync_flow_mapper_defaults():
     mapper = _ACTIVITY_TYPE_MAP["WorkspaceRepoSyncFlow"]
     _, cfg = mapper(_act("ws-sync", "WorkspaceRepoSyncFlow", {}))
     assert cfg.min_repos == 5
-
-
-def test_vercel_project_sync_flow_mapper_resolves():
-    mapper = _ACTIVITY_TYPE_MAP["VercelProjectSyncFlow"]
-    workflow_cls, cfg = mapper(
-        _act(
-            "vercel-project-sync-daily",
-            "VercelProjectSyncFlow",
-            {"include_personal": True, "team_ids": ["team_example"]},
-        )
-    )
-    assert workflow_cls is VercelProjectSyncFlow
-    assert isinstance(cfg, VercelProjectSyncInput)
-    assert cfg.include_personal is True
-    assert cfg.team_ids == ["team_example"]
-
-
-def test_vercel_project_sync_flow_mapper_defaults_to_personal_only():
-    mapper = _ACTIVITY_TYPE_MAP["VercelProjectSyncFlow"]
-    _, cfg = mapper(_act("vc-sync", "VercelProjectSyncFlow", {}))
-    assert cfg.include_personal is True
-    assert cfg.team_ids == []

@@ -1,41 +1,47 @@
-"""InventoryActivities — workspace repo + Vercel project sync into `resources`."""
+"""InventoryActivities — workspace repo sync + GitHub webhook reconciliation
+into `resources`."""
 
 from __future__ import annotations
 
 import json
 
 import pytest
-import respx
 from aegis_worker.activities.inventory import (
     InventoryActivities,
-    ListVercelProjectsInput,
     UpsertResourcesBatchInput,
     WorkspaceReposInput,
+    _aegis_webhook_present,
     dedupe_workspace_repos,
     origin_to_github_repo,
 )
-from httpx import Response
 from temporalio.testing import ActivityEnvironment
 
 
-def _make_inv(db_pool=None, *, remote_script=None, vercel_token="vrc_test", team="team_abc"):
-    return InventoryActivities(
-        db_pool=db_pool,
-        remote_script=remote_script,
-        vercel_token=vercel_token,
-        vercel_team_id=team,
-    )
+def _make_inv(db_pool=None, *, remote_script=None):
+    return InventoryActivities(db_pool=db_pool, remote_script=remote_script)
 
 
 class FakeRemoteScript:
     """Minimal RemoteScriptConnector stand-in for workspace activities."""
 
-    def __init__(self, scan=None, *, scan_host="node-b", base_host="node-a", present=()):
+    def __init__(
+        self,
+        scan=None,
+        *,
+        scan_host="node-b",
+        base_host="node-a",
+        present=(),
+        hook_responses=None,
+    ):
         self._scan = scan or []
         self._scan_host = scan_host
         self._host = base_host
         self._present = set(present)
         self.ensured: list[tuple[str, str]] = []
+        # repo -> gh CLI result dict {"status", "stdout", "stderr"}, keyed by
+        # the "owner/name" embedded in the run_on_host command string.
+        self._hook_responses = hook_responses or {}
+        self.hook_calls: list[str] = []
 
     def workspace_scan_host(self):
         return self._scan_host
@@ -55,6 +61,23 @@ class FakeRemoteScript:
         if not clone_url:
             return {"status": "failed", "path": rel_path, "error": "no origin_url to clone from"}
         return {"status": "cloned", "path": rel_path}
+
+    async def run_on_host(self, host, remote_cmd, timeout=30, stdin=None):
+        for repo, response in self._hook_responses.items():
+            if repo in remote_cmd:
+                self.hook_calls.append(repo)
+                return response
+        return {"status": "failed", "exit_code": -1, "stdout": "", "stderr": "unmocked repo"}
+
+
+_TEST_SLUG_PREFIX = "test-inv-"
+
+
+async def _clean_test_resources(db_pool):
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            "DELETE FROM resources WHERE slug LIKE $1", f"{_TEST_SLUG_PREFIX}%"
+        )
 
 
 # =====================================================================
@@ -167,158 +190,89 @@ async def test_mirror_clones_missing_and_reports_failures():
 
 
 # =====================================================================
-# list_vercel_projects
+# _aegis_webhook_present — pure missing-webhook detection logic
+# =====================================================================
+
+
+def test_aegis_webhook_present_true_when_endpoint_in_list():
+    hooks = json.dumps(
+        ["https://other.example.com/hook", "https://aegis.example.com/api/webhooks/github"]
+    )
+    assert _aegis_webhook_present(hooks) is True
+
+
+def test_aegis_webhook_present_false_when_endpoint_absent():
+    hooks = json.dumps(["https://other.example.com/hook", "https://ci.example.com/hooks"])
+    assert _aegis_webhook_present(hooks) is False
+
+
+def test_aegis_webhook_present_false_for_empty_hook_list():
+    assert _aegis_webhook_present("[]") is False
+    assert _aegis_webhook_present("") is False
+
+
+def test_aegis_webhook_present_none_for_unparseable_output():
+    """Garbled/truncated SSH output must be 'skip', never 'missing'."""
+    assert _aegis_webhook_present("not json") is None
+    assert _aegis_webhook_present('{"not": "a list"}') is None
+
+
+# =====================================================================
+# check_github_webhooks
 # =====================================================================
 
 
 @pytest.mark.asyncio
-@respx.mock
-async def test_list_vercel_projects_personal_extracts_github_link():
-    inv = _make_inv(team="")
-    respx.get("https://api.vercel.com/v9/projects").mock(
-        return_value=Response(
-            200,
-            json={
-                "projects": [
-                    {
-                        "id": "prj_abc",
-                        "name": "example-site",
-                        "framework": "nextjs",
-                        "link": {
-                            "type": "github",
-                            "org": "example",
-                            "repo": "example-site",
-                            "productionBranch": "main",
-                        },
-                        "targets": {
-                            "production": {"alias": ["example.com", "example-site.vercel.app"]}
-                        },
-                    },
-                    {
-                        "id": "prj_def",
-                        "name": "acme-marketing",
-                        "framework": "astro",
-                        "link": {"type": "gitlab", "projectId": "12345"},
-                        "targets": {"production": {"alias": ["acme-marketing.vercel.app"]}},
-                    },
-                    {
-                        "id": "prj_ghi",
-                        "name": "no-git-project",
-                        "framework": None,
-                        "link": None,
-                        "targets": {"production": {"alias": ["no-git.vercel.app"]}},
-                    },
-                ],
-                "pagination": {"next": None},
-            },
+async def test_check_github_webhooks_no_remote_script_returns_empty():
+    inv = _make_inv(remote_script=None)
+    env = ActivityEnvironment()
+    result = await env.run(inv.check_github_webhooks)
+    assert result == {"missing_webhooks": [], "checked": 0, "skipped": 0}
+
+
+@pytest.mark.asyncio
+async def test_check_github_webhooks_flags_missing_and_skips_unparseable(db_pool):
+    await _clean_test_resources(db_pool)
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO resources (kind, slug, title, metadata) VALUES "
+            "('repository', $1, 'has hook', $2),"
+            "('repository', $3, 'missing hook', $4),"
+            "('repository', $5, 'gh 404s', $6)",
+            f"{_TEST_SLUG_PREFIX}has-hook",
+            {"github_repo": "acme/has-hook"},
+            f"{_TEST_SLUG_PREFIX}missing-hook",
+            {"github_repo": "acme/missing-hook"},
+            f"{_TEST_SLUG_PREFIX}gone",
+            {"github_repo": "acme/gone"},
         )
+    fake = FakeRemoteScript(
+        hook_responses={
+            "acme/has-hook": {
+                "status": "succeeded",
+                "stdout": json.dumps(["https://aegis.example.com/api/webhooks/github"]),
+            },
+            "acme/missing-hook": {
+                "status": "succeeded",
+                "stdout": json.dumps(["https://other.example.com/hook"]),
+            },
+            "acme/gone": {"status": "failed", "stderr": "gh: Not Found (HTTP 404)"},
+        }
     )
+    inv = _make_inv(db_pool=db_pool, remote_script=fake)
     env = ActivityEnvironment()
-    projects = await env.run(
-        inv.list_vercel_projects,
-        ListVercelProjectsInput(include_personal=True, team_ids=[]),
-    )
-    assert len(projects) == 3
-    example_site = next(p for p in projects if p["name"] == "example-site")
-    assert example_site["github_repo"] == "example/example-site"
-    assert example_site["production_domain"] == "example.com"
-    assert example_site["scope"] == "personal"
-    acme = next(p for p in projects if p["name"] == "acme-marketing")
-    assert acme["github_repo"] == ""
-    no_git = next(p for p in projects if p["name"] == "no-git-project")
-    assert no_git["github_repo"] == ""
+    result = await env.run(inv.check_github_webhooks)
+    await _clean_test_resources(db_pool)
 
-
-@pytest.mark.asyncio
-@respx.mock
-async def test_list_vercel_projects_team_scope_passes_team_id():
-    inv = _make_inv()
-    route = respx.get("https://api.vercel.com/v9/projects").mock(
-        return_value=Response(200, json={"projects": [], "pagination": {"next": None}})
-    )
-    env = ActivityEnvironment()
-    await env.run(
-        inv.list_vercel_projects,
-        ListVercelProjectsInput(include_personal=False, team_ids=["team_abc"]),
-    )
-    assert route.call_count == 1
-    request = route.calls[0].request
-    assert "teamId=team_abc" in str(request.url)
-
-
-@pytest.mark.asyncio
-@respx.mock
-async def test_list_vercel_projects_personal_plus_team_two_passes():
-    inv = _make_inv()
-    route = respx.get("https://api.vercel.com/v9/projects").mock(
-        side_effect=[
-            Response(
-                200,
-                json={
-                    "projects": [
-                        {
-                            "id": "prj_p",
-                            "name": "personal-proj",
-                            "framework": None,
-                            "link": None,
-                            "targets": {"production": None},
-                        }
-                    ],
-                    "pagination": {"next": None},
-                },
-            ),
-            Response(
-                200,
-                json={
-                    "projects": [
-                        {
-                            "id": "prj_t",
-                            "name": "team-proj",
-                            "framework": None,
-                            "link": None,
-                            "targets": {"production": None},
-                        }
-                    ],
-                    "pagination": {"next": None},
-                },
-            ),
-        ]
-    )
-    env = ActivityEnvironment()
-    projects = await env.run(
-        inv.list_vercel_projects,
-        ListVercelProjectsInput(include_personal=True, team_ids=["team_abc"]),
-    )
-    assert route.call_count == 2
-    names = {p["name"] for p in projects}
-    assert names == {"personal-proj", "team-proj"}
-
-
-@pytest.mark.asyncio
-@respx.mock
-async def test_list_vercel_projects_no_token_returns_empty():
-    inv = _make_inv(vercel_token="")
-    env = ActivityEnvironment()
-    projects = await env.run(
-        inv.list_vercel_projects,
-        ListVercelProjectsInput(include_personal=True, team_ids=["team_abc"]),
-    )
-    assert projects == []
+    assert result["missing_webhooks"] == ["acme/missing-hook"]
+    assert result["checked"] == 2
+    assert result["skipped"] == 1
+    assert set(fake.hook_calls) == {"acme/has-hook", "acme/missing-hook", "acme/gone"}
 
 
 # =====================================================================
 # upsert_resources_batch — exercises real Postgres
 # =====================================================================
-
-
-_TEST_SLUG_PREFIX = "test-inv-"
-
-
-async def _clean_test_resources(db_pool):
-    async with db_pool.acquire() as conn:
-        await conn.execute(
-            "DELETE FROM resources WHERE slug LIKE $1", f"{_TEST_SLUG_PREFIX}%"
-        )
 
 
 @pytest.mark.asyncio
@@ -339,12 +293,12 @@ async def test_upsert_resources_batch_inserts_new_rows(db_pool):
                     "metadata": {"path": "new-a", "github_repo": "org/new-a"},
                 },
                 {
-                    "kind": "vercel_project",
+                    "kind": "endpoint",
                     "slug": f"{_TEST_SLUG_PREFIX}new-b",
                     "title": "Inv Test B",
                     "url": "https://b.example.com",
-                    "tags": ["vercel", "test"],
-                    "metadata": {"project_id": "prj_b", "github_repo": "org/b"},
+                    "tags": ["other", "test"],
+                    "metadata": {"note": "arbitrary second kind for upsert test"},
                 },
             ]
         ),
