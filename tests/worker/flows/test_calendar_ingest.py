@@ -160,6 +160,9 @@ async def test_fetch_failure_skips_account():
     assert result["errors"] == 1  # personal failed
     assert result["events"] == 1  # only sebas' 1 event
     assert result["ingested"] == 1
+    # Labeled so a soft-failing account is visible instead of hiding behind
+    # an unlabeled `errors: 1` (issue #120).
+    assert result["errors_by_account"] == {"personal": 1}
 
 
 @pytest.mark.asyncio

@@ -52,6 +52,10 @@ class DeliveryWatchdogFlow:
             )
 
         # Best-effort comms inbound health check — never fails the watchdog run.
+        # Recorded into result_summary (issue #120): previously this half of the
+        # watchdog was invisible to audits even though it has caught 2 real
+        # Slack outages per audit_log.
+        result: dict = {"undelivered": len(rows), "comms_inbound_status": "unknown"}
         try:
             health = await workflow.execute_activity_method(
                 HomelabActivities.check_comms_inbound_health,
@@ -59,14 +63,16 @@ class DeliveryWatchdogFlow:
                 start_to_close_timeout=TIMEOUT_FAST,
                 retry_policy=NO_RETRY,
             )
+            result["comms_inbound_status"] = health.get("status", "unknown")
             if health.get("status") == "down":
-                await workflow.execute_activity_method(
+                alerted = await workflow.execute_activity_method(
                     HomelabActivities.alert_comms_inbound_down,
                     args=[health.get("last_ok_seconds_ago"), health.get("last_error")],
                     start_to_close_timeout=TIMEOUT_FAST,
                     retry_policy=NO_RETRY,
                 )
+                result["comms_inbound_alerted"] = bool(alerted)
         except Exception:
-            pass  # polling check is best-effort; never fails the watchdog
+            result["comms_inbound_status"] = "check_failed"
 
-        return {"undelivered": len(rows)}
+        return result

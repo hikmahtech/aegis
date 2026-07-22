@@ -34,6 +34,10 @@ _TIMESTAMP_COLUMNS: dict[str, str] = {
     # full retention window past their actual expiry).
     "alert_mutes": "muted_until",
     "pending_prs": "created_at",
+    # todoist_webhook_events records receipt time as `received_at`, not
+    # `created_at` (migration 001).
+    "todoist_webhook_events": "received_at",
+    "knowledge_injection_log": "created_at",
     # pandoras_actor.* — per migration 003 the timestamp columns are
     # `detected_at` (homelab_drift) and `checked_at` (everything else).
     "pandoras_actor.homelab_drift": "detected_at",
