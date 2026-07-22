@@ -114,6 +114,73 @@ async def test_reingest_same_url_replaces_chunks(store):
     assert status["title"] == "v2"
 
 
+async def test_reference_reingest_does_not_downgrade_intelligence(store):
+    """Issue #110 belt: a source_type='reference' re-ingest must NOT clobber a
+    richer existing row (intelligence + significance/topic metadata). The
+    existing row's source_type/title/tags/metadata and its chunks are all
+    preserved untouched."""
+    url = "aegis://test/intel-clobber"
+    first = await store.ingest_content(
+        url=url,
+        title="Fed holds rates — significance 5",
+        source_type="intelligence",
+        raw_text="markets rallied on the news " * 50,
+        tags=["intel", "topic:markets"],
+        metadata={"significance": 5, "topic": "markets"},
+    )
+    assert first["status"] == "ok"
+    cid = first["content_id"]
+    chunks_before = first["chunks_total"]
+
+    # ClarifyFlow would re-ingest the SAME url as a bland reference.
+    second = await store.ingest_content(
+        url=url,
+        title="Fed holds rates",  # generic clarify title, no significance
+        source_type="reference",
+        tags=["gtd:reference", "#research"],
+        metadata={"todoist_task_id": "abc", "captured_via": "gtd_clarify"},
+    )
+    assert second["content_id"] == cid
+    assert second["status"] == "preserved"
+    assert second["chunks_total"] == chunks_before  # chunks left intact
+
+    status = await store.get_content_status(cid)
+    assert status["source_type"] == "intelligence"
+    assert status["title"] == "Fed holds rates — significance 5"
+    assert status["metadata"] == {"significance": 5, "topic": "markets"}
+    assert set(status["tags"]) == {"intel", "topic:markets"}
+
+
+async def test_reference_over_reference_still_updates(store):
+    """The belt only blocks downgrades from a non-reference row; a plain
+    reference→reference re-ingest still upserts normally."""
+    url = "aegis://test/ref-ref"
+    await store.ingest_content(url=url, title="v1", source_type="reference",
+                               raw_text="body one " * 50, tags=["a"])
+    second = await store.ingest_content(url=url, title="v2", source_type="reference",
+                                        raw_text="body two", tags=["b"])
+    assert second["status"] == "ok"
+    status = await store.get_content_status(second["content_id"])
+    assert status["title"] == "v2" and status["source_type"] == "reference"
+    assert status["tags"] == ["b"]
+
+
+async def test_non_reference_reingest_still_upgrades(store):
+    """An intelligence re-ingest OVER an existing reference row is an upgrade,
+    not a downgrade — the belt must let it through."""
+    url = "aegis://test/upgrade"
+    await store.ingest_content(url=url, title="ref", source_type="reference",
+                               raw_text="something " * 50)
+    second = await store.ingest_content(
+        url=url, title="promoted", source_type="intelligence",
+        raw_text="promoted body " * 50, metadata={"significance": 4})
+    assert second["status"] == "ok"
+    status = await store.get_content_status(second["content_id"])
+    assert status["source_type"] == "intelligence"
+    assert status["title"] == "promoted"
+    assert status["metadata"]["significance"] == 4
+
+
 async def test_empty_body_is_skipped(store):
     res = await store.ingest_content(url="aegis://test/empty", title="", source_type="x")
     assert res["status"] == "empty" and res["chunks_total"] == 0
