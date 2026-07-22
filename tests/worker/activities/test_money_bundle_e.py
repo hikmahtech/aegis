@@ -2,12 +2,15 @@
 
 Covers:
   1. evaluate_renewal_alerts past-due 14d guard
+  1b. evaluate_renewal_alerts no-daily-refire (#113)
   2. notify_renewal_alert send-level 7d dedup
   3. detect_cancellations cadence IN (...) filter
   4. notify_cancellation chat send
   5. upsert_charges cadence preservation (real → unknown keeps real)
+  6. upsert_charges one-off skip (#113)
 
-Schema dependency: requires migration 019 (renewal_alert.last_notified_at).
+Schema dependency: requires migration 019 (renewal_alert.last_notified_at)
+and migration 013 (renewal_alert.next_due_at).
 DB-bound tests skip on no Postgres via the shared `db_pool` fixture.
 """
 
@@ -136,6 +139,121 @@ async def test_evaluate_renewal_alerts_excludes_long_past_due(db_pool):
     alerts = await env.run(act.evaluate_renewal_alerts, [0])
     ids = {a["charge_id"] for a in alerts}
     assert charge_id not in ids
+
+
+# ----------------- 1b. #113 no-daily-refire regression --------
+
+
+@pytest.mark.asyncio
+async def test_evaluate_renewal_alerts_fires_once_then_stops(db_pool):
+    """Regression #113: a threshold, once alerted for a charge's current
+    next_due_at, must not re-fire on a later evaluate call for that same
+    renewal cycle — even though the old dedup index was scoped per UTC
+    day (which used to let this refire every single day forever)."""
+    act = _make_act(db_pool)
+    async with db_pool.acquire() as conn:
+        await _clean(conn, "bundle-e-once-%")
+        charge_id = await _insert_active_charge(
+            conn,
+            account="acct-once",
+            sender_label="bundle-e-once",
+            amount_cents=999,
+        )
+        await conn.execute(
+            "UPDATE finance.recurring_charge SET next_due_at = NOW() - INTERVAL '1 days' "
+            "WHERE id = $1::uuid",
+            charge_id,
+        )
+
+    env = ActivityEnvironment()
+    first = await env.run(act.evaluate_renewal_alerts, [0])
+    assert charge_id in {a["charge_id"] for a in first}
+
+    # "Evaluate again next day" — nothing about the charge changed, so the
+    # same threshold is still crossed. It must NOT fire a second time.
+    second = await env.run(act.evaluate_renewal_alerts, [0])
+    assert charge_id not in {a["charge_id"] for a in second}
+
+    async with db_pool.acquire() as conn:
+        count = await conn.fetchval(
+            "SELECT COUNT(*) FROM finance.renewal_alert WHERE charge_id=$1::uuid",
+            charge_id,
+        )
+    assert count == 1
+
+
+@pytest.mark.asyncio
+async def test_evaluate_renewal_alerts_ignores_stale_day_scoped_row(db_pool):
+    """Simulates the exact prod bug: an alert already fired 'yesterday'
+    (backdated fired_at) for this (charge, threshold, next_due_at). The
+    old day-scoped unique index would let today's run insert a duplicate
+    for the new day; the fix must not."""
+    act = _make_act(db_pool)
+    async with db_pool.acquire() as conn:
+        await _clean(conn, "bundle-e-refire-%")
+        charge_id = await _insert_active_charge(
+            conn,
+            account="acct-refire",
+            sender_label="bundle-e-refire",
+            amount_cents=1999,
+        )
+        await conn.execute(
+            "UPDATE finance.recurring_charge SET next_due_at = NOW() - INTERVAL '1 days' "
+            "WHERE id = $1::uuid",
+            charge_id,
+        )
+        next_due_at = await conn.fetchval(
+            "SELECT next_due_at FROM finance.recurring_charge WHERE id=$1::uuid",
+            charge_id,
+        )
+        await conn.execute(
+            "INSERT INTO finance.renewal_alert "
+            "(charge_id, threshold_days, next_due_at, fired_at) "
+            "VALUES ($1::uuid, 0, $2, NOW() - INTERVAL '1 days')",
+            charge_id,
+            next_due_at,
+        )
+
+    env = ActivityEnvironment()
+    alerts = await env.run(act.evaluate_renewal_alerts, [0])
+    assert charge_id not in {a["charge_id"] for a in alerts}
+
+    async with db_pool.acquire() as conn:
+        count = await conn.fetchval(
+            "SELECT COUNT(*) FROM finance.renewal_alert WHERE charge_id=$1::uuid",
+            charge_id,
+        )
+    assert count == 1  # only the pre-seeded row — no refire
+
+
+@pytest.mark.asyncio
+async def test_evaluate_renewal_alerts_fires_lowest_missing_only(db_pool):
+    """A charge that jumps past several thresholds at once (freshly
+    overdue) gets exactly ONE alert per call — the lowest not-yet-fired
+    crossed threshold — not a burst of all of them."""
+    act = _make_act(db_pool)
+    async with db_pool.acquire() as conn:
+        await _clean(conn, "bundle-e-burst-%")
+        charge_id = await _insert_active_charge(
+            conn,
+            account="acct-burst",
+            sender_label="bundle-e-burst",
+            amount_cents=2999,
+        )
+        await conn.execute(
+            "UPDATE finance.recurring_charge SET next_due_at = NOW() - INTERVAL '2 days' "
+            "WHERE id = $1::uuid",
+            charge_id,
+        )
+
+    env = ActivityEnvironment()
+    mine = [
+        a
+        for a in await env.run(act.evaluate_renewal_alerts, [30, 14, 7, 0])
+        if a["charge_id"] == charge_id
+    ]
+    assert len(mine) == 1
+    assert mine[0]["threshold_days"] == 0
 
 
 # ----------------- 2. notify_renewal_alert 7d dedup -----------
@@ -487,3 +605,142 @@ async def test_upsert_charges_upgrades_unknown_to_real(db_pool):
             "SELECT cadence FROM finance.recurring_charge WHERE sender_label='bundle-e-cad-upgrade'"
         )
     assert cadence == "monthly"
+
+
+# ----------------- 6. upsert_charges one-off skip (#113) -------
+
+
+@pytest.mark.asyncio
+async def test_upsert_charges_skips_one_off_purchase(db_pool):
+    """is_recurring=False (a one-off purchase, e.g. a single Amazon order)
+    must NOT mint a recurring_charge row — it should never sit as a fake
+    'active subscription' forever. The receipt is still marked parsed."""
+    act = MoneyActivities(db_pool=db_pool, llm=None, delivery=None, fx_rates=_FX_RATES)
+    receipt_id = str(uuid.uuid4())
+    async with db_pool.acquire() as conn:
+        await _clean(conn, "bundle-e-oneoff")
+        await conn.execute(
+            "INSERT INTO finance.receipt_email "
+            "(id, message_id, account, sender, subject, received_at, parsed) "
+            "VALUES ($1::uuid, $2, 'acct-oneoff', 'orders@amazon.com', 's', NOW(), '{}'::jsonb) "
+            "ON CONFLICT (message_id) DO NOTHING",
+            receipt_id,
+            f"oneoff-{receipt_id}",
+        )
+
+    env = ActivityEnvironment()
+    processed = await env.run(
+        act.upsert_charges,
+        "acct-oneoff",
+        [
+            {
+                "receipt_id": receipt_id,
+                "is_receipt": True,
+                "is_recurring": False,
+                "vendor_name": "Amazon",
+                "sender_label": "bundle-e-oneoff",
+                "category": "other",
+                "amount": 1299.0,
+                "currency": "INR",
+                "cadence": "unknown",
+            }
+        ],
+    )
+    assert processed == 1
+
+    async with db_pool.acquire() as conn:
+        charge_count = await conn.fetchval(
+            "SELECT COUNT(*) FROM finance.recurring_charge WHERE sender_label='bundle-e-oneoff'"
+        )
+        parsed = await conn.fetchval(
+            "SELECT parsed FROM finance.receipt_email WHERE id=$1::uuid", receipt_id
+        )
+    assert charge_count == 0
+    assert parsed.get("is_recurring") is False
+
+
+@pytest.mark.asyncio
+async def test_upsert_charges_mints_recurring_when_flag_true(db_pool):
+    """is_recurring=True (explicit subscription/utility) mints a
+    recurring_charge row, same as before this field existed."""
+    act = MoneyActivities(db_pool=db_pool, llm=None, delivery=None, fx_rates=_FX_RATES)
+    receipt_id = str(uuid.uuid4())
+    async with db_pool.acquire() as conn:
+        await _clean(conn, "bundle-e-recurtrue")
+        await conn.execute(
+            "INSERT INTO finance.receipt_email "
+            "(id, message_id, account, sender, subject, received_at, parsed) "
+            "VALUES ($1::uuid, $2, 'acct-recurtrue', 'billing@netflix.com', 's', NOW(), '{}'::jsonb) "
+            "ON CONFLICT (message_id) DO NOTHING",
+            receipt_id,
+            f"recurtrue-{receipt_id}",
+        )
+
+    env = ActivityEnvironment()
+    await env.run(
+        act.upsert_charges,
+        "acct-recurtrue",
+        [
+            {
+                "receipt_id": receipt_id,
+                "is_receipt": True,
+                "is_recurring": True,
+                "vendor_name": "Netflix",
+                "sender_label": "bundle-e-recurtrue",
+                "category": "media",
+                "amount": 649.0,
+                "currency": "INR",
+                "cadence": "monthly",
+            }
+        ],
+    )
+
+    async with db_pool.acquire() as conn:
+        charge_count = await conn.fetchval(
+            "SELECT COUNT(*) FROM finance.recurring_charge WHERE sender_label='bundle-e-recurtrue'"
+        )
+    assert charge_count == 1
+
+
+@pytest.mark.asyncio
+async def test_upsert_charges_missing_is_recurring_defaults_to_minted(db_pool):
+    """No is_recurring key at all (pre-fix extractions, or the model
+    genuinely couldn't tell) is treated conservatively as recurring —
+    preserves the exact prior behaviour for ambiguous/legacy cases."""
+    act = MoneyActivities(db_pool=db_pool, llm=None, delivery=None, fx_rates=_FX_RATES)
+    receipt_id = str(uuid.uuid4())
+    async with db_pool.acquire() as conn:
+        await _clean(conn, "bundle-e-recurmissing")
+        await conn.execute(
+            "INSERT INTO finance.receipt_email "
+            "(id, message_id, account, sender, subject, received_at, parsed) "
+            "VALUES ($1::uuid, $2, 'acct-recurmissing', 'billing@spotify.com', 's', NOW(), '{}'::jsonb) "
+            "ON CONFLICT (message_id) DO NOTHING",
+            receipt_id,
+            f"recurmissing-{receipt_id}",
+        )
+
+    env = ActivityEnvironment()
+    await env.run(
+        act.upsert_charges,
+        "acct-recurmissing",
+        [
+            {
+                "receipt_id": receipt_id,
+                "is_receipt": True,
+                # No is_recurring key at all.
+                "vendor_name": "Spotify",
+                "sender_label": "bundle-e-recurmissing",
+                "category": "media",
+                "amount": 199.0,
+                "currency": "INR",
+                "cadence": "monthly",
+            }
+        ],
+    )
+
+    async with db_pool.acquire() as conn:
+        charge_count = await conn.fetchval(
+            "SELECT COUNT(*) FROM finance.recurring_charge WHERE sender_label='bundle-e-recurmissing'"
+        )
+    assert charge_count == 1

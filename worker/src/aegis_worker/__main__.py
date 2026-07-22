@@ -579,6 +579,7 @@ async def main():
         activities += [
             money_act.store_receipt_email,
             money_act.load_receipts,
+            money_act.find_stuck_receipts,
             money_act.classify_and_extract,
             money_act.upsert_charges,
             money_act.detect_cancellations,

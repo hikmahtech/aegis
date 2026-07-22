@@ -4,6 +4,15 @@ Per-message money hygiene is owned by GmailIngestFlow's tag-based fan-out
 (financial/payments → MoneyProcessFlow). This flow exists only as a weekly
 safety-net: it re-scans recent receipt-shaped mail and fans out any message
 the hourly triage missed to MoneyProcessFlow with idempotent semantics.
+
+It also runs a bounded re-attempt sweep (fix #113) over `receipt_email`
+rows that MoneyProcessFlow's fire-and-forget pipeline left permanently
+stuck — parse/extract failures that predate the 07-16 smart-tier fix.
+MoneyProcessFlow can't be reused for this: it starts from `store_receipt_email`,
+which is idempotent on `message_id` and would immediately short-circuit as
+"duplicate" for an already-stored row. The sweep instead re-drives the
+already-hydrated row directly through `classify_and_extract` +
+`upsert_charges`.
 """
 
 from __future__ import annotations
@@ -26,6 +35,7 @@ with workflow.unsafe.imports_passed_through():
 
 _ACT_TIMEOUT = timedelta(seconds=60)
 _FETCH_TIMEOUT = timedelta(seconds=120)
+_CLASSIFY_TIMEOUT = timedelta(seconds=120)
 
 # Hardcoded receipt-shaped sender filter stays in code (versioned with tests).
 # The time window is the only knob exposed through seed config (query_window).
@@ -47,6 +57,8 @@ class ReceiptIngestInput:
     max_per_account: int = 50
     query_window: str = _DEFAULT_QUERY_WINDOW
     aegis_ui_url: str = ""
+    sweep_limit: int = 20
+    sweep_older_than_days: int = 1
 
     @property
     def query(self) -> str:
@@ -119,11 +131,69 @@ class ReceiptIngestFlow:
                     retry_policy=ACT_RETRY,
                 )
 
+        swept = await self._sweep_stuck_receipts(input)
+
         return {
             "stored": stored,
             "accounts": accounts_processed,
             "errors": errors,
+            "swept": swept,
         }
+
+    async def _sweep_stuck_receipts(self, input: ReceiptIngestInput) -> int:
+        """Bounded re-attempt for receipt_email rows whose `parsed` result
+        is missing/failed (fix #113). Reprocesses each directly through
+        classify_and_extract + upsert_charges — a row that fails again
+        just leaves `parsed` unset and waits for next week's sweep.
+
+        # ponytail: no per-row retry-count/backoff bookkeeping — the
+        # weekly cadence + a small limit is the whole throttle. Good
+        # enough for a bounded, known-small backlog (36 rows); add real
+        # tracking only if a genuinely unparseable row starts burning a
+        # sweep slot every single week forever.
+        """
+        stuck_ids = await workflow.execute_activity(
+            "find_stuck_receipts",
+            args=[input.sweep_limit, input.sweep_older_than_days],
+            start_to_close_timeout=_ACT_TIMEOUT,
+            retry_policy=ACT_RETRY,
+        )
+        swept = 0
+        for receipt_id in stuck_ids:
+            try:
+                receipts = await workflow.execute_activity(
+                    "load_receipts",
+                    [receipt_id],
+                    start_to_close_timeout=_ACT_TIMEOUT,
+                    retry_policy=ACT_RETRY,
+                )
+                if not receipts:
+                    continue
+
+                extractions = await workflow.execute_activity(
+                    "classify_and_extract",
+                    args=[receipts, input.agent_id],
+                    start_to_close_timeout=_CLASSIFY_TIMEOUT,
+                    retry_policy=ACT_RETRY,
+                )
+                if not extractions or extractions[0].get("_parse_failed"):
+                    # Still failing — leave unparsed for next week's sweep.
+                    continue
+
+                await workflow.execute_activity(
+                    "upsert_charges",
+                    args=[receipts[0]["account"], extractions],
+                    start_to_close_timeout=_ACT_TIMEOUT,
+                    retry_policy=ACT_RETRY,
+                )
+                swept += 1
+            except Exception as exc:
+                workflow.logger.warning(
+                    "receipt_sweep_failed receipt_id=%s err=%s",
+                    receipt_id,
+                    str(exc)[:200],
+                )
+        return swept
 
     async def _fetch_with_reauth(
         self, input: ReceiptIngestInput, label: str, since: str | None

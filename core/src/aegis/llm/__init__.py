@@ -124,6 +124,11 @@ For EACH receipt below, return one JSON object with these fields:
 - cadence: monthly | quarterly | yearly | unknown. Infer from "annual",
   "every month", "billed quarterly", "3 months", "1 year plan".
 - next_due_at: ISO date (YYYY-MM-DD) if explicitly stated; null otherwise.
+- is_recurring: true if this looks like a SUBSCRIPTION or UTILITY that will
+  bill again (SaaS plan, streaming, domain/hosting renewal, insurance
+  premium, electricity/water/phone bill). false if it is a ONE-OFF purchase
+  that will not repeat (a single Amazon/e-commerce order, a one-time
+  service, a single event ticket). null if you cannot tell.
 - confidence: 0.0–1.0 self-rating.
 
 IMPORTANT: When is_receipt=true you MUST provide the amount and currency that

@@ -31,6 +31,15 @@ def test_parse_llm_json_handles_fences_prose_arrays_and_garbage():
     assert parse_llm_json("{broken") is None
 
 
+def test_batch_receipt_prompt_asks_for_is_recurring():
+    """Fix #113: the prompt must instruct the model to distinguish a
+    recurring subscription/utility from a one-off purchase, so
+    upsert_charges can skip minting a fake subscription for a one-off."""
+    prompt = _BATCH_RECEIPT_PROMPT.lower()
+    assert "is_recurring" in prompt
+    assert "one-off" in prompt
+
+
 def test_batch_receipt_prompt_has_bank_alert_exclusions():
     """Regression guard: the receipt prompt must keep the is_receipt=false rules
     for failed payments, autopay reminders, and card statements so a bank
@@ -262,6 +271,64 @@ async def test_extract_receipts_batch_marks_parse_failed_per_item():
     assert "_parse_failed" not in out[0]
     assert out[1]["is_receipt"] is False
     assert out[1].get("_parse_failed") is True
+
+
+async def test_extract_receipts_batch_passes_through_is_recurring():
+    """Fix #113: is_recurring survives ReceiptExtraction validation and is
+    echoed back per item, so upsert_charges can act on it."""
+    client = LLMClient(base_url="http://localhost:4000/v1", api_key="test")
+
+    async def stub_think(*args, **kwargs):
+        return {
+            "response": (
+                '```json\n'
+                '[{"is_receipt": true, "vendor_name": "Amazon", "sender_label": "amazon.com", '
+                '"category": "other", "amount": 12.99, "currency": "USD", "cadence": "unknown", '
+                '"is_recurring": false, "confidence": 0.9}, '
+                '{"is_receipt": true, "vendor_name": "Netflix", "sender_label": "netflix.com", '
+                '"category": "media", "amount": 6.99, "currency": "USD", "cadence": "monthly", '
+                '"is_recurring": true, "confidence": 0.95}]\n'
+                '```'
+            ),
+            "model": "gemma4:e2b",
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+        }
+
+    receipts = [
+        {"id": "r1", "sender": "a", "subject": "b", "body_plain": "c"},
+        {"id": "r2", "sender": "a", "subject": "b", "body_plain": "c"},
+    ]
+    with patch.object(client, "think", side_effect=stub_think):
+        out = await client.extract_receipts_batch(receipts, model="gemma4:e2b")
+    assert out[0]["is_recurring"] is False
+    assert out[1]["is_recurring"] is True
+
+
+async def test_extract_receipts_batch_is_recurring_defaults_to_none():
+    """A response that omits is_recurring entirely (older prompt version,
+    or model just didn't answer) must default to None, not False — so
+    upsert_charges' conservative "treat as recurring" fallback applies."""
+    client = LLMClient(base_url="http://localhost:4000/v1", api_key="test")
+
+    async def stub_think(*args, **kwargs):
+        return {
+            "response": (
+                '```json\n'
+                '[{"is_receipt": true, "vendor_name": "Namecheap", "sender_label": "namecheap.com", '
+                '"category": "domain", "amount": 12.99, "currency": "USD", "cadence": "yearly", '
+                '"confidence": 0.9}]\n'
+                '```'
+            ),
+            "model": "gemma4:e2b",
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+        }
+
+    receipts = [{"id": "r1", "sender": "a", "subject": "b", "body_plain": "c"}]
+    with patch.object(client, "think", side_effect=stub_think):
+        out = await client.extract_receipts_batch(receipts, model="gemma4:e2b")
+    assert out[0]["is_recurring"] is None
 
 
 # --------------- LLMTruncationError / reasoning-model guard ---------------
