@@ -1,0 +1,11 @@
+-- Renewal alerts refired daily (#113): the existing dedup was scoped to a
+-- UTC day (partial unique index on charge_id/threshold_days/day(fired_at)),
+-- so an already-crossed threshold kept re-inserting a new row every single
+-- day forever (166 rows in 3 weeks from only 7 charges). Dedup now scopes
+-- to the renewal cycle instead: evaluate_renewal_alerts stores the charge's
+-- next_due_at at fire time and checks existence across ALL time for
+-- (charge_id, threshold_days, next_due_at) before inserting. A NULL
+-- next_due_at on pre-existing rows is harmless — the new existence check
+-- simply won't match them, so each threshold gets at most one more alert
+-- as charges catch up to the new dedup key.
+ALTER TABLE finance.renewal_alert ADD COLUMN IF NOT EXISTS next_due_at timestamptz;

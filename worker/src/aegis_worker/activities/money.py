@@ -180,6 +180,33 @@ class MoneyActivities:
         ]
 
     @activity.defn
+    async def find_stuck_receipts(
+        self, limit: int = 20, older_than_days: int = 1
+    ) -> list[str]:
+        """Return up to `limit` receipt_email ids whose parse result is
+        missing or failed — `parsed` NULL or lacking the `is_receipt` key.
+
+        Fix #113: MoneyProcessFlow is fire-and-forget — on extract/parse
+        failure it returns early without ever writing `parsed`, so these
+        rows are permanently stuck (the pre-07-16 smart-tier failures; 36
+        of them in prod, verified 0% failure since). ReceiptIngestFlow's
+        weekly sweep re-drives them through classify_and_extract +
+        upsert_charges directly. Oldest-first so the backlog drains in
+        order; `older_than_days` avoids racing a receipt that's still
+        mid-flight in its original MoneyProcessFlow run.
+        """
+        async with self.db_pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT id FROM finance.receipt_email "
+                "WHERE (parsed IS NULL OR NOT (parsed ? 'is_receipt')) "
+                "  AND received_at < NOW() - ($2 * INTERVAL '1 day') "
+                "ORDER BY received_at ASC LIMIT $1",
+                limit,
+                older_than_days,
+            )
+        return [str(r["id"]) for r in rows]
+
+    @activity.defn
     async def classify_and_extract(
         self, receipts: list[dict], agent_id: str = ""
     ) -> list[dict]:
@@ -220,7 +247,8 @@ class MoneyActivities:
     @activity.defn
     async def upsert_charges(self, account: str, extractions: list[dict]) -> int:
         """For each extraction, link `finance.receipt_email` and (when
-        is_receipt=True) upsert `finance.recurring_charge` keyed on
+        is_receipt=True and is_recurring is not False) upsert
+        `finance.recurring_charge` keyed on
         (account, sender_label, amount_cents, currency).
 
         Cadence is upgrade-only ('unknown' may be replaced; explicit
@@ -258,6 +286,29 @@ class MoneyActivities:
                         receipt_id=receipt_id,
                         sender=e.get("sender", ""),
                         sender_label=e.get("sender_label", ""),
+                        vendor_name=e.get("vendor_name", ""),
+                    )
+                    await conn.execute(
+                        "UPDATE finance.receipt_email SET parsed=$2 WHERE id=$1::uuid",
+                        receipt_id,
+                        e,
+                    )
+                    processed += 1
+                    continue
+
+                # One-off purchase, not a subscription/utility (#113): mint
+                # no recurring_charge row so it doesn't sit as a fake
+                # "active subscription" forever. The receipt itself is
+                # still stored/marked parsed. A missing/uncertain flag
+                # (None — model didn't answer, or pre-fix extractions that
+                # predate this field) is treated conservatively as
+                # recurring, preserving prior behaviour for ambiguous
+                # cases. Existing prod one-off rows are NOT reclassified
+                # here — see PR description for the manual prune.
+                if e.get("is_recurring") is False:
+                    logger.info(
+                        "money_skip_one_off",
+                        receipt_id=receipt_id,
                         vendor_name=e.get("vendor_name", ""),
                     )
                     await conn.execute(
@@ -374,13 +425,25 @@ class MoneyActivities:
 
     @activity.defn
     async def evaluate_renewal_alerts(self, thresholds: list[int]) -> list[dict]:
-        """Insert renewal_alert rows for each threshold a charge has crossed
-        today. Returns the NEW alert payloads (for notification).
+        """Insert one renewal_alert row for the lowest not-yet-alerted
+        threshold each active, due-soon charge has crossed. Returns the NEW
+        alert payloads (for notification).
 
-        Idempotent — partial unique index on
-        (charge_id, threshold_days, ((fired_at AT TIME ZONE 'UTC')::date))
-        means multi-fire same UTC day is a no-op. The ON CONFLICT clause
-        below MUST match that index expression exactly or dedup breaks.
+        Fix #113: dedup used to be scoped to a UTC day (partial unique
+        index on charge_id/threshold_days/day(fired_at)) so an
+        already-crossed threshold re-fired every single day forever (166
+        rows in 3 weeks from only 7 charges). Dedup is now scoped to the
+        renewal cycle instead — (charge_id, threshold_days, next_due_at),
+        checked across ALL time, not just today — so a threshold, once
+        alerted for a given next_due_at, never re-fires for that same
+        cycle. Only the single lowest never-alerted crossed threshold
+        fires per call: a charge that jumps past several thresholds at
+        once (freshly imported, already overdue) gets one alert, not a
+        burst, matching the "at most one alert" cadence the downstream
+        Slack 7-day guard and Todoist charge_id+next_due_at dedupe already
+        assume. The day-scoped ON CONFLICT clause stays as a
+        race-condition backstop; it must still match the original index
+        expression exactly.
         """
         new_alerts: list[dict] = []
         async with self.db_pool.acquire() as conn:
@@ -398,34 +461,50 @@ class MoneyActivities:
             )
             for c in charges:
                 days_left = float(c["days_left"])
-                for t in thresholds:
-                    if days_left > t:
-                        continue
-                    row = await conn.fetchrow(
-                        "INSERT INTO finance.renewal_alert "
-                        "(charge_id, threshold_days) VALUES ($1, $2) "
-                        "ON CONFLICT (charge_id, threshold_days, "
-                        "             ((fired_at AT TIME ZONE 'UTC')::date)) "
-                        "DO NOTHING RETURNING id",
-                        c["id"],
-                        t,
+                crossed = sorted(t for t in thresholds if days_left <= t)
+                if not crossed:
+                    continue
+
+                fired_rows = await conn.fetch(
+                    "SELECT threshold_days FROM finance.renewal_alert "
+                    "WHERE charge_id = $1 AND next_due_at = $2 "
+                    "  AND threshold_days = ANY($3::int[])",
+                    c["id"],
+                    c["next_due_at"],
+                    crossed,
+                )
+                fired = {r["threshold_days"] for r in fired_rows}
+                not_yet_fired = [t for t in crossed if t not in fired]
+                if not not_yet_fired:
+                    continue
+                t = min(not_yet_fired)
+
+                row = await conn.fetchrow(
+                    "INSERT INTO finance.renewal_alert "
+                    "(charge_id, threshold_days, next_due_at) VALUES ($1, $2, $3) "
+                    "ON CONFLICT (charge_id, threshold_days, "
+                    "             ((fired_at AT TIME ZONE 'UTC')::date)) "
+                    "DO NOTHING RETURNING id",
+                    c["id"],
+                    t,
+                    c["next_due_at"],
+                )
+                if row is not None:
+                    new_alerts.append(
+                        {
+                            "alert_id": str(row["id"]),
+                            "charge_id": str(c["id"]),
+                            "threshold_days": t,
+                            "vendor_name": c["vendor_name"],
+                            "category": c["category"],
+                            "amount_cents": c["amount_cents"],
+                            "currency": c["currency"],
+                            "monthly_home_equivalent": float(c["monthly_home_equivalent"]),
+                            "days_left": round(days_left, 1),
+                            "next_due_at": c["next_due_at"].isoformat(),
+                            "account": c["account"],
+                        }
                     )
-                    if row is not None:
-                        new_alerts.append(
-                            {
-                                "alert_id": str(row["id"]),
-                                "charge_id": str(c["id"]),
-                                "threshold_days": t,
-                                "vendor_name": c["vendor_name"],
-                                "category": c["category"],
-                                "amount_cents": c["amount_cents"],
-                                "currency": c["currency"],
-                                "monthly_home_equivalent": float(c["monthly_home_equivalent"]),
-                                "days_left": round(days_left, 1),
-                                "next_due_at": c["next_due_at"].isoformat(),
-                                "account": c["account"],
-                            }
-                        )
         return new_alerts
 
     @activity.defn
