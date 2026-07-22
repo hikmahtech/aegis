@@ -109,6 +109,33 @@ class KnowledgeStore:
         "empty" when there's no embeddable text.
         """
         content_id = _content_id_for(url)
+        # Belt for issue #110: a 'reference' re-ingest must never downgrade a
+        # richer existing row (e.g. source_type='intelligence' carrying
+        # significance/topic metadata). If this write would do that, preserve
+        # the existing row and its chunks untouched. The primary guard is the
+        # clarify choke point (ingest_reference_to_ks); this protects against
+        # any future pipeline collision, not just clarify.
+        if source_type == "reference":
+            existing = await self._pool.fetchrow(
+                """
+                SELECT c.source_type,
+                       (SELECT count(*) FROM knowledge_chunks k
+                        WHERE k.content_id = c.content_id) AS chunks_total
+                FROM knowledge_content c WHERE c.content_id = $1
+                """,
+                content_id,
+            )
+            if existing is not None and existing["source_type"] != "reference":
+                logger.info(
+                    "knowledge_content_ingest_preserved",
+                    content_id=content_id,
+                    existing_source_type=existing["source_type"],
+                )
+                return {
+                    "content_id": content_id,
+                    "status": "preserved",
+                    "chunks_total": existing["chunks_total"],
+                }
         title = _strip_nul(title) or ""
         summary = _strip_nul(summary)
         raw_text = _strip_nul(raw_text)

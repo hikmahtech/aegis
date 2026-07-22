@@ -60,6 +60,7 @@ from aegis.services.gtd_rules import (
     DEFAULT_SKIP_INBOX,
     get_gtd_rules,
 )
+from aegis.services.knowledge import _content_id_for
 
 
 class _RuleSet:
@@ -1899,6 +1900,31 @@ class ClarifyActivities:
             "source_tag": source_tag or "",
             "captured_via": "gtd_clarify",
         }
+
+        # Choke point for issue #110: if this exact URL is already in the
+        # knowledge store (e.g. IntelligenceScanFlow ingested it as
+        # source_type='intelligence' with significance/topic metadata), a
+        # re-ingest here as source_type='reference' would clobber that richer
+        # row — or, for unscrapable URLs like HN, spawn a junk synthetic
+        # duplicate under aegis://reference/{task_id}. Skip the KS write; the
+        # caller still does its Todoist-side labeling from this "ok" verdict.
+        if url:
+            existing = await self.knowledge_connector.get_content_status(
+                _content_id_for(url)
+            )
+            if existing.get("status") == "completed":
+                activity.logger.info(
+                    "ingest_reference_to_ks_skip_existing task_id=%s url=%s content_id=%s",
+                    task_id,
+                    url,
+                    existing.get("content_id"),
+                )
+                return {
+                    "status": "ok",
+                    "url": url,
+                    "content_id": existing.get("content_id"),
+                    "job_id": None,
+                }
 
         # For URLs KS can't scrape (Gmail deeplinks, HN items), fetch the
         # body ourselves and send it as raw_text. Without this, KS stores

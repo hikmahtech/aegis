@@ -1761,6 +1761,7 @@ async def test_ingest_reference_to_ks_with_url() -> None:
     """When task content contains a URL, KS gets the URL (no raw_text);
     KS will fetch + extract via its own scraper."""
     kc = AsyncMock()
+    kc.get_content_status = AsyncMock(return_value={"status": "not_found"})
     kc.ingest_content = AsyncMock(
         return_value={"status": "accepted", "job_id": "JOB-1", "content_id": "C-1"}
     )
@@ -1789,6 +1790,37 @@ async def test_ingest_reference_to_ks_with_url() -> None:
     assert kwargs["metadata"]["todoist_task_id"] == "T_REF1"
     # No raw_text when URL is present — KS does extraction
     assert "raw_text" not in kwargs
+
+
+@pytest.mark.asyncio
+async def test_ingest_reference_to_ks_skips_already_known_url() -> None:
+    """Issue #110 choke point: when the extracted URL is already in KS (e.g.
+    IntelligenceScanFlow ingested it as source_type='intelligence'), the
+    reference re-ingest must NOT call ingest_content — no clobber, no synthetic
+    duplicate — and still return an 'ok' verdict with the existing content_id
+    so the caller does its Todoist-side labeling."""
+    kc = AsyncMock()
+    kc.get_content_status = AsyncMock(
+        return_value={"status": "completed", "content_id": "C-INTEL"}
+    )
+    kc.ingest_content = AsyncMock()
+    acts = ClarifyActivities(
+        db_pool=None,
+        todoist_connector=AsyncMock(),
+        llm_client=AsyncMock(),
+        knowledge_connector=kc,
+    )
+    out = await acts.ingest_reference_to_ks(
+        task_id="T_DUP",
+        task_content="Fed holds rates https://reuters.com/fed",
+        task_description="",
+        source_tag="#research",
+        latest_user_note=None,
+    )
+    assert out["status"] == "ok"
+    assert out["url"] == "https://reuters.com/fed"
+    assert out["content_id"] == "C-INTEL"
+    kc.ingest_content.assert_not_awaited()  # no re-ingest, no clobber
 
 
 @pytest.mark.asyncio
@@ -1824,6 +1856,7 @@ async def test_ingest_reference_to_ks_gmail_url_falls_through_to_raw_text() -> N
     drop the URL and send the description (which now carries the body
     excerpt stashed by gmail_ingest) as raw_text."""
     kc = AsyncMock()
+    kc.get_content_status = AsyncMock(return_value={"status": "not_found"})
     kc.ingest_content = AsyncMock(return_value={"status": "ok", "content_id": "C-GM"})
     acts = ClarifyActivities(
         db_pool=None,
@@ -1854,6 +1887,7 @@ async def test_ingest_reference_to_ks_hn_url_fetches_body(monkeypatch) -> None:
     """HN item URLs aren't usefully scrapable as HTML — the route fetches
     the Firebase API body + top comments and ships them as raw_text."""
     kc = AsyncMock()
+    kc.get_content_status = AsyncMock(return_value={"status": "not_found"})
     kc.ingest_content = AsyncMock(return_value={"status": "ok", "content_id": "C-HN"})
     acts = ClarifyActivities(
         db_pool=None,
