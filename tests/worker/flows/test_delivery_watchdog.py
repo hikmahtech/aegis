@@ -18,6 +18,7 @@ with workflow.unsafe.imports_passed_through():
 
 _find_calls: list[tuple] = []
 _notify_calls: list[list] = []
+_alert_calls: list[tuple] = []
 
 
 def _make_find(rows):
@@ -34,14 +35,30 @@ async def stub_notify(rows: list[dict]) -> None:
     _notify_calls.append(rows)
 
 
-async def _run(find_stub, config, wf_id):
+def _make_health(health: dict):
+    @activity.defn(name="check_comms_inbound_health")
+    async def stub_health(comms_url: str) -> dict:
+        return health
+
+    return stub_health
+
+
+@activity.defn(name="alert_comms_inbound_down")
+async def stub_alert(last_ok_seconds_ago: int | None, last_error: str | None) -> bool:
+    _alert_calls.append((last_ok_seconds_ago, last_error))
+    return True
+
+
+async def _run(find_stub, config, wf_id, health_stub=None, alert_stub=None):
+    activities = [find_stub, stub_notify, health_stub or _make_health({"status": "ok"})]
+    activities.append(alert_stub or stub_alert)
     async with (
         await WorkflowEnvironment.start_time_skipping() as env,
         Worker(
             env.client,
             task_queue="tq",
             workflows=[DeliveryWatchdogFlow],
-            activities=[find_stub, stub_notify],
+            activities=activities,
         ),
     ):
         return await env.client.execute_workflow(
@@ -55,7 +72,7 @@ async def test_notifies_when_undelivered_found():
     _notify_calls.clear()
     rows = [{"id": "i1", "origin": "alert_confirm_repo", "status": "pending"}]
     result = await _run(_make_find(rows), DeliveryWatchdogConfig(), "dw-1")
-    assert result == {"undelivered": 1}
+    assert result == {"undelivered": 1, "comms_inbound_status": "ok"}
     assert len(_notify_calls) == 1
     assert _find_calls == [(120, 24)]
 
@@ -65,8 +82,51 @@ async def test_silent_when_none_undelivered():
     _find_calls.clear()
     _notify_calls.clear()
     result = await _run(_make_find([]), DeliveryWatchdogConfig(), "dw-2")
-    assert result == {"undelivered": 0}
+    assert result == {"undelivered": 0, "comms_inbound_status": "ok"}
     assert _notify_calls == []
+
+
+@pytest.mark.asyncio
+async def test_records_comms_down_and_alerted():
+    """A down comms status must surface in result_summary alongside whether
+    the alert activity actually fired — this half of the watchdog was
+    previously invisible (issue #120)."""
+    _find_calls.clear()
+    _notify_calls.clear()
+    _alert_calls.clear()
+    health = {"status": "down", "last_ok_seconds_ago": 900, "last_error": "socket closed"}
+    result = await _run(
+        _make_find([]),
+        DeliveryWatchdogConfig(),
+        "dw-3",
+        health_stub=_make_health(health),
+    )
+    assert result == {
+        "undelivered": 0,
+        "comms_inbound_status": "down",
+        "comms_inbound_alerted": True,
+    }
+    assert _alert_calls == [(900, "socket closed")]
+
+
+@pytest.mark.asyncio
+async def test_records_comms_check_failed_without_crashing_watchdog():
+    """A failing health check must not fail the whole watchdog run — it
+    should degrade to a visible status instead."""
+    _find_calls.clear()
+    _notify_calls.clear()
+
+    @activity.defn(name="check_comms_inbound_health")
+    async def failing_health(comms_url: str) -> dict:
+        raise RuntimeError("connection refused")
+
+    result = await _run(
+        _make_find([]),
+        DeliveryWatchdogConfig(),
+        "dw-4",
+        health_stub=failing_health,
+    )
+    assert result == {"undelivered": 0, "comms_inbound_status": "check_failed"}
 
 
 # ----- activity (real Postgres) ---------------------------------------------

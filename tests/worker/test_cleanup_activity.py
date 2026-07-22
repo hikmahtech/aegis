@@ -266,6 +266,8 @@ _EXPANDED_TABLES = [
     "pandoras_actor.backup_health",
     "pandoras_actor.schedule_health",
     "pandoras_actor.cert_expiry",
+    "todoist_webhook_events",
+    "knowledge_injection_log",
 ]
 
 
@@ -295,6 +297,8 @@ def test_expanded_tables_use_correct_timestamp_columns():
         "pandoras_actor.backup_health": "checked_at",
         "pandoras_actor.schedule_health": "checked_at",
         "pandoras_actor.cert_expiry": "checked_at",
+        "todoist_webhook_events": "received_at",
+        "knowledge_injection_log": "created_at",
     }
     for table, ts_col in expected.items():
         assert _TIMESTAMP_COLUMNS[table] == ts_col, (

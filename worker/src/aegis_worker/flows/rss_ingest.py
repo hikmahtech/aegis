@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import timedelta
+from datetime import datetime, timedelta
 
 from temporalio import workflow
 
@@ -14,6 +14,11 @@ with workflow.unsafe.imports_passed_through():
 
 _ACT_TIMEOUT = timedelta(seconds=60)
 _FETCH_TIMEOUT = timedelta(seconds=120)
+
+# A feed whose last known entry is older than this is almost certainly dead
+# (moved, discontinued, or was never a real feed) rather than just quiet —
+# surface it instead of polling it hourly forever (issue #120).
+_STALE_FEED_DAYS = 90
 
 
 @dataclass
@@ -39,6 +44,23 @@ class RssIngestFlow:
         for ch in channels:
             identifier = ch["identifier"]
             since = (ch.get("config") or {}).get("last_cursor")
+
+            # Once per run: flag feeds that haven't yielded a new entry in a
+            # long time so they surface instead of being polled silently
+            # forever. `since` is the ISO timestamp of the last entry we
+            # ever accepted (or None if the feed has never yielded one).
+            if since:
+                try:
+                    last_entry_at = datetime.fromisoformat(since)
+                    stale_days = (workflow.now() - last_entry_at).days
+                except (ValueError, TypeError):
+                    stale_days = 0
+                if stale_days > _STALE_FEED_DAYS:
+                    workflow.logger.warning(
+                        "rss_feed_stale feed=%s days_since_last_entry=%d",
+                        identifier,
+                        stale_days,
+                    )
 
             try:
                 result: FetchFeedResult = await workflow.execute_activity(

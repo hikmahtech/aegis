@@ -29,6 +29,10 @@ _DEFAULT_RETENTIONS: dict[str, int] = {
     "alert_dedup_index": 60,
     "alert_mutes": 30,
     "pending_prs": 30,
+    # inserted unconditionally per webhook (webhooks.py) / per knowledge
+    # injection — unbounded growth otherwise (issue #120).
+    "todoist_webhook_events": 60,
+    "knowledge_injection_log": 90,
     # pandoras_actor.* homelab observation tables — see migration 003.
     "pandoras_actor.homelab_drift": 60,
     "pandoras_actor.backup_health": 60,

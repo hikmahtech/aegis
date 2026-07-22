@@ -60,6 +60,9 @@ class CalendarIngestFlow:
         total_content = 0
         total_ingested = 0
         errors = 0
+        # Labeled per-account so a soft-failing account is visible instead of
+        # hiding behind an unlabeled `errors: 1` (issue #120).
+        errors_by_account: dict[str, int] = {}
 
         for ch in channels:
             identifier = ch["identifier"]
@@ -69,6 +72,7 @@ class CalendarIngestFlow:
             result = await self._fetch_with_reauth(input, label, since_cursor)
             if result is None:
                 errors += 1
+                errors_by_account[label] = errors_by_account.get(label, 0) + 1
                 continue
 
             if not result.events:
@@ -138,12 +142,15 @@ class CalendarIngestFlow:
                     retry_policy=ACT_RETRY,
                 )
 
-        return {
+        result_summary: dict = {
             "events": total_events,
             "content": total_content,
             "ingested": total_ingested,
             "errors": errors,
         }
+        if errors_by_account:
+            result_summary["errors_by_account"] = errors_by_account
+        return result_summary
 
     async def _fetch_with_reauth(
         self,
