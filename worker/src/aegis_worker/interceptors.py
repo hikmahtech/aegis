@@ -21,6 +21,7 @@ activities.
 
 from __future__ import annotations
 
+import json
 from dataclasses import asdict, is_dataclass
 from datetime import timedelta
 from typing import Any
@@ -41,12 +42,55 @@ with workflow.unsafe.imports_passed_through():
 _ACT_RETRY = RetryPolicy(maximum_attempts=2)
 _ACT_TIMEOUT = timedelta(seconds=30)
 
+# ~16KB serialized cap on result_summary/input_summary (issue #112) — big enough
+# for legitimate distributional fields (by_category, per-feed breakdowns) while
+# stopping one pathological result from bloating workflow_runs indefinitely.
+_MAX_SUMMARY_BYTES = 16_000
+
+_JSON_PRIMITIVES = (str, int, float, bool, type(None))
+
+
+def _json_safe(value: Any) -> Any:
+    """Recursively coerce a value into native JSON types (dict/list/str/int/float/bool/None).
+
+    The asyncpg jsonb codec's encoder (`db/pool.py::_encode_jsonb`) calls bare
+    `json.dumps(value)` with no `default=` — so any leaf that isn't already a
+    JSON-native type (e.g. a datetime nested inside a dict) would raise
+    mid-activity and turn an otherwise-successful workflow into a spurious
+    failure. Non-native leaves are stringified here, up front, via `str()`.
+    """
+    if isinstance(value, _JSON_PRIMITIVES):
+        return value
+    if isinstance(value, dict):
+        return {str(k): _json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(v) for v in value]
+    return str(value)
+
+
+def _cap_summary_size(d: dict[str, Any], max_bytes: int = _MAX_SUMMARY_BYTES) -> dict[str, Any]:
+    """Drop the largest top-level values (by their own serialized size) until
+    the whole dict serializes under `max_bytes`. Values are assumed already
+    JSON-safe (see `_json_safe`), so plain `json.dumps` is enough here."""
+    if len(json.dumps(d)) <= max_bytes:
+        return d
+    out = dict(d)
+    sizes = {k: len(json.dumps(v)) for k, v in d.items()}
+    for k in sorted(sizes, key=lambda key: sizes[key], reverse=True):
+        out[k] = f"<dropped: {sizes[k]} bytes>"
+        if len(json.dumps(out)) <= max_bytes:
+            break
+    return out
+
 
 def _summarise(obj: Any) -> dict[str, Any] | None:
     """Best-effort summary of a dataclass or plain dict (first arg or return value).
 
-    Primitives pass through; everything else stringified and capped at 500 chars
-    so the JSONB column doesn't balloon.
+    Nested dict/list values pass through natively as real JSON objects/arrays
+    (not `str(v)` reprs) so SQL (`->`, `->>`, `jsonb_each`) can query them —
+    see issue #112. Every leaf is coerced to a JSON-native type first
+    (`_json_safe`), then the whole summary is capped at ~16KB serialized
+    (`_cap_summary_size`) so a pathological result can't bloat the table.
     """
     if obj is None:
         return None
@@ -59,10 +103,8 @@ def _summarise(obj: Any) -> dict[str, Any] | None:
         d = obj
     else:
         return {"type": type(obj).__name__}
-    return {
-        k: (v if isinstance(v, (int, float, bool, str, type(None))) else str(v)[:500])
-        for k, v in d.items()
-    }
+    safe = {str(k): _json_safe(v) for k, v in d.items()}
+    return _cap_summary_size(safe)
 
 
 def _extract_agent_id(args: tuple[Any, ...]) -> str | None:

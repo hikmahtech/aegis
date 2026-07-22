@@ -54,12 +54,29 @@ class DriveActivities:
             recurse=input.recurse,
             skip_unchanged=skip,
         )
-        activity.logger.info(
-            "drive_folder_synced folder=%s ingested=%s unchanged=%s skipped=%s errors=%s",
-            input.folder_id,
-            result["ingested"],
-            result["unchanged"],
-            result["skipped"],
-            result["errors"],
+        is_empty = not any(
+            result[k] for k in ("ingested", "unchanged", "skipped", "errors")
         )
-        return {"status": "ok", **result}
+        if is_empty:
+            # Issue #111: 122/122 DriveSyncFlow runs silently reported "ok" with
+            # every counter at zero (the folder listing came back empty), and
+            # nothing ever surfaced it. A folder listing 0 files total is
+            # distinguishable from "already synced" (which shows up as
+            # unchanged>0) so flag it loudly instead of letting it masquerade
+            # as a normal run.
+            activity.logger.warning(
+                "drive_folder_empty_listing account=%s folder_id=%s — listing "
+                "returned 0 files (ingested/unchanged/skipped/errors all zero)",
+                input.account,
+                input.folder_id,
+            )
+        else:
+            activity.logger.info(
+                "drive_folder_synced folder=%s ingested=%s unchanged=%s skipped=%s errors=%s",
+                input.folder_id,
+                result["ingested"],
+                result["unchanged"],
+                result["skipped"],
+                result["errors"],
+            )
+        return {"status": "empty_listing" if is_empty else "ok", **result}

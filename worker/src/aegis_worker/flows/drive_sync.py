@@ -38,6 +38,7 @@ class DriveSyncFlow:
         if not folders:
             return {"status": "skipped", "reason": "no_folder_configured"}
         agg = {"ingested": 0, "unchanged": 0, "skipped": 0, "errors": 0, "folders": 0}
+        empty_folder_ids: list[str] = []
         for f in folders:
             r = await workflow.execute_activity(
                 "sync_drive_folder",
@@ -50,7 +51,17 @@ class DriveSyncFlow:
                 start_to_close_timeout=_SYNC_TIMEOUT,
                 retry_policy=RETRY_ONCE,
             )
+            if r.get("status") == "empty_listing":
+                empty_folder_ids.append(f["id"])
             for k in ("ingested", "unchanged", "skipped", "errors"):
                 agg[k] += r.get(k, 0)
             agg["folders"] += 1
-        return {"status": "ok", **agg}
+        # Issue #111: a "ok" status with an empty per-folder listing hid 122
+        # consecutive silent no-ops. Surface it in the aggregate status too, so
+        # a dashboard/alert reading workflow_runs.result_summary can't mistake
+        # this for a normal run.
+        status = "empty_listing" if empty_folder_ids else "ok"
+        out = {"status": status, **agg}
+        if empty_folder_ids:
+            out["empty_folder_ids"] = empty_folder_ids
+        return out
