@@ -3,9 +3,9 @@
 # before deploy — Phase 1 checklist: `curl http://ollama:11434/api/tags | jq`.
 
 tiers:
-  fast:     "gemma4:e2b"              # quick chat, tight-loop classification
-  balanced: "gpt-oss:20b"             # default chat + most flows (qwen3:14b retired)
-  smart:    "claude-sonnet-5"         # LiteLLM proxy alias — point at a strong, tool-calling-capable model (e.g. anthropic/claude-sonnet-5); chat tool-calling needs the alias to pass tools through
+  fast:     "gemma4:e2b"              # quick chat, tight-loop classification (local ollama on meem)
+  balanced: "kimi-k2.5"               # default chat + most flows — Kimi-for-Coding via LiteLLM (flat-rate, tool-calling). Replaces gpt-oss:20b, whose host (ollama-2 on asif) is down indefinitely.
+  smart:    "claude-sonnet-5"         # Anthropic API via LiteLLM — reserved for chat; background flows should use balanced
 
 litellm:
   # base_url is set by env: AEGIS_LITELLM_URL
