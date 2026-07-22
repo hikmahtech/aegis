@@ -566,3 +566,199 @@ async def test_resolve_resource_llm_returns_multiple():
     assert result["resources"][1]["resource_id"] == "res-003"
     # No connector in list → no infra-gitops expansion (already present)
     assert len([r for r in result["resources"] if r["resource_id"] == "res-003"]) == 1
+
+
+# ---------------------------------------------------------------------------
+# Tier 1.6 — deterministic free-text token match (Fixes #119)
+#
+# Shapes below mirror real prod `resources` rows (read-only prod inspection,
+# names only — no secrets): hikmahtech/trading-system-pipeline,
+# hikmahtech/em-credibility-monitor (title mismatches its own slug/path,
+# exactly like prod: slug repo-quantamental-data-platform, path
+# hikmah/quantamental-data-platform), arshadansari27/chattapp.
+# ---------------------------------------------------------------------------
+
+DAGSTER_SAMPLE_RESOURCES = [
+    {
+        "id": "res-trading",
+        "title": "hikmahtech/trading-system-pipeline",
+        "kind": "repository",
+        "url": "https://github.com/hikmahtech/trading-system-pipeline",
+        "metadata": {
+            "path": "trading/trading-system-pipeline",
+            "github_repo": "hikmahtech/trading-system-pipeline",
+            "coding_enabled": True,
+        },
+    },
+    {
+        "id": "res-credibility",
+        "title": "hikmahtech/em-credibility-monitor",
+        "kind": "repository",
+        "url": "https://github.com/hikmahtech/em-credibility-monitor",
+        "metadata": {
+            "path": "hikmah/quantamental-data-platform",
+            "github_repo": "hikmahtech/em-credibility-monitor",
+            "coding_enabled": True,
+        },
+    },
+    {
+        "id": "res-chattapp",
+        "title": "arshadansari27/chattapp",
+        "kind": "repository",
+        "url": "https://github.com/arshadansari27/chattapp",
+        "metadata": {
+            "path": "personal/chattapp",
+            "github_repo": "arshadansari27/chattapp",
+            "coding_enabled": True,
+        },
+    },
+]
+
+
+async def test_resolve_resource_deterministic_token_match_unambiguous():
+    """Tier 1.6: a Dagster alert with empty `service` (alertmanager Dagster
+    alerts never set it) but a `pipeline_name` label naming the pipeline
+    ("daily_credibility_job") resolves via free-text token overlap
+    ("credibility") against the ONE matching repo — before ever consulting
+    the LLM.
+
+    Real-world case behind issue #119: the 2026-07-19 00:27 investigation of
+    this exact alert landed on resource_source="none" because `service` is
+    empty for alertmanager Dagster alerts, so Tier 1.5's exact basename match
+    never fires. (The OTHER Dagster alert in the issue,
+    equities_fundamentals_pipeline, genuinely belongs to a DIFFERENT repo —
+    trading-system-pipeline — with no literal token overlap; see
+    test_resolve_resource_deterministic_token_match_no_overlap_falls_back_to_llm
+    below. Confirmed by grepping both pipeline/job names against the actual
+    checked-out repos.)
+    """
+    mock_db = AsyncMock()
+    mock_db.fetch.return_value = DAGSTER_SAMPLE_RESOURCES
+    mock_kg = AsyncMock()
+    mock_kg.search.return_value = []
+    mock_llm = AsyncMock()  # must never be consulted
+
+    alert = {
+        "title": "Dagster Pipeline Failed: daily_credibility_job",
+        "source": "alertmanager",
+        "fingerprint": "fp-dagster-credibility",
+        "service": "",
+        "description": (
+            "Pipeline: daily_credibility_job\nFailed Step: ingest_bis_policy_rates\n"
+            "Error Type: ReadTimeout\nError: httpx.ReadTimeout"
+        ),
+        "labels": {
+            "alertname": "Dagster Pipeline Failure",
+            "pipeline_name": "daily_credibility_job",
+            "failed_step": "ingest_bis_policy_rates",
+            "error_class": "ReadTimeout",
+            "severity": "critical",
+        },
+    }
+    act = AlertActivities(db_pool=mock_db, llm_client=mock_llm, knowledge_connector=mock_kg)
+    env = ActivityEnvironment()
+    result = await env.run(act.resolve_alert_resource, alert)
+
+    assert result["source"] == "deterministic"
+    assert result["resource_id"] == "res-credibility"
+    assert result["github_repo"] == "hikmahtech/em-credibility-monitor"
+    assert result["confidence"] == 1.0
+    assert len(result["resources"]) == 1
+    mock_llm.think.assert_not_called()
+
+
+async def test_resolve_resource_deterministic_token_match_no_overlap_falls_back_to_llm():
+    """Zero candidate resources share an identifying token with the alert ->
+    Tier 1.6 declines to match and control falls through to the LLM tier,
+    unchanged from pre-#119 behavior.
+
+    Real-world case: equities_fundamentals_pipeline (the OTHER Dagster alert
+    from issue #119) has no literal token in common with any tracked repo's
+    title/github_repo/path — it belongs to trading-system-pipeline, but
+    neither "equities" nor "fundamentals" nor "yfinance" appears in that
+    repo's name. This is expected to keep falling back to the LLM tier (no
+    regression) rather than a wrong guess.
+    """
+    mock_db = AsyncMock()
+    mock_db.fetch.return_value = DAGSTER_SAMPLE_RESOURCES
+    mock_kg = AsyncMock()
+    mock_kg.search.return_value = []
+    mock_llm = AsyncMock()
+    mock_llm.think.return_value = {
+        "response": json.dumps({"resources": []}),
+        "model": "gpt-oss:20b",
+        "prompt_tokens": 10,
+        "completion_tokens": 5,
+    }
+    alert = {
+        "title": "Dagster Pipeline Failed: equities_fundamentals_pipeline",
+        "source": "alertmanager",
+        "fingerprint": "fp-dagster-equities",
+        "service": "",
+        "description": (
+            "Pipeline: equities_fundamentals_pipeline\n"
+            "Failed Step: equities__fundamentals__yfinance_fundamentals"
+        ),
+        "labels": {
+            "alertname": "Dagster Pipeline Failure",
+            "pipeline_name": "equities_fundamentals_pipeline",
+            "failed_step": "equities__fundamentals__yfinance_fundamentals",
+            "error_class": "CheckError",
+            "severity": "critical",
+        },
+    }
+    act = AlertActivities(
+        db_pool=mock_db, llm_client=mock_llm, knowledge_connector=mock_kg, model_balanced="gpt-oss:20b"
+    )
+    env = ActivityEnvironment()
+    result = await env.run(act.resolve_alert_resource, alert)
+
+    assert result["source"] != "deterministic"
+    mock_llm.think.assert_called_once()
+    assert result["resource_id"] is None
+
+
+async def test_resolve_resource_deterministic_token_match_ambiguous_falls_back_to_llm():
+    """Two candidate resources share the alert's identifying token
+    ("trading") -> Tier 1.6 refuses to guess between them and falls through
+    to the LLM tier, same as a zero-match miss."""
+    resources = DAGSTER_SAMPLE_RESOURCES + [
+        {
+            "id": "res-trading-mirror",
+            "title": "hikmahtech/trading-system-pipeline-mirror",
+            "kind": "repository",
+            "url": "https://github.com/hikmahtech/trading-system-pipeline-mirror",
+            "metadata": {
+                "path": "trading/trading-system-pipeline-mirror",
+                "github_repo": "hikmahtech/trading-system-pipeline-mirror",
+                "coding_enabled": True,
+            },
+        },
+    ]
+    mock_db = AsyncMock()
+    mock_db.fetch.return_value = resources
+    mock_kg = AsyncMock()
+    mock_kg.search.return_value = []
+    mock_llm = AsyncMock()
+    mock_llm.think.return_value = {
+        "response": json.dumps({"resources": []}),
+        "model": "gpt-oss:20b",
+        "prompt_tokens": 10,
+        "completion_tokens": 5,
+    }
+    alert = {
+        "title": "Disk pressure on trading host",
+        "source": "alertmanager",
+        "fingerprint": "fp-ambiguous",
+        "service": "",
+        "description": "",
+        "labels": {"alertname": "HostDiskSpaceFull", "instance": "trading-worker-1"},
+    }
+    act = AlertActivities(
+        db_pool=mock_db, llm_client=mock_llm, knowledge_connector=mock_kg, model_balanced="gpt-oss:20b"
+    )
+    env = ActivityEnvironment()
+    result = await env.run(act.resolve_alert_resource, alert)
+
+    assert result["source"] != "deterministic"
+    mock_llm.think.assert_called_once()

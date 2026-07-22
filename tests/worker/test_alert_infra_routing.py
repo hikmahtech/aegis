@@ -232,6 +232,29 @@ async def test_resolve_infra_resource_found(mock_db_pool):
     assert result["resource_id"] is not None
 
 
+async def test_resolve_infra_resource_queries_deployed_slug_and_repo(mock_db_pool):
+    """Regression guard for #119: resolve_infra_resource's DB lookup must
+    target THIS deployment's actual homelab-gitops-equivalent resource
+    (`repo-homelab-gitops` / `hikmahtech/homelab-gitops`, confirmed via
+    read-only prod query), not the upstream placeholder
+    (`repo-infra-gitops` / `example/infra-gitops`) — that mismatch was why
+    EVERY infra-classified alert (NodeDown, CriticalEndpointDown, Dagster
+    Pipeline Failure, ...) silently resolved to source="none" in prod: the
+    WHERE clause never found a matching row."""
+    mock_db_pool.fetchrow.return_value = None
+    activities = AlertActivities(db_pool=mock_db_pool)
+    env = ActivityEnvironment()
+    alert = {"source": "alertmanager", "labels": {"alertname": "NodeDown"}}
+    await env.run(activities.resolve_infra_resource, alert)
+
+    args, _ = mock_db_pool.fetchrow.call_args
+    queried_slug, queried_repo = args[1], args[2]
+    assert queried_slug == "repo-homelab-gitops"
+    assert queried_repo == "hikmahtech/homelab-gitops"
+    assert queried_slug != "repo-infra-gitops"
+    assert queried_repo != "example/infra-gitops"
+
+
 async def test_resolve_infra_resource_not_found_returns_null(mock_db_pool):
     """Falls back to null-resource when infra-gitops row is missing."""
     mock_db_pool.fetchrow.return_value = None
