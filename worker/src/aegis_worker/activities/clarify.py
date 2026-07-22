@@ -231,6 +231,46 @@ def _assignee_labels(reg: dict[str, dict]) -> list[str]:
 _LABEL_SOMEDAY = "@someday"
 _LABEL_NEXT = "@next"
 
+# Confidence floor below which apply_outcome asks the user (NEEDS REVIEW card)
+# instead of applying the classification. Was the `escalation_threshold`
+# dataclass knob, which also gated a Sonnet re-classification branch removed in
+# issue #117 (that branch never fired: avg classifier confidence 0.914 vs 0.7
+# floor, llm_model never 'claude-sonnet'). The low-conf card is the only
+# remaining consumer, so this is a plain module constant now.
+_LOW_CONF_FLOOR = 0.7
+
+# Notification-junk markers (issue #117). All 11 all-time gtd_clarify_2_min
+# cards were resolved "trash" — every one an automated #email notification
+# (auth/OTP codes, security alerts, social invites, marketing/account digests),
+# never a genuine 2-minute action. When the LLM tags an #email task 2_min but
+# its title matches one of these shapes, it's junk → downgrade to trash so it
+# never reaches a card. Substring match, case-insensitive.
+_NOTIFICATION_MARKERS = (
+    "login code",
+    "access code",
+    "verification code",
+    "verify your",
+    "please verify",
+    "security alert",
+    "security code",
+    "one-time",
+    "one time pass",
+    "otp code",
+    "2fa",
+    "confirm your email",
+    "wants to be friends",
+    "wants to connect",
+    "new invitation",
+    "new connection request",
+    "sharing your real-time location",
+    "welcome to",
+    "dependabot",
+    "oauth application",
+    "pulse survey",
+    "will be deleted",
+    "will be charged",
+)
+
 
 import asyncpg  # noqa: E402
 from aegis.clarify_note import (  # noqa: E402
@@ -261,12 +301,10 @@ class ClarifyActivities:
     # DeliveryActivities to talk to the comms delivery server. Wired
     # in worker boot; None in unit tests that don't exercise notifications.
     delivery_connector: object | None = None
-    sonnet_model: str = "claude-sonnet"
     # primary_model defaults to qwen3:14b but the worker boot wires
     # settings.model_balanced into it so operators can flip via
     # AEGIS_MODEL_BALANCED=gemma4:e2b (etc.) without a code change.
     primary_model: str = "qwen3:14b"
-    escalation_threshold: float = 0.7
 
     @activity.defn
     async def find_unclassified_items(self, max_items: int = 20) -> list[dict]:
@@ -538,6 +576,12 @@ class ClarifyActivities:
             '"assignee": str, "contexts": [str], "reason": str}\n'
             "classification ∈ {trash, reference, someday, 2_min, "
             "next_action}\n"
+            "2_min means a genuine action YOU must personally do in under two "
+            "minutes (a quick reply, a one-line confirmation). Automated "
+            "notification emails — login/verification/OTP codes, security "
+            "alerts, 'verify your device', social invites, marketing or "
+            "account digests — are NOT actions: classify them as trash (or "
+            "reference if worth keeping), never 2_min.\n"
             "confidence ∈ [0.0, 1.0]\n"
             f"assignee ∈ {{{', '.join(assignees or ['@me', '@sebas', '@raphael', '@maou', '@pandora'])}}}\n"
             "contexts ⊆ {@5min, @deep, @email, @phone, @code, @errand, "
@@ -561,6 +605,13 @@ class ClarifyActivities:
             prompt_tokens = None
             completion_tokens = None
         return parse_llm_json(raw) or {}, prompt_tokens, completion_tokens
+
+    @staticmethod
+    def _looks_like_notification(title: str | None) -> bool:
+        """True when a task title matches a known automated-notification shape
+        (issue #117). Used to keep such junk out of the 2-min card path."""
+        low = (title or "").lower()
+        return any(marker in low for marker in _NOTIFICATION_MARKERS)
 
     @activity.defn
     async def classify_one(self, task: dict) -> dict:
@@ -761,22 +812,19 @@ class ClarifyActivities:
             "completion_tokens": primary_ct,
         }
 
-        # Escalate to Sonnet on low confidence; keep whichever wins on confidence.
-        if primary_conf < self.escalation_threshold:
-            sonnet_result = await self.llm_client.think(prompt, model=self.sonnet_model)
-            sonnet, sonnet_pt, sonnet_ct = self._unpack_think_result(sonnet_result)
-            sonnet_conf = float(sonnet.get("confidence") or 0.0)
-            if sonnet_conf >= primary_conf:
-                best = {
-                    "classification": sonnet.get("classification") or best["classification"],
-                    "confidence": sonnet_conf,
-                    "assignee": sonnet.get("assignee") or best["assignee"],
-                    "contexts": sonnet.get("contexts") or best["contexts"],
-                    "reason": sonnet.get("reason") or "",
-                    "llm_model": self.sonnet_model,
-                    "prompt_tokens": sonnet_pt,
-                    "completion_tokens": sonnet_ct,
-                }
+        # Notification-junk guard (issue #117): a 2_min tag on an #email task
+        # whose title reads like an automated notification is junk the user
+        # will only ever trash (11/11 all-time). Downgrade to trash so it never
+        # reaches a 2-min card.
+        if (
+            best["classification"] == "2_min"
+            and (source_tag or "") == "#email"
+            and self._looks_like_notification(task.get("content"))
+        ):
+            best["classification"] = "trash"
+            best["reason"] = (
+                f"notification junk downgraded from 2_min ({best.get('reason') or ''})"
+            ).strip()
 
         return best
 
@@ -1123,7 +1171,7 @@ class ClarifyActivities:
         # per-command ITEM_NOT_FOUND on a stale projection row), we still
         # spawn the user interaction since the chat card is the real
         # signal. Log the rejection so it surfaces in observability.
-        if confidence < self.escalation_threshold and not force_apply:
+        if confidence < _LOW_CONF_FLOOR and not force_apply:
             note_cmd = TodoistConnector.build_note_add_command(
                 item_id, self._format_review_note(decision, pass_n, _now)
             )

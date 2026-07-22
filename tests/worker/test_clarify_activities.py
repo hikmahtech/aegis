@@ -660,31 +660,21 @@ async def test_classify_one_handles_real_llm_dict_return_shape(db_pool) -> None:
 
 
 @pytest.mark.asyncio
-async def test_classify_one_low_confidence_escalates_to_sonnet(db_pool) -> None:
-    """qwen3:14b < 0.7 -> Sonnet retry."""
+async def test_classify_one_low_confidence_no_escalation(db_pool) -> None:
+    """Issue #117 removed the dead Sonnet escalation branch. A low-confidence
+    qwen3:14b result is now returned verbatim in a single call (no second
+    model); the low-confidence card is spawned later by apply_outcome."""
     llm = AsyncMock()
-    # First call (qwen) returns low confidence; second (Sonnet) returns higher
     llm.think = AsyncMock(
-        side_effect=[
-            json.dumps(
-                {
-                    "classification": "someday",
-                    "confidence": 0.4,
-                    "assignee": "@me",
-                    "contexts": ["@reading"],
-                    "reason": "unclear",
-                }
-            ),
-            json.dumps(
-                {
-                    "classification": "reference",
-                    "confidence": 0.9,
-                    "assignee": "@raphael",
-                    "contexts": ["@reading"],
-                    "reason": "informational only",
-                }
-            ),
-        ]
+        return_value=json.dumps(
+            {
+                "classification": "someday",
+                "confidence": 0.4,
+                "assignee": "@me",
+                "contexts": ["@reading"],
+                "reason": "unclear",
+            }
+        )
     )
     acts = ClarifyActivities(db_pool=db_pool, todoist_connector=AsyncMock(), llm_client=llm)
     task = {
@@ -696,10 +686,10 @@ async def test_classify_one_low_confidence_escalates_to_sonnet(db_pool) -> None:
         "latest_user_note": None,
     }
     result = await acts.classify_one(task)
-    assert result["classification"] == "reference"
-    assert result["confidence"] == 0.9
-    assert result["llm_model"] == "claude-sonnet"
-    assert llm.think.await_count == 2
+    assert result["classification"] == "someday"
+    assert result["confidence"] == 0.4
+    assert result["llm_model"] == "qwen3:14b"
+    assert llm.think.await_count == 1
 
 
 @pytest.mark.asyncio
@@ -730,6 +720,113 @@ async def test_classify_one_user_hint_propagates_into_prompt(db_pool) -> None:
     prompt = llm.think.await_args.args[0]
     assert "not action — just save for later" in prompt
     assert "authoritative supervision" in prompt
+
+
+def test_looks_like_notification_markers() -> None:
+    """Issue #117: notification-shape titles are recognised; genuine
+    action-y titles are not."""
+    f = ClarifyActivities._looks_like_notification
+    # Real trashed 2_min titles from prod gtd_clarify_log.
+    assert f("Cloudflare Access login code for truenas.hikmahtech.in")
+    assert f("Mohammed Arshad, please verify your new device")
+    assert f("Security alert for conspiracyonly@gmail.com")
+    assert f("Prema Khan wants to be friends on Facebook")
+    assert f("You have 1 new invitation")
+    assert f("[GitHub] Your Dependabot alerts for the week of Jul 7 - Jul 14")
+    assert f("Welcome to Bluesky")
+    # Genuine quick actions must NOT match.
+    assert not f("Reply to vendor about the March invoice")
+    assert not f("Confirm dinner reservation for Friday")
+    assert not f(None)
+    assert not f("")
+
+
+@pytest.mark.asyncio
+async def test_classify_one_downgrades_notification_2min_to_trash(db_pool) -> None:
+    """Issue #117: an #email task the LLM tags 2_min whose title reads like a
+    notification is junk → downgraded to trash so it never reaches a card."""
+    llm = AsyncMock()
+    llm.think = AsyncMock(
+        return_value=json.dumps(
+            {
+                "classification": "2_min",
+                "confidence": 0.95,
+                "assignee": "@me",
+                "contexts": ["@5min"],
+                "reason": "quick",
+            }
+        )
+    )
+    acts = ClarifyActivities(db_pool=db_pool, todoist_connector=AsyncMock(), llm_client=llm)
+    task = {
+        "id": "T_NOTIF",
+        "content": "Cloudflare Access login code for postiz.hikmahtech.in",
+        "source_tag": "#email",
+        "labels": ["#email"],
+        "description": None,
+        "latest_user_note": None,
+    }
+    result = await acts.classify_one(task)
+    assert result["classification"] == "trash"
+    assert "downgraded from 2_min" in result["reason"]
+
+
+@pytest.mark.asyncio
+async def test_classify_one_keeps_genuine_2min(db_pool) -> None:
+    """A genuine #email 2-min action is left as 2_min (guard must not
+    over-fire)."""
+    llm = AsyncMock()
+    llm.think = AsyncMock(
+        return_value=json.dumps(
+            {
+                "classification": "2_min",
+                "confidence": 0.9,
+                "assignee": "@me",
+                "contexts": ["@5min", "@email"],
+                "reason": "quick reply",
+            }
+        )
+    )
+    acts = ClarifyActivities(db_pool=db_pool, todoist_connector=AsyncMock(), llm_client=llm)
+    task = {
+        "id": "T_REAL2M",
+        "content": "Reply to the plumber to confirm Tuesday 9am",
+        "source_tag": "#email",
+        "labels": ["#email"],
+        "description": None,
+        "latest_user_note": None,
+    }
+    result = await acts.classify_one(task)
+    assert result["classification"] == "2_min"
+
+
+@pytest.mark.asyncio
+async def test_classify_one_notification_guard_scoped_to_email(db_pool) -> None:
+    """The 2_min notification downgrade is #email-scoped — a manually captured
+    task whose title happens to match a marker is NOT downgraded."""
+    llm = AsyncMock()
+    llm.think = AsyncMock(
+        return_value=json.dumps(
+            {
+                "classification": "2_min",
+                "confidence": 0.9,
+                "assignee": "@me",
+                "contexts": ["@5min"],
+                "reason": "quick",
+            }
+        )
+    )
+    acts = ClarifyActivities(db_pool=db_pool, todoist_connector=AsyncMock(), llm_client=llm)
+    task = {
+        "id": "T_MANUAL",
+        "content": "Verify your new device works before the trip",
+        "source_tag": "#manual",
+        "labels": ["#manual"],
+        "description": None,
+        "latest_user_note": None,
+    }
+    result = await acts.classify_one(task)
+    assert result["classification"] == "2_min"
 
 
 def _seed_managed_projects(db_pool):

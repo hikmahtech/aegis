@@ -718,3 +718,50 @@ def test_weekly_preview_omits_never_clarified_when_zero() -> None:
         "never_clarified_oldest5": [],
     })
     assert "Never-clarified" not in body
+
+
+@pytest.mark.asyncio
+async def test_daily_digest_flags_claimed_stale(db_pool) -> None:
+    """Issue #117: an Inbox task claimed with @me, watermark >5d old and no
+    note activity since, is surfaced (count + titles). A claimed task with a
+    recent note, and an unclaimed task, are excluded."""
+    await run_migrations(db_pool)
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO settings (key, value) VALUES "
+            "('todoist_managed_project_ids', $1) "
+            "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+            {"inbox": "P_INB_CS"},
+        )
+        await conn.execute(
+            "INSERT INTO todoist_projects (id, name, is_managed, raw) "
+            "VALUES ('P_INB_CS','P_INB_CS',true,'{}'::jsonb) ON CONFLICT (id) DO NOTHING"
+        )
+        await conn.execute("DELETE FROM todoist_tasks WHERE project_id='P_INB_CS'")
+        # STALE: claimed @me, watermark 6d old, last note 6d old -> flagged.
+        await conn.execute(
+            "INSERT INTO todoist_tasks (id, project_id, content, labels, "
+            "last_clarified_at, last_note_at, is_completed, raw) VALUES "
+            "('T_CS_STALE','P_INB_CS','APP-11230: fix login',ARRAY['@me'],"
+            "now()-interval '6 days', now()-interval '6 days', false, '{}'::jsonb)"
+        )
+        # ACTIVE: claimed but a note arrived yesterday -> NOT stale.
+        await conn.execute(
+            "INSERT INTO todoist_tasks (id, project_id, content, labels, "
+            "last_clarified_at, last_note_at, is_completed, raw) VALUES "
+            "('T_CS_ACTIVE','P_INB_CS','APP-11231: still on it',ARRAY['@me'],"
+            "now()-interval '6 days', now()-interval '1 day', false, '{}'::jsonb)"
+        )
+        # UNCLAIMED: no @me -> not a claimed-stale item.
+        await conn.execute(
+            "INSERT INTO todoist_tasks (id, project_id, content, labels, "
+            "last_clarified_at, last_note_at, is_completed, raw) VALUES "
+            "('T_CS_UNCLAIMED','P_INB_CS','APP-11232: fresh',ARRAY['#email'],"
+            "now()-interval '6 days', now()-interval '6 days', false, '{}'::jsonb)"
+        )
+    digest = await ReviewActivities(db_pool=db_pool).gather_daily_digest()
+    assert digest["claimed_stale_count"] == 1
+    assert digest["claimed_stale_top3"] == ["APP-11230: fix login"]
+    body = format_daily_preview(digest)
+    assert "Claimed but stale" in body
+    assert "APP-11230: fix login" in body
