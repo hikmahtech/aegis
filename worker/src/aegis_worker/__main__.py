@@ -73,7 +73,6 @@ from aegis_worker.flows.social_metrics import SocialMetricsFlow
 from aegis_worker.flows.social_publish import SocialPublishFlow
 from aegis_worker.flows.subscription_audit import SubscriptionAuditFlow
 from aegis_worker.flows.todoist_sync import TodoistSyncFlow
-from aegis_worker.flows.vercel_project_sync import VercelProjectSyncFlow
 from aegis_worker.flows.workspace_repo_sync import WorkspaceRepoSyncFlow
 from aegis_worker.interceptors import WorkflowRunRecorderInterceptor
 from aegis_worker.schedule_sync import sync_schedules
@@ -124,7 +123,6 @@ WORKFLOWS: list = [
     DailyReviewFlow,
     WeeklyReviewFlow,
     WorkspaceRepoSyncFlow,
-    VercelProjectSyncFlow,
     SocialPublishFlow,
     SocialMetricsFlow,
 ]
@@ -348,8 +346,6 @@ async def main():
     inventory_act = InventoryActivities(
         db_pool=deps.pool,
         remote_script=connectors.get("remote_script"),
-        vercel_token=getattr(settings, "vercel_token", ""),
-        vercel_team_id=getattr(settings, "vercel_team_id", ""),
     )
     from aegis.connectors.todoist import TodoistConnector
 
@@ -556,7 +552,7 @@ async def main():
         inventory_act.scan_workspace_repos,
         inventory_act.reconcile_workspace_resources,
         inventory_act.mirror_workspace_repos,
-        inventory_act.list_vercel_projects,
+        inventory_act.check_github_webhooks,
         inventory_act.upsert_resources_batch,
     ]
 
@@ -611,7 +607,6 @@ async def main():
         DailyReviewFlow,
         WeeklyReviewFlow,
         WorkspaceRepoSyncFlow,
-        VercelProjectSyncFlow,
         SocialPublishFlow,
         SocialMetricsFlow,
     ]

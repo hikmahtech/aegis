@@ -251,25 +251,17 @@ activities:
     config: {}
     active: true
 
-  # Resource-inventory syncs — keep `resources` mirroring the canonical
-  # workspace hierarchy (the workspace host's ~/Workspace) and Vercel projects so alert
-  # investigation has the right candidate set. Daily at 05:00 UTC, staggered
-  # 15 min apart. WorkspaceRepoSyncFlow also mirrors missing checkouts onto
-  # the base host (node-a) at the same relative paths.
+  # Resource-inventory sync — keep `resources` mirroring the canonical
+  # workspace hierarchy (the workspace host's ~/Workspace) so alert
+  # investigation has the right candidate set. Daily at 05:00 UTC.
+  # WorkspaceRepoSyncFlow also mirrors missing checkouts onto the base host
+  # (node-a) at the same relative paths, and flags tracked GitHub repos
+  # whose AEGIS webhook is missing (detection only, result_summary.
+  # missing_webhooks).
   - slug: workspace-repo-sync-daily
     workflow_type: WorkspaceRepoSyncFlow
     agent_id: pandoras-actor
     schedule_cron: "0 5 * * *"
     config:
       min_repos: 5
-    active: true
-
-  - slug: vercel-project-sync-daily
-    workflow_type: VercelProjectSyncFlow
-    agent_id: pandoras-actor
-    schedule_cron: "15 5 * * *"
-    config:
-      include_personal: true
-      team_ids:
-        - your-vercel-team-id
     active: true

@@ -44,7 +44,6 @@ from aegis_worker.flows.social_metrics import SocialMetricsConfig, SocialMetrics
 from aegis_worker.flows.social_publish import SocialPublishConfig, SocialPublishFlow
 from aegis_worker.flows.subscription_audit import SubscriptionAuditConfig, SubscriptionAuditFlow
 from aegis_worker.flows.todoist_sync import TodoistSyncConfig, TodoistSyncFlow
-from aegis_worker.flows.vercel_project_sync import VercelProjectSyncFlow, VercelProjectSyncInput
 from aegis_worker.flows.workspace_repo_sync import (
     WorkspaceRepoSyncFlow,
     WorkspaceRepoSyncInput,
@@ -233,14 +232,6 @@ _ACTIVITY_TYPE_MAP = {
         WorkspaceRepoSyncInput(
             agent_id=act["agent_id"],
             min_repos=int(act["config"].get("min_repos", 5)),
-        ),
-    ),
-    "VercelProjectSyncFlow": lambda act: (
-        VercelProjectSyncFlow,
-        VercelProjectSyncInput(
-            agent_id=act["agent_id"],
-            include_personal=bool(act["config"].get("include_personal", True)),
-            team_ids=list(act["config"].get("team_ids") or []),
         ),
     ),
 }

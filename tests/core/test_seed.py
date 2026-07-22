@@ -69,10 +69,12 @@ async def test_load_seeds_populates_resources_and_activities(db_pool):
 @pytest.mark.asyncio
 async def test_load_seeds_preserves_sync_managed_resource_kinds(db_pool):
     """Regression: the orphan-delete in _load_resources must NOT touch rows of
-    kinds managed by sync flows (`repository` via WorkspaceRepoSyncFlow + the
-    resolve_alert_resource auto-register path, `vercel_project` via
-    VercelProjectSyncFlow). Only kinds the YAML actually owns
-    (connector/runbook/endpoint/mcp_server) are eligible for orphan-delete.
+    kinds the YAML doesn't own. `repository` (via WorkspaceRepoSyncFlow + the
+    resolve_alert_resource auto-register path) is the real example;
+    `test_other_kind` stands in for "any kind outside yaml_managed_kinds" to
+    prove this is an allow-list, not a block-list. Only kinds the YAML
+    actually owns (connector/runbook/endpoint/mcp_server) are eligible for
+    orphan-delete.
     """
     await run_migrations(db_pool)
     await load_seeds(db_pool, SEED_DIR)
@@ -81,21 +83,21 @@ async def test_load_seeds_preserves_sync_managed_resource_kinds(db_pool):
         await conn.execute(
             "INSERT INTO resources (kind, slug, title) VALUES "
             "('repository','test-sync-managed-repo','test sync repo'),"
-            "('vercel_project','test-sync-managed-vercel','test sync vercel')"
+            "('test_other_kind','test-sync-managed-other','test sync other')"
         )
         # Re-run the loader; the new rows must survive.
         await load_seeds(db_pool, SEED_DIR)
         repo_survives = await conn.fetchval(
             "SELECT 1 FROM resources WHERE slug='test-sync-managed-repo'"
         )
-        vercel_survives = await conn.fetchval(
-            "SELECT 1 FROM resources WHERE slug='test-sync-managed-vercel'"
+        other_survives = await conn.fetchval(
+            "SELECT 1 FROM resources WHERE slug='test-sync-managed-other'"
         )
         await conn.execute(
             "DELETE FROM resources WHERE slug LIKE 'test-sync-managed-%'"
         )
     assert repo_survives == 1
-    assert vercel_survives == 1
+    assert other_survives == 1
 
 
 _PHASE3_ACTIVITY_SLUGS = [

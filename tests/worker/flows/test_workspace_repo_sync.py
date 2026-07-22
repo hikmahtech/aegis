@@ -46,6 +46,7 @@ _SCAN = [
 _scan_result: list[dict] = []
 _reconcile_calls: list[list[dict]] = []
 _mirror_calls: list[list[dict]] = []
+_webhook_check_calls: int = 0
 
 
 @activity.defn(name="scan_workspace_repos")
@@ -65,11 +66,20 @@ async def stub_mirror(input: WorkspaceReposInput):
     return {"present": len(input.items) - 1, "cloned": 1, "cloned_paths": ["personal/example-site"], "failed": []}
 
 
+@activity.defn(name="check_github_webhooks")
+async def stub_check_github_webhooks():
+    global _webhook_check_calls
+    _webhook_check_calls += 1
+    return {"missing_webhooks": ["acme/bcp"], "checked": 4, "skipped": 0}
+
+
 def _reset(scan):
+    global _webhook_check_calls
     _scan_result.clear()
     _scan_result.extend(scan)
     _reconcile_calls.clear()
     _mirror_calls.clear()
+    _webhook_check_calls = 0
 
 
 async def _run_flow(min_repos=5):
@@ -79,7 +89,7 @@ async def _run_flow(min_repos=5):
             env.client,
             task_queue="tq",
             workflows=[WorkspaceRepoSyncFlow],
-            activities=[stub_scan, stub_reconcile, stub_mirror],
+            activities=[stub_scan, stub_reconcile, stub_mirror, stub_check_github_webhooks],
         ),
     ):
         return await env.client.execute_workflow(
@@ -98,8 +108,10 @@ async def test_workspace_sync_reconciles_and_mirrors_scan():
     assert result["scanned"] == 5
     assert result["deleted"] == 2
     assert result["mirror"]["cloned"] == 1
+    assert result["missing_webhooks"] == ["acme/bcp"]
     assert _reconcile_calls == [_SCAN]
     assert _mirror_calls == [_SCAN]
+    assert _webhook_check_calls == 1
 
 
 @pytest.mark.asyncio
@@ -110,3 +122,4 @@ async def test_workspace_sync_aborts_on_suspiciously_small_scan():
     assert result["status"] == "aborted_scan_too_small"
     assert _reconcile_calls == []
     assert _mirror_calls == []
+    assert _webhook_check_calls == 0
