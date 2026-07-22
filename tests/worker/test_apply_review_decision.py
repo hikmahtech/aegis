@@ -58,6 +58,54 @@ async def test_slipping_tomorrow_updates_due():
 
 
 @pytest.mark.asyncio
+async def test_claimed_stale_done_completes_task():
+    """Issue #117: 'done' on a claimed-stale card completes the task."""
+    fake = _FakeTodoist()
+    acts = ReviewActivities(db_pool=None, todoist_connector=fake)
+    out = await acts.apply_review_decision(
+        "i1", {"value": "done"}, {"signal": "claimed_stale", "task_id": "T_CS"})
+    assert out["applied"] is True
+    cmd = fake.batches[0][0]
+    assert cmd["type"] == "item_complete" and cmd["args"]["id"] == "T_CS"
+
+
+@pytest.mark.asyncio
+async def test_claimed_stale_unclaim_strips_me_label(db_pool):
+    """Issue #117: 'unclaim' removes @me so the task re-enters clarify /
+    becomes visible to the other GTD surfaces again."""
+    await run_migrations(db_pool)
+    async with db_pool.acquire() as conn:
+        await conn.execute("DELETE FROM todoist_tasks WHERE id='T_CS2'")
+        await conn.execute(
+            "INSERT INTO todoist_tasks (id, content, labels, is_completed, raw) "
+            "VALUES ('T_CS2', 'APP-11230: investigate', ARRAY['@me','@deep'], false, '{}'::jsonb)"
+        )
+    fake = _FakeTodoist()
+    acts = ReviewActivities(db_pool=db_pool, todoist_connector=fake)
+    out = await acts.apply_review_decision(
+        "i1", {"value": "unclaim"},
+        {"signal": "claimed_stale", "task_id": "T_CS2"})
+    assert out["applied"] is True
+    cmd = fake.batches[0][0]
+    assert cmd["type"] == "item_update"
+    assert cmd["args"]["id"] == "T_CS2"
+    assert "@me" not in cmd["args"]["labels"]
+    assert "@deep" in cmd["args"]["labels"]
+
+
+@pytest.mark.asyncio
+async def test_claimed_stale_keep_is_noop():
+    """Issue #117: 'keep' (Still on it) is a no-op — the card simply
+    re-nudges next week."""
+    fake = _FakeTodoist()
+    acts = ReviewActivities(db_pool=None, todoist_connector=fake)
+    out = await acts.apply_review_decision(
+        "i1", {"value": "keep"}, {"signal": "claimed_stale", "task_id": "T_CS"})
+    assert out["applied"] is True and out["noop"] is True
+    assert fake.batches == []
+
+
+@pytest.mark.asyncio
 async def test_someday_activate_swaps_someday_label_for_next(db_pool):
     """'activate' on a someday_resurface item swaps @someday -> @next on
     the task's label set via item_update — Next/Someday are labels now,

@@ -25,6 +25,13 @@ _REVIEW_DEFAULTS = {
     "next_actions_days": 14,
     "someday_resurface_days": 90,
     "top_n": 5,
+    # Claimed-stale detector (issue #117): an Inbox task the user claimed with
+    # @me but hasn't touched in this many days is structurally invisible to
+    # every other GTD surface — surface it in the daily digest + weekly cards.
+    "claimed_stale_days": 5,
+    # How many prior weekly digests to walk when computing an aging-waiting
+    # item's consecutive-appearance streak (issue #117 keep-escalation).
+    "streak_lookback": 12,
 }
 # GTD state labels (Todoist restructure, 2026-07): Someday/Later and Next
 # used to be managed projects; Someday is now the @someday label (Next is
@@ -65,6 +72,8 @@ class ReviewActivities:
             "pending_clarify_count": 0,
             "applied_24h_count": 0,
             "outbox_failed_7d_count": 0,
+            "claimed_stale_count": 0,
+            "claimed_stale_top3": [],
         }
         if self.db_pool is None:
             return empty
@@ -126,6 +135,33 @@ class ReviewActivities:
                 "SELECT count(*) FROM todoist_outbox "
                 "WHERE status='failed' AND created_at > now() - interval '7 days'"
             )
+            # Claimed-stale (issue #117): an Inbox task the user claimed with
+            # @me (e.g. "I've got it" on a gate card) whose watermark is >5d
+            # old and which has seen no note activity since. These are
+            # invisible to find_unclassified_items (excludes @me),
+            # gather_today_focus (excludes Inbox) and every weekly stale
+            # detector (needs parent_id / NULL watermark) — so nudge them here.
+            claimed_stale_count = await conn.fetchval(
+                "SELECT count(*) FROM todoist_tasks "
+                "WHERE project_id=$1 AND NOT is_completed "
+                "AND '@me' = ANY(labels) "
+                "AND last_clarified_at < now() - interval '5 days' "
+                "AND COALESCE(last_note_at, 'epoch'::timestamptz) "
+                "    < now() - interval '5 days'",
+                inbox_id,
+            )
+            claimed_stale_top3 = [
+                r["content"] for r in await conn.fetch(
+                    "SELECT content FROM todoist_tasks "
+                    "WHERE project_id=$1 AND NOT is_completed "
+                    "AND '@me' = ANY(labels) "
+                    "AND last_clarified_at < now() - interval '5 days' "
+                    "AND COALESCE(last_note_at, 'epoch'::timestamptz) "
+                    "    < now() - interval '5 days' "
+                    "ORDER BY last_clarified_at ASC LIMIT 3",
+                    inbox_id,
+                )
+            ]
         return {
             "inbox_count": int(inbox_count or 0),
             "inbox_top3": list(inbox_top3 or []),
@@ -138,6 +174,8 @@ class ReviewActivities:
             "pending_clarify_count": int(pending_clarify_count or 0),
             "applied_24h_count": int(applied_24h_count or 0),
             "outbox_failed_7d_count": int(outbox_failed_7d or 0),
+            "claimed_stale_count": int(claimed_stale_count or 0),
+            "claimed_stale_top3": list(claimed_stale_top3 or []),
         }
 
     async def gather_weekly_digest(self) -> dict:
@@ -297,6 +335,7 @@ class ReviewActivities:
             "slipping_items": [],
             "to_read_count": 0,
             "someday_resurface_items": [],
+            "claimed_stale_items": [],
             "_top_n": _REVIEW_DEFAULTS["top_n"],
         })
         if self.db_pool is None:
@@ -308,6 +347,11 @@ class ReviewActivities:
             cfg = {**_REVIEW_DEFAULTS,
                    **(cfg_raw if isinstance(cfg_raw, dict) else {})}
             base["_top_n"] = int(cfg["top_n"])
+            # Inbox id for the claimed-stale detector below (None-safe).
+            managed = await conn.fetchval(
+                "SELECT value FROM settings WHERE key='todoist_managed_project_ids'"
+            )
+            inbox_id = managed.get("inbox") if isinstance(managed, dict) else None
 
             # Stalled: leaf work-stream project (has a parent AREA project;
             # excludes top-level AREA projects and the Inbox) with open
@@ -345,6 +389,43 @@ class ReviewActivities:
                     int(cfg["waiting_days"]),
                 )
             ]
+            # Consecutive-appearance streak per aging-waiting item (issue #117):
+            # walk prior WEEKLY digest snapshots (newest-first) and count how
+            # many in a row already listed this task, so the decision card can
+            # say "kept N weeks running" and escalate its wording after 3+.
+            # 'keep' is a no-op, so the same item resurfaces untouched forever;
+            # the streak is the only signal that the human is stuck.
+            prior_weeklies = [
+                _decode_counts(r["counts"]) for r in await conn.fetch(
+                    "SELECT counts FROM review_digest_log WHERE review_kind='weekly' "
+                    "ORDER BY created_at DESC LIMIT $1",
+                    int(cfg.get("streak_lookback", _REVIEW_DEFAULTS["streak_lookback"])),
+                )
+            ]
+            for it in base["aging_waiting_items"]:
+                it["streak"] = _waiting_streak(it["task_id"], prior_weeklies)
+            # Claimed-stale (issue #117): Inbox tasks claimed with @me, watermark
+            # >Nd old, no note activity since — same detector as the daily digest
+            # but emitted as per-item decision cards (reuses _build_decisions).
+            claimed_days = int(cfg.get("claimed_stale_days",
+                                       _REVIEW_DEFAULTS["claimed_stale_days"]))
+            if inbox_id:
+                base["claimed_stale_items"] = [
+                    {"task_id": r["id"], "content": r["content"],
+                     "days": int(r["days"]), "url": r["url"]}
+                    for r in await conn.fetch(
+                        "SELECT id, content, raw->>'url' AS url, "
+                        "EXTRACT(day FROM now()-last_clarified_at)::int AS days "
+                        "FROM todoist_tasks "
+                        "WHERE project_id=$1 AND NOT is_completed "
+                        "AND '@me' = ANY(labels) "
+                        "AND last_clarified_at < now() - make_interval(days => $2) "
+                        "AND COALESCE(last_note_at, 'epoch'::timestamptz) "
+                        "    < now() - make_interval(days => $2) "
+                        "ORDER BY last_clarified_at ASC LIMIT 5",
+                        inbox_id, claimed_days,
+                    )
+                ]
             # Slipping: overdue OR a leaf work-stream-project next-action
             # stale past threshold (project/* labels retired — see
             # stale_next_actions_count above for the same join pattern).
@@ -395,12 +476,36 @@ class ReviewActivities:
         narrative (deep-link, human re-enters)."""
         decs: list[dict] = []
         for it in snapshot.get("aging_waiting_items") or []:
+            days = it.get("days", "?")
+            streak = int(it.get("streak") or 1)
+            # "kept N weeks running" = how many prior weeklies you already kept
+            # this in (streak counts the current appearance too). Issue #117:
+            # 'keep' is a no-op, so ≥3 consecutive appearances (kept 2+ times)
+            # escalates — the card leads with drop/done instead of keep so the
+            # easy tap resolves the stuck item rather than deferring it again.
+            kept_note = f" — kept {streak - 1}w running" if streak >= 2 else ""
+            if streak >= 3:
+                prompt = f"⏳ Waiting {days}d{kept_note} — still worth it? {it['content']}"
+                options = {"drop": "Drop it", "done": "Mark done",
+                           "nudge": "Nudge", "keep": "Keep waiting"}
+            else:
+                prompt = f"⏳ Waiting {days}d{kept_note}: {it['content']}"
+                options = {"nudge": "Nudge", "done": "Mark done",
+                           "drop": "Drop", "keep": "Keep"}
             decs.append({
                 "id": f"aging_waiting:{it['task_id']}",
                 "signal": "aging_waiting", "task_id": it["task_id"],
-                "prompt": f"⏳ Waiting {it.get('days', '?')}d: {it['content']}",
-                "options": {"nudge": "Nudge", "done": "Mark done",
-                            "drop": "Drop", "keep": "Keep"},
+                "prompt": prompt,
+                "options": options,
+            })
+        for it in snapshot.get("claimed_stale_items") or []:
+            decs.append({
+                "id": f"claimed_stale:{it['task_id']}",
+                "signal": "claimed_stale", "task_id": it["task_id"],
+                "prompt": (f"🙋 Claimed {it.get('days', '?')}d ago, untouched since: "
+                           f"{it['content']}"),
+                "options": {"done": "Mark done", "unclaim": "Un-claim (re-triage)",
+                            "keep": "Still on it"},
             })
         for it in snapshot.get("slipping_items") or []:
             due = it.get("due_date")
@@ -506,6 +611,23 @@ class ReviewActivities:
                     task_id, due={"string": "next monday"})]
             elif choice == "letgo":
                 cmds = [TodoistConnector.build_item_complete_command(task_id)]
+        elif signal == "claimed_stale":
+            # Issue #117: a task claimed with @me but abandoned. 'done'
+            # completes it; 'unclaim' strips @me so it re-enters clarify /
+            # becomes visible to the other GTD surfaces again. ('keep' is the
+            # no-op handled above — the card simply re-nudges next week.)
+            if choice == "done":
+                cmds = [TodoistConnector.build_item_complete_command(task_id)]
+            elif choice == "unclaim":
+                existing_labels: list[str] = []
+                if self.db_pool is not None:
+                    async with self.db_pool.acquire() as conn:
+                        row_labels = await conn.fetchval(
+                            "SELECT labels FROM todoist_tasks WHERE id=$1", task_id
+                        )
+                    existing_labels = list(row_labels or [])
+                new_labels = [lab for lab in existing_labels if lab != "@me"]
+                cmds = [TodoistConnector.build_item_update_command(task_id, labels=new_labels)]
         elif signal == "someday_resurface":
             if choice == "drop":
                 cmds = [TodoistConnector.build_item_complete_command(task_id)]
@@ -715,6 +837,11 @@ def format_daily_preview(digest: dict, today: dt.date | None = None) -> str:
     waiting = digest.get("waiting_stale_count") or 0
     applied = digest.get("applied_24h_count") or 0
     lines.append(f"⏳ Waiting For (stale >3d): {waiting}")
+    claimed = digest.get("claimed_stale_count") or 0
+    if claimed:
+        lines.append(f"🙋 <b>Claimed but stale</b> (@me, >5d no activity): {claimed}")
+        for title in (digest.get("claimed_stale_top3") or [])[:3]:
+            lines.append(f"  • {_clip(title, 70)}")
     lines.append(f"✅ Applied last 24h: {applied}")
     outbox_failed = digest.get("outbox_failed_7d_count") or 0
     if outbox_failed:
@@ -754,6 +881,11 @@ def format_weekly_preview(digest: dict, today: dt.date | None = None) -> str:
     for item in (digest.get("waiting_stale_top") or [])[:5]:
         who = f" ({', '.join(item['delegates'])})" if item.get("delegates") else ""
         lines.append(f"  • {_clip(item.get('content'), 70)}{who} — {item.get('days')}d")
+    claimed_items = digest.get("claimed_stale_items") or []
+    if claimed_items:
+        lines.append(f"🙋 <b>Claimed but stale</b> (@me, untouched): {len(claimed_items)}")
+        for item in claimed_items[:5]:
+            lines.append(f"  • {_clip(item.get('content'), 70)} — {item.get('days')}d")
     lines.append(f"📭 Inbox unclarified (>7d): {digest.get('inbox_unclarified_7d_count') or 0}")
     never_n = digest.get("never_clarified_count") or 0
     if never_n:
@@ -766,6 +898,36 @@ def format_weekly_preview(digest: dict, today: dt.date | None = None) -> str:
     if len(body) > 3500:
         body = body[:3500] + "\n…(truncated)"
     return body
+
+
+def _decode_counts(value: Any) -> dict:
+    """review_digest_log.counts is jsonb — a dict when asyncpg's jsonb codec
+    is registered, else a raw string. Accept both; {} on anything odd."""
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str):
+        import json
+
+        try:
+            parsed = json.loads(value)
+            return parsed if isinstance(parsed, dict) else {}
+        except (ValueError, TypeError):
+            return {}
+    return {}
+
+
+def _waiting_streak(task_id: str, prior_weeklies: list[dict]) -> int:
+    """Consecutive weekly digests (most-recent-first) that already listed
+    `task_id` under aging_waiting_items, +1 for the current appearance.
+    First-ever appearance ⇒ 1; a break in the run stops the count."""
+    streak = 1
+    for snap in prior_weeklies:
+        items = snap.get("aging_waiting_items") or []
+        if any(isinstance(it, dict) and it.get("task_id") == task_id for it in items):
+            streak += 1
+        else:
+            break
+    return streak
 
 
 def _clip(value: Any, n: int) -> str:

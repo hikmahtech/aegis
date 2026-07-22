@@ -133,3 +133,111 @@ async def test_detectors_quiet_on_clean(db_pool):
     assert snap["stalled_projects"] == []
     assert snap["aging_waiting_items"] == []
     assert snap["someday_resurface_items"] == []
+    assert snap["claimed_stale_items"] == []
+
+
+@pytest.mark.asyncio
+async def test_claimed_stale_detector_weekly(db_pool):
+    """Issue #117: gather_weekly_state surfaces Inbox tasks claimed with @me,
+    watermark >Nd old, no note activity since, as claimed_stale_items."""
+    await run_migrations(db_pool)
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO settings (key, value) VALUES "
+            "('todoist_managed_project_ids', $1) "
+            "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+            {"inbox": "P_INB_W"},
+        )
+        await conn.execute(
+            "INSERT INTO todoist_projects (id, name, is_managed, raw) "
+            "VALUES ('P_INB_W','P_INB_W',true,'{}'::jsonb) ON CONFLICT (id) DO NOTHING"
+        )
+        await conn.execute("DELETE FROM todoist_tasks WHERE project_id='P_INB_W'")
+        await conn.execute(
+            "INSERT INTO todoist_tasks (id, project_id, content, labels, "
+            "last_clarified_at, last_note_at, is_completed, raw) VALUES "
+            "('T_WCS','P_INB_W','APP-11235: claimed then abandoned',ARRAY['@me'],"
+            "now()-interval '7 days', now()-interval '7 days', false, '{}'::jsonb), "
+            "('T_WACT','P_INB_W','APP-11236: active',ARRAY['@me'],"
+            "now()-interval '7 days', now()-interval '1 day', false, '{}'::jsonb)"
+        )
+    snap = await ReviewActivities(db_pool=db_pool).gather_weekly_state()
+    ids = {i["task_id"] for i in snap["claimed_stale_items"]}
+    assert "T_WCS" in ids
+    assert "T_WACT" not in ids
+    item = next(i for i in snap["claimed_stale_items"] if i["task_id"] == "T_WCS")
+    assert item["days"] >= 5
+
+
+@pytest.mark.asyncio
+async def test_aging_waiting_streak_from_prior_digests(db_pool):
+    """Issue #117: an aging_waiting item that appeared in the two most-recent
+    prior weekly digests accumulates streak == 3 (current + 2 prior)."""
+    await run_migrations(db_pool)
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO settings (key, value) VALUES "
+            "('todoist_managed_project_ids', $1) "
+            "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+            {"inbox": "P_INB_STK"},
+        )
+        await conn.execute(
+            "INSERT INTO todoist_projects (id, name, is_managed, raw) "
+            "VALUES ('P_INB_STK','P_INB_STK',true,'{}'::jsonb) ON CONFLICT (id) DO NOTHING"
+        )
+        await conn.execute("DELETE FROM todoist_tasks WHERE id='T_STK'")
+        await conn.execute(
+            "INSERT INTO todoist_tasks (id, project_id, content, labels, "
+            "is_completed, updated_at, raw) VALUES "
+            "('T_STK','P_INB_STK','chase the vendor',ARRAY['@waiting'],false,"
+            "now()-interval '17 days','{}'::jsonb)"
+        )
+        # Two prior WEEKLY digests that both listed T_STK. Inserted last, so
+        # they are the most-recent rows in the streak lookback window.
+        for _ in range(2):
+            await conn.execute(
+                "INSERT INTO review_digest_log (review_kind, counts, preview) "
+                "VALUES ('weekly', $1, 'p')",
+                {"aging_waiting_items": [
+                    {"task_id": "T_STK", "content": "chase the vendor", "days": 10}
+                ]},
+            )
+    snap = await ReviewActivities(db_pool=db_pool).gather_weekly_state()
+    item = next((i for i in snap["aging_waiting_items"] if i["task_id"] == "T_STK"), None)
+    assert item is not None
+    assert item["streak"] == 3
+
+
+def test_build_decisions_escalates_after_three_keeps():
+    """Issue #117: a streak>=3 aging_waiting item escalates — the card leads
+    with drop/done and notes 'kept Nw running'. A first appearance is unchanged."""
+    acts = ReviewActivities(db_pool=None)
+    snap = {
+        "aging_waiting_items": [
+            {"task_id": "T_HOT", "content": "chase vendor", "days": 17, "streak": 3},
+            {"task_id": "T_NEW", "content": "new wait", "days": 8, "streak": 1},
+        ],
+    }
+    decs = acts._build_decisions(snap)
+    hot = next(d for d in decs if d["task_id"] == "T_HOT")
+    new = next(d for d in decs if d["task_id"] == "T_NEW")
+    # Escalated: leads with 'drop', mentions the running streak.
+    assert list(hot["options"].keys())[0] == "drop"
+    assert "kept 2w running" in hot["prompt"]
+    # First appearance: unchanged — leads with 'nudge', no streak note.
+    assert list(new["options"].keys())[0] == "nudge"
+    assert "running" not in new["prompt"]
+
+
+def test_build_decisions_emits_claimed_stale_cards():
+    """Issue #117: claimed_stale_items become decision cards (reused card
+    machinery, no new interaction kind)."""
+    acts = ReviewActivities(db_pool=None)
+    snap = {"claimed_stale_items": [
+        {"task_id": "T_CLM", "content": "APP-11230: investigate", "days": 6},
+    ]}
+    decs = acts._build_decisions(snap)
+    card = next(d for d in decs if d["signal"] == "claimed_stale")
+    assert card["task_id"] == "T_CLM"
+    assert set(card["options"].keys()) == {"done", "unclaim", "keep"}
+    assert "Claimed" in card["prompt"]
