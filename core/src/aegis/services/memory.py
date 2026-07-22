@@ -74,6 +74,44 @@ async def record_correction_from_interaction(
         logger.warning("agent_memory_record_failed", error=str(exc)[:200])
 
 
+async def record_gmail_triage_correction(
+    pool: Any, agent_id: str, email_id: str, subject: str, predicted: str, actual: str
+) -> bool:
+    """Write an agent_memory row for a REAL Gmail triage correction (#116) —
+    the user re-labeled an email AEGIS mis-triaged, detected by the recheck
+    loop (`recheck_triage_outcomes`) without any manual note. This is the
+    correction signal that fires without user effort, unlike
+    `record_correction_from_interaction` which needs a free-text reason
+    nobody types.
+
+    Idempotent per email_id: a dedupe marker is embedded in `content` and
+    checked before insert, so a re-run (e.g. the same message rechecked
+    twice) does not write a second row. Never raises.
+    """
+    dedupe_marker = f"[gmail:{email_id}]"
+    try:
+        exists = await pool.fetchval(
+            "SELECT 1 FROM agent_memory WHERE agent_id = $1 AND content LIKE $2 LIMIT 1",
+            agent_id,
+            f"%{dedupe_marker}",
+        )
+        if exists:
+            return False
+        subject_trunc = (subject or "(no subject)").strip()[:80]
+        content = (
+            f"User corrected email triage: '{subject_trunc}' — predicted {predicted}, "
+            f"actually {actual}. {dedupe_marker}"
+        )
+        await record_memory(
+            pool, agent_id, content, importance=0.7, source="gmail_triage_correction"
+        )
+        logger.info("agent_memory_recorded", agent_id=agent_id, source="gmail_triage_correction")
+        return True
+    except Exception as exc:  # noqa: BLE001 — memory write must never break recheck
+        logger.warning("agent_memory_record_failed", error=str(exc)[:200])
+        return False
+
+
 async def prune_memories(pool: Any, agent_id: str, keep: int = 50) -> int:
     """Cap an agent's memory at `keep` rows (highest importance, then recency).
     Returns the number deleted. The nightly MemoryReflectionFlow calls this."""
