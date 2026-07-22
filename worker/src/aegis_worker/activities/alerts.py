@@ -68,8 +68,21 @@ INFRA_ALERTNAMES: frozenset[str] = frozenset(
 )
 
 # Slug / github_repo of the resource that infra alerts route to.
-_HOMELAB_GITOPS_SLUG = "repo-infra-gitops"
-_HOMELAB_GITOPS_REPO = "example/infra-gitops"
+# ponytail: these two constants are a per-fork configuration point, not a
+# real default — `resources` rows for kind='repository' are NOT seeded from
+# YAML, they're auto-created by WorkspaceRepoSyncFlow scanning the workspace
+# host, which slugs a repo as `repo-<checkout-dirname>` (see
+# activities/inventory.py). "example/infra-gitops" is the upstream
+# placeholder; a fork whose swarm-config repo has any other name/path (this
+# deployment's is checked out as `infra-gitops` -> homelab-gitops, giving
+# slug `repo-homelab-gitops` / github_repo `hikmahtech/homelab-gitops`) must
+# update these two lines to match, or resolve_infra_resource's DB lookup
+# below silently finds no row and every infra-classified alert (Fixes #119:
+# confirmed via read-only prod query that this exact mismatch was why
+# CriticalEndpointDown/Dagster-Pipeline-Failure alerts always landed on
+# resource_source="none") dead-ends on the no-repo-access investigate() path.
+_HOMELAB_GITOPS_SLUG = "repo-homelab-gitops"
+_HOMELAB_GITOPS_REPO = "hikmahtech/homelab-gitops"
 
 # Infra alert classes safe to auto-remediate with a `service update --force`.
 # A force-restart reschedules a stuck/unplaced task (the DockerServiceDown /
@@ -431,6 +444,101 @@ def _coding_match(rid: Any, title: Any, meta: dict, confidence: float) -> dict:
         "claude_account": (meta.get("claude_account") or "").strip(),
         "confidence": confidence,
     }
+
+
+# ---------------------------------------------------------------------------
+# Tier 1.6 deterministic token match (resolve_alert_resource)
+# ---------------------------------------------------------------------------
+
+_MATCH_TOKEN_RE = re.compile(r"[a-z0-9]+")
+
+# Vocabulary common enough across BOTH many alerts and many repo names that a
+# shared token alone is coincidental, not identifying — e.g. "pipeline"
+# appears in almost every Dagster alert title AND in a repo literally named
+# "*-pipeline"; matching on it would false-positive. Deliberately small/local
+# to this matcher, not a general stopword list.
+_GENERIC_MATCH_TOKENS = frozenset(
+    {
+        "the", "a", "an", "is", "of", "to", "in", "on", "for", "and", "or",
+        "down", "up", "unreachable", "failed", "failure", "error", "errors",
+        "alert", "critical", "warning", "warn", "service", "endpoint", "repo",
+        "pipeline", "job", "run", "dagster", "http", "https", "www",
+        "com", "org", "io", "net", "unknown", "none", "true", "false",
+        "prod", "production", "staging", "dev", "class", "type", "message",
+    }
+)
+
+# Tokens shorter than this are dropped — short fragments ("em", "io") are too
+# likely to coincidentally appear in an unrelated resource's name.
+_MIN_MATCH_TOKEN_LEN = 4
+
+# Alert label keys that describe SCOPE/SEVERITY/CATEGORY rather than
+# identity. `alertname` in particular is a class, not an instance — e.g.
+# "Dagster Pipeline Failure" fires for every Dagster pipeline in every repo,
+# so including it would make every such alert token-match every repo whose
+# name contains "pipeline".
+_NON_IDENTIFYING_LABEL_KEYS = frozenset(
+    {"alertname", "severity", "cluster", "environment", "job", "grafana_folder", "run_id"}
+)
+
+
+def _match_tokens(*values: Any) -> set[str]:
+    """Lowercase + tokenize a set of strings into meaningful matching words.
+
+    Shared by both the alert side and the resource side of
+    `_deterministic_resource_match` so both use identical normalization.
+    """
+    tokens: set[str] = set()
+    for value in values:
+        if not value:
+            continue
+        for word in _MATCH_TOKEN_RE.findall(str(value).lower()):
+            if len(word) >= _MIN_MATCH_TOKEN_LEN and word not in _GENERIC_MATCH_TOKENS:
+                tokens.add(word)
+    return tokens
+
+
+def _alert_match_tokens(alert: dict) -> set[str]:
+    """Identifying tokens pulled from the alert's title/service/labels."""
+    labels = alert.get("labels") or {}
+    if not isinstance(labels, dict):
+        labels = {}
+    label_values = [
+        v
+        for k, v in labels.items()
+        if k not in _NON_IDENTIFYING_LABEL_KEYS and isinstance(v, str)
+    ]
+    return _match_tokens(alert.get("title"), alert.get("service"), *label_values)
+
+
+def _resource_match_tokens(title: Any, meta: dict) -> set[str]:
+    """Identifying tokens for one resources row: title, github_repo, path."""
+    return _match_tokens(title, meta.get("github_repo"), meta.get("path"))
+
+
+def _deterministic_resource_match(alert: dict, rows: list) -> dict | None:
+    """Tier 1.6: free-text token overlap between the alert and a candidate
+    resource's title/github_repo/path.
+
+    Catches alerts where `alert.service` is empty but a label value (e.g. a
+    Dagster `pipeline_name`) or the title literally names a tracked repo —
+    Tier 1.5's exact service-basename match only fires when `service` itself
+    is set. Returns the single unambiguously-matched resource, or None when
+    zero or multiple candidate resources share a token with the alert:
+    ambiguity always falls through to the LLM tier rather than guessing.
+    """
+    alert_tokens = _alert_match_tokens(alert)
+    if not alert_tokens:
+        return None
+    matches: list[tuple[Any, dict]] = []
+    for row in rows:
+        meta = _decode_metadata(row)
+        if alert_tokens & _resource_match_tokens(row["title"], meta):
+            matches.append((row, meta))
+    if len(matches) != 1:
+        return None
+    row, meta = matches[0]
+    return _coding_match(row["id"], row["title"], meta, 1.0)
 
 
 @dataclass
@@ -1048,7 +1156,8 @@ class AlertActivities:
         """Map an alert to matching resources using KG cache then LLM, with rule-based expansion.
 
         Returns backward-compatible top-level fields plus a 'resources' list for multi-repo
-        investigation. source: "knowledge" | "llm" | "auto_registered" | "none"
+        investigation. source: "knowledge" | "sentry_project" | "service_match" |
+        "deterministic" | "llm" | "llm_unconfirmed" | "auto_registered" | "none"
         """
         null_result = {
             "resource_id": None,
@@ -1163,6 +1272,15 @@ class AlertActivities:
                 if service_base in {path_base, repo_base} or service.lower() == github_repo.lower():
                     matched = _coding_match(row["id"], row["title"], meta, 1.0)
                     return {**matched, "source": "service_match", "resources": [matched]}
+
+        # Tier 1.6: deterministic free-text token match. Covers alerts where
+        # `service` is empty (e.g. alertmanager Dagster alerts) but a label
+        # value (pipeline_name, failed_step, ...) or the title literally names
+        # a tracked repo. Only acts on a SINGLE unambiguous match; zero or
+        # multiple candidates fall through to the LLM tier below, unchanged.
+        deterministic = _deterministic_resource_match(alert, rows)
+        if deterministic is not None:
+            return {**deterministic, "source": "deterministic", "resources": [deterministic]}
 
         if not self.llm_client:
             return null_result
@@ -1292,6 +1410,19 @@ class AlertActivities:
                             slug,
                             service,
                         )
+            # Both resolution tiers dead-ended: the deterministic token match
+            # (Tier 1.6, above) found zero or an ambiguous set of candidates,
+            # and the LLM returned no candidate at/above the confidence bar
+            # either. Logged distinctly (vs. resolve_resource_parse_failed,
+            # which is an unparseable LLM response) so "genuinely no match"
+            # is diagnosable from worker logs instead of silently landing on
+            # investigate() with no clue why.
+            activity.logger.info(
+                "resolve_alert_resource_no_match fingerprint=%s title=%s "
+                "(deterministic: no/ambiguous token overlap; llm: no candidate >= threshold)",
+                alert.get("fingerprint", ""),
+                title[:120],
+            )
             return null_result
 
         # Build enriched resource list from DB rows
