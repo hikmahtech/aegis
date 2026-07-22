@@ -8,6 +8,7 @@ from aegis.services.memory import (
     prune_memories,
     recent_memories,
     record_correction_from_interaction,
+    record_gmail_triage_correction,
     record_memory,
 )
 
@@ -61,6 +62,32 @@ async def test_prune_caps_to_keep(mem_agent):
     deleted = await prune_memories(mem_agent, _AID, keep=3)
     assert deleted == 7
     assert len(await recent_memories(mem_agent, _AID, limit=50)) == 3
+
+
+async def test_record_gmail_triage_correction_writes_and_dedupes(mem_agent):
+    """(#116) A Gmail triage correction writes an agent_memory row; a second
+    call for the SAME email_id is a no-op (idempotent)."""
+    wrote = await record_gmail_triage_correction(
+        mem_agent, _AID, "msg-123", "Newsletter roundup", "useless", "important"
+    )
+    assert wrote is True
+    out = await recent_memories(mem_agent, _AID)
+    assert len(out) == 1
+    assert "Newsletter roundup" in out[0]
+    assert "predicted useless" in out[0]
+    assert "actually important" in out[0]
+
+    wrote_again = await record_gmail_triage_correction(
+        mem_agent, _AID, "msg-123", "Newsletter roundup", "useless", "important"
+    )
+    assert wrote_again is False
+    assert len(await recent_memories(mem_agent, _AID)) == 1
+
+
+async def test_record_gmail_triage_correction_distinct_ids_both_write(mem_agent):
+    await record_gmail_triage_correction(mem_agent, _AID, "msg-a", "A", "useless", "important")
+    await record_gmail_triage_correction(mem_agent, _AID, "msg-b", "B", "useless", "important")
+    assert len(await recent_memories(mem_agent, _AID)) == 2
 
 
 def test_format_memories():

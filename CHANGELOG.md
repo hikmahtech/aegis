@@ -43,6 +43,12 @@ to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **Learning-loop input on Slack cards** (#71): approval/choice/ack interaction
   cards carry an optional "Why?" free-text input; a note typed with a button
   tap lands as `response.note` and becomes a durable `agent_memory` lesson.
+- **Gmail triage corrections feed `agent_memory`** (#116): a REAL user
+  correction detected by `recheck_triage_outcomes` (the user re-labeled an
+  email AEGIS mis-triaged) now also writes a durable `agent_memory` row via
+  `record_gmail_triage_correction` — the correction signal that fires without
+  any manual note, unlike the Slack-card "Why?" input above which nobody
+  types. Idempotent per email_id.
 - **Per-tool chat executor timeouts** (#73): `_TOOL_TIMEOUT_OVERRIDES` in
   `services/chat.py` lets long-running tools exceed the 30s default —
   `aegis_self_diagnose` (remote coding-CLI run, up to 8 min) could previously
@@ -64,6 +70,17 @@ to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Gmail triage recheck starvation** (#115): 473 of 1658 lifetime
+  `triage_accuracy` predictions had aged past the 7-day recheck window with
+  both `actual` and `last_checked_at` NULL, permanently excluded from the
+  accuracy signal. The implicit-confirm UPDATE in `recheck_triage_outcomes`
+  now also catches never-checked rows once they're past the 7-day window
+  (silence is agreement applies equally whether or not the row was ever
+  actively observed) — this backfills the 473 stuck rows on first run. A
+  second contributing bug is also fixed: an unresolvable row (deleted mail,
+  or another account's message) previously kept `last_checked_at` NULL
+  forever, letting it win queue-front priority on every future call and
+  crowd out genuinely-resolvable rows; it now gets stamped too.
 - **Google Calendar 410 poison loop** (#69): a quiet calendar's cursor
   (max event `updated`) ages past Google's `updatedMin` horizon and every daily
   fetch 410s without advancing it. On 410 the fetch now retries the full window
