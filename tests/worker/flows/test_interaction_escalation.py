@@ -125,3 +125,18 @@ async def test_escalation_stops_at_max_repeats_then_times_out():
     assert result.status == "archived"
     assert len(_calls["cards"]) == 3  # original + exactly max_repeats
     assert _calls["timeouts"] == 1
+
+
+async def test_no_spurious_nag_when_deadline_clips_final_interval():
+    _reset()
+    env, worker, input = await _start(
+        _input(interval_minutes=10, mention_id="U042", max_repeats=10)
+    )
+    input.timeout_seconds = 300  # deadline arrives before the first full interval
+    async with env, worker:
+        result = await env.client.execute_workflow(
+            InteractionFlow.run, input, id=f"i-{uuid.uuid4()}", task_queue=worker.task_queue
+        )
+    assert result.status == "archived"
+    assert len(_calls["cards"]) == 1  # original card only — no reminder at archive time
+    assert _calls["timeouts"] == 1

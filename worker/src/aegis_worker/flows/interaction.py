@@ -152,7 +152,8 @@ class InteractionFlow:
             # -identical.
             esc = (input.metadata or {}).get("escalation") or {}
             esc_interval_s = int(esc.get("interval_minutes") or 0) * 60
-            esc_max = int(esc.get("max_repeats") or 10)
+            _esc_max_raw = esc.get("max_repeats")
+            esc_max = 10 if _esc_max_raw is None else int(_esc_max_raw)
             mention = str(esc.get("mention_id") or "").strip()
             deadline = workflow.now() + timedelta(seconds=input.timeout_seconds)
             repeats = 0
@@ -172,7 +173,7 @@ class InteractionFlow:
                         lambda: self._resolved, timeout=timedelta(seconds=chunk)
                     )
                 except TimeoutError:
-                    if esc_interval_s > 0 and repeats < esc_max:
+                    if esc_interval_s > 0 and repeats < esc_max and chunk == esc_interval_s:
                         repeats += 1
                         prefix = f"<@{mention}> " if mention else ""
                         nag = (
@@ -193,7 +194,7 @@ class InteractionFlow:
                                 retry_policy=_BEST_EFFORT_RETRY,
                                 start_to_close_timeout=_ACT_TIMEOUT,
                             )
-                        except Exception as exc:  # noqa: BLE001 — nag is best-effort
+                        except Exception as exc:
                             workflow.logger.warning(
                                 "interaction_escalation_dispatch_failed: %s", str(exc)[:200]
                             )
