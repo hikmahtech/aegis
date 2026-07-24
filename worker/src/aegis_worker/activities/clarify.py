@@ -903,6 +903,7 @@ class ClarifyActivities:
         *,
         service: str | None = None,
         resource_tags: list[str] | None = None,
+        alert_overrides: dict | None = None,
     ) -> dict:
         """Build the AlertInvestigationFlow spawn payload for a content-route
         investigation. Shared by the pandora_investigation and pandora_followup
@@ -912,7 +913,10 @@ class ClarifyActivities:
 
         `source` stays "todoist-jira": AlertInvestigationFlow treats that value
         as a scoping-only contract (investigate + comment, never an autonomous
-        PR) — the right default for a gated inbox work ticket.
+        PR) — the right default for a gated inbox work ticket. A route's
+        `alert_overrides` (source/alertname/severity) can replace these
+        defaults — e.g. to route a hand-captured "noon is down" task through
+        the deterministic homelab-gitops infra pipeline instead.
         """
         labels: dict = {"alertname": content[:100]}
         alert: dict = {
@@ -930,6 +934,11 @@ class ClarifyActivities:
             labels["service"] = service
         if resource_tags:
             alert["resource_tag_filter"] = list(resource_tags)
+        for k, v in (alert_overrides or {}).items():
+            if k == "alertname":
+                labels["alertname"] = v
+            elif k in ("source", "severity"):
+                alert[k] = v
         return {"spawn_kind": "pandora_investigation", "alert": alert}
 
     def _build_agent_synthetic_input(
@@ -1280,6 +1289,7 @@ class ClarifyActivities:
                 item_id,
                 service=route.get("service"),
                 resource_tags=route.get("resource_tags"),
+                alert_overrides=route.get("alert_overrides"),
             )
             interaction_spawned = True
 
@@ -1326,6 +1336,7 @@ class ClarifyActivities:
                 item_id,
                 service=_route.get("service"),
                 resource_tags=_route.get("resource_tags"),
+                alert_overrides=_route.get("alert_overrides"),
             )
             interaction_spawned = True
             # No commands to send — labels already include @pandora. We

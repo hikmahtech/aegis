@@ -118,3 +118,29 @@ async def test_save_and_get_roundtrip(clean_routes):
 async def test_save_rejects_bad_regex(clean_routes):
     with pytest.raises(ValueError):
         await save_content_routes(clean_routes, [{"key": "k", "match": "regex", "value": "["}])
+
+
+def test_alert_overrides_validated_and_normalized():
+    routes = validate_routes(
+        [
+            {
+                "key": "infra",
+                "match": "contains",
+                "value": "down",
+                "alert_overrides": {"source": "todoist-infra", "alertname": "NodeDown"},
+            }
+        ]
+    )
+    assert routes[0]["alert_overrides"] == {"source": "todoist-infra", "alertname": "NodeDown"}
+
+
+def test_alert_overrides_rejects_unknown_keys():
+    with pytest.raises(ValueError):
+        validate_routes(
+            [{"key": "x", "match": "contains", "value": "y", "alert_overrides": {"exec": "rm"}}]
+        )
+
+
+def test_alert_overrides_absent_stays_none():
+    routes = validate_routes([{"key": "x", "match": "contains", "value": "y"}])
+    assert routes[0]["alert_overrides"] is None
