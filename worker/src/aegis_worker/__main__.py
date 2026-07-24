@@ -57,6 +57,7 @@ from aegis_worker.flows.delivery_watchdog import DeliveryWatchdogFlow
 from aegis_worker.flows.drive_sync import DriveSyncFlow
 from aegis_worker.flows.github_alert import GitHubAlertFlow
 from aegis_worker.flows.gmail_ingest import GmailIngestFlow
+from aegis_worker.flows.infra_heartbeat import InfraHeartbeatFlow
 from aegis_worker.flows.intelligence_scan import IntelligenceScanFlow
 from aegis_worker.flows.interaction import InteractionFlow
 from aegis_worker.flows.llm_spend_guard import LLMSpendGuardFlow
@@ -276,6 +277,8 @@ async def main():
             db_pool=deps.pool,
             homelab=connectors.get("homelab"),
             delivery=delivery_act,
+            heartbeat_ping_url=getattr(settings, "infra_heartbeat_ping_url", "") or "",
+            infra_cluster=getattr(settings, "infra_cluster", "") or "",
         )
 
     money_act = None
@@ -569,6 +572,12 @@ async def main():
             homelab_act.collect_services,
             homelab_act.probe_and_upsert_cert,
             homelab_act.notify_cert_alert,
+            homelab_act.collect_infra_state,
+            homelab_act.read_heartbeat_state,
+            homelab_act.write_heartbeat_state,
+            homelab_act.record_heartbeat_resolved,
+            homelab_act.ping_deadman,
+            homelab_act.get_heartbeat_routing,
         ]
 
     if money_act:
@@ -617,6 +626,7 @@ async def main():
             ServiceDriftFlow,
             CertRadarFlow,
             DeliveryWatchdogFlow,
+            InfraHeartbeatFlow,
         ]
 
     if settings.money_hygiene_enabled:
