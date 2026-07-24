@@ -80,10 +80,31 @@ Point your alert sources at Core (all HMAC/secret-verified, auth-exempt):
 - `POST /api/webhooks/alert` — Grafana / Alertmanager-shaped payloads
 - `POST /api/webhooks/github` — PR notifications (`GitHubAlertFlow`)
 - `POST /api/webhooks/todoist` — Todoist sync events
+- **AEGIS heartbeat (2-min poll)** → `InfraHeartbeatFlow` → `AlertInvestigationFlow` on
+  node/service transitions (source `aegis-heartbeat`)
 
 All of them feed `AlertInvestigationFlow` / the flows described in
 [`architecture/overview.md`](architecture/overview.md). Per-alert runbooks live in
 `runbooks/<AlertName>.md`, baked into the worker image.
+
+### Infra heartbeat & escalation
+
+`InfraHeartbeatFlow` (schedule `infra-heartbeat-2m`, gated by `homelab_enabled`) polls
+`docker node ls` + `docker service ls` every 2 min and spawns investigations on state
+transitions only. Recovery transitions write the same resolved audit rows the webhook
+writes, so self-resolve works for heartbeat alerts. Configure on the admin Integrations
+page (worker restart required):
+
+- **Heartbeat dead-man ping URL** — healthchecks.io check pinged on every successful tick.
+- **Slack member id for escalation mentions** — critical infra Gate-2 cards re-ping with
+  an @-mention every 3 min (max 10) until acked or self-resolved.
+
+Infra Gate-2 cards can carry a **Run fix** option (kimi's `PROPOSED_COMMANDS:` footer);
+approval executes the commands on the coding host via SSH (refused if the infra row is
+`read_only`), posts outputs to the task, and re-verifies. Approving with a note runs the
+note's lines instead. To route hand-captured Todoist tasks ("noon is down") into the
+same pipeline, add a content route with `alert_overrides`, e.g.
+`{"source": "todoist-infra", "alertname": "NodeDown", "severity": "critical"}`.
 
 ## Debugging comms/Slack
 

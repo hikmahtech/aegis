@@ -1,6 +1,6 @@
 # AEGIS v3 Architecture
 
-AEGIS v3 is a flow-first personal AI orchestration platform. It coordinates 4 named personalities over 28 Temporal flows, a chat surface with 42 tools gated per-personality, native ingest connectors, and a native Postgres+pgvector knowledge store for semantic search and query-time RAG.
+AEGIS v3 is a flow-first personal AI orchestration platform. It coordinates 4 named personalities over 29 Temporal flows, a chat surface with 42 tools gated per-personality, native ingest connectors, and a native Postgres+pgvector knowledge store for semantic search and query-time RAG.
 
 This document is the canonical reference for what the running system does today. For commands and setup, see [`development.md`](../development.md). For deployment, see [`production.md`](../production.md). For where the architecture is **going** — a kernel + SDK + capability-plugin redesign for productization — see the reference stubs in [`sdk-stubs/`](sdk-stubs/README.md).
 
@@ -9,7 +9,7 @@ This document is the canonical reference for what the running system does today.
 | Service | Package | Port | Purpose |
 |---------|---------|------|---------|
 | Core API | `aegis-core` | 8080 | REST API, personalities, chat, connectors, admin panel SPA |
-| Worker | `aegis-worker` | — | Temporal workflows (28 flows), activities, schedule sync |
+| Worker | `aegis-worker` | — | Temporal workflows (29 flows), activities, schedule sync |
 | Comms | `aegis-comms` | 8081 | Channel adapter — **Slack** (Socket Mode); FastAPI delivery server + interaction cards. Core reaches it via `AEGIS_COMMS_URL`; idles as a no-op until Slack is configured |
 | Postgres | pgvector/pg16 | 25432 | Primary database (migrations 001 → 008) |
 | Temporal | auto-setup | 7233 | Workflow orchestration (task queue `aegis-main`) |
@@ -37,7 +37,7 @@ To add or repurpose an agent, create it and check the capability tags that descr
 | **Sebas** | Executive assistant | `smart` | `GmailIngestFlow`, `CalendarIngestFlow`, `TodoistSyncFlow`, `ClarifyFlow`, `DailyReviewFlow` + `WeeklyReviewFlow`, `SocialPublishFlow`, `MemoryReflectionFlow` |
 | **Raphael** | Research + knowledge | `smart` | `DailyBriefingFlow`, `IntelligenceScanFlow` (×3 sources), `RaindropIngestFlow`, `RssIngestFlow`, `DriveSyncFlow` |
 | **Maou** | Finance | `smart` | `MoneyProcessFlow`, `MoneyHygieneDailyFlow`, `ReceiptIngestFlow`, `SubscriptionAuditFlow` |
-| **Pandora's Actor** | Infrastructure | `smart` | `ServiceDriftFlow`, `CertRadarFlow`, `SentryPollFlow`, `DeliveryWatchdogFlow`, `CleanupFlow`, `WorkspaceRepoSyncFlow`, `GitHubAlertFlow` (PR notifier, webhook-driven) |
+| **Pandora's Actor** | Infrastructure | `smart` | `ServiceDriftFlow`, `CertRadarFlow`, `SentryPollFlow`, `DeliveryWatchdogFlow`, `InfraHeartbeatFlow` (2-min swarm node/service poll, transition-only alerts), `CleanupFlow`, `WorkspaceRepoSyncFlow`, `GitHubAlertFlow` (PR notifier, webhook-driven) |
 
 **Utility flows (driven by their callers, not owner-scheduled):**
 - `InteractionFlow` — man-in-the-middle handoff; any flow spawns this as a child to wait for a human response.
@@ -126,7 +126,7 @@ Cross-agent handoff via agent-written `@<other>` labels is **out of scope for v1
 
 ## Flows
 
-28 Temporal workflows on task queue `aegis-main`. Flow code lives in `worker/src/aegis_worker/flows/`. Most scheduled flows carry `agent_id` in their config dataclass so `WorkflowRunRecorderInterceptor` can populate `workflow_runs.agent_id`; utility flows (`InteractionFlow`, `AlertInvestigationFlow`, `AgentChatReplyFlow`) take it from their caller.
+29 Temporal workflows on task queue `aegis-main`. Flow code lives in `worker/src/aegis_worker/flows/`. Most scheduled flows carry `agent_id` in their config dataclass so `WorkflowRunRecorderInterceptor` can populate `workflow_runs.agent_id`; utility flows (`InteractionFlow`, `AlertInvestigationFlow`, `AgentChatReplyFlow`) take it from their caller.
 
 Owner-scheduled flows are listed in the Personalities table above. The remaining named flows:
 
@@ -163,7 +163,7 @@ Specialist flows subscribe to tag subsets and run as abandoned children:
 8. **Knowledge context** — `gather_alert_knowledge` prepends `runbooks/<AlertName>.md` (if present and non-stub), then appends prior-incident context from KS.
 9. **Investigation** — coding-CLI (kimi/claude) via `run_investigation` when a `resource_path` is available; LLM fallback otherwise. The run executes on the effective host (the configured kimi host when reachable, else the base coding host — see [`infrastructure.md`](../infrastructure.md)); that host is threaded back through the read-back poll, worktree cleanup, and PR push so they all happen where the branch was made.
 10. **Haiku assessment** → structured verdict: `resolved` / `not_actionable` / `actionable` / `inconclusive`.
-11. **Gate 2** (non-Jira, non-self-resolved verdicts) — Open PR(s) / Mute 24h / Acknowledge / Discard via Slack. Jira-source runs (`source=='todoist-jira'`) bypass Gate 2 by contract.
+11. **Gate 2** (non-Jira, non-self-resolved verdicts) — Open PR(s) / Run fix (infra alerts whose investigation ends with a `PROPOSED_COMMANDS:` footer — human-approved SSH execution, read_only-gated, note overrides the commands) / Mute 24h / Acknowledge / Discard via Slack. Jira-source runs (`source=='todoist-jira'`) bypass Gate 2 by contract.
 12. Comms notification (Slack) + Todoist task comment + audit log write.
 
 When a `todoist_task_id` is on the alert (pandora APP-<n>: clarify path), the flow attaches to the existing task; otherwise `capture_to_inbox(extra_labels=["@pandora"])` creates one upfront. Start + final comments are posted via `AlertActivities.post_task_note`.
