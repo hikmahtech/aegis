@@ -14,6 +14,7 @@ from typing import Any
 
 import httpx
 import structlog
+from aegis.observability import log_audit
 from temporalio import activity
 
 from aegis_worker.activities.delivery import safe_send_message
@@ -48,6 +49,8 @@ class HomelabActivities:
     delivery: Any  # DeliveryActivities
     agent_id: str = "pandoras-actor"
     todoist_connector: Any = None  # TodoistConnector; wired in __main__ when available
+    heartbeat_ping_url: str = ""  # healthchecks.io dead-man URL; "" = disabled
+    infra_cluster: str = ""       # Prometheus cluster label for synthetic alerts
 
     async def _notify_card(self, agent_id: str, title: str, body: str, log_event: str) -> None:
         """Fire-and-forget chat-card send shared by the notify_* activities.
@@ -480,6 +483,92 @@ class HomelabActivities:
                 alert.get("threshold"),
                 str(result.get("error", "ok=false"))[:200],
             )
+
+    # ------------------------------------------------------------------
+    # Infra heartbeat (dead-man's switch for the swarm + AEGIS itself)
+    # ------------------------------------------------------------------
+
+    _HEARTBEAT_STATE_KEY = "infra_heartbeat_state"
+    _HEARTBEAT_STATE_DEFAULT = {"nodes": {}, "stuck": [], "confirmed": [], "fail_count": 0}
+
+    @activity.defn
+    async def collect_infra_state(self) -> dict:
+        """One heartbeat sample: node statuses + services stuck below desired."""
+        if not self.homelab:
+            return {"ok": False, "nodes": {}, "stuck": [], "error": "no_homelab_connector"}
+        nodes_env = await self.homelab.list_nodes()
+        if not nodes_env.get("ok"):
+            return {"ok": False, "nodes": {}, "stuck": [], "error": str(nodes_env.get("error"))[:200]}
+        svc_env = await self.homelab.list_services()
+        if not svc_env.get("ok"):
+            return {"ok": False, "nodes": {}, "stuck": [], "error": str(svc_env.get("error"))[:200]}
+        nodes = {n["hostname"]: n["status"] for n in nodes_env.get("data") or [] if n.get("hostname")}
+        stuck = sorted(
+            s["name"]
+            for s in svc_env.get("data") or []
+            if (s.get("replicas_desired") or 0) > 0
+            and (s.get("replicas_actual") or 0) < (s.get("replicas_desired") or 0)
+        )
+        return {"ok": True, "nodes": nodes, "stuck": stuck, "error": ""}
+
+    @activity.defn
+    async def read_heartbeat_state(self) -> dict:
+        if not self.db_pool:
+            return dict(self._HEARTBEAT_STATE_DEFAULT)
+        row = await self.db_pool.fetchrow(
+            "SELECT value FROM settings WHERE key = $1", self._HEARTBEAT_STATE_KEY
+        )
+        if not row or not row["value"]:
+            return dict(self._HEARTBEAT_STATE_DEFAULT)
+        value = row["value"]
+        return {**self._HEARTBEAT_STATE_DEFAULT, **value} if isinstance(value, dict) else dict(
+            self._HEARTBEAT_STATE_DEFAULT
+        )
+
+    @activity.defn
+    async def write_heartbeat_state(self, state: dict) -> None:
+        if not self.db_pool:
+            return
+        await self.db_pool.execute(
+            "INSERT INTO settings (key, value, updated_at) VALUES ($1, $2, NOW()) "
+            "ON CONFLICT (key) DO UPDATE SET value = $2, updated_at = NOW()",
+            self._HEARTBEAT_STATE_KEY,
+            state,
+        )
+
+    @activity.defn
+    async def record_heartbeat_resolved(self, fingerprint: str) -> None:
+        """Mirror the webhook's resolved-alert audit row so check_alert_resolved
+        (and thus the whole self-resolve machinery) works for heartbeat alerts."""
+        if not self.db_pool or not fingerprint:
+            return
+        await log_audit(
+            self.db_pool,
+            actor="alert:aegis-heartbeat",
+            action="alert_received",
+            target_type="alert",
+            target_id=fingerprint,
+            details={"resolved": "true"},
+        )
+
+    @activity.defn
+    async def ping_deadman(self) -> dict:
+        """Fire-and-forget healthchecks.io ping. Only called on a SUCCESSFUL
+        collect, so a silent heartbeat (AEGIS/node death) stops the pings."""
+        if not self.heartbeat_ping_url:
+            return {"pinged": False}
+        try:
+            async with httpx.AsyncClient(timeout=5) as client:
+                await client.get(self.heartbeat_ping_url)
+            return {"pinged": True}
+        except Exception as exc:  # noqa: BLE001 — dead-man ping is never fatal
+            activity.logger.warning("heartbeat_deadman_ping_failed err=%s", str(exc)[:200])
+            return {"pinged": False}
+
+    @activity.defn
+    async def get_heartbeat_routing(self) -> dict:
+        """Settings-derived knobs for the flow (workflows can't read Settings)."""
+        return {"infra_cluster": self.infra_cluster}
 
 
 def _parse_rowcount(status: str) -> int:
