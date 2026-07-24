@@ -587,12 +587,19 @@ class AlertActivities:
     # Settings.infra_cluster (admin Integrations page; AEGIS_INFRA_CLUSTER
     # env fallback). Blank = cluster-label matching off.
     infra_cluster: str = ""
+    # Slack member id for escalation @-mentions on Gate-2 cards raised by
+    # escalating (NodeDown / HeartbeatCollectFailed) alerts. Injected from
+    # Settings.slack_owner_member_id. Blank = no @-mention in the nag.
+    slack_owner_member_id: str = ""
 
     @activity.defn
     async def get_alert_routing_config(self) -> dict:
         """Settings-derived routing knobs for the flow (workflows can't read
         Settings/DB — mirror of the AgentRegistryActivities pattern)."""
-        return {"infra_cluster": self.infra_cluster}
+        return {
+            "infra_cluster": self.infra_cluster,
+            "slack_owner_member_id": self.slack_owner_member_id,
+        }
 
     async def _effective_runbooks_dir(self) -> str:
         """Runbooks dir, DB-first: the infra coding block (via the connector)

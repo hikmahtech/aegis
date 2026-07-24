@@ -220,6 +220,7 @@ async def main():
         # client connects to the "default" namespace too (see Client.connect
         # below). Wire a settings field here if a non-default namespace is added.
         infra_cluster=getattr(settings, "infra_cluster", "") or "",
+        slack_owner_member_id=getattr(settings, "slack_owner_member_id", "") or "",
     )
     briefing_act = BriefingActivities(
         db_pool=deps.pool,

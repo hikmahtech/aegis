@@ -30,6 +30,7 @@ steps 2.7 and 3.
 
 from __future__ import annotations
 
+import asyncio
 import re
 from datetime import timedelta
 
@@ -335,6 +336,22 @@ class AlertInvestigationFlow:
             f"🔍 Alert investigation started: <b>{_html_escape(title)}</b> ({severity}/{source})"
         )
 
+        # Escalating infra alerts (NodeDown / HeartbeatCollectFailed — Task 4
+        # marks alert["escalate"]) get an immediate heads-up chat ping so the
+        # owner knows a decision card is coming and will be nagged until acked.
+        # Non-escalating alerts skip this entirely (byte-identical to before).
+        _escalate = bool(alert.get("escalate"))
+        if _escalate:
+            await self._safe_send_message(
+                agent_id=agent_id,
+                message=(
+                    f"🔴 <b>{_html_escape(title)}</b>\n"
+                    f"{severity} · {source} — investigating now; "
+                    f"I'll escalate until you ack the decision card."
+                ),
+                log_event="alert_heads_up_notify_failed",
+            )
+
         # ── Step 1: Skip if resolved on arrival ──
         if alert.get("resolved"):
             workflow.logger.info("alert_resolved_skip title=%s", title)
@@ -375,6 +392,7 @@ class AlertInvestigationFlow:
         # before this change so they keep replaying the pre-patch (env-only)
         # behavior instead of non-deterministically diverging mid-history.
         infra_cluster = ""
+        owner_mention = ""
         if workflow.patched("infra-cluster-from-settings"):
             routing = await workflow.execute_activity_method(
                 AlertActivities.get_alert_routing_config,
@@ -382,6 +400,7 @@ class AlertInvestigationFlow:
                 retry_policy=FAST,
             )
             infra_cluster = routing.get("infra_cluster") or ""
+            owner_mention = routing.get("slack_owner_member_id") or ""
 
         # ── Step 2.7: Signature dedup — attach to existing open task ──
         # Sentry mints a new issue id per stack-frame variation, so
@@ -1130,19 +1149,71 @@ class AlertInvestigationFlow:
             if branches:
                 options["discard"] = "🗑 Discard"
 
-            g2 = await workflow.execute_child_workflow(
-                InteractionFlow.run,
-                InteractionFlowInput(
-                    agent_id=agent_id,
-                    kind="choice",
-                    origin="alert_approve_pr",
-                    prompt=prompt,
-                    options=options,
-                    timeout_seconds=172800,  # 48h
-                    timeout_policy="archive",
+            gate_input = InteractionFlowInput(
+                agent_id=agent_id,
+                kind="choice",
+                origin="alert_approve_pr",
+                prompt=prompt,
+                options=options,
+                timeout_seconds=172800,  # 48h
+                timeout_policy="archive",
+                # Escalating alerts nag the owner every 3 min (up to 10×) with an
+                # @-mention until acked; non-escalating alerts pass metadata=None
+                # so InteractionFlow's escalation loop is a no-op (byte-identical
+                # to the pre-escalation single-wait behaviour).
+                metadata=(
+                    {
+                        "escalation": {
+                            "interval_minutes": 3,
+                            "mention_id": owner_mention,
+                            "max_repeats": 10,
+                        }
+                    }
+                    if _escalate
+                    else None
                 ),
-                id=f"gate2-{_safe_workflow_id_segment(alert.get('fingerprint') or '')}-{workflow.info().workflow_id}",
             )
+            gate_id = (
+                f"gate2-{_safe_workflow_id_segment(alert.get('fingerprint') or '')}"
+                f"-{workflow.info().workflow_id}"
+            )
+            if not _escalate:
+                # Unchanged path: spawn + await the decision card. In-flight
+                # prod runs replay through exactly this branch.
+                g2 = await workflow.execute_child_workflow(
+                    InteractionFlow.run, gate_input, id=gate_id
+                )
+            else:
+                # Escalating alert: race the decision card against the alert
+                # self-resolving. Poll check_alert_resolved every 3 min; if the
+                # underlying condition clears while we await the human, auto-close
+                # the card (signal self_resolved) so we stop nagging the owner
+                # about an alert that already recovered.
+                handle = await workflow.start_child_workflow(
+                    InteractionFlow.run, gate_input, id=gate_id
+                )
+                gate_task = asyncio.ensure_future(handle)
+                while True:
+                    # workflow.wait is the deterministic, replay-safe equivalent
+                    # of asyncio.wait (same (done, pending) return; no raise on
+                    # timeout). The 180s timeout becomes a workflow timer.
+                    done, _ = await workflow.wait({gate_task}, timeout=180)
+                    if gate_task in done:
+                        g2 = gate_task.result()
+                        break
+                    recheck = await workflow.execute_activity_method(
+                        AlertActivities.check_alert_resolved,
+                        args=[fingerprint, 10],
+                        start_to_close_timeout=TIMEOUT_FAST,
+                        retry_policy=FAST,
+                    )
+                    if recheck.get("resolved"):
+                        await handle.signal(
+                            InteractionFlow.submit_response,
+                            {"value": "self_resolved", "note": "auto-closed: alert resolved"},
+                        )
+                        g2 = await gate_task
+                        break
             # Mirror Gate-1's archived-treatment: a 48h-ignored Gate-2 means
             # the user never decided. Don't fall through to the regular
             # verdict ping — drop a skip-comment on the track-task and short
@@ -1163,6 +1234,28 @@ class AlertInvestigationFlow:
                     "todoist_task_id": track_task_id,
                 }
             v2 = ((g2.response or {}).get("value") or "").strip()
+            if v2 == "self_resolved":
+                # The self-resolve race auto-closed the card because the alert
+                # recovered while we awaited the human. Log for dedup and short
+                # out — there's no decision to act on.
+                await self._safe_post_note(
+                    track_task_id or "",
+                    "✅ Self-resolved while awaiting your decision — card closed automatically.",
+                )
+                try:
+                    await workflow.execute_activity_method(
+                        AlertActivities.log_alert,
+                        args=[alert],
+                        start_to_close_timeout=TIMEOUT_FAST,
+                        retry_policy=NO_RETRY,
+                    )
+                except Exception:
+                    pass
+                return {
+                    "status": "self_resolved_during_gate",
+                    "task_id": None,
+                    "todoist_task_id": track_task_id,
+                }
             if v2 == "discard":
                 await self._safe_post_note(
                     track_task_id or "",
