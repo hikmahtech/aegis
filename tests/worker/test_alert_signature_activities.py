@@ -13,7 +13,7 @@ from __future__ import annotations
 import uuid
 
 import pytest
-from aegis_worker.activities.alerts import AlertActivities, build_alert_signature
+from aegis_worker.activities.alerts import AlertActivities, build_alert_signature, is_infra_alert
 
 # ---------------------------------------------------------------------------
 # build_alert_signature — pure function, no DB
@@ -74,6 +74,13 @@ def test_infra_signature_is_source_independent():
     sig_hb = build_alert_signature(hb, "homelab-swarm")
     assert sig_am == sig_hb
     assert sig_am == "infra-class:homelab-swarm:nodedown"
+
+
+def test_heartbeat_collect_failed_is_infra_alert_without_cluster_label():
+    """HeartbeatCollectFailed must be self-sufficient in INFRA_ALERTNAMES —
+    unlike NodeDown/DockerServiceDown it has no per-node/service subject, so
+    it can't rely on a `cluster` label match alone to classify as infra."""
+    assert is_infra_alert({"labels": {"alertname": "HeartbeatCollectFailed"}}) is True
 
 
 # ---------------------------------------------------------------------------

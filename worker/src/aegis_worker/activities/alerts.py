@@ -47,6 +47,7 @@ INFRA_ALERTNAMES: frozenset[str] = frozenset(
     {
         "nodedown",
         "dockerservicedown",
+        "heartbeatcollectfailed",
         "lokidown",
         "criticalendpointdown",
         "postgresqldown",
