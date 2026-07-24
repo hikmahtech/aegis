@@ -865,6 +865,12 @@ class AlertInvestigationFlow:
                 "`docker --context swarm service logs <service>`). "
                 "Do NOT look for application source code — focus on ansible roles, "
                 "docker-compose/stack templates, and swarm service state."
+                " End your report with a PROPOSED_COMMANDS: section — one `- <command>` "
+                "line per safe, idempotent recovery command you recommend (max 5, "
+                "e.g. `- docker --context swarm service update --force <svc>`). "
+                "Propose ONLY read-safe or idempotent commands; omit the section if "
+                "no command is warranted. The commands are NOT run automatically — "
+                "a human approves them."
             )
             if labels_str:
                 infra_hint += f"\nAlert labels: {labels_str}"

@@ -11,7 +11,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 from aegis_worker.activities import alerts as alerts_mod
-from aegis_worker.activities.alerts import AlertActivities
+from aegis_worker.activities.alerts import AlertActivities, extract_proposed_commands
 from aegis_worker.flows.alert_investigation import _build_repo_confirm_prompt
 from temporalio.testing import ActivityEnvironment
 
@@ -148,3 +148,53 @@ def test_repo_confirm_prompt_no_candidates_is_safe():
         title="x", source="s", severity="warn", service="", description="", task_id="", candidates=None,
     )
     assert "Which repository" in out
+
+
+def test_extract_proposed_commands_parses_footer():
+    text = (
+        "…investigation findings…\n\n"
+        "PROPOSED_COMMANDS:\n"
+        "- docker --context swarm service update --force koyracloud_order-finder\n"
+        "- docker --context swarm service ps koyracloud_order-finder\n\n"
+        "Some trailing prose."
+    )
+    cmds = extract_proposed_commands(text)
+    assert cmds == [
+        "docker --context swarm service update --force koyracloud_order-finder",
+        "docker --context swarm service ps koyracloud_order-finder",
+    ]
+
+
+def test_extract_proposed_commands_caps_and_absent():
+    assert extract_proposed_commands("no footer here") == []
+    many = "PROPOSED_COMMANDS:\n" + "\n".join(f"- echo {i}" for i in range(9))
+    assert len(extract_proposed_commands(many)) == 5
+    long = "PROPOSED_COMMANDS:\n- " + "x" * 900
+    assert extract_proposed_commands(long) == []  # over-long command dropped
+
+
+@pytest.mark.asyncio
+async def test_run_remediation_commands_executes_and_audits():
+    remote = AsyncMock()
+    remote.run_on_host.return_value = {"status": "ok", "exit_code": 0, "stdout": "done", "stderr": ""}
+    pool = AsyncMock()
+    pool.fetchval.return_value = False  # read_only = false
+    act = AlertActivities(db_pool=pool, remote_script=remote)
+    result = await ActivityEnvironment().run(
+        act.run_remediation_commands, ["docker service ls"], host="meem"
+    )
+    assert result["refused"] is None
+    assert result["ran"][0]["exit_code"] == 0
+    remote.run_on_host.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_run_remediation_commands_refuses_read_only_host():
+    remote = AsyncMock()
+    pool = AsyncMock()
+    pool.fetchval.return_value = True  # coding host read_only
+    act = AlertActivities(db_pool=pool, remote_script=remote)
+    result = await act.run_remediation_commands(["docker service ls"], host="")
+    assert result["refused"] == "coding_host_read_only"
+    assert result["ran"] == []
+    remote.run_on_host.assert_not_awaited()

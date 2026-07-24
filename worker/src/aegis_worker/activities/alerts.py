@@ -190,6 +190,41 @@ def build_alert_signature(alert: dict, infra_cluster: str = "") -> str:
     return ""
 
 
+# Caps for the human-approved remediation-command path (Gate 2 "Run fix"):
+# an investigation's PROPOSED_COMMANDS footer is untrusted LLM output, so both
+# the number of commands and each command's length are bounded before they
+# ever reach run_remediation_commands.
+_MAX_REMEDIATION_COMMANDS = 5
+_MAX_REMEDIATION_CMD_CHARS = 500
+
+
+def extract_proposed_commands(text: str) -> list[str]:
+    """Parse the `PROPOSED_COMMANDS:` footer an infra investigation is asked to
+    emit — `- <command>` lines after the marker, until a non-list line. Pure and
+    deterministic (called from workflow code). Over-long commands are dropped,
+    the list is capped."""
+    if not text:
+        return []
+    lines = text.splitlines()
+    try:
+        start = next(i for i, ln in enumerate(lines) if ln.strip() == "PROPOSED_COMMANDS:")
+    except StopIteration:
+        return []
+    out: list[str] = []
+    for ln in lines[start + 1 :]:
+        stripped = ln.strip()
+        if not stripped.startswith("- "):
+            if stripped == "":
+                continue
+            break
+        cmd = stripped[2:].strip()
+        if cmd and len(cmd) <= _MAX_REMEDIATION_CMD_CHARS:
+            out.append(cmd)
+        if len(out) >= _MAX_REMEDIATION_COMMANDS:
+            break
+    return out
+
+
 def _iter_kimi_assistant_text(raw: str):
     """Yield decoded text content from each assistant message in a coding-CLI
     stream-json output (kimi or claude).
@@ -1162,6 +1197,57 @@ class AlertActivities:
         activity.logger.info(
             "remediate_infra_service service=%s recovered=%s", service, recovered
         )
+        return result
+
+    @activity.defn
+    async def run_remediation_commands(self, commands: list[str], host: str = "") -> dict:
+        """Execute HUMAN-APPROVED remediation commands on the coding host via
+        SSH. Only reachable from the Gate-2 'Run fix' approval — never
+        autonomous. Refuses when the coding-host infra row is read_only.
+        Every execution is audit-logged with commands + exit codes."""
+        result: dict = {"ran": [], "refused": None}
+        if not self.remote_script:
+            result["refused"] = "no_remote_script_connector"
+            return result
+        commands = [
+            c.strip()
+            for c in (commands or [])
+            if c.strip() and len(c.strip()) <= _MAX_REMEDIATION_CMD_CHARS
+        ][:_MAX_REMEDIATION_COMMANDS]
+        if not commands:
+            result["refused"] = "no_commands"
+            return result
+        if self.db_pool:
+            read_only = await self.db_pool.fetchval(
+                "SELECT read_only FROM infra WHERE coding->>'enabled' = 'true' LIMIT 1"
+            )
+            if read_only:
+                result["refused"] = "coding_host_read_only"
+                return result
+        for cmd in commands:
+            activity.heartbeat()
+            try:
+                env = await self.remote_script.run_on_host(host, cmd, timeout=120)
+            except Exception as exc:  # noqa: BLE001 — report, don't crash the gate
+                env = {"status": "error", "exit_code": -1, "stdout": "", "stderr": repr(exc)[:300]}
+            entry = {
+                "command": cmd,
+                "exit_code": env.get("exit_code", -1),
+                "stdout": str(env.get("stdout") or "")[:1500],
+                "stderr": str(env.get("stderr") or "")[:1500],
+            }
+            result["ran"].append(entry)
+            if entry["exit_code"] != 0:
+                break  # stop the sequence on first failure — report, don't cascade
+        if self.db_pool:
+            await log_audit(
+                self.db_pool,
+                actor="alert:remediation",
+                action="remediation_executed",
+                target_type="infra",
+                target_id=host or "coding-host",
+                details={"ran": result["ran"]},
+            )
         return result
 
     @activity.defn
