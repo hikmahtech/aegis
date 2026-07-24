@@ -136,10 +136,12 @@ def build_alert_signature(alert: dict, infra_cluster: str = "") -> str:
     `service` + the alert's `alertname` label (or a slugified title), so all
     re-fires of e.g. a Dagster pipeline failure collapse onto one open task.
 
-    Infra/swarm alerts (is_infra_alert) key the signature on
-    `{source}-class:{cluster}:{alertname}` (NOT instance/service) so a
-    NodeDown storm across node-b/node-a/node-d collapses to ONE signature and the
-    dedup gate prevents duplicate investigations.
+    Infra/swarm alerts (is_infra_alert) key the signature on the literal
+    `infra-class:{cluster}:{alertname}` (NOT instance/service, and NOT
+    source-interpolated) so a NodeDown storm across node-b/node-a/node-d
+    collapses to ONE signature and the dedup gate prevents duplicate
+    investigations regardless of which source (alertmanager/prometheus/
+    grafana/aegis-heartbeat) reported it.
     """
     source = (alert.get("source") or "").strip()
     if source == "sentry":
@@ -155,7 +157,7 @@ def build_alert_signature(alert: dict, infra_cluster: str = "") -> str:
             return ""
         return f"sentry-class:{service}:{error_class}"
 
-    if source in {"alertmanager", "prometheus", "grafana"}:
+    if source in {"alertmanager", "prometheus", "grafana", "aegis-heartbeat"}:
         labels = alert.get("labels") or {}
         alertname = ""
         if isinstance(labels, dict):
@@ -163,13 +165,16 @@ def build_alert_signature(alert: dict, infra_cluster: str = "") -> str:
 
         # Infra/swarm storm collapse: key on cluster+alertname, NOT instance/service,
         # so one outage (N nodes down) maps to ONE signature and one open task.
+        # The prefix is a literal ("infra-class"), NOT source-interpolated, so a
+        # heartbeat-detected outage and an Alertmanager-pushed one collapse onto
+        # the same signature instead of spawning duplicate investigations.
         if is_infra_alert(alert, infra_cluster):
             cluster = (labels.get("cluster") or "").strip() if isinstance(labels, dict) else ""
             subkey = alertname.lower()
             if not subkey:
                 title = (alert.get("title") or "").strip()
                 subkey = re.sub(r"[^a-z0-9]+", "-", title.lower()).strip("-")[:40]
-            return f"{source}-class:{cluster or 'infra'}:{subkey}"
+            return f"infra-class:{cluster or 'infra'}:{subkey}"
 
         service = (alert.get("service") or "").strip()
         subkey = alertname.lower()

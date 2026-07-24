@@ -174,7 +174,7 @@ def test_build_alert_signature_infra_cluster_param():
         "labels": {"alertname": "SomeAppAlert", "cluster": "my-swarm", "instance": "node-a"},
     }
     # cluster match only via the explicit param now
-    assert build_alert_signature(alert, infra_cluster="my-swarm").startswith("alertmanager-class:")
+    assert build_alert_signature(alert, infra_cluster="my-swarm").startswith("infra-class:")
     assert build_alert_signature(alert) != build_alert_signature(alert, infra_cluster="my-swarm")
 
 

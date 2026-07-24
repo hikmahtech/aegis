@@ -61,6 +61,21 @@ def test_build_signature_non_dict_payload_returns_empty():
     assert build_alert_signature(alert) == ""
 
 
+def test_infra_signature_is_source_independent():
+    """A NodeDown from alertmanager and from the aegis heartbeat must share one
+    signature, so cross-source dedup collapses them onto one open task."""
+    base = {
+        "title": "Swarm node noon down",
+        "labels": {"alertname": "NodeDown", "cluster": "homelab-swarm"},
+    }
+    am = {**base, "source": "alertmanager"}
+    hb = {**base, "source": "aegis-heartbeat"}
+    sig_am = build_alert_signature(am, "homelab-swarm")
+    sig_hb = build_alert_signature(hb, "homelab-swarm")
+    assert sig_am == sig_hb
+    assert sig_am == "infra-class:homelab-swarm:nodedown"
+
+
 # ---------------------------------------------------------------------------
 # DB-backed activity helpers
 # ---------------------------------------------------------------------------
