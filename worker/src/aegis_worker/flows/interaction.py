@@ -142,12 +142,62 @@ class InteractionFlow:
         if input.timeout_policy == "hold":
             await workflow.wait_condition(lambda: self._resolved)
         else:
-            try:
-                await workflow.wait_condition(
-                    lambda: self._resolved,
-                    timeout=timedelta(seconds=input.timeout_seconds),
+            # Optional escalate-until-ack loop: metadata["escalation"] =
+            # {interval_minutes, mention_id, max_repeats}. With no escalation
+            # metadata (or interval_minutes <= 0), esc_interval_s is 0, so
+            # chunk == remaining on every pass through the loop below — a
+            # single wait_condition call, identical to the pre-escalation
+            # behavior (including the TimeoutError → apply_interaction_timeout
+            # path). This keeps existing callers (Task 7 and others) byte
+            # -identical.
+            esc = (input.metadata or {}).get("escalation") or {}
+            esc_interval_s = int(esc.get("interval_minutes") or 0) * 60
+            esc_max = int(esc.get("max_repeats") or 10)
+            mention = str(esc.get("mention_id") or "").strip()
+            deadline = workflow.now() + timedelta(seconds=input.timeout_seconds)
+            repeats = 0
+            timed_out = False
+            while not self._resolved:
+                remaining = (deadline - workflow.now()).total_seconds()
+                if remaining <= 0:
+                    timed_out = True
+                    break
+                chunk = (
+                    min(esc_interval_s, remaining)
+                    if esc_interval_s > 0 and repeats < esc_max
+                    else remaining
                 )
-            except TimeoutError:
+                try:
+                    await workflow.wait_condition(
+                        lambda: self._resolved, timeout=timedelta(seconds=chunk)
+                    )
+                except TimeoutError:
+                    if esc_interval_s > 0 and repeats < esc_max:
+                        repeats += 1
+                        prefix = f"<@{mention}> " if mention else ""
+                        nag = (
+                            f"{prefix}⏰ Reminder {repeats}/{esc_max} — still waiting on this:"
+                            f"\n\n{input.prompt}"
+                        )
+                        try:
+                            await workflow.execute_activity(
+                                "send_interaction_card",
+                                args=[
+                                    interaction_id,
+                                    input.agent_id,
+                                    input.kind,
+                                    nag,
+                                    input.options,
+                                    input.allow_hint,
+                                ],
+                                retry_policy=_BEST_EFFORT_RETRY,
+                                start_to_close_timeout=_ACT_TIMEOUT,
+                            )
+                        except Exception as exc:  # noqa: BLE001 — nag is best-effort
+                            workflow.logger.warning(
+                                "interaction_escalation_dispatch_failed: %s", str(exc)[:200]
+                            )
+            if timed_out:
                 await workflow.execute_activity(
                     "apply_interaction_timeout",
                     ApplyTimeoutInput(interaction_id=interaction_id, policy=input.timeout_policy),
