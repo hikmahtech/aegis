@@ -179,9 +179,12 @@ def test_build_alert_signature_infra_cluster_param():
 
 
 async def test_get_alert_routing_config_activity():
-    act = AlertActivities(infra_cluster="homelab-swarm")
+    act = AlertActivities(infra_cluster="homelab-swarm", slack_owner_member_id="U042")
     env = ActivityEnvironment()
-    assert await env.run(act.get_alert_routing_config) == {"infra_cluster": "homelab-swarm"}
+    assert await env.run(act.get_alert_routing_config) == {
+        "infra_cluster": "homelab-swarm",
+        "slack_owner_member_id": "U042",
+    }
 
 
 def test_build_signature_non_infra_alertmanager_uses_service():
