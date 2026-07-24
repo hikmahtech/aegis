@@ -59,3 +59,37 @@ async def test_tls_probe_parses_expiry():
     assert env["ok"] is True
     assert env["data"]["serial"] == "0123456789ABCDEF"
     assert env["data"]["not_after"].year == 2026
+
+
+@pytest.mark.asyncio
+async def test_list_nodes_returns_envelope(monkeypatch):
+    conn = HomelabConnector(docker_context="")
+    lines = (
+        '{"Hostname": "baa", "Status": "Ready", "Availability": "Active", "ManagerStatus": "Leader"}\n'
+        '{"Hostname": "noon", "Status": "Down", "Availability": "Active", "ManagerStatus": ""}\n'
+    )
+
+    async def fake_docker(*args, timeout=30):
+        assert args == ("node", "ls", "--format", "{{json .}}")
+        return (0, lines, "")
+
+    monkeypatch.setattr(conn, "_docker", fake_docker)
+    env = await conn.list_nodes()
+    assert env["ok"] is True
+    assert env["data"] == [
+        {"hostname": "baa", "status": "Ready", "availability": "Active", "manager": "Leader"},
+        {"hostname": "noon", "status": "Down", "availability": "Active", "manager": ""},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_list_nodes_failure_retryable(monkeypatch):
+    conn = HomelabConnector(docker_context="")
+
+    async def fake_docker(*args, timeout=30):
+        return (1, "", "cannot connect")
+
+    monkeypatch.setattr(conn, "_docker", fake_docker)
+    env = await conn.list_nodes()
+    assert env["ok"] is False
+    assert env["retryable"] is True
