@@ -1,19 +1,15 @@
-"""AlertInvestigationFlow escalation — heads-up ping, Gate-2 escalation
-metadata, and the self-resolve-during-gate race.
+"""AlertInvestigationFlow Gate-2 "Run fix" — approve-to-run infra remediation.
 
-Escalating infra alerts (NodeDown / HeartbeatCollectFailed — Task 4 sets
-``alert["escalate"] = True``) get:
-  1. an immediate heads-up chat ping at flow start,
-  2. a Gate-2 decision card spawned with escalation metadata
-     (interval_minutes / mention_id / max_repeats) so InteractionFlow nags
-     the owner until they ack, and
-  3. that gate raced against ``check_alert_resolved`` every 3 min — if the
-     underlying alert self-resolves while awaiting the human, the flow signals
-     the card closed and returns ``self_resolved_during_gate``.
+When an infra investigation's transcript ends in a `PROPOSED_COMMANDS:` footer
+(Task 8's `extract_proposed_commands`), the Gate-2 decision card offers a
+`run_fix` option alongside mute/ack. Approving it runs the proposed commands
+via `AlertActivities.run_remediation_commands`, posts the outcome to the
+track-task + chat, waits 180s, and re-checks alert resolution.
 
-Harness copied from test_alert_investigation_gates.py, retargeted to the
-escalating infra-alert path (Gate-0 skipped; resolve_infra_resource /
-remediate_infra_service instead of resolve_alert_resource).
+Harness copied from test_alert_escalation.py (same stubs, same escalating
+infra alert — Gate-0 is skipped for infra alerts so Gate-2's insert_interaction
+is the first/only one), with the run_investigation stub's output carrying a
+PROPOSED_COMMANDS footer and a `run_remediation_commands` stub added.
 """
 
 from __future__ import annotations
@@ -65,9 +61,9 @@ def _reset(**overrides):
             "muted": False,
             "check_dedup_result": {"is_duplicate": False},
             "delay_result": {"delay_seconds": 0, "reason": "test"},
-            "resolved_check_result": {"resolved": False},
-            # Infra-resource shape (resolve_infra_resource path). source=infra so
-            # is_infra_alert-driven Gate-0 skip + infra investigation apply.
+            # Post-fix verification succeeds — the run_fix branch's
+            # check_alert_resolved(fingerprint, 5) call after the 180s wait.
+            "resolved_check_result": {"resolved": True},
             "resource_result": {
                 "resource_id": "res-homelab",
                 "resource_title": "Homelab GitOps",
@@ -89,10 +85,15 @@ def _reset(**overrides):
             "knowledge_result": "",
             "run_investigation_result": {
                 "status": "succeeded",
-                "output": "Root cause: noon NIC flapped",
+                "output": (
+                    "Root cause: noon NIC flapped\n"
+                    "PROPOSED_COMMANDS:\n"
+                    "- docker --context swarm service update --force svc_a\n"
+                ),
                 "session_id": "sess-1",
-                "branch": "aegis-fix/test",
-                "branches": {"homelab-gitops": "aegis-fix/test"},
+                "branch": "",
+                "branches": {},
+                "host": "meem",
             },
             "investigate_result": {
                 "investigation": "LLM-only narrative",
@@ -161,7 +162,7 @@ async def stub_capture_to_inbox(
     project: str, external_id: str, title: str, description: str, labels: list[str]
 ) -> str:
     _calls.setdefault("capture", []).append(external_id)
-    return "task-esc-1"
+    return "task-runfix-1"
 
 
 @activity.defn(name="get_verification_delay")
@@ -173,8 +174,6 @@ async def stub_get_verification_delay(alert: dict) -> dict:
 @activity.defn(name="check_alert_resolved")
 async def stub_check_alert_resolved(fingerprint: str, window_minutes: int) -> dict:
     _calls.setdefault("resolved_checks", []).append((fingerprint, window_minutes))
-    if _state.get("resolved_check_raises"):
-        raise RuntimeError("boom: resolved-check upstream failure")
     return _state["resolved_check_result"]
 
 
@@ -269,13 +268,29 @@ async def stub_accumulate_digest(item: dict) -> None:
     pass
 
 
+@activity.defn(name="run_remediation_commands")
+async def stub_run_remediation_commands(commands: list[str], host: str = "") -> dict:
+    _calls.setdefault("run_remediation_args", []).append((commands, host))
+    return {
+        "ran": [
+            {
+                "command": "docker --context swarm service update --force svc_a",
+                "exit_code": 0,
+                "stdout": "ok",
+                "stderr": "",
+            }
+        ],
+        "refused": None,
+    }
+
+
 # --- InteractionFlow activities ---
 
 
 @activity.defn(name="insert_interaction")
 async def stub_insert_interaction(inp: InsertInteractionInput) -> InsertInteractionResult:
     _calls.setdefault("insert_inputs", []).append(inp)
-    return InsertInteractionResult(interaction_id="ia-gate2-test")
+    return InsertInteractionResult(interaction_id="ia-runfix-test")
 
 
 @activity.defn(name="send_interaction_card")
@@ -329,6 +344,7 @@ ALL_STUBS = [
     stub_send_message,
     stub_send_voice,
     stub_accumulate_digest,
+    stub_run_remediation_commands,
     stub_insert_interaction,
     stub_send_card,
     stub_resolve,
@@ -349,134 +365,67 @@ async def _wait_for_gate2(poll) -> None:
     raise AssertionError("Gate 2 child never started")
 
 
-# ---------------------------------------------------------------------------
-# Test 1: heads-up ping + Gate-2 escalation metadata
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_escalating_alert_sends_heads_up_and_escalation_metadata():
-    """Escalating NodeDown alert fires an immediate heads-up chat ping and
-    spawns Gate 2 carrying escalation metadata (3-min interval, owner mention
-    from routing.slack_owner_member_id)."""
-    _reset()
-
+async def _run_to_gate2_and_signal(response: dict, wf_id: str) -> dict:
     async with (
-        await WorkflowEnvironment.start_local() as env,
+        await WorkflowEnvironment.start_time_skipping() as env,
         Worker(
             env.client,
-            task_queue="tq-esc",
+            task_queue="tq-runfix",
             workflows=[AlertInvestigationFlow, InteractionFlow],
             activities=ALL_STUBS,
         ),
     ):
-        wf_id = "esc-metadata-test"
         handle = await env.client.start_workflow(
             AlertInvestigationFlow.run,
             _esc_alert(),
             id=wf_id,
-            task_queue="tq-esc",
+            task_queue="tq-runfix",
         )
 
-        await _wait_for_gate2(lambda: asyncio.sleep(0.05))
+        await _wait_for_gate2(lambda: env.sleep(1))
 
         gate2_id = f"gate2-{_SAFE_FINGERPRINT}-{wf_id}"
         gate2_handle = env.client.get_workflow_handle(gate2_id)
-        await gate2_handle.signal(InteractionFlow.submit_response, {"value": "ack"})
+        await gate2_handle.signal(InteractionFlow.submit_response, response)
 
-        result = await asyncio.wait_for(handle.result(), timeout=15.0)
+        return await asyncio.wait_for(handle.result(), timeout=30.0)
 
-    assert result["status"] != "gate2_discarded"
-    # Heads-up ping fired at start (before the Gate-2 verdict ping).
-    assert any("noon" in m for m in _calls["messages"]), (
-        f"heads-up ping never fired: {_calls.get('messages')}"
+
+# ---------------------------------------------------------------------------
+# Test 1: run_fix executes proposed commands and reports the outcome
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_infra_gate2_run_fix_executes_and_reports():
+    _reset()
+
+    result = await _run_to_gate2_and_signal(
+        {"value": "run_fix"}, "runfix-executes-test"
     )
+
+    assert _calls["run_remediation_args"][0][0] == [
+        "docker --context swarm service update --force svc_a"
+    ]
+    assert _calls["run_remediation_args"][0][1] == "meem"
+    assert result["status"] == "remediated"
     gate_insert = _calls["insert_inputs"][-1]
-    assert gate_insert.metadata["escalation"]["interval_minutes"] == 3
-    assert gate_insert.metadata["escalation"]["mention_id"] == "U042"
-    assert gate_insert.metadata["escalation"]["max_repeats"] == 10
+    assert "service update --force svc_a" in gate_insert.prompt
+    assert "run_fix" in gate_insert.options
 
 
 # ---------------------------------------------------------------------------
-# Test 2: self-resolve race closes the gate
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_gate2_self_resolve_race_closes_gate():
-    """While the escalating Gate-2 card awaits a human, the alert self-resolves.
-    The flow's 3-min race detects it via check_alert_resolved, signals the card
-    closed, and returns self_resolved_during_gate — no human answer needed."""
-    _reset(resolved_check_result={"resolved": False})
-
-    async with (
-        await WorkflowEnvironment.start_time_skipping() as env,
-        Worker(
-            env.client,
-            task_queue="tq-esc",
-            workflows=[AlertInvestigationFlow, InteractionFlow],
-            activities=ALL_STUBS,
-        ),
-    ):
-        handle = await env.client.start_workflow(
-            AlertInvestigationFlow.run,
-            _esc_alert(),
-            id="esc-self-resolve-test",
-            task_queue="tq-esc",
-        )
-
-        # Let the flow reach Gate 2 (verification delay is 0 → fast).
-        await _wait_for_gate2(lambda: env.sleep(1))
-
-        # The alert recovers while we await the human decision.
-        _state["resolved_check_result"] = {"resolved": True}
-        await env.sleep(200)  # cross one 180s race tick
-
-        result = await handle.result()
-
-    assert result["status"] == "self_resolved_during_gate"
-
-
-# ---------------------------------------------------------------------------
-# Test 3: a raising recheck must not kill the pending gate
+# Test 2: a free-text note on the gate overrides the proposed commands
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_gate2_recheck_exception_does_not_kill_gate():
-    """A raising check_alert_resolved recheck (e.g. the activity exhausted its
-    retries against a transient DB/API failure) must be treated as "not
-    resolved yet" and the race loop keeps waiting — never propagate and kill
-    the pending gate."""
-    _reset(resolved_check_raises=True)
+async def test_infra_gate2_note_overrides_commands():
+    _reset()
 
-    async with (
-        await WorkflowEnvironment.start_time_skipping() as env,
-        Worker(
-            env.client,
-            task_queue="tq-esc",
-            workflows=[AlertInvestigationFlow, InteractionFlow],
-            activities=ALL_STUBS,
-        ),
-    ):
-        handle = await env.client.start_workflow(
-            AlertInvestigationFlow.run,
-            _esc_alert(),
-            id="esc-recheck-exception-test",
-            task_queue="tq-esc",
-        )
+    result = await _run_to_gate2_and_signal(
+        {"value": "run_fix", "note": "docker node ls"}, "runfix-note-override-test"
+    )
 
-        await _wait_for_gate2(lambda: env.sleep(1))
-
-        # Cross one 180s race tick while every recheck raises — the gate must
-        # still be alive (not killed by a propagated exception) afterwards.
-        await env.sleep(200)
-
-        gate2_id = f"gate2-{_SAFE_FINGERPRINT}-esc-recheck-exception-test"
-        gate2_handle = env.client.get_workflow_handle(gate2_id)
-        await gate2_handle.signal(InteractionFlow.submit_response, {"value": "ack"})
-
-        result = await asyncio.wait_for(handle.result(), timeout=15.0)
-
-    assert result["status"] != "gate2_discarded"
-    assert _calls["resolved_checks"], "recheck must have been attempted at least once"
+    assert _calls["run_remediation_args"][0][0] == ["docker node ls"]
+    assert result["status"] == "remediated"

@@ -471,6 +471,7 @@ async def main():
         alert_act.check_alert_resolved,
         alert_act.get_verification_delay,
         alert_act.run_investigation,
+        alert_act.run_remediation_commands,
         alert_act.assess_investigation,
         alert_act.accumulate_digest_item,
         alert_act.build_alert_digest,

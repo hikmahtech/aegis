@@ -186,6 +186,14 @@ async def test_run_remediation_commands_executes_and_audits():
     assert result["refused"] is None
     assert result["ran"][0]["exit_code"] == 0
     remote.run_on_host.assert_awaited_once()
+    # log_audit(pool, *, actor, action, target_type, target_id, details) issues
+    # pool.execute("INSERT INTO audit_log ...", actor, action, target_type,
+    # target_id, details) — assert the audit write actually happened and is
+    # tagged with the remediation action (core/src/aegis/observability.py).
+    pool.execute.assert_awaited_once()
+    audit_args = pool.execute.await_args.args
+    assert "remediation_executed" in audit_args
+    assert audit_args[-1] == {"ran": result["ran"]}
 
 
 @pytest.mark.asyncio

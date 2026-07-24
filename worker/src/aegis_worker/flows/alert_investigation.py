@@ -53,6 +53,7 @@ with workflow.unsafe.imports_passed_through():
     from aegis_worker.activities.alerts import (
         AlertActivities,
         build_alert_signature,
+        extract_proposed_commands,
         is_infra_alert,
     )
     from aegis_worker.activities.capture import CaptureActivities
@@ -1113,6 +1114,15 @@ class AlertInvestigationFlow:
         # info ping. No action gate for them.
         branches = inv_result.get("branches") or {}
         gate_skipped = is_jira or verdict_status == "resolved"
+        # Human-approved remediation: an infra investigation asked to end its
+        # transcript in a PROPOSED_COMMANDS: footer (Step 5.5's hint) may have
+        # produced one. Parsed here (deterministic, workflow-safe) so both the
+        # prompt and the options below can react to it. Never populated for
+        # app-code alerts — running arbitrary commands only makes sense on the
+        # infra-gitops host.
+        proposed_cmds: list[str] = (
+            extract_proposed_commands(investigation_output) if _is_infra else []
+        )
         if not gate_skipped:
             # assess_investigation returns {status, root_cause, suggested_fix,
             # confidence}. The earlier `summary`/`severity`/`title` fallback
@@ -1146,10 +1156,17 @@ class AlertInvestigationFlow:
                     prompt += f"\n\nRoot cause: {_html_escape(verdict_summary)}"
                 if suggested_fix:
                     prompt += f"\nSuggested: {_html_escape(suggested_fix)}"
+                if proposed_cmds:
+                    cmd_lines = "\n".join(
+                        f"  <code>{_html_escape(c)}</code>" for c in proposed_cmds
+                    )
+                    prompt += f"\n\nProposed fix commands:\n{cmd_lines}"
 
             options: dict[str, str] = {}
             if branches:
                 options["open_all_prs"] = f"📝 Open {len(branches)} PR(s)"
+            if proposed_cmds:
+                options["run_fix"] = "🔧 Run fix"
             options["mute_24h"] = "🔕 Mute 24h"
             options["ack"] = "✅ Acknowledge"
             if branches:
@@ -1203,16 +1220,35 @@ class AlertInvestigationFlow:
                     # workflow.wait is the deterministic, replay-safe equivalent
                     # of asyncio.wait (same (done, pending) return; no raise on
                     # timeout). The 180s timeout becomes a workflow timer.
-                    done, _ = await workflow.wait({gate_task}, timeout=180)
+                    # return_when is explicit (default is the same
+                    # ALL_COMPLETED-vs-FIRST_COMPLETED distinction, moot for a
+                    # single-future set, but the intent — stop waiting as soon
+                    # as EITHER the gate resolves or the timer fires — should
+                    # not depend on reading workflow.wait's default).
+                    done, _ = await workflow.wait(
+                        {gate_task}, timeout=180, return_when=asyncio.FIRST_COMPLETED
+                    )
                     if gate_task in done:
                         g2 = gate_task.result()
                         break
-                    recheck = await workflow.execute_activity_method(
-                        AlertActivities.check_alert_resolved,
-                        args=[fingerprint, 10],
-                        start_to_close_timeout=TIMEOUT_FAST,
-                        retry_policy=FAST,
-                    )
+                    # A raising recheck (activity exhausted its retries) must
+                    # never propagate and kill the pending gate — treat it the
+                    # same as "not resolved yet" and keep waiting for the next
+                    # tick or the human's decision.
+                    try:
+                        recheck = await workflow.execute_activity_method(
+                            AlertActivities.check_alert_resolved,
+                            args=[fingerprint, 10],
+                            start_to_close_timeout=TIMEOUT_FAST,
+                            retry_policy=FAST,
+                        )
+                    except Exception as exc:
+                        workflow.logger.warning(
+                            "alert_gate2_recheck_failed_keep_waiting fingerprint=%s err=%s",
+                            fingerprint,
+                            str(exc)[:200],
+                        )
+                        continue
                     if recheck.get("resolved"):
                         await handle.signal(
                             InteractionFlow.submit_response,
@@ -1261,6 +1297,75 @@ class AlertInvestigationFlow:
                     "status": "self_resolved_during_gate",
                     "task_id": None,
                     "todoist_task_id": track_task_id,
+                }
+            if v2 == "run_fix" and proposed_cmds:
+                # A free-text note on the card overrides the parsed commands
+                # (one command per line) — lets the operator correct/replace
+                # what the LLM proposed without re-running the investigation.
+                # No line here re-checks length/count: run_remediation_commands
+                # applies the same caps (_MAX_REMEDIATION_COMMANDS /
+                # _MAX_REMEDIATION_CMD_CHARS) to whatever it's handed, note or
+                # not, so the human-typed override can't bypass them either.
+                note = ((g2.response or {}).get("note") or "").strip()
+                cmds = (
+                    [ln.strip() for ln in note.splitlines() if ln.strip()]
+                    if note
+                    else proposed_cmds
+                )
+                exec_result = await workflow.execute_activity_method(
+                    AlertActivities.run_remediation_commands,
+                    args=[cmds, inv_result.get("host", "")],
+                    start_to_close_timeout=TIMEOUT_LONG,
+                    heartbeat_timeout=TIMEOUT_STANDARD,
+                    retry_policy=NO_RETRY,
+                )
+                if exec_result.get("refused"):
+                    outcome_note = f"🚫 Remediation refused: {exec_result['refused']}"
+                else:
+                    ran = exec_result.get("ran") or []
+                    ok = all(r.get("exit_code") == 0 for r in ran)
+                    detail = "\n".join(
+                        f"$ {r['command']}\n  exit={r['exit_code']} {(r['stdout'] or r['stderr'])[:300]}"
+                        for r in ran
+                    )
+                    outcome_note = f"{'✅' if ok else '⚠️'} Ran {len(ran)} command(s):\n{detail}"
+                await self._safe_post_note(track_task_id or "", outcome_note)
+                await self._safe_send_message(
+                    agent_id=agent_id,
+                    message=f"<b>Remediation result</b> — {_html_escape(title)}\n"
+                    f"<pre>{_html_escape(outcome_note[:1500])}</pre>",
+                    log_event="alert_remediation_notify_failed",
+                )
+                if not exec_result.get("refused"):
+                    await workflow.sleep(timedelta(seconds=180))
+                    post_check = await workflow.execute_activity_method(
+                        AlertActivities.check_alert_resolved,
+                        args=[fingerprint, 5],
+                        start_to_close_timeout=TIMEOUT_FAST,
+                        retry_policy=FAST,
+                    )
+                    verdict_note = (
+                        "✅ Verified: alert resolved after remediation."
+                        if post_check.get("resolved")
+                        else "⚠️ Alert not yet showing resolved — the next heartbeat tick "
+                        "confirms recovery; investigate further if it re-fires."
+                    )
+                    await self._safe_post_note(track_task_id or "", verdict_note)
+                try:
+                    await workflow.execute_activity_method(
+                        AlertActivities.log_alert,
+                        args=[alert],
+                        start_to_close_timeout=TIMEOUT_FAST,
+                        retry_policy=NO_RETRY,
+                    )
+                except Exception:
+                    pass
+                return {
+                    "status": "remediated",
+                    "task_id": None,
+                    "todoist_task_id": track_task_id,
+                    "commands_ran": len(exec_result.get("ran") or []),
+                    "refused": exec_result.get("refused"),
                 }
             if v2 == "discard":
                 await self._safe_post_note(
