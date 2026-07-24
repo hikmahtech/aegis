@@ -72,3 +72,16 @@ async def test_record_heartbeat_resolved_writes_alert_received_resolved_row():
 async def test_ping_deadman_noop_without_url():
     result = await _act().ping_deadman()
     assert result == {"pinged": False}
+
+
+@pytest.mark.asyncio
+async def test_read_heartbeat_state_returns_fresh_containers_each_call():
+    pool = AsyncMock()
+    pool.fetchrow.return_value = None
+    act = _act(db_pool=pool)
+    first = await act.read_heartbeat_state()
+    first["stuck"].append("phantom_service")
+    first["nodes"]["ghost"] = "Down"
+    second = await act.read_heartbeat_state()
+    assert second["stuck"] == []
+    assert second["nodes"] == {}

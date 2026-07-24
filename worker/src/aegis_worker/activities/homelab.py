@@ -489,7 +489,10 @@ class HomelabActivities:
     # ------------------------------------------------------------------
 
     _HEARTBEAT_STATE_KEY = "infra_heartbeat_state"
-    _HEARTBEAT_STATE_DEFAULT = {"nodes": {}, "stuck": [], "confirmed": [], "fail_count": 0}
+
+    @staticmethod
+    def _default_heartbeat_state() -> dict:
+        return {"nodes": {}, "stuck": [], "confirmed": [], "fail_count": 0}
 
     @activity.defn
     async def collect_infra_state(self) -> dict:
@@ -514,16 +517,14 @@ class HomelabActivities:
     @activity.defn
     async def read_heartbeat_state(self) -> dict:
         if not self.db_pool:
-            return dict(self._HEARTBEAT_STATE_DEFAULT)
+            return self._default_heartbeat_state()
         row = await self.db_pool.fetchrow(
             "SELECT value FROM settings WHERE key = $1", self._HEARTBEAT_STATE_KEY
         )
         if not row or not row["value"]:
-            return dict(self._HEARTBEAT_STATE_DEFAULT)
+            return self._default_heartbeat_state()
         value = row["value"]
-        return {**self._HEARTBEAT_STATE_DEFAULT, **value} if isinstance(value, dict) else dict(
-            self._HEARTBEAT_STATE_DEFAULT
-        )
+        return {**self._default_heartbeat_state(), **value} if isinstance(value, dict) else self._default_heartbeat_state()
 
     @activity.defn
     async def write_heartbeat_state(self, state: dict) -> None:
