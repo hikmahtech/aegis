@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import re
 import time
@@ -93,6 +94,11 @@ _REMEDIABLE_ALERTNAMES = frozenset({"dockerservicedown", "servicedownprolonged"}
 # Recovery poll budget after the restart: 6 × 5s = 30s of convergence wait.
 _REMEDIATE_POLLS = 6
 _REMEDIATE_POLL_INTERVAL_S = 5
+# Interval for the background heartbeater during run_remediation_commands: a
+# `docker service update --force` routinely runs >60s, so heartbeats must keep
+# flowing while commands execute or the activity's heartbeat timeout kills it
+# mid-sequence (and the audit row is lost).
+_REMEDIATION_HEARTBEAT_INTERVAL_S = 15
 
 # Matches "owner/repo" shaped hints (e.g. "acme/brand-new-repo").
 _HINT_REPO_RE = re.compile(r"^[\w.-]+/[\w.-]+$")
@@ -175,6 +181,19 @@ def build_alert_signature(alert: dict, infra_cluster: str = "") -> str:
             if not subkey:
                 title = (alert.get("title") or "").strip()
                 subkey = re.sub(r"[^a-z0-9]+", "-", title.lower()).strip("-")[:40]
+            # Remediable per-service classes (DockerServiceDown / ...) must NOT
+            # collapse across services: two stuck services need separate
+            # signatures → separate @pandora tasks → each gets its own
+            # auto-remediation. Extend the subkey with the service when present.
+            if subkey in _REMEDIABLE_ALERTNAMES:
+                svc = (
+                    labels.get("service_name")
+                    or labels.get("service")
+                    or alert.get("service")
+                    or ""
+                ).strip()
+                if svc:
+                    subkey = f"{subkey}:{svc}"
             return f"infra-class:{cluster or 'infra'}:{subkey}"
 
         service = (alert.get("service") or "").strip()
@@ -823,14 +842,32 @@ class AlertActivities:
 
     @activity.defn
     async def check_dedup(self, fingerprint: str, window_hours: int = 24) -> dict:
-        """Check if this alert was recently investigated (dedup)."""
+        """Resolved-aware dedup: a duplicate ONLY if investigated within the
+        window AND not recovered since.
+
+        Heartbeat fingerprints are deterministic, so a 03:00 flap that
+        self-resolves leaves an `alert_investigated` row that — with plain
+        window dedup — would suppress a genuine 09:00 outage of the same class
+        for 24h (no card, no escalation). A recovery row (`alert_received` with
+        details.resolved='true') created AFTER the latest investigation is
+        evidence of a NEW incident, so we only report a duplicate when the most
+        recent in-window investigation has NO resolved row after it.
+        """
         if not self.db_pool or not fingerprint:
             return {"is_duplicate": False}
 
         row = await self.db_pool.fetchrow(
-            "SELECT id FROM audit_log WHERE target_type = 'alert' AND target_id = $1 "
-            "AND action = 'alert_investigated' "
-            "AND created_at > NOW() - INTERVAL '1 hour' * $2 LIMIT 1",
+            "SELECT ai.created_at FROM audit_log ai "
+            "WHERE ai.target_type = 'alert' AND ai.target_id = $1 "
+            "AND ai.action = 'alert_investigated' "
+            "AND ai.created_at > NOW() - INTERVAL '1 hour' * $2 "
+            "AND NOT EXISTS ("
+            "  SELECT 1 FROM audit_log ar "
+            "  WHERE ar.target_type = 'alert' AND ar.target_id = $1 "
+            "  AND ar.action = 'alert_received' AND ar.details->>'resolved' = 'true' "
+            "  AND ar.created_at > ai.created_at"
+            ") "
+            "ORDER BY ai.created_at DESC LIMIT 1",
             fingerprint,
             window_hours,
         )
@@ -1204,7 +1241,13 @@ class AlertActivities:
         """Execute HUMAN-APPROVED remediation commands on the coding host via
         SSH. Only reachable from the Gate-2 'Run fix' approval — never
         autonomous. Refuses when the coding-host infra row is read_only.
-        Every execution is audit-logged with commands + exit codes."""
+
+        Writes a `remediation_started` audit row BEFORE executing (so the
+        approval leaves a trail even if the activity is later killed), then a
+        `remediation_executed` row with results after. A background heartbeater
+        keeps `activity.heartbeat()` flowing while commands run so a long
+        `docker service update --force` (routinely >60s) never trips the
+        activity's heartbeat timeout mid-sequence."""
         result: dict = {"ran": [], "refused": None}
         if not self.remote_script:
             result["refused"] = "no_remote_script_connector"
@@ -1224,21 +1267,47 @@ class AlertActivities:
             if read_only:
                 result["refused"] = "coding_host_read_only"
                 return result
-        for cmd in commands:
-            activity.heartbeat()
-            try:
-                env = await self.remote_script.run_on_host(host, cmd, timeout=120)
-            except Exception as exc:  # noqa: BLE001 — report, don't crash the gate
-                env = {"status": "error", "exit_code": -1, "stdout": "", "stderr": repr(exc)[:300]}
-            entry = {
-                "command": cmd,
-                "exit_code": env.get("exit_code", -1),
-                "stdout": str(env.get("stdout") or "")[:1500],
-                "stderr": str(env.get("stderr") or "")[:1500],
-            }
-            result["ran"].append(entry)
-            if entry["exit_code"] != 0:
-                break  # stop the sequence on first failure — report, don't cascade
+            # Audit the approved run BEFORE execution — a killed/timed-out
+            # activity still leaves a record of what was approved and started.
+            await log_audit(
+                self.db_pool,
+                actor="alert:remediation",
+                action="remediation_started",
+                target_type="infra",
+                target_id=host or "coding-host",
+                details={"commands": commands, "host": host or "coding-host"},
+            )
+
+        async def _heartbeater() -> None:
+            while True:
+                activity.heartbeat()
+                await asyncio.sleep(_REMEDIATION_HEARTBEAT_INTERVAL_S)
+
+        hb = asyncio.create_task(_heartbeater())
+        try:
+            for cmd in commands:
+                try:
+                    env = await self.remote_script.run_on_host(host, cmd, timeout=120)
+                except Exception as exc:  # noqa: BLE001 — report, don't crash the gate
+                    env = {
+                        "status": "error",
+                        "exit_code": -1,
+                        "stdout": "",
+                        "stderr": repr(exc)[:300],
+                    }
+                entry = {
+                    "command": cmd,
+                    "exit_code": env.get("exit_code", -1),
+                    "stdout": str(env.get("stdout") or "")[:1500],
+                    "stderr": str(env.get("stderr") or "")[:1500],
+                }
+                result["ran"].append(entry)
+                if entry["exit_code"] != 0:
+                    break  # stop the sequence on first failure — report, don't cascade
+        finally:
+            hb.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await hb
         if self.db_pool:
             await log_audit(
                 self.db_pool,
@@ -1708,18 +1777,36 @@ class AlertActivities:
             return empty
 
     @activity.defn
-    async def check_alert_resolved(self, fingerprint: str, window_minutes: int = 10) -> dict:
-        """Check if a matching resolve event arrived within the time window."""
+    async def check_alert_resolved(
+        self, fingerprint: str, window_minutes: int = 10, since_iso: str = ""
+    ) -> dict:
+        """Check if a matching resolve event arrived.
+
+        With `since_iso` (an ISO-8601 timestamp) set, only recoveries created
+        strictly after that instant count — callers pass the flow's own start
+        time so a PREVIOUS flap's resolved row can't instantly (and wrongly)
+        close this run's gate. Empty `since_iso` keeps the legacy rolling
+        `window_minutes` behaviour for other callers (backward compat).
+        """
         if not self.db_pool or not fingerprint:
             return {"resolved": False}
 
-        row = await self.db_pool.fetchrow(
-            "SELECT id FROM audit_log WHERE target_type = 'alert' AND target_id = $1 "
-            "AND action = 'alert_received' AND details->>'resolved' = 'true' "
-            "AND created_at > NOW() - INTERVAL '1 minute' * $2 LIMIT 1",
-            fingerprint,
-            window_minutes,
-        )
+        if since_iso:
+            row = await self.db_pool.fetchrow(
+                "SELECT id FROM audit_log WHERE target_type = 'alert' AND target_id = $1 "
+                "AND action = 'alert_received' AND details->>'resolved' = 'true' "
+                "AND created_at > $2::timestamptz LIMIT 1",
+                fingerprint,
+                since_iso,
+            )
+        else:
+            row = await self.db_pool.fetchrow(
+                "SELECT id FROM audit_log WHERE target_type = 'alert' AND target_id = $1 "
+                "AND action = 'alert_received' AND details->>'resolved' = 'true' "
+                "AND created_at > NOW() - INTERVAL '1 minute' * $2 LIMIT 1",
+                fingerprint,
+                window_minutes,
+            )
         return {"resolved": row is not None}
 
     @activity.defn

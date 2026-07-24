@@ -78,9 +78,16 @@ class InfraHeartbeatConfig:
 class InfraHeartbeatFlow:
     async def _spawn(self, alert: dict) -> bool:
         """ABANDONED child; an already-running same-id child is benign."""
+        # Deterministic per-transition stamp (workflow.now() is deterministic
+        # inside a workflow) so a LATER transition of the same node/service
+        # never collides with a completed/running earlier child — that
+        # collision is what let a genuine re-fire get silently dropped as an
+        # already-started duplicate. Fingerprints stay deterministic (recovery
+        # audit rows must still match), only the child workflow id is unique.
+        stamp = workflow.now().strftime("%Y%m%d%H%M%S")
         child_id = (
             f"aegis-heartbeat-{_safe_id_segment(alert['labels']['alertname'].lower())}-"
-            f"{_safe_id_segment(alert['fingerprint'].rsplit(':', 1)[-1])}"
+            f"{_safe_id_segment(alert['fingerprint'].rsplit(':', 1)[-1])}-{stamp}"
         )
         try:
             await workflow.start_child_workflow(

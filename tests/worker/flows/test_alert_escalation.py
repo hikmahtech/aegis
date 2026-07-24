@@ -171,8 +171,10 @@ async def stub_get_verification_delay(alert: dict) -> dict:
 
 
 @activity.defn(name="check_alert_resolved")
-async def stub_check_alert_resolved(fingerprint: str, window_minutes: int) -> dict:
-    _calls.setdefault("resolved_checks", []).append((fingerprint, window_minutes))
+async def stub_check_alert_resolved(
+    fingerprint: str, window_minutes: int, since_iso: str = ""
+) -> dict:
+    _calls.setdefault("resolved_checks", []).append((fingerprint, window_minutes, since_iso))
     if _state.get("resolved_check_raises"):
         raise RuntimeError("boom: resolved-check upstream failure")
     return _state["resolved_check_result"]
@@ -480,3 +482,49 @@ async def test_gate2_recheck_exception_does_not_kill_gate():
 
     assert result["status"] != "gate2_discarded"
     assert _calls["resolved_checks"], "recheck must have been attempted at least once"
+
+
+# ---------------------------------------------------------------------------
+# Test 4: escalating alert on a signature-dedup hit attaches and CONTINUES
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_escalating_signature_dedup_hit_continues_to_gate2():
+    """An escalating alert whose signature already owns an open task must NOT
+    early-exit as skipped_signature_dedup (the pre-fix behaviour that silently
+    suppressed a real re-outage). It attaches to the existing task, skips the
+    capture-new-task step, and CONTINUES the pipeline to the Gate-2 card."""
+    _reset(open_task_for_signature="task-existing-1")
+
+    async with (
+        await WorkflowEnvironment.start_time_skipping() as env,
+        Worker(
+            env.client,
+            task_queue="tq-esc",
+            workflows=[AlertInvestigationFlow, InteractionFlow],
+            activities=ALL_STUBS,
+        ),
+    ):
+        handle = await env.client.start_workflow(
+            AlertInvestigationFlow.run,
+            _esc_alert(),
+            id="esc-sigdedup-continue-test",
+            task_queue="tq-esc",
+        )
+
+        await _wait_for_gate2(lambda: env.sleep(1))
+
+        gate2_id = f"gate2-{_SAFE_FINGERPRINT}-esc-sigdedup-continue-test"
+        gate2_handle = env.client.get_workflow_handle(gate2_id)
+        await gate2_handle.signal(InteractionFlow.submit_response, {"value": "ack"})
+
+        result = await asyncio.wait_for(handle.result(), timeout=15.0)
+
+    # Did NOT early-exit; reached Gate-2 and attached to the existing task.
+    assert result["status"] != "skipped_signature_dedup"
+    assert result.get("todoist_task_id") == "task-existing-1"
+    # No new capture task was created — it attached to the existing one.
+    assert _calls.get("capture") is None
+    # The Gate-2 decision card was actually presented.
+    assert _calls.get("insert_inputs")

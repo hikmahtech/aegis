@@ -172,8 +172,10 @@ async def stub_get_verification_delay(alert: dict) -> dict:
 
 
 @activity.defn(name="check_alert_resolved")
-async def stub_check_alert_resolved(fingerprint: str, window_minutes: int) -> dict:
-    _calls.setdefault("resolved_checks", []).append((fingerprint, window_minutes))
+async def stub_check_alert_resolved(
+    fingerprint: str, window_minutes: int, since_iso: str = ""
+) -> dict:
+    _calls.setdefault("resolved_checks", []).append((fingerprint, window_minutes, since_iso))
     return _state["resolved_check_result"]
 
 

@@ -229,6 +229,39 @@ async def alert_client_real_db(db_pool, settings, temporal_stub):
         await conn.execute("DELETE FROM ingest_idempotency WHERE source_type = 'alertmanager'")
 
 
+async def test_resolved_alert_writes_resolved_audit_row(alert_client_real_db, db_pool):
+    """A `status=resolved` alertmanager payload is skipped for investigation but
+    now writes an `alert_received`/resolved=true audit row so check_alert_resolved
+    (self-resolve) works for alertmanager alerts, not just heartbeat ones."""
+    client, temporal = alert_client_real_db
+    fp = "am-resolved-audit-1"
+    async with db_pool.acquire() as conn:
+        await conn.execute("DELETE FROM audit_log WHERE target_id = $1", fp)
+
+    payload = json.dumps(
+        {"alerts": [{"status": "resolved", "labels": {"alertname": "HighCPU"}, "fingerprint": fp}]}
+    ).encode()
+    resp = await client.post("/api/webhooks/alert", content=payload)
+    assert resp.json() == {"accepted": True, "started": 0, "skipped": 1}
+    temporal.start_workflow.assert_not_awaited()
+
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT actor, action, details FROM audit_log "
+            "WHERE target_id = $1 AND action = 'alert_received'",
+            fp,
+        )
+    assert row is not None
+    assert row["actor"] == "alert:alertmanager"
+    details = row["details"]
+    if isinstance(details, str):
+        details = json.loads(details)
+    assert details.get("resolved") == "true"
+
+    async with db_pool.acquire() as conn:
+        await conn.execute("DELETE FROM audit_log WHERE target_id = $1", fp)
+
+
 async def test_duplicate_fingerprint_real_db(alert_client_real_db):
     client, temporal = alert_client_real_db
     alert = {

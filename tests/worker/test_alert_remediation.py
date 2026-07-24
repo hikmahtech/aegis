@@ -7,6 +7,7 @@ crash-loop (ServiceCrashLooping) must NOT be auto-restarted — restarting it
 just churns; that case stays on the investigation path.
 """
 
+import asyncio
 from unittest.mock import AsyncMock
 
 import pytest
@@ -186,14 +187,51 @@ async def test_run_remediation_commands_executes_and_audits():
     assert result["refused"] is None
     assert result["ran"][0]["exit_code"] == 0
     remote.run_on_host.assert_awaited_once()
-    # log_audit(pool, *, actor, action, target_type, target_id, details) issues
-    # pool.execute("INSERT INTO audit_log ...", actor, action, target_type,
-    # target_id, details) — assert the audit write actually happened and is
-    # tagged with the remediation action (core/src/aegis/observability.py).
-    pool.execute.assert_awaited_once()
-    audit_args = pool.execute.await_args.args
-    assert "remediation_executed" in audit_args
-    assert audit_args[-1] == {"ran": result["ran"]}
+    # log_audit(pool, *, actor, action, ...) issues pool.execute("INSERT INTO
+    # audit_log ...", actor, action, ...). Two rows now: 'remediation_started'
+    # BEFORE the commands run (so a killed activity still leaves a trail), then
+    # 'remediation_executed' with results after.
+    assert pool.execute.await_count == 2
+    started_args = pool.execute.await_args_list[0].args
+    executed_args = pool.execute.await_args_list[1].args
+    # started is recorded first, before execution, with the commands list.
+    assert "remediation_started" in started_args
+    assert started_args[-1] == {"commands": ["docker service ls"], "host": "meem"}
+    assert "remediation_executed" in executed_args
+    assert executed_args[-1] == {"ran": result["ran"]}
+
+
+@pytest.mark.asyncio
+async def test_run_remediation_heartbeats_during_long_command(monkeypatch):
+    """A `docker service update --force` can run well past the heartbeat
+    timeout. The background heartbeater must keep firing activity.heartbeat()
+    while a long command executes, so the activity isn't killed mid-sequence."""
+    # Tiny interval so a short "slow" command spans several heartbeats.
+    monkeypatch.setattr(alerts_mod, "_REMEDIATION_HEARTBEAT_INTERVAL_S", 0.02)
+
+    async def _slow_run(host, cmd, timeout=120):
+        await asyncio.sleep(0.15)  # >> heartbeat interval
+        return {"status": "ok", "exit_code": 0, "stdout": "done", "stderr": ""}
+
+    remote = AsyncMock()
+    remote.run_on_host.side_effect = _slow_run
+    pool = AsyncMock()
+    pool.fetchval.return_value = False
+
+    env = ActivityEnvironment()
+    beats: list = []
+    env.on_heartbeat = lambda *a: beats.append(a)
+
+    act = AlertActivities(db_pool=pool, remote_script=remote)
+    result = await env.run(
+        act.run_remediation_commands,
+        ["docker --context swarm service update --force svc_a"],
+        host="meem",
+    )
+
+    assert result["ran"][0]["exit_code"] == 0
+    # Multiple beats across the single slow command → continuous heartbeats.
+    assert len(beats) >= 2
 
 
 @pytest.mark.asyncio

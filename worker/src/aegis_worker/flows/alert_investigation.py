@@ -316,6 +316,15 @@ class AlertInvestigationFlow:
         fingerprint = alert.get("fingerprint", "")
         severity = alert.get("severity", "unknown")
         source = alert.get("source", "unknown")
+        # Escalating infra alerts (NodeDown / HeartbeatCollectFailed — Task 4
+        # marks alert["escalate"]). Resolved early so both the heads-up ping and
+        # the signature-dedup attach-and-continue path below can branch on it.
+        _escalate = bool(alert.get("escalate"))
+        # Flow start instant — passed as `since_iso` to check_alert_resolved so
+        # the self-resolve rechecks only count recoveries during THIS run, not a
+        # previous flap's stale resolved row (which would instantly close the
+        # gate). workflow.now() is deterministic/replay-safe.
+        flow_start_iso = workflow.now().isoformat()
 
         # Owner of the alert pipeline = whoever holds the `infra` behavior tag
         # (issue #36). Every delivery/attribution/child-interaction below is
@@ -336,22 +345,6 @@ class AlertInvestigationFlow:
         await self._safe_event(
             f"🔍 Alert investigation started: <b>{_html_escape(title)}</b> ({severity}/{source})"
         )
-
-        # Escalating infra alerts (NodeDown / HeartbeatCollectFailed — Task 4
-        # marks alert["escalate"]) get an immediate heads-up chat ping so the
-        # owner knows a decision card is coming and will be nagged until acked.
-        # Non-escalating alerts skip this entirely (byte-identical to before).
-        _escalate = bool(alert.get("escalate"))
-        if _escalate:
-            await self._safe_send_message(
-                agent_id=agent_id,
-                message=(
-                    f"🔴 <b>{_html_escape(title)}</b>\n"
-                    f"{severity} · {source} — investigating now; "
-                    f"I'll escalate until you ack the decision card."
-                ),
-                log_event="alert_heads_up_notify_failed",
-            )
 
         # ── Step 1: Skip if resolved on arrival ──
         if alert.get("resolved"):
@@ -386,6 +379,23 @@ class AlertInvestigationFlow:
                 await self._safe_event(f"🔕 Muted: {_html_escape(title)}")
                 return {"status": "muted", "task_id": None}
 
+        # ── Step 2.6: Escalating heads-up ping ──
+        # Escalating infra alerts (NodeDown / HeartbeatCollectFailed) get an
+        # immediate heads-up chat ping so the owner knows a decision card is
+        # coming and will be nagged until acked. Placed AFTER resolved-skip,
+        # dedup, and mute so it never fires for an alert that's already
+        # resolved-on-arrival, deduped, or muted. Non-escalating alerts skip it.
+        if _escalate:
+            await self._safe_send_message(
+                agent_id=agent_id,
+                message=(
+                    f"🔴 <b>{_html_escape(title)}</b>\n"
+                    f"{severity} · {source} — investigating now; "
+                    f"I'll escalate until you ack the decision card."
+                ),
+                log_event="alert_heads_up_notify_failed",
+            )
+
         # ── Step 2.65: Routing config — infra_cluster (#91) ──
         # is_infra_alert/build_alert_signature can't read Settings/DB from
         # workflow code, so fetch the configured cluster label once here via
@@ -413,6 +423,7 @@ class AlertInvestigationFlow:
         # todoist_task_id (clarify-APP path) bypasses signature dedup —
         # the caller has explicitly anchored to a specific task.
         signature = build_alert_signature(alert, infra_cluster)
+        signature_task_id: str | None = None
         if signature and not alert.get("todoist_task_id"):
             existing_task_id = await workflow.execute_activity_method(
                 AlertActivities.find_open_task_for_signature,
@@ -422,10 +433,11 @@ class AlertInvestigationFlow:
             )
             if existing_task_id:
                 workflow.logger.info(
-                    "alert_signature_dedup_hit signature=%s task_id=%s fingerprint=%s",
+                    "alert_signature_dedup_hit signature=%s task_id=%s fingerprint=%s escalate=%s",
                     signature,
                     existing_task_id,
                     fingerprint,
+                    _escalate,
                 )
                 recurrence_note = (
                     f"⚠️ Another occurrence of this error class\n"
@@ -439,38 +451,53 @@ class AlertInvestigationFlow:
                     start_to_close_timeout=TIMEOUT_FAST,
                     retry_policy=NO_RETRY,
                 )
-                # Also write the per-fingerprint dedup audit row so a
-                # re-fire of THIS exact Sentry issue short-circuits at
-                # step 2 (check_dedup) instead of repeating the signature
-                # lookup.
-                try:
-                    await workflow.execute_activity_method(
-                        AlertActivities.log_alert,
-                        args=[alert],
-                        start_to_close_timeout=TIMEOUT_FAST,
-                        retry_policy=NO_RETRY,
+                if _escalate:
+                    # Escalating alerts must NOT be silently suppressed on a
+                    # recurrence: a real re-outage that re-uses the same
+                    # signature still needs a decision card + escalation. Attach
+                    # to the existing task and CONTINUE the pipeline (verification
+                    # delay → investigation → escalating Gate-2). log_alert is
+                    # left to step 10 at the end of this run.
+                    signature_task_id = existing_task_id
+                    await self._safe_event(
+                        "🪞 AlertInvestigation — recurrence (escalating), continuing "
+                        f"on existing task: {_html_escape(title)}"
                     )
-                except Exception:
-                    pass
-                await self._safe_event(
-                    f"🪞 AlertInvestigation — recurrence, attached to existing task: {_html_escape(title)}"
-                )
-                return {
-                    "status": "skipped_signature_dedup",
-                    "task_id": None,
-                    "todoist_task_id": existing_task_id,
-                    "signature": signature,
-                    "verdict": None,
-                    "resource": None,
-                    "investigation": "",
-                }
+                else:
+                    # Non-escalating: early-exit (attach recurrence note + skip).
+                    # Write the per-fingerprint dedup audit row so a re-fire of
+                    # THIS exact issue short-circuits at step 2 (check_dedup)
+                    # instead of repeating the signature lookup.
+                    try:
+                        await workflow.execute_activity_method(
+                            AlertActivities.log_alert,
+                            args=[alert],
+                            start_to_close_timeout=TIMEOUT_FAST,
+                            retry_policy=NO_RETRY,
+                        )
+                    except Exception:
+                        pass
+                    await self._safe_event(
+                        "🪞 AlertInvestigation — recurrence, attached to existing "
+                        f"task: {_html_escape(title)}"
+                    )
+                    return {
+                        "status": "skipped_signature_dedup",
+                        "task_id": None,
+                        "todoist_task_id": existing_task_id,
+                        "signature": signature,
+                        "verdict": None,
+                        "resource": None,
+                        "investigation": "",
+                    }
 
         # ── Step 2.8: Ensure todoist track-task exists ──
-        # Either the caller passed an existing task_id (clarify-APP path)
-        # OR we create one now in the Inbox tagged @pandora. The same
-        # task receives start- and final-comments and shows up in the
-        # user's Pandora filter while the investigation runs.
-        track_task_id: str | None = alert.get("todoist_task_id") or None
+        # Either the caller passed an existing task_id (clarify-APP path), the
+        # escalating signature-dedup path above attached to an open task, OR we
+        # create one now in the Inbox tagged @pandora. The same task receives
+        # start- and final-comments and shows up in the user's Pandora filter
+        # while the investigation runs.
+        track_task_id: str | None = alert.get("todoist_task_id") or signature_task_id or None
         if not track_task_id:
             capture_title = title[:120]
             capture_description = (alert.get("description") or "")[:2000]
@@ -537,11 +564,13 @@ class AlertInvestigationFlow:
             )
             await workflow.sleep(timedelta(seconds=delay_seconds))
 
-            # Re-check if alert self-resolved during the delay
+            # Re-check if alert self-resolved during the delay. Bound the lookup
+            # to this run's start (since_iso) so it only counts a recovery that
+            # arrived during THIS firing, never a previous flap's resolved row.
             window_minutes = delay_seconds // 60 + 2
             resolved_check = await workflow.execute_activity_method(
                 AlertActivities.check_alert_resolved,
-                args=[fingerprint, window_minutes],
+                args=[fingerprint, window_minutes, flow_start_iso],
                 start_to_close_timeout=TIMEOUT_FAST,
                 retry_policy=FAST,
             )
@@ -1238,7 +1267,10 @@ class AlertInvestigationFlow:
                     try:
                         recheck = await workflow.execute_activity_method(
                             AlertActivities.check_alert_resolved,
-                            args=[fingerprint, 10],
+                            # since_iso=flow_start: a resolved row from a
+                            # PREVIOUS flap must NOT auto-close this run's gate —
+                            # only a recovery during THIS run counts.
+                            args=[fingerprint, 10, flow_start_iso],
                             start_to_close_timeout=TIMEOUT_FAST,
                             retry_policy=FAST,
                         )
@@ -1312,13 +1344,47 @@ class AlertInvestigationFlow:
                     if note
                     else proposed_cmds
                 )
-                exec_result = await workflow.execute_activity_method(
-                    AlertActivities.run_remediation_commands,
-                    args=[cmds, inv_result.get("host", "")],
-                    start_to_close_timeout=TIMEOUT_LONG,
-                    heartbeat_timeout=TIMEOUT_STANDARD,
-                    retry_policy=NO_RETRY,
-                )
+                try:
+                    exec_result = await workflow.execute_activity_method(
+                        AlertActivities.run_remediation_commands,
+                        args=[cmds, inv_result.get("host", "")],
+                        # 12 min: 5 commands × 120s + slack headroom. The
+                        # activity now heartbeats continuously (background
+                        # heartbeater), so heartbeat_timeout stays STANDARD while
+                        # start_to_close is the real budget for the whole
+                        # sequence — a `service update --force` no longer gets
+                        # killed mid-run and the audit row is preserved.
+                        start_to_close_timeout=timedelta(minutes=12),
+                        heartbeat_timeout=TIMEOUT_STANDARD,
+                        retry_policy=NO_RETRY,
+                    )
+                except Exception as exc:
+                    # The activity timed out or raised (NO_RETRY). Don't strand
+                    # the human-approved run silently — post an explicit manual-
+                    # verify note to task + chat and return a distinct status.
+                    err = str(exc)[:200]
+                    workflow.logger.warning(
+                        "alert_remediation_activity_failed title=%s err=%s", title, err
+                    )
+                    fail_note = (
+                        "⚠️ Remediation execution failed or timed out — verify host "
+                        f"state manually: {err}"
+                    )
+                    await self._safe_post_note(track_task_id or "", fail_note)
+                    await self._safe_send_message(
+                        agent_id=agent_id,
+                        message=(
+                            f"<b>Remediation failed</b> — {_html_escape(title)}\n"
+                            f"<pre>{_html_escape(fail_note[:1500])}</pre>"
+                        ),
+                        log_event="alert_remediation_notify_failed",
+                    )
+                    return {
+                        "status": "remediation_failed",
+                        "task_id": None,
+                        "todoist_task_id": track_task_id,
+                        "refused": "activity_error",
+                    }
                 if exec_result.get("refused"):
                     outcome_note = f"🚫 Remediation refused: {exec_result['refused']}"
                 else:
@@ -1361,7 +1427,12 @@ class AlertInvestigationFlow:
                 except Exception:
                     pass
                 return {
-                    "status": "remediated",
+                    # A refused run (read-only host, no commands, ...) never
+                    # executed anything — surface it distinctly in workflow_runs
+                    # rather than mislabelling it "remediated".
+                    "status": (
+                        "remediation_refused" if exec_result.get("refused") else "remediated"
+                    ),
                     "task_id": None,
                     "todoist_task_id": track_task_id,
                     "commands_ran": len(exec_result.get("ran") or []),
