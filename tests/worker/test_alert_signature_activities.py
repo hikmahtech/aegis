@@ -189,6 +189,28 @@ async def test_check_dedup_resolved_before_investigation_still_dedups(db_pool):
     await _clear_audit(db_pool, fp)
 
 
+@pytest.mark.asyncio
+async def test_check_alert_resolved_since_iso_accepts_isoformat_string(db_pool):
+    """Regression (prod 2026-07-26): the flow passes workflow.now().isoformat()
+    as since_iso; asyncpg binds timestamptz params as datetime objects, so the
+    raw string must be parsed — a TypeError here killed every investigation at
+    the verification recheck. Exercises the REAL query, not a stub."""
+    from datetime import UTC, datetime, timedelta
+
+    acts = AlertActivities(db_pool=db_pool)
+    fp = f"aegis-heartbeat:NodeDown:{uuid.uuid4().hex[:10]}"
+    await _clear_audit(db_pool, fp)
+    await _log_resolved(db_pool, fp)  # recovery row now
+
+    past = (datetime.now(UTC) - timedelta(minutes=5)).isoformat()
+    future = (datetime.now(UTC) + timedelta(minutes=5)).isoformat()
+    assert (await acts.check_alert_resolved(fp, 10, since_iso=past))["resolved"] is True
+    assert (await acts.check_alert_resolved(fp, 10, since_iso=future))["resolved"] is False
+    # Garbage since_iso degrades to not-resolved instead of raising.
+    assert (await acts.check_alert_resolved(fp, 10, since_iso="not-a-date"))["resolved"] is False
+    await _clear_audit(db_pool, fp)
+
+
 # ---------------------------------------------------------------------------
 # DB-backed activity helpers
 # ---------------------------------------------------------------------------

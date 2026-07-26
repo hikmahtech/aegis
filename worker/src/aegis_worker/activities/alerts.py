@@ -9,6 +9,7 @@ import re
 import time
 from collections import Counter
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -1792,12 +1793,22 @@ class AlertActivities:
             return {"resolved": False}
 
         if since_iso:
+            # asyncpg binds timestamptz params as datetime objects, never raw
+            # strings (caught in prod 2026-07-26: TypeError killed every
+            # investigation at the verification recheck).
+            try:
+                since_dt = datetime.fromisoformat(since_iso)
+            except ValueError:
+                activity.logger.warning(
+                    "check_alert_resolved_bad_since_iso value=%s", since_iso[:50]
+                )
+                return {"resolved": False}
             row = await self.db_pool.fetchrow(
                 "SELECT id FROM audit_log WHERE target_type = 'alert' AND target_id = $1 "
                 "AND action = 'alert_received' AND details->>'resolved' = 'true' "
-                "AND created_at > $2::timestamptz LIMIT 1",
+                "AND created_at > $2 LIMIT 1",
                 fingerprint,
-                since_iso,
+                since_dt,
             )
         else:
             row = await self.db_pool.fetchrow(
