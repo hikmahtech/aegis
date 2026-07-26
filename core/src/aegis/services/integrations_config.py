@@ -73,6 +73,18 @@ CONFIG_REGISTRY: list[ConfigKey] = [
         "skipping the LLM repo-match. Blank = alertname matching only. "
         "Worker restart required; a set env var can only be overridden, not blanked, from here.",
     ),
+    ConfigKey(
+        "infra_heartbeat_ping_url", "Heartbeat dead-man ping URL (healthchecks.io)",
+        "System Monitoring", False,
+        help="GET on every successful 2-min heartbeat tick; configure the check to alert "
+        "when pings stop. Blank = disabled. Worker restart required.",
+    ),
+    ConfigKey(
+        "slack_owner_member_id", "Slack member id for escalation mentions",
+        "System Monitoring", False,
+        help="Used to @-mention you on unacked critical infra cards (e.g. U0123456789). "
+        "Blank = escalate without mention. Worker restart required.",
+    ),
     # Feature flags — enable/disable whole subsystems. Off by default unless noted.
     # `help` names the extra config a feature needs to actually work.
     ConfigKey(

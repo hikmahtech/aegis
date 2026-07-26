@@ -81,6 +81,14 @@ def validate_routes(routes: Any) -> list[dict]:
             raise ValueError(f"route {key!r}: value required")
         if not _valid_pattern(compile_pattern(match, value)):
             raise ValueError(f"route {key!r}: value is not a valid regex")
+        overrides_raw = r.get("alert_overrides") or {}
+        if not isinstance(overrides_raw, dict):
+            raise ValueError(f"route {key!r}: alert_overrides must be an object")
+        _allowed_overrides = {"source", "alertname", "severity"}
+        bad = set(overrides_raw) - _allowed_overrides
+        if bad:
+            raise ValueError(f"route {key!r}: unknown alert_overrides keys: {sorted(bad)}")
+        overrides = {k: str(v) for k, v in overrides_raw.items() if str(v).strip()}
         out.append(
             {
                 "key": key,
@@ -92,6 +100,7 @@ def validate_routes(routes: Any) -> list[dict]:
                 "gate": bool(r.get("gate", True)),
                 "service": str(r["service"]) if r.get("service") else None,
                 "resource_tags": [str(t) for t in (r.get("resource_tags") or [])],
+                "alert_overrides": overrides or None,
             }
         )
     return out

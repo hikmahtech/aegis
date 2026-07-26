@@ -150,6 +150,8 @@ class Settings(BaseSettings):
     # your own cluster label to also route by cluster. Editable from the
     # admin Integrations page.
     infra_cluster: str = ""
+    infra_heartbeat_ping_url: str = ""  # healthchecks.io dead-man URL ("" = off)
+    slack_owner_member_id: str = ""  # Slack member id for escalation @-mentions ("" = no mention)
     # Bank / card-alert sender domains (comma-separated, case-insensitive
     # substring match). Deterministic guard in Money Hygiene that stops bank
     # statements / autopay reminders from minting fake recurring charges.

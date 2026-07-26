@@ -57,6 +57,7 @@ from aegis_worker.flows.delivery_watchdog import DeliveryWatchdogFlow
 from aegis_worker.flows.drive_sync import DriveSyncFlow
 from aegis_worker.flows.github_alert import GitHubAlertFlow
 from aegis_worker.flows.gmail_ingest import GmailIngestFlow
+from aegis_worker.flows.infra_heartbeat import InfraHeartbeatFlow
 from aegis_worker.flows.intelligence_scan import IntelligenceScanFlow
 from aegis_worker.flows.interaction import InteractionFlow
 from aegis_worker.flows.llm_spend_guard import LLMSpendGuardFlow
@@ -219,6 +220,7 @@ async def main():
         # client connects to the "default" namespace too (see Client.connect
         # below). Wire a settings field here if a non-default namespace is added.
         infra_cluster=getattr(settings, "infra_cluster", "") or "",
+        slack_owner_member_id=getattr(settings, "slack_owner_member_id", "") or "",
     )
     briefing_act = BriefingActivities(
         db_pool=deps.pool,
@@ -276,6 +278,8 @@ async def main():
             db_pool=deps.pool,
             homelab=connectors.get("homelab"),
             delivery=delivery_act,
+            heartbeat_ping_url=getattr(settings, "infra_heartbeat_ping_url", "") or "",
+            infra_cluster=getattr(settings, "infra_cluster", "") or "",
         )
 
     money_act = None
@@ -467,6 +471,7 @@ async def main():
         alert_act.check_alert_resolved,
         alert_act.get_verification_delay,
         alert_act.run_investigation,
+        alert_act.run_remediation_commands,
         alert_act.assess_investigation,
         alert_act.accumulate_digest_item,
         alert_act.build_alert_digest,
@@ -569,6 +574,12 @@ async def main():
             homelab_act.collect_services,
             homelab_act.probe_and_upsert_cert,
             homelab_act.notify_cert_alert,
+            homelab_act.collect_infra_state,
+            homelab_act.read_heartbeat_state,
+            homelab_act.write_heartbeat_state,
+            homelab_act.record_heartbeat_resolved,
+            homelab_act.ping_deadman,
+            homelab_act.get_heartbeat_routing,
         ]
 
     if money_act:
@@ -617,6 +628,7 @@ async def main():
             ServiceDriftFlow,
             CertRadarFlow,
             DeliveryWatchdogFlow,
+            InfraHeartbeatFlow,
         ]
 
     if settings.money_hygiene_enabled:

@@ -174,14 +174,17 @@ def test_build_alert_signature_infra_cluster_param():
         "labels": {"alertname": "SomeAppAlert", "cluster": "my-swarm", "instance": "node-a"},
     }
     # cluster match only via the explicit param now
-    assert build_alert_signature(alert, infra_cluster="my-swarm").startswith("alertmanager-class:")
+    assert build_alert_signature(alert, infra_cluster="my-swarm").startswith("infra-class:")
     assert build_alert_signature(alert) != build_alert_signature(alert, infra_cluster="my-swarm")
 
 
 async def test_get_alert_routing_config_activity():
-    act = AlertActivities(infra_cluster="homelab-swarm")
+    act = AlertActivities(infra_cluster="homelab-swarm", slack_owner_member_id="U042")
     env = ActivityEnvironment()
-    assert await env.run(act.get_alert_routing_config) == {"infra_cluster": "homelab-swarm"}
+    assert await env.run(act.get_alert_routing_config) == {
+        "infra_cluster": "homelab-swarm",
+        "slack_owner_member_id": "U042",
+    }
 
 
 def test_build_signature_non_infra_alertmanager_uses_service():
@@ -386,7 +389,9 @@ async def _stub_verification_delay(alert: dict) -> dict:
 
 
 @activity.defn(name="check_alert_resolved")
-async def _stub_check_alert_resolved(fingerprint: str, window_minutes: int) -> dict:
+async def _stub_check_alert_resolved(
+    fingerprint: str, window_minutes: int, since_iso: str = ""
+) -> dict:
     return _flow_state["resolved_check_result"]
 
 

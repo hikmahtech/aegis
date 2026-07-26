@@ -27,6 +27,7 @@ from aegis.api.deps import get_settings
 from aegis.api.routes.interactions import get_workflow_client
 from aegis.clarify_note import AGENT_REPLY_PREFIX, CLARIFY_NOTE_PREFIX
 from aegis.config import Settings
+from aegis.observability import log_audit
 from aegis.services.agents import resolve_tag
 
 logger = structlog.get_logger()
@@ -251,12 +252,6 @@ async def alert_webhook(
     for a in alerts_raw:
         if not isinstance(a, dict):
             continue
-        # Only "firing" alerts trigger investigation; "resolved" ones are noise
-        status = a.get("status", "firing")
-        if status == "resolved":
-            skipped += 1
-            continue
-
         labels = a.get("labels") or {}
         annotations = a.get("annotations") or {}
         fingerprint = a.get("fingerprint") or ""
@@ -266,6 +261,27 @@ async def alert_webhook(
         # Synthesize fingerprint if missing
         if not fingerprint:
             fingerprint = f"alertmanager:{alertname}:{instance}"
+
+        # Only "firing" alerts trigger investigation; "resolved" ones are noise
+        # for the pipeline — but we still record a resolved audit row (same
+        # shape as record_heartbeat_resolved) so check_alert_resolved's
+        # self-resolve machinery works for alertmanager alerts too, not just
+        # heartbeat ones. Best-effort: a DB hiccup must never break the webhook.
+        status = a.get("status", "firing")
+        if status == "resolved":
+            try:
+                await log_audit(
+                    pool,
+                    actor="alert:alertmanager",
+                    action="alert_received",
+                    target_type="alert",
+                    target_id=fingerprint,
+                    details={"resolved": "true"},
+                )
+            except Exception:
+                logger.warning("alert_webhook_resolved_audit_failed", fingerprint=fingerprint)
+            skipped += 1
+            continue
 
         # Idempotency claim
         async with pool.acquire() as conn:

@@ -25,6 +25,7 @@ from aegis_worker.flows.daily_briefing import DailyBriefingConfig, DailyBriefing
 from aegis_worker.flows.delivery_watchdog import DeliveryWatchdogConfig, DeliveryWatchdogFlow
 from aegis_worker.flows.drive_sync import DriveSyncFlow, DriveSyncInput
 from aegis_worker.flows.gmail_ingest import GmailIngestFlow, GmailIngestInput
+from aegis_worker.flows.infra_heartbeat import InfraHeartbeatConfig, InfraHeartbeatFlow
 from aegis_worker.flows.intelligence_scan import IntelligenceScanFlow, IntelligenceScanInput
 from aegis_worker.flows.llm_spend_guard import LLMSpendGuardConfig, LLMSpendGuardFlow
 from aegis_worker.flows.memory_reflection import MemoryReflectionFlow, MemoryReflectionInput
@@ -95,6 +96,13 @@ _ACTIVITY_TYPE_MAP = {
         CertRadarConfig(
             silent=bool(act["config"].get("silent", False)),
             domains=act["config"].get("domains", []),
+        ),
+    ),
+    "InfraHeartbeatFlow": lambda act: (
+        InfraHeartbeatFlow,
+        InfraHeartbeatConfig(
+            agent_id=act["agent_id"],
+            fail_threshold=int(act["config"].get("fail_threshold", 3)),
         ),
     ),
     # v3 Phase 3 — ingest flows + learning loop.
@@ -244,7 +252,12 @@ _ACTIVITY_TYPE_MAP = {
 # it never enters expected_ids, the prune pass deletes any stale schedule —
 # so toggling a flag off cleans up too).
 _FEATURE_FLAGGED_TYPES = {
-    "homelab_enabled": {"ServiceDriftFlow", "DeliveryWatchdogFlow", "CertRadarFlow"},
+    "homelab_enabled": {
+        "ServiceDriftFlow",
+        "DeliveryWatchdogFlow",
+        "CertRadarFlow",
+        "InfraHeartbeatFlow",
+    },
     "money_hygiene_enabled": {
         "ReceiptIngestFlow",
         "MoneyHygieneDailyFlow",

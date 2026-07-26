@@ -80,10 +80,46 @@ Point your alert sources at Core (all HMAC/secret-verified, auth-exempt):
 - `POST /api/webhooks/alert` — Grafana / Alertmanager-shaped payloads
 - `POST /api/webhooks/github` — PR notifications (`GitHubAlertFlow`)
 - `POST /api/webhooks/todoist` — Todoist sync events
+- **AEGIS heartbeat (2-min poll)** → `InfraHeartbeatFlow` → `AlertInvestigationFlow` on
+  node/service transitions (source `aegis-heartbeat`)
 
 All of them feed `AlertInvestigationFlow` / the flows described in
 [`architecture/overview.md`](architecture/overview.md). Per-alert runbooks live in
 `runbooks/<AlertName>.md`, baked into the worker image.
+
+### Infra heartbeat & escalation
+
+`InfraHeartbeatFlow` (schedule `infra-heartbeat-2m`, gated by `homelab_enabled`) polls
+`docker node ls` + `docker service ls` every 2 min and spawns investigations on state
+transitions only. Recovery transitions write an `alert_received` / `resolved=true` audit
+row; the `/api/webhooks/alert` handler writes the identical row for alertmanager
+`status=resolved` payloads, so `check_alert_resolved` (self-resolve) works for both
+heartbeat and alertmanager alerts. Those recovery rows also **re-arm dedup**: a class that
+flapped and recovered is no longer treated as a duplicate, so a genuine later outage of the
+same class still spawns a fresh investigation (`check_dedup` only suppresses when the
+latest investigation has no recovery after it).
+
+**Cross-source dedup invariant:** a heartbeat-detected outage and an alertmanager-pushed
+one collapse onto ONE signature (`infra-class:<cluster>:<alertname>`) only when the
+`infra_cluster` setting equals the Prometheus `cluster` label — otherwise they key on
+different clusters and dedup won't merge them.
+
+Configure on the admin Integrations page (worker restart required):
+
+- **Heartbeat dead-man ping URL** — healthchecks.io check pinged on every successful tick.
+- **Slack member id for escalation mentions** — critical infra Gate-2 cards re-ping with
+  an @-mention every 3 min (max 10) until acked or self-resolved.
+
+**Known limitation:** a service held below desired replicas for ~9+ min by a slow deploy
+can trip a heartbeat `DockerServiceDown` and get force-restarted (transient deploys usually
+converge before the 2-tick debounce, so this is rare).
+
+Infra Gate-2 cards can carry a **Run fix** option (kimi's `PROPOSED_COMMANDS:` footer);
+approval executes the commands on the coding host via SSH (refused if the infra row is
+`read_only`), posts outputs to the task, and re-verifies. Approving with a note runs the
+note's lines instead. To route hand-captured Todoist tasks ("noon is down") into the
+same pipeline, add a content route with `alert_overrides`, e.g.
+`{"source": "todoist-infra", "alertname": "NodeDown", "severity": "critical"}`.
 
 ## Debugging comms/Slack
 

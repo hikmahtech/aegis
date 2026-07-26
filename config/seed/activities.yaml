@@ -216,6 +216,18 @@ activities:
     config: {}
     active: true
 
+  # Pandora — 2-min swarm liveness heartbeat (spec 2026-07-24). Primary fast
+  # internal detector for node-down and post-reboot stuck services; emits only
+  # on state transitions so steady state costs nothing. Complements (does not
+  # replace) alertmanager push — a power flap that silences alertmanager is
+  # exactly what this catches.
+  - slug: infra-heartbeat-2m
+    workflow_type: InfraHeartbeatFlow
+    agent_id: pandoras-actor
+    schedule_cron: "*/2 * * * *"
+    config: {}
+    active: true
+
   # Catches silently-undelivered interaction cards. Slowed 15min → hourly: it
   # has found zero undelivered in practice, so a worst-case ~1h detection lag on
   # a genuinely stuck card is an acceptable trade for 4× fewer runs.

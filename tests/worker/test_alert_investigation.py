@@ -52,8 +52,12 @@ async def test_check_dedup_match(mock_db_pool):
     assert result["is_duplicate"] is True
 
 
-async def test_check_dedup_ignores_alert_received(mock_db_pool):
-    """check_dedup does NOT match on 'alert_received' action entries."""
+async def test_check_dedup_anchors_on_investigated(mock_db_pool):
+    """check_dedup anchors on 'alert_investigated' — a bare 'alert_received' row
+    is not itself an investigation. The resolved-aware query does reference
+    'alert_received', but only to EXCLUDE a recovery that landed after the
+    latest investigation (a recovery re-arms dedup so a later real incident is
+    not suppressed)."""
     mock_db_pool.fetchrow.return_value = None
     activities = AlertActivities(db_pool=mock_db_pool)
     env = ActivityEnvironment()
@@ -61,7 +65,9 @@ async def test_check_dedup_ignores_alert_received(mock_db_pool):
     assert result["is_duplicate"] is False
     sql = mock_db_pool.fetchrow.call_args[0][0]
     assert "alert_investigated" in sql
-    assert "alert_received" not in sql
+    # Resolved-exclusion subquery keys on a resolved alert_received row.
+    assert "alert_received" in sql
+    assert "resolved" in sql
 
 
 async def test_investigate_returns_assessment(mock_db_pool, mock_llm):

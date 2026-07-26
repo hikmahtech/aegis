@@ -147,6 +147,31 @@ class HomelabConnector:
             )
         return _envelope(True, data=tasks)
 
+    async def list_nodes(self) -> dict:
+        """Return swarm nodes. Shape per item:
+        {hostname, status, availability, manager}. status is Ready|Down."""
+        rc, out, err = await self._docker("node", "ls", "--format", "{{json .}}")
+        if rc != 0:
+            return _envelope(False, error=f"docker node ls failed: {err[:200]}", retryable=True)
+        nodes = []
+        for line in out.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                n = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            nodes.append(
+                {
+                    "hostname": n.get("Hostname", ""),
+                    "status": n.get("Status", ""),
+                    "availability": n.get("Availability", ""),
+                    "manager": n.get("ManagerStatus", ""),
+                }
+            )
+        return _envelope(True, data=nodes)
+
     async def restart_service(self, service_name: str) -> dict:
         """Force-restart a swarm service (idempotent: reschedules its tasks
         without changing the spec).
