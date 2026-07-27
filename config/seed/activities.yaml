@@ -225,6 +225,10 @@ activities:
     workflow_type: InfraHeartbeatFlow
     agent_id: pandoras-actor
     schedule_cron: "*/2 * * * *"
+    # config.quiet_nodes: [node, ...] — nodes expected to leave/rejoin the
+    # swarm (dual-boot boxes etc.); their transitions send a plain FYI ping
+    # instead of spawning an investigation. Edit the DB activities row —
+    # schedule_sync propagates within ~5 min, no redeploy.
     config: {}
     active: true
 

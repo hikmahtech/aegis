@@ -26,7 +26,7 @@ _state: dict = {}
 
 def _reset(collect: dict, prior: dict | None = None):
     _calls.clear()
-    _calls.update({"spawned": [], "resolved": [], "written": [], "pinged": 0})
+    _calls.update({"spawned": [], "resolved": [], "written": [], "pinged": 0, "quiet": []})
     _state.clear()
     _state["collect"] = collect
     _state["prior"] = prior or {"nodes": {}, "stuck": [], "confirmed": [], "fail_count": 0}
@@ -58,6 +58,11 @@ async def _ping() -> dict:
     return {"pinged": True}
 
 
+@activity.defn(name="notify_node_transition")
+async def _quiet_notify(node: str, status: str) -> None:
+    _calls["quiet"].append((node, status))
+
+
 @activity.defn(name="get_heartbeat_routing")
 async def _routing() -> dict:
     return {"infra_cluster": "homelab-swarm"}
@@ -71,7 +76,7 @@ class _StubAlertFlow:
         return {"status": "stub"}
 
 
-_ACTS = [_collect, _read, _write, _resolved, _ping, _routing]
+_ACTS = [_collect, _read, _write, _resolved, _ping, _routing, _quiet_notify]
 
 
 async def _run(config: InfraHeartbeatConfig | None = None) -> dict:
@@ -171,3 +176,44 @@ async def test_collect_recovery_resolves_collect_alert():
     await _run()
     assert _hb_fingerprint("HeartbeatCollectFailed", "collect") in _calls["resolved"]
     assert _calls["written"][0]["fail_count"] == 0
+
+
+async def test_quiet_node_down_notifies_without_alert():
+    """A quiet node (dual-boot box, expected to drop out) transitioning to Down
+    sends a plain FYI notification and spawns NO investigation."""
+    _reset({"ok": True, "nodes": {"baa": "Ready", "asif": "Down"}, "stuck": [], "error": ""})
+    result = await _run(InfraHeartbeatConfig(quiet_nodes=["asif"]))
+    assert result["alerts_spawned"] == 0
+    assert result["quiet_notified"] == 1
+    assert _calls["spawned"] == []
+    assert _calls["quiet"] == [("asif", "down")]
+    assert _calls["written"][0]["nodes"] == {"baa": "Ready", "asif": "Down"}
+
+
+async def test_quiet_node_steady_down_stays_silent():
+    prior = {"nodes": {"asif": "Down"}, "stuck": [], "confirmed": [], "fail_count": 0}
+    _reset({"ok": True, "nodes": {"asif": "Down"}, "stuck": [], "error": ""}, prior)
+    result = await _run(InfraHeartbeatConfig(quiet_nodes=["asif"]))
+    assert result["quiet_notified"] == 0
+    assert _calls["quiet"] == []
+    assert _calls["spawned"] == []
+
+
+async def test_quiet_node_recovery_notifies_and_still_writes_resolved():
+    """Recovery of a quiet node: FYI ping plus the resolved audit row (harmless,
+    and it closes out any alert fired before the node was quieted)."""
+    prior = {"nodes": {"asif": "Down"}, "stuck": [], "confirmed": [], "fail_count": 0}
+    _reset({"ok": True, "nodes": {"asif": "Ready"}, "stuck": [], "error": ""}, prior)
+    result = await _run(InfraHeartbeatConfig(quiet_nodes=["asif"]))
+    assert result["quiet_notified"] == 1
+    assert _calls["quiet"] == [("asif", "up")]
+    assert _calls["resolved"] == [_hb_fingerprint("NodeDown", "asif")]
+    assert _calls["spawned"] == []
+
+
+async def test_non_quiet_node_still_alerts_when_quiet_list_set():
+    _reset({"ok": True, "nodes": {"asif": "Ready", "noon": "Down"}, "stuck": [], "error": ""})
+    result = await _run(InfraHeartbeatConfig(quiet_nodes=["asif"]))
+    assert result["alerts_spawned"] == 1
+    assert _calls["spawned"][0]["fingerprint"] == _hb_fingerprint("NodeDown", "noon")
+    assert _calls["quiet"] == []
