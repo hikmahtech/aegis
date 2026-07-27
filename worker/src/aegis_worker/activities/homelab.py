@@ -571,6 +571,22 @@ class HomelabActivities:
         """Settings-derived knobs for the flow (workflows can't read Settings)."""
         return {"infra_cluster": self.infra_cluster}
 
+    @activity.defn
+    async def notify_node_transition(self, node: str, status: str) -> None:
+        """Plain FYI ping for a quiet node's Down/Ready transition — no
+        investigation, no task, no escalation (e.g. a dual-boot box that is
+        expected to leave and rejoin the swarm). Fire-and-forget safe."""
+        if status == "up":
+            title = f"[NODE] {node} is back up"
+            body = f"Quiet node {node} rejoined the swarm (Ready)."
+        else:
+            title = f"[NODE] {node} is down"
+            body = (
+                f"Quiet node {node} left the swarm. No investigation started — "
+                f"it is on the quiet_nodes list (expected downtime)."
+            )
+        await self._notify_card(self.agent_id, title, body, "homelab_notify_node_transition_failed")
+
 
 def _parse_rowcount(status: str) -> int:
     if not status:

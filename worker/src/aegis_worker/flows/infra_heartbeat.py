@@ -21,7 +21,7 @@ successful collect so a dead AEGIS/node silences healthchecks.io.
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from temporalio import workflow
 
@@ -72,6 +72,11 @@ def build_heartbeat_alert(
 class InfraHeartbeatConfig:
     agent_id: str = "pandoras-actor"
     fail_threshold: int = 3
+    # Nodes expected to leave/rejoin the swarm (e.g. a dual-boot box): their
+    # Down/Ready transitions send a plain FYI chat ping instead of spawning an
+    # investigation. Lives in activities.config so schedule_sync propagates
+    # edits live (≤5 min) without a redeploy.
+    quiet_nodes: list[str] = field(default_factory=list)
 
 
 @workflow.defn
@@ -164,7 +169,18 @@ class InfraHeartbeatFlow:
         confirmed_now = (prev_confirmed | new_confirmed) & cur_stuck
         recovered_services = prev_confirmed - cur_stuck
 
+        quiet = set(config.quiet_nodes or [])
+        quiet_notified = 0
         for node in nodes_down:
+            if node in quiet:
+                await workflow.execute_activity_method(
+                    HomelabActivities.notify_node_transition,
+                    args=[node, "down"],
+                    start_to_close_timeout=TIMEOUT_FAST,
+                    retry_policy=NO_RETRY,
+                )
+                quiet_notified += 1
+                continue
             alert = build_heartbeat_alert(
                 "NodeDown",
                 node,
@@ -189,12 +205,22 @@ class InfraHeartbeatFlow:
                 spawned += 1
 
         for node in nodes_recovered:
+            # Resolved row written for quiet nodes too — harmless, and it
+            # closes out any alert fired before the node was quieted.
             await workflow.execute_activity_method(
                 HomelabActivities.record_heartbeat_resolved,
                 args=[_hb_fingerprint("NodeDown", node)],
                 start_to_close_timeout=TIMEOUT_FAST,
                 retry_policy=NO_RETRY,
             )
+            if node in quiet:
+                await workflow.execute_activity_method(
+                    HomelabActivities.notify_node_transition,
+                    args=[node, "up"],
+                    start_to_close_timeout=TIMEOUT_FAST,
+                    retry_policy=NO_RETRY,
+                )
+                quiet_notified += 1
         for svc in sorted(recovered_services):
             await workflow.execute_activity_method(
                 HomelabActivities.record_heartbeat_resolved,
@@ -231,6 +257,7 @@ class InfraHeartbeatFlow:
         return {
             "collect_ok": True,
             "alerts_spawned": spawned,
+            "quiet_notified": quiet_notified,
             "nodes_down": len(nodes_down),
             "nodes_recovered": len(nodes_recovered),
             "services_confirmed_stuck": len(new_confirmed),

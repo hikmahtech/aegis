@@ -580,6 +580,7 @@ async def main():
             homelab_act.record_heartbeat_resolved,
             homelab_act.ping_deadman,
             homelab_act.get_heartbeat_routing,
+            homelab_act.notify_node_transition,
         ]
 
     if money_act:
