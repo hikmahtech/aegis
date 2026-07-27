@@ -20,6 +20,7 @@ router = APIRouter(
 _FLOW_NAMES = {
     "money_hygiene": "MoneyHygieneDailyFlow",
     "subscription_audit": "SubscriptionAuditFlow",
+    "receipt_scan": "ReceiptIngestFlow",
 }
 
 

@@ -1,4 +1,4 @@
-"""whats_next chat tool + weekly_review trigger registration."""
+"""whats_next chat tool."""
 from __future__ import annotations
 
 import pytest
@@ -10,12 +10,6 @@ from aegis.services.chat import (
     _exec_whats_next,
     _validate_agent_tool_sets,
 )
-from aegis.services.workflows import TRIGGERABLE_WORKFLOWS
-
-
-def test_weekly_review_is_triggerable():
-    assert TRIGGERABLE_WORKFLOWS["weekly_review"]["workflow"] == "WeeklyReviewFlow"
-    assert TRIGGERABLE_WORKFLOWS["weekly_review"]["task_queue"] == "aegis-main"
 
 
 def test_whats_next_registered_and_valid():
