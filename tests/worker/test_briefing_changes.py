@@ -84,6 +84,35 @@ async def test_changes_fire_on_planted(db_pool, _seeded):
 
 
 @pytest.mark.asyncio
+async def test_changes_includes_completed_run_with_error_result_summary(db_pool, _seeded):
+    """A flow can return `{"status": "error", "reason": "..."}` without
+    raising — the workflow_run interceptor then records status='completed'
+    with error IS NULL, so the plain `status='failed' OR error IS NOT NULL`
+    predicate misses it entirely. gather_briefing_changes must also catch
+    result_summary->>'status' = 'error' so this class of silent failure
+    still surfaces in the digest."""
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO workflow_runs (run_id, workflow_id, workflow_type, status, "
+            "started_at, completed_at, result_summary) VALUES "
+            "($1, $2, $3, 'completed', now()-interval '2 hours', now()-interval '2 hours', $4)",
+            "brchg-compl-err",
+            "wf3",
+            "AgentChatReplyFlow",
+            {"status": "error", "reason": "Connection error.", "message_id": None},
+        )
+    act = BriefingActivities(db_pool=db_pool, knowledge_connector=_kc(intel=[], contradictions=3))
+    out = await act.gather_briefing_changes()
+    types = {r["workflow_type"] for r in out["broke"]["failed_runs"]}
+    # both the genuinely-failed run (from _seeded) and the completed-but-error
+    # run must be present
+    assert "RaindropIngestFlow" in types
+    assert "AgentChatReplyFlow" in types
+    compl_err = next(r for r in out["broke"]["failed_runs"] if r["workflow_type"] == "AgentChatReplyFlow")
+    assert "Connection error." in compl_err["error"]
+
+
+@pytest.mark.asyncio
 async def test_changes_quiet_on_clean(db_pool):
     await run_migrations(db_pool)
     async with db_pool.acquire() as conn:
