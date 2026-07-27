@@ -1320,6 +1320,29 @@ CHAT_TOOLS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "system_status",
+            "description": (
+                "Aggregate system status: workflow runs by type/status, hard failures, "
+                "runs that completed but actually failed (result_summary encodes an "
+                "error), LLM token spend, pending interactions, and stuck infra services. "
+                "Use when the user asks what ran, what broke, what's pending on them, or "
+                "what we spent."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "hours": {
+                        "type": "integer",
+                        "description": "Lookback window in hours (default 24, max 168).",
+                        "default": 24,
+                    },
+                },
+            },
+        },
+    },
 ]
 
 
@@ -3158,6 +3181,16 @@ async def _exec_pdf_to_text(pool: asyncpg.Pool, args: dict, ctx: ToolContext) ->
     )
 
 
+async def _exec_system_status(pool: asyncpg.Pool, args: dict, ctx: ToolContext) -> str:
+    """Aggregate status digest — see aegis.services.status_digest."""
+    from aegis.services.status_digest import get_status_digest
+
+    hours = int(args.get("hours") or 24)
+    hours = min(max(hours, 1), 168)
+    digest = await get_status_digest(pool, hours=hours)
+    return json.dumps(digest, default=str)
+
+
 # --- Dispatch dict mapping tool names to executor functions ---
 
 TOOL_EXECUTORS: dict[str, Any] = {
@@ -3207,6 +3240,7 @@ TOOL_EXECUTORS: dict[str, Any] = {
     "vercel_get_build_logs": _exec_vercel_get_build_logs,
     "youtube_transcript": _exec_youtube_transcript,
     "pdf_to_text": _exec_pdf_to_text,
+    "system_status": _exec_system_status,
 }
 
 # --- Per-agent tool sets ---
@@ -3234,6 +3268,7 @@ AGENT_TOOL_SETS: dict[str, set[str]] = {
         # Document-attachment tools
         "youtube_transcript",
         "pdf_to_text",
+        "system_status",
     },
     "raphael": {
         "search_knowledge",

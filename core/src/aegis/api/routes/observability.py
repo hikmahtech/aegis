@@ -8,6 +8,7 @@ from fastapi import APIRouter, Depends, Request
 
 from aegis.api.auth import verify_auth
 from aegis.api.sql_filters import build_where
+from aegis.services.status_digest import get_status_digest
 
 router = APIRouter(prefix="/api/observability", dependencies=[Depends(verify_auth)])
 
@@ -99,6 +100,17 @@ async def connector_stats(
         *params,
     )
     return dict(row)
+
+
+@router.get("/status-digest")
+async def status_digest(request: Request, hours: int = 24) -> dict[str, Any]:
+    """Aggregate 'what ran / what broke / what's pending / what did we spend'
+    for the last `hours`. Shared by the `system_status` chat tool
+    (aegis.services.chat) and Slack `/status` (aegis_comms has no
+    aegis-core dependency, so it reaches this over HTTP)."""
+    pool = request.app.state.db_pool
+    safe_hours = min(max(hours, 1), 168)
+    return await get_status_digest(pool, hours=safe_hours)
 
 
 @router.get("/workflow-runs")
