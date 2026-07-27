@@ -38,7 +38,11 @@ async def test_llm_happy_path():
             return {"response": "Two things need you this morning."}
     act = BriefingActivities(llm_client=_LLM())
     out = await act.frame_briefing(BUNDLE)
-    assert out == "Two things need you this morning."
+    # The LLM narrative is followed by the deterministic failure block —
+    # BUNDLE has one failed run, so it can't be dropped even though the LLM
+    # summary itself doesn't mention it.
+    assert out.startswith("Two things need you this morning.")
+    assert "RaindropIngestFlow" in out
 
 
 @pytest.mark.asyncio
@@ -49,3 +53,39 @@ async def test_fallback_on_llm_error():
     act = BriefingActivities(llm_client=_LLM())
     out = await act.frame_briefing(BUNDLE)
     assert "GPT-6 ships" in out  # fell back to deterministic
+
+
+@pytest.mark.asyncio
+async def test_failure_block_appended_after_llm_narrative():
+    """The deterministic failure block (plain counts + workflow types) is
+    appended AFTER the narrative regardless of the LLM's summary — a real
+    failure competing with intel headlines for one of 2-5 sentences can't
+    be dropped, because this block bypasses the LLM entirely."""
+    class _LLM:
+        async def think(self, prompt, model=None):
+            return {"response": "All quiet, nothing much worth mentioning today."}
+
+    bundle = {
+        **BUNDLE,
+        "broke": {
+            "failed_runs": [
+                {"workflow_type": "RaindropIngestFlow", "error": "boom"},
+                {"workflow_type": "AgentChatReplyFlow", "error": "Connection error."},
+            ],
+            "new_drift": [],
+        },
+    }
+    act = BriefingActivities(llm_client=_LLM())
+    out = await act.frame_briefing(bundle)
+    assert out.startswith("All quiet, nothing much worth mentioning today.")
+    assert "2 workflow failure" in out
+    assert "RaindropIngestFlow" in out
+    assert "AgentChatReplyFlow" in out
+
+
+@pytest.mark.asyncio
+async def test_no_failure_block_when_nothing_broke():
+    bundle = {**BUNDLE, "broke": {"failed_runs": [], "new_drift": []}}
+    act = BriefingActivities(llm_client=None)
+    out = await act.frame_briefing(bundle)
+    assert "workflow failure" not in out

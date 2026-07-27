@@ -44,3 +44,64 @@ async def test_disabled_always_sends(clean_notif):
     d = _FakeDelivery(clean_notif, enabled=False, budget=0)
     await safe_send_message(d, agent_id="sebas", message="hi", log_event="e")
     assert d.sent == ["hi"]
+
+
+class _OkFalseDelivery:
+    """Comms responded, but the send itself failed (`{"ok": False, ...}`)."""
+
+    def __init__(self, pool):
+        self.db_pool = pool
+        self.budget_enabled = False
+        self.daily_budget = 8
+        self.channel = "slack"
+
+    async def send_message(self, *, agent_id, message, chat_id):
+        return {"ok": False, "error": "comms 500"}
+
+
+class _RaisingDelivery:
+    def __init__(self, pool):
+        self.db_pool = pool
+        self.budget_enabled = False
+        self.daily_budget = 8
+        self.channel = "slack"
+
+    async def send_message(self, *, agent_id, message, chat_id):
+        raise RuntimeError("connection refused")
+
+
+async def test_ok_false_records_as_not_sent(clean_notif):
+    """The recorded row must reflect the ACTUAL outcome — an `{"ok": False}`
+    result must never land as `sent=true` (issue: it used to, unconditionally)."""
+    d = _OkFalseDelivery(clean_notif)
+    await safe_send_message(d, agent_id="sebas", message="hi", log_event="renewal_notify_failed")
+    row = await clean_notif.fetchrow(
+        "SELECT sent, log_event FROM notification_log ORDER BY id DESC LIMIT 1"
+    )
+    assert row["sent"] is False
+    assert row["log_event"] == "renewal_notify_failed_ok_false"
+
+
+async def test_raised_exception_records_as_not_sent(clean_notif):
+    """A raised exception must also be recorded (as a failure) — previously
+    the raise path returned before recording anything at all, leaving the
+    failure invisible in notification_log."""
+    d = _RaisingDelivery(clean_notif)
+    await safe_send_message(d, agent_id="sebas", message="hi", log_event="renewal_notify_failed")
+    row = await clean_notif.fetchrow(
+        "SELECT sent, log_event FROM notification_log ORDER BY id DESC LIMIT 1"
+    )
+    assert row["sent"] is False
+    assert row["log_event"] == "renewal_notify_failed_raised"
+
+
+async def test_success_records_unsuffixed_log_event(clean_notif):
+    """A true success keeps the caller's log_event name as-is — only failure
+    paths get a distinguishing suffix."""
+    d = _FakeDelivery(clean_notif, enabled=False, budget=0)
+    await safe_send_message(d, agent_id="sebas", message="hi", log_event="renewal_notify_failed")
+    row = await clean_notif.fetchrow(
+        "SELECT sent, log_event FROM notification_log ORDER BY id DESC LIMIT 1"
+    )
+    assert row["sent"] is True
+    assert row["log_event"] == "renewal_notify_failed"

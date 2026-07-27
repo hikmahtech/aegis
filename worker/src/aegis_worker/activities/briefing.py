@@ -297,18 +297,32 @@ class BriefingActivities:
         new_drift: list[dict] = []
         if self.db_pool:
             try:
+                # Also catch runs that ran to completion but whose own return
+                # value encodes a failure (e.g. `{"status": "error", "reason":
+                # "Connection error."}` — AgentChatReplyFlow's synth-failure
+                # path) — the interceptor records those as status='completed'
+                # with error IS NULL, so they'd otherwise never show up here.
                 rows = await self.db_pool.fetch(
-                    "SELECT workflow_type, error, completed_at FROM workflow_runs "
-                    "WHERE completed_at > $1 AND (status='failed' OR error IS NOT NULL) "
-                    "ORDER BY completed_at DESC LIMIT 10",
+                    "SELECT workflow_type, error, completed_at, result_summary FROM workflow_runs "
+                    "WHERE completed_at > $1 AND ("
+                    "status='failed' OR error IS NOT NULL OR result_summary->>'status' = 'error'"
+                    ") ORDER BY completed_at DESC LIMIT 10",
                     cursor,
                 )
-                failed_runs = [
-                    {"workflow_type": r["workflow_type"],
-                     "error": (r["error"] or "")[:160],
-                     "completed_at": r["completed_at"].isoformat() if r["completed_at"] else None}
-                    for r in rows
-                ]
+                failed_runs = []
+                for r in rows:
+                    rs = r["result_summary"]
+                    if isinstance(rs, str):
+                        try:
+                            rs = json.loads(rs)
+                        except (json.JSONDecodeError, TypeError):
+                            rs = None
+                    err = r["error"] or (rs or {}).get("reason") or "error"
+                    failed_runs.append({
+                        "workflow_type": r["workflow_type"],
+                        "error": str(err)[:160],
+                        "completed_at": r["completed_at"].isoformat() if r["completed_at"] else None,
+                    })
             except Exception as exc:
                 activity.logger.warning("briefing_failed_runs_failed err=%s", str(exc)[:200])
             try:
@@ -360,21 +374,30 @@ class BriefingActivities:
     async def frame_briefing(self, changes: dict) -> str:
         """One LLM call phrases the diff bundle into a tight narrative. Quiet
         bundle → one-liner. Any LLM failure → deterministic fallback, so the
-        briefing always ships."""
+        briefing always ships.
+
+        A deterministic failure block (`_format_failure_block`) is appended
+        AFTER the narrative either way — the LLM is asked for 2-5 sentences
+        over the whole diff bundle, so a real failure can lose out to intel
+        headlines and get silently dropped. Counts/workflow-types bypass the
+        LLM entirely so that can't happen.
+        """
         if changes.get("quiet"):
             return "\U0001f7e2 Quiet overnight — nothing needs you."
         fallback = self._format_changes_fallback(changes)
-        if not self.llm_client:
-            return fallback
-        try:
-            result = await self.llm_client.think(
-                self._build_briefing_prompt(changes), model=self.frame_model
-            )
-            raw = result.get("response", "") if isinstance(result, dict) else (result or "")
-            return (raw or "").strip() or fallback
-        except Exception as exc:  # noqa: BLE001
-            activity.logger.warning("frame_briefing_llm_failed err=%s", str(exc)[:200])
-            return fallback
+        narrative = fallback
+        if self.llm_client:
+            try:
+                result = await self.llm_client.think(
+                    self._build_briefing_prompt(changes), model=self.frame_model
+                )
+                raw = result.get("response", "") if isinstance(result, dict) else (result or "")
+                narrative = (raw or "").strip() or fallback
+            except Exception as exc:  # noqa: BLE001
+                activity.logger.warning("frame_briefing_llm_failed err=%s", str(exc)[:200])
+                narrative = fallback
+        failure_block = self._format_failure_block(changes)
+        return f"{narrative}\n\n{failure_block}" if failure_block else narrative
 
     def _format_changes_fallback(self, changes: dict) -> str:
         lines: list[str] = []
@@ -405,6 +428,17 @@ class BriefingActivities:
                 pre = f"{hhmm} — " if hhmm else ""
                 lines.append(f"  • {pre}{_esc(str(e.get('summary')))}")
         return "\n".join(lines) if lines else "\U0001f7e2 Quiet overnight — nothing needs you."
+
+    def _format_failure_block(self, changes: dict) -> str:
+        """Plain counts + failing workflow types — no LLM involved. Covers
+        both genuinely-failed runs and runs that completed but returned a
+        `{"status": "error", ...}`-shaped result (see `gather_briefing_changes`).
+        Empty string when there's nothing to report."""
+        fr = (changes.get("broke") or {}).get("failed_runs") or []
+        if not fr:
+            return ""
+        types = sorted({str(r.get("workflow_type")) for r in fr if r.get("workflow_type")})
+        return f"<b>⚠️ {len(fr)} workflow failure(s)</b>: {_esc(', '.join(types))}"
 
     def _build_briefing_prompt(self, changes: dict) -> str:
         import json

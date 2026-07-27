@@ -14,9 +14,11 @@ _logger = structlog.get_logger()
 
 async def safe_send_message(delivery: Any, *, agent_id: str, message: str, log_event: str) -> None:
     """Best-effort wrapper around `DeliveryActivities.send_message` for
-    fire-and-forget notification call sites. Logs *both* raised exceptions
-    and `{ok: false}` dict returns under `log_event` so a future failure
-    can't hide the way the dict-vs-str 422 bug did pre-PR #257.
+    fire-and-forget notification call sites. Records the ACTUAL delivery
+    outcome in `notification_log` — `sent` reflects `result.ok`, never a
+    blanket True — and suffixes `log_event` on failure (`_raised` /
+    `_ok_false`) so a failed send is never recorded under the same event
+    name as a successful one (pre-fix, both were indistinguishable rows).
 
     Does not raise. Suitable for notify_drift / cert / backup / renewal
     paths where we'd rather drop the alert than poison the activity.
@@ -49,24 +51,32 @@ async def safe_send_message(delivery: Any, *, agent_id: str, message: str, log_e
         except Exception as exc:  # noqa: BLE001 — budget must never block delivery
             _logger.warning("notification_budget_check_failed", error=str(exc)[:200])
 
-    try:
-        result = await delivery.send_message(agent_id=agent_id, message=message, chat_id=0)
-    except Exception as exc:  # noqa: BLE001 — boundary, must not propagate
-        _logger.warning(log_event, error=str(exc)[:200], reason="raised")
-        return
-    if isinstance(result, dict) and not result.get("ok"):
-        _logger.warning(
-            log_event,
-            error=str(result.get("error", "ok=false"))[:200],
-            reason="ok_false",
-        )
-    if pool is not None:
+    async def _record(event: str, sent: bool) -> None:
+        if pool is None:
+            return
         try:
             from aegis.services.notifications import record_notification
 
-            await record_notification(pool, agent_id, log_event, sent=True)
+            await record_notification(pool, agent_id, event, sent=sent)
         except Exception:  # noqa: BLE001 — recording is best-effort
             pass
+
+    try:
+        result = await delivery.send_message(agent_id=agent_id, message=message, chat_id=0)
+    except Exception as exc:  # noqa: BLE001 — boundary, must not propagate
+        _logger.warning(f"{log_event}_raised", error=str(exc)[:200])
+        await _record(f"{log_event}_raised", sent=False)
+        return
+
+    ok = isinstance(result, dict) and bool(result.get("ok"))
+    if not ok:
+        _logger.warning(
+            f"{log_event}_ok_false",
+            error=str(result.get("error", "ok=false"))[:200]
+            if isinstance(result, dict)
+            else "non_dict_result",
+        )
+    await _record(log_event if ok else f"{log_event}_ok_false", sent=ok)
 
 
 @dataclass
