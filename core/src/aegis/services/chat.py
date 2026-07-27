@@ -376,14 +376,18 @@ CHAT_TOOLS = [
         "type": "function",
         "function": {
             "name": "trigger_workflow",
-            "description": "Trigger a Temporal workflow manually. Returns the workflow run ID.",
+            "description": (
+                "Trigger a Temporal workflow manually. Returns the workflow run ID. "
+                "workflow_type must match an existing activities.workflow_type (e.g. "
+                "DailyBriefingFlow, ClarifyFlow) — an unknown name is rejected with the "
+                "list of valid values."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "workflow_type": {
                         "type": "string",
-                        "enum": ["daily_briefing", "weekly_review"],
-                        "description": "Which workflow to trigger",
+                        "description": "Which workflow to trigger, e.g. 'DailyBriefingFlow'",
                     },
                     "params": {"type": "object", "description": "Optional workflow parameters"},
                 },
@@ -2016,7 +2020,7 @@ async def _exec_trigger_workflow(pool: asyncpg.Pool, args: dict, ctx: ToolContex
     from aegis.services.workflows import trigger_workflow
 
     result = await trigger_workflow(
-        ctx.temporal_client, args.get("workflow_type", ""), args.get("params")
+        ctx.temporal_client, pool, args.get("workflow_type", ""), args.get("params")
     )
     return json.dumps(result, default=str)
 

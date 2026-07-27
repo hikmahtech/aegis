@@ -244,10 +244,6 @@ export const api = {
   saveSlackConfig: (body: any) =>
     apiFetch<any>('/api/admin/slack-config', { method: 'PUT', body: JSON.stringify(body) }),
 
-  // Homelab Guardian
-  homelabState: () => apiFetch<any>('/api/admin/homelab/state'),
-  homelabRunFlow: (flow: string) => apiFetch<any>(`/api/admin/homelab/${flow}/run`, { method: 'POST' }),
-
   // Todoist sync + outbox (GTD hub)
   todoistState: () => apiFetch<any>('/api/admin/todoist/state'),
   getTodoistConfig: () => apiFetch<any>('/api/admin/todoist/config'),

@@ -9,33 +9,34 @@ import structlog
 
 logger = structlog.get_logger()
 
-TRIGGERABLE_WORKFLOWS: dict[str, dict[str, str]] = {
-    # Worker polls "aegis-main" (see worker/src/aegis_worker/__main__.py:TASK_QUEUE).
-    # Triggers landing on any other queue are orphans nobody picks up.
-    "daily_briefing": {"workflow": "DailyBriefingFlow", "task_queue": "aegis-main"},
-    "weekly_review": {"workflow": "WeeklyReviewFlow", "task_queue": "aegis-main"},
-}
+# Worker polls "aegis-main" (see worker/src/aegis_worker/__main__.py:TASK_QUEUE).
+# Triggers landing on any other queue are orphans nobody picks up.
+TASK_QUEUE = "aegis-main"
 
 
 async def trigger_workflow(
     client: Any,
+    pool: Any,
     workflow_type: str,
     params: dict | None = None,
 ) -> dict[str, Any]:
-    """Start a Temporal workflow by type name. Returns {workflow_id, workflow_type, status} or {error}."""
-    config = TRIGGERABLE_WORKFLOWS.get(workflow_type)
-    if not config:
-        return {
-            "error": f"Unknown workflow type: {workflow_type}. Valid: {list(TRIGGERABLE_WORKFLOWS.keys())}"
-        }
+    """Start a Temporal workflow by type name. Returns {workflow_id, workflow_type, status} or {error}.
+
+    Valid workflow_type values are whatever is scheduled in `activities`
+    (see `_exec_create_schedule` in chat.py for the same lookup pattern).
+    """
+    valid_rows = await pool.fetch("SELECT DISTINCT workflow_type FROM activities ORDER BY 1")
+    valid = [r["workflow_type"] for r in valid_rows]
+    if workflow_type not in valid:
+        return {"error": f"Unknown workflow type: {workflow_type}. Valid: {valid}"}
 
     workflow_id = f"chat-{workflow_type}-{uuid4().hex[:8]}"
     try:
         handle = await client.start_workflow(
-            config["workflow"],
+            workflow_type,
             arg=params or {},
             id=workflow_id,
-            task_queue=config["task_queue"],
+            task_queue=TASK_QUEUE,
         )
         logger.info(
             "workflow_triggered_from_chat", workflow_type=workflow_type, workflow_id=handle.id
