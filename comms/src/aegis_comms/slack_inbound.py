@@ -373,6 +373,12 @@ class SlackCoreClient:
         """GET /api/agents."""
         return await self._get("/api/agents")
 
+    async def status_digest(self, *, hours: int = 24) -> dict | None:
+        """GET /api/observability/status-digest — the shared aggregate behind
+        `/status` and the `system_status` chat tool (comms has no aegis-core
+        dependency, so it reaches the data over HTTP)."""
+        return await self._get(f"/api/observability/status-digest?hours={hours}")
+
     async def knowledge_ingest(
         self, *, url: str, title: str, raw_text: str, tags: list[str] | None = None
     ) -> str | None:
@@ -644,18 +650,43 @@ class SlackInbound:
         )
 
     async def on_status(self) -> str:
-        """Format a `/status` summary from /api/health + /api/agents."""
-        health = await self._core.health()
-        agents = await self._core.agents()
-        lines = ["*System Status*"]
-        if health:
-            lines.append(f"API: {health.get('status', '?')}")
-            pg = health.get("postgres", {})
-            if pg:
-                lines.append(f"DB: {pg.get('status', '?')} ({pg.get('latency_ms', '?')}ms)")
-        if agents:
-            names = ", ".join(a.get("name", "?") for a in agents)
-            lines.append(f"Agents: {names}")
+        """Format a `/status` summary from the shared status-digest aggregate.
+
+        Deterministic formatting, NO LLM call — this must be instant and
+        free. Failures and pending-on-you first, counts second (issue: the
+        old version only showed API/DB/agent-name liveness, not what
+        actually ran/broke/spent).
+        """
+        digest = await self._core.status_digest(hours=24)
+        if not digest:
+            return "⚠ Could not reach Core API for status."
+
+        lines = ["*System Status* (24h)"]
+
+        failed = digest.get("failed_runs") or []
+        soft_failed = digest.get("completed_but_failed") or []
+        total_failures = len(failed) + len(soft_failed)
+        if total_failures:
+            lines.append(f"*Failures: {total_failures}*")
+            for r in (failed + soft_failed)[:5]:
+                reason = r.get("error") or r.get("reason") or r.get("status") or "unknown"
+                lines.append(f"  • {r.get('workflow_type', '?')}: {str(reason)[:140]}")
+        else:
+            lines.append("Failures: none")
+
+        pending = digest.get("pending_interactions") or 0
+        if pending:
+            lines.append(f"*Pending on you:* {pending} interaction(s)")
+
+        stuck = digest.get("infra_stuck") or []
+        if stuck:
+            lines.append(f"*Infra stuck:* {', '.join(stuck[:8])}")
+
+        total_runs = sum(r.get("count", 0) for r in digest.get("runs_by_type_status") or [])
+        lines.append(
+            f"Runs: {total_runs} | LLM calls: {digest.get('llm_calls', 0)} "
+            f"({digest.get('llm_tokens', 0):,} tokens)"
+        )
         return "\n".join(lines)
 
     async def on_file(self, *, file_id: str, channel_id: str, caption: str, client) -> None:

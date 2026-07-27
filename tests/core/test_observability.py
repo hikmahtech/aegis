@@ -223,3 +223,33 @@ async def test_connector_stats_with_agent_id_filter(app, auth_headers, mock_db_p
         call_args = mock_db_pool.fetchrow.call_args
         query = call_args[0][0]
         assert "agent_id = $1" in query
+
+
+async def test_status_digest_route_shape(app, auth_headers, mock_db_pool):
+    """GET /api/observability/status-digest — shared aggregate behind the
+    `system_status` chat tool and Slack `/status`."""
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.get("/api/observability/status-digest", headers=auth_headers)
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["window_hours"] == 24
+        for key in (
+            "runs_by_type_status",
+            "failed_runs",
+            "completed_but_failed",
+            "llm_calls",
+            "llm_tokens",
+            "pending_interactions",
+            "infra_stuck",
+            "infra_confirmed",
+        ):
+            assert key in data
+
+
+async def test_status_digest_route_clamps_hours(app, auth_headers, mock_db_pool):
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.get(
+            "/api/observability/status-digest?hours=10000", headers=auth_headers
+        )
+        assert resp.status_code == 200
+        assert resp.json()["window_hours"] == 168

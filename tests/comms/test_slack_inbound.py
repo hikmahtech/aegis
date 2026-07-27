@@ -361,14 +361,74 @@ async def test_on_capture_blank_text_does_not_call_core():
     core.capture.assert_not_awaited()
 
 
-async def test_on_status_summarizes_health_and_agents():
+async def test_on_status_renders_failures_and_pending_first():
     inbound, core, adapter = _inbound()
-    core.health.return_value = {"status": "ok"}
-    core.agents.return_value = [{"name": "Sebas"}, {"name": "Maou"}]
+    core.status_digest.return_value = {
+        "window_hours": 24,
+        "runs_by_type_status": [
+            {"workflow_type": "DailyBriefingFlow", "status": "completed", "count": 1},
+            {"workflow_type": "GmailIngestFlow", "status": "failed", "count": 2},
+        ],
+        "failed_runs": [
+            {"workflow_type": "GmailIngestFlow", "error": "boom", "completed_at": "2026-07-27T00:00:00Z"},
+        ],
+        "completed_but_failed": [
+            {
+                "workflow_type": "RssIngestFlow",
+                "status": "fetch_failed",
+                "reason": "timeout",
+                "completed_at": "2026-07-27T00:00:00Z",
+            },
+        ],
+        "llm_calls": 42,
+        "llm_tokens": 12345,
+        "pending_interactions": 3,
+        "infra_stuck": ["homelab-gitops"],
+        "infra_confirmed": [],
+    }
+
     summary = await inbound.on_status()
-    assert "ok" in summary
-    assert "Sebas" in summary
-    assert "Maou" in summary
+
+    core.status_digest.assert_awaited_once_with(hours=24)
+    assert "Failures: 2" in summary
+    assert "GmailIngestFlow" in summary
+    assert "boom" in summary
+    assert "RssIngestFlow" in summary
+    assert "timeout" in summary
+    assert "Pending on you:* 3" in summary
+    assert "homelab-gitops" in summary
+    assert "42" in summary
+    assert "12,345" in summary
+    # Failures + pending must appear before the raw run/token counts.
+    assert summary.index("Failures") < summary.index("Runs:")
+
+
+async def test_on_status_no_failures_or_pending():
+    inbound, core, adapter = _inbound()
+    core.status_digest.return_value = {
+        "window_hours": 24,
+        "runs_by_type_status": [{"workflow_type": "DailyBriefingFlow", "status": "completed", "count": 1}],
+        "failed_runs": [],
+        "completed_but_failed": [],
+        "llm_calls": 5,
+        "llm_tokens": 100,
+        "pending_interactions": 0,
+        "infra_stuck": [],
+        "infra_confirmed": [],
+    }
+
+    summary = await inbound.on_status()
+
+    assert "Failures: none" in summary
+    assert "Pending on you" not in summary
+    assert "Infra stuck" not in summary
+
+
+async def test_on_status_core_unreachable():
+    inbound, core, adapter = _inbound()
+    core.status_digest.return_value = None
+    summary = await inbound.on_status()
+    assert "Could not reach" in summary
 
 
 # --- front-door intent routing (slice 3) ------------------------------------
