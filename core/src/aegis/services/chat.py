@@ -3225,7 +3225,14 @@ async def _exec_system_status(pool: asyncpg.Pool, args: dict, ctx: ToolContext) 
 
 
 _HTML_TAG_RE = re.compile(r"<[^>]+>")
-_SOCIAL_TIMELINE_LIMIT = 50
+# Stay clear of _truncate_result's 4096-byte cap. That truncator shrinks a
+# dict by keeping its first N KEYS, so an over-budget result here doesn't come
+# back trimmed — the `posts` list is dropped wholesale and the model gets only
+# the metadata (it then re-calls with narrower windows, hunting for the data
+# that no window will ever produce). Fitting the budget ourselves is the only
+# way to keep the payload; the row count adapts to how long the posts are.
+_SOCIAL_TIMELINE_BUDGET = 3400
+_SOCIAL_TIMELINE_TEXT = 140
 
 
 async def _exec_social_timeline(pool: asyncpg.Pool, args: dict, ctx: ToolContext) -> str:
@@ -3271,21 +3278,33 @@ async def _exec_social_timeline(pool: asyncpg.Pool, args: dict, ctx: ToolContext
         text = _HTML_TAG_RE.sub("", str(post.get("content") or "")).strip()
         rows.append(
             {
-                "publish_date": post.get("publishDate"),
+                "date": str(post.get("publishDate") or "")[:16].replace("T", " "),
                 "state": post_state,
                 "channel": integration.get("name"),
-                "platform": integration.get("providerIdentifier"),
-                "text": text[:280],
+                "text": text[:_SOCIAL_TIMELINE_TEXT],
                 "url": post.get("releaseURL"),
             }
         )
-    rows.sort(key=lambda r: str(r["publish_date"] or ""), reverse=True)
+    rows.sort(key=lambda r: r["date"], reverse=True)
+
+    kept: list[dict] = []
+    used = 0
+    for row in rows:
+        size = len(json.dumps(row, default=str))
+        if kept and used + size > _SOCIAL_TIMELINE_BUDGET:
+            break
+        kept.append(row)
+        used += size
+
     return json.dumps(
         {
+            # `posts` first: if this ever does overflow, the key-order truncator
+            # keeps the leading keys, so the data survives and metadata is what
+            # gets dropped — the opposite of the failure this budget prevents.
+            "posts": kept,
+            "count": len(kept),
+            "total_in_window": len(rows),
             "window": {"days_back": days_back, "days_ahead": days_ahead, "state": state or None},
-            "count": len(rows),
-            "truncated": len(rows) > _SOCIAL_TIMELINE_LIMIT,
-            "posts": rows[:_SOCIAL_TIMELINE_LIMIT],
         },
         default=str,
     )

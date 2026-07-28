@@ -73,13 +73,13 @@ async def test_social_timeline_normalizes_posts(monkeypatch):
     result = json.loads(await TOOL_EXECUTORS["social_timeline"](None, {}, ToolContext()))
 
     assert result["count"] == 2
-    assert result["truncated"] is False
+    assert result["total_in_window"] == 2
     # Newest first — the queued August post leads.
     assert [p["state"] for p in result["posts"]] == ["QUEUE", "PUBLISHED"]
     published = result["posts"][1]
     assert published["text"] == "Older published post"  # HTML stripped
     assert published["channel"] == "Hikmah Technologies"
-    assert published["platform"] == "linkedin-page"
+    assert published["date"] == "2026-07-03 23:34"
     assert published["url"] == "https://linkedin.example/1"
     assert fake.closed is True
 
@@ -110,6 +110,65 @@ async def test_social_timeline_clamps_window(monkeypatch, args, expected):
     result = json.loads(await TOOL_EXECUTORS["social_timeline"](None, args, ToolContext()))
 
     assert (result["window"]["days_back"], result["window"]["days_ahead"]) == expected
+
+
+async def test_social_timeline_result_survives_the_tool_result_truncator(monkeypatch):
+    """The regression that made this tool useless in prod.
+
+    `_truncate_result` shrinks an over-budget dict by keeping its first N KEYS,
+    so a fat payload doesn't come back trimmed — `posts` vanishes entirely and
+    the model sees only metadata. Sebas then re-called the tool five times
+    hunting for data no window would return. The executor must therefore fit
+    the byte budget itself, whatever Postiz hands back.
+    """
+    from aegis.services.chat import _truncate_result
+
+    many = [
+        {
+            "id": f"p{i}",
+            "content": f"<p>{'post body ' * 60}</p>",  # ~600 chars each, well over budget
+            "publishDate": f"2026-07-{(i % 28) + 1:02d}T09:00:00.000Z",
+            "releaseURL": f"https://linkedin.example/feed/update/urn:li:share:74789542444657786{i:02d}",
+            "state": "PUBLISHED",
+            "integration": {"providerIdentifier": "linkedin-page", "name": "Hikmah Technologies"},
+        }
+        for i in range(80)
+    ]
+    _patch_connector(monkeypatch, _FakeConnector(posts=many))
+
+    raw = await TOOL_EXECUTORS["social_timeline"](None, {}, ToolContext())
+
+    # Untouched by the truncator — which is the whole point.
+    assert _truncate_result(raw) == raw
+    result = json.loads(raw)
+    assert result["posts"], "posts must survive; dropping them is the bug"
+    assert result["count"] < result["total_in_window"] == 80
+    # Still newest-first after the budget cut, not an arbitrary slice.
+    dates = [p["date"] for p in result["posts"]]
+    assert dates == sorted(dates, reverse=True)
+
+
+async def test_social_timeline_keeps_one_post_even_if_oversized(monkeypatch):
+    """A single monster post must not yield an empty timeline."""
+    _patch_connector(
+        monkeypatch,
+        _FakeConnector(
+            posts=[
+                {
+                    "id": "big",
+                    "content": "x" * 50_000,
+                    "publishDate": "2026-07-10T09:00:00.000Z",
+                    "state": "PUBLISHED",
+                    "integration": {"name": "Hikmah Technologies"},
+                }
+            ]
+        ),
+    )
+
+    result = json.loads(await TOOL_EXECUTORS["social_timeline"](None, {}, ToolContext()))
+
+    assert result["count"] == 1
+    assert len(result["posts"][0]["text"]) <= 140
 
 
 async def test_social_timeline_reports_connector_failure(monkeypatch):
