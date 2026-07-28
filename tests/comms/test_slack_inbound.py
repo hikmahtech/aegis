@@ -706,3 +706,36 @@ async def test_on_file_pdf_attaches_extracted_text_and_summarizes():
         "adapter": "slack",
         "channel": "CSEBAS",
     }
+
+
+# --- SlackCoreClient.chat surfaces the real failure reason -------------------
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_chat_reports_core_500_body_not_generic_message():
+    """A 500 from /api/chat carries the real cause — don't hide it behind
+    "Failed to reach Core API", which sent us hunting network problems when
+    the LLM key was the issue."""
+    core = SlackCoreClient(_settings())
+    respx.post("http://core/api/chat").mock(
+        return_value=httpx.Response(500, json={"detail": "AuthenticationError: x-api-key required"})
+    )
+
+    result = await core.chat(agent_id="sebas", message="hi", thread_id="t1", delivery_ref=None)
+
+    assert "500" in result["response"]
+    assert "x-api-key required" in result["response"]
+    assert result["assistant_message_id"] is None
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_chat_reports_transport_failure():
+    core = SlackCoreClient(_settings())
+    respx.post("http://core/api/chat").mock(side_effect=httpx.ConnectError("no route"))
+
+    result = await core.chat(agent_id="sebas", message="hi", thread_id="t1", delivery_ref=None)
+
+    assert "Could not reach Core API" in result["response"]
+    assert "no route" in result["response"]

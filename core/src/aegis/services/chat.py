@@ -10,7 +10,7 @@ import os
 import re
 import time
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from typing import Any
 from uuid import UUID, uuid4
@@ -1338,6 +1338,39 @@ CHAT_TOOLS = [
                         "type": "integer",
                         "description": "Lookback window in hours (default 24, max 168).",
                         "default": 24,
+                    },
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "social_timeline",
+            "description": (
+                "The social-media post timeline from Postiz: what was published, what is "
+                "still queued/scheduled, on which channel, with the live post URL. Use "
+                "when the user asks about posts, the posting schedule, what went out on "
+                "LinkedIn/X/Facebook, or what is lined up next."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "days_back": {
+                        "type": "integer",
+                        "description": "How far back to look, in days (default 14, max 90).",
+                        "default": 14,
+                    },
+                    "days_ahead": {
+                        "type": "integer",
+                        "description": "How far ahead to look, in days (default 14, max 90).",
+                        "default": 14,
+                    },
+                    "state": {
+                        "type": "string",
+                        "description": (
+                            "Optional Postiz state filter, e.g. PUBLISHED, QUEUE, DRAFT, ERROR."
+                        ),
                     },
                 },
             },
@@ -3191,6 +3224,73 @@ async def _exec_system_status(pool: asyncpg.Pool, args: dict, ctx: ToolContext) 
     return json.dumps(digest, default=str)
 
 
+_HTML_TAG_RE = re.compile(r"<[^>]+>")
+_SOCIAL_TIMELINE_LIMIT = 50
+
+
+async def _exec_social_timeline(pool: asyncpg.Pool, args: dict, ctx: ToolContext) -> str:
+    """Postiz post timeline — published + queued, newest first.
+
+    Reads Postiz directly (not `social_outbox`) so posts authored in the
+    Postiz UI show up alongside the ones AEGIS published.
+    """
+    from aegis.connectors.social import SocialConnector
+
+    def _clamp(key: str, default: int) -> int:
+        raw = args.get(key)
+        if raw is None or raw == "":
+            return default
+        try:
+            value = int(raw)  # 0 is meaningful ("no future posts"), so don't `or default`
+        except (TypeError, ValueError):
+            return default
+        return min(max(value, 0), 90)
+
+    days_back = _clamp("days_back", 14)
+    days_ahead = _clamp("days_ahead", 14)
+    state = (args.get("state") or "").strip().upper()
+
+    now = datetime.now(UTC)
+    connector = SocialConnector(db_pool=pool, settings=ctx.settings)
+    try:
+        posts = await connector.list_posts_window(
+            (now - timedelta(days=days_back)).isoformat(),
+            (now + timedelta(days=days_ahead)).isoformat(),
+        )
+    except Exception as exc:  # noqa: BLE001 — surface as a tool result, not a chat crash
+        return json.dumps({"error": str(exc)[:300]})
+    finally:
+        await connector.close()
+
+    rows = []
+    for post in posts:
+        post_state = str(post.get("state") or "")
+        if state and post_state.upper() != state:
+            continue
+        integration = post.get("integration") or {}
+        text = _HTML_TAG_RE.sub("", str(post.get("content") or "")).strip()
+        rows.append(
+            {
+                "publish_date": post.get("publishDate"),
+                "state": post_state,
+                "channel": integration.get("name"),
+                "platform": integration.get("providerIdentifier"),
+                "text": text[:280],
+                "url": post.get("releaseURL"),
+            }
+        )
+    rows.sort(key=lambda r: str(r["publish_date"] or ""), reverse=True)
+    return json.dumps(
+        {
+            "window": {"days_back": days_back, "days_ahead": days_ahead, "state": state or None},
+            "count": len(rows),
+            "truncated": len(rows) > _SOCIAL_TIMELINE_LIMIT,
+            "posts": rows[:_SOCIAL_TIMELINE_LIMIT],
+        },
+        default=str,
+    )
+
+
 # --- Dispatch dict mapping tool names to executor functions ---
 
 TOOL_EXECUTORS: dict[str, Any] = {
@@ -3241,6 +3341,7 @@ TOOL_EXECUTORS: dict[str, Any] = {
     "youtube_transcript": _exec_youtube_transcript,
     "pdf_to_text": _exec_pdf_to_text,
     "system_status": _exec_system_status,
+    "social_timeline": _exec_social_timeline,
 }
 
 # --- Per-agent tool sets ---
@@ -3269,6 +3370,7 @@ AGENT_TOOL_SETS: dict[str, set[str]] = {
         "youtube_transcript",
         "pdf_to_text",
         "system_status",
+        "social_timeline",
     },
     "raphael": {
         "search_knowledge",
