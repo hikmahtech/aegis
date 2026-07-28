@@ -231,7 +231,16 @@ class SlackCoreClient:
     def _headers(self) -> dict[str, str]:
         return {"X-API-Key": self._api_key} if self._api_key else {}
 
-    async def _post(self, path: str, data: dict, timeout: float = 90) -> Any:
+    async def _post(
+        self, path: str, data: dict, timeout: float = 90, error_sink: dict | None = None
+    ) -> Any:
+        """POST to Core. Returns the JSON body, or None on any failure.
+
+        Pass `error_sink` to also capture WHY it failed (`reason` key) — Core
+        puts the real cause (LLM auth error, tool crash, …) in the 500 body,
+        and callers that report to a human should say that rather than a
+        generic "couldn't reach Core".
+        """
         try:
             async with httpx.AsyncClient(timeout=timeout) as client:
                 resp = await client.post(
@@ -248,6 +257,8 @@ class SlackCoreClient:
                     status=resp.status_code,
                     body=resp.text[:200],
                 )
+                if error_sink is not None:
+                    error_sink["reason"] = f"Core API returned {resp.status_code}: {resp.text[:400]}"
         except Exception as exc:  # noqa: BLE001 — best-effort; caller degrades
             logger.warning(
                 "slack_core_post_failed",
@@ -255,6 +266,8 @@ class SlackCoreClient:
                 error=str(exc),
                 error_type=type(exc).__name__,
             )
+            if error_sink is not None:
+                error_sink["reason"] = f"Could not reach Core API: {type(exc).__name__}: {exc}"
         return None
 
     async def _patch(self, path: str, data: dict, timeout: float = 30) -> Any:
@@ -307,9 +320,11 @@ class SlackCoreClient:
             "thread_id": thread_id,
             "delivery_ref": delivery_ref,
         }
-        result = await self._post("/api/chat", payload, timeout=600)
+        error_sink: dict = {}
+        result = await self._post("/api/chat", payload, timeout=600, error_sink=error_sink)
         if result is None:
-            return {"response": "Failed to reach Core API.", "assistant_message_id": None}
+            reason = error_sink.get("reason") or "Core API call failed."
+            return {"response": f":warning: {reason}", "assistant_message_id": None}
         return result
 
     async def route_intent(self, *, message: str) -> dict:

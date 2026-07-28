@@ -90,6 +90,11 @@ them on the row:
   = 09:00 IST) controls both how far back `find`-eligible outbox rows go and the
   `GET /posts` lookup window. No gate on `social_publishing_enabled` — refreshing
   metrics on already-posted rows is harmless even while publishing is off.
+- **Chat:** the `social_timeline` tool (Sebas) answers "what have we posted / what's
+  queued" straight from Postiz `GET /posts` — published *and* scheduled, including
+  posts authored in the Postiz UI that never went through `social_outbox`. Args:
+  `days_back` / `days_ahead` (default 14, max 90) and an optional Postiz `state`
+  filter. Granting it to another agent is a DB write to `agents.metadata.tool_set`.
 
 ## What it does (target behavior)
 
