@@ -23,6 +23,11 @@ ADDRESSABLE_ASSIGNEES = ["@sebas", "@raphael", "@maou", "@pandora"]
 PARK_LABEL = "@waiting"
 EXCLUDED_LABELS = ["@someday", PARK_LABEL]
 
+# Upper bound on the eligible pool we consider per tick. Production's whole
+# agent-assigned backlog is ~80 rows, so this is the pool, not a sample.
+# ponytail: fixed bound; move both caps into SQL if the pool ever nears it.
+_ELIGIBLE_SCAN_LIMIT = 200
+
 
 @dataclass
 class AgentTaskActivities:
@@ -64,8 +69,7 @@ class AgentTaskActivities:
             ADDRESSABLE_ASSIGNEES,
             EXCLUDED_LABELS,
             cooldown_hours,
-            # Over-fetch so the coding cap can drop rows without shrinking the batch.
-            max_tasks * 4,
+            _ELIGIBLE_SCAN_LIMIT,
         )
 
         out: list[dict] = []

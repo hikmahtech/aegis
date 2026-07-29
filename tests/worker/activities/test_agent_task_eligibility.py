@@ -95,3 +95,27 @@ async def test_at_most_one_coding_task_per_batch(db_pool, _seed):
 
 async def test_no_pool_degrades_to_empty():
     assert await AgentTaskActivities(db_pool=None).find_actionable_tasks() == []
+
+
+async def test_coding_backlog_does_not_underfill_batch(db_pool, _seed):
+    """Regression: a large, old coding backlog must not starve non-coding tasks
+    out of the batch just because the SQL scan window fills entirely with
+    coding rows before the per-batch coding cap is applied in Python.
+    """
+    coding_ids = [f"ct-{n}" for n in range(1, 21)]
+    await db_pool.executemany(
+        """
+        INSERT INTO todoist_tasks
+            (id, content, labels, source_tag, assignee_label, is_completed, updated_at)
+        VALUES ($1, $2, ARRAY['@pandora','@code'], NULL, '@pandora', false, now() - make_interval(days => $3))
+        """,
+        [(cid, f"coding backlog {n}", 20 + n) for n, cid in enumerate(coding_ids, start=1)],
+    )
+    try:
+        act = AgentTaskActivities(db_pool=db_pool)
+        rows = await act.find_actionable_tasks(max_tasks=3, max_coding=1)
+        coding = [r for r in rows if r["source_tag"] is None and "@code" in r["labels"]]
+        assert len(rows) == 3
+        assert len(coding) == 1
+    finally:
+        await db_pool.execute("DELETE FROM todoist_tasks WHERE id = ANY($1::text[])", coding_ids)
