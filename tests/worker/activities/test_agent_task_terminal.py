@@ -72,6 +72,10 @@ async def test_comment_body_carries_the_workflow_run_footer(db_pool, _seed):
 
     act = AgentTaskActivities(db_pool=db_pool, todoist_connector=_Todoist())
     assert (await act.comment("tm-1", "pandoras-actor", "found the cause"))["ok"] is True
+    # Prove the fake was actually exercised — a connector that silently
+    # no-oped would otherwise still pass every assertion below.
+    assert len(sent["cmds"]) == 1
+    assert sent["cmds"][0]["type"] == "note_add"
     content = sent["cmds"][0]["args"]["content"]
     assert sent["cmds"][0]["args"]["item_id"] == "tm-1"
     assert "Workflow run:" in content

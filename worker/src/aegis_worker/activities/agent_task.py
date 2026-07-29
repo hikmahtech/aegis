@@ -222,11 +222,13 @@ class AgentTaskActivities:
         excludes AEGIS-authored notes by matching it, and without it this
         comment re-eligibles the task and the flow re-spawns every 15 min.
 
-        Delivery follows the established `build_note_add_command` +
-        `commands()` + `check_sync_status()` pattern (see
-        activities/alerts.py::post_task_note) — the Sync API envelope can
-        report ok=True while the per-command note_add was rejected, so the
-        envelope alone is not proof the comment landed.
+        Delivery mirrors `activities/alerts.py::post_task_note`'s
+        build_note_add_command + commands() + check_sync_status() shape —
+        the Sync API envelope can report ok=True while the per-command
+        note_add was rejected, so the envelope alone is not proof the comment
+        landed. Exceptions from the connector call are caught (comments are
+        best-effort) so a delivery failure never blocks the park_task step
+        that always follows this one.
         """
         from aegis.connectors.todoist import TodoistConnector
 
@@ -238,14 +240,23 @@ class AgentTaskActivities:
         cmd = TodoistConnector.build_note_add_command(task_id, content)
         try:
             result = await self.todoist_connector.commands([cmd])
+            status = TodoistConnector.check_sync_status(result, [cmd["uuid"]])
         except Exception as exc:  # noqa: BLE001 — comments are best-effort
             activity.logger.warning("agent_task_comment_failed err=%s", str(exc)[:200])
             return {"ok": False, "error": str(exc)[:200]}
-        status = TodoistConnector.check_sync_status(result, [cmd["uuid"]])
-        if not status["ok"]:
+        if status["ok"]:
+            return {"ok": True, "error": None}
+        if status["envelope_error"]:
             activity.logger.warning(
-                "agent_task_comment_rejected task_id=%s error=%s",
+                "agent_task_comment_envelope_failed task_id=%s error=%s",
                 task_id,
-                str(status.get("envelope_error") or status.get("rejected"))[:200],
+                str(status["envelope_error"])[:200],
             )
-        return {"ok": status["ok"]}
+            return {"ok": False, "error": status["envelope_error"]}
+        rejected = status["rejected"].get(cmd["uuid"])
+        activity.logger.warning(
+            "agent_task_comment_rejected task_id=%s status=%s",
+            task_id,
+            str(rejected)[:200],
+        )
+        return {"ok": False, "error": f"command_rejected: {rejected}"}
