@@ -239,15 +239,30 @@ class SocialConnector(HTTPConnector):
             text = _render_text(payload)
             value = [{"content": text, "image": []}]
         # A payload carrying schedule_at (the Todoist due time) becomes a
-        # SCHEDULED Postiz post for that moment; anything else — past due
-        # times included (approval arrived late) — publishes immediately.
+        # SCHEDULED Postiz post for that moment. When approval arrives after
+        # the slot has passed, keep the intended time-of-day and roll forward
+        # whole days to its next occurrence — posting "now" instead fires at
+        # whatever hour the approval happened to land (a 13:00 IST slot went
+        # out at 00:31 IST that way).
         post_type, post_date = "now", datetime.now(UTC)
         schedule_at = (payload.get("schedule_at") or "").strip()
         if schedule_at:
             try:
                 when = datetime.fromisoformat(schedule_at)
-                if when > datetime.now(UTC) + timedelta(minutes=2):
-                    post_type, post_date = "schedule", when.astimezone(UTC)
+                cutoff = datetime.now(UTC) + timedelta(minutes=2)
+                if when <= cutoff:
+                    # ponytail: whole-day roll-forward, no slot-conflict
+                    # resolution — two very-late posts sharing a time-of-day
+                    # land on the same day. Still strictly better than both
+                    # firing back-to-back at approval time. IST has no DST, so
+                    # timedelta days keep the wall-clock time intact.
+                    when += timedelta(days=(cutoff - when).days + 1)
+                    logger.info(
+                        "postiz_late_approval_rolled_forward",
+                        requested=schedule_at,
+                        scheduled=when.isoformat(),
+                    )
+                post_type, post_date = "schedule", when.astimezone(UTC)
             except (ValueError, TypeError):  # unparseable or naive datetime
                 logger.warning("postiz_schedule_at_unparseable", value=schedule_at[:40])
         settings = _build_postiz_settings(platform, text, account["meta"] or {})
