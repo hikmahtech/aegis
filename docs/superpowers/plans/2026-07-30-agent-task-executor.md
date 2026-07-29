@@ -172,6 +172,34 @@ async def test_at_most_one_coding_task_per_batch(db_pool, _seed):
         await db_pool.execute("DELETE FROM todoist_tasks WHERE id = 'tt-10'")
 
 
+async def test_many_old_coding_tasks_do_not_starve_the_batch(db_pool, _seed):
+    """The coding cap must not under-fill the batch.
+
+    A fixed `LIMIT max_tasks * 4` over-fetch fills entirely with coding rows when
+    enough of them are older than the non-coding ones; all but max_coding are then
+    skipped and the batch comes back short while eligible non-coding tasks sit
+    further down the table.
+    """
+    rows = ", ".join(
+        f"('tt-c{n}','code {n}', ARRAY['@pandora','@code'], NULL, '@pandora', false,"
+        f" now() - interval '{60 + n} days')"
+        for n in range(20)
+    )
+    await db_pool.execute(
+        "INSERT INTO todoist_tasks "
+        "(id, content, labels, source_tag, assignee_label, is_completed, updated_at) "
+        f"VALUES {rows}"
+    )
+    try:
+        act = AgentTaskActivities(db_pool=db_pool)
+        got = await act.find_actionable_tasks(max_tasks=3, max_coding=1)
+        assert len(got) == 3
+        coding = [r for r in got if r["source_tag"] is None and "@code" in r["labels"]]
+        assert len(coding) == 1
+    finally:
+        await db_pool.execute("DELETE FROM todoist_tasks WHERE id LIKE 'tt-c%'")
+
+
 async def test_no_pool_degrades_to_empty():
     assert await AgentTaskActivities(db_pool=None).find_actionable_tasks() == []
 ```
@@ -209,6 +237,14 @@ ADDRESSABLE_ASSIGNEES = ["@sebas", "@raphael", "@maou", "@pandora"]
 # the cooldown becomes an infinite slow loop over the same tasks.
 PARK_LABEL = "@waiting"
 EXCLUDED_LABELS = ["@someday", PARK_LABEL]
+
+# Upper bound on the eligible pool we scan per tick. Production's entire
+# agent-assigned backlog is ~80 rows, so this is the whole pool, not a sample.
+# A `LIMIT max_tasks * 4` here under-fills the batch: if enough eligible coding
+# tasks are older than the non-coding ones, the window fills with coding rows
+# that all get skipped past max_coding.
+# ponytail: fixed bound; move both caps into SQL if the pool ever nears it.
+_ELIGIBLE_SCAN_LIMIT = 200
 
 
 @dataclass
@@ -251,8 +287,7 @@ class AgentTaskActivities:
             ADDRESSABLE_ASSIGNEES,
             EXCLUDED_LABELS,
             cooldown_hours,
-            # Over-fetch so the coding cap can drop rows without shrinking the batch.
-            max_tasks * 4,
+            _ELIGIBLE_SCAN_LIMIT,
         )
 
         out: list[dict] = []
@@ -274,7 +309,7 @@ class AgentTaskActivities:
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `PYTHONPATH=core/src:worker/src:comms/src pytest tests/worker/activities/test_agent_task_eligibility.py -v`
-Expected: PASS — 7 passed
+Expected: PASS — 8 passed
 
 - [ ] **Step 5: Lint and commit**
 
