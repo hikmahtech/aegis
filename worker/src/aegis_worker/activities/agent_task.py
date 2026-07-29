@@ -9,6 +9,7 @@ oldest first, and a per-task cooldown.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -27,6 +28,43 @@ EXCLUDED_LABELS = ["@someday", PARK_LABEL]
 # agent-assigned backlog is ~80 rows, so this is the pool, not a sample.
 # ponytail: fixed bound; move both caps into SQL if the pool ever nears it.
 _ELIGIBLE_SCAN_LIMIT = 200
+
+# source_tag → verb. source_tag is PRIMARY; @code is consulted only when
+# source_tag IS NULL (i.e. the task is user-authored). Clarify put a stray
+# @code label on a real #email task in prod, and treating that as "run a
+# coding agent on this email" would be nonsense.
+_VERB_BY_SOURCE_TAG = {
+    "#alert": "infra",
+    "#receipt": "finance",
+    "#email": "email",
+}
+
+# Swarm service names as they appear in real prod alert titles.
+_SERVICE_PATTERNS = (
+    re.compile(r"^PROLONGED:\s+(\S+)\s+degraded", re.I),
+    re.compile(r"^Service\s+(\S+)\s+has\s+fewer\s+tasks", re.I),
+    re.compile(r"^([A-Za-z][\w.-]*)\s+is\s+down\b", re.I),
+)
+
+
+def resolve_verb(task: dict) -> str:
+    """Verb for a task: from source_tag, or @code when source_tag is NULL."""
+    source_tag = task.get("source_tag")
+    if source_tag:
+        return _VERB_BY_SOURCE_TAG.get(source_tag, "unknown")
+    if "@code" in (task.get("labels") or []):
+        return "coding"
+    return "unknown"
+
+
+def extract_service_name(title: str) -> str:
+    """Swarm service named by an alert title, or '' when none is."""
+    text = (title or "").strip()
+    for pattern in _SERVICE_PATTERNS:
+        match = pattern.match(text)
+        if match:
+            return match.group(1).lower() if "_" not in match.group(1) else match.group(1)
+    return ""
 
 
 @dataclass
@@ -86,3 +124,29 @@ class AgentTaskActivities:
             if len(out) >= max_tasks:
                 break
         return out
+
+    @activity.defn
+    async def load_task_context(self, task_id: str) -> dict:
+        """Recover the source identity a task was captured from.
+
+        `todoist_capture_idempotency` links task → external_id with near-total
+        coverage in prod (41/42 #alert, 30/30 #email). external_id is prefixed
+        by source: `alert-<fingerprint>`, `gmail-<message_id>`.
+        """
+        empty = {"external_id": "", "fingerprint": "", "gmail_message_id": ""}
+        if self.db_pool is None or not task_id:
+            return empty
+        external_id = await self.db_pool.fetchval(
+            "SELECT external_id FROM todoist_capture_idempotency "
+            "WHERE todoist_task_ref = $1 ORDER BY captured_at DESC LIMIT 1",
+            task_id,
+        )
+        if not external_id:
+            return empty
+        return {
+            "external_id": external_id,
+            "fingerprint": external_id[len("alert-") :] if external_id.startswith("alert-") else "",
+            "gmail_message_id": (
+                external_id[len("gmail-") :] if external_id.startswith("gmail-") else ""
+            ),
+        }
