@@ -1027,10 +1027,21 @@ instance:
     agent_task_act.comment,
 ```
 
-In `worker/src/aegis_worker/schedule_sync.py`, add to `_ACTIVITY_TYPE_MAP`:
+In `worker/src/aegis_worker/schedule_sync.py`, add to `_ACTIVITY_TYPE_MAP`. Every entry is a
+`lambda act: (WorkflowClass, ConfigInstance)` — schedule_sync.py:363 does
+`workflow_cls, flow_config = mapper(act)`, so a bare class reference would fail to unpack. Mirror the
+`SocialPublishFlow` entry:
 
 ```python
-    "AgentTaskSweepFlow": AgentTaskSweepFlow,
+    "AgentTaskSweepFlow": lambda act: (
+        AgentTaskSweepFlow,
+        AgentTaskSweepConfig(
+            agent_id=act["agent_id"],
+            max_tasks=int(act["config"].get("max_tasks", 3)),
+            cooldown_hours=int(act["config"].get("cooldown_hours", 6)),
+            max_coding=int(act["config"].get("max_coding", 1)),
+        ),
+    ),
 ```
 
 In `config/seed/activities.yaml`, append:
@@ -1042,7 +1053,11 @@ In `config/seed/activities.yaml`, append:
   - slug: agent-task-15min
     workflow_type: AgentTaskSweepFlow
     agent_id: pandoras-actor
-    cron: "*/15 * * * *"
+    # The key is `schedule_cron`, NOT `cron`. All 27 existing rows use it and
+    # core/src/aegis/seed.py:219 indexes r["schedule_cron"] strictly (no .get),
+    # so a `cron:` key KeyErrors _load_activities and breaks seeding for EVERY
+    # activity on Core startup, not just this one.
+    schedule_cron: "*/15 * * * *"
     active: true
     config: {}
 ```
