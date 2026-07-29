@@ -1466,6 +1466,7 @@ Task 4 parks unhealthy services without offering a restart. This task adds the c
 - Consumes: `InfraOpsActivities.restart_service`, `service_health`, `complete_task`, `park_task`, `comment`.
 - Produces: `AgentTaskActivities.apply_restart_approval(interaction_id: str, response: dict, metadata: dict) -> dict`
   → `{"applied": "approved" | "skipped" | "none"}`. `metadata` carries `{"task_id", "service", "agent_id"}`.
+  Also adds the `infra_ops: Any = None` collaborator field to `AgentTaskActivities`.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -1495,9 +1496,9 @@ class _Recorder:
 
 
 def _act(rec: _Recorder) -> AgentTaskActivities:
-    act = AgentTaskActivities(db_pool=None)
-    act._restart_service = rec.restart_service          # noqa: SLF001 — test seam
-    act._service_health = rec.service_health            # noqa: SLF001
+    # `infra_ops` is a normal collaborator field, so the fake drops straight in —
+    # no private-attribute injection.
+    act = AgentTaskActivities(db_pool=None, infra_ops=rec)
     async def _complete(task_id: str) -> dict:
         rec.completed.append(task_id)
         return {"completed": True}
@@ -1564,11 +1565,12 @@ Expected: FAIL — `AttributeError: 'AgentTaskActivities' object has no attribut
 
 Add to `AgentTaskActivities` in `worker/src/aegis_worker/activities/agent_task.py`:
 
+Add the collaborator field to the dataclass (alongside `todoist_connector` etc.):
+
 ```python
-    # Seams so the hook can be unit-tested without a live swarm; production
-    # wiring in main() assigns the real InfraOpsActivities methods.
-    _restart_service: Any = None
-    _service_health: Any = None
+    # InfraOpsActivities instance. A plain field, not a private seam, so tests
+    # pass a fake and production passes the real thing.
+    infra_ops: Any = None
 
     @activity.defn
     async def apply_restart_approval(
@@ -1600,8 +1602,8 @@ Add to `AgentTaskActivities` in `worker/src/aegis_worker/activities/agent_task.p
             )
             return {"applied": "none"}
 
-        restart = await self._restart_service(service)
-        health = await self._service_health(service)
+        restart = await self.infra_ops.restart_service(service)
+        health = await self.infra_ops.service_health(service)
         if restart.get("ok") and health.get("healthy"):
             await self.comment(
                 task_id, agent_id, f"Restarted `{service}` and it's healthy again — closing."
@@ -1680,11 +1682,10 @@ Update `tests/worker/flows/test_agent_task_infra.py::test_unhealthy_service_inve
 In `worker/src/aegis_worker/__main__.py`, inside `main()` after both instances exist:
 
 ```python
-    # Seams for apply_restart_approval — the hook runs as an AgentTask activity
-    # but needs the infra ops. Mirrors the existing
-    # `alert_act.todoist_connector = todoist_connector` late-wiring at ~line 415.
-    agent_task_act._restart_service = infra_ops_act.restart_service
-    agent_task_act._service_health = infra_ops_act.service_health
+    # apply_restart_approval runs as an AgentTask activity but needs the infra
+    # ops. Mirrors the existing `alert_act.todoist_connector = todoist_connector`
+    # late-wiring at ~line 415.
+    agent_task_act.infra_ops = infra_ops_act
 ```
 
 Add `apply_restart_approval` to BOTH the module-level `ACTIVITIES` (as
@@ -2007,8 +2008,8 @@ async def test_merchant_history_unknown_merchant_is_empty_not_error(db_pool):
     assert result == {"merchant": "", "charges": [], "summary": ""}
 
 
-async def test_finance_decision_expected_completes_the_task():
-    calls: list = []
+def _act_recording(calls: list) -> AgentTaskActivities:
+    """AgentTaskActivities with its three terminal-state writers recorded."""
     act = AgentTaskActivities(db_pool=None)
 
     async def _complete(task_id: str) -> dict:
@@ -2025,37 +2026,26 @@ async def test_finance_decision_expected_completes_the_task():
     act.complete_task = _complete   # type: ignore[assignment]
     act.park_task = _park           # type: ignore[assignment]
     act.comment = _comment          # type: ignore[assignment]
+    return act
 
+
+async def test_finance_decision_expected_completes_the_task():
+    calls: list = []
     meta = {"task_id": "tfin-1", "agent_id": "maou", "merchant": "Eleven Labs"}
-    assert await act.apply_finance_decision("i1", {"value": "expected"}, meta) == {
-        "applied": "expected"
-    }
+    result = await _act_recording(calls).apply_finance_decision(
+        "i1", {"value": "expected"}, meta
+    )
+    assert result == {"applied": "expected"}
     assert ("complete", "tfin-1") in calls
 
 
 async def test_finance_decision_investigate_parks_the_task():
     calls: list = []
-    act = AgentTaskActivities(db_pool=None)
-
-    async def _complete(task_id: str) -> dict:
-        calls.append(("complete", task_id))
-        return {"completed": True}
-
-    async def _park(task_id: str, reason: str) -> dict:
-        calls.append(("park", task_id))
-        return {"parked": True}
-
-    async def _comment(task_id: str, agent_id: str, body: str) -> dict:
-        return {"ok": True}
-
-    act.complete_task = _complete   # type: ignore[assignment]
-    act.park_task = _park           # type: ignore[assignment]
-    act.comment = _comment          # type: ignore[assignment]
-
     meta = {"task_id": "tfin-2", "agent_id": "maou", "merchant": "Eleven Labs"}
-    assert await act.apply_finance_decision("i1", {"value": "investigate"}, meta) == {
-        "applied": "investigate"
-    }
+    result = await _act_recording(calls).apply_finance_decision(
+        "i1", {"value": "investigate"}, meta
+    )
+    assert result == {"applied": "investigate"}
     assert ("park", "tfin-2") in calls
 ```
 
@@ -2919,10 +2909,16 @@ async def test_declined_plan_stops_before_any_implement_run():
     assert any(kind == "park" for kind, _ in events)
 ```
 
-Note: this test exercises the declined path, which needs no card answer (the card times out under
-`timeout_policy="archive"` and time-skipping fast-forwards it). Driving the *approved* path requires
-signalling the child `InteractionFlow`; add that case only if the harness supports it cleanly —
-otherwise the approved path is covered by Task 5's hook tests plus the live validation in Task 10.
+The test above covers the DECLINED path, which needs no card answer (the card times out under
+`timeout_policy="archive"` and time-skipping fast-forwards it).
+
+**You must also cover the APPROVED path** — it is the whole point of the verb, and leaving it to live
+validation means the first real run is the first test. There is a working precedent for signalling a
+child `InteractionFlow`: `tests/worker/flows/test_alert_investigation_gates.py` uses
+`WorkflowEnvironment.start_local()` (not `start_time_skipping()`) precisely so the child can be
+signalled at the right moment — read its Gate-2 test and mirror the pattern. Add
+`test_approved_plan_implements_then_opens_pr_and_parks`, asserting the ordered sequence
+`investigate → implement → pr` in `events` and a final status of `pr_opened`.
 
 - [ ] **Step 6: Run flow test to verify it fails**
 
