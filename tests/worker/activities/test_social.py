@@ -656,7 +656,8 @@ async def test_post_routes_postiz_account_with_raw_auth_header_no_x_calls(social
 @respx.mock
 async def test_post_postiz_future_schedule_at_schedules_instead_of_now(social_env):
     """A payload with a future schedule_at (the Todoist due time) must become a
-    Postiz SCHEDULED post at exactly that moment; a past one posts now."""
+    Postiz SCHEDULED post at exactly that moment; a past one keeps its
+    time-of-day and rolls forward to the next occurrence."""
     account_id = await _seed_postiz_account(social_env, platform="mastodon", integration_id="int-9")
     posts_route = respx.post("https://postiz.example.com/api/public/v1/posts").respond(
         200, json=[{"postId": "pz-sched", "integration": "int-9"}]
@@ -673,13 +674,23 @@ async def test_post_postiz_future_schedule_at_schedules_instead_of_now(social_en
         assert body["type"] == "schedule"
         assert body["date"] == future.strftime("%Y-%m-%dT%H:%M:%S.000Z")
 
-        # Past schedule_at (late approval) → immediate post.
+        # Past schedule_at (late approval) → same time-of-day, next day.
         past = datetime.now(UTC) - timedelta(minutes=30)
         await connector.post(
             account_id, {"text": "late", "link": "", "schedule_at": past.isoformat()}
         )
         body2 = json.loads(posts_route.calls[1].request.content)
-        assert body2["type"] == "now"
+        assert body2["type"] == "schedule"
+        assert body2["date"] == (past + timedelta(days=1)).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+
+        # Days-late approval rolls forward as many whole days as needed.
+        stale = datetime.now(UTC) - timedelta(days=3, minutes=30)
+        await connector.post(
+            account_id, {"text": "stale", "link": "", "schedule_at": stale.isoformat()}
+        )
+        body3 = json.loads(posts_route.calls[2].request.content)
+        assert body3["type"] == "schedule"
+        assert body3["date"] == (stale + timedelta(days=4)).strftime("%Y-%m-%dT%H:%M:%S.000Z")
     finally:
         await connector.close()
 
