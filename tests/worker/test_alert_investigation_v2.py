@@ -682,3 +682,51 @@ def test_parse_kimi_branches_claude_stream_json_shape():
         '[{"type":"text","text":"Committed.\\n\\nBRANCH: bcp:aegis-fix/fp-7\\nSTATUS: investigated"}]}}\n'
     )
     assert _parse_kimi_branches(stream, primary_repo="bcp") == {"bcp": "aegis-fix/fp-7"}
+
+
+# ── investigation output: assistant transcript, never raw stream-json ────────
+
+
+def test_extract_transcript_returns_empty_for_toolonly_stream_json():
+    """Stream-json with no assistant event yields "" — never raw JSON.
+
+    `_exec` caps SSH stdout to the tail of the file, so a tool-heavy run can
+    lose every assistant turn. The old raw fallback handed those bytes to the
+    assessor LLM, producing every prod verdict's confidence=0.0 with
+    `{"role":"tool"…` inside root_cause.
+    """
+    from aegis_worker.activities.alerts import _extract_kimi_transcript
+
+    tool_only = (
+        '{"role":"tool","content":[{"type":"text","text":"command not found"}]}\n'
+        '{"role":"user","content":[{"type":"text","text":"continue"}]}\n'
+    )
+    assert _extract_kimi_transcript(tool_only) == ""
+
+
+def test_extract_transcript_keeps_assistant_text_and_drops_tool_noise():
+    from aegis_worker.activities.alerts import _extract_kimi_transcript
+
+    raw = "\n".join(
+        [
+            json.dumps({"session_id": "s1"}),
+            json.dumps(
+                {"role": "tool", "content": [{"type": "text", "text": "NOISE nfs mount table"}]}
+            ),
+            json.dumps(
+                {
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "Root cause: stale NFS handle."}],
+                }
+            ),
+        ]
+    )
+    out = _extract_kimi_transcript(raw)
+    assert out == "Root cause: stale NFS handle."
+    assert "NOISE" not in out
+
+
+def test_extract_transcript_still_passes_plain_text_through():
+    from aegis_worker.activities.alerts import _extract_kimi_transcript
+
+    assert _extract_kimi_transcript("STATUS: scoped\n") == "STATUS: scoped"

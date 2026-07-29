@@ -773,3 +773,47 @@ def test_plan_mixed_kimi_and_claude_windows_prunes_oldest_dead():
     prune, use_tmux = _plan_tmux_launch(_wl(*rows), cap=4)
     assert prune == ["@0"]
     assert use_tmux is True
+
+
+@pytest.mark.asyncio
+async def test_fetch_kimi_run_output_drops_truncated_leading_fragment(conn):
+    """A capped read starts mid-line; that JSON debris must not survive.
+
+    Left in, it reaches the assessor LLM looking like the agent's own prose
+    (prod: every kimi verdict came back confidence=0.0 with `{"role":"tool"…`
+    inside root_cause).
+    """
+    from aegis.connectors.remote_script import _KIMI_OUTPUT_CAP
+
+    fragment = 'timeout": 30}"}}]}'
+    body = '{"role":"assistant","content":[{"type":"text","text":"done"}]}'
+    filler = "\n".join([body] * 200)
+    raw = fragment + "\n" + filler
+    raw += "x" * max(0, _KIMI_OUTPUT_CAP - len(raw))  # force the cap to bite
+
+    proc = AsyncMock()
+    proc.communicate = AsyncMock(return_value=(raw.encode(), b""))
+    proc.returncode = 0
+    proc.kill = MagicMock()
+    proc.wait = AsyncMock(return_value=0)
+    with patch("asyncio.create_subprocess_exec", AsyncMock(return_value=proc)):
+        out = await conn.fetch_kimi_run_output("/tmp/aegis-kimi-run-x.jsonl")
+
+    assert out is not None
+    assert not out.startswith(fragment)
+    assert body in out
+
+
+@pytest.mark.asyncio
+async def test_fetch_kimi_run_output_keeps_first_line_when_under_cap(conn):
+    """An uncapped read is complete — never drop its first line."""
+    proc = AsyncMock()
+    proc.communicate = AsyncMock(return_value=(b'{"session_id":"s1"}\nhello\n', b""))
+    proc.returncode = 0
+    proc.kill = MagicMock()
+    proc.wait = AsyncMock(return_value=0)
+    with patch("asyncio.create_subprocess_exec", AsyncMock(return_value=proc)):
+        out = await conn.fetch_kimi_run_output("/tmp/aegis-kimi-run-x.jsonl")
+
+    assert out is not None
+    assert out.startswith('{"session_id":"s1"}')

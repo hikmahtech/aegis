@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import httpx
 import pytest
 import respx
 from aegis_worker.activities.sentry_ingest import (
@@ -271,3 +272,36 @@ async def test_fetch_new_issues_no_project_filter_when_list_empty():
     assert route.called
     request = route.calls.last.request
     assert "project=" not in str(request.url)
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_fetch_new_issues_uses_a_generous_client_timeout(monkeypatch):
+    """The default-constructed client must not inherit httpx's 5s timeout.
+
+    Prod polled Sentry for 8 days with every attempt ReadTimeout'ing (2026-07-21
+    → 07-29) because `httpx.AsyncClient()` defaults to 5s while the activity's
+    own budget is 120s.
+    """
+    captured: dict = {}
+    real_client = httpx.AsyncClient
+
+    def _spy(*args, **kwargs):
+        captured.update(kwargs)
+        return real_client(*args, **kwargs)
+
+    monkeypatch.setattr(httpx, "AsyncClient", _spy)
+    respx.get("https://sentry.example.com/api/0/organizations/org-x/issues/").mock(
+        return_value=Response(200, json=[])
+    )
+    act = SentryIngestActivities(
+        db_pool=None,
+        sentry_url="https://sentry.example.com",
+        sentry_token="tok",
+        sentry_org="org-x",
+    )
+    await ActivityEnvironment().run(act.fetch_new_issues, FetchNewIssuesInput())
+
+    timeout = captured.get("timeout")
+    assert timeout is not None, "fetch_new_issues built an AsyncClient with no timeout"
+    assert float(timeout) > 5.0

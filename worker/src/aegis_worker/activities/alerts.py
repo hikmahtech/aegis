@@ -328,13 +328,32 @@ def _extract_kimi_transcript(raw: str) -> str:
     separators. Falls back to the raw input when the file isn't
     stream-json (e.g. plain-text test fixtures). Skips JSON wrapping
     so the resulting text is greppable / pasteable.
+
+    The fallback keeps only lines that are NOT JSON events, so stream-json
+    with no recoverable assistant text yields "" instead of raw bytes. That
+    bare `return raw` used to leak truncated JSON into the assessor prompt —
+    `_exec` caps stdout to the LAST 32KB, so a tool-heavy run's tail holds
+    tool results and no complete assistant event. That noise is why every
+    kimi verdict in prod came back confidence=0.0 with `{"role":"tool"…`
+    sitting in its root_cause.
     """
     if not raw:
         return ""
     chunks = list(_iter_kimi_assistant_text(raw))
     if chunks:
         return "\n\n".join(c.strip() for c in chunks if c.strip())
-    return raw.strip()
+    # Plain-text (or hybrid) output: kimi emits a `{"session_id": …}` header
+    # then prose. Keep the prose, drop every JSON event line.
+    prose: list[str] = []
+    for line in raw.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        try:
+            json.loads(stripped)
+        except (json.JSONDecodeError, ValueError):
+            prose.append(stripped)
+    return "\n".join(prose)
 
 
 def _parse_kimi_branches(raw: str, primary_repo: str) -> dict[str, str]:
@@ -2027,7 +2046,9 @@ class AlertActivities:
                         primary_branch = branches.get(repo_key, fix_branch if branches else "")
                         return {
                             "status": "succeeded",
-                            "output": raw[-_INVESTIGATION_OUTPUT_CAP:],
+                            "output": _extract_kimi_transcript(raw)[
+                                -_INVESTIGATION_OUTPUT_CAP:
+                            ],
                             "session_id": session_id,
                             "branch": primary_branch,
                             "branches": branches,
@@ -2042,7 +2063,7 @@ class AlertActivities:
             return {
                 "status": "timed_out",
                 "output": (
-                    latest_raw[-_INVESTIGATION_OUTPUT_CAP:]
+                    _extract_kimi_transcript(latest_raw)[-_INVESTIGATION_OUTPUT_CAP:]
                     if latest_raw
                     else "Investigation exceeded 30 minute timeout"
                 ),

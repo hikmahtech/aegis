@@ -47,7 +47,11 @@ class SentryIngestActivities:
         if self.sentry_projects:
             params["project"] = [str(p) for p in self.sentry_projects]
 
-        client = self.http_client or httpx.AsyncClient()
+        # httpx defaults to a 5s timeout, which the org-issues query across
+        # several projects blows through — every poll ReadTimeout'd for 8 days
+        # (2026-07-21 → 07-29) while the activity's own budget was 120s. Stay
+        # under that so Temporal still owns the outer deadline.
+        client = self.http_client or httpx.AsyncClient(timeout=60.0)
         try:
             resp = await client.get(
                 url,
