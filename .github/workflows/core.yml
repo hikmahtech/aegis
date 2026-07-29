@@ -59,4 +59,4 @@ jobs:
         run: ruff check core/src/ tests/core/
 
       - name: Test
-        run: pytest tests/core/ -v --tb=short --cov=core/src/aegis --cov-report=term-missing --cov-report=xml
+        run: pytest tests/core/ -n auto --dist loadfile --timeout=300 -v --tb=short --cov=core/src/aegis --cov-report=term-missing --cov-report=xml

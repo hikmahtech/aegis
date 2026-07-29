@@ -128,6 +128,9 @@ def _plan_tmux_launch(list_windows_output: str, cap: int) -> tuple[list[str], bo
 # of long task-handler output visible.
 _STDOUT_CAP = 32 * 1024
 _STDERR_CAP = 4 * 1024
+# Coding-CLI stream-json logs are mostly tool results; keep enough of the tail
+# that the agent's own assistant turns survive the slice.
+_KIMI_OUTPUT_CAP = 512 * 1024
 
 
 def _parse_workspace_scan(output: str) -> list[dict]:
@@ -406,6 +409,7 @@ class RemoteScriptConnector:
         stdin: bytes | None = None,
         connect_timeout: int = 10,
         batch_mode: bool = False,
+        stdout_cap: int = _STDOUT_CAP,
     ) -> dict:
         """Run `remote_cmd` on `host` with the active key (materialized per
         call when DB-stored), returning the standard result envelope."""
@@ -431,7 +435,7 @@ class RemoteScriptConnector:
                 # build_ssh_args doesn't take a port; splice `-p` in before the
                 # destination (second-to-last element).
                 args = args[:-2] + ["-p", str(self._port)] + args[-2:]
-            return await self._run_capture(args, timeout, stdin=stdin)
+            return await self._run_capture(args, timeout, stdin=stdin, stdout_cap=stdout_cap)
 
     async def run_on_host(
         self, host: str, remote_cmd: str, timeout: int = 30, stdin: bytes | None = None
@@ -484,7 +488,11 @@ class RemoteScriptConnector:
         return self._host, False
 
     async def _run_capture(
-        self, ssh_args: list[str], timeout: int, stdin: bytes | None = None
+        self,
+        ssh_args: list[str],
+        timeout: int,
+        stdin: bytes | None = None,
+        stdout_cap: int = _STDOUT_CAP,
     ) -> dict:
         """Run an SSH command and capture its output into the standard envelope."""
         proc = await asyncio.create_subprocess_exec(
@@ -501,7 +509,7 @@ class RemoteScriptConnector:
             return {
                 "status": status,
                 "exit_code": proc.returncode,
-                "stdout": stdout.decode()[-_STDOUT_CAP:],
+                "stdout": stdout.decode()[-stdout_cap:],
                 "stderr": stderr.decode()[-_STDERR_CAP:],
             }
         except TimeoutError:
@@ -862,8 +870,22 @@ class RemoteScriptConnector:
         """
         await self._refresh_config()
         result = await self._exec(
-            host or self._host, f"cat {shlex.quote(output_file)} 2>/dev/null", timeout=15
+            host or self._host,
+            f"cat {shlex.quote(output_file)} 2>/dev/null",
+            timeout=15,
+            # The generic 32KB tail cap decapitates a tool-heavy run: tool
+            # results dwarf the agent's own turns, so the last 32KB can hold
+            # zero complete assistant events and the transcript comes back
+            # empty. Callers extract assistant text and re-cap it themselves.
+            stdout_cap=_KIMI_OUTPUT_CAP,
         )
+        if len(result.get("stdout", "")) >= _KIMI_OUTPUT_CAP:
+            # Capped ⇒ the slice starts mid-line. Drop that fragment; leaving
+            # it lets JSON debris ("…\"timeout\": 30}\"}}]}") pass downstream
+            # as if it were the agent's own prose.
+            _, _, rest = result["stdout"].partition("\n")
+            result["stdout"] = rest
+            logger.warning("kimi_output_truncated", output_file=output_file)
         if result["exit_code"] == -1:
             logger.warning(
                 "fetch_kimi_run_output_failed", output_file=output_file, error=result["stderr"]

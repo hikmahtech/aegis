@@ -41,4 +41,4 @@ jobs:
         run: ruff check comms/src/ tests/comms/
 
       - name: Test
-        run: pytest tests/comms/ -v --tb=short --cov=comms/src/aegis_comms --cov-report=term-missing --cov-report=xml
+        run: pytest tests/comms/ -n auto --dist loadfile --timeout=300 -v --tb=short --cov=comms/src/aegis_comms --cov-report=term-missing --cov-report=xml

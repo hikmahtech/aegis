@@ -46,7 +46,13 @@ def pytest_sessionstart(session: pytest.Session) -> None:
 # Postgres server from `docker compose up -d postgres`. Tests get their own
 # database on it (below) — never the long-lived `aegis` dev database.
 _PG_SERVER = "postgresql://aegis:aegis_dev@localhost:25432"
-_TEST_DB = "aegis_test"
+# One database PER xdist worker. Every worker is its own pytest session and so
+# runs this fixture independently — sharing a name means worker B drops and
+# recreates the database worker A is mid-test on. Plain (non-xdist) runs have
+# no PYTEST_XDIST_WORKER and keep the historical `aegis_test`.
+_TEST_DB = "aegis_test" + (
+    f"_{os.environ['PYTEST_XDIST_WORKER']}" if os.environ.get("PYTEST_XDIST_WORKER") else ""
+)
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 
 

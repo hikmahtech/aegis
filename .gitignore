@@ -51,3 +51,4 @@ seed_data/
 # and a JSONL audit log of every write; both are local-only.
 scripts/.migration-state.json
 scripts/migration-audit.jsonl
+.coverage
