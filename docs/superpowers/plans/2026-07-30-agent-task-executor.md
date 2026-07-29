@@ -595,19 +595,25 @@ async def test_park_missing_task_is_false_not_crash(db_pool, _seed):
 async def test_comment_body_carries_the_workflow_run_footer(db_pool, _seed):
     """Without this marker clarify treats the comment as fresh user input and
     re-spawns the flow every 15 minutes (loop shipped twice: 2026-05-21, 05-27)."""
-    sent: dict = {}
+    sent: list = []
 
     class _Todoist:
+        """Mirrors the REAL TodoistConnector surface: commands(), not add_note."""
+
         @staticmethod
-        async def add_note(task_id: str, content: str) -> dict:
-            sent["task_id"] = task_id
-            sent["content"] = content
-            return {"ok": True}
+        async def commands(cmds: list[dict]) -> dict:
+            sent.extend(cmds)
+            return {"sync_status": {c["uuid"]: "ok" for c in cmds}}
 
     act = AgentTaskActivities(db_pool=db_pool, todoist_connector=_Todoist())
     assert (await act.comment("tm-1", "pandoras-actor", "found the cause"))["ok"] is True
-    assert "Workflow run:" in sent["content"]
-    assert "found the cause" in sent["content"]
+    # The fake must actually have been driven — a connector that silently did
+    # nothing would otherwise pass this test.
+    assert len(sent) == 1
+    assert sent[0]["type"] == "note_add"
+    content = sent[0]["args"]["content"]
+    assert "Workflow run:" in content
+    assert "found the cause" in content
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
@@ -692,11 +698,25 @@ Add to `worker/src/aegis_worker/activities/agent_task.py`:
         comment re-eligibles the task and the flow re-spawns every 15 min."""
         if self.todoist_connector is None or not task_id:
             return {"ok": False}
+        from aegis.connectors.todoist import TodoistConnector
+
         info = activity.info() if activity.in_activity() else None
         run_ref = info.workflow_id if info else "local"
         content = f"[{agent_id}] {body}\n\nWorkflow run: {run_ref}"
+        # TodoistConnector has NO add_note. The established idiom across
+        # alerts.py / clarify.py / review.py / social.py is build the command,
+        # send it via commands(), then inspect the PER-COMMAND sync status —
+        # commands() can return HTTP 200 with an individual command rejected.
+        # Mirror AlertActivities.post_task_note (alerts.py:760-772).
         try:
-            return await self.todoist_connector.add_note(task_id, content)
+            cmd = TodoistConnector.build_note_add_command(task_id, content)
+            result = await self.todoist_connector.commands([cmd])
+            status = TodoistConnector.check_sync_status(result, [cmd["uuid"]])
+            if status["ok"]:
+                return {"ok": True, "error": None}
+            error = status["envelope_error"] or status["rejected"].get(cmd["uuid"])
+            activity.logger.warning("agent_task_comment_failed err=%s", str(error)[:200])
+            return {"ok": False, "error": str(error)[:200]}
         except Exception as exc:  # noqa: BLE001 — comments are best-effort
             activity.logger.warning("agent_task_comment_failed err=%s", str(exc)[:200])
             return {"ok": False, "error": str(exc)[:200]}
