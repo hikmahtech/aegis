@@ -17,6 +17,7 @@ from temporalio.client import (
     ScheduleUpdateInput,
 )
 
+from aegis_worker.flows.agent_task import AgentTaskSweepConfig, AgentTaskSweepFlow
 from aegis_worker.flows.calendar_ingest import CalendarIngestFlow, CalendarIngestInput
 from aegis_worker.flows.cert_radar import CertRadarConfig, CertRadarFlow
 from aegis_worker.flows.clarify import ClarifyConfig, ClarifyFlow
@@ -54,6 +55,15 @@ logger = structlog.get_logger()
 
 # Map activity type → (workflow class, config builder)
 _ACTIVITY_TYPE_MAP = {
+    "AgentTaskSweepFlow": lambda act: (
+        AgentTaskSweepFlow,
+        AgentTaskSweepConfig(
+            agent_id=act["agent_id"],
+            max_tasks=int(act["config"].get("max_tasks", 3)),
+            cooldown_hours=int(act["config"].get("cooldown_hours", 6)),
+            max_coding=int(act["config"].get("max_coding", 1)),
+        ),
+    ),
     "DailyBriefingFlow": lambda act: (
         DailyBriefingFlow,
         DailyBriefingConfig(

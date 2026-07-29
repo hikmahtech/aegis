@@ -280,3 +280,13 @@ activities:
     config:
       min_repos: 5
     active: true
+
+  # Executes AEGIS's own agent-assigned tasks. 3 per tick with a 6h per-task
+  # cooldown, so the ~80-task backlog drains over about two days rather than
+  # stampeding on the first run.
+  - slug: agent-task-15min
+    workflow_type: AgentTaskSweepFlow
+    agent_id: pandoras-actor
+    schedule_cron: "*/15 * * * *"
+    active: true
+    config: {}

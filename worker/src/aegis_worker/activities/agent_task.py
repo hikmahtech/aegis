@@ -150,3 +150,102 @@ class AgentTaskActivities:
                 external_id[len("gmail-") :] if external_id.startswith("gmail-") else ""
             ),
         }
+
+    # --- terminal states ---
+
+    async def _queue_command(self, temp_id: str, command: dict) -> None:
+        """Enqueue a Todoist Sync command. The deterministic temp_id makes
+        re-runs no-ops until TodoistSyncFlow drains it."""
+        await self.db_pool.execute(
+            "INSERT INTO todoist_outbox (temp_id, command, status) "
+            "VALUES ($1, $2, 'pending') ON CONFLICT (temp_id) DO NOTHING",
+            temp_id,
+            command,
+        )
+
+    @activity.defn
+    async def park_task(self, task_id: str, reason: str) -> dict:
+        """Add @waiting — the parking state. Eligibility excludes @waiting, so
+        this is what removes a task from the pool and stops the cooldown
+        re-picking it forever."""
+        from aegis.connectors.todoist import TodoistConnector
+
+        if self.db_pool is None or not task_id:
+            return {"parked": False}
+        labels = await self.db_pool.fetchval(
+            "SELECT labels FROM todoist_tasks WHERE id = $1", task_id
+        )
+        if labels is None:
+            return {"parked": False}
+        if PARK_LABEL in labels:
+            return {"parked": True}
+        new_labels = [*labels, PARK_LABEL]
+        await self._queue_command(
+            f"agent-task-park-{task_id}",
+            TodoistConnector.build_item_update_command(task_id, labels=new_labels),
+        )
+        # Optimistic local update so the next tick doesn't re-select the task
+        # before the 5-min sync round-trips.
+        await self.db_pool.execute(
+            "UPDATE todoist_tasks SET labels = $1, updated_at = now() WHERE id = $2",
+            new_labels,
+            task_id,
+        )
+        activity.logger.info("agent_task_parked task_id=%s reason=%s", task_id, reason[:120])
+        return {"parked": True}
+
+    @activity.defn
+    async def complete_task(self, task_id: str) -> dict:
+        """Close the task — only when no human work remains."""
+        from aegis.connectors.todoist import TodoistConnector
+
+        if self.db_pool is None or not task_id:
+            return {"completed": False}
+        exists = await self.db_pool.fetchval(
+            "SELECT 1 FROM todoist_tasks WHERE id = $1", task_id
+        )
+        if not exists:
+            return {"completed": False}
+        await self._queue_command(
+            f"agent-task-complete-{task_id}",
+            TodoistConnector.build_item_complete_command(task_id),
+        )
+        await self.db_pool.execute(
+            "UPDATE todoist_tasks SET is_completed = true, updated_at = now() WHERE id = $1",
+            task_id,
+        )
+        return {"completed": True}
+
+    @activity.defn
+    async def comment(self, task_id: str, agent_id: str, body: str) -> dict:
+        """Post a task comment. The `Workflow run:` footer is REQUIRED: clarify
+        excludes AEGIS-authored notes by matching it, and without it this
+        comment re-eligibles the task and the flow re-spawns every 15 min.
+
+        Delivery follows the established `build_note_add_command` +
+        `commands()` + `check_sync_status()` pattern (see
+        activities/alerts.py::post_task_note) — the Sync API envelope can
+        report ok=True while the per-command note_add was rejected, so the
+        envelope alone is not proof the comment landed.
+        """
+        from aegis.connectors.todoist import TodoistConnector
+
+        if self.todoist_connector is None or not task_id:
+            return {"ok": False}
+        info = activity.info() if activity.in_activity() else None
+        run_ref = info.workflow_id if info else "local"
+        content = f"[{agent_id}] {body}\n\nWorkflow run: {run_ref}"
+        cmd = TodoistConnector.build_note_add_command(task_id, content)
+        try:
+            result = await self.todoist_connector.commands([cmd])
+        except Exception as exc:  # noqa: BLE001 — comments are best-effort
+            activity.logger.warning("agent_task_comment_failed err=%s", str(exc)[:200])
+            return {"ok": False, "error": str(exc)[:200]}
+        status = TodoistConnector.check_sync_status(result, [cmd["uuid"]])
+        if not status["ok"]:
+            activity.logger.warning(
+                "agent_task_comment_rejected task_id=%s error=%s",
+                task_id,
+                str(status.get("envelope_error") or status.get("rejected"))[:200],
+            )
+        return {"ok": status["ok"]}
