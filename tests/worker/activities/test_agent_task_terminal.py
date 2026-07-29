@@ -53,6 +53,58 @@ async def test_park_missing_task_is_false_not_crash(db_pool, _seed):
     assert (await AgentTaskActivities(db_pool=db_pool).park_task("tm-absent", "x"))["parked"] is False
 
 
+async def test_park_task_requeues_once_the_first_park_has_drained(db_pool, _seed):
+    """Regression: temp_id is deterministic and permanent per task
+    (`agent-task-park-{task_id}`). If a previous park already drained to a
+    terminal outbox status (committed/failed) and the human/some other flow
+    then removed @waiting — returning the task to the pool — a later
+    park_task call must re-queue, not silently no-op forever while only the
+    local label projection changes (which the next TodoistSyncFlow pull then
+    overwrites via its `labels = EXCLUDED.labels` upsert)."""
+    act = AgentTaskActivities(db_pool=db_pool)
+    assert (await act.park_task("tm-1", "first park"))["parked"] is True
+
+    # Simulate TodoistSyncFlow having drained the first park, and @waiting
+    # having been removed again (task re-entered the pool).
+    await db_pool.execute(
+        "UPDATE todoist_outbox SET status = 'committed', committed_id = 'note-1' "
+        "WHERE temp_id = 'agent-task-park-tm-1'"
+    )
+    await db_pool.execute("UPDATE todoist_tasks SET labels = ARRAY['@pandora'] WHERE id = 'tm-1'")
+
+    assert (await act.park_task("tm-1", "second park"))["parked"] is True
+
+    row = await db_pool.fetchrow(
+        "SELECT status, attempt_count, command FROM todoist_outbox "
+        "WHERE temp_id = 'agent-task-park-tm-1'"
+    )
+    assert row["status"] == "pending"
+    assert row["attempt_count"] == 0
+    assert row["command"]["type"] == "item_update"
+    # Still exactly one row for the deterministic temp_id — re-queued in
+    # place, not duplicated.
+    count = await db_pool.fetchval(
+        "SELECT count(*) FROM todoist_outbox WHERE temp_id = 'agent-task-park-tm-1'"
+    )
+    assert count == 1
+
+
+async def test_queue_command_leaves_an_undrained_pending_row_untouched(db_pool, _seed):
+    """The other half of the fix: an outbox row still 'pending' (not yet
+    drained by TodoistSyncFlow) must NOT be clobbered by a second write to
+    the same temp_id — that would race a real in-flight sync attempt."""
+    act = AgentTaskActivities(db_pool=db_pool)
+    temp_id = "agent-task-park-tm-1"
+    await act._queue_command(temp_id, {"type": "item_update", "args": {"id": "tm-1", "n": 1}})
+    await act._queue_command(temp_id, {"type": "item_update", "args": {"id": "tm-1", "n": 2}})
+
+    row = await db_pool.fetchrow(
+        "SELECT status, command FROM todoist_outbox WHERE temp_id = $1", temp_id
+    )
+    assert row["status"] == "pending"
+    assert row["command"]["args"]["n"] == 1
+
+
 async def test_comment_body_carries_the_workflow_run_footer(db_pool, _seed):
     """Without this marker clarify treats the comment as fresh user input and
     re-spawns the flow every 15 minutes (loop shipped twice: 2026-05-21, 05-27).

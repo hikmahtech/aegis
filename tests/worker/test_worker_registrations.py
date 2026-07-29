@@ -108,6 +108,101 @@ def test_social_metrics_flow_in_schedule_map():
     assert config.window_days == 21
 
 
+def test_agent_task_sweep_flow_registered():
+    from aegis_worker.flows.agent_task import AgentTaskSweepFlow
+
+    assert AgentTaskSweepFlow in worker_main.WORKFLOWS, (
+        "AgentTaskSweepFlow must be registered in worker/__main__.py WORKFLOWS list"
+    )
+
+
+def test_agent_task_flow_registered():
+    from aegis_worker.flows.agent_task import AgentTaskFlow
+
+    assert AgentTaskFlow in worker_main.WORKFLOWS, (
+        "AgentTaskFlow must be registered in worker/__main__.py WORKFLOWS list"
+    )
+
+
+def test_agent_task_activities_registered():
+    names = _activity_names()
+    for expected in (
+        "find_actionable_tasks",
+        "load_task_context",
+        "park_task",
+        "complete_task",
+        "comment",
+    ):
+        assert expected in names, f"{expected} must be in __main__.ACTIVITIES list"
+
+
+def test_agent_task_sweep_flow_in_schedule_map():
+    from aegis_worker.schedule_sync import _ACTIVITY_TYPE_MAP
+
+    assert "AgentTaskSweepFlow" in _ACTIVITY_TYPE_MAP
+    _cls, config = _ACTIVITY_TYPE_MAP["AgentTaskSweepFlow"](
+        {
+            "agent_id": "pandoras-actor",
+            "config": {"max_tasks": 5, "cooldown_hours": 3, "max_coding": 2},
+        }
+    )
+    assert config.agent_id == "pandoras-actor"
+    assert config.max_tasks == 5
+    assert config.cooldown_hours == 3
+    assert config.max_coding == 2
+
+
+def test_agent_task_registrations_reach_mains_live_lists():
+    """`_activity_names()` and the WORKFLOWS-membership tests above only
+    inspect the module-level stubs (built at import time from db_pool=None
+    instances) — nothing checks that main()'s LIVE `workflows = [...]` /
+    `activities = [...]` lists (constructed inside main(), never exercised by
+    a plain import) also carry these entries. An entry present only in the
+    stub passes every test above and every generic AST guard
+    (test_module_stub_workflows_covers_runtime_base_list only checks
+    runtime ⊆ stub; test_every_registered_activity_is_decorated only checks
+    decoration) while still crashing the live worker at boot with an
+    unknown workflow/activity type. This closes that gap for the five new
+    agent_task registrations specifically.
+    """
+    import ast
+    import inspect
+
+    src = inspect.getsource(worker_main)
+    tree = ast.parse(src)
+
+    live_workflow_names: set[str] = set()
+    live_activity_attrs: set[str] = set()
+    for node in ast.walk(tree):
+        if not (
+            isinstance(node, ast.Assign)
+            and len(node.targets) == 1
+            and isinstance(node.targets[0], ast.Name)
+            and isinstance(node.value, ast.List)
+        ):
+            continue
+        target = node.targets[0].id
+        if target == "workflows":
+            live_workflow_names |= {elt.id for elt in node.value.elts if isinstance(elt, ast.Name)}
+        elif target == "activities":
+            live_activity_attrs |= {
+                elt.attr for elt in node.value.elts if isinstance(elt, ast.Attribute)
+            }
+
+    assert "AgentTaskSweepFlow" in live_workflow_names
+    assert "AgentTaskFlow" in live_workflow_names
+    for expected in (
+        "find_actionable_tasks",
+        "load_task_context",
+        "park_task",
+        "complete_task",
+        "comment",
+    ):
+        assert expected in live_activity_attrs, (
+            f"{expected} must be in main()'s live activities=[...] list, not just the module stub"
+        )
+
+
 def test_module_stub_workflows_covers_runtime_base_list():
     """The module-level WORKFLOWS stub (import-time; used by registration
     tests that never boot the worker) must include every workflow class in

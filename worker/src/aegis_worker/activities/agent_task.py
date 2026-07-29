@@ -154,11 +154,24 @@ class AgentTaskActivities:
     # --- terminal states ---
 
     async def _queue_command(self, temp_id: str, command: dict) -> None:
-        """Enqueue a Todoist Sync command. The deterministic temp_id makes
-        re-runs no-ops until TodoistSyncFlow drains it."""
+        """Enqueue a Todoist Sync command. The temp_id is deterministic and
+        permanent per task (e.g. `agent-task-park-{task_id}`), so a plain
+        `DO NOTHING` would only cover the FIRST park/complete ever — once
+        TodoistSyncFlow drains that row to a terminal status ('committed' or
+        'failed', per activities/todoist.py), a LATER re-park of the same
+        task (label removed, task re-enters the pool, cooldown re-fires)
+        would insert nothing, leaving only the local optimistic projection
+        updated — which the next TodoistSyncFlow pull overwrites via its
+        `labels = EXCLUDED.labels` upsert, silently dropping the park
+        forever. Re-queue whenever the existing row is terminal; leave an
+        undrained 'pending' row untouched so we don't clobber work in
+        flight."""
         await self.db_pool.execute(
             "INSERT INTO todoist_outbox (temp_id, command, status) "
-            "VALUES ($1, $2, 'pending') ON CONFLICT (temp_id) DO NOTHING",
+            "VALUES ($1, $2, 'pending') "
+            "ON CONFLICT (temp_id) DO UPDATE "
+            "SET command = EXCLUDED.command, status = 'pending', attempt_count = 0 "
+            "WHERE todoist_outbox.status <> 'pending'",
             temp_id,
             command,
         )

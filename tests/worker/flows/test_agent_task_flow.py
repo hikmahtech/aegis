@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import uuid
 
+import pytest
 from aegis_worker.flows.agent_task import (
     AgentTaskFlow,
     AgentTaskFlowInput,
@@ -11,6 +12,7 @@ from aegis_worker.flows.agent_task import (
     AgentTaskSweepFlow,
 )
 from temporalio import activity
+from temporalio.client import WorkflowFailureError
 from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import Worker
 
@@ -42,17 +44,13 @@ async def test_unknown_verb_parks_the_task_and_never_leaves_it_in_the_pool():
         calls.append(("park", reason))
         return {"parked": True}
 
-    @activity.defn(name="resolve_agents")
-    async def resolve_agents(tags: list[str]) -> dict:
-        return {"infra": "pandoras-actor"}
-
     async with await WorkflowEnvironment.start_time_skipping() as env:
         queue = f"tq-{uuid.uuid4()}"
         async with Worker(
             env.client,
             task_queue=queue,
             workflows=[AgentTaskFlow],
-            activities=[load_task_context, comment, park_task, resolve_agents],
+            activities=[load_task_context, comment, park_task],
         ):
             result = await env.client.execute_workflow(
                 AgentTaskFlow.run,
@@ -66,6 +64,48 @@ async def test_unknown_verb_parks_the_task_and_never_leaves_it_in_the_pool():
     assert result["verb"] == "unknown"
     assert result["status"] == "parked"
     assert any(kind == "park" for kind, _ in calls)
+
+
+async def test_activity_failure_still_parks_the_task_before_the_flow_fails():
+    """Regression: AgentTaskFlow.run must reach a terminal state even when a
+    step raises — otherwise the task is never parked, stays eligible, and the
+    6h cooldown re-picks (and re-fails) it forever."""
+    calls: list[tuple[str, str]] = []
+
+    @activity.defn(name="load_task_context")
+    async def load_task_context(task_id: str) -> dict:
+        return {"external_id": "", "fingerprint": "", "gmail_message_id": ""}
+
+    @activity.defn(name="comment")
+    async def comment(task_id: str, agent_id: str, body: str) -> dict:
+        raise RuntimeError("todoist unavailable")
+
+    @activity.defn(name="park_task")
+    async def park_task(task_id: str, reason: str) -> dict:
+        calls.append(("park", reason))
+        return {"parked": True}
+
+    async with await WorkflowEnvironment.start_time_skipping() as env:
+        queue = f"tq-{uuid.uuid4()}"
+        async with Worker(
+            env.client,
+            task_queue=queue,
+            workflows=[AgentTaskFlow],
+            activities=[load_task_context, comment, park_task],
+        ):
+            with pytest.raises(WorkflowFailureError):
+                await env.client.execute_workflow(
+                    AgentTaskFlow.run,
+                    AgentTaskFlowInput(
+                        agent_id="pandoras-actor", todoist_task_id="tf-1", task=_TASK
+                    ),
+                    id=f"agent-task-tf-1-{uuid.uuid4()}",
+                    task_queue=queue,
+                )
+
+    assert any(kind == "park" for kind, _ in calls), (
+        "the task must be parked even though the flow ultimately fails"
+    )
 
 
 async def test_sweep_spawns_one_child_per_task_and_does_not_await_them():

@@ -98,30 +98,65 @@ class AgentTaskFlow:
         task_id = input.todoist_task_id
         verb = resolve_verb(task)
 
-        await workflow.execute_activity(
-            "load_task_context",
-            args=[task_id],
-            start_to_close_timeout=TIMEOUT_FAST,
-            retry_policy=ACT_RETRY,
-        )
+        step = "load_task_context"
+        try:
+            context = await workflow.execute_activity(
+                "load_task_context",
+                args=[task_id],
+                start_to_close_timeout=TIMEOUT_FAST,
+                retry_policy=ACT_RETRY,
+            )
 
-        # Verb executors are added in Tasks 4-7. An unmapped verb parks the
-        # task rather than guessing at it.
-        await workflow.execute_activity(
-            "comment",
-            args=[
-                task_id,
-                input.agent_id,
-                f"No executor for this task type ({task.get('source_tag') or 'no source tag'}) "
-                "— leaving it for you.",
-            ],
-            start_to_close_timeout=TIMEOUT_FAST,
-            retry_policy=NO_RETRY,
-        )
-        await workflow.execute_activity(
-            "park_task",
-            args=[task_id, f"no executor for verb={verb}"],
-            start_to_close_timeout=TIMEOUT_FAST,
-            retry_policy=ACT_RETRY,
-        )
+            # Verb executors are added in Tasks 4-7. An unmapped verb parks
+            # the task rather than guessing at it. The loaded source identity
+            # (when recovered) rides along in the comment purely as a human
+            # debugging aid — no verb-specific behavior depends on it yet.
+            step = "comment"
+            source_note = (
+                f" (source: {context['external_id']})" if context.get("external_id") else ""
+            )
+            await workflow.execute_activity(
+                "comment",
+                args=[
+                    task_id,
+                    input.agent_id,
+                    f"No executor for this task type ({task.get('source_tag') or 'no source tag'})"
+                    f"{source_note} — leaving it for you.",
+                ],
+                # TIMEOUT_STANDARD (60s), not TIMEOUT_FAST (15s): comment()'s
+                # own connector call is best-effort internally, but the
+                # start-to-close deadline still needs enough room for that
+                # call to finish and hand back a caught {"ok": False} rather
+                # than have Temporal time out the activity out from under it.
+                start_to_close_timeout=TIMEOUT_STANDARD,
+                retry_policy=NO_RETRY,
+            )
+            step = "park_task"
+            await workflow.execute_activity(
+                "park_task",
+                args=[task_id, f"no executor for verb={verb}"],
+                start_to_close_timeout=TIMEOUT_FAST,
+                retry_policy=ACT_RETRY,
+            )
+        except Exception as exc:  # noqa: BLE001
+            # Every child MUST reach a terminal state — completed or parked —
+            # or the task sits in the eligible pool forever, re-picked and
+            # re-failed every cooldown window. Best-effort park here (own
+            # try/except so a park failure can't mask the original error)
+            # before re-raising with step context per repo convention.
+            try:
+                await workflow.execute_activity(
+                    "park_task",
+                    args=[task_id, f"agent_task_failed at step={step}: {exc!r}"],
+                    start_to_close_timeout=TIMEOUT_FAST,
+                    retry_policy=ACT_RETRY,
+                )
+            except Exception:  # noqa: BLE001
+                workflow.logger.warning(
+                    "agent_task_park_on_failure_failed task_id=%s step=%s", task_id, step
+                )
+            raise ApplicationError(
+                f"agent_task_failed at step={step}: {exc!r}", non_retryable=True
+            ) from exc
+
         return {"task_id": task_id, "verb": verb, "status": "parked"}
