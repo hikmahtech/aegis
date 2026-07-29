@@ -54,4 +54,4 @@ jobs:
         run: ruff check worker/src/ tests/worker/
 
       - name: Test
-        run: pytest tests/worker/ -v --tb=short --cov=worker/src/aegis_worker --cov-report=term-missing --cov-report=xml
+        run: pytest tests/worker/ -n auto --dist loadfile --timeout=300 -v --tb=short --cov=worker/src/aegis_worker --cov-report=term-missing --cov-report=xml
