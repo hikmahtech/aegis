@@ -1559,7 +1559,17 @@ Task 4 parks unhealthy services without offering a restart. This task adds the c
 
 from __future__ import annotations
 
+from unittest.mock import AsyncMock
+
+import pytest
 from aegis_worker.activities.agent_task import AgentTaskActivities
+
+
+@pytest.fixture(autouse=True)
+def _no_sleep(monkeypatch):
+    """The hook polls 5x4s for swarm convergence; don't really sleep 20s.
+    Same pattern as test_alert_investigation.py:305 for the analogous loop."""
+    monkeypatch.setattr("asyncio.sleep", AsyncMock())
 
 
 class _Recorder:
