@@ -30,6 +30,17 @@ EXCLUDED_LABELS = ["@someday", PARK_LABEL]
 # ponytail: fixed bound; move both caps into SQL if the pool ever nears it.
 _ELIGIBLE_SCAN_LIMIT = 200
 
+# comment() retries in-activity rather than via a Temporal retry_policy, so the
+# command uuid stays stable and the Sync API dedups. A parked task's comment is
+# its ONLY user-visible explanation, and a transient Todoist http_503 silently
+# lost both comments on this flow's first production tick (issue #159).
+# ponytail: 3 attempts / 2s; worst case 4s of sleep inside comment's 60s
+# TIMEOUT_STANDARD budget. `apply_restart_approval` calls comment() directly
+# inside InteractionFlow's hard 30s post_resolve deadline, so this must stay
+# small — see the budget note there before raising it.
+_COMMENT_ATTEMPTS = 3
+_COMMENT_RETRY_SECONDS = 2
+
 # source_tag → verb. source_tag is PRIMARY; @code is consulted only when
 # source_tag IS NULL (i.e. the task is user-authored). Clarify put a stray
 # @code label on a real #email task in prod, and treating that as "run a
@@ -291,29 +302,50 @@ class AgentTaskActivities:
         info = activity.info() if activity.in_activity() else None
         run_ref = info.workflow_id if info else "local"
         content = f"[{agent_id}] {body}\n\nWorkflow run: {run_ref}"
+        # Build the command ONCE and reuse it across attempts. The Sync API keys
+        # idempotency on the command uuid, so a retry with the same uuid cannot
+        # double-post; rebuilding it (which a Temporal activity retry would do,
+        # since the whole activity re-runs) mints a new uuid and could.
         cmd = TodoistConnector.build_note_add_command(task_id, content)
-        try:
-            result = await self.todoist_connector.commands([cmd])
-            status = TodoistConnector.check_sync_status(result, [cmd["uuid"]])
-        except Exception as exc:  # noqa: BLE001 — comments are best-effort
-            activity.logger.warning("agent_task_comment_failed err=%s", str(exc)[:200])
-            return {"ok": False, "error": str(exc)[:200]}
-        if status["ok"]:
-            return {"ok": True, "error": None}
-        if status["envelope_error"]:
-            activity.logger.warning(
-                "agent_task_comment_envelope_failed task_id=%s error=%s",
-                task_id,
-                str(status["envelope_error"])[:200],
-            )
-            return {"ok": False, "error": status["envelope_error"]}
-        rejected = status["rejected"].get(cmd["uuid"])
-        activity.logger.warning(
-            "agent_task_comment_rejected task_id=%s status=%s",
-            task_id,
-            str(rejected)[:200],
-        )
-        return {"ok": False, "error": f"command_rejected: {rejected}"}
+        last_error: Any = None
+        for attempt in range(1, _COMMENT_ATTEMPTS + 1):
+            try:
+                result = await self.todoist_connector.commands([cmd])
+                status = TodoistConnector.check_sync_status(result, [cmd["uuid"]])
+            except Exception as exc:  # noqa: BLE001 — comments are best-effort
+                last_error = str(exc)[:200]
+                activity.logger.warning(
+                    "agent_task_comment_failed task_id=%s attempt=%s err=%s",
+                    task_id,
+                    attempt,
+                    last_error,
+                )
+            else:
+                if status["ok"]:
+                    return {"ok": True, "error": None}
+                if status["envelope_error"]:
+                    # Transient in practice — a live Todoist http_503 lost both
+                    # comments on this flow's first production tick (issue #159).
+                    last_error = status["envelope_error"]
+                    activity.logger.warning(
+                        "agent_task_comment_envelope_failed task_id=%s attempt=%s error=%s",
+                        task_id,
+                        attempt,
+                        str(last_error)[:200],
+                    )
+                else:
+                    # A per-command rejection is a permanent 4xx-class verdict
+                    # (bad item id, malformed content) — retrying poison-loops.
+                    rejected = status["rejected"].get(cmd["uuid"])
+                    activity.logger.warning(
+                        "agent_task_comment_rejected task_id=%s status=%s",
+                        task_id,
+                        str(rejected)[:200],
+                    )
+                    return {"ok": False, "error": f"command_rejected: {rejected}"}
+            if attempt < _COMMENT_ATTEMPTS:
+                await asyncio.sleep(_COMMENT_RETRY_SECONDS)
+        return {"ok": False, "error": last_error}
 
     @activity.defn
     async def apply_restart_approval(
