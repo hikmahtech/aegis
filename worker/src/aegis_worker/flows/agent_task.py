@@ -19,7 +19,7 @@ from temporalio import workflow
 from temporalio.exceptions import ApplicationError, WorkflowAlreadyStartedError
 
 with workflow.unsafe.imports_passed_through():
-    from aegis_worker.activities.agent_task import resolve_verb
+    from aegis_worker.activities.agent_task import extract_service_name, resolve_verb
     from aegis_worker.shared.retry import (
         ACT_RETRY,
         NO_RETRY,
@@ -107,7 +107,11 @@ class AgentTaskFlow:
                 retry_policy=ACT_RETRY,
             )
 
-            # Verb executors are added in Tasks 4-7. An unmapped verb parks
+            if verb == "infra":
+                step = "run_infra"
+                return await self._run_infra(input, task_id)
+
+            # Verb executors are added in Tasks 5-7. An unmapped verb parks
             # the task rather than guessing at it. The loaded source identity
             # (when recovered) rides along in the comment purely as a human
             # debugging aid — no verb-specific behavior depends on it yet.
@@ -160,3 +164,86 @@ class AgentTaskFlow:
             ) from exc
 
         return {"task_id": task_id, "verb": verb, "status": "parked"}
+
+    async def _run_infra(self, input: AgentTaskFlowInput, task_id: str) -> dict:
+        """Check live service state; investigate and gate a restart if broken.
+
+        Deliberately does NOT replay alert history: only 12 of 42 open #alert
+        tasks have an alert_dedup_index row, and the 30 without one are exactly
+        the PROLONGED bulk. Every such title names a service, so asking Docker
+        about current state covers all of them.
+        """
+        title = str(input.task.get("content") or "")
+        service = extract_service_name(title)
+        if not service:
+            await workflow.execute_activity(
+                "comment",
+                args=[task_id, input.agent_id, "I couldn't tell which service this is about."],
+                start_to_close_timeout=TIMEOUT_STANDARD,
+                retry_policy=NO_RETRY,
+            )
+            await workflow.execute_activity(
+                "park_task",
+                args=[task_id, "service name not parseable from title"],
+                start_to_close_timeout=TIMEOUT_FAST,
+                retry_policy=ACT_RETRY,
+            )
+            return {"task_id": task_id, "verb": "infra", "status": "parked"}
+
+        health = await workflow.execute_activity(
+            "service_health",
+            args=[service],
+            start_to_close_timeout=TIMEOUT_STANDARD,
+            retry_policy=ACT_RETRY,
+        )
+
+        if health["found"] and health["healthy"]:
+            await workflow.execute_activity(
+                "comment",
+                args=[
+                    task_id,
+                    input.agent_id,
+                    f"`{service}` is healthy now ({health['detail']}) — this alert has "
+                    "resolved itself, so I'm closing the task.",
+                ],
+                start_to_close_timeout=TIMEOUT_STANDARD,
+                retry_policy=NO_RETRY,
+            )
+            await workflow.execute_activity(
+                "complete_task",
+                args=[task_id],
+                start_to_close_timeout=TIMEOUT_FAST,
+                retry_policy=ACT_RETRY,
+            )
+            return {"task_id": task_id, "verb": "infra", "status": "resolved", "service": service}
+
+        logs = await workflow.execute_activity(
+            "service_logs",
+            args=[service, 50],
+            start_to_close_timeout=TIMEOUT_STANDARD,
+            retry_policy=ACT_RETRY,
+        )
+        detail = health["detail"] if health["found"] else "not present in the swarm"
+        await workflow.execute_activity(
+            "comment",
+            args=[
+                task_id,
+                input.agent_id,
+                f"`{service}` is still unhealthy ({detail}).\n\n{logs['logs'][:1500]}",
+            ],
+            start_to_close_timeout=TIMEOUT_STANDARD,
+            retry_policy=NO_RETRY,
+        )
+
+        # Restarting is a write, so it needs human approval before this flow
+        # would ever execute it — that approval path (an InteractionFlow card
+        # + post_resolve activity, same pattern as social_publish.py/review.py)
+        # is not implemented yet. For now this run only investigates and
+        # parks; a human acts on the comment above manually.
+        await workflow.execute_activity(
+            "park_task",
+            args=[task_id, f"awaiting restart approval for {service}"],
+            start_to_close_timeout=TIMEOUT_FAST,
+            retry_policy=ACT_RETRY,
+        )
+        return {"task_id": task_id, "verb": "infra", "status": "parked", "service": service}

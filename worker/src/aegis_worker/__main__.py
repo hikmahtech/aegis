@@ -32,6 +32,7 @@ from aegis_worker.activities.delivery import DeliveryActivities
 from aegis_worker.activities.drive import DriveActivities
 from aegis_worker.activities.gmail import GmailActivities
 from aegis_worker.activities.homelab import HomelabActivities
+from aegis_worker.activities.infra_ops import InfraOpsActivities
 from aegis_worker.activities.intel_scan import IntelScanActivities
 from aegis_worker.activities.intelligence import IntelligenceActivities
 from aegis_worker.activities.interactions import InteractionActivities
@@ -105,6 +106,7 @@ _stub_social_act = SocialActivities(db_pool=None)
 _stub_agent_registry_act = AgentRegistryActivities(db_pool=None)
 _stub_llm_governor_act = LLMGovernorActivities(db_pool=None)
 _stub_agent_task_act = AgentTaskActivities(db_pool=None)
+_stub_infra_ops_act = InfraOpsActivities(homelab_connector=None)
 
 WORKFLOWS: list = [
     AgentChatReplyFlow,
@@ -150,6 +152,9 @@ ACTIVITIES: list = [
     _stub_agent_task_act.park_task,
     _stub_agent_task_act.complete_task,
     _stub_agent_task_act.comment,
+    _stub_infra_ops_act.service_health,
+    _stub_infra_ops_act.service_logs,
+    _stub_infra_ops_act.restart_service,
 ]
 
 
@@ -424,6 +429,7 @@ async def main():
         remote_script=connectors.get("remote_script"),
         homelab_connector=connectors.get("homelab"),
     )
+    infra_ops_act = InfraOpsActivities(homelab_connector=connectors.get("homelab"))
     # AlertInvestigationFlow posts start- and final-comments on the Todoist
     # track-task via alert_act.post_task_note. The dataclass declared
     # todoist_connector=None upstream; wire the live connector now.
@@ -580,6 +586,9 @@ async def main():
         agent_task_act.park_task,
         agent_task_act.complete_task,
         agent_task_act.comment,
+        infra_ops_act.service_health,
+        infra_ops_act.service_logs,
+        infra_ops_act.restart_service,
     ]
 
     if settings.homelab_enabled and homelab_act is not None:
