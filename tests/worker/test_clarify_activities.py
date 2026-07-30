@@ -741,6 +741,49 @@ def test_looks_like_notification_markers() -> None:
     assert not f("")
 
 
+def test_looks_like_notification_2026_07_additions() -> None:
+    """Issue #157: three markers added after auditing 33 real #email tasks.
+
+    Only unambiguous courtesy pings were added. The audit found the backlog is
+    mostly LEGITIMATE mail — bills, tax records, real action-required notices —
+    so widening aggressively would lose it. These titles are verbatim from prod.
+    """
+    f = ClarifyActivities._looks_like_notification
+    assert f("Pedram just messaged you")
+    assert f("Shadab just messaged you")
+    assert f("Mohammed Arshad, we\u2019ve got 2 new jobs for you")
+    assert f("Your Google Account was recovered successfully")
+
+
+def test_looks_like_notification_leaves_real_prod_actions_alone() -> None:
+    """The load-bearing half of #157. Every title below is a REAL open task in
+    prod that must stay actionable — marking one a notification keeps it out of
+    the 2-min card path AND lets the agent-task executor archive it, so a false
+    positive here silently loses mail.
+
+    The 'Meta Insights' entries matter most: 8 of the 33 open #email tasks are
+    one repeatedly-failing Make.com scenario plus a failed deployment. That is a
+    live broken integration, not noise — archiving it would hide the problem.
+    """
+    f = ClarifyActivities._looks_like_notification
+    for title in (
+        "\u26a0\ufe0f [Action required] Update your Stripe connections as soon as possible",
+        "Action required - Your account Ansaar.in Has Been Disabled",
+        "KYC update required for your account",
+        "Invoices not transmitted to ICEGATE because of non-authentication of Aadhaar",
+        "RE: GSTR-2B CONSO for the month of June 2026-27 of HIKMAH TECHNOLOGIES",
+        "Re: AEGIS + BacklinkLog",
+        "GST Invoice for GSTIN 27AHDPA9121XXXX",
+        "Tax Invoice for Internet Services of Mach1 Broadband",
+        "Your Axis Bank My Zone Credit Card Statement ending XX13 - July 2026",
+        "New bill from Mahavitaran - Maharashtra Electricity (MSEDCL). Pay now on Google Pay",
+        "\U0001f6d1 Encountered error in Meta Insights Daily  Marketing OS  scenario",
+        "\U0001f6d1 The scenario Meta Insights Daily  Marketing OS  has been stopped.",
+        "Failed deployment from arshadhikmah",
+    ):
+        assert not f(title), f"must stay actionable: {title!r}"
+
+
 @pytest.mark.asyncio
 async def test_classify_one_downgrades_notification_2min_to_trash(db_pool) -> None:
     """Issue #117: an #email task the LLM tags 2_min whose title reads like a
