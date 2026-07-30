@@ -16,7 +16,7 @@ be wrong. Prod data, 2026-07-29:
 |---|---|---|---|---|
 | `@sebas` | `#email` | 30/30 | 0 | Inbox mail clarify called a 2-min action |
 | `@pandora` | `#alert` | 40/43 | 0 | "PROLONGED: clickhouse_clickhouse degraded for over 2 hours", "Loki is down" |
-| `@maou` | `#receipt` | 7/7 | 0 | "Anomaly: ? Eleven Labs", "Renewal in 19.6 days: MSEDCL" |
+| `@maou` | `#receipt` | 7/7 | 0 | "Anomaly: ? Acme SaaS", "Renewal in 19.6 days: City Power Co" |
 
 **There is not one user-authored delegation.** All 80 agent-assigned tasks are AEGIS's own triage
 output, and the oldest has been sitting since 2026-07-01. So the real defect is that *AEGIS delegates
@@ -148,7 +148,7 @@ whether the service is healthy *now*, which works for all 42 and is what a human
 
 ### `#receipt` → finance (7 tasks)
 
-These are questions ("Anomaly: ? Eleven Labs"), not work — a human decides whether a charge is
+These are questions ("Anomaly: ? Acme SaaS"), not work — a human decides whether a charge is
 legitimate. So: gather context (prior charges for that merchant, the amount's history) and put a
 decision card up. No autonomous action; the value is the assembled context, not the decision.
 
@@ -185,8 +185,8 @@ create_github_pr                → @waiting
 
 Repo resolution, most reliable first:
 
-1. **Todoist project → repo.** The projects already mirror repos: BCP → `Stockopedia/bcp`, Aegis →
-   `hikmahtech/aegis`, Home Infra → `hikmahtech/homelab-gitops`, DrWho → `hikmahtech/drwhome`. A
+1. **Todoist project → repo.** The projects already mirror repos: BCP → `acme/api`, Aegis →
+   `hikmahtech/aegis`, Home Infra → `acme/infra`, DrWho → `acme/webapp`. A
    stored, editable map.
 2. **Title/description matching**, reusing the tiers inside `resolve_alert_resource` via a synthetic
    alert-shaped dict (`title`=content, `fingerprint`=`task:<id>`). The KG tier misses on a synthetic
