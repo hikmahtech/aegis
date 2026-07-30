@@ -25,7 +25,9 @@ with workflow.unsafe.imports_passed_through():
     from aegis_worker.shared.retry import (
         ACT_RETRY,
         NO_RETRY,
+        RETRY_ONCE,
         TIMEOUT_FAST,
+        TIMEOUT_LONG,
         TIMEOUT_STANDARD,
     )
 
@@ -120,6 +122,10 @@ class AgentTaskFlow:
             if verb == "finance":
                 step = "run_finance"
                 return await self._run_finance(input, task_id)
+
+            if verb == "coding":
+                step = "run_coding"
+                return await self._run_coding(input, task_id)
 
             # Any remaining verb parks the task rather than guessing at it.
             # The loaded source identity (when recovered) rides along in the
@@ -412,3 +418,68 @@ class AgentTaskFlow:
             retry_policy=ACT_RETRY,
         )
         return {"task_id": task_id, "verb": "finance", "status": "carded"}
+
+    async def _run_coding(self, input: AgentTaskFlowInput, task_id: str) -> dict:
+        """Phase 1: resolve the repo, investigate read-only, card the plan."""
+        repo = await workflow.execute_activity(
+            "resolve_task_repo",
+            args=[input.task],
+            start_to_close_timeout=TIMEOUT_STANDARD,
+            retry_policy=ACT_RETRY,
+        )
+        if not repo["github_repo"]:
+            await workflow.execute_activity(
+                "comment",
+                args=[
+                    task_id,
+                    input.agent_id,
+                    "I couldn't work out which repository this task is about, so I "
+                    "haven't touched anything.",
+                ],
+                start_to_close_timeout=TIMEOUT_STANDARD,
+                retry_policy=NO_RETRY,
+            )
+            await workflow.execute_activity(
+                "park_task",
+                args=[task_id, "repo unresolved"],
+                start_to_close_timeout=TIMEOUT_FAST,
+                retry_policy=ACT_RETRY,
+            )
+            return {"task_id": task_id, "verb": "coding", "status": "parked"}
+
+        investigation = await workflow.execute_activity(
+            "run_task_investigation",
+            args=[
+                task_id,
+                str(input.task.get("content") or ""),
+                str(input.task.get("description") or ""),
+                repo["repo_path"],
+                repo["github_repo"],
+            ],
+            start_to_close_timeout=TIMEOUT_LONG,
+            retry_policy=RETRY_ONCE,
+        )
+
+        await workflow.execute_activity(
+            "comment",
+            args=[
+                task_id,
+                input.agent_id,
+                f"Investigating in `{repo['github_repo']}` "
+                f"(run {investigation.get('run_id', '?')}).",
+            ],
+            start_to_close_timeout=TIMEOUT_STANDARD,
+            retry_policy=NO_RETRY,
+        )
+        await workflow.execute_activity(
+            "park_task",
+            args=[task_id, "coding investigation dispatched"],
+            start_to_close_timeout=TIMEOUT_FAST,
+            retry_policy=ACT_RETRY,
+        )
+        return {
+            "task_id": task_id,
+            "verb": "coding",
+            "status": "investigating",
+            "repo": repo["github_repo"],
+        }

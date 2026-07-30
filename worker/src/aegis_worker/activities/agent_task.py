@@ -86,6 +86,16 @@ def extract_merchant(title: str) -> str:
     return ""
 
 
+# Todoist project name → GitHub repo. The projects already mirror repos, which
+# is a far stronger signal than guessing from a task title.
+PROJECT_REPO_MAP = {
+    "bcp": "Stockopedia/bcp",
+    "aegis": "hikmahtech/aegis",
+    "home infra": "hikmahtech/homelab-gitops",
+    "drwho": "hikmahtech/drwhome",
+}
+
+
 @dataclass
 class AgentTaskActivities:
     db_pool: Any = None
@@ -465,3 +475,96 @@ class AgentTaskActivities:
             "agent_task_finance_no_action interaction_id=%s choice=%s", interaction_id, choice
         )
         return {"applied": "none"}
+
+    @activity.defn
+    async def resolve_task_repo(self, task: dict) -> dict:
+        """Resolve a coding task to a repo. Never guesses.
+
+        Tier 1 is the Todoist project name. An unresolved repo is a hard stop —
+        running a coding agent against the wrong checkout is worse than not
+        running it.
+        """
+        empty = {"github_repo": "", "repo_path": "", "source": "none", "candidates": []}
+        project_id = task.get("project_id")
+        if self.db_pool is None or not project_id:
+            return empty
+        name = await self.db_pool.fetchval(
+            "SELECT name FROM todoist_projects WHERE id = $1", project_id
+        )
+        if not name:
+            return empty
+        github_repo = PROJECT_REPO_MAP.get(str(name).strip().lower(), "")
+        if not github_repo:
+            activity.logger.info("agent_task_repo_unmapped project=%s", name)
+            return empty
+        # repo_path is the workspace-relative checkout path start_kimi_run needs.
+        # The JSONB key is `path`, NOT `resource_path`. `resource_path` is only an
+        # application-level rename applied AFTER reading (alerts.py:521);
+        # inventory.py:386-397 writes {"path", "github_repo", "origin_url"}.
+        # Querying 'resource_path' always yields NULL, silently flattening a
+        # nested checkout (stockopedia/bcp -> bcp) so start_kimi_run then hard-
+        # fails with a false "Repo checkout missing".
+        row = await self.db_pool.fetchrow(
+            "SELECT metadata->>'path' AS rpath FROM resources "
+            "WHERE kind = 'repository' AND metadata->>'github_repo' = $1 LIMIT 1",
+            github_repo,
+        )
+        return {
+            "github_repo": github_repo,
+            "repo_path": (row["rpath"] if row and row["rpath"] else github_repo.split("/")[-1]),
+            "source": "project_map",
+            "candidates": [],
+        }
+
+    @activity.defn
+    async def run_task_investigation(
+        self,
+        task_id: str,
+        title: str,
+        description: str,
+        repo_path: str,
+        github_repo: str,
+    ) -> dict:
+        """Read-only coding-CLI run: understand the task and propose a plan.
+
+        Phase 1 of two. Investigating first means a misread task or wrong repo
+        costs nothing. MUST NOT write code — the prompt says so and the plan
+        card gates phase 2.
+        """
+        if self.remote_script is None or not repo_path:
+            return {"status": "failed", "transcript": "", "run_id": ""}
+
+        prompt = (
+            "You are investigating a task. Do NOT modify any files, do NOT commit, "
+            "do NOT create branches.\n\n"
+            f"Task: {title}\n\n{description}\n\n"
+            "Read the code and report:\n"
+            "1. What the task is actually asking for.\n"
+            "2. Which files would need to change.\n"
+            "3. A short implementation plan.\n"
+            "4. Anything that makes this ambiguous or risky.\n\n"
+            "End your final message with exactly one of:\n"
+            "     STATUS: scoped\n"
+            "     STATUS: unactionable: <why>\n"
+        )
+        settings = await self.remote_script.coding_settings()
+        started = await self.remote_script.start_kimi_run(
+            repo=repo_path,
+            prompt=prompt,
+            kimi_binary=settings.get("kimi_binary", ""),
+            github_repo=github_repo,
+        )
+        if started.get("status") != "running":
+            return {
+                "status": "failed",
+                "transcript": started.get("error", "")[:500],
+                "run_id": started.get("run_id", ""),
+            }
+        return {
+            "status": "running",
+            "transcript": "",
+            "run_id": started.get("run_id", ""),
+            "output_file": started.get("output_file", ""),
+            "host": started.get("host", ""),
+            "worktree_path": started.get("worktree_path", ""),
+        }
