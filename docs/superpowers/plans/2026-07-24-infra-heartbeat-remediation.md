@@ -846,7 +846,7 @@ ruff check . && git add worker/src/aegis_worker/flows/infra_heartbeat.py tests/w
     ConfigKey(
         "slack_owner_member_id", "Slack member id for escalation mentions",
         "System Monitoring", False,
-        help="Used to @-mention you on unacked critical infra cards (e.g. U0123456789). "
+        help="Used to @-mention you on unacked critical infra cards (e.g. UXXXXXXXXX). "
         "Blank = escalate without mention. Worker restart required.",
     ),
 ```
