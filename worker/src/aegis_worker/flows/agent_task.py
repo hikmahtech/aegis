@@ -26,6 +26,7 @@ with workflow.unsafe.imports_passed_through():
         CreateGithubPrInput,
         StagePendingPrInput,
     )
+    from aegis_worker.flows.alert_investigation import _build_repo_confirm_prompt
     from aegis_worker.flows.interaction import InteractionFlow, InteractionFlowInput
     from aegis_worker.shared.retry import (
         ACT_RETRY,
@@ -493,6 +494,63 @@ class AgentTaskFlow:
 
         return await self._implement_and_open_pr(input, task_id, repo, plan)
 
+    async def _confirm_repo_gate0(
+        self, input: AgentTaskFlowInput, task_id: str, candidates: list[dict]
+    ) -> dict | None:
+        """Tier 3: resolve_task_repo's tiers 1-2 didn't confidently resolve a
+        repo but did surface candidates — ask rather than guess. Mirrors
+        alert_investigation.py's Gate-0 repo-confirm card (same
+        _build_repo_confirm_prompt + numbered candidate menu), blocking here
+        because AgentTaskFlow is already an ABANDONED child of the sweep (safe
+        to await, same reasoning as the plan/PR cards above).
+
+        Returns the resolved repo dict on a confirmed pick, or None on
+        decline/timeout — the caller then parks exactly as it would for a
+        fully-unresolved repo."""
+        top = candidates[:5]
+        if not top:
+            return None
+        options = {
+            str(i): f"{i + 1}. 📦 {c.get('resource_title') or c.get('github_repo') or '?'}"
+            for i, c in enumerate(top)
+        }
+        options["none"] = "❌ None of these / cancel"
+        prompt = _build_repo_confirm_prompt(
+            title=str(input.task.get("content") or ""),
+            source="agent_task",
+            severity="",
+            service="",
+            description=str(input.task.get("description") or ""),
+            task_id=task_id,
+            candidates=top,
+        )
+        picked = await workflow.execute_child_workflow(
+            InteractionFlow.run,
+            InteractionFlowInput(
+                agent_id=input.agent_id,
+                kind="choice",
+                origin="agent_task_repo_confirm",
+                prompt=prompt,
+                options=options,
+                timeout_seconds=86400,
+                timeout_policy="archive",
+            ),
+            id=f"agent-task-repo-confirm-{task_id}",
+        )
+        if getattr(picked, "status", None) == "archived":
+            return None
+        picked_val = ((picked.response or {}).get("value") or "").strip()
+        if not picked_val.isdigit() or int(picked_val) >= len(top):
+            return None
+        chosen = top[int(picked_val)]
+        chosen_repo = chosen.get("github_repo") or ""
+        return {
+            "github_repo": chosen_repo,
+            "repo_path": chosen.get("resource_path") or chosen_repo.split("/")[-1],
+            "source": "user_confirmed",
+            "candidates": [],
+        }
+
     async def _investigate_coding_task(self, input: AgentTaskFlowInput, task_id: str) -> dict:
         """Phase 1: resolve the repo, run a read-only investigation, and post
         the plan as a comment. Returns the terminal result dict directly on
@@ -505,6 +563,12 @@ class AgentTaskFlow:
             start_to_close_timeout=TIMEOUT_STANDARD,
             retry_policy=ACT_RETRY,
         )
+        # Tier 3: tiers 1-2 didn't confidently resolve a repo but did surface
+        # candidates — ask rather than guess (Gate-0 confirm card).
+        if not repo["github_repo"] and repo.get("candidates"):
+            confirmed = await self._confirm_repo_gate0(input, task_id, repo["candidates"])
+            if confirmed is not None:
+                repo = confirmed
         if not repo["github_repo"]:
             return await self._park_coding(
                 task_id,
