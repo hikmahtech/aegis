@@ -1542,6 +1542,9 @@ Task 4 parks unhealthy services without offering a restart. This task adds the c
 - Modify: `worker/src/aegis_worker/__main__.py`
 - Test: `tests/worker/activities/test_agent_task_restart_hook.py`
 
+**Add `import asyncio` at the top of `activities/agent_task.py`** — the convergence poll needs it.
+**In the test, monkeypatch `asyncio.sleep`** so the 20s poll doesn't slow the suite.
+
 **Interfaces:**
 - Consumes: `InfraOpsActivities.restart_service`, `service_health`, `complete_task`, `park_task`, `comment`.
 - Produces: `AgentTaskActivities.apply_restart_approval(interaction_id: str, response: dict, metadata: dict) -> dict`
@@ -1561,6 +1564,7 @@ from aegis_worker.activities.agent_task import AgentTaskActivities
 
 class _Recorder:
     def __init__(self, healthy_after_restart: bool):
+        # Mirrors InfraOpsActivities' surface so the hook's poll loop works.
         self.healthy_after = healthy_after_restart
         self.restarted: list[str] = []
         self.completed: list[str] = []
@@ -1683,7 +1687,22 @@ Add the collaborator field to the dataclass (alongside `todoist_connector` etc.)
             return {"applied": "none"}
 
         restart = await self.infra_ops.restart_service(service)
-        health = await self.infra_ops.service_health(service)
+        # `restart_service` runs `docker service update --force --detach`
+        # (connectors/homelab.py:175) and returns BEFORE the swarm converges, so
+        # a single immediate health check would essentially never see recovery.
+        # The sibling `remediate_infra_service` (alerts.py:1220-1252) polls 6x5s
+        # for exactly this reason — but this runs as InteractionFlow's
+        # post_resolve activity, which has a hard 30s timeout
+        # (flows/interaction.py:67), so budget the poll well inside it.
+        # ponytail: 5x4s=20s; if swarm convergence is routinely slower, move the
+        # verification out of the hook and let the next sweep tick observe it.
+        health = {"healthy": False, "detail": "not checked"}
+        if restart.get("ok"):
+            for _ in range(5):
+                await asyncio.sleep(4)
+                health = await self.infra_ops.service_health(service)
+                if health.get("healthy"):
+                    break
         if restart.get("ok") and health.get("healthy"):
             await self.comment(
                 task_id, agent_id, f"Restarted `{service}` and it's healthy again — closing."
@@ -1693,8 +1712,9 @@ Add the collaborator field to the dataclass (alongside `todoist_connector` etc.)
             await self.comment(
                 task_id,
                 agent_id,
-                f"Restarted `{service}` but it's still not healthy "
-                f"({health.get('detail', 'unknown')}) — needs a look.",
+                f"Restarted `{service}` but it hadn't come back healthy within 20s "
+                f"({health.get('detail', 'unknown')}) — it may still be converging; "
+                "leaving this open for you.",
             )
             await self.park_task(task_id, "restart did not restore health")
         return {"applied": "approved"}
@@ -1840,7 +1860,9 @@ def _act(gmail: _Gmail) -> AgentTaskActivities:
 
 async def test_notification_is_archived_on_the_owning_account():
     gmail = _Gmail(owner="arshad-stpd")
-    result = await _act(gmail).triage_email("te-1", "Plan Expiry Notification", "msg-1")
+    result = await _act(gmail).triage_email(
+        "te-1", "Arshad, here's a Pulse survey for you", "msg-1"
+    )
     assert result["action"] == "archived"
     assert result["account"] == "arshad-stpd"
     assert gmail.labelled == [("arshad-stpd", "msg-1", "ARCHIVE")]
@@ -1857,14 +1879,18 @@ async def test_real_action_email_is_left_for_the_human():
 
 async def test_message_in_no_account_is_not_found():
     gmail = _Gmail(owner=None)
-    result = await _act(gmail).triage_email("te-3", "Plan Expiry Notification", "msg-3")
+    result = await _act(gmail).triage_email(
+        "te-3", "Arshad, here's a Pulse survey for you", "msg-3"
+    )
     assert result["action"] == "not_found"
 
 
 async def test_missing_message_id_is_needs_human_not_archive():
     """Without an id we cannot verify what we'd archive, so never guess."""
     gmail = _Gmail(owner="arshad-stpd")
-    result = await _act(gmail).triage_email("te-4", "Plan Expiry Notification", "")
+    result = await _act(gmail).triage_email(
+        "te-4", "Arshad, here's a Pulse survey for you", ""
+    )
     assert result["action"] == "needs_human"
     assert gmail.labelled == []
 ```
@@ -2068,8 +2094,11 @@ async def _charges(db_pool):
     await db_pool.execute(
         "INSERT INTO finance.recurring_charge "
         "  (account, sender_label, vendor_name, amount_cents, currency, last_seen_at) "
+        # UNIQUE (account, sender_label, amount_cents, currency) —
+        # migrations/001_baseline.sql:726. Identical amount_cents on both rows
+        # would be a duplicate-key violation at fixture setup.
         "VALUES ('a','s','Eleven Labs', 2200, 'USD', now() - interval '30 days'), "
-        "       ('a','s','Eleven Labs', 2200, 'USD', now() - interval '60 days')"
+        "       ('a','s','Eleven Labs', 2500, 'USD', now() - interval '60 days')"
     )
     yield
     await db_pool.execute("DELETE FROM finance.recurring_charge WHERE vendor_name = 'Eleven Labs'")
@@ -2230,7 +2259,15 @@ Expected: PASS — 8 passed
 
 - [ ] **Step 5: Wire the finance branch into the flow**
 
-In `AgentTaskFlow.run`, add before the unknown-verb fallback:
+First add the import inside the `workflow.unsafe.imports_passed_through()` block at the top of
+`flows/agent_task.py` — it is not there yet, and every other flow that spawns a card imports it the
+same way (`flows/social_publish.py:26`):
+
+```python
+    from aegis_worker.flows.interaction import InteractionFlow, InteractionFlowInput
+```
+
+Then in `AgentTaskFlow.run`, add before the unknown-verb fallback:
 
 ```python
         if verb == "finance":
@@ -2364,10 +2401,11 @@ async def _seed(db_pool):
         "INSERT INTO todoist_projects (id, name, is_managed, is_archived, order_idx) "
         "VALUES ('pr-bcp','BCP',false,false,1), ('pr-unknown','Nowhere',false,false,2)"
     )
+    # `path` must be present AND nested, so a wrong JSONB key is catchable.
     await db_pool.execute(
         "INSERT INTO resources (slug, kind, title, metadata) VALUES "
         "('test-repo-bcp','repository','Stockopedia/bcp',"
-        " '{\"github_repo\": \"Stockopedia/bcp\"}'::jsonb)"
+        " '{\"github_repo\": \"Stockopedia/bcp\", \"path\": \"stockopedia/bcp\"}'::jsonb)"
     )
     yield
     await db_pool.execute("DELETE FROM todoist_projects WHERE id LIKE 'pr-%'")
@@ -2381,6 +2419,9 @@ async def test_project_name_resolves_to_repo(db_pool, _seed):
     )
     assert result["github_repo"] == "Stockopedia/bcp"
     assert result["source"] == "project_map"
+    # Load-bearing: proves the JSONB key is right. Without this the wrong key
+    # ships green, flattening every nested checkout.
+    assert result["repo_path"] == "stockopedia/bcp"
 
 
 async def test_unmapped_project_returns_no_repo_never_a_guess(db_pool, _seed):
@@ -2442,8 +2483,14 @@ PROJECT_REPO_MAP = {
             activity.logger.info("agent_task_repo_unmapped project=%s", name)
             return empty
         # repo_path is the workspace-relative checkout path start_kimi_run needs.
+        # The JSONB key is `path`, NOT `resource_path`. `resource_path` is only an
+        # application-level rename applied AFTER reading (alerts.py:521);
+        # inventory.py:386-397 writes {"path", "github_repo", "origin_url"}.
+        # Querying 'resource_path' always yields NULL, silently flattening a
+        # nested checkout (stockopedia/bcp -> bcp) so start_kimi_run then hard-
+        # fails with a false "Repo checkout missing".
         row = await self.db_pool.fetchrow(
-            "SELECT metadata->>'resource_path' AS rpath FROM resources "
+            "SELECT metadata->>'path' AS rpath FROM resources "
             "WHERE kind = 'repository' AND metadata->>'github_repo' = $1 LIMIT 1",
             github_repo,
         )
@@ -2464,7 +2511,8 @@ Expected: PASS — 3 passed
 
 This reuses the coding-run machinery and the transcript extraction fixed in #150. Read
 `worker/src/aegis_worker/activities/alerts.py::run_investigation` (around line 1990) and mirror its
-start → poll → extract loop, then:
+**start step ONLY** — polling and transcript extraction are Task 9's `collect_coding_run`. Adding a
+poll loop here would defeat the two-phase split. Then:
 
 ```python
     @activity.defn
