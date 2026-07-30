@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import dataclasses
+
 import pytest
 from aegis_worker.activities.agent_task import AgentTaskActivities
+from temporalio.testing import ActivityEnvironment
 
 
 @pytest.fixture(autouse=True)
@@ -156,3 +159,27 @@ async def test_missing_task_id_takes_no_action():
     result = await _act(rec).apply_restart_approval("i1", {"value": "approve"}, {})
     assert result == {"applied": "none"}
     assert rec.restarted == []
+
+
+async def test_attempt_greater_than_one_does_not_reissue_the_restart():
+    """Issue #155. `post_resolve_activity` runs with maximum_attempts=2
+    (flows/interaction.py's _BEST_EFFORT_RETRY) and `restart_service` is a
+    real write (`docker service update --force`) — a retried attempt must
+    NOT re-issue it, or a timeout re-entering this function would reschedule
+    the tasks the first call just scheduled, actively delaying the
+    convergence being polled for.
+
+    The tests above all call apply_restart_approval as a plain coroutine, so
+    `activity.in_activity()` is False and the attempt>1 guard's condition can
+    never be true there — that leaves the guard correct only by inspection.
+    Run it inside a real ActivityEnvironment with attempt=2 faked in to
+    actually exercise the branch."""
+    rec = _Recorder(healthy_on_call=1)
+    env = ActivityEnvironment()
+    env.info = dataclasses.replace(env.info, attempt=2)
+    result = await env.run(_act(rec).apply_restart_approval, "i1", {"value": "approve"}, _META)
+    assert result == {"applied": "approved"}
+    assert rec.restarted == [], "attempt>1 must not re-issue restart_service"
+    # The rest of the hook must still run normally off the faked "already
+    # issued" restart result — health gets polled and the task completes.
+    assert rec.completed == ["tr-1"]
