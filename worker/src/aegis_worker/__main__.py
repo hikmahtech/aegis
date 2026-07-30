@@ -153,6 +153,7 @@ ACTIVITIES: list = [
     _stub_agent_task_act.complete_task,
     _stub_agent_task_act.comment,
     _stub_agent_task_act.apply_restart_approval,
+    _stub_agent_task_act.triage_email,
     _stub_infra_ops_act.service_health,
     _stub_infra_ops_act.service_logs,
     _stub_infra_ops_act.restart_service,
@@ -435,6 +436,19 @@ async def main():
     # ops. Mirrors the existing `alert_act.todoist_connector = todoist_connector`
     # late-wiring below.
     agent_task_act.infra_ops = infra_ops_act
+    # triage_email needs GmailActivities.apply_label plus the set of accounts
+    # to probe. Active email channels are the Gmail accounts to probe. Read
+    # them from the channels table (kind='email', active) — config->>'label'
+    # is the account label apply_label expects: arshad-personal, arshad-stpd,
+    # arshad-hikmah in prod.
+    agent_task_act.gmail_activities = gmail_act
+    agent_task_act.gmail_accounts = [
+        r["label"]
+        for r in await deps.pool.fetch(
+            "SELECT config->>'label' AS label FROM channels "
+            "WHERE kind = 'email' AND active AND config->>'label' IS NOT NULL"
+        )
+    ]
     # AlertInvestigationFlow posts start- and final-comments on the Todoist
     # track-task via alert_act.post_task_note. The dataclass declared
     # todoist_connector=None upstream; wire the live connector now.
@@ -592,6 +606,7 @@ async def main():
         agent_task_act.complete_task,
         agent_task_act.comment,
         agent_task_act.apply_restart_approval,
+        agent_task_act.triage_email,
         infra_ops_act.service_health,
         infra_ops_act.service_logs,
         infra_ops_act.restart_service,

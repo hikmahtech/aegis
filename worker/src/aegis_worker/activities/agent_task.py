@@ -78,6 +78,10 @@ class AgentTaskActivities:
     # InfraOpsActivities instance. A plain field, not a private seam, so tests
     # pass a fake and production passes the real thing.
     infra_ops: Any = None
+    # GmailActivities instance (for triage_email's apply_label calls). A plain
+    # field like infra_ops above, late-wired in __main__.py after GmailActivities
+    # is constructed.
+    gmail_activities: Any = None
 
     @activity.defn
     async def find_actionable_tasks(
@@ -340,3 +344,32 @@ class AgentTaskActivities:
             )
             await self.park_task(task_id, "restart did not restore health")
         return {"applied": "approved"}
+
+    @activity.defn
+    async def triage_email(self, task_id: str, title: str, gmail_message_id: str) -> dict:
+        """Archive notification mail; leave anything needing a reply.
+
+        Sending is impossible under the current `gmail.modify` scope, so a real
+        action is parked for the user rather than answered.
+
+        Reuses clarify's notification detection so this flow and the classifier
+        agree on what counts as junk.
+        """
+        from aegis_worker.activities.clarify import ClarifyActivities
+
+        if not gmail_message_id:
+            return {"action": "needs_human", "account": ""}
+        if not ClarifyActivities._looks_like_notification(title):
+            return {"action": "needs_human", "account": ""}
+        if self.gmail_activities is None:
+            return {"action": "not_found", "account": ""}
+
+        # The task doesn't record which of the three accounts the message came
+        # from, so probe: a wrong account 404s, which is a clean discriminator.
+        for account in self.gmail_accounts:
+            result = await self.gmail_activities.apply_label(
+                account, gmail_message_id, "ARCHIVE"
+            )
+            if result.get("ok"):
+                return {"action": "archived", "account": account}
+        return {"action": "not_found", "account": ""}

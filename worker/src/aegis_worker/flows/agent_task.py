@@ -13,6 +13,7 @@ it the 6h cooldown is an infinite slow loop.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from html import escape as _esc
 from typing import Any
 
 from temporalio import workflow
@@ -112,7 +113,11 @@ class AgentTaskFlow:
                 step = "run_infra"
                 return await self._run_infra(input, task_id)
 
-            # Verb executors are added in Tasks 5-7. An unmapped verb parks
+            if verb == "email":
+                step = "run_email"
+                return await self._run_email(input, task_id, context)
+
+            # Verb executors are added in Task 7. An unmapped verb parks
             # the task rather than guessing at it. The loaded source identity
             # (when recovered) rides along in the comment purely as a human
             # debugging aid — no verb-specific behavior depends on it yet.
@@ -247,7 +252,7 @@ class AgentTaskFlow:
                     kind="choice",
                     origin="agent_task_infra",
                     prompt=(
-                        f"🔧 <b>{service}</b> is unhealthy ({detail}).\n\n"
+                        f"🔧 <b>{_esc(service)}</b> is unhealthy ({detail}).\n\n"
                         "Restart it?"
                     ),
                     options={"approve": "🔄 Restart", "skip": "⏭️ Leave it"},
@@ -275,3 +280,58 @@ class AgentTaskFlow:
             retry_policy=ACT_RETRY,
         )
         return {"task_id": task_id, "verb": "infra", "status": "carded", "service": service}
+
+    async def _run_email(
+        self, input: AgentTaskFlowInput, task_id: str, context: dict
+    ) -> dict:
+        """Archive notification mail; park anything needing a human reply."""
+        title = str(input.task.get("content") or "")
+        outcome = await workflow.execute_activity(
+            "triage_email",
+            args=[task_id, title, context.get("gmail_message_id", "")],
+            start_to_close_timeout=TIMEOUT_STANDARD,
+            retry_policy=ACT_RETRY,
+        )
+
+        if outcome["action"] == "archived":
+            await workflow.execute_activity(
+                "comment",
+                args=[
+                    task_id,
+                    input.agent_id,
+                    "This is an automated notification, not an action — archived it "
+                    f"in {outcome['account']} and closing the task.",
+                ],
+                # TIMEOUT_STANDARD, not TIMEOUT_FAST: comment()'s own connector
+                # call needs enough room to finish and hand back a caught
+                # {"ok": False} rather than have Temporal cancel it mid-call
+                # (same reasoning as every other comment() call site here).
+                start_to_close_timeout=TIMEOUT_STANDARD,
+                retry_policy=NO_RETRY,
+            )
+            await workflow.execute_activity(
+                "complete_task",
+                args=[task_id],
+                start_to_close_timeout=TIMEOUT_FAST,
+                retry_policy=ACT_RETRY,
+            )
+            return {"task_id": task_id, "verb": "email", "status": "archived"}
+
+        reason = (
+            "needs a reply, and I can't send mail (scope is gmail.modify)"
+            if outcome["action"] == "needs_human"
+            else "I couldn't find this message in any connected account"
+        )
+        await workflow.execute_activity(
+            "comment",
+            args=[task_id, input.agent_id, f"Leaving this one for you — {reason}."],
+            start_to_close_timeout=TIMEOUT_STANDARD,
+            retry_policy=NO_RETRY,
+        )
+        await workflow.execute_activity(
+            "park_task",
+            args=[task_id, f"email {outcome['action']}"],
+            start_to_close_timeout=TIMEOUT_FAST,
+            retry_policy=ACT_RETRY,
+        )
+        return {"task_id": task_id, "verb": "email", "status": "parked"}
