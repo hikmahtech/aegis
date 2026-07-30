@@ -3134,7 +3134,7 @@ Replace everything in `_run_coding` after the `run_task_investigation` call with
             await workflow.execute_activity(
                 "comment",
                 args=[task_id, input.agent_id, "I couldn't start a coding run for this."],
-                start_to_close_timeout=TIMEOUT_FAST,
+                start_to_close_timeout=TIMEOUT_STANDARD,
                 retry_policy=NO_RETRY,
             )
             await workflow.execute_activity(
@@ -3157,7 +3157,7 @@ Replace everything in `_run_coding` after the `run_task_investigation` call with
             await workflow.execute_activity(
                 "comment",
                 args=[task_id, input.agent_id, "The investigation produced no usable output."],
-                start_to_close_timeout=TIMEOUT_FAST,
+                start_to_close_timeout=TIMEOUT_STANDARD,
                 retry_policy=NO_RETRY,
             )
             await workflow.execute_activity(
@@ -3171,7 +3171,7 @@ Replace everything in `_run_coding` after the `run_task_investigation` call with
         await workflow.execute_activity(
             "comment",
             args=[task_id, input.agent_id, f"Investigation in `{repo['github_repo']}`:\n\n{plan}"],
-            start_to_close_timeout=TIMEOUT_FAST,
+            start_to_close_timeout=TIMEOUT_STANDARD,
             retry_policy=NO_RETRY,
         )
 
@@ -3237,7 +3237,7 @@ Replace everything in `_run_coding` after the `run_task_investigation` call with
                 f"Implementation run finished ({impl_output.get('status')}) on branch "
                 f"`{implementation.get('branch', '?')}`.",
             ],
-            start_to_close_timeout=TIMEOUT_FAST,
+            start_to_close_timeout=TIMEOUT_STANDARD,
             retry_policy=NO_RETRY,
         )
         if impl_output.get("status") != "succeeded" or not implementation.get("branch"):
@@ -3306,7 +3306,7 @@ Replace everything in `_run_coding` after the `run_task_investigation` call with
         await workflow.execute_activity(
             "comment",
             args=[task_id, input.agent_id, f"Opened a PR: {pr.get('pr_url') or 'see the repo'}"],
-            start_to_close_timeout=TIMEOUT_FAST,
+            start_to_close_timeout=TIMEOUT_STANDARD,
             retry_policy=NO_RETRY,
         )
         # @waiting, never complete: the PR still needs your review.
