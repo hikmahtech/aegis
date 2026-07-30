@@ -640,10 +640,35 @@ class AgentTaskFlow:
             start_to_close_timeout=TIMEOUT_LONG,
             retry_policy=RETRY_ONCE,
         )
-        # create_github_pr returns {"pr_url", "status", ...} — the key is pr_url.
+        # create_github_pr returns {"pr_url", "status", "error"} and can report
+        # status="failed" (push rejected, gh pr create failure, missing
+        # pending_pr row) WITHOUT raising — checking pr.get("status") is
+        # required, not just reading pr_url, or a failed PR silently reads as
+        # opened.
+        if pr.get("status") != "opened" or not pr.get("pr_url"):
+            await workflow.execute_activity(
+                "comment",
+                args=[
+                    task_id,
+                    input.agent_id,
+                    f"Implementation is on branch `{implementation['branch']}` in "
+                    f"`{repo['github_repo']}`, but opening the PR failed: "
+                    f"{pr.get('error') or 'unknown error'}.",
+                ],
+                start_to_close_timeout=TIMEOUT_STANDARD,
+                retry_policy=NO_RETRY,
+            )
+            await workflow.execute_activity(
+                "park_task",
+                args=[task_id, f"PR creation failed: {pr.get('error') or 'unknown error'}"],
+                start_to_close_timeout=TIMEOUT_FAST,
+                retry_policy=ACT_RETRY,
+            )
+            return {"task_id": task_id, "verb": "coding", "status": "pr_failed"}
+
         await workflow.execute_activity(
             "comment",
-            args=[task_id, input.agent_id, f"Opened a PR: {pr.get('pr_url') or 'see the repo'}"],
+            args=[task_id, input.agent_id, f"Opened a PR: {pr['pr_url']}"],
             start_to_close_timeout=TIMEOUT_STANDARD,
             retry_policy=NO_RETRY,
         )

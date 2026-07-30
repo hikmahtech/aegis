@@ -34,7 +34,7 @@ _CODE_TASK = {
 }
 
 
-def _activities(events: list, *, plan_choice: str):
+def _activities(events: list, *, pr_result: dict | None = None):
     @activity.defn(name="load_task_context")
     async def load_task_context(task_id: str) -> dict:
         return {"external_id": "", "fingerprint": "", "gmail_message_id": ""}
@@ -101,8 +101,13 @@ def _activities(events: list, *, plan_choice: str):
 
     @activity.defn(name="create_github_pr")
     async def create_github_pr(inp) -> dict:
-        events.append(("pr", "opened"))
-        return {"pr_url": "https://github.com/Stockopedia/bcp/pull/1", "status": "opened"}
+        result = pr_result or {
+            "pr_url": "https://github.com/Stockopedia/bcp/pull/1",
+            "status": "opened",
+            "error": "",
+        }
+        events.append(("pr", result["status"]))
+        return result
 
     # InteractionFlow's own activities. Names and input types copied from the
     # canonical stub block in tests/worker/flows/test_alert_investigation_gates.py
@@ -162,7 +167,7 @@ async def test_declined_plan_stops_before_any_implement_run():
             env.client,
             task_queue=queue,
             workflows=[AgentTaskFlow, InteractionFlow],
-            activities=_activities(events, plan_choice="skip"),
+            activities=_activities(events),
         ):
             result = await env.client.execute_workflow(
                 AgentTaskFlow.run,
@@ -189,7 +194,7 @@ async def test_approved_plan_implements_then_opens_pr_and_parks():
             env.client,
             task_queue="tq-agent-task-coding",
             workflows=[AgentTaskFlow, InteractionFlow],
-            activities=_activities(events, plan_choice="approve"),
+            activities=_activities(events),
         ),
     ):
         wf_id = f"agent-task-tc-1-{uuid.uuid4()}"
@@ -222,3 +227,61 @@ async def test_approved_plan_implements_then_opens_pr_and_parks():
     assert result["status"] == "pr_opened"
     kinds = [kind for kind, _ in events]
     assert kinds.index("investigate") < kinds.index("implement") < kinds.index("pr")
+
+
+@pytest.mark.asyncio
+async def test_pr_creation_failure_does_not_claim_pr_opened():
+    """create_github_pr can return status=failed WITHOUT raising (push
+    rejected, gh pr create failure, missing pending_pr row). The flow must
+    not comment "Opened a PR" or return status=pr_opened in that case — a
+    silent PR failure would leave the task parked at @waiting with a comment
+    claiming a PR exists that was never actually created."""
+    events: list = []
+    async with (
+        await WorkflowEnvironment.start_local() as env,
+        Worker(
+            env.client,
+            task_queue="tq-agent-task-coding-pr-fail",
+            workflows=[AgentTaskFlow, InteractionFlow],
+            activities=_activities(
+                events,
+                pr_result={
+                    "pr_url": "",
+                    "status": "failed",
+                    "error": "git push failed: remote rejected",
+                },
+            ),
+        ),
+    ):
+        wf_id = f"agent-task-tc-1-{uuid.uuid4()}"
+        handle = await env.client.start_workflow(
+            AgentTaskFlow.run,
+            AgentTaskFlowInput(
+                agent_id="pandoras-actor", todoist_task_id="tc-1", task=_CODE_TASK
+            ),
+            id=wf_id,
+            task_queue="tq-agent-task-coding-pr-fail",
+        )
+
+        plan_card = env.client.get_workflow_handle("agent-task-plan-tc-1")
+        for _ in range(200):
+            await asyncio.sleep(0.05)
+            if any(kind == "insert_ia" and body == "agent_task_coding_plan" for kind, body in events):
+                break
+        await plan_card.signal(InteractionFlow.submit_response, {"value": "approve"})
+
+        pr_card = env.client.get_workflow_handle("agent-task-pr-tc-1")
+        for _ in range(200):
+            await asyncio.sleep(0.05)
+            if any(kind == "insert_ia" and body == "agent_task_coding_pr" for kind, body in events):
+                break
+        await pr_card.signal(InteractionFlow.submit_response, {"value": "approve"})
+
+        result = await asyncio.wait_for(handle.result(), timeout=15.0)
+
+    assert result["verb"] == "coding"
+    assert result["status"] != "pr_opened"
+    assert not any(
+        "Opened a PR" in body for kind, body in events if kind == "comment"
+    ), "must not claim a PR was opened when create_github_pr reported failure"
+    assert any(kind == "park" for kind, _ in events)

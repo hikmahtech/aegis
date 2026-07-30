@@ -579,8 +579,6 @@ class AgentTaskActivities:
         jsonl to an LLM is what made every prod verdict confidence=0.0 with
         `{"role":"tool"` in its root_cause (fixed in #150).
         """
-        import asyncio
-
         from aegis_worker.activities.alerts import (
             _INVESTIGATION_OUTPUT_CAP,
             _extract_kimi_transcript,
