@@ -269,6 +269,14 @@ _NOTIFICATION_MARKERS = (
     "pulse survey",
     "will be deleted",
     "will be charged",
+    # Added 2026-07-30 after auditing 33 real #email tasks (issue #157).
+    # Deliberately conservative: only titles that are unambiguously a
+    # courtesy ping with nothing to do. Marking a real action as a
+    # notification keeps it OUT of the 2-min card path and lets the
+    # agent-task executor archive it, so a false positive here loses mail.
+    "just messaged you",          # LinkedIn/social relay pings
+    "new jobs for you",           # job-board digests
+    "recovered successfully",     # post-hoc "your account was recovered"
 )
 
 
