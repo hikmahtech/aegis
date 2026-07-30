@@ -17,20 +17,30 @@ def _no_sleep(monkeypatch):
 
 
 class _Recorder:
-    def __init__(self, healthy_after_restart: bool):
-        # Mirrors InfraOpsActivities' surface so the hook's poll loop works.
-        self.healthy_after = healthy_after_restart
+    def __init__(self, healthy_on_call: int | None):
+        """`healthy_on_call`: the 1-indexed service_health() call number on
+        which the fake first reports healthy; None means it never does.
+
+        Stateful by call count (not a fixed answer) so these tests actually
+        exercise the poll loop — a single-check implementation and a 5x-retry
+        implementation must diverge on both the outcome and the call count,
+        instead of passing identically either way.
+        """
+        self.healthy_on_call = healthy_on_call
         self.restarted: list[str] = []
         self.completed: list[str] = []
         self.parked: list[str] = []
         self.notes: list[str] = []
+        self.health_calls = 0
 
     async def restart_service(self, service_name: str) -> dict:
         self.restarted.append(service_name)
         return {"ok": True, "detail": "ok"}
 
     async def service_health(self, service_name: str) -> dict:
-        return {"found": True, "healthy": self.healthy_after, "detail": "1/1"}
+        self.health_calls += 1
+        healthy = self.healthy_on_call is not None and self.health_calls >= self.healthy_on_call
+        return {"found": True, "healthy": healthy, "detail": f"call {self.health_calls}"}
 
 
 def _act(rec: _Recorder) -> AgentTaskActivities:
@@ -56,7 +66,7 @@ _META = {"task_id": "tr-1", "service": "redis_redis", "agent_id": "pandoras-acto
 
 
 async def test_approve_restarts_and_completes_when_service_recovers():
-    rec = _Recorder(healthy_after_restart=True)
+    rec = _Recorder(healthy_on_call=1)
     result = await _act(rec).apply_restart_approval("i1", {"value": "approve"}, _META)
     assert result == {"applied": "approved"}
     assert rec.restarted == ["redis_redis"]
@@ -65,15 +75,38 @@ async def test_approve_restarts_and_completes_when_service_recovers():
 
 
 async def test_approve_parks_when_service_still_broken_after_restart():
-    rec = _Recorder(healthy_after_restart=False)
+    rec = _Recorder(healthy_on_call=None)
     await _act(rec).apply_restart_approval("i1", {"value": "approve"}, _META)
     assert rec.restarted == ["redis_redis"]
     assert rec.completed == []
     assert rec.parked == ["tr-1"]
 
 
+async def test_approve_completes_only_after_polling_recovers():
+    """Recovery on the 3rd health check, not the 1st — this is the case a
+    single-check implementation gets wrong: it would see the 1st check's
+    unhealthy answer and park, never finding out the service came back.
+    """
+    rec = _Recorder(healthy_on_call=3)
+    result = await _act(rec).apply_restart_approval("i1", {"value": "approve"}, _META)
+    assert result == {"applied": "approved"}
+    assert rec.completed == ["tr-1"]
+    assert rec.parked == []
+    assert rec.health_calls >= 3
+
+
+async def test_approve_parks_after_exhausting_the_poll_bound():
+    """Never healthy ⇒ the loop must run its full 5 attempts (not 1) before
+    giving up and parking — pins the poll bound itself, not just the outcome.
+    """
+    rec = _Recorder(healthy_on_call=None)
+    await _act(rec).apply_restart_approval("i1", {"value": "approve"}, _META)
+    assert rec.parked == ["tr-1"]
+    assert rec.health_calls == 5
+
+
 async def test_skip_parks_without_restarting():
-    rec = _Recorder(healthy_after_restart=True)
+    rec = _Recorder(healthy_on_call=1)
     result = await _act(rec).apply_restart_approval("i1", {"value": "skip"}, _META)
     assert result == {"applied": "skipped"}
     assert rec.restarted == []
@@ -81,14 +114,14 @@ async def test_skip_parks_without_restarting():
 
 
 async def test_unknown_choice_takes_no_action():
-    rec = _Recorder(healthy_after_restart=True)
+    rec = _Recorder(healthy_on_call=1)
     result = await _act(rec).apply_restart_approval("i1", {"value": "???"}, _META)
     assert result == {"applied": "none"}
     assert rec.restarted == []
 
 
 async def test_missing_task_id_takes_no_action():
-    rec = _Recorder(healthy_after_restart=True)
+    rec = _Recorder(healthy_on_call=1)
     result = await _act(rec).apply_restart_approval("i1", {"value": "approve"}, {})
     assert result == {"applied": "none"}
     assert rec.restarted == []
