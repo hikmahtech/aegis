@@ -1,6 +1,6 @@
 # Agent task executor — design
 
-**Status:** approved design, not yet implemented
+**Status:** implemented and live (`agent-task-15min`)
 **Issue:** [#151](https://github.com/hikmahtech/aegis/issues/151)
 **Date:** 2026-07-30
 
