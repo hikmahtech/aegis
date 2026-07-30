@@ -46,6 +46,12 @@ _REFRESH_MARGIN = timedelta(minutes=5)
 # telegram / nostr / vk / kick) need NO entry — `{"__type": platform}` alone
 # validates. Any account can pin/override these via meta.postiz_settings.
 # YouTube's `title` and Reddit's `subreddit` are data-derived, handled below.
+# Platforms whose Postiz DTO requires a `title`. Article platforms need one just
+# as YouTube does; omitting it makes Postiz reject the post with a 400 that names
+# the field. Verified 2026-07-31 against the deployed DTOs
+# (`medium.settings.dto.js`, `dev.to.settings.dto.js`) and by live posts.
+_POSTIZ_TITLE_PLATFORMS: frozenset[str] = frozenset({"youtube", "medium", "devto"})
+
 _POSTIZ_REQUIRED_SETTINGS: dict[str, dict] = {
     # XDto.who_can_reply_post — @IsIn(...), not @IsOptional.
     "x": {"who_can_reply_post": "everyone"},
@@ -75,9 +81,18 @@ def _build_postiz_settings(platform: str, text: str, meta: dict) -> dict:
     reject a malformed body with a cryptic 400 (caught per-row by the outbox
     drain, so it never crashes the flow)."""
     settings: dict = {"__type": platform, **_POSTIZ_REQUIRED_SETTINGS.get(platform, {})}
-    if platform == "youtube":
-        title = text.strip()[:90]
+    if platform in _POSTIZ_TITLE_PLATFORMS:
+        title = text.strip().splitlines()[0].strip()[:90] if text.strip() else ""
         settings["title"] = title if len(title) >= 2 else "Untitled"
+    if platform == "medium":
+        # MediumSettingsDto.subtitle is @IsDefined + @MinLength(2) — verified
+        # against the deployed Postiz DTO and by a real 400:
+        #   "posts.0.settings.subtitle should not be null or undefined"
+        # Derive from the body's second line when there is one, else reuse the
+        # title, so a short-form post still satisfies the contract.
+        body = [ln.strip() for ln in text.strip().splitlines() if ln.strip()]
+        subtitle = (body[1] if len(body) > 1 else settings.get("title", ""))[:120]
+        settings["subtitle"] = subtitle if len(subtitle) >= 2 else settings["title"]
     settings.update((meta or {}).get("postiz_settings") or {})
     if platform == "reddit" and not settings.get("subreddit"):
         raise RuntimeError(
