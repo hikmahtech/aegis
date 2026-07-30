@@ -1986,7 +1986,11 @@ where `context` is the dict returned by the `load_task_context` call (assign it:
                     "This is an automated notification, not an action — archived it "
                     f"in {outcome['account']} and closing the task.",
                 ],
-                start_to_close_timeout=TIMEOUT_FAST,
+                # comment() makes an external Todoist call (connector HTTP
+                # timeout 10s), so it gets TIMEOUT_STANDARD — a tighter budget
+                # kills its error handling. park_task/complete_task are local
+                # DB+outbox writes and correctly stay on TIMEOUT_FAST.
+                start_to_close_timeout=TIMEOUT_STANDARD,
                 retry_policy=NO_RETRY,
             )
             await workflow.execute_activity(
@@ -2005,7 +2009,7 @@ where `context` is the dict returned by the `load_task_context` call (assign it:
         await workflow.execute_activity(
             "comment",
             args=[task_id, input.agent_id, f"Leaving this one for you — {reason}."],
-            start_to_close_timeout=TIMEOUT_FAST,
+            start_to_close_timeout=TIMEOUT_STANDARD,
             retry_policy=NO_RETRY,
         )
         await workflow.execute_activity(
