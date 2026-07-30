@@ -17,16 +17,29 @@ def _no_sleep(monkeypatch):
 
 
 class _Recorder:
-    def __init__(self, healthy_on_call: int | None):
+    def __init__(
+        self,
+        healthy_on_call: int | None,
+        restart_ok: bool = True,
+        restart_detail: str = "ok",
+    ):
         """`healthy_on_call`: the 1-indexed service_health() call number on
         which the fake first reports healthy; None means it never does.
 
         Stateful by call count (not a fixed answer) so these tests actually
-        exercise the poll loop — a single-check implementation and a 5x-retry
+        exercise the poll loop — a single-check implementation and a 3x-retry
         implementation must diverge on both the outcome and the call count,
         instead of passing identically either way.
+
+        `restart_ok`/`restart_detail` mirror InfraOpsActivities.restart_service
+        returning `{"ok": False, "detail": ...}` when the write itself fails
+        (no connector, connector exception, or `docker service update --force`
+        exiting non-zero) — a real, distinct failure mode from "restarted but
+        still unhealthy".
         """
         self.healthy_on_call = healthy_on_call
+        self.restart_ok = restart_ok
+        self.restart_detail = restart_detail
         self.restarted: list[str] = []
         self.completed: list[str] = []
         self.parked: list[str] = []
@@ -35,7 +48,7 @@ class _Recorder:
 
     async def restart_service(self, service_name: str) -> dict:
         self.restarted.append(service_name)
-        return {"ok": True, "detail": "ok"}
+        return {"ok": self.restart_ok, "detail": self.restart_detail}
 
     async def service_health(self, service_name: str) -> dict:
         self.health_calls += 1
@@ -96,13 +109,31 @@ async def test_approve_completes_only_after_polling_recovers():
 
 
 async def test_approve_parks_after_exhausting_the_poll_bound():
-    """Never healthy ⇒ the loop must run its full 5 attempts (not 1) before
+    """Never healthy ⇒ the loop must run its full 3 attempts (not 1) before
     giving up and parking — pins the poll bound itself, not just the outcome.
     """
     rec = _Recorder(healthy_on_call=None)
     await _act(rec).apply_restart_approval("i1", {"value": "approve"}, _META)
     assert rec.parked == ["tr-1"]
-    assert rec.health_calls == 5
+    assert rec.health_calls == 3
+
+
+async def test_approve_reports_restart_failure_without_claiming_it_happened():
+    """restart_service itself failing (bad service name, read_only infra entry,
+    unreachable daemon, ...) is a distinct case from "restarted but still
+    unhealthy" — the hook must never say "Restarted" when nothing was, and
+    must never even poll health for a restart that didn't happen.
+    """
+    rec = _Recorder(healthy_on_call=1, restart_ok=False, restart_detail="no such service")
+    result = await _act(rec).apply_restart_approval("i1", {"value": "approve"}, _META)
+    assert result == {"applied": "approved"}
+    assert rec.restarted == ["redis_redis"]
+    assert rec.completed == []
+    assert rec.parked == ["tr-1"]
+    assert rec.health_calls == 0
+    note = rec.notes[-1]
+    assert "no such service" in note
+    assert not note.startswith("Restarted")
 
 
 async def test_skip_parks_without_restarting():

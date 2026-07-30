@@ -638,7 +638,12 @@ class AgentTaskFlow:
                 repo_path=repo["repo_path"],
             ),
             start_to_close_timeout=TIMEOUT_LONG,
-            retry_policy=RETRY_ONCE,
+            # NO_RETRY, matching the canonical caller (alert_investigation.py:1556):
+            # `git push` + `gh pr create` is NOT idempotent. If attempt 1 succeeds
+            # but runs past TIMEOUT_LONG, a retried attempt 2's `gh pr create` fails
+            # with "a pull request already exists" → status="failed" → this flow
+            # would then correctly-but-wrongly report pr_failed while a PR exists.
+            retry_policy=NO_RETRY,
         )
         # create_github_pr returns {"pr_url", "status", "error"} and can report
         # status="failed" (push rejected, gh pr create failure, missing

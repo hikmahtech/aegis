@@ -64,6 +64,11 @@ def extract_service_name(title: str) -> str:
     for pattern in _SERVICE_PATTERNS:
         match = pattern.match(text)
         if match:
+            # Compose-style names (`redis_redis`) already come out of the
+            # PROLONGED/fewer-tasks patterns lowercase and underscore-joined —
+            # don't touch them. Only the free-text "X is down" pattern needs
+            # normalising, since that title can carry whatever casing a human
+            # or another system used.
             return match.group(1).lower() if "_" not in match.group(1) else match.group(1)
     return ""
 
@@ -340,24 +345,51 @@ class AgentTaskActivities:
             )
             return {"applied": "none"}
 
-        restart = await self.infra_ops.restart_service(service)
+        # This activity has maximum_attempts=2 (flows/interaction.py's
+        # _BEST_EFFORT_RETRY) and `restart_service` is a real write —
+        # `docker service update --force` — so a retried attempt must NOT
+        # re-issue it: that would reschedule the tasks the first call just
+        # scheduled and actively delay the convergence we're polling for.
+        # Treat a second attempt as having already issued the restart.
+        if activity.in_activity() and activity.info().attempt > 1:
+            restart = {"ok": True, "detail": "restart already issued on a previous attempt"}
+        else:
+            restart = await self.infra_ops.restart_service(service)
+
+        if not restart.get("ok"):
+            # The restart call itself failed (no connector, connector
+            # exception, or `docker service update --force` exiting non-zero —
+            # covers a renamed/missing service, a read_only infra entry, or an
+            # unreachable daemon). Nothing was restarted, so say so — do NOT
+            # fall into the "still converging" message below, which would
+            # falsely claim a restart happened.
+            await self.comment(
+                task_id,
+                agent_id,
+                f"Tried to restart `{service}` but the restart itself failed "
+                f"({restart.get('detail', 'unknown error')}) — nothing was restarted.",
+            )
+            await self.park_task(task_id, "restart_service failed")
+            return {"applied": "approved"}
+
         # `restart_service` runs `docker service update --force --detach`
         # (connectors/homelab.py:175) and returns BEFORE the swarm converges, so
         # a single immediate health check would essentially never see recovery.
         # The sibling `remediate_infra_service` (alerts.py:1220-1252) polls 6x5s
         # for exactly this reason — but this runs as InteractionFlow's
         # post_resolve activity, which has a hard 30s timeout
-        # (flows/interaction.py:67), so budget the poll well inside it.
-        # ponytail: 5x4s=20s; if swarm convergence is routinely slower, move the
+        # (flows/interaction.py:67) and only ONE retry-safe attempt (above), so
+        # budget the poll with real headroom inside it, not right up against it.
+        # ponytail: 3x3s=9s; if swarm convergence is routinely slower, move the
         # verification out of the hook and let the next sweep tick observe it.
         health = {"healthy": False, "detail": "not checked"}
-        if restart.get("ok"):
-            for _ in range(5):
-                await asyncio.sleep(4)
-                health = await self.infra_ops.service_health(service)
-                if health.get("healthy"):
-                    break
-        if restart.get("ok") and health.get("healthy"):
+        for _ in range(3):
+            await asyncio.sleep(3)
+            health = await self.infra_ops.service_health(service)
+            if health.get("healthy"):
+                break
+
+        if health.get("healthy"):
             await self.comment(
                 task_id, agent_id, f"Restarted `{service}` and it's healthy again — closing."
             )
@@ -366,7 +398,7 @@ class AgentTaskActivities:
             await self.comment(
                 task_id,
                 agent_id,
-                f"Restarted `{service}` but it hadn't come back healthy within 20s "
+                f"Restarted `{service}` but it hadn't come back healthy within 9s "
                 f"({health.get('detail', 'unknown')}) — it may still be converging; "
                 "leaving this open for you.",
             )
