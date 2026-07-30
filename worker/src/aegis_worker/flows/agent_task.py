@@ -117,10 +117,14 @@ class AgentTaskFlow:
                 step = "run_email"
                 return await self._run_email(input, task_id, context)
 
-            # Verb executors are added in Task 7. An unmapped verb parks
-            # the task rather than guessing at it. The loaded source identity
-            # (when recovered) rides along in the comment purely as a human
-            # debugging aid — no verb-specific behavior depends on it yet.
+            if verb == "finance":
+                step = "run_finance"
+                return await self._run_finance(input, task_id)
+
+            # Any remaining verb parks the task rather than guessing at it.
+            # The loaded source identity (when recovered) rides along in the
+            # comment purely as a human debugging aid — no verb-specific
+            # behavior depends on it yet.
             step = "comment"
             source_note = (
                 f" (source: {context['external_id']})" if context.get("external_id") else ""
@@ -335,3 +339,76 @@ class AgentTaskFlow:
             retry_policy=ACT_RETRY,
         )
         return {"task_id": task_id, "verb": "email", "status": "parked"}
+
+    async def _run_finance(self, input: AgentTaskFlowInput, task_id: str) -> dict:
+        """Gather merchant context and put the decision to the user.
+
+        No autonomous write: whether a charge is legitimate is the user's
+        call, so this verb only assembles history and cards a decision.
+        """
+        title = str(input.task.get("content") or "")
+        history = await workflow.execute_activity(
+            "merchant_history",
+            args=[title, 6],
+            start_to_close_timeout=TIMEOUT_STANDARD,
+            retry_policy=ACT_RETRY,
+        )
+        if not history["merchant"]:
+            await workflow.execute_activity(
+                "comment",
+                args=[task_id, input.agent_id, "I couldn't tell which merchant this is about."],
+                start_to_close_timeout=TIMEOUT_STANDARD,
+                retry_policy=NO_RETRY,
+            )
+            await workflow.execute_activity(
+                "park_task",
+                args=[task_id, "merchant not parseable from title"],
+                start_to_close_timeout=TIMEOUT_FAST,
+                retry_policy=ACT_RETRY,
+            )
+            return {"task_id": task_id, "verb": "finance", "status": "parked"}
+
+        await workflow.execute_activity(
+            "comment",
+            args=[
+                task_id,
+                input.agent_id,
+                f"Prior charges for {history['merchant']}: {history['summary']}",
+            ],
+            start_to_close_timeout=TIMEOUT_STANDARD,
+            retry_policy=NO_RETRY,
+        )
+        try:
+            await workflow.start_child_workflow(
+                InteractionFlow.run,
+                InteractionFlowInput(
+                    agent_id=input.agent_id,
+                    kind="choice",
+                    origin="agent_task_finance",
+                    prompt=(
+                        f"💳 <b>{_esc(history['merchant'])}</b>\n\n{title}\n\n"
+                        f"History: {history['summary']}\n\nIs this expected?"
+                    ),
+                    options={"expected": "✅ Expected", "investigate": "🔍 Investigate"},
+                    timeout_seconds=86400,
+                    timeout_policy="archive",
+                    metadata={
+                        "task_id": task_id,
+                        "agent_id": input.agent_id,
+                        "merchant": history["merchant"],
+                    },
+                    post_resolve_activity="apply_finance_decision",
+                ),
+                id=f"agent-task-finance-{task_id}",
+                parent_close_policy=workflow.ParentClosePolicy.ABANDON,
+            )
+        except WorkflowAlreadyStartedError:
+            pass
+
+        await workflow.execute_activity(
+            "park_task",
+            args=[task_id, "awaiting finance decision"],
+            start_to_close_timeout=TIMEOUT_FAST,
+            retry_policy=ACT_RETRY,
+        )
+        return {"task_id": task_id, "verb": "finance", "status": "carded"}

@@ -68,6 +68,24 @@ def extract_service_name(title: str) -> str:
     return ""
 
 
+# #receipt task title shapes, as clarify actually produces them in prod.
+_MERCHANT_PATTERNS = (
+    re.compile(r"^Anomaly:\s*\?\s*(.+?)\s*$", re.I),
+    re.compile(r"^Anomaly:\s*[\d.,]+\s+\w+\s+(.+?)\s*$", re.I),
+    re.compile(r"^Renewal in [\d.]+ days:\s*(.+?)\s*\([^)]*\)\s*$", re.I),
+)
+
+
+def extract_merchant(title: str) -> str:
+    """Merchant named by a #receipt task title, or '' when none is."""
+    text = (title or "").strip()
+    for pattern in _MERCHANT_PATTERNS:
+        match = pattern.match(text)
+        if match:
+            return match.group(1).strip()
+    return ""
+
+
 @dataclass
 class AgentTaskActivities:
     db_pool: Any = None
@@ -373,3 +391,77 @@ class AgentTaskActivities:
             if result.get("ok"):
                 return {"action": "archived", "account": account}
         return {"action": "not_found", "account": ""}
+
+    @activity.defn
+    async def merchant_history(self, title: str, limit: int = 6) -> dict:
+        """Prior charges for the merchant this task names.
+
+        The value of this verb is assembled context, not an autonomous
+        decision — whether a charge is legitimate is the user's call.
+        """
+        merchant = extract_merchant(title)
+        if not merchant or self.db_pool is None:
+            return {"merchant": "", "charges": [], "summary": ""}
+        # `recurring_charge` is UPSERT-keyed on
+        # (account, sender_label, amount_cents, currency) — one row per charge
+        # SIGNATURE with last_seen_at bumped in place (money.py:250-252) — so a
+        # merchant billing a steady amount has exactly ONE row and no history.
+        # `receipt_email` IS append-only (one row per receipt, unique on
+        # message_id), so join through its charge_id FK for the canonical vendor
+        # and read each receipt's own amount from the `parsed` extraction.
+        rows = await self.db_pool.fetch(
+            """
+            SELECT re.received_at,
+                   COALESCE((re.parsed->>'amount')::numeric,
+                            rc.amount_cents / 100.0) AS amount,
+                   COALESCE(re.parsed->>'currency', rc.currency) AS currency
+            FROM finance.receipt_email re
+            JOIN finance.recurring_charge rc ON rc.id = re.charge_id
+            WHERE rc.vendor_name = $1
+            ORDER BY re.received_at DESC
+            LIMIT $2
+            """,
+            merchant,
+            limit,
+        )
+        charges = [
+            {
+                "amount": float(r["amount"] or 0),
+                "currency": r["currency"] or "",
+                "last_seen_at": r["received_at"].isoformat() if r["received_at"] else "",
+            }
+            for r in rows
+        ]
+        summary = (
+            "; ".join(f"{c['amount']:g} {c['currency']} on {c['last_seen_at'][:10]}" for c in charges)
+            or "no prior charges on record"
+        )
+        return {"merchant": merchant, "charges": charges, "summary": summary}
+
+    @activity.defn
+    async def apply_finance_decision(
+        self, interaction_id: str, response: dict, metadata: dict
+    ) -> dict:
+        """InteractionFlow post_resolve hook for the anomaly decision card."""
+        choice = (response.get("value") or "").strip()
+        task_id = str(metadata.get("task_id") or "")
+        agent_id = str(metadata.get("agent_id") or "")
+        merchant = str(metadata.get("merchant") or "this charge")
+        if not task_id:
+            return {"applied": "none"}
+
+        if choice == "expected":
+            await self.comment(task_id, agent_id, f"You confirmed {merchant} is expected — closing.")
+            await self.complete_task(task_id)
+            return {"applied": "expected"}
+        if choice == "investigate":
+            await self.comment(
+                task_id, agent_id, f"Flagged {merchant} for you to investigate."
+            )
+            await self.park_task(task_id, "finance anomaly needs investigation")
+            return {"applied": "investigate"}
+
+        activity.logger.info(
+            "agent_task_finance_no_action interaction_id=%s choice=%s", interaction_id, choice
+        )
+        return {"applied": "none"}

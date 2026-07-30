@@ -162,10 +162,10 @@ def test_agent_task_registrations_reach_mains_live_lists():
     (test_module_stub_workflows_covers_runtime_base_list only checks
     runtime ⊆ stub; test_every_registered_activity_is_decorated only checks
     decoration) while still crashing the live worker at boot with an
-    unknown workflow/activity type. This closes that gap for the seven
+    unknown workflow/activity type. This closes that gap for the nine
     agent_task registrations plus the three infra_ops registrations added
-    alongside the infra verb (Task 4), restart-approval hook (Task 5), and
-    email verb (Task 6) specifically.
+    alongside the infra verb (Task 4), restart-approval hook (Task 5),
+    email verb (Task 6), and finance verb (Task 7) specifically.
     """
     import ast
     import inspect
@@ -201,6 +201,8 @@ def test_agent_task_registrations_reach_mains_live_lists():
         "comment",
         "apply_restart_approval",
         "triage_email",
+        "merchant_history",
+        "apply_finance_decision",
         "service_health",
         "service_logs",
         "restart_service",
