@@ -152,6 +152,7 @@ ACTIVITIES: list = [
     _stub_agent_task_act.park_task,
     _stub_agent_task_act.complete_task,
     _stub_agent_task_act.comment,
+    _stub_agent_task_act.apply_restart_approval,
     _stub_infra_ops_act.service_health,
     _stub_infra_ops_act.service_logs,
     _stub_infra_ops_act.restart_service,
@@ -430,6 +431,10 @@ async def main():
         homelab_connector=connectors.get("homelab"),
     )
     infra_ops_act = InfraOpsActivities(homelab_connector=connectors.get("homelab"))
+    # apply_restart_approval runs as an AgentTask activity but needs the infra
+    # ops. Mirrors the existing `alert_act.todoist_connector = todoist_connector`
+    # late-wiring below.
+    agent_task_act.infra_ops = infra_ops_act
     # AlertInvestigationFlow posts start- and final-comments on the Todoist
     # track-task via alert_act.post_task_note. The dataclass declared
     # todoist_connector=None upstream; wire the live connector now.
@@ -586,6 +591,7 @@ async def main():
         agent_task_act.park_task,
         agent_task_act.complete_task,
         agent_task_act.comment,
+        agent_task_act.apply_restart_approval,
         infra_ops_act.service_health,
         infra_ops_act.service_logs,
         infra_ops_act.restart_service,

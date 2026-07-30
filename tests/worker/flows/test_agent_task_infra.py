@@ -4,7 +4,14 @@ from __future__ import annotations
 
 import uuid
 
+from aegis_worker.activities.interactions import (
+    ApplyTimeoutInput,
+    InsertInteractionInput,
+    InsertInteractionResult,
+    ResolveInteractionInput,
+)
 from aegis_worker.flows.agent_task import AgentTaskFlow, AgentTaskFlowInput
+from aegis_worker.flows.interaction import InteractionFlow
 from temporalio import activity
 from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import Worker
@@ -53,6 +60,27 @@ def _base_activities(events: list, *, healthy: bool):
         events.append(("restart", service_name))
         return {"ok": True, "detail": "restarted"}
 
+    # InteractionFlow's own activities — needed because the restart card is
+    # spawned as an ABANDONED child in the same worker/task-queue; without
+    # these the child has no registered activities to call.
+    @activity.defn(name="insert_interaction")
+    async def insert_interaction(inp: InsertInteractionInput) -> InsertInteractionResult:
+        return InsertInteractionResult(interaction_id="ia-restart-1")
+
+    @activity.defn(name="send_interaction_card")
+    async def send_interaction_card(
+        interaction_id: str, agent_id: str, kind: str, prompt: str, options, allow_hint=False
+    ) -> dict:
+        return {"ok": True}
+
+    @activity.defn(name="resolve_interaction")
+    async def resolve_interaction(inp: ResolveInteractionInput) -> None:
+        return None
+
+    @activity.defn(name="apply_interaction_timeout")
+    async def apply_interaction_timeout(inp: ApplyTimeoutInput) -> None:
+        return None
+
     return [
         load_task_context,
         comment,
@@ -61,6 +89,10 @@ def _base_activities(events: list, *, healthy: bool):
         service_health,
         service_logs,
         restart_service,
+        insert_interaction,
+        send_interaction_card,
+        resolve_interaction,
+        apply_interaction_timeout,
     ]
 
 
@@ -72,7 +104,7 @@ async def test_healthy_service_completes_task_without_a_card():
         async with Worker(
             env.client,
             task_queue=queue,
-            workflows=[AgentTaskFlow],
+            workflows=[AgentTaskFlow, InteractionFlow],
             activities=_base_activities(events, healthy=True),
         ):
             result = await env.client.execute_workflow(
@@ -91,14 +123,15 @@ async def test_healthy_service_completes_task_without_a_card():
 
 
 async def test_unhealthy_service_investigates_and_parks_pending_approval():
-    """No card answer in this harness ⇒ must park, never leave the task live."""
+    """A restart-approval card is spawned; the task parks meanwhile so the
+    next tick doesn't re-select it while the card is still open."""
     events: list = []
     async with await WorkflowEnvironment.start_time_skipping() as env:
         queue = f"tq-{uuid.uuid4()}"
         async with Worker(
             env.client,
             task_queue=queue,
-            workflows=[AgentTaskFlow],
+            workflows=[AgentTaskFlow, InteractionFlow],
             activities=_base_activities(events, healthy=False),
         ):
             result = await env.client.execute_workflow(
@@ -110,6 +143,6 @@ async def test_unhealthy_service_investigates_and_parks_pending_approval():
                 task_queue=queue,
             )
 
-    assert result["status"] == "parked"
+    assert result["status"] == "carded"
     assert any(kind == "comment" and "boot loop" in body for kind, body in events)
     assert any(kind == "park" for kind, _ in events)

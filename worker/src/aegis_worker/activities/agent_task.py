@@ -9,6 +9,7 @@ oldest first, and a per-task cooldown.
 
 from __future__ import annotations
 
+import asyncio
 import re
 from dataclasses import dataclass, field
 from typing import Any
@@ -74,6 +75,9 @@ class AgentTaskActivities:
     remote_script: Any = None
     homelab_connector: Any = None
     gmail_accounts: list[str] = field(default_factory=list)
+    # InfraOpsActivities instance. A plain field, not a private seam, so tests
+    # pass a fake and production passes the real thing.
+    infra_ops: Any = None
 
     @activity.defn
     async def find_actionable_tasks(
@@ -273,3 +277,66 @@ class AgentTaskActivities:
             str(rejected)[:200],
         )
         return {"ok": False, "error": f"command_rejected: {rejected}"}
+
+    @activity.defn
+    async def apply_restart_approval(
+        self, interaction_id: str, response: dict, metadata: dict
+    ) -> dict:
+        """InteractionFlow post_resolve hook for the restart card.
+
+        Approve: restart, re-check health, and complete the task only if the
+        service actually recovered — a restart that didn't fix it must stay
+        visible, so it parks instead.
+        """
+        choice = (response.get("value") or "").strip()
+        task_id = str(metadata.get("task_id") or "")
+        service = str(metadata.get("service") or "")
+        agent_id = str(metadata.get("agent_id") or "")
+        if not task_id or not service:
+            return {"applied": "none"}
+
+        if choice == "skip":
+            await self.comment(task_id, agent_id, f"Leaving `{service}` alone as you asked.")
+            await self.park_task(task_id, "restart declined")
+            return {"applied": "skipped"}
+
+        if choice != "approve":
+            activity.logger.info(
+                "agent_task_restart_no_action interaction_id=%s choice=%s",
+                interaction_id,
+                choice,
+            )
+            return {"applied": "none"}
+
+        restart = await self.infra_ops.restart_service(service)
+        # `restart_service` runs `docker service update --force --detach`
+        # (connectors/homelab.py:175) and returns BEFORE the swarm converges, so
+        # a single immediate health check would essentially never see recovery.
+        # The sibling `remediate_infra_service` (alerts.py:1220-1252) polls 6x5s
+        # for exactly this reason — but this runs as InteractionFlow's
+        # post_resolve activity, which has a hard 30s timeout
+        # (flows/interaction.py:67), so budget the poll well inside it.
+        # ponytail: 5x4s=20s; if swarm convergence is routinely slower, move the
+        # verification out of the hook and let the next sweep tick observe it.
+        health = {"healthy": False, "detail": "not checked"}
+        if restart.get("ok"):
+            for _ in range(5):
+                await asyncio.sleep(4)
+                health = await self.infra_ops.service_health(service)
+                if health.get("healthy"):
+                    break
+        if restart.get("ok") and health.get("healthy"):
+            await self.comment(
+                task_id, agent_id, f"Restarted `{service}` and it's healthy again — closing."
+            )
+            await self.complete_task(task_id)
+        else:
+            await self.comment(
+                task_id,
+                agent_id,
+                f"Restarted `{service}` but it hadn't come back healthy within 20s "
+                f"({health.get('detail', 'unknown')}) — it may still be converging; "
+                "leaving this open for you.",
+            )
+            await self.park_task(task_id, "restart did not restore health")
+        return {"applied": "approved"}

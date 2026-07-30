@@ -20,6 +20,7 @@ from temporalio.exceptions import ApplicationError, WorkflowAlreadyStartedError
 
 with workflow.unsafe.imports_passed_through():
     from aegis_worker.activities.agent_task import extract_service_name, resolve_verb
+    from aegis_worker.flows.interaction import InteractionFlow, InteractionFlowInput
     from aegis_worker.shared.retry import (
         ACT_RETRY,
         NO_RETRY,
@@ -236,14 +237,41 @@ class AgentTaskFlow:
         )
 
         # Restarting is a write, so it needs human approval before this flow
-        # would ever execute it — that approval path (an InteractionFlow card
-        # + post_resolve activity, same pattern as social_publish.py/review.py)
-        # is not implemented yet. For now this run only investigates and
-        # parks; a human acts on the comment above manually.
+        # would ever execute it — an InteractionFlow card + post_resolve
+        # activity, same pattern as social_publish.py/review.py.
+        try:
+            await workflow.start_child_workflow(
+                InteractionFlow.run,
+                InteractionFlowInput(
+                    agent_id=input.agent_id,
+                    kind="choice",
+                    origin="agent_task_infra",
+                    prompt=(
+                        f"🔧 <b>{service}</b> is unhealthy ({detail}).\n\n"
+                        "Restart it?"
+                    ),
+                    options={"approve": "🔄 Restart", "skip": "⏭️ Leave it"},
+                    timeout_seconds=86400,
+                    timeout_policy="archive",
+                    metadata={
+                        "task_id": task_id,
+                        "service": service,
+                        "agent_id": input.agent_id,
+                    },
+                    post_resolve_activity="apply_restart_approval",
+                ),
+                id=f"agent-task-restart-{task_id}",
+                parent_close_policy=workflow.ParentClosePolicy.ABANDON,
+            )
+        except WorkflowAlreadyStartedError:
+            pass  # a previous run's card is still open
+
+        # Park now: the card's post_resolve hook owns the outcome from here, and
+        # parking keeps the task out of the next tick's selection meanwhile.
         await workflow.execute_activity(
             "park_task",
             args=[task_id, f"awaiting restart approval for {service}"],
             start_to_close_timeout=TIMEOUT_FAST,
             retry_policy=ACT_RETRY,
         )
-        return {"task_id": task_id, "verb": "infra", "status": "parked", "service": service}
+        return {"task_id": task_id, "verb": "infra", "status": "carded", "service": service}
