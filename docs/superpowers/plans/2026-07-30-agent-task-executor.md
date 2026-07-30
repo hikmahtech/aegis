@@ -2698,12 +2698,24 @@ across post-resolve hooks.
 from __future__ import annotations
 
 import json
+from unittest.mock import AsyncMock
+
+import pytest
 
 from aegis_worker.activities.agent_task import AgentTaskActivities
 
 
 def _assistant(text: str) -> str:
     return json.dumps({"role": "assistant", "content": [{"type": "text", "text": text}]})
+
+
+@pytest.fixture(autouse=True)
+def _no_sleep(monkeypatch):
+    """The poll loop sleeps 30s between attempts; every comparable test in this
+    repo mocks it (test_alert_investigation.py:305, test_clarify_activities.py:2978).
+    `collect_coding_run` does a local `import asyncio`, so patch the global
+    attribute rather than a module-qualified path."""
+    monkeypatch.setattr("asyncio.sleep", AsyncMock())
 
 
 class _Remote:
@@ -2772,6 +2784,7 @@ Add to `AgentTaskActivities`:
         import asyncio
 
         from aegis_worker.activities.alerts import (
+            _INVESTIGATION_OUTPUT_CAP,
             _extract_kimi_transcript,
             _kimi_output_complete,
         )
@@ -2787,14 +2800,21 @@ Add to `AgentTaskActivities`:
                 if _kimi_output_complete(raw):
                     return {
                         "status": "succeeded",
-                        "transcript": _extract_kimi_transcript(raw)[-8000:],
+                        "transcript": _extract_kimi_transcript(raw)[-_INVESTIGATION_OUTPUT_CAP:],
                     }
-            activity.heartbeat()
+            # heartbeat() RAISES RuntimeError("Not in activity context") outside a
+            # Worker, unlike activity.logger which degrades silently. The unit
+            # tests call this method directly, so guard it the way comment()
+            # already does in this same file.
+            if activity.in_activity():
+                activity.heartbeat()
             await asyncio.sleep(30)
 
         return {
             "status": "timed_out",
-            "transcript": _extract_kimi_transcript(latest)[-8000:] if latest else "",
+            "transcript": (
+                _extract_kimi_transcript(latest)[-_INVESTIGATION_OUTPUT_CAP:] if latest else ""
+            ),
         }
 
     @activity.defn
@@ -3320,7 +3340,16 @@ Expected: `PLAY RECAP` with `failed=0`. `asif` shows `unreachable=1` — that bo
 ssh arshad@10.20.0.103 'docker logs --since 5m $(docker ps -qf name=aegis_worker|head -1) 2>&1 | grep -oE "activities=[0-9]+ flows=[0-9]+|ERROR|CRITICAL" | sort | uniq -c'
 ```
 
-Expected: the `flows=` count is 2 higher than before (was `flows=30`), no ERROR/CRITICAL.
+Expected: **`flows=24`, unchanged** — and no ERROR/CRITICAL. Do NOT expect the flows count to
+grow: `AgentTaskSweepFlow` and `AgentTaskFlow` were both registered back in Task 3, and Tasks 5-9
+add only *activities* to the existing flows. `flows=len(workflows)` (`__main__.py:725`) is 24 in
+this worktree. The number that grows is `activities=`; confirm the new names are live with:
+
+```bash
+ssh arshad@10.20.0.103 'docker exec $(docker ps -qf name=aegis_worker|head -1) sh -c "grep -c . /dev/null"; echo "(check the boot log line for the activities= count instead)"'
+```
+
+A stale expectation here is worse than no check — it reads a successful deploy as a failure.
 
 - [ ] **Step 4: Confirm the schedule reconciled**
 
