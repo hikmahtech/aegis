@@ -132,3 +132,80 @@ async def test_comment_body_carries_the_workflow_run_footer(db_pool, _seed):
     assert sent["cmds"][0]["args"]["item_id"] == "tm-1"
     assert "Workflow run:" in content
     assert "found the cause" in content
+
+
+# --- comment() retry on transient envelope failure (issue #159) ---
+
+
+class _FlakyTodoist:
+    """Fails the envelope `fail_first` times, then succeeds.
+
+    Mirrors the real TodoistConnector surface: `commands()` returning a Sync API
+    envelope. A live http_503 lost both comments on this flow's first production
+    tick, which is what the retry exists for.
+    """
+
+    def __init__(self, fail_first: int):
+        self.fail_first = fail_first
+        self.calls: list[list[dict]] = []
+
+    async def commands(self, cmds: list[dict]) -> dict:
+        self.calls.append(cmds)
+        if len(self.calls) <= self.fail_first:
+            return {"error": "http_503"}
+        return {"ok": True}
+
+
+async def test_comment_retries_a_transient_envelope_failure(db_pool, _seed):
+    """A 503 on the first attempt must not lose the comment — it is the only
+    user-visible explanation on a parked task."""
+    conn = _FlakyTodoist(fail_first=1)
+    act = AgentTaskActivities(db_pool=db_pool, todoist_connector=conn)
+
+    result = await act.comment("tm-1", "pandoras-actor", "found the cause")
+
+    assert result["ok"] is True
+    assert len(conn.calls) == 2, "expected one retry after the 503"
+
+
+async def test_comment_retry_reuses_the_same_command_uuid(db_pool, _seed):
+    """The Sync API keys idempotency on the command uuid. Rebuilding the command
+    per attempt (which a Temporal activity retry would do) could double-post."""
+    conn = _FlakyTodoist(fail_first=2)
+    act = AgentTaskActivities(db_pool=db_pool, todoist_connector=conn)
+
+    await act.comment("tm-1", "pandoras-actor", "found the cause")
+
+    uuids = {batch[0]["uuid"] for batch in conn.calls}
+    assert len(conn.calls) == 3
+    assert len(uuids) == 1, f"uuid changed across attempts: {uuids}"
+
+
+async def test_comment_gives_up_after_the_attempt_bound(db_pool, _seed):
+    conn = _FlakyTodoist(fail_first=99)
+    act = AgentTaskActivities(db_pool=db_pool, todoist_connector=conn)
+
+    result = await act.comment("tm-1", "pandoras-actor", "found the cause")
+
+    assert result["ok"] is False
+    assert len(conn.calls) == 3, "must stop at the attempt bound, not loop"
+
+
+async def test_comment_does_not_retry_a_per_command_rejection(db_pool, _seed):
+    """A per-command rejection is a permanent 4xx-class verdict (bad item id,
+    malformed content). Retrying it poison-loops — the same lesson as
+    TodoistConnector.check_sync_status's rejected_retryable distinction."""
+    calls: list[list[dict]] = []
+
+    class _Rejecting:
+        @staticmethod
+        async def commands(cmds: list[dict]) -> dict:
+            calls.append(cmds)
+            return {"sync_status": {cmds[0]["uuid"]: {"error": "item not found"}}}
+
+    act = AgentTaskActivities(db_pool=db_pool, todoist_connector=_Rejecting())
+    result = await act.comment("tm-1", "pandoras-actor", "found the cause")
+
+    assert result["ok"] is False
+    assert "command_rejected" in str(result["error"])
+    assert len(calls) == 1, "a permanent rejection must NOT be retried"
