@@ -1,0 +1,158 @@
+"""apply_restart_approval — the InteractionFlow post_resolve hook."""
+
+from __future__ import annotations
+
+import pytest
+from aegis_worker.activities.agent_task import AgentTaskActivities
+
+
+@pytest.fixture(autouse=True)
+def _no_sleep(monkeypatch):
+    # The convergence poll awaits asyncio.sleep(4) up to 5x — stub it so the
+    # suite doesn't actually burn up to 20s per test (test_alert_investigation.py
+    # uses this same monkeypatch shape for the kimi-poll activity).
+    from unittest.mock import AsyncMock
+
+    monkeypatch.setattr("aegis_worker.activities.agent_task.asyncio.sleep", AsyncMock())
+
+
+class _Recorder:
+    def __init__(
+        self,
+        healthy_on_call: int | None,
+        restart_ok: bool = True,
+        restart_detail: str = "ok",
+    ):
+        """`healthy_on_call`: the 1-indexed service_health() call number on
+        which the fake first reports healthy; None means it never does.
+
+        Stateful by call count (not a fixed answer) so these tests actually
+        exercise the poll loop — a single-check implementation and a 3x-retry
+        implementation must diverge on both the outcome and the call count,
+        instead of passing identically either way.
+
+        `restart_ok`/`restart_detail` mirror InfraOpsActivities.restart_service
+        returning `{"ok": False, "detail": ...}` when the write itself fails
+        (no connector, connector exception, or `docker service update --force`
+        exiting non-zero) — a real, distinct failure mode from "restarted but
+        still unhealthy".
+        """
+        self.healthy_on_call = healthy_on_call
+        self.restart_ok = restart_ok
+        self.restart_detail = restart_detail
+        self.restarted: list[str] = []
+        self.completed: list[str] = []
+        self.parked: list[str] = []
+        self.notes: list[str] = []
+        self.health_calls = 0
+
+    async def restart_service(self, service_name: str) -> dict:
+        self.restarted.append(service_name)
+        return {"ok": self.restart_ok, "detail": self.restart_detail}
+
+    async def service_health(self, service_name: str) -> dict:
+        self.health_calls += 1
+        healthy = self.healthy_on_call is not None and self.health_calls >= self.healthy_on_call
+        return {"found": True, "healthy": healthy, "detail": f"call {self.health_calls}"}
+
+
+def _act(rec: _Recorder) -> AgentTaskActivities:
+    # `infra_ops` is a normal collaborator field, so the fake drops straight in —
+    # no private-attribute injection.
+    act = AgentTaskActivities(db_pool=None, infra_ops=rec)
+    async def _complete(task_id: str) -> dict:
+        rec.completed.append(task_id)
+        return {"completed": True}
+    async def _park(task_id: str, reason: str) -> dict:
+        rec.parked.append(task_id)
+        return {"parked": True}
+    async def _comment(task_id: str, agent_id: str, body: str) -> dict:
+        rec.notes.append(body)
+        return {"ok": True}
+    act.complete_task = _complete                        # type: ignore[assignment]
+    act.park_task = _park                                # type: ignore[assignment]
+    act.comment = _comment                               # type: ignore[assignment]
+    return act
+
+
+_META = {"task_id": "tr-1", "service": "redis_redis", "agent_id": "pandoras-actor"}
+
+
+async def test_approve_restarts_and_completes_when_service_recovers():
+    rec = _Recorder(healthy_on_call=1)
+    result = await _act(rec).apply_restart_approval("i1", {"value": "approve"}, _META)
+    assert result == {"applied": "approved"}
+    assert rec.restarted == ["redis_redis"]
+    assert rec.completed == ["tr-1"]
+    assert rec.parked == []
+
+
+async def test_approve_parks_when_service_still_broken_after_restart():
+    rec = _Recorder(healthy_on_call=None)
+    await _act(rec).apply_restart_approval("i1", {"value": "approve"}, _META)
+    assert rec.restarted == ["redis_redis"]
+    assert rec.completed == []
+    assert rec.parked == ["tr-1"]
+
+
+async def test_approve_completes_only_after_polling_recovers():
+    """Recovery on the 3rd health check, not the 1st — this is the case a
+    single-check implementation gets wrong: it would see the 1st check's
+    unhealthy answer and park, never finding out the service came back.
+    """
+    rec = _Recorder(healthy_on_call=3)
+    result = await _act(rec).apply_restart_approval("i1", {"value": "approve"}, _META)
+    assert result == {"applied": "approved"}
+    assert rec.completed == ["tr-1"]
+    assert rec.parked == []
+    assert rec.health_calls >= 3
+
+
+async def test_approve_parks_after_exhausting_the_poll_bound():
+    """Never healthy ⇒ the loop must run its full 3 attempts (not 1) before
+    giving up and parking — pins the poll bound itself, not just the outcome.
+    """
+    rec = _Recorder(healthy_on_call=None)
+    await _act(rec).apply_restart_approval("i1", {"value": "approve"}, _META)
+    assert rec.parked == ["tr-1"]
+    assert rec.health_calls == 3
+
+
+async def test_approve_reports_restart_failure_without_claiming_it_happened():
+    """restart_service itself failing (bad service name, read_only infra entry,
+    unreachable daemon, ...) is a distinct case from "restarted but still
+    unhealthy" — the hook must never say "Restarted" when nothing was, and
+    must never even poll health for a restart that didn't happen.
+    """
+    rec = _Recorder(healthy_on_call=1, restart_ok=False, restart_detail="no such service")
+    result = await _act(rec).apply_restart_approval("i1", {"value": "approve"}, _META)
+    assert result == {"applied": "approved"}
+    assert rec.restarted == ["redis_redis"]
+    assert rec.completed == []
+    assert rec.parked == ["tr-1"]
+    assert rec.health_calls == 0
+    note = rec.notes[-1]
+    assert "no such service" in note
+    assert not note.startswith("Restarted")
+
+
+async def test_skip_parks_without_restarting():
+    rec = _Recorder(healthy_on_call=1)
+    result = await _act(rec).apply_restart_approval("i1", {"value": "skip"}, _META)
+    assert result == {"applied": "skipped"}
+    assert rec.restarted == []
+    assert rec.parked == ["tr-1"]
+
+
+async def test_unknown_choice_takes_no_action():
+    rec = _Recorder(healthy_on_call=1)
+    result = await _act(rec).apply_restart_approval("i1", {"value": "???"}, _META)
+    assert result == {"applied": "none"}
+    assert rec.restarted == []
+
+
+async def test_missing_task_id_takes_no_action():
+    rec = _Recorder(healthy_on_call=1)
+    result = await _act(rec).apply_restart_approval("i1", {"value": "approve"}, {})
+    assert result == {"applied": "none"}
+    assert rec.restarted == []

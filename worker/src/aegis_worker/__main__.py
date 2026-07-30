@@ -16,6 +16,7 @@ from temporalio.worker import Worker
 
 from aegis_worker.activities.active_work import ActiveWorkActivities
 from aegis_worker.activities.agent_registry import AgentRegistryActivities
+from aegis_worker.activities.agent_task import AgentTaskActivities
 from aegis_worker.activities.alert_governance import AlertGovernanceActivities
 from aegis_worker.activities.alerts import AlertActivities
 from aegis_worker.activities.briefing import BriefingActivities
@@ -31,6 +32,7 @@ from aegis_worker.activities.delivery import DeliveryActivities
 from aegis_worker.activities.drive import DriveActivities
 from aegis_worker.activities.gmail import GmailActivities
 from aegis_worker.activities.homelab import HomelabActivities
+from aegis_worker.activities.infra_ops import InfraOpsActivities
 from aegis_worker.activities.intel_scan import IntelScanActivities
 from aegis_worker.activities.intelligence import IntelligenceActivities
 from aegis_worker.activities.interactions import InteractionActivities
@@ -47,6 +49,7 @@ from aegis_worker.activities.social import SocialActivities
 from aegis_worker.activities.todoist import TodoistActivities
 from aegis_worker.bootstrap import bootstrap
 from aegis_worker.flows.agent_chat_reply import AgentChatReplyFlow
+from aegis_worker.flows.agent_task import AgentTaskFlow, AgentTaskSweepFlow
 from aegis_worker.flows.alert_investigation import AlertInvestigationFlow
 from aegis_worker.flows.calendar_ingest import CalendarIngestFlow
 from aegis_worker.flows.cert_radar import CertRadarFlow
@@ -102,9 +105,13 @@ _stub_clarify_act = ClarifyActivities(db_pool=None)
 _stub_social_act = SocialActivities(db_pool=None)
 _stub_agent_registry_act = AgentRegistryActivities(db_pool=None)
 _stub_llm_governor_act = LLMGovernorActivities(db_pool=None)
+_stub_agent_task_act = AgentTaskActivities(db_pool=None)
+_stub_infra_ops_act = InfraOpsActivities(homelab_connector=None)
 
 WORKFLOWS: list = [
     AgentChatReplyFlow,
+    AgentTaskSweepFlow,
+    AgentTaskFlow,
     AlertInvestigationFlow,
     CalendarIngestFlow,
     DailyBriefingFlow,
@@ -140,6 +147,22 @@ ACTIVITIES: list = [
     _stub_social_act.complete_posted_tasks,
     _stub_social_act.apply_social_approval,
     _stub_social_act.refresh_post_metrics,
+    _stub_agent_task_act.find_actionable_tasks,
+    _stub_agent_task_act.load_task_context,
+    _stub_agent_task_act.park_task,
+    _stub_agent_task_act.complete_task,
+    _stub_agent_task_act.comment,
+    _stub_agent_task_act.apply_restart_approval,
+    _stub_agent_task_act.triage_email,
+    _stub_agent_task_act.merchant_history,
+    _stub_agent_task_act.apply_finance_decision,
+    _stub_agent_task_act.resolve_task_repo,
+    _stub_agent_task_act.run_task_investigation,
+    _stub_agent_task_act.collect_coding_run,
+    _stub_agent_task_act.run_task_implementation,
+    _stub_infra_ops_act.service_health,
+    _stub_infra_ops_act.service_logs,
+    _stub_infra_ops_act.restart_service,
 ]
 
 
@@ -408,6 +431,30 @@ async def main():
         db_pool=deps.pool,
         connector=connectors.get("social"),
     )
+    agent_task_act = AgentTaskActivities(
+        db_pool=deps.pool,
+        todoist_connector=todoist_connector,
+        remote_script=connectors.get("remote_script"),
+        homelab_connector=connectors.get("homelab"),
+    )
+    infra_ops_act = InfraOpsActivities(homelab_connector=connectors.get("homelab"))
+    # apply_restart_approval runs as an AgentTask activity but needs the infra
+    # ops. Mirrors the existing `alert_act.todoist_connector = todoist_connector`
+    # late-wiring below.
+    agent_task_act.infra_ops = infra_ops_act
+    # triage_email needs GmailActivities.apply_label plus the set of accounts
+    # to probe. Active email channels are the Gmail accounts to probe. Read
+    # them from the channels table (kind='email', active) — config->>'label'
+    # is the account label apply_label expects: arshad-personal, arshad-stpd,
+    # arshad-hikmah in prod.
+    agent_task_act.gmail_activities = gmail_act
+    agent_task_act.gmail_accounts = [
+        r["label"]
+        for r in await deps.pool.fetch(
+            "SELECT config->>'label' AS label FROM channels "
+            "WHERE kind = 'email' AND active AND config->>'label' IS NOT NULL"
+        )
+    ]
     # AlertInvestigationFlow posts start- and final-comments on the Todoist
     # track-task via alert_act.post_task_note. The dataclass declared
     # todoist_connector=None upstream; wire the live connector now.
@@ -559,6 +606,22 @@ async def main():
         inventory_act.mirror_workspace_repos,
         inventory_act.check_github_webhooks,
         inventory_act.upsert_resources_batch,
+        agent_task_act.find_actionable_tasks,
+        agent_task_act.load_task_context,
+        agent_task_act.park_task,
+        agent_task_act.complete_task,
+        agent_task_act.comment,
+        agent_task_act.apply_restart_approval,
+        agent_task_act.triage_email,
+        agent_task_act.merchant_history,
+        agent_task_act.apply_finance_decision,
+        agent_task_act.resolve_task_repo,
+        agent_task_act.run_task_investigation,
+        agent_task_act.collect_coding_run,
+        agent_task_act.run_task_implementation,
+        infra_ops_act.service_health,
+        infra_ops_act.service_logs,
+        infra_ops_act.restart_service,
     ]
 
     if settings.homelab_enabled and homelab_act is not None:
@@ -601,6 +664,8 @@ async def main():
     # All workflows
     workflows = [
         AgentChatReplyFlow,
+        AgentTaskSweepFlow,
+        AgentTaskFlow,
         AlertInvestigationFlow,
         CalendarIngestFlow,
         DailyBriefingFlow,
