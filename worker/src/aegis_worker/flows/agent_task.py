@@ -425,93 +425,43 @@ class AgentTaskFlow:
         )
         return {"task_id": task_id, "verb": "finance", "status": "carded"}
 
+    async def _park_coding(
+        self,
+        task_id: str,
+        reason: str,
+        *,
+        status: str = "parked",
+        comment: str | None = None,
+        agent_id: str | None = None,
+        **extra: Any,
+    ) -> dict:
+        """Shared tail for every _run_coding exit: an optional explanation
+        comment, then park_task, then the terminal result dict. Every
+        _run_coding branch parks — a coding task never auto-completes; even
+        an opened PR still needs human review."""
+        if comment is not None:
+            await workflow.execute_activity(
+                "comment",
+                args=[task_id, agent_id, comment],
+                start_to_close_timeout=TIMEOUT_STANDARD,
+                retry_policy=NO_RETRY,
+            )
+        await workflow.execute_activity(
+            "park_task",
+            args=[task_id, reason],
+            start_to_close_timeout=TIMEOUT_FAST,
+            retry_policy=ACT_RETRY,
+        )
+        return {"task_id": task_id, "verb": "coding", "status": status, **extra}
+
     async def _run_coding(self, input: AgentTaskFlowInput, task_id: str) -> dict:
         """Resolve the repo, investigate read-only, gate the plan, implement on
         approval, then gate the PR. Every exit path parks — a coding task never
         auto-completes; even an opened PR still needs human review."""
-        repo = await workflow.execute_activity(
-            "resolve_task_repo",
-            args=[input.task],
-            start_to_close_timeout=TIMEOUT_STANDARD,
-            retry_policy=ACT_RETRY,
-        )
-        if not repo["github_repo"]:
-            await workflow.execute_activity(
-                "comment",
-                args=[
-                    task_id,
-                    input.agent_id,
-                    "I couldn't work out which repository this task is about, so I "
-                    "haven't touched anything.",
-                ],
-                start_to_close_timeout=TIMEOUT_STANDARD,
-                retry_policy=NO_RETRY,
-            )
-            await workflow.execute_activity(
-                "park_task",
-                args=[task_id, "repo unresolved"],
-                start_to_close_timeout=TIMEOUT_FAST,
-                retry_policy=ACT_RETRY,
-            )
-            return {"task_id": task_id, "verb": "coding", "status": "parked"}
-
-        investigation = await workflow.execute_activity(
-            "run_task_investigation",
-            args=[
-                task_id,
-                str(input.task.get("content") or ""),
-                str(input.task.get("description") or ""),
-                repo["repo_path"],
-                repo["github_repo"],
-            ],
-            start_to_close_timeout=TIMEOUT_LONG,
-            retry_policy=RETRY_ONCE,
-        )
-
-        if investigation.get("status") == "failed":
-            await workflow.execute_activity(
-                "comment",
-                args=[task_id, input.agent_id, "I couldn't start a coding run for this."],
-                start_to_close_timeout=TIMEOUT_STANDARD,
-                retry_policy=NO_RETRY,
-            )
-            await workflow.execute_activity(
-                "park_task",
-                args=[task_id, "coding run failed to start"],
-                start_to_close_timeout=TIMEOUT_FAST,
-                retry_policy=ACT_RETRY,
-            )
-            return {"task_id": task_id, "verb": "coding", "status": "parked"}
-
-        collected = await workflow.execute_activity(
-            "collect_coding_run",
-            args=[investigation.get("output_file", ""), investigation.get("host", "")],
-            start_to_close_timeout=TIMEOUT_CLAUDE,
-            retry_policy=NO_RETRY,
-            heartbeat_timeout=timedelta(minutes=2),
-        )
-        plan = collected.get("transcript", "")
-        if not plan:
-            await workflow.execute_activity(
-                "comment",
-                args=[task_id, input.agent_id, "The investigation produced no usable output."],
-                start_to_close_timeout=TIMEOUT_STANDARD,
-                retry_policy=NO_RETRY,
-            )
-            await workflow.execute_activity(
-                "park_task",
-                args=[task_id, "empty investigation transcript"],
-                start_to_close_timeout=TIMEOUT_FAST,
-                retry_policy=ACT_RETRY,
-            )
-            return {"task_id": task_id, "verb": "coding", "status": "parked"}
-
-        await workflow.execute_activity(
-            "comment",
-            args=[task_id, input.agent_id, f"Investigation in `{repo['github_repo']}`:\n\n{plan}"],
-            start_to_close_timeout=TIMEOUT_STANDARD,
-            retry_policy=NO_RETRY,
-        )
+        setup = await self._investigate_coding_task(input, task_id)
+        if "plan" not in setup:
+            return setup  # early exit already parked (no repo / failed / empty)
+        repo, plan = setup["repo"], setup["plan"]
 
         # AWAIT the plan card. Safe because the sweep spawned this workflow
         # ABANDONED — blocking here cannot starve later ticks.
@@ -539,14 +489,79 @@ class AgentTaskFlow:
             id=f"agent-task-plan-{task_id}",
         )
         if (plan_card.response or {}).get("value") != "approve":
-            await workflow.execute_activity(
-                "park_task",
-                args=[task_id, "plan not approved"],
-                start_to_close_timeout=TIMEOUT_FAST,
-                retry_policy=ACT_RETRY,
-            )
-            return {"task_id": task_id, "verb": "coding", "status": "plan_declined"}
+            return await self._park_coding(task_id, "plan not approved", status="plan_declined")
 
+        return await self._implement_and_open_pr(input, task_id, repo, plan)
+
+    async def _investigate_coding_task(self, input: AgentTaskFlowInput, task_id: str) -> dict:
+        """Phase 1: resolve the repo, run a read-only investigation, and post
+        the plan as a comment. Returns the terminal result dict directly on
+        any early exit (no repo / investigation failed / empty transcript);
+        otherwise returns {"repo": repo, "plan": plan} for the plan-approval
+        gate in _run_coding."""
+        repo = await workflow.execute_activity(
+            "resolve_task_repo",
+            args=[input.task],
+            start_to_close_timeout=TIMEOUT_STANDARD,
+            retry_policy=ACT_RETRY,
+        )
+        if not repo["github_repo"]:
+            return await self._park_coding(
+                task_id,
+                "repo unresolved",
+                comment="I couldn't work out which repository this task is about, so I "
+                "haven't touched anything.",
+                agent_id=input.agent_id,
+            )
+
+        investigation = await workflow.execute_activity(
+            "run_task_investigation",
+            args=[
+                task_id,
+                str(input.task.get("content") or ""),
+                str(input.task.get("description") or ""),
+                repo["repo_path"],
+                repo["github_repo"],
+            ],
+            start_to_close_timeout=TIMEOUT_LONG,
+            retry_policy=RETRY_ONCE,
+        )
+        if investigation.get("status") == "failed":
+            return await self._park_coding(
+                task_id,
+                "coding run failed to start",
+                comment="I couldn't start a coding run for this.",
+                agent_id=input.agent_id,
+            )
+
+        collected = await workflow.execute_activity(
+            "collect_coding_run",
+            args=[investigation.get("output_file", ""), investigation.get("host", "")],
+            start_to_close_timeout=TIMEOUT_CLAUDE,
+            retry_policy=NO_RETRY,
+            heartbeat_timeout=timedelta(minutes=2),
+        )
+        plan = collected.get("transcript", "")
+        if not plan:
+            return await self._park_coding(
+                task_id,
+                "empty investigation transcript",
+                comment="The investigation produced no usable output.",
+                agent_id=input.agent_id,
+            )
+
+        await workflow.execute_activity(
+            "comment",
+            args=[task_id, input.agent_id, f"Investigation in `{repo['github_repo']}`:\n\n{plan}"],
+            start_to_close_timeout=TIMEOUT_STANDARD,
+            retry_policy=NO_RETRY,
+        )
+        return {"repo": repo, "plan": plan}
+
+    async def _implement_and_open_pr(
+        self, input: AgentTaskFlowInput, task_id: str, repo: dict, plan: str
+    ) -> dict:
+        """Phase 2: implement the approved plan, then gate opening a PR."""
         implementation = await workflow.execute_activity(
             "run_task_implementation",
             args=[
@@ -579,13 +594,7 @@ class AgentTaskFlow:
             retry_policy=NO_RETRY,
         )
         if impl_output.get("status") != "succeeded" or not implementation.get("branch"):
-            await workflow.execute_activity(
-                "park_task",
-                args=[task_id, "implementation did not complete"],
-                start_to_close_timeout=TIMEOUT_FAST,
-                retry_policy=ACT_RETRY,
-            )
-            return {"task_id": task_id, "verb": "coding", "status": "parked"}
+            return await self._park_coding(task_id, "implementation did not complete")
 
         pr_card = await workflow.execute_child_workflow(
             InteractionFlow.run,
@@ -604,13 +613,9 @@ class AgentTaskFlow:
             id=f"agent-task-pr-{task_id}",
         )
         if (pr_card.response or {}).get("value") != "approve":
-            await workflow.execute_activity(
-                "park_task",
-                args=[task_id, "PR not approved; branch left in place"],
-                start_to_close_timeout=TIMEOUT_FAST,
-                retry_policy=ACT_RETRY,
+            return await self._park_coding(
+                task_id, "PR not approved; branch left in place", status="pr_declined"
             )
-            return {"task_id": task_id, "verb": "coding", "status": "pr_declined"}
 
         # stage_pending_pr takes StagePendingPrInput and returns a PLAIN STRING
         # pending_pr_id (alert_governance.py:103) — not a dict. `alert_fingerprint`
@@ -651,42 +656,22 @@ class AgentTaskFlow:
         # required, not just reading pr_url, or a failed PR silently reads as
         # opened.
         if pr.get("status") != "opened" or not pr.get("pr_url"):
-            await workflow.execute_activity(
-                "comment",
-                args=[
-                    task_id,
-                    input.agent_id,
-                    f"Implementation is on branch `{implementation['branch']}` in "
-                    f"`{repo['github_repo']}`, but opening the PR failed: "
-                    f"{pr.get('error') or 'unknown error'}.",
-                ],
-                start_to_close_timeout=TIMEOUT_STANDARD,
-                retry_policy=NO_RETRY,
+            return await self._park_coding(
+                task_id,
+                f"PR creation failed: {pr.get('error') or 'unknown error'}",
+                status="pr_failed",
+                comment=f"Implementation is on branch `{implementation['branch']}` in "
+                f"`{repo['github_repo']}`, but opening the PR failed: "
+                f"{pr.get('error') or 'unknown error'}.",
+                agent_id=input.agent_id,
             )
-            await workflow.execute_activity(
-                "park_task",
-                args=[task_id, f"PR creation failed: {pr.get('error') or 'unknown error'}"],
-                start_to_close_timeout=TIMEOUT_FAST,
-                retry_policy=ACT_RETRY,
-            )
-            return {"task_id": task_id, "verb": "coding", "status": "pr_failed"}
 
-        await workflow.execute_activity(
-            "comment",
-            args=[task_id, input.agent_id, f"Opened a PR: {pr['pr_url']}"],
-            start_to_close_timeout=TIMEOUT_STANDARD,
-            retry_policy=NO_RETRY,
-        )
         # @waiting, never complete: the PR still needs your review.
-        await workflow.execute_activity(
-            "park_task",
-            args=[task_id, "PR opened, awaiting review"],
-            start_to_close_timeout=TIMEOUT_FAST,
-            retry_policy=ACT_RETRY,
+        return await self._park_coding(
+            task_id,
+            "PR opened, awaiting review",
+            status="pr_opened",
+            comment=f"Opened a PR: {pr['pr_url']}",
+            agent_id=input.agent_id,
+            repo=repo["github_repo"],
         )
-        return {
-            "task_id": task_id,
-            "verb": "coding",
-            "status": "pr_opened",
-            "repo": repo["github_repo"],
-        }
