@@ -162,8 +162,9 @@ def test_agent_task_registrations_reach_mains_live_lists():
     (test_module_stub_workflows_covers_runtime_base_list only checks
     runtime ⊆ stub; test_every_registered_activity_is_decorated only checks
     decoration) while still crashing the live worker at boot with an
-    unknown workflow/activity type. This closes that gap for the five new
-    agent_task registrations specifically.
+    unknown workflow/activity type. This closes that gap for the five
+    agent_task registrations plus the three infra_ops registrations added
+    alongside the infra verb (Task 4) specifically.
     """
     import ast
     import inspect
@@ -197,6 +198,9 @@ def test_agent_task_registrations_reach_mains_live_lists():
         "park_task",
         "complete_task",
         "comment",
+        "service_health",
+        "service_logs",
+        "restart_service",
     ):
         assert expected in live_activity_attrs, (
             f"{expected} must be in main()'s live activities=[...] list, not just the module stub"
