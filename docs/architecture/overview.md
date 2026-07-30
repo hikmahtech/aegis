@@ -15,7 +15,7 @@ This document is the canonical reference for what the running system does today.
 | Temporal | auto-setup | 7233 | Workflow orchestration (task queue `aegis-main`) |
 | Temporal UI | temporalio/ui | 8233 | Workflow debugging |
 | Ollama | `--profile local-llm` | 11434 | Optional bundled local model server (point the LLM backend at it for fully-local) |
-| ElevenLabs | hosted vendor | api.acme-saas.example | Media transcription (Scribe STT) + per-persona voice notes (TTS) |
+| ElevenLabs | hosted vendor | api.elevenlabs.io | Media transcription (Scribe STT) + per-persona voice notes (TTS) |
 
 Knowledge is **native to Core** (Postgres + pgvector, `services/knowledge.py`) — there is no separate knowledge service. Deployment is a fork-owned concern: this repo's CI is test-only, and images are built/deployed by your own infrastructure — see [`production.md`](../production.md). ElevenLabs is a hosted vendor (no in-cluster GPU service).
 

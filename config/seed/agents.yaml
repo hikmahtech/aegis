@@ -60,7 +60,7 @@ agents:
     # `infra` is a behavior tag (aegis.agent_tags) — routing keys on it, not on the id.
     capabilities: [infra, homelab, k8s, argocd, certs, drift]
     model_tier: smart
-    interaction_timeout_default: auto_reject
+    interaction_timeout_default: archive
     slack_channel_id: ""
     elevenlabs_voice_id: ""
     metadata:
