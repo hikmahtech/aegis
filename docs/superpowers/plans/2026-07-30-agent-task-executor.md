@@ -1089,6 +1089,16 @@ git commit -m "feat(agent-task): sweep + per-task flow with terminal states and 
 
 ### Task 4: `#alert` → infra verb (40 tasks, the largest group)
 
+> **PLAN ERROR, corrected during implementation (commit `be6b596`).** The
+> `InfraOpsActivities` code and test fake below were written against a fictional flat connector
+> shape `{"services": [{"name", "replicas": "1/1"}]}`. The REAL `HomelabConnector.list_services`
+> (`core/src/aegis/connectors/homelab.py:82`) returns an `_envelope(...)` — `{"ok", "data", ...}` —
+> whose service items carry `replicas_actual` / `replicas_desired` as **ints**, not a
+> `"running/desired"` string. Verified against real callers at `activities/alerts.py:1215-1250`
+> and `activities/homelab.py::collect_services`. The shipped implementation uses the real shape;
+> the activity-level contract (`{"found", "healthy", "detail"}`) is unchanged, so Task 5 is
+> unaffected. Read the connector before reusing any snippet below.
+
 **Files:**
 - Create: `worker/src/aegis_worker/activities/infra_ops.py`
 - Modify: `worker/src/aegis_worker/flows/agent_task.py`
