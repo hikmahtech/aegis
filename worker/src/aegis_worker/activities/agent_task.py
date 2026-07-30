@@ -568,3 +568,101 @@ class AgentTaskActivities:
             "host": started.get("host", ""),
             "worktree_path": started.get("worktree_path", ""),
         }
+
+    @activity.defn
+    async def collect_coding_run(
+        self, output_file: str, host: str, max_polls: int = 40
+    ) -> dict:
+        """Poll a coding run until its STATUS footer appears, then extract text.
+
+        Returns the ASSISTANT TRANSCRIPT, never the raw stream-json: handing raw
+        jsonl to an LLM is what made every prod verdict confidence=0.0 with
+        `{"role":"tool"` in its root_cause (fixed in #150).
+        """
+        import asyncio
+
+        from aegis_worker.activities.alerts import (
+            _INVESTIGATION_OUTPUT_CAP,
+            _extract_kimi_transcript,
+            _kimi_output_complete,
+        )
+
+        if self.remote_script is None or not output_file:
+            return {"status": "failed", "transcript": ""}
+
+        latest = ""
+        for _ in range(max_polls):
+            raw = await self.remote_script.fetch_kimi_run_output(output_file, host=host)
+            if raw:
+                latest = raw
+                if _kimi_output_complete(raw):
+                    return {
+                        "status": "succeeded",
+                        "transcript": _extract_kimi_transcript(raw)[-_INVESTIGATION_OUTPUT_CAP:],
+                    }
+            # heartbeat() RAISES RuntimeError("Not in activity context") outside a
+            # Worker, unlike activity.logger which degrades silently. The unit
+            # tests call this method directly, so guard it the way comment()
+            # already does in this same file.
+            if activity.in_activity():
+                activity.heartbeat()
+            await asyncio.sleep(30)
+
+        return {
+            "status": "timed_out",
+            "transcript": (
+                _extract_kimi_transcript(latest)[-_INVESTIGATION_OUTPUT_CAP:] if latest else ""
+            ),
+        }
+
+    @activity.defn
+    async def run_task_implementation(
+        self,
+        task_id: str,
+        title: str,
+        description: str,
+        plan: str,
+        repo_path: str,
+        github_repo: str,
+    ) -> dict:
+        """Phase 2: implement the approved plan on a branch. Does NOT open a PR.
+
+        Opening the PR is a separate gated step, so a bad implementation stays
+        local and reviewable rather than becoming a PR nobody asked for.
+        """
+        if self.remote_script is None or not repo_path:
+            return {"status": "failed", "transcript": "", "branch": "", "run_id": ""}
+
+        branch = f"aegis-task/{task_id}"
+        prompt = (
+            "Implement the approved plan below. Commit your work to a new branch "
+            f"named exactly `{branch}`. Do NOT open a pull request.\n\n"
+            f"Task: {title}\n\n{description}\n\n"
+            f"Approved plan:\n{plan}\n\n"
+            "End your final message with exactly one of:\n"
+            f"     BRANCH: {github_repo.split('/')[-1]}:{branch}\n"
+            "     STATUS: implemented\n"
+            "   or STATUS: unactionable: <why>\n"
+        )
+        settings = await self.remote_script.coding_settings()
+        started = await self.remote_script.start_kimi_run(
+            repo=repo_path,
+            prompt=prompt,
+            kimi_binary=settings.get("kimi_binary", ""),
+            github_repo=github_repo,
+        )
+        if started.get("status") != "running":
+            return {
+                "status": "failed",
+                "transcript": started.get("error", "")[:500],
+                "branch": "",
+                "run_id": started.get("run_id", ""),
+            }
+        return {
+            "status": "running",
+            "transcript": "",
+            "branch": branch,
+            "run_id": started.get("run_id", ""),
+            "output_file": started.get("output_file", ""),
+            "host": started.get("host", ""),
+        }

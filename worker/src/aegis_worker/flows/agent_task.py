@@ -13,6 +13,7 @@ it the 6h cooldown is an infinite slow loop.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import timedelta
 from html import escape as _esc
 from typing import Any
 
@@ -21,11 +22,16 @@ from temporalio.exceptions import ApplicationError, WorkflowAlreadyStartedError
 
 with workflow.unsafe.imports_passed_through():
     from aegis_worker.activities.agent_task import extract_service_name, resolve_verb
+    from aegis_worker.activities.alert_governance import (
+        CreateGithubPrInput,
+        StagePendingPrInput,
+    )
     from aegis_worker.flows.interaction import InteractionFlow, InteractionFlowInput
     from aegis_worker.shared.retry import (
         ACT_RETRY,
         NO_RETRY,
         RETRY_ONCE,
+        TIMEOUT_CLAUDE,
         TIMEOUT_FAST,
         TIMEOUT_LONG,
         TIMEOUT_STANDARD,
@@ -420,7 +426,9 @@ class AgentTaskFlow:
         return {"task_id": task_id, "verb": "finance", "status": "carded"}
 
     async def _run_coding(self, input: AgentTaskFlowInput, task_id: str) -> dict:
-        """Phase 1: resolve the repo, investigate read-only, card the plan."""
+        """Resolve the repo, investigate read-only, gate the plan, implement on
+        approval, then gate the PR. Every exit path parks — a coding task never
+        auto-completes; even an opened PR still needs human review."""
         repo = await workflow.execute_activity(
             "resolve_task_repo",
             args=[input.task],
@@ -460,26 +468,195 @@ class AgentTaskFlow:
             retry_policy=RETRY_ONCE,
         )
 
+        if investigation.get("status") == "failed":
+            await workflow.execute_activity(
+                "comment",
+                args=[task_id, input.agent_id, "I couldn't start a coding run for this."],
+                start_to_close_timeout=TIMEOUT_STANDARD,
+                retry_policy=NO_RETRY,
+            )
+            await workflow.execute_activity(
+                "park_task",
+                args=[task_id, "coding run failed to start"],
+                start_to_close_timeout=TIMEOUT_FAST,
+                retry_policy=ACT_RETRY,
+            )
+            return {"task_id": task_id, "verb": "coding", "status": "parked"}
+
+        collected = await workflow.execute_activity(
+            "collect_coding_run",
+            args=[investigation.get("output_file", ""), investigation.get("host", "")],
+            start_to_close_timeout=TIMEOUT_CLAUDE,
+            retry_policy=NO_RETRY,
+            heartbeat_timeout=timedelta(minutes=2),
+        )
+        plan = collected.get("transcript", "")
+        if not plan:
+            await workflow.execute_activity(
+                "comment",
+                args=[task_id, input.agent_id, "The investigation produced no usable output."],
+                start_to_close_timeout=TIMEOUT_STANDARD,
+                retry_policy=NO_RETRY,
+            )
+            await workflow.execute_activity(
+                "park_task",
+                args=[task_id, "empty investigation transcript"],
+                start_to_close_timeout=TIMEOUT_FAST,
+                retry_policy=ACT_RETRY,
+            )
+            return {"task_id": task_id, "verb": "coding", "status": "parked"}
+
+        await workflow.execute_activity(
+            "comment",
+            args=[task_id, input.agent_id, f"Investigation in `{repo['github_repo']}`:\n\n{plan}"],
+            start_to_close_timeout=TIMEOUT_STANDARD,
+            retry_policy=NO_RETRY,
+        )
+
+        # AWAIT the plan card. Safe because the sweep spawned this workflow
+        # ABANDONED — blocking here cannot starve later ticks.
+        plan_card = await workflow.execute_child_workflow(
+            InteractionFlow.run,
+            InteractionFlowInput(
+                agent_id=input.agent_id,
+                kind="choice",
+                origin="agent_task_coding_plan",
+                prompt=(
+                    # _esc() every user/agent-derived string inside an HTML tag —
+                    # repo-wide convention (_run_infra, _run_finance,
+                    # calendar_ingest, receipt_ingest, gmail_ingest all do this).
+                    # A literal `<` or `&` in a task title otherwise breaks the
+                    # comms html_to_mrkdwn parse.
+                    f"🛠 <b>{_esc(str(input.task.get('content') or ''))}</b>\n\n"
+                    f"Repo: <code>{_esc(repo['github_repo'])}</code>\n\n"
+                    f"{_esc(plan[:1200])}\n\n"
+                    "Implement this?"
+                ),
+                options={"approve": "✅ Implement", "skip": "⏭️ Not now"},
+                timeout_seconds=172800,
+                timeout_policy="archive",
+            ),
+            id=f"agent-task-plan-{task_id}",
+        )
+        if (plan_card.response or {}).get("value") != "approve":
+            await workflow.execute_activity(
+                "park_task",
+                args=[task_id, "plan not approved"],
+                start_to_close_timeout=TIMEOUT_FAST,
+                retry_policy=ACT_RETRY,
+            )
+            return {"task_id": task_id, "verb": "coding", "status": "plan_declined"}
+
+        implementation = await workflow.execute_activity(
+            "run_task_implementation",
+            args=[
+                task_id,
+                str(input.task.get("content") or ""),
+                str(input.task.get("description") or ""),
+                plan,
+                repo["repo_path"],
+                repo["github_repo"],
+            ],
+            start_to_close_timeout=TIMEOUT_LONG,
+            retry_policy=NO_RETRY,
+        )
+        impl_output = await workflow.execute_activity(
+            "collect_coding_run",
+            args=[implementation.get("output_file", ""), implementation.get("host", "")],
+            start_to_close_timeout=TIMEOUT_CLAUDE,
+            retry_policy=NO_RETRY,
+            heartbeat_timeout=timedelta(minutes=2),
+        )
         await workflow.execute_activity(
             "comment",
             args=[
                 task_id,
                 input.agent_id,
-                f"Investigating in `{repo['github_repo']}` "
-                f"(run {investigation.get('run_id', '?')}).",
+                f"Implementation run finished ({impl_output.get('status')}) on branch "
+                f"`{implementation.get('branch', '?')}`.",
             ],
             start_to_close_timeout=TIMEOUT_STANDARD,
             retry_policy=NO_RETRY,
         )
+        if impl_output.get("status") != "succeeded" or not implementation.get("branch"):
+            await workflow.execute_activity(
+                "park_task",
+                args=[task_id, "implementation did not complete"],
+                start_to_close_timeout=TIMEOUT_FAST,
+                retry_policy=ACT_RETRY,
+            )
+            return {"task_id": task_id, "verb": "coding", "status": "parked"}
+
+        pr_card = await workflow.execute_child_workflow(
+            InteractionFlow.run,
+            InteractionFlowInput(
+                agent_id=input.agent_id,
+                kind="choice",
+                origin="agent_task_coding_pr",
+                prompt=(
+                    f"📤 Branch <code>{_esc(implementation['branch'])}</code> is ready in "
+                    f"<code>{_esc(repo['github_repo'])}</code>.\n\nOpen a PR?"
+                ),
+                options={"approve": "✅ Open PR", "skip": "⏭️ Leave the branch"},
+                timeout_seconds=172800,
+                timeout_policy="archive",
+            ),
+            id=f"agent-task-pr-{task_id}",
+        )
+        if (pr_card.response or {}).get("value") != "approve":
+            await workflow.execute_activity(
+                "park_task",
+                args=[task_id, "PR not approved; branch left in place"],
+                start_to_close_timeout=TIMEOUT_FAST,
+                retry_policy=ACT_RETRY,
+            )
+            return {"task_id": task_id, "verb": "coding", "status": "pr_declined"}
+
+        # stage_pending_pr takes StagePendingPrInput and returns a PLAIN STRING
+        # pending_pr_id (alert_governance.py:103) — not a dict. `alert_fingerprint`
+        # is reused as the correlation key; for a task-driven PR that is task:<id>.
+        staged = await workflow.execute_activity(
+            "stage_pending_pr",
+            StagePendingPrInput(
+                alert_fingerprint=f"task:{task_id}",
+                repo=repo["github_repo"],
+                branch=implementation["branch"],
+                title=f"{input.task.get('content')}"[:72],
+                body=f"Implements Todoist task {task_id}.\n\n{plan[:2000]}",
+            ),
+            start_to_close_timeout=TIMEOUT_STANDARD,
+            retry_policy=ACT_RETRY,
+        )
+        pr = await workflow.execute_activity(
+            "create_github_pr",
+            CreateGithubPrInput(
+                pending_pr_id=staged,
+                repo=repo["github_repo"],
+                branch=implementation["branch"],
+                base="main",
+                host=implementation.get("host", ""),
+                repo_path=repo["repo_path"],
+            ),
+            start_to_close_timeout=TIMEOUT_LONG,
+            retry_policy=RETRY_ONCE,
+        )
+        # create_github_pr returns {"pr_url", "status", ...} — the key is pr_url.
+        await workflow.execute_activity(
+            "comment",
+            args=[task_id, input.agent_id, f"Opened a PR: {pr.get('pr_url') or 'see the repo'}"],
+            start_to_close_timeout=TIMEOUT_STANDARD,
+            retry_policy=NO_RETRY,
+        )
+        # @waiting, never complete: the PR still needs your review.
         await workflow.execute_activity(
             "park_task",
-            args=[task_id, "coding investigation dispatched"],
+            args=[task_id, "PR opened, awaiting review"],
             start_to_close_timeout=TIMEOUT_FAST,
             retry_policy=ACT_RETRY,
         )
         return {
             "task_id": task_id,
             "verb": "coding",
-            "status": "investigating",
+            "status": "pr_opened",
             "repo": repo["github_repo"],
         }
