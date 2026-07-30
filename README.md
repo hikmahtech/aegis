@@ -88,6 +88,8 @@ Backed by **Postgres 16 + pgvector** (migrations auto-apply on core startup),
 `fast` / `balanced` / `smart` model tiers to whatever models you point it at.
 
 Full design: [`docs/architecture/overview.md`](docs/architecture/overview.md).
+Operator's guide — what runs when, human-in-the-loop, the alert pipeline, and
+the failure modes worth recognising: [`docs/how-it-works.md`](docs/how-it-works.md).
 
 ## Quick start
 
