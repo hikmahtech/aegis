@@ -2059,7 +2059,7 @@ git commit -m "feat(agent-task): email verb — archive notifications, park real
 
 ### Task 7: `#receipt` → finance verb (7 tasks)
 
-These are questions ("Anomaly: ? Eleven Labs"), not work — a human decides whether a charge is
+These are questions ("Anomaly: ? Acme SaaS"), not work — a human decides whether a charge is
 legitimate. The value is the assembled context, not an autonomous decision, so this verb gathers
 prior charges for the merchant and puts up a decision card. No autonomous write.
 
@@ -2103,9 +2103,9 @@ from aegis_worker.activities.agent_task import AgentTaskActivities, extract_merc
 @pytest.mark.parametrize(
     ("title", "expected"),
     [
-        ("Anomaly: ? Eleven Labs", "Eleven Labs"),
-        ("Anomaly: 8100.00 INR Mahavitaran (MSEDCL)", "Mahavitaran (MSEDCL)"),
-        ("Renewal in 19.6 days: Mahavitaran (MSEDCL) (810000 INR)", "Mahavitaran (MSEDCL)"),
+        ("Anomaly: ? Acme SaaS", "Acme SaaS"),
+        ("Anomaly: 8100.00 INR City Power Co", "City Power Co"),
+        ("Renewal in 19.6 days: City Power Co (810000 INR)", "City Power Co"),
         ("Something unrelated", ""),
     ],
 )
@@ -2116,35 +2116,35 @@ def test_extract_merchant(title, expected):
 @pytest_asyncio.fixture(loop_scope="function")
 async def _charges(db_pool):
     await db_pool.execute("DELETE FROM finance.receipt_email WHERE message_id LIKE 'test-el-%'")
-    await db_pool.execute("DELETE FROM finance.recurring_charge WHERE vendor_name = 'Eleven Labs'")
+    await db_pool.execute("DELETE FROM finance.recurring_charge WHERE vendor_name = 'Acme SaaS'")
     # ONE charge signature (the table is upsert-keyed, 001_baseline.sql:726),
     # then TWO receipt rows against it — that is where real history lives.
     charge_id = await db_pool.fetchval(
         "INSERT INTO finance.recurring_charge "
         "  (account, sender_label, vendor_name, amount_cents, currency, last_seen_at) "
-        "VALUES ('a','s','Eleven Labs', 2200, 'USD', now() - interval '30 days') "
+        "VALUES ('a','s','Acme SaaS', 2200, 'USD', now() - interval '30 days') "
         "RETURNING id"
     )
     await db_pool.execute(
         "INSERT INTO finance.receipt_email "
         "  (message_id, account, sender, subject, received_at, charge_id, parsed) "
-        "VALUES ('test-el-1','a','billing@elevenlabs.io','Receipt', "
+        "VALUES ('test-el-1','a','billing@acme-saas.example','Receipt', "
         "         now() - interval '30 days', $1, "
         "         '{\"is_receipt\": true, \"amount\": 22.0, \"currency\": \"USD\"}'::jsonb), "
-        "       ('test-el-2','a','billing@elevenlabs.io','Receipt', "
+        "       ('test-el-2','a','billing@acme-saas.example','Receipt', "
         "         now() - interval '60 days', $1, "
         "         '{\"is_receipt\": true, \"amount\": 22.0, \"currency\": \"USD\"}'::jsonb)",
         charge_id,
     )
     yield
     await db_pool.execute("DELETE FROM finance.receipt_email WHERE message_id LIKE 'test-el-%'")
-    await db_pool.execute("DELETE FROM finance.recurring_charge WHERE vendor_name = 'Eleven Labs'")
+    await db_pool.execute("DELETE FROM finance.recurring_charge WHERE vendor_name = 'Acme SaaS'")
 
 
 async def test_merchant_history_returns_prior_charges(db_pool, _charges):
     act = AgentTaskActivities(db_pool=db_pool)
-    result = await act.merchant_history("Anomaly: ? Eleven Labs")
-    assert result["merchant"] == "Eleven Labs"
+    result = await act.merchant_history("Anomaly: ? Acme SaaS")
+    assert result["merchant"] == "Acme SaaS"
     assert len(result["charges"]) == 2
     assert "22" in result["summary"]
 
@@ -2177,7 +2177,7 @@ def _act_recording(calls: list) -> AgentTaskActivities:
 
 async def test_finance_decision_expected_completes_the_task():
     calls: list = []
-    meta = {"task_id": "tfin-1", "agent_id": "maou", "merchant": "Eleven Labs"}
+    meta = {"task_id": "tfin-1", "agent_id": "maou", "merchant": "Acme SaaS"}
     result = await _act_recording(calls).apply_finance_decision(
         "i1", {"value": "expected"}, meta
     )
@@ -2187,7 +2187,7 @@ async def test_finance_decision_expected_completes_the_task():
 
 async def test_finance_decision_investigate_parks_the_task():
     calls: list = []
-    meta = {"task_id": "tfin-2", "agent_id": "maou", "merchant": "Eleven Labs"}
+    meta = {"task_id": "tfin-2", "agent_id": "maou", "merchant": "Acme SaaS"}
     result = await _act_recording(calls).apply_finance_decision(
         "i1", {"value": "investigate"}, meta
     )
@@ -2456,8 +2456,8 @@ async def _seed(db_pool):
     # `path` must be present AND nested, so a wrong JSONB key is catchable.
     await db_pool.execute(
         "INSERT INTO resources (slug, kind, title, metadata) VALUES "
-        "('test-repo-bcp','repository','Stockopedia/bcp',"
-        " '{\"github_repo\": \"Stockopedia/bcp\", \"path\": \"stockopedia/bcp\"}'::jsonb)"
+        "('test-repo-bcp','repository','acme/api',"
+        " '{\"github_repo\": \"acme/api\", \"path\": \"acme/api\"}'::jsonb)"
     )
     yield
     await db_pool.execute("DELETE FROM todoist_projects WHERE id LIKE 'pr-%'")
@@ -2469,11 +2469,11 @@ async def test_project_name_resolves_to_repo(db_pool, _seed):
     result = await act.resolve_task_repo(
         {"id": "x", "content": "Fix the exporter", "project_id": "pr-bcp"}
     )
-    assert result["github_repo"] == "Stockopedia/bcp"
+    assert result["github_repo"] == "acme/api"
     assert result["source"] == "project_map"
     # Load-bearing: proves the JSONB key is right. Without this the wrong key
     # ships green, flattening every nested checkout.
-    assert result["repo_path"] == "stockopedia/bcp"
+    assert result["repo_path"] == "acme/api"
 
 
 async def test_unmapped_project_returns_no_repo_never_a_guess(db_pool, _seed):
@@ -2505,10 +2505,10 @@ module constant so it is one obvious place to extend (there are 55 registered re
 # Todoist project name → GitHub repo. The projects already mirror repos, which
 # is a far stronger signal than guessing from a task title.
 PROJECT_REPO_MAP = {
-    "bcp": "Stockopedia/bcp",
+    "bcp": "acme/api",
     "aegis": "hikmahtech/aegis",
-    "home infra": "hikmahtech/homelab-gitops",
-    "drwho": "hikmahtech/drwhome",
+    "home infra": "acme/infra",
+    "drwho": "acme/webapp",
 }
 ```
 
@@ -2539,7 +2539,7 @@ PROJECT_REPO_MAP = {
         # application-level rename applied AFTER reading (alerts.py:521);
         # inventory.py:386-397 writes {"path", "github_repo", "origin_url"}.
         # Querying 'resource_path' always yields NULL, silently flattening a
-        # nested checkout (stockopedia/bcp -> bcp) so start_kimi_run then hard-
+        # nested checkout (acme/api -> bcp) so start_kimi_run then hard-
         # fails with a false "Repo checkout missing".
         row = await self.db_pool.fetchrow(
             "SELECT metadata->>'path' AS rpath FROM resources "
@@ -2983,8 +2983,8 @@ def _activities(events: list, *, plan_choice: str):
     @activity.defn(name="resolve_task_repo")
     async def resolve_task_repo(task: dict) -> dict:
         return {
-            "github_repo": "Stockopedia/bcp",
-            "repo_path": "Stockopedia/bcp",
+            "github_repo": "acme/api",
+            "repo_path": "acme/api",
             "source": "project_map",
             "candidates": [],
         }
@@ -3033,7 +3033,7 @@ def _activities(events: list, *, plan_choice: str):
     @activity.defn(name="create_github_pr")
     async def create_github_pr(inp) -> dict:
         events.append(("pr", "opened"))
-        return {"pr_url": "https://github.com/Stockopedia/bcp/pull/1", "status": "opened"}
+        return {"pr_url": "https://github.com/acme/api/pull/1", "status": "opened"}
 
     # InteractionFlow's own activities. Names and input types copied from the
     # canonical stub block in tests/worker/flows/test_alert_investigation_gates.py
@@ -3398,7 +3398,7 @@ Expected: `PLAY RECAP` with `failed=0`. `asif` shows `unreachable=1` — that bo
 - [ ] **Step 3: Verify the worker booted with the new flows**
 
 ```bash
-ssh arshad@10.20.0.103 'docker logs --since 5m $(docker ps -qf name=aegis_worker|head -1) 2>&1 | grep -oE "activities=[0-9]+ flows=[0-9]+|ERROR|CRITICAL" | sort | uniq -c'
+ssh <core-host> 'docker logs --since 5m $(docker ps -qf name=aegis_worker|head -1) 2>&1 | grep -oE "activities=[0-9]+ flows=[0-9]+|ERROR|CRITICAL" | sort | uniq -c'
 ```
 
 Expected: **`flows=24`, unchanged** — and no ERROR/CRITICAL. Do NOT expect the flows count to
@@ -3407,7 +3407,7 @@ add only *activities* to the existing flows. `flows=len(workflows)` (`__main__.p
 this worktree. The number that grows is `activities=`; confirm the new names are live with:
 
 ```bash
-ssh arshad@10.20.0.103 'docker exec $(docker ps -qf name=aegis_worker|head -1) sh -c "grep -c . /dev/null"; echo "(check the boot log line for the activities= count instead)"'
+ssh <core-host> 'docker exec $(docker ps -qf name=aegis_worker|head -1) sh -c "grep -c . /dev/null"; echo "(check the boot log line for the activities= count instead)"'
 ```
 
 A stale expectation here is worse than no check — it reads a successful deploy as a failure.
@@ -3415,7 +3415,7 @@ A stale expectation here is worse than no check — it reads a successful deploy
 - [ ] **Step 4: Confirm the schedule reconciled**
 
 ```bash
-ssh ubuntu@qaf 'CID=$(docker ps -qf name=aegis_temporal.1|head -1); docker exec -i "$CID" sh -c "temporal schedule list --address \$(hostname -i):7233" | grep agent-task'
+ssh <swarm-manager> 'CID=$(docker ps -qf name=aegis_temporal.1|head -1); docker exec -i "$CID" sh -c "temporal schedule list --address \$(hostname -i):7233" | grep agent-task'
 ```
 
 Expected: `agent-task-15min` listed. `schedule_sync` reconciles on boot and every ~300s.
@@ -3423,7 +3423,7 @@ Expected: `agent-task-15min` listed. `schedule_sync` reconciles on boot and ever
 - [ ] **Step 5: Trigger one tick and read the outcome**
 
 ```bash
-ssh ubuntu@qaf 'CID=$(docker ps -qf name=aegis_temporal.1|head -1); docker exec -i "$CID" sh -c "temporal schedule trigger --schedule-id agent-task-15min --address \$(hostname -i):7233"'
+ssh <swarm-manager> 'CID=$(docker ps -qf name=aegis_temporal.1|head -1); docker exec -i "$CID" sh -c "temporal schedule trigger --schedule-id agent-task-15min --address \$(hostname -i):7233"'
 ```
 
 Then, after a minute:
