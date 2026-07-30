@@ -2049,6 +2049,15 @@ These are questions ("Anomaly: ? Eleven Labs"), not work — a human decides whe
 legitimate. The value is the assembled context, not an autonomous decision, so this verb gathers
 prior charges for the merchant and puts up a decision card. No autonomous write.
 
+**Where the history comes from (corrected after the pre-flight audit).**
+`finance.recurring_charge` is NOT a ledger — it is upserted one row per
+`(account, sender_label, amount_cents, currency)` signature with `last_seen_at` bumped in place
+(`activities/money.py:250-252`), so a merchant billing a steady amount has exactly one row and can
+supply no history at all. `finance.receipt_email` IS append-only (one row per received receipt,
+unique on `message_id`) and carries a `charge_id` FK plus each receipt's own extracted
+`amount`/`currency` in its `parsed` jsonb. The query therefore joins `receipt_email` to
+`recurring_charge` for the canonical `vendor_name` and reads per-receipt amounts.
+
 **Files:**
 - Modify: `worker/src/aegis_worker/activities/agent_task.py`, `worker/src/aegis_worker/flows/agent_task.py`
 - Modify: `worker/src/aegis_worker/__main__.py`
@@ -2058,7 +2067,9 @@ prior charges for the merchant and puts up a decision card. No autonomous write.
 - Consumes: `comment`, `park_task`, `complete_task`.
 - Produces:
   - `AgentTaskActivities.merchant_history(title: str, limit: int = 6) -> dict`
-    → `{"merchant": str, "charges": list[dict], "summary": str}`
+    → `{"merchant": str, "charges": list[dict], "summary": str}`; each charge is
+    `{"amount": float, "currency": str, "last_seen_at": str}`, sourced from the append-only
+    `finance.receipt_email`, NOT the upsert-keyed `recurring_charge`.
   - `AgentTaskActivities.apply_finance_decision(interaction_id: str, response: dict, metadata: dict) -> dict`
     → `{"applied": "expected" | "investigate" | "none"}`
 
@@ -2090,17 +2101,29 @@ def test_extract_merchant(title, expected):
 
 @pytest_asyncio.fixture(loop_scope="function")
 async def _charges(db_pool):
+    await db_pool.execute("DELETE FROM finance.receipt_email WHERE message_id LIKE 'test-el-%'")
     await db_pool.execute("DELETE FROM finance.recurring_charge WHERE vendor_name = 'Eleven Labs'")
-    await db_pool.execute(
+    # ONE charge signature (the table is upsert-keyed, 001_baseline.sql:726),
+    # then TWO receipt rows against it — that is where real history lives.
+    charge_id = await db_pool.fetchval(
         "INSERT INTO finance.recurring_charge "
         "  (account, sender_label, vendor_name, amount_cents, currency, last_seen_at) "
-        # UNIQUE (account, sender_label, amount_cents, currency) —
-        # migrations/001_baseline.sql:726. Identical amount_cents on both rows
-        # would be a duplicate-key violation at fixture setup.
-        "VALUES ('a','s','Eleven Labs', 2200, 'USD', now() - interval '30 days'), "
-        "       ('a','s','Eleven Labs', 2500, 'USD', now() - interval '60 days')"
+        "VALUES ('a','s','Eleven Labs', 2200, 'USD', now() - interval '30 days') "
+        "RETURNING id"
+    )
+    await db_pool.execute(
+        "INSERT INTO finance.receipt_email "
+        "  (message_id, account, sender, subject, received_at, charge_id, parsed) "
+        "VALUES ('test-el-1','a','billing@elevenlabs.io','Receipt', "
+        "         now() - interval '30 days', $1, "
+        "         '{\"is_receipt\": true, \"amount\": 22.0, \"currency\": \"USD\"}'::jsonb), "
+        "       ('test-el-2','a','billing@elevenlabs.io','Receipt', "
+        "         now() - interval '60 days', $1, "
+        "         '{\"is_receipt\": true, \"amount\": 22.0, \"currency\": \"USD\"}'::jsonb)",
+        charge_id,
     )
     yield
+    await db_pool.execute("DELETE FROM finance.receipt_email WHERE message_id LIKE 'test-el-%'")
     await db_pool.execute("DELETE FROM finance.recurring_charge WHERE vendor_name = 'Eleven Labs'")
 
 
@@ -2202,18 +2225,33 @@ And to `AgentTaskActivities`:
         merchant = extract_merchant(title)
         if not merchant or self.db_pool is None:
             return {"merchant": "", "charges": [], "summary": ""}
+        # `recurring_charge` is UPSERT-keyed on
+        # (account, sender_label, amount_cents, currency) — one row per charge
+        # SIGNATURE with last_seen_at bumped in place (money.py:250-252) — so a
+        # merchant billing a steady amount has exactly ONE row and no history.
+        # `receipt_email` IS append-only (one row per receipt, unique on
+        # message_id), so join through its charge_id FK for the canonical vendor
+        # and read each receipt's own amount from the `parsed` extraction.
         rows = await self.db_pool.fetch(
-            "SELECT amount_cents, currency, last_seen_at FROM finance.recurring_charge "
-            "WHERE vendor_name = $1 ORDER BY last_seen_at DESC LIMIT $2",
+            """
+            SELECT re.received_at,
+                   COALESCE((re.parsed->>'amount')::numeric,
+                            rc.amount_cents / 100.0) AS amount,
+                   COALESCE(re.parsed->>'currency', rc.currency) AS currency
+            FROM finance.receipt_email re
+            JOIN finance.recurring_charge rc ON rc.id = re.charge_id
+            WHERE rc.vendor_name = $1
+            ORDER BY re.received_at DESC
+            LIMIT $2
+            """,
             merchant,
             limit,
         )
         charges = [
             {
-                # amount_cents is an integer number of cents (migration 001).
-                "amount": (r["amount_cents"] or 0) / 100.0,
+                "amount": float(r["amount"] or 0),
                 "currency": r["currency"] or "",
-                "last_seen_at": r["last_seen_at"].isoformat() if r["last_seen_at"] else "",
+                "last_seen_at": r["received_at"].isoformat() if r["received_at"] else "",
             }
             for r in rows
         ]
