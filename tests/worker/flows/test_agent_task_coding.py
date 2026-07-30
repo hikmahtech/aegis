@@ -34,7 +34,39 @@ _CODE_TASK = {
 }
 
 
-def _activities(events: list, *, pr_result: dict | None = None):
+_REPO_OK = {
+    "github_repo": "Stockopedia/bcp",
+    "repo_path": "Stockopedia/bcp",
+    "source": "project_map",
+    "candidates": [],
+}
+
+_REPO_CANDIDATES = [
+    {
+        "resource_title": "bcp",
+        "github_repo": "Stockopedia/bcp",
+        "resource_path": "stockopedia/bcp",
+        "score": 0.6,
+    },
+    {
+        "resource_title": "aegis-core",
+        "github_repo": "hikmahtech/aegis",
+        "resource_path": "aegis",
+        "score": 0.4,
+    },
+]
+
+# resolve_task_repo returning unconfirmed candidates — tier 1/2 didn't
+# confidently resolve, so the flow must raise the tier-3 Gate-0 confirm card.
+_REPO_UNCONFIRMED = {
+    "github_repo": "",
+    "repo_path": "",
+    "source": "none",
+    "candidates": _REPO_CANDIDATES,
+}
+
+
+def _activities(events: list, *, pr_result: dict | None = None, repo_result: dict | None = None):
     @activity.defn(name="load_task_context")
     async def load_task_context(task_id: str) -> dict:
         return {"external_id": "", "fingerprint": "", "gmail_message_id": ""}
@@ -51,12 +83,7 @@ def _activities(events: list, *, pr_result: dict | None = None):
 
     @activity.defn(name="resolve_task_repo")
     async def resolve_task_repo(task: dict) -> dict:
-        return {
-            "github_repo": "Stockopedia/bcp",
-            "repo_path": "Stockopedia/bcp",
-            "source": "project_map",
-            "candidates": [],
-        }
+        return repo_result if repo_result is not None else _REPO_OK
 
     @activity.defn(name="run_task_investigation")
     async def run_task_investigation(
@@ -284,4 +311,106 @@ async def test_pr_creation_failure_does_not_claim_pr_opened():
     assert not any(
         "Opened a PR" in body for kind, body in events if kind == "comment"
     ), "must not claim a PR was opened when create_github_pr reported failure"
+    assert any(kind == "park" for kind, _ in events)
+
+
+# --- Issue #158: tier 3 — the Gate-0 repo-confirm card ---------------------
+#
+# resolve_task_repo returns unconfirmed `candidates` (tier 1 project-map and
+# tier 2 title/description match both missed the confidence bar). The flow
+# must ask via a Gate-0 confirm card rather than proceed on the candidates —
+# these tests prove both outcomes actually gate the investigation, not just
+# that the returned status string looks right (same falsifiability standard
+# as the rest of this file: assert on the activity call, not the literal).
+
+
+@pytest.mark.asyncio
+async def test_gate0_confirm_approved_investigates_the_picked_repo():
+    """Candidates offered, user picks #1 (index 0, Stockopedia/bcp) — the
+    flow must proceed to investigate that repo, not park."""
+    events: list = []
+    async with (
+        await WorkflowEnvironment.start_local() as env,
+        Worker(
+            env.client,
+            task_queue="tq-agent-task-gate0-approve",
+            workflows=[AgentTaskFlow, InteractionFlow],
+            activities=_activities(events, repo_result=_REPO_UNCONFIRMED),
+        ),
+    ):
+        wf_id = f"agent-task-tc-1-{uuid.uuid4()}"
+        handle = await env.client.start_workflow(
+            AgentTaskFlow.run,
+            AgentTaskFlowInput(
+                agent_id="pandoras-actor", todoist_task_id="tc-1", task=_CODE_TASK
+            ),
+            id=wf_id,
+            task_queue="tq-agent-task-gate0-approve",
+        )
+
+        confirm_card = env.client.get_workflow_handle("agent-task-repo-confirm-tc-1")
+        for _ in range(200):
+            await asyncio.sleep(0.05)
+            if any(
+                kind == "insert_ia" and body == "agent_task_repo_confirm"
+                for kind, body in events
+            ):
+                break
+        await confirm_card.signal(InteractionFlow.submit_response, {"value": "0"})
+
+        plan_card = env.client.get_workflow_handle("agent-task-plan-tc-1")
+        for _ in range(200):
+            await asyncio.sleep(0.05)
+            if any(kind == "insert_ia" and body == "agent_task_coding_plan" for kind, body in events):
+                break
+        await plan_card.signal(InteractionFlow.submit_response, {"value": "skip"})
+
+        result = await asyncio.wait_for(handle.result(), timeout=15.0)
+
+    assert result["verb"] == "coding"
+    assert result["status"] == "plan_declined"
+    assert ("investigate", "stockopedia/bcp") in events, (
+        "the picked candidate's resource_path must reach run_task_investigation"
+    )
+
+
+@pytest.mark.asyncio
+async def test_gate0_confirm_declined_parks_without_investigating():
+    """User picks "None of these" — the task parks exactly like a fully
+    unresolved repo; no investigation run is ever started."""
+    events: list = []
+    async with (
+        await WorkflowEnvironment.start_local() as env,
+        Worker(
+            env.client,
+            task_queue="tq-agent-task-gate0-decline",
+            workflows=[AgentTaskFlow, InteractionFlow],
+            activities=_activities(events, repo_result=_REPO_UNCONFIRMED),
+        ),
+    ):
+        wf_id = f"agent-task-tc-1-{uuid.uuid4()}"
+        handle = await env.client.start_workflow(
+            AgentTaskFlow.run,
+            AgentTaskFlowInput(
+                agent_id="pandoras-actor", todoist_task_id="tc-1", task=_CODE_TASK
+            ),
+            id=wf_id,
+            task_queue="tq-agent-task-gate0-decline",
+        )
+
+        confirm_card = env.client.get_workflow_handle("agent-task-repo-confirm-tc-1")
+        for _ in range(200):
+            await asyncio.sleep(0.05)
+            if any(
+                kind == "insert_ia" and body == "agent_task_repo_confirm"
+                for kind, body in events
+            ):
+                break
+        await confirm_card.signal(InteractionFlow.submit_response, {"value": "none"})
+
+        result = await asyncio.wait_for(handle.result(), timeout=15.0)
+
+    assert result["verb"] == "coding"
+    assert result["status"] == "parked"
+    assert not any(kind == "investigate" for kind, _ in events)
     assert any(kind == "park" for kind, _ in events)

@@ -111,6 +111,22 @@ PROJECT_REPO_MAP = {
     "drwho": "hikmahtech/drwhome",
 }
 
+# Tier 2 (title/description match via AlertActivities.resolve_alert_resource)
+# auto-accepts only at or above this bar. resolve_alert_resource's OWN "llm"
+# vs "llm_unconfirmed" split sits at 0.5 — calibrated for the alert-investigation
+# flow, which re-scores the pick against the issue content at its own Gate-0
+# (score_resource_relevance) and further guards with an active-work check
+# before ever touching a repo. resolve_task_repo has neither of those extra
+# checks downstream — the flow proceeds straight to a real kimi run — so a
+# bare 0.5 here would let a coin-flip LLM guess kick one off unsupervised,
+# which is the one thing this resolver must never do (issue #158). 0.8 still
+# passes genuinely confident picks (free-text token overlap is always 1.0;
+# a clear LLM match commonly scores >= 0.85 — see
+# tests/worker/test_alert_resource_resolution.py) while anything softer is
+# surfaced as `candidates` for the flow's tier 3 Gate-0 confirm card instead
+# of guessed.
+_TIER2_CONFIDENCE_THRESHOLD = 0.8
+
 
 @dataclass
 class AgentTaskActivities:
@@ -126,6 +142,12 @@ class AgentTaskActivities:
     # field like infra_ops above, late-wired in __main__.py after GmailActivities
     # is constructed.
     gmail_activities: Any = None
+    # AlertActivities instance — resolve_task_repo's tier 2 reuses its
+    # resolve_alert_resource directly (same plain-field, direct-call pattern as
+    # gmail_activities.apply_label above), late-wired in __main__.py after
+    # AlertActivities is constructed. None ⇒ tier 2/3 are skipped and
+    # resolve_task_repo behaves exactly as tier-1-only (never guesses).
+    alert_act: Any = None
 
     @activity.defn
     async def find_actionable_tasks(
@@ -544,41 +566,93 @@ class AgentTaskActivities:
     async def resolve_task_repo(self, task: dict) -> dict:
         """Resolve a coding task to a repo. Never guesses.
 
-        Tier 1 is the Todoist project name. An unresolved repo is a hard stop —
-        running a coding agent against the wrong checkout is worse than not
-        running it.
+        Tier 1: Todoist project name -> PROJECT_REPO_MAP — the strongest
+        signal, since a project already mirrors a repo.
+
+        Tier 2 (only when tier 1 misses): reuse
+        AlertActivities.resolve_alert_resource's title/description-matching
+        tiers by synthesising an alert-shaped dict. `service` is deliberately
+        left blank — a Todoist task has no alertmanager service label, so the
+        (otherwise deterministic) sentry_project/service_match tiers correctly
+        sit out rather than false-matching on an empty string, and `fingerprint`
+        is a synthetic `task:<id>` that no knowledge-graph claim was ever
+        written against, so the KG tier misses by construction too. Both fall
+        through to the free-text/LLM tiers, which is the intent. A confident
+        pick (>= _TIER2_CONFIDENCE_THRESHOLD) resolves exactly like tier 1.
+
+        Tier 3: anything less confident is surfaced as `candidates` (never
+        auto-applied) for the flow's Gate-0 confirm card — running a coding
+        agent against the wrong checkout is worse than not running it.
         """
         empty = {"github_repo": "", "repo_path": "", "source": "none", "candidates": []}
         project_id = task.get("project_id")
-        if self.db_pool is None or not project_id:
-            return empty
-        name = await self.db_pool.fetchval(
-            "SELECT name FROM todoist_projects WHERE id = $1", project_id
-        )
-        if not name:
-            return empty
-        github_repo = PROJECT_REPO_MAP.get(str(name).strip().lower(), "")
-        if not github_repo:
+        name = None
+        if self.db_pool is not None and project_id:
+            name = await self.db_pool.fetchval(
+                "SELECT name FROM todoist_projects WHERE id = $1", project_id
+            )
+        github_repo = PROJECT_REPO_MAP.get(str(name).strip().lower(), "") if name else ""
+        if github_repo:
+            # repo_path is the workspace-relative checkout path start_kimi_run needs.
+            # The JSONB key is `path`, NOT `resource_path`. `resource_path` is only an
+            # application-level rename applied AFTER reading (alerts.py:521);
+            # inventory.py:386-397 writes {"path", "github_repo", "origin_url"}.
+            # Querying 'resource_path' always yields NULL, silently flattening a
+            # nested checkout (stockopedia/bcp -> bcp) so start_kimi_run then hard-
+            # fails with a false "Repo checkout missing".
+            row = await self.db_pool.fetchrow(
+                "SELECT metadata->>'path' AS rpath FROM resources "
+                "WHERE kind = 'repository' AND metadata->>'github_repo' = $1 LIMIT 1",
+                github_repo,
+            )
+            return {
+                "github_repo": github_repo,
+                "repo_path": (row["rpath"] if row and row["rpath"] else github_repo.split("/")[-1]),
+                "source": "project_map",
+                "candidates": [],
+            }
+        if name:
             activity.logger.info("agent_task_repo_unmapped project=%s", name)
+
+        if self.alert_act is None:
             return empty
-        # repo_path is the workspace-relative checkout path start_kimi_run needs.
-        # The JSONB key is `path`, NOT `resource_path`. `resource_path` is only an
-        # application-level rename applied AFTER reading (alerts.py:521);
-        # inventory.py:386-397 writes {"path", "github_repo", "origin_url"}.
-        # Querying 'resource_path' always yields NULL, silently flattening a
-        # nested checkout (stockopedia/bcp -> bcp) so start_kimi_run then hard-
-        # fails with a false "Repo checkout missing".
-        row = await self.db_pool.fetchrow(
-            "SELECT metadata->>'path' AS rpath FROM resources "
-            "WHERE kind = 'repository' AND metadata->>'github_repo' = $1 LIMIT 1",
-            github_repo,
-        )
-        return {
-            "github_repo": github_repo,
-            "repo_path": (row["rpath"] if row and row["rpath"] else github_repo.split("/")[-1]),
-            "source": "project_map",
-            "candidates": [],
+        synthetic_alert = {
+            "title": str(task.get("content") or ""),
+            "description": str(task.get("description") or ""),
+            "fingerprint": f"task:{task.get('id') or ''}",
+            "service": "",
         }
+        try:
+            resolved = await self.alert_act.resolve_alert_resource(synthetic_alert)
+        except Exception as exc:  # noqa: BLE001 — tier 2 is best-effort; never guess on error
+            activity.logger.warning("agent_task_repo_tier2_failed err=%s", str(exc)[:200])
+            return empty
+
+        # Candidate shape matches what _build_repo_confirm_prompt expects
+        # (resource_title/github_repo/resource_path/score) so the flow's Gate-0
+        # card can consume it unchanged. Drop any candidate with no github_repo —
+        # nothing to check out, so it isn't a pickable option.
+        candidates = [
+            {
+                "resource_title": r.get("resource_title") or "",
+                "github_repo": r.get("github_repo") or "",
+                "resource_path": r.get("resource_path") or "",
+                "score": float(r.get("confidence") or 0.0),
+            }
+            for r in (resolved.get("resources") or [])
+            if r.get("github_repo")
+        ]
+        tier2_repo = resolved.get("github_repo") or ""
+        tier2_confidence = float(resolved.get("confidence") or 0.0)
+        if tier2_repo and tier2_confidence >= _TIER2_CONFIDENCE_THRESHOLD:
+            repo_path = resolved.get("resource_path") or tier2_repo.split("/")[-1]
+            return {
+                "github_repo": tier2_repo,
+                "repo_path": repo_path,
+                "source": "title_match",
+                "candidates": [],
+            }
+        return {**empty, "candidates": candidates}
 
     @activity.defn
     async def run_task_investigation(

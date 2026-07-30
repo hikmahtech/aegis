@@ -442,6 +442,10 @@ async def main():
     # ops. Mirrors the existing `alert_act.todoist_connector = todoist_connector`
     # late-wiring below.
     agent_task_act.infra_ops = infra_ops_act
+    # resolve_task_repo's tier 2 reuses alert_act.resolve_alert_resource
+    # directly (same direct-call pattern as gmail_activities.apply_label
+    # below). alert_act is constructed above, well before agent_task_act.
+    agent_task_act.alert_act = alert_act
     # triage_email needs GmailActivities.apply_label plus the set of accounts
     # to probe. Active email channels are the Gmail accounts to probe. Read
     # them from the channels table (kind='email', active) — config->>'label'
