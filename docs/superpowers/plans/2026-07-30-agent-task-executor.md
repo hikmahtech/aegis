@@ -3184,8 +3184,14 @@ Replace everything in `_run_coding` after the `run_task_investigation` call with
                 kind="choice",
                 origin="agent_task_coding_plan",
                 prompt=(
-                    f"🛠 <b>{input.task.get('content')}</b>\n\n"
-                    f"Repo: <code>{repo['github_repo']}</code>\n\n{plan[:1200]}\n\n"
+                    # _esc() every user/agent-derived string inside an HTML tag —
+                    # repo-wide convention (_run_infra, _run_finance,
+                    # calendar_ingest, receipt_ingest, gmail_ingest all do this).
+                    # A literal `<` or `&` in a task title otherwise breaks the
+                    # comms html_to_mrkdwn parse.
+                    f"🛠 <b>{_esc(str(input.task.get('content') or ''))}</b>\n\n"
+                    f"Repo: <code>{_esc(repo['github_repo'])}</code>\n\n"
+                    f"{_esc(plan[:1200])}\n\n"
                     "Implement this?"
                 ),
                 options={"approve": "✅ Implement", "skip": "⏭️ Not now"},
@@ -3250,8 +3256,8 @@ Replace everything in `_run_coding` after the `run_task_investigation` call with
                 kind="choice",
                 origin="agent_task_coding_pr",
                 prompt=(
-                    f"📤 Branch <code>{implementation['branch']}</code> is ready in "
-                    f"<code>{repo['github_repo']}</code>.\n\nOpen a PR?"
+                    f"📤 Branch <code>{_esc(implementation['branch'])}</code> is ready in "
+                    f"<code>{_esc(repo['github_repo'])}</code>.\n\nOpen a PR?"
                 ),
                 options={"approve": "✅ Open PR", "skip": "⏭️ Leave the branch"},
                 timeout_seconds=172800,
@@ -3317,6 +3323,9 @@ Replace everything in `_run_coding` after the `run_task_investigation` call with
             "repo": repo["github_repo"],
         }
 ```
+
+`_esc` (i.e. `from html import escape as _esc`) is ALREADY imported at the top of
+`flows/agent_task.py` from Task 5 — use it, don't re-import.
 
 Add to the imports at the top of `flows/agent_task.py`: `from datetime import timedelta` (module
 level, outside the `imports_passed_through` block), `TIMEOUT_CLAUDE` to the retry imports, and inside
