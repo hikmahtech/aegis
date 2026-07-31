@@ -74,6 +74,16 @@ class Settings(BaseSettings):
     admin_password: str = ""
     api_key: str = ""
 
+    # CORS. Defaults to empty (no cross-origin allowed): this is a
+    # single-origin self-hosted deployment where the admin-panel SPA is
+    # served from the same origin as the API, so CORS should never need to
+    # apply in production. Set AEGIS_CORS_ALLOWED_ORIGINS (comma-separated)
+    # only for a deployment topology that genuinely serves the SPA from a
+    # different origin than the API.
+    # NoDecode: skip pydantic-settings' JSON decoding so the raw env/dotenv
+    # string reaches _parse_cors_allowed_origins, which splits it on commas.
+    cors_allowed_origins: Annotated[list[str], NoDecode] = Field(default_factory=list)
+
     # Connectors
     vercel_token: str = ""
     vercel_team_id: str = ""
@@ -268,6 +278,18 @@ class Settings(BaseSettings):
             if isinstance(domains, str):
                 data["homelab_public_domains"] = [
                     s.strip() for s in domains.split(",") if s.strip()
+                ]
+        return data
+
+    @model_validator(mode="before")
+    @classmethod
+    def _parse_cors_allowed_origins(cls, data: Any) -> Any:
+        """Parse comma-separated cors_allowed_origins into a list."""
+        if isinstance(data, dict) and "cors_allowed_origins" in data:
+            origins = data["cors_allowed_origins"]
+            if isinstance(origins, str):
+                data["cors_allowed_origins"] = [
+                    s.strip() for s in origins.split(",") if s.strip()
                 ]
         return data
 
