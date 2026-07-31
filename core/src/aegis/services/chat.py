@@ -21,7 +21,7 @@ from jsonschema import Draft202012Validator
 from jsonschema.exceptions import ValidationError as JSONSchemaValidationError
 
 from aegis.llm import parse_llm_json
-from aegis.llm.tier import resolve_model_for_agent
+from aegis.llm.tier import resolve_model_for_agent, tier_to_model
 from aegis.observability import log_audit, record_llm_call, record_tool_call
 from aegis.services.todoist_config import resolve_todoist_api_key
 
@@ -174,18 +174,31 @@ async def classify_intent(message: str, llm, settings, pool=None) -> dict:
     return {"agent_id": "sebas", "reason": "default", "method": "default"}
 
 
-# Models served via max-proxy strip the `tools` array silently. When an agent
-# has tools to call, swap the resolved model for `_TOOL_FALLBACK_MODEL` so the
-# request actually carries tool definitions to a model that supports them.
-# gpt-oss:20b (OpenAI open-weight) is OpenAI's tool-use-tuned release — MXFP4
-# quant fits in ~12 GB on node-b's GPU (16 GB) with comfortable headroom
-# and the Harmony format produces stronger structured tool calls than the
-# previous fallback (qwen3:14b). LiteLLM exposes it as `gpt-oss:20b` →
-# `ollama_chat/gpt-oss:20b` with `supports_function_calling: true`
-# (see infra-gitops/.../litellm-config.yaml.j2). Fallbacks in the LiteLLM
-# router config let it degrade to qwen3:14b → claude-haiku if Ollama hiccups.
+# Two very different things share the "claude-" name in the LiteLLM config
+# (infra: ansible/roles/ollama/templates/litellm-config.yaml.j2), and it
+# matters which one a tier resolves to:
+#   - Bridge aliases (bare names, no version): claude-haiku, claude-sonnet,
+#     claude-opus. These proxy through max-proxy (the Claude-Code-subscription
+#     bridge, api_base http://<max_proxy>/v1) and silently strip the `tools`
+#     array from the upstream request — the model never sees the tool
+#     definitions and responds in plain text (often hallucinating that no
+#     tools are available). THESE are what `_TOOL_INCAPABLE_MODELS` matches.
+#   - Real Anthropic-API aliases (versioned names): claude-sonnet-5,
+#     claude-haiku-4.5. These hit `anthropic/...` directly with a real API
+#     key and `model_info.supports_function_calling: true` — fully
+#     tool-capable. `smart` currently resolves to claude-sonnet-5
+#     (config/models.yaml), so it is deliberately NOT in this set.
+# Do NOT turn this into a `claude-` prefix check — that would also catch the
+# versioned, tool-capable names and silently downgrade every tool-bearing
+# smart-tier chat turn to the balanced tier for no reason. Match must stay
+# an exact-name set of the three bridge aliases.
+# When an agent has tools to call and the resolved model is one of these,
+# swap in whatever the live `balanced` tier currently resolves to
+# (`aegis/llm/tier.py::tier_to_model`) rather than a hardcoded model name,
+# so the fallback always tracks config/models.yaml / the DB-configured
+# backend instead of silently going stale (the previous hardcoded fallback,
+# `gpt-oss:20b`, has its host down indefinitely per config/models.yaml).
 _TOOL_INCAPABLE_MODELS: frozenset[str] = frozenset({"claude-haiku", "claude-sonnet", "claude-opus"})
-_TOOL_FALLBACK_MODEL: str = "gpt-oss:20b"
 
 
 def _json_default(value: Any) -> Any:
@@ -4076,8 +4089,6 @@ async def send_message(
     model = None
     if tier_override:
         try:
-            from aegis.llm.tier import tier_to_model
-
             model = tier_to_model(tier_override)
         except KeyError:
             logger.warning("chat_tier_override_unknown", tier=tier_override)
@@ -4092,25 +4103,30 @@ async def send_message(
     # Build agent-specific tool list and structured prompt
     agent_tools = _get_agent_tools(agent_id, metadata=agent_meta) if tools_enabled else []
 
-    # Tool-calling routing: the smart-tier models (claude-haiku/sonnet/opus)
-    # are served via max-proxy (Claude-Code-subscription bridge), which
-    # silently strips the `tools` array from the upstream request — the model
-    # never sees the tool definitions and responds in plain text (often
-    # hallucinating that no tools are available). qwen3:14b via ollama_chat
-    # IS function-calling-capable, so swap the resolved model for qwen3:14b
-    # whenever the agent actually has tools to call. Reasoning quality on
-    # synthesis-heavy chat takes a hit but this is the only way tool calls
-    # actually fire today. See cmemory lesson — empty chat_tool_calls table
-    # for 7d across all agents was the diagnostic signature.
+    # Tool-calling routing: see the `_TOOL_INCAPABLE_MODELS` comment above —
+    # only the three bare max-proxy bridge aliases strip tools; versioned
+    # Anthropic-API names (claude-sonnet-5, claude-haiku-4.5) are tool-capable
+    # and must NOT match here. Swap in whatever the live `balanced` tier
+    # resolves to whenever the agent has tools to call and the resolved model
+    # is one of the bridge aliases. If the `balanced` tier isn't resolvable
+    # (e.g. tiers not yet loaded at boot), degrade safely and leave the model
+    # unchanged rather than crash the chat request. See cmemory lesson —
+    # empty chat_tool_calls table for 7d across all agents was the diagnostic
+    # signature that motivated this guard in the first place.
     if tools_enabled and agent_tools and model in _TOOL_INCAPABLE_MODELS:
-        logger.info(
-            "chat_model_substituted_for_tools",
-            agent_id=agent_id,
-            from_model=model,
-            to_model=_TOOL_FALLBACK_MODEL,
-            tool_count=len(agent_tools),
-        )
-        model = _TOOL_FALLBACK_MODEL
+        try:
+            fallback_model = tier_to_model("balanced")
+        except KeyError:
+            fallback_model = None
+        if fallback_model is not None and fallback_model != model:
+            logger.info(
+                "chat_model_substituted_for_tools",
+                agent_id=agent_id,
+                from_model=model,
+                to_model=fallback_model,
+                tool_count=len(agent_tools),
+            )
+            model = fallback_model
 
     tool_desc_lines = [
         f"- {t['function']['name']}: {t['function']['description']}" for t in agent_tools
