@@ -12,8 +12,10 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.staticfiles import StaticFiles
+from pydantic import ValidationError
 
 from aegis.api.deps import get_settings
+from aegis.config import Settings
 from aegis.db import create_pool, run_migrations
 from aegis.llm import LLMClient, set_model_tiers
 from aegis.services.chat import _validate_agent_tool_sets
@@ -210,8 +212,36 @@ async def lifespan(app: FastAPI):
     logger.info("aegis_v2_stopped")
 
 
-def create_app(run_lifespan: bool = True) -> FastAPI:
-    """Create the FastAPI application."""
+def create_app(run_lifespan: bool = True, settings: Settings | None = None) -> FastAPI:
+    """Create the FastAPI application.
+
+    `settings` is only consulted for build-time app config (currently CORS)
+    that must be baked in via `add_middleware` rather than resolved per
+    request; defaults to the process-global `get_settings()`. Runtime
+    request handling and `lifespan()` startup still resolve settings via
+    `get_settings()` independently, as before.
+
+    Many tests build the app via `create_app(run_lifespan=False)` with no
+    `settings` and no `AEGIS_*` env configured at all (they only need
+    individual routes, wired up afterwards via
+    `app.dependency_overrides[get_settings]`) — `get_settings()` would raise
+    there since required fields (e.g. database_url) are missing. Real
+    deployments always have that config (main.py's bare `create_app()` call
+    site can't boot otherwise — `lifespan()` calls `get_settings()` again
+    and fails fast on the same missing config), so falling back to the safe
+    CORS default (no cross-origin allowed) when settings can't be resolved
+    doesn't mask a real misconfiguration in production.
+    """
+    # Resolve before the `from aegis.api.routes import (..., settings, ...)`
+    # below rebinds the local name `settings` to that routes submodule.
+    if settings is not None:
+        resolved_settings = settings
+    else:
+        try:
+            resolved_settings = get_settings()
+        except ValidationError:
+            resolved_settings = None
+
     from aegis.api.routes import (
         activities,
         agents,
@@ -251,12 +281,22 @@ def create_app(run_lifespan: bool = True) -> FastAPI:
         lifespan=lifespan if run_lifespan else None,
     )
 
+    # Single-origin self-hosted deployment: the admin-panel SPA is served from
+    # the same origin as this API, so CORS should never need to apply in
+    # production and cors_allowed_origins defaults to empty (no cross-origin
+    # allowed). Per the CORS spec browsers refuse `*` together with
+    # credentialed requests, so allow_credentials is only turned on when an
+    # explicit origin allowlist is configured. allow_methods/allow_headers
+    # are scoped to what admin-panel/frontend/src/api/client.ts actually
+    # sends (GET/POST/PUT/PATCH/DELETE, Content-Type + Authorization) rather
+    # than a wildcard.
+    cors_origins = resolved_settings.cors_allowed_origins if resolved_settings else []
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=["*"],
-        allow_credentials=True,
-        allow_methods=["*"],
-        allow_headers=["*"],
+        allow_origins=cors_origins,
+        allow_credentials=bool(cors_origins),
+        allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE"],
+        allow_headers=["Content-Type", "Authorization"],
     )
 
     # Compress JSON responses and the admin-panel SPA bundle (~332 KB → ~90 KB).
