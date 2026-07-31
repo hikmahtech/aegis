@@ -8,7 +8,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 import structlog
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -324,8 +324,17 @@ def create_app(run_lifespan: bool = True) -> FastAPI:
         # SPA fallback — serve index.html for all non-API routes
         @app.get("/{path:path}")
         async def serve_spa(path: str):
-            # Don't intercept API routes
-            if path.startswith("api/") or path == "health":
+            # Don't intercept API routes: a genuinely unmatched /api/* path
+            # (typo, retired endpoint, client bug) must 404 like any other
+            # missing route, not look like a successful empty (200 null)
+            # response.
+            if path.startswith("api/"):
+                raise HTTPException(status_code=404)
+            # /health is served by its own router (registered earlier, so it
+            # always matches before this catch-all runs) — this branch is
+            # unreachable in practice but kept as a defensive no-op so this
+            # handler never claims ownership of it.
+            if path == "health":
                 return None
             file_path = admin_dist / path
             if file_path.exists() and file_path.is_file():
