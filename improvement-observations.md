@@ -156,11 +156,16 @@ follow.
 **Cross-theme coordination notes**
 
 - **Suggested overall order:** D1+D2 (quick wins) → C8 (source_type registry) →
-  A1→A2 (profile loop) → B1→B3 (capture) → A8 (day log) → A6→A7 (curiosity) →
-  C1/C4 (entities) → C5→C6→C7 (expiry/assets) → B4→B5/B6 (push senses) →
-  A3→A4→A5 (memory lifecycle) → D6 (declarative registry — land before the
-  third new scheduled flow) → B7 → B8→B9 (MCP) → D7 (chat.py split) →
+  A1→A2 (profile loop) → B1→B2→B3 (capture) → A8→A9 (day log + rollups) →
+  D6 (declarative registry — must land here: A2 and A8 are the first two new
+  scheduled flows, and D6's own constraint is "before the third") →
+  A6→A7 (curiosity) → C1→C2→C3 (people + enrichment + payoff features) /
+  C4 (observations) → C5→C6→C7 (expiry/assets) → B4→B5/B6 (push senses) →
+  A3→A4→A5 (memory lifecycle) → B7 → B8→B9 (MCP) → D7 (chat.py split) →
   D3/D4/D5 anytime.
+  (New cron-scheduled flows in this order: A2 #1, A8 #2 — D6 — A7 #3,
+  C6 #4, B7 #5. The previous revision of this order both violated the D6
+  constraint and omitted A9, B2, C2 and C3 entirely.)
 - **Migration numbers collide across themes** (A1 and C1 both assume `015_`,
   etc.). Numbers below are relative — always take the next free slot at
   implementation time, and never reuse `006`.
@@ -170,7 +175,7 @@ follow.
 
 ## Theme A — Memory & learning loop
 
-Goal: AEGIS stops being stateless-with-notes and starts accumulating a durable, human-auditable model of its owner. Four features, split into nine independently shippable tasks. All flow work follows the 5-point registration rule (flow class import + module-level `WORKFLOWS` at `worker/src/aegis_worker/__main__.py:111` + the local `workflows` list in `main()` ~line 670 + the `activities` list ~line 555 + `_ACTIVITY_TYPE_MAP` at `worker/src/aegis_worker/schedule_sync.py:57` + a seed row in `config/seed/activities.yaml`); every flow config dataclass keeps `agent_id` as its first field.
+Goal: AEGIS stops being stateless-with-notes and starts accumulating a durable, human-auditable model of its owner. Four features, split into nine independently shippable tasks. All flow work follows the 6-point registration rule (flow class import + module-level `WORKFLOWS` at `worker/src/aegis_worker/__main__.py:111` + the local `workflows` list in `main()` ~line 670 + the `activities` list ~line 555 + `_ACTIVITY_TYPE_MAP` at `worker/src/aegis_worker/schedule_sync.py:57` + a seed row in `config/seed/activities.yaml` — Part 1's "five hand-edited lists plus seed YAML"); every flow config dataclass keeps `agent_id` as its first field. Per-task "all 5 points" checklists below fold the flow-class import into point 1.
 
 ### A1 — Profile write path + revision log
 
@@ -179,7 +184,8 @@ Goal: AEGIS stops being stateless-with-notes and starts accumulating a durable, 
 **Implementation sketch**
 - Add `migrations/015_agent_profile_revisions.sql`: `agent_profile_revisions(id bigserial, agent_id text, kind text, before_content text, after_content text, source text, interaction_id uuid null, created_at timestamptz)`. Mirrors the `agent_personalities` shape in `migrations/007_agent_personalities.sql`.
 - In `core/src/aegis/services/personalities.py`, add `apply_profile_patch(pool, agent_id, kind, new_content, *, source, interaction_id=None)` — reads current via `get_personality(..., use_cache=False)`, writes the revision row, delegates the upsert to the existing `set_personality` (which already calls `invalidate`), and refuses writes >N% shrink without an explicit `allow_shrink` flag.
-- Add `list_profile_revisions` / `revert_profile_revision` helpers; expose read-only at `GET /api/admin/agents/{agent_id}/personality/revisions` in `core/src/aegis/api/routes/agents.py` (next to the existing `GET`/`PUT /{agent_id}/personality` at lines 25–46).
+- Add `list_profile_revisions` / `revert_profile_revision` helpers; expose read-only at `GET /api/admin/agents/{agent_id}/personality/revisions` in `core/src/aegis/api/routes/agents.py` (next to the existing `GET`/`PUT /{agent_id}/personality` at lines 25–46). Mark the route docstring "intentionally curl/ops-only, no UI consumer" — issue #101's convention for endpoints that are deliberately not wired to the admin panel.
+- Retention: add an `agent_profile_revisions` entry (365 days) to `_DEFAULT_RETENTIONS` in `worker/src/aegis_worker/flows/cleanup.py:14` — every patch writes a row forever otherwise.
 - New worker activity module `worker/src/aegis_worker/activities/profile.py` with `ProfileActivities(db_pool)` exposing `read_profile_context` and `apply_profile_patch` (thin wrappers, `@activity.defn`), so flows never import the FastAPI layer.
 
 **Wiring checklist** migration only + activities list in `__main__.py` (no flow, no schedule, no `_ACTIVITY_TYPE_MAP` entry yet).
@@ -198,11 +204,12 @@ Goal: AEGIS stops being stateless-with-notes and starts accumulating a durable, 
 
 **Implementation sketch**
 - `worker/src/aegis_worker/activities/profile.py`: add `gather_profile_evidence(agent_id, since)` — one isolated try/except per source so a dead source degrades to empty, exactly like `BriefingActivities.gather_briefing_changes` (`worker/src/aegis_worker/activities/briefing.py:205`). Sources: `chat_history` (`migrations/001_baseline.sql:255`), `agent_memory` (:158), resolved `interactions` (:339) with a correction reason, `finance.receipt_email` (:31) / `finance.recurring_charge` (:45), calendar events from the `calendar_events_%` settings KV rows read by `BriefingActivities.gather_calendar_events`.
-- Add `propose_profile_patch(agent_id, evidence, current_user_doc)` — one LLM call via the injected `llm_client.think` (same wiring as `frame_briefing`), returning `{proposed_doc, rationale, changed_lines}`. Any LLM failure returns `{}` → flow exits `status="skipped"`, never a failed run.
+- Add `propose_profile_patch(agent_id, evidence, current_user_doc)` — one LLM call via the injected `llm_client.think` on the balanced tier, passing `db_pool` and `purpose="profile_reflection"` so the call lands in `llm_calls` (do NOT copy `frame_briefing`'s wiring verbatim — it is one of issue #106's named unlogged call sites; B3's `capture_classify` wiring is the correct template). Returns `{proposed_doc, rationale, changed_lines}`. Any LLM failure returns `{}` → flow exits `status="skipped"`, never a failed run.
 - New flow `worker/src/aegis_worker/flows/profile_reflection.py` with `ProfileReflectionConfig(agent_id: str = "sebas", lookback_days: int = 7)`. Spawns `InteractionFlow` (`worker/src/aegis_worker/flows/interaction.py`) as an ABANDONED child with `kind="draft_review"`, `timeout_policy="archive"`, `timeout_seconds=7*86400`, `metadata={agent_id, kind:"user", proposed_doc, revision_of}`, `post_resolve_activity="apply_profile_reflection"` — copy the spawn shape from `worker/src/aegis_worker/flows/social_publish.py:60-90`.
 - `apply_profile_reflection(interaction_id, response, metadata)` in `ProfileActivities`: writes `response["edited_doc"]` if present, else `metadata["proposed_doc"]`, via A1's `apply_profile_patch(source="profile_reflection", interaction_id=...)`. Any non-approve response is a no-op (but the existing `record_correction_from_interaction` in `core/src/aegis/api/routes/interactions.py:106` still banks the reason as a memory).
-- Note the UI dependency: `comms/src/aegis_comms/cards.py:87` renders `draft_review` as a single deep-link button to `/interactions/{id}`, so the edit affordance must exist in `admin-panel/frontend/src/pages/InteractionDetail.tsx` — verify the free-text response field submits `edited_doc`.
-- Seed: `slug: profile-reflection-weekly`, `schedule_cron: "0 4 * * 0"` (09:30 IST Sunday), `config: {lookback_days: 7}`, one row per agent that should self-reflect.
+- **UI work (required, not a verification step):** `admin-panel/frontend/src/pages/InteractionDetail.tsx` currently shares one textarea+submit branch between `input` and `draft_review`, posting `resolveInteraction(id, {value: draft})` — there is no `action` or `edited_doc` key and no reject button, so `apply_profile_reflection`'s contract cannot fire from this screen today. Add a `draft_review`-specific panel: proposed-doc preview, editable text initialised to `metadata.proposed_doc`, and explicit Approve / Reject buttons submitting `{action: "approve", edited_doc}` / `{action: "reject", reason}`. (`comms/src/aegis_comms/cards.py:87` already deep-links here, so no comms change.)
+- Budget gate: `send_interaction_card` bypasses `safe_send_message` and therefore the notification budget (`delivery.py:163` posts straight to `/api/deliver/card`). Gate the weekly card exactly as A7 does — call `aegis.services.notifications.should_send` before spawning and `record_notification(pool, agent_id, "profile_reflection", sent)` after, so the card consumes the same daily budget.
+- Seed: `slug: profile-reflection-weekly`, `schedule_cron: "0 2 * * 0"` (07:30 IST Sunday — `0 4` belongs to `cleanup-daily` and sits 30 min before the 04:30 briefing, the busiest minute-cluster in the schedule), `config: {lookback_days: 7}`, one row per agent that should self-reflect.
 
 **Wiring checklist** all 5 points (flow + `ProfileActivities` methods + both `__main__.py` lists + `_ACTIVITY_TYPE_MAP` builder reading `lookback_days` + seed rows).
 
@@ -210,6 +217,8 @@ Goal: AEGIS stops being stateless-with-notes and starts accumulating a durable, 
 - Flow test under `tests/worker/` using the Temporal test environment (pattern: `tests/worker/test_clarify_flow.py`): mocked activities → exactly one `InteractionFlow` child spawned with `kind="draft_review"` and `post_resolve_activity="apply_profile_reflection"`.
 - Empty evidence bundle → no card spawned, `status="skipped"`.
 - `apply_profile_reflection` with `{"action":"approve","edited_doc":"..."}` on a real `db_pool` writes the edited text (not the proposed text) and one revision row; with `{"action":"reject","reason":"..."}` writes nothing.
+- **End-to-end payload-shape test (falsifiability guard):** resolve a seeded `draft_review` interaction through the real resolve route with the exact JSON the UI submits, and assert the profile changed — this test MUST fail if the UI payload shape and `apply_profile_reflection`'s contract drift apart. A direct call with a hand-built dict does not satisfy this criterion.
+- Second run in the same day with the notification budget exhausted → no card spawned, `status="budget"`, one `notification_log` row from the first run.
 - Registration test asserting `ProfileReflectionFlow` is in `WORKFLOWS` and has an `_ACTIVITY_TYPE_MAP` entry.
 
 **Size** L **Depends on** A1
@@ -220,7 +229,8 @@ Goal: AEGIS stops being stateless-with-notes and starts accumulating a durable, 
 
 **Implementation sketch**
 - `core/src/aegis/services/memory.py`: add `all_memories(pool, agent_id)` (id + content + importance + source + created_at — `recent_memories` at line 36 returns content only) and `apply_consolidation(pool, agent_id, ops)` executing a validated `[{op, id?, content?, importance?}]` list in one transaction.
-- `worker/src/aegis_worker/activities/memory.py`: add `consolidate_agent_memories(agent_id, dry_run=True)` to `MemoryActivities` — loads the agent's rows, one LLM call returning strict JSON ops, validates every referenced id belongs to that agent, returns `{ops, applied, skipped}`. `MemoryActivities` currently takes only `db_pool`, so add an `llm_client: Any = None` field and pass `deps.llm` at `worker/src/aegis_worker/__main__.py:350`; a null client makes the activity a documented no-op.
+- `worker/src/aegis_worker/activities/memory.py`: add `consolidate_agent_memories(agent_id, dry_run=True)` to `MemoryActivities` — loads the agent's rows, one LLM call (balanced tier, with `db_pool` and `purpose="memory_consolidation"` so it lands in `llm_calls` — not `frame_briefing`'s unlogged wiring, which issue #106 names as the offending pattern) returning strict JSON ops, validates every referenced id belongs to that agent, returns `{ops, applied, skipped}`. `MemoryActivities` currently takes only `db_pool`, so add an `llm_client: Any = None` field and pass `deps.llm` at `worker/src/aegis_worker/__main__.py:350`; a null client makes the activity a documented no-op.
+- **Hard gate, in code, not config:** DELETE here is a hard delete of human-authored corrections driven by LLM JSON, and `dry_run: true` as a seed default is not a safety mechanism — a config edit could flip it before the rails exist. A3 ships with `dry_run=False` REFUSED (`ApplicationError`, non-retryable) whenever the A4 provenance machinery (`agent_memory_ops_log` table / soft-retire path) is absent; A4 removes the refusal. Until then the activity is observe-only by construction.
 - `worker/src/aegis_worker/flows/memory_reflection.py`: run consolidation **before** `prune_agent_memories` (consolidating first means the cap deletes fewer real lessons), each step in its own try/except so consolidation failure still prunes. Extend `MemoryReflectionInput` with `consolidate: bool = False` and `dry_run: bool = True`; update the docstring, which currently advertises this pass as unbuilt.
 - `_ACTIVITY_TYPE_MAP["MemoryReflectionFlow"]` (`schedule_sync.py:168`) reads the two new config keys; ship the seed row (`config/seed/activities.yaml:144`) with `consolidate: true, dry_run: true` so the first production week is observe-only.
 
@@ -230,9 +240,10 @@ Goal: AEGIS stops being stateless-with-notes and starts accumulating a durable, 
 - `tests/worker/activities/test_memory_consolidation.py` on the real `db_pool`: two near-duplicate rows + a stubbed LLM returning a merge op → one row remains, content is the merged text, `agent_memory` count drops by exactly one.
 - An op referencing another agent's memory id is rejected and counted in `skipped`; the foreign row survives.
 - `dry_run=True` returns the ops but leaves the table byte-identical.
+- `dry_run=False` without A4's `agent_memory_ops_log` present → the activity refuses (non-retryable error), zero rows changed — proven by a test that creates the condition, not by the config default.
 - LLM raising → activity returns `{"status":"llm_failed"}`, flow still returns the prune result.
 
-**Size** M **Depends on** —
+**Size** M **Depends on** — (dry-run only; non-dry-run execution is hard-blocked until A4 lands)
 
 ### A4 — Consolidation safety rails
 
@@ -242,8 +253,9 @@ Goal: AEGIS stops being stateless-with-notes and starts accumulating a durable, 
 - `migrations/016_agent_memory_provenance.sql`: add `agent_memory.superseded_by bigint NULL`, `agent_memory.last_consolidated_at timestamptz NULL`, and `agent_memory_ops_log(id, agent_id, op, memory_id, before_content, after_content, dry_run bool, created_at)`.
 - Make DELETE a soft retire in `apply_consolidation` (set `superseded_by`, exclude retired rows from `recent_memories`) so `format_memories` output changes but nothing is lost; `prune_memories` (`core/src/aegis/services/memory.py:115`) becomes the only hard delete.
 - Quotas in `consolidate_agent_memories`: refuse a batch that deletes/merges more than `max_ops_pct` (default 25%) of an agent's rows; never touch rows younger than `min_age_hours` (default 24) or with `importance >= 0.9`; protect `source='gmail_triage_correction'` rows from silent merge (they carry the `[gmail:<id>]` dedupe marker that `record_gmail_triage_correction` relies on at line 91).
-- Log every proposed op to `agent_memory_ops_log` including in dry-run — that log is how we decide when to flip `dry_run: false`.
-- Surface a read-only `GET /api/admin/agents/{agent_id}/memory/ops` in `core/src/aegis/api/routes/` for the flip decision.
+- Log every proposed op to `agent_memory_ops_log` including in dry-run — that log is how we decide when to flip `dry_run: false`. Because dry-run is the intended long-running default, this table grows nightly forever: add an `agent_memory_ops_log` entry (90 days) to `_DEFAULT_RETENTIONS` in `worker/src/aegis_worker/flows/cleanup.py:14` in the same task.
+- Removing A3's hard refusal of `dry_run=False` is part of THIS task — the gate and the rails swap in one commit.
+- Surface a read-only `GET /api/admin/agents/{agent_id}/memory/ops` in `core/src/aegis/api/routes/` for the flip decision, with an "intentionally curl/ops-only, no UI consumer" docstring note (issue #101's convention).
 
 **Wiring checklist** migration + config keys (`max_ops_pct`, `min_age_hours`) threaded through `_ACTIVITY_TYPE_MAP` and the seed row. No new flow.
 
@@ -282,7 +294,7 @@ Goal: AEGIS stops being stateless-with-notes and starts accumulating a durable, 
 - New `worker/src/aegis_worker/activities/curiosity.py`, `CuriosityActivities(db_pool, llm_client=None)`, activity `find_curiosity_gaps(agent_id, limit=5)`.
 - Detectors, each independently try/excepted: (a) recurring calendar attendee never mentioned in `chat_history` or `agent_memory` — attendee emails are already carried through `CalendarActivities.fetch_events` (`worker/src/aegis_worker/activities/calendar.py:109`) and into KS text via `calendar_event_to_content` (`core/src/aegis/services/claims.py:10`); (b) `finance.recurring_charge` rows with `status='active'` and no matching memory/profile mention; (c) a frequently-hit `todoist_tasks` project (`migrations/001_baseline.sql:607`) with no profile context.
 - Each candidate: `{gap_type, subject, question, evidence, novelty_key}`. `novelty_key` is a stable hash (e.g. `attendee:<email>`) used for the never-ask-twice check against previously-created `interactions` rows (`metadata->>'novelty_key'`).
-- Optional single LLM pass phrases the question; deterministic template is the fallback, same pattern as `frame_briefing` (`activities/briefing.py:374`).
+- Optional single LLM pass phrases the question; deterministic template is the fallback (structure like `frame_briefing`, `activities/briefing.py:374`, but pass `db_pool` + `purpose="curiosity_phrasing"` to `think()` — `frame_briefing` itself is an unlogged call site named by issue #106; don't copy that part).
 
 **Wiring checklist** activities list in `__main__.py` + construction with `db_pool` and `deps.llm`.
 
@@ -299,7 +311,7 @@ Goal: AEGIS stops being stateless-with-notes and starts accumulating a durable, 
 **Outcome** At most one `input`-kind card per day asks the owner a real question about their life, and the answer is banked as durable memory.
 
 **Implementation sketch**
-- New `worker/src/aegis_worker/flows/curiosity.py`, `CuriosityConfig(agent_id: str = "sebas", max_per_day: int = 1)`. Daily cron, e.g. `"0 9 * * *"` (14:30 IST) — deliberately not adjacent to the 04:30 briefing.
+- New `worker/src/aegis_worker/flows/curiosity.py`, `CuriosityConfig(agent_id: str = "sebas", max_per_day: int = 1)`. Daily cron `"30 9 * * *"` (15:00 IST) — not adjacent to the 04:30 briefing, and NOT `0 9`, which `money-hygiene-daily` already holds.
 - Gate before spawning: interaction cards go out via `send_interaction_card`, which does **not** pass through `safe_send_message` (`worker/src/aegis_worker/activities/delivery.py:15`) and therefore is not currently covered by the notification budget. So the gate is explicit: call `aegis.services.notifications.should_send` (`core/src/aegis/services/notifications.py:32`) from a small `check_curiosity_budget` activity, and on send call `record_notification(pool, agent_id, "curiosity_card", sent)` so curiosity consumes the same daily budget as proactive FYIs. Additionally hard-cap at one *pending* curiosity interaction at a time (`SELECT ... FROM interactions WHERE origin='curiosity' AND status='pending'`).
 - Spawn `InteractionFlow` ABANDONED with `kind="input"`, `origin="curiosity"`, `timeout_policy="archive"`, `timeout_seconds=2*86400`, `metadata={novelty_key, gap_type, subject}`, `post_resolve_activity="apply_curiosity_answer"`.
 - `apply_curiosity_answer` writes the answer via `record_memory(pool, agent_id, ..., importance=0.8, source="curiosity")`; high-signal answers additionally show up as evidence to A2 next Sunday (no direct profile write from this path).
@@ -331,7 +343,7 @@ Goal: AEGIS stops being stateless-with-notes and starts accumulating a durable, 
 
 **Acceptance criteria**
 - Real-Postgres test seeding one completed task, one resolved interaction and one calendar event for a date → `gather_day_events` returns all three bucketed by kind; a failing source (bad table/permission) degrades that bucket to empty without failing the activity.
-- Stubbed knowledge connector receives exactly one `ingest_content` call with `source_type='daylog'` and `url='aegis://daylog/<date>'`.
+- Stubbed knowledge connector receives exactly one `ingest_content` call with `source_type='daylog'` and `url='aegis://daylog/<date>'` — AND the `raw_text` it carries mentions the seeded task/interaction/event content (a call-shape assertion alone passes with `distil_daylog` returning `""`; asserting the narrative reflects the inputs is what makes this falsifiable).
 - Running the flow twice for the same date issues the same URL (no second entry) and does not double-advance `daylog_state`.
 - An empty day still writes an entry (a quiet day is data), marked `quiet: true` in metadata.
 
@@ -350,7 +362,7 @@ Goal: AEGIS stops being stateless-with-notes and starts accumulating a durable, 
 **Wiring checklist** `_ACTIVITY_TYPE_MAP["DayLogFlow"]` reads `mode`; two additional seed rows; activities list gains `gather_daylogs` / `distil_rollup`. No new flow class, no new `WORKFLOWS` entry.
 
 **Acceptance criteria**
-- Seven stubbed daylog entries → one `ingest_content` call with `source_type='daylog_rollup'`, `metadata.covers` listing all seven dates.
+- Seven stubbed daylog entries → one `ingest_content` call with `source_type='daylog_rollup'`, `metadata.covers` listing all seven dates, and non-empty `raw_text` that references content from the entries (not just their existence).
 - Fewer than 2 entries in the window → no rollup written, `status="insufficient"`.
 - The monthly run fires only on the actual last day of the month (test February and a 31-day month).
 - `mode="daily"` behaviour is byte-identical to A8 (regression test over the same fixture).
@@ -418,7 +430,7 @@ New life-data senses. Every task below reuses one of three existing shapes: the 
 
 **Acceptance criteria**
 - `tests/core/test_capture_route.py`: with a stubbed `LLMClient` returning `life_fact`, the row lands in `knowledge_content` with `source_type='life_fact'`; returning garbage or raising → task lane, and the request still returns 200.
-- `tests/comms/test_voice_ingest.py`: missing/bad shared secret → 401; valid audio with `transcribe` stubbed → exactly one core `capture` call carrying the transcript.
+- `tests/comms/test_voice_ingest.py`: missing/bad shared secret → 401; valid audio with `transcribe` stubbed → exactly one core `capture` call carrying the transcript. Comms tests may stop at the client boundary, but pair this with one core-side test (real Postgres) asserting that `capture(kind="auto")` with that transcript actually lands a `knowledge_content` or Todoist-outbox row — a mock-was-called assertion alone passes with the core route broken (B1's own criteria assert the real row; reuse that fixture).
 - `tests/comms/test_slack_voice_capture.py`: transcript starting "remember …" hits `capture`, not `_route_and_dispatch`; a normal transcript still routes to chat (existing behaviour unchanged).
 
 **Size:** M · **Depends on:** B1
@@ -433,6 +445,7 @@ New life-data senses. Every task below reuses one of three existing shapes: the 
 - Idempotency: claim `ingest_idempotency (source_type=f"life:{source}", external_id=…)` with the same `INSERT … ON CONFLICT DO NOTHING RETURNING` used by `github_webhook`; external id from a payload `id`/`_id` field, else `sha256(body)`.
 - Body size cap (reject > ~1 MB) and return `202 {"accepted": true, "workflow_id": …}` immediately — never await flow completion.
 - `log_audit` (`core/src/aegis/observability.py:100`) each accepted push so a chatty device is visible.
+- **Security notes:** (1) one shared secret covers every life source — a leak compromises location AND health ingestion at once. Acceptable for v1 (one owner, few devices), but support an optional per-source override (`life_webhook_secret_<source>` config lookup falling back to the shared key) so a single leaked device credential can be rotated without touching the others. (2) `ingest_idempotency` dedupes *processing* but does not reject a captured-and-replayed signed request — accept an optional `X-Aegis-Timestamp` header folded into the HMAC input with a ±5 min window; clients that send it get replay protection, ones that don't still work. TLS in front is assumed and required.
 
 **Wiring checklist:** route + `LIFE_SOURCES` · `Settings.life_webhook_secret` · `ConfigKey("life_webhook_secret", "Webhook secret", "Life data", True)` in `integrations_config.py` · docs note on computing the HMAC from an iOS Shortcut.
 
@@ -493,10 +506,10 @@ New life-data senses. Every task below reuses one of three existing shapes: the 
 **Implementation sketch**
 - `channels` rows with `kind="wearable"`, `identifier=<vendor>` (e.g. `oura`), `config={last_cursor, agent_id}`. Add `"wearable"` to `CHANNEL_KINDS` in `core/src/aegis/api/routes/channels.py`; optional starter row in `config/seed/channels.yaml` with `active: false`.
 - `worker/src/aegis_worker/activities/wearable.py` modeled on `worker/src/aegis_worker/activities/raindrop.py` (~150-line template): dataclass in/out, token from settings, `httpx` client injectable for tests, `_MAX_PAGES` runaway guard, returns records + `latest_cursor`.
-- `worker/src/aegis_worker/flows/wearable_ingest.py` modeled on `worker/src/aegis_worker/flows/rss_ingest.py` (~60 lines): `list_active_channels("wearable")` → poll → per-record `ingest_idempotency_claim` → write observations → `update_channel_config_key(kind, identifier, "last_cursor", …)`. Advance the cursor **only** past records with a definite outcome, exactly as `rss_ingest` does — this is the bug-avoidance the RSS flow already documents.
+- `worker/src/aegis_worker/flows/wearable_ingest.py` modeled on `worker/src/aegis_worker/flows/rss_ingest.py` (183 lines — budget for that, not a toy): `list_active_channels("wearable")` → poll → per-record `ingest_idempotency_claim` → write observations → `update_channel_config_key(kind, identifier, "last_cursor", …)`. Advance the cursor **only** past records with a definite outcome, exactly as `rss_ingest` does — this is the bug-avoidance the RSS flow already documents.
 - Reuse B6's metric vocabulary and normalization helpers so both channels produce identical `observations` rows.
 
-**Wiring checklist:** all 5 registration points — flow + activities modules; `WORKFLOWS` (`__main__.py:110`) and the worker-run list (`:670`); activity instance (~`:351`) and its methods (~`:560`); `_ACTIVITY_TYPE_MAP` in `worker/src/aegis_worker/schedule_sync.py:57`; seed row in `config/seed/activities.yaml` (copy the `rss-ingest-hourly` shape at `:123`). Plus `ConfigKey("oura_api_token", "API token", "Wearables", True)` in `integrations_config.py` and the matching `Settings` field.
+**Wiring checklist:** all 5 registration points — flow + activities modules; `WORKFLOWS` (`__main__.py:110`) and the worker-run list (`:670`); activity instance (~`:351`) and its methods (~`:560`); `_ACTIVITY_TYPE_MAP` in `worker/src/aegis_worker/schedule_sync.py:57`; seed row in `config/seed/activities.yaml` (follow the `rss-ingest-hourly` shape at `:123` but with its OWN cron — `schedule_cron: "45 */2 * * *"`; copying `30 * * * *` verbatim would stack it on the RSS run every hour, and wearable APIs update far less often than feeds). Plus `ConfigKey("oura_api_token", "API token", "Wearables", True)` in `integrations_config.py` and the matching `Settings` field.
 
 **Acceptance criteria**
 - `tests/worker/test_wearable_ingest.py` (real Postgres, stubbed `httpx`): first poll with no cursor ingests N records and writes `last_cursor`; second poll with the vendor returning the same records ingests 0 and leaves the cursor unchanged.
@@ -672,14 +685,14 @@ Migration numbers below assume the tasks ship in the listed order starting from 
 **Implementation sketch:**
 - New flow `worker/src/aegis_worker/flows/expiry_radar.py` (`ExpiryRadarFlow`), modeled directly on `CertRadarFlow`: loop over due items via `ExpiringItemsActivities.due_within`, and for each crossed `lead_days` threshold not already in `life.expiring_item_alerts`, raise a card.
 - New activities `worker/src/aegis_worker/activities/expiring_items.py` (`ExpiringItemsActivities`): `find_due_items`, `record_alert_and_get_card_payload`, `notify_expiry`. Use `safe_send_message` (`worker/src/aegis_worker/activities/delivery.py`, function starts line 15) for the notification — insert the alert row only after a successful `safe_send_message` call (or insert first and treat as "attempted", accepting the same at-most-once tradeoff `safe_send_message`'s docstring already describes for drift/cert/backup/renewal paths).
-- Card format: reuse `worker/src/aegis_worker/flows/interaction.py`'s `InteractionFlow` for anything needing a user response (e.g. "renewed?" acknowledgement); a simple FYI can go straight through `safe_send_message` like cert alerts do.
+- Card format: reuse `worker/src/aegis_worker/flows/interaction.py`'s `InteractionFlow` for anything needing a user response (e.g. "renewed?" acknowledgement); a simple FYI can go straight through `safe_send_message` like cert alerts do. Note the asymmetry: `safe_send_message` respects the notification budget, but interaction cards bypass it (`send_interaction_card` posts straight to `/api/deliver/card`) — call `record_notification(pool, agent_id, "expiry_card", sent)` on the card path too, so expiry acks count against the same daily budget as everything else (A2/A7 set the pattern).
 
 **Wiring checklist (the 5 registration points for a new scheduled flow):**
 1. Flow + activities class created (files above).
 2. Added to the module-level `WORKFLOWS` list in `worker/src/aegis_worker/__main__.py` (~line 111).
 3. Added to the runtime `workflows` list inside the same file (~line 668) — default to always-on since it's not homelab-specific.
 4. `_ACTIVITY_TYPE_MAP` entry in `worker/src/aegis_worker/schedule_sync.py` (dict starts line 57), mapping `"ExpiryRadarFlow"` to `(ExpiryRadarFlow, ExpiryRadarConfig(...))`.
-5. Seed row in `config/seed/activities.yaml` (follow the `cert-radar-daily` entry at line ~245 as a template): `slug: expiry-radar-daily`, `workflow_type: ExpiryRadarFlow`, `agent_id: sebas`, daily cron.
+5. Seed row in `config/seed/activities.yaml` (follow the `cert-radar-daily` entry at line ~245 as a template, but with its OWN cron): `slug: expiry-radar-daily`, `workflow_type: ExpiryRadarFlow`, `agent_id: sebas`, `schedule_cron: "15 7 * * *"` — `0 7` is already held by two existing rows (incl. cert-radar) and `30 7` by a third; copying the template's cron verbatim would stack a fourth flow on the same minute.
 
 **Acceptance criteria:**
 - `tests/worker/flows/test_expiry_radar.py` (new, workflow test harness matching existing flow tests e.g. `tests/worker/test_review_flows.py`): item crossing a threshold produces exactly one alert; a second run on the same day does not re-fire (dedup via `life.expiring_item_alerts`); an item with no crossed threshold produces none.
@@ -864,6 +877,7 @@ Migration numbers below assume the tasks ship in the listed order starting from 
 - `services/chat.py` line count drops substantially (target: under ~2,000 lines) with no changes to `TOOL_EXECUTORS` keys, `CHAT_TOOLS` contents, or any `_exec_*` function's behavior.
 - All existing tests under `tests/core/` that import `_exec_*` names (19+ files confirmed referencing `_exec_` today) pass without modification to their import statements, or with a mechanical import-path update reviewed as zero-behavior-change.
 - `_validate_agent_tool_sets()` still runs at app boot (`core/src/aegis/api/app.py` lifespan) and still raises on an orphaned tool reference — add a regression test that moving executors didn't silently drop one from `TOOL_EXECUTORS`.
+- Equivalence proof beyond incumbent tests (which don't cover all ~104 executors): capture `sorted(TOOL_EXECUTORS)` and each value's `__wrapped__`/`func.__name__` identity BEFORE the split (one committed snapshot test), and assert the merged post-split registry is identical — a `functools.partial` rebinding a stale reference or a dropped key then fails the snapshot instead of passing on untested executors.
 - `ruff` line-length 100 clean across new `services/tools/*.py` modules; tests run against real Postgres per `tests/conftest.py`.
 
 **Size:** M
