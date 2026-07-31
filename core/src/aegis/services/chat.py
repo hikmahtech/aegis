@@ -23,6 +23,7 @@ from jsonschema.exceptions import ValidationError as JSONSchemaValidationError
 from aegis.llm import parse_llm_json
 from aegis.llm.tier import resolve_model_for_agent, tier_to_model
 from aegis.observability import log_audit, record_llm_call, record_tool_call
+from aegis.services.source_types import DEFAULT_DECAY_DAYS, get_decay_days
 from aegis.services.todoist_config import resolve_todoist_api_key
 
 logger = structlog.get_logger()
@@ -3636,15 +3637,9 @@ def _extract_query_entities(message: str) -> list[str]:
 
 
 # --- Knowledge decay ---
-
-DECAY_WINDOWS = {
-    "chat": 30,
-    "task_outcome": 60,
-    "triage": 90,
-    "content": 180,
-    "manual": 365,
-}
-DEFAULT_DECAY_WINDOW = 90
+# Registry (types + per-type decay window) now lives in source_types.py.
+# DEFAULT_DECAY_WINDOW kept as a back-compat name — tests import it directly.
+DEFAULT_DECAY_WINDOW = DEFAULT_DECAY_DAYS
 
 
 def _apply_knowledge_decay(items: list[dict]) -> list[dict]:
@@ -3655,7 +3650,7 @@ def _apply_knowledge_decay(items: list[dict]) -> list[dict]:
     """
     for item in items:
         source_type = item.get("source_type", "unknown")
-        decay_window = DECAY_WINDOWS.get(source_type, DEFAULT_DECAY_WINDOW)
+        decay_window = get_decay_days(source_type)
         # Default to 0 (fresh) when age is unknown — don't penalize items without age data
         days = item.get("days_since_referenced", 0)
         decay_factor = max(0.1, 1.0 - (days / decay_window))
