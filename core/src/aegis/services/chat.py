@@ -174,22 +174,31 @@ async def classify_intent(message: str, llm, settings, pool=None) -> dict:
     return {"agent_id": "sebas", "reason": "default", "method": "default"}
 
 
-# Models served via the Claude-Code-subscription "bridge" (the LiteLLM
-# aliases claude-haiku/claude-sonnet/claude-opus) silently strip the `tools`
-# array from the upstream request — the model never sees the tool
-# definitions and responds in plain text (often hallucinating that no tools
-# are available). This used to be matched by exact string equality against
-# those three bare alias names, which stopped firing the moment
-# config/models.yaml pointed a tier at a *versioned* name (e.g.
-# smart -> "claude-sonnet-5") since that's a different string entirely.
-# Match on the `claude-` prefix instead so any Claude model — aliased or
-# versioned — is caught. When an agent has tools to call, swap the resolved
-# model for whatever the live `balanced` tier currently resolves to
+# Two very different things share the "claude-" name in the LiteLLM config
+# (infra: ansible/roles/ollama/templates/litellm-config.yaml.j2), and it
+# matters which one a tier resolves to:
+#   - Bridge aliases (bare names, no version): claude-haiku, claude-sonnet,
+#     claude-opus. These proxy through max-proxy (the Claude-Code-subscription
+#     bridge, api_base http://<max_proxy>/v1) and silently strip the `tools`
+#     array from the upstream request — the model never sees the tool
+#     definitions and responds in plain text (often hallucinating that no
+#     tools are available). THESE are what `_TOOL_INCAPABLE_MODELS` matches.
+#   - Real Anthropic-API aliases (versioned names): claude-sonnet-5,
+#     claude-haiku-4.5. These hit `anthropic/...` directly with a real API
+#     key and `model_info.supports_function_calling: true` — fully
+#     tool-capable. `smart` currently resolves to claude-sonnet-5
+#     (config/models.yaml), so it is deliberately NOT in this set.
+# Do NOT turn this into a `claude-` prefix check — that would also catch the
+# versioned, tool-capable names and silently downgrade every tool-bearing
+# smart-tier chat turn to the balanced tier for no reason. Match must stay
+# an exact-name set of the three bridge aliases.
+# When an agent has tools to call and the resolved model is one of these,
+# swap in whatever the live `balanced` tier currently resolves to
 # (`aegis/llm/tier.py::tier_to_model`) rather than a hardcoded model name,
 # so the fallback always tracks config/models.yaml / the DB-configured
 # backend instead of silently going stale (the previous hardcoded fallback,
 # `gpt-oss:20b`, has its host down indefinitely per config/models.yaml).
-_TOOL_INCAPABLE_MODEL_PREFIX: str = "claude-"
+_TOOL_INCAPABLE_MODELS: frozenset[str] = frozenset({"claude-haiku", "claude-sonnet", "claude-opus"})
 
 
 def _json_default(value: Any) -> Any:
@@ -4094,15 +4103,17 @@ async def send_message(
     # Build agent-specific tool list and structured prompt
     agent_tools = _get_agent_tools(agent_id, metadata=agent_meta) if tools_enabled else []
 
-    # Tool-calling routing: see the `_TOOL_INCAPABLE_MODEL_PREFIX` comment
-    # above. Swap in whatever the live `balanced` tier resolves to whenever
-    # the agent has tools to call and the resolved model matches the prefix.
-    # If the `balanced` tier isn't resolvable (e.g. tiers not yet loaded at
-    # boot), degrade safely and leave the model unchanged rather than crash
-    # the chat request. See cmemory lesson — empty chat_tool_calls table for
-    # 7d across all agents was the diagnostic signature that motivated this
-    # guard in the first place.
-    if tools_enabled and agent_tools and model.startswith(_TOOL_INCAPABLE_MODEL_PREFIX):
+    # Tool-calling routing: see the `_TOOL_INCAPABLE_MODELS` comment above —
+    # only the three bare max-proxy bridge aliases strip tools; versioned
+    # Anthropic-API names (claude-sonnet-5, claude-haiku-4.5) are tool-capable
+    # and must NOT match here. Swap in whatever the live `balanced` tier
+    # resolves to whenever the agent has tools to call and the resolved model
+    # is one of the bridge aliases. If the `balanced` tier isn't resolvable
+    # (e.g. tiers not yet loaded at boot), degrade safely and leave the model
+    # unchanged rather than crash the chat request. See cmemory lesson —
+    # empty chat_tool_calls table for 7d across all agents was the diagnostic
+    # signature that motivated this guard in the first place.
+    if tools_enabled and agent_tools and model in _TOOL_INCAPABLE_MODELS:
         try:
             fallback_model = tier_to_model("balanced")
         except KeyError:

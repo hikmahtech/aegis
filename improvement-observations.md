@@ -752,20 +752,21 @@ Migration numbers below assume the tasks ship in the listed order starting from 
 
 ## Theme D — Platform fixes & hygiene
 
-### D1 — Fix stale tool-capability guard in chat.py (quick win)
+### D1 — Fix stale tool-capability fallback in chat.py (quick win)
 
-**Outcome:** Tool-calling requests are correctly routed to a model that can actually carry the `tools` array, using the live-configured tiers instead of a frozen, now-wrong model-name list.
+**Outcome:** The tool-calling substitution's fallback model is routed via the live-configured `balanced` tier instead of a frozen, now-dead model name.
+
+**Correction (2026-08-01, PR #173):** an earlier draft of this section wrongly claimed `_TOOL_INCAPABLE_MODELS` was stale and should become a `claude-` prefix check. Verified against the live LiteLLM config (`homelab-gitops/ansible/roles/ollama/templates/litellm-config.yaml.j2`): `claude-haiku`/`claude-sonnet`/`claude-opus` are bare max-proxy bridge aliases that strip the `tools` array, while `claude-sonnet-5` / `claude-haiku-4.5` are separate, real-Anthropic-API LiteLLM entries with `model_info.supports_function_calling: true` — fully tool-capable. `smart` resolving to `claude-sonnet-5` and NOT matching `_TOOL_INCAPABLE_MODELS` is correct, intentional behavior, not a bug — a prefix check would silently downgrade every tool-bearing smart-tier chat turn to `balanced` for no reason. The exact-match set is right as-is. The genuine defect below (the hardcoded fallback literal) stands.
 
 **Implementation sketch:**
-- `core/src/aegis/services/chat.py:187` — `_TOOL_INCAPABLE_MODELS = frozenset({"claude-haiku", "claude-sonnet", "claude-opus"})` is matched by exact string equality at `chat.py:4105` (`model in _TOOL_INCAPABLE_MODELS`). `config/models.yaml` currently maps the `smart` tier to `"claude-sonnet-5"` (confirmed in repo), which never matches any entry in the set, so the substitution silently never fires for the smart tier today.
-- `chat.py:188` — `_TOOL_FALLBACK_MODEL = "gpt-oss:20b"` points at a model `config/models.yaml` documents as "down indefinitely" (its comment says `balanced` was moved to `"kimi-k2.5"` for exactly this reason). Confirmed live in the repo, not a stale claim.
-- Fix: replace exact-match against hardcoded names with a normalized/prefix check (e.g. match on `claude-` prefix or a small helper in `aegis/llm/tier.py`) so any Claude smart-tier model is caught regardless of version suffix.
-- Replace the hardcoded fallback literal with a lookup against the live `balanced` tier via `tier_to_model("balanced")` (`core/src/aegis/llm/tier.py`) instead of a string constant, so the fallback always tracks whatever `config/models.yaml` currently designates.
-- Update the stale comment block (`chat.py:176-186`) referencing `gpt-oss:20b` capabilities to reflect that the fallback is now tier-driven.
+- `core/src/aegis/services/chat.py:187` — `_TOOL_INCAPABLE_MODELS = frozenset({"claude-haiku", "claude-sonnet", "claude-opus"})` is matched by exact string equality at `chat.py:4105` (`model in _TOOL_INCAPABLE_MODELS`). This is correct as an exact-match set — keep it unchanged; do not prefix-match it (see correction above).
+- `chat.py:188` — `_TOOL_FALLBACK_MODEL = "gpt-oss:20b"` points at a model `config/models.yaml` documents as "down indefinitely" (its comment says `balanced` was moved to `"kimi-k2.5"` for exactly this reason). Confirmed live in the repo, not a stale claim — this is the actual defect.
+- Fix: replace the hardcoded fallback literal with a lookup against the live `balanced` tier via `tier_to_model("balanced")` (`core/src/aegis/llm/tier.py`) instead of a string constant, so the fallback always tracks whatever `config/models.yaml` currently designates. Degrade safely (leave the model unchanged) if `balanced` isn't resolvable.
+- Update the comment block (`chat.py:176-190`) to state the bridge-vs-real-API distinction explicitly (citing the litellm config path), so this doesn't get "fixed" into a prefix check again.
 
 **Acceptance criteria:**
-- New test in `tests/core/` asserts that a chat request with `model = tier_to_model("smart")` (currently `"claude-sonnet-5"`) and a non-empty tool list gets substituted to the `balanced` tier's model, not left unmatched.
-- Test confirms the fallback model resolves dynamically from `set_model_tiers(...)` rather than a literal `"gpt-oss:20b"`.
+- New test in `tests/core/` asserts that a chat request with a bare bridge-alias model (e.g. `"claude-sonnet"`) and a non-empty tool list gets substituted to the `balanced` tier's model, resolved dynamically — not a literal `"gpt-oss:20b"`.
+- Test asserts a chat request with `model = tier_to_model("smart")` (currently `"claude-sonnet-5"`) and a non-empty tool list is left **unchanged** (regression guard against prefix-matching this again).
 - Existing `_exec_*` / chat pipeline tests continue to pass; `ruff` (line-length 100) clean.
 
 **Size:** S
