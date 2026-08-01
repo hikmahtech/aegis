@@ -38,6 +38,11 @@ _TIMESTAMP_COLUMNS: dict[str, str] = {
     # `created_at` (migration 001).
     "todoist_webhook_events": "received_at",
     "knowledge_injection_log": "created_at",
+    # agent_profile_revisions (migration 015) — the persona revision log.
+    # Must be listed here as well as in _DEFAULT_RETENTIONS: _ALLOWED_TABLES
+    # is derived from these keys, so a retention entry alone would be
+    # silently skipped by prune_old_records.
+    "agent_profile_revisions": "created_at",
     # pandoras_actor.* — per migration 003 the timestamp columns are
     # `detected_at` (homelab_drift) and `checked_at` (everything else).
     "pandoras_actor.homelab_drift": "detected_at",

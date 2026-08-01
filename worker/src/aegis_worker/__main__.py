@@ -40,6 +40,7 @@ from aegis_worker.activities.inventory import InventoryActivities
 from aegis_worker.activities.llm_governor import LLMGovernorActivities
 from aegis_worker.activities.memory import MemoryActivities
 from aegis_worker.activities.money import MoneyActivities, parse_bank_alert_senders
+from aegis_worker.activities.profile import ProfileActivities
 from aegis_worker.activities.raindrop import RaindropActivities
 from aegis_worker.activities.review import ReviewActivities
 from aegis_worker.activities.rss import RssActivities
@@ -348,6 +349,8 @@ async def main():
         knowledge_connector=connectors.get("knowledge"),
     )
     memory_act = MemoryActivities(db_pool=deps.pool)
+    # Registered but dormant — no flow calls these yet (A1 ships the substrate).
+    profile_act = ProfileActivities(db_pool=deps.pool)
     raindrop_act = RaindropActivities(
         raindrop_api_token=getattr(settings, "raindrop_api_token", ""),
         db_pool=deps.pool,
@@ -569,6 +572,8 @@ async def main():
         gmail_act.apply_label,
         drive_act.sync_drive_folder,
         memory_act.prune_agent_memories,
+        profile_act.read_profile_context,
+        profile_act.apply_profile_patch,
         raindrop_act.poll_bookmarks,
         rss_act.fetch_feed,
         intel_scan_act.search_source,

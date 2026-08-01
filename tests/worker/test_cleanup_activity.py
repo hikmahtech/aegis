@@ -281,6 +281,15 @@ def test_expanded_tables_present_in_defaults_and_allowlist():
         assert table in _TIMESTAMP_COLUMNS, f"missing from _TIMESTAMP_COLUMNS: {table}"
 
 
+def test_agent_profile_revisions_is_actually_prunable():
+    """A retention entry alone is a no-op: prune_old_records skips anything
+    outside _ALLOWED_TABLES (derived from _TIMESTAMP_COLUMNS). The persona
+    revision log (migration 015) must appear in all three."""
+    assert _DEFAULT_RETENTIONS["agent_profile_revisions"] == 365
+    assert "agent_profile_revisions" in _ALLOWED_TABLES
+    assert _TIMESTAMP_COLUMNS["agent_profile_revisions"] == "created_at"
+
+
 def test_expanded_tables_use_correct_timestamp_columns():
     """The timestamp column chosen per table must match the migration:
     workflow_runs → started_at, alert_dedup_index → last_seen_at,
