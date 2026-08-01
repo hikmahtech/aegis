@@ -2,15 +2,201 @@
 
 import asyncio
 import os
+import signal
+import sys
+import time
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from aegis.config import Settings
 
+# ---------------------------------------------------------------------------
+# aegis#190: never leave an orphaned Temporal ephemeral server behind
+# ---------------------------------------------------------------------------
+#
+# `WorkflowEnvironment.start_time_skipping()` / `.start_local()` spawn a server
+# binary as a DIRECT CHILD of this pytest process, and only kill it from
+# `WorkflowEnvironment.__aexit__`. Every one of our ~48 flow-test modules drives
+# that via an in-test `async with`, so the shutdown depends on the test
+# coroutine unwinding — which is exactly what does NOT happen when pytest-timeout
+# fires: its SIGALRM handler raises `Failed` from whatever frame the main thread
+# happens to be in (normally `selectors.select()` deep inside the event loop),
+# so the exception leaves `run_until_complete` without ever resuming the test
+# coroutine. The `async with` body is abandoned mid-await; when the coroutine is
+# finally garbage-collected the loop is gone and `__aexit__` dies with
+# "RuntimeError: no running event loop". The server survives — a hung next run,
+# and (locally) a permanently held `flock` fd, since the child inherits it.
+#
+# So: reap our own leaked children after every test and at session end, and
+# reap pre-existing orphans at session start. Linux-only (/proc); a no-op
+# everywhere else and a no-op whenever there is nothing to reap.
+
+# The SDK downloads its ephemeral servers to the system temp dir as
+# "<binary>-<sdk-name>-<sdk-version>" — /tmp/temporal-test-server-sdk-python-1.30.0
+# for start_time_skipping(), /tmp/temporal-sdk-python-1.30.0 for start_local().
+# Matching the full prefix keeps a developer's own `temporal` CLI (basename
+# "temporal") and every other process on the box out of scope.
+_EPHEMERAL_SERVER_PREFIXES = ("temporal-test-server-sdk-", "temporal-sdk-")
+_PROC = Path("/proc")
+
+
+def _is_ephemeral_temporal_server(pid: int) -> bool:
+    """True iff `pid` is one of the temporalio SDK's downloaded server binaries.
+
+    Reading /proc/<pid>/exe requires the process to be ours, so this also
+    implicitly scopes the match to the current user.
+    """
+    try:
+        exe = os.readlink(_PROC / str(pid) / "exe")
+    except OSError:
+        return False  # gone, another user's, or a kernel thread
+    # A deleted binary reads back as "<path> (deleted)"; the prefix still matches.
+    return os.path.basename(exe).startswith(_EPHEMERAL_SERVER_PREFIXES)
+
+
+def _proc_field(pid: int, name: str) -> str:
+    try:
+        for line in (_PROC / str(pid) / "status").read_text().splitlines():
+            if line.startswith(name):
+                return line.split(":", 1)[1].strip()
+    except OSError:
+        pass
+    return ""
+
+
+def _is_gone(pid: int) -> bool:
+    """True once `pid` has exited. `os.kill(pid, 0)` is NOT usable here: our own
+    killed children stay around as zombies until waited on, and a zombie still
+    accepts signal 0. So reap opportunistically and read the /proc state."""
+    try:
+        os.waitpid(pid, os.WNOHANG)
+    except OSError:
+        pass  # not our child — nothing to reap
+    state = _proc_field(pid, "State:")
+    return not state or state.startswith("Z")
+
+
+def _kill_pids(pids: list[int]) -> None:
+    """SIGTERM, then SIGKILL anything still alive after a grace period."""
+    for pid in pids:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError:
+            pass
+    remaining = list(pids)
+    deadline = time.monotonic() + 5.0
+    while remaining and time.monotonic() < deadline:
+        remaining = [pid for pid in remaining if not _is_gone(pid)]
+        if remaining:
+            time.sleep(0.02)
+    for pid in remaining:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
+            pass
+
+
+def _all_server_pids() -> list[int]:
+    """Every ephemeral Temporal server process visible to this user."""
+    try:
+        entries = os.listdir(_PROC)
+    except OSError:
+        return []
+    return sorted(
+        pid
+        for pid in (int(e) for e in entries if e.isdigit())
+        if _is_ephemeral_temporal_server(pid)
+    )
+
+
+def _own_leaked_servers() -> list[int]:
+    """Ephemeral Temporal servers that are children of THIS pytest process.
+
+    Parentage is the whole scoping argument: we started it, so it is ours to
+    kill. Children are collected per-thread because the SDK's Rust runtime may
+    fork the server off a worker thread rather than the main one.
+    """
+    if sys.platform != "linux":
+        return []
+    me = os.getpid()
+    tasks = _PROC / str(me) / "task"
+    if not (tasks / str(me) / "children").exists():
+        # Kernel without CONFIG_PROC_CHILDREN — fall back to a full scan.
+        return [pid for pid in _all_server_pids() if _proc_field(pid, "PPid:") == str(me)]
+    children: set[int] = set()
+    try:
+        for tid in os.listdir(tasks):
+            try:
+                children.update(int(p) for p in (tasks / tid / "children").read_text().split())
+            except OSError:
+                continue
+    except OSError:
+        return []
+    return sorted(p for p in children if _is_ephemeral_temporal_server(p))
+
+
+def _orphaned_servers() -> list[int]:
+    """Ephemeral Temporal servers left behind by a PREVIOUS pytest process.
+
+    Deliberately narrow, because killing the wrong process is worse than the
+    bug: the executable must be one of the SDK's downloaded server binaries
+    (which also proves it is ours to read), and its parent must no longer be a
+    live Python process. A server belonging to a pytest session that is still
+    running — another agent's, or a sibling xdist worker's — has a live `python`
+    parent and is skipped.
+    """
+    if sys.platform != "linux":
+        return []
+    orphans = []
+    for pid in _all_server_pids():
+        ppid = _proc_field(pid, "PPid:")
+        parent_comm = _proc_field(int(ppid), "Name:") if ppid.isdigit() else ""
+        # Reparented to init/systemd (or anything that is not an interpreter)
+        # ⇒ whoever started it is gone.
+        if not parent_comm.startswith(("python", "pytest")):
+            orphans.append(pid)
+    return orphans
+
+
+def _reap_temporal_servers(pids: list[int], why: str) -> None:
+    if not pids:
+        return  # the common case: nothing to do, nothing printed
+    print(f"\n[aegis#190] reaping {why} temporal test server(s): {pids}", file=sys.stderr)
+    _kill_pids(pids)
+
+
+@pytest.hookimpl(wrapper=True)
+def pytest_runtest_teardown(item: pytest.Item):
+    """Kill any ephemeral server this test left running.
+
+    A wrapper, not a plain hook, for two reasons. It must run AFTER the fixture
+    finalizers — the handful of modules that own their WorkflowEnvironment in a
+    `pytest_asyncio.fixture` shut it down there, and reaping first turns their
+    teardown into `RuntimeError: Failed shutting down Temporalite: No such
+    process`. And the post-yield half runs from a `finally`, so a teardown that
+    itself blows up still gets the server cleaned up.
+
+    pytest always runs the teardown phase, including after a failure, a setup
+    error, or a pytest-timeout kill, which makes this the backstop for the
+    abandoned-`async with` path described above. Every WorkflowEnvironment in
+    this suite is function-scoped, so a server still alive here is by definition
+    a leak.
+    """
+    try:
+        return (yield)
+    finally:
+        _reap_temporal_servers(_own_leaked_servers(), "leaked")
+
+
+def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
+    _reap_temporal_servers(_own_leaked_servers(), "leaked")
+
 
 def pytest_sessionstart(session: pytest.Session) -> None:
-    """Guard against aegis#96: wrong-checkout tests running silently green (or red).
+    """Reap aegis#190 orphans, then guard against aegis#96.
+
+    aegis#96: wrong-checkout tests running silently green (or red).
 
     This repo's `.venv` is built from editable installs
     (`pip install -e core -e worker -e comms`), so the interpreter's
@@ -25,6 +211,11 @@ def pytest_sessionstart(session: pytest.Session) -> None:
     Detect it here rather than let it happen quietly: the already-imported
     `aegis` package must resolve to a path under this session's rootdir.
     """
+    # A server orphaned by an earlier run keeps its port, its Postgres/test-lock
+    # fds and its worker registrations — enough to wedge this session before it
+    # gets anywhere. Clear it out first.
+    _reap_temporal_servers(_orphaned_servers(), "orphaned")
+
     import aegis
 
     pkg_file = getattr(aegis, "__file__", None)

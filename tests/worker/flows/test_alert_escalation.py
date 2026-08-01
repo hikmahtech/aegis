@@ -23,6 +23,7 @@ import re
 
 import pytest
 from temporalio import activity, workflow
+from temporalio.api.enums.v1 import EventType
 from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import Worker
 
@@ -290,6 +291,13 @@ async def stub_send_card(
     allow_hint: bool = False,
 ) -> dict:
     _calls.setdefault("cards", []).append(prompt)
+    # Optional hold. Parking the gate child inside its first card dispatch parks
+    # it BEFORE it arms its escalation-reminder timer, which is what lets the
+    # self-resolve race test below de-alias that timer from the flow's own
+    # recheck timer. Absent `card_gate` (every other test) this is a no-op.
+    card_gate = _state.get("card_gate")
+    if card_gate is not None:
+        await card_gate.wait()
     return {"ok": True, "message_id": 42}
 
 
@@ -351,6 +359,22 @@ async def _wait_for_gate2(poll) -> None:
     raise AssertionError("Gate 2 child never started")
 
 
+async def _wait_for_recheck_timer(handle) -> None:
+    """Poll (in real time — no clock skipping) until the flow has armed the
+    Gate-2 recheck timer, i.e. a TIMER_STARTED recorded after the gate child was
+    started. Establishing that before skipping time is what makes the
+    de-aliasing in the self-resolve race test below deterministic."""
+    for _ in range(400):
+        seen_child = False
+        async for ev in handle.fetch_history_events():
+            if ev.event_type == EventType.EVENT_TYPE_START_CHILD_WORKFLOW_EXECUTION_INITIATED:
+                seen_child = True
+            elif seen_child and ev.event_type == EventType.EVENT_TYPE_TIMER_STARTED:
+                return
+        await asyncio.sleep(0.05)
+    raise AssertionError("flow never armed its Gate-2 recheck timer")
+
+
 # ---------------------------------------------------------------------------
 # Test 1: heads-up ping + Gate-2 escalation metadata
 # ---------------------------------------------------------------------------
@@ -408,8 +432,26 @@ async def test_escalating_alert_sends_heads_up_and_escalation_metadata():
 async def test_gate2_self_resolve_race_closes_gate():
     """While the escalating Gate-2 card awaits a human, the alert self-resolves.
     The flow's 3-min race detects it via check_alert_resolved, signals the card
-    closed, and returns self_resolved_during_gate — no human answer needed."""
+    closed, and returns self_resolved_during_gate — no human answer needed.
+
+    De-aliased on purpose (aegis#190). The flow rechecks the alert every 180s and
+    also hands InteractionFlow an escalation interval of 3 min — the same period,
+    both armed at the same virtual instant when Gate 2 opens. Under the
+    time-skipping test server "the same instant" is exact, so every recheck lands
+    together with a reminder timer, and roughly one run in four the gate child's
+    resulting activation (cancel the pending reminder timer + complete the
+    workflow) is rejected by the test server's history builder with "invalid
+    history builder state for action". Its workflow task then never completes,
+    the parent waits on a child that can never finish, and the test wedges
+    forever — which is how a leaked temporal-test-server got orphaned in the
+    first place. So: park the gate child inside its first card dispatch, i.e.
+    before it arms the reminder timer, skip 10s, and only then let it continue.
+    The reminder is now due at t0+190 while the flow's recheck fires at t0+180,
+    and the two never share an instant. Assertions are unchanged — this only
+    controls *when* the two timers are armed, not what the flow is asked to do.
+    """
     _reset(resolved_check_result={"resolved": False})
+    _state["card_gate"] = asyncio.Event()
 
     async with (
         await WorkflowEnvironment.start_time_skipping() as env,
@@ -427,14 +469,27 @@ async def test_gate2_self_resolve_race_closes_gate():
             task_queue="tq-esc",
         )
 
-        # Let the flow reach Gate 2 (verification delay is 0 → fast).
-        await _wait_for_gate2(lambda: env.sleep(1))
+        # Let the flow reach Gate 2 (verification delay is 0 → fast). Poll in
+        # real time: the child is held in send_interaction_card, so the clock
+        # must not move until both sides are where we want them.
+        await _wait_for_gate2(lambda: asyncio.sleep(0.05))
+        await _wait_for_recheck_timer(handle)
+
+        # Recheck timer armed at t0, reminder timer not armed yet → skip 10s
+        # (well inside InteractionFlow's 30s activity start-to-close) and let the
+        # child arm its reminder at t0+10.
+        await env.sleep(10)
+        _state["card_gate"].set()
 
         # The alert recovers while we await the human decision.
         _state["resolved_check_result"] = {"resolved": True}
-        await env.sleep(200)  # cross one 180s race tick
+        await env.sleep(185)  # cross the t0+180 recheck, stop short of t0+190
 
-        result = await handle.result()
+        # Bounded: a wedged workflow must fail this test from INSIDE the
+        # coroutine, so the `async with` unwinds and shuts the test server down.
+        # Letting pytest-timeout fire instead abandons the context manager and
+        # orphans the server (aegis#190).
+        result = await asyncio.wait_for(handle.result(), timeout=30.0)
 
     assert result["status"] == "self_resolved_during_gate"
 
