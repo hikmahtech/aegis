@@ -112,6 +112,17 @@ activities:
     config: {}
     active: true
 
+  # Raphael — nightly episodic diary (A8). One dated knowledge entry per day
+  # so retrieval has a timeline, not just topics. Cron 19:00 UTC = 00:30 IST,
+  # i.e. just after the IST day closes — the run's own UTC date IS the day
+  # being logged, so day_offset stays 0.
+  - slug: daylog-nightly
+    workflow_type: DayLogFlow
+    agent_id: raphael
+    schedule_cron: "0 19 * * *"
+    config: {}
+    active: true
+
   # Raphael — knowledge ingestion (raindrop + rss + intel scans)
   - slug: raindrop-ingest-2h
     workflow_type: RaindropIngestFlow
