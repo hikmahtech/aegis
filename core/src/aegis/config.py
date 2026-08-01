@@ -243,6 +243,10 @@ class Settings(BaseSettings):
     content_extraction_enabled: bool = True
     raindrop_api_token: str = ""
 
+    # Wearables (B7). Blank = WearableIngestFlow reports `token_missing` and
+    # never issues a request. Oura personal access token.
+    oura_api_token: str = ""
+
     # ElevenLabs (separate vendor — NOT the LiteLLM proxy). Empty key = kill
     # switch for media transcription.
     elevenlabs_api_key: str = ""

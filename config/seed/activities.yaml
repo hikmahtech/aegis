@@ -178,6 +178,30 @@ activities:
     config: {}
     active: true
 
+  # Sebas — B7 wearable vendor poll into life.observations.
+  #
+  # Cron 50 */6: 00:50 / 06:50 / 12:50 / 18:50 UTC. Minute :50 is used by no
+  # other row in this file, and deliberately avoids the ingest crowd at :00 and
+  # :30 and the */5 and */15 sweep minutes. Four times a day rather than the
+  # hourly cadence feeds get: a wearable publishes DAILY summaries, so the only
+  # thing extra polls buy is a shorter wait after the vendor finalises a day —
+  # 6h covers any timezone's morning and lets a failed poll self-heal on the
+  # next tick without a manual run. Data is deduped in the database, so an
+  # overlapping window costs nothing.
+  #
+  # Inert until BOTH `oura_api_token` (Integrations) and the wearable channel
+  # row (Channels, ships inactive) are set — until then the run reports
+  # `no_channel` / `token_missing` instead of failing.
+  - slug: wearable-ingest-6h
+    workflow_type: WearableIngestFlow
+    agent_id: sebas
+    schedule_cron: "50 */6 * * *"
+    config:
+      # Days of history requested when the channel has no cursor yet, and the
+      # floor the window is re-based to. Clamped to 30 in the activity.
+      lookback_days: 7
+    active: true
+
   # Watches ONE designated Google Drive folder, incrementally ingesting new/
   # changed docs (skip-unchanged by Drive modifiedTime). folder_id is empty by
   # default → the flow no-ops until a folder is designated. account = the gmail

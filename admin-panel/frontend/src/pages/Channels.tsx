@@ -3,22 +3,26 @@ import { Link } from 'react-router-dom';
 import { api } from '../api/client';
 import ErrorBanner from '../components/ErrorBanner';
 
-// Ingestion channels (email / rss / raindrop). DB-owned: the seed yaml only
-// plants starter rows on first boot — everything here survives restarts.
+// Ingestion channels (email / rss / raindrop / wearable). DB-owned: the seed
+// yaml only plants starter rows on first boot — everything here survives
+// restarts. This list also drives which kinds are RENDERED, so a kind missing
+// here is a channel row nobody can see or edit.
 
-const CHANNEL_KINDS = ['email', 'rss', 'raindrop'] as const;
+const CHANNEL_KINDS = ['email', 'rss', 'raindrop', 'wearable'] as const;
 type ChannelKind = (typeof CHANNEL_KINDS)[number];
 
 const KIND_COLORS: Record<string, string> = {
   email: 'var(--info)',
   rss: 'var(--warning)',
   raindrop: 'var(--purple)',
+  wearable: 'var(--success)',
 };
 
 const KIND_HELP: Record<ChannelKind, string> = {
   email: 'Gmail accounts polled by GmailIngestFlow. The account must be authorized via the Google accounts re-auth flow before ingestion works.',
   rss: 'Feed URLs polled by RssIngestFlow.',
   raindrop: 'Raindrop.io bookmark collections (the token lives in Integrations).',
+  wearable: 'Wearable vendors polled by WearableIngestFlow into life.observations. Identifier is the vendor slug (currently only "oura"); the token lives in Integrations.',
 };
 
 interface ChannelForm {

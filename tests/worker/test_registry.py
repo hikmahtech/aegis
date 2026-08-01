@@ -212,10 +212,11 @@ def test_module_workflows_is_the_unflagged_registry():
 @pytest.mark.parametrize(
     ("homelab", "money", "flows", "activities"),
     [
-        # prod: `worker_starting activities=171 flows=35`
-        (True, True, 35, 171),
-        (False, False, 27, 142),
-        (True, False, 31, 160),
+        # prod: `worker_starting activities=171 flows=35`, +1 flow and +2
+        # activities from B7's WearableIngestFlow / WearableActivities.
+        (True, True, 36, 173),
+        (False, False, 28, 144),
+        (True, False, 32, 162),
     ],
 )
 def test_real_registration_passes_the_boot_check(homelab, money, flows, activities):

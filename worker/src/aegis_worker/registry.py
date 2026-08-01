@@ -83,6 +83,7 @@ from aegis_worker.flows.social_metrics import SocialMetricsConfig, SocialMetrics
 from aegis_worker.flows.social_publish import SocialPublishConfig, SocialPublishFlow
 from aegis_worker.flows.subscription_audit import SubscriptionAuditConfig, SubscriptionAuditFlow
 from aegis_worker.flows.todoist_sync import TodoistSyncConfig, TodoistSyncFlow
+from aegis_worker.flows.wearable_ingest import WearableIngestFlow, WearableIngestInput
 from aegis_worker.flows.workspace_repo_sync import WorkspaceRepoSyncFlow, WorkspaceRepoSyncInput
 
 logger = structlog.get_logger()
@@ -209,6 +210,17 @@ FLOWS: tuple[FlowSpec, ...] = (
     FlowSpec(
         RssIngestFlow,
         lambda act: RssIngestInput(agent_id=act["agent_id"]),
+    ),
+    # B7 — wearable vendor poll. Not feature-flagged: the flow is inert until
+    # a `channels` row with kind='wearable' is activated (the seed row ships
+    # inactive), and it reports `status=no_channel` while that is the case, so
+    # an unconfigured install is visible on the Flows page rather than silent.
+    FlowSpec(
+        WearableIngestFlow,
+        lambda act: WearableIngestInput(
+            agent_id=act["agent_id"],
+            lookback_days=int((act["config"] or {}).get("lookback_days", 7)),
+        ),
     ),
     FlowSpec(
         DriveSyncFlow,

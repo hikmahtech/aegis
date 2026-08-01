@@ -37,3 +37,15 @@ channels:
       agent_id: raphael
       label: arxiv-ai
     active: true
+
+  # B7 — wearable vendor poll. Ships INACTIVE: activating it before setting
+  # `oura_api_token` under admin → Integrations just makes WearableIngestFlow
+  # report `token_missing` every 6 hours. Identifier is the vendor slug and is
+  # what `poll_wearable` dispatches on — only "oura" has a metric mapping today.
+  - kind: wearable
+    identifier: oura
+    config:
+      last_cursor: null
+      agent_id: sebas
+      label: oura-ring
+    active: false

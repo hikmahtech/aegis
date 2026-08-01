@@ -1,4 +1,4 @@
-"""Admin CRUD for ingestion channels (email / rss / raindrop).
+"""Admin CRUD for ingestion channels (email / rss / raindrop / wearable).
 
 Channels are DB-owned: `config/seed/channels.yaml` only inserts starter rows
 on first boot (see seed.py::_load_channels); everything afterwards is managed
@@ -18,7 +18,7 @@ from aegis.api.auth import verify_auth
 
 router = APIRouter(prefix="/api/admin/channels", dependencies=[Depends(verify_auth)])
 
-CHANNEL_KINDS = ("email", "rss", "raindrop")
+CHANNEL_KINDS = ("email", "rss", "raindrop", "wearable")
 
 _COLS = "id, kind, identifier, config, active, created_at"
 
