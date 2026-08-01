@@ -7,6 +7,8 @@ Usage:
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import hmac
 import time
 from dataclasses import dataclass, field
 from typing import Any
@@ -14,7 +16,7 @@ from typing import Any
 import httpx
 import structlog
 import uvicorn
-from fastapi import APIRouter, FastAPI, Header, HTTPException
+from fastapi import APIRouter, FastAPI, Header, HTTPException, Request
 from pydantic import BaseModel
 
 from aegis_comms.adapters.base import CardSpec, DeliveryRef
@@ -34,6 +36,11 @@ logger = structlog.get_logger()
 
 _SLACK_PROBE_INTERVAL = 60  # seconds between is_connected() polls
 _PROBE_STALE_THRESHOLD = 180  # seconds — older than this → healthy=False
+
+# Largest raw body POST /api/ingest/voice will read. ElevenLabs Scribe caps at
+# 1 GB but a phone voice note is kilobytes — this is the "don't let a bad
+# client stream us out of memory" bound, not a product limit.
+_MAX_VOICE_BYTES = 25 * 1024 * 1024
 
 
 @dataclass
@@ -308,6 +315,69 @@ def create_delivery_app(adapter: SlackAdapter, settings: CommsSettings) -> FastA
         send_result = await adapter.send_voice(agent_id=req.agent_id, text=req.text)
         result = send_result.to_response()
         return {"ok": result.get("ok", False), "agent_id": req.agent_id, **result}
+
+    @router.post("/api/ingest/voice")
+    async def ingest_voice(
+        request: Request,
+        x_voice_secret: str | None = Header(default=None, alias="X-Voice-Secret"),
+        filename: str = "voice.m4a",
+    ) -> dict[str, Any]:
+        """Voice-first capture from outside Slack (B3) — iOS Shortcut, etc.
+
+        The recording is the RAW request body (not multipart: python-multipart
+        is not a comms dependency, and "Get Contents of URL → Request Body:
+        File" is the shape a Shortcut produces anyway). Transcribe, then hand
+        the text to core's `kind="auto"` classifier, which decides between the
+        Todoist Inbox and the knowledge store. Returns the transcript and the
+        resolved lane so the Shortcut can show what happened.
+
+        Auth is `voice_ingest_secret`, NOT the general comms api key — an
+        unconfigured secret is a 503 (fail closed), never an open endpoint.
+        """
+        if not settings.voice_ingest_secret:
+            raise HTTPException(503, "voice ingest not configured")
+        if not x_voice_secret or not hmac.compare_digest(
+            x_voice_secret, settings.voice_ingest_secret
+        ):
+            raise HTTPException(401, "Invalid voice ingest secret")
+        if not settings.elevenlabs_api_key:
+            raise HTTPException(503, "transcription not configured")
+
+        audio = await request.body()
+        if not audio:
+            raise HTTPException(400, "empty audio body")
+        if len(audio) > _MAX_VOICE_BYTES:
+            raise HTTPException(413, "audio too large")
+
+        from aegis_comms import elevenlabs
+        from aegis_comms.slack_inbound import SlackCoreClient
+
+        transcript = await elevenlabs.transcribe(
+            audio,
+            api_key=settings.elevenlabs_api_key,
+            model_id=settings.elevenlabs_stt_model,
+            filename=filename,
+        )
+        if not transcript:
+            raise HTTPException(502, "transcription failed")
+
+        ext_id = f"voice:{hashlib.sha256(transcript.encode()).hexdigest()[:16]}"
+        # Not Slack-specific despite the name — it is just the core HTTP client.
+        result = await SlackCoreClient(settings).capture(
+            text=transcript, external_id=ext_id, kind="auto"
+        )
+        if not result:
+            raise HTTPException(502, "core capture failed")
+        logger.info(
+            "voice_ingest_captured", lane=result.get("lane"), external_id=ext_id
+        )
+        return {
+            "ok": True,
+            "transcript": transcript,
+            "lane": result.get("lane"),
+            "task_ref": result.get("task_ref"),
+            "content_id": result.get("content_id"),
+        }
 
     @router.post("/api/deliver/card")
     async def deliver_card(

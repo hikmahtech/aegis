@@ -61,3 +61,12 @@ class CommsSettings(BaseSettings):
         default="eleven_multilingual_v2",
         validation_alias=AliasChoices("AEGIS_ELEVENLABS_TTS_MODEL"),
     )
+
+    # Voice-first capture from outside Slack (POST /api/ingest/voice — an iOS
+    # Shortcut posts the recording as the raw request body). Its own secret
+    # rather than AEGIS_API_KEY so a phone holds a credential that can ONLY
+    # capture, not send messages as any agent. Blank = the route is off (503),
+    # so an unconfigured deploy can never accept unauthenticated audio.
+    voice_ingest_secret: str = Field(
+        default="", validation_alias=AliasChoices("AEGIS_VOICE_INGEST_SECRET")
+    )
