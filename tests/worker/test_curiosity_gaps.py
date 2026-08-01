@@ -467,15 +467,21 @@ def test_find_curiosity_gaps_is_an_activity_def():
     assert hasattr(method, "__temporal_activity_definition")
 
 
-def test_activity_is_registered_in_worker_activities_list():
-    """The wiring that actually makes the activity callable from a flow."""
+def test_activity_is_registered_on_the_worker():
+    """The wiring that actually makes the activity callable from a flow.
+
+    Since D6 the per-activity registration line is gone — main() constructs
+    `curiosity_act` and hands the instance to registry.collect_activities,
+    which serves all of its @activity.defn methods. Assert both halves: the
+    instance is still constructed, and the activity is in the served set.
+    """
     import inspect
 
     import aegis_worker.__main__ as m
+    from aegis_worker.registry import expected_activity_names
 
-    src = inspect.getsource(m.main)
-    assert "curiosity_act.find_curiosity_gaps" in src
-    assert "CuriosityActivities(" in src
+    assert "find_curiosity_gaps" in expected_activity_names()
+    assert "CuriosityActivities(" in inspect.getsource(m.main)
 
 
 @pytest.mark.parametrize("kw", ["db_pool", "llm_client"])

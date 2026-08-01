@@ -855,26 +855,14 @@ def test_daylog_flow_is_registered():
     )
 
 
-def test_daylog_activities_are_in_the_runtime_activities_list():
-    """The module-level ACTIVITIES stub list is a subset; the list that
-    actually reaches Temporal is built inside main(). Read it via AST."""
-    import ast
-    import inspect
+def test_daylog_activities_are_served_by_the_worker():
+    """The worker serves every @activity.defn of every instance main() builds
+    (registry.collect_activities, boot-checked by check_registration), so what
+    still matters here is that these five carry the decorator under exactly
+    these names — a rename silently drops them from the served set."""
+    from aegis_worker.registry import expected_activity_names
 
-    import aegis_worker.__main__ as worker_main
-
-    tree = ast.parse(inspect.getsource(worker_main))
-    attrs: set[str] = set()
-    for node in ast.walk(tree):
-        if (
-            isinstance(node, ast.Assign)
-            and len(node.targets) == 1
-            and isinstance(node.targets[0], ast.Name)
-            and node.targets[0].id == "activities"
-            and isinstance(node.value, ast.List)
-        ):
-            attrs |= {e.attr for e in node.value.elts if isinstance(e, ast.Attribute)}
-
+    served = expected_activity_names()
     for name in (
         "gather_day_events",
         "distil_daylog",
@@ -882,7 +870,7 @@ def test_daylog_activities_are_in_the_runtime_activities_list():
         "gather_daylogs",
         "distil_rollup",
     ):
-        assert name in attrs, f"{name} missing from main()'s activities list"
+        assert name in served, f"{name} is not an activity the worker serves"
 
 
 def test_daylog_flow_in_schedule_map():

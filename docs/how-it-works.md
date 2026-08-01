@@ -472,8 +472,11 @@ ORDER BY created_at;
 
 1. Is the `activities` row `active` and its cron right? (Admin **Flows** page.)
 2. Does the schedule exist in Temporal? (UI → Schedules. A missing schedule
-   with a `schedule_unknown_type` warning in worker logs means the flow's
-   `_ACTIVITY_TYPE_MAP` entry is missing.)
+   with a `schedule_unknown_type` warning in worker logs means the row's
+   `workflow_type` names a flow with no schedule config in
+   `worker/src/aegis_worker/registry.py`. Note the worker refuses to boot on
+   that state for *seeded* rows — this can only happen for a row added
+   directly in the DB.)
 3. Was the tick **skipped**? Schedules default to overlap=SKIP — a
    still-running previous run silently swallows ticks. The schedule detail
    page shows recent actions.
@@ -493,21 +496,26 @@ call, with tokens and latency); connector ground truth is `connector_calls`.
 
 ## 9. Extending it
 
-**A new scheduled flow** — four registration points, and *nothing is
-auto-discovered* (full steps in
+**A new scheduled flow** — one declaration plus a seed row (full steps in
 [`development.md`](development.md#adding-a-new-flow)):
 
 1. The flow (`@workflow.defn`) in `worker/src/aegis_worker/flows/` and its
    activities in `activities/`. The config dataclass **must** have
    `agent_id: str` as its first field — the run recorder reads it.
-2. Register **both** the workflow and the activities in
-   `worker/src/aegis_worker/__main__.py` — two separate explicit lists, and
-   updating only one is a boot regression that has happened before.
-3. Add an `_ACTIVITY_TYPE_MAP` entry in
-   `worker/src/aegis_worker/schedule_sync.py`, keyed by the PascalCase class
-   name, mapping an `activities` row to the flow's config dataclass.
-4. Seed a row in `config/seed/activities.yaml`. `schedule_sync` registers the
+2. One `FlowSpec` in `worker/src/aegis_worker/registry.py`: the class, the
+   builder that turns an `activities` row into the config dataclass, and the
+   settings flag gating it (if any). The worker's workflow list and
+   `schedule_sync`'s type map are both derived from that table. Activities need
+   no registration at all — every `@activity.defn` on the instances `main()`
+   builds is served automatically.
+3. Seed a row in `config/seed/activities.yaml`. `schedule_sync` registers the
    Temporal schedule on the next worker start and reconciles every ~5 min.
+
+`registry.check_registration()` runs at worker boot, before the Temporal
+worker is constructed, and **refuses to start** on a half-wired flow: declared
+but never registered, registered but with no seed row, a seed row naming a
+flow that cannot be scheduled, or an activity class that was written but never
+constructed in `main()`.
 
 For any human decision inside the flow, spawn `InteractionFlow` — don't build
 custom callback plumbing.

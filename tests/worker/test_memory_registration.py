@@ -13,17 +13,23 @@ def test_consolidate_is_an_activity_def():
 
 
 def test_worker_registers_consolidate_activity():
-    """The ACTIVITIES list is assembled inside main() at runtime, so (as with
-    the other registration tests here) assert on the entrypoint source: an
-    unregistered activity dies in production with 'activity type not
-    registered', and an llm_client-less MemoryActivities is a silent no-op."""
+    """An unregistered activity dies in production with 'activity type not
+    registered', and an llm_client-less MemoryActivities is a silent no-op.
+
+    Registration itself is now derived (registry.collect_activities over the
+    instances main() builds, guarded by check_registration at boot), so the
+    per-activity line this used to grep for is gone. The constructor wiring is
+    still hand-written and still worth pinning to the source.
+    """
     from pathlib import Path
 
     import aegis_worker.__main__ as worker_main
+    from aegis_worker.registry import expected_activity_names
+
+    assert "consolidate_agent_memories" in expected_activity_names()
 
     lines = [ln.strip() for ln in Path(worker_main.__file__).read_text().splitlines()]
     live = [ln for ln in lines if not ln.startswith("#")]
-    assert "memory_act.consolidate_agent_memories," in live
     assert any(ln.startswith("memory_act = MemoryActivities(") for ln in live)
     assert any(
         "MemoryActivities(db_pool=deps.pool, llm_client=deps.llm" in ln for ln in live

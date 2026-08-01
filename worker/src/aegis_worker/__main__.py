@@ -53,40 +53,14 @@ from aegis_worker.activities.sentry_ingest import SentryIngestActivities
 from aegis_worker.activities.social import SocialActivities
 from aegis_worker.activities.todoist import TodoistActivities
 from aegis_worker.bootstrap import bootstrap
-from aegis_worker.flows.agent_chat_reply import AgentChatReplyFlow
-from aegis_worker.flows.agent_task import AgentTaskFlow, AgentTaskSweepFlow
-from aegis_worker.flows.alert_investigation import AlertInvestigationFlow
-from aegis_worker.flows.calendar_ingest import CalendarIngestFlow
-from aegis_worker.flows.cert_radar import CertRadarFlow
-from aegis_worker.flows.clarify import ClarifyFlow
-from aegis_worker.flows.cleanup import CleanupFlow
-from aegis_worker.flows.curiosity import CuriosityCardFlow
-from aegis_worker.flows.daily_briefing import DailyBriefingFlow
-from aegis_worker.flows.daylog import DayLogFlow
-from aegis_worker.flows.delivery_watchdog import DeliveryWatchdogFlow
-from aegis_worker.flows.drive_sync import DriveSyncFlow
-from aegis_worker.flows.expiry_radar import ExpiryRadarFlow
-from aegis_worker.flows.github_alert import GitHubAlertFlow
-from aegis_worker.flows.gmail_ingest import GmailIngestFlow
-from aegis_worker.flows.infra_heartbeat import InfraHeartbeatFlow
-from aegis_worker.flows.intelligence_scan import IntelligenceScanFlow
-from aegis_worker.flows.interaction import InteractionFlow
-from aegis_worker.flows.llm_spend_guard import LLMSpendGuardFlow
-from aegis_worker.flows.memory_reflection import MemoryReflectionFlow
-from aegis_worker.flows.money_hygiene import MoneyHygieneDailyFlow
-from aegis_worker.flows.money_process import MoneyProcessFlow
-from aegis_worker.flows.raindrop_ingest import RaindropIngestFlow
-from aegis_worker.flows.receipt_ingest import ReceiptIngestFlow
-from aegis_worker.flows.review import DailyReviewFlow, WeeklyReviewFlow
-from aegis_worker.flows.rss_ingest import RssIngestFlow
-from aegis_worker.flows.sentry_poll import SentryPollFlow
-from aegis_worker.flows.service_drift import ServiceDriftFlow
-from aegis_worker.flows.social_metrics import SocialMetricsFlow
-from aegis_worker.flows.social_publish import SocialPublishFlow
-from aegis_worker.flows.subscription_audit import SubscriptionAuditFlow
-from aegis_worker.flows.todoist_sync import TodoistSyncFlow
-from aegis_worker.flows.workspace_repo_sync import WorkspaceRepoSyncFlow
 from aegis_worker.interceptors import WorkflowRunRecorderInterceptor
+from aegis_worker.registry import (
+    all_activity_methods,
+    base_workflows,
+    check_registration,
+    collect_activities,
+    workflows_for,
+)
 from aegis_worker.schedule_sync import sync_schedules
 
 logger = structlog.get_logger()
@@ -94,90 +68,24 @@ logger = structlog.get_logger()
 TASK_QUEUE = "aegis-main"
 
 # ---------------------------------------------------------------------------
-# Module-level registration lists
+# Module-level registration views — DERIVED, never hand-maintained.
 #
-# WORKFLOWS: pure list of workflow classes.  Stable at import time — no
-#   runtime dependencies needed.
+# WORKFLOWS: the flow classes registered regardless of any feature flag.
+#   main() registers `workflows_for(settings)` instead, which adds the
+#   flag-gated ones; check_registration() refuses to boot if that list ever
+#   disagrees with the registry (issue #188).
 #
-# ACTIVITIES: list of bound activity methods.  Built from stub instances
-#   (all deps=None) at module level so registration tests can inspect them
-#   without connecting to Temporal, Postgres, or any external service.
-#   main() replaces these with the real instances that have live deps.
+# ACTIVITIES: every @activity.defn in aegis_worker.activities, as unbound
+#   functions — import-time safe, nothing is instantiated. The live list
+#   handed to Worker() is built by collect_activities() inside main() from
+#   the real instances, and check_registration() proves the two agree.
+#
+# The single source of truth for both is aegis_worker/registry.py.
 # ---------------------------------------------------------------------------
 
-# Stub instances for module-level ACTIVITIES (deps=None is safe at import
-# time; the dataclass @activity.defn decorator binds the name to the
-# method object, not to the dependency values).
-_stub_chat_act = ChatActivities(client=None)  # type: ignore[arg-type]
-_stub_clarify_act = ClarifyActivities(db_pool=None)
-_stub_social_act = SocialActivities(db_pool=None)
-_stub_agent_registry_act = AgentRegistryActivities(db_pool=None)
-_stub_llm_governor_act = LLMGovernorActivities(db_pool=None)
-_stub_agent_task_act = AgentTaskActivities(db_pool=None)
-_stub_infra_ops_act = InfraOpsActivities(homelab_connector=None)
-_stub_expiring_items_act = ExpiringItemsActivities(db_pool=None)
+WORKFLOWS: list = base_workflows()
 
-WORKFLOWS: list = [
-    AgentChatReplyFlow,
-    AgentTaskSweepFlow,
-    AgentTaskFlow,
-    AlertInvestigationFlow,
-    CalendarIngestFlow,
-    DailyBriefingFlow,
-    DayLogFlow,
-    CleanupFlow,
-    InteractionFlow,
-    GmailIngestFlow,
-    GitHubAlertFlow,
-    RaindropIngestFlow,
-    RssIngestFlow,
-    DriveSyncFlow,
-    LLMSpendGuardFlow,
-    MemoryReflectionFlow,
-    IntelligenceScanFlow,
-    SentryPollFlow,
-    TodoistSyncFlow,
-    ClarifyFlow,
-    DailyReviewFlow,
-    WeeklyReviewFlow,
-    WorkspaceRepoSyncFlow,
-    SocialPublishFlow,
-    SocialMetricsFlow,
-    CuriosityCardFlow,
-    ExpiryRadarFlow,
-]
-
-ACTIVITIES: list = [
-    _stub_agent_registry_act.resolve_agents,
-    _stub_llm_governor_act.check_llm_budget,
-    _stub_chat_act.synthesize_reply,
-    _stub_clarify_act.post_agent_reply_comment,
-    _stub_clarify_act.post_agent_reply_error_comment,
-    _stub_clarify_act.clear_clarify_watermark,
-    _stub_social_act.find_due_posts,
-    _stub_social_act.drain_social_outbox,
-    _stub_social_act.complete_posted_tasks,
-    _stub_social_act.apply_social_approval,
-    _stub_social_act.refresh_post_metrics,
-    _stub_agent_task_act.find_actionable_tasks,
-    _stub_agent_task_act.load_task_context,
-    _stub_agent_task_act.park_task,
-    _stub_agent_task_act.complete_task,
-    _stub_agent_task_act.comment,
-    _stub_agent_task_act.apply_restart_approval,
-    _stub_agent_task_act.triage_email,
-    _stub_agent_task_act.merchant_history,
-    _stub_agent_task_act.apply_finance_decision,
-    _stub_agent_task_act.resolve_task_repo,
-    _stub_agent_task_act.run_task_investigation,
-    _stub_agent_task_act.collect_coding_run,
-    _stub_agent_task_act.run_task_implementation,
-    _stub_infra_ops_act.service_health,
-    _stub_infra_ops_act.service_logs,
-    _stub_infra_ops_act.restart_service,
-    _stub_expiring_items_act.claim_due_alerts,
-    _stub_expiring_items_act.record_expiry_cards,
-]
+ACTIVITIES: list = all_activity_methods()
 
 
 async def run_periodic_schedule_sync(
@@ -552,243 +460,64 @@ async def main():
         )
     )
 
-    # All activities
-    activities = [
-        active_work_act.check_active_work,
-        agent_registry_act.resolve_agents,
-        alert_governance_act.check_alert_mute,
-        alert_governance_act.write_alert_mute,
-        alert_governance_act.stage_pending_pr,
-        alert_governance_act.create_github_pr,
-        alert_act.check_dedup,
-        alert_act.find_open_task_for_signature,
-        alert_act.record_signature_recurrence,
-        alert_act.record_signature_new_task,
-        alert_act.investigate,
-        alert_act.gather_alert_knowledge,
-        alert_act.log_alert,
-        alert_act.resolve_infra_resource,
-        alert_act.remediate_infra_service,
-        alert_act.resolve_alert_resource,
-        alert_act.score_resource_relevance,
-        alert_act.reresolve_with_hint,
-        alert_act.check_alert_resolved,
-        alert_act.get_verification_delay,
-        alert_act.run_investigation,
-        alert_act.run_remediation_commands,
-        alert_act.assess_investigation,
-        alert_act.accumulate_digest_item,
-        alert_act.build_alert_digest,
-        alert_act.post_task_note,
-        alert_act.record_verdict_to_kg,
-        alert_act.upload_kimi_log,
-        alert_act.get_alert_routing_config,
-        briefing_act.ingest_briefing,
-        briefing_act.gather_market_data,
-        briefing_act.format_market_section,
-        briefing_act.gather_briefing_changes,
-        briefing_act.frame_briefing,
-        briefing_act.commit_briefing_state,
-        delivery_act.send_message,
-        delivery_act.send_system_event,
-        delivery_act.send_voice,
-        delivery_act.send_interaction_card,
-        content_act.process_content,
-        content_act.ingest_content,
-        intel_act.dedup_items,
-        intel_act.score_significance,
-        intel_act.ingest_intelligence,
-        cleanup_act.prune_old_records,
-        cleanup_act.archive_orphan_interactions,
-        cleanup_act.cleanup_old_dispatches,
-        llm_governor_act.check_llm_budget,
-        interaction_act.insert_interaction,
-        interaction_act.resolve_interaction,
-        interaction_act.apply_interaction_timeout,
-        interaction_act.update_interaction_delivery_ref,
-        run_recorder_act.record_workflow_run,
-        channel_act.list_active_channels,
-        channel_act.update_channel_config_key,
-        channel_act.ingest_idempotency_claim,
-        calendar_act.fetch_events,
-        calendar_act.events_to_content,
-        gmail_act.fetch_emails,
-        gmail_act.fetch_thread,
-        gmail_act.classify_email,
-        gmail_act.record_triage_outcome,
-        gmail_act.recheck_triage_outcomes,
-        gmail_act.ingest_email_to_kg,
-        gmail_act.gather_email_context,
-        gmail_act.apply_label,
-        drive_act.sync_drive_folder,
-        memory_act.prune_agent_memories,
-        memory_act.consolidate_agent_memories,
-        profile_act.read_profile_context,
-        profile_act.apply_profile_patch,
-        people_act.enrich_people_from_email,
-        people_act.enrich_people_from_events,
-        curiosity_act.find_curiosity_gaps,
-        curiosity_act.check_curiosity_budget,
-        curiosity_act.record_curiosity_card,
-        curiosity_act.apply_curiosity_answer,
-        daylog_act.gather_day_events,
-        daylog_act.distil_daylog,
-        daylog_act.commit_daylog_state,
-        daylog_act.gather_daylogs,
-        daylog_act.distil_rollup,
-        raindrop_act.poll_bookmarks,
-        rss_act.fetch_feed,
-        intel_scan_act.search_source,
-        sentry_ingest_act.fetch_new_issues,
-        sentry_ingest_act.issue_to_alert,
-        sentry_ingest_act.read_sentry_cursor,
-        sentry_ingest_act.write_sentry_cursor,
-        todoist_act.bootstrap_if_empty,
-        todoist_act.fetch_sync,
-        todoist_act.apply_sync_diff,
-        todoist_act.drain_outbox,
-        capture_act.capture_to_inbox,
-        social_act.find_due_posts,
-        social_act.drain_social_outbox,
-        social_act.complete_posted_tasks,
-        social_act.apply_social_approval,
-        social_act.refresh_post_metrics,
-        clarify_act.find_unclassified_items,
-        clarify_act.classify_one,
-        clarify_act.apply_outcome,
-        clarify_act.log_classification,
-        clarify_act.apply_clarify_resolution,
-        clarify_act.ingest_reference_to_ks,
-        clarify_act.complete_reference_task,
-        clarify_act.reclassify_reference_to_reading,
-        clarify_act.post_agent_reply_comment,
-        clarify_act.post_agent_reply_error_comment,
-        clarify_act.clear_clarify_watermark,
-        chat_act.synthesize_reply,
-        review_act.gather_daily_digest,
-        review_act.log_review_digest,
-        review_act.apply_review_acknowledgement,
-        review_act.gather_weekly_state,
-        review_act.check_upcoming_key_dates,
-        review_act.frame_review,
-        review_act.apply_review_decision,
-        review_act.gather_today_focus,
-        inventory_act.scan_workspace_repos,
-        inventory_act.reconcile_workspace_resources,
-        inventory_act.mirror_workspace_repos,
-        inventory_act.check_github_webhooks,
-        inventory_act.upsert_resources_batch,
-        agent_task_act.find_actionable_tasks,
-        agent_task_act.load_task_context,
-        agent_task_act.park_task,
-        agent_task_act.complete_task,
-        agent_task_act.comment,
-        agent_task_act.apply_restart_approval,
-        agent_task_act.triage_email,
-        agent_task_act.merchant_history,
-        agent_task_act.apply_finance_decision,
-        agent_task_act.resolve_task_repo,
-        agent_task_act.run_task_investigation,
-        agent_task_act.collect_coding_run,
-        agent_task_act.run_task_implementation,
-        infra_ops_act.service_health,
-        infra_ops_act.service_logs,
-        infra_ops_act.restart_service,
-        expiring_items_act.claim_due_alerts,
-        expiring_items_act.record_expiry_cards,
-    ]
+    # All activities — every @activity.defn method of every instance below is
+    # registered automatically (registry.collect_activities). Adding a method
+    # to one of these classes needs no edit here; adding a new activity CLASS
+    # means constructing it above and naming it here, and check_registration()
+    # below refuses to boot if you forget.
+    activities = collect_activities(
+        active_work_act,
+        agent_registry_act,
+        alert_governance_act,
+        alert_act,
+        briefing_act,
+        delivery_act,
+        content_act,
+        intel_act,
+        cleanup_act,
+        llm_governor_act,
+        interaction_act,
+        run_recorder_act,
+        channel_act,
+        calendar_act,
+        gmail_act,
+        drive_act,
+        memory_act,
+        profile_act,
+        people_act,
+        curiosity_act,
+        daylog_act,
+        raindrop_act,
+        rss_act,
+        intel_scan_act,
+        sentry_ingest_act,
+        todoist_act,
+        capture_act,
+        social_act,
+        clarify_act,
+        chat_act,
+        review_act,
+        inventory_act,
+        agent_task_act,
+        infra_ops_act,
+        expiring_items_act,
+        # None when their feature flag is off — collect_activities skips those.
+        homelab_act,
+        money_act,
+    )
 
-    if settings.homelab_enabled and homelab_act is not None:
-        activities += [
-            homelab_act.persist_drifts,
-            homelab_act.resolve_stale_drifts,
-            homelab_act.notify_drift,
-            homelab_act.notify_pr_event,
-            homelab_act.find_undelivered_interactions,
-            homelab_act.notify_undelivered_interactions,
-            homelab_act.check_comms_inbound_health,
-            homelab_act.alert_comms_inbound_down,
-            homelab_act.collect_services,
-            homelab_act.probe_and_upsert_cert,
-            homelab_act.notify_cert_alert,
-            homelab_act.collect_infra_state,
-            homelab_act.read_heartbeat_state,
-            homelab_act.write_heartbeat_state,
-            homelab_act.record_heartbeat_resolved,
-            homelab_act.ping_deadman,
-            homelab_act.get_heartbeat_routing,
-            homelab_act.notify_node_transition,
-        ]
+    # All workflows — flag-gated entries are declared in registry.FLOWS.
+    workflows = workflows_for(settings)
 
-    if money_act:
-        activities += [
-            money_act.store_receipt_email,
-            money_act.load_receipts,
-            money_act.find_stuck_receipts,
-            money_act.classify_and_extract,
-            money_act.upsert_charges,
-            money_act.detect_cancellations,
-            money_act.evaluate_renewal_alerts,
-            money_act.notify_renewal_alert,
-            money_act.notify_cancellation,
-            money_act.build_subscription_digest,
-            money_act.notify_subscription_digest,
-        ]
-
-    # All workflows
-    workflows = [
-        AgentChatReplyFlow,
-        AgentTaskSweepFlow,
-        AgentTaskFlow,
-        AlertInvestigationFlow,
-        CalendarIngestFlow,
-        DailyBriefingFlow,
-        DayLogFlow,
-        CleanupFlow,
-        InteractionFlow,
-        GmailIngestFlow,
-        GitHubAlertFlow,
-        RaindropIngestFlow,
-        RssIngestFlow,
-        DriveSyncFlow,
-        LLMSpendGuardFlow,
-        MemoryReflectionFlow,
-        IntelligenceScanFlow,
-        SentryPollFlow,
-        TodoistSyncFlow,
-        ClarifyFlow,
-        DailyReviewFlow,
-        WeeklyReviewFlow,
-        WorkspaceRepoSyncFlow,
-        SocialPublishFlow,
-        SocialMetricsFlow,
-        CuriosityCardFlow,
-        ExpiryRadarFlow,
-    ]
-
-    if settings.homelab_enabled:
-        workflows += [
-            ServiceDriftFlow,
-            CertRadarFlow,
-            DeliveryWatchdogFlow,
-            InfraHeartbeatFlow,
-        ]
-
-    if settings.money_hygiene_enabled:
-        workflows += [
-            ReceiptIngestFlow,
-            MoneyHygieneDailyFlow,
-            SubscriptionAuditFlow,
-            MoneyProcessFlow,
-        ]
-
-    # Publish final lists to module-level names so tests can inspect them
-    # without running main() (the module-level stubs cover import-time tests;
-    # these updates give integration-level tests the live bound methods).
-    import aegis_worker.__main__ as _self  # noqa: PLW0406 — intentional self-ref
-
-    _self.WORKFLOWS = workflows
-    _self.ACTIVITIES = activities
+    # Fail loudly and early: a flow/activity declared but not fully wired (or
+    # wired but not declared) dies HERE, before the worker accepts any task,
+    # instead of at the first schedule tick hours later.
+    check_registration(
+        settings=settings,
+        workflows=workflows,
+        activities=activities,
+        seed_dir=settings.seed_dir,
+    )
 
     # Sync schedules from activities table
     sync_count = 0

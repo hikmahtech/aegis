@@ -55,9 +55,10 @@ ruff format .     # format (but NOT on core/src/aegis/services/chat.py — see n
   version drift — do **not** run `ruff format` on it (it rewrites the whole
   file). Write already-formatted edits; `ruff check` must still pass.
 - **Adding a flow / chat tool / connector:** the conventions live in
-  [CLAUDE.md](CLAUDE.md) and [docs/development.md](docs/development.md) —
-  they're explicit lists (nothing is auto-discovered), so follow the checklist
-  there.
+  [CLAUDE.md](CLAUDE.md) and [docs/development.md](docs/development.md) — a
+  flow is one `FlowSpec` in `worker/src/aegis_worker/registry.py` plus a seed
+  row, and the worker refuses to boot if the two disagree; chat tools and
+  connectors are still explicit lists. Follow the checklist there.
 
 ## Reporting bugs & requesting features
 
