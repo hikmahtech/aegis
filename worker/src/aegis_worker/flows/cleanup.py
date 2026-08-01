@@ -33,6 +33,10 @@ _DEFAULT_RETENTIONS: dict[str, int] = {
     # injection — unbounded growth otherwise (issue #120).
     "todoist_webhook_events": 60,
     "knowledge_injection_log": 90,
+    # Persona revision log (migration 015): one row per programmatic profile
+    # patch, forever otherwise. A year keeps the audit trail long enough to
+    # answer "when did AEGIS start believing this about me?".
+    "agent_profile_revisions": 365,
     # pandoras_actor.* homelab observation tables — see migration 003.
     "pandoras_actor.homelab_drift": 60,
     "pandoras_actor.backup_health": 60,

@@ -14,7 +14,11 @@ from aegis.services.agents import get_agent as _get_agent
 from aegis.services.agents import list_agents as _list_agents
 from aegis.services.agents import reassign_agent_rows as _reassign_agent_rows
 from aegis.services.agents import update_agent as _update_agent
-from aegis.services.personalities import get_personality, set_personality
+from aegis.services.personalities import (
+    get_personality,
+    list_profile_revisions,
+    set_personality,
+)
 
 router = APIRouter(prefix="/api/agents", dependencies=[Depends(verify_auth)])
 
@@ -44,6 +48,28 @@ async def put_agent_personality(
         raise HTTPException(status_code=404, detail=f"Agent '{agent_id}' not found")
     try:
         return await set_personality(pool, agent_id, body)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+
+
+@admin_router.get("/{agent_id}/personality/revisions")
+async def get_agent_personality_revisions(
+    agent_id: str, request: Request, kind: str | None = None, limit: int = 50
+) -> list[dict[str, Any]]:
+    """Persona revision log for the agent, newest first.
+
+    Every programmatic patch (aegis.services.personalities.apply_profile_patch)
+    records before/after content plus its `source`; hand edits via PUT
+    …/personality do not appear here. Read-only — reverting is service-level
+    only (`revert_profile_revision`), deliberately not exposed as a route.
+
+    This endpoint is intentionally curl/ops-only, no UI consumer.
+    """
+    pool = request.app.state.db_pool
+    if not await _get_agent(pool, agent_id):
+        raise HTTPException(status_code=404, detail=f"Agent '{agent_id}' not found")
+    try:
+        return await list_profile_revisions(pool, agent_id, kind=kind, limit=limit)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
 
