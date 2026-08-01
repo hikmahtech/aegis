@@ -58,6 +58,7 @@ from aegis_worker.flows.calendar_ingest import CalendarIngestFlow
 from aegis_worker.flows.cert_radar import CertRadarFlow
 from aegis_worker.flows.clarify import ClarifyFlow
 from aegis_worker.flows.cleanup import CleanupFlow
+from aegis_worker.flows.curiosity import CuriosityCardFlow
 from aegis_worker.flows.daily_briefing import DailyBriefingFlow
 from aegis_worker.flows.daylog import DayLogFlow
 from aegis_worker.flows.delivery_watchdog import DeliveryWatchdogFlow
@@ -138,6 +139,7 @@ WORKFLOWS: list = [
     WorkspaceRepoSyncFlow,
     SocialPublishFlow,
     SocialMetricsFlow,
+    CuriosityCardFlow,
 ]
 
 ACTIVITIES: list = [
@@ -360,11 +362,15 @@ async def main():
     )
     # Registered but dormant — no flow calls these yet (A1 ships the substrate).
     profile_act = ProfileActivities(db_pool=deps.pool)
-    # Same: A6 ships the gap detector, A7 is the flow that will ask the question.
+    # A6 ships the gap detector; A7 (CuriosityCardFlow) asks the question.
     curiosity_act = CuriosityActivities(
         db_pool=deps.pool,
         llm_client=deps.llm,
         model=model_balanced,
+        # Interaction cards bypass safe_send_message, so CuriosityCardFlow
+        # consults the notification budget itself — same knobs as delivery_act.
+        budget_enabled=getattr(settings, "notification_budget_enabled", False),
+        daily_budget=getattr(settings, "notification_daily_budget", 8),
         # Google lists the calendar owner among an event's attendees, so the
         # owner's own address must never become "a stranger you keep meeting".
         # DB-backed integration config (admin Integrations page), so it takes
@@ -600,6 +606,9 @@ async def main():
         profile_act.read_profile_context,
         profile_act.apply_profile_patch,
         curiosity_act.find_curiosity_gaps,
+        curiosity_act.check_curiosity_budget,
+        curiosity_act.record_curiosity_card,
+        curiosity_act.apply_curiosity_answer,
         daylog_act.gather_day_events,
         daylog_act.distil_daylog,
         daylog_act.commit_daylog_state,
@@ -729,6 +738,7 @@ async def main():
         WorkspaceRepoSyncFlow,
         SocialPublishFlow,
         SocialMetricsFlow,
+        CuriosityCardFlow,
     ]
 
     if settings.homelab_enabled:

@@ -34,6 +34,13 @@ async def clean_db(db_pool):
 
 
 async def _wipe(conn):
+    # Children before parents: finance.renewal_alert / finance.receipt_email
+    # reference recurring_charge with no ON DELETE CASCADE, and the money tests
+    # leave alert rows behind — without this the unqualified delete below raises
+    # ForeignKeyViolationError and errors every test in this file, but only when
+    # those files land on the same xdist worker.
+    await conn.execute("DELETE FROM finance.renewal_alert")
+    await conn.execute("DELETE FROM finance.receipt_email WHERE charge_id IS NOT NULL")
     await conn.execute("DELETE FROM finance.recurring_charge")
     await conn.execute("DELETE FROM agent_memory WHERE agent_id = $1", AGENT)
     await conn.execute("DELETE FROM agent_personalities WHERE agent_id = $1", AGENT)

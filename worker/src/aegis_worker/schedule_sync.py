@@ -22,6 +22,7 @@ from aegis_worker.flows.calendar_ingest import CalendarIngestFlow, CalendarInges
 from aegis_worker.flows.cert_radar import CertRadarConfig, CertRadarFlow
 from aegis_worker.flows.clarify import ClarifyConfig, ClarifyFlow
 from aegis_worker.flows.cleanup import CleanupConfig, CleanupFlow
+from aegis_worker.flows.curiosity import CuriosityCardFlow, CuriosityConfig
 from aegis_worker.flows.daily_briefing import DailyBriefingConfig, DailyBriefingFlow
 from aegis_worker.flows.daylog import DayLogConfig, DayLogFlow
 from aegis_worker.flows.delivery_watchdog import DeliveryWatchdogConfig, DeliveryWatchdogFlow
@@ -83,6 +84,20 @@ _ACTIVITY_TYPE_MAP = {
             agent_id=act["agent_id"],
             day_offset=int(act["config"].get("day_offset", 0)),
             mode=str(act["config"].get("mode", "daily")),
+        ),
+    ),
+    # A7 — one curiosity question per day. aegis_ui_url comes from settings
+    # (not the activity config) because cards.py renders NO button for an
+    # `input` card without it, so a Slack card would otherwise be unanswerable
+    # from Slack.
+    "CuriosityCardFlow": lambda act: (
+        CuriosityCardFlow,
+        CuriosityConfig(
+            agent_id=act["agent_id"],
+            max_per_day=int(act["config"].get("max_per_day", 1)),
+            limit=int(act["config"].get("limit", 5)),
+            timeout_seconds=int(act["config"].get("timeout_seconds", 2 * 86400)),
+            aegis_ui_url=act["_settings"].get("aegis_ui_url", ""),
         ),
     ),
     "CleanupFlow": lambda act: (
