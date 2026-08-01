@@ -95,6 +95,11 @@ them on the row:
   posts authored in the Postiz UI that never went through `social_outbox`. Args:
   `days_back` / `days_ahead` (default 14, max 90) and an optional Postiz `state`
   filter. Granting it to another agent is a DB write to `agents.metadata.tool_set`.
+  The returned `posts` list is a byte-budgeted *sample* (`truncated` says whether
+  rows were dropped); `channels_in_window` is the complete per-channel roll-up,
+  keyed by Postiz `providerIdentifier`, and is what answers "which channels am I
+  posting to?" — channel display names are not unique (dev.to and the personal
+  LinkedIn share one).
 
 ## What it does (target behavior)
 

@@ -12,6 +12,7 @@ import time
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
+from itertools import zip_longest
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -1364,8 +1365,11 @@ CHAT_TOOLS = [
             "description": (
                 "The social-media post timeline from Postiz: what was published, what is "
                 "still queued/scheduled, on which channel, with the live post URL. Use "
-                "when the user asks about posts, the posting schedule, what went out on "
-                "LinkedIn/X/Facebook, or what is lined up next."
+                "when the user asks about posts, the posting schedule, what went out on a "
+                "given channel, or what is lined up next. `posts` is a sample and may be "
+                "partial (`truncated` says so); `channels_in_window` is always the "
+                "COMPLETE per-channel roll-up for the window, keyed by platform — answer "
+                "'which channels am I posting to?' from it, never from `posts`."
             ),
             "parameters": {
                 "type": "object",
@@ -3245,8 +3249,14 @@ _HTML_TAG_RE = re.compile(r"<[^>]+>")
 # the metadata (it then re-calls with narrower windows, hunting for the data
 # that no window will ever produce). Fitting the budget ourselves is the only
 # way to keep the payload; the row count adapts to how long the posts are.
-_SOCIAL_TIMELINE_BUDGET = 3400
+# `posts` is only a SAMPLE, so it can never answer "which channels am I posting
+# to?" — the complete answer is `channels_in_window`, computed over every row
+# before the budget cut. The drop from 3400 to 2900 is what funds it.
+_SOCIAL_TIMELINE_BUDGET = 2900
 _SOCIAL_TIMELINE_TEXT = 140
+# Nominal size of `channels_in_window`; anything beyond it is taken back out of
+# the posts budget so the whole result still clears 4096 bytes.
+_SOCIAL_TIMELINE_SUMMARY_ALLOWANCE = 500
 
 
 async def _exec_social_timeline(pool: asyncpg.Pool, args: dict, ctx: ToolContext) -> str:
@@ -3294,30 +3304,73 @@ async def _exec_social_timeline(pool: asyncpg.Pool, args: dict, ctx: ToolContext
             {
                 "date": str(post.get("publishDate") or "")[:16].replace("T", " "),
                 "state": post_state,
+                # The display name is NOT unique — dev.to and the personal
+                # LinkedIn both come back as the same person's name. Only
+                # providerIdentifier tells the two platforms apart.
+                "platform": integration.get("providerIdentifier"),
                 "channel": integration.get("name"),
                 "text": text[:_SOCIAL_TIMELINE_TEXT],
                 "url": post.get("releaseURL"),
             }
         )
     rows.sort(key=lambda r: r["date"], reverse=True)
+    now_str = now.strftime("%Y-%m-%d %H:%M")
+
+    # Complete per-channel roll-up over EVERY row, built before the byte budget
+    # drops any of them. Channel coverage must not depend on which sample rows
+    # happened to survive truncation.
+    grouped: dict[tuple[str, str], dict] = {}
+    for row in rows:
+        entry = grouped.setdefault(
+            (row["platform"] or "unknown", row["channel"] or "unknown"),
+            {"name": row["channel"], "posts": 0, "queued": 0, "published": 0, "next": None},
+        )
+        entry["posts"] += 1
+        upper = row["state"].upper()
+        if upper == "QUEUE":
+            entry["queued"] += 1
+        elif upper == "PUBLISHED":
+            entry["published"] += 1
+        if row["date"] >= now_str and (entry["next"] is None or row["date"] < entry["next"]):
+            entry["next"] = row["date"]
+    platforms = [platform for platform, _ in grouped]
+    channels = {
+        (platform if platforms.count(platform) == 1 else f"{platform} ({name})"): entry
+        for (platform, name), entry in grouped.items()
+    }
+    channels_json = json.dumps(channels, default=str)
+
+    # Sample nearest-to-now first — alternating soonest-upcoming with
+    # most-recent-past — so a truncated timeline straddles both sides of today
+    # instead of showing only the far future. Display order stays newest-first.
+    future = [r for r in rows if r["date"] >= now_str][::-1]
+    past = [r for r in rows if r["date"] < now_str]
+    budget = _SOCIAL_TIMELINE_BUDGET - max(
+        0, len(channels_json) - _SOCIAL_TIMELINE_SUMMARY_ALLOWANCE
+    )
 
     kept: list[dict] = []
     used = 0
-    for row in rows:
+    for row in [r for pair in zip_longest(future, past) for r in pair if r is not None]:
         size = len(json.dumps(row, default=str))
-        if kept and used + size > _SOCIAL_TIMELINE_BUDGET:
+        if kept and used + size > budget:
             break
         kept.append(row)
         used += size
+    kept.sort(key=lambda r: r["date"], reverse=True)
 
     return json.dumps(
         {
             # `posts` first: if this ever does overflow, the key-order truncator
             # keeps the leading keys, so the data survives and metadata is what
             # gets dropped — the opposite of the failure this budget prevents.
+            # `channels_in_window` is second for the same reason: it is the
+            # complete channel answer and must outrank the metadata.
             "posts": kept,
+            "channels_in_window": channels,
             "count": len(kept),
             "total_in_window": len(rows),
+            "truncated": len(kept) < len(rows),
             "window": {"days_back": days_back, "days_ahead": days_ahead, "state": state or None},
         },
         default=str,
