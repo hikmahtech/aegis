@@ -141,6 +141,62 @@ DB owns the channels, so UI edits, deactivations, and operator-added channels
 (e.g. a new Gmail account) survive Core restarts. Email channels additionally need
 the account authorized via the Google accounts re-auth flow (Flows page).
 
+### MCP servers (external tool servers)
+
+AEGIS can call tools on external [MCP](https://modelcontextprotocol.io) servers.
+The subsystem is **off by default** and fails closed — an MCP server is a remote
+party that defines and executes tools, so nothing is contacted until you opt in:
+
+1. Turn on **MCP client (external tool servers)** under Integrations → Features
+   (`settings.mcp_enabled`). Off ⇒ every `/api/mcp` call returns 503 and no
+   socket is ever opened, whatever `AEGIS_MCP_SERVERS` says.
+2. Declare the servers in the env-only `AEGIS_MCP_SERVERS` JSON
+   (`Settings.mcp_servers`) and restart Core:
+
+   ```jsonc
+   {
+     "docs": {
+       "transport": "streamable-http",   // the only supported transport
+       "url": "https://mcp.example.com/mcp",
+       "auth_token": "…",                 // sent as `Authorization: Bearer …`
+       "timeout_s": 30,                   // total budget per call, max 120
+       "max_response_bytes": 1000000      // hard cap, max 8 MB
+     }
+   }
+   ```
+
+   `auth_token` is optional, but **declaring it and leaving it blank rejects the
+   server** rather than connecting anonymously. Omit the key entirely for an
+   unauthenticated server on your own network.
+
+   **`transport: "stdio"` is deliberately unsupported.** stdio MCP spawns a
+   local process per server — arbitrary local code execution driven by config —
+   so such an entry is rejected with an explicit error instead of being ignored.
+
+A malformed entry does not stop Core from booting: it is logged at ERROR
+(`mcp_server_config_rejected`), reported by `GET /api/mcp` as
+`{"usable": false, "error": …}`, and any call to it fails immediately with that
+reason. Other servers are unaffected.
+
+Endpoints (all `Depends(verify_auth)`, route `core/src/aegis/api/routes/mcp.py`):
+
+| Endpoint | Purpose |
+|---|---|
+| `GET /api/mcp` | configured servers + config health (never the token) |
+| `GET /api/mcp/{server}/tools` | the server's tool list — discovery only |
+| `POST /api/mcp/{server}/{tool}` | run one tool, JSON body = its arguments |
+
+Failure isolation (`core/src/aegis/mcp_manager.py`): connect timeout, read
+timeout, a total per-call budget, a response byte cap enforced from the
+`Content-Length` *and* while streaming, no redirect following (an unfollowed
+redirect is an error, so the `Authorization` header is never replayed at a host
+the server picks), and a typed exception for every failure mode. A transport
+failure resets the session so the next call re-initialises instead of wedging.
+
+**Enabling the client does not let any agent call these tools** — exposing MCP
+tools to chat agents, with per-agent server allow-lists and audit logging, is a
+separate piece of work (B9).
+
 ### Authentication (required for non-proxied deployments)
 
 If your deployment is **NOT** behind an authenticating proxy (Cloudflare Access, an

@@ -165,7 +165,12 @@ async def lifespan(app: FastAPI):
     )
     app.state.remote_script_connector = remote_script_connector
 
-    mcp_manager = MCPManager(server_configs=settings.mcp_servers or {})
+    # MCP client for external tool servers. Constructing it contacts nothing;
+    # a bad server entry is rejected + logged at ERROR here (never a silent
+    # None downstream — issue #205) and connections happen lazily on first use.
+    mcp_manager = MCPManager(
+        server_configs=settings.mcp_servers or {}, enabled=settings.mcp_enabled
+    )
     app.state.mcp_manager = mcp_manager
     app.state.settings = settings
 

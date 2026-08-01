@@ -238,7 +238,14 @@ class Settings(BaseSettings):
     # owner's personal data store.
     life_webhook_secret: str = ""  # X-Aegis-Signature + X-Aegis-Timestamp
 
-    # MCP
+    # MCP — client for EXTERNAL tool servers. Off by default: an MCP server is
+    # a remote party that defines and executes tools, so the subsystem stays
+    # closed until an operator explicitly opens it. Off = no server is ever
+    # contacted, whatever mcp_servers says.
+    mcp_enabled: bool = False
+    # {"<name>": {"transport": "streamable-http", "url": "https://…/mcp",
+    #             "auth_token": "…", "timeout_s": 30, "max_response_bytes": …}}
+    # stdio is deliberately unsupported (it would spawn local processes).
     mcp_servers: dict = {}
 
     # Worker -> Core API

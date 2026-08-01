@@ -22,14 +22,15 @@ resources:
       4. Escalate via InteractionFlow if root cause unclear after 5 minutes.
     tags: [homelab, restart, pandoras-actor]
 
+  # Documentation only — the MCP client reads AEGIS_MCP_SERVERS (Settings.
+  # mcp_servers), never this table. Only the streamable-http transport is
+  # supported; a stdio entry is rejected because it would spawn a local process.
   - kind: mcp_server
     slug: example-mcp
-    title: Example MCP server (placeholder — replace with real one before Phase 5)
+    title: Example MCP server (placeholder — replace with a real one)
     metadata:
-      transport: stdio
-      command: /usr/local/bin/example-mcp
-      args: []
-      env_keys: []
+      transport: streamable-http
+      url: https://mcp.example.invalid/mcp
     tags: [mcp, placeholder]
 
   # Code repositories (kind: repository) are NOT seeded here — they are owned
