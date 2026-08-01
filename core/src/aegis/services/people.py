@@ -15,6 +15,8 @@ a user problem to fix in the UI, not a heuristic to guess at.
 
 from __future__ import annotations
 
+import datetime as dt
+import re
 from typing import Any
 from uuid import UUID
 
@@ -147,3 +149,153 @@ async def delete_person(pool: asyncpg.Pool, person_id: UUID | str) -> bool:
     """Delete by id. Returns False (no exception) when the row didn't exist."""
     result = await pool.execute("DELETE FROM life.people WHERE id = $1", person_id)
     return result != "DELETE 0"
+
+
+# ─────────────────────────── passive enrichment (C2) ───────────────────────────
+#
+# Email and calendar are harvested for WHO the owner is in contact with. That
+# means writing information about real third parties, so the filters below are
+# deliberately blunt: it is far better to miss a human than to fill the registry
+# with `noreply@` senders or with the owner themselves.
+
+_ADDR_RE = re.compile(r"<([^>]+)>")
+_EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
+# Local parts that ARE the whole address (`support@…`, `billing@…`) — a role
+# mailbox, not a person. Exact match only: `sanjeev.info@` is a human.
+_ROLE_LOCALPARTS = frozenset(
+    {
+        "admin", "alert", "alerts", "billing", "bounce", "bounces", "care",
+        "contact", "customercare", "daemon", "help", "hello", "info", "invoice",
+        "invoices", "mail", "mailer", "mailer-daemon", "marketing", "news",
+        "newsletter", "notification", "notifications", "notify", "postmaster",
+        "receipts", "reply", "root", "sales", "service", "support", "team",
+        "updates", "webmaster",
+    }
+)
+# Unmistakable machine markers — matched anywhere in the local part, because
+# senders bolt ids onto them (`no-reply-1a2b@`, `bounces+xyz@`).
+_MACHINE_MARKERS = (
+    "noreply", "no-reply", "no_reply", "donotreply", "do-not-reply",
+    "do_not_reply", "mailer-daemon", "bounce", "notification", "automated",
+    "auto-confirm", "unsubscribe",
+)
+# Google's room/resource/shared-calendar pseudo-attendees. These land in an
+# event's `attendees` exactly like a person does.
+_MACHINE_DOMAIN_SUFFIXES = (
+    "calendar.google.com",
+    "resource.calendar.google.com",
+    "group.calendar.google.com",
+)
+
+
+def parse_contact(raw: str) -> tuple[str, str]:
+    """Split a `"Display Name" <a@b.com>` header into (email, display_name).
+
+    Mirrors `aegis_worker.activities.gmail._normalize_sender` for the address
+    half — the email comes back lowercased so it is ready for `normalize_aliases`
+    and for the `aliases @> ARRAY[$1]` containment probe `find_people` uses.
+    """
+    raw = (raw or "").strip()
+    if not raw:
+        return "", ""
+    m = _ADDR_RE.search(raw)
+    if m:
+        email = m.group(1).strip().lower()
+        name = raw[: m.start()].strip().strip('"').strip()
+    else:
+        email, name = raw.lower(), ""
+    return email, name
+
+
+def is_probably_human(email: str) -> bool:
+    """False for role mailboxes, machine senders and calendar resources."""
+    email = (email or "").strip().lower()
+    if not _EMAIL_RE.match(email):
+        return False
+    local, _, domain = email.partition("@")
+    if any(domain == s or domain.endswith("." + s) for s in _MACHINE_DOMAIN_SUFFIXES):
+        return False
+    # Strip the plus-address tag before the role-mailbox comparison.
+    base = local.split("+", 1)[0]
+    if base in _ROLE_LOCALPARTS:
+        return False
+    return not any(marker in local for marker in _MACHINE_MARKERS)
+
+
+def name_from_email(email: str) -> str:
+    """`john.doe@x.com` → `John Doe`. Only used when nothing better exists."""
+    local = (email or "").split("@")[0].split("+", 1)[0]
+    words = [w for w in re.split(r"[._\-]+", local) if w]
+    return " ".join(w.capitalize() for w in words) or email
+
+
+async def record_contact(
+    pool: asyncpg.Pool,
+    email: str,
+    display_name: str = "",
+    contact_at: dt.datetime | None = None,
+    *,
+    allow_create: bool = False,
+    owner_emails: frozenset[str] | set[str] = frozenset(),
+    source: str = "",
+) -> str:
+    """Fold one observed contact into `life.people`. Returns the outcome tag.
+
+    Outcomes: `skipped_invalid`, `skipped_non_human`, `skipped_owner`,
+    `skipped_ambiguous`, `no_match` (nobody matched and creating was not
+    allowed), `updated`, `created`.
+
+    Matching is exact, never fuzzy (the C1 rule — two rows for one human is a
+    user problem, silently merging two humans is a data-loss bug):
+      1. the address as an alias, then
+      2. the display name as the person's `name`, and only when it resolves to
+         exactly ONE row — that is the enrichment that matters, because it
+         teaches an address to a person the user entered by hand.
+    Every alias written goes through `normalize_aliases`; skipping it would make
+    the new alias invisible to `find_people`'s containment probe.
+    """
+    email = (email or "").strip().lower()
+    if not _EMAIL_RE.match(email):
+        return "skipped_invalid"
+    if email in {o.strip().lower() for o in owner_emails}:
+        # The owner is not a contact. Google puts the calendar owner in every
+        # event's attendees, so without this the registry grows a row for the
+        # user themselves on the very first run.
+        return "skipped_owner"
+    if not is_probably_human(email):
+        return "skipped_non_human"
+
+    display_name = (display_name or "").strip()
+    matches = await find_people(pool, email)
+    if not matches and display_name:
+        matches = await find_people(pool, display_name)
+    if len(matches) > 1:
+        return "skipped_ambiguous"
+
+    if matches:
+        person = matches[0]
+        patch: dict[str, Any] = {}
+        aliases = normalize_aliases([*(person.get("aliases") or []), email])
+        if aliases != list(person.get("aliases") or []):
+            patch["aliases"] = aliases
+        last = person.get("last_contact")
+        if contact_at and (last is None or contact_at > last):
+            patch["last_contact"] = contact_at
+        if patch:
+            await update_person(pool, person["id"], patch)
+        return "updated"
+
+    if not allow_create:
+        return "no_match"
+
+    await create_person(
+        pool,
+        {
+            "name": display_name or name_from_email(email),
+            "aliases": [email],
+            "last_contact": contact_at,
+            "metadata": {"source": source} if source else {},
+        },
+    )
+    return "created"

@@ -43,6 +43,7 @@ from aegis_worker.activities.inventory import InventoryActivities
 from aegis_worker.activities.llm_governor import LLMGovernorActivities
 from aegis_worker.activities.memory import MemoryActivities
 from aegis_worker.activities.money import MoneyActivities, parse_bank_alert_senders
+from aegis_worker.activities.people import PeopleActivities
 from aegis_worker.activities.profile import ProfileActivities
 from aegis_worker.activities.raindrop import RaindropActivities
 from aegis_worker.activities.review import ReviewActivities
@@ -368,6 +369,18 @@ async def main():
     )
     # Registered but dormant — no flow calls these yet (A1 ships the substrate).
     profile_act = ProfileActivities(db_pool=deps.pool)
+    # C2 — passive people enrichment off email/calendar. Ships dark; email only
+    # ever enriches an existing person, and the calendar (creating) lane refuses
+    # while owner_emails is empty rather than minting a row for the user.
+    people_act = PeopleActivities(
+        db_pool=deps.pool,
+        enabled=getattr(settings, "people_enrichment_enabled", False),
+        owner_emails=frozenset(
+            e.strip()
+            for e in (getattr(settings, "owner_emails", "") or "").split(",")
+            if e.strip()
+        ),
+    )
     # A6 ships the gap detector; A7 (CuriosityCardFlow) asks the question.
     curiosity_act = CuriosityActivities(
         db_pool=deps.pool,
@@ -612,6 +625,8 @@ async def main():
         memory_act.consolidate_agent_memories,
         profile_act.read_profile_context,
         profile_act.apply_profile_patch,
+        people_act.enrich_people_from_email,
+        people_act.enrich_people_from_events,
         curiosity_act.find_curiosity_gaps,
         curiosity_act.check_curiosity_budget,
         curiosity_act.record_curiosity_card,

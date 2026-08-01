@@ -305,6 +305,25 @@ class GmailIngestFlow:
         except Exception:
             pass
 
+        # C2: fold the sender into life.people so "when did I last talk to X?"
+        # has an answer. Runs for every category, not just the important ones —
+        # a quiet note from a friend is exactly the contact worth remembering.
+        # Enriches only (it never creates a person) and is inert until
+        # `people_enrichment_enabled` is on. Fire-and-forget.
+        try:
+            await workflow.execute_activity(
+                "enrich_people_from_email",
+                args=[msg],
+                start_to_close_timeout=TIMEOUT_FAST,
+                retry_policy=NO_RETRY,
+            )
+        except Exception as exc:
+            workflow.logger.warning(
+                "gmail_people_enrichment_failed msg_id=%s err=%s",
+                msg.get("id", ""),
+                str(exc)[:200],
+            )
+
         # Important emails (action + read) land in the knowledge graph
         # so Raphael's search/ask tools can recall them later. Fire-and-
         # forget — ingest failures don't block the route's primary action.

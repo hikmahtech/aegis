@@ -110,6 +110,22 @@ class CalendarIngestFlow:
                         str(exc)[:200],
                     )
 
+            # C2: attendees of small upcoming meetings become life.people rows.
+            # Inert until `people_enrichment_enabled` is on, and refuses outright
+            # while `owner_emails` is unset (Google lists the calendar owner
+            # among the attendees). Fire-and-forget — never blocks ingest.
+            try:
+                await workflow.execute_activity(
+                    "enrich_people_from_events",
+                    result.events,
+                    start_to_close_timeout=_ACT_TIMEOUT,
+                    retry_policy=NO_RETRY,
+                )
+            except Exception as exc:
+                workflow.logger.warning(
+                    "calendar_people_enrichment_failed label=%s err=%s", label, str(exc)[:200]
+                )
+
             content_items = await workflow.execute_activity(
                 "events_to_content",
                 result.events,
