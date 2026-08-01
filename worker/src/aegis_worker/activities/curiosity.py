@@ -9,7 +9,8 @@ has ever been told (its memories and its persona docs).
                   and is never mentioned in chat_history / agent_memory / profile
   (b) finance   — an active `finance.recurring_charge` whose vendor is never
                   mentioned in agent_memory / profile
-  (c) todoist   — a project carrying real task volume with no profile context
+  (c) todoist   — a project carrying real OPEN task volume with no profile
+                  context (a finished project is not a gap)
 
 Each detector is independently try/excepted: a broken one costs its own
 candidates, never the run. `novelty_key` (`attendee:<email>`, `charge:<vendor>`,
@@ -53,6 +54,11 @@ class CuriosityActivities:
     # what "recurring" and "frequently hit" mean without editing the detector.
     min_attendee_events: int = 3
     min_project_tasks: int = 5
+    # The operator's own email addresses (Settings.owner_emails — the DB-backed
+    # `owner_emails` integration config). Google puts the calendar owner in
+    # every event's `attendees`, so without this the owner is a "stranger you
+    # keep meeting". Empty (unconfigured) = no exclusion, same as before.
+    owner_emails: frozenset[str] = frozenset()
 
     @activity.defn
     async def find_curiosity_gaps(self, agent_id: str = "sebas", limit: int = 5) -> list[dict]:
@@ -147,8 +153,16 @@ class CuriosityActivities:
                 for email in _EMAIL_RE.findall(line):
                     seen.setdefault(email.lower(), set()).add(r["content_id"])
 
+        # Normalized here so the match is case-insensitive however the operator
+        # typed the config, and applied here (not at ingest) so events already
+        # in the knowledge store are covered too.
+        owners = {o.strip().lower() for o in self.owner_emails}
+
         out: list[tuple[float, dict]] = []
         for email, events in seen.items():
+            # The owner attends their own meetings — never a gap.
+            if email in owners:
+                continue
             if len(events) < self.min_attendee_events:
                 continue
             local = email.split("@")[0]
@@ -214,7 +228,7 @@ class CuriosityActivities:
         rows = await self.db_pool.fetch(
             "SELECT p.name, COUNT(t.id) AS tasks FROM todoist_projects p "
             "JOIN todoist_tasks t ON t.project_id = p.id "
-            "WHERE p.is_archived = FALSE "
+            "WHERE p.is_archived = FALSE AND t.is_completed = FALSE "
             "GROUP BY p.name HAVING COUNT(t.id) >= $1 "
             "ORDER BY COUNT(t.id) DESC LIMIT 20",
             self.min_project_tasks,

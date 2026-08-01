@@ -357,6 +357,15 @@ async def main():
         db_pool=deps.pool,
         llm_client=deps.llm,
         model=model_balanced,
+        # Google lists the calendar owner among an event's attendees, so the
+        # owner's own address must never become "a stranger you keep meeting".
+        # DB-backed integration config (admin Integrations page), so it takes
+        # effect on a worker restart with no redeploy. Blank = no exclusion.
+        owner_emails=frozenset(
+            e.strip()
+            for e in (getattr(settings, "owner_emails", "") or "").split(",")
+            if e.strip()
+        ),
     )
     raindrop_act = RaindropActivities(
         raindrop_api_token=getattr(settings, "raindrop_api_token", ""),

@@ -95,6 +95,15 @@ async def test_infra_cluster_and_bank_alert_senders_overlay(clean_int):
     assert s.bank_alert_senders == "axisbank.com, hdfcbank.net"
 
 
+async def test_owner_emails_overlay_from_db(clean_int):
+    """owner_emails is registry-backed: settable from the admin UI with no
+    redeploy, and a blank DB row keeps whatever the env had."""
+    s = _settings(owner_emails="")
+    await save_integration(clean_int, s, "owner_emails", "me@hikmah.com, me@work.io")
+    await apply_config_overrides(s, clean_int)
+    assert s.owner_emails == "me@hikmah.com, me@work.io"
+
+
 async def test_infra_cluster_empty_db_value_keeps_env(clean_int):
     s = _settings(infra_cluster="env-cluster")
     await save_integration(clean_int, s, "infra_cluster", "")

@@ -201,6 +201,74 @@ async def test_attendee_mentioned_in_chat_history_is_not_a_gap(clean_db):
     assert await _run(clean_db) == []
 
 
+# ------------------------------------------------------- owner-email exclusion
+
+
+async def test_owner_email_is_never_a_curiosity_gap(clean_db):
+    """Google lists the calendar owner in `attendees` — don't ask who they are."""
+    for i in range(4):
+        await _add_calendar_event(
+            clean_db, f"ev-{i}", "arshad@hikmah.com, nadia@example.com"
+        )
+
+    out = await _run(clean_db, owner_emails=frozenset({"arshad@hikmah.com"}))
+
+    assert [c["novelty_key"] for c in out] == ["attendee:nadia@example.com"]
+
+
+async def test_owner_email_match_is_case_and_whitespace_insensitive(clean_db):
+    """However the operator typed it into the admin UI, it must still match.
+
+    Event says `Arshad@Hikmah.COM`; the config value is padded and capitalised
+    differently. Both sides are normalized before comparison.
+    """
+    for i in range(4):
+        await _add_calendar_event(
+            clean_db, f"ev-{i}", "Arshad@Hikmah.COM, nadia@example.com"
+        )
+
+    out = await _run(clean_db, owner_emails=frozenset({"  ARSHAD@hikmah.Com  "}))
+
+    assert [c["novelty_key"] for c in out] == ["attendee:nadia@example.com"]
+
+
+async def test_unset_owner_emails_excludes_nobody(clean_db):
+    """Unconfigured => previous behaviour, no exclusion and no exception."""
+    for i in range(3):
+        await _add_calendar_event(clean_db, f"ev-{i}", "nadia@example.com")
+
+    out = await _run(clean_db)  # owner_emails defaults to frozenset()
+
+    assert [c["novelty_key"] for c in out] == ["attendee:nadia@example.com"]
+
+
+def test_owner_emails_are_wired_from_settings_into_the_worker():
+    """The dataclass field is useless unless main() actually fills it.
+
+    Must read Settings.owner_emails — the DB-backed integration config — so a
+    value set in the admin UI reaches the detector without a redeploy.
+    """
+    import inspect
+
+    import aegis_worker.__main__ as m
+
+    src = inspect.getsource(m.main)
+    assert "owner_emails=frozenset(" in src
+    assert 'getattr(settings, "owner_emails", "")' in src
+
+
+def test_owner_emails_is_a_db_backed_integration_config_key():
+    """Env-only would need a redeploy to change — it must be in the registry."""
+    from aegis.config import Settings
+    from aegis.services.integrations_config import CONFIG_REGISTRY
+
+    spec = next((c for c in CONFIG_REGISTRY if c.key == "owner_emails"), None)
+    assert spec is not None, "owner_emails is not in CONFIG_REGISTRY (not admin-settable)"
+    assert not spec.secret and not spec.boolean
+    # apply_config_overrides only overlays keys that exist on Settings.
+    assert Settings.model_fields["owner_emails"].default == ""
+
+
 async def test_busy_todoist_project_with_no_profile_context_is_a_gap(clean_db):
     await clean_db.execute(
         "INSERT INTO todoist_projects (id, name, is_archived) VALUES ('p1', 'Sabaki', FALSE)"
@@ -216,6 +284,49 @@ async def test_busy_todoist_project_with_no_profile_context_is_a_gap(clean_db):
 
     assert [c["novelty_key"] for c in out] == ["project:sabaki"]
     assert out[0]["evidence"] == {"tasks": 5}
+
+
+async def test_finished_project_is_not_a_gap(clean_db):
+    """A project whose tasks are all done doesn't 'carry' anything."""
+    await clean_db.execute(
+        "INSERT INTO todoist_projects (id, name, is_archived) VALUES ('p1', 'Sabaki', FALSE)"
+    )
+    for i in range(8):
+        await clean_db.execute(
+            "INSERT INTO todoist_tasks (id, project_id, content, is_completed) "
+            "VALUES ($1, 'p1', $2, TRUE)",
+            f"t{i}",
+            f"done {i}",
+        )
+
+    assert await _run(clean_db) == []
+
+
+async def test_project_task_count_excludes_completed_tasks(clean_db):
+    """The evidence number must be OPEN tasks, not lifetime task volume."""
+    await clean_db.execute(
+        "INSERT INTO todoist_projects (id, name, is_archived) VALUES ('p1', 'Sabaki', FALSE)"
+    )
+    for i in range(5):
+        await clean_db.execute(
+            "INSERT INTO todoist_tasks (id, project_id, content, is_completed) "
+            "VALUES ($1, 'p1', $2, FALSE)",
+            f"open-{i}",
+            f"task {i}",
+        )
+    for i in range(20):
+        await clean_db.execute(
+            "INSERT INTO todoist_tasks (id, project_id, content, is_completed) "
+            "VALUES ($1, 'p1', $2, TRUE)",
+            f"done-{i}",
+            f"done {i}",
+        )
+
+    out = await _run(clean_db)
+
+    assert [c["novelty_key"] for c in out] == ["project:sabaki"]
+    assert out[0]["evidence"] == {"tasks": 5}
+    assert "5 of your tasks" in out[0]["question"]
 
 
 async def test_broken_detector_does_not_kill_the_run(clean_db, monkeypatch):

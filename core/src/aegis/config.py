@@ -162,6 +162,11 @@ class Settings(BaseSettings):
     infra_cluster: str = ""
     infra_heartbeat_ping_url: str = ""  # healthchecks.io dead-man URL ("" = off)
     slack_owner_member_id: str = ""  # Slack member id for escalation @-mentions ("" = no mention)
+    # Your own email addresses (comma-separated, matched case-insensitively).
+    # Google lists the calendar owner among an event's attendees, so without
+    # this the curiosity gap-finder can ask you who you are. Empty = no
+    # exclusion. Editable from the admin Integrations page.
+    owner_emails: str = ""
     # Bank / card-alert sender domains (comma-separated, case-insensitive
     # substring match). Deterministic guard in Money Hygiene that stops bank
     # statements / autopay reminders from minting fake recurring charges.
