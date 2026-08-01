@@ -180,6 +180,61 @@ prunes per table, so a shorter window for location alone is not expressible
 today; the mitigation is that what survives a year is a coarse presence
 timeline of names the owner chose, not a track.
 
+### `health` — Apple Health Auto Export
+
+`source=health` accepts the JSON [Health Auto Export](https://www.healthyapps.dev)
+posts (`{"data": {"metrics": [{"name", "units", "data": [{"date", "qty"|…}]}]}}`)
+and stores **five** metrics. Everything else HealthKit offers is counted and
+dropped.
+
+| Health Auto Export metric | Stored as | Notes |
+|---|---|---|
+| `sleep_analysis` | `sleep_minutes` | `totalSleep` (else `asleep`/`inBed`); hours → minutes |
+| `heart_rate_variability` | `hrv_ms` | |
+| `resting_heart_rate` | `resting_hr` | |
+| `step_count` | `steps` | |
+| `active_energy` | `active_energy_kcal` | kJ → kcal when the phone exports kJ |
+
+Widening that list is a deliberate edit to `_METRIC_ALLOWLIST`
+(`core/src/aegis/services/health.py`). It is short on purpose: a store of every
+HealthKit sample the phone holds — glucose, cycle, blood oxygen, ECG — is a
+liability that grows on its own, and nothing in AEGIS reads it.
+
+**Set up the automation like this**, or the push will be refused:
+
+- **Selected metrics:** the five above and nothing else.
+- **Aggregation:** daily, over *completed* days (yesterday, or the last 7 days).
+- **Not** per-sample export of a wide window: 64 KiB is the body cap on every
+  life source and it is a security control, not a tuning knob. Five metrics ×
+  daily × 30 days is ~18 KiB and fits easily; five metrics × hourly × 7 days is
+  ~100 KiB and gets a `413 body_too_large`. Narrow the export, don't raise the
+  cap. A single push also processes at most 500 samples and reports
+  `"truncated": true` if it had more.
+- Aggregate *completed* days because the first write for a given (metric,
+  instant) wins: steps exported at noon and again at midnight share the day's
+  timestamp, and the noon figure is the one kept.
+
+Every sample is deduplicated on `(source='health', metric, instant-in-UTC)`, so
+a re-export of an overlapping window — which Health Auto Export does by design
+whenever the phone has been offline — writes only the genuinely new samples.
+The 202 response reports `{"stored", "duplicate", "skipped", "truncated"}`.
+A malformed envelope (no `metrics` list) is a `422` and releases its
+idempotency claim so the same batch id can be retried once the export is fixed.
+
+**No value is ever logged.** Log lines from this lane carry counts only, never
+a metric name or a reading, and the per-sample device name Health Auto Export
+attaches is not stored. The one place a health value is rendered is the daily
+briefing's *Health* line — the newest reading of each metric, dropped once it
+is more than 36 hours old — which goes to the owner's own channel.
+
+Ingest is inline, like `location`: a Temporal workflow argument is persisted
+verbatim in workflow history, and handing a health batch to a flow would copy
+body data into a second store with its own retention and its own web UI.
+
+Retention: 365 days by `observed_at`, shared with the rest of
+`life.observations`. `CleanupFlow` prunes per table, so a shorter window for
+health alone is not expressible today.
+
 ### Infra heartbeat & escalation
 
 `InfraHeartbeatFlow` (schedule `infra-heartbeat-2m`, gated by `homelab_enabled`) polls

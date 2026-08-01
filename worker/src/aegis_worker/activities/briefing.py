@@ -8,6 +8,7 @@ from html import escape as _esc
 from typing import Any
 
 import httpx
+from aegis.services.health import HEALTH_SOURCE
 from temporalio import activity
 
 # How old `settings.current_place` (written by the location webhook, B5) may
@@ -15,6 +16,11 @@ from temporalio import activity
 # offline, or the push has broken — and announcing a place the owner left two
 # days ago is worse than announcing none.
 _PLACE_STALE_HOURS = 12
+
+# How old a health reading (B6) may be and still lead the morning briefing.
+# Health Auto Export runs once a day, so 36h tolerates a late or skipped run
+# while still refusing to report last week's resting heart rate as today's.
+_HEALTH_STALE_HOURS = 36
 
 
 def _within_hours(ts_raw: Any, cutoff: datetime) -> bool:
@@ -386,6 +392,26 @@ class BriefingActivities:
             except Exception as exc:
                 activity.logger.warning("briefing_place_failed err=%s", str(exc)[:200])
 
+        # health: the newest reading of each metric the health push writes
+        # (B6). This is the ONE place a health value is ever rendered — it goes
+        # to the owner's own channel, never to a log line. Deliberately outside
+        # the `quiet` test below: a daily export always lands, so counting it
+        # as news would mean no briefing is ever quiet again.
+        health: dict = {}
+        if self.db_pool:
+            try:
+                hrows = await self.db_pool.fetch(
+                    "SELECT DISTINCT ON (metric) metric, value::float8 AS value "
+                    "FROM life.observations "
+                    "WHERE source = $1 AND observed_at >= $2 "
+                    "ORDER BY metric, observed_at DESC",
+                    HEALTH_SOURCE,
+                    now - timedelta(hours=_HEALTH_STALE_HOURS),
+                )
+                health = {r["metric"]: r["value"] for r in hrows if r["value"] is not None}
+            except Exception as exc:
+                activity.logger.warning("briefing_health_failed err=%s", str(exc)[:200])
+
         quiet = not (intel_out or collected_out or failed_runs or new_drift or new_cal_ids)
         new_state = {
             "last_briefing_at": now.isoformat(),
@@ -400,6 +426,7 @@ class BriefingActivities:
             "broke": {"failed_runs": failed_runs, "new_drift": new_drift},
             "calendar": {"today": cal_today, "new_ids": new_cal_ids},
             "place": place,
+            "health": health,
             "_new_state": new_state,
         }
 
@@ -464,6 +491,11 @@ class BriefingActivities:
         if place:
             lines.append("<b>Location</b>")
             lines.append(f"  • last seen at {_esc(str(place))}")
+        health = changes.get("health") or {}
+        if health:
+            lines.append("<b>Health</b>")
+            for metric in sorted(health):
+                lines.append(f"  • {_esc(str(metric))}: {round(float(health[metric]), 1)}")
         return "\n".join(lines) if lines else "\U0001f7e2 Quiet overnight — nothing needs you."
 
     def _format_failure_block(self, changes: dict) -> str:

@@ -206,3 +206,69 @@ async def test_garbage_current_place_never_kills_the_briefing(db_pool, _seeded, 
     assert any(
         r["workflow_type"] == "RaindropIngestFlow" for r in out["broke"]["failed_runs"]
     )
+
+
+# ---------------------------------------------------------------------------
+# Health dimension (B6) — the newest reading of each metric the health push
+# writes. As above, every assertion uses a literal age, not the production
+# staleness constant. Rows are scoped by `source='health'`, which only the B6
+# lane ever writes.
+# ---------------------------------------------------------------------------
+
+
+async def _set_health(pool, metric, value, age_hours) -> None:
+    """One health observation `age_hours` old, shaped the way ingest writes it."""
+    observed_at = datetime.now(UTC) - timedelta(hours=age_hours)
+    async with pool.acquire() as conn:
+        await conn.execute("DELETE FROM life.observations WHERE source = 'health'")
+        await conn.execute(
+            "INSERT INTO life.observations (source, metric, value, observed_at, external_id) "
+            "VALUES ('health', $1, $2, $3, $4)",
+            metric,
+            value,
+            observed_at,
+            f"zzb6b-{observed_at.isoformat()}",
+        )
+
+
+@pytest.mark.asyncio
+async def test_a_fresh_health_reading_surfaces_in_the_briefing(db_pool, _seeded):
+    await _set_health(db_pool, "resting_hr", 54, age_hours=6)
+    act = BriefingActivities(db_pool=db_pool, knowledge_connector=_kc())
+    out = await act.gather_briefing_changes()
+    assert out["health"] == {"resting_hr": 54.0}
+    assert "resting_hr: 54" in act._format_changes_fallback(out)
+
+
+@pytest.mark.asyncio
+async def test_a_health_reading_from_last_week_is_not_reported_as_today(db_pool, _seeded):
+    await _set_health(db_pool, "resting_hr", 54, age_hours=24 * 7)
+    act = BriefingActivities(db_pool=db_pool, knowledge_connector=_kc())
+    out = await act.gather_briefing_changes()
+    assert out["health"] == {}
+    assert "resting_hr" not in act._format_changes_fallback(out)
+
+
+@pytest.mark.asyncio
+async def test_only_the_newest_reading_of_each_metric_is_reported(db_pool, _seeded):
+    """A push writes one row per sample, so the window holds several of each."""
+    await _set_health(db_pool, "steps", 1, age_hours=30)  # clears, then seeds
+    async with db_pool.acquire() as conn:
+        for metric, value, age in (
+            ("steps", 8421, 4),
+            ("resting_hr", 61, 20),
+            ("resting_hr", 54, 5),
+        ):
+            observed_at = datetime.now(UTC) - timedelta(hours=age)
+            await conn.execute(
+                "INSERT INTO life.observations "
+                "(source, metric, value, observed_at, external_id) "
+                "VALUES ('health', $1, $2, $3, $4)",
+                metric,
+                value,
+                observed_at,
+                f"zzb6b-{metric}-{observed_at.isoformat()}",
+            )
+    act = BriefingActivities(db_pool=db_pool, knowledge_connector=_kc())
+    out = await act.gather_briefing_changes()
+    assert out["health"] == {"steps": 8421.0, "resting_hr": 54.0}

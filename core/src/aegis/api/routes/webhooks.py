@@ -30,6 +30,7 @@ from aegis.clarify_note import AGENT_REPLY_PREFIX, CLARIFY_NOTE_PREFIX
 from aegis.config import Settings
 from aegis.observability import log_audit
 from aegis.services.agents import resolve_tag
+from aegis.services.health import record_health_push
 from aegis.services.observations import record_observation
 from aegis.services.places import record_location_push
 
@@ -97,9 +98,15 @@ def _safe_json(body: bytes) -> dict:
 # copy the owner's coordinates into a second store (and write a `workflow_runs`
 # row per ping — a phone pushing every 5 minutes is ~290 workflow executions a
 # day) in order to durably retry what is one haversine and one INSERT.
+#
+# `health` (B6) is inline for the same reason, and more strongly: a Health Auto
+# Export batch is the owner's body data, and Temporal history keeps a flow
+# argument verbatim, with its own retention and its own web UI. The B6 note
+# asked for a `HealthIngestFlow`; that would have been the second copy.
 LIFE_SOURCES: dict[str, str | None] = {
     "observation": None,
     "location": None,
+    "health": None,
 }
 
 # Maximum accepted body. A phone/watch push is a few hundred bytes; 64 KiB is
@@ -271,6 +278,7 @@ async def life_webhook(
         # POST /api/admin/capture (kind="life_fact") already owns that lane and
         # a second door to the same room is a second thing to get wrong.
         meta = payload.get("metadata")
+        health: dict | None = None
         try:
             if source == "location":
                 # Coordinates are resolved to a named place and dropped inside
@@ -279,6 +287,11 @@ async def life_webhook(
                 row = await record_location_push(pool, payload, external_id)
                 if row is None:
                     return {"accepted": True, "duplicate": True, "external_id": external_id}
+            elif source == "health":
+                # A batch, not a reading: one push fans out to many samples,
+                # each deduped on its own instant. Only counts come back —
+                # nothing that could echo a value into a proxy log.
+                health = await record_health_push(pool, payload)
             else:
                 row = await record_observation(
                     pool,
@@ -299,6 +312,8 @@ async def life_webhook(
             logger.warning("life_webhook_bad_observation", life_source=source)
             raise HTTPException(status_code=422, detail="invalid_observation") from exc
         logger.info("life_webhook_observation_recorded", life_source=source)
+        if health is not None:
+            return {"accepted": True, "external_id": external_id, **health}
         return {
             "accepted": True,
             "external_id": external_id,
