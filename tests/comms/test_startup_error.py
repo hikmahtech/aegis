@@ -18,6 +18,9 @@ def _settings(monkeypatch, **env_vars):
     monkeypatch.delenv("AEGIS_SLACK_BOT_TOKEN", raising=False)
     monkeypatch.delenv("AEGIS_SLACK_APP_TOKEN", raising=False)
     monkeypatch.delenv("AEGIS_CHANNEL", raising=False)
+    monkeypatch.delenv("AEGIS_SLACK_OWNER_MEMBER_ID", raising=False)
+    monkeypatch.delenv("AEGIS_SLACK_SAVEIT_EMOJI", raising=False)
+    monkeypatch.delenv("AEGIS_SLACK_NOTE_TO_SELF_CHANNEL", raising=False)
     for k, v in env_vars.items():
         monkeypatch.setenv(k, v)
     from aegis_comms.config import CommsSettings
@@ -260,6 +263,47 @@ async def test_merge_slack_config_falls_back_to_env_when_db_empty(monkeypatch):
     _merge_slack_config(settings, {"configured": False, "bot_token": "", "app_token": ""})
     assert settings.slack_bot_token == "env-bot"
     assert settings.slack_app_token == "env-app"
+
+
+async def test_merge_slack_config_pulls_self_capture_knobs_from_db(monkeypatch):
+    """B2: the owner id / save-it emoji / note-to-self channel are set on core's
+    admin Integrations page, so comms can ONLY learn them from this merge. If
+    they are dropped here they stay blank forever and self-capture silently
+    never fires."""
+    from aegis_comms.__main__ import _merge_slack_config
+
+    settings = _settings(monkeypatch, AEGIS_SLACK_BOT_TOKEN="env-bot")
+    assert settings.slack_owner_member_id == ""  # sanity: nothing in env
+
+    _merge_slack_config(
+        settings,
+        {
+            "configured": True,
+            "bot_token": "db-bot",
+            "app_token": "db-app",
+            "owner_member_id": "UOWNER",
+            "saveit_emoji": "brain,memo",
+            "note_to_self_channel": "CNOTES",
+        },
+    )
+    assert settings.slack_owner_member_id == "UOWNER"
+    assert settings.slack_saveit_emoji == "brain,memo"
+    assert settings.slack_note_to_self_channel == "CNOTES"
+
+
+async def test_merge_slack_config_self_capture_env_fallback(monkeypatch):
+    """Core older than this change (or the keys unset) → env values survive."""
+    from aegis_comms.__main__ import _merge_slack_config
+
+    settings = _settings(
+        monkeypatch,
+        AEGIS_SLACK_OWNER_MEMBER_ID="UENV",
+        AEGIS_SLACK_NOTE_TO_SELF_CHANNEL="CENV",
+    )
+    _merge_slack_config(settings, {"configured": True, "bot_token": "db-bot"})
+    assert settings.slack_owner_member_id == "UENV"
+    assert settings.slack_note_to_self_channel == "CENV"
+    assert settings.slack_saveit_emoji == "brain"  # default kept
 
 
 async def test_merge_slack_config_noop_on_none(monkeypatch):

@@ -86,6 +86,20 @@ CONFIG_REGISTRY: list[ConfigKey] = [
         "Blank = escalate without mention. Worker restart required.",
     ),
     ConfigKey(
+        "slack_saveit_emoji", "Save-it reaction names (comma-sep, no colons)",
+        "Slack self-capture", False,
+        help="React to YOUR OWN Slack message with one of these (default `brain`) "
+        "to file it as a life_fact. Inert unless the Slack member id above is "
+        "set; never ingests anyone else's message. Comms restart required.",
+    ),
+    ConfigKey(
+        "slack_note_to_self_channel", "Note-to-self channel id",
+        "Slack self-capture", False,
+        help="Every message YOU post in this channel (e.g. C0123456789) is filed "
+        "as a life_fact instead of being routed to an agent. Blank = disabled. "
+        "Inert unless the Slack member id above is set. Comms restart required.",
+    ),
+    ConfigKey(
         "owner_emails", "Your own email addresses (comma-sep)",
         "Owner", False,
         help="The addresses that are YOU. Google lists the calendar owner among an "

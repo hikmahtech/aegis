@@ -162,6 +162,13 @@ class Settings(BaseSettings):
     infra_cluster: str = ""
     infra_heartbeat_ping_url: str = ""  # healthchecks.io dead-man URL ("" = off)
     slack_owner_member_id: str = ""  # Slack member id for escalation @-mentions ("" = no mention)
+    # Curated self-signal ingest (comms reads these over /api/internal/slack-config).
+    # Reaction names (no colons, comma-separated) that file YOUR OWN message as a
+    # life_fact; and a channel id where every message you post is filed the same
+    # way. Both are inert unless slack_owner_member_id is set — AEGIS never
+    # ingests anyone else's message.
+    slack_saveit_emoji: str = "brain"
+    slack_note_to_self_channel: str = ""
     # Your own email addresses (comma-separated, matched case-insensitively).
     # Google lists the calendar owner among an event's attendees, so without
     # this the curiosity gap-finder can ask you who you are. Empty = no

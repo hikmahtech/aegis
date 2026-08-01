@@ -32,6 +32,7 @@ oauth_config:
       - im:history
       - im:read
       - users:read
+      - reactions:read
 settings:
   event_subscriptions:
     bot_events:
@@ -39,6 +40,7 @@ settings:
       - message.im
       - app_mention
       - file_shared
+      - reaction_added
   interactivity:
     is_enabled: true
   socket_mode_enabled: true

@@ -57,6 +57,13 @@ async def resolve_slack_config(pool: Any, settings: Any) -> dict[str, Any]:
         "bot_token": bot_token,
         "app_token": app_token,
         "channel": channel,
+        # Self-capture knobs. These live on Settings (admin Integrations page ->
+        # DB overlay via apply_config_overrides, env as fallback), NOT under the
+        # `slack` settings key — but comms has no DB access, so this endpoint is
+        # the only way they reach it. Non-secret, so safe alongside the tokens.
+        "owner_member_id": getattr(settings, "slack_owner_member_id", "") or "",
+        "saveit_emoji": getattr(settings, "slack_saveit_emoji", "") or "",
+        "note_to_self_channel": getattr(settings, "slack_note_to_self_channel", "") or "",
     }
 
 
