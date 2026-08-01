@@ -635,6 +635,7 @@ async def main():
         review_act.log_review_digest,
         review_act.apply_review_acknowledgement,
         review_act.gather_weekly_state,
+        review_act.check_upcoming_key_dates,
         review_act.frame_review,
         review_act.apply_review_decision,
         review_act.gather_today_focus,

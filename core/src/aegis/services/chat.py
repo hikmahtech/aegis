@@ -1149,6 +1149,30 @@ CHAT_TOOLS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "last_contact_with_person",
+            "description": (
+                "Look up someone in the people registry: when you were last in "
+                "contact, how you know them, their key dates and any notes. "
+                "Matches their name or any alias (nickname, maiden name, email)."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": (
+                            "Name, nickname or email address of the person, as "
+                            "the user said it. Case doesn't matter."
+                        ),
+                    },
+                },
+                "required": ["name"],
+            },
+        },
+    },
     # --- Vercel read-only (Pandora) ---
     # Project arg accepts either the bare Vercel project name (e.g. "example-site")
     # or the resources-table slug ("vercel-example-site"); the executor strips the
@@ -2932,6 +2956,53 @@ async def _exec_find_reference(pool: asyncpg.Pool, args: dict, ctx: ToolContext)
     return "\n".join(out)
 
 
+async def _exec_last_contact_with_person(pool: asyncpg.Pool, args: dict, ctx: ToolContext) -> str:
+    """Answer "when did I last talk to X?" from life.people (migration 016).
+
+    Goes through services.people.find_people, which lowercases the needle
+    before probing `lower(name)` / `aliases @> ARRAY[$1]` — aliases are stored
+    lowercased (normalize_aliases), so any lookup that skips that
+    normalisation silently misses every mixed-case alias.
+    """
+    from aegis.services.people import find_people
+
+    name = (args.get("name") or "").strip()
+    if not name:
+        return "Refused: empty name"
+    if pool is None:
+        return "People registry unavailable."
+    matches = await find_people(pool, name)
+    if not matches:
+        return (
+            f"No one called '{name}' is in the people registry — "
+            "add them on the admin People page to track contact."
+        )
+    lines: list[str] = []
+    for person in matches[:5]:
+        header = person["name"]
+        if person.get("relationship"):
+            header += f" ({person['relationship']})"
+        last = person.get("last_contact")
+        if last:
+            days = (datetime.now(UTC) - last).days
+            ago = "today" if days <= 0 else ("yesterday" if days == 1 else f"{days} days ago")
+            lines.append(f"{header} — last contact {last.date().isoformat()} ({ago})")
+        else:
+            lines.append(f"{header} — no contact recorded yet")
+        key_dates = person.get("key_dates") or {}
+        if isinstance(key_dates, str):
+            try:
+                key_dates = json.loads(key_dates)
+            except (ValueError, TypeError):
+                key_dates = {}
+        if isinstance(key_dates, dict) and key_dates:
+            rendered = ", ".join(f"{k}: {v}" for k, v in list(key_dates.items())[:5])
+            lines.append(f"  key dates — {rendered}")
+        if person.get("notes"):
+            lines.append(f"  notes — {str(person['notes'])[:300]}")
+    return "\n".join(lines)
+
+
 # --- Tool-arg validation ---
 
 
@@ -3453,6 +3524,7 @@ TOOL_EXECUTORS: dict[str, Any] = {
     "mark_waiting": _exec_mark_waiting,
     "handoff_task": _exec_handoff_task,
     "find_reference": _exec_find_reference,
+    "last_contact_with_person": _exec_last_contact_with_person,
     # Vercel read-only (Pandora) — see PR for design notes.
     "vercel_get_project": _exec_vercel_get_project,
     "vercel_list_deployments": _exec_vercel_list_deployments,
@@ -3486,6 +3558,8 @@ AGENT_TOOL_SETS: dict[str, set[str]] = {
         "mark_waiting",
         "handoff_task",
         "find_reference",
+        # People registry (life.people) — "when did I last talk to X?"
+        "last_contact_with_person",
         # Document-attachment tools
         "youtube_transcript",
         "pdf_to_text",

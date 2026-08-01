@@ -185,6 +185,10 @@ async def test_weekly_review_flow_sends_digest_and_logs() -> None:
     async def apply_dec(*a, **kw):
         return {"applied": True}
 
+    @activity.defn(name="check_upcoming_key_dates")
+    async def check_key_dates():
+        return []
+
     async with await WorkflowEnvironment.start_time_skipping() as env:
         client = env.client
         async with Worker(
@@ -201,6 +205,7 @@ async def test_weekly_review_flow_sends_digest_and_logs() -> None:
                 resolve,
                 timeout,
                 apply_dec,
+                check_key_dates,
             ],
         ):
             result = await client.execute_workflow(
@@ -215,6 +220,8 @@ async def test_weekly_review_flow_sends_digest_and_logs() -> None:
             assert "Weekly review" in sent[0]
             assert logs[0]["kind"] == "weekly"
             assert result["decisions"] == 0
+            # Nothing upcoming ⇒ no people block bolted onto the narrative.
+            assert "Coming up" not in sent[0]
 
 
 @pytest.mark.asyncio
@@ -367,3 +374,108 @@ async def test_daily_review_addresses_config_agent_id() -> None:
     assert sent_agents, "expected at least one agent-addressed action"
     assert all(a == "custom-gtd" for a in sent_agents)
     assert "sebas" not in sent_agents
+
+
+# ── C3: people radar — life.people key dates ride out with the weekly review ──
+
+
+def _weekly_stubs(sent: list[str], key_dates: list[dict] | None, *, fail: bool = False):
+    """Weekly-review activity stubs with a configurable check_upcoming_key_dates."""
+
+    @activity.defn(name="gather_weekly_state")
+    async def gather_weekly_state():
+        return _stub_digest_weekly()
+
+    @activity.defn(name="frame_review")
+    async def frame_review(snapshot):
+        # Production path: the LLM narrative REPLACES format_weekly_preview,
+        # so the people block has to survive a framed narrative.
+        return {"narrative": "Weekly review — LLM framing.", "decisions": []}
+
+    @activity.defn(name="send_message")
+    async def send_message(agent_id: str, message: str, chat_id: int = 0, keyboard=None):
+        sent.append(message)
+        return {"ok": True}
+
+    @activity.defn(name="log_review_digest")
+    async def log_review_digest(kind, counts, preview, interaction_id):
+        return 42
+
+    @activity.defn(name="check_upcoming_key_dates")
+    async def check_upcoming_key_dates():
+        if fail:
+            raise RuntimeError("simulated life.people outage")
+        return key_dates or []
+
+    @activity.defn(name="apply_review_decision")
+    async def apply_dec(*a, **kw):
+        return {"applied": True}
+
+    return [
+        gather_weekly_state,
+        frame_review,
+        send_message,
+        log_review_digest,
+        check_upcoming_key_dates,
+        apply_dec,
+    ]
+
+
+@pytest.mark.asyncio
+async def test_weekly_review_appends_upcoming_key_dates() -> None:
+    sent: list[str] = []
+    hits = [
+        {
+            "name": "Amma",
+            "relationship": "mother",
+            "label": "birthday",
+            "date": "2026-08-04",
+            "days_until": 3,
+            "years": 60,
+        }
+    ]
+    async with (
+        await WorkflowEnvironment.start_time_skipping() as env,
+        Worker(
+            env.client,
+            task_queue="aegis-review-keydates-test",
+            workflows=[WeeklyReviewFlow, InteractionFlow],
+            activities=_weekly_stubs(sent, hits),
+        ),
+    ):
+        await env.client.execute_workflow(
+            WeeklyReviewFlow.run,
+            WeeklyReviewConfig(),
+            id=f"weekly-keydates-{uuid.uuid4()}",
+            task_queue="aegis-review-keydates-test",
+        )
+    assert len(sent) == 1
+    # The framed narrative is preserved AND carries the people block.
+    assert "Weekly review — LLM framing." in sent[0]
+    assert "Coming up" in sent[0]
+    assert "Amma (mother): birthday in 3d — turning 60" in sent[0]
+
+
+@pytest.mark.asyncio
+async def test_weekly_review_ships_when_key_dates_lookup_fails() -> None:
+    """A broken/absent people registry must not cost the user their review."""
+    sent: list[str] = []
+    async with (
+        await WorkflowEnvironment.start_time_skipping() as env,
+        Worker(
+            env.client,
+            task_queue="aegis-review-keydates-fail",
+            workflows=[WeeklyReviewFlow, InteractionFlow],
+            activities=_weekly_stubs(sent, None, fail=True),
+        ),
+    ):
+        result = await env.client.execute_workflow(
+            WeeklyReviewFlow.run,
+            WeeklyReviewConfig(),
+            id=f"weekly-keydates-fail-{uuid.uuid4()}",
+            task_queue="aegis-review-keydates-fail",
+        )
+    assert result["kind"] == "weekly"
+    assert len(sent) == 1
+    assert "Weekly review — LLM framing." in sent[0]
+    assert "Coming up" not in sent[0]

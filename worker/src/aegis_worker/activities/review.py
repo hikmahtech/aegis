@@ -32,6 +32,9 @@ _REVIEW_DEFAULTS = {
     # How many prior weekly digests to walk when computing an aging-waiting
     # item's consecutive-appearance streak (issue #117 keep-escalation).
     "streak_lookback": 12,
+    # People radar: how far ahead the weekly review looks for birthdays and
+    # anniversaries in life.people.key_dates (migration 016).
+    "key_dates_lead_days": 14,
 }
 # GTD state labels (Todoist restructure, 2026-07): Someday/Later and Next
 # used to be managed projects; Someday is now the @someday label (Next is
@@ -713,6 +716,45 @@ class ReviewActivities:
         ]
 
     @activity.defn
+    async def check_upcoming_key_dates(self) -> list[dict]:
+        """Birthdays / anniversaries from life.people (migration 016) landing
+        inside the next `key_dates_lead_days` days, soonest first.
+
+        Deliberately its own activity rather than another key on the weekly
+        snapshot: the snapshot is fed verbatim to the framing LLM and written
+        to review_digest_log, and the people registry belongs in neither.
+        `days_until` is computed here so the workflow-side formatter stays
+        deterministic (no clock read inside the sandbox).
+
+        The registry is bounded by the number of humans the user knows, so a
+        full scan of the rows that actually carry key dates is cheaper than
+        expressing month/day recurrence + year wrap in SQL.
+        """
+        if self.db_pool is None:
+            return []
+        async with self.db_pool.acquire() as conn:
+            cfg_raw = await conn.fetchval(
+                "SELECT value FROM settings WHERE key='review_config'"
+            )
+            cfg = {**_REVIEW_DEFAULTS,
+                   **(cfg_raw if isinstance(cfg_raw, dict) else {})}
+            lead_days = int(cfg.get("key_dates_lead_days",
+                                    _REVIEW_DEFAULTS["key_dates_lead_days"]))
+            rows = await conn.fetch(
+                "SELECT name, relationship, key_dates FROM life.people "
+                "WHERE key_dates <> '{}'::jsonb ORDER BY name"
+            )
+        today = dt.date.today()
+        out: list[dict] = []
+        for r in rows:
+            # key_dates is jsonb — dict with the codec registered, str without
+            # (same tolerance as review_digest_log.counts).
+            for hit in _upcoming_key_dates(_decode_counts(r["key_dates"]), today, lead_days):
+                out.append({"name": r["name"], "relationship": r["relationship"], **hit})
+        out.sort(key=lambda h: (h["days_until"], h["name"]))
+        return out[:20]
+
+    @activity.defn
     async def log_review_digest(
         self,
         kind: str,
@@ -898,6 +940,70 @@ def format_weekly_preview(digest: dict, today: dt.date | None = None) -> str:
     if len(body) > 3500:
         body = body[:3500] + "\n…(truncated)"
     return body
+
+
+def _upcoming_key_dates(key_dates: dict, today: dt.date, lead_days: int) -> list[dict]:
+    """Occurrences of one person's key dates falling in [today, today+lead_days].
+
+    Values are ISO dates ("1985-04-02") or, when the year is unknown, the
+    "--MM-DD" form documented in migration 016. The stored year is the
+    ORIGINAL one, so recurrence is matched on month/day and rolled forward —
+    a January birthday is upcoming from a late-December review. `years` is the
+    number the person is turning (None when the year isn't known).
+
+    Anything unparseable is skipped: a typo in one person's notes must not
+    take down the weekly review.
+    """
+    if not isinstance(key_dates, dict):
+        return []
+    out: list[dict] = []
+    for label, raw in key_dates.items():
+        text = str(raw or "").strip()
+        if not text:
+            continue
+        year: int | None = None
+        try:
+            if text.startswith("--"):  # year unknown, e.g. "--04-02"
+                month, day = (int(p) for p in text[2:].split("-", 1))
+            else:
+                origin = dt.date.fromisoformat(text[:10])
+                year, month, day = origin.year, origin.month, origin.day
+        except (ValueError, TypeError):
+            continue
+        for candidate_year in (today.year, today.year + 1):
+            try:
+                occurrence = dt.date(candidate_year, month, day)
+            except ValueError:  # 29 Feb in a non-leap year
+                continue
+            days_until = (occurrence - today).days
+            if 0 <= days_until <= lead_days:
+                out.append({
+                    "label": str(label),
+                    "date": occurrence.isoformat(),
+                    "days_until": days_until,
+                    "years": (candidate_year - year) if year else None,
+                })
+                break
+    return out
+
+
+def format_key_dates(items: list[dict]) -> str:
+    """Weekly-review "coming up" block, or "" when nothing is upcoming.
+
+    Uses only `days_until` from the activity — no clock read, so this stays
+    safe to call from inside the workflow.
+    """
+    if not items:
+        return ""
+    lines = ["🎂 <b>Coming up</b>"]
+    for it in items[:10]:
+        days = it.get("days_until")
+        when = "today" if days == 0 else ("tomorrow" if days == 1 else f"in {days}d")
+        who = _clip(it.get("name"), 40)
+        rel = f" ({_clip(it.get('relationship'), 24)})" if it.get("relationship") else ""
+        years = f" — turning {it['years']}" if it.get("years") else ""
+        lines.append(f"  • {who}{rel}: {_clip(it.get('label'), 24)} {when}{years}")
+    return "\n".join(lines)
 
 
 def _decode_counts(value: Any) -> dict:
