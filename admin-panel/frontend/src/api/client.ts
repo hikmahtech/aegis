@@ -76,6 +76,17 @@ export const api = {
   deleteResource: (id: string) =>
     apiFetch<any>(`/api/admin/resources/${id}`, { method: 'DELETE' }),
 
+  // People registry (life.people — name, aliases, relationship, key dates)
+  listPeople: (q?: string) =>
+    apiFetch<any[]>(`/api/admin/people${q ? `?q=${encodeURIComponent(q)}` : ''}`),
+  getPerson: (id: string) => apiFetch<any>(`/api/admin/people/${id}`),
+  createPerson: (data: any) =>
+    apiFetch<any>('/api/admin/people', { method: 'POST', body: JSON.stringify(data) }),
+  updatePerson: (id: string, data: any) =>
+    apiFetch<any>(`/api/admin/people/${id}`, { method: 'PUT', body: JSON.stringify(data) }),
+  deletePerson: (id: string) =>
+    apiFetch<any>(`/api/admin/people/${id}`, { method: 'DELETE' }),
+
   // Channels (email / rss / raindrop ingestion — DB-owned, UI-managed)
   listChannels: (kind?: string) =>
     apiFetch<any[]>(`/api/admin/channels${kind ? `?kind=${encodeURIComponent(kind)}` : ''}`),
