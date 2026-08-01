@@ -163,17 +163,7 @@ async def test_update_rejects_blanking_the_name(pool):
     assert still is not None and still["name"] == f"{PREFIX}Keeps Name"
 
 
-async def test_people_is_not_registered_for_retention_pruning():
-    """life.people is user-curated data, deliberately NOT age-pruned.
-
-    Guards the decision in migration 016 against a later "every table needs a
-    retention" sweep quietly deleting the people talked to least recently.
-    Both maps must stay clear of it: _ALLOWED_TABLES derives from
-    _TIMESTAMP_COLUMNS, so an entry in either one alone is a live bug.
-    """
-    from aegis_worker.activities.cleanup import _ALLOWED_TABLES, _TIMESTAMP_COLUMNS
-    from aegis_worker.flows.cleanup import _DEFAULT_RETENTIONS
-
-    assert "life.people" not in _TIMESTAMP_COLUMNS
-    assert "life.people" not in _ALLOWED_TABLES
-    assert "life.people" not in _DEFAULT_RETENTIONS
+# The companion guard — that life.people is deliberately absent from the
+# cleanup retention maps — lives in tests/worker/test_cleanup_activity.py,
+# because CI's core job installs only `core[dev]` and cannot import
+# aegis_worker.
