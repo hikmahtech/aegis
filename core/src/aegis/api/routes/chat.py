@@ -187,6 +187,7 @@ async def chat(request: Request, body: dict[str, Any]) -> dict[str, Any]:
         search_connector=getattr(request.app.state, "search_connector", None),
         remote_script_connector=getattr(request.app.state, "remote_script_connector", None),
         vercel_connector=getattr(request.app.state, "vercel_connector", None),
+        mcp_manager=getattr(request.app.state, "mcp_manager", None),
         background_tasks=getattr(request.app.state, "background_tasks", None),
         user_metadata=user_metadata,
         tier_override=(body.get("tier") or None),
@@ -342,6 +343,7 @@ async def post_agent_reply(
             remote_script_connector=getattr(
                 request.app.state, "remote_script_connector", None
             ),
+            mcp_manager=getattr(request.app.state, "mcp_manager", None),
         )
     except (httpx.HTTPStatusError, httpx.ConnectError, httpx.TimeoutException) as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
