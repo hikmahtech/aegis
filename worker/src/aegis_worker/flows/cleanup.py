@@ -37,6 +37,12 @@ _DEFAULT_RETENTIONS: dict[str, int] = {
     # patch, forever otherwise. A year keeps the audit trail long enough to
     # answer "when did AEGIS start believing this about me?".
     "agent_profile_revisions": 365,
+    # life.observations (migration 017) — machine-written life metrics
+    # (weight, sleep, sensors, pings), unbounded by nature. A year keeps every
+    # trend query the chat tool can ask for; pruned by `observed_at`, not
+    # created_at (see _TIMESTAMP_COLUMNS). Sibling life.people is deliberately
+    # NOT here — that one is user-curated.
+    "life.observations": 365,
     # pandoras_actor.* homelab observation tables — see migration 003.
     "pandoras_actor.homelab_drift": 60,
     "pandoras_actor.backup_health": 60,

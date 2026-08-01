@@ -382,6 +382,69 @@ async def test_prune_uses_checked_at_for_pandoras_actor_backup_health():
     assert "checked_at <" in sql
 
 
+async def test_life_observations_is_registered_for_pruning():
+    """life.observations (migration 017) is machine-written and unbounded, so
+    unlike its sibling life.people it IS pruned — at 365 days, by
+    `observed_at` (the reading's own age, not when the row was written).
+
+    Must appear in all three maps: a _DEFAULT_RETENTIONS entry alone is a
+    silent no-op because _ALLOWED_TABLES derives from _TIMESTAMP_COLUMNS.
+    """
+    assert _DEFAULT_RETENTIONS["life.observations"] == 365
+    assert "life.observations" in _ALLOWED_TABLES
+    assert _TIMESTAMP_COLUMNS["life.observations"] == "observed_at"
+
+
+async def test_prune_targets_life_observations_by_observed_at():
+    pool = AsyncMock()
+    pool.fetchval = AsyncMock(return_value=True)
+    pool.execute = AsyncMock(return_value="DELETE 0")
+    activities = CleanupActivities(db_pool=pool)
+    env = ActivityEnvironment()
+    await env.run(activities.prune_old_records, {"retentions": {"life.observations": 365}})
+    sql = pool.execute.await_args.args[0]
+    assert "DELETE FROM life.observations" in sql
+    assert "observed_at <" in sql
+    assert "created_at" not in sql
+    # to_regclass must receive the schema-qualified name.
+    assert pool.fetchval.await_args.args[1] == "life.observations"
+
+
+async def test_prune_deletes_stale_life_observations_against_real_postgres(db_pool):
+    """End-to-end against the real table: a reading past the retention window
+    is deleted and a recent one survives. Mocks would not catch a wrong
+    column name, an unqualified table name, or a schema that never shipped."""
+    from aegis.db import run_migrations
+
+    await run_migrations(db_pool)
+    source = "zzcleanup017"
+    await db_pool.execute("DELETE FROM life.observations WHERE source = $1", source)
+    try:
+        await db_pool.execute(
+            "INSERT INTO life.observations (source, metric, value, observed_at) VALUES "
+            "($1, 'stale', 1, now() - interval '400 days'), "
+            "($1, 'fresh', 2, now() - interval '10 days')",
+            source,
+        )
+
+        activities = CleanupActivities(db_pool=db_pool)
+        env = ActivityEnvironment()
+        result = await env.run(
+            activities.prune_old_records, {"retentions": {"life.observations": 365}}
+        )
+
+        assert result["life.observations"] >= 1
+        surviving = [
+            r["metric"]
+            for r in await db_pool.fetch(
+                "SELECT metric FROM life.observations WHERE source = $1", source
+            )
+        ]
+        assert surviving == ["fresh"]
+    finally:
+        await db_pool.execute("DELETE FROM life.observations WHERE source = $1", source)
+
+
 async def test_life_people_is_never_pruned():
     """life.people (migration 016) is user-curated data, deliberately NOT
     age-pruned — a retention sweep would delete the people talked to least
