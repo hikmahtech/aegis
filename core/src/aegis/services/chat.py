@@ -1173,6 +1173,36 @@ CHAT_TOOLS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "query_observations",
+            "description": (
+                "Summarise a recorded life metric (weight, sleep hours, steps, "
+                "a home-sensor reading) over a recent window: how many "
+                "readings, latest value, min/max/average, and whether it is "
+                "trending up or down against the window before it."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "metric": {
+                        "type": "string",
+                        "description": (
+                            "Metric name as it was recorded, e.g. 'weight_kg', "
+                            "'sleep_hours', 'steps'. Case doesn't matter."
+                        ),
+                    },
+                    "window_days": {
+                        "type": "integer",
+                        "description": "How many days back to look. Default 30.",
+                        "default": 30,
+                    },
+                },
+                "required": ["metric"],
+            },
+        },
+    },
     # --- Vercel read-only (Pandora) ---
     # Project arg accepts either the bare Vercel project name (e.g. "example-site")
     # or the resources-table slug ("vercel-example-site"); the executor strips the
@@ -3003,6 +3033,69 @@ async def _exec_last_contact_with_person(pool: asyncpg.Pool, args: dict, ctx: To
     return "\n".join(lines)
 
 
+async def _exec_query_observations(pool: asyncpg.Pool, args: dict, ctx: ToolContext) -> str:
+    """Summarise a life metric from life.observations (migration 017).
+
+    Two `summarize` calls: the requested window, and the window immediately
+    before it, so the answer can say which way the metric is moving instead
+    of just quoting an average. `services.observations` lowercases the metric
+    on both write and read, so 'Weight' finds what the sensor wrote.
+    """
+    from aegis.services.observations import summarize
+
+    metric = (args.get("metric") or "").strip()
+    if not metric:
+        return "Refused: empty metric"
+    if pool is None:
+        return "Observation store unavailable."
+    try:
+        window = int(args.get("window_days") or 30)
+    except (TypeError, ValueError):
+        window = 30
+    window = max(1, min(window, 3650))
+
+    now = datetime.now(UTC)
+    current = await summarize(pool, metric, window_days=window, until=now)
+    if not current["count"]:
+        return (
+            f"No '{metric}' observations in the last {window} days — "
+            "nothing has recorded that metric yet."
+        )
+
+    lines = [f"{metric} — {current['count']} observation(s) in the last {window} days"]
+    if current["avg"] is None:
+        # Rows exist but every `value` is NULL: a metadata-only signal
+        # (location ping, door-open event) rather than a number series.
+        lines.append("no numeric values recorded — this metric carries metadata only")
+        return "\n".join(lines)
+
+    if current["latest"] is not None and current["latest_at"] is not None:
+        lines.append(
+            f"latest {current['latest']:.2f} at {current['latest_at'].date().isoformat()}"
+        )
+    lines.append(
+        f"min {current['min']:.2f} / max {current['max']:.2f} / avg {current['avg']:.2f}"
+    )
+
+    previous = await summarize(pool, metric, window_days=window, until=current["since"])
+    prev_avg = previous["avg"]
+    if prev_avg is None:
+        lines.append(f"trend: no data for the previous {window} days to compare against")
+    else:
+        delta = current["avg"] - prev_avg
+        # 1% relative tolerance so sensor noise doesn't read as a trend.
+        flat = abs(delta) <= abs(prev_avg) * 0.01 if prev_avg else abs(delta) < 1e-9
+        if flat:
+            lines.append(f"trend: flat vs the previous {window} days (avg {prev_avg:.2f})")
+        else:
+            direction = "up" if delta > 0 else "down"
+            lines.append(
+                f"trend: {direction} {abs(delta):.2f} vs the previous {window} days "
+                f"(avg {prev_avg:.2f})"
+            )
+    return "\n".join(lines)
+
+
 # --- Tool-arg validation ---
 
 
@@ -3525,6 +3618,7 @@ TOOL_EXECUTORS: dict[str, Any] = {
     "handoff_task": _exec_handoff_task,
     "find_reference": _exec_find_reference,
     "last_contact_with_person": _exec_last_contact_with_person,
+    "query_observations": _exec_query_observations,
     # Vercel read-only (Pandora) — see PR for design notes.
     "vercel_get_project": _exec_vercel_get_project,
     "vercel_list_deployments": _exec_vercel_list_deployments,
@@ -3560,6 +3654,8 @@ AGENT_TOOL_SETS: dict[str, set[str]] = {
         "find_reference",
         # People registry (life.people) — "when did I last talk to X?"
         "last_contact_with_person",
+        # Life metrics (life.observations) — "how's my weight trending?"
+        "query_observations",
         # Document-attachment tools
         "youtube_transcript",
         "pdf_to_text",

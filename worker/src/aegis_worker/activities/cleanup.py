@@ -43,6 +43,12 @@ _TIMESTAMP_COLUMNS: dict[str, str] = {
     # is derived from these keys, so a retention entry alone would be
     # silently skipped by prune_old_records.
     "agent_profile_revisions": "created_at",
+    # life.observations (migration 017) prunes by `observed_at` — the row's
+    # age is when the reading happened, so a backfilled old reading drops on
+    # the next sweep instead of living a year past its relevance. Listed here
+    # as well as in _DEFAULT_RETENTIONS: _ALLOWED_TABLES derives from these
+    # keys, so a retention entry alone would be silently skipped.
+    "life.observations": "observed_at",
     # pandoras_actor.* — per migration 003 the timestamp columns are
     # `detected_at` (homelab_drift) and `checked_at` (everything else).
     "pandoras_actor.homelab_drift": "detected_at",
