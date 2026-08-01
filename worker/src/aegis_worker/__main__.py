@@ -28,6 +28,7 @@ from aegis_worker.activities.clarify import ClarifyActivities
 from aegis_worker.activities.cleanup import CleanupActivities
 from aegis_worker.activities.content import ContentActivities
 from aegis_worker.activities.core_client import CoreClient
+from aegis_worker.activities.curiosity import CuriosityActivities
 from aegis_worker.activities.delivery import DeliveryActivities
 from aegis_worker.activities.drive import DriveActivities
 from aegis_worker.activities.gmail import GmailActivities
@@ -351,6 +352,12 @@ async def main():
     memory_act = MemoryActivities(db_pool=deps.pool)
     # Registered but dormant — no flow calls these yet (A1 ships the substrate).
     profile_act = ProfileActivities(db_pool=deps.pool)
+    # Same: A6 ships the gap detector, A7 is the flow that will ask the question.
+    curiosity_act = CuriosityActivities(
+        db_pool=deps.pool,
+        llm_client=deps.llm,
+        model=model_balanced,
+    )
     raindrop_act = RaindropActivities(
         raindrop_api_token=getattr(settings, "raindrop_api_token", ""),
         db_pool=deps.pool,
@@ -574,6 +581,7 @@ async def main():
         memory_act.prune_agent_memories,
         profile_act.read_profile_context,
         profile_act.apply_profile_patch,
+        curiosity_act.find_curiosity_gaps,
         raindrop_act.poll_bookmarks,
         rss_act.fetch_feed,
         intel_scan_act.search_source,
