@@ -103,7 +103,11 @@ SOURCE_TYPES: dict[str, SourceTypeInfo] = {
         "Items with an expiry/renewal date (life-domain, planned)"
     ),
     "asset": SourceTypeInfo("Household/asset records (life-domain, planned)"),
-    "life_fact": SourceTypeInfo("Standalone life facts (life-domain, planned)"),
+    "life_fact": SourceTypeInfo(
+        "Standalone life facts captured via POST /api/admin/capture "
+        "{kind:'life_fact'} — Slack `/remember`, chat, and downstream "
+        "curated-signal ingest all land here"
+    ),
     "daylog": SourceTypeInfo("Daily log entries (life-domain, planned)"),
     "daylog_rollup": SourceTypeInfo("Rolled-up daylog summaries (life-domain, planned)"),
 }

@@ -3,15 +3,22 @@
 A tiny wrapper around the same _capture_to_inbox_impl helper that the
 capture_to_inbox chat tool uses. Lets a chat bot (which has no
 direct DB access) drop a task into the Todoist Inbox by HTTP.
+
+`kind` picks the capture lane: `task` (default) is the Todoist Inbox path
+above; `life_fact` files the text as a knowledge-store fact instead, for
+things that are true about your life rather than things to do.
 """
 
 from __future__ import annotations
+
+from typing import Literal
 
 import structlog
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
 
 from aegis.api.auth import verify_auth
+from aegis.api.deps import get_knowledge_connector
 
 logger = structlog.get_logger()
 
@@ -30,12 +37,14 @@ class CaptureRequest(BaseModel):
     # Optional explicit external_id (for idempotent re-tries from the bot).
     # If omitted, a hash of (source + text) is used.
     external_id: str | None = Field(default=None, max_length=128)
+    kind: Literal["task", "life_fact"] = "task"
 
 
 class CaptureResponse(BaseModel):
     task_ref: str | None
     source_tag: str
     external_id: str
+    content_id: str | None = None
 
 
 @router.post("/capture", response_model=CaptureResponse)
@@ -43,11 +52,16 @@ async def capture(
     body: CaptureRequest,
     request: Request,
 ) -> CaptureResponse:
-    """Drop a one-line task into the Todoist Inbox.
+    """Drop a one-line task into the Todoist Inbox, or file a life fact.
 
     Idempotent on (source_tag, external_id) via todoist_capture_idempotency.
     Returns the Todoist task id (or temp_id if outbox-queued) plus the
     source_tag used so the caller has the audit trail.
+
+    `kind="life_fact"` skips Todoist entirely and upserts the text into the
+    knowledge store under a synthetic `aegis://life_fact/{external_id}` URL,
+    so re-posting the same text is an idempotent no-op (`content_id` is a
+    hash of that URL). `task_ref` is None on that lane.
     """
     from aegis.services.chat import _capture_to_inbox_impl  # avoid circular import
 
@@ -61,6 +75,33 @@ async def capture(
             f"{body.source}:"
             f"{hashlib.sha256(body.text.encode()).hexdigest()[:16]}"
         )
+
+    if body.kind == "life_fact":
+        store = get_knowledge_connector(request)
+        text = body.text.strip()
+        raw_text = f"{text}\n\n{body.description}" if body.description else text
+        result = await store.ingest_content(
+            url=f"aegis://life_fact/{ext_id}",
+            title=text[:200],
+            source_type="life_fact",
+            raw_text=raw_text,
+            tags=["life_fact", body.source],
+        )
+        content_id = result.get("content_id")
+        logger.info(
+            "capture_admin_life_fact",
+            source_tag=source_tag,
+            external_id=ext_id[:32],
+            content_id=content_id,
+            status=result.get("status"),
+        )
+        return CaptureResponse(
+            task_ref=None,
+            source_tag=source_tag,
+            external_id=ext_id,
+            content_id=content_id,
+        )
+
     ref = await _capture_to_inbox_impl(
         pool=pool,
         source_tag=source_tag,

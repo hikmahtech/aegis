@@ -485,6 +485,14 @@ class SlackAdapter:
             )
             await respond(reply)
 
+        @app.command("/remember")
+        async def _on_remember(ack, command, respond):  # noqa: ANN001
+            await ack()
+            reply = await inbound.on_remember(
+                text=command.get("text", ""), user_id=command.get("user_id", "")
+            )
+            await respond(reply)
+
         @app.command("/status")
         async def _on_status(ack, respond):  # noqa: ANN001
             await ack()
