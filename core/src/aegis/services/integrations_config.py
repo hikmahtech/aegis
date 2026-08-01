@@ -145,6 +145,15 @@ CONFIG_REGISTRY: list[ConfigKey] = [
         boolean=True,
         help="Lets agents run tools mid-chat. No extra config. On by default.",
     ),
+    ConfigKey(
+        "people_enrichment_enabled", "Passive people enrichment (email + calendar)",
+        "Features", False,
+        boolean=True,
+        help="Learns email addresses and last-contact dates for people already on the "
+        "People page. Email NEVER creates a person; calendar attendees may, but only "
+        "for small meetings and only once Owner → your own email addresses is set. "
+        "Restart the worker after enabling.",
+    ),
 ]
 _BY_KEY = {c.key: c for c in CONFIG_REGISTRY}
 

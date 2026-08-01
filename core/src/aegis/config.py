@@ -174,6 +174,12 @@ class Settings(BaseSettings):
     # this the curiosity gap-finder can ask you who you are. Empty = no
     # exclusion. Editable from the admin Integrations page.
     owner_emails: str = ""
+    # Passive people enrichment (C2) — keep life.people current from the mail
+    # and meetings already flowing through AEGIS. Off by default: it writes
+    # information about real third parties. Email only ever ENRICHES an
+    # existing person; the calendar lane, which may create, additionally
+    # refuses while owner_emails above is unset.
+    people_enrichment_enabled: bool = False
     # Bank / card-alert sender domains (comma-separated, case-insensitive
     # substring match). Deterministic guard in Money Hygiene that stops bank
     # statements / autopay reminders from minting fake recurring charges.

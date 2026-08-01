@@ -140,7 +140,7 @@ The shipped schedule set (`config/seed/activities.yaml` — all crons UTC):
 
 | Slug | Cron | Flow | Agent | What it does |
 |---|---|---|---|---|
-| `gmail-ingest-hourly` | `0 * * * *` | `GmailIngestFlow` | Sebas | Fetch + classify new mail; tag fan-out spawns `MoneyProcessFlow` for `financial`/`payments` mail |
+| `gmail-ingest-hourly` | `0 * * * *` | `GmailIngestFlow` | Sebas | Fetch + classify new mail; tag fan-out spawns `MoneyProcessFlow` for `financial`/`payments` mail. With Integrations → Features → **Passive people enrichment** on, each sender is also folded into `life.people`: it learns their address as an alias and moves `last_contact` forward, but it **never creates a person** — an inbox is unbounded and mostly transactional |
 | `delivery-watchdog-hourly` | `0 * * * *` | `DeliveryWatchdogFlow` | Pandora's Actor | Finds interaction cards that were never delivered; checks comms liveness |
 | `rss-ingest-hourly` | `30 * * * *` | `RssIngestFlow` | Raphael | RSS feeds → knowledge store |
 | `raindrop-ingest-2h` | `0 */2 * * *` | `RaindropIngestFlow` | Raphael | Raindrop bookmarks → knowledge store |
@@ -157,7 +157,7 @@ The shipped schedule set (`config/seed/activities.yaml` — all crons UTC):
 | `cleanup-daily` | `0 4 * * *` | `CleanupFlow` | Pandora's Actor | Retention prune for unbounded ops tables |
 | `daily-briefing-raphael` | `30 4 * * *` | `DailyBriefingFlow` | Raphael | The daily brief: interactions, activity, knowledge, market summary → your channel |
 | `workspace-repo-sync-daily` | `0 5 * * *` | `WorkspaceRepoSyncFlow` | Pandora's Actor | Mirrors the coding host's workspace checkouts into `resources`; flags tracked repos with a missing AEGIS webhook |
-| `calendar-ingest-daily` | `0 6 * * *` | `CalendarIngestFlow` | Sebas | Calendar events, 30-day horizon |
+| `calendar-ingest-daily` | `0 6 * * *` | `CalendarIngestFlow` | Sebas | Calendar events, 30-day horizon. With **Passive people enrichment** on, attendees of small meetings (≤ 8 invitees) are auto-added to `life.people` — the only lane that creates a person. It **refuses entirely until Integrations → Owner (`owner_emails`) is filled in**, because Google lists you among your own events' attendees. It never sets `last_contact`: the horizon is forward-looking, and a meeting you have not had yet is not contact |
 | `cert-radar-daily` | `0 7 * * *` | `CertRadarFlow` | Pandora's Actor | TLS expiry checks for the domains in its config — **replace the seed list with your own** |
 | `expiry-radar-daily` | `25 7 * * *` | `ExpiryRadarFlow` | Sebas | Warns on anything in `life.expiring_items` (passport, visa, licence, insurance, warranty, medication, domain) crossing one of its `lead_days` thresholds. One Acknowledge card per threshold per expiry cycle — renewing an item (moving `expires_on`) re-arms them all. Add rows on the admin **Expiring Items** page; empty registry = silent |
 | `intel-scan-hn` / `-news` / `-finance` | `0 7` / `30 7` / `0 8 * * *` | `IntelligenceScanFlow` | Raphael | Scores sources against your topics; ingests items ≥ `significance_threshold` |
