@@ -264,6 +264,7 @@ def create_app(run_lifespan: bool = True, settings: Settings | None = None) -> F
         money,
         observability,
         overview,
+        people_admin,
         references,
         resources,
         settings,
@@ -336,6 +337,7 @@ def create_app(run_lifespan: bool = True, settings: Settings | None = None) -> F
     app.include_router(infra_admin.router)
     app.include_router(system_status.router)
     app.include_router(resources.router)
+    app.include_router(people_admin.router)
     app.include_router(todoist.router)
 
     # Serve admin panel SPA (static files from built frontend)

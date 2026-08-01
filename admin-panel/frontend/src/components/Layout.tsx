@@ -21,6 +21,7 @@ const NAV: { section: string; items: { path: string; label: string }[] }[] = [
       { path: '/knowledge', label: 'Knowledge' },
       { path: '/references', label: 'References' },
       { path: '/content', label: 'Content' },
+      { path: '/people', label: 'People' },
       { path: '/market', label: 'Market' },
       { path: '/admin/money', label: 'Money' },
     ],

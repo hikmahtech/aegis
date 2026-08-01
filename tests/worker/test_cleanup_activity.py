@@ -381,3 +381,27 @@ async def test_prune_uses_checked_at_for_pandoras_actor_backup_health():
     assert "DELETE FROM pandoras_actor.backup_health" in sql
     assert "checked_at <" in sql
 
+
+async def test_life_people_is_never_pruned():
+    """life.people (migration 016) is user-curated data, deliberately NOT
+    age-pruned — a retention sweep would delete the people talked to least
+    recently, which is the opposite of what a contact registry is for.
+
+    Guards that decision two ways: the table is absent from both maps (an
+    entry in only one of them is the silent-no-op bug this file already
+    covers), AND a retention config naming it is ignored at runtime rather
+    than issuing a DELETE.
+    """
+    assert "life.people" not in _TIMESTAMP_COLUMNS
+    assert "life.people" not in _ALLOWED_TABLES
+    assert "life.people" not in _DEFAULT_RETENTIONS
+
+    pool = AsyncMock()
+    pool.fetchval = AsyncMock(return_value=True)
+    pool.execute = AsyncMock(return_value="DELETE 10")
+    activities = CleanupActivities(db_pool=pool)
+    env = ActivityEnvironment()
+    result = await env.run(activities.prune_old_records, {"retentions": {"life.people": 365}})
+    assert result == {}
+    pool.execute.assert_not_awaited()
+
