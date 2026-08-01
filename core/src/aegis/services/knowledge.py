@@ -17,6 +17,8 @@ from typing import TYPE_CHECKING, Any
 
 import structlog
 
+from aegis.services.source_types import warn_if_unknown
+
 if TYPE_CHECKING:
     import asyncpg
 
@@ -108,6 +110,7 @@ class KnowledgeStore:
         Returns {content_id, status, chunks_total}. status is "ok" on success,
         "empty" when there's no embeddable text.
         """
+        warn_if_unknown(source_type)
         content_id = _content_id_for(url)
         # Belt for issue #110: a 'reference' re-ingest must never downgrade a
         # richer existing row (e.g. source_type='intelligence' carrying
