@@ -43,6 +43,36 @@ async def recent_memories(pool: Any, agent_id: str, limit: int = 8) -> list[str]
     return [r["content"] for r in rows]
 
 
+async def all_memories(pool: Any, agent_id: str) -> list[dict[str, Any]]:
+    """Every memory row for one agent, with the metadata consolidation needs.
+
+    `recent_memories` deliberately returns bare content strings (it feeds a
+    system prompt). A consolidation pass has to reference rows by id and weigh
+    them, so it needs id / importance / source / created_at too.
+
+    Read-only. A3 ships NO apply path: there is intentionally no
+    `apply_consolidation` here, because writing one before A4's rails
+    (soft-retire via `agent_memory.superseded_by`, `agent_memory_ops_log`
+    provenance, delete quotas) would put an LLM-driven DELETE of
+    human-authored corrections one call away.
+    """
+    rows = await pool.fetch(
+        "SELECT id, content, importance, source, created_at FROM agent_memory "
+        "WHERE agent_id = $1 ORDER BY importance DESC, created_at DESC",
+        agent_id,
+    )
+    return [
+        {
+            "id": int(r["id"]),
+            "content": r["content"],
+            "importance": float(r["importance"]),
+            "source": r["source"],
+            "created_at": r["created_at"],
+        }
+        for r in rows
+    ]
+
+
 def format_memories(memories: list[str]) -> str:
     if not memories:
         return ""

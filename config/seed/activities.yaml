@@ -151,11 +151,17 @@ activities:
 
   # Phase 4 — nightly per-agent memory consolidation (caps each agent's
   # agent_memory at `keep` rows; the learning loop writes corrections live).
+  # consolidate: run the A3 planner first — it PROPOSES ADD/UPDATE/DELETE/NOOP
+  # ops and logs them; it never writes. dry_run must stay true: the activity
+  # refuses false outright until A4 ships the soft-retire + provenance rails.
+  # NOTE: `config` is DB-owned (seed.py only refreshes workflow_type/agent_id),
+  # so these keys apply to a FRESH install only — on an existing deploy set them
+  # on /admin/flows.
   - slug: memory-reflection-nightly
     workflow_type: MemoryReflectionFlow
     agent_id: sebas
     schedule_cron: "0 3 * * *"
-    config: {keep: 50}
+    config: {keep: 50, consolidate: true, dry_run: true}
     active: true
 
   # significance_threshold: the LLM scorer rates 1–5; only items >= this ingest.

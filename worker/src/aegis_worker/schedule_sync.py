@@ -182,6 +182,12 @@ _ACTIVITY_TYPE_MAP = {
         MemoryReflectionInput(
             agent_id=act["agent_id"],
             keep=int((act["config"] or {}).get("keep", 50)),
+            # Fail closed: an existing DB row predating A3 has neither key, and
+            # `activities.config` is DB-owned (seed.py never overwrites it), so
+            # enabling consolidation on a live deploy is a deliberate edit on
+            # /admin/flows — not something a redeploy turns on.
+            consolidate=bool((act["config"] or {}).get("consolidate", False)),
+            dry_run=bool((act["config"] or {}).get("dry_run", True)),
         ),
     ),
     "IntelligenceScanFlow": lambda act: (
