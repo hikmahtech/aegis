@@ -1,4 +1,4 @@
-"""Admin CRUD for ingestion channels (email / rss / raindrop / wearable).
+"""Admin CRUD for ingestion channels (email / rss / raindrop / wearable / place).
 
 Channels are DB-owned: `config/seed/channels.yaml` only inserts starter rows
 on first boot (see seed.py::_load_channels); everything afterwards is managed
@@ -18,7 +18,12 @@ from aegis.api.auth import verify_auth
 
 router = APIRouter(prefix="/api/admin/channels", dependencies=[Depends(verify_auth)])
 
-CHANNEL_KINDS = ("email", "rss", "raindrop", "wearable")
+# `place` is not an ingestion source — it is the reference data the location
+# webhook resolves against (`services/places.py`), stored here so named places
+# get admin CRUD and activate/deactivate for free. Its config is
+# {lat, lon, radius_m}: the ONLY coordinates AEGIS persists, and user-typed,
+# never inferred.
+CHANNEL_KINDS = ("email", "rss", "raindrop", "wearable", "place")
 
 _COLS = "id, kind, identifier, config, active, created_at"
 

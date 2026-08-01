@@ -146,6 +146,40 @@ additionally collapsed by an `ingest_idempotency` claim on
 Free-form text is **not** pushed here: `POST /api/admin/capture` with
 `kind="life_fact"` already owns that lane.
 
+### `location` — place inference from a phone push
+
+`source=location` accepts an OwnTracks / Home Assistant shaped body
+(`{"lat":…, "lon":…}` or `{"latitude":…, "longitude":…}`, optional `tst` unix
+seconds and OwnTracks' `t` trigger code) and resolves it to a **named place**.
+
+**What is stored is a label, not a position.** The pushed coordinate is used
+once — to pick which configured place contains it — and is then discarded. The
+observation row is `source='location'`, `metric='place'`, `value=NULL`,
+`metadata={"place": "home", "trigger": "p"}`. No coordinate reaches
+`life.observations`, `settings`, a log line, the response body, or Temporal
+(the lane is inline precisely so a raw payload is never persisted in workflow
+history). A push outside every configured place stores `"elsewhere"`.
+
+**Places are yours to configure, never inferred.** Add them on admin →
+**Channels** → *place*: identifier = the label that gets stored, config =
+`{lat, lon, radius_m}` (radius defaults to 150 m). These few user-typed centres
+are the only coordinates AEGIS keeps. Overlapping circles resolve to the
+smallest, so an `office` inside a wider `city` circle wins. With no place rows
+configured every push stores `elsewhere` — the endpoint still works, it just
+has nothing to name.
+
+The newest fix also updates a `settings.current_place` pointer
+(`{"place","at"}`, label only), which the daily briefing reports as a
+*Location* line and **drops once it is more than 12 hours old** rather than
+asserting a place the owner may have left.
+
+Retention: location observations age out with everything else in
+`life.observations` — 365 days by `observed_at`, so a push queued on an offline
+phone ages from when the fix was taken, not from when it arrived. `CleanupFlow`
+prunes per table, so a shorter window for location alone is not expressible
+today; the mitigation is that what survives a year is a coarse presence
+timeline of names the owner chose, not a track.
+
 ### Infra heartbeat & escalation
 
 `InfraHeartbeatFlow` (schedule `infra-heartbeat-2m`, gated by `homelab_enabled`) polls

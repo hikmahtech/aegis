@@ -153,3 +153,42 @@ async def test_delete_channel(client):
     # deleting again → 404
     r2 = await client.delete(f"/api/admin/channels/{created['id']}")
     assert r2.status_code == 404
+
+
+async def test_place_channel_round_trips_with_its_coordinates(client):
+    """B5 — named places are `channels` rows, so the kind must be accepted and
+    its {lat, lon, radius_m} config must survive the round trip. Without the
+    kind in CHANNEL_KINDS this is a 400 and location pushes can never resolve
+    to anything but "elsewhere"."""
+    created = await _create(
+        client,
+        kind="place",
+        config={"lat": 19.076, "lon": 72.8777, "radius_m": 200, "label": "flat"},
+    )
+    assert created["kind"] == "place"
+    listed = (await client.get("/api/admin/channels?kind=place")).json()
+    fetched = next(c for c in listed if c["id"] == created["id"])
+    assert fetched["config"]["lat"] == 19.076
+    assert fetched["config"]["lon"] == 72.8777
+    assert fetched["config"]["radius_m"] == 200
+
+
+async def test_admin_panel_renders_every_channel_kind():
+    """`Channels.tsx` keeps its OWN copy of the kind list and that copy is what
+    drives rendering, so a kind present only server-side produces rows nobody
+    can see or edit in the admin panel (this bit B7).
+
+    Parsed out of the source rather than duplicated here — a literal list in
+    this test would agree with itself while the page stayed stale.
+    """
+    import re
+    from pathlib import Path
+
+    page = (
+        Path(__file__).resolve().parents[2]
+        / "admin-panel/frontend/src/pages/Channels.tsx"
+    )
+    match = re.search(r"const CHANNEL_KINDS = \[(.*?)\] as const;", page.read_text())
+    assert match, "CHANNEL_KINDS not found in Channels.tsx"
+    frontend = {k.strip().strip("'\"") for k in match.group(1).split(",") if k.strip()}
+    assert set(channels.CHANNEL_KINDS) == frontend

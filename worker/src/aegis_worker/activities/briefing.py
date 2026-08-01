@@ -10,6 +10,12 @@ from typing import Any
 import httpx
 from temporalio import activity
 
+# How old `settings.current_place` (written by the location webhook, B5) may
+# be and still be reported in the briefing. Past this the phone has been off,
+# offline, or the push has broken — and announcing a place the owner left two
+# days ago is worse than announcing none.
+_PLACE_STALE_HOURS = 12
+
 
 def _within_hours(ts_raw: Any, cutoff: datetime) -> bool:
     """Return True if an item with timestamp `ts_raw` is at/after `cutoff`.
@@ -354,6 +360,32 @@ class BriefingActivities:
         except Exception as exc:
             activity.logger.warning("briefing_calendar_diff_failed err=%s", str(exc)[:200])
 
+        # location: where the owner currently is, as a LABEL (B5). The KV holds
+        # {"place": "home", "at": iso} — never a coordinate — and a pointer
+        # older than `_PLACE_STALE_HOURS` is dropped rather than reported.
+        # Isolated like every other dimension: a missing, stale or garbage KV
+        # degrades to no place line, never a dead briefing.
+        place: dict = {}
+        if self.db_pool:
+            try:
+                prow = await self.db_pool.fetchrow(
+                    "SELECT value FROM settings WHERE key='current_place'"
+                )
+                raw = prow["value"] if prow else None
+                current = json.loads(raw) if isinstance(raw, str) else raw
+                if not isinstance(current, dict):
+                    current = {}
+                name = str(current.get("place") or "")
+                seen_at = datetime.fromisoformat(
+                    str(current.get("at")).replace("Z", "+00:00")
+                )
+                if seen_at.tzinfo is None:
+                    seen_at = seen_at.replace(tzinfo=UTC)
+                if name and now - seen_at <= timedelta(hours=_PLACE_STALE_HOURS):
+                    place = {"place": name, "at": seen_at.isoformat()}
+            except Exception as exc:
+                activity.logger.warning("briefing_place_failed err=%s", str(exc)[:200])
+
         quiet = not (intel_out or collected_out or failed_runs or new_drift or new_cal_ids)
         new_state = {
             "last_briefing_at": now.isoformat(),
@@ -367,6 +399,7 @@ class BriefingActivities:
             "collected": collected_out,
             "broke": {"failed_runs": failed_runs, "new_drift": new_drift},
             "calendar": {"today": cal_today, "new_ids": new_cal_ids},
+            "place": place,
             "_new_state": new_state,
         }
 
@@ -427,6 +460,10 @@ class BriefingActivities:
                 hhmm = start.split("T")[1][:5] if "T" in start else start
                 pre = f"{hhmm} — " if hhmm else ""
                 lines.append(f"  • {pre}{_esc(str(e.get('summary')))}")
+        place = (changes.get("place") or {}).get("place")
+        if place:
+            lines.append("<b>Location</b>")
+            lines.append(f"  • last seen at {_esc(str(place))}")
         return "\n".join(lines) if lines else "\U0001f7e2 Quiet overnight — nothing needs you."
 
     def _format_failure_block(self, changes: dict) -> str:

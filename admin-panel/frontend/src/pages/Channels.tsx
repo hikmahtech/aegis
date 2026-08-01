@@ -3,12 +3,13 @@ import { Link } from 'react-router-dom';
 import { api } from '../api/client';
 import ErrorBanner from '../components/ErrorBanner';
 
-// Ingestion channels (email / rss / raindrop / wearable). DB-owned: the seed
+// Ingestion channels (email / rss / raindrop / wearable) plus named places
+// (`place`, B5 — reference data, not a source). DB-owned: the seed
 // yaml only plants starter rows on first boot — everything here survives
 // restarts. This list also drives which kinds are RENDERED, so a kind missing
 // here is a channel row nobody can see or edit.
 
-const CHANNEL_KINDS = ['email', 'rss', 'raindrop', 'wearable'] as const;
+const CHANNEL_KINDS = ['email', 'rss', 'raindrop', 'wearable', 'place'] as const;
 type ChannelKind = (typeof CHANNEL_KINDS)[number];
 
 const KIND_COLORS: Record<string, string> = {
@@ -16,6 +17,7 @@ const KIND_COLORS: Record<string, string> = {
   rss: 'var(--warning)',
   raindrop: 'var(--purple)',
   wearable: 'var(--success)',
+  place: 'var(--info)',
 };
 
 const KIND_HELP: Record<ChannelKind, string> = {
@@ -23,7 +25,14 @@ const KIND_HELP: Record<ChannelKind, string> = {
   rss: 'Feed URLs polled by RssIngestFlow.',
   raindrop: 'Raindrop.io bookmark collections (the token lives in Integrations).',
   wearable: 'Wearable vendors polled by WearableIngestFlow into life.observations. Identifier is the vendor slug (currently only "oura"); the token lives in Integrations.',
+  place: 'Named places (home / office / gym) that POST /api/webhooks/life/location resolves a phone push against. Identifier is the name that gets stored; the centre coordinate below is the ONLY location AEGIS keeps — the pushed lat/lon is used to pick a place and then discarded, never written to the database or a log.',
 };
+
+// `place` is reference data, not an ingest source, so it is the one kind whose
+// config carries coordinates. Without these three fields a place row is
+// unusable (list_places skips it) — which is why the form renders them rather
+// than leaving the admin to hand-edit JSON.
+const DEFAULT_RADIUS_M = 150;
 
 interface ChannelForm {
   kind: ChannelKind;
@@ -31,6 +40,9 @@ interface ChannelForm {
   label: string;
   token_path: string;
   agent_id: string;
+  lat: string;
+  lon: string;
+  radius_m: string;
   active: boolean;
 }
 
@@ -40,6 +52,9 @@ const emptyForm: ChannelForm = {
   label: '',
   token_path: '',
   agent_id: '',
+  lat: '',
+  lon: '',
+  radius_m: String(DEFAULT_RADIUS_M),
   active: true,
 };
 
@@ -86,6 +101,9 @@ export default function Channels() {
       label: cfg.label || '',
       token_path: cfg.token_path || '',
       agent_id: cfg.agent_id || '',
+      lat: cfg.lat === undefined || cfg.lat === null ? '' : String(cfg.lat),
+      lon: cfg.lon === undefined || cfg.lon === null ? '' : String(cfg.lon),
+      radius_m: cfg.radius_m === undefined || cfg.radius_m === null ? String(DEFAULT_RADIUS_M) : String(cfg.radius_m),
       active: !!c.active,
     });
     setFormError('');
@@ -102,6 +120,11 @@ export default function Channels() {
     } else if (form.kind === 'rss') {
       base.label = form.label.trim();
       if (base.last_cursor === undefined) base.last_cursor = null;
+    } else if (form.kind === 'place') {
+      base.label = form.label.trim();
+      base.lat = Number(form.lat);
+      base.lon = Number(form.lon);
+      base.radius_m = Number(form.radius_m) || DEFAULT_RADIUS_M;
     } else {
       if (base.last_cursor === undefined) base.last_cursor = null;
     }
@@ -114,6 +137,19 @@ export default function Channels() {
     if (!form.identifier.trim()) {
       setFormError(form.kind === 'rss' ? 'Feed URL is required' : 'Identifier is required');
       return;
+    }
+    if (form.kind === 'place') {
+      const lat = Number(form.lat);
+      const lon = Number(form.lon);
+      if (!form.lat.trim() || !form.lon.trim() || Number.isNaN(lat) || Number.isNaN(lon)
+          || lat < -90 || lat > 90 || lon < -180 || lon > 180) {
+        setFormError('Latitude (-90..90) and longitude (-180..180) are required for a place');
+        return;
+      }
+      if (!(Number(form.radius_m) > 0)) {
+        setFormError('Radius must be a positive number of metres');
+        return;
+      }
     }
     setSaving(true);
     setFormError('');
@@ -170,7 +206,8 @@ export default function Channels() {
         <div>
           <h1 className="page-title">Channels</h1>
           <p className="page-subtitle">
-            Ingestion sources (email / RSS / Raindrop). Managed here — the seed yaml only
+            Ingestion sources (email / RSS / Raindrop / wearable) and named places.
+            Managed here — the seed yaml only
             plants starter examples on first boot; edits and additions survive restarts.
           </p>
         </div>
@@ -187,11 +224,11 @@ export default function Channels() {
             <div className="modal-body">
               {formError && <div className="form-error">{formError}</div>}
               <div className="form-group">
-                <label>{form.kind === 'email' ? 'Email address' : form.kind === 'rss' ? 'Feed URL' : 'Identifier'}</label>
+                <label>{form.kind === 'email' ? 'Email address' : form.kind === 'rss' ? 'Feed URL' : form.kind === 'place' ? 'Place name' : 'Identifier'}</label>
                 <input
                   value={form.identifier}
                   onChange={e => setForm({ ...form, identifier: e.target.value })}
-                  placeholder={form.kind === 'email' ? 'you@example.com' : form.kind === 'rss' ? 'https://example.com/feed.xml' : 'default'}
+                  placeholder={form.kind === 'email' ? 'you@example.com' : form.kind === 'rss' ? 'https://example.com/feed.xml' : form.kind === 'place' ? 'home' : 'default'}
                   className="mono"
                 />
               </div>
@@ -220,6 +257,42 @@ export default function Channels() {
                     the OAuth token to this path.
                   </p>
                 </div>
+              )}
+              {form.kind === 'place' && (
+                <>
+                  <div className="form-group">
+                    <label>Centre latitude</label>
+                    <input
+                      value={form.lat}
+                      onChange={e => setForm({ ...form, lat: e.target.value })}
+                      placeholder="19.0760"
+                      className="mono"
+                    />
+                  </div>
+                  <div className="form-group">
+                    <label>Centre longitude</label>
+                    <input
+                      value={form.lon}
+                      onChange={e => setForm({ ...form, lon: e.target.value })}
+                      placeholder="72.8777"
+                      className="mono"
+                    />
+                  </div>
+                  <div className="form-group">
+                    <label>Radius (metres)</label>
+                    <input
+                      value={form.radius_m}
+                      onChange={e => setForm({ ...form, radius_m: e.target.value })}
+                      placeholder={String(DEFAULT_RADIUS_M)}
+                      className="mono"
+                    />
+                    <p style={{ fontSize: 12, color: 'var(--text-muted)', margin: '4px 0 0' }}>
+                      A push inside this circle resolves to this place; overlapping
+                      circles resolve to the smallest one. Outside every place, the
+                      stored label is "elsewhere".
+                    </p>
+                  </div>
+                </>
               )}
               <div className="form-group">
                 <label>Agent</label>
