@@ -41,6 +41,17 @@ _DEFAULT_AGENT = "sebas"
 _AUDIO_EXTENSIONS = (".mp4", ".m4a", ".webm", ".mp3", ".ogg", ".wav", ".aac", ".flac")
 
 
+# Reaction names that file your own message as a life fact when nothing is
+# configured. Slack sends reaction names without colons ("brain", not ":brain:").
+_DEFAULT_SAVEIT_EMOJI = "brain"
+
+
+def _parse_emoji_set(raw: str) -> frozenset[str]:
+    """Comma-separated reaction names → a normalized set (colons stripped)."""
+    names = {n.strip().strip(":").lower() for n in (raw or "").split(",")}
+    return frozenset(names - {""}) or frozenset({_DEFAULT_SAVEIT_EMOJI})
+
+
 def _is_audio_file(name: str, mimetype: str) -> bool:
     """True if a shared Slack file looks like audio (voice note or upload)."""
     if mimetype.startswith("audio/"):
@@ -449,6 +460,9 @@ class SlackInbound:
         bot_token: str = "",
         elevenlabs_api_key: str = "",
         elevenlabs_stt_model: str = "scribe_v1",
+        owner_member_id: str = "",
+        saveit_emoji: str = "",
+        note_to_self_channel: str = "",
     ) -> None:
         self._adapter = adapter
         self._core = core
@@ -457,6 +471,10 @@ class SlackInbound:
         self._bot_token = bot_token
         self._elevenlabs_api_key = elevenlabs_api_key
         self._elevenlabs_stt_model = elevenlabs_stt_model
+        # Curated self-signal ingest (B2). Blank owner id disables both lanes.
+        self._owner_member_id = (owner_member_id or "").strip()
+        self._saveit_emojis = _parse_emoji_set(saveit_emoji)
+        self._note_to_self_channel = (note_to_self_channel or "").strip()
         # channel_id -> (agent_id, monotonic_ts); ephemeral conversation context.
         self._sticky: dict[str, tuple[str, float]] = {}
         # Cached (mention_map, async_agents) derived from GET /api/agents.
@@ -535,11 +553,16 @@ class SlackInbound:
         text: str,
         user_id: str | None,
         bot_id: str | None = None,
+        ts: str = "",
     ) -> None:
         """Route a text message (sync chat vs async agent-reply).
 
         Ignores the bot's own messages (a `bot_id` is present, or `user_id`
         equals our bot user id) to avoid self-reply loops.
+
+        Note-to-self short-circuit: in the configured note-to-self channel, the
+        OWNER's own messages are filed as life facts instead of being routed to
+        an agent. Anyone else posting there still gets normal chat routing.
 
         Async path (mirrors bot.py::_dispatch_agent_reply): ack ONLY if the
         trigger returned 2xx; on any failure fall back to the sync path so the
@@ -552,7 +575,102 @@ class SlackInbound:
         if not text:
             return
 
+        if self._is_note_to_self(channel_id=channel_id, user_id=user_id):
+            await self._ingest_self_signal(channel_id=channel_id, ts=ts, text=text)
+            return
+
         await self._route_and_dispatch(channel_id=channel_id, text=text)
+
+    # --- curated self-signal ingest (B2) ------------------------------------
+
+    def _is_note_to_self(self, *, channel_id: str, user_id: str | None) -> bool:
+        """True only for the OWNER posting in the configured note-to-self channel.
+
+        Fails safe: no owner id configured (or no channel configured) ⇒ False,
+        so an unconfigured deployment ingests nothing.
+        """
+        if not self._owner_member_id or not self._note_to_self_channel:
+            return False
+        if channel_id != self._note_to_self_channel:
+            return False
+        return user_id == self._owner_member_id
+
+    async def on_reaction(
+        self,
+        *,
+        reaction: str,
+        user_id: str,
+        item_user: str,
+        channel_id: str,
+        ts: str,
+        client: Any,
+    ) -> None:
+        """`reaction_added` — file MY OWN message as a life fact.
+
+        Two hard, independent security filters, both before any Slack API call
+        so another person's message body is never even fetched:
+
+          1. `user_id` (who reacted) must be the configured owner;
+          2. `item_user` (who wrote the message) must be that same owner.
+
+        Unset `slack_owner_member_id` ⇒ both fail ⇒ nothing is ingested. Any
+        other emoji, or a non-message item (no channel/ts), is ignored.
+        """
+        if not self._owner_member_id:
+            return
+        if user_id != self._owner_member_id:
+            return
+        if item_user != self._owner_member_id:
+            return
+        if reaction.strip().strip(":").lower() not in self._saveit_emojis:
+            return
+        if not channel_id or not ts:
+            return
+
+        text = await self._fetch_message_text(client, channel_id, ts)
+        # A blank/failed fetch is dropped by _ingest_self_signal's own guard.
+        await self._ingest_self_signal(channel_id=channel_id, ts=ts, text=text)
+
+    @staticmethod
+    async def _fetch_message_text(client: Any, channel_id: str, ts: str) -> str:
+        """The reacted-to message's text via conversations.history, or "".
+
+        Only ever called after both owner filters have passed.
+        """
+        try:
+            resp = await client.conversations_history(
+                channel=channel_id, latest=ts, oldest=ts, inclusive=True, limit=1
+            )
+            messages = (resp or {}).get("messages") or []
+        except Exception as exc:  # noqa: BLE001 — a fetch failure must not crash inbound
+            logger.warning("slack_reaction_history_failed", error=str(exc)[:200])
+            return ""
+        if not messages:
+            logger.warning("slack_reaction_message_not_found", channel=channel_id, ts=ts)
+            return ""
+        return (messages[0].get("text") or "").strip()
+
+    async def _ingest_self_signal(self, *, channel_id: str, ts: str, text: str) -> None:
+        """File an owner self-signal into the knowledge store as a `life_fact`.
+
+        `slack://{channel}/{ts}` is the dedupe key — core derives content_id
+        from the url and upserts, so a duplicate `reaction_added` for the same
+        message refreshes one row instead of creating a second.
+        """
+        text = (text or "").strip()
+        if not text:
+            return
+        content_id = await self._core.knowledge_ingest(
+            url=f"slack://{channel_id}/{ts}",
+            title=text[:200],
+            raw_text=text,
+            tags=["life_fact", "slack"],
+            source_type="life_fact",
+        )
+        if content_id:
+            logger.info("slack_self_signal_ingested", channel=channel_id, ts=ts)
+        else:
+            logger.warning("slack_self_signal_ingest_failed", channel=channel_id, ts=ts)
 
     async def _route_and_dispatch(self, *, channel_id: str, text: str) -> None:
         """Route an inbound message body and dispatch it (sync chat vs async).

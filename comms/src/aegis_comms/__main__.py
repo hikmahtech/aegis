@@ -411,6 +411,18 @@ def _merge_slack_config(settings: CommsSettings, db_config: dict[str, Any] | Non
     settings.slack_bot_token = db_config.get("bot_token") or settings.slack_bot_token
     settings.slack_app_token = db_config.get("app_token") or settings.slack_app_token
     settings.channel = db_config.get("channel") or settings.channel
+    # Self-capture knobs: the admin Integrations page writes them to core's DB,
+    # so without this merge they'd be permanently blank in comms and the whole
+    # feature would be a silent no-op.
+    settings.slack_owner_member_id = (
+        db_config.get("owner_member_id") or settings.slack_owner_member_id
+    )
+    settings.slack_saveit_emoji = (
+        db_config.get("saveit_emoji") or settings.slack_saveit_emoji
+    )
+    settings.slack_note_to_self_channel = (
+        db_config.get("note_to_self_channel") or settings.slack_note_to_self_channel
+    )
 
 
 async def run() -> None:

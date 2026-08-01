@@ -34,6 +34,20 @@ class CommsSettings(BaseSettings):
     slack_bot_token: str = Field(default="", validation_alias=AliasChoices("AEGIS_SLACK_BOT_TOKEN"))
     slack_app_token: str = Field(default="", validation_alias=AliasChoices("AEGIS_SLACK_APP_TOKEN"))
 
+    # Curated self-signal ingest. Normally set on core's admin Integrations page
+    # and pulled over /api/internal/slack-config at boot (see _merge_slack_config);
+    # these env vars are the offline fallback. Blank owner id = the whole feature
+    # is inert, so AEGIS can never ingest someone else's message.
+    slack_owner_member_id: str = Field(
+        default="", validation_alias=AliasChoices("AEGIS_SLACK_OWNER_MEMBER_ID")
+    )
+    slack_saveit_emoji: str = Field(
+        default="brain", validation_alias=AliasChoices("AEGIS_SLACK_SAVEIT_EMOJI")
+    )
+    slack_note_to_self_channel: str = Field(
+        default="", validation_alias=AliasChoices("AEGIS_SLACK_NOTE_TO_SELF_CHANNEL")
+    )
+
     # ElevenLabs (hosted vendor — NOT the LiteLLM proxy). Drives inbound voice-note
     # transcription (Scribe STT) and outbound per-persona voice notes (TTS).
     # Empty key = both disabled.

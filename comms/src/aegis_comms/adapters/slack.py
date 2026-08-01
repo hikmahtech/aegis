@@ -423,6 +423,11 @@ class SlackAdapter:
             bot_token=self._settings.slack_bot_token,
             elevenlabs_api_key=self._settings.elevenlabs_api_key,
             elevenlabs_stt_model=self._settings.elevenlabs_stt_model,
+            owner_member_id=getattr(self._settings, "slack_owner_member_id", "") or "",
+            saveit_emoji=getattr(self._settings, "slack_saveit_emoji", "") or "",
+            note_to_self_channel=(
+                getattr(self._settings, "slack_note_to_self_channel", "") or ""
+            ),
         )
 
         @app.event("message")
@@ -440,6 +445,7 @@ class SlackAdapter:
                 text=event.get("text", ""),
                 user_id=event.get("user"),
                 bot_id=event.get("bot_id"),
+                ts=event.get("ts", ""),
             )
 
         @app.event("app_mention")
@@ -497,6 +503,20 @@ class SlackAdapter:
         async def _on_status(ack, respond):  # noqa: ANN001
             await ack()
             await respond(await inbound.on_status())
+
+        @app.event("reaction_added")
+        async def _on_reaction(event, client):  # noqa: ANN001
+            # `item` is {type, channel, ts} for a message; file reactions carry
+            # no ts and are dropped by on_reaction's channel/ts guard.
+            item = event.get("item") or {}
+            await inbound.on_reaction(
+                reaction=event.get("reaction", ""),
+                user_id=event.get("user", "") or "",
+                item_user=event.get("item_user", "") or "",
+                channel_id=item.get("channel", "") or "",
+                ts=item.get("ts", "") or "",
+                client=client,
+            )
 
         @app.event("file_shared")
         async def _on_file(event, client):  # noqa: ANN001
