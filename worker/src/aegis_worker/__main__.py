@@ -352,7 +352,7 @@ async def main():
         db_pool=deps.pool,
         knowledge_connector=connectors.get("knowledge"),
     )
-    memory_act = MemoryActivities(db_pool=deps.pool)
+    memory_act = MemoryActivities(db_pool=deps.pool, llm_client=deps.llm, model=model_balanced)
     daylog_act = DayLogActivities(
         db_pool=deps.pool,
         llm_client=deps.llm,
@@ -596,6 +596,7 @@ async def main():
         gmail_act.apply_label,
         drive_act.sync_drive_folder,
         memory_act.prune_agent_memories,
+        memory_act.consolidate_agent_memories,
         profile_act.read_profile_context,
         profile_act.apply_profile_patch,
         curiosity_act.find_curiosity_gaps,

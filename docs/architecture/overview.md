@@ -133,7 +133,7 @@ Owner-scheduled flows are listed in the Personalities table above. The remaining
 - `TodoistSyncFlow` — 5-min Sync API tick: incremental sync from Todoist, drains the outbox.
 - `DailyBriefingFlow` (Raphael, daily) — gathers interactions/activity/knowledge → synthesizes → the active comms channel (Slack).
 - `DailyReviewFlow` / `WeeklyReviewFlow` (Sebas) — daily + weekly digests; logs to `review_digest_log`, spawns acknowledgement InteractionFlow.
-- `MemoryReflectionFlow` (Sebas, nightly) — per-agent memory consolidation: caps `agent_memory` (prunes oldest/lowest-importance beyond `keep`).
+- `MemoryReflectionFlow` (Sebas, nightly) — per-agent memory consolidation. Optional first step (`consolidate: true`): an LLM *proposes* ADD/UPDATE/DELETE/NOOP ops over the agent's rows and the plan is logged for inspection — it is never applied (`dry_run=False` is refused in code until the soft-retire + provenance rails land). Then the cap: prunes oldest/lowest-importance beyond `keep`, the only step that deletes.
 - `DriveSyncFlow` (Raphael) — incremental ingest of a tracked Google Drive folder into the knowledge store; no-ops until a folder is configured.
 - `DeliveryWatchdogFlow` (Pandora's Actor, hourly) — catches interaction cards that were never delivered and checks comms `/api/health` inbound liveness; on outage captures a Todoist Inbox task (the chat channel is the thing that's down).
 - `WorkspaceRepoSyncFlow` (Pandora's Actor, daily) — scans the coding host's workspace for git checkouts and makes the `resources` table mirror it (one `kind='repository'` row per checkout); also flags tracked GitHub repos whose AEGIS webhook is missing/dead (`check_github_webhooks`, detection only — result_summary.missing_webhooks).

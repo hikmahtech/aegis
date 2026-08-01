@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import pytest
 import pytest_asyncio
 from aegis.services.memory import (
+    all_memories,
     format_memories,
     prune_memories,
     recent_memories,
@@ -88,6 +90,22 @@ async def test_record_gmail_triage_correction_distinct_ids_both_write(mem_agent)
     await record_gmail_triage_correction(mem_agent, _AID, "msg-a", "A", "useless", "important")
     await record_gmail_triage_correction(mem_agent, _AID, "msg-b", "B", "useless", "important")
     assert len(await recent_memories(mem_agent, _AID)) == 2
+
+
+async def test_all_memories_returns_ids_and_metadata(mem_agent):
+    """Consolidation needs the ids `recent_memories` throws away — that read
+    path returns bare strings, so it cannot drive an op list."""
+    await record_memory(mem_agent, _AID, "low note", importance=0.2, source="correction")
+    await record_memory(mem_agent, _AID, "high lesson", importance=0.9, source="gmail_triage_correction")
+
+    rows = await all_memories(mem_agent, _AID)
+
+    assert [r["content"] for r in rows] == ["high lesson", "low note"]  # importance-ordered
+    assert all(isinstance(r["id"], int) and r["id"] > 0 for r in rows)
+    assert rows[0]["source"] == "gmail_triage_correction"
+    assert rows[0]["importance"] == pytest.approx(0.9)
+    assert rows[0]["created_at"] is not None
+    assert len({r["id"] for r in rows}) == 2
 
 
 def test_format_memories():

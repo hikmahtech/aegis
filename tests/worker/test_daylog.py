@@ -34,6 +34,13 @@ async def _wipe(conn):
     await conn.execute("DELETE FROM knowledge_content")
     await conn.execute("DELETE FROM interactions")
     await conn.execute("DELETE FROM gtd_clarify_log")
+    # Children before parents: todoist_notes.item_id REFERENCES todoist_tasks(id)
+    # with no ON DELETE CASCADE, and the clarify tests leave notes behind (they
+    # only clean up at setup). Under `--dist loadfile` whether they land on this
+    # xdist worker is pure file-assignment luck, so the unqualified tasks delete
+    # below MUST clear the notes first or it raises ForeignKeyViolationError and
+    # errors every test in this file.
+    await conn.execute("DELETE FROM todoist_notes")
     await conn.execute("DELETE FROM todoist_tasks")
     await conn.execute("DELETE FROM workflow_runs")
     await conn.execute("DELETE FROM settings WHERE key = 'daylog_state'")
