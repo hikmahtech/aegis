@@ -250,6 +250,7 @@ def create_app(run_lifespan: bool = True, settings: Settings | None = None) -> F
         capture,
         channels,
         chat,
+        expiring_items_admin,
         gmail_reauth,
         health,
         homelab,
@@ -338,6 +339,7 @@ def create_app(run_lifespan: bool = True, settings: Settings | None = None) -> F
     app.include_router(system_status.router)
     app.include_router(resources.router)
     app.include_router(people_admin.router)
+    app.include_router(expiring_items_admin.router)
     app.include_router(todoist.router)
 
     # Serve admin panel SPA (static files from built frontend)

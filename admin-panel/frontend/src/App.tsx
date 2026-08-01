@@ -21,6 +21,7 @@ import Money from './pages/Money';
 import Todoist from './pages/Todoist';
 import Overview from './pages/Overview';
 import People from './pages/People';
+import ExpiringItems from './pages/ExpiringItems';
 import AgentDetail from './pages/AgentDetail';
 import Agents from './pages/Agents';
 import References from './pages/References';
@@ -57,6 +58,7 @@ export default function App() {
           <Route path="/content/:id" element={<ContentDetail />} />
           <Route path="/references" element={<References />} />
           <Route path="/people" element={<People />} />
+          <Route path="/expiring-items" element={<ExpiringItems />} />
           <Route path="/audit" element={<AuditLog />} />
           <Route path="/settings" element={<Settings />} />
           <Route path="/infra" element={<Infra />} />

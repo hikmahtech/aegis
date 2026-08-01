@@ -22,6 +22,7 @@ const NAV: { section: string; items: { path: string; label: string }[] }[] = [
       { path: '/references', label: 'References' },
       { path: '/content', label: 'Content' },
       { path: '/people', label: 'People' },
+      { path: '/expiring-items', label: 'Expiry Radar' },
       { path: '/market', label: 'Market' },
       { path: '/admin/money', label: 'Money' },
     ],
