@@ -28,7 +28,7 @@ from aegis_worker.activities.clarify import ClarifyActivities
 from aegis_worker.activities.cleanup import CleanupActivities
 from aegis_worker.activities.content import ContentActivities
 from aegis_worker.activities.core_client import CoreClient
-from aegis_worker.activities.curiosity import CuriosityActivities, parse_owner_emails
+from aegis_worker.activities.curiosity import CuriosityActivities
 from aegis_worker.activities.delivery import DeliveryActivities
 from aegis_worker.activities.drive import DriveActivities
 from aegis_worker.activities.gmail import GmailActivities
@@ -359,8 +359,13 @@ async def main():
         model=model_balanced,
         # Google lists the calendar owner among an event's attendees, so the
         # owner's own address must never become "a stranger you keep meeting".
-        # AEGIS_GMAIL_ACCOUNTS ("label:email,...") is the existing operator id.
-        owner_emails=parse_owner_emails(getattr(settings, "gmail_accounts", "")),
+        # DB-backed integration config (admin Integrations page), so it takes
+        # effect on a worker restart with no redeploy. Blank = no exclusion.
+        owner_emails=frozenset(
+            e.strip()
+            for e in (getattr(settings, "owner_emails", "") or "").split(",")
+            if e.strip()
+        ),
     )
     raindrop_act = RaindropActivities(
         raindrop_api_token=getattr(settings, "raindrop_api_token", ""),

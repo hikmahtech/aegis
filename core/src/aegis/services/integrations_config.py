@@ -85,6 +85,13 @@ CONFIG_REGISTRY: list[ConfigKey] = [
         help="Used to @-mention you on unacked critical infra cards (e.g. U0123456789). "
         "Blank = escalate without mention. Worker restart required.",
     ),
+    ConfigKey(
+        "owner_emails", "Your own email addresses (comma-sep)",
+        "Owner", False,
+        help="The addresses that are YOU. Google lists the calendar owner among an "
+        "event's attendees, so without this AEGIS can ask you who you are. Matched "
+        "case-insensitively. Blank = no exclusion. Worker restart required.",
+    ),
     # Feature flags — enable/disable whole subsystems. Off by default unless noted.
     # `help` names the extra config a feature needs to actually work.
     ConfigKey(

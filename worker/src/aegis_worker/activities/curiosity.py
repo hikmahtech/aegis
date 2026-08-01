@@ -43,22 +43,6 @@ _EMAIL_RE = re.compile(r"[\w.+-]+@[\w-]+\.[\w.-]+")
 _DETECTORS = ("calendar_attendee", "recurring_charge", "todoist_project")
 
 
-def parse_owner_emails(raw: str) -> frozenset[str]:
-    """`"label1:email1,label2:email2"` (Settings.gmail_accounts) -> the emails.
-
-    These are the operator's own addresses. Entries with no `:email` part
-    (accounts discovered from a token file on disk) contribute nothing —
-    a bare label is not an email. Blank input -> empty set.
-    """
-    out: set[str] = set()
-    for entry in (raw or "").split(","):
-        _, _, email = entry.partition(":")
-        email = email.strip().lower()
-        if email:
-            out.add(email)
-    return frozenset(out)
-
-
 @dataclass
 class CuriosityActivities:
     """Detect knowledge gaps worth asking the owner about."""
@@ -70,10 +54,10 @@ class CuriosityActivities:
     # what "recurring" and "frequently hit" mean without editing the detector.
     min_attendee_events: int = 3
     min_project_tasks: int = 5
-    # The operator's own email addresses, from Settings.gmail_accounts via
-    # parse_owner_emails. Google puts the calendar owner in every event's
-    # `attendees`, so without this the owner is a "stranger you keep meeting".
-    # Empty (unconfigured) = no exclusion, same as before.
+    # The operator's own email addresses (Settings.owner_emails — the DB-backed
+    # `owner_emails` integration config). Google puts the calendar owner in
+    # every event's `attendees`, so without this the owner is a "stranger you
+    # keep meeting". Empty (unconfigured) = no exclusion, same as before.
     owner_emails: frozenset[str] = frozenset()
 
     @activity.defn
@@ -169,11 +153,15 @@ class CuriosityActivities:
                 for email in _EMAIL_RE.findall(line):
                     seen.setdefault(email.lower(), set()).add(r["content_id"])
 
+        # Normalized here so the match is case-insensitive however the operator
+        # typed the config, and applied here (not at ingest) so events already
+        # in the knowledge store are covered too.
+        owners = {o.strip().lower() for o in self.owner_emails}
+
         out: list[tuple[float, dict]] = []
         for email, events in seen.items():
-            # The owner attends their own meetings — never a gap. Filtered here
-            # (not at ingest) so already-stored events are covered too.
-            if email in self.owner_emails:
+            # The owner attends their own meetings — never a gap.
+            if email in owners:
                 continue
             if len(events) < self.min_attendee_events:
                 continue
