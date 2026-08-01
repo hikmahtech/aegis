@@ -8,6 +8,7 @@ from html import escape as _esc
 from typing import Any
 
 import httpx
+from aegis.services.health import HEALTH_SOURCE
 from temporalio import activity
 
 # How old `settings.current_place` (written by the location webhook, B5) may
@@ -15,6 +16,11 @@ from temporalio import activity
 # offline, or the push has broken — and announcing a place the owner left two
 # days ago is worse than announcing none.
 _PLACE_STALE_HOURS = 12
+
+# How old a health reading (B6) may be and still lead the morning briefing.
+# Health Auto Export runs once a day, so 36h tolerates a late or skipped run
+# while still refusing to report last week's resting heart rate as today's.
+_HEALTH_STALE_HOURS = 36
 
 
 def _within_hours(ts_raw: Any, cutoff: datetime) -> bool:
@@ -386,6 +392,26 @@ class BriefingActivities:
             except Exception as exc:
                 activity.logger.warning("briefing_place_failed err=%s", str(exc)[:200])
 
+        # health: the newest reading of each metric the health push writes
+        # (B6). This is the ONE place a health value is ever rendered — it goes
+        # to the owner's own channel, never to a log line. Deliberately outside
+        # the `quiet` test below: a daily export always lands, so counting it
+        # as news would mean no briefing is ever quiet again.
+        health: dict = {}
+        if self.db_pool:
+            try:
+                hrows = await self.db_pool.fetch(
+                    "SELECT DISTINCT ON (metric) metric, value::float8 AS value "
+                    "FROM life.observations "
+                    "WHERE source = $1 AND observed_at >= $2 "
+                    "ORDER BY metric, observed_at DESC",
+                    HEALTH_SOURCE,
+                    now - timedelta(hours=_HEALTH_STALE_HOURS),
+                )
+                health = {r["metric"]: r["value"] for r in hrows if r["value"] is not None}
+            except Exception as exc:
+                activity.logger.warning("briefing_health_failed err=%s", str(exc)[:200])
+
         quiet = not (intel_out or collected_out or failed_runs or new_drift or new_cal_ids)
         new_state = {
             "last_briefing_at": now.isoformat(),
@@ -400,6 +426,7 @@ class BriefingActivities:
             "broke": {"failed_runs": failed_runs, "new_drift": new_drift},
             "calendar": {"today": cal_today, "new_ids": new_cal_ids},
             "place": place,
+            "health": health,
             "_new_state": new_state,
         }
 
@@ -409,14 +436,16 @@ class BriefingActivities:
         bundle → one-liner. Any LLM failure → deterministic fallback, so the
         briefing always ships.
 
-        A deterministic failure block (`_format_failure_block`) is appended
-        AFTER the narrative either way — the LLM is asked for 2-5 sentences
-        over the whole diff bundle, so a real failure can lose out to intel
-        headlines and get silently dropped. Counts/workflow-types bypass the
-        LLM entirely so that can't happen.
+        Two deterministic blocks are appended AFTER the narrative either way —
+        the LLM is asked for 2-5 sentences over the whole diff bundle, so a
+        real failure can lose out to intel headlines and get silently dropped.
+        Counts/workflow-types (`_format_failure_block`) and health readings
+        (`_format_health_block`) bypass the LLM entirely so that can't happen.
         """
+        health_block = self._format_health_block(changes)
         if changes.get("quiet"):
-            return "\U0001f7e2 Quiet overnight — nothing needs you."
+            quiet = "\U0001f7e2 Quiet overnight — nothing needs you."
+            return f"{quiet}\n\n{health_block}" if health_block else quiet
         fallback = self._format_changes_fallback(changes)
         narrative = fallback
         if self.llm_client:
@@ -429,8 +458,8 @@ class BriefingActivities:
             except Exception as exc:  # noqa: BLE001
                 activity.logger.warning("frame_briefing_llm_failed err=%s", str(exc)[:200])
                 narrative = fallback
-        failure_block = self._format_failure_block(changes)
-        return f"{narrative}\n\n{failure_block}" if failure_block else narrative
+        blocks = [b for b in (health_block, self._format_failure_block(changes)) if b]
+        return "\n\n".join([narrative, *blocks]) if blocks else narrative
 
     def _format_changes_fallback(self, changes: dict) -> str:
         lines: list[str] = []
@@ -464,6 +493,8 @@ class BriefingActivities:
         if place:
             lines.append("<b>Location</b>")
             lines.append(f"  • last seen at {_esc(str(place))}")
+        # Health is deliberately NOT here — `_format_health_block` appends it
+        # after the narrative on every path, so it cannot be dropped.
         return "\n".join(lines) if lines else "\U0001f7e2 Quiet overnight — nothing needs you."
 
     def _format_failure_block(self, changes: dict) -> str:
@@ -477,9 +508,27 @@ class BriefingActivities:
         types = sorted({str(r.get("workflow_type")) for r in fr if r.get("workflow_type")})
         return f"<b>⚠️ {len(fr)} workflow failure(s)</b>: {_esc(', '.join(types))}"
 
+    def _format_health_block(self, changes: dict) -> str:
+        """Health readings (B6), rendered deterministically. Empty when absent.
+
+        A block rather than a line inside the narrative, for two reasons. The
+        framing model is `model_balanced`, which may well be a hosted API —
+        body data must not leave the box merely to be phrased, so `health` is
+        excluded from `_build_briefing_prompt` and formatted here instead. And
+        the LLM is asked for 2-5 sentences over the whole bundle, so a health
+        line can lose out to intel headlines exactly as a failure can.
+        """
+        health = changes.get("health") or {}
+        if not health:
+            return ""
+        parts = [f"{_esc(str(m))} {round(float(health[m]), 1)}" for m in sorted(health)]
+        return "<b>Health</b>: " + ", ".join(parts)
+
     def _build_briefing_prompt(self, changes: dict) -> str:
         import json
-        payload = {k: v for k, v in changes.items() if k != "_new_state"}
+        # `health` is withheld: see `_format_health_block`. Adding it back sends
+        # the owner's body data to whatever `model_balanced` resolves to.
+        payload = {k: v for k, v in changes.items() if k not in ("_new_state", "health")}
         return (
             "You are raphael writing a terse morning briefing. Given this JSON of "
             "what changed since the last briefing, write a 2-5 sentence plain-text "
