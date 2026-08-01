@@ -129,3 +129,80 @@ async def test_changes_quiet_on_clean(db_pool):
     assert out["quiet"] is True
     assert out["intel"] == []
     assert out["broke"]["failed_runs"] == []
+
+
+# ---------------------------------------------------------------------------
+# B5 — the `current_place` dimension.
+#
+# The KV holds {"place": <label>, "at": <iso>}, written by the location
+# webhook. Every assertion below uses a literal age rather than the production
+# staleness constant, so moving that constant is a visible test change and not
+# a silently self-adjusting one.
+# ---------------------------------------------------------------------------
+
+
+async def _set_place(pool, value) -> None:
+    async with pool.acquire() as conn:
+        await conn.execute("DELETE FROM settings WHERE key = 'current_place'")
+        if value is not None:
+            await conn.execute(
+                "INSERT INTO settings (key, value) VALUES ('current_place', $1)", value
+            )
+
+
+@pytest.mark.asyncio
+async def test_fresh_current_place_surfaces_in_the_briefing(db_pool, _seeded):
+    await _set_place(
+        db_pool,
+        {"place": "zzb5b-office", "at": _iso(datetime.now(UTC) - timedelta(hours=1))},
+    )
+    act = BriefingActivities(db_pool=db_pool, knowledge_connector=_kc())
+    out = await act.gather_briefing_changes()
+    assert out["place"]["place"] == "zzb5b-office"
+    assert "zzb5b-office" in act._format_changes_fallback(out)
+
+
+@pytest.mark.asyncio
+async def test_stale_current_place_degrades_to_no_place_line(db_pool, _seeded):
+    """A pointer from two days ago is worse than none — the phone has been off
+    or the push has broken, and the briefing must not assert where you are."""
+    await _set_place(
+        db_pool,
+        {"place": "zzb5b-office", "at": _iso(datetime.now(UTC) - timedelta(hours=48))},
+    )
+    act = BriefingActivities(db_pool=db_pool, knowledge_connector=_kc())
+    out = await act.gather_briefing_changes()
+    assert out["place"] == {}
+    assert "zzb5b-office" not in act._format_changes_fallback(out)
+
+
+@pytest.mark.asyncio
+async def test_absent_current_place_is_no_place_line_not_an_exception(db_pool, _seeded):
+    await _set_place(db_pool, None)
+    act = BriefingActivities(db_pool=db_pool, knowledge_connector=_kc())
+    out = await act.gather_briefing_changes()
+    assert out["place"] == {}
+    # the rest of the briefing still gathered normally
+    assert any(
+        r["workflow_type"] == "RaindropIngestFlow" for r in out["broke"]["failed_runs"]
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "value",
+    [
+        {"place": "zzb5b-office"},  # no timestamp
+        {"place": "zzb5b-office", "at": "not-a-date"},
+        {"at": "2026-07-30T00:00:00+00:00"},  # no label
+        ["not", "an", "object"],
+    ],
+)
+async def test_garbage_current_place_never_kills_the_briefing(db_pool, _seeded, value):
+    await _set_place(db_pool, value)
+    act = BriefingActivities(db_pool=db_pool, knowledge_connector=_kc())
+    out = await act.gather_briefing_changes()
+    assert out["place"] == {}
+    assert any(
+        r["workflow_type"] == "RaindropIngestFlow" for r in out["broke"]["failed_runs"]
+    )

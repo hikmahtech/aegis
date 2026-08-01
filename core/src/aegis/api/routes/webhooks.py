@@ -31,6 +31,7 @@ from aegis.config import Settings
 from aegis.observability import log_audit
 from aegis.services.agents import resolve_tag
 from aegis.services.observations import record_observation
+from aegis.services.places import record_location_push
 
 logger = structlog.get_logger()
 
@@ -86,11 +87,19 @@ def _safe_json(body: bytes) -> dict:
 # Source slug → Temporal workflow name, or ``None`` to record the payload
 # inline as a ``life.observations`` row (no worker involvement).
 #
-# B4 ships only the generic numeric lane. B5 adds
-# ``"location": "LocationIngestFlow"`` and B6 a health source — one line each,
-# because the auth/idempotency/audit path below is source-agnostic.
+# B4 ships the generic numeric lane; B5 adds ``location``, also inline. A
+# source only needs a workflow when its push fans out into several rows or
+# calls something external — the auth/idempotency/audit path below is
+# source-agnostic either way.
+#
+# `location` is inline rather than flow-backed on purpose: a Temporal input is
+# persisted in workflow history, so handing the raw payload to a flow would
+# copy the owner's coordinates into a second store (and write a `workflow_runs`
+# row per ping — a phone pushing every 5 minutes is ~290 workflow executions a
+# day) in order to durably retry what is one haversine and one INSERT.
 LIFE_SOURCES: dict[str, str | None] = {
     "observation": None,
+    "location": None,
 }
 
 # Maximum accepted body. A phone/watch push is a few hundred bytes; 64 KiB is
@@ -263,13 +272,21 @@ async def life_webhook(
         # a second door to the same room is a second thing to get wrong.
         meta = payload.get("metadata")
         try:
-            row = await record_observation(
-                pool,
-                source=str(payload.get("source") or source),
-                metric=str(payload.get("metric") or ""),
-                value=payload.get("value"),
-                metadata=meta if isinstance(meta, dict) else {},
-            )
+            if source == "location":
+                # Coordinates are resolved to a named place and dropped inside
+                # `record_location_push`; they are never persisted or logged.
+                # `None` = this external_id already produced a row.
+                row = await record_location_push(pool, payload, external_id)
+                if row is None:
+                    return {"accepted": True, "duplicate": True, "external_id": external_id}
+            else:
+                row = await record_observation(
+                    pool,
+                    source=str(payload.get("source") or source),
+                    metric=str(payload.get("metric") or ""),
+                    value=payload.get("value"),
+                    metadata=meta if isinstance(meta, dict) else {},
+                )
         except (ValueError, TypeError) as exc:
             # Release the idempotency claim: a malformed push is client-fixable,
             # and a device that sends its own `id` would otherwise be locked out
