@@ -68,6 +68,11 @@ ruff format .             # format
 
 pytest config lives in the root `pyproject.toml` (not under `core/`) because rootdir is the project root.
 
+CI only runs `ruff check` (see `.github/workflows/*.yml`). Do **not** run `ruff format` on
+`core/src/aegis/services/chat.py` or `core/src/aegis/services/tools/infra.py` — both carry
+hand-laid-out data tables that a local ruff version rewrites wholesale, burying real changes
+in whole-file churn. Write already-formatted edits and let `ruff check` be the gate.
+
 ## Configuration
 
 Copy `config/.env.example` to `config/.env` and fill in secrets:
@@ -367,8 +372,8 @@ Two front doors:
 ## Adding a New Chat Tool
 
 1. Add tool schema to `CHAT_TOOLS` list in `core/src/aegis/services/chat.py` (OpenAI function-calling format)
-2. Create executor function: `async def _exec_tool_name(pool, args, ctx: ToolContext) -> str`
-3. Add to `TOOL_EXECUTORS` dict
+2. Create executor function: `async def _exec_tool_name(pool, args, ctx: ToolContext) -> str`. Executors for an already-extracted domain live in `core/src/aegis/services/tools/<domain>.py` (today: `infra.py`, `vercel.py`); anything else still goes in `chat.py` until its domain is extracted. `ToolContext` itself lives in `services/tools/base.py` and is re-exported from `chat.py`.
+3. Add to the `TOOL_EXECUTORS` dict in `chat.py` — it stays the single registry regardless of which module the executor lives in, so `_validate_agent_tool_sets` and `GET /api/agents` see every tool in one place
 4. Grant it to agents via their `metadata.tool_set` — set it on the admin **Behavior** tab (runtime source of truth) and/or in `config/seed/agents.yaml`. The shipped `AGENT_TOOL_SETS` dict is now only a seed-time default for the four example agents; an agent's DB `metadata.tool_set` overrides it, and an unconfigured agent falls back to a small read-only `_FALLBACK_TOOL_SET` (not Sebas's full surface). `_validate_agent_tool_sets` refuses to boot on a tool name with no executor, and Core additionally warns at startup on any DB `metadata.tool_set` entry that references a missing executor.
 5. If the tool needs new connectors on `ToolContext`, add the field and wire it in `send_message()`
 6. Write tests in `tests/core/test_{tool_name}_tool.py`
