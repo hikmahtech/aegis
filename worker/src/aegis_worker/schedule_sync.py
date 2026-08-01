@@ -23,6 +23,7 @@ from aegis_worker.flows.cert_radar import CertRadarConfig, CertRadarFlow
 from aegis_worker.flows.clarify import ClarifyConfig, ClarifyFlow
 from aegis_worker.flows.cleanup import CleanupConfig, CleanupFlow
 from aegis_worker.flows.daily_briefing import DailyBriefingConfig, DailyBriefingFlow
+from aegis_worker.flows.daylog import DayLogConfig, DayLogFlow
 from aegis_worker.flows.delivery_watchdog import DeliveryWatchdogConfig, DeliveryWatchdogFlow
 from aegis_worker.flows.drive_sync import DriveSyncFlow, DriveSyncInput
 from aegis_worker.flows.gmail_ingest import GmailIngestFlow, GmailIngestInput
@@ -68,6 +69,17 @@ _ACTIVITY_TYPE_MAP = {
         DailyBriefingFlow,
         DailyBriefingConfig(
             agent_id=act["agent_id"],
+        ),
+    ),
+    # day_offset 0 = the date the run starts on. At the 19:00 UTC cron that is
+    # the IST day that just closed (19:00 UTC = 00:30 IST), so the default
+    # needs no adjustment; the knob exists for a manual backfill of an older
+    # date without touching code.
+    "DayLogFlow": lambda act: (
+        DayLogFlow,
+        DayLogConfig(
+            agent_id=act["agent_id"],
+            day_offset=int(act["config"].get("day_offset", 0)),
         ),
     ),
     "CleanupFlow": lambda act: (

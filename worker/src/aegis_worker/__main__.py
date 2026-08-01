@@ -29,6 +29,7 @@ from aegis_worker.activities.cleanup import CleanupActivities
 from aegis_worker.activities.content import ContentActivities
 from aegis_worker.activities.core_client import CoreClient
 from aegis_worker.activities.curiosity import CuriosityActivities
+from aegis_worker.activities.daylog import DayLogActivities
 from aegis_worker.activities.delivery import DeliveryActivities
 from aegis_worker.activities.drive import DriveActivities
 from aegis_worker.activities.gmail import GmailActivities
@@ -58,6 +59,7 @@ from aegis_worker.flows.cert_radar import CertRadarFlow
 from aegis_worker.flows.clarify import ClarifyFlow
 from aegis_worker.flows.cleanup import CleanupFlow
 from aegis_worker.flows.daily_briefing import DailyBriefingFlow
+from aegis_worker.flows.daylog import DayLogFlow
 from aegis_worker.flows.delivery_watchdog import DeliveryWatchdogFlow
 from aegis_worker.flows.drive_sync import DriveSyncFlow
 from aegis_worker.flows.github_alert import GitHubAlertFlow
@@ -117,6 +119,7 @@ WORKFLOWS: list = [
     AlertInvestigationFlow,
     CalendarIngestFlow,
     DailyBriefingFlow,
+    DayLogFlow,
     CleanupFlow,
     InteractionFlow,
     GmailIngestFlow,
@@ -350,6 +353,11 @@ async def main():
         knowledge_connector=connectors.get("knowledge"),
     )
     memory_act = MemoryActivities(db_pool=deps.pool)
+    daylog_act = DayLogActivities(
+        db_pool=deps.pool,
+        llm_client=deps.llm,
+        model=model_balanced,
+    )
     # Registered but dormant — no flow calls these yet (A1 ships the substrate).
     profile_act = ProfileActivities(db_pool=deps.pool)
     # Same: A6 ships the gap detector, A7 is the flow that will ask the question.
@@ -591,6 +599,9 @@ async def main():
         profile_act.read_profile_context,
         profile_act.apply_profile_patch,
         curiosity_act.find_curiosity_gaps,
+        daylog_act.gather_day_events,
+        daylog_act.distil_daylog,
+        daylog_act.commit_daylog_state,
         raindrop_act.poll_bookmarks,
         rss_act.fetch_feed,
         intel_scan_act.search_source,
@@ -695,6 +706,7 @@ async def main():
         AlertInvestigationFlow,
         CalendarIngestFlow,
         DailyBriefingFlow,
+        DayLogFlow,
         CleanupFlow,
         InteractionFlow,
         GmailIngestFlow,
