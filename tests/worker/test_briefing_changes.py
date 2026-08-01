@@ -237,7 +237,34 @@ async def test_a_fresh_health_reading_surfaces_in_the_briefing(db_pool, _seeded)
     act = BriefingActivities(db_pool=db_pool, knowledge_connector=_kc())
     out = await act.gather_briefing_changes()
     assert out["health"] == {"resting_hr": 54.0}
-    assert "resting_hr: 54" in act._format_changes_fallback(out)
+    assert act._format_health_block(out) == "<b>Health</b>: resting_hr 54.0"
+
+
+@pytest.mark.asyncio
+async def test_the_framing_prompt_never_carries_a_health_value(db_pool, _seeded):
+    """The framing model is `model_balanced`, which may be a hosted API. The
+    health line is rendered deterministically so body data never goes to it."""
+    await _set_health(db_pool, "resting_hr", 54321.5, age_hours=6)
+    act = BriefingActivities(db_pool=db_pool, knowledge_connector=_kc())
+    out = await act.gather_briefing_changes()
+    prompt = act._build_briefing_prompt(out)
+    assert "resting_hr" not in prompt
+    assert "54321" not in prompt  # distinctive enough not to collide with a timestamp
+    # Non-vacuity: the prompt really does carry the rest of the bundle.
+    assert "RaindropIngestFlow" in prompt
+
+
+@pytest.mark.asyncio
+async def test_the_health_block_survives_an_llm_narrative(db_pool, _seeded):
+    """It is appended after the narrative, so a chatty model cannot drop it."""
+    await _set_health(db_pool, "steps", 8421, age_hours=6)
+    llm = AsyncMock()
+    llm.think = AsyncMock(return_value={"response": "Nothing much happened."})
+    act = BriefingActivities(db_pool=db_pool, knowledge_connector=_kc(), llm_client=llm)
+    out = await act.gather_briefing_changes()
+    framed = await act.frame_briefing(out)
+    assert framed.startswith("Nothing much happened.")
+    assert "<b>Health</b>: steps 8421.0" in framed
 
 
 @pytest.mark.asyncio
@@ -246,7 +273,7 @@ async def test_a_health_reading_from_last_week_is_not_reported_as_today(db_pool,
     act = BriefingActivities(db_pool=db_pool, knowledge_connector=_kc())
     out = await act.gather_briefing_changes()
     assert out["health"] == {}
-    assert "resting_hr" not in act._format_changes_fallback(out)
+    assert act._format_health_block(out) == ""
 
 
 @pytest.mark.asyncio

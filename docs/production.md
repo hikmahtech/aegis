@@ -227,6 +227,13 @@ attaches is not stored. The one place a health value is rendered is the daily
 briefing's *Health* line — the newest reading of each metric, dropped once it
 is more than 36 hours old — which goes to the owner's own channel.
 
+**Health values are also withheld from the briefing's framing model.** That
+model is `model_balanced`, which may resolve to a hosted API, so the *Health*
+line is formatted deterministically and appended after the narrative rather
+than being handed to the LLM to phrase — the same treatment the workflow-failure
+block gets, and for the second reason too: an appended block cannot be dropped
+by a model asked for 2-5 sentences.
+
 Ingest is inline, like `location`: a Temporal workflow argument is persisted
 verbatim in workflow history, and handing a health batch to a flow would copy
 body data into a second store with its own retention and its own web UI.
