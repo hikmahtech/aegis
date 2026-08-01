@@ -41,6 +41,10 @@ async def _wipe(conn):
     await conn.execute("DELETE FROM knowledge_chunks")
     await conn.execute("DELETE FROM knowledge_content")
     await conn.execute("DELETE FROM chat_history WHERE agent_id = $1", AGENT)
+    # Children before parents (same reason as tests/worker/test_daylog.py):
+    # todoist_notes -> todoist_tasks -> todoist_projects, none cascading, and
+    # the clarify tests leave notes behind for whichever xdist worker gets them.
+    await conn.execute("DELETE FROM todoist_notes")
     await conn.execute("DELETE FROM todoist_tasks")
     await conn.execute("DELETE FROM todoist_projects")
 
