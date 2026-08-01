@@ -87,6 +87,22 @@ export const api = {
   deletePerson: (id: string) =>
     apiFetch<any>(`/api/admin/people/${id}`, { method: 'DELETE' }),
 
+  // Expiry radar registry (life.expiring_items — passports, policies, warranties)
+  listExpiringItems: (params?: { kind?: string; dueWithin?: number }) => {
+    const q = new URLSearchParams();
+    if (params?.kind) q.set('kind', params.kind);
+    if (params?.dueWithin !== undefined) q.set('due_within', String(params.dueWithin));
+    const qs = q.toString();
+    return apiFetch<any[]>(`/api/admin/expiring-items${qs ? `?${qs}` : ''}`);
+  },
+  getExpiringItem: (id: string) => apiFetch<any>(`/api/admin/expiring-items/${id}`),
+  createExpiringItem: (data: any) =>
+    apiFetch<any>('/api/admin/expiring-items', { method: 'POST', body: JSON.stringify(data) }),
+  updateExpiringItem: (id: string, data: any) =>
+    apiFetch<any>(`/api/admin/expiring-items/${id}`, { method: 'PUT', body: JSON.stringify(data) }),
+  deleteExpiringItem: (id: string) =>
+    apiFetch<any>(`/api/admin/expiring-items/${id}`, { method: 'DELETE' }),
+
   // Channels (email / rss / raindrop ingestion — DB-owned, UI-managed)
   listChannels: (kind?: string) =>
     apiFetch<any[]>(`/api/admin/channels${kind ? `?kind=${encodeURIComponent(kind)}` : ''}`),

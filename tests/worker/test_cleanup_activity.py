@@ -468,3 +468,50 @@ async def test_life_people_is_never_pruned():
     assert result == {}
     pool.execute.assert_not_awaited()
 
+
+async def test_life_expiring_items_and_their_alerts_are_never_pruned():
+    """life.expiring_items / life.expiring_item_alerts (migration 018) are
+    deliberately NOT age-pruned, for two independent reasons:
+
+    1. expiring_items is user-curated (like life.people). An item whose
+       expiry is long past is the MOST important row in the table — it is the
+       document that still needs renewing — so age-pruning would delete
+       exactly the alarm the radar exists to raise.
+    2. expiring_item_alerts is the dedup ledger, and per migration 013 the
+       fix for duplicate alerts (#113) was an existence check across ALL
+       time. Pruning that ledger by age re-arms every already-fired
+       threshold, reintroducing precisely the bug 013 closed.
+
+    Guards the decision two ways: absent from all three maps (an entry in
+    only one is the silent-no-op bug this file already covers), AND a
+    retention config naming either table is ignored at runtime rather than
+    issuing a DELETE.
+    """
+    for table in ("life.expiring_items", "life.expiring_item_alerts"):
+        assert table not in _TIMESTAMP_COLUMNS
+        assert table not in _ALLOWED_TABLES
+        assert table not in _DEFAULT_RETENTIONS
+
+    pool = AsyncMock()
+    pool.fetchval = AsyncMock(return_value=True)
+    pool.execute = AsyncMock(return_value="DELETE 10")
+    activities = CleanupActivities(db_pool=pool)
+    env = ActivityEnvironment()
+    result = await env.run(
+        activities.prune_old_records,
+        {"retentions": {"life.expiring_items": 365, "life.expiring_item_alerts": 365}},
+    )
+    assert result == {}
+    pool.execute.assert_not_awaited()
+
+
+async def test_registered_life_tables_are_a_deliberate_allowlist():
+    """The `life` schema now has three tables and only ONE is pruned.
+
+    A future `life.*` table added to the retention maps by reflex — rather
+    than by the deliberate user-curated-vs-machine-written call migrations
+    016/017/018 each document — trips this test.
+    """
+    life_tables = {t for t in _TIMESTAMP_COLUMNS if t.startswith("life.")}
+    assert life_tables == {"life.observations"}
+
