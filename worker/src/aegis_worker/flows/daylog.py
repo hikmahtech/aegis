@@ -12,12 +12,17 @@ data, and A9's rollups need every date present to reason about a week.
 
 Scheduled nightly at 19:00 UTC = 00:30 IST — after the IST day closes, so
 the run's own UTC date IS the IST day being logged.
+
+A9 folds the weekly and monthly rollups into this same flow class via
+`DayLogConfig.mode`: the period runs read the already-filed daily entries
+back out and condense them into one `source_type='daylog_rollup'` document,
+so a "last quarter" retrieval reads 3 documents instead of 90.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import timedelta
+from datetime import datetime, timedelta
 
 from temporalio import workflow
 
@@ -47,14 +52,52 @@ class DayLogConfig:
 
     agent_id: str = "raphael"
     day_offset: int = 0
+    # "daily" | "weekly" | "monthly". One flow class with a mode switch rather
+    # than three near-identical @workflow.defn classes — the schedule is what
+    # differs, not the shape of the work.
+    mode: str = "daily"
+
+
+_ROLLUP_MODES = ("weekly", "monthly")
+
+
+def rollup_window(mode: str, now: datetime) -> tuple[str, str, str] | None:
+    """`(start_date, end_date, label)` for the period `now` sits in.
+
+    `None` means "this run is not a period end" — cron has no last-day-of-month
+    operator, so the monthly schedule fires on days 28-31 and this guard drops
+    every run but the real month end. February (28 or 29) and 30/31-day months
+    all fall out of the same "is tomorrow a new month" test.
+
+    Weekly anchors on the ISO week (Mon-Sun) that `now` belongs to, so the
+    Sunday-evening scheduled run covers the week that just closed, and a manual
+    mid-week run produces the SAME url — a later Sunday run then completes it
+    in place rather than filing a second, partial rollup.
+    """
+    if mode == "weekly":
+        iso = now.isocalendar()
+        start = now - timedelta(days=iso[2] - 1)
+        return (
+            start.strftime("%Y-%m-%d"),
+            (start + timedelta(days=6)).strftime("%Y-%m-%d"),
+            f"{iso[0]}-W{iso[1]:02d}",
+        )
+    if mode == "monthly":
+        if (now + timedelta(days=1)).month == now.month:
+            return None
+        return now.strftime("%Y-%m-01"), now.strftime("%Y-%m-%d"), now.strftime("%Y-%m")
+    raise ValueError(f"unknown daylog rollup mode: {mode!r}")
 
 
 @workflow.defn
 class DayLogFlow:
-    """Gather → distil → ingest → commit cursor, for one day."""
+    """Gather → distil → ingest → commit cursor, for one day (or one period)."""
 
     @workflow.run
     async def run(self, config: DayLogConfig) -> dict:
+        if config.mode != "daily":
+            return await self._run_rollup(config)
+
         target_date = (workflow.now() - timedelta(days=config.day_offset)).strftime("%Y-%m-%d")
         workflow.logger.info("daylog_starting date=%s", target_date)
 
@@ -136,5 +179,98 @@ class DayLogFlow:
             "date": target_date,
             "url": url,
             "quiet": bool(events.get("quiet")),
+            "content_id": (ingested or {}).get("content_id"),
+        }
+
+    # ---------------------------------------------------------------- rollups
+
+    async def _run_rollup(self, config: DayLogConfig) -> dict:
+        """Condense a window of already-filed day logs into one entry."""
+        if config.mode not in _ROLLUP_MODES:
+            # A typo'd activities.config must not crash a scheduled run.
+            workflow.logger.warning("daylog_unknown_mode mode=%s", config.mode)
+            return {"status": "skipped", "reason": "unknown_mode", "mode": config.mode}
+
+        window = rollup_window(config.mode, workflow.now())
+        if window is None:
+            workflow.logger.info("daylog_rollup_not_period_end mode=%s", config.mode)
+            return {"status": "skipped", "reason": "not_period_end", "mode": config.mode}
+        start, end, label = window
+        kind = "week" if config.mode == "weekly" else "month"
+        url = f"aegis://daylog/{kind}/{label}"
+
+        try:
+            entries = await workflow.execute_activity_method(
+                DayLogActivities.gather_daylogs,
+                args=[start, end],
+                start_to_close_timeout=TIMEOUT_STANDARD,
+                retry_policy=RETRY_ONCE,
+            )
+        except Exception:
+            workflow.logger.warning("daylog_rollup_gather_failed label=%s", label)
+            return {"status": "skipped", "reason": "gather_failed", "label": label}
+
+        # One day does not make a week. Filing a "rollup" of a single entry
+        # only duplicates that entry into the retrieval set.
+        if len(entries) < 2:
+            workflow.logger.info("daylog_rollup_insufficient label=%s n=%d", label, len(entries))
+            return {"status": "insufficient", "label": label, "entries": len(entries)}
+
+        try:
+            narrative = await workflow.execute_activity_method(
+                DayLogActivities.distil_rollup,
+                args=[entries, config.mode, label, config.agent_id],
+                start_to_close_timeout=TIMEOUT_LLM,
+                retry_policy=NO_RETRY,
+            )
+        except Exception:
+            workflow.logger.warning("daylog_rollup_distil_failed label=%s", label)
+            return {"status": "skipped", "reason": "distil_failed", "label": label}
+
+        if not (narrative or "").strip():
+            return {"status": "skipped", "reason": "empty_narrative", "label": label}
+
+        covers = [e.get("date") for e in entries]
+        try:
+            ingested = await workflow.execute_activity_method(
+                ContentActivities.ingest_content,
+                args=[
+                    {
+                        "url": url,
+                        "title": f"{kind.capitalize()} Log {label}",
+                        "source_type": "daylog_rollup",
+                        "raw_text": narrative,
+                        "tags": ["daylog", "daylog_rollup"],
+                        "metadata": {
+                            "period": config.mode,
+                            "label": label,
+                            "start": start,
+                            "end": end,
+                            "covers": covers,
+                        },
+                    }
+                ],
+                start_to_close_timeout=TIMEOUT_STANDARD,
+                retry_policy=RETRY_ONCE,
+            )
+        except Exception:
+            workflow.logger.warning("daylog_rollup_ingest_failed label=%s", label)
+            return {"status": "skipped", "reason": "ingest_failed", "label": label}
+
+        status = (ingested or {}).get("status")
+        if status != "ok":
+            workflow.logger.warning("daylog_rollup_not_ingested label=%s status=%s", label, status)
+            return {
+                "status": "skipped",
+                "reason": f"ingest_{status or 'no_result'}",
+                "label": label,
+            }
+
+        return {
+            "status": "ingested",
+            "mode": config.mode,
+            "label": label,
+            "url": url,
+            "covers": covers,
             "content_id": (ingested or {}).get("content_id"),
         }

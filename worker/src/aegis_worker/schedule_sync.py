@@ -75,11 +75,14 @@ _ACTIVITY_TYPE_MAP = {
     # the IST day that just closed (19:00 UTC = 00:30 IST), so the default
     # needs no adjustment; the knob exists for a manual backfill of an older
     # date without touching code.
+    # `mode` selects daily / weekly / monthly — three schedule rows, one flow
+    # class. schedule_id is the activity slug, so the rows never collide.
     "DayLogFlow": lambda act: (
         DayLogFlow,
         DayLogConfig(
             agent_id=act["agent_id"],
             day_offset=int(act["config"].get("day_offset", 0)),
+            mode=str(act["config"].get("mode", "daily")),
         ),
     ),
     "CleanupFlow": lambda act: (

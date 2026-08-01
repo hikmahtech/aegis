@@ -21,6 +21,11 @@ are deliberately NOT a source here.
 
 Day boundaries are UTC. The nightly cron fires at 19:00 UTC = 00:30 IST, so
 the run's own UTC date is the IST day that just closed.
+
+A9 adds the period rollups on top: `gather_daylogs` reads a date RANGE of
+already-filed day logs back out and `distil_rollup` condenses them into one
+`source_type='daylog_rollup'` entry, so retrieval over "last quarter" reads
+3 documents instead of 90.
 """
 
 from __future__ import annotations
@@ -90,6 +95,55 @@ def _format_daylog_fallback(events: dict, date: str) -> str:
     if not lines:
         return f"Day log for {date}. Quiet day — nothing was recorded."
     return f"Day log for {date}.\n" + "\n".join(lines)
+
+
+# --- A9 rollups ---------------------------------------------------------
+
+# Per-entry body clip. A month is 31 entries; at 1200 chars each the whole
+# prompt is ~37 KB, which fits the balanced tier with room to spare while
+# keeping the Temporal activity payload small.
+_ROLLUP_ENTRY_CLIP = 1200
+_ROLLUP_PROMPT_CLIP = 40000
+
+
+def _stitch(chunks: list[str]) -> str:
+    """Rejoin `knowledge_chunks` rows into the original body.
+
+    `KnowledgeStore._chunk` slices with a 200-char OVERLAP, so a plain
+    concatenation repeats a paragraph at every chunk boundary — visible
+    duplication in the rollup that actually gets filed. Drop the longest
+    suffix/prefix match instead of hardcoding core's overlap constant.
+    """
+    out = ""
+    for chunk in chunks:
+        n = min(len(out), len(chunk))
+        while n and not out.endswith(chunk[:n]):
+            n -= 1
+        out += chunk[n:]
+    return out
+
+
+def _format_rollup_fallback(entries: list[dict], period: str, label: str) -> str:
+    """Deterministic concatenation — always computed, used when the LLM isn't."""
+    header = f"{period.capitalize()} log {label} — {len(entries)} day(s) recorded."
+    blocks = [
+        f"{e.get('date') or '?'}\n{(e.get('text') or '').strip()}"
+        for e in entries
+        if (e.get("text") or "").strip()
+    ]
+    return header + ("\n\n" + "\n\n".join(blocks) if blocks else "")
+
+
+_ROLLUP_SYSTEM_PROMPT = (
+    "You are the owner's biographer, condensing a run of their daily diary "
+    "entries into one summary of the period, in the third person. Write "
+    "300-600 words of plain prose (no markdown, no headings, no bullets) "
+    "covering the recurring themes, the decisions that were made, what "
+    "shipped or broke, and the threads still open at the end of the period. "
+    "Name the actual people, projects and items — a future search over this "
+    "period must hit the real names. Invent nothing that is not in the "
+    "entries. If the entries are mostly empty, say so in one sentence."
+)
 
 
 _SYSTEM_PROMPT = (
@@ -298,6 +352,104 @@ class DayLogActivities:
             completion_tokens=result.get("completion_tokens", 0),
             latency_ms=int((time.monotonic() - _t0) * 1000),
             purpose="daylog_narrative",
+            agent_id=agent_id,
+        )
+        return (result.get("response") or "").strip() or fallback
+
+    # ---------------------------------------------------------------- rollups
+
+    @activity.defn
+    async def gather_daylogs(self, start: str, end: str) -> list[dict]:
+        """Filed day logs whose `metadata.date` falls in `[start, end]`, oldest first.
+
+        DEVIATION from the A9 sketch, which routed this through
+        `KnowledgeStore.list_content_items` / `search`. Neither can do it:
+
+        * `list_content_items` selects the `summary` COLUMN, and A8 files the
+          narrative as `raw_text` — `knowledge_content` has no raw-text column
+          at all, the body exists only as `knowledge_chunks` rows. It also
+          filters on nothing but `source_type`, returning an `ingested_at
+          DESC` window rather than a date range.
+        * `search` is a semantic top-k over a query string, so it can neither
+          bound a window nor guarantee every date in it.
+
+        Going through either yields a rollup of titles with no content — the
+        precise silent failure A9's acceptance criteria forbid. Read the
+        chunks directly, exactly as `_source_meetings` above already reads
+        `source_type='calendar'`.
+        """
+        if self.db_pool is None:
+            return []
+        rows = await self.db_pool.fetch(
+            "SELECT c.metadata->>'date' AS date, c.title, "
+            "       array_agg(k.chunk_text ORDER BY k.chunk_index) "
+            "         FILTER (WHERE k.chunk_text IS NOT NULL) AS chunks "
+            "FROM knowledge_content c "
+            "LEFT JOIN knowledge_chunks k ON k.content_id = c.content_id "
+            "WHERE c.source_type = 'daylog' "
+            "  AND c.metadata->>'date' >= $1 AND c.metadata->>'date' <= $2 "
+            "GROUP BY c.content_id, c.title, c.metadata "
+            "ORDER BY 1",
+            start,
+            end,
+        )
+        out = [
+            {
+                "date": r["date"],
+                "title": _clip(r["title"], 200),
+                "text": _stitch(list(r["chunks"] or []))[:_ROLLUP_ENTRY_CLIP],
+            }
+            for r in rows
+        ]
+        activity.logger.info("daylog_rollup_gathered start=%s end=%s n=%d", start, end, len(out))
+        return out
+
+    @activity.defn
+    async def distil_rollup(
+        self,
+        entries: list[dict],
+        period: str,
+        label: str,
+        agent_id: str = "raphael",
+    ) -> str:
+        """One narrative for the whole period. Never raises, never returns "".
+
+        Same discipline as `distil_daylog`: the deterministic concatenation is
+        built first and is the floor, so an absent or failing LLM costs prose
+        quality, never the rollup.
+        """
+        import json
+
+        fallback = _format_rollup_fallback(entries, period, label)
+        if not self.llm_client:
+            return fallback
+
+        from aegis.observability import record_llm_call
+
+        _t0 = time.monotonic()
+        try:
+            result = await self.llm_client.think(
+                prompt=json.dumps(entries, default=str)[:_ROLLUP_PROMPT_CLIP],
+                model=self.model,
+                system_prompt=_ROLLUP_SYSTEM_PROMPT,
+                max_tokens=2400,
+                db_pool=self.db_pool,
+                purpose="daylog_rollup",
+                agent_id=agent_id,
+            )
+        except Exception as exc:  # noqa: BLE001 — degrade to the concatenation
+            activity.logger.warning(
+                "daylog_rollup_llm_failed label=%s err=%s", label, str(exc)[:200]
+            )
+            return fallback
+
+        await record_llm_call(
+            self.db_pool,
+            model=result.get("model", self.model),
+            prompt_tokens=result.get("prompt_tokens", 0),
+            completion_tokens=result.get("completion_tokens", 0),
+            latency_ms=int((time.monotonic() - _t0) * 1000),
+            purpose="daylog_rollup",
             agent_id=agent_id,
         )
         return (result.get("response") or "").strip() or fallback

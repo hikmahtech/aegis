@@ -123,6 +123,32 @@ activities:
     config: {}
     active: true
 
+  # Raphael — weekly rollup (A9), same flow class with mode=weekly. Sunday
+  # 20:20 UTC: after the 19:00 UTC nightly entry for that same Sunday lands,
+  # so the ISO week (Mon-Sun) it summarises is complete. Minute :20 on
+  # purpose — minute :00 is the busiest slot in this file (two hourly flows
+  # plus every */N schedule land there), and :30 is the next busiest.
+  - slug: daylog-weekly
+    workflow_type: DayLogFlow
+    agent_id: raphael
+    schedule_cron: "20 20 * * 0"
+    config:
+      mode: weekly
+    active: true
+
+  # Raphael — monthly rollup (A9), mode=monthly. Cron has no last-day-of-month
+  # operator, so this fires on days 28-31 and DayLogFlow's own guard drops
+  # every run except the real month end (correct for February, 30- and
+  # 31-day months alike). 21:20 UTC on that day, i.e. after both the 19:00
+  # nightly entry and any 20:20 weekly run for the same date.
+  - slug: daylog-monthly
+    workflow_type: DayLogFlow
+    agent_id: raphael
+    schedule_cron: "20 21 28-31 * *"
+    config:
+      mode: monthly
+    active: true
+
   # Raphael — knowledge ingestion (raindrop + rss + intel scans)
   - slug: raindrop-ingest-2h
     workflow_type: RaindropIngestFlow
