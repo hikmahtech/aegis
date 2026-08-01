@@ -9,7 +9,8 @@ has ever been told (its memories and its persona docs).
                   and is never mentioned in chat_history / agent_memory / profile
   (b) finance   — an active `finance.recurring_charge` whose vendor is never
                   mentioned in agent_memory / profile
-  (c) todoist   — a project carrying real task volume with no profile context
+  (c) todoist   — a project carrying real OPEN task volume with no profile
+                  context (a finished project is not a gap)
 
 Each detector is independently try/excepted: a broken one costs its own
 candidates, never the run. `novelty_key` (`attendee:<email>`, `charge:<vendor>`,
@@ -42,6 +43,22 @@ _EMAIL_RE = re.compile(r"[\w.+-]+@[\w-]+\.[\w.-]+")
 _DETECTORS = ("calendar_attendee", "recurring_charge", "todoist_project")
 
 
+def parse_owner_emails(raw: str) -> frozenset[str]:
+    """`"label1:email1,label2:email2"` (Settings.gmail_accounts) -> the emails.
+
+    These are the operator's own addresses. Entries with no `:email` part
+    (accounts discovered from a token file on disk) contribute nothing —
+    a bare label is not an email. Blank input -> empty set.
+    """
+    out: set[str] = set()
+    for entry in (raw or "").split(","):
+        _, _, email = entry.partition(":")
+        email = email.strip().lower()
+        if email:
+            out.add(email)
+    return frozenset(out)
+
+
 @dataclass
 class CuriosityActivities:
     """Detect knowledge gaps worth asking the owner about."""
@@ -53,6 +70,11 @@ class CuriosityActivities:
     # what "recurring" and "frequently hit" mean without editing the detector.
     min_attendee_events: int = 3
     min_project_tasks: int = 5
+    # The operator's own email addresses, from Settings.gmail_accounts via
+    # parse_owner_emails. Google puts the calendar owner in every event's
+    # `attendees`, so without this the owner is a "stranger you keep meeting".
+    # Empty (unconfigured) = no exclusion, same as before.
+    owner_emails: frozenset[str] = frozenset()
 
     @activity.defn
     async def find_curiosity_gaps(self, agent_id: str = "sebas", limit: int = 5) -> list[dict]:
@@ -149,6 +171,10 @@ class CuriosityActivities:
 
         out: list[tuple[float, dict]] = []
         for email, events in seen.items():
+            # The owner attends their own meetings — never a gap. Filtered here
+            # (not at ingest) so already-stored events are covered too.
+            if email in self.owner_emails:
+                continue
             if len(events) < self.min_attendee_events:
                 continue
             local = email.split("@")[0]
@@ -214,7 +240,7 @@ class CuriosityActivities:
         rows = await self.db_pool.fetch(
             "SELECT p.name, COUNT(t.id) AS tasks FROM todoist_projects p "
             "JOIN todoist_tasks t ON t.project_id = p.id "
-            "WHERE p.is_archived = FALSE "
+            "WHERE p.is_archived = FALSE AND t.is_completed = FALSE "
             "GROUP BY p.name HAVING COUNT(t.id) >= $1 "
             "ORDER BY COUNT(t.id) DESC LIMIT 20",
             self.min_project_tasks,

@@ -61,7 +61,8 @@ async def capture(
     `kind="life_fact"` skips Todoist entirely and upserts the text into the
     knowledge store under a synthetic `aegis://life_fact/{external_id}` URL,
     so re-posting the same text is an idempotent no-op (`content_id` is a
-    hash of that URL). `task_ref` is None on that lane.
+    hash of that URL). `task_ref` is None on that lane, and text that ingests
+    to nothing (whitespace-only) is a 422 rather than a phantom `content_id`.
     """
     from aegis.services.chat import _capture_to_inbox_impl  # avoid circular import
 
@@ -88,12 +89,28 @@ async def capture(
             tags=["life_fact", body.source],
         )
         content_id = result.get("content_id")
+        status = result.get("status")
+        if status == "empty":
+            # ingest_content early-returns without writing when the body chunks
+            # to nothing (e.g. whitespace-only text, which pydantic's
+            # min_length=1 lets through and the strip above empties). Returning
+            # 200 + content_id here hands the caller an id for a row that does
+            # not exist — reject instead.
+            logger.warning(
+                "capture_admin_life_fact_empty",
+                source_tag=source_tag,
+                external_id=ext_id[:32],
+            )
+            raise HTTPException(
+                status_code=422,
+                detail="life_fact text is empty after stripping — nothing ingested",
+            )
         logger.info(
             "capture_admin_life_fact",
             source_tag=source_tag,
             external_id=ext_id[:32],
             content_id=content_id,
-            status=result.get("status"),
+            status=status,
         )
         return CaptureResponse(
             task_ref=None,

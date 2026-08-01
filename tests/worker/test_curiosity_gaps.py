@@ -12,7 +12,7 @@ from uuid import uuid4
 
 import pytest
 import pytest_asyncio
-from aegis_worker.activities.curiosity import CuriosityActivities
+from aegis_worker.activities.curiosity import CuriosityActivities, parse_owner_emails
 from temporalio.testing import ActivityEnvironment
 
 AGENT = "sebas"
@@ -201,6 +201,62 @@ async def test_attendee_mentioned_in_chat_history_is_not_a_gap(clean_db):
     assert await _run(clean_db) == []
 
 
+# ------------------------------------------------------- owner-email exclusion
+
+
+def test_parse_owner_emails_extracts_and_lowercases():
+    assert parse_owner_emails("personal:Me@Example.COM, work:me@work.io") == frozenset(
+        {"me@example.com", "me@work.io"}
+    )
+
+
+def test_parse_owner_emails_ignores_label_only_and_blank_entries():
+    """A bare label (token-file-discovered account) is not an email address."""
+    assert parse_owner_emails("personal, ,work:me@work.io") == frozenset({"me@work.io"})
+
+
+def test_parse_owner_emails_on_blank_config_is_empty():
+    assert parse_owner_emails("") == frozenset()
+
+
+async def test_owner_email_is_never_a_curiosity_gap(clean_db):
+    """Google lists the calendar owner in `attendees` — don't ask who they are.
+
+    Also pins case-insensitivity: the event says `Arshad@Hikmah.COM`, the
+    config says lowercase.
+    """
+    for i in range(4):
+        await _add_calendar_event(
+            clean_db, f"ev-{i}", "Arshad@Hikmah.COM, nadia@example.com"
+        )
+
+    out = await _run(
+        clean_db, owner_emails=parse_owner_emails("hikmah:arshad@hikmah.com")
+    )
+
+    assert [c["novelty_key"] for c in out] == ["attendee:nadia@example.com"]
+
+
+async def test_unset_owner_emails_excludes_nobody(clean_db):
+    """Unconfigured => previous behaviour, no exclusion and no exception."""
+    for i in range(3):
+        await _add_calendar_event(clean_db, f"ev-{i}", "nadia@example.com")
+
+    out = await _run(clean_db)  # owner_emails defaults to frozenset()
+
+    assert [c["novelty_key"] for c in out] == ["attendee:nadia@example.com"]
+
+
+def test_owner_emails_are_wired_into_the_worker():
+    """The dataclass field is useless unless main() actually fills it."""
+    import inspect
+
+    import aegis_worker.__main__ as m
+
+    src = inspect.getsource(m.main)
+    assert "owner_emails=parse_owner_emails(" in src
+
+
 async def test_busy_todoist_project_with_no_profile_context_is_a_gap(clean_db):
     await clean_db.execute(
         "INSERT INTO todoist_projects (id, name, is_archived) VALUES ('p1', 'Sabaki', FALSE)"
@@ -216,6 +272,49 @@ async def test_busy_todoist_project_with_no_profile_context_is_a_gap(clean_db):
 
     assert [c["novelty_key"] for c in out] == ["project:sabaki"]
     assert out[0]["evidence"] == {"tasks": 5}
+
+
+async def test_finished_project_is_not_a_gap(clean_db):
+    """A project whose tasks are all done doesn't 'carry' anything."""
+    await clean_db.execute(
+        "INSERT INTO todoist_projects (id, name, is_archived) VALUES ('p1', 'Sabaki', FALSE)"
+    )
+    for i in range(8):
+        await clean_db.execute(
+            "INSERT INTO todoist_tasks (id, project_id, content, is_completed) "
+            "VALUES ($1, 'p1', $2, TRUE)",
+            f"t{i}",
+            f"done {i}",
+        )
+
+    assert await _run(clean_db) == []
+
+
+async def test_project_task_count_excludes_completed_tasks(clean_db):
+    """The evidence number must be OPEN tasks, not lifetime task volume."""
+    await clean_db.execute(
+        "INSERT INTO todoist_projects (id, name, is_archived) VALUES ('p1', 'Sabaki', FALSE)"
+    )
+    for i in range(5):
+        await clean_db.execute(
+            "INSERT INTO todoist_tasks (id, project_id, content, is_completed) "
+            "VALUES ($1, 'p1', $2, FALSE)",
+            f"open-{i}",
+            f"task {i}",
+        )
+    for i in range(20):
+        await clean_db.execute(
+            "INSERT INTO todoist_tasks (id, project_id, content, is_completed) "
+            "VALUES ($1, 'p1', $2, TRUE)",
+            f"done-{i}",
+            f"done {i}",
+        )
+
+    out = await _run(clean_db)
+
+    assert [c["novelty_key"] for c in out] == ["project:sabaki"]
+    assert out[0]["evidence"] == {"tasks": 5}
+    assert "5 of your tasks" in out[0]["question"]
 
 
 async def test_broken_detector_does_not_kill_the_run(clean_db, monkeypatch):

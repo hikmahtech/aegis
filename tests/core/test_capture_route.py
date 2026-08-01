@@ -208,6 +208,25 @@ async def test_capture_life_fact_does_not_touch_todoist(life_fact_client, monkey
     assert r.json()["task_ref"] is None
 
 
+async def test_capture_life_fact_blank_text_is_rejected(life_fact_client, db_pool):
+    """Whitespace-only text writes no row — the caller must not get an id.
+
+    pydantic's min_length=1 lets "   " through, the route strips it, and
+    ingest_content early-returns status="empty" without writing.
+    """
+    r = await life_fact_client.post(
+        "/api/admin/capture",
+        json={"text": "   ", "source": "chat", "kind": "life_fact"},
+    )
+
+    assert r.status_code == 422, r.text
+    assert "content_id" not in r.text
+    rows = await db_pool.fetchval(
+        "SELECT count(*) FROM knowledge_content WHERE url LIKE 'aegis://life_fact/%'"
+    )
+    assert rows == 0, "a row was written for blank life_fact text"
+
+
 def test_capture_default_kind_is_task(app_client, monkeypatch):
     """kind omitted → the unchanged Todoist path (no behaviour drift)."""
     async def fake_capture(pool, source_tag, external_id, title, description):
