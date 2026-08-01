@@ -170,6 +170,8 @@ The shipped schedule set (`config/seed/activities.yaml` — all crons UTC):
 | `gtd-weekly-review` | `30 3 * * 0` | `WeeklyReviewFlow` | Sebas | Weekly review digest (Sunday) |
 | `receipt-ingest-weekly` | `0 5 * * 0` | `ReceiptIngestFlow` | Maou | 14-day receipt safety net behind the hourly tag fan-out |
 | `subscription-audit-monthly` | `0 10 1 * *` | `SubscriptionAuditFlow` | Maou | Monthly subscription audit digest |
+| `daylog-weekly` | `20 20 * * 0` | `DayLogFlow` (`mode: weekly`) | Raphael | Condenses the ISO week's day logs into one `aegis://daylog/week/<iso-week>` entry (`source_type='daylog_rollup'`). Sunday, after that day's own 19:00 nightly entry |
+| `daylog-monthly` | `20 21 28-31 * *` | `DayLogFlow` (`mode: monthly`) | Raphael | Same for the calendar month → `aegis://daylog/month/<yyyy-mm>`. Cron has no last-day operator, so it fires on 28-31 and the flow drops every run but the real month end |
 
 Not in this table because they're **event-driven, not scheduled**:
 `InteractionFlow` (spawned by any flow needing a decision),
