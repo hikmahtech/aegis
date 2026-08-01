@@ -313,6 +313,30 @@ activities:
         - temporal.hikmahtech.in
     active: true
 
+  # Sebas — life-document expiry radar (C6): passports, visas, licences,
+  # insurance, warranties, medication refills, domains. Reads
+  # life.expiring_items and raises one ack card per newly-crossed lead_days
+  # threshold; the dedup ledger makes each threshold fire once per expiry
+  # cycle, forever.
+  #
+  # 07:25 UTC: the only free daily slot in the morning band. Hour 7 already
+  # holds intel-scan-hn + cert-radar at :00 and intel-scan-news at :30, and
+  # :15 is the */15 sweep minute (gtd-clarify, llm-spend-guard) — :25 collides
+  # with nothing but the two cheap */5 pollers. Sits after cert-radar so the
+  # two radars never contend, and hours before money-hygiene (09:00), which
+  # is the other card-raising daily flow.
+  - slug: expiry-radar-daily
+    workflow_type: ExpiryRadarFlow
+    agent_id: sebas
+    schedule_cron: "25 7 * * *"
+    config:
+      # Window for `due_within`; per-item lead_days is the real filter.
+      lookahead_days: 400
+      # Cards bypass the notification budget — hard cap per run. Surplus
+      # stays unclaimed and alerts on the next run.
+      max_cards: 5
+    active: true
+
   # Pandora — nightly retention prune for unbounded ops tables.
   # Defaults from worker/src/aegis_worker/flows/cleanup.py::_DEFAULT_RETENTIONS.
   # Override per-table via config.retentions if needed.

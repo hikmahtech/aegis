@@ -32,6 +32,7 @@ from aegis_worker.activities.curiosity import CuriosityActivities
 from aegis_worker.activities.daylog import DayLogActivities
 from aegis_worker.activities.delivery import DeliveryActivities
 from aegis_worker.activities.drive import DriveActivities
+from aegis_worker.activities.expiring_items import ExpiringItemsActivities
 from aegis_worker.activities.gmail import GmailActivities
 from aegis_worker.activities.homelab import HomelabActivities
 from aegis_worker.activities.infra_ops import InfraOpsActivities
@@ -63,6 +64,7 @@ from aegis_worker.flows.daily_briefing import DailyBriefingFlow
 from aegis_worker.flows.daylog import DayLogFlow
 from aegis_worker.flows.delivery_watchdog import DeliveryWatchdogFlow
 from aegis_worker.flows.drive_sync import DriveSyncFlow
+from aegis_worker.flows.expiry_radar import ExpiryRadarFlow
 from aegis_worker.flows.github_alert import GitHubAlertFlow
 from aegis_worker.flows.gmail_ingest import GmailIngestFlow
 from aegis_worker.flows.infra_heartbeat import InfraHeartbeatFlow
@@ -112,6 +114,7 @@ _stub_agent_registry_act = AgentRegistryActivities(db_pool=None)
 _stub_llm_governor_act = LLMGovernorActivities(db_pool=None)
 _stub_agent_task_act = AgentTaskActivities(db_pool=None)
 _stub_infra_ops_act = InfraOpsActivities(homelab_connector=None)
+_stub_expiring_items_act = ExpiringItemsActivities(db_pool=None)
 
 WORKFLOWS: list = [
     AgentChatReplyFlow,
@@ -140,6 +143,7 @@ WORKFLOWS: list = [
     SocialPublishFlow,
     SocialMetricsFlow,
     CuriosityCardFlow,
+    ExpiryRadarFlow,
 ]
 
 ACTIVITIES: list = [
@@ -170,6 +174,8 @@ ACTIVITIES: list = [
     _stub_infra_ops_act.service_health,
     _stub_infra_ops_act.service_logs,
     _stub_infra_ops_act.restart_service,
+    _stub_expiring_items_act.claim_due_alerts,
+    _stub_expiring_items_act.record_expiry_cards,
 ]
 
 
@@ -471,6 +477,7 @@ async def main():
         homelab_connector=connectors.get("homelab"),
     )
     infra_ops_act = InfraOpsActivities(homelab_connector=connectors.get("homelab"))
+    expiring_items_act = ExpiringItemsActivities(db_pool=deps.pool)
     # apply_restart_approval runs as an AgentTask activity but needs the infra
     # ops. Mirrors the existing `alert_act.todoist_connector = todoist_connector`
     # late-wiring below.
@@ -672,6 +679,8 @@ async def main():
         infra_ops_act.service_health,
         infra_ops_act.service_logs,
         infra_ops_act.restart_service,
+        expiring_items_act.claim_due_alerts,
+        expiring_items_act.record_expiry_cards,
     ]
 
     if settings.homelab_enabled and homelab_act is not None:
@@ -739,6 +748,7 @@ async def main():
         SocialPublishFlow,
         SocialMetricsFlow,
         CuriosityCardFlow,
+        ExpiryRadarFlow,
     ]
 
     if settings.homelab_enabled:

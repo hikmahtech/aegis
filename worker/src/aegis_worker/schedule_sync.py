@@ -27,6 +27,7 @@ from aegis_worker.flows.daily_briefing import DailyBriefingConfig, DailyBriefing
 from aegis_worker.flows.daylog import DayLogConfig, DayLogFlow
 from aegis_worker.flows.delivery_watchdog import DeliveryWatchdogConfig, DeliveryWatchdogFlow
 from aegis_worker.flows.drive_sync import DriveSyncFlow, DriveSyncInput
+from aegis_worker.flows.expiry_radar import ExpiryRadarConfig, ExpiryRadarFlow
 from aegis_worker.flows.gmail_ingest import GmailIngestFlow, GmailIngestInput
 from aegis_worker.flows.infra_heartbeat import InfraHeartbeatConfig, InfraHeartbeatFlow
 from aegis_worker.flows.intelligence_scan import IntelligenceScanFlow, IntelligenceScanInput
@@ -136,6 +137,17 @@ _ACTIVITY_TYPE_MAP = {
         CertRadarConfig(
             silent=bool(act["config"].get("silent", False)),
             domains=act["config"].get("domains", []),
+        ),
+    ),
+    # Life-document expiry radar (C6). Not feature-flagged — the registry is
+    # empty on a fresh install, so the sweep is a no-op until the owner adds a
+    # row on the admin Expiring Items page.
+    "ExpiryRadarFlow": lambda act: (
+        ExpiryRadarFlow,
+        ExpiryRadarConfig(
+            agent_id=act["agent_id"],
+            lookahead_days=int(act["config"].get("lookahead_days", 400)),
+            max_cards=int(act["config"].get("max_cards", 5)),
         ),
     ),
     "InfraHeartbeatFlow": lambda act: (

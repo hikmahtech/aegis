@@ -34,7 +34,7 @@ To add or repurpose an agent, create it and check the capability tags that descr
 
 | Personality | Role | Model tier | Workflows owned (per `config/seed/activities.yaml`) |
 |-------------|------|------------|-----------------|
-| **Sebas** | Executive assistant | `smart` | `GmailIngestFlow`, `CalendarIngestFlow`, `TodoistSyncFlow`, `ClarifyFlow`, `DailyReviewFlow` + `WeeklyReviewFlow`, `SocialPublishFlow`, `MemoryReflectionFlow`, `CuriosityCardFlow` |
+| **Sebas** | Executive assistant | `smart` | `GmailIngestFlow`, `CalendarIngestFlow`, `TodoistSyncFlow`, `ClarifyFlow`, `DailyReviewFlow` + `WeeklyReviewFlow`, `SocialPublishFlow`, `MemoryReflectionFlow`, `CuriosityCardFlow`, `ExpiryRadarFlow` |
 | **Raphael** | Research + knowledge | `smart` | `DailyBriefingFlow`, `DayLogFlow`, `IntelligenceScanFlow` (×3 sources), `RaindropIngestFlow`, `RssIngestFlow`, `DriveSyncFlow` |
 | **Maou** | Finance | `smart` | `MoneyProcessFlow`, `MoneyHygieneDailyFlow`, `ReceiptIngestFlow`, `SubscriptionAuditFlow` |
 | **Pandora's Actor** | Infrastructure | `smart` | `ServiceDriftFlow`, `CertRadarFlow`, `SentryPollFlow`, `DeliveryWatchdogFlow`, `InfraHeartbeatFlow` (2-min swarm node/service poll, transition-only alerts), `CleanupFlow`, `WorkspaceRepoSyncFlow`, `GitHubAlertFlow` (PR notifier, webhook-driven) |
