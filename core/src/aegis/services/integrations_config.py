@@ -168,6 +168,16 @@ CONFIG_REGISTRY: list[ConfigKey] = [
         "for small meetings and only once Owner → your own email addresses is set. "
         "Restart the worker after enabling.",
     ),
+    ConfigKey(
+        "mcp_enabled", "MCP client (external tool servers)", "Features", False,
+        boolean=True,
+        help="Lets AEGIS call tools on EXTERNAL MCP servers listed in AEGIS_MCP_SERVERS "
+        "(env-only JSON: name -> {url, auth_token, timeout_s}). Only the streamable-http "
+        "transport is supported; stdio entries are rejected because they would spawn "
+        "local processes. Off = no MCP server is contacted at all. Turning it on does "
+        "NOT let any agent call these tools — that is granted separately. Core restart "
+        "required.",
+    ),
 ]
 _BY_KEY = {c.key: c for c in CONFIG_REGISTRY}
 
