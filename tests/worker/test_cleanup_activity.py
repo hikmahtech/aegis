@@ -505,12 +505,38 @@ async def test_life_expiring_items_and_their_alerts_are_never_pruned():
     pool.execute.assert_not_awaited()
 
 
+async def test_life_assets_is_never_pruned():
+    """life.assets (migration 019) is user-curated data, deliberately NOT
+    age-pruned — rows are typed in by hand, one per physical object owned,
+    and the OLDEST row is the boiler installed in 2009, precisely the asset
+    whose service history matters most. Growth is bounded by how many things
+    a household owns, not by time.
+
+    Guards the decision two ways: absent from all three maps (an entry in
+    only one of them is the silent-no-op bug this file already covers), AND a
+    retention config naming it is ignored at runtime rather than issuing a
+    DELETE.
+    """
+    assert "life.assets" not in _TIMESTAMP_COLUMNS
+    assert "life.assets" not in _ALLOWED_TABLES
+    assert "life.assets" not in _DEFAULT_RETENTIONS
+
+    pool = AsyncMock()
+    pool.fetchval = AsyncMock(return_value=True)
+    pool.execute = AsyncMock(return_value="DELETE 10")
+    activities = CleanupActivities(db_pool=pool)
+    env = ActivityEnvironment()
+    result = await env.run(activities.prune_old_records, {"retentions": {"life.assets": 365}})
+    assert result == {}
+    pool.execute.assert_not_awaited()
+
+
 async def test_registered_life_tables_are_a_deliberate_allowlist():
-    """The `life` schema now has three tables and only ONE is pruned.
+    """The `life` schema now has four tables and only ONE is pruned.
 
     A future `life.*` table added to the retention maps by reflex — rather
     than by the deliberate user-curated-vs-machine-written call migrations
-    016/017/018 each document — trips this test.
+    016/017/018/019 each document — trips this test.
     """
     life_tables = {t for t in _TIMESTAMP_COLUMNS if t.startswith("life.")}
     assert life_tables == {"life.observations"}

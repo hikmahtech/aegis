@@ -11,6 +11,7 @@ from datetime import date
 from typing import Any
 from uuid import UUID
 
+import asyncpg
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 
@@ -47,6 +48,13 @@ class ExpiringItemUpdate(BaseModel):
     metadata: dict[str, Any] | None = None
 
 
+# `person_id` (migration 018) and `asset_id` (migration 019) are both foreign
+# keys. A payload naming a row that doesn't exist is a client mistake, not a
+# server fault — without this it surfaces as an unhandled
+# asyncpg.ForeignKeyViolationError, i.e. HTTP 500.
+_BAD_REF = "person_id or asset_id does not reference an existing row"
+
+
 @router.get("")
 async def list_expiring_items(
     request: Request, kind: str | None = None, due_within: int | None = None
@@ -78,6 +86,8 @@ async def create_expiring_item(request: Request, body: ExpiringItemCreate) -> di
         row = await items_service.create_expiring_item(pool, body.model_dump())
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
+    except asyncpg.ForeignKeyViolationError as exc:
+        raise HTTPException(400, _BAD_REF) from exc
     await log_audit(
         pool,
         actor="api:expiring_items_admin",
@@ -97,6 +107,8 @@ async def update_expiring_item(request: Request, item_id: UUID, body: ExpiringIt
         row = await items_service.update_expiring_item(pool, item_id, data)
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
+    except asyncpg.ForeignKeyViolationError as exc:
+        raise HTTPException(400, _BAD_REF) from exc
     if not row:
         raise HTTPException(404, "Expiring item not found")
     await log_audit(

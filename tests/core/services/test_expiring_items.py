@@ -36,6 +36,7 @@ async def _wipe(pool: asyncpg.Pool) -> None:
     )
     await pool.execute("DELETE FROM life.expiring_items WHERE title LIKE $1", f"{PREFIX}%")
     await pool.execute("DELETE FROM life.people WHERE name LIKE $1", f"{PREFIX}%")
+    await pool.execute("DELETE FROM life.assets WHERE slug LIKE $1", f"{PREFIX}%")
 
 
 @pytest_asyncio.fixture(loop_scope="function")
@@ -85,7 +86,12 @@ async def test_create_get_update_delete_round_trip(pool, today):
     person_id = await pool.fetchval(
         "INSERT INTO life.people (name) VALUES ($1) RETURNING id", f"{PREFIX}Owner"
     )
-    asset_id = uuid4()
+    # A REAL asset, not an invented uuid: migration 019 turned asset_id into a
+    # foreign key onto life.assets (018 left it a bare uuid pending C7).
+    asset_id = await pool.fetchval(
+        "INSERT INTO life.assets (slug, name, kind) VALUES ($1, $1, 'car') RETURNING id",
+        f"{PREFIX}car",
+    )
     created = await svc.create_expiring_item(
         pool,
         {

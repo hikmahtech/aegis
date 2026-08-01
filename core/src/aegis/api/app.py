@@ -246,6 +246,7 @@ def create_app(run_lifespan: bool = True, settings: Settings | None = None) -> F
         activities,
         agents,
         api_key,
+        assets_admin,
         audit,
         capture,
         channels,
@@ -340,6 +341,7 @@ def create_app(run_lifespan: bool = True, settings: Settings | None = None) -> F
     app.include_router(resources.router)
     app.include_router(people_admin.router)
     app.include_router(expiring_items_admin.router)
+    app.include_router(assets_admin.router)
     app.include_router(todoist.router)
 
     # Serve admin panel SPA (static files from built frontend)
