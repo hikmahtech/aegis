@@ -60,6 +60,11 @@ class DailyBriefingFlow:
         except Exception:
             pass
 
+        # `changes` is an activity RESULT and then `frame_briefing`'s ARGUMENT,
+        # both of which Temporal persists verbatim in workflow history. Nothing
+        # that must not be copied into a second store may ride in it — health
+        # readings in particular are read inside `frame_briefing` instead (see
+        # `BriefingActivities._recent_health`).
         changes = await workflow.execute_activity_method(
             BriefingActivities.gather_briefing_changes,
             start_to_close_timeout=TIMEOUT_LLM, retry_policy=NO_RETRY,

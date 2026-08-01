@@ -1,6 +1,7 @@
 """gather_briefing_changes — diff against prior briefing_state."""
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock
 
@@ -235,19 +236,49 @@ async def _set_health(pool, metric, value, age_hours) -> None:
 async def test_a_fresh_health_reading_surfaces_in_the_briefing(db_pool, _seeded):
     await _set_health(db_pool, "resting_hr", 54, age_hours=6)
     act = BriefingActivities(db_pool=db_pool, knowledge_connector=_kc())
-    out = await act.gather_briefing_changes()
-    assert out["health"] == {"resting_hr": 54.0}
-    assert act._format_health_block(out) == "<b>Health</b>: resting_hr 54.0"
+    assert await act._recent_health() == {"resting_hr": 54.0}
+    framed = await act.frame_briefing(await act.gather_briefing_changes())
+    assert "<b>Health</b>: resting_hr 54.0" in framed
+
+
+@pytest.mark.asyncio
+async def test_no_health_value_crosses_the_workflow_boundary(db_pool, _seeded):
+    """`gather_briefing_changes`'s return value is `DailyBriefingFlow`'s
+    `changes`, which Temporal persists verbatim as an activity result and again
+    as `frame_briefing`'s argument — a second store for the owner's body data,
+    with its own retention and its own web UI, which is exactly what
+    `aegis.services.health` refused to create when it made ingest inline.
+
+    So the reading must not be anywhere in that bundle, at any depth.
+    """
+    await _set_health(db_pool, "resting_hr", 54321.5, age_hours=6)
+    act = BriefingActivities(db_pool=db_pool, knowledge_connector=_kc())
+
+    # Non-vacuity: the reading really is there to be leaked. Without this the
+    # test would pass just as happily against an empty life.observations.
+    assert await act._recent_health() == {"resting_hr": 54321.5}
+
+    bundle = await act.gather_briefing_changes()  # the activity RESULT ...
+    blob = json.dumps(bundle, default=str)  # ... and frame_briefing's ARGUMENT
+    assert "resting_hr" not in blob
+    assert "54321" not in blob  # distinctive enough not to collide with a timestamp
+    # Non-vacuity: the bundle really does carry everything else.
+    assert "RaindropIngestFlow" in blob
 
 
 @pytest.mark.asyncio
 async def test_the_framing_prompt_never_carries_a_health_value(db_pool, _seeded):
     """The framing model is `model_balanced`, which may be a hosted API. The
-    health line is rendered deterministically so body data never goes to it."""
-    await _set_health(db_pool, "resting_hr", 54321.5, age_hours=6)
+    health line is rendered deterministically so body data never goes to it.
+
+    Health is injected into the bundle by hand here on purpose: since
+    `gather_briefing_changes` stopped emitting it, feeding this the real bundle
+    would prove nothing about `_build_briefing_prompt`'s own filter — the two
+    guards would mask each other. This proves the prompt-side one alone.
+    """
     act = BriefingActivities(db_pool=db_pool, knowledge_connector=_kc())
-    out = await act.gather_briefing_changes()
-    prompt = act._build_briefing_prompt(out)
+    bundle = {**await act.gather_briefing_changes(), "health": {"resting_hr": 54321.5}}
+    prompt = act._build_briefing_prompt(bundle)
     assert "resting_hr" not in prompt
     assert "54321" not in prompt  # distinctive enough not to collide with a timestamp
     # Non-vacuity: the prompt really does carry the rest of the bundle.
@@ -271,9 +302,9 @@ async def test_the_health_block_survives_an_llm_narrative(db_pool, _seeded):
 async def test_a_health_reading_from_last_week_is_not_reported_as_today(db_pool, _seeded):
     await _set_health(db_pool, "resting_hr", 54, age_hours=24 * 7)
     act = BriefingActivities(db_pool=db_pool, knowledge_connector=_kc())
-    out = await act.gather_briefing_changes()
-    assert out["health"] == {}
-    assert act._format_health_block(out) == ""
+    assert await act._recent_health() == {}
+    framed = await act.frame_briefing(await act.gather_briefing_changes())
+    assert "<b>Health</b>" not in framed
 
 
 @pytest.mark.asyncio
@@ -297,5 +328,4 @@ async def test_only_the_newest_reading_of_each_metric_is_reported(db_pool, _seed
                 f"zzb6b-{metric}-{observed_at.isoformat()}",
             )
     act = BriefingActivities(db_pool=db_pool, knowledge_connector=_kc())
-    out = await act.gather_briefing_changes()
-    assert out["health"] == {"steps": 8421.0, "resting_hr": 54.0}
+    assert await act._recent_health() == {"steps": 8421.0, "resting_hr": 54.0}
