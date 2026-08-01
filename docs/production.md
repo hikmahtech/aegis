@@ -87,6 +87,65 @@ All of them feed `AlertInvestigationFlow` / the flows described in
 [`architecture/overview.md`](architecture/overview.md). Per-alert runbooks live in
 `runbooks/<AlertName>.md`, baked into the worker image.
 
+## Life-data push (`POST /api/webhooks/life/{source}`)
+
+One signed endpoint for phone / watch / home-automation clients to push personal
+data. It is **off until you configure a secret** — with `life_webhook_secret`
+unset every request is rejected with 503, including correctly signed ones. An
+empty secret never means "skip verification".
+
+Generate and store the secret (admin → Integrations → *Life data → Webhook
+secret*, or `AEGIS_LIFE_WEBHOOK_SECRET`):
+
+```bash
+openssl rand -hex 32
+```
+
+**Signing.** The client HMAC-SHA256s `"{source}.{unix_seconds}." + raw_body`
+with that secret and sends the lowercase hex digest:
+
+| Header | Value |
+|---|---|
+| `X-Aegis-Timestamp` | Unix seconds, **required**, must be within ±5 min |
+| `X-Aegis-Signature` | `hex(hmac_sha256(secret, "{source}.{ts}." + body))` |
+
+Both headers are required. The timestamp and the source slug are inside the
+signed input, so a captured request expires after 5 minutes and cannot be
+re-pointed at a different source. Bodies over 64 KiB are refused (413). Every
+authentication failure answers `401 {"detail":"unauthorized"}` — the response
+never says *why*, and never echoes the signature.
+
+Shell client (the shape an iOS Shortcut's *Run Script over SSH* or any
+home-automation `command:` block needs):
+
+```bash
+SRC=observation
+TS=$(date +%s)
+BODY='{"source":"scale","metric":"weight_kg","value":80.5,"metadata":{"unit":"kg"}}'
+SIG=$(printf '%s.%s.%s' "$SRC" "$TS" "$BODY" \
+      | openssl dgst -sha256 -hmac "$AEGIS_LIFE_WEBHOOK_SECRET" -r | cut -d' ' -f1)
+curl -sS -X POST "https://<aegis>/api/webhooks/life/$SRC" \
+  -H "X-Aegis-Timestamp: $TS" -H "X-Aegis-Signature: $SIG" \
+  -H 'Content-Type: application/json' --data-raw "$BODY"
+```
+
+From an **iOS Shortcut** the same three steps are: *Current Date → Format as Unix
+timestamp*, *Text* = `{source}.{ts}.{json}` piped into a base64/HMAC action (the
+built-in *Hash* action does not do HMAC — use a Shortcut HMAC helper, Scriptable,
+or an `openssl` step on a jump host), then *Get Contents of URL* with the two
+headers. TLS in front of Core is assumed and required.
+
+Sources are declared in `LIFE_SOURCES` (`core/src/aegis/api/routes/webhooks.py`).
+`observation` writes one `life.observations` row per push (pruned at 365 days by
+`CleanupFlow`); a source mapped to a workflow name starts that Temporal workflow
+instead. An unknown slug is a 404 — but only for a *correctly signed* request, so
+the endpoint cannot be used to enumerate which sources exist. Replays are
+additionally collapsed by an `ingest_idempotency` claim on
+`(life:{source}, payload id | sha256 of the signed input)`.
+
+Free-form text is **not** pushed here: `POST /api/admin/capture` with
+`kind="life_fact"` already owns that lane.
+
 ### Infra heartbeat & escalation
 
 `InfraHeartbeatFlow` (schedule `infra-heartbeat-2m`, gated by `homelab_enabled`) polls

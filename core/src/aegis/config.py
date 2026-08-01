@@ -232,6 +232,11 @@ class Settings(BaseSettings):
     # empty = unauthenticated (legacy default — anyone who can reach the port
     # can mint alerts and spawn investigation flows).
     alert_webhook_secret: str = ""  # X-Alert-Token
+    # /api/webhooks/life/{source} — signed push from phones/watches/home
+    # automation. Empty = the endpoint rejects EVERYTHING (503). Never treat
+    # an unset secret as "skip verification": this door writes into the
+    # owner's personal data store.
+    life_webhook_secret: str = ""  # X-Aegis-Signature + X-Aegis-Timestamp
 
     # MCP
     mcp_servers: dict = {}

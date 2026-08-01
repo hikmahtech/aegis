@@ -17,6 +17,7 @@ import base64
 import hashlib
 import hmac
 import json as _json
+import time as _time
 import uuid as _uuid
 
 import structlog
@@ -29,6 +30,7 @@ from aegis.clarify_note import AGENT_REPLY_PREFIX, CLARIFY_NOTE_PREFIX
 from aegis.config import Settings
 from aegis.observability import log_audit
 from aegis.services.agents import resolve_tag
+from aegis.services.observations import record_observation
 
 logger = structlog.get_logger()
 
@@ -73,6 +75,229 @@ def _safe_json(body: bytes) -> dict:
         return _json.loads(body)
     except Exception:
         return {}
+
+
+# ---------------------------------------------------------------------------
+# Life-data push (B4) — the one internet-facing door into the owner's personal
+# data store. Everything below the signature check is plumbing; the signature
+# check IS the feature.
+# ---------------------------------------------------------------------------
+
+# Source slug → Temporal workflow name, or ``None`` to record the payload
+# inline as a ``life.observations`` row (no worker involvement).
+#
+# B4 ships only the generic numeric lane. B5 adds
+# ``"location": "LocationIngestFlow"`` and B6 a health source — one line each,
+# because the auth/idempotency/audit path below is source-agnostic.
+LIFE_SOURCES: dict[str, str | None] = {
+    "observation": None,
+}
+
+# Maximum accepted body. A phone/watch push is a few hundred bytes; 64 KiB is
+# already generous. Enforced while STREAMING, not after — `await
+# request.body()` would buffer an unbounded body into memory first.
+LIFE_MAX_BODY_BYTES = 64 * 1024
+
+# Replay window for X-Aegis-Timestamp, in seconds, either direction.
+LIFE_TIMESTAMP_WINDOW_SECONDS = 300
+
+# One opaque failure for every authentication outcome — a missing header, a
+# malformed one, a stale timestamp and a wrong signature are indistinguishable
+# to the caller. Anything more specific is a probing oracle.
+_LIFE_UNAUTHORIZED = "unauthorized"
+
+
+def life_signing_input(source: str, timestamp: str, body: bytes) -> bytes:
+    """Exact bytes a client must HMAC: ``"{source}.{timestamp}." + raw_body``.
+
+    The source slug is bound into the signature so a captured push to one
+    source cannot be re-pointed at another (health data replayed as a location
+    fix), and the timestamp is bound in so a captured request expires. Both
+    are what makes this more than "HMAC of the body".
+    """
+    return f"{source}.{timestamp}.".encode() + body
+
+
+async def _read_bounded_body(request: Request, limit: int) -> bytes:
+    """Read at most ``limit`` bytes, raising 413 the moment that is exceeded.
+
+    Streams so an attacker cannot make the process buffer an arbitrarily large
+    body before any check runs. Chunked transfers carry no Content-Length, so
+    trusting that header alone would not bound anything.
+    """
+    chunks: list[bytes] = []
+    size = 0
+    async for chunk in request.stream():
+        size += len(chunk)
+        if size > limit:
+            raise HTTPException(status_code=413, detail="body_too_large")
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
+@router.post("/life/{source}", status_code=202)
+async def life_webhook(
+    source: str,
+    request: Request,
+    x_aegis_signature: str | None = Header(default=None),
+    x_aegis_timestamp: str | None = Header(default=None),
+    settings: Settings = Depends(get_settings),
+    temporal: Client = Depends(get_workflow_client),
+):
+    """Signed life-data push from a phone / watch / home-automation client.
+
+    Signature scheme (compute client-side, e.g. in an iOS Shortcut)::
+
+        signed  = "{source}.{unix_seconds}." + raw_json_body
+        headers = {
+            "X-Aegis-Timestamp": unix_seconds,
+            "X-Aegis-Signature": hex(hmac_sha256(AEGIS_LIFE_WEBHOOK_SECRET, signed)),
+        }
+
+    Both headers are REQUIRED. The observation doc suggested making the
+    timestamp optional "so clients that don't send it still work" — that is
+    not replay protection at all, since an attacker replaying a captured
+    request simply drops the header and the body signature still verifies
+    forever. Fail closed instead.
+
+    Defence in depth, in order:
+
+    1. **No secret configured ⇒ 503, always.** An empty secret can never mean
+       "skip verification" on an endpoint that writes to personal data.
+    2. Body bounded at ``LIFE_MAX_BODY_BYTES`` while streaming.
+    3. ``X-Aegis-Timestamp`` must be present, numeric and within
+       ±``LIFE_TIMESTAMP_WINDOW_SECONDS`` — a captured request dies in 5 min.
+    4. ``hmac.compare_digest`` over the source+timestamp-bound input.
+    5. ``ingest_idempotency`` claim, which collapses the residual in-window
+       replay to a single no-op.
+
+    Every failure in 3–4 returns the same opaque 401 body and nothing about
+    the secret or the presented signature is ever logged.
+    """
+    # (1) Fail closed. Before the body is even read.
+    if not settings.life_webhook_secret:
+        logger.error("life_webhook_secret_missing", life_source=source)
+        raise HTTPException(status_code=503, detail="life_webhook_secret_not_configured")
+
+    # (2) Bounded read.
+    body = await _read_bounded_body(request, LIFE_MAX_BODY_BYTES)
+
+    # (3) Mandatory, bounded timestamp. The length guard comes first so a
+    # multi-thousand-digit header can neither hit int()'s parse limit nor
+    # overflow the float subtraction below.
+    raw_ts = x_aegis_timestamp or ""
+    ts: int | None = None
+    if raw_ts.isdigit() and len(raw_ts) <= 12:
+        ts = int(raw_ts)
+    if ts is None or abs(_time.time() - ts) > LIFE_TIMESTAMP_WINDOW_SECONDS:
+        logger.warning("life_webhook_rejected", life_source=source, stage="timestamp")
+        raise HTTPException(status_code=401, detail=_LIFE_UNAUTHORIZED)
+
+    # (4) Constant-time signature check over source + timestamp + body.
+    # compare_digest rejects non-ASCII str input with TypeError, and a header
+    # is latin-1 decoded, so a hostile byte would 500 instead of 401 — treat
+    # any comparison failure as a failed verification.
+    try:
+        ok = verify_hmac(
+            settings.life_webhook_secret,
+            life_signing_input(source, raw_ts, body),
+            x_aegis_signature,
+            prefix="",
+        )
+    except TypeError:
+        ok = False
+    if not ok:
+        logger.warning("life_webhook_rejected", life_source=source, stage="signature")
+        raise HTTPException(status_code=401, detail=_LIFE_UNAUTHORIZED)
+
+    # Unknown-source 404 deliberately sits AFTER verification, so an
+    # unauthenticated prober cannot enumerate which life sources exist.
+    if source not in LIFE_SOURCES:
+        logger.warning("life_webhook_unknown_source", life_source=source)
+        raise HTTPException(status_code=404, detail="unknown_source")
+
+    try:
+        payload = _json.loads(body)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail="invalid_json") from exc
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="invalid_json")
+
+    # (5) Idempotency. External id from the payload when the device supplies
+    # one, else the signed input's digest — so the same body at the same
+    # timestamp claims once, while a genuinely repeated reading at a later
+    # timestamp is a new row.
+    external_id = str(payload.get("id") or payload.get("_id") or "")[:128] or hashlib.sha256(
+        life_signing_input(source, raw_ts, body)
+    ).hexdigest()
+    pool = request.app.state.db_pool
+    async with pool.acquire() as conn:
+        claimed = await conn.fetchval(
+            """
+            INSERT INTO ingest_idempotency (source_type, external_id)
+            VALUES ($1, $2)
+            ON CONFLICT DO NOTHING
+            RETURNING external_id
+            """,
+            f"life:{source}",
+            external_id,
+        )
+    if claimed is None:
+        logger.info("life_webhook_duplicate_skipped", life_source=source)
+        return {"accepted": True, "duplicate": True, "external_id": external_id}
+
+    await log_audit(
+        pool,
+        actor=f"life:{source}",
+        action="life_push_accepted",
+        target_type="life_webhook",
+        target_id=external_id,
+        details={"bytes": len(body)},
+    )
+
+    workflow_name = LIFE_SOURCES[source]
+    if workflow_name is None:
+        # Inline lane: a bare numeric/categorical reading needs no durable
+        # workflow, it is one INSERT. Free-text capture is NOT handled here —
+        # POST /api/admin/capture (kind="life_fact") already owns that lane and
+        # a second door to the same room is a second thing to get wrong.
+        meta = payload.get("metadata")
+        try:
+            row = await record_observation(
+                pool,
+                source=str(payload.get("source") or source),
+                metric=str(payload.get("metric") or ""),
+                value=payload.get("value"),
+                metadata=meta if isinstance(meta, dict) else {},
+            )
+        except (ValueError, TypeError) as exc:
+            # Release the idempotency claim: a malformed push is client-fixable,
+            # and a device that sends its own `id` would otherwise be locked out
+            # of that id forever by one bad payload.
+            await pool.execute(
+                "DELETE FROM ingest_idempotency WHERE source_type = $1 AND external_id = $2",
+                f"life:{source}",
+                external_id,
+            )
+            logger.warning("life_webhook_bad_observation", life_source=source)
+            raise HTTPException(status_code=422, detail="invalid_observation") from exc
+        logger.info("life_webhook_observation_recorded", life_source=source)
+        return {
+            "accepted": True,
+            "external_id": external_id,
+            "observation_id": str(row["id"]),
+        }
+
+    handle = await temporal.start_workflow(
+        workflow_name,
+        {"source": source, "external_id": external_id, "payload": payload},
+        id=f"life-{source}-{external_id}",
+        task_queue="aegis-main",
+    )
+    logger.info(
+        "life_webhook_flow_started", life_source=source, workflow_id=handle.id
+    )
+    return {"accepted": True, "external_id": external_id, "workflow_id": handle.id}
 
 
 @router.post("/github")
