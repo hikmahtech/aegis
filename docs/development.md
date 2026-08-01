@@ -220,6 +220,25 @@ Kill switches:
 - `AEGIS_ELEVENLABS_API_KEY=""` (empty) — disables media transcription only
 - `AEGIS_TTS_ENABLED=false` (default) — disables outbound per-persona voice notes
 
+### Voice-first capture
+
+A spoken note becomes a Todoist Inbox task or a knowledge-store `life_fact`
+without the speaker choosing: `POST /api/admin/capture {"kind": "auto"}` runs
+the intent classifier in `core/src/aegis/services/capture_classify.py` (one
+`balanced`-tier call, logged to `llm_calls` under `purpose='capture_classify'`,
+decision logged to `audit_log` under `action='capture_classified'`). Every
+classifier failure — no LLM, kill switch, timeout, truncation, unparseable
+JSON, low confidence — degrades to the task lane, which is the recoverable one.
+
+Two front doors:
+- **Slack** — a voice note whose transcript opens with `remember …`,
+  `note to self …`, `capture …`, `make a note …` or `add to inbox …` is
+  captured instead of being routed to an agent. Anything else still chats.
+- **iOS Shortcut / HTTP** — `POST http://comms:8081/api/ingest/voice` with the
+  recording as the **raw request body**, header `X-Voice-Secret`, optional
+  `?filename=voice.m4a`. Needs `AEGIS_VOICE_INGEST_SECRET` set on comms
+  (its own credential, not `AEGIS_API_KEY`); unset ⇒ the route is 503.
+
 ## Adding a New Connector
 
 1. Create `core/src/aegis/connectors/{name}.py` with async methods

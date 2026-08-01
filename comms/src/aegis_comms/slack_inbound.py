@@ -59,6 +59,48 @@ def _is_audio_file(name: str, mimetype: str) -> bool:
     return name.lower().endswith(_AUDIO_EXTENSIONS)
 
 
+# Spoken openers that mean "file this", not "talk to me about this" (B3). A
+# transcript starting with one of these skips chat routing and goes to
+# POST /api/admin/capture with kind="auto", which picks the lane.
+_CAPTURE_PREFIXES = (
+    "note to self",
+    "make a note",
+    "add to inbox",
+    "capture",
+    "remember",
+)
+
+
+def capture_intent_text(transcript: str) -> str | None:
+    """Strip a capture-intent opener off a transcript, or None if absent.
+
+    The opener must be a whole word — "remembering the milk" is a sentence
+    about remembering, not a capture instruction, and must still reach chat.
+    """
+    text = (transcript or "").strip()
+    lowered = text.lower()
+    for prefix in _CAPTURE_PREFIXES:
+        if not lowered.startswith(prefix):
+            continue
+        if len(text) > len(prefix) and (
+            text[len(prefix)].isalnum() or text[len(prefix)] == "'"
+        ):
+            continue  # "remembering ..." — not the bare opener
+        return text[len(prefix) :].lstrip(" ,:;.-—") or None
+    return None
+
+
+def capture_ack(result: dict | None) -> str:
+    """User-facing acknowledgement for a classified capture."""
+    if not result:
+        return "⚠ Capture failed — check Core logs."
+    if result.get("lane") == "life_fact" and result.get("content_id"):
+        return f"🧠 Filed as a life fact: `{str(result['content_id'])[:12]}`"
+    if result.get("task_ref"):
+        return f"📥 Captured to Inbox: `{result['task_ref']}`"
+    return "⚠ Capture failed — check Core logs."
+
+
 # Front-door conversation stickiness window. An ambiguous follow-up within this
 # many seconds stays with the conversation's last agent.
 # ponytail: fixed 30-min TTL; per-user tuning only if it ever matters.
@@ -364,6 +406,9 @@ class SlackCoreClient:
 
         `kind="life_fact"` files the text in the knowledge store instead of
         Todoist; the response carries `content_id` rather than `task_ref`.
+        `kind="auto"` lets core's intent classifier pick between the two (it
+        degrades to the task lane on any LLM fault); the response's `lane`
+        says which one it took.
         """
         payload = {
             "text": text[:2000],
@@ -1024,6 +1069,26 @@ class SlackInbound:
             text=f"🎤 <i>{transcript}</i>",
             target={"channel": channel_id},
         )
+
+        # "remember …" / "note to self …" is a filing instruction, not a
+        # conversation opener: hand it to core's intent classifier instead of
+        # an agent, and echo which lane it landed in.
+        spoken_capture = capture_intent_text(transcript)
+        if spoken_capture:
+            ext_id = (
+                f"slack:{channel_id}:"
+                f"{hashlib.sha256(spoken_capture.encode()).hexdigest()[:16]}"
+            )
+            result = await self._core.capture(
+                text=spoken_capture, external_id=ext_id, kind="auto"
+            )
+            await self._adapter.send_message(
+                agent_id=agent_id,
+                text=capture_ack(result),
+                target={"channel": channel_id},
+            )
+            return
+
         message = f"{transcript}\n\n{caption}" if caption else transcript
         await self._route_and_dispatch(channel_id=channel_id, text=message)
 

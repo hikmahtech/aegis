@@ -6,7 +6,9 @@ direct DB access) drop a task into the Todoist Inbox by HTTP.
 
 `kind` picks the capture lane: `task` (default) is the Todoist Inbox path
 above; `life_fact` files the text as a knowledge-store fact instead, for
-things that are true about your life rather than things to do.
+things that are true about your life rather than things to do; `auto` (B3)
+hands the text to the intent classifier and takes whichever lane it names,
+for voice notes where the speaker never said which one they meant.
 """
 
 from __future__ import annotations
@@ -37,7 +39,7 @@ class CaptureRequest(BaseModel):
     # Optional explicit external_id (for idempotent re-tries from the bot).
     # If omitted, a hash of (source + text) is used.
     external_id: str | None = Field(default=None, max_length=128)
-    kind: Literal["task", "life_fact"] = "task"
+    kind: Literal["task", "life_fact", "auto"] = "task"
 
 
 class CaptureResponse(BaseModel):
@@ -45,6 +47,10 @@ class CaptureResponse(BaseModel):
     source_tag: str
     external_id: str
     content_id: str | None = None
+    # The lane actually written to — always "task" or "life_fact", never
+    # "auto". Callers (Slack ack, iOS Shortcut confirmation) echo it so the
+    # human sees where a classified note landed.
+    lane: str = "task"
 
 
 @router.post("/capture", response_model=CaptureResponse)
@@ -63,6 +69,11 @@ async def capture(
     so re-posting the same text is an idempotent no-op (`content_id` is a
     hash of that URL). `task_ref` is None on that lane, and text that ingests
     to nothing (whitespace-only) is a 422 rather than a phantom `content_id`.
+
+    `kind="auto"` resolves the lane with the intent classifier first (see
+    `services/capture_classify.py`); any classifier failure degrades to the
+    task lane, so this request shape can never fail on account of the LLM.
+    The resolved lane comes back as `lane`.
     """
     from aegis.services.chat import _capture_to_inbox_impl  # avoid circular import
 
@@ -77,7 +88,21 @@ async def capture(
             f"{hashlib.sha256(body.text.encode()).hexdigest()[:16]}"
         )
 
-    if body.kind == "life_fact":
+    lane = body.kind
+    if lane == "auto":
+        from aegis.services.capture_classify import classify_capture
+
+        lane = (
+            await classify_capture(
+                pool=pool,
+                llm=getattr(request.app.state, "llm", None),
+                text=body.text,
+                external_id=ext_id,
+                source=body.source,
+            )
+        ).lane
+
+    if lane == "life_fact":
         store = get_knowledge_connector(request)
         text = body.text.strip()
         raw_text = f"{text}\n\n{body.description}" if body.description else text
@@ -117,6 +142,7 @@ async def capture(
             source_tag=source_tag,
             external_id=ext_id,
             content_id=content_id,
+            lane="life_fact",
         )
 
     ref = await _capture_to_inbox_impl(
@@ -146,4 +172,5 @@ async def capture(
         task_ref=ref,
         source_tag=source_tag,
         external_id=ext_id,
+        lane="task",
     )
