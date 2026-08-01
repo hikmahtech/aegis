@@ -327,3 +327,84 @@ async def test_result_fits_the_tool_result_cap(monkeypatch, label, posts):
     assert result["posts"], f"{label}: posts must survive; dropping them is the regression"
     expected = {p["integration"]["providerIdentifier"] for p in posts}
     assert set(result["channels_in_window"]) == expected, f"{label}: a channel went missing"
+
+
+# --- The roll-up itself has to be bounded --------------------------------
+#
+# `channels_in_window` was complete by design and therefore UNCAPPED, while the
+# clawback that pays for it can only shrink `posts`, which floors at one row.
+# The test above passed only because its 12 channels had 17-char ASCII names.
+# Real display names are not ASCII, and `json.dumps` escapes every non-ASCII
+# char to `\uXXXX` (6 bytes; emoji become surrogate pairs, 12) — with the cap
+# lifted these very fixtures measure 4360 bytes at 12 channels, 8494 at 25 and
+# 13279 at 40. Past 4096 `_smart_subset` keeps the leading `posts` key and drops
+# `channels_in_window`, `truncated` and `total_in_window` wholesale, so the
+# complete-coverage guarantee vanished on exactly the account shape needing it.
+
+_UNICODE_CHANNEL = "हिकमह टेक्नोलॉजीज़ प्राइवेट लिमिटेड 🚀✨ बहुत लंबा नाम यहाँ"
+
+
+def _unicode_channel_window(n_channels: int) -> list[dict]:
+    """`_many_channel_window`, but with the display names a non-English account
+    actually carries."""
+    return [
+        _post(
+            c * 10 + i,
+            f"platform-{c:02d}",
+            f"{_UNICODE_CHANNEL} {c:02d}",
+            -3 + c * 0.2 + i * 0.1,
+        )
+        for c in range(n_channels)
+        for i in range(6)
+    ]
+
+
+@pytest.mark.parametrize("n_channels", [12, 25, 40])
+async def test_unicode_channel_names_cannot_blow_the_result_cap(monkeypatch, n_channels):
+    """THE BUG. A bigger account must not cost us the roll-up it exists to give."""
+    from aegis.services.chat import _truncate_result
+
+    raw, result = await _timeline(monkeypatch, _unicode_channel_window(n_channels))
+
+    size = len(raw.encode())
+    assert size <= 4096, (
+        f"{n_channels} unicode-named channels: {size} bytes — over the cap the "
+        "truncator drops `channels_in_window` entirely"
+    )
+    # The failure was never a crash: it was the roll-up quietly disappearing.
+    assert _truncate_result(raw) == raw, "truncator rewrote the result"
+    survived = json.loads(_truncate_result(raw))
+    assert survived["channels_in_window"] == result["channels_in_window"]
+    assert survived["truncated"] == result["truncated"]
+    assert survived["total_in_window"] == result["total_in_window"]
+    assert result["posts"], "posts must survive too"
+
+    # Capped by bytes, not by count — but every post is still accounted for:
+    # the channels too small to list individually are summed into `+K more`.
+    channels = result["channels_in_window"]
+    assert sum(c["posts"] for c in channels.values()) == result["total_in_window"] == n_channels * 6
+    aggregates = [k for k in channels if k.endswith(" more")]
+    assert len(aggregates) == 1, f"expected one `+K more` bucket, got {list(channels)}"
+    assert channels[aggregates[0]]["channels"] == n_channels - (len(channels) - 1)
+    # The listed ones are the busiest, and they are listed in full.
+    named = [v for k, v in channels.items() if k not in aggregates]
+    assert named and all("name" in v for v in named)
+
+
+async def test_a_monstrous_channel_name_is_clipped_not_dropped(monkeypatch):
+    """An unbounded display name must not push a channel out of the roll-up.
+
+    Without the name clip a single entry can exceed the whole roll-up budget on
+    its own, and then nothing is named at all — the account gets a bare
+    `+N more` bucket instead of an answer to 'which channels am I posting to?'.
+    """
+    posts = [_post(i, "linkedin-page", "छ" * 300, -3 + i * 0.1) for i in range(6)]
+
+    raw, result = await _timeline(monkeypatch, posts)
+
+    assert len(raw.encode()) <= 4096
+    channels = result["channels_in_window"]
+    assert list(channels) == ["linkedin-page"], f"the only channel went missing: {list(channels)}"
+    assert 0 < len(channels["linkedin-page"]["name"]) <= 40
+    assert channels["linkedin-page"]["posts"] == 6
+    assert 0 < len(result["posts"][0]["channel"]) <= 40

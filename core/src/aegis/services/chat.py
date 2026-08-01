@@ -1367,9 +1367,12 @@ CHAT_TOOLS = [
                 "still queued/scheduled, on which channel, with the live post URL. Use "
                 "when the user asks about posts, the posting schedule, what went out on a "
                 "given channel, or what is lined up next. `posts` is a sample and may be "
-                "partial (`truncated` says so); `channels_in_window` is always the "
-                "COMPLETE per-channel roll-up for the window, keyed by platform — answer "
-                "'which channels am I posting to?' from it, never from `posts`."
+                "partial (`truncated` says so); `channels_in_window` is the per-channel "
+                "roll-up over the WHOLE window, keyed by platform — answer 'which "
+                "channels am I posting to?' from it, never from `posts`. It accounts for "
+                "every post in the window, but on an account with many channels only the "
+                "busiest are listed individually and the rest are summed into a single "
+                "`+K more` entry; say so rather than implying the named ones are all."
             ),
             "parameters": {
                 "type": "object",
@@ -3257,6 +3260,16 @@ _SOCIAL_TIMELINE_TEXT = 140
 # Nominal size of `channels_in_window`; anything beyond it is taken back out of
 # the posts budget so the whole result still clears 4096 bytes.
 _SOCIAL_TIMELINE_SUMMARY_ALLOWANCE = 500
+# ...but that clawback can only shrink `posts`, which floors at one row, so an
+# UNCAPPED roll-up still blows the 4096 cap on a big account — and then
+# `_smart_subset` keeps the leading `posts` key and drops `channels_in_window`
+# entirely, killing the complete-coverage guarantee on exactly the account that
+# needs it. Measured: 12 channels with long Devanagari+emoji names = 4360 bytes
+# (json.dumps escapes each char to \uXXXX, 6 bytes; emoji 12), 40 = 13279.
+# So the roll-up is capped by BYTES, not by channel count — the tail folds into
+# one `+K more` aggregate, which keeps the post totals complete either way.
+_SOCIAL_TIMELINE_CHANNEL_CAP = 1400
+_SOCIAL_TIMELINE_CHANNEL_NAME = 40
 
 
 async def _exec_social_timeline(pool: asyncpg.Pool, args: dict, ctx: ToolContext) -> str:
@@ -3300,6 +3313,9 @@ async def _exec_social_timeline(pool: asyncpg.Pool, args: dict, ctx: ToolContext
             continue
         integration = post.get("integration") or {}
         text = _HTML_TAG_RE.sub("", str(post.get("content") or "")).strip()
+        channel = integration.get("name")
+        if isinstance(channel, str):
+            channel = channel[:_SOCIAL_TIMELINE_CHANNEL_NAME]
         rows.append(
             {
                 "date": str(post.get("publishDate") or "")[:16].replace("T", " "),
@@ -3308,7 +3324,7 @@ async def _exec_social_timeline(pool: asyncpg.Pool, args: dict, ctx: ToolContext
                 # LinkedIn both come back as the same person's name. Only
                 # providerIdentifier tells the two platforms apart.
                 "platform": integration.get("providerIdentifier"),
-                "channel": integration.get("name"),
+                "channel": channel,
                 "text": text[:_SOCIAL_TIMELINE_TEXT],
                 "url": post.get("releaseURL"),
             }
@@ -3334,10 +3350,28 @@ async def _exec_social_timeline(pool: asyncpg.Pool, args: dict, ctx: ToolContext
         if row["date"] >= now_str and (entry["next"] is None or row["date"] < entry["next"]):
             entry["next"] = row["date"]
     platforms = [platform for platform, _ in grouped]
-    channels = {
-        (platform if platforms.count(platform) == 1 else f"{platform} ({name})"): entry
-        for (platform, name), entry in grouped.items()
-    }
+    # Busiest channels first, so the ones that survive the byte cap are the ones
+    # the question is most likely about. Once one entry overflows, every later
+    # (smaller) one joins it — otherwise the kept set would cherry-pick by name
+    # length rather than being an honest "top N by post count".
+    channels: dict[str, dict] = {}
+    overflow: list[dict] = []
+    summary_used = 0
+    for (platform, name), entry in sorted(grouped.items(), key=lambda kv: (-kv[1]["posts"], kv[0])):
+        key = platform if platforms.count(platform) == 1 else f"{platform} ({name})"
+        size = len(json.dumps({key: entry}, default=str))
+        if overflow or summary_used + size > _SOCIAL_TIMELINE_CHANNEL_CAP:
+            overflow.append(entry)
+            continue
+        channels[key] = entry
+        summary_used += size
+    if overflow:
+        channels[f"+{len(overflow)} more"] = {
+            "channels": len(overflow),
+            "posts": sum(e["posts"] for e in overflow),
+            "queued": sum(e["queued"] for e in overflow),
+            "published": sum(e["published"] for e in overflow),
+        }
     channels_json = json.dumps(channels, default=str)
 
     # Sample nearest-to-now first — alternating soonest-upcoming with

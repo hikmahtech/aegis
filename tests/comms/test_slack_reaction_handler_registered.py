@@ -145,6 +145,33 @@ async def test_message_handler_forwards_ts_for_note_to_self(monkeypatch):
     assert seen[0]["ts"] == "1700000009.5"
 
 
+async def test_app_mention_handler_forwards_ts(monkeypatch):
+    """The `message` handler defers every bot-mention to `app_mention`, so this
+    is the ONLY path an @mention takes. It shipped without `ts`, which left the
+    note-to-self lane with a blank dedupe key (`slack://CNOTES/`) — one
+    degenerate row that every later mention overwrote."""
+    app, inbound = await _listen(monkeypatch)
+    seen: list[dict] = []
+
+    async def _capture(**kw):
+        seen.append(kw)
+
+    inbound.on_message = _capture
+
+    await app.events["app_mention"](
+        {
+            "type": "app_mention",
+            "channel": "CNOTES",
+            "text": "<@UBOT> what's on today?",
+            "user": "UOWNER",
+            "ts": "1700000010.000100",
+        }
+    )
+
+    assert len(seen) == 1
+    assert seen[0]["ts"] == "1700000010.000100"
+
+
 async def test_self_capture_settings_are_passed_into_slack_inbound(monkeypatch):
     """The owner id / emoji / channel must be handed to SlackInbound, otherwise
     the guards see blanks and the feature is permanently inert."""

@@ -173,8 +173,11 @@ class DayLogActivities:
 
     async def _source_decisions(self, start: datetime, end: datetime) -> list[dict]:
         rows = await self.db_pool.fetch(
+            # `status = 'resolved'` matters: archiving a card that timed out
+            # UNANSWERED also stamps resolved_at, so without the filter the day
+            # log reports "Decided:" for a decision nobody ever made.
             "SELECT kind, origin, prompt, status, response FROM interactions "
-            "WHERE resolved_at >= $1 AND resolved_at < $2 "
+            "WHERE resolved_at >= $1 AND resolved_at < $2 AND status = 'resolved' "
             "ORDER BY resolved_at LIMIT $3",
             start,
             end,
