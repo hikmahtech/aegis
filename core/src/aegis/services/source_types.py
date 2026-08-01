@@ -108,6 +108,12 @@ SOURCE_TYPES: dict[str, SourceTypeInfo] = {
         "{kind:'life_fact'} — Slack `/remember`, chat, and downstream "
         "curated-signal ingest all land here"
     ),
+    "wearable": SourceTypeInfo(
+        "Wearable vendor metrics polled by WearableIngestFlow. Numeric "
+        "readings go to life.observations (source='oura', not "
+        "knowledge_content) — registered here so the vocabulary of ingest "
+        "sources stays enumerated in one place."
+    ),
     "daylog": SourceTypeInfo("Daily log entries (life-domain, planned)"),
     "daylog_rollup": SourceTypeInfo("Rolled-up daylog summaries (life-domain, planned)"),
 }

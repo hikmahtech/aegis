@@ -146,6 +146,7 @@ The shipped schedule set (`config/seed/activities.yaml` — all crons UTC):
 | `raindrop-ingest-2h` | `0 */2 * * *` | `RaindropIngestFlow` | Raphael | Raindrop bookmarks → knowledge store |
 | `service-drift-4h` | `0 */4 * * *` | `ServiceDriftFlow` | Pandora's Actor | Secondary swarm drift check (alertmanager is the primary path) |
 | `drive-sync-raphael` | `15 */4 * * *` | `DriveSyncFlow` | Raphael | Watched Google Drive folder → knowledge. **No-ops until `folder_id` is set** in its config |
+| `wearable-ingest-6h` | `50 */6 * * *` | `WearableIngestFlow` | Sebas | Wearable vendor API (Oura today) → `life.observations` (`sleep_score`, `readiness_score`, `activity_score`, `steps`). Needs **both** an `oura_api_token` under Integrations and an active `wearable` row under Channels — until then the run reports `token_missing` / `no_channel` rather than failing. Re-polls an overlapping window on purpose; rows dedup on `(source, metric, external_id)` in the database |
 
 **Daily**
 

@@ -60,6 +60,13 @@ CONFIG_REGISTRY: list[ConfigKey] = [
     ConfigKey("vercel_team_id", "Team id", "Vercel", False),
     ConfigKey("elevenlabs_api_key", "API key", "Voice (ElevenLabs)", True),
     ConfigKey("raindrop_api_token", "API token", "Raindrop", True),
+    ConfigKey(
+        "oura_api_token", "Oura personal access token", "Wearables", True,
+        help="Polled by WearableIngestFlow into life.observations. Also needs a "
+        "channel row (kind=wearable, identifier=oura) switched on under Channels. "
+        "Blank = the flow reports token_missing and never calls the API. "
+        "Worker restart required.",
+    ),
     ConfigKey("miniflux_url", "Base URL", "RSS (Miniflux)", False),
     ConfigKey("miniflux_api_key", "API key", "RSS (Miniflux)", True),
     ConfigKey("searxng_url", "Base URL", "Search (SearXNG)", False),

@@ -21,6 +21,12 @@ Two things every caller depends on:
   (`_SELECT_COLS` and the aggregates in `summarize`): floats out, JSON-safe.
   Writes need no cast — asyncpg 0.31 accepts a Python float for a numeric
   parameter (verified against this repo's asyncpg).
+
+Readings that arrive from an external system with a stable id of their own go
+through `record_external_observation` instead, which deduplicates on
+`(source, metric, external_id)` via the unique index in migration 021.
+`external_id` is deliberately absent from `_SELECT_COLS`: it is an ingest-side
+dedup key, not part of what a reader of a series cares about.
 """
 
 from __future__ import annotations
@@ -79,6 +85,55 @@ async def record_observation(
         metadata or {},
     )
     return dict(row)
+
+
+async def record_external_observation(
+    pool: asyncpg.Pool,
+    source: str,
+    metric: str,
+    external_id: str,
+    value: float | int | None = None,
+    observed_at: datetime | None = None,
+    metadata: dict | None = None,
+) -> dict | None:
+    """Insert one reading that carries a stable id from an external system.
+
+    Returns the stored row, or **None** when `(source, metric, external_id)`
+    is already present — i.e. None means "already ingested", not "failed".
+
+    The dedup is the partial unique index from migration 021 plus
+    `ON CONFLICT DO NOTHING`, deliberately NOT a SELECT-then-INSERT: a poll
+    flow re-reads an overlapping window on every tick, so two overlapping runs
+    would both read nothing and both insert. Here they serialise on the index
+    and exactly one gets a row back.
+
+    Shared by every "external metric → observation" ingest path (wearable
+    polls, location pings, health pushes) so they all dedup identically.
+    """
+    src = normalize_key(source)
+    met = normalize_key(metric)
+    ext = str(external_id or "").strip()
+    if not src:
+        raise ValueError("source is required")
+    if not met:
+        raise ValueError("metric is required")
+    if not ext:
+        raise ValueError("external_id is required")
+    num = None if value is None else float(value)
+    row = await pool.fetchrow(
+        "INSERT INTO life.observations "
+        "(source, metric, value, observed_at, metadata, external_id) "
+        "VALUES ($1, $2, $3, $4, $5, $6) "
+        "ON CONFLICT DO NOTHING "
+        f"RETURNING {_SELECT_COLS}",
+        src,
+        met,
+        num,
+        observed_at or datetime.now(UTC),
+        metadata or {},
+        ext,
+    )
+    return dict(row) if row is not None else None
 
 
 async def query_trend(

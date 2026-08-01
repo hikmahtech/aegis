@@ -52,6 +52,7 @@ from aegis_worker.activities.runs_v3 import RunRecorderActivities
 from aegis_worker.activities.sentry_ingest import SentryIngestActivities
 from aegis_worker.activities.social import SocialActivities
 from aegis_worker.activities.todoist import TodoistActivities
+from aegis_worker.activities.wearable import WearableActivities
 from aegis_worker.bootstrap import bootstrap
 from aegis_worker.interceptors import WorkflowRunRecorderInterceptor
 from aegis_worker.registry import (
@@ -313,6 +314,13 @@ async def main():
         db_pool=deps.pool,
     )
     rss_act = RssActivities(db_pool=deps.pool)
+    # B7 — wearable vendor poll. An empty token is not an error here: the
+    # activity refuses to issue a request and reports `token_missing`, which
+    # the flow surfaces in result_summary.
+    wearable_act = WearableActivities(
+        oura_api_token=getattr(settings, "oura_api_token", ""),
+        db_pool=deps.pool,
+    )
     intel_scan_act = IntelScanActivities(searxng_url=getattr(settings, "searxng_url", ""))
     sentry_project_ids: list[int] = []
     for _p in (getattr(settings, "sentry_projects", "") or "").split(","):
@@ -489,6 +497,7 @@ async def main():
         daylog_act,
         raindrop_act,
         rss_act,
+        wearable_act,
         intel_scan_act,
         sentry_ingest_act,
         todoist_act,
