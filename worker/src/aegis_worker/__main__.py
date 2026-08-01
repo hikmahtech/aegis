@@ -603,6 +603,8 @@ async def main():
         daylog_act.gather_day_events,
         daylog_act.distil_daylog,
         daylog_act.commit_daylog_state,
+        daylog_act.gather_daylogs,
+        daylog_act.distil_rollup,
         raindrop_act.poll_bookmarks,
         rss_act.fetch_feed,
         intel_scan_act.search_source,

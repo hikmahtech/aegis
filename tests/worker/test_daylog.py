@@ -365,12 +365,14 @@ class _RecordingKS:
         return {"content_id": f"c-{kwargs['url']}", "status": "ok", "chunks_total": 1}
 
 
-async def _run_flow(client, ks, day_acts, task_queue: str, extra_activities=None):
+async def _run_flow(client, ks, day_acts, task_queue: str, extra_activities=None, config=None):
     content_acts = ContentActivities(knowledge_connector=ks, enabled=True)
     activities = [
         day_acts.gather_day_events,
         day_acts.distil_daylog,
         day_acts.commit_daylog_state,
+        day_acts.gather_daylogs,
+        day_acts.distil_rollup,
         content_acts.ingest_content,
     ]
     if extra_activities:
@@ -385,7 +387,7 @@ async def _run_flow(client, ks, day_acts, task_queue: str, extra_activities=None
     ):
         return await client.execute_workflow(
             DayLogFlow.run,
-            DayLogConfig(agent_id="raphael"),
+            config or DayLogConfig(agent_id="raphael"),
             id=f"daylog-{uuid4().hex[:8]}",
             task_queue=task_queue,
         )
@@ -506,6 +508,342 @@ async def test_flow_does_not_advance_the_cursor_when_ingest_is_disabled(clean_db
     assert await clean_db.fetchval("SELECT value FROM settings WHERE key = 'daylog_state'") is None
 
 
+# ================================================================ A9 rollups
+
+
+async def _add_daylog_entry(pool, date: str, chunks: list[str]):
+    """Exactly what A8's flow files: a `source_type='daylog'` content row whose
+    body lives ONLY in knowledge_chunks (there is no raw-text column)."""
+    cid = f"daylog-{date}"
+    await pool.execute(
+        "INSERT INTO knowledge_content (content_id, url, title, source_type, metadata) "
+        "VALUES ($1, $2, $3, 'daylog', $4)",
+        cid,
+        f"aegis://daylog/{date}",
+        f"Day Log {date}",
+        {"date": date, "quiet": False, "counts": {}},
+    )
+    for i, text in enumerate(chunks):
+        await pool.execute(
+            "INSERT INTO knowledge_chunks (content_id, chunk_index, chunk_text) "
+            "VALUES ($1, $2, $3)",
+            cid,
+            i,
+            text,
+        )
+
+
+def _iso_week_dates(now: datetime) -> list[str]:
+    monday = now - timedelta(days=now.isocalendar()[2] - 1)
+    return [(monday + timedelta(days=i)).strftime("%Y-%m-%d") for i in range(7)]
+
+
+# ------------------------------------------------------------- window maths
+
+
+def test_rollup_window_weekly_anchors_on_the_iso_week():
+    from aegis_worker.flows.daylog import rollup_window
+
+    # 2026-08-02 is a Sunday — the scheduled run. ISO week 31 of 2026 runs
+    # Mon 2026-07-27 .. Sun 2026-08-02.
+    assert rollup_window("weekly", datetime(2026, 8, 2, 20, 20, tzinfo=UTC)) == (
+        "2026-07-27",
+        "2026-08-02",
+        "2026-W31",
+    )
+    # A manual mid-week run must land on the SAME window/url, not a partial one.
+    assert rollup_window("weekly", datetime(2026, 7, 29, 9, 0, tzinfo=UTC)) == (
+        "2026-07-27",
+        "2026-08-02",
+        "2026-W31",
+    )
+    # ISO year rolls independently of the calendar year: 2027-01-03 is a Sunday
+    # belonging to ISO week 53 of 2026.
+    assert rollup_window("weekly", datetime(2027, 1, 3, 20, 20, tzinfo=UTC))[2] == "2026-W53"
+
+
+def test_rollup_window_monthly_fires_only_on_the_last_day_of_the_month():
+    from aegis_worker.flows.daylog import rollup_window
+
+    # The 28-31 cron fires up to four times a month; only the real end may run.
+    for not_last in (
+        datetime(2026, 2, 27, 21, 20, tzinfo=UTC),  # short February
+        datetime(2024, 2, 28, 21, 20, tzinfo=UTC),  # LEAP February — 28th is not the end
+        datetime(2026, 1, 30, 21, 20, tzinfo=UTC),  # 31-day month
+        datetime(2026, 4, 29, 21, 20, tzinfo=UTC),  # 30-day month
+    ):
+        assert rollup_window("monthly", not_last) is None, f"{not_last} must not roll up"
+
+    assert rollup_window("monthly", datetime(2026, 2, 28, 21, 20, tzinfo=UTC)) == (
+        "2026-02-01",
+        "2026-02-28",
+        "2026-02",
+    )
+    assert rollup_window("monthly", datetime(2024, 2, 29, 21, 20, tzinfo=UTC)) == (
+        "2024-02-01",
+        "2024-02-29",
+        "2024-02",
+    )
+    assert rollup_window("monthly", datetime(2026, 1, 31, 21, 20, tzinfo=UTC))[1] == "2026-01-31"
+    assert rollup_window("monthly", datetime(2026, 4, 30, 21, 20, tzinfo=UTC))[1] == "2026-04-30"
+
+
+# -------------------------------------------------------------- gather/distil
+
+
+@pytest.mark.asyncio
+async def test_gather_daylogs_returns_bodies_in_date_order_and_respects_the_window(clean_db):
+    for d, body in (
+        ("2019-03-11", "Monday: shipped the pgvector migration."),
+        ("2019-03-13", "Wednesday: standup with Zara about the outage."),
+        ("2019-03-12", "Tuesday: renewed the domain."),
+        ("2019-03-18", "Next week: out of window entirely."),
+    ):
+        await _add_daylog_entry(clean_db, d, [body])
+    # A non-daylog document inside the same window must not be swept in.
+    await _add_email(clean_db, "Some newsletter")
+
+    acts = DayLogActivities(db_pool=clean_db)
+    got = await ActivityEnvironment().run(acts.gather_daylogs, "2019-03-11", "2019-03-17")
+
+    assert [e["date"] for e in got] == ["2019-03-11", "2019-03-12", "2019-03-13"]
+    # The BODY is the point — metadata-only would make the rollup contentless.
+    assert "pgvector migration" in got[0]["text"]
+    assert "renewed the domain" in got[1]["text"]
+    assert "standup with Zara" in got[2]["text"]
+
+
+@pytest.mark.asyncio
+async def test_gather_daylogs_stitches_overlapping_chunks_without_repeating(clean_db):
+    """KnowledgeStore chunks with a 200-char overlap, so a naive concat repeats
+    a paragraph inside every rollup it files."""
+    overlap = "the overlap paragraph. "
+    await _add_daylog_entry(
+        clean_db,
+        "2019-03-11",
+        [f"Head of the day. {overlap}", f"{overlap}Tail of the day."],
+    )
+
+    acts = DayLogActivities(db_pool=clean_db)
+    got = await ActivityEnvironment().run(acts.gather_daylogs, "2019-03-11", "2019-03-11")
+
+    assert got[0]["text"] == f"Head of the day. {overlap}Tail of the day."
+    assert got[0]["text"].count(overlap) == 1
+
+
+@pytest.mark.asyncio
+async def test_distil_rollup_without_an_llm_concatenates_the_entries():
+    entries = [
+        {"date": "2019-03-11", "title": "Day Log", "text": "shipped the pgvector migration"},
+        {"date": "2019-03-12", "title": "Day Log", "text": "renewed the domain"},
+    ]
+    acts = DayLogActivities(db_pool=None, llm_client=None)
+    text = await ActivityEnvironment().run(acts.distil_rollup, entries, "weekly", "2019-W11")
+
+    assert "2019-W11" in text
+    for needle in ("2019-03-11", "shipped the pgvector migration", "renewed the domain"):
+        assert needle in text, f"deterministic rollup lost {needle!r}"
+
+
+@pytest.mark.asyncio
+async def test_distil_rollup_llm_failure_degrades_to_the_concatenation():
+    class _Boom:
+        async def think(self, **kwargs):
+            raise RuntimeError("llm gateway 503")
+
+    entries = [
+        {"date": "2019-03-11", "title": "Day Log", "text": "shipped the pgvector migration"},
+        {"date": "2019-03-12", "title": "Day Log", "text": "renewed the domain"},
+    ]
+    acts = DayLogActivities(db_pool=None, llm_client=_Boom())
+    text = await ActivityEnvironment().run(acts.distil_rollup, entries, "weekly", "2019-W11")
+
+    assert "shipped the pgvector migration" in text
+
+
+@pytest.mark.asyncio
+async def test_distil_rollup_records_the_llm_call(clean_db):
+    seen: dict = {}
+
+    class _Ok:
+        async def think(self, **kwargs):
+            seen.update(kwargs)
+            return {
+                "response": "A busy week.",
+                "model": "test-model",
+                "prompt_tokens": 21,
+                "completion_tokens": 9,
+            }
+
+    await clean_db.execute("DELETE FROM llm_calls WHERE purpose = 'daylog_rollup'")
+    acts = DayLogActivities(db_pool=clean_db, llm_client=_Ok(), model="test-model")
+    entries = [{"date": "2019-03-11", "text": "a"}, {"date": "2019-03-12", "text": "b"}]
+    text = await ActivityEnvironment().run(acts.distil_rollup, entries, "weekly", "2019-W11")
+
+    assert text == "A busy week."
+    assert seen["purpose"] == "daylog_rollup"
+    assert seen["db_pool"] is clean_db
+    row = await clean_db.fetchrow(
+        "SELECT model, purpose, input_tokens, output_tokens FROM llm_calls "
+        "WHERE purpose = 'daylog_rollup'"
+    )
+    assert row is not None, "successful rollup LLM call was not recorded in llm_calls"
+    assert row["input_tokens"] == 21
+    assert row["output_tokens"] == 9
+    await clean_db.execute("DELETE FROM llm_calls WHERE purpose = 'daylog_rollup'")
+
+
+# ---------------------------------------------------------------- rollup flow
+
+
+@pytest.mark.asyncio
+async def test_weekly_rollup_files_one_entry_covering_every_day_of_the_week(clean_db):
+    ks = _RecordingKS()
+    async with await WorkflowEnvironment.start_time_skipping() as env:
+        # Auto time-skipping OFF: the test server otherwise jumps the clock by
+        # YEARS between runs, and every assertion here is date-sensitive.
+        with env.auto_time_skipping_disabled():
+            now = await env.get_current_time()
+            dates = _iso_week_dates(now)
+            for i, d in enumerate(dates):
+                await _add_daylog_entry(clean_db, d, [f"Day {i}: worked on marker-{i}."])
+            result = await _run_flow(
+                env.client,
+                ks,
+                DayLogActivities(db_pool=clean_db, llm_client=None),
+                "daylog-w1",
+                config=DayLogConfig(agent_id="raphael", mode="weekly"),
+            )
+
+    iso = now.isocalendar()
+    label = f"{iso[0]}-W{iso[1]:02d}"
+    assert result["status"] == "ingested"
+    assert result["label"] == label
+    assert len(ks.calls) == 1
+    call = ks.calls[0]
+    assert call["source_type"] == "daylog_rollup"
+    assert call["url"] == f"aegis://daylog/week/{label}"
+    assert call["metadata"]["period"] == "weekly"
+    assert call["metadata"]["covers"] == dates, "rollup did not cover all seven days"
+    # Not just their existence: the filed text must carry the days' content.
+    for i in range(7):
+        assert f"marker-{i}" in call["raw_text"], f"rollup lost day {i}'s content"
+
+
+@pytest.mark.asyncio
+async def test_rollup_with_fewer_than_two_entries_writes_nothing(clean_db):
+    ks = _RecordingKS()
+    async with await WorkflowEnvironment.start_time_skipping() as env:
+        with env.auto_time_skipping_disabled():
+            now = await env.get_current_time()
+            await _add_daylog_entry(clean_db, _iso_week_dates(now)[0], ["Only one day recorded."])
+            result = await _run_flow(
+                env.client,
+                ks,
+                DayLogActivities(db_pool=clean_db, llm_client=None),
+                "daylog-w2",
+                config=DayLogConfig(agent_id="raphael", mode="weekly"),
+            )
+
+    assert result["status"] == "insufficient"
+    assert result["entries"] == 1
+    assert ks.calls == [], "a one-day 'rollup' was filed"
+
+
+def _first_of_next_month(when: datetime) -> datetime:
+    return (when.replace(day=1) + timedelta(days=32)).replace(day=1)
+
+
+async def _run_monthly_at(clean_db, ks, day_in_month, task_queue: str):
+    """Drive the test server's clock to a chosen day-of-month and run the
+    monthly rollup there, so neither branch of the month-end guard depends on
+    what date the suite happens to run.
+
+    `day_in_month` picks a day of the month AFTER the environment's start
+    month (a whole clean month, fully seedable): an int, or "last".
+    """
+    async with await WorkflowEnvironment.start_time_skipping() as env:
+        with env.auto_time_skipping_disabled():
+            start = await env.get_current_time()
+        month = _first_of_next_month(start)
+        end_of_month = _first_of_next_month(month) - timedelta(days=1)
+        day = end_of_month.day if day_in_month == "last" else day_in_month
+        target = month.replace(day=day, hour=21, minute=20, second=0, microsecond=0)
+        await env.sleep(target - start)
+
+        with env.auto_time_skipping_disabled():
+            now = await env.get_current_time()
+            assert now.strftime("%Y-%m-%d") == target.strftime("%Y-%m-%d"), (
+                f"clock landed on {now} instead of {target}"
+            )
+            for i in range(1, end_of_month.day + 1):
+                await _add_daylog_entry(
+                    clean_db, month.replace(day=i).strftime("%Y-%m-%d"), [f"Day {i}: item-{i}."]
+                )
+            result = await _run_flow(
+                env.client,
+                ks,
+                DayLogActivities(db_pool=clean_db, llm_client=None),
+                task_queue,
+                config=DayLogConfig(agent_id="raphael", mode="monthly"),
+            )
+    return result, month, end_of_month
+
+
+@pytest.mark.asyncio
+async def test_monthly_rollup_skips_a_run_that_is_not_the_month_end(clean_db):
+    """The 28-31 cron fires up to four times a month; the flow's guard is the
+    only thing that stops three of those runs writing a partial month."""
+    ks = _RecordingKS()
+    result, _, _ = await _run_monthly_at(clean_db, ks, 28, "daylog-m1")
+
+    assert result["status"] == "skipped"
+    assert result["reason"] == "not_period_end"
+    assert ks.calls == [], "a 28th-of-the-month run filed a monthly rollup"
+
+
+@pytest.mark.asyncio
+async def test_monthly_rollup_files_on_the_last_day_of_the_month(clean_db):
+    ks = _RecordingKS()
+    result, month, end_of_month = await _run_monthly_at(clean_db, ks, "last", "daylog-m2")
+
+    label = month.strftime("%Y-%m")
+    assert result["status"] == "ingested"
+    assert result["label"] == label
+    assert len(ks.calls) == 1
+    assert ks.calls[0]["source_type"] == "daylog_rollup"
+    assert ks.calls[0]["url"] == f"aegis://daylog/month/{label}"
+    assert ks.calls[0]["metadata"]["period"] == "monthly"
+    assert len(ks.calls[0]["metadata"]["covers"]) == end_of_month.day
+    assert f"item-{end_of_month.day}." in ks.calls[0]["raw_text"], "rollup lost the final day"
+
+
+@pytest.mark.asyncio
+async def test_daily_mode_is_unchanged_by_the_rollup_branch(clean_db):
+    """A8 regression: an explicit mode='daily' must file exactly what A8 filed."""
+    ks = _RecordingKS()
+    async with await WorkflowEnvironment.start_time_skipping() as env:
+        with env.auto_time_skipping_disabled():
+            now = await env.get_current_time()
+            await _add_completed_task(clean_db, "Ship the pgvector migration", now)
+            result = await _run_flow(
+                env.client,
+                ks,
+                DayLogActivities(db_pool=clean_db, llm_client=None),
+                "daylog-d1",
+                config=DayLogConfig(agent_id="raphael", mode="daily"),
+            )
+
+    expected_date = now.strftime("%Y-%m-%d")
+    assert result["status"] == "ingested"
+    assert result["date"] == expected_date
+    assert len(ks.calls) == 1
+    assert ks.calls[0]["source_type"] == "daylog"
+    assert ks.calls[0]["url"] == f"aegis://daylog/{expected_date}"
+    assert ks.calls[0]["tags"] == ["daylog"]
+    assert "Ship the pgvector migration" in ks.calls[0]["raw_text"]
+
+
 # --------------------------------------------------------------- registration
 
 
@@ -537,7 +875,13 @@ def test_daylog_activities_are_in_the_runtime_activities_list():
         ):
             attrs |= {e.attr for e in node.value.elts if isinstance(e, ast.Attribute)}
 
-    for name in ("gather_day_events", "distil_daylog", "commit_daylog_state"):
+    for name in (
+        "gather_day_events",
+        "distil_daylog",
+        "commit_daylog_state",
+        "gather_daylogs",
+        "distil_rollup",
+    ):
         assert name in attrs, f"{name} missing from main()'s activities list"
 
 
@@ -551,6 +895,13 @@ def test_daylog_flow_in_schedule_map():
     assert cls is DayLogFlow
     assert config.agent_id == "raphael"
     assert config.day_offset == 2
+    # Absent mode must stay daily, or an existing daylog-nightly row would
+    # silently change behaviour on deploy.
+    assert config.mode == "daily"
+    _, weekly = _ACTIVITY_TYPE_MAP["DayLogFlow"](
+        {"agent_id": "raphael", "config": {"mode": "weekly"}}
+    )
+    assert weekly.mode == "weekly", "_ACTIVITY_TYPE_MAP does not read config.mode"
 
 
 def test_daylog_seed_row_exists():
@@ -566,3 +917,31 @@ def test_daylog_seed_row_exists():
     # 19:00 UTC = 00:30 IST — the run's UTC date is the IST day just closed.
     assert row["schedule_cron"] == "0 19 * * *"
     assert row["active"] is True
+    # A9 must not have changed the nightly row's mode out from under it.
+    assert (row["config"] or {}).get("mode", "daily") == "daily"
+
+
+def test_daylog_rollup_seed_rows_exist():
+    from pathlib import Path
+
+    import yaml
+
+    repo = Path(__file__).resolve().parents[2]
+    rows = yaml.safe_load((repo / "config" / "seed" / "activities.yaml").read_text())["activities"]
+    by_slug = {r["slug"]: r for r in rows}
+
+    for slug, cron, mode in (
+        ("daylog-weekly", "20 20 * * 0", "weekly"),
+        ("daylog-monthly", "20 21 28-31 * *", "monthly"),
+    ):
+        row = by_slug.get(slug)
+        assert row is not None, f"{slug} missing from config/seed/activities.yaml"
+        assert row["workflow_type"] == "DayLogFlow"
+        assert row["schedule_cron"] == cron
+        assert row["config"]["mode"] == mode, f"{slug} would run in daily mode"
+        assert row["active"] is True
+
+    # The three rows must not share a minute-of-hour slot with each other, and
+    # none may sit on the :00 pile-up every */N schedule already lands on.
+    minutes = {by_slug[s]["schedule_cron"].split()[0] for s in ("daylog-weekly", "daylog-monthly")}
+    assert "0" not in minutes, "rollups scheduled onto the busiest minute in the file"
