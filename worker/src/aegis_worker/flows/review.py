@@ -18,6 +18,7 @@ with workflow.unsafe.imports_passed_through():
     from aegis_worker.activities.review import (
         ReviewActivities,
         format_daily_preview,
+        format_key_dates,
         format_today_focus,
         format_weekly_preview,
     )
@@ -200,6 +201,27 @@ class WeeklyReviewFlow:
             )
             narrative = framed.get("narrative") or format_weekly_preview(snapshot)
             decisions = framed.get("decisions") or []
+            # People radar (life.people.key_dates). Appended to the narrative
+            # rather than folded into format_weekly_preview, because that
+            # formatter is only frame_review's FALLBACK — in production the
+            # delivered narrative is the LLM's, so a block added there alone
+            # would never ship. Best-effort: an empty/unreachable registry
+            # must not cost the user their weekly review.
+            step = "check_upcoming_key_dates"
+            try:
+                key_dates = await workflow.execute_activity_method(
+                    ReviewActivities.check_upcoming_key_dates,
+                    start_to_close_timeout=TIMEOUT_FAST,
+                    retry_policy=NO_RETRY,
+                )
+            except Exception as exc:  # noqa: BLE001
+                workflow.logger.warning(
+                    "weekly_key_dates_failed err=%s", str(exc)[:200]
+                )
+                key_dates = []
+            key_dates_block = format_key_dates(key_dates)
+            if key_dates_block:
+                narrative = f"{narrative}\n\n{key_dates_block}"
             step = "send_message"
             try:
                 await workflow.execute_activity_method(
