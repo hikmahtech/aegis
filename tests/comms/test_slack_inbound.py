@@ -361,6 +361,71 @@ async def test_on_capture_blank_text_does_not_call_core():
     core.capture.assert_not_awaited()
 
 
+async def test_on_remember_sends_life_fact_kind():
+    inbound, core, adapter = _inbound()
+    core.capture.return_value = {"content_id": "abcdef0123456789"}
+
+    reply = await inbound.on_remember(text="passport expires 2030", user_id="UME")
+
+    core.capture.assert_awaited_once()
+    ckw = core.capture.await_args.kwargs
+    assert ckw["kind"] == "life_fact"
+    assert ckw["text"] == "passport expires 2030"
+    assert ckw["external_id"].startswith("slack:UME:")
+    assert "abcdef012345" in reply
+
+
+async def test_on_remember_blank_text_does_not_call_core():
+    inbound, core, adapter = _inbound()
+    reply = await inbound.on_remember(text="  ", user_id="UME")
+    core.capture.assert_not_awaited()
+    assert "Usage" in reply
+
+
+@respx.mock
+async def test_core_capture_posts_kind_life_fact():
+    """SlackCoreClient.capture forwards `kind` in the POST body."""
+    core = SlackCoreClient(_settings())
+    route = respx.post("http://core/api/admin/capture").mock(
+        return_value=httpx.Response(200, json={"content_id": "cid-1"})
+    )
+
+    await core.capture(text="a fact", external_id="slack:U:1", kind="life_fact")
+
+    body = json.loads(route.calls.last.request.content)
+    assert body["kind"] == "life_fact"
+    assert body["text"] == "a fact"
+
+
+@respx.mock
+async def test_core_capture_defaults_kind_to_task():
+    core = SlackCoreClient(_settings())
+    route = respx.post("http://core/api/admin/capture").mock(
+        return_value=httpx.Response(200, json={"task_ref": "T1"})
+    )
+
+    await core.capture(text="buy milk", external_id="slack:U:2")
+
+    assert json.loads(route.calls.last.request.content)["kind"] == "task"
+
+
+@respx.mock
+async def test_core_knowledge_ingest_source_type_is_parameterized():
+    """knowledge_ingest defaults to `document` but accepts an override (B2)."""
+    core = SlackCoreClient(_settings())
+    route = respx.post("http://core/api/knowledge/ingest").mock(
+        return_value=httpx.Response(200, json={"content_id": "cid-2"})
+    )
+
+    await core.knowledge_ingest(url="u", title="t", raw_text="body")
+    assert json.loads(route.calls.last.request.content)["source_type"] == "document"
+
+    await core.knowledge_ingest(
+        url="u", title="t", raw_text="body", source_type="life_fact"
+    )
+    assert json.loads(route.calls.last.request.content)["source_type"] == "life_fact"
+
+
 async def test_on_status_renders_failures_and_pending_first():
     inbound, core, adapter = _inbound()
     core.status_digest.return_value = {

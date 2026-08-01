@@ -11,6 +11,10 @@ features:
       description: Capture a thought to your GTD inbox
       usage_hint: "[text]"
       should_escape: false
+    - command: /remember
+      description: File a fact about your life into the knowledge store
+      usage_hint: "[text]"
+      should_escape: false
     - command: /status
       description: Show AEGIS system status
 oauth_config:

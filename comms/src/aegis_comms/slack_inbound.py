@@ -346,9 +346,20 @@ class SlackCoreClient:
         }
         return await self._post("/api/chat/agent-reply/trigger", payload, timeout=15)
 
-    async def capture(self, *, text: str, external_id: str) -> dict | None:
-        """POST /api/admin/capture — drop a task into the Todoist Inbox."""
-        payload = {"text": text[:2000], "source": "slack", "external_id": external_id}
+    async def capture(
+        self, *, text: str, external_id: str, kind: str = "task"
+    ) -> dict | None:
+        """POST /api/admin/capture — Todoist Inbox task, or a `life_fact`.
+
+        `kind="life_fact"` files the text in the knowledge store instead of
+        Todoist; the response carries `content_id` rather than `task_ref`.
+        """
+        payload = {
+            "text": text[:2000],
+            "source": "slack",
+            "external_id": external_id,
+            "kind": kind,
+        }
         return await self._post("/api/admin/capture", payload, timeout=30)
 
     async def resolve_interaction(
@@ -395,7 +406,13 @@ class SlackCoreClient:
         return await self._get(f"/api/observability/status-digest?hours={hours}")
 
     async def knowledge_ingest(
-        self, *, url: str, title: str, raw_text: str, tags: list[str] | None = None
+        self,
+        *,
+        url: str,
+        title: str,
+        raw_text: str,
+        tags: list[str] | None = None,
+        source_type: str = "document",
     ) -> str | None:
         """POST /api/knowledge/ingest — returns content_id on success."""
         result = await self._post(
@@ -403,7 +420,7 @@ class SlackCoreClient:
             {
                 "url": url,
                 "title": title,
-                "source_type": "document",
+                "source_type": source_type,
                 "raw_text": raw_text[:100_000],
                 "tags": tags or [],
             },
@@ -663,6 +680,24 @@ class SlackInbound:
             "⚠ Capture failed — check Core logs (capture kill switch off, "
             "Todoist not configured, or inbox project missing)."
         )
+
+    async def on_remember(self, *, text: str, user_id: str) -> str:
+        """`/remember <text>` — file a fact about my life, not a task.
+
+        Same idempotency key shape as `/capture`, but the `life_fact` lane:
+        Core upserts it into the knowledge store, so re-sending identical
+        text just refreshes the same row. Returns a user-facing string.
+        """
+        text = (text or "").strip()
+        if not text:
+            return "Usage: `/remember my passport expires in March 2030`"
+        ext_id = f"slack:{user_id}:{hashlib.sha256(text.encode()).hexdigest()[:16]}"
+        result = await self._core.capture(
+            text=text, external_id=ext_id, kind="life_fact"
+        )
+        if result and result.get("content_id"):
+            return f"🧠 Remembered: `{result['content_id'][:12]}`"
+        return "⚠ Remember failed — check Core logs (knowledge subsystem unavailable?)."
 
     async def on_status(self) -> str:
         """Format a `/status` summary from the shared status-digest aggregate.
