@@ -1,12 +1,20 @@
-"""Worker boot-time registration assertions for the comment-channel.
+"""Worker registration assertions for the comment-channel.
 
-A new @workflow.defn / @activity.defn is INVISIBLE to Temporal unless it
-appears in worker/__main__.py's explicit registration lists. These tests
-catch the omission at the unit-test level instead of at "unknown workflow
-type" runtime.
+Since D6 there is ONE declaration — `aegis_worker/registry.py` — and a boot
+check that refuses to start the worker when the runtime disagrees with it
+(`tests/worker/test_registry.py` covers that machinery and its falsifiability).
+What is still worth asserting per feature here is that the flow is in the
+registry, that its activities carry @activity.defn under the expected names,
+and that its schedule mapper reads the config keys it claims to.
 """
 
+from types import SimpleNamespace
+
 import aegis_worker.__main__ as worker_main
+from aegis_worker.registry import expected_activity_names, workflows_for
+
+# Prod settings: both feature flags on.
+_PROD = SimpleNamespace(homelab_enabled=True, money_hygiene_enabled=True)
 
 
 def test_agent_chat_reply_flow_registered():
@@ -152,48 +160,27 @@ def test_agent_task_sweep_flow_in_schedule_map():
     assert config.max_coding == 2
 
 
-def test_agent_task_registrations_reach_mains_live_lists():
-    """`_activity_names()` and the WORKFLOWS-membership tests above only
-    inspect the module-level stubs (built at import time from db_pool=None
-    instances) — nothing checks that main()'s LIVE `workflows = [...]` /
-    `activities = [...]` lists (constructed inside main(), never exercised by
-    a plain import) also carry these entries. An entry present only in the
-    stub passes every test above and every generic AST guard
-    (test_module_stub_workflows_covers_runtime_base_list only checks
-    runtime ⊆ stub; test_every_registered_activity_is_decorated only checks
-    decoration) while still crashing the live worker at boot with an
-    unknown workflow/activity type. This closes that gap for the thirteen
-    agent_task registrations plus the three infra_ops registrations added
-    alongside the infra verb (Task 4), restart-approval hook (Task 5),
-    email verb (Task 6), finance verb (Task 7), and coding verb phases 1-2
-    (Tasks 8-9) specifically.
+def test_agent_task_registrations_reach_the_worker():
+    """Before D6 this test AST-parsed main()'s hand-written `workflows`/
+    `activities` literals, because the module-level lists were a parallel truth
+    that could silently disagree (issue #188). Both literals are gone: the flow
+    list IS `registry.workflows_for(settings)` and the activity list IS
+    `collect_activities(...)` over the instances main() builds, with
+    `check_registration()` refusing to boot on any disagreement (proved in
+    tests/worker/test_registry.py).
+
+    What remains worth pinning here: these sixteen names — the thirteen
+    agent_task registrations plus the three infra_ops ones added alongside the
+    infra verb (Task 4), restart-approval hook (Task 5), email verb (Task 6),
+    finance verb (Task 7) and coding verb phases 1-2 (Tasks 8-9) — are the
+    activity names the worker serves. A rename or a dropped @activity.defn
+    still breaks the flows that call them by name.
     """
-    import ast
-    import inspect
+    served = expected_activity_names(_PROD)
+    registered_flows = {c.__name__ for c in workflows_for(_PROD)}
 
-    src = inspect.getsource(worker_main)
-    tree = ast.parse(src)
-
-    live_workflow_names: set[str] = set()
-    live_activity_attrs: set[str] = set()
-    for node in ast.walk(tree):
-        if not (
-            isinstance(node, ast.Assign)
-            and len(node.targets) == 1
-            and isinstance(node.targets[0], ast.Name)
-            and isinstance(node.value, ast.List)
-        ):
-            continue
-        target = node.targets[0].id
-        if target == "workflows":
-            live_workflow_names |= {elt.id for elt in node.value.elts if isinstance(elt, ast.Name)}
-        elif target == "activities":
-            live_activity_attrs |= {
-                elt.attr for elt in node.value.elts if isinstance(elt, ast.Attribute)
-            }
-
-    assert "AgentTaskSweepFlow" in live_workflow_names
-    assert "AgentTaskFlow" in live_workflow_names
+    assert "AgentTaskSweepFlow" in registered_flows
+    assert "AgentTaskFlow" in registered_flows
     for expected in (
         "find_actionable_tasks",
         "load_task_context",
@@ -212,97 +199,4 @@ def test_agent_task_registrations_reach_mains_live_lists():
         "service_logs",
         "restart_service",
     ):
-        assert expected in live_activity_attrs, (
-            f"{expected} must be in main()'s live activities=[...] list, not just the module stub"
-        )
-
-
-def test_module_stub_workflows_covers_runtime_base_list():
-    """The module-level WORKFLOWS stub (import-time; used by registration
-    tests that never boot the worker) must include every workflow class in
-    main()'s unconditional `workflows = [...]` base list.
-
-    main() also appends settings-gated extras (homelab_enabled,
-    money_hygiene_enabled) via `workflows += [...]`, which the stub is not
-    expected to mirror — only the unconditional base list. This is an
-    AST cross-check (like test_every_registered_activity_is_decorated
-    above) so it catches drift, e.g. a flow added to main()'s base list
-    but forgotten in the stub, without needing to run main() itself.
-    """
-    import ast
-    import inspect
-
-    src = inspect.getsource(worker_main)
-    tree = ast.parse(src)
-
-    runtime_names: set[str] = set()
-    for node in ast.walk(tree):
-        if (
-            isinstance(node, ast.Assign)
-            and len(node.targets) == 1
-            and isinstance(node.targets[0], ast.Name)
-            and node.targets[0].id == "workflows"
-            and isinstance(node.value, ast.List)
-        ):
-            for elt in node.value.elts:
-                assert isinstance(elt, ast.Name), (
-                    f"unexpected non-name element in runtime workflows list: {elt}"
-                )
-                runtime_names.add(elt.id)
-
-    assert runtime_names, "could not find the runtime `workflows = [...]` base list via AST"
-
-    stub_names = {cls.__name__ for cls in worker_main.WORKFLOWS}
-    missing = runtime_names - stub_names
-    assert not missing, (
-        f"module-level WORKFLOWS stub is missing {sorted(missing)}, present in "
-        "main()'s unconditional runtime workflows list"
-    )
-
-
-def test_every_registered_activity_is_decorated():
-    """Every method referenced in an activities list anywhere in __main__.py —
-    including the REAL list inside main(), which no test instantiates — must
-    carry @activity.defn. An undecorated entry crashes the worker at boot
-    ("missing attributes, was it decorated with @activity.defn?"), which unit
-    tests never see because main() only runs against live Temporal.
-    """
-    import ast
-    import inspect
-
-    from temporalio import activity
-
-    src = inspect.getsource(worker_main)
-    tree = ast.parse(src)
-
-    # instance name -> Activities class name, from `x_act = SomeActivities(...)`
-    instances: dict[str, str] = {}
-    for node in ast.walk(tree):
-        if (
-            isinstance(node, ast.Assign)
-            and len(node.targets) == 1
-            and isinstance(node.targets[0], ast.Name)
-            and isinstance(node.value, ast.Call)
-            and isinstance(node.value.func, ast.Name)
-        ):
-            instances[node.targets[0].id] = node.value.func.id
-
-    checked = 0
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.List):
-            continue
-        for elt in node.elts:
-            if (
-                isinstance(elt, ast.Attribute)
-                and isinstance(elt.value, ast.Name)
-                and elt.value.id in instances
-            ):
-                cls = getattr(worker_main, instances[elt.value.id])
-                fn = inspect.getattr_static(cls, elt.attr)
-                assert activity._Definition.from_callable(fn) is not None, (
-                    f"{instances[elt.value.id]}.{elt.attr} is registered in "
-                    "worker/__main__.py but not decorated with @activity.defn — "
-                    "the worker would crash at boot"
-                )
-                checked += 1
-    assert checked > 50, f"AST scan found only {checked} registrations — scan is broken"
+        assert expected in served, f"{expected} is not an activity the worker serves"

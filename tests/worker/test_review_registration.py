@@ -1,9 +1,8 @@
 """The new review activities carry @activity.defn so the worker can register them."""
 from __future__ import annotations
 
-from pathlib import Path
-
 from aegis_worker.activities.review import ReviewActivities
+from aegis_worker.registry import expected_activity_names
 
 
 def test_new_review_activities_are_activity_defs():
@@ -20,22 +19,21 @@ def test_new_review_activities_are_activity_defs():
 
 
 def test_every_review_activity_is_wired_into_the_worker():
-    """Nothing is auto-discovered: an @activity.defn that never makes it into
-    the `activities=[...]` list in __main__ fails at runtime with "activity
-    type not registered", which no unit test would otherwise catch.
+    """An @activity.defn the worker doesn't serve fails at runtime with
+    "activity type not registered", which no unit test would otherwise catch.
 
-    The list is built inside `main()` (it needs live connectors), so it can't
-    be imported — assert against the source text instead.
+    This used to grep `__main__.py` for `review_act.<name>` — a per-activity
+    line that no longer exists. Since D6 `registry.collect_activities` serves
+    every @activity.defn of every instance main() builds, and
+    `check_registration()` refuses to boot if an activity class is not among
+    them (tests/worker/test_registry.py). So the question here is just whether
+    each ReviewActivities activity is in the served set.
     """
-    source = (
-        Path(__file__).resolve().parents[2]
-        / "worker/src/aegis_worker/__main__.py"
-    ).read_text()
+    served = expected_activity_names()
     for name in dir(ReviewActivities):
         method = getattr(ReviewActivities, name)
         if not hasattr(method, "__temporal_activity_definition"):
             continue
-        assert f"review_act.{name}" in source, (
-            f"ReviewActivities.{name} is an activity but is not registered in "
-            "worker/src/aegis_worker/__main__.py"
+        assert name in served, (
+            f"ReviewActivities.{name} is an activity but the worker does not serve it"
         )

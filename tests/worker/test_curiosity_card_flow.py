@@ -518,55 +518,35 @@ async def test_apply_curiosity_answer_ignores_an_empty_answer(clean_db):
 # ------------------------------------------------------------------ registration
 
 
-def test_flow_is_registered_in_both_workflow_lists():
-    import ast
-    import inspect
+def test_flow_is_registered_on_the_worker():
+    """main() no longer builds a second workflow list to fall out of sync with
+    (issue #188) — it registers registry.workflows_for(settings) verbatim, and
+    check_registration() refuses to boot otherwise."""
+    from types import SimpleNamespace
 
     import aegis_worker.__main__ as worker_main
+    from aegis_worker.registry import workflows_for
 
     assert CuriosityCardFlow in worker_main.WORKFLOWS
-
-    # main() builds its own list; read it via AST so a mention in a comment or
-    # a docstring cannot satisfy this.
-    tree = ast.parse(inspect.getsource(worker_main))
-    names: set[str] = set()
-    for node in ast.walk(tree):
-        if (
-            isinstance(node, ast.Assign)
-            and len(node.targets) == 1
-            and isinstance(node.targets[0], ast.Name)
-            and node.targets[0].id == "workflows"
-            and isinstance(node.value, ast.List)
-        ):
-            names |= {e.id for e in node.value.elts if isinstance(e, ast.Name)}
-    assert "CuriosityCardFlow" in names, "CuriosityCardFlow missing from main()'s workflows list"
+    prod = SimpleNamespace(homelab_enabled=True, money_hygiene_enabled=True)
+    assert CuriosityCardFlow in workflows_for(prod)
 
 
-def test_curiosity_activities_are_in_the_runtime_activities_list():
-    import ast
-    import inspect
+def test_curiosity_activities_are_served_by_the_worker():
+    """Registration is derived from the @activity.defn methods of the instances
+    main() builds (registry.collect_activities), so what still matters here is
+    that these four carry the decorator under exactly these names — a rename
+    silently drops them from the served set."""
+    from aegis_worker.registry import expected_activity_names
 
-    import aegis_worker.__main__ as worker_main
-
-    tree = ast.parse(inspect.getsource(worker_main))
-    attrs: set[str] = set()
-    for node in ast.walk(tree):
-        if (
-            isinstance(node, ast.Assign)
-            and len(node.targets) == 1
-            and isinstance(node.targets[0], ast.Name)
-            and node.targets[0].id == "activities"
-            and isinstance(node.value, ast.List)
-        ):
-            attrs |= {e.attr for e in node.value.elts if isinstance(e, ast.Attribute)}
-
+    served = expected_activity_names()
     for name in (
         "find_curiosity_gaps",
         "check_curiosity_budget",
         "record_curiosity_card",
         "apply_curiosity_answer",
     ):
-        assert name in attrs, f"{name} missing from main()'s activities list"
+        assert name in served, f"{name} is not an activity the worker serves"
 
 
 def test_flow_in_schedule_map():

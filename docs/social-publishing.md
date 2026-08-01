@@ -301,12 +301,13 @@ Wrap step failures as
 `ApplicationError(f"social_publish_failed at step=X: {exc!r}", non_retryable=True)`
 per convention.
 
-### 6. Registration (nothing is auto-discovered)
+### 6. Registration
 
-- Add `SocialPublishFlow` to `WORKFLOWS` and the stub-bound activity methods to
-  `ACTIVITIES` in `worker/src/aegis_worker/__main__.py`.
-- Add `"SocialPublishFlow"` to `_ACTIVITY_TYPE_MAP` in
-  `worker/src/aegis_worker/schedule_sync.py`.
+- Add one `FlowSpec(SocialPublishFlow, lambda act: SocialPublishConfig(...))` to
+  `FLOWS` in `worker/src/aegis_worker/registry.py`. The worker's workflow list
+  and `schedule_sync._ACTIVITY_TYPE_MAP` are derived from it; `SocialActivities`
+  needs no registration (every `@activity.defn` on the instance `main()` builds
+  is served automatically).
 - Seed in `config/seed/activities.yaml`:
 
 ```yaml

@@ -315,24 +315,17 @@ def _main_tree():
     return ast.parse(inspect.getsource(worker_main))
 
 
-def test_people_activities_are_in_the_runtime_activities_list():
-    """main() builds its own `activities` list; read it via AST so a mention in
-    a comment or a docstring cannot satisfy this."""
-    import ast
+def test_people_activities_are_served_by_the_worker():
+    """main() no longer hand-lists activities — registry.collect_activities
+    serves every @activity.defn of every instance it is given, and
+    check_registration() refuses to boot if an activity class is missing from
+    that call (tests/worker/test_registry.py). What still matters here is that
+    both methods carry the decorator under exactly these names."""
+    from aegis_worker.registry import expected_activity_names
 
-    attrs: set[str] = set()
-    for node in ast.walk(_main_tree()):
-        if (
-            isinstance(node, ast.Assign)
-            and len(node.targets) == 1
-            and isinstance(node.targets[0], ast.Name)
-            and node.targets[0].id == "activities"
-            and isinstance(node.value, ast.List)
-        ):
-            attrs |= {e.attr for e in node.value.elts if isinstance(e, ast.Attribute)}
-
+    served = expected_activity_names()
     for name in ("enrich_people_from_email", "enrich_people_from_events"):
-        assert name in attrs, f"{name} missing from main()'s activities list"
+        assert name in served, f"{name} is not an activity the worker serves"
 
 
 def test_people_activities_are_constructed_from_settings():
