@@ -103,6 +103,17 @@ export const api = {
   deleteExpiringItem: (id: string) =>
     apiFetch<any>(`/api/admin/expiring-items/${id}`, { method: 'DELETE' }),
 
+  // Household/asset registry (life.assets — cars, appliances, home systems)
+  listAssets: (kind?: string) =>
+    apiFetch<any[]>(`/api/admin/assets${kind ? `?kind=${encodeURIComponent(kind)}` : ''}`),
+  getAsset: (id: string) => apiFetch<any>(`/api/admin/assets/${id}`),
+  createAsset: (data: any) =>
+    apiFetch<any>('/api/admin/assets', { method: 'POST', body: JSON.stringify(data) }),
+  updateAsset: (id: string, data: any) =>
+    apiFetch<any>(`/api/admin/assets/${id}`, { method: 'PUT', body: JSON.stringify(data) }),
+  deleteAsset: (id: string) =>
+    apiFetch<any>(`/api/admin/assets/${id}`, { method: 'DELETE' }),
+
   // Channels (email / rss / raindrop ingestion — DB-owned, UI-managed)
   listChannels: (kind?: string) =>
     apiFetch<any[]>(`/api/admin/channels${kind ? `?kind=${encodeURIComponent(kind)}` : ''}`),
