@@ -44,6 +44,13 @@ CONFIG_REGISTRY: list[ConfigKey] = [
     ConfigKey("sentry_projects", "Project ids (comma-sep, blank = all)", "Sentry", False),
     ConfigKey("sentry_webhook_secret", "Webhook secret", "Sentry", True),
     ConfigKey("todoist_webhook_secret", "Webhook secret", "Todoist", True),
+    ConfigKey(
+        "life_webhook_secret", "Webhook secret", "Life data", True,
+        help="Signs pushes to /api/webhooks/life/{source} from your phone, watch or "
+        "home automation. Generate with `openssl rand -hex 32`. UNSET = the endpoint "
+        "rejects every request (503) — it never runs unauthenticated. Applies on save "
+        "(read per-request).",
+    ),
     ConfigKey("x_client_id", "OAuth client id", "X (Twitter)", False),
     ConfigKey("x_client_secret", "OAuth client secret", "X (Twitter)", True),
     ConfigKey("postiz_url", "Base URL", "Postiz", False),
