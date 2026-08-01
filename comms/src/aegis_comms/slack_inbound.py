@@ -562,7 +562,9 @@ class SlackInbound:
 
         Note-to-self short-circuit: in the configured note-to-self channel, the
         OWNER's own messages are filed as life facts instead of being routed to
-        an agent. Anyone else posting there still gets normal chat routing.
+        an agent. Anyone else posting there still gets normal chat routing, and
+        so does an @mention of the bot — a note channel must not make the bot
+        unreachable in it.
 
         Async path (mirrors bot.py::_dispatch_agent_reply): ack ONLY if the
         trigger returned 2xx; on any failure fall back to the sync path so the
@@ -575,7 +577,7 @@ class SlackInbound:
         if not text:
             return
 
-        if self._is_note_to_self(channel_id=channel_id, user_id=user_id):
+        if self._is_note_to_self(channel_id=channel_id, user_id=user_id, text=text):
             await self._ingest_self_signal(channel_id=channel_id, ts=ts, text=text)
             return
 
@@ -583,15 +585,21 @@ class SlackInbound:
 
     # --- curated self-signal ingest (B2) ------------------------------------
 
-    def _is_note_to_self(self, *, channel_id: str, user_id: str | None) -> bool:
+    def _is_note_to_self(self, *, channel_id: str, user_id: str | None, text: str = "") -> bool:
         """True only for the OWNER posting in the configured note-to-self channel.
 
         Fails safe: no owner id configured (or no channel configured) ⇒ False,
         so an unconfigured deployment ingests nothing.
+
+        An @mention of the bot is never a note: filing it would leave the owner
+        unable to talk to the bot in that channel at all, and would store the
+        raw `<@UBOT> ...` markup as a "fact".
         """
         if not self._owner_member_id or not self._note_to_self_channel:
             return False
         if channel_id != self._note_to_self_channel:
+            return False
+        if self._bot_user_id and f"<@{self._bot_user_id}" in (text or ""):
             return False
         return user_id == self._owner_member_id
 
@@ -643,7 +651,24 @@ class SlackInbound:
             )
             messages = (resp or {}).get("messages") or []
         except Exception as exc:  # noqa: BLE001 — a fetch failure must not crash inbound
-            logger.warning("slack_reaction_history_failed", error=str(exc)[:200])
+            detail = str(exc)[:200]
+            # A PRIVATE channel is the natural home for notes, and the app has
+            # historically shipped without `groups:history` — so this fetch 403s
+            # `missing_scope` and the whole lane is a silent no-op. Loud + named,
+            # not a generic warning nobody connects to the missing scope.
+            if "missing_scope" in detail:
+                logger.error(
+                    "slack_reaction_history_missing_scope",
+                    channel=channel_id,
+                    error=detail,
+                    remedy=(
+                        "the Slack app lacks history scope for this channel type: add "
+                        "groups:history (private channels) / channels:history (public) "
+                        "/ im:history (DMs) to the bot scopes and REINSTALL the app"
+                    ),
+                )
+            else:
+                logger.warning("slack_reaction_history_failed", error=detail)
             return ""
         if not messages:
             logger.warning("slack_reaction_message_not_found", channel=channel_id, ts=ts)
@@ -656,9 +681,16 @@ class SlackInbound:
         `slack://{channel}/{ts}` is the dedupe key — core derives content_id
         from the url and upserts, so a duplicate `reaction_added` for the same
         message refreshes one row instead of creating a second.
+
+        A missing `ts` therefore has to fail CLOSED: `slack://{channel}/` is the
+        same url for every note in that channel, so each one would silently
+        overwrite the last into a single degenerate row.
         """
         text = (text or "").strip()
         if not text:
+            return
+        if not ts:
+            logger.warning("slack_self_signal_missing_ts", channel=channel_id)
             return
         content_id = await self._core.knowledge_ingest(
             url=f"slack://{channel_id}/{ts}",

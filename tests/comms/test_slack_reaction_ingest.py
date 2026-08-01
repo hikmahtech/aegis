@@ -316,3 +316,115 @@ async def test_note_to_self_whitespace_only_body_is_not_ingested():
 
     core.knowledge_ingest.assert_not_awaited()
     core.chat.assert_not_awaited()  # it WAS treated as a note, just an empty one
+
+
+async def test_note_to_self_does_not_swallow_an_at_mention_of_the_bot():
+    """In a note channel the owner must still be able to TALK to the bot.
+
+    The note lane matched on channel+owner only, so `@AEGIS what's on today?`
+    was filed as a life fact — zero chat routing, and the stored "fact" was the
+    raw `<@UBOT> ...` markup.
+    """
+    inbound, core, _adapter, _client = _inbound(note_channel=NOTE_CHANNEL)
+    core.chat.return_value = {"response": "three meetings", "assistant_message_id": None}
+    core.route_intent.return_value = {"agent_id": "sebas", "method": "keyword"}
+
+    await inbound.on_message(
+        channel_id=NOTE_CHANNEL,
+        text="<@UBOT> what's on today?",
+        user_id=OWNER,
+        ts="1700000007.1",
+    )
+
+    core.knowledge_ingest.assert_not_awaited()
+    core.chat.assert_awaited_once()
+
+    # ...and a plain note in the same channel is still a note.
+    await inbound.on_message(
+        channel_id=NOTE_CHANNEL, text="passport expires in March", user_id=OWNER, ts="1700000007.2"
+    )
+    core.knowledge_ingest.assert_awaited_once()
+
+
+async def test_self_signal_with_no_ts_is_refused_not_collapsed():
+    """A missing dedupe key must fail CLOSED.
+
+    `slack://{channel}/{ts}` is the upsert key, so a blank ts makes every note
+    in the channel the SAME url — each one silently overwriting the last into a
+    single degenerate row rather than erroring.
+    """
+    inbound, core, _adapter, _client = _inbound(note_channel=NOTE_CHANNEL)
+
+    await inbound.on_message(channel_id=NOTE_CHANNEL, text="first note", user_id=OWNER, ts="")
+    await inbound.on_message(channel_id=NOTE_CHANNEL, text="second note", user_id=OWNER, ts="")
+
+    core.knowledge_ingest.assert_not_awaited()
+
+
+class _RaisingClient:
+    def __init__(self, exc: Exception):
+        self.exc = exc
+
+    async def conversations_history(self, **kwargs):
+        raise self.exc
+
+
+_MISSING_SCOPE = RuntimeError(
+    "The request to the Slack API failed. (url: conversations.history) The server "
+    "responded with: {'ok': False, 'error': 'missing_scope', 'needed': "
+    "'groups:history', 'provided': 'channels:history'}"
+)
+
+
+async def test_history_missing_scope_is_logged_loudly_with_the_scope_named():
+    """A private note channel with no `groups:history` 403s here, and the whole
+    lane is a silent no-op — everything looks configured and nothing happens.
+    That has to be an ERROR naming the missing scope, not a generic warning
+    nobody connects back to the app manifest.
+    """
+    from structlog.testing import capture_logs
+
+    inbound, core, _adapter, _client = _inbound()
+
+    with capture_logs() as logs:
+        await _react(inbound, _RaisingClient(_MISSING_SCOPE))
+
+    core.knowledge_ingest.assert_not_awaited()
+    errors = [e for e in logs if e.get("log_level") == "error"]
+    assert errors, f"missing_scope must log at ERROR; got {[e.get('log_level') for e in logs]}"
+    blob = repr(errors)
+    assert "missing_scope" in blob
+    assert "groups:history" in blob, "the operator must be told WHICH scope to add"
+
+
+async def test_an_ordinary_history_failure_stays_a_warning():
+    """The ERROR level has to mean something — only missing_scope earns it."""
+    from structlog.testing import capture_logs
+
+    inbound, _core, _adapter, _client = _inbound()
+
+    with capture_logs() as logs:
+        await _react(inbound, _RaisingClient(RuntimeError("connection reset by peer")))
+
+    assert [e.get("log_level") for e in logs] == ["warning"]
+
+
+def test_manifest_covers_private_channels():
+    """Both B2 lanes are a silent no-op in a PRIVATE channel — which is where a
+    note-to-self channel naturally lives — unless the app asks for the `groups`
+    scope and event. Without `message.groups` no message event is ever
+    delivered, so notes are never filed; without `groups:history` the `:brain:`
+    lane's conversations.history fetch 403s. Everything looks configured and
+    nothing happens, so the manifest is asserted here rather than trusted.
+    """
+    import pathlib
+
+    import yaml
+
+    root = pathlib.Path(__file__).resolve().parents[2]
+    manifest = yaml.safe_load((root / "comms" / "slack-app-manifest.yaml").read_text())
+
+    scopes = manifest["oauth_config"]["scopes"]["bot"]
+    events = manifest["settings"]["event_subscriptions"]["bot_events"]
+    assert {"channels:history", "groups:history"} <= set(scopes), scopes
+    assert {"message.channels", "message.groups"} <= set(events), events

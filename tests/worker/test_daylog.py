@@ -88,6 +88,19 @@ async def _add_resolved_interaction(pool, prompt: str, answer: str, when: dateti
     )
 
 
+async def _add_archived_interaction(pool, prompt: str, when: datetime = DAY_TS):
+    """A card nobody answered. The `archive` timeout policy sets
+    `status='archived', resolved_at=now()` — same stamp a real answer leaves."""
+    await pool.execute(
+        "INSERT INTO interactions "
+        "(flow_run_id, agent_id, kind, origin, prompt, status, resolved_at) "
+        "VALUES ($1, 'raphael', 'choice', 'test', $2, 'archived', $3)",
+        f"run-{uuid4().hex[:8]}",
+        prompt,
+        when,
+    )
+
+
 async def _add_clarify_entry(pool, task_content: str, classification: str):
     task_id = f"task-{uuid4().hex[:8]}"
     await pool.execute(
@@ -159,6 +172,24 @@ async def test_gather_day_events_buckets_task_calendar_and_interaction(clean_db)
         "email": 1,
         "failures": 1,
     }
+
+
+@pytest.mark.asyncio
+async def test_gather_day_events_excludes_archived_interactions(clean_db):
+    """A card that TIMED OUT unanswered is not a decision.
+
+    `handle_interaction_timeout`'s archive policy stamps `resolved_at` exactly
+    like a real answer does, so a resolved_at-only window files
+    "Decided: <prompt>" for a question nobody ever answered.
+    """
+    await _add_resolved_interaction(clean_db, "Renew the domain?", "yes")
+    await _add_archived_interaction(clean_db, "Approve the invoice?")
+
+    acts = DayLogActivities(db_pool=clean_db)
+    out = await ActivityEnvironment().run(acts.gather_day_events, DAY)
+
+    assert [d["prompt"] for d in out["decisions"]] == ["Renew the domain?"]
+    assert out["counts"]["decisions"] == 1
 
 
 @pytest.mark.asyncio

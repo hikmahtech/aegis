@@ -455,6 +455,10 @@ class SlackAdapter:
                 text=event.get("text", ""),
                 user_id=event.get("user"),
                 bot_id=event.get("bot_id"),
+                # `message` defers every bot-mention to this handler, so this is
+                # the ONLY path an @mention takes. Omitting `ts` left the
+                # note-to-self lane with a blank dedupe key.
+                ts=event.get("ts", ""),
             )
 
         @app.action(re.compile(r"^interaction_"))
