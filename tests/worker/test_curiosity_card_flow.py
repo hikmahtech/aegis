@@ -5,7 +5,10 @@ The flow tests wire the REAL CuriosityActivities and the REAL InteractionFlow
 assert on is the `interactions` row and the `notification_log` row production
 would actually write — not a recording stub of the spawn call.
 `send_interaction_card` is the only stub: it is the one step that leaves the
-process (POST /api/deliver/card).
+process (POST /api/deliver/card). Its captured payload is asserted as a card
+*spec*, never rendered here — `aegis_comms` is not installed in the worker CI
+job, and the Block Kit rendering of that spec belongs to
+`tests/comms/test_cards_slack.py`.
 
 The card child is spawned ABANDONED, so it is still working when the parent
 workflow returns — every assertion about it has to be made while the worker is
@@ -275,31 +278,19 @@ async def test_flow_cards_the_top_gap_and_charges_the_budget(clean_db):
     assert row["metadata"]["novelty_key"] == "charge:zephyrly"
     assert row["metadata"]["subject"] == "Zephyrly"
 
-    # The card the comms service was handed renders as an ANSWERABLE `input`
-    # card: cards.py emits no button at all for `input` without
-    # options.aegis_ui_url.
-    from aegis_comms.adapters.base import CardSpec
-    from aegis_comms.cards import render_slack_blocks
-
+    # The spec handed to the comms service is an ANSWERABLE `input` card.
+    # `aegis_ui_url` is load-bearing, not decoration: aegis_comms/cards.py
+    # renders NO button at all for `input` unless `options.aegis_ui_url` is
+    # present, so a card without it is unanswerable from Slack. The rendering
+    # half of that contract is owned by
+    # tests/comms/test_cards_slack.py::test_input_url_button (the comms CI job);
+    # this side asserts the worker emits exactly the key that test consumes.
+    # Deliberately no `aegis_comms` import here — the worker CI job installs
+    # core+worker only, and aegis-comms is independent by design.
     assert len(cards) == 1
     assert cards[0]["kind"] == "input"
-    blocks = render_slack_blocks(
-        CardSpec(
-            interaction_id=cards[0]["interaction_id"],
-            agent_id=cards[0]["agent_id"],
-            kind=cards[0]["kind"],
-            prompt=cards[0]["prompt"],
-            options=cards[0]["options"],
-        )
-    )
-    urls = [
-        e.get("url")
-        for b in blocks
-        if b["type"] == "actions"
-        for e in b["elements"]
-        if e.get("url")
-    ]
-    assert urls == [f"https://aegis.example.com/interactions/{cards[0]['interaction_id']}"]
+    assert cards[0]["options"] == {"aegis_ui_url": "https://aegis.example.com"}
+    assert cards[0]["interaction_id"]
 
     # Charged to the same daily budget as a proactive FYI.
     logged = await clean_db.fetch(
