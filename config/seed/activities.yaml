@@ -149,6 +149,20 @@ activities:
       mode: monthly
     active: true
 
+  # Sebas — A7, one curiosity question per day (at most). 09:30 UTC = 15:00 IST:
+  # a mid-afternoon question, deliberately away from both the 04:30 briefing and
+  # the 09:00 money-hygiene run, and off the crowded :00 / :30-of-every-hour
+  # slots that the ingest flows own. The flow gates itself on the notification
+  # budget, so this cron is an upper bound, not a promise of a daily card.
+  # NOTE: `config` is DB-owned (seed.py only refreshes workflow_type/agent_id) —
+  # on an existing deploy tune max_per_day on /admin/flows, not here.
+  - slug: curiosity-daily
+    workflow_type: CuriosityCardFlow
+    agent_id: sebas
+    schedule_cron: "30 9 * * *"
+    config: {max_per_day: 1}
+    active: true
+
   # Raphael — knowledge ingestion (raindrop + rss + intel scans)
   - slug: raindrop-ingest-2h
     workflow_type: RaindropIngestFlow

@@ -22,8 +22,12 @@ is always computed first and is the fallback, so an absent or failing LLM still
 yields the same candidates with usable text. Zero detectors firing returns `[]`
 — never a synthetic filler question.
 
-A6 ships the activity only. A7 is the flow that consumes it, so this is
-registered but dormant: no flow, no schedule, no _ACTIVITY_TYPE_MAP entry.
+A7 adds the three activities `CuriosityCardFlow` needs around the detector:
+`check_curiosity_budget` (the gate — interaction cards bypass
+`safe_send_message`, so the notification budget has to be consulted here),
+`record_curiosity_card` (what makes a delivered card consume that budget), and
+`apply_curiosity_answer` (the InteractionFlow post-resolve hook that banks the
+owner's reply as durable memory).
 """
 
 from __future__ import annotations
@@ -59,6 +63,12 @@ class CuriosityActivities:
     # every event's `attendees`, so without this the owner is a "stranger you
     # keep meeting". Empty (unconfigured) = no exclusion, same as before.
     owner_emails: frozenset[str] = frozenset()
+    # Notification budget (same knobs DeliveryActivities carries). A curiosity
+    # card is a proactive push like any other, but it goes out via
+    # `send_interaction_card`, which never reaches `safe_send_message` — so the
+    # budget is consulted here instead of being inherited.
+    budget_enabled: bool = False
+    daily_budget: int = 8
 
     @activity.defn
     async def find_curiosity_gaps(self, agent_id: str = "sebas", limit: int = 5) -> list[dict]:
@@ -314,3 +324,129 @@ class CuriosityActivities:
         except Exception as exc:  # noqa: BLE001
             activity.logger.warning("curiosity_phrasing_parse_failed err=%s", str(exc)[:200])
         return candidates
+
+    # -------------------------------------------------------------------- A7
+
+    @activity.defn
+    async def check_curiosity_budget(self, agent_id: str = "sebas", max_per_day: int = 1) -> dict:
+        """Read-only gate the flow consults BEFORE it spawns anything.
+
+        Three reasons to stay quiet, checked in this order:
+
+          `budget`        — this flow already sent its card(s) today. Checked
+                            first so a second run on the same day reports the
+                            cap it hit, not the still-open card that cap left
+                            behind.
+          `global_budget` — the shared daily notification budget is spent
+                            (`aegis.services.notifications.should_send`; a
+                            no-op while `notification_budget_enabled` is off,
+                            which is the current deployment state).
+          `pending`       — an unanswered curiosity card is still open. Asking
+                            a second question before the first is answered is
+                            how a helpful assistant becomes a nag.
+
+        Also reports whether `owner_emails` is configured. It is EMPTY in the
+        current deployment, and Google puts the calendar owner in every event's
+        attendee list, so the flow uses this to refuse the calendar-attendee
+        lane rather than risk asking the owner who they are.
+        """
+        from aegis.services.notifications import should_send
+
+        sent_today = int(
+            await self.db_pool.fetchval(
+                "SELECT count(*) FROM notification_log "
+                "WHERE log_event = 'curiosity_card' AND sent "
+                "AND created_at >= date_trunc('day', now())"
+            )
+            or 0
+        )
+        pending = int(
+            await self.db_pool.fetchval(
+                "SELECT count(*) FROM interactions "
+                "WHERE origin = 'curiosity' AND status = 'pending'"
+            )
+            or 0
+        )
+        allow, global_today = await should_send(
+            self.db_pool, enabled=self.budget_enabled, daily_budget=self.daily_budget
+        )
+
+        if sent_today >= max(0, max_per_day):
+            reason = "budget"
+        elif not allow:
+            reason = "global_budget"
+        elif pending:
+            reason = "pending"
+        else:
+            reason = "ok"
+
+        activity.logger.info(
+            "curiosity_budget agent=%s reason=%s sent_today=%d pending=%d global_today=%d",
+            agent_id,
+            reason,
+            sent_today,
+            pending,
+            global_today,
+        )
+        return {
+            "allow": reason == "ok",
+            "reason": reason,
+            "sent_today": sent_today,
+            "pending": pending,
+            "global_today": global_today,
+            "owner_emails_configured": bool(self.owner_emails),
+        }
+
+    @activity.defn
+    async def record_curiosity_card(self, agent_id: str, sent: bool = True) -> dict:
+        """Charge a delivered curiosity card to the daily notification budget."""
+        from aegis.services.notifications import record_notification
+
+        await record_notification(self.db_pool, agent_id, "curiosity_card", sent)
+        return {"recorded": True, "sent": sent}
+
+    @activity.defn
+    async def apply_curiosity_answer(
+        self, interaction_id: str, response: dict | None, metadata: dict | None
+    ) -> dict:
+        """InteractionFlow post-resolve hook — bank the answer as memory.
+
+        An empty answer (the owner submitted nothing, or the card was resolved
+        by something other than a typed reply) writes nothing: a memory row
+        saying the owner said nothing is worse than no row.
+        """
+        from aegis.services.memory import record_memory
+
+        meta = metadata or {}
+        answer = str((response or {}).get("value") or "").strip()
+        if not answer:
+            activity.logger.info("curiosity_answer_empty id=%s", interaction_id)
+            return {"recorded": False, "reason": "empty"}
+
+        row = None
+        try:
+            row = await self.db_pool.fetchrow(
+                "SELECT agent_id, prompt FROM interactions WHERE id = $1::uuid",
+                interaction_id,
+            )
+        except Exception as exc:  # noqa: BLE001 — a malformed id must not lose the answer
+            activity.logger.warning("curiosity_answer_lookup_failed err=%s", str(exc)[:200])
+        agent_id = (row["agent_id"] if row else None) or str(meta.get("agent_id") or "sebas")
+        question = str(meta.get("question") or (row["prompt"] if row else "") or "").strip()
+        subject = str(meta.get("subject") or "").strip()
+
+        head = question or (f"About {subject}" if subject else "Curiosity question")
+        await record_memory(
+            self.db_pool,
+            agent_id,
+            f"{head}\nThe owner answered: {answer}",
+            importance=0.8,
+            source="curiosity",
+        )
+        activity.logger.info(
+            "curiosity_answer_recorded id=%s agent=%s subject=%s",
+            interaction_id,
+            agent_id,
+            subject,
+        )
+        return {"recorded": True, "agent_id": agent_id, "subject": subject}
