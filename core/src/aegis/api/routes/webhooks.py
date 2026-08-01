@@ -201,9 +201,19 @@ async def life_webhook(
     # (3) Mandatory, bounded timestamp. The length guard comes first so a
     # multi-thousand-digit header can neither hit int()'s parse limit nor
     # overflow the float subtraction below.
+    #
+    # `isdecimal()`, NOT `isdigit()`: `isdigit()` is True for the Unicode
+    # superscripts ¹ ² ³ (U+00B9/B2/B3), which are latin-1 representable and so
+    # survive Starlette's header decoding intact — but `int()` rejects them.
+    # With `isdigit()` the guard ADMITTED such a header and the `int()` below
+    # escaped as an uncaught ValueError: an unauthenticated 500 reached before
+    # the signature check, i.e. exactly the distinguishing oracle (and log-noise
+    # generator) the "same opaque 401 for every failure" promise forbids.
+    # Within latin-1, `isdecimal()` is True for ASCII 0-9 and nothing else, so
+    # together with the length bound `int()` below cannot fail.
     raw_ts = x_aegis_timestamp or ""
     ts: int | None = None
-    if raw_ts.isdigit() and len(raw_ts) <= 12:
+    if raw_ts.isdecimal() and len(raw_ts) <= 12:
         ts = int(raw_ts)
     if ts is None or abs(_time.time() - ts) > LIFE_TIMESTAMP_WINDOW_SECONDS:
         logger.warning("life_webhook_rejected", life_source=source, stage="timestamp")
@@ -262,6 +272,31 @@ async def life_webhook(
         logger.info("life_webhook_duplicate_skipped", life_source=source)
         return {"accepted": True, "duplicate": True, "external_id": external_id}
 
+    async def _release_claim() -> None:
+        """Hand the claim back so the device's retry is genuinely reprocessed.
+
+        A claim held after a failed handling burns that `external_id` forever:
+        the retry is answered `202 {"duplicate": true}` — indistinguishable
+        from success — while nothing was ever recorded. So it is released on
+        ANY failure below, not just the client-fixable ones.
+
+        Safe because re-sending is idempotent one level down: every ingest path
+        writes through `record_external_observation`, whose per-sample
+        `(source, metric, external_id)` `ON CONFLICT DO NOTHING` means a batch
+        that half-wrote before failing re-inserts only its missing samples.
+
+        Best-effort: if the release itself fails there is nothing better to do
+        than let the original failure surface.
+        """
+        try:
+            await pool.execute(
+                "DELETE FROM ingest_idempotency WHERE source_type = $1 AND external_id = $2",
+                f"life:{source}",
+                external_id,
+            )
+        except Exception:  # noqa: BLE001 — must not mask the original failure
+            logger.warning("life_webhook_claim_release_failed", life_source=source)
+
     await log_audit(
         pool,
         actor=f"life:{source}",
@@ -304,13 +339,15 @@ async def life_webhook(
             # Release the idempotency claim: a malformed push is client-fixable,
             # and a device that sends its own `id` would otherwise be locked out
             # of that id forever by one bad payload.
-            await pool.execute(
-                "DELETE FROM ingest_idempotency WHERE source_type = $1 AND external_id = $2",
-                f"life:{source}",
-                external_id,
-            )
+            await _release_claim()
             logger.warning("life_webhook_bad_observation", life_source=source)
             raise HTTPException(status_code=422, detail="invalid_observation") from exc
+        except Exception:
+            # Anything else — an asyncpg hiccup partway through a health batch,
+            # say. The push failed, so the claim must not survive it either.
+            await _release_claim()
+            logger.warning("life_webhook_record_failed", life_source=source)
+            raise
         logger.info("life_webhook_observation_recorded", life_source=source)
         if health is not None:
             return {"accepted": True, "external_id": external_id, **health}
@@ -320,12 +357,19 @@ async def life_webhook(
             "observation_id": str(row["id"]),
         }
 
-    handle = await temporal.start_workflow(
-        workflow_name,
-        {"source": source, "external_id": external_id, "payload": payload},
-        id=f"life-{source}-{external_id}",
-        task_queue="aegis-main",
-    )
+    try:
+        handle = await temporal.start_workflow(
+            workflow_name,
+            {"source": source, "external_id": external_id, "payload": payload},
+            id=f"life-{source}-{external_id}",
+            task_queue="aegis-main",
+        )
+    except Exception:
+        # A Temporal outage must not burn the external_id: without this the
+        # device's retry gets `{"duplicate": true}` and the push is lost.
+        await _release_claim()
+        logger.warning("life_webhook_dispatch_failed", life_source=source)
+        raise
     logger.info(
         "life_webhook_flow_started", life_source=source, workflow_id=handle.id
     )

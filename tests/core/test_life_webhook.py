@@ -341,6 +341,57 @@ async def test_non_numeric_timestamp_rejected(client):
     assert resp.status_code == 401
 
 
+#: Latin-1 bytes whose decoded `str` is `isdigit()`-True but `isdecimal()`-False.
+#: Starlette decodes headers as latin-1, so these arrive as the real superscript
+#: characters (httpx would UTF-8 encode a non-ASCII `str` header, which decodes
+#: to "Â²" and is `isdigit()`-False — hence raw bytes, as in the garbage-header
+#: test above). `int()` rejects every one of them.
+_ISDIGIT_NOT_DECIMAL = [
+    b"\xb9",  # ¹ U+00B9
+    b"\xb2",  # ² U+00B2
+    b"\xb3",  # ³ U+00B3
+    b"1\xb2",  # mixed: an ASCII digit followed by a superscript
+    b"\xb9\xb2\xb3",  # ¹²³
+]
+
+
+@pytest.mark.parametrize("raw_ts", _ISDIGIT_NOT_DECIMAL, ids=lambda b: b.hex())
+async def test_isdigit_but_not_int_parseable_timestamp_is_401_not_500(
+    client, db_pool, raw_ts
+):
+    """A superscript timestamp must be the same opaque 401 as any other junk.
+
+    `str.isdigit()` is True for ¹ ² ³ but `int()` raises on them, so guarding
+    with `isdigit()` admitted the header and let the parse escape as an
+    unauthenticated 500 — reached BEFORE the signature check, so no secret is
+    needed to trigger it. That is both a distinguishing oracle (500 here vs 401
+    for ordinary junk) and a way to generate stack traces at will.
+    """
+    assert raw_ts.decode("latin-1").isdigit()
+    assert not raw_ts.decode("latin-1").isdecimal()
+
+    resp = await client.post(
+        f"/api/webhooks/life/{SOURCE}",
+        content=b"{}",
+        headers=[
+            (b"x-aegis-timestamp", raw_ts),
+            (b"x-aegis-signature", b"0" * 64),
+        ],
+    )
+    assert resp.status_code == 401
+    assert resp.json()["detail"] == "unauthorized"
+
+    # Control, in the same run: ordinary non-numeric junk answers identically,
+    # so there is nothing to distinguish the two probes by.
+    plain = await client.post(
+        f"/api/webhooks/life/{SOURCE}",
+        content=b"{}",
+        headers={"X-Aegis-Timestamp": "not-a-number", "X-Aegis-Signature": "0" * 64},
+    )
+    assert (resp.status_code, resp.json()) == (plain.status_code, plain.json())
+    assert await _counts(db_pool) == (0, 0)
+
+
 async def test_failures_are_indistinguishable(client):
     """No oracle: a bad timestamp and a bad signature answer identically."""
     _, raw_a, headers_a = _push({"metric": "zzb4-weight"}, ts=str(int(time.time()) - 600))
@@ -502,3 +553,101 @@ async def test_flow_backed_replay_starts_no_second_workflow(
     second = await client.post(url, content=raw, headers=headers)
     assert second.json()["duplicate"] is True
     assert temporal_stub.start_workflow.await_count == 1
+
+
+# ---------------------------------------------------------------------------
+# A failed push must not keep its idempotency claim.
+#
+# The claim is what makes a replay a no-op, so a claim that outlives a FAILED
+# handling burns that external_id permanently: the device's retry is answered
+# `202 {"duplicate": true}` — indistinguishable from success — while nothing
+# was ever recorded. Both lanes are covered: the flow dispatch and the inline
+# recorder.
+# ---------------------------------------------------------------------------
+
+
+@pytest_asyncio.fixture(loop_scope="function")
+async def client_500(db_pool, temporal_stub):
+    """Same app as `client`, but an unhandled handler error becomes a real 500
+    response (what uvicorn does in production) instead of being re-raised into
+    the test, so the retry can be driven through the same client."""
+    await _cleanup(db_pool)
+    app = _build_app(db_pool, Settings(**_TEST_SETTINGS), temporal_stub)
+    async with AsyncClient(
+        transport=ASGITransport(app=app, raise_app_exceptions=False),
+        base_url="http://test",
+    ) as c:
+        yield c
+    await _cleanup(db_pool)
+
+
+async def _claim_exists(pool, source: str, external_id: str) -> bool:
+    return bool(
+        await pool.fetchval(
+            "SELECT count(*) FROM ingest_idempotency "
+            "WHERE source_type = $1 AND external_id = $2",
+            f"life:{source}",
+            external_id,
+        )
+    )
+
+
+async def test_a_failed_temporal_dispatch_releases_the_claim(
+    client_500, db_pool, temporal_stub, monkeypatch
+):
+    """A transient Temporal outage must not cost the device its external_id.
+
+    Latent today only because every shipped source maps to `None`; it goes
+    live the moment one is mapped to a workflow.
+    """
+    monkeypatch.setitem(webhooks.LIFE_SOURCES, "zzb4-flowsrc", "ZzB4IngestFlow")
+    handle = MagicMock()
+    handle.id = "wf-life-retry"
+    temporal_stub.start_workflow = AsyncMock(
+        side_effect=[RuntimeError("temporal unreachable"), handle]
+    )
+
+    url, raw, headers = _push({"id": "zzb4-evt-outage"}, source="zzb4-flowsrc")
+    first = await client_500.post(url, content=raw, headers=headers)
+    assert first.status_code == 500
+    assert not await _claim_exists(db_pool, "zzb4-flowsrc", "zzb4-evt-outage")
+
+    retry = await client_500.post(url, content=raw, headers=headers)
+    assert retry.status_code == 202
+    assert retry.json().get("duplicate") is None  # genuinely reprocessed
+    assert retry.json()["workflow_id"] == "wf-life-retry"
+    assert temporal_stub.start_workflow.await_count == 2
+
+
+async def test_a_failed_inline_record_releases_the_claim(
+    client_500, db_pool, monkeypatch
+):
+    """The inline lane released the claim only on ValueError/TypeError.
+
+    An asyncpg failure — a closed connection partway through a health batch,
+    say — is neither, so the claim survived a push that recorded nothing.
+    `record_health_push` sits in this very try-block, and re-sending is safe
+    because every ingest path writes through `record_external_observation`,
+    whose per-sample `ON CONFLICT DO NOTHING` re-inserts only what is missing.
+    """
+    attempts: list[dict] = []
+
+    async def _flaky(pool, **kwargs):
+        attempts.append(kwargs)
+        if len(attempts) == 1:
+            raise ConnectionError("connection was closed in the middle of operation")
+        return {"id": "00000000-0000-0000-0000-0000000000ff"}
+
+    monkeypatch.setattr(webhooks, "record_observation", _flaky)
+
+    url, raw, headers = _push(
+        {"id": "zzb4-inline-outage", "metric": "zzb4-steps", "value": 7, "source": "zzb4-watch"}
+    )
+    first = await client_500.post(url, content=raw, headers=headers)
+    assert first.status_code == 500
+    assert not await _claim_exists(db_pool, SOURCE, "zzb4-inline-outage")
+
+    retry = await client_500.post(url, content=raw, headers=headers)
+    assert retry.status_code == 202
+    assert retry.json().get("duplicate") is None  # genuinely reprocessed
+    assert len(attempts) == 2  # the recorder really ran a second time

@@ -392,26 +392,9 @@ class BriefingActivities:
             except Exception as exc:
                 activity.logger.warning("briefing_place_failed err=%s", str(exc)[:200])
 
-        # health: the newest reading of each metric the health push writes
-        # (B6). This is the ONE place a health value is ever rendered — it goes
-        # to the owner's own channel, never to a log line. Deliberately outside
-        # the `quiet` test below: a daily export always lands, so counting it
-        # as news would mean no briefing is ever quiet again.
-        health: dict = {}
-        if self.db_pool:
-            try:
-                hrows = await self.db_pool.fetch(
-                    "SELECT DISTINCT ON (metric) metric, value::float8 AS value "
-                    "FROM life.observations "
-                    "WHERE source = $1 AND observed_at >= $2 "
-                    "ORDER BY metric, observed_at DESC",
-                    HEALTH_SOURCE,
-                    now - timedelta(hours=_HEALTH_STALE_HOURS),
-                )
-                health = {r["metric"]: r["value"] for r in hrows if r["value"] is not None}
-            except Exception as exc:
-                activity.logger.warning("briefing_health_failed err=%s", str(exc)[:200])
-
+        # Health (B6) is deliberately NOT gathered here — see `_recent_health`.
+        # It is read at render time, inside `frame_briefing`, so that no body
+        # data ever enters this bundle.
         quiet = not (intel_out or collected_out or failed_runs or new_drift or new_cal_ids)
         new_state = {
             "last_briefing_at": now.isoformat(),
@@ -426,9 +409,42 @@ class BriefingActivities:
             "broke": {"failed_runs": failed_runs, "new_drift": new_drift},
             "calendar": {"today": cal_today, "new_ids": new_cal_ids},
             "place": place,
-            "health": health,
             "_new_state": new_state,
         }
+
+    async def _recent_health(self) -> dict:
+        """Newest reading of each metric the health push writes (B6).
+
+        Read HERE, at render time, rather than in `gather_briefing_changes`,
+        because that activity's return value is `DailyBriefingFlow`'s `changes`
+        bundle — which Temporal persists verbatim as an activity RESULT and
+        again as `frame_briefing`'s ARGUMENT. That is the second store with its
+        own retention and its own web UI that `aegis.services.health` refused
+        to create when it made health ingest inline instead of a flow. The
+        readings are needed only to render one block, so they are fetched where
+        that block is built and never enter the bundle.
+
+        Deliberately outside the `quiet` test in `gather_briefing_changes`: a
+        daily export always lands, so counting it as news would mean no
+        briefing is ever quiet again.
+        """
+        if not self.db_pool:
+            return {}
+        from datetime import timedelta
+
+        try:
+            rows = await self.db_pool.fetch(
+                "SELECT DISTINCT ON (metric) metric, value::float8 AS value "
+                "FROM life.observations "
+                "WHERE source = $1 AND observed_at >= $2 "
+                "ORDER BY metric, observed_at DESC",
+                HEALTH_SOURCE,
+                datetime.now(UTC) - timedelta(hours=_HEALTH_STALE_HOURS),
+            )
+            return {r["metric"]: r["value"] for r in rows if r["value"] is not None}
+        except Exception as exc:
+            activity.logger.warning("briefing_health_failed err=%s", str(exc)[:200])
+            return {}
 
     @activity.defn
     async def frame_briefing(self, changes: dict) -> str:
@@ -442,7 +458,7 @@ class BriefingActivities:
         Counts/workflow-types (`_format_failure_block`) and health readings
         (`_format_health_block`) bypass the LLM entirely so that can't happen.
         """
-        health_block = self._format_health_block(changes)
+        health_block = self._format_health_block(await self._recent_health())
         if changes.get("quiet"):
             quiet = "\U0001f7e2 Quiet overnight — nothing needs you."
             return f"{quiet}\n\n{health_block}" if health_block else quiet
@@ -508,8 +524,11 @@ class BriefingActivities:
         types = sorted({str(r.get("workflow_type")) for r in fr if r.get("workflow_type")})
         return f"<b>⚠️ {len(fr)} workflow failure(s)</b>: {_esc(', '.join(types))}"
 
-    def _format_health_block(self, changes: dict) -> str:
+    def _format_health_block(self, health: dict | None) -> str:
         """Health readings (B6), rendered deterministically. Empty when absent.
+
+        Takes the readings directly (from `_recent_health`) rather than the
+        `changes` bundle, because the bundle must never carry them.
 
         A block rather than a line inside the narrative, for two reasons. The
         framing model is `model_balanced`, which may well be a hosted API —
@@ -518,7 +537,7 @@ class BriefingActivities:
         the LLM is asked for 2-5 sentences over the whole bundle, so a health
         line can lose out to intel headlines exactly as a failure can.
         """
-        health = changes.get("health") or {}
+        health = health or {}
         if not health:
             return ""
         parts = [f"{_esc(str(m))} {round(float(health[m]), 1)}" for m in sorted(health)]
@@ -528,6 +547,10 @@ class BriefingActivities:
         import json
         # `health` is withheld: see `_format_health_block`. Adding it back sends
         # the owner's body data to whatever `model_balanced` resolves to.
+        # `gather_briefing_changes` no longer puts it in the bundle at all, so
+        # this filter is now the second lock rather than the only one — kept
+        # because a caller could still hand-build a bundle that carries it, and
+        # tested independently of the gather-side change.
         payload = {k: v for k, v in changes.items() if k not in ("_new_state", "health")}
         return (
             "You are raphael writing a terse morning briefing. Given this JSON of "
