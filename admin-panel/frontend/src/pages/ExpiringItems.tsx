@@ -184,8 +184,13 @@ export default function ExpiringItems() {
               </div>
               <div className="form-group">
                 <label>Person ID (optional)</label>
-                <input value={form.person_id} onChange={e => setForm({ ...form, person_id: e.target.value })} placeholder="uuid from the People page" className="mono" />
-                <p className="meta" style={{ margin: '0.25rem 0 0' }}>Links this document to someone in the people registry. Cleared automatically if that person is deleted.</p>
+                <div style={{ display: 'flex', gap: '0.5rem', alignItems: 'center' }}>
+                  <input value={form.person_id} onChange={e => setForm({ ...form, person_id: e.target.value })} placeholder="uuid from the People page" className="mono" />
+                  {form.person_id.trim() && (
+                    <button type="button" className="btn btn-sm" onClick={() => setForm({ ...form, person_id: '' })}>Unlink</button>
+                  )}
+                </div>
+                <p className="meta" style={{ margin: '0.25rem 0 0' }}>Links this document to someone in the people registry. Unlink (or just empty the box) and save to detach it — the field is sent as an explicit null, which the API reads as "unlink". Also cleared automatically if that person is deleted.</p>
               </div>
               <div className="form-group">
                 <label>Notes</label>
