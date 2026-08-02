@@ -24,8 +24,10 @@ What is never persisted or logged, beyond the value itself:
 
 * the per-sample ``source`` device name Health Auto Export attaches,
 * the raw payload, in whole or in part,
-* any individual value — log lines carry counts only. The one place a value is
-  ever rendered is the owner's own briefing.
+* any individual value — log lines carry counts only, plus (on the unreadable-
+  unit warning) the metric name and the unit string, which are export
+  configuration rather than readings. The one place a value is ever rendered is
+  the owner's own briefing.
 
 Ingest is inline (a service called from the webhook), NOT a Temporal flow, for
 the same reason B5's location lane is: a workflow's argument is persisted in
@@ -94,6 +96,23 @@ _OFFSET_SPACE = re.compile(r"\s+([+-]\d{2}:?\d{2})$")
 
 _KJ_PER_KCAL = 4.184
 
+# THE UNIT ALLOWLIST, per metric whose value depends on its unit. A unit outside
+# its metric's sets is NOT assumed away — `convert` returns None and the sample
+# is skipped, because a stored reading is effectively permanent:
+# `record_external_observation` dedups on (source, metric, instant) with
+# ON CONFLICT DO NOTHING, so a corrected re-export can never overwrite a
+# wrong-unit value. A skipped sample, by contrast, is re-offered by the very
+# next overlapping export once the phone is set right.
+#
+# Only what Health Auto Export is known to emit is listed. A plausible-looking
+# unit it has never been observed to send (`Cal`, `kilojoules`) skips loudly so
+# the operator confirms what it means before it becomes an unfixable row.
+_SLEEP_MINUTES = frozenset({"min", "mins", "minute", "minutes"})
+_SLEEP_SECONDS = frozenset({"s", "sec", "secs", "second", "seconds"})
+_SLEEP_HOURS = frozenset({"h", "hr", "hrs", "hour", "hours"})
+_ENERGY_KCAL = frozenset({"kcal"})
+_ENERGY_KJ = frozenset({"kj"})
+
 
 def parse_timestamp(raw: Any, now: datetime | None = None) -> datetime | None:
     """When a sample was taken, or ``None`` if that cannot be established.
@@ -119,24 +138,40 @@ def parse_timestamp(raw: Any, now: datetime | None = None) -> datetime | None:
     return stamp
 
 
-def convert(metric: str, units: Any, value: float) -> float:
-    """Value in the canonical unit named by `metric`.
+def convert(metric: str, units: Any, value: float) -> float | None:
+    """Value in the canonical unit named by `metric`, or ``None`` if unreadable.
 
     The unit is read from the export rather than assumed, because Health Auto
     Export follows the phone's locale — energy arrives as kJ or kcal depending
     on the owner's settings, and treating one as the other is a silent 4x
-    error. An unknown or absent unit falls back to Health Auto Export's
-    documented default for that metric (hours for sleep, kcal for energy).
+    error.
+
+    An unknown or absent unit on a metric whose value depends on it returns
+    ``None`` — "this sample cannot be read" — rather than falling back to Health
+    Auto Export's default. The fallback used to turn a mislabeled export into a
+    silent 60x (sleep, hours assumed) or 4x (energy, kcal assumed) error that
+    landed in `life.observations` and poisoned every downstream trend with no
+    signal at all. The caller counts a ``None`` into `skipped` and names the
+    offending unit in a warning.
+
+    Metrics that need no conversion (steps, HRV, resting HR) are returned as
+    given: they have no unit-dependent branch to get wrong.
     """
     unit = str(units or "").strip().lower()
     if metric == "sleep_minutes":
-        if unit in ("min", "mins", "minute", "minutes"):
+        if unit in _SLEEP_MINUTES:
             return value
-        if unit in ("s", "sec", "secs", "second", "seconds"):
+        if unit in _SLEEP_SECONDS:
             return value / 60.0
-        return value * 60.0
-    if metric == "active_energy_kcal" and unit == "kj":
-        return value / _KJ_PER_KCAL
+        if unit in _SLEEP_HOURS:
+            return value * 60.0
+        return None
+    if metric == "active_energy_kcal":
+        if unit in _ENERGY_KCAL:
+            return value
+        if unit in _ENERGY_KJ:
+            return value / _KJ_PER_KCAL
+        return None
     return value
 
 
@@ -173,6 +208,10 @@ def parse_health_export(
     samples: list[tuple[str, float, datetime]] = []
     skipped = 0
     truncated = False
+    # canonical metric -> the unreadable unit strings seen for it. Collected
+    # rather than logged per sample: one mislabeled export is hundreds of
+    # samples carrying the same wrong unit.
+    unreadable: dict[str, set[str]] = {}
     for entry in metrics:
         if truncated:
             break
@@ -198,7 +237,23 @@ def parse_health_export(
             if value is None or observed_at is None:
                 skipped += 1
                 continue
-            samples.append((canonical, convert(canonical, units, value), observed_at))
+            converted = convert(canonical, units, value)
+            if converted is None:
+                # Unreadable unit — dropped rather than assumed. See `convert`.
+                skipped += 1
+                unreadable.setdefault(canonical, set()).add(str(units or "")[:32])
+                continue
+            samples.append((canonical, converted, observed_at))
+
+    if unreadable:
+        # WARNING, not info: this is a misconfigured export losing readings, and
+        # it is the only signal that it happened. Metric names and unit strings
+        # are configuration, not readings — no value is rendered, same rule as
+        # `record_health_push`.
+        logger.warning(
+            "health_push_unreadable_unit",
+            units={metric: sorted(seen) for metric, seen in sorted(unreadable.items())},
+        )
     return samples, skipped, truncated
 
 
