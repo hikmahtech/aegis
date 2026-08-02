@@ -131,10 +131,15 @@ async def resolve_interaction(
 async def get_interaction(interaction_id: UUID, request: Request):
     pool = request.app.state.db_pool
     async with pool.acquire() as conn:
+        # `metadata` is returned by the single-interaction read only (never by
+        # the list): the draft_review panel needs `metadata.proposed_doc` to
+        # populate its editor, and a card's metadata is the payload the
+        # post-resolve activity will be handed, so showing it is also the only
+        # way an operator can see what an approval is about to do.
         row = await conn.fetchrow(
             "SELECT id, flow_run_id, agent_id, kind, origin, prompt, options, "
             "status, response, timeout_policy, timeout_at, telegram_message_id, "
-            "created_at, resolved_at "
+            "metadata, created_at, resolved_at "
             "FROM interactions WHERE id = $1",
             interaction_id,
         )

@@ -276,8 +276,17 @@ async def main():
         llm_client=deps.llm,
         model=model_balanced,
     )
-    # Registered but dormant — no flow calls these yet (A1 ships the substrate).
-    profile_act = ProfileActivities(db_pool=deps.pool)
+    # A1 shipped the write substrate; A2 (ProfileReflectionFlow) drives it.
+    profile_act = ProfileActivities(
+        db_pool=deps.pool,
+        llm_client=deps.llm,
+        model=model_balanced,
+        # A draft_review card goes out via send_interaction_card, which bypasses
+        # safe_send_message — so the flow consults the notification budget
+        # itself, same knobs as delivery_act and curiosity_act.
+        budget_enabled=getattr(settings, "notification_budget_enabled", False),
+        daily_budget=getattr(settings, "notification_daily_budget", 8),
+    )
     # C2 — passive people enrichment off email/calendar. Ships dark; email only
     # ever enriches an existing person, and the calendar (creating) lane refuses
     # while owner_emails is empty rather than minting a row for the user.

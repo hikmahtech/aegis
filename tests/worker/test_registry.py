@@ -213,10 +213,13 @@ def test_module_workflows_is_the_unflagged_registry():
     ("homelab", "money", "flows", "activities"),
     [
         # prod: `worker_starting activities=171 flows=35`, +1 flow and +2
-        # activities from B7's WearableIngestFlow / WearableActivities.
-        (True, True, 36, 173),
-        (False, False, 28, 144),
-        (True, False, 32, 162),
+        # activities from B7's WearableIngestFlow / WearableActivities, then
+        # +1 flow and +5 activities from A2's ProfileReflectionFlow
+        # (gather_profile_evidence, propose_profile_patch, check_profile_budget,
+        # record_profile_card, apply_profile_reflection).
+        (True, True, 37, 178),
+        (False, False, 29, 149),
+        (True, False, 33, 167),
     ],
 )
 def test_real_registration_passes_the_boot_check(homelab, money, flows, activities):

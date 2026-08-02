@@ -170,6 +170,7 @@ The shipped schedule set (`config/seed/activities.yaml` — all crons UTC):
 
 | Slug | Cron (UTC) | Flow | Agent | What it does |
 |---|---|---|---|---|
+| `profile-reflection-weekly` | `23 2 * * 0` | `ProfileReflectionFlow` | Sebas | Proposes one revision of the agent's own **user-context persona doc** from the week's evidence (chat, memories, resolved-interaction corrections, finance, calendar) and sends it as a `draft_review` card. **Nothing is written until you press Approve** — the admin panel shows the proposed document, lets you edit it, and Approve applies exactly what is in the editor; Reject writes nothing and banks your reason as a lesson. Every applied patch lands an `agent_profile_revisions` row (`source='profile_reflection'`) and is revertible. Quiet week, LLM failure, or an unchanged proposal ⇒ no card |
 | `gtd-weekly-review` | `30 3 * * 0` | `WeeklyReviewFlow` | Sebas | Weekly review digest (Sunday) |
 | `receipt-ingest-weekly` | `0 5 * * 0` | `ReceiptIngestFlow` | Maou | 14-day receipt safety net behind the hourly tag fan-out |
 | `subscription-audit-monthly` | `0 10 1 * *` | `SubscriptionAuditFlow` | Maou | Monthly subscription audit digest |
