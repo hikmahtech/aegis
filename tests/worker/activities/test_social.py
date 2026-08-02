@@ -1363,13 +1363,30 @@ async def test_refresh_keeps_long_lead_rows_eligible_regardless_of_created_at(st
 async def test_refresh_malformed_schedule_at_does_not_abort_the_pass(stuck_env):
     """`payload->>'schedule_at'` is free text. A bare ::timestamptz on a bad
     value aborts the whole statement — i.e. one junk row would silently kill
-    metrics AND the watchdog that reads them."""
+    metrics AND the watchdog that reads them.
+
+    The junk rows are seeded OLD on purpose: the eligibility clause is
+    `created_at recent OR schedule_at recent`, and Postgres short-circuits the
+    OR for a recent row, so a recent junk row would never evaluate the cast and
+    the test would pass with the guard removed."""
     account_id = await _seed_postiz_account(stuck_env, platform="linkedin")
     await _seed_outbox(
-        stuck_env, account_id, "zzsa-junk", "zzsa-pz-junk", schedule_at="not-a-date", state=None
+        stuck_env,
+        account_id,
+        "zzsa-junk",
+        "zzsa-pz-junk",
+        schedule_at="not-a-date",
+        state=None,
+        created_days_ago=60,
     )
     await _seed_outbox(
-        stuck_env, account_id, "zzsa-empty", "zzsa-pz-empty", schedule_at="", state=None
+        stuck_env,
+        account_id,
+        "zzsa-empty",
+        "zzsa-pz-empty",
+        schedule_at="",
+        state=None,
+        created_days_ago=60,
     )
     await _seed_outbox(
         stuck_env,
@@ -1389,12 +1406,18 @@ async def test_refresh_malformed_schedule_at_does_not_abort_the_pass(stuck_env):
     connector = SocialConnector(db_pool=stuck_env, settings=_settings_with_postiz())
     act = SocialActivities(db_pool=stuck_env, connector=connector)
     try:
-        # The junk/empty rows are recent, so they stay eligible on the
-        # created_at branch; the point is that the statement RAN at all.
+        # The two junk rows are simply not eligible (neither branch true); the
+        # point is that the statement RAN at all instead of raising.
         assert await ActivityEnvironment().run(act.refresh_post_metrics, 14, 45, 200) == {
-            "refreshed": 3,
+            "refreshed": 1,
             "failed": 0,
         }
+        assert (
+            await stuck_env.fetchval(
+                "SELECT metrics FROM social_outbox WHERE todoist_task_id = 'zzsa-junk'"
+            )
+            == {}
+        )
     finally:
         await connector.close()
 
