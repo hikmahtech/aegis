@@ -59,6 +59,7 @@ from aegis_worker.flows.daylog import DayLogConfig, DayLogFlow
 from aegis_worker.flows.delivery_watchdog import DeliveryWatchdogConfig, DeliveryWatchdogFlow
 from aegis_worker.flows.drive_sync import DriveSyncFlow, DriveSyncInput
 from aegis_worker.flows.expiry_radar import ExpiryRadarConfig, ExpiryRadarFlow
+from aegis_worker.flows.flow_health import FlowHealthConfig, FlowHealthWatchdogFlow
 from aegis_worker.flows.github_alert import GitHubAlertFlow
 from aegis_worker.flows.gmail_ingest import GmailIngestFlow, GmailIngestInput
 from aegis_worker.flows.infra_heartbeat import InfraHeartbeatConfig, InfraHeartbeatFlow
@@ -364,6 +365,23 @@ FLOWS: tuple[FlowSpec, ...] = (
             agent_id=act["agent_id"],
             lookahead_days=int(act["config"].get("lookahead_days", 400)),
             max_cards=int(act["config"].get("max_cards", 5)),
+        ),
+    ),
+    # Watchdog over AEGIS's own scheduled flows (#226). Deliberately NOT behind
+    # homelab_enabled: it watches workflow_runs, which every install has, and
+    # the silent-failure gap it closes is not homelab-specific.
+    FlowSpec(
+        FlowHealthWatchdogFlow,
+        lambda act: FlowHealthConfig(
+            agent_id=act["agent_id"],
+            consecutive_failures=int((act["config"] or {}).get("consecutive_failures", 2)),
+            lookback_hours=int((act["config"] or {}).get("lookback_hours", 24)),
+            stale_multiplier=float((act["config"] or {}).get("stale_multiplier", 3.0)),
+            min_stale_minutes=int((act["config"] or {}).get("min_stale_minutes", 60)),
+            dedup_hours=int((act["config"] or {}).get("dedup_hours", 12)),
+            recovery_hours=int((act["config"] or {}).get("recovery_hours", 168)),
+            check_stale=bool((act["config"] or {}).get("check_stale", True)),
+            silent=bool((act["config"] or {}).get("silent", False)),
         ),
     ),
     # --- homelab_enabled ---------------------------------------------------

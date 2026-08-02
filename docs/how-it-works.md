@@ -142,6 +142,7 @@ The shipped schedule set (`config/seed/activities.yaml` — all crons UTC):
 |---|---|---|---|---|
 | `gmail-ingest-hourly` | `0 * * * *` | `GmailIngestFlow` | Sebas | Fetch + classify new mail; tag fan-out spawns `MoneyProcessFlow` for `financial`/`payments` mail. With Integrations → Features → **Passive people enrichment** on, each sender is also folded into `life.people`: it learns their address as an alias and moves `last_contact` forward, but it **never creates a person** — an inbox is unbounded and mostly transactional |
 | `delivery-watchdog-hourly` | `0 * * * *` | `DeliveryWatchdogFlow` | Pandora's Actor | Finds interaction cards that were never delivered; checks comms liveness |
+| `flow-health-watchdog-30m` | `7,37 * * * *` | `FlowHealthWatchdogFlow` | Pandora's Actor | Watches AEGIS's own flows: 2 consecutive failed runs of one `workflow_type` (recency-ordered, so a later success clears it), or an active schedule with no *successful* run in 3x its own cadence. One deduped card per fault, a `[FLOW OK]` card on recovery. Mute one with `INSERT INTO alert_mutes (mute_key, muted_until) VALUES ('flow-health:<subject>', now() + interval '2 days')` |
 | `rss-ingest-hourly` | `30 * * * *` | `RssIngestFlow` | Raphael | RSS feeds → knowledge store |
 | `raindrop-ingest-2h` | `0 */2 * * *` | `RaindropIngestFlow` | Raphael | Raindrop bookmarks → knowledge store |
 | `service-drift-4h` | `0 */4 * * *` | `ServiceDriftFlow` | Pandora's Actor | Secondary swarm drift check (alertmanager is the primary path) |

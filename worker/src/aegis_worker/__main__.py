@@ -33,6 +33,7 @@ from aegis_worker.activities.daylog import DayLogActivities
 from aegis_worker.activities.delivery import DeliveryActivities
 from aegis_worker.activities.drive import DriveActivities
 from aegis_worker.activities.expiring_items import ExpiringItemsActivities
+from aegis_worker.activities.flow_health import FlowHealthActivities
 from aegis_worker.activities.gmail import GmailActivities
 from aegis_worker.activities.homelab import HomelabActivities
 from aegis_worker.activities.infra_ops import InfraOpsActivities
@@ -423,6 +424,7 @@ async def main():
     )
     infra_ops_act = InfraOpsActivities(homelab_connector=connectors.get("homelab"))
     expiring_items_act = ExpiringItemsActivities(db_pool=deps.pool)
+    flow_health_act = FlowHealthActivities(db_pool=deps.pool, delivery=delivery_act)
     # apply_restart_approval runs as an AgentTask activity but needs the infra
     # ops. Mirrors the existing `alert_act.todoist_connector = todoist_connector`
     # late-wiring below.
@@ -526,6 +528,7 @@ async def main():
         agent_task_act,
         infra_ops_act,
         expiring_items_act,
+        flow_health_act,
         # None when their feature flag is off — collect_activities skips those.
         homelab_act,
         money_act,

@@ -217,10 +217,13 @@ def test_module_workflows_is_the_unflagged_registry():
         # +1 flow and +5 activities from A2's ProfileReflectionFlow
         # (gather_profile_evidence, propose_profile_patch, check_profile_budget,
         # record_profile_card, apply_profile_reflection), then +1 activity and
-        # NO new flow from A5 (propose_generalizations, which rides A2's flow).
-        (True, True, 37, 179),
-        (False, False, 29, 150),
-        (True, False, 33, 168),
+        # NO new flow from A5 (propose_generalizations, which rides A2's flow),
+        # then +1 flow and +3 activities from #226's FlowHealthWatchdogFlow /
+        # FlowHealthActivities (find_failing_flows, find_stale_flows,
+        # report_flow_health) — unflagged, so all three rows move.
+        (True, True, 38, 182),
+        (False, False, 30, 153),
+        (True, False, 34, 171),
     ],
 )
 def test_real_registration_passes_the_boot_check(homelab, money, flows, activities):
