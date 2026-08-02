@@ -2,12 +2,14 @@
 
 Covers: first-sight Down fires once; steady Down fires nothing; recovery
 writes resolved row; stuck service needs 2 consecutive ticks; collect
-failure threshold; dead-man only on success.
+failure threshold; dead-man only on success; a node that vanishes from the
+listing entirely (#131); the confirmed-stuck re-investigation (#138).
 """
 
 from __future__ import annotations
 
 import uuid
+from datetime import datetime, timedelta
 
 from temporalio import activity, workflow
 from temporalio.testing import WorkflowEnvironment
@@ -143,10 +145,16 @@ async def test_stuck_service_needs_two_consecutive_ticks():
 
 
 async def test_confirmed_stuck_service_recovery_writes_resolved():
+    """Both fingerprints: a service that was re-investigated (#138) owns a live
+    ServiceDownProlonged escalation as well, and it needs its own resolved row
+    or it keeps nagging after the outage is over."""
     prior = {"nodes": {}, "stuck": ["svc_a"], "confirmed": ["svc_a"], "fail_count": 0}
     _reset({"ok": True, "nodes": {}, "stuck": [], "error": ""}, prior)
     await _run()
-    assert _calls["resolved"] == [_hb_fingerprint("DockerServiceDown", "svc_a")]
+    assert _calls["resolved"] == [
+        _hb_fingerprint("DockerServiceDown", "svc_a"),
+        _hb_fingerprint("ServiceDownProlonged", "svc_a"),
+    ]
 
 
 async def test_collect_failure_threshold_fires_once_and_no_ping():
@@ -217,3 +225,189 @@ async def test_non_quiet_node_still_alerts_when_quiet_list_set():
     assert result["alerts_spawned"] == 1
     assert _calls["spawned"][0]["fingerprint"] == _hb_fingerprint("NodeDown", "noon")
     assert _calls["quiet"] == []
+
+
+def _backdate(state: dict, key: str, svc: str, hours: float) -> dict:
+    """Rewind one per-service clock in a state dict the flow itself wrote.
+
+    Reads back the stamp `workflow.now()` produced instead of inventing one
+    from pytest's clock, so these tests don't depend on the time-skipping test
+    server sharing a wall clock with the test process.
+    """
+    out = {**state, key: dict(state.get(key) or {})}
+    out[key][svc] = (
+        datetime.fromisoformat(out[key][svc]) - timedelta(hours=hours)
+    ).isoformat()
+    return out
+
+
+# --------------------------------------------------------------------------
+# #131 — a node that disappears from `docker node ls` entirely
+# --------------------------------------------------------------------------
+
+
+async def test_node_vanished_while_down_resolves_its_alert():
+    """The bug: the diff walked cur_nodes only, so a Down node that dropped out
+    of the listing never got its resolved row — an escalating NodeDown that can
+    then only stop at ack/max-repeats/48h archive."""
+    prior = {
+        "nodes": {"baa": "Ready", "noon": "Down"},
+        "stuck": [],
+        "confirmed": [],
+        "fail_count": 0,
+    }
+    _reset({"ok": True, "nodes": {"baa": "Ready"}, "stuck": [], "error": ""}, prior)
+    result = await _run()
+    assert result["nodes_vanished"] == 1
+    assert _calls["resolved"] == [_hb_fingerprint("NodeDown", "noon")]
+    assert result["alerts_spawned"] == 0
+    assert _calls["written"][0]["nodes"] == {"baa": "Ready"}
+
+
+async def test_node_vanished_while_ready_resolves_nothing():
+    """Only a node that was Down owns an open alert. A Ready node leaving the
+    swarm must not write a resolved row for an alert that never fired."""
+    prior = {
+        "nodes": {"baa": "Ready", "lam": "Ready"},
+        "stuck": [],
+        "confirmed": [],
+        "fail_count": 0,
+    }
+    _reset({"ok": True, "nodes": {"baa": "Ready"}, "stuck": [], "error": ""}, prior)
+    result = await _run()
+    assert result["nodes_vanished"] == 0
+    assert _calls["resolved"] == []
+
+
+async def test_empty_node_listing_does_not_resolve_every_down_node():
+    """An ok-but-empty listing is a collection anomaly, not a mass
+    decommission: resolving on it would close real escalations."""
+    prior = {
+        "nodes": {"baa": "Ready", "noon": "Down"},
+        "stuck": [],
+        "confirmed": [],
+        "fail_count": 0,
+    }
+    _reset({"ok": True, "nodes": {}, "stuck": [], "error": ""}, prior)
+    result = await _run()
+    assert result["nodes_vanished"] == 0
+    assert _calls["resolved"] == []
+
+
+async def test_empty_node_listing_keeps_the_last_good_node_map():
+    """...and it must not erase the stored Down status either — that erasure is
+    the other half of the #131 orphan."""
+    prior = {
+        "nodes": {"baa": "Ready", "noon": "Down"},
+        "stuck": [],
+        "confirmed": [],
+        "fail_count": 0,
+    }
+    _reset({"ok": True, "nodes": {}, "stuck": [], "error": ""}, prior)
+    await _run()
+    assert _calls["written"][0]["nodes"] == {"baa": "Ready", "noon": "Down"}
+
+
+# --------------------------------------------------------------------------
+# #138 — a confirmed-stuck service is never retried
+# --------------------------------------------------------------------------
+
+
+async def test_confirmed_stuck_service_reinvestigates_once_not_every_tick():
+    """miniflux_miniflux sat `confirmed` for >24h with no retry and nobody told.
+
+    Asserts the COUNT across three consecutive polls: the re-investigation must
+    fire exactly once, not once every 2 minutes.
+    """
+    svc = "miniflux_miniflux"
+    collect = {"ok": True, "nodes": {"baa": "Ready"}, "stuck": [svc], "error": ""}
+
+    # Tick 1 — already confirmed when this code shipped: clock starts now.
+    prior = {"nodes": {}, "stuck": [svc], "confirmed": [svc], "fail_count": 0}
+    _reset(collect, prior)
+    first = await _run()
+    assert first["services_reinvestigated"] == 0
+    assert _calls["spawned"] == []
+    seeded = _calls["written"][0]
+    assert svc in seeded["confirmed_at"]
+
+    # Tick 2 — same service, 30h of being stuck later.
+    aged = _backdate(seeded, "confirmed_at", svc, 30)
+    _reset(collect, aged)
+    second = await _run()
+    assert second["services_reinvestigated"] == 1
+    assert len(_calls["spawned"]) == 1
+    alert = _calls["spawned"][0]
+    assert alert["labels"]["alertname"] == "ServiceDownProlonged"
+    assert alert["labels"]["service_name"] == svc
+    assert alert["fingerprint"] == _hb_fingerprint("ServiceDownProlonged", svc)
+    assert alert["escalate"] is True
+    after = _calls["written"][0]
+    assert svc in after["reinvestigated_at"]
+
+    # Tick 3 — the very next poll, still stuck, still past the threshold.
+    _reset(collect, after)
+    third = await _run()
+    assert third["services_reinvestigated"] == 0
+    assert _calls["spawned"] == []
+
+
+async def test_reinvestigation_repeats_after_the_dedup_window_expires():
+    """The ratchet is a delay, not a permanent silence."""
+    svc = "ollama_ollama-2"
+    collect = {"ok": True, "nodes": {"baa": "Ready"}, "stuck": [svc], "error": ""}
+    prior = {
+        "nodes": {},
+        "stuck": [svc],
+        "confirmed": [svc],
+        "confirmed_at": {},
+        "reinvestigated_at": {},
+        "fail_count": 0,
+    }
+    _reset(collect, prior)
+    await _run()
+    aged = _backdate(_calls["written"][0], "confirmed_at", svc, 60)
+    _reset(collect, aged)
+    await _run()
+    once = _calls["written"][0]
+    assert once["reinvestigated_at"][svc]
+
+    # Another 30h with no recovery.
+    aged_again = _backdate(once, "reinvestigated_at", svc, 30)
+    _reset(collect, aged_again)
+    again = await _run()
+    assert again["services_reinvestigated"] == 1
+    assert len(_calls["spawned"]) == 1
+    assert _calls["spawned"][0]["labels"]["alertname"] == "ServiceDownProlonged"
+
+
+async def test_restuck_hours_zero_disables_reinvestigation():
+    svc = "koyracloud_redis"
+    collect = {"ok": True, "nodes": {"baa": "Ready"}, "stuck": [svc], "error": ""}
+    prior = {"nodes": {}, "stuck": [svc], "confirmed": [svc], "fail_count": 0}
+    _reset(collect, prior)
+    await _run(InfraHeartbeatConfig(restuck_hours=0))
+    aged = _backdate(_calls["written"][0], "confirmed_at", svc, 240)
+    _reset(collect, aged)
+    result = await _run(InfraHeartbeatConfig(restuck_hours=0))
+    assert result["services_reinvestigated"] == 0
+    assert _calls["spawned"] == []
+
+
+async def test_recovered_service_drops_its_clocks():
+    """A service that recovers must lose confirmed_at/reinvestigated_at, or a
+    later re-break would inherit a stale clock and re-investigate instantly."""
+    svc = "svc_flappy"
+    prior = {
+        "nodes": {"baa": "Ready"},
+        "stuck": [svc],
+        "confirmed": [svc],
+        "confirmed_at": {svc: "2026-01-01T00:00:00+00:00"},
+        "reinvestigated_at": {svc: "2026-01-01T00:00:00+00:00"},
+        "fail_count": 0,
+    }
+    _reset({"ok": True, "nodes": {"baa": "Ready"}, "stuck": [], "error": ""}, prior)
+    await _run()
+    written = _calls["written"][0]
+    assert written["confirmed_at"] == {}
+    assert written["reinvestigated_at"] == {}

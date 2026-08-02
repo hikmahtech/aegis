@@ -49,6 +49,14 @@ INFRA_ALERTNAMES: frozenset[str] = frozenset(
     {
         "nodedown",
         "dockerservicedown",
+        # Prometheus' 2h escalation of DockerServiceDown, and the alertname
+        # InfraHeartbeatFlow re-fires under for a service confirmed-stuck past
+        # `restuck_hours` (#138). It was already in _REMEDIABLE_ALERTNAMES but
+        # missing here, and _safe_remediate_infra only runs inside the
+        # is_infra_alert branch — so with `infra_cluster` unset (its default)
+        # every ServiceDownProlonged went down the LLM repo-match path and
+        # never got its force-restart.
+        "servicedownprolonged",
         "heartbeatcollectfailed",
         "lokidown",
         "criticalendpointdown",

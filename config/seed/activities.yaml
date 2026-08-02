@@ -350,6 +350,9 @@ activities:
     # swarm (dual-boot boxes etc.); their transitions send a plain FYI ping
     # instead of spawning an investigation. Edit the DB activities row —
     # schedule_sync propagates within ~5 min, no redeploy.
+    # config.restuck_hours: hours a service must sit confirmed-stuck before it
+    # is re-investigated as ServiceDownProlonged, and the minimum gap between
+    # two such re-investigations of the same service (default 24; 0 disables).
     config: {}
     active: true
 

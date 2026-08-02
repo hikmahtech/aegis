@@ -46,7 +46,29 @@ async def test_read_heartbeat_state_defaults_when_unset():
     pool = AsyncMock()
     pool.fetchrow.return_value = None
     state = await _act(db_pool=pool).read_heartbeat_state()
-    assert state == {"nodes": {}, "stuck": [], "confirmed": [], "fail_count": 0}
+    assert state == {
+        "nodes": {},
+        "stuck": [],
+        "confirmed": [],
+        "confirmed_at": {},
+        "reinvestigated_at": {},
+        "fail_count": 0,
+    }
+
+
+@pytest.mark.asyncio
+async def test_read_heartbeat_state_backfills_clocks_missing_from_a_pre_138_row():
+    """A state row written before #138 has no confirmed_at/reinvestigated_at.
+    The default-merge must supply them, or the flow KeyErrors on the first tick
+    after deploy."""
+    pool = AsyncMock()
+    pool.fetchrow.return_value = {
+        "value": {"nodes": {"baa": "Ready"}, "stuck": ["a"], "confirmed": ["a"], "fail_count": 0}
+    }
+    state = await _act(db_pool=pool).read_heartbeat_state()
+    assert state["confirmed_at"] == {}
+    assert state["reinvestigated_at"] == {}
+    assert state["confirmed"] == ["a"]
 
 
 @pytest.mark.asyncio
