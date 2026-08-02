@@ -180,6 +180,15 @@ class Settings(BaseSettings):
     # existing person; the calendar lane, which may create, additionally
     # refuses while owner_emails above is unset.
     people_enrichment_enabled: bool = False
+    # Memory consolidation (A4) — the deployment-level kill switch for letting
+    # an LLM plan MUTATE agent_memory (the user's accumulated corrections).
+    # False = the nightly pass plans and logs but writes nothing, whatever
+    # /admin/flows says. Enabling apply needs BOTH this env var on the worker
+    # AND `dry_run: false` in the memory-reflection-nightly activities.config;
+    # two keys in two systems, so neither a misclick in the admin UI nor a
+    # stray env can grant write access on its own. Turning this back off kills
+    # writes fleet-wide on the next worker restart, no DB edit needed.
+    memory_consolidation_apply_enabled: bool = False
     # Bank / card-alert sender domains (comma-separated, case-insensitive
     # substring match). Deterministic guard in Money Hygiene that stops bank
     # statements / autopay reminders from minting fake recurring charges.

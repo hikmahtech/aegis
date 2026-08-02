@@ -1,10 +1,23 @@
-"""A3 — the memory consolidation PLANNER must never mutate agent_memory.
+"""The memory consolidation pass must not mutate agent_memory in dry-run.
 
 These rows are the user's own accumulated knowledge (mostly human-authored
-corrections) and a wrong DELETE is unrecoverable, so the load-bearing tests
-here are the destructive ones: seed real rows, run the pass under every
-plausible config, and prove both that no mutating SQL was issued and that the
-rows are byte-identical afterwards.
+corrections), so the load-bearing tests here are the destructive ones: seed
+real rows, run the pass under every plausible config, and prove both that no
+mutating SQL was issued and that the rows are byte-identical afterwards.
+
+A4 gave the pass a real apply path, so this spy stopped being belt-and-braces
+and became the primary safety net. Two changes to it (issue #201):
+
+* the mutation regex now covers MERGE / TRUNCATE / COPY … FROM / DROP /
+  ALTER as well as DELETE / UPDATE / INSERT. The old three-verb regex would
+  have watched a `TRUNCATE agent_memory` go by;
+* `acquire()` is no longer a hard AssertionError but a RECORDING PROXY.
+  A4 applies plans inside a transaction, which needs a real connection —
+  refusing `acquire` would have meant the apply path simply could not be
+  spied on at all. The proxy records connection-level statements into the
+  same list, so `mutations` sees strictly MORE than it used to.
+
+`test_spy_detects_an_injected_write` proves the rig can actually fail.
 """
 
 from __future__ import annotations
@@ -15,22 +28,64 @@ import re
 import pytest
 import pytest_asyncio
 from aegis_worker.activities.memory import MemoryActivities
-from temporalio.exceptions import ApplicationError
 from temporalio.testing import ActivityEnvironment
 
 _AID = "zzcons-agent"
 _OTHER = "zzcons-other"
 
-# Any statement that could change an agent_memory row.
-_MUTATION = re.compile(r"\b(delete|update|insert)\b[\s\S]*\bagent_memory\b", re.IGNORECASE)
+# Any statement that could change an agent_memory row. `agent_memory(?!\w)`
+# matches the table but NOT `agent_memory_ops_log`, which the pass writes to
+# by design in every mode — see test_ops_log_writes_are_not_counted_as_mutations.
+_MUTATION = re.compile(
+    r"\b(delete|update|insert|merge|truncate|copy|drop|alter|replace)\b"
+    r"[\s\S]*\bagent_memory(?!\w)",
+    re.IGNORECASE,
+)
+
+
+class _SpyConn:
+    """A connection whose statements land in the owning spy's list."""
+
+    def __init__(self, conn, queries: list[str]):
+        self._conn = conn
+        self._queries = queries
+
+    async def execute(self, query, *args, **kwargs):
+        self._queries.append(query)
+        return await self._conn.execute(query, *args, **kwargs)
+
+    async def fetch(self, query, *args, **kwargs):
+        self._queries.append(query)
+        return await self._conn.fetch(query, *args, **kwargs)
+
+    async def fetchval(self, query, *args, **kwargs):
+        self._queries.append(query)
+        return await self._conn.fetchval(query, *args, **kwargs)
+
+    async def fetchrow(self, query, *args, **kwargs):
+        self._queries.append(query)
+        return await self._conn.fetchrow(query, *args, **kwargs)
+
+    def transaction(self, *args, **kwargs):
+        return self._conn.transaction(*args, **kwargs)
+
+
+class _SpyAcquire:
+    """Async context manager mirroring asyncpg's `pool.acquire()`."""
+
+    def __init__(self, pool, queries: list[str]):
+        self._ctx = pool.acquire()
+        self._queries = queries
+
+    async def __aenter__(self):
+        return _SpyConn(await self._ctx.__aenter__(), self._queries)
+
+    async def __aexit__(self, *exc):
+        return await self._ctx.__aexit__(*exc)
 
 
 class _SpyPool:
-    """Records every statement the activity issues, then delegates.
-
-    `acquire` is deliberately unavailable: a raw connection would let a future
-    edit slip mutating SQL past this spy.
-    """
+    """Records every statement the activity issues, then delegates."""
 
     def __init__(self, pool):
         self._pool = pool
@@ -53,7 +108,7 @@ class _SpyPool:
         return await self._pool.execute(query, *args, **kwargs)
 
     def acquire(self, *args, **kwargs):
-        raise AssertionError("consolidation must not take a raw connection")
+        return _SpyAcquire(self._pool, self.queries)
 
     @property
     def mutations(self) -> list[str]:
@@ -87,6 +142,13 @@ async def _snapshot(pool, agent_id: str) -> list[tuple]:
     return [tuple(r) for r in rows]
 
 
+# Filler rows so the agent clears _MIN_MEMORIES_TO_APPLY (10) and the quota
+# arithmetic is exercised for real. Below that floor every plan is refused
+# wholesale, which is the subject of its own test in test_memory_a4_rails.py.
+_FILLER = 12
+_TOTAL = _FILLER + 2
+
+
 @pytest_asyncio.fixture(loop_scope="function")
 async def seeded(db_pool):
     for aid in (_AID, _OTHER):
@@ -111,6 +173,13 @@ async def seeded(db_pool):
                 content,
             )
         )
+    for n in range(_FILLER):
+        await db_pool.execute(
+            "INSERT INTO agent_memory (agent_id, content, importance, source) "
+            "VALUES ($1,$2,0.5,'correction')",
+            _AID,
+            f"unrelated lesson {n}",
+        )
     foreign_id = await db_pool.fetchval(
         "INSERT INTO agent_memory (agent_id, content, importance, source) "
         "VALUES ($1,'another agent''s lesson',0.6,'correction') RETURNING id",
@@ -118,6 +187,7 @@ async def seeded(db_pool):
     )
     yield {"pool": db_pool, "ids": ids, "foreign_id": foreign_id}
     for aid in (_AID, _OTHER):
+        await db_pool.execute("DELETE FROM agent_memory_ops_log WHERE agent_id = $1", aid)
         await db_pool.execute("DELETE FROM agent_memory WHERE agent_id = $1", aid)
         await db_pool.execute("DELETE FROM llm_calls WHERE agent_id = $1", aid)
         await db_pool.execute("DELETE FROM agents WHERE id = $1", aid)
@@ -161,7 +231,7 @@ async def test_delete_plan_deletes_nothing(seeded):
 
     assert spy.mutations == [], f"consolidation issued mutating SQL: {spy.mutations}"
     assert await _snapshot(pool, _AID) == before
-    assert len(before) == 2
+    assert len(before) == _TOTAL
 
 
 @pytest.mark.parametrize(
@@ -191,32 +261,74 @@ async def test_no_destructive_sql_under_any_plan(seeded, label, make_llm):
     assert await _snapshot(pool, _AID) == before, f"[{label}] rows changed"
 
 
-async def test_non_dry_run_is_refused_and_changes_nothing(seeded):
-    """dry_run=False is refused non-retryably — the refusal is unconditional,
-    so no config, env var or DB state reaches an apply path."""
+async def test_non_dry_run_without_env_switch_changes_nothing(seeded):
+    """A4 replaces A3's unconditional refusal with a two-key gate. This is the
+    half that matters most: `dry_run=False` from the DB config, but the worker
+    env switch off ⇒ the pass degrades to dry-run and writes nothing.
+
+    Note it does NOT raise: failing the nightly run on a config/env mismatch
+    would also stop the memory cap in step 2 of the flow.
+    """
     pool, ids = seeded["pool"], seeded["ids"]
     before = await _snapshot(pool, _AID)
     spy = _SpyPool(pool)
     llm = _StubLLM(_merge_plan(ids))
-    act = MemoryActivities(db_pool=spy, llm_client=llm)
+    act = MemoryActivities(db_pool=spy, llm_client=llm, apply_enabled=False)
 
-    with pytest.raises(ApplicationError) as exc:
-        await ActivityEnvironment().run(act.consolidate_agent_memories, _AID, False)
+    out = await ActivityEnvironment().run(act.consolidate_agent_memories, _AID, False)
 
-    assert exc.value.non_retryable is True
-    assert "non_dry_run_refused" in str(exc.value)
-    assert "agent_memory_ops_log" in str(exc.value)  # names what A4 must add
-    assert llm.calls == []  # refused before spending a token
-    assert spy.queries == []
+    assert out["status"] == "apply_disabled"
+    assert out["dry_run"] is True  # the EFFECTIVE mode, not the requested one
+    assert out["applied"] == 0
+    assert spy.mutations == [], f"apply-disabled run issued mutating SQL: {spy.mutations}"
     assert await _snapshot(pool, _AID) == before
 
 
-async def test_apply_consolidation_does_not_exist_yet(seeded):
-    """The structural half of the gate: there is no apply path to call, so
-    deleting the refusal alone still cannot write. A4 adds this function."""
-    import aegis.services.memory as memory_service
+async def test_ops_log_writes_are_not_counted_as_mutations(seeded):
+    """The spy must flag writes to `agent_memory` and ignore writes to
+    `agent_memory_ops_log` — the pass writes the ledger in every mode, so a
+    regex that confused the two would make the whole suite unfalsifiable in
+    the other direction (permanently red).
+    """
+    pool, ids = seeded["pool"], seeded["ids"]
+    spy = _SpyPool(pool)
+    act = MemoryActivities(db_pool=spy, llm_client=_StubLLM(_merge_plan(ids)))
 
-    assert not hasattr(memory_service, "apply_consolidation")
+    await ActivityEnvironment().run(act.consolidate_agent_memories, _AID, True)
+
+    ledger_writes = [q for q in spy.queries if "agent_memory_ops_log" in q and "INSERT" in q]
+    assert ledger_writes, "dry-run must still write the ops ledger"
+    assert spy.mutations == []
+    # And the regex is not simply never matching: the same verb against the
+    # real table IS caught.
+    assert _MUTATION.search("INSERT INTO agent_memory (agent_id) VALUES ('x')")
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "DELETE FROM agent_memory WHERE agent_id = 'x'",
+        "UPDATE agent_memory SET content = 'x'",
+        "INSERT INTO agent_memory (agent_id) VALUES ('x')",
+        "TRUNCATE agent_memory",
+        "TRUNCATE TABLE public.agent_memory CASCADE",
+        "MERGE INTO agent_memory t USING s ON t.id = s.id",
+        "DROP TABLE agent_memory",
+        "ALTER TABLE agent_memory DROP COLUMN content",
+        "COPY agent_memory FROM STDIN",
+    ],
+)
+def test_mutation_regex_covers_every_destructive_verb(sql):
+    """Issue #201: the A3 regex matched only DELETE/UPDATE/INSERT, so a
+    `TRUNCATE agent_memory` would have sailed past the primary safety net."""
+    assert _MUTATION.search(sql), f"spy would not have caught: {sql}"
+
+
+def test_mutation_regex_ignores_the_ledger_table():
+    assert not _MUTATION.search(
+        "INSERT INTO agent_memory_ops_log (agent_id, op, memory_id) VALUES ($1,$2,$3)"
+    )
+    assert not _MUTATION.search("DELETE FROM agent_memory_ops_log WHERE agent_id = $1")
 
 
 # --------------------------------------------------------------------------

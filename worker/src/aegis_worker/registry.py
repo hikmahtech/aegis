@@ -253,7 +253,13 @@ FLOWS: tuple[FlowSpec, ...] = (
             # enabling consolidation on a live deploy is a deliberate edit on
             # /admin/flows — not something a redeploy turns on.
             consolidate=bool((act["config"] or {}).get("consolidate", False)),
+            # Every A4 rail below fails CLOSED on a missing key: a pre-A4 DB row
+            # has none of them, so an existing deployment picks up dry-run,
+            # the strictest quota and no hard purge without any operator action.
             dry_run=bool((act["config"] or {}).get("dry_run", True)),
+            max_ops_pct=float((act["config"] or {}).get("max_ops_pct", 0.25)),
+            min_age_hours=int((act["config"] or {}).get("min_age_hours", 24)),
+            retire_grace_days=int((act["config"] or {}).get("retire_grace_days", 0)),
         ),
     ),
     FlowSpec(

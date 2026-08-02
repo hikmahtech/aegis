@@ -270,7 +270,14 @@ async def main():
         db_pool=deps.pool,
         knowledge_connector=connectors.get("knowledge"),
     )
-    memory_act = MemoryActivities(db_pool=deps.pool, llm_client=deps.llm, model=model_balanced)
+    # apply_enabled is the environment half of A4's two-key gate: without it,
+    # `dry_run: false` on /admin/flows plans and logs but never writes.
+    memory_act = MemoryActivities(
+        db_pool=deps.pool,
+        llm_client=deps.llm,
+        model=model_balanced,
+        apply_enabled=bool(getattr(settings, "memory_consolidation_apply_enabled", False)),
+    )
     daylog_act = DayLogActivities(
         db_pool=deps.pool,
         llm_client=deps.llm,
