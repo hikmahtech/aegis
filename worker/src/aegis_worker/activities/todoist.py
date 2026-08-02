@@ -71,6 +71,51 @@ def _parse_ts(value: str | None) -> datetime | None:
         return None
 
 
+async def _delete(
+    conn: Any,
+    phase: str,
+    degraded: list[str],
+    sql: str,
+    *args: Any,
+) -> int:
+    """Run one deletion-phase statement in a SAVEPOINT; degrade, don't abort.
+
+    Deletions are the only statements in `apply_sync_diff` that can fail
+    *deterministically*: an FK a given diff can never satisfy fails identically
+    on every replay. Because the `sync_token` advance shares this transaction,
+    letting such a failure propagate rolls back the whole apply, the token
+    never moves, and Todoist re-serves the exact same poisoned diff every 5
+    minutes — the sync is wedged, not flaky. That has now bitten prod twice
+    (2026-05-25, 2026-08-02).
+
+    So deletes degrade: roll back just this statement, keep the stale local
+    row, record the phase, and let the rest of the diff plus the token commit.
+    A stale row is a visible, self-correcting divergence (the next full sync
+    purges it); a jammed sync token is a hard outage needing manual surgery.
+
+    Upserts deliberately do NOT get this treatment — silently dropping an
+    upsert would corrupt the projection with no way to notice.
+
+    Returns the number of rows deleted (0 if the phase degraded).
+    """
+    try:
+        async with conn.transaction():  # nested → SAVEPOINT
+            tag = await conn.execute(sql, *args)
+    except asyncpg.PostgresError as exc:
+        degraded.append(phase)
+        activity.logger.error(
+            "todoist_apply_delete_degraded phase=%s error=%r — stale rows kept so the "
+            "sync_token can still advance",
+            phase,
+            exc,
+        )
+        return 0
+    try:
+        return int(str(tag).rsplit(" ", 1)[-1])
+    except ValueError:
+        return 0
+
+
 @dataclass
 class TodoistActivities:
     """Pool + connector are injected. db_pool may be None in unit tests that
@@ -104,6 +149,10 @@ class TodoistActivities:
 
         is_full_sync = bool(diff.get("full_sync", False))
 
+        # Delete phases that had to be rolled back (see `_delete`). Surfaced in
+        # the return value so workflow_runs.result_summary shows the divergence.
+        degraded: list[str] = []
+
         async with self.db_pool.acquire() as conn:  # noqa: SIM117
             async with conn.transaction():
                 # Full-sync snapshot: Todoist sends every live resource in
@@ -116,15 +165,24 @@ class TodoistActivities:
                     snapshot_item_ids = [it["id"] for it in items if it.get("id")]
                     snapshot_note_ids = [n["id"] for n in notes if n.get("id")]
                     # Order matters: notes → items → labels → projects (FK).
-                    await conn.execute(
+                    await _delete(
+                        conn,
+                        "full_sync_purge_notes",
+                        degraded,
                         "DELETE FROM todoist_notes WHERE id <> ALL($1::text[])",
                         snapshot_note_ids,
                     )
-                    await conn.execute(
+                    await _delete(
+                        conn,
+                        "full_sync_purge_tasks",
+                        degraded,
                         "DELETE FROM todoist_tasks WHERE id <> ALL($1::text[])",
                         snapshot_item_ids,
                     )
-                    await conn.execute(
+                    await _delete(
+                        conn,
+                        "full_sync_purge_labels",
+                        degraded,
                         "DELETE FROM todoist_labels WHERE id <> ALL($1::text[])",
                         snapshot_label_ids,
                     )
@@ -132,7 +190,10 @@ class TodoistActivities:
                     # markers from bootstrap. Preserve them even if the
                     # snapshot didn't include them (Todoist's "show me
                     # everything" can be filtered by archive state).
-                    await conn.execute(
+                    await _delete(
+                        conn,
+                        "full_sync_purge_projects",
+                        degraded,
                         "DELETE FROM todoist_projects "
                         "WHERE id <> ALL($1::text[]) AND is_managed = false",
                         snapshot_proj_ids,
@@ -208,7 +269,10 @@ class TodoistActivities:
                         lab,
                     )
                 if deleted_label_ids:
-                    await conn.execute(
+                    await _delete(
+                        conn,
+                        "labels",
+                        degraded,
                         "DELETE FROM todoist_labels WHERE id = ANY($1::text[])",
                         deleted_label_ids,
                     )
@@ -365,11 +429,17 @@ class TodoistActivities:
                     )
                 if deleted_item_ids:
                     # Cascade through notes first.
-                    await conn.execute(
+                    await _delete(
+                        conn,
+                        "item_notes",
+                        degraded,
                         "DELETE FROM todoist_notes WHERE item_id = ANY($1::text[])",
                         deleted_item_ids,
                     )
-                    await conn.execute(
+                    await _delete(
+                        conn,
+                        "items",
+                        degraded,
                         "DELETE FROM todoist_tasks WHERE id = ANY($1::text[])",
                         deleted_item_ids,
                     )
@@ -432,7 +502,10 @@ class TodoistActivities:
                             item_id,
                         )
                 if deleted_note_ids:
-                    await conn.execute(
+                    await _delete(
+                        conn,
+                        "notes",
+                        degraded,
                         "DELETE FROM todoist_notes WHERE id = ANY($1::text[])",
                         deleted_note_ids,
                     )
@@ -443,8 +516,82 @@ class TodoistActivities:
                 # Managed projects are preserved even if Todoist says they're
                 # gone (the user may have archived them and we want the
                 # projection to retain history).
+                #
+                # That deferral is NOT enough on its own. Todoist's incremental
+                # sync reports a deleted project as `is_deleted` on the PROJECT
+                # only — it does not emit per-item deletes for the tasks that
+                # lived inside it; clients are expected to cascade. So the
+                # items pass sees nothing and the pre-existing local task rows
+                # keep referencing the doomed project. Prod 2026-08-02: project
+                # `6h2fmwpmjgrh8m4x` deleted with 48 local tasks still pointing
+                # at it → todoist_tasks_project_id_fkey → whole txn rolled back
+                # → sync_token frozen → the identical diff replayed every 5 min.
+                #
+                # Semantics: the tasks are gone upstream too (a deleted Todoist
+                # project takes its items with it, and a later full sync would
+                # purge them anyway), so mirroring the deletion locally is the
+                # correct projection — keeping them would leave GTD clarify,
+                # /whats-next and review surfacing phantom work that no longer
+                # exists and can no longer be written to. gtd_clarify_log has no
+                # FK to todoist_tasks, so the clarify audit trail survives.
                 if deleted_project_ids:
-                    await conn.execute(
+                    # Only cascade under projects we will ACTUALLY delete —
+                    # managed projects are preserved, so their tasks must be too.
+                    doomed = [
+                        r["id"]
+                        for r in await conn.fetch(
+                            "SELECT id FROM todoist_projects "
+                            "WHERE id = ANY($1::text[]) AND is_managed = false",
+                            deleted_project_ids,
+                        )
+                    ]
+                    if doomed:
+                        # Surviving tasks elsewhere that hang off a doomed task
+                        # get re-parented to top level rather than dropped —
+                        # same policy as the orphan-parent guard in the items
+                        # pass, and it keeps todoist_tasks_parent_id_fkey happy.
+                        await _delete(
+                            conn,
+                            "project_cascade_reparent",
+                            degraded,
+                            "UPDATE todoist_tasks SET parent_id = NULL "
+                            "WHERE parent_id IN ("
+                            "  SELECT id FROM todoist_tasks "
+                            "  WHERE project_id = ANY($1::text[])"
+                            ") AND (project_id IS NULL OR project_id <> ALL($1::text[]))",
+                            doomed,
+                        )
+                        # Children before parents: notes → tasks → project.
+                        # todoist_notes.item_id has an FK with no ON DELETE
+                        # CASCADE, so skipping this just swaps one FK violation
+                        # for another.
+                        await _delete(
+                            conn,
+                            "project_cascade_notes",
+                            degraded,
+                            "DELETE FROM todoist_notes WHERE item_id IN ("
+                            "  SELECT id FROM todoist_tasks "
+                            "  WHERE project_id = ANY($1::text[])"
+                            ")",
+                            doomed,
+                        )
+                        cascaded_tasks = await _delete(
+                            conn,
+                            "project_cascade_tasks",
+                            degraded,
+                            "DELETE FROM todoist_tasks WHERE project_id = ANY($1::text[])",
+                            doomed,
+                        )
+                        if cascaded_tasks:
+                            activity.logger.info(
+                                "todoist_project_delete_cascade projects=%d tasks_deleted=%d",
+                                len(doomed),
+                                cascaded_tasks,
+                            )
+                    await _delete(
+                        conn,
+                        "projects",
+                        degraded,
                         "DELETE FROM todoist_projects "
                         "WHERE id = ANY($1::text[]) AND is_managed = false",
                         deleted_project_ids,
@@ -466,17 +613,19 @@ class TodoistActivities:
                     )
 
         activity.logger.info(
-            "todoist_apply_sync_diff projects=%d labels=%d items=%d notes=%d",
+            "todoist_apply_sync_diff projects=%d labels=%d items=%d notes=%d degraded=%s",
             len(projects),
             len(labels),
             len(items),
             len(notes),
+            ",".join(degraded) or "none",
         )
         return {
             "projects_upserted": len(projects),
             "labels_upserted": len(labels),
             "tasks_upserted": len(items),
             "notes_upserted": len(notes),
+            "degraded_deletes": degraded,
         }
 
     @activity.defn
