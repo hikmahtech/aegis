@@ -14,6 +14,7 @@ from aegis.connectors.social import SocialConnector
 from aegis.crypto import decrypt_secret, encrypt_secret
 from aegis_worker.activities.delivery import DeliveryActivities
 from aegis_worker.activities.social import (
+    CLOSE_ACTION,
     STUCK_ALERT_ACTION,
     STUCK_MUTE_PREFIX,
     STUCK_RECOVERY_ACTION,
@@ -450,6 +451,13 @@ async def test_complete_posted_tasks_enqueues_item_complete_once(social_env):
 
 
 async def test_complete_posted_tasks_waits_for_all_platforms(social_env):
+    """The unposted-row guard, with the missing-platform guard held OPEN.
+
+    Both accounts are on platform `x`, so `posted_platforms` already covers
+    every intended+connected platform and `missing` is empty — the still-pending
+    row is the ONLY thing that can stop the closure here (#135: the two guards
+    must each be provable alone).
+    """
     a1 = await _seed_account(social_env, label="one")
     a2 = await _seed_account(social_env, label="two")
     await _seed_task(social_env, "soctest-partial", ["publish", "x"])
@@ -461,7 +469,90 @@ async def test_complete_posted_tasks_waits_for_all_platforms(social_env):
         a2,
     )
     act = SocialActivities(db_pool=social_env)
-    assert (await ActivityEnvironment().run(act.complete_posted_tasks))["completed"] == 0
+    assert await ActivityEnvironment().run(act.complete_posted_tasks) == {
+        "completed": 0,
+        "blocked": 1,
+    }
+
+
+# --------------------------------------------------- closure reporting (#135)
+
+
+async def test_complete_reports_blocked_for_a_terminally_failed_post(social_env):
+    """A task wedged behind an exhausted-retry post is BLOCKED, not invisible.
+
+    #135's whole difficulty was that `completed: 0` meant both "nothing to do"
+    and "everything is stuck". The old `HAVING count(*) FILTER (WHERE status <>
+    'posted') = 0` deleted this row in SQL, so it never reached Python: no
+    counter, no log line, no distinction. Closure itself must still NOT happen —
+    the post never went out.
+    """
+    a1 = await _seed_account(social_env, platform="x", label="one")
+    a2 = await _seed_account(social_env, platform="linkedin", label="two")
+    await _seed_task(social_env, "soctest-zz135-failed", ["publish", "x", "linkedin"])
+    await social_env.execute(
+        "INSERT INTO social_outbox (todoist_task_id, account_id, payload, status, "
+        "attempt_count) VALUES "
+        "('soctest-zz135-failed', $1, '{}'::jsonb, 'posted', 1), "
+        "('soctest-zz135-failed', $2, '{}'::jsonb, 'failed', 5)",
+        a1,
+        a2,
+    )
+    act = SocialActivities(db_pool=social_env)
+    assert await ActivityEnvironment().run(act.complete_posted_tasks) == {
+        "completed": 0,
+        "blocked": 1,
+    }
+    assert await social_env.fetchval(
+        "SELECT count(*) FROM todoist_outbox "
+        "WHERE temp_id = 'social-complete-soctest-zz135-failed'"
+    ) == 0
+
+
+async def test_complete_writes_exactly_one_audit_row_per_closure(social_env):
+    """`audit_log` is the durable proof a @publish task was closed.
+
+    In production the closure is performed by `apply_social_approval` seconds
+    after the post; InteractionFlow discards that activity's result, so no flow
+    summary anywhere ever carried a non-zero count — which is exactly how #135
+    concluded from 6,743 `completed: 0` runs that closure never happened. The
+    audit row is written by whichever path wins the ON CONFLICT, so it is
+    exactly-once regardless of who closed the task.
+    """
+    await social_env.execute(
+        "DELETE FROM audit_log WHERE action = $1 AND target_id LIKE 'soctest-zz135-%'",
+        CLOSE_ACTION,
+    )
+    account_id = await _seed_account(social_env, platform="x")
+    await _seed_task(social_env, "soctest-zz135-audit", ["publish", "x"])
+    await social_env.execute(
+        "INSERT INTO social_outbox (todoist_task_id, account_id, payload, status, posted_ref) "
+        "VALUES ('soctest-zz135-audit', $1, '{}'::jsonb, 'posted', 'ref-a')",
+        account_id,
+    )
+    act = SocialActivities(db_pool=social_env)
+    env = ActivityEnvironment()
+    assert await env.run(act.complete_posted_tasks) == {"completed": 1, "blocked": 0}
+    row = await social_env.fetchrow(
+        "SELECT actor, target_type, target_id, details FROM audit_log "
+        "WHERE action = $1 AND target_id = 'soctest-zz135-audit'",
+        CLOSE_ACTION,
+    )
+    assert row is not None
+    assert (row["actor"], row["target_type"]) == ("social-publish", "todoist_task")
+    details = row["details"] if isinstance(row["details"], dict) else json.loads(row["details"])
+    assert details["posted_platforms"] == ["x"]
+
+    # Re-run: the ON CONFLICT no-op must not mint a second audit row.
+    assert await env.run(act.complete_posted_tasks) == {"completed": 0, "blocked": 0}
+    assert await social_env.fetchval(
+        "SELECT count(*) FROM audit_log WHERE action = $1 AND target_id = 'soctest-zz135-audit'",
+        CLOSE_ACTION,
+    ) == 1
+    await social_env.execute(
+        "DELETE FROM audit_log WHERE action = $1 AND target_id LIKE 'soctest-zz135-%'",
+        CLOSE_ACTION,
+    )
 
 
 # ---------------------------------------------------------------- approval hook
@@ -478,7 +569,18 @@ async def test_apply_social_approval_approve_posts_and_completes(social_env):
         {"value": "approve"},
         {"task_id": "soctest-appr", "platforms": ["x"], "text": "hi", "link": ""},
     )
-    assert result == {"applied": "approved"}
+    # #135: the hook used to answer a bare {"applied": "approved"} and drop the
+    # enqueue/drain/complete counts, which is why a closure done HERE (the only
+    # place it is ever done in prod) left no number anywhere.
+    assert result == {
+        "applied": "approved",
+        "queued": 1,
+        "missing_accounts": [],
+        "posted": 1,
+        "post_failed": 0,
+        "completed": 1,
+        "blocked": 0,
+    }
     assert fake.calls and fake.calls[0][1]["text"] == "hi"
     status = await social_env.fetchval(
         "SELECT status FROM social_outbox WHERE todoist_task_id = 'soctest-appr'"
@@ -506,7 +608,7 @@ async def test_apply_social_approval_rereads_current_due_over_stale_snapshot(soc
         {"task_id": "soctest-moved", "platforms": ["x"], "text": "hi", "link": "",
          "post_at": stale},
     )
-    assert result == {"applied": "approved"}
+    assert result["applied"] == "approved"
     payload = fake.calls[0][1]
     assert payload["schedule_at"] == f"{current_due}+00:00"  # user_tz=UTC in fixture
 
@@ -549,7 +651,9 @@ async def test_apply_social_approval_missing_account_comments_and_still_complete
         {"value": "approve"},
         {"task_id": "soctest-miss", "platforms": ["x", "linkedin"], "text": "hi", "link": ""},
     )
-    assert result == {"applied": "approved"}
+    assert result["applied"] == "approved"
+    assert result["missing_accounts"] == ["linkedin"]
+    assert (result["completed"], result["blocked"]) == (1, 0)
     # x posted…
     assert await social_env.fetchval(
         "SELECT status FROM social_outbox WHERE todoist_task_id = 'soctest-miss'"
@@ -571,7 +675,12 @@ async def test_apply_social_approval_missing_account_comments_and_still_complete
 async def test_complete_still_waits_for_a_connected_platform_that_has_not_posted(social_env):
     """The relaxation above must NOT swallow a platform that IS connected and
     simply hasn't gone out yet — otherwise a task closes while a real channel
-    is still pending, which is the opposite failure."""
+    is still pending, which is the opposite failure.
+
+    The missing-platform guard, with the unposted-row guard held OPEN: every
+    outbox row this task HAS is posted, so `unposted_rows` is 0 and only the
+    absent linkedin row can block it (#135).
+    """
     x_account = await _seed_account(social_env, platform="x")
     await _seed_account(social_env, platform="linkedin")  # connected, no outbox row
     await _seed_task(social_env, "soctest-halfposted", ["publish", "x", "linkedin"])
@@ -581,7 +690,10 @@ async def test_complete_still_waits_for_a_connected_platform_that_has_not_posted
         x_account,
     )
     act = SocialActivities(db_pool=social_env)
-    assert (await ActivityEnvironment().run(act.complete_posted_tasks))["completed"] == 0
+    assert await ActivityEnvironment().run(act.complete_posted_tasks) == {
+        "completed": 0,
+        "blocked": 1,
+    }
     assert await social_env.fetchval(
         "SELECT count(*) FROM todoist_outbox WHERE temp_id = 'social-complete-soctest-halfposted'"
     ) == 0

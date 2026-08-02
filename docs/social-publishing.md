@@ -26,6 +26,19 @@ Implementation deviations from the plan below (each for a concrete reason):
 - **Skip strips the `@publish` label** (via todoist_outbox + optimistic projection
   update) instead of doing nothing — a plain "do nothing" would re-card the still-due
   task every 5 minutes. Re-adding the label re-arms the post.
+- **Do NOT read task closure off `SocialPublishFlow.result_summary`.** Because the
+  hook above does enqueue→post→complete seconds after approval, the scheduled tick
+  finds nothing left to do: `drain_posted: 0` and `completed: 0` are what a *healthy*
+  system reports, forever (#135 mistook 6,743 such runs for a dead feature). Two
+  keys tell you the truth instead:
+  - `blocked` in the run summary — open tasks that have outbox rows and still
+    cannot close (a row not yet `posted`, incl. a terminally `failed` one, or a
+    connected labeled platform with no posted row). `completed: 0, blocked: 0` is
+    idle-and-healthy; `blocked > 0` is the thing to investigate, and each one logs
+    `social_complete_blocked task_id=… unposted=… failed=… missing=…`.
+  - `audit_log` — one `social_task_closed` row per closure, written by whichever
+    path won, so `SELECT count(*) FROM audit_log WHERE action = 'social_task_closed'`
+    is the durable answer to "has AEGIS ever closed a @publish task?".
 
 ## Postiz mode
 
