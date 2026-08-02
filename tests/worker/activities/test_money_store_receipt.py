@@ -3,8 +3,37 @@
 from __future__ import annotations
 
 import pytest
+import pytest_asyncio
 from aegis_worker.activities.money import MoneyActivities
 from temporalio.testing import ActivityEnvironment
+
+
+@pytest_asyncio.fixture(autouse=True, loop_scope="function")
+async def _drop_receipts_on_exit(test_db_url):
+    """Teardown, not just setup-time cleanup — see the sibling note in
+    test_money_bundle_e.py. `finance.receipt_email` is read agent-agnostically
+    by ProfileReflectionActivities._evidence_finance, so a recent leftover
+    row makes another file's "quiet week" assertion fail depending on how
+    `--dist loadfile` happened to shard the suite.
+
+    Takes its own connection off the session-scoped `test_db_url` rather than
+    borrowing the `db_pool` fixture: db_pool is function-scoped and would be
+    closed before this teardown runs, and depending on it would force the
+    no-Postgres tests in this file to require a database.
+    """
+    yield
+    if test_db_url is None:
+        return
+    import asyncpg
+
+    conn = await asyncpg.connect(test_db_url)
+    try:
+        await conn.execute(
+            "DELETE FROM finance.receipt_email "
+            "WHERE message_id LIKE 'rt-%' OR message_id LIKE 'stuck-%'"
+        )
+    finally:
+        await conn.close()
 
 
 def _make_act(db_pool):

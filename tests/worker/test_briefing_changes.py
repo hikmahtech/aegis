@@ -51,7 +51,23 @@ async def _seeded(db_pool):
             "(service_name, stack_name, drift_type, expected, actual, severity, alert_key, detected_at) "
             "VALUES ('brchg-svc', 'test', 'config', '{}'::jsonb, '{}'::jsonb, 'warning', 'brchg-svc-key', now()-interval '1 hour')"
         )
-    return db_pool
+    yield db_pool
+    # Teardown is load-bearing, not tidiness. `settings` is a GLOBAL key-value
+    # table with no agent scoping, and `calendar_events_test` is read by any
+    # code that sweeps `key LIKE 'calendar_events_%'` — including
+    # ProfileReflectionActivities._evidence_calendar. Leaving the row behind
+    # made another file's "a quiet week sends nothing" test see evidence and
+    # card instead of skipping, but only when pytest-xdist's `--dist loadfile`
+    # happened to put the two files on the same worker. The `brchg-%` rows
+    # below are prefix-scoped and already re-cleaned on setup; these two KV
+    # singletons were the ones that escaped.
+    async with db_pool.acquire() as conn:
+        await conn.execute("DELETE FROM settings WHERE key LIKE 'calendar_events_%'")
+        await conn.execute("DELETE FROM settings WHERE key = 'briefing_state'")
+        await conn.execute("DELETE FROM workflow_runs WHERE run_id LIKE 'brchg-%'")
+        await conn.execute(
+            "DELETE FROM pandoras_actor.homelab_drift WHERE service_name LIKE 'brchg-%'"
+        )
 
 
 def _kc(intel=None, contradictions=3):
