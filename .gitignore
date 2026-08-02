@@ -26,6 +26,10 @@ config/.env
 # Claude Code
 .claude/
 .claire/
+# CLAUDE.md is this repo's contributor/agent instruction sheet and IS tracked.
+# Many developers ignore `CLAUDE.md` globally (~/.gitignore_global); this
+# negation overrides that for this repo only. Do not "tidy" it away.
+!CLAUDE.md
 
 # Worktrees
 .worktrees/
