@@ -5,10 +5,14 @@ post_resolve hook: it applies the user's card choice (approve → enqueue +
 post immediately; skip → strip the publish label so the task stops
 re-carding). The scheduled flow's own drain/complete steps are the retry
 safety net for anything the hook attempt left behind.
+
+Also carries the **stuck-post watchdog** (#225) that SocialMetricsFlow runs
+right after the metrics refresh — see the block above `find_stuck_posts`.
 """
 
 from __future__ import annotations
 
+import html as _html
 import re
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -17,6 +21,8 @@ from typing import Any
 import asyncpg
 from aegis.connectors.todoist import TodoistConnector
 from temporalio import activity
+
+from aegis_worker.activities.delivery import safe_send_message
 
 _MAX_ATTEMPTS = 5  # mirror todoist_outbox semantics
 
@@ -27,6 +33,115 @@ _MAX_ATTEMPTS = 5  # mirror todoist_outbox semantics
 # needs a real URL. Normalize once here, at ingest, so every downstream
 # transport sees a bare link (#114).
 _MD_LINK_RE = re.compile(r"\[([^\]]+)\]\((https?://\S+?)\)")
+
+# ---------------------------------------------------------------------------
+# stuck-post watchdog (#225) — constants
+# ---------------------------------------------------------------------------
+
+#: `audit_log` actions/target — the dedup substrate, same as
+#: `FlowHealthActivities` (issue #226). `alert_dedup_index` is deliberately NOT
+#: used: its `task_id` is NOT NULL and joined against `todoist_tasks`, and this
+#: watchdog notifies with a plain chat card, not a @pandora task.
+STUCK_ALERT_ACTION = "social_stuck_alert"
+STUCK_RECOVERY_ACTION = "social_stuck_recovered"
+STUCK_TARGET_TYPE = "social_post"
+#: `alert_mutes.mute_key` prefix — silence one known-stuck post with
+#: `INSERT INTO alert_mutes (mute_key, muted_until) VALUES ('social-stuck:<postiz id>', ...)`.
+STUCK_MUTE_PREFIX = "social-stuck:"
+STUCK_ACTOR = "social-stuck-watchdog"
+
+#: The only Postiz state that means "this post actually went out". Everything
+#: else past its `schedule_at` — QUEUE, ERROR, DRAFT, or the `unknown` we write
+#: when Postiz doesn't return the post at all — counts as stuck.
+#:
+#: Deliberately a denylist of one. The 2026-07-29→08-02 outage (four days, no
+#: post published, nothing alerted) went unseen partly because three of the
+#: seven stuck rows had aged into `unknown` rather than `QUEUE`: a QUEUE-only
+#: rule stays silent on them. Only a positive publish confirmation is
+#: reassuring; anything else past due is worth one card.
+PUBLISHED_STATE = "PUBLISHED"
+
+# `payload->>'schedule_at'` is free text — `enqueue_outbox` writes an ISO
+# timestamp, but "" is possible and `POST /api/social/publish` copies the value
+# straight out of the request body. A bare `::timestamptz` on a malformed value
+# aborts the WHOLE statement, which would take out the metrics refresh AND this
+# watchdog — precisely the silent-failure class this change exists to remove.
+# `pg_input_is_valid` (Postgres 16) turns a bad value into NULL instead.
+_SCHEDULE_AT = (
+    "CASE WHEN pg_input_is_valid(o.payload->>'schedule_at', 'timestamptz') "
+    "THEN (o.payload->>'schedule_at')::timestamptz END"
+)
+
+_STUCK_SQL = f"""
+SELECT o.id,
+       o.posted_ref,
+       o.todoist_task_id,
+       a.platform,
+       a.label,
+       s.sched,
+       o.metrics->>'state' AS state,
+       o.metrics_at,
+       left(coalesce(o.payload->>'text', ''), 120) AS preview
+FROM social_outbox o
+JOIN social_accounts a ON a.id = o.account_id
+CROSS JOIN LATERAL (SELECT {_SCHEDULE_AT} AS sched) s
+WHERE o.status = 'posted'
+  AND o.posted_ref IS NOT NULL
+  AND a.meta ? 'postiz_integration_id'
+  AND s.sched IS NOT NULL
+  AND s.sched < now() - make_interval(hours => $1)
+  AND coalesce(o.metrics->>'state', '') <> '{PUBLISHED_STATE}'
+ORDER BY s.sched DESC
+LIMIT $2
+"""
+
+# Resolved-aware dedup, mirroring `flow_health._SUPPRESSED_SQL`/`_OPEN_SQL`: an
+# alert suppresses the next one only while no recovery row was written after it,
+# so a post that gets stuck, publishes, and gets stuck again alerts twice.
+_STUCK_SUPPRESSED_SQL = f"""
+SELECT DISTINCT a.target_id
+FROM audit_log a
+WHERE a.action = '{STUCK_ALERT_ACTION}'
+  AND a.target_type = '{STUCK_TARGET_TYPE}'
+  AND a.target_id = ANY($1::text[])
+  AND a.created_at > now() - make_interval(hours => $2)
+  AND NOT EXISTS (
+      SELECT 1 FROM audit_log r
+      WHERE r.action = '{STUCK_RECOVERY_ACTION}'
+        AND r.target_type = '{STUCK_TARGET_TYPE}'
+        AND r.target_id = a.target_id
+        AND r.created_at > a.created_at
+  )
+"""
+
+_STUCK_OPEN_SQL = f"""
+SELECT DISTINCT a.target_id
+FROM audit_log a
+WHERE a.action = '{STUCK_ALERT_ACTION}'
+  AND a.target_type = '{STUCK_TARGET_TYPE}'
+  AND a.created_at > now() - make_interval(hours => $1)
+  AND NOT EXISTS (
+      SELECT 1 FROM audit_log r
+      WHERE r.action = '{STUCK_RECOVERY_ACTION}'
+        AND r.target_type = '{STUCK_TARGET_TYPE}'
+        AND r.target_id = a.target_id
+        AND r.created_at > a.created_at
+  )
+"""
+
+
+def _stuck_card(title: str, body: str) -> str:
+    return f"<b>{_html.escape(title)}</b>\n{_html.escape(body)}"
+
+
+def _describe_stuck(finding: dict) -> str:
+    return (
+        f"  {finding.get('platform', '?')}/{finding.get('label', '?')} "
+        f"post {finding.get('subject', '?')}: due {finding.get('schedule_at', '?')}, "
+        f"Postiz state {finding.get('state') or 'missing'} "
+        f"({finding.get('overdue_hours', '?')}h overdue)\n"
+        f"    {str(finding.get('preview') or '')[:120]}"
+    )
 
 
 def _normalize_link(text: str, link: str) -> tuple[str, str]:
@@ -56,10 +171,12 @@ def _normalize_link(text: str, link: str) -> tuple[str, str]:
 @dataclass
 class SocialActivities:
     """db_pool may be None in unit tests that only exercise pure branches;
-    connector is the SocialConnector (None in tests that don't post)."""
+    connector is the SocialConnector (None in tests that don't post);
+    delivery is DeliveryActivities, used only by the stuck-post watchdog."""
 
     db_pool: asyncpg.Pool | None
     connector: Any = None
+    delivery: Any = None
 
     async def _setting(self, key: str, default):
         if self.db_pool is None:
@@ -444,7 +561,9 @@ class SocialActivities:
         return {"applied": "none"}
 
     @activity.defn
-    async def refresh_post_metrics(self, window_days: int = 14) -> dict:
+    async def refresh_post_metrics(
+        self, window_days: int = 14, lookahead_days: int = 45, max_rows: int = 200
+    ) -> dict:
         """Pull Postiz analytics for recently-posted rows into social_outbox.metrics.
 
         Only Postiz-routed accounts are touched (native X posts have no
@@ -452,6 +571,27 @@ class SocialActivities:
         social_publishing_enabled is false — this only refreshes metrics on
         rows that are ALREADY posted, it doesn't gate on the publishing kill
         switch, so SocialMetricsFlow needs no such gate either.
+
+        `lookahead_days` bounds the forward half of the Postiz `GET /posts`
+        window. It used to be a hardcoded **1 day**, which meant every post
+        scheduled further out than tomorrow was absent from the response and
+        fell through to `state: "unknown"` — 31 of prod's 35 unknown rows on
+        2026-08-02 were simply future-scheduled, so `unknown` carried no
+        information and nothing could be built on it (#225). 45 days covers the
+        longest real campaign (the book launch runs Aug 2 → Aug 31, 30 days)
+        with ~50% headroom for a calendar authored a couple of weeks ahead of
+        its first slot. `GET /posts` is one unpaginated call (~70 posts today),
+        so the wider window costs nothing.
+
+        Eligibility is `created_at` recency **or** a `schedule_at` that is still
+        ahead / recently past. The old `created_at`-only filter aged long-lead
+        posts out of monitoring before they published: three prod rows created
+        2026-07-15 were frozen at a 2026-07-29 snapshot and would never have
+        refreshed again.
+
+        `max_rows` bounds the per-pass Postiz analytics calls, one per row.
+        Hitting it is logged loudly — silent truncation is how a stuck post
+        would slip past the watchdog that reads what this writes.
         """
         if self.db_pool is None or self.connector is None:
             return {"refreshed": 0, "failed": 0}
@@ -461,7 +601,7 @@ class SocialActivities:
         try:
             posts = await self.connector.list_posts_window(
                 (now - timedelta(days=window_days)).isoformat(),
-                (now + timedelta(days=1)).isoformat(),
+                (now + timedelta(days=lookahead_days)).isoformat(),
             )
             for p in posts:
                 pid = str(p.get("id") or "")
@@ -478,19 +618,29 @@ class SocialActivities:
             activity.logger.warning("social_list_posts_window_failed err=%s", str(exc)[:200])
 
         rows = await self.db_pool.fetch(
-            """
+            f"""
             SELECT o.id, o.posted_ref
             FROM social_outbox o
             JOIN social_accounts a ON a.id = o.account_id
             WHERE o.status = 'posted'
               AND o.posted_ref IS NOT NULL
-              AND o.created_at > now() - make_interval(days => $1)
               AND a.meta ? 'postiz_integration_id'
+              AND (
+                    o.created_at > now() - make_interval(days => $1)
+                    OR {_SCHEDULE_AT} > now() - make_interval(days => $1)
+                  )
             ORDER BY o.created_at DESC
-            LIMIT 50
+            LIMIT $2
             """,
             window_days,
+            max_rows,
         )
+        if len(rows) >= max_rows:
+            activity.logger.warning(
+                "social_refresh_post_metrics_truncated max_rows=%d — eligible rows were "
+                "dropped this pass; raise SocialMetricsFlow's max_rows",
+                max_rows,
+            )
 
         refreshed = failed = 0
         for r in rows:
@@ -522,3 +672,157 @@ class SocialActivities:
             "social_refresh_post_metrics refreshed=%d failed=%d", refreshed, failed
         )
         return {"refreshed": refreshed, "failed": failed}
+
+    # -- stuck-post watchdog (#225) ----------------------------------------
+
+    @activity.defn
+    async def find_stuck_posts(self, overdue_hours: int = 6, limit: int = 50) -> list[dict]:
+        """Postiz-routed posts past their `schedule_at` that Postiz never published.
+
+        Runs immediately after `refresh_post_metrics` inside SocialMetricsFlow,
+        so `metrics.state` is the state Postiz reported seconds ago — checking a
+        day-old snapshot would be checking nothing.
+
+        `overdue_hours` is a false-positive margin, not a detection budget: the
+        flow is daily, so latency is set by the schedule either way. Its job is
+        to absorb the skew between AEGIS's intended `schedule_at` (a Todoist due
+        time) and Postiz's own publish + analytics lag. 6h is comfortably longer
+        than any observed skew (seconds) and comfortably shorter than the 24h
+        cadence, so nothing that came due since the previous run can slip
+        through the gap.
+
+        A row with no parseable `schedule_at` is skipped rather than guessed —
+        "overdue" is undefined without a due time, and guessing would either
+        alert forever or never.
+
+        Returns [] (never raises) when there is no pool.
+        """
+        if self.db_pool is None:
+            return []
+        rows = await self.db_pool.fetch(_STUCK_SQL, overdue_hours, limit)
+        now = datetime.now(UTC)
+        out = [
+            {
+                # The Postiz post id: unique per outbox row, and the thing an
+                # operator pastes into Postiz to look the post up. It is the
+                # audit/mute subject, so mutes read `social-stuck:<postiz id>`.
+                "subject": str(r["posted_ref"]),
+                "outbox_id": r["id"],
+                "todoist_task_id": r["todoist_task_id"],
+                "platform": r["platform"],
+                "label": r["label"],
+                "schedule_at": r["sched"].isoformat(),
+                "overdue_hours": int((now - r["sched"]).total_seconds() // 3600),
+                "state": r["state"],
+                "metrics_at": r["metrics_at"].isoformat() if r["metrics_at"] else None,
+                "preview": r["preview"],
+            }
+            for r in rows
+        ]
+        activity.logger.info("social_find_stuck_posts found=%d", len(out))
+        return out
+
+    @activity.defn
+    async def report_stuck_posts(
+        self,
+        findings: list[dict],
+        agent_id: str = "sebas",
+        dedup_hours: int = 168,
+        recovery_hours: int = 720,
+    ) -> dict:
+        """Notify about NEW stuck posts, and about posts that finally published.
+
+        One chat card per run, not one per post. A subject already alerted
+        within `dedup_hours` with no recovery since is silent, so a post wedged
+        for a week produces one alert, not seven. `dedup_hours` defaults above
+        the flow's own 24h cadence — a shorter window would not dedup at all.
+
+        Must be called even when `findings` is empty: that is exactly when the
+        recovery notice fires, and the recovery row is what re-arms dedup.
+        """
+        result = {"alerted": 0, "deduped": 0, "muted": 0, "recovered": 0}
+        if self.db_pool is None:
+            return result
+
+        subjects = [s for s in (str(f.get("subject") or "") for f in findings) if s]
+
+        async with self.db_pool.acquire() as conn:
+            muted: set[str] = set()
+            suppressed: set[str] = set()
+            if subjects:
+                muted = {
+                    row["mute_key"][len(STUCK_MUTE_PREFIX) :]
+                    for row in await conn.fetch(
+                        "SELECT mute_key FROM alert_mutes "
+                        "WHERE mute_key = ANY($1::text[]) AND muted_until > now()",
+                        [STUCK_MUTE_PREFIX + s for s in subjects],
+                    )
+                }
+                suppressed = {
+                    row["target_id"]
+                    for row in await conn.fetch(_STUCK_SUPPRESSED_SQL, subjects, dedup_hours)
+                }
+            open_subjects = {
+                row["target_id"] for row in await conn.fetch(_STUCK_OPEN_SQL, recovery_hours)
+            }
+
+        fresh = [
+            f
+            for f in findings
+            if f.get("subject")
+            and f["subject"] not in muted
+            and f["subject"] not in suppressed
+        ]
+        result["muted"] = sum(1 for f in findings if f.get("subject") in muted)
+        result["deduped"] = sum(1 for f in findings if f.get("subject") in suppressed)
+
+        if fresh:
+            body = (
+                "Postiz accepted these posts but never published them:\n"
+                + "\n".join(_describe_stuck(f) for f in fresh)
+                + "\n\nCheck Postiz first: a stalled orchestrator shows 0 pollers on "
+                "`temporal task-queue describe --task-queue main`. "
+                "`docker service update --force postiz_postiz` revives it — reschedule "
+                "overdue posts BEFORE reviving or they all publish at once.\n"
+                f"Silence one: INSERT INTO alert_mutes (mute_key, muted_until) "
+                f"VALUES ('{STUCK_MUTE_PREFIX}<postiz post id>', now() + interval '2 days');"
+            )
+            await safe_send_message(
+                self.delivery,
+                agent_id=agent_id,
+                message=_stuck_card(f"[SOCIAL] {len(fresh)} post(s) stuck in Postiz", body),
+                log_event="social_stuck_notify_failed",
+            )
+            await self._audit_stuck(STUCK_ALERT_ACTION, fresh)
+            result["alerted"] = len(fresh)
+
+        recovered = sorted(open_subjects - set(subjects))
+        if recovered:
+            await safe_send_message(
+                self.delivery,
+                agent_id=agent_id,
+                message=_stuck_card(
+                    f"[SOCIAL OK] {len(recovered)} post(s) published",
+                    "No longer stuck:\n" + "\n".join(f"  {s}" for s in recovered),
+                ),
+                log_event="social_stuck_recovery_notify_failed",
+            )
+            await self._audit_stuck(
+                STUCK_RECOVERY_ACTION, [{"subject": s, "state": "recovered"} for s in recovered]
+            )
+            result["recovered"] = len(recovered)
+
+        return result
+
+    async def _audit_stuck(self, action: str, findings: list[dict]) -> None:
+        from aegis.observability import log_audit
+
+        for f in findings:
+            await log_audit(
+                self.db_pool,
+                actor=STUCK_ACTOR,
+                action=action,
+                target_type=STUCK_TARGET_TYPE,
+                target_id=str(f["subject"]),
+                details={k: v for k, v in f.items() if k != "subject"},
+            )

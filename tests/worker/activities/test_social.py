@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 import json
 from datetime import UTC, datetime, timedelta
 
@@ -11,7 +12,14 @@ import respx
 from aegis.config import Settings
 from aegis.connectors.social import SocialConnector
 from aegis.crypto import decrypt_secret, encrypt_secret
-from aegis_worker.activities.social import SocialActivities, _normalize_link
+from aegis_worker.activities.delivery import DeliveryActivities
+from aegis_worker.activities.social import (
+    STUCK_ALERT_ACTION,
+    STUCK_MUTE_PREFIX,
+    STUCK_RECOVERY_ACTION,
+    SocialActivities,
+    _normalize_link,
+)
 from httpx import Response
 from temporalio.testing import ActivityEnvironment
 
@@ -1127,3 +1135,546 @@ async def test_drain_social_outbox_posts_via_postiz_end_to_end(social_env):
         assert (row["status"], row["posted_ref"]) == ("posted", "pz-2")
     finally:
         await connector.close()
+
+
+# ============================================================================
+# #225 — the stuck-post watchdog, and the two metrics fixes it stands on.
+#
+# Between 2026-07-29 07:30 and 2026-08-02 13:01 UTC not one social post
+# published: Postiz's Temporal worker came back from a restart with zero
+# pollers. `social_outbox` said `posted` (the handoff genuinely succeeded)
+# while Postiz's own state stayed QUEUE, and nothing alerted for four days.
+#
+# Every row seeded below is prefixed `zzsa-` (todoist_task_id, posted_ref, and
+# therefore the audit target_id / mute_key), so nothing here can perturb
+# another test sharing the same xdist-worker database.
+# ============================================================================
+
+
+class _FakeDelivery:
+    """Stand-in for DeliveryActivities as `safe_send_message` uses it.
+
+    `test_stuck_fake_delivery_matches_the_real_class` pins this against the
+    real class so the fake cannot drift into testing nothing.
+    """
+
+    channel = "slack"
+    db_pool = None  # skips the notification-budget path in safe_send_message
+
+    def __init__(self):
+        self.sent: list[str] = []
+
+    async def send_message(self, *, agent_id: str, message: str, chat_id: int = 0) -> dict:
+        self.sent.append(message)
+        return {"ok": True}
+
+
+def test_stuck_fake_delivery_matches_the_real_class():
+    real = inspect.signature(DeliveryActivities.send_message).parameters
+    fake = inspect.signature(_FakeDelivery.send_message).parameters
+    for name in ("agent_id", "message", "chat_id"):
+        assert name in real, f"DeliveryActivities.send_message lost {name}"
+        assert name in fake, f"_FakeDelivery.send_message lost {name}"
+    fields = set(DeliveryActivities.__dataclass_fields__)
+    assert {"channel", "db_pool"} <= fields
+    assert hasattr(_FakeDelivery, "channel") and hasattr(_FakeDelivery, "db_pool")
+
+
+@pytest_asyncio.fixture(loop_scope="function")
+async def stuck_env(social_env):
+    """social_env plus the two tables the watchdog writes, prefix-scoped."""
+
+    async def _clean(conn):
+        await conn.execute(
+            "DELETE FROM audit_log WHERE actor = 'social-stuck-watchdog' "
+            "AND target_id LIKE 'zzsa-%'"
+        )
+        await conn.execute("DELETE FROM alert_mutes WHERE mute_key LIKE 'social-stuck:zzsa-%'")
+
+    async with social_env.acquire() as conn:
+        await _clean(conn)
+    yield social_env
+    async with social_env.acquire() as conn:
+        await _clean(conn)
+
+
+async def _seed_outbox(
+    pool,
+    account_id: int,
+    task_id: str,
+    posted_ref: str,
+    *,
+    schedule_at,
+    state: str | None = "QUEUE",
+    created_days_ago: float = 0.0,
+    status: str = "posted",
+):
+    """One posted outbox row. `schedule_at` may be a datetime or a raw string
+    (so a malformed value can be seeded); `state=None` leaves metrics `{}`."""
+    sched = schedule_at.isoformat() if hasattr(schedule_at, "isoformat") else schedule_at
+    row_id = await pool.fetchval(
+        "INSERT INTO social_outbox (todoist_task_id, account_id, payload, status, posted_ref, "
+        "created_at) VALUES ($1, $2, $3, $4, $5, now() - make_interval(secs => $6)) RETURNING id",
+        task_id,
+        account_id,
+        {"text": f"post {task_id}", "link": "", "schedule_at": sched},
+        status,
+        posted_ref,
+        int(created_days_ago * 86400),
+    )
+    if state is not None:
+        await pool.execute(
+            "UPDATE social_outbox SET metrics = $1, metrics_at = now() WHERE id = $2",
+            {"state": state, "release_url": None, "publish_date": None, "series": {}},
+            row_id,
+        )
+    return row_id
+
+
+def _finding(subject: str = "zzsa-pz-1", **over) -> dict:
+    base = {
+        "subject": subject,
+        "outbox_id": 1,
+        "todoist_task_id": "zzsa-task",
+        "platform": "linkedin",
+        "label": "postiz-test",
+        "schedule_at": "2026-07-30T07:30:00+00:00",
+        "overdue_hours": 72,
+        "state": "QUEUE",
+        "metrics_at": None,
+        "preview": "hello",
+    }
+    base.update(over)
+    return base
+
+
+# ---------------------------------------------------------------- fix 1: lookahead
+
+
+@respx.mock
+async def test_refresh_lookahead_sees_a_month_out_campaign(stuck_env):
+    """The live book campaign runs ~30 days out. Postiz only returns posts
+    inside [startDate, endDate], so with the old `now + 1 day` end the post is
+    absent from the response and falls through to `state: "unknown"` — which is
+    why `unknown` carried no information at all before this change."""
+    account_id = await _seed_postiz_account(stuck_env, platform="linkedin")
+    far = datetime.now(UTC) + timedelta(days=30)
+    await _seed_outbox(
+        stuck_env, account_id, "zzsa-far", "zzsa-pz-far", schedule_at=far, state=None
+    )
+
+    def _postiz_list(request):
+        """Postiz's real windowing: the post is only returned when the
+        requested window actually contains its publishDate."""
+        start = datetime.fromisoformat(request.url.params["startDate"])
+        end = datetime.fromisoformat(request.url.params["endDate"])
+        inside = start <= far <= end
+        return Response(
+            200,
+            json={
+                "posts": (
+                    [{"id": "zzsa-pz-far", "state": "QUEUE", "publishDate": far.isoformat()}]
+                    if inside
+                    else []
+                )
+            },
+        )
+
+    respx.get("https://postiz.example.com/api/public/v1/posts").mock(side_effect=_postiz_list)
+    respx.get("https://postiz.example.com/api/public/v1/analytics/post/zzsa-pz-far").respond(
+        200, json=[]
+    )
+
+    connector = SocialConnector(db_pool=stuck_env, settings=_settings_with_postiz())
+    act = SocialActivities(db_pool=stuck_env, connector=connector)
+    try:
+        assert await ActivityEnvironment().run(act.refresh_post_metrics, 14, 45, 200) == {
+            "refreshed": 1,
+            "failed": 0,
+        }
+        metrics = await stuck_env.fetchval(
+            "SELECT metrics FROM social_outbox WHERE todoist_task_id = 'zzsa-far'"
+        )
+        assert metrics["state"] == "QUEUE"
+    finally:
+        await connector.close()
+
+
+# ------------------------------------------------------------ fix 2: eligibility
+
+
+@respx.mock
+async def test_refresh_keeps_long_lead_rows_eligible_regardless_of_created_at(stuck_env):
+    """A row created 60 days ago whose schedule_at is still ahead must keep
+    refreshing — three prod rows created 2026-07-15 were frozen at a 07-29
+    snapshot by the old created_at-only filter and would never refresh again.
+
+    The `zzsa-history` control proves the relaxation did NOT become "refresh
+    everything": old row, old schedule_at, still excluded."""
+    account_id = await _seed_postiz_account(stuck_env, platform="linkedin")
+    await _seed_outbox(
+        stuck_env,
+        account_id,
+        "zzsa-longlead",
+        "zzsa-pz-longlead",
+        schedule_at=datetime.now(UTC) + timedelta(days=3),
+        state=None,
+        created_days_ago=60,
+    )
+    await _seed_outbox(
+        stuck_env,
+        account_id,
+        "zzsa-history",
+        "zzsa-pz-history",
+        schedule_at=datetime.now(UTC) - timedelta(days=60),
+        state=None,
+        created_days_ago=60,
+    )
+    respx.get("https://postiz.example.com/api/public/v1/posts").respond(200, json={"posts": []})
+    respx.get("https://postiz.example.com/api/public/v1/analytics/post/zzsa-pz-longlead").respond(
+        200, json=[{"label": "Likes", "data": [{"total": "1", "date": "2026-08-01"}]}]
+    )
+    respx.get("https://postiz.example.com/api/public/v1/analytics/post/zzsa-pz-history").respond(
+        200, json=[]
+    )
+
+    connector = SocialConnector(db_pool=stuck_env, settings=_settings_with_postiz())
+    act = SocialActivities(db_pool=stuck_env, connector=connector)
+    try:
+        assert await ActivityEnvironment().run(act.refresh_post_metrics, 14, 45, 200) == {
+            "refreshed": 1,
+            "failed": 0,
+        }
+        fresh = await stuck_env.fetchval(
+            "SELECT metrics FROM social_outbox WHERE todoist_task_id = 'zzsa-longlead'"
+        )
+        assert fresh["series"] == {"likes": 1}
+        assert (
+            await stuck_env.fetchval(
+                "SELECT metrics FROM social_outbox WHERE todoist_task_id = 'zzsa-history'"
+            )
+            == {}
+        )
+    finally:
+        await connector.close()
+
+
+@respx.mock
+async def test_refresh_malformed_schedule_at_does_not_abort_the_pass(stuck_env):
+    """`payload->>'schedule_at'` is free text. A bare ::timestamptz on a bad
+    value aborts the whole statement — i.e. one junk row would silently kill
+    metrics AND the watchdog that reads them."""
+    account_id = await _seed_postiz_account(stuck_env, platform="linkedin")
+    await _seed_outbox(
+        stuck_env, account_id, "zzsa-junk", "zzsa-pz-junk", schedule_at="not-a-date", state=None
+    )
+    await _seed_outbox(
+        stuck_env, account_id, "zzsa-empty", "zzsa-pz-empty", schedule_at="", state=None
+    )
+    await _seed_outbox(
+        stuck_env,
+        account_id,
+        "zzsa-good",
+        "zzsa-pz-good",
+        schedule_at=datetime.now(UTC) + timedelta(days=2),
+        state=None,
+        created_days_ago=60,
+    )
+    respx.get("https://postiz.example.com/api/public/v1/posts").respond(200, json={"posts": []})
+    for ref in ("zzsa-pz-junk", "zzsa-pz-empty", "zzsa-pz-good"):
+        respx.get(f"https://postiz.example.com/api/public/v1/analytics/post/{ref}").respond(
+            200, json=[]
+        )
+
+    connector = SocialConnector(db_pool=stuck_env, settings=_settings_with_postiz())
+    act = SocialActivities(db_pool=stuck_env, connector=connector)
+    try:
+        # The junk/empty rows are recent, so they stay eligible on the
+        # created_at branch; the point is that the statement RAN at all.
+        assert await ActivityEnvironment().run(act.refresh_post_metrics, 14, 45, 200) == {
+            "refreshed": 3,
+            "failed": 0,
+        }
+    finally:
+        await connector.close()
+
+
+# ------------------------------------------------------------------ fix 3: LIMIT
+
+
+@respx.mock
+async def test_refresh_max_rows_caps_the_pass_and_says_so(stuck_env, caplog):
+    account_id = await _seed_postiz_account(stuck_env, platform="linkedin")
+    for i in range(3):
+        await _seed_outbox(
+            stuck_env,
+            account_id,
+            f"zzsa-cap-{i}",
+            f"zzsa-pz-cap-{i}",
+            schedule_at=datetime.now(UTC),
+            state=None,
+        )
+    respx.get("https://postiz.example.com/api/public/v1/posts").respond(200, json={"posts": []})
+    respx.get(url__regex=r".*/analytics/post/zzsa-pz-cap-\d").respond(200, json=[])
+
+    connector = SocialConnector(db_pool=stuck_env, settings=_settings_with_postiz())
+    act = SocialActivities(db_pool=stuck_env, connector=connector)
+    try:
+        with caplog.at_level("WARNING"):
+            result = await ActivityEnvironment().run(act.refresh_post_metrics, 14, 45, 2)
+        assert result == {"refreshed": 2, "failed": 0}
+        assert any("social_refresh_post_metrics_truncated" in r.message for r in caplog.records)
+    finally:
+        await connector.close()
+
+
+# -------------------------------------------------- detection: the outage replay
+
+
+async def test_find_stuck_posts_catches_queue_and_unknown(stuck_env):
+    """THE outage-shape test. Seven rows were genuinely stuck in the
+    2026-07-29→08-02 outage and three of them had aged into `unknown`, not
+    `QUEUE`: the issue's original QUEUE-only design would have stayed silent on
+    those. All three not-published shapes must alert; PUBLISHED and
+    not-yet-due must not."""
+    account_id = await _seed_postiz_account(stuck_env, platform="linkedin")
+    past = datetime.now(UTC) - timedelta(days=3)
+    await _seed_outbox(
+        stuck_env, account_id, "zzsa-q", "zzsa-pz-q", schedule_at=past, state="QUEUE"
+    )
+    await _seed_outbox(
+        stuck_env, account_id, "zzsa-u", "zzsa-pz-u", schedule_at=past, state="unknown"
+    )
+    await _seed_outbox(stuck_env, account_id, "zzsa-n", "zzsa-pz-n", schedule_at=past, state=None)
+    await _seed_outbox(
+        stuck_env, account_id, "zzsa-p", "zzsa-pz-p", schedule_at=past, state="PUBLISHED"
+    )
+    await _seed_outbox(
+        stuck_env,
+        account_id,
+        "zzsa-fut",
+        "zzsa-pz-fut",
+        schedule_at=datetime.now(UTC) + timedelta(days=2),
+        state="QUEUE",
+    )
+
+    act = SocialActivities(db_pool=stuck_env)
+    found = await ActivityEnvironment().run(act.find_stuck_posts, 6, 50)
+    assert {f["subject"] for f in found} == {"zzsa-pz-q", "zzsa-pz-u", "zzsa-pz-n"}
+    by_subject = {f["subject"]: f for f in found}
+    assert by_subject["zzsa-pz-q"]["state"] == "QUEUE"
+    assert by_subject["zzsa-pz-u"]["state"] == "unknown"
+    assert by_subject["zzsa-pz-n"]["state"] is None
+    assert by_subject["zzsa-pz-q"]["overdue_hours"] == 72
+    assert by_subject["zzsa-pz-q"]["platform"] == "linkedin"
+
+
+async def test_find_stuck_posts_overdue_margin_is_load_bearing(stuck_env):
+    """The margin is a real parameter, not decoration: the same row is quiet at
+    6h and loud at 1h."""
+    account_id = await _seed_postiz_account(stuck_env, platform="linkedin")
+    await _seed_outbox(
+        stuck_env,
+        account_id,
+        "zzsa-recent",
+        "zzsa-pz-recent",
+        schedule_at=datetime.now(UTC) - timedelta(hours=2),
+        state="QUEUE",
+    )
+    act = SocialActivities(db_pool=stuck_env)
+    assert await ActivityEnvironment().run(act.find_stuck_posts, 6, 50) == []
+    loud = await ActivityEnvironment().run(act.find_stuck_posts, 1, 50)
+    assert [f["subject"] for f in loud] == ["zzsa-pz-recent"]
+
+
+async def test_find_stuck_posts_skips_unparseable_schedule_at(stuck_env):
+    """A junk schedule_at must be skipped, not guessed — and must not abort the
+    statement that finds the real stuck row sitting next to it."""
+    account_id = await _seed_postiz_account(stuck_env, platform="linkedin")
+    await _seed_outbox(stuck_env, account_id, "zzsa-j", "zzsa-pz-j", schedule_at="not-a-date")
+    await _seed_outbox(stuck_env, account_id, "zzsa-e", "zzsa-pz-e", schedule_at="")
+    await _seed_outbox(
+        stuck_env,
+        account_id,
+        "zzsa-real",
+        "zzsa-pz-real",
+        schedule_at=datetime.now(UTC) - timedelta(days=1),
+    )
+    act = SocialActivities(db_pool=stuck_env)
+    found = await ActivityEnvironment().run(act.find_stuck_posts, 6, 50)
+    assert [f["subject"] for f in found] == ["zzsa-pz-real"]
+
+
+async def test_find_stuck_posts_ignores_non_postiz_and_unposted_rows(stuck_env):
+    """Native-transport accounts have no Postiz state to be stuck in, and a row
+    that never left `pending` is SocialPublishFlow's problem, not this
+    watchdog's."""
+    postiz_id = await _seed_postiz_account(stuck_env, platform="linkedin")
+    native_id = await _seed_account(stuck_env, platform="x", label="zzsa-native")
+    past = datetime.now(UTC) - timedelta(days=1)
+    await _seed_outbox(stuck_env, native_id, "zzsa-native", "zzsa-pz-native", schedule_at=past)
+    await _seed_outbox(
+        stuck_env, postiz_id, "zzsa-pending", "zzsa-pz-pending", schedule_at=past, status="pending"
+    )
+    await _seed_outbox(stuck_env, postiz_id, "zzsa-yes", "zzsa-pz-yes", schedule_at=past)
+
+    act = SocialActivities(db_pool=stuck_env)
+    found = await ActivityEnvironment().run(act.find_stuck_posts, 6, 50)
+    assert [f["subject"] for f in found] == ["zzsa-pz-yes"]
+
+
+async def test_find_stuck_posts_without_pool_returns_empty():
+    act = SocialActivities(db_pool=None)
+    assert await ActivityEnvironment().run(act.find_stuck_posts, 6, 50) == []
+
+
+# ------------------------------------------------ alerting: dedup, mute, recovery
+
+
+async def test_stuck_alert_fires_once_not_on_every_sweep(stuck_env):
+    """THE dedup property, as a count. Twenty sweeps of the same stuck post
+    must produce exactly one card and exactly one audit row."""
+    delivery = _FakeDelivery()
+    act = SocialActivities(db_pool=stuck_env, delivery=delivery)
+    env = ActivityEnvironment()
+    results = [
+        await env.run(act.report_stuck_posts, [_finding()], "sebas", 168, 720) for _ in range(20)
+    ]
+    assert sum(r["alerted"] for r in results) == 1
+    assert sum(r["deduped"] for r in results) == 19
+    assert len(delivery.sent) == 1
+    assert (
+        await stuck_env.fetchval(
+            "SELECT count(*) FROM audit_log WHERE action = $1 AND target_id = $2",
+            STUCK_ALERT_ACTION,
+            "zzsa-pz-1",
+        )
+        == 1
+    )
+
+
+async def test_stuck_alert_card_names_the_post_and_its_state(stuck_env):
+    delivery = _FakeDelivery()
+    act = SocialActivities(db_pool=stuck_env, delivery=delivery)
+    await ActivityEnvironment().run(
+        act.report_stuck_posts, [_finding("zzsa-pz-card", state="unknown")], "sebas", 168, 720
+    )
+    assert len(delivery.sent) == 1
+    card = delivery.sent[0]
+    assert "zzsa-pz-card" in card
+    assert "unknown" in card
+    assert "1 post(s) stuck" in card
+
+
+async def test_stuck_dedup_expires_after_the_window(stuck_env):
+    """The dedup is time-bounded, not permanent: a post still stuck after
+    `dedup_hours` gets one more nag."""
+    act = SocialActivities(db_pool=stuck_env, delivery=_FakeDelivery())
+    env = ActivityEnvironment()
+    first = await env.run(act.report_stuck_posts, [_finding()], "sebas", 168, 720)
+    assert first["alerted"] == 1
+    async with stuck_env.acquire() as conn:
+        await conn.execute(
+            "UPDATE audit_log SET created_at = now() - interval '169 hours' "
+            "WHERE action = $1 AND target_id = $2",
+            STUCK_ALERT_ACTION,
+            "zzsa-pz-1",
+        )
+    again = await env.run(act.report_stuck_posts, [_finding()], "sebas", 168, 720)
+    assert (again["alerted"], again["deduped"]) == (1, 0)
+
+
+async def test_stuck_recovery_notifies_and_re_arms_dedup(stuck_env):
+    """A post that finally publishes drops out of findings: that sends the
+    recovery card, and the recovery audit row is what lets the SAME post alert
+    again if it gets stuck a second time inside the dedup window."""
+    delivery = _FakeDelivery()
+    act = SocialActivities(db_pool=stuck_env, delivery=delivery)
+    env = ActivityEnvironment()
+    first = await env.run(act.report_stuck_posts, [_finding()], "sebas", 168, 720)
+    assert first["alerted"] == 1
+
+    recovered = await env.run(act.report_stuck_posts, [], "sebas", 168, 720)
+    assert recovered == {"alerted": 0, "deduped": 0, "muted": 0, "recovered": 1}
+    assert (
+        await stuck_env.fetchval(
+            "SELECT count(*) FROM audit_log WHERE action = $1 AND target_id = $2",
+            STUCK_RECOVERY_ACTION,
+            "zzsa-pz-1",
+        )
+        == 1
+    )
+    assert "1 post(s) published" in delivery.sent[-1]
+
+    again = await env.run(act.report_stuck_posts, [_finding()], "sebas", 168, 720)
+    assert (again["alerted"], again["deduped"]) == (1, 0)
+    # ...and having re-alerted, it is deduped again.
+    quiet = await env.run(act.report_stuck_posts, [_finding()], "sebas", 168, 720)
+    assert quiet == {"alerted": 0, "deduped": 1, "muted": 0, "recovered": 0}
+
+
+async def test_stuck_recovery_is_silent_when_nothing_was_ever_alerted(stuck_env):
+    act = SocialActivities(db_pool=stuck_env, delivery=_FakeDelivery())
+    assert await ActivityEnvironment().run(act.report_stuck_posts, [], "sebas", 168, 720) == {
+        "alerted": 0,
+        "deduped": 0,
+        "muted": 0,
+        "recovered": 0,
+    }
+
+
+async def test_active_mute_suppresses_the_stuck_alert(stuck_env):
+    """Guard independence #1: the mute alone must suppress, with an empty
+    audit_log so dedup cannot be what did it."""
+    async with stuck_env.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO alert_mutes (mute_key, muted_until) VALUES ($1, now() + interval '1 day')",
+            STUCK_MUTE_PREFIX + "zzsa-pz-1",
+        )
+    delivery = _FakeDelivery()
+    act = SocialActivities(db_pool=stuck_env, delivery=delivery)
+    r = await ActivityEnvironment().run(act.report_stuck_posts, [_finding()], "sebas", 168, 720)
+    assert r == {"alerted": 0, "deduped": 0, "muted": 1, "recovered": 0}
+    assert delivery.sent == []
+
+
+async def test_expired_mute_does_not_suppress_the_stuck_alert(stuck_env):
+    """Guard independence #2: the mute lookup is `muted_until > now()`, not
+    "a row exists" — an expired mute must let the alert through, which also
+    proves the previous test's suppression came from the mute's freshness."""
+    async with stuck_env.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO alert_mutes (mute_key, muted_until) "
+            "VALUES ($1, now() - interval '1 hour')",
+            STUCK_MUTE_PREFIX + "zzsa-pz-1",
+        )
+    act = SocialActivities(db_pool=stuck_env, delivery=_FakeDelivery())
+    r = await ActivityEnvironment().run(act.report_stuck_posts, [_finding()], "sebas", 168, 720)
+    assert r == {"alerted": 1, "deduped": 0, "muted": 0, "recovered": 0}
+
+
+async def test_stuck_report_without_pool_is_a_no_op():
+    act = SocialActivities(db_pool=None, delivery=_FakeDelivery())
+    r = await ActivityEnvironment().run(act.report_stuck_posts, [_finding()], "sebas", 168, 720)
+    assert r == {"alerted": 0, "deduped": 0, "muted": 0, "recovered": 0}
+
+
+async def test_two_stuck_posts_are_one_card_but_two_audit_rows(stuck_env):
+    delivery = _FakeDelivery()
+    act = SocialActivities(db_pool=stuck_env, delivery=delivery)
+    r = await ActivityEnvironment().run(
+        act.report_stuck_posts,
+        [_finding("zzsa-pz-a"), _finding("zzsa-pz-b")],
+        "sebas",
+        168,
+        720,
+    )
+    assert r["alerted"] == 2
+    assert len(delivery.sent) == 1
+    assert (
+        await stuck_env.fetchval(
+            "SELECT count(*) FROM audit_log WHERE action = $1 AND target_id LIKE 'zzsa-pz-%'",
+            STUCK_ALERT_ACTION,
+        )
+        == 2
+    )
