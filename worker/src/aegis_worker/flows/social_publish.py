@@ -154,16 +154,22 @@ class SocialPublishFlow:
                 non_retryable=True,
             ) from exc
 
-        # NOTE: happy-path posts happen in the approval card's post_resolve
-        # (InteractionFlow), not here — drain_social_outbox is only the retry
-        # net, so its count is ~always 0 while real posts still flow. The keys
-        # say so explicitly; `completed` reflects tasks closed for posted rows.
+        # NOTE: happy-path posts AND the task closure both happen in the
+        # approval card's post_resolve (InteractionFlow), not here — steps 4/5
+        # are only the retry net, so `drain_posted` AND `completed` are ~always
+        # 0 while real posts still flow. That is why #135 read 6,743 straight
+        # `completed: 0` runs as "closure never happens" when every closure had
+        # in fact succeeded seconds after approval. `blocked` is the key that
+        # tells the two apart: 0 means nothing was waiting to close, non-zero
+        # means that many tasks CAN'T close. The positive record of a closure
+        # lives in `audit_log` (`action = 'social_task_closed'`), not here.
         return {
             "due": len(due),
             "carded": carded,
             "drain_posted": drained.get("posted", 0),
             "drain_failed": drained.get("failed", 0),
             "completed": completed.get("completed", 0),
+            "blocked": completed.get("blocked", 0),
             "channel_sync": channels.get("status", "unknown"),
             "channels_synced": channels.get("synced", 0),
             "retired": retired.get("retired", 0),

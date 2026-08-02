@@ -32,7 +32,13 @@ _TASK = {
 }
 
 
-def _make_stubs(due: list[dict], *, sync_fails: bool = False, retire_fails: bool = False):
+def _make_stubs(
+    due: list[dict],
+    *,
+    sync_fails: bool = False,
+    retire_fails: bool = False,
+    complete_result: dict | None = None,
+):
     """Stub activity set + call recorder for one worker instance."""
     calls: dict[str, list] = {
         "hook": [],
@@ -73,7 +79,7 @@ def _make_stubs(due: list[dict], *, sync_fails: bool = False, retire_fails: bool
     @activity.defn(name="complete_posted_tasks")
     async def complete_posted_tasks() -> dict:
         calls["complete"].append(True)
-        return {"completed": 0}
+        return complete_result if complete_result is not None else {"completed": 0}
 
     @activity.defn(name="apply_social_approval")
     async def apply_social_approval(interaction_id: str, response: dict, metadata: dict) -> dict:
@@ -214,6 +220,7 @@ async def test_no_due_posts_does_nothing(temporal_env):
             "drain_posted": 0,
             "drain_failed": 0,
             "completed": 0,
+            "blocked": 0,
             "channel_sync": "ok",
             "channels_synced": 3,
             "retired": 2,
@@ -275,3 +282,26 @@ async def test_a_postiz_outage_does_not_stop_the_publish_tick(temporal_env):
     # The publish half still ran end to end.
     assert calls["order"][-1] == "find_due"
     assert calls["drain"] and calls["complete"]
+
+
+async def test_blocked_tasks_reach_the_run_summary(temporal_env):
+    """#135: `completed: 0` alone cannot distinguish "nothing to close" from
+    "everything is stuck" — 6,743 consecutive zero runs were read as the second
+    when they were the first. `blocked` is the key that separates them, so it
+    has to survive the trip from the activity into result_summary."""
+    stubs, _ = _make_stubs(due=[], complete_result={"completed": 0, "blocked": 4})
+    tq = f"test-{uuid4().hex[:8]}"
+    async with Worker(
+        temporal_env.client,
+        task_queue=tq,
+        workflows=[SocialPublishFlow, InteractionFlow],
+        activities=stubs,
+    ):
+        result = await temporal_env.client.execute_workflow(
+            SocialPublishFlow.run,
+            SocialPublishConfig(agent_id="sebas"),
+            id=f"social-publish-{uuid4()}",
+            task_queue=tq,
+        )
+    assert result["blocked"] == 4
+    assert result["completed"] == 0

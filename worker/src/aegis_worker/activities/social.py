@@ -24,6 +24,7 @@ from typing import Any
 
 import asyncpg
 from aegis.connectors.todoist import TodoistConnector
+from aegis.observability import log_audit
 from aegis.services import social_channels
 from temporalio import activity
 
@@ -38,6 +39,21 @@ _MAX_ATTEMPTS = 5  # mirror todoist_outbox semantics
 # needs a real URL. Normalize once here, at ingest, so every downstream
 # transport sees a bare link (#114).
 _MD_LINK_RE = re.compile(r"\[([^\]]+)\]\((https?://\S+?)\)")
+
+# ---------------------------------------------------------------------------
+# task closure (#135) — constants
+# ---------------------------------------------------------------------------
+
+#: `audit_log` row written the instant a task's `item_complete` is queued. It is
+#: the ONLY durable, path-independent record that AEGIS closed a @publish task.
+#: Needed because closure is normally performed by `apply_social_approval`
+#: (InteractionFlow's post_resolve hook) whose return value InteractionFlow
+#: discards — so `SocialPublishFlow.result_summary->>'completed'` is 0 on a
+#: perfectly healthy system and there was no other place to look. Query it with
+#: `SELECT count(*) FROM audit_log WHERE action = 'social_task_closed'`.
+CLOSE_ACTION = "social_task_closed"
+CLOSE_TARGET_TYPE = "todoist_task"
+CLOSE_ACTOR = "social-publish"
 
 # ---------------------------------------------------------------------------
 # stuck-post watchdog (#225) — constants
@@ -478,32 +494,58 @@ class SocialActivities:
         Idempotent: the deterministic temp_id social-complete-<task_id> makes
         re-runs no-ops until the 5-min TodoistSyncFlow drains the command and
         the task flips is_completed in the projection.
+
+        Reporting (#135). Two things are counted, and neither used to be:
+
+        * `blocked` — open tasks that HAVE outbox rows and still cannot close.
+          The old query filtered them out in SQL (`HAVING …unposted… = 0`), so a
+          task wedged behind a permanently `failed` post never reached Python
+          and produced no log line, no counter, nothing: identical output to an
+          idle system. `completed: 0, blocked: 0` now means "nothing to do";
+          `completed: 0, blocked: N` means "N tasks are stuck", which is the
+          distinction #135's 6,743 zero-runs could not make.
+        * an `audit_log` row per closure (`social_task_closed`). Closure is
+          normally done by `apply_social_approval` seconds after the post, not
+          by the scheduled tick, and InteractionFlow discards the hook's return
+          value — so on a healthy system NO flow summary anywhere ever carried a
+          non-zero closure count. The audit row is the durable proof, written
+          exactly once per task because only the INSERT that wins the
+          `ON CONFLICT` writes it.
         """
         if self.db_pool is None:
-            return {"completed": 0}
+            return {"completed": 0, "blocked": 0}
         platform_labels: dict = await self._setting("social_platform_labels", {"x": "x"})
         connected = await self._connected_platforms()
         rows = await self.db_pool.fetch(
             """
             SELECT o.todoist_task_id AS task_id, t.labels AS labels,
-                   array_agg(DISTINCT a.platform) AS posted_platforms
+                   array_agg(DISTINCT a.platform) FILTER (WHERE o.status = 'posted')
+                     AS posted_platforms,
+                   count(*) FILTER (WHERE o.status <> 'posted') AS unposted_rows,
+                   count(*) FILTER (WHERE o.status = 'failed') AS failed_rows
             FROM social_outbox o
             JOIN todoist_tasks t ON t.id = o.todoist_task_id
             JOIN social_accounts a ON a.id = o.account_id
             WHERE o.todoist_task_id IS NOT NULL AND NOT t.is_completed
             GROUP BY o.todoist_task_id, t.labels
-            HAVING count(*) FILTER (WHERE o.status <> 'posted') = 0
             """
         )
-        completed = 0
+        completed = blocked = 0
         for r in rows:
             labels = set(r["labels"] or [])
             intended = {p for p, lab in platform_labels.items() if lab in labels}
             missing = (intended & connected) - set(r["posted_platforms"] or [])
-            if missing:
+            # Gate unchanged: every outbox row posted AND every connected
+            # intended platform among them. `unposted_rows` is what the old
+            # HAVING clause enforced in SQL — moved into Python only so the
+            # blocked task is visible instead of being filtered away.
+            if r["unposted_rows"] or missing:
+                blocked += 1
                 activity.logger.warning(
-                    "social_complete_skipped_missing_platform task_id=%s missing=%s",
+                    "social_complete_blocked task_id=%s unposted=%d failed=%d missing=%s",
                     r["task_id"],
+                    r["unposted_rows"],
+                    r["failed_rows"],
                     sorted(missing),
                 )
                 continue
@@ -521,10 +563,25 @@ class SocialActivities:
                 f"social-complete-{r['task_id']}",
                 cmd,
             )
-            completed += int(result.endswith("1"))
-        if completed:
-            activity.logger.info("social_complete_posted_tasks enqueued=%d", completed)
-        return {"completed": completed}
+            if not result.endswith("1"):
+                continue  # already queued by an earlier pass — don't re-audit
+            completed += 1
+            await log_audit(
+                self.db_pool,
+                actor=CLOSE_ACTOR,
+                action=CLOSE_ACTION,
+                target_type=CLOSE_TARGET_TYPE,
+                target_id=str(r["task_id"]),
+                details={
+                    "posted_platforms": sorted(r["posted_platforms"] or []),
+                    "unpublishable": unpublishable,
+                },
+            )
+        if completed or blocked:
+            activity.logger.info(
+                "social_complete_posted_tasks enqueued=%d blocked=%d", completed, blocked
+            )
+        return {"completed": completed, "blocked": blocked}
 
     @activity.defn
     async def sync_postiz_channels(self, min_interval_minutes: int = 60) -> dict:
@@ -715,22 +772,47 @@ class SocialActivities:
         Approve posts immediately (enqueue → drain → complete as plain method
         calls); any failure here is retried by the scheduled flow's own
         drain/complete steps on the next tick.
+
+        This is where publishing and closure ACTUALLY happen in production — by
+        the time the 5-min tick runs, the outbox is drained and the task is
+        closed, which is why `SocialPublishFlow` reports `drain_posted: 0` and
+        `completed: 0` forever on a healthy system (#135). The three steps used
+        to have their results dropped on the floor here; they are returned and
+        logged now so the work is attributable to the run that did it.
         """
         choice = (response.get("value") or "").strip()
         task_id = metadata.get("task_id") or ""
         if not task_id:
             return {"applied": "none"}
         if choice == "approve":
-            await self.enqueue_outbox(
+            enqueued = await self.enqueue_outbox(
                 task_id,
                 list(metadata.get("platforms") or []),
                 str(metadata.get("text") or ""),
                 str(metadata.get("link") or ""),
                 await self._current_post_at(task_id) or str(metadata.get("post_at") or ""),
             )
-            await self.drain_social_outbox()
-            await self.complete_posted_tasks()
-            return {"applied": "approved"}
+            drained = await self.drain_social_outbox()
+            closed = await self.complete_posted_tasks()
+            applied = {
+                "applied": "approved",
+                "queued": enqueued.get("queued", 0),
+                "missing_accounts": enqueued.get("missing_accounts", []),
+                "posted": drained.get("posted", 0),
+                "post_failed": drained.get("failed", 0),
+                "completed": closed.get("completed", 0),
+                "blocked": closed.get("blocked", 0),
+            }
+            activity.logger.info(
+                "social_approval_applied task_id=%s queued=%d posted=%d "
+                "completed=%d blocked=%d",
+                task_id,
+                applied["queued"],
+                applied["posted"],
+                applied["completed"],
+                applied["blocked"],
+            )
+            return applied
         if choice == "skip":
             await self.unpublish_task(task_id)
             return {"applied": "skipped"}
