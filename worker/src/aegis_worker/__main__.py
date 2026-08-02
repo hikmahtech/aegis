@@ -415,6 +415,9 @@ async def main():
     social_act = SocialActivities(
         db_pool=deps.pool,
         connector=connectors.get("social"),
+        # #225 stuck-post watchdog notifies through the same delivery path as
+        # the flow-health watchdog.
+        delivery=delivery_act,
     )
     agent_task_act = AgentTaskActivities(
         db_pool=deps.pool,

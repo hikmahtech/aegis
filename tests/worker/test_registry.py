@@ -220,10 +220,13 @@ def test_module_workflows_is_the_unflagged_registry():
         # NO new flow from A5 (propose_generalizations, which rides A2's flow),
         # then +1 flow and +3 activities from #226's FlowHealthWatchdogFlow /
         # FlowHealthActivities (find_failing_flows, find_stale_flows,
-        # report_flow_health) — unflagged, so all three rows move.
-        (True, True, 38, 182),
-        (False, False, 30, 153),
-        (True, False, 34, 171),
+        # report_flow_health) — unflagged, so all three rows move. Then +2
+        # activities and NO new flow from #225's stuck-post watchdog
+        # (find_stuck_posts, report_stuck_posts on the existing
+        # SocialActivities, driven by the existing SocialMetricsFlow).
+        (True, True, 38, 184),
+        (False, False, 30, 155),
+        (True, False, 34, 173),
     ],
 )
 def test_real_registration_passes_the_boot_check(homelab, money, flows, activities):

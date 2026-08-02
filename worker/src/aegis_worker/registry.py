@@ -326,6 +326,13 @@ FLOWS: tuple[FlowSpec, ...] = (
         lambda act: SocialMetricsConfig(
             agent_id=act["agent_id"],
             window_days=int(act["config"].get("window_days", 14)),
+            lookahead_days=int(act["config"].get("lookahead_days", 45)),
+            max_rows=int(act["config"].get("max_rows", 200)),
+            stuck_after_hours=int(act["config"].get("stuck_after_hours", 6)),
+            max_stuck=int(act["config"].get("max_stuck", 50)),
+            dedup_hours=int(act["config"].get("dedup_hours", 168)),
+            recovery_hours=int(act["config"].get("recovery_hours", 720)),
+            check_stuck=bool(act["config"].get("check_stuck", True)),
         ),
     ),
     # A7 — one curiosity question per day. aegis_ui_url comes from settings
