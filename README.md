@@ -27,9 +27,10 @@ extra horsepower.
 - **Agents, not a chatbot.** Four personalities (an assistant, a researcher, a
   money agent, an infra/ops agent) each own a slice of your life. Routing
   between them is data-driven (per-agent keywords/tools in the DB, not hardcoded).
-- **Flows do the work.** ~30 Temporal workflows on a schedule or trigger:
+- **Flows do the work.** ~40 Temporal workflows on a schedule or trigger:
   triage email, mirror your task manager, sweep subscriptions, watch a Google
-  Drive folder, investigate alerts, build a daily brief.
+  Drive folder, investigate alerts, build a daily brief — and a watchdog over
+  AEGIS's own flows, so a wedged schedule tells you instead of going quiet.
 - **Human-in-the-loop, budgeted.** When an agent needs a decision it sends a
   card to your chat channel; you Approve / Edit / Reject. A daily
   **notification budget** keeps proactive pings from becoming noise.

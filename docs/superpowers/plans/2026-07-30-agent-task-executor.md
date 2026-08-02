@@ -1,5 +1,18 @@
 # Agent Task Executor Implementation Plan
 
+> **SHIPPED — historical record, not a recipe.** This plan was executed; the
+> executor is live as `agent-task-15min`. Its **registration instructions are now
+> wrong**: PR #204 deleted the hand-edited lists in
+> `worker/src/aegis_worker/__main__.py`, so the "FOUR registration lists" note and
+> every `_ACTIVITY_TYPE_MAP` / `WORKFLOWS` / `workflows = [...]` step below have no
+> counterpart in the tree. Registering a flow today is one `FlowSpec` in
+> `worker/src/aegis_worker/registry.py` plus a seed row, enforced by
+> `registry.check_registration()` at boot; activities need no registration at all.
+> Flow/activity counts quoted here are also stale. See
+> [`development.md`](../../development.md#adding-a-new-flow) for the current
+> procedure and [`how-it-works.md`](../../how-it-works.md#5-the-agent-task-executor)
+> for what the executor actually does.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Close the loop on AEGIS's own triage output — 80 agent-assigned Todoist tasks that have sat untouched since 2026-07-01 — by executing each according to its `source_tag`.

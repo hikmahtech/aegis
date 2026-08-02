@@ -72,6 +72,50 @@ and schedules — edit them in the admin UI, not by copying YAML onto a volume.
 (A DB `activities.config` change propagates to the live Temporal schedule within
 ~300s, no redeploy.)
 
+## Features that stay inert until you act
+
+Several subsystems ship `active: true` but deliberately do nothing until an operator
+turns a key. Their runs complete green in the meantime, which is the system's
+signature failure mode
+([`how-it-works.md`](how-it-works.md#10-failure-modes-worth-recognising)) — so this is
+the checklist to work through after a deploy.
+
+| Subsystem | What it needs | Where |
+|---|---|---|
+| Social publishing | `social_publishing_enabled` + a connected account | Integrations / Settings |
+| LLM spend governor | a non-zero `daily_token_budget` (defaults to 0) | Settings |
+| Drive sync | a `folder_id` on `drive-sync-raphael` | admin **Flows** |
+| Wearable ingest | `oura_api_token` **and** an active `wearable` channel row | Integrations + Channels |
+| Expiry radar | at least one `life.expiring_items` row (empty registry = silent) | admin **Expiring Items** / **Assets** |
+| Life-data webhook | `life_webhook_secret` (unset ⇒ every request 503s, including correctly signed ones) | Integrations → Life data |
+| `location` place names | one or more `place` channel rows; with none, every push stores `elsewhere` | Channels → *place* |
+| Passive people enrichment | `people_enrichment_enabled` **and** `owner_emails` — the calendar lane refuses entirely without the latter, because Google lists you among your own events' attendees. Worker restart required | Integrations → Features / Owner |
+| Curiosity's calendar lane | `owner_emails`, same reason | Integrations → Owner |
+| Slack reaction capture | `slack_owner_member_id` (unset ⇒ the lane is a no-op) + the scopes below | Integrations + the Slack app |
+| Voice ingest on comms | `AEGIS_VOICE_INGEST_SECRET` (its own credential, **not** `AEGIS_API_KEY`) **and** `AEGIS_ELEVENLABS_API_KEY` for transcription — either unset ⇒ 503, never an open endpoint | comms env |
+| MCP client | `mcp_enabled`, `AEGIS_MCP_SERVERS`, **and** a per-agent `metadata.mcp_servers` grant — three independent gates, all default-deny. Core restart required | [`development.md`](development.md#mcp-servers-external-tool-servers) |
+| Life chat tools | `query_observations` / `last_contact_with_person` are in `AGENT_TOOL_SETS` but **not** in `config/seed/agents.yaml`, so no agent gets them from a seed — grant them explicitly | Agents → **Behavior** |
+| Memory consolidation (A4) | **two independent keys**: `dry_run: false` on the `memory-reflection-nightly` row *and* `AEGIS_MEMORY_CONSOLIDATION_APPLY_ENABLED=true` in the worker env. Either one alone writes nothing | admin **Flows** + worker env |
+| Persona self-editing (A2/A5) | nothing to enable — but nothing is written to a persona doc until a human approves the `draft_review` card. A resolve whose acknowledged base fingerprint has drifted is refused with **409** and must be resubmitted with a matching `base_ack` | Interactions |
+
+### Slack scopes
+
+The Slack app needs a bot token with scopes covering everything the adapter subscribes
+to: `message` / `app_mention` events, the `/capture`, `/remember` and `/status` slash
+commands, `file_shared`, and — added by the self-signal capture lane —
+**`reactions:read`** plus the `reaction_added` event subscription.
+
+Reading the reacted-to message additionally needs a **history** scope matching the
+channel type: `groups:history` (private channels — the natural home for notes, and the
+scope the app historically shipped without), `channels:history` (public), `im:history`
+(DMs). Without it the `conversations.history` fetch 403s and the whole lane is a silent
+no-op; comms logs `slack_reaction_history_missing_scope` with the remedy, which is the
+one signal to grep for.
+
+**Adding a scope requires reinstalling the app, and reinstalling reissues the bot
+token** — update it on the admin **Slack** page afterwards, or comms authenticates with
+a dead token.
+
 ## Alert routing (inbound webhooks)
 
 Point your alert sources at Core (all HMAC/secret-verified, auth-exempt):

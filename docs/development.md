@@ -342,13 +342,24 @@ classifier failure — no LLM, kill switch, timeout, truncation, unparseable
 JSON, low confidence — degrades to the task lane, which is the recoverable one.
 
 Two front doors:
-- **Slack** — a voice note whose transcript opens with `remember …`,
-  `note to self …`, `capture …`, `make a note …` or `add to inbox …` is
-  captured instead of being routed to an agent. Anything else still chats.
+- **Slack** — a voice note (or a typed message) whose text opens with
+  `remember …`, `note to self …`, `capture …`, `make a note …` or
+  `add to inbox …` is captured instead of being routed to an agent. The opener
+  must be a whole word, so "remembering the milk" still reaches chat.
 - **iOS Shortcut / HTTP** — `POST http://comms:8081/api/ingest/voice` with the
   recording as the **raw request body**, header `X-Voice-Secret`, optional
   `?filename=voice.m4a`. Needs `AEGIS_VOICE_INGEST_SECRET` set on comms
-  (its own credential, not `AEGIS_API_KEY`); unset ⇒ the route is 503.
+  (its own credential, not `AEGIS_API_KEY`) and `AEGIS_ELEVENLABS_API_KEY` for
+  transcription; either unset ⇒ the route is 503.
+
+Slack has two more capture lanes that skip the classifier and file a `life_fact`
+directly: the `/remember <text>` slash command, and reacting to **your own**
+message with `slack_saveit_emoji` (default `:brain:`) — the latter requires
+`slack_owner_member_id` plus a Slack history scope, and is a silent no-op
+without them. The full set of capture surfaces is tabulated in
+[`architecture/overview.md`](architecture/overview.md#capture-surfaces); the
+scopes and the reinstall they require are in
+[`production.md`](production.md#slack-scopes).
 
 ## Adding a New Connector
 

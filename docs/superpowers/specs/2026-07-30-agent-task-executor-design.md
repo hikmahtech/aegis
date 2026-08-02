@@ -1,6 +1,9 @@
 # Agent task executor — design
 
-**Status:** implemented and live (`agent-task-15min`)
+**Status:** implemented and live (`agent-task-15min`). Historical record — the
+registration notes below (`worker/__main__.py`'s "two separate lists",
+`_ACTIVITY_TYPE_MAP`) were superseded by the `registry.py` `FlowSpec` table in
+PR #204; see [`development.md`](../../development.md#adding-a-new-flow).
 **Issue:** [#151](https://github.com/hikmahtech/aegis/issues/151)
 **Date:** 2026-07-30
 

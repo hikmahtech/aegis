@@ -12,9 +12,14 @@ then broken into themed, independently-shippable development tasks (Part 3).*
 
 **The entire 33-task queue below (A1–A9, B1–B9, C1–C8, D1–D7) has been
 implemented, merged to `main`, deployed and independently reviewed.** Every task
-shipped as its own squash-merged PR. Four separate code-review rounds produced
-follow-up fix PRs (#181, #185, #191, #214, #222), plus a CI-flake fix (#196) and
-a production incident fix (#224).
+shipped as its own squash-merged PR. Five separate code-review rounds produced
+follow-up fix PRs (#181, #185, #191, #214, #222, and — after this status block was
+first written — #229, #231, #233), plus a CI-flake fix (#196) and a production
+incident fix (#224). The last round's fixes were: curiosity no longer surfaces
+A4-retired memories and the health importer refuses an unknown unit instead of
+assuming one (#229); a person or asset can be unlinked from an expiring item, and a
+connector that fails to initialise raises instead of degrading to `None` (#231); and
+A2 refuses a drifted persona-draft approval (#233, below).
 
 **Read everything below as a record of intent and reasoning — NOT as a to-do
 list, and NOT as an accurate description of the code.** It was written on
@@ -35,7 +40,10 @@ and where the implementation deliberately deviated from the sketch.
   independent keys* are turned — the DB-side config flag and an environment kill
   switch. Shipping it did not arm it.
 - **A2** and **A5** write nothing to a persona doc until a human approves the
-  `draft_review` card.
+  `draft_review` card. As of #233, an approval whose acknowledged base fingerprint
+  no longer matches the live doc is refused with **409** rather than clobbering the
+  newer content — the human is shown the conflict and must resubmit with a
+  `base_ack` equal to the current fingerprint.
 
 ---
 

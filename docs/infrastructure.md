@@ -313,7 +313,7 @@ this or the page will show nothing.
 
 ## Remote script / coding agents
 
-The remote-script subsystem (chat's `run_script` infra tools, coding-CLI runs
+The remote-script subsystem (chat's `run_infra_script` and the other infra tools, coding-CLI runs
 via kimi/claude, workspace scans/mirrors, `gh pr create`) SSHes into one
 designated host. That host is configured **from the admin UI**: any
 `ssh_host`/`swarm`/`docker` entry has a collapsible **Coding agent (remote
