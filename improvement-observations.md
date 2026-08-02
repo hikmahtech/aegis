@@ -8,6 +8,294 @@ then broken into themed, independently-shippable development tasks (Part 3).*
 
 ---
 
+## STATUS (2026-08-02) — COMPLETE. This is a record, not a plan.
+
+**The entire 33-task queue below (A1–A9, B1–B9, C1–C8, D1–D7) has been
+implemented, merged to `main`, deployed and independently reviewed.** Every task
+shipped as its own squash-merged PR. Four separate code-review rounds produced
+follow-up fix PRs (#181, #185, #191, #214, #222), plus a CI-flake fix (#196) and
+a production incident fix (#224).
+
+**Read everything below as a record of intent and reasoning — NOT as a to-do
+list, and NOT as an accurate description of the code.** It was written on
+2026-07-31 against a tree that has since moved substantially (D6 and D7 rewrote
+the very registration and `chat.py` structure the sketches cite). **43 of its
+specific claims are catalogued below as false or stale** — some already false
+when written, some made false by the queue's own execution — and several of
+them, followed literally, would have shipped silent failures. They are in
+**Known-stale claims** immediately below, which is the section to read first.
+
+The per-task sketches are retained **unedited**: their reasoning is the point of
+keeping this document. Each now carries a one-line outcome marker naming its PR
+and where the implementation deliberately deviated from the sketch.
+
+**Three tasks ship deliberately inert** and stay inert until an operator acts:
+
+- **A4** (memory consolidation) will not mutate `agent_memory` until *two
+  independent keys* are turned — the DB-side config flag and an environment kill
+  switch. Shipping it did not arm it.
+- **A2** and **A5** write nothing to a persona doc until a human approves the
+  `draft_review` card.
+
+---
+
+## Known-stale claims — do NOT trust this document for mechanics
+
+Each entry cites the PR that found it. Numbers are for reference only.
+
+### Migration numbers — every single one in this document is wrong
+
+Slots were reallocated as the queue executed. `migrations/` is at `021`, not the
+`014` the Theme C preamble claims.
+
+| # | Doc says | Actually shipped as | Found by |
+|---|---|---|---|
+| 1 | A4 `016_agent_memory_provenance.sql` | `020_agent_memory_consolidation.sql` | #218 |
+| 2 | C1 `015_life_people.sql` | `016_life_people.sql` | #189 |
+| 3 | C4 `016_life_observations.sql` | `017_life_observations.sql` | #195 |
+| 4 | C5 `017_life_expiring_items.sql` | `018_life_expiring_items.sql` | #199 |
+| 5 | C7 `018_life_assets.sql` | `019_life_assets.sql` | #203 |
+| 6 | Theme C preamble: "`migrations/` is up to `014`" | stale by seven slots; B7 took `021` | #207 |
+
+A1's `015` is the only number in the document that held.
+
+### Line numbers and file structure
+
+7. **Every `chat.py` line number in this document is stale**, and the file has
+   since been *partially decomposed* — the infra and Vercel executors now live in
+   `core/src/aegis/services/tools/`, so some cited symbols are no longer in
+   `chat.py` at all. (#216, #193, #195, #213)
+8. **`chat.py`'s size and shape were both misreported.** D7 claims "~4,537 lines,
+   confirmed" (it was 5,169 at the time) and "~104 `_exec_*` functions" (there
+   were 52 definitions / 50 registry entries). (#216)
+9. **Other stale citations, all cosmetic but all wrong:** `knowledge.py:301`/`:187`
+   → `:304`/`:190` (#192); `alert_webhook_secret` `config.py:206` → `:234`, and
+   `integrations_config.py` lives under `services/`, not `api/routes/` (#206);
+   `Settings.mcp_servers` `config.py:209` → `:242`, `app.py:166`/`:207` →
+   `:168`/`:209` (#211); `prune_memories` `:115` → `:145` (#218);
+   `prune_old_records` `:227` → `:232` (#195); `slack_owner_member_id` `:82` →
+   `:83` and the `file_shared` handler `:493` → `:500` (#186);
+   `KnowledgeStore.ingest_content` `:94` → `:96` (#179); `_ACTIVITY_TYPE_MAP`
+   `:57` → `:59`/`:60`, `WORKFLOWS` `~:111` → `:118`/`:120`, runtime `workflows`
+   `~:668` → `~:724`/`:731` (#199, #193, #204).
+
+### Wiring checklists — the registration model changed underneath them
+
+10. **The six hand-edited `__main__.py` lists named all over Theme A/B/C
+    checklists were DELETED by D6** (`c6b9f8f`). Registration is now a single
+    `FlowSpec` in `worker/src/aegis_worker/registry.py` plus a seed row, enforced
+    by a `check_registration()` boot check; `base_workflows()` /
+    `all_activity_methods()` derive the rest. **Activity methods need no
+    registration edit at all** — they are collected from `@activity.defn` on the
+    instances `main()` builds. Every checklist saying "both `__main__.py` lists"
+    or "the activities list ~:560" is obsolete. (#207, #209, #210, #217, #219)
+11. **D6's own fan-out count was wrong** — it lists five places; there were
+    **seven**. It misses `_FEATURE_FLAGGED_TYPES` (`schedule_sync.py`) and treats
+    the flow-class import as free. (#204)
+12. **A8's "both `__main__.py` lists" was really three**, and its activity list
+    was short by one (`commit_daylog_state`). (#187)
+13. **C3's "No new flow registration" omitted the activity registration** its own
+    sketch requires — following it verbatim gives a runtime "activity type not
+    registered" failure that no existing unit test catches. (#193)
+14. **C6's five-point checklist contains no activity-registration point at
+    all.** Followed verbatim it ships a flow that boots fine and dies at
+    runtime. Six points were needed. (#199)
+15. **C5 and C7's checklists both omit the SPA wiring** (`App.tsx` route,
+    `Layout.tsx` nav, `api/client.ts`). (#203)
+16. **B7: `CHANNEL_KINDS` exists twice.** The doc names only
+    `core/src/aegis/api/routes/channels.py`; `admin-panel/frontend/src/pages/Channels.tsx`
+    has its own copy that drives rendering, so a wearable row would have been
+    invisible and uneditable in the admin panel. (#207)
+
+### Behavioural claims that were simply false
+
+These are the dangerous ones — correct about what to call, wrong about what that
+call does. CI cannot catch any of them.
+
+17. **"Pass `db_pool` + `purpose` to `LLMClient.think()` so the call lands in
+    `llm_calls`" is FALSE.** `think()` calls `_record_failure` only from its
+    `except` block, and raises `LLMTruncationError` *outside* that block — so
+    both success and truncation go unrecorded. Repeated in A2, A3 and A6.
+    Implementations use an explicit `record_llm_call` on success plus an explicit
+    error row on truncation. (#217, #208)
+18. **`KnowledgeStore.list_content_items` cannot return the body A9 assumes.**
+    It selects the `summary` *column*, and `knowledge_content` has no raw-text
+    column at all — the body exists only as `knowledge_chunks` rows. `search` is
+    a semantic top-k and can neither bound a window nor guarantee every date in
+    one. Following the sketch would have filed a contentless rollup with green
+    tests. (#192)
+19. **`format_weekly_preview` is only a FALLBACK.** In production `frame_review`
+    returns an LLM narrative that *replaces* it, so C3's key-date block added
+    there would have rendered in tests and never reached the user. (#193)
+20. **Core `ConfigKey`s do not reach the comms process.** `CONFIG_REGISTRY`
+    values live in core's `settings` table overlaid onto core's `Settings`; comms
+    has no DB access and `CommsSettings` is env-only. Only the Slack subset
+    crosses, via `resolve_slack_config` / `GET /api/internal/slack-config`. B2's
+    checklist as written would have made the feature permanently inert with
+    nothing logged; B3's requested `ConfigKey("voice_ingest_secret", …)` was
+    dropped for the same reason. (#186, #208)
+21. **`ConfigKey("mcp_enabled", "…", "Features", boolean=True)` is a `TypeError`
+    as written** — `secret` is a required positional. (#211)
+22. **The `settings` `calendar_events_%` KV rows have NO writer in this repo.**
+    Cited as an evidence source by A2 and A8; they are legacy n8n leftovers with
+    exactly one reference anywhere, a *read*. Live calendar data is
+    `knowledge_content` + `knowledge_chunks` at `source_type='calendar'`.
+    (#180, #187)
+23. **Retention entries keyed by SOURCE silently no-op.** `prune_old_records`
+    prunes by TABLE: `_ALLOWED_TABLES` is derived from `_TIMESTAMP_COLUMNS`, and
+    anything outside it is skipped with a `cleanup_table_not_allowed` log. So B5's
+    `"location"` key would have looked configured and pruned nothing, and C4's
+    "no code change is needed there beyond the new dict key" is wrong — a
+    `_DEFAULT_RETENTIONS` entry alone never deletes a row. A1 hit the same trap
+    and had to add the `_TIMESTAMP_COLUMNS` entry. (#195, #209, #210, #178)
+24. **`seed.py` does not overwrite `activities.config` once the DB owns it**, so
+    a seed-YAML config edit never reaches an existing deployment. A3's "ship the
+    seed row with `dry_run: true` so the first production week is observe-only"
+    silently assumed propagation; it applies to a fresh install only. (New slugs
+    are an INSERT, so *those* land.) (#194, #198, #204)
+25. **A6's detector SQL named a column that no longer exists.**
+    `finance.recurring_charge.monthly_inr_equivalent` was renamed to
+    `monthly_home_equivalent` by `migrations/009_money_home_currency.sql`. As
+    written it would raise `UndefinedColumnError` on every run — swallowed by the
+    per-detector try/except into a permanently, silently dead detector. (#180)
+26. **Both of C2's named call sites are wrong.** `calendar_event_to_content` is a
+    pure converter in core with no pool (and `CalendarActivities` carries no
+    `db_pool`); `ingest_email_to_kg` is only called for
+    `important_action`/`important_read` and early-returns on an unset connector
+    or empty body, so enrichment hung off it would silently cover a fraction of
+    mail. (#202)
+27. **Calendar cannot set `last_contact`.** `fetch_events` uses `timeMin=now`
+    with a forward horizon — every event it returns is in the *future*, so
+    bumping `last_contact` from it would answer "when did I last talk to X?"
+    with a meeting that has not happened. Calendar also flattens attendees to
+    bare email strings, so it cannot supply display names either. (#202)
+28. **B9's "executor calls `request.app.state.mcp_manager`" is impossible as
+    written** — executors are `(pool, args, ctx)`; there is no `request`.
+    Required adding `ToolContext.mcp_manager`. Its "truncates the result to the
+    same size ceiling other executors use" is also false: **no** executor
+    truncates; the `send_message` loop does. And `metadata.mcp_servers` had to
+    be an object, not the list the doc specifies, or the acceptance criteria
+    themselves are unsatisfiable. (#213)
+29. **C7's acceptance criterion 3 is not implementable.** Tagging a `resources`
+    row `asset:<slug>` and finding it "via the existing knowledge search path"
+    does not work — `search_knowledge` does pgvector search over
+    `knowledge_content`, `references.py` lists `knowledge_content`, and
+    `list_resources` filters only by `kind`. **Nothing reads `public.resources`
+    by tag.** Storable, not queryable. (#203)
+30. **A2's UI instruction was not implementable as written** —
+    `GET /api/interactions/{id}` did not return `metadata`, so the editor could
+    not be initialised from `metadata.proposed_doc`. A2 added it. (#217)
+31. **An `input` card with no options renders as a dead card.** `cards.py` emits
+    a URL button for `input` only when `options.aegis_ui_url` is present, so A7's
+    card needed that threaded from settings or there would have been no way to
+    answer it; C6 sidestepped it by using `ack`. (#198, #199)
+32. **A7's `should_send` gate alone cannot produce `status="budget"`.**
+    `notification_budget_enabled` is `False` by default and in production, and
+    `should_send` *always allows* when disabled. The per-day count is what
+    actually enforces `max_per_day`. (#198)
+33. **B4's per-source secret override cannot be generic.** `Settings` is a
+    pydantic model, so `getattr(settings, f"life_webhook_secret_{source}")`
+    resolves to nothing unless the field is *declared*. Also: an **optional**
+    `X-Aegis-Timestamp` is not replay protection — it shipped mandatory. (#206)
+34. **C1's requested GIN index would have been dead.** A plain GIN index over a
+    mixed-case `text[]` cannot serve the case-insensitive alias probe C2 needs;
+    aliases are normalized on write instead. (#189)
+35. **A3's acceptance criterion 1 is unreachable as written** — "one row
+    remains, count drops by exactly one" requires applying the plan, which A3's
+    own hard gate forbids. Internally inconsistent with criteria 3 and 4 in the
+    same list. (#194)
+36. **C6's "insert the alert row only after a successful `safe_send_message`" is
+    not possible on a card path** (dispatch happens in a child workflow after the
+    activity returns) and is not race-safe. (#199)
+37. **A5's "`superseded_by = NULL, source = 'promoted'`" is incoherent and
+    unsafe** — `superseded_by = NULL` is a no-op on a column that does not exist
+    until A4, and rewriting `source` would clobber `source='gmail_triage_correction'`,
+    the exact marker A4's own section says must be protected. Relatedly, A4's
+    `superseded_by` cannot be the retirement marker at all; `superseded_at` was
+    added instead. (#219, #218)
+
+### Forward references and things that did not exist
+
+38. **`capture_classify` did not exist when A2, A3 and A6 cite it as "the
+    correct template" for LLM-call wiring.** It appears only in this document —
+    as B3's own `purpose` string, and in sections that reference B3. It was a
+    forward reference; **B3 created it** (#208). A3 had to substitute
+    `IntelligenceActivities.score_significance` / `DayLogActivities.distil_daylog`
+    (#194).
+39. **B7's "reuse B6's metric vocabulary and normalization helpers" — B6 had not
+    landed.** There was nothing to reuse. (#207)
+40. **B7's `source_types.py` registration is inert.** That registry is the
+    `knowledge_content.source_type` vocabulary; the wearable feature writes to
+    `life.observations.source`, a different column, and nothing calls
+    `warn_if_unknown` on it. (#207)
+41. **`channels:history` was already in the Slack manifest** — only
+    `reactions:read` and the `reaction_added` subscription were new. (#186)
+42. **B5's `metadata={place, lat, lon, accuracy, trigger}` contradicts its own
+    "coarse coords only" instruction** in the same bullet. Shipped storing no
+    coordinates at all. (#209)
+43. **Two proposed crons land on crowded minutes.** A2's `0 2 * * 0` sits on
+    minute `:00`, the busiest minute in the schedule file (two hourly flows plus
+    the `*/2`, `*/5`, `*/15` and `*/30` steppers) — the very thing its own
+    justification rules out; shipped `23 2 * * 0`. C6's `15 7 * * *` is free
+    among daily rows but is the `*/15` sweep minute; shipped `25 7 * * *`.
+    (#217, #199)
+
+---
+
+## Follow-on issues this work opened
+
+Open:
+
+- **#182** — Postiz channel sync is manual-only; new channels stay invisible to the publish pipeline
+- **#183** — Task labelled for a platform with no connected account stays open forever
+- **#184** — No tool answers "which social channels can you post to?"
+- **#200** — No API path to unlink a person or asset from an expiring item (C5/C7)
+- **#205** — Connector construction failures degrade silently to `None` (the hazard D6 declined to fix in scope)
+- **#212** — Health import: unknown unit falls back silently, risking a 60x or 4x error (B6)
+- **#215** — Briefing narrative still carries the rendered health block into Temporal history (B6)
+- **#220** — `gather_profile_evidence` reads two global tables, so any test leak breaks every "quiet week" assertion (A2)
+- **#221** — A2: a drifted persona-doc approval is silent to the approver
+- **#223** — Curiosity `_known_text` does not filter A4 soft-retired memories (A6/A4 interaction)
+- **#225** — Social posts silently stuck: Postiz orchestrator stopped polling Temporal since Jul 29, with no QUEUE-past-due alert
+- **#226** — A scheduled flow can fail every run indefinitely with no alert
+
+Closed by their fixing PRs:
+
+- **#188** — Flow registration tests checked the wrong list; a removal from the Worker's actual list would slip past → closed by **#204** (D6)
+- **#190** — `test_alert_escalation` leaks a temporal-test-server, hanging the next suite run at ~99% → closed by **#196**
+- **#201** — A4 review checklist: the consolidation SQL spy does not cover MERGE/TRUNCATE → closed by **#218**
+
+---
+
+## What the queue actually taught us
+
+Two findings worth carrying forward.
+
+**1. The document's errors had one shape: correct about what it calls, wrong
+about what that call does.** Symbol names and file paths were nearly always
+right. What was wrong was the *behaviour* behind them — `think()` does not log
+the call, `list_content_items` does not return the body, `format_weekly_preview`
+is not the delivery path, a source-keyed retention entry prunes nothing, a
+`ConfigKey` does not reach comms, `seed.py` does not overwrite config. Every one
+of these compiles, type-checks, lints clean and passes a call-shape test. CI
+cannot catch this class of error; only reading the callee can. Every task in the
+queue was therefore run with an explicit "verify each cited claim against the
+code before implementing, and report deviations" step — which is where this
+entire stale-claims list came from.
+
+**2. Break-and-revert falsifiability caught vacuous tests in most rounds.** The
+practice — deliberately break the implementation, confirm the test fails, revert
+— repeatedly exposed tests that passed for the wrong reason, *including several
+where an agent's own first-draft test passed against a deliberately broken
+implementation*. Concrete examples: A9's rollup test passed with the day-log body
+dropped entirely, until break-and-revert showed the filed document read
+`"Weekly log 2026-W31 — 7 day(s) recorded."` and nothing else (#192); C4's
+`float8` write cast turned out to be doing nothing and was removed (#195); B2
+dropped a duplicate guard because removing either copy alone changed no test
+(#186). A test that has never been observed to fail is not evidence.
+
+---
+
 ## Part 1 — Where the system stands today
 
 ### What AEGIS currently ingests about its owner
@@ -175,9 +463,18 @@ follow.
 
 ## Theme A — Memory & learning loop
 
+> **STALE — the "6-point registration rule" below no longer exists.** D6 (PR #204,
+> `c6b9f8f`) deleted all six hand-edited lists. A new scheduled flow is now one
+> `FlowSpec` in `worker/src/aegis_worker/registry.py` plus a seed row in
+> `config/seed/activities.yaml`, enforced by `check_registration()` at worker boot.
+> Activity methods need no registration edit at all. Every per-task "all 5 points"
+> checklist in Themes A, B and C is obsolete for the same reason.
+
 Goal: AEGIS stops being stateless-with-notes and starts accumulating a durable, human-auditable model of its owner. Four features, split into nine independently shippable tasks. All flow work follows the 6-point registration rule (flow class import + module-level `WORKFLOWS` at `worker/src/aegis_worker/__main__.py:111` + the local `workflows` list in `main()` ~line 670 + the `activities` list ~line 555 + `_ACTIVITY_TYPE_MAP` at `worker/src/aegis_worker/schedule_sync.py:57` + a seed row in `config/seed/activities.yaml` — Part 1's "five hand-edited lists plus seed YAML"); every flow config dataclass keeps `agent_id` as its first field. Per-task "all 5 points" checklists below fold the flow-class import into point 1.
 
 ### A1 — Profile write path + revision log
+
+> **SHIPPED — PR #178 (`0abb939`).** Migration `015` as sketched (the only correct number in the doc). Deviations: a `_TIMESTAMP_COLUMNS` entry was also required or the retention would never have pruned; no FK on `interaction_id` (a revision must outlive the interaction); a patch is recorded even when content is unchanged.
 
 **Outcome** A safe, auditable server-side path for programmatically patching an agent's `user` personality doc, with every revision recorded and revertible. Nothing writes to it yet — this is the substrate A2/A5/A7 land on.
 
@@ -199,6 +496,8 @@ Goal: AEGIS stops being stateless-with-notes and starts accumulating a durable, 
 **Size** M **Depends on** —
 
 ### A2 — ProfileReflectionFlow (weekly draft_review)
+
+> **SHIPPED — PR #217 (`793d4db`). Ships INERT: nothing reaches a persona doc until a human approves the card.** Deviations: registration is a `FlowSpec` (D6), not the listed lists; the `think()` logging claim is false, so `record_llm_call` is explicit on both success and `LLMTruncationError`; `metadata` had to be added to `GET /api/interactions/{id}` for the UI panel; cron `23 2 * * 0`, not `0 2 * * 0`. Follow-ups: #220, #221; refined by #222.
 
 **Outcome** Every week each agent proposes a concrete diff to its own `user` personality doc, delivered as a `draft_review` interaction card; the human approves or edits before anything is written.
 
@@ -225,6 +524,8 @@ Goal: AEGIS stops being stateless-with-notes and starts accumulating a durable, 
 
 ### A3 — Memory consolidation pass (ADD/UPDATE/DELETE/NOOP)
 
+> **SHIPPED — PR #194 (`6d768ba`), planner only.** Deviations: `apply_consolidation` was deliberately NOT written (not writing the destructive SQL makes safety structural rather than a flag); `dry_run=False` refuses *unconditionally* rather than probing for A4's table; acceptance criterion 1 was unreachable as written; the seed `config` change does not reach an existing deployment.
+
 **Outcome** The nightly `MemoryReflectionFlow` stops being a row-cap and actually consolidates: duplicate lessons merge, contradictions resolve in favour of the newer signal, stale rows retire.
 
 **Implementation sketch**
@@ -246,6 +547,8 @@ Goal: AEGIS stops being stateless-with-notes and starts accumulating a durable, 
 **Size** M **Depends on** — (dry-run only; non-dry-run execution is hard-blocked until A4 lands)
 
 ### A4 — Consolidation safety rails
+
+> **SHIPPED — PR #218 (`407afc3`). Ships INERT: two independent keys (DB config flag + environment kill switch) are required before it mutates `agent_memory`.** Deviations: migration `020`, not `016`; `superseded_at` is the retirement marker, not `superseded_by`; `agent_memory_ops_log` deliberately left OUT of `_DEFAULT_RETENTIONS` (the janitor has no predicate support and would delete the applied-op record) with a tripwire test; protection keyed on the `[gmail:` content marker rather than `source`. Closed #201.
 
 **Outcome** The consolidation pass can be trusted to run with `dry_run: false`: deletions are bounded, provenance survives, and a bad night is reversible.
 
@@ -269,6 +572,8 @@ Goal: AEGIS stops being stateless-with-notes and starts accumulating a durable, 
 
 ### A5 — Generalization promotion (memory → profile)
 
+> **SHIPPED — PR #219 (`39f9801`). Ships INERT behind A2's human-approved card.** Deviations: `propose_generalizations` lives on `ProfileActivities`, not `MemoryActivities` (avoids racing A4's concurrent rewrite of that file); the sketch's `superseded_by = NULL, source = 'promoted'` was not implemented — incoherent and would clobber the gmail dedupe marker — so nothing in `agent_memory` is mutated and the ledger is `promoted_memory_ids` + the revision row; zero registration edits needed. Refined by #222.
+
 **Outcome** Repeated lessons stop living forever as one-line memories and get promoted into the durable `user` profile doc — through the same human-approved card as A2, never silently.
 
 **Implementation sketch**
@@ -287,6 +592,8 @@ Goal: AEGIS stops being stateless-with-notes and starts accumulating a durable, 
 **Size** M **Depends on** A1, A2, A3
 
 ### A6 — Curiosity gap-finder activity
+
+> **SHIPPED — PR #180 (`e7b68cd`), plus review fix #181 (`b9db109`: exclude the calendar owner from gaps, count only open tasks).** Deviations: the sketch's `finance.recurring_charge` column was renamed by migration `009`, so the detector as specced would have been permanently and silently dead; attendees are read from `knowledge_content`/`knowledge_chunks` at `source_type='calendar'`, not the writerless `calendar_events_%` KV rows. Open follow-up: #223.
 
 **Outcome** A deterministic, testable detector that turns data gaps into at most a handful of ranked candidate questions per day — no delivery, no LLM required for the detection itself.
 
@@ -307,6 +614,8 @@ Goal: AEGIS stops being stateless-with-notes and starts accumulating a durable, 
 **Size** M **Depends on** —
 
 ### A7 — CuriosityCardFlow (one question per day, budget-aware)
+
+> **SHIPPED — PR #198 (`7b54879`).** Deviations: the daily cap is checked *before* the shared budget (otherwise a pending card shadows `status="budget"`), and the shared-budget rejection is reported as `global_budget`; `should_send` alone cannot enforce the cap since the budget is disabled by default; three activities, not two; the card must thread `aegis_ui_url` or an `input` card renders with no way to answer.
 
 **Outcome** At most one `input`-kind card per day asks the owner a real question about their life, and the answer is banked as durable memory.
 
@@ -329,6 +638,8 @@ Goal: AEGIS stops being stateless-with-notes and starts accumulating a durable, 
 
 ### A8 — DayLogFlow (nightly episodic diary)
 
+> **SHIPPED — PR #187 (`b261c56`), plus review fix #191 (`300c6ca`: exclude archived cards).** Deviations: `calendar_events_%` settings rows are not a source (they have no writer) — meetings come from `knowledge_chunks` filtered on the `Start: <date>` text; `lookback_hours` → `day_offset` (a 24h window at the 19:00 UTC cron lands on the wrong date); three registration lists, not two, and a third activity (`commit_daylog_state`).
+
 **Outcome** Each night, the day's actual events become one dated knowledge-store entry with `source_type='daylog'`, giving future retrieval an episodic spine ("what happened on 2026-07-14") the briefing archive can't provide.
 
 **Implementation sketch**
@@ -350,6 +661,8 @@ Goal: AEGIS stops being stateless-with-notes and starts accumulating a durable, 
 **Size** M **Depends on** —
 
 ### A9 — DayLog weekly + monthly rollups
+
+> **SHIPPED — PR #192 (`3cd781a`).** Deviation (load-bearing): `KnowledgeStore.list_content_items` / `search` cannot supply the day-log body — the activity reads `knowledge_content JOIN knowledge_chunks` directly and stitches the 200-char chunk overlap. Flow count is unchanged by design (`activities` 160→162, `flows` 33→33).
 
 **Outcome** Weekly and monthly summaries built from the daylog entries, so retrieval over "last quarter" doesn't have to read 90 daily documents.
 
@@ -377,6 +690,8 @@ New life-data senses. Every task below reuses one of three existing shapes: the 
 
 ### B1 — `life_fact` capture lane
 
+> **SHIPPED — PR #179 (`da653b5`), plus review fix #181 (`b9db109`: reject an empty `life_fact`).** The most accurate section in the document — every cited claim held except `ingest_content` being at `:96`, not `:94`. Implementation deviation: the new DB-touching route tests use httpx `ASGITransport`, not the file's existing `TestClient` (which drives its own event loop and dies on the asyncpg pool).
+
 **Outcome:** The existing capture surfaces can drop a *fact about my life* into the knowledge store instead of a Todoist task. Everything downstream (B2, B3) routes into this lane.
 
 **Implementation sketch**
@@ -396,6 +711,8 @@ New life-data senses. Every task below reuses one of three existing shapes: the 
 **Size:** S · **Depends on:** —
 
 ### B2 — Curated self-signal ingest (Slack reaction / note-to-self)
+
+> **SHIPPED — PR #186 (`1f09540`), plus review fix #191 (`300c6ca`: unblock note-channel mentions).** Deviation (load-bearing): the wiring checklist would have shipped a permanent silent no-op — core `ConfigKey`s never reach comms, so both guards would have read `""` forever. Config is threaded through `resolve_slack_config` / `/api/internal/slack-config` instead. `channels:history` was already in the manifest; only `reactions:read` is new.
 
 **Outcome:** Marking my own message with a designated emoji (or posting in a note-to-self channel) files it as a `life_fact`. Only self-signals — never other people's messages.
 
@@ -418,6 +735,8 @@ New life-data senses. Every task below reuses one of three existing shapes: the 
 
 ### B3 — Voice-first capture with intent classifier
 
+> **SHIPPED — PR #208 (`e627a70`).** This task **created** `capture_classify`, which A2/A3/A6 cite as an existing template — it was a forward reference. Deviations: `balanced` tier, not `fast`; `think()` records neither successes nor truncations, so both are recorded explicitly; no core `ConfigKey` for the voice secret (ConfigKeys do not reach comms) — it is a comms env var, unset ⇒ 503 fail-closed; raw body rather than multipart (`python-multipart` is not a comms dependency); low-confidence and unknown labels also fall back to `task`.
+
 **Outcome:** A voice note (iOS Shortcut or Slack) becomes either a Todoist Inbox task or a `life_fact`, without me deciding which.
 
 **Implementation sketch**
@@ -436,6 +755,8 @@ New life-data senses. Every task below reuses one of three existing shapes: the 
 **Size:** M · **Depends on:** B1
 
 ### B4 — Generic signed life-data webhook
+
+> **SHIPPED — PR #206 (`16b6384`), plus review fix #214 (`22894a0`: opaque 401 for isdigit-but-unparseable timestamps, release idempotency claims on failure).** Deviations: `X-Aegis-Timestamp` is **mandatory**, not optional (an optional one is not replay protection); the per-source secret override was dropped for v1 (pydantic `Settings` cannot resolve an undeclared dynamic field); unknown-slug 404 moved *after* verification so the endpoint cannot be enumerated; `LIFE_SOURCES` values are `str | None`, with `None` meaning "record inline", or the endpoint would have 404'd every request until B5.
 
 **Outcome:** One authenticated push endpoint that phone/watch/home-automation clients can POST to, dispatching to a per-source Temporal flow. The substrate for B5 and B6.
 
@@ -457,6 +778,8 @@ New life-data senses. Every task below reuses one of three existing shapes: the 
 **Size:** M · **Depends on:** —
 
 ### B5 — Location channel with place inference
+
+> **SHIPPED — PR #209 (`3c96e47`), plus review fix #214.** Deviations: **no `LocationIngestFlow`** — a workflow argument is persisted verbatim in Temporal history, i.e. a second copy of exactly the coordinates this feature exists to discard, at ~290 executions/day for one haversine and one INSERT; ingest is inline. The suggested source-keyed retention entry is a silent no-op and was not added. No coordinates are stored at all — `metadata` is `{place, trigger}`. Migration slot `020` was not needed.
 
 **Outcome:** OwnTracks / Home Assistant pushes resolve to a named place ('home', 'office', …), recorded as observations and surfaced in the daily briefing.
 
@@ -480,6 +803,8 @@ New life-data senses. Every task below reuses one of three existing shapes: the 
 
 ### B6 — Health push channel (Apple Health Auto Export)
 
+> **SHIPPED — PR #210 (`bb5a267`), plus review fix #214 (keep health out of workflow history).** Deviations: **no `HealthIngestFlow`** — same Temporal-history argument as B5, stronger for body data; ingest is inline, boot delta zero. No source-keyed retention entry (silent no-op); malformed payload → 422 plus claim release, not a `{"status": …}` result; no new `ConfigKey`, `Settings` field or migration. Added beyond the sketch: timestamp plausibility bounds. Open follow-ups: #212, #215.
+
 **Outcome:** Sleep, HRV, resting HR, steps and active energy land as observations from a Health Auto Export automation, ready for the briefing and for correlation work in Theme C.
 
 **Implementation sketch**
@@ -501,6 +826,8 @@ New life-data senses. Every task below reuses one of three existing shapes: the 
 
 ### B7 — Wearables poll channel (Oura / Whoop-style API)
 
+> **SHIPPED — PR #207 (`bba2529`), migration `021`.** Deviations: the wiring checklist is obsolete — D6 deleted all six lists an hour earlier, so registration is one `FlowSpec` plus a seed row; the frontend `Channels.tsx` keeps its own `CHANNEL_KINDS` copy that the checklist omits (the row would have been invisible in the admin panel); cron `50 */6`, not `45 */2` (the sketch's own justification argues against 12 polls a day); B6 had not landed, so there was no metric vocabulary to reuse; the `source_types.py` entry is inert (wrong column).
+
 **Outcome:** A scheduled cursor-based poll for wearable vendors that offer an API but no webhook — the same data shape as B6, different transport.
 
 **Implementation sketch**
@@ -520,6 +847,8 @@ New life-data senses. Every task below reuses one of three existing shapes: the 
 **Size:** M · **Depends on:** C4
 
 ### B8 — Real MCP client transport
+
+> **SHIPPED — PR #211 (`1588f8f`), streamable-HTTP only.** Deviations: **stdio was deliberately not implemented** — it is config-driven local process execution and is *explicitly rejected* with a message rather than silently ignored, which also voids the sketch's stdio-fixture acceptance criteria (replaced with respx-mocked HTTP equivalents); `ConfigKey(…, boolean=True)` as written is a `TypeError`; `mcp>=1.2` was not added; an unknown transport is a per-entry rejection with an ERROR log, not a boot-time raise that would take Core down over one typo.
 
 **Outcome:** `MCPManager` actually connects. `POST /api/mcp/{server}/{tool}` executes against a configured MCP server instead of returning 501, and servers can be listed/introspected.
 
@@ -542,6 +871,8 @@ New life-data senses. Every task below reuses one of three existing shapes: the 
 **Size:** L · **Depends on:** —
 
 ### B9 — MCP tool surface for agents
+
+> **SHIPPED — PR #213 (`593c118`).** Deviations: `request.app.state.mcp_manager` is unreachable from an executor (signature is `(pool, args, ctx)`) — added `ToolContext.mcp_manager`, wired for both `send_message` and `synthesize_agent_reply`; `metadata.mcp_servers` is an **object**, not a list, and a list is now explicitly refused; truncation applied in the executor because no other executor truncates; the `channels`-row stretch bullet was not shipped, per the sketch's own instruction.
 
 **Outcome:** Agents can call whitelisted MCP tools from chat, so an MCP server becomes both a tool provider and a life-data source.
 
@@ -568,9 +899,18 @@ New life-data senses. Every task below reuses one of three existing shapes: the 
 
 **Schema strategy (applies to C1–C7):** follow the existing per-domain schema precedent (`finance`, `pandoras_actor`, created by `migrations/001_baseline.sql` and renamed/extended in `migrations/010_rename_maou_schema.sql` / `008_infra_cloud.sql`). Introduce a new `life` schema for the tables this theme adds (`life.people`, `life.observations`, `life.expiring_items`, `life.assets`). Keep them out of `public` so `\dt` / backups / retention sweeps stay organized by domain the same way finance and homelab data already are. `core/src/aegis/db/pool.py::run_migrations` runs plain numbered SQL with no schema-awareness required — a `CREATE SCHEMA IF NOT EXISTS life;` at the top of the first migration that touches it is sufficient. Household/asset data (C7) and life-document expiry (C5/C6) both live in `life` rather than extending `resources` or `infra`, because those two tables carry infra-specific columns (`ssh_user`, `docker_context`, encrypted `credentials`) that don't fit a car or a passport; manuals/receipts stay in `knowledge_content`/`resources` and are cross-referenced by tag/slug instead of by foreign key, consistent with how `resources.infra_id` is the only existing cross-table link of this kind.
 
+> **STALE — every migration number in this theme is wrong**, and `migrations/` is
+> now at `021`, not `014`. Actual slots: C1 `016_life_people`, C4
+> `017_life_observations`, C5 `018_life_expiring_items`, C7 `019_life_assets`
+> (A4 took `020`, B7 `021`). The paragraph's own advice — "verify the highest
+> existing number again immediately before creating each migration file" — is the
+> one instruction here that held, and D5's CI guard now enforces it.
+
 Migration numbers below assume the tasks ship in the listed order starting from the next free slot; `migrations/` is up to `014_delete_vercel_project_sync.sql` (note two `006_*.sql` files already exist — `006_infra_coding.sql` and `006_social_metrics.sql` — so that collision is historical, not a slot to reuse). **Verify the highest existing number again immediately before creating each migration file**, since other themes may land first.
 
 ### C1 — `people` schema + service + admin CRUD
+
+> **SHIPPED — PR #189 (`86c740d`), migration `016` not `015`.** The most accurate Theme C section — every structural claim held. Deviations: aliases are normalized to lowercase on write, because a plain GIN index over a mixed-case `text[]` cannot serve the case-insensitive probe C2 needs (it would have been a dead index); added `find_people` + a `?q=` list param, which the section's own acceptance criteria require.
 
 **Outcome:** a queryable `life.people` table with basic CRUD, usable standalone (manual entry) before any enrichment exists.
 
@@ -595,6 +935,8 @@ Migration numbers below assume the tasks ship in the listed order starting from 
 
 ### C2 — Passive people enrichment from email/calendar co-occurrence
 
+> **SHIPPED — PR #202 (`c78b2fa`).** Deviations: **both named call sites were wrong** — `calendar_event_to_content` is a pure converter with no pool, and `ingest_email_to_kg` runs for only a fraction of mail; enrichment is a new `PeopleActivities` called from the flow and from `_route`. Calendar deliberately does **not** set `last_contact` (`fetch_events` is forward-looking, so it would answer "when did I last talk to X?" with a meeting that has not happened) and cannot supply display names. The kill switch is a `CONFIG_REGISTRY` boolean, not a settings row + migration.
+
 **Outcome:** `life.people` rows get created/updated automatically from who the user emails and meets, without manual entry, laying the groundwork for "last time I talked to X" and birthday radar.
 
 **Implementation sketch:**
@@ -616,6 +958,8 @@ Migration numbers below assume the tasks ship in the listed order starting from 
 
 ### C3 — People downstream: birthday/anniversary radar + "last time I talked to X" chat tool
 
+> **SHIPPED — PR #193 (`6f35c43`).** Deviations: `format_weekly_preview` is only a **fallback** — in production `frame_review`'s LLM narrative replaces it, so key dates are appended in the flow *after* `frame_review` and survive both paths; the "no new flow registration" checklist omitted the new `ReviewActivities` method, which would have failed at runtime, so a guard test now asserts every `@activity.defn` on that class is registered; `_spawn_review_interaction` belongs to `DailyReviewFlow`, not `WeeklyReviewFlow`.
+
 **Outcome:** `key_dates` on a person surface proactively, and any chat agent can answer contact-recency questions.
 
 **Implementation sketch:**
@@ -635,6 +979,8 @@ Migration numbers below assume the tasks ship in the listed order starting from 
 **Depends on:** C1 (dates can be entered manually even without C2); C2 improves `last_contact` accuracy but is not required.
 
 ### C4 — `observations` table + query service + chat tool
+
+> **SHIPPED — PR #195 (`febfdbd`), migration `017` not `016`.** Deviation (load-bearing): "no code change is needed there beyond the new dict key" is **wrong** — `_ALLOWED_TABLES` is derived from `_TIMESTAMP_COLUMNS`, so a `_DEFAULT_RETENTIONS` entry alone would have shipped a retention that never deleted a row; both maps were edited. Also: the read-side `value::float8` cast is load-bearing (asyncpg returns `Decimal`), the write-side one was not and was removed after break-and-revert; tool param is `window_days`.
 
 **Outcome:** a generic life-metrics store (weight, sleep, location pings, home-sensor readings, etc.) that other themes (Theme B location/health channels) can write into immediately.
 
@@ -658,6 +1004,8 @@ Migration numbers below assume the tasks ship in the listed order starting from 
 
 ### C5 — Expiry radar: `life.expiring_items` registry + admin CRUD
 
+> **SHIPPED — PR #197 (`a16c249`), migration `018` not `017`.** The section's core call — start with the `finance.renewal_alert` existence-check dedup shape rather than `cert_expiry`'s sticky column — was adopted as written. The wiring checklist's omission of the SPA wiring (`App.tsx` / `Layout.tsx` / `client.ts`) was noted by C7 (#203). Open follow-up: #200.
+
 **Outcome:** a place to register anything with an expiry/renewal date (passport, visa, licence, insurance policy, warranty, medication refill, domain), ready for the daily flow in C6 to consume. Ships independently as manually-browsable data even before the flow exists.
 
 **Implementation sketch:**
@@ -679,6 +1027,8 @@ Migration numbers below assume the tasks ship in the listed order starting from 
 **Depends on:** C1 (optional `person_id` FK — nullable, so C5 does not hard-depend on C1 shipping first; omit the FK constraint if C1 hasn't landed yet and add it in a later migration)
 
 ### C6 — Expiry radar: daily flow + interaction cards
+
+> **SHIPPED — PR #199 (`eb2170e`).** Deviations: the five-point checklist below has **no activity-registration point**, so following it verbatim ships a flow that boots and then dies at runtime — six points were needed; three activities collapsed into one atomic `claim_due_alerts` (splitting find from record reintroduces the read-then-write race the ledger exists to remove); "insert the alert row only after a successful `safe_send_message`" is impossible on a card path, so the sketch's own insert-first alternative was taken; cron `25 7`, not `15 7` (the `*/15` sweep minute); card kind `ack`, because `input` renders with no button unless `aegis_ui_url` is threaded.
 
 **Outcome:** the registry from C5 actually produces proactive warnings, generalizing the `CertRadarFlow` pattern (`worker/src/aegis_worker/flows/cert_radar.py`) to life documents.
 
@@ -704,6 +1054,8 @@ Migration numbers below assume the tasks ship in the listed order starting from 
 
 ### C7 — Household/asset registry
 
+> **SHIPPED — PR #203 (`4725e7a`), migration `019` not `018`.** Deviations: acceptance criterion 3 is **not implementable** — nothing in the codebase reads `public.resources` by tag, so an `asset:<slug>` tag is storable but not queryable; the limitation is documented in the `019` header instead, and wiring a tag-filtered read is a separate opt-in change. The sketch gives no upsert key and `life.expiring_items` has no unique constraint to support `ON CONFLICT`, so the service-due feed is UPDATE-then-INSERT. The wiring checklist omits the SPA wiring (same gap as C5). Open follow-up: #200.
+
 **Outcome:** cars, appliances, and home systems get a structured home, generalizing the `infra` table pattern (`core/src/aegis/services/infra.py`, admin page `admin-panel/frontend/src/pages/Infra.tsx`) without inheriting infra's SSH/credentials machinery that doesn't apply to a washing machine.
 
 **Implementation sketch:**
@@ -726,6 +1078,8 @@ Migration numbers below assume the tasks ship in the listed order starting from 
 **Depends on:** C5 (for the `life.expiring_items` upsert — the CRUD half could ship without it, but do it as one task since the service-due feed is the point of the feature)
 
 ### C8 — `source_type` registry module
+
+> **SHIPPED — PR #177 (`a2cc33c`).** Implemented as sketched; no deviations reported. Note the resulting registry governs `knowledge_content.source_type` only — B7 later found that registering a value there does nothing for `life.observations.source`, a different column (#207).
 
 **Outcome:** the knowledge store's `source_type` stops being an implicit, scattered string vocabulary and becomes a single declared list with per-type decay windows, making it safe to add life-domain source types (`people`, `observation`, `expiring_item`) without another silent-drift risk.
 
@@ -754,6 +1108,8 @@ Migration numbers below assume the tasks ship in the listed order starting from 
 
 ### D1 — Fix stale tool-capability fallback in chat.py (quick win)
 
+> **SHIPPED — PR #173 (`04781c3`).** Implemented as sketched (post-correction); no further deviations reported.
+
 **Outcome:** The tool-calling substitution's fallback model is routed via the live-configured `balanced` tier instead of a frozen, now-dead model name.
 
 **Correction (2026-08-01, PR #173):** an earlier draft of this section wrongly claimed `_TOOL_INCAPABLE_MODELS` was stale and should become a `claude-` prefix check. Verified against the live LiteLLM config (`homelab-gitops/ansible/roles/ollama/templates/litellm-config.yaml.j2`): `claude-haiku`/`claude-sonnet`/`claude-opus` are bare max-proxy bridge aliases that strip the `tools` array, while `claude-sonnet-5` / `claude-haiku-4.5` are separate, real-Anthropic-API LiteLLM entries with `model_info.supports_function_calling: true` — fully tool-capable. `smart` resolving to `claude-sonnet-5` and NOT matching `_TOOL_INCAPABLE_MODELS` is correct, intentional behavior, not a bug — a prefix check would silently downgrade every tool-bearing smart-tier chat turn to `balanced` for no reason. The exact-match set is right as-is. The genuine defect below (the hardcoded fallback literal) stands.
@@ -774,6 +1130,8 @@ Migration numbers below assume the tasks ship in the listed order starting from 
 
 ### D2 — Declare the `cryptography` dependency (quick win)
 
+> **SHIPPED — PR #173 (`04781c3`), together with D1.** Implemented as sketched; no deviations reported.
+
 **Outcome:** `core`'s dependency manifest accurately reflects what its code imports, so `cryptography` isn't silently relying on another package's transitive pin.
 
 **Implementation sketch:**
@@ -790,6 +1148,8 @@ Migration numbers below assume the tasks ship in the listed order starting from 
 **Depends on:** none
 
 ### D3 — Fix CORS misconfiguration in app.py
+
+> **SHIPPED — PR #176 (`c73baca`).** Implemented as sketched; no deviations reported.
 
 **Outcome:** CORS policy is a real, enforceable allowlist instead of a combination browsers reject outright (and that is meaningless for a same-origin-serving SPA + API).
 
@@ -808,6 +1168,8 @@ Migration numbers below assume the tasks ship in the listed order starting from 
 
 ### D4 — SPA catch-all must 404 unknown `/api/*` paths, not return `200 null`
 
+> **SHIPPED — PR #174 (`8dd122c`).** Implemented as sketched; no deviations reported.
+
 **Outcome:** Requests to unregistered `/api/*` routes return a proper `404`, matching client/error-handling expectations instead of a deceptive `200` with a `null` body.
 
 **Implementation sketch:**
@@ -823,6 +1185,8 @@ Migration numbers below assume the tasks ship in the listed order starting from 
 **Depends on:** none
 
 ### D5 — Guard against future duplicate migration numbers
+
+> **SHIPPED — PR #175 (`00c4ccb`).** Implemented as sketched; no deviations reported. It earned its keep immediately — six of the queue's migrations landed in slots other than the ones this document assigns.
 
 **Outcome:** A CI check fails fast if a new migration reuses an already-taken numeric prefix, while the existing duplicate pair (`006_infra_coding.sql` / `006_social_metrics.sql`) is left untouched since renaming applied migrations is unsafe (tracked by filename in `schema_migrations`).
 
@@ -840,6 +1204,8 @@ Migration numbers below assume the tasks ship in the listed order starting from 
 **Depends on:** none
 
 ### D6 — Declarative flow/activity/connector registration + boot-time completeness check
+
+> **SHIPPED — PR #204 (`c6b9f8f`). This task invalidated every wiring checklist in this document.** Registration is now one `FlowSpec` in `worker/src/aegis_worker/registry.py` plus a seed row, with `base_workflows()` / `all_activity_methods()` / `activity_type_map()` derived from it and a `check_registration()` boot check. Deviations: the fan-out was **seven** places, not five (`_FEATURE_FLAGGED_TYPES` was missed); no per-flow `activities:` list — activities are owned by classes, not flows, so they are derived from the instances and the list is removed rather than moved; `seed_defaults` omitted (one flow class backs several rows with different configs, and `activities.config` is DB-owned after first boot); the **connector registry was declined** — four connectors with genuinely different construction, no second consumer, no completeness invariant. Closed #188; the declined connector hazard is tracked as #205.
 
 **Outcome:** Adding a new Temporal flow (or connector) requires touching one declarative registration point instead of five hand-maintained lists, and a half-wired flow fails loudly at worker boot instead of silently never scheduling.
 
@@ -864,6 +1230,8 @@ Migration numbers below assume the tasks ship in the listed order starting from 
 **Depends on:** none (but should land before new life-data flows are added, per theme framing)
 
 ### D7 — Begin chat.py decomposition: extract tool executors into `services/tools/<domain>.py`
+
+> **SHIPPED — PR #216 (`105bf19`), first pass only: `services/tools/{base,infra,vercel}.py`.** Every figure this section cites was wrong at HEAD — 5,169 lines not "~4,537", 52 `_exec_*` definitions / 50 registry entries not "~104", and all four line numbers stale. The "under ~2,000 lines" acceptance criterion was **not met and not attempted** (the section says *begin*). Deviations: per-module executor dicts rejected — the names must be imported into `chat.py` anyway for routes and tests, so a per-module dict would be a second source of truth; and `AGENT_TOOL_SETS` is agent-scoped and overlapping, so it does not induce a partition of the executors — implementation coupling was used instead.
 
 **Outcome:** `services/chat.py` (currently ~4,537 lines, confirmed) shrinks by moving its ~104 `_exec_*` tool-executor functions into domain-scoped modules under `services/tools/`, with zero behavior change and all existing import paths preserved for tests.
 
@@ -890,6 +1258,12 @@ Migration numbers below assume the tasks ship in the listed order starting from 
 ## Part 4 — Bugs & hygiene found along the way
 
 Found incidentally during the audit; tracked as Theme D tasks above.
+
+> **All five are FIXED.** (1) and (2) → PR #173; (3) → PR #176; (4) → PR #174;
+> (5) → PR #175. Note item 1's framing was already corrected in PR #172 before
+> implementation — see the correction block inside D1: the `smart` tier
+> *deliberately* does not match `_TOOL_INCAPABLE_MODELS`, and only the hardcoded
+> `gpt-oss:20b` fallback was a real defect.
 
 1. **Stale tool-capability guard (likely live bug on the main chat path).**
    `_TOOL_INCAPABLE_MODELS` in `core/src/aegis/services/chat.py` matches by
