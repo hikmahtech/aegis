@@ -154,8 +154,8 @@ The shipped schedule set (`config/seed/activities.yaml` — all crons UTC):
 | Slug | Cron (UTC) | Flow | Agent | What it does |
 |---|---|---|---|---|
 | `gtd-daily-review` | `30 2 * * *` | `DailyReviewFlow` | Sebas | Daily GTD digest + acknowledgement card |
-| `memory-reflection-nightly` | `0 3 * * *` | `MemoryReflectionFlow` | Sebas | Caps each agent's `agent_memory` at `keep` rows (default 50). With `consolidate: true` it first *proposes* a merge/retire plan and logs it — observe-only, it never writes |
-| `social-metrics-daily` | `30 3 * * *` | `SocialMetricsFlow` | Sebas | Pulls post analytics into `social_outbox.metrics` |
+| `memory-reflection-nightly` | `0 3 * * *` | `MemoryReflectionFlow` | Sebas | Caps each agent's `agent_memory` at `keep` rows (default 50). With `consolidate: true` it first *proposes* a merge/retire plan and logs every op to `agent_memory_ops_log`. Applying it needs **two independent keys**: `dry_run: false` on this row *and* `AEGIS_MEMORY_CONSOLIDATION_APPLY_ENABLED=true` in the worker environment. Both default to off, so it ships inert. Armed, a DELETE is a **soft retire** (recoverable; `retire_grace_days: 0` = never hard-deleted), and a plan whose destructive ops exceed `max_ops_pct` of the agent's live rows is refused wholesale |
+| `social-metrics-daily` | `30 3 * * *` | `SocialMetricsFlow` | Sebas | Pulls post analytics into `social_outbox.metrics`, then runs the stuck-post watchdog: a Postiz-routed post more than `stuck_after_hours` (6) past its schedule with no PUBLISHED confirmation raises one deduped `[SOCIAL]` card (a `[SOCIAL OK]` on recovery). Mute key `social-stuck:<subject>` |
 | `cleanup-daily` | `0 4 * * *` | `CleanupFlow` | Pandora's Actor | Retention prune for unbounded ops tables |
 | `daily-briefing-raphael` | `30 4 * * *` | `DailyBriefingFlow` | Raphael | The daily brief: interactions, activity, knowledge, market summary → your channel |
 | `workspace-repo-sync-daily` | `0 5 * * *` | `WorkspaceRepoSyncFlow` | Pandora's Actor | Mirrors the coding host's workspace checkouts into `resources`; flags tracked repos with a missing AEGIS webhook |
@@ -186,10 +186,14 @@ replies), `AgentTaskFlow` (per-task child of the sweep), and `GitHubAlertFlow`
 (GitHub PR webhook notifier).
 
 Note the **ship-active-but-inert** pattern: `social-publish-5min`,
-`llm-spend-guard-15min`, and `drive-sync-raphael` are all `active: true` but
-gated on a settings/config value that defaults to off. Their runs complete
-green while doing nothing until you flip the gate — deliberate, but easy to
-misread ([§10](#10-failure-modes-worth-recognising)).
+`llm-spend-guard-15min`, `drive-sync-raphael`, `wearable-ingest-6h`,
+`expiry-radar-daily`, and the consolidation half of `memory-reflection-nightly`
+are all `active: true` but gated on a settings value, a credential, an empty
+registry, or (for consolidation) two independent keys. Their runs complete green
+while doing nothing until you act — deliberate, but easy to misread
+([§10](#10-failure-modes-worth-recognising)). The full list of what each one is
+waiting for is in
+[`production.md`](production.md#features-that-stay-inert-until-you-act).
 
 ## 4. The GTD / Todoist model
 

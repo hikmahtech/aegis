@@ -96,14 +96,16 @@ The pandora carve-out: when `spawn_kind == "pandora_investigation"` and `applied
 
 ## 6. Settings invariants
 
-These settings rows are seeded by migrations 011 + 012 and are read by the GTD pipeline:
+These settings rows are read by the GTD pipeline. All four static ones are seeded by
+`001_baseline.sql` (they predate the baseline squash, which absorbed the migrations
+that originally created them):
 
-| Key | Migration | Default | Purpose |
+| Key | Seeded by | Default | Purpose |
 |---|---|---|---|
-| `todoist_capture_enabled` | 011 | `true` | Kill switch for every `capture_to_inbox` call |
-| `todoist_managed_project_ids` | runtime | `{}` | Created by `bootstrap_if_empty`; maps `inbox / reference / someday / projects / ...` keys to Todoist project ids |
-| `gtd_clarify_enabled` | 012 | `true` | Kill switch for `ClarifyFlow.find_unclassified_items` |
-| `gtd_2min_rule_enabled` | 012 | `true` | Gate for the 2-min in-window comms card spawn (Slack) |
+| `todoist_capture_enabled` | 001 | `true` | Kill switch for every `capture_to_inbox` call |
+| `todoist_managed_project_ids` | runtime | `{}` | Created by `bootstrap_if_empty`; maps **only** `inbox` → the native Todoist Inbox's id. AEGIS manages no other project |
+| `gtd_clarify_enabled` | 001 | `true` | Kill switch for `ClarifyFlow.find_unclassified_items` |
+| `gtd_2min_rule_enabled` | 001 | `true` | Gate for the 2-min in-window comms card spawn (Slack) |
 | `user_timezone` | 001 | `UTC` | Used by the in-window check for the 2-min rule |
 
 The worker bootstrap at `worker/.../__main__.py` logs a `todoist_settings_missing` warning if any of these keys are absent at boot — flags a failed migration before the silent defaults engage.
@@ -112,4 +114,4 @@ The worker bootstrap at `worker/.../__main__.py` logs a `todoist_settings_missin
 
 The `todoist_labels` projection has no `UNIQUE(name)` index (an earlier one was dropped, folded into `001_baseline.sql`). Such a unique constraint was a sync-token poison pill: a Todoist delta containing a rename collision (label A id=X name="Old" already in our projection; label B id=Y name="Old" arrives in the same diff) made the `INSERT ... ON CONFLICT (id) DO UPDATE` violate the name-unique index because the INSERT path matches by id, not name. The transaction aborted, sync_token never advanced, and every subsequent tick re-polled the same poison diff.
 
-No runtime code reads `todoist_labels` by name (the seed loader uses ids; chat-tool reads come off the `todoist_tasks.labels` text-array column), so dropping the index is safe. Migration 018 drops it. The defensive empty-name skip in `apply_sync_diff:194` remains in place.
+No runtime code reads `todoist_labels` by name (the seed loader uses ids; chat-tool reads come off the `todoist_tasks.labels` text-array column), so dropping the index is safe — the drop is itself folded into `001_baseline.sql`, which simply never creates it. The defensive empty-name skip in `apply_sync_diff` remains in place.

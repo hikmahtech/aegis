@@ -44,21 +44,23 @@ the admin login, and `docker compose up -d` (see
 ```bash
 pytest            # full suite — needs the Postgres from step 3
 ruff check .      # lint — this is what CI enforces
-ruff format .     # format (but NOT on core/src/aegis/services/chat.py — see note)
+ruff format .     # format (but NOT on the two files noted below)
 ```
 
 - **CI is test-only.** The GitHub Actions workflows run `ruff check` + `pytest`
   on every push/PR and nothing else — no deploy, no secrets — so a PR from a
   fork runs cleanly with zero configuration. DB-dependent tests self-skip when
   no Postgres is reachable.
-- **`chat.py` formatting:** `core/src/aegis/services/chat.py` has local-ruff
-  version drift — do **not** run `ruff format` on it (it rewrites the whole
-  file). Write already-formatted edits; `ruff check` must still pass.
+- **Two files you must not `ruff format`:** `core/src/aegis/services/chat.py`
+  and `core/src/aegis/services/tools/infra.py`. Both carry hand-laid-out data
+  tables that a local ruff version rewrites wholesale, burying a real change in
+  whole-file churn. Write already-formatted edits; `ruff check` must still pass,
+  and CI's ruff considers both files clean as they stand.
 - **Adding a flow / chat tool / connector:** the conventions live in
-  [CLAUDE.md](CLAUDE.md) and [docs/development.md](docs/development.md) — a
-  flow is one `FlowSpec` in `worker/src/aegis_worker/registry.py` plus a seed
-  row, and the worker refuses to boot if the two disagree; chat tools and
-  connectors are still explicit lists. Follow the checklist there.
+  [docs/development.md](docs/development.md) — a flow is one `FlowSpec` in
+  `worker/src/aegis_worker/registry.py` plus a seed row, and the worker refuses
+  to boot if the two disagree (activities need no registration at all); chat
+  tools and connectors are still explicit lists. Follow the checklist there.
 
 ## Reporting bugs & requesting features
 

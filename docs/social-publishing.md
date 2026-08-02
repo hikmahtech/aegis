@@ -40,10 +40,14 @@ via `/api/admin/social/{platform}/connect` still works for accounts connected th
 **Scheduling:** on approval, Postiz-routed posts are created with `type: "schedule"` at
 the task's Todoist due time (`payload.schedule_at`, threaded from `find_due_posts` →
 card metadata → outbox payload) — the post sits in Postiz's queue and Postiz publishes
-it at exactly the due moment. A due time already in the past when approval lands
-publishes immediately (`type: "now"`; date-only tasks resolve to `default_post_hour`
-local and follow the same rule). The Todoist task completes at approval/handoff —
-Postiz owns delivery from there.
+it at exactly the due moment. A due time already in the past when approval lands is
+**rolled forward whole days to the next occurrence of the same time-of-day** and stays
+a `type: "schedule"` post — posting "now" instead fired a 13:00 slot at whatever hour
+the approval happened to land. The roll-forward is logged as
+`postiz_late_approval_rolled_forward`. Only a payload with no (or an unparseable)
+`schedule_at` posts `type: "now"`. Date-only tasks resolve to `default_post_hour`
+local first, then follow the same rule. The Todoist task completes at
+approval/handoff — Postiz owns delivery from there.
 
 - **Config:** set `postiz_url` (base URL, e.g. `https://postiz.example.com`) and
   `postiz_api_key` on the admin **Integrations** page, under the "Postiz" group.
@@ -98,20 +102,41 @@ them on the row:
   posts" table (`GET /api/admin/social/posts?days=14`) showing platform, text,
   status, state, series summary, a "open ↗" link to `release_url`, and when metrics
   were last refreshed.
-- **Knobs:** `window_days` (default 14, seed slug `social-metrics-daily`, 03:30 UTC
-  = 09:00 IST) controls both how far back `find`-eligible outbox rows go and the
-  `GET /posts` lookup window. No gate on `social_publishing_enabled` — refreshing
+- **Knobs** (seed slug `social-metrics-daily`, 03:30 UTC = 09:00 IST): `window_days`
+  (14) is the **backward** half — how far back `find`-eligible outbox rows go and the
+  `GET /posts` lookback; `lookahead_days` (45) is the forward half, which was
+  previously hardcoded at 1 day and made every post scheduled past tomorrow read as
+  `state: "unknown"`. A row is eligible on `created_at` recency **or** a still-ahead /
+  recently-past `schedule_at`. `max_rows` (200) caps analytics calls per pass — hitting
+  it is logged, never swallowed. No gate on `social_publishing_enabled` — refreshing
   metrics on already-posted rows is harmless even while publishing is off.
-- **Chat:** the `social_timeline` tool (Sebas) answers "what have we posted / what's
-  queued" straight from Postiz `GET /posts` — published *and* scheduled, including
-  posts authored in the Postiz UI that never went through `social_outbox`. Args:
-  `days_back` / `days_ahead` (default 14, max 90) and an optional Postiz `state`
+- **Stuck-post watchdog** (same flow, second half, `check_stuck: true` by default):
+  `find_stuck_posts` flags Postiz-routed rows more than `stuck_after_hours` (6) past
+  their `schedule_at` with no PUBLISHED confirmation, and `report_stuck_posts` sends
+  one `[SOCIAL] N post(s) stuck in Postiz` card carrying the remediation text (a Postiz
+  instance showing "0 pollers" needs
+  `docker service update --force <stack>_postiz`). Deduped for `dedup_hours` (168) via
+  `audit_log` `social_stuck_alert`; a `[SOCIAL OK]` recovery notice re-arms it within
+  `recovery_hours` (720). Silence it with an `alert_mutes` row keyed
+  `social-stuck:<subject>`. The watchdog is best-effort — a failure returns
+  `stuck_status: "check_failed"` rather than taking the metrics refresh down, and
+  reporting is **skipped** (not called with an empty list) when detection failed, so a
+  detection outage can't fire bogus recovery notices.
+- **Chat:** the `social_timeline` tool (seeded to Sebas) answers "what have we posted /
+  what's queued" straight from Postiz `GET /posts` — published *and* scheduled,
+  including posts authored in the Postiz UI that never went through `social_outbox`.
+  Args: `days_back` / `days_ahead` (default 14, max 90) and an optional Postiz `state`
   filter. Granting it to another agent is a DB write to `agents.metadata.tool_set`.
-  The returned `posts` list is a byte-budgeted *sample* (`truncated` says whether
-  rows were dropped); `channels_in_window` is the complete per-channel roll-up,
-  keyed by Postiz `providerIdentifier`, and is what answers "which channels am I
-  posting to?" — channel display names are not unique (dev.to and the personal
-  LinkedIn share one).
+  The returned `posts` list is a byte-budgeted *sample* (`truncated` says whether rows
+  were dropped). `channels_in_window` keeps the post **totals** complete, but the
+  per-channel breakdown is itself byte-capped: channels are listed busiest-first and
+  the remainder folds into a single `+K more` entry. Keys are the platform alone when
+  unique, else `platform (channel name)` — display names are not unique (dev.to and
+  the personal LinkedIn share one).
+- `list_social_channels` (also seeded to Sebas) is the direct answer to "which
+  channels am I posting to?": every connected `social_accounts` row (`platform`,
+  `channel`, `via`, `todoist_label`) plus `labeled_but_not_connected` — labels mapped
+  in `social_platform_labels` with no account behind them — and `publishing_enabled`.
 
 ## What it does (target behavior)
 
@@ -127,9 +152,16 @@ them on the row:
    channel `identifier`: `linkedin-page` = a company page, `linkedin` = a personal
    profile (so e.g. `social_platform_labels` maps a bare `linkedin` label → the
    `linkedin-page` account when that's the channel you connected).
-2. `SocialPublishFlow` (scheduled every 5 min) finds due publish-labeled tasks in the
-   already-mirrored `todoist_tasks` table.
+2. `SocialPublishFlow` (scheduled every 5 min) first does two best-effort housekeeping
+   steps outside its failing path — `sync_postiz_channels` (throttled channel mirror)
+   and `retire_unpublishable_tasks` — then finds due publish-labeled tasks in the
+   already-mirrored `todoist_tasks` table. "Due" means within `lookahead_minutes`,
+   *except* for tasks whose labeled platforms are **all** Postiz-mirrored: Postiz
+   holds the schedule itself, so those are carded however far out their due date is.
 3. For each, it spawns an `InteractionFlow` card: post preview + [Approve] [Skip].
+   The card is an **abandoned** child with a `post_resolve_activity` hook and a
+   deterministic id (`social-approve-<task_id>`), not an awaited one — see the
+   deviations above.
 4. On approve, the post is queued in `social_outbox` and published to each labeled
    platform; the Todoist task is completed via the existing `todoist_outbox`.
 5. Failures retry with attempt counting (same semantics as `todoist_outbox`); a post
@@ -164,8 +196,11 @@ Todoist task (labels: publish + x, due 9:00)
         │  (already mirrored by TodoistSyncFlow every 5 min → todoist_tasks)
         ▼
 SocialPublishFlow (cron */5)                          worker/flows/social_publish.py
+  sync_postiz_channels + retire_unpublishable_tasks  (best-effort housekeeping)
+        │
   find_due_posts ──► InteractionFlow card ──► user taps Approve in Slack
-        │                                             (existing HITL primitive)
+        │             (ABANDONED child +                (existing HITL primitive)
+        │              apply_social_approval hook)
         ▼
   social_outbox row(s), one per platform             migrations/005_social.sql
         ▼

@@ -1,7 +1,10 @@
 # Proactive infra detection & remediation — design
 
 **Date:** 2026-07-24
-**Status:** Approved (pending spec review)
+**Status:** Implemented and live (`infra-heartbeat-2m`). Historical record — the
+worker-registration notes below (`__main__.py`'s two explicit lists,
+`_ACTIVITY_TYPE_MAP`) were superseded by the `registry.py` `FlowSpec` table in
+PR #204; see [`development.md`](../../development.md#adding-a-new-flow).
 **Driver:** 2026-07-24 incident — two swarm nodes hard-reset (~2 min power flap); one came back with node-pinned services stuck `0/1`. AEGIS never alerted: Alertmanager's `NodeDown` self-resolved before firing (webhook skips `status=resolved`), the only internal poll (`ServiceDriftFlow`) runs every 4h, and the hand-captured Todoist task triggered nothing.
 
 ## Problem

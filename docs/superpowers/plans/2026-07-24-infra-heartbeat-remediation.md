@@ -1,5 +1,14 @@
 # Infra Heartbeat & Approve-to-Run Remediation Implementation Plan
 
+> **SHIPPED — historical record, not a recipe.** `InfraHeartbeatFlow`, the
+> escalation loop and the Gate-2 "Run fix" option are all live. The **worker
+> registration steps below are wrong**: PR #204 deleted the hand-edited
+> `workflows` / `activities` / `WORKFLOWS` / `_ACTIVITY_TYPE_MAP` lists this plan
+> edits. Registering a flow today is one `FlowSpec` in
+> `worker/src/aegis_worker/registry.py` plus a seed row — see
+> [`development.md`](../../development.md#adding-a-new-flow). Operator-facing
+> behaviour lives in [`production.md`](../../production.md#infra-heartbeat--escalation).
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Close the three infra gaps from the 2026-07-24 outage: fast internal node/service liveness detection (2-min poll), Slack escalation-until-ack for critical infra alerts, and human-approved command execution ("Run fix") from the Gate-2 card — plus a content-route bridge so hand-captured Todoist infra tasks trigger investigations.
