@@ -337,6 +337,64 @@ async def test_promotion_excludes_only_the_promoted_rows(clean_db):
 
 
 @pytest.mark.asyncio
+async def test_a_memory_a4_retired_never_supports_a_promoted_claim(clean_db):
+    """A4 composition, and the sharpest edge of it.
+
+    A retired row is one the consolidator judged redundant, contradicted or
+    wrong. If the pool query does not filter `superseded_at IS NULL`, that row
+    can be one of the >=3 supporting ids behind a claim the human then approves
+    into the `user` persona doc — the most durable store in the system, injected
+    into every prompt. Retirement would make the belief permanent instead of
+    removing it.
+
+    Retired through the real `apply_consolidation` (which issues `_SQL_RETIRE`),
+    so this breaks if A4 ever changes its retirement marker.
+
+    Deliberately seeded so the retired row is the NEWEST at equal importance:
+    unfiltered it would sort FIRST in the pool, not fall off the end — the
+    result cannot be right by an ordering accident.
+    """
+    from aegis.services.memory import apply_consolidation
+
+    triple = await _seed(clean_db, TRIPLE)
+    retired_text = "zzret-retired: owner is happy to meet at 8am"
+    (retired,) = await _seed(clean_db, [retired_text])
+    outcome = await apply_consolidation(
+        clean_db,
+        AGENT,
+        [{"op": "DELETE", "id": retired, "apply": True}],
+        run_id="zza5-retire",
+        dry_run=False,
+    )
+    assert outcome["applied"] == 1, "nothing was retired — the test proves nothing"
+    assert (
+        await clean_db.fetchval(
+            "SELECT superseded_at IS NOT NULL FROM agent_memory WHERE id = $1", retired
+        )
+        is True
+    ), "the row was hard-deleted, not soft-retired"
+
+    llm = PromptReadingLLM()
+    result = await _run(_acts(clean_db, llm))
+
+    # Content first, deliberately: a count alone could be right by accident.
+    # The model was called, and saw the three live rows and only those.
+    assert llm.prompts, "the model was never called — wrong code path"
+    assert retired_text not in llm.prompts[0]
+    for content in TRIPLE:
+        assert content in llm.prompts[0], "a live row was dropped too"
+    # ids too, because ids are what a claim is allowed to cite.
+    assert sorted(int(m) for m in re.findall(r'"id":\s*(\d+)', llm.prompts[0])) == sorted(triple)
+
+    # Nothing derived from the pool cites it either.
+    assert result["candidates"][0]["supporting_memory_ids"] == sorted(triple)
+    assert retired not in result["candidates"][0]["supporting_memory_ids"]
+
+    assert result["pool"] == len(triple), "the retired row was still counted into the pool"
+    assert result["excluded"] == 0, "retirement is not the promotion ledger"
+
+
+@pytest.mark.asyncio
 async def test_a_rejected_card_leaves_the_memories_in_the_pool_and_untouched(clean_db):
     """Acceptance: rejection leaves all supporting memories untouched and
     un-retired — so the same rows are still candidates."""

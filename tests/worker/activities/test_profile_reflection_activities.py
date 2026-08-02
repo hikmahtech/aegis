@@ -214,6 +214,68 @@ async def test_gather_evidence_on_a_quiet_week_is_total_zero(clean_db):
 
 
 @pytest.mark.asyncio
+async def test_gather_evidence_omits_a_memory_a4_soft_retired(clean_db):
+    """A4 composition: retirement must remove a belief from A2's evidence.
+
+    A4 (migration 020) retires a memory by stamping `superseded_at` and leaving
+    the row in place — it is the applier's only DELETE. If `_evidence_memories`
+    does not filter on `superseded_at IS NULL`, a lesson the consolidator
+    withdrew as redundant/contradicted keeps being quoted at the model that
+    drafts the persona doc, so retirement makes the belief MORE durable.
+
+    Retirement here goes through the real `apply_consolidation` (which issues
+    `_SQL_RETIRE`), not a hand-written UPDATE, so the test breaks if A4 ever
+    changes how a row is marked retired.
+
+    Two live rows, one retired — a bundle that is empty because nothing was
+    seeded would prove nothing, so the surviving row is asserted BY CONTENT.
+    """
+    from aegis.services.memory import apply_consolidation
+
+    live = "zzret-live: owner squashes before merging"
+    retired = "zzret-retired: owner always rebases onto main"
+    ids = {}
+    for content in (live, retired):
+        ids[content] = await clean_db.fetchval(
+            "INSERT INTO agent_memory (agent_id, content, importance, source) "
+            "VALUES ($1, $2, 0.8, 'correction') RETURNING id",
+            AGENT,
+            content,
+        )
+
+    outcome = await apply_consolidation(
+        clean_db,
+        AGENT,
+        [{"op": "DELETE", "id": ids[retired], "apply": True}],
+        run_id=f"zza2-{uuid4()}",
+        dry_run=False,
+    )
+    assert outcome["applied"] == 1, "nothing was retired — the test proves nothing"
+    assert (
+        await clean_db.fetchval(
+            "SELECT superseded_at IS NOT NULL FROM agent_memory WHERE id = $1", ids[retired]
+        )
+        is True
+    ), "the row was hard-deleted, not soft-retired"
+
+    out = await ActivityEnvironment().run(_acts(clean_db).gather_profile_evidence, AGENT, 7)
+
+    assert any(live in m for m in out["memories"]), "the LIVE row vanished too"
+    assert not any(retired in m for m in out["memories"]), out["memories"]
+    assert out["counts"]["memories"] == 1
+
+    # ...and it stays out of everything derived from the bundle. The prompt is
+    # where a leaked belief actually does its damage.
+    llm = FakeLLM(response=_llm_json())
+    await ActivityEnvironment().run(
+        _acts(clean_db, llm_client=llm).propose_profile_patch, AGENT, out, CURRENT_DOC
+    )
+    prompt = llm.calls[0]["prompt"]
+    assert live in prompt, "the live evidence never reached the prompt — wrong code path"
+    assert retired not in prompt
+
+
+@pytest.mark.asyncio
 async def test_gather_evidence_respects_the_lookback_window(clean_db):
     await clean_db.execute(
         "INSERT INTO agent_memory (agent_id, content, importance, source, created_at) "
