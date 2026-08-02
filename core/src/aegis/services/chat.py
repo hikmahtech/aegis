@@ -1477,6 +1477,27 @@ CHAT_TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "list_social_channels",
+            "description": (
+                "The social channels AEGIS is actually connected to and can publish "
+                "to — the `social_accounts` mirror, which is what the publishing "
+                "pipeline resolves a post against. Use this for ANY question about "
+                "which channels exist, are connected, or can be posted to, and to "
+                "check whether a specific platform (Bluesky, LinkedIn, Medium, X…) "
+                "is set up. Do NOT answer that from `social_timeline`: that tool "
+                "reports POSTS in a time window, so a connected channel with nothing "
+                "scheduled is invisible to it and reads as 'not configured'. "
+                "`todoist_label` is the label to put on a @publish task to route it "
+                "to that channel; `labeled_but_not_connected` lists platforms that "
+                "have such a label but NO account, so posts labelled for them cannot "
+                "go out until the channel is connected."
+            ),
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "call_mcp_tool",
             "description": (
                 "Run one tool on an EXTERNAL MCP server. Only the servers and tools "
@@ -3233,6 +3254,75 @@ async def _exec_social_timeline(pool: asyncpg.Pool, args: dict, ctx: ToolContext
     )
 
 
+# `social_accounts` is 6 rows in prod, but the roll-up has to stay inside
+# `_truncate_result`'s 4096-byte cap for the same reason `social_timeline` does:
+# over budget, `_smart_subset` keeps the first N KEYS of the dict and drops the
+# `channels` list wholesale, so the model gets metadata and no answer.
+_SOCIAL_CHANNELS_BUDGET = 2800
+_SOCIAL_CHANNELS_NAME = 60
+
+
+async def _exec_list_social_channels(pool: asyncpg.Pool, args: dict, ctx: ToolContext) -> str:
+    """Which channels AEGIS can post to, straight from `social_accounts`.
+
+    The gap this closes (#184): nothing was backed by `social_accounts`, so
+    "which social channels can you post to?" had to be inferred from
+    `social_timeline` — a view of POSTS, not of channels. On 2026-08-01 that
+    inference reported a connected, mirrored Bluesky channel with 5 queued
+    posts as absent, because the sampled window happened not to include it.
+
+    `labeled_but_not_connected` is the other half of the answer: platforms the
+    label map routes to with no account behind them, which is exactly the state
+    that silently swallows a @publish task.
+    """
+    rows = await pool.fetch(
+        "SELECT platform, label, meta, expires_at FROM social_accounts "
+        "ORDER BY platform, label"
+    )
+    label_map = await pool.fetchval(
+        "SELECT value FROM settings WHERE key = 'social_platform_labels'"
+    )
+    label_map = label_map if isinstance(label_map, dict) else {}
+    enabled = await pool.fetchval(
+        "SELECT value FROM settings WHERE key = 'social_publishing_enabled'"
+    )
+
+    channels: list[dict] = []
+    used = 0
+    for r in rows:
+        meta = r["meta"] or {}
+        entry = {
+            "platform": r["platform"],
+            "channel": str(r["label"] or "")[:_SOCIAL_CHANNELS_NAME],
+            # Postiz-mirrored rows hold no tokens of their own; native ones do.
+            "via": meta.get("via") or ("postiz" if meta.get("postiz_integration_id") else "native"),
+            "todoist_label": label_map.get(r["platform"]),
+        }
+        size = len(json.dumps(entry, default=str))
+        if channels and used + size > _SOCIAL_CHANNELS_BUDGET:
+            break
+        channels.append(entry)
+        used += size
+
+    connected = {r["platform"] for r in rows}
+    return json.dumps(
+        {
+            # `channels` leads so any future overflow sheds metadata, not the answer.
+            "channels": channels,
+            "count": len(channels),
+            "total": len(rows),
+            "truncated": len(channels) < len(rows),
+            "labeled_but_not_connected": {
+                platform: label
+                for platform, label in sorted(label_map.items())
+                if platform not in connected
+            },
+            "publishing_enabled": bool(enabled),
+        },
+        default=str,
+    )
+
+
 # --- External MCP tools (B9) ---
 #
 # An MCP server is a THIRD PARTY: it defines the tools, writes their
@@ -3585,6 +3675,7 @@ TOOL_EXECUTORS: dict[str, Any] = {
     "pdf_to_text": _exec_pdf_to_text,
     "system_status": _exec_system_status,
     "social_timeline": _exec_social_timeline,
+    "list_social_channels": _exec_list_social_channels,
     "call_mcp_tool": _exec_call_mcp_tool,
 }
 
@@ -3619,6 +3710,7 @@ AGENT_TOOL_SETS: dict[str, set[str]] = {
         "pdf_to_text",
         "system_status",
         "social_timeline",
+        "list_social_channels",
     },
     "raphael": {
         "search_knowledge",

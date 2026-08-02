@@ -32,12 +32,37 @@ _TASK = {
 }
 
 
-def _make_stubs(due: list[dict]):
+def _make_stubs(due: list[dict], *, sync_fails: bool = False, retire_fails: bool = False):
     """Stub activity set + call recorder for one worker instance."""
-    calls: dict[str, list] = {"hook": [], "drain": [], "complete": [], "card_kind": []}
+    calls: dict[str, list] = {
+        "hook": [],
+        "drain": [],
+        "complete": [],
+        "card_kind": [],
+        "sync": [],
+        "retire": [],
+        "order": [],
+    }
+
+    @activity.defn(name="sync_postiz_channels")
+    async def sync_postiz_channels(min_interval_minutes: int = 60) -> dict:
+        calls["sync"].append(min_interval_minutes)
+        calls["order"].append("sync")
+        if sync_fails:
+            raise RuntimeError("postiz unreachable")
+        return {"synced": 3, "skipped_disabled": 1, "status": "ok"}
+
+    @activity.defn(name="retire_unpublishable_tasks")
+    async def retire_unpublishable_tasks(limit: int = 20) -> dict:
+        calls["retire"].append(limit)
+        calls["order"].append("retire")
+        if retire_fails:
+            raise RuntimeError("todoist projection mid-sync")
+        return {"retired": 2}
 
     @activity.defn(name="find_due_posts")
     async def find_due_posts(lookahead_minutes: int = 10, default_post_hour: int = 9):
+        calls["order"].append("find_due")
         return due
 
     @activity.defn(name="drain_social_outbox")
@@ -75,6 +100,8 @@ def _make_stubs(due: list[dict]):
         return None
 
     stubs = [
+        sync_postiz_channels,
+        retire_unpublishable_tasks,
         find_due_posts,
         drain_social_outbox,
         complete_posted_tasks,
@@ -187,5 +214,64 @@ async def test_no_due_posts_does_nothing(temporal_env):
             "drain_posted": 0,
             "drain_failed": 0,
             "completed": 0,
+            "channel_sync": "ok",
+            "channels_synced": 3,
+            "retired": 2,
         }
         assert not calls["hook"]
+
+
+# --- #182 / #183: the housekeeping steps in front of the publish loop -------
+
+
+async def test_channel_sync_and_retirement_run_before_cards_are_dealt(temporal_env):
+    """#182: the Postiz mirror is refreshed on the schedule, not by a button.
+    #183: unpublishable tasks are retired BEFORE find_due_posts, so the tick
+    that ends them cannot also card them."""
+    stubs, calls = _make_stubs(due=[])
+    tq = f"test-{uuid4().hex[:8]}"
+    async with Worker(
+        temporal_env.client,
+        task_queue=tq,
+        workflows=[SocialPublishFlow, InteractionFlow],
+        activities=stubs,
+    ):
+        result = await temporal_env.client.execute_workflow(
+            SocialPublishFlow.run,
+            SocialPublishConfig(agent_id="sebas", channel_sync_minutes=15, max_retire=7),
+            id=f"social-publish-{uuid4()}",
+            task_queue=tq,
+        )
+
+    assert calls["order"] == ["sync", "retire", "find_due"]
+    assert calls["sync"] == [15], "channel_sync_minutes must reach the activity"
+    assert calls["retire"] == [7], "max_retire must reach the activity"
+    assert result["channel_sync"] == "ok"
+    assert result["channels_synced"] == 3
+    assert result["retired"] == 2
+
+
+async def test_a_postiz_outage_does_not_stop_the_publish_tick(temporal_env):
+    """The mirror refresh is housekeeping: an unreachable Postiz must not stop
+    an already-approved post from draining, nor fail the run."""
+    stubs, calls = _make_stubs(due=[], sync_fails=True, retire_fails=True)
+    tq = f"test-{uuid4().hex[:8]}"
+    async with Worker(
+        temporal_env.client,
+        task_queue=tq,
+        workflows=[SocialPublishFlow, InteractionFlow],
+        activities=stubs,
+    ):
+        result = await temporal_env.client.execute_workflow(
+            SocialPublishFlow.run,
+            SocialPublishConfig(agent_id="sebas"),
+            id=f"social-publish-{uuid4()}",
+            task_queue=tq,
+        )
+
+    assert result["channel_sync"] == "sync_failed"
+    assert result["channels_synced"] == 0
+    assert result["retired"] == 0
+    # The publish half still ran end to end.
+    assert calls["order"][-1] == "find_due"
+    assert calls["drain"] and calls["complete"]

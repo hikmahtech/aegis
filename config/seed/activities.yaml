@@ -84,11 +84,16 @@ activities:
   # Social publishing — a Todoist task (@publish + platform labels, due time =
   # post time) becomes a post after an approval card. Ships inert: the
   # social_publishing_enabled settings row (migration 005) defaults to false.
+  # channel_sync_minutes: how stale the social_accounts mirror of Postiz's
+  # connected channels may get before the tick re-syncs it (#182). The mirror
+  # is what a Todoist platform label resolves against, so a channel connected
+  # in Postiz is unpublishable until it lands here.
   - slug: social-publish-5min
     workflow_type: SocialPublishFlow
     agent_id: sebas
     schedule_cron: "*/5 * * * *"
-    config: {}
+    config:
+      channel_sync_minutes: 60
     active: true
 
   # Daily Postiz analytics pull into social_outbox.metrics (Postiz-routed
