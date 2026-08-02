@@ -52,6 +52,19 @@ def test_is_infra_alert_dockerservicedown():
     assert is_infra_alert(alert) is True
 
 
+def test_is_infra_alert_servicedownprolonged_without_cluster_label():
+    """ServiceDownProlonged is already in _REMEDIABLE_ALERTNAMES, but
+    _safe_remediate_infra only runs inside the is_infra_alert branch — so
+    missing here (with `infra_cluster` at its blank default) meant Prometheus'
+    2h escalation, and InfraHeartbeatFlow's #138 re-investigation, went down
+    the LLM repo-match path and never got their force-restart."""
+    alert = {
+        "source": "aegis-heartbeat",
+        "labels": {"alertname": "ServiceDownProlonged", "service_name": "miniflux_miniflux"},
+    }
+    assert is_infra_alert(alert) is True
+
+
 def test_is_infra_alert_cluster_label_alone():
     """A configured cluster label is sufficient even with an unknown alertname."""
     alert = {

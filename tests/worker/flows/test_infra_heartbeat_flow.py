@@ -352,6 +352,22 @@ async def test_confirmed_stuck_service_reinvestigates_once_not_every_tick():
     assert _calls["spawned"] == []
 
 
+async def test_service_confirmed_recently_is_not_reinvestigated():
+    """The threshold itself: 2h of being stuck is not `restuck_hours`. Without
+    it every confirmed service would re-alert on the tick after confirmation —
+    exactly the 2-minute noise transition-only logic exists to avoid."""
+    svc = "koyra-drwhome_drwhome-jobs"
+    collect = {"ok": True, "nodes": {"baa": "Ready"}, "stuck": [svc], "error": ""}
+    prior = {"nodes": {}, "stuck": [svc], "confirmed": [svc], "fail_count": 0}
+    _reset(collect, prior)
+    await _run()
+    aged = _backdate(_calls["written"][0], "confirmed_at", svc, 2)
+    _reset(collect, aged)
+    result = await _run(InfraHeartbeatConfig(restuck_hours=24))
+    assert result["services_reinvestigated"] == 0
+    assert _calls["spawned"] == []
+
+
 async def test_reinvestigation_repeats_after_the_dedup_window_expires():
     """The ratchet is a delay, not a permanent silence."""
     svc = "ollama_ollama-2"
