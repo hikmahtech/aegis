@@ -20,10 +20,53 @@ import uuid
 from unittest.mock import AsyncMock
 
 import pytest
+import pytest_asyncio
 from aegis_worker.activities.money import MoneyActivities
 from temporalio.testing import ActivityEnvironment
 
 _FX_RATES = {"USD": 84.5}
+
+
+@pytest_asyncio.fixture(autouse=True, loop_scope="function")
+async def _drop_finance_rows_on_exit(test_db_url):
+    """Clean up on TEARDOWN, not just before each insert.
+
+    Every test here already deletes its own rows on setup, which keeps the
+    file self-consistent but leaves them in the shared database for whoever
+    runs next. `finance.recurring_charge` and `finance.receipt_email` are read
+    AGENT-AGNOSTICALLY by ProfileReflectionActivities._evidence_finance
+    (`WHERE status = 'active'`, no agent_id), so the leftovers made another
+    file's "a quiet week produces no evidence" test see 18 items and fail —
+    but only when pytest-xdist's `--dist loadfile` put the two files on the
+    same worker, which is why it surfaced as an unrelated PR's flake.
+
+    Takes its own connection off the session-scoped `test_db_url` rather than
+    borrowing the `db_pool` fixture: db_pool is function-scoped and would be
+    closed before this teardown runs, and depending on it would force the
+    no-Postgres tests in this file to require a database.
+    """
+    yield
+    if test_db_url is None:
+        return
+    import asyncpg
+
+    scope = "account LIKE 'acct-%' OR sender_label LIKE 'bundle-e-%'"
+    conn = await asyncpg.connect(test_db_url)
+    try:
+        # FK order: renewal_alert and receipt_email both reference
+        # recurring_charge.id.
+        await conn.execute(
+            f"DELETE FROM finance.renewal_alert WHERE charge_id IN "
+            f"(SELECT id FROM finance.recurring_charge WHERE {scope})"
+        )
+        await conn.execute("DELETE FROM finance.receipt_email WHERE account LIKE 'acct-%'")
+        await conn.execute(
+            f"UPDATE finance.receipt_email SET charge_id = NULL WHERE charge_id IN "
+            f"(SELECT id FROM finance.recurring_charge WHERE {scope})"
+        )
+        await conn.execute(f"DELETE FROM finance.recurring_charge WHERE {scope}")
+    finally:
+        await conn.close()
 
 
 def _make_act(db_pool, delivery=None):

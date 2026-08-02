@@ -14,6 +14,7 @@ from aegis.services.agents import get_agent as _get_agent
 from aegis.services.agents import list_agents as _list_agents
 from aegis.services.agents import reassign_agent_rows as _reassign_agent_rows
 from aegis.services.agents import update_agent as _update_agent
+from aegis.services.memory import list_memory_ops
 from aegis.services.personalities import (
     get_personality,
     list_profile_revisions,
@@ -72,6 +73,31 @@ async def get_agent_personality_revisions(
         return await list_profile_revisions(pool, agent_id, kind=kind, limit=limit)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
+
+
+@admin_router.get("/{agent_id}/memory/ops")
+async def get_agent_memory_ops(
+    agent_id: str, request: Request, limit: int = 100, applied_only: bool = False
+) -> list[dict[str, Any]]:
+    """The memory-consolidation ledger for the agent, newest first (A4).
+
+    One row per operation the nightly planner PROPOSED — in dry-run as well as
+    apply mode — with the before/after content and, when a safety rail refused
+    it, the `skip_reason`. This is the evidence for the flip decision: read a
+    week of `dry_run=true` rows here before setting
+    `AEGIS_MEMORY_CONSOLIDATION_APPLY_ENABLED=true`, and read
+    `?applied_only=true` afterwards to see what actually changed.
+
+    Read-only. Restoring a soft-retired row is a deliberate SQL step
+    (`UPDATE agent_memory SET superseded_at = NULL, superseded_by = NULL
+    WHERE id = …`), intentionally not exposed as a route.
+
+    This endpoint is intentionally curl/ops-only, no UI consumer.
+    """
+    pool = request.app.state.db_pool
+    if not await _get_agent(pool, agent_id):
+        raise HTTPException(status_code=404, detail=f"Agent '{agent_id}' not found")
+    return await list_memory_ops(pool, agent_id, limit=limit, applied_only=applied_only)
 
 
 @router.get("")

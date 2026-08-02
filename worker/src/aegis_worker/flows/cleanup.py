@@ -37,6 +37,19 @@ _DEFAULT_RETENTIONS: dict[str, int] = {
     # patch, forever otherwise. A year keeps the audit trail long enough to
     # answer "when did AEGIS start believing this about me?".
     "agent_profile_revisions": 365,
+    # agent_memory_ops_log (migration 020) is DELIBERATELY ABSENT — do not add
+    # it without reading this. `prune_old_records` is an unconditional
+    # `DELETE … WHERE <ts> < cutoff` with no predicate support, so a retention
+    # entry would delete `applied = true` rows too. Those rows are the only
+    # record of what an LLM changed in the user's memory, and their
+    # `before_content` is the last copy of any row later hard-purged by
+    # `purge_retired_memories` — pruning them destroys the reconstruction path
+    # the whole A4 design exists to provide. Growth is small and only accrues
+    # while `consolidate: true` (a handful of rows per agent per night, capped
+    # at _MAX_OPS=200), so unbounded-growth pressure does not apply here.
+    # If this ever needs pruning, prune `dry_run = true AND applied = false`
+    # rows only — which needs predicate support in prune_old_records first.
+    #
     # life.observations (migration 017) — machine-written life metrics
     # (weight, sleep, sensors, pings), unbounded by nature. A year keeps every
     # trend query the chat tool can ask for; pruned by `observed_at`, not

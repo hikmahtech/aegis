@@ -234,17 +234,33 @@ activities:
 
   # Phase 4 — nightly per-agent memory consolidation (caps each agent's
   # agent_memory at `keep` rows; the learning loop writes corrections live).
-  # consolidate: run the A3 planner first — it PROPOSES ADD/UPDATE/DELETE/NOOP
-  # ops and logs them; it never writes. dry_run must stay true: the activity
-  # refuses false outright until A4 ships the soft-retire + provenance rails.
+  # consolidate: run the A4 planner first — it PROPOSES ADD/UPDATE/DELETE/NOOP
+  # ops and writes every one of them to agent_memory_ops_log for inspection
+  # (GET /api/admin/agents/sebas/memory/ops).
+  #
+  # dry_run: true is the intended LONG-RUNNING default. Applying a plan needs
+  # BOTH dry_run: false here AND AEGIS_MEMORY_CONSOLIDATION_APPLY_ENABLED=true
+  # in the worker environment — with the env var unset this pass plans and logs
+  # but writes nothing, whatever this file or the DB says.
+  # max_ops_pct / min_age_hours TIGHTEN the rails; the absolute op cap, the
+  # importance floor and the [gmail:] dedupe-marker protection are code
+  # constants that no config edit can widen.
+  # retire_grace_days: 0 = soft-retired rows are never hard-deleted.
+  #
   # NOTE: `config` is DB-owned (seed.py only refreshes workflow_type/agent_id),
-  # so these keys apply to a FRESH install only — on an existing deploy set them
-  # on /admin/flows.
+  # so these keys apply to a FRESH install only — ON AN EXISTING DEPLOY EDITING
+  # THIS FILE CHANGES NOTHING. Set them on /admin/flows.
   - slug: memory-reflection-nightly
     workflow_type: MemoryReflectionFlow
     agent_id: sebas
     schedule_cron: "0 3 * * *"
-    config: {keep: 50, consolidate: true, dry_run: true}
+    config:
+      keep: 50
+      consolidate: true
+      dry_run: true
+      max_ops_pct: 0.25
+      min_age_hours: 24
+      retire_grace_days: 0
     active: true
 
   # significance_threshold: the LLM scorer rates 1–5; only items >= this ingest.

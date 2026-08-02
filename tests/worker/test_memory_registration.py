@@ -1,5 +1,9 @@
-"""A3 wiring: the consolidation activity is registered and its config keys are
-threaded through the schedule mapper (nothing here is auto-discovered)."""
+"""Wiring: the consolidation activity is registered and its config keys are
+threaded through the schedule mapper (nothing here is auto-discovered).
+
+A4 adds the rails to what must be threaded — a `max_ops_pct` that never
+reaches the activity would leave the quota running on a default the operator
+thinks they changed."""
 
 from __future__ import annotations
 
@@ -31,22 +35,45 @@ def test_worker_registers_consolidate_activity():
     lines = [ln.strip() for ln in Path(worker_main.__file__).read_text().splitlines()]
     live = [ln for ln in lines if not ln.startswith("#")]
     assert any(ln.startswith("memory_act = MemoryActivities(") for ln in live)
-    assert any(
-        "MemoryActivities(db_pool=deps.pool, llm_client=deps.llm" in ln for ln in live
-    ), "MemoryActivities without llm_client is a silent no-op"
+    # The constructor call spans several lines, so match on the joined source
+    # rather than a single line.
+    source = " ".join(live)
+    assert "MemoryActivities( db_pool=deps.pool, llm_client=deps.llm" in source, (
+        "MemoryActivities without llm_client is a silent no-op"
+    )
+    # A4: the environment half of the two-key apply gate. Unwired, the kill
+    # switch could never be opened and apply mode would be dead code.
+    assert "apply_enabled=bool(getattr(settings, \"memory_consolidation_apply_enabled\"" in source
 
 
 def test_schedule_mapper_reads_consolidation_config():
+    """Non-default values throughout: a mapper that ignored `config` and
+    handed back the dataclass defaults would pass a same-as-default check."""
     _, built = _ACTIVITY_TYPE_MAP["MemoryReflectionFlow"](
-        {"agent_id": "sebas", "config": {"keep": 12, "consolidate": True, "dry_run": True}}
+        {
+            "agent_id": "sebas",
+            "config": {
+                "keep": 12,
+                "consolidate": True,
+                "dry_run": False,
+                "max_ops_pct": 0.1,
+                "min_age_hours": 72,
+                "retire_grace_days": 45,
+            },
+        }
     )
-    assert (built.keep, built.consolidate, built.dry_run) == (12, True, True)
+    assert (built.keep, built.consolidate, built.dry_run) == (12, True, False)
+    assert (built.max_ops_pct, built.min_age_hours, built.retire_grace_days) == (0.1, 72, 45)
 
 
 def test_schedule_mapper_fails_closed_on_a_legacy_config():
-    """A row seeded before A3 (config = {keep: 50}) must stay observe-only."""
+    """A row seeded before A3/A4 (config = {keep: 50}) must stay observe-only,
+    on the strictest quota, and must never start hard-deleting retired rows."""
     _, built = _ACTIVITY_TYPE_MAP["MemoryReflectionFlow"](
         {"agent_id": "sebas", "config": {"keep": 50}}
     )
     assert built.consolidate is False
     assert built.dry_run is True
+    assert built.max_ops_pct == 0.25
+    assert built.min_age_hours == 24
+    assert built.retire_grace_days == 0, "a legacy row must not enable the hard purge"
