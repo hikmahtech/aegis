@@ -256,10 +256,24 @@ _SHRINK_PASSES: tuple[tuple[int, int], ...] = (
     (1, 150),
 )
 
+# How many dropped key names to spell out before folding the tail into a single
+# `… +K more` entry.
+_MAX_LISTED_DROPPED_KEYS = 12
 
-def _shrink_strings(obj, max_str_len: int):
-    """Recursively replace any string longer than ``max_str_len`` with a
-    truncated-with-ellipsis version. Leaves other types untouched."""
+
+def _shrink_strings(obj, max_str_len: int, n_items: int):
+    """Recursively shrink over-long strings AND cap nested lists at ``n_items``
+    entries, replacing the dropped tail with one in-band ``… +K of N more``
+    element. Leaves other types untouched.
+
+    Capping nested lists is what makes an over-budget dict shrinkable at all.
+    Before #148 the only lever was dropping whole keys, so a result whose
+    payload sat under a non-leading key lost that payload outright, and a
+    result whose payload WAS leading couldn't be shrunk enough to fit and fell
+    through to the "too large to display" stub. Keeping the dropped count
+    inside the list it describes means the same mechanism that removed the
+    items can never separate them from their own count.
+    """
     if isinstance(obj, str):
         if len(obj) > max_str_len:
             # Leave room for the marker so the caller can tell a cut happened.
@@ -267,26 +281,59 @@ def _shrink_strings(obj, max_str_len: int):
             return obj[:head] + "… [truncated]"
         return obj
     if isinstance(obj, list):
-        return [_shrink_strings(x, max_str_len) for x in obj]
+        kept = [_shrink_strings(x, max_str_len, n_items) for x in obj[:n_items]]
+        if len(obj) > n_items:
+            kept.append(f"… +{len(obj) - n_items} of {len(obj)} more")
+        return kept
     if isinstance(obj, dict):
-        return {k: _shrink_strings(v, max_str_len) for k, v in obj.items()}
+        return {k: _shrink_strings(v, max_str_len, n_items) for k, v in obj.items()}
     return obj
 
 
+def _payload_rank(value) -> int:
+    """Rank a dict value by how likely it is to BE the answer: a list of
+    records outranks a nested object, which outranks a scalar.
+
+    ``sorted`` is stable, so position only breaks ties within a rank — an
+    executor that deliberately leads with its payload (``social_timeline``,
+    ``list_social_channels``) still wins, while one that leads with a scalar
+    ``count``/``ok``/``window_hours`` no longer loses its data to it (#148).
+    """
+    if isinstance(value, list):
+        return 0
+    if isinstance(value, dict):
+        return 1
+    return 2
+
+
 def _smart_subset(data, n_items: int, max_str_len: int):
-    """Keep the first ``n_items`` of a list or keys of a dict, shrinking any
-    long string values inside the kept portion. Returns the trimmed object
-    plus truncation metadata so the LLM knows content was dropped."""
+    """Keep the first ``n_items`` of a list, or the ``n_items`` highest-ranked
+    keys of a dict, shrinking long strings and capping nested lists inside the
+    kept portion. Returns the trimmed object plus truncation metadata so the
+    LLM knows content was dropped — and, for a dict, WHICH keys were dropped,
+    so it can ask a narrower question instead of blind-retrying the same call.
+    """
     if isinstance(data, list):
         return {
-            "results": [_shrink_strings(item, max_str_len) for item in data[:n_items]],
+            "results": [_shrink_strings(item, max_str_len, n_items) for item in data[:n_items]],
             "truncated": True,
             "total": len(data),
         }
-    keys = list(data.keys())[:n_items]
-    subset = {k: _shrink_strings(data[k], max_str_len) for k in keys}
+    keep = set(sorted(data, key=lambda k: _payload_rank(data[k]))[:n_items])
+    subset = {k: _shrink_strings(v, max_str_len, n_items) for k, v in data.items() if k in keep}
+    dropped = [k for k in data if k not in keep]
+    # Assigned AFTER the selection above, so the signal is never itself a
+    # candidate for eviction by the pass that produced it.
     subset["_truncated"] = True
     subset["_total_keys"] = len(data)
+    if dropped:
+        # Bounded like the `+K more` aggregates in `list_social_channels` and
+        # the `social_timeline` roll-up, so naming the casualties can never be
+        # what pushes a pass over budget and forces the minimal stub.
+        listed = [str(k)[:60] for k in dropped[:_MAX_LISTED_DROPPED_KEYS]]
+        if len(dropped) > _MAX_LISTED_DROPPED_KEYS:
+            listed.append(f"… +{len(dropped) - _MAX_LISTED_DROPPED_KEYS} more")
+        subset["_dropped_keys"] = listed
     return subset
 
 
@@ -296,9 +343,10 @@ def _truncate_result(result_json: str, max_bytes: int = 4096) -> str:
     Strategy, loosest → tightest:
     1. Return unchanged if already under budget.
     2. Parse. Non-JSON or scalar → raw byte slice.
-    3. For a list/dict, iterate ``_SHRINK_PASSES``: keep first N items/keys
-       and recursively shrink long string values inside them. Return the
-       first pass whose serialisation fits.
+    3. For a list/dict, iterate ``_SHRINK_PASSES``: keep the first N items of
+       a list or the N highest-ranked keys of a dict (see ``_payload_rank``),
+       recursively shrinking long strings and capping nested lists inside the
+       kept portion. Return the first pass whose serialisation fits.
     4. Fallback: minimal summary noting the total count.
 
     This is better than a byte-level slice because the LLM still sees
@@ -306,6 +354,11 @@ def _truncate_result(result_json: str, max_bytes: int = 4096) -> str:
     slice-then-give-up approach because deeply nested records (common for
     knowledge/search tool output) get their big string fields shrunk down
     rather than being replaced entirely by a "too large" note.
+
+    Every path out of here past step 2 carries a machine-readable truncation
+    signal — ``truncated``/``total`` for a list, ``_truncated``/``_total_keys``
+    (plus ``_dropped_keys``) for a dict, ``… +K of N more`` inside any capped
+    nested list — so a partial result is never mistakable for a complete one.
     """
     if len(result_json.encode()) <= max_bytes:
         return result_json
