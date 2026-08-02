@@ -227,9 +227,12 @@ def test_module_workflows_is_the_unflagged_registry():
         # more activities and again NO new flow from #182/#183
         # (sync_postiz_channels, retire_unpublishable_tasks — both on
         # SocialActivities, both driven by the existing SocialPublishFlow).
-        (True, True, 38, 186),
-        (False, False, 30, 157),
-        (True, False, 34, 175),
+        # Then +1 activity and NO new flow from #215's `deliver_briefing`, which
+        # renders the health block and sends it inside one activity so the
+        # readings never become an argument or a result.
+        (True, True, 38, 187),
+        (False, False, 30, 158),
+        (True, False, 34, 176),
     ],
 )
 def test_real_registration_passes_the_boot_check(homelab, money, flows, activities):

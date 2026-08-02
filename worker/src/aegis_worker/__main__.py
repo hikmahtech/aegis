@@ -195,6 +195,10 @@ async def main():
         daily_budget=getattr(settings, "notification_daily_budget", 8),
         channel=effective_channel,
     )
+    # `deliver_briefing` renders the health block and sends it in one activity,
+    # so the readings never cross a boundary (#215). Wired after construction
+    # because delivery_act does not exist yet above.
+    briefing_act.delivery = delivery_act
     content_act = ContentActivities(
         knowledge_connector=connectors.get("knowledge"),
         db_pool=deps.pool,

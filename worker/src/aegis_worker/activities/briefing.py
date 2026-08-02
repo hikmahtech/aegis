@@ -51,6 +51,11 @@ class BriefingActivities:
     core_api_url: str = ""
     api_key: str = ""
     frame_model: str = "gpt-oss:20b"
+    # DeliveryActivities, wired in `__main__.py` after it is constructed (the
+    # same pattern HomelabActivities/MoneyActivities use). Needed because the
+    # health block is rendered and sent inside ONE activity — see
+    # `deliver_briefing`.
+    delivery: Any = None
 
     async def gather_calendar_events(self) -> dict:
         """Read calendar events from settings KV (populated by n8n Calendar Fetcher)."""
@@ -415,14 +420,16 @@ class BriefingActivities:
     async def _recent_health(self) -> dict:
         """Newest reading of each metric the health push writes (B6).
 
-        Read HERE, at render time, rather than in `gather_briefing_changes`,
-        because that activity's return value is `DailyBriefingFlow`'s `changes`
-        bundle — which Temporal persists verbatim as an activity RESULT and
-        again as `frame_briefing`'s ARGUMENT. That is the second store with its
-        own retention and its own web UI that `aegis.services.health` refused
-        to create when it made health ingest inline instead of a flow. The
-        readings are needed only to render one block, so they are fetched where
-        that block is built and never enter the bundle.
+        Read inside `deliver_briefing`, at send time, rather than in
+        `gather_briefing_changes`, because that activity's return value is
+        `DailyBriefingFlow`'s `changes` bundle — which Temporal persists
+        verbatim as an activity RESULT and again as `frame_briefing`'s
+        ARGUMENT. That is the second store with its own retention and its own
+        web UI that `aegis.services.health` refused to create when it made
+        health ingest inline instead of a flow. The readings are needed only to
+        render one block, so they are fetched in the activity that also sends
+        it, and neither the readings nor the rendered block ever cross an
+        activity boundary (#214, #215).
 
         Deliberately outside the `quiet` test in `gather_briefing_changes`: a
         daily export always lands, so counting it as news would mean no
@@ -452,16 +459,19 @@ class BriefingActivities:
         bundle → one-liner. Any LLM failure → deterministic fallback, so the
         briefing always ships.
 
-        Two deterministic blocks are appended AFTER the narrative either way —
-        the LLM is asked for 2-5 sentences over the whole diff bundle, so a
-        real failure can lose out to intel headlines and get silently dropped.
-        Counts/workflow-types (`_format_failure_block`) and health readings
-        (`_format_health_block`) bypass the LLM entirely so that can't happen.
+        The failure block is appended AFTER the narrative either way — the LLM
+        is asked for 2-5 sentences over the whole diff bundle, so a real failure
+        can lose out to intel headlines and get silently dropped.
+        `_format_failure_block` bypasses the LLM entirely so that can't happen.
+
+        Health readings are NOT rendered here (issue #215). This return value is
+        an activity result, then `send_voice`'s argument, then the text
+        `ingest_briefing` embeds into the knowledge store — three copies with
+        three different retentions, one of which `search_knowledge` can pull
+        back into a prompt. They are rendered in `deliver_briefing` instead.
         """
-        health_block = self._format_health_block(await self._recent_health())
         if changes.get("quiet"):
-            quiet = "\U0001f7e2 Quiet overnight — nothing needs you."
-            return f"{quiet}\n\n{health_block}" if health_block else quiet
+            return "\U0001f7e2 Quiet overnight — nothing needs you."
         fallback = self._format_changes_fallback(changes)
         narrative = fallback
         if self.llm_client:
@@ -474,8 +484,36 @@ class BriefingActivities:
             except Exception as exc:  # noqa: BLE001
                 activity.logger.warning("frame_briefing_llm_failed err=%s", str(exc)[:200])
                 narrative = fallback
-        blocks = [b for b in (health_block, self._format_failure_block(changes)) if b]
-        return "\n\n".join([narrative, *blocks]) if blocks else narrative
+        failures = self._format_failure_block(changes)
+        return f"{narrative}\n\n{failures}" if failures else narrative
+
+    @activity.defn
+    async def deliver_briefing(self, agent_id: str, message: str) -> dict:
+        """Render the health block and send the briefing, in ONE activity.
+
+        #214 kept health readings out of the `changes` bundle; this keeps the
+        RENDERED block out of everything downstream of composition. Reading,
+        formatting and sending all happen inside this activity, so the only copy
+        that crosses a boundary is the one the owner asked for, in their own
+        channel.
+
+        Without this the same string is (a) `frame_briefing`'s activity result
+        and `send_message`'s argument, both persisted verbatim in Temporal
+        history; (b) `send_voice`'s argument, and the text a TTS provider is
+        handed when `AEGIS_TTS_ENABLED`; and (c) the document `ingest_briefing`
+        embeds into the pgvector knowledge store — indefinitely, where
+        `search_knowledge`/`ask_knowledge` can retrieve it into a chat prompt
+        bound for whatever `model_balanced`/`model_smart` resolve to. (c) is the
+        one that matters: it re-opens exactly the hole `_format_health_block`
+        was written to close.
+        """
+        if self.delivery is None:
+            # Loud, not degraded — a briefing that silently stops arriving is
+            # this flow's worst failure mode.
+            raise RuntimeError("deliver_briefing: delivery not wired")
+        block = self._format_health_block(await self._recent_health())
+        body = f"{message}\n\n{block}" if block else message
+        return await self.delivery.send_message(agent_id, body, 0)
 
     def _format_changes_fallback(self, changes: dict) -> str:
         lines: list[str] = []
@@ -528,7 +566,8 @@ class BriefingActivities:
         """Health readings (B6), rendered deterministically. Empty when absent.
 
         Takes the readings directly (from `_recent_health`) rather than the
-        `changes` bundle, because the bundle must never carry them.
+        `changes` bundle, because the bundle must never carry them. Called only
+        from `deliver_briefing`, which sends the result without returning it.
 
         A block rather than a line inside the narrative, for two reasons. The
         framing model is `model_balanced`, which may well be a hosted API —

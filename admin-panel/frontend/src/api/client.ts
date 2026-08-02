@@ -35,7 +35,20 @@ export async function apiFetch<T>(path: string, options?: RequestInit): Promise<
     headers: { ...headers(), ...(options?.headers || {}) },
   });
   if (resp.status === 401) onUnauthorized();
-  if (!resp.ok) throw new Error(`API ${resp.status}: ${resp.statusText}`);
+  if (!resp.ok) {
+    // Read the body before throwing: FastAPI puts the *reason* in `detail`, and
+    // a structured detail (the 409 a stale persona draft returns, say) is the
+    // only thing that lets a page render something better than "Conflict".
+    const raw = await resp.text().catch(() => '');
+    let detail: unknown;
+    try { detail = raw ? (JSON.parse(raw) as { detail?: unknown }).detail : undefined; } catch { detail = undefined; }
+    const err = new Error(
+      `API ${resp.status}: ${typeof detail === 'string' ? detail : resp.statusText}`,
+    ) as Error & { status?: number; detail?: unknown };
+    err.status = resp.status;
+    err.detail = detail;
+    throw err;
+  }
   // 204 / empty body (e.g. DELETE) → resp.json() would throw on empty input.
   if (resp.status === 204) return undefined as T;
   const text = await resp.text();

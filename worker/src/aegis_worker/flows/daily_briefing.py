@@ -110,9 +110,13 @@ class DailyBriefingFlow:
         msg = f"<b>Daily Briefing</b>\n\n{narrative}"
         sent_ok = False
         try:
+            # `deliver_briefing`, not `send_message`: it appends the health block
+            # and sends it in the same activity, so the readings never become an
+            # argument or a result. `narrative` below therefore carries no body
+            # data into the voice note or the knowledge store either (#215).
             await workflow.execute_activity_method(
-                DeliveryActivities.send_message,
-                args=[config.agent_id, msg, 0],
+                BriefingActivities.deliver_briefing,
+                args=[config.agent_id, msg],
                 start_to_close_timeout=TIMEOUT_FAST, retry_policy=RETRY_ONCE,
             )
             sent_ok = True

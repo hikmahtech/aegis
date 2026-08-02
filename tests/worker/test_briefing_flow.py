@@ -1,10 +1,12 @@
-"""DailyBriefingFlow: gather_changes → frame → send → commit (after send)."""
+"""DailyBriefingFlow: gather_changes → frame → deliver → commit (after send)."""
 
 from __future__ import annotations
 
 import uuid
+from datetime import UTC, datetime, timedelta
 
 import pytest
+from aegis_worker.activities.briefing import BriefingActivities
 from aegis_worker.flows.daily_briefing import DailyBriefingConfig, DailyBriefingFlow
 from temporalio import activity
 from temporalio.client import Client
@@ -46,6 +48,13 @@ def _stubs(sent, committed, fail_send=False, resolve_map=None, market_calls=None
     async def frame(changes):
         return "narrative body"
 
+    @activity.defn(name="deliver_briefing")
+    async def deliver(agent_id, message):
+        if fail_send:
+            raise RuntimeError("comms down")
+        sent.append((agent_id, message))
+        return {"ok": True}
+
     @activity.defn(name="send_message")
     async def send_tg(agent_id, message, chat_id=0, keyboard=None):
         if fail_send and agent_id != "pandoras-actor":
@@ -65,7 +74,10 @@ def _stubs(sent, committed, fail_send=False, resolve_map=None, market_calls=None
     async def commit(state):
         committed.append(state)
 
-    return [resolve_agents, gather_market, sys_evt, gather, frame, send_tg, digest, ingest, commit]
+    return [
+        resolve_agents, gather_market, sys_evt, gather, frame, deliver, send_tg,
+        digest, ingest, commit,
+    ]
 
 
 @pytest.mark.asyncio
@@ -112,6 +124,83 @@ async def test_flow_skips_commit_when_send_fails():
 
 
 # ── Issue #36: market section gated on the `finance` tag, not `== "maou"` ──
+
+
+# ── Issue #215: the rendered health block must not reach workflow history ──
+
+
+class _Recorder:
+    """Stands in for DeliveryActivities — records what actually went out."""
+
+    def __init__(self):
+        self.sent: list[tuple[str, str]] = []
+
+    async def send_message(self, agent_id, message, chat_id=0):
+        self.sent.append((agent_id, message))
+        return {"ok": True}
+
+
+@pytest.mark.asyncio
+async def test_the_health_block_never_enters_workflow_history(db_pool):
+    """The claim in #215, asserted against REAL Temporal history bytes.
+
+    Every activity here is a stub except `deliver_briefing`, which is the real
+    one: it reads `life.observations`, renders the `<b>Health</b>` block and
+    sends it, all inside the activity. So the reading exists, is rendered, and
+    reaches the owner's channel — and none of it may appear in the history the
+    Temporal web UI serves.
+
+    Scanning the serialized history events catches every route in one go: the
+    activity's own argument and result, `send_voice`'s argument, and the text
+    handed to `ingest_briefing` (which in production is embedded into the
+    knowledge store).
+    """
+    async with db_pool.acquire() as conn:
+        await conn.execute("DELETE FROM life.observations WHERE source = 'health'")
+        await conn.execute(
+            "INSERT INTO life.observations (source, metric, value, observed_at, external_id) "
+            "VALUES ('health', 'resting_hr', 54321.5, $1, 'zz215-hr')",
+            datetime.now(UTC) - timedelta(hours=6),
+        )
+
+    rec = _Recorder()
+    act = BriefingActivities(db_pool=db_pool, delivery=rec)
+    sent, committed = [], []
+    acts = [
+        a
+        for a in _stubs(sent, committed)
+        if activity._Definition.must_from_callable(a).name != "deliver_briefing"
+    ] + [act.deliver_briefing]
+
+    wid = f"brf-{uuid.uuid4()}"
+    try:
+        async with await WorkflowEnvironment.start_time_skipping() as env:
+            async with Worker(
+                env.client, task_queue="brf-health", workflows=[DailyBriefingFlow], activities=acts
+            ):
+                await env.client.execute_workflow(
+                    DailyBriefingFlow.run,
+                    DailyBriefingConfig(agent_id="raphael"),
+                    id=wid,
+                    task_queue="brf-health",
+                )
+
+            blob = b""
+            async for event in env.client.get_workflow_handle(wid).fetch_history_events():
+                blob += event.SerializeToString()
+    finally:
+        async with db_pool.acquire() as conn:
+            await conn.execute("DELETE FROM life.observations WHERE external_id = 'zz215-hr'")
+
+    # Non-vacuity, twice over: the reading is live and the block really was
+    # rendered and delivered, and the history really does hold this run's text.
+    assert len(rec.sent) == 1, "deliver_briefing never sent"
+    assert "<b>Health</b>: resting_hr 54321.5" in rec.sent[0][1]
+    assert b"narrative body" in blob, "the history scan found none of the briefing"
+
+    assert b"54321" not in blob
+    assert b"resting_hr" not in blob
+    assert b"Health" not in blob
 
 
 @pytest.mark.asyncio
