@@ -1,6 +1,10 @@
-"""SocialActivities — find due @publish tasks, outbox enqueue/drain, completion.
+"""SocialActivities — mirror Postiz channels, find due @publish tasks, outbox
+enqueue/drain, completion.
 
-Called by SocialPublishFlow. `apply_social_approval` is InteractionFlow's
+Called by SocialPublishFlow. `sync_postiz_channels` keeps the `social_accounts`
+mirror honest (#182) and `retire_unpublishable_tasks` gives a task labeled for
+a channel nobody connected a real ending (#183). `apply_social_approval` is
+InteractionFlow's
 post_resolve hook: it applies the user's card choice (approve → enqueue +
 post immediately; skip → strip the publish label so the task stops
 re-carding). The scheduled flow's own drain/complete steps are the retry
@@ -20,6 +24,7 @@ from typing import Any
 
 import asyncpg
 from aegis.connectors.todoist import TodoistConnector
+from aegis.services import social_channels
 from temporalio import activity
 
 from aegis_worker.activities.delivery import safe_send_message
@@ -184,6 +189,64 @@ class SocialActivities:
         val = await self.db_pool.fetchval("SELECT value FROM settings WHERE key = $1", key)
         return default if val is None else val
 
+    async def _connected_platforms(self) -> set[str]:
+        """Platforms with at least one row in `social_accounts`.
+
+        The label→platform map is operator config and lists what the user WANTS
+        to publish to; this is what AEGIS actually CAN publish to. In prod they
+        differ (`x` and `youtube` are mapped with no account behind them), and
+        every #183 symptom comes from treating the map as if it were this set.
+        """
+        if self.db_pool is None:
+            return set()
+        rows = await self.db_pool.fetch("SELECT DISTINCT platform FROM social_accounts")
+        return {r["platform"] for r in rows}
+
+    async def _comment_missing_platforms(
+        self, task_id: str, missing: list[str], *, terminal: bool
+    ) -> None:
+        """Tell the user, once, that a labeled platform can't be published to.
+
+        Deterministic temp_id → idempotent across retries and across the two
+        callers (`enqueue_outbox` for a partial gap, `retire_unpublishable_tasks`
+        when nothing at all can publish).
+        """
+        if self.db_pool is None:
+            return
+        tail = (
+            "Nothing on this task can publish, so AEGIS is removing the publish "
+            "label — re-add it once the channel is connected."
+            if terminal
+            else "The other labeled channels still go out, and this task closes "
+            "once they do."
+        )
+        note = TodoistConnector.build_note_add_command(
+            task_id,
+            "⚠️ AEGIS could not publish to: "
+            + ", ".join(missing)
+            + " — no connected account. Connect it on the admin Social page "
+            "(or remove the label). " + tail,
+        )
+        await self.db_pool.execute(
+            "INSERT INTO todoist_outbox (temp_id, command, status) "
+            "VALUES ($1, $2, 'pending') ON CONFLICT (temp_id) DO NOTHING",
+            f"social-missing-{task_id}-{'.'.join(sorted(missing))}",
+            note,
+        )
+
+    async def _postiz_creds(self) -> tuple[str, str]:
+        """Postiz base URL + API key.
+
+        Deliberately delegates to `SocialConnector._postiz_creds` rather than
+        re-reading the settings table here: the storage shape (plain
+        `integration:postiz_url`, encrypted `integration:postiz_api_key`, boot
+        snapshot as fallback) is the connector's contract, and a second copy of
+        it would rot silently the day that changes.
+        """
+        if self.connector is None:
+            return "", ""
+        return await self.connector._postiz_creds()
+
     @activity.defn
     async def find_due_posts(
         self, lookahead_minutes: int = 10, default_post_hour: int = 9
@@ -335,23 +398,11 @@ class SocialActivities:
             queued += int(result.endswith("1"))
         if missing:
             # Surface the gap: a labeled platform with no connected account is
-            # NOT silently dropped. Comment on the task so the user notices, and
-            # complete_posted_tasks keeps the task open until every labeled
-            # platform posts. Deterministic temp_id → idempotent across retries.
-            note = TodoistConnector.build_note_add_command(
-                task_id,
-                "⚠️ AEGIS could not publish to: "
-                + ", ".join(missing)
-                + " — no connected account. Connect it on the admin Social page "
-                "(or remove the label). This task stays open until every labeled "
-                "platform posts.",
-            )
-            await self.db_pool.execute(
-                "INSERT INTO todoist_outbox (temp_id, command, status) "
-                "VALUES ($1, $2, 'pending') ON CONFLICT (temp_id) DO NOTHING",
-                f"social-missing-{task_id}-{'.'.join(sorted(missing))}",
-                note,
-            )
+            # NOT silently dropped — the user gets one comment naming it. It no
+            # longer BLOCKS completion, though (#183): the connected platforms
+            # publish and complete_posted_tasks closes the task, instead of
+            # leaving it open forever with nothing left to happen.
+            await self._comment_missing_platforms(task_id, missing, terminal=False)
         activity.logger.info(
             "social_enqueue_outbox task_id=%s queued=%d missing=%s", task_id, queued, missing
         )
@@ -408,15 +459,21 @@ class SocialActivities:
 
     @activity.defn
     async def complete_posted_tasks(self) -> dict:
-        """Enqueue item_complete (via todoist_outbox) for tasks whose EVERY
-        labeled platform has posted.
+        """Enqueue item_complete (via todoist_outbox) for tasks whose every
+        *publishable* labeled platform has posted.
 
         A task completes only when (a) all its outbox rows are 'posted' AND
-        (b) every platform its labels ask for actually has a posted row. A
-        labeled platform with no connected account — hence no outbox row —
-        would otherwise be invisible to the all-rows-posted check and let the
-        task complete while that platform never went out. Such a task is left
-        open so the user notices (enqueue_outbox comments the gap).
+        (b) every labeled platform that HAS a connected account has a posted
+        row. Requirement (b) exists because a platform with a connected account
+        but a still-pending row would otherwise be invisible to (a)'s
+        all-rows-posted check on a partially-enqueued task.
+
+        A labeled platform with NO connected account is excluded from (b)
+        (#183). It used to block completion forever "so the user notices",
+        which gave that task no terminal state at all: one Todoist comment and
+        then permanent silence, since nothing would ever create the outbox row
+        it was waiting for. The comment (enqueue_outbox) is the notice; the task
+        closes once everything that CAN publish has.
 
         Idempotent: the deterministic temp_id social-complete-<task_id> makes
         re-runs no-ops until the 5-min TodoistSyncFlow drains the command and
@@ -425,6 +482,7 @@ class SocialActivities:
         if self.db_pool is None:
             return {"completed": 0}
         platform_labels: dict = await self._setting("social_platform_labels", {"x": "x"})
+        connected = await self._connected_platforms()
         rows = await self.db_pool.fetch(
             """
             SELECT o.todoist_task_id AS task_id, t.labels AS labels,
@@ -441,7 +499,7 @@ class SocialActivities:
         for r in rows:
             labels = set(r["labels"] or [])
             intended = {p for p, lab in platform_labels.items() if lab in labels}
-            missing = intended - set(r["posted_platforms"] or [])
+            missing = (intended & connected) - set(r["posted_platforms"] or [])
             if missing:
                 activity.logger.warning(
                     "social_complete_skipped_missing_platform task_id=%s missing=%s",
@@ -449,6 +507,13 @@ class SocialActivities:
                     sorted(missing),
                 )
                 continue
+            unpublishable = sorted(intended - connected)
+            if unpublishable:
+                activity.logger.warning(
+                    "social_complete_ignoring_unconnected_platform task_id=%s platforms=%s",
+                    r["task_id"],
+                    unpublishable,
+                )
             cmd = TodoistConnector.build_item_complete_command(r["task_id"])
             result = await self.db_pool.execute(
                 "INSERT INTO todoist_outbox (temp_id, command, status) "
@@ -460,6 +525,117 @@ class SocialActivities:
         if completed:
             activity.logger.info("social_complete_posted_tasks enqueued=%d", completed)
         return {"completed": completed}
+
+    @activity.defn
+    async def sync_postiz_channels(self, min_interval_minutes: int = 60) -> dict:
+        """Refresh the `social_accounts` mirror from Postiz's connected channels.
+
+        `SocialPublishFlow` resolves a Todoist platform label against
+        `social_accounts`, so a channel connected in Postiz is unpublishable
+        until it is mirrored. That mirror used to be refreshed ONLY by a human
+        clicking "Sync Postiz channels" on the admin Flows page (#182), which
+        makes the most fragile step in the publish path a manual one.
+
+        Throttled by the mirror's own watermark rather than a schedule of its
+        own: `mirror_integrations` bumps `updated_at` on every pass, so the
+        newest Postiz-mirrored row IS the last successful sync. At the flow's
+        5-min cadence and a 60-min interval that is ~24 Postiz calls a day with
+        a ≤1h staleness bound. (Degenerate case: an install with zero mirrored
+        channels has no watermark and therefore syncs every tick — which is
+        exactly the install that most needs the next connect to land fast.)
+
+        Never raises. A Postiz outage must not stop the publish tick that
+        follows from draining an already-queued post, so failures come back as
+        a status and a warning line.
+        """
+        idle = {"synced": 0, "skipped_disabled": 0}
+        if self.db_pool is None or self.connector is None:
+            return {**idle, "status": "unconfigured"}
+        last = await self.db_pool.fetchval(
+            "SELECT max(updated_at) FROM social_accounts "
+            "WHERE meta ? 'postiz_integration_id'"
+        )
+        if last is not None and last > datetime.now(UTC) - timedelta(
+            minutes=min_interval_minutes
+        ):
+            return {**idle, "status": "throttled"}
+        base_url, api_key = await self._postiz_creds()
+        if not base_url or not api_key:
+            return {**idle, "status": "unconfigured"}
+        try:
+            result = await social_channels.sync_postiz_channels(
+                self.db_pool, base_url, api_key
+            )
+        except Exception as exc:  # noqa: BLE001 — degrade, never block publishing
+            activity.logger.warning("social_sync_channels_failed err=%s", str(exc)[:200])
+            return {**idle, "status": "failed"}
+        activity.logger.info(
+            "social_sync_channels synced=%d skipped_disabled=%d",
+            result["synced"],
+            result["skipped_disabled"],
+        )
+        return {**result, "status": "ok"}
+
+    @activity.defn
+    async def retire_unpublishable_tasks(self, limit: int = 20) -> dict:
+        """Terminate open @publish tasks that no connected account can publish.
+
+        The #183 hole: `social_platform_labels` maps platforms (prod maps `x`
+        and `youtube`) that have no `social_accounts` row. A task labeled for
+        only those cards, fails to enqueue, gets one "no connected account"
+        Todoist comment — and then nothing else ever happens to it. It is not
+        completed, not re-carded with an action, not closed: it just sits open
+        while every later tick re-runs the same dead end.
+
+        Terminal state chosen: comment once, then REVOKE the publish label
+        (exactly what the card's "skip" choice does). Rejected alternatives:
+        *completing* the task destroys content the user still means to post,
+        and *pruning the label map at sync time* rewrites operator config —
+        they'd have to re-add `x` after connecting it, and it would not help
+        the partial case (some platforms connected, some not) at all.
+
+        Tasks that already have an outbox row are excluded: something did
+        publish for them, so `complete_posted_tasks` owns their ending.
+        """
+        if self.db_pool is None:
+            return {"retired": 0}
+        publish_label = str(await self._setting("social_publish_label", "publish"))
+        platform_labels: dict = await self._setting("social_platform_labels", {"x": "x"})
+        connected = await self._connected_platforms()
+        rows = await self.db_pool.fetch(
+            """
+            SELECT t.id, t.labels
+            FROM todoist_tasks t
+            WHERE NOT t.is_completed
+              AND $1 = ANY(t.labels)
+              AND NOT EXISTS (
+                    SELECT 1 FROM social_outbox o WHERE o.todoist_task_id = t.id
+                  )
+            ORDER BY t.id
+            LIMIT $2
+            """,
+            publish_label,
+            limit,
+        )
+        retired = 0
+        for r in rows:
+            labels = set(r["labels"] or [])
+            intended = {p for p, lab in platform_labels.items() if lab in labels}
+            # No platform label at all is a DIFFERENT problem (the user may be
+            # mid-edit) — find_due_posts already warns about it. Don't strip a
+            # label on a task whose intent we can't read.
+            if not intended or (intended & connected):
+                continue
+            await self._comment_missing_platforms(r["id"], sorted(intended), terminal=True)
+            await self.unpublish_task(r["id"])
+            retired += 1
+            activity.logger.warning(
+                "social_retired_unpublishable task_id=%s platforms=%s",
+                r["id"],
+                sorted(intended),
+            )
+        activity.logger.info("social_retire_unpublishable retired=%d", retired)
+        return {"retired": retired}
 
     async def unpublish_task(self, task_id: str) -> dict:
         """Skip = revoke publish intent: strip the publish label off the task.

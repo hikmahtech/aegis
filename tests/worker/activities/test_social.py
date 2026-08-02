@@ -530,9 +530,15 @@ async def test_apply_social_approval_skip_strips_publish_label(social_env):
     assert cmd["args"]["labels"] == ["x"]
 
 
-async def test_apply_social_approval_missing_account_does_not_complete(social_env):
-    """Fix #3: a labeled platform with no connected account must NOT complete
-    the task — it stays open (visible) and the gap is surfaced as a comment."""
+async def test_apply_social_approval_missing_account_comments_and_still_completes(social_env):
+    """#183: a labeled platform with no connected account is REPORTED but must
+    not hold the task open forever.
+
+    It used to block completion "so the user notices", which left the task with
+    no terminal state at all — nothing would ever create the outbox row it was
+    waiting on. Now: one comment naming the gap, and the task closes as soon as
+    everything that CAN publish has.
+    """
     await _seed_account(social_env, platform="x")  # only x connected; linkedin absent
     await _seed_task(social_env, "soctest-miss", ["publish", "x", "linkedin"])
     fake = _FakeConnector(ref="tweet-x")
@@ -544,14 +550,14 @@ async def test_apply_social_approval_missing_account_does_not_complete(social_en
         {"task_id": "soctest-miss", "platforms": ["x", "linkedin"], "text": "hi", "link": ""},
     )
     assert result == {"applied": "approved"}
-    # x still posted…
+    # x posted…
     assert await social_env.fetchval(
         "SELECT status FROM social_outbox WHERE todoist_task_id = 'soctest-miss'"
     ) == "posted"
-    # …but the task is NOT completed (linkedin never went out).
+    # …and the task reaches a terminal state instead of hanging on linkedin.
     assert await social_env.fetchval(
         "SELECT count(*) FROM todoist_outbox WHERE temp_id = 'social-complete-soctest-miss'"
-    ) == 0
+    ) == 1
     # gap surfaced as a Todoist comment
     note = await social_env.fetchrow(
         "SELECT command FROM todoist_outbox WHERE temp_id = 'social-missing-soctest-miss-linkedin'"
@@ -560,6 +566,25 @@ async def test_apply_social_approval_missing_account_does_not_complete(social_en
     cmd = note["command"] if isinstance(note["command"], dict) else json.loads(note["command"])
     assert cmd["type"] == "note_add"
     assert "linkedin" in cmd["args"]["content"]
+
+
+async def test_complete_still_waits_for_a_connected_platform_that_has_not_posted(social_env):
+    """The relaxation above must NOT swallow a platform that IS connected and
+    simply hasn't gone out yet — otherwise a task closes while a real channel
+    is still pending, which is the opposite failure."""
+    x_account = await _seed_account(social_env, platform="x")
+    await _seed_account(social_env, platform="linkedin")  # connected, no outbox row
+    await _seed_task(social_env, "soctest-halfposted", ["publish", "x", "linkedin"])
+    await social_env.execute(
+        "INSERT INTO social_outbox (todoist_task_id, account_id, payload, status, posted_ref) "
+        "VALUES ('soctest-halfposted', $1, '{}'::jsonb, 'posted', 'ref-h')",
+        x_account,
+    )
+    act = SocialActivities(db_pool=social_env)
+    assert (await ActivityEnvironment().run(act.complete_posted_tasks))["completed"] == 0
+    assert await social_env.fetchval(
+        "SELECT count(*) FROM todoist_outbox WHERE temp_id = 'social-complete-soctest-halfposted'"
+    ) == 0
 
 
 # ------------------------------------------------------------- connector refresh
@@ -1701,3 +1726,289 @@ async def test_two_stuck_posts_are_one_card_but_two_audit_rows(stuck_env):
         )
         == 2
     )
+
+
+# ============================================================================
+# #182 — the Postiz channel mirror is refreshed on a schedule, not by a button.
+#
+# `SocialPublishFlow` resolves a Todoist platform label against
+# `social_accounts`, never against Postiz, so a channel connected in Postiz was
+# unpublishable until a human clicked "Sync Postiz channels" on the admin Flows
+# page. Prod's mirror was 3 days stale when the issue was filed.
+# ============================================================================
+
+
+class _CredConnector:
+    """Stands in for SocialConnector as `SocialActivities._postiz_creds` uses it.
+
+    `test_cred_connector_matches_the_real_connector` pins it against the real
+    class so the fake cannot drift into testing nothing.
+    """
+
+    def __init__(self, url: str = "https://postiz.example.com", key: str = "pz-key"):
+        self._url = url
+        self._key = key
+
+    async def _postiz_creds(self) -> tuple[str, str]:
+        return self._url, self._key
+
+
+def test_cred_connector_matches_the_real_connector():
+    assert hasattr(SocialConnector, "_postiz_creds")
+    real = inspect.signature(SocialConnector._postiz_creds).parameters
+    fake = inspect.signature(_CredConnector._postiz_creds).parameters
+    assert list(real) == list(fake) == ["self"]
+
+
+_INTEGRATIONS = [
+    {
+        "id": "int-bsky",
+        "name": "Hikmah Tech",
+        "identifier": "bluesky",
+        "disabled": False,
+        "profile": "hikmah.bsky.social",
+        "picture": "",
+    },
+    {
+        "id": "int-off",
+        "name": "Retired Channel",
+        "identifier": "threads",
+        "disabled": True,
+        "profile": "",
+        "picture": "",
+    },
+]
+
+
+@respx.mock
+async def test_sync_postiz_channels_mirrors_enabled_channels(social_env):
+    """THE BUG: without this, a channel connected in Postiz never reaches
+    `social_accounts` and every post labelled for it fails to enqueue."""
+    route = respx.get("https://postiz.example.com/api/public/v1/integrations").respond(
+        200, json=_INTEGRATIONS
+    )
+    act = SocialActivities(db_pool=social_env, connector=_CredConnector())
+
+    result = await ActivityEnvironment().run(act.sync_postiz_channels, 60)
+
+    assert result == {"synced": 1, "skipped_disabled": 1, "status": "ok"}
+    assert route.calls[0].request.headers["authorization"] == "pz-key"
+    row = await social_env.fetchrow(
+        "SELECT platform, label, meta FROM social_accounts WHERE platform = 'bluesky'"
+    )
+    assert row is not None, "the channel Postiz reports must be publishable"
+    assert row["label"] == "hikmah-tech"
+    assert row["meta"]["postiz_integration_id"] == "int-bsky"
+    assert row["meta"]["via"] == "postiz"
+    # The disabled one is NOT mirrored — mirroring it would make a dead channel
+    # look publishable.
+    assert await social_env.fetchval(
+        "SELECT count(*) FROM social_accounts WHERE platform = 'threads'"
+    ) == 0
+
+
+@respx.mock
+async def test_sync_postiz_channels_is_throttled_by_the_mirror_watermark(social_env):
+    """The flow ticks every 5 min; the mirror's own `updated_at` is what keeps
+    that from being 288 Postiz calls a day."""
+    route = respx.get("https://postiz.example.com/api/public/v1/integrations").respond(
+        200, json=_INTEGRATIONS
+    )
+    act = SocialActivities(db_pool=social_env, connector=_CredConnector())
+    env = ActivityEnvironment()
+
+    first = await env.run(act.sync_postiz_channels, 60)
+    assert first["status"] == "ok"
+    assert route.call_count == 1
+
+    second = await env.run(act.sync_postiz_channels, 60)
+    assert second == {"synced": 0, "skipped_disabled": 0, "status": "throttled"}
+    assert route.call_count == 1, "a fresh mirror must not be re-fetched"
+
+
+@respx.mock
+async def test_sync_postiz_channels_runs_again_once_the_mirror_is_stale(social_env):
+    """The throttle is an interval, not a latch — proves the test above is
+    suppressed by FRESHNESS, not by "a row exists"."""
+    route = respx.get("https://postiz.example.com/api/public/v1/integrations").respond(
+        200, json=_INTEGRATIONS
+    )
+    act = SocialActivities(db_pool=social_env, connector=_CredConnector())
+    env = ActivityEnvironment()
+
+    assert (await env.run(act.sync_postiz_channels, 60))["status"] == "ok"
+    await social_env.execute(
+        "UPDATE social_accounts SET updated_at = now() - interval '3 hours'"
+    )
+
+    again = await env.run(act.sync_postiz_channels, 60)
+    assert again["status"] == "ok"
+    assert route.call_count == 2
+
+
+@respx.mock
+async def test_sync_postiz_channels_syncs_when_nothing_is_mirrored_yet(social_env):
+    """A NATIVE-only account carries no `postiz_integration_id`, so it must not
+    count as a watermark — otherwise the very first Postiz connect on an install
+    with a native X account would be throttled out for an hour."""
+    await _seed_account(social_env, platform="x")  # native, updated_at = now()
+    route = respx.get("https://postiz.example.com/api/public/v1/integrations").respond(
+        200, json=_INTEGRATIONS
+    )
+    act = SocialActivities(db_pool=social_env, connector=_CredConnector())
+
+    result = await ActivityEnvironment().run(act.sync_postiz_channels, 60)
+
+    assert result["status"] == "ok"
+    assert route.call_count == 1
+
+
+@respx.mock
+async def test_sync_postiz_channels_survives_a_postiz_outage(social_env):
+    """The sweep runs in front of the publish loop — a 500 must degrade to a
+    status, never raise, or a Postiz outage stops posts already approved."""
+    respx.get("https://postiz.example.com/api/public/v1/integrations").respond(
+        500, json={"error": "boom"}
+    )
+    act = SocialActivities(db_pool=social_env, connector=_CredConnector())
+
+    result = await ActivityEnvironment().run(act.sync_postiz_channels, 60)
+
+    assert result == {"synced": 0, "skipped_disabled": 0, "status": "failed"}
+
+
+async def test_sync_postiz_channels_without_creds_is_a_no_op(social_env):
+    act = SocialActivities(db_pool=social_env, connector=_CredConnector(url="", key=""))
+    result = await ActivityEnvironment().run(act.sync_postiz_channels, 60)
+    assert result == {"synced": 0, "skipped_disabled": 0, "status": "unconfigured"}
+
+
+async def test_sync_postiz_channels_without_connector_is_a_no_op(social_env):
+    act = SocialActivities(db_pool=social_env)
+    assert (await ActivityEnvironment().run(act.sync_postiz_channels, 60))["status"] == (
+        "unconfigured"
+    )
+
+
+# ============================================================================
+# #183 — a task labelled for a platform nobody connected gets an ENDING.
+#
+# Prod maps `x` and `youtube` in `social_platform_labels` with no
+# `social_accounts` row behind either. Such a task carded, failed to enqueue,
+# got one "no connected account" comment — and then stayed open forever, with
+# every later tick re-running the same dead end.
+# ============================================================================
+
+
+async def _labels(pool, task_id: str) -> list[str]:
+    return await pool.fetchval("SELECT labels FROM todoist_tasks WHERE id = $1", task_id)
+
+
+async def test_retire_strips_the_publish_label_when_no_platform_is_connected(social_env):
+    """THE BUG. `x` is mapped by the label map but has no account: the task can
+    never publish, so it must terminate instead of sitting open."""
+    await _seed_task(social_env, "soctest-orphan", ["publish", "x"])
+    act = SocialActivities(db_pool=social_env)
+
+    result = await ActivityEnvironment().run(act.retire_unpublishable_tasks, 20)
+
+    assert result == {"retired": 1}
+    assert await _labels(social_env, "soctest-orphan") == ["x"], "publish label must be revoked"
+    # ...and the revocation is written through to Todoist, not just locally.
+    skip = await social_env.fetchrow(
+        "SELECT command FROM todoist_outbox WHERE temp_id = 'social-skip-soctest-orphan'"
+    )
+    assert skip is not None
+    cmd = skip["command"] if isinstance(skip["command"], dict) else json.loads(skip["command"])
+    assert cmd["type"] == "item_update"
+    assert cmd["args"]["labels"] == ["x"]
+    # The user is told WHY, once.
+    note = await social_env.fetchrow(
+        "SELECT command FROM todoist_outbox WHERE temp_id = 'social-missing-soctest-orphan-x'"
+    )
+    assert note is not None
+    note_cmd = (
+        note["command"] if isinstance(note["command"], dict) else json.loads(note["command"])
+    )
+    assert note_cmd["type"] == "note_add"
+    body = note_cmd["args"]["content"]
+    assert "x" in body and "no connected account" in body
+    assert "removing the publish label" in body
+
+
+async def test_retire_leaves_a_task_alone_when_one_platform_is_connected(social_env):
+    """Guard independence: the retirement decision is "NOTHING can publish",
+    not "something is missing" — a partial gap is enqueue_outbox's business and
+    must not cost the task its publish label."""
+    await _seed_account(social_env, platform="linkedin")
+    await _seed_task(social_env, "soctest-partial-ok", ["publish", "x", "linkedin"])
+    act = SocialActivities(db_pool=social_env)
+
+    assert (await ActivityEnvironment().run(act.retire_unpublishable_tasks, 20)) == {"retired": 0}
+    assert await _labels(social_env, "soctest-partial-ok") == ["publish", "x", "linkedin"]
+
+
+async def test_retire_ignores_a_task_with_no_platform_label_at_all(social_env):
+    """`publish` with no platform label is a different problem (possibly a
+    half-finished edit) — don't rewrite labels on an intent we can't read."""
+    await _seed_task(social_env, "soctest-bare", ["publish"])
+    act = SocialActivities(db_pool=social_env)
+
+    assert (await ActivityEnvironment().run(act.retire_unpublishable_tasks, 20)) == {"retired": 0}
+    assert await _labels(social_env, "soctest-bare") == ["publish"]
+
+
+async def test_retire_skips_a_task_that_already_has_an_outbox_row(social_env):
+    """Something already published for it — `complete_posted_tasks` owns that
+    task's ending, and stripping its label here would fight that."""
+    account_id = await _seed_postiz_account(social_env, platform="mastodon")
+    await _seed_task(social_env, "soctest-posted", ["publish", "x"])
+    await social_env.execute(
+        "INSERT INTO social_outbox (todoist_task_id, account_id, payload, status, posted_ref) "
+        "VALUES ('soctest-posted', $1, '{}'::jsonb, 'posted', 'pz-x')",
+        account_id,
+    )
+    act = SocialActivities(db_pool=social_env)
+
+    assert (await ActivityEnvironment().run(act.retire_unpublishable_tasks, 20)) == {"retired": 0}
+    assert await _labels(social_env, "soctest-posted") == ["publish", "x"]
+
+
+async def test_retire_is_idempotent_across_ticks(social_env):
+    """The label strip is optimistic in the local projection, so the next tick
+    5 minutes later must find nothing left to do — no comment storm."""
+    await _seed_task(social_env, "soctest-once", ["publish", "x"])
+    act = SocialActivities(db_pool=social_env)
+    env = ActivityEnvironment()
+
+    assert (await env.run(act.retire_unpublishable_tasks, 20)) == {"retired": 1}
+    assert (await env.run(act.retire_unpublishable_tasks, 20)) == {"retired": 0}
+    assert await social_env.fetchval(
+        "SELECT count(*) FROM todoist_outbox WHERE temp_id LIKE 'social-missing-soctest-once%'"
+    ) == 1
+
+
+async def test_retire_respects_its_limit(social_env):
+    for i in range(3):
+        await _seed_task(social_env, f"soctest-many-{i}", ["publish", "x"])
+    act = SocialActivities(db_pool=social_env)
+
+    assert (await ActivityEnvironment().run(act.retire_unpublishable_tasks, 2)) == {"retired": 2}
+
+
+async def test_retired_task_no_longer_cards(social_env):
+    """The point of the whole thing: after retirement the task stops entering
+    the publish funnel, instead of re-carding every 5 minutes forever."""
+    past = (datetime.now(UTC) - timedelta(minutes=5)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    await _seed_task(social_env, "soctest-loop", ["publish", "x"], due_datetime=past)
+    act = SocialActivities(db_pool=social_env)
+    env = ActivityEnvironment()
+
+    assert [d["task_id"] for d in await env.run(act.find_due_posts, 10, 9)] == ["soctest-loop"]
+    await env.run(act.retire_unpublishable_tasks, 20)
+    assert await env.run(act.find_due_posts, 10, 9) == []
+
+
+async def test_retire_without_pool_is_a_no_op():
+    act = SocialActivities(db_pool=None)
+    assert await ActivityEnvironment().run(act.retire_unpublishable_tasks, 20) == {"retired": 0}

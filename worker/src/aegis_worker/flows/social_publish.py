@@ -1,16 +1,25 @@
 """SocialPublishFlow — a Todoist task is a social post, gated by an approval card.
 
 Every 5 min:
-1. find_due_posts — open @publish tasks due within the lookahead, plus
+0. sync_postiz_channels — refresh the `social_accounts` mirror from Postiz
+   (throttled to ~hourly by the mirror's own watermark). Step 1 resolves a
+   platform LABEL against that mirror, so before #182 a channel connected in
+   Postiz stayed unpublishable until a human clicked a button on the admin
+   Flows page. Best-effort: a Postiz outage must not stop steps 1-4.
+1. retire_unpublishable_tasks — an open @publish task whose every labeled
+   platform has no connected account can never publish; comment once and strip
+   the publish label so it has an ending instead of re-entering this loop
+   forever (#183). Runs BEFORE find_due_posts so the same tick doesn't card it.
+2. find_due_posts — open @publish tasks due within the lookahead, plus
    fully-Postiz-routed tasks however far out (Postiz holds the schedule, #60).
-2. Spawn one InteractionFlow card per task, ABANDONED with a deterministic
+3. Spawn one InteractionFlow card per task, ABANDONED with a deterministic
    id (social-approve-<task_id>) so overlapping ticks can't double-card, and
    a post_resolve hook (apply_social_approval) that applies the choice:
    approve → enqueue + post + complete; skip → strip the publish label.
    Cards are NOT awaited — Temporal schedules default to overlap=SKIP, so a
    tick blocked on a human for hours would starve every later tick (same
    reason ClarifyFlow spawns abandoned children).
-3. drain_social_outbox + complete_posted_tasks — retry net for anything the
+4. drain_social_outbox + complete_posted_tasks — retry net for anything the
    hook attempt left pending/failed.
 """
 
@@ -33,6 +42,12 @@ class SocialPublishConfig:
     lookahead_minutes: int = 10
     default_post_hour: int = 9  # date-only tasks post at this local hour
     approval_timeout_seconds: int = 86400  # archive after; the next tick re-cards
+    #: Minimum age of the `social_accounts` mirror before it is re-synced from
+    #: Postiz. The flow runs every 5 min; 60 keeps the channel list ≤1h stale
+    #: for ~24 Postiz calls a day. 0 syncs on every tick.
+    channel_sync_minutes: int = 60
+    #: Per-tick cap on tasks retired for having no publishable platform.
+    max_retire: int = 20
 
 
 def _preview(task: dict) -> str:
@@ -47,6 +62,29 @@ def _preview(task: dict) -> str:
 class SocialPublishFlow:
     @workflow.run
     async def run(self, config: SocialPublishConfig) -> dict:
+        # Best-effort, OUTSIDE the fail-the-flow try below: the mirror refresh
+        # and the retirement sweep are both housekeeping. Publishing an
+        # already-approved post must not stop because Postiz is unreachable or
+        # the Todoist projection is mid-sync.
+        try:
+            channels = await workflow.execute_activity_method(
+                SocialActivities.sync_postiz_channels,
+                args=[config.channel_sync_minutes],
+                start_to_close_timeout=TIMEOUT_STANDARD,
+                retry_policy=NO_RETRY,
+            )
+        except Exception:  # noqa: BLE001 — degrade, never take the tick down
+            channels = {"status": "sync_failed", "synced": 0}
+        try:
+            retired = await workflow.execute_activity_method(
+                SocialActivities.retire_unpublishable_tasks,
+                args=[config.max_retire],
+                start_to_close_timeout=TIMEOUT_FAST,
+                retry_policy=NO_RETRY,
+            )
+        except Exception:  # noqa: BLE001
+            retired = {"retired": 0}
+
         step = "find_due_posts"
         carded = 0
         try:
@@ -126,4 +164,7 @@ class SocialPublishFlow:
             "drain_posted": drained.get("posted", 0),
             "drain_failed": drained.get("failed", 0),
             "completed": completed.get("completed", 0),
+            "channel_sync": channels.get("status", "unknown"),
+            "channels_synced": channels.get("synced", 0),
+            "retired": retired.get("retired", 0),
         }

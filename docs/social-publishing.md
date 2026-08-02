@@ -47,21 +47,33 @@ Postiz owns delivery from there.
 
 - **Config:** set `postiz_url` (base URL, e.g. `https://postiz.example.com`) and
   `postiz_api_key` on the admin **Integrations** page, under the "Postiz" group.
-- **Sync:** `POST /api/admin/social/postiz/sync` (also a "Sync Postiz channels" button
+- **Sync:** the mirror is refreshed automatically — `SocialPublishFlow` calls
+  `SocialActivities.sync_postiz_channels` before every tick, throttled to
+  `channel_sync_minutes` (default 60) by the newest mirrored row's `updated_at`
+  (#182). `POST /api/admin/social/postiz/sync` (also a "Sync Postiz channels" button
   on the admin **Flows & Integrations** page, next to the Social accounts Reload
-  button) calls Postiz's `GET /api/public/v1/integrations`, and upserts one
+  button) is the manual trigger for the same code path
+  (`core/src/aegis/services/social_channels.py`). Both call Postiz's
+  `GET /api/public/v1/integrations` and upsert one
   `social_accounts` row per non-disabled channel — `platform` = the Postiz
   `identifier` (e.g. `x`, `linkedin-page`, `mastodon`, `bluesky`, `threads`,
   `youtube`, `reddit`, `telegram`…), `label` = the channel name slugified, and
   `meta = {postiz_integration_id, via: "postiz", profile, picture}`. No tokens are
   stored — Postiz holds them. Connect/manage the actual channels in the Postiz UI
   itself; the aegis-side sync only mirrors what's already connected there. Re-running
-  the sync is idempotent (upsert on `(platform, label)`).
+  the sync is idempotent (upsert on `(platform, label)`). Channels REMOVED in Postiz
+  keep their row (posted history references it) and simply stop being re-confirmed.
 - **Platform labels:** `find_due_posts` still matches Todoist labels to platforms via
   the `social_platform_labels` settings row (`{"x":"x","linkedin":"linkedin",...}`) —
   extend that row (from the Settings page) with entries for any Postiz-only platform
   you sync, e.g. `{"bluesky":"bluesky","mastodon":"mastodon"}`, using the same
-  `identifier` values Postiz reports.
+  `identifier` values Postiz reports. A label mapped to a platform with **no**
+  connected account cannot publish: if that is the task's only platform,
+  `retire_unpublishable_tasks` comments once and revokes the `@publish` label so the
+  task ends instead of re-carding forever; if other labeled platforms *are*
+  connected, those publish, the gap is commented, and the task still completes
+  (#183). Ask an agent `list_social_channels` to see connected channels alongside
+  the mapped-but-unconnected ones.
 - **Posting:** `SocialConnector.post()` checks `account.meta.postiz_integration_id`
   BEFORE any token-refresh attempt (Postiz-mirrored accounts carry no tokens to
   refresh) and, when set, POSTs to `{postiz_url}/api/public/v1/posts` with

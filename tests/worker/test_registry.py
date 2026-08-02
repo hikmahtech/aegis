@@ -223,10 +223,13 @@ def test_module_workflows_is_the_unflagged_registry():
         # report_flow_health) — unflagged, so all three rows move. Then +2
         # activities and NO new flow from #225's stuck-post watchdog
         # (find_stuck_posts, report_stuck_posts on the existing
-        # SocialActivities, driven by the existing SocialMetricsFlow).
-        (True, True, 38, 184),
-        (False, False, 30, 155),
-        (True, False, 34, 173),
+        # SocialActivities, driven by the existing SocialMetricsFlow). Then +2
+        # more activities and again NO new flow from #182/#183
+        # (sync_postiz_channels, retire_unpublishable_tasks — both on
+        # SocialActivities, both driven by the existing SocialPublishFlow).
+        (True, True, 38, 186),
+        (False, False, 30, 157),
+        (True, False, 34, 175),
     ],
 )
 def test_real_registration_passes_the_boot_check(homelab, money, flows, activities):

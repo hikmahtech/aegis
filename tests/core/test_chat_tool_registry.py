@@ -58,6 +58,7 @@ EXPECTED_TOOL_NAMES = [
     "list_pods",
     "list_projects",
     "list_services",
+    "list_social_channels",
     "mark_waiting",
     "pdf_to_text",
     "query_activities",

@@ -319,6 +319,8 @@ FLOWS: tuple[FlowSpec, ...] = (
             agent_id=act["agent_id"],
             lookahead_minutes=int(act["config"].get("lookahead_minutes", 10)),
             default_post_hour=int(act["config"].get("default_post_hour", 9)),
+            channel_sync_minutes=int(act["config"].get("channel_sync_minutes", 60)),
+            max_retire=int(act["config"].get("max_retire", 20)),
         ),
     ),
     FlowSpec(
