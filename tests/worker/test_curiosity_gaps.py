@@ -43,6 +43,10 @@ async def _wipe(conn):
     await conn.execute("DELETE FROM finance.receipt_email WHERE charge_id IS NOT NULL")
     await conn.execute("DELETE FROM finance.recurring_charge")
     await conn.execute("DELETE FROM agent_memory WHERE agent_id = $1", AGENT)
+    # The soft-retirement test drives the real `apply_consolidation`, which
+    # writes a ledger row per op. The ledger has no FK to agent_memory (it must
+    # outlive the rows it describes), so it needs its own delete.
+    await conn.execute("DELETE FROM agent_memory_ops_log WHERE agent_id = $1", AGENT)
     await conn.execute("DELETE FROM agent_personalities WHERE agent_id = $1", AGENT)
     await conn.execute("DELETE FROM interactions")
     await conn.execute("DELETE FROM knowledge_chunks")
@@ -108,6 +112,63 @@ async def test_memory_naming_the_vendor_removes_the_candidate(clean_db):
     )
 
     assert await _run(clean_db) == []
+
+
+async def test_an_a4_retired_memory_no_longer_suppresses_the_question(clean_db):
+    """A withdrawn belief must stop counting as "already known".
+
+    A4 (migration 020) retires a memory it judged redundant, contradicted or
+    wrong by stamping `superseded_at` rather than deleting the row. The row
+    stays SELECT-able forever, so a retire-blind read of `agent_memory` keeps
+    the withdrawn text in the "everything the agent has been told" haystack and
+    the gap it used to explain is never re-opened.
+
+    Two vendors, two memories, one retired — so the pass cannot come from the
+    haystack breaking wholesale: `Linear` is still explained by a LIVE memory
+    and must stay suppressed while `Framer` re-opens.
+
+    Retired through the real `apply_consolidation` (which issues `_SQL_RETIRE`),
+    so this breaks if A4 ever changes its retirement marker.
+    """
+    from aegis.services.memory import apply_consolidation
+
+    await _add_charge(clean_db, "Framer")
+    await _add_charge(clean_db, "Linear")
+    retired_id = await clean_db.fetchval(
+        "INSERT INTO agent_memory (agent_id, content, importance, source) "
+        "VALUES ($1, 'zzsf1-Framer is where the landing pages live.', 0.8, 'curiosity') "
+        "RETURNING id",
+        AGENT,
+    )
+    await clean_db.execute(
+        "INSERT INTO agent_memory (agent_id, content, importance, source) "
+        "VALUES ($1, 'zzsf1-Linear is where the roadmap lives.', 0.8, 'curiosity')",
+        AGENT,
+    )
+
+    # Baseline: while BOTH memories are live, BOTH charges are suppressed. This
+    # is what stops the final assertion passing because the charge detector
+    # never fired, or because nothing was seeded.
+    assert await _run(clean_db) == []
+
+    outcome = await apply_consolidation(
+        clean_db,
+        AGENT,
+        [{"op": "DELETE", "id": retired_id, "apply": True}],
+        run_id="zzsf1-retire",
+        dry_run=False,
+    )
+    assert outcome["applied"] == 1, "nothing was retired — the test proves nothing"
+    assert (
+        await clean_db.fetchval(
+            "SELECT superseded_at IS NOT NULL FROM agent_memory WHERE id = $1", retired_id
+        )
+        is True
+    ), "the row was hard-deleted, not soft-retired — wrong mechanism under test"
+
+    out = await _run(clean_db)
+
+    assert [c["novelty_key"] for c in out] == ["charge:framer"]
 
 
 async def test_profile_naming_the_vendor_also_removes_the_candidate(clean_db):

@@ -189,11 +189,20 @@ dropped.
 
 | Health Auto Export metric | Stored as | Notes |
 |---|---|---|
-| `sleep_analysis` | `sleep_minutes` | `totalSleep` (else `asleep`/`inBed`); hours → minutes |
+| `sleep_analysis` | `sleep_minutes` | `totalSleep` (else `asleep`/`inBed`); `hr`/`min`/`s` → minutes |
 | `heart_rate_variability` | `hrv_ms` | |
 | `resting_heart_rate` | `resting_hr` | |
 | `step_count` | `steps` | |
-| `active_energy` | `active_energy_kcal` | kJ → kcal when the phone exports kJ |
+| `active_energy` | `active_energy_kcal` | `kJ` → kcal when the phone exports kJ |
+
+Sleep and active energy are stored **only** when the export names a unit the
+allowlist knows. Anything else — an absent unit, or one Health Auto Export has
+not been seen to send — is counted into `skipped` and logged as
+`health_push_unreadable_unit` with the offending unit, rather than assumed. An
+assumed unit would be a silent 60× (sleep) or 4× (energy) error, and because
+the first write for a (metric, instant) wins, a corrected re-export could never
+overwrite it; a skipped sample is simply re-offered by the next export. If that
+warning appears, fix the phone's units and re-export the window.
 
 Widening that list is a deliberate edit to `_METRIC_ALLOWLIST`
 (`core/src/aegis/services/health.py`). It is short on purpose: a store of every

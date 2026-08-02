@@ -267,6 +267,63 @@ async def test_junk_samples_are_skipped_without_poisoning_the_batch(client, db_p
     assert [r["value"] for r in await _rows(db_pool)] == [8421.0]
 
 
+async def test_an_unreadable_unit_is_skipped_and_warned_never_assumed(client, db_pool):
+    """The unit is load-bearing, so an unknown one drops the sample loudly.
+
+    Assuming Health Auto Export's default (hours for sleep, kcal for energy) on
+    an export that does not say so is a silent 60x / 4x error, and the first
+    write for a (metric, instant) wins — so a corrected re-export could never
+    overwrite it. Skipping keeps the store repairable.
+
+    Controls, so this cannot pass by the lane simply storing nothing: the same
+    batch carries a `sleep_analysis` entry that DOES name its unit and a
+    `step_count` entry, and both must still land.
+    """
+    url, raw, headers = _push(
+        _export(
+            # No `units` key at all — the "absent" half of the bug.
+            {"name": "sleep_analysis", "data": [
+                {"date": "2026-07-29 00:00:00 +0530", "totalSleep": 7.0},
+            ]},
+            # Present but not a unit this lane has ever seen HAE send.
+            _metric("active_energy", "kilojoules", [
+                {"date": "2026-07-29 00:00:00 +0530", "qty": 2092.0},
+            ]),
+            # Controls: identical shape, unit named, must still be stored.
+            _metric("sleep_analysis", "hr", [
+                {"date": "2026-07-30 00:00:00 +0530", "totalSleep": 7.5},
+            ]),
+            _metric("step_count", "count", [
+                {"date": "2026-07-30 00:00:00 +0530", "qty": 8421},
+            ]),
+        )
+    )
+    with capture_logs() as captured:
+        resp = await client.post(url, content=raw, headers=headers)
+    assert resp.status_code == 202, resp.text
+    assert resp.json()["stored"] == 2
+    assert resp.json()["skipped"] == 2
+
+    rows = await _rows(db_pool)
+    # The unit-bearing sleep sample landed; the unit-less one did not, and
+    # emphatically not as `7.0 * 60`, the hours the old fallback assumed.
+    assert [r["value"] for r in rows if r["metric"] == "sleep_minutes"] == [450.0]
+    # 2092 kJ is 500 kcal; the old fallback would have banked it as 2092 kcal.
+    assert [r["metric"] for r in rows] == ["sleep_minutes", "steps"]
+    assert [r["value"] for r in rows if r["metric"] == "steps"] == [8421.0]
+
+    # The operator can tell it happened, and from what.
+    warnings = [e for e in captured if e.get("event") == "health_push_unreadable_unit"]
+    assert len(warnings) == 1, captured
+    assert warnings[0]["log_level"] == "warning"
+    assert warnings[0]["units"] == {
+        "active_energy_kcal": ["kilojoules"],
+        "sleep_minutes": [""],
+    }
+    # Non-vacuity: the lane logged normally too, so the capture really works.
+    assert any(e.get("event") == "health_push_recorded" for e in captured)
+
+
 async def test_a_batch_beyond_the_sample_cap_is_truncated_not_run_to_completion(
     client, db_pool
 ):

@@ -116,9 +116,16 @@ class CuriosityActivities:
 
         Memories are capped at 50/agent by the pruner and persona docs are a few
         KB, so this stays small enough to substring-match against.
+
+        LIVE rows only (`superseded_at IS NULL`, migration 020's marker — the
+        same predicate every A4 reader uses). A consolidation pass retires a
+        memory it judged redundant, contradicted or wrong; leaving it in this
+        haystack would keep suppressing the question about a belief AEGIS has
+        already withdrawn.
         """
         rows = await self.db_pool.fetch(
-            "SELECT content FROM agent_memory WHERE agent_id = $1", agent_id
+            "SELECT content FROM agent_memory WHERE agent_id = $1 AND superseded_at IS NULL",
+            agent_id,
         )
         rows += await self.db_pool.fetch(
             "SELECT content FROM agent_personalities WHERE agent_id = $1", agent_id
