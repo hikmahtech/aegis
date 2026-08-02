@@ -163,6 +163,25 @@ activities:
     config: {max_per_day: 1}
     active: true
 
+  # Sebas — A2, one proposed edit to his own `user` persona doc per week,
+  # delivered as a draft_review card that a human must approve before anything
+  # is written. 02:23 UTC Sunday = 07:53 IST.
+  #
+  # The minute matters more than the hour here. The spec proposed "0 2 * * 0",
+  # but minute :00 of EVERY hour is the busiest slot in this file — two hourly
+  # flows plus the */2, */5, */15 and */30 steppers all fire there — and this is
+  # an LLM flow whose whole point was to avoid a crowded cluster. :23 is hit by
+  # no stepper (odd, not a multiple of 5) and by no fixed-minute row, and it
+  # sits clear of the Sunday 03:30/05:00 review cluster.
+  # NOTE: `config` is DB-owned (seed.py only refreshes workflow_type/agent_id) —
+  # on an existing deploy tune lookback_days on /admin/flows, not here.
+  - slug: profile-reflection-weekly
+    workflow_type: ProfileReflectionFlow
+    agent_id: sebas
+    schedule_cron: "23 2 * * 0"
+    config: {lookback_days: 7, max_per_day: 1}
+    active: true
+
   # Raphael — knowledge ingestion (raindrop + rss + intel scans)
   - slug: raindrop-ingest-2h
     workflow_type: RaindropIngestFlow

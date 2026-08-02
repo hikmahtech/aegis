@@ -68,6 +68,7 @@ from aegis_worker.flows.llm_spend_guard import LLMSpendGuardConfig, LLMSpendGuar
 from aegis_worker.flows.memory_reflection import MemoryReflectionFlow, MemoryReflectionInput
 from aegis_worker.flows.money_hygiene import MoneyHygieneConfig, MoneyHygieneDailyFlow
 from aegis_worker.flows.money_process import MoneyProcessFlow
+from aegis_worker.flows.profile_reflection import ProfileReflectionConfig, ProfileReflectionFlow
 from aegis_worker.flows.raindrop_ingest import RaindropIngestFlow, RaindropIngestInput
 from aegis_worker.flows.receipt_ingest import ReceiptIngestFlow, ReceiptIngestInput
 from aegis_worker.flows.review import (
@@ -331,6 +332,20 @@ FLOWS: tuple[FlowSpec, ...] = (
             max_per_day=int(act["config"].get("max_per_day", 1)),
             limit=int(act["config"].get("limit", 5)),
             timeout_seconds=int(act["config"].get("timeout_seconds", 2 * 86400)),
+            aegis_ui_url=act["_settings"].get("aegis_ui_url", ""),
+        ),
+    ),
+    # A2 — weekly proposed edit to the agent's own `user` persona doc, delivered
+    # as a draft_review card. aegis_ui_url comes from settings (not the activity
+    # config) because cards.py renders NO button for `draft_review` without it,
+    # so the Slack card would otherwise be a dead end.
+    FlowSpec(
+        ProfileReflectionFlow,
+        lambda act: ProfileReflectionConfig(
+            agent_id=act["agent_id"],
+            lookback_days=int((act["config"] or {}).get("lookback_days", 7)),
+            max_per_day=int((act["config"] or {}).get("max_per_day", 1)),
+            timeout_seconds=int((act["config"] or {}).get("timeout_seconds", 7 * 86400)),
             aegis_ui_url=act["_settings"].get("aegis_ui_url", ""),
         ),
     ),
