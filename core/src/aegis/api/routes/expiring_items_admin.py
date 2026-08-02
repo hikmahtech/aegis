@@ -38,6 +38,10 @@ class ExpiringItemCreate(BaseModel):
 
 
 class ExpiringItemUpdate(BaseModel):
+    # Patch semantics: the handler dumps this with `exclude_unset=True`, so an
+    # omitted field is left alone. An explicit `"person_id": null` /
+    # `"asset_id": null` is therefore distinguishable from "not supplied" and
+    # the service reads it as "unlink" (issue #200).
     kind: str | None = None
     title: str | None = None
     expires_on: date | None = None

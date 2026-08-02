@@ -44,6 +44,16 @@ _EDITABLE_FIELDS = (
     "metadata",
 )
 
+# Nullable foreign keys an operator must be able to *detach*, not just
+# re-point. The admin route builds its patch with `model_dump(exclude_unset=True)`,
+# so a key reaches `update_expiring_item` only when the client actually sent it:
+# an explicit JSON `null` on one of these means "unlink", while an absent key
+# still means "leave alone". Every other field keeps the people.py / infra.py
+# convention where `None` is indistinguishable from absent — a UUID column has
+# no ""-sentinel, so without this a mislinked document could only be fixed by
+# deleting the person/asset or by hand-written SQL (issue #200).
+_CLEARABLE_FIELDS = ("person_id", "asset_id")
+
 # Used when a caller supplies no lead_days at all. Mirrors the column DEFAULT
 # in migration 018 — kept here too so `create_expiring_item` always writes an
 # explicit, normalised array rather than relying on the DB default for some
@@ -155,9 +165,17 @@ async def update_expiring_item(
     """Patch the editable fields present in `data`. Returns None if no such row.
 
     `None` values are treated as "not supplied" (people.py / infra.py
-    convention) — clear a text field with "" rather than null.
+    convention) — clear a text field with "" rather than null. The exception is
+    `_CLEARABLE_FIELDS`: for those a *present* `None` detaches the link, which
+    is the only way to unlink a person or asset (issue #200). Keys the caller
+    never sent are still left alone, so a partial patch cannot unlink by
+    accident.
     """
-    fields = {k: v for k, v in data.items() if k in _EDITABLE_FIELDS and v is not None}
+    fields = {
+        k: v
+        for k, v in data.items()
+        if k in _EDITABLE_FIELDS and (v is not None or k in _CLEARABLE_FIELDS)
+    }
     if "kind" in fields:
         kind = str(fields["kind"]).strip().lower()
         if not kind:

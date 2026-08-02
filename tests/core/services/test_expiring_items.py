@@ -174,6 +174,37 @@ async def test_update_rejects_blanking_required_fields(pool, today):
     assert (await svc.get_expiring_item(pool, item["id"]))["title"] == f"{PREFIX}Schengen"
 
 
+async def test_only_the_link_columns_read_a_present_none_as_clear(pool, today):
+    """`None` still means "not supplied" everywhere except person_id/asset_id.
+
+    Widening `_CLEARABLE_FIELDS` would turn every partial patch into a wipe of
+    the fields the caller happened to model as `None`, so the non-clearable
+    side of the rule is asserted here, not assumed (issue #200).
+    """
+    person_id = await pool.fetchval(
+        "INSERT INTO life.people (name) VALUES ($1) RETURNING id", f"{PREFIX}Keeper"
+    )
+    item = await svc.create_expiring_item(
+        pool,
+        {
+            "kind": "visa",
+            "title": f"{PREFIX}Schengen",
+            "expires_on": today,
+            "person_id": person_id,
+            "notes": "keep me",
+        },
+    )
+    updated = await svc.update_expiring_item(
+        pool, item["id"], {"notes": None, "title": None, "person_id": None}
+    )
+    assert updated is not None
+    # The two non-clearable Nones were ignored...
+    assert updated["notes"] == "keep me"
+    assert updated["title"] == f"{PREFIX}Schengen"
+    # ...while the link column in the same patch was cleared.
+    assert updated["person_id"] is None
+
+
 async def test_update_of_a_missing_row_returns_none(pool):
     assert await svc.update_expiring_item(pool, uuid4(), {"notes": "ghost"}) is None
     # An empty patch on a missing row is also None, not a crash.

@@ -8,7 +8,9 @@ progress" the moment a handler touches the database).
 from __future__ import annotations
 
 import base64
+import re
 from datetime import timedelta
+from pathlib import Path
 
 import asyncpg
 import pytest
@@ -22,7 +24,7 @@ PREFIX = "zzexproute-"
 
 
 async def _wipe(pool: asyncpg.Pool) -> None:
-    # Children before parents: alerts -> items -> people.
+    # Children before parents: alerts -> items -> people/assets.
     await pool.execute(
         "DELETE FROM life.expiring_item_alerts WHERE item_id IN "
         "(SELECT id FROM life.expiring_items WHERE title LIKE $1)",
@@ -30,6 +32,7 @@ async def _wipe(pool: asyncpg.Pool) -> None:
     )
     await pool.execute("DELETE FROM life.expiring_items WHERE title LIKE $1", f"{PREFIX}%")
     await pool.execute("DELETE FROM life.people WHERE name LIKE $1", f"{PREFIX}%")
+    await pool.execute("DELETE FROM life.assets WHERE slug LIKE $1", f"{PREFIX}%")
 
 
 @pytest_asyncio.fixture(loop_scope="function")
@@ -255,3 +258,133 @@ async def test_mutations_are_audit_logged(client, auth_headers, db_pool):
         "SELECT 1 FROM audit_log WHERE target_id = $1 AND action = 'expiring_item_deleted'",
         item_id,
     )
+
+
+_PAGE = Path(__file__).resolve().parents[2] / "admin-panel/frontend/src/pages/ExpiringItems.tsx"
+
+
+def _spa_save_payload(form: dict[str, str]) -> dict:
+    """The body `ExpiringItems.tsx#handleSave` builds from its form state.
+
+    Mirrored rather than invented: #200 is about the SPA's "empty the box"
+    gesture reaching the service as an explicit null, so a hand-rolled request
+    would prove the service works while the page stayed unable to drive it.
+    `test_admin_panel_unlinks_with_an_explicit_null` pins this mirror to the
+    real source so the two cannot drift apart in silence.
+    """
+    lead_days = []
+    for chunk in form["lead_days"].split(","):
+        try:
+            lead_days.append(int(chunk.strip()))
+        except ValueError:
+            continue
+    return {
+        "kind": form["kind"].strip(),
+        "title": form["title"].strip(),
+        "expires_on": form["expires_on"],
+        "lead_days": lead_days,
+        "person_id": form["person_id"].strip() or None,
+        "notes": form["notes"],
+    }
+
+
+async def test_admin_panel_unlinks_with_an_explicit_null():
+    """The page must SEND `person_id: null` when its box is empty.
+
+    If it ever switched to omitting the key, the handler's `exclude_unset=True`
+    would drop it and the unlink would silently do nothing — the precise drift
+    #200 describes. Read out of the source instead of restated here, which
+    would only agree with itself.
+    """
+    src = _PAGE.read_text()
+    assert re.search(r"person_id:\s*form\.person_id\.trim\(\)\s*\|\|\s*null", src), (
+        "ExpiringItems.tsx no longer sends person_id as an explicit null — "
+        "_spa_save_payload and the unlink path below are now fiction"
+    )
+    # ...and it offers a control that empties the box (the Unlink button).
+    # Matched on the setForm call, not on the bare `person_id: ''`, which the
+    # page's `emptyForm` constant satisfies whether or not the button exists.
+    assert re.search(r"setForm\(\{\s*\.\.\.form,\s*person_id:\s*''\s*\}\)", src), (
+        "ExpiringItems.tsx has no control that clears an existing person link"
+    )
+
+
+async def test_person_and_asset_links_can_be_cleared_through_the_route(
+    client, auth_headers, db_pool, today
+):
+    person_id = await db_pool.fetchval(
+        "INSERT INTO life.people (name) VALUES ($1) RETURNING id", f"{PREFIX}Owner"
+    )
+    asset_id = await db_pool.fetchval(
+        "INSERT INTO life.assets (slug, name, kind) VALUES ($1, $2, 'appliance') RETURNING id",
+        f"{PREFIX}boiler",
+        f"{PREFIX}Boiler",
+    )
+    form = {
+        "kind": "passport",
+        "title": f"{PREFIX}Mislinked passport",
+        "expires_on": (today + timedelta(days=200)).isoformat(),
+        "lead_days": "30, 7, 1",
+        "person_id": str(person_id),
+        "notes": "linked to the wrong person",
+    }
+    payload = _spa_save_payload(form)
+    payload["asset_id"] = str(asset_id)  # the page has no asset box; API-only link
+    resp = await client.post("/api/admin/expiring-items", headers=auth_headers, json=payload)
+    assert resp.status_code == 201, resp.text
+    item_id = resp.json()["id"]
+    assert resp.json()["person_id"] == str(person_id)
+    assert resp.json()["asset_id"] == str(asset_id)
+
+    # A patch that never mentions person_id leaves the link alone. Proven on
+    # its own, because "the link survived" and "the link was cleared" are
+    # decided by the same filter — a test showing only the clear would pass
+    # just as happily if that filter wiped every unmentioned field.
+    resp = await client.put(
+        f"/api/admin/expiring-items/{item_id}",
+        headers=auth_headers,
+        json={"notes": "still linked"},
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["person_id"] == str(person_id)
+    assert resp.json()["asset_id"] == str(asset_id)
+
+    # Emptying the box in the edit modal detaches the person.
+    form["person_id"] = "   "  # what `.trim() || null` turns into a JSON null
+    resp = await client.put(
+        f"/api/admin/expiring-items/{item_id}",
+        headers=auth_headers,
+        json=_spa_save_payload(form),
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["person_id"] is None, "emptying the person box did not unlink"
+    assert (
+        await db_pool.fetchval(
+            "SELECT person_id FROM life.expiring_items WHERE id = $1::uuid", item_id
+        )
+        is None
+    ), "the response said unlinked but the column still holds the person"
+    # The clear is targeted: a field the payload never mentioned is untouched,
+    # and the rest of the same patch still applied.
+    assert body["asset_id"] == str(asset_id)
+    assert body["lead_days"] == [30, 7, 1]
+    # Unlinking is not deleting — the person row is still there.
+    assert (
+        await db_pool.fetchval("SELECT name FROM life.people WHERE id = $1", person_id)
+        == f"{PREFIX}Owner"
+    )
+
+    # The asset link detaches the same way, and the asset survives.
+    resp = await client.put(
+        f"/api/admin/expiring-items/{item_id}", headers=auth_headers, json={"asset_id": None}
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["asset_id"] is None
+    assert (
+        await db_pool.fetchval(
+            "SELECT asset_id FROM life.expiring_items WHERE id = $1::uuid", item_id
+        )
+        is None
+    )
+    assert await db_pool.fetchval("SELECT 1 FROM life.assets WHERE id = $1", asset_id) == 1
