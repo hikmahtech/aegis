@@ -358,6 +358,26 @@ activities:
     config: {}
     active: true
 
+  # Pandora — watchdog over AEGIS's own scheduled flows (#226): N consecutive
+  # failures of one workflow_type, plus schedules that have stopped succeeding
+  # within a multiple of their own cadence. Alerts are deduped in audit_log,
+  # so a flow wedged all day produces one card, not one per tick.
+  #
+  # ":07 and :37" — every 30 min, which bounds the alert lag on a wedged
+  # 5-minute flow to ~30 min (the 2026-08-02 TodoistSync incident ran 25 min
+  # unseen). Minutes 7/37 are odd, not multiples of 5, so they miss every
+  # */2, */5, */15 and */30 stepper as well as the busy :00 minute; hour is
+  # unrestricted, so no daily slot is contended either.
+  - slug: flow-health-watchdog-30m
+    workflow_type: FlowHealthWatchdogFlow
+    agent_id: pandoras-actor
+    schedule_cron: "7,37 * * * *"
+    # Knobs (all DB-editable on /admin/flows, propagate in <=5 min without a
+    # redeploy): consecutive_failures, lookback_hours, stale_multiplier,
+    # min_stale_minutes, dedup_hours, recovery_hours, check_stale, silent.
+    config: {}
+    active: true
+
   - slug: cert-radar-daily
     workflow_type: CertRadarFlow
     agent_id: pandoras-actor
