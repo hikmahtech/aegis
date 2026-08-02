@@ -34,6 +34,15 @@ Four things make it safe to run unattended:
    id derived from the agent and the ISO week, so an overlapping run cannot
    double-card the same week, and a draft blocked on a human for days never
    starves the schedule (Temporal schedules default to overlap=SKIP).
+
+A5 adds one step between the evidence and the proposal: `propose_generalizations`
+looks for claims that three or more *independent* memories agree on, and those
+claims go into the prompt weighted above the week's raw evidence and into the
+card's metadata so the human sees what is being generalised about them. The
+supporting ids ride along as `promoted_memory_ids`; approving the card is what
+makes them promoted, and `_promoted_memory_ids` reads that back so the same
+claim is not proposed again next week. The step is additive — if it fails, the
+weekly draft still goes out, just without generalisations.
 """
 
 from __future__ import annotations
@@ -54,7 +63,13 @@ with workflow.unsafe.imports_passed_through():
 _PROMPT_MAX = 1200
 
 
-def _card_text(agent_id: str, rationale: str, changed: list[str], days: int) -> str:
+def _card_text(
+    agent_id: str,
+    rationale: str,
+    changed: list[str],
+    days: int,
+    generalizations: list | None = None,
+) -> str:
     lines = [
         f"📝 Weekly profile draft for *{agent_id}* (last {days} days)",
         "",
@@ -65,6 +80,16 @@ def _card_text(agent_id: str, rationale: str, changed: list[str], days: int) -> 
         lines += ["Proposed changes:", *changed[:12]]
     else:
         lines.append("Proposed changes: (see the full document in the admin panel)")
+    # A5: name the inferences explicitly. A generalisation is a claim ABOUT the
+    # human drawn from rows an LLM wrote — burying it inside a 2000-word
+    # document is how it gets approved without being read.
+    claims = [
+        f"• {str(g.get('claim'))[:200]} ({len(g.get('supporting_memory_ids') or [])} memories)"
+        for g in (generalizations or [])
+        if isinstance(g, dict) and str(g.get("claim") or "").strip()
+    ]
+    if claims:
+        lines += ["", "Generalised from repeated memories:", *claims[:5]]
     lines += ["", "Review, edit if needed, then Approve — or Reject with a reason."]
     return "\n".join(lines)[:_PROMPT_MAX]
 
@@ -129,11 +154,43 @@ class ProfileReflectionFlow:
             if not int(evidence.get("total") or 0):
                 return {"status": "skipped", "carded": 0, "reason": "no_evidence"}
 
+            step = "propose_generalizations"
+            # A5. Additive: the activity itself never raises, so this `except`
+            # only fires when the ACTIVITY does (a Temporal timeout, a dead
+            # worker, a DB error on the way out) — and even then the weekly
+            # draft still goes out, without generalisations. Losing the whole
+            # card because the clustering pass tripped would be a worse trade.
+            try:
+                gen = await workflow.execute_activity_method(
+                    ProfileActivities.propose_generalizations,
+                    args=[config.agent_id],
+                    start_to_close_timeout=TIMEOUT_LLM,
+                    retry_policy=NO_RETRY,
+                )
+            except Exception as exc:  # noqa: BLE001
+                workflow.logger.warning(
+                    "profile_generalizations_failed err=%s", str(exc)[:200]
+                )
+                gen = {}
+            generalizations = [
+                g for g in ((gen or {}).get("candidates") or []) if isinstance(g, dict)
+            ]
+            # The ids the human's approval will graduate. Flattened here so the
+            # applier and `_promoted_memory_ids` read ONE list.
+            promoted_ids = sorted(
+                {
+                    int(i)
+                    for g in generalizations
+                    for i in (g.get("supporting_memory_ids") or [])
+                    if isinstance(i, int) and not isinstance(i, bool)
+                }
+            )
+
             step = "propose_profile_patch"
             try:
                 proposal = await workflow.execute_activity_method(
                     ProfileActivities.propose_profile_patch,
-                    args=[config.agent_id, evidence, current_doc],
+                    args=[config.agent_id, evidence, current_doc, generalizations],
                     start_to_close_timeout=TIMEOUT_LLM,
                     retry_policy=NO_RETRY,
                 )
@@ -170,6 +227,7 @@ class ProfileReflectionFlow:
                             str(proposal.get("rationale") or ""),
                             changed,
                             int(evidence.get("lookback_days") or config.lookback_days),
+                            generalizations,
                         ),
                         options=options,
                         timeout_seconds=config.timeout_seconds,
@@ -183,6 +241,13 @@ class ProfileReflectionFlow:
                             "revision_of": proposal.get("revision_of"),
                             "rationale": proposal.get("rationale"),
                             "changed_lines": changed[:40],
+                            # A5. `promoted_memory_ids` is the ledger entry:
+                            # approving this card is what makes these rows
+                            # promoted, and `_promoted_memory_ids` reads it back
+                            # (gated on an approve AND a real revision) so the
+                            # same claim is not re-proposed every week.
+                            "generalizations": generalizations[:10],
+                            "promoted_memory_ids": promoted_ids,
                         },
                         post_resolve_activity="apply_profile_reflection",
                     ),
@@ -214,4 +279,6 @@ class ProfileReflectionFlow:
             "evidence_total": int(evidence.get("total") or 0),
             "changed_lines": len(changed),
             "proposed_chars": len(proposed_doc),
+            "generalizations": len(generalizations),
+            "promoted_memory_ids": len(promoted_ids),
         }
