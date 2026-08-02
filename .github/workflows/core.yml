@@ -4,6 +4,13 @@ name: "Core — Test"
 # homelab-gitops infra repo (ansible), not here — so forks/clones never build
 # or deploy, and no infra/registry details leak into the open-source repo.
 
+# The `paths:` filter must list every input this job's tests READ, not just the
+# package under test. In particular `config/**`: tests/conftest.py seeds each
+# test database with `load_seeds(config/seed)`, and tests/core/test_seed.py,
+# test_todoist_seed.py and test_agent_tags.py assert directly against those
+# YAML files. Omitting a path here does not merely skip a job — it silently
+# disarms the tests that exist to validate that path (issue #170).
+
 on:
   push:
     branches: [main]
@@ -11,6 +18,10 @@ on:
       - "core/**"
       - "admin-panel/frontend/src/**"
       - "tests/core/**"
+      - "tests/api/**"
+      - "tests/integration/**"
+      - "tests/conftest.py"
+      - "config/**"
       - "migrations/**"
       - "personalities/**"
       - "pyproject.toml"
@@ -21,6 +32,10 @@ on:
       - "core/**"
       - "admin-panel/frontend/src/**"
       - "tests/core/**"
+      - "tests/api/**"
+      - "tests/integration/**"
+      - "tests/conftest.py"
+      - "config/**"
       - "migrations/**"
       - "personalities/**"
       - "pyproject.toml"
@@ -56,7 +71,7 @@ jobs:
           pip install -e "core[dev]"
 
       - name: Lint
-        run: ruff check core/src/ tests/core/
+        run: ruff check core/src/ tests/core/ tests/api/ tests/integration/ tests/conftest.py
 
       - name: Test
-        run: pytest tests/core/ -n auto --dist loadfile --timeout=300 -v --tb=short --cov=core/src/aegis --cov-report=term-missing --cov-report=xml
+        run: pytest tests/core/ tests/api/ tests/integration/ -n auto --dist loadfile --timeout=300 -v --tb=short --cov=core/src/aegis --cov-report=term-missing --cov-report=xml

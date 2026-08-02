@@ -3,20 +3,41 @@ name: "Worker — Test"
 # Public repo: test only. Image build + swarm deploy live in the private
 # homelab-gitops infra repo (ansible), not here.
 
+# The `paths:` filter must list every input this job's tests READ, not just the
+# package under test. `config/**` because tests/conftest.py seeds each test DB
+# from config/seed/ and several worker tests parse config/seed/activities.yaml
+# directly (test_expiry_radar, test_flow_health, test_daylog, test_registry,
+# test_curiosity_card_flow, test_llm_spend_guard); migrations/ + personalities/
+# because that same fixture migrates and imports them; admin-panel because
+# test_profile_reflection_e2e.py parses InteractionDetail.tsx. Omitting a path
+# here silently disarms the tests that validate it (issue #170).
+
 on:
   push:
     branches: [main]
     paths:
       - "worker/**"
       - "core/**"
+      - "admin-panel/frontend/src/**"
       - "tests/worker/**"
+      - "tests/conftest.py"
+      - "config/**"
+      - "migrations/**"
+      - "personalities/**"
+      - "pyproject.toml"
       - ".github/workflows/worker.yml"
   pull_request:
     branches: [main]
     paths:
       - "worker/**"
       - "core/**"
+      - "admin-panel/frontend/src/**"
       - "tests/worker/**"
+      - "tests/conftest.py"
+      - "config/**"
+      - "migrations/**"
+      - "personalities/**"
+      - "pyproject.toml"
       - ".github/workflows/worker.yml"
 
 jobs:
