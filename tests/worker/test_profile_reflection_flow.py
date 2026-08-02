@@ -51,6 +51,17 @@ async def _wipe(conn):
     await conn.execute("DELETE FROM interactions WHERE agent_id = $1", AGENT)
     await conn.execute("DELETE FROM notification_log WHERE agent_id = $1", AGENT)
     await conn.execute("DELETE FROM llm_calls WHERE agent_id = $1", AGENT)
+    # `test_a_quiet_week_sends_nothing` asserts the flow SKIPS for want of
+    # evidence, and two of the five evidence sources are global — no agent_id
+    # column on `finance.*`, and every `calendar_events_%` settings row counts.
+    # Any other test file's leftovers are this agent's evidence, which is how a
+    # stray fixture turned this into `assert 'carded' == 'skipped'` on pristine
+    # `main` (issue #220). Cleared here rather than chased at each source.
+    # Children before parents: both FK to `recurring_charge`.
+    await conn.execute("DELETE FROM settings WHERE key LIKE 'calendar_events_%'")
+    await conn.execute("DELETE FROM finance.renewal_alert")
+    await conn.execute("DELETE FROM finance.receipt_email")
+    await conn.execute("DELETE FROM finance.recurring_charge")
 
 
 @pytest_asyncio.fixture(loop_scope="function")

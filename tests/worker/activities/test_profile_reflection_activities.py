@@ -30,6 +30,32 @@ PROPOSED_DOC = CURRENT_DOC + "\nRuns a homelab swarm called meem."
 EDITED_DOC = CURRENT_DOC + "\nRuns a homelab swarm on three nodes."
 
 
+async def clear_global_evidence(conn):
+    """The evidence sources `gather_profile_evidence` reads GLOBALLY (issue #220).
+
+    Three of its five sources are agent-scoped, and a `WHERE agent_id = 'zza2-…'`
+    teardown covers them. The other two are not, and no per-agent teardown
+    anywhere ever could be: `finance.recurring_charge` / `finance.receipt_email`
+    have no `agent_id` column at all, and `_evidence_calendar` reads EVERY
+    `calendar_events_%` row in `settings`.
+
+    So any test in the suite that leaves an active charge, a recent receipt or a
+    calendar KV row behind turns this file's "quiet week" assertions into
+    `assert 18 == 0` — but only on the shardings where `--dist loadfile` happens
+    to co-locate the leaker, so it presents as an unrelated PR breaking an
+    unrelated test. #218 chased three such fixtures at source; this clears the
+    sources themselves, so the assertion holds regardless of what a future test
+    leaves behind.
+
+    Children before parents: `renewal_alert` and `receipt_email` both carry an
+    FK to `recurring_charge`.
+    """
+    await conn.execute("DELETE FROM settings WHERE key LIKE 'calendar_events_%'")
+    await conn.execute("DELETE FROM finance.renewal_alert")
+    await conn.execute("DELETE FROM finance.receipt_email")
+    await conn.execute("DELETE FROM finance.recurring_charge")
+
+
 async def _wipe(conn):
     for agent in (AGENT, OTHER):
         await conn.execute("DELETE FROM agent_profile_revisions WHERE agent_id = $1", agent)
@@ -39,9 +65,7 @@ async def _wipe(conn):
         await conn.execute("DELETE FROM interactions WHERE agent_id = $1", agent)
         await conn.execute("DELETE FROM notification_log WHERE agent_id = $1", agent)
         await conn.execute("DELETE FROM llm_calls WHERE agent_id = $1", agent)
-    await conn.execute("DELETE FROM settings WHERE key LIKE 'calendar_events_zza2%'")
-    await conn.execute("DELETE FROM finance.receipt_email WHERE account LIKE 'zza2-%'")
-    await conn.execute("DELETE FROM finance.recurring_charge WHERE account LIKE 'zza2-%'")
+    await clear_global_evidence(conn)
 
 
 @pytest_asyncio.fixture(loop_scope="function")
@@ -211,6 +235,70 @@ async def test_gather_evidence_on_a_quiet_week_is_total_zero(clean_db):
     out = await ActivityEnvironment().run(_acts(clean_db).gather_profile_evidence, AGENT, 7)
     assert out["total"] == 0
     assert out["failed"] == []
+
+
+async def _seed_foreign_leak(pool):
+    """What a leaking fixture in some OTHER test file leaves behind.
+
+    Deliberately prefixed `zzleak-`, not `zza2-`: the point is rows this file's
+    own row-prefix teardown has no reason to know about.
+    """
+    await pool.execute(
+        "INSERT INTO finance.recurring_charge (account, sender_label, vendor_name, category, "
+        "amount_cents, currency, cadence, status) "
+        "VALUES ('zzleak-acct', 'zzleak', 'Leakwire', 'software', 900, 'INR', 'monthly', 'active')"
+    )
+    await pool.execute(
+        "INSERT INTO finance.receipt_email (message_id, account, sender, subject, received_at) "
+        "VALUES ($1, 'zzleak-acct', 'billing@leakwire.test', 'Your receipt', now())",
+        f"zzleak-{uuid4()}",
+    )
+    await pool.execute(
+        "INSERT INTO settings (key, value) VALUES ('calendar_events_zzleak', $1) "
+        "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+        [{"summary": "Someone else's standup", "start": "2026-08-02T09:00:00Z"}],
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_foreign_leak_cannot_survive_this_files_setup(db_pool):
+    """Issue #220: the quiet-week assertion must not depend on the whole suite
+    being tidy.
+
+    Two of the five evidence sources are global, so a stray active charge, a
+    recent receipt email or a `calendar_events_*` row left by ANY other test
+    file counts as this agent's evidence. Reproduced on pristine `main` as
+    `assert 18 == 0` here, and `assert 'carded' == 'skipped'` in the flow test.
+
+    Uses `db_pool` rather than `clean_db` on purpose: the fixture teardown is
+    not what has to work — the fixture SETUP is, because a foreign leaker has
+    no teardown of ours to run.
+    """
+    try:
+        await _seed_foreign_leak(db_pool)
+        acts = _acts(db_pool)
+
+        # The leak is real and IS read as this agent's evidence — without this
+        # the assertion below would be "empty because nothing was seeded".
+        dirty = await ActivityEnvironment().run(acts.gather_profile_evidence, AGENT, 7)
+        assert dirty["counts"]["finance"] >= 2, dirty["counts"]
+        assert dirty["counts"]["calendar"] >= 1, dirty["counts"]
+        assert any("Leakwire" in f for f in dirty["finance"]), dirty["finance"]
+
+        # Exactly what `clean_db` runs before every test in this file.
+        async with db_pool.acquire() as conn:
+            await _wipe(conn)
+
+        out = await ActivityEnvironment().run(acts.gather_profile_evidence, AGENT, 7)
+        assert out["total"] == 0, out["counts"]
+        assert out["failed"] == []
+    finally:
+        # Explicit, prefix-scoped — so this test cleans up after itself even
+        # when the very helper it is exercising is broken.
+        async with db_pool.acquire() as conn:
+            await conn.execute("DELETE FROM finance.receipt_email WHERE account = 'zzleak-acct'")
+            await conn.execute("DELETE FROM finance.recurring_charge WHERE account = 'zzleak-acct'")
+            await conn.execute("DELETE FROM settings WHERE key = 'calendar_events_zzleak'")
 
 
 @pytest.mark.asyncio

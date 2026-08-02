@@ -17,6 +17,8 @@ never overwritten by files.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 import time
 import uuid as _uuid
@@ -106,6 +108,76 @@ async def get_personality(
 
     _cache[agent_id] = (time.monotonic() + _CACHE_TTL_SECONDS, dict(data))
     return data
+
+
+def doc_fingerprint(text: str) -> str:
+    """Stable short handle for "the exact text of a persona doc".
+
+    Written into a `draft_review` card's metadata as `revision_of` by
+    `ProfileReflectionFlow`, and re-checked here at approve time. It lives in
+    core rather than in the worker activity that mints it so both sides hash
+    the same way — two copies that drift would make the guard below either
+    never fire or always fire, and both are silent.
+    """
+    return hashlib.sha256((text or "").encode("utf-8")).hexdigest()[:16]
+
+
+async def draft_base_conflict(
+    conn: Any, metadata: Any, response: dict[str, Any] | None
+) -> dict[str, Any] | None:
+    """Has the persona doc moved since this draft_review card was proposed?
+
+    A profile draft is a WHOLE-DOCUMENT rewrite proposed against the doc as it
+    read a week ago. If the doc changed in between — a hand edit through the
+    admin UI, or another approved card — approving discards that change
+    wholesale. The approver has to be told before that happens, so this is
+    checked at the resolve choke-point and refused with a 409 rather than
+    logged after the write (issue #221).
+
+    Returns None when there is nothing to stop:
+
+      * the card carries no `revision_of`/`agent_id` — not a profile draft, and
+        every other interaction kind resolves exactly as before;
+      * the human is not approving (a reject writes nothing, so a stale base is
+        irrelevant and must not block saying no);
+      * the live doc still hashes to the recorded base;
+      * the human answered with `base_ack` equal to the CURRENT fingerprint —
+        the explicit override, only obtainable from a 409 body they were shown.
+
+    Otherwise the conflict dict the route returns as the 409 detail, carrying
+    the current document so the panel can show what the approval would discard.
+    """
+    if isinstance(metadata, str):
+        try:
+            metadata = json.loads(metadata)
+        except ValueError:
+            return None
+    if not isinstance(metadata, dict):
+        return None
+    base = str(metadata.get("revision_of") or "")
+    agent_id = str(metadata.get("agent_id") or "")
+    if not base or not agent_id:
+        return None
+
+    response = response if isinstance(response, dict) else {}
+    if str(response.get("action") or "").strip().lower() != "approve":
+        return None
+
+    kind = str(metadata.get("kind") or "user")
+    live = (await get_personality(conn, agent_id, use_cache=False)).get(kind, "") or ""
+    current = doc_fingerprint(live)
+    if current == base:
+        return None
+    if str(response.get("base_ack") or "") == current:
+        return None
+    return {
+        "error": "profile_base_drift",
+        "agent_id": agent_id,
+        "kind": kind,
+        "proposed_from": base,
+        "current": current,
+        "current_doc": live,
+    }
 
 
 def _validate_updates(updates: dict[str, str]) -> None:

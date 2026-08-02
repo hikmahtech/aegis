@@ -7,7 +7,10 @@ POST /api/interactions/{id}/resolve — resolve from UI or chat
 The resolve endpoint is the single choke-point for every human response.
 It updates the DB row AND sends a Temporal signal to the InteractionFlow
 workflow. If the row is already resolved (idempotent re-entry), no signal
-is sent.
+is sent. Being the choke-point is also why the one precondition a card can
+declare is checked here: a persona `draft_review` whose base document moved
+while the card was open is refused with a 409 instead of silently clobbering
+the change (see `personalities.draft_base_conflict`).
 """
 
 from __future__ import annotations
@@ -23,6 +26,7 @@ from temporalio.client import Client
 from aegis.api.auth import verify_auth
 from aegis.api.deps import get_settings
 from aegis.config import Settings
+from aegis.services.personalities import draft_base_conflict
 
 logger = structlog.get_logger()
 
@@ -59,7 +63,8 @@ async def resolve_interaction(
 
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
-            "SELECT flow_run_id, status, agent_id, prompt FROM interactions WHERE id = $1",
+            "SELECT flow_run_id, status, agent_id, prompt, metadata "
+            "FROM interactions WHERE id = $1",
             interaction_id,
         )
         if row is None:
@@ -76,6 +81,21 @@ async def resolve_interaction(
                 status=row["status"],
                 already_resolved=True,
             )
+
+        # A persona draft is approved against the document the card was built
+        # from. If that document moved while the card was open, approving would
+        # silently discard the change — so the resolve is refused with a 409
+        # carrying the current text, and the card stays pending until the human
+        # has seen it (issue #221). Every other interaction returns None here.
+        conflict = await draft_base_conflict(conn, row["metadata"], body.response)
+        if conflict is not None:
+            logger.warning(
+                "interaction_resolve_base_drift",
+                interaction_id=str(interaction_id),
+                agent_id=conflict["agent_id"],
+                kind=conflict["kind"],
+            )
+            raise HTTPException(status_code=409, detail=conflict)
 
         # Guard with `AND status='pending'` even though the SELECT above just
         # observed pending — a concurrent /resolve POST (from a duplicate

@@ -65,6 +65,11 @@ export default function InteractionDetail() {
   const [submitting, setSubmitting] = useState(false);
   const [draft, setDraft] = useState('');
   const [reason, setReason] = useState('');
+  // The 409 body from a drifted persona draft: the document moved between the
+  // card being proposed and this approval, so the server refused it and handed
+  // back the CURRENT text. Held in state so the operator sees what their
+  // approval would have discarded, and can approve again on purpose.
+  const [conflict, setConflict] = useState<any>(null);
 
   useEffect(() => {
     setLoading(true);
@@ -83,6 +88,7 @@ export default function InteractionDetail() {
         }
         if (i?.kind === 'input') setDraft('');
         setReason('');
+        setConflict(null);
         setLoading(false);
       })
       .catch(e => { setError(e); setLoading(false); });
@@ -96,8 +102,12 @@ export default function InteractionDetail() {
       await api.resolveInteraction(id, payload);
       const refreshed = await api.getInteraction(id);
       setInteraction(refreshed);
+      setConflict(null);
     } catch (e: any) {
-      setError(e);
+      // A refused approval is not an error to dismiss — it is a question to
+      // answer, so it gets its own panel rather than the red banner.
+      if (e?.status === 409 && e?.detail?.error === 'profile_base_drift') setConflict(e.detail);
+      else setError(e);
     } finally {
       setSubmitting(false);
     }
@@ -132,11 +142,33 @@ export default function InteractionDetail() {
         </div>
       </div>
 
+      {pending && conflict && (
+        <div className="card" style={{ marginBottom: 12, borderColor: '#fecdca' }}>
+          <h3>The document changed since this was proposed</h3>
+          <p className="meta">
+            This draft was written against <span className="mono">{conflict.proposed_from}</span>,
+            but <span className="mono">{conflict.agent_id}</span>&rsquo;s{' '}
+            <span className="mono">{conflict.kind}</span> document is now{' '}
+            <span className="mono">{conflict.current}</span> — a hand edit, or another approved
+            draft, landed while this card was open. Approving replaces the text below in full.
+          </p>
+          <pre style={{
+            whiteSpace: 'pre-wrap', wordBreak: 'break-word', fontSize: 12,
+            maxHeight: 320, overflow: 'auto',
+          }}>{String(conflict.current_doc ?? '')}</pre>
+          <p className="meta">
+            Read it, merge anything worth keeping into the editor below, then approve again — the
+            second approval is recorded against the document shown here.
+          </p>
+        </div>
+      )}
+
       {pending && (
         <div className="card" style={{ marginBottom: 12 }}>
           <h3>Respond</h3>
           {renderActionBody(interaction, {
-            draft, setDraft, reason, setReason, submit, submitPayload, busy: submitting,
+            draft, setDraft, reason, setReason, submit, submitPayload, conflict,
+            busy: submitting,
           })}
         </div>
       )}
@@ -172,11 +204,12 @@ interface ActionCtx {
   setReason: (v: string) => void;
   submit: (value: string) => void;
   submitPayload: (payload: Record<string, unknown>) => void;
+  conflict: any;
   busy: boolean;
 }
 
 function renderActionBody(i: any, ctx: ActionCtx) {
-  const { draft, setDraft, reason, setReason, submit, submitPayload, busy } = ctx;
+  const { draft, setDraft, reason, setReason, submit, submitPayload, conflict, busy } = ctx;
   switch (i.kind) {
     case 'approval':
       return (
@@ -238,9 +271,18 @@ function renderActionBody(i: any, ctx: ActionCtx) {
     // tests/worker/test_profile_reflection_e2e.py reads them out of THIS file
     // and drives the real resolve route with them, so renaming a key here fails
     // the build's end-to-end guard rather than silently breaking approvals.
+    // `base_ack` is the third key: the resolve route refuses an approve whose
+    // base document moved while the card was open (409), and only an ack
+    // carrying the fingerprint it handed back unlocks the retry. It is empty —
+    // and ignored — on the normal, undrifted path.
     case 'draft_review': {
       const proposed = String(i.metadata?.proposed_doc ?? i.options?.draft ?? '');
       const edited = draft !== proposed;
+      // Empty until the server has refused an approval because the document
+      // moved (409). Echoing the fingerprint it showed us back on the retry is
+      // what says "I saw that text and still mean it" — a blind resubmit of
+      // the same payload is refused again.
+      const baseAck = String(conflict?.current ?? '');
       return (
         <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
           {proposed && (
@@ -275,9 +317,9 @@ function renderActionBody(i: any, ctx: ActionCtx) {
             <button
               className="btn btn-primary"
               disabled={busy || !draft.trim()}
-              onClick={() => submitPayload({ action: 'approve', edited_doc: draft })}
+              onClick={() => submitPayload({ action: 'approve', edited_doc: draft, base_ack: baseAck })}
             >
-              {busy ? 'Submitting…' : 'Approve & apply'}
+              {busy ? 'Submitting…' : conflict ? 'Approve anyway & replace' : 'Approve & apply'}
             </button>
             <button
               className="btn"

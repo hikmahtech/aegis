@@ -248,13 +248,31 @@ async def _set_health(pool, metric, value, age_hours) -> None:
         )
 
 
+class _Recorder:
+    """Stands in for DeliveryActivities: records what actually went out."""
+
+    def __init__(self):
+        self.sent: list[tuple[str, str]] = []
+
+    async def send_message(self, agent_id, message, chat_id=0):
+        self.sent.append((agent_id, message))
+        return {"ok": True}
+
+
+async def _delivered(act, message="<b>Daily Briefing</b>\n\nnarrative") -> str:
+    rec = _Recorder()
+    act.delivery = rec
+    await act.deliver_briefing("zzb6b-agent", message)
+    assert len(rec.sent) == 1, "deliver_briefing sent nothing"
+    return rec.sent[0][1]
+
+
 @pytest.mark.asyncio
 async def test_a_fresh_health_reading_surfaces_in_the_briefing(db_pool, _seeded):
     await _set_health(db_pool, "resting_hr", 54, age_hours=6)
     act = BriefingActivities(db_pool=db_pool, knowledge_connector=_kc())
     assert await act._recent_health() == {"resting_hr": 54.0}
-    framed = await act.frame_briefing(await act.gather_briefing_changes())
-    assert "<b>Health</b>: resting_hr 54.0" in framed
+    assert "<b>Health</b>: resting_hr 54.0" in await _delivered(act)
 
 
 @pytest.mark.asyncio
@@ -308,10 +326,11 @@ async def test_the_health_block_survives_an_llm_narrative(db_pool, _seeded):
     llm = AsyncMock()
     llm.think = AsyncMock(return_value={"response": "Nothing much happened."})
     act = BriefingActivities(db_pool=db_pool, knowledge_connector=_kc(), llm_client=llm)
-    out = await act.gather_briefing_changes()
-    framed = await act.frame_briefing(out)
+    framed = await act.frame_briefing(await act.gather_briefing_changes())
     assert framed.startswith("Nothing much happened.")
-    assert "<b>Health</b>: steps 8421.0" in framed
+    delivered = await _delivered(act, framed)
+    assert delivered.startswith("Nothing much happened.")
+    assert "<b>Health</b>: steps 8421.0" in delivered
 
 
 @pytest.mark.asyncio
@@ -319,8 +338,41 @@ async def test_a_health_reading_from_last_week_is_not_reported_as_today(db_pool,
     await _set_health(db_pool, "resting_hr", 54, age_hours=24 * 7)
     act = BriefingActivities(db_pool=db_pool, knowledge_connector=_kc())
     assert await act._recent_health() == {}
+    assert "<b>Health</b>" not in await _delivered(act)
+
+
+@pytest.mark.asyncio
+async def test_the_rendered_health_block_never_leaves_deliver_briefing(db_pool, _seeded):
+    """Issue #215 — the residual #214 left behind.
+
+    #214 kept the *readings* out of the `changes` bundle. But `frame_briefing`
+    still appended the RENDERED `<b>Health</b>` line to its return value, and
+    that string is (a) an activity result and `send_message`'s argument, both
+    persisted verbatim in Temporal history, (b) `send_voice`'s argument, hence
+    the text a TTS provider is handed, and (c) the document `ingest_briefing`
+    embeds into the pgvector knowledge store — indefinitely, and retrievable by
+    `search_knowledge`/`ask_knowledge` into a chat prompt bound for whatever
+    `model_balanced`/`model_smart` resolve to. (c) re-opens exactly the hole
+    `_format_health_block` exists to close.
+
+    So the block must appear ONLY in what `deliver_briefing` sends.
+    """
+    await _set_health(db_pool, "resting_hr", 54321.5, age_hours=6)
+    act = BriefingActivities(db_pool=db_pool, knowledge_connector=_kc())
+
+    # Non-vacuity: the reading is live and IS rendered — this would pass just as
+    # happily against an empty life.observations without it.
+    assert await act._recent_health() == {"resting_hr": 54321.5}
+
     framed = await act.frame_briefing(await act.gather_briefing_changes())
-    assert "<b>Health</b>" not in framed
+    assert "Health" not in framed
+    assert "resting_hr" not in framed
+    assert "54321" not in framed
+    # Non-vacuity: the narrative that crosses the boundary is a real briefing.
+    assert "RaindropIngestFlow" in framed
+
+    delivered = await _delivered(act, framed)
+    assert "<b>Health</b>: resting_hr 54321.5" in delivered
 
 
 @pytest.mark.asyncio

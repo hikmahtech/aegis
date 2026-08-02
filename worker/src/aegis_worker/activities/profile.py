@@ -38,11 +38,11 @@ getting a write path of its own. Nothing here promotes anything; approval does.
 
 from __future__ import annotations
 
-import hashlib
 import time
 from dataclasses import dataclass, field
 from typing import Any
 
+from aegis.services.personalities import doc_fingerprint as _doc_fingerprint
 from temporalio import activity
 
 # The persona kind an automated writer is allowed to touch. `soul`/`agents` are
@@ -221,15 +221,6 @@ def _validate_generalizations(
         )
     candidates.sort(key=lambda c: c["confidence"], reverse=True)
     return candidates[: max(0, limit)], below, dropped
-
-
-def _doc_fingerprint(text: str) -> str:
-    """Stable handle for "the document this proposal was based on".
-
-    Carried through the card's metadata so the applier can tell whether the doc
-    moved under the human while the card was open.
-    """
-    return hashlib.sha256((text or "").encode("utf-8")).hexdigest()[:16]
 
 
 @dataclass
@@ -928,9 +919,13 @@ class ProfileActivities:
         from aegis.services.personalities import get_personality
 
         # Did the doc move under the human while the card was open? A week is
-        # long enough for a hand edit through the admin UI. We still apply —
-        # the human approved the text in front of them and the revision row
-        # holds what it replaced — but a silent clobber would be undiagnosable.
+        # long enough for a hand edit through the admin UI. Since #221 the
+        # approver is TOLD before this runs: `/api/interactions/{id}/resolve`
+        # refuses an approve on a drifted base with a 409 showing the current
+        # text, so reaching here with drift means they saw it and acknowledged
+        # it (`base_ack`). This stays as the second lock — the revision row
+        # holds what was replaced either way, and a silent clobber through some
+        # future resolve path would be undiagnosable without the line below.
         base = str(metadata.get("revision_of") or "")
         if base:
             live = await get_personality(self.db_pool, agent_id, use_cache=False)
