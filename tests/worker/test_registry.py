@@ -216,10 +216,11 @@ def test_module_workflows_is_the_unflagged_registry():
         # activities from B7's WearableIngestFlow / WearableActivities, then
         # +1 flow and +5 activities from A2's ProfileReflectionFlow
         # (gather_profile_evidence, propose_profile_patch, check_profile_budget,
-        # record_profile_card, apply_profile_reflection).
-        (True, True, 37, 178),
-        (False, False, 29, 149),
-        (True, False, 33, 167),
+        # record_profile_card, apply_profile_reflection), then +1 activity and
+        # NO new flow from A5 (propose_generalizations, which rides A2's flow).
+        (True, True, 37, 179),
+        (False, False, 29, 150),
+        (True, False, 33, 168),
     ],
 )
 def test_real_registration_passes_the_boot_check(homelab, money, flows, activities):

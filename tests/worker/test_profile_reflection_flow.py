@@ -70,9 +70,19 @@ async def clean_db(db_pool):
 
 
 class FakeLLM:
-    def __init__(self, *, response: str = "", raises: BaseException | None = None):
+    def __init__(
+        self,
+        *,
+        response: str = "",
+        raises: BaseException | None = None,
+        by_purpose: dict[str, str] | None = None,
+    ):
         self._response = response
         self._raises = raises
+        # A5: the flow now makes TWO calls with different `purpose` values
+        # (profile_generalization, then profile_reflection). Keyed replies let a
+        # test answer each one without stubbing the activity.
+        self._by_purpose = by_purpose or {}
         self.calls: list[dict] = []
 
     async def think(self, **kwargs):
@@ -80,11 +90,16 @@ class FakeLLM:
         if self._raises is not None:
             raise self._raises
         return {
-            "response": self._response,
+            "response": self._by_purpose.get(kwargs.get("purpose", ""), self._response),
             "model": "fake-balanced",
             "prompt_tokens": 5,
             "completion_tokens": 7,
         }
+
+    def prompt_for(self, purpose: str) -> str:
+        return next(
+            (str(c.get("prompt") or "") for c in self.calls if c.get("purpose") == purpose), ""
+        )
 
 
 def _llm_reply(doc: str = PROPOSED_DOC) -> str:
@@ -114,6 +129,35 @@ async def _seed_evidence(pool):
         "INSERT INTO agent_memory (agent_id, content, importance, source) "
         "VALUES ($1, 'Owner runs a homelab swarm called meem', 0.9, 'correction')",
         AGENT,
+    )
+
+
+# A5: three memories saying the same thing — the promotable pattern.
+A5_TRIPLE = [
+    "Owner refuses meetings before 11am",
+    "Owner moved the standup because it was before 11am",
+    "Owner asked never to be booked in the morning",
+]
+A5_CLAIM = "The owner does not take meetings in the morning."
+
+
+async def _seed_triple(pool) -> list[int]:
+    ids = []
+    for content in A5_TRIPLE:
+        ids.append(
+            await pool.fetchval(
+                "INSERT INTO agent_memory (agent_id, content, importance, source) "
+                "VALUES ($1, $2, 0.7, 'correction') RETURNING id",
+                AGENT,
+                content,
+            )
+        )
+    return sorted(ids)
+
+
+def _generalization_reply(ids: list[int], confidence: float = 0.9) -> str:
+    return json.dumps(
+        [{"claim": A5_CLAIM, "supporting_memory_ids": ids, "confidence": confidence}]
     )
 
 
@@ -166,6 +210,7 @@ async def _flow_worker(client, pool, *, llm=None, cards=None, extra=None, drop=(
         prof.check_profile_budget,
         prof.read_profile_context,
         prof.gather_profile_evidence,
+        prof.propose_generalizations,
         prof.propose_profile_patch,
         prof.record_profile_card,
         prof.apply_profile_reflection,
@@ -358,7 +403,7 @@ async def test_a_proposal_activity_blow_up_degrades_to_skipped(clean_db):
     await _seed_evidence(clean_db)
 
     @activity.defn(name="propose_profile_patch")
-    async def exploding(agent_id, evidence, current_doc):
+    async def exploding(agent_id, evidence, current_doc, generalizations=None):
         raise RuntimeError("worker lost the task")
 
     async with await WorkflowEnvironment.start_time_skipping() as env:
@@ -437,6 +482,122 @@ async def test_second_run_the_same_day_is_budget_blocked(clean_db):
     assert [r["sent"] for r in sent] == [True]
 
 
+# ------------------------------------------------------------------------- A5
+
+
+async def _card_metadata(pool):
+    return await pool.fetchval(
+        "SELECT metadata FROM interactions WHERE origin = $1 AND agent_id = $2", PURPOSE, AGENT
+    )
+
+
+@pytest.mark.asyncio
+async def test_generalizations_reach_the_prompt_and_the_card(clean_db):
+    """A5 end to end through the flow: three agreeing memories become a claim,
+    the claim is weighted into the drafting prompt, and BOTH the claim and the
+    ids it rests on land in the card the human answers.
+
+    `promoted_memory_ids` is the ledger `_promoted_memory_ids` reads back, so if
+    it never reaches the metadata the promotion can never become idempotent.
+    """
+    await _seed_doc(clean_db)
+    ids = await _seed_triple(clean_db)
+    cards: list = []
+    llm = FakeLLM(
+        by_purpose={
+            "profile_generalization": _generalization_reply(ids),
+            "profile_reflection": _llm_reply(),
+        }
+    )
+
+    async with await WorkflowEnvironment.start_time_skipping() as env:
+        with env.auto_time_skipping_disabled():
+            async with _flow_worker(env.client, clean_db, llm=llm, cards=cards) as run:
+                result = await run()
+                await _wait_for(_async(lambda: len(cards)))
+                metadata = await _wait_for(lambda: _card_metadata(clean_db))
+
+    assert result["status"] == "carded"
+    assert result["generalizations"] == 1
+    assert result["promoted_memory_ids"] == 3
+
+    metadata = json.loads(metadata) if isinstance(metadata, str) else metadata
+    assert metadata["promoted_memory_ids"] == ids
+    assert [g["claim"] for g in metadata["generalizations"]] == [A5_CLAIM]
+    assert metadata["generalizations"][0]["supporting_memory_ids"] == ids
+
+    # The drafting call was actually told about the claim…
+    assert A5_CLAIM in llm.prompt_for("profile_reflection")
+    # …and the human is told too, on the card itself — an inference about them
+    # buried inside a long document is an inference nobody reads.
+    assert A5_CLAIM in cards[0]["prompt"]
+
+
+@pytest.mark.asyncio
+async def test_a_low_confidence_claim_never_reaches_the_card(clean_db):
+    """Off-week safety: below the confidence bar the claim is logged, and the
+    weekly draft still goes out — just without it."""
+    await _seed_doc(clean_db)
+    ids = await _seed_triple(clean_db)
+    cards: list = []
+    llm = FakeLLM(
+        by_purpose={
+            "profile_generalization": _generalization_reply(ids, confidence=0.1),
+            "profile_reflection": _llm_reply(),
+        }
+    )
+
+    async with await WorkflowEnvironment.start_time_skipping() as env:
+        with env.auto_time_skipping_disabled():
+            async with _flow_worker(env.client, clean_db, llm=llm, cards=cards) as run:
+                result = await run()
+                await _wait_for(_async(lambda: len(cards)))
+                metadata = await _wait_for(lambda: _card_metadata(clean_db))
+
+    assert result["status"] == "carded"
+    assert result["generalizations"] == 0
+    metadata = json.loads(metadata) if isinstance(metadata, str) else metadata
+    assert metadata["generalizations"] == []
+    assert metadata["promoted_memory_ids"] == []
+    assert A5_CLAIM not in cards[0]["prompt"]
+    assert "(none)" in llm.prompt_for("profile_reflection")
+
+
+@pytest.mark.asyncio
+async def test_a_generalization_activity_blow_up_still_cards(clean_db):
+    """The activity swallows its own faults, so the flow's `except` around
+    `propose_generalizations` only fires when the ACTIVITY does. Proven by
+    failing the activity — and the point of the guard is that the weekly draft
+    survives it: replace `gen = {}` with `raise` and this test fails."""
+    await _seed_doc(clean_db)
+    await _seed_triple(clean_db)
+    cards: list = []
+
+    @activity.defn(name="propose_generalizations")
+    async def exploding(agent_id):
+        raise RuntimeError("worker lost the task")
+
+    async with await WorkflowEnvironment.start_time_skipping() as env:
+        with env.auto_time_skipping_disabled():
+            async with _flow_worker(
+                env.client,
+                clean_db,
+                llm=FakeLLM(response=_llm_reply()),
+                cards=cards,
+                drop=("propose_generalizations",),
+                extra=[exploding],
+            ) as run:
+                result = await run()
+                await _wait_for(_async(lambda: len(cards)))
+                metadata = await _wait_for(lambda: _card_metadata(clean_db))
+
+    assert result["status"] == "carded", "a broken generalisation pass cost the weekly draft"
+    assert result["generalizations"] == 0
+    metadata = json.loads(metadata) if isinstance(metadata, str) else metadata
+    assert metadata["promoted_memory_ids"] == []
+    assert await _budget_rows(clean_db) == 1
+
+
 # ------------------------------------------------------------------ registration
 
 
@@ -461,6 +622,7 @@ def test_profile_activities_are_served_by_the_worker():
     served = expected_activity_names()
     for name in (
         "gather_profile_evidence",
+        "propose_generalizations",
         "propose_profile_patch",
         "check_profile_budget",
         "record_profile_card",

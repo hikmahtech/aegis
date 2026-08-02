@@ -48,7 +48,7 @@ from aegis_worker.flows.interaction import InteractionFlow
 from aegis_worker.flows.profile_reflection import ProfileReflectionConfig, ProfileReflectionFlow
 from httpx import ASGITransport, AsyncClient
 from temporalio import activity
-from temporalio.testing import WorkflowEnvironment
+from temporalio.testing import ActivityEnvironment, WorkflowEnvironment
 from temporalio.worker import Worker
 
 AGENT = "zza2e-profile"
@@ -187,16 +187,36 @@ async def clean_db(db_pool):
         await conn.execute("DELETE FROM agents WHERE id = $1", AGENT)
 
 
+A5_CLAIM = "The owner does not take meetings in the morning."
+A5_TRIPLE = [
+    "Owner refuses meetings before 11am",
+    "Owner moved the standup because it was before 11am",
+    "Owner asked never to be booked in the morning",
+]
+
+
 class FakeLLM:
+    """A5: the flow makes two calls. The generalisation one answers with the ids
+    it can SEE in its own prompt — so if the pool query stopped excluding
+    already-promoted rows, this fake would name them again and the idempotence
+    test below would fail."""
+
     async def think(self, **kwargs):
+        if kwargs.get("purpose") == "profile_generalization":
+            ids = [int(m) for m in re.findall(r'"id":\s*(\d+)', kwargs.get("prompt") or "")]
+            body = (
+                [{"claim": A5_CLAIM, "supporting_memory_ids": ids, "confidence": 0.9}]
+                if len(ids) >= 3
+                else []
+            )
+        else:
+            body = {
+                "proposed_doc": PROPOSED_DOC,
+                "rationale": "the owner mentioned a homelab twice",
+                "changed_lines": ["+ Runs a homelab swarm called meem."],
+            }
         return {
-            "response": json.dumps(
-                {
-                    "proposed_doc": PROPOSED_DOC,
-                    "rationale": "the owner mentioned a homelab twice",
-                    "changed_lines": ["+ Runs a homelab swarm called meem."],
-                }
-            ),
+            "response": json.dumps(body),
             "model": "fake-balanced",
             "prompt_tokens": 5,
             "completion_tokens": 7,
@@ -226,6 +246,7 @@ async def _flow_worker(client, pool):
             prof.check_profile_budget,
             prof.read_profile_context,
             prof.gather_profile_evidence,
+            prof.propose_generalizations,
             prof.propose_profile_patch,
             prof.record_profile_card,
             prof.apply_profile_reflection,
@@ -408,3 +429,116 @@ async def test_the_panels_reject_payload_writes_nothing(clean_db, settings, auth
     # The reject reason is the one thing a rejection should leave behind.
     assert len(lessons) == 1
     assert any(str(v) in lessons[0]["content"] for v in payload.values() if v != "reject")
+
+
+# ----------------------------------------------------------------------- A5
+
+
+async def _seed_triple(pool) -> list[int]:
+    ids = []
+    for content in A5_TRIPLE:
+        ids.append(
+            await pool.fetchval(
+                "INSERT INTO agent_memory (agent_id, content, importance, source) "
+                "VALUES ($1, $2, 0.7, 'correction') RETURNING id",
+                AGENT,
+                content,
+            )
+        )
+    return sorted(ids)
+
+
+async def _memory_rows(pool):
+    return [
+        dict(r)
+        for r in await pool.fetch(
+            "SELECT id, content, importance, source FROM agent_memory "
+            "WHERE agent_id = $1 ORDER BY id",
+            AGENT,
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_an_approved_promotion_does_not_come_back_next_week(
+    clean_db, settings, auth_headers
+):
+    """A5 acceptance, driven end to end by rows the REAL chain wrote.
+
+    Nothing here is hand-seeded on the suppression side: the `interactions`
+    metadata comes from the flow, and the `agent_profile_revisions` row that
+    proves the write happened comes from `apply_profile_reflection` firing on
+    the panel's Approve payload. A second `propose_generalizations` pass over
+    the same data then has an empty pool and returns nothing.
+
+    And the memories themselves are untouched — promotion is recorded against
+    the decision that authorised it, not by mutating the owner's memory rows.
+    """
+    payload = _panel_payload("approve")
+    ids = await _seed_triple(clean_db)
+    before = await _memory_rows(clean_db)
+
+    async with await WorkflowEnvironment.start_time_skipping() as env:
+        with env.auto_time_skipping_disabled():
+            async with _flow_worker(env.client, clean_db) as run:
+                flow = await run()
+                assert flow["status"] == "carded", flow
+                assert flow["generalizations"] == 1
+                row = await _wait_for(lambda: _card_row(clean_db))
+                assert row is not None
+
+                metadata = row["metadata"]
+                metadata = json.loads(metadata) if isinstance(metadata, str) else metadata
+                assert set(ids).issubset(set(metadata["promoted_memory_ids"]))
+
+                resp = await _resolve(
+                    _app(clean_db, settings, env.client), auth_headers, row["id"], payload
+                )
+                assert resp.status_code == 200, resp.text
+                child = await env.client.get_workflow_handle(flow["child_id"]).result()
+
+    assert child["status"] == "resolved"
+    revisions = await _revisions(clean_db)
+    assert len(revisions) == 1, "nothing was written, so nothing was promoted"
+
+    # The second week. Same activity, same data, same fake model.
+    acts = ProfileActivities(db_pool=clean_db, llm_client=FakeLLM())
+    again = await ActivityEnvironment().run(acts.propose_generalizations, AGENT)
+
+    assert again["candidates"] == []
+    assert again["pool"] == 0
+    assert again["excluded"] == len(before)
+    assert await _memory_rows(clean_db) == before, "promotion mutated the owner's memories"
+
+
+@pytest.mark.asyncio
+async def test_a_rejected_promotion_comes_back(clean_db, settings, auth_headers):
+    """The other side of the same gate: Reject writes no revision, so the rows
+    stay in the pool and the claim is still available to propose. Without this,
+    the test above would also pass with `_promoted_memory_ids` excluding every
+    row that was ever carded, approved or not."""
+    payload = _panel_payload("reject")
+    await _seed_triple(clean_db)
+    before = await _memory_rows(clean_db)
+
+    async with await WorkflowEnvironment.start_time_skipping() as env:
+        with env.auto_time_skipping_disabled():
+            async with _flow_worker(env.client, clean_db) as run:
+                flow = await run()
+                row = await _wait_for(lambda: _card_row(clean_db))
+                resp = await _resolve(
+                    _app(clean_db, settings, env.client), auth_headers, row["id"], payload
+                )
+                assert resp.status_code == 200, resp.text
+                await env.client.get_workflow_handle(flow["child_id"]).result()
+
+    assert await _revisions(clean_db) == []
+
+    acts = ProfileActivities(db_pool=clean_db, llm_client=FakeLLM())
+    again = await ActivityEnvironment().run(acts.propose_generalizations, AGENT)
+
+    assert again["excluded"] == 0
+    assert len(again["candidates"]) == 1
+    # The reject reason was banked as a memory, so the pool grew rather than
+    # shrank — but every row that was there before is still there.
+    assert (await _memory_rows(clean_db))[: len(before)] == before
