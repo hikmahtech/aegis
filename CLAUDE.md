@@ -135,11 +135,15 @@ land in the open-source tree. Keep it that way: a deploy step added here would l
 infrastructure detail into a public repo. Wire your own fork up to your own
 registry/runner if you want CD.
 
-Two CI facts worth knowing before you open a PR: the three test workflows are
-`paths:`-filtered per package, so a change touching only `config/` (including
-`config/seed/*.yaml` and `config/models.yaml`) or `docs/` runs **no test job** — validate
-those locally. And `ci-grep-guard.yml` runs on every PR, failing the build if deleted n8n-era
-files or symbols reappear.
+Two CI facts worth knowing before you open a PR. First, the three test workflows are
+`paths:`-filtered, and the filter must list every input the job's tests *read*, not just its
+package — `config/**`, `migrations/**`, `personalities/**`, `tests/conftest.py` and the root
+`pyproject.toml` are all in scope for core and worker, because `tests/conftest.py` builds each
+test database by running `migrations/` and `load_seeds(config/seed)` and several tests parse
+`config/seed/*.yaml` directly. Add the path when you add the dependency: a missing entry does
+not merely skip a job, it silently disarms the tests that exist to validate that path (#170).
+A `docs/`-only change still runs no test job. Second, `ci-grep-guard.yml` runs on every PR,
+failing the build if deleted n8n-era files or symbols reappear.
 
 ## Issue Tracking — GitHub Issues
 

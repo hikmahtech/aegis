@@ -3,18 +3,34 @@ name: "Comms — Test"
 # Public repo: test only. Image build + swarm deploy live in the private
 # homelab-gitops infra repo (ansible), not here.
 
+# The `paths:` filter must list every input this job's tests READ, not just the
+# package under test. aegis-comms has no aegis-core dependency at runtime, but
+# this job installs `core[dev]` and tests/conftest.py does `from aegis.config
+# import Settings` at import time — so a core change can break collection of
+# the whole comms suite. migrations/ and personalities/ are deliberately absent:
+# no comms test touches the DB fixture, so the seeding path never runs here.
+# Omitting a path silently disarms the tests that validate it (issue #170).
+
 on:
   push:
     branches: [main]
     paths:
       - "comms/**"
+      - "core/**"
       - "tests/comms/**"
+      - "tests/conftest.py"
+      - "config/**"
+      - "pyproject.toml"
       - ".github/workflows/comms.yml"
   pull_request:
     branches: [main]
     paths:
       - "comms/**"
+      - "core/**"
       - "tests/comms/**"
+      - "tests/conftest.py"
+      - "config/**"
+      - "pyproject.toml"
       - ".github/workflows/comms.yml"
 
 jobs:
