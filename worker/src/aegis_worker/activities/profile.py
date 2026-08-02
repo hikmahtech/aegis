@@ -368,9 +368,14 @@ class ProfileActivities:
         return [str(r["content"])[:400] for r in rows if (r["content"] or "").strip()]
 
     async def _evidence_memories(self, agent_id: str, days: int) -> list[str]:
+        # LIVE rows only. A4 (migration 020) retires a memory by setting
+        # `superseded_at` instead of deleting it, so a retire-blind read here
+        # would keep quoting a belief the consolidator already withdrew —
+        # straight into the weekly persona-doc proposal.
         rows = await self.db_pool.fetch(
             "SELECT content, importance, source FROM agent_memory "
-            "WHERE agent_id = $1 AND created_at >= now() - make_interval(days => $2) "
+            "WHERE agent_id = $1 AND superseded_at IS NULL "
+            "AND created_at >= now() - make_interval(days => $2) "
             "ORDER BY importance DESC, created_at DESC LIMIT $3",
             agent_id,
             days,
@@ -533,9 +538,14 @@ class ProfileActivities:
         }
 
         excluded = await self._promoted_memory_ids(agent_id)
+        # LIVE rows only (`superseded_at IS NULL`), same predicate every A4
+        # reader uses. A retired row must never be one of the >=3 supporting
+        # ids behind a claim promoted into the persona doc: that would launder
+        # a withdrawn belief into the most durable store in the system.
         rows = await self.db_pool.fetch(
             "SELECT id, content, importance, source FROM agent_memory "
-            "WHERE agent_id = $1 AND NOT (id = ANY($2::bigint[])) "
+            "WHERE agent_id = $1 AND superseded_at IS NULL "
+            "AND NOT (id = ANY($2::bigint[])) "
             "ORDER BY importance DESC, created_at DESC LIMIT $3",
             agent_id,
             sorted(excluded),
