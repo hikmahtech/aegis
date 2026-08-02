@@ -549,7 +549,10 @@ class SocialActivities:
         a status and a warning line.
         """
         idle = {"synced": 0, "skipped_disabled": 0}
-        if self.db_pool is None or self.connector is None:
+        # Only the pool is guarded here. A missing connector is handled once, in
+        # `_postiz_creds`, which answers ("", "") — a second check for it here
+        # would be a guard that can only ever be masked by that one.
+        if self.db_pool is None:
             return {**idle, "status": "unconfigured"}
         last = await self.db_pool.fetchval(
             "SELECT max(updated_at) FROM social_accounts "

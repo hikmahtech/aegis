@@ -1884,10 +1884,21 @@ async def test_sync_postiz_channels_without_creds_is_a_no_op(social_env):
 
 
 async def test_sync_postiz_channels_without_connector_is_a_no_op(social_env):
+    """No connector at all (bootstrap declined to build one) must be a quiet
+    no-op, not an AttributeError inside the activity."""
     act = SocialActivities(db_pool=social_env)
     assert (await ActivityEnvironment().run(act.sync_postiz_channels, 60))["status"] == (
         "unconfigured"
     )
+
+
+async def test_sync_postiz_channels_without_pool_is_a_no_op():
+    act = SocialActivities(db_pool=None, connector=_CredConnector())
+    assert await ActivityEnvironment().run(act.sync_postiz_channels, 60) == {
+        "synced": 0,
+        "skipped_disabled": 0,
+        "status": "unconfigured",
+    }
 
 
 # ============================================================================
@@ -1976,15 +1987,33 @@ async def test_retire_skips_a_task_that_already_has_an_outbox_row(social_env):
 
 async def test_retire_is_idempotent_across_ticks(social_env):
     """The label strip is optimistic in the local projection, so the next tick
-    5 minutes later must find nothing left to do — no comment storm."""
+    5 minutes later must find nothing left to do — no second retirement."""
     await _seed_task(social_env, "soctest-once", ["publish", "x"])
     act = SocialActivities(db_pool=social_env)
     env = ActivityEnvironment()
 
     assert (await env.run(act.retire_unpublishable_tasks, 20)) == {"retired": 1}
     assert (await env.run(act.retire_unpublishable_tasks, 20)) == {"retired": 0}
+
+
+async def test_missing_platform_comment_is_written_once_per_task(social_env):
+    """The comment's temp_id must be deterministic on its own.
+
+    Deliberately NOT asserted through `retire_unpublishable_tasks`: there the
+    label strip already stops the second pass, so a non-deterministic temp_id
+    would be masked and this dedup would be untested. `enqueue_outbox` retries
+    on the SAME task with the label intact, which is where it actually matters.
+    """
+    await _seed_account(social_env, platform="x")  # linkedin deliberately absent
+    act = SocialActivities(db_pool=social_env)
+    env = ActivityEnvironment()
+
+    for _ in range(3):
+        await env.run(act.enqueue_outbox, "soctest-recomment", ["x", "linkedin"], "hi", "")
+
     assert await social_env.fetchval(
-        "SELECT count(*) FROM todoist_outbox WHERE temp_id LIKE 'social-missing-soctest-once%'"
+        "SELECT count(*) FROM todoist_outbox "
+        "WHERE temp_id LIKE 'social-missing-soctest-recomment%'"
     ) == 1
 
 
