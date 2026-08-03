@@ -50,9 +50,11 @@ ruff check core/src/ tests/core/                             # lint — CI lints
 pristine `main`. `-n auto --dist loadfile` is what makes it terminate, and `tests/conftest.py`
 gives every xdist worker its own `aegis_test_<gwN>` database so parallel runs don't collide.
 Lint the same way: CI runs `ruff check` **scoped per package** (`core/src/ tests/core/`, and
-the worker/comms equivalents), which is the gate your PR must pass. A bare `ruff check .` also
-sweeps `docs/` and currently reports a pre-existing nit there that CI never sees. `ruff format`
-is deliberately absent from this block — see the "must NOT `ruff format`" convention below.
+the worker/comms equivalents), which is the gate your PR must pass. A bare `ruff check .` is
+also clean and equivalent — `docs/` is in ruff's `extend-exclude` (#236) because the Python
+under it is non-running illustration, so the root sweep no longer reports a nit CI never sees.
+`ruff format` is deliberately absent from this block — see the "must NOT `ruff format`"
+convention below.
 
 Tests need a real Postgres (`docker compose up -d postgres`, port 25432) — no DB mocks.
 The full stack (built images, all services) is `docker compose up -d`; add `--profile slack`

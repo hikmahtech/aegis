@@ -280,3 +280,89 @@ def test_realistic_worst_case_stays_under_the_cap(label, shape):
     assert result["runs_by_type_status"][0]["workflow_type"] == "हिकमह Flow 000", label
     assert result["failed_runs"], f"{label}: a payload list was dropped; kept {list(result)}"
     assert result["_truncated"] is True, label
+
+
+# --- 6. The non-JSON path (#239) ------------------------------------------
+#
+# #148 scoped itself to the dict/list branches. The third branch — a result that
+# isn't a JSON object or array — kept the original `result_json[:max_bytes]`:
+# a CHARACTER slice against a BYTE budget, with no marker appended. Executors
+# that return plain text (`query_observations`, `last_contact_with_person`, the
+# refusal strings) all land there, so both defects were live.
+#
+# The two defects are asserted by separate tests on purpose: byte-correctness and
+# the marker are independent, and a fix for one must not be able to make the
+# other's test pass by accident.
+
+# Spelled out, never imported from `chat`. Importing `_TRUNCATION_MARKER` would
+# make these assertions compare the constant against itself and pass for any
+# value it takes.
+MARKER = "… [truncated]"
+# 2 bytes per character in UTF-8, so a character slice at a byte budget overshoots
+# by exactly 2x — big enough to be unmistakable, and a real script rather than a
+# contrived astral-plane codepoint.
+MULTIBYTE = "λ"
+
+
+def test_multibyte_text_result_is_cut_by_bytes_not_characters():
+    """THE BYTE BUG. `raw[:500]` returns 500 characters = 1000 bytes, double the
+    budget the caller asked for. The budget's unit is bytes; the cut must use it."""
+    raw = MULTIBYTE * 10_000
+    with pytest.raises(json.JSONDecodeError):
+        json.loads(raw)  # the fixture really does take the non-JSON branch
+
+    result = _truncate_result(raw, max_bytes=500)
+
+    assert len(result.encode()) <= 500, f"{len(result.encode())} bytes over a 500-byte budget"
+    # Exact, from arithmetic done here rather than from the code under test:
+    # 500 - 15 marker bytes = 485 for content; 485 // 2 = 242 whole λ (484 bytes,
+    # the 485th byte is half a λ and is dropped); 484 + 15 = 499.
+    assert result == MULTIBYTE * 242 + MARKER
+    assert len(result.encode()) == 499
+
+
+def test_text_result_tells_the_model_it_was_cut():
+    """THE MARKER BUG, proven on ASCII so the byte fix alone cannot produce it:
+    at 500 bytes an ASCII slice was already within budget, and still arrived with
+    no signal that a sentence had been chopped in half."""
+    raw = "The quick brown fox. " * 500
+    with pytest.raises(json.JSONDecodeError):
+        json.loads(raw)
+
+    result = _truncate_result(raw, max_bytes=500)
+
+    assert result.endswith(MARKER), f"no truncation signal: ...{result[-40:]!r}"
+    assert result.startswith("The quick brown fox."), "content thrown away, not just trimmed"
+    assert len(result.encode()) <= 500
+
+
+def test_json_scalar_result_gets_the_same_treatment():
+    """The second, independent call site: `json.loads` SUCCEEDS but yields a
+    str/int rather than a list or dict. Fixing only the JSONDecodeError branch
+    leaves this one sliced by characters and unmarked."""
+    raw = json.dumps(MULTIBYTE * 10_000, ensure_ascii=False)
+    assert isinstance(json.loads(raw), str), "fixture must parse to a scalar"
+
+    result = _truncate_result(raw, max_bytes=500)
+
+    assert len(result.encode()) <= 500, f"{len(result.encode())} bytes over budget"
+    assert result.endswith(MARKER)
+    # One leading quote byte + 242 λ (484 bytes) = 485, then the 15-byte marker.
+    assert result == '"' + MULTIBYTE * 242 + MARKER
+    assert len(result.encode()) == 500
+
+
+def test_budget_too_small_for_the_marker_still_respects_the_budget():
+    """Degenerate budget: the marker itself is 15 bytes, so at 10 there is no
+    room for it. Dropping the signal is acceptable; exceeding the budget, or
+    raising on a half-decoded character, is not."""
+    result = _truncate_result(MULTIBYTE * 100, max_bytes=10)
+
+    assert len(result.encode()) <= 10
+    assert result == MULTIBYTE * 5  # 10 bytes exactly, no partial character
+
+
+def test_text_under_budget_is_returned_untouched():
+    """The marker must mean something. A result that fits is never stamped."""
+    raw = MULTIBYTE * 10  # 20 bytes
+    assert _truncate_result(raw, max_bytes=500) == raw

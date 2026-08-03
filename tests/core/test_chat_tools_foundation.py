@@ -88,10 +88,18 @@ def test_truncate_large_dict():
 
 
 def test_truncate_non_json_string():
-    """Non-JSON strings truncated by raw slicing."""
+    """Non-JSON strings are cut to the BYTE budget and marked as cut (#239).
+
+    Was `len(result) == 500` — an exact character count, which is what the old
+    character slice produced and what made the byte overshoot invisible. The
+    budget is now spent on 485 bytes of content plus the 15-byte marker, so 500
+    bytes is the ceiling rather than the character count. Deliberate behaviour
+    change; `tests/core/test_chat_result_truncation.py` proves the new contract.
+    """
     raw = "x" * 10000
     result = _truncate_result(raw, max_bytes=500)
-    assert len(result) == 500
+    assert len(result.encode()) <= 500
+    assert result.endswith("… [truncated]")
 
 
 def test_truncate_list_with_huge_strings_shrinks_content_instead_of_giving_up():

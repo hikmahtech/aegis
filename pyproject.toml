@@ -10,6 +10,14 @@ addopts = "-v --tb=short"
 [tool.ruff]
 target-version = "py312"
 line-length = 100
+# `docs/` is prose plus non-running illustration — `docs/architecture/sdk-stubs/`
+# is an implementation-free sketch of a target `aegis-sdk` API, written to be read
+# by a human, not imported. Holding it to the shipped-code rule set is what made
+# `ruff check .` fail on pristine `main` while all three CI lint jobs (scoped to
+# `*/src` + `tests/`) stayed green — a divergence every contributor rediscovered
+# by hand (#236). Extend, don't replace: bare `exclude` would drop ruff's own
+# defaults (.git, .venv, build, node_modules, …).
+extend-exclude = ["docs/"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "N", "W", "UP", "B", "C4", "SIM"]
