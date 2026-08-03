@@ -10,6 +10,8 @@ import pytest
 import pytest_asyncio
 from aegis_worker.activities.clarify import ClarifyActivities
 
+from tests.llm_stub import StubbedLLMClient
+
 
 @pytest_asyncio.fixture(autouse=True, loop_scope="function")
 async def _auto_content_route(seed_app_route):
@@ -3250,3 +3252,53 @@ def test_build_agent_synthetic_input_warns_against_echoing_markers() -> None:
     assert "do NOT reproduce or echo them" in out
     assert "[Agent reply @ ...]" in out
     assert "Write only your" in out
+
+
+@pytest.mark.asyncio
+async def test_classify_one_records_the_llm_call(db_pool) -> None:
+    """issue #106: GTD clarify is the highest-volume LLM path in AEGIS and its
+    classifier call wrote NO `llm_calls` row — the per-task token counts go to
+    `clarify_decisions`, which is an audit ledger, not the spend table.
+
+    Real `LLMClient` (only the HTTP layer stubbed) against the real pool, row
+    read back: `record_llm_call` swallows its own errors, so a mock assertion
+    passes against a write that never landed.
+    """
+    await db_pool.execute("DELETE FROM llm_calls WHERE purpose = 'clarify_classification'")
+    llm = StubbedLLMClient(
+        db_pool=db_pool,
+        content=json.dumps(
+            {
+                "classification": "next_action",
+                "confidence": 0.85,
+                "assignee": "@sebas",
+                "contexts": ["@email"],
+                "reason": "reply due",
+            }
+        ),
+    )
+    acts = ClarifyActivities(db_pool=db_pool, todoist_connector=AsyncMock(), llm_client=llm)
+    task = {
+        "id": "T_REC",
+        "content": "Reply to vendor",
+        "source_tag": "#email",
+        "labels": ["#email"],
+        "description": None,
+        "latest_user_note": None,
+    }
+    try:
+        result = await acts.classify_one(task)
+        assert result["classification"] == "next_action"
+
+        rows = await db_pool.fetch(
+            "SELECT status, model, input_tokens FROM llm_calls "
+            "WHERE purpose = 'clarify_classification'"
+        )
+        # Exactly one per classified task — two would double every clarify run's
+        # reported spend, and clarify runs every five minutes.
+        assert len(rows) == 1, f"expected one clarify_classification row, got {len(rows)}"
+        assert rows[0]["status"] == "success"
+        assert rows[0]["model"] == "qwen3:14b"
+        assert rows[0]["input_tokens"] == 11
+    finally:
+        await db_pool.execute("DELETE FROM llm_calls WHERE purpose = 'clarify_classification'")
