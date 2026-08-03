@@ -1,0 +1,32 @@
+-- 022: drop pandoras_actor.backup_health and pandoras_actor.schedule_health.
+--
+-- These are leftovers from PR #19 (12437d9, 2026-07-03 — "strip owner-specific
+-- homelab probes… keep swarm drift + cert radar"). That PR deleted the two
+-- flows that were their only producers:
+--
+--   BackupAuditFlow   (daily)    -> pandoras_actor.backup_health
+--   ScheduleHealthFlow (4-hourly) -> pandoras_actor.schedule_health
+--
+-- but left the baseline tables and their CleanupFlow retention entries behind.
+-- The last backup_health.checked_at in prod is 2026-07-03 06:00 UTC — the
+-- morning run before the removal deployed. schedule_health never held a row.
+--
+-- Nothing reads either table: `homelab.py /state` selects only homelab_drift
+-- and cert_expiry, `briefing.py` reads only homelab_drift, and there is no
+-- chat tool, admin route, SPA call or comms consumer for them. The only repo
+-- references were the baseline DDL, the two CleanupFlow maps, and tests — all
+-- removed alongside this migration. Verified in prod: no dependent views,
+-- no inbound foreign keys, and the CleanupFlow `activities.config` is `{}`
+-- (no stored retention override naming them).
+--
+-- Data destroyed in prod: 4 rows in backup_health (NFS-backup freshness for
+-- postgresql/clickhouse, written 2026-07-01/02) and 0 rows in schedule_health.
+-- Re-wiring instead of dropping would reverse #19's deliberate decision; the
+-- old flows are recoverable at 12437d9^ if backup monitoring is wanted back
+-- (aegis#99).
+--
+-- IF EXISTS keeps this idempotent — safe to re-run, and safe on a fresh
+-- database where 001_baseline.sql has just created both tables.
+
+DROP TABLE IF EXISTS pandoras_actor.backup_health;
+DROP TABLE IF EXISTS pandoras_actor.schedule_health;

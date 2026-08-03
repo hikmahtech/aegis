@@ -37,10 +37,11 @@ EXPECTED_FINANCE_TABLES = {
     "subscription_digest",
 }
 
+# backup_health / schedule_health are created by 001_baseline.sql but dropped
+# again by migration 022 (aegis#99), so they are deliberately absent here —
+# run_migrations() applies the whole directory, not just the baseline.
 EXPECTED_PANDORAS_ACTOR_TABLES = {
     "homelab_drift",
-    "backup_health",
-    "schedule_health",
     "cert_expiry",
 }
 

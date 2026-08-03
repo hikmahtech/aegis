@@ -56,10 +56,12 @@ _DEFAULT_RETENTIONS: dict[str, int] = {
     # created_at (see _TIMESTAMP_COLUMNS). Sibling life.people is deliberately
     # NOT here — that one is user-curated.
     "life.observations": 365,
-    # pandoras_actor.* homelab observation tables — see migration 003.
+    # pandoras_actor.* homelab observation tables. Only two remain:
+    # backup_health / schedule_health were DROPPED by migration 022, since
+    # PR #19 deleted BackupAuditFlow and ScheduleHealthFlow, the only things
+    # that ever wrote them (aegis#99). Do not re-add retention for a table
+    # that no longer exists.
     "pandoras_actor.homelab_drift": 60,
-    "pandoras_actor.backup_health": 60,
-    "pandoras_actor.schedule_health": 60,
     "pandoras_actor.cert_expiry": 60,
 }
 

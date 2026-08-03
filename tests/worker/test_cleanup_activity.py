@@ -263,8 +263,6 @@ _EXPANDED_TABLES = [
     "alert_mutes",
     "pending_prs",
     "pandoras_actor.homelab_drift",
-    "pandoras_actor.backup_health",
-    "pandoras_actor.schedule_health",
     "pandoras_actor.cert_expiry",
     "todoist_webhook_events",
     "knowledge_injection_log",
@@ -294,7 +292,7 @@ def test_expanded_tables_use_correct_timestamp_columns():
     """The timestamp column chosen per table must match the migration:
     workflow_runs → started_at, alert_dedup_index → last_seen_at,
     alert_mutes → muted_until (dead-by), pandoras_actor.* → detected_at
-    (homelab_drift) or checked_at (everything else)."""
+    (homelab_drift) or checked_at (cert_expiry)."""
     expected = {
         "workflow_runs": "started_at",
         "ingest_idempotency": "created_at",
@@ -303,8 +301,6 @@ def test_expanded_tables_use_correct_timestamp_columns():
         "alert_mutes": "muted_until",
         "pending_prs": "created_at",
         "pandoras_actor.homelab_drift": "detected_at",
-        "pandoras_actor.backup_health": "checked_at",
-        "pandoras_actor.schedule_health": "checked_at",
         "pandoras_actor.cert_expiry": "checked_at",
         "todoist_webhook_events": "received_at",
         "knowledge_injection_log": "created_at",
@@ -365,9 +361,10 @@ async def test_prune_handles_schema_qualified_table_names():
     assert regclass_arg == "pandoras_actor.homelab_drift"
 
 
-async def test_prune_uses_checked_at_for_pandoras_actor_backup_health():
-    """backup_health / schedule_health / cert_expiry all use `checked_at`
-    per migration 003."""
+async def test_prune_uses_checked_at_for_pandoras_actor_cert_expiry():
+    """cert_expiry is the surviving `checked_at` table under pandoras_actor
+    (its former siblings backup_health / schedule_health were dropped by
+    migration 022), so it carries the checked_at-path coverage."""
     pool = AsyncMock()
     pool.fetchval = AsyncMock(return_value=True)
     pool.execute = AsyncMock(return_value="DELETE 0")
@@ -375,10 +372,10 @@ async def test_prune_uses_checked_at_for_pandoras_actor_backup_health():
     env = ActivityEnvironment()
     await env.run(
         activities.prune_old_records,
-        {"retentions": {"pandoras_actor.backup_health": 60}},
+        {"retentions": {"pandoras_actor.cert_expiry": 60}},
     )
     sql = pool.execute.await_args.args[0]
-    assert "DELETE FROM pandoras_actor.backup_health" in sql
+    assert "DELETE FROM pandoras_actor.cert_expiry" in sql
     assert "checked_at <" in sql
 
 
@@ -540,4 +537,48 @@ async def test_registered_life_tables_are_a_deliberate_allowlist():
     """
     life_tables = {t for t in _TIMESTAMP_COLUMNS if t.startswith("life.")}
     assert life_tables == {"life.observations"}
+
+
+async def test_dropped_homelab_health_tables_have_no_retention():
+    """pandoras_actor.backup_health / schedule_health were DROPPED by
+    migration 022 (aegis#99): PR #19 deleted BackupAuditFlow and
+    ScheduleHealthFlow, the only producers, and the tables outlived them by a
+    month holding 4 and 0 rows respectively.
+
+    Retention for a table that no longer exists is not merely dead config —
+    `prune_old_records` would issue a `DELETE FROM pandoras_actor.backup_health`
+    against a missing relation on every nightly CleanupFlow tick. Guarded the
+    same two ways as the `life.*` tripwires: absent from all three maps (an
+    entry in only one is the silent-no-op bug this file already covers), AND a
+    retention config naming them is ignored at runtime rather than issuing a
+    DELETE.
+    """
+    dropped = ("pandoras_actor.backup_health", "pandoras_actor.schedule_health")
+    for table in dropped:
+        assert table not in _TIMESTAMP_COLUMNS
+        assert table not in _ALLOWED_TABLES
+        assert table not in _DEFAULT_RETENTIONS
+
+    pool = AsyncMock()
+    pool.fetchval = AsyncMock(return_value=True)
+    pool.execute = AsyncMock(return_value="DELETE 10")
+    activities = CleanupActivities(db_pool=pool)
+    env = ActivityEnvironment()
+    result = await env.run(
+        activities.prune_old_records,
+        {"retentions": dict.fromkeys(dropped, 60)},
+    )
+    assert result == {}
+    pool.execute.assert_not_awaited()
+
+
+def test_registered_pandoras_actor_tables_are_a_deliberate_allowlist():
+    """Only the two surviving homelab observation tables are pruned.
+
+    Mirrors the `life.*` allowlist tripwire: a `pandoras_actor.*` retention
+    entry added by reflex — or a re-added backup_health / schedule_health —
+    trips this test rather than silently targeting a dropped relation.
+    """
+    pa_tables = {t for t in _TIMESTAMP_COLUMNS if t.startswith("pandoras_actor.")}
+    assert pa_tables == {"pandoras_actor.homelab_drift", "pandoras_actor.cert_expiry"}
 
