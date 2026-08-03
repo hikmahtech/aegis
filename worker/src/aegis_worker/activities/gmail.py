@@ -221,6 +221,41 @@ _TRIAGE_UNIMPORTANT = {"useless", "informational"}
 # Tiers AEGIS treats as "important" (IMPORTANT label + kept unread).
 _TRIAGE_IMPORTANT = {"important_action", "important_read"}
 
+# What the "READ" verdict (useless/informational) removes in its single
+# Gmail modify call.
+#
+# (#102) IMPORTANT is in here for measurement integrity, not tidiness. Gmail
+# auto-applies IMPORTANT at *delivery* — the same marker this module already
+# discounts as a classifier input ("liberal, inflates fake important", see
+# classify_email). Until 2026-08 the unimportant verdict removed only UNREAD,
+# so Gmail's own delivery-time IMPORTANT survived untouched and
+# assess_triage_correction — which reads IMPORTANT ∨ STARRED as "the user
+# elevated this" — logged a "user correction" for every auto-IMPORTANT
+# marketing mail we correctly called useless, with no human involved. Prod
+# bore this out exactly: 75/75 corrections ran unimportant→important and
+# ZERO ran the other way, the signature of a one-directional artefact rather
+# than a model error, and the subject lines were campaign spam (two of them
+# recorded twice, once per duplicate send).
+#
+# Stripping IMPORTANT here means that at recheck time the label can only be
+# present because a human put it back, which is precisely the signal we want.
+# Gmail's importance classifier scores a message once, on delivery, and does
+# not re-mark an already-delivered message; the ingest fetch only ever sees
+# delivered mail (`is:unread` + a forward-moving `after:` cursor), so nothing
+# re-adds it behind us. IMPORTANT is user-mutable over the API — the flow
+# already writes it in the add direction (`addLabelIds:["IMPORTANT"]` for the
+# important_* tiers), and removal is the symmetric operation on the same
+# `gmail.modify` scope.
+_READ_VERDICT_REMOVES = ("UNREAD", "IMPORTANT")
+
+# (#102) assess_triage_correction speaks in coarse directions; triage_state
+# caches one of the four fine-grained _TRIAGE_CATEGORIES. Map a correction
+# onto the *conservative* member of its direction: "important" relearns as
+# important_read (label + keep unread) rather than important_action, which
+# would start manufacturing Todoist tasks off one label; "unimportant"
+# relearns as informational rather than useless.
+_CORRECTION_TO_CATEGORY = {"important": "important_read", "unimportant": "informational"}
+
 
 def assess_triage_correction(predicted: str, labels: list[str]) -> str | None:
     """Compare AEGIS's prediction to the email's CURRENT Gmail labels,
@@ -544,7 +579,9 @@ class GmailActivities:
         last_checked_at ASC NULLS FIRST, created_at ASC`):
           - labels contradict the prediction → actual + corrected_by='user_gmail'.
             This is a REAL, zero-effort human correction signal (#116) — also
-            write an agent_memory row so the mis-triage is remembered.
+            write an agent_memory row so the mis-triage is remembered, and
+            (#102) feed the sender back into `triage_state` so the correction
+            actually changes a future verdict.
           - consistent → stamp last_checked_at and keep cycling.
           - unobservable (deleted mail, or another account's — predictions
             don't record their account) → stamp last_checked_at too (#115):
@@ -558,7 +595,13 @@ class GmailActivities:
             corrected_by='implicit'.
         Fire-and-forget: never raises.
         """
-        empty = {"checked": 0, "corrected": 0, "confirmed": 0, "memories_written": 0}
+        empty = {
+            "checked": 0,
+            "corrected": 0,
+            "confirmed": 0,
+            "memories_written": 0,
+            "senders_relearned": 0,
+        }
         if not self.db_pool:
             return empty
         try:
@@ -570,13 +613,13 @@ class GmailActivities:
                 "ORDER BY last_checked_at ASC NULLS FIRST, created_at ASC LIMIT $1",
                 limit,
             )
-            checked = corrected = memories_written = 0
+            checked = corrected = memories_written = senders_relearned = 0
             if rows:
                 token_path = Path(self.gmail_token_dir) / f"{account_label}.json"
 
-                def _sync_labels() -> dict[str, tuple[list[str], str] | None]:
+                def _sync_labels() -> dict[str, tuple[list[str], str, str] | None]:
                     svc = _build_gmail_service(self.gmail_credentials_file, token_path)
-                    out: dict[str, tuple[list[str], str] | None] = {}
+                    out: dict[str, tuple[list[str], str, str] | None] = {}
                     for r in rows:
                         try:
                             m = (
@@ -586,14 +629,21 @@ class GmailActivities:
                                     userId="me",
                                     id=r["email_id"],
                                     format="metadata",
-                                    metadataHeaders=["Subject"],
+                                    # (#102) From comes back too: triage_accuracy
+                                    # stores no sender, and the relearn step below
+                                    # needs one to key triage_state.
+                                    metadataHeaders=["Subject", "From"],
                                 )
                                 .execute()
                             )
                             # System labels (IMPORTANT/STARRED/UNREAD) have
                             # id == name, so labelIds feed assess directly.
-                            subject = _parse_headers(m.get("payload") or {})["Subject"]
-                            out[r["email_id"]] = (m.get("labelIds") or [], subject)
+                            hdrs = _parse_headers(m.get("payload") or {})
+                            out[r["email_id"]] = (
+                                m.get("labelIds") or [],
+                                hdrs["Subject"],
+                                hdrs["From"],
+                            )
                         except Exception:  # noqa: BLE001 — gone/foreign message
                             out[r["email_id"]] = None
                     return out
@@ -612,7 +662,7 @@ class GmailActivities:
                             r["id"],
                         )
                         continue
-                    labels, subject = observed
+                    labels, subject, from_header = observed
                     checked += 1
                     correction = assess_triage_correction(r["predicted"], labels)
                     if correction:
@@ -623,6 +673,23 @@ class GmailActivities:
                             r["id"],
                             correction,
                         )
+                        # (#102) Teach the sender cache. Corrections used to be
+                        # write-only — recorded in triage_accuracy and
+                        # agent_memory, but never fed back into triage_state,
+                        # so they could not change a single future verdict. The
+                        # classify cascade short-circuits the LLM entirely once
+                        # a sender reaches n>=3 at conf>=0.75 (and gmail_promo
+                        # seeds unseen promo senders straight to 'useless'), so
+                        # a mis-cached sender stayed mis-cached forever. Route
+                        # through _triage_upsert rather than a parallel rule so
+                        # a human correction lands with exactly the same
+                        # disagreement arithmetic as an LLM disagreement:
+                        # conf -= 0.3, flip category once conf <= 0.3.
+                        relearn_as = _CORRECTION_TO_CATEGORY.get(correction)
+                        sender = _normalize_sender(from_header)
+                        if sender and relearn_as:
+                            await self._triage_upsert(sender, relearn_as)
+                            senders_relearned += 1
                         if await record_gmail_triage_correction(
                             self.db_pool,
                             self.agent_id,
@@ -651,18 +718,20 @@ class GmailActivities:
             if checked or confirmed:
                 activity.logger.info(
                     "recheck_triage_outcomes account=%s checked=%d corrected=%d confirmed=%d "
-                    "memories_written=%d",
+                    "memories_written=%d senders_relearned=%d",
                     account_label,
                     checked,
                     corrected,
                     confirmed,
                     memories_written,
+                    senders_relearned,
                 )
             return {
                 "checked": checked,
                 "corrected": corrected,
                 "confirmed": confirmed,
                 "memories_written": memories_written,
+                "senders_relearned": senders_relearned,
             }
         except Exception as exc:  # noqa: BLE001 — feedback must never block ingest
             activity.logger.warning(
@@ -834,14 +903,20 @@ class GmailActivities:
 
     @activity.defn
     async def apply_label(self, account_label: str, message_id: str, label: str) -> dict:
-        """Apply a Gmail label to a message. Best-effort — returns {ok: bool}."""
+        """Apply a Gmail label to a message. Best-effort — returns {ok: bool}.
+
+        "READ" is not a generic mark-as-read: it is the *verdict* AEGIS applies
+        to `useless`/`informational` (the only two categories the flow routes
+        here — `flows/gmail_ingest.py`). See `_READ_VERDICT_REMOVES` for why it
+        also strips IMPORTANT.
+        """
         token_path = Path(self.gmail_token_dir) / f"{account_label}.json"
 
         def _sync() -> dict:
             svc = _build_gmail_service(self.gmail_credentials_file, token_path)
             body: dict = {"addLabelIds": [label]}
             if label == "READ":
-                body = {"removeLabelIds": ["UNREAD"]}
+                body = {"removeLabelIds": list(_READ_VERDICT_REMOVES)}
             elif label == "ARCHIVE":
                 body = {"removeLabelIds": ["INBOX"]}
             return svc.users().messages().modify(userId="me", id=message_id, body=body).execute()
