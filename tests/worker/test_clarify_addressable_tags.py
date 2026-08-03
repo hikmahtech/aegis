@@ -99,7 +99,15 @@ async def test_custom_agent_alias_routes_and_prefetches_by_tag(db_pool):
     )
     _reset_reg_cache()
     try:
-        acts = ClarifyActivities(db_pool=db_pool)
+        # apply_outcome now stamps the GTD state on the followup branch too
+        # (issue #139), so this needs a connector that answers like the Sync API.
+        from unittest.mock import AsyncMock
+
+        connector = AsyncMock()
+        connector.commands = AsyncMock(
+            return_value={"ok": True, "data": {"sync_status": {}, "temp_id_mapping": {}}}
+        )
+        acts = ClarifyActivities(db_pool=db_pool, todoist_connector=connector)
         # classify: @ops label routes to the custom agent's followup branch.
         out = await acts.classify_one(_task(["@ops", "#manual"]))
         assert out["classification"] == "tagtest-ops_followup"

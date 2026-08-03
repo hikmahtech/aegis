@@ -2427,13 +2427,72 @@ async def test_classify_one_pandora_app_with_only_failed_runs_still_retries(
 
 
 @pytest.mark.asyncio
-async def test_apply_outcome_pandora_owned_is_noop(db_pool) -> None:
-    """pandora_owned applies no Todoist commands but logs as applied."""
+async def test_apply_outcome_pandora_owned_applies_no_routing_changes(db_pool) -> None:
+    """pandora_owned makes no routing/assignee changes and logs as applied. Its
+    only write is the GTD state stamp (issue #139) — no note, no completion, no
+    label churn beyond the one state label."""
     await _seed_managed_projects(db_pool)()
     connector = AsyncMock()
-    connector.commands = AsyncMock(return_value={"ok": True, "data": {}})
+    connector.commands = AsyncMock(
+        return_value={"ok": True, "data": {"sync_status": {}, "temp_id_mapping": {}}}
+    )
     acts = ClarifyActivities(db_pool=db_pool, todoist_connector=connector, llm_client=AsyncMock())
     task = {"id": "T_OWNED", "labels": ["@pandora"]}
+    decision = {
+        "classification": "pandora_owned",
+        "confidence": 1.0,
+        "assignee": "@pandora",
+        "contexts": [],
+        "reason": "owned",
+        "llm_model": "rules",
+    }
+    out = await acts.apply_outcome(task, decision)
+    assert out["applied"] is True
+    assert out["commands_sent"] == 1
+    sent = connector.commands.await_args.args[0]
+    assert [c["type"] for c in sent] == ["item_update"]
+    assert set(sent[0]["args"]["labels"]) == {"@pandora", "@next"}
+
+
+@pytest.mark.asyncio
+async def test_apply_outcome_pandora_owned_stamps_next_label(db_pool) -> None:
+    """The single largest limbo bucket in production (49/66 all-time
+    pandora_owned tasks carried no GTD state). A task claimed by a prior
+    investigation is still open work → @next."""
+    await _seed_managed_projects(db_pool)()
+    connector = AsyncMock()
+    connector.commands = AsyncMock(
+        return_value={"ok": True, "data": {"sync_status": {}, "temp_id_mapping": {}}}
+    )
+    acts = ClarifyActivities(db_pool=db_pool, todoist_connector=connector, llm_client=AsyncMock())
+    task = {"id": "T_OWNED_STATE", "labels": ["@pandora", "@code"]}
+    decision = {
+        "classification": "pandora_owned",
+        "confidence": 1.0,
+        "assignee": "@pandora",
+        "contexts": [],
+        "reason": "owned",
+        "llm_model": "rules",
+    }
+    out = await acts.apply_outcome(task, decision)
+    assert out["applied"] is True
+    upd = next(c for c in connector.commands.await_args.args[0] if c["type"] == "item_update")
+    assert "@next" in upd["args"]["labels"]
+    # Pre-existing labels survive the stamp.
+    assert {"@pandora", "@code"} <= set(upd["args"]["labels"])
+
+
+@pytest.mark.asyncio
+async def test_apply_outcome_pandora_owned_stamp_is_idempotent(db_pool) -> None:
+    """pandora_owned is re-visited on every note; once the state label is on the
+    task the branch must go back to sending nothing (135 all-time visits)."""
+    await _seed_managed_projects(db_pool)()
+    connector = AsyncMock()
+    connector.commands = AsyncMock(
+        return_value={"ok": True, "data": {"sync_status": {}, "temp_id_mapping": {}}}
+    )
+    acts = ClarifyActivities(db_pool=db_pool, todoist_connector=connector, llm_client=AsyncMock())
+    task = {"id": "T_OWNED_IDEM", "labels": ["@pandora", "@next"]}
     decision = {
         "classification": "pandora_owned",
         "confidence": 1.0,
