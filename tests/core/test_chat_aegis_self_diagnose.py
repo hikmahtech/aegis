@@ -9,7 +9,10 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from aegis.config import Settings
 from aegis.services.chat import (
+    _AEGIS_SELF_DIAGNOSE_MAX_WAIT,
+    _TOOL_TIMEOUT_OVERRIDES,
     AGENT_TOOL_SETS,
     CHAT_TOOLS,
     TOOL_EXECUTORS,
@@ -17,6 +20,7 @@ from aegis.services.chat import (
     _build_aegis_self_diagnose_prompt,
     _exec_aegis_self_diagnose,
     _slugify_issue,
+    send_message,
 )
 
 
@@ -236,6 +240,135 @@ async def test_exec_returns_within_budget_when_fetch_hangs(monkeypatch):
     # Hard bound: MAX_WAIT (0.5s) + one preempted fetch (0.15s) + slack — nowhere
     # near the 30s hang. A regression (unbounded fetch) would blow this.
     assert elapsed < 5.0
+
+
+# =====================================================================
+# The 30,000 ms cap itself (#140) — the tool loop's timeout wiring
+# =====================================================================
+
+
+def _loop_settings():
+    return Settings(
+        database_url="postgresql://test:test@localhost/test",
+        litellm_url="https://litellm.test/v1",
+        temporal_ui_url="https://temporal.test",
+        n8n_ui_url="https://n8n.test",
+        admin_username="admin",
+        admin_password="admin",
+        n8n_webhook_secret="test-secret",
+        model_balanced="test-model",
+        tool_calling_enabled=True,
+        tool_max_iterations=5,
+        tool_result_max_bytes=4096,
+        tool_timeout_seconds=30,
+    )
+
+
+def _agent_pool():
+    """AsyncMock pool that answers every agent lookup as pandoras-actor."""
+    pool = AsyncMock()
+    pool.fetchrow.return_value = {
+        "id": "pandoras-actor",
+        "name": "Pandora",
+        "system_prompt_path": "personalities/pandoras-actor/SOUL.md",
+    }
+    pool.fetch.return_value = []
+    conn = AsyncMock()
+    conn.fetchval = AsyncMock(return_value=None)
+    ctx = MagicMock()
+    ctx.__aenter__ = AsyncMock(return_value=conn)
+    ctx.__aexit__ = AsyncMock(return_value=False)
+    pool.acquire = MagicMock(return_value=ctx)
+    return pool
+
+
+@pytest.mark.asyncio
+async def test_tool_loop_applies_the_self_diagnose_timeout_override(monkeypatch):
+    """Regression for the ONLY failure this tool has ever had in production.
+
+    All 3 lifetime invocations (pandoras-actor, 2026-07-15 21:28-21:29 IST)
+    died identically: `latency_ms=30000`, `Tool 'aegis_self_diagnose' timed out
+    after 30s`. Nothing in the executor caused that — the outer tool loop's
+    `asyncio.wait_for` was simply set to `settings.tool_timeout_seconds`, and a
+    tool that polls a remote coding CLI for 8 minutes can never fit in 30s.
+    PR #73 added `_TOOL_TIMEOUT_OVERRIDES`, but nothing ever pinned that the
+    loop *consults* it, so a refactor could quietly restore the 30s guillotine.
+
+    Proven two ways that cannot mask each other, both against the SAME slow
+    executor and the SAME 0.05s default:
+      * `aegis_self_diagnose` survives          -> the override is applied;
+      * `list_nodes` (no override) still dies   -> the guillotine is armed,
+        so the first result isn't just "timeouts are broken everywhere".
+    """
+    import aegis.services.chat as chat_mod
+
+    async def _slow(_pool, _args, _ctx):
+        await asyncio.sleep(0.30)
+        return json.dumps({"ok": "executor finished"})
+
+    monkeypatch.setitem(chat_mod.TOOL_EXECUTORS, "aegis_self_diagnose", _slow)
+    monkeypatch.setitem(chat_mod.TOOL_EXECUTORS, "list_nodes", _slow)
+
+    settings = _loop_settings()
+    # Assigned, not constructed: the field is typed int, so passing 0.05 to
+    # Settings(...) would coerce it to 0 and every tool would time out.
+    settings.tool_timeout_seconds = 0.05
+
+    turns = [
+        {
+            "response": "",
+            "tool_calls": [
+                {
+                    "id": "tc-diag",
+                    "name": "aegis_self_diagnose",
+                    "arguments": json.dumps({"issue": "why is X slow", "mode": "investigate"}),
+                },
+                {
+                    "id": "tc-nodes",
+                    "name": "list_nodes",
+                    "arguments": json.dumps({"context": "swarm"}),
+                },
+            ],
+            "model": "test-model",
+            "prompt_tokens": 10,
+            "completion_tokens": 5,
+        },
+        {
+            "response": "Done.",
+            "tool_calls": [],
+            "model": "test-model",
+            "prompt_tokens": 20,
+            "completion_tokens": 10,
+        },
+    ]
+    seen: list[list[dict]] = []
+
+    async def _chat(messages, model, tools=None):
+        seen.append([dict(m) for m in messages])
+        return turns.pop(0)
+
+    llm = AsyncMock()
+    llm.chat = _chat
+
+    await send_message(
+        _agent_pool(), llm, "pandoras-actor", "diagnose yourself", settings=settings
+    )
+
+    # Messages the model saw on its second turn = the tool results.
+    by_id = {
+        m["tool_call_id"]: m["content"] for m in seen[-1] if m.get("role") == "tool"
+    }
+    # Assert the BODY, not merely "no error": the executor's own payload has to
+    # be what came back, which only happens if it ran to completion.
+    assert json.loads(by_id["tc-diag"]) == {"ok": "executor finished"}
+    # Control: identical executor, no override -> guillotined at 0.05s.
+    assert "timed out after 0.05s" in by_id["tc-nodes"]
+
+    # And the configured budget must clear the poll loop it wraps, with room
+    # for the launch round-trip. 30 is a literal here on purpose — it is the
+    # production default that produced all three 30,000 ms failures.
+    assert _TOOL_TIMEOUT_OVERRIDES["aegis_self_diagnose"] > 30
+    assert _TOOL_TIMEOUT_OVERRIDES["aegis_self_diagnose"] > _AEGIS_SELF_DIAGNOSE_MAX_WAIT
 
 
 @pytest.mark.asyncio

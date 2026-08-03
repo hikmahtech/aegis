@@ -19,9 +19,22 @@ reconcile — a half-broken scan must not mass-delete the table.
 
 A final, best-effort step checks that each tracked repo still has AEGIS's
 GitHub webhook registered (`check_github_webhooks`, detection only — see
-aegis#118) and folds `missing_webhooks` into this flow's result_summary. A
-failure here never fails the flow: the reconcile/mirror steps above are
-the load-bearing part of this daily run.
+aegis#118) and folds the result into this flow's result_summary. A failure
+here never fails the flow: the reconcile/mirror steps above are the
+load-bearing part of this daily run.
+
+**That step reports a change, not a level (aegis#142).** It used to warn on
+the standing `missing_webhooks` set every single day — 11-16 of 33 repos for
+24 days running, a number that by construction never reaches zero because
+most tracked checkouts are client repos that should *not* have a webhook
+pointing at a homelab endpoint. The alternative, auto-creating the hooks,
+was rejected: it is an outward-facing mutation against third-party repos,
+and the check has no way to tell "should have a webhook and doesn't" from
+"was never meant to have one", so it would mass-create ~14 unwanted hooks.
+Instead the warning now fires only on `webhooks_newly_missing` — a webhook
+that vanished, or a newly-tracked repo — while the full standing list stays
+in `result_summary.missing_webhooks` and this flow is chat-triggerable, so
+the report is still reachable on demand rather than dropped.
 """
 
 from __future__ import annotations
@@ -92,14 +105,25 @@ class WorkspaceRepoSyncFlow:
                 heartbeat_timeout=_WEBHOOK_CHECK_HEARTBEAT,
                 retry_policy=NO_RETRY,
             )
-            if webhook_check.get("missing_webhooks"):
+            # Only the DELTA warns (#142) — the standing set is carried in the
+            # result_summary for on-demand reads, not re-announced every day.
+            if webhook_check.get("webhooks_newly_missing"):
                 workflow.logger.warning(
-                    "workspace_repo_sync_missing_webhooks repos=%s",
-                    webhook_check["missing_webhooks"],
+                    "workspace_repo_sync_webhooks_newly_missing repos=%s standing=%s",
+                    webhook_check["webhooks_newly_missing"],
+                    webhook_check.get("missing_webhooks_count"),
                 )
         except Exception as exc:
             workflow.logger.error("github_webhook_check_failed error=%s", str(exc)[:200])
-            webhook_check = {"missing_webhooks": [], "webhook_check_status": "failed"}
+            # status='failed' keeps this empty set from becoming the next run's
+            # baseline, which would flag the whole backlog as newly missing.
+            webhook_check = {
+                "missing_webhooks": [],
+                "missing_webhooks_count": 0,
+                "webhooks_newly_missing": [],
+                "webhooks_recovered": [],
+                "webhook_check_status": "failed",
+            }
 
         return {
             "scanned": len(repos),

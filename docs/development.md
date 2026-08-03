@@ -56,22 +56,34 @@ docker compose logs worker --tail 50 -f
 
 ## Testing
 
+Run **one package at a time, in parallel** — exactly as CI does. A bare `pytest` (and
+`pytest tests/worker/` without `-n`) deadlocks, and always has, including on pristine `main`;
+`-n auto --dist loadfile` is what makes it terminate.
+
 ```bash
-pytest                    # full suite (asyncio_mode=auto)
-pytest tests/core/        # core only
-pytest tests/worker/      # worker only
-pytest tests/comms/       # comms only
-pytest -x                 # stop on first failure
-ruff check .              # lint
-ruff format .             # format
+pytest tests/core/ tests/api/ tests/integration/ -n auto --dist loadfile --timeout=300  # what CI runs
+pytest tests/worker/ -n auto --dist loadfile --timeout=300
+pytest tests/comms/ -n auto --dist loadfile --timeout=300
+pytest tests/worker/test_cleanup_activity.py::test_name  # single test
+pytest tests/core/ -x                                    # stop on first failure
+ruff check .                                             # lint — see the caveat below
 ```
 
-pytest config lives in the root `pyproject.toml` (not under `core/`) because rootdir is the project root.
+pytest config lives in the root `pyproject.toml` (not under `core/`) because rootdir is the
+project root, and `tests/conftest.py` gives every xdist worker its own `aegis_test_<gwN>`
+database so parallel runs don't collide.
 
-CI only runs `ruff check` (see `.github/workflows/*.yml`). Do **not** run `ruff format` on
+CI lints **scoped per package** (`ruff check core/src/ tests/core/ …`, see
+`.github/workflows/*.yml`), which is the gate your PR must pass; a bare `ruff check .` is
+clean and equivalent because `docs/` sits in ruff's `extend-exclude` (#236).
+
+`ruff format` is deliberately absent from that block. Do **not** run it on
 `core/src/aegis/services/chat.py` or `core/src/aegis/services/tools/infra.py` — both carry
-hand-laid-out data tables that a local ruff version rewrites wholesale, burying real changes
-in whole-file churn. Write already-formatted edits and let `ruff check` be the gate.
+hand-laid-out data tables (`CHAT_TOOLS`/`TOOL_EXECUTORS`, `_INFRA_SPECS`) that a local ruff
+version rewrites wholesale while CI's ruff version considers them clean, burying real changes
+in whole-file churn. CI never runs `ruff format`, so it is not a gate you have to satisfy:
+write already-formatted edits, let `ruff check` be the gate, and verify a minimal diff with
+`git diff main -- <file> | grep -c '^@@'`.
 
 ## Configuration
 

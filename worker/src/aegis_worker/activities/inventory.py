@@ -13,8 +13,9 @@ Currently covers:
     share one hierarchy.
   * GitHub webhook reconciliation — for each tracked repo (a `resources`
     row of kind='repository' with `metadata.github_repo` set), checks
-    that AEGIS's own GitHub webhook is registered and flags the ones
-    that aren't. Detection only; see `check_github_webhooks`.
+    that AEGIS's own GitHub webhook is registered and reports the ones
+    that aren't as a **delta against the previous run**, not as a level.
+    Detection only; see `check_github_webhooks`.
 
 `upsert_resources_batch` inserts new rows and union-merges tags /
 shallow-merges metadata on existing rows. Title and URL are insert-only
@@ -37,6 +38,12 @@ logger = structlog.get_logger()
 # Path segment identifying AEGIS's GitHub webhook receiver — see
 # `core/src/aegis/api/routes/webhooks.py`.
 _AEGIS_WEBHOOK_PATH = "/api/webhooks/github"
+
+# The webhook check's own previous-run state lives in this flow's
+# `workflow_runs.result_summary` — the durable store already exists, so the
+# delta needs no new table and no migration. Only rows from a run that
+# actually completed the check are valid baselines (see `check_github_webhooks`).
+_WEBHOOK_STATE_WORKFLOW = "WorkspaceRepoSyncFlow"
 
 
 # =====================================================================
@@ -186,12 +193,39 @@ class InventoryActivities:
     # GitHub webhook reconciliation
     # ------------------------------------------------------------------
 
-    # ponytail: detection only — flags repos with a missing/dead webhook so a
+    async def _previous_missing_webhooks(self) -> list[str] | None:
+        """The `missing_webhooks` set the previous *conclusive* run recorded.
+
+        `None` means there has never been one — a first observation is news,
+        not a standing condition, so the whole set is reported as new.
+
+        Only runs whose check actually concluded are valid baselines: a run
+        that bailed early (no remote_script) or whose check raised records
+        `webhook_check_status != 'ok'` and is skipped here. Without that
+        filter one inconclusive run would record an empty set and the next
+        run would re-report the entire standing backlog as newly missing.
+        Rows predating that key (`COALESCE(..., 'ok')`) are treated as
+        conclusive, so shipping this doesn't flush the whole backlog once.
+        """
+        async with self.db_pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT result_summary->'missing_webhooks' AS missing FROM workflow_runs "
+                "WHERE workflow_type = $1 "
+                "  AND result_summary->'missing_webhooks' IS NOT NULL "
+                "  AND COALESCE(result_summary->>'webhook_check_status', 'ok') = 'ok' "
+                "ORDER BY started_at DESC LIMIT 1",
+                _WEBHOOK_STATE_WORKFLOW,
+            )
+        if row is None or not isinstance(row["missing"], list):
+            return None
+        return [str(r) for r in row["missing"]]
+
+    # ponytail: detection only — reports repos with a missing/dead webhook so a
     # human can re-run the GitHub App / webhook setup; does not create or
-    # repair anything itself (aegis#118 checkbox 3).
+    # repair anything itself (aegis#118 checkbox 3, aegis#142).
     @activity.defn
     async def check_github_webhooks(self) -> dict:
-        """Flag tracked GitHub repos whose AEGIS webhook is missing/dead.
+        """Report tracked GitHub repos whose AEGIS webhook is missing/dead.
 
         "Tracked" mirrors `HomelabActivities.notify_pr_event`'s definition:
         a `resources` row of kind='repository' with `metadata.github_repo`
@@ -199,14 +233,30 @@ class InventoryActivities:
         host (the same SSH exec path `scan_workspace_repos` uses) and checks
         whether any hook URL points at our `/api/webhooks/github` endpoint.
 
+        **Reports a delta, not a level (aegis#142).** Most tracked repos are
+        client/third-party checkouts that are not supposed to carry a webhook
+        pointing at a homelab endpoint, so the standing set is ~14 of 33 and
+        will never reach zero. Re-announcing it every day trained everyone to
+        ignore it — and would have buried the one case that matters, a repo
+        (like `hikmahtech/aegis`, the repo that motivated #118) whose webhook
+        actually *disappears*. So the standing set is reported as a count and
+        the full list, while `webhooks_newly_missing` / `webhooks_recovered`
+        carry the change, and only a change is worth a warning. This mirrors
+        `FlowHealthWatchdogFlow`: a sustained fault is one alert, not one per
+        tick. The full list stays in `result_summary` and the flow is
+        chat-triggerable, so the report is still available on demand.
+
         Soft-fails per repo: a repo where `gh` errors (missing binary, 404,
         auth failure, timeout, ...) is skipped with a debug log rather than
         counted as missing — an inconclusive check must never look like a
-        confirmed gap. Returns {missing_webhooks: [...], checked: N, skipped: N}.
+        confirmed gap.
+
+        Returns {missing_webhooks, missing_webhooks_count, webhooks_newly_missing,
+        webhooks_recovered, checked, skipped, webhook_check_status}.
         """
         if not self.remote_script:
             logger.debug("github_webhook_check_no_remote_script")
-            return {"missing_webhooks": [], "checked": 0, "skipped": 0}
+            return _webhook_check_skipped()
 
         async with self.db_pool.acquire() as conn:
             rows = await conn.fetch(
@@ -215,7 +265,7 @@ class InventoryActivities:
             )
         repos = sorted({r["repo"] for r in rows if r["repo"]})
         if not repos:
-            return {"missing_webhooks": [], "checked": 0, "skipped": 0}
+            return _webhook_check_skipped()
 
         await self.remote_script.ensure_config()
         host = self.remote_script.workspace_scan_host()
@@ -247,9 +297,33 @@ class InventoryActivities:
             if not present:
                 missing.append(repo)
 
-        if missing:
-            logger.warning("github_webhooks_missing", repos=missing, count=len(missing))
-        return {"missing_webhooks": missing, "checked": checked, "skipped": skipped}
+        previous = await self._previous_missing_webhooks()
+        baseline = set(previous or [])
+        newly_missing = sorted(set(missing) - baseline)
+        recovered = sorted(baseline - set(missing))
+
+        # Only a CHANGE warns. The standing set is a debug line — see #142.
+        if newly_missing:
+            logger.warning(
+                "github_webhooks_newly_missing",
+                repos=newly_missing,
+                count=len(newly_missing),
+                standing=len(missing),
+            )
+        elif missing:
+            logger.debug("github_webhooks_missing_unchanged", count=len(missing))
+        if recovered:
+            logger.info("github_webhooks_recovered", repos=recovered, count=len(recovered))
+
+        return {
+            "missing_webhooks": missing,
+            "missing_webhooks_count": len(missing),
+            "webhooks_newly_missing": newly_missing,
+            "webhooks_recovered": recovered,
+            "checked": checked,
+            "skipped": skipped,
+            "webhook_check_status": "ok",
+        }
 
     # ------------------------------------------------------------------
     # Upsert
@@ -321,6 +395,25 @@ def origin_to_github_repo(origin_url: str) -> str:
     """Parse "owner/name" out of a GitHub origin URL ("" for non-GitHub)."""
     m = _GITHUB_ORIGIN_RE.match((origin_url or "").strip())
     return m.group("repo") if m else ""
+
+
+def _webhook_check_skipped() -> dict:
+    """Result for a run that never got to check anything (no connector, no repos).
+
+    `webhook_check_status='skipped'` is load-bearing, not cosmetic: it keeps
+    this empty set out of `_previous_missing_webhooks`' baseline lookup. If an
+    inconclusive run counted as a baseline, its `missing_webhooks: []` would
+    make the next run re-report the entire standing backlog as newly missing.
+    """
+    return {
+        "missing_webhooks": [],
+        "missing_webhooks_count": 0,
+        "webhooks_newly_missing": [],
+        "webhooks_recovered": [],
+        "checked": 0,
+        "skipped": 0,
+        "webhook_check_status": "skipped",
+    }
 
 
 def _aegis_webhook_present(hooks_json: str) -> bool | None:
