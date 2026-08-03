@@ -65,10 +65,19 @@ jobs:
           cache: pip
           cache-dependency-path: core/pyproject.toml
 
+      # `[google]` as well as `[dev]` (#248). Both Dockerfiles install
+      # `./core[google]`, so without it CI ran the ONE configuration production
+      # never runs. `test_ingest_drive_returns_the_documented_reauth_error`
+      # asserts the reauth error names the account's token file — reachable only
+      # once `google.auth` imports; absent it, the handler fails one step earlier
+      # with `No module named 'google.auth'` and the assertion cannot hold. It
+      # merged green because every dev venv has the extra. Measured cost: 14
+      # packages, ~112MB, +3.1s on a warm cache — and Core's job sits ~52s under
+      # the Worker-bound PR gate, so it buys the coverage for nothing.
       - name: Install packages
         run: |
           python -m pip install --upgrade pip
-          pip install -e "core[dev]"
+          pip install -e "core[dev,google]"
 
       - name: Lint
         run: ruff check core/src/ tests/core/ tests/api/ tests/integration/ tests/conftest.py
