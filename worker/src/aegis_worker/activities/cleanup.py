@@ -49,11 +49,11 @@ _TIMESTAMP_COLUMNS: dict[str, str] = {
     # as well as in _DEFAULT_RETENTIONS: _ALLOWED_TABLES derives from these
     # keys, so a retention entry alone would be silently skipped.
     "life.observations": "observed_at",
-    # pandoras_actor.* — per migration 003 the timestamp columns are
-    # `detected_at` (homelab_drift) and `checked_at` (everything else).
+    # pandoras_actor.* — the timestamp columns are `detected_at`
+    # (homelab_drift) and `checked_at` (cert_expiry). Sibling tables
+    # backup_health / schedule_health were DROPPED by migration 022 along
+    # with the flows that fed them (aegis#99) — do not re-add them here.
     "pandoras_actor.homelab_drift": "detected_at",
-    "pandoras_actor.backup_health": "checked_at",
-    "pandoras_actor.schedule_health": "checked_at",
     "pandoras_actor.cert_expiry": "checked_at",
 }
 

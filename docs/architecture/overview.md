@@ -287,7 +287,7 @@ PostgreSQL 16 + pgvector. Migrations 001 → 021 in `migrations/` (001 is the sq
 
 **Maou (finance)** — `finance.recurring_charge`, `finance.receipt_email`, `finance.renewal_alert`, `finance.subscription_digest`.
 
-**Pandora's Actor (infra)** — `pandoras_actor.homelab_drift`, `pandoras_actor.cert_expiry`. (`pandoras_actor.schedule_health` and `pandoras_actor.backup_health` also exist in the baseline and carry `CleanupFlow` retention entries, but no code currently writes to them.)
+**Pandora's Actor (infra)** — `pandoras_actor.homelab_drift`, `pandoras_actor.cert_expiry`. (`pandoras_actor.backup_health` and `pandoras_actor.schedule_health` were created by the baseline and dropped again by migration 022: their producers, `BackupAuditFlow` and `ScheduleHealthFlow`, were removed when the owner-specific homelab probes were stripped, leaving the tables and their `CleanupFlow` retention entries behind as dead weight.)
 
 **Life context (`life` schema)** — `life.people` (who matters, aliases, `last_contact`), `life.observations` (time-series personal signals from wearables and the life webhook; 365-day retention by `observed_at`), `life.expiring_items` + `life.expiring_item_alerts` (the expiry radar's registry and its per-threshold dedup ledger), `life.assets` (owned things; an asset with a service interval mirrors itself in as an `asset_service` expiring item).
 
