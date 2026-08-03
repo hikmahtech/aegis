@@ -8,6 +8,20 @@ import pytest
 from aegis_worker.activities.clarify import ClarifyActivities
 
 
+def _connector() -> AsyncMock:
+    """Connector whose commands() returns a well-formed empty envelope.
+
+    The followup branch sends no *routing* commands, but since issue #139 it
+    does stamp the GTD state label before returning, so the mock has to answer
+    like the real Sync API.
+    """
+    connector = AsyncMock()
+    connector.commands = AsyncMock(
+        return_value={"ok": True, "data": {"sync_status": {}, "temp_id_mapping": {}}}
+    )
+    return connector
+
+
 def _task(labels: list[str], content: str = "Title here") -> dict:
     return {
         "id": "task-z",
@@ -33,13 +47,14 @@ async def test_apply_outcome_agent_followup_returns_spawn_payload(
     db_pool, classification, target_agent
 ):
     """Each per-agent branch returns:
-    - applied=True (no Todoist commands to fail)
+    - applied=True
     - interaction_spawned=True
     - interaction_payload with spawn_kind="agent_chat_reply" + target_agent
     - thread_id=`todoist-task-<id>`
-    - no commands sent to Todoist
+    - exactly one Todoist command: the GTD state stamp (issue #139). The reply
+      itself is the spawned workflow's job — no routing/assignee changes here.
     """
-    todoist = AsyncMock()  # MUST NOT be called
+    todoist = _connector()
     acts = ClarifyActivities(db_pool=db_pool, todoist_connector=todoist)
     decision = {
         "classification": classification,
@@ -61,9 +76,12 @@ async def test_apply_outcome_agent_followup_returns_spawn_payload(
     assert payload["thread_id"] == "todoist-task-task-z"
     assert "Comment from user." in payload["synthetic_input"]
     assert "Title here" in payload["synthetic_input"]
-    assert outcome["commands_sent"] == 0
     assert outcome["outbox_queued"] == 0
-    todoist.commands.assert_not_called()
+    # The only write is the state stamp — no assignee/context/area churn.
+    assert outcome["commands_sent"] == 1
+    sent = todoist.commands.await_args.args[0]
+    assert [c["type"] for c in sent] == ["item_update"]
+    assert set(sent[0]["args"]["labels"]) == {f"@{target_agent}", "#manual", "@next"}
 
 
 @pytest.mark.asyncio
@@ -73,7 +91,7 @@ async def test_apply_outcome_pandora_chat_followup_returns_spawn_payload(db_pool
     which is just a label prefix). The label on the task stays @pandora
     — only the spawn payload's target_agent differs.
     """
-    todoist = AsyncMock()  # MUST NOT be called
+    todoist = _connector()
     acts = ClarifyActivities(db_pool=db_pool, todoist_connector=todoist)
     decision = {
         "classification": "pandora_chat_followup",
@@ -95,9 +113,12 @@ async def test_apply_outcome_pandora_chat_followup_returns_spawn_payload(db_pool
     assert payload["thread_id"] == "todoist-task-task-z"
     assert "Comment from user." in payload["synthetic_input"]
     assert "Title here" in payload["synthetic_input"]
-    assert outcome["commands_sent"] == 0
     assert outcome["outbox_queued"] == 0
-    todoist.commands.assert_not_called()
+    assert outcome["commands_sent"] == 1
+    sent = todoist.commands.await_args.args[0]
+    assert [c["type"] for c in sent] == ["item_update"]
+    # The task's label stays @pandora — only the state label is added.
+    assert set(sent[0]["args"]["labels"]) == {"@pandora", "#manual", "@next"}
 
 
 @pytest.mark.asyncio
@@ -130,7 +151,7 @@ async def test_apply_outcome_threads_recent_comments_into_synthetic_input(db_poo
         },
     ]
 
-    acts = ClarifyActivities(db_pool=db_pool, todoist_connector=AsyncMock())
+    acts = ClarifyActivities(db_pool=db_pool, todoist_connector=_connector())
     decision = {
         "classification": "pandora_chat_followup",
         "confidence": 1.0,
@@ -171,7 +192,7 @@ async def test_apply_outcome_synthetic_input_works_when_no_recent_notes(db_pool)
     """
     from unittest.mock import patch
 
-    acts = ClarifyActivities(db_pool=db_pool, todoist_connector=AsyncMock())
+    acts = ClarifyActivities(db_pool=db_pool, todoist_connector=_connector())
     decision = {
         "classification": "sebas_followup",
         "confidence": 1.0,
@@ -200,7 +221,7 @@ async def test_apply_outcome_raphael_pre_fetches_ks_context(db_pool):
     synthetic_input includes 'Existing knowledge:'."""
     from unittest.mock import patch
 
-    acts = ClarifyActivities(db_pool=db_pool, todoist_connector=AsyncMock())
+    acts = ClarifyActivities(db_pool=db_pool, todoist_connector=_connector())
     decision = {
         "classification": "raphael_followup",
         "confidence": 1.0,
@@ -223,7 +244,7 @@ async def test_apply_outcome_raphael_pre_fetches_ks_context(db_pool):
 async def test_apply_outcome_maou_pre_fetches_transaction_context(db_pool):
     from unittest.mock import patch
 
-    acts = ClarifyActivities(db_pool=db_pool, todoist_connector=AsyncMock())
+    acts = ClarifyActivities(db_pool=db_pool, todoist_connector=_connector())
     decision = {
         "classification": "maou_followup",
         "confidence": 1.0,
@@ -249,7 +270,7 @@ async def test_apply_outcome_sebas_has_no_prefetch_hook(db_pool):
     """Sebas branch does NOT call any pre-fetch — his context IS the task."""
     from unittest.mock import patch
 
-    acts = ClarifyActivities(db_pool=db_pool, todoist_connector=AsyncMock())
+    acts = ClarifyActivities(db_pool=db_pool, todoist_connector=_connector())
     decision = {
         "classification": "sebas_followup",
         "confidence": 1.0,
@@ -290,7 +311,7 @@ async def test_apply_outcome_maou_real_hook_returns_unchanged_when_no_receipts()
     mock_pool = MagicMock()
     mock_pool.acquire = MagicMock(return_value=mock_cm)
 
-    acts = ClarifyActivities(db_pool=mock_pool, todoist_connector=AsyncMock())
+    acts = ClarifyActivities(db_pool=mock_pool, todoist_connector=_connector())
     decision = {
         "classification": "maou_followup",
         "confidence": 1.0,
@@ -350,7 +371,7 @@ async def test_maybe_attach_ks_context_calls_real_search_method():
 
     acts = ClarifyActivities(
         db_pool=None,
-        todoist_connector=AsyncMock(),
+        todoist_connector=_connector(),
         knowledge_connector=kc,
     )
     task = {
@@ -378,7 +399,7 @@ async def test_maybe_attach_ks_context_returns_input_when_connector_unset():
     """None-guard branch — no connector means no prefetch attempt, no error."""
     acts = ClarifyActivities(
         db_pool=None,
-        todoist_connector=AsyncMock(),
+        todoist_connector=_connector(),
         knowledge_connector=None,
     )
     task = {"id": "t", "content": "anything", "labels": ["@raphael"]}

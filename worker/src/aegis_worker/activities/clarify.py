@@ -32,11 +32,18 @@ Content-route classifications:
   route's assignee + contexts (+ area_label) directly, no card, no agent run.
 
 - `pandora_owned` — task already carries the @pandora label (claimed by a
-  prior AlertInvestigationFlow run). apply_outcome is a no-op; log_classification
-  still bumps last_clarified_at so the task drops out of find_unclassified_items.
+  prior AlertInvestigationFlow run). apply_outcome applies no routing changes —
+  only the GTD state stamp below; log_classification still bumps
+  last_clarified_at so the task drops out of find_unclassified_items.
 
 Any task carrying @me — set on a gate card or by hand — is skipped by
 find_unclassified_items entirely: the user's "hands off, I'm on it" signal.
+
+GTD state contract (issue #139): GTD state lives entirely in labels, so a task
+that exits clarify with none of @next/@someday/@waiting/@reference is in no GTD
+state — invisible to every "what's next" / "what am I blocked on" view. Every
+classification apply_outcome can terminate on therefore has an entry in
+`_GTD_STATE_FOR`, either a state label or an explicit None with the reason.
 """
 
 from __future__ import annotations
@@ -230,6 +237,117 @@ def _assignee_labels(reg: dict[str, dict]) -> list[str]:
 # / _LABEL_SOMEDAY / _LABEL_NEXT (cross-package; keep in sync).
 _LABEL_SOMEDAY = "@someday"
 _LABEL_NEXT = "@next"
+_LABEL_REFERENCE = "@reference"
+_LABEL_WAITING = "@waiting"
+
+# The complete GTD state vocabulary. A task carrying none of these is in no GTD
+# state at all: invisible to "what's next" (@next), to "what am I blocked on"
+# (@waiting) and to every review filter. Keep in sync with the label seeds in
+# config/seed/todoist.yaml.
+GTD_STATE_LABELS: tuple[str, ...] = (_LABEL_NEXT, _LABEL_SOMEDAY, _LABEL_WAITING, _LABEL_REFERENCE)
+
+# --- issue #139: every terminal clarify outcome leaves a GTD state behind ----
+#
+# Historically only `next_action` / `reference` / `someday` stamped a state
+# label, so the majority of clarify's terminal outcomes dropped the task into
+# limbo. This table is the contract: EVERY classification apply_outcome can
+# terminate on declares the state it guarantees, or an explicit None plus the
+# reason no state is the correct answer for that outcome. A new outcome added
+# without an entry here fails test_clarify_gtd_state_contract.
+#
+# Two labels in GTD_STATE_LABELS are *park* labels for the agent-task executor
+# (aegis_worker.activities.agent_task.EXCLUDED_LABELS = @someday + @waiting):
+# reaching either removes an agent-assigned task from find_actionable_tasks'
+# eligible pool. So clarify must never stamp @waiting — an assignee label means
+# "an AEGIS agent should work this", not "blocked on a human". @waiting is
+# applied at the END of an agent run (agent_task.park_task), which is the only
+# point at which the task is genuinely blocked. Coupling assignee → @waiting at
+# classification time would empty the executor's pool.
+_GTD_STATE_FOR: dict[str, str | None] = {
+    # -- actionable now -------------------------------------------------------
+    "next_action": _LABEL_NEXT,
+    # A 2-minute task is the most actionable item there is. The out-of-window /
+    # force_apply path used to stamp only "@5min", which is a CONTEXT (where the
+    # work happens), never a state — 9/9 all-time 2_min tasks ended in limbo.
+    "2_min": _LABEL_NEXT,
+    # The human claimed the task ("I've got it" on the gate card, or @me by
+    # hand). It is theirs to do now, so it belongs in their next-actions view —
+    # @me is a person label, not a state. 17/17 all-time `mine` tasks in limbo.
+    "mine": _LABEL_NEXT,
+    # Handed to an AEGIS agent. Actionable, and must NOT carry a park label or
+    # the agent-task sweep will never pick the task up.
+    "route_apply": _LABEL_NEXT,
+    "pandora_investigation": _LABEL_NEXT,
+    # Claimed by a prior investigation and still open — the single largest limbo
+    # bucket in production (49/66 all-time).
+    "pandora_owned": _LABEL_NEXT,
+    "pandora_followup": _LABEL_NEXT,
+    # -- deliberately parked --------------------------------------------------
+    "someday": _LABEL_SOMEDAY,
+    # The human was already shown a card and chose "Leave for later". That is a
+    # decision — not-yet-actionable — so record it rather than asking again.
+    "leave": _LABEL_SOMEDAY,
+    "reference": _LABEL_REFERENCE,
+    # apply_outcome's `decision.get("classification") or "unknown"` fallback,
+    # and its `else` branch. Same reasoning as _GTD_STATE_DEFAULT below: the
+    # ambiguous case already got a card at the confidence floor, so this is a
+    # malformed response, and it must still land somewhere the user can see.
+    "unknown": _LABEL_NEXT,
+    # -- no state label is correct --------------------------------------------
+    # item_complete fires: the row leaves every view, so a state label on it is
+    # noise that would pollute "what's next" with completed junk.
+    "trash": None,
+    # A choice card is pending. apply_clarify_resolution re-enters apply_outcome
+    # with the user's real classification, and THAT sets the state.
+    "pandora_gate": None,
+    # Not a classification at all — classify_one's bail-out (kill switch off, no
+    # LLM client). It always carries confidence 0.0, so apply_outcome routes it
+    # to the low-conf card before any label branch runs; the resolution decides.
+    "skipped": None,
+}
+
+# Any per-agent comment-channel branch ("<agent>_followup", built from the live
+# agent registry so it can't be enumerated statically) hands a live conversation
+# on an open, agent-assigned task to AgentChatReplyFlow. Actionable.
+_FOLLOWUP_SUFFIX = "_followup"
+
+# Fallback for a classification outside the vocabulary (a malformed model
+# response reaching apply_outcome's `else` branch with high confidence — the
+# genuinely-ambiguous case already got a card at the _LOW_CONF_FLOOR gate above,
+# so a second card here would just nag about a model defect). The default must
+# be the VISIBLE state, never an invisible one: a wrong @next costs the user one
+# glance and a relabel, whereas a wrong "no state" costs them the task entirely.
+_GTD_STATE_DEFAULT = _LABEL_NEXT
+
+
+def gtd_state_label(classification: str) -> str | None:
+    """The GTD state label a terminal clarify outcome must leave on the task.
+
+    None means no state label is correct for that outcome (documented per entry
+    in ``_GTD_STATE_FOR``). Unknown classifications fall back to the visible
+    state rather than silently leaving the task in limbo.
+    """
+    if classification in _GTD_STATE_FOR:
+        return _GTD_STATE_FOR[classification]
+    if classification.endswith(_FOLLOWUP_SUFFIX):
+        return _LABEL_NEXT
+    return _GTD_STATE_DEFAULT
+
+
+def _apply_gtd_state(commands: list[dict], item_id: str, labels: list[str], state: str) -> None:
+    """Union ``state`` into the batch's item_update labels, in place.
+
+    Branches build at most one item_update; when a branch sends none (e.g.
+    pandora_followup) a label-only update is appended so the state still lands.
+    """
+    from aegis.connectors.todoist import TodoistConnector
+
+    for cmd in commands:
+        if cmd.get("type") == "item_update" and "labels" in (cmd.get("args") or {}):
+            cmd["args"]["labels"] = list({*cmd["args"]["labels"], state})
+            return
+    commands.append(TodoistConnector.build_item_update_command(item_id, labels=[*labels, state]))
+
 
 # Confidence floor below which apply_outcome asks the user (NEEDS REVIEW card)
 # instead of applying the classification. Was the `escalation_threshold`
@@ -1157,6 +1275,39 @@ class ClarifyActivities:
             "pass_n": pass_n,
         }
 
+    async def _stamp_gtd_state(
+        self, item_id: str, existing_labels: list[str], classification: str
+    ) -> int:
+        """Stamp the outcome's GTD state on a branch that sends no other Todoist
+        commands (issue #139). Returns the number of commands sent — 0 when the
+        outcome wants no state, or when the label is already on the task, so
+        repeat visits to a no-op branch stay free.
+        """
+        from aegis.connectors.todoist import TodoistConnector
+
+        state = gtd_state_label(classification)
+        if not state or state in existing_labels:
+            return 0
+        cmd = TodoistConnector.build_item_update_command(
+            item_id, labels=[*existing_labels, state]
+        )
+        result = await self.todoist_connector.commands([cmd])
+        status = TodoistConnector.check_sync_status(result, [cmd["uuid"]])
+        if not status["ok"]:
+            # Best-effort: the branch's real work (a spawned workflow, or just
+            # the watermark bump) must not be lost because a label write failed.
+            # The task re-enters clarify on the next user note and retries.
+            activity.logger.warning(
+                "clarify_gtd_state_stamp_rejected task_id=%s state=%s "
+                "classification=%s envelope_err=%s rejected=%s",
+                item_id,
+                state,
+                classification,
+                status["envelope_error"],
+                str(status["rejected"])[:200],
+            )
+        return 1
+
     @activity.defn
     async def apply_outcome(
         self,
@@ -1231,15 +1382,20 @@ class ClarifyActivities:
             task.get("content") or "", await get_content_routes(self.db_pool)
         )
 
-        # Pandora-owned task — no side effects at all. classify_one
-        # already identified this case; we only need log_classification
-        # to bump last_clarified_at so the watermark advances.
+        # Pandora-owned task — the classification itself has no side effects;
+        # classify_one already identified this case and log_classification
+        # bumps last_clarified_at so the watermark advances. The one write it
+        # DOES owe is the GTD state (issue #139): a task claimed by a prior
+        # investigation is still open work, and this branch left 49 of 66
+        # all-time pandora_owned tasks with no state at all. Idempotent — once
+        # stamped, existing_labels carries it and the next visit sends nothing.
         if classification == "pandora_owned":
+            sent = await self._stamp_gtd_state(item_id, existing_labels, classification)
             return {
                 "applied": True,
                 "interaction_spawned": False,
                 "interaction_payload": None,
-                "commands_sent": 0,
+                "commands_sent": sent,
                 "outbox_queued": 0,
             }
 
@@ -1384,6 +1540,10 @@ class ClarifyActivities:
                 synthetic_input = await self._maybe_attach_transaction_context(
                     synthetic_input, task
                 )
+            # The reply itself is the spawned workflow's job, but the task is
+            # open, agent-assigned and under active discussion — i.e. actionable.
+            # Stamp the state so it stops being invisible (issue #139).
+            sent = await self._stamp_gtd_state(item_id, existing_labels, classification)
             return {
                 "applied": True,
                 "interaction_spawned": True,
@@ -1394,7 +1554,7 @@ class ClarifyActivities:
                     "synthetic_input": synthetic_input,
                     "thread_id": f"todoist-task-{item_id}",
                 },
-                "commands_sent": 0,
+                "commands_sent": sent,
                 "outbox_queued": 0,
             }
 
@@ -1479,6 +1639,14 @@ class ClarifyActivities:
             commands.append(
                 TodoistConnector.build_item_update_command(item_id, labels=merged_labels)
             )
+
+        # GTD state guarantee (issue #139). Every terminal outcome that writes
+        # to Todoist leaves exactly one GTD state behind, so no task can exit
+        # clarify invisible to "what's next". `None` is an explicit, documented
+        # answer for the outcomes where no state is correct (see _GTD_STATE_FOR).
+        state = gtd_state_label(classification)
+        if state:
+            _apply_gtd_state(commands, item_id, existing_labels, state)
 
         # Always append the reasoning note
         commands.append(
