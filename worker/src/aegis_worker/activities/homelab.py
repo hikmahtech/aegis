@@ -492,7 +492,18 @@ class HomelabActivities:
 
     @staticmethod
     def _default_heartbeat_state() -> dict:
-        return {"nodes": {}, "stuck": [], "confirmed": [], "fail_count": 0}
+        # confirmed_at / reinvestigated_at: {service: iso8601} clocks behind the
+        # re-investigate path for confirmed-stuck services (#138). Merged over
+        # the stored value in read_heartbeat_state, so a state row written
+        # before they existed reads back as empty maps rather than KeyError.
+        return {
+            "nodes": {},
+            "stuck": [],
+            "confirmed": [],
+            "confirmed_at": {},
+            "reinvestigated_at": {},
+            "fail_count": 0,
+        }
 
     @activity.defn
     async def collect_infra_state(self) -> dict:
