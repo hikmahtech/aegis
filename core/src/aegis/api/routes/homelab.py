@@ -38,7 +38,13 @@ async def _start_workflow(flow: str, cfg: dict, temporal_client: TemporalClient)
 
 @router.get("/state")
 async def homelab_state(request: Request) -> dict:
-    """Return latest rows from the homelab monitoring tables."""
+    """Return latest rows from the homelab monitoring tables.
+
+    The drift/cert debugging surface — "what did ServiceDriftFlow actually see,
+    and which cert is closest to expiry".
+
+    This endpoint is intentionally curl/ops-only, no UI consumer.
+    """
     pool = request.app.state.db_pool
     async with pool.acquire() as conn:
         drift = await conn.fetch(
@@ -69,6 +75,9 @@ async def trigger_flow(
     {"domains": [...]}). When omitted, defaults are pulled from settings —
     cert_radar falls back to settings.homelab_public_domains so manual
     triggers match scheduled behavior.
+
+    This endpoint is intentionally curl/ops-only, no UI consumer — it pairs
+    with GET /state when re-running a guardian flow to reproduce drift.
     """
     client = require_temporal_client(request)
     try:

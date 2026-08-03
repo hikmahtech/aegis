@@ -1,12 +1,15 @@
 """Reference library — raphael's KS-backed reading corpus + failure lane.
 
-Surfaces three views:
+Surfaces two views:
 
 - ``GET /api/references`` — the library: KS content with
   ``source_type=reference``, filtered/searched in the UI.
-- ``GET /api/references/{content_id}`` — detail view (status + chunks).
 - ``GET /api/references/failures`` — tasks demoted to ``@to-read`` because
   KS ingest gave up. Sourced from the ``todoist_tasks`` projection.
+
+There is deliberately no per-reference detail route here: the UI's
+``/content/:id`` page (References.tsx) links straight to the knowledge
+routes ``GET /api/knowledge/content/{id}`` + ``…/chunks``.
 """
 
 from __future__ import annotations
@@ -118,28 +121,3 @@ async def list_failures(request: Request, limit: int = Query(100, ge=1, le=500))
         out.append(record)
     return out
 
-
-@router.get("/{content_id}")
-async def get_reference(request: Request, content_id: str) -> dict[str, Any]:
-    """Reference detail — status metadata + chunked body.
-
-    Returns ``{"content": <status-dict>, "chunks": [<chunk>, ...]}`` so the
-    UI can render a single round-trip detail view. 404 only when KS itself
-    returns 404; transient KS failures bubble up as 5xx.
-    """
-    connector = _get_connector(request)
-    try:
-        status = await connector.get_content_status(content_id)
-    except Exception as exc:  # noqa: BLE001
-        # Translate httpx 4xx into FastAPI 404; let other errors propagate.
-        import httpx
-
-        if isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code == 404:
-            raise HTTPException(status_code=404, detail="Reference not found") from exc
-        raise
-    chunks: list[dict[str, Any]] = []
-    try:
-        chunks = await connector.get_content_chunks(content_id)
-    except Exception:  # noqa: BLE001
-        pass
-    return {"content": status, "chunks": chunks}

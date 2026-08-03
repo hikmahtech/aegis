@@ -22,7 +22,13 @@ async def list_llm_calls(
     limit: int = 100,
     offset: int = 0,
 ) -> list[dict[str, Any]]:
-    """Browse LLM call telemetry."""
+    """Browse LLM call telemetry — raw `llm_calls` rows, newest first.
+
+    The UI charts the aggregate (`/llm-stats`); this is the row-level lane a
+    spend/latency audit actually reads ("which calls burned the tokens").
+
+    This endpoint is intentionally curl/ops-only, no UI consumer.
+    """
     pool = request.app.state.db_pool
     where, params = build_where({"model": model, "agent_id": agent_id, "purpose": purpose})
     idx = len(params) + 1
@@ -66,7 +72,13 @@ async def list_connector_calls(
     limit: int = 100,
     offset: int = 0,
 ) -> list[dict[str, Any]]:
-    """Browse connector call telemetry."""
+    """Browse connector call telemetry — raw `connector_calls` rows, newest first.
+
+    The UI charts the aggregate (`/connector-stats`); this is the row-level
+    lane for "which connector call failed, and with what error".
+
+    This endpoint is intentionally curl/ops-only, no UI consumer.
+    """
     pool = request.app.state.db_pool
     where, params = build_where(
         {"connector": connector, "action": action, "status": status, "agent_id": agent_id}

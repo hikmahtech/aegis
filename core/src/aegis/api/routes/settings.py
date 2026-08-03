@@ -37,7 +37,13 @@ async def list_settings(request: Request) -> list[dict[str, Any]]:
 
 @router.get("/{key}")
 async def get_setting(key: str, request: Request) -> dict[str, Any]:
-    """Get a setting by key. Secret-bearing keys are never returned here."""
+    """Get a setting by key. Secret-bearing keys are never returned here.
+
+    Kept for REST symmetry with the wired ``PUT /api/settings/{key}`` — the UI
+    reads the whole set via ``GET /api/settings`` and never fetches one key.
+
+    This endpoint is intentionally curl/ops-only, no UI consumer.
+    """
     if _is_hidden(key):
         raise HTTPException(status_code=403, detail="Managed on its own page; not readable here.")
     pool = request.app.state.db_pool
