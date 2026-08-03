@@ -351,19 +351,6 @@ class KnowledgeStore:
         )
         return [dict(r) for r in rows]
 
-    async def get_recent_jobs(self, limit: int = 20) -> list[dict]:
-        """Recent ingests as job-shaped rows (no real job queue here)."""
-        items = await self.list_content_items(limit=limit)
-        return [
-            {
-                "content_id": it["content_id"],
-                "title": it.get("title"),
-                "status": "completed",
-                "ingested_at": it.get("ingested_at"),
-            }
-            for it in items
-        ]
-
     async def get_stats(self) -> dict:
         """Counts for the admin health panel."""
         async with self._pool.acquire() as conn:

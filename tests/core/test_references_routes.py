@@ -3,7 +3,6 @@
 import base64
 from unittest.mock import AsyncMock, MagicMock
 
-import httpx
 import pytest
 from aegis.api.app import create_app
 from aegis.api.deps import get_settings
@@ -34,16 +33,6 @@ def mock_knowledge():
     ]
     kc.search.return_value = [
         {"content_id": "ref-1", "title": "Search hit", "source_type": "reference"}
-    ]
-    kc.get_content_status.return_value = {
-        "content_id": "ref-1",
-        "title": "Reference one",
-        "status": "ready",
-        "chunks_total": 3,
-    }
-    kc.get_content_chunks.return_value = [
-        {"id": 1, "index": 0, "text": "chunk 0"},
-        {"id": 2, "index": 1, "text": "chunk 1"},
     ]
     return kc
 
@@ -159,32 +148,16 @@ async def test_list_references_search_query_uses_semantic(app, auth_headers, moc
     mock_knowledge.list_content_items.assert_not_called()
 
 
-async def test_get_reference_returns_status_and_chunks(app, auth_headers):
+async def test_no_per_reference_detail_route(app, auth_headers):
+    """There is deliberately no GET /api/references/{id} (issue #101).
+
+    The UI's /content/:id page reads the knowledge routes instead, so an
+    unknown segment under /api/references must 404 rather than resolve to a
+    duplicate detail handler.
+    """
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as client:
         resp = await client.get("/api/references/ref-1", headers=auth_headers)
-    assert resp.status_code == 200
-    body = resp.json()
-    assert body["content"]["content_id"] == "ref-1"
-    assert len(body["chunks"]) == 2
-
-
-async def test_get_reference_translates_ks_404_to_404(
-    test_settings, mock_knowledge, auth_headers
-):
-    request = httpx.Request("GET", "http://ks/api/content/missing/status")
-    response = httpx.Response(404, request=request, json={"detail": "not found"})
-    mock_knowledge.get_content_status = AsyncMock(
-        side_effect=httpx.HTTPStatusError("404", request=request, response=response)
-    )
-    application = create_app(run_lifespan=False)
-    application.dependency_overrides[get_settings] = lambda: test_settings
-    pool, _ = _make_pool_with_rows([])
-    application.state.db_pool = pool
-    application.state.knowledge_connector = mock_knowledge
-    transport = ASGITransport(app=application)
-    async with AsyncClient(transport=transport, base_url="http://test") as client:
-        resp = await client.get("/api/references/missing", headers=auth_headers)
     assert resp.status_code == 404
 
 

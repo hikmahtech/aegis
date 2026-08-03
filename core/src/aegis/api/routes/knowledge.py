@@ -182,6 +182,10 @@ async def ingest_drive(
     Reuses the Gmail OAuth token for `account` — it must be re-authorized with
     the Drive scope (see gmail_reauth). Lists the folder, extracts each file
     (Google Docs exported to text; pdf/txt/md/… downloaded), and ingests.
+
+    This endpoint is intentionally curl/ops-only, no UI consumer — seeding
+    needs a Drive-scoped token and a raw folder id, so it stays curl-first
+    while its siblings (ingest / ingest-folder / upload) are wired to the UI.
     """
     from aegis.services.drive import ingest_drive_folder
 
@@ -242,26 +246,12 @@ async def get_content_chunks(request: Request, content_id: str) -> list[dict[str
     return await connector.get_content_chunks(content_id)
 
 
-@router.get("/jobs")
-async def list_jobs(
-    request: Request,
-    limit: int = Query(20, ge=1, le=100),
-) -> list[dict[str, Any]]:
-    """Recent ingestion jobs."""
-    connector = _get_connector(request)
-    return await connector.get_recent_jobs(limit=limit)
-
-
-@router.get("/jobs/{content_id}")
-async def get_job_status(request: Request, content_id: str) -> dict[str, Any]:
-    """Ingestion job status for a content item."""
-    connector = _get_connector(request)
-    return await connector.get_content_status(content_id)
-
-
 @router.get("/health")
 async def knowledge_health(request: Request) -> dict[str, Any]:
-    """Aggregated knowledge health metrics."""
+    """Aggregated knowledge health metrics.
+
+    This endpoint is intentionally curl/ops-only, no UI consumer.
+    """
     pool = request.app.state.db_pool
     connector = getattr(request.app.state, "knowledge_connector", None)
 

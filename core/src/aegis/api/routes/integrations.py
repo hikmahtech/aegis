@@ -24,7 +24,13 @@ router = APIRouter(prefix="/api/admin/integrations", dependencies=[Depends(verif
 async def notification_budget(
     request: Request, settings: Settings = Depends(get_settings)
 ) -> dict[str, Any]:
-    """Today's proactive-notification count vs the daily budget (Phase 5)."""
+    """Today's proactive-notification count vs the daily budget (Phase 5).
+
+    The debugging surface for "why was my notification suppressed" — it is the
+    only way to see `deferred_today` without querying `notification_log` by hand.
+
+    This endpoint is intentionally curl/ops-only, no UI consumer.
+    """
     from aegis.services.notifications import budget_status
 
     return await budget_status(

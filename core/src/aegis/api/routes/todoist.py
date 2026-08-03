@@ -297,20 +297,6 @@ async def list_clarify_log(
     return [dict(r) for r in rows]
 
 
-@router.get("/clarify-log/{log_id}")
-async def get_clarify_log_detail(log_id: int, request: Request) -> dict[str, Any]:
-    """Single clarify decision, all columns, joined to task content."""
-    pool = request.app.state.db_pool
-    row = await pool.fetchrow(
-        "SELECT l.*, t.content AS task_content FROM gtd_clarify_log l "
-        "LEFT JOIN todoist_tasks t ON t.id = l.todoist_task_id WHERE l.id = $1",
-        log_id,
-    )
-    if not row:
-        raise HTTPException(status_code=404, detail="Clarify log entry not found")
-    return dict(row)
-
-
 @router.post("/tasks/{task_id}/reclarify")
 async def reclarify_task(task_id: str, request: Request) -> dict[str, Any]:
     """Null out last_clarified_at so the next ClarifyFlow run reclassifies this task."""
