@@ -53,6 +53,9 @@ class _FakeGmailService:
         # `labelIds: ["Label_forwarded_acme"]` on a message and
         # supplying a matching label dict.
         self._labels = labels or []
+        # Verbatim kwargs of every messages().modify() call, so a test can
+        # assert the wire payload rather than merely that a call happened.
+        self.modify_calls: list[dict] = []
 
     def users(self):
         return self
@@ -74,6 +77,7 @@ class _FakeGmailService:
         return _FakeGmailRequest(match or {}, self._raise_auth)
 
     def modify(self, **kwargs):
+        self.modify_calls.append(kwargs)
         return _FakeGmailRequest({"id": kwargs.get("id", "")}, self._raise_auth)
 
 
@@ -288,6 +292,54 @@ async def test_apply_label_ok(gmail, monkeypatch):
     env = ActivityEnvironment()
     result = await env.run(gmail.apply_label, "sebas", "msg-1", "READ")
     assert result["ok"] is True
+
+
+@pytest.mark.asyncio
+async def test_apply_label_read_verdict_strips_important(gmail, monkeypatch):
+    """(#102) "READ" is AEGIS's useless/informational verdict, and it must
+    remove Gmail's delivery-time IMPORTANT in the SAME modify call.
+
+    Leaving it on is what made the correction signal fake: at recheck,
+    assess_triage_correction reads IMPORTANT as "the user elevated this", so
+    every auto-IMPORTANT marketing mail we correctly called useless logged a
+    "user correction" nobody made. Asserts the literal wire payload — the
+    thing Gmail actually receives — not that a mock was called.
+    """
+    fake_service = _FakeGmailService([{"id": "msg-1"}])
+    monkeypatch.setattr(
+        "aegis_worker.activities.gmail._build_gmail_service",
+        lambda *a, **k: fake_service,
+    )
+    result = await ActivityEnvironment().run(gmail.apply_label, "sebas", "msg-1", "READ")
+    assert result["ok"] is True
+    assert fake_service.modify_calls == [
+        {
+            "userId": "me",
+            "id": "msg-1",
+            "body": {"removeLabelIds": ["UNREAD", "IMPORTANT"]},
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_apply_label_other_verdicts_unchanged(gmail, monkeypatch):
+    """(#102) The IMPORTANT strip is scoped to the "READ" verdict only —
+    ARCHIVE must not start removing it, and the important_* tiers must still
+    ADD it. Guards against a blanket "always drop IMPORTANT" regression, which
+    would silently disarm the important side of the feedback loop.
+    """
+    fake_service = _FakeGmailService([{"id": "msg-2"}])
+    monkeypatch.setattr(
+        "aegis_worker.activities.gmail._build_gmail_service",
+        lambda *a, **k: fake_service,
+    )
+    env = ActivityEnvironment()
+    await env.run(gmail.apply_label, "sebas", "msg-2", "ARCHIVE")
+    await env.run(gmail.apply_label, "sebas", "msg-2", "IMPORTANT")
+    assert [c["body"] for c in fake_service.modify_calls] == [
+        {"removeLabelIds": ["INBOX"]},
+        {"addLabelIds": ["IMPORTANT"]},
+    ]
 
 
 @pytest.mark.asyncio

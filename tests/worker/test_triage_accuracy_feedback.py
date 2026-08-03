@@ -114,10 +114,20 @@ async def test_record_triage_outcome_no_pool_is_noop():
 class _FakeGmail:
     """Just enough of the googleapiclient chain for messages().get().execute()."""
 
-    def __init__(self, labels_by_id: dict, subjects_by_id: dict | None = None):
+    def __init__(
+        self,
+        labels_by_id: dict,
+        subjects_by_id: dict | None = None,
+        senders_by_id: dict | None = None,
+    ):
         self._labels = labels_by_id
         self._subjects = subjects_by_id or {}
+        self._senders = senders_by_id or {}
         self._current = ""
+        # (#102) Records the metadataHeaders each get() asked for, so a test
+        # can prove the From header is actually requested — a header the API
+        # is never asked for comes back empty no matter what the fake holds.
+        self.requested_headers: list[list[str]] = []
 
     def users(self):
         return self
@@ -133,14 +143,20 @@ class _FakeGmail:
         metadataHeaders: list[str] | None = None,  # noqa: N803 — API shape
     ):
         self._current = id
+        self.requested_headers.append(list(metadataHeaders or []))
         return self
 
     def execute(self):
         labels = self._labels.get(self._current)
         if labels is None:
             raise RuntimeError("404 not found")
-        subject = self._subjects.get(self._current, "")
-        return {"labelIds": labels, "payload": {"headers": [{"name": "Subject", "value": subject}]}}
+        requested = set(self.requested_headers[-1]) if self.requested_headers else set()
+        headers = []
+        if "Subject" in requested:
+            headers.append({"name": "Subject", "value": self._subjects.get(self._current, "")})
+        if "From" in requested:
+            headers.append({"name": "From", "value": self._senders.get(self._current, "")})
+        return {"labelIds": labels, "payload": {"headers": headers}}
 
 
 async def _seed_prediction(db_pool, email_id, predicted, age, checked_age=None):
@@ -160,6 +176,7 @@ async def _wipe(db_pool):
     await db_pool.execute(
         "DELETE FROM agent_memory WHERE agent_id='sebas' AND content LIKE '%[gmail:E_RC%'"
     )
+    await db_pool.execute("DELETE FROM triage_state WHERE email_addr LIKE 'zz102-%'")
 
 
 async def test_recheck_corrects_from_current_labels(db_pool, monkeypatch):
@@ -169,12 +186,20 @@ async def test_recheck_corrects_from_current_labels(db_pool, monkeypatch):
         gmail_mod,
         "_build_gmail_service",
         lambda *a: _FakeGmail(
-            {"E_RC1": ["INBOX", "STARRED"]}, {"E_RC1": "You've been added to a board"}
+            {"E_RC1": ["INBOX", "STARRED"]},
+            {"E_RC1": "You've been added to a board"},
+            {"E_RC1": "Board Bot <zz102-board@example.com>"},
         ),
     )
     act = GmailActivities(gmail_credentials_file="x", gmail_token_dir="x", db_pool=db_pool)
     res = await ActivityEnvironment().run(act.recheck_triage_outcomes, "acct")
-    assert res == {"checked": 1, "corrected": 1, "confirmed": 0, "memories_written": 1}
+    assert res == {
+        "checked": 1,
+        "corrected": 1,
+        "confirmed": 0,
+        "memories_written": 1,
+        "senders_relearned": 1,
+    }
     row = await db_pool.fetchrow(
         "SELECT actual, corrected_by, last_checked_at FROM triage_accuracy "
         "WHERE email_id='E_RC1'"
@@ -193,7 +218,13 @@ async def test_recheck_consistent_stamps_only(db_pool, monkeypatch):
     )
     act = GmailActivities(gmail_credentials_file="x", gmail_token_dir="x", db_pool=db_pool)
     res = await ActivityEnvironment().run(act.recheck_triage_outcomes, "acct")
-    assert res == {"checked": 1, "corrected": 0, "confirmed": 0, "memories_written": 0}
+    assert res == {
+        "checked": 1,
+        "corrected": 0,
+        "confirmed": 0,
+        "memories_written": 0,
+        "senders_relearned": 0,
+    }
     row = await db_pool.fetchrow(
         "SELECT actual, last_checked_at FROM triage_accuracy WHERE email_id='E_RC2'"
     )
@@ -211,7 +242,13 @@ async def test_recheck_implicit_confirms_checked_and_never_checked_rows(db_pool)
     await _seed_prediction(db_pool, "E_RC4", "useless", "8 days")  # never checked
     act = GmailActivities(gmail_credentials_file="x", gmail_token_dir="x", db_pool=db_pool)
     res = await ActivityEnvironment().run(act.recheck_triage_outcomes, "acct")
-    assert res == {"checked": 0, "corrected": 0, "confirmed": 2, "memories_written": 0}
+    assert res == {
+        "checked": 0,
+        "corrected": 0,
+        "confirmed": 2,
+        "memories_written": 0,
+        "senders_relearned": 0,
+    }
     rows = {
         r["email_id"]: r
         for r in await db_pool.fetch(
@@ -236,7 +273,13 @@ async def test_recheck_unobservable_message_stamps_last_checked_at(db_pool, monk
     monkeypatch.setattr(gmail_mod, "_build_gmail_service", lambda *a: _FakeGmail({}))
     act = GmailActivities(gmail_credentials_file="x", gmail_token_dir="x", db_pool=db_pool)
     res = await ActivityEnvironment().run(act.recheck_triage_outcomes, "acct")
-    assert res == {"checked": 0, "corrected": 0, "confirmed": 0, "memories_written": 0}
+    assert res == {
+        "checked": 0,
+        "corrected": 0,
+        "confirmed": 0,
+        "memories_written": 0,
+        "senders_relearned": 0,
+    }
     row = await db_pool.fetchrow(
         "SELECT actual, last_checked_at FROM triage_accuracy WHERE email_id='E_RC5'"
     )
@@ -255,7 +298,13 @@ async def test_recheck_service_down_never_raises(db_pool, monkeypatch):
     monkeypatch.setattr(gmail_mod, "_build_gmail_service", _boom)
     act = GmailActivities(gmail_credentials_file="x", gmail_token_dir="x", db_pool=db_pool)
     res = await ActivityEnvironment().run(act.recheck_triage_outcomes, "acct")
-    assert res == {"checked": 0, "corrected": 0, "confirmed": 0, "memories_written": 0}
+    assert res == {
+        "checked": 0,
+        "corrected": 0,
+        "confirmed": 0,
+        "memories_written": 0,
+        "senders_relearned": 0,
+    }
     await _wipe(db_pool)
 
 
@@ -301,4 +350,175 @@ async def test_recheck_correction_writes_agent_memory_once(db_pool, monkeypatch)
         "SELECT id FROM agent_memory WHERE agent_id='sebas' AND content LIKE '%[gmail:E_RC7]%'"
     )
     assert len(rows_after) == 1
+    await _wipe(db_pool)
+
+
+# ----- (#102) the correction signal must be genuine, and must teach ----------
+
+
+class _StatefulFakeGmail:
+    """A fake whose messages().modify() actually mutates the stored label set,
+    so a test can chain the real `apply_label` into the real
+    `assess_triage_correction` over one message — the exact production chain
+    that manufactured the phantom corrections."""
+
+    def __init__(self, labels: list[str]):
+        self.labels = list(labels)
+
+    def users(self):
+        return self
+
+    def messages(self):
+        return self
+
+    def modify(
+        self,
+        userId: str,  # noqa: N803 — API shape
+        id: str,  # noqa: A002 — API shape
+        body: dict,
+    ):
+        for lid in body.get("removeLabelIds") or []:
+            if lid in self.labels:
+                self.labels.remove(lid)
+        for lid in body.get("addLabelIds") or []:
+            if lid not in self.labels:
+                self.labels.append(lid)
+        return self
+
+    def execute(self):
+        return {"id": "M1"}
+
+
+@pytest.mark.asyncio
+async def test_auto_important_no_longer_reads_as_a_user_correction(monkeypatch):
+    """(#102) Gmail auto-applies IMPORTANT at delivery. Before this fix the
+    useless/informational verdict removed only UNREAD, so that marker survived
+    and the recheck loop read it as "the user elevated this" — which is why
+    prod recorded 75 corrections, ALL unimportant→important and none the other
+    way, over subject lines like "Skip the scrolling. Watch this instead."
+    (logged twice, once per duplicate campaign send).
+
+    Asserted in three independent steps so none can mask another: the
+    delivered state really is the polluting one, the verdict really strips
+    IMPORTANT on the wire, and only then that assess sees no correction.
+    """
+    delivered = ["INBOX", "UNREAD", "IMPORTANT", "CATEGORY_PROMOTIONS"]
+    # 1. Baseline — this label set is exactly what used to be misread.
+    assert assess_triage_correction("useless", delivered) == "important"
+
+    svc = _StatefulFakeGmail(delivered)
+    monkeypatch.setattr(gmail_mod, "_build_gmail_service", lambda *a: svc)
+    act = GmailActivities(gmail_credentials_file="x", gmail_token_dir="x")
+    res = await ActivityEnvironment().run(act.apply_label, "acct", "M1", "READ")
+    assert res["ok"] is True
+
+    # 2. The verdict removed IMPORTANT (and UNREAD) and nothing else.
+    assert svc.labels == ["INBOX", "CATEGORY_PROMOTIONS"]
+    # 3. With no human involved, there is now no correction to record.
+    assert assess_triage_correction("useless", svc.labels) is None
+    # ...but a human who re-elevates it still registers — the signal is
+    # narrowed to real input, not switched off.
+    assert assess_triage_correction("useless", [*svc.labels, "IMPORTANT"]) == "important"
+
+
+def _meta_of(row) -> dict:
+    """Decode a triage_state metadata cell without going through the module
+    under test."""
+    import json
+
+    meta = row["metadata"]
+    return json.loads(meta) if isinstance(meta, str) else dict(meta)
+
+
+@pytest.mark.asyncio
+async def test_correction_relearns_sender_and_flips_a_poisoned_cache(db_pool, monkeypatch):
+    """(#102) Corrections used to be write-only: recorded in triage_accuracy
+    and agent_memory, never fed back into `triage_state`. Because the classify
+    cascade short-circuits the LLM entirely at n>=3/conf>=0.75, a sender cached
+    wrong (e.g. seeded 'useless' by the gmail_promo shortcut) stayed wrong
+    forever — no amount of user correction could reach it.
+
+    Walks the disagreement arithmetic _triage_upsert already owns:
+    conf 0.9 -> 0.6 -> (<=0.3) flip.
+    """
+    await _wipe(db_pool)
+    sender = "zz102-promo@example.com"
+    await db_pool.execute(
+        "INSERT INTO triage_state (email_addr, state, metadata, updated_at) "
+        "VALUES ($1, 'useless', $2, now())",
+        sender,
+        {"n": 5, "confidence": 0.9, "category": "useless"},
+    )
+    # No llm_client on purpose: a cache MISS falls through to source='fallback',
+    # so 'cache' below cannot be an accident of the default return shape.
+    act = GmailActivities(gmail_credentials_file="x", gmail_token_dir="x", db_pool=db_pool)
+
+    before = await ActivityEnvironment().run(
+        act.classify_email, {"id": "M0", "sender": f"Promo <{sender}>", "labels": []}, ""
+    )
+    assert (before["source"], before["category"]) == ("cache", "useless")
+
+    async def _correct(email_id: str) -> dict:
+        await _seed_prediction(db_pool, email_id, "useless", "2 hours")
+        monkeypatch.setattr(
+            gmail_mod,
+            "_build_gmail_service",
+            lambda *a, _id=email_id: _FakeGmail(
+                {_id: ["INBOX", "STARRED"]},
+                {_id: "Re: contract"},
+                {_id: f"Promo <{sender}>"},
+            ),
+        )
+        return await ActivityEnvironment().run(act.recheck_triage_outcomes, "acct")
+
+    res1 = await _correct("E_RC10")
+    assert (res1["corrected"], res1["senders_relearned"]) == (1, 1)
+    row = await db_pool.fetchrow(
+        "SELECT state, metadata FROM triage_state WHERE email_addr=$1", sender
+    )
+    # One disagreement: confidence drops 0.3, category not yet flipped.
+    assert (row["state"], _meta_of(row)["confidence"]) == ("useless", 0.6)
+
+    res2 = await _correct("E_RC11")
+    assert (res2["corrected"], res2["senders_relearned"]) == (1, 1)
+    row = await db_pool.fetchrow(
+        "SELECT state, metadata FROM triage_state WHERE email_addr=$1", sender
+    )
+    # Second disagreement bottoms out (0.6 - 0.3 <= 0.3) and flips the cached
+    # verdict to the conservative important tier, reset to 0.6.
+    assert (row["state"], _meta_of(row)["confidence"]) == ("important_read", 0.6)
+
+    # And the poisoned short-circuit is gone: the sender no longer forces
+    # 'useless' without the LLM ever being consulted.
+    after = await ActivityEnvironment().run(
+        act.classify_email, {"id": "M9", "sender": f"Promo <{sender}>", "labels": []}, ""
+    )
+    assert after["source"] != "cache"
+    await _wipe(db_pool)
+
+
+@pytest.mark.asyncio
+async def test_recheck_requests_the_from_header_it_relearns_on(db_pool, monkeypatch):
+    """(#102) triage_accuracy stores no sender, so the relearn step depends on
+    From being added to the metadataHeaders of the recheck fetch. A header the
+    Gmail API is never asked for comes back empty regardless of what the
+    mailbox holds, silently turning the relearn into a no-op — assert the
+    request, not just the outcome."""
+    await _wipe(db_pool)
+    await _seed_prediction(db_pool, "E_RC12", "useless", "2 hours")
+    fake = _FakeGmail(
+        {"E_RC12": ["INBOX", "STARRED"]},
+        {"E_RC12": "Re: invoice"},
+        {"E_RC12": "Acct <zz102-acct@example.com>"},
+    )
+    monkeypatch.setattr(gmail_mod, "_build_gmail_service", lambda *a: fake)
+    act = GmailActivities(gmail_credentials_file="x", gmail_token_dir="x", db_pool=db_pool)
+    res = await ActivityEnvironment().run(act.recheck_triage_outcomes, "acct")
+    assert fake.requested_headers == [["Subject", "From"]]
+    assert res["senders_relearned"] == 1
+    row = await db_pool.fetchrow(
+        "SELECT state FROM triage_state WHERE email_addr='zz102-acct@example.com'"
+    )
+    assert row is not None, "correction must create the sender's triage_state row"
+    assert row["state"] == "important_read"
     await _wipe(db_pool)
