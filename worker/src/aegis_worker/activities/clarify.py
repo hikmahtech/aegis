@@ -924,7 +924,15 @@ class ClarifyActivities:
         # {response, model, prompt_tokens, completion_tokens} — extract
         # the raw text from .response. Unit tests mocked think() to
         # return a bare string, so accept both shapes defensively.
-        primary_result = await self.llm_client.think(prompt, model=self.primary_model)
+        # db_pool + purpose ⇒ think() writes the llm_calls row (issue #106).
+        # The per-task token counts still ride into `clarify_decisions` below;
+        # that is a different table and not a duplicate of the spend row.
+        primary_result = await self.llm_client.think(
+            prompt,
+            model=self.primary_model,
+            db_pool=self.db_pool,
+            purpose="clarify_classification",
+        )
         primary, primary_pt, primary_ct = self._unpack_think_result(primary_result)
         primary_conf = float(primary.get("confidence") or 0.0)
         best = {

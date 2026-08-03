@@ -24,7 +24,6 @@ success as well as failure.
 
 from __future__ import annotations
 
-import time
 from dataclasses import dataclass
 from typing import Any
 
@@ -32,7 +31,7 @@ import structlog
 
 from aegis.llm import LLMTruncationError, parse_llm_json
 from aegis.llm.tier import tier_to_model
-from aegis.observability import log_audit, record_llm_call
+from aegis.observability import log_audit
 
 logger = structlog.get_logger()
 
@@ -170,7 +169,9 @@ async def _classify(*, pool: Any, llm: Any, text: str) -> Classification:
     except KeyError:
         return Classification(SAFE_LANE, "unknown", 0.0, "tier_unresolved")
 
-    t0 = time.monotonic()
+    # think() writes the llm_calls row for every outcome (success, truncation,
+    # failure) because db_pool + purpose are passed — see LLMClient._record_call.
+    # Nothing here may record again: a second row inflates reported spend.
     try:
         result = await llm.think(
             prompt=_PROMPT.format(text=text[:2000]),
@@ -181,26 +182,11 @@ async def _classify(*, pool: Any, llm: Any, text: str) -> Classification:
             purpose=PURPOSE,
         )
     except LLMTruncationError as exc:
-        # think() raises this AFTER a successful HTTP call, outside its own
-        # failure-recording try — so nothing lands in llm_calls unless we do
-        # it here, and a truncating model would look like zero traffic.
         logger.warning("capture_classify_truncated", error=str(exc)[:200])
-        if pool is not None:
-            await record_llm_call(
-                pool,
-                model=model,
-                prompt_tokens=0,
-                completion_tokens=0,
-                latency_ms=int((time.monotonic() - t0) * 1000),
-                purpose=PURPOSE,
-                status="error",
-                error=f"truncated: {exc}"[:500],
-            )
         return Classification(SAFE_LANE, "unknown", 0.0, "llm_truncated")
     except Exception as exc:  # noqa: BLE001 — capture must survive any LLM fault
-        # think() already wrote the llm_calls failure row (db_pool + purpose
-        # were passed); the kill-switch path raises before any row, which the
-        # audit row still records.
+        # The kill-switch path raises before any row, which the audit row
+        # still records.
         logger.warning(
             "capture_classify_failed",
             error=str(exc)[:200],
@@ -208,16 +194,6 @@ async def _classify(*, pool: Any, llm: Any, text: str) -> Classification:
         )
         return Classification(
             SAFE_LANE, "unknown", 0.0, f"llm_error:{type(exc).__name__}"
-        )
-
-    if pool is not None:
-        await record_llm_call(
-            pool,
-            model=result.get("model", model),
-            prompt_tokens=result.get("prompt_tokens", 0),
-            completion_tokens=result.get("completion_tokens", 0),
-            latency_ms=int((time.monotonic() - t0) * 1000),
-            purpose=PURPOSE,
         )
 
     parsed = parse_llm_json(result.get("response", ""))

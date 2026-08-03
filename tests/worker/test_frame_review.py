@@ -4,6 +4,8 @@ from __future__ import annotations
 import pytest
 from aegis_worker.activities.review import ReviewActivities
 
+from tests.llm_stub import StubbedLLMClient
+
 SNAP = {
     "stale_next_actions_count": 0, "stale_next_actions_top3": [],
     "someday_count": 1, "waiting_stale_7d_count": 1, "waiting_stale_top": [],
@@ -40,7 +42,7 @@ async def test_frame_review_fallback_when_no_llm():
 @pytest.mark.asyncio
 async def test_frame_review_uses_llm_order_and_narrative():
     class _LLM:
-        async def think(self, prompt, model=None):
+        async def think(self, prompt, model=None, **kwargs):
             return {"response": '{"narrative":"Focus week.","order":["slipping:T_S"]}'}
     acts = ReviewActivities(db_pool=None, llm_client=_LLM())
     out = await acts.frame_review(SNAP)
@@ -53,9 +55,60 @@ async def test_frame_review_uses_llm_order_and_narrative():
 @pytest.mark.asyncio
 async def test_frame_review_fallback_on_llm_error():
     class _LLM:
-        async def think(self, prompt, model=None):
+        async def think(self, prompt, model=None, **kwargs):
             raise RuntimeError("proxy timeout")
     acts = ReviewActivities(db_pool=None, llm_client=_LLM())
     out = await acts.frame_review(SNAP)
     assert "Weekly review" in out["narrative"]
     assert len(out["decisions"]) == 3
+
+
+@pytest.mark.asyncio
+async def test_frame_review_records_the_llm_call(db_pool):
+    """issue #106: the weekly review's narrative/ranking call wrote NO
+    llm_calls row — not even on failure — because it passed neither `db_pool`
+    nor `purpose`.
+
+    Real `LLMClient` (only the HTTP layer stubbed) against the real pool, row
+    read back: `record_llm_call` swallows its own errors, so a mock assertion
+    passes against a write that never landed.
+    """
+    await db_pool.execute("DELETE FROM llm_calls WHERE purpose = 'review_frame'")
+    llm = StubbedLLMClient(
+        db_pool=db_pool, content='{"narrative":"Focus week.","order":["slipping:T_S"]}'
+    )
+    acts = ReviewActivities(db_pool=db_pool, llm_client=llm)
+    try:
+        out = await acts.frame_review(SNAP)
+        assert out["narrative"] == "Focus week."
+
+        rows = await db_pool.fetch(
+            "SELECT status, agent_id, output_tokens FROM llm_calls "
+            "WHERE purpose = 'review_frame'"
+        )
+        assert len(rows) == 1, f"expected one review_frame row, got {len(rows)}"
+        assert rows[0]["status"] == "success"
+        assert rows[0]["agent_id"] == "sebas"
+        assert rows[0]["output_tokens"] == 22
+    finally:
+        await db_pool.execute("DELETE FROM llm_calls WHERE purpose = 'review_frame'")
+
+
+@pytest.mark.asyncio
+async def test_frame_review_records_a_failed_llm_call(db_pool):
+    """The deterministic fallback must not hide the failure too."""
+    await db_pool.execute("DELETE FROM llm_calls WHERE purpose = 'review_frame'")
+    llm = StubbedLLMClient(db_pool=db_pool, raises=RuntimeError("proxy timeout"))
+    acts = ReviewActivities(db_pool=db_pool, llm_client=llm)
+    try:
+        out = await acts.frame_review(SNAP)
+        assert "Weekly review" in out["narrative"]
+
+        rows = await db_pool.fetch(
+            "SELECT status, error FROM llm_calls WHERE purpose = 'review_frame'"
+        )
+        assert len(rows) == 1, f"expected one review_frame row, got {len(rows)}"
+        assert rows[0]["status"] == "timeout"
+        assert "proxy timeout" in (rows[0]["error"] or "")
+    finally:
+        await db_pool.execute("DELETE FROM llm_calls WHERE purpose = 'review_frame'")

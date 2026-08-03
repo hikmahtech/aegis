@@ -58,6 +58,10 @@ class ReviewActivities:
     llm_client: object | None = None
     frame_model: str = "gpt-oss:20b"
     todoist_connector: object | None = None
+    # Owning agent — matches the review flows' config default. Threaded into
+    # the `llm_calls` row for `frame_review` so the weekly review's LLM spend is
+    # attributable rather than NULL (same pattern as IntelligenceActivities).
+    agent_id: str = "sebas"
 
     @activity.defn
     async def gather_daily_digest(self) -> dict:
@@ -561,6 +565,9 @@ class ReviewActivities:
             result = await self.llm_client.think(
                 self._build_frame_prompt(snapshot, decisions),
                 model=self.frame_model,
+                db_pool=self.db_pool,
+                purpose="review_frame",
+                agent_id=self.agent_id,
             )
             raw = result.get("response", "") if isinstance(result, dict) else (result or "")
             parsed = parse_llm_json(raw) or {}

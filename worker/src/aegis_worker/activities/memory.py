@@ -41,7 +41,6 @@ The rails, in the order they fire:
 from __future__ import annotations
 
 import json
-import time
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -334,7 +333,6 @@ class MemoryActivities:
             return {**base, "status": "skipped", "reason": "no_llm_client"}
 
         from aegis.llm import parse_llm_json
-        from aegis.observability import record_llm_call
 
         payload = json.dumps(
             [
@@ -347,7 +345,8 @@ class MemoryActivities:
                 for m in memories
             ]
         )
-        started = time.monotonic()
+        # db_pool + purpose ⇒ think() writes the llm_calls row itself, for
+        # success and failure alike (LLMClient._record_call). Do not record here.
         try:
             result = await self.llm_client.think(
                 prompt=payload[:12000],
@@ -363,16 +362,6 @@ class MemoryActivities:
                 "memory_consolidation_llm_failed agent=%s err=%s", agent_id, str(exc)[:200]
             )
             return {**base, "status": "llm_failed", "error": str(exc)[:200]}
-
-        await record_llm_call(
-            self.db_pool,
-            model=result.get("model", self.model),
-            prompt_tokens=result.get("prompt_tokens", 0),
-            completion_tokens=result.get("completion_tokens", 0),
-            latency_ms=int((time.monotonic() - started) * 1000),
-            purpose="memory_consolidation",
-            agent_id=agent_id,
-        )
 
         parsed = parse_llm_json(result.get("response") or "")
         ops, skipped = _validate_ops(parsed, {m["id"] for m in memories})

@@ -21,6 +21,8 @@ from temporalio import activity
 from temporalio.testing import ActivityEnvironment, WorkflowEnvironment
 from temporalio.worker import Worker
 
+from tests.llm_stub import StubbedLLMClient
+
 # A date nothing else in the suite writes to.
 DAY = "2019-03-14"
 DAY_TS = datetime(2019, 3, 14, 10, 30, tzinfo=UTC)
@@ -315,36 +317,31 @@ async def test_distil_daylog_falls_back_when_the_llm_returns_empty():
 
 @pytest.mark.asyncio
 async def test_distil_daylog_logs_the_call_to_llm_calls(clean_db):
-    """Unlogged LLM call sites are a known open issue — this one must land."""
-    seen: dict = {}
+    """Unlogged LLM call sites are a known open issue — this one must land.
 
-    class _Ok:
-        async def think(self, **kwargs):
-            seen.update(kwargs)
-            return {
-                "response": "A calm Thursday.",
-                "model": "test-model",
-                "prompt_tokens": 11,
-                "completion_tokens": 7,
-            }
-
+    Driven through a real `LLMClient` (stubbed HTTP only) because the row is
+    written by `LLMClient._record_call`; a fake `think()` would record nothing
+    and the assertion would test the fake.
+    """
     await clean_db.execute("DELETE FROM llm_calls WHERE purpose = 'daylog_narrative'")
-    acts = DayLogActivities(db_pool=clean_db, llm_client=_Ok(), model="test-model")
+    llm = StubbedLLMClient(
+        db_pool=clean_db, content="A calm Thursday.", prompt_tokens=11, completion_tokens=7
+    )
+    acts = DayLogActivities(db_pool=clean_db, llm_client=llm, model="test-model")
     text = await ActivityEnvironment().run(acts.distil_daylog, _EVENTS, DAY, "raphael")
 
     assert text == "A calm Thursday."
-    # think() itself gets the pool + purpose so its OWN failure path records too.
-    assert seen["purpose"] == "daylog_narrative"
-    assert seen["db_pool"] is clean_db
-    row = await clean_db.fetchrow(
+    rows = await clean_db.fetch(
         "SELECT model, purpose, agent_id, input_tokens, output_tokens FROM llm_calls "
         "WHERE purpose = 'daylog_narrative'"
     )
-    assert row is not None, "successful daylog LLM call was not recorded in llm_calls"
-    assert row["model"] == "test-model"
-    assert row["agent_id"] == "raphael"
-    assert row["input_tokens"] == 11
-    assert row["output_tokens"] == 7
+    # Exactly one — a second row would mean the activity records on top of the
+    # choke point and inflates reported spend.
+    assert len(rows) == 1, f"expected one daylog llm_calls row, got {len(rows)}"
+    assert rows[0]["model"] == "test-model"
+    assert rows[0]["agent_id"] == "raphael"
+    assert rows[0]["input_tokens"] == 11
+    assert rows[0]["output_tokens"] == 7
     await clean_db.execute("DELETE FROM llm_calls WHERE purpose = 'daylog_narrative'")
 
 
@@ -663,33 +660,22 @@ async def test_distil_rollup_llm_failure_degrades_to_the_concatenation():
 
 @pytest.mark.asyncio
 async def test_distil_rollup_records_the_llm_call(clean_db):
-    seen: dict = {}
-
-    class _Ok:
-        async def think(self, **kwargs):
-            seen.update(kwargs)
-            return {
-                "response": "A busy week.",
-                "model": "test-model",
-                "prompt_tokens": 21,
-                "completion_tokens": 9,
-            }
-
     await clean_db.execute("DELETE FROM llm_calls WHERE purpose = 'daylog_rollup'")
-    acts = DayLogActivities(db_pool=clean_db, llm_client=_Ok(), model="test-model")
+    llm = StubbedLLMClient(
+        db_pool=clean_db, content="A busy week.", prompt_tokens=21, completion_tokens=9
+    )
+    acts = DayLogActivities(db_pool=clean_db, llm_client=llm, model="test-model")
     entries = [{"date": "2019-03-11", "text": "a"}, {"date": "2019-03-12", "text": "b"}]
     text = await ActivityEnvironment().run(acts.distil_rollup, entries, "weekly", "2019-W11")
 
     assert text == "A busy week."
-    assert seen["purpose"] == "daylog_rollup"
-    assert seen["db_pool"] is clean_db
-    row = await clean_db.fetchrow(
+    rows = await clean_db.fetch(
         "SELECT model, purpose, input_tokens, output_tokens FROM llm_calls "
         "WHERE purpose = 'daylog_rollup'"
     )
-    assert row is not None, "successful rollup LLM call was not recorded in llm_calls"
-    assert row["input_tokens"] == 21
-    assert row["output_tokens"] == 9
+    assert len(rows) == 1, f"expected one rollup llm_calls row, got {len(rows)}"
+    assert rows[0]["input_tokens"] == 21
+    assert rows[0]["output_tokens"] == 9
     await clean_db.execute("DELETE FROM llm_calls WHERE purpose = 'daylog_rollup'")
 
 

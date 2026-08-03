@@ -315,6 +315,18 @@ The `activities` table drives Temporal schedules. Worker on startup queries acti
 | `chat_tool_calls` | Every tool call during a chat turn |
 | `workflow_runs` | Temporal workflow start / complete / fail via `WorkflowRunRecorderInterceptor` |
 
+`llm_calls` rows come from **one choke point**, `LLMClient._record_call` (issue #106):
+`think()`/`chat()` record every terminal outcome — success, `LLMTruncationError`, upstream
+failure — for any call that names a `purpose`. The pool is the client's own unless the caller
+passes `db_pool=`, so a client constructed with a pool records by construction while a client
+built without one (`routes/llm_backend.py::test_backend`) stays deliberately ungoverned. The
+kill switch produces no row on purpose: it raises before any HTTP request, so nothing was
+spent. **A call site must never call `record_llm_call` itself after `think()`/`chat()`** — the
+second row inflates reported spend and nothing errors anywhere. Passing `db_pool=` without a
+`purpose` logs `llm_call_unrecorded` at WARNING rather than silently skipping the write. The
+one remaining explicit recorder is `services/chat.py`'s tool loop, which passes neither
+argument and so is not double-counted.
+
 Distributed tracing: OTel SDK + JSON-formatted logs with `trace_id`/`span_id` injected from the active span. Per-package `telemetry.py` + `logging_config.py` modules. Gated on `OTEL_ENABLED=true`. Auto-instrumentation covers FastAPI, asyncpg, httpx, requests. The Worker registers `temporalio.contrib.opentelemetry.TracingInterceptor` so trace context flows through workflow headers automatically.
 
 ## Knowledge (native RAG)

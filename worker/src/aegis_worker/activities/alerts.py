@@ -6,7 +6,6 @@ import asyncio
 import contextlib
 import json
 import re
-import time
 from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime
@@ -14,7 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from aegis.llm import parse_llm_json
-from aegis.observability import log_audit, record_llm_call
+from aegis.observability import log_audit
 from aegis.security import SPOTLIGHT_INSTRUCTION, assess_rule_of_two, spotlight
 from temporalio import activity
 
@@ -1020,7 +1019,6 @@ class AlertActivities:
         if not self.llm_client:
             return {"investigation": "LLM not available", "actionable": True, "auto_fixable": False}
 
-        start = time.monotonic()
         result = await self.llm_client.think(
             prompt,
             # Balanced (gpt-oss), not model_light (gemma4:e2b): this is the
@@ -1030,14 +1028,7 @@ class AlertActivities:
             model=self.model_balanced,
             system_prompt=agent_system_prompt
             or "You are a site reliability engineer investigating production alerts.",
-        )
-        latency_ms = int((time.monotonic() - start) * 1000)
-        await record_llm_call(
-            self.db_pool,
-            model=result.get("model", self.model_balanced),
-            prompt_tokens=result.get("prompt_tokens", 0),
-            completion_tokens=result.get("completion_tokens", 0),
-            latency_ms=latency_ms,
+            db_pool=self.db_pool,
             purpose="alert_investigation",
             agent_id=alert.get("agent_id"),
         )
@@ -1508,7 +1499,6 @@ class AlertActivities:
             "Return an empty list if nothing matches."
         )
 
-        start = time.monotonic()
         llm_result = await self.llm_client.think(
             prompt,
             # Balanced (gpt-oss), not model_light (gemma4:e2b): picking the right
@@ -1517,14 +1507,7 @@ class AlertActivities:
             # fallback.
             model=self.model_balanced,
             system_prompt="You are a site reliability engineer mapping alerts to repositories.",
-        )
-        latency_ms = int((time.monotonic() - start) * 1000)
-        await record_llm_call(
-            self.db_pool,
-            model=llm_result.get("model", self.model_balanced),
-            prompt_tokens=llm_result.get("prompt_tokens", 0),
-            completion_tokens=llm_result.get("completion_tokens", 0),
-            latency_ms=latency_ms,
+            db_pool=self.db_pool,
             purpose="alert_resource_resolution",
             agent_id=alert.get("agent_id"),
         )
@@ -2161,22 +2144,11 @@ class AlertActivities:
                 '"confidence": <0.0-1.0>}'
             )
 
-        start = time.monotonic()
         result = await self.llm_client.think(
             prompt,
             model=self.model_balanced,
             system_prompt="You are a site reliability engineer assessing alert investigations.",
             db_pool=self.db_pool,
-            purpose="alert_assessment",
-            agent_id=alert.get("agent_id"),
-        )
-        latency_ms = int((time.monotonic() - start) * 1000)
-        await record_llm_call(
-            self.db_pool,
-            model=result.get("model", self.model_balanced),
-            prompt_tokens=result.get("prompt_tokens", 0),
-            completion_tokens=result.get("completion_tokens", 0),
-            latency_ms=latency_ms,
             purpose="alert_assessment",
             agent_id=alert.get("agent_id"),
         )

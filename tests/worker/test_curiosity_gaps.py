@@ -15,6 +15,8 @@ import pytest_asyncio
 from aegis_worker.activities.curiosity import CuriosityActivities
 from temporalio.testing import ActivityEnvironment
 
+from tests.llm_stub import StubbedLLMClient
+
 AGENT = "sebas"
 
 
@@ -456,27 +458,30 @@ async def test_llm_failure_degrades_to_template(clean_db):
 
 
 async def test_llm_rephrases_and_logs_the_call(clean_db):
+    """Real `LLMClient`, stubbed HTTP: the llm_calls row comes from
+    `LLMClient._record_call` (issue #106), so a fake `think()` would leave
+    nothing to assert on."""
     await _add_charge(clean_db, "Framer")
-    llm = _FakeLLM(response='[{"index": 0, "question": "What do you use Framer for?"}]')
+    llm = StubbedLLMClient(
+        db_pool=clean_db,
+        content='[{"index": 0, "question": "What do you use Framer for?"}]',
+        prompt_tokens=11,
+        completion_tokens=7,
+    )
 
-    out = await _run(clean_db, llm_client=llm)
+    out = await _run(clean_db, llm_client=llm, model="fake-model")
 
     assert out[0]["question"] == "What do you use Framer for?"
-    # Unlogged LLM call sites are a known open issue — this one must land in
-    # llm_calls with a purpose, and think() must be given db_pool for its own
-    # failure rows.
-    assert llm.calls[0]["purpose"] == "curiosity_phrasing"
-    assert llm.calls[0]["db_pool"] is clean_db
-    assert llm.calls[0]["agent_id"] == AGENT
-    row = await clean_db.fetchrow(
+    rows = await clean_db.fetch(
         "SELECT model, purpose, agent_id, input_tokens, output_tokens FROM llm_calls "
-        "WHERE purpose = 'curiosity_phrasing' ORDER BY created_at DESC LIMIT 1"
+        "WHERE purpose = 'curiosity_phrasing'"
     )
-    assert row is not None, "no llm_calls row recorded"
-    assert row["model"] == "fake-model"
-    assert row["agent_id"] == AGENT
-    assert row["input_tokens"] == 11
-    assert row["output_tokens"] == 7
+    # Exactly one — two rows would double-count this call's spend.
+    assert len(rows) == 1, f"expected one curiosity_phrasing row, got {len(rows)}"
+    assert rows[0]["model"] == "fake-model"
+    assert rows[0]["agent_id"] == AGENT
+    assert rows[0]["input_tokens"] == 11
+    assert rows[0]["output_tokens"] == 7
     await clean_db.execute("DELETE FROM llm_calls WHERE purpose = 'curiosity_phrasing'")
 
 

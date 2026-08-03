@@ -33,7 +33,6 @@ owner's reply as durable memory).
 from __future__ import annotations
 
 import re
-import time
 from dataclasses import dataclass
 from typing import Any
 
@@ -283,13 +282,13 @@ class CuriosityActivities:
             return candidates
 
         from aegis.llm import parse_llm_json
-        from aegis.observability import record_llm_call
 
         listing = "\n".join(
             f"{i}. [{c['gap_type']}] {c['subject']} — {c['question']}"
             for i, c in enumerate(candidates)
         )
-        _t0 = time.monotonic()
+        # db_pool + purpose ⇒ think() writes the llm_calls row itself, for
+        # success and failure alike (LLMClient._record_call). Do not record here.
         try:
             result = await self.llm_client.think(
                 prompt=listing,
@@ -308,16 +307,6 @@ class CuriosityActivities:
         except Exception as exc:  # noqa: BLE001 — degrade to the template, never crash
             activity.logger.warning("curiosity_phrasing_failed err=%s", str(exc)[:200])
             return candidates
-
-        await record_llm_call(
-            self.db_pool,
-            model=result.get("model", self.model),
-            prompt_tokens=result.get("prompt_tokens", 0),
-            completion_tokens=result.get("completion_tokens", 0),
-            latency_ms=int((time.monotonic() - _t0) * 1000),
-            purpose="curiosity_phrasing",
-            agent_id=agent_id,
-        )
 
         try:
             parsed = parse_llm_json(result.get("response", ""))

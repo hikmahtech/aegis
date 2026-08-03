@@ -16,6 +16,8 @@ from aegis.config import Settings
 from aegis.db import run_migrations
 from httpx import ASGITransport, AsyncClient
 
+from tests.llm_stub import StubbedLLMClient
+
 _SETTINGS = {
     "database_url": "postgresql://test:test@localhost:5432/test",
     "litellm_url": "https://litellm.example.com/v1",
@@ -137,6 +139,32 @@ async def test_suggest_returns_pattern(app_client):
     body = r.json()
     assert body["pattern"] == r"^APP-\d+:"
     assert body["all_examples_match"] is True
+
+
+async def test_suggest_records_the_llm_call(app_client, routes_pool):
+    """issue #106: this admin ad-hoc route passed a `purpose` but no pool, so
+    not even a failure could reach `llm_calls`. Real `LLMClient` (stubbed HTTP)
+    against the real pool, row read back — `record_llm_call` swallows its own
+    errors, so a mock would pass against a write that never landed."""
+    client, app = app_client
+    app.state.llm = StubbedLLMClient(db_pool=routes_pool, content='{"pattern": "^APP-"}')
+    await routes_pool.execute("DELETE FROM llm_calls WHERE purpose = 'content_route_suggest'")
+    try:
+        r = await client.post(
+            "/api/admin/todoist/content-routes/suggest",
+            auth=AUTH,
+            json={"examples": ["APP-1: x"]},
+        )
+        assert r.status_code == 200, r.text
+        rows = await routes_pool.fetch(
+            "SELECT status FROM llm_calls WHERE purpose = 'content_route_suggest'"
+        )
+        assert len(rows) == 1, f"expected one content_route_suggest row, got {len(rows)}"
+        assert rows[0]["status"] == "success"
+    finally:
+        await routes_pool.execute(
+            "DELETE FROM llm_calls WHERE purpose = 'content_route_suggest'"
+        )
 
 
 async def test_suggest_empty_examples_400(app_client):

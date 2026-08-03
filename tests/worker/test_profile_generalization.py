@@ -28,9 +28,10 @@ import re
 
 import pytest
 import pytest_asyncio
-from aegis.llm import LLMTruncationError
 from aegis_worker.activities.profile import ProfileActivities
 from temporalio.testing import ActivityEnvironment
+
+from tests.llm_stub import StubbedLLMClient
 
 AGENT = "zza5-gen"
 OTHER_AGENT = "zza5-gen-other"
@@ -502,33 +503,57 @@ async def test_too_few_memories_never_calls_the_model(clean_db):
 
 
 @pytest.mark.asyncio
+def _prompt_reading_client(pool, **kw) -> StubbedLLMClient:
+    """`PromptReadingLLM`'s behaviour behind a REAL `LLMClient`.
+
+    The llm_calls row is written inside `LLMClient._record_call` (issue #106),
+    so a stand-in with its own `think()` bypasses the code these two tests
+    exist to protect. Only `chat.completions.create` is stubbed.
+    """
+
+    def _respond(create_kwargs: dict) -> str:
+        prompt = "\n".join(m.get("content") or "" for m in create_kwargs.get("messages", []))
+        ids = [int(m) for m in re.findall(r'"id":\s*(\d+)', prompt)]
+        body = (
+            [{"claim": CLAIM, "supporting_memory_ids": ids, "confidence": 0.9}] if ids else []
+        )
+        return json.dumps(body)
+
+    return StubbedLLMClient(
+        db_pool=pool, responder=_respond, prompt_tokens=11, completion_tokens=13, **kw
+    )
+
+
+@pytest.mark.asyncio
 async def test_a_successful_pass_records_an_llm_calls_row(clean_db):
-    """`think()` records only FAILURES, so the success row is written by the
-    activity. Without it a working generalisation pass is invisible in spend."""
+    """Without this row a working generalisation pass is invisible in spend."""
     await _seed(clean_db, TRIPLE)
-    await _run(_acts(clean_db, PromptReadingLLM()))
+    await _run(_acts(clean_db, _prompt_reading_client(clean_db)))
     rows = await clean_db.fetch(
         "SELECT purpose, status, output_tokens FROM llm_calls WHERE agent_id = $1", AGENT
     )
-    assert len(rows) == 1
+    # Exactly one — two would mean the activity records on top of the choke
+    # point and this pass reports double its real spend.
+    assert len(rows) == 1, f"expected one {PURPOSE} row, got {len(rows)}"
     assert rows[0]["purpose"] == PURPOSE
+    assert rows[0]["status"] == "success"
     assert rows[0]["output_tokens"] == 13
 
 
 @pytest.mark.asyncio
 async def test_a_truncated_reply_records_an_error_row(clean_db):
-    """`LLMTruncationError` is raised OUTSIDE think()'s own recording try, so a
+    """`LLMTruncationError` is raised after a real, billed upstream call, so a
     truncating model would otherwise look like zero traffic."""
     await _seed(clean_db, TRIPLE)
     result = await _run(
-        _acts(clean_db, PromptReadingLLM(raises=LLMTruncationError("empty content")))
+        _acts(clean_db, StubbedLLMClient(db_pool=clean_db, content="", finish_reason="length"))
     )
     assert result["status"] == "skipped"
     assert result["reason"] == "truncated"
     rows = await clean_db.fetch(
         "SELECT purpose, status, error FROM llm_calls WHERE agent_id = $1", AGENT
     )
-    assert len(rows) == 1
+    assert len(rows) == 1, f"expected one {PURPOSE} row, got {len(rows)}"
     assert (rows[0]["purpose"], rows[0]["status"]) == (PURPOSE, "error")
     assert "truncated" in rows[0]["error"]
 

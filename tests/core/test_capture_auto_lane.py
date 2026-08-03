@@ -12,13 +12,15 @@ this file and cannot strip rows another test file seeded. `knowledge_chunks`
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 import pytest_asyncio
 from aegis.api.app import create_app
 from aegis.api.auth import verify_auth
 from aegis.api.deps import get_settings
 from aegis.config import Settings
-from aegis.llm import LLMTruncationError
+from aegis.llm import LLMClient, LLMTruncationError
 from aegis.services.knowledge import KnowledgeStore
 from httpx import ASGITransport, AsyncClient
 
@@ -71,6 +73,41 @@ class _FakeLLM:
             "prompt_tokens": 11,
             "completion_tokens": 22,
         }
+
+
+class _RecordingLLM(LLMClient):
+    """A REAL `LLMClient` with only the HTTP layer stubbed.
+
+    The `llm_calls` row is written inside `LLMClient._record_call` (issue #106),
+    so a hand-rolled fake with its own `think()` makes every recording assertion
+    vacuous — it would pass whether or not the production choke point works.
+    Everything from `think()` down is the shipping code path here; only
+    `chat.completions.create` and `embed` are stubbed.
+    """
+
+    def __init__(self, db_pool, *, content: str = "", finish_reason: str = "stop"):
+        super().__init__(base_url="http://litellm.invalid/v1", db_pool=db_pool)
+        self.create_calls: list[dict] = []
+
+        async def _create(**kwargs):
+            self.create_calls.append(kwargs)
+            usage = SimpleNamespace(prompt_tokens=11, completion_tokens=22)
+            choice = SimpleNamespace(
+                message=SimpleNamespace(content=content), finish_reason=finish_reason
+            )
+            return SimpleNamespace(choices=[choice], usage=usage)
+
+        self._client = SimpleNamespace(
+            chat=SimpleNamespace(completions=SimpleNamespace(create=_create))
+        )
+
+    async def embed(self, texts, model="nomic-embed-text"):
+        vecs = []
+        for t in texts:
+            v = [0.0] * _DIM
+            v[sum(ord(c) for c in t) % _DIM] = 1.0
+            vecs.append(v)
+        return vecs
 
 
 @pytest_asyncio.fixture(loop_scope="function")
@@ -279,7 +316,7 @@ async def test_classification_is_recorded_in_llm_calls(make_client, db_pool, mon
         "aegis.services.chat._capture_to_inbox_impl", fake_capture, raising=False
     )
     await db_pool.execute("DELETE FROM llm_calls WHERE purpose = 'capture_classify'")
-    llm = _FakeLLM(_reply("task"))
+    llm = _RecordingLLM(db_pool, content=_reply("task"))
     async with await make_client(llm) as client:
         r = await _post(client, "llm1")
     assert r.status_code == 200, r.text
@@ -288,6 +325,8 @@ async def test_classification_is_recorded_in_llm_calls(make_client, db_pool, mon
         "SELECT model, status, input_tokens, output_tokens FROM llm_calls "
         "WHERE purpose = 'capture_classify'"
     )
+    # Exactly one: zero means the choke point never fired, two means the call
+    # site records again on top of it and every spend report is inflated.
     assert len(rows) == 1, f"expected exactly one classifier llm_calls row, got {len(rows)}"
     assert rows[0]["status"] == "success"
     assert rows[0]["input_tokens"] == 11
@@ -295,15 +334,18 @@ async def test_classification_is_recorded_in_llm_calls(make_client, db_pool, mon
     # The session tier map resolves fast→gemma4:e2b, balanced→qwen3:14b,
     # smart→qwen3:32b, so this pins the classifier to the balanced tier.
     assert rows[0]["model"] == "qwen3:14b"
-    assert len(llm.calls) == 1, "the classifier made more than one LLM call"
-    assert llm.calls[0]["purpose"] == "capture_classify"
-    assert llm.calls[0]["db_pool"] is not None
+    assert len(llm.create_calls) == 1, "the classifier made more than one LLM call"
 
 
 async def test_truncated_classification_is_recorded_in_llm_calls(
     make_client, db_pool, monkeypatch
 ):
-    """think() does NOT record truncation itself — the classifier must."""
+    """A truncated classifier call still lands exactly one row.
+
+    `think()` raises `LLMTruncationError` AFTER a real, billed upstream call, so
+    the row has to come off that branch of the choke point — the classifier
+    itself no longer records anything.
+    """
 
     async def fake_capture(*a, **kw):
         return "TASK-TRUNC"
@@ -312,7 +354,8 @@ async def test_truncated_classification_is_recorded_in_llm_calls(
         "aegis.services.chat._capture_to_inbox_impl", fake_capture, raising=False
     )
     await db_pool.execute("DELETE FROM llm_calls WHERE purpose = 'capture_classify'")
-    async with await make_client(_FakeLLM(raises=LLMTruncationError("no budget"))) as c:
+    llm = _RecordingLLM(db_pool, content="", finish_reason="length")
+    async with await make_client(llm) as c:
         r = await _post(c, "llm2")
     assert r.status_code == 200, r.text
 
