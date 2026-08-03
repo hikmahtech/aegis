@@ -153,12 +153,20 @@ def _classification_literals_in_source() -> set[str]:
 
 
 def test_source_scan_finds_the_known_outcomes() -> None:
-    """Guard the guard: if the AST walk ever stops matching, the coverage test
-    below would pass vacuously on an empty set."""
+    """Guard the guard: if any arm of the AST walk stops matching, the coverage
+    test below quietly narrows and starts passing on outcomes it never saw.
+
+    Each assertion below pins ONE arm, using a literal that only that arm can
+    reach — checking a literal several arms find (e.g. "mine", which is both a
+    dict value and an `==` comparand) would leave the other arms unprotected.
+    """
     found = _classification_literals_in_source()
-    # Literals, not derived from _GTD_STATE_FOR — these must be present for the
-    # scan to be doing its job.
-    assert {"trash", "reference", "someday", "next_action", "2_min", "mine", "unknown"} <= found
+    # dict-value arm: `skipped` only ever appears as a classify_one return value.
+    assert "skipped" in found
+    # BoolOp arm: `unknown` only appears as apply_outcome's `or "unknown"`.
+    assert "unknown" in found
+    # Compare arm: apply_outcome's branch chain — the shape a NEW outcome takes.
+    assert {"trash", "reference", "someday", "next_action", "2_min", "mine"} <= found
     assert len(found) >= 10
 
 
