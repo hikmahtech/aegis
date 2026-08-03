@@ -3,9 +3,12 @@
 GTD state in AEGIS lives entirely in labels (`@next` / `@someday` / `@waiting` /
 `@reference`). A task that exits ClarifyFlow carrying none of them is in no GTD
 state: invisible to "what's next", to "what am I blocked on", and to every review
-filter. In production 82 of the 83 non-trash tasks clarify had marked terminal
-were in exactly that limbo, concentrated in the outcomes that stamped only a
-*context* label (`@5min`), only a *person* label (`@me`), or nothing at all.
+filter. In production 83 tasks clarify had marked terminal were in exactly that
+limbo (excluding `trash`, which completes the item), and they were not spread
+evenly: `reference` (303/303) and `next_action` (122/123) always stamped a state,
+while `pandora_owned` (49/66), `mine` (17/17), `2_min` (9/9) and
+`pandora_investigation` (6/14) stamped only a *context* label (`@5min`), only a
+*person* label (`@me`), or nothing at all.
 
 The tests here are deliberately of three kinds:
 
