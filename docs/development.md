@@ -64,9 +64,9 @@ Run **one package at a time, in parallel** — exactly as CI does. A bare `pytes
 pytest tests/core/ tests/api/ tests/integration/ -n auto --dist loadfile --timeout=300  # what CI runs
 pytest tests/worker/ -n auto --dist loadfile --timeout=300
 pytest tests/comms/ -n auto --dist loadfile --timeout=300
-pytest tests/worker/test_cleanup.py::test_name   # single test
-pytest tests/core/ -x                            # stop on first failure
-ruff check .                                     # lint — see the `ruff format` caveat below
+pytest tests/worker/test_cleanup_activity.py::test_name  # single test
+pytest tests/core/ -x                                    # stop on first failure
+ruff check .                                             # lint — see the caveat below
 ```
 
 pytest config lives in the root `pyproject.toml` (not under `core/`) because rootdir is the
