@@ -8,9 +8,13 @@ Daily. Two halves:
    state/release_url/publish_date onto the row. No gate on
    `social_publishing_enabled` — metrics on already-posted rows are harmless to
    refresh even while publishing itself is switched off.
-2. the **stuck-post watchdog** (#225): any Postiz-routed row whose `schedule_at`
-   is hours past while Postiz has not confirmed it PUBLISHED gets one deduped
-   card. Between 2026-07-29 07:30 and 2026-08-02 13:01 UTC not a single social
+2. the **stuck-post watchdog** (#225): any Postiz-routed row hours past its due
+   time while Postiz has not confirmed it PUBLISHED gets one deduped card.
+   "Due" is Postiz's `publishDate` when it has one, falling back to AEGIS's
+   `payload.schedule_at` — which is a never-reconciled record of what was
+   *requested*, so trusting it alone both cried wolf over hand-rescheduled
+   posts and hid genuinely stuck ones (PR #230). Between 2026-07-29 07:30 and
+   2026-08-02 13:01 UTC not a single social
    post published — Postiz's Temporal worker came back from a restart with zero
    pollers — and nothing told anyone for four days. `social_outbox` said
    `posted` (the handoff really did succeed) while Postiz's state stayed QUEUE.
@@ -49,9 +53,10 @@ class SocialMetricsConfig:
     #: Per-pass cap on Postiz analytics calls (one per row). Hitting it is
     #: logged as a warning, never swallowed.
     max_rows: int = 200
-    #: A post is stuck once it is this many hours past `schedule_at` without a
-    #: PUBLISHED confirmation. A false-positive margin, not a detection budget —
-    #: the daily cadence sets latency.
+    #: A post is stuck once it is this many hours past its due time (Postiz's
+    #: `publishDate`, else `payload.schedule_at`) without a PUBLISHED
+    #: confirmation. A false-positive margin, not a detection budget — the daily
+    #: cadence sets latency.
     stuck_after_hours: int = 6
     max_stuck: int = 50
     #: Above the 24h cadence on purpose: a shorter window would never dedup.

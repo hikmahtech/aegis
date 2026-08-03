@@ -93,26 +93,58 @@ _SCHEDULE_AT = (
     "THEN (o.payload->>'schedule_at')::timestamptz END"
 )
 
+# Postiz's own `publishDate`, mirrored onto the row by `refresh_post_metrics`.
+# Free text for the same reason: it is whatever Postiz's JSON held, so it needs
+# the identical `pg_input_is_valid` guard — one junk value under a bare cast
+# aborts the whole statement.
+_PUBLISH_DATE = (
+    "CASE WHEN pg_input_is_valid(o.metrics->>'publish_date', 'timestamptz') "
+    "THEN (o.metrics->>'publish_date')::timestamptz END"
+)
+
+# When is a post actually due? Postiz's `publishDate` decides, because Postiz is
+# what publishes it — and an operator can move that date by hand at any time.
+# `payload.schedule_at` is only what AEGIS *requested* at enqueue time and is
+# never reconciled, so the two diverge without limit once a human reschedules.
+# Reading state from `metrics` but the due time from `payload` mixed a fresh
+# fact with a stale one, and broke both ways in PR #230: two posts moved Aug 1 →
+# Aug 3 alerted as "46h overdue" and then published on time (over-report), and
+# the mirror case — moved earlier, stale copy still in the future — hides a
+# genuinely stuck post forever (under-report). No `overdue_hours` margin can
+# absorb an unbounded, human-sized drift; only reading the authoritative clock
+# can.
+#
+# The fallback is load-bearing, not defensive: `refresh_post_metrics` writes
+# `state='unknown'` with no `publish_date` when Postiz's `GET /posts` did not
+# return the post at all, and that absence is precisely the stuck signal the
+# #225 outage produced (three of seven rows). Prefer-with-fallback keeps those
+# detectable; publish_date-only would go blind on them.
+_DUE_AT = f"COALESCE({_PUBLISH_DATE}, {_SCHEDULE_AT})"
+
 _STUCK_SQL = f"""
 SELECT o.id,
        o.posted_ref,
        o.todoist_task_id,
        a.platform,
        a.label,
+       s.due,
        s.sched,
+       s.pub,
        o.metrics->>'state' AS state,
        o.metrics_at,
        left(coalesce(o.payload->>'text', ''), 120) AS preview
 FROM social_outbox o
 JOIN social_accounts a ON a.id = o.account_id
-CROSS JOIN LATERAL (SELECT {_SCHEDULE_AT} AS sched) s
+CROSS JOIN LATERAL (
+    SELECT {_DUE_AT} AS due, {_SCHEDULE_AT} AS sched, {_PUBLISH_DATE} AS pub
+) s
 WHERE o.status = 'posted'
   AND o.posted_ref IS NOT NULL
   AND a.meta ? 'postiz_integration_id'
-  AND s.sched IS NOT NULL
-  AND s.sched < now() - make_interval(hours => $1)
+  AND s.due IS NOT NULL
+  AND s.due < now() - make_interval(hours => $1)
   AND coalesce(o.metrics->>'state', '') <> '{PUBLISHED_STATE}'
-ORDER BY s.sched DESC
+ORDER BY s.due DESC
 LIMIT $2
 """
 
@@ -156,9 +188,23 @@ def _stuck_card(title: str, body: str) -> str:
 
 
 def _describe_stuck(finding: dict) -> str:
+    # Print BOTH clocks. A post whose Postiz `publishDate` no longer matches the
+    # `schedule_at` AEGIS asked for was rescheduled by a human, and seeing the
+    # two side by side is how an operator recognises that at a glance instead of
+    # trusting a due time derived from AEGIS's never-reconciled copy (PR #230).
+    # `or schedule_at` covers a finding produced by a pre-fix worker still in
+    # flight across a rolling deploy.
+    postiz_at = finding.get("postiz_publish_date")
+    if postiz_at:
+        when = f"due {postiz_at} per Postiz (AEGIS asked {finding.get('schedule_at') or '?'})"
+    else:
+        when = (
+            f"due {finding.get('due_at') or finding.get('schedule_at', '?')} — "
+            "Postiz returned no publishDate"
+        )
     return (
         f"  {finding.get('platform', '?')}/{finding.get('label', '?')} "
-        f"post {finding.get('subject', '?')}: due {finding.get('schedule_at', '?')}, "
+        f"post {finding.get('subject', '?')}: {when}, "
         f"Postiz state {finding.get('state') or 'missing'} "
         f"({finding.get('overdue_hours', '?')}h overdue)\n"
         f"    {str(finding.get('preview') or '')[:120]}"
@@ -944,16 +990,20 @@ class SocialActivities:
         so `metrics.state` is the state Postiz reported seconds ago — checking a
         day-old snapshot would be checking nothing.
 
+        "Due" means Postiz's `publishDate` whenever Postiz reported one — see
+        `_DUE_AT`. AEGIS's `payload.schedule_at` is a request, not a fact, and a
+        post rescheduled by hand leaves it stale in either direction.
+
         `overdue_hours` is a false-positive margin, not a detection budget: the
         flow is daily, so latency is set by the schedule either way. Its job is
-        to absorb the skew between AEGIS's intended `schedule_at` (a Todoist due
-        time) and Postiz's own publish + analytics lag. 6h is comfortably longer
-        than any observed skew (seconds) and comfortably shorter than the 24h
-        cadence, so nothing that came due since the previous run can slip
-        through the gap.
+        to absorb Postiz's own publish + analytics lag (seconds). It is
+        deliberately NOT sized to cover reschedule drift — that is unbounded,
+        and no margin can absorb it; reading the authoritative clock is what
+        does. 6h is comfortably shorter than the 24h cadence, so nothing that
+        came due since the previous run can slip through the gap.
 
-        A row with no parseable `schedule_at` is skipped rather than guessed —
-        "overdue" is undefined without a due time, and guessing would either
+        A row with no parseable due time on either side is skipped rather than
+        guessed — "overdue" is undefined without one, and guessing would either
         alert forever or never.
 
         Returns [] (never raises) when there is no pool.
@@ -972,8 +1022,12 @@ class SocialActivities:
                 "todoist_task_id": r["todoist_task_id"],
                 "platform": r["platform"],
                 "label": r["label"],
-                "schedule_at": r["sched"].isoformat(),
-                "overdue_hours": int((now - r["sched"]).total_seconds() // 3600),
+                # `due_at` is what overdue is measured from; the other two are
+                # kept unmerged so a card can show a reschedule for what it is.
+                "due_at": r["due"].isoformat(),
+                "schedule_at": r["sched"].isoformat() if r["sched"] else None,
+                "postiz_publish_date": r["pub"].isoformat() if r["pub"] else None,
+                "overdue_hours": int((now - r["due"]).total_seconds() // 3600),
                 "state": r["state"],
                 "metrics_at": r["metrics_at"].isoformat() if r["metrics_at"] else None,
                 "preview": r["preview"],

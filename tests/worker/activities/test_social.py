@@ -1343,12 +1343,16 @@ async def _seed_outbox(
     *,
     schedule_at,
     state: str | None = "QUEUE",
+    publish_date=None,
     created_days_ago: float = 0.0,
     status: str = "posted",
 ):
-    """One posted outbox row. `schedule_at` may be a datetime or a raw string
-    (so a malformed value can be seeded); `state=None` leaves metrics `{}`."""
+    """One posted outbox row. `schedule_at` (what AEGIS asked Postiz for, in
+    `payload`) and `publish_date` (what Postiz reports back, in `metrics`) may
+    each be a datetime or a raw string, so a malformed value can be seeded.
+    `state=None` leaves metrics `{}` — a row the refresh never reached."""
     sched = schedule_at.isoformat() if hasattr(schedule_at, "isoformat") else schedule_at
+    pub = publish_date.isoformat() if hasattr(publish_date, "isoformat") else publish_date
     row_id = await pool.fetchval(
         "INSERT INTO social_outbox (todoist_task_id, account_id, payload, status, posted_ref, "
         "created_at) VALUES ($1, $2, $3, $4, $5, now() - make_interval(secs => $6)) RETURNING id",
@@ -1362,7 +1366,7 @@ async def _seed_outbox(
     if state is not None:
         await pool.execute(
             "UPDATE social_outbox SET metrics = $1, metrics_at = now() WHERE id = $2",
-            {"state": state, "release_url": None, "publish_date": None, "series": {}},
+            {"state": state, "release_url": None, "publish_date": pub, "series": {}},
             row_id,
         )
     return row_id
@@ -1375,7 +1379,9 @@ def _finding(subject: str = "zzsa-pz-1", **over) -> dict:
         "todoist_task_id": "zzsa-task",
         "platform": "linkedin",
         "label": "postiz-test",
+        "due_at": "2026-07-30T07:30:00+00:00",
         "schedule_at": "2026-07-30T07:30:00+00:00",
+        "postiz_publish_date": None,
         "overdue_hours": 72,
         "state": "QUEUE",
         "metrics_at": None,
@@ -1665,6 +1671,183 @@ async def test_find_stuck_posts_skips_unparseable_schedule_at(stuck_env):
     assert [f["subject"] for f in found] == ["zzsa-pz-real"]
 
 
+# --------------------------------------- #230: whose clock says the post is due?
+
+
+async def test_find_stuck_posts_trusts_postiz_publish_date_over_a_stale_schedule_at(stuck_env):
+    """THE false positive PR #230 shipped, replayed row for row.
+
+    Postiz posts `cms7gvfd20007t08rtfxddj9u` / `cms7gvfdx0008t08rcgffn3y3`
+    alerted at 2026-08-03 03:30 UTC as "46h overdue, state QUEUE" and then
+    published normally at 05:30 — two hours AFTER the card, with real release
+    URLs. Nothing was stuck: the operator had moved both posts Aug 1 05:30 →
+    Aug 3 05:30 by hand in Postiz during the #225 recovery.
+
+    `payload.schedule_at` is only what AEGIS *requested* at enqueue time and is
+    never reconciled; Postiz's `publishDate` is authoritative and mutable. The
+    detector read `state` out of `metrics` but the due time out of `payload`,
+    so only the payload half was stale — `refresh_post_metrics` had written the
+    corrected time into `metrics.publish_date`, the same JSONB blob, seconds
+    earlier. At 03:30 QUEUE was the *correct* state for a post due at 05:30.
+
+    The drift a human reschedule introduces is unbounded (+48h here), so no
+    `overdue_hours` margin can absorb it."""
+    account_id = await _seed_postiz_account(stuck_env, platform="linkedin")
+    now = datetime.now(UTC)
+    for ref in ("zzsf-pz-resched-a", "zzsf-pz-resched-b"):
+        await _seed_outbox(
+            stuck_env,
+            account_id,
+            f"zzsf-{ref}",
+            ref,
+            schedule_at=now - timedelta(hours=46),
+            state="QUEUE",
+            publish_date=now + timedelta(hours=2),
+        )
+    # A genuinely stuck row alongside them, so the assertion is "these two and
+    # only these two dropped out", not "the query returned nothing".
+    await _seed_outbox(
+        stuck_env,
+        account_id,
+        "zzsf-real",
+        "zzsf-pz-real",
+        schedule_at=now - timedelta(hours=46),
+        state="QUEUE",
+        publish_date=now - timedelta(hours=46),
+    )
+
+    act = SocialActivities(db_pool=stuck_env)
+    found = await ActivityEnvironment().run(act.find_stuck_posts, 6, 50)
+    assert {f["subject"] for f in found} == {"zzsf-pz-real"}
+    only = found[0]
+    assert only["overdue_hours"] == 46
+    assert only["due_at"] == only["postiz_publish_date"]
+
+
+async def test_find_stuck_posts_flags_a_post_postiz_was_pulled_earlier(stuck_env):
+    """The mirror bug, and the one that actually matters: NOT observed in prod,
+    derived from the same line.
+
+    Reschedule the other way — Postiz's `publishDate` moved *earlier* than the
+    `schedule_at` AEGIS recorded — and the stale payload copy still sits in the
+    future, so a genuinely stuck post is never flagged at all. Over-reporting
+    is noise; this is the detector silently failing at the single job it
+    exists to do."""
+    account_id = await _seed_postiz_account(stuck_env, platform="linkedin")
+    now = datetime.now(UTC)
+    await _seed_outbox(
+        stuck_env,
+        account_id,
+        "zzsf-early",
+        "zzsf-pz-early",
+        schedule_at=now + timedelta(hours=48),
+        state="QUEUE",
+        publish_date=now - timedelta(hours=48),
+    )
+    # Control: same future schedule_at, and Postiz agrees it is still future.
+    # It must stay quiet, so the flag above cannot be "any QUEUE row".
+    await _seed_outbox(
+        stuck_env,
+        account_id,
+        "zzsf-later",
+        "zzsf-pz-later",
+        schedule_at=now + timedelta(hours=48),
+        state="QUEUE",
+        publish_date=now + timedelta(hours=48),
+    )
+
+    act = SocialActivities(db_pool=stuck_env)
+    found = await ActivityEnvironment().run(act.find_stuck_posts, 6, 50)
+    assert [f["subject"] for f in found] == ["zzsf-pz-early"]
+    flagged = found[0]
+    assert flagged["overdue_hours"] == 48
+    # Reported against Postiz's clock, not AEGIS's still-future request.
+    assert flagged["due_at"] == flagged["postiz_publish_date"]
+    assert flagged["due_at"] < flagged["schedule_at"]
+
+
+async def test_find_stuck_posts_falls_back_to_schedule_at_when_postiz_lost_the_post(stuck_env):
+    """The COALESCE fallback is load-bearing, not defensive.
+
+    `metrics.state = 'unknown'` is what `refresh_post_metrics` writes when
+    Postiz's `GET /posts` did not return the post at all — so there is no
+    `publish_date` to prefer, and that absence IS the stuck signal. Three of
+    the seven rows in the #225 outage had aged into exactly this shape (which
+    is also why the rule is `state <> 'PUBLISHED'` rather than a QUEUE
+    allowlist). Drop the fallback and the original outage goes undetected."""
+    account_id = await _seed_postiz_account(stuck_env, platform="linkedin")
+    past = datetime.now(UTC) - timedelta(hours=72)
+    await _seed_outbox(
+        stuck_env, account_id, "zzsf-unk", "zzsf-pz-unk", schedule_at=past, state="unknown"
+    )
+    # metrics `{}` entirely — the refresh never reached this row.
+    await _seed_outbox(
+        stuck_env, account_id, "zzsf-none", "zzsf-pz-none", schedule_at=past, state=None
+    )
+
+    act = SocialActivities(db_pool=stuck_env)
+    found = await ActivityEnvironment().run(act.find_stuck_posts, 6, 50)
+    assert {f["subject"] for f in found} == {"zzsf-pz-unk", "zzsf-pz-none"}
+    for f in found:
+        assert f["postiz_publish_date"] is None
+        assert f["due_at"] == f["schedule_at"]
+        assert f["overdue_hours"] == 72
+
+
+async def test_find_stuck_posts_survives_a_malformed_publish_date(stuck_env):
+    """`metrics.publish_date` is whatever Postiz's JSON held, so it needs the
+    same `pg_input_is_valid` guard `schedule_at` has: a bare `::timestamptz` on
+    one junk value aborts the WHOLE statement, taking out the watchdog *and*
+    the metrics refresh that shares the expression."""
+    account_id = await _seed_postiz_account(stuck_env, platform="linkedin")
+    past = datetime.now(UTC) - timedelta(hours=30)
+    await _seed_outbox(
+        stuck_env,
+        account_id,
+        "zzsf-badpub",
+        "zzsf-pz-badpub",
+        schedule_at=past,
+        state="QUEUE",
+        publish_date="not-a-date",
+    )
+    await _seed_outbox(
+        stuck_env,
+        account_id,
+        "zzsf-emptypub",
+        "zzsf-pz-emptypub",
+        schedule_at=past,
+        state="QUEUE",
+        publish_date="",
+    )
+
+    act = SocialActivities(db_pool=stuck_env)
+    found = await ActivityEnvironment().run(act.find_stuck_posts, 6, 50)
+    # Junk parses to NULL, so both fall back to schedule_at and stay visible.
+    assert {f["subject"] for f in found} == {"zzsf-pz-badpub", "zzsf-pz-emptypub"}
+    for f in found:
+        assert f["postiz_publish_date"] is None
+        assert f["due_at"] == f["schedule_at"]
+
+
+async def test_finding_keys_match_what_find_stuck_posts_actually_returns(stuck_env):
+    """`_finding()` feeds every alerting test below. Pin its shape against a
+    real query result so the fake cannot drift into testing a dict the
+    activity never produces."""
+    account_id = await _seed_postiz_account(stuck_env, platform="linkedin")
+    await _seed_outbox(
+        stuck_env,
+        account_id,
+        "zzsf-shape",
+        "zzsf-pz-shape",
+        schedule_at=datetime.now(UTC) - timedelta(days=1),
+        state="QUEUE",
+    )
+    act = SocialActivities(db_pool=stuck_env)
+    found = await ActivityEnvironment().run(act.find_stuck_posts, 6, 50)
+    assert len(found) == 1
+    assert set(found[0]) == set(_finding())
+
+
 async def test_find_stuck_posts_ignores_non_postiz_and_unposted_rows(stuck_env):
     """Native-transport accounts have no Postiz state to be stuck in, and a row
     that never left `pending` is SocialPublishFlow's problem, not this
@@ -1724,6 +1907,49 @@ async def test_stuck_alert_card_names_the_post_and_its_state(stuck_env):
     assert "zzsa-pz-card" in card
     assert "unknown" in card
     assert "1 post(s) stuck" in card
+
+
+async def test_stuck_card_shows_postiz_publish_date_beside_what_aegis_asked_for(stuck_env):
+    """A reschedule-shaped card must let a human recognise the move at a glance
+    instead of trusting a number derived from AEGIS's stale copy — so when
+    Postiz has its own `publishDate`, both times appear."""
+    delivery = _FakeDelivery()
+    act = SocialActivities(db_pool=stuck_env, delivery=delivery)
+    await ActivityEnvironment().run(
+        act.report_stuck_posts,
+        [
+            _finding(
+                "zzsa-pz-both",
+                due_at="2026-08-03T05:30:00+00:00",
+                postiz_publish_date="2026-08-03T05:30:00+00:00",
+                schedule_at="2026-08-01T05:30:00+00:00",
+            )
+        ],
+        "sebas",
+        168,
+        720,
+    )
+    card = delivery.sent[0]
+    assert "2026-08-03T05:30:00+00:00" in card  # Postiz's authoritative time
+    assert "2026-08-01T05:30:00+00:00" in card  # what AEGIS originally asked for
+
+
+async def test_stuck_card_says_so_when_postiz_returned_no_publish_date(stuck_env):
+    """The fallback shape (`state='unknown'`, no `publishDate`) reads
+    differently on purpose: the due time is AEGIS's own, and the card must not
+    imply Postiz confirmed it."""
+    delivery = _FakeDelivery()
+    act = SocialActivities(db_pool=stuck_env, delivery=delivery)
+    await ActivityEnvironment().run(
+        act.report_stuck_posts,
+        [_finding("zzsa-pz-nopub", state="unknown", postiz_publish_date=None)],
+        "sebas",
+        168,
+        720,
+    )
+    card = delivery.sent[0]
+    assert "2026-07-30T07:30:00+00:00" in card
+    assert "no publishDate" in card
 
 
 async def test_stuck_dedup_expires_after_the_window(stuck_env):
