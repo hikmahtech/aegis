@@ -260,6 +260,12 @@ _SHRINK_PASSES: tuple[tuple[int, int], ...] = (
 # `… +K more` entry.
 _MAX_LISTED_DROPPED_KEYS = 12
 
+# The one marker for prose the model reads as prose. `_shrink_strings` appends it
+# inside an over-long JSON string field; `_truncate_text` appends it to a whole
+# non-JSON result. Shared deliberately (#239): "was this cut?" must have exactly
+# one thing to look for, not a third spelling per code path.
+_TRUNCATION_MARKER = "… [truncated]"
+
 
 def _shrink_strings(obj, max_str_len: int, n_items: int):
     """Recursively shrink over-long strings AND cap nested lists at ``n_items``
@@ -277,8 +283,8 @@ def _shrink_strings(obj, max_str_len: int, n_items: int):
     if isinstance(obj, str):
         if len(obj) > max_str_len:
             # Leave room for the marker so the caller can tell a cut happened.
-            head = max(0, max_str_len - len("… [truncated]"))
-            return obj[:head] + "… [truncated]"
+            head = max(0, max_str_len - len(_TRUNCATION_MARKER))
+            return obj[:head] + _TRUNCATION_MARKER
         return obj
     if isinstance(obj, list):
         kept = [_shrink_strings(x, max_str_len, n_items) for x in obj[:n_items]]
@@ -337,12 +343,36 @@ def _smart_subset(data, n_items: int, max_str_len: int):
     return subset
 
 
+def _truncate_text(text: str, max_bytes: int) -> str:
+    """Cut a non-JSON tool result down to ``max_bytes`` and say that it was cut.
+
+    Two things the old ``text[:max_bytes]`` got wrong (#239). It counted
+    CHARACTERS against a byte budget, so a non-ASCII result came back over
+    budget — up to 4x for multi-byte UTF-8. And it appended nothing, so the
+    model received a string ending mid-sentence with no signal it was partial,
+    which is the same silent-partial failure the dict and list paths were fixed
+    for in #148. This is a live path, not a theoretical one: several executors
+    return plain text rather than JSON (``query_observations``,
+    ``last_contact_with_person``, the refusal strings).
+
+    Slicing encoded bytes can land inside a multi-byte sequence, so the decode
+    drops that trailing partial character instead of raising.
+    """
+    budget = max_bytes - len(_TRUNCATION_MARKER.encode())
+    if budget <= 0:
+        # Budget too tight to hold the marker at all — a byte-safe cut is all
+        # that fits. Still never over budget, which the character slice could be.
+        return text.encode()[:max_bytes].decode(errors="ignore")
+    return text.encode()[:budget].decode(errors="ignore") + _TRUNCATION_MARKER
+
+
 def _truncate_result(result_json: str, max_bytes: int = 4096) -> str:
     """Trim a JSON-serialised tool result so it fits within ``max_bytes``.
 
     Strategy, loosest → tightest:
     1. Return unchanged if already under budget.
-    2. Parse. Non-JSON or scalar → raw byte slice.
+    2. Parse. Non-JSON or scalar → byte-safe cut plus a ``… [truncated]`` marker
+       (``_truncate_text``).
     3. For a list/dict, iterate ``_SHRINK_PASSES``: keep the first N items of
        a list or the N highest-ranked keys of a dict (see ``_payload_rank``),
        recursively shrinking long strings and capping nested lists inside the
@@ -355,10 +385,12 @@ def _truncate_result(result_json: str, max_bytes: int = 4096) -> str:
     knowledge/search tool output) get their big string fields shrunk down
     rather than being replaced entirely by a "too large" note.
 
-    Every path out of here past step 2 carries a machine-readable truncation
-    signal — ``truncated``/``total`` for a list, ``_truncated``/``_total_keys``
-    (plus ``_dropped_keys``) for a dict, ``… +K of N more`` inside any capped
-    nested list — so a partial result is never mistakable for a complete one.
+    EVERY path out of here carries a truncation signal — ``… [truncated]`` on a
+    non-JSON cut, ``truncated``/``total`` for a list, ``_truncated``/
+    ``_total_keys`` (plus ``_dropped_keys``) for a dict, ``… +K of N more``
+    inside any capped nested list — so a partial result is never mistakable for
+    a complete one. Every return is also measured in BYTES, matching the budget's
+    own unit.
     """
     if len(result_json.encode()) <= max_bytes:
         return result_json
@@ -366,10 +398,10 @@ def _truncate_result(result_json: str, max_bytes: int = 4096) -> str:
     try:
         data = json.loads(result_json)
     except (json.JSONDecodeError, TypeError):
-        return result_json[:max_bytes]
+        return _truncate_text(result_json, max_bytes)
 
     if not isinstance(data, (list, dict)):
-        return result_json[:max_bytes]
+        return _truncate_text(result_json, max_bytes)
 
     for n_items, max_str_len in _SHRINK_PASSES:
         candidate = _smart_subset(data, n_items, max_str_len)

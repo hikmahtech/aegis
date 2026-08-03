@@ -17,9 +17,11 @@ from fastapi.testclient import TestClient
 def _make_flow_mock():
     """Build a fake google_auth_oauthlib.flow module + Flow class.
 
-    google_auth_oauthlib is not installed in the test venv, so we inject
-    a lightweight fake into sys.modules so the lazy `from ... import Flow`
-    inside the route handlers resolves to our mock.
+    Injected into sys.modules so the lazy `from ... import Flow` inside the
+    route handlers resolves to our mock. The real package IS installed now
+    (CI takes `core[dev,google]` since #248), but a real `Flow` would want a
+    live OAuth round-trip, so the fake stays — it is here to avoid the network,
+    not to paper over a missing dependency.
     """
     fake_module = types.ModuleType("google_auth_oauthlib")
     fake_flow_module = types.ModuleType("google_auth_oauthlib.flow")
