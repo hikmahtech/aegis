@@ -9,6 +9,8 @@ from aegis.llm import LLMClient, LLMTruncationError
 from aegis_worker.activities.intelligence import IntelligenceActivities
 from temporalio.testing import ActivityEnvironment
 
+from tests.llm_stub import StubbedLLMClient
+
 
 @pytest.fixture
 def mock_kc():
@@ -191,15 +193,15 @@ def _act(llm, pool, mock_kc):
 
 
 async def test_scoring_success_writes_an_llm_calls_row(scoring_agent, mock_kc):
-    """Baseline for the two tests below: a successful score is recorded."""
-    llm = MagicMock()
-    llm.think = AsyncMock(
-        return_value={
-            "response": json.dumps([{"index": 0, "score": 4, "reason": "big"}]),
-            "model": "kimi-k2.5",
-            "prompt_tokens": 11,
-            "completion_tokens": 22,
-        }
+    """Baseline for the two tests below: a successful score is recorded ONCE.
+
+    The row now comes from `LLMClient._record_call` (issue #106), so this drives
+    a real client with a stubbed HTTP layer — a `MagicMock().think` would skip
+    the choke point entirely and make the assertion vacuous.
+    """
+    llm = StubbedLLMClient(
+        db_pool=scoring_agent,
+        content=json.dumps([{"index": 0, "score": 4, "reason": "big"}]),
     )
     env = ActivityEnvironment()
     await env.run(
@@ -213,22 +215,22 @@ async def test_scoring_success_writes_an_llm_calls_row(scoring_agent, mock_kc):
         "FROM llm_calls WHERE agent_id = $1",
         _AGENT,
     )
+    # Exactly one: two would mean the activity records on top of the choke
+    # point and every spend report is silently inflated.
     assert len(rows) == 1, f"expected one scoring row, got {len(rows)}"
     assert rows[0]["purpose"] == _PURPOSE
     assert rows[0]["status"] == "success"
-    assert rows[0]["model"] == "kimi-k2.5"
+    assert rows[0]["model"] == "gemma4:e2b"
     assert rows[0]["input_tokens"] == 11
     assert rows[0]["output_tokens"] == 22
 
 
 async def test_truncated_scoring_writes_an_llm_calls_row(scoring_agent, mock_kc):
-    """issue #137: think() raises LLMTruncationError from OUTSIDE its own
-    failure-recording try, so a truncation reaches `llm_calls` only if this
-    activity writes it. A model that truncates every scan used to look
-    identical to a model nobody called — which is how "fast-tier calls went
-    invisible" came to be reported."""
-    llm = MagicMock()
-    llm.think = AsyncMock(side_effect=LLMTruncationError("no budget left for content"))
+    """issue #137: `LLMTruncationError` is raised AFTER a real, billed upstream
+    call. A model that truncates every scan used to look identical to a model
+    nobody called — which is how "fast-tier calls went invisible" came to be
+    reported. The row comes off the choke point's truncation branch."""
+    llm = StubbedLLMClient(db_pool=scoring_agent, content="", finish_reason="length")
     env = ActivityEnvironment()
 
     with pytest.raises(LLMTruncationError):
@@ -249,9 +251,9 @@ async def test_truncated_scoring_writes_an_llm_calls_row(scoring_agent, mock_kc)
 
 
 async def test_failed_scoring_writes_an_llm_calls_row(scoring_agent, mock_kc):
-    """The third status. Unlike truncation this row comes from think()'s own
-    `_record_failure`, which fires only because the activity threads db_pool +
-    purpose + agent_id down into the call — assert that wiring is intact."""
+    """The third status. This row comes from the choke point's failure branch,
+    which fires only because the activity threads db_pool + purpose + agent_id
+    down into the call — assert that wiring is intact."""
     client = LLMClient(base_url="http://localhost:4000/v1", api_key="test")
 
     class _UpstreamError(RuntimeError):

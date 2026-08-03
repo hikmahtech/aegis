@@ -30,7 +30,6 @@ already-filed day logs back out and `distil_rollup` condenses them into one
 
 from __future__ import annotations
 
-import time
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -327,10 +326,9 @@ class DayLogActivities:
         if not self.llm_client:
             return fallback
 
-        from aegis.observability import record_llm_call
-
+        # db_pool + purpose ⇒ think() writes the llm_calls row itself, for
+        # success and failure alike (LLMClient._record_call). Do not record here.
         payload = {k: v for k, v in events.items() if k != "counts"}
-        _t0 = time.monotonic()
         try:
             result = await self.llm_client.think(
                 prompt=json.dumps(payload, default=str)[:6000],
@@ -345,15 +343,6 @@ class DayLogActivities:
             activity.logger.warning("daylog_distil_llm_failed date=%s err=%s", date, str(exc)[:200])
             return fallback
 
-        await record_llm_call(
-            self.db_pool,
-            model=result.get("model", self.model),
-            prompt_tokens=result.get("prompt_tokens", 0),
-            completion_tokens=result.get("completion_tokens", 0),
-            latency_ms=int((time.monotonic() - _t0) * 1000),
-            purpose="daylog_narrative",
-            agent_id=agent_id,
-        )
         return (result.get("response") or "").strip() or fallback
 
     # ---------------------------------------------------------------- rollups
@@ -424,9 +413,7 @@ class DayLogActivities:
         if not self.llm_client:
             return fallback
 
-        from aegis.observability import record_llm_call
-
-        _t0 = time.monotonic()
+        # think() records this call (db_pool + purpose) — see distil_daylog.
         try:
             result = await self.llm_client.think(
                 prompt=json.dumps(entries, default=str)[:_ROLLUP_PROMPT_CLIP],
@@ -443,15 +430,6 @@ class DayLogActivities:
             )
             return fallback
 
-        await record_llm_call(
-            self.db_pool,
-            model=result.get("model", self.model),
-            prompt_tokens=result.get("prompt_tokens", 0),
-            completion_tokens=result.get("completion_tokens", 0),
-            latency_ms=int((time.monotonic() - _t0) * 1000),
-            purpose="daylog_rollup",
-            agent_id=agent_id,
-        )
         return (result.get("response") or "").strip() or fallback
 
     # ------------------------------------------------------------------ state

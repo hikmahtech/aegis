@@ -2,12 +2,10 @@
 
 from __future__ import annotations
 
-import time
 from dataclasses import dataclass
 from typing import Any
 
-from aegis.llm import LLMTruncationError, parse_llm_json
-from aegis.observability import record_llm_call
+from aegis.llm import parse_llm_json
 from temporalio import activity
 
 
@@ -72,49 +70,23 @@ class IntelligenceActivities:
             f"[{i}] {item.get('title', '')} — {item.get('snippet', '')[:200]}"
             for i, item in enumerate(items)
         )
-        _t0 = time.monotonic()
-        try:
-            result = await self.llm_client.think(
-                prompt=items_text,
-                model=self.model_light,
-                system_prompt=(
-                    "Rate each news item 1-5 for significance to a user interested in: "
-                    f"{topic_desc}. Consider: relevance, novelty, potential impact on financial/life decisions. "
-                    'Return JSON array: [{"index": 0, "score": 4, "reason": "<max 10 words>"}]'
-                ),
-                # gemma4:e2b returns EMPTY content below ~900 tokens for this task and
-                # is more verbose than gpt-oss (markdown-fenced, pretty-printed), so it
-                # needs generous headroom to emit the full scored array (validated live).
-                max_tokens=1500,
-                db_pool=self.db_pool,
-                purpose="intel_score_significance",
-                agent_id=self.agent_id,
-            )
-        except LLMTruncationError as exc:
-            # think() raises this AFTER a successful HTTP call and OUTSIDE its
-            # own failure-recording try, so nothing reaches llm_calls unless we
-            # write it here. Without this row a model that truncates every scan
-            # is indistinguishable from a model nobody called — the reporting
-            # gap behind issue #137, and the same class as #106. Same shape as
-            # services/capture_classify.py::_classify (the reference site).
-            await record_llm_call(
-                self.db_pool,
-                model=self.model_light,
-                prompt_tokens=0,
-                completion_tokens=0,
-                latency_ms=int((time.monotonic() - _t0) * 1000),
-                purpose="intel_score_significance",
-                agent_id=self.agent_id,
-                status="error",
-                error=f"truncated: {exc}"[:500],
-            )
-            raise
-        await record_llm_call(
-            self.db_pool,
-            model=result.get("model", self.model_light),
-            prompt_tokens=result.get("prompt_tokens", 0),
-            completion_tokens=result.get("completion_tokens", 0),
-            latency_ms=int((time.monotonic() - _t0) * 1000),
+        # db_pool + purpose ⇒ think() writes the llm_calls row itself for every
+        # outcome. Truncation included: without that row a model that truncates
+        # every scan reads as a model nobody called (issue #137). It still
+        # propagates, so the flow's graceful-degrade guard fires as before.
+        result = await self.llm_client.think(
+            prompt=items_text,
+            model=self.model_light,
+            system_prompt=(
+                "Rate each news item 1-5 for significance to a user interested in: "
+                f"{topic_desc}. Consider: relevance, novelty, potential impact on financial/life decisions. "
+                'Return JSON array: [{"index": 0, "score": 4, "reason": "<max 10 words>"}]'
+            ),
+            # gemma4:e2b returns EMPTY content below ~900 tokens for this task and
+            # is more verbose than gpt-oss (markdown-fenced, pretty-printed), so it
+            # needs generous headroom to emit the full scored array (validated live).
+            max_tokens=1500,
+            db_pool=self.db_pool,
             purpose="intel_score_significance",
             agent_id=self.agent_id,
         )

@@ -264,7 +264,14 @@ async def draft_persona(agent_id: str, request: Request, body: dict[str, Any]) -
     prompt = _DRAFT_PROMPT.format(
         name=agent.get("name", agent_id), role=agent.get("role", ""), description=description
     )
-    result = await llm.think(prompt, model=model, max_tokens=2000, purpose="persona_draft")
+    result = await llm.think(
+        prompt,
+        model=model,
+        max_tokens=2000,
+        db_pool=pool,
+        purpose="persona_draft",
+        agent_id=agent_id,
+    )
     raw = result.get("response", "") if isinstance(result, dict) else str(result)
     parsed = parse_llm_json(raw) or {}
     return {

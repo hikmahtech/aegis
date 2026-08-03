@@ -4,14 +4,12 @@ from __future__ import annotations
 
 import asyncio
 import json
-import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 import structlog
 from aegis.llm import parse_llm_json
-from aegis.observability import record_llm_call
 from aegis.services.memory import record_gmail_triage_correction
 from temporalio import activity
 from temporalio.exceptions import ApplicationError
@@ -463,7 +461,8 @@ class GmailActivities:
         prompt_parts.append(f"Body:\n{body[:800]}")
         prompt = "\n".join(prompt_parts)
         try:
-            _t0 = time.monotonic()
+            # db_pool + purpose ⇒ think() writes the llm_calls row itself, for
+            # success and failure alike (LLMClient._record_call).
             raw = await self.llm_client.think(
                 prompt=prompt,
                 model=self.model_balanced,
@@ -475,15 +474,6 @@ class GmailActivities:
                 # with ~256 for the JSON payload.
                 max_tokens=2048,
                 db_pool=self.db_pool,
-                purpose="gmail_classification",
-                agent_id=self.agent_id,
-            )
-            await record_llm_call(
-                self.db_pool,
-                model=raw.get("model", self.model_balanced),
-                prompt_tokens=raw.get("prompt_tokens", 0),
-                completion_tokens=raw.get("completion_tokens", 0),
-                latency_ms=int((time.monotonic() - _t0) * 1000),
                 purpose="gmail_classification",
                 agent_id=self.agent_id,
             )

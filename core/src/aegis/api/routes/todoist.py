@@ -151,7 +151,11 @@ async def suggest_content_route(request: Request, body: dict[str, Any]) -> dict[
     )
     try:
         result = await llm.think(
-            prompt, model=model, max_tokens=200, purpose="content_route_suggest"
+            prompt,
+            model=model,
+            max_tokens=200,
+            db_pool=request.app.state.db_pool,
+            purpose="content_route_suggest",
         )
     except Exception as exc:  # noqa: BLE001 — convenience endpoint, never 500
         return {"pattern": None, "error": f"LLM error: {str(exc)[:200]}"}

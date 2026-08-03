@@ -30,6 +30,8 @@ import pytest_asyncio
 from aegis_worker.activities.memory import MemoryActivities
 from temporalio.testing import ActivityEnvironment
 
+from tests.llm_stub import StubbedLLMClient
+
 _AID = "zzcons-agent"
 _OTHER = "zzcons-other"
 
@@ -424,21 +426,24 @@ async def test_no_memories_skips_before_the_llm(seeded):
 
 
 async def test_llm_call_is_logged_with_purpose(seeded):
+    """Real `LLMClient`, stubbed HTTP: the row is written inside
+    `LLMClient._record_call` (issue #106), so a fake `think()` would record
+    nothing and this assertion would be about the fake."""
     pool, ids = seeded["pool"], seeded["ids"]
     await pool.execute("DELETE FROM llm_calls WHERE purpose = 'memory_consolidation'")
-    llm = _StubLLM(_merge_plan(ids))
-    act = MemoryActivities(db_pool=pool, llm_client=llm)
+    llm = StubbedLLMClient(db_pool=pool, content=_merge_plan(ids))
+    act = MemoryActivities(db_pool=pool, llm_client=llm, model="stub-model")
 
     await ActivityEnvironment().run(act.consolidate_agent_memories, _AID, True)
 
-    assert llm.calls[0]["purpose"] == "memory_consolidation"
-    assert llm.calls[0]["db_pool"] is pool  # failures self-log inside think()
-    row = await pool.fetchrow(
-        "SELECT model, input_tokens, output_tokens, agent_id FROM llm_calls "
-        "WHERE purpose = 'memory_consolidation' ORDER BY created_at DESC LIMIT 1"
+    rows = await pool.fetch(
+        "SELECT model, input_tokens, output_tokens, agent_id, status FROM llm_calls "
+        "WHERE purpose = 'memory_consolidation'"
     )
-    assert row is not None, "no llm_calls row written for memory_consolidation"
-    assert row["model"] == "stub-model"
-    assert (row["input_tokens"], row["output_tokens"]) == (11, 22)
-    assert row["agent_id"] == _AID
+    # Exactly one — a second row would double-count this call's spend.
+    assert len(rows) == 1, f"expected one memory_consolidation row, got {len(rows)}"
+    assert rows[0]["model"] == "stub-model"
+    assert rows[0]["status"] == "success"
+    assert (rows[0]["input_tokens"], rows[0]["output_tokens"]) == (11, 22)
+    assert rows[0]["agent_id"] == _AID
     await pool.execute("DELETE FROM llm_calls WHERE purpose = 'memory_consolidation'")

@@ -7,6 +7,8 @@ import pytest
 from aegis_worker.activities.alerts import AlertActivities, build_alert_signature
 from temporalio.testing import ActivityEnvironment
 
+from tests.llm_stub import StubbedLLMClient
+
 
 @pytest.fixture
 def mock_db_pool():
@@ -1092,3 +1094,52 @@ async def test_run_investigation_threads_github_repo_to_launcher(
     assert kwargs["github_repo"] == "Acme/bcp"
     # JIT clone removed — the fixed checkout is the only source.
     assert "clone_url" not in kwargs
+
+
+async def test_investigate_records_the_llm_call(db_pool):
+    """issue #106: `investigate` recorded its success by hand and its FAILURES
+    not at all (it passed neither `db_pool` nor `purpose` into `think()`), so an
+    LLM outage during alert triage read as no traffic.
+
+    Real `LLMClient` (only the HTTP layer stubbed) against the real pool, row
+    read back: `record_llm_call` swallows its own errors, so a mock assertion
+    passes against a write that never landed.
+    """
+    await db_pool.execute("DELETE FROM llm_calls WHERE purpose = 'alert_investigation'")
+    llm = StubbedLLMClient(db_pool=db_pool, content="Root cause: OOM. Fix: restart.")
+    act = AlertActivities(db_pool=db_pool, llm_client=llm)
+    try:
+        out = await ActivityEnvironment().run(
+            act.investigate, {"title": "svc down", "fingerprint": "zz106-fp"}, ""
+        )
+        assert "Root cause" in out["investigation"]
+
+        rows = await db_pool.fetch(
+            "SELECT status, input_tokens FROM llm_calls WHERE purpose = 'alert_investigation'"
+        )
+        # Exactly one — the hand-written row this replaced would now be a second.
+        assert len(rows) == 1, f"expected one alert_investigation row, got {len(rows)}"
+        assert rows[0]["status"] == "success"
+        assert rows[0]["input_tokens"] == 11
+    finally:
+        await db_pool.execute("DELETE FROM llm_calls WHERE purpose = 'alert_investigation'")
+
+
+async def test_investigate_records_a_failed_llm_call(db_pool):
+    """The failure row is the half that did not exist before #106."""
+    await db_pool.execute("DELETE FROM llm_calls WHERE purpose = 'alert_investigation'")
+    llm = StubbedLLMClient(db_pool=db_pool, raises=RuntimeError("litellm 502"))
+    act = AlertActivities(db_pool=db_pool, llm_client=llm)
+    try:
+        with pytest.raises(RuntimeError):
+            await ActivityEnvironment().run(
+                act.investigate, {"title": "svc down", "fingerprint": "zz106-fp"}, ""
+            )
+        rows = await db_pool.fetch(
+            "SELECT status, error FROM llm_calls WHERE purpose = 'alert_investigation'"
+        )
+        assert len(rows) == 1, f"expected one alert_investigation row, got {len(rows)}"
+        assert rows[0]["status"] == "error"
+        assert "litellm 502" in (rows[0]["error"] or "")
+    finally:
+        await db_pool.execute("DELETE FROM llm_calls WHERE purpose = 'alert_investigation'")

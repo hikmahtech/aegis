@@ -12,7 +12,6 @@ import json
 from unittest.mock import AsyncMock
 
 import pytest
-from aegis_worker.activities import gmail as gmail_mod
 from aegis_worker.activities.gmail import GmailActivities
 from temporalio.testing import ActivityEnvironment
 
@@ -70,8 +69,7 @@ async def test_gmail_promo_unknown_sender_skips_llm():
 
 
 @pytest.mark.asyncio
-async def test_unknown_sender_falls_back_to_llm_and_caches(monkeypatch):
-    monkeypatch.setattr(gmail_mod, "record_llm_call", AsyncMock())
+async def test_unknown_sender_falls_back_to_llm_and_caches():
     llm = _CountingLlm(json.dumps({"category": "important_action", "confidence": 0.9, "tags": []}))
     g = _make(llm=llm, lookup=None)
     msg = {"id": "m", "sender": "boss@co.com", "subject": "Hi", "snippet": "b", "labels": []}
@@ -83,8 +81,7 @@ async def test_unknown_sender_falls_back_to_llm_and_caches(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_low_confidence_cache_still_uses_llm(monkeypatch):
-    monkeypatch.setattr(gmail_mod, "record_llm_call", AsyncMock())
+async def test_low_confidence_cache_still_uses_llm():
     llm = _CountingLlm(json.dumps({"category": "informational", "confidence": 0.6, "tags": []}))
     # n below _CACHE_MIN_N (3) → not trusted yet
     g = _make(llm=llm, lookup={"category": "useless", "n": 2, "confidence": 0.5})
@@ -95,10 +92,9 @@ async def test_low_confidence_cache_still_uses_llm(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_gmail_important_marker_not_leaked_to_llm(monkeypatch):
+async def test_gmail_important_marker_not_leaked_to_llm():
     """Gmail's liberal auto-IMPORTANT marker must NOT be fed to the LLM as a
     prior — it inflates 'fake important'. The LLM decides from content only."""
-    monkeypatch.setattr(gmail_mod, "record_llm_call", AsyncMock())
 
     captured = {}
 
@@ -117,12 +113,11 @@ async def test_gmail_important_marker_not_leaked_to_llm(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_classify_email_uses_enough_max_tokens(monkeypatch):
+async def test_classify_email_uses_enough_max_tokens():
     """Regression: max_tokens=120 truncated the JSON (category+confidence+
     reason+2-3 sentence summary+tags) ~3/7 calls -> Unterminated string ->
     silent fallback to informational. The LLM call must request >=256 tokens
     so the full JSON object fits."""
-    monkeypatch.setattr(gmail_mod, "record_llm_call", AsyncMock())
     captured = {}
 
     class _Spy(_CountingLlm):

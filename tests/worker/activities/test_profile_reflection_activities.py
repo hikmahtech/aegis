@@ -19,6 +19,8 @@ import pytest_asyncio
 from aegis_worker.activities.profile import ProfileActivities
 from temporalio.testing import ActivityEnvironment
 
+from tests.llm_stub import StubbedLLMClient
+
 AGENT = "zza2-profile"
 OTHER = "zza2-other"
 PURPOSE = "profile_reflection"
@@ -396,10 +398,14 @@ async def _llm_rows(pool, agent: str = AGENT) -> list:
 
 @pytest.mark.asyncio
 async def test_propose_returns_the_doc_and_records_the_successful_call(clean_db):
-    """`think()` records ONLY failures, so a success row exists here or nowhere
-    — which is exactly how issue #106's call sites came to look like zero
-    traffic."""
-    llm = FakeLLM(response=_llm_json())
+    """A success row exists here or nowhere — which is exactly how issue #106's
+    call sites came to look like zero traffic.
+
+    Real `LLMClient` with a stubbed HTTP layer: since #106 the row is written by
+    `LLMClient._record_call`, so a `FakeLLM` with its own `think()` would bypass
+    the code this test exists to protect.
+    """
+    llm = StubbedLLMClient(db_pool=clean_db, content=_llm_json())
     out = await ActivityEnvironment().run(
         _acts(clean_db, llm_client=llm).propose_profile_patch, AGENT, _EVIDENCE, CURRENT_DOC
     )
@@ -411,31 +417,27 @@ async def test_propose_returns_the_doc_and_records_the_successful_call(clean_db)
     assert out["revision_of"]
 
     rows = await _llm_rows(clean_db)
-    assert len(rows) == 1
+    # Exactly one — two means the activity records on top of the choke point.
+    assert len(rows) == 1, f"expected one {PURPOSE} row, got {len(rows)}"
     assert rows[0]["purpose"] == PURPOSE
     assert rows[0]["status"] == "success"
     assert rows[0]["input_tokens"] == 11
     assert rows[0]["output_tokens"] == 22
-    # db_pool + purpose are still passed to think() so ITS failure rows carry
-    # the same purpose.
-    assert llm.calls[0]["purpose"] == PURPOSE
-    assert llm.calls[0]["db_pool"] is not None
 
 
 @pytest.mark.asyncio
 async def test_propose_records_a_truncated_call(clean_db):
-    """LLMTruncationError is raised OUTSIDE think()'s own recording try, so a
-    truncating model is invisible in llm_calls unless we write the row here."""
-    from aegis.llm import LLMTruncationError
-
-    llm = FakeLLM(raises=LLMTruncationError("finish_reason=length"))
+    """`LLMTruncationError` is raised after a real, billed upstream call, so the
+    row comes off the choke point's truncation branch — a truncating model must
+    not read as zero traffic."""
+    llm = StubbedLLMClient(db_pool=clean_db, content="", finish_reason="length")
     out = await ActivityEnvironment().run(
         _acts(clean_db, llm_client=llm).propose_profile_patch, AGENT, _EVIDENCE, CURRENT_DOC
     )
 
     assert out == {}
     rows = await _llm_rows(clean_db)
-    assert len(rows) == 1
+    assert len(rows) == 1, f"expected one {PURPOSE} row, got {len(rows)}"
     assert rows[0]["purpose"] == PURPOSE
     assert rows[0]["status"] == "error"
     assert "truncated" in (rows[0]["error"] or "")

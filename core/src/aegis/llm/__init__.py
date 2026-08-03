@@ -255,10 +255,10 @@ class LLMClient:
     ) -> dict[str, Any]:
         """Send a prompt to the LLM and return the response (no tool calling).
 
-        When `db_pool` and `purpose` are both provided, failures are
-        recorded into `llm_calls` with status="timeout"|"error" so we
-        can measure the real failure rate (success rows are still
-        written by the caller — that path is unchanged).
+        Every terminal outcome — success, truncation, upstream failure — is
+        recorded to `llm_calls` by `_record_call`. Supply a `purpose`; the pool
+        is the client's own unless you pass a different `db_pool`. Do NOT call
+        `record_llm_call` yourself afterwards: that double-counts spend.
         """
         await self._check_kill_switch()
         max_tokens = _reasoning_floor(model, max_tokens)
@@ -293,8 +293,14 @@ class LLMClient:
                     )
             except Exception as exc:
                 span.set_attribute("llm.status", "error")
-                await self._record_failure(
-                    db_pool, model, purpose, agent_id, _t0, exc
+                await self._record_call(
+                    db_pool,
+                    model,
+                    purpose,
+                    agent_id,
+                    _t0,
+                    status=_classify_llm_error(exc),
+                    error=str(exc)[:500],
                 )
                 raise
 
@@ -327,13 +333,37 @@ class LLMClient:
                     output_tokens=completion_tokens,
                     purpose=purpose,
                 )
-                raise LLMTruncationError(
+                detail = (
                     f"model={model} returned empty content with finish_reason=length "
                     f"(max_tokens={max_tokens}, output_tokens={completion_tokens}); "
                     "increase max_tokens or suppress reasoning"
                 )
+                # This branch runs AFTER a real, billed upstream call, so it
+                # needs its own row: a model that truncates every call would
+                # otherwise be indistinguishable from a model nobody called.
+                await self._record_call(
+                    db_pool,
+                    model,
+                    purpose,
+                    agent_id,
+                    _t0,
+                    prompt_tokens=prompt_tokens,
+                    completion_tokens=completion_tokens,
+                    status="error",
+                    error=f"truncated: {detail}"[:500],
+                )
+                raise LLMTruncationError(detail)
 
             span.set_attribute("llm.status", "success")
+            await self._record_call(
+                db_pool,
+                model,
+                purpose,
+                agent_id,
+                _t0,
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+            )
 
             logger.debug(
                 "llm_complete",
@@ -350,17 +380,48 @@ class LLMClient:
                 "completion_tokens": completion_tokens,
             }
 
-    async def _record_failure(
+    async def _record_call(
         self,
         db_pool: Any,
         model: str,
         purpose: str | None,
         agent_id: str | None,
         t0: float,
-        exc: BaseException,
+        *,
+        prompt_tokens: int = 0,
+        completion_tokens: int = 0,
+        status: str = "success",
+        error: str | None = None,
     ) -> None:
-        """Best-effort failure row for `llm_calls`. Never raises."""
-        if db_pool is None or not purpose:
+        """Write one `llm_calls` row for a generation call. Never raises.
+
+        THE choke point (issue #106). Every terminal outcome of
+        `think()`/`chat()` funnels through here, so "an LLM call is visible in
+        `llm_calls`" is structural rather than a convention every new call site
+        has to remember — several never did, and their spend was invisible.
+        **Call sites must not also call `record_llm_call` themselves**: a second
+        row inflates reported spend with no error anywhere.
+
+        Pool resolution: the per-call `db_pool` when the caller passes one, else
+        the client's own. A client constructed with a pool is governed — it
+        already pays for the kill-switch lookup on every call — so it records
+        too, which is what makes a bare `purpose=` enough at a core route.
+        A client built without a pool is deliberately ungoverned
+        (`routes/llm_backend.py::test_backend`) and stays silent.
+
+        `purpose` is what makes a row attributable, so there is no row without
+        one. A caller that hands over an explicit `db_pool` and no `purpose` has
+        simply forgotten it — say so at WARNING rather than dropping the call on
+        the floor. Passing neither is the opted-out path (`services/chat.py`'s
+        tool loop, which records itself).
+
+        The kill switch deliberately produces no row: it raises before any HTTP
+        request, so nothing was spent.
+        """
+        pool = db_pool if db_pool is not None else self._db_pool
+        if pool is None or not purpose:
+            if db_pool is not None and not purpose:
+                logger.warning("llm_call_unrecorded", model=model, reason="missing_purpose")
             return
         import time
 
@@ -368,18 +429,18 @@ class LLMClient:
             from aegis.observability import record_llm_call
 
             await record_llm_call(
-                db_pool,
+                pool,
                 model=model,
-                prompt_tokens=0,
-                completion_tokens=0,
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
                 latency_ms=int((time.monotonic() - t0) * 1000),
                 purpose=purpose,
                 agent_id=agent_id,
-                status=_classify_llm_error(exc),
-                error=str(exc)[:500],
+                status=status,
+                error=error,
             )
         except Exception:
-            logger.warning("record_llm_failure_failed", model=model, purpose=purpose)
+            logger.warning("record_llm_call_failed", model=model, purpose=purpose)
 
     async def chat(
         self,
@@ -433,8 +494,14 @@ class LLMClient:
                     completion = await self._client.chat.completions.create(**kwargs)
             except Exception as exc:
                 span.set_attribute("llm.status", "error")
-                await self._record_failure(
-                    db_pool, model, purpose, agent_id, _t0, exc
+                await self._record_call(
+                    db_pool,
+                    model,
+                    purpose,
+                    agent_id,
+                    _t0,
+                    status=_classify_llm_error(exc),
+                    error=str(exc)[:500],
                 )
                 raise
 
@@ -464,6 +531,15 @@ class LLMClient:
             span.set_attribute("llm.tool_calls_returned", len(tool_calls))
             span.set_attribute("llm.status", "success")
             _set_genai_usage(span, prompt_tokens, completion_tokens)
+            await self._record_call(
+                db_pool,
+                model,
+                purpose,
+                agent_id,
+                _t0,
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+            )
 
             logger.debug(
                 "llm_chat_complete",
@@ -523,14 +599,11 @@ class LLMClient:
         spend freeze surfaces as a real failure rather than silently
         marking every receipt unparseable.
         """
-        import time
-
         from aegis.api.models.money import ReceiptExtraction
 
         if not receipts:
             return []
         prompt = _BATCH_RECEIPT_PROMPT.format(receipts=_format_receipts_for_prompt(receipts))
-        _t0 = time.monotonic()
         try:
             result = await self.think(
                 prompt=prompt,
@@ -541,18 +614,6 @@ class LLMClient:
                 purpose="money_receipt_extraction",
                 agent_id=agent_id,
             )
-            if db_pool is not None:
-                from aegis.observability import record_llm_call
-
-                await record_llm_call(
-                    db_pool,
-                    model=result.get("model", model),
-                    prompt_tokens=result.get("prompt_tokens", 0),
-                    completion_tokens=result.get("completion_tokens", 0),
-                    latency_ms=int((time.monotonic() - _t0) * 1000),
-                    purpose="money_receipt_extraction",
-                    agent_id=agent_id,
-                )
             parsed = parse_llm_json(result.get("response", ""))
             if not isinstance(parsed, list):
                 raise ValueError("expected JSON array")

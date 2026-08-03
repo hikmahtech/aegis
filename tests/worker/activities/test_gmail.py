@@ -13,6 +13,8 @@ from aegis_worker.activities.gmail import (
 )
 from temporalio.testing import ActivityEnvironment
 
+from tests.llm_stub import StubbedLLMClient
+
 
 class _FakeGmailRequest:
     def __init__(self, payload, raise_auth):
@@ -592,62 +594,54 @@ async def test_classify_email_uses_higher_max_tokens(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_classify_email_records_agent_id_on_llm_call(tmp_path):
+async def test_classify_email_records_agent_id_on_llm_call(tmp_path, db_pool):
     """gmail_classification is the highest-volume worker-side LLM call
     (hourly triage across every account) and was one of the call sites
-    contributing to the 95% of llm_calls rows with NULL agent_id — this
-    guards that both the think() call and the llm_calls insert now carry
-    GmailActivities.agent_id (default 'sebas', matching GmailIngestFlow's
-    config default)."""
-    from unittest.mock import AsyncMock
+    contributing to the 95% of llm_calls rows with NULL agent_id — this guards
+    that the row carries GmailActivities.agent_id (default 'sebas', matching
+    GmailIngestFlow's config default).
 
-    class _FakeDbPool:
-        """Only `execute` (the record_llm_call insert) is exercised here.
-        `_triage_lookup`/`_triage_upsert` also call `.acquire()`, but both are
-        best-effort (try/except) — raising synchronously keeps this fake
-        pool minimal without leaving unawaited-coroutine warnings."""
-
-        def __init__(self):
-            self.execute = AsyncMock()
-
-        def acquire(self):
-            raise RuntimeError("_FakeDbPool.acquire is not implemented in this test")
-
-    llm = AsyncMock()
-    llm.think = AsyncMock(
-        return_value={
-            "response": (
-                '{"category": "informational", "confidence": 0.6, '
-                '"reason": "digest", "summary": "Low value.", "tags": []}'
-            ),
-            "model": "gpt-oss:20b",
-            "prompt_tokens": 30,
-            "completion_tokens": 20,
-        }
+    Real pool, row read back: `record_llm_call` swallows its own errors, so an
+    `execute` mock asserts against a write that may never have landed. Real
+    `LLMClient` too, because the row comes from `_record_call` (issue #106).
+    """
+    await db_pool.execute("DELETE FROM llm_calls WHERE purpose = 'gmail_classification'")
+    llm = StubbedLLMClient(
+        db_pool=db_pool,
+        content=(
+            '{"category": "informational", "confidence": 0.6, '
+            '"reason": "digest", "summary": "Low value.", "tags": []}'
+        ),
+        prompt_tokens=30,
+        completion_tokens=20,
     )
     acts = _make_gmail_with_llm(tmp_path, llm)
-    db_pool = _FakeDbPool()
     acts.db_pool = db_pool
     msg = {
         "id": "msg-agent",
-        "sender": "digest@example.com",
+        "sender": "zz106-digest@example.com",
         "subject": "Weekly digest",
         "snippet": "...",
         "labels": [],
         "lane": "own",
     }
     env = ActivityEnvironment()
-    await env.run(acts.classify_email, msg)
+    try:
+        await env.run(acts.classify_email, msg)
 
-    # think() itself gets agent_id (so a failure row would attribute too).
-    _, think_kwargs = llm.think.call_args
-    assert think_kwargs.get("agent_id") == "sebas"
-
-    # The success-path llm_calls insert also carries agent_id — this is the
-    # column the 95%-NULL finding is about.
-    assert db_pool.execute.called
-    call = db_pool.execute.call_args
-    sql = call.args[0]
-    assert "INSERT INTO llm_calls" in sql
-    # (sql, model, input_tokens, output_tokens, latency_ms, purpose, agent_id, status, error)
-    assert call.args[6] == "sebas"
+        rows = await db_pool.fetch(
+            "SELECT agent_id, model, input_tokens, output_tokens, status "
+            "FROM llm_calls WHERE purpose = 'gmail_classification'"
+        )
+        # Exactly one — two would mean the activity records on top of the choke
+        # point, which inflates spend reporting with nothing erroring.
+        assert len(rows) == 1, f"expected one gmail_classification row, got {len(rows)}"
+        assert rows[0]["agent_id"] == "sebas"
+        assert rows[0]["status"] == "success"
+        assert rows[0]["input_tokens"] == 30
+        assert rows[0]["output_tokens"] == 20
+    finally:
+        await db_pool.execute(
+            "DELETE FROM llm_calls WHERE purpose = 'gmail_classification'"
+        )
+        await db_pool.execute("DELETE FROM triage_state WHERE email_addr LIKE 'zz106-%'")

@@ -38,7 +38,6 @@ getting a write path of its own. Nothing here promotes anything; approval does.
 
 from __future__ import annotations
 
-import time
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -512,13 +511,11 @@ class ProfileActivities:
         only.
 
         The call is recorded in `llm_calls` under
-        ``purpose='profile_generalization'`` on SUCCESS as well as failure —
-        `LLMClient.think()` records only failures and raises
-        `LLMTruncationError` outside its own recording try, so both rows are
-        written here (the `aegis.services.capture_classify` template).
+        ``purpose='profile_generalization'`` for every outcome — success,
+        truncation and failure — by `LLMClient._record_call`, because `db_pool`
+        and `purpose` are passed to `think()`. Nothing here records again.
         """
         from aegis.llm import LLMTruncationError, parse_llm_json
-        from aegis.observability import record_llm_call
 
         base: dict[str, Any] = {
             "candidates": [],
@@ -567,7 +564,6 @@ class ProfileActivities:
             ]
         )
 
-        _t0 = time.monotonic()
         try:
             result = await self.llm_client.think(
                 prompt=_GENERALIZATION_PROMPT.format(
@@ -581,37 +577,13 @@ class ProfileActivities:
                 agent_id=agent_id,
             )
         except LLMTruncationError as exc:
-            # Raised AFTER a successful HTTP call, outside think()'s own
-            # failure-recording try — without this row a truncating model looks
-            # like zero traffic.
             activity.logger.warning("profile_generalize_truncated err=%s", str(exc)[:200])
-            await record_llm_call(
-                self.db_pool,
-                model=self.model,
-                prompt_tokens=0,
-                completion_tokens=0,
-                latency_ms=int((time.monotonic() - _t0) * 1000),
-                purpose=_GENERALIZATION_PURPOSE,
-                agent_id=agent_id,
-                status="error",
-                error=f"truncated: {exc}"[:500],
-            )
             return {**base, "status": "skipped", "reason": "truncated"}
         except Exception as exc:  # noqa: BLE001 — no claims beats a failed run
             activity.logger.warning(
                 "profile_generalize_failed err=%s type=%s", str(exc)[:200], type(exc).__name__
             )
             return {**base, "status": "skipped", "reason": "llm_failed"}
-
-        await record_llm_call(
-            self.db_pool,
-            model=result.get("model", self.model),
-            prompt_tokens=result.get("prompt_tokens", 0),
-            completion_tokens=result.get("completion_tokens", 0),
-            latency_ms=int((time.monotonic() - _t0) * 1000),
-            purpose=_GENERALIZATION_PURPOSE,
-            agent_id=agent_id,
-        )
 
         parsed = parse_llm_json(result.get("response", ""))
         candidates, below, dropped = _validate_generalizations(
@@ -663,14 +635,11 @@ class ProfileActivities:
         or, worse, a card proposing nonsense.
 
         The call is recorded in `llm_calls` under
-        ``purpose='profile_reflection'`` on SUCCESS as well as failure.
-        `LLMClient.think()` records only failures, and it raises
-        `LLMTruncationError` outside its own recording try — so both the success
-        row and the truncation row have to be written here, exactly as
-        `aegis.services.capture_classify` does.
+        ``purpose='profile_reflection'`` for every outcome — success, truncation
+        and failure — by `LLMClient._record_call`, because `db_pool` and
+        `purpose` are passed to `think()`. Nothing here records again.
         """
         from aegis.llm import LLMTruncationError, parse_llm_json
-        from aegis.observability import record_llm_call
 
         current = current_doc or ""
         if self.llm_client is None:
@@ -681,7 +650,6 @@ class ProfileActivities:
         if not rendered:
             return {}
 
-        _t0 = time.monotonic()
         try:
             result = await self.llm_client.think(
                 prompt=_PROMPT.format(
@@ -698,39 +666,14 @@ class ProfileActivities:
                 agent_id=agent_id,
             )
         except LLMTruncationError as exc:
-            # think() raises this AFTER a successful HTTP call, outside its own
-            # failure-recording try — nothing lands in llm_calls unless we write
-            # it here, and a truncating model would look like zero traffic.
             activity.logger.warning("profile_propose_truncated err=%s", str(exc)[:200])
-            await record_llm_call(
-                self.db_pool,
-                model=self.model,
-                prompt_tokens=0,
-                completion_tokens=0,
-                latency_ms=int((time.monotonic() - _t0) * 1000),
-                purpose=_PURPOSE,
-                agent_id=agent_id,
-                status="error",
-                error=f"truncated: {exc}"[:500],
-            )
             return {}
         except Exception as exc:  # noqa: BLE001 — a quiet week beats a failed run
-            # think() already wrote the llm_calls failure row (db_pool + purpose
-            # were passed); the kill-switch path raises before any row.
+            # The kill-switch path raises before any row — nothing was spent.
             activity.logger.warning(
                 "profile_propose_failed err=%s type=%s", str(exc)[:200], type(exc).__name__
             )
             return {}
-
-        await record_llm_call(
-            self.db_pool,
-            model=result.get("model", self.model),
-            prompt_tokens=result.get("prompt_tokens", 0),
-            completion_tokens=result.get("completion_tokens", 0),
-            latency_ms=int((time.monotonic() - _t0) * 1000),
-            purpose=_PURPOSE,
-            agent_id=agent_id,
-        )
 
         parsed = parse_llm_json(result.get("response", ""))
         if not isinstance(parsed, dict):
