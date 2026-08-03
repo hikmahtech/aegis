@@ -47,6 +47,17 @@ _scan_result: list[dict] = []
 _reconcile_calls: list[list[dict]] = []
 _mirror_calls: list[list[dict]] = []
 _webhook_check_calls: int = 0
+_webhook_check_raises: bool = False
+_DEFAULT_WEBHOOK_RESULT = {
+    "missing_webhooks": ["acme/bcp"],
+    "missing_webhooks_count": 1,
+    "webhooks_newly_missing": [],
+    "webhooks_recovered": [],
+    "checked": 4,
+    "skipped": 0,
+    "webhook_check_status": "ok",
+}
+_webhook_check_result: dict = dict(_DEFAULT_WEBHOOK_RESULT)
 
 
 @activity.defn(name="scan_workspace_repos")
@@ -70,16 +81,20 @@ async def stub_mirror(input: WorkspaceReposInput):
 async def stub_check_github_webhooks():
     global _webhook_check_calls
     _webhook_check_calls += 1
-    return {"missing_webhooks": ["acme/bcp"], "checked": 4, "skipped": 0}
+    if _webhook_check_raises:
+        raise RuntimeError("gh api exploded")
+    return dict(_webhook_check_result)
 
 
-def _reset(scan):
-    global _webhook_check_calls
+def _reset(scan, *, webhook_result=None, webhook_raises=False):
+    global _webhook_check_calls, _webhook_check_result, _webhook_check_raises
     _scan_result.clear()
     _scan_result.extend(scan)
     _reconcile_calls.clear()
     _mirror_calls.clear()
     _webhook_check_calls = 0
+    _webhook_check_result = dict(webhook_result or _DEFAULT_WEBHOOK_RESULT)
+    _webhook_check_raises = webhook_raises
 
 
 async def _run_flow(min_repos=5):
@@ -123,3 +138,47 @@ async def test_workspace_sync_aborts_on_suspiciously_small_scan():
     assert _reconcile_calls == []
     assert _mirror_calls == []
     assert _webhook_check_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_workspace_sync_surfaces_the_webhook_delta_not_just_the_level():
+    """#142: the delta keys reach result_summary, where a reader can act on them.
+
+    The standing list is still carried (on-demand readers keep their data) but
+    it is `webhooks_newly_missing` that says something changed today.
+    """
+    _reset(
+        _SCAN,
+        webhook_result={
+            "missing_webhooks": ["acme/bcp", "youruser/aegis"],
+            "missing_webhooks_count": 2,
+            "webhooks_newly_missing": ["youruser/aegis"],
+            "webhooks_recovered": ["example/example-site"],
+            "checked": 4,
+            "skipped": 0,
+            "webhook_check_status": "ok",
+        },
+    )
+    result = await _run_flow()
+    assert result["webhooks_newly_missing"] == ["youruser/aegis"]
+    assert result["webhooks_recovered"] == ["example/example-site"]
+    assert result["missing_webhooks"] == ["acme/bcp", "youruser/aegis"]
+    assert result["missing_webhooks_count"] == 2
+    assert result["webhook_check_status"] == "ok"
+
+
+@pytest.mark.asyncio
+async def test_workspace_sync_webhook_failure_does_not_poison_the_next_baseline():
+    """A raising webhook check degrades to status='failed', never 'ok'.
+
+    The flow must still succeed (the check is best-effort), but the row it
+    writes must be excluded from the next run's baseline lookup — an empty
+    'ok' set there would make tomorrow re-report the whole backlog as new.
+    """
+    _reset(_SCAN, webhook_raises=True)
+    result = await _run_flow()
+    assert result["status"] == "ok"
+    assert result["webhook_check_status"] == "failed"
+    assert result["missing_webhooks"] == []
+    assert result["webhooks_newly_missing"] == []
+    assert result["missing_webhooks_count"] == 0

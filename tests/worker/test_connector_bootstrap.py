@@ -158,13 +158,19 @@ async def test_dependent_activity_fails_with_the_reason_instead_of_a_clean_lie(
     await _seed_repo_resource(db_pool)
     env = ActivityEnvironment()
     try:
-        # Status quo for a connector that was never configured — unchanged on
-        # purpose, and shown here so the contrast is not taken on trust.
+        # Status quo for a connector that was never configured — still an
+        # empty result, shown here so the contrast is not taken on trust. It
+        # now at least labels itself `webhook_check_status='skipped'` (#142)
+        # rather than being indistinguishable from a clean bill of health.
         silent = InventoryActivities(db_pool=db_pool, remote_script=None)
         assert await env.run(silent.check_github_webhooks) == {
             "missing_webhooks": [],
+            "missing_webhooks_count": 0,
+            "webhooks_newly_missing": [],
+            "webhooks_recovered": [],
             "checked": 0,
             "skipped": 0,
+            "webhook_check_status": "skipped",
         }
 
         # A connector that was configured and failed to build: same call, and

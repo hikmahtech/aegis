@@ -56,6 +56,20 @@ to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **Webhook reconciliation reports the change, not the level** (#142):
+  `WorkspaceRepoSyncFlow` re-announced the same 11-16 missing GitHub webhooks
+  every run for 24 days — a number that by construction never reaches zero,
+  because most tracked checkouts are client repos that should *not* carry a
+  webhook pointing at a homelab endpoint. Auto-creating them was rejected (an
+  outward-facing mutation against third-party repos, and the check cannot tell
+  "should have one" from "was never meant to"). `check_github_webhooks` now
+  diffs against the previous run's own `workflow_runs` row and only
+  `webhooks_newly_missing` / `webhooks_recovered` warn — the
+  `FlowHealthWatchdogFlow` pattern, where a sustained fault is one alert. The
+  full standing list stays in `result_summary.missing_webhooks` and the flow is
+  chat-triggerable, so nothing is dropped; `webhook_check_status`
+  (`ok`/`skipped`/`failed`) keeps an inconclusive run from resetting the
+  baseline to empty and re-flagging the whole backlog.
 - **`schedule_sync` converges** (#72, fixes #11): schedules are rewritten only
   when their config fingerprint changes (embedded in the action id
   `scheduled-<slug>--v<fp>`), instead of unconditionally every ~5-min tick.
@@ -70,6 +84,18 @@ to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **`aegis_self_diagnose`'s 30s guillotine is now pinned by a test** (#140): the
+  tool's 3/3 lifetime production timeouts (`latency_ms=30000`, 2026-07-15
+  21:28-21:29 IST) were already fixed by #73 (`_TOOL_TIMEOUT_OVERRIDES`, merged
+  21:36 the same evening) and hardened by #105 — but nothing pinned that the
+  tool loop actually *consults* the override, so a refactor could silently
+  restore the cap. `test_tool_loop_applies_the_self_diagnose_timeout_override`
+  proves it against a live `send_message` run, with an un-overridden tool as the
+  control. No behaviour change; the issue was verified fixed, not re-fixed.
+- **`docs/development.md` no longer advertises a command it then forbids**
+  (#247): the Testing block listed `ruff format .` two lines above the paragraph
+  banning it on `chat.py` / `tools/infra.py`, and a bare `pytest` that deadlocks.
+  The block now shows the per-package parallel invocations CI actually runs.
 - **Gmail triage recheck starvation** (#115): 473 of 1658 lifetime
   `triage_accuracy` predictions had aged past the 7-day recheck window with
   both `actual` and `last_checked_at` NULL, permanently excluded from the

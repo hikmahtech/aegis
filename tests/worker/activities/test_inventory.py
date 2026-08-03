@@ -14,6 +14,7 @@ from aegis_worker.activities.inventory import (
     dedupe_workspace_repos,
     origin_to_github_repo,
 )
+from structlog.testing import capture_logs
 from temporalio.testing import ActivityEnvironment
 
 
@@ -227,7 +228,16 @@ async def test_check_github_webhooks_no_remote_script_returns_empty():
     inv = _make_inv(remote_script=None)
     env = ActivityEnvironment()
     result = await env.run(inv.check_github_webhooks)
-    assert result == {"missing_webhooks": [], "checked": 0, "skipped": 0}
+    assert result == {
+        "missing_webhooks": [],
+        "missing_webhooks_count": 0,
+        "webhooks_newly_missing": [],
+        "webhooks_recovered": [],
+        "checked": 0,
+        "skipped": 0,
+        # Not "ok": an unchecked run must never become the delta baseline.
+        "webhook_check_status": "skipped",
+    }
 
 
 @pytest.mark.asyncio
@@ -268,6 +278,167 @@ async def test_check_github_webhooks_flags_missing_and_skips_unparseable(db_pool
     assert result["checked"] == 2
     assert result["skipped"] == 1
     assert set(fake.hook_calls) == {"acme/has-hook", "acme/missing-hook", "acme/gone"}
+
+
+# =====================================================================
+# check_github_webhooks — delta vs the previous run (#142)
+# =====================================================================
+
+
+async def _clean_webhook_runs(db_pool):
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            "DELETE FROM workflow_runs WHERE workflow_type = 'WorkspaceRepoSyncFlow'"
+        )
+
+
+async def _seed_prior_run(db_pool, missing, *, status="ok", minutes_ago=60):
+    """Record a prior WorkspaceRepoSyncFlow run carrying `missing`."""
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO workflow_runs "
+            "(run_id, workflow_id, workflow_type, status, started_at, result_summary) "
+            "VALUES ($1, $1, 'WorkspaceRepoSyncFlow', 'completed', "
+            "        now() - ($2 || ' minutes')::interval, $3)",
+            f"zzmisc-wh-{status}-{minutes_ago}",
+            str(minutes_ago),
+            {"missing_webhooks": list(missing), "webhook_check_status": status},
+        )
+
+
+async def _seed_repos(db_pool, repos):
+    async with db_pool.acquire() as conn:
+        for repo in repos:
+            await conn.execute(
+                "INSERT INTO resources (kind, slug, title, metadata) "
+                "VALUES ('repository', $1, $1, $2)",
+                f"{_TEST_SLUG_PREFIX}{repo.replace('/', '-')}",
+                {"github_repo": repo},
+            )
+
+
+def _hooks(present, absent):
+    """gh-CLI stdout map: `present` repos carry AEGIS's hook, `absent` don't."""
+    responses = {
+        r: {"status": "succeeded", "stdout": json.dumps(["https://aegis.example.com/api/webhooks/github"])}
+        for r in present
+    }
+    responses.update(
+        {
+            r: {"status": "succeeded", "stdout": json.dumps(["https://other.example.com/hook"])}
+            for r in absent
+        }
+    )
+    return responses
+
+
+@pytest.mark.asyncio
+async def test_check_github_webhooks_reports_delta_against_previous_run(db_pool):
+    """The change, not the level (#142).
+
+    Previous run recorded {alpha, beta} missing. This run finds {beta, gamma}:
+    gamma is news, alpha recovered, beta is the standing set nobody needs told
+    about again. Expected values are literals, not re-derived from the code.
+    """
+    await _clean_test_resources(db_pool)
+    await _clean_webhook_runs(db_pool)
+    await _seed_prior_run(db_pool, ["acme/alpha", "acme/beta"])
+    await _seed_repos(db_pool, ["acme/alpha", "acme/beta", "acme/gamma"])
+    fake = FakeRemoteScript(
+        hook_responses=_hooks(present=["acme/alpha"], absent=["acme/beta", "acme/gamma"])
+    )
+    inv = _make_inv(db_pool=db_pool, remote_script=fake)
+
+    with capture_logs() as logs:
+        result = await ActivityEnvironment().run(inv.check_github_webhooks)
+    await _clean_test_resources(db_pool)
+    await _clean_webhook_runs(db_pool)
+
+    assert result["webhooks_newly_missing"] == ["acme/gamma"]
+    assert result["webhooks_recovered"] == ["acme/alpha"]
+    # Standing set still reported in full — on-demand readers keep their data.
+    assert result["missing_webhooks"] == ["acme/beta", "acme/gamma"]
+    assert result["missing_webhooks_count"] == 2
+    assert result["webhook_check_status"] == "ok"
+    # A real change DOES warn, and names only the new repo.
+    warnings = [e for e in logs if e["event"] == "github_webhooks_newly_missing"]
+    assert len(warnings) == 1
+    assert warnings[0]["log_level"] == "warning"
+    assert warnings[0]["repos"] == ["acme/gamma"]
+
+
+@pytest.mark.asyncio
+async def test_check_github_webhooks_standing_set_does_not_warn(db_pool):
+    """The 24-day noise case: an unchanged set must produce no warning.
+
+    This is the whole point of #142 — 11-16 repos re-announced every run for
+    24 days. Paired with the test above (which proves the warning DOES fire on
+    a change), so "no warning" here can't be an artefact of broken logging.
+    """
+    await _clean_test_resources(db_pool)
+    await _clean_webhook_runs(db_pool)
+    await _seed_prior_run(db_pool, ["acme/beta", "acme/delta"])
+    await _seed_repos(db_pool, ["acme/beta", "acme/delta"])
+    fake = FakeRemoteScript(hook_responses=_hooks(present=[], absent=["acme/beta", "acme/delta"]))
+    inv = _make_inv(db_pool=db_pool, remote_script=fake)
+
+    with capture_logs() as logs:
+        result = await ActivityEnvironment().run(inv.check_github_webhooks)
+    await _clean_test_resources(db_pool)
+    await _clean_webhook_runs(db_pool)
+
+    assert result["missing_webhooks"] == ["acme/beta", "acme/delta"]
+    assert result["missing_webhooks_count"] == 2
+    assert result["webhooks_newly_missing"] == []
+    assert result["webhooks_recovered"] == []
+    assert [e for e in logs if e["log_level"] == "warning"] == []
+    # It is still *observed*, just at debug — the signal is quiet, not deleted.
+    assert [e["event"] for e in logs if e["event"] == "github_webhooks_missing_unchanged"] == [
+        "github_webhooks_missing_unchanged"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_check_github_webhooks_first_ever_run_reports_whole_set(db_pool):
+    """No baseline at all => the first observation is news, not a standing set."""
+    await _clean_test_resources(db_pool)
+    await _clean_webhook_runs(db_pool)
+    await _seed_repos(db_pool, ["acme/beta", "acme/delta"])
+    fake = FakeRemoteScript(hook_responses=_hooks(present=[], absent=["acme/beta", "acme/delta"]))
+    inv = _make_inv(db_pool=db_pool, remote_script=fake)
+
+    result = await ActivityEnvironment().run(inv.check_github_webhooks)
+    await _clean_test_resources(db_pool)
+    await _clean_webhook_runs(db_pool)
+
+    assert result["webhooks_newly_missing"] == ["acme/beta", "acme/delta"]
+    assert result["webhooks_recovered"] == []
+
+
+@pytest.mark.asyncio
+async def test_check_github_webhooks_ignores_inconclusive_run_as_baseline(db_pool):
+    """An inconclusive run must not reset the baseline to empty.
+
+    A run that bailed (no connector) records `missing_webhooks: []` with
+    status='skipped'. If the lookup took the most recent row regardless of
+    status, that empty set would become the baseline and the ENTIRE standing
+    backlog would re-report as newly missing — reintroducing #142's noise on
+    every worker hiccup. The older conclusive row is the baseline instead.
+    """
+    await _clean_test_resources(db_pool)
+    await _clean_webhook_runs(db_pool)
+    await _seed_prior_run(db_pool, ["acme/beta", "acme/delta"], status="ok", minutes_ago=120)
+    await _seed_prior_run(db_pool, [], status="skipped", minutes_ago=10)
+    await _seed_repos(db_pool, ["acme/beta", "acme/delta"])
+    fake = FakeRemoteScript(hook_responses=_hooks(present=[], absent=["acme/beta", "acme/delta"]))
+    inv = _make_inv(db_pool=db_pool, remote_script=fake)
+
+    result = await ActivityEnvironment().run(inv.check_github_webhooks)
+    await _clean_test_resources(db_pool)
+    await _clean_webhook_runs(db_pool)
+
+    assert result["missing_webhooks"] == ["acme/beta", "acme/delta"]
+    assert result["webhooks_newly_missing"] == []
 
 
 # =====================================================================
