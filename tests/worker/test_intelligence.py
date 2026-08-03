@@ -1,9 +1,11 @@
 """Tests for intelligence activities."""
 
 import json
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+import pytest_asyncio
+from aegis.llm import LLMClient, LLMTruncationError
 from aegis_worker.activities.intelligence import IntelligenceActivities
 from temporalio.testing import ActivityEnvironment
 
@@ -83,10 +85,14 @@ async def test_score_significance_no_llm(mock_kc):
 
 
 async def test_score_significance_uses_light_model_with_headroom(mock_kc):
-    """Significance scoring runs on the fast tier (gemma4:e2b), not the balanced
-    tier — gpt-oss:20b intermittently hangs >180s under proxy load (PR #319).
-    gemma4 returns empty below ~900 tokens, so a generous max_tokens is required
-    for it to emit the scored JSON array at all (validated live: 4/4 at mt=900)."""
+    """Scoring passes `model_light` through to think() with generous headroom —
+    the model returns EMPTY content below ~900 tokens for this task, so a tight
+    cap yields LLMTruncationError instead of a scored array.
+
+    NOTE the scope of the model assertion: it pins the dataclass DEFAULT, which
+    is what direct construction gets. A real worker overrides it —
+    __main__.py passes `model_light=model_balanced` — so this does NOT show
+    that production scoring runs on the fast tier. It does not."""
     captured: dict = {}
 
     async def fake_think(**kwargs):
@@ -98,8 +104,8 @@ async def test_score_significance_uses_light_model_with_headroom(mock_kc):
     act = IntelligenceActivities(knowledge_connector=mock_kc, llm_client=llm)
     env = ActivityEnvironment()
     await env.run(act.score_significance, [{"title": "x", "snippet": "y"}], [{"name": "ai"}])
-    assert captured["model"] == "gemma4:e2b"  # fast tier, not the balanced gpt-oss:20b
-    assert captured["max_tokens"] >= 900  # headroom so gemma4 doesn't return empty
+    assert captured["model"] == "gemma4:e2b"  # the dataclass default, not prod's tier
+    assert captured["max_tokens"] >= 900  # headroom so the model doesn't return empty
 
 
 async def test_ingest_intelligence(mock_kc):
@@ -142,3 +148,130 @@ async def test_ingest_intelligence_snippet_shape(mock_kc):
     _, kwargs = mock_kc.ingest_content.call_args
     assert kwargs["summary"] == "The window is closing rapidly..."
     assert kwargs["source_type"] == "intelligence"
+
+
+# --------------------------------------------------------------------------
+# issue #137 — every scoring call must leave an llm_calls row.
+#
+# These assert on rows actually present in Postgres, not on a mock having been
+# called: `record_llm_call` swallows its own errors, so a mock-based test would
+# happily pass against a write that never lands.
+# --------------------------------------------------------------------------
+
+_AGENT = "zzis-raphael"
+_PURPOSE = "intel_score_significance"
+
+
+@pytest_asyncio.fixture(loop_scope="function")
+async def scoring_agent(db_pool):
+    """A prefix-scoped agent row to satisfy llm_calls.agent_id's FK.
+
+    Teardown is children-before-parents: llm_calls rows first, then the agent.
+    """
+    await db_pool.execute(
+        "INSERT INTO agents (id, name, role, system_prompt_path, active) "
+        "VALUES ($1,$1,'test','/dev/null',true) ON CONFLICT (id) DO NOTHING",
+        _AGENT,
+    )
+    await db_pool.execute("DELETE FROM llm_calls WHERE agent_id = $1", _AGENT)
+    try:
+        yield db_pool
+    finally:
+        await db_pool.execute("DELETE FROM llm_calls WHERE agent_id = $1", _AGENT)
+        await db_pool.execute("DELETE FROM agents WHERE id = $1", _AGENT)
+
+
+def _act(llm, pool, mock_kc):
+    return IntelligenceActivities(
+        knowledge_connector=mock_kc,
+        llm_client=llm,
+        db_pool=pool,
+        agent_id=_AGENT,
+    )
+
+
+async def test_scoring_success_writes_an_llm_calls_row(scoring_agent, mock_kc):
+    """Baseline for the two tests below: a successful score is recorded."""
+    llm = MagicMock()
+    llm.think = AsyncMock(
+        return_value={
+            "response": json.dumps([{"index": 0, "score": 4, "reason": "big"}]),
+            "model": "kimi-k2.5",
+            "prompt_tokens": 11,
+            "completion_tokens": 22,
+        }
+    )
+    env = ActivityEnvironment()
+    await env.run(
+        _act(llm, scoring_agent, mock_kc).score_significance,
+        [{"title": "x", "snippet": "y"}],
+        [{"name": "ai"}],
+    )
+
+    rows = await scoring_agent.fetch(
+        "SELECT purpose, model, status, input_tokens, output_tokens "
+        "FROM llm_calls WHERE agent_id = $1",
+        _AGENT,
+    )
+    assert len(rows) == 1, f"expected one scoring row, got {len(rows)}"
+    assert rows[0]["purpose"] == _PURPOSE
+    assert rows[0]["status"] == "success"
+    assert rows[0]["model"] == "kimi-k2.5"
+    assert rows[0]["input_tokens"] == 11
+    assert rows[0]["output_tokens"] == 22
+
+
+async def test_truncated_scoring_writes_an_llm_calls_row(scoring_agent, mock_kc):
+    """issue #137: think() raises LLMTruncationError from OUTSIDE its own
+    failure-recording try, so a truncation reaches `llm_calls` only if this
+    activity writes it. A model that truncates every scan used to look
+    identical to a model nobody called — which is how "fast-tier calls went
+    invisible" came to be reported."""
+    llm = MagicMock()
+    llm.think = AsyncMock(side_effect=LLMTruncationError("no budget left for content"))
+    env = ActivityEnvironment()
+
+    with pytest.raises(LLMTruncationError):
+        await env.run(
+            _act(llm, scoring_agent, mock_kc).score_significance,
+            [{"title": "x", "snippet": "y"}],
+            [{"name": "ai"}],
+        )
+
+    rows = await scoring_agent.fetch(
+        "SELECT purpose, status, error FROM llm_calls WHERE agent_id = $1",
+        _AGENT,
+    )
+    assert len(rows) == 1, "a truncated scoring call left no llm_calls row"
+    assert rows[0]["purpose"] == _PURPOSE
+    assert rows[0]["status"] == "error"
+    assert "truncated" in (rows[0]["error"] or "")
+
+
+async def test_failed_scoring_writes_an_llm_calls_row(scoring_agent, mock_kc):
+    """The third status. Unlike truncation this row comes from think()'s own
+    `_record_failure`, which fires only because the activity threads db_pool +
+    purpose + agent_id down into the call — assert that wiring is intact."""
+    client = LLMClient(base_url="http://localhost:4000/v1", api_key="test")
+
+    class _UpstreamError(RuntimeError):
+        pass
+
+    env = ActivityEnvironment()
+    with patch.object(client, "_client") as mock_openai:
+        mock_openai.chat.completions.create = AsyncMock(side_effect=_UpstreamError("read timed out"))
+        with pytest.raises(_UpstreamError):
+            await env.run(
+                _act(client, scoring_agent, mock_kc).score_significance,
+                [{"title": "x", "snippet": "y"}],
+                [{"name": "ai"}],
+            )
+
+    rows = await scoring_agent.fetch(
+        "SELECT purpose, status, error FROM llm_calls WHERE agent_id = $1",
+        _AGENT,
+    )
+    assert len(rows) == 1, "a failed scoring call left no llm_calls row"
+    assert rows[0]["purpose"] == _PURPOSE
+    assert rows[0]["status"] == "timeout"  # classified from "read timed out"
+    assert "read timed out" in (rows[0]["error"] or "")

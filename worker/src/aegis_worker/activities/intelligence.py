@@ -6,7 +6,7 @@ import time
 from dataclasses import dataclass
 from typing import Any
 
-from aegis.llm import parse_llm_json
+from aegis.llm import LLMTruncationError, parse_llm_json
 from aegis.observability import record_llm_call
 from temporalio import activity
 
@@ -17,9 +17,14 @@ class IntelligenceActivities:
 
     knowledge_connector: Any = None
     llm_client: Any = None
-    # Significance scoring runs on the FAST tier (gemma4:e2b), not balanced —
-    # gpt-oss:20b intermittently hangs >180s under proxy load (PR #319) and a
-    # 1-5 significance score is a lightweight judgment a small model handles.
+    # Scoring model. NOTE: this default is only used by direct construction —
+    # __main__.py passes `model_light=model_balanced`, so in a real worker the
+    # significance score runs on whatever the BALANCED tier resolves to, not on
+    # gemma4:e2b. An earlier comment here claimed the fast tier; it was never
+    # wired that way, and that mismatch is what made issue #137 read the
+    # 2026-07-22 balanced-tier remap (gemma4:e2b/gpt-oss:20b -> kimi-k2.5) as
+    # "fast-tier calls went invisible". Change the wiring in __main__.py if you
+    # want a different tier — changing this default alone does nothing.
     model_light: str = "gemma4:e2b"
     db_pool: Any = None
     # Owning agent — matches IntelligenceScanFlow's config default. Threaded
@@ -68,22 +73,42 @@ class IntelligenceActivities:
             for i, item in enumerate(items)
         )
         _t0 = time.monotonic()
-        result = await self.llm_client.think(
-            prompt=items_text,
-            model=self.model_light,
-            system_prompt=(
-                "Rate each news item 1-5 for significance to a user interested in: "
-                f"{topic_desc}. Consider: relevance, novelty, potential impact on financial/life decisions. "
-                'Return JSON array: [{"index": 0, "score": 4, "reason": "<max 10 words>"}]'
-            ),
-            # gemma4:e2b returns EMPTY content below ~900 tokens for this task and
-            # is more verbose than gpt-oss (markdown-fenced, pretty-printed), so it
-            # needs generous headroom to emit the full scored array (validated live).
-            max_tokens=1500,
-            db_pool=self.db_pool,
-            purpose="intel_score_significance",
-            agent_id=self.agent_id,
-        )
+        try:
+            result = await self.llm_client.think(
+                prompt=items_text,
+                model=self.model_light,
+                system_prompt=(
+                    "Rate each news item 1-5 for significance to a user interested in: "
+                    f"{topic_desc}. Consider: relevance, novelty, potential impact on financial/life decisions. "
+                    'Return JSON array: [{"index": 0, "score": 4, "reason": "<max 10 words>"}]'
+                ),
+                # gemma4:e2b returns EMPTY content below ~900 tokens for this task and
+                # is more verbose than gpt-oss (markdown-fenced, pretty-printed), so it
+                # needs generous headroom to emit the full scored array (validated live).
+                max_tokens=1500,
+                db_pool=self.db_pool,
+                purpose="intel_score_significance",
+                agent_id=self.agent_id,
+            )
+        except LLMTruncationError as exc:
+            # think() raises this AFTER a successful HTTP call and OUTSIDE its
+            # own failure-recording try, so nothing reaches llm_calls unless we
+            # write it here. Without this row a model that truncates every scan
+            # is indistinguishable from a model nobody called — the reporting
+            # gap behind issue #137, and the same class as #106. Same shape as
+            # services/capture_classify.py::_classify (the reference site).
+            await record_llm_call(
+                self.db_pool,
+                model=self.model_light,
+                prompt_tokens=0,
+                completion_tokens=0,
+                latency_ms=int((time.monotonic() - _t0) * 1000),
+                purpose="intel_score_significance",
+                agent_id=self.agent_id,
+                status="error",
+                error=f"truncated: {exc}"[:500],
+            )
+            raise
         await record_llm_call(
             self.db_pool,
             model=result.get("model", self.model_light),
