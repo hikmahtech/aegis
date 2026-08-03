@@ -60,17 +60,52 @@ class IntelligenceScanFlow:
         )
         items = scan_result.items
         raw_count = len(items)
+        # Partial-search marker, threaded into every return below so a scan
+        # that lost some topics is never indistinguishable from a quiet one.
+        degraded: dict = {}
+        if scan_result.failed_topics:
+            degraded["search_degraded"] = True
+            degraded["failed_topics"] = list(scan_result.failed_topics)
 
         if not items:
-            return {"source": input.source, "raw": 0, "novel": 0, "ingested": 0}
+            return {
+                "source": input.source,
+                "raw": 0,
+                "novel": 0,
+                "ingested": 0,
+                **degraded,
+            }
 
-        # 2. Dedup against KG
-        novel = await workflow.execute_activity(
-            "dedup_items",
-            items,
-            start_to_close_timeout=_ACT_TIMEOUT,
-            retry_policy=ACT_RETRY,
-        )
+        # 2. Dedup against KG — graceful-degrade guard. dedup_items is a
+        # best-effort filter: its own per-item handler already treats an
+        # unreachable knowledge store as "novel". But when the store got slow
+        # the ACTIVITY blew its 60s ceiling, and ACT_RETRY's 3 attempts turned
+        # that into a ~183s hard workflow failure — the exact signature of the
+        # 9 timed-out runs in issue #136 (duration_ms 186-189k on 07-16/17/21,
+        # = 60+1+60+2+60 plus the search). Retrying is actively harmful here:
+        # Temporal does not cancel a non-heartbeating activity when
+        # start_to_close fires, so each retry stacks another in-flight scan on
+        # the store that was already too slow to answer. Fail fast (RETRY_ONCE)
+        # and fall back to "everything is novel" — the same answer dedup gives
+        # per-item when the store is down. The pgvector plan fix in
+        # services/knowledge.py::search removed the known cause; this guard
+        # stops the next slow-store episode from failing the scan at all.
+        try:
+            novel = await workflow.execute_activity(
+                "dedup_items",
+                items,
+                start_to_close_timeout=_ACT_TIMEOUT,
+                retry_policy=RETRY_ONCE,
+            )
+        except Exception as exc:
+            workflow.logger.warning(
+                "intel_dedup_degraded source=%s raw=%d err=%s",
+                input.source,
+                raw_count,
+                str(exc)[:200],
+            )
+            novel = items
+            degraded["dedup_degraded"] = True
         novel_count = len(novel)
 
         if not novel:
@@ -79,6 +114,7 @@ class IntelligenceScanFlow:
                 "raw": raw_count,
                 "novel": 0,
                 "ingested": 0,
+                **degraded,
             }
 
         # 3. Score — graceful-degrade guard. score_significance runs on
@@ -108,6 +144,7 @@ class IntelligenceScanFlow:
                 "raw": raw_count,
                 "novel": novel_count,
                 "ingested": 0,
+                **degraded,
                 "score_degraded": True,
             }
 
@@ -119,6 +156,7 @@ class IntelligenceScanFlow:
                 "raw": raw_count,
                 "novel": novel_count,
                 "ingested": 0,
+                **degraded,
             }
 
         # 5. Capture worthy items to Todoist Inbox
@@ -168,4 +206,5 @@ class IntelligenceScanFlow:
             "novel": novel_count,
             "scored_worthy": len(worthy),
             "ingested": ingested,
+            **degraded,
         }
