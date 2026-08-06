@@ -35,12 +35,17 @@ _calls: dict[str, list] = {
     "send_card": [],
     "capture_to_inbox": [],
     "send_system_event": [],
+    "unread_check": [],
 }
+
+# What `is_message_unread` reports. Flipped to False by the already-read test.
+_still_unread: list[bool] = [True]
 
 
 def _reset() -> None:
     for v in _calls.values():
         v.clear()
+    _still_unread[0] = True
 
 
 # ---------------------------------------------------------------------------
@@ -262,27 +267,37 @@ async def stub_fetch_urgent(inp) -> FetchEmailsResult:
     )
 
 
+@activity.defn(name="is_message_unread")
+async def stub_is_message_unread(account_label: str, message_id: str) -> bool:
+    _calls["unread_check"].append((account_label, message_id))
+    return _still_unread[0]
+
+
+_STUBS_URGENT = [
+    stub_list,
+    stub_fetch_urgent,
+    stub_classify,
+    stub_fetch_thread,
+    stub_apply_label,
+    stub_send_message,
+    stub_cursor,
+    stub_idem,
+    stub_insert_ia,
+    stub_send_card,
+    stub_resolve,
+    stub_timeout,
+    stub_capture_to_inbox,
+    stub_send_system_event,
+    stub_is_message_unread,
+]
+
+
 @pytest.mark.asyncio
 async def test_classifies_and_routes_important_action():
     """'urgent' subject → classified important_action → captured to Todoist Inbox."""
     _reset()
 
-    stubs_urgent = [
-        stub_list,
-        stub_fetch_urgent,
-        stub_classify,
-        stub_fetch_thread,
-        stub_apply_label,
-        stub_send_message,
-        stub_cursor,
-        stub_idem,
-        stub_insert_ia,
-        stub_send_card,
-        stub_resolve,
-        stub_timeout,
-        stub_capture_to_inbox,
-        stub_send_system_event,
-    ]
+    stubs_urgent = _STUBS_URGENT
 
     async with (
         await WorkflowEnvironment.start_time_skipping() as env,
@@ -324,6 +339,46 @@ async def test_classifies_and_routes_important_action():
     assert not any(c[0] == "approval" for c in _calls["insert_ia"])
     # No ARCHIVE label
     assert not any(c[2] == "ARCHIVE" for c in _calls["apply_label"])
+    # The live-unread check ran before we interrupted
+    assert _calls["unread_check"] == [("sebas", "msg-urgent-1")]
+
+
+@pytest.mark.asyncio
+async def test_already_read_email_is_labelled_but_never_interrupts():
+    """The user's ask: don't tell me about mail I've already read.
+
+    The fetch query is `is:unread`, but classification lands minutes later and
+    mail gets read on a phone in between — so the important_action path re-reads
+    the live state before the two things that cost attention. Labelling still
+    happens, which keeps the triage_accuracy feedback data consistent.
+
+    Fails if the guard is dropped, or if it starts suppressing the label too.
+    """
+    _reset()
+    _still_unread[0] = False
+
+    async with (
+        await WorkflowEnvironment.start_time_skipping() as env,
+        Worker(
+            env.client,
+            task_queue="tq",
+            workflows=[GmailIngestFlow, InteractionFlow],
+            activities=_STUBS_URGENT,
+        ),
+    ):
+        result = await env.client.execute_workflow(
+            GmailIngestFlow.run,
+            GmailIngestInput(agent_id="sebas", aegis_ui_url="https://x"),
+            id="gmail-already-read-1",
+            task_queue="tq",
+        )
+
+    assert result["by_category"].get("important_action") == 1
+    assert _calls["capture_to_inbox"] == [], "must not create a task for mail already read"
+    assert _calls["send_system_event"] == [], "must not ping chat about mail already read"
+    assert [c[2] for c in _calls["apply_label"]] == ["IMPORTANT"], (
+        f"still label it so the feedback loop stays consistent, got {_calls['apply_label']}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -914,9 +969,14 @@ async def stub_fetch_receipt_redesign(inp) -> FetchEmailsResult:
 
 
 @pytest.mark.asyncio
-async def test_important_read_labels_important_and_skips_ping():
-    """receipt subject → important_read → apply_label IMPORTANT, NOT READ, and
-    no per-email chat ping."""
+async def test_important_read_labels_important_and_marks_read_without_pinging():
+    """receipt subject → important_read → the IMPORTANT_READ verdict (label it,
+    clear UNREAD) and no per-email chat ping.
+
+    This tier used to KEEP the mail unread, and nothing ever cleared it. At 68%
+    of all triaged mail that turned the unread count into a strictly increasing
+    function of time. Fails if keep-unread comes back.
+    """
     _reset()
     async with (
         await WorkflowEnvironment.start_time_skipping() as env,
@@ -947,8 +1007,7 @@ async def test_important_read_labels_important_and_skips_ping():
 
     assert result["by_category"].get("important_read") == 1
     labels = [c[2] for c in _calls["apply_label"]]
-    assert "IMPORTANT" in labels, f"expected IMPORTANT label, got {labels}"
-    assert "READ" not in labels, f"important_read must stay unread, got {labels}"
+    assert labels == ["IMPORTANT_READ"], f"expected the IMPORTANT_READ verdict, got {labels}"
     assert _calls["send_message"] == [], "important_read must not send a chat ping anymore"
 
 

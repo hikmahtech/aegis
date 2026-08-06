@@ -178,9 +178,28 @@ Owner-scheduled flows are listed in the Personalities table above. The remaining
 - `WorkspaceRepoSyncFlow` (Pandora's Actor, daily) — scans the coding host's workspace for git checkouts and makes the `resources` table mirror it (one `kind='repository'` row per checkout); also reports tracked GitHub repos whose AEGIS webhook is missing/dead (`check_github_webhooks`, detection only — it never creates a hook). It reports the **change, not the level** (#142): the standing set is ~14 of 33 and never reaches zero because most tracked checkouts are client repos that shouldn't carry a homelab webhook, so only `result_summary.webhooks_newly_missing` / `webhooks_recovered` warn, diffed against the previous run's own `workflow_runs` row. The full standing list stays in `result_summary.missing_webhooks` (and the flow is chat-triggerable) so it's still readable on demand. `webhook_check_status` (`ok`/`skipped`/`failed`) marks which runs are valid diff baselines — an inconclusive run must not reset the baseline to empty.
 - `MoneyProcessFlow` (Maou, child) — single-email money hygiene: `store_receipt_email` → `load_receipts` → `classify_and_extract` → `upsert_charges`. Spawned by `GmailIngestFlow` on `financial`/`payments` tags and by the weekly `ReceiptIngestFlow` safety-net. `ParentClosePolicy.ABANDON`; idempotent on `message_id` at the `store_receipt_email` step.
 
-### Email Triage Tag Fan-out
+### Email Triage
 
-`GmailIngestFlow` runs hourly. For each new message it calls `classify_email`, which returns a `category` AND a list of `tags` from a closed vocabulary (`financial`, `payments`, `receipt`, `subscription`, `security`, `calendar_invite`, `shipping`, `travel`, `health`, `work`, `personal`, `newsletter`, `technology`, `support`). Tags are additive and orthogonal to the routing category.
+`GmailIngestFlow` runs hourly over every `kind='email'` channel. `classify_email` resolves a category through a cheapest-signal-first cascade — a user `sender_overrides` rule, then the per-sender reputation cache (`triage_state`, short-circuits the LLM at n≥3 and confidence ≥0.75), then Gmail's promotions/social marker for unseen senders, then the LLM — and every *learned* verdict passes through `cap_notification_category`, which can only ever demote `important_action` to `important_read` when the subject matches a courtesy-notification marker.
+
+What each category does to the mail:
+
+| Category | Gmail | Elsewhere |
+|---|---|---|
+| `important_action` | `IMPORTANT`, left unread | Todoist Inbox task tagged `#email`; Slack ping when confidence > 0.9 and tagged `security`/`payments` |
+| `important_read` | `IMPORTANT`, **marked read** | ingested into the knowledge store |
+| `informational` / `useless` | `UNREAD` and `IMPORTANT` both removed | — |
+
+`important_action` is the only tier that interrupts, so it is guarded twice: the notification cap above, and a live `is_message_unread` re-read immediately before the task and the ping — mail you have already read on your phone gets labelled but never interrupts. Both guards fail open.
+
+Two knobs are yours, in the `settings` row `email_triage_rules` (edit it on the admin Settings page; the repo ships both empty so a fork carries nobody's mailbox — see `services/email_rules.py`):
+
+- `sender_overrides` — `{"@substack.com": "informational"}`. Exact address beats domain, decides outright with no LLM call, and deliberately writes no `triage_state`, so deleting a rule stops it applying instead of leaving learned state behind.
+- `extra_notification_markers` — extra subject substrings for the cap, for phrasing specific to your bank or tooling.
+
+Accuracy is scored in `triage_accuracy` from two independent human signals, both zero-effort: what you do to the mail's Gmail labels, and how you close the `#email` task AEGIS created (`#trash` or `@reference` ⇒ "this needed nothing from me"). Both feed `triage_state` through the same disagreement arithmetic, so a correction demotes a sender rather than overriding it.
+
+For each new message `classify_email` also returns a list of `tags` from a closed vocabulary (`financial`, `payments`, `receipt`, `subscription`, `security`, `calendar_invite`, `shipping`, `travel`, `health`, `work`, `personal`, `newsletter`, `technology`, `support`). Tags are additive and orthogonal to the routing category.
 
 Specialist flows subscribe to tag subsets and run as abandoned children:
 

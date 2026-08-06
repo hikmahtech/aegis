@@ -230,9 +230,9 @@ def test_module_workflows_is_the_unflagged_registry():
         # Then +1 activity and NO new flow from #215's `deliver_briefing`, which
         # renders the health block and sends it inside one activity so the
         # readings never become an argument or a result.
-        (True, True, 38, 187),
-        (False, False, 30, 158),
-        (True, False, 34, 176),
+        (True, True, 38, 188),
+        (False, False, 30, 159),
+        (True, False, 34, 177),
     ],
 )
 def test_real_registration_passes_the_boot_check(homelab, money, flows, activities):

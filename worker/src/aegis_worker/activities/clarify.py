@@ -395,6 +395,19 @@ _NOTIFICATION_MARKERS = (
     "just messaged you",          # LinkedIn/social relay pings
     "new jobs for you",           # job-board digests
     "recovered successfully",     # post-hoc "your account was recovered"
+    # Added 2026-08-06 by the email-triage audit. The sign-in family was the
+    # single loudest source of false interrupts — "Account Activity: New Sign-In
+    # detected" and friends became Todoist tasks for logins the user had just
+    # performed themselves. Kept narrow on purpose: a bare "sign in" would catch
+    # magic-link mail you actually need, and anything fraud-shaped ("unusual
+    # activity", a specific bank's phrasing) belongs in the per-user
+    # `extra_notification_markers` setting, not in the shared default.
+    "new sign-in",
+    "new sign in",
+    "sign-in detected",
+    "sign in detected",
+    "signed in to",
+    "new device",
 )
 
 
