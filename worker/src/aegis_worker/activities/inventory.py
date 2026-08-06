@@ -249,10 +249,14 @@ class InventoryActivities:
         Soft-fails per repo: a repo where `gh` errors (missing binary, 404,
         auth failure, timeout, ...) is skipped with a debug log rather than
         counted as missing — an inconclusive check must never look like a
-        confirmed gap.
+        confirmed gap. **Nor like a fix**: an inconclusive repo is excluded
+        from the delta entirely and keeps its previous verdict in the standing
+        list, so a flaky `gh` call can't manufacture a recovery one day and a
+        `webhooks_newly_missing` warning the next.
 
         Returns {missing_webhooks, missing_webhooks_count, webhooks_newly_missing,
-        webhooks_recovered, checked, skipped, webhook_check_status}.
+        webhooks_recovered, webhooks_inconclusive, checked, skipped,
+        webhook_check_status}.
         """
         if not self.remote_script:
             logger.debug("github_webhook_check_no_remote_script")
@@ -270,9 +274,9 @@ class InventoryActivities:
         await self.remote_script.ensure_config()
         host = self.remote_script.workspace_scan_host()
 
-        missing: list[str] = []
-        checked = 0
-        skipped = 0
+        confirmed_missing: list[str] = []
+        checked_repos: list[str] = []
+        inconclusive: list[str] = []
         for repo in repos:
             activity.heartbeat(repo)
             result = await self.remote_script.run_on_host(
@@ -286,21 +290,32 @@ class InventoryActivities:
                     repo=repo,
                     error=(result.get("stderr") or "")[:200],
                 )
-                skipped += 1
+                inconclusive.append(repo)
                 continue
             present = _aegis_webhook_present(result.get("stdout", ""))
             if present is None:
                 logger.debug("github_webhook_check_unparseable", repo=repo)
-                skipped += 1
+                inconclusive.append(repo)
                 continue
-            checked += 1
+            checked_repos.append(repo)
             if not present:
-                missing.append(repo)
+                confirmed_missing.append(repo)
 
         previous = await self._previous_missing_webhooks()
         baseline = set(previous or [])
-        newly_missing = sorted(set(missing) - baseline)
-        recovered = sorted(baseline - set(missing))
+        confirmed = set(confirmed_missing)
+        # A repo whose check was inconclusive keeps its last known verdict
+        # instead of silently leaving the set (#142): ~15 of 48 tracked repos
+        # 404 on `gh api .../hooks` every run because the token isn't an admin
+        # there, and any one of them can flip in or out of that group on a
+        # transient failure. Dropping it read as "recovered", and its return
+        # the next day as "newly missing" — a warning about a webhook that
+        # never changed. So the delta is computed over conclusively-checked
+        # repos only, and the standing list carries the rest forward.
+        carried = sorted(baseline & set(inconclusive))
+        missing = sorted(confirmed.union(carried))
+        newly_missing = sorted(confirmed - baseline)
+        recovered = sorted((baseline & set(checked_repos)) - confirmed)
 
         # Only a CHANGE warns. The standing set is a debug line — see #142.
         if newly_missing:
@@ -320,8 +335,12 @@ class InventoryActivities:
             "missing_webhooks_count": len(missing),
             "webhooks_newly_missing": newly_missing,
             "webhooks_recovered": recovered,
-            "checked": checked,
-            "skipped": skipped,
+            # Named, not just counted: these are the repos whose entry in
+            # `missing_webhooks` is a carried-forward verdict rather than a
+            # fresh observation.
+            "webhooks_inconclusive": sorted(inconclusive),
+            "checked": len(checked_repos),
+            "skipped": len(inconclusive),
             "webhook_check_status": "ok",
         }
 
@@ -410,6 +429,7 @@ def _webhook_check_skipped() -> dict:
         "missing_webhooks_count": 0,
         "webhooks_newly_missing": [],
         "webhooks_recovered": [],
+        "webhooks_inconclusive": [],
         "checked": 0,
         "skipped": 0,
         "webhook_check_status": "skipped",

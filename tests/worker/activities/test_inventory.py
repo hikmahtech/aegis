@@ -233,6 +233,7 @@ async def test_check_github_webhooks_no_remote_script_returns_empty():
         "missing_webhooks_count": 0,
         "webhooks_newly_missing": [],
         "webhooks_recovered": [],
+        "webhooks_inconclusive": [],
         "checked": 0,
         "skipped": 0,
         # Not "ok": an unchecked run must never become the delta baseline.
@@ -396,6 +397,83 @@ async def test_check_github_webhooks_standing_set_does_not_warn(db_pool):
     assert [e["event"] for e in logs if e["event"] == "github_webhooks_missing_unchanged"] == [
         "github_webhooks_missing_unchanged"
     ]
+
+
+@pytest.mark.asyncio
+async def test_check_github_webhooks_inconclusive_repo_is_not_a_recovery(db_pool):
+    """A repo we could not check is not a repo that got fixed (#142).
+
+    `acme/beta` was missing last run and `gh` 404s on it this run. Prod does
+    this to ~15 of 48 repos every day, and one of them wobbled in and out on
+    2026-08-05/06. Its verdict must carry forward, and the delta must stay
+    empty in BOTH directions.
+    """
+    await _clean_test_resources(db_pool)
+    await _clean_webhook_runs(db_pool)
+    await _seed_prior_run(db_pool, ["acme/beta"])
+    await _seed_repos(db_pool, ["acme/alpha", "acme/beta"])
+    fake = FakeRemoteScript(
+        hook_responses={
+            **_hooks(present=["acme/alpha"], absent=[]),
+            "acme/beta": {"status": "failed", "stderr": "gh: Not Found (HTTP 404)"},
+        }
+    )
+    inv = _make_inv(db_pool=db_pool, remote_script=fake)
+
+    with capture_logs() as logs:
+        result = await ActivityEnvironment().run(inv.check_github_webhooks)
+    await _clean_test_resources(db_pool)
+    await _clean_webhook_runs(db_pool)
+
+    assert result["webhooks_recovered"] == []
+    assert result["webhooks_newly_missing"] == []
+    # Carried forward, so tomorrow's baseline still knows beta is missing.
+    assert result["missing_webhooks"] == ["acme/beta"]
+    assert result["webhooks_inconclusive"] == ["acme/beta"]
+    assert result["checked"] == 1
+    assert result["skipped"] == 1
+    assert [e for e in logs if e["log_level"] == "warning"] == []
+
+
+@pytest.mark.asyncio
+async def test_check_github_webhooks_flake_then_return_does_not_warn(db_pool):
+    """The prod false alarm, end to end (#142).
+
+    Two real runs: `acme/beta` is inconclusive in run 1 (recorded as its own
+    baseline), then conclusively missing again in run 2. Before the fix run 1
+    reported it recovered and run 2 warned it was newly missing — for a
+    webhook that never changed. `acme/gamma`, genuinely new, still warns, so
+    a silent run 2 can't pass by having broken the warning outright.
+    """
+    await _clean_test_resources(db_pool)
+    await _clean_webhook_runs(db_pool)
+    await _seed_prior_run(db_pool, ["acme/beta"], minutes_ago=120)
+    await _seed_repos(db_pool, ["acme/beta", "acme/gamma"])
+
+    flaky = FakeRemoteScript(
+        hook_responses={
+            **_hooks(present=["acme/gamma"], absent=[]),
+            "acme/beta": {"status": "failed", "stderr": "gh: Not Found (HTTP 404)"},
+        }
+    )
+    inv = _make_inv(db_pool=db_pool, remote_script=flaky)
+    run_one = await ActivityEnvironment().run(inv.check_github_webhooks)
+    # Run 1's own output becomes run 2's baseline, exactly as prod records it.
+    await _seed_prior_run(db_pool, run_one["missing_webhooks"], minutes_ago=60)
+
+    healthy = FakeRemoteScript(hook_responses=_hooks(present=[], absent=["acme/beta", "acme/gamma"]))
+    inv = _make_inv(db_pool=db_pool, remote_script=healthy)
+    with capture_logs() as logs:
+        run_two = await ActivityEnvironment().run(inv.check_github_webhooks)
+    await _clean_test_resources(db_pool)
+    await _clean_webhook_runs(db_pool)
+
+    assert run_one["webhooks_recovered"] == []
+    assert run_two["webhooks_newly_missing"] == ["acme/gamma"]
+    assert run_two["missing_webhooks"] == ["acme/beta", "acme/gamma"]
+    warnings = [e for e in logs if e["event"] == "github_webhooks_newly_missing"]
+    assert len(warnings) == 1
+    assert warnings[0]["repos"] == ["acme/gamma"]
 
 
 @pytest.mark.asyncio

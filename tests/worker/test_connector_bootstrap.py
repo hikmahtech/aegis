@@ -168,6 +168,7 @@ async def test_dependent_activity_fails_with_the_reason_instead_of_a_clean_lie(
             "missing_webhooks_count": 0,
             "webhooks_newly_missing": [],
             "webhooks_recovered": [],
+            "webhooks_inconclusive": [],
             "checked": 0,
             "skipped": 0,
             "webhook_check_status": "skipped",
