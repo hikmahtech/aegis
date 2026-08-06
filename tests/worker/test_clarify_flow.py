@@ -29,7 +29,9 @@ class _StubActs:
             }
         ]
 
-    async def classify_one(self, task: dict) -> dict:
+    async def classify_one(self, task: dict, agent_id: str | None = None) -> dict:
+        # This class claims to mirror ClarifyActivities's surface, so it tracks
+        # the real arity even though the shim below calls it with one arg.
         return {
             "classification": "next_action",
             "confidence": 0.9,
@@ -69,13 +71,20 @@ async def test_clarify_flow_processes_one_task() -> None:
         # regression that defaults bump_watermark=False on the happy path
         # would silently cost a full re-classify per tick.
         bumps_seen: list[bool] = []
+        # The flow must hand classify_one its OWNING agent, which is what makes
+        # the resulting `llm_calls` row attributable. Accepting the kwarg is not
+        # the same as receiving the right value: prod recorded 54/54
+        # clarify_classification rows with a NULL agent_id while every other
+        # purpose sat at 100%, so this asserts the value, not the arity.
+        agents_seen: list[str | None] = []
 
         @activity.defn(name="find_unclassified_items")
         async def find_unclassified_items(max_items: int = 20):
             return await stub.find_unclassified_items(max_items)
 
         @activity.defn(name="classify_one")
-        async def classify_one(task: dict):
+        async def classify_one(task: dict, agent_id: str | None = None):
+            agents_seen.append(agent_id)
             return await stub.classify_one(task)
 
         @activity.defn(name="apply_outcome")
@@ -119,6 +128,10 @@ async def test_clarify_flow_processes_one_task() -> None:
             assert bumps_seen == [True], (
                 f"applied=True happy path must bump watermark, got: {bumps_seen}"
             )
+            assert agents_seen == ["sebas"], (
+                "classify_one must receive the flow's owning agent_id so the "
+                f"llm_calls row is attributable, got: {agents_seen}"
+            )
 
 
 @pytest.mark.asyncio
@@ -132,7 +145,7 @@ async def test_clarify_flow_no_tasks_returns_zero_counts() -> None:
             return []
 
         @activity.defn(name="classify_one")
-        async def classify_one(task: dict):
+        async def classify_one(task: dict, agent_id: str | None = None):
             raise AssertionError("must not be called")
 
         @activity.defn(name="apply_outcome")
@@ -211,7 +224,7 @@ async def test_clarify_flow_spawns_interaction_when_payload_returned() -> None:
             ]
 
         @activity.defn(name="classify_one")
-        async def classify_one(task: dict):
+        async def classify_one(task: dict, agent_id: str | None = None):
             return {
                 "classification": "someday",
                 "confidence": 0.4,
@@ -315,7 +328,7 @@ async def test_clarify_flow_no_spawn_when_applied_true() -> None:
             ]
 
         @activity.defn(name="classify_one")
-        async def classify(task: dict):
+        async def classify(task: dict, agent_id: str | None = None):
             return {
                 "classification": "next_action",
                 "confidence": 0.9,
@@ -408,7 +421,7 @@ async def test_clarify_flow_spawns_alert_investigation_for_pandora_path() -> Non
             ]
 
         @activity.defn(name="classify_one")
-        async def classify_one(task: dict):
+        async def classify_one(task: dict, agent_id: str | None = None):
             return {
                 "classification": "pandora_investigation",
                 "confidence": 1.0,
@@ -504,7 +517,7 @@ async def test_clarify_flow_pandora_unapplied_does_not_bump_watermark() -> None:
             }]
 
         @activity.defn(name="classify_one")
-        async def classify_one(task: dict):
+        async def classify_one(task: dict, agent_id: str | None = None):
             return {
                 "classification": "pandora_followup",
                 "confidence": 1.0,
@@ -606,7 +619,7 @@ async def test_reference_verdict_demotes_when_complete_permanently_fails() -> No
             ]
 
         @activity.defn(name="classify_one")
-        async def classify(task: dict):
+        async def classify(task: dict, agent_id: str | None = None):
             return {
                 "classification": "reference",
                 "confidence": 0.95,

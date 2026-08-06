@@ -64,16 +64,30 @@ def parse_llm_json(raw: str) -> Any | None:
         return None
 
 
-_REASONING_MIN_TOKENS = 2048
+# 2048 was too tight in practice: prod ran 11/54 clarify_classification calls
+# and 1/3 daylog_narrative calls straight into empty-content truncation, and
+# 6/42 intel_score_significance calls came back clipped at exactly 2048 wearing
+# a success label. The largest *successful* visible output observed anywhere is
+# 2944 tokens, and that came from the one call site that already passes a 4000
+# budget of its own — so 4096 clears every real output with headroom.
+_REASONING_MIN_TOKENS = 4096
+
+# Substring match, because the tier map resolves to bare proxy names that carry
+# no "reasoning" marker of their own. Both families billed hidden
+# reasoning_content against max_tokens in prod. A model outside this list falls
+# back to the caller's raw budget, so add new reasoning models here when the
+# tier map moves — a missing entry is silent, not loud (that is exactly how
+# qwen3.5:9b came to run briefing_frame at a raw 2000 and fail 3/3).
+_REASONING_MODELS = ("kimi", "qwen")
 
 
 def _reasoning_floor(model: str, max_tokens: int) -> int:
-    """Reasoning models (kimi) bill hidden reasoning_content against max_tokens,
+    """Reasoning models bill hidden reasoning_content against max_tokens,
     so tight caller budgets (512-1000) truncate to empty visible content.
 
     # ponytail: floor the budget here instead of touching every call site.
     """
-    if "kimi" in model and max_tokens < _REASONING_MIN_TOKENS:
+    if any(m in model for m in _REASONING_MODELS) and max_tokens < _REASONING_MIN_TOKENS:
         return _REASONING_MIN_TOKENS
     return max_tokens
 
@@ -354,7 +368,27 @@ class LLMClient:
                 )
                 raise LLMTruncationError(detail)
 
-            span.set_attribute("llm.status", "success")
+            # The OTHER truncation: budget exhausted AFTER some visible content
+            # was written. `finish_reason=length` with a non-empty body is a
+            # response cut mid-sentence — for a JSON caller that means a short
+            # array or an unparseable tail, and prod ran 6/42
+            # intel_score_significance calls into it, every one recorded as a
+            # plain success. It is deliberately NOT raised: partial content is
+            # often still usable, and the callers that parse it already handle
+            # a short/failed parse. It gets its own status so the failure mode
+            # stops hiding inside the success count.
+            clipped = finish_reason == "length"
+            if clipped:
+                span.set_attribute("llm.status", "clipped")
+                logger.warning(
+                    "llm_clipped",
+                    model=model,
+                    max_tokens=max_tokens,
+                    output_tokens=completion_tokens,
+                    purpose=purpose,
+                )
+            else:
+                span.set_attribute("llm.status", "success")
             await self._record_call(
                 db_pool,
                 model,
@@ -363,6 +397,14 @@ class LLMClient:
                 _t0,
                 prompt_tokens=prompt_tokens,
                 completion_tokens=completion_tokens,
+                status="clipped" if clipped else "success",
+                error=(
+                    f"clipped: model={model} hit finish_reason=length after "
+                    f"{completion_tokens} visible tokens (max_tokens={max_tokens}); "
+                    "content may be cut mid-response"
+                    if clipped
+                    else None
+                ),
             )
 
             logger.debug(

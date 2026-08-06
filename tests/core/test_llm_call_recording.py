@@ -99,6 +99,49 @@ async def test_a_truncated_think_writes_one_error_row(pool):
     assert rows[0]["output_tokens"] == 256
 
 
+async def test_a_clipped_think_records_clipped_not_success(pool):
+    """finish_reason=length WITH visible content is the other truncation: the
+    response was cut mid-write. It must not be raised (partial content is often
+    usable) and must not be filed as a plain success — prod ran 6/42
+    intel_score_significance calls into this and every one counted as healthy.
+    """
+    purpose = f"{_PREFIX}think-clipped"
+    client = StubbedLLMClient(
+        db_pool=pool,
+        content='[{"topic": "half an ans',
+        finish_reason="length",
+        prompt_tokens=40,
+        completion_tokens=2048,
+    )
+
+    # Deliberately does NOT raise — that is the behavioural contract.
+    result = await client.think(
+        "go", model="kimi-k2.5", db_pool=pool, purpose=purpose, agent_id=_AGENT
+    )
+    assert result["response"] == '[{"topic": "half an ans'
+
+    rows = await _rows(pool, purpose)
+    assert len(rows) == 1, f"expected exactly one row, got {len(rows)}"
+    assert rows[0]["status"] == "clipped", "a clipped call must not hide in the success count"
+    assert (rows[0]["error"] or "").startswith("clipped: ")
+    assert rows[0]["output_tokens"] == 2048
+
+
+async def test_an_uncut_think_is_still_plain_success(pool):
+    """Guard the other direction: normal completions must keep status=success,
+    or every dashboard that counts successes breaks."""
+    purpose = f"{_PREFIX}think-stop"
+    client = StubbedLLMClient(
+        db_pool=pool, content="all done", finish_reason="stop", prompt_tokens=5, completion_tokens=2
+    )
+
+    await client.think("go", model="kimi-k2.5", db_pool=pool, purpose=purpose, agent_id=_AGENT)
+
+    rows = await _rows(pool, purpose)
+    assert rows[0]["status"] == "success"
+    assert rows[0]["error"] is None
+
+
 async def test_a_failed_think_still_writes_one_row(pool):
     purpose = f"{_PREFIX}think-failed"
 

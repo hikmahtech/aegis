@@ -33,7 +33,9 @@ def _make_acts(found, decision_for, outcome_for, child_log):
         return found
 
     @activity.defn(name="classify_one")
-    async def classify(task):
+    async def classify(task, agent_id=None):
+        # Mirrors the real classify_one arity — see the note in
+        # test_clarify_flow_agent_error.py.
         return decision_for(task)
 
     @activity.defn(name="apply_outcome")

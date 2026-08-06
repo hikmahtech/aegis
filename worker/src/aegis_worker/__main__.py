@@ -175,7 +175,13 @@ async def main():
         knowledge_connector=connectors.get("knowledge"),
         core_api_url=getattr(settings, "core_api_url", "http://localhost:8080"),
         api_key=getattr(settings, "api_key", ""),
-        frame_model=getattr(settings, "model_balanced", "gpt-oss:20b"),
+        # `model_balanced` (the local, tier-resolved name), NOT the raw settings
+        # field. Reaching past the tier map here is what silently degraded the
+        # daily briefing for six days: decommissioning ollama-2 repointed the
+        # env var at a reasoning model, every other consumer kept resolving
+        # through the tier map, and this one call site inherited the new model
+        # alone and truncated on 100% of calls into a fallback nobody saw.
+        frame_model=model_balanced,
     )
     # Effective channel: an explicit AEGIS_CHANNEL wins; otherwise infer from
     # whether comms is wired (prod sets the comms URL but not AEGIS_CHANNEL on
@@ -477,7 +483,8 @@ async def main():
         temporal_host=getattr(settings, "temporal_host", None),
         llm_client=deps.llm,
         todoist_connector=todoist_connector,
-        frame_model=getattr(settings, "model_balanced", "gpt-oss:20b"),
+        # Tier-resolved, same reason as BriefingActivities above.
+        frame_model=model_balanced,
     )
     chat_act = ChatActivities(
         client=CoreClient(

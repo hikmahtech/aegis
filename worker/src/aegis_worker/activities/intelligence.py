@@ -119,6 +119,7 @@ class IntelligenceActivities:
         # the graph-claim extraction path is gone (no knowledge graph).
         ingested_ok = 0
         ingest_failures = 0
+        skipped_no_text = 0
         for a in analyses:
             # The intel-scan pipeline (activities/intel_scan.py::search_source)
             # emits items keyed `snippet`, not `summary` — gating on `summary`
@@ -148,6 +149,12 @@ class IntelligenceActivities:
                         (a.get("url") or "")[:120],
                         str(exc)[:200],
                     )
+            else:
+                # The third outcome, and until now the invisible one: the item
+                # carried no text at all, so it was never even attempted.
+                # Without its own counter a scored-worthy item that vanishes
+                # here is indistinguishable from one that failed to ingest.
+                skipped_no_text += 1
 
         # Observability: a silent 0-ingest despite worthy items is exactly the
         # bug that hid the snippet/summary mismatch for weeks — surface it.
@@ -162,4 +169,5 @@ class IntelligenceActivities:
             "ingested": ingested_ok,
             "failed": ingest_failures,
             "candidates": len(analyses),
+            "skipped_no_text": skipped_no_text,
         }

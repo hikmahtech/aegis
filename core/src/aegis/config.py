@@ -40,10 +40,15 @@ class Settings(BaseSettings):
     # Optional app secret for encrypting BYO provider keys stored in the DB
     # (Phase A). Unset → secrets stored plaintext (single-user self-hosted).
     secret_key: str = ""
-    # v3 model tiers — match config/models.yaml
+    # v3 model tiers — LAST-RESORT defaults; they must match config/models.yaml,
+    # which is itself only the fallback under the `settings.llm_backend` DB row.
+    # These read as dead config right up until the moment a yaml/DB lookup is
+    # missing and one of them silently becomes the live model, so a
+    # decommissioned name here is a live hazard: both of these said
+    # `gpt-oss:20b` for weeks after its host (ollama-2 on asif) left the swarm.
     model_fast: str = "gemma4:e2b"  # quick replies, low latency
-    model_balanced: str = "gpt-oss:20b"  # default chat + most flows (qwen3:14b retired)
-    model_smart: str = "gpt-oss:20b"  # long-context synthesis, Raphael (qwen3:32b retired)
+    model_balanced: str = "kimi-k2.5"  # default chat + most flows
+    model_smart: str = "claude-sonnet-5"  # long-context synthesis, Raphael
     # Active-work guard: lookback window for open-PR / recent-push / in-flight signals.
     active_work_lookback_hours: int = 48
     # Path to config/models.yaml — loaded at startup by app.lifespan.

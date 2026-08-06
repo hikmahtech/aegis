@@ -427,9 +427,10 @@ class ClarifyActivities:
     # DeliveryActivities to talk to the comms delivery server. Wired
     # in worker boot; None in unit tests that don't exercise notifications.
     delivery_connector: object | None = None
-    # primary_model defaults to qwen3:14b but the worker boot wires
-    # settings.model_balanced into it so operators can flip via
-    # AEGIS_MODEL_BALANCED=gemma4:e2b (etc.) without a code change.
+    # primary_model defaults to qwen3:14b but the worker boot wires the
+    # TIER-RESOLVED balanced model into it (__main__.py — the tier map first,
+    # AEGIS_MODEL_BALANCED only as fallback), so operators flip it by editing
+    # the tier map, not by setting the env var behind its back.
     primary_model: str = "qwen3:14b"
 
     @activity.defn
@@ -740,12 +741,17 @@ class ClarifyActivities:
         return any(marker in low for marker in _NOTIFICATION_MARKERS)
 
     @activity.defn
-    async def classify_one(self, task: dict) -> dict:
+    async def classify_one(self, task: dict, agent_id: str | None = None) -> dict:
         """Run the clarify decision for a single task.
 
         Returns a dict ready for log_classification + apply_outcome:
             {classification, confidence, assignee, contexts, reason,
              llm_model, prompt_tokens, completion_tokens, latency_ms}
+
+        `agent_id` is the owning agent from the flow config, threaded through
+        purely so the `llm_calls` row is attributable. Optional because the
+        activity is called directly in tests; a None just reproduces the old
+        unattributed row rather than failing.
         """
         if not await self._settings_bool("gtd_clarify_enabled", True):
             return {
@@ -932,6 +938,7 @@ class ClarifyActivities:
             model=self.primary_model,
             db_pool=self.db_pool,
             purpose="clarify_classification",
+            agent_id=agent_id,
         )
         primary, primary_pt, primary_ct = self._unpack_think_result(primary_result)
         primary_conf = float(primary.get("confidence") or 0.0)
