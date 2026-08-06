@@ -201,6 +201,21 @@ The page leads with **stuck senders**: those at n≥3 and confidence ≥0.75 sho
 
 Accuracy is scored in `triage_accuracy` from two independent human signals, both zero-effort: what you do to the mail's Gmail labels, and how you close the `#email` task AEGIS created (`#trash` or `@reference` ⇒ "this needed nothing from me"). Both feed `triage_state` through the same disagreement arithmetic, so a correction demotes a sender rather than overriding it.
 
+**Scope — AEGIS only owns mail it actually fetched.** The window is `is:unread newer_than:7d` *and* a forward-only cursor, so anything that ages out before a run sees it is never triaged, and never will be: widening the query cannot reach backwards, because each run advances the cursor to the newest message it saw. A backfill would need purpose-built oldest-first iteration. **Your unread count is therefore not a measure of triage health** — on the author's own accounts it was ~102,000, of which AEGIS had ever judged 2,366. Related: `is:unread is:important` is *not* "AEGIS labelled it" either; Gmail applies IMPORTANT at delivery, so 26,000 messages carried it while only 1,467 came from an AEGIS verdict. Any query about what triage did must intersect against `triage_accuracy.email_id`, never against a Gmail label.
+
+Two known gaps, both documented rather than fixed: a sender above the cache threshold [cannot self-heal from a wrong verdict](https://github.com/hikmahtech/aegis/issues/262), and an override [returns no tags, so overriding a biller silently stops receipt extraction](https://github.com/hikmahtech/aegis/issues/263). Useful checks:
+
+```sql
+-- who can still interrupt you, and can't correct itself
+SELECT email_addr, state, metadata FROM triage_state
+WHERE state = 'important_action'
+  AND (metadata->>'n')::int >= 3 AND (metadata->>'confidence')::float >= 0.75;
+
+-- is the feedback loop learning in both directions? (pre-2026-08 it could not)
+SELECT predicted, actual, corrected_by, count(*) FROM triage_accuracy
+WHERE actual IS NOT NULL GROUP BY 1,2,3 ORDER BY 4 DESC;
+```
+
 For each new message `classify_email` also returns a list of `tags` from a closed vocabulary (`financial`, `payments`, `receipt`, `subscription`, `security`, `calendar_invite`, `shipping`, `travel`, `health`, `work`, `personal`, `newsletter`, `technology`, `support`). Tags are additive and orthogonal to the routing category.
 
 Specialist flows subscribe to tag subsets and run as abandoned children:
