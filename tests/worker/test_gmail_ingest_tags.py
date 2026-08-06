@@ -30,6 +30,11 @@ class _FakeMoneyProcessFlow:
         return {"agent_id": agent_id}
 
 
+# Activities run OUTSIDE the workflow sandbox, so unlike the child-workflow
+# fake above, an activity stub can record what the flow actually passed it.
+_TRIAGE_ARGS: list[list] = []
+
+
 def _stubs(resolve_map):
     @activity.defn(name="list_active_channels")
     async def list_channels(kind):
@@ -67,6 +72,7 @@ def _stubs(resolve_map):
 
     @activity.defn(name="record_triage_outcome")
     async def record_triage(*a, **k):
+        _TRIAGE_ARGS.append(list(a))
         return None
 
     @activity.defn(name="update_channel_config_key")
@@ -92,6 +98,7 @@ def _stubs(resolve_map):
 async def _run(resolve_map, agent_id):
     """Run the flow over one financial email; return the fan-out child's
     received agent_id, or None if no MoneyProcessFlow child was spawned."""
+    _TRIAGE_ARGS.clear()
     async with await WorkflowEnvironment.start_time_skipping() as env:
         client: Client = env.client
         async with Worker(
@@ -128,3 +135,14 @@ async def test_financial_fanout_skipped_when_no_finance_agent():
     """No agent holds `finance` → the money fan-out is skipped entirely."""
     spawned_agent = await _run({}, agent_id="sebas")
     assert spawned_agent is None
+
+
+@pytest.mark.asyncio
+async def test_triage_prediction_records_owning_account():
+    """(#260) The prediction must carry the account whose mailbox holds the
+    message. record_triage_outcome is the only INSERT into triage_accuracy, so
+    if the flow doesn't pass the account here it is never recorded — and
+    recheck_triage_outcomes, which resolves rows with ONE account's token, has
+    no way to tell its own rows from another mailbox's."""
+    await _run({"finance": "money-agent"}, agent_id="sebas")
+    assert [a[3:] for a in _TRIAGE_ARGS] == [["acct"]]
