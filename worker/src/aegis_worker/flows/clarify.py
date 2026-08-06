@@ -174,7 +174,12 @@ class ClarifyFlow:
                 # occasionally longer. Use TIMEOUT_LLM (180s) not TIMEOUT_FAST.
                 decision = await workflow.execute_activity_method(
                     ClarifyActivities.classify_one,
-                    args=[task],
+                    # The flow's owning agent, threaded through so the
+                    # `llm_calls` row is attributable. #252 made this call site
+                    # start recording at all, which is how it arrived after
+                    # #107's attribution sweep and put 54/54 rows in with a
+                    # NULL agent_id while every other purpose was at 100%.
+                    args=[task, config.agent_id],
                     start_to_close_timeout=TIMEOUT_LLM,
                     retry_policy=NO_RETRY,
                 )

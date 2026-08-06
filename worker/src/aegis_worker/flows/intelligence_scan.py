@@ -199,6 +199,23 @@ class IntelligenceScanFlow:
         ingested = (
             ingest_result.get("ingested", 0) if isinstance(ingest_result, dict) else len(worthy)
         )
+        # Record WHY worthy items didn't land, not just how many did. Prod ran
+        # days of `scored_worthy: 5, ingested: 0` that were undiagnosable from
+        # the summary alone — "knowledge-store ingest is failing" and "the
+        # items carried no text" are different bugs and these two counters are
+        # what tells them apart. The activity already counted them; the flow
+        # was dropping them on the floor. Zeros are omitted so a healthy run
+        # reads exactly as it did before (`candidates` is skipped entirely —
+        # it is just len(worthy), which `scored_worthy` already reports).
+        ingest_detail = (
+            {
+                k: ingest_result[k]
+                for k in ("failed", "skipped_no_text")
+                if ingest_result.get(k)
+            }
+            if isinstance(ingest_result, dict)
+            else {}
+        )
 
         return {
             "source": input.source,
@@ -206,5 +223,6 @@ class IntelligenceScanFlow:
             "novel": novel_count,
             "scored_worthy": len(worthy),
             "ingested": ingested,
+            **ingest_detail,
             **degraded,
         }

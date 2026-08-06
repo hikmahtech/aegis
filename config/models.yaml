@@ -4,7 +4,7 @@
 
 tiers:
   fast:     "gemma4:e2b"              # quick chat, tight-loop classification (local ollama on meem)
-  balanced: "kimi-k2.5"               # default chat + most flows — Kimi-for-Coding via LiteLLM (flat-rate, tool-calling). Replaces gpt-oss:20b, whose host (ollama-2 on asif) is down indefinitely.
+  balanced: "kimi-k2.5"               # default chat + most flows — Kimi-for-Coding via LiteLLM (flat-rate, tool-calling). Replaced gpt-oss:20b, whose host (ollama-2 on asif) was decommissioned 2026-08.
   smart:    "claude-sonnet-5"         # Anthropic API via LiteLLM — reserved for chat; background flows should use balanced
 
 litellm:

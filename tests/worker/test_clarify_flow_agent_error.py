@@ -48,7 +48,11 @@ def _make_acts(found, decision_for, outcome_for, child_log):
         return found
 
     @activity.defn(name="classify_one")
-    async def classify(task):
+    async def classify(task, agent_id=None):
+        # Signature must track the real ClarifyActivities.classify_one — the
+        # flow passes the owning agent through for llm_calls attribution, and a
+        # stub stuck on the old arity fails the whole flow rather than the one
+        # assertion it was written to make.
         return decision_for(task)
 
     @activity.defn(name="apply_outcome")

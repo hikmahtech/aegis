@@ -491,7 +491,14 @@ class BriefingActivities:
                 narrative = (raw or "").strip() or fallback
             except Exception as exc:  # noqa: BLE001
                 activity.logger.warning("frame_briefing_llm_failed err=%s", str(exc)[:200])
-                narrative = fallback
+                # Keep shipping the briefing — "you always get one" is the point
+                # of the fallback — but SAY that it is the degraded one. This
+                # ran silently for six days: the flow reported `delivered`, the
+                # only trace was an `llm_calls` row nothing alerts on, and the
+                # reader had no way to tell a mechanical bullet list from a
+                # quiet morning. The daily reader is the cheapest monitor there
+                # is; this line is what lets them do the job.
+                narrative = f"{fallback}\n\n_(fallback summary — the briefing model failed)_"
         failures = self._format_failure_block(changes)
         return f"{narrative}\n\n{failures}" if failures else narrative
 
