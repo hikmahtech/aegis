@@ -335,8 +335,12 @@ The `activities` table drives Temporal schedules. Worker on startup queries acti
 | `workflow_runs` | Temporal workflow start / complete / fail via `WorkflowRunRecorderInterceptor` |
 
 `llm_calls` rows come from **one choke point**, `LLMClient._record_call` (issue #106):
-`think()`/`chat()` record every terminal outcome — success, `LLMTruncationError`, upstream
-failure — for any call that names a `purpose`. The pool is the client's own unless the caller
+`think()`/`chat()` record every terminal outcome — success, `clipped`, `LLMTruncationError`,
+upstream failure — for any call that names a `purpose`. `status` therefore has three values,
+not two: `clipped` marks a call that returned usable content but hit `finish_reason=length`
+mid-write, which previously counted as a clean success and hid steady truncation on the
+intelligence-scoring path (#255). Filter on `status <> 'success'` rather than `= 'error'` when
+asking "what is degrading". The pool is the client's own unless the caller
 passes `db_pool=`, so a client constructed with a pool records by construction while a client
 built without one (`routes/llm_backend.py::test_backend`) stays deliberately ungoverned. The
 kill switch produces no row on purpose: it raises before any HTTP request, so nothing was
