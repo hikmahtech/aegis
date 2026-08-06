@@ -84,6 +84,45 @@ to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **The daily briefing shipped fallback text for six days while reporting
+  `delivered`** (#255): decommissioning `ollama-2`/`asif` repointed
+  `AEGIS_MODEL_BALANCED` at `qwen3.5:9b`. Every consumer resolves models through
+  the tier map and was unaffected — but `worker/__main__.py:178`/`:480` wired
+  `frame_model` from the **raw** settings field, so `briefing_frame` alone
+  inherited the new model. `_reasoning_floor` matched only `"kimi"`, so it got no
+  floor at a raw `max_tokens=2000`, returned empty content on **3/3 calls daily
+  from 2026-08-01**, and `briefing.py`'s `except Exception` substituted the
+  mechanical `_format_changes_fallback` silently. Both sites now take the
+  tier-resolved local, `_REASONING_MODELS` covers `("kimi", "qwen")`, and the
+  floor is 4096 (the largest successful visible output ever observed is 2944).
+  The fallback still ships — "you always get a briefing" is deliberate — but now
+  appends a visible `(fallback summary — the briefing model failed)` marker,
+  because an `llm_calls` row is forensic pull-data nothing alerts on.
+- **Reasoning-budget truncation on the GTD and narrative paths** (#255):
+  `clarify_classification` failed 11/54 (20%) and `daylog_narrative` 1/3 on
+  `kimi-k2.5` at the old 2048 floor. Both clear it at 4096. No task was ever
+  stranded — the clarify watermark correctly stays NULL on a failed
+  classification so the item re-enters `find_unclassified_items` — but each
+  failure cost a wasted round trip.
+- **A clipped LLM response counted as a success** (#255): `finish_reason=length`
+  with **non-empty** content is a response cut mid-write, and it was recorded as
+  a clean success — hiding 6/42 `intel_score_significance` calls truncating at
+  exactly the floor. Now recorded as `llm_calls.status='clipped'`, deliberately
+  not raised, since partial content is usually still usable.
+- **`clarify_classification` spend was unattributable** (#255): all 54
+  post-#252 rows carried a NULL `agent_id` while every other high-volume purpose
+  sat at 100%, because #252 made the call site start recording *after* #107's
+  attribution sweep. `ClarifyFlow` now threads `config.agent_id` through.
+- **`IntelligenceScanFlow` couldn't explain a worthy-but-not-ingested item**
+  (#255): prod ran days of `scored_worthy: 5, ingested: 0` where "the knowledge
+  store is failing" and "the items carried no text" were indistinguishable from
+  the summary. Adds a `skipped_no_text` counter for the previously uncounted
+  third outcome and surfaces `failed`/`skipped_no_text` in the flow summary
+  (zeros omitted, so a healthy run reads as before).
+- **Decommissioned `gpt-oss:20b` removed as a live fallback** (#255):
+  `core/src/aegis/config.py` still defaulted `model_balanced`/`model_smart` to a
+  model whose host had left the swarm. These read as dead config right up until
+  a yaml/DB lookup is missing and one of them silently becomes the live model.
 - **`aegis_self_diagnose`'s 30s guillotine is now pinned by a test** (#140): the
   tool's 3/3 lifetime production timeouts (`latency_ms=30000`, 2026-07-15
   21:28-21:29 IST) were already fixed by #73 (`_TOOL_TIMEOUT_OVERRIDES`, merged
