@@ -31,10 +31,20 @@ pointing at a homelab endpoint. The alternative, auto-creating the hooks,
 was rejected: it is an outward-facing mutation against third-party repos,
 and the check has no way to tell "should have a webhook and doesn't" from
 "was never meant to have one", so it would mass-create ~14 unwanted hooks.
-Instead the warning now fires only on `webhooks_newly_missing` — a webhook
+Instead the warning fires only on `webhooks_newly_missing` — a webhook
 that vanished, or a newly-tracked repo — while the full standing list stays
 in `result_summary.missing_webhooks` and this flow is chat-triggerable, so
 the report is still reachable on demand rather than dropped.
+
+The delta then had to be made flake-proof to be worth anything. ~15 of 48
+tracked repos are permanently inconclusive (the token isn't an admin there,
+so `gh api .../hooks` 404s), and membership of that group wobbles run to
+run. Because an inconclusive repo simply fell out of `missing_webhooks`, it
+was reported as `webhooks_recovered` and then, on its return, warned about
+as `webhooks_newly_missing` — prod did exactly this to
+`arshadansari27/stranger-to-sold-site` on 2026-08-05/06 for a webhook that
+never changed. An inconclusive repo now keeps its previous verdict and stays
+out of the delta.
 """
 
 from __future__ import annotations
@@ -122,6 +132,7 @@ class WorkspaceRepoSyncFlow:
                 "missing_webhooks_count": 0,
                 "webhooks_newly_missing": [],
                 "webhooks_recovered": [],
+                "webhooks_inconclusive": [],
                 "webhook_check_status": "failed",
             }
 
