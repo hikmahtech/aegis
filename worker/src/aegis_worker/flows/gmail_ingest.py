@@ -294,11 +294,13 @@ class GmailIngestFlow:
         """Act on the email per its category. Returns the action string."""
         # Feedback loop: log this prediction and, on any later re-observation of
         # the same email, capture a user Gmail-label correction into
-        # triage_accuracy (the mis-triage signal). Fire-and-forget.
+        # triage_accuracy (the mis-triage signal). `label` records the owning
+        # account so the recheck re-reads it with THAT account's token (#260).
+        # Fire-and-forget.
         try:
             await workflow.execute_activity(
                 "record_triage_outcome",
-                args=[msg.get("id", ""), category, msg.get("labels") or []],
+                args=[msg.get("id", ""), category, msg.get("labels") or [], label],
                 start_to_close_timeout=TIMEOUT_FAST,
                 retry_policy=NO_RETRY,
             )

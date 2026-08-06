@@ -1,0 +1,26 @@
+-- 023: triage_accuracy.account_label — which Gmail account owns the message a
+-- prediction was made about (#260).
+--
+-- The table recorded a prediction per email_id but never which mailbox the
+-- email lived in, while `recheck_triage_outcomes` resolves rows with ONE
+-- account's token. A row belonging to another account 404s, is recorded as
+-- "unobservable", and gets last_checked_at stamped anyway (#115's
+-- anti-starvation rule) — which pushes it behind every unchecked row in the
+-- `ORDER BY last_checked_at ASC NULLS FIRST` queue. GmailIngestFlow runs the
+-- accounts in sequence, so account #1 stamped the other accounts' rows out of
+-- reach before they ever ran. A real human IMPORTANT label on any non-first
+-- account was structurally undetectable, and the row then aged into
+-- corrected_by='implicit' at day 7 — recording "AEGIS was right" about the one
+-- message the user had explicitly said it was wrong about. An INVERTED signal.
+--
+-- Written by record_triage_outcome (the only INSERT into this table); the
+-- recheck filters on it so each account only pulls, and only spends Gmail
+-- messages.get quota on, its own rows.
+--
+-- Rows written before this migration keep NULL and stay resolvable by ANY
+-- account (`account_label = $2 OR account_label IS NULL`) — the pre-existing
+-- best-effort behaviour, not a regression — and the population is self-
+-- draining: the recheck window is 7 days, so every legacy row is either scored
+-- or implicitly confirmed within a week of deploying this.
+
+ALTER TABLE triage_accuracy ADD COLUMN IF NOT EXISTS account_label text;

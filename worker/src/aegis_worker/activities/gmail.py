@@ -647,7 +647,13 @@ class GmailActivities:
             }
 
     @activity.defn
-    async def record_triage_outcome(self, email_id: str, predicted: str, labels: list[str]) -> dict:
+    async def record_triage_outcome(
+        self,
+        email_id: str,
+        predicted: str,
+        labels: list[str],
+        account_label: str = "",
+    ) -> dict:
         """Feedback loop: log the per-email prediction and capture user
         corrections into `triage_accuracy` (the only objective mis-triage signal
         — the table was previously unused). First sight inserts the prediction
@@ -655,6 +661,12 @@ class GmailActivities:
         the ORIGINAL prediction sets actual + corrected_by='user_gmail'. Records
         confirmations are not stored (only corrections), keeping the table a
         clean list of where AEGIS got it wrong. Fire-and-forget: never raises.
+
+        `account_label` records WHICH mailbox the message lives in (#260) — this
+        is the only INSERT into the table, so it is the only place that knowledge
+        exists to be captured. Without it `recheck_triage_outcomes` cannot tell
+        "this message is gone" from "this message belongs to someone else's
+        token".
         """
         if not email_id or not self.db_pool:
             return {"recorded": False}
@@ -666,9 +678,11 @@ class GmailActivities:
                 )
                 if row is None:
                     await conn.execute(
-                        "INSERT INTO triage_accuracy (email_id, predicted) VALUES ($1,$2)",
+                        "INSERT INTO triage_accuracy (email_id, predicted, account_label) "
+                        "VALUES ($1,$2,$3)",
                         email_id,
                         predicted,
+                        account_label or None,
                     )
                     return {"recorded": True, "outcome": "predicted"}
                 if row["actual"] is not None:
@@ -706,8 +720,7 @@ class GmailActivities:
             (#102) feed the sender back into `triage_state` so the correction
             actually changes a future verdict.
           - consistent → stamp last_checked_at and keep cycling.
-          - unobservable (deleted mail, or another account's — predictions
-            don't record their account) → stamp last_checked_at too (#115):
+          - unobservable (deleted mail) → stamp last_checked_at too (#115):
             leaving it NULL forever let an unresolvable row camp at the front
             of the NULLS-FIRST queue on every future call, starving
             genuinely-resolvable rows behind it once unresolvable rows ever
@@ -716,6 +729,17 @@ class GmailActivities:
             actively checked (#115 — silence is agreement applies equally to
             a row this loop never got to) → actual = predicted,
             corrected_by='implicit'.
+
+        Rows are scoped to `account_label` (#260). Selecting account-agnostically
+        while resolving with ONE account's token made every foreign row a 404 →
+        "unobservable" → stamped, and since the flow runs the accounts in
+        sequence, account #1 stamped the others' rows behind the NULLS-FIRST
+        queue before they ran. A real human IMPORTANT label on any non-first
+        account could therefore never be seen, and aged into
+        corrected_by='implicit' — inverting the user's verdict. Pre-#260 rows
+        have account_label NULL and stay resolvable by any account (unchanged
+        best-effort; they drain within the 7d window).
+
         Fire-and-forget: never raises.
         """
         empty = {
@@ -739,10 +763,12 @@ class GmailActivities:
             rows = await self.db_pool.fetch(
                 "SELECT id, email_id, predicted FROM triage_accuracy "
                 "WHERE actual IS NULL "
+                "  AND (account_label = $2 OR account_label IS NULL) "
                 "  AND created_at > now() - interval '7 days' "
                 "  AND created_at < now() - interval '1 hour' "
                 "ORDER BY last_checked_at ASC NULLS FIRST, created_at ASC LIMIT $1",
                 limit,
+                account_label,
             )
             checked = corrected = memories_written = senders_relearned = 0
             if rows:
@@ -775,7 +801,7 @@ class GmailActivities:
                                 hdrs["Subject"],
                                 hdrs["From"],
                             )
-                        except Exception:  # noqa: BLE001 — gone/foreign message
+                        except Exception:  # noqa: BLE001 — message gone
                             out[r["email_id"]] = None
                     return out
 
@@ -787,7 +813,10 @@ class GmailActivities:
                         # unobservable row doesn't win queue-front priority
                         # (NULLS FIRST) on every subsequent call, crowding out
                         # rows that ARE resolvable. It still ages into the
-                        # honest implicit-confirm path at the 7d mark.
+                        # honest implicit-confirm path at the 7d mark. Safe
+                        # now that the SELECT is account-scoped (#260): a miss
+                        # here means OUR message is gone, not that we asked the
+                        # wrong mailbox.
                         await self.db_pool.execute(
                             "UPDATE triage_accuracy SET last_checked_at=now() WHERE id=$1",
                             r["id"],

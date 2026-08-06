@@ -47,14 +47,17 @@ async def test_record_triage_outcome_first_sight_inserts(db_pool):
         await conn.execute("DELETE FROM triage_accuracy WHERE email_id='E_FB1'")
     act = GmailActivities(gmail_credentials_file="x", gmail_token_dir="x", db_pool=db_pool)
     env = ActivityEnvironment()
-    res = await env.run(act.record_triage_outcome, "E_FB1", "useless", ["INBOX"])
+    res = await env.run(act.record_triage_outcome, "E_FB1", "useless", ["INBOX"], "acct-b")
     assert res["outcome"] == "predicted"
     async with db_pool.acquire() as conn:
         row = await conn.fetchrow(
-            "SELECT predicted, actual FROM triage_accuracy WHERE email_id='E_FB1'"
+            "SELECT predicted, actual, account_label FROM triage_accuracy WHERE email_id='E_FB1'"
         )
     assert row["predicted"] == "useless"
     assert row["actual"] is None
+    # (#260) The owning mailbox is captured here or nowhere — this is the only
+    # INSERT into the table, and the recheck cannot re-derive it later.
+    assert row["account_label"] == "acct-b"
     async with db_pool.acquire() as conn:
         await conn.execute("DELETE FROM triage_accuracy WHERE email_id='E_FB1'")
 
@@ -128,6 +131,9 @@ class _FakeGmail:
         # can prove the From header is actually requested — a header the API
         # is never asked for comes back empty no matter what the fake holds.
         self.requested_headers: list[list[str]] = []
+        # (#260) Records which message ids this account was asked for, so a
+        # test can prove another account's rows aren't burning Gmail quota.
+        self.requested_ids: list[str] = []
 
     def users(self):
         return self
@@ -143,6 +149,7 @@ class _FakeGmail:
         metadataHeaders: list[str] | None = None,  # noqa: N803 — API shape
     ):
         self._current = id
+        self.requested_ids.append(id)
         self.requested_headers.append(list(metadataHeaders or []))
         return self
 
@@ -159,15 +166,17 @@ class _FakeGmail:
         return {"labelIds": labels, "payload": {"headers": headers}}
 
 
-async def _seed_prediction(db_pool, email_id, predicted, age, checked_age=None):
+async def _seed_prediction(db_pool, email_id, predicted, age, checked_age=None, account=None):
     await db_pool.execute(
-        "INSERT INTO triage_accuracy (email_id, predicted, created_at, last_checked_at) "
+        "INSERT INTO triage_accuracy "
+        "(email_id, predicted, created_at, last_checked_at, account_label) "
         "VALUES ($1, $2, now() - ($3::text)::interval, "
-        "        CASE WHEN $4::text IS NULL THEN NULL ELSE now() - ($4::text)::interval END)",
+        "        CASE WHEN $4::text IS NULL THEN NULL ELSE now() - ($4::text)::interval END, $5)",
         email_id,
         predicted,
         age,
         checked_age,
+        account,
     )
 
 
@@ -176,7 +185,9 @@ async def _wipe(db_pool):
     await db_pool.execute(
         "DELETE FROM agent_memory WHERE agent_id='sebas' AND content LIKE '%[gmail:E_RC%'"
     )
-    await db_pool.execute("DELETE FROM triage_state WHERE email_addr LIKE 'zz102-%'")
+    await db_pool.execute(
+        "DELETE FROM triage_state WHERE email_addr LIKE 'zz102-%' OR email_addr LIKE 'zz260-%'"
+    )
 
 
 async def test_recheck_corrects_from_current_labels(db_pool, monkeypatch):
@@ -289,6 +300,50 @@ async def test_recheck_unobservable_message_stamps_last_checked_at(db_pool, monk
     )
     assert row["actual"] is None
     assert row["last_checked_at"] is not None  # no longer camps at queue-front forever
+    await _wipe(db_pool)
+
+
+async def test_recheck_scopes_rows_to_their_owning_account(db_pool, monkeypatch):
+    """(#260) A correction on the SECOND account must be detected.
+
+    Predictions used to be selected account-agnostically and resolved with one
+    account's token, so account #1 404'd on account #2's rows, recorded them as
+    "unobservable" and stamped last_checked_at — pushing them behind the
+    NULLS-FIRST queue before account #2 (which runs after it, in the same flow)
+    ever looked. The user's IMPORTANT label was structurally undetectable and
+    the row later aged into corrected_by='implicit', i.e. "AEGIS was right".
+
+    The batch limit is what makes the starvation observable, exactly as in prod
+    (LIMIT 50 with more unscored rows than that), so this runs with limit=1 and
+    seeds acct-b's row OLDER so it sorts to the front of acct-a's batch.
+    """
+    await _wipe(db_pool)
+    await _seed_prediction(db_pool, "E_RC8", "informational", "3 hours", account="acct-b")
+    await _seed_prediction(db_pool, "E_RC7", "useless", "2 hours", account="acct-a")
+    fakes = {
+        "acct-a": _FakeGmail({"E_RC7": ["INBOX"]}),
+        "acct-b": _FakeGmail(
+            {"E_RC8": ["INBOX", "IMPORTANT"]},
+            {"E_RC8": "Invoice overdue"},
+            {"E_RC8": "Billing <zz260-billing@example.com>"},
+        ),
+    }
+    act = GmailActivities(gmail_credentials_file="x", gmail_token_dir="x", db_pool=db_pool)
+
+    # Accounts run in sequence within one GmailIngestFlow run.
+    for account in ("acct-a", "acct-b"):
+        monkeypatch.setattr(gmail_mod, "_build_gmail_service", lambda *a, _f=fakes[account]: _f)
+        res = await ActivityEnvironment().run(act.recheck_triage_outcomes, account, 1)
+
+    # acct-b's pass — the one that owns E_RC8 — recorded the human correction.
+    assert res["corrected"] == 1
+    row = await db_pool.fetchrow(
+        "SELECT actual, corrected_by FROM triage_accuracy WHERE email_id='E_RC8'"
+    )
+    assert row["actual"] == "important"
+    assert row["corrected_by"] == "user_gmail"
+    # acct-a never spent a doomed messages.get on a mailbox it cannot read.
+    assert fakes["acct-a"].requested_ids == ["E_RC7"]
     await _wipe(db_pool)
 
 
