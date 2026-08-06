@@ -933,6 +933,52 @@ async def test_postiz_linkedin_link_only_stays_in_body(social_env):
 
 
 @respx.mock
+async def test_postiz_linkedin_utm_link_stays_in_body(social_env):
+    """Postiz markdown-escapes `_` on the first-comment path, so a UTM link
+    sent there publishes as `utm\\_source=...` and GA4 drops the campaign
+    (#257, proven live 2026-08-07 on two LinkedIn posts while the identical
+    link in-body published clean on facebook and bluesky). Underscore-bearing
+    links must take the in-body route instead — a reach penalty is cheaper
+    than unattributable traffic."""
+    account_id = await _seed_postiz_account(social_env, platform="linkedin", integration_id="int-utm")
+    route = respx.post("https://postiz.example.com/api/public/v1/posts").respond(
+        200, json=[{"postId": "pz-utm", "integration": "int-utm"}]
+    )
+    link = "https://www.strangertosold.com/quiz?utm_source=linkedin&utm_medium=social&utm_campaign=launch"
+    connector = SocialConnector(db_pool=social_env, settings=_settings_with_postiz())
+    try:
+        await connector.post(account_id, {"text": "Link in the first comment.", "link": link})
+        body = json.loads(route.calls[0].request.content)
+        value = body["posts"][0]["value"]
+        assert value == [{"content": f"Link in the first comment.\n\n{link}", "image": []}], (
+            "an underscore-bearing link must not go through the comment path"
+        )
+    finally:
+        await connector.close()
+
+
+@respx.mock
+async def test_postiz_linkedin_page_utm_link_stays_in_body(social_env):
+    """Company pages publish through the same Postiz comment lifecycle and were
+    corrupted identically live — the guard is not personal-account-only."""
+    account_id = await _seed_postiz_account(
+        social_env, platform="linkedin-page", integration_id="int-utm-pg"
+    )
+    route = respx.post("https://postiz.example.com/api/public/v1/posts").respond(
+        200, json=[{"postId": "pz-utm-pg", "integration": "int-utm-pg"}]
+    )
+    link = "https://www.strangertosold.com/quiz?utm_source=hikmah&utm_campaign=finder-intro"
+    connector = SocialConnector(db_pool=social_env, settings=_settings_with_postiz())
+    try:
+        await connector.post(account_id, {"text": "Link below.", "link": link})
+        value = json.loads(route.calls[0].request.content)["posts"][0]["value"]
+        assert len(value) == 1, "linkedin-page must not use the comment path for a UTM link"
+        assert value[0]["content"].endswith(link)
+    finally:
+        await connector.close()
+
+
+@respx.mock
 async def test_postiz_non_linkedin_keeps_link_in_body(social_env):
     """Non-LinkedIn platforms are unaffected — link stays appended in-body."""
     account_id = await _seed_postiz_account(social_env, platform="x", integration_id="int-x")

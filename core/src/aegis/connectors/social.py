@@ -247,7 +247,17 @@ class SocialConnector(HTTPConnector):
         # provider posts value[1:] as comments on the main post (orchestrator
         # postComment lifecycle). Every other platform keeps the link in-body
         # via the shared _render_text (#83).
-        if platform.startswith("linkedin") and body_text and link:
+        #
+        # …except Postiz markdown-escapes `_` on that comment path, so
+        # `?utm_source=linkedin` publishes as `?utm\_source=linkedin` and GA4
+        # cannot parse the campaign (#257). Proven live 2026-08-07: two
+        # LinkedIn comments published escaped while the SAME link sent in-body
+        # published clean on facebook and bluesky, and Postiz's own stored copy
+        # was clean in every case — the corruption is the comment lifecycle
+        # alone. So a link carrying an underscore goes in-body: a reach penalty
+        # is cheaper than traffic nobody can attribute. Underscore-free links
+        # survive the comment intact and keep the #83 behaviour.
+        if platform.startswith("linkedin") and body_text and link and "_" not in link:
             text = body_text
             value = [{"content": body_text, "image": []}, {"content": link, "image": []}]
         else:
