@@ -89,7 +89,7 @@ CONFIG_REGISTRY: list[ConfigKey] = [
     ),
     ConfigKey(
         "infra_heartbeat_ping_url", "Heartbeat dead-man ping URL (healthchecks.io)",
-        "System Monitoring", False,
+        "System Monitoring", True,
         help="GET on every successful 2-min heartbeat tick; configure the check to alert "
         "when pings stop. Blank = disabled. Worker restart required.",
     ),
