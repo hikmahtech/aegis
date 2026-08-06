@@ -192,10 +192,12 @@ What each category does to the mail:
 
 `important_action` is the only tier that interrupts, so it is guarded twice: the notification cap above, and a live `is_message_unread` re-read immediately before the task and the ping — mail you have already read on your phone gets labelled but never interrupts. Both guards fail open.
 
-Two knobs are yours, in the `settings` row `email_triage_rules` (edit it on the admin Settings page; the repo ships both empty so a fork carries nobody's mailbox — see `services/email_rules.py`):
+Two knobs are yours, edited on the admin **Email triage** page (`GET/PUT /api/admin/email/triage-rules`) and stored in the `settings` row `email_triage_rules`. The repo ships both empty so a fork carries nobody's mailbox — see `services/email_rules.py`:
 
-- `sender_overrides` — `{"@substack.com": "informational"}`. Exact address beats domain, decides outright with no LLM call, and deliberately writes no `triage_state`, so deleting a rule stops it applying instead of leaving learned state behind.
+- `sender_overrides` — `{"@substack.com": "informational"}`. Exact address beats domain, decides outright with no LLM call, and deliberately writes no `triage_state`, so deleting a rule stops it applying instead of leaving learned state behind. It returns no content tags, so don't override bank/receipt senders — the `MoneyProcessFlow` fan-out keys on the `financial`/`payments` tags and would stop firing for them.
 - `extra_notification_markers` — extra subject substrings for the cap, for phrasing specific to your bank or tooling.
+
+The page leads with **stuck senders**: those at n≥3 and confidence ≥0.75 short-circuit the classifier entirely, so a wrong verdict there cannot self-correct (a cache hit never reaches the LLM, and only the LLM path re-teaches the cache) — an override is the only thing that changes them. Categories are a dropdown, not free text, because the read path drops an unknown category rather than crashing; a typed one would vanish silently. The write path 400s on anything invalid for the same reason.
 
 Accuracy is scored in `triage_accuracy` from two independent human signals, both zero-effort: what you do to the mail's Gmail labels, and how you close the `#email` task AEGIS created (`#trash` or `@reference` ⇒ "this needed nothing from me"). Both feed `triage_state` through the same disagreement arithmetic, so a correction demotes a sender rather than overriding it.
 

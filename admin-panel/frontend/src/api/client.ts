@@ -295,6 +295,13 @@ export const api = {
   saveSlackConfig: (body: any) =>
     apiFetch<any>('/api/admin/slack-config', { method: 'PUT', body: JSON.stringify(body) }),
 
+  // Email triage rules (user-owned sender verdicts + notification phrases)
+  getEmailTriageRules: () => apiFetch<any>('/api/admin/email/triage-rules'),
+  saveEmailTriageRules: (body: {
+    sender_overrides: Record<string, string>;
+    extra_notification_markers: string[];
+  }) => apiFetch<any>('/api/admin/email/triage-rules', { method: 'PUT', body: JSON.stringify(body) }),
+
   // Todoist sync + outbox (GTD hub)
   todoistState: () => apiFetch<any>('/api/admin/todoist/state'),
   getTodoistConfig: () => apiFetch<any>('/api/admin/todoist/config'),

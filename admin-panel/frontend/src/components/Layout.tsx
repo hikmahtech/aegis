@@ -46,6 +46,7 @@ const NAV: { section: string; items: { path: string; label: string }[] }[] = [
       { path: '/infra', label: 'Infrastructure' },
       { path: '/system', label: 'System monitoring' },
       { path: '/admin/todoist', label: 'Todoist' },
+      { path: '/admin/email-triage', label: 'Email triage' },
       { path: '/audit', label: 'Audit' },
       { path: '/settings', label: 'Settings' },
     ],
