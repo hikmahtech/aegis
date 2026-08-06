@@ -349,3 +349,19 @@ def _load_model_tiers_for_tests() -> None:
     from aegis.llm.tier import set_model_tiers
 
     set_model_tiers({"fast": "gemma4:e2b", "balanced": "qwen3:14b", "smart": "qwen3:32b"})
+
+
+@pytest.fixture(autouse=True)
+def _isolate_model_tiers():
+    """aegis#250: `set_model_tiers` installs a process-global map, so a test that
+    installs a real backend map (e.g. a worker test exercising llm_backend) leaks
+    it into whatever test runs next in the same interpreter. Invisible in CI,
+    which never mixes core and worker files in one process, but real for a
+    developer validating a cross-package change with `-n 1`. Snapshot/restore
+    the map around every test so installation can't escape the test that did it."""
+    import aegis.llm.tier as _tier_mod
+
+    saved = dict(_tier_mod._TIERS)
+    yield
+    _tier_mod._TIERS.clear()
+    _tier_mod._TIERS.update(saved)
