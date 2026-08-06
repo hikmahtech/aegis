@@ -18,6 +18,7 @@ import Knowledge from './pages/Knowledge';
 import ModelsProviders from './pages/ModelsProviders';
 import Market from './pages/Market';
 import Money from './pages/Money';
+import EmailTriage from './pages/EmailTriage';
 import Todoist from './pages/Todoist';
 import Overview from './pages/Overview';
 import People from './pages/People';
@@ -67,6 +68,7 @@ export default function App() {
           <Route path="/system" element={<SystemMonitoring />} />
           <Route path="/admin/money" element={<Money />} />
           <Route path="/admin/todoist" element={<Todoist />} />
+          <Route path="/admin/email-triage" element={<EmailTriage />} />
         </Route>
       </Routes>
     </BrowserRouter>

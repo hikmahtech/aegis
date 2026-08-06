@@ -256,6 +256,7 @@ def create_app(run_lifespan: bool = True, settings: Settings | None = None) -> F
         capture,
         channels,
         chat,
+        email_admin,
         expiring_items_admin,
         gmail_reauth,
         health,
@@ -317,6 +318,7 @@ def create_app(run_lifespan: bool = True, settings: Settings | None = None) -> F
     app.include_router(agents.router)
     app.include_router(agents.admin_router)
     app.include_router(gmail_reauth.router)
+    app.include_router(email_admin.router)
     app.include_router(social_auth.router)
     app.include_router(chat.router)
     app.include_router(knowledge.router)
