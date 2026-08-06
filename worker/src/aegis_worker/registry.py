@@ -200,7 +200,11 @@ FLOWS: tuple[FlowSpec, ...] = (
         lambda act: GmailIngestInput(
             agent_id=act["agent_id"],
             max_per_account=int(act["config"].get("max_per_account", 50)),
-            query=act["config"].get("query", "is:unread newer_than:2d"),
+            # 7d, not 2d: the `after:<cursor>` guard means a wider window costs
+            # nothing on a healthy run, but it is the only thing that recovers
+            # mail missed while the flow was down or the 50/run cap truncated.
+            # Anything that falls out of this window is never triaged at all.
+            query=act["config"].get("query", "is:unread newer_than:7d"),
             aegis_ui_url=act["_settings"].get("aegis_ui_url", ""),
         ),
     ),

@@ -199,6 +199,7 @@ async def test_recheck_corrects_from_current_labels(db_pool, monkeypatch):
         "confirmed": 0,
         "memories_written": 1,
         "senders_relearned": 1,
+        "disposition_corrected": 0,
     }
     row = await db_pool.fetchrow(
         "SELECT actual, corrected_by, last_checked_at FROM triage_accuracy "
@@ -224,6 +225,7 @@ async def test_recheck_consistent_stamps_only(db_pool, monkeypatch):
         "confirmed": 0,
         "memories_written": 0,
         "senders_relearned": 0,
+        "disposition_corrected": 0,
     }
     row = await db_pool.fetchrow(
         "SELECT actual, last_checked_at FROM triage_accuracy WHERE email_id='E_RC2'"
@@ -248,6 +250,7 @@ async def test_recheck_implicit_confirms_checked_and_never_checked_rows(db_pool)
         "confirmed": 2,
         "memories_written": 0,
         "senders_relearned": 0,
+        "disposition_corrected": 0,
     }
     rows = {
         r["email_id"]: r
@@ -279,6 +282,7 @@ async def test_recheck_unobservable_message_stamps_last_checked_at(db_pool, monk
         "confirmed": 0,
         "memories_written": 0,
         "senders_relearned": 0,
+        "disposition_corrected": 0,
     }
     row = await db_pool.fetchrow(
         "SELECT actual, last_checked_at FROM triage_accuracy WHERE email_id='E_RC5'"
@@ -304,6 +308,7 @@ async def test_recheck_service_down_never_raises(db_pool, monkeypatch):
         "confirmed": 0,
         "memories_written": 0,
         "senders_relearned": 0,
+        "disposition_corrected": 0,
     }
     await _wipe(db_pool)
 

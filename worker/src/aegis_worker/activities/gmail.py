@@ -10,9 +10,17 @@ from typing import Any
 
 import structlog
 from aegis.llm import parse_llm_json
+from aegis.services.email_rules import get_email_rules, match_sender_override
+from aegis.services.email_rules import merge as merge_email_rules
 from aegis.services.memory import record_gmail_triage_correction
 from temporalio import activity
 from temporalio.exceptions import ApplicationError
+
+# `_NOTIFICATION_MARKERS` is the one shared definition of "this is a courtesy
+# notification", used by clarify and by the classifier's important_action cap so
+# the two can't drift into disagreeing about what junk is. clarify does not
+# import this module, so the dependency stays one-way.
+from aegis_worker.activities.clarify import _NOTIFICATION_MARKERS
 
 logger = structlog.get_logger()
 
@@ -128,10 +136,24 @@ def _extract_text_from_part(part: dict) -> str:
 _CLASSIFY_SYSTEM = """\
 You are an email triage assistant. Classify the email into exactly one category:
 
-- important_action  — requires a decision or response (payment due, account issue, security alert, job offer, personal message from a real person)
-- important_read    — informational but worth reading (receipts, invoices, shipping updates, newsletters with real value, GitHub notifications)
+- important_action  — a human is waiting on your reply, or money or a deadline is genuinely at stake and only you can act (an unpaid bill, a failed payment, a contract or filing due, a real person writing to you, a job offer)
+- important_read    — worth reading but asks nothing of you (receipts, paid invoices, shipping updates, GitHub notifications, newsletters you actually read)
 - informational     — low-value but harmless (automated reports, digests, minor notifications)
 - useless           — pure noise with no value (marketing, promotions, spam, unsubscribe bait)
+
+important_action is the ONLY category that interrupts the user, so it is
+expensive. Be strict: if nothing would go wrong by reading it tomorrow, it
+is not important_action.
+
+NEVER important_action — a courtesy notice about something the user almost
+certainly did themselves or cannot act on: sign-in / new-device / new-location
+alerts, one-time passcodes and login or verification codes, "incorrect login
+attempt", account locked / unlocked / recovered, password-changed
+confirmations, connection and friend requests, social relay pings, calendar
+reminders for events already accepted. These are important_read at most.
+
+A no-reply sender can still be important_action, but only when it is asking
+for money or naming a real deadline.
 
 Additionally, assign zero or more tags from this exact set (lowercase):
   financial, payments, receipt, subscription, security,
@@ -214,6 +236,49 @@ def _normalize_sender(raw: str) -> str:
     return (m.group(1) if m else (raw or "")).strip().lower()
 
 
+def _sender_from_description(description: str | None) -> str:
+    """Recover the sender from a captured `#email` task's description.
+
+    `flows/gmail_ingest.py::_route` writes `From: <sender>` as the FIRST line of
+    every email capture, which is the only place a `triage_accuracy` row's
+    sender survives without a Gmail round-trip (the table stores none). Used by
+    the Todoist-disposition feedback below so a "you were wrong" verdict can
+    reach `triage_state`.
+
+    ponytail: parses the flow's own output format rather than adding a sender
+    column + migration. `test_sender_from_description_matches_capture_format`
+    pins the shape; if it ever drifts, the correction is still recorded and only
+    the sender relearn is skipped.
+    """
+    first = (description or "").split("\n", 1)[0].strip()
+    if not first.lower().startswith("from:"):
+        return ""
+    return _normalize_sender(first[len("from:") :].strip())
+
+
+def cap_notification_category(category: str, subject: str, extra_markers: list[str]) -> str:
+    """A courtesy notification can never be `important_action`.
+
+    The classifier's own judgement was not enough: prod cached
+    no-reply@accounts.google.com, security-noreply@linkedin.com and seven more
+    pure-notification senders as `important_action`, and the sender cache then
+    short-circuited the LLM entirely — so a prompt fix alone would not have
+    unstuck them, and "Security Alert: Your one-time sign in code is 429718"
+    kept becoming a Todoist task. This runs AFTER both the cache and the LLM so
+    it catches every path, and the capped verdict is what teaches
+    `triage_state`, letting a poisoned sender decay instead of self-reinforcing.
+
+    Deliberately caps at `important_read`, not `useless` — a false positive here
+    should cost visibility, never the mail itself.
+    """
+    if category != "important_action":
+        return category
+    low = (subject or "").lower()
+    if any(marker in low for marker in (*_NOTIFICATION_MARKERS, *extra_markers)):
+        return "important_read"
+    return category
+
+
 # Tiers AEGIS treats as "not important" (marks READ, no IMPORTANT label).
 _TRIAGE_UNIMPORTANT = {"useless", "informational"}
 # Tiers AEGIS treats as "important" (IMPORTANT label + kept unread).
@@ -253,6 +318,10 @@ _READ_VERDICT_REMOVES = ("UNREAD", "IMPORTANT")
 # would start manufacturing Todoist tasks off one label; "unimportant"
 # relearns as informational rather than useless.
 _CORRECTION_TO_CATEGORY = {"important": "important_read", "unimportant": "informational"}
+
+# Closing an AEGIS-created `#email` task with either of these is the user saying
+# "this needed nothing from me" — see `_mine_todoist_dispositions`.
+_DISPOSITION_NOISE_LABELS = ("#trash", "@reference")
 
 
 def assess_triage_correction(predicted: str, labels: list[str]) -> str | None:
@@ -389,29 +458,90 @@ class GmailActivities:
             return ""
 
     @activity.defn
+    async def is_message_unread(self, account_label: str, message_id: str) -> bool:
+        """Re-read the message's CURRENT unread state, right before we interrupt.
+
+        The fetch query is `is:unread`, but classification happens minutes later
+        and the user reads mail on their phone in between. Interrupting about
+        something they have already seen is the loudest way to be useless, so
+        the important_action path re-checks here before creating a task or
+        pinging chat.
+
+        Fails OPEN (returns True) on any error: a missed capture loses a real
+        action item, while a redundant one costs a single archive.
+        """
+        token_path = Path(self.gmail_token_dir) / f"{account_label}.json"
+
+        def _sync() -> bool:
+            svc = _build_gmail_service(self.gmail_credentials_file, token_path)
+            m = (
+                svc.users()
+                .messages()
+                .get(userId="me", id=message_id, format="minimal")
+                .execute()
+            )
+            return "UNREAD" in (m.get("labelIds") or [])
+
+        try:
+            return await asyncio.to_thread(_sync)
+        except Exception as exc:
+            activity.logger.warning(
+                "is_message_unread_failed msg_id=%s err=%s — assuming unread",
+                message_id,
+                str(exc)[:200],
+            )
+            return True
+
+    @activity.defn
     async def classify_email(self, msg: dict, thread_content: str = "") -> dict:
         """Classify an email via a data-driven cascade — cheapest signal first,
         LLM last. Returns {category, confidence, tags, reason, summary, lane, source}.
 
         Cascade (2026-05-30):
+          0. (O) user `sender_overrides` rule    -> use it, NO LLM (source=override)
           1. (A) confident per-sender cache hit  -> use it, NO LLM (source=cache)
           2. (B) unknown sender + Gmail promo    -> useless, NO LLM (source=gmail_promo)
           3. LLM tie-breaker (fed Gmail's IMPORTANT prior); result teaches the
              sender cache for next time (source=llm)
+
+        Every learned verdict then passes through `cap_notification_category`,
+        which is the one thing an override skips: an explicit rule is the user's
+        own judgement and outranks the heuristic.
 
         Falls back to 'informational' if the LLM is unavailable or returns bad JSON.
         thread_content: full thread text from fetch_thread (preferred over snippet).
         """
         lane = msg.get("lane") or _OWN_LANE
         sender = _normalize_sender(msg.get("sender") or "")
+        subject = msg.get("subject") or ""
         labels = msg.get("labels") or []
         gmail_promo = any(c in labels for c in _GMAIL_PROMO_LABELS)
+
+        rules = await self._load_email_rules()
+        extra_markers = rules["extra_notification_markers"]
+
+        # (O) An explicit user rule wins outright. It deliberately does NOT
+        # write triage_state: deleting the rule must stop it applying, not
+        # leave its verdict behind as learned sender reputation.
+        override = match_sender_override(rules["sender_overrides"], sender)
+        if override:
+            return {
+                "category": override,
+                "confidence": 1.0,
+                "tags": [],
+                "reason": "sender_overrides rule",
+                "summary": "",
+                "lane": lane,
+                "source": "override",
+            }
 
         # (A) Confident sender-reputation cache -> trust it, skip the LLM.
         cached = await self._triage_lookup(sender) if (sender and self.db_pool) else None
         if cached and cached["n"] >= _CACHE_MIN_N and cached["confidence"] >= _CACHE_MIN_CONF:
             return {
-                "category": cached["category"],
+                "category": cap_notification_category(
+                    cached["category"], subject, extra_markers
+                ),
                 "confidence": cached["confidence"],
                 "tags": [],
                 "reason": "",
@@ -445,7 +575,6 @@ class GmailActivities:
                 "source": "fallback",
             }
 
-        subject = msg.get("subject") or ""
         body = thread_content.strip() if thread_content else (msg.get("snippet") or "")
 
         # Surface forwarding provenance to the classifier so it can weigh
@@ -489,6 +618,10 @@ class GmailActivities:
             category = parsed.get("category", _FALLBACK_CATEGORY)
             if category not in _TRIAGE_CATEGORIES:
                 category = _FALLBACK_CATEGORY
+            # Cap BEFORE teaching, so a notification sender can never accumulate
+            # important_action reputation and start short-circuiting the LLM
+            # straight into a Todoist task.
+            category = cap_notification_category(category, subject, extra_markers)
             # Teach the per-sender cache so repeat senders skip the LLM next time.
             if sender and self.db_pool:
                 await self._triage_upsert(sender, category)
@@ -591,10 +724,18 @@ class GmailActivities:
             "confirmed": 0,
             "memories_written": 0,
             "senders_relearned": 0,
+            "disposition_corrected": 0,
         }
         if not self.db_pool:
             return empty
         try:
+            # Mine the Todoist verdicts FIRST, so a prediction the user has
+            # already ruled on is off the table before the Gmail-label pass
+            # selects rows — each prediction records exactly one correction and
+            # teaches `triage_state` exactly once.
+            empty["disposition_corrected"] = 0
+            mined = await self._mine_todoist_dispositions(limit)
+
             rows = await self.db_pool.fetch(
                 "SELECT id, email_id, predicted FROM triage_accuracy "
                 "WHERE actual IS NULL "
@@ -705,29 +846,100 @@ class GmailActivities:
                 "  AND created_at <= now() - interval '7 days'"
             )
             confirmed = int(result.split()[-1])
-            if checked or confirmed:
+            if checked or confirmed or mined["corrected"]:
                 activity.logger.info(
                     "recheck_triage_outcomes account=%s checked=%d corrected=%d confirmed=%d "
-                    "memories_written=%d senders_relearned=%d",
+                    "memories_written=%d senders_relearned=%d disposition_corrected=%d",
                     account_label,
                     checked,
                     corrected,
                     confirmed,
-                    memories_written,
-                    senders_relearned,
+                    memories_written + mined["memories_written"],
+                    senders_relearned + mined["senders_relearned"],
+                    mined["corrected"],
                 )
             return {
                 "checked": checked,
                 "corrected": corrected,
                 "confirmed": confirmed,
-                "memories_written": memories_written,
-                "senders_relearned": senders_relearned,
+                "memories_written": memories_written + mined["memories_written"],
+                "senders_relearned": senders_relearned + mined["senders_relearned"],
+                "disposition_corrected": mined["corrected"],
             }
         except Exception as exc:  # noqa: BLE001 — feedback must never block ingest
             activity.logger.warning(
                 "recheck_triage_outcomes_failed account=%s err=%s", account_label, str(exc)[:200]
             )
             return empty
+
+    async def _mine_todoist_dispositions(self, limit: int = 50) -> dict:
+        """Read the user's own verdict on captured emails out of Todoist.
+
+        The Gmail-label detector can only ever learn in one direction. Its
+        "unimportant" branch requires IMPORTANT and STARRED to both be ABSENT —
+        but AEGIS itself stamps IMPORTANT on every `important_*` verdict, so
+        that branch was unreachable in practice: 76 corrections in prod, 100% of
+        them unimportant→important, zero the other way, ever. Every correction
+        then relearned the sender as `important_read`. The loop could only make
+        triage noisier.
+
+        This is the missing negative signal, and it was already sitting in the
+        DB: when the user closes an AEGIS-created `#email` task carrying
+        `#trash` or `@reference`, they have said "this needed nothing from me"
+        with no extra effort. In prod that is 77 of 188 completed captures —
+        a 41% wrong-to-interrupt rate that nothing read.
+
+        Routes through `_triage_upsert` so a Todoist verdict lands with exactly
+        the same disagreement arithmetic as any other (conf -= 0.3, flip at
+        <= 0.3) rather than as a privileged override.
+        """
+        out = {"corrected": 0, "senders_relearned": 0, "memories_written": 0}
+        rows = await self.db_pool.fetch(
+            """
+            SELECT ta.id, ta.email_id, ta.predicted, t.content, t.description
+            FROM triage_accuracy ta
+            JOIN todoist_capture_idempotency tci
+              ON tci.source_tag = '#email'
+             AND tci.external_id = 'gmail-' || ta.email_id
+            JOIN todoist_tasks t ON t.id = tci.todoist_task_ref
+            WHERE ta.actual IS NULL
+              AND t.is_completed
+              AND t.labels && $1::text[]
+            LIMIT $2
+            """,
+            list(_DISPOSITION_NOISE_LABELS),
+            limit,
+        )
+        for r in rows:
+            updated = await self.db_pool.execute(
+                "UPDATE triage_accuracy SET actual='unimportant', "
+                "corrected_by='user_todoist', last_checked_at=now() "
+                "WHERE id=$1 AND actual IS NULL",
+                r["id"],
+            )
+            if updated.split()[-1] == "0":  # raced by the label pass
+                continue
+            out["corrected"] += 1
+            sender = _sender_from_description(r["description"])
+            if sender:
+                await self._triage_upsert(sender, _CORRECTION_TO_CATEGORY["unimportant"])
+                out["senders_relearned"] += 1
+            else:
+                activity.logger.warning(
+                    "disposition_sender_unparsed email_id=%s — correction recorded, "
+                    "sender not relearned",
+                    r["email_id"],
+                )
+            if await record_gmail_triage_correction(
+                self.db_pool,
+                self.agent_id,
+                r["email_id"],
+                r["content"] or "",
+                r["predicted"],
+                "unimportant",
+            ):
+                out["memories_written"] += 1
+        return out
 
     @activity.defn
     async def ingest_email_to_kg(
@@ -821,6 +1033,20 @@ class GmailActivities:
                 break
         return "\n".join(lines)
 
+    async def _load_email_rules(self) -> dict:
+        """User rules from `settings.email_triage_rules`, or the empty defaults.
+
+        Best-effort like `_triage_lookup`: a config read must never be what stops
+        mail from being classified.
+        """
+        if not self.db_pool:
+            return merge_email_rules(None)
+        try:
+            return await get_email_rules(self.db_pool)
+        except Exception as exc:
+            activity.logger.warning("email_rules_load_failed err=%s", str(exc)[:120])
+            return merge_email_rules(None)
+
     async def _triage_lookup(self, sender: str) -> dict | None:
         """Return {category, n, confidence} for a sender from triage_state, or
         None. Best-effort — never raises into the classifier."""
@@ -899,6 +1125,14 @@ class GmailActivities:
         to `useless`/`informational` (the only two categories the flow routes
         here — `flows/gmail_ingest.py`). See `_READ_VERDICT_REMOVES` for why it
         also strips IMPORTANT.
+
+        "IMPORTANT_READ" is the `important_read` verdict: surface it with Gmail's
+        IMPORTANT marker but do NOT hold it unread. Until 2026-08 that tier both
+        labelled AND kept the mail unread, and nothing ever cleared it — with
+        important_read running at 68% of all triaged mail (2,155 of 3,186
+        predictions) the unread count could only grow, forever, which is exactly
+        what it did. The label still makes the mail findable; the unread badge
+        goes back to meaning "you have not seen this".
         """
         token_path = Path(self.gmail_token_dir) / f"{account_label}.json"
 
@@ -907,6 +1141,8 @@ class GmailActivities:
             body: dict = {"addLabelIds": [label]}
             if label == "READ":
                 body = {"removeLabelIds": list(_READ_VERDICT_REMOVES)}
+            elif label == "IMPORTANT_READ":
+                body = {"addLabelIds": ["IMPORTANT"], "removeLabelIds": ["UNREAD"]}
             elif label == "ARCHIVE":
                 body = {"removeLabelIds": ["INBOX"]}
             return svc.users().messages().modify(userId="me", id=message_id, body=body).execute()

@@ -44,7 +44,7 @@ _LLM_THROTTLE_SECS = 2
 class GmailIngestInput:
     agent_id: str = "sebas"
     max_per_account: int = 0  # 0 = no limit (fetch all via pagination)
-    query: str = "is:unread newer_than:30d"
+    query: str = "is:unread newer_than:7d"
     aegis_ui_url: str = ""
 
 
@@ -353,6 +353,39 @@ class GmailIngestFlow:
             sender = msg.get("sender", "unknown sender")
             reason = cl.get("reason", "")
             summary = cl.get("summary", "")
+
+            # Don't interrupt about mail the user has already read. The fetch
+            # query is `is:unread`, but classification lands minutes later and
+            # mail gets read on a phone in between — so re-read the live state
+            # before the two things that cost attention (a Todoist task and a
+            # chat ping). Labelling still happens either way, which keeps the
+            # triage_accuracy feedback data consistent. The activity fails open,
+            # so an API error still captures.
+            try:
+                still_unread = await workflow.execute_activity(
+                    "is_message_unread",
+                    args=[label, msg_id],
+                    start_to_close_timeout=TIMEOUT_FAST,
+                    retry_policy=NO_RETRY,
+                )
+            except Exception as exc:
+                workflow.logger.warning(
+                    "gmail_unread_check_failed msg_id=%s err=%s", msg_id, str(exc)[:200]
+                )
+                still_unread = True
+            if not still_unread:
+                workflow.logger.info(
+                    "gmail_capture_skipped_already_read msg_id=%s subject=%s",
+                    msg_id,
+                    subject[:80],
+                )
+                await workflow.execute_activity(
+                    "apply_label",
+                    args=[label, msg_id, "IMPORTANT"],
+                    start_to_close_timeout=_ACT_TIMEOUT,
+                    retry_policy=NO_RETRY,
+                )
+                return "already_read"
             deeplink = msg.get("permalink") or f"https://mail.google.com/mail/u/0/#inbox/{msg_id}"
             # Description chain: From + LLM summary + Open-in-Gmail link, plus
             # body excerpt OR snippet as a separator-delimited tail. The
@@ -449,18 +482,24 @@ class GmailIngestFlow:
             return "captured_to_inbox"
 
         if category == "important_read":
-            # Surface via Gmail's IMPORTANT label and KEEP UNREAD. No per-email
-            # chat ping — the label is the surface now (pinging every
-            # receipt/GitHub notice is noise; 2026-05-30 redesign).
+            # Surface via Gmail's IMPORTANT label and MARK READ. No per-email
+            # chat ping — the label is the surface (pinging every receipt/GitHub
+            # notice is noise; 2026-05-30 redesign).
+            #
+            # This tier used to keep the mail unread as well, and nothing ever
+            # cleared it. At 68% of all triaged mail that made the unread count
+            # a strictly increasing function of time — the single biggest reason
+            # triage stopped feeling useful. "Worth reading" is what the
+            # IMPORTANT label is for; the unread badge means "not seen yet".
             label_result = await workflow.execute_activity(
                 "apply_label",
-                args=[label, msg["id"], "IMPORTANT"],
+                args=[label, msg["id"], "IMPORTANT_READ"],
                 start_to_close_timeout=_ACT_TIMEOUT,
                 retry_policy=NO_RETRY,
             )
             if not (label_result or {}).get("ok"):
                 workflow.logger.warning(
-                    "apply_label_failed account=%s msg_id=%s label=IMPORTANT result=%s",
+                    "apply_label_failed account=%s msg_id=%s label=IMPORTANT_READ result=%s",
                     label,
                     msg["id"],
                     label_result,
