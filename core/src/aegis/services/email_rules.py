@@ -14,7 +14,7 @@ mistyped category vanishes silently. Prefer the dedicated page.
       "sender_overrides": {
         "@substack.com": "informational",
         "no-reply@accounts.google.com": "important_read",
-        "tax@jbpassociates.in": "important_action"
+        "billing@bank.example": {"category": "important_read", "tags": ["financial"]}
       },
       "extra_notification_markers": ["incorrect login attempt", "account unlocked"]
     }
@@ -22,9 +22,12 @@ mistyped category vanishes silently. Prefer the dedicated page.
 ``sender_overrides`` is checked FIRST in ``classify_email`` — ahead of the
 per-sender cache and the LLM — and deliberately does not write ``triage_state``:
 an override must stop applying the moment you delete it, not live on as learned
-sender state. ``extra_notification_markers`` extend the shared
-``_NOTIFICATION_MARKERS`` list that caps courtesy notifications out of
-``important_action``.
+sender state. A rule value is either a bare category string or an object also
+carrying content ``tags``: an override skips the LLM, so it produces no tags of
+its own, and the ``MoneyProcessFlow`` fan-out keys on ``financial``/``payments``
+— silencing a biller used to silently stop its receipt extraction (#263).
+``extra_notification_markers`` extend the shared ``_NOTIFICATION_MARKERS`` list
+that caps courtesy notifications out of ``important_action``.
 
 Lives in core (a worker dependency) so the worker classifier and the admin API
 share one definition, matching ``services/gtd_rules.py``.
@@ -40,8 +43,25 @@ CATEGORIES = ("important_action", "important_read", "informational", "useless")
 
 # Both deliberately empty: the open-source default must carry no personal
 # senders and no mailbox-specific phrasing. Yours live in the DB row.
-DEFAULT_SENDER_OVERRIDES: dict[str, str] = {}
+DEFAULT_SENDER_OVERRIDES: dict[str, dict] = {}
 DEFAULT_EXTRA_NOTIFICATION_MARKERS: list[str] = []
+
+
+def _normalise_override(value: Any) -> dict | None:
+    """One rule value — either shape — as ``{"category", "tags"}``, or None if
+    the category is unusable. Lenient by design; ``validate`` is the loud half.
+    """
+    if isinstance(value, dict):
+        category = str(value.get("category") or "")
+        raw_tags = value.get("tags")
+        tags = (
+            [str(t).strip().lower() for t in raw_tags if isinstance(t, str) and t.strip()]
+            if isinstance(raw_tags, list)
+            else []
+        )
+    else:
+        category, tags = str(value), []
+    return {"category": category, "tags": tags} if category in CATEGORIES else None
 
 
 def merge(value: dict | None) -> dict:
@@ -49,15 +69,16 @@ def merge(value: dict | None) -> dict:
 
     Unknown categories are dropped rather than raising — a typo in one sender
     entry must not take the whole ruleset (and with it every classification)
-    down. Keys and markers are normalised to lowercase because both are matched
-    against lowercased input.
+    down. Keys, tags and markers are normalised to lowercase because all three
+    are matched against lowercased input.
     """
     v = value or {}
-    overrides = {
-        str(addr).strip().lower(): str(cat)
-        for addr, cat in (v.get("sender_overrides") or {}).items()
-        if str(cat) in CATEGORIES and str(addr).strip()
-    }
+    overrides = {}
+    for addr, cat in (v.get("sender_overrides") or {}).items():
+        key = str(addr).strip().lower()
+        rule = _normalise_override(cat)
+        if key and rule:
+            overrides[key] = rule
     markers = [
         str(m).strip().lower() for m in (v.get("extra_notification_markers") or []) if str(m).strip()
     ]
@@ -86,9 +107,19 @@ def validate(value: dict | None) -> dict:
     for addr, cat in overrides.items():
         if not str(addr).strip():
             raise ValueError("sender_overrides has an entry with an empty sender")
-        if str(cat) not in CATEGORIES:
+        category = cat
+        if isinstance(cat, dict):
+            category = cat.get("category")
+            tags = cat.get("tags") or []
+            if not isinstance(tags, list) or not all(
+                isinstance(t, str) and t.strip() for t in tags
+            ):
+                raise ValueError(
+                    f"tags for '{addr}' must be a list of non-empty strings"
+                )
+        if str(category) not in CATEGORIES:
             raise ValueError(
-                f"'{cat}' is not a valid category for '{addr}' "
+                f"'{category}' is not a valid category for '{addr}' "
                 f"— use one of: {', '.join(CATEGORIES)}"
             )
     markers = v.get("extra_notification_markers") or []
@@ -157,10 +188,12 @@ async def known_senders(pool: Any, limit: int = 200) -> list[dict]:
     ]
 
 
-def match_sender_override(overrides: dict[str, str], sender: str) -> str | None:
-    """Exact address wins over the domain, so one sender can be pulled out of a
+def match_sender_override(overrides: dict[str, dict], sender: str) -> dict | None:
+    """The matching rule (``{"category", "tags"}``) or None.
+
+    Exact address wins over the domain, so one sender can be pulled out of a
     blanket domain rule. `sender` must already be a bare lowercased address
-    (``_normalize_sender``). Returns None when nothing matches.
+    (``_normalize_sender``). Values are the normalised shape ``merge`` produces.
     """
     addr = (sender or "").strip().lower()
     if not addr:
