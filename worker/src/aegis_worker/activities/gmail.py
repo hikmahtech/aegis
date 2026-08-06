@@ -522,13 +522,17 @@ class GmailActivities:
 
         # (O) An explicit user rule wins outright. It deliberately does NOT
         # write triage_state: deleting the rule must stop it applying, not
-        # leave its verdict behind as learned sender reputation.
+        # leave its verdict behind as learned sender reputation. Its `tags` are
+        # the rule author's, because skipping the LLM means nothing else can
+        # produce them — and the money fan-out keys on financial/payments, so
+        # without this an override on a biller silently killed its receipt
+        # extraction (#263).
         override = match_sender_override(rules["sender_overrides"], sender)
         if override:
             return {
-                "category": override,
+                "category": override["category"],
                 "confidence": 1.0,
-                "tags": [],
+                "tags": list(override["tags"]),
                 "reason": "sender_overrides rule",
                 "summary": "",
                 "lane": lane,
@@ -538,10 +542,17 @@ class GmailActivities:
         # (A) Confident sender-reputation cache -> trust it, skip the LLM.
         cached = await self._triage_lookup(sender) if (sender and self.db_pool) else None
         if cached and cached["n"] >= _CACHE_MIN_N and cached["confidence"] >= _CACHE_MIN_CONF:
+            category = cap_notification_category(cached["category"], subject, extra_markers)
+            # (#262) A sender above the threshold never reaches the LLM, and
+            # only the LLM path used to re-teach the cache — so a wrong verdict
+            # here was permanent. Feeding the CAPPED verdict back lets a
+            # repeatedly-capped sender decay out of important_action on its own.
+            # Only on disagreement: reinforcing every cache hit would ratchet
+            # every sender's n and confidence up merely for sending mail.
+            if category != cached["category"]:
+                await self._triage_upsert(sender, category)
             return {
-                "category": cap_notification_category(
-                    cached["category"], subject, extra_markers
-                ),
+                "category": category,
                 "confidence": cached["confidence"],
                 "tags": [],
                 "reason": "",

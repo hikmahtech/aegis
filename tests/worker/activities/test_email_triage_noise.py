@@ -114,6 +114,89 @@ async def test_llm_important_action_notification_is_capped_before_it_teaches_the
 
 
 @pytest.mark.asyncio
+async def test_capped_cache_hit_reteaches_the_cache_so_a_stuck_sender_can_decay():
+    """(#262) The cache branch used to return without touching `triage_state`,
+    and only the LLM branch re-taught it — so a sender above the threshold with
+    a wrong verdict was stuck permanently, correctable by nothing the classifier
+    itself could do. The CAPPED verdict must be what goes back.
+    """
+    llm = _CountingLlm()
+    g = _make(llm=llm, lookup={"category": "important_action", "n": 6, "confidence": 0.9})
+    msg = {
+        "id": "m",
+        "sender": "Google <no-reply@accounts.google.com>",
+        "subject": "Security Alert: Your one-time sign in code is 429718.",
+        "snippet": "",
+        "labels": [],
+    }
+    await ActivityEnvironment().run(g.classify_email, msg, "")
+    g._triage_upsert.assert_awaited_once_with("no-reply@accounts.google.com", "important_read")
+    assert llm.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_uncapped_cache_hit_leaves_the_cache_alone():
+    """The re-teach is scoped to disagreement. Reinforcing on every hit would
+    ratchet each sender's n and confidence up merely for sending mail, pinning
+    every cached verdict at 1.0 and making the LLM unreachable for good.
+    """
+    llm = _CountingLlm()
+    g = _make(llm=llm, lookup={"category": "important_action", "n": 6, "confidence": 0.9})
+    msg = {
+        "id": "m",
+        "sender": "boss@co.com",
+        "subject": "Can you sign this by Friday?",
+        "snippet": "",
+        "labels": [],
+    }
+    res = await ActivityEnvironment().run(g.classify_email, msg, "")
+    assert res["category"] == "important_action"
+    g._triage_upsert.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_capped_sender_stops_short_circuiting_the_llm(db_pool):
+    """(#262) end to end, against the real disagreement arithmetic: one capped
+    cache hit drops a 0.9-confidence sender to 0.6 — below `_CACHE_MIN_CONF` —
+    so the very next message from it reaches the classifier again instead of
+    being answered from a verdict nothing could change.
+    """
+    sender = "zz262-stuck@example.com"
+    await db_pool.execute("DELETE FROM triage_state WHERE email_addr = $1", sender)
+    await db_pool.execute(
+        "INSERT INTO triage_state (email_addr, state, metadata, updated_at) "
+        "VALUES ($1, 'important_action', $2, now())",
+        sender,
+        {"n": 6, "confidence": 0.9, "category": "important_action"},
+    )
+    # No llm_client on purpose: a cache MISS lands on source='fallback', so
+    # 'cache' below cannot be an accident of the default return shape.
+    g = GmailActivities(gmail_credentials_file="x", gmail_token_dir="x", db_pool=db_pool)
+    try:
+        first = await ActivityEnvironment().run(
+            g.classify_email,
+            {"id": "m1", "sender": sender, "subject": "Security alert: new sign-in", "labels": []},
+            "",
+        )
+        assert (first["source"], first["category"]) == ("cache", "important_read")
+        row = await db_pool.fetchrow(
+            "SELECT state, metadata FROM triage_state WHERE email_addr = $1", sender
+        )
+        meta = row["metadata"]
+        meta = json.loads(meta) if isinstance(meta, str) else dict(meta)
+        assert float(meta["confidence"]) == 0.6  # 0.9 - 0.3, one disagreement
+
+        second = await ActivityEnvironment().run(
+            g.classify_email,
+            {"id": "m2", "sender": sender, "subject": "Invoice attached", "labels": []},
+            "",
+        )
+        assert second["source"] != "cache"
+    finally:
+        await db_pool.execute("DELETE FROM triage_state WHERE email_addr = $1", sender)
+
+
+@pytest.mark.asyncio
 async def test_cap_leaves_real_action_mail_alone():
     """The cap keys on notification phrasing only. A no-reply biller asking for
     money is still important_action — this fails if the cap ever grows into a
@@ -180,6 +263,42 @@ async def test_sender_override_classifies_without_the_llm_or_the_cache():
     res = await ActivityEnvironment().run(g.classify_email, msg, "")
     assert res["category"] == "informational"
     assert res["source"] == "override"
+    assert res["tags"] == []
+    assert llm.calls == 0
+    g._triage_upsert.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_sender_override_returns_its_own_tags_so_the_money_fanout_survives():
+    """(#263) An override skips the LLM, so nothing else can produce tags — and
+    `GmailIngestFlow` spawns MoneyProcessFlow on `financial`/`payments`. Before
+    this, silencing a biller silently turned its receipt extraction off.
+    Still no `triage_state` write: tags do not make a rule learned state.
+    """
+    llm = _CountingLlm(json.dumps({"category": "important_action", "confidence": 0.9}))
+    g = _make(
+        llm=llm,
+        lookup=None,
+        rules={
+            "sender_overrides": {
+                "billing@bank.example": {
+                    "category": "important_read",
+                    "tags": ["financial", "receipt"],
+                }
+            }
+        },
+    )
+    msg = {
+        "id": "m",
+        "sender": "Bank <billing@bank.example>",
+        "subject": "Your statement",
+        "snippet": "",
+        "labels": [],
+    }
+    res = await ActivityEnvironment().run(g.classify_email, msg, "")
+    assert res["category"] == "important_read"
+    assert res["source"] == "override"
+    assert set(res["tags"]) & {"financial", "payments"}
     assert llm.calls == 0
     g._triage_upsert.assert_not_awaited()
 

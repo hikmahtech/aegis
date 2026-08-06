@@ -17,6 +17,9 @@ type Sender = {
   skips_llm: boolean;
 };
 
+// A rule row, flattened for editing: [sender, category, comma-separated tags].
+type Rule = [string, string, string];
+
 const CATEGORY_HELP: Record<string, string> = {
   important_action: 'Interrupts you — creates a Todoist Inbox task, keeps the mail unread.',
   important_read: 'Labelled IMPORTANT and marked read. Findable, never interrupts.',
@@ -24,9 +27,15 @@ const CATEGORY_HELP: Record<string, string> = {
   useless: 'Same as informational — use it to record that a sender is pure noise.',
 };
 
+function toRules(stored: any): Rule[] {
+  return Object.entries(stored || {}).map(
+    ([addr, v]: [string, any]) => [addr, v?.category ?? v, (v?.tags || []).join(', ')] as Rule,
+  );
+}
+
 export default function EmailTriage() {
   const [categories, setCategories] = useState<string[]>([]);
-  const [overrides, setOverrides] = useState<[string, string][]>([]);
+  const [overrides, setOverrides] = useState<Rule[]>([]);
   const [markers, setMarkers] = useState<string[]>([]);
   const [senders, setSenders] = useState<Sender[]>([]);
   const [error, setError] = useState<Error | null>(null);
@@ -39,7 +48,7 @@ export default function EmailTriage() {
     try {
       const r = await api.getEmailTriageRules();
       setCategories(r.categories || []);
-      setOverrides(Object.entries(r.sender_overrides || {}) as [string, string][]);
+      setOverrides(toRules(r.sender_overrides));
       setMarkers(r.extra_notification_markers || []);
       setSenders(r.known_senders || []);
     } catch (e: any) { setError(e); }
@@ -50,15 +59,18 @@ export default function EmailTriage() {
   async function save() {
     setError(null); setSaving(true); setSaved(false);
     try {
-      const sender_overrides: Record<string, string> = {};
-      for (const [addr, cat] of overrides) {
-        if (addr.trim()) sender_overrides[addr.trim().toLowerCase()] = cat;
+      const sender_overrides: Record<string, { category: string; tags: string[] }> = {};
+      for (const [addr, cat, tags] of overrides) {
+        if (addr.trim()) sender_overrides[addr.trim().toLowerCase()] = {
+          category: cat,
+          tags: tags.split(',').map(t => t.trim().toLowerCase()).filter(Boolean),
+        };
       }
       const r = await api.saveEmailTriageRules({
         sender_overrides,
         extra_notification_markers: markers.map(m => m.trim()).filter(Boolean),
       });
-      setOverrides(Object.entries(r.sender_overrides || {}) as [string, string][]);
+      setOverrides(toRules(r.sender_overrides));
       setMarkers(r.extra_notification_markers || []);
       setSenders(r.known_senders || []);
       setSaved(true);
@@ -70,9 +82,9 @@ export default function EmailTriage() {
     () => new Set(overrides.map(([a]) => a.trim().toLowerCase())),
     [overrides],
   );
-  // Senders that short-circuit the LLM and aren't covered by a rule. A wrong
-  // verdict here cannot self-correct: a cache hit never reaches the LLM, and
-  // only the LLM path re-teaches the cache. These are what overrides are for.
+  // Senders that short-circuit the LLM and aren't covered by a rule. A cache
+  // hit never reaches the LLM, so a wrong verdict here only self-corrects when
+  // the notification cap fires on it (#262). These are what overrides are for.
   const stuck = senders.filter(s => s.skips_llm && !ruled.has(s.email_addr));
 
   return (
@@ -89,9 +101,9 @@ export default function EmailTriage() {
           <h2 className="section-title">Stuck senders ({stuck.length})</h2>
           <p className="meta" style={{ marginBottom: 8 }}>
             These have enough history (n≥3, confidence≥0.75) that the classifier trusts
-            the cache and never calls the LLM for them — so if the cached verdict is
-            wrong it <strong>cannot fix itself</strong>. An override is the only thing that
-            changes them. Click one to add a rule.
+            the cache and never calls the LLM for them. A wrong verdict here only
+            corrects itself when a notification phrase demotes it; otherwise an override
+            is the <strong>only</strong> thing that changes them. Click one to add a rule.
           </p>
           <div className="table-scroll">
             <table className="data-table">
@@ -110,7 +122,7 @@ export default function EmailTriage() {
                     <td>
                       <button
                         className="btn btn-sm"
-                        onClick={() => setOverrides(o => [...o, [s.email_addr, 'informational']])}
+                        onClick={() => setOverrides(o => [...o, [s.email_addr, 'informational', '']])}
                       >+ Rule</button>
                     </td>
                   </tr>
@@ -130,34 +142,43 @@ export default function EmailTriage() {
           Deleting a rule genuinely stops it applying: rules never write learned state.
         </p>
         <p className="meta" style={{ marginBottom: 12 }}>
-          ⚠️ A rule returns no content tags, and the receipt/money fan-out keys on those
-          tags — so <strong>don't override banks, payment or receipt senders</strong> or you
-          silently disable receipt extraction for them.
+          A rule skips the LLM, so it produces no content tags of its own — set them here.
+          The receipt/money fan-out keys on <code>financial</code> and <code>payments</code>,
+          so <strong>give bank, payment and receipt senders those tags</strong> or overriding
+          them turns off receipt extraction.
         </p>
         <div className="table-scroll">
           <table className="data-table">
             <thead>
-              <tr><th>Sender or @domain</th><th style={{ width: 220 }}>Treat as</th>
-                <th style={{ width: 320 }}>What that does</th><th style={{ width: 50 }} /></tr>
+              <tr><th>Sender or @domain</th><th style={{ width: 180 }}>Treat as</th>
+                <th style={{ width: 180 }}>Tags</th>
+                <th style={{ width: 280 }}>What that does</th><th style={{ width: 50 }} /></tr>
             </thead>
             <tbody>
-              {overrides.map(([addr, cat], i) => (
+              {overrides.map(([addr, cat, tags], i) => (
                 <tr key={i}>
                   <td>
                     <input
                       type="text" value={addr} list="known-senders"
                       placeholder="name@example.com or @example.com"
-                      onChange={e => setOverrides(o => o.map((r, j) => j === i ? [e.target.value, r[1]] : r))}
+                      onChange={e => setOverrides(o => o.map((r, j) => j === i ? [e.target.value, r[1], r[2]] : r))}
                       style={{ width: '100%' }}
                     />
                   </td>
                   <td>
                     <select
                       value={cat}
-                      onChange={e => setOverrides(o => o.map((r, j) => j === i ? [r[0], e.target.value] : r))}
+                      onChange={e => setOverrides(o => o.map((r, j) => j === i ? [r[0], e.target.value, r[2]] : r))}
                     >
                       {categories.map(c => <option key={c} value={c}>{c}</option>)}
                     </select>
+                  </td>
+                  <td>
+                    <input
+                      type="text" value={tags} placeholder="financial, payments"
+                      onChange={e => setOverrides(o => o.map((r, j) => j === i ? [r[0], r[1], e.target.value] : r))}
+                      style={{ width: '100%' }}
+                    />
                   </td>
                   <td className="meta">{CATEGORY_HELP[cat] || ''}</td>
                   <td>
@@ -166,7 +187,7 @@ export default function EmailTriage() {
                 </tr>
               ))}
               {overrides.length === 0 && (
-                <tr><td colSpan={4} className="empty">No sender rules. The classifier decides everything.</td></tr>
+                <tr><td colSpan={5} className="empty">No sender rules. The classifier decides everything.</td></tr>
               )}
             </tbody>
           </table>
@@ -176,7 +197,7 @@ export default function EmailTriage() {
         </datalist>
         <button
           className="btn" style={{ marginTop: 8 }}
-          onClick={() => setOverrides(o => [...o, ['', 'informational']])}
+          onClick={() => setOverrides(o => [...o, ['', 'informational', '']])}
         >+ Add sender rule</button>
       </div>
 

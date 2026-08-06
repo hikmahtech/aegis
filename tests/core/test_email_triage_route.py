@@ -94,12 +94,44 @@ async def test_round_trip_persists_and_normalises(app_client):
         },
     )
     assert r.status_code == 200, r.text
-    assert r.json()["sender_overrides"] == {"news@substack.com": "informational"}
+    assert r.json()["sender_overrides"] == {
+        "news@substack.com": {"category": "informational", "tags": []}
+    }
     assert r.json()["extra_notification_markers"] == ["incorrect login attempt"]
     # survives a fresh read
     assert (await client.get(URL, auth=AUTH)).json()["sender_overrides"] == {
-        "news@substack.com": "informational"
+        "news@substack.com": {"category": "informational", "tags": []}
     }
+
+
+async def test_tagged_rule_round_trips(app_client):
+    """(#263) The tags are what keep the money fan-out alive for an overridden
+    biller, so they have to survive the write path, not just `merge`."""
+    client, _ = app_client
+    r = await client.put(
+        URL, auth=AUTH,
+        json={"sender_overrides": {"Bank@Example.com": {
+            "category": "important_read", "tags": ["Financial", "receipt"],
+        }}},
+    )
+    assert r.status_code == 200, r.text
+    assert (await client.get(URL, auth=AUTH)).json()["sender_overrides"] == {
+        "bank@example.com": {"category": "important_read", "tags": ["financial", "receipt"]}
+    }
+
+
+async def test_malformed_tags_are_a_400_not_a_silent_drop(app_client):
+    """Same contract as a typo'd category: `merge` drops junk tags so mail keeps
+    being classified, which means the write path is the only place the author
+    can be told their receipt fan-out will never fire."""
+    client, _ = app_client
+    for bad in ("financial", ["ok", 7], ["  "], [None]):
+        r = await client.put(
+            URL, auth=AUTH,
+            json={"sender_overrides": {"a@b.com": {"category": "useless", "tags": bad}}},
+        )
+        assert r.status_code == 400, (bad, r.text)
+    assert (await client.get(URL, auth=AUTH)).json()["sender_overrides"] == {}
 
 
 async def test_invalid_category_is_a_400_not_a_silent_drop(app_client):
@@ -122,6 +154,8 @@ async def test_malformed_shapes_are_rejected(app_client):
     for bad in (
         {"sender_overrides": ["a@b.com"]},
         {"sender_overrides": {"": "useless"}},
+        {"sender_overrides": {"a@b.com": {"category": "informationnal"}}},
+        {"sender_overrides": {"a@b.com": {"tags": ["financial"]}}},
         {"extra_notification_markers": "not a list"},
         {"extra_notification_markers": ["ok", 123]},
     ):
