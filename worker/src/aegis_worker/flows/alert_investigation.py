@@ -1506,21 +1506,27 @@ class AlertInvestigationFlow:
                 )
             if v2 == "open_all_prs":
                 verdict_summary = (verdict.get("root_cause") or "")[:400]
-                # `branches` is keyed by repo BASENAME (kimi's BRANCH: lines);
-                # resource_path is workspace-relative and may be nested, so
-                # index both lookups by its basename too.
+                # `branches` is keyed by the engine's `BRANCH: <repo_name>:`
+                # footer, and engines write either the checkout-dir basename
+                # or the GitHub repo name (the prompt doesn't pin which). A
+                # checkout folder named differently from its GitHub repo made
+                # the old basename-only index miss and silently open 0 PRs
+                # (issue #270) — so index both names, case-insensitively.
                 repo_to_github: dict[str, str] = {}
                 repo_to_path: dict[str, str] = {}
                 for r in resources_list:
                     rp = (r.get("resource_path") or "").rstrip("/")
                     if not rp:
                         continue
-                    base_name = rp.rsplit("/", 1)[-1]
-                    repo_to_github[base_name] = r.get("github_repo", "")
-                    repo_to_path[base_name] = rp
+                    gh = r.get("github_repo", "")
+                    gh_name = gh.rsplit("/", 1)[-1].lower() if gh else ""
+                    for key in (rp.rsplit("/", 1)[-1].lower(), gh_name):
+                        if key:
+                            repo_to_github[key] = gh
+                            repo_to_path[key] = rp
                 pr_urls: list[str] = []
                 for repo_name, branch_name in branches.items():
-                    github_repo = repo_to_github.get(repo_name, "")
+                    github_repo = repo_to_github.get(repo_name.lower(), "")
                     if not github_repo or not branch_name:
                         continue
                     pending_pr_id = await workflow.execute_activity(
@@ -1545,7 +1551,7 @@ class AlertInvestigationFlow:
                             repo=github_repo,
                             branch=branch_name,
                             host=inv_result.get("host", ""),
-                            repo_path=repo_to_path.get(repo_name, ""),
+                            repo_path=repo_to_path.get(repo_name.lower(), ""),
                         ),
                         # 5 min — the activity runs two SSH subprocess calls
                         # (git push, gh pr create) each bounded at 60s
@@ -1583,6 +1589,27 @@ class AlertInvestigationFlow:
                         await self._safe_post_note(
                             track_task_id,
                             f"{voice_head}\n\n{links_plain}",
+                        )
+                elif branches:
+                    # User approved PRs and fix branches exist, yet none
+                    # opened (mapping miss or create_github_pr failure).
+                    # Silence here read as success (issue #270) — say it
+                    # failed and name the surviving branches instead.
+                    branch_list = ", ".join(f"{r}:{b}" for r, b in branches.items())
+                    workflow.logger.warning(
+                        "alert_open_all_prs_zero_opened title=%s branches=%s",
+                        title,
+                        branch_list,
+                    )
+                    await self._safe_event(
+                        f"⚠️ Open-PR approved but 0 of {len(branches)} PR(s) "
+                        f"opened for: {_html_escape(title)}"
+                    )
+                    if track_task_id and not track_task_id.startswith("item-"):
+                        await self._safe_post_note(
+                            track_task_id,
+                            "⚠️ Open-PR was approved but no PR could be opened. "
+                            f"Fix branch(es) still exist on the run host: {branch_list}",
                         )
         # ── Step 8: Compute final status (no task creation in v3) ──
         final_status = "logged"
