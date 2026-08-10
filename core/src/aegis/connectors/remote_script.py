@@ -907,6 +907,45 @@ class RemoteScriptConnector:
         content = result["stdout"]
         return content if content.strip() else None
 
+    async def kimi_run_alive(self, output_file: str, host: str = "") -> bool:
+        """Return whether the agent process for a run is still running.
+
+        Probes via `fuser` on `output_file` rather than matching the launched
+        process's own command line: shell command substitution (kimi's
+        `-p "$(cat prompt_file)"`) and stdin redirection (claude's
+        `< prompt_file`) both consume the prompt-file path *before* exec, so
+        it never survives into the running process's argv once launched
+        detached via `nohup ... &` (verified empirically — the only process
+        that ever has that literal path in its own cmdline is the transient
+        launcher shell, which exits within milliseconds of backgrounding the
+        job). A marker matched against argv would therefore report a
+        healthy nohup-launched run as dead almost immediately — and nohup is
+        the common path here (prod runs with no `kimi_host` configured).
+
+        `output_file`, by contrast, stays open for the run's entire duration
+        regardless of launch mode: in nohup mode the agent process itself
+        holds the `> output_file` redirection open until it exits; in tmux
+        mode `tee output_file` holds it and exits once the agent's end of
+        the pipe closes. Either way, a live run holds the file open and a
+        dead run doesn't — and a launch that died before ever creating the
+        file also correctly reads as "not held open".
+
+        rc 0 (something holds it open) → True (alive)
+        rc 1 (file exists but nothing holds it, or the file was never
+            created — e.g. the process died before writing anything) →
+            False (dead)
+        ssh error, missing `fuser`, or any other rc → True (fail-open: a
+            flaky probe must never be mistaken for a dead run and kill a
+            healthy investigation)
+        """
+        await self._refresh_config()
+        result = await self._exec(
+            host or self._host,
+            f"fuser {shlex.quote(output_file)} >/dev/null 2>&1",
+            timeout=10,
+        )
+        return result["exit_code"] != 1
+
     async def remove_worktree(self, worktree_path: str, host: str = "") -> None:
         """Best-effort cleanup of a per-run git worktree created by start_kimi_run.
 

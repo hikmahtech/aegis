@@ -2026,41 +2026,84 @@ class AlertActivities:
             output_file = run_result.get("output_file", "")
             session_id = ""
 
+            def _succeeded_result(raw: str) -> dict | None:
+                """Parse session_id out of `raw` and, if it carries a
+                complete STATUS footer, build the succeeded-result dict.
+                Returns None when `raw` is not yet complete (session_id is
+                still recorded via the nonlocal so it isn't lost)."""
+                nonlocal session_id
+                # Parse session_id from stream-json events. Claude (and
+                # pre-0.31 kimi) emit it in the FIRST event. kimi CLI
+                # 0.31.x (issue #271) instead appends a
+                # `{"role":"meta","type":"session.resume_hint",...}`
+                # event carrying session_id as the LAST line, written
+                # only once the whole run has completed — so check both.
+                non_empty = [ln.strip() for ln in raw.splitlines() if ln.strip()]
+                for candidate in {non_empty[0], non_empty[-1]} if non_empty else ():
+                    try:
+                        evt = json.loads(candidate)
+                        if evt.get("session_id"):
+                            session_id = evt["session_id"]
+                    except (json.JSONDecodeError, AttributeError):
+                        pass
+                if not _kimi_output_complete(raw):
+                    return None
+                branches = _parse_kimi_branches(raw, primary_repo=repo_key)
+                primary_branch = branches.get(repo_key, fix_branch if branches else "")
+                return {
+                    "status": "succeeded",
+                    "output": _extract_kimi_transcript(raw)[-_INVESTIGATION_OUTPUT_CAP:],
+                    "session_id": session_id,
+                    "branch": primary_branch,
+                    "branches": branches,
+                    "output_file": output_file,
+                    "host": inv_host,
+                    "engine": run_result.get("engine", "kimi"),
+                }
+
             max_iterations = 60
             latest_raw = ""
-            for _ in range(max_iterations):
+            for iteration in range(max_iterations):
                 raw = await self.remote_script.fetch_kimi_run_output(output_file, host=inv_host)
                 if raw:
                     latest_raw = raw
-                    # Parse session_id from stream-json events. Claude (and
-                    # pre-0.31 kimi) emit it in the FIRST event. kimi CLI
-                    # 0.31.x (issue #271) instead appends a
-                    # `{"role":"meta","type":"session.resume_hint",...}`
-                    # event carrying session_id as the LAST line, written
-                    # only once the whole run has completed — so check both.
-                    non_empty = [ln.strip() for ln in raw.splitlines() if ln.strip()]
-                    for candidate in {non_empty[0], non_empty[-1]} if non_empty else ():
-                        try:
-                            evt = json.loads(candidate)
-                            if evt.get("session_id"):
-                                session_id = evt["session_id"]
-                        except (json.JSONDecodeError, AttributeError):
-                            pass
-                    if _kimi_output_complete(raw):
-                        branches = _parse_kimi_branches(raw, primary_repo=repo_key)
-                        primary_branch = branches.get(repo_key, fix_branch if branches else "")
-                        return {
-                            "status": "succeeded",
-                            "output": _extract_kimi_transcript(raw)[
-                                -_INVESTIGATION_OUTPUT_CAP:
-                            ],
-                            "session_id": session_id,
-                            "branch": primary_branch,
-                            "branches": branches,
-                            "output_file": output_file,
-                            "host": inv_host,
-                            "engine": run_result.get("engine", "kimi"),
-                        }
+                    result = _succeeded_result(raw)
+                    if result is not None:
+                        return result
+
+                # Not complete yet. From the second iteration on (grace
+                # period for launch latency — e.g. SSH/repo-checkout time
+                # before the agent binary even starts), verify the agent
+                # process is still alive so a run that died right after
+                # launch (issue #271 — e.g. a CLI flag error) fails fast
+                # instead of burning the full 30-minute timeout.
+                if iteration > 0 and not await self.remote_script.kimi_run_alive(
+                    output_file, host=inv_host
+                ):
+                    # One final fetch — the process may have exited normally
+                    # right as we polled (STATUS-footer race).
+                    raw = await self.remote_script.fetch_kimi_run_output(
+                        output_file, host=inv_host
+                    )
+                    if raw:
+                        latest_raw = raw
+                        result = _succeeded_result(raw)
+                        if result is not None:
+                            return result
+                    return {
+                        "status": "failed",
+                        "output": (
+                            "Agent process exited before completing (early death — "
+                            "e.g. CLI flag error). Partial output:\n"
+                            + _extract_kimi_transcript(latest_raw)
+                        )[-_INVESTIGATION_OUTPUT_CAP:],
+                        "session_id": session_id,
+                        "branch": "",
+                        "branches": {},
+                        "output_file": output_file,
+                        "host": inv_host,
+                        "engine": run_result.get("engine", "kimi"),
+                    }
 
                 activity.heartbeat()
                 await asyncio.sleep(30)

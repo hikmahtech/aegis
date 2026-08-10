@@ -50,6 +50,7 @@ def mock_remote_script():
         '{"type": "assistant", "message": "Investigation complete. Found root cause: service restart needed."}\n'
         "STATUS: investigated\n"
     )
+    rs.kimi_run_alive.return_value = True
     return rs
 
 
@@ -176,6 +177,7 @@ async def test_run_investigation_kimi_031_session_id_from_resume_hint(monkeypatc
         '"command":"kimi -r kimi-sess-999",'
         '"content":"To resume this session: kimi -r kimi-sess-999"}\n'
     )
+    rs.kimi_run_alive.return_value = True
     activities = AlertActivities(
         remote_script=rs,
         kimi_binary="/home/user/.local/bin/kimi",

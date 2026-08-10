@@ -864,3 +864,90 @@ async def test_fetch_kimi_run_output_keeps_first_line_when_under_cap(conn):
 
     assert out is not None
     assert out.startswith('{"session_id":"s1"}')
+
+
+# ── kimi_run_alive (issue #271 fail-fast probe) ──────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_kimi_run_alive_rc0_file_held_open_returns_true(conn):
+    """fuser rc=0 means some process still holds output_file open → alive."""
+    proc = AsyncMock()
+    proc.communicate = AsyncMock(return_value=(b"", b""))
+    proc.returncode = 0
+    proc.kill = MagicMock()
+    proc.wait = AsyncMock(return_value=0)
+    with patch("asyncio.create_subprocess_exec", AsyncMock(return_value=proc)) as mock_exec:
+        alive = await conn.kimi_run_alive("/tmp/aegis-kimi-run-x.jsonl")
+    assert alive is True
+    argv = " ".join(str(a) for a in mock_exec.call_args.args)
+    assert "fuser" in argv
+    assert "/tmp/aegis-kimi-run-x.jsonl" in argv
+
+
+@pytest.mark.asyncio
+async def test_kimi_run_alive_rc1_not_held_returns_false(conn):
+    """fuser rc=1 means nobody holds the file (or it was never created) → dead."""
+    proc = AsyncMock()
+    proc.communicate = AsyncMock(return_value=(b"", b""))
+    proc.returncode = 1
+    proc.kill = MagicMock()
+    proc.wait = AsyncMock(return_value=1)
+    with patch("asyncio.create_subprocess_exec", AsyncMock(return_value=proc)):
+        alive = await conn.kimi_run_alive("/tmp/aegis-kimi-run-x.jsonl")
+    assert alive is False
+
+
+@pytest.mark.asyncio
+async def test_kimi_run_alive_unexpected_rc_fails_open(conn):
+    """A surprising fuser exit code (e.g. missing binary → rc 127) must never
+    be mistaken for 'dead' — fail open so a flaky probe can't kill a healthy
+    run."""
+    proc = AsyncMock()
+    proc.communicate = AsyncMock(return_value=(b"", b"fuser: command not found"))
+    proc.returncode = 127
+    proc.kill = MagicMock()
+    proc.wait = AsyncMock(return_value=127)
+    with patch("asyncio.create_subprocess_exec", AsyncMock(return_value=proc)):
+        alive = await conn.kimi_run_alive("/tmp/aegis-kimi-run-x.jsonl")
+    assert alive is True
+
+
+@pytest.mark.asyncio
+async def test_kimi_run_alive_ssh_error_fails_open(conn):
+    """An SSH/exec-level failure (exit_code=-1) must fail open, not report dead."""
+    proc = AsyncMock()
+    proc.communicate = AsyncMock(side_effect=OSError("ssh connection refused"))
+    proc.returncode = None
+    proc.kill = MagicMock()
+    proc.wait = AsyncMock(return_value=None)
+    with patch("asyncio.create_subprocess_exec", AsyncMock(return_value=proc)):
+        alive = await conn.kimi_run_alive("/tmp/aegis-kimi-run-x.jsonl")
+    assert alive is True
+
+
+@pytest.mark.asyncio
+async def test_kimi_run_alive_targets_explicit_host(conn):
+    proc = AsyncMock()
+    proc.communicate = AsyncMock(return_value=(b"", b""))
+    proc.returncode = 0
+    proc.kill = MagicMock()
+    proc.wait = AsyncMock(return_value=0)
+    with patch("asyncio.create_subprocess_exec", AsyncMock(return_value=proc)) as mock_exec:
+        await conn.kimi_run_alive("/tmp/aegis-kimi-run-x.jsonl", host="node-b")
+    argv = " ".join(str(a) for a in mock_exec.call_args.args)
+    assert "user@node-b" in argv
+
+
+@pytest.mark.asyncio
+async def test_kimi_run_alive_defaults_to_base_host(conn):
+    proc = AsyncMock()
+    proc.communicate = AsyncMock(return_value=(b"", b""))
+    proc.returncode = 0
+    proc.kill = MagicMock()
+    proc.wait = AsyncMock(return_value=0)
+    with patch("asyncio.create_subprocess_exec", AsyncMock(return_value=proc)) as mock_exec:
+        await conn.kimi_run_alive("/tmp/aegis-kimi-run-x.jsonl")
+    argv = " ".join(str(a) for a in mock_exec.call_args.args)
+    assert "user@node-a" in argv
+    assert "user@node-b" not in argv
