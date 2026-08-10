@@ -60,7 +60,14 @@ def _agent_launch_flags(
 ) -> str:
     """Build the agent CLI invocation (without output redirection) for `engine`.
 
-    kimi:   --print --input-format text --output-format stream-json --work-dir <p>
+    kimi:   --output-format stream-json -p "$(cat <prompt_file>)"
+            (CLI 0.31.x dropped --print/--input-format/--work-dir outright — issue
+            #271. There is no --work-dir either; the launcher cd's into work_path
+            instead, same as claude. No permission flag is passed: 0.31.x's prompt
+            mode (-p) rejects both --auto and --yolo with "Cannot combine
+            --prompt with --auto/--yolo" — prompt-mode runs are unconditionally
+            forced to full-auto permission internally regardless, so there is
+            nothing to opt into.)
     claude: --print --output-format stream-json --verbose --dangerously-skip-permissions
             (stream-json in print mode requires --verbose; permissions are skipped
             because runs are non-interactive — nobody can answer a prompt. claude
@@ -68,8 +75,10 @@ def _agent_launch_flags(
             `config_dir`, when set, becomes CLAUDE_CONFIG_DIR so the run uses a
             non-default login (personal account for non-org fallback runs).
 
-    Both read the prompt from stdin and emit one JSON event per line, so the
-    flow's output polling and STATUS-footer parsing are engine-agnostic.
+    claude reads the prompt from stdin; kimi takes it as a `-p` argument via
+    `$(cat ...)` command substitution instead. Both emit one JSON event per
+    line, so the flow's output polling and STATUS-footer parsing are
+    engine-agnostic.
     """
     if engine == "claude":
         env = f"CLAUDE_CONFIG_DIR={shlex.quote(config_dir)} " if config_dir else ""
@@ -78,9 +87,8 @@ def _agent_launch_flags(
             f"--verbose --dangerously-skip-permissions < {shlex.quote(prompt_file)}"
         )
     return (
-        f"{shlex.quote(binary)} --print --input-format text "
-        f"--output-format stream-json --work-dir {shlex.quote(work_path)} "
-        f"< {shlex.quote(prompt_file)}"
+        f"{shlex.quote(binary)} --output-format stream-json "
+        f'-p "$(cat {shlex.quote(prompt_file)})"'
     )
 
 
@@ -748,8 +756,11 @@ class RemoteScriptConnector:
 
         # Phase 4: launch the agent. tmux mode → live-attachable window with
         # tee-capture; otherwise today's detached nohup. `nohup` alone detaches;
-        # a second stdin redirect would (last-wins) blank the prompt, so we
-        # never add `< /dev/null`.
+        # we never add `< /dev/null` — for claude, a second stdin redirect
+        # would (last-wins) blank the prompt (claude still reads it from
+        # stdin). kimi no longer reads the prompt from stdin at all (it's
+        # substituted into `-p` via `$(cat ...)`), but the same rule holds
+        # regardless: this launch command never redirects stdin itself.
         agent_flags = _agent_launch_flags(engine, binary, work_path, prompt_file, config_dir)
         nohup_cmd = (
             f"cd {shlex.quote(work_path)} && "
@@ -863,8 +874,10 @@ class RemoteScriptConnector:
         """Fetch the raw stream-json output of a kimi run from the remote host.
 
         output_file is the path returned by start_kimi_run.  The caller parses
-        the stream-json lines to extract session_id (first event) and the final
-        assistant message.
+        the stream-json lines to extract session_id (claude and pre-0.31 kimi
+        carry it in the first event; kimi CLI 0.31.x only in the last, a
+        `session.resume_hint` meta event written once the run completes) and
+        the final assistant message.
 
         Returns the file content or None if empty / not yet written.
         """
@@ -893,6 +906,45 @@ class RemoteScriptConnector:
             return None
         content = result["stdout"]
         return content if content.strip() else None
+
+    async def kimi_run_alive(self, output_file: str, host: str = "") -> bool:
+        """Return whether the agent process for a run is still running.
+
+        Probes via `fuser` on `output_file` rather than matching the launched
+        process's own command line: shell command substitution (kimi's
+        `-p "$(cat prompt_file)"`) and stdin redirection (claude's
+        `< prompt_file`) both consume the prompt-file path *before* exec, so
+        it never survives into the running process's argv once launched
+        detached via `nohup ... &` (verified empirically — the only process
+        that ever has that literal path in its own cmdline is the transient
+        launcher shell, which exits within milliseconds of backgrounding the
+        job). A marker matched against argv would therefore report a
+        healthy nohup-launched run as dead almost immediately — and nohup is
+        the common path here (prod runs with no `kimi_host` configured).
+
+        `output_file`, by contrast, stays open for the run's entire duration
+        regardless of launch mode: in nohup mode the agent process itself
+        holds the `> output_file` redirection open until it exits; in tmux
+        mode `tee output_file` holds it and exits once the agent's end of
+        the pipe closes. Either way, a live run holds the file open and a
+        dead run doesn't — and a launch that died before ever creating the
+        file also correctly reads as "not held open".
+
+        rc 0 (something holds it open) → True (alive)
+        rc 1 (file exists but nothing holds it, or the file was never
+            created — e.g. the process died before writing anything) →
+            False (dead)
+        ssh error, missing `fuser`, or any other rc → True (fail-open: a
+            flaky probe must never be mistaken for a dead run and kill a
+            healthy investigation)
+        """
+        await self._refresh_config()
+        result = await self._exec(
+            host or self._host,
+            f"fuser {shlex.quote(output_file)} >/dev/null 2>&1",
+            timeout=10,
+        )
+        return result["exit_code"] != 1
 
     async def remove_worktree(self, worktree_path: str, host: str = "") -> None:
         """Best-effort cleanup of a per-run git worktree created by start_kimi_run.

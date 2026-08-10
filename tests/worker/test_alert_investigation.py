@@ -146,6 +146,7 @@ def mock_remote_script():
             "output_file": "/tmp/aegis-kimi-run-test.jsonl",
         }
     )
+    rs.kimi_run_alive = AsyncMock(return_value=True)
     return rs
 
 
@@ -396,6 +397,143 @@ async def test_run_investigation_times_out_without_status_footer(
     result = await env.run(act.run_investigation, alert, SAMPLE_RESOURCES[:1], "")
     assert result["status"] == "timed_out"
     assert result["host"] == "node-b"
+
+
+# ── fail-fast on early process death (issue #271) ───────────────────────
+
+_NEVER_COMPLETES = '{"session_id": "sess-dead"}\nKimi launched, then died before finishing.\n'
+
+
+async def test_run_investigation_fails_fast_when_process_dies(
+    monkeypatch, mock_db_pool, mock_remote_script
+):
+    """When kimi_run_alive reports the process dead, run_investigation
+    returns status=failed (with the load-bearing 'engine' key for the
+    flow's kimi->claude fallback) in far fewer than the full 60 polls."""
+    mock_remote_script.fetch_kimi_run_output = AsyncMock(return_value=_NEVER_COMPLETES)
+    mock_remote_script.kimi_run_alive = AsyncMock(return_value=False)
+    monkeypatch.setattr("aegis_worker.activities.alerts.asyncio.sleep", AsyncMock())
+
+    act = AlertActivities(
+        db_pool=mock_db_pool,
+        remote_script=mock_remote_script,
+        kimi_binary="/usr/local/bin/kimi",
+    )
+    env = ActivityEnvironment()
+    alert = {
+        "title": "T",
+        "severity": "info",
+        "fingerprint": "fp-dead",
+        "source": "github",
+        "description": "",
+    }
+    result = await env.run(act.run_investigation, alert, SAMPLE_RESOURCES[:1], "")
+
+    assert result["status"] == "failed"
+    assert "engine" in result
+    assert result["engine"] == "kimi"
+    assert "exited before completing" in result["output"]
+    # 2 regular polls (grace period on the 1st) + 1 final re-fetch on death —
+    # nowhere near the 60-iteration timeout budget.
+    assert mock_remote_script.fetch_kimi_run_output.await_count == 3
+    mock_remote_script.kimi_run_alive.assert_awaited_once_with(
+        "/tmp/aegis-kimi-run-test.jsonl", host=""
+    )
+
+
+async def test_run_investigation_dead_but_final_refetch_completes(
+    monkeypatch, mock_db_pool, mock_remote_script
+):
+    """A process that finished and exited right as we polled (STATUS-footer
+    race) must still be recorded as succeeded — the final re-fetch after a
+    'dead' probe result gives it one last chance."""
+    completed = _NEVER_COMPLETES + "STATUS: investigated\n"
+    mock_remote_script.fetch_kimi_run_output = AsyncMock(
+        side_effect=[_NEVER_COMPLETES, _NEVER_COMPLETES, completed]
+    )
+    mock_remote_script.kimi_run_alive = AsyncMock(return_value=False)
+    monkeypatch.setattr("aegis_worker.activities.alerts.asyncio.sleep", AsyncMock())
+
+    act = AlertActivities(
+        db_pool=mock_db_pool,
+        remote_script=mock_remote_script,
+        kimi_binary="/usr/local/bin/kimi",
+    )
+    env = ActivityEnvironment()
+    alert = {
+        "title": "T",
+        "severity": "info",
+        "fingerprint": "fp-dead-footer-race",
+        "source": "github",
+        "description": "",
+    }
+    result = await env.run(act.run_investigation, alert, SAMPLE_RESOURCES[:1], "")
+
+    assert result["status"] == "succeeded"
+    assert mock_remote_script.fetch_kimi_run_output.await_count == 3
+    mock_remote_script.kimi_run_alive.assert_awaited_once()
+
+
+async def test_run_investigation_alive_never_completes_still_times_out(
+    monkeypatch, mock_db_pool, mock_remote_script
+):
+    """The probe reporting the process alive throughout must not change the
+    pre-existing behavior: a run that never emits STATUS: still exhausts
+    all 60 polls and returns timed_out."""
+    mock_remote_script.fetch_kimi_run_output = AsyncMock(return_value=_NEVER_COMPLETES)
+    mock_remote_script.kimi_run_alive = AsyncMock(return_value=True)
+    monkeypatch.setattr("aegis_worker.activities.alerts.asyncio.sleep", AsyncMock())
+
+    act = AlertActivities(
+        db_pool=mock_db_pool,
+        remote_script=mock_remote_script,
+        kimi_binary="/usr/local/bin/kimi",
+    )
+    env = ActivityEnvironment()
+    alert = {
+        "title": "T",
+        "severity": "info",
+        "fingerprint": "fp-alive-timeout",
+        "source": "github",
+        "description": "",
+    }
+    result = await env.run(act.run_investigation, alert, SAMPLE_RESOURCES[:1], "")
+
+    assert result["status"] == "timed_out"
+    assert mock_remote_script.fetch_kimi_run_output.await_count == 60
+    # Probed once per iteration after the 1st (grace period) — 59 times.
+    assert mock_remote_script.kimi_run_alive.await_count == 59
+
+
+async def test_run_investigation_probe_forced_alive_never_fails_fast(
+    monkeypatch, mock_db_pool, mock_remote_script
+):
+    """Falsifiability control for test_run_investigation_fails_fast_when_process_dies:
+    identical setup (same never-completing output), but with the probe
+    forced alive instead of dead. The fail-fast path must NOT trigger —
+    proving the earlier test's failure genuinely depends on kimi_run_alive
+    returning False, not on the output content alone."""
+    mock_remote_script.fetch_kimi_run_output = AsyncMock(return_value=_NEVER_COMPLETES)
+    mock_remote_script.kimi_run_alive = AsyncMock(return_value=True)
+    monkeypatch.setattr("aegis_worker.activities.alerts.asyncio.sleep", AsyncMock())
+
+    act = AlertActivities(
+        db_pool=mock_db_pool,
+        remote_script=mock_remote_script,
+        kimi_binary="/usr/local/bin/kimi",
+    )
+    env = ActivityEnvironment()
+    alert = {
+        "title": "T",
+        "severity": "info",
+        "fingerprint": "fp-forced-alive",
+        "source": "github",
+        "description": "",
+    }
+    result = await env.run(act.run_investigation, alert, SAMPLE_RESOURCES[:1], "")
+
+    assert result["status"] != "failed"
+    assert "exited before completing" not in result["output"]
 
 
 # ── stream-json end-to-end through run_investigation ────────────────────
