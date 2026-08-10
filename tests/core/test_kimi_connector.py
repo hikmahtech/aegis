@@ -269,6 +269,76 @@ async def test_start_kimi_run_prompt_write_nonzero_rc_fails_before_launch(conn):
 
 
 @pytest.mark.asyncio
+async def test_start_kimi_run_launch_ssh_failure_carries_engine(conn):
+    """A genuine ssh/connect failure at launch (`_exec` status='failed' —
+    nothing was launched remotely) is fallback-eligible: engine is carried
+    through unchanged so the flow's kimi->claude fallback can retry.
+
+    Call sequence (repo exists, worktree succeeds):
+      0: test -d check (rc=0)
+      1: git pull (rc=0)
+      2: mkdir + git worktree add --detach (rc=0)
+      3: cat > prompt_file (rc=0)
+      4: nohup launch — ssh itself fails (status='failed', not 'timed_out')
+    """
+    procs = [
+        _stub_proc(returncode=0),
+        _stub_proc(returncode=0),
+        _stub_proc(returncode=0),
+        _stub_proc(returncode=0),
+    ]
+    launch_proc = AsyncMock()
+    launch_proc.communicate = AsyncMock(side_effect=OSError("ssh connection refused"))
+    launch_proc.returncode = None
+    launch_proc.kill = MagicMock()
+    launch_proc.wait = AsyncMock(return_value=None)
+    procs.append(launch_proc)
+
+    with patch("asyncio.create_subprocess_exec", side_effect=procs):
+        result = await conn.start_kimi_run(
+            repo="youruser/bcp",
+            prompt="investigate bug",
+            kimi_binary="/usr/local/bin/kimi",
+        )
+
+    assert result["status"] == "failed"
+    assert result["engine"] == "kimi"
+
+
+@pytest.mark.asyncio
+async def test_start_kimi_run_launch_timeout_engine_empty_not_fallback_eligible(conn):
+    """A launch that TIMES OUT (`_exec` status='timed_out') may have already
+    forked the detached `(nohup ... &)` remotely before the 15s ssh timeout
+    hit — the kimi agent could be ALIVE. engine must be '' so the flow's
+    kimi->claude fallback does not race a possibly-live agent on the same
+    deterministic fix branch. Before this fix, `engine` was carried through
+    unconditionally on any exit_code == -1, including this timed-out case
+    (falsifiability: reverting `"" if launch["status"] == "timed_out" else
+    engine` back to a bare `engine` makes this test see engine == "kimi").
+
+    Call sequence identical to the ssh-failure test above, except the launch
+    step raises TimeoutError instead of a generic connection error.
+    """
+    procs = [
+        _stub_proc(returncode=0),
+        _stub_proc(returncode=0),
+        _stub_proc(returncode=0),
+        _stub_proc(returncode=0),
+        _stub_proc(returncode=None, communicate_side_effect=TimeoutError()),
+    ]
+
+    with patch("asyncio.create_subprocess_exec", side_effect=procs):
+        result = await conn.start_kimi_run(
+            repo="youruser/bcp",
+            prompt="investigate bug",
+            kimi_binary="/usr/local/bin/kimi",
+        )
+
+    assert result["status"] == "failed"
+    assert result["engine"] == ""
+
+
+@pytest.mark.asyncio
 async def test_remove_worktree_issues_git_worktree_remove(conn):
     """remove_worktree should run `git worktree remove --force` and not raise on nonzero exit."""
     worktree = "/home/user/Workspace/bcp-aegis-wt/run123"

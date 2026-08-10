@@ -796,7 +796,11 @@ class RemoteScriptConnector:
                     "run_id": run_id,
                     "status": "failed",
                     "error": launch["stderr"],
-                    "engine": engine,
+                    # A timed-out launch (vs. a clean ssh/connect failure) may have
+                    # already forked the `(nohup ... &)` remotely before the 15s
+                    # timeout hit — the kimi agent could be alive, so a claude
+                    # fallback would race it on the same deterministic fix branch.
+                    "engine": "" if launch["status"] == "timed_out" else engine,
                 }
 
         logger.info(
