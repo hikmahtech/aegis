@@ -50,7 +50,12 @@ async def test_start_kimi_run_happy_path(conn):
     combined = " ".join(" ".join(str(a) for a in c.args) for c in mock_exec.call_args_list)
     assert "/home/user/.local/bin/kimi" in combined
     assert "--output-format stream-json" in combined
-    assert "--work-dir" in combined
+    # kimi CLI 0.31.x dropped --print/--input-format/--work-dir (issue #271);
+    # the prompt is substituted into -p via $(cat ...) instead of stdin/flags.
+    assert "--work-dir" not in combined
+    assert "--print" not in combined
+    assert "--input-format" not in combined
+    assert '-p "$(cat' in combined
     assert "/home/user/Workspace/youruser/aegis" in combined
 
 
@@ -183,14 +188,13 @@ async def test_start_kimi_run_creates_worktree_and_runs_kimi_there(conn):
     # One command must perform the worktree add
     assert any("worktree add --detach" in cmd and "-aegis-wt/" in cmd for cmd in all_cmds)
 
-    # The kimi launch (last command) must cd into + --work-dir the worktree, NOT bare repo_path
+    # The kimi launch (last command) must cd into the worktree, NOT bare repo_path.
+    # kimi CLI 0.31.x has no --work-dir flag; the `cd` prefix carries the cwd.
     kimi_cmd = all_cmds[-1]
     repo_path = "/home/user/Workspace/youruser/bcp"
-    assert "--work-dir" in kimi_cmd
-    # The --work-dir argument must reference the worktree path (contains -aegis-wt/)
+    assert "--work-dir" not in kimi_cmd
+    # The cd target must reference the worktree path (contains -aegis-wt/)
     assert "-aegis-wt/" in kimi_cmd
-    # And it must NOT cd into / use the bare repo_path for --work-dir (worktree is used instead)
-    # (repo_path still appears in the worktree-add command, which is fine)
     assert result["repo_path"] == repo_path
 
 
@@ -221,8 +225,9 @@ async def test_start_kimi_run_worktree_failure_falls_back_to_shared(conn):
     all_cmds = [" ".join(str(a) for a in c.args) for c in mock_exec.call_args_list]
     kimi_cmd = all_cmds[-1]
 
-    # kimi must run with --work-dir pointing at the shared repo_path (not -aegis-wt/)
-    assert "--work-dir" in kimi_cmd
+    # kimi must run from the shared repo_path (not a worktree); the `cd` prefix
+    # carries cwd since kimi CLI 0.31.x has no --work-dir flag.
+    assert "--work-dir" not in kimi_cmd
     assert repo_path in kimi_cmd
     assert "-aegis-wt/" not in kimi_cmd
 
@@ -600,6 +605,47 @@ def test_agent_launch_flags_claude_config_dir():
     assert "CLAUDE_CONFIG_DIR" not in _agent_launch_flags("kimi", "/bin/kimi", "/w", "/p", "/x")
 
 
+def test_agent_launch_flags_claude_unchanged():
+    """The claude branch is untouched by the kimi CLI 0.31.x fix (issue #271) —
+    still --print/--verbose/--dangerously-skip-permissions with the prompt
+    piped in over stdin."""
+    flags = _agent_launch_flags("claude", "/bin/claude", "/w", "/p")
+    assert flags == (
+        "/bin/claude --print --output-format stream-json "
+        "--verbose --dangerously-skip-permissions < /p"
+    )
+
+
+def test_agent_launch_flags_kimi_cli_031_form():
+    """kimi CLI 0.31.1 (issue #271) dropped --print/--input-format/--work-dir
+    outright, and rejects both --auto and --yolo in prompt mode ("Cannot
+    combine --prompt with --auto/--yolo" — confirmed by running the real
+    0.31.1 binary; -p mode is unconditionally forced to full-auto permission
+    internally, per the shipped CLI source, so no permission flag is passed
+    at all). The prompt is substituted into -p via `$(cat <prompt_file>)`
+    instead of a stdin redirect."""
+    flags = _agent_launch_flags("kimi", "/bin/kimi", "/w", "/p")
+    assert flags == '/bin/kimi --output-format stream-json -p "$(cat /p)"'
+    # Old CLI (<0.31) flags must be gone.
+    assert "--print" not in flags
+    assert "--input-format" not in flags
+    assert "--work-dir" not in flags
+    # Both rejected-in-prompt-mode permission flags must be absent.
+    assert "--auto" not in flags
+    assert "--yolo" not in flags
+    assert " -y" not in flags
+    # No trailing stdin redirect (kimi no longer reads the prompt from stdin).
+    assert not flags.endswith(f"< {'/p'}")
+    assert "< /p" not in flags
+
+
+def test_agent_launch_flags_kimi_prompt_file_shlex_quoted():
+    """The prompt_file path is shlex-quoted INSIDE the $(cat ...) substitution
+    (e.g. a path containing a space must not break the command)."""
+    flags = _agent_launch_flags("kimi", "/bin/kimi", "/w", "/tmp/a b/prompt.txt")
+    assert "$(cat '/tmp/a b/prompt.txt')" in flags
+
+
 @pytest.mark.asyncio
 async def test_engine_override_forces_personal_claude_on_base_host(conn_claude):
     """Non-org repo + engine_override='claude' → claude CLI on node-a (not node-b)
@@ -710,7 +756,8 @@ async def test_start_kimi_run_non_org_repo_still_prefers_kimi_host(conn_claude):
     launch = " ".join(str(a) for a in mock_exec.call_args_list[-1].args)
     assert "kimi-aegis-" in launch
     assert "/home/user/.local/bin/kimi" in launch
-    assert "--work-dir" in launch
+    assert "--work-dir" not in launch
+    assert '-p "$(cat' in launch
     assert "--dangerously-skip-permissions" not in launch
 
 

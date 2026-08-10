@@ -150,6 +150,48 @@ async def test_run_investigation_success(mock_remote_script):
     mock_remote_script.start_kimi_run.assert_called_once()
 
 
+async def test_run_investigation_kimi_031_session_id_from_resume_hint(monkeypatch):
+    """kimi CLI 0.31.x (issue #271) only emits session_id in a
+    `session.resume_hint` meta event on the LAST line, appended once the run
+    completes — unlike claude/pre-0.31 kimi, which put it in the FIRST event
+    (see test_run_investigation_success above). run_investigation must
+    recover it from either position. (asyncio.sleep is mocked so that, run
+    against the pre-fix first-line-only parser, this fails fast with
+    status=timed_out rather than actually waiting out all 60 polls.)"""
+    monkeypatch.setattr(
+        "aegis_worker.activities.alerts.asyncio.sleep", AsyncMock(return_value=None)
+    )
+    rs = AsyncMock()
+    rs.start_kimi_run.return_value = {
+        "run_id": "run-999",
+        "repo_path": "/home/user/repos/aegis",
+        "output_file": "/tmp/aegis-kimi-run-run-999.jsonl",
+        "status": "running",
+    }
+    rs.fetch_kimi_run_output.return_value = (
+        '{"role":"assistant","content":"Investigating."}\n'
+        '{"role":"tool","tool_call_id":"t1","content":"pattern found"}\n'
+        '{"role":"assistant","content":"Root cause confirmed.\\n\\nSTATUS: investigated"}\n'
+        '{"role":"meta","type":"session.resume_hint","session_id":"kimi-sess-999",'
+        '"command":"kimi -r kimi-sess-999",'
+        '"content":"To resume this session: kimi -r kimi-sess-999"}\n'
+    )
+    activities = AlertActivities(
+        remote_script=rs,
+        kimi_binary="/home/user/.local/bin/kimi",
+    )
+    env = ActivityEnvironment()
+    alert = {"title": "OOM Kill", "severity": "critical"}
+    result = await env.run(
+        activities.run_investigation,
+        alert,
+        _AEGIS_RESOURCE,
+        "Check memory usage and restart if needed",
+    )
+    assert result["status"] == "succeeded"
+    assert result["session_id"] == "kimi-sess-999"
+
+
 async def test_run_investigation_no_kimi_binary(mock_remote_script):
     """Returns failed when kimi_binary is unset (settings not configured)."""
     activities = AlertActivities(remote_script=mock_remote_script, kimi_binary="")
@@ -684,6 +726,37 @@ def test_parse_kimi_branches_claude_stream_json_shape():
     assert _parse_kimi_branches(stream, primary_repo="bcp") == {"bcp": "aegis-fix/fp-7"}
 
 
+def test_kimi_output_complete_matches_kimi_031_flat_string_shape():
+    """kimi CLI 0.31.x (issue #271) flattens assistant `content` to a plain
+    string instead of a list of typed blocks — STATUS detection must still
+    see it. Shape captured by inspecting the shipped 0.31.1 binary's
+    PromptJsonWriter (live auth wasn't available on the verification host,
+    so this comes from reading the bundled JS, not a live run — see the
+    task report). Ends with the 0.31.x `session.resume_hint` meta line."""
+    from aegis_worker.activities.alerts import _kimi_output_complete
+
+    stream = (
+        '{"role":"assistant","content":"Investigating."}\n'
+        '{"role":"tool","tool_call_id":"t1","content":"pattern found"}\n'
+        '{"role":"assistant","content":"Root cause confirmed.\\n\\n'
+        'BRANCH: aegis:aegis-fix/fp77\\n\\nSTATUS: investigated"}\n'
+        '{"role":"meta","type":"session.resume_hint","session_id":"kimi-sess-1",'
+        '"command":"kimi -r kimi-sess-1",'
+        '"content":"To resume this session: kimi -r kimi-sess-1"}\n'
+    )
+    assert _kimi_output_complete(stream) is True
+
+
+def test_parse_kimi_branches_kimi_031_flat_string_shape():
+    from aegis_worker.activities.alerts import _parse_kimi_branches
+
+    stream = (
+        '{"role":"assistant","content":'
+        '"Committed.\\n\\nBRANCH: bcp:aegis-fix/fp-7\\nSTATUS: investigated"}\n'
+    )
+    assert _parse_kimi_branches(stream, primary_repo="bcp") == {"bcp": "aegis-fix/fp-7"}
+
+
 # ── investigation output: assistant transcript, never raw stream-json ────────
 
 
@@ -720,6 +793,23 @@ def test_extract_transcript_keeps_assistant_text_and_drops_tool_noise():
                 }
             ),
         ]
+    )
+    out = _extract_kimi_transcript(raw)
+    assert out == "Root cause: stale NFS handle."
+    assert "NOISE" not in out
+
+
+def test_extract_transcript_kimi_031_flat_string_shape():
+    """kimi CLI 0.31.x's assistant `content` is a plain string (issue #271),
+    not a list of typed blocks — the pre-0.31 shape `_iter_kimi_assistant_text`
+    was written for. Regression: before the fix, `isinstance(content, list)`
+    silently skipped every 0.31.x assistant message, so the transcript (and
+    thus the assessor prompt) came back empty for every kimi run."""
+    from aegis_worker.activities.alerts import _extract_kimi_transcript
+
+    raw = (
+        '{"role":"tool","tool_call_id":"t1","content":"NOISE nfs mount table"}\n'
+        '{"role":"assistant","content":"Root cause: stale NFS handle."}\n'
     )
     out = _extract_kimi_transcript(raw)
     assert out == "Root cause: stale NFS handle."

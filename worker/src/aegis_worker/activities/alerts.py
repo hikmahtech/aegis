@@ -257,24 +257,31 @@ def _iter_kimi_assistant_text(raw: str):
     stream-json output (kimi or claude).
 
     Both engines run in `--output-format stream-json`, so each non-empty line
-    is a JSON event. Kimi assistant turns are flat:
+    is a JSON event. Pre-0.31 kimi assistant turns were flat, content a list
+    of typed blocks:
 
         {"role":"assistant","content":[
           {"type":"think","text":"..."},
           {"type":"text","text":"...STATUS: scoped"}
         ]}
 
-    Claude wraps the same shape one level down under "message":
+    kimi CLI 0.31.x (issue #271) flattens `content` further, to a plain
+    string with no block wrapper:
+
+        {"role":"assistant","content":"...STATUS: scoped","tool_calls":[...]}
+
+    Claude wraps the pre-0.31-kimi shape one level down under "message":
 
         {"type":"assistant","message":{"role":"assistant","content":[
           {"type":"text","text":"...STATUS: scoped"}
         ]}}
 
     The STATUS/BRANCH lines the agent promises to emit live INSIDE one of
-    those `text` fields. Searching the raw file with a multiline regex misses
-    them because the `\\n` between log content and `STATUS:` is a JSON
-    escape, not a real newline. Decoding via json.loads restores the real
-    newlines, so regexes that key on `^STATUS:` (multiline) match again.
+    those `text` fields (or directly in the 0.31.x string). Searching the raw
+    file with a multiline regex misses them because the `\\n` between log
+    content and `STATUS:` is a JSON escape, not a real newline. Decoding via
+    json.loads restores the real newlines, so regexes that key on `^STATUS:`
+    (multiline) match again.
 
     Non-JSON lines (e.g. kimi's trailing "To resume this session: kimi -r
     <id>") and non-assistant events (role=tool, role=user, plain session
@@ -298,6 +305,11 @@ def _iter_kimi_assistant_text(raw: str):
                 continue
             evt = msg
         content = evt.get("content")
+        if isinstance(content, str):
+            # kimi 0.31.x: content is the flat text itself, not a block list.
+            if content:
+                yield content
+            continue
         if not isinstance(content, list):
             continue
         for block in content:
@@ -2020,18 +2032,20 @@ class AlertActivities:
                 raw = await self.remote_script.fetch_kimi_run_output(output_file, host=inv_host)
                 if raw:
                     latest_raw = raw
-                    # Parse session_id from first stream-json event
-                    for line in raw.splitlines():
-                        line = line.strip()
-                        if not line:
-                            continue
+                    # Parse session_id from stream-json events. Claude (and
+                    # pre-0.31 kimi) emit it in the FIRST event. kimi CLI
+                    # 0.31.x (issue #271) instead appends a
+                    # `{"role":"meta","type":"session.resume_hint",...}`
+                    # event carrying session_id as the LAST line, written
+                    # only once the whole run has completed — so check both.
+                    non_empty = [ln.strip() for ln in raw.splitlines() if ln.strip()]
+                    for candidate in {non_empty[0], non_empty[-1]} if non_empty else ():
                         try:
-                            evt = json.loads(line)
+                            evt = json.loads(candidate)
                             if evt.get("session_id"):
                                 session_id = evt["session_id"]
                         except (json.JSONDecodeError, AttributeError):
                             pass
-                        break
                     if _kimi_output_complete(raw):
                         branches = _parse_kimi_branches(raw, primary_repo=repo_key)
                         primary_branch = branches.get(repo_key, fix_branch if branches else "")

@@ -60,7 +60,14 @@ def _agent_launch_flags(
 ) -> str:
     """Build the agent CLI invocation (without output redirection) for `engine`.
 
-    kimi:   --print --input-format text --output-format stream-json --work-dir <p>
+    kimi:   --output-format stream-json -p "$(cat <prompt_file>)"
+            (CLI 0.31.x dropped --print/--input-format/--work-dir outright — issue
+            #271. There is no --work-dir either; the launcher cd's into work_path
+            instead, same as claude. No permission flag is passed: 0.31.x's prompt
+            mode (-p) rejects both --auto and --yolo with "Cannot combine
+            --prompt with --auto/--yolo" — prompt-mode runs are unconditionally
+            forced to full-auto permission internally regardless, so there is
+            nothing to opt into.)
     claude: --print --output-format stream-json --verbose --dangerously-skip-permissions
             (stream-json in print mode requires --verbose; permissions are skipped
             because runs are non-interactive — nobody can answer a prompt. claude
@@ -68,8 +75,10 @@ def _agent_launch_flags(
             `config_dir`, when set, becomes CLAUDE_CONFIG_DIR so the run uses a
             non-default login (personal account for non-org fallback runs).
 
-    Both read the prompt from stdin and emit one JSON event per line, so the
-    flow's output polling and STATUS-footer parsing are engine-agnostic.
+    claude reads the prompt from stdin; kimi takes it as a `-p` argument via
+    `$(cat ...)` command substitution instead. Both emit one JSON event per
+    line, so the flow's output polling and STATUS-footer parsing are
+    engine-agnostic.
     """
     if engine == "claude":
         env = f"CLAUDE_CONFIG_DIR={shlex.quote(config_dir)} " if config_dir else ""
@@ -78,9 +87,8 @@ def _agent_launch_flags(
             f"--verbose --dangerously-skip-permissions < {shlex.quote(prompt_file)}"
         )
     return (
-        f"{shlex.quote(binary)} --print --input-format text "
-        f"--output-format stream-json --work-dir {shlex.quote(work_path)} "
-        f"< {shlex.quote(prompt_file)}"
+        f"{shlex.quote(binary)} --output-format stream-json "
+        f'-p "$(cat {shlex.quote(prompt_file)})"'
     )
 
 
@@ -748,8 +756,11 @@ class RemoteScriptConnector:
 
         # Phase 4: launch the agent. tmux mode → live-attachable window with
         # tee-capture; otherwise today's detached nohup. `nohup` alone detaches;
-        # a second stdin redirect would (last-wins) blank the prompt, so we
-        # never add `< /dev/null`.
+        # we never add `< /dev/null` — for claude, a second stdin redirect
+        # would (last-wins) blank the prompt (claude still reads it from
+        # stdin). kimi no longer reads the prompt from stdin at all (it's
+        # substituted into `-p` via `$(cat ...)`), but the same rule holds
+        # regardless: this launch command never redirects stdin itself.
         agent_flags = _agent_launch_flags(engine, binary, work_path, prompt_file, config_dir)
         nohup_cmd = (
             f"cd {shlex.quote(work_path)} && "
@@ -863,8 +874,10 @@ class RemoteScriptConnector:
         """Fetch the raw stream-json output of a kimi run from the remote host.
 
         output_file is the path returned by start_kimi_run.  The caller parses
-        the stream-json lines to extract session_id (first event) and the final
-        assistant message.
+        the stream-json lines to extract session_id (claude and pre-0.31 kimi
+        carry it in the first event; kimi CLI 0.31.x only in the last, a
+        `session.resume_hint` meta event written once the run completes) and
+        the final assistant message.
 
         Returns the file content or None if empty / not yet written.
         """
