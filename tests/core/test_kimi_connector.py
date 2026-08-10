@@ -10,6 +10,7 @@ import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+import structlog.testing
 from aegis.connectors.remote_script import (
     RemoteScriptConnector,
     _agent_launch_flags,
@@ -73,6 +74,10 @@ async def test_start_kimi_run_repo_missing_returns_failed(conn):
         )
     assert result["status"] == "failed"
     assert "checkout missing" in result["error"].lower()
+    # engine (item 4, #275): the kimi->claude fallback in the flow keys on
+    # this field, so a launch failure that never reaches an engine-aware
+    # caller must still carry it.
+    assert result["engine"] == "kimi"
     # No JIT clone: a missing checkout must never trigger a `git clone`.
     combined = " ".join(" ".join(str(a) for a in c.args) for c in mock_exec.call_args_list)
     assert "git clone" not in combined
@@ -230,6 +235,107 @@ async def test_start_kimi_run_worktree_failure_falls_back_to_shared(conn):
     assert "--work-dir" not in kimi_cmd
     assert repo_path in kimi_cmd
     assert "-aegis-wt/" not in kimi_cmd
+
+
+@pytest.mark.asyncio
+async def test_start_kimi_run_prompt_write_nonzero_rc_fails_before_launch(conn):
+    """A nonzero (non-ssh-error) rc from `cat > prompt_file` means the prompt
+    is missing/truncated on the remote — with kimi's `-p "$(cat ...)"` form
+    that would otherwise launch a full-auto agent with an EMPTY prompt.
+    Before the fix, only exit_code == -1 (an ssh-level error) failed here, so
+    a remote rc=1 (e.g. disk full, permission denied — ssh itself succeeded)
+    launched anyway. Falsifiability: reverting the `!= 0` guard back to
+    `== -1` makes this test launch (status flips to 'running' and a 5th
+    subprocess call — the kimi launch — appears).
+
+    Call sequence (repo exists, worktree succeeds):
+      0: test -d check (rc=0)
+      1: git pull (rc=0)
+      2: mkdir + git worktree add --detach (rc=0)
+      3: cat > prompt_file (rc=1 — remote failure, NOT an ssh error)
+    """
+    procs = _make_proc_sequence([0, 0, 0, 1])
+    with patch("asyncio.create_subprocess_exec", side_effect=procs) as mock_exec:
+        result = await conn.start_kimi_run(
+            repo="youruser/bcp",
+            prompt="investigate bug",
+            kimi_binary="/usr/local/bin/kimi",
+        )
+
+    assert result["status"] == "failed"
+    assert result["engine"] == "kimi"
+    # Exactly 4 subprocess calls — the launch (a 5th) must never happen.
+    assert mock_exec.call_count == 4
+
+
+@pytest.mark.asyncio
+async def test_start_kimi_run_launch_ssh_failure_carries_engine(conn):
+    """A genuine ssh/connect failure at launch (`_exec` status='failed' —
+    nothing was launched remotely) is fallback-eligible: engine is carried
+    through unchanged so the flow's kimi->claude fallback can retry.
+
+    Call sequence (repo exists, worktree succeeds):
+      0: test -d check (rc=0)
+      1: git pull (rc=0)
+      2: mkdir + git worktree add --detach (rc=0)
+      3: cat > prompt_file (rc=0)
+      4: nohup launch — ssh itself fails (status='failed', not 'timed_out')
+    """
+    procs = [
+        _stub_proc(returncode=0),
+        _stub_proc(returncode=0),
+        _stub_proc(returncode=0),
+        _stub_proc(returncode=0),
+    ]
+    launch_proc = AsyncMock()
+    launch_proc.communicate = AsyncMock(side_effect=OSError("ssh connection refused"))
+    launch_proc.returncode = None
+    launch_proc.kill = MagicMock()
+    launch_proc.wait = AsyncMock(return_value=None)
+    procs.append(launch_proc)
+
+    with patch("asyncio.create_subprocess_exec", side_effect=procs):
+        result = await conn.start_kimi_run(
+            repo="youruser/bcp",
+            prompt="investigate bug",
+            kimi_binary="/usr/local/bin/kimi",
+        )
+
+    assert result["status"] == "failed"
+    assert result["engine"] == "kimi"
+
+
+@pytest.mark.asyncio
+async def test_start_kimi_run_launch_timeout_engine_empty_not_fallback_eligible(conn):
+    """A launch that TIMES OUT (`_exec` status='timed_out') may have already
+    forked the detached `(nohup ... &)` remotely before the 15s ssh timeout
+    hit — the kimi agent could be ALIVE. engine must be '' so the flow's
+    kimi->claude fallback does not race a possibly-live agent on the same
+    deterministic fix branch. Before this fix, `engine` was carried through
+    unconditionally on any exit_code == -1, including this timed-out case
+    (falsifiability: reverting `"" if launch["status"] == "timed_out" else
+    engine` back to a bare `engine` makes this test see engine == "kimi").
+
+    Call sequence identical to the ssh-failure test above, except the launch
+    step raises TimeoutError instead of a generic connection error.
+    """
+    procs = [
+        _stub_proc(returncode=0),
+        _stub_proc(returncode=0),
+        _stub_proc(returncode=0),
+        _stub_proc(returncode=0),
+        _stub_proc(returncode=None, communicate_side_effect=TimeoutError()),
+    ]
+
+    with patch("asyncio.create_subprocess_exec", side_effect=procs):
+        result = await conn.start_kimi_run(
+            repo="youruser/bcp",
+            prompt="investigate bug",
+            kimi_binary="/usr/local/bin/kimi",
+        )
+
+    assert result["status"] == "failed"
+    assert result["engine"] == ""
 
 
 @pytest.mark.asyncio
@@ -801,6 +907,9 @@ async def test_start_kimi_run_claude_binary_missing_fails_fast(conn_b):
     mock_exec.assert_not_called()
     assert result["status"] == "failed"
     assert "claude_binary" in result["error"]
+    # This IS the claude path (engine resolved to claude before the binary
+    # check) — hardcoded, not resolved via engine_override.
+    assert result["engine"] == "claude"
 
 
 def test_plan_counts_claude_windows_toward_cap():
@@ -902,15 +1011,43 @@ async def test_kimi_run_alive_rc1_not_held_returns_false(conn):
 async def test_kimi_run_alive_unexpected_rc_fails_open(conn):
     """A surprising fuser exit code (e.g. missing binary → rc 127) must never
     be mistaken for 'dead' — fail open so a flaky probe can't kill a healthy
-    run."""
+    run. It must also be logged (item 2, #275) so a permanently-inconclusive
+    probe (e.g. a host missing `fuser`) is visible instead of a silent
+    permanent no-op."""
     proc = AsyncMock()
     proc.communicate = AsyncMock(return_value=(b"", b"fuser: command not found"))
     proc.returncode = 127
     proc.kill = MagicMock()
     proc.wait = AsyncMock(return_value=127)
-    with patch("asyncio.create_subprocess_exec", AsyncMock(return_value=proc)):
+    with (
+        patch("asyncio.create_subprocess_exec", AsyncMock(return_value=proc)),
+        structlog.testing.capture_logs() as logs,
+    ):
         alive = await conn.kimi_run_alive("/tmp/aegis-kimi-run-x.jsonl")
     assert alive is True
+    warnings = [log for log in logs if log["event"] == "kimi_run_alive_probe_inconclusive"]
+    assert len(warnings) == 1
+    assert warnings[0]["exit_code"] == 127
+    assert warnings[0]["output_file"] == "/tmp/aegis-kimi-run-x.jsonl"
+    assert warnings[0]["host"] == "node-a"
+
+
+@pytest.mark.asyncio
+async def test_kimi_run_alive_rc0_does_not_log_inconclusive_warning(conn):
+    """Falsifiability control: a normal rc=0 (alive) probe must NOT emit the
+    inconclusive-probe warning — proves the log in the test above is keyed on
+    the unexpected rc, not emitted unconditionally."""
+    proc = AsyncMock()
+    proc.communicate = AsyncMock(return_value=(b"", b""))
+    proc.returncode = 0
+    proc.kill = MagicMock()
+    proc.wait = AsyncMock(return_value=0)
+    with (
+        patch("asyncio.create_subprocess_exec", AsyncMock(return_value=proc)),
+        structlog.testing.capture_logs() as logs,
+    ):
+        await conn.kimi_run_alive("/tmp/aegis-kimi-run-x.jsonl")
+    assert not [log for log in logs if log["event"] == "kimi_run_alive_probe_inconclusive"]
 
 
 @pytest.mark.asyncio

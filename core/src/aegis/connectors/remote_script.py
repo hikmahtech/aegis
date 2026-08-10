@@ -680,7 +680,7 @@ class RemoteScriptConnector:
             if not self._claude_binary:
                 error = f"claude engine selected for {github_repo} but claude_binary not configured"
                 logger.warning("claude_binary_missing", github_repo=github_repo)
-                return {"run_id": run_id, "status": "failed", "error": error}
+                return {"run_id": run_id, "status": "failed", "error": error, "engine": "claude"}
             host, use_tmux = self._host, True
             binary = self._claude_binary
             # Precedence for CLAUDE_CONFIG_DIR (empty ⇒ host's default ~/.claude):
@@ -708,7 +708,7 @@ class RemoteScriptConnector:
         if check["exit_code"] == -1:  # ssh error/timeout — not a missing dir
             error = check["stderr"] or "repo check failed"
             logger.warning("kimi_repo_check_failed", error=error)
-            return {"run_id": run_id, "status": "failed", "error": error}
+            return {"run_id": run_id, "status": "failed", "error": error, "engine": engine}
         dir_exists = check["status"] == "succeeded"
 
         if not dir_exists:
@@ -717,7 +717,7 @@ class RemoteScriptConnector:
                 "provision it via WorkspaceRepoSyncFlow (no JIT clone)"
             )
             logger.warning("kimi_repo_missing", repo=repo, repo_path=repo_path, host=host)
-            return {"run_id": run_id, "status": "failed", "error": error}
+            return {"run_id": run_id, "status": "failed", "error": error, "engine": engine}
 
         await self._exec(
             host,
@@ -750,9 +750,16 @@ class RemoteScriptConnector:
             timeout=15,
             stdin=prompt[:5000].encode(),
         )
-        if wrote["exit_code"] == -1:
-            logger.warning("kimi_prompt_write_failed", error=wrote["stderr"])
-            return {"run_id": run_id, "status": "failed", "error": wrote["stderr"]}
+        if wrote["exit_code"] != 0:
+            logger.warning(
+                "kimi_prompt_write_failed", error=wrote["stderr"], exit_code=wrote["exit_code"]
+            )
+            return {
+                "run_id": run_id,
+                "status": "failed",
+                "error": wrote["stderr"],
+                "engine": engine,
+            }
 
         # Phase 4: launch the agent. tmux mode → live-attachable window with
         # tee-capture; otherwise today's detached nohup. `nohup` alone detaches;
@@ -785,7 +792,16 @@ class RemoteScriptConnector:
             launch = await self._exec(host, nohup_cmd, timeout=15)
             if launch["exit_code"] == -1:  # ssh error/timeout, not a remote rc
                 logger.warning("kimi_start_failed", error=launch["stderr"])
-                return {"run_id": run_id, "status": "failed", "error": launch["stderr"]}
+                return {
+                    "run_id": run_id,
+                    "status": "failed",
+                    "error": launch["stderr"],
+                    # A timed-out launch (vs. a clean ssh/connect failure) may have
+                    # already forked the `(nohup ... &)` remotely before the 15s
+                    # timeout hit — the kimi agent could be alive, so a claude
+                    # fallback would race it on the same deterministic fix branch.
+                    "engine": "" if launch["status"] == "timed_out" else engine,
+                }
 
         logger.info(
             "kimi_run_started",
@@ -939,11 +955,22 @@ class RemoteScriptConnector:
             healthy investigation)
         """
         await self._refresh_config()
+        target_host = host or self._host
         result = await self._exec(
-            host or self._host,
+            target_host,
             f"fuser {shlex.quote(output_file)} >/dev/null 2>&1",
             timeout=10,
         )
+        if result["exit_code"] not in (0, 1):
+            # e.g. rc 127 (fuser missing on host) — fail-open (below) is
+            # unchanged, but a permanently-inconclusive probe would silently
+            # never fail-fast again; surface it instead of staying silent.
+            logger.warning(
+                "kimi_run_alive_probe_inconclusive",
+                exit_code=result["exit_code"],
+                output_file=output_file,
+                host=target_host,
+            )
         return result["exit_code"] != 1
 
     async def remove_worktree(self, worktree_path: str, host: str = "") -> None:

@@ -2015,6 +2015,7 @@ class AlertActivities:
                     "branch": "",
                     "branches": {},
                     "output_file": "",
+                    "engine": run_result.get("engine", ""),
                 }
 
             # Isolated per-run worktree (empty if start_kimi_run fell back to
@@ -2090,6 +2091,12 @@ class AlertActivities:
                         result = _succeeded_result(raw)
                         if result is not None:
                             return result
+                    activity.logger.warning(
+                        "run_investigation_dead_probe output_file=%s iteration=%d engine=%s",
+                        output_file,
+                        iteration,
+                        run_result.get("engine", "kimi"),
+                    )
                     return {
                         "status": "failed",
                         "output": (
@@ -2131,6 +2138,9 @@ class AlertActivities:
                 "branch": "",
                 "branches": {},
                 "output_file": "",
+                # Deliberate no-fallback: an unknown crash shouldn't auto-trigger
+                # a second 30-minute claude attempt.
+                "engine": "",
             }
         finally:
             if worktree_path:
