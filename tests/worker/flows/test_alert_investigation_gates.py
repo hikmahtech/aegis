@@ -169,13 +169,16 @@ async def stub_investigate(alert: dict, system_prompt: str) -> dict:
 @activity.defn(name="run_investigation")
 async def stub_run_investigation(alert: dict, resources: list[dict], runbook: str, *_a) -> dict:
     _calls.setdefault("run_investigation_called", []).append(True)
-    return _state.get("run_investigation_result", {
-        "status": "succeeded",
-        "output": "test output",
-        "session_id": "sess-1",
-        "branch": "aegis-fix/test",
-        "branches": {"aegis": "aegis-fix/test"},
-    })
+    return _state.get(
+        "run_investigation_result",
+        {
+            "status": "succeeded",
+            "output": "test output",
+            "session_id": "sess-1",
+            "branch": "aegis-fix/test",
+            "branches": {"aegis": "aegis-fix/test"},
+        },
+    )
 
 
 @activity.defn(name="assess_investigation")
@@ -640,6 +643,79 @@ async def test_alertmanager_kimi_triggers_gate2():
     call = created[0]
     repo_path = call["repo_path"] if isinstance(call, dict) else call.repo_path
     assert repo_path == "infrastructure/infra-gitops"
+
+
+# ---------------------------------------------------------------------------
+# Test 8b: BRANCH: keyed by GitHub repo name ≠ checkout folder name
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_gate2_open_prs_branch_keyed_by_github_repo_name():
+    """The engine's `BRANCH: <repo_name>:` footer may use the GitHub repo name
+    rather than the checkout-dir basename. When the two differ (e.g. checkout
+    `hikmah/quantamental-data-platform` for `hikmahtech/em-credibility-monitor`)
+    the old basename-only index silently opened 0 PRs (issue #270)."""
+    _reset(muted=False)
+    _state["run_investigation_result"] = {
+        "status": "succeeded",
+        "output": "fix committed",
+        "session_id": "sess-kimi",
+        "branch": "aegis-fix/xyz",
+        # Keyed by the GitHub repo name, NOT the checkout basename.
+        "branches": {"em-credibility-monitor": "aegis-fix/xyz"},
+    }
+    _state["resource_result"] = {
+        "resource_id": "res-ecm",
+        "resource_title": "EM Credibility Monitor",
+        "resource_path": "hikmah/quantamental-data-platform",
+        "github_repo": "hikmahtech/em-credibility-monitor",
+        "confidence": 0.9,
+        "source": "llm",
+        "resources": [
+            {
+                "resource_id": "res-ecm",
+                "resource_title": "EM Credibility Monitor",
+                "resource_path": "hikmah/quantamental-data-platform",
+                "github_repo": "hikmahtech/em-credibility-monitor",
+                "confidence": 0.9,
+            }
+        ],
+    }
+
+    async with (
+        await WorkflowEnvironment.start_local() as env,
+        Worker(
+            env.client,
+            task_queue="tq-gates",
+            workflows=[AlertInvestigationFlow, InteractionFlow],
+            activities=ALL_STUBS,
+        ),
+    ):
+        wf_id = "gate2-github-name-key-test"
+        handle = await env.client.start_workflow(
+            AlertInvestigationFlow.run,
+            _make_alert(),
+            id=wf_id,
+            task_queue="tq-gates",
+        )
+
+        gate2_handle = await _drive_to_gate2(env, handle, wf_id)
+        await gate2_handle.signal(InteractionFlow.submit_response, {"value": "open_all_prs"})
+
+        result = await asyncio.wait_for(handle.result(), timeout=15.0)
+
+    assert result["status"] != "gate2_discarded"
+    staged = _calls.get("stage_pending_pr", [])
+    assert staged, "stage_pending_pr was never called (basename-only key miss)"
+    call = staged[0]
+    repo = call["repo"] if isinstance(call, dict) else call.repo
+    assert repo == "hikmahtech/em-credibility-monitor"
+    created = _calls.get("create_github_pr", [])
+    assert created, "create_github_pr was never called"
+    call = created[0]
+    repo_path = call["repo_path"] if isinstance(call, dict) else call.repo_path
+    assert repo_path == "hikmah/quantamental-data-platform"
 
 
 # ---------------------------------------------------------------------------
