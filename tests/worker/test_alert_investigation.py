@@ -405,11 +405,14 @@ _NEVER_COMPLETES = '{"session_id": "sess-dead"}\nKimi launched, then died before
 
 
 async def test_run_investigation_fails_fast_when_process_dies(
-    monkeypatch, mock_db_pool, mock_remote_script
+    monkeypatch, mock_db_pool, mock_remote_script, caplog
 ):
     """When kimi_run_alive reports the process dead, run_investigation
     returns status=failed (with the load-bearing 'engine' key for the
-    flow's kimi->claude fallback) in far fewer than the full 60 polls."""
+    flow's kimi->claude fallback) in far fewer than the full 60 polls, and
+    logs the outcome (item 1, #275) so prod logs distinguish "died after
+    ~60s" from "timed out after 30 min". (`activity.logger` is a stdlib
+    logger under `temporalio.activity`, so caplog sees it.)"""
     mock_remote_script.fetch_kimi_run_output = AsyncMock(return_value=_NEVER_COMPLETES)
     mock_remote_script.kimi_run_alive = AsyncMock(return_value=False)
     monkeypatch.setattr("aegis_worker.activities.alerts.asyncio.sleep", AsyncMock())
@@ -427,7 +430,8 @@ async def test_run_investigation_fails_fast_when_process_dies(
         "source": "github",
         "description": "",
     }
-    result = await env.run(act.run_investigation, alert, SAMPLE_RESOURCES[:1], "")
+    with caplog.at_level("WARNING", logger="temporalio.activity"):
+        result = await env.run(act.run_investigation, alert, SAMPLE_RESOURCES[:1], "")
 
     assert result["status"] == "failed"
     assert "engine" in result
@@ -439,6 +443,77 @@ async def test_run_investigation_fails_fast_when_process_dies(
     mock_remote_script.kimi_run_alive.assert_awaited_once_with(
         "/tmp/aegis-kimi-run-test.jsonl", host=""
     )
+    messages = " ".join(r.getMessage() for r in caplog.records)
+    assert "run_investigation_dead_probe" in messages
+    assert "/tmp/aegis-kimi-run-test.jsonl" in messages
+    assert "iteration=1" in messages
+    assert "engine=kimi" in messages
+
+
+async def test_run_investigation_alive_timeout_does_not_log_dead_probe(
+    monkeypatch, mock_db_pool, mock_remote_script, caplog
+):
+    """Falsifiability control for the log assertion above: a run that times
+    out normally (probe stays alive) must NOT emit the dead-probe warning —
+    proves that warning is keyed on the fail-fast path, not logged on every
+    non-succeeded outcome."""
+    mock_remote_script.fetch_kimi_run_output = AsyncMock(return_value=_NEVER_COMPLETES)
+    mock_remote_script.kimi_run_alive = AsyncMock(return_value=True)
+    monkeypatch.setattr("aegis_worker.activities.alerts.asyncio.sleep", AsyncMock())
+
+    act = AlertActivities(
+        db_pool=mock_db_pool,
+        remote_script=mock_remote_script,
+        kimi_binary="/usr/local/bin/kimi",
+    )
+    env = ActivityEnvironment()
+    alert = {
+        "title": "T",
+        "severity": "info",
+        "fingerprint": "fp-alive-no-log",
+        "source": "github",
+        "description": "",
+    }
+    with caplog.at_level("WARNING", logger="temporalio.activity"):
+        result = await env.run(act.run_investigation, alert, SAMPLE_RESOURCES[:1], "")
+
+    assert result["status"] == "timed_out"
+    messages = " ".join(r.getMessage() for r in caplog.records)
+    assert "run_investigation_dead_probe" not in messages
+
+
+async def test_run_investigation_launch_failure_carries_engine(mock_db_pool, mock_remote_script):
+    """A kimi launch failure (e.g. repo-missing/prompt-write/ssh — anything
+    start_kimi_run rejects before the agent starts) must surface `engine` in
+    run_investigation's failure dict (item 4, #275): the flow's kimi->claude
+    fallback (alert_investigation.py:948) triggers on
+    `status != "succeeded" and engine == "kimi"`, so a launch failure missing
+    this key silently never falls back to claude."""
+    mock_remote_script.start_kimi_run = AsyncMock(
+        return_value={
+            "run_id": "r1",
+            "status": "failed",
+            "error": "Repo checkout missing on node-a: /home/user/repos/aegis",
+            "engine": "kimi",
+        }
+    )
+    act = AlertActivities(
+        db_pool=mock_db_pool,
+        remote_script=mock_remote_script,
+        kimi_binary="/usr/local/bin/kimi",
+    )
+    env = ActivityEnvironment()
+    alert = {
+        "title": "T",
+        "severity": "info",
+        "fingerprint": "fp-launch-fail",
+        "source": "github",
+        "description": "",
+    }
+    result = await env.run(act.run_investigation, alert, SAMPLE_RESOURCES[:1], "")
+
+    assert result["status"] == "failed"
+    assert result["engine"] == "kimi"
 
 
 async def test_run_investigation_dead_but_final_refetch_completes(

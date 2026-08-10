@@ -83,7 +83,7 @@ def _alert() -> dict:
     }
 
 
-async def _run_to_completion(wf_id: str) -> dict:
+async def _run_to_completion(wf_id: str, stubs: list | None = None) -> dict:
     """Start the flow, ack Gate-2 once it opens, return the workflow result."""
     async with (
         await WorkflowEnvironment.start_local() as env,
@@ -91,7 +91,7 @@ async def _run_to_completion(wf_id: str) -> dict:
             env.client,
             task_queue="tq-claude-fb",
             workflows=[AlertInvestigationFlow, InteractionFlow],
-            activities=_build_stubs(),
+            activities=stubs if stubs is not None else _build_stubs(),
         ),
     ):
         handle = await env.client.start_workflow(
@@ -160,4 +160,44 @@ async def test_kimi_failure_then_claude_failure_degrades_to_llm():
 
     assert _calls.get("engine_overrides") == ["", "claude"]
     assert _calls.get("investigate_called"), "LLM fallback must run after both CLIs fail"
+    assert result["status"] == "logged", result["status"]
+
+
+@activity.defn(name="run_investigation")
+async def _raising_run_investigation(
+    alert: dict, resources: list[dict], runbook: str, engine_override: str = "", allow_fix: bool = True
+) -> dict:
+    _calls.setdefault("engine_overrides", []).append(engine_override)
+    raise RuntimeError("synthetic activity-layer failure")
+
+
+def _build_stubs_raising_investigation() -> list:
+    overridden = {"run_investigation", "assess_investigation", "investigate", "record_verdict_to_kg"}
+    base = [s for s in ALL_STUBS if activity._Definition.must_from_callable(s).name not in overridden]
+    return base + [
+        _raising_run_investigation,
+        stub_assess_investigation,
+        stub_record_verdict_to_kg,
+        stub_investigate,
+    ]
+
+
+@pytest.mark.asyncio
+async def test_run_investigation_raise_synthesizes_no_fallback_engine():
+    """When run_investigation raises at the Temporal layer (e.g. the activity
+    exceeded its start_to_close timeout under NO_RETRY), the flow's except
+    block synthesizes a timed_out-shaped dict with engine="" (item 4, #275):
+    a deliberate no-fallback, since the activity already burned its full
+    budget and a second full attempt would double the walltime. Proven by
+    run_investigation being invoked exactly once (engine_override="") — a
+    claude retry never fires even though status != succeeded."""
+    _reset(muted=False)
+    _state.clear()
+
+    result = await _run_to_completion(
+        "claude-fallback-raise-no-retry", stubs=_build_stubs_raising_investigation()
+    )
+
+    assert _calls.get("engine_overrides") == [""]
+    assert _calls.get("investigate_called"), "LLM fallback must still run after the raise"
     assert result["status"] == "logged", result["status"]

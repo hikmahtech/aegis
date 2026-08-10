@@ -939,6 +939,9 @@ class AlertInvestigationFlow:
                     "session_id": "",
                     "branch": "",
                     "branches": {},
+                    # Deliberate no-fallback: the activity already burned its
+                    # full budget; a second full attempt would double the walltime.
+                    "engine": "",
                 }
 
             # Fallback: a non-org (kimi) run that didn't succeed gets one retry
