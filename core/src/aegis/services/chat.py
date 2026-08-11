@@ -2462,7 +2462,8 @@ async def _exec_list_next_actions(pool: asyncpg.Pool, args: dict, ctx: ToolConte
     # (9 of 11 open @pandora tasks, 2026-08-11) and chat truthfully reported an
     # empty queue. Agents see their parked work; @me keeps GTD semantics.
     # Roster comes from the DB, so a new agent is covered without a code edit.
-    if assignee and assignee != "@me" and assignee in await _assignee_labels(pool):
+    is_agent = bool(assignee) and assignee != "@me" and assignee in await _assignee_labels(pool)
+    if is_agent:
         parked.remove("@waiting")
     params: list[object] = [parked]
     where = [
@@ -2479,7 +2480,14 @@ async def _exec_list_next_actions(pool: asyncpg.Pool, args: dict, ctx: ToolConte
         inbox_id = await conn.fetchval(
             "SELECT value->>'inbox' FROM settings WHERE key='todoist_managed_project_ids'"
         )
-        if inbox_id:
+        # The Inbox is excluded for humans because an Inbox item is unclarified
+        # — clarify it before it can be a next action. An agent-assigned task is
+        # the opposite: the @agent label IS clarify's output, and AEGIS's own
+        # triage (#alert/#email/#receipt) parks its work there, so 10 of the 11
+        # open @pandora tasks were Inbox rows. agent_task.find_actionable_tasks
+        # already works them with no inbox filter, so excluding them here only
+        # ever hid work the worker was actively doing.
+        if inbox_id and not is_agent:
             params.append(inbox_id)
             where.append(f"t.project_id <> ${len(params)}")
         params.append(limit)
