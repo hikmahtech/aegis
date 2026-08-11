@@ -30,6 +30,7 @@ from aegis.clarify_note import AGENT_REPLY_PREFIX, CLARIFY_NOTE_PREFIX
 from aegis.config import Settings
 from aegis.observability import log_audit
 from aegis.services.agents import resolve_tag
+from aegis.services.alert_tasks import close_task_for_resolved_alert
 from aegis.services.health import record_health_push
 from aegis.services.observations import record_observation
 from aegis.services.places import record_location_push
@@ -581,6 +582,9 @@ async def alert_webhook(
                 )
             except Exception:
                 logger.warning("alert_webhook_resolved_audit_failed", fingerprint=fingerprint)
+            # The audit row only re-arms dedup; close the task this alert
+            # spawned too, or it outlives its incident indefinitely (#279).
+            await close_task_for_resolved_alert(pool, fingerprint)
             skipped += 1
             continue
 

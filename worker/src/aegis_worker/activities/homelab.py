@@ -15,6 +15,7 @@ from typing import Any
 import httpx
 import structlog
 from aegis.observability import log_audit
+from aegis.services.alert_tasks import close_task_for_resolved_alert
 from temporalio import activity
 
 from aegis_worker.activities.delivery import safe_send_message
@@ -551,7 +552,12 @@ class HomelabActivities:
     @activity.defn
     async def record_heartbeat_resolved(self, fingerprint: str) -> None:
         """Mirror the webhook's resolved-alert audit row so check_alert_resolved
-        (and thus the whole self-resolve machinery) works for heartbeat alerts."""
+        (and thus the whole self-resolve machinery) works for heartbeat alerts,
+        then close the `#alert` task this alert spawned (issue #279).
+
+        The audit row alone only re-armed dedup; nothing ever told the task its
+        incident was over, so recovered-service tasks sat open for days.
+        """
         if not self.db_pool or not fingerprint:
             return
         await log_audit(
@@ -562,6 +568,7 @@ class HomelabActivities:
             target_id=fingerprint,
             details={"resolved": "true"},
         )
+        await close_task_for_resolved_alert(self.db_pool, fingerprint)
 
     @activity.defn
     async def ping_deadman(self) -> dict:
