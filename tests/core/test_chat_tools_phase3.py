@@ -115,6 +115,47 @@ async def test_exec_list_next_actions_reads_projection(db_pool) -> None:
 
 
 @pytest.mark.asyncio
+async def test_agent_assignee_sees_parked_waiting_tasks(db_pool) -> None:
+    """@waiting is agent_task.PARK_LABEL — stamped at the END of every agent
+    run. Filtering it as GTD "blocked" hid 9 of 11 open @pandora tasks and made
+    chat report an empty queue (2026-08-11). An agent must see its own parked
+    work; @me must NOT (there @waiting really does mean blocked)."""
+    from aegis.services.chat import ToolContext, _exec_list_next_actions
+
+    # pandoras-actor is seeded with mention_aliases [pandora], so @pandora
+    # resolves through the real roster — no fixture agent needed.
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO todoist_projects (id, name, is_managed, raw) "
+            "VALUES ('P_PRJ','Projects',true,'{}'::jsonb) ON CONFLICT (id) DO NOTHING"
+        )
+        await conn.execute("DELETE FROM todoist_tasks WHERE id IN ('T_PARK','T_HUMAN')")
+        await conn.execute(
+            "INSERT INTO todoist_tasks "
+            "(id, project_id, content, labels, assignee_label, is_completed, raw) VALUES "
+            "('T_PARK','P_PRJ','restart redis',ARRAY['@pandora','@waiting'],"
+            "  '@pandora',false,'{}'::jsonb), "
+            "('T_HUMAN','P_PRJ','blocked on bank',ARRAY['@nobody','@waiting'],"
+            "  '@nobody',false,'{}'::jsonb)"
+        )
+
+    agent_out = await _exec_list_next_actions(
+        pool=db_pool, args={"assignee": "@pandora", "limit": 50}, ctx=ToolContext(agent_id="x")
+    )
+    assert "T_PARK" in agent_out, "agent must see its own parked queue"
+    assert "[parked]" in agent_out, "parked rows must be flagged, not silently mixed in"
+
+    # A non-agent assignee keeps GTD semantics: @waiting really is "blocked".
+    human_out = await _exec_list_next_actions(
+        pool=db_pool, args={"assignee": "@nobody", "limit": 50}, ctx=ToolContext(agent_id="x")
+    )
+    assert "T_HUMAN" not in human_out, "non-agent @waiting stays hidden"
+    # ...and the empty answer must account for what it hid, so a caller cannot
+    # report "nothing to do" when the rows were merely filtered.
+    assert "excluded" in human_out and "1" in human_out, human_out
+
+
+@pytest.mark.asyncio
 async def test_exec_list_projects_returns_project_labels(db_pool) -> None:
     """list_projects now enumerates leaf work-stream projects (real Todoist
     projects nested under an AREA project via parent_id) with open-task
