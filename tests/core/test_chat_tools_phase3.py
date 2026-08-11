@@ -156,6 +156,47 @@ async def test_agent_assignee_sees_parked_waiting_tasks(db_pool) -> None:
 
 
 @pytest.mark.asyncio
+async def test_agent_assignee_sees_inbox_tasks(db_pool) -> None:
+    """The Inbox is excluded for humans (an Inbox item is unclarified). For an
+    agent it is the opposite: the @agent label IS clarify's output, and AEGIS's
+    own triage parks #alert work in the Inbox — 10 of 11 open @pandora tasks
+    lived there. agent_task.find_actionable_tasks already works them with no
+    inbox filter, so hiding them here hid work the worker was actively doing."""
+    from aegis.services.chat import ToolContext, _exec_list_next_actions
+
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO settings (key, value) VALUES "
+            "('todoist_managed_project_ids', $1) "
+            "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+            {"inbox": "P_INBOX"},
+        )
+        await conn.execute(
+            "INSERT INTO todoist_projects (id, name, is_managed, raw) "
+            "VALUES ('P_INBOX','Inbox',true,'{}'::jsonb) ON CONFLICT (id) DO NOTHING"
+        )
+        await conn.execute("DELETE FROM todoist_tasks WHERE id IN ('T_IN_AG','T_IN_HU')")
+        await conn.execute(
+            "INSERT INTO todoist_tasks "
+            "(id, project_id, content, labels, assignee_label, is_completed, raw) VALUES "
+            "('T_IN_AG','P_INBOX','koyracloud redis down',ARRAY['@pandora','#alert'],"
+            "  '@pandora',false,'{}'::jsonb), "
+            "('T_IN_HU','P_INBOX','unsorted thought',ARRAY['@nobody'],"
+            "  '@nobody',false,'{}'::jsonb)"
+        )
+
+    agent_out = await _exec_list_next_actions(
+        pool=db_pool, args={"assignee": "@pandora", "limit": 50}, ctx=ToolContext(agent_id="x")
+    )
+    assert "T_IN_AG" in agent_out, "agent must see its Inbox-resident triage work"
+
+    human_out = await _exec_list_next_actions(
+        pool=db_pool, args={"assignee": "@nobody", "limit": 50}, ctx=ToolContext(agent_id="x")
+    )
+    assert "T_IN_HU" not in human_out, "Inbox stays hidden for humans — clarify first"
+
+
+@pytest.mark.asyncio
 async def test_exec_list_projects_returns_project_labels(db_pool) -> None:
     """list_projects now enumerates leaf work-stream projects (real Todoist
     projects nested under an AREA project via parent_id) with open-task
