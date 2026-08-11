@@ -1112,7 +1112,7 @@ CHAT_TOOLS = [
         "type": "function",
         "function": {
             "name": "list_next_actions",
-            "description": "Read open (incomplete), actionable Next Action tasks from the Todoist projection (excludes @waiting/@reference/@someday/@to-read parked tasks). Optional filters: assignee label, context label, due window.",
+            "description": "Read open (incomplete), actionable tasks from the Todoist projection. Excludes @reference/@someday/@to-read, and excludes @waiting for @me. When assignee is an agent label (e.g. @pandora), @waiting tasks ARE included and marked [parked] — for an agent @waiting means 'a run finished a pass', not 'blocked', so this is that agent's own working queue. Optional filters: assignee label, context label, due window.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -2450,22 +2450,31 @@ async def _exec_list_next_actions(pool: asyncpg.Pool, args: dict, ctx: ToolConte
     assignee = args.get("assignee")
     context = args.get("context")
     limit = int(args.get("limit") or 25)
+    if pool is None:
+        return "No DB pool"
+    # State labels mirror aegis_worker.activities.review._STATE_LABELS
+    # (cross-package; keep in sync) and _exec_whats_next below — a task parked
+    # as @waiting/@reference/@someday/@to-read isn't a human next action.
+    parked = ["@waiting", "@reference", "@to-read", "@someday"]
+    # ...but @waiting on an AGENT-assigned task is not "blocked": it is
+    # agent_task.PARK_LABEL, stamped by park_task at the END of every run. So
+    # filtering it hid the agent's entire worked backlog from the agent itself
+    # (9 of 11 open @pandora tasks, 2026-08-11) and chat truthfully reported an
+    # empty queue. Agents see their parked work; @me keeps GTD semantics.
+    # Roster comes from the DB, so a new agent is covered without a code edit.
+    if assignee and assignee != "@me" and assignee in await _assignee_labels(pool):
+        parked.remove("@waiting")
+    params: list[object] = [parked]
     where = [
         "NOT t.is_completed",
-        # State labels mirror aegis_worker.activities.review._STATE_LABELS
-        # (cross-package; keep in sync) and _exec_whats_next below — a task
-        # parked as @waiting/@reference/@someday/@to-read isn't a next action.
-        "NOT (t.labels && ARRAY['@waiting','@reference','@to-read','@someday'])",
+        "NOT (t.labels && $1::text[])",
     ]
-    params: list[object] = []
     if assignee:
         params.append(assignee)
         where.append(f"t.assignee_label = ${len(params)}")
     if context:
         params.append(context)
         where.append(f"${len(params)} = ANY(t.labels)")
-    if pool is None:
-        return "No DB pool"
     async with pool.acquire() as conn:
         inbox_id = await conn.fetchval(
             "SELECT value->>'inbox' FROM settings WHERE key='todoist_managed_project_ids'"
@@ -2482,12 +2491,30 @@ async def _exec_list_next_actions(pool: asyncpg.Pool, args: dict, ctx: ToolConte
             f"LIMIT ${len(params)}"
         )
         rows = await conn.fetch(sql, *params)
-    if not rows:
-        return "No matching next actions."
+        if not rows:
+            # An empty list used to be indistinguishable from "everything was
+            # filtered out", which is exactly how a full queue got reported as
+            # nothing-to-do. Say what was hidden so the agent can't confabulate.
+            hidden = await conn.fetchval(
+                "SELECT count(*) FROM todoist_tasks t WHERE NOT t.is_completed "
+                "AND t.labels && $1::text[] "
+                "AND ($2::text IS NULL OR t.assignee_label = $2)",
+                parked,
+                assignee,
+            )
+            if hidden:
+                return (
+                    f"No matching next actions ({hidden} excluded as "
+                    f"{'/'.join(parked)})."
+                )
+            return "No matching next actions."
     lines = []
     for r in rows:
         due = f" due {r['due_date'].isoformat()}" if r["due_date"] else ""
-        lines.append(f"- [{r['id']}] {r['content']} ({r['assignee_label'] or '@me'}){due}")
+        parked_note = " [parked]" if "@waiting" in (r["labels"] or []) else ""
+        lines.append(
+            f"- [{r['id']}] {r['content']} ({r['assignee_label'] or '@me'}){due}{parked_note}"
+        )
     return "\n".join(lines)
 
 
