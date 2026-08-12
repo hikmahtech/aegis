@@ -1,6 +1,7 @@
 import { Fragment, useEffect, useState } from 'react';
 import { api } from '../api/client';
 import ErrorBanner from '../components/ErrorBanner';
+import { toast } from '../components/Toast';
 
 type TodoistState = {
   sync: { key: string; last_full_sync_at: string | null; last_incremental_at: string | null } | null;
@@ -134,16 +135,13 @@ export default function Todoist() {
   const [apiKey, setApiKey] = useState('');
   const [projects, setProjects] = useState<Record<string, string>>({ inbox: '' });
   const [savingCfg, setSavingCfg] = useState(false);
-  const [cfgMsg, setCfgMsg] = useState('');
   const [gtd, setGtd] = useState<any>(null);
   const [savingGtd, setSavingGtd] = useState(false);
-  const [gtdMsg, setGtdMsg] = useState('');
 
   // Content routes (regex/prefix/contains on task title → assignee/labels/gate)
   const [routes, setRoutes] = useState<any[]>([]);
   const [matchModes, setMatchModes] = useState<string[]>(['prefix', 'contains', 'regex']);
   const [savingRoutes, setSavingRoutes] = useState(false);
-  const [routesMsg, setRoutesMsg] = useState('');
   const [previews, setPreviews] = useState<Record<number, any>>({});
   const [suggestExamples, setSuggestExamples] = useState('');
   const [suggesting, setSuggesting] = useState(false);
@@ -236,13 +234,13 @@ export default function Todoist() {
   }
 
   async function saveGtd() {
-    setSavingGtd(true); setGtdMsg(''); setError(null);
+    setSavingGtd(true); setError(null);
     try {
       const skip: Record<string, string> = {};
       for (const [k, v] of Object.entries(gtd.skip_inbox || {})) if (v) skip[k] = v as string;
       const r = await api.saveGtdRules({ assignee: gtd.assignee, contexts: gtd.contexts, skip_inbox: skip });
       setGtd(r);
-      setGtdMsg('Saved — applies within ~30s.');
+      toast.ok('GTD rules saved — applies within ~30s.');
     } catch (e: any) { setError(e); } finally { setSavingGtd(false); }
   }
 
@@ -270,11 +268,11 @@ export default function Todoist() {
     setPreviews({});
   }
   async function saveRoutes() {
-    setSavingRoutes(true); setRoutesMsg(''); setError(null);
+    setSavingRoutes(true); setError(null);
     try {
       const r = await api.saveContentRoutes({ routes });
       setRoutes(r.routes || []);
-      setRoutesMsg('Saved — applies within ~30s.');
+      toast.ok('Content routes saved — applies within ~30s.');
     } catch (e: any) { setError(e); } finally { setSavingRoutes(false); }
   }
   async function previewRoute(i: number) {
@@ -289,7 +287,7 @@ export default function Todoist() {
   async function suggestPattern() {
     const examples = suggestExamples.split(/[\n,]/).map(s => s.trim()).filter(Boolean);
     if (!examples.length) return;
-    setSuggesting(true); setRoutesMsg(''); setError(null);
+    setSuggesting(true); setError(null);
     try {
       const s = await api.suggestContentRoute({ examples });
       if (s.pattern) {
@@ -299,23 +297,23 @@ export default function Todoist() {
           key: '', match: 'regex', value: s.pattern, assignee: '@pandora', contexts: [],
           area_label: null, gate: true, service: null, resource_tags: [],
         }]);
-        setRoutesMsg(s.all_examples_match
+        toast.ok(s.all_examples_match
           ? '✨ Added a suggested pattern matching all examples — review + preview before saving.'
           : '✨ Added a suggested pattern (not all examples matched) — edit + preview before saving.');
       } else {
-        setRoutesMsg('Suggest failed: ' + (s.error || 'no pattern derived'));
+        toast.err('Suggest failed: ' + (s.error || 'no pattern derived'));
       }
     } catch (e: any) { setError(e); } finally { setSuggesting(false); }
   }
 
   async function saveConfig() {
-    setSavingCfg(true); setCfgMsg(''); setError(null);
+    setSavingCfg(true); setError(null);
     try {
       const body: any = { projects };
       if (apiKey) body.api_key = apiKey;
       const c = await api.saveTodoistConfig(body);
       setCfg(c); setApiKey('');
-      setCfgMsg('Saved — restart the worker to apply a new API key to flows.');
+      toast.ok('Saved — restart the worker to apply a new API key to flows.');
     } catch (e: any) { setError(e); } finally { setSavingCfg(false); }
   }
 
@@ -395,7 +393,6 @@ export default function Todoist() {
           </div>
         ))}
         <button className="btn" disabled={savingCfg} onClick={saveConfig}>{savingCfg ? 'Saving…' : 'Save Todoist config'}</button>
-        {cfgMsg && <span className="msg-success" style={{ marginLeft: 10 }}>{cfgMsg}</span>}
       </div>
 
       {/* Projects tree — read-only view of the real Todoist structure (Areas -> work-streams) */}
@@ -415,7 +412,7 @@ export default function Todoist() {
                   {project.is_archived && <span className="badge badge-neutral">archived</span>}
                 </div>
                 {children.length > 0 && (
-                  <ul style={{ listStyle: 'none', margin: '4px 0 0 20px', padding: 0, borderLeft: '2px solid var(--border, #e5e5e5)' }}>
+                  <ul style={{ listStyle: 'none', margin: '4px 0 0 20px', padding: 0, borderLeft: '2px solid var(--border)' }}>
                     {children.map(child => (
                       <li key={child.id} style={{ padding: '2px 0 2px 12px', display: 'flex', alignItems: 'center', gap: 8 }}>
                         {child.name}
@@ -478,7 +475,6 @@ export default function Todoist() {
           <button className="btn" style={{ marginTop: 8 }} disabled={savingGtd} onClick={saveGtd}>
             {savingGtd ? 'Saving…' : 'Save GTD rules'}
           </button>
-          {gtdMsg && <span className="msg-success" style={{ marginLeft: 10 }}>{gtdMsg}</span>}
         </div>
       )}
 
@@ -545,7 +541,7 @@ export default function Todoist() {
                 </tr>
                 {previews[i] && (
                   <tr key={`p${i}`}>
-                    <td colSpan={11} style={{ fontSize: 12, background: 'var(--bg-subtle, #f6f6f6)' }}>
+                    <td colSpan={11} style={{ fontSize: 12, background: 'var(--surface-2)' }}>
                       {previews[i].error
                         ? <span className="msg-error">Preview error: {previews[i].error}</span>
                         : <span>
@@ -561,7 +557,7 @@ export default function Todoist() {
               </Fragment>
             ))}
             {routes.length === 0 && (
-              <tr><td colSpan={11} style={{ color: 'var(--text-muted, #888)' }}>No routes — add one, or ✨ suggest from examples.</td></tr>
+              <tr><td colSpan={11} style={{ color: 'var(--text-muted)' }}>No routes — add one, or ✨ suggest from examples.</td></tr>
             )}
           </tbody>
         </table>
@@ -570,7 +566,6 @@ export default function Todoist() {
         <button className="btn btn-primary" style={{ marginTop: 8, marginLeft: 8 }} disabled={savingRoutes} onClick={saveRoutes}>
           {savingRoutes ? 'Saving…' : 'Save content routes'}
         </button>
-        {routesMsg && <span className="msg-success" style={{ marginLeft: 10 }}>{routesMsg}</span>}
       </div>
 
       {/* Tasks workbench */}
@@ -738,7 +733,7 @@ export default function Todoist() {
         </div>
         <div className="card" style={{ padding: 16, minWidth: 160 }}>
           <div style={{ fontSize: 12, opacity: 0.7 }}>Outbox failed</div>
-          <div style={{ fontSize: 24, fontWeight: 600, color: failedCount > 0 ? 'var(--error, #c0392b)' : undefined }}>
+          <div style={{ fontSize: 24, fontWeight: 600, color: failedCount > 0 ? 'var(--danger-text)' : undefined }}>
             {failedCount}
           </div>
         </div>

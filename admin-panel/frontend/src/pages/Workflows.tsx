@@ -72,7 +72,11 @@ function LiveTab() {
     <>
       <ErrorBanner error={error} onDismiss={() => setError(null)} />
       {data?.error && <div className="empty">{data.error}</div>}
-      {loading && executions.length === 0 && <div className="loading">Loading live workflows…</div>}
+      {loading && executions.length === 0 && (
+        <div className="skeleton-list" aria-busy="true" aria-label="Loading live workflows">
+          {[0, 1, 2, 3, 4].map(i => <div key={i} className="skeleton skeleton-row" />)}
+        </div>
+      )}
       <div className="table-scroll">
         <table className="data-table">
           <thead>

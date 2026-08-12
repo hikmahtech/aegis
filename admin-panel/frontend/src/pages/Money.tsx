@@ -231,7 +231,7 @@ export default function Money() {
               {dedupAlerts(alerts).map((a) => (
                 <tr
                   key={`${a.charge_id}:${a.threshold_days}`}
-                  style={{ color: a.threshold_days <= 7 ? 'var(--danger, #e53e3e)' : undefined }}
+                  style={{ color: a.threshold_days <= 7 ? 'var(--danger)' : undefined }}
                 >
                   <td><strong>{a.vendor_name}</strong></td>
                   <td className="mono">{a.threshold_days}</td>

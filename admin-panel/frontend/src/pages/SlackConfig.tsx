@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 import { api } from '../api/client';
 import ErrorBanner from '../components/ErrorBanner';
+import { toast } from '../components/Toast';
 
 type SlackConfigResponse = {
   bot_token_set: boolean;
@@ -16,7 +17,6 @@ export default function SlackConfig() {
   const [channel, setChannel] = useState('');
   const [status, setStatus] = useState<SlackConfigResponse | null>(null);
   const [error, setError] = useState<Error | null>(null);
-  const [msg, setMsg] = useState('');
   const [busy, setBusy] = useState(false);
 
   async function load() {
@@ -31,14 +31,14 @@ export default function SlackConfig() {
   useEffect(() => { load(); /* eslint-disable-next-line */ }, []);
 
   async function save() {
-    setBusy(true); setMsg(''); setError(null);
+    setBusy(true); setError(null);
     try {
       const body: any = {};
       if (botToken) body.bot_token = botToken;
       if (appToken) body.app_token = appToken;
       if (channel) body.channel = channel;
       await api.saveSlackConfig(body);
-      setMsg('Saved.');
+      toast.ok('Saved.');
       await load();
     } catch (e: any) { setError(e); } finally { setBusy(false); }
   }
@@ -71,7 +71,6 @@ export default function SlackConfig() {
         <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
           <button className="btn btn-primary" disabled={busy} onClick={save}>Save</button>
         </div>
-        {msg && <p className="msg-success">{msg}</p>}
         {status && (
           status.configured
             ? <p className="msg-success">Connected — Slack enabled (source: {status.source})</p>

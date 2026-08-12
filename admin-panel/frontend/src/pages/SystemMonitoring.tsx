@@ -109,7 +109,7 @@ export default function SystemMonitoring() {
         <div
           style={{
             background: 'var(--danger-tint)',
-            border: '1px solid #fecdca',
+            border: '1px solid var(--danger)',
             color: 'var(--danger-text)',
             padding: '10px 14px',
             margin: '8px 0 1rem',

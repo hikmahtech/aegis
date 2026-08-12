@@ -133,7 +133,11 @@ export default function Interactions() {
         <span className="meta" style={{ alignSelf: 'center' }}>{rows.length} rows · auto-refresh 10s</span>
       </div>
 
-      {loading && rows.length === 0 && <div className="loading">Loading interactions…</div>}
+      {loading && rows.length === 0 && (
+        <div className="skeleton-list" aria-busy="true" aria-label="Loading interactions">
+          {[0, 1, 2, 3, 4].map(i => <div key={i} className="skeleton skeleton-row" />)}
+        </div>
+      )}
       {!loading && rows.length === 0 && <div className="empty">No interactions match these filters.</div>}
 
       <div style={{ display: 'grid', gap: 10 }}>

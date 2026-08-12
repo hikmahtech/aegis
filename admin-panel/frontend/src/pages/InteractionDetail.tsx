@@ -143,7 +143,7 @@ export default function InteractionDetail() {
       </div>
 
       {pending && conflict && (
-        <div className="card" style={{ marginBottom: 12, borderColor: '#fecdca' }}>
+        <div className="card" style={{ marginBottom: 12, borderColor: 'var(--danger)' }}>
           <h3>The document changed since this was proposed</h3>
           <p className="meta">
             This draft was written against <span className="mono">{conflict.proposed_from}</span>,

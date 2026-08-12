@@ -1,12 +1,12 @@
 import { useEffect, useState } from 'react';
 import { api } from '../api/client';
 import ErrorBanner from '../components/ErrorBanner';
+import { toast } from '../components/Toast';
 
 export default function Integrations() {
   const [items, setItems] = useState<any[]>([]);
   const [edits, setEdits] = useState<Record<string, string>>({});
   const [error, setError] = useState<Error | null>(null);
-  const [msg, setMsg] = useState('');
   const [savingKey, setSavingKey] = useState('');
   const [keyStatus, setKeyStatus] = useState<{ configured: boolean; source: string } | null>(null);
   const [newKey, setNewKey] = useState('');
@@ -20,19 +20,19 @@ export default function Integrations() {
   useEffect(() => { load(); /* eslint-disable-next-line */ }, []);
 
   async function save(key: string) {
-    setSavingKey(key); setMsg(''); setError(null);
+    setSavingKey(key); setError(null);
     try {
       setItems(await api.saveIntegration(key, edits[key] ?? ''));
       setEdits(e => { const n = { ...e }; delete n[key]; return n; });
-      setMsg(`Saved ${key}.`);
+      toast.ok(`Saved ${key}.`);
     } catch (e: any) { setError(e); } finally { setSavingKey(''); }
   }
 
   async function saveBool(key: string, on: boolean) {
-    setSavingKey(key); setMsg(''); setError(null);
+    setSavingKey(key); setError(null);
     try {
       setItems(await api.saveIntegration(key, on ? 'true' : 'false'));
-      setMsg(`${on ? 'Enabled' : 'Disabled'} ${key}.`);
+      toast.ok(`${on ? 'Enabled' : 'Disabled'} ${key}.`);
     } catch (e: any) { setError(e); } finally { setSavingKey(''); }
   }
 
@@ -67,7 +67,6 @@ export default function Integrations() {
         turns whole subsystems on/off — each note lists the extra config it needs; homelab/money features need a worker restart to take effect.
       </p>
       <ErrorBanner error={error} onDismiss={() => setError(null)} />
-      {msg && <p className="msg-success">{msg}</p>}
 
       <div className="card" style={{ marginBottom: 12 }}>
         <h3>API Key</h3>
@@ -84,12 +83,12 @@ export default function Integrations() {
         {newKey && (
           <div style={{ marginTop: 10 }}>
             <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
-              <code data-testid="new-api-key" style={{ wordBreak: 'break-all', padding: '6px 8px', background: 'var(--bg-inset, rgba(128,128,128,0.12))', borderRadius: 4 }}>
+              <code data-testid="new-api-key" style={{ wordBreak: 'break-all', padding: '6px 8px', background: 'var(--surface-3)', borderRadius: 4 }}>
                 {newKey}
               </code>
               <button className="btn btn-sm" onClick={() => void copyKey()}>{copied ? 'Copied ✓' : 'Copy'}</button>
             </div>
-            <p style={{ color: 'var(--warning, #b58900)', fontSize: 12, marginTop: 6 }}>
+            <p style={{ color: 'var(--warning-text)', fontSize: 12, marginTop: 6 }}>
               Copy it now — this key is shown only once and cannot be retrieved again.
               Generating a new key replaces this one.
             </p>

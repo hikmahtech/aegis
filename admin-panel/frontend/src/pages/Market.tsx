@@ -42,7 +42,7 @@ export default function Market() {
                   <tr key={i}>
                     <td><strong>{q.symbol}</strong></td>
                     <td>{q.price != null ? q.price.toLocaleString?.() ?? q.price : '—'}</td>
-                    <td style={{ color: q.change != null ? (q.change < 0 ? 'var(--danger, #c00)' : 'var(--success, #080)') : undefined }}>
+                    <td style={{ color: q.change != null ? (q.change < 0 ? 'var(--danger)' : 'var(--success)') : undefined }}>
                       {q.change != null ? q.change.toFixed?.(2) ?? q.change : '—'}
                     </td>
                     <td>{q.change_percent != null ? `${q.change_percent > 0 ? '+' : ''}${q.change_percent}%` : '—'}</td>

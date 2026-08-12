@@ -231,7 +231,7 @@ export default function Resources() {
                 </div>
               )}
               {form.kind === 'repository' && (
-                <fieldset style={{ border: '1px solid var(--border, #333)', borderRadius: 6, padding: '0.5rem 0.75rem', margin: '0 0 0.75rem' }}>
+                <fieldset style={{ border: '1px solid var(--border)', borderRadius: 6, padding: '0.5rem 0.75rem', margin: '0 0 0.75rem' }}>
                   <legend style={{ fontSize: 12, padding: '0 6px' }}>Coding-agent routing</legend>
                   <div className="form-group">
                     <label style={{ display: 'flex', alignItems: 'center', gap: 8, cursor: 'pointer' }}>

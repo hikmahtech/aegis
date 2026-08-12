@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { api } from '../api/client';
 import ErrorBanner from '../components/ErrorBanner';
+import Icon from '../components/icons';
 
 // Prompts can carry light chat HTML; the card shows plain-text snippets.
 function stripHtml(raw: string): string {
@@ -30,6 +31,7 @@ export default function Overview() {
   const [config, setConfig] = useState<any>({});
   const [pending, setPending] = useState<any[]>([]);
   const [error, setError] = useState<Error | null>(null);
+  const [loading, setLoading] = useState(true);
 
   async function load() {
     setError(null);
@@ -43,7 +45,7 @@ export default function Overview() {
         api.listInteractions({ status: 'pending', limit: 6 }),
       ]);
       setBrief(b); setStatus(s); setInfo(i); setAgents(ag); setConfig(cfg); setPending(pend || []);
-    } catch (e: any) { setError(e); }
+    } catch (e: any) { setError(e); } finally { setLoading(false); }
   }
   useEffect(() => { void load(); }, []);
 
@@ -56,6 +58,11 @@ export default function Overview() {
       <p className="page-subtitle">What needs you right now, and how the system is doing.</p>
       <ErrorBanner error={error} onDismiss={() => setError(null)} />
 
+      {loading ? (
+        <div className="skeleton-stats" aria-busy="true" aria-label="Loading">
+          {[0, 1, 2, 3].map(i => <div key={i} className="skeleton skeleton-stat" />)}
+        </div>
+      ) : (
       <div className="stats-bar">
         <div className="stat-item">
           <span className="stat-value">{brief?.pending_interactions ?? '—'}</span>
@@ -74,6 +81,7 @@ export default function Overview() {
           <span className="stat-label">Uptime</span>
         </div>
       </div>
+      )}
 
       {/* Decision-first: the whole point of AEGIS is surfacing what needs a human. */}
       <div className="section">
@@ -84,7 +92,11 @@ export default function Overview() {
           </h2>
           {pending.length > 0 && <Link to="/interactions" className="btn btn-sm">View all →</Link>}
         </div>
-        {pending.length === 0 ? (
+        {loading ? (
+          <div className="skeleton-list" aria-busy="true">
+            {[0, 1, 2].map(i => <div key={i} className="skeleton skeleton-row" />)}
+          </div>
+        ) : pending.length === 0 ? (
           <div className="empty">All clear — nothing needs you right now.</div>
         ) : (
           <div className="decision-list">
@@ -96,7 +108,7 @@ export default function Overview() {
                     {agentName(p.agent_id)} · {p.kind} · {relTime(p.created_at)}
                   </div>
                 </div>
-                <span className="decision-arrow">→</span>
+                <span className="decision-arrow"><Icon name="arrowRight" /></span>
               </Link>
             ))}
           </div>
