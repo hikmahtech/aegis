@@ -12,7 +12,7 @@ export default function ErrorBanner({ error, onDismiss }: Props) {
   const msg = typeof error === 'string' ? error : (error.message || 'Unknown error');
   return (
     <div style={{
-      background: 'var(--danger-tint)', border: '1px solid #fecdca', color: 'var(--danger-text)',
+      background: 'var(--danger-tint)', border: '1px solid var(--danger)', color: 'var(--danger-text)',
       padding: '10px 14px', margin: '8px 0', borderRadius: 'var(--radius-sm)',
       display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 12,
     }}>

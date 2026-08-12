@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react';
 import { clearCredentials, setCredentials } from '../api/client';
+import Icon from '../components/icons';
 
 // Runtime login: creds are entered here and stored as a base64 token, then
 // verified against a real authed endpoint before we let the app render.
@@ -44,23 +45,27 @@ export default function Login({ onSuccess }: { onSuccess: () => void }) {
   };
 
   return (
-    <div style={{ minHeight: '100vh', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-      <form onSubmit={submit} className="card" style={{ width: 320, display: 'flex', flexDirection: 'column', gap: 12 }}>
-        <h2 style={{ margin: 0 }}>AEGIS</h2>
-        {error && <div style={{ color: '#c0392b', fontSize: '0.85rem' }}>{error}</div>}
+    <div className="login-screen">
+      <form onSubmit={submit} className="login-card">
+        <div className="login-brand">
+          <span className="brand-dot"><Icon name="shield" /></span>
+          <h1>AEGIS</h1>
+          <p>Sign in to the control panel</p>
+        </div>
+        {error && <div className="login-error">{error}</div>}
         <input
           autoFocus
           placeholder="Username"
+          autoComplete="username"
           value={user}
           onChange={e => setUser(e.target.value)}
-          style={{ padding: '0.4rem 0.6rem' }}
         />
         <input
           type="password"
           placeholder="Password"
+          autoComplete="current-password"
           value={pass}
           onChange={e => setPass(e.target.value)}
-          style={{ padding: '0.4rem 0.6rem' }}
         />
         <button type="submit" className="btn btn-primary" disabled={busy || !user || !pass}>
           {busy ? 'Signing in…' : 'Sign in'}

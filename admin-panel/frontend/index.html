@@ -4,7 +4,16 @@
     <meta charset="UTF-8" />
     <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>frontend</title>
+    <meta name="color-scheme" content="light dark" />
+    <title>AEGIS</title>
+    <script>
+      // Stamp the stored theme before first paint so an explicit choice never
+      // flashes the OS default. Bare (no attribute) means "follow the OS".
+      try {
+        var t = localStorage.getItem('aegis-theme');
+        if (t === 'light' || t === 'dark') document.documentElement.dataset.theme = t;
+      } catch (e) {}
+    </script>
   </head>
   <body>
     <div id="root"></div>

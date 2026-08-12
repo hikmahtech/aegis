@@ -3,6 +3,7 @@ import { api } from '../api/client';
 import ErrorBanner from '../components/ErrorBanner';
 import ActionMenu from '../components/ActionMenu';
 import JsonViewer from '../components/JsonViewer';
+import { toast } from '../components/Toast';
 
 const INFRA_KINDS = ['ssh_host', 'swarm', 'docker', 'k8s', 'cloud'];
 
@@ -342,10 +343,9 @@ function K8sClusterPanel({ infraId, readOnly }: { infraId: string; readOnly: boo
   const [logs, setLogs] = useState<{ pod: string; text: string } | null>(null);
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(false);
-  const [msg, setMsg] = useState('');
 
   const load = async () => {
-    setLoading(true); setError(''); setMsg(''); setLogs(null);
+    setLoading(true); setError(''); setLogs(null);
     try {
       const [p, d] = await Promise.all([
         api.infraK8sPods(infraId, namespace),
@@ -369,10 +369,10 @@ function K8sClusterPanel({ infraId, readOnly }: { infraId: string; readOnly: boo
 
   const restart = async (name: string) => {
     if (!confirm(`Restart deployment ${name} in ${namespace}?`)) return;
-    setError(''); setMsg('');
+    setError('');
     try {
       const r = await api.infraK8sRestartDeployment(infraId, namespace, name);
-      setMsg(r?.output || 'restart submitted');
+      toast.ok(r?.output || 'restart submitted');
     } catch (e: any) { setError(e.message || 'restart failed'); }
   };
 
@@ -388,7 +388,6 @@ function K8sClusterPanel({ infraId, readOnly }: { infraId: string; readOnly: boo
         </button>
       </div>
       {error && <div className="msg-error" style={{ marginTop: 6 }}>{error}</div>}
-      {msg && <p className="msg-success" style={{ marginTop: 6 }}>{msg}</p>}
 
       <h4 style={{ margin: '0.6rem 0 0.3rem' }}>Deployments</h4>
       {deployments.length === 0 ? <p className="meta">None in this namespace.</p> : (

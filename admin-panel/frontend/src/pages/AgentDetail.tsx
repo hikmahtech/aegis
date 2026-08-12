@@ -272,7 +272,7 @@ export default function AgentDetail() {
           <button className="btn" disabled={lifecycleBusy || !reassignTo} onClick={reassign}>
             {lifecycleBusy ? 'Working…' : 'Reassign'}
           </button>
-          <button className="btn" style={{ color: 'var(--error-text, #c00)' }}
+          <button className="btn" style={{ color: 'var(--danger-text)' }}
             disabled={lifecycleBusy} onClick={removeAgent}>
             Delete agent
           </button>

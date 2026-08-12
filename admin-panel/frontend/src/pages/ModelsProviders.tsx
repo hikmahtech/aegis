@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 import { api } from '../api/client';
 import ErrorBanner from '../components/ErrorBanner';
+import { toast } from '../components/Toast';
 
 type Tiers = { fast: string; balanced: string; smart: string };
 
@@ -13,7 +14,6 @@ export default function ModelsProviders() {
   const [presets, setPresets] = useState<Record<string, { label: string; base_url: string }>>({});
   const [source, setSource] = useState('');
   const [error, setError] = useState<Error | null>(null);
-  const [msg, setMsg] = useState('');
   const [testResult, setTestResult] = useState<any>(null);
   const [busy, setBusy] = useState(false);
 
@@ -44,10 +44,10 @@ export default function ModelsProviders() {
   }
 
   async function save() {
-    setBusy(true); setMsg(''); setError(null);
+    setBusy(true); setError(null);
     try {
       await api.saveLlmBackend(body());
-      setMsg('Saved — chat reloaded immediately; restart the worker to apply to flows.');
+      toast.ok('Saved — chat reloaded immediately; restart the worker to apply to flows.');
       setApiKey('');
       await load();
     } catch (e: any) { setError(e); } finally { setBusy(false); }
@@ -99,7 +99,6 @@ export default function ModelsProviders() {
           <button className="btn" disabled={busy} onClick={save}>Save</button>
           <button className="btn" disabled={busy} onClick={test}>Test connection</button>
         </div>
-        {msg && <p className="msg-success">{msg}</p>}
         {testResult && (
           <p className={testResult.ok ? 'msg-success' : 'msg-error'}>
             {testResult.ok ? `✓ ${testResult.model}: "${testResult.reply}"` : `✗ ${testResult.error}`}
