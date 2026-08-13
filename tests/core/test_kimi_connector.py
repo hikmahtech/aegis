@@ -1187,6 +1187,23 @@ def test_mcp_config_path_sanitizes_agent_id():
     assert _mcp_config_path("pandoras-actor") == "$HOME/.aegis/mcp-pandoras-actor.json"
     assert _mcp_config_path("a b;rm -rf /") == "$HOME/.aegis/mcp-a-b-rm--rf--.json"
     assert _mcp_config_path("") == "$HOME/.aegis/mcp-agent.json"
+    # A gated run gets its own file — same sanitising, different content.
+    assert _mcp_config_path("sebas", True) == "$HOME/.aegis/mcp-sebas-gated.json"
+    assert _mcp_config_path("a b;rm -rf /", True) == "$HOME/.aegis/mcp-a-b-rm--rf---gated.json"
+
+
+def test_mcp_run_config_gated_points_at_the_enforcing_endpoint():
+    """The gated mount is the ENTIRE server-side enforcement: claude 2.1.231
+    auto-allows tools from an explicitly-passed --mcp-config in -p mode, so a
+    gated run that mounted the plain endpoint would execute AEGIS mutations
+    with nobody asked (#294, observed live). Falsifiable: drop the `gated`
+    argument at the call site and the URL loses `/gated`."""
+    cfg = json.loads(_mcp_run_config("sebas", "http://10.0.0.5:8080", "K", True))
+    assert cfg["mcpServers"]["aegis"]["url"] == "http://10.0.0.5:8080/api/mcp-server/sebas/gated"
+    # Ungated is unchanged — the two differ by exactly this suffix.
+    plain = json.loads(_mcp_run_config("sebas", "http://10.0.0.5:8080", "K"))
+    assert plain["mcpServers"]["aegis"]["url"] == "http://10.0.0.5:8080/api/mcp-server/sebas"
+    assert cfg["mcpServers"]["aegis"]["headers"] == plain["mcpServers"]["aegis"]["headers"]
 
 
 @pytest.mark.asyncio
@@ -1464,8 +1481,10 @@ async def test_gated_run_without_the_mcp_mount_fails(conn_claude):
 @pytest.mark.asyncio
 async def test_gated_claude_run_launches_with_the_gate_in_tmux(conn_mount):
     """The full gated launch: prompt tool in, skip-permissions out, timeout env
-    exported, AEGIS tools mounted strictly."""
-    with patch("asyncio.create_subprocess_exec", side_effect=_claude_run_procs()) as mock_exec:
+    exported, AEGIS tools mounted strictly — from the GATED config file, which
+    is what actually enforces anything (#294)."""
+    procs = _claude_run_procs()
+    with patch("asyncio.create_subprocess_exec", side_effect=procs) as mock_exec:
         result = await conn_mount.start_kimi_run(
             repo="bcp", prompt="x", kimi_binary="/k", github_repo="Acme/bcp",
             agent_id="sebas", gated=True,
@@ -1476,7 +1495,38 @@ async def test_gated_claude_run_launches_with_the_gate_in_tmux(conn_mount):
     assert "--permission-prompt-tool mcp__aegis__approve_tool_use" in launch
     assert "--dangerously-skip-permissions" not in launch
     assert "MCP_TOOL_TIMEOUT=600000" in launch
-    assert "--mcp-config $HOME/.aegis/mcp-sebas.json --strict-mcp-config" in launch
+    assert "--mcp-config $HOME/.aegis/mcp-sebas-gated.json --strict-mcp-config" in launch
+    # The mounted config points at the ENFORCING endpoint. The CLI flags above
+    # are belt-and-braces (they do gate Bash/Edit); this URL is the part no CLI
+    # policy can opt out of.
+    cfg = json.loads(procs[4].communicate.await_args.kwargs["input"].decode())
+    assert cfg["mcpServers"]["aegis"]["url"] == (
+        "http://10.0.0.5:8080/api/mcp-server/sebas/gated"
+    )
+
+
+@pytest.mark.asyncio
+async def test_gated_and_ungated_runs_do_not_share_a_config_file(conn_mount):
+    """Two files, because they carry different URLs. One shared path would let
+    a gated launch overwrite the config an in-flight ungated run is reading —
+    or leave a gated run pointed at the unenforced endpoint."""
+    gated = _claude_run_procs()
+    with patch("asyncio.create_subprocess_exec", side_effect=gated):
+        await conn_mount.start_kimi_run(
+            repo="bcp", prompt="x", kimi_binary="/k", github_repo="Acme/bcp",
+            agent_id="sebas", gated=True,
+        )
+    ungated = _claude_run_procs()
+    with patch("asyncio.create_subprocess_exec", side_effect=ungated):
+        await conn_mount.start_kimi_run(
+            repo="bcp", prompt="x", kimi_binary="/k", github_repo="Acme/bcp", agent_id="sebas"
+        )
+
+    assert _mcp_config_path("sebas", True) != _mcp_config_path("sebas", False)
+    gated_cfg = json.loads(gated[4].communicate.await_args.kwargs["input"].decode())
+    ungated_cfg = json.loads(ungated[4].communicate.await_args.kwargs["input"].decode())
+    assert gated_cfg["mcpServers"]["aegis"]["url"].endswith("/sebas/gated")
+    assert ungated_cfg["mcpServers"]["aegis"]["url"].endswith("/sebas")
 
 
 @pytest.mark.asyncio

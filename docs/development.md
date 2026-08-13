@@ -590,6 +590,34 @@ run wants to use Bash/Write/…
   └─ run continues either way (a deny is a tool result, not a crash)
 ```
 
+**That path covers the CLI's BUILT-IN tools only.** Live E2E on 2026-08-13
+(issue **#294**) caught claude 2.1.231 executing `mcp__aegis__capture_to_inbox`
+in a gated run with zero cards: tools that arrive through an explicitly-passed
+`--mcp-config` are trusted in `-p` mode and never reach
+`--permission-prompt-tool` (Bash *does* still reach it). So AEGIS's own tools are
+gated **server-side** instead, by the URL the gated run mounts:
+
+```
+POST /api/mcp-server/{agent_id}/gated        ← what a gated run mounts
+  read-only tool (_READ_ONLY_TOOLS)   → executes, no card
+  anything else                       → approve-then-retry:
+     1st call  → raise an InteractionFlow card, wait mcp_gate_wait_seconds (40),
+                 then answer isError "…retry this exact call in ~60 seconds…"
+     retry     → find the approval by (agent, tool, sha256(canonical args)),
+                 claim it single-use, execute, return the real result
+     denied    → permanent deny for those arguments; archived → "expired"
+```
+
+40 seconds is deliberate: the CLI was measured to abandon an MCP tool call at
+~60s regardless of `MCP_TOOL_TIMEOUT`, so the gate cannot hold a call open until
+a human answers — it has to come back in time to *instruct the retry*. An
+approval lives 15 minutes, covers exactly the arguments the operator read
+(canonical-JSON hash, so key order is not a new call) and authorises exactly one
+execution: the claim is an atomic `UPDATE … WHERE metadata->>'gate_consumed_at'
+IS NULL`, so two concurrent retries cannot both run. `_READ_ONLY_TOOLS`
+(`api/routes/mcp_server.py`) is v1 of the classification issue **#289** asks for
+— an ALLOW-list, so a tool added later is gated until someone classifies it.
+
 This is AEGIS's **Rule-of-Two** posture in one flag: a run that reads untrusted
 content *and* can mutate state should not also be unsupervised. Give up any one
 of the three and you are back in safe territory — a gated run keeps the first
@@ -627,7 +655,7 @@ as a normal `{"status": "failed", ...}`:
 | Precondition | Why |
 |---|---|
 | engine is `claude` | kimi has no `--permission-prompt-tool` equivalent |
-| the MCP mount succeeded | the approval tool lives on the `aegis` server; without the mount the CLI cannot reach it |
+| the MCP mount succeeded | it is both where the approval tool lives and what points the run at the enforcing `/gated` endpoint — an unmounted gated run is an ungated run |
 
 Neither degrades to an ungated run. A request for a human in the loop that
 quietly became a full-auto session is the one failure mode this feature cannot
@@ -640,14 +668,16 @@ could not run gated at all. It is deliberately **not** a `CHAT_TOOLS` entry: it
 is a transport-level permission gate, not something an agent may call in chat,
 and calling it grants nothing anyway.
 
-### Provisioning the scratch workspace (once)
+### Provisioning the aegis-scratch workspace (once)
 
 `start_kimi_run` never JIT-clones — a missing checkout is a deliberate hard
-failure. A run dispatched without a `repo` uses the fixed `scratch` checkout,
-which the operator creates once on the coding host:
+failure. A run dispatched without a `repo` uses the fixed `aegis-scratch`
+checkout, which the operator creates once on the coding host. The name is
+AEGIS-prefixed deliberately (#292): `repo_base` is a real workspace root where a
+plain `scratch/` usually already exists as a personal, non-git folder.
 
 ```bash
-mkdir -p <repo_base>/scratch && cd <repo_base>/scratch && \
+mkdir -p <repo_base>/aegis-scratch && cd <repo_base>/aegis-scratch && \
   git init && git commit --allow-empty -m init
 ```
 
