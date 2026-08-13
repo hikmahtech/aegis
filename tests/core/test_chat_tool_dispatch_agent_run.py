@@ -7,6 +7,7 @@ flow's dataclass is built from.
 
 from unittest.mock import AsyncMock, MagicMock
 
+import pytest
 from aegis.services.chat import CHAT_TOOLS, TOOL_EXECUTORS, ToolContext, _execute_tool
 
 
@@ -131,6 +132,86 @@ async def test_dispatch_defaults_to_ungated():
     payload = client.start_workflow.call_args[0][1]
     assert "gated" in payload
     assert payload["gated"] is False
+
+
+async def test_dispatch_forwards_an_explicit_timeout_minutes():
+    """The caller's watch window reaches the flow verbatim, gated or not."""
+    pool = AsyncMock()
+    client = _client()
+    ctx = ToolContext(agent_id="sebas", temporal_client=client)
+
+    await _execute_tool(
+        pool, "dispatch_agent_run", {"prompt": "long audit", "timeout_minutes": 90}, ctx
+    )
+    assert client.start_workflow.call_args[0][1]["timeout_minutes"] == 90
+
+
+async def test_gated_run_without_an_explicit_timeout_gets_the_longer_window():
+    """A gated run spends most of its window BLOCKED on a human: each approval
+    card holds the CLI for up to 9 minutes, so 3-4 questions exhaust the flow's
+    30-minute default while the run is still working and still raising cards —
+    the flow stops watching and the transcript is never delivered."""
+    pool = AsyncMock()
+    client = _client()
+    ctx = ToolContext(agent_id="sebas", temporal_client=client)
+
+    await _execute_tool(
+        pool,
+        "dispatch_agent_run",
+        {"prompt": "Refactor the retry policy", "engine": "claude", "gated": True},
+        ctx,
+    )
+    assert client.start_workflow.call_args[0][1]["timeout_minutes"] == 120
+
+
+async def test_ungated_run_keeps_the_short_default():
+    """Falsifiability control: the longer window is tied to `gated`, not to
+    everything — a blanket 120 would fail here."""
+    pool = AsyncMock()
+    client = _client()
+    ctx = ToolContext(agent_id="sebas", temporal_client=client)
+
+    await _execute_tool(pool, "dispatch_agent_run", {"prompt": "research X"}, ctx)
+    assert client.start_workflow.call_args[0][1]["timeout_minutes"] == 30
+
+
+async def test_an_explicit_timeout_wins_over_the_gated_default():
+    pool = AsyncMock()
+    client = _client()
+    ctx = ToolContext(agent_id="sebas", temporal_client=client)
+
+    await _execute_tool(
+        pool,
+        "dispatch_agent_run",
+        {"prompt": "x", "engine": "claude", "gated": True, "timeout_minutes": 240},
+        ctx,
+    )
+    assert client.start_workflow.call_args[0][1]["timeout_minutes"] == 240
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [(1, 5), (9999, 240), ("nonsense", 30), (None, 30)],
+)
+async def test_out_of_range_timeouts_are_clamped_never_passed_through(raw, expected):
+    """The schema bounds this on the validated paths; the executor clamps so an
+    unvalidated caller cannot start a 3-second or a 7-day watch."""
+    pool = AsyncMock()
+    client = _client()
+    ctx = ToolContext(agent_id="sebas", temporal_client=client)
+
+    await _execute_tool(pool, "dispatch_agent_run", {"prompt": "x", "timeout_minutes": raw}, ctx)
+    assert client.start_workflow.call_args[0][1]["timeout_minutes"] == expected
+
+
+def test_timeout_minutes_is_advertised_with_its_bounds():
+    """The model can only choose a window it can see, and only a bounded one is
+    safe to expose (an unbounded value is a workflow that watches forever)."""
+    schema = next(t for t in CHAT_TOOLS if t["function"]["name"] == "dispatch_agent_run")
+    spec = schema["function"]["parameters"]["properties"]["timeout_minutes"]
+    assert spec["type"] == "integer"
+    assert (spec["minimum"], spec["maximum"]) == (5, 240)
+    assert "timeout_minutes" not in schema["function"]["parameters"]["required"]
 
 
 def test_gated_is_advertised_as_a_boolean():
