@@ -229,10 +229,13 @@ def test_module_workflows_is_the_unflagged_registry():
         # SocialActivities, both driven by the existing SocialPublishFlow).
         # Then +1 activity and NO new flow from #215's `deliver_briefing`, which
         # renders the health block and sends it inside one activity so the
-        # readings never become an argument or a result.
-        (True, True, 38, 188),
-        (False, False, 30, 159),
-        (True, False, 34, 177),
+        # readings never become an argument or a result. Then +1 flow and +2
+        # activities from AgentRunFlow / AgentRunActivities (launch_agent_run,
+        # check_agent_run) — event-driven (dispatched by the
+        # `dispatch_agent_run` chat tool), unflagged, so all three rows move.
+        (True, True, 39, 190),
+        (False, False, 31, 161),
+        (True, False, 35, 179),
     ],
 )
 def test_real_registration_passes_the_boot_check(homelab, money, flows, activities):

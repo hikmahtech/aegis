@@ -16,6 +16,7 @@ from temporalio.worker import Worker
 
 from aegis_worker.activities.active_work import ActiveWorkActivities
 from aegis_worker.activities.agent_registry import AgentRegistryActivities
+from aegis_worker.activities.agent_run import AgentRunActivities
 from aegis_worker.activities.agent_task import AgentTaskActivities
 from aegis_worker.activities.alert_governance import AlertGovernanceActivities
 from aegis_worker.activities.alerts import AlertActivities
@@ -429,6 +430,9 @@ async def main():
         # the flow-health watchdog.
         delivery=delivery_act,
     )
+    # General agent-run lane (AgentRunFlow) — same coding host + connector as
+    # the coding lane below, no Todoist coupling.
+    agent_run_act = AgentRunActivities(remote_script=connectors.get("remote_script"))
     agent_task_act = AgentTaskActivities(
         db_pool=deps.pool,
         todoist_connector=todoist_connector,
@@ -539,6 +543,7 @@ async def main():
         chat_act,
         review_act,
         inventory_act,
+        agent_run_act,
         agent_task_act,
         infra_ops_act,
         expiring_items_act,

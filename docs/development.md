@@ -449,6 +449,68 @@ scopes and the reinstall they require are in
 6. Write tests in `tests/core/test_{tool_name}_tool.py`
 7. If the tool can legitimately run longer than `tool_timeout_seconds` (default 30s), add an entry to `_TOOL_TIMEOUT_OVERRIDES` in `chat.py` — otherwise the executor cancels it mid-flight and the model retries, orphaning whatever the tool started (e.g. `aegis_self_diagnose` gets its full remote coding-run budget there).
 
+## Agent runs (the heavy lane)
+
+Agent work runs in two lanes.
+
+| | Light lane | Heavy lane |
+|---|---|---|
+| What | Core's in-process chat loop (`services/chat.py`) | `AgentRunFlow` — a headless claude/kimi CLI session on the coding host |
+| Where | Core, one LLM call + a bounded tool loop | `RemoteScriptConnector.start_kimi_run`, in a per-run git worktree, tmux window when the host is reachable |
+| How long | Seconds; answers in the same turn | Minutes to tens of minutes; the result is delivered to the agent's channel when it lands |
+| Dispatch | the user talks to the agent | the `dispatch_agent_run` chat tool, or `start_workflow("AgentRunFlow", {...})` |
+
+An **agent run** is deliberately not "a coding task ending in a PR". It is the
+same machinery `activities/agent_task.py` uses for the coding lane with the
+Todoist coupling removed, so investigation, research and analysis are equally
+valid asks — the run gets a filesystem, a full tool budget and its own
+time, and AEGIS gets the transcript tail back in chat.
+
+Two invariants worth knowing before you touch `flows/agent_run.py`:
+
+- **The launch activity is `NO_RETRY`.** Launching is not idempotent — a retry
+  is a second CLI session on a second worktree, burning tokens and racing the
+  first one's writes. Polling (`check_agent_run`) is a `cat` plus a `fuser`,
+  so it retries freely.
+- **A timeout does not kill the run.** The process may be minutes from a good
+  answer and the operator can attach to its tmux window, so the flow reports
+  where the run is (`tmux window <name> on <host>`, plus the output file) and
+  exits with `status: "timeout"`.
+
+Completion is detected by **process exit**, not by the `STATUS:` footer
+`alerts._kimi_output_complete` looks for: that regex accepts a closed
+vocabulary of alert-RCA / Jira-scoping verbs a general run has no reason to
+emit.
+
+### Provisioning the scratch workspace (once)
+
+`start_kimi_run` never JIT-clones — a missing checkout is a deliberate hard
+failure. A run dispatched without a `repo` uses the fixed `scratch` checkout,
+which the operator creates once on the coding host:
+
+```bash
+mkdir -p <repo_base>/scratch && cd <repo_base>/scratch && \
+  git init && git commit --allow-empty -m init
+```
+
+The empty commit is load-bearing: the launch adds a **detached worktree**, which
+needs a `HEAD` to detach from. If it is missing, the flow delivers the failure
+with this exact command in it.
+
+### Granting the tool on an existing deployment
+
+`agents.metadata.tool_set` is **DB-owned once non-empty**, so adding
+`dispatch_agent_run` to `config/seed/agents.yaml` grants it on a *fresh* boot
+only. On a running deployment, add it on the admin **Behavior** tab or:
+
+```bash
+curl -X PATCH "$AEGIS_URL/api/agents/pandoras-actor" \
+  -H 'content-type: application/json' \
+  -d '{"metadata": {"tool_set": [<existing tools...>, "dispatch_agent_run"]}}'
+```
+
+`tool_set` is replaced wholesale, so send the full list, not just the new entry.
+
 ## Adding Intelligence Topics
 
 The topics `IntelligenceScanFlow` (Raphael) scans are set **per source** in the flow config: the `topics` list on each `intelligence-scan-*` row in `config/seed/activities.yaml`, also editable live at `/admin/flows`. Change the config and `schedule_sync` propagates it without a redeploy.

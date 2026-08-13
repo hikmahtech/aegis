@@ -1462,6 +1462,46 @@ CHAT_TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "dispatch_agent_run",
+            "description": (
+                "Dispatch a LONG-RUNNING background agent run (a headless claude/kimi CLI "
+                "session on the coding host) and return immediately — the result arrives in "
+                "this channel later, typically in several minutes. Use it for heavy "
+                "multi-step work you cannot finish in this reply: investigating a codebase, "
+                "researching something end-to-end, analysing data, drafting a large change. "
+                "Do NOT use it for a quick question you can answer yourself or with a "
+                "read-only tool — this costs minutes and a full agent session. Write the "
+                "prompt as a complete standalone brief: the run cannot see this conversation "
+                "and nobody can answer its questions mid-run."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "prompt": {
+                        "type": "string",
+                        "description": "The full standalone brief for the run: what to do, what to look at, what to report back.",
+                    },
+                    "repo": {
+                        "type": "string",
+                        "description": "Optional workspace-relative checkout to run in, e.g. 'bcp' or 'acme/bcp'. Omit for work that needs no repo (a shared scratch workspace is used).",
+                    },
+                    "engine": {
+                        "type": "string",
+                        "enum": ["claude", "kimi"],
+                        "description": "Optional engine override. Omit to let repo/org routing decide.",
+                    },
+                    "purpose": {
+                        "type": "string",
+                        "description": "Short human label for the run, e.g. 'audit bcp retry logic'. Shown in the result header.",
+                    },
+                },
+                "required": ["prompt"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "youtube_transcript",
             "description": (
                 "Fetch the caption transcript of a YouTube video and deliver it to the "
@@ -1984,6 +2024,48 @@ async def _exec_trigger_workflow(pool: asyncpg.Pool, args: dict, ctx: ToolContex
         ctx.temporal_client, pool, args.get("workflow_type", ""), args.get("params")
     )
     return json.dumps(result, default=str)
+
+
+async def _exec_dispatch_agent_run(pool: asyncpg.Pool, args: dict, ctx: ToolContext) -> str:
+    """Spawn AgentRunFlow — the heavy lane. Fire-and-forget.
+
+    Core never imports worker code, so the flow is started by NAME with a plain
+    dict arg (Temporal's converter fills the AgentRunInput dataclass), exactly
+    like the agent-reply trigger route and `_exec_investigate_resource`. The
+    flow delivers the transcript tail to this agent's channel when the run
+    lands; nothing is awaited here.
+    """
+    if not ctx.temporal_client:
+        return "Can't dispatch: Temporal client not available."
+    prompt = (args.get("prompt") or "").strip()
+    if not prompt:
+        return "Can't dispatch: prompt is required."
+    engine = (args.get("engine") or "").strip().lower()
+    if engine and engine not in ("claude", "kimi"):
+        return f"Can't dispatch: unknown engine '{engine}' — use 'claude' or 'kimi', or omit it."
+    agent_id = ctx.agent_id or "sebas"
+    workflow_id = f"agent-run-{uuid4().hex[:8]}"
+    try:
+        await ctx.temporal_client.start_workflow(
+            "AgentRunFlow",
+            {
+                "agent_id": agent_id,
+                "prompt": prompt,
+                "repo": (args.get("repo") or "").strip() or None,
+                "engine": engine,
+                "purpose": (args.get("purpose") or "").strip(),
+            },
+            id=workflow_id,
+            task_queue="aegis-main",
+        )
+    except Exception as exc:  # noqa: BLE001 — a dispatch failure is a chat answer, not a crash
+        logger.warning("dispatch_agent_run_failed", workflow_id=workflow_id, error=str(exc)[:200])
+        return f"Couldn't dispatch the agent run: {str(exc)[:200]}"
+    logger.info("dispatch_agent_run_started", workflow_id=workflow_id, agent_id=agent_id)
+    return (
+        f"Dispatched agent run {workflow_id} ({engine or 'auto'}) — "
+        "results will land in this channel."
+    )
 
 
 async def _exec_create_schedule(pool: asyncpg.Pool, args: dict, ctx: ToolContext) -> str:
@@ -3750,6 +3832,7 @@ TOOL_EXECUTORS: dict[str, Any] = {
     "remember_this": _exec_remember_this,
     "query_activities": _exec_query_activities,
     "trigger_workflow": _exec_trigger_workflow,
+    "dispatch_agent_run": _exec_dispatch_agent_run,
     "create_schedule": _exec_create_schedule,
     "get_quote": _exec_get_quote,
     "get_market_overview": _exec_get_market_overview,
@@ -3807,6 +3890,9 @@ AGENT_TOOL_SETS: dict[str, set[str]] = {
     "sebas": {
         "query_activities",
         "trigger_workflow",
+        # Heavy lane: hand multi-step work to a headless CLI run (AgentRunFlow),
+        # result delivered to the channel later.
+        "dispatch_agent_run",
         "search_knowledge",
         "configure_triage",
         "remember_this",
@@ -3851,6 +3937,9 @@ AGENT_TOOL_SETS: dict[str, set[str]] = {
     },
     "pandoras-actor": {
         "trigger_workflow",
+        # Heavy lane, repo-agnostic: investigate/analyse anything in a headless
+        # CLI run. investigate_resource stays the code-fix-with-Gate-2 path.
+        "dispatch_agent_run",
         "create_schedule",
         "search_knowledge",
         "update_runbook",
