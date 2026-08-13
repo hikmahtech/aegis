@@ -292,7 +292,10 @@ class SlackCoreClient:
         Pass `error_sink` to also capture WHY it failed (`reason` key) — Core
         puts the real cause (LLM auth error, tool crash, …) in the 500 body,
         and callers that report to a human should say that rather than a
-        generic "couldn't reach Core".
+        generic "couldn't reach Core". A non-2xx response also fills in
+        `status_code` (int) so a caller can tell a deterministic 4xx (never
+        worth retrying) from a transient 5xx/transport failure (issue #296);
+        a transport failure leaves `status_code` unset.
         """
         try:
             async with httpx.AsyncClient(timeout=timeout) as client:
@@ -312,6 +315,7 @@ class SlackCoreClient:
                 )
                 if error_sink is not None:
                     error_sink["reason"] = f"Core API returned {resp.status_code}: {resp.text[:400]}"
+                    error_sink["status_code"] = resp.status_code
         except Exception as exc:  # noqa: BLE001 — best-effort; caller degrades
             logger.warning(
                 "slack_core_post_failed",
@@ -419,13 +423,19 @@ class SlackCoreClient:
         return await self._post("/api/admin/capture", payload, timeout=30)
 
     async def resolve_interaction(
-        self, *, interaction_id: str, value: str, note: str = ""
+        self,
+        *,
+        interaction_id: str,
+        value: str,
+        note: str = "",
+        error_sink: dict | None = None,
     ) -> dict | None:
         """POST /api/interactions/{id}/resolve — record a button choice.
 
         `note` — optional human reason typed into the card's note input; the
         core learning loop (record_correction_from_interaction) turns it into
-        a durable agent_memory lesson."""
+        a durable agent_memory lesson. `error_sink` — see `_post`; lets
+        `on_action` distinguish a permanent 4xx from a retryable failure."""
         response: dict = {"value": value}
         if note:
             response["note"] = note[:500]
@@ -433,6 +443,7 @@ class SlackCoreClient:
             f"/api/interactions/{interaction_id}/resolve",
             {"response": response},
             timeout=30,
+            error_sink=error_sink,
         )
 
     async def attach_delivery_ref(self, *, message_id: str, delivery_ref: dict) -> dict | None:
@@ -819,26 +830,54 @@ class SlackInbound:
     async def on_action(
         self, *, value: str, channel_id: str, message_ts: str, note: str = ""
     ) -> None:
-        """Resolve an interaction button, then stamp the card ONLY on success.
+        """Resolve an interaction button and always leave the card in a
+        state that tells the truth about what happened (issue #296).
 
         `value` is the button payload `interaction:{id}:{v}`. `note` is the
         optional free-text from the card's note input — passed through so a
-        correction becomes a durable agent lesson. Retries up to 3× on
-        transport failure (mirrors bot.py::handle_interaction_callback). The
-        card is edited (buttons cleared) ONLY when the result status is
-        `resolved` or `already_resolved`; on failure the buttons are left intact
-        so the user can re-click.
+        correction becomes a durable agent lesson.
+
+        Outcomes:
+          - status "resolved" (first tap or an idempotent re-tap) → edit the
+            card to `✅ {value}`, buttons cleared.
+          - any OTHER non-pending status (e.g. "archived" — a card whose
+            `timeout_policy=archive` fired, ~12% of all cards in 30d) → the
+            card is dead; edit it to an explicit expired state so it stops
+            looking tappable, rather than leaving a silent no-op forever.
+          - a permanent 4xx (409 base-drift conflict, 404 gone) → resolve is
+            attempted exactly ONCE (a deterministic 4xx never heals — same
+            lesson as `TodoistConnector.check_sync_status`); a threaded reply
+            under the card gives visible feedback while leaving the card's
+            buttons intact (a 409 in particular may still be actionable once
+            the drift is resolved).
+          - transport failure / 5xx → retried up to 3×, then a threaded
+            "couldn't reach AEGIS" reply; buttons stay intact so the user can
+            retry.
         """
         interaction_id, val = parse_action(value)
         if not interaction_id:
             return
 
+        ref = DeliveryRef("slack", {"channel": channel_id, "ts": message_ts})
+
         result = None
+        error_sink: dict = {}
         for attempt in range(1, 4):
+            error_sink = {}
             result = await self._core.resolve_interaction(
-                interaction_id=interaction_id, value=val, note=note
+                interaction_id=interaction_id, value=val, note=note, error_sink=error_sink
             )
             if result is not None:
+                break
+            status_code = error_sink.get("status_code")
+            if status_code is not None and 400 <= status_code < 500:
+                # Permanent client error — retrying a deterministic 4xx never
+                # heals; stop immediately instead of burning up to 90s.
+                logger.warning(
+                    "slack_action_resolve_permanent_failure",
+                    interaction_id=interaction_id,
+                    status_code=status_code,
+                )
                 break
             if attempt < 3:
                 logger.warning(
@@ -847,16 +886,62 @@ class SlackInbound:
                     attempt=attempt,
                 )
 
-        status = (result or {}).get("status", "")
-        if status in ("resolved", "already_resolved"):
-            ref = DeliveryRef("slack", {"channel": channel_id, "ts": message_ts})
-            await self._adapter.edit_card(ref=ref, text=f"✅ {val}")
-        else:
+        if result is not None:
+            status = result.get("status", "")
+            if status == "resolved":
+                await self._adapter.edit_card(ref=ref, text=f"✅ {val}")
+                return
+            # Any other non-pending status is a dead card (timed out before a
+            # response, or some other terminal state) — clear the buttons so
+            # it stops looking tappable instead of failing silently forever.
             logger.warning(
-                "slack_action_resolve_failed",
+                "slack_action_resolve_non_pending_status",
                 interaction_id=interaction_id,
-                result=result,
+                status=status,
             )
+            await self._adapter.edit_card(
+                ref=ref,
+                text=f"⏰ Expired — this card timed out before a response ({status})",
+            )
+            return
+
+        status_code = error_sink.get("status_code")
+        if status_code == 409:
+            await self._adapter.post_thread(
+                ref=ref,
+                text=(
+                    "⚠️ This card is stale — it changed since it was rendered. "
+                    "Check the interaction and try again."
+                ),
+            )
+            return
+        if status_code == 404:
+            await self._adapter.post_thread(
+                ref=ref, text="⚠️ This card no longer exists."
+            )
+            return
+        if status_code is not None and 400 <= status_code < 500:
+            await self._adapter.post_thread(
+                ref=ref,
+                text=f"⚠️ AEGIS rejected this action ({status_code}) — it was not recorded.",
+            )
+            return
+
+        # Transport failure or 5xx that survived all 3 retries — the tap
+        # genuinely never got through; leave the buttons live.
+        logger.warning(
+            "slack_action_resolve_failed",
+            interaction_id=interaction_id,
+            result=result,
+            status_code=status_code,
+        )
+        await self._adapter.post_thread(
+            ref=ref,
+            text=(
+                "⚠️ Couldn't reach AEGIS — your tap was not recorded; the "
+                "buttons are still active, try again."
+            ),
+        )
 
     async def on_capture(self, *, text: str, user_id: str) -> str:
         """`/capture <text>` — drop a task into the Todoist Inbox.

@@ -260,52 +260,137 @@ async def test_on_message_ignores_own_user_id():
 
 
 async def test_on_action_resolves_then_stamps_card():
+    """(e) regression guard: status 'resolved' → unchanged ✅ edit."""
     inbound, core, adapter = _inbound()
     core.resolve_interaction.return_value = {"status": "resolved"}
 
     await inbound.on_action(value="interaction:i1:approve", channel_id="CSEBAS", message_ts="3.3")
 
-    core.resolve_interaction.assert_awaited_once_with(
-        interaction_id="i1", value="approve", note=""
-    )
+    core.resolve_interaction.assert_awaited_once()
+    ckw = core.resolve_interaction.await_args.kwargs
+    assert ckw["interaction_id"] == "i1"
+    assert ckw["value"] == "approve"
+    assert ckw["note"] == ""
     adapter.edit_card.assert_awaited_once()
     ekw = adapter.edit_card.await_args.kwargs
     assert ekw["ref"] == DeliveryRef("slack", {"channel": "CSEBAS", "ts": "3.3"})
     assert "approve" in ekw["text"]
+    adapter.post_thread.assert_not_awaited()
 
 
-async def test_on_action_already_resolved_also_stamps_card():
-    """Fix 3 (success variant): already_resolved is treated as success."""
+async def test_on_action_idempotent_retap_also_stamps_card():
+    """(e) regression guard, idempotent variant: a re-tap after the row is
+    already resolved comes back from core as status='resolved',
+    already_resolved=True (routes/interactions.py) — NEVER a literal
+    'already_resolved' status string, which is what the old accidental
+    `status in ("resolved", "already_resolved")` check assumed."""
     inbound, core, adapter = _inbound()
-    core.resolve_interaction.return_value = {"status": "already_resolved"}
+    core.resolve_interaction.return_value = {"status": "resolved", "already_resolved": True}
 
     await inbound.on_action(value="interaction:i2:reject", channel_id="CSEBAS", message_ts="4.4")
 
     adapter.edit_card.assert_awaited_once()
+    adapter.post_thread.assert_not_awaited()
 
 
-async def test_on_action_failed_resolve_does_not_stamp_card():
-    """Fix 3: non-resolved result → edit_card NOT called, buttons survive."""
+async def test_on_action_archived_status_expires_card_no_retry():
+    """(a) issue #296 dominant case: timeout_policy=archive fired (~12% of
+    all cards in 30d) — the card is dead and must stop looking tappable
+    instead of silently staying alive forever. A 200 response (even a
+    non-resolved status) is a definitive answer, so no retry happens."""
     inbound, core, adapter = _inbound()
-    # Simulate persistent transport failure (all 3 attempts return None).
+    core.resolve_interaction.return_value = {"status": "archived", "already_resolved": True}
+
+    await inbound.on_action(value="interaction:i5:approve", channel_id="CSEBAS", message_ts="7.7")
+
+    assert core.resolve_interaction.await_count == 1
+    adapter.edit_card.assert_awaited_once()
+    ekw = adapter.edit_card.await_args.kwargs
+    assert ekw["ref"] == DeliveryRef("slack", {"channel": "CSEBAS", "ts": "7.7"})
+    assert "⏰" in ekw["text"]
+    assert "archived" in ekw["text"]
+    adapter.post_thread.assert_not_awaited()
+
+
+async def test_on_action_unknown_terminal_status_also_expires_card():
+    """The fix is generic, not special-cased to the literal string
+    'archived': ANY status that is neither 'resolved' nor 'pending' clears
+    the buttons, and the real status is echoed for operator context."""
+    inbound, core, adapter = _inbound()
+    core.resolve_interaction.return_value = {"status": "cancelled"}
+
+    await inbound.on_action(value="interaction:i9:approve", channel_id="CSEBAS", message_ts="11.11")
+
+    adapter.edit_card.assert_awaited_once()
+    ekw = adapter.edit_card.await_args.kwargs
+    assert "cancelled" in ekw["text"]
+
+
+async def test_on_action_409_conflict_no_retry_posts_stale_feedback():
+    """(b) a 409 base-drift conflict is a deterministic 4xx — retrying it
+    can never succeed, so resolve is attempted exactly once. Feedback goes
+    to a THREADED reply, not an edit, so the card's buttons stay actionable
+    (the conflict may resolve itself, e.g. the base document settling)."""
+    inbound, core, adapter = _inbound()
+
+    async def _conflict(*, interaction_id, value, note="", error_sink=None):
+        if error_sink is not None:
+            error_sink["status_code"] = 409
+            error_sink["reason"] = "Core API returned 409: base drift"
+        return None
+
+    core.resolve_interaction.side_effect = _conflict
+
+    await inbound.on_action(value="interaction:i6:approve", channel_id="CSEBAS", message_ts="8.8")
+
+    assert core.resolve_interaction.await_count == 1
+    adapter.edit_card.assert_not_awaited()
+    adapter.post_thread.assert_awaited_once()
+    tkw = adapter.post_thread.await_args.kwargs
+    assert tkw["ref"] == DeliveryRef("slack", {"channel": "CSEBAS", "ts": "8.8"})
+    assert "stale" in tkw["text"].lower()
+
+
+async def test_on_action_404_gone_no_retry_posts_gone_feedback():
+    """(c) a 404 (interaction row gone) is also a deterministic 4xx — one
+    attempt, then feedback that the card no longer exists."""
+    inbound, core, adapter = _inbound()
+
+    async def _gone(*, interaction_id, value, note="", error_sink=None):
+        if error_sink is not None:
+            error_sink["status_code"] = 404
+            error_sink["reason"] = "Core API returned 404: interaction_not_found"
+        return None
+
+    core.resolve_interaction.side_effect = _gone
+
+    await inbound.on_action(value="interaction:i7:approve", channel_id="CSEBAS", message_ts="9.9")
+
+    assert core.resolve_interaction.await_count == 1
+    adapter.edit_card.assert_not_awaited()
+    adapter.post_thread.assert_awaited_once()
+    tkw = adapter.post_thread.await_args.kwargs
+    assert "no longer exists" in tkw["text"].lower()
+
+
+async def test_on_action_transport_failure_retries_then_posts_try_again_feedback():
+    """(d) a pure transport/5xx failure (no HTTP status to key off) still
+    gets the existing 3 retries; only after the final failure does it post
+    visible feedback, and the buttons are explicitly left intact."""
+    inbound, core, adapter = _inbound()
+    # No status_code captured — models a transport exception (or exhausted
+    # 5xx retries), never a permanent 4xx.
     core.resolve_interaction.return_value = None
 
-    await inbound.on_action(value="interaction:i3:approve", channel_id="CSEBAS", message_ts="5.5")
+    await inbound.on_action(value="interaction:i8:approve", channel_id="CSEBAS", message_ts="10.10")
 
-    # Retried 3 times.
     assert core.resolve_interaction.await_count == 3
-    # Card must NOT be stamped (buttons left intact for re-click).
     adapter.edit_card.assert_not_awaited()
-
-
-async def test_on_action_error_status_does_not_stamp_card():
-    """Fix 3: a non-resolved status (e.g. 'error') → card not stamped."""
-    inbound, core, adapter = _inbound()
-    core.resolve_interaction.return_value = {"status": "error", "detail": "timeout"}
-
-    await inbound.on_action(value="interaction:i4:approve", channel_id="CSEBAS", message_ts="6.6")
-
-    adapter.edit_card.assert_not_awaited()
+    adapter.post_thread.assert_awaited_once()
+    tkw = adapter.post_thread.await_args.kwargs
+    assert tkw["ref"] == DeliveryRef("slack", {"channel": "CSEBAS", "ts": "10.10"})
+    assert "try again" in tkw["text"].lower()
+    assert "buttons" in tkw["text"].lower()
 
 
 # --- SlackCoreClient.attach_delivery_ref POST regression guard --------------
@@ -338,6 +423,67 @@ async def test_attach_delivery_ref_issues_post_not_patch():
     body = json.loads(req.content)
     assert body == {"delivery_ref": ref_payload}
     assert result == {"ok": True}
+
+
+# --- SlackCoreClient.resolve_interaction error_sink status_code plumbing ----
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_resolve_interaction_error_sink_captures_status_code():
+    """Issue #296 plumbing: resolve_interaction must surface the real HTTP
+    status via error_sink so on_action can tell a permanent 4xx (never
+    retry) from a transient failure (retry 3x)."""
+    core = SlackCoreClient(_settings())
+    respx.post("http://core/api/interactions/abc/resolve").mock(
+        return_value=httpx.Response(409, json={"detail": "base drift"})
+    )
+    error_sink: dict = {}
+
+    result = await core.resolve_interaction(
+        interaction_id="abc", value="approve", error_sink=error_sink
+    )
+
+    assert result is None
+    assert error_sink["status_code"] == 409
+    assert "409" in error_sink["reason"]
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_resolve_interaction_transport_failure_leaves_status_code_unset():
+    """A transport exception has no HTTP status at all — error_sink must not
+    fabricate one (on_action relies on this to keep retrying)."""
+    core = SlackCoreClient(_settings())
+    respx.post("http://core/api/interactions/abc/resolve").mock(
+        side_effect=httpx.ConnectError("no route")
+    )
+    error_sink: dict = {}
+
+    result = await core.resolve_interaction(
+        interaction_id="abc", value="approve", error_sink=error_sink
+    )
+
+    assert result is None
+    assert "status_code" not in error_sink
+    assert "Could not reach Core API" in error_sink["reason"]
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_resolve_interaction_without_error_sink_is_unaffected():
+    """The hint-modal caller (adapters/slack.py::handle_hint_submit) never
+    passes error_sink — must keep working exactly as before."""
+    core = SlackCoreClient(_settings())
+    respx.post("http://core/api/interactions/abc/resolve").mock(
+        return_value=httpx.Response(
+            200, json={"status": "resolved", "already_resolved": False}
+        )
+    )
+
+    result = await core.resolve_interaction(interaction_id="abc", value="hint:foo")
+
+    assert result == {"status": "resolved", "already_resolved": False}
 
 
 async def test_on_capture_idempotency_key_shape():

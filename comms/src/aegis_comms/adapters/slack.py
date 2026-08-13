@@ -358,6 +358,21 @@ class SlackAdapter:
             blocks=[],
         )
 
+    async def post_thread(self, *, ref: DeliveryRef, text: str) -> None:
+        """Post a threaded reply under `ref`'s message.
+
+        Used for feedback that must NOT disturb the card itself (e.g. a 409
+        conflict, where the buttons may still be actionable once the drift
+        is resolved) — unlike `edit_card`, the original message and its
+        blocks/buttons are left untouched.
+        """
+        await self._client.chat_postMessage(
+            channel=ref.data["channel"],
+            thread_ts=ref.data["ts"],
+            text=html_to_mrkdwn(text),
+            mrkdwn=True,
+        )
+
     async def delete_message(self, *, ref: DeliveryRef) -> bool:
         try:
             await self._client.chat_delete(channel=ref.data["channel"], ts=ref.data["ts"])
