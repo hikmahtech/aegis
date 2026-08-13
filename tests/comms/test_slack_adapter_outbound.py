@@ -117,6 +117,20 @@ async def test_edit_card_clears_buttons(monkeypatch):
     assert kwargs["blocks"] == []
 
 
+async def test_post_thread_replies_under_card_without_touching_it(monkeypatch):
+    """Issue #296: 409/transport feedback must land as a threaded reply, not
+    an edit — the card's own message (and its buttons) stays untouched."""
+    a = _adapter(monkeypatch)
+    ref = DeliveryRef("slack", {"channel": "C1", "ts": "1.2"})
+    await a.post_thread(ref=ref, text="<b>stale</b>")
+    a._client.chat_update.assert_not_awaited()
+    kwargs = a._client.chat_postMessage.await_args.kwargs
+    assert kwargs["channel"] == "C1"
+    assert kwargs["thread_ts"] == "1.2"
+    assert kwargs["text"] == "*stale*"
+    assert kwargs["mrkdwn"] is True
+
+
 async def test_delete_message_ok(monkeypatch):
     a = _adapter(monkeypatch)
     ref = DeliveryRef("slack", {"channel": "C1", "ts": "1.2"})
