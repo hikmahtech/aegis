@@ -36,7 +36,8 @@ def _frontmatter(path: pathlib.Path) -> dict:
 
 
 def test_expected_skills_are_present():
-    assert {p.parent.name for p in _skill_files()} == EXPECTED
+    """Superset, not equality: adding a runbook is free, losing one is not."""
+    assert {p.parent.name for p in _skill_files()} >= EXPECTED
 
 
 @pytest.mark.parametrize("path", _skill_files(), ids=lambda p: p.parent.name)
