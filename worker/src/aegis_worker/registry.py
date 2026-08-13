@@ -43,6 +43,7 @@ import structlog
 from temporalio import activity, workflow
 
 from aegis_worker.flows.agent_chat_reply import AgentChatReplyFlow
+from aegis_worker.flows.agent_run import AgentRunFlow
 from aegis_worker.flows.agent_task import (
     AgentTaskFlow,
     AgentTaskSweepConfig,
@@ -145,6 +146,9 @@ def _enabled(spec: FlowSpec, settings: object | None) -> bool:
 
 FLOWS: tuple[FlowSpec, ...] = (
     FlowSpec(AgentChatReplyFlow),
+    # Event-driven: dispatched by the `dispatch_agent_run` chat tool, never on
+    # a schedule — so no schedule_config and no activities.yaml seed row.
+    FlowSpec(AgentRunFlow),
     FlowSpec(
         AgentTaskSweepFlow,
         lambda act: AgentTaskSweepConfig(
