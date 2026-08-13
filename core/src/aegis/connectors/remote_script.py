@@ -48,6 +48,24 @@ _SCRIPT_ID_RE = re.compile(r"^[a-zA-Z0-9_\-./]+$")
 # ignored.
 _AGENT_WINDOW_PREFIXES = ("kimi-", "claude-")
 
+# The MCP server key written into a run's client config (`_mcp_run_config`).
+_MCP_SERVER_NAME = "aegis"
+
+# The synthetic approval tool AEGIS's own MCP server serves for gated runs
+# (`api/routes/mcp_server.py::APPROVAL_TOOL_NAME`). Addressed through the
+# `mcp__<server>__<tool>` naming the CLI resolves `--permission-prompt-tool`
+# against, so BOTH halves have to match core — a rename on either side turns
+# every gated tool use into an unresolvable prompt. Asserted in
+# `tests/core/test_kimi_connector.py`.
+PERMISSION_PROMPT_TOOL = f"mcp__{_MCP_SERVER_NAME}__approve_tool_use"
+
+# claude's per-MCP-tool-call timeout, in MILLISECONDS. A gated run's approval
+# call blocks on a human being, so the stock timeout would abort the prompt long
+# before anyone could answer. 10 minutes, deliberately longer than core's 9-min
+# approval cap (`AGENT_RUN_APPROVAL_TIMEOUT_S`): the slow case must come back as
+# a clean DENY from AEGIS, not as a transport failure inside the run.
+MCP_TOOL_TIMEOUT_MS = 600_000
+
 
 def _sanitize_window_repo(repo: str) -> str:
     """Basename of `repo` with all non [A-Za-z0-9_-] chars replaced by '-'."""
@@ -87,7 +105,7 @@ def _mcp_run_config(agent_id: str, external_url: str, api_key: str) -> str:
     return json.dumps(
         {
             "mcpServers": {
-                "aegis": {
+                _MCP_SERVER_NAME: {
                     "type": "http",
                     "url": f"{base}/api/mcp-server/{agent_id}",
                     "headers": {"X-API-Key": api_key},
@@ -125,6 +143,7 @@ def _agent_launch_flags(
     prompt_file: str,
     config_dir: str = "",
     mcp_config: str = "",
+    gated: bool = False,
 ) -> str:
     """Build the agent CLI invocation (without output redirection) for `engine`.
 
@@ -144,9 +163,18 @@ def _agent_launch_flags(
             non-default login (personal account for non-org fallback runs).
             `mcp_config`, when set, adds `--mcp-config <path> --strict-mcp-config`
             so the run mounts AEGIS's own tools — and ONLY those (see below).
+            `gated` REPLACES `--dangerously-skip-permissions` with
+            `--permission-prompt-tool mcp__aegis__approve_tool_use` and exports
+            `MCP_TOOL_TIMEOUT`, so every action the CLI would otherwise
+            auto-allow becomes an approval card a human answers. The two are
+            mutually exclusive by construction: leaving skip-permissions in
+            would auto-allow everything and the prompt tool would never fire,
+            which is a gate that silently does nothing.
 
-    `mcp_config` is claude-only: the kimi CLI has no equivalent flag pair, so a
-    kimi run gets no mounted AEGIS tools (documented limitation).
+    `mcp_config` and `gated` are claude-only: the kimi CLI has no equivalent
+    flag pair, so a kimi run gets no mounted AEGIS tools and cannot be gated
+    (`start_kimi_run` refuses a gated kimi launch outright rather than
+    downgrading it to an ungated one).
 
     claude reads the prompt from stdin; kimi takes it as a `-p` argument via
     `$(cat ...)` command substitution instead. Both emit one JSON event per
@@ -154,16 +182,28 @@ def _agent_launch_flags(
     engine-agnostic.
     """
     if engine == "claude":
-        env = f"CLAUDE_CONFIG_DIR={shlex.quote(config_dir)} " if config_dir else ""
+        env_parts = []
+        if config_dir:
+            env_parts.append(f"CLAUDE_CONFIG_DIR={shlex.quote(config_dir)}")
+        if gated:
+            # Without this the CLI abandons the approval call after its default
+            # per-tool timeout and the gate becomes a hang.
+            env_parts.append(f"MCP_TOOL_TIMEOUT={MCP_TOOL_TIMEOUT_MS}")
+        env = "".join(f"{part} " for part in env_parts)
         # NOT shlex-quoted: the path is composed by `_mcp_config_path` from a
         # sanitized agent id and starts with `$HOME`, which must stay expandable
         # by the remote shell. `--strict-mcp-config` makes that file the ONLY
         # server list, so a `.mcp.json` checked into the target repo cannot
         # inject extra servers into an unattended run.
         mcp = f" --mcp-config {mcp_config} --strict-mcp-config" if mcp_config else ""
+        permission = (
+            f" --permission-prompt-tool {PERMISSION_PROMPT_TOOL}"
+            if gated
+            else " --dangerously-skip-permissions"
+        )
         return (
             f"{env}{shlex.quote(binary)} --print --output-format stream-json "
-            f"--verbose --dangerously-skip-permissions{mcp} < {shlex.quote(prompt_file)}"
+            f"--verbose{permission}{mcp} < {shlex.quote(prompt_file)}"
         )
     return (
         f"{shlex.quote(binary)} --output-format stream-json "
@@ -730,6 +770,7 @@ class RemoteScriptConnector:
         claude_config_dir: str = "",
         claude_account: str = "",
         agent_id: str = "",
+        gated: bool = False,
     ) -> dict:
         """Start a coding-CLI run (kimi or claude) on the effective host.
 
@@ -762,6 +803,18 @@ class RemoteScriptConnector:
         to a plain run, never to a failed launch. Kimi runs get neither: the CLI
         has no `--mcp-config`, and skills are a claude-side convention.
 
+        `gated` turns the run into a human-in-the-loop one: the CLI asks AEGIS
+        for permission (`--permission-prompt-tool`) instead of auto-allowing,
+        and each request becomes an `interactions` card. It has two HARD
+        preconditions, both of which return a normal `failed` result rather than
+        quietly launching an ungated run — the whole point is that nothing
+        mutating happens without a human, so "gated was requested and not
+        applied" must never be a silent outcome:
+          1. engine must be `claude` (kimi has no equivalent flag), and
+          2. the MCP mount must have succeeded — `--permission-prompt-tool`
+             names a tool on the `aegis` server, so without the mount the CLI
+             cannot reach it and every gated action fails or hangs.
+
         Reachable-host runs are wrapped in a tmux window for live attach.
         Output is always captured to `output_file` (via `tee` in tmux mode) so
         stream-json parsing is unchanged.
@@ -777,6 +830,14 @@ class RemoteScriptConnector:
         repo_path = f"{self._repo_base}/{repo}" if self._repo_base else repo
         route_engine, route_config_dir = self._route_for(github_repo)
         engine = engine_override or route_engine
+        if gated and engine != "claude":
+            error = (
+                f"gated runs require the claude engine, but this run routed to '{engine}' — "
+                "the kimi CLI has no --permission-prompt-tool equivalent. Pass "
+                "engine='claude' (an ungated fallback would defeat the gate)."
+            )
+            logger.warning("gated_run_engine_unsupported", engine=engine, github_repo=github_repo)
+            return {"run_id": run_id, "status": "failed", "error": error, "engine": engine}
         if engine == "claude":
             if not self._claude_binary:
                 error = f"claude engine selected for {github_repo} but claude_binary not configured"
@@ -872,6 +933,17 @@ class RemoteScriptConnector:
         # by design — a run without its tools is degraded, a run that never
         # launched is dead.
         mcp_config = await self._mount_mcp_config(host, engine, agent_id)
+        if gated and not mcp_config:
+            # Best-effort stops being acceptable here: the permission prompt
+            # lives ON that server. An unmounted gated run would ask a server
+            # it cannot see for permission on every action.
+            error = (
+                "gated run aborted: AEGIS's MCP tools were not mounted, so the CLI cannot "
+                "reach the approval tool. Check mcp_server_external_url, the API key and "
+                "that the run carries an agent_id."
+            )
+            logger.warning("gated_run_mcp_mount_missing", agent_id=agent_id, run_id=run_id)
+            return {"run_id": run_id, "status": "failed", "error": error, "engine": engine}
 
         # Phase 4: launch the agent. tmux mode → live-attachable window with
         # tee-capture; otherwise today's detached nohup. `nohup` alone detaches;
@@ -881,7 +953,7 @@ class RemoteScriptConnector:
         # substituted into `-p` via `$(cat ...)`), but the same rule holds
         # regardless: this launch command never redirects stdin itself.
         agent_flags = _agent_launch_flags(
-            engine, binary, work_path, prompt_file, config_dir, mcp_config
+            engine, binary, work_path, prompt_file, config_dir, mcp_config, gated
         )
         nohup_cmd = (
             f"cd {shlex.quote(work_path)} && "
@@ -901,6 +973,7 @@ class RemoteScriptConnector:
                 binary=binary,
                 config_dir=config_dir,
                 mcp_config=mcp_config,
+                gated=gated,
             )
 
         if not launched_in_tmux:
@@ -1016,6 +1089,7 @@ class RemoteScriptConnector:
         binary: str,
         config_dir: str = "",
         mcp_config: str = "",
+        gated: bool = False,
     ) -> bool:
         """Launch the agent in a tmux window on `host`. Returns True if a window
         was created, False if it should fall back to detached nohup (all windows
@@ -1042,7 +1116,7 @@ class RemoteScriptConnector:
         winname = f"{engine}-{_sanitize_window_repo(repo)}-{run_id}"
         inner = (
             f"cd {shlex.quote(work_path)} && "
-            f"{_agent_launch_flags(engine, binary, work_path, prompt_file, config_dir, mcp_config)} "
+            f"{_agent_launch_flags(engine, binary, work_path, prompt_file, config_dir, mcp_config, gated)} "
             f"2>&1 | tee {shlex.quote(output_file)}"
         )
         prune = "".join(f"tmux kill-window -t {shlex.quote(pid)}; " for pid in prune_ids)
