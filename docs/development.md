@@ -290,8 +290,9 @@ the other direction: unset `AEGIS_AUTH_DISABLED` and give the endpoint a key.
 | Method | Behaviour |
 |---|---|
 | `POST /api/mcp-server/{agent_id}` | one JSON-RPC 2.0 message per request — `initialize`, `ping`, `tools/list`, `tools/call`, plus 202 for notifications |
-| `GET /api/mcp-server/{agent_id}` | 405 — stateless, no server-initiated SSE stream |
-| `DELETE /api/mcp-server/{agent_id}` | 204 — session termination no-op |
+| `POST /api/mcp-server/{agent_id}/gated` | identical, except a tool outside `_READ_ONLY_TOOLS` needs an operator approval first — see [Gated runs](#gated-runs-human-in-the-loop) |
+| `GET /api/mcp-server/{agent_id}[/gated]` | 405 — stateless, no server-initiated SSE stream |
+| `DELETE /api/mcp-server/{agent_id}[/gated]` | 204 — session termination no-op |
 
 Three things bound what a mounted client can do:
 
@@ -544,7 +545,8 @@ behind an authenticating proxy a headless CLI cannot traverse.
   and lands in shell audit logs; a heredoc would be equivalent but leaves the
   content in the command string too. The content is never logged — only
   `mcp_config_written agent_id=… path=…`.
-- The file lives at `$HOME/.aegis/mcp-<agent_id>.json`, written under
+- The file lives at `$HOME/.aegis/mcp-<agent_id>.json` (a gated run gets its own
+  `mcp-<agent_id>-gated.json`, pointed at the enforcing endpoint), written under
   `umask 077` (0600, in a 0700 directory) and deliberately **outside the run's
   worktree**, so the agent it authenticates cannot commit or push its own
   credential.
