@@ -63,7 +63,9 @@ async def resolve_interaction(
 
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
-            "SELECT flow_run_id, status, agent_id, prompt, metadata "
+            # `origin` is read for the learning loop below: some cards quote
+            # untrusted content in their prompt and must not become memory.
+            "SELECT flow_run_id, status, agent_id, prompt, origin, metadata "
             "FROM interactions WHERE id = $1",
             interaction_id,
         )
@@ -123,10 +125,13 @@ async def resolve_interaction(
 
     # Learning loop (Phase 4): a human correction (a reason/note in the response)
     # becomes a durable lesson for this agent, surfaced in its next chat prompt.
+    # `origin` is passed because that prompt is stored verbatim, and some cards
+    # (the agent-run permission gate) quote a run's untrusted tool input in it —
+    # `memory._UNLEARNABLE_ORIGINS` is where that decision lives.
     from aegis.services.memory import record_correction_from_interaction
 
     await record_correction_from_interaction(
-        pool, row["agent_id"], row["prompt"], body.response
+        pool, row["agent_id"], row["prompt"], body.response, row["origin"]
     )
 
     handle = temporal.get_workflow_handle(row["flow_run_id"])

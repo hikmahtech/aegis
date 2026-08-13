@@ -17,6 +17,23 @@ logger = structlog.get_logger()
 # Response fields that carry a human correction worth remembering.
 _CORRECTION_KEYS = ("reason", "note", "feedback", "comment", "correction")
 
+# `interactions.origin` values whose cards must NEVER become agent memory.
+#
+# The learning loop stores the card's PROMPT verbatim, and an agent-run
+# permission card's prompt embeds up to 800 bytes of the run's pending tool
+# input — a file the run just read, a command it composed, text from a web page
+# it fetched. Denying that input and then persisting it into the agent's system
+# prompt is prompt injection with a delay: the refused content ends up in front
+# of the model anyway, on every later turn, labelled as something the human
+# taught it.
+#
+# Skipping (rather than redacting down to the tool name) is the right shape
+# because the lesson has no value to begin with: "the human denied Bash once"
+# generalises to nothing, the operator's note is about that one call, and the
+# run that raised the card is long finished. `origin` is a real column on
+# `interactions` and the gate already sets it, so no new plumbing is needed.
+_UNLEARNABLE_ORIGINS = frozenset({"agent_run_gate"})
+
 
 async def record_memory(
     pool: Any, agent_id: str, content: str, importance: float = 0.5, source: str = "correction"
@@ -83,11 +100,16 @@ def format_memories(memories: list[str]) -> str:
 
 
 async def record_correction_from_interaction(
-    pool: Any, agent_id: str, prompt: str, response: Any
+    pool: Any, agent_id: str, prompt: str, response: Any, origin: str = ""
 ) -> None:
     """Save a durable lesson when a resolved interaction carries a human
-    correction (a reason/note/feedback). No-op for bare accepts. Never raises —
-    a memory write must not break interaction resolution."""
+    correction (a reason/note/feedback). No-op for bare accepts, and for any
+    card whose `origin` is in `_UNLEARNABLE_ORIGINS` — its prompt quotes
+    untrusted content. Never raises — a memory write must not break interaction
+    resolution."""
+    if str(origin or "") in _UNLEARNABLE_ORIGINS:
+        logger.debug("agent_memory_skipped_untrusted_origin", agent_id=agent_id, origin=origin)
+        return
     if not isinstance(response, dict):
         return
     reason = next(
