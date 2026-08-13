@@ -39,6 +39,7 @@ EXPECTED_TOOL_NAMES = [
     "configure_triage",
     "create_schedule",
     "defer_task",
+    "dispatch_agent_run",
     "find_reference",
     "get_finance_news",
     "get_market_overview",
