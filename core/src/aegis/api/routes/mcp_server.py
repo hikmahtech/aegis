@@ -1,11 +1,11 @@
 """MCP **server** — AEGIS's own chat tools, served over streamable HTTP.
 
-The mirror image of :mod:`aegis.mcp_manager` (the client). One endpoint,
-``POST /api/mcp-server/{agent_id}``, speaks JSON-RPC 2.0 so an external agent
-harness — ``claude`` / ``kimi`` CLI headless runs, Claude Desktop — can mount
-AEGIS's GTD / knowledge / infra / money tools natively instead of shelling back
-into the chat API. ``routes/mcp.py`` is the *client* admin surface and is
-untouched by this module.
+The mirror image of :mod:`aegis.mcp_manager` (the client). One handler behind
+two URLs — ``POST /api/mcp-server/{agent_id}`` and its ``/gated`` variant (last
+paragraph) — speaks JSON-RPC 2.0 so an external agent harness (``claude`` /
+``kimi`` CLI headless runs, Claude Desktop) can mount AEGIS's GTD / knowledge /
+infra / money tools natively instead of shelling back into the chat API.
+``routes/mcp.py`` is the *client* admin surface and is untouched by this module.
 
 Serving tools to a third-party harness is a door into this AEGIS, so it is shut
 by default and narrow when open:
