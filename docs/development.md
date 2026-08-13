@@ -257,7 +257,7 @@ radius is bounded, not eliminated:
   only granted tools, flattened to one line each (no newlines or control
   characters, so a description cannot forge a `## System:` heading), capped at 12
   tools per server and ~4 KB overall, fetched best-effort under a 5 s timeout;
-- tool results are truncated to `tool_result_max_bytes` (4 KB by default) before
+- tool results are truncated to `tool_result_max_bytes` (16 KB by default) before
   they reach the model — B8's 1 MB wire cap is three orders of magnitude too
   generous for a prompt.
 
