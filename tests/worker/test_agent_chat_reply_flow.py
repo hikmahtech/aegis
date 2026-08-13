@@ -97,7 +97,7 @@ async def test_happy_path_per_agent(agent):
 
 @pytest.mark.asyncio
 async def test_synthesize_failure_posts_error_comment():
-    """synthesize_reply raises after retries → flow runs error-comment + reports failure."""
+    """synthesize_reply raises → flow runs error-comment + reports failure."""
     error_log = []
 
     @activity.defn(name="synthesize_reply")
@@ -140,6 +140,59 @@ async def test_synthesize_failure_posts_error_comment():
     assert len(error_log) == 1
     assert error_log[0]["agent_id"] == "raphael"
     assert "LLM proxy down" in error_log[0]["reason"]
+
+
+@pytest.mark.asyncio
+async def test_synthesize_failure_is_not_retried():
+    """synthesize_reply is an HTTP wrapper around core's entire chat tool
+    loop, which can execute side-effecting tools (restart_service,
+    complete_task, trigger_workflow, ...) before failing. Retrying it would
+    re-execute those side effects, so it must use NO_RETRY: exactly one
+    attempt, then degrade via the error-comment path.
+
+    Falsifiable: under the old RETRY_ONCE policy, Temporal would attempt
+    this activity twice and `attempts["count"] == 1` would fail."""
+    attempts = {"count": 0}
+    error_log = []
+
+    @activity.defn(name="synthesize_reply")
+    async def synth(agent_id, message, thread_id, task_id):
+        attempts["count"] += 1
+        raise RuntimeError("core chat loop failed after tools already ran")
+
+    @activity.defn(name="send_message")
+    async def deliver(agent_id, message, chat_id=0, keyboard=None):
+        raise RuntimeError("should not be called")
+
+    @activity.defn(name="post_agent_reply_comment")
+    async def post_ok(task_id, agent_id, reply_text, tool_trace_summary, message_id):
+        raise RuntimeError("should not be called")
+
+    @activity.defn(name="post_agent_reply_error_comment")
+    async def post_err(task_id, agent_id, reason):
+        error_log.append({"task_id": task_id, "agent_id": agent_id, "reason": reason})
+        return {"posted": True}
+
+    async with await WorkflowEnvironment.start_time_skipping() as env:
+        task_queue = f"tq-{uuid.uuid4().hex[:8]}"
+        async with Worker(
+            env.client,
+            task_queue=task_queue,
+            workflows=[AgentChatReplyFlow],
+            activities=[synth, deliver, post_ok, post_err],
+        ):
+            result = await env.client.execute_workflow(
+                AgentChatReplyFlow.run,
+                _make_input(),
+                id=f"acf-once-{uuid.uuid4().hex[:8]}",
+                task_queue=task_queue,
+            )
+
+    assert attempts["count"] == 1, "synthesize_reply must be attempted exactly once (NO_RETRY)"
+    assert result["status"] == "error"
+    assert len(error_log) == 1, "error-comment activity must fire exactly once"
+    assert error_log[0]["agent_id"] == "raphael"
+    assert "core chat loop failed after tools already ran" in error_log[0]["reason"]
 
 
 @pytest.mark.asyncio
