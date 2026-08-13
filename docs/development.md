@@ -482,6 +482,61 @@ Completion is detected by **process exit**, not by the `STATUS:` footer
 vocabulary of alert-RCA / Jira-scoping verbs a general run has no reason to
 emit.
 
+### What a run gets in its workspace
+
+A **claude-engine** run is not a bare CLI session — the connector mounts two
+things into it before launch. Both are best-effort: neither can fail a launch,
+and a run that gets neither is degraded, not broken.
+
+**SKILL.md runbooks.** `config/skills/*/SKILL.md` in this repo are copied into
+`<worktree>/.claude/skills` as part of the worktree-creation command. The source
+is AEGIS's own checkout on the coding host — `coding.self_repo_path` (or
+`AEGIS_SELF_REPO_PATH`), resolved against `repo_base`, which
+`WorkspaceRepoSyncFlow` keeps current, so editing a skill and merging it is
+enough to change what runs see. With `self_repo_path` unset, or the directory
+missing on the host, the copy fragment is skipped (`[ -d … ] && … || true`) and
+the launch proceeds. The copy happens only when the per-run worktree was
+actually created: the shared clone is long-lived, and seeding `.claude/skills`
+into it would leave untracked files behind forever.
+
+**AEGIS's own tools over MCP.** The run mounts `POST /api/mcp-server/{agent_id}`
+(PR #284) as an MCP server named `aegis`, so it can read the GTD projection,
+capture tasks, search knowledge and query infra with the *same* tools the
+dispatching agent has in chat — its `metadata.tool_set`, no wider. The gate is a
+chain, and every link must be open:
+
+| Link | Where | If missing |
+|---|---|---|
+| `mcp_server_enabled` | `AEGIS_MCP_SERVER_ENABLED` | endpoint 403s; the run mounts a server that refuses everything |
+| `mcp_server_external_url` | `AEGIS_MCP_SERVER_EXTERNAL_URL`, or infra `coding.mcp_server_url` (DB wins) | no config written, run launches toolless |
+| `api_key` | `AEGIS_API_KEY` | no config written + a `mcp_mount_skipped` WARNING |
+| engine == `claude` | routing / `engine_override` | kimi runs never mount (see below) |
+| `agent_id` | `AgentRunInput.agent_id`, threaded through `launch_agent_run` | no per-agent endpoint to point at |
+
+The URL must be reachable **from the coding host** — an internal address like
+`http://10.0.0.5:8080`, not the browser-facing hostname, which is typically
+behind an authenticating proxy a headless CLI cannot traverse.
+
+**Security posture.** The mounted key is full API access to AEGIS, so:
+
+- It is written by piping the config through the **SSH channel's stdin**, never
+  as a command argument. argv is world-readable via `ps` on a shared coding host
+  and lands in shell audit logs; a heredoc would be equivalent but leaves the
+  content in the command string too. The content is never logged — only
+  `mcp_config_written agent_id=… path=…`.
+- The file lives at `$HOME/.aegis/mcp-<agent_id>.json`, written under
+  `umask 077` (0600, in a 0700 directory) and deliberately **outside the run's
+  worktree**, so the agent it authenticates cannot commit or push its own
+  credential.
+- The launch adds `--strict-mcp-config`, which makes that file the *only* server
+  list. Without it, a `.mcp.json` checked into the target repo could add servers
+  of its own to an unattended, full-auto run.
+
+**Kimi runs get neither (v1).** The kimi CLI has no `--mcp-config` /
+`--strict-mcp-config` pair and no skills convention, so a kimi run is a plain
+CLI session exactly as before. Force `engine: "claude"` on a dispatch that needs
+AEGIS's tools.
+
 ### Provisioning the scratch workspace (once)
 
 `start_kimi_run` never JIT-clones — a missing checkout is a deliberate hard
