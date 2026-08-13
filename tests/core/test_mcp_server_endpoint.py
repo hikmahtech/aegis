@@ -28,11 +28,22 @@ UNKNOWN_AGENT = "zzb9-nobody"
 PATH = f"/api/mcp-server/{AGENT}"
 AUTH = {"X-API-Key": "test-key"}
 
-# `call_mcp_tool` is granted in the DB on purpose: the endpoint must strip it.
-TOOL_SET = ["whats_next", "capture_to_inbox", "call_mcp_tool"]
+# Every `_UNSERVED_TOOLS` member is granted in the DB on purpose: the endpoint
+# must strip all of them. `call_mcp_tool` would re-enter AEGIS's MCP client; the
+# other three each launch another CLI run, which mounts this same server again.
+TOOL_SET = [
+    "whats_next",
+    "capture_to_inbox",
+    "call_mcp_tool",
+    "dispatch_agent_run",
+    "aegis_self_diagnose",
+    "investigate_resource",
+]
 
 
-def _settings(*, enabled: bool = True) -> Settings:
+def _settings(
+    *, enabled: bool = True, auth_disabled: bool = False, allow_unauthenticated: bool = False
+) -> Settings:
     return Settings(
         database_url="postgresql://test:test@localhost/test",
         litellm_url="https://litellm.test/v1",
@@ -43,6 +54,8 @@ def _settings(*, enabled: bool = True) -> Settings:
         n8n_webhook_secret="test-secret",
         api_key="test-key",
         mcp_server_enabled=enabled,
+        auth_disabled=auth_disabled,
+        mcp_server_allow_unauthenticated=allow_unauthenticated,
     )
 
 
@@ -98,6 +111,48 @@ async def test_disabled_setting_refuses_and_says_how_to_enable(db_pool, agent_ro
     detail = resp.json()["detail"]
     assert "AEGIS_MCP_SERVER_ENABLED" in detail
     assert "disabled" in detail
+
+
+async def test_auth_disabled_refuses_to_serve_unauthenticated_tools(db_pool, agent_row):
+    """`auth_disabled` + this endpoint = every agent's tools with no credential.
+
+    `verify_auth` returns True unconditionally under AEGIS_AUTH_DISABLED (the
+    documented posture for a proxy-fronted deployment), but the URL a run mounts
+    is a LAN/overlay address that bypasses that proxy by design. The refusal has
+    to name the way out, or an operator's only option is to guess.
+    """
+    app = _app(_settings(auth_disabled=True), db_pool)
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as c:
+        resp = await _rpc(c, "tools/list")
+
+    assert resp.status_code == 403, resp.text
+    detail = resp.json()["detail"]
+    assert "AEGIS_AUTH_DISABLED" in detail
+    assert "AEGIS_MCP_SERVER_ALLOW_UNAUTHENTICATED" in detail
+
+
+async def test_allow_unauthenticated_flag_serves_the_tools(db_pool, agent_row):
+    """The escape hatch really is an escape hatch — and it is the ONLY thing
+    that changed between this test and the one above."""
+    app = _app(_settings(auth_disabled=True, allow_unauthenticated=True), db_pool)
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as c:
+        # No credentials at all: auth_disabled is what makes this reach the route.
+        resp = await _rpc(c, "tools/list", headers={})
+
+    assert resp.status_code == 200, resp.text
+    assert "whats_next" in [t["name"] for t in resp.json()["result"]["tools"]]
+
+
+async def test_disabled_server_still_403s_even_with_the_allow_flag(db_pool, agent_row):
+    """The unauthenticated escape hatch does not switch the server ON."""
+    app = _app(_settings(enabled=False, auth_disabled=True, allow_unauthenticated=True), db_pool)
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as c:
+        resp = await _rpc(c, "tools/list", headers={})
+    assert resp.status_code == 403, resp.text
+    assert "AEGIS_MCP_SERVER_ENABLED" in resp.json()["detail"]
 
 
 async def test_auth_is_required(client):
@@ -179,7 +234,7 @@ async def test_get_is_405_and_delete_is_204(client):
 # -- tools/list ------------------------------------------------------------
 
 
-async def test_tools_list_is_the_agents_set_minus_call_mcp_tool(client):
+async def test_tools_list_is_the_agents_set_minus_the_unserved_tools(client):
     resp = await _rpc(client, "tools/list")
     assert resp.status_code == 200, resp.text
     # `approve_tool_use` is the permission gate, not a chat tool the agent was
@@ -191,11 +246,11 @@ async def test_tools_list_is_the_agents_set_minus_call_mcp_tool(client):
         "capture_to_inbox",
         "whats_next",
     ]
-    # Proves the filter did the work: the DB really granted call_mcp_tool.
-    assert "call_mcp_tool" in TOOL_SET
+    # Proves the filter did the work: the DB really granted every excluded tool.
+    assert set(mcp_server_mod._UNSERVED_TOOLS) <= set(TOOL_SET)
 
     by_name = {t["name"] for t in tools}
-    assert "call_mcp_tool" not in by_name
+    assert by_name.isdisjoint(mcp_server_mod._UNSERVED_TOOLS)
 
     schemas = {
         spec["function"]["name"]: spec["function"]["parameters"]
@@ -281,15 +336,45 @@ async def test_tools_call_for_an_ungranted_tool_is_invalid_params(client):
     assert "result" not in body
 
 
-async def test_call_mcp_tool_cannot_be_invoked_even_though_it_is_granted(client):
-    """Filtered from tools/list AND refused on call — no MCP-client re-entry."""
-    resp = await _rpc(
-        client,
-        "tools/call",
-        params={"name": "call_mcp_tool", "arguments": {"server": "x", "tool": "y"}},
-    )
-    assert resp.status_code == 200, resp.text
-    assert resp.json()["error"]["code"] == -32602
+@pytest.mark.parametrize("name", sorted(mcp_server_mod._UNSERVED_TOOLS))
+async def test_unserved_tools_cannot_be_invoked_even_though_they_are_granted(client, name):
+    """Filtered from tools/list AND refused on call.
+
+    Both halves matter and they are one derivation (`_served_tools`), so this
+    parametrized pair is what proves the derivation is shared: a filter applied
+    only at listing time would leave every one of these callable by name.
+
+    `dispatch_agent_run` / `aegis_self_diagnose` / `investigate_resource` each
+    START ANOTHER CLI RUN, and a run mounts this endpoint with the same tool
+    set — serving them is unbounded recursion with no depth counter anywhere.
+    `call_mcp_tool` re-enters AEGIS's MCP *client* (confused deputy).
+    """
+    assert name in TOOL_SET, "the DB grant is what makes this test non-vacuous"
+
+    listed = await _rpc(client, "tools/list")
+    assert name not in [t["name"] for t in listed.json()["result"]["tools"]]
+
+    called = await _rpc(client, "tools/call", params={"name": name, "arguments": {}})
+    assert called.status_code == 200, called.text
+    body = called.json()
+    assert body["error"]["code"] == -32602
+    assert "result" not in body  # nothing ran
+
+
+async def test_the_unserved_set_is_exactly_these_four(client):
+    """A closed list, asserted by name: adding a run-spawning tool to an agent's
+    `tool_set` without adding it here silently re-opens the recursion door, and
+    the only way to notice is a test that pins the membership."""
+    assert set(mcp_server_mod._UNSERVED_TOOLS) == {
+        "call_mcp_tool",
+        "dispatch_agent_run",
+        "aegis_self_diagnose",
+        "investigate_resource",
+    }
+    # Every one of them is a real chat tool with a real executor — a typo here
+    # would exclude nothing at all.
+    for name in mcp_server_mod._UNSERVED_TOOLS:
+        assert name in chat_mod.TOOL_EXECUTORS
 
 
 async def test_raising_executor_becomes_an_is_error_result_not_a_500(client, monkeypatch):
@@ -551,8 +636,14 @@ async def test_only_an_explicit_approve_value_allows(gated_client, value):
 
 
 async def test_approval_gate_needs_no_tool_set_grant(db_pool):
-    """An agent with an EMPTY tool_set still gets the gate — otherwise a
-    locked-down agent could never run gated at all."""
+    """No `tool_set` grant can produce the gate, so an agent that never asked
+    for it still gets it — otherwise a locked-down agent could never run gated.
+
+    The agent below stores `tool_set: []`, which `_get_agent_tools` reads as
+    *unconfigured* (falling back to `_FALLBACK_TOOL_SET`), not as "no tools" —
+    so this is "the gate rides along regardless of the set", not "the gate
+    survives an empty set".
+    """
     bare = "zzb9-bare-agent"
     await db_pool.execute("DELETE FROM agents WHERE id = $1", bare)
     await db_pool.execute(

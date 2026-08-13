@@ -412,6 +412,44 @@ async def test_launch_defaults_to_ungated():
     assert rec.calls[0]["gated"] is False
 
 
+def test_the_fakes_signatures_really_do_match_the_real_connector():
+    """The fakes above CLAIM to mirror `RemoteScriptConnector`, and until this
+    test nothing checked it — a renamed or reordered parameter on the real
+    class left every test in this file passing against a fake that no longer
+    resembles it, which is the whole failure mode fakes are supposed to avoid.
+
+    `inspect.signature(...).bind(...)` is the check: it accepts only calls the
+    REAL method would accept, with the same names, and the fakes are exercised
+    with the same keyword sets the activity uses.
+    """
+    import inspect
+
+    from aegis.connectors.remote_script import RemoteScriptConnector
+
+    real_launch = inspect.signature(RemoteScriptConnector.start_kimi_run)
+    fake_launch = inspect.signature(_LaunchRecorder.start_kimi_run)
+    launch_kwargs = {
+        "repo": "scratch",
+        "prompt": "p",
+        "kimi_binary": "/bin/kimi",
+        "engine_override": "claude",
+        "agent_id": "sebas",
+        "gated": True,
+    }
+    real_launch.bind(None, **launch_kwargs)
+    fake_launch.bind(None, **launch_kwargs)
+    # Same parameter NAMES in the same order — the activity passes keywords, so
+    # a reorder is survivable, but a rename silently drops to a default.
+    assert list(fake_launch.parameters) == list(real_launch.parameters)
+
+    for name in ("fetch_kimi_run_output", "kimi_run_alive"):
+        real = inspect.signature(getattr(RemoteScriptConnector, name))
+        fake = inspect.signature(getattr(_FakeRemoteScript, name))
+        assert list(fake.parameters) == list(real.parameters), name
+        real.bind(None, output_file="/tmp/run.jsonl", host="node-a")
+        fake.bind(None, output_file="/tmp/run.jsonl", host="node-a")
+
+
 @pytest.mark.asyncio
 async def test_gated_input_reaches_the_launch_activity():
     """`AgentRunInput.gated` → `launch_agent_run(..., gated)`. The flow is the

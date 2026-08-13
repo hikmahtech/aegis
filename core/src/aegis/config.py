@@ -271,6 +271,13 @@ class Settings(BaseSettings):
     # POST /api/mcp-server/{agent_id}. Off by default, same default-deny posture
     # as the client above — this door lets an outside harness run AEGIS tools.
     mcp_server_enabled: bool = False
+    # Escape hatch for `mcp_server_enabled` + `auth_disabled` together. That
+    # pair serves every agent's tools with NO credential: auth_disabled makes
+    # verify_auth a no-op (correct only behind an authenticating proxy), while
+    # this endpoint is mounted at a LAN/overlay URL that deliberately bypasses
+    # that proxy so a headless CLI can reach it. The endpoint 403s on the
+    # combination unless this is explicitly true.
+    mcp_server_allow_unauthenticated: bool = False
     # Core's base URL **as reachable from the coding host** (e.g.
     # http://10.0.0.5:8080) — NOT the browser-facing one, which is typically
     # behind an authenticating proxy the CLI can't traverse. Used only to mount

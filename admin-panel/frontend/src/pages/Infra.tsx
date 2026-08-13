@@ -40,6 +40,12 @@ interface CodingFormData {
   kimi_host_slug: string;
   self_repo_path: string;
   runbooks_dir: string;
+  // Core's base URL as reachable FROM this coding host, where a claude run
+  // mounts AEGIS's own MCP tool server. Must round-trip through all three of
+  // codingFromRow / codingToPayload / the form: validate_coding replaces the
+  // whole `coding` object, so a field this file does not carry is erased by
+  // any unrelated save on this page.
+  mcp_server_url: string;
 }
 
 const emptyCoding: CodingFormData = {
@@ -56,6 +62,7 @@ const emptyCoding: CodingFormData = {
   kimi_host_slug: '',
   self_repo_path: '',
   runbooks_dir: '',
+  mcp_server_url: '',
 };
 
 function codingFromRow(coding: any): CodingFormData {
@@ -87,6 +94,7 @@ function codingFromRow(coding: any): CodingFormData {
     kimi_host_slug: coding.kimi_host_slug || '',
     self_repo_path: coding.self_repo_path || '',
     runbooks_dir: coding.runbooks_dir || '',
+    mcp_server_url: coding.mcp_server_url || '',
   };
 }
 
@@ -115,6 +123,7 @@ function codingToPayload(c: CodingFormData): Record<string, any> {
     kimi_host_slug: c.kimi_host_slug.trim() || null,
     self_repo_path: c.self_repo_path.trim(),
     runbooks_dir: c.runbooks_dir.trim(),
+    mcp_server_url: c.mcp_server_url.trim(),
   };
 }
 
@@ -123,7 +132,7 @@ function codingTouched(c: CodingFormData): boolean {
     c.enabled ||
     !!(c.repo_base.trim() || c.claude_binary.trim() || c.kimi_binary.trim() ||
        c.kimi_host_slug.trim() || c.self_repo_path.trim() || c.runbooks_dir.trim() ||
-       c.default_account.trim()) ||
+       c.mcp_server_url.trim() || c.default_account.trim()) ||
     c.accounts.length > 0 ||
     c.routes.length > 0 ||
     c.default_engine !== 'kimi' ||
@@ -1002,6 +1011,13 @@ export default function Infra() {
                         <div className="form-group">
                           <label>Runbooks dir (worker-local)</label>
                           <input value={form.coding.runbooks_dir} onChange={e => setCoding({ runbooks_dir: e.target.value })} placeholder="/app/runbooks" className="mono" />
+                        </div>
+                      </div>
+
+                      <div className="form-row">
+                        <div className="form-group">
+                          <label>MCP server URL (coding-host-reachable)</label>
+                          <input value={form.coding.mcp_server_url} onChange={e => setCoding({ mcp_server_url: e.target.value })} placeholder="http://10.0.0.5:8080" className="mono" />
                         </div>
                       </div>
                     </div>

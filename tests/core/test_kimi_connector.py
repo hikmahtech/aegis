@@ -1492,3 +1492,154 @@ async def test_ungated_claude_run_is_unchanged_by_the_gate(conn_mount):
     assert "--dangerously-skip-permissions" in launch
     assert "--permission-prompt-tool" not in launch
     assert "MCP_TOOL_TIMEOUT" not in launch
+
+
+# ── the nohup fallback has to actually execute what it is given ────────────
+
+
+@pytest.mark.asyncio
+async def test_nohup_fallback_wraps_env_assignments_in_env(conn_claude):
+    """`nohup VAR=… binary` NEVER RUNS: nohup execs its first argument as a
+    PROGRAM, so it looks for a binary literally named "VAR=value" and dies with
+    "nohup: failed to run command". The claude path carries CLAUDE_CONFIG_DIR
+    whenever an account is routed, and a gated launch adds MCP_TOOL_TIMEOUT on
+    top — so those runs died at launch while still reporting `status: running`
+    (the shell's `( … &)` exits 0 either way).
+
+    Falsifiable: drop the `env` and both assertions below invert.
+    """
+    live = "\n".join(f"@{i}:claude-bcp-{i:04d}:0" for i in range(10))
+    procs = _make_proc_sequence([0, 0, 0, 0, 0, 0])
+    procs[4].communicate = AsyncMock(return_value=(live.encode(), b""))
+    with patch("asyncio.create_subprocess_exec", side_effect=procs) as mock_exec:
+        result = await conn_claude.start_kimi_run(
+            repo="bcp",
+            prompt="investigate",
+            kimi_binary="/home/user/.local/bin/kimi",
+            github_repo="Acme/bcp",
+            claude_config_dir="/home/user/.config/aegis",
+        )
+    assert result["status"] == "running"
+    assert result["in_tmux"] is False
+    launch = " ".join(str(a) for a in mock_exec.call_args_list[-1].args)
+
+    assert "nohup env CLAUDE_CONFIG_DIR=/home/user/.config/aegis" in launch
+    assert "nohup CLAUDE_CONFIG_DIR" not in launch  # the broken form
+    # The binary still gets its flags, and the redirect is still the shell's.
+    assert "/home/user/.local/bin/claude --print" in launch
+    assert "> /tmp/aegis-kimi-run-" in launch
+
+
+@pytest.mark.asyncio
+async def test_nohup_fallback_uses_env_even_with_no_assignments(conn):
+    """`env <binary> …` is just `<binary> …`, so the wrapper is unconditional —
+    one launch composition instead of two, and no prefix-detection to get
+    wrong."""
+    procs = _make_proc_sequence([0, 0, 0, 0, 0])
+    with patch("asyncio.create_subprocess_exec", side_effect=procs) as mock_exec:
+        await conn.start_kimi_run(
+            repo="youruser/bcp", prompt="x", kimi_binary="/usr/local/bin/kimi"
+        )
+    launch = " ".join(str(a) for a in mock_exec.call_args_list[-1].args)
+    assert "nohup env /usr/local/bin/kimi" in launch
+
+
+# ── the mount key: env OR the admin-generated DB key ───────────────────────
+
+
+class _KeyRowPool:
+    """Minimal asyncpg-pool stand-in serving one encrypted `settings` row."""
+
+    def __init__(self, row):
+        self._row = row
+        self.queries: list[str] = []
+
+    async def fetchrow(self, query: str, *args):
+        self.queries.append(query)
+        return self._row
+
+
+@pytest.mark.asyncio
+async def test_mount_uses_the_admin_generated_db_key_when_env_is_unset():
+    """`verify_auth` accepts the DB key as a first-class credential, and the
+    admin UI's Generate button is the only key most deployments ever mint. An
+    env-only mount therefore logs `mcp_mount_skipped reason=api_key_unset` on a
+    correctly configured instance and every claude run is silently toolless.
+    The key must still never reach argv.
+    """
+    from aegis.crypto import encrypt_secret
+    from aegis.services.api_key import invalidate_api_key_cache
+
+    secret_key = "unit-test-secret-key"
+    pool = _KeyRowPool({"value": {"key_enc": encrypt_secret("DB-MINTED-KEY", secret_key)}})
+    conn = RemoteScriptConnector(
+        host="node-a",
+        user="user",
+        key_file="/tmp/fake_key",
+        repo_base="/home/user/Workspace",
+        claude_orgs="acme",
+        claude_binary="/bin/claude",
+        mcp_server_url="http://10.0.0.5:8080",
+        api_key="",  # nothing in the env
+        db_pool=pool,
+        secret_key=secret_key,
+    )
+    invalidate_api_key_cache()
+    try:
+        procs = _claude_run_procs()
+        with (
+            patch.object(conn, "_refresh_config", AsyncMock(return_value=None)),
+            patch("asyncio.create_subprocess_exec", side_effect=procs) as mock_exec,
+            structlog.testing.capture_logs() as logs,
+        ):
+            result = await conn.start_kimi_run(
+                repo="bcp", prompt="x", kimi_binary="/k", github_repo="Acme/bcp", agent_id="sebas"
+            )
+    finally:
+        invalidate_api_key_cache()
+
+    assert result["status"] == "running"
+    assert not [log for log in logs if log["event"] == "mcp_mount_skipped"]
+
+    all_cmds = [" ".join(str(a) for a in c.args) for c in mock_exec.call_args_list]
+    assert all("DB-MINTED-KEY" not in c for c in all_cmds), "API key leaked into argv"
+    assert "DB-MINTED-KEY" not in json.dumps(logs)
+
+    payload = procs[4].communicate.await_args.kwargs["input"]
+    cfg = json.loads(payload.decode())
+    assert cfg["mcpServers"]["aegis"]["headers"]["X-API-Key"] == "DB-MINTED-KEY"
+    assert "--mcp-config" in all_cmds[-1]
+
+
+@pytest.mark.asyncio
+async def test_env_key_wins_and_never_queries_the_db(conn_mount):
+    """Falsifiability control: the DB read is a FALLBACK. A connector holding an
+    env key must not touch `settings` at all — this runs on every launch."""
+    pool = _KeyRowPool({"value": {"key_enc": "unused"}})
+    conn_mount._db_pool = pool
+    conn_mount._secret_key = "unit-test-secret-key"
+    with (
+        patch.object(conn_mount, "_refresh_config", AsyncMock(return_value=None)),
+        patch("asyncio.create_subprocess_exec", side_effect=_claude_run_procs()),
+    ):
+        await conn_mount.start_kimi_run(
+            repo="bcp", prompt="x", kimi_binary="/k", github_repo="Acme/bcp", agent_id="sebas"
+        )
+    assert pool.queries == []
+
+
+@pytest.mark.asyncio
+async def test_mcp_config_write_is_atomic(conn_mount):
+    """Two launches for the same agent write the SAME path, so the content goes
+    to a temp file and is `mv`d into place (atomic within one filesystem). A
+    plain `cat > path` truncates the file the other run's CLI is opening."""
+    procs = _claude_run_procs()
+    with patch("asyncio.create_subprocess_exec", side_effect=procs) as mock_exec:
+        await conn_mount.start_kimi_run(
+            repo="bcp", prompt="x", kimi_binary="/k", github_repo="Acme/bcp", agent_id="sebas"
+        )
+    all_cmds = [" ".join(str(a) for a in c.args) for c in mock_exec.call_args_list]
+    write_cmd = next(c for c in all_cmds if "mcp-sebas.json" in c and "cat >" in c)
+
+    assert "cat > $HOME/.aegis/mcp-sebas.json.$$.tmp" in write_cmd
+    assert "mv $HOME/.aegis/mcp-sebas.json.$$.tmp $HOME/.aegis/mcp-sebas.json" in write_cmd

@@ -29,10 +29,13 @@ class ChatActivities:
     ) -> dict:
         """Call core /api/chat/agent-reply and return its body verbatim.
 
-        Raises httpx.HTTPStatusError on 5xx — STANDARD retry policy in
-        AgentChatReplyFlow drives the retry behaviour. 200 OK with an
-        ``error`` body field signals a PERMANENT failure (agent-not-found
-        or LLM refusal) and is NOT retried — caller composes apology.
+        Raises httpx.HTTPStatusError on 5xx. AgentChatReplyFlow runs this on
+        NO_RETRY since PR #283 — the call is not idempotent (the tool loop
+        behind it can complete a task, open a PR, capture to the inbox), so a
+        retry duplicates real-world actions rather than just LLM spend, and the
+        flow degrades visibly instead. 200 OK with an ``error`` body field
+        signals a PERMANENT failure (agent-not-found or LLM refusal) —
+        caller composes apology.
 
         ``task_id`` may be None on the DM (taskless) path — surface tag in
         user_metadata switches from `todoist_comment` to `chat_dm` on

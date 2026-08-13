@@ -955,9 +955,17 @@ class RemoteScriptConnector:
         agent_flags = _agent_launch_flags(
             engine, binary, work_path, prompt_file, config_dir, mcp_config, gated
         )
+        # `nohup env …`, never `nohup VAR=… …`: nohup execs its first argument
+        # as a PROGRAM, so an environment-assignment prefix (CLAUDE_CONFIG_DIR,
+        # MCP_TOOL_TIMEOUT) makes it look for a binary literally named
+        # "VAR=value" and die with "nohup: failed to run command". `env` is the
+        # POSIX tool whose whole job is turning those assignments back into
+        # environment. Harmless when there are none — `env <binary> …` is just
+        # `<binary> …`. The tmux path needs no such wrapper: tmux runs its
+        # command through a shell, which understands the prefix natively.
         nohup_cmd = (
             f"cd {shlex.quote(work_path)} && "
-            f"(nohup {agent_flags} > {shlex.quote(output_file)} 2>&1 &)"
+            f"(nohup env {agent_flags} > {shlex.quote(output_file)} 2>&1 &)"
         )
 
         launched_in_tmux = False
@@ -1035,6 +1043,35 @@ class RemoteScriptConnector:
             path = f"{self._repo_base}/{path}"
         return f"{path}/config/skills"
 
+    async def _resolve_mount_api_key(self) -> str:
+        """The key a mounted run authenticates with — constructor first, DB next.
+
+        `verify_auth` accepts BOTH the env `AEGIS_API_KEY` (this connector's
+        constructor value) and the admin-generated key stored encrypted in the
+        `settings` table, and the admin UI's *Generate* button is the only one
+        of the two a deployment gets by clicking. A mount that consulted the
+        env var alone would report `mcp_mount_skipped reason=api_key_unset` on
+        a perfectly well-configured instance, so the DB key is resolved here
+        when the constructor value is empty.
+
+        Never raises: `resolve_api_key` swallows its own read/decrypt failures
+        and returns "", which the caller degrades on.
+        """
+        if self._api_key:
+            return self._api_key
+        if self._db_pool is None or not self._secret_key:
+            return ""
+        # Imported inside the method: `services/api_key` is core-side and this
+        # connector is constructed by the worker too — a module-level import
+        # would widen the worker's import graph for a call it may never make.
+        from types import SimpleNamespace
+
+        from aegis.services.api_key import resolve_api_key
+
+        # `resolve_api_key` reads exactly one attribute off `settings`
+        # (`secret_key`, to decrypt), and the connector already holds it.
+        return await resolve_api_key(self._db_pool, SimpleNamespace(secret_key=self._secret_key))
+
     async def _mount_mcp_config(self, host: str, engine: str, agent_id: str) -> str:
         """Write the run's MCP client config on `host`; return its path.
 
@@ -1043,6 +1080,10 @@ class RemoteScriptConnector:
         that never set `mcp_server_external_url` is opting out. A *failed*
         write is also "" — the run launches without its tools rather than not
         at all.
+
+        The key comes from `_resolve_mount_api_key` (env, then the
+        admin-generated DB key), so a deployment whose only credential was
+        minted in the UI still mounts.
 
         The API key is piped through the SSH channel's STDIN and never appears
         in a command line: argv is world-readable via `ps` on the coding host
@@ -1053,17 +1094,24 @@ class RemoteScriptConnector:
         """
         if engine != "claude" or not agent_id or not self._mcp_server_url:
             return ""
-        if not self._api_key:
+        api_key = await self._resolve_mount_api_key()
+        if not api_key:
             # Visible degradation: the URL was configured, so somebody meant to
             # mount this and a silent skip would look like a broken feature.
             logger.warning("mcp_mount_skipped", agent_id=agent_id, reason="api_key_unset")
             return ""
         path = _mcp_config_path(agent_id)
+        # Written to a temp file and `mv`d into place. `mv` within one
+        # filesystem is atomic, so a second launch for the same agent cannot be
+        # read half-written by the first run's CLI — a plain `cat > path`
+        # truncates the file the other process is about to open. `$$` (the
+        # remote shell's pid) keeps two concurrent temps apart.
         wrote = await self._exec(
             host,
-            f"umask 077 && mkdir -p $HOME/.aegis && cat > {path}",
+            f"umask 077 && mkdir -p $HOME/.aegis && cat > {path}.$$.tmp "
+            f"&& mv {path}.$$.tmp {path}",
             timeout=15,
-            stdin=_mcp_run_config(agent_id, self._mcp_server_url, self._api_key).encode(),
+            stdin=_mcp_run_config(agent_id, self._mcp_server_url, api_key).encode(),
         )
         if wrote["exit_code"] != 0:
             logger.warning(

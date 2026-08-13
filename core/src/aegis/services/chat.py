@@ -1498,6 +1498,12 @@ CHAT_TOOLS = [
                         "type": "boolean",
                         "description": "Require human approval for mutating actions during the run; approval cards land in your channel. Use it when the run can change things (write files, run commands, open PRs) or will read untrusted content. Requires the claude engine.",
                     },
+                    "timeout_minutes": {
+                        "type": "integer",
+                        "minimum": 5,
+                        "maximum": 240,
+                        "description": "Optional watch window in minutes (5-240). Omit for the default (30, or 120 for a gated run, which spends most of its time waiting for approvals). A timeout never kills the run — it only stops watching it.",
+                    },
                 },
                 "required": ["prompt"],
             },
@@ -2030,14 +2036,46 @@ async def _exec_trigger_workflow(pool: asyncpg.Pool, args: dict, ctx: ToolContex
     return json.dumps(result, default=str)
 
 
+# Watch-window bounds for `dispatch_agent_run`, mirroring its tool schema.
+# 30 matches `AgentRunInput.timeout_minutes`'s own default. A GATED run is
+# different in kind: it blocks on a human for up to 9 minutes per approval
+# card, so 3-4 questions exhaust a 30-minute window while the CLI is still
+# raising them — the flow stops watching a run that is working fine.
+_RUN_TIMEOUT_MIN_MINUTES = 5
+_RUN_TIMEOUT_MAX_MINUTES = 240
+_UNGATED_TIMEOUT_MINUTES = 30
+_GATED_TIMEOUT_MINUTES = 120
+
+
+def _run_timeout_minutes(raw: Any, gated: bool) -> int:
+    """The caller's `timeout_minutes`, clamped to the schema's bounds.
+
+    Unparseable or absent ⇒ the default for this kind of run. Clamped rather
+    than rejected: the schema already refuses out-of-range values on the
+    validated paths, and a dispatch is not worth failing over a stray number.
+    """
+    default = _GATED_TIMEOUT_MINUTES if gated else _UNGATED_TIMEOUT_MINUTES
+    try:
+        minutes = int(raw)
+    except (TypeError, ValueError):
+        return default
+    return max(_RUN_TIMEOUT_MIN_MINUTES, min(_RUN_TIMEOUT_MAX_MINUTES, minutes))
+
+
 async def _exec_dispatch_agent_run(pool: asyncpg.Pool, args: dict, ctx: ToolContext) -> str:
     """Spawn AgentRunFlow — the heavy lane. Fire-and-forget.
 
     Core never imports worker code, so the flow is started by NAME with a plain
     dict arg (Temporal's converter fills the AgentRunInput dataclass), exactly
     like the agent-reply trigger route and `_exec_investigate_resource`. The
-    flow delivers the transcript tail to this agent's channel when the run
-    lands; nothing is awaited here.
+    converter IGNORES an unknown key, so every key below must match a field on
+    `AgentRunInput` — a typo silently takes that field's default (a mistyped
+    `gated` is an ungated run reporting success). `tests/worker/
+    test_dataclass_payload_seams.py` asserts the two sides still agree.
+
+    `timeout_minutes` is the watch window, not a kill switch. A gated run
+    spends most of it waiting on humans (each card holds up to 9 min), so an
+    unset value defaults to `_GATED_TIMEOUT_MINUTES` rather than the flow's 30.
     """
     if not ctx.temporal_client:
         return "Can't dispatch: Temporal client not available."
@@ -2048,6 +2086,7 @@ async def _exec_dispatch_agent_run(pool: asyncpg.Pool, args: dict, ctx: ToolCont
     if engine and engine not in ("claude", "kimi"):
         return f"Can't dispatch: unknown engine '{engine}' — use 'claude' or 'kimi', or omit it."
     agent_id = ctx.agent_id or "sebas"
+    gated = bool(args.get("gated"))
     workflow_id = f"agent-run-{uuid4().hex[:8]}"
     try:
         await ctx.temporal_client.start_workflow(
@@ -2058,7 +2097,8 @@ async def _exec_dispatch_agent_run(pool: asyncpg.Pool, args: dict, ctx: ToolCont
                 "repo": (args.get("repo") or "").strip() or None,
                 "engine": engine,
                 "purpose": (args.get("purpose") or "").strip(),
-                "gated": bool(args.get("gated")),
+                "gated": gated,
+                "timeout_minutes": _run_timeout_minutes(args.get("timeout_minutes"), gated),
             },
             id=workflow_id,
             task_queue="aegis-main",
