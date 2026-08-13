@@ -285,6 +285,13 @@ class Settings(BaseSettings):
     # empty ⇒ runs launch with no AEGIS tools. An infra `coding.mcp_server_url`
     # overrides it. The run authenticates with `api_key`, so both must be set.
     mcp_server_external_url: str = ""
+    # How long the GATED endpoint (`/api/mcp-server/{agent_id}/gated`) holds a
+    # mutating tool call open waiting for the operator before telling the model
+    # to retry. Deliberately well under the ~60s hard cap the claude CLI was
+    # measured to impose on an MCP tool call (2.1.231 — MCP_TOOL_TIMEOUT does
+    # not lift it), because the gate's contract is "retry and it executes",
+    # which only works if OUR answer comes back before the CLI gives up.
+    mcp_gate_wait_seconds: int = 40
 
     # Worker -> Core API
     core_api_url: str = "http://localhost:8080"

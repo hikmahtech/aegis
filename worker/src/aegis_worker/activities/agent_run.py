@@ -29,11 +29,16 @@ from temporalio import activity
 # A run with no repo of its own gets this fixed checkout. `start_kimi_run`
 # never JIT-clones — a missing directory is a deliberate hard failure — so the
 # operator provisions it once (see docs/development.md):
-#   mkdir -p <repo_base>/scratch && cd <repo_base>/scratch &&
+#   mkdir -p <repo_base>/aegis-scratch && cd <repo_base>/aegis-scratch &&
 #   git init && git commit --allow-empty -m init
 # The empty commit matters: the launch adds a detached worktree, which needs a
 # HEAD to detach from.
-SCRATCH_REPO = "scratch"
+#
+# The name is AEGIS-prefixed on purpose (#292): `repo_base` is the operator's
+# real workspace root, where a plain `scratch/` is very likely to already exist
+# as a NON-git personal experiments folder — provisioning THAT as the run
+# workspace would point unattended CLI sessions at real personal data.
+SCRATCH_REPO = "aegis-scratch"
 
 # The CLI writes stream-json, so escapes are rare — but a plain-text banner
 # (or a non-stream-json fallback mode) tees straight through, and the tail we

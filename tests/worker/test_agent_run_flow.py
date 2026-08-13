@@ -9,6 +9,7 @@ deadline that reports where the still-running process is instead of killing it.
 
 from __future__ import annotations
 
+import asyncio
 import uuid
 
 import pytest
@@ -22,14 +23,14 @@ from temporalio.worker import Worker
 def _launched(**over) -> dict:
     base = {
         "status": "running",
-        "repo": "scratch",
+        "repo": "aegis-scratch",
         "run_id": "ab12cd34",
         "output_file": "/tmp/aegis-kimi-run-ab12cd34.jsonl",
         "host": "node-a",
         "engine": "claude",
         "in_tmux": True,
         "tmux_window": "claude-scratch-ab12cd34",
-        "worktree_path": "/w/scratch-aegis-wt/ab12cd34",
+        "worktree_path": "/w/aegis-scratch-aegis-wt/ab12cd34",
     }
     base.update(over)
     return base
@@ -100,7 +101,7 @@ async def test_happy_path_delivers_output_tail():
     assert launch_calls == [
         {
             "prompt": "Audit the retry policy in bcp.",
-            "repo": "scratch",
+            "repo": "aegis-scratch",
             "engine": "",
             "purpose": "retry audit",
             "agent_id": "pandoras-actor",
@@ -179,8 +180,8 @@ async def test_missing_scratch_checkout_delivers_provision_command():
     async def launch(prompt, repo="", engine="", purpose="", agent_id="", gated=False):
         return {
             "status": "failed",
-            "error": "Repo checkout missing on node-a: /w/scratch — provision it",
-            "repo": "scratch",
+            "error": "Repo checkout missing on node-a: /w/aegis-scratch — provision it",
+            "repo": "aegis-scratch",
             "repo_base": "/w",
             "run_id": "zz99",
             "engine": "kimi",
@@ -213,13 +214,20 @@ async def test_missing_scratch_checkout_delivers_provision_command():
     assert result["status"] == "failed"
     assert len(delivered) == 1
     assert "git init" in delivered[0]
-    assert "/w/scratch" in delivered[0]
+    assert "/w/aegis-scratch" in delivered[0]
 
 
 @pytest.mark.asyncio
-async def test_timeout_reports_where_the_run_is_and_does_not_kill_it():
+async def test_timeout_fires_at_the_deadline_and_reports_where_the_run_is():
     """Deadline reached with the run still alive: report the tmux window and
-    the output file, return status timeout, and DON'T stop the process."""
+    the output file, return status timeout, and DON'T stop the process.
+
+    `timeout_minutes=5` with an upper bound on `elapsed_s` is the part that
+    matters — the old assertion was `elapsed_s >= 60` against a 1-minute
+    deadline, which cannot tell "fired on time" from "fired eventually", and a
+    prod run sailed 2h17m past a 30-minute deadline while this test stayed
+    green (#295).
+    """
     delivered: list[str] = []
     checks = {"count": 0}
 
@@ -251,7 +259,7 @@ async def test_timeout_reports_where_the_run_is_and_does_not_kill_it():
                     agent_id="sebas",
                     prompt="long job",
                     purpose="long job",
-                    timeout_minutes=1,
+                    timeout_minutes=5,
                 ),
                 id=f"arf-timeout-{uuid.uuid4().hex[:8]}",
                 task_queue=task_queue,
@@ -259,16 +267,127 @@ async def test_timeout_reports_where_the_run_is_and_does_not_kill_it():
 
     assert result["status"] == "timeout"
     assert result["run_id"] == "ab12cd34"
-    assert result["elapsed_s"] >= 60
+    # 5 simulated minutes, not "at least one minute, whenever": the deadline is
+    # a deadline. The slack is for activity execution, which is real time even
+    # under time skipping.
+    assert 300 <= result["elapsed_s"] <= 330, result["elapsed_s"]
     assert set(result) == {"status", "reason", "run_id", "engine", "host", "elapsed_s"}
-    # The run kept being polled until the deadline (not abandoned after one look).
-    assert checks["count"] >= 2
+    # The run kept being polled the whole way (not abandoned after one look).
+    assert checks["count"] >= 5
     assert len(delivered) == 1
     msg = delivered[0]
     assert "still running" in msg
     assert "kimi-scratch-ab12cd34" in msg
     assert "/tmp/aegis-kimi-run-ab12cd34.jsonl" in msg
     assert "NOT been stopped" in msg
+
+
+@pytest.mark.asyncio
+async def test_the_deadline_holds_when_the_polls_themselves_are_slow():
+    """The #295 shape: the flow's time goes INSIDE the poll, not between polls.
+
+    Prod's poll stalled and the loop only ever compared the deadline against a
+    clock sample taken *before* the activity — so the deadline check ran late,
+    against a stale number, and the run went 2h17m past a 30-minute budget.
+    Here each poll burns 10 real seconds against a 60-second deadline.
+
+    Falsifiable: sample `elapsed` once at the top of the iteration and reuse it
+    after the poll (the old code) and this reports ~70s instead of ~60s.
+    Remove the `schedule_to_close_timeout` cap as well and a poll that never
+    returns pushes it arbitrarily far.
+    """
+    delivered: list[str] = []
+
+    @activity.defn(name="launch_agent_run")
+    async def launch(prompt, repo="", engine="", purpose="", agent_id="", gated=False):
+        return _launched()
+
+    @activity.defn(name="check_agent_run")
+    async def check(output_file, host="", probe_alive=True):
+        await asyncio.sleep(10)
+        return {"status": "running", "output": "", "reason": ""}
+
+    @activity.defn(name="send_message")
+    async def send_message(agent_id, message, chat_id=0, keyboard=None):
+        delivered.append(message)
+        return {"ok": True, "message_id": 1}
+
+    async with await WorkflowEnvironment.start_time_skipping() as env:
+        task_queue = f"tq-{uuid.uuid4().hex[:8]}"
+        async with Worker(
+            env.client,
+            task_queue=task_queue,
+            workflows=[AgentRunFlow],
+            activities=[launch, check, send_message],
+        ):
+            result = await env.client.execute_workflow(
+                AgentRunFlow.run,
+                AgentRunInput(
+                    agent_id="sebas",
+                    prompt="stalling job",
+                    purpose="stalling job",
+                    timeout_minutes=1,
+                ),
+                id=f"arf-stalled-{uuid.uuid4().hex[:8]}",
+                task_queue=task_queue,
+            )
+
+    assert result["status"] == "timeout"
+    assert 60 <= result["elapsed_s"] <= 66, result["elapsed_s"]
+    assert len(delivered) == 1
+    assert "still running" in delivered[0]
+
+
+@pytest.mark.asyncio
+async def test_elapsed_s_is_wall_clock_including_the_time_spent_in_the_last_poll():
+    """`elapsed_s` must be launch → terminal state, not launch → last sample.
+
+    Prod reported `elapsed_s: 62` for a run that took 2h17m — and its ungated
+    twin reported exactly 62 too, which is the tell: 62 is two poll intervals
+    plus launch latency, i.e. the sample taken before the poll that eventually
+    answered. Here the poll that reports `finished` takes 3 seconds, so the
+    stale sample (60) and the real wall clock (63+) are distinguishable.
+
+    Falsifiable: move the `elapsed` computation back above the poll and this
+    fails at 60.
+    """
+    calls = {"count": 0}
+
+    @activity.defn(name="launch_agent_run")
+    async def launch(prompt, repo="", engine="", purpose="", agent_id="", gated=False):
+        return _launched()
+
+    @activity.defn(name="check_agent_run")
+    async def check(output_file, host="", probe_alive=True):
+        calls["count"] += 1
+        if calls["count"] < 2:
+            return {"status": "running", "output": "", "reason": ""}
+        await asyncio.sleep(3)
+        return {"status": "finished", "output": "done at last", "reason": ""}
+
+    @activity.defn(name="send_message")
+    async def send_message(agent_id, message, chat_id=0, keyboard=None):
+        return {"ok": True, "message_id": 1}
+
+    async with await WorkflowEnvironment.start_time_skipping() as env:
+        task_queue = f"tq-{uuid.uuid4().hex[:8]}"
+        async with Worker(
+            env.client,
+            task_queue=task_queue,
+            workflows=[AgentRunFlow],
+            activities=[launch, check, send_message],
+        ):
+            result = await env.client.execute_workflow(
+                AgentRunFlow.run,
+                AgentRunInput(agent_id="sebas", prompt="slow finish", purpose="slow finish"),
+                id=f"arf-elapsed-{uuid.uuid4().hex[:8]}",
+                task_queue=task_queue,
+            )
+
+    assert result["status"] == "ok"
+    # Two 30s poll intervals (skipped) + the 3s the final poll really took.
+    assert result["elapsed_s"] >= 62, result["elapsed_s"]
+    assert result["elapsed_s"] <= 120, result["elapsed_s"]
 
 
 class _FakeRemoteScript:
@@ -373,7 +492,7 @@ async def test_launch_forwards_agent_id_to_the_connector():
     assert out["status"] == "running"
     assert rec.calls == [
         {
-            "repo": "scratch",
+            "repo": "aegis-scratch",
             "engine_override": "",
             "agent_id": "pandoras-actor",
             "gated": False,
@@ -429,7 +548,7 @@ def test_the_fakes_signatures_really_do_match_the_real_connector():
     real_launch = inspect.signature(RemoteScriptConnector.start_kimi_run)
     fake_launch = inspect.signature(_LaunchRecorder.start_kimi_run)
     launch_kwargs = {
-        "repo": "scratch",
+        "repo": "aegis-scratch",
         "prompt": "p",
         "kimi_binary": "/bin/kimi",
         "engine_override": "claude",

@@ -1,11 +1,11 @@
 """MCP **server** — AEGIS's own chat tools, served over streamable HTTP.
 
-The mirror image of :mod:`aegis.mcp_manager` (the client). One endpoint,
-``POST /api/mcp-server/{agent_id}``, speaks JSON-RPC 2.0 so an external agent
-harness — ``claude`` / ``kimi`` CLI headless runs, Claude Desktop — can mount
-AEGIS's GTD / knowledge / infra / money tools natively instead of shelling back
-into the chat API. ``routes/mcp.py`` is the *client* admin surface and is
-untouched by this module.
+The mirror image of :mod:`aegis.mcp_manager` (the client). One handler behind
+two URLs — ``POST /api/mcp-server/{agent_id}`` and its ``/gated`` variant (last
+paragraph) — speaks JSON-RPC 2.0 so an external agent harness (``claude`` /
+``kimi`` CLI headless runs, Claude Desktop) can mount AEGIS's GTD / knowledge /
+infra / money tools natively instead of shelling back into the chat API.
+``routes/mcp.py`` is the *client* admin surface and is untouched by this module.
 
 Serving tools to a third-party harness is a door into this AEGIS, so it is shut
 by default and narrow when open:
@@ -37,12 +37,25 @@ answer. The handler raises an ``interactions`` card (the repo's universal HITL
 primitive) and returns the operator's verdict. It is deliberately absent from
 ``CHAT_TOOLS``/``TOOL_EXECUTORS``: it is a transport-level permission gate, not
 something an agent may call in chat.
+
+**The gated endpoint** ``POST /api/mcp-server/{agent_id}/gated`` is the same
+server with enforcement moved INSIDE it (issue #294). Live E2E on 2026-08-13
+showed the claude CLI (2.1.231) executing ``mcp__aegis__capture_to_inbox`` in a
+gated run with zero approval cards: tools from an explicitly-passed
+``--mcp-config`` are trusted in ``-p`` mode and never reach
+``--permission-prompt-tool``. A permission model that lives in the CLI's policy
+is therefore not a permission model at all for AEGIS's own tools, so the gated
+mount points here instead: every tool NOT in ``_READ_ONLY_TOOLS`` needs an
+operator approval before this process will execute it, whatever the CLI thinks.
 """
 
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
+import time
+from dataclasses import dataclass
 from typing import Any
 from uuid import uuid4
 
@@ -178,6 +191,102 @@ _APPROVAL_TOOL_DESCRIPTOR = {
 }
 
 
+# ── server-side gating for the /gated endpoint (issue #294) ────────────────
+#
+# v1 of the read-only/mutating classification #289 asks for. It is a CURATED
+# frozenset rather than metadata on `CHAT_TOOLS` because the registry has no
+# such field yet, and it is an ALLOW-list on purpose: a tool that is not named
+# here needs an approval, so a tool added tomorrow — or renamed — is gated by
+# construction instead of quietly auto-allowed.
+#
+# Every entry below was read at its executor (`TOOL_EXECUTORS[name]`) and does
+# nothing but SELECT / fetch / synthesise. Deliberately excluded despite being
+# "reads":
+#   * `youtube_transcript` / `pdf_to_text` — both end in `_deliver_documents`,
+#     which POSTS a file into the operator's channel. Harmless, but not a read.
+#   * every infra / cloud / vercel tool — `list_nodes` and friends run a shell
+#     script on the script host through the same `_INFRA_SPECS` pipeline as
+#     `restart_service`, so "read-only" there is a property of the remote
+#     script, not of this process. v1 keeps that whole domain gated.
+# `tests/core/test_mcp_server_gated.py` re-derives the write-marker check from
+# the executors' own source, so an executor that GAINS a write fails CI.
+_READ_ONLY_TOOLS = frozenset(
+    {
+        "ask_knowledge",
+        "find_reference",
+        "get_finance_news",
+        "get_market_overview",
+        "get_quote",
+        "last_contact_with_person",
+        "list_interactions",
+        "list_next_actions",
+        "list_projects",
+        "list_social_channels",
+        "query_activities",
+        "query_observations",
+        "research_topic",
+        "search_knowledge",
+        "social_timeline",
+        "system_status",
+        "whats_next",
+    }
+)
+
+# `interactions.origin` for both gates — the CLI-facing `approve_tool_use` and
+# this one. `memory._UNLEARNABLE_ORIGINS` keys on it: these prompts quote a
+# run's untrusted tool input and must never become agent memory.
+_GATE_ORIGIN = "agent_run_gate"
+
+# How long an approval stays usable. The card's own `timeout_seconds` matches,
+# so an unanswered card archives exactly when its approval would have expired.
+_GATE_TTL_SECONDS = 900
+
+# Re-read cadence while waiting on a card raised by an EARLIER request.
+_GATE_POLL_INTERVAL_S = 2.0
+
+# What the model is told when the operator has not answered yet. It is
+# deliberately an instruction, not a status: the CLI caps an MCP tool call at
+# ~60s, so the only way an approval can ever result in an execution is if the
+# model comes BACK with byte-identical arguments after the human answers.
+_GATE_RETRY_TEXT = (
+    "Pending operator approval — a card was sent to the operator. Retry this exact "
+    "tool call with identical arguments in about 60 seconds; it will execute once "
+    "approved. Do not change the arguments (that requires a new approval)."
+)
+
+
+@dataclass(frozen=True)
+class _GateDecision:
+    """`allow=True` ⇒ execute. Anything else is a message for the model and NO
+    execution — there is no third outcome."""
+
+    allow: bool
+    message: str = ""
+
+
+def _args_fingerprint(args: dict) -> str:
+    """Canonical hash of the call's arguments.
+
+    Key-order-independent (`sort_keys`) and whitespace-independent so the
+    retry the model makes hashes to the same value as the call the human saw —
+    while any actual change of an argument does not, which is the point: an
+    approval authorises exactly the arguments on the card.
+    """
+    canonical = json.dumps(args, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(canonical.encode()).hexdigest()[:16]
+
+
+def _gate_key(agent_id: str, tool_name: str, args: dict) -> str:
+    return f"{agent_id}:{tool_name}:{_args_fingerprint(args)}"
+
+
+def _render_tool_input(tool_input: dict) -> str:
+    try:
+        return json.dumps(tool_input, indent=2, default=str, ensure_ascii=False)
+    except (TypeError, ValueError):  # pragma: no cover — default=str covers ~everything
+        return str(tool_input)
+
+
 def _decision_allow(tool_input: dict) -> str:
     """The CLI expects the verdict JSON-stringified in the tool result text.
 
@@ -194,10 +303,7 @@ def _decision_deny(message: str) -> str:
 
 def _approval_prompt(agent_id: str, tool_name: str, tool_input: dict) -> str:
     """The card text: whose run, which tool, and a bounded look at the input."""
-    try:
-        rendered = json.dumps(tool_input, indent=2, default=str, ensure_ascii=False)
-    except (TypeError, ValueError):  # pragma: no cover — default=str covers ~everything
-        rendered = str(tool_input)
+    rendered = _render_tool_input(tool_input)
     return (
         f"🔒 Gated run for *{agent_id}* wants to use `{tool_name}`.\n\n"
         f"```\n{_truncate_text(rendered, _APPROVAL_PREVIEW_BYTES)}\n```\n\n"
@@ -385,6 +491,249 @@ async def _handle_approve_tool_use(
     return _tool_result(request_id, _decision_deny(message), is_error=False)
 
 
+# ── the server-side gate (gated endpoint) ──────────────────────────────────
+
+
+def _gate_prompt(agent_id: str, tool_name: str, args: dict) -> str:
+    """The card text for a gated AEGIS tool call.
+
+    It has to state the RETRY contract, because unlike the CLI-facing
+    `approve_tool_use` gate nothing is blocked waiting on this answer: the
+    request that raised the card has already come back to the model telling it
+    to retry. What the operator approves is the *next* attempt.
+    """
+    return (
+        f"🔒 Gated run for *{agent_id}* wants to run the AEGIS tool `{tool_name}`.\n\n"
+        f"```\n{_truncate_text(_render_tool_input(args), _APPROVAL_PREVIEW_BYTES)}\n```\n\n"
+        "Approve and the agent will retry and execute it with exactly this input "
+        "(valid 15 minutes, single use). Deny and it is blocked — the run keeps "
+        "going and is told why."
+    )
+
+
+async def _read_gate_row(pool: Any, gate_key: str) -> dict | None:
+    """The newest UNCONSUMED gate card for this (agent, tool, args), within TTL.
+
+    Consumed rows are filtered out here rather than reported as "already used":
+    a second identical call is a second mutation and needs its own approval, so
+    it falls through to the no-match branch and raises a fresh card.
+    """
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT id, status, response FROM interactions "
+            "WHERE origin = $1 AND metadata->>'gate_key' = $2 "
+            "AND metadata->>'gate_consumed_at' IS NULL "
+            "AND created_at > now() - make_interval(secs => $3::float8) "
+            "ORDER BY created_at DESC LIMIT 1",
+            _GATE_ORIGIN,
+            gate_key,
+            float(_GATE_TTL_SECONDS),
+        )
+    return dict(row) if row is not None else None
+
+
+async def _claim_gate_approval(pool: Any, interaction_id: str) -> bool:
+    """Mark an approval consumed, atomically. True ⇒ this caller owns it.
+
+    Single-use is enforced by the UPDATE's own predicate, not by a read-then-
+    write: two concurrent retries of the same approved call race here, and
+    exactly one of them can win. There is no sanctioned service for this write
+    (the `interactions` table is owned by the worker's InteractionActivities,
+    which has no notion of a gate), so it is a deliberately narrow UPDATE that
+    touches one metadata key and nothing else.
+    """
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "UPDATE interactions "
+            "SET metadata = metadata || jsonb_build_object('gate_consumed_at', now()) "
+            "WHERE id = $1::uuid AND status = 'resolved' "
+            "AND metadata->>'gate_consumed_at' IS NULL "
+            "RETURNING id",
+            interaction_id,
+        )
+    return row is not None
+
+
+async def _await_gate_row(pool: Any, interaction_id: str, wait_s: float) -> dict | None:
+    """Re-read one interaction until it leaves `pending` or the budget runs out."""
+    deadline = time.monotonic() + wait_s
+    while True:
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT id, status, response FROM interactions WHERE id = $1::uuid",
+                interaction_id,
+            )
+        if row is None or str(row["status"]) != "pending":
+            return dict(row) if row is not None else None
+        if time.monotonic() >= deadline:
+            return dict(row)
+        await asyncio.sleep(_GATE_POLL_INTERVAL_S)
+
+
+async def _raise_gate_card(
+    request: Request, agent_id: str, tool_name: str, args: dict, gate_key: str, wait_s: float
+) -> dict | None:
+    """Start the approval card and wait `wait_s` for an answer.
+
+    Returns the resolved interaction, or None when the operator has not
+    answered yet — in which case the card stays LIVE (its own timeout is the
+    gate TTL) so the model's retry finds it. Raises on a broken Temporal path;
+    the caller turns that into a deny.
+    """
+    client = getattr(request.app.state, "temporal_client", None)
+    if client is None:
+        raise RuntimeError("no temporal client — cannot ask anyone for approval")
+    handle = await client.start_workflow(
+        "InteractionFlow",
+        {
+            "agent_id": agent_id,
+            "kind": "choice",
+            "origin": _GATE_ORIGIN,
+            "prompt": _gate_prompt(agent_id, tool_name, args),
+            "options": _APPROVAL_OPTIONS,
+            "timeout_seconds": _GATE_TTL_SECONDS,
+            # `archive`, so an unanswered card dies with its own approval
+            # window instead of leaving a workflow pending forever.
+            "timeout_policy": "archive",
+            # The key the retry looks itself up by. `gate_tool`/`gate_agent`
+            # are forensics only — the match is on `gate_key` alone.
+            "metadata": {
+                "gate_key": gate_key,
+                "gate_tool": tool_name,
+                "gate_agent": agent_id,
+            },
+        },
+        id=f"agent-run-gate-{uuid4().hex[:12]}",
+        task_queue="aegis-main",
+    )
+    try:
+        result = await asyncio.wait_for(handle.result(), timeout=wait_s)
+    except TimeoutError:
+        return None
+    payload = result if isinstance(result, dict) else {}
+    return {
+        "id": str(payload.get("interaction_id") or ""),
+        "status": str(payload.get("status") or ""),
+        "response": payload.get("response"),
+    }
+
+
+def _gate_verdict(row: dict | None) -> tuple[str, str]:
+    """(verdict, operator note) for one gate row.
+
+    `approved` requires BOTH a resolved row and an explicit approve value —
+    every other shape (archived, unknown status, a missing or malformed
+    response) resolves to something that does not execute.
+    """
+    if row is None:
+        return "pending", ""
+    status = str(row.get("status") or "")
+    response = row.get("response") if isinstance(row.get("response"), dict) else {}
+    value = str((response or {}).get("value") or "").strip().lower()
+    note = str((response or {}).get("note") or "").strip()
+    if status == "resolved":
+        return ("approved" if value in _APPROVE_VALUES else "denied"), note
+    if status == "pending":
+        return "pending", ""
+    return "expired", ""
+
+
+async def _gate_tool_call(
+    request: Request, agent_id: str, settings: Settings, tool_name: str, args: dict
+) -> _GateDecision:
+    """Decide whether ONE mutating tool call on the gated endpoint may execute.
+
+    The protocol is approve-then-retry, because the claude CLI abandons an MCP
+    tool call after ~60s and cannot be made to wait for a human:
+
+      1. no card for these exact arguments  → raise one, wait `wait_s`, and if
+         nobody has answered tell the model to retry;
+      2. a card exists and is still pending → wait `wait_s` on it, same answer;
+      3. approved                           → claim it (single use) and execute;
+      4. denied                             → say so, permanently, with the note;
+      5. archived (nobody answered in 15m)  → say the approval expired.
+
+    **Fails closed on every path.** No pool, no Temporal, a malformed row, an
+    unexpected exception — all of them return `allow=False`. The only thing
+    that returns `allow=True` is a claim on a human-approved card, so a bug in
+    here can cost an execution that should have happened but can never cause
+    one that should not.
+    """
+    wait_s = float(max(1, int(getattr(settings, "mcp_gate_wait_seconds", 40) or 40)))
+    gate_key = _gate_key(agent_id, tool_name, args)
+    try:
+        pool = getattr(request.app.state, "db_pool", None)
+        if pool is None:
+            raise RuntimeError("no db pool — cannot read or record approvals")
+        row = await _read_gate_row(pool, gate_key)
+        if row is None:
+            row = await _raise_gate_card(request, agent_id, tool_name, args, gate_key, wait_s)
+        elif str(row["status"]) == "pending":
+            row = await _await_gate_row(pool, str(row["id"]), wait_s)
+        verdict, note = _gate_verdict(row)
+
+        if verdict == "approved":
+            interaction_id = str((row or {}).get("id") or "")
+            if not interaction_id or not await _claim_gate_approval(pool, interaction_id):
+                logger.warning(
+                    "mcp_gate_decision",
+                    agent_id=agent_id,
+                    tool=tool_name,
+                    decision="block",
+                    reason="approval_already_used",
+                    interaction_id=interaction_id,
+                )
+                return _GateDecision(
+                    False,
+                    "That approval has already been used — an approval covers exactly one "
+                    "execution. Retry to request a fresh one.",
+                )
+            logger.info(
+                "mcp_gate_decision",
+                agent_id=agent_id,
+                tool=tool_name,
+                decision="allow",
+                interaction_id=interaction_id,
+            )
+            return _GateDecision(True)
+
+        logger.info(
+            "mcp_gate_decision",
+            agent_id=agent_id,
+            tool=tool_name,
+            decision="block",
+            reason=verdict,
+            interaction_id=str((row or {}).get("id") or ""),
+        )
+        if verdict == "denied":
+            message = f"Denied by operator: {note[:_ERROR_CHARS]}" if note else "Denied by operator"
+            return _GateDecision(
+                False,
+                f"{message}. This call is blocked — do NOT retry it with these arguments.",
+            )
+        if verdict == "expired":
+            return _GateDecision(
+                False,
+                "The approval for this call expired before it was used — the whole request "
+                "must be re-attempted from the start.",
+            )
+        return _GateDecision(False, _GATE_RETRY_TEXT)
+    except Exception as exc:  # noqa: BLE001 — a broken gate must block, never execute
+        logger.warning(
+            "mcp_gate_decision",
+            agent_id=agent_id,
+            tool=tool_name,
+            decision="block",
+            reason="error",
+            error=type(exc).__name__,
+        )
+        return _GateDecision(
+            False,
+            f"Approval could not be obtained ({type(exc).__name__}) — nothing was executed. "
+            "Retry shortly.",
+        )
+
+
 def _require_enabled(settings: Settings = Depends(get_settings)) -> None:
     """Refuse every method while the server side is switched off — or while it
     would be served with no authentication at all.
@@ -533,8 +882,13 @@ async def _handle_tools_call(
     request_id: Any,
     params: Any,
     tools: list[dict],
+    gated: bool = False,
 ) -> JSONResponse:
-    """Validate, authorize and run one tool call."""
+    """Validate, authorize and run one tool call.
+
+    `gated` is the /gated endpoint's enforcement: a tool outside
+    `_READ_ONLY_TOOLS` needs an operator approval before it executes here.
+    """
     if not isinstance(params, dict):
         return _rpc_error(request_id, _INVALID_PARAMS, "'params' must be an object")
     name = params.get("name")
@@ -578,6 +932,21 @@ async def _handle_tools_call(
         # Deliberately a tool result, not a JSON-RPC error: the schema hint is
         # what lets the calling model fix its own arguments and retry.
         return _tool_result(request_id, message, is_error=True)
+
+    # The gate sits between validation and execution on purpose: a call that
+    # would have been rejected for bad arguments must not raise a card, and the
+    # arguments the operator sees are the ones that would run.
+    if gated and name not in _READ_ONLY_TOOLS:
+        decision = await _gate_tool_call(request, agent_id, settings, name, args)
+        if not decision.allow:
+            logger.info(
+                "mcp_server_tool_call",
+                agent_id=agent_id,
+                tool=name,
+                status="gate_blocked",
+                arg_keys=arg_keys,
+            )
+            return _tool_result(request_id, decision.message, is_error=True)
 
     pool = request.app.state.db_pool
     ctx = _tool_context(request, agent_id, settings)
@@ -624,17 +993,9 @@ async def _handle_tools_call(
     return _tool_result(request_id, text, is_error=False)
 
 
-@router.post("/{agent_id}")
-async def mcp_server_endpoint(
-    agent_id: str,
-    request: Request,
-    settings: Settings = Depends(get_settings),
-) -> Response:
-    """Streamable-HTTP MCP endpoint serving `agent_id`'s chat tools.
-
-    One JSON-RPC message per POST. Stateless: no `Mcp-Session-Id` is issued and
-    one sent by the client is ignored.
-    """
+async def _serve(agent_id: str, request: Request, settings: Settings, *, gated: bool) -> Response:
+    """One JSON-RPC message. `gated` decides whether a mutating tool needs an
+    operator approval first; nothing else differs between the two endpoints."""
     agent = await _load_agent(request, agent_id)
     tools = _served_tools(agent_id, dict(agent.get("metadata") or {}))
 
@@ -691,10 +1052,40 @@ async def mcp_server_endpoint(
 
     if method == "tools/call":
         return await _handle_tools_call(
-            request, agent_id, settings, request_id, message.get("params"), tools
+            request, agent_id, settings, request_id, message.get("params"), tools, gated
         )
 
     return _rpc_error(request_id, _METHOD_NOT_FOUND, f"Unknown method '{method}'")
+
+
+@router.post("/{agent_id}")
+async def mcp_server_endpoint(
+    agent_id: str,
+    request: Request,
+    settings: Settings = Depends(get_settings),
+) -> Response:
+    """Streamable-HTTP MCP endpoint serving `agent_id`'s chat tools.
+
+    One JSON-RPC message per POST. Stateless: no `Mcp-Session-Id` is issued and
+    one sent by the client is ignored.
+    """
+    return await _serve(agent_id, request, settings, gated=False)
+
+
+@router.post("/{agent_id}/gated")
+async def mcp_server_gated_endpoint(
+    agent_id: str,
+    request: Request,
+    settings: Settings = Depends(get_settings),
+) -> Response:
+    """Same server, with the approval gate enforced HERE.
+
+    What a gated agent run mounts (`RemoteScriptConnector._mcp_run_config`).
+    Identical tool list and identical semantics for read-only tools; anything
+    else executes only after an operator approves it, because the CLI's own
+    permission routing was measured not to gate MCP tools at all (#294).
+    """
+    return await _serve(agent_id, request, settings, gated=True)
 
 
 @router.get("/{agent_id}")
@@ -707,7 +1098,23 @@ async def mcp_server_no_stream(agent_id: str) -> Response:
     )
 
 
+@router.get("/{agent_id}/gated")
+async def mcp_server_gated_no_stream(agent_id: str) -> Response:
+    """Parity with the ungated endpoint — a client probes the URL it mounts."""
+    raise HTTPException(
+        status_code=405,
+        detail="This MCP endpoint is stateless and POST-only; it opens no server-initiated stream.",
+        headers={"Allow": "POST, DELETE"},
+    )
+
+
 @router.delete("/{agent_id}", status_code=204)
 async def mcp_server_end_session(agent_id: str) -> Response:
     """Session termination. No session is ever issued, so this is a no-op."""
+    return Response(status_code=204)
+
+
+@router.delete("/{agent_id}/gated", status_code=204)
+async def mcp_server_gated_end_session(agent_id: str) -> Response:
+    """Session termination on the gated URL — same no-op."""
     return Response(status_code=204)

@@ -84,30 +84,43 @@ def _sanitize_agent_id(agent_id: str) -> str:
     return re.sub(r"[^a-zA-Z0-9_-]", "-", agent_id.strip()) or "agent"
 
 
-def _mcp_config_path(agent_id: str) -> str:
+def _mcp_config_path(agent_id: str, gated: bool = False) -> str:
     """Where a run's MCP client config lives on the coding host.
 
     Outside the run's worktree on purpose: a file inside it could be committed
     (and pushed) by the very agent it authenticates.
+
+    A gated run gets its OWN file. The two configs differ in the URL they point
+    at (gated ⇒ the enforcing endpoint), so sharing one path would let a gated
+    launch overwrite the ungated config an in-flight run is still reading — or,
+    worse, leave a gated run pointed at the ungated endpoint.
     """
-    return f"$HOME/.aegis/mcp-{_sanitize_agent_id(agent_id)}.json"
+    suffix = "-gated" if gated else ""
+    return f"$HOME/.aegis/mcp-{_sanitize_agent_id(agent_id)}{suffix}.json"
 
 
-def _mcp_run_config(agent_id: str, external_url: str, api_key: str) -> str:
+def _mcp_run_config(agent_id: str, external_url: str, api_key: str, gated: bool = False) -> str:
     """The claude-CLI MCP client config mounting AEGIS's own tool server.
 
     `external_url` is core's base URL **as reachable from the coding host**
     (a LAN address, not the browser-facing one). One server, `aegis`, pointed
     at this agent's endpoint — so the run's tools are exactly that agent's
     `metadata.tool_set`, per `api/routes/mcp_server.py`.
+
+    `gated` selects the `/gated` variant of that endpoint, where AEGIS itself
+    requires an operator approval before executing a mutating tool. That URL is
+    the ONLY thing that gates AEGIS's own tools: the claude CLI trusts tools
+    from an explicitly-passed `--mcp-config` in `-p` mode and never routes them
+    to `--permission-prompt-tool` (measured live, 2.1.231 — issue #294).
     """
     base = external_url.rstrip("/")
+    path = f"{base}/api/mcp-server/{agent_id}" + ("/gated" if gated else "")
     return json.dumps(
         {
             "mcpServers": {
                 _MCP_SERVER_NAME: {
                     "type": "http",
-                    "url": f"{base}/api/mcp-server/{agent_id}",
+                    "url": path,
                     "headers": {"X-API-Key": api_key},
                 }
             }
@@ -169,7 +182,10 @@ def _agent_launch_flags(
             auto-allow becomes an approval card a human answers. The two are
             mutually exclusive by construction: leaving skip-permissions in
             would auto-allow everything and the prompt tool would never fire,
-            which is a gate that silently does nothing.
+            which is a gate that silently does nothing. These flags are kept as
+            belt-and-braces for the tools the CLI DOES route through them
+            (Bash, Edit); AEGIS's own MCP tools are gated server-side instead,
+            by the `/gated` endpoint `_mcp_run_config` points the run at (#294).
 
     `mcp_config` and `gated` are claude-only: the kimi CLI has no equivalent
     flag pair, so a kimi run gets no mounted AEGIS tools and cannot be gated
@@ -803,17 +819,24 @@ class RemoteScriptConnector:
         to a plain run, never to a failed launch. Kimi runs get neither: the CLI
         has no `--mcp-config`, and skills are a claude-side convention.
 
-        `gated` turns the run into a human-in-the-loop one: the CLI asks AEGIS
-        for permission (`--permission-prompt-tool`) instead of auto-allowing,
-        and each request becomes an `interactions` card. It has two HARD
-        preconditions, both of which return a normal `failed` result rather than
-        quietly launching an ungated run — the whole point is that nothing
-        mutating happens without a human, so "gated was requested and not
-        applied" must never be a silent outcome:
+        `gated` turns the run into a human-in-the-loop one. It works on two
+        levels, and only the second is trustworthy:
+          * the CLI is asked to route non-allowed actions to AEGIS's approval
+            tool (`--permission-prompt-tool`) — which it honours for BUILT-IN
+            tools (Bash, Edit) but demonstrably not for the MCP tools it was
+            handed via `--mcp-config` (#294);
+          * the run's mount points at `/api/mcp-server/{agent_id}/gated`, where
+            AEGIS refuses to execute a mutating tool until a human approves it.
+            No CLI policy can bypass that, because the enforcement runs in
+            core's own process.
+        It has two HARD preconditions, both of which return a normal `failed`
+        result rather than quietly launching an ungated run — the whole point is
+        that nothing mutating happens without a human, so "gated was requested
+        and not applied" must never be a silent outcome:
           1. engine must be `claude` (kimi has no equivalent flag), and
-          2. the MCP mount must have succeeded — `--permission-prompt-tool`
-             names a tool on the `aegis` server, so without the mount the CLI
-             cannot reach it and every gated action fails or hangs.
+          2. the MCP mount must have succeeded — it is both where the approval
+             tool lives and what points the run at the enforcing endpoint, so
+             an unmounted gated run is an ungated run.
 
         Reachable-host runs are wrapped in a tmux window for live attach.
         Output is always captured to `output_file` (via `tee` in tmux mode) so
@@ -932,7 +955,7 @@ class RemoteScriptConnector:
         # Phase 3b: mount AEGIS's own tools over MCP (claude only). Best-effort
         # by design — a run without its tools is degraded, a run that never
         # launched is dead.
-        mcp_config = await self._mount_mcp_config(host, engine, agent_id)
+        mcp_config = await self._mount_mcp_config(host, engine, agent_id, gated)
         if gated and not mcp_config:
             # Best-effort stops being acceptable here: the permission prompt
             # lives ON that server. An unmounted gated run would ask a server
@@ -1072,7 +1095,9 @@ class RemoteScriptConnector:
         # (`secret_key`, to decrypt), and the connector already holds it.
         return await resolve_api_key(self._db_pool, SimpleNamespace(secret_key=self._secret_key))
 
-    async def _mount_mcp_config(self, host: str, engine: str, agent_id: str) -> str:
+    async def _mount_mcp_config(
+        self, host: str, engine: str, agent_id: str, gated: bool = False
+    ) -> str:
         """Write the run's MCP client config on `host`; return its path.
 
         "" means no mount, and that is a normal outcome: kimi has no
@@ -1080,6 +1105,9 @@ class RemoteScriptConnector:
         that never set `mcp_server_external_url` is opting out. A *failed*
         write is also "" — the run launches without its tools rather than not
         at all.
+
+        `gated` writes a SEPARATE file pointed at the enforcing endpoint, so a
+        gated launch never disturbs the ungated config (and vice versa).
 
         The key comes from `_resolve_mount_api_key` (env, then the
         admin-generated DB key), so a deployment whose only credential was
@@ -1100,7 +1128,7 @@ class RemoteScriptConnector:
             # mount this and a silent skip would look like a broken feature.
             logger.warning("mcp_mount_skipped", agent_id=agent_id, reason="api_key_unset")
             return ""
-        path = _mcp_config_path(agent_id)
+        path = _mcp_config_path(agent_id, gated)
         # Written to a temp file and `mv`d into place. `mv` within one
         # filesystem is atomic, so a second launch for the same agent cannot be
         # read half-written by the first run's CLI — a plain `cat > path`
@@ -1111,7 +1139,7 @@ class RemoteScriptConnector:
             f"umask 077 && mkdir -p $HOME/.aegis && cat > {path}.$$.tmp "
             f"&& mv {path}.$$.tmp {path}",
             timeout=15,
-            stdin=_mcp_run_config(agent_id, self._mcp_server_url, api_key).encode(),
+            stdin=_mcp_run_config(agent_id, self._mcp_server_url, api_key, gated).encode(),
         )
         if wrote["exit_code"] != 0:
             logger.warning(
@@ -1121,7 +1149,7 @@ class RemoteScriptConnector:
                 error=wrote["stderr"][:200],
             )
             return ""
-        logger.info("mcp_config_written", agent_id=agent_id, path=path)
+        logger.info("mcp_config_written", agent_id=agent_id, path=path, gated=gated)
         return path
 
     async def _launch_in_tmux(
