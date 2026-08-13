@@ -248,10 +248,20 @@ _GATE_POLL_INTERVAL_S = 2.0
 # deliberately an instruction, not a status: the CLI caps an MCP tool call at
 # ~60s, so the only way an approval can ever result in an execution is if the
 # model comes BACK with byte-identical arguments after the human answers.
+# The instruction says IMMEDIATELY, never "wait N seconds": the server already
+# holds every attempt open for mcp_gate_wait_seconds, and in one-shot -p mode
+# a model cannot wait on its own — the live E2E showed it backgrounding a
+# `sleep 60` and ENDING ITS TURN ("I'll retry when the timer fires"), which
+# ends the whole run with the approval forever unconsumed. Chained immediate
+# retries need no clock: 10 attempts × the server-side hold ≈ a 7-minute
+# approval window with zero model-side waiting.
 _GATE_RETRY_TEXT = (
     "Pending operator approval — a card was sent to the operator. Retry this exact "
-    "tool call with identical arguments in about 60 seconds; it will execute once "
-    "approved. Do not change the arguments (that requires a new approval)."
+    "tool call with identical arguments IMMEDIATELY, and keep retrying (up to 10 "
+    "times) — the server holds each attempt open while the operator responds, so "
+    "do NOT sleep, schedule timers, or end your turn between attempts. It will "
+    "execute once approved. Do not change the arguments (that requires a new "
+    "approval)."
 )
 
 
