@@ -276,6 +276,17 @@ endpoint per agent.
 (`settings.mcp_server_enabled`) and restart Core. While off, every method on the
 endpoint returns 403 with that instruction.
 
+**It also refuses to run unauthenticated.** `AEGIS_AUTH_DISABLED=true` makes
+`verify_auth` a no-op, which is the documented posture for a deployment behind
+an authenticating proxy (Cloudflare Access, an OAuth2 proxy) — but the URL an
+agent run mounts is deliberately a LAN/overlay address that *bypasses* that
+proxy, so the two together would serve every agent's tool set (`restart_service`,
+`run_infra_script`, money and GTD writes) to anything that can open a socket to
+Core. Enabled + `auth_disabled` is therefore a 403 naming both settings, unless
+the operator accepts it explicitly with
+`AEGIS_MCP_SERVER_ALLOW_UNAUTHENTICATED=true`. The fix in almost every case is
+the other direction: unset `AEGIS_AUTH_DISABLED` and give the endpoint a key.
+
 | Method | Behaviour |
 |---|---|
 | `POST /api/mcp-server/{agent_id}` | one JSON-RPC 2.0 message per request — `initialize`, `ping`, `tools/list`, `tools/call`, plus 202 for notifications |
@@ -289,9 +300,16 @@ Three things bound what a mounted client can do:
   `metadata.tool_set` (the same `_get_agent_tools` the chat loop uses), so the
   MCP surface can never be wider than that agent's chat surface. An agent id
   with no row is a 404. Point a harness at a *narrow* agent.
-- **`call_mcp_tool` is always removed** from the served list, even when the agent
-  holds it: serving it would let an MCP client drive AEGIS's MCP *client* at a
-  third-party server (recursion, confused deputy).
+- **`_UNSERVED_TOOLS` is always removed** from the served list, even when the
+  agent holds those tools. `call_mcp_tool` would let an MCP client drive AEGIS's
+  MCP *client* at a third-party server (confused deputy). `dispatch_agent_run`,
+  `aegis_self_diagnose` and `investigate_resource` each **start another CLI
+  run** — which mounts this same endpoint with the same tool set, so serving
+  them is unbounded recursion with no depth counter anywhere in the loop (the
+  only brake is the coding host's tmux window cap, past which launches fall
+  through to detached `nohup` and stop being bounded at all). The exclusion is
+  applied where the served set is *derived*, so an excluded tool is neither
+  listed nor callable — `tools/call` authorizes against that same list.
 
 Responses are always `application/json`; no `Mcp-Session-Id` is issued and one
 sent by a client is ignored. A *tool* failure (bad arguments, timeout, executor
@@ -509,8 +527,9 @@ chain, and every link must be open:
 | Link | Where | If missing |
 |---|---|---|
 | `mcp_server_enabled` | `AEGIS_MCP_SERVER_ENABLED` | endpoint 403s; the run mounts a server that refuses everything |
+| not (`auth_disabled` without `mcp_server_allow_unauthenticated`) | `AEGIS_AUTH_DISABLED` / `AEGIS_MCP_SERVER_ALLOW_UNAUTHENTICATED` | endpoint 403s (see the MCP-server section above) |
 | `mcp_server_external_url` | `AEGIS_MCP_SERVER_EXTERNAL_URL`, or infra `coding.mcp_server_url` (DB wins) | no config written, run launches toolless |
-| `api_key` | `AEGIS_API_KEY` | no config written + a `mcp_mount_skipped` WARNING |
+| an API key | `AEGIS_API_KEY`, **or** the admin-generated key in `settings` (env first, DB fallback — `_resolve_mount_api_key`) | no config written + a `mcp_mount_skipped` WARNING |
 | engine == `claude` | routing / `engine_override` | kimi runs never mount (see below) |
 | `agent_id` | `AgentRunInput.agent_id`, threaded through `launch_agent_run` | no per-agent endpoint to point at |
 
@@ -532,6 +551,21 @@ behind an authenticating proxy a headless CLI cannot traverse.
 - The launch adds `--strict-mcp-config`, which makes that file the *only* server
   list. Without it, a `.mcp.json` checked into the target repo could add servers
   of its own to an unattended, full-auto run.
+- The write is `cat > <path>.$$.tmp && mv <path>.$$.tmp <path>`, not a plain
+  `cat >`: two launches for the same agent target the same path, and a
+  truncate-in-place would be read half-written by the other run's CLI.
+
+**Per-agent tool scoping is not a security boundary against a hostile run.**
+The mount key is one shared AEGIS API key, and the per-agent scoping is only
+the URL a run was *handed*. A run that goes off the rails can read the other
+agents' config files on the same coding host (or simply guess the path — it is
+`$HOME/.aegis/mcp-<agent_id>.json`) and drive `/api/mcp-server/<other-agent>`
+with the same key, which is every tool any agent holds. Per-run scoped tokens
+are issue **#288**; until then the real containment is (a) gated runs, which
+put a human on every action, and (b) the `_UNSERVED_TOOLS` exclusions above,
+which keep the recursion-capable tools off the mount entirely. Treat "agent X's
+mount" as "AEGIS's whole tool surface, addressed conveniently", not as a
+sandbox.
 
 **Kimi runs get neither (v1).** The kimi CLI has no `--mcp-config` /
 `--strict-mcp-config` pair and no skills convention, so a kimi run is a plain
@@ -578,6 +612,14 @@ the CLI gave up first, a slow operator would surface inside the run as a
 transport failure and their answer would land nowhere. Raise one and raise the
 other. The card's own `timeout_policy` is `archive`, so an unanswered card stops
 being pending instead of holding a workflow open forever.
+
+**A third clock: the flow's watch window.** `AgentRunInput.timeout_minutes`
+(default 30) is how long `AgentRunFlow` keeps polling; it never kills the run,
+it only stops watching and reports where the process is. A gated run spends most
+of that window *blocked on a human* (up to 9 min per card), so three or four
+questions exhaust 30 minutes while the CLI is still working and still raising
+cards. `dispatch_agent_run` therefore takes an optional `timeout_minutes`
+(5–240) and defaults a **gated** dispatch to **120** when the caller omits it.
 
 **Gated has two hard preconditions**, both checked at launch and both returned
 as a normal `{"status": "failed", ...}`:
