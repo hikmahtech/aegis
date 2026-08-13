@@ -17,9 +17,9 @@ by default and narrow when open:
 * **Per-agent tool gating.** The URL names an agent and the served *chat* tools
   are exactly that agent's ``metadata.tool_set`` (via ``_get_agent_tools``), so a
   mounted server can never reach past what that agent may already do in chat.
-  ``call_mcp_tool`` is removed on top of that: serving it would let an MCP
-  client re-enter AEGIS's MCP *client* (recursion, confused deputy). The one
-  addition is ``approve_tool_use`` (below), which grants nothing.
+  ``_UNSERVED_TOOLS`` is removed on top of that — the MCP passthrough and every
+  tool that spawns another agent run (see the constant). The one addition is
+  ``approve_tool_use`` (below), which grants nothing.
 * **Stateless.** No ``Mcp-Session-Id`` is ever issued and one sent by a client is
   ignored, so there is no server-side session to hijack, expire or leak. ``GET``
   is 405 (no server-initiated streams) and ``DELETE`` is a 204 no-op.
@@ -87,6 +87,31 @@ _TOOL_RESULT_MAX_BYTES = 65_536
 
 # Cap on the text of an executor failure echoed back to the caller.
 _ERROR_CHARS = 300
+
+# Chat tools that are NEVER served here, however the agent's `tool_set` reads.
+#
+# `call_mcp_tool` is the MCP *client* passthrough: serving it would let a
+# mounted client drive AEGIS's own client at a third-party server on its behalf
+# (confused deputy).
+#
+# The other three each START ANOTHER CLI RUN — and a run's mount carries the
+# same tool set, so a mounted run calling one of them spawns a run that can
+# spawn a run. There is no depth counter anywhere in that loop: the only brake
+# is the coding host's tmux window cap (10), past which launches fall through
+# to detached `nohup` and stop being bounded at all. Each level is a billed
+# agent session, so this is removed at the source rather than rate-limited.
+#
+# Both halves of the door are closed by ONE derivation: `_served_tools` is what
+# `tools/list` advertises AND what `tools/call` authorizes against, so a name
+# missing from that list is unreachable, not merely unadvertised.
+_UNSERVED_TOOLS = frozenset(
+    {
+        _MCP_TOOL_NAME,
+        "dispatch_agent_run",
+        "aegis_self_diagnose",
+        "investigate_resource",
+    }
+)
 
 # ── the permission gate (gated agent runs) ─────────────────────────────────
 #
@@ -196,11 +221,42 @@ async def _handle_approve_tool_use(
     the decision out of the result text, and an error result would be a broken
     permission check rather than a deny.
     """
-    tool_name = args.get("tool_name")
-    tool_input = args.get("input")
-    tool_use_id = str(args.get("tool_use_id") or "")[:64]
+    # Argument parsing lives INSIDE the fail-closed try, not before it: an
+    # exception escaping here would leave FastAPI to return a 500, which the
+    # CLI reads as a transport failure rather than as a decision — the one
+    # outcome a permission gate must never produce. Malformed input for any
+    # OTHER tool is still a normal JSON-RPC error; only this one owes the
+    # caller a verdict on every path.
+    try:
+        tool_name = args.get("tool_name")
+        tool_input = args.get("input")
+        tool_use_id = str(args.get("tool_use_id") or "")[:64]
+        malformed = (
+            not isinstance(tool_name, str)
+            or not tool_name.strip()
+            or not isinstance(tool_input, dict)
+        )
+        if not malformed:
+            tool_name = tool_name.strip()
+            # Length only. The input is the thing we are refusing to trust: it
+            # can carry a file's contents, a token pasted into a command,
+            # someone's private text.
+            input_bytes = len(json.dumps(tool_input, default=str).encode())
+    except Exception as exc:  # noqa: BLE001 — a broken gate must deny, never raise
+        logger.warning(
+            "mcp_approval_decision",
+            agent_id=agent_id,
+            decision="deny",
+            reason="unreadable_request",
+            error=type(exc).__name__,
+        )
+        return _tool_result(
+            request_id,
+            _decision_deny("Denied — the permission request could not be read."),
+            is_error=False,
+        )
 
-    if not isinstance(tool_name, str) or not tool_name.strip() or not isinstance(tool_input, dict):
+    if malformed:
         logger.warning(
             "mcp_approval_decision",
             agent_id=agent_id,
@@ -214,10 +270,6 @@ async def _handle_approve_tool_use(
             is_error=False,
         )
 
-    tool_name = tool_name.strip()
-    # Length only. The input is the thing we are refusing to trust: it can carry
-    # a file's contents, a token pasted into a command, someone's private text.
-    input_bytes = len(json.dumps(tool_input, default=str).encode())
     # Read the module global at call time so a test can shrink the wait without
     # sleeping out the real 9-minute cap.
     timeout_s = AGENT_RUN_APPROVAL_TIMEOUT_S
@@ -334,13 +386,48 @@ async def _handle_approve_tool_use(
 
 
 def _require_enabled(settings: Settings = Depends(get_settings)) -> None:
-    """Refuse every method while the server side is switched off."""
+    """Refuse every method while the server side is switched off — or while it
+    would be served with no authentication at all.
+
+    ``verify_auth`` returns True unconditionally under ``auth_disabled``, which
+    is the documented posture for a deployment fronted by an authenticating
+    proxy (Cloudflare Access, an OAuth2 proxy). That posture does NOT extend to
+    this endpoint: the URL a run mounts is by design a LAN/overlay address
+    reachable *from the coding host*, i.e. one that bypasses the proxy the
+    posture depends on. Enabling both would serve every agent's tool set —
+    `restart_service`, `run_infra_script`, the money and GTD writes — to
+    anything that can open a TCP connection to Core.
+
+    So the two settings are refused together unless the operator has explicitly
+    accepted it. `mcp_server_allow_unauthenticated` is the acceptance, and it
+    exists as a separate switch precisely so that turning the MCP server on is
+    never *implicitly* a decision about authentication.
+    """
     if not getattr(settings, "mcp_server_enabled", False):
         raise HTTPException(
             status_code=403,
             detail=(
                 "AEGIS MCP server is disabled — set AEGIS_MCP_SERVER_ENABLED=true "
                 "and restart Core to serve AEGIS's chat tools to external MCP clients."
+            ),
+        )
+    if getattr(settings, "auth_disabled", False) and not getattr(
+        settings, "mcp_server_allow_unauthenticated", False
+    ):
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                "AEGIS MCP server refuses to serve unauthenticated tool calls: "
+                "AEGIS_AUTH_DISABLED=true makes verify_auth a no-op, and this "
+                "endpoint is mounted at a LAN/overlay URL that bypasses the "
+                "proxy AEGIS_AUTH_DISABLED assumes in front of Core. As it "
+                "stands, anything that can reach Core could run every agent's "
+                "tools (restart_service, run_infra_script, money and GTD "
+                "writes) with no credential. Fix it by unsetting "
+                "AEGIS_AUTH_DISABLED and setting AEGIS_API_KEY (or generating "
+                "an API key in the admin UI) — or, if Core really is "
+                "unreachable except from trusted hosts, accept the risk "
+                "explicitly with AEGIS_MCP_SERVER_ALLOW_UNAUTHENTICATED=true."
             ),
         )
 
@@ -382,18 +469,20 @@ async def _load_agent(request: Request, agent_id: str) -> dict:
 
 
 def _served_tools(agent_id: str, metadata: dict | None) -> list[dict]:
-    """The agent's chat tools, minus the MCP passthrough.
+    """The agent's chat tools, minus ``_UNSERVED_TOOLS``.
 
     ``_get_agent_tools`` is the single source of truth for what an agent may
     call (DB ``metadata.tool_set`` → seed defaults → the minimal fallback set),
     so this surface can never be broader than the same agent's chat surface.
-    ``call_mcp_tool`` is dropped: an MCP client calling it would drive AEGIS's
-    own MCP client at a third-party server on its behalf.
+    This function is then the single derivation of the *served* set: the
+    endpoint calls it once per request and hands the result to both
+    ``tools/list`` and ``tools/call``, so an excluded tool is neither listed
+    nor callable.
     """
     return [
         tool
         for tool in _get_agent_tools(agent_id, metadata=metadata)
-        if tool["function"]["name"] != _MCP_TOOL_NAME
+        if tool["function"]["name"] not in _UNSERVED_TOOLS
     ]
 
 
