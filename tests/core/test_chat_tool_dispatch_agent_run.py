@@ -103,6 +103,46 @@ async def test_dispatch_failure_is_reported_not_raised():
     assert "temporal frontend unreachable" in result
 
 
+async def test_dispatch_forwards_gated_to_the_flow():
+    """`gated` is the human-in-the-loop switch. Core never imports worker code,
+    so this dict key is the entire contract — drop it and the model's request
+    for approval cards silently produces a full-auto run."""
+    pool = AsyncMock()
+    client = _client()
+    ctx = ToolContext(agent_id="sebas", temporal_client=client)
+
+    await _execute_tool(
+        pool,
+        "dispatch_agent_run",
+        {"prompt": "Fix the flaky test", "engine": "claude", "gated": True},
+        ctx,
+    )
+    assert client.start_workflow.call_args[0][1]["gated"] is True
+
+
+async def test_dispatch_defaults_to_ungated():
+    """Falsifiability control for the test above: the gate is opt-in, and an
+    omitted `gated` must cross as a real False rather than a missing key."""
+    pool = AsyncMock()
+    client = _client()
+    ctx = ToolContext(agent_id="sebas", temporal_client=client)
+
+    await _execute_tool(pool, "dispatch_agent_run", {"prompt": "research X"}, ctx)
+    payload = client.start_workflow.call_args[0][1]
+    assert "gated" in payload
+    assert payload["gated"] is False
+
+
+def test_gated_is_advertised_as_a_boolean():
+    """A knob the model cannot see is a feature that never gets used."""
+    schema = next(t for t in CHAT_TOOLS if t["function"]["name"] == "dispatch_agent_run")
+    gated = schema["function"]["parameters"]["properties"]["gated"]
+    assert gated["type"] == "boolean"
+    assert "approval" in gated["description"].lower()
+    # Opt-in: it must never become a required argument.
+    assert "gated" not in schema["function"]["parameters"]["required"]
+
+
 def test_tool_is_advertised_and_dispatchable():
     """A schema with no executor is never dispatched; an executor with no
     schema is never advertised. Both halves have to exist."""

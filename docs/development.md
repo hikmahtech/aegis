@@ -459,6 +459,7 @@ Agent work runs in two lanes.
 | Where | Core, one LLM call + a bounded tool loop | `RemoteScriptConnector.start_kimi_run`, in a per-run git worktree, tmux window when the host is reachable |
 | How long | Seconds; answers in the same turn | Minutes to tens of minutes; the result is delivered to the agent's channel when it lands |
 | Dispatch | the user talks to the agent | the `dispatch_agent_run` chat tool, or `start_workflow("AgentRunFlow", {...})` |
+| Permissions | every tool call is AEGIS's own, already scoped to the agent | full-auto by default; `gated: true` puts a human on every non-allowed action (see [Gated runs](#gated-runs-human-in-the-loop)) |
 
 An **agent run** is deliberately not "a coding task ending in a PR". It is the
 same machinery `activities/agent_task.py` uses for the coding lane with the
@@ -536,6 +537,66 @@ behind an authenticating proxy a headless CLI cannot traverse.
 `--strict-mcp-config` pair and no skills convention, so a kimi run is a plain
 CLI session exactly as before. Force `engine: "claude"` on a dispatch that needs
 AEGIS's tools.
+
+### Gated runs (human-in-the-loop)
+
+A normal run launches with `--dangerously-skip-permissions`: nobody is sitting
+at the terminal, so nothing can prompt. A **gated** run
+(`gated: true` on `dispatch_agent_run` / `AgentRunInput`) replaces that flag with
+`--permission-prompt-tool mcp__aegis__approve_tool_use` and turns every action
+the CLI would otherwise auto-allow into a question for a human.
+
+```
+run wants to use Bash/Write/…
+  └─ CLI calls mcp__aegis__approve_tool_use {tool_name, input, tool_use_id}
+       └─ core (routes/mcp_server.py) starts an InteractionFlow
+            └─ approval card lands in the agent's channel
+                 └─ ✅ Approve → {"behavior":"allow","updatedInput":<the input, verbatim>}
+                    ⛔ Deny    → {"behavior":"deny","message":"Denied by operator: …"}
+  └─ run continues either way (a deny is a tool result, not a crash)
+```
+
+This is AEGIS's **Rule-of-Two** posture in one flag: a run that reads untrusted
+content *and* can mutate state should not also be unsupervised. Give up any one
+of the three and you are back in safe territory — a gated run keeps the first
+two and hands the third to a person.
+
+**The gate fails closed.** Only a human resolving the card with an approve value
+produces an `allow`. Every other outcome is a deny: no Temporal client, a
+malformed request, a workflow that will not start, an exception mid-flight, a
+timeout, an archived card, or a response value the gate does not positively
+recognise. That is deliberate and worth preserving — a permission gate that
+opens when it breaks is not a gate. The verdict always comes back as a normal
+(`isError: false`) MCP result, because an error result is a broken permission
+check rather than a decision.
+
+**Two timeouts, and their order matters.** Core holds the CLI's permission call
+open for `AGENT_RUN_APPROVAL_TIMEOUT_S` (**9 min**,
+`api/routes/mcp_server.py`) and the launch exports `MCP_TOOL_TIMEOUT=600000`
+(**10 min**, `connectors/remote_script.py`). The nine must stay under the ten: if
+the CLI gave up first, a slow operator would surface inside the run as a
+transport failure and their answer would land nowhere. Raise one and raise the
+other. The card's own `timeout_policy` is `archive`, so an unanswered card stops
+being pending instead of holding a workflow open forever.
+
+**Gated has two hard preconditions**, both checked at launch and both returned
+as a normal `{"status": "failed", ...}`:
+
+| Precondition | Why |
+|---|---|
+| engine is `claude` | kimi has no `--permission-prompt-tool` equivalent |
+| the MCP mount succeeded | the approval tool lives on the `aegis` server; without the mount the CLI cannot reach it |
+
+Neither degrades to an ungated run. A request for a human in the loop that
+quietly became a full-auto session is the one failure mode this feature cannot
+have, so it fails the launch instead and the flow delivers the reason.
+
+`approve_tool_use` is served by `POST /api/mcp-server/{agent_id}` to **every**
+agent regardless of `metadata.tool_set` — `--permission-prompt-tool` only
+resolves a tool the server advertises, and an agent whose gate is invisible
+could not run gated at all. It is deliberately **not** a `CHAT_TOOLS` entry: it
+is a transport-level permission gate, not something an agent may call in chat,
+and calling it grants nothing anyway.
 
 ### Provisioning the scratch workspace (once)
 

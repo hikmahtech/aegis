@@ -12,7 +12,13 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 import structlog.testing
+from aegis.api.routes.mcp_server import (
+    AGENT_RUN_APPROVAL_TIMEOUT_S,
+    APPROVAL_TOOL_NAME,
+)
 from aegis.connectors.remote_script import (
+    MCP_TOOL_TIMEOUT_MS,
+    PERMISSION_PROMPT_TOOL,
     RemoteScriptConnector,
     _agent_launch_flags,
     _mcp_config_path,
@@ -1342,3 +1348,147 @@ async def test_mcp_mount_skipped_visibly_when_api_key_unset():
     assert skipped[0]["reason"] == "api_key_unset"
     launch = " ".join(str(a) for a in mock_exec.call_args_list[-1].args)
     assert "--mcp-config" not in launch
+
+
+# ── gated runs (human-in-the-loop permission gate) ─────────────────────────
+
+
+def test_agent_launch_flags_ungated_claude_is_byte_identical():
+    """Snapshot of the pre-gate command. `gated=False` is the overwhelming
+    majority of runs, so the gate must be provably invisible to them — a stray
+    flag or env prefix leaking into the default path fails right here."""
+    assert _agent_launch_flags("claude", "/bin/claude", "/w", "/p", gated=False) == (
+        "/bin/claude --print --output-format stream-json "
+        "--verbose --dangerously-skip-permissions < /p"
+    )
+    assert _agent_launch_flags(
+        "claude", "/bin/claude", "/w", "/p", "/cfg", "$HOME/.aegis/mcp-sebas.json", False
+    ) == (
+        "CLAUDE_CONFIG_DIR=/cfg /bin/claude --print --output-format stream-json "
+        "--verbose --dangerously-skip-permissions "
+        "--mcp-config $HOME/.aegis/mcp-sebas.json --strict-mcp-config < /p"
+    )
+    # Default is ungated: omitting the argument must not change anything.
+    assert _agent_launch_flags("claude", "/bin/claude", "/w", "/p") == _agent_launch_flags(
+        "claude", "/bin/claude", "/w", "/p", gated=False
+    )
+
+
+def test_agent_launch_flags_gated_swaps_skip_permissions_for_the_prompt_tool():
+    """The two are mutually exclusive: leaving --dangerously-skip-permissions in
+    would auto-allow everything, so the prompt tool would never fire and the
+    'gate' would approve every action without asking anyone."""
+    flags = _agent_launch_flags(
+        "claude", "/bin/claude", "/w", "/p", "", "$HOME/.aegis/mcp-sebas.json", True
+    )
+    assert "--dangerously-skip-permissions" not in flags
+    assert "--permission-prompt-tool mcp__aegis__approve_tool_use" in flags
+    # The MCP mount survives — the prompt tool lives on that very server.
+    assert "--mcp-config $HOME/.aegis/mcp-sebas.json --strict-mcp-config" in flags
+    assert "--print --output-format stream-json --verbose" in flags
+
+
+def test_agent_launch_flags_gated_exports_the_mcp_tool_timeout():
+    """The approval call blocks on a human. Without this the CLI abandons it
+    after its default per-tool timeout and the gate becomes a hang."""
+    flags = _agent_launch_flags(
+        "claude", "/bin/claude", "/w", "/p", "", "$HOME/.aegis/mcp-x.json", True
+    )
+    assert flags.startswith("MCP_TOOL_TIMEOUT=600000 /bin/claude")
+    # 10 minutes in ms, and it MUST outlast core's 9-minute approval cap or a
+    # slow operator surfaces as a transport failure instead of a deny.
+    assert MCP_TOOL_TIMEOUT_MS == 600_000
+    assert MCP_TOOL_TIMEOUT_MS / 1000 > AGENT_RUN_APPROVAL_TIMEOUT_S
+
+    # With a config dir too: both env vars, CLAUDE_CONFIG_DIR still first.
+    with_cfg = _agent_launch_flags(
+        "claude", "/bin/claude", "/w", "/p", "/cfg", "$HOME/.aegis/mcp-x.json", True
+    )
+    assert with_cfg.startswith("CLAUDE_CONFIG_DIR=/cfg MCP_TOOL_TIMEOUT=600000 /bin/claude")
+    # Ungated never exports it.
+    assert "MCP_TOOL_TIMEOUT" not in _agent_launch_flags("claude", "/bin/claude", "/w", "/p")
+
+
+def test_permission_prompt_tool_matches_the_tool_core_actually_serves():
+    """`mcp__<server>__<tool>`: the server half must be the key written into the
+    run's MCP config, the tool half the name core's MCP server advertises. A
+    rename on either side makes every gated tool use unresolvable — and this
+    assertion is the only place the two modules meet."""
+    cfg = json.loads(_mcp_run_config("sebas", "http://10.0.0.5:8080", "K"))
+    server = next(iter(cfg["mcpServers"]))
+    assert f"mcp__{server}__{APPROVAL_TOOL_NAME}" == PERMISSION_PROMPT_TOOL
+    assert PERMISSION_PROMPT_TOOL == "mcp__aegis__approve_tool_use"
+
+
+@pytest.mark.asyncio
+async def test_gated_kimi_run_fails_instead_of_running_ungated(conn_mount):
+    """kimi has no --permission-prompt-tool. Silently downgrading to an ungated
+    run is the one outcome that must never happen: the caller asked for a human
+    in the loop and would get an unattended full-auto session instead."""
+    with patch("asyncio.create_subprocess_exec") as mock_exec:
+        result = await conn_mount.start_kimi_run(
+            repo="aegis",
+            prompt="x",
+            kimi_binary="/k",
+            github_repo="youruser/aegis",  # non-org → routes to kimi
+            agent_id="sebas",
+            gated=True,
+        )
+    assert result["status"] == "failed"
+    assert "claude" in result["error"]
+    assert result["engine"] == "kimi"
+    # Refused before touching the host at all — no worktree, no prompt file.
+    assert mock_exec.call_count == 0
+
+
+@pytest.mark.asyncio
+async def test_gated_run_without_the_mcp_mount_fails(conn_claude):
+    """--permission-prompt-tool names a tool on the `aegis` MCP server. Without
+    the mount the CLI cannot reach it, so every gated action would fail or hang.
+    conn_claude has no mcp_server_url, so the mount is skipped."""
+    procs = _make_proc_sequence([0, 0, 0, 0])
+    with patch("asyncio.create_subprocess_exec", side_effect=procs) as mock_exec:
+        result = await conn_claude.start_kimi_run(
+            repo="bcp", prompt="x", kimi_binary="/k", github_repo="Acme/bcp",
+            agent_id="sebas", gated=True,
+        )
+    assert result["status"] == "failed"
+    assert "mcp" in result["error"].lower()
+    assert result["engine"] == "claude"
+    # It got as far as the mount attempt and stopped there — never launched.
+    all_cmds = [" ".join(str(a) for a in c.args) for c in mock_exec.call_args_list]
+    assert all("--permission-prompt-tool" not in c for c in all_cmds)
+    assert all("/bin/claude --print" not in c for c in all_cmds)
+
+
+@pytest.mark.asyncio
+async def test_gated_claude_run_launches_with_the_gate_in_tmux(conn_mount):
+    """The full gated launch: prompt tool in, skip-permissions out, timeout env
+    exported, AEGIS tools mounted strictly."""
+    with patch("asyncio.create_subprocess_exec", side_effect=_claude_run_procs()) as mock_exec:
+        result = await conn_mount.start_kimi_run(
+            repo="bcp", prompt="x", kimi_binary="/k", github_repo="Acme/bcp",
+            agent_id="sebas", gated=True,
+        )
+    assert result["status"] == "running"
+    assert result["engine"] == "claude"
+    launch = " ".join(str(a) for a in mock_exec.call_args_list[-1].args)
+    assert "--permission-prompt-tool mcp__aegis__approve_tool_use" in launch
+    assert "--dangerously-skip-permissions" not in launch
+    assert "MCP_TOOL_TIMEOUT=600000" in launch
+    assert "--mcp-config $HOME/.aegis/mcp-sebas.json --strict-mcp-config" in launch
+
+
+@pytest.mark.asyncio
+async def test_ungated_claude_run_is_unchanged_by_the_gate(conn_mount):
+    """Falsifiability control for the test above: the same launch without
+    `gated` must still be the pre-gate command."""
+    with patch("asyncio.create_subprocess_exec", side_effect=_claude_run_procs()) as mock_exec:
+        result = await conn_mount.start_kimi_run(
+            repo="bcp", prompt="x", kimi_binary="/k", github_repo="Acme/bcp", agent_id="sebas"
+        )
+    assert result["status"] == "running"
+    launch = " ".join(str(a) for a in mock_exec.call_args_list[-1].args)
+    assert "--dangerously-skip-permissions" in launch
+    assert "--permission-prompt-tool" not in launch
+    assert "MCP_TOOL_TIMEOUT" not in launch
