@@ -286,6 +286,12 @@ async def test_a_mutating_tool_raises_a_card_and_tells_the_model_to_retry(
     text = _text(result)
     assert "Pending operator approval" in text
     assert "Retry this exact tool call" in text
+    # The instruction must demand IMMEDIATE chained retries and never name a
+    # wait interval: in one-shot -p mode a model cannot wait (live E2E showed
+    # it backgrounding `sleep 60` and ending its turn — run over, approval
+    # never consumed). The server holds each attempt open instead.
+    assert "IMMEDIATELY" in text
+    assert "60 seconds" not in text, "a timed-retry instruction regressed — see gated E2E v2"
     temporal.start_workflow.assert_awaited_once()
     payload = temporal.start_workflow.await_args.args[1]
     assert payload["origin"] == "agent_run_gate"
