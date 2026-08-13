@@ -37,7 +37,6 @@ with workflow.unsafe.imports_passed_through():
     from aegis_worker.activities.delivery import DeliveryActivities
     from aegis_worker.shared.retry import (
         NO_RETRY,
-        RETRY_ONCE,
         STANDARD,
         TIMEOUT_CHAT_REPLY,
         TIMEOUT_FAST,
@@ -80,9 +79,15 @@ class AgentChatReplyFlow:
         # Step 1 — synthesize the reply. Smart-tier agents (pandoras-actor on
         # claude-sonnet) routinely take 3-6 min when invoking heavy tools
         # (remote_script kimi SSH, deep KS search). Use TIMEOUT_CHAT_REPLY
-        # (600s) to match the chat path (PR #248). RETRY_ONCE
-        # instead of STANDARD: a single retry covers transient 5xx without
-        # compounding the LLM cost on legitimate slow runs.
+        # (600s) to match the chat path (PR #248). NO_RETRY, not RETRY_ONCE:
+        # this activity is an HTTP wrapper around core's entire chat tool
+        # loop, which can execute side-effecting tools (restart_service,
+        # complete_task, trigger_workflow, capture_to_inbox, handoff_task)
+        # before a timeout or late failure is raised back to us. It is NOT
+        # idempotent, so at-least-once retry means duplicating real-world
+        # actions, not just re-spending LLM cost. A transient failure
+        # degrades visibly via post_agent_reply_error_comment below instead
+        # of being silently retried.
         try:
             synth = await workflow.execute_activity_method(
                 ChatActivities.synthesize_reply,
@@ -93,7 +98,7 @@ class AgentChatReplyFlow:
                     inp.task_id,
                 ],
                 start_to_close_timeout=TIMEOUT_CHAT_REPLY,
-                retry_policy=RETRY_ONCE,
+                retry_policy=NO_RETRY,
             )
         except Exception as exc:  # noqa: BLE001
             err_msg = _err_str(exc)
