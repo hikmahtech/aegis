@@ -218,10 +218,15 @@ class Settings(BaseSettings):
     finance_provider: str = "yahoo"
     finance_indices: str = "^GSPC,^IXIC,^NSEI"
 
-    # Chat tool-calling
+    # Chat tool-calling. 5 iterations (~4 tool steps) was the binding
+    # constraint on multi-step agent work; the repeat-signature guard in
+    # services/chat.py (chat_tool_repeat_stop) already stops degenerate
+    # loops, so raising the cap doesn't reopen that failure mode. 4096 bytes
+    # was starving the model of tool output; balanced-tier models have large
+    # contexts, so the truncation cap can afford to be generous too.
     tool_calling_enabled: bool = True
-    tool_max_iterations: int = 5
-    tool_result_max_bytes: int = 4096
+    tool_max_iterations: int = 15
+    tool_result_max_bytes: int = 16384
     tool_timeout_seconds: int = 30
 
     # Notification budget (Phase 5) — cap daily proactive FYI pushes. Disabled =
