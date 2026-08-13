@@ -271,6 +271,13 @@ class Settings(BaseSettings):
     # POST /api/mcp-server/{agent_id}. Off by default, same default-deny posture
     # as the client above — this door lets an outside harness run AEGIS tools.
     mcp_server_enabled: bool = False
+    # Core's base URL **as reachable from the coding host** (e.g.
+    # http://10.0.0.5:8080) — NOT the browser-facing one, which is typically
+    # behind an authenticating proxy the CLI can't traverse. Used only to mount
+    # AEGIS's tools into a claude-engine agent run (`RemoteScriptConnector`);
+    # empty ⇒ runs launch with no AEGIS tools. An infra `coding.mcp_server_url`
+    # overrides it. The run authenticates with `api_key`, so both must be set.
+    mcp_server_external_url: str = ""
 
     # Worker -> Core API
     core_api_url: str = "http://localhost:8080"

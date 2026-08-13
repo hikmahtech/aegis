@@ -56,13 +56,23 @@ class AgentRunActivities:
 
     @activity.defn
     async def launch_agent_run(
-        self, prompt: str, repo: str = "", engine: str = "", purpose: str = ""
+        self,
+        prompt: str,
+        repo: str = "",
+        engine: str = "",
+        purpose: str = "",
+        agent_id: str = "",
     ) -> dict:
         """Start one CLI run on the coding host. NOT idempotent — see the flow.
 
         `repo` is a workspace-relative FIXED checkout under `repo_base`;
         empty ⇒ SCRATCH_REPO. `engine` ("claude"|"kimi") forces the engine,
         empty leaves the connector's org routing in charge.
+
+        `agent_id` is the dispatching agent, and it is load-bearing rather than
+        decorative: the connector mounts THAT agent's AEGIS tool surface into a
+        claude run over MCP (`/api/mcp-server/{agent_id}`). Dropping it here
+        silently produces a run with no AEGIS tools.
         """
         if self.remote_script is None:
             return {
@@ -77,6 +87,7 @@ class AgentRunActivities:
             prompt=_compose_prompt(prompt, purpose),
             kimi_binary=settings.get("kimi_binary", ""),
             engine_override=(engine or "").strip(),
+            agent_id=(agent_id or "").strip(),
         )
         if started.get("status") != "running":
             return {

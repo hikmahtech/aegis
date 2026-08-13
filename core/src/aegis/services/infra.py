@@ -191,6 +191,11 @@ def validate_coding(coding: Any, kind: str = "") -> dict:
 
     out["self_repo_path"] = _expect(coding.get("self_repo_path", ""), str, "self_repo_path")
     out["runbooks_dir"] = _expect(coding.get("runbooks_dir", ""), str, "runbooks_dir")
+    # Core's base URL as reachable FROM this coding host — where a claude agent
+    # run mounts AEGIS's own MCP tool server. Non-secret (the API key it pairs
+    # with is NOT stored here), so it belongs in this block rather than
+    # credentials. Empty ⇒ the env fallback (AEGIS_MCP_SERVER_EXTERNAL_URL).
+    out["mcp_server_url"] = _expect(coding.get("mcp_server_url", ""), str, "mcp_server_url")
     return out
 
 
