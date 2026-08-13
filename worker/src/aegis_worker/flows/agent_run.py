@@ -66,8 +66,9 @@ def _elapsed_str(seconds: int) -> str:
 @dataclass
 class AgentRunInput:
     """`agent_id` is first per the flow-config convention — the run recorder
-    interceptor reads it to populate `workflow_runs.agent_id`, and it is also
-    the agent whose channel the result is delivered to.
+    interceptor reads it to populate `workflow_runs.agent_id`, it is the agent
+    whose channel the result is delivered to, and it is the agent whose AEGIS
+    tool surface a claude run mounts over MCP.
 
     `repo` None ⇒ the `scratch` checkout. `engine` "" ⇒ the connector's own
     org routing decides claude vs kimi.
@@ -100,7 +101,7 @@ class AgentRunFlow:
         try:
             launched = await workflow.execute_activity_method(
                 AgentRunActivities.launch_agent_run,
-                args=[inp.prompt, repo, inp.engine, purpose],
+                args=[inp.prompt, repo, inp.engine, purpose, inp.agent_id],
                 start_to_close_timeout=TIMEOUT_LONG,
                 retry_policy=NO_RETRY,
             )

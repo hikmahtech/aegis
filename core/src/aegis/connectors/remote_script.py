@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import os
 import re
 import shlex
@@ -55,8 +56,75 @@ def _sanitize_window_repo(repo: str) -> str:
     return cleaned or "repo"
 
 
+def _sanitize_agent_id(agent_id: str) -> str:
+    """`agent_id` reduced to [A-Za-z0-9_-] for use in a remote filesystem path.
+
+    The MCP config path is deliberately left UNQUOTED in the remote commands
+    (so `$HOME` expands on the coding host), which is only safe because every
+    character of the variable part comes through here first.
+    """
+    return re.sub(r"[^a-zA-Z0-9_-]", "-", agent_id.strip()) or "agent"
+
+
+def _mcp_config_path(agent_id: str) -> str:
+    """Where a run's MCP client config lives on the coding host.
+
+    Outside the run's worktree on purpose: a file inside it could be committed
+    (and pushed) by the very agent it authenticates.
+    """
+    return f"$HOME/.aegis/mcp-{_sanitize_agent_id(agent_id)}.json"
+
+
+def _mcp_run_config(agent_id: str, external_url: str, api_key: str) -> str:
+    """The claude-CLI MCP client config mounting AEGIS's own tool server.
+
+    `external_url` is core's base URL **as reachable from the coding host**
+    (a LAN address, not the browser-facing one). One server, `aegis`, pointed
+    at this agent's endpoint — so the run's tools are exactly that agent's
+    `metadata.tool_set`, per `api/routes/mcp_server.py`.
+    """
+    base = external_url.rstrip("/")
+    return json.dumps(
+        {
+            "mcpServers": {
+                "aegis": {
+                    "type": "http",
+                    "url": f"{base}/api/mcp-server/{agent_id}",
+                    "headers": {"X-API-Key": api_key},
+                }
+            }
+        }
+    )
+
+
+def _skills_copy_fragment(skills_src: str, worktree_path: str) -> str:
+    """Shell fragment appended to the worktree-creation command that seeds
+    `<worktree>/.claude/skills` from AEGIS's own checkout.
+
+    Returns "" when there is nothing to copy. The fragment is a `&&`-chained
+    group whose LAST step is `|| true`, so:
+      - it runs only when `git worktree add` succeeded (never dirtying the
+        shared clone, which — unlike a per-run worktree — is not thrown away);
+      - it always exits 0, so the caller's rc still reflects the worktree add.
+    A missing source directory is therefore a silent skip, never a failed launch.
+    """
+    if not skills_src or not worktree_path:
+        return ""
+    dest = f"{worktree_path}/.claude/skills"
+    return (
+        f" && {{ [ -d {shlex.quote(skills_src)} ] && "
+        f"mkdir -p {shlex.quote(dest)} && "
+        f"cp -r {shlex.quote(skills_src)}/. {shlex.quote(dest)}/ || true; }}"
+    )
+
+
 def _agent_launch_flags(
-    engine: str, binary: str, work_path: str, prompt_file: str, config_dir: str = ""
+    engine: str,
+    binary: str,
+    work_path: str,
+    prompt_file: str,
+    config_dir: str = "",
+    mcp_config: str = "",
 ) -> str:
     """Build the agent CLI invocation (without output redirection) for `engine`.
 
@@ -74,6 +142,11 @@ def _agent_launch_flags(
             has no --work-dir; the launcher cd's into work_path instead.)
             `config_dir`, when set, becomes CLAUDE_CONFIG_DIR so the run uses a
             non-default login (personal account for non-org fallback runs).
+            `mcp_config`, when set, adds `--mcp-config <path> --strict-mcp-config`
+            so the run mounts AEGIS's own tools — and ONLY those (see below).
+
+    `mcp_config` is claude-only: the kimi CLI has no equivalent flag pair, so a
+    kimi run gets no mounted AEGIS tools (documented limitation).
 
     claude reads the prompt from stdin; kimi takes it as a `-p` argument via
     `$(cat ...)` command substitution instead. Both emit one JSON event per
@@ -82,9 +155,15 @@ def _agent_launch_flags(
     """
     if engine == "claude":
         env = f"CLAUDE_CONFIG_DIR={shlex.quote(config_dir)} " if config_dir else ""
+        # NOT shlex-quoted: the path is composed by `_mcp_config_path` from a
+        # sanitized agent id and starts with `$HOME`, which must stay expandable
+        # by the remote shell. `--strict-mcp-config` makes that file the ONLY
+        # server list, so a `.mcp.json` checked into the target repo cannot
+        # inject extra servers into an unattended run.
+        mcp = f" --mcp-config {mcp_config} --strict-mcp-config" if mcp_config else ""
         return (
             f"{env}{shlex.quote(binary)} --print --output-format stream-json "
-            f"--verbose --dangerously-skip-permissions < {shlex.quote(prompt_file)}"
+            f"--verbose --dangerously-skip-permissions{mcp} < {shlex.quote(prompt_file)}"
         )
     return (
         f"{shlex.quote(binary)} --output-format stream-json "
@@ -202,6 +281,8 @@ class RemoteScriptConnector:
         kimi_binary: str = "",
         self_repo_path: str = "",
         runbooks_dir: str = "",
+        mcp_server_url: str = "",
+        api_key: str = "",
         db_pool: Any = None,
         secret_key: str = "",
     ):
@@ -236,6 +317,10 @@ class RemoteScriptConnector:
             "claude_default_account": "",
             "self_repo_path": self_repo_path,
             "runbooks_dir": runbooks_dir,
+            # Core's base URL as reachable FROM the coding host, plus the key a
+            # mounted run authenticates with. Both empty ⇒ no MCP mount at all.
+            "mcp_server_url": mcp_server_url,
+            "api_key": api_key,
         }
         self._apply_config(self._env_config)
 
@@ -259,14 +344,16 @@ class RemoteScriptConnector:
         self._claude_default_account = cfg["claude_default_account"]
         self._self_repo_path = cfg["self_repo_path"]
         self._runbooks_dir = cfg["runbooks_dir"]
+        self._mcp_server_url = cfg["mcp_server_url"]
+        self._api_key = cfg["api_key"]
 
     def _config_from_row(self, row: dict, kimi_host: str) -> dict[str, Any]:
         """Map an infra row (+ resolved kimi host) onto the active config.
 
         The enabled row is authoritative for the SSH identity and the coding
-        block; self_repo_path/runbooks_dir keep their env values when the
-        block omits them (they have image-local defaults a DB row rarely
-        needs to override).
+        block; self_repo_path/runbooks_dir/mcp_server_url keep their env values
+        when the block omits them (they have image-local defaults a DB row
+        rarely needs to override).
         """
         coding = row.get("coding") or {}
         engines = coding.get("engines") or {}
@@ -305,6 +392,11 @@ class RemoteScriptConnector:
             "claude_default_account": claude.get("default_account") or "",
             "self_repo_path": coding.get("self_repo_path") or env["self_repo_path"],
             "runbooks_dir": coding.get("runbooks_dir") or env["runbooks_dir"],
+            "mcp_server_url": coding.get("mcp_server_url") or env["mcp_server_url"],
+            # Never sourced from the coding block: the API key is a secret, and
+            # `coding` is the ONE non-secret jsonb on the infra row (returned
+            # verbatim by the public read). It stays env/constructor-only.
+            "api_key": env["api_key"],
         }
 
     async def _refresh_config(self) -> None:
@@ -637,6 +729,7 @@ class RemoteScriptConnector:
         engine_override: str = "",
         claude_config_dir: str = "",
         claude_account: str = "",
+        agent_id: str = "",
     ) -> dict:
         """Start a coding-CLI run (kimi or claude) on the effective host.
 
@@ -660,6 +753,14 @@ class RemoteScriptConnector:
         resource-scoped CLAUDE_CONFIG_DIR account *label* (resolved against the
         coding block's config_dirs); it wins over org routing but not over an
         explicit `claude_config_dir`. (Kimi ignores both — no profile.)
+
+        `agent_id` is the DISPATCHING AEGIS agent. It is what makes a run
+        AEGIS-aware: a claude-engine launch gets that agent's own tool surface
+        mounted over MCP (`_mount_mcp_config`, gated on `mcp_server_url` + an
+        API key) on top of the SKILL.md runbooks copied into the worktree. Both
+        are best-effort — a missing skills dir or a failed config write degrades
+        to a plain run, never to a failed launch. Kimi runs get neither: the CLI
+        has no `--mcp-config`, and skills are a claude-side convention.
 
         Reachable-host runs are wrapped in a tmux window for live attach.
         Output is always captured to `output_file` (via `tee` in tmux mode) so
@@ -725,12 +826,18 @@ class RemoteScriptConnector:
             timeout=30,
         )
 
-        # Phase 2: create an isolated per-run worktree (sibling of the shared clone).
+        # Phase 2: create an isolated per-run worktree (sibling of the shared
+        # clone), and — for claude — seed it with AEGIS's SKILL.md runbooks in
+        # the same round trip. The fragment is rc-neutral and self-skipping, so
+        # neither an unconfigured self_repo_path nor a missing skills dir can
+        # change what this command reports.
         worktree_path = f"{repo_path}-aegis-wt/{run_id}"
         worktree_parent = f"{repo_path}-aegis-wt"
+        skills_src = self._skills_source_dir() if engine == "claude" else ""
         wt_cmd = (
             f"mkdir -p {shlex.quote(worktree_parent)} && "
             f"git -C {shlex.quote(repo_path)} worktree add --detach {shlex.quote(worktree_path)}"
+            f"{_skills_copy_fragment(skills_src, worktree_path)}"
         )
         wt = await self._exec(host, wt_cmd, timeout=30)
         if wt["status"] != "succeeded":
@@ -761,6 +868,11 @@ class RemoteScriptConnector:
                 "engine": engine,
             }
 
+        # Phase 3b: mount AEGIS's own tools over MCP (claude only). Best-effort
+        # by design — a run without its tools is degraded, a run that never
+        # launched is dead.
+        mcp_config = await self._mount_mcp_config(host, engine, agent_id)
+
         # Phase 4: launch the agent. tmux mode → live-attachable window with
         # tee-capture; otherwise today's detached nohup. `nohup` alone detaches;
         # we never add `< /dev/null` — for claude, a second stdin redirect
@@ -768,7 +880,9 @@ class RemoteScriptConnector:
         # stdin). kimi no longer reads the prompt from stdin at all (it's
         # substituted into `-p` via `$(cat ...)`), but the same rule holds
         # regardless: this launch command never redirects stdin itself.
-        agent_flags = _agent_launch_flags(engine, binary, work_path, prompt_file, config_dir)
+        agent_flags = _agent_launch_flags(
+            engine, binary, work_path, prompt_file, config_dir, mcp_config
+        )
         nohup_cmd = (
             f"cd {shlex.quote(work_path)} && "
             f"(nohup {agent_flags} > {shlex.quote(output_file)} 2>&1 &)"
@@ -786,6 +900,7 @@ class RemoteScriptConnector:
                 engine=engine,
                 binary=binary,
                 config_dir=config_dir,
+                mcp_config=mcp_config,
             )
 
         if not launched_in_tmux:
@@ -810,6 +925,13 @@ class RemoteScriptConnector:
             host=host,
             in_tmux=launched_in_tmux,
             engine=engine,
+            # Booleans, never the config itself — the file holds an API key.
+            # `mcp_mounted` is verified (the write returned rc 0);
+            # `skills_requested` is not — the copy is a self-skipping fragment
+            # whose rc is deliberately swallowed, so claiming "mounted" here
+            # would assert something this process never observed.
+            mcp_mounted=bool(mcp_config),
+            skills_requested=bool(skills_src) and worktree_path != "",
         )
         return {
             "run_id": run_id,
@@ -823,6 +945,64 @@ class RemoteScriptConnector:
             "engine": engine,
         }
 
+    def _skills_source_dir(self) -> str:
+        """Absolute path of `config/skills` inside AEGIS's own checkout on the
+        coding host, or "" when `self_repo_path` is unset.
+
+        `self_repo_path` is workspace-relative (the same value `start_kimi_run`
+        takes as `repo`), so it is resolved against `repo_base` exactly the way
+        a run's own checkout is. The checkout is kept fresh by
+        WorkspaceRepoSyncFlow, which is what makes the skills current without a
+        redeploy.
+        """
+        path = (self._self_repo_path or "").strip().rstrip("/")
+        if not path:
+            return ""
+        if not path.startswith("/") and self._repo_base:
+            path = f"{self._repo_base}/{path}"
+        return f"{path}/config/skills"
+
+    async def _mount_mcp_config(self, host: str, engine: str, agent_id: str) -> str:
+        """Write the run's MCP client config on `host`; return its path.
+
+        "" means no mount, and that is a normal outcome: kimi has no
+        `--mcp-config`, an unrouted run has no `agent_id`, and a deployment
+        that never set `mcp_server_external_url` is opting out. A *failed*
+        write is also "" — the run launches without its tools rather than not
+        at all.
+
+        The API key is piped through the SSH channel's STDIN and never appears
+        in a command line: argv is world-readable via `ps` on the coding host
+        and lands in shell audit logs, and this key is full API access to
+        AEGIS. `umask 077` makes the directory and file owner-only, and the
+        path is deliberately OUTSIDE the run's worktree so the agent cannot
+        commit its own credential. The content is never logged.
+        """
+        if engine != "claude" or not agent_id or not self._mcp_server_url:
+            return ""
+        if not self._api_key:
+            # Visible degradation: the URL was configured, so somebody meant to
+            # mount this and a silent skip would look like a broken feature.
+            logger.warning("mcp_mount_skipped", agent_id=agent_id, reason="api_key_unset")
+            return ""
+        path = _mcp_config_path(agent_id)
+        wrote = await self._exec(
+            host,
+            f"umask 077 && mkdir -p $HOME/.aegis && cat > {path}",
+            timeout=15,
+            stdin=_mcp_run_config(agent_id, self._mcp_server_url, self._api_key).encode(),
+        )
+        if wrote["exit_code"] != 0:
+            logger.warning(
+                "mcp_config_write_failed",
+                agent_id=agent_id,
+                exit_code=wrote["exit_code"],
+                error=wrote["stderr"][:200],
+            )
+            return ""
+        logger.info("mcp_config_written", agent_id=agent_id, path=path)
+        return path
+
     async def _launch_in_tmux(
         self,
         *,
@@ -835,6 +1015,7 @@ class RemoteScriptConnector:
         engine: str,
         binary: str,
         config_dir: str = "",
+        mcp_config: str = "",
     ) -> bool:
         """Launch the agent in a tmux window on `host`. Returns True if a window
         was created, False if it should fall back to detached nohup (all windows
@@ -861,7 +1042,7 @@ class RemoteScriptConnector:
         winname = f"{engine}-{_sanitize_window_repo(repo)}-{run_id}"
         inner = (
             f"cd {shlex.quote(work_path)} && "
-            f"{_agent_launch_flags(engine, binary, work_path, prompt_file, config_dir)} "
+            f"{_agent_launch_flags(engine, binary, work_path, prompt_file, config_dir, mcp_config)} "
             f"2>&1 | tee {shlex.quote(output_file)}"
         )
         prune = "".join(f"tmux kill-window -t {shlex.quote(pid)}; " for pid in prune_ids)

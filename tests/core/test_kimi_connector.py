@@ -7,6 +7,7 @@ Integration against real node-a is out of scope for unit tests.
 from __future__ import annotations
 
 import asyncio
+import json
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -14,6 +15,8 @@ import structlog.testing
 from aegis.connectors.remote_script import (
     RemoteScriptConnector,
     _agent_launch_flags,
+    _mcp_config_path,
+    _mcp_run_config,
     _plan_tmux_launch,
     _sanitize_window_repo,
 )
@@ -1088,3 +1091,254 @@ async def test_kimi_run_alive_defaults_to_base_host(conn):
     argv = " ".join(str(a) for a in mock_exec.call_args.args)
     assert "user@node-a" in argv
     assert "user@node-b" not in argv
+
+
+# ── workspace mount: SKILL.md runbooks + the AEGIS MCP tool server ──────────
+#
+# Both are claude-only and both are best-effort: a missing skills dir or a
+# failed MCP-config write must degrade the run, never fail the launch.
+
+
+@pytest.fixture
+def conn_mount():
+    """Claude-routed connector with everything the mount needs configured."""
+    return RemoteScriptConnector(
+        host="node-a",
+        user="user",
+        key_file="/tmp/fake_key",
+        repo_base="/home/user/Workspace",
+        claude_orgs="acme",
+        claude_binary="/home/user/.local/bin/claude",
+        self_repo_path="youruser/aegis",
+        mcp_server_url="http://10.0.0.5:8080",
+        api_key="SUPER-SECRET-KEY",
+    )
+
+
+def _claude_run_procs(list_output: bytes = b"@0:bash:0\n") -> list[AsyncMock]:
+    """Subprocess mocks for a claude launch WITH the MCP mount:
+    0 test-d, 1 pull, 2 worktree(+skills), 3 prompt, 4 mcp config,
+    5 tmux ensure+list, 6 tmux new-window."""
+    procs = _make_proc_sequence([0, 0, 0, 0, 0, 0, 0])
+    procs[5].communicate = AsyncMock(return_value=(list_output, b""))
+    return procs
+
+
+def test_mcp_run_config_shape():
+    """One server named `aegis`, pointed at THIS agent's endpoint, with the key
+    in a header (never the query string — URLs land in access logs)."""
+    cfg = json.loads(_mcp_run_config("pandoras-actor", "http://10.0.0.5:8080", "KEY123"))
+    assert list(cfg["mcpServers"]) == ["aegis"]
+    server = cfg["mcpServers"]["aegis"]
+    assert server["type"] == "http"
+    assert server["url"] == "http://10.0.0.5:8080/api/mcp-server/pandoras-actor"
+    assert server["headers"] == {"X-API-Key": "KEY123"}
+
+
+def test_mcp_run_config_normalizes_trailing_slash():
+    """A base URL with a trailing slash must not produce `//api/mcp-server/...`."""
+    cfg = json.loads(_mcp_run_config("sebas", "http://10.0.0.5:8080/", "K"))
+    assert cfg["mcpServers"]["aegis"]["url"] == "http://10.0.0.5:8080/api/mcp-server/sebas"
+    # ...and neither must several of them.
+    cfg2 = json.loads(_mcp_run_config("sebas", "http://10.0.0.5:8080///", "K"))
+    assert cfg2["mcpServers"]["aegis"]["url"] == "http://10.0.0.5:8080/api/mcp-server/sebas"
+
+
+def test_agent_launch_flags_mcp_config_added_only_when_supplied():
+    """`--mcp-config` + `--strict-mcp-config` appear exactly when a config path
+    is passed, and the pair is inseparable: without `--strict-mcp-config` a
+    `.mcp.json` in the target repo would add its own servers to an unattended
+    full-auto run."""
+    with_mcp = _agent_launch_flags(
+        "claude", "/bin/claude", "/w", "/p", "", "$HOME/.aegis/mcp-sebas.json"
+    )
+    assert "--mcp-config $HOME/.aegis/mcp-sebas.json" in with_mcp
+    assert "--strict-mcp-config" in with_mcp
+    # The path must stay UNQUOTED so the remote shell expands $HOME.
+    assert "'$HOME" not in with_mcp
+
+    without = _agent_launch_flags("claude", "/bin/claude", "/w", "/p")
+    assert "--mcp-config" not in without
+    assert "--strict-mcp-config" not in without
+    # Unchanged from the pre-mount form (falsifiable: appending the flags
+    # unconditionally breaks this exact-equality assert).
+    assert without == (
+        "/bin/claude --print --output-format stream-json "
+        "--verbose --dangerously-skip-permissions < /p"
+    )
+
+
+def test_agent_launch_flags_kimi_never_takes_mcp_config():
+    """kimi CLI has no --mcp-config; passing one must not splice an unknown flag
+    into its argv (which would kill the run outright)."""
+    flags = _agent_launch_flags("kimi", "/bin/kimi", "/w", "/p", "", "$HOME/.aegis/mcp-x.json")
+    assert flags == '/bin/kimi --output-format stream-json -p "$(cat /p)"'
+
+
+def test_mcp_config_path_sanitizes_agent_id():
+    """The path is used UNQUOTED remotely (so $HOME expands), so the variable
+    part may only ever contain [A-Za-z0-9_-]."""
+    assert _mcp_config_path("pandoras-actor") == "$HOME/.aegis/mcp-pandoras-actor.json"
+    assert _mcp_config_path("a b;rm -rf /") == "$HOME/.aegis/mcp-a-b-rm--rf--.json"
+    assert _mcp_config_path("") == "$HOME/.aegis/mcp-agent.json"
+
+
+@pytest.mark.asyncio
+async def test_claude_run_copies_skills_into_the_worktree(conn_mount):
+    """self_repo_path set → the worktree command also seeds
+    <worktree>/.claude/skills from the aegis checkout's config/skills."""
+    with patch("asyncio.create_subprocess_exec", side_effect=_claude_run_procs()) as mock_exec:
+        result = await conn_mount.start_kimi_run(
+            repo="bcp", prompt="x", kimi_binary="/k", github_repo="Acme/bcp", agent_id="sebas"
+        )
+    assert result["status"] == "running"
+    all_cmds = [" ".join(str(a) for a in c.args) for c in mock_exec.call_args_list]
+    wt_cmd = next(c for c in all_cmds if "worktree add --detach" in c)
+    # Source resolves through repo_base, destination is inside the run worktree.
+    assert "/home/user/Workspace/youruser/aegis/config/skills" in wt_cmd
+    assert ".claude/skills" in wt_cmd
+    assert "cp -r" in wt_cmd
+    # Guarded + rc-neutral: a missing skills dir must not fail the worktree step.
+    assert "[ -d " in wt_cmd
+    assert "|| true" in wt_cmd
+
+
+@pytest.mark.asyncio
+async def test_skills_copy_omitted_when_self_repo_path_unset(conn_claude):
+    """conn_claude has no self_repo_path → no copy fragment anywhere. This is
+    the falsifiability control for the test above."""
+    procs = _make_proc_sequence([0, 0, 0, 0, 0, 0])
+    procs[4].communicate = AsyncMock(return_value=(b"@0:bash:0\n", b""))
+    with patch("asyncio.create_subprocess_exec", side_effect=procs) as mock_exec:
+        await conn_claude.start_kimi_run(
+            repo="bcp", prompt="x", kimi_binary="/k", github_repo="Acme/bcp", agent_id="sebas"
+        )
+    all_cmds = [" ".join(str(a) for a in c.args) for c in mock_exec.call_args_list]
+    assert all(".claude/skills" not in c for c in all_cmds)
+
+
+@pytest.mark.asyncio
+async def test_kimi_run_gets_neither_skills_nor_mcp(conn_mount):
+    """v1 limitation, asserted so it can't drift silently: a kimi run copies no
+    skills and writes no MCP config (5 ssh calls — no config-write step)."""
+    procs = _make_proc_sequence([0, 0, 0, 0, 0])
+    with patch("asyncio.create_subprocess_exec", side_effect=procs) as mock_exec:
+        result = await conn_mount.start_kimi_run(
+            repo="aegis",
+            prompt="x",
+            kimi_binary="/k",
+            github_repo="youruser/aegis",  # non-org → kimi
+            agent_id="sebas",
+        )
+    assert result["engine"] == "kimi"
+    all_cmds = [" ".join(str(a) for a in c.args) for c in mock_exec.call_args_list]
+    assert all(".claude/skills" not in c for c in all_cmds)
+    assert all("mcp-sebas.json" not in c for c in all_cmds)
+    assert mock_exec.call_count == 5
+
+
+@pytest.mark.asyncio
+async def test_mcp_config_written_via_stdin_and_key_never_in_argv(conn_mount):
+    """The API key reaches the host through the SSH channel's STDIN only.
+
+    Falsifiable by construction: moving the config into the command line (an
+    `echo '<json>' >` or a heredoc) puts the key into argv — visible in `ps` on
+    a shared coding host and in shell audit logs — and fails this test.
+    """
+    procs = _claude_run_procs()
+    with (
+        patch("asyncio.create_subprocess_exec", side_effect=procs) as mock_exec,
+        structlog.testing.capture_logs() as logs,
+    ):
+        result = await conn_mount.start_kimi_run(
+            repo="bcp", prompt="x", kimi_binary="/k", github_repo="Acme/bcp", agent_id="sebas"
+        )
+    assert result["status"] == "running"
+
+    all_cmds = [" ".join(str(a) for a in c.args) for c in mock_exec.call_args_list]
+    assert all("SUPER-SECRET-KEY" not in c for c in all_cmds), "API key leaked into argv"
+
+    # The write itself: umask 077, outside the worktree, content over stdin.
+    write_cmd = next(c for c in all_cmds if "mcp-sebas.json" in c and "cat >" in c)
+    assert "umask 077" in write_cmd
+    assert "-aegis-wt/" not in write_cmd  # never inside the run's own worktree
+    payload = procs[4].communicate.await_args.kwargs["input"]
+    cfg = json.loads(payload.decode())
+    assert cfg["mcpServers"]["aegis"]["headers"]["X-API-Key"] == "SUPER-SECRET-KEY"
+    assert cfg["mcpServers"]["aegis"]["url"] == "http://10.0.0.5:8080/api/mcp-server/sebas"
+
+    # The launch mounts it, strictly.
+    launch = all_cmds[-1]
+    assert "--mcp-config $HOME/.aegis/mcp-sebas.json" in launch
+    assert "--strict-mcp-config" in launch
+
+    # Logged by path only — never the content.
+    written = [log for log in logs if log["event"] == "mcp_config_written"]
+    assert len(written) == 1
+    assert written[0]["agent_id"] == "sebas"
+    assert "SUPER-SECRET-KEY" not in json.dumps(logs)
+
+
+@pytest.mark.asyncio
+async def test_mcp_config_write_failure_launches_degraded_not_dead(conn_mount):
+    """A failed config write costs the run its AEGIS tools, not its life."""
+    procs = _claude_run_procs()
+    procs[4].returncode = 1  # the `cat > mcp config` step fails remotely
+    procs[4].communicate = AsyncMock(return_value=(b"", b"Permission denied"))
+    with (
+        patch("asyncio.create_subprocess_exec", side_effect=procs) as mock_exec,
+        structlog.testing.capture_logs() as logs,
+    ):
+        result = await conn_mount.start_kimi_run(
+            repo="bcp", prompt="x", kimi_binary="/k", github_repo="Acme/bcp", agent_id="sebas"
+        )
+    assert result["status"] == "running"
+    launch = " ".join(str(a) for a in mock_exec.call_args_list[-1].args)
+    assert "--mcp-config" not in launch
+    assert [log for log in logs if log["event"] == "mcp_config_write_failed"]
+
+
+@pytest.mark.asyncio
+async def test_no_mcp_mount_without_agent_id(conn_mount):
+    """No agent_id ⇒ no endpoint to point at (the URL is per-agent), so no
+    config write and no flags — 6 ssh calls, not 7."""
+    procs = _make_proc_sequence([0, 0, 0, 0, 0, 0])
+    procs[4].communicate = AsyncMock(return_value=(b"@0:bash:0\n", b""))
+    with patch("asyncio.create_subprocess_exec", side_effect=procs) as mock_exec:
+        await conn_mount.start_kimi_run(
+            repo="bcp", prompt="x", kimi_binary="/k", github_repo="Acme/bcp"
+        )
+    assert mock_exec.call_count == 6
+    all_cmds = [" ".join(str(a) for a in c.args) for c in mock_exec.call_args_list]
+    assert all("--mcp-config" not in c for c in all_cmds)
+
+
+@pytest.mark.asyncio
+async def test_mcp_mount_skipped_visibly_when_api_key_unset():
+    """URL configured but no key: skipping is correct, doing it SILENTLY is not
+    — an operator who set the URL expects the mount and would otherwise see a
+    toolless run with no explanation."""
+    conn = RemoteScriptConnector(
+        host="node-a",
+        user="user",
+        key_file="/tmp/fake_key",
+        repo_base="/home/user/Workspace",
+        claude_orgs="acme",
+        claude_binary="/bin/claude",
+        mcp_server_url="http://10.0.0.5:8080",
+        api_key="",
+    )
+    procs = _make_proc_sequence([0, 0, 0, 0, 0, 0])
+    procs[4].communicate = AsyncMock(return_value=(b"@0:bash:0\n", b""))
+    with (
+        patch("asyncio.create_subprocess_exec", side_effect=procs) as mock_exec,
+        structlog.testing.capture_logs() as logs,
+    ):
+        await conn.start_kimi_run(
+            repo="bcp", prompt="x", kimi_binary="/k", github_repo="Acme/bcp", agent_id="sebas"
+        )
+    skipped = [log for log in logs if log["event"] == "mcp_mount_skipped"]
+    assert len(skipped) == 1
+    assert skipped[0]["reason"] == "api_key_unset"
+    launch = " ".join(str(a) for a in mock_exec.call_args_list[-1].args)
+    assert "--mcp-config" not in launch

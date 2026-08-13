@@ -203,6 +203,11 @@ async def bootstrap(settings: Settings | None = None) -> WorkerDeps:
             kimi_binary=getattr(settings, "kimi_cli_binary_path", ""),
             self_repo_path=getattr(settings, "aegis_self_repo_path", ""),
             runbooks_dir=getattr(settings, "runbooks_dir", ""),
+            # The worker owns AgentRunFlow, so this is the connector that
+            # actually mounts AEGIS's tools into a run — core's copy matters
+            # only for the chat-tool lane.
+            mcp_server_url=getattr(settings, "mcp_server_external_url", ""),
+            api_key=getattr(settings, "api_key", ""),
             db_pool=pool,
             secret_key=getattr(settings, "secret_key", ""),
         )

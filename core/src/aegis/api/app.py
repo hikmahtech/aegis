@@ -155,6 +155,8 @@ async def lifespan(app: FastAPI):
         kimi_binary=getattr(settings, "kimi_cli_binary_path", ""),
         self_repo_path=getattr(settings, "aegis_self_repo_path", ""),
         runbooks_dir=getattr(settings, "runbooks_dir", ""),
+        mcp_server_url=getattr(settings, "mcp_server_external_url", ""),
+        api_key=getattr(settings, "api_key", ""),
         db_pool=pool,
         secret_key=settings.secret_key,
     )

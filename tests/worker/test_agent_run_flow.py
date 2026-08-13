@@ -44,9 +44,15 @@ async def test_happy_path_delivers_output_tail():
     transcript = "Read 14 files.\n\nSUMMARY: the retry policy is unbounded."
 
     @activity.defn(name="launch_agent_run")
-    async def launch(prompt, repo="", engine="", purpose=""):
+    async def launch(prompt, repo="", engine="", purpose="", agent_id=""):
         launch_calls.append(
-            {"prompt": prompt, "repo": repo, "engine": engine, "purpose": purpose}
+            {
+                "prompt": prompt,
+                "repo": repo,
+                "engine": engine,
+                "purpose": purpose,
+                "agent_id": agent_id,
+            }
         )
         return _launched()
 
@@ -87,13 +93,16 @@ async def test_happy_path_delivers_output_tail():
     # Uniform result shape across every return path.
     assert set(result) == {"status", "reason", "run_id", "engine", "host", "elapsed_s"}
 
-    # repo omitted ⇒ the scratch checkout, not an empty path.
+    # repo omitted ⇒ the scratch checkout, not an empty path. agent_id must
+    # reach the launch: it is what mounts that agent's AEGIS tools into the run
+    # (dropping it yields a silently toolless run, not an error).
     assert launch_calls == [
         {
             "prompt": "Audit the retry policy in bcp.",
             "repo": "scratch",
             "engine": "",
             "purpose": "retry audit",
+            "agent_id": "pandoras-actor",
         }
     ]
     # First poll must NOT probe liveness — SSH/checkout latency would read as
@@ -120,7 +129,7 @@ async def test_launch_failure_is_attempted_once_and_delivered():
     checked = {"hit": False}
 
     @activity.defn(name="launch_agent_run")
-    async def launch(prompt, repo="", engine="", purpose=""):
+    async def launch(prompt, repo="", engine="", purpose="", agent_id=""):
         attempts["count"] += 1
         raise RuntimeError("ssh: connect to host node-a port 22: Connection refused")
 
@@ -165,7 +174,7 @@ async def test_missing_scratch_checkout_delivers_provision_command():
     delivered: list[str] = []
 
     @activity.defn(name="launch_agent_run")
-    async def launch(prompt, repo="", engine="", purpose=""):
+    async def launch(prompt, repo="", engine="", purpose="", agent_id=""):
         return {
             "status": "failed",
             "error": "Repo checkout missing on node-a: /w/scratch — provision it",
@@ -213,7 +222,7 @@ async def test_timeout_reports_where_the_run_is_and_does_not_kill_it():
     checks = {"count": 0}
 
     @activity.defn(name="launch_agent_run")
-    async def launch(prompt, repo="", engine="", purpose=""):
+    async def launch(prompt, repo="", engine="", purpose="", agent_id=""):
         return _launched(engine="kimi", tmux_window="kimi-scratch-ab12cd34")
 
     @activity.defn(name="check_agent_run")
@@ -314,3 +323,54 @@ async def test_check_does_not_probe_liveness_during_the_launch_grace():
     out = await acts.check_agent_run("/tmp/run.jsonl", "node-a", False)
     assert out["status"] == "running"
     assert fake.alive_calls == 0
+
+
+class _LaunchRecorder:
+    """Records the launch call. `start_kimi_run`'s signature is copied from the
+    real connector so a rename or reorder there breaks this test."""
+
+    def __init__(self):
+        self.calls: list[dict] = []
+
+    async def coding_settings(self) -> dict:
+        return {"kimi_binary": "/bin/kimi", "repo_base": "/w"}
+
+    async def start_kimi_run(
+        self,
+        repo: str,
+        prompt: str,
+        kimi_binary: str,
+        timeout: int = 1800,
+        github_repo: str = "",
+        engine_override: str = "",
+        claude_config_dir: str = "",
+        claude_account: str = "",
+        agent_id: str = "",
+    ) -> dict:
+        self.calls.append({"repo": repo, "engine_override": engine_override, "agent_id": agent_id})
+        return {"status": "running", "run_id": "r1", "output_file": "/tmp/o", "engine": "claude"}
+
+
+@pytest.mark.asyncio
+async def test_launch_forwards_agent_id_to_the_connector():
+    """The dispatching agent decides WHICH AEGIS tool surface the run mounts
+    (`/api/mcp-server/{agent_id}`). If the activity drops it, the run launches
+    perfectly and silently has no AEGIS tools at all — nothing else fails, so
+    this assertion is the only thing standing between that and production."""
+    rec = _LaunchRecorder()
+    acts = AgentRunActivities(remote_script=rec)
+    out = await acts.launch_agent_run("do a thing", "", "", "audit", "pandoras-actor")
+    assert out["status"] == "running"
+    assert rec.calls == [
+        {"repo": "scratch", "engine_override": "", "agent_id": "pandoras-actor"}
+    ]
+
+
+@pytest.mark.asyncio
+async def test_launch_without_agent_id_passes_empty_not_a_placeholder():
+    """No agent ⇒ no mount. The connector's own gate keys on an EMPTY agent_id,
+    so inventing a default here would point a run at a nonexistent endpoint."""
+    rec = _LaunchRecorder()
+    acts = AgentRunActivities(remote_script=rec)
+    await acts.launch_agent_run("do a thing")
+    assert rec.calls[0]["agent_id"] == ""
