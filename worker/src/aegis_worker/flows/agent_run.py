@@ -72,6 +72,11 @@ class AgentRunInput:
 
     `repo` None ⇒ the `scratch` checkout. `engine` "" ⇒ the connector's own
     org routing decides claude vs kimi.
+
+    `gated` requires a human to approve every action the CLI would otherwise
+    auto-allow. It is claude-only and needs the MCP mount; the connector refuses
+    the launch rather than downgrading to an ungated run, so a gated request
+    that cannot be honoured surfaces as a delivered failure.
     """
 
     agent_id: str
@@ -80,6 +85,7 @@ class AgentRunInput:
     engine: str = ""
     purpose: str = ""
     timeout_minutes: int = 30
+    gated: bool = False
 
 
 @workflow.defn(name="AgentRunFlow")
@@ -90,18 +96,19 @@ class AgentRunFlow:
         purpose = (inp.purpose or "").strip() or "agent run"
         repo = (inp.repo or "").strip() or SCRATCH_REPO
         workflow.logger.info(
-            "agent_run_flow_starting agent=%s repo=%s engine=%s purpose=%s",
+            "agent_run_flow_starting agent=%s repo=%s engine=%s purpose=%s gated=%s",
             inp.agent_id,
             repo,
             inp.engine or "auto",
             purpose,
+            inp.gated,
         )
 
         # Step 1 — launch. NO_RETRY: a second attempt is a second CLI session.
         try:
             launched = await workflow.execute_activity_method(
                 AgentRunActivities.launch_agent_run,
-                args=[inp.prompt, repo, inp.engine, purpose, inp.agent_id],
+                args=[inp.prompt, repo, inp.engine, purpose, inp.agent_id, inp.gated],
                 start_to_close_timeout=TIMEOUT_LONG,
                 retry_policy=NO_RETRY,
             )

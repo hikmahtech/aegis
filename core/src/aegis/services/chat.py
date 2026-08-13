@@ -1494,6 +1494,10 @@ CHAT_TOOLS = [
                         "type": "string",
                         "description": "Short human label for the run, e.g. 'audit bcp retry logic'. Shown in the result header.",
                     },
+                    "gated": {
+                        "type": "boolean",
+                        "description": "Require human approval for mutating actions during the run; approval cards land in your channel. Use it when the run can change things (write files, run commands, open PRs) or will read untrusted content. Requires the claude engine.",
+                    },
                 },
                 "required": ["prompt"],
             },
@@ -2054,6 +2058,7 @@ async def _exec_dispatch_agent_run(pool: asyncpg.Pool, args: dict, ctx: ToolCont
                 "repo": (args.get("repo") or "").strip() or None,
                 "engine": engine,
                 "purpose": (args.get("purpose") or "").strip(),
+                "gated": bool(args.get("gated")),
             },
             id=workflow_id,
             task_queue="aegis-main",

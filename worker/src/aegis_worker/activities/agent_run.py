@@ -62,6 +62,7 @@ class AgentRunActivities:
         engine: str = "",
         purpose: str = "",
         agent_id: str = "",
+        gated: bool = False,
     ) -> dict:
         """Start one CLI run on the coding host. NOT idempotent — see the flow.
 
@@ -73,6 +74,12 @@ class AgentRunActivities:
         decorative: the connector mounts THAT agent's AEGIS tool surface into a
         claude run over MCP (`/api/mcp-server/{agent_id}`). Dropping it here
         silently produces a run with no AEGIS tools.
+
+        `gated` asks for human approval on every non-auto-allowed action. Same
+        class of bug as dropping `agent_id`, only worse: a dropped `gated` gives
+        a perfectly healthy run that quietly mutates things nobody approved.
+        The connector enforces the preconditions and returns `failed` when it
+        cannot honour the request — this activity only has to forward it.
         """
         if self.remote_script is None:
             return {
@@ -88,6 +95,7 @@ class AgentRunActivities:
             kimi_binary=settings.get("kimi_binary", ""),
             engine_override=(engine or "").strip(),
             agent_id=(agent_id or "").strip(),
+            gated=bool(gated),
         )
         if started.get("status") != "running":
             return {

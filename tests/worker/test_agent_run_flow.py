@@ -44,7 +44,7 @@ async def test_happy_path_delivers_output_tail():
     transcript = "Read 14 files.\n\nSUMMARY: the retry policy is unbounded."
 
     @activity.defn(name="launch_agent_run")
-    async def launch(prompt, repo="", engine="", purpose="", agent_id=""):
+    async def launch(prompt, repo="", engine="", purpose="", agent_id="", gated=False):
         launch_calls.append(
             {
                 "prompt": prompt,
@@ -52,6 +52,7 @@ async def test_happy_path_delivers_output_tail():
                 "engine": engine,
                 "purpose": purpose,
                 "agent_id": agent_id,
+                "gated": gated,
             }
         )
         return _launched()
@@ -103,6 +104,7 @@ async def test_happy_path_delivers_output_tail():
             "engine": "",
             "purpose": "retry audit",
             "agent_id": "pandoras-actor",
+            "gated": False,
         }
     ]
     # First poll must NOT probe liveness — SSH/checkout latency would read as
@@ -129,7 +131,7 @@ async def test_launch_failure_is_attempted_once_and_delivered():
     checked = {"hit": False}
 
     @activity.defn(name="launch_agent_run")
-    async def launch(prompt, repo="", engine="", purpose="", agent_id=""):
+    async def launch(prompt, repo="", engine="", purpose="", agent_id="", gated=False):
         attempts["count"] += 1
         raise RuntimeError("ssh: connect to host node-a port 22: Connection refused")
 
@@ -174,7 +176,7 @@ async def test_missing_scratch_checkout_delivers_provision_command():
     delivered: list[str] = []
 
     @activity.defn(name="launch_agent_run")
-    async def launch(prompt, repo="", engine="", purpose="", agent_id=""):
+    async def launch(prompt, repo="", engine="", purpose="", agent_id="", gated=False):
         return {
             "status": "failed",
             "error": "Repo checkout missing on node-a: /w/scratch — provision it",
@@ -222,7 +224,7 @@ async def test_timeout_reports_where_the_run_is_and_does_not_kill_it():
     checks = {"count": 0}
 
     @activity.defn(name="launch_agent_run")
-    async def launch(prompt, repo="", engine="", purpose="", agent_id=""):
+    async def launch(prompt, repo="", engine="", purpose="", agent_id="", gated=False):
         return _launched(engine="kimi", tmux_window="kimi-scratch-ab12cd34")
 
     @activity.defn(name="check_agent_run")
@@ -346,8 +348,16 @@ class _LaunchRecorder:
         claude_config_dir: str = "",
         claude_account: str = "",
         agent_id: str = "",
+        gated: bool = False,
     ) -> dict:
-        self.calls.append({"repo": repo, "engine_override": engine_override, "agent_id": agent_id})
+        self.calls.append(
+            {
+                "repo": repo,
+                "engine_override": engine_override,
+                "agent_id": agent_id,
+                "gated": gated,
+            }
+        )
         return {"status": "running", "run_id": "r1", "output_file": "/tmp/o", "engine": "claude"}
 
 
@@ -362,7 +372,12 @@ async def test_launch_forwards_agent_id_to_the_connector():
     out = await acts.launch_agent_run("do a thing", "", "", "audit", "pandoras-actor")
     assert out["status"] == "running"
     assert rec.calls == [
-        {"repo": "scratch", "engine_override": "", "agent_id": "pandoras-actor"}
+        {
+            "repo": "scratch",
+            "engine_override": "",
+            "agent_id": "pandoras-actor",
+            "gated": False,
+        }
     ]
 
 
@@ -374,3 +389,70 @@ async def test_launch_without_agent_id_passes_empty_not_a_placeholder():
     acts = AgentRunActivities(remote_script=rec)
     await acts.launch_agent_run("do a thing")
     assert rec.calls[0]["agent_id"] == ""
+
+
+@pytest.mark.asyncio
+async def test_launch_forwards_gated_to_the_connector():
+    """A dropped `gated` is the quietest failure in this lane: the run launches
+    fine, reports success, and mutates whatever it likes with nobody asked. The
+    connector is the only enforcement point, so it has to receive the flag."""
+    rec = _LaunchRecorder()
+    acts = AgentRunActivities(remote_script=rec)
+    out = await acts.launch_agent_run("do a thing", "bcp", "claude", "audit", "sebas", True)
+    assert out["status"] == "running"
+    assert rec.calls[0]["gated"] is True
+
+
+@pytest.mark.asyncio
+async def test_launch_defaults_to_ungated():
+    """Falsifiability control: gated must be opt-in, never the default."""
+    rec = _LaunchRecorder()
+    acts = AgentRunActivities(remote_script=rec)
+    await acts.launch_agent_run("do a thing")
+    assert rec.calls[0]["gated"] is False
+
+
+@pytest.mark.asyncio
+async def test_gated_input_reaches_the_launch_activity():
+    """`AgentRunInput.gated` → `launch_agent_run(..., gated)`. The flow is the
+    only carrier between the dispatcher's request and the connector that
+    enforces it; a dropped flag here produces an ungated run that reports
+    success — exactly the outcome the gate exists to prevent."""
+    launch_calls: list[dict] = []
+
+    @activity.defn(name="launch_agent_run")
+    async def launch(prompt, repo="", engine="", purpose="", agent_id="", gated=False):
+        launch_calls.append({"gated": gated, "engine": engine})
+        return _launched()
+
+    @activity.defn(name="check_agent_run")
+    async def check(output_file, host="", probe_alive=True):
+        return {"status": "finished", "output": "done", "reason": ""}
+
+    @activity.defn(name="send_message")
+    async def send_message(agent_id, message, chat_id=0, keyboard=None):
+        return {"ok": True, "message_id": 1}
+
+    async with await WorkflowEnvironment.start_time_skipping() as env:
+        task_queue = f"tq-{uuid.uuid4().hex[:8]}"
+        async with Worker(
+            env.client,
+            task_queue=task_queue,
+            workflows=[AgentRunFlow],
+            activities=[launch, check, send_message],
+        ):
+            for gated in (True, False):
+                await env.client.execute_workflow(
+                    AgentRunFlow.run,
+                    AgentRunInput(
+                        agent_id="sebas",
+                        prompt="Refactor the retry policy.",
+                        engine="claude",
+                        gated=gated,
+                    ),
+                    id=f"arf-gated-{gated}-{uuid.uuid4().hex[:8]}",
+                    task_queue=task_queue,
+                )
+
+    # Both values cross the boundary — a hardcoded True or False fails.
+    assert [call["gated"] for call in launch_calls] == [True, False]
