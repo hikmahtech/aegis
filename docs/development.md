@@ -264,6 +264,53 @@ radius is bounded, not eliminated:
 None of that stops a server from writing persuasive text inside those bounds.
 Grant narrowly, and prefer read-only tools.
 
+### MCP server (serving AEGIS tools)
+
+The other direction: AEGIS can *be* an MCP server, so an external agent harness
+— `claude` / `kimi` CLI headless runs, Claude Desktop — mounts AEGIS's GTD,
+knowledge, infra and money tools natively instead of shelling back into the chat
+API. Route: `core/src/aegis/api/routes/mcp_server.py`, one streamable-HTTP
+endpoint per agent.
+
+**Off by default**, same posture as the client: set `AEGIS_MCP_SERVER_ENABLED=true`
+(`settings.mcp_server_enabled`) and restart Core. While off, every method on the
+endpoint returns 403 with that instruction.
+
+| Method | Behaviour |
+|---|---|
+| `POST /api/mcp-server/{agent_id}` | one JSON-RPC 2.0 message per request — `initialize`, `ping`, `tools/list`, `tools/call`, plus 202 for notifications |
+| `GET /api/mcp-server/{agent_id}` | 405 — stateless, no server-initiated SSE stream |
+| `DELETE /api/mcp-server/{agent_id}` | 204 — session termination no-op |
+
+Three things bound what a mounted client can do:
+
+- **Auth** is the repo standard (`verify_auth`): `X-API-Key`, or Basic. No new scheme.
+- **The URL names an agent**, and the served tools are exactly that agent's
+  `metadata.tool_set` (the same `_get_agent_tools` the chat loop uses), so the
+  MCP surface can never be wider than that agent's chat surface. An agent id
+  with no row is a 404. Point a harness at a *narrow* agent.
+- **`call_mcp_tool` is always removed** from the served list, even when the agent
+  holds it: serving it would let an MCP client drive AEGIS's MCP *client* at a
+  third-party server (recursion, confused deputy).
+
+Responses are always `application/json`; no `Mcp-Session-Id` is issued and one
+sent by a client is ignored. A *tool* failure (bad arguments, timeout, executor
+exception) comes back as an MCP tool result with `isError: true` — argument
+errors carry the tool's schema hint so the calling model can self-correct —
+while protocol problems use JSON-RPC error envelopes (`-32700`, `-32600`,
+`-32601`, `-32602`) sent with HTTP 200, because a compliant client treats a
+non-2xx status as a transport failure and never reads the body. Results are
+truncated to 64 KB (an engine holds far more context than the small chat model,
+so the 4 KB `tool_result_max_bytes` chat cap would throw away useful output).
+Each call logs `mcp_server_tool_call` with the argument **keys** only — never
+their values.
+
+Client config for the `claude` CLI (`.mcp.json`, or Claude Desktop's config):
+
+```json
+{"mcpServers": {"aegis": {"type": "http", "url": "http://<core-host>:8080/api/mcp-server/sebas", "headers": {"X-API-Key": "<key>"}}}}
+```
+
 ### Authentication (required for non-proxied deployments)
 
 If your deployment is **NOT** behind an authenticating proxy (Cloudflare Access, an

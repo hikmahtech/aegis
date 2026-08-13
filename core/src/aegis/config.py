@@ -261,6 +261,11 @@ class Settings(BaseSettings):
     #             "auth_token": "…", "timeout_s": 30, "max_response_bytes": …}}
     # stdio is deliberately unsupported (it would spawn local processes).
     mcp_servers: dict = {}
+    # MCP — SERVER side (api/routes/mcp_server.py): serve AEGIS's own chat tools
+    # to external MCP clients (claude/kimi CLI, Claude Desktop) at
+    # POST /api/mcp-server/{agent_id}. Off by default, same default-deny posture
+    # as the client above — this door lets an outside harness run AEGIS tools.
+    mcp_server_enabled: bool = False
 
     # Worker -> Core API
     core_api_url: str = "http://localhost:8080"

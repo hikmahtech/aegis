@@ -269,6 +269,7 @@ def create_app(run_lifespan: bool = True, settings: Settings | None = None) -> F
         llm_backend,
         market,
         mcp,
+        mcp_server,
         money,
         observability,
         overview,
@@ -338,6 +339,7 @@ def create_app(run_lifespan: bool = True, settings: Settings | None = None) -> F
     app.include_router(webhooks.router)
     app.include_router(capture.router)
     app.include_router(mcp.router)
+    app.include_router(mcp_server.router)
     app.include_router(market.router)
     app.include_router(overview.router)
     app.include_router(homelab.router)
