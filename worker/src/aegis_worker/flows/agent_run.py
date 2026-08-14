@@ -18,6 +18,7 @@ Shape:
   2. poll    — `workflow.sleep(30s)` → a read-only check activity, until the
                run reports finished/failed or `timeout_minutes` elapses
   3. deliver — one chat message: header + the tail of the transcript
+  4. cleanup — remove the run's per-run worktree, on EVERY terminal path
 
 The launch is NO_RETRY because it is NOT idempotent: a retry is a SECOND CLI
 session on a second worktree, burning tokens and racing the first one's
@@ -140,6 +141,10 @@ class AgentRunFlow:
         host = str(launched.get("host") or "")
         output_file = str(launched.get("output_file") or "")
         tmux_window = str(launched.get("tmux_window") or "")
+        # Carried purely so a terminal path can remove it. Every run gets its own
+        # worktree and nothing else ever cleans one up (#300) — this value used to
+        # be threaded all the way here and then dropped.
+        worktree_path = str(launched.get("worktree_path") or "")
         deadline_s = max(1, int(inp.timeout_minutes or 30)) * 60
         # The one clock everything below is measured against: the moment the
         # run actually started. Sampled here, never re-based.
@@ -168,6 +173,11 @@ class AgentRunFlow:
                     f"attach: {where}; output: {output_file}",
                 )
                 workflow.logger.warning("agent_run_timeout run_id=%s elapsed_s=%d", run_id, elapsed)
+                # `output_file` is passed here and NOWHERE else: the run was not
+                # stopped, so the activity has to probe before removing anything.
+                # A live run keeps its worktree (and leaks it — the lesser evil);
+                # one that died between the last poll and the deadline is swept.
+                await self._cleanup(worktree_path, output_file, host)
                 return _result(
                     "timeout",
                     f"still running after {inp.timeout_minutes} min",
@@ -232,6 +242,11 @@ class AgentRunFlow:
                     status,
                     elapsed,
                 )
+                # Both terminal statuses mean the poll already OBSERVED the
+                # process gone, so no `output_file` — re-probing would only add a
+                # round trip and a fail-open window in which a dead run's
+                # worktree survives.
+                await self._cleanup(worktree_path, "", host)
                 return _result(
                     "ok" if status == "finished" else "failed",
                     str(check.get("reason") or "") or None,
@@ -254,6 +269,25 @@ class AgentRunFlow:
         except Exception as exc:  # noqa: BLE001
             workflow.logger.warning(
                 "agent_run_delivery_failed agent=%s err=%s", agent_id, _err_str(exc)
+            )
+
+    async def _cleanup(self, worktree_path: str, output_file: str, host: str) -> None:
+        """Remove the run's worktree. Same contract as `_deliver`: housekeeping
+        that runs AFTER the outcome is known must never be able to change it, so
+        a failure here is logged and swallowed — a leaked directory is not worth
+        turning a completed run into a failed workflow."""
+        if not worktree_path:
+            return
+        try:
+            await workflow.execute_activity_method(
+                AgentRunActivities.cleanup_agent_run,
+                args=[worktree_path, output_file, host],
+                start_to_close_timeout=TIMEOUT_STANDARD,
+                retry_policy=STANDARD,
+            )
+        except Exception as exc:  # noqa: BLE001
+            workflow.logger.warning(
+                "agent_run_cleanup_failed worktree=%s err=%s", worktree_path, _err_str(exc)
             )
 
 

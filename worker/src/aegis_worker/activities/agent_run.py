@@ -180,6 +180,35 @@ class AgentRunActivities:
             return {"status": "finished", "output": transcript, "reason": ""}
         return {"status": "running", "output": "", "reason": ""}
 
+    @activity.defn
+    async def cleanup_agent_run(
+        self, worktree_path: str, output_file: str = "", host: str = ""
+    ) -> dict:
+        """Remove a finished run's per-run worktree. Best-effort, idempotent.
+
+        Every run gets its own worktree and nothing else ever removes it, so
+        without this the coding host accumulates one directory and one
+        `git worktree list` registration per run, for ever (issue #300).
+
+        Removing it under a LIVE process is worse than leaking it — the run's cwd
+        would vanish mid-write — so the liveness probe decides. It fails OPEN
+        ("alive" when it cannot tell), which here means "skip the removal": the
+        safe direction for a probe that is only advisory. The flow calls this on
+        its timeout path too, where a still-running process is the norm and
+        skipping is the whole point.
+        """
+        if self.remote_script is None or not worktree_path:
+            return {"removed": False, "reason": "nothing to remove"}
+        if output_file and await self.remote_script.kimi_run_alive(output_file, host=host):
+            activity.logger.info(
+                "agent_run_cleanup_skipped_alive worktree=%s output_file=%s",
+                worktree_path,
+                output_file,
+            )
+            return {"removed": False, "reason": "run still alive"}
+        await self.remote_script.remove_worktree(worktree_path, host=host)
+        return {"removed": True, "reason": ""}
+
 
 def _tmux_window_name(engine: str, repo: str, run_id: str) -> str:
     from aegis.connectors.remote_script import _sanitize_window_repo

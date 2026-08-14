@@ -262,8 +262,9 @@ async def test_start_kimi_run_prompt_write_nonzero_rc_fails_before_launch(conn):
       1: git pull (rc=0)
       2: mkdir + git worktree add --detach (rc=0)
       3: cat > prompt_file (rc=1 — remote failure, NOT an ssh error)
+      4: worktree cleanup — nothing was launched, so nothing holds it (#300)
     """
-    procs = _make_proc_sequence([0, 0, 0, 1])
+    procs = _make_proc_sequence([0, 0, 0, 1, 0])
     with patch("asyncio.create_subprocess_exec", side_effect=procs) as mock_exec:
         result = await conn.start_kimi_run(
             repo="youruser/bcp",
@@ -273,8 +274,12 @@ async def test_start_kimi_run_prompt_write_nonzero_rc_fails_before_launch(conn):
 
     assert result["status"] == "failed"
     assert result["engine"] == "kimi"
-    # Exactly 4 subprocess calls — the launch (a 5th) must never happen.
-    assert mock_exec.call_count == 4
+    all_cmds = [" ".join(str(a) for a in c.args) for c in mock_exec.call_args_list]
+    # The launch must never happen...
+    assert not any("nohup" in cmd for cmd in all_cmds)
+    # ...and the worktree this call created must not outlive the failed launch.
+    assert any("worktree remove --force" in cmd and "-aegis-wt/" in cmd for cmd in all_cmds)
+    assert mock_exec.call_count == 5
 
 
 @pytest.mark.asyncio
@@ -302,8 +307,9 @@ async def test_start_kimi_run_launch_ssh_failure_carries_engine(conn):
     launch_proc.kill = MagicMock()
     launch_proc.wait = AsyncMock(return_value=None)
     procs.append(launch_proc)
+    procs.append(_stub_proc(returncode=0))  # 5: worktree cleanup
 
-    with patch("asyncio.create_subprocess_exec", side_effect=procs):
+    with patch("asyncio.create_subprocess_exec", side_effect=procs) as mock_exec:
         result = await conn.start_kimi_run(
             repo="youruser/bcp",
             prompt="investigate bug",
@@ -312,6 +318,9 @@ async def test_start_kimi_run_launch_ssh_failure_carries_engine(conn):
 
     assert result["status"] == "failed"
     assert result["engine"] == "kimi"
+    # ssh never connected ⇒ no process exists ⇒ the worktree is safe to remove.
+    all_cmds = [" ".join(str(a) for a in c.args) for c in mock_exec.call_args_list]
+    assert any("worktree remove --force" in cmd for cmd in all_cmds)
 
 
 @pytest.mark.asyncio
@@ -336,7 +345,7 @@ async def test_start_kimi_run_launch_timeout_engine_empty_not_fallback_eligible(
         _stub_proc(returncode=None, communicate_side_effect=TimeoutError()),
     ]
 
-    with patch("asyncio.create_subprocess_exec", side_effect=procs):
+    with patch("asyncio.create_subprocess_exec", side_effect=procs) as mock_exec:
         result = await conn.start_kimi_run(
             repo="youruser/bcp",
             prompt="investigate bug",
@@ -345,6 +354,11 @@ async def test_start_kimi_run_launch_timeout_engine_empty_not_fallback_eligible(
 
     assert result["status"] == "failed"
     assert result["engine"] == ""
+    # The same reason `engine` is blanked applies to the worktree: a possibly-
+    # live agent's cwd must not be deleted. Falsifiability pair with the
+    # ssh-failure test above, which DOES clean up.
+    all_cmds = [" ".join(str(a) for a in c.args) for c in mock_exec.call_args_list]
+    assert not any("worktree remove" in cmd for cmd in all_cmds)
 
 
 @pytest.mark.asyncio
@@ -365,6 +379,10 @@ async def test_remove_worktree_issues_git_worktree_remove(conn):
     cmd = " ".join(str(a) for a in mock_exec.call_args.args)
     assert "worktree remove --force" in cmd
     assert worktree in cmd
+    # `remove` can fail (locked, or a dirty tree) while the `rm -rf` still takes
+    # the directory — that combination is what leaves a dangling REGISTRATION in
+    # the shared clone, so the prune has to run unconditionally after it.
+    assert "worktree prune" in cmd
 
 
 @pytest.mark.asyncio
@@ -1463,7 +1481,7 @@ async def test_gated_run_without_the_mcp_mount_fails(conn_claude):
     """--permission-prompt-tool names a tool on the `aegis` MCP server. Without
     the mount the CLI cannot reach it, so every gated action would fail or hang.
     conn_claude has no mcp_server_url, so the mount is skipped."""
-    procs = _make_proc_sequence([0, 0, 0, 0])
+    procs = _make_proc_sequence([0, 0, 0, 0, 0])  # …+1 for the worktree cleanup
     with patch("asyncio.create_subprocess_exec", side_effect=procs) as mock_exec:
         result = await conn_claude.start_kimi_run(
             repo="bcp", prompt="x", kimi_binary="/k", github_repo="Acme/bcp",
@@ -1476,6 +1494,10 @@ async def test_gated_run_without_the_mcp_mount_fails(conn_claude):
     all_cmds = [" ".join(str(a) for a in c.args) for c in mock_exec.call_args_list]
     assert all("--permission-prompt-tool" not in c for c in all_cmds)
     assert all("/bin/claude --print" not in c for c in all_cmds)
+    # A refused launch must not leave its worktree behind — this is the most
+    # repeatable of the post-worktree failure paths (a misconfigured mount fails
+    # every single time), so it would leak once per attempt (#300).
+    assert any("worktree remove --force" in c for c in all_cmds)
 
 
 @pytest.mark.asyncio

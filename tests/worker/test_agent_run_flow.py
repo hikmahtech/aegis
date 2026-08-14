@@ -36,11 +36,27 @@ def _launched(**over) -> dict:
     return base
 
 
+def _cleanup_activity(calls: list[dict]):
+    """Stand-in for `cleanup_agent_run`, recording what the flow asked to remove.
+
+    Registered by every workflow test below: the flow calls it on each terminal
+    path, and an unregistered activity would turn into retries and noise rather
+    than a clear failure."""
+
+    @activity.defn(name="cleanup_agent_run")
+    async def cleanup(worktree_path, output_file="", host=""):
+        calls.append({"worktree_path": worktree_path, "output_file": output_file, "host": host})
+        return {"removed": True, "reason": ""}
+
+    return cleanup
+
+
 @pytest.mark.asyncio
 async def test_happy_path_delivers_output_tail():
     """Launch ok → first check finished → transcript tail delivered, status ok."""
     launch_calls: list[dict] = []
     check_calls: list[dict] = []
+    cleanup_calls: list[dict] = []
     delivered: list[str] = []
     transcript = "Read 14 files.\n\nSUMMARY: the retry policy is unbounded."
 
@@ -74,7 +90,7 @@ async def test_happy_path_delivers_output_tail():
             env.client,
             task_queue=task_queue,
             workflows=[AgentRunFlow],
-            activities=[launch, check, send_message],
+            activities=[launch, check, send_message, _cleanup_activity(cleanup_calls)],
         ):
             result = await env.client.execute_workflow(
                 AgentRunFlow.run,
@@ -113,6 +129,13 @@ async def test_happy_path_delivers_output_tail():
     assert check_calls[0]["probe_alive"] is False
     assert check_calls[0]["output_file"] == "/tmp/aegis-kimi-run-ab12cd34.jsonl"
 
+    # The run's worktree is removed once the run is over (#300). No `output_file`
+    # on this path: the poll already saw the process gone, so re-probing would
+    # only add a fail-open window in which a dead run's worktree survives.
+    assert cleanup_calls == [
+        {"worktree_path": "/w/aegis-scratch-aegis-wt/ab12cd34", "output_file": "", "host": "node-a"}
+    ]
+
     assert len(delivered) == 1
     assert transcript in delivered[0]
     assert "retry audit" in delivered[0]
@@ -129,6 +152,7 @@ async def test_launch_failure_is_attempted_once_and_delivered():
     `attempts == 1` fails."""
     attempts = {"count": 0}
     delivered: list[str] = []
+    cleanup_calls: list[dict] = []
     checked = {"hit": False}
 
     @activity.defn(name="launch_agent_run")
@@ -152,7 +176,7 @@ async def test_launch_failure_is_attempted_once_and_delivered():
             env.client,
             task_queue=task_queue,
             workflows=[AgentRunFlow],
-            activities=[launch, check, send_message],
+            activities=[launch, check, send_message, _cleanup_activity(cleanup_calls)],
         ):
             result = await env.client.execute_workflow(
                 AgentRunFlow.run,
@@ -163,6 +187,9 @@ async def test_launch_failure_is_attempted_once_and_delivered():
 
     assert attempts["count"] == 1, "launch must be attempted exactly once (NO_RETRY)"
     assert checked["hit"] is False
+    # Nothing launched ⇒ no worktree to remove. The connector cleans up its own
+    # half-built launches; the flow must not invent a path it never received.
+    assert cleanup_calls == []
     assert result["status"] == "failed"
     assert "Connection refused" in (result["reason"] or "")
     assert set(result) == {"status", "reason", "run_id", "engine", "host", "elapsed_s"}
@@ -175,6 +202,7 @@ async def test_missing_scratch_checkout_delivers_provision_command():
     """The connector's hard failure on a missing checkout is only fixable by
     provisioning it — the delivered message has to say how."""
     delivered: list[str] = []
+    cleanup_calls: list[dict] = []
 
     @activity.defn(name="launch_agent_run")
     async def launch(prompt, repo="", engine="", purpose="", agent_id="", gated=False):
@@ -202,7 +230,7 @@ async def test_missing_scratch_checkout_delivers_provision_command():
             env.client,
             task_queue=task_queue,
             workflows=[AgentRunFlow],
-            activities=[launch, check, send_message],
+            activities=[launch, check, send_message, _cleanup_activity(cleanup_calls)],
         ):
             result = await env.client.execute_workflow(
                 AgentRunFlow.run,
@@ -230,6 +258,7 @@ async def test_timeout_fires_at_the_deadline_and_reports_where_the_run_is():
     """
     delivered: list[str] = []
     checks = {"count": 0}
+    cleanup_calls: list[dict] = []
 
     @activity.defn(name="launch_agent_run")
     async def launch(prompt, repo="", engine="", purpose="", agent_id="", gated=False):
@@ -251,7 +280,7 @@ async def test_timeout_fires_at_the_deadline_and_reports_where_the_run_is():
             env.client,
             task_queue=task_queue,
             workflows=[AgentRunFlow],
-            activities=[launch, check, send_message],
+            activities=[launch, check, send_message, _cleanup_activity(cleanup_calls)],
         ):
             result = await env.client.execute_workflow(
                 AgentRunFlow.run,
@@ -274,6 +303,17 @@ async def test_timeout_fires_at_the_deadline_and_reports_where_the_run_is():
     assert set(result) == {"status", "reason", "run_id", "engine", "host", "elapsed_s"}
     # The run kept being polled the whole way (not abandoned after one look).
     assert checks["count"] >= 5
+    # Cleanup is attempted here too, but WITH the output file: the process was
+    # deliberately not stopped, so the activity's liveness probe — not the flow —
+    # decides whether the worktree can go. Passing "" here would delete the cwd
+    # of a run that is still writing to it.
+    assert cleanup_calls == [
+        {
+            "worktree_path": "/w/aegis-scratch-aegis-wt/ab12cd34",
+            "output_file": "/tmp/aegis-kimi-run-ab12cd34.jsonl",
+            "host": "node-a",
+        }
+    ]
     assert len(delivered) == 1
     msg = delivered[0]
     assert "still running" in msg
@@ -297,6 +337,7 @@ async def test_the_deadline_holds_when_the_polls_themselves_are_slow():
     returns pushes it arbitrarily far.
     """
     delivered: list[str] = []
+    cleanup_calls: list[dict] = []
 
     @activity.defn(name="launch_agent_run")
     async def launch(prompt, repo="", engine="", purpose="", agent_id="", gated=False):
@@ -318,7 +359,7 @@ async def test_the_deadline_holds_when_the_polls_themselves_are_slow():
             env.client,
             task_queue=task_queue,
             workflows=[AgentRunFlow],
-            activities=[launch, check, send_message],
+            activities=[launch, check, send_message, _cleanup_activity(cleanup_calls)],
         ):
             result = await env.client.execute_workflow(
                 AgentRunFlow.run,
@@ -352,6 +393,7 @@ async def test_elapsed_s_is_wall_clock_including_the_time_spent_in_the_last_poll
     fails at 60.
     """
     calls = {"count": 0}
+    cleanup_calls: list[dict] = []
 
     @activity.defn(name="launch_agent_run")
     async def launch(prompt, repo="", engine="", purpose="", agent_id="", gated=False):
@@ -375,7 +417,7 @@ async def test_elapsed_s_is_wall_clock_including_the_time_spent_in_the_last_poll
             env.client,
             task_queue=task_queue,
             workflows=[AgentRunFlow],
-            activities=[launch, check, send_message],
+            activities=[launch, check, send_message, _cleanup_activity(cleanup_calls)],
         ):
             result = await env.client.execute_workflow(
                 AgentRunFlow.run,
@@ -398,6 +440,7 @@ class _FakeRemoteScript:
         self.outputs = outputs
         self.alive = alive
         self.alive_calls = 0
+        self.removed: list[str] = []
 
     async def fetch_kimi_run_output(self, output_file: str, host: str = "") -> str | None:
         return self.outputs.pop(0) if self.outputs else None
@@ -405,6 +448,9 @@ class _FakeRemoteScript:
     async def kimi_run_alive(self, output_file: str, host: str = "") -> bool:
         self.alive_calls += 1
         return self.alive
+
+    async def remove_worktree(self, worktree_path: str, host: str = "") -> None:
+        self.removed.append(worktree_path)
 
 
 @pytest.mark.asyncio
@@ -443,6 +489,56 @@ async def test_check_does_not_probe_liveness_during_the_launch_grace():
     acts = AgentRunActivities(remote_script=fake)
     out = await acts.check_agent_run("/tmp/run.jsonl", "node-a", False)
     assert out["status"] == "running"
+    assert fake.alive_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_cleanup_removes_the_worktree_of_a_dead_run():
+    """The whole point of #300: five prod runs left five worktrees and five
+    `git worktree list` registrations behind because nothing ever called this."""
+    fake = _FakeRemoteScript([], alive=False)
+    acts = AgentRunActivities(remote_script=fake)
+    out = await acts.cleanup_agent_run("/w/aegis-scratch-aegis-wt/ab12", "/tmp/run.jsonl", "node-a")
+    assert out["removed"] is True
+    assert fake.removed == ["/w/aegis-scratch-aegis-wt/ab12"]
+
+
+@pytest.mark.asyncio
+async def test_cleanup_leaves_a_live_runs_worktree_alone():
+    """Deleting the cwd of a running agent is worse than leaking a directory.
+    The probe also fails OPEN — an inconclusive `fuser` reads as alive — so an
+    unreachable host leaks rather than destroys."""
+    fake = _FakeRemoteScript([], alive=True)
+    acts = AgentRunActivities(remote_script=fake)
+    out = await acts.cleanup_agent_run("/w/aegis-scratch-aegis-wt/ab12", "/tmp/run.jsonl", "node-a")
+    assert out["removed"] is False
+    assert "alive" in out["reason"]
+    assert fake.removed == []
+
+
+@pytest.mark.asyncio
+async def test_cleanup_without_an_output_file_skips_the_probe():
+    """Falsifiability pair with the test above: same `alive=True` connector,
+    opposite outcome, and the only difference is the empty `output_file` the
+    flow passes once a poll has already observed the process exit."""
+    fake = _FakeRemoteScript([], alive=True)
+    acts = AgentRunActivities(remote_script=fake)
+    out = await acts.cleanup_agent_run("/w/aegis-scratch-aegis-wt/ab12", "", "node-a")
+    assert out["removed"] is True
+    assert fake.alive_calls == 0
+    assert fake.removed == ["/w/aegis-scratch-aegis-wt/ab12"]
+
+
+@pytest.mark.asyncio
+async def test_cleanup_with_no_worktree_does_nothing():
+    """`start_kimi_run` falls back to the SHARED clone when `worktree add`
+    fails, and reports an empty path for it. Removing that would delete the
+    checkout every future run depends on."""
+    fake = _FakeRemoteScript([], alive=False)
+    acts = AgentRunActivities(remote_script=fake)
+    out = await acts.cleanup_agent_run("", "/tmp/run.jsonl", "node-a")
+    assert out["removed"] is False
+    assert fake.removed == []
     assert fake.alive_calls == 0
 
 
@@ -568,6 +664,12 @@ def test_the_fakes_signatures_really_do_match_the_real_connector():
         real.bind(None, output_file="/tmp/run.jsonl", host="node-a")
         fake.bind(None, output_file="/tmp/run.jsonl", host="node-a")
 
+    real_rm = inspect.signature(RemoteScriptConnector.remove_worktree)
+    fake_rm = inspect.signature(_FakeRemoteScript.remove_worktree)
+    assert list(fake_rm.parameters) == list(real_rm.parameters)
+    real_rm.bind(None, worktree_path="/w/r-aegis-wt/ab12", host="node-a")
+    fake_rm.bind(None, worktree_path="/w/r-aegis-wt/ab12", host="node-a")
+
 
 @pytest.mark.asyncio
 async def test_gated_input_reaches_the_launch_activity():
@@ -576,6 +678,7 @@ async def test_gated_input_reaches_the_launch_activity():
     enforces it; a dropped flag here produces an ungated run that reports
     success — exactly the outcome the gate exists to prevent."""
     launch_calls: list[dict] = []
+    cleanup_calls: list[dict] = []
 
     @activity.defn(name="launch_agent_run")
     async def launch(prompt, repo="", engine="", purpose="", agent_id="", gated=False):
@@ -596,7 +699,7 @@ async def test_gated_input_reaches_the_launch_activity():
             env.client,
             task_queue=task_queue,
             workflows=[AgentRunFlow],
-            activities=[launch, check, send_message],
+            activities=[launch, check, send_message, _cleanup_activity(cleanup_calls)],
         ):
             for gated in (True, False):
                 await env.client.execute_workflow(
