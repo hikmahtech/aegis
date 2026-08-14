@@ -486,7 +486,7 @@ Todoist coupling removed, so investigation, research and analysis are equally
 valid asks — the run gets a filesystem, a full tool budget and its own
 time, and AEGIS gets the transcript tail back in chat.
 
-Two invariants worth knowing before you touch `flows/agent_run.py`:
+Three invariants worth knowing before you touch `flows/agent_run.py`:
 
 - **The launch activity is `NO_RETRY`.** Launching is not idempotent — a retry
   is a second CLI session on a second worktree, burning tokens and racing the
@@ -496,6 +496,15 @@ Two invariants worth knowing before you touch `flows/agent_run.py`:
   answer and the operator can attach to its tmux window, so the flow reports
   where the run is (`tmux window <name> on <host>`, plus the output file) and
   exits with `status: "timeout"`.
+- **Every terminal path calls `cleanup_agent_run`.** Nothing else removes a
+  run's worktree, so a missing call leaks one directory and one
+  `git worktree list` registration per run, for ever (#300). The activity
+  probes liveness before removing anything and the flow passes `output_file`
+  only on the timeout path — where the process was deliberately *not* killed,
+  so a live run keeps its worktree (leaking it is better than deleting the cwd
+  it is writing to). `start_kimi_run` cleans up after its own failed launches
+  for the same reason, except a launch that TIMED OUT, which may already have
+  forked the agent.
 
 Completion is detected by **process exit**, not by the `STATUS:` footer
 `alerts._kimi_output_complete` looks for: that regex accepts a closed

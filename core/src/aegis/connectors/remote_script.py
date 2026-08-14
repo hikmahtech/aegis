@@ -945,6 +945,9 @@ class RemoteScriptConnector:
             logger.warning(
                 "kimi_prompt_write_failed", error=wrote["stderr"], exit_code=wrote["exit_code"]
             )
+            # Nothing was launched, so nothing can be holding the worktree: this
+            # method owns what it created up to the point a process exists.
+            await self.remove_worktree(worktree_path, host=host)
             return {
                 "run_id": run_id,
                 "status": "failed",
@@ -966,6 +969,7 @@ class RemoteScriptConnector:
                 "that the run carries an agent_id."
             )
             logger.warning("gated_run_mcp_mount_missing", agent_id=agent_id, run_id=run_id)
+            await self.remove_worktree(worktree_path, host=host)
             return {"run_id": run_id, "status": "failed", "error": error, "engine": engine}
 
         # Phase 4: launch the agent. tmux mode → live-attachable window with
@@ -1011,6 +1015,12 @@ class RemoteScriptConnector:
             launch = await self._exec(host, nohup_cmd, timeout=15)
             if launch["exit_code"] == -1:  # ssh error/timeout, not a remote rc
                 logger.warning("kimi_start_failed", error=launch["stderr"])
+                # Same reasoning as the engine field below: a TIMED-OUT launch may
+                # already have forked the agent remotely, and pulling the worktree
+                # out from under a live process is worse than leaking it. A clean
+                # ssh/connect failure never started anything, so it cleans up.
+                if launch["status"] != "timed_out":
+                    await self.remove_worktree(worktree_path, host=host)
                 return {
                     "run_id": run_id,
                     "status": "failed",
@@ -1321,10 +1331,16 @@ class RemoteScriptConnector:
         parts = worktree_path.split("-aegis-wt/")
         repo_path = parts[0]
 
+        # `prune` is not redundant with `remove`: a `worktree remove` that fails
+        # (locked, or a dirty tree git won't force past) still leaves the `rm -rf`
+        # to delete the directory, and that combination leaves a REGISTRATION
+        # behind — which is what makes `git worktree list` in the shared clone
+        # useless for telling live runs from dead ones.
         rm_cmd = (
             f"git -C {shlex.quote(repo_path)} worktree remove --force "
             f"{shlex.quote(worktree_path)} 2>/dev/null; "
-            f"rm -rf {shlex.quote(worktree_path)}"
+            f"rm -rf {shlex.quote(worktree_path)}; "
+            f"git -C {shlex.quote(repo_path)} worktree prune"
         )
         await self._refresh_config()
         result = await self._exec(host or self._host, rm_cmd, timeout=30)
