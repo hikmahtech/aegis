@@ -17,6 +17,12 @@ on:
     paths:
       - "core/**"
       - "admin-panel/frontend/src/**"
+      # tests/core/test_pwa_manifest.py asserts on the PWA install
+      # contract, which lives OUTSIDE src/ (public/sw.js, public/manifest.json,
+      # index.html). Without these the sw.js no-fetch-handler guard is
+      # silently disarmed by the very edit it exists to catch (#170).
+      - "admin-panel/frontend/public/**"
+      - "admin-panel/frontend/index.html"
       - "tests/core/**"
       - "tests/api/**"
       - "tests/integration/**"
@@ -31,6 +37,12 @@ on:
     paths:
       - "core/**"
       - "admin-panel/frontend/src/**"
+      # tests/core/test_pwa_manifest.py asserts on the PWA install
+      # contract, which lives OUTSIDE src/ (public/sw.js, public/manifest.json,
+      # index.html). Without these the sw.js no-fetch-handler guard is
+      # silently disarmed by the very edit it exists to catch (#170).
+      - "admin-panel/frontend/public/**"
+      - "admin-panel/frontend/index.html"
       - "tests/core/**"
       - "tests/api/**"
       - "tests/integration/**"
