@@ -29,11 +29,41 @@ function onUnauthorized(): never {
   throw new Error('API 401: Unauthorized');
 }
 
+// An expired authenticating-proxy session (Cloudflare Access) does NOT surface
+// as a 401. The proxy answers with a 302 to its own login host; fetch() follows
+// it, CORS blocks reading the cross-origin response, and we get a TypeError —
+// so onUnauthorized() above never runs and the user just sees a broken screen.
+// Reloading turns the same request into a top-level *navigation*, which the
+// browser is allowed to follow, landing them on the login page. This matters
+// most in the installed PWA, where "just hit refresh" is not obvious.
+//
+// Only once per page-load: a flaky mobile connection raises the identical
+// TypeError, and reloading on every blip would thrash the app in a loop. The
+// second failure is therefore reported normally, which is also what makes a
+// genuinely offline device settle on the browser's offline page instead.
+//
+// ponytail: cannot distinguish "session expired" from "wifi dropped" — both are
+// an opaque TypeError, by design in the fetch spec. Reloading is correct for the
+// first and harmless for the second, so we do not try to tell them apart.
+let didReloadForNetworkError = false;
+function onNetworkError(err: unknown): never {
+  if (!didReloadForNetworkError) {
+    didReloadForNetworkError = true;
+    window.location.reload();
+  }
+  throw err;
+}
+
 export async function apiFetch<T>(path: string, options?: RequestInit): Promise<T> {
-  const resp = await fetch(`${API_BASE}${path}`, {
-    ...options,
-    headers: { ...headers(), ...(options?.headers || {}) },
-  });
+  let resp: Response;
+  try {
+    resp = await fetch(`${API_BASE}${path}`, {
+      ...options,
+      headers: { ...headers(), ...(options?.headers || {}) },
+    });
+  } catch (err) {
+    onNetworkError(err);
+  }
   if (resp.status === 401) onUnauthorized();
   if (!resp.ok) {
     // Read the body before throwing: FastAPI puts the *reason* in `detail`, and
@@ -168,11 +198,18 @@ export const api = {
     fd.append('source_type', source_type);
     fd.append('tags', tags);
     const token = authToken();
-    const resp = await fetch(`${API_BASE}/api/knowledge/upload`, {
-      method: 'POST',
-      headers: token ? { Authorization: `Basic ${token}` } : {},
-      body: fd,
-    });
+    let resp: Response;
+    try {
+      resp = await fetch(`${API_BASE}/api/knowledge/upload`, {
+        method: 'POST',
+        headers: token ? { Authorization: `Basic ${token}` } : {},
+        body: fd,
+      });
+    } catch (err) {
+      // Same expired-proxy-session case as apiFetch — this call can't reuse it
+      // because multipart must leave Content-Type to the browser.
+      onNetworkError(err);
+    }
     if (resp.status === 401) onUnauthorized();
     if (!resp.ok) throw new Error(`API ${resp.status}: ${resp.statusText}`);
     return resp.json();
