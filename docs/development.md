@@ -384,6 +384,37 @@ npm run dev     # Dev server on port 5173
 npm run build   # Build for production (served by Core)
 ```
 
+### PWA assets and the one rule that must not be broken
+
+The panel is an installable PWA. The pieces live in `admin-panel/frontend/public/`
+(`manifest.json`, `sw.js`, `icon-192.png`, `icon-512.png`, `icon-maskable-512.png`);
+Vite copies `public/*` to the `dist/` root and Core's SPA catch-all
+(`api/app.py::serve_spa`) serves them, so adding a file there needs no route change.
+
+**`sw.js` must not register a `fetch` handler.** Chrome requires a *registered* service
+worker before it offers "Install app", but it does not require the worker to do anything —
+so this one does nothing on purpose.
+
+The reason is that AEGIS is typically deployed behind an authenticating proxy. A service
+worker that answers navigation requests from cache turns an expired proxy session into a
+bricked app: the shell boots from cache, its API calls hit the proxy's cross-origin redirect
+to a login page, that redirect fails silently inside `fetch()`, and the user has no route
+back short of uninstalling. Letting navigations reach the network means the browser follows
+the redirect normally and the user logs in.
+
+If offline caching is ever genuinely wanted, it must pass navigations straight through:
+
+```js
+if (event.request.mode === 'navigate') return;  // never cache navigations
+```
+
+`tests/core/test_pwa_manifest.py` enforces this, along with the manifest fields Chrome needs
+to offer an install. It asserts on the *source* files rather than a build, because `dist/` is
+gitignored and CI never runs `vite build` — a test that needed the bundle would pass by
+skipping. Note that its inputs sit outside `admin-panel/frontend/src/**`, so `core.yml`'s
+`paths:` filter also lists `public/**` and `index.html`; without those, editing `sw.js` would
+not trigger the job that guards it.
+
 ## Content Extraction Setup
 
 The worker's content extraction pipeline requires system-level dependencies for PDF, image, and media processing:
