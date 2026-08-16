@@ -72,6 +72,64 @@ and schedules — edit them in the admin UI, not by copying YAML onto a volume.
 (A DB `activities.config` change propagates to the live Temporal schedule within
 ~300s, no redeploy.)
 
+## Installing the admin panel on a phone
+
+The admin panel is an installable PWA, so you can run AEGIS from a home-screen icon
+rather than a browser tab. Nothing needs enabling — it ships installable.
+
+**Neither platform pops up an offer**, which is the usual reason people think it is
+broken:
+
+- **Android** (Chrome, Brave): ⋮ menu → **Install app** / *Add to Home screen*.
+  Automatic install banners were retired years ago; the menu entry is the way in.
+- **iOS / iPadOS**: Safari → Share → **Add to Home Screen**. iOS has never
+  implemented an install prompt, and every iOS browser — Brave and Chrome included —
+  is WebKit underneath, so none of them will ever offer one. Use Safari to install;
+  the installed app runs standalone regardless of which browser you normally use.
+
+Two things worth knowing before you install:
+
+**HTTPS with a valid certificate is required.** A service worker will not register
+without it, and no service worker means no install offer. This is why a bare
+`https://<ip>` cannot work — a certificate can't be issued for a private IP. If you
+reach AEGIS over a LAN-only address, give it a real hostname and a real certificate.
+
+**The installed app is permanently bound to the origin you installed it from.**
+`start_url` and `scope` are `/`, and the API client uses same-origin relative paths,
+so the app never names a host — it talks to whoever served it. If you run AEGIS on
+two hostnames (say a public one and an internal split-horizon one), installing from
+each gives you two *separate* apps: two icons, two service workers, two local
+storages. They are not a fallback pair, and nothing warns you when the internal one
+stops resolving off-network. **Install from the hostname that works everywhere.**
+
+### Behind an authenticating proxy
+
+If you front AEGIS with an auth proxy (Cloudflare Access, oauth2-proxy, Authelia…),
+the installed app handles the login redirect correctly: launching it is a top-level
+navigation, so the browser follows the redirect to your identity provider, you
+authenticate, and it returns. This works because `sw.js` deliberately has no fetch
+handler — see [`development.md`](development.md#pwa-assets-and-the-one-rule-that-must-not-be-broken).
+
+An expiry that happens **while the app is already open** is the awkward case, and it
+is handled explicitly. Such a session does not expire as a `401`: the proxy answers
+with a redirect to its own login host, `fetch()` follows it, CORS blocks reading the
+cross-origin response, and the caller gets an opaque `TypeError`. The API client
+(`admin-panel/frontend/src/api/client.ts`) catches that and reloads the page **once**,
+which converts the request into a navigation the browser is allowed to follow — so you
+land on the login page instead of a dead screen.
+
+It reloads only once per page-load on purpose: a flaky mobile connection raises the
+identical `TypeError`, and reloading on every blip would thrash. The second failure is
+reported normally, which is also what lets a genuinely offline device settle on the
+browser's offline page. There is no way to tell the two cases apart — the fetch spec
+gives an opaque error for both by design.
+
+Set a generous proxy session lifetime and this is rare regardless.
+
+**Older iOS:** below iOS 16.4 the manifest's `display: standalone` is ignored and the
+app opens wrapped in Safari's UI. Add `<meta name="apple-mobile-web-app-capable"
+content="yes">` to `index.html` if you need to support those versions.
+
 ## Features that stay inert until you act
 
 Several subsystems ship `active: true` but deliberately do nothing until an operator
