@@ -40,9 +40,26 @@ _TEST_SETTINGS = {
     "api_key": "",
 }
 
-# Paths legitimately reachable without verify_auth.
-_ALLOWLIST_EXACT = {"/health"}
-_ALLOWLIST_PREFIXES = ("/api/webhooks/",)
+# Paths legitimately reachable without verify_auth. Every entry is a deliberate
+# decision, not an accident of where the path sits — see _guarded_routes.
+_ALLOWLIST_EXACT = {
+    "/health",  # liveness probe; must answer without credentials
+    # The admin-panel SPA shell. Serving the bundle anonymously is intentional
+    # and unavoidable — a browser has to fetch the login page before it can
+    # authenticate. The API calls the shell then makes are all guarded.
+    "/{path:path}",
+}
+_ALLOWLIST_PREFIXES = (
+    "/api/webhooks/",  # each verifies its own HMAC / shared secret
+    "/assets",  # hashed JS/CSS for the SPA shell, StaticFiles mount
+)
+
+# Routes that must NOT exist at all under default settings. Allowlisting these
+# would be wrong: they aren't "public by design", they're FastAPI defaults that
+# leak a full API map, so `expose_api_docs` is off unless an operator opts in
+# (#305). Asserted absent rather than asserted-401, because gating them behind
+# auth is no protection in an `auth_disabled=true` deployment.
+_MUST_NOT_EXIST = ("/docs", "/redoc", "/openapi.json")
 
 
 @pytest.fixture
@@ -71,13 +88,22 @@ def _walk(routes) -> list[APIRoute]:
     return found
 
 
-def _api_routes(app) -> list[tuple[str, str]]:
-    """Every registered /api route as (method, path), minus the allowlist."""
+def _guarded_routes(app) -> list[tuple[str, str]]:
+    """Every registered route as (method, path), minus the public allowlist.
+
+    Walks **all** routes, not just ``/api`` ones (#306). The previous version
+    skipped anything outside ``/api``, which meant a route mounted elsewhere was
+    invisible to this audit and shipped unauthenticated with no CI signal — which
+    is exactly how FastAPI's own ``/docs`` and ``/openapi.json`` stayed anonymous
+    (#305) while this test reported full coverage.
+
+    Being public is now an explicit allowlist entry rather than a side effect of
+    where a path happens to sit, so a new anonymous route has to be added to
+    ``_ALLOWLIST_*`` in a diff a human reads.
+    """
     out: list[tuple[str, str]] = []
     for route in _walk(app.routes):
         path = route.path
-        if not path.startswith("/api"):
-            continue  # /health, /openapi.json, SPA fallback
         if path in _ALLOWLIST_EXACT or path.startswith(_ALLOWLIST_PREFIXES):
             continue
         for method in sorted(route.methods - {"HEAD", "OPTIONS"}):
@@ -92,8 +118,8 @@ async def auth_app(settings):
     return app
 
 
-async def test_every_api_route_rejects_anonymous(auth_app):
-    routes = _api_routes(auth_app)
+async def test_every_route_rejects_anonymous(auth_app):
+    routes = _guarded_routes(auth_app)
     # Sanity-check the walk itself: if create_app ever stops registering
     # routers, an empty list would make this test vacuously green.
     assert len(routes) > 50, f"route walk looks broken, found only: {routes}"
@@ -116,6 +142,65 @@ async def test_health_is_reachable_anonymously(auth_app):
     async with AsyncClient(transport=transport, base_url="http://test") as client:
         resp = await client.get("/health")
     assert resp.status_code == 200
+
+
+async def test_audit_catches_unauthenticated_routes_outside_api(auth_app):
+    """Proves the widened walk has teeth (#306).
+
+    Necessary because of a nasty property of this suite: in a test environment
+    the ONLY non-``/api`` route registered is ``/health`` (the SPA catch-all
+    needs a built ``dist/``, and the docs routes are off by default), so
+    switching the walk from "/api only" to "everything" cannot be observed by
+    the other tests here — they would pass identically either way.
+
+    So inject a route where the old filter had a blind spot and assert the audit
+    both lists it and flags it as anonymous. Revert the walk to
+    ``path.startswith("/api")`` and this fails.
+    """
+    auth_app.add_api_route("/sneaky-unauthed", lambda: {"ok": True}, methods=["GET"])
+
+    assert ("GET", "/sneaky-unauthed") in _guarded_routes(auth_app), (
+        "audit is blind to routes outside /api — the #306 regression"
+    )
+
+    transport = ASGITransport(app=auth_app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.get("/sneaky-unauthed")
+    assert resp.status_code == 200, "sanity: the injected route really is anonymous"
+
+
+async def test_interactive_docs_are_off_by_default(auth_app):
+    """#305: /docs, /redoc and /openapi.json must not be registered at all.
+
+    FastAPI adds these itself, outside the router tree every /api path goes
+    through, so they carry no auth dependency. An anonymous caller reading
+    /openapi.json gets every endpoint, parameter and schema in one request.
+    """
+    # getattr: app.routes also holds _IncludedRouter wrappers with no `.path`.
+    registered = {p for r in auth_app.routes if (p := getattr(r, "path", None))}
+    exposed = [p for p in _MUST_NOT_EXIST if p in registered]
+    assert not exposed, f"interactive docs exposed by default: {exposed}"
+
+    transport = ASGITransport(app=auth_app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        for path in _MUST_NOT_EXIST:
+            resp = await client.get(path)
+            # The SPA catch-all answers unknown paths with index.html, so 200 is
+            # only acceptable when it is NOT the schema. A JSON body here would
+            # mean openapi is still being served.
+            assert resp.status_code != 200 or "openapi" not in resp.text[:200], (
+                f"{path} still serving API schema anonymously"
+            )
+
+
+async def test_interactive_docs_can_be_opted_into(settings):
+    """The switch has to actually work, or developers will just delete it."""
+    settings.expose_api_docs = True
+    app = create_app(run_lifespan=False, settings=settings)
+    registered = {p for r in app.routes if (p := getattr(r, "path", None))}
+    assert {"/docs", "/openapi.json"} <= registered, (
+        f"expose_api_docs=True did not register the docs routes: {sorted(registered)[:10]}"
+    )
 
 
 async def test_auth_disabled_allows_anonymous(settings):
