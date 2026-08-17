@@ -52,13 +52,30 @@ def _encode_jsonb(value: Any) -> str:
 
 
 async def _init_connection(conn: asyncpg.Connection) -> None:
-    """Set up JSONB codec so asyncpg returns Python objects, not strings."""
+    """Set up the JSONB codec and pgvector's filtered-search behaviour."""
     await conn.set_type_codec(
         "jsonb",
         encoder=_encode_jsonb,
         decoder=json.loads,
         schema="pg_catalog",
     )
+    # pgvector's HNSW scan stops after `hnsw.ef_search` candidates (default 40)
+    # NO MATTER what LIMIT the query asks for. `KnowledgeStore.search` is a
+    # two-stage "ANN candidates, then filter" query, so that cap lands upstream
+    # of every source_type/tags filter: measured in prod, an inner LIMIT of 400,
+    # 2000 and 10000 each returned exactly 40 rows, and a search filtered to
+    # source_type='intelligence' (0.05% of the corpus) returned 1 document.
+    # `iterative_scan` keeps scanning until the LIMIT is satisfied instead, so
+    # the existing oversample actually means something. It is also FASTER here
+    # (16ms vs 28ms measured) because it stops as soon as it has enough.
+    # `relaxed_order` rather than `strict_order`: the outer query already
+    # re-sorts by similarity, so we don't pay for ordering pgvector would only
+    # have to redo. Requires pgvector >= 0.8; older builds don't know the GUC,
+    # so tolerate that rather than making the whole pool un-creatable.
+    try:
+        await conn.execute("SET hnsw.iterative_scan = relaxed_order")
+    except asyncpg.PostgresError as exc:
+        logger.warning("hnsw_iterative_scan_unavailable", error=str(exc)[:200])
 
 
 async def create_pool(database_url: str, min_size: int = 2, max_size: int = 10) -> asyncpg.Pool:

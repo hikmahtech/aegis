@@ -38,6 +38,7 @@ class RssIngestFlow:
         )
         total_entries = 0
         total_ingested = 0
+        total_failed = 0
         errors = 0
         per_feed: list[dict] = []
 
@@ -83,6 +84,7 @@ class RssIngestFlow:
                 continue
 
             feed_ingested = 0
+            feed_failed = 0
             # Track the highest entry timestamp that has a DEFINITE
             # outcome — either `process_content` succeeded, or the
             # entry was a known dup (idempotency claim already held).
@@ -91,7 +93,22 @@ class RssIngestFlow:
             # KS another shot. Earlier code blindly advanced to
             # `result.latest_published`, which silently dropped failed
             # entries on the floor.
+            #
+            # Taking the MAX of resolved entries was not enough, because a
+            # batch is not ordered by outcome. If entry A (10:00) fails and
+            # entry B (11:00) resolves, the max is 11:00 and `fetch_feed`'s
+            # `published_iso <= since_cursor` filter then excludes A for good.
+            # `earliest_failed_published` is the real ceiling: the cursor may
+            # only move to the newest resolved entry OLDER than the oldest
+            # failure. Measured cost of not doing this: 553 of 3835 arXiv
+            # entries (14%) lost over 14 days, in two large overnight batches.
             latest_resolved_published: str | None = None
+            earliest_failed_published: str | None = None
+            # A failure we cannot place in time can't be fenced by a timestamp
+            # comparison, so the whole feed holds its cursor for this run
+            # rather than risk stepping over it. Costs a re-fetch, never a drop.
+            saw_untimed_failure = False
+            resolved_published_all: list[str] = []
             for entry in result.entries:
                 external_id = entry.get("id") or entry.get("link", "")
                 if not external_id:
@@ -138,15 +155,50 @@ class RssIngestFlow:
                             str(exc)[:200],
                         )
 
-                    feed_ingested += 1
                     if entry_ok:
+                        # Only a real ingest counts. This used to increment
+                        # unconditionally, so `ingested` in result_summary
+                        # counted failures as successes — the one number an
+                        # operator would have checked said everything landed.
+                        feed_ingested += 1
                         resolved_published = entry.get("published") or None
+                    else:
+                        feed_failed += 1
+                        # Hand the claim back, or the retry this cursor logic
+                        # is protecting can never happen: the next poll would
+                        # re-see the entry, get "not new", and treat it as a
+                        # known dup — which is exactly how a batch can report
+                        # 299 entries and 0 ingested.
+                        await workflow.execute_activity(
+                            "ingest_idempotency_release",
+                            args=["rss", external_id],
+                            start_to_close_timeout=_ACT_TIMEOUT,
+                            retry_policy=ACT_RETRY,
+                        )
+                        failed_published = entry.get("published") or None
+                        if not failed_published:
+                            saw_untimed_failure = True
+                        elif (
+                            earliest_failed_published is None
+                            or failed_published < earliest_failed_published
+                        ):
+                            earliest_failed_published = failed_published
 
-                if resolved_published and (
-                    latest_resolved_published is None
-                    or resolved_published > latest_resolved_published
-                ):
-                    latest_resolved_published = resolved_published
+                if resolved_published:
+                    resolved_published_all.append(resolved_published)
+
+            # Cursor ceiling: newest resolved entry strictly older than the
+            # oldest failure. Computed after the loop because a failure can
+            # appear after the resolved entry it has to fence.
+            if saw_untimed_failure:
+                latest_resolved_published = None
+            else:
+                eligible = [
+                    p
+                    for p in resolved_published_all
+                    if earliest_failed_published is None or p < earliest_failed_published
+                ]
+                latest_resolved_published = max(eligible) if eligible else None
 
             total_entries += len(result.entries)
             total_ingested += feed_ingested
@@ -167,17 +219,24 @@ class RssIngestFlow:
                     retry_policy=ACT_RETRY,
                 )
 
-            per_feed.append(
-                {
-                    "feed": identifier,
-                    "entries": len(result.entries),
-                    "ingested": feed_ingested,
-                }
-            )
+            entry_summary = {
+                "feed": identifier,
+                "entries": len(result.entries),
+                "ingested": feed_ingested,
+            }
+            # Report failures, and report a HELD cursor as its own fact. Both
+            # were previously invisible: `entries: 299, ingested: 0` looked
+            # like a quiet feed rather than a batch that lost everything.
+            if feed_failed:
+                entry_summary["failed"] = feed_failed
+                entry_summary["cursor_held"] = latest_resolved_published is None
+            per_feed.append(entry_summary)
+            total_failed += feed_failed
 
         return {
             "entries": total_entries,
             "ingested": total_ingested,
+            "failed": total_failed,
             "errors": errors,
             "feeds": per_feed,
         }

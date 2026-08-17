@@ -21,6 +21,7 @@ _calls: dict[str, list] = {
     "content": [],
     "ingest": [],
     "cursor": [],
+    "released": [],
 }
 
 
@@ -72,6 +73,14 @@ async def stub_fetch(inp: FetchFeedInput) -> FetchFeedResult:
 @activity.defn(name="ingest_idempotency_claim")
 async def stub_idem(source_type: str, external_id: str) -> bool:
     _calls["idem"].append((source_type, external_id))
+    return True
+
+
+@activity.defn(name="ingest_idempotency_release")
+async def stub_release(source_type: str, external_id: str) -> bool:
+    # A failed entry hands its claim back so the next poll can retry it
+    # instead of reading the stale claim as "already handled".
+    _calls["released"].append((source_type, external_id))
     return True
 
 
@@ -215,6 +224,7 @@ async def test_rss_cursor_does_not_advance_past_failed_entries():
                 stub_list,
                 stub_fetch,
                 stub_idem,
+                stub_release,
                 selective_content,
                 stub_ingest,
                 stub_cursor,

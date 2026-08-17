@@ -541,7 +541,17 @@ class GmailActivities:
 
         # (A) Confident sender-reputation cache -> trust it, skip the LLM.
         cached = await self._triage_lookup(sender) if (sender and self.db_pool) else None
-        if cached and cached["n"] >= _CACHE_MIN_N and cached["confidence"] >= _CACHE_MIN_CONF:
+        if (
+            cached
+            and cached["n"] >= _CACHE_MIN_N
+            and cached["confidence"] >= _CACHE_MIN_CONF
+            # A row that has never recorded tags cannot answer the fan-out
+            # question, and a sender above the threshold never reaches the LLM
+            # again — so short-circuiting here would strand it tagless forever.
+            # Fall through to the LLM ONCE; the upsert below records the tags
+            # and every later message for this sender takes the cache path.
+            and cached.get("tags") is not None
+        ):
             category = cap_notification_category(cached["category"], subject, extra_markers)
             # (#262) A sender above the threshold never reaches the LLM, and
             # only the LLM path used to re-teach the cache — so a wrong verdict
@@ -554,7 +564,9 @@ class GmailActivities:
             return {
                 "category": category,
                 "confidence": cached["confidence"],
-                "tags": [],
+                # Replay the LLM's tags. Returning [] here is what disabled the
+                # MoneyProcessFlow fan-out for every cached financial sender.
+                "tags": list(cached.get("tags") or []),
                 "reason": "",
                 "summary": "",
                 "lane": lane,
@@ -633,13 +645,16 @@ class GmailActivities:
             # important_action reputation and start short-circuiting the LLM
             # straight into a Todoist task.
             category = cap_notification_category(category, subject, extra_markers)
-            # Teach the per-sender cache so repeat senders skip the LLM next time.
+            # Teach the per-sender cache so repeat senders skip the LLM next
+            # time — including the tags, which the cache hit replays into the
+            # fan-out decision.
+            tags = _parse_tags(parsed.get("tags"))
             if sender and self.db_pool:
-                await self._triage_upsert(sender, category)
+                await self._triage_upsert(sender, category, tags)
             return {
                 "category": category,
                 "confidence": float(parsed.get("confidence", 0.7)),
-                "tags": _parse_tags(parsed.get("tags")),
+                "tags": tags,
                 "reason": str(parsed.get("reason") or "").strip(),
                 "summary": str(parsed.get("summary") or "").strip(),
                 "lane": lane,
@@ -1088,8 +1103,14 @@ class GmailActivities:
             return merge_email_rules(None)
 
     async def _triage_lookup(self, sender: str) -> dict | None:
-        """Return {category, n, confidence} for a sender from triage_state, or
-        None. Best-effort — never raises into the classifier."""
+        """Return {category, n, confidence, tags} for a sender from
+        triage_state, or None. Best-effort — never raises into the classifier.
+
+        `tags` is None when the row has never recorded any (every row written
+        before the tags column existed), which is NOT the same as `[]` — see
+        the cache-hit branch in `classify_email`, which refuses to
+        short-circuit on a tagless row precisely so it can learn them.
+        """
         try:
             async with self.db_pool.acquire() as conn:
                 row = await conn.fetchrow(
@@ -1099,19 +1120,34 @@ class GmailActivities:
             if not row:
                 return None
             meta = _triage_meta(row)
+            raw_tags = meta.get("tags")
             return {
                 "category": row["state"],
                 "n": int(meta.get("n", 0)),
                 "confidence": float(meta.get("confidence", 0.0)),
+                "tags": _parse_tags(raw_tags) if isinstance(raw_tags, list) else None,
             }
         except Exception as exc:
             activity.logger.warning("triage_lookup_failed sender=%s err=%s", sender, str(exc)[:120])
             return None
 
-    async def _triage_upsert(self, sender: str, category: str) -> None:
+    async def _triage_upsert(
+        self, sender: str, category: str, tags: list[str] | None = None
+    ) -> None:
         """Reinforce a sender's cached category. Agreement raises confidence;
         disagreement lowers it and flips the category once it bottoms out.
-        Best-effort — never raises into the classifier."""
+        Best-effort — never raises into the classifier.
+
+        `tags` is the LLM's content tags for this message. They are stored so a
+        later cache hit can replay them: the fan-out in `GmailIngestFlow` keys
+        on `financial`/`payments`, so a cache hit that returned `[]` silently
+        disabled receipt extraction for every sender that ever got cached
+        (same defect class as #263, which fixed it for `sender_overrides` only).
+        Pass None from the non-LLM callers (the cap-decay path) to PRESERVE the
+        tags already on the row — a decay must not wipe what the LLM taught.
+        Tags describe what the mail IS, not how much attention it deserves, so
+        they deliberately survive a category flip.
+        """
         if not sender or not self.db_pool:
             return
         try:
@@ -1122,6 +1158,8 @@ class GmailActivities:
                 )
                 if row is None:
                     meta = {"n": 1, "confidence": 0.6, "category": category}
+                    if tags is not None:
+                        meta["tags"] = list(tags)
                     # Pass the dict directly — the pool's asyncpg jsonb codec
                     # (db/pool.py::_init_connection) encodes it. json.dumps here
                     # would double-encode it into a JSON string scalar.
@@ -1147,6 +1185,12 @@ class GmailActivities:
                     else:
                         new_cat = cur
                 meta = {"n": n, "confidence": round(conf, 3), "category": new_cat}
+                # None => caller has nothing to teach; keep what we already know.
+                prior_tags = _triage_meta(row).get("tags")
+                if tags is not None:
+                    meta["tags"] = list(tags)
+                elif isinstance(prior_tags, list):
+                    meta["tags"] = list(prior_tags)
                 await conn.execute(
                     "UPDATE triage_state SET state = $2, metadata = $3, updated_at = now() "
                     "WHERE email_addr = $1",

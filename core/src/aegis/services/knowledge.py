@@ -215,11 +215,15 @@ class KnowledgeStore:
             return []
         # ponytail: oversampling (limit * 20, floor 200) is a fixed guess at
         # how many ANN candidates survive the source_type/tags/content_id
-        # filters. A very selective filter can still legitimately return
-        # fewer than `limit` matches even though more exist further out in
-        # the corpus. If that ever matters in practice, upgrade to iterative
-        # widening (re-run with 2x/4x oversample when the filtered result is
-        # short) instead of raising the fixed multiplier for everyone.
+        # filters.
+        #
+        # This number is only honoured because `_init_connection`
+        # (db/pool.py) sets `hnsw.iterative_scan = relaxed_order`. Without it
+        # pgvector's HNSW scan returns at most `hnsw.ef_search` rows (default
+        # 40) regardless of this LIMIT, which silently capped every filtered
+        # search — a search for source_type='intelligence' (0.05% of the prod
+        # corpus) returned ONE document. If you ever see filtered searches come
+        # back short again, check that GUC before touching this multiplier.
         oversample = max(limit * 20, 200)
         rows = await self._pool.fetch(
             """

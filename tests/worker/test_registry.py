@@ -235,10 +235,14 @@ def test_module_workflows_is_the_unflagged_registry():
         # `dispatch_agent_run` chat tool), unflagged, so all three rows move.
         # Then +1 activity and NO new flow from #300's `cleanup_agent_run`,
         # which removes the run's per-run worktree on AgentRunFlow's terminal
-        # paths (nothing else ever did, so every run leaked one).
-        (True, True, 39, 191),
-        (False, False, 31, 162),
-        (True, False, 35, 180),
+        # paths (nothing else ever did, so every run leaked one). Then +1
+        # activity and NO new flow from `ingest_idempotency_release` on the
+        # existing ChannelActivities — RssIngestFlow hands a claim back when
+        # `process_content` fails, so the entry is retried on the next poll
+        # instead of being read as an already-handled dup.
+        (True, True, 39, 192),
+        (False, False, 31, 163),
+        (True, False, 35, 181),
     ],
 )
 def test_real_registration_passes_the_boot_check(homelab, money, flows, activities):

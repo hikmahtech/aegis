@@ -275,10 +275,16 @@ activities:
   # NOTE: the runtime value comes from this config (the schedule_sync mapper
   # reads activities.config); the IntelligenceScanInput dataclass default is a
   # dead fallback. Tune per-source if needed.
+  # Scan times must stay AHEAD of daily-briefing-raphael (04:30 UTC), which is
+  # the only surface these items reach. They ran at 07:00/07:30/08:00 — i.e.
+  # 2.5-3.5 hours AFTER the briefing that reports them — so every briefing
+  # could only ever describe yesterday's scan. 01:00/01:30/02:00 leaves a >2h
+  # margin for the */15 ClarifyFlow tick that turns the #research captures into
+  # `source_type='reference'` rows, which the briefing also reads.
   - slug: intel-scan-hn
     workflow_type: IntelligenceScanFlow
     agent_id: raphael
-    schedule_cron: "0 7 * * *"
+    schedule_cron: "0 1 * * *"
     config:
       source: hn
       topics: [ai, systems, startups]
@@ -288,7 +294,7 @@ activities:
   - slug: intel-scan-news
     workflow_type: IntelligenceScanFlow
     agent_id: raphael
-    schedule_cron: "30 7 * * *"
+    schedule_cron: "30 1 * * *"
     config:
       source: news
       topics: [world, tech]
@@ -298,7 +304,7 @@ activities:
   - slug: intel-scan-finance
     workflow_type: IntelligenceScanFlow
     agent_id: raphael
-    schedule_cron: "0 8 * * *"
+    schedule_cron: "0 2 * * *"
     config:
       source: finance
       topics: [equities, macro, crypto]
@@ -407,11 +413,12 @@ activities:
   # cycle, forever.
   #
   # 07:25 UTC: the only free daily slot in the morning band. Hour 7 already
-  # holds intel-scan-hn + cert-radar at :00 and intel-scan-news at :30, and
-  # :15 is the */15 sweep minute (gtd-clarify, llm-spend-guard) — :25 collides
-  # with nothing but the two cheap */5 pollers. Sits after cert-radar so the
-  # two radars never contend, and hours before money-hygiene (09:00), which
-  # is the other card-raising daily flow.
+  # holds cert-radar at :00, and :15 is the */15 sweep minute (gtd-clarify,
+  # llm-spend-guard) — :25 collides with nothing but the two cheap */5
+  # pollers. Sits after cert-radar so the two radars never contend, and hours
+  # before money-hygiene (09:00), which is the other card-raising daily flow.
+  # (The intel scans used to share this hour; they moved to 01:00-02:00 so
+  # they land before the 04:30 briefing that reports them.)
   - slug: expiry-radar-daily
     workflow_type: ExpiryRadarFlow
     agent_id: sebas

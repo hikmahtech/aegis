@@ -78,7 +78,7 @@ async def test_cached_important_action_notification_is_capped_before_routing():
     if the cap is only applied to LLM verdicts.
     """
     llm = _CountingLlm()
-    g = _make(llm=llm, lookup={"category": "important_action", "n": 6, "confidence": 0.9})
+    g = _make(llm=llm, lookup={"category": "important_action", "n": 6, "confidence": 0.9, "tags": []})
     msg = {
         "id": "m",
         "sender": "Google <no-reply@accounts.google.com>",
@@ -110,7 +110,10 @@ async def test_llm_important_action_notification_is_capped_before_it_teaches_the
     }
     res = await ActivityEnvironment().run(g.classify_email, msg, "")
     assert res["category"] == "important_read"
-    g._triage_upsert.assert_awaited_once_with("security-noreply@linkedin.com", "important_read")
+    # Third arg is the LLM's tags, cached so the fan-out survives a cache hit.
+    g._triage_upsert.assert_awaited_once_with(
+        "security-noreply@linkedin.com", "important_read", ["security"]
+    )
 
 
 @pytest.mark.asyncio
@@ -121,7 +124,7 @@ async def test_capped_cache_hit_reteaches_the_cache_so_a_stuck_sender_can_decay(
     itself could do. The CAPPED verdict must be what goes back.
     """
     llm = _CountingLlm()
-    g = _make(llm=llm, lookup={"category": "important_action", "n": 6, "confidence": 0.9})
+    g = _make(llm=llm, lookup={"category": "important_action", "n": 6, "confidence": 0.9, "tags": []})
     msg = {
         "id": "m",
         "sender": "Google <no-reply@accounts.google.com>",
@@ -141,7 +144,7 @@ async def test_uncapped_cache_hit_leaves_the_cache_alone():
     every cached verdict at 1.0 and making the LLM unreachable for good.
     """
     llm = _CountingLlm()
-    g = _make(llm=llm, lookup={"category": "important_action", "n": 6, "confidence": 0.9})
+    g = _make(llm=llm, lookup={"category": "important_action", "n": 6, "confidence": 0.9, "tags": []})
     msg = {
         "id": "m",
         "sender": "boss@co.com",
@@ -167,7 +170,10 @@ async def test_a_capped_sender_stops_short_circuiting_the_llm(db_pool):
         "INSERT INTO triage_state (email_addr, state, metadata, updated_at) "
         "VALUES ($1, 'important_action', $2, now())",
         sender,
-        {"n": 6, "confidence": 0.9, "category": "important_action"},
+        # `tags` present (even empty) is what makes this a cacheable row —
+        # a row without the key is treated as pre-tags legacy state and
+        # deliberately falls through to the LLM. See test_triage_cache_tags.
+        {"n": 6, "confidence": 0.9, "category": "important_action", "tags": []},
     )
     # No llm_client on purpose: a cache MISS lands on source='fallback', so
     # 'cache' below cannot be an accident of the default return shape.
@@ -250,7 +256,7 @@ async def test_sender_override_classifies_without_the_llm_or_the_cache():
     llm = _CountingLlm(json.dumps({"category": "important_action", "confidence": 0.9}))
     g = _make(
         llm=llm,
-        lookup={"category": "important_action", "n": 9, "confidence": 1.0},
+        lookup={"category": "important_action", "n": 9, "confidence": 1.0, "tags": []},
         rules={"sender_overrides": {"@substack.com": "informational"}},
     )
     msg = {

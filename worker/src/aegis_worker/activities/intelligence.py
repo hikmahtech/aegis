@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from aegis.llm import parse_llm_json
+from aegis.services.knowledge import _content_id_for
 from temporalio import activity
 
 
@@ -32,26 +33,47 @@ class IntelligenceActivities:
 
     @activity.defn
     async def dedup_items(self, items: list[dict]) -> list[dict]:
-        """Filter out items already covered in the knowledge graph."""
+        """Filter out items already covered in the knowledge graph.
+
+        Identity, not similarity. This used to ask `search(title, limit=1)` and
+        skip on `similarity >= 0.85`, which is the wrong instrument twice over:
+        a vector search answers "what is this like", and pgvector's HNSW scan
+        only ever considers `hnsw.ef_search` candidates — so against a corpus
+        where intelligence is a fraction of a percent, a genuine duplicate
+        usually was not in the window and the check quietly passed everything.
+        A dedupe that fails open is not a dedupe.
+
+        The knowledge store already keys content on `sha1(url)` (see
+        `KnowledgeStore._content_id_for`), so an exact lookup is both correct
+        and cheaper. Items without a URL keep the old fail-open behaviour —
+        there is nothing to key on, and re-ingesting beats dropping.
+        """
         if not self.knowledge_connector or not items:
             return items
 
         novel = []
         for item in items:
-            title = item.get("title", "")
+            url = (item.get("url") or item.get("link") or "").strip()
+            if not url:
+                novel.append(item)
+                continue
             try:
-                results = await self.knowledge_connector.search(title, limit=1)
-                if results and any(r.get("similarity", 0) >= 0.85 for r in results):
-                    activity.logger.info("intel_dedup_skip", extra={"title": title})
+                status = await self.knowledge_connector.get_content_status(
+                    _content_id_for(url)
+                )
+                if (status or {}).get("status") == "completed":
+                    activity.logger.info(
+                        "intel_dedup_skip", extra={"title": item.get("title", "")}
+                    )
                     continue
             except Exception as exc:
-                # KS search down → fall back to "treat as novel" (we'd rather
+                # KS down → fall back to "treat as novel" (we'd rather
                 # re-ingest on the next tick than silently drop a candidate).
                 # Logging means operators see KS flakiness instead of inferring
                 # from missing analyses downstream.
                 activity.logger.warning(
-                    "intel_dedup_search_failed title=%s err=%s",
-                    title[:80],
+                    "intel_dedup_lookup_failed url=%s err=%s",
+                    url[:120],
                     str(exc)[:200],
                 )
             novel.append(item)
