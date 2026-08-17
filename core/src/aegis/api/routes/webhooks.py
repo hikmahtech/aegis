@@ -118,6 +118,14 @@ LIFE_MAX_BODY_BYTES = 64 * 1024
 # Replay window for X-Aegis-Timestamp, in seconds, either direction.
 LIFE_TIMESTAMP_WINDOW_SECONDS = 300
 
+# Same treatment for /alert, which is the one webhook that can be left
+# unauthenticated (blank `alert_webhook_secret` is a documented legacy default),
+# and whose work per request is unbounded: every element of the posted array can
+# spawn an AlertInvestigationFlow, i.e. LLM spend plus Todoist/Slack writes.
+# A real Alertmanager or Grafana group is a handful of alerts in a few KiB.
+ALERT_MAX_BODY_BYTES = 256 * 1024
+ALERT_MAX_ALERTS_PER_REQUEST = 50
+
 # One opaque failure for every authentication outcome — a missing header, a
 # malformed one, a stale timestamp and a wrong signature are indistinguishable
 # to the caller. Anything more specific is a probing oracle.
@@ -531,7 +539,10 @@ async def alert_webhook(
             logger.warning("alert_webhook_bad_token")
             raise HTTPException(status_code=401, detail="bad_token")
 
-    body = await request.body()
+    # Bounded + streamed, like /life/: `await request.body()` would buffer an
+    # arbitrarily large body into memory before any check ran, and this endpoint
+    # is reachable unauthenticated whenever the secret is unset.
+    body = await _read_bounded_body(request, ALERT_MAX_BODY_BYTES)
     try:
         payload = _json.loads(body)
     except Exception as exc:
@@ -546,6 +557,22 @@ async def alert_webhook(
         alerts_raw = payload.get("alerts") or [payload]
     else:
         alerts_raw = []
+
+    # Cap the fan-out. Each surviving alert spawns a child workflow that costs
+    # LLM budget and writes to Todoist/Slack, so an oversized array is an
+    # amplification vector rather than a big-but-harmless request. Truncate
+    # loudly instead of silently: a genuine group this large is itself a signal
+    # worth seeing in the logs.
+    dropped = 0
+    if len(alerts_raw) > ALERT_MAX_ALERTS_PER_REQUEST:
+        dropped = len(alerts_raw) - ALERT_MAX_ALERTS_PER_REQUEST
+        logger.warning(
+            "alert_webhook_truncated",
+            received=len(alerts_raw),
+            cap=ALERT_MAX_ALERTS_PER_REQUEST,
+            dropped=dropped,
+        )
+        alerts_raw = alerts_raw[:ALERT_MAX_ALERTS_PER_REQUEST]
 
     pool = request.app.state.db_pool
     started = 0
@@ -622,8 +649,8 @@ async def alert_webhook(
         )
         started += 1
 
-    logger.info("alert_webhook_processed", started=started, skipped=skipped)
-    return {"accepted": True, "started": started, "skipped": skipped}
+    logger.info("alert_webhook_processed", started=started, skipped=skipped, dropped=dropped)
+    return {"accepted": True, "started": started, "skipped": skipped, "dropped": dropped}
 
 
 @router.post("/todoist")
