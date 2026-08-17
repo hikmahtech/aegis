@@ -287,10 +287,20 @@ def create_app(run_lifespan: bool = True, settings: Settings | None = None) -> F
         webhooks,
     )
 
+    # Interactive docs are default-deny (#305). FastAPI registers /docs, /redoc
+    # and /openapi.json itself, so they never pick up the `verify_auth`
+    # dependency every /api router carries — leaving them on publishes a
+    # complete endpoint + schema map to anonymous callers. `resolved_settings is
+    # None` (tests, unconfigured env) must land on OFF for the same reason.
+    expose_docs = bool(resolved_settings and resolved_settings.expose_api_docs)
+
     app = FastAPI(
         title="AEGIS",
         version="0.1.0",
         lifespan=lifespan if run_lifespan else None,
+        docs_url="/docs" if expose_docs else None,
+        redoc_url="/redoc" if expose_docs else None,
+        openapi_url="/openapi.json" if expose_docs else None,
     )
 
     # Single-origin self-hosted deployment: the admin-panel SPA is served from

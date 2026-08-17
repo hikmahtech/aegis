@@ -89,6 +89,15 @@ class Settings(BaseSettings):
     # string reaches _parse_cors_allowed_origins, which splits it on commas.
     cors_allowed_origins: Annotated[list[str], NoDecode] = Field(default_factory=list)
 
+    # Expose FastAPI's interactive docs — /docs, /redoc, /openapi.json. OFF by
+    # default (#305): FastAPI mounts those itself, so they carry none of the
+    # `verify_auth` dependencies every /api router gets, and an anonymous caller
+    # gets a complete map of every endpoint and schema. Gating them behind auth
+    # instead would be no protection at all in the common `auth_disabled=true`
+    # topology, so the switch is explicit rather than tied to the auth posture.
+    # Turn on for local development: AEGIS_EXPOSE_API_DOCS=true.
+    expose_api_docs: bool = False
+
     # Connectors
     vercel_token: str = ""
     vercel_team_id: str = ""

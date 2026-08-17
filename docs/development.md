@@ -375,6 +375,34 @@ To confirm auth is actually on, an anonymous request must be rejected:
 curl -s -o /dev/null -w '%{http_code}\n' http://<host>:8080/api/agents   # expect 401
 ```
 
+## Interactive API docs (`/docs`) are off by default
+
+`/docs`, `/redoc` and `/openapi.json` are **not registered** unless you opt in:
+
+```bash
+AEGIS_EXPOSE_API_DOCS=true python -m aegis
+```
+
+FastAPI mounts those routes itself, so they never pick up the `verify_auth`
+dependency that every `/api` router carries — leaving them on hands an anonymous
+caller a complete map of every endpoint, parameter and schema (#305). Gating them
+behind auth instead would be no protection at all in the common
+`AEGIS_AUTH_DISABLED=true` topology, which is why this is an explicit switch
+rather than something derived from the auth posture.
+
+`tests/core/test_route_auth_coverage.py` asserts both directions: absent by
+default, and present when the flag is on (a switch nobody can turn on gets
+deleted).
+
+That same file is the auth audit for **every** registered route, not just `/api`
+ones. Being reachable anonymously is an explicit `_ALLOWLIST_*` entry — `/health`,
+`/api/webhooks/*` (each verifies its own HMAC), and the SPA shell plus its
+`/assets`. It previously skipped anything outside `/api`, which is how the docs
+routes stayed anonymous while the test reported full coverage (#306). Note that
+in a test environment `/health` is the *only* non-`/api` route registered, so one
+test deliberately injects a route outside `/api` to prove the audit can still see
+it — without that, narrowing the walk back again would break nothing visibly.
+
 ## Admin Panel Development
 
 ```bash
