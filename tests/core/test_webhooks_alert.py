@@ -356,6 +356,80 @@ async def test_alert_webhook_open_when_secret_unset(token_client):
     assert resp.json()["started"] == 1
 
 
+# --- Bearer auth (#304) ------------------------------------------------------
+#
+# The secret stayed blank in production because neither sender can set an
+# arbitrary header on the pinned versions, but both speak Bearer: alertmanager
+# via http_config.authorization, grafana via the webhook contact point's
+# authorization_scheme/authorization_credentials. Accepting Bearer is what makes
+# the secret settable without taking alerting down.
+
+
+async def test_alert_accepts_bearer_token(token_client, temporal_stub):
+    async with token_client("s3cret") as c:
+        resp = await c.post(
+            "/api/webhooks/alert",
+            content=_FIRING,
+            headers={"Authorization": "Bearer s3cret"},
+        )
+    assert resp.status_code == 200
+    assert resp.json()["started"] == 1
+    temporal_stub.start_workflow.assert_awaited()
+
+
+async def test_bearer_scheme_is_case_insensitive(token_client):
+    """"Bearer" is a case-insensitive token per RFC 7235."""
+    async with token_client("s3cret") as c:
+        resp = await c.post(
+            "/api/webhooks/alert",
+            content=_FIRING,
+            headers={"Authorization": "bearer s3cret"},
+        )
+    assert resp.status_code == 200
+
+
+async def test_x_alert_token_still_works(token_client):
+    """The original header must keep working — do not break existing callers."""
+    async with token_client("s3cret") as c:
+        resp = await c.post(
+            "/api/webhooks/alert", content=_FIRING, headers={"X-Alert-Token": "s3cret"}
+        )
+    assert resp.status_code == 200
+
+
+@pytest.mark.parametrize(
+    "headers",
+    [
+        pytest.param({"Authorization": "Bearer wrong"}, id="wrong-credential"),
+        pytest.param({"Authorization": "s3cret"}, id="no-scheme"),
+        pytest.param({"Authorization": "Basic s3cret"}, id="wrong-scheme"),
+        pytest.param({"Authorization": "Bearer"}, id="scheme-only"),
+        pytest.param({"Authorization": "Bearer "}, id="empty-credential"),
+        pytest.param({"X-Alert-Token": "wrong"}, id="wrong-x-alert-token"),
+        pytest.param({}, id="no-header-at-all"),
+    ],
+)
+async def test_alert_rejects_bad_credentials(token_client, temporal_stub, headers):
+    """Every near-miss must 401 — adding a second accepted header must not
+    accidentally widen what counts as authenticated."""
+    async with token_client("s3cret") as c:
+        resp = await c.post("/api/webhooks/alert", content=_FIRING, headers=headers)
+    assert resp.status_code == 401
+    temporal_stub.start_workflow.assert_not_awaited()
+
+
+async def test_blank_secret_ignores_a_supplied_bearer(token_client):
+    """With no secret configured the endpoint stays open (legacy default) and a
+    stray Authorization header must not turn into a rejection."""
+    async with token_client("") as c:
+        resp = await c.post(
+            "/api/webhooks/alert",
+            content=_FIRING,
+            headers={"Authorization": "Bearer anything"},
+        )
+    assert resp.status_code == 200
+
+
 # --- Abuse caps (#304) -------------------------------------------------------
 #
 # /alert is the one webhook that can legitimately run unauthenticated (a blank

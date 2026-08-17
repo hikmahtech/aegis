@@ -523,6 +523,22 @@ async def sentry_webhook(
     }
 
 
+def _alert_token_ok(request: Request, secret: str) -> bool:
+    """True if the request presents ``secret`` in either accepted header.
+
+    Both are compared with ``hmac.compare_digest`` so neither is a timing
+    oracle. The Authorization scheme is matched case-insensitively because
+    "Bearer" is a case-insensitive token per RFC 7235, while the credential
+    itself is compared exactly.
+    """
+    if hmac.compare_digest(request.headers.get("X-Alert-Token") or "", secret):
+        return True
+
+    authorization = request.headers.get("Authorization") or ""
+    scheme, _, credential = authorization.partition(" ")
+    return scheme.lower() == "bearer" and hmac.compare_digest(credential.strip(), secret)
+
+
 @router.post("/alert")
 async def alert_webhook(
     request: Request,
@@ -532,25 +548,38 @@ async def alert_webhook(
     """Generic alert webhook (Alertmanager/Grafana).
 
     Alertmanager and Grafana don't sign their payloads, so there is no vendor
-    HMAC to verify here. Set ``AEGIS_ALERT_WEBHOOK_SECRET`` to require a
-    matching ``X-Alert-Token`` header; leaving it empty keeps the endpoint
-    unauthenticated (the legacy default, kept for backward compatibility).
+    HMAC to verify here. Set ``AEGIS_ALERT_WEBHOOK_SECRET`` and the caller must
+    present it, in **either** of two headers:
 
-    An unauthenticated alert endpoint lets anyone who can reach the port mint
-    fake alerts, each spawning an AlertInvestigationFlow that burns LLM budget
-    and posts to Todoist/Slack — so set the secret whenever port 8080 is not
-    fully fronted by an authenticating proxy (#88).
+    * ``X-Alert-Token: <secret>`` — the original scheme.
+    * ``Authorization: Bearer <secret>`` — because neither sender can set an
+      arbitrary header on the version pinned here, but both speak Bearer:
+      alertmanager via ``http_config.authorization`` and grafana via the webhook
+      contact point's ``authorization_scheme``/``authorization_credentials``.
+      Without this the secret is unsettable without breaking alerting, which is
+      why it stayed blank (#304).
+
+    Leaving the secret empty keeps the endpoint unauthenticated — the legacy
+    default, kept for backward compatibility, and a footgun: it lets anyone who
+    can reach the port mint fake alerts, each spawning an AlertInvestigationFlow
+    that burns LLM budget and posts to Todoist/Slack. Worse than the cost, alert
+    labels and annotations are caller-controlled text handed to an autonomous LLM
+    flow holding write tools, and they all share the ``aegis-main`` task queue, so
+    a flood starves every other flow. Set the secret whenever this endpoint is
+    reachable by anything you don't trust (#88, #304).
 
     Body: Alertmanager v2 or Grafana Unified Alerting JSON. Each alert
     in the payload spawns one AlertInvestigationFlow child. Dedup'd via
     ingest_idempotency on the alert's fingerprint (or a derived one if
     missing).
     """
-    if settings.alert_webhook_secret:
-        token = request.headers.get("X-Alert-Token") or ""
-        if not hmac.compare_digest(token, settings.alert_webhook_secret):
-            logger.warning("alert_webhook_bad_token")
-            raise HTTPException(status_code=401, detail="bad_token")
+    # Blank secret = open, the legacy default: the `and` short-circuits before
+    # _alert_token_ok, so an unconfigured deployment never rejects.
+    if settings.alert_webhook_secret and not _alert_token_ok(
+        request, settings.alert_webhook_secret
+    ):
+        logger.warning("alert_webhook_bad_token")
+        raise HTTPException(status_code=401, detail="bad_token")
 
     # Bounded + streamed, like /life/: `await request.body()` would buffer an
     # arbitrarily large body into memory before any check ran, and this endpoint
