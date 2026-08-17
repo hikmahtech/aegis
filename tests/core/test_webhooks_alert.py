@@ -400,6 +400,25 @@ async def test_alert_fanout_is_capped(alert_client):
     assert temporal.start_workflow.await_count == ALERT_MAX_ALERTS_PER_REQUEST
 
 
+async def test_whole_cluster_outage_is_not_truncated():
+    """The ceiling must clear a total-outage group, not just a normal one.
+
+    This homelab loses power to half the cluster periodically, and alertmanager
+    groups by (alertname, cluster, service) — so one `DockerServiceDown` event
+    arrives as a single group carrying an entry per swarm service.
+
+    Truncation keeps the FIRST N and each kept alert claims
+    `ingest_idempotency`, so on the `group_interval` resend the same first N are
+    skipped as duplicates and the dropped tail is never reached. Dropping here
+    is permanent loss during the incident that matters most, which is why the
+    cap is an abuse ceiling far above real traffic rather than a tight bound.
+    """
+    assert ALERT_MAX_ALERTS_PER_REQUEST >= 300, (
+        "cap is too tight to survive a whole-cluster outage group; the dropped "
+        "tail would be lost permanently, not retried. See the constant's comment."
+    )
+
+
 async def test_normal_sized_group_is_untouched(alert_client):
     """The cap must not clip a realistic Alertmanager group.
 

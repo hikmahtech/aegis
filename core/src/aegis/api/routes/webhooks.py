@@ -122,9 +122,22 @@ LIFE_TIMESTAMP_WINDOW_SECONDS = 300
 # unauthenticated (blank `alert_webhook_secret` is a documented legacy default),
 # and whose work per request is unbounded: every element of the posted array can
 # spawn an AlertInvestigationFlow, i.e. LLM spend plus Todoist/Slack writes.
-# A real Alertmanager or Grafana group is a handful of alerts in a few KiB.
-ALERT_MAX_BODY_BYTES = 256 * 1024
-ALERT_MAX_ALERTS_PER_REQUEST = 50
+#
+# These are ABUSE ceilings, deliberately far above real traffic — not a way to
+# shape it. Sizing matters in both directions:
+#
+#   * Too high and a small body of minimal alerts (~22 bytes each) mints
+#     thousands of workflows.
+#   * Too LOW and a genuine incident loses alerts, permanently. Truncation keeps
+#     the FIRST N, and every kept alert claims `ingest_idempotency`; on
+#     Alertmanager's `group_interval` resend the same first N are claimed and
+#     skipped, so the dropped tail is never reached on a later attempt. A
+#     whole-cluster outage is precisely when the group is largest and when
+#     losing alerts costs most, so the ceiling has to clear that case with room
+#     to spare: alertmanager groups by (alertname, cluster, service), so one
+#     `DockerServiceDown` event can carry an entry per swarm service at once.
+ALERT_MAX_BODY_BYTES = 1024 * 1024
+ALERT_MAX_ALERTS_PER_REQUEST = 500
 
 # One opaque failure for every authentication outcome — a missing header, a
 # malformed one, a stale timestamp and a wrong signature are indistinguishable
