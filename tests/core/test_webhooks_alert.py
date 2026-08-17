@@ -11,6 +11,7 @@ import pytest_asyncio
 from aegis.api.app import create_app
 from aegis.api.deps import get_settings
 from aegis.api.routes.interactions import get_workflow_client
+from aegis.api.routes.webhooks import ALERT_MAX_ALERTS_PER_REQUEST, ALERT_MAX_BODY_BYTES
 from aegis.config import Settings
 from httpx import ASGITransport, AsyncClient
 
@@ -82,7 +83,7 @@ async def test_alertmanager_firing_spawns_flow(alert_client):
     }
     resp = await c.post("/api/webhooks/alert", content=json.dumps(payload))
     assert resp.status_code == 200
-    assert resp.json() == {"accepted": True, "started": 1, "skipped": 0}
+    assert resp.json() == {"accepted": True, "started": 1, "skipped": 0, "dropped": 0}
     temporal.start_workflow.assert_awaited_once()
     call = temporal.start_workflow.call_args
     assert call.args[0] == "AlertInvestigationFlow"
@@ -103,7 +104,7 @@ async def test_resolved_alert_skipped(alert_client):
     }
     resp = await c.post("/api/webhooks/alert", content=json.dumps(payload))
     assert resp.status_code == 200
-    assert resp.json() == {"accepted": True, "started": 0, "skipped": 1}
+    assert resp.json() == {"accepted": True, "started": 0, "skipped": 1, "dropped": 0}
     temporal.start_workflow.assert_not_awaited()
 
 
@@ -194,7 +195,7 @@ async def test_multiple_alerts_mixed_status(settings, temporal_stub):
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
         resp = await c.post("/api/webhooks/alert", content=json.dumps(payload))
 
-    assert resp.json() == {"accepted": True, "started": 2, "skipped": 1}
+    assert resp.json() == {"accepted": True, "started": 2, "skipped": 1, "dropped": 0}
 
 
 async def test_bare_single_alert_dict_handled(alert_client):
@@ -242,7 +243,7 @@ async def test_resolved_alert_writes_resolved_audit_row(alert_client_real_db, db
         {"alerts": [{"status": "resolved", "labels": {"alertname": "HighCPU"}, "fingerprint": fp}]}
     ).encode()
     resp = await client.post("/api/webhooks/alert", content=payload)
-    assert resp.json() == {"accepted": True, "started": 0, "skipped": 1}
+    assert resp.json() == {"accepted": True, "started": 0, "skipped": 1, "dropped": 0}
     temporal.start_workflow.assert_not_awaited()
 
     async with db_pool.acquire() as conn:
@@ -353,3 +354,88 @@ async def test_alert_webhook_open_when_secret_unset(token_client):
         resp = await c.post("/api/webhooks/alert", content=_FIRING)
     assert resp.status_code == 200
     assert resp.json()["started"] == 1
+
+
+# --- Abuse caps (#304) -------------------------------------------------------
+#
+# /alert is the one webhook that can legitimately run unauthenticated (a blank
+# `alert_webhook_secret` is a documented legacy default), and its work per
+# request is unbounded: every array element can spawn an AlertInvestigationFlow,
+# which costs LLM budget and writes to Todoist/Slack. These caps bound what a
+# single request can do regardless of who sent it.
+
+
+async def test_oversized_body_rejected_before_parsing(alert_client):
+    """413 rather than buffering an arbitrarily large body into memory.
+
+    The read is streamed, so this must fail on size alone — the payload is
+    deliberately not valid JSON, so reaching the parser at all would be the bug.
+    """
+    c, temporal = alert_client
+    resp = await c.post("/api/webhooks/alert", content=b"x" * (ALERT_MAX_BODY_BYTES + 1))
+    assert resp.status_code == 413
+    assert resp.json()["detail"] == "body_too_large"
+    temporal.start_workflow.assert_not_awaited()
+
+
+async def test_alert_fanout_is_capped(alert_client):
+    """A huge array must not spawn one workflow per element."""
+    c, temporal = alert_client
+    over = ALERT_MAX_ALERTS_PER_REQUEST + 25
+    payload = {
+        "alerts": [
+            {
+                "status": "firing",
+                "labels": {"alertname": f"Flood{i}", "instance": "node-a"},
+                "fingerprint": f"flood-{i}",
+            }
+            for i in range(over)
+        ]
+    }
+    resp = await c.post("/api/webhooks/alert", content=json.dumps(payload))
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["started"] == ALERT_MAX_ALERTS_PER_REQUEST
+    assert body["dropped"] == 25
+    assert temporal.start_workflow.await_count == ALERT_MAX_ALERTS_PER_REQUEST
+
+
+async def test_whole_cluster_outage_is_not_truncated():
+    """The ceiling must clear a total-outage group, not just a normal one.
+
+    This homelab loses power to half the cluster periodically, and alertmanager
+    groups by (alertname, cluster, service) — so one `DockerServiceDown` event
+    arrives as a single group carrying an entry per swarm service.
+
+    Truncation keeps the FIRST N and each kept alert claims
+    `ingest_idempotency`, so on the `group_interval` resend the same first N are
+    skipped as duplicates and the dropped tail is never reached. Dropping here
+    is permanent loss during the incident that matters most, which is why the
+    cap is an abuse ceiling far above real traffic rather than a tight bound.
+    """
+    assert ALERT_MAX_ALERTS_PER_REQUEST >= 300, (
+        "cap is too tight to survive a whole-cluster outage group; the dropped "
+        "tail would be lost permanently, not retried. See the constant's comment."
+    )
+
+
+async def test_normal_sized_group_is_untouched(alert_client):
+    """The cap must not clip a realistic Alertmanager group.
+
+    Guards against a future cap set so tight it silently drops real alerts —
+    the failure mode this endpoint already has too much of.
+    """
+    c, temporal = alert_client
+    payload = {
+        "alerts": [
+            {
+                "status": "firing",
+                "labels": {"alertname": f"Real{i}", "instance": "node-a"},
+                "fingerprint": f"real-{i}",
+            }
+            for i in range(10)
+        ]
+    }
+    resp = await c.post("/api/webhooks/alert", content=json.dumps(payload))
+    assert resp.status_code == 200
+    assert resp.json() == {"accepted": True, "started": 10, "skipped": 0, "dropped": 0}
