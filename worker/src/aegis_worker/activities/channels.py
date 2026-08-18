@@ -97,3 +97,28 @@ class ChannelActivities:
                 external_id,
             )
         return result is not None
+
+    @activity.defn
+    async def ingest_idempotency_release(self, source_type: str, external_id: str) -> bool:
+        """Give a claim back after the work it guarded failed.
+
+        A claim taken by `ingest_idempotency_claim` says "this item is handled".
+        When the handling then fails, leaving the claim in place turns a
+        RETRYABLE failure into a permanent drop: the next poll re-sees the item,
+        the claim returns "not new", and the caller treats it as a known dup and
+        moves on. Releasing puts the item back in line for the next tick.
+
+        Returns True when a row was actually removed, so a caller can tell a
+        real release from a no-op. Same DELETE the alert webhook already does
+        (`core/src/aegis/api/routes/webhooks.py`) — this is that pattern made
+        available to flows.
+        """
+        if not self.db_pool:
+            return False
+        async with self.db_pool.acquire() as conn:
+            result = await conn.execute(
+                "DELETE FROM ingest_idempotency WHERE source_type = $1 AND external_id = $2",
+                source_type,
+                external_id,
+            )
+        return result.endswith(" 1")

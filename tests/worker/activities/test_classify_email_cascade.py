@@ -41,7 +41,7 @@ def _make(llm=None, lookup=None) -> GmailActivities:
 @pytest.mark.asyncio
 async def test_confident_cache_hit_skips_llm():
     llm = _CountingLlm()
-    g = _make(llm=llm, lookup={"category": "important_read", "n": 5, "confidence": 0.9})
+    g = _make(llm=llm, lookup={"category": "important_read", "n": 5, "confidence": 0.9, "tags": []})
     msg = {"id": "m", "sender": "Acme <a@acme.com>", "subject": "s", "snippet": "b", "labels": []}
     res = await ActivityEnvironment().run(g.classify_email, msg, "")
     assert res["category"] == "important_read"

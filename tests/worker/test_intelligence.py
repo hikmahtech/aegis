@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 import pytest_asyncio
 from aegis.llm import LLMClient, LLMTruncationError
+from aegis.services.knowledge import _content_id_for
 from aegis_worker.activities.intelligence import IntelligenceActivities
 from temporalio.testing import ActivityEnvironment
 
@@ -22,7 +23,7 @@ def mock_kc():
 
 
 async def test_dedup_items_passes_novel_items(mock_kc):
-    mock_kc.search = AsyncMock(return_value=[])
+    mock_kc.get_content_status = AsyncMock(return_value={"status": "not_found"})
     act = IntelligenceActivities(knowledge_connector=mock_kc)
     env = ActivityEnvironment()
     items = [
@@ -42,12 +43,56 @@ async def test_dedup_items_passes_novel_items(mock_kc):
 
 
 async def test_dedup_items_removes_duplicates(mock_kc):
-    mock_kc.search = AsyncMock(return_value=[{"similarity": 0.9, "content": "Already seen"}])
+    mock_kc.get_content_status = AsyncMock(return_value={"status": "completed"})
     act = IntelligenceActivities(knowledge_connector=mock_kc)
     env = ActivityEnvironment()
     items = [{"title": "Old news", "url": "https://example.com/old", "snippet": "..."}]
     result = await env.run(act.dedup_items, items)
     assert len(result) == 0
+
+
+async def test_dedup_is_identity_not_similarity(mock_kc):
+    """The dedupe used to ask `search(title, limit=1)` and skip on
+    similarity >= 0.85. A vector search answers "what is this like", and
+    pgvector only ever considers `hnsw.ef_search` candidates — so against a
+    corpus where intelligence is a fraction of a percent, a real duplicate
+    usually was not in the window and the check passed everything. A dedupe
+    that fails open is not a dedupe.
+
+    A search that returns NOTHING must not stop a URL-identical duplicate
+    being caught: this fails if the similarity path is ever reinstated.
+    """
+    mock_kc.search = AsyncMock(return_value=[])
+    mock_kc.get_content_status = AsyncMock(return_value={"status": "completed"})
+    act = IntelligenceActivities(knowledge_connector=mock_kc)
+
+    result = await ActivityEnvironment().run(
+        act.dedup_items, [{"title": "Old news", "url": "https://example.com/old"}]
+    )
+
+    assert result == []
+    # keyed on the knowledge store's own content id, sha1(url)
+    mock_kc.get_content_status.assert_awaited_once_with(
+        _content_id_for("https://example.com/old")
+    )
+
+
+async def test_dedup_keeps_an_item_with_no_url(mock_kc):
+    """Nothing to key on — re-ingesting beats dropping a candidate."""
+    mock_kc.get_content_status = AsyncMock(return_value={"status": "completed"})
+    act = IntelligenceActivities(knowledge_connector=mock_kc)
+    result = await ActivityEnvironment().run(act.dedup_items, [{"title": "No link here"}])
+    assert len(result) == 1
+    mock_kc.get_content_status.assert_not_awaited()
+
+
+async def test_dedup_fails_open_when_the_store_is_down(mock_kc):
+    mock_kc.get_content_status = AsyncMock(side_effect=RuntimeError("KS down"))
+    act = IntelligenceActivities(knowledge_connector=mock_kc)
+    result = await ActivityEnvironment().run(
+        act.dedup_items, [{"title": "x", "url": "https://example.com/x"}]
+    )
+    assert len(result) == 1
 
 
 async def test_score_significance(mock_kc):

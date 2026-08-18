@@ -222,6 +222,61 @@ class BriefingActivities:
         )
         return filtered[:50]
 
+    async def gather_email_digest(self, hours: int = 24) -> list[dict]:
+        """Return the mail AEGIS judged worth reading in the last `hours`.
+
+        `important_read` is 60% of all triaged mail and it is the tier the
+        owner never sees: `GmailIngestFlow._route` applies Gmail's IMPORTANT
+        label and MARKS IT READ in the same step, so the only surface is a
+        label on a message that no longer shows as unread. It IS already
+        embedded in the knowledge store (~42 items/day), so no new ingest is
+        needed — this just reads it back out.
+
+        Deliberately NOT `informational`: that tier is marked read and stored
+        nowhere, and it is the LOW-value half (LinkedIn, facebookmail, job
+        boards). Surfacing it would need a new ingest AND would dilute the
+        digest. `important_action` is included because it is the tier that
+        becomes a Todoist task — naming it closes the loop on why a task
+        appeared in the review card.
+
+        Uses `list_content_items` (a plain ingested_at-ordered listing), NOT
+        `search`: "what landed since yesterday" is an ORDER BY, and the vector
+        path answers a similarity question instead — which is exactly how the
+        intelligence section came to be empty every day.
+        """
+        if not self.knowledge_connector:
+            return []
+        try:
+            items = await self.knowledge_connector.list_content_items(
+                limit=200, source_type="email"
+            )
+        except Exception as exc:
+            activity.logger.warning("email_digest_query_failed err=%s", str(exc)[:200])
+            return []
+
+        from datetime import timedelta
+
+        cutoff = datetime.now(UTC) - timedelta(hours=hours)
+        out: list[dict] = []
+        for item in items or []:
+            meta = item.get("metadata") or {}
+            if meta.get("category") not in ("important_read", "important_action"):
+                continue
+            if not _within_hours(item.get("ingested_at") or item.get("created_at"), cutoff):
+                continue
+            out.append(
+                {
+                    "title": item.get("title") or "",
+                    "sender": meta.get("sender") or "",
+                    "category": meta.get("category") or "",
+                    # Work vs personal reads differently in prose; the lane is
+                    # what lets the model say so instead of flattening both.
+                    "lane": meta.get("lane") or "own",
+                    "content_id": item.get("content_id") or item.get("id") or "",
+                }
+            )
+        return out
+
     @activity.defn
     async def gather_briefing_changes(self) -> dict:
         """Diff current state vs the prior run (briefing_state KV). Reuses the
@@ -290,17 +345,32 @@ class BriefingActivities:
         # collected: references filed (raindrop / RSS / email / chat) since the
         # last briefing — the "what I learned from what I collected" digest. The
         # ingest flows otherwise fill KS silently and the user never sees it.
-        # Intelligence is already covered by `intel` (sig>=4), so restrict to
-        # source_type='reference' here to avoid double-listing.
+        #
+        # This used to `continue` on anything that wasn't source_type
+        # 'reference', on the stated assumption that "intelligence is already
+        # covered by `intel` (sig>=4)". It was not: `intel` comes from
+        # `gather_intelligence_summary`, a VECTOR search, and pgvector's HNSW
+        # scan returns at most `hnsw.ef_search` candidates before the
+        # source_type filter is applied — with intelligence at 0.05% of the
+        # corpus that yielded ~nothing. Measured in prod: 162 intelligence
+        # items ingested over 26 days, exactly 1 reached a briefing.
+        # `gather_references_filed` already fetches BOTH source types through
+        # the healthy `list_content_items` path, so dropping the filter is all
+        # it takes to get them back.
+        #
+        # The old comment's double-listing worry was real, though, because
+        # `seen_intel` and `seen_ref` are separate sets: an item the vector
+        # search DID return would otherwise appear in both `intel` and
+        # `collected`. The intel loop runs first and has already added its ids
+        # to `seen_intel`, so skipping those here is what keeps each item in
+        # exactly one section.
         collected_out: list[dict] = []
         new_ref_ids: list[str] = []
         try:
             refs = await self.gather_references_filed(hours=max(24, min(elapsed_h, 72)))
             for r in refs:
-                if r.get("source_type") != "reference":
-                    continue
                 cid = str(r.get("content_id") or r.get("id") or r.get("title") or "")
-                if not cid or cid in seen_ref:
+                if not cid or cid in seen_ref or cid in seen_intel:
                     continue
                 seen_ref.add(cid)
                 new_ref_ids.append(cid)
@@ -312,6 +382,32 @@ class BriefingActivities:
                     break
         except Exception as exc:
             activity.logger.warning("briefing_collected_diff_failed err=%s", str(exc)[:200])
+
+        # inbox: the `important_read` mail AEGIS filed and marked read without
+        # ever showing the owner. Same diff-and-dedup shape as `collected`.
+        prior_email_ids = list(prior.get("seen_email_ids") or [])
+        seen_email = set(prior_email_ids)
+        emails_out: list[dict] = []
+        new_email_ids: list[str] = []
+        try:
+            mail = await self.gather_email_digest(hours=max(24, min(elapsed_h, 72)))
+            # CI notifications repeat the same subject for the same commit
+            # several times a day and are ~40% of this tier by volume. Collapse
+            # on title so one noisy repo can't crowd out the rest of the digest.
+            seen_titles: set[str] = set()
+            for m in mail:
+                cid = str(m.get("content_id") or m.get("title") or "")
+                title_key = str(m.get("title") or "").strip().lower()
+                if not cid or cid in seen_email or title_key in seen_titles:
+                    continue
+                seen_email.add(cid)
+                seen_titles.add(title_key)
+                new_email_ids.append(cid)
+                emails_out.append(m)
+                if len(emails_out) >= 12:
+                    break
+        except Exception as exc:
+            activity.logger.warning("briefing_email_diff_failed err=%s", str(exc)[:200])
 
         # what broke: failed runs + new open drift since cursor
         failed_runs: list[dict] = []
@@ -404,17 +500,23 @@ class BriefingActivities:
         # Health (B6) is deliberately NOT gathered here — see `_recent_health`.
         # It is read at render time, inside `frame_briefing`, so that no body
         # data ever enters this bundle.
-        quiet = not (intel_out or collected_out or failed_runs or new_drift or new_cal_ids)
+        quiet = not (
+            intel_out or collected_out or emails_out or failed_runs or new_drift or new_cal_ids
+        )
         new_state = {
             "last_briefing_at": now.isoformat(),
             "seen_intel_ids": (prior_intel_ids + new_intel_ids)[-50:],
             "seen_reference_ids": (prior_ref_ids + new_ref_ids)[-100:],
             "seen_calendar_ids": all_cal_ids[-50:],
+            # Wider than the others: this tier runs ~42 items/day, so a 100-id
+            # window would roll over inside three days and re-report old mail.
+            "seen_email_ids": (prior_email_ids + new_email_ids)[-300:],
         }
         return {
             "quiet": quiet,
             "intel": intel_out,
             "collected": collected_out,
+            "emails": emails_out,
             "broke": {"failed_runs": failed_runs, "new_drift": new_drift},
             "calendar": {"today": cal_today, "new_ids": new_cal_ids},
             "place": place,
@@ -542,6 +644,14 @@ class BriefingActivities:
             lines.append("<b>Came across your feeds</b>")
             for it in collected:
                 lines.append(f"  • {_esc(str(it.get('title', '')))}")
+        emails = (changes.get("emails") or [])[:8]
+        if emails:
+            lines.append("<b>Mail worth reading</b>")
+            for it in emails:
+                mark = "❗ " if it.get("category") == "important_action" else ""
+                sender = str(it.get("sender") or "")
+                frm = f" — {_esc(sender)}" if sender else ""
+                lines.append(f"  • {mark}{_esc(str(it.get('title', '')))}{frm}")
         broke = changes.get("broke") or {}
         fr, dr = broke.get("failed_runs") or [], broke.get("new_drift") or []
         if fr or dr:
@@ -613,6 +723,11 @@ class BriefingActivities:
             "attention. The `collected` list is what AEGIS read/saved from the "
             "user's feeds (raindrop/RSS/email) since yesterday — distil it into one "
             "sentence on the themes worth knowing, don't list every item. "
+            "The `emails` list is mail AEGIS judged worth reading and already "
+            "marked read, so the user has NOT seen it — give it its own sentence "
+            "on what arrived, and phrase `lane: own` (work) separately from the "
+            "personal lanes rather than merging them. Name any entry whose "
+            "`category` is important_action, since that one became a task. "
             "Do not invent items; only summarize what's present.\n\n"
             + json.dumps(payload)[:3000]
         )

@@ -507,7 +507,10 @@ async def test_correction_relearns_sender_and_flips_a_poisoned_cache(db_pool, mo
         "INSERT INTO triage_state (email_addr, state, metadata, updated_at) "
         "VALUES ($1, 'useless', $2, now())",
         sender,
-        {"n": 5, "confidence": 0.9, "category": "useless"},
+        # `tags` present (even empty) is what makes a row cacheable — one
+        # without the key is pre-tags legacy state and deliberately falls
+        # through to the LLM so it can learn them. See test_triage_cache_tags.
+        {"n": 5, "confidence": 0.9, "category": "useless", "tags": []},
     )
     # No llm_client on purpose: a cache MISS falls through to source='fallback',
     # so 'cache' below cannot be an accident of the default return shape.
