@@ -30,12 +30,19 @@ channels:
       label: hn-frontpage
     active: true
 
+  # arxiv publishes its whole day in one burst (270-750 entries) and RSS has
+  # no relevance filter, so without a cap this single feed becomes the corpus:
+  # it grew to 94.7% of all knowledge chunks and crowded every other source
+  # out of retrieval. The cap is per RUN, not per day, and the flow takes the
+  # OLDEST entries first — so the burst drains over the following hours rather
+  # than being dropped. 30/hour clears a 270-entry day in ~9h.
   - kind: rss
     identifier: https://arxiv.org/rss/cs.AI
     config:
       last_cursor: null
       agent_id: raphael
       label: arxiv-ai
+      max_entries_per_run: 30
     active: true
 
   # B7 — wearable vendor poll. Ships INACTIVE: activating it before setting
