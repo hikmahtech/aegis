@@ -28,11 +28,28 @@ async def test_pooled_connections_enable_iterative_scan(db_pool):
 
 
 async def test_every_connection_in_the_pool_gets_it(db_pool):
-    """`init=` runs per connection, so a pool that grew past its initial size
-    must not hand out unconfigured connections."""
+    """A pool that grew past its initial size must not hand out unconfigured
+    connections."""
     async with db_pool.acquire() as a, db_pool.acquire() as b:
         assert await a.fetchval("SHOW hnsw.iterative_scan") == "relaxed_order"
         assert await b.fetchval("SHOW hnsw.iterative_scan") == "relaxed_order"
+
+
+async def test_it_survives_a_connection_going_back_to_the_pool(db_pool):
+    """The regression that shipped: asyncpg runs `RESET ALL` on release, so a
+    session `SET` from `init=` applies on a connection's FIRST use and is gone
+    on every reuse after that. Both tests above pass either way, because both
+    take freshly-initialised connections — this is the one that tells them
+    apart. Found in prod: the second acquire reported an empty value and the
+    ANN scan fell back to 40 candidates.
+    """
+    seen = []
+    for _ in range(3):
+        # Sequential acquires, each releasing before the next, so the pool
+        # hands the SAME connection back after a reset.
+        async with db_pool.acquire() as conn:
+            seen.append(await conn.fetchval("SHOW hnsw.iterative_scan"))
+    assert seen == ["relaxed_order"] * 3, f"lost after release/reacquire: {seen}"
 
 
 async def test_an_ann_scan_is_not_capped_at_ef_search(db_pool):
