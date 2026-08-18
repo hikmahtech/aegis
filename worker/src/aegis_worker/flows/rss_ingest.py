@@ -83,6 +83,38 @@ class RssIngestFlow:
                 per_feed.append({"feed": identifier, "entries": 0})
                 continue
 
+            # Per-feed throttle. arxiv cs.AI publishes its whole day in ONE
+            # burst — 270-750 entries — and every entry is fully fetched and
+            # chunked, which is how PDFs came to be 94.7% of the knowledge
+            # corpus and how one feed came to crowd every other source out of
+            # retrieval. There is no relevance filter here (unlike
+            # IntelligenceScanFlow's significance gate), so volume is the only
+            # knob, and it lives in the DB: `channels.config.max_entries_per_run`,
+            # absent or 0 meaning unlimited.
+            #
+            # OLDEST-first, not newest-first. A cap that took the newest N and
+            # then advanced the cursor past the rest would silently drop them —
+            # the exact data-loss shape the cursor logic below exists to
+            # prevent. Taking the oldest N leaves the remainder ABOVE the
+            # cursor, so the next poll picks them up: a burst drains over
+            # several hours instead of being lost or ingested all at once.
+            available = len(result.entries)
+            cap = (ch.get("config") or {}).get("max_entries_per_run") or 0
+            entries = result.entries
+            try:
+                cap = int(cap)
+            except (TypeError, ValueError):
+                workflow.logger.warning(
+                    "rss_bad_max_entries_per_run feed=%s value=%r", identifier, cap
+                )
+                cap = 0
+            if cap > 0 and available > cap:
+                # "" (no timestamp) sorts first and so is never starved.
+                entries = sorted(result.entries, key=lambda e: e.get("published") or "")[:cap]
+                workflow.logger.info(
+                    "rss_throttled feed=%s took=%d of=%d", identifier, len(entries), available
+                )
+
             feed_ingested = 0
             feed_failed = 0
             # Track the highest entry timestamp that has a DEFINITE
@@ -109,7 +141,7 @@ class RssIngestFlow:
             # rather than risk stepping over it. Costs a re-fetch, never a drop.
             saw_untimed_failure = False
             resolved_published_all: list[str] = []
-            for entry in result.entries:
+            for entry in entries:
                 external_id = entry.get("id") or entry.get("link", "")
                 if not external_id:
                     continue
@@ -200,7 +232,7 @@ class RssIngestFlow:
                 ]
                 latest_resolved_published = max(eligible) if eligible else None
 
-            total_entries += len(result.entries)
+            total_entries += len(entries)
             total_ingested += feed_ingested
 
             # Cursor advances only past entries with a DEFINITE outcome
@@ -221,9 +253,15 @@ class RssIngestFlow:
 
             entry_summary = {
                 "feed": identifier,
-                "entries": len(result.entries),
+                "entries": len(entries),
                 "ingested": feed_ingested,
             }
+            # A throttled feed has a backlog. Say so, or "entries: 30" on a
+            # 300-entry burst reads as a quiet feed rather than a queue nine
+            # hours deep.
+            if len(entries) < available:
+                entry_summary["available"] = available
+                entry_summary["backlog"] = available - len(entries)
             # Report failures, and report a HELD cursor as its own fact. Both
             # were previously invisible: `entries: 299, ingested: 0` looked
             # like a quiet feed rather than a batch that lost everything.
