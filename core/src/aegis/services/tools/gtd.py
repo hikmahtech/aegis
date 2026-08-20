@@ -12,7 +12,9 @@ from there.
 
 from __future__ import annotations
 
+from datetime import date, datetime
 from typing import Literal
+from zoneinfo import ZoneInfo
 
 import asyncpg
 import structlog
@@ -189,6 +191,36 @@ async def _assignee_labels(pool: asyncpg.Pool | None) -> list[str]:
         return fallback
 
 
+async def _user_today(pool: asyncpg.Pool | None) -> date:
+    """Today's calendar date in the user's own timezone (`settings.user_timezone`).
+
+    Deliberately NOT `CURRENT_DATE`. The Postgres session runs in UTC while
+    `todoist_tasks.due_date` is a plain `date` holding the user's LOCAL calendar
+    date, so UTC-today is the user's YESTERDAY for the whole 00:00–05:30 IST
+    window — plausible chat hours, and exactly when someone asks what is still
+    due today. (`aegis_worker.activities.review` gets away with a bare
+    `CURRENT_DATE` only because those flows run on a morning schedule; chat is
+    called at any hour.)
+
+    Never raises. A missing pool, a missing row, a non-string value, an unknown
+    zone or a failed read all fall back to UTC — a typo'd setting must not take
+    a chat tool down. The pool's jsonb codec (`db/pool.py`) json-decodes the
+    stored scalar for us, so `"Asia/Kolkata"` arrives as the bare zone name.
+    """
+    tz = ZoneInfo("UTC")
+    if pool is not None:
+        try:
+            row = await pool.fetchrow(
+                "SELECT value FROM settings WHERE key = $1", "user_timezone"
+            )
+            name = row["value"] if row else None
+            if isinstance(name, str) and name.strip():
+                tz = ZoneInfo(name.strip())
+        except Exception as exc:  # noqa: BLE001 — never break the tool on a config read
+            logger.warning("user_timezone_read_failed", error=str(exc)[:200])
+    return datetime.now(tz).date()
+
+
 @aegis_tool
 async def _exec_capture_to_inbox(
     pool: asyncpg.Pool,
@@ -247,7 +279,9 @@ async def _exec_list_next_actions(
     Args:
         assignee: Assignee label (e.g. @me, @sebas)
         context: Context label (e.g. @5min, @deep)
-        due: Optional due-window filter
+        due: Due window. overdue=past due; today=due today or overdue;
+            this_week=due within 7 days, today, or overdue. Undated tasks
+            excluded.
         limit: Max rows to return
     """
     limit = int(limit or 25)
@@ -277,6 +311,37 @@ async def _exec_list_next_actions(
     if context:
         params.append(context)
         where.append(f"${len(params)} = ANY(t.labels)")
+    # The due window. `due` was advertised to the LLM from Phase 3 but never
+    # read (#324), so "what's due today" silently answered with the UNFILTERED
+    # list — a confident wrong answer, not a missing feature.
+    #
+    # The windows are NESTED, not disjoint: `today` and `this_week` include what
+    # is already overdue. That matches Todoist's own Today view (what the user
+    # actually looks at) and this repo's existing meaning — review.py:109 names a
+    # `due_date <= CURRENT_DATE` query `due_today_count`, and :448 uses
+    # `< CURRENT_DATE` for overdue.
+    #
+    # All three require a due_date. A due window is a question about dates, and
+    # an undated @next task is a first-class GTD state (deliberately dateless),
+    # not "due always" — it has no position in any window. Undated work stays
+    # reachable through the no-filter call and `whats_next`.
+    #
+    # One reference date, computed in the USER's timezone (see `_user_today` —
+    # CURRENT_DATE would be wrong here) and bound as a parameter. `::date` on
+    # the `this_week` parameter is required, not decoration: without it Postgres
+    # infers the parameter's type from the `+ 7` and the query dies with
+    # "operator does not exist: date <= integer". The cast is on the PARAMETER,
+    # so the planner still folds the whole expression to a constant and every
+    # predicate stays sargable against the partial index
+    # `todoist_tasks_due_date_idx (due_date) WHERE NOT is_completed`.
+    due_sql = {
+        "overdue": "t.due_date IS NOT NULL AND t.due_date < ${n}",
+        "today": "t.due_date IS NOT NULL AND t.due_date <= ${n}",
+        "this_week": "t.due_date IS NOT NULL AND t.due_date <= ${n}::date + 7",
+    }.get(due or "")
+    if due_sql:
+        params.append(await _user_today(pool))
+        where.append(due_sql.format(n=len(params)))
     async with pool.acquire() as conn:
         inbox_id = await conn.fetchval(
             "SELECT value->>'inbox' FROM settings WHERE key='todoist_managed_project_ids'"

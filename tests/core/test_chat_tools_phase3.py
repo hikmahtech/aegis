@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
+
 import pytest
 from aegis.services.chat import (
     AGENT_TOOL_SETS,  # noqa: F401 — used by Tasks 15/16 gating tests
@@ -12,6 +15,25 @@ from aegis.services.chat import (
 
 def _names_in_chat_tools() -> set[str]:
     return {t["function"]["name"] for t in CHAT_TOOLS}
+
+
+async def _read_setting(pool, key: str):
+    row = await pool.fetchrow("SELECT value FROM settings WHERE key = $1", key)
+    return row["value"] if row else None
+
+
+async def _write_setting(pool, key: str, value) -> None:
+    """Set (or, for value=None, remove) a settings row — used to restore the
+    original `user_timezone` so these tests can't leak into the rest of the file."""
+    if value is None:
+        await pool.execute("DELETE FROM settings WHERE key = $1", key)
+        return
+    await pool.execute(
+        "INSERT INTO settings (key, value) VALUES ($1, $2) "
+        "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+        key,
+        value,
+    )
 
 
 PHASE3_TOOLS = {
@@ -116,6 +138,147 @@ async def test_exec_list_next_actions_reads_projection(db_pool) -> None:
     )
     assert "T_NA" in out or "call vendor" in out
     assert "T_DONE" not in out and "old done" not in out
+
+
+# --- due-window filter (issue #324) ---
+#
+# `due` was advertised to the LLM with enum [today, this_week, overdue] from
+# Phase 3 and never read by the executor, so every "what's due today" got the
+# UNFILTERED list back and presented it as the answer. The bug returns a
+# SUPERSET of every correct answer, which is exactly why nothing caught it for
+# months: any presence-only assertion passes against the broken executor. The
+# ABSENCE assertions below are the whole test — they are the only thing that
+# can fail while the filter is missing.
+
+_DUE_TASK_IDS = ("T_DUE_PAST", "T_DUE_TODAY", "T_DUE_FAR", "T_DUE_NONE")
+
+
+async def _seed_due_window_tasks(conn, ref) -> None:
+    """Four open, non-parked, non-inbox @sebas tasks straddling `ref`."""
+    await conn.execute(
+        "INSERT INTO todoist_projects (id, name, is_managed, raw) "
+        "VALUES ('P_PRJ','Projects',true,'{}'::jsonb) ON CONFLICT (id) DO NOTHING"
+    )
+    await conn.execute(
+        "DELETE FROM todoist_tasks WHERE id = ANY($1::text[])", list(_DUE_TASK_IDS)
+    )
+    await conn.execute(
+        "INSERT INTO todoist_tasks "
+        "(id, project_id, content, labels, assignee_label, is_completed, due_date, raw) "
+        "VALUES "
+        "('T_DUE_PAST','P_PRJ','overdue task',ARRAY['@sebas'],'@sebas',false,$1,'{}'::jsonb), "
+        "('T_DUE_TODAY','P_PRJ','today task',ARRAY['@sebas'],'@sebas',false,$2,'{}'::jsonb), "
+        "('T_DUE_FAR','P_PRJ','far task',ARRAY['@sebas'],'@sebas',false,$3,'{}'::jsonb), "
+        "('T_DUE_NONE','P_PRJ','undated task',ARRAY['@sebas'],'@sebas',false,NULL,'{}'::jsonb)",
+        ref - timedelta(days=1),
+        ref,
+        ref + timedelta(days=30),
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "due,present,absent",
+    [
+        # today/this_week are NESTED, not disjoint: both include what is already
+        # overdue, matching Todoist's own Today view and review.py's
+        # `due_date <= CURRENT_DATE` = due_today_count.
+        ("today", {"T_DUE_PAST", "T_DUE_TODAY"}, {"T_DUE_FAR", "T_DUE_NONE"}),
+        ("overdue", {"T_DUE_PAST"}, {"T_DUE_TODAY", "T_DUE_FAR", "T_DUE_NONE"}),
+        ("this_week", {"T_DUE_PAST", "T_DUE_TODAY"}, {"T_DUE_FAR", "T_DUE_NONE"}),
+    ],
+)
+async def test_list_next_actions_due_window_filters(
+    db_pool, due: str, present: set[str], absent: set[str]
+) -> None:
+    from aegis.services.chat import ToolContext, _exec_list_next_actions
+    from aegis.services.tools.gtd import _user_today
+
+    ref = await _user_today(db_pool)
+    async with db_pool.acquire() as conn:
+        await _seed_due_window_tasks(conn, ref)
+    out = await _exec_list_next_actions(
+        pool=db_pool,
+        args={"assignee": "@sebas", "due": due, "limit": 50},
+        ctx=ToolContext(agent_id="sebas"),
+    )
+    for task_id in present:
+        assert task_id in out, f"due={due!r} dropped {task_id}, which is in the window"
+    # Collected, not asserted one at a time, so a failure names EVERY task that
+    # leaked rather than whichever the set happened to yield first. The
+    # unfiltered (broken) executor returns all four rows, so every entry here is
+    # a real failure signal.
+    leaked = sorted(t for t in absent if t in out)
+    assert not leaked, (
+        f"due={due!r} returned {leaked}, which are OUTSIDE the window — "
+        "the filter is not being applied"
+    )
+
+
+@pytest.mark.asyncio
+async def test_list_next_actions_without_due_returns_every_task(db_pool) -> None:
+    """due=None keeps the historic behaviour: no clause, undated tasks included."""
+    from aegis.services.chat import ToolContext, _exec_list_next_actions
+    from aegis.services.tools.gtd import _user_today
+
+    ref = await _user_today(db_pool)
+    async with db_pool.acquire() as conn:
+        await _seed_due_window_tasks(conn, ref)
+    out = await _exec_list_next_actions(
+        pool=db_pool,
+        args={"assignee": "@sebas", "limit": 50},
+        ctx=ToolContext(agent_id="sebas"),
+    )
+    for task_id in _DUE_TASK_IDS:
+        assert task_id in out, f"no due filter must return {task_id}"
+
+
+@pytest.mark.asyncio
+async def test_user_today_reads_the_user_timezone_setting(db_pool) -> None:
+    """The reference date comes from `settings.user_timezone`, not from UTC.
+
+    Two zones 26 hours apart must land on different calendar dates at every
+    instant. A `_user_today` that ignored the setting (or used CURRENT_DATE,
+    which is UTC because the Postgres session runs in Etc/UTC) would return the
+    same date for both and fail here.
+    """
+    from aegis.services.tools.gtd import _user_today
+
+    prev = await _read_setting(db_pool, "user_timezone")
+    try:
+        await _write_setting(db_pool, "user_timezone", "Pacific/Kiritimati")  # UTC+14
+        east = await _user_today(db_pool)
+        await _write_setting(db_pool, "user_timezone", "Etc/GMT+12")  # UTC-12
+        west = await _user_today(db_pool)
+    finally:
+        await _write_setting(db_pool, "user_timezone", prev)
+    assert east > west, f"timezone setting ignored: {east} vs {west}"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bad", ["Not/AZone", "", "   ", None, {"tz": "UTC"}])
+async def test_user_today_falls_back_to_utc_on_a_bad_setting(db_pool, bad) -> None:
+    """A missing, empty, wrongly-typed or invalid zone must never raise out of a
+    chat tool — it degrades to UTC."""
+    from aegis.services.tools.gtd import _user_today
+
+    prev = await _read_setting(db_pool, "user_timezone")
+    try:
+        if bad is None:
+            async with db_pool.acquire() as conn:
+                await conn.execute("DELETE FROM settings WHERE key='user_timezone'")
+        else:
+            await _write_setting(db_pool, "user_timezone", bad)
+        assert await _user_today(db_pool) == datetime.now(ZoneInfo("UTC")).date()
+    finally:
+        await _write_setting(db_pool, "user_timezone", prev)
+
+
+@pytest.mark.asyncio
+async def test_user_today_without_a_pool_is_utc() -> None:
+    from aegis.services.tools.gtd import _user_today
+
+    assert await _user_today(None) == datetime.now(ZoneInfo("UTC")).date()
 
 
 @pytest.mark.asyncio
