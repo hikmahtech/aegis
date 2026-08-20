@@ -9,12 +9,15 @@ and degrades instead of dying when a best-effort half breaks.
 
 from __future__ import annotations
 
+import inspect
+
 import pytest
 from temporalio import activity, workflow
 from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import Worker
 
 with workflow.unsafe.imports_passed_through():
+    from aegis_worker.activities.flow_health import FlowHealthActivities
     from aegis_worker.flows.flow_health import FlowHealthConfig, FlowHealthWatchdogFlow
 
 _failing_calls: list[tuple] = []
@@ -49,8 +52,8 @@ def _make_stale(rows, boom: bool = False):
 
 def _make_dead_llm(rows, boom: bool = False):
     @activity.defn(name="find_dead_llm_purposes")
-    async def stub(min_calls: int = 2, lookback_hours: int = 24) -> list[dict]:
-        _llm_calls.append((min_calls, lookback_hours))
+    async def stub(consecutive: int = 2, staleness_hours: int = 720) -> list[dict]:
+        _llm_calls.append((consecutive, staleness_hours))
         if boom:
             raise RuntimeError("llm scan exploded")
         return rows
@@ -133,14 +136,32 @@ async def test_config_knobs_reach_the_detectors():
         min_stale_minutes=11,
         dedup_hours=5,
         recovery_hours=13,
-        llm_min_calls=6,
-        llm_lookback_hours=3,
+        llm_consecutive=6,
+        llm_staleness_hours=3,
     )
     await _run(cfg, "fh-2")
     assert _failing_calls == [(4, 9)]
     assert _stale_calls == [(7.5, 11)]
     assert _llm_calls == [(6, 3)]
     assert _report_calls[0][1:] == ("sebas", 5, 13)
+
+
+def test_the_flow_defaults_match_the_detector_defaults():
+    """The config dataclass carries a SECOND copy of every default, and the
+    flow always passes them explicitly — so the detector's own defaults are
+    never what production runs. #321 shipped a detector whose default window
+    could not fire; this pins the two copies together so a thought-through
+    default in one file cannot be quietly overridden by a stale one in the
+    other.
+    """
+    detector = inspect.signature(FlowHealthActivities.find_dead_llm_purposes).parameters
+    cfg = FlowHealthConfig()
+    assert cfg.llm_consecutive == detector["consecutive"].default
+    assert cfg.llm_staleness_hours == detector["staleness_hours"].default
+    # The staleness bound has to outreach the slowest live purpose's cadence:
+    # profile_generalization and review_frame each ran twice in 30 days, so
+    # anything under a month is unsatisfiable for them however broken they are.
+    assert cfg.llm_staleness_hours >= 24 * 30
 
 
 @pytest.mark.asyncio

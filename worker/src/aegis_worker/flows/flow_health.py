@@ -61,11 +61,18 @@ class FlowHealthConfig:
     dedup_hours: int = 12
     recovery_hours: int = 168
     check_stale: bool = True
-    # Detector 3 (#321): an llm_calls purpose with calls but no successes.
-    # `llm_min_calls` mirrors `consecutive_failures` — one failure is a blip.
+    # Detector 3 (#321): a purpose whose most recent `llm_consecutive` calls
+    # ALL failed. Cadence-independent on purpose — this shipped as "2 calls, 0
+    # successes, 24h" and could not fire for the six purposes that never make
+    # two calls in one day, which included both purposes the issue was about.
+    # `llm_consecutive` is 2 for the same reason `consecutive_failures` is: one
+    # failure is a blip, two in a row is a pattern. `llm_staleness_hours` is a
+    # bound on how far back to look, not a rate window: 30 days reaches the
+    # twice-a-month purposes and still sits inside the 90-day llm_calls
+    # retention.
     check_llm: bool = True
-    llm_min_calls: int = 2
-    llm_lookback_hours: int = 24
+    llm_consecutive: int = 2
+    llm_staleness_hours: int = 720
     silent: bool = False  # detect but never notify
 
 
@@ -106,7 +113,7 @@ class FlowHealthWatchdogFlow:
             try:
                 dead_llm = await workflow.execute_activity_method(
                     FlowHealthActivities.find_dead_llm_purposes,
-                    args=[config.llm_min_calls, config.llm_lookback_hours],
+                    args=[config.llm_consecutive, config.llm_staleness_hours],
                     start_to_close_timeout=TIMEOUT_FAST,
                     retry_policy=FAST,
                 )
