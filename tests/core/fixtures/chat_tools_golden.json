@@ -799,7 +799,7 @@
               "this_week",
               "overdue"
             ],
-            "description": "Optional due-window filter"
+            "description": "Due window. overdue=past due; today=due today or overdue; this_week=due within 7 days, today, or overdue. Undated tasks excluded."
           },
           "limit": {
             "type": "integer",
