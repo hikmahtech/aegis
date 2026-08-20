@@ -80,6 +80,22 @@ _REASONING_MIN_TOKENS = 4096
 # qwen3.5:9b came to run briefing_frame at a raw 2000 and fail 3/3).
 _REASONING_MODELS = ("kimi", "qwen")
 
+# One-shot re-roll budget for a call that came back EMPTY with
+# finish_reason=length. Deliberately NOT a new floor: 30 days of prod kimi-k2.5
+# is 984 successes averaging 705 visible output tokens (max 5796) against 22
+# empty-truncations that burned 2048-4096. So 4096 is the right steady-state
+# budget and the ~2% that die are stochastic overthink spirals, not a model
+# that needs more room — the cure is another roll of the dice with enough
+# headroom to swallow one spiral, not a permanently wider budget on every call.
+#
+# Raising the floor again would be treating a cure that already worked. Those
+# 22 truncations cluster on 2026-08-03..06 and taper to ~1-2/day afterwards,
+# which is exactly when #255 took the floor from 2048 to 4096: the floor moved
+# the bulk, and what is left is a residual tail no floor removes, because a
+# spiral can exhaust any budget. A retry is what a stochastic tail needs.
+# 16384 is confirmed accepted by the proxy.
+_TRUNCATION_RETRY_TOKENS = 16384
+
 
 def _reasoning_floor(model: str, max_tokens: int) -> int:
     """Reasoning models bill hidden reasoning_content against max_tokens,
@@ -273,16 +289,84 @@ class LLMClient:
         recorded to `llm_calls` by `_record_call`. Supply a `purpose`; the pool
         is the client's own unless you pass a different `db_pool`. Do NOT call
         `record_llm_call` yourself afterwards: that double-counts spend.
+
+        A response that comes back EMPTY with `finish_reason='length'` is
+        re-issued ONCE at `_TRUNCATION_RETRY_TOKENS` before
+        `LLMTruncationError` is raised (#321). Two upstream calls is a hard cap
+        — the re-roll never re-rolls — and both are billed, so both are
+        recorded. The retry keys on the truncation SYMPTOM, never on a model
+        name: that is the point. The recurring failure is a reasoning model
+        nobody added to `_REASONING_MODELS`, which therefore gets no floor at
+        all and fails silently (#255), and a symptom-keyed retry rescues it
+        without anyone having to notice first.
         """
         await self._check_kill_switch()
         max_tokens = _reasoning_floor(model, max_tokens)
 
-        import time
-
-        messages = []
+        messages: list[dict[str, Any]] = []
         if system_prompt:
             messages.append({"role": "system", "content": system_prompt})
         messages.append({"role": "user", "content": prompt})
+
+        # None ⇒ nothing to re-roll at, because the caller already asked for at
+        # least the retry budget. That call gets one attempt and the raise.
+        retry_budget = (
+            _TRUNCATION_RETRY_TOKENS if max_tokens < _TRUNCATION_RETRY_TOKENS else None
+        )
+        try:
+            return await self._think_once(
+                messages,
+                model,
+                max_tokens,
+                db_pool,
+                purpose,
+                agent_id,
+                retry_budget=retry_budget,
+            )
+        except LLMTruncationError:
+            if retry_budget is None:
+                raise
+            logger.warning(
+                "llm_truncated_retrying",
+                model=model,
+                purpose=purpose,
+                first_max_tokens=max_tokens,
+                retry_max_tokens=retry_budget,
+            )
+        # `retry_budget=None` makes this attempt terminal — it raises instead of
+        # recursing, which is what pins the hard cap at two upstream calls.
+        return await self._think_once(
+            messages,
+            model,
+            retry_budget,
+            db_pool,
+            purpose,
+            agent_id,
+            retry_budget=None,
+        )
+
+    async def _think_once(
+        self,
+        messages: list[dict[str, Any]],
+        model: str,
+        max_tokens: int,
+        db_pool: Any,
+        purpose: str | None,
+        agent_id: str | None,
+        *,
+        retry_budget: int | None,
+    ) -> dict[str, Any]:
+        """One upstream completion for `think()`; raises on empty truncation.
+
+        `retry_budget` changes nothing about the request. It is the budget
+        `think()` will re-roll at should this attempt truncate (None when this
+        attempt is terminal), and it lands in the recorded error text so an
+        `llm_calls` row tells the operator whether they are looking at a
+        rescued attempt or a real failure. The count of `(retrying at N)` rows
+        is the meter for a stale floor: when it climbs, `_REASONING_MIN_TOKENS`
+        has fallen behind whatever the tier map now resolves to.
+        """
+        import time
 
         sem = self._semaphore_for(model)
         with _tracer.start_as_current_span("llm.call") as span:
@@ -355,6 +439,11 @@ class LLMClient:
                 # This branch runs AFTER a real, billed upstream call, so it
                 # needs its own row: a model that truncates every call would
                 # otherwise be indistinguishable from a model nobody called.
+                # That stays true of a rescued attempt — the tokens were spent
+                # either way — so the retry gets a row too, marked as such.
+                recorded = f"truncated: {detail}"
+                if retry_budget is not None:
+                    recorded += f" (retrying at {retry_budget})"
                 await self._record_call(
                     db_pool,
                     model,
@@ -364,7 +453,7 @@ class LLMClient:
                     prompt_tokens=prompt_tokens,
                     completion_tokens=completion_tokens,
                     status="error",
-                    error=f"truncated: {detail}"[:500],
+                    error=recorded[:500],
                 )
                 raise LLMTruncationError(detail)
 

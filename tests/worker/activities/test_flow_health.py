@@ -18,6 +18,7 @@ from aegis.db import run_migrations
 from aegis_worker.activities.delivery import DeliveryActivities
 from aegis_worker.activities.flow_health import (
     ALERT_ACTION,
+    LLM_SUBJECT_PREFIX,
     MUTE_PREFIX,
     RECOVERY_ACTION,
     FlowHealthActivities,
@@ -29,6 +30,8 @@ UTC = dt.UTC
 TYPE_A = "zzwd-type-a"
 TYPE_B = "zzwd-type-b"
 SLUG_A = "zzwd-sched-a"
+PURPOSE_A = "zzwd-purpose-a"
+PURPOSE_B = "zzwd-purpose-b"
 
 
 async def _prep(db_pool):
@@ -39,6 +42,7 @@ async def _prep(db_pool):
         await conn.execute("DELETE FROM activities WHERE slug LIKE 'zzwd-%'")
         await conn.execute("DELETE FROM audit_log WHERE actor = 'flow-health-watchdog'")
         await conn.execute("DELETE FROM alert_mutes WHERE mute_key LIKE 'flow-health:zzwd-%'")
+        await conn.execute("DELETE FROM llm_calls WHERE purpose LIKE 'zzwd-%'")
 
 
 async def _run_row(
@@ -74,6 +78,28 @@ async def _activity_row(db_pool, slug: str, workflow_type: str, cron: str):
             slug,
             workflow_type,
             cron,
+        )
+
+
+async def _llm_row(
+    db_pool,
+    purpose: str,
+    status: str,
+    minutes_ago: float,
+    *,
+    model: str = "kimi-k2.5",
+    error: str | None = "truncated: empty content",
+):
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO llm_calls (model, purpose, status, error, input_tokens, "
+            "output_tokens, latency_ms, created_at) "
+            "VALUES ($1,$2,$3,$4,50,4096,900,now() - make_interval(mins => $5))",
+            model,
+            purpose,
+            status,
+            error,
+            int(minutes_ago),
         )
 
 
@@ -434,6 +460,166 @@ async def test_unparseable_cron_is_skipped_and_logged(db_pool):
 async def test_stale_no_pool_degrades(db_pool):
     env = ActivityEnvironment()
     assert await env.run(_acts(None).find_stale_flows, 3.0, 60) == []
+
+
+# ---------------------------------------------------------------------------
+# detector 3: LLM purposes that call and never succeed (#321)
+# ---------------------------------------------------------------------------
+#
+# The workflow-level detectors cannot see this at all. Almost every LLM caller
+# in AEGIS catches its own failure and degrades to non-LLM output, so the flow
+# COMPLETES, the schedule stays fresh, and the thinking part of it quietly
+# produces nothing — six days of it in #255.
+
+
+@pytest.mark.asyncio
+async def test_a_purpose_that_never_succeeds_is_reported(db_pool):
+    """The #255 shape exactly: briefing_frame returned empty content on 100% of
+    calls for six days while the briefing went out every morning."""
+    await _prep(db_pool)
+    await _llm_row(db_pool, PURPOSE_A, "error", 30)
+    await _llm_row(db_pool, PURPOSE_A, "error", 20)
+    await _llm_row(db_pool, PURPOSE_A, "error", 10)
+
+    found = await ActivityEnvironment().run(_acts(db_pool).find_dead_llm_purposes, 2, 24)
+
+    hit = next(f for f in found if f["purpose"] == PURPOSE_A)
+    assert hit["kind"] == "llm_dead"
+    assert hit["calls"] == 3
+    assert hit["errors"] == 3
+    assert hit["model"] == "kimi-k2.5"
+    assert hit["window_hours"] == 24
+
+
+@pytest.mark.asyncio
+async def test_the_subject_is_namespaced_against_flow_names(db_pool):
+    """Dedup, mutes and recovery all key on the bare subject string, which a
+    workflow_type and an activities slug already share. A purpose called
+    `todoist_sync` must not be able to mute TodoistSyncFlow."""
+    await _prep(db_pool)
+    await _llm_row(db_pool, PURPOSE_A, "error", 10)
+    await _llm_row(db_pool, PURPOSE_A, "timeout", 5)
+
+    found = await ActivityEnvironment().run(_acts(db_pool).find_dead_llm_purposes, 2, 24)
+
+    hit = next(f for f in found if f["purpose"] == PURPOSE_A)
+    assert hit["subject"] == LLM_SUBJECT_PREFIX + PURPOSE_A
+    assert hit["timeouts"] == 1
+
+
+@pytest.mark.asyncio
+async def test_one_success_clears_the_purpose(db_pool):
+    """THE false-positive guard. A purpose that works at all is not dead, and a
+    watchdog that cried on partial failure would be muted within a week."""
+    await _prep(db_pool)
+    await _llm_row(db_pool, PURPOSE_A, "error", 30)
+    await _llm_row(db_pool, PURPOSE_A, "error", 20)
+    await _llm_row(db_pool, PURPOSE_A, "success", 10, error=None)
+
+    found = await ActivityEnvironment().run(_acts(db_pool).find_dead_llm_purposes, 2, 24)
+
+    assert PURPOSE_A not in {f["purpose"] for f in found}
+
+
+@pytest.mark.asyncio
+async def test_a_single_failed_call_is_below_the_threshold(db_pool):
+    """One failure is a blip — same reasoning as `consecutive_failures=2`. It
+    also keeps a one-shot purpose (a chat tool nobody ran twice) off the card."""
+    await _prep(db_pool)
+    await _llm_row(db_pool, PURPOSE_A, "error", 10)
+
+    found = await ActivityEnvironment().run(_acts(db_pool).find_dead_llm_purposes, 2, 24)
+
+    assert PURPOSE_A not in {f["purpose"] for f in found}
+
+
+@pytest.mark.asyncio
+async def test_calls_outside_the_window_are_ignored(db_pool):
+    """A purpose that broke, was fixed and is no longer called must stop
+    alerting on its own rather than needing a mute."""
+    await _prep(db_pool)
+    await _llm_row(db_pool, PURPOSE_A, "error", 60 * 30)
+    await _llm_row(db_pool, PURPOSE_A, "error", 60 * 26)
+
+    found = await ActivityEnvironment().run(_acts(db_pool).find_dead_llm_purposes, 2, 24)
+
+    assert PURPOSE_A not in {f["purpose"] for f in found}
+
+
+@pytest.mark.asyncio
+async def test_a_purpose_that_only_ever_clips_is_reported(db_pool):
+    """`clipped` is a response cut mid-write (#255), not a success. Every call
+    clipping means every call returns truncated JSON — the same silent
+    uselessness, and it must not hide behind a status that is not 'error'."""
+    await _prep(db_pool)
+    await _llm_row(db_pool, PURPOSE_A, "clipped", 20, error="clipped: cut mid-response")
+    await _llm_row(db_pool, PURPOSE_A, "clipped", 10, error="clipped: cut mid-response")
+
+    found = await ActivityEnvironment().run(_acts(db_pool).find_dead_llm_purposes, 2, 24)
+
+    hit = next(f for f in found if f["purpose"] == PURPOSE_A)
+    assert hit["clipped"] == 2
+
+
+@pytest.mark.asyncio
+async def test_purposes_do_not_combine(db_pool):
+    """Per purpose, not per fleet: the cause is usually one budget, one prompt
+    or one model behind one tier. Two failures spread over two purposes is two
+    blips, not one dead purpose."""
+    await _prep(db_pool)
+    await _llm_row(db_pool, PURPOSE_A, "error", 20)
+    await _llm_row(db_pool, PURPOSE_B, "error", 10)
+
+    found = await ActivityEnvironment().run(_acts(db_pool).find_dead_llm_purposes, 2, 24)
+
+    assert {PURPOSE_A, PURPOSE_B} & {f["purpose"] for f in found} == set()
+
+
+@pytest.mark.asyncio
+async def test_the_last_error_is_carried_for_diagnosis(db_pool):
+    """The card has to say WHY, or the operator's first move is the same SQL
+    query every time."""
+    await _prep(db_pool)
+    await _llm_row(db_pool, PURPOSE_A, "error", 20, error="truncated: old one")
+    await _llm_row(db_pool, PURPOSE_A, "error", 5, error="truncated: the newest one")
+
+    found = await ActivityEnvironment().run(_acts(db_pool).find_dead_llm_purposes, 2, 24)
+
+    assert next(f for f in found if f["purpose"] == PURPOSE_A)["reason"] == (
+        "truncated: the newest one"
+    )
+
+
+@pytest.mark.asyncio
+async def test_dead_llm_no_pool_degrades(db_pool):
+    assert await ActivityEnvironment().run(_acts(None).find_dead_llm_purposes, 2, 24) == []
+
+
+@pytest.mark.asyncio
+async def test_a_dead_purpose_alerts_through_the_existing_plumbing(db_pool):
+    """No new notification path: a dead purpose rides the same card, the same
+    audit-log dedup and the same mute key as a failing flow. The card names the
+    purpose and hands over the query that applies to IT, not the workflow_runs
+    one."""
+    await _prep(db_pool)
+    await _llm_row(db_pool, PURPOSE_A, "error", 20)
+    await _llm_row(db_pool, PURPOSE_A, "error", 10)
+    env = ActivityEnvironment()
+    delivery = FakeDelivery()
+    act = _acts(db_pool, delivery)
+
+    findings = await env.run(act.find_dead_llm_purposes, 2, 24)
+    findings = [f for f in findings if f["purpose"] == PURPOSE_A]
+    first = await env.run(act.report_flow_health, findings, "pandoras-actor", 12, 168)
+    second = await env.run(act.report_flow_health, findings, "pandoras-actor", 12, 168)
+
+    assert (first["alerted"], second["alerted"]) == (1, 0), "a wedged purpose alerts once"
+    assert second["deduped"] == 1
+    assert len(delivery.sent) == 1
+    card = delivery.sent[0]
+    assert PURPOSE_A in card
+    assert "ZERO successful" in card
+    assert "FROM llm_calls WHERE purpose" in card
 
 
 # ---------------------------------------------------------------------------

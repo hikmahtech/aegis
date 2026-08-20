@@ -388,7 +388,9 @@ activities:
     schedule_cron: "7,37 * * * *"
     # Knobs (all DB-editable on /admin/flows, propagate in <=5 min without a
     # redeploy): consecutive_failures, lookback_hours, stale_multiplier,
-    # min_stale_minutes, dedup_hours, recovery_hours, check_stale, silent.
+    # min_stale_minutes, dedup_hours, recovery_hours, check_stale, silent,
+    # and for the zero-success LLM-purpose detector (#321): check_llm,
+    # llm_min_calls, llm_lookback_hours.
     config: {}
     active: true
 

@@ -543,7 +543,9 @@ async def test_a_successful_pass_records_an_llm_calls_row(clean_db):
 @pytest.mark.asyncio
 async def test_a_truncated_reply_records_an_error_row(clean_db):
     """`LLMTruncationError` is raised after a real, billed upstream call, so a
-    truncating model would otherwise look like zero traffic."""
+    truncating model would otherwise look like zero traffic. Two rows since
+    #321: the empty truncation is re-rolled once at a bigger budget, and both
+    attempts are billed."""
     await _seed(clean_db, TRIPLE)
     result = await _run(
         _acts(clean_db, StubbedLLMClient(db_pool=clean_db, content="", finish_reason="length"))
@@ -553,9 +555,9 @@ async def test_a_truncated_reply_records_an_error_row(clean_db):
     rows = await clean_db.fetch(
         "SELECT purpose, status, error FROM llm_calls WHERE agent_id = $1", AGENT
     )
-    assert len(rows) == 1, f"expected one {PURPOSE} row, got {len(rows)}"
-    assert (rows[0]["purpose"], rows[0]["status"]) == (PURPOSE, "error")
-    assert "truncated" in rows[0]["error"]
+    assert len(rows) == 2, f"expected one {PURPOSE} row per billed call, got {len(rows)}"
+    assert {(r["purpose"], r["status"]) for r in rows} == {(PURPOSE, "error")}
+    assert all("truncated" in r["error"] for r in rows)
 
 
 # ----------------------------------------------------- nothing here writes

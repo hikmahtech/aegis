@@ -274,7 +274,8 @@ async def test_truncated_scoring_writes_an_llm_calls_row(scoring_agent, mock_kc)
     """issue #137: `LLMTruncationError` is raised AFTER a real, billed upstream
     call. A model that truncates every scan used to look identical to a model
     nobody called — which is how "fast-tier calls went invisible" came to be
-    reported. The row comes off the choke point's truncation branch."""
+    reported. The rows come off the choke point's truncation branch, one per
+    billed call: #321 re-rolls an empty truncation once at a bigger budget."""
     llm = StubbedLLMClient(db_pool=scoring_agent, content="", finish_reason="length")
     env = ActivityEnvironment()
 
@@ -289,10 +290,10 @@ async def test_truncated_scoring_writes_an_llm_calls_row(scoring_agent, mock_kc)
         "SELECT purpose, status, error FROM llm_calls WHERE agent_id = $1",
         _AGENT,
     )
-    assert len(rows) == 1, "a truncated scoring call left no llm_calls row"
-    assert rows[0]["purpose"] == _PURPOSE
-    assert rows[0]["status"] == "error"
-    assert "truncated" in (rows[0]["error"] or "")
+    assert len(rows) == 2, "a truncated scoring call left no llm_calls row per billed call"
+    assert {r["purpose"] for r in rows} == {_PURPOSE}
+    assert {r["status"] for r in rows} == {"error"}
+    assert all("truncated" in (r["error"] or "") for r in rows)
 
 
 async def test_failed_scoring_writes_an_llm_calls_row(scoring_agent, mock_kc):

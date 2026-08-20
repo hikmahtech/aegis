@@ -16,7 +16,15 @@ ACT_RETRY = RetryPolicy(maximum_attempts=3)
 
 TIMEOUT_FAST = timedelta(seconds=15)
 TIMEOUT_STANDARD = timedelta(seconds=60)
-TIMEOUT_LLM = timedelta(seconds=180)  # 3 min — local qwen3:14b can be slow under load
+# 10 min. Was 180s, sized for a "local qwen3:14b can be slow under load" that
+# has since been decommissioned. Two things outgrew it: prod successes on the
+# current balanced tier (kimi-k2.5) already reach 120.8s, leaving a 3-min
+# ceiling under 1.5x headroom; and `LLMClient.think` now re-rolls an
+# empty-truncated response once at a 16384 budget (#321), so a single activity
+# can legitimately span two upstream calls. At 180s the activity timeout would
+# kill the re-roll before it could land — the cure would be cut off by the
+# clock it was meant to run under.
+TIMEOUT_LLM = timedelta(seconds=600)
 TIMEOUT_LONG = timedelta(seconds=300)
 TIMEOUT_CHAT_REPLY = timedelta(
     seconds=600

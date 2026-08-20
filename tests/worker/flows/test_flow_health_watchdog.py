@@ -1,9 +1,10 @@
-"""FlowHealthWatchdogFlow — wiring of the two detectors into one report (#226).
+"""FlowHealthWatchdogFlow — wiring of the three detectors into one report.
 
-The detectors themselves are exercised against a real database in
+#226 for the two workflow-level detectors, #321 for the zero-success LLM
+purpose. The detectors themselves are exercised against a real database in
 tests/worker/activities/test_flow_health.py; this file only proves the flow
-hands them the configured knobs, merges both result sets, and degrades instead
-of dying when the stale half breaks.
+hands them the configured knobs, merges every result set into ONE report call,
+and degrades instead of dying when a best-effort half breaks.
 """
 
 from __future__ import annotations
@@ -18,10 +19,12 @@ with workflow.unsafe.imports_passed_through():
 
 _failing_calls: list[tuple] = []
 _stale_calls: list[tuple] = []
+_llm_calls: list[tuple] = []
 _report_calls: list[tuple] = []
 
 FAILING = {"kind": "failing", "subject": "zzwd-type-a", "consecutive": 2}
 STALE = {"kind": "stale", "subject": "zzwd-sched-a", "idle_minutes": 300}
+DEAD_LLM = {"kind": "llm_dead", "subject": "llm-purpose:zzwd-purpose-a", "calls": 3}
 
 
 def _make_failing(rows):
@@ -44,6 +47,17 @@ def _make_stale(rows, boom: bool = False):
     return stub
 
 
+def _make_dead_llm(rows, boom: bool = False):
+    @activity.defn(name="find_dead_llm_purposes")
+    async def stub(min_calls: int = 2, lookback_hours: int = 24) -> list[dict]:
+        _llm_calls.append((min_calls, lookback_hours))
+        if boom:
+            raise RuntimeError("llm scan exploded")
+        return rows
+
+    return stub
+
+
 @activity.defn(name="report_flow_health")
 async def stub_report(
     findings: list[dict],
@@ -55,9 +69,12 @@ async def stub_report(
     return {"alerted": len(findings), "deduped": 0, "muted": 0, "recovered": 0}
 
 
-async def _run(config, wf_id, failing=(), stale=(), stale_boom=False):
+async def _run(
+    config, wf_id, failing=(), stale=(), dead_llm=(), stale_boom=False, llm_boom=False
+):
     _failing_calls.clear()
     _stale_calls.clear()
+    _llm_calls.clear()
     _report_calls.clear()
     async with (
         await WorkflowEnvironment.start_time_skipping() as env,
@@ -68,6 +85,7 @@ async def _run(config, wf_id, failing=(), stale=(), stale_boom=False):
             activities=[
                 _make_failing(list(failing)),
                 _make_stale(list(stale), boom=stale_boom),
+                _make_dead_llm(list(dead_llm), boom=llm_boom),
                 stub_report,
             ],
         ),
@@ -78,17 +96,29 @@ async def _run(config, wf_id, failing=(), stale=(), stale_boom=False):
 
 
 @pytest.mark.asyncio
-async def test_both_detectors_feed_one_report():
-    result = await _run(FlowHealthConfig(), "fh-1", failing=[FAILING], stale=[STALE])
+async def test_every_detector_feeds_one_report():
+    result = await _run(
+        FlowHealthConfig(), "fh-1", failing=[FAILING], stale=[STALE], dead_llm=[DEAD_LLM]
+    )
     assert result["failing"] == 1
     assert result["stale"] == 1
+    assert result["llm_dead"] == 1
     assert result["stale_status"] == "ok"
-    assert result["subjects"] == ["zzwd-sched-a", "zzwd-type-a"]
-    assert len(_report_calls) == 1
+    assert result["llm_status"] == "ok"
+    assert result["subjects"] == [
+        "llm-purpose:zzwd-purpose-a",
+        "zzwd-sched-a",
+        "zzwd-type-a",
+    ]
+    assert len(_report_calls) == 1, "three detectors, still one card"
     findings, agent_id, dedup_hours, recovery_hours = _report_calls[0]
-    assert [f["subject"] for f in findings] == ["zzwd-type-a", "zzwd-sched-a"]
+    assert [f["subject"] for f in findings] == [
+        "zzwd-type-a",
+        "zzwd-sched-a",
+        "llm-purpose:zzwd-purpose-a",
+    ]
     assert (agent_id, dedup_hours, recovery_hours) == ("pandoras-actor", 12, 168)
-    assert result["alerted"] == 2
+    assert result["alerted"] == 3
 
 
 @pytest.mark.asyncio
@@ -103,10 +133,13 @@ async def test_config_knobs_reach_the_detectors():
         min_stale_minutes=11,
         dedup_hours=5,
         recovery_hours=13,
+        llm_min_calls=6,
+        llm_lookback_hours=3,
     )
     await _run(cfg, "fh-2")
     assert _failing_calls == [(4, 9)]
     assert _stale_calls == [(7.5, 11)]
+    assert _llm_calls == [(6, 3)]
     assert _report_calls[0][1:] == ("sebas", 5, 13)
 
 
@@ -117,7 +150,7 @@ async def test_report_runs_even_with_no_findings():
     result = await _run(FlowHealthConfig(), "fh-3")
     assert len(_report_calls) == 1
     assert _report_calls[0][0] == []
-    assert result["failing"] == 0 and result["stale"] == 0
+    assert result["failing"] == 0 and result["stale"] == 0 and result["llm_dead"] == 0
 
 
 @pytest.mark.asyncio
@@ -143,8 +176,47 @@ async def test_check_stale_false_skips_the_scan():
 @pytest.mark.asyncio
 async def test_silent_detects_but_never_notifies():
     result = await _run(
-        FlowHealthConfig(silent=True), "fh-6", failing=[FAILING], stale=[STALE]
+        FlowHealthConfig(silent=True),
+        "fh-6",
+        failing=[FAILING],
+        stale=[STALE],
+        dead_llm=[DEAD_LLM],
     )
     assert _report_calls == []
     assert result["silent"] is True
+    assert result["failing"] == 1 and result["stale"] == 1 and result["llm_dead"] == 1
+
+
+@pytest.mark.asyncio
+async def test_a_dead_llm_purpose_alerts_on_its_own():
+    """The de-silencing case standing alone: every workflow completed, every
+    schedule is fresh, and the only thing wrong is that one purpose has not
+    produced a usable answer all day. Detectors 1 and 2 see nothing."""
+    result = await _run(FlowHealthConfig(), "fh-7", dead_llm=[DEAD_LLM])
+    assert result["failing"] == 0 and result["stale"] == 0
+    assert result["llm_dead"] == 1
+    assert [f["subject"] for f in _report_calls[0][0]] == ["llm-purpose:zzwd-purpose-a"]
+    assert result["alerted"] == 1
+
+
+@pytest.mark.asyncio
+async def test_a_broken_llm_scan_still_delivers_the_other_alerts():
+    """Best-effort, same contract as the stale half: the newest detector must
+    not be able to cost the operator the two that already worked."""
+    result = await _run(
+        FlowHealthConfig(), "fh-8", failing=[FAILING], stale=[STALE], llm_boom=True
+    )
+    assert result["llm_status"] == "check_failed"
+    assert result["llm_dead"] == 0
     assert result["failing"] == 1 and result["stale"] == 1
+    assert [f["subject"] for f in _report_calls[0][0]] == ["zzwd-type-a", "zzwd-sched-a"]
+
+
+@pytest.mark.asyncio
+async def test_check_llm_false_skips_the_scan():
+    result = await _run(
+        FlowHealthConfig(check_llm=False), "fh-9", dead_llm=[DEAD_LLM]
+    )
+    assert _llm_calls == []
+    assert result["llm_status"] == "disabled"
+    assert result["llm_dead"] == 0
