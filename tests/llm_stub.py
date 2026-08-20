@@ -26,7 +26,9 @@ class StubbedLLMClient(LLMClient):
     `content` is the assistant text (or a list, consumed one per call), or use
     `responder(create_kwargs) -> str` when the reply has to depend on the
     prompt. `finish_reason="length"` with empty content reproduces the
-    reasoning-model truncation case. `raises` makes the upstream call blow up,
+    reasoning-model truncation case; pass a LIST to vary it per call, which is
+    what a truncate-then-succeed sequence needs now that `think()` re-rolls a
+    truncated call once (#321). `raises` makes the upstream call blow up,
     which is the failure-row path.
     """
 
@@ -36,7 +38,7 @@ class StubbedLLMClient(LLMClient):
         db_pool: Any = None,
         content: str | list[str] = "",
         responder: Any = None,
-        finish_reason: str = "stop",
+        finish_reason: str | list[str] = "stop",
         prompt_tokens: int = 11,
         completion_tokens: int = 22,
         raises: BaseException | None = None,
@@ -48,7 +50,10 @@ class StubbedLLMClient(LLMClient):
         self._scripted = list(content) if isinstance(content, list) else None
         self._content = "" if self._scripted is not None else content
         self._responder = responder
-        self._finish_reason = finish_reason
+        # A list is consumed one entry per call, like `content`; once it runs
+        # out every further call reports "stop".
+        self._finish_reasons = list(finish_reason) if isinstance(finish_reason, list) else None
+        self._finish_reason = "stop" if self._finish_reasons is not None else finish_reason
         self._prompt_tokens = prompt_tokens
         self._completion_tokens = completion_tokens
         self._raises = raises
@@ -65,8 +70,12 @@ class StubbedLLMClient(LLMClient):
                 text = self._scripted.pop(0) if self._scripted else ""
             else:
                 text = self._content
+            if self._finish_reasons is not None:
+                reason = self._finish_reasons.pop(0) if self._finish_reasons else "stop"
+            else:
+                reason = self._finish_reason
             message = SimpleNamespace(content=text, tool_calls=self._tool_calls)
-            choice = SimpleNamespace(message=message, finish_reason=self._finish_reason)
+            choice = SimpleNamespace(message=message, finish_reason=reason)
             return SimpleNamespace(
                 choices=[choice],
                 usage=SimpleNamespace(

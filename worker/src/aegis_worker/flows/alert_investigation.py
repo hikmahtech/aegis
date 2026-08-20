@@ -655,11 +655,12 @@ class AlertInvestigationFlow:
                 resource = await workflow.execute_activity_method(
                     AlertActivities.resolve_alert_resource,
                     args=[alert],
-                    # Raised from TIMEOUT_STANDARD (60s) to TIMEOUT_LLM (180s):
+                    # Raised from TIMEOUT_STANDARD (60s) to TIMEOUT_LLM:
                     # gpt-oss:20b repo-match against ~160 resources peaks at 52s
                     # under normal load and grazes 60s under proxy pressure,
                     # causing all 3 FAST retries to time out → hard workflow
-                    # failure. 180s gives 3× headroom over the observed p95.
+                    # failure. TIMEOUT_LLM (600s since #321) clears that p95
+                    # many times over.
                     start_to_close_timeout=TIMEOUT_LLM,
                     retry_policy=FAST,
                 )

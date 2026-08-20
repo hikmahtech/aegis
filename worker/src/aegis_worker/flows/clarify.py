@@ -171,7 +171,7 @@ class ClarifyFlow:
                 pass_n = 2 if user_hint else 1
                 # classify_one calls qwen3:14b (primary) and may escalate to
                 # Sonnet on low confidence — both can take 30-60s under load,
-                # occasionally longer. Use TIMEOUT_LLM (180s) not TIMEOUT_FAST.
+                # occasionally longer. Use TIMEOUT_LLM (600s) not TIMEOUT_FAST.
                 decision = await workflow.execute_activity_method(
                     ClarifyActivities.classify_one,
                     # The flow's owning agent, threaded through so the

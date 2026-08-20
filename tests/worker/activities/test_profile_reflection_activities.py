@@ -429,7 +429,8 @@ async def test_propose_returns_the_doc_and_records_the_successful_call(clean_db)
 async def test_propose_records_a_truncated_call(clean_db):
     """`LLMTruncationError` is raised after a real, billed upstream call, so the
     row comes off the choke point's truncation branch — a truncating model must
-    not read as zero traffic."""
+    not read as zero traffic. Two rows since #321: the empty truncation is
+    re-rolled once at a bigger budget and both attempts are billed."""
     llm = StubbedLLMClient(db_pool=clean_db, content="", finish_reason="length")
     out = await ActivityEnvironment().run(
         _acts(clean_db, llm_client=llm).propose_profile_patch, AGENT, _EVIDENCE, CURRENT_DOC
@@ -437,10 +438,10 @@ async def test_propose_records_a_truncated_call(clean_db):
 
     assert out == {}
     rows = await _llm_rows(clean_db)
-    assert len(rows) == 1, f"expected one {PURPOSE} row, got {len(rows)}"
-    assert rows[0]["purpose"] == PURPOSE
-    assert rows[0]["status"] == "error"
-    assert "truncated" in (rows[0]["error"] or "")
+    assert len(rows) == 2, f"expected one {PURPOSE} row per billed call, got {len(rows)}"
+    assert {r["purpose"] for r in rows} == {PURPOSE}
+    assert {r["status"] for r in rows} == {"error"}
+    assert all("truncated" in (r["error"] or "") for r in rows)
 
 
 @pytest.mark.asyncio

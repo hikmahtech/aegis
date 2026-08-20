@@ -10,12 +10,16 @@ Watches every `workflow_type` in `workflow_runs`, not only scheduled ones —
 a child flow (AlertInvestigation, AgentTask) failing every attempt is the same
 class of silent breakage and costs nothing extra to catch.
 
+It also watches `llm_calls` per purpose (#321). A flow whose LLM step returns
+nothing usually still COMPLETES — the caller catches the error and degrades —
+so the two workflow-level detectors are blind to it by construction.
+
 **Who watches the watcher**: nothing does, directly — this flow is itself a
 scheduled flow, and if it fails there is no second watchdog. That is bounded
 rather than solved, deliberately (a second watchdog just moves the problem):
 
-* it is thin by design — two read-only SELECTs and a fire-and-forget card;
-  `safe_send_message` never raises, and both detectors return [] rather than
+* it is thin by design — three read-only SELECTs and a fire-and-forget card;
+  `safe_send_message` never raises, and every detector returns [] rather than
   throwing on empty/unparseable input, so there is very little that *can* fail;
 * its own failures are recorded in `workflow_runs` like everyone else's, and
   the daily briefing's failed-run block plus `/status` already surface those to
@@ -57,6 +61,11 @@ class FlowHealthConfig:
     dedup_hours: int = 12
     recovery_hours: int = 168
     check_stale: bool = True
+    # Detector 3 (#321): an llm_calls purpose with calls but no successes.
+    # `llm_min_calls` mirrors `consecutive_failures` — one failure is a blip.
+    check_llm: bool = True
+    llm_min_calls: int = 2
+    llm_lookback_hours: int = 24
     silent: bool = False  # detect but never notify
 
 
@@ -89,11 +98,31 @@ class FlowHealthWatchdogFlow:
         else:
             stale_status = "disabled"
 
+        # Third detector, same best-effort contract as the second: a broken
+        # LLM-health scan must not cost the operator the other two alerts.
+        dead_llm: list[dict] = []
+        llm_status = "ok"
+        if config.check_llm:
+            try:
+                dead_llm = await workflow.execute_activity_method(
+                    FlowHealthActivities.find_dead_llm_purposes,
+                    args=[config.llm_min_calls, config.llm_lookback_hours],
+                    start_to_close_timeout=TIMEOUT_FAST,
+                    retry_policy=FAST,
+                )
+            except Exception:  # noqa: BLE001 — degrade, never take the run down
+                llm_status = "check_failed"
+        else:
+            llm_status = "disabled"
+
+        findings = [*failing, *stale, *dead_llm]
         result = {
             "failing": len(failing),
             "stale": len(stale),
             "stale_status": stale_status,
-            "subjects": sorted(f["subject"] for f in [*failing, *stale]),
+            "llm_dead": len(dead_llm),
+            "llm_status": llm_status,
+            "subjects": sorted(f["subject"] for f in findings),
         }
         if config.silent:
             result["silent"] = True
@@ -104,7 +133,7 @@ class FlowHealthWatchdogFlow:
         report = await workflow.execute_activity_method(
             FlowHealthActivities.report_flow_health,
             args=[
-                [*failing, *stale],
+                findings,
                 config.agent_id,
                 config.dedup_hours,
                 config.recovery_hours,

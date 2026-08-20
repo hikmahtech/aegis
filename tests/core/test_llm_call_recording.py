@@ -77,9 +77,15 @@ async def test_a_successful_think_writes_exactly_one_row(pool):
     assert rows[0]["error"] is None
 
 
-async def test_a_truncated_think_writes_one_error_row(pool):
+async def test_a_truncated_think_writes_a_row_per_billed_call(pool):
     """The truncation branch sits after a real, billed upstream call — it used
-    to be outside the recording try, which is precisely the bug."""
+    to be outside the recording try, which is precisely the bug.
+
+    Since #321 an empty truncation is re-rolled once at a bigger budget, so a
+    model in a permanent overthink spiral bills TWO calls and therefore writes
+    two rows. One row would mean the re-roll's own spend went unmetered, which
+    is the same class of invisibility #106 closed.
+    """
     purpose = f"{_PREFIX}think-truncated"
     client = StubbedLLMClient(
         db_pool=pool, content="", finish_reason="length", prompt_tokens=50, completion_tokens=256
@@ -91,12 +97,15 @@ async def test_a_truncated_think_writes_one_error_row(pool):
         )
 
     rows = await _rows(pool, purpose)
-    assert len(rows) == 1, f"expected exactly one row, got {len(rows)}"
-    assert rows[0]["status"] == "error"
-    assert (rows[0]["error"] or "").startswith("truncated: ")
+    assert len(rows) == 2, f"expected one row per billed call, got {len(rows)}"
+    assert {r["status"] for r in rows} == {"error"}
+    assert all((r["error"] or "").startswith("truncated: ") for r in rows)
+    # Only the re-rolled attempt carries the marker, so counting those rows
+    # counts re-rolls issued.
+    assert len([r for r in rows if "retrying at" in (r["error"] or "")]) == 1
     # The tokens were spent even though no visible content came back.
-    assert rows[0]["input_tokens"] == 50
-    assert rows[0]["output_tokens"] == 256
+    assert {r["input_tokens"] for r in rows} == {50}
+    assert {r["output_tokens"] for r in rows} == {256}
 
 
 async def test_a_clipped_think_records_clipped_not_success(pool):

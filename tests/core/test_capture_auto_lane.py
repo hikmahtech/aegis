@@ -340,11 +340,12 @@ async def test_classification_is_recorded_in_llm_calls(make_client, db_pool, mon
 async def test_truncated_classification_is_recorded_in_llm_calls(
     make_client, db_pool, monkeypatch
 ):
-    """A truncated classifier call still lands exactly one row.
+    """A truncated classifier call still lands its rows.
 
     `think()` raises `LLMTruncationError` AFTER a real, billed upstream call, so
     the row has to come off that branch of the choke point — the classifier
-    itself no longer records anything.
+    itself no longer records anything. Two rows since #321: an empty truncation
+    is re-rolled once at a bigger budget and both attempts are billed.
     """
 
     async def fake_capture(*a, **kw):
@@ -362,9 +363,9 @@ async def test_truncated_classification_is_recorded_in_llm_calls(
     rows = await db_pool.fetch(
         "SELECT status, error FROM llm_calls WHERE purpose = 'capture_classify'"
     )
-    assert len(rows) == 1, "a truncated classifier call left no llm_calls row"
-    assert rows[0]["status"] == "error"
-    assert "truncated" in (rows[0]["error"] or "")
+    assert len(rows) == 2, "a truncated classifier call left no llm_calls row per billed call"
+    assert {r["status"] for r in rows} == {"error"}
+    assert all("truncated" in (r["error"] or "") for r in rows)
 
 
 async def test_classification_writes_an_audit_row(make_client, db_pool, monkeypatch):

@@ -15,6 +15,15 @@ Two detectors, both reading `workflow_runs` (no new table, no migration):
    run is older than `multiplier x` its own cadence (derived from
    `schedule_cron`). This is the "silently stopped running" case, which
    detector 1 cannot see at all: a schedule that never fires writes no rows.
+3. **dead LLM purpose** — an `llm_calls.purpose` with calls but not one
+   success in the trailing window (#321). Neither detector above can see this:
+   almost every LLM caller in AEGIS catches its own failure and degrades to
+   non-LLM output, so the flow *completes* and the schedule stays fresh while
+   the thinking part of it produces nothing. That is exactly how #255 ran for
+   six days — `briefing_frame` returned empty content on 100% of calls and the
+   briefing went out every morning looking fine. Purpose-level, because the
+   cause is usually per-purpose (a budget, a prompt, a model in one tier), not
+   whole-fleet.
 
 Alerting is deduped in `audit_log` (`flow_health_alert` /
 `flow_health_recovered`), the same substrate `DeliveryWatchdogFlow` uses for
@@ -49,6 +58,10 @@ TARGET_TYPE = "flow"
 #: `INSERT INTO alert_mutes (mute_key, muted_until) VALUES ('flow-health:<subject>', ...)`.
 MUTE_PREFIX = "flow-health:"
 ACTOR = "flow-health-watchdog"
+#: Namespace for detector 3's subjects. Dedup, mutes and recovery all key on
+#: the bare `subject` string, so an LLM purpose has to be unambiguous against a
+#: `workflow_type` and an `activities.slug` sharing that keyspace.
+LLM_SUBJECT_PREFIX = "llm-purpose:"
 
 _MINUTES_PER_DAY = 1440
 _MINUTES_PER_WEEK = 7 * _MINUTES_PER_DAY
@@ -186,6 +199,30 @@ WHERE a.active = TRUE
 ORDER BY a.slug
 """
 
+# `clipped` deliberately does NOT count as a success: it is a response cut
+# mid-write, and a purpose whose every call clips is producing truncated JSON
+# on every call — the same "loud about nothing" state, and worth the same card.
+# `timeout` and `error` obviously don't count. The kill switch writes no row at
+# all, so a spend freeze cannot masquerade as a dead purpose.
+_DEAD_LLM_SQL = """
+SELECT purpose,
+       count(*) AS calls,
+       count(*) FILTER (WHERE status = 'error') AS errors,
+       count(*) FILTER (WHERE status = 'timeout') AS timeouts,
+       count(*) FILTER (WHERE status = 'clipped') AS clipped,
+       max(created_at) AS last_call_at,
+       (array_agg(model ORDER BY created_at DESC))[1] AS model,
+       (array_agg(coalesce(error, '') ORDER BY created_at DESC))[1] AS reason
+FROM llm_calls
+WHERE created_at > now() - make_interval(hours => $2)
+  AND purpose IS NOT NULL
+  AND purpose <> ''
+GROUP BY purpose
+HAVING count(*) >= $1
+   AND count(*) FILTER (WHERE status = 'success') = 0
+ORDER BY purpose
+"""
+
 # Resolved-aware: an alert only suppresses a new one while no recovery row was
 # written after it.
 _SUPPRESSED_SQL = f"""
@@ -226,6 +263,15 @@ def _card(title: str, body: str) -> str:
 
 def _describe(finding: dict) -> str:
     subject = finding.get("subject", "?")
+    if finding.get("kind") == "llm_dead":
+        return (
+            f"  {subject}: {finding.get('calls', '?')} LLM calls in "
+            f"{finding.get('window_hours', '?')}h, ZERO successful "
+            f"(model {finding.get('model', '?')}; errors="
+            f"{finding.get('errors', 0)} timeouts={finding.get('timeouts', 0)} "
+            f"clipped={finding.get('clipped', 0)})\n"
+            f"    last error: {str(finding.get('reason') or 'unknown')[:300]}"
+        )
     if finding.get("kind") == "stale":
         return (
             f"  {subject} ({finding.get('workflow_type', '?')}, "
@@ -331,6 +377,47 @@ class FlowHealthActivities:
             )
         return out
 
+    @activity.defn
+    async def find_dead_llm_purposes(
+        self, min_calls: int = 2, lookback_hours: int = 24
+    ) -> list[dict]:
+        """LLM purposes with calls but not one success in the window (#321).
+
+        The de-silencing half of the reasoning-truncation fix. Retrying a
+        truncated call heals *an instance*; this makes the failure CLASS loud,
+        whatever its cause — a stale token floor, a decommissioned model behind
+        a tier, a prompt that always overflows, a proxy rejecting one model.
+        Every one of those looks identical from here: calls going out, nothing
+        coming back, and a caller quietly degrading.
+
+        `min_calls` is 2 for the same reason `consecutive_failures` is: one
+        failure is a blip, two is a pattern. It also keeps a purpose that ran
+        exactly once and errored — a chat tool nobody used twice — off the
+        card.
+
+        Returns [] (never raises) on an empty `llm_calls`.
+        """
+        if not self.db_pool or min_calls < 1:
+            return []
+        async with self.db_pool.acquire() as conn:
+            rows = await conn.fetch(_DEAD_LLM_SQL, min_calls, lookback_hours)
+        return [
+            {
+                "kind": "llm_dead",
+                "subject": LLM_SUBJECT_PREFIX + r["purpose"],
+                "purpose": r["purpose"],
+                "model": r["model"],
+                "calls": r["calls"],
+                "errors": r["errors"],
+                "timeouts": r["timeouts"],
+                "clipped": r["clipped"],
+                "window_hours": lookback_hours,
+                "last_call_at": r["last_call_at"].isoformat() if r["last_call_at"] else None,
+                "reason": (r["reason"] or "")[:500],
+            }
+            for r in rows
+        ]
+
     # -- alerting ----------------------------------------------------------
 
     @activity.defn
@@ -394,6 +481,16 @@ class FlowHealthActivities:
                 + "\n\nInspect: SELECT status, started_at, result_summary->>'reason' "
                 "FROM workflow_runs WHERE workflow_type = '<type>' "
                 "ORDER BY started_at DESC LIMIT 10;"
+            )
+            if any(f.get("kind") == "llm_dead" for f in fresh):
+                # A dead purpose is diagnosed in a different table, so the
+                # operator gets the query that actually applies to it.
+                body += (
+                    "\nInspect an llm: purpose: SELECT status, model, error, created_at "
+                    "FROM llm_calls WHERE purpose = '<purpose>' "
+                    "ORDER BY created_at DESC LIMIT 10;"
+                )
+            body += (
                 f"\nSilence one: INSERT INTO alert_mutes (mute_key, muted_until) "
                 f"VALUES ('{MUTE_PREFIX}<subject>', now() + interval '2 days');"
             )

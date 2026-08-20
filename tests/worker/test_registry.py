@@ -239,10 +239,13 @@ def test_module_workflows_is_the_unflagged_registry():
         # activity and NO new flow from `ingest_idempotency_release` on the
         # existing ChannelActivities — RssIngestFlow hands a claim back when
         # `process_content` fails, so the entry is retried on the next poll
-        # instead of being read as an already-handled dup.
-        (True, True, 39, 192),
-        (False, False, 31, 163),
-        (True, False, 35, 181),
+        # instead of being read as an already-handled dup. Then +1 activity and
+        # NO new flow from #321's `find_dead_llm_purposes` — a third detector on
+        # the existing FlowHealthActivities, driven by the existing
+        # FlowHealthWatchdogFlow, so it moves in every row.
+        (True, True, 39, 193),
+        (False, False, 31, 164),
+        (True, False, 35, 182),
     ],
 )
 def test_real_registration_passes_the_boot_check(homelab, money, flows, activities):
