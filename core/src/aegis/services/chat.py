@@ -7,11 +7,10 @@ import hashlib
 import json
 import re
 import time
-from datetime import UTC, date, datetime, timedelta
-from decimal import Decimal
+from datetime import UTC, datetime, timedelta
 from itertools import zip_longest
 from typing import Any
-from uuid import UUID, uuid4
+from uuid import uuid4
 
 import asyncpg
 import structlog
@@ -23,7 +22,18 @@ from aegis.llm.tier import resolve_model_for_agent, tier_to_model
 from aegis.mcp_manager import MCPError
 from aegis.observability import log_audit, record_llm_call, record_tool_call
 from aegis.services.source_types import DEFAULT_DECAY_DAYS, get_decay_days
-from aegis.services.tools.base import ToolContext
+from aegis.services.tools.base import (
+    _MAX_LISTED_DROPPED_KEYS,  # noqa: F401 — re-export: kept importable from here
+    _SHRINK_PASSES,  # noqa: F401 — re-export: imported from here by tests
+    _TRUNCATION_MARKER,  # noqa: F401 — re-export: kept importable from here
+    ToolContext,
+    _json_default,  # noqa: F401 — re-export: kept importable from here
+    _payload_rank,  # noqa: F401 — re-export: kept importable from here
+    _shrink_strings,  # noqa: F401 — re-export: kept importable from here
+    _smart_subset,  # noqa: F401 — re-export: imported from here by tests
+    _truncate_result,
+    _truncate_text,  # noqa: F401 — re-export: routes/mcp_server.py imports it here
+)
 from aegis.services.tools.gtd import (
     _assignee_labels,  # noqa: F401 — re-export: imported from here by tests
     _capture_to_inbox_impl,  # noqa: F401 — re-export: routes/chat.py + routes/capture.py
@@ -53,6 +63,12 @@ from aegis.services.tools.infra import (
     _exec_restart_service,
     _exec_run_infra_script,
     _exec_sync_argocd_app,
+)
+from aegis.services.tools.knowledge import (
+    _exec_ask_knowledge,
+    _exec_remember_this,
+    _exec_search_knowledge,
+    _knowledge_unavailable,  # noqa: F401 — re-export: kept importable from here
 )
 from aegis.services.tools.registry import TOOL_REGISTRY
 from aegis.services.tools.vercel import (
@@ -259,257 +275,11 @@ async def classify_intent(message: str, llm, settings, pool=None) -> dict:
 _TOOL_INCAPABLE_MODELS: frozenset[str] = frozenset({"claude-haiku", "claude-sonnet", "claude-opus"})
 
 
-def _json_default(value: Any) -> Any:
-    """Type-specific JSON encoder for tool result payloads.
-
-    Coerces the common DB/HTTP types the LLM sees into shapes it understands:
-    Decimal -> float, datetime/date -> ISO string, UUID -> str. Everything
-    else falls back to ``str()`` so we never raise during serialization.
-    """
-    if isinstance(value, Decimal):
-        return float(value)
-    if isinstance(value, (datetime, date)):
-        return value.isoformat()
-    if isinstance(value, UUID):
-        return str(value)
-    return str(value)
-
-
-# Passes used to progressively shrink a tool result that exceeds the byte
-# budget. Each tuple is (n_items_to_keep, max_string_length). We try the
-# loosest pass first (keep a lot, leave strings long) and tighten on each
-# attempt, so results stay as useful as possible. Only when even the
-# tightest pass overflows do we fall through to the minimal summary.
-_SHRINK_PASSES: tuple[tuple[int, int], ...] = (
-    (5, 1000),
-    (5, 500),
-    (3, 500),
-    (3, 250),
-    (1, 500),
-    (1, 150),
-)
-
-# How many dropped key names to spell out before folding the tail into a single
-# `… +K more` entry.
-_MAX_LISTED_DROPPED_KEYS = 12
-
-# The one marker for prose the model reads as prose. `_shrink_strings` appends it
-# inside an over-long JSON string field; `_truncate_text` appends it to a whole
-# non-JSON result. Shared deliberately (#239): "was this cut?" must have exactly
-# one thing to look for, not a third spelling per code path.
-_TRUNCATION_MARKER = "… [truncated]"
-
-
-def _shrink_strings(obj, max_str_len: int, n_items: int):
-    """Recursively shrink over-long strings AND cap nested lists at ``n_items``
-    entries, replacing the dropped tail with one in-band ``… +K of N more``
-    element. Leaves other types untouched.
-
-    Capping nested lists is what makes an over-budget dict shrinkable at all.
-    Before #148 the only lever was dropping whole keys, so a result whose
-    payload sat under a non-leading key lost that payload outright, and a
-    result whose payload WAS leading couldn't be shrunk enough to fit and fell
-    through to the "too large to display" stub. Keeping the dropped count
-    inside the list it describes means the same mechanism that removed the
-    items can never separate them from their own count.
-    """
-    if isinstance(obj, str):
-        if len(obj) > max_str_len:
-            # Leave room for the marker so the caller can tell a cut happened.
-            head = max(0, max_str_len - len(_TRUNCATION_MARKER))
-            return obj[:head] + _TRUNCATION_MARKER
-        return obj
-    if isinstance(obj, list):
-        kept = [_shrink_strings(x, max_str_len, n_items) for x in obj[:n_items]]
-        if len(obj) > n_items:
-            kept.append(f"… +{len(obj) - n_items} of {len(obj)} more")
-        return kept
-    if isinstance(obj, dict):
-        return {k: _shrink_strings(v, max_str_len, n_items) for k, v in obj.items()}
-    return obj
-
-
-def _payload_rank(value) -> int:
-    """Rank a dict value by how likely it is to BE the answer: a list of
-    records outranks a nested object, which outranks a scalar.
-
-    ``sorted`` is stable, so position only breaks ties within a rank — an
-    executor that deliberately leads with its payload (``social_timeline``,
-    ``list_social_channels``) still wins, while one that leads with a scalar
-    ``count``/``ok``/``window_hours`` no longer loses its data to it (#148).
-    """
-    if isinstance(value, list):
-        return 0
-    if isinstance(value, dict):
-        return 1
-    return 2
-
-
-def _smart_subset(data, n_items: int, max_str_len: int):
-    """Keep the first ``n_items`` of a list, or the ``n_items`` highest-ranked
-    keys of a dict, shrinking long strings and capping nested lists inside the
-    kept portion. Returns the trimmed object plus truncation metadata so the
-    LLM knows content was dropped — and, for a dict, WHICH keys were dropped,
-    so it can ask a narrower question instead of blind-retrying the same call.
-    """
-    if isinstance(data, list):
-        return {
-            "results": [_shrink_strings(item, max_str_len, n_items) for item in data[:n_items]],
-            "truncated": True,
-            "total": len(data),
-        }
-    keep = set(sorted(data, key=lambda k: _payload_rank(data[k]))[:n_items])
-    subset = {k: _shrink_strings(v, max_str_len, n_items) for k, v in data.items() if k in keep}
-    dropped = [k for k in data if k not in keep]
-    # Assigned AFTER the selection above, so the signal is never itself a
-    # candidate for eviction by the pass that produced it.
-    subset["_truncated"] = True
-    subset["_total_keys"] = len(data)
-    if dropped:
-        # Bounded like the `+K more` aggregates in `list_social_channels` and
-        # the `social_timeline` roll-up, so naming the casualties can never be
-        # what pushes a pass over budget and forces the minimal stub.
-        listed = [str(k)[:60] for k in dropped[:_MAX_LISTED_DROPPED_KEYS]]
-        if len(dropped) > _MAX_LISTED_DROPPED_KEYS:
-            listed.append(f"… +{len(dropped) - _MAX_LISTED_DROPPED_KEYS} more")
-        subset["_dropped_keys"] = listed
-    return subset
-
-
-def _truncate_text(text: str, max_bytes: int) -> str:
-    """Cut a non-JSON tool result down to ``max_bytes`` and say that it was cut.
-
-    Two things the old ``text[:max_bytes]`` got wrong (#239). It counted
-    CHARACTERS against a byte budget, so a non-ASCII result came back over
-    budget — up to 4x for multi-byte UTF-8. And it appended nothing, so the
-    model received a string ending mid-sentence with no signal it was partial,
-    which is the same silent-partial failure the dict and list paths were fixed
-    for in #148. This is a live path, not a theoretical one: several executors
-    return plain text rather than JSON (``query_observations``,
-    ``last_contact_with_person``, the refusal strings).
-
-    Slicing encoded bytes can land inside a multi-byte sequence, so the decode
-    drops that trailing partial character instead of raising.
-    """
-    budget = max_bytes - len(_TRUNCATION_MARKER.encode())
-    if budget <= 0:
-        # Budget too tight to hold the marker at all — a byte-safe cut is all
-        # that fits. Still never over budget, which the character slice could be.
-        return text.encode()[:max_bytes].decode(errors="ignore")
-    return text.encode()[:budget].decode(errors="ignore") + _TRUNCATION_MARKER
-
-
-def _truncate_result(result_json: str, max_bytes: int = 4096) -> str:
-    """Trim a JSON-serialised tool result so it fits within ``max_bytes``.
-
-    Strategy, loosest → tightest:
-    1. Return unchanged if already under budget.
-    2. Parse. Non-JSON or scalar → byte-safe cut plus a ``… [truncated]`` marker
-       (``_truncate_text``).
-    3. For a list/dict, iterate ``_SHRINK_PASSES``: keep the first N items of
-       a list or the N highest-ranked keys of a dict (see ``_payload_rank``),
-       recursively shrinking long strings and capping nested lists inside the
-       kept portion. Return the first pass whose serialisation fits.
-    4. Fallback: minimal summary noting the total count.
-
-    This is better than a byte-level slice because the LLM still sees
-    structured data with sample content; it's better than the prior
-    slice-then-give-up approach because deeply nested records (common for
-    knowledge/search tool output) get their big string fields shrunk down
-    rather than being replaced entirely by a "too large" note.
-
-    EVERY path out of here carries a truncation signal — ``… [truncated]`` on a
-    non-JSON cut, ``truncated``/``total`` for a list, ``_truncated``/
-    ``_total_keys`` (plus ``_dropped_keys``) for a dict, ``… +K of N more``
-    inside any capped nested list — so a partial result is never mistakable for
-    a complete one. Every return is also measured in BYTES, matching the budget's
-    own unit.
-    """
-    if len(result_json.encode()) <= max_bytes:
-        return result_json
-
-    try:
-        data = json.loads(result_json)
-    except (json.JSONDecodeError, TypeError):
-        return _truncate_text(result_json, max_bytes)
-
-    if not isinstance(data, (list, dict)):
-        return _truncate_text(result_json, max_bytes)
-
-    for n_items, max_str_len in _SHRINK_PASSES:
-        candidate = _smart_subset(data, n_items, max_str_len)
-        encoded = json.dumps(candidate, default=str)
-        if len(encoded.encode()) <= max_bytes:
-            return encoded
-
-    # Even a single item with very short strings overflows — emit a minimal
-    # summary. Keeps the tool result valid JSON and preserves the count.
-    if isinstance(data, list):
-        return json.dumps(
-            {"truncated": True, "total": len(data), "note": "Results too large to display"}
-        )
-    return json.dumps(
-        {"_truncated": True, "_total_keys": len(data), "note": "Results too large to display"}
-    )
-
-
 # Tool definitions for agent chat (OpenAI format)
 CHAT_TOOLS = [
-    {
-        "type": "function",
-        "function": {
-            "name": "search_knowledge",
-            "description": "Search the knowledge base using semantic similarity. Returns relevant content with titles, summaries, and similarity scores.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "query": {"type": "string", "description": "Natural language search query"},
-                    "limit": {
-                        "type": "integer",
-                        "description": "Max results (1-100)",
-                        "default": 10,
-                    },
-                },
-                "required": ["query"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "ask_knowledge",
-            "description": "Ask a question and get a synthesized answer from the knowledge base with sources and confidence scores.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "question": {"type": "string", "description": "Natural language question"},
-                },
-                "required": ["question"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "remember_this",
-            "description": "Store important information from this conversation in the knowledge base for future reference. Only call when something is worth remembering long-term.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "summary": {
-                        "type": "string",
-                        "description": "Concise summary of what to remember",
-                    },
-                    "tags": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                        "description": "Categorization tags",
-                    },
-                },
-                "required": ["summary"],
-            },
-        },
-    },
+    _registry_schema("search_knowledge"),
+    _registry_schema("ask_knowledge"),
+    _registry_schema("remember_this"),
     {
         "type": "function",
         "function": {
@@ -1786,43 +1556,6 @@ async def _exec_investigate_resource(pool: asyncpg.Pool, args: dict, ctx: ToolCo
     return json.dumps({"status": "investigation_started", "workflow_id": workflow_id, "repo": repo})
 
 
-def _knowledge_unavailable(detail: str = "Knowledge service not available") -> str:
-    """Return a clearly-labeled 'service down' status.
-
-    Distinct from an empty successful search so the LLM can decide whether to
-    retry, apologise to the user, or fall back to another tool instead of
-    treating the gap as "no results found".
-    """
-    return json.dumps({"status": "unavailable", "error": detail, "retry_suggested": True})
-
-
-async def _exec_search_knowledge(pool: asyncpg.Pool, args: dict, ctx: ToolContext) -> str:
-    if not ctx.knowledge_connector:
-        return _knowledge_unavailable()
-    query = args.get("query", "")
-    limit = args.get("limit", 10)
-    try:
-        results = await ctx.knowledge_connector.search(query, limit=limit)
-    except Exception as exc:
-        logger.warning("search_knowledge_unreachable", error=str(exc))
-        return _knowledge_unavailable(f"search failed: {exc}")
-    return json.dumps(results, default=_json_default)
-
-
-async def _exec_ask_knowledge(pool: asyncpg.Pool, args: dict, ctx: ToolContext) -> str:
-    if not ctx.knowledge_connector:
-        return _knowledge_unavailable()
-    question = args.get("question", "")
-    try:
-        result = await ctx.knowledge_connector.ask(question)
-    except Exception as exc:
-        logger.warning("ask_knowledge_unreachable", error=str(exc))
-        return _knowledge_unavailable(f"ask failed: {exc}")
-    return json.dumps(result, default=_json_default)
-
-
-
-
 async def _exec_list_interactions(pool: Any, args: dict, ctx: ToolContext) -> str:
     """Return interactions for an agent filtered by status."""
     agent_id = args.get("agent_id") or ctx.agent_id
@@ -1860,29 +1593,6 @@ async def _exec_list_interactions(pool: Any, args: dict, ctx: ToolContext) -> st
         for r in rows
     ]
     return json.dumps(result, default=str)
-
-
-async def _exec_remember_this(pool: asyncpg.Pool, args: dict, ctx: ToolContext) -> str:
-    if not ctx.knowledge_connector:
-        return json.dumps({"error": "Knowledge service not available"})
-    chat_ctx = ctx.chat_context or {}
-    summary = args.get("summary", "")
-    thread_id = chat_ctx.get("thread_id", "unknown")
-    timestamp = int(time.time())
-    raw_text = f"User: {chat_ctx.get('user_message', '')}\nSummary: {summary}"
-    try:
-        result = await ctx.knowledge_connector.ingest_content(
-            url=f"aegis://chat/{thread_id}/{timestamp}",
-            title=summary,
-            summary=summary,
-            source_type="chat",
-            raw_text=raw_text,
-            tags=args.get("tags", []),
-        )
-        return json.dumps({"stored": True, **result}, default=str)
-    except Exception as exc:
-        logger.warning("remember_this_failed", error=str(exc))
-        return json.dumps({"stored": False, "error": str(exc)})
 
 
 async def _exec_query_activities(pool: asyncpg.Pool, args: dict, ctx: ToolContext) -> str:
