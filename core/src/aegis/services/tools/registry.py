@@ -28,7 +28,8 @@ parameter after them is a tool argument. Supported annotations:
 - `Annotated[int, Field(ge=.., le=..)]`   -> minimum / maximum
 
 A signature default becomes the schema's `"default"`; parameters without a
-default are listed in `"required"` (the key is omitted when empty). The tool
+default are listed in `"required"` (the key is omitted when empty, unless
+`empty_required=True` preserves a legacy explicit `[]`). The tool
 description is the docstring's first paragraph; per-argument descriptions come
 from a Google-style `Args:` section — both must reproduce the advertised text
 verbatim, because the schema is the LLM's contract.
@@ -178,12 +179,23 @@ def _parse_docstring(doc: str, *, tool: str) -> tuple[str, dict[str, str]]:
     return description, arg_docs
 
 
-def aegis_tool(fn=None, *, name: str | None = None, hide: tuple[str, ...] = ()):
+def aegis_tool(
+    fn=None,
+    *,
+    name: str | None = None,
+    hide: tuple[str, ...] = (),
+    empty_required: bool = False,
+):
     """Register a chat tool; schema generated from the signature + docstring.
 
     `name` overrides the default (the function name minus a leading `_exec_`).
     `hide` lists signature parameters that are accepted at call time but must
     NOT appear in the advertised schema (legacy argument aliases).
+    `empty_required` keeps an explicit `"required": []` on a tool whose
+    parameters are all optional — JSON Schema treats that as identical to
+    omitting the key, but a hand-written schema that spelled it out keeps
+    spelling it out, so a migration is a byte-for-byte no-op against the
+    golden snapshot (`whats_next` is the only such tool).
     """
 
     def decorate(func):
@@ -211,7 +223,7 @@ def aegis_tool(fn=None, *, name: str | None = None, hide: tuple[str, ...] = ()):
                 spec["default"] = p.default
             properties[p.name] = spec
         parameters: dict[str, Any] = {"type": "object", "properties": properties}
-        if required:
+        if required or empty_required:
             parameters["required"] = required
 
         @functools.wraps(func)

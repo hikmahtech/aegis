@@ -40,7 +40,7 @@ _REVIEW_DEFAULTS = {
 # used to be managed projects; Someday is now the @someday label (Next is
 # @next — see apply_review_decision). Mirrors
 # aegis_worker.activities.clarify._LABEL_SOMEDAY / _LABEL_NEXT and
-# core.aegis.services.chat._exec_whats_next (cross-package; keep in sync).
+# core.aegis.services.tools.gtd._exec_whats_next (cross-package; keep in sync).
 _LABEL_SOMEDAY = "@someday"
 _LABEL_NEXT = "@next"
 # State labels mark a task non-actionable (parked/delegated/reference).

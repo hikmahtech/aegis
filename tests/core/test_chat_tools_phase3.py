@@ -64,8 +64,12 @@ async def test_exec_capture_to_inbox_calls_capture_helper(monkeypatch) -> None:
         })
         return "TASK-REF-1"
 
+    # Patch where the helper is DEFINED (services/tools/gtd.py), not where
+    # chat.py re-exports it — the executor moved into that module with it, so
+    # it resolves its own global and a patch on the re-export would miss.
+    # `raising=True`: the name must exist, or this test silently proves nothing.
     monkeypatch.setattr(
-        "aegis.services.chat._capture_to_inbox_impl", fake_capture, raising=False
+        "aegis.services.tools.gtd._capture_to_inbox_impl", fake_capture, raising=True
     )
     ctx = ToolContext(agent_id="sebas")
     result = await _exec_capture_to_inbox(
