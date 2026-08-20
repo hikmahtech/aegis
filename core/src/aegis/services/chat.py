@@ -7,11 +7,10 @@ import hashlib
 import json
 import re
 import time
-from datetime import UTC, date, datetime, timedelta
-from decimal import Decimal
+from datetime import UTC, datetime, timedelta
 from itertools import zip_longest
 from typing import Any
-from uuid import UUID, uuid4
+from uuid import uuid4
 
 import asyncpg
 import structlog
@@ -23,8 +22,31 @@ from aegis.llm.tier import resolve_model_for_agent, tier_to_model
 from aegis.mcp_manager import MCPError
 from aegis.observability import log_audit, record_llm_call, record_tool_call
 from aegis.services.source_types import DEFAULT_DECAY_DAYS, get_decay_days
-from aegis.services.todoist_config import resolve_todoist_api_key
-from aegis.services.tools.base import ToolContext
+from aegis.services.tools.base import (
+    _MAX_LISTED_DROPPED_KEYS,  # noqa: F401 — re-export: kept importable from here
+    _SHRINK_PASSES,  # noqa: F401 — re-export: imported from here by tests
+    _TRUNCATION_MARKER,  # noqa: F401 — re-export: kept importable from here
+    ToolContext,
+    _json_default,  # noqa: F401 — re-export: kept importable from here
+    _payload_rank,  # noqa: F401 — re-export: kept importable from here
+    _shrink_strings,  # noqa: F401 — re-export: kept importable from here
+    _smart_subset,  # noqa: F401 — re-export: imported from here by tests
+    _truncate_result,
+    _truncate_text,  # noqa: F401 — re-export: routes/mcp_server.py imports it here
+)
+from aegis.services.tools.gtd import (
+    _assignee_labels,  # noqa: F401 — re-export: imported from here by tests
+    _capture_to_inbox_impl,  # noqa: F401 — re-export: routes/chat.py + routes/capture.py
+    _exec_capture_to_inbox,
+    _exec_complete_task,
+    _exec_defer_task,
+    _exec_find_reference,
+    _exec_handoff_task,
+    _exec_list_next_actions,
+    _exec_list_projects,
+    _exec_mark_waiting,
+    _exec_whats_next,
+)
 from aegis.services.tools.infra import (
     _INFRA_CONTEXTS_K8S,  # noqa: F401 — re-export: tests mutate this set in place
     _exec_cloud_identity,
@@ -42,6 +64,13 @@ from aegis.services.tools.infra import (
     _exec_run_infra_script,
     _exec_sync_argocd_app,
 )
+from aegis.services.tools.knowledge import (
+    _exec_ask_knowledge,
+    _exec_remember_this,
+    _exec_search_knowledge,
+    _knowledge_unavailable,  # noqa: F401 — re-export: kept importable from here
+)
+from aegis.services.tools.registry import TOOL_REGISTRY
 from aegis.services.tools.vercel import (
     _exec_vercel_get_build_logs,
     _exec_vercel_get_deployment,
@@ -51,6 +80,26 @@ from aegis.services.tools.vercel import (
 )
 
 logger = structlog.get_logger()
+
+
+def _registry_schema(name: str) -> dict:
+    """The advertised schema for one `@aegis_tool`-registered executor.
+
+    Lets `CHAT_TOOLS` keep its hand-laid order — the list IS the LLM's prompt —
+    while a migrated domain's schema is generated from that tool's typed
+    signature plus docstring instead of being duplicated here. `KeyError` on an
+    unknown name is deliberate: a rename must fail at import, not silently drop
+    the tool from the surface the model can see.
+    """
+    tool = TOOL_REGISTRY[name]
+    return {
+        "type": "function",
+        "function": {
+            "name": tool.name,
+            "description": tool.description,
+            "parameters": tool.parameters,
+        },
+    }
 
 
 # Intent routing for the chat front door. Deterministic keyword map first
@@ -226,257 +275,11 @@ async def classify_intent(message: str, llm, settings, pool=None) -> dict:
 _TOOL_INCAPABLE_MODELS: frozenset[str] = frozenset({"claude-haiku", "claude-sonnet", "claude-opus"})
 
 
-def _json_default(value: Any) -> Any:
-    """Type-specific JSON encoder for tool result payloads.
-
-    Coerces the common DB/HTTP types the LLM sees into shapes it understands:
-    Decimal -> float, datetime/date -> ISO string, UUID -> str. Everything
-    else falls back to ``str()`` so we never raise during serialization.
-    """
-    if isinstance(value, Decimal):
-        return float(value)
-    if isinstance(value, (datetime, date)):
-        return value.isoformat()
-    if isinstance(value, UUID):
-        return str(value)
-    return str(value)
-
-
-# Passes used to progressively shrink a tool result that exceeds the byte
-# budget. Each tuple is (n_items_to_keep, max_string_length). We try the
-# loosest pass first (keep a lot, leave strings long) and tighten on each
-# attempt, so results stay as useful as possible. Only when even the
-# tightest pass overflows do we fall through to the minimal summary.
-_SHRINK_PASSES: tuple[tuple[int, int], ...] = (
-    (5, 1000),
-    (5, 500),
-    (3, 500),
-    (3, 250),
-    (1, 500),
-    (1, 150),
-)
-
-# How many dropped key names to spell out before folding the tail into a single
-# `… +K more` entry.
-_MAX_LISTED_DROPPED_KEYS = 12
-
-# The one marker for prose the model reads as prose. `_shrink_strings` appends it
-# inside an over-long JSON string field; `_truncate_text` appends it to a whole
-# non-JSON result. Shared deliberately (#239): "was this cut?" must have exactly
-# one thing to look for, not a third spelling per code path.
-_TRUNCATION_MARKER = "… [truncated]"
-
-
-def _shrink_strings(obj, max_str_len: int, n_items: int):
-    """Recursively shrink over-long strings AND cap nested lists at ``n_items``
-    entries, replacing the dropped tail with one in-band ``… +K of N more``
-    element. Leaves other types untouched.
-
-    Capping nested lists is what makes an over-budget dict shrinkable at all.
-    Before #148 the only lever was dropping whole keys, so a result whose
-    payload sat under a non-leading key lost that payload outright, and a
-    result whose payload WAS leading couldn't be shrunk enough to fit and fell
-    through to the "too large to display" stub. Keeping the dropped count
-    inside the list it describes means the same mechanism that removed the
-    items can never separate them from their own count.
-    """
-    if isinstance(obj, str):
-        if len(obj) > max_str_len:
-            # Leave room for the marker so the caller can tell a cut happened.
-            head = max(0, max_str_len - len(_TRUNCATION_MARKER))
-            return obj[:head] + _TRUNCATION_MARKER
-        return obj
-    if isinstance(obj, list):
-        kept = [_shrink_strings(x, max_str_len, n_items) for x in obj[:n_items]]
-        if len(obj) > n_items:
-            kept.append(f"… +{len(obj) - n_items} of {len(obj)} more")
-        return kept
-    if isinstance(obj, dict):
-        return {k: _shrink_strings(v, max_str_len, n_items) for k, v in obj.items()}
-    return obj
-
-
-def _payload_rank(value) -> int:
-    """Rank a dict value by how likely it is to BE the answer: a list of
-    records outranks a nested object, which outranks a scalar.
-
-    ``sorted`` is stable, so position only breaks ties within a rank — an
-    executor that deliberately leads with its payload (``social_timeline``,
-    ``list_social_channels``) still wins, while one that leads with a scalar
-    ``count``/``ok``/``window_hours`` no longer loses its data to it (#148).
-    """
-    if isinstance(value, list):
-        return 0
-    if isinstance(value, dict):
-        return 1
-    return 2
-
-
-def _smart_subset(data, n_items: int, max_str_len: int):
-    """Keep the first ``n_items`` of a list, or the ``n_items`` highest-ranked
-    keys of a dict, shrinking long strings and capping nested lists inside the
-    kept portion. Returns the trimmed object plus truncation metadata so the
-    LLM knows content was dropped — and, for a dict, WHICH keys were dropped,
-    so it can ask a narrower question instead of blind-retrying the same call.
-    """
-    if isinstance(data, list):
-        return {
-            "results": [_shrink_strings(item, max_str_len, n_items) for item in data[:n_items]],
-            "truncated": True,
-            "total": len(data),
-        }
-    keep = set(sorted(data, key=lambda k: _payload_rank(data[k]))[:n_items])
-    subset = {k: _shrink_strings(v, max_str_len, n_items) for k, v in data.items() if k in keep}
-    dropped = [k for k in data if k not in keep]
-    # Assigned AFTER the selection above, so the signal is never itself a
-    # candidate for eviction by the pass that produced it.
-    subset["_truncated"] = True
-    subset["_total_keys"] = len(data)
-    if dropped:
-        # Bounded like the `+K more` aggregates in `list_social_channels` and
-        # the `social_timeline` roll-up, so naming the casualties can never be
-        # what pushes a pass over budget and forces the minimal stub.
-        listed = [str(k)[:60] for k in dropped[:_MAX_LISTED_DROPPED_KEYS]]
-        if len(dropped) > _MAX_LISTED_DROPPED_KEYS:
-            listed.append(f"… +{len(dropped) - _MAX_LISTED_DROPPED_KEYS} more")
-        subset["_dropped_keys"] = listed
-    return subset
-
-
-def _truncate_text(text: str, max_bytes: int) -> str:
-    """Cut a non-JSON tool result down to ``max_bytes`` and say that it was cut.
-
-    Two things the old ``text[:max_bytes]`` got wrong (#239). It counted
-    CHARACTERS against a byte budget, so a non-ASCII result came back over
-    budget — up to 4x for multi-byte UTF-8. And it appended nothing, so the
-    model received a string ending mid-sentence with no signal it was partial,
-    which is the same silent-partial failure the dict and list paths were fixed
-    for in #148. This is a live path, not a theoretical one: several executors
-    return plain text rather than JSON (``query_observations``,
-    ``last_contact_with_person``, the refusal strings).
-
-    Slicing encoded bytes can land inside a multi-byte sequence, so the decode
-    drops that trailing partial character instead of raising.
-    """
-    budget = max_bytes - len(_TRUNCATION_MARKER.encode())
-    if budget <= 0:
-        # Budget too tight to hold the marker at all — a byte-safe cut is all
-        # that fits. Still never over budget, which the character slice could be.
-        return text.encode()[:max_bytes].decode(errors="ignore")
-    return text.encode()[:budget].decode(errors="ignore") + _TRUNCATION_MARKER
-
-
-def _truncate_result(result_json: str, max_bytes: int = 4096) -> str:
-    """Trim a JSON-serialised tool result so it fits within ``max_bytes``.
-
-    Strategy, loosest → tightest:
-    1. Return unchanged if already under budget.
-    2. Parse. Non-JSON or scalar → byte-safe cut plus a ``… [truncated]`` marker
-       (``_truncate_text``).
-    3. For a list/dict, iterate ``_SHRINK_PASSES``: keep the first N items of
-       a list or the N highest-ranked keys of a dict (see ``_payload_rank``),
-       recursively shrinking long strings and capping nested lists inside the
-       kept portion. Return the first pass whose serialisation fits.
-    4. Fallback: minimal summary noting the total count.
-
-    This is better than a byte-level slice because the LLM still sees
-    structured data with sample content; it's better than the prior
-    slice-then-give-up approach because deeply nested records (common for
-    knowledge/search tool output) get their big string fields shrunk down
-    rather than being replaced entirely by a "too large" note.
-
-    EVERY path out of here carries a truncation signal — ``… [truncated]`` on a
-    non-JSON cut, ``truncated``/``total`` for a list, ``_truncated``/
-    ``_total_keys`` (plus ``_dropped_keys``) for a dict, ``… +K of N more``
-    inside any capped nested list — so a partial result is never mistakable for
-    a complete one. Every return is also measured in BYTES, matching the budget's
-    own unit.
-    """
-    if len(result_json.encode()) <= max_bytes:
-        return result_json
-
-    try:
-        data = json.loads(result_json)
-    except (json.JSONDecodeError, TypeError):
-        return _truncate_text(result_json, max_bytes)
-
-    if not isinstance(data, (list, dict)):
-        return _truncate_text(result_json, max_bytes)
-
-    for n_items, max_str_len in _SHRINK_PASSES:
-        candidate = _smart_subset(data, n_items, max_str_len)
-        encoded = json.dumps(candidate, default=str)
-        if len(encoded.encode()) <= max_bytes:
-            return encoded
-
-    # Even a single item with very short strings overflows — emit a minimal
-    # summary. Keeps the tool result valid JSON and preserves the count.
-    if isinstance(data, list):
-        return json.dumps(
-            {"truncated": True, "total": len(data), "note": "Results too large to display"}
-        )
-    return json.dumps(
-        {"_truncated": True, "_total_keys": len(data), "note": "Results too large to display"}
-    )
-
-
 # Tool definitions for agent chat (OpenAI format)
 CHAT_TOOLS = [
-    {
-        "type": "function",
-        "function": {
-            "name": "search_knowledge",
-            "description": "Search the knowledge base using semantic similarity. Returns relevant content with titles, summaries, and similarity scores.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "query": {"type": "string", "description": "Natural language search query"},
-                    "limit": {
-                        "type": "integer",
-                        "description": "Max results (1-100)",
-                        "default": 10,
-                    },
-                },
-                "required": ["query"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "ask_knowledge",
-            "description": "Ask a question and get a synthesized answer from the knowledge base with sources and confidence scores.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "question": {"type": "string", "description": "Natural language question"},
-                },
-                "required": ["question"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "remember_this",
-            "description": "Store important information from this conversation in the knowledge base for future reference. Only call when something is worth remembering long-term.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "summary": {
-                        "type": "string",
-                        "description": "Concise summary of what to remember",
-                    },
-                    "tags": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                        "description": "Categorization tags",
-                    },
-                },
-                "required": ["summary"],
-            },
-        },
-    },
+    _registry_schema("search_knowledge"),
+    _registry_schema("ask_knowledge"),
+    _registry_schema("remember_this"),
     {
         "type": "function",
         "function": {
@@ -1087,176 +890,17 @@ CHAT_TOOLS = [
             },
         },
     },
-    {
-        "type": "function",
-        "function": {
-            "name": "capture_to_inbox",
-            "description": "Drop a task into the Todoist Inbox. The task gets a #chat source tag by default unless 'source' is given.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "text": {"type": "string", "description": "Task title"},
-                    "source": {
-                        "type": "string",
-                        "enum": ["chat", "manual"],
-                        "default": "chat",
-                        "description": "Where the capture originated (tags as #<source>)",
-                    },
-                    "description": {"type": "string", "description": "Optional longer body"},
-                },
-                "required": ["text"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "list_next_actions",
-            "description": "Read open (incomplete), actionable tasks from the Todoist projection. Excludes @reference/@someday/@to-read, and excludes @waiting for @me. When assignee is an agent label (e.g. @pandora), @waiting tasks ARE included and marked [parked] — for an agent @waiting means 'a run finished a pass', not 'blocked', so this is that agent's own working queue. Optional filters: assignee label, context label, due window.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "assignee": {
-                        "type": "string",
-                        "description": "Assignee label (e.g. @me, @sebas)",
-                    },
-                    "context": {
-                        "type": "string",
-                        "description": "Context label (e.g. @5min, @deep)",
-                    },
-                    "due": {
-                        "type": "string",
-                        "enum": ["today", "this_week", "overdue"],
-                        "description": "Optional due-window filter",
-                    },
-                    "limit": {
-                        "type": "integer",
-                        "default": 25,
-                        "description": "Max rows to return",
-                    },
-                },
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "whats_next",
-            "description": (
-                "Suggest what to work on now. Returns a short ranked list of "
-                "your own next actions (excludes waiting/reference/reading and "
-                "inbox/someday). Optionally tailor to available time and energy."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "minutes": {
-                        "type": "integer",
-                        "description": "Minutes available (<=5 prefers @5min tasks)",
-                    },
-                    "energy": {
-                        "type": "string",
-                        "enum": ["low", "high"],
-                        "description": "low prefers light tasks; high prefers deep work",
-                    },
-                    "limit": {"type": "integer", "description": "Max items (default 5)"},
-                },
-                "required": [],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "list_projects",
-            "description": "List work-stream projects with open task counts.",
-            "parameters": {"type": "object", "properties": {}},
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "complete_task",
-            "description": "Mark a Todoist task complete. Optional 'note' is appended as a Todoist comment.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "task_id": {"type": "string"},
-                    "note": {"type": "string"},
-                },
-                "required": ["task_id"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "defer_task",
-            "description": "Reschedule a Todoist task to a new due date.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "task_id": {"type": "string"},
-                    "until": {
-                        "type": "string",
-                        "description": "ISO date or natural string like 'tomorrow', 'next friday'",
-                    },
-                },
-                "required": ["task_id", "until"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "mark_waiting",
-            "description": "Mark a task @waiting (with a 'who' note). Optionally include expected_by ISO date.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "task_id": {"type": "string"},
-                    "who": {"type": "string", "description": "The person we're waiting on"},
-                    "expected_by": {"type": "string", "description": "Optional ISO date"},
-                },
-                "required": ["task_id", "who"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "handoff_task",
-            "description": (
-                "Reassign a task to a different personality assignee, given as "
-                "an @label (e.g. @me, @raphael, @pandora). Valid labels are the "
-                "active agents' mention aliases plus @me; an invalid one is "
-                "rejected with the list of valid labels."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "task_id": {"type": "string"},
-                    "to_assignee": {"type": "string"},
-                },
-                "required": ["task_id", "to_assignee"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "find_reference",
-            "description": "Search the \U0001f516 Reference project + knowledge-service for relevant items.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "query": {"type": "string"},
-                    "limit": {"type": "integer", "default": 10},
-                },
-                "required": ["query"],
-            },
-        },
-    },
+    # GTD / Todoist — schemas generated from the typed `@aegis_tool` executors
+    # in `services/tools/gtd.py`; the order here is still the order the LLM sees.
+    _registry_schema("capture_to_inbox"),
+    _registry_schema("list_next_actions"),
+    _registry_schema("whats_next"),
+    _registry_schema("list_projects"),
+    _registry_schema("complete_task"),
+    _registry_schema("defer_task"),
+    _registry_schema("mark_waiting"),
+    _registry_schema("handoff_task"),
+    _registry_schema("find_reference"),
     {
         "type": "function",
         "function": {
@@ -1912,43 +1556,6 @@ async def _exec_investigate_resource(pool: asyncpg.Pool, args: dict, ctx: ToolCo
     return json.dumps({"status": "investigation_started", "workflow_id": workflow_id, "repo": repo})
 
 
-def _knowledge_unavailable(detail: str = "Knowledge service not available") -> str:
-    """Return a clearly-labeled 'service down' status.
-
-    Distinct from an empty successful search so the LLM can decide whether to
-    retry, apologise to the user, or fall back to another tool instead of
-    treating the gap as "no results found".
-    """
-    return json.dumps({"status": "unavailable", "error": detail, "retry_suggested": True})
-
-
-async def _exec_search_knowledge(pool: asyncpg.Pool, args: dict, ctx: ToolContext) -> str:
-    if not ctx.knowledge_connector:
-        return _knowledge_unavailable()
-    query = args.get("query", "")
-    limit = args.get("limit", 10)
-    try:
-        results = await ctx.knowledge_connector.search(query, limit=limit)
-    except Exception as exc:
-        logger.warning("search_knowledge_unreachable", error=str(exc))
-        return _knowledge_unavailable(f"search failed: {exc}")
-    return json.dumps(results, default=_json_default)
-
-
-async def _exec_ask_knowledge(pool: asyncpg.Pool, args: dict, ctx: ToolContext) -> str:
-    if not ctx.knowledge_connector:
-        return _knowledge_unavailable()
-    question = args.get("question", "")
-    try:
-        result = await ctx.knowledge_connector.ask(question)
-    except Exception as exc:
-        logger.warning("ask_knowledge_unreachable", error=str(exc))
-        return _knowledge_unavailable(f"ask failed: {exc}")
-    return json.dumps(result, default=_json_default)
-
-
-
-
 async def _exec_list_interactions(pool: Any, args: dict, ctx: ToolContext) -> str:
     """Return interactions for an agent filtered by status."""
     agent_id = args.get("agent_id") or ctx.agent_id
@@ -1986,29 +1593,6 @@ async def _exec_list_interactions(pool: Any, args: dict, ctx: ToolContext) -> st
         for r in rows
     ]
     return json.dumps(result, default=str)
-
-
-async def _exec_remember_this(pool: asyncpg.Pool, args: dict, ctx: ToolContext) -> str:
-    if not ctx.knowledge_connector:
-        return json.dumps({"error": "Knowledge service not available"})
-    chat_ctx = ctx.chat_context or {}
-    summary = args.get("summary", "")
-    thread_id = chat_ctx.get("thread_id", "unknown")
-    timestamp = int(time.time())
-    raw_text = f"User: {chat_ctx.get('user_message', '')}\nSummary: {summary}"
-    try:
-        result = await ctx.knowledge_connector.ingest_content(
-            url=f"aegis://chat/{thread_id}/{timestamp}",
-            title=summary,
-            summary=summary,
-            source_type="chat",
-            raw_text=raw_text,
-            tags=args.get("tags", []),
-        )
-        return json.dumps({"stored": True, **result}, default=str)
-    except Exception as exc:
-        logger.warning("remember_this_failed", error=str(exc))
-        return json.dumps({"stored": False, "error": str(exc)})
 
 
 async def _exec_query_activities(pool: asyncpg.Pool, args: dict, ctx: ToolContext) -> str:
@@ -2447,535 +2031,6 @@ async def _exec_update_runbook(pool: asyncpg.Pool, args: dict, ctx: ToolContext)
     except Exception as exc:
         logger.warning("update_runbook_failed", error=str(exc))
         return json.dumps({"ok": False, "error": str(exc)})
-
-
-# --- GTD / Todoist tool executors (Phase 3) ---
-
-
-async def _capture_to_inbox_impl(
-    pool,
-    source_tag: str,
-    external_id: str,
-    title: str,
-    description: str | None,
-    extra_labels: list[str] | None = None,
-) -> str | None:
-    """Thin wrapper that lets tests monkeypatch the capture core.
-
-    In production this delegates to the same logic as
-    CaptureActivities.capture_to_inbox; we keep the HTTP-facing service
-    layer decoupled from the worker activity module so chat-tool calls
-    don't pull worker imports into Core.
-
-    `extra_labels` are appended to the `[source_tag]` label set (dedup-
-    preserving) — used to assign a captured task to an agent (e.g.
-    `@pandora`) so it anchors that agent's downstream workflows.
-    """
-    from aegis.connectors.todoist import TodoistConnector
-
-    if pool is None:
-        return None
-    async with pool.acquire() as conn:
-        kill = await conn.fetchval(
-            "SELECT value FROM settings WHERE key = 'todoist_capture_enabled'"
-        )
-        if kill is False or (isinstance(kill, dict) and kill.get("value") is False):
-            return None
-        managed = await conn.fetchval(
-            "SELECT value FROM settings WHERE key = 'todoist_managed_project_ids'"
-        )
-        inbox_id = (managed or {}).get("inbox") if isinstance(managed, dict) else None
-        if not inbox_id:
-            return None
-        inserted = await conn.fetchval(
-            "INSERT INTO todoist_capture_idempotency (source_tag, external_id) "
-            "VALUES ($1,$2) ON CONFLICT DO NOTHING RETURNING captured_at",
-            source_tag,
-            external_id,
-        )
-        if inserted is None:
-            existing = await conn.fetchval(
-                "SELECT todoist_task_ref FROM todoist_capture_idempotency "
-                "WHERE source_tag=$1 AND external_id=$2",
-                source_tag,
-                external_id,
-            )
-            return existing
-
-    from aegis.config import Settings
-
-    settings = Settings()
-    _tk = await resolve_todoist_api_key(pool, settings)
-    if not _tk:
-        return None
-    connector = TodoistConnector(api_key=_tk, db_pool=pool, timeout=10.0)
-    item_labels = [source_tag]
-    for lbl in extra_labels or []:
-        if lbl and lbl not in item_labels:
-            item_labels.append(lbl)
-    cmd = TodoistConnector.build_create_item_command(
-        project_id=inbox_id,
-        content=title[:120],
-        description=description,
-        labels=item_labels,
-    )
-    result = await connector.commands([cmd])
-    status = TodoistConnector.check_sync_status(result, [cmd["uuid"]])
-    ref: str | None = None
-    if status["ok"]:
-        mapping = (result.get("data") or {}).get("temp_id_mapping", {}) or {}
-        ref = mapping.get(cmd["temp_id"])
-    elif status["retryable"] or status["rejected_retryable"]:
-        # Transient failure — queue for drain_outbox to retry.
-        async with pool.acquire() as conn:
-            await conn.execute(
-                "INSERT INTO todoist_outbox (temp_id, command, status) "
-                "VALUES ($1,$2,'pending') ON CONFLICT (temp_id) DO NOTHING",
-                cmd["temp_id"],
-                cmd,
-            )
-        ref = cmd["temp_id"]
-    # Permanent rejection (ITEM_NOT_FOUND / INVALID_ARGUMENT etc.) leaves
-    # ref=None so the idempotency row keeps todoist_task_ref NULL — the
-    # caller surfaces "no ref" to the user instead of poisoning the outbox.
-    async with pool.acquire() as conn:
-        await conn.execute(
-            "UPDATE todoist_capture_idempotency SET todoist_task_ref=$1 "
-            "WHERE source_tag=$2 AND external_id=$3",
-            ref,
-            source_tag,
-            external_id,
-        )
-    return ref
-
-
-async def _exec_capture_to_inbox(pool: asyncpg.Pool, args: dict, ctx: ToolContext) -> str:
-    text = (args.get("text") or "").strip()
-    if not text:
-        return "Refused: empty text"
-    source = args.get("source") or "chat"
-    description = args.get("description")
-    # Deterministic external id from (agent, text) so identical re-asks
-    # dedupe; including agent_id keeps separate personalities independent.
-    import hashlib
-
-    agent = (ctx.agent_id if ctx else None) or "chat"
-    ext_id = f"chat:{agent}:{hashlib.sha256(text.encode()).hexdigest()[:16]}"
-    ref = await _capture_to_inbox_impl(
-        pool=pool,
-        source_tag=f"#{source}",
-        external_id=ext_id,
-        title=text,
-        description=description,
-    )
-    if ref is None:
-        return "Capture skipped (kill switch off, missing inbox, or no api key)"
-    return f"Captured: {ref}"
-
-
-async def _exec_list_next_actions(pool: asyncpg.Pool, args: dict, ctx: ToolContext) -> str:
-    assignee = args.get("assignee")
-    context = args.get("context")
-    limit = int(args.get("limit") or 25)
-    if pool is None:
-        return "No DB pool"
-    # State labels mirror aegis_worker.activities.review._STATE_LABELS
-    # (cross-package; keep in sync) and _exec_whats_next below — a task parked
-    # as @waiting/@reference/@someday/@to-read isn't a human next action.
-    parked = ["@waiting", "@reference", "@to-read", "@someday"]
-    # ...but @waiting on an AGENT-assigned task is not "blocked": it is
-    # agent_task.PARK_LABEL, stamped by park_task at the END of every run. So
-    # filtering it hid the agent's entire worked backlog from the agent itself
-    # (9 of 11 open @pandora tasks, 2026-08-11) and chat truthfully reported an
-    # empty queue. Agents see their parked work; @me keeps GTD semantics.
-    # Roster comes from the DB, so a new agent is covered without a code edit.
-    is_agent = bool(assignee) and assignee != "@me" and assignee in await _assignee_labels(pool)
-    if is_agent:
-        parked.remove("@waiting")
-    params: list[object] = [parked]
-    where = [
-        "NOT t.is_completed",
-        "NOT (t.labels && $1::text[])",
-    ]
-    if assignee:
-        params.append(assignee)
-        where.append(f"t.assignee_label = ${len(params)}")
-    if context:
-        params.append(context)
-        where.append(f"${len(params)} = ANY(t.labels)")
-    async with pool.acquire() as conn:
-        inbox_id = await conn.fetchval(
-            "SELECT value->>'inbox' FROM settings WHERE key='todoist_managed_project_ids'"
-        )
-        # The Inbox is excluded for humans because an Inbox item is unclarified
-        # — clarify it before it can be a next action. An agent-assigned task is
-        # the opposite: the @agent label IS clarify's output, and AEGIS's own
-        # triage (#alert/#email/#receipt) parks its work there, so 10 of the 11
-        # open @pandora tasks were Inbox rows. agent_task.find_actionable_tasks
-        # already works them with no inbox filter, so excluding them here only
-        # ever hid work the worker was actively doing.
-        if inbox_id and not is_agent:
-            params.append(inbox_id)
-            where.append(f"t.project_id <> ${len(params)}")
-        params.append(limit)
-        sql = (
-            "SELECT t.id, t.content, t.assignee_label, t.labels, t.due_date "
-            "FROM todoist_tasks t "
-            f"WHERE {' AND '.join(where)} "
-            "ORDER BY COALESCE(t.due_date,'9999-12-31'::date), t.updated_at DESC "
-            f"LIMIT ${len(params)}"
-        )
-        rows = await conn.fetch(sql, *params)
-        if not rows:
-            # An empty list used to be indistinguishable from "everything was
-            # filtered out", which is exactly how a full queue got reported as
-            # nothing-to-do. Say what was hidden so the agent can't confabulate.
-            hidden = await conn.fetchval(
-                "SELECT count(*) FROM todoist_tasks t WHERE NOT t.is_completed "
-                "AND t.labels && $1::text[] "
-                "AND ($2::text IS NULL OR t.assignee_label = $2)",
-                parked,
-                assignee,
-            )
-            if hidden:
-                return (
-                    f"No matching next actions ({hidden} excluded as "
-                    f"{'/'.join(parked)})."
-                )
-            return "No matching next actions."
-    lines = []
-    for r in rows:
-        due = f" due {r['due_date'].isoformat()}" if r["due_date"] else ""
-        parked_note = " [parked]" if "@waiting" in (r["labels"] or []) else ""
-        lines.append(
-            f"- [{r['id']}] {r['content']} ({r['assignee_label'] or '@me'}){due}{parked_note}"
-        )
-    return "\n".join(lines)
-
-
-async def _exec_whats_next(pool: asyncpg.Pool, args: dict, ctx: ToolContext) -> str:
-    if pool is None:
-        return "No DB pool"
-    minutes = args.get("minutes")
-    energy = (args.get("energy") or "").lower()
-    # ponytail: tiny inline minutes/energy->context map; not worth a module.
-    contexts: list[str] = []
-    if minutes is not None and int(minutes) <= 5:
-        contexts = ["@5min"]
-    elif energy == "low":
-        contexts = ["@5min", "@email", "@reading"]
-    elif energy == "high":
-        contexts = ["@deep", "@code"]
-    where = [
-        "NOT t.is_completed",
-        "(t.assignee_label='@me' OR t.assignee_label IS NULL)",
-        # State labels mirror aegis_worker.activities.review._STATE_LABELS
-        # (cross-package; keep in sync). @someday is included here now that
-        # Someday/Later is a label, not a managed project (Todoist
-        # restructure, 2026-07).
-        "NOT (t.labels && ARRAY['@waiting','@reference','@to-read','@someday'])",
-    ]
-    params: list = []
-    async with pool.acquire() as conn:
-        managed = await conn.fetchval(
-            "SELECT value FROM settings WHERE key='todoist_managed_project_ids'"
-        )
-        # Someday is excluded via the @someday state label above; only Inbox
-        # is still a managed-project id to exclude.
-        exclude = []
-        if isinstance(managed, dict):
-            exclude = [e for e in (managed.get("inbox"),) if e]
-        if exclude:
-            params.append(exclude)
-            where.append(
-                f"(t.project_id IS NULL OR t.project_id <> ALL(${len(params)}::text[]))"
-            )
-        if contexts:
-            params.append(contexts)
-            where.append(f"t.labels && ${len(params)}::text[]")
-        params.append(int(args.get("limit") or 5))
-        sql = (
-            "SELECT t.id, t.content, t.due_date FROM todoist_tasks t "
-            f"WHERE {' AND '.join(where)} "
-            "ORDER BY (t.due_date IS NULL), t.due_date ASC, "
-            "t.priority DESC NULLS LAST, t.updated_at DESC "
-            f"LIMIT ${len(params)}"
-        )
-        rows = await conn.fetch(sql, *params)
-    if not rows:
-        return "Nothing queued that fits — inbox may be clear or everything's @waiting."
-    lines = []
-    for r in rows:
-        due = f" (due {r['due_date'].isoformat()})" if r["due_date"] else ""
-        lines.append(f"- [{r['id']}] {r['content']}{due}")
-    return "\n".join(lines)
-
-
-async def _exec_list_projects(pool: asyncpg.Pool, args: dict, ctx: ToolContext) -> str:
-    """List leaf work-stream projects (nested under an area project) with
-    open-task counts.
-
-    Post-restructure, areas/work-streams are real nested Todoist projects
-    (parent AREA project has parent_id IS NULL, leaf WORK-STREAM has
-    parent_id IS NOT NULL) — the old `project/*` label convention is
-    retired.
-    """
-    if pool is None:
-        return "No DB pool"
-    async with pool.acquire() as conn:
-        rows = await conn.fetch(
-            "SELECT p.id, p.name, "
-            "  count(t.id) FILTER (WHERE NOT t.is_completed) AS open_n "
-            "FROM todoist_projects p "
-            "LEFT JOIN todoist_tasks t ON t.project_id = p.id "
-            "WHERE p.parent_id IS NOT NULL AND NOT p.is_archived "
-            "GROUP BY p.id, p.name "
-            "ORDER BY p.name"
-        )
-    if not rows:
-        return "No work-stream projects."
-    return "\n".join(f"- [{r['id']}] {r['name']} ({r['open_n']} open)" for r in rows)
-
-
-async def _stage_chat_tool_outbox(
-    pool: asyncpg.Pool | None,
-    commands: list[dict],
-    status: dict,
-    op: str,
-) -> str | None:
-    """Inspect a `check_sync_status()` envelope for a chat-tool command batch.
-
-    Three outcomes:
-    - Status OK → returns None; caller proceeds to its success path.
-    - Failure is retryable (envelope 5xx-class OR per-cmd transient rejection)
-      → stage each command in `todoist_outbox` and return a user-facing
-      "queued for retry" string so the user can stop waiting on the chat
-      reply.
-    - Failure is permanent (envelope 4xx OR per-cmd ITEM_NOT_FOUND etc.)
-      → return a user-facing "Todoist error" string. No outbox stage —
-      replaying a malformed command just burns retries.
-
-    Matches the outbox-queue contract that `_capture_to_inbox_impl`,
-    `CaptureActivities.capture_to_inbox`, and `ClarifyActivities.apply_outcome`
-    already use, so transient Todoist outages don't silently drop user
-    intent across any code path.
-    """
-    if status["ok"]:
-        return None
-    if status["retryable"] or status["rejected_retryable"]:
-        if pool is None:
-            return f"Todoist transient error ({op}); no pool to queue retry"
-        import uuid as _uuid
-
-        async with pool.acquire() as conn:
-            for cmd in commands:
-                temp_id = cmd.get("temp_id") or f"chattool-{op}-{_uuid.uuid4()}"
-                await conn.execute(
-                    "INSERT INTO todoist_outbox (temp_id, command, status) "
-                    "VALUES ($1, $2, 'pending') ON CONFLICT (temp_id) DO NOTHING",
-                    temp_id,
-                    cmd,
-                )
-        logger.warning(
-            "chat_tool_outbox_queued",
-            op=op,
-            count=len(commands),
-            envelope_error=status["envelope_error"],
-        )
-        return f"Todoist hiccup ({op}); queued for retry"
-    return f"Todoist error ({op}): {status['envelope_error'] or status['rejected']}"
-
-
-async def _exec_complete_task(pool: asyncpg.Pool, args: dict, ctx: ToolContext) -> str:
-    import uuid as _uuid
-
-    from aegis.config import Settings
-    from aegis.connectors.todoist import TodoistConnector
-
-    task_id = (args.get("task_id") or "").strip()
-    note_text = args.get("note")
-    if not task_id:
-        return "Refused: task_id required"
-    settings = Settings()
-    _tk = await resolve_todoist_api_key(pool, settings)
-    if not _tk:
-        return "Todoist not configured"
-    connector = TodoistConnector(api_key=_tk, db_pool=pool, timeout=10.0)
-    commands = [
-        {"type": "item_complete", "uuid": str(_uuid.uuid4()), "args": {"id": task_id}},
-    ]
-    if note_text:
-        commands.append(TodoistConnector.build_note_add_command(task_id, note_text))
-    result = await connector.commands(commands)
-    status = TodoistConnector.check_sync_status(result, [c["uuid"] for c in commands])
-    fail_msg = await _stage_chat_tool_outbox(pool, commands, status, "complete_task")
-    if fail_msg is not None:
-        return fail_msg
-    return f"Completed {task_id}"
-
-
-async def _exec_defer_task(pool: asyncpg.Pool, args: dict, ctx: ToolContext) -> str:
-    from aegis.config import Settings
-    from aegis.connectors.todoist import TodoistConnector
-
-    task_id = (args.get("task_id") or "").strip()
-    until = (args.get("until") or "").strip()
-    if not task_id or not until:
-        return "Refused: task_id and until required"
-    settings = Settings()
-    _tk = await resolve_todoist_api_key(pool, settings)
-    if not _tk:
-        return "Todoist not configured"
-    connector = TodoistConnector(api_key=_tk, db_pool=pool, timeout=10.0)
-    # Todoist accepts natural-language strings under args.due.string
-    cmd = TodoistConnector.build_item_update_command(task_id, due={"string": until})
-    result = await connector.commands([cmd])
-    status = TodoistConnector.check_sync_status(result, [cmd["uuid"]])
-    fail_msg = await _stage_chat_tool_outbox(pool, [cmd], status, "defer_task")
-    if fail_msg is not None:
-        return fail_msg
-    return f"Deferred {task_id} until {until}"
-
-
-async def _exec_mark_waiting(pool: asyncpg.Pool, args: dict, ctx: ToolContext) -> str:
-    from aegis.config import Settings
-    from aegis.connectors.todoist import TodoistConnector
-
-    task_id = (args.get("task_id") or "").strip()
-    who = (args.get("who") or "").strip()
-    expected = args.get("expected_by")
-    if not task_id or not who:
-        return "Refused: task_id and who required"
-    if pool is None:
-        return "No DB pool"
-    async with pool.acquire() as conn:
-        existing_labels = await conn.fetchval(
-            "SELECT labels FROM todoist_tasks WHERE id=$1", task_id
-        )
-    if existing_labels is None:
-        return f"Unknown task {task_id}"
-    settings = Settings()
-    _tk = await resolve_todoist_api_key(pool, settings)
-    if not _tk:
-        return "Todoist not configured"
-    connector = TodoistConnector(api_key=_tk, db_pool=pool, timeout=10.0)
-    new_labels = list({*(existing_labels or []), "@waiting"})
-    note_body = f"Waiting on {who}" + (f" (expected by {expected})" if expected else "")
-    commands = [
-        TodoistConnector.build_item_update_command(task_id, labels=new_labels),
-        TodoistConnector.build_note_add_command(task_id, note_body),
-    ]
-    result = await connector.commands(commands)
-    status = TodoistConnector.check_sync_status(result, [c["uuid"] for c in commands])
-    fail_msg = await _stage_chat_tool_outbox(pool, commands, status, "mark_waiting")
-    if fail_msg is not None:
-        return fail_msg
-    return f"Marked {task_id} waiting on {who}"
-
-
-async def _assignee_labels(pool: asyncpg.Pool | None) -> list[str]:
-    """Valid handoff assignee labels: @me plus every active agent's mention
-    aliases (metadata.mention_aliases, default [id]) — issue #36. Falls back to
-    the shipped 4-agent set without a pool or on read failure."""
-    fallback = ["@me", "@sebas", "@raphael", "@maou", "@pandora"]
-    if pool is None:
-        return fallback
-    try:
-        rows = await pool.fetch("SELECT id, metadata FROM agents WHERE active = TRUE")
-        labels = ["@me"]
-        for r in rows:
-            aliases = (r["metadata"] or {}).get("mention_aliases") or [r["id"]]
-            labels.extend(f"@{str(a).lstrip('@')}" for a in aliases)
-        return labels or fallback
-    except Exception as exc:  # noqa: BLE001 — never break the tool on a config read
-        logger.warning("handoff_assignee_labels_failed", error=str(exc)[:200])
-        return fallback
-
-
-async def _exec_handoff_task(pool: asyncpg.Pool, args: dict, ctx: ToolContext) -> str:
-    from aegis.config import Settings
-    from aegis.connectors.todoist import TodoistConnector
-
-    task_id = (args.get("task_id") or "").strip()
-    to_assignee = (args.get("to_assignee") or "").strip()
-    if not task_id:
-        return "Refused: valid task_id + to_assignee required"
-    valid_assignees = await _assignee_labels(pool)
-    if to_assignee not in valid_assignees:
-        return f"Refused: to_assignee must be one of {', '.join(valid_assignees)}"
-    if pool is None:
-        return "No DB pool"
-    async with pool.acquire() as conn:
-        existing_labels = await conn.fetchval(
-            "SELECT labels FROM todoist_tasks WHERE id=$1", task_id
-        )
-    if existing_labels is None:
-        return f"Unknown task {task_id}"
-    # Strip any existing @assignee, add the new one
-    kept = [lab for lab in (existing_labels or []) if lab not in valid_assignees]
-    new_labels = [*kept, to_assignee]
-    settings = Settings()
-    _tk = await resolve_todoist_api_key(pool, settings)
-    if not _tk:
-        return "Todoist not configured"
-    connector = TodoistConnector(api_key=_tk, db_pool=pool, timeout=10.0)
-    cmd = TodoistConnector.build_item_update_command(task_id, labels=new_labels)
-    result = await connector.commands([cmd])
-    status = TodoistConnector.check_sync_status(result, [cmd["uuid"]])
-    fail_msg = await _stage_chat_tool_outbox(pool, [cmd], status, "handoff_task")
-    if fail_msg is not None:
-        return fail_msg
-    return f"Handed off {task_id} to {to_assignee}"
-
-
-async def _exec_find_reference(pool: asyncpg.Pool, args: dict, ctx: ToolContext) -> str:
-    """Two sources: tasks labeled @reference + knowledge-service semantic
-    search filtered to source_type='reference'.
-
-    Phase 5: KS gains a real reference corpus when ClarifyFlow classifies
-    items as 'reference' (ingest_reference_to_ks pushes body + URL + tags).
-    This tool searches THAT corpus, with a Todoist title ILIKE fallback
-    for items not yet ingested. Post-GTD-restructure the Todoist query
-    is by @reference label, not project_id.
-    """
-    query = (args.get("query") or "").strip()
-    limit = int(args.get("limit") or 10)
-    if not query:
-        return "Refused: empty query"
-    out: list[str] = []
-    if pool is not None:
-        async with pool.acquire() as conn:
-            rows = await conn.fetch(
-                "SELECT id, content FROM todoist_tasks "
-                "WHERE '@reference' = ANY(labels) "
-                "AND NOT is_completed "
-                "AND content ILIKE $1 "
-                "ORDER BY updated_at DESC LIMIT $2",
-                f"%{query}%",
-                limit,
-            )
-            for r in rows:
-                out.append(f"- [reference:{r['id']}] {r['content']}")
-    # KS pass — semantic search the reference corpus directly.
-    if ctx.knowledge_connector:
-        try:
-            ks_results = await ctx.knowledge_connector.search(
-                query,
-                limit=limit,
-                source_type="reference",
-            )
-            if ks_results:
-                out.append("Semantic matches (Reference KB):")
-                for item in ks_results[:limit]:
-                    title = (item.get("title") or "").strip()[:120]
-                    score = item.get("score") or item.get("similarity") or 0.0
-                    cid = item.get("content_id") or item.get("id") or ""
-                    out.append(f"- [{cid}] {title} (score={score:.2f})")
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("find_reference_ks_failed", error=str(exc)[:200])
-    if not out:
-        return "No reference matches."
-    return "\n".join(out)
 
 
 async def _exec_last_contact_with_person(pool: asyncpg.Pool, args: dict, ctx: ToolContext) -> str:
