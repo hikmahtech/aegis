@@ -389,8 +389,18 @@ activities:
     # Knobs (all DB-editable on /admin/flows, propagate in <=5 min without a
     # redeploy): consecutive_failures, lookback_hours, stale_multiplier,
     # min_stale_minutes, dedup_hours, recovery_hours, check_stale, silent,
-    # and for the zero-success LLM-purpose detector (#321): check_llm,
-    # llm_min_calls, llm_lookback_hours.
+    # and for the dead-LLM-purpose detector (#321): check_llm,
+    # llm_consecutive (default 2), llm_staleness_hours (720).
+    #
+    # That detector asks "did this purpose's last llm_consecutive calls ALL
+    # fail?", NOT "how many failed in the last H hours" — purpose cadence
+    # ranges from 102 calls a month to 2, so a rate window is unsatisfiable at
+    # the slow end. `llm_staleness_hours` only bounds how far back to look;
+    # keep it well above the slowest purpose's gap between calls (30 days
+    # covers the twice-a-month ones) and below the 90-day llm_calls retention.
+    # Both replace `llm_min_calls`/`llm_lookback_hours`, which are no longer
+    # read: a leftover `llm_lookback_hours: 24` in a DB config row now does
+    # nothing, where before it made the detector unable to fire at all.
     config: {}
     active: true
 

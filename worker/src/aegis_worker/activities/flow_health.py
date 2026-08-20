@@ -5,7 +5,8 @@ Issue #226: `TodoistSyncFlow` failed six consecutive times (2026-08-02
 `workflow_runs` rows with `status='failed'` and a useful
 `result_summary->>'reason'` — the data was there, nothing was watching it.
 
-Two detectors, both reading `workflow_runs` (no new table, no migration):
+Three detectors — two over `workflow_runs`, one over `llm_calls` (no new
+table, no migration):
 
 1. **consecutive failures** — the most recent N runs of a `workflow_type`
    are ALL failed. A `workflow_runs` row is written only after the run's own
@@ -15,15 +16,39 @@ Two detectors, both reading `workflow_runs` (no new table, no migration):
    run is older than `multiplier x` its own cadence (derived from
    `schedule_cron`). This is the "silently stopped running" case, which
    detector 1 cannot see at all: a schedule that never fires writes no rows.
-3. **dead LLM purpose** — an `llm_calls.purpose` with calls but not one
-   success in the trailing window (#321). Neither detector above can see this:
-   almost every LLM caller in AEGIS catches its own failure and degrades to
-   non-LLM output, so the flow *completes* and the schedule stays fresh while
-   the thinking part of it produces nothing. That is exactly how #255 ran for
-   six days — `briefing_frame` returned empty content on 100% of calls and the
-   briefing went out every morning looking fine. Purpose-level, because the
-   cause is usually per-purpose (a budget, a prompt, a model in one tier), not
+3. **dead LLM purpose** — the most recent N calls of one `llm_calls.purpose`
+   ALL failed (#321). Neither detector above can see this: almost every LLM
+   caller in AEGIS catches its own failure and degrades to non-LLM output, so
+   the flow *completes* and the schedule stays fresh while the thinking part of
+   it produces nothing. That is exactly how #255 ran for six days —
+   `briefing_frame` returned empty content on 100% of calls and the briefing
+   went out every morning looking fine. Purpose-level, because the cause is
+   usually per-purpose (a budget, a prompt, a model in one tier), not
    whole-fleet.
+
+Detectors 1 and 3 are both *last-N* tests, not rate-over-a-window tests, and
+that is the load-bearing choice. Cadence in AEGIS spans three orders of
+magnitude — `clarify_classification` runs 102 times a month, `review_frame`
+twice — so no fixed time window is right for every subject. #321 shipped
+detector 3 as "2 calls with 0 successes in 24h" and it could not fire for six
+of fourteen live purposes, including the two the issue was opened about: they
+never reach two calls in a single day, so the condition was unsatisfiable no
+matter how broken they were. Time is now a *staleness bound* (don't dig into
+ancient history) rather than the gate.
+
+The one thing the staleness bound is for is the retired purpose: a purpose
+deleted from the code whose final calls happened to fail keeps matching "its
+last calls all failed" forever, because no newer call will ever arrive to
+clear it. It stops matching once its last call is older than
+`staleness_hours`. Until then it behaves like any other unfixed fault — one
+card per `dedup_hours`, silenced with one `alert_mutes` row — which is the
+same deal a permanently stale schedule already gets from detector 2, except
+this one expires on its own. That is the accepted cost of not gating on
+cadence: the alternative (deriving each purpose's expected interval from its
+own history) needs a floor for burst-shaped purposes, and a mis-set floor
+would silently stop the detector firing, which is precisely the failure this
+rewrite exists to remove. A loud fault that expires beats a quiet one that
+does not.
 
 Alerting is deduped in `audit_log` (`flow_health_alert` /
 `flow_health_recovered`), the same substrate `DeliveryWatchdogFlow` uses for
@@ -199,26 +224,51 @@ WHERE a.active = TRUE
 ORDER BY a.slug
 """
 
+# _FAILING_SQL's shape, applied to llm_calls: rank each purpose's own calls by
+# recency and require that the newest `consecutive` of them ALL failed — a
+# streak test, not "N calls in H hours", which no single H can express across a
+# fleet whose cadences differ by 50x. `count(*) = $1` doubles as the "has it
+# even run N times" floor, so a purpose called once and errored is not judged.
+# $2 is a staleness bound, not the gate — it keeps the scan off ancient history
+# and lets a purpose that broke, got retired and was never called again fall
+# silent on its own.
+#
+# Measured against live production, which is why it is a streak and not "no
+# successes among the last 3": `daylog_rollup` runs WEEKLY and its last two
+# calls (error 2026-08-09, clipped 2026-08-16) are both dead, but a success
+# from 2026-08-02 still sits in its last three. A last-3-with-no-successes
+# test is suppressed by that fortnight-old success and misses a purpose that is
+# dark right now — one of the two purposes #321 was opened about.
+#
 # `clipped` deliberately does NOT count as a success: it is a response cut
 # mid-write, and a purpose whose every call clips is producing truncated JSON
 # on every call — the same "loud about nothing" state, and worth the same card.
 # `timeout` and `error` obviously don't count. The kill switch writes no row at
 # all, so a spend freeze cannot masquerade as a dead purpose.
 _DEAD_LLM_SQL = """
+WITH recent AS (
+    SELECT purpose, status, model, error, created_at,
+           row_number() OVER (
+               PARTITION BY purpose ORDER BY created_at DESC
+           ) AS rn
+    FROM llm_calls
+    WHERE created_at > now() - make_interval(hours => $2)
+      AND purpose IS NOT NULL
+      AND purpose <> ''
+)
 SELECT purpose,
        count(*) AS calls,
        count(*) FILTER (WHERE status = 'error') AS errors,
        count(*) FILTER (WHERE status = 'timeout') AS timeouts,
        count(*) FILTER (WHERE status = 'clipped') AS clipped,
+       min(created_at) AS first_call_at,
        max(created_at) AS last_call_at,
        (array_agg(model ORDER BY created_at DESC))[1] AS model,
        (array_agg(coalesce(error, '') ORDER BY created_at DESC))[1] AS reason
-FROM llm_calls
-WHERE created_at > now() - make_interval(hours => $2)
-  AND purpose IS NOT NULL
-  AND purpose <> ''
+FROM recent
+WHERE rn <= $1
 GROUP BY purpose
-HAVING count(*) >= $1
+HAVING count(*) = $1
    AND count(*) FILTER (WHERE status = 'success') = 0
 ORDER BY purpose
 """
@@ -265,11 +315,12 @@ def _describe(finding: dict) -> str:
     subject = finding.get("subject", "?")
     if finding.get("kind") == "llm_dead":
         return (
-            f"  {subject}: {finding.get('calls', '?')} LLM calls in "
-            f"{finding.get('window_hours', '?')}h, ZERO successful "
+            f"  {subject}: last {finding.get('calls', '?')} LLM calls, ZERO successful "
             f"(model {finding.get('model', '?')}; errors="
             f"{finding.get('errors', 0)} timeouts={finding.get('timeouts', 0)} "
-            f"clipped={finding.get('clipped', 0)})\n"
+            f"clipped={finding.get('clipped', 0)}; spread over "
+            f"{finding.get('span_hours', '?')}h, last "
+            f"{finding.get('last_call_at', '?')})\n"
             f"    last error: {str(finding.get('reason') or 'unknown')[:300]}"
         )
     if finding.get("kind") == "stale":
@@ -379,9 +430,9 @@ class FlowHealthActivities:
 
     @activity.defn
     async def find_dead_llm_purposes(
-        self, min_calls: int = 2, lookback_hours: int = 24
+        self, consecutive: int = 2, staleness_hours: int = 720
     ) -> list[dict]:
-        """LLM purposes with calls but not one success in the window (#321).
+        """LLM purposes whose most recent `consecutive` calls ALL failed (#321).
 
         The de-silencing half of the reasoning-truncation fix. Retrying a
         truncated call heals *an instance*; this makes the failure CLASS loud,
@@ -390,33 +441,62 @@ class FlowHealthActivities:
         Every one of those looks identical from here: calls going out, nothing
         coming back, and a caller quietly degrading.
 
-        `min_calls` is 2 for the same reason `consecutive_failures` is: one
-        failure is a blip, two is a pattern. It also keeps a purpose that ran
-        exactly once and errored — a chat tool nobody used twice — off the
-        card.
+        The test is deliberately cadence-independent — the subject's own last
+        `consecutive` calls, not a rate over a fixed window. Two knobs, because
+        a third would only be another way to make this unfireable:
+
+        * `consecutive=2` — the same number and the same reasoning as
+          `find_failing_flows`: one failure is a blip, two in a row is a
+          pattern. It is also the floor on "has this purpose even run": a
+          purpose with fewer than `consecutive` calls in the whole staleness
+          window is not judged at all, which keeps a one-shot chat tool that
+          errored off the card.
+        * `staleness_hours=720` (30 days) — the *only* time bound, and it has
+          to reach the slowest live purpose: `profile_generalization` and
+          `review_frame` each run twice a MONTH, so anything shorter is
+          unsatisfiable for them however broken they are. It stays under the
+          90-day `llm_calls` cleanup retention, so the bound is real data, not
+          a window that quietly ends at whatever cleanup left behind.
+
+        A retired purpose whose final calls failed alerts until its last call
+        ages past `staleness_hours` — accepted deliberately, see the
+        module-level note on bounding that.
 
         Returns [] (never raises) on an empty `llm_calls`.
         """
-        if not self.db_pool or min_calls < 1:
+        if not self.db_pool or consecutive < 1:
             return []
         async with self.db_pool.acquire() as conn:
-            rows = await conn.fetch(_DEAD_LLM_SQL, min_calls, lookback_hours)
-        return [
-            {
-                "kind": "llm_dead",
-                "subject": LLM_SUBJECT_PREFIX + r["purpose"],
-                "purpose": r["purpose"],
-                "model": r["model"],
-                "calls": r["calls"],
-                "errors": r["errors"],
-                "timeouts": r["timeouts"],
-                "clipped": r["clipped"],
-                "window_hours": lookback_hours,
-                "last_call_at": r["last_call_at"].isoformat() if r["last_call_at"] else None,
-                "reason": (r["reason"] or "")[:500],
-            }
-            for r in rows
-        ]
+            rows = await conn.fetch(_DEAD_LLM_SQL, consecutive, staleness_hours)
+        out: list[dict] = []
+        for r in rows:
+            first, last = r["first_call_at"], r["last_call_at"]
+            out.append(
+                {
+                    "kind": "llm_dead",
+                    "subject": LLM_SUBJECT_PREFIX + r["purpose"],
+                    "purpose": r["purpose"],
+                    "model": r["model"],
+                    "calls": r["calls"],
+                    "errors": r["errors"],
+                    "timeouts": r["timeouts"],
+                    "clipped": r["clipped"],
+                    "consecutive": consecutive,
+                    "staleness_hours": staleness_hours,
+                    # How far apart those calls were. On the card because a
+                    # low-cadence purpose and a wedged busy one need different
+                    # reactions, and only this number tells them apart.
+                    "span_hours": (
+                        round((last - first).total_seconds() / 3600.0, 1)
+                        if first and last
+                        else 0.0
+                    ),
+                    "first_call_at": first.isoformat() if first else None,
+                    "last_call_at": last.isoformat() if last else None,
+                    "reason": (r["reason"] or "")[:500],
+                }
+            )
+        return out
 
     # -- alerting ----------------------------------------------------------
 
