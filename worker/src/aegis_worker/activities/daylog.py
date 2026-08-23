@@ -104,6 +104,26 @@ def _format_daylog_fallback(events: dict, date: str) -> str:
 _ROLLUP_ENTRY_CLIP = 1200
 _ROLLUP_PROMPT_CLIP = 40000
 
+# Token budget for both distil calls. The visible ask is small — 200-400 words
+# for a day, 300-600 for a period, so well under 1000 tokens of prose — but the
+# balanced tier is a REASONING model, and kimi bills hidden reasoning_content
+# against max_tokens BEFORE writing a word. The old 1800/2400 were both raised
+# to `_reasoning_floor`'s 4096 anyway, and 4096 is not enough: reasoning ate the
+# budget and the prose came back either empty (`error`) or cut mid-sentence
+# (`clipped`).
+#
+# `clipped` is the one that actually costs data. It deliberately does NOT raise,
+# so `distil_rollup`'s `or fallback` never fires — a half-written narrative is
+# truthy — and the 2026-08-16 weekly rollup was FILED truncated instead of
+# degrading to the deterministic concatenation.
+#
+# 16384 is `LLMClient._TRUNCATION_RETRY_TOKENS`, the budget the empty-truncation
+# re-roll already re-issues at: this codebase's existing answer to "enough for a
+# reasoning model to think and then write". Asking for it up front costs nothing
+# — billing is per token generated, not per ceiling — and saves the doubled call
+# every time the re-roll would have fired.
+_DISTIL_MAX_TOKENS = 16384
+
 
 def _stitch(chunks: list[str]) -> str:
     """Rejoin `knowledge_chunks` rows into the original body.
@@ -334,7 +354,7 @@ class DayLogActivities:
                 prompt=json.dumps(payload, default=str)[:6000],
                 model=self.model,
                 system_prompt=_SYSTEM_PROMPT,
-                max_tokens=1800,
+                max_tokens=_DISTIL_MAX_TOKENS,
                 db_pool=self.db_pool,
                 purpose="daylog_narrative",
                 agent_id=agent_id,
@@ -419,7 +439,7 @@ class DayLogActivities:
                 prompt=json.dumps(entries, default=str)[:_ROLLUP_PROMPT_CLIP],
                 model=self.model,
                 system_prompt=_ROLLUP_SYSTEM_PROMPT,
-                max_tokens=2400,
+                max_tokens=_DISTIL_MAX_TOKENS,
                 db_pool=self.db_pool,
                 purpose="daylog_rollup",
                 agent_id=agent_id,

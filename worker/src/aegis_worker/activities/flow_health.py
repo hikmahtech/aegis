@@ -67,6 +67,7 @@ from __future__ import annotations
 import html as _html
 import re
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any
 
 import structlog
@@ -275,8 +276,16 @@ ORDER BY purpose
 
 # Resolved-aware: an alert only suppresses a new one while no recovery row was
 # written after it.
+#
+# Returns WHEN each subject was last alerted, not just whether — `$2` is the
+# lookback (wide enough to see alerts older than the dedup window) and `$3` is
+# the dedup window itself, so `within_dedup` still answers the clock question
+# while `last_alert_at` lets the caller answer the evidence question for
+# `llm_dead`. Both bounds stay in SQL: one clock, no tz round-tripping.
 _SUPPRESSED_SQL = f"""
-SELECT DISTINCT a.target_id
+SELECT a.target_id,
+       max(a.created_at) AS last_alert_at,
+       max(a.created_at) > now() - make_interval(hours => $3) AS within_dedup
 FROM audit_log a
 WHERE a.action = '{ALERT_ACTION}'
   AND a.target_type = '{TARGET_TYPE}'
@@ -289,7 +298,58 @@ WHERE a.action = '{ALERT_ACTION}'
         AND r.target_id = a.target_id
         AND r.created_at > a.created_at
   )
+GROUP BY a.target_id
 """
+
+def _as_utc(value: Any) -> datetime | None:
+    """An ISO string from a finding as an aware datetime, or None.
+
+    None on anything unparseable OR tz-naive, deliberately. The only caller
+    compares this against a `timestamptz` out of Postgres, and comparing an
+    aware and a naive datetime raises `TypeError` — inside `report_flow_health`,
+    which runs NO_RETRY, so that exception would swallow the very alert the
+    watchdog exists to send. Unknown ⇒ fall back to the clock rule.
+    """
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo is not None else None
+
+
+def _is_suppressed(finding: dict, prior: dict[str, Any]) -> bool:
+    """Has the operator already been told this, with nothing new since?
+
+    Two rules, because the two detector families produce new evidence on
+    different clocks:
+
+    * Workflow findings (failing/stale) are re-evaluated every watchdog tick
+      against fresh `workflow_runs` rows, so "don't repeat within
+      `dedup_hours`" is the right bound.
+    * An `llm_dead` finding cannot change until the purpose is CALLED again —
+      the verdict is a streak over that purpose's own last N `llm_calls` rows
+      (#321/#327). Re-alerting on a clock therefore says nothing new: a weekly
+      purpose that broke on Saturday re-alerted every 12h for seven days, ~14
+      identical cards for one fault (daylog_rollup, 2026-08-16 → 08-23), and it
+      could not possibly recover before its next weekly run. So it stays silent
+      until a call lands AFTER the last alert, then alerts on that new evidence.
+
+    The dedup window still applies underneath, so a purpose called every minute
+    cannot alert every tick. Unknown `last_call_at` falls through to the clock
+    rule rather than going silent — this must fail LOUD.
+    """
+    subject = finding.get("subject")
+    row = prior.get(subject) if subject else None
+    if row is None:
+        return False
+    if finding.get("kind") == "llm_dead":
+        last_call = _as_utc(finding.get("last_call_at"))
+        if last_call is not None and row["last_alert_at"] >= last_call:
+            return True
+    return bool(row["within_dedup"])
+
 
 _OPEN_SQL = f"""
 SELECT DISTINCT a.target_id
@@ -536,9 +596,19 @@ class FlowHealthActivities:
                         [MUTE_PREFIX + s for s in subjects],
                     )
                 }
+                prior = {
+                    row["target_id"]: row
+                    for row in await conn.fetch(
+                        _SUPPRESSED_SQL,
+                        subjects,
+                        max(dedup_hours, recovery_hours),
+                        dedup_hours,
+                    )
+                }
                 suppressed = {
-                    row["target_id"]
-                    for row in await conn.fetch(_SUPPRESSED_SQL, subjects, dedup_hours)
+                    str(f.get("subject"))
+                    for f in findings
+                    if f.get("subject") and _is_suppressed(f, prior)
                 }
             open_subjects = {
                 row["target_id"] for row in await conn.fetch(_OPEN_SQL, recovery_hours)
