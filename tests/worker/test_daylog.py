@@ -698,6 +698,52 @@ async def test_both_distil_calls_ask_for_reasoning_room():
         )
 
 
+class _Fixed:
+    def __init__(self, content: str):
+        self.content = content
+
+    async def think(self, **kwargs):
+        return {"response": self.content}
+
+
+async def _rollup_text(content: str) -> str:
+    entries = [
+        {"date": "2019-03-11", "title": "Day Log", "text": "shipped the pgvector migration"},
+        {"date": "2019-03-12", "title": "Day Log", "text": "renewed the domain"},
+    ]
+    acts = DayLogActivities(db_pool=None, llm_client=_Fixed(content))
+    return await ActivityEnvironment().run(acts.distil_rollup, entries, "weekly", "2019-W11")
+
+
+@pytest.mark.asyncio
+async def test_a_volunteered_markdown_heading_is_stripped():
+    """The prompt forbids headings; kimi-k2.5 writes one anyway (#333).
+
+    Enforced in code rather than by asking the prompt more loudly, because a
+    deterministic strip does not depend on the model complying. Only the top of
+    the document, and only headings — a `#` inside the prose is the owner's own
+    text and must survive.
+    """
+    stripped = await _rollup_text(
+        "# Summary: August 3-9, 2026\n\nDuring the first week the owner shipped things."
+    )
+    assert stripped == "During the first week the owner shipped things."
+
+    # Prose that never had a heading is untouched, `#` in the body included.
+    body = "They closed issue #333 and moved on.\n\nA second paragraph."
+    assert await _rollup_text(body) == body
+
+    # Several leading heading lines, and an indented one, all go.
+    assert await _rollup_text("## Week\n   ### Sub\n\nReal prose here.") == "Real prose here."
+
+
+@pytest.mark.asyncio
+async def test_a_response_that_is_only_a_heading_degrades_to_the_concatenation():
+    """Stripping to nothing must fall back, not file an empty rollup."""
+    text = await _rollup_text("# Summary of the week\n\n")
+    assert "shipped the pgvector migration" in text, "empty strip did not degrade"
+
+
 @pytest.mark.asyncio
 async def test_distil_rollup_records_the_llm_call(clean_db):
     await clean_db.execute("DELETE FROM llm_calls WHERE purpose = 'daylog_rollup'")
