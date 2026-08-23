@@ -30,6 +30,7 @@ already-filed day logs back out and `distil_rollup` condenses them into one
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -151,6 +152,33 @@ def _format_rollup_fallback(entries: list[dict], period: str, label: str) -> str
         if (e.get("text") or "").strip()
     ]
     return header + ("\n\n" + "\n\n".join(blocks) if blocks else "")
+
+
+# A leading ATX heading — `#` to `######`, up to three spaces of indent, the
+# CommonMark shape. Not a markdown parser: the only thing being removed is the
+# title line the model volunteers at the top.
+_LEADING_HEADING = re.compile(r"^\s{0,3}#{1,6}\s")
+
+
+def _strip_leading_heading(text: str) -> str:
+    """Drop a leading markdown heading the rollup prompt asked for without.
+
+    `_ROLLUP_SYSTEM_PROMPT` says "plain prose (no markdown, no headings, no
+    bullets)" and kimi-k2.5 writes `# Summary: August 3-9, 2026` anyway — in 2
+    of the 3 weekly rollups on file (#333). Enforced here rather than by asking
+    the prompt more loudly, because a deterministic strip does not depend on a
+    model complying and does not regress when the tier map moves.
+
+    Only the TOP of the document, and only headings: a `#` in the middle of the
+    prose is the owner's own text (an issue reference, a channel name) and must
+    survive. Stripping to nothing is fine — `distil_rollup`'s `or fallback`
+    then files the deterministic concatenation, which is the right degrade for
+    a response that was ONLY a heading.
+    """
+    lines = text.splitlines()
+    while lines and (not lines[0].strip() or _LEADING_HEADING.match(lines[0])):
+        lines.pop(0)
+    return "\n".join(lines).strip()
 
 
 _ROLLUP_SYSTEM_PROMPT = (
@@ -450,7 +478,7 @@ class DayLogActivities:
             )
             return fallback
 
-        return (result.get("response") or "").strip() or fallback
+        return _strip_leading_heading(result.get("response") or "") or fallback
 
     # ------------------------------------------------------------------ state
 
