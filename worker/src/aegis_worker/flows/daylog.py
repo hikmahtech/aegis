@@ -48,6 +48,12 @@ class DayLogConfig:
     19:00 UTC cron a literal 24h lookback lands on the PREVIOUS date, i.e.
     the wrong day. `day_offset` says the same thing without the off-by-one:
     0 = the date the run starts on (the IST day that just closed).
+
+    In a rollup mode `day_offset` shifts the same anchor, so the window is the
+    period that date falls in: `day_offset=7` on a Sunday re-files the previous
+    week. That is the only way to reproduce a past period — the window comes
+    from the clock — and it is a rewrite, not a duplicate, because the url is
+    keyed on the period label.
     """
 
     agent_id: str = "raphael"
@@ -191,7 +197,14 @@ class DayLogFlow:
             workflow.logger.warning("daylog_unknown_mode mode=%s", config.mode)
             return {"status": "skipped", "reason": "unknown_mode", "mode": config.mode}
 
-        window = rollup_window(config.mode, workflow.now())
+        # `day_offset` shifts the anchor here exactly as it does for a daily
+        # run, which is what makes a past period re-runnable at all: the window
+        # is derived from the clock, so without it the only rollup you can ever
+        # produce is the one for right now. `day_offset=7` on a Sunday re-files
+        # last week's — the url is `aegis://daylog/<kind>/<label>`, so a re-run
+        # OVERWRITES that period in place rather than filing a second copy.
+        # Used 2026-08-23 to rewrite 2026-W33, which was filed truncated.
+        window = rollup_window(config.mode, workflow.now() - timedelta(days=config.day_offset))
         if window is None:
             workflow.logger.info("daylog_rollup_not_period_end mode=%s", config.mode)
             return {"status": "skipped", "reason": "not_period_end", "mode": config.mode}

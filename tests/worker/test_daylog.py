@@ -757,6 +757,45 @@ async def test_weekly_rollup_files_one_entry_covering_every_day_of_the_week(clea
 
 
 @pytest.mark.asyncio
+async def test_day_offset_rolls_up_a_past_week_in_place(clean_db):
+    """`day_offset` must shift the rollup anchor, not just the daily one.
+
+    The window is derived from the clock, so without this the only rollup that
+    can ever be produced is the current period's — a period filed wrong (as
+    2026-W33 was, truncated) could never be rewritten. The url is keyed on the
+    period label, so this rewrites that week rather than filing a second copy.
+    """
+    ks = _RecordingKS()
+    async with await WorkflowEnvironment.start_time_skipping() as env:
+        with env.auto_time_skipping_disabled():
+            now = await env.get_current_time()
+            this_week = _iso_week_dates(now)
+            last_week = _iso_week_dates(now - timedelta(days=7))
+            for d in [*last_week, *this_week]:
+                await _add_daylog_entry(clean_db, d, [f"Entry for {d}."])
+            result = await _run_flow(
+                env.client,
+                ks,
+                DayLogActivities(db_pool=clean_db, llm_client=None),
+                "daylog-w-offset",
+                config=DayLogConfig(agent_id="raphael", mode="weekly", day_offset=7),
+            )
+
+    assert result["status"] == "ingested"
+    expected = (now - timedelta(days=7)).isocalendar()
+    label = f"{expected[0]}-W{expected[1]:02d}"
+    assert result["label"] == label, f"rolled up {result['label']}, wanted {label}"
+    assert len(ks.calls) == 1
+    filed = ks.calls[0]
+    assert filed["url"] == f"aegis://daylog/week/{label}"
+    assert filed["metadata"]["covers"] == last_week, (
+        "the offset run covered the wrong days — it must read LAST week's entries"
+    )
+    for d in this_week:
+        assert d not in filed["raw_text"], f"this week's {d} leaked into last week's rollup"
+
+
+@pytest.mark.asyncio
 async def test_rollup_with_fewer_than_two_entries_writes_nothing(clean_db):
     ks = _RecordingKS()
     async with await WorkflowEnvironment.start_time_skipping() as env:
