@@ -659,6 +659,46 @@ async def test_distil_rollup_llm_failure_degrades_to_the_concatenation():
 
 
 @pytest.mark.asyncio
+async def test_both_distil_calls_ask_for_reasoning_room():
+    """Both daylog LLM calls must clear the empty-truncation re-roll budget.
+
+    The balanced tier is a reasoning model that bills hidden reasoning_content
+    against max_tokens before writing anything, so a budget sized for the prose
+    alone (the old 1800/2400, floored to 4096) returns empty or half-written
+    text. `clipped` does not raise, so `distil_rollup` files the truncated
+    narrative rather than degrading — which is what happened to the 2026-08-16
+    weekly rollup. Asking below `_TRUNCATION_RETRY_TOKENS` up front means, at
+    best, paying for the same call twice.
+    """
+    from aegis.llm import _TRUNCATION_RETRY_TOKENS
+
+    seen: list[int] = []
+
+    class _Capture:
+        async def think(self, **kwargs):
+            seen.append(kwargs["max_tokens"])
+            return {"response": "prose"}
+
+    acts = DayLogActivities(db_pool=None, llm_client=_Capture(), model="test-model")
+    env = ActivityEnvironment()
+    await env.run(acts.distil_daylog, {"date": DAY}, DAY)
+    await env.run(
+        acts.distil_rollup,
+        [{"date": DAY, "text": "a"}, {"date": DAY, "text": "b"}],
+        "weekly",
+        "2019-W11",
+    )
+
+    assert len(seen) == 2, f"expected both distil calls to reach the LLM, got {seen}"
+    for budget in seen:
+        assert budget >= _TRUNCATION_RETRY_TOKENS, (
+            f"daylog distil asks for {budget} tokens, below the "
+            f"{_TRUNCATION_RETRY_TOKENS} the truncation re-roll uses — a "
+            "reasoning model will clip the prose or return nothing"
+        )
+
+
+@pytest.mark.asyncio
 async def test_distil_rollup_records_the_llm_call(clean_db):
     await clean_db.execute("DELETE FROM llm_calls WHERE purpose = 'daylog_rollup'")
     llm = StubbedLLMClient(

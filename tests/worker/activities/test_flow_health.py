@@ -765,6 +765,65 @@ async def test_dedup_expires_after_the_window(db_pool):
     assert len(delivery.sent) == 2
 
 
+def _llm_finding(last_call_at: str, subject: str = LLM_SUBJECT_PREFIX + PURPOSE_A) -> dict:
+    return {
+        "kind": "llm_dead",
+        "subject": subject,
+        "purpose": PURPOSE_A,
+        "model": "kimi-k2.5",
+        "calls": 2,
+        "errors": 1,
+        "timeouts": 0,
+        "clipped": 1,
+        "consecutive": 2,
+        "staleness_hours": 720,
+        "span_hours": 168.0,
+        "first_call_at": "2026-08-09T20:21:00+00:00",
+        "last_call_at": last_call_at,
+        "reason": "clipped: model=kimi-k2.5 hit finish_reason=length",
+    }
+
+
+@pytest.mark.asyncio
+async def test_a_dead_llm_purpose_stays_quiet_until_it_is_called_again(db_pool):
+    """A weekly purpose must not re-alert on the clock.
+
+    `llm_dead` is a streak over the purpose's own last N `llm_calls` rows, so
+    the verdict cannot change until the purpose is CALLED again. The 12h clock
+    dedup made daylog_rollup send ~14 identical cards between 2026-08-16 and
+    08-23 while it waited for its next weekly run. Past the dedup window with
+    no new call it must still be silent; a call landing after the last alert is
+    what makes it speak.
+    """
+    await _prep(db_pool)
+    env = ActivityEnvironment()
+    delivery = FakeDelivery()
+    act = _acts(db_pool, delivery)
+    stale_call = "2026-01-01T00:00:00+00:00"
+
+    first = await env.run(act.report_flow_health, [_llm_finding(stale_call)], "a", 12, 168)
+    assert first["alerted"] == 1
+
+    # Age the alert well past the 12h dedup window. A `failing` finding would
+    # re-alert here (test_dedup_expires_after_the_window); this one must not,
+    # because no call has landed since.
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE audit_log SET created_at = now() - interval '72 hours' "
+            "WHERE actor = 'flow-health-watchdog'"
+        )
+    quiet = await env.run(act.report_flow_health, [_llm_finding(stale_call)], "a", 12, 168)
+    assert quiet["alerted"] == 0, "re-alerted a dead LLM purpose with no new evidence"
+    assert quiet["deduped"] == 1
+    assert len(delivery.sent) == 1, f"sent {len(delivery.sent)} cards, expected 1"
+
+    # A new failed call AFTER that alert is new evidence — speak up.
+    fresh = dt.datetime.now(dt.UTC).isoformat()
+    again = await env.run(act.report_flow_health, [_llm_finding(fresh)], "a", 12, 168)
+    assert again["alerted"] == 1, "stayed silent after a new call failed"
+    assert len(delivery.sent) == 2
+
+
 @pytest.mark.asyncio
 async def test_recovery_is_announced_and_re_arms_the_alert(db_pool):
     """Recovery is observable two ways at once: the operator gets a [FLOW OK]
