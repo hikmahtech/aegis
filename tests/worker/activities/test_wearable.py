@@ -143,14 +143,18 @@ async def test_poll_sends_bearer_token_and_the_cursor_window(acts):
     respx.get(f"{_BASE}/daily_readiness").mock(return_value=_oura_page([]))
     respx.get(f"{_BASE}/daily_activity").mock(return_value=_oura_page([]))
     env = ActivityEnvironment()
+    # Relative to today: _window floors start at today - _MAX_LOOKBACK_DAYS, so a
+    # fixed cursor date silently crosses the floor as time passes (this test
+    # broke on 2026-08-25, 30 days after its hardcoded 2026-07-25 cursor).
+    cursor = (datetime.now(UTC).date() - timedelta(days=5)).isoformat()
     await env.run(
         acts.poll_wearable,
-        PollWearableInput(vendor="oura", since_cursor="2026-07-25"),
+        PollWearableInput(vendor="oura", since_cursor=cursor),
     )
     req = route.calls.last.request
     assert req.headers["authorization"] == f"Bearer {TOKEN}"
     # Cursor is INCLUSIVE — the cursor day is re-requested so a partial day heals.
-    assert req.url.params["start_date"] == "2026-07-25"
+    assert req.url.params["start_date"] == cursor
 
 
 @pytest.mark.asyncio

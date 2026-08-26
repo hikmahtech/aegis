@@ -33,6 +33,12 @@ on:
       - "pyproject.toml"
       - ".github/workflows/comms.yml"
 
+# Cancel superseded runs on the same PR branch; never cancel main pushes —
+# main is the deploy source, every merge's final state needs a verdict.
+concurrency:
+  group: comms-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   test:
     name: Lint & Test

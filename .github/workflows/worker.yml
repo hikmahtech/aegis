@@ -40,6 +40,14 @@ on:
       - "pyproject.toml"
       - ".github/workflows/worker.yml"
 
+# Cancel superseded runs on the same PR branch — a rapid follow-up push
+# obsoletes the in-flight run, and GitHub otherwise executes both to the end.
+# Never cancel main pushes: main is what the infra repo builds images from,
+# so every merge's final state needs its own verdict.
+concurrency:
+  group: worker-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   # aegis#164: flows is 88% of the worker test step (each flow test spins its
   # own Temporal test server). Splitting it into its own parallel job pulls
