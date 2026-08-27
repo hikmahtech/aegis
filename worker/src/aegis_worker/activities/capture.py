@@ -22,6 +22,8 @@ from typing import Any
 import asyncpg
 from temporalio import activity
 
+from aegis_worker.shared.todoist_write import submit_or_queue
+
 
 @dataclass
 class CaptureActivities:
@@ -241,31 +243,12 @@ class CaptureActivities:
                 labels.append(UNBLOCK_ADD)
             cmds.append(TodoistConnector.build_item_update_command(task_id, labels=labels))
 
-        result = await self.connector.commands(cmds)
-        status = TodoistConnector.check_sync_status(result, [c["uuid"] for c in cmds])
-        if not status["ok"]:
-            if status["retryable"] or status["rejected_retryable"]:
-                async with self.db_pool.acquire() as conn:
-                    for cmd in cmds:
-                        await conn.execute(
-                            "INSERT INTO todoist_outbox (temp_id, command, status) "
-                            "VALUES ($1, $2, 'pending') ON CONFLICT (temp_id) DO NOTHING",
-                            cmd.get("temp_id") or cmd["uuid"],
-                            cmd,
-                        )
-                activity.logger.warning(
-                    "email_task_link_outbox_staged rule=%s task=%s err=%s",
-                    hit["key"],
-                    task_id,
-                    status["envelope_error"] or str(status["rejected"])[:200],
-                )
+        res = await submit_or_queue(
+            self.db_pool, self.connector, cmds, f"email_task_link:{hit['key']}"
+        )
+        if not res["ok"]:
+            if res["queued"]:
                 return {"applied": True, "queued": True, **hit, "task_id": task_id}
-            activity.logger.warning(
-                "email_task_link_rejected rule=%s task=%s rejected=%s",
-                hit["key"],
-                task_id,
-                str(status["rejected"])[:200],
-            )
             return {"applied": False, "reason": "rejected", **hit, "task_id": task_id}
 
         activity.logger.info(

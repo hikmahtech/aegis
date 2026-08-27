@@ -243,9 +243,9 @@ def test_module_workflows_is_the_unflagged_registry():
         # NO new flow from #321's `find_dead_llm_purposes` — a third detector on
         # the existing FlowHealthActivities, driven by the existing
         # FlowHealthWatchdogFlow, so it moves in every row.
-        (True, True, 39, 194),
-        (False, False, 31, 165),
-        (True, False, 35, 183),
+        (True, True, 40, 196),
+        (False, False, 32, 167),
+        (True, False, 36, 185),
     ],
 )
 def test_real_registration_passes_the_boot_check(homelab, money, flows, activities):

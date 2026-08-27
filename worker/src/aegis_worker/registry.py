@@ -42,6 +42,7 @@ from typing import Any
 import structlog
 from temporalio import activity, workflow
 
+from aegis_worker.activities.jira import DEFAULT_KEY_PATTERN
 from aegis_worker.flows.agent_chat_reply import AgentChatReplyFlow
 from aegis_worker.flows.agent_run import AgentRunFlow
 from aegis_worker.flows.agent_task import (
@@ -66,6 +67,7 @@ from aegis_worker.flows.gmail_ingest import GmailIngestFlow, GmailIngestInput
 from aegis_worker.flows.infra_heartbeat import InfraHeartbeatConfig, InfraHeartbeatFlow
 from aegis_worker.flows.intelligence_scan import IntelligenceScanFlow, IntelligenceScanInput
 from aegis_worker.flows.interaction import InteractionFlow
+from aegis_worker.flows.jira_sync import JiraSyncConfig, JiraSyncFlow
 from aegis_worker.flows.llm_spend_guard import LLMSpendGuardConfig, LLMSpendGuardFlow
 from aegis_worker.flows.memory_reflection import MemoryReflectionFlow, MemoryReflectionInput
 from aegis_worker.flows.money_hygiene import MoneyHygieneConfig, MoneyHygieneDailyFlow
@@ -279,6 +281,15 @@ FLOWS: tuple[FlowSpec, ...] = (
             topics=list(act["config"].get("topics") or []),
             max_results=int(act["config"].get("max_results", 20)),
             significance_threshold=int(act["config"].get("significance_threshold", 4)),
+        ),
+    ),
+    FlowSpec(
+        JiraSyncFlow,
+        lambda act: JiraSyncConfig(
+            agent_id=act["agent_id"],
+            key_pattern=str(act["config"].get("key_pattern", DEFAULT_KEY_PATTERN)),
+            max_tasks=int(act["config"].get("max_tasks", 100)),
+            dry_run=bool(act["config"].get("dry_run", False)),
         ),
     ),
     FlowSpec(

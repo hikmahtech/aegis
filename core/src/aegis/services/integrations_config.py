@@ -61,6 +61,24 @@ CONFIG_REGISTRY: list[ConfigKey] = [
     ConfigKey("elevenlabs_api_key", "API key", "Voice (ElevenLabs)", True),
     ConfigKey("raindrop_api_token", "API token", "Raindrop", True),
     ConfigKey(
+        "jira_base_url", "Site URL (https://yours.atlassian.net)", "Jira", False,
+        help="JiraSyncFlow closes a Todoist task once its issue has a resolution. "
+        "It exists because Jira sends NO notification for a transition you make "
+        "yourself — email triage can only ever close tickets somebody else "
+        "resolved. Worker restart required.",
+    ),
+    ConfigKey(
+        "jira_email", "Atlassian account email", "Jira", False,
+        help="The email half of Basic auth — your Atlassian account, not a "
+        "team alias.",
+    ),
+    ConfigKey(
+        "jira_api_token", "API token", "Jira", True,
+        help="Create at id.atlassian.com/manage-profile/security/api-tokens. "
+        "A password will not work. Any of the three fields blank = the flow "
+        "reports not_configured and makes no request.",
+    ),
+    ConfigKey(
         "oura_api_token", "Oura personal access token", "Wearables", True,
         help="Polled by WearableIngestFlow into life.observations. Also needs a "
         "channel row (kind=wearable, identifier=oura) switched on under Channels. "

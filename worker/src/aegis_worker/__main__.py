@@ -42,6 +42,7 @@ from aegis_worker.activities.intel_scan import IntelScanActivities
 from aegis_worker.activities.intelligence import IntelligenceActivities
 from aegis_worker.activities.interactions import InteractionActivities
 from aegis_worker.activities.inventory import InventoryActivities
+from aegis_worker.activities.jira import JiraActivities
 from aegis_worker.activities.llm_governor import LLMGovernorActivities
 from aegis_worker.activities.memory import MemoryActivities
 from aegis_worker.activities.money import MoneyActivities, parse_bank_alert_senders
@@ -423,6 +424,13 @@ async def main():
         db_pool=deps.pool,
         connector=todoist_connector,
     )
+    jira_act = JiraActivities(
+        db_pool=deps.pool,
+        connector=todoist_connector,
+        base_url=getattr(settings, "jira_base_url", ""),
+        email=getattr(settings, "jira_email", ""),
+        api_token=getattr(settings, "jira_api_token", ""),
+    )
     social_act = SocialActivities(
         db_pool=deps.pool,
         connector=connectors.get("social"),
@@ -538,6 +546,7 @@ async def main():
         sentry_ingest_act,
         todoist_act,
         capture_act,
+        jira_act,
         social_act,
         clarify_act,
         chat_act,
