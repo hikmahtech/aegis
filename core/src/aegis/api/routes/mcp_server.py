@@ -12,8 +12,15 @@ by default and narrow when open:
 
 * **Off by default.** ``settings.mcp_server_enabled`` (``AEGIS_MCP_SERVER_ENABLED``)
   gates every method, matching the client's default-deny posture. Off ⇒ 403.
-* **Repo-standard auth.** The router carries the same ``verify_auth`` dependency
-  as every other authenticated route — API key or Basic, no new scheme.
+* **Repo-standard auth, plus a scoped run credential.** Admin access is the same
+  ``verify_auth`` as every other route — API key or Basic. A *run* instead
+  presents a short-TTL **mount token** (``services/mcp_tokens.py``) signed for
+  one agent and one gated mode, which ``_enforce_mount_token_binding`` checks
+  against the URL. That is the fix for issue #288: a run reads untrusted content
+  and, ungated, has a shell, so it can read its own mount file — the credential
+  it finds there must therefore open nothing but its own endpoint. A mount token
+  is deliberately NOT accepted by ``verify_auth``, so it can never reach the
+  admin API.
 * **Per-agent tool gating.** The URL names an agent and the served *chat* tools
   are exactly that agent's ``metadata.tool_set`` (via ``_get_agent_tools``), so a
   mounted server can never reach past what that agent may already do in chat.
@@ -62,9 +69,10 @@ from uuid import uuid4
 import structlog
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from fastapi.responses import JSONResponse
+from fastapi.security import HTTPBasicCredentials
 from jsonschema.exceptions import ValidationError as JSONSchemaValidationError
 
-from aegis.api.auth import verify_auth
+from aegis.api.auth import security, verify_auth
 from aegis.api.deps import get_settings
 from aegis.config import Settings
 from aegis.mcp_manager import _PROTOCOL_VERSION as MCP_PROTOCOL_VERSION
@@ -79,6 +87,7 @@ from aegis.services.chat import (
     _truncate_text,
     _validate_tool_args,
 )
+from aegis.services.mcp_tokens import read_mount_token
 from aegis.services.tools.base import ToolContext
 
 logger = structlog.get_logger()
@@ -791,9 +800,28 @@ def _require_enabled(settings: Settings = Depends(get_settings)) -> None:
         )
 
 
+async def _verify_mcp_auth(
+    request: Request,
+    credentials: HTTPBasicCredentials | None = Depends(security),
+    settings: Settings = Depends(get_settings),
+) -> bool:
+    """Accept a run's scoped mount token, else fall back to admin credentials.
+
+    A mount token is only RECOGNISED here — `_serve` binds it to the agent and
+    mode in the URL. Splitting it keeps this dependency ignorant of the route
+    shape while the binding is still enforced exactly once, where the path is
+    known. Mount tokens deliberately do not go through `verify_auth`: that
+    guards the whole admin API, and a run's credential must never open it.
+    """
+    presented = request.headers.get("X-API-Key") or ""
+    if presented and read_mount_token(presented, settings.secret_key or "") is not None:
+        return True
+    return await verify_auth(request, credentials, settings)
+
+
 router = APIRouter(
     prefix="/api/mcp-server",
-    dependencies=[Depends(verify_auth), Depends(_require_enabled)],
+    dependencies=[Depends(_verify_mcp_auth), Depends(_require_enabled)],
 )
 
 
@@ -1003,9 +1031,49 @@ async def _handle_tools_call(
     return _tool_result(request_id, text, is_error=False)
 
 
+def _enforce_mount_token_binding(
+    agent_id: str, request: Request, settings: Settings, *, gated: bool
+) -> None:
+    """A presented mount token must match THIS agent and THIS mode (issue #288).
+
+    This is the whole point of the scoped token. A run reads untrusted content
+    and, ungated, has a shell — so it can read its own mount file. Binding means
+    that credential still only opens the endpoint it was minted for: swapping
+    the `{agent_id}` path segment, or presenting a gated run's token at the
+    ungated URL, fails here rather than succeeding on a shared key.
+
+    A request with no mount token is untouched — it authenticated as an admin
+    (or under `auth_disabled`) and keeps whatever reach that already granted.
+    """
+    presented = request.headers.get("X-API-Key") or ""
+    if not presented:
+        return
+    read = read_mount_token(presented, settings.secret_key or "")
+    if read is None:
+        return  # not a mount token at all — an admin key, handled upstream
+    token_agent, token_gated = read
+    if token_agent == agent_id.strip() and token_gated == gated:
+        return
+    logger.warning(
+        "mcp_mount_token_scope_violation",
+        token_agent=token_agent,
+        requested_agent=agent_id[:64],
+        token_gated=token_gated,
+        requested_gated=gated,
+    )
+    raise HTTPException(
+        status_code=403,
+        detail=(
+            "This mount token does not authorise this endpoint. It was issued for "
+            f"agent {token_agent!r} in {'gated' if token_gated else 'ungated'} mode."
+        ),
+    )
+
+
 async def _serve(agent_id: str, request: Request, settings: Settings, *, gated: bool) -> Response:
     """One JSON-RPC message. `gated` decides whether a mutating tool needs an
     operator approval first; nothing else differs between the two endpoints."""
+    _enforce_mount_token_binding(agent_id, request, settings, gated=gated)
     agent = await _load_agent(request, agent_id)
     tools = _served_tools(agent_id, dict(agent.get("metadata") or {}))
 

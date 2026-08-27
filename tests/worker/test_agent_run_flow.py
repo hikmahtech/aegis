@@ -61,7 +61,9 @@ async def test_happy_path_delivers_output_tail():
     transcript = "Read 14 files.\n\nSUMMARY: the retry policy is unbounded."
 
     @activity.defn(name="launch_agent_run")
-    async def launch(prompt, repo="", engine="", purpose="", agent_id="", gated=False):
+    async def launch(
+        prompt, repo="", engine="", purpose="", agent_id="", gated=False, timeout_minutes=0
+    ):
         launch_calls.append(
             {
                 "prompt": prompt,
@@ -156,7 +158,9 @@ async def test_launch_failure_is_attempted_once_and_delivered():
     checked = {"hit": False}
 
     @activity.defn(name="launch_agent_run")
-    async def launch(prompt, repo="", engine="", purpose="", agent_id="", gated=False):
+    async def launch(
+        prompt, repo="", engine="", purpose="", agent_id="", gated=False, timeout_minutes=0
+    ):
         attempts["count"] += 1
         raise RuntimeError("ssh: connect to host node-a port 22: Connection refused")
 
@@ -205,7 +209,9 @@ async def test_missing_scratch_checkout_delivers_provision_command():
     cleanup_calls: list[dict] = []
 
     @activity.defn(name="launch_agent_run")
-    async def launch(prompt, repo="", engine="", purpose="", agent_id="", gated=False):
+    async def launch(
+        prompt, repo="", engine="", purpose="", agent_id="", gated=False, timeout_minutes=0
+    ):
         return {
             "status": "failed",
             "error": "Repo checkout missing on node-a: /w/aegis-scratch — provision it",
@@ -261,7 +267,9 @@ async def test_timeout_fires_at_the_deadline_and_reports_where_the_run_is():
     cleanup_calls: list[dict] = []
 
     @activity.defn(name="launch_agent_run")
-    async def launch(prompt, repo="", engine="", purpose="", agent_id="", gated=False):
+    async def launch(
+        prompt, repo="", engine="", purpose="", agent_id="", gated=False, timeout_minutes=0
+    ):
         return _launched(engine="kimi", tmux_window="kimi-scratch-ab12cd34")
 
     @activity.defn(name="check_agent_run")
@@ -340,7 +348,9 @@ async def test_the_deadline_holds_when_the_polls_themselves_are_slow():
     cleanup_calls: list[dict] = []
 
     @activity.defn(name="launch_agent_run")
-    async def launch(prompt, repo="", engine="", purpose="", agent_id="", gated=False):
+    async def launch(
+        prompt, repo="", engine="", purpose="", agent_id="", gated=False, timeout_minutes=0
+    ):
         return _launched()
 
     @activity.defn(name="check_agent_run")
@@ -396,7 +406,9 @@ async def test_elapsed_s_is_wall_clock_including_the_time_spent_in_the_last_poll
     cleanup_calls: list[dict] = []
 
     @activity.defn(name="launch_agent_run")
-    async def launch(prompt, repo="", engine="", purpose="", agent_id="", gated=False):
+    async def launch(
+        prompt, repo="", engine="", purpose="", agent_id="", gated=False, timeout_minutes=0
+    ):
         return _launched()
 
     @activity.defn(name="check_agent_run")
@@ -564,6 +576,7 @@ class _LaunchRecorder:
         claude_account: str = "",
         agent_id: str = "",
         gated: bool = False,
+        token_ttl_seconds: int = 0,
     ) -> dict:
         self.calls.append(
             {
@@ -571,6 +584,7 @@ class _LaunchRecorder:
                 "engine_override": engine_override,
                 "agent_id": agent_id,
                 "gated": gated,
+                "token_ttl_seconds": token_ttl_seconds,
             }
         )
         return {"status": "running", "run_id": "r1", "output_file": "/tmp/o", "engine": "claude"}
@@ -592,6 +606,8 @@ async def test_launch_forwards_agent_id_to_the_connector():
             "engine_override": "",
             "agent_id": "pandoras-actor",
             "gated": False,
+            # No timeout supplied ⇒ 0 ⇒ the connector's default mount-token TTL.
+            "token_ttl_seconds": 0,
         }
     ]
 
@@ -681,7 +697,9 @@ async def test_gated_input_reaches_the_launch_activity():
     cleanup_calls: list[dict] = []
 
     @activity.defn(name="launch_agent_run")
-    async def launch(prompt, repo="", engine="", purpose="", agent_id="", gated=False):
+    async def launch(
+        prompt, repo="", engine="", purpose="", agent_id="", gated=False, timeout_minutes=0
+    ):
         launch_calls.append({"gated": gated, "engine": engine})
         return _launched()
 

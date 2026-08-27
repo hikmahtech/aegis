@@ -69,6 +69,7 @@ class AgentRunActivities:
         purpose: str = "",
         agent_id: str = "",
         gated: bool = False,
+        timeout_minutes: int = 0,
     ) -> dict:
         """Start one CLI run on the coding host. NOT idempotent — see the flow.
 
@@ -117,6 +118,10 @@ class AgentRunActivities:
             engine_override=(engine or "").strip(),
             agent_id=(agent_id or "").strip(),
             gated=bool(gated),
+            # The MCP mount token dies with the run's own deadline, plus an
+            # hour so a run that overruns still has its tools (the flow does
+            # not kill an overrunning run — it reports and leaves it attached).
+            token_ttl_seconds=(int(timeout_minutes) * 60 + 3600) if timeout_minutes else 0,
         )
         if started.get("status") != "running":
             return {

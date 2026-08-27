@@ -31,6 +31,8 @@ from aegis.connectors._ssh import build_ssh_args
 from aegis.connectors._subprocess import kill_and_wait
 from aegis.connectors.coding_sessions import parse_agents_json, to_records
 from aegis.crypto import decrypt_secret
+from aegis.services.mcp_tokens import DEFAULT_TTL_SECONDS as DEFAULT_MOUNT_TTL_SECONDS
+from aegis.services.mcp_tokens import mint_mount_token
 
 logger = structlog.get_logger()
 
@@ -860,8 +862,13 @@ class RemoteScriptConnector:
         claude_account: str = "",
         agent_id: str = "",
         gated: bool = False,
+        token_ttl_seconds: int = 0,
     ) -> dict:
         """Start a coding-CLI run (kimi or claude) on the effective host.
+
+        `token_ttl_seconds` bounds the life of the MCP mount token (issue #288);
+        0 uses the generous default. Pass the run's own deadline when the caller
+        knows it, so the credential cannot outlive the run by much.
 
         `repo` is the workspace-relative path of a FIXED checkout under
         `repo_base` (may contain subdirectories, e.g. "acme/bcp").
@@ -1031,7 +1038,9 @@ class RemoteScriptConnector:
         # Phase 3b: mount AEGIS's own tools over MCP (claude only). Best-effort
         # by design — a run without its tools is degraded, a run that never
         # launched is dead.
-        mcp_config = await self._mount_mcp_config(host, engine, agent_id, gated)
+        mcp_config = await self._mount_mcp_config(
+            host, engine, agent_id, gated, ttl_seconds=token_ttl_seconds
+        )
         if gated and not mcp_config:
             # Best-effort stops being acceptable here: the permission prompt
             # lives ON that server. An unmounted gated run would ask a server
@@ -1179,7 +1188,12 @@ class RemoteScriptConnector:
         return await resolve_api_key(self._db_pool, SimpleNamespace(secret_key=self._secret_key))
 
     async def _mount_mcp_config(
-        self, host: str, engine: str, agent_id: str, gated: bool = False
+        self,
+        host: str,
+        engine: str,
+        agent_id: str,
+        gated: bool = False,
+        ttl_seconds: int = 0,
     ) -> str:
         """Write the run's MCP client config on `host`; return its path.
 
@@ -1192,24 +1206,46 @@ class RemoteScriptConnector:
         `gated` writes a SEPARATE file pointed at the enforcing endpoint, so a
         gated launch never disturbs the ungated config (and vice versa).
 
-        The key comes from `_resolve_mount_api_key` (env, then the
-        admin-generated DB key), so a deployment whose only credential was
-        minted in the UI still mounts.
+        The credential is a per-agent, short-TTL MOUNT TOKEN (issue #288), not
+        the shared API key. It is signed for this agent and this gated mode, so
+        a run that reads its own config file still cannot swap the `{agent_id}`
+        path segment to reach another agent's tools, nor present an ungated
+        token at the gated endpoint. It also expires, so a token printed into a
+        transcript and delivered to chat ages out instead of being a permanent
+        credential. `AEGIS_SECRET_KEY` signs it; Core verifies with the same
+        secret, so there is no lookup and nothing to revoke on a dead run.
 
-        The API key is piped through the SSH channel's STDIN and never appears
-        in a command line: argv is world-readable via `ps` on the coding host
-        and lands in shell audit logs, and this key is full API access to
-        AEGIS. `umask 077` makes the directory and file owner-only, and the
-        path is deliberately OUTSIDE the run's worktree so the agent cannot
-        commit its own credential. The content is never logged.
+        Falls back to the shared API key ONLY when no secret is configured —
+        otherwise a deployment without `AEGIS_SECRET_KEY` would lose its tools
+        entirely. That fallback is logged, because it is the weaker posture.
+
+        The credential is piped through the SSH channel's STDIN and never
+        appears in a command line: argv is world-readable via `ps` on the
+        coding host and lands in shell audit logs. `umask 077` makes the
+        directory and file owner-only, and the path is deliberately OUTSIDE the
+        run's worktree so the agent cannot commit its own credential. The
+        content is never logged.
         """
         if engine != "claude" or not agent_id or not self._mcp_server_url:
             return ""
-        api_key = await self._resolve_mount_api_key()
-        if not api_key:
+        credential = mint_mount_token(
+            agent_id,
+            self._secret_key or "",
+            gated=gated,
+            ttl_seconds=ttl_seconds or DEFAULT_MOUNT_TTL_SECONDS,
+        )
+        if not credential:
+            credential = await self._resolve_mount_api_key()
+            if credential:
+                logger.warning(
+                    "mcp_mount_token_unavailable_using_shared_key",
+                    agent_id=agent_id,
+                    reason="secret_key_unset",
+                )
+        if not credential:
             # Visible degradation: the URL was configured, so somebody meant to
             # mount this and a silent skip would look like a broken feature.
-            logger.warning("mcp_mount_skipped", agent_id=agent_id, reason="api_key_unset")
+            logger.warning("mcp_mount_skipped", agent_id=agent_id, reason="no_credential")
             return ""
         path = _mcp_config_path(agent_id, gated)
         # Written to a temp file and `mv`d into place. `mv` within one
@@ -1222,7 +1258,7 @@ class RemoteScriptConnector:
             f"umask 077 && mkdir -p $HOME/.aegis && cat > {path}.$$.tmp "
             f"&& mv {path}.$$.tmp {path}",
             timeout=15,
-            stdin=_mcp_run_config(agent_id, self._mcp_server_url, api_key, gated).encode(),
+            stdin=_mcp_run_config(agent_id, self._mcp_server_url, credential, gated).encode(),
         )
         if wrote["exit_code"] != 0:
             logger.warning(
