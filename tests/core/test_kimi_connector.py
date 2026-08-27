@@ -1380,7 +1380,9 @@ async def test_mcp_mount_skipped_visibly_when_api_key_unset():
         )
     skipped = [log for log in logs if log["event"] == "mcp_mount_skipped"]
     assert len(skipped) == 1
-    assert skipped[0]["reason"] == "api_key_unset"
+    # No secret_key to mint a mount token with (#288) AND no shared key to fall
+    # back to, so there is no credential of either kind.
+    assert skipped[0]["reason"] == "no_credential"
     launch = " ".join(str(a) for a in mock_exec.call_args_list[-1].args)
     assert "--mcp-config" not in launch
 
@@ -1632,18 +1634,22 @@ class _KeyRowPool:
 
 
 @pytest.mark.asyncio
-async def test_mount_uses_the_admin_generated_db_key_when_env_is_unset():
-    """`verify_auth` accepts the DB key as a first-class credential, and the
-    admin UI's Generate button is the only key most deployments ever mint. An
-    env-only mount therefore logs `mcp_mount_skipped reason=api_key_unset` on a
-    correctly configured instance and every claude run is silently toolless.
-    The key must still never reach argv.
+async def test_mount_writes_a_scoped_token_and_never_the_shared_key(monkeypatch):
+    """The mount credential is a per-agent, short-TTL token, NOT the shared key.
+
+    This is the fix for #288: a run can read its own config file, so what that
+    file contains has to be a credential that only opens that run's own
+    endpoint. A deployment with a secret must therefore never write the shared
+    API key there — that key is full API access and never expires.
+
+    The DB key is not even consulted: minting needs no lookup, so a connector
+    with a secret makes zero `settings` queries on the mount path.
     """
-    from aegis.crypto import encrypt_secret
     from aegis.services.api_key import invalidate_api_key_cache
+    from aegis.services.mcp_tokens import verify_mount_token
 
     secret_key = "unit-test-secret-key"
-    pool = _KeyRowPool({"value": {"key_enc": encrypt_secret("DB-MINTED-KEY", secret_key)}})
+    pool = _KeyRowPool({"value": {"key_enc": "should-never-be-read"}})
     conn = RemoteScriptConnector(
         host="node-a",
         user="user",
@@ -1652,7 +1658,7 @@ async def test_mount_uses_the_admin_generated_db_key_when_env_is_unset():
         claude_orgs="acme",
         claude_binary="/bin/claude",
         mcp_server_url="http://10.0.0.5:8080",
-        api_key="",  # nothing in the env
+        api_key="SHARED-ADMIN-KEY",  # present, and must still not be used
         db_pool=pool,
         secret_key=secret_key,
     )
@@ -1674,12 +1680,17 @@ async def test_mount_uses_the_admin_generated_db_key_when_env_is_unset():
     assert not [log for log in logs if log["event"] == "mcp_mount_skipped"]
 
     all_cmds = [" ".join(str(a) for a in c.args) for c in mock_exec.call_args_list]
-    assert all("DB-MINTED-KEY" not in c for c in all_cmds), "API key leaked into argv"
-    assert "DB-MINTED-KEY" not in json.dumps(logs)
+    assert all("SHARED-ADMIN-KEY" not in c for c in all_cmds), "shared key leaked into argv"
+    assert "SHARED-ADMIN-KEY" not in json.dumps(logs)
 
     payload = procs[4].communicate.await_args.kwargs["input"]
     cfg = json.loads(payload.decode())
-    assert cfg["mcpServers"]["aegis"]["headers"]["X-API-Key"] == "DB-MINTED-KEY"
+    written = cfg["mcpServers"]["aegis"]["headers"]["X-API-Key"]
+    assert written != "SHARED-ADMIN-KEY", "the shared key must never be the mount credential"
+    assert verify_mount_token(written, "sebas", secret_key) is True
+    # Bound: the same token must not authorise another agent.
+    assert verify_mount_token(written, "pandora", secret_key) is False
+    assert pool.queries == [], "minting needs no DB lookup"
     assert "--mcp-config" in all_cmds[-1]
 
 

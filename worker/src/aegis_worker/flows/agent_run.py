@@ -119,7 +119,15 @@ class AgentRunFlow:
         try:
             launched = await workflow.execute_activity_method(
                 AgentRunActivities.launch_agent_run,
-                args=[inp.prompt, repo, inp.engine, purpose, inp.agent_id, inp.gated],
+                args=[
+                    inp.prompt,
+                    repo,
+                    inp.engine,
+                    purpose,
+                    inp.agent_id,
+                    inp.gated,
+                    inp.timeout_minutes,
+                ],
                 start_to_close_timeout=TIMEOUT_LONG,
                 retry_policy=NO_RETRY,
             )

@@ -435,6 +435,34 @@ and log `coding_run_skipped_repo_busy`. Ask any agent holding the
 One consequence worth knowing: a skipped **Todoist** task is retried after the
 sweep's `cooldown_hours` (six by default), not on the next fifteen-minute tick,
 because its workflow completed. Lower `cooldown_hours` if you want it sooner.
+### How a run authenticates to AEGIS (mount tokens)
+
+A claude run mounts AEGIS's own tools over MCP at
+`{mcp_server_url}/api/mcp-server/{agent_id}`. The credential written into that
+run's config file is a **mount token**: an HMAC over the agent id, the gated
+flag and an expiry, signed with `AEGIS_SECRET_KEY`.
+
+It is not the shared API key, and that is the point. A run reads untrusted
+content by design, and an ungated one has a shell, so it can read its own config
+file. A shared key found there would be full API access that never expires, and
+could be used against any other agent's endpoint by changing one path segment.
+A mount token instead:
+
+- opens only its own `{agent_id}` — another agent's endpoint returns 403;
+- opens only its own mode — a gated run cannot present its token at the ungated
+  URL to escape the approval gate;
+- expires, so a token printed into a transcript and delivered to chat ages out.
+  The TTL follows the run's own deadline where the caller knows it, and is
+  otherwise six hours.
+
+Verification is stateless: Core recomputes the signature with the same secret.
+No table, no lookup on the auth path, and nothing to revoke when a run dies with
+the power.
+
+Set `AEGIS_SECRET_KEY`. Without it no token can be signed and the mount falls
+back to the shared API key, which is logged as
+`mcp_mount_token_unavailable_using_shared_key` — the weaker posture, kept only
+so such a deployment is not left with toolless runs.
 
 ### Verify the coding host
 
