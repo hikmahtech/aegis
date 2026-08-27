@@ -1217,6 +1217,18 @@
   {
     "type": "function",
     "function": {
+      "name": "list_coding_sessions",
+      "description": "List coding-CLI sessions currently open on the coding host, across every configured account. Read-only. Shows which repo each session is in and whether it is busy, and marks AEGIS's own runs as owner=aegis. Use it to answer 'what is running on the coding host?', or to check before asking for a coding run whether someone is already working in that repo.",
+      "parameters": {
+        "type": "object",
+        "properties": {},
+        "required": []
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
       "name": "system_status",
       "description": "Aggregate system status: workflow runs by type/status, hard failures, runs that completed but actually failed (result_summary encodes an error), LLM token spend, pending interactions, and stuck infra services. Use when the user asks what ran, what broke, what's pending on them, or what we spent.",
       "parameters": {

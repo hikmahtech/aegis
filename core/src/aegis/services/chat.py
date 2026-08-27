@@ -1194,6 +1194,24 @@ CHAT_TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "list_coding_sessions",
+            "description": (
+                "List coding-CLI sessions currently open on the coding host, across every "
+                "configured account. Read-only. Shows which repo each session is in and "
+                "whether it is busy, and marks AEGIS's own runs as owner=aegis. Use it to "
+                "answer 'what is running on the coding host?', or to check before asking "
+                "for a coding run whether someone is already working in that repo."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "system_status",
             "description": (
                 "Aggregate system status: workflow runs by type/status, hard failures, "
@@ -2380,6 +2398,37 @@ async def _exec_pdf_to_text(pool: asyncpg.Pool, args: dict, ctx: ToolContext) ->
     )
 
 
+async def _exec_list_coding_sessions(pool: asyncpg.Pool, args: dict, ctx: ToolContext) -> str:
+    """Read-only inventory of coding-CLI sessions on the coding host.
+
+    Reports `disabled` distinctly from "nothing running": an operator reading
+    an empty list must be able to tell "nobody is working" from "the feature
+    was never switched on".
+    """
+    if not ctx.remote_script_connector:
+        return "The coding host is not configured."
+    result = await ctx.remote_script_connector.list_coding_sessions()
+    status = result.get("status")
+    if status == "disabled":
+        return "Session inventory is disabled for this coding host (coding.inventory.enabled)."
+    sessions = result.get("sessions") or []
+    errors = result.get("errors") or []
+    if not sessions and status != "ok":
+        detail = "; ".join(f"{e.get('account', '?')}: {e.get('error', '')}" for e in errors)
+        return f"Could not read the session inventory. {detail}".strip()
+    if not sessions:
+        return "No coding sessions are open on the coding host."
+    lines = [
+        f"- {s.get('name') or s.get('session_id')} "
+        f"[{s.get('account')}] {s.get('repo') or s.get('cwd')} "
+        f"— {s.get('status')} ({s.get('owner')})"
+        for s in sessions
+    ]
+    if errors:
+        lines.append(f"({len(errors)} account(s) could not be read)")
+    return "\n".join(lines)
+
+
 async def _exec_system_status(pool: asyncpg.Pool, args: dict, ctx: ToolContext) -> str:
     """Aggregate status digest — see aegis.services.status_digest."""
     from aegis.services.status_digest import get_status_digest
@@ -2976,6 +3025,7 @@ TOOL_EXECUTORS: dict[str, Any] = {
     "vercel_get_build_logs": _exec_vercel_get_build_logs,
     "youtube_transcript": _exec_youtube_transcript,
     "pdf_to_text": _exec_pdf_to_text,
+    "list_coding_sessions": _exec_list_coding_sessions,
     "system_status": _exec_system_status,
     "social_timeline": _exec_social_timeline,
     "list_social_channels": _exec_list_social_channels,

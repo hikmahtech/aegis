@@ -52,6 +52,7 @@ EXPECTED_TOOL_NAMES = [
     "last_contact_with_person",
     "list_argocd_apps",
     "list_cloud_accounts",
+    "list_coding_sessions",
     "list_deployments",
     "list_interactions",
     "list_next_actions",
