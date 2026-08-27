@@ -184,6 +184,33 @@ def validate_coding(coding: Any, kind: str = "") -> dict:
         raise ValueError("coding.tmux.window_cap must be >= 1")
     out["tmux"] = {"session": session, "window_cap": window_cap}
 
+    # Read-only session inventory (docs/superpowers/specs/
+    # 2026-08-28-coding-session-inventory-design.md). Default OFF: this decides
+    # whether runs start at all, so a fork opts in deliberately. An account that
+    # is not a config_dirs key is rejected here rather than silently enumerating
+    # nothing — the same rule routing.orgs[*].account already follows.
+    inv_in = _expect(coding.get("inventory", {}) or {}, dict, "inventory")
+    for flag in ("enabled", "skip_when_busy"):
+        if flag in inv_in and not isinstance(inv_in[flag], bool):
+            raise ValueError(f"coding.inventory.{flag} must be a boolean")
+    accounts_in = _expect(inv_in.get("accounts", []) or [], list, "inventory.accounts")
+    accounts: list[str] = []
+    claude_dirs = (engines.get("claude") or {}).get("config_dirs") or {}
+    for account in accounts_in:
+        if not isinstance(account, str):
+            raise ValueError("coding.inventory.accounts must be a list of strings")
+        if account not in claude_dirs:
+            raise ValueError(
+                f"coding.inventory.accounts entry {account!r} "
+                "is not in engines.claude.config_dirs"
+            )
+        accounts.append(account)
+    out["inventory"] = {
+        "enabled": bool(inv_in.get("enabled", False)),
+        "skip_when_busy": bool(inv_in.get("skip_when_busy", True)),
+        "accounts": accounts,
+    }
+
     kimi_host_slug = coding.get("kimi_host_slug")
     if kimi_host_slug is not None and not isinstance(kimi_host_slug, str):
         raise ValueError("coding.kimi_host_slug must be a string or null")

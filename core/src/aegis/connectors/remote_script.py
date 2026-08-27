@@ -29,6 +29,7 @@ import structlog
 
 from aegis.connectors._ssh import build_ssh_args
 from aegis.connectors._subprocess import kill_and_wait
+from aegis.connectors.coding_sessions import parse_agents_json, to_records
 from aegis.crypto import decrypt_secret
 
 logger = structlog.get_logger()
@@ -377,6 +378,9 @@ class RemoteScriptConnector:
             # mounted run authenticates with. Both empty ⇒ no MCP mount at all.
             "mcp_server_url": mcp_server_url,
             "api_key": api_key,
+            # Session inventory is DB-only (infra.coding.inventory) and OFF for
+            # an env-configured connector: it changes whether runs start.
+            "inventory": {"enabled": False, "skip_when_busy": True, "accounts": []},
         }
         self._apply_config(self._env_config)
 
@@ -402,6 +406,7 @@ class RemoteScriptConnector:
         self._runbooks_dir = cfg["runbooks_dir"]
         self._mcp_server_url = cfg["mcp_server_url"]
         self._api_key = cfg["api_key"]
+        self._inventory_config = cfg["inventory"]
 
     def _config_from_row(self, row: dict, kimi_host: str) -> dict[str, Any]:
         """Map an infra row (+ resolved kimi host) onto the active config.
@@ -417,6 +422,7 @@ class RemoteScriptConnector:
         kimi = engines.get("kimi") or {}
         routing = coding.get("routing") or {}
         tmux = coding.get("tmux") or {}
+        inventory = coding.get("inventory") or {}
         env = self._env_config
         key_material = (
             decrypt_secret(
@@ -434,6 +440,11 @@ class RemoteScriptConnector:
             "kimi_host": kimi_host,
             "tmux_session": (tmux.get("session") or "remote"),
             "tmux_window_cap": int(tmux.get("window_cap") or 10),
+            "inventory": {
+                "enabled": bool(inventory.get("enabled", False)),
+                "skip_when_busy": bool(inventory.get("skip_when_busy", True)),
+                "accounts": [str(a) for a in (inventory.get("accounts") or [])],
+            },
             "routing_orgs": {
                 str(org).lower(): dict(route)
                 for org, route in (routing.get("orgs") or {}).items()
@@ -514,6 +525,68 @@ class RemoteScriptConnector:
             "self_repo_path": self._self_repo_path,
             "runbooks_dir": self._runbooks_dir,
             "source": self._config_source,
+        }
+
+    async def list_coding_sessions(self) -> dict:
+        """Read-only inventory of Claude Code sessions on the coding host.
+
+        Runs `claude agents --json` once per configured account over the SSH
+        identity this connector already uses — no new credential. The command
+        is documented for scripting and needs no TTY.
+
+        Returns ``{"status", "sessions", "errors", "skip_when_busy"}`` where
+        status is ``disabled`` (feature off), ``unavailable`` (nothing could be
+        enumerated) or ``ok`` (including partial success with errors).
+
+        NEVER raises. The launch path treats anything other than ``ok`` as "no
+        collision known" and proceeds — a broken inventory must not become an
+        outage of the coding lane.
+        """
+        await self._refresh_config()
+        cfg = getattr(self, "_inventory_config", None) or {}
+        skip = bool(cfg.get("skip_when_busy", True))
+        if not cfg.get("enabled"):
+            return {"status": "disabled", "sessions": [], "errors": [], "skip_when_busy": skip}
+
+        dirs = self._claude_config_dirs or {}
+        if not self._claude_binary or not dirs:
+            return {
+                "status": "unavailable",
+                "sessions": [],
+                "errors": [
+                    {"account": "", "error": "claude binary or config_dirs not configured"}
+                ],
+                "skip_when_busy": skip,
+            }
+
+        sessions: list[dict] = []
+        errors: list[dict] = []
+        for account in cfg.get("accounts") or list(dirs):
+            config_dir = dirs.get(account)
+            if not config_dir:
+                errors.append({"account": account, "error": "no config_dir for account"})
+                continue
+            cmd = (
+                f"CLAUDE_CONFIG_DIR={shlex.quote(config_dir)} "
+                f"{shlex.quote(self._claude_binary)} agents --json"
+            )
+            result = await self._exec(self._host, cmd, timeout=20, batch_mode=True)
+            if result["status"] != "succeeded":
+                errors.append({"account": account, "error": str(result["stderr"])[:200]})
+                continue
+            try:
+                parsed = parse_agents_json(result["stdout"])
+            except ValueError as exc:
+                errors.append({"account": account, "error": str(exc)[:200]})
+                continue
+            sessions.extend(to_records(parsed, account, self._repo_base))
+
+        status = "ok" if sessions or not errors else "unavailable"
+        return {
+            "status": status,
+            "sessions": sessions,
+            "errors": errors,
+            "skip_when_busy": skip,
         }
 
     # ── SSH plumbing ─────────────────────────────────────────────────────────

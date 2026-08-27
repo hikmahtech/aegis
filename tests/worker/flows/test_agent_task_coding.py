@@ -66,7 +66,13 @@ _REPO_UNCONFIRMED = {
 }
 
 
-def _activities(events: list, *, pr_result: dict | None = None, repo_result: dict | None = None):
+def _activities(
+    events: list,
+    *,
+    pr_result: dict | None = None,
+    repo_result: dict | None = None,
+    investigation_result: dict | None = None,
+):
     @activity.defn(name="load_task_context")
     async def load_task_context(task_id: str) -> dict:
         return {"external_id": "", "fingerprint": "", "gmail_message_id": ""}
@@ -90,6 +96,8 @@ def _activities(events: list, *, pr_result: dict | None = None, repo_result: dic
         task_id: str, title: str, description: str, repo_path: str, github_repo: str
     ) -> dict:
         events.append(("investigate", repo_path))
+        if investigation_result is not None:
+            return investigation_result
         return {
             "status": "running",
             "transcript": "",
@@ -183,6 +191,44 @@ def _activities(events: list, *, pr_result: dict | None = None, repo_result: dic
         apply_interaction_timeout,
         update_interaction_delivery_ref,
     ]
+
+
+async def test_repo_busy_skip_does_not_park_the_task():
+    """A transient collision must leave the task in the eligible pool.
+
+    Every other terminal path in this branch parks (stamping @waiting, which
+    removes the task from find_actionable_tasks until something unparks it), so
+    the omission here is exactly what a later refactor would restore by accident.
+    """
+    events: list = []
+    skipped = {
+        "status": "skipped",
+        "reason": "repo_busy",
+        "transcript": "",
+        "run_id": "",
+    }
+    async with await WorkflowEnvironment.start_time_skipping() as env:
+        queue = f"tq-{uuid.uuid4()}"
+        async with Worker(
+            env.client,
+            task_queue=queue,
+            workflows=[AgentTaskFlow, InteractionFlow],
+            activities=_activities(events, investigation_result=skipped),
+        ):
+            result = await env.client.execute_workflow(
+                AgentTaskFlow.run,
+                AgentTaskFlowInput(
+                    agent_id="pandoras-actor", todoist_task_id="tc-1", task=_CODE_TASK
+                ),
+                id=f"agent-task-tc-1-{uuid.uuid4()}",
+                task_queue=queue,
+            )
+
+    assert not any(kind == "park" for kind, _ in events), "a repo-busy skip must not park"
+    assert not any(kind == "comment" for kind, _ in events), "a scheduled skip must stay quiet"
+    assert not any(kind == "implement" for kind, _ in events)
+    assert not any(kind == "insert_ia" for kind, _ in events), "no card for a quiet skip"
+    assert result.get("reason") == "repo_busy"
 
 
 async def test_declined_plan_stops_before_any_implement_run():

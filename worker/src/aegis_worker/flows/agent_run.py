@@ -126,6 +126,19 @@ class AgentRunFlow:
         except Exception as exc:  # noqa: BLE001 — degrade visibly, never retry
             launched = {"status": "failed", "error": _err_str(exc)}
 
+        # Deconfliction, not a failure — must be checked BEFORE the generic
+        # not-running branch below, which would otherwise report "couldn't
+        # start" for a run AEGIS deliberately chose not to start.
+        if launched.get("status") == "skipped":
+            names = ", ".join(str(s.get("name") or "?") for s in launched.get("sessions") or [])
+            await self._deliver(
+                inp.agent_id,
+                f"Skipped the {purpose} run on `{repo}` — you already have a session "
+                f"working there ({names}).",
+            )
+            workflow.logger.info("agent_run_skipped_repo_busy repo=%s sessions=%s", repo, names)
+            return _result("skipped", "repo_busy", "", "", "", 0)
+
         if launched.get("status") != "running":
             reason = str(launched.get("error") or "launch failed")
             await self._deliver(

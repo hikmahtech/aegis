@@ -46,6 +46,13 @@ interface CodingFormData {
   // whole `coding` object, so a field this file does not carry is erased by
   // any unrelated save on this page.
   mcp_server_url: string;
+  // Read-only session inventory: check for an open Claude Code session in the
+  // target repo before launching a run. Same round-trip rule as
+  // mcp_server_url above — a field this file drops is erased on the next save.
+  inventory_enabled: boolean;
+  inventory_skip_when_busy: boolean;
+  // Comma-separated account labels; blank means every configured account.
+  inventory_accounts: string;
 }
 
 const emptyCoding: CodingFormData = {
@@ -63,6 +70,9 @@ const emptyCoding: CodingFormData = {
   self_repo_path: '',
   runbooks_dir: '',
   mcp_server_url: '',
+  inventory_enabled: false,
+  inventory_skip_when_busy: true,
+  inventory_accounts: '',
 };
 
 function codingFromRow(coding: any): CodingFormData {
@@ -73,6 +83,7 @@ function codingFromRow(coding: any): CodingFormData {
   const kimi = coding.engines?.kimi || {};
   const routing = coding.routing || {};
   const tmux = coding.tmux || {};
+  const inventory = coding.inventory || {};
   return {
     enabled: !!coding.enabled,
     repo_base: coding.repo_base || '',
@@ -95,6 +106,10 @@ function codingFromRow(coding: any): CodingFormData {
     self_repo_path: coding.self_repo_path || '',
     runbooks_dir: coding.runbooks_dir || '',
     mcp_server_url: coding.mcp_server_url || '',
+    inventory_enabled: !!inventory.enabled,
+    // Defaults true when absent, matching validate_coding.
+    inventory_skip_when_busy: inventory.skip_when_busy !== false,
+    inventory_accounts: (inventory.accounts || []).join(', '),
   };
 }
 
@@ -124,6 +139,14 @@ function codingToPayload(c: CodingFormData): Record<string, any> {
     self_repo_path: c.self_repo_path.trim(),
     runbooks_dir: c.runbooks_dir.trim(),
     mcp_server_url: c.mcp_server_url.trim(),
+    inventory: {
+      enabled: c.inventory_enabled,
+      skip_when_busy: c.inventory_skip_when_busy,
+      accounts: c.inventory_accounts
+        .split(',')
+        .map((a) => a.trim())
+        .filter(Boolean),
+    },
   };
 }
 
@@ -137,7 +160,10 @@ function codingTouched(c: CodingFormData): boolean {
     c.routes.length > 0 ||
     c.default_engine !== 'kimi' ||
     c.tmux_session !== 'remote' ||
-    c.tmux_window_cap !== '10'
+    c.tmux_window_cap !== '10' ||
+    c.inventory_enabled ||
+    !c.inventory_skip_when_busy ||
+    !!c.inventory_accounts.trim()
   );
 }
 
@@ -1018,6 +1044,37 @@ export default function Infra() {
                         <div className="form-group">
                           <label>MCP server URL (coding-host-reachable)</label>
                           <input value={form.coding.mcp_server_url} onChange={e => setCoding({ mcp_server_url: e.target.value })} placeholder="http://10.0.0.5:8080" className="mono" />
+                        </div>
+                      </div>
+
+                      <div className="form-group">
+                        <label>
+                          <input
+                            type="checkbox"
+                            checked={form.coding.inventory_enabled}
+                            onChange={e => setCoding({ inventory_enabled: e.target.checked })}
+                            style={{ width: 'auto', marginRight: '0.4rem' }}
+                          />
+                          Check for open sessions before launching a run
+                        </label>
+                      </div>
+
+                      <div className="form-group">
+                        <label>
+                          <input
+                            type="checkbox"
+                            checked={form.coding.inventory_skip_when_busy}
+                            onChange={e => setCoding({ inventory_skip_when_busy: e.target.checked })}
+                            style={{ width: 'auto', marginRight: '0.4rem' }}
+                          />
+                          Skip the launch when a session is busy (off = log only)
+                        </label>
+                      </div>
+
+                      <div className="form-row">
+                        <div className="form-group">
+                          <label>Accounts to check (blank = all)</label>
+                          <input value={form.coding.inventory_accounts} onChange={e => setCoding({ inventory_accounts: e.target.value })} placeholder="personal, work" className="mono" />
                         </div>
                       </div>
                     </div>

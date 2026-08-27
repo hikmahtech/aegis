@@ -396,6 +396,46 @@ key is pasted.)
    > have a workspace checkout:
    > `UPDATE resources SET metadata = jsonb_set(metadata,'{coding_enabled}','true') WHERE kind='repository' AND metadata->>'path' IS NOT NULL;`
 
+### Session inventory
+
+Before starting a coding run, AEGIS can check whether one of your own Claude
+Code sessions is already busy in the same repo, and skip rather than compete
+with you. It reads `claude agents --json` — the documented, TTY-free listing —
+once per configured account, over the SSH identity the coding host already uses.
+Nothing is stored: the inventory is read fresh each time.
+
+```json
+"inventory": {
+  "enabled": false,
+  "skip_when_busy": true,
+  "accounts": []
+}
+```
+
+- `enabled` — off by default. Turn it on deliberately: it changes whether runs
+  start. Off means not one extra SSH round trip.
+- `skip_when_busy` — set false to log collisions without acting on them, so you
+  can watch what it would do before letting it decide.
+- `accounts` — restrict to some of `engines.claude.config_dirs`; blank means all.
+  An account label that is not a `config_dirs` key is rejected when you save,
+  because it would otherwise enumerate nothing and silently disable the check.
+
+A busy session only blocks a run when it is human-owned. AEGIS's own runs live in
+`<repo>-aegis-wt/<run_id>` worktrees and are recognised as its own, so runs never
+block each other. Only `busy` sessions count — an idle session parked in a
+directory is not someone mid-thought.
+
+Any failure to read the inventory fails open and the run starts, which is the
+behaviour without this feature at all.
+
+Skipped runs appear in `workflow_runs` with `result_summary.reason = "repo_busy"`,
+and log `coding_run_skipped_repo_busy`. Ask any agent holding the
+`list_coding_sessions` tool what is currently open on the host.
+
+One consequence worth knowing: a skipped **Todoist** task is retried after the
+sweep's `cooldown_hours` (six by default), not on the next fifteen-minute tick,
+because its workflow completed. Lower `cooldown_hours` if you want it sooner.
+
 ### Verify the coding host
 
 Drive the live connector from inside the running worker — it uses the same

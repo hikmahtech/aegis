@@ -24,6 +24,7 @@ import re
 from dataclasses import dataclass
 from typing import Any
 
+from aegis.connectors.coding_sessions import busy_human_sessions
 from temporalio import activity
 
 # A run with no repo of its own gets this fixed checkout. `start_kimi_run`
@@ -93,6 +94,21 @@ class AgentRunActivities:
                 "repo": repo or SCRATCH_REPO,
             }
         target_repo = (repo or "").strip() or SCRATCH_REPO
+        # Defer to a human already mid-thought in this repo. Fails open, so an
+        # unreachable or disabled inventory launches exactly as it does today.
+        busy = await busy_human_sessions(self.remote_script, target_repo)
+        if busy:
+            activity.logger.warning(
+                "coding_run_skipped_repo_busy repo=%s sessions=%s",
+                target_repo,
+                [s.get("name") for s in busy],
+            )
+            return {
+                "status": "skipped",
+                "reason": "repo_busy",
+                "repo": target_repo,
+                "sessions": busy,
+            }
         settings = await self.remote_script.coding_settings()
         started = await self.remote_script.start_kimi_run(
             repo=target_repo,

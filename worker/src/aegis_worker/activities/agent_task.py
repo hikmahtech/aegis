@@ -14,6 +14,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Any
 
+from aegis.connectors.coding_sessions import busy_human_sessions
 from temporalio import activity
 
 # Assignee labels this flow will act on. @me is deliberately absent: a task the
@@ -671,6 +672,23 @@ class AgentTaskActivities:
         """
         if self.remote_script is None or not repo_path:
             return {"status": "failed", "transcript": "", "run_id": ""}
+
+        # Entry point of the coding lane: defer to a human already busy in this
+        # repo. The FLOW must not park on this path — parking stamps @waiting,
+        # which would retire the task over a transient collision.
+        busy = await busy_human_sessions(self.remote_script, repo_path)
+        if busy:
+            activity.logger.warning(
+                "coding_run_skipped_repo_busy repo=%s sessions=%s",
+                repo_path,
+                [s.get("name") for s in busy],
+            )
+            return {
+                "status": "skipped",
+                "reason": "repo_busy",
+                "transcript": "",
+                "run_id": "",
+            }
 
         prompt = (
             "You are investigating a task. Do NOT modify any files, do NOT commit, "

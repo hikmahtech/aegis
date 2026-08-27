@@ -457,11 +457,13 @@ class AgentTaskFlow:
 
     async def _run_coding(self, input: AgentTaskFlowInput, task_id: str) -> dict:
         """Resolve the repo, investigate read-only, gate the plan, implement on
-        approval, then gate the PR. Every exit path parks — a coding task never
-        auto-completes; even an opened PR still needs human review."""
+        approval, then gate the PR. Every exit path parks EXCEPT a repo-busy
+        skip, which must leave the task untouched so it stays in the eligible
+        pool — a coding task never auto-completes; even an opened PR still needs
+        human review."""
         setup = await self._investigate_coding_task(input, task_id)
         if "plan" not in setup:
-            return setup  # early exit already parked (no repo / failed / empty)
+            return setup  # early exit: parked, or a repo-busy skip that must not park
         repo, plan = setup["repo"], setup["plan"]
 
         # AWAIT the plan card. Safe because the sweep spawned this workflow
@@ -590,6 +592,14 @@ class AgentTaskFlow:
             start_to_close_timeout=TIMEOUT_LONG,
             retry_policy=RETRY_ONCE,
         )
+        # A transient collision must NOT park: park_task stamps @waiting, which
+        # removes the task from find_actionable_tasks' pool until something
+        # unparks it, so a busy afternoon would retire the task for good.
+        # Returning without "plan" makes _run_coding exit; the cooldown on this
+        # workflow's terminal run row defers the retry.
+        if investigation.get("status") == "skipped":
+            return {"status": "skipped", "reason": "repo_busy", "task_id": task_id}
+
         if investigation.get("status") == "failed":
             return await self._park_coding(
                 task_id,
