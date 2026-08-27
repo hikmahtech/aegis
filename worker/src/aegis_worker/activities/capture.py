@@ -192,6 +192,7 @@ class CaptureActivities:
         from aegis.services.email_task_links import (
             UNBLOCK_ADD,
             UNBLOCK_REMOVE,
+            blocks_unblock,
             get_email_task_links,
             match_link,
             task_key_pattern,
@@ -225,6 +226,27 @@ class CaptureActivities:
 
         task_id = row["id"]
         action = hit["action"]
+
+        # `@waiting` on an agent-assigned task is agent_task.PARK_LABEL — "this
+        # pass is done", not "blocked on a human". Stripping it re-enters the
+        # task into find_actionable_tasks and recreates the cooldown loop that
+        # parking exists to prevent. Refuse rather than guess; the audit note is
+        # skipped too, because there is nothing to report to the human.
+        if action == "unblock" and (agent_label := blocks_unblock(list(row["labels"] or []))):
+            activity.logger.info(
+                "email_task_link_unblock_skipped_agent_parked rule=%s task=%s label=%s",
+                hit["key"],
+                task_id,
+                agent_label,
+            )
+            return {
+                "applied": False,
+                "reason": "agent_parked",
+                **hit,
+                "task_id": task_id,
+                "agent_label": agent_label,
+            }
+
         subject = (msg.get("subject") or "(no subject)")[:150]
         permalink = msg.get("permalink") or ""
         marker = {"complete": "✅ Closed by email", "unblock": "▶️ Unblocked by email"}.get(

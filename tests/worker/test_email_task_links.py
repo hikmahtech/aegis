@@ -213,6 +213,58 @@ async def test_already_completed_task_is_not_touched_again(db_pool):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("agent_label", ["@sebas", "@raphael", "@maou", "@pandora"])
+async def test_unblock_refuses_an_agent_parked_task(db_pool, agent_label):
+    """`@waiting` on an agent task is PARK_LABEL, not "blocked on a human".
+
+    Stripping it re-enters the task into `find_actionable_tasks` and recreates
+    the infinite cooldown loop parking exists to prevent. On real data 19 of 25
+    open `@waiting` tasks were agent-parked, so this is the common case.
+    """
+    await _seed(db_pool, "etl-5", "APP-77: agent is working this", ["@waiting", agent_label])
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO settings (key, value) VALUES ('email_task_links', $1) "
+            "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+            [{**JIRA_DONE, "body_re": None, "action": "unblock"}],
+        )
+    connector = _RecordingConnector()
+    acts = CaptureActivities(db_pool=db_pool, connector=connector)
+    result = await ActivityEnvironment().run(
+        acts.link_email_to_task, {"id": "m5", "subject": "[JIRA] (APP-77) x"}, "anything"
+    )
+    assert result["applied"] is False
+    assert result["reason"] == "agent_parked"
+    assert result["agent_label"] == agent_label
+    # Not even the note — nothing happened, so there is nothing to report.
+    assert connector.submitted == []
+
+
+@pytest.mark.asyncio
+async def test_complete_still_works_on_an_agent_parked_task(db_pool):
+    """The guard is scoped to `unblock`; closing a done ticket stays correct
+    whether or not an agent was working it."""
+    await _seed(db_pool, "etl-6", "APP-1234: agent worked this", ["@waiting", "@pandora"])
+    connector = _RecordingConnector()
+    acts = CaptureActivities(db_pool=db_pool, connector=connector)
+    result = await ActivityEnvironment().run(
+        acts.link_email_to_task, {"id": "m6", "subject": SUBJECT}, BODY_RESOLVED
+    )
+    assert result["applied"] is True
+    assert _types(connector) == ["note_add", "item_complete"]
+
+
+def test_park_label_matches_agent_tasks_definition():
+    """The guard is only correct while these two agree — if `agent_task` renames
+    PARK_LABEL or adds an assignee, this fails instead of silently re-queueing."""
+    from aegis.services.email_task_links import UNBLOCK_REMOVE, UNBLOCK_SKIP_LABELS
+    from aegis_worker.activities.agent_task import ADDRESSABLE_ASSIGNEES, PARK_LABEL
+
+    assert UNBLOCK_REMOVE == PARK_LABEL
+    assert set(UNBLOCK_SKIP_LABELS) == set(ADDRESSABLE_ASSIGNEES)
+
+
+@pytest.mark.asyncio
 async def test_unblock_swaps_waiting_for_next(db_pool):
     await _seed(db_pool, "etl-4", "APP-99: chase vendor", ["@waiting", "@email"])
     async with db_pool.acquire() as conn:
