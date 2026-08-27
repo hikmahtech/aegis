@@ -311,6 +311,23 @@ activities:
       significance_threshold: 4
     active: true
 
+  # Sebas — close Todoist tasks whose Jira issue already has a resolution.
+  # Ships ACTIVE but INERT: blank jira_base_url/jira_email/jira_api_token means
+  # the flow reports `not_configured` and makes no request (same pattern as the
+  # LLM spend guard below). Set the three on the admin Integrations page, then
+  # restart the worker — connector config applies at BOOT.
+  # This is NOT redundant with email_task_links: Jira sends no notification for
+  # a transition you make yourself, so mail can only close tickets somebody
+  # else resolved. Set dry_run: true for one run to see what it would close.
+  - slug: jira-sync-30m
+    workflow_type: JiraSyncFlow
+    agent_id: sebas
+    schedule_cron: "*/30 * * * *"
+    config:
+      max_tasks: 100
+      dry_run: false
+    active: true
+
   # Pandora — Sentry poll safety-net (webhook is the fast path)
   - slug: sentry-poll-30m
     workflow_type: SentryPollFlow

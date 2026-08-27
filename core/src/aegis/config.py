@@ -309,6 +309,14 @@ class Settings(BaseSettings):
     content_extraction_enabled: bool = True
     raindrop_api_token: str = ""
 
+    # Jira (JiraSyncFlow). Any of the three blank = the flow reports
+    # `not_configured` and issues no request. Basic auth: the Atlassian ACCOUNT
+    # EMAIL plus an API token from id.atlassian.com/manage-profile/security/
+    # api-tokens — not a password, and not the login you use for SSO.
+    jira_base_url: str = ""
+    jira_email: str = ""
+    jira_api_token: str = ""
+
     # Wearables (B7). Blank = WearableIngestFlow reports `token_missing` and
     # never issues a request. Oura personal access token.
     oura_api_token: str = ""
