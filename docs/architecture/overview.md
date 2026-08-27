@@ -202,13 +202,15 @@ Two knobs are yours, edited on the admin **Email triage** page (`GET/PUT /api/ad
 ```json
 {"key": "jira-done",
  "subject_re": "\\((APP-\\d+)\\)",
- "body_re": "changed the status.*to\\s*'?Done|resolved this issue",
+ "body_re": "resolution\\s*:\\s*(?:Done|Fixed|Completed|Duplicate|Declined)",
  "action": "complete"}
 ```
 
 Actions are `complete`, `unblock` (drop `@waiting`, add `@next` — the reply you were parked on arrived) and `comment`. Every action leaves a note naming the email first, so a task closed by a robot says who closed it.
 
 `body_re` is optional and you almost always want one: Jira sends the **same subject** for a resolution, a comment and a reassignment, so a subject-only rule would close a ticket because somebody asked for an update. Key matching is word-bounded (`APP-12` never matches `APP-123`) and literal-escaped. Only open tasks are candidates, which is what makes the whole thing re-runnable — a second pass finds nothing left to close.
+
+**Author `body_re` against a real message.** Machine-generated mail is not prose, and the first live run matched 0 of 50 Jira mails for two reasons that both look like nothing is wrong. Jira's plain-text part renders the field table with no separator between fields, so a resolution reads `Resolution : DoneStatus : Deployed` — a `\b` after `Done` can never match, because `Done` is glued to `Status`. And that table sits ~2400 chars into a body that reaches 15k, past the classifier's prompt budget. The flow therefore fetches the whole message once (`_LINK_BODY_CHARS`, 20k) and hands the classifier and the knowledge store the old 2000-char slice, so widening this reader never widens an LLM prompt. A rule written from either assumption silently matches nothing forever — `linked: 0` is the only symptom, and it is indistinguishable from "no mail qualified".
 
 The check runs on every triaged email, before and independently of the category switch. A `complete` ends the route (capturing a new Inbox task for work that just finished is the noise this removes); `unblock` and `comment` fall through to normal routing, because a reply you were waiting on may still need an action of its own. Ships empty, read leniently — a malformed rule is dropped and logged, never raised, because a typo here must not stop mail being classified. There is no admin page yet; edit the settings row.
 

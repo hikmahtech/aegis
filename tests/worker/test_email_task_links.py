@@ -28,6 +28,27 @@ SUBJECT = "[JIRA] (APP-1234) Login page throws on submit"
 BODY_RESOLVED = "Alex Doe changed the status of APP-1234 to Done"
 BODY_COMMENTED = "Alex Doe commented on APP-1234:\n> any update on this?"
 
+# The shipped example rule, and a body in Jira's REAL plain-text shape (captured
+# from live notification mail). Two traps live in these four lines — see
+# test_shipped_jira_example_matches_a_real_notification.
+SHIPPED_JIRA_RULE = {
+    "key": "jira-done",
+    "subject_re": r"\((APP-\d+)\)",
+    "body_re": r"resolution\s*:\s*(?:Done|Fixed|Completed|Duplicate|Declined)",
+    "action": "complete",
+}
+REAL_JIRA_RESOLVED = (
+    "Arshad Ansari made an update\r\n\r\n"
+    "App\r\n[https://stocky.atlassian.net/browse/APP?atlOrigin=eyJpIjoiMDhjMDhi]"
+    " / APP-1234\r\n" + ("[https://stocky.atlassian.net/browse/APP-1234]\r\n" * 50) +
+    "Resolution : DoneStatus : Deployed&#x2192;\r\n"
+)
+REAL_JIRA_IN_PROGRESS = (
+    "Arshad Ansari made an update\r\n\r\n"
+    + ("[https://stocky.atlassian.net/browse/APP-1234]\r\n" * 50)
+    + "Status : Waiting to Validate&#x2192;\r\n"
+)
+
 
 class _RecordingConnector:
     """Captures submitted commands; reports success for all of them."""
@@ -60,6 +81,27 @@ def test_body_discriminator_separates_resolved_from_commented():
     }
     # Same subject, different event — must NOT fire.
     assert match_link([JIRA_DONE], SUBJECT, BODY_COMMENTED) is None
+
+
+def test_shipped_jira_example_matches_a_real_notification():
+    """Guards the two traps that made the first live run match 0 of 50 mails.
+
+    1. Jira's plain-text field table has no separator, so a resolution reads
+       `Resolution : DoneStatus : Deployed`. A `\\b` after `Done` never matches.
+    2. That table sits far past the classifier's 2000-char prompt budget, so the
+       rule only sees it if the caller passes the untruncated body.
+    """
+    hit = match_link([SHIPPED_JIRA_RULE], SUBJECT, REAL_JIRA_RESOLVED)
+    assert hit is not None, "the shipped example must match real Jira mail"
+    assert hit["task_key"] == "APP-1234"
+
+    # Trap 2, stated as an assertion: the discriminator is past 2000 chars, so
+    # handing this rule the classifier's slice finds nothing.
+    assert REAL_JIRA_RESOLVED.index("Resolution") > 2000
+    assert match_link([SHIPPED_JIRA_RULE], SUBJECT, REAL_JIRA_RESOLVED[:2000]) is None
+
+    # An unresolved ticket has a Status line but no Resolution line.
+    assert match_link([SHIPPED_JIRA_RULE], SUBJECT, REAL_JIRA_IN_PROGRESS) is None
 
 
 def test_no_subject_match_is_no_link():

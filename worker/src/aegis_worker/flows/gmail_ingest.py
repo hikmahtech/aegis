@@ -38,6 +38,13 @@ _FETCH_TIMEOUT = timedelta(seconds=900)
 _CLASSIFY_TIMEOUT = timedelta(seconds=180)
 # Pause between LLM classification calls to avoid overwhelming qwen.
 _LLM_THROTTLE_SECS = 2
+# One thread fetch serves two readers with different appetites. `email_task_links`
+# rules match on things machine-generated mail buries deep — Jira's field table
+# lands past char 2400 — so the fetch asks for the whole message. Classification
+# and the knowledge store keep the old 2000-char budget, because widening their
+# slice would silently widen every LLM prompt.
+_LINK_BODY_CHARS = 20000
+_CLASSIFY_BODY_CHARS = 2000
 
 
 @dataclass
@@ -113,21 +120,23 @@ class GmailIngestFlow:
                     if not new:
                         continue
 
-                # Fetch full thread body for richer classification context.
-                thread_content = ""
+                # One fetch, two readers: `link_body` is the whole message for
+                # email_task_links, `thread_content` the classifier's slice.
+                link_body = ""
                 if msg.get("thread_id"):
                     try:
-                        thread_content = await workflow.execute_activity(
+                        link_body = await workflow.execute_activity(
                             "fetch_thread",
-                            args=[label, msg["thread_id"]],
+                            args=[label, msg["thread_id"], _LINK_BODY_CHARS],
                             start_to_close_timeout=_ACT_TIMEOUT,
                             retry_policy=NO_RETRY,
                         )
                     except Exception as _te:
                         workflow.logger.warning("fetch_thread_skipped: %s", str(_te)[:200])
+                thread_content = link_body[:_CLASSIFY_BODY_CHARS]
 
                 if input.link_only:
-                    if (await self._link_to_task(msg, thread_content)).get("applied"):
+                    if (await self._link_to_task(msg, link_body)).get("applied"):
                         linked_total += 1
                     processed_here += 1
                     total_processed += 1
@@ -160,7 +169,7 @@ class GmailIngestFlow:
                 by_source[source] = by_source.get(source, 0) + 1
 
                 action = await self._route(
-                    input, label, msg, category, classification, thread_content
+                    input, label, msg, category, classification, thread_content, link_body
                 )
                 if action == "task_linked":
                     linked_total += 1
@@ -337,8 +346,13 @@ class GmailIngestFlow:
         category: str,
         classification: dict | None = None,
         thread_content: str = "",
+        link_body: str = "",
     ) -> str:
-        """Act on the email per its category. Returns the action string."""
+        """Act on the email per its category. Returns the action string.
+
+        `thread_content` is the classifier's slice; `link_body` is the whole
+        message, which only `email_task_links` reads (see `_LINK_BODY_CHARS`).
+        """
         # Feedback loop: log this prediction and, on any later re-observation of
         # the same email, capture a user Gmail-label correction into
         # triage_accuracy (the mis-triage signal). `label` records the owning
@@ -380,7 +394,7 @@ class GmailIngestFlow:
         # is exactly the noise this feature exists to remove. `unblock`/`comment`
         # fall through, because a reply you were waiting on may still need an
         # action of its own.
-        linked = await self._link_to_task(msg, thread_content)
+        linked = await self._link_to_task(msg, link_body or thread_content)
         if linked.get("applied") and linked.get("action") == "complete":
             await workflow.execute_activity(
                 "apply_label",
