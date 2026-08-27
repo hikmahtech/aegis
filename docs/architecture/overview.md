@@ -197,6 +197,23 @@ Two knobs are yours, edited on the admin **Email triage** page (`GET/PUT /api/ad
 - `sender_overrides` — `{"@substack.com": "informational"}`, or with tags: `{"billing@bank.example": {"category": "important_read", "tags": ["financial"]}}`. Exact address beats domain, decides outright with no LLM call, and deliberately writes no `triage_state`, so deleting a rule stops it applying instead of leaving learned state behind. Skipping the LLM means a rule produces no content tags of its own, and the `MoneyProcessFlow` fan-out keys on `financial`/`payments` — so a bank/receipt sender needs those tags on its rule or overriding it turns receipt extraction off.
 - `extra_notification_markers` — extra subject substrings for the cap, for phrasing specific to your bank or tooling.
 
+**Mail that changes a task you already have.** Categories only ever *create* Todoist tasks, which leaves a whole class of email doing nothing: your Jira ticket is closed, the mail says so, and the Todoist row lives on forever. A third `settings` row, `email_task_links` (`services/email_task_links.py`), is an ordered first-match-wins list that acts on an *existing* task instead. A rule finds a task key in the subject, confirms the event in the body, and applies one action to the open task whose title carries that key:
+
+```json
+{"key": "jira-done",
+ "subject_re": "\\((APP-\\d+)\\)",
+ "body_re": "changed the status.*to\\s*'?Done|resolved this issue",
+ "action": "complete"}
+```
+
+Actions are `complete`, `unblock` (drop `@waiting`, add `@next` — the reply you were parked on arrived) and `comment`. Every action leaves a note naming the email first, so a task closed by a robot says who closed it.
+
+`body_re` is optional and you almost always want one: Jira sends the **same subject** for a resolution, a comment and a reassignment, so a subject-only rule would close a ticket because somebody asked for an update. Key matching is word-bounded (`APP-12` never matches `APP-123`) and literal-escaped. Only open tasks are candidates, which is what makes the whole thing re-runnable — a second pass finds nothing left to close.
+
+The check runs on every triaged email, before and independently of the category switch. A `complete` ends the route (capturing a new Inbox task for work that just finished is the noise this removes); `unblock` and `comment` fall through to normal routing, because a reply you were waiting on may still need an action of its own. Ships empty, read leniently — a malformed rule is dropped and logged, never raised, because a typo here must not stop mail being classified. There is no admin page yet; edit the settings row.
+
+`GmailIngestFlow(link_only=True)` runs *only* this check, over whatever `query` you pass, ignoring the idempotency claim and the cursor — the backfill for rules added after the fact. It classifies nothing and advances nothing.
+
 The page leads with **stuck senders**: those at n≥3 and confidence ≥0.75 short-circuit the classifier entirely. A cache hit never reaches the LLM, so the only thing that can correct one from the inside is the notification cap — when it demotes a cached verdict the *capped* verdict is written back, which drops the sender below the confidence threshold and hands it to the LLM again (#262). Agreement writes nothing, or every sender would ratchet to n=∞ and confidence 1.0 merely for sending mail. For everything the cap does not catch, an override is still the only lever. Categories are a dropdown, not free text, because the read path drops an unknown category rather than crashing; a typed one would vanish silently. The write path 400s on anything invalid for the same reason.
 
 Accuracy is scored in `triage_accuracy` from two independent human signals, both zero-effort: what you do to the mail's Gmail labels, and how you close the `#email` task AEGIS created (`#trash` or `@reference` ⇒ "this needed nothing from me"). Both feed `triage_state` through the same disagreement arithmetic, so a correction demotes a sender rather than overriding it.

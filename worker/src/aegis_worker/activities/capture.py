@@ -173,3 +173,107 @@ class CaptureActivities:
             "capture_emitted source=%s ext=%s ref=%s", source_tag, external_id, ref
         )
         return ref
+
+    @activity.defn
+    async def link_email_to_task(self, msg: dict, body: str = "") -> dict:
+        """Apply the first matching ``email_task_links`` rule to an existing task.
+
+        The mirror of ``capture_to_inbox``: instead of creating a task from an
+        email, this changes the state of one AEGIS already tracks — closing the
+        Todoist row for a Jira ticket the mail says was resolved, or unparking a
+        ``@waiting`` task whose reply just arrived.
+
+        Best-effort. It runs on every triaged email, so every failure returns
+        ``{"applied": False, "reason": ...}`` rather than raising.
+        """
+        from aegis.connectors.todoist import TodoistConnector
+        from aegis.services.email_task_links import (
+            UNBLOCK_ADD,
+            UNBLOCK_REMOVE,
+            get_email_task_links,
+            match_link,
+            task_key_pattern,
+        )
+
+        if self.db_pool is None or self.connector is None:
+            return {"applied": False, "reason": "no_pool"}
+
+        links = await get_email_task_links(self.db_pool)
+        if not links:
+            return {"applied": False, "reason": "no_rules"}
+
+        hit = match_link(links, msg.get("subject") or "", body)
+        if hit is None:
+            return {"applied": False, "reason": "no_match"}
+
+        # Only open tasks are candidates, which is also what makes a re-run safe:
+        # a second pass over the same email finds nothing left to close.
+        async with self.db_pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT id, content, labels FROM todoist_tasks "
+                "WHERE NOT is_completed AND content ~ $1 "
+                "ORDER BY updated_at DESC LIMIT 1",
+                task_key_pattern(hit["task_key"]),
+            )
+        if row is None:
+            activity.logger.info(
+                "email_task_link_no_open_task rule=%s key=%s", hit["key"], hit["task_key"]
+            )
+            return {"applied": False, "reason": "no_open_task", "task_key": hit["task_key"]}
+
+        task_id = row["id"]
+        action = hit["action"]
+        subject = (msg.get("subject") or "(no subject)")[:150]
+        permalink = msg.get("permalink") or ""
+        marker = {"complete": "✅ Closed by email", "unblock": "▶️ Unblocked by email"}.get(
+            action, "📬 Email"
+        )
+        note = f"{marker}: {subject}"
+        if permalink:
+            note += f"\n{permalink}"
+
+        cmds = [TodoistConnector.build_note_add_command(task_id, note)]
+        if action == "complete":
+            cmds.append(TodoistConnector.build_item_complete_command(task_id))
+        elif action == "unblock":
+            labels = [lab for lab in (row["labels"] or []) if lab != UNBLOCK_REMOVE]
+            if UNBLOCK_ADD not in labels:
+                labels.append(UNBLOCK_ADD)
+            cmds.append(TodoistConnector.build_item_update_command(task_id, labels=labels))
+
+        result = await self.connector.commands(cmds)
+        status = TodoistConnector.check_sync_status(result, [c["uuid"] for c in cmds])
+        if not status["ok"]:
+            if status["retryable"] or status["rejected_retryable"]:
+                async with self.db_pool.acquire() as conn:
+                    for cmd in cmds:
+                        await conn.execute(
+                            "INSERT INTO todoist_outbox (temp_id, command, status) "
+                            "VALUES ($1, $2, 'pending') ON CONFLICT (temp_id) DO NOTHING",
+                            cmd.get("temp_id") or cmd["uuid"],
+                            cmd,
+                        )
+                activity.logger.warning(
+                    "email_task_link_outbox_staged rule=%s task=%s err=%s",
+                    hit["key"],
+                    task_id,
+                    status["envelope_error"] or str(status["rejected"])[:200],
+                )
+                return {"applied": True, "queued": True, **hit, "task_id": task_id}
+            activity.logger.warning(
+                "email_task_link_rejected rule=%s task=%s rejected=%s",
+                hit["key"],
+                task_id,
+                str(status["rejected"])[:200],
+            )
+            return {"applied": False, "reason": "rejected", **hit, "task_id": task_id}
+
+        activity.logger.info(
+            "email_task_link_applied rule=%s action=%s key=%s task=%s title=%s",
+            hit["key"],
+            action,
+            hit["task_key"],
+            task_id,
+            (row["content"] or "")[:80],
+        )
+        return {"applied": True, "queued": False, **hit, "task_id": task_id}
