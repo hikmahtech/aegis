@@ -12,13 +12,23 @@ action to the open task whose title contains that key::
 
     {"key": "jira-done",
      "subject_re": "\\\\((APP-\\\\d+)\\\\)",
-     "body_re": "changed the status.*to\\\\s*'?Done|resolved this issue",
+     "body_re": "resolution\\\\s*:\\\\s*(?:Done|Fixed|Completed|Duplicate|Declined)",
      "action": "complete"}
 
 Group 1 of ``subject_re`` is the task key (the whole match if the pattern has no
 group). ``body_re`` is optional but you almost always want one: Jira sends the
 same subject for *every* event on an issue, so subject-only matching would close
 a ticket because somebody commented on it.
+
+**Write ``body_re`` against a real message, not a guess.** Machine-generated mail
+is not prose, and two things that look obviously right are wrong in practice.
+Jira's plain-text part renders the field table with no separator between fields,
+so a resolution reads ``Resolution : DoneStatus : Deployed`` — a trailing ``\\b``
+after ``Done`` never matches, because ``Done`` is glued to ``Status``. And that
+table sits ~2400 chars into a body that reaches 15k, well past the classifier's
+prompt budget, which is why the flow fetches the whole message for this check
+alone (``_LINK_BODY_CHARS``). A rule authored from either assumption matches
+nothing and reports nothing, forever.
 
 Actions:
 

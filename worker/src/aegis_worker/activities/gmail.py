@@ -437,9 +437,22 @@ class GmailActivities:
         return await asyncio.to_thread(_sync_fetch)
 
     @activity.defn
-    async def fetch_thread(self, account_label: str, thread_id: str) -> str:
-        """Return plain-text body of the most recent messages in a thread (up to 2000 chars)."""
+    async def fetch_thread(
+        self, account_label: str, thread_id: str, max_chars: int = 2000
+    ) -> str:
+        """Return the plain-text body of the most recent messages in a thread.
+
+        `max_chars` defaults to the classifier's prompt budget. Raise it only for
+        a reader that needs the whole message: machine-generated mail front-loads
+        boilerplate, so the part that carries the meaning can sit far past 2000
+        chars. Jira is the worked example — its notification opens with two ~200
+        char tracking URLs, and the field table that says `Resolution : Done`
+        lands around char 2400 of a body that reaches 15k. At the old fixed
+        600-per-message cap, an `email_task_links` rule matching on that table
+        saw nothing but the URLs and could never fire.
+        """
         token_path = Path(self.gmail_token_dir) / f"{account_label}.json"
+        per_message = max(600, max_chars // 3)
 
         def _sync() -> str:
             svc = _build_gmail_service(self.gmail_credentials_file, token_path)
@@ -448,8 +461,8 @@ class GmailActivities:
             for msg in (thread.get("messages") or [])[-5:]:  # last 5 messages max
                 text = _extract_text_from_part(msg.get("payload") or {})
                 if text.strip():
-                    parts.append(text[:600])
-            return "\n---\n".join(parts)[:2000]
+                    parts.append(text[:per_message])
+            return "\n---\n".join(parts)[:max_chars]
 
         try:
             return await asyncio.to_thread(_sync)
