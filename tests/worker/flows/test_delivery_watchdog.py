@@ -19,6 +19,7 @@ with workflow.unsafe.imports_passed_through():
 _find_calls: list[tuple] = []
 _notify_calls: list[list] = []
 _alert_calls: list[tuple] = []
+_resolve_calls: list[bool] = []
 
 
 def _make_find(rows):
@@ -49,9 +50,19 @@ async def stub_alert(last_ok_seconds_ago: int | None, last_error: str | None) ->
     return True
 
 
-async def _run(find_stub, config, wf_id, health_stub=None, alert_stub=None):
+def _make_resolve(returns: bool):
+    @activity.defn(name="resolve_comms_inbound_alert")
+    async def stub_resolve() -> bool:
+        _resolve_calls.append(returns)
+        return returns
+
+    return stub_resolve
+
+
+async def _run(find_stub, config, wf_id, health_stub=None, alert_stub=None, resolve_stub=None):
     activities = [find_stub, stub_notify, health_stub or _make_health({"status": "ok"})]
     activities.append(alert_stub or stub_alert)
+    activities.append(resolve_stub or _make_resolve(False))
     async with (
         await WorkflowEnvironment.start_time_skipping() as env,
         Worker(
@@ -94,6 +105,7 @@ async def test_records_comms_down_and_alerted():
     _find_calls.clear()
     _notify_calls.clear()
     _alert_calls.clear()
+    _resolve_calls.clear()
     health = {"status": "down", "last_ok_seconds_ago": 900, "last_error": "socket closed"}
     result = await _run(
         _make_find([]),
@@ -107,6 +119,26 @@ async def test_records_comms_down_and_alerted():
         "comms_inbound_alerted": True,
     }
     assert _alert_calls == [(900, "socket closed")]
+    # Recovery-only work must not run on a down tick.
+    assert _resolve_calls == []
+
+
+@pytest.mark.asyncio
+async def test_healthy_tick_closes_the_open_alert_task():
+    """Recovery completes the outage task. Without this the task stays open
+    forever and the open-task guard suppresses every later outage alert."""
+    _find_calls.clear()
+    _notify_calls.clear()
+    _resolve_calls.clear()
+    result = await _run(
+        _make_find([]), DeliveryWatchdogConfig(), "dw-4", resolve_stub=_make_resolve(True)
+    )
+    assert result == {
+        "undelivered": 0,
+        "comms_inbound_status": "ok",
+        "comms_inbound_resolved": True,
+    }
+    assert _resolve_calls == [True]
 
 
 @pytest.mark.asyncio
