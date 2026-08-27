@@ -36,6 +36,14 @@ Actions:
     Close the task.
 ``unblock``
     Drop ``@waiting``, add ``@next`` — the reply you were parked on arrived.
+    **Never applied to a task carrying an agent assignee label.** ``@waiting`` is
+    overloaded: for a human task it means "blocked on someone", but it is also
+    ``agent_task.PARK_LABEL``, stamped at the END of every agent pass precisely
+    to drop the task out of ``find_actionable_tasks``. Stripping it there does
+    not unblock anything — it re-queues finished agent work, and recreates the
+    infinite cooldown loop parking exists to prevent. Measured on real data, 19
+    of 25 open ``@waiting`` tasks were agent-parked, so this is the common case,
+    not the edge case. See ``UNBLOCK_SKIP_LABELS``.
 ``comment``
     Leave a note and nothing else.
 
@@ -57,11 +65,30 @@ logger = logging.getLogger(__name__)
 SETTINGS_KEY = "email_task_links"
 ACTIONS = ("complete", "unblock", "comment")
 
-#: Labels the ``unblock`` action swaps. `@waiting` is also `agent_task.PARK_LABEL`,
-#: so an unblocked task re-enters both the human "what's next" views and the
-#: agent's actionable pool.
+#: Labels the ``unblock`` action swaps.
 UNBLOCK_REMOVE = "@waiting"
 UNBLOCK_ADD = "@next"
+
+#: An agent assignee label means "an AEGIS agent owns this", and on such a task
+#: `@waiting` is `agent_task.PARK_LABEL` — "this pass is done", not "blocked on a
+#: human". Removing it re-enters the task into `find_actionable_tasks`, which is
+#: the infinite cooldown loop parking exists to prevent. `unblock` therefore
+#: refuses these outright; `complete` and `comment` are unaffected, because
+#: neither touches the parking state.
+#:
+#: Kept as a literal rather than resolved from `agents.mention_aliases` on
+#: purpose: this is a SAFETY guard, and it must still hold when the DB is
+#: unreachable or an agent row has been renamed. A stale extra entry here costs
+#: a skipped unblock; a missing one costs re-queued agent work.
+UNBLOCK_SKIP_LABELS = ("@sebas", "@raphael", "@maou", "@pandora")
+
+
+def blocks_unblock(labels: list[str] | None) -> str | None:
+    """The agent label that makes `unblock` unsafe on this task, or None."""
+    for lab in labels or []:
+        if lab in UNBLOCK_SKIP_LABELS:
+            return lab
+    return None
 
 
 def merge(raw: Any) -> list[dict]:
