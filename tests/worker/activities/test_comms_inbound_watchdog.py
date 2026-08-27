@@ -178,6 +178,9 @@ async def test_alert_polling_down_no_dedup_creates_task(db_pool):
     assert cmd["type"] == "item_add"
     # Label @pandora must be present
     assert "@pandora" in cmd["args"]["labels"]
+    # ...and #alert, which is what gives the task a source_tag. Without it
+    # resolve_verb returns "unknown" and AgentTaskFlow parks the task unworked.
+    assert "#alert" in cmd["args"]["labels"]
     # Content mentions the outage
     assert "DOWN" in cmd["args"]["content"] or "down" in cmd["args"]["content"].lower()
 
@@ -264,3 +267,124 @@ async def test_alert_rejected_create_does_not_write_dedup_audit(db_pool):
             "SELECT 1 FROM audit_log WHERE action = 'comms_inbound_alert' LIMIT 1"
         )
     assert row is None
+
+
+# ---------------------------------------------------------------------------
+# One-open-task-at-a-time guard + resolve
+#
+# Prod produced 8 identical open tasks over 4 days on the old 12h time window
+# (2026-08-23..27). These pin the replacement: the alert is suppressed while its
+# task is open, and re-arms only once that task is completed.
+# ---------------------------------------------------------------------------
+
+
+async def _seed_alert_settings(db_pool) -> None:
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO settings (key, value) VALUES ('todoist_capture_enabled', 'true'::jsonb)"
+            " ON CONFLICT (key) DO UPDATE SET value = 'true'::jsonb"
+        )
+        await conn.execute(
+            "INSERT INTO settings (key, value) VALUES "
+            "('todoist_managed_project_ids', '{\"inbox\": \"inbox-project-1\"}'::jsonb)"
+            " ON CONFLICT (key) DO UPDATE SET value = "
+            "'{\"inbox\": \"inbox-project-1\"}'::jsonb"
+        )
+        await conn.execute("DELETE FROM audit_log WHERE action = 'comms_inbound_alert'")
+        await conn.execute("DELETE FROM todoist_tasks WHERE id = 'alert-task-1'")
+
+
+async def _seed_prior_alert(db_pool, *, task_ref: str, completed: bool) -> None:
+    """A previous alert whose task exists in todoist_tasks."""
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO todoist_tasks (id, content, labels, is_completed) "
+            "VALUES ($1, 'AEGIS inbound comms is DOWN', "
+            "ARRAY['#alert','@pandora']::text[], $2)",
+            task_ref,
+            completed,
+        )
+        await conn.execute(
+            "INSERT INTO audit_log (actor, action, target_type, target_id, details) "
+            "VALUES ('delivery-watchdog', 'comms_inbound_alert', 'comms', 'polling', $1)",
+            {"task_ref": task_ref},
+        )
+
+
+def _recording_todoist(calls: list):
+    todoist = MagicMock()
+
+    async def fake_commands(cmds):
+        calls.extend(cmds)
+        # item_complete carries no temp_id; only item_add gets a mapping back.
+        temp_id = cmds[0].get("temp_id")
+        mapping = {temp_id: "new-task-9"} if temp_id else {}
+        return {"ok": True, "data": {"temp_id_mapping": mapping}}
+
+    todoist.commands = fake_commands
+    return todoist
+
+
+async def test_alert_suppressed_while_previous_task_still_open(db_pool):
+    """An open alert task suppresses a new one however long the outage lasts."""
+    await _seed_alert_settings(db_pool)
+    await _seed_prior_alert(db_pool, task_ref="alert-task-1", completed=False)
+
+    calls: list = []
+    act = _make_act(db_pool=db_pool, todoist_connector=_recording_todoist(calls))
+    created = await ActivityEnvironment().run(act.alert_comms_inbound_down, 900, None)
+
+    assert created is False
+    assert calls == []
+
+
+async def test_alert_rearms_once_previous_task_completed(db_pool):
+    """Completing the task re-arms the alert — the guard must not be permanent."""
+    await _seed_alert_settings(db_pool)
+    await _seed_prior_alert(db_pool, task_ref="alert-task-1", completed=True)
+
+    calls: list = []
+    act = _make_act(db_pool=db_pool, todoist_connector=_recording_todoist(calls))
+    created = await ActivityEnvironment().run(act.alert_comms_inbound_down, 900, None)
+
+    assert created is True
+    assert len(calls) == 1
+    # The new task's id is recorded, or the next tick has nothing to check.
+    async with db_pool.acquire() as conn:
+        ref = await conn.fetchval(
+            "SELECT details->>'task_ref' FROM audit_log "
+            "WHERE action = 'comms_inbound_alert' ORDER BY created_at DESC LIMIT 1"
+        )
+    assert ref == "new-task-9"
+
+
+async def test_resolve_completes_the_open_alert_task(db_pool):
+    """Recovery completes the task, which is what re-arms the guard."""
+    await _seed_alert_settings(db_pool)
+    await _seed_prior_alert(db_pool, task_ref="alert-task-1", completed=False)
+
+    calls: list = []
+    act = _make_act(db_pool=db_pool, todoist_connector=_recording_todoist(calls))
+    resolved = await ActivityEnvironment().run(act.resolve_comms_inbound_alert)
+
+    assert resolved is True
+    assert calls[0]["type"] == "item_complete"
+    assert calls[0]["args"]["id"] == "alert-task-1"
+    async with db_pool.acquire() as conn:
+        done = await conn.fetchval(
+            "SELECT is_completed FROM todoist_tasks WHERE id = 'alert-task-1'"
+        )
+    assert done is True
+
+
+async def test_resolve_is_a_noop_when_no_task_is_open(db_pool):
+    """No open alert task → nothing to complete, and no Todoist call."""
+    await _seed_alert_settings(db_pool)
+    await _seed_prior_alert(db_pool, task_ref="alert-task-1", completed=True)
+
+    calls: list = []
+    act = _make_act(db_pool=db_pool, todoist_connector=_recording_todoist(calls))
+    resolved = await ActivityEnvironment().run(act.resolve_comms_inbound_alert)
+
+    assert resolved is False
+    assert calls == []

@@ -7,11 +7,12 @@ grace window was never delivered.
 Previously the only way to notice was a manual SQL query; this flow surfaces it
 automatically.
 
-Additionally, each 15-min run checks the comms service's /api/health endpoint
-for the `inbound.healthy` flag.  When it is False the flow creates a Todoist
-Inbox task (via Todoist, not the chat channel — which is the thing that's down)
-so the outage is visible without relying on the broken channel.  A 12-hour dedup
-window prevents task spam during a sustained outage.
+Additionally, each run checks the comms service's /api/health endpoint for the
+`inbound.healthy` flag.  When it is False the flow creates a Todoist Inbox task
+(via Todoist, not the chat channel — which is the thing that's down) so the
+outage is visible without relying on the broken channel.  Exactly one such task
+is open at a time: a sustained outage does not mint a new one, and the task is
+completed here when inbound recovers.
 """
 
 from __future__ import annotations
@@ -72,6 +73,14 @@ class DeliveryWatchdogFlow:
                     retry_policy=NO_RETRY,
                 )
                 result["comms_inbound_alerted"] = bool(alerted)
+            elif health.get("status") == "ok":
+                resolved = await workflow.execute_activity_method(
+                    HomelabActivities.resolve_comms_inbound_alert,
+                    start_to_close_timeout=TIMEOUT_FAST,
+                    retry_policy=NO_RETRY,
+                )
+                if resolved:
+                    result["comms_inbound_resolved"] = True
         except Exception:
             result["comms_inbound_status"] = "check_failed"
 

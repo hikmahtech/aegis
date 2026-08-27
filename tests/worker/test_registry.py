@@ -242,10 +242,14 @@ def test_module_workflows_is_the_unflagged_registry():
         # instead of being read as an already-handled dup. Then +1 activity and
         # NO new flow from #321's `find_dead_llm_purposes` — a third detector on
         # the existing FlowHealthActivities, driven by the existing
-        # FlowHealthWatchdogFlow, so it moves in every row.
-        (True, True, 40, 196),
+        # FlowHealthWatchdogFlow, so it moves in every row. Then +1 activity and
+        # NO new flow from `resolve_comms_inbound_alert` on the existing
+        # HomelabActivities — DeliveryWatchdogFlow closes the inbound-outage task
+        # on recovery, which is what re-arms the one-open-task-at-a-time guard.
+        # HomelabActivities is homelab-flagged, so only the homelab rows move.
+        (True, True, 40, 197),
         (False, False, 32, 167),
-        (True, False, 36, 185),
+        (True, False, 36, 186),
     ],
 )
 def test_real_registration_passes_the_boot_check(homelab, money, flows, activities):
