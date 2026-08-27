@@ -46,6 +46,11 @@ class GmailIngestInput:
     max_per_account: int = 0  # 0 = no limit (fetch all via pagination)
     query: str = "is:unread newer_than:7d"
     aegis_ui_url: str = ""
+    #: Backfill mode: run ONLY the `email_task_links` check over whatever `query`
+    #: matches, skipping the idempotency claim (so already-triaged mail is
+    #: re-examined), classification, routing and the cursor advance. Safe to
+    #: re-run — a rule only ever acts on a task that is still open.
+    link_only: bool = False
 
 
 @workflow.defn(name="GmailIngestFlow")
@@ -59,6 +64,7 @@ class GmailIngestFlow:
             retry_policy=ACT_RETRY,
         )
         total_processed = 0
+        linked_total = 0
         by_category: dict[str, int] = {}
         by_source: dict[str, int] = {}
         per_account: list[dict] = []
@@ -82,6 +88,10 @@ class GmailIngestFlow:
             identifier = ch["identifier"]
             label = (ch.get("config") or {}).get("label", identifier)
             since_cursor = (ch.get("config") or {}).get("last_cursor_ts")
+            if input.link_only:
+                # A backfill reaches BACK past the cursor by definition; clamping
+                # to it would return nothing.
+                since_cursor = None
 
             fetched = await self._fetch_with_reauth(input, label, identifier, since_cursor)
             if fetched is None:
@@ -90,15 +100,18 @@ class GmailIngestFlow:
 
             processed_here = 0
             for msg in fetched.messages:
-                # Idempotency claim
-                new = await workflow.execute_activity(
-                    "ingest_idempotency_claim",
-                    args=["gmail", msg["id"]],
-                    start_to_close_timeout=_ACT_TIMEOUT,
-                    retry_policy=ACT_RETRY,
-                )
-                if not new:
-                    continue
+                # Idempotency claim. Skipped in link_only mode — the whole point
+                # of a backfill is to re-examine mail that has already been
+                # triaged once.
+                if not input.link_only:
+                    new = await workflow.execute_activity(
+                        "ingest_idempotency_claim",
+                        args=["gmail", msg["id"]],
+                        start_to_close_timeout=_ACT_TIMEOUT,
+                        retry_policy=ACT_RETRY,
+                    )
+                    if not new:
+                        continue
 
                 # Fetch full thread body for richer classification context.
                 thread_content = ""
@@ -112,6 +125,13 @@ class GmailIngestFlow:
                         )
                     except Exception as _te:
                         workflow.logger.warning("fetch_thread_skipped: %s", str(_te)[:200])
+
+                if input.link_only:
+                    if (await self._link_to_task(msg, thread_content)).get("applied"):
+                        linked_total += 1
+                    processed_here += 1
+                    total_processed += 1
+                    continue
 
                 try:
                     classification = await workflow.execute_activity(
@@ -139,7 +159,11 @@ class GmailIngestFlow:
                 by_category[category] = by_category.get(category, 0) + 1
                 by_source[source] = by_source.get(source, 0) + 1
 
-                await self._route(input, label, msg, category, classification, thread_content)
+                action = await self._route(
+                    input, label, msg, category, classification, thread_content
+                )
+                if action == "task_linked":
+                    linked_total += 1
 
                 # Tag-based fan-out — additive, orthogonal to category. Currently
                 # only `financial`/`payments` spawn a child (MoneyProcessFlow);
@@ -169,8 +193,10 @@ class GmailIngestFlow:
                 processed_here += 1
                 total_processed += 1
 
-            # Advance cursor for the account (only if fetched returned a valid date)
-            if fetched.latest_internal_date_ms > 0:
+            # Advance cursor for the account (only if fetched returned a valid
+            # date). NOT in link_only mode: a backfill over old mail would drag
+            # the cursor backwards and re-triage everything since.
+            if fetched.latest_internal_date_ms > 0 and not input.link_only:
                 latest_iso = _dt.datetime.fromtimestamp(
                     fetched.latest_internal_date_ms / 1000,
                     tz=_dt.UTC,
@@ -210,7 +236,28 @@ class GmailIngestFlow:
             "by_category": by_category,
             "by_source": by_source,
             "accounts": per_account,
+            "linked": linked_total,
+            "link_only": input.link_only,
         }
+
+    async def _link_to_task(self, msg: dict, thread_content: str) -> dict:
+        """Let an email change an existing Todoist task (`email_task_links`).
+
+        Returns the activity's verdict — `{"applied": bool, "action": ...}`.
+        Fire-and-forget: a failure here must not stop triage.
+        """
+        try:
+            return await workflow.execute_activity(
+                "link_email_to_task",
+                args=[msg, thread_content],
+                start_to_close_timeout=TIMEOUT_STANDARD,
+                retry_policy=NO_RETRY,
+            )
+        except Exception as exc:
+            workflow.logger.warning(
+                "email_task_link_failed msg_id=%s err=%s", msg.get("id", ""), str(exc)[:200]
+            )
+            return {"applied": False, "reason": "activity_failed"}
 
     async def _fetch_with_reauth(
         self,
@@ -325,6 +372,23 @@ class GmailIngestFlow:
                 msg.get("id", ""),
                 str(exc)[:200],
             )
+
+        # Email → EXISTING task (`email_task_links`). Runs before the category
+        # switch and independently of it: "APP-1234 was resolved" is
+        # informational mail that nonetheless closes a task. A `complete` ends
+        # the route — capturing a fresh Inbox task for work that just finished
+        # is exactly the noise this feature exists to remove. `unblock`/`comment`
+        # fall through, because a reply you were waiting on may still need an
+        # action of its own.
+        linked = await self._link_to_task(msg, thread_content)
+        if linked.get("applied") and linked.get("action") == "complete":
+            await workflow.execute_activity(
+                "apply_label",
+                args=[label, msg["id"], "READ"],
+                start_to_close_timeout=_ACT_TIMEOUT,
+                retry_policy=NO_RETRY,
+            )
+            return "task_linked"
 
         # Important emails (action + read) land in the knowledge graph
         # so Raphael's search/ask tools can recall them later. Fire-and-
