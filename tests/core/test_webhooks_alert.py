@@ -280,6 +280,49 @@ async def test_duplicate_fingerprint_real_db(alert_client_real_db):
     assert temporal.start_workflow.await_count == 1
 
 
+async def test_refiring_alert_is_investigated_again(alert_client_real_db):
+    """The SAME fingerprint firing a SECOND time must be investigated again.
+
+    Alertmanager's fingerprint is a hash of the label set, so it is identical
+    on every firing. Claiming on it alone muted the alert until the row aged
+    out of retention (60 days) — a service that broke in July and broke again
+    today was skipped in silence. The claim is scoped by `startsAt` so one
+    firing episode collapses its resends while the next firing gets through.
+    """
+    client, temporal = alert_client_real_db
+
+    def _fire(starts_at):
+        return json.dumps(
+            {
+                "alerts": [
+                    {
+                        "status": "firing",
+                        "labels": {"alertname": "DockerServiceDown", "instance": "noon"},
+                        "annotations": {"summary": "refire test"},
+                        "fingerprint": "am-refire-1",
+                        "startsAt": starts_at,
+                    }
+                ]
+            }
+        ).encode()
+
+    july = _fire("2026-07-14T11:53:01.061Z")
+    today = _fire("2026-08-28T21:27:06.063Z")
+
+    # First episode, and its group_interval resend.
+    assert (await client.post("/api/webhooks/alert", content=july)).json()["started"] == 1
+    assert (await client.post("/api/webhooks/alert", content=july)).json()["skipped"] == 1
+
+    # Same alert, new episode: investigated, not swallowed.
+    assert (await client.post("/api/webhooks/alert", content=today)).json()["started"] == 1
+    assert temporal.start_workflow.await_count == 2
+
+    # Episode-scoped workflow ids, so a re-fire can't collide with a still-
+    # running investigation of the previous one.
+    ids = {c.kwargs["id"] for c in temporal.start_workflow.await_args_list}
+    assert len(ids) == 2, ids
+
+
 # ---------------------------------------------------------------------------
 # Optional X-Alert-Token shared secret (#88)
 #
