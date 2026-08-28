@@ -31,8 +31,36 @@ async def test_record_tool_call():
     pool.execute.assert_called_once()
     sql, *params = pool.execute.call_args[0]
     assert "chat_tool_calls" in sql
-    assert "(agent_id, tool_name, args, result, status, latency_ms)" in sql
-    assert params == ["sebas", "list_tasks", {"status": "pending"}, {"tasks": []}, "success", 42]
+    assert "(agent_id, tool_name, args, result, status, latency_ms, surface)" in sql
+    # `surface` defaults to chat, so the in-process loop needed no change when
+    # the MCP surface started recording into this same table.
+    assert params == [
+        "sebas",
+        "list_tasks",
+        {"status": "pending"},
+        {"tasks": []},
+        "success",
+        42,
+        "chat",
+    ]
+
+
+async def test_record_tool_call_carries_an_explicit_surface():
+    """MCP callers tag their mount so a failing tool is attributable to it."""
+    pool = AsyncMock()
+    await record_tool_call(
+        pool,
+        agent_id="sebas",
+        thread_id=None,
+        tool_name="list_services",
+        tool_args={"context": "swarm"},
+        tool_result={"error": "boom"},
+        status="error",
+        latency_ms=7,
+        surface="mcp_operator",
+    )
+    _sql, *params = pool.execute.call_args[0]
+    assert params[-1] == "mcp_operator"
 
 
 async def test_record_tool_call_never_raises():

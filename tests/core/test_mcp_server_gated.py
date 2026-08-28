@@ -108,6 +108,8 @@ def _answers(payload: dict):
 
 @pytest_asyncio.fixture(loop_scope="function")
 async def agent_row(db_pool):
+    # The MCP surface records tool calls, a FK child of `agents`.
+    await db_pool.execute("DELETE FROM chat_tool_calls WHERE agent_id = $1", AGENT)
     await db_pool.execute("DELETE FROM agents WHERE id = $1", AGENT)
     await db_pool.execute(
         "INSERT INTO agents (id, name, role, system_prompt_path, metadata, active) "
@@ -117,6 +119,8 @@ async def agent_row(db_pool):
     )
     yield AGENT
     await db_pool.execute("DELETE FROM interactions WHERE agent_id = $1", AGENT)
+    # The MCP surface records tool calls, a FK child of `agents`.
+    await db_pool.execute("DELETE FROM chat_tool_calls WHERE agent_id = $1", AGENT)
     await db_pool.execute("DELETE FROM agents WHERE id = $1", AGENT)
 
 

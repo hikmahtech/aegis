@@ -74,24 +74,32 @@ async def record_tool_call(
     tool_result: dict,
     status: str,
     latency_ms: int,
+    surface: str = "chat",
 ) -> None:
-    """Record a chat tool execution to chat_tool_calls table. Never raises.
+    """Record a tool execution to chat_tool_calls table. Never raises.
 
     `thread_id` is accepted by callers for symmetry with chat_history but the
     chat_tool_calls table itself doesn't store it — agent_id + created_at is
     enough to correlate.
+
+    `surface` says WHERE the call came from — `chat`, or one of the MCP mounts
+    (`mcp`, `mcp_gated`, `mcp_operator`). It defaults to `chat` so the in-process
+    loop needs no change, and it exists because a failing tool has to be
+    attributable to the surface that ran it: the same tool behaves differently
+    for a run and for an operator terminal.
     """
     try:
         await pool.execute(
             "INSERT INTO chat_tool_calls "
-            "(agent_id, tool_name, args, result, status, latency_ms) "
-            "VALUES ($1, $2, $3, $4, $5, $6)",
+            "(agent_id, tool_name, args, result, status, latency_ms, surface) "
+            "VALUES ($1, $2, $3, $4, $5, $6, $7)",
             agent_id,
             tool_name,
             tool_args,
             tool_result,
             status,
             latency_ms,
+            surface,
         )
     except Exception as exc:
         logger.warning("record_tool_call_failed", tool=tool_name, error=str(exc))
