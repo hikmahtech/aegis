@@ -339,10 +339,15 @@ async def post_agent_reply(
             message=body.message,
             thread_id=body.thread_id,
             task_id=body.task_id,
+            settings=getattr(request.app.state, "settings", None),
             temporal_client=temporal_client,
+            knowledge_connector=getattr(request.app.state, "knowledge_connector", None),
+            finance_connector=getattr(request.app.state, "finance_connector", None),
+            search_connector=getattr(request.app.state, "search_connector", None),
             remote_script_connector=getattr(
                 request.app.state, "remote_script_connector", None
             ),
+            vercel_connector=getattr(request.app.state, "vercel_connector", None),
             mcp_manager=getattr(request.app.state, "mcp_manager", None),
         )
     except (httpx.HTTPStatusError, httpx.ConnectError, httpx.TimeoutException) as exc:

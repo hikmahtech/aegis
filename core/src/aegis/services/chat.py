@@ -4245,8 +4245,13 @@ async def synthesize_agent_reply(
     message: str,
     thread_id: str,
     task_id: str | None = None,
+    settings: Any = None,
     temporal_client: Any = None,
+    knowledge_connector: Any = None,
+    finance_connector: Any = None,
+    search_connector: Any = None,
     remote_script_connector: Any = None,
+    vercel_connector: Any = None,
     mcp_manager: Any = None,
 ) -> dict:
     """Chat entry point for two surfaces:
@@ -4284,6 +4289,15 @@ async def synthesize_agent_reply(
     # send_message handles auth/personality/tooling/history. Any non-transient
     # failure (agent not found, refusal) lands in the returned dict's "error"
     # field. Transient failures raise.
+    # EVERY dependency send_message accepts is forwarded. The docstring above
+    # promises this surface behaves identically to a web chat, and for months it
+    # did not: `settings` and four connectors were dropped here, so a Slack or
+    # Todoist-comment ask got a half-populated ToolContext. The tools degraded
+    # silently and differently from the admin UI — `aegis_self_diagnose`
+    # returned "settings not threaded into ToolContext", and the knowledge,
+    # money, search and vercel tools ran without their connectors.
+    # `test_agent_reply_forwards_every_dependency` pins the two signatures
+    # together so a newly added dependency cannot be dropped here again.
     resp = await send_message(
         pool=pool,
         llm_client=llm_client,
@@ -4291,8 +4305,13 @@ async def synthesize_agent_reply(
         message=message,
         thread_id=thread_id,
         user_metadata=user_metadata,
+        settings=settings,
         temporal_client=temporal_client,
+        knowledge_connector=knowledge_connector,
+        finance_connector=finance_connector,
+        search_connector=search_connector,
         remote_script_connector=remote_script_connector,
+        vercel_connector=vercel_connector,
         mcp_manager=mcp_manager,
     )
 
