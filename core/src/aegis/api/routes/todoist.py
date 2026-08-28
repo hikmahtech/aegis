@@ -88,6 +88,30 @@ async def put_content_routes_route(request: Request, body: dict[str, Any]) -> di
     return {"match_modes": list(MATCH_MODES), "routes": routes}
 
 
+@router.get("/project-repo-map")
+async def get_project_repo_map_route(request: Request) -> dict[str, Any]:
+    """Todoist project name → GitHub repo, the coding lane's tier-1 resolver.
+
+    Ships empty; each deployment maps its own projects (issue #345)."""
+    from aegis.services.project_repo_map import get_project_repo_map
+
+    return {"project_repo_map": await get_project_repo_map(request.app.state.db_pool)}
+
+
+@router.put("/project-repo-map")
+async def put_project_repo_map_route(request: Request, body: dict[str, Any]) -> dict[str, Any]:
+    """Replace the project→repo mapping. 400 on a bad project name or repo."""
+    from aegis.services.project_repo_map import save_project_repo_map
+
+    try:
+        mapping = await save_project_repo_map(
+            request.app.state.db_pool, body.get("project_repo_map") or {}
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"project_repo_map": mapping}
+
+
 @router.post("/content-routes/preview")
 async def preview_content_route(request: Request, body: dict[str, Any]) -> dict[str, Any]:
     """Given a single {match, value}, return the current Inbox task titles it
