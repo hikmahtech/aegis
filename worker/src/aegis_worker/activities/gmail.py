@@ -323,6 +323,14 @@ _CORRECTION_TO_CATEGORY = {"important": "important_read", "unimportant": "inform
 # "this needed nothing from me" — see `_mine_todoist_dispositions`.
 _DISPOSITION_NOISE_LABELS = ("#trash", "@reference")
 
+# ...but ONLY when a human put the label there. ClarifyFlow classifies AEGIS's
+# own `#email` captures on a 15-min tick and applies exactly these two
+# dispositions itself, so a task it clarified carries AEGIS's opinion, not the
+# user's. Reading those back scored 39 self-authored verdicts as user
+# corrections in prod — 39 of 39 — each one demoting a sender and writing a
+# "User corrected email triage" memory no human ever expressed.
+_CLARIFY_SELF_DISPOSITIONS = ("trash", "reference")
+
 
 def assess_triage_correction(predicted: str, labels: list[str]) -> str | None:
     """Compare AEGIS's prediction to the email's CURRENT Gmail labels,
@@ -954,8 +962,17 @@ class GmailActivities:
         This is the missing negative signal, and it was already sitting in the
         DB: when the user closes an AEGIS-created `#email` task carrying
         `#trash` or `@reference`, they have said "this needed nothing from me"
-        with no extra effort. In prod that is 77 of 188 completed captures —
-        a 41% wrong-to-interrupt rate that nothing read.
+        with no extra effort.
+
+        The signal is only worth anything if a HUMAN closed the task, and the
+        first cut of this did not check. ClarifyFlow applies `@reference` and
+        `#trash` to AEGIS's own `#email` captures every 15 minutes, so the loop
+        was reading its own classification back as the user's verdict: all 39
+        `user_todoist` corrections in prod had an applied clarify decision
+        behind them, 39 of 39, each one demoting a sender and writing a
+        "User corrected email triage" memory nobody expressed. Those rows then
+        dominated sebas's working memory. `_CLARIFY_SELF_DISPOSITIONS` excludes
+        them; what survives is a disposition AEGIS did not author.
 
         Routes through `_triage_upsert` so a Todoist verdict lands with exactly
         the same disagreement arithmetic as any other (conf -= 0.3, flip at
@@ -973,9 +990,19 @@ class GmailActivities:
             WHERE ta.actual IS NULL
               AND t.is_completed
               AND t.labels && $1::text[]
-            LIMIT $2
+              -- The disposition must be the USER's. Keyed on `applied`, not on
+              -- the mere existence of a clarify row: a decision clarify made but
+              -- did not apply left the label to a human, so that stays a signal.
+              AND NOT EXISTS (
+                    SELECT 1 FROM gtd_clarify_log g
+                    WHERE g.todoist_task_id = tci.todoist_task_ref
+                      AND g.applied
+                      AND g.classification = ANY($2::text[])
+              )
+            LIMIT $3
             """,
             list(_DISPOSITION_NOISE_LABELS),
+            list(_CLARIFY_SELF_DISPOSITIONS),
             limit,
         )
         for r in rows:
