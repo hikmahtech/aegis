@@ -4128,6 +4128,32 @@ async def send_message(
 
                 messages.append({"role": "tool", "tool_call_id": _tc_id, "content": tool_result})
                 tool_calls_made.append({"name": _tc_name, "args": args})
+
+                try:
+                    result_dict = json.loads(tool_result)
+                except (json.JSONDecodeError, TypeError):
+                    result_dict = {"raw": tool_result[:500]}
+
+                # An executor reports failure by RETURNING an error envelope, not
+                # by raising: `_exec_infra` turns a non-zero exit into
+                # {"error": ..., "exit_code": ...} so the MODEL can read and relay
+                # it. Only a raise reached the `except` arms above, so every such
+                # failure was stored as status='success' with the error sitting in
+                # `result` — and every "which tools are failing?" query answered
+                # "none". That is precisely how infra tools returning exit 127
+                # stayed invisible from 2026-07-16 to 08-28.
+                #
+                # Detection is deliberately narrow: a JSON object with a truthy
+                # `error`. A tool that returns a prose apology ("the coding host is
+                # not configured") is indistinguishable from a successful answer at
+                # this layer, and guessing from prose would be worse than the gap.
+                if (
+                    tool_status == "success"
+                    and isinstance(result_dict, dict)
+                    and result_dict.get("error")
+                ):
+                    tool_status = "error"
+
                 logger.info(
                     "chat_tool_executed",
                     tool=_tc_name,
@@ -4135,12 +4161,6 @@ async def send_message(
                     status=tool_status,
                     latency_ms=tool_latency,
                 )
-
-                # Record observability
-                try:
-                    result_dict = json.loads(tool_result)
-                except (json.JSONDecodeError, TypeError):
-                    result_dict = {"raw": tool_result[:500]}
                 await record_tool_call(
                     pool,
                     agent_id=agent_id,
