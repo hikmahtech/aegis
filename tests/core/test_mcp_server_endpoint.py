@@ -71,6 +71,8 @@ def _app(settings: Settings, db_pool):
 @pytest_asyncio.fixture(loop_scope="function")
 async def agent_row(db_pool):
     """A real agent whose tool_set is exactly TOOL_SET."""
+    # The MCP surface records tool calls, a FK child of `agents`.
+    await db_pool.execute("DELETE FROM chat_tool_calls WHERE agent_id = $1", AGENT)
     await db_pool.execute("DELETE FROM agents WHERE id = $1", AGENT)
     await db_pool.execute(
         "INSERT INTO agents (id, name, role, system_prompt_path, metadata, active) "
@@ -79,6 +81,8 @@ async def agent_row(db_pool):
         {"tool_set": TOOL_SET},
     )
     yield AGENT
+    # The MCP surface records tool calls, a FK child of `agents`.
+    await db_pool.execute("DELETE FROM chat_tool_calls WHERE agent_id = $1", AGENT)
     await db_pool.execute("DELETE FROM agents WHERE id = $1", AGENT)
 
 
@@ -651,6 +655,8 @@ async def test_approval_gate_needs_no_tool_set_grant(db_pool):
     survives an empty set".
     """
     bare = "zzb9-bare-agent"
+    # The MCP surface records tool calls, a FK child of `agents`.
+    await db_pool.execute("DELETE FROM chat_tool_calls WHERE agent_id = $1", bare)
     await db_pool.execute("DELETE FROM agents WHERE id = $1", bare)
     await db_pool.execute(
         "INSERT INTO agents (id, name, role, system_prompt_path, metadata, active) "
@@ -666,4 +672,6 @@ async def test_approval_gate_needs_no_tool_set_grant(db_pool):
         names = [t["name"] for t in resp.json()["result"]["tools"]]
         assert "approve_tool_use" in names
     finally:
+        # The MCP surface records tool calls, a FK child of `agents`.
+        await db_pool.execute("DELETE FROM chat_tool_calls WHERE agent_id = $1", bare)
         await db_pool.execute("DELETE FROM agents WHERE id = $1", bare)

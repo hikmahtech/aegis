@@ -43,6 +43,8 @@ def _settings() -> Settings:
 @pytest_asyncio.fixture(loop_scope="function")
 async def agents(db_pool):
     for agent in (AGENT, OTHER_AGENT):
+        # The MCP surface records tool calls, a FK child of `agents`.
+        await db_pool.execute("DELETE FROM chat_tool_calls WHERE agent_id = $1", agent)
         await db_pool.execute("DELETE FROM agents WHERE id = $1", agent)
         await db_pool.execute(
             "INSERT INTO agents (id, name, role, system_prompt_path, metadata, active) "
@@ -52,6 +54,8 @@ async def agents(db_pool):
         )
     yield
     for agent in (AGENT, OTHER_AGENT):
+        # The MCP surface records tool calls, a FK child of `agents`.
+        await db_pool.execute("DELETE FROM chat_tool_calls WHERE agent_id = $1", agent)
         await db_pool.execute("DELETE FROM agents WHERE id = $1", agent)
 
 

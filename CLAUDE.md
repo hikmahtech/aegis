@@ -131,6 +131,21 @@ imports them from `aegis.*`; comms keeps its own (no `aegis-core` dep). No-op un
 `LLMClient.{think,chat,embed}` are manually spanned (all three as `llm.call`). Use stdlib
 `logging.getLogger(__name__)`; the JSON formatter is wired into the root logger.
 
+**`chat_tool_calls` covers BOTH tool surfaces, and `status` is not a summary of
+the HTTP result.** The chat loop and the MCP server (`routes/mcp_server.py`) both
+write rows via `observability.py::record_tool_call`; `surface` says which
+(`chat`, `mcp`, `mcp_gated`, `mcp_operator`) and defaults to `chat`. Two traps,
+both of which have already hidden a real outage: an executor reports failure by
+**returning** an error envelope (`{"error": ..., "exit_code": ...}`) rather than
+raising, so both surfaces downgrade a `success` whose payload carries a truthy
+`error` — without that the table called a failed call successful and every
+"which tools are failing?" query answered "none" (that is how infra tools broken
+2026-07-16→08-28 went unnoticed). And a tool that returns a *prose* apology is
+indistinguishable from an answer at this layer, so it is still recorded
+`success`; that limit is deliberate and pinned by tests. `approve_tool_use` is
+never recorded — it is the permission gate, not a tool call, and its outcome is
+an `interactions` row.
+
 ## Deployment
 
 This is a personal project built to be **forked and configured for your own life**. The

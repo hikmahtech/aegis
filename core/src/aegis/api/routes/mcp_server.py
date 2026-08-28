@@ -77,6 +77,7 @@ from aegis.api.auth import security, verify_auth
 from aegis.api.deps import get_settings
 from aegis.config import Settings
 from aegis.mcp_manager import _PROTOCOL_VERSION as MCP_PROTOCOL_VERSION
+from aegis.observability import record_tool_call
 from aegis.services.agents import get_agent
 from aegis.services.api_key import resolve_api_key
 from aegis.services.chat import (
@@ -988,11 +989,16 @@ async def _handle_tools_call(
     params: Any,
     tools: list[dict],
     gated: bool = False,
+    *,
+    operator: bool = False,
 ) -> JSONResponse:
     """Validate, authorize and run one tool call.
 
     `gated` is the /gated endpoint's enforcement: a tool outside
     `_READ_ONLY_TOOLS` needs an operator approval before it executes here.
+
+    `operator` only selects the recorded `surface` — the operator mount's own
+    authorization happened in `_serve` before this was reached.
     """
     if not isinstance(params, dict):
         return _rpc_error(request_id, _INVALID_PARAMS, "'params' must be an object")
@@ -1005,13 +1011,44 @@ async def _handle_tools_call(
     if not isinstance(args, dict):
         return _rpc_error(request_id, _INVALID_PARAMS, "'params.arguments' must be an object")
 
+    surface = "mcp_operator" if operator else ("mcp_gated" if gated else "mcp")
+    started = time.monotonic()
+
+    async def _record(status: str, result: dict) -> None:
+        """Write this call's chat_tool_calls row. Never raises (record_tool_call
+        swallows), so observability can never fail a tool call.
+
+        Every terminal path below records one. Until now the MCP surface wrote
+        NOTHING to that table, so every coding run's and every operator
+        terminal's tool use was invisible to the same queries that already
+        covered chat — including "which tools are failing?".
+
+        The status strings are the ones this handler already logs, so the row
+        and the log line always agree; `surface` distinguishes the MCP-native
+        outcomes (`not_granted`, `gate_blocked`) from chat's vocabulary.
+        """
+        await record_tool_call(
+            request.app.state.db_pool,
+            agent_id=agent_id,
+            thread_id=None,
+            tool_name=name,
+            tool_args=args,
+            tool_result=result,
+            status=status,
+            latency_ms=int((time.monotonic() - started) * 1000),
+            surface=surface,
+        )
+
     # The permission gate is served to every agent and has no CHAT_TOOLS entry,
-    # so it is dispatched before the tool-set check rather than through it.
+    # so it is dispatched before the tool-set check rather than through it. It is
+    # deliberately NOT recorded: it is the gate mechanism, not a tool the agent
+    # called, and its outcome is already an `interactions` row.
     if name == APPROVAL_TOOL_NAME:
         return await _handle_approve_tool_use(request, agent_id, request_id, args)
 
     if name not in {t["function"]["name"] for t in tools}:
         logger.info("mcp_server_tool_call", agent_id=agent_id, tool=name, status="not_granted")
+        await _record("not_granted", {"error": f"tool not in agent '{agent_id}' tool set"})
         return _rpc_error(
             request_id,
             _INVALID_PARAMS,
@@ -1034,6 +1071,7 @@ async def _handle_tools_call(
             status="invalid_args",
             arg_keys=arg_keys,
         )
+        await _record("invalid_args", {"error": message})
         # Deliberately a tool result, not a JSON-RPC error: the schema hint is
         # what lets the calling model fix its own arguments and retry.
         return _tool_result(request_id, message, is_error=True)
@@ -1051,6 +1089,7 @@ async def _handle_tools_call(
                 status="gate_blocked",
                 arg_keys=arg_keys,
             )
+            await _record("gate_blocked", {"error": decision.message})
             return _tool_result(request_id, decision.message, is_error=True)
 
     pool = request.app.state.db_pool
@@ -1068,6 +1107,7 @@ async def _handle_tools_call(
             status="timeout",
             arg_keys=arg_keys,
         )
+        await _record("timeout", {"error": f"timed out after {timeout}s"})
         return _tool_result(
             request_id, f"Tool '{name}' timed out after {timeout}s", is_error=True
         )
@@ -1080,6 +1120,7 @@ async def _handle_tools_call(
             error=type(exc).__name__,
             arg_keys=arg_keys,
         )
+        await _record("error", {"error": f"{type(exc).__name__}: {str(exc)[:_ERROR_CHARS]}"})
         return _tool_result(
             request_id,
             f"Tool '{name}' failed: {type(exc).__name__}: {str(exc)[:_ERROR_CHARS]}",
@@ -1087,14 +1128,30 @@ async def _handle_tools_call(
         )
 
     text = _truncate_result(str(result), max_bytes=_TOOL_RESULT_MAX_BYTES)
+
+    # Same rule the chat loop applies: an executor reports failure by RETURNING
+    # an error envelope, not by raising, so a `success` whose payload carries a
+    # truthy `error` is really a failure. Without this the MCP surface would
+    # reproduce the exact mislabelling that hid broken infra tools for six weeks.
+    try:
+        result_dict = json.loads(text)
+    except (json.JSONDecodeError, TypeError):
+        result_dict = {"raw": text[:500]}
+    status = (
+        "error"
+        if isinstance(result_dict, dict) and result_dict.get("error")
+        else "success"
+    )
+
     logger.info(
         "mcp_server_tool_call",
         agent_id=agent_id,
         tool=name,
-        status="success",
+        status=status,
         arg_keys=arg_keys,
         result_bytes=len(text.encode()),
     )
+    await _record(status, result_dict)
     return _tool_result(request_id, text, is_error=False)
 
 
@@ -1208,7 +1265,14 @@ async def _serve(
 
     if method == "tools/call":
         return await _handle_tools_call(
-            request, agent_id, settings, request_id, message.get("params"), tools, gated
+            request,
+            agent_id,
+            settings,
+            request_id,
+            message.get("params"),
+            tools,
+            gated,
+            operator=operator,
         )
 
     return _rpc_error(request_id, _METHOD_NOT_FOUND, f"Unknown method '{method}'")
