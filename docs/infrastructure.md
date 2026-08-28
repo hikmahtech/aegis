@@ -464,6 +464,41 @@ back to the shared API key, which is logged as
 `mcp_mount_token_unavailable_using_shared_key` — the weaker posture, kept only
 so such a deployment is not left with toolless runs.
 
+### Driving runs from your own terminal (the operator mount)
+
+`POST /api/mcp-server/{agent_id}/operator` is the mount for a human's session
+rather than a run's. Same agent, same tool set, plus the tools a run mount
+withholds — so you can start, inspect and stop coding work from whatever editor
+session you are already in.
+
+Add it to your CLI once:
+
+```bash
+claude mcp add --transport http aegis-operator \
+  https://<your-core-url>/api/mcp-server/<agent>/operator \
+  --header "X-API-Key: <your AEGIS API key>"
+```
+
+Then, in any session: *"what's running on the coding host?"* (`list_coding_sessions`),
+*"have sebas look at this Todoist task"* (`dispatch_agent_run`), *"stop run
+a1b2c3"* (`stop_agent_run`).
+
+**This endpoint requires a real API key even when `AEGIS_AUTH_DISABLED=true`**,
+and refuses a run's mount token outright. That asymmetry is the design: the
+credential it needs is never written to the coding host, so a run cannot escalate
+from "use my tools" to "start and stop runs" however much of its own filesystem
+it reads. `stop_agent_run` is withheld from run mounts for the same reason — a
+run able to stop runs could kill a sibling, or the run you are waiting on.
+
+Passing `todoist_task_id` to `dispatch_agent_run` ties the run to that task with
+a deterministic workflow id, so asking twice cannot start a second session on the
+same work.
+
+Stopping kills the run's tmux window. The flow notices on its next poll, reports
+the run as failed, and cleans up the worktree — so there is no half-stopped
+state. "No live tmux window" is a normal answer: the run may have finished, or
+have been launched detached past the tmux window cap.
+
 ### Verify the coding host
 
 Drive the live connector from inside the running worker — it uses the same

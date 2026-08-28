@@ -1148,8 +1148,35 @@ CHAT_TOOLS = [
                         "maximum": 240,
                         "description": "Optional watch window in minutes (5-240). Omit for the default (30, or 120 for a gated run, which spends most of its time waiting for approvals). A timeout never kills the run — it only stops watching it.",
                     },
+                    "todoist_task_id": {
+                        "type": "string",
+                        "description": "Optional Todoist task this run is working. Ties the run to that task so asking twice cannot start a second session on the same work.",
+                    },
                 },
                 "required": ["prompt"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "stop_agent_run",
+            "description": (
+                "Stop a running background agent run on the coding host by killing its "
+                "session. Use it when a run is doing the wrong thing, duplicates work you "
+                "are already doing yourself, or is no longer wanted. The run's workspace is "
+                "cleaned up automatically afterwards. Stopping is not reversible — the work "
+                "in progress is lost — so prefer letting a nearly-finished run complete."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "run_id": {
+                        "type": "string",
+                        "description": "The run id, as given in the dispatch confirmation or shown by list_coding_sessions.",
+                    },
+                },
+                "required": ["run_id"],
             },
         },
     },
@@ -1679,6 +1706,8 @@ async def _exec_dispatch_agent_run(pool: asyncpg.Pool, args: dict, ctx: ToolCont
     spends most of it waiting on humans (each card holds up to 9 min), so an
     unset value defaults to `_GATED_TIMEOUT_MINUTES` rather than the flow's 30.
     """
+    from temporalio.exceptions import WorkflowAlreadyStartedError
+
     if not ctx.temporal_client:
         return "Can't dispatch: Temporal client not available."
     prompt = (args.get("prompt") or "").strip()
@@ -1689,7 +1718,12 @@ async def _exec_dispatch_agent_run(pool: asyncpg.Pool, args: dict, ctx: ToolCont
         return f"Can't dispatch: unknown engine '{engine}' — use 'claude' or 'kimi', or omit it."
     agent_id = ctx.agent_id or "sebas"
     gated = bool(args.get("gated"))
-    workflow_id = f"agent-run-{uuid4().hex[:8]}"
+    # A run tied to a Todoist task gets a DETERMINISTIC workflow id, so asking
+    # twice for the same task is refused by Temporal instead of starting a
+    # second CLI session on the same work. The untied case keeps a random id:
+    # two "look into X" asks are two legitimate runs.
+    task_id = (args.get("todoist_task_id") or "").strip()
+    workflow_id = f"agent-run-task-{task_id}" if task_id else f"agent-run-{uuid4().hex[:8]}"
     try:
         await ctx.temporal_client.start_workflow(
             "AgentRunFlow",
@@ -1705,6 +1739,11 @@ async def _exec_dispatch_agent_run(pool: asyncpg.Pool, args: dict, ctx: ToolCont
             id=workflow_id,
             task_queue="aegis-main",
         )
+    except WorkflowAlreadyStartedError:
+        return (
+            f"A run for that task is already in flight ({workflow_id}). "
+            "Stop it with stop_agent_run if you want to start over."
+        )
     except Exception as exc:  # noqa: BLE001 — a dispatch failure is a chat answer, not a crash
         logger.warning("dispatch_agent_run_failed", workflow_id=workflow_id, error=str(exc)[:200])
         return f"Couldn't dispatch the agent run: {str(exc)[:200]}"
@@ -1713,6 +1752,39 @@ async def _exec_dispatch_agent_run(pool: asyncpg.Pool, args: dict, ctx: ToolCont
         f"Dispatched agent run {workflow_id} ({engine or 'auto'}) — "
         "results will land in this channel."
     )
+
+
+async def _exec_stop_agent_run(pool: asyncpg.Pool, args: dict, ctx: ToolContext) -> str:
+    """Kill a coding run's tmux window on the coding host.
+
+    The flow is not signalled: its next poll sees the process gone, reports the
+    run as failed and removes the worktree. So stopping is one action here, not
+    a two-sided handshake that could half-complete.
+
+    "Not found" is reported plainly rather than as an error — the run may have
+    already finished, or have been launched detached with no window at all.
+    """
+    run_id = (args.get("run_id") or "").strip()
+    if not run_id:
+        return "Can't stop: run_id is required (the id in the dispatch message, or from list_coding_sessions)."
+    connector = getattr(ctx, "remote_script_connector", None)
+    if connector is None:
+        return "The coding host is not configured."
+    result = await connector.stop_coding_run(run_id)
+    if result.get("stopped"):
+        return (
+            f"Stopped run {run_id} (tmux window `{result.get('window')}`). "
+            "Its worktree is cleaned up when the flow next polls."
+        )
+    reason = result.get("reason") or "unknown"
+    if reason == "not_found":
+        return (
+            f"No live tmux window for run {run_id} — it has probably finished already, "
+            "or was launched detached."
+        )
+    if reason == "invalid_run_id":
+        return f"'{run_id}' is not a valid run id."
+    return f"Couldn't stop run {run_id}: {reason}."
 
 
 async def _exec_create_schedule(pool: asyncpg.Pool, args: dict, ctx: ToolContext) -> str:
@@ -2982,6 +3054,7 @@ TOOL_EXECUTORS: dict[str, Any] = {
     "query_activities": _exec_query_activities,
     "trigger_workflow": _exec_trigger_workflow,
     "dispatch_agent_run": _exec_dispatch_agent_run,
+    "stop_agent_run": _exec_stop_agent_run,
     "create_schedule": _exec_create_schedule,
     "get_quote": _exec_get_quote,
     "get_market_overview": _exec_get_market_overview,

@@ -1168,10 +1168,33 @@
             "minimum": 5,
             "maximum": 240,
             "description": "Optional watch window in minutes (5-240). Omit for the default (30, or 120 for a gated run, which spends most of its time waiting for approvals). A timeout never kills the run \u2014 it only stops watching it."
+          },
+          "todoist_task_id": {
+            "type": "string",
+            "description": "Optional Todoist task this run is working. Ties the run to that task so asking twice cannot start a second session on the same work."
           }
         },
         "required": [
           "prompt"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "stop_agent_run",
+      "description": "Stop a running background agent run on the coding host by killing its session. Use it when a run is doing the wrong thing, duplicates work you are already doing yourself, or is no longer wanted. The run's workspace is cleaned up automatically afterwards. Stopping is not reversible \u2014 the work in progress is lost \u2014 so prefer letting a nearly-finished run complete.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "run_id": {
+            "type": "string",
+            "description": "The run id, as given in the dispatch confirmation or shown by list_coding_sessions."
+          }
+        },
+        "required": [
+          "run_id"
         ]
       }
     }

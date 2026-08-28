@@ -61,6 +61,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import secrets
 import time
 from dataclasses import dataclass
 from typing import Any
@@ -77,6 +78,7 @@ from aegis.api.deps import get_settings
 from aegis.config import Settings
 from aegis.mcp_manager import _PROTOCOL_VERSION as MCP_PROTOCOL_VERSION
 from aegis.services.agents import get_agent
+from aegis.services.api_key import resolve_api_key
 from aegis.services.chat import (
     _MCP_TOOL_NAME,
     _TOOL_TIMEOUT_OVERRIDES,
@@ -132,8 +134,20 @@ _UNSERVED_TOOLS = frozenset(
         "dispatch_agent_run",
         "aegis_self_diagnose",
         "investigate_resource",
+        # Not a recursion risk — the opposite. A run that can stop runs can kill
+        # its siblings, or the very run a human is waiting on. Stopping is an
+        # operator action, so it lives only on the operator mount.
+        "stop_agent_run",
     }
 )
+
+# What the OPERATOR mount withholds. The run-spawning tools come back, because
+# the recursion this guards against is run→run and a human terminal is that
+# recursion's base case — and the operator mount cannot be opened with a
+# credential that exists on the coding host. `call_mcp_tool` stays out: it is
+# the MCP client passthrough, and the confused-deputy problem it creates does
+# not depend on who opened the door.
+_OPERATOR_UNSERVED_TOOLS = frozenset({_MCP_TOOL_NAME})
 
 # ── the permission gate (gated agent runs) ─────────────────────────────────
 #
@@ -819,6 +833,48 @@ async def _verify_mcp_auth(
     return await verify_auth(request, credentials, settings)
 
 
+async def _require_operator_key(request: Request, settings: Settings) -> None:
+    """The operator mount demands a REAL API key. `auth_disabled` does not open it.
+
+    Every other route here can be reached under `auth_disabled=true`, the
+    documented posture for a proxy-fronted deployment. This one must not be.
+    The URL a run mounts is a LAN/overlay address that bypasses that proxy by
+    design, and this endpoint serves the tools that START and STOP coding runs —
+    so honouring the bypass would hand run control to anything that can open a
+    TCP connection to Core.
+
+    A mount token is refused explicitly rather than merely failing to match: a
+    run holds one, can read its own config file, and must never be able to
+    escalate from "use my tools" to "dispatch and kill runs". That credential
+    class is deliberately never materialised on the coding host.
+    """
+    presented = request.headers.get("X-API-Key") or ""
+    if not presented:
+        raise HTTPException(
+            status_code=401,
+            detail="The operator mount requires an X-API-Key. It is not covered by AEGIS_AUTH_DISABLED.",
+        )
+    if read_mount_token(presented, settings.secret_key or "") is not None:
+        logger.warning("mcp_operator_mount_token_refused")
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                "A run mount token cannot open the operator mount. "
+                "Present the AEGIS API key instead."
+            ),
+        )
+    candidates = []
+    if settings.api_key:
+        candidates.append(settings.api_key)
+    pool = getattr(request.app.state, "db_pool", None)
+    if pool is not None:
+        db_key = await resolve_api_key(pool, settings)
+        if db_key:
+            candidates.append(db_key)
+    if not any(secrets.compare_digest(presented, k) for k in candidates):
+        raise HTTPException(status_code=401, detail="Invalid API key for the operator mount.")
+
+
 router = APIRouter(
     prefix="/api/mcp-server",
     dependencies=[Depends(_verify_mcp_auth), Depends(_require_enabled)],
@@ -855,7 +911,7 @@ async def _load_agent(request: Request, agent_id: str) -> dict:
     return agent
 
 
-def _served_tools(agent_id: str, metadata: dict | None) -> list[dict]:
+def _served_tools(agent_id: str, metadata: dict | None, *, operator: bool = False) -> list[dict]:
     """The agent's chat tools, minus ``_UNSERVED_TOOLS``.
 
     ``_get_agent_tools`` is the single source of truth for what an agent may
@@ -865,11 +921,22 @@ def _served_tools(agent_id: str, metadata: dict | None) -> list[dict]:
     endpoint calls it once per request and hands the result to both
     ``tools/list`` and ``tools/call``, so an excluded tool is neither listed
     nor callable.
+
+    ``operator=True`` keeps the run-spawning tools, because the exclusion is an
+    ACCIDENTAL-RECURSION guard, not a security boundary: it exists so a run
+    cannot spawn a run that spawns a run, there being no depth counter anywhere
+    in that loop. A human at a terminal is the base case of that recursion, and
+    the operator mount is unreachable with a run's credential
+    (``_require_operator_key``), so nothing on the coding host can take this
+    path. ``call_mcp_tool`` stays withheld regardless — it is the MCP *client*
+    passthrough, and serving it would make AEGIS a confused deputy against a
+    third-party server whichever credential opened the door.
     """
+    excluded = _OPERATOR_UNSERVED_TOOLS if operator else _UNSERVED_TOOLS
     return [
         tool
         for tool in _get_agent_tools(agent_id, metadata=metadata)
-        if tool["function"]["name"] not in _UNSERVED_TOOLS
+        if tool["function"]["name"] not in excluded
     ]
 
 
@@ -1070,12 +1137,23 @@ def _enforce_mount_token_binding(
     )
 
 
-async def _serve(agent_id: str, request: Request, settings: Settings, *, gated: bool) -> Response:
+async def _serve(
+    agent_id: str,
+    request: Request,
+    settings: Settings,
+    *,
+    gated: bool,
+    operator: bool = False,
+) -> Response:
     """One JSON-RPC message. `gated` decides whether a mutating tool needs an
-    operator approval first; nothing else differs between the two endpoints."""
-    _enforce_mount_token_binding(agent_id, request, settings, gated=gated)
+    operator approval first; `operator` widens the served set to include the
+    run-spawning tools. Nothing else differs between the three endpoints."""
+    if operator:
+        await _require_operator_key(request, settings)
+    else:
+        _enforce_mount_token_binding(agent_id, request, settings, gated=gated)
     agent = await _load_agent(request, agent_id)
-    tools = _served_tools(agent_id, dict(agent.get("metadata") or {}))
+    tools = _served_tools(agent_id, dict(agent.get("metadata") or {}), operator=operator)
 
     raw = await request.body()
     try:
@@ -1164,6 +1242,26 @@ async def mcp_server_gated_endpoint(
     permission routing was measured not to gate MCP tools at all (#294).
     """
     return await _serve(agent_id, request, settings, gated=True)
+
+
+@router.post("/{agent_id}/operator")
+async def mcp_server_operator_endpoint(
+    agent_id: str,
+    request: Request,
+    settings: Settings = Depends(get_settings),
+) -> Response:
+    """The mount for a HUMAN's terminal, not for a run.
+
+    Same server and the same agent's tool set, plus the run-spawning tools a run
+    mount withholds — so you can ask AEGIS to start, inspect or stop coding work
+    from whatever session you are already sitting in.
+
+    It requires a real API key even under `auth_disabled`, and explicitly refuses
+    a run's mount token. That asymmetry is the whole design: the credential this
+    endpoint needs is never written to the coding host, so a run cannot reach it
+    however much of its own filesystem it reads.
+    """
+    return await _serve(agent_id, request, settings, gated=False, operator=True)
 
 
 @router.get("/{agent_id}")
