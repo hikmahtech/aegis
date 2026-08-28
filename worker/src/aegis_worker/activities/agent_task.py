@@ -15,6 +15,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from aegis.connectors.coding_sessions import busy_human_sessions
+from aegis.services.project_repo_map import get_project_repo_map, lookup
 from temporalio import activity
 
 # Assignee labels this flow will act on. @me is deliberately absent: a task the
@@ -103,14 +104,12 @@ def extract_merchant(title: str) -> str:
     return ""
 
 
-# Todoist project name → GitHub repo. The projects already mirror repos, which
-# is a far stronger signal than guessing from a task title.
-PROJECT_REPO_MAP = {
-    "bcp": "Stockopedia/bcp",
-    "aegis": "hikmahtech/aegis",
-    "home infra": "hikmahtech/homelab-gitops",
-    "drwho": "hikmahtech/drwhome",
-}
+# Todoist project name → GitHub repo now lives in the `project_repo_map`
+# settings row (`core/src/aegis/services/project_repo_map.py`), edited at
+# GET/PUT /api/admin/todoist/project-repo-map. It used to be a constant here,
+# which shipped one operator's Todoist layout in a public repo and could not be
+# changed without editing code (issue #345). Ships EMPTY: a deployment with no
+# mapping simply falls through to the resolver's later tiers.
 
 # Tier 2 (title/description match via AlertActivities.resolve_alert_resource)
 # auto-accepts only at or above this bar. resolve_alert_resource's OWN "llm"
@@ -567,7 +566,7 @@ class AgentTaskActivities:
     async def resolve_task_repo(self, task: dict) -> dict:
         """Resolve a coding task to a repo. Never guesses.
 
-        Tier 1: Todoist project name -> PROJECT_REPO_MAP — the strongest
+        Tier 1: Todoist project name -> the `project_repo_map` setting — the strongest
         signal, since a project already mirrors a repo.
 
         Tier 2 (only when tier 1 misses): reuse
@@ -592,7 +591,8 @@ class AgentTaskActivities:
             name = await self.db_pool.fetchval(
                 "SELECT name FROM todoist_projects WHERE id = $1", project_id
             )
-        github_repo = PROJECT_REPO_MAP.get(str(name).strip().lower(), "") if name else ""
+        mapping = await get_project_repo_map(self.db_pool) if self.db_pool is not None else {}
+        github_repo = lookup(name, mapping)
         if github_repo:
             # repo_path is the workspace-relative checkout path start_kimi_run needs.
             # The JSONB key is `path`, NOT `resource_path`. `resource_path` is only an

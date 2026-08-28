@@ -23,9 +23,19 @@ async def _seed(db_pool):
         "('test-repo-bcp','repository','Stockopedia/bcp',"
         " '{\"github_repo\": \"Stockopedia/bcp\", \"path\": \"stockopedia/bcp\"}'::jsonb)"
     )
+    # Tier 1's mapping is DB config, not a Python constant (issue #345), so the
+    # fixture has to seed it — which also means these tests now exercise the
+    # real settings read rather than a hardcoded dict.
+    await db_pool.execute(
+        "INSERT INTO settings (key, value, updated_at) VALUES ($1, $2, NOW()) "
+        "ON CONFLICT (key) DO UPDATE SET value = $2",
+        "project_repo_map",
+        {"bcp": "Stockopedia/bcp"},
+    )
     yield
     await db_pool.execute("DELETE FROM todoist_projects WHERE id LIKE 'pr-%'")
     await db_pool.execute("DELETE FROM resources WHERE slug LIKE 'test-repo-%'")
+    await db_pool.execute("DELETE FROM settings WHERE key = 'project_repo_map'")
 
 
 async def test_project_name_resolves_to_repo(db_pool, _seed):
