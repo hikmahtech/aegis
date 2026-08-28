@@ -1423,6 +1423,72 @@ class RemoteScriptConnector:
             )
         return result["exit_code"] != 1
 
+    async def stop_coding_run(self, run_id: str, host: str = "") -> dict:
+        """Kill the tmux window of a coding run. Returns a result envelope.
+
+        The operator-facing counterpart to `start_kimi_run`. Until now stopping a
+        run meant knowing the window name and running `tmux kill-window` by hand;
+        the flow observes the death on its next poll, reports `failed`, and
+        cleans the worktree, so the machinery already existed — only the handle
+        was missing.
+
+        Matches on the run id SUFFIX of the window name
+        (`{engine}-{repo}-{run_id}`, `_launch_in_tmux`) rather than
+        reconstructing the whole name, because the repo segment is sanitised on
+        the way in and is not recoverable from the run id alone.
+
+        `stopped: False` with `reason="not_found"` is a normal outcome, not an
+        error: the run may have finished already, or been launched detached with
+        no window at all (what happens past the tmux window cap).
+
+        Never raises. A run id that is not plain hex is refused outright — the
+        value is spliced into a remote shell command.
+        """
+        run_id = (run_id or "").strip()
+        if not run_id or not re.fullmatch(r"[A-Za-z0-9_-]{4,64}", run_id):
+            return {"stopped": False, "reason": "invalid_run_id", "window": ""}
+        await self._refresh_config()
+        target_host = host or self._host
+        sess = self._tmux_session
+        listed = await self._exec(
+            target_host,
+            f"tmux list-windows -t {shlex.quote(sess)} -F '#{{window_id}}:#{{window_name}}' 2>/dev/null",
+            timeout=15,
+        )
+        if listed["status"] != "succeeded":
+            logger.warning(
+                "coding_run_stop_list_failed", run_id=run_id, error=listed["stderr"][:200]
+            )
+            return {"stopped": False, "reason": "tmux_unreachable", "window": ""}
+
+        window_id = ""
+        window_name = ""
+        for line in listed["stdout"].splitlines():
+            wid, _, name = line.strip().partition(":")
+            if not wid or not name.startswith(_AGENT_WINDOW_PREFIXES):
+                continue
+            if name.endswith(f"-{run_id}"):
+                window_id, window_name = wid, name
+                break
+        if not window_id:
+            return {"stopped": False, "reason": "not_found", "window": ""}
+
+        killed = await self._exec(
+            target_host,
+            f"tmux kill-window -t {shlex.quote(window_id)}",
+            timeout=15,
+        )
+        if killed["status"] != "succeeded":
+            logger.warning(
+                "coding_run_stop_failed",
+                run_id=run_id,
+                window=window_name,
+                error=killed["stderr"][:200],
+            )
+            return {"stopped": False, "reason": "kill_failed", "window": window_name}
+        logger.info("coding_run_stopped", run_id=run_id, window=window_name, host=target_host)
+        return {"stopped": True, "reason": "", "window": window_name}
+
     async def remove_worktree(self, worktree_path: str, host: str = "") -> None:
         """Best-effort cleanup of a per-run git worktree created by start_kimi_run.
 

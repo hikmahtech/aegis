@@ -72,6 +72,7 @@ EXPECTED_TOOL_NAMES = [
     "run_infra_script",
     "search_knowledge",
     "social_timeline",
+    "stop_agent_run",
     "sync_argocd_app",
     "system_status",
     "track_topic",

@@ -38,6 +38,7 @@ TOOL_SET = [
     "dispatch_agent_run",
     "aegis_self_diagnose",
     "investigate_resource",
+    "stop_agent_run",
 ]
 
 
@@ -361,15 +362,20 @@ async def test_unserved_tools_cannot_be_invoked_even_though_they_are_granted(cli
     assert "result" not in body  # nothing ran
 
 
-async def test_the_unserved_set_is_exactly_these_four(client):
+async def test_the_unserved_set_is_exactly_these_five(client):
     """A closed list, asserted by name: adding a run-spawning tool to an agent's
     `tool_set` without adding it here silently re-opens the recursion door, and
-    the only way to notice is a test that pins the membership."""
+    the only way to notice is a test that pins the membership.
+
+    `stop_agent_run` joined for a different reason than the rest — it does not
+    spawn anything, it KILLS. A run able to call it could take out a sibling run
+    or the very run a human is waiting on, so it is operator-only too."""
     assert set(mcp_server_mod._UNSERVED_TOOLS) == {
         "call_mcp_tool",
         "dispatch_agent_run",
         "aegis_self_diagnose",
         "investigate_resource",
+        "stop_agent_run",
     }
     # Every one of them is a real chat tool with a real executor — a typo here
     # would exclude nothing at all.
