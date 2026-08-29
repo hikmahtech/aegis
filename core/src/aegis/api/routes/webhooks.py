@@ -657,7 +657,25 @@ async def alert_webhook(
             skipped += 1
             continue
 
-        # Idempotency claim
+        # Idempotency claim, scoped to ONE firing episode.
+        #
+        # Alertmanager's fingerprint is a hash of the label set, so it is
+        # byte-identical every time the same alert fires. Claiming on the bare
+        # fingerprint therefore mutes that alert until the row ages out of
+        # retention — 60 days (worker cleanup.py) — and the resolved branch
+        # above never releases it. A service that broke in July and broke again
+        # today went uninvestigated, silently: `skipped`, no workflow, no task,
+        # no Slack. Releasing on resolve would not be enough either, since it
+        # depends on that one webhook being delivered while we are up.
+        #
+        # `startsAt` bounds the claim instead. It is stable for the life of one
+        # firing (Prometheus restores `activeAt` across restarts), so
+        # `repeat_interval` resends still collapse to a single claim — but the
+        # NEXT firing carries a new `startsAt` and is investigated. Absent or
+        # blank, fall back to the fingerprint alone: dedup that is too strong
+        # beats minting a workflow per resend.
+        episode = str(a.get("startsAt") or "")
+        claim_id = f"{fingerprint}:{episode}" if episode else fingerprint
         async with pool.acquire() as conn:
             claimed = await conn.fetchval(
                 """
@@ -666,12 +684,16 @@ async def alert_webhook(
                 ON CONFLICT DO NOTHING
                 RETURNING external_id
                 """,
-                fingerprint,
+                claim_id,
             )
         if claimed is None:
             skipped += 1
             continue
 
+        # NB: the alert keeps the BARE fingerprint. That is what
+        # close_task_for_resolved_alert matches on when the resolve arrives,
+        # and it is what the alert_tasks rows are keyed by — only the claim and
+        # the workflow id are episode-scoped.
         alert = {
             "source": "alertmanager",
             "title": annotations.get("summary") or alertname or "Alert",
@@ -686,7 +708,7 @@ async def alert_webhook(
         await temporal.start_workflow(
             "AlertInvestigationFlow",
             alert,
-            id=f"alertmanager-{fingerprint}",
+            id=f"alertmanager-{claim_id}",
             task_queue="aegis-main",
         )
         started += 1
