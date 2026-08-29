@@ -331,6 +331,14 @@ _DISPOSITION_NOISE_LABELS = ("#trash", "@reference")
 # "User corrected email triage" memory no human ever expressed.
 _CLARIFY_SELF_DISPOSITIONS = ("trash", "reference")
 
+# How much one disagreement costs a cached sender's confidence. A human verdict
+# uses the full step, which flips a 0.6-confidence sender on the first hit. A
+# clarify disagreement is a SECOND MACHINE OPINION, not evidence about what the
+# user wanted, so it costs half and needs corroboration before it can flip
+# anything. Same arithmetic, different weight — see `_triage_upsert`.
+_DISAGREEMENT_STEP = 0.3
+_MACHINE_DISAGREEMENT_STEP = 0.15
+
 
 def assess_triage_correction(predicted: str, labels: list[str]) -> str | None:
     """Compare AEGIS's prediction to the email's CURRENT Gmail labels,
@@ -796,6 +804,7 @@ class GmailActivities:
             "memories_written": 0,
             "senders_relearned": 0,
             "disposition_corrected": 0,
+            "machine_corrected": 0,
         }
         if not self.db_pool:
             return empty
@@ -938,6 +947,7 @@ class GmailActivities:
                 "checked": checked,
                 "corrected": corrected,
                 "confirmed": confirmed,
+                "machine_corrected": mined["machine_corrected"],
                 "memories_written": memories_written + mined["memories_written"],
                 "senders_relearned": senders_relearned + mined["senders_relearned"],
                 "disposition_corrected": mined["corrected"],
@@ -964,24 +974,51 @@ class GmailActivities:
         `#trash` or `@reference`, they have said "this needed nothing from me"
         with no extra effort.
 
-        The signal is only worth anything if a HUMAN closed the task, and the
-        first cut of this did not check. ClarifyFlow applies `@reference` and
-        `#trash` to AEGIS's own `#email` captures every 15 minutes, so the loop
-        was reading its own classification back as the user's verdict: all 39
-        `user_todoist` corrections in prod had an applied clarify decision
-        behind them, 39 of 39, each one demoting a sender and writing a
-        "User corrected email triage" memory nobody expressed. Those rows then
-        dominated sebas's working memory. `_CLARIFY_SELF_DISPOSITIONS` excludes
-        them; what survives is a disposition AEGIS did not author.
+        The signal is only worth anything if the AUTHOR of the disposition is
+        known, and the first cut of this did not check. ClarifyFlow applies
+        `@reference` and `#trash` to AEGIS's own `#email` captures every 15
+        minutes, so the loop was reading its own classification back as the
+        user's verdict: all 39 `user_todoist` corrections in prod had an applied
+        clarify decision behind them, 39 of 39, each one demoting a sender and
+        writing a "User corrected email triage" memory nobody expressed (#353).
+
+        Both authors are now mined, under different provenance, because a
+        measurement of prod showed the human signal is not merely rare but
+        ABSENT: of 212 completed `important_action` captures, every one of the
+        76 carrying a noise label had been disposed by clarify, and a 300-message
+        sample of flagged mail found 0 trashed, 0 unstarred and 0 with IMPORTANT
+        removed. Excluding clarify and stopping there leaves the loop with no
+        negative direction at all.
+
+        So a clarify disposition is kept as what it honestly is — a second
+        machine opinion that disagrees with triage. Triage's LLM said this
+        warranted an interrupt; clarify's own logic (deterministic notification
+        markers, then an LLM with a different prompt) said it was reference or
+        trash. That disagreement is real evidence, and it is abundant. It is
+        recorded as `corrected_by='clarify_disagreement'`, costs half a step of
+        sender confidence so it cannot flip a sender alone, and NEVER writes an
+        `agent_memory` row. A human disposition still gets full weight, the
+        `user_todoist` provenance and a memory.
 
         Routes through `_triage_upsert` so a Todoist verdict lands with exactly
         the same disagreement arithmetic as any other (conf -= 0.3, flip at
         <= 0.3) rather than as a privileged override.
         """
-        out = {"corrected": 0, "senders_relearned": 0, "memories_written": 0}
+        out = {
+            "corrected": 0,
+            "senders_relearned": 0,
+            "memories_written": 0,
+            "machine_corrected": 0,
+        }
         rows = await self.db_pool.fetch(
             """
-            SELECT ta.id, ta.email_id, ta.predicted, t.content, t.description
+            SELECT ta.id, ta.email_id, ta.predicted, t.content, t.description,
+                   EXISTS (
+                       SELECT 1 FROM gtd_clarify_log g
+                       WHERE g.todoist_task_id = tci.todoist_task_ref
+                         AND g.applied
+                         AND g.classification = ANY($2::text[])
+                   ) AS clarify_disposed
             FROM triage_accuracy ta
             JOIN todoist_capture_idempotency tci
               ON tci.source_tag = '#email'
@@ -990,15 +1027,6 @@ class GmailActivities:
             WHERE ta.actual IS NULL
               AND t.is_completed
               AND t.labels && $1::text[]
-              -- The disposition must be the USER's. Keyed on `applied`, not on
-              -- the mere existence of a clarify row: a decision clarify made but
-              -- did not apply left the label to a human, so that stays a signal.
-              AND NOT EXISTS (
-                    SELECT 1 FROM gtd_clarify_log g
-                    WHERE g.todoist_task_id = tci.todoist_task_ref
-                      AND g.applied
-                      AND g.classification = ANY($2::text[])
-              )
             LIMIT $3
             """,
             list(_DISPOSITION_NOISE_LABELS),
@@ -1006,18 +1034,29 @@ class GmailActivities:
             limit,
         )
         for r in rows:
+            # WHO disposed of the task decides everything downstream: the
+            # provenance string, how hard it hits the sender cache, and whether
+            # a memory is written at all. Keyed on `applied` — a decision
+            # clarify made but did not apply left the label to a human.
+            machine = bool(r["clarify_disposed"])
+            provenance = "clarify_disagreement" if machine else "user_todoist"
             updated = await self.db_pool.execute(
                 "UPDATE triage_accuracy SET actual='unimportant', "
-                "corrected_by='user_todoist', last_checked_at=now() "
+                "corrected_by=$2, last_checked_at=now() "
                 "WHERE id=$1 AND actual IS NULL",
                 r["id"],
+                provenance,
             )
             if updated.split()[-1] == "0":  # raced by the label pass
                 continue
-            out["corrected"] += 1
+            out["machine_corrected" if machine else "corrected"] += 1
             sender = _sender_from_description(r["description"])
             if sender:
-                await self._triage_upsert(sender, _CORRECTION_TO_CATEGORY["unimportant"])
+                await self._triage_upsert(
+                    sender,
+                    _CORRECTION_TO_CATEGORY["unimportant"],
+                    weight=_MACHINE_DISAGREEMENT_STEP if machine else _DISAGREEMENT_STEP,
+                )
                 out["senders_relearned"] += 1
             else:
                 activity.logger.warning(
@@ -1025,6 +1064,13 @@ class GmailActivities:
                     "sender not relearned",
                     r["email_id"],
                 )
+            if machine:
+                # No agent_memory row, ever. A memory reads as a fact about the
+                # USER ("User corrected email triage: …") and this is AEGIS
+                # disagreeing with itself. Writing one is exactly the defect
+                # #353 removed; the signal lives in triage_state and
+                # triage_accuracy, where its provenance travels with it.
+                continue
             if await record_gmail_triage_correction(
                 self.db_pool,
                 self.agent_id,
@@ -1172,11 +1218,19 @@ class GmailActivities:
             return None
 
     async def _triage_upsert(
-        self, sender: str, category: str, tags: list[str] | None = None
+        self,
+        sender: str,
+        category: str,
+        tags: list[str] | None = None,
+        weight: float = _DISAGREEMENT_STEP,
     ) -> None:
         """Reinforce a sender's cached category. Agreement raises confidence;
         disagreement lowers it and flips the category once it bottoms out.
         Best-effort — never raises into the classifier.
+
+        `weight` is how much a disagreement costs. Defaults to the full step;
+        a machine-authored signal passes `_MACHINE_DISAGREEMENT_STEP` so it
+        nudges rather than flips on a single observation.
 
         `tags` is the LLM's content tags for this message. They are stored so a
         later cache hit can replay them: the fan-out in `GmailIngestFlow` keys
@@ -1219,7 +1273,7 @@ class GmailActivities:
                     new_cat = cur
                     conf = min(1.0, conf + 0.15)
                 else:
-                    conf -= 0.3
+                    conf -= weight
                     if conf <= 0.3:
                         new_cat, conf = category, 0.6  # flip to the new majority
                     else:

@@ -163,6 +163,12 @@ async def test_already_scored_prediction_is_left_alone(db_pool):
     assert (row["actual"], row["corrected_by"]) == ("important", "user_gmail")
 
 
+def _meta(row):
+    import json
+    m = row["metadata"]
+    return json.loads(m) if isinstance(m, str) else m
+
+
 async def _clarified(db_pool, task_id: str, classification: str, *, applied: bool = True):
     """Record that AEGIS's own ClarifyFlow decided this task's disposition."""
     await db_pool.execute(
@@ -175,53 +181,115 @@ async def _clarified(db_pool, task_id: str, classification: str, *, applied: boo
 
 
 @pytest.mark.asyncio
-async def test_a_disposition_aegis_applied_itself_is_not_a_user_verdict(db_pool):
-    """The whole signal rests on a HUMAN having closed the task. ClarifyFlow
-    applies `@reference`/`#trash` to AEGIS's own `#email` captures on a 15-min
-    tick, so without this guard the loop reads its own classification back as
-    "the user said I was wrong" — then demotes the sender and writes a
-    "User corrected email triage" memory no human ever expressed.
+async def test_clarify_disposition_is_recorded_as_a_machine_signal_not_the_user(db_pool):
+    """ClarifyFlow applies `@reference`/`#trash` to AEGIS's own `#email`
+    captures on a 15-min tick, so a task it disposed carries AEGIS's opinion,
+    not the user's. In prod all 39 `user_todoist` corrections had an applied
+    clarify decision behind them — 39 of 39 (#353).
 
-    In production this was not an edge case: all 39 `user_todoist` corrections
-    had an applied clarify decision behind them. 39 of 39.
+    It is still mined, because measurement showed the human signal is absent
+    rather than rare, but under its own provenance. Fails if a machine verdict
+    is ever laundered as the user's.
     """
     email_id = f"m-{uuid.uuid4().hex[:10]}"
-    sender = f"alerts-{uuid.uuid4().hex[:6]}@axisbank.com"
     task_id = await _seed(
-        db_pool, email_id=email_id, sender=sender, labels=["#email", "#trash"], completed=True
+        db_pool,
+        email_id=email_id,
+        sender=f"alerts-{uuid.uuid4().hex[:6]}@axisbank.com",
+        labels=["#email", "#trash"],
+        completed=True,
     )
     await _clarified(db_pool, task_id, "trash")
 
     out = await _acts(db_pool)._mine_todoist_dispositions()
 
-    assert out["corrected"] == 0, "AEGIS graded its own clarify decision as user feedback"
-    assert (await _accuracy(db_pool, email_id))["actual"] is None
-    assert await db_pool.fetchrow(
-        "SELECT 1 FROM triage_state WHERE email_addr=$1", sender
-    ) is None, "a self-authored verdict must never relearn the sender"
+    assert out["machine_corrected"] == 1
+    assert out["corrected"] == 0, "a clarify verdict must never count as the user's"
+    row = await _accuracy(db_pool, email_id)
+    assert (row["actual"], row["corrected_by"]) == ("unimportant", "clarify_disagreement")
 
 
 @pytest.mark.asyncio
-async def test_reference_applied_by_clarify_is_also_excluded(db_pool):
-    """`reference` is the other disposition clarify applies — 24 of the 39."""
+async def test_a_machine_signal_never_writes_a_memory(db_pool):
+    """`record_gmail_triage_correction` writes "User corrected email triage: …"
+    — a claim about the human. 39 such rows were 78% of sebas's live memory and
+    none of them came from a person. A second machine opinion must never
+    produce one, however useful it is for the sender cache.
+    """
     email_id = f"m-{uuid.uuid4().hex[:10]}"
     task_id = await _seed(
         db_pool,
         email_id=email_id,
-        sender=f"news-{uuid.uuid4().hex[:6]}@substack.com",
-        labels=["#email", "@reference", "@sebas"],
+        sender=f"noreply-{uuid.uuid4().hex[:6]}@axisbank.com",
+        labels=["#email", "@reference"],
         completed=True,
     )
     await _clarified(db_pool, task_id, "reference")
+
+    out = await _acts(db_pool)._mine_todoist_dispositions()
+
+    assert out["memories_written"] == 0
+    assert await db_pool.fetchval(
+        "SELECT count(*) FROM agent_memory WHERE content LIKE $1",
+        f"%[gmail:{email_id}]",
+    ) == 0, "a machine disagreement wrote a memory claiming the user corrected triage"
+
+
+@pytest.mark.asyncio
+async def test_a_machine_signal_alone_cannot_flip_a_sender(db_pool):
+    """Half a step, deliberately. A human verdict flips a 0.6-confidence sender
+    on the first hit; a second machine opinion has to be corroborated. Fails if
+    the weight is dropped and clarify starts silently rewriting the cache.
+    """
+    sender = f"nudge-{uuid.uuid4().hex[:6]}@vendor.example"
+    await db_pool.execute(
+        "INSERT INTO triage_state (email_addr, state, metadata, updated_at) "
+        "VALUES ($1, 'important_action', $2, now())",
+        sender,
+        {"n": 3, "confidence": 0.6, "category": "important_action"},
+    )
+    email_id = f"m-{uuid.uuid4().hex[:10]}"
+    task_id = await _seed(
+        db_pool, email_id=email_id, sender=sender, labels=["#email", "#trash"], completed=True
+    )
+    await _clarified(db_pool, task_id, "trash")
+
     await _acts(db_pool)._mine_todoist_dispositions()
-    assert (await _accuracy(db_pool, email_id))["actual"] is None
+
+    row = await db_pool.fetchrow("SELECT state, metadata FROM triage_state WHERE email_addr=$1", sender)
+    assert row["state"] == "important_action", "one machine opinion flipped the sender"
+    assert float(_meta(row)["confidence"]) == pytest.approx(0.45), "expected a half-step nudge"
+
+
+@pytest.mark.asyncio
+async def test_a_human_disposition_still_flips_on_the_first_hit(db_pool):
+    """The counterpart. A real human verdict keeps its full weight, so the fix
+    for the machine signal cannot quietly weaken the signal that matters most.
+    """
+    sender = f"real-{uuid.uuid4().hex[:6]}@vendor.example"
+    await db_pool.execute(
+        "INSERT INTO triage_state (email_addr, state, metadata, updated_at) "
+        "VALUES ($1, 'important_action', $2, now())",
+        sender,
+        {"n": 3, "confidence": 0.6, "category": "important_action"},
+    )
+    email_id = f"m-{uuid.uuid4().hex[:10]}"
+    await _seed(
+        db_pool, email_id=email_id, sender=sender, labels=["#email", "#trash"], completed=True
+    )
+
+    out = await _acts(db_pool)._mine_todoist_dispositions()
+
+    assert out["corrected"] == 1 and out["machine_corrected"] == 0
+    assert (await _accuracy(db_pool, email_id))["corrected_by"] == "user_todoist"
+    row = await db_pool.fetchrow("SELECT state FROM triage_state WHERE email_addr=$1", sender)
+    assert row["state"] == "informational", "a human verdict must still flip on the first hit"
 
 
 @pytest.mark.asyncio
 async def test_a_clarify_decision_that_was_not_applied_leaves_the_verdict_human(db_pool):
-    """Guards the fix against over-reach. Clarify considered the task but did
-    NOT apply its decision, so whoever put `#trash` there was a human and the
-    correction must still count. Fails if the exclusion keys on the mere
+    """Clarify considered the task but did NOT apply its decision, so whoever
+    put `#trash` there was a human. Fails if provenance keys on the mere
     existence of a clarify row instead of `applied`.
     """
     email_id = f"m-{uuid.uuid4().hex[:10]}"
@@ -234,13 +302,13 @@ async def test_a_clarify_decision_that_was_not_applied_leaves_the_verdict_human(
     )
     await _clarified(db_pool, task_id, "trash", applied=False)
     await _acts(db_pool)._mine_todoist_dispositions()
-    assert (await _accuracy(db_pool, email_id))["actual"] == "unimportant"
+    assert (await _accuracy(db_pool, email_id))["corrected_by"] == "user_todoist"
 
 
 @pytest.mark.asyncio
 async def test_clarify_deciding_something_else_leaves_the_verdict_human(db_pool):
     """Clarify routed it as real work; the `#trash` label came from the user
-    afterwards. That is a genuine correction and must survive the filter.
+    afterwards. That is a genuine correction and keeps full weight.
     """
     email_id = f"m-{uuid.uuid4().hex[:10]}"
     task_id = await _seed(
@@ -252,4 +320,4 @@ async def test_clarify_deciding_something_else_leaves_the_verdict_human(db_pool)
     )
     await _clarified(db_pool, task_id, "2_min")
     await _acts(db_pool)._mine_todoist_dispositions()
-    assert (await _accuracy(db_pool, email_id))["actual"] == "unimportant"
+    assert (await _accuracy(db_pool, email_id))["corrected_by"] == "user_todoist"
