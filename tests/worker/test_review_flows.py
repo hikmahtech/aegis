@@ -5,7 +5,7 @@ from __future__ import annotations
 import uuid
 
 import pytest
-from aegis_worker.activities.review import format_meeting_week
+from aegis_worker.activities.review import format_key_dates, format_meeting_week
 from aegis_worker.flows.interaction import InteractionFlow
 from aegis_worker.flows.review import (
     DailyReviewConfig,
@@ -572,3 +572,54 @@ def test_format_meeting_week_renders_block_and_is_empty_without_meetings():
     # A stale flat-shape row (pre-fix payload, in-flight deploy) must not crash.
     legacy = format_meeting_week({"meetings": [], "missing_doc_by_account": {"old": 3}})
     assert "⚠ 3 meetings stored without their doc (unknown)" in legacy
+
+
+def test_format_meeting_week_escapes_every_value_it_interpolates():
+    """The weekly block is parsed as HTML downstream (comms `html_to_mrkdwn` is
+    an HTMLParser), so an `<a href>` the review model emits would arrive as a
+    real clickable Slack link and a `<` in a doc title would be swallowed.
+    Every interpolated value is escaped; the block's own tags are not."""
+    evil = '<b>bold</b> <a href="http://x">link</a>'
+    out = format_meeting_week(
+        {
+            "meetings": [
+                {
+                    "title": evil,
+                    "talk_share_pct": 9.0,
+                    "contributions": [evil],
+                    "problems_raised": [evil],
+                    "commitments": [evil],
+                    "verbosity_note": evil,
+                }
+            ],
+            "missing_doc_by_account": {evil: {"no_drive_scope": 1, "<i>odd</i>": 2}},
+        }
+    )
+    assert "<b>bold</b>" not in out
+    assert "<a href=" not in out
+    assert "<i>odd</i>" not in out
+    assert "&lt;b&gt;bold&lt;/b&gt;" in out
+    assert "&lt;a href=&quot;http://x&quot;&gt;link&lt;/a&gt;" in out
+    # …and the formatter's own markup is untouched.
+    assert out.startswith("🎙 <b>Meetings this week</b> (1)")
+
+
+def test_format_key_dates_escapes_the_people_values():
+    """Same gap, same delivered message: life.people values are free text too."""
+    out = format_key_dates(
+        [
+            {
+                "name": "<script>alert(1)</script>",
+                "relationship": "<b>mother</b>",
+                "label": "<i>birthday</i>",
+                "date": "2026-08-04",
+                "days_until": 3,
+                "years": 60,
+            }
+        ]
+    )
+    assert "<script>" not in out
+    assert "<b>mother</b>" not in out
+    assert "<i>birthday</i>" not in out
+    assert "&lt;script&gt;alert(1)&lt;/script&gt;" in out
+    assert out.startswith("🎂 <b>Coming up</b>")
