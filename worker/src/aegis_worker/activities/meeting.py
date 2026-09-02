@@ -141,18 +141,32 @@ def split_notes_transcript(text: str) -> tuple[str, list[tuple[str, str]]]:
     with a label that recurs or looks like a name — opens it, preferring one where
     such lines dominate what follows; `_transcript_start` holds the full rule and
     the reason it degrades rather than rejecting every candidate. Inside the
-    transcript a bare timestamp line is dropped and any other non-speaker,
-    non-blank line is a wrapped continuation of the previous utterance. Not keyed
-    on a "Transcript" heading: the Gemini export mentions that word inside the
-    notes tab too. A leading BOM is stripped first: Drive's plain-text export
-    starts with one and ``str.strip`` does not remove it, so without this the
-    notes begin with an invisible U+FEFF.
+    transcript a candidate line opens an utterance when it is the line at
+    `start` — that line opened the transcript, so it is speech by definition —
+    or when its label is a transcript SPEAKER: it labels two or more lines below
+    `start`, or it labels no line in the notes above. A candidate that is
+    neither is a notes heading reprinted inside the transcript, and it is
+    dropped along with any wrapped lines that follow it, because its words are
+    not speech and folding them would put a heading in the previous speaker's
+    mouth. A bare timestamp line is dropped and any other non-speaker,
+    non-blank line is a wrapped continuation of the previous utterance. Not
+    keyed on a "Transcript" heading: the Gemini export
+    mentions that word inside the notes tab too. A leading BOM is stripped
+    first: Drive's plain-text export starts with one and ``str.strip`` does not
+    remove it, so without this the notes begin with an invisible U+FEFF.
     # ponytail: label heuristic plus a density count, no vendor knowledge. Its
     # ceiling is a notes heading that reads as a speaker and either sits within
     # two non-speaker lines of the transcript (dense enough to win outright) or is
     # the only candidate left once density has failed everywhere. Either way it
-    # costs notes, never the transcript. The upgrade path is unchanged: a
-    # vendor-keyed splitter chosen from the sending address.
+    # costs notes, never the transcript. The speaker rule has a ceiling of its
+    # own, and this one costs speech: a participant who speaks exactly once
+    # MID-transcript and whose label also heads a line up in the notes loses
+    # that turn's text entirely — it is read as a reprinted heading and dropped,
+    # with its wrapped lines. Bounded on both sides: the line at `start` is
+    # exempt, so a transcript can never open on a silent drop, and a second turn
+    # anywhere below `start` makes the label a speaker outright. The upgrade
+    # path is unchanged: a vendor-keyed splitter chosen from the sending
+    # address.
     """
     lines = (text or "").lstrip("\ufeff").splitlines()
     labels: list[str | None] = []
@@ -170,17 +184,27 @@ def split_notes_transcript(text: str) -> tuple[str, list[tuple[str, str]]]:
     if start is None:
         return (text or "").strip(), []
     notes = "\n".join(lines[:start]).strip()
+    region_counts: dict[str, int] = {}
+    for lab in labels[start:]:
+        if lab:
+            region_counts[lab] = region_counts.get(lab, 0) + 1
+    notes_labels = {labels[i] for i in range(start) if labels[i]}
+    speakers = {lab for lab, n in region_counts.items() if n >= 2 or lab not in notes_labels}
     utterances: list[tuple[str, str]] = []
+    dropping = False  # inside a dropped heading, so its wrapped lines go too
     for i in range(start, len(lines)):
         stripped = lines[i].strip()
         label = labels[i]
         if not stripped:
             continue
-        if label in candidates:
+        if label in candidates and (i == start or label in speakers):
             utterances.append((str(label), lines[i].split(": ", 1)[1].strip()))
+            dropping = False
+        elif label in candidates:
+            dropping = True  # a notes heading reprinted inside the transcript
         elif _TIMESTAMP_LINE_RE.match(stripped):
             continue
-        elif utterances:
+        elif utterances and not dropping:
             speaker, utterance = utterances[-1]
             utterances[-1] = (speaker, f"{utterance} {stripped}")
     return notes, utterances

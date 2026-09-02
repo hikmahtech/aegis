@@ -384,3 +384,156 @@ def test_with_no_recurring_label_the_split_sacrifices_notes_never_the_transcript
     assert "Sam Doe" in {s for s, _ in utt}
     for _, u in utt:
         assert u not in notes
+
+
+# --- A heading the note-taker reprints INSIDE the transcript is not a speaker. ---
+# Gemini reprints the doc's own "Title: Subtitle" line in the transcript tab. That
+# label is a candidate — it recurs, and it is name-like — so it used to open a
+# one-line utterance by a speaker who was never in the room: `speakers` grew by
+# one and the title words counted toward `meeting_words_total`.
+
+REPRINTED_TITLE = """✍️ Quick notes
+Data Foundations: Session 4 - Seams as Contracts
+Team walked through the seam contract for the ingest boundary.
+
+Seams as contracts
+* Ada framed the seam as the only place the two teams agree.
+* Sam raised the migration risk on the older collections.
+
+Attachments Data Foundations: Session 4 files
+You should review Gemini's notes to make sure they are accurate.
+Get tips and learn how Gemini takes notes.
+Please provide feedback about using Gemini.
+
+Transcript
+
+Ada Lovelace: Morning all, let's start with the seams.
+Sam Doe: The contract needs a version field before we migrate.
+Data Foundations: Session 4 - Seams as Contracts
+Ada Lovelace: Agreed, I will write that up as an ADR.
+Sam Doe: I can review it on Thursday after the parity run.
+Ada Lovelace: Thanks, that closes it.
+"""
+
+# One correction from a person who speaks once and appears nowhere in the notes.
+# The rule cannot be "the label recurs", or he is dropped with the headings.
+ONE_LINE_SPEAKER = """✍️ Quick notes
+Data Foundations: Session 4 - Seams as Contracts
+Team walked through the seam contract for the ingest boundary.
+
+Seams as contracts
+* Ada framed the seam as the only place the two teams agree.
+* Sam raised the migration risk on the older collections.
+
+Transcript
+
+Ada Lovelace: Morning all, let's start with the seams.
+Sam Doe: The contract needs a version field before we migrate.
+Oliver Cooper: One correction, the older collections are already on v2.
+Ada Lovelace: Good, that closes it.
+"""
+
+
+def test_a_notes_heading_repeated_inside_the_transcript_is_not_a_speaker():
+    notes, utt = split_notes_transcript(REPRINTED_TITLE)
+    # Notes are untouched — the start selection already got this one right.
+    assert notes.startswith("✍️ Quick notes")
+    assert "Data Foundations: Session 4 - Seams as Contracts" in notes
+    assert "* Ada framed the seam" in notes
+    assert "* Sam raised the migration risk" in notes
+    assert "Attachments Data Foundations" in notes
+    assert "Morning all" not in notes
+    # The reprinted title is dropped whole. It is not a speaker, and it is not
+    # folded into the utterance above it either: those words are not speech.
+    assert {s for s, _ in utt} == {"Ada Lovelace", "Sam Doe"}
+    assert len(utt) == 5
+    for _, u in utt:
+        assert "Seams as Contracts" not in u
+    assert utt[1] == ("Sam Doe", "The contract needs a version field before we migrate.")
+
+
+def test_a_speaker_with_one_line_who_is_not_in_the_notes_is_kept():
+    notes, utt = split_notes_transcript(ONE_LINE_SPEAKER)
+    assert "* Ada framed the seam" in notes
+    assert "Morning all" not in notes
+    assert ("Oliver Cooper", "One correction, the older collections are already on v2.") in utt
+    assert [s for s, _ in utt] == ["Ada Lovelace", "Sam Doe", "Oliver Cooper", "Ada Lovelace"]
+
+
+# --- Dropping a line is deleting it, so the rule is bounded on both sides. ---
+# Speech that is neither notes nor an utterance is gone with no trace, which is
+# worse than the pseudo-speaker it was meant to prevent.
+
+# The line at `start` opened the transcript, so it is speech whatever its label
+# says. Here "Ada Lovelace" heads a line in the notes AND speaks only once, so
+# the speaker test alone would drop her opening turn — and its two wrapped lines
+# after it, since there is no utterance yet for them to fold into.
+SPEAKS_ONCE_AT_THE_START = """✍️ Quick notes
+Ada Lovelace: raised the seam contract ahead of the session.
+* Sam raised the migration risk on the older collections.
+* Grace asked for a version field on the contract.
+* Ada agreed to write the ADR by Thursday.
+
+Suggested next steps
+* Sam to check parity on the older collections.
+
+Transcript
+
+Ada Lovelace: This is my one and only turn
+and it runs on to a second line
+and then a third.
+Sam Doe: The contract needs a version field.
+Sam Doe: And the parity run lands on Thursday.
+"""
+
+# The reprinted title wraps onto a second line. Folding that line into the
+# utterance above puts heading text in Sam Doe's mouth.
+REPRINTED_TITLE_WRAPPED = """✍️ Quick notes
+Data Foundations: Session 4 - Seams as Contracts
+Team walked through the seam contract for the ingest boundary.
+
+Seams as contracts
+* Ada framed the seam as the only place the two teams agree.
+* Sam raised the migration risk on the older collections.
+
+Attachments Data Foundations: Session 4 files
+You should review Gemini's notes to make sure they are accurate.
+Get tips and learn how Gemini takes notes.
+Please provide feedback about using Gemini.
+
+Transcript
+
+Ada Lovelace: Morning all, let's start with the seams.
+Sam Doe: The contract needs a version field before we migrate.
+Data Foundations: Session 4 - Seams as Contracts
+a recording of this session is attached to the invite
+Ada Lovelace: Agreed, I will write that up as an ADR.
+Sam Doe: I can review it on Thursday after the parity run.
+Ada Lovelace: Thanks, that closes it.
+"""
+
+
+def test_the_line_that_opens_the_transcript_is_always_a_speaker():
+    notes, utt = split_notes_transcript(SPEAKS_ONCE_AT_THE_START)
+    assert "* Sam to check parity" in notes
+    assert "one and only turn" not in notes
+    # Her one turn survives, and so do the two lines it wraps onto: dropping the
+    # opening line would delete all three, into neither notes nor utterances.
+    assert utt[0] == (
+        "Ada Lovelace",
+        "This is my one and only turn and it runs on to a second line and then a third.",
+    )
+    assert [s for s, _ in utt] == ["Ada Lovelace", "Sam Doe", "Sam Doe"]
+
+
+def test_a_dropped_headings_wrapped_line_is_dropped_too_not_folded_upward():
+    notes, utt = split_notes_transcript(REPRINTED_TITLE_WRAPPED)
+    assert "Attachments Data Foundations" in notes
+    assert "Morning all" not in notes
+    assert {s for s, _ in utt} == {"Ada Lovelace", "Sam Doe"}
+    assert len(utt) == 5
+    for _, u in utt:
+        assert "Seams as Contracts" not in u
+        assert "a recording of this session" not in u
+    # The speaker before the heading keeps exactly what they said.
+    assert utt[1] == ("Sam Doe", "The contract needs a version field before we migrate.")
