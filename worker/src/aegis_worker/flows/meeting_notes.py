@@ -152,9 +152,6 @@ class MeetingNotesFlow:
                     "content_id": content_id,
                     "url": url,
                 }
-            step = "record_analysis_outcome"
-            await _record_outcome(content_id, "ok")
-
             step = "ingest_review"
             review_key = doc.get("doc_id") or msg_id
             review_ingested = await workflow.execute_activity_method(
@@ -182,14 +179,23 @@ class MeetingNotesFlow:
                 retry_policy=RETRY_ONCE,
             )
             review_status = (review_ingested or {}).get("status")
+            step = "record_analysis_outcome"
             if review_status != "ok":
+                # The stamp is the TERMINAL outcome, which is why it waits for
+                # the review ingest. Stamping "ok" before it would hide the
+                # meeting twice over — no `meeting_review` row for the weekly
+                # list, and `no_review_by_reason` skips 'ok'. Same string the
+                # result carries, so the row and the run cannot disagree.
+                reason = f"review_ingest_{review_status or 'no_result'}"
+                await _record_outcome(content_id, reason)
                 return {
                     "status": "stored_no_analysis",
-                    "analysis": f"review_ingest_{review_status or 'no_result'}",
+                    "analysis": reason,
                     "doc_status": doc_status,
                     "content_id": content_id,
                     "url": url,
                 }
+            await _record_outcome(content_id, "ok")
             return {
                 "status": "stored",
                 "doc_status": doc_status,

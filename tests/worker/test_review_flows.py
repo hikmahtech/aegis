@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import uuid
 
+import aegis_worker.activities.review as activities_review
 import pytest
 from aegis_worker.activities.review import format_key_dates, format_meeting_week
 from aegis_worker.flows.interaction import InteractionFlow
@@ -605,6 +606,47 @@ def test_format_meeting_week_renders_block_and_is_empty_without_meetings():
     # A stale flat-shape row (pre-fix payload, in-flight deploy) must not crash.
     legacy = format_meeting_week({"meetings": [], "missing_doc_by_account": {"old": 3}})
     assert "⚠ 3 meetings stored without their doc (unknown)" in legacy
+
+
+@pytest.mark.asyncio
+async def test_weekly_review_ships_when_the_key_dates_formatter_raises(monkeypatch) -> None:
+    """The other half of the same guard. Driven by replacing the formatter, not
+    by a malformed activity result: `check_upcoming_key_dates` is annotated
+    `-> list[dict]`, so a wrongly-typed stub result fails payload conversion
+    OUTSIDE the workflow's try — a workflow TASK failure, which retries forever
+    and hangs under time skipping instead of failing. Both formatters come into
+    `flows.review` through `imports_passed_through()`, so they are ordinary
+    module attributes and a monkeypatch reaches the workflow — but it has to be
+    set on `activities.review`, the module that is passed through. The sandbox
+    re-imports `flows.review` itself, so a patch on THAT module is rebound to
+    the real function before the workflow runs and the test passes vacuously."""
+
+    def _boom(items):
+        raise TypeError("simulated formatter bug")
+
+    monkeypatch.setattr(activities_review, "format_key_dates", _boom)
+    hits = [{"name": "Amma", "relationship": "mother", "label": "birthday",
+             "date": "2026-08-04", "days_until": 3, "years": 60}]
+    sent: list[str] = []
+    async with (
+        await WorkflowEnvironment.start_time_skipping() as env,
+        Worker(
+            env.client,
+            task_queue="aegis-review-keydatesfmt-fail",
+            workflows=[WeeklyReviewFlow, InteractionFlow],
+            activities=_weekly_stubs(sent, hits),
+        ),
+    ):
+        result = await env.client.execute_workflow(
+            WeeklyReviewFlow.run,
+            WeeklyReviewConfig(),
+            id=f"weekly-keydatesfmt-fail-{uuid.uuid4()}",
+            task_queue="aegis-review-keydatesfmt-fail",
+        )
+    assert result["kind"] == "weekly"
+    assert len(sent) == 1
+    assert "Weekly review — LLM framing." in sent[0]
+    assert "Coming up" not in sent[0]
 
 
 def test_format_meeting_week_warns_about_meetings_filed_without_a_review():

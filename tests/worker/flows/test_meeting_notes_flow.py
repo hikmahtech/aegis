@@ -124,6 +124,10 @@ async def test_a_failed_review_ingest_is_reported_not_called_stored():
     assert res["url"] == "gdoc://doc-1"
     assert "review_content_id" not in res
     assert len(_calls["ingest"]) == 2
+    # The stamp is the TERMINAL outcome, so it waits for the review ingest. A
+    # premature "ok" here would hide the meeting twice over: no meeting_review
+    # row for the list, and `no_review_by_reason` skips 'ok'.
+    assert _calls["outcome"] == [("cid-meeting", "review_ingest_disabled")]
 
 
 @pytest.mark.asyncio
