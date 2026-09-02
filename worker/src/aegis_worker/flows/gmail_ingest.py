@@ -28,6 +28,7 @@ with workflow.unsafe.imports_passed_through():
         FetchEmailsResult,
     )
     from aegis_worker.flows.interaction import InteractionFlow, InteractionFlowInput
+    from aegis_worker.flows.meeting_notes import MeetingNotesFlow, MeetingNotesInput
     from aegis_worker.flows.money_process import MoneyProcessFlow, MoneyProcessInput
     from aegis_worker.shared.gmail_auth import is_auth_expired
     from aegis_worker.shared.retry import ACT_RETRY, NO_RETRY, TIMEOUT_FAST, TIMEOUT_STANDARD
@@ -195,6 +196,29 @@ class GmailIngestFlow:
                     except Exception as exc:
                         workflow.logger.warning(
                             "money_fanout_start_failed msg=%s err=%s",
+                            msg.get("id", ""),
+                            str(exc)[:200],
+                        )
+
+                # `meeting` — set by a sender-override rule on the Email triage
+                # page (any note-taker vendor). The child fetches the linked doc,
+                # files the full notes and reviews the user's part; it inherits
+                # this run's agent. Same fire-and-forget contract as money.
+                if "meeting" in tag_set:
+                    try:
+                        await workflow.start_child_workflow(
+                            MeetingNotesFlow.run,
+                            MeetingNotesInput(
+                                agent_id=input.agent_id,
+                                msg=msg,
+                                account_label=label,
+                            ),
+                            id=f"meeting-notes-{msg['id']}",
+                            parent_close_policy=ParentClosePolicy.ABANDON,
+                        )
+                    except Exception as exc:
+                        workflow.logger.warning(
+                            "meeting_fanout_start_failed msg=%s err=%s",
                             msg.get("id", ""),
                             str(exc)[:200],
                         )
@@ -407,7 +431,12 @@ class GmailIngestFlow:
         # Important emails (action + read) land in the knowledge graph
         # so Raphael's search/ask tools can recall them later. Fire-and-
         # forget — ingest failures don't block the route's primary action.
-        if category in {"important_action", "important_read"} and classification:
+        # A `meeting`-tagged email is filed in full by MeetingNotesFlow under
+        # its own url; the 2000-char copy here would only be a truncated twin.
+        is_meeting = "meeting" in {
+            t for t in ((classification or {}).get("tags") or []) if isinstance(t, str)
+        }
+        if category in {"important_action", "important_read"} and classification and not is_meeting:
             try:
                 await workflow.execute_activity(
                     "ingest_email_to_kg",
