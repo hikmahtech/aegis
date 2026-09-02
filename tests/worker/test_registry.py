@@ -247,9 +247,16 @@ def test_module_workflows_is_the_unflagged_registry():
         # HomelabActivities — DeliveryWatchdogFlow closes the inbound-outage task
         # on recovery, which is what re-arms the one-open-task-at-a-time guard.
         # HomelabActivities is homelab-flagged, so only the homelab rows move.
-        (True, True, 40, 197),
-        (False, False, 32, 167),
-        (True, False, 36, 186),
+        # Then +1 flow and +2 activities from MeetingNotesFlow /
+        # MeetingActivities (fetch_meeting_document, analyse_meeting) — a child
+        # of GmailIngestFlow's `meeting` tag fan-out, unflagged, so all three
+        # rows move. Then +1 activity and NO new flow from
+        # `gather_meeting_week` on the existing ReviewActivities — the weekly
+        # meetings block is SQL aggregation driven by the existing
+        # WeeklyReviewFlow, so it moves in every row.
+        (True, True, 41, 200),
+        (False, False, 33, 170),
+        (True, False, 37, 189),
     ],
 )
 def test_real_registration_passes_the_boot_check(homelab, money, flows, activities):

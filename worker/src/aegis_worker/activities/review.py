@@ -762,6 +762,91 @@ class ReviewActivities:
         return out[:20]
 
     @activity.defn
+    async def gather_meeting_week(self) -> dict:
+        """This week's meeting self-reviews, talk-share/words-per-turn averages
+        against the previous 7 days, and meetings filed without their doc.
+        SQL only — the per-meeting LLM review already happened in
+        MeetingNotesFlow; the weekly block is aggregation, not another call."""
+        empty = {
+            "meetings": [],
+            "talk_share_avg": None,
+            "talk_share_prev": None,
+            "words_per_turn_avg": None,
+            "words_per_turn_prev": None,
+            "missing_doc_by_account": {},
+        }
+        if self.db_pool is None:
+            return empty
+        async with self.db_pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT title, metadata FROM knowledge_content "
+                "WHERE source_type='meeting_review' "
+                "AND ingested_at >= now() - interval '7 days' "
+                "ORDER BY ingested_at DESC LIMIT 20"
+            )
+            meetings = []
+            for r in rows:
+                md = _decode_counts(r["metadata"])
+                review = md.get("review") if isinstance(md.get("review"), dict) else {}
+                stats = md.get("stats") if isinstance(md.get("stats"), dict) else {}
+                me = stats.get("self") if isinstance(stats.get("self"), dict) else {}
+                meetings.append(
+                    {
+                        "title": r["title"] or "",
+                        "talk_share_pct": me.get("talk_share_pct"),
+                        "contributions": list(review.get("contributions") or []),
+                        "problems_raised": list(review.get("problems_raised") or []),
+                        "commitments": list(review.get("commitments") or []),
+                        "verbosity_note": str(review.get("verbosity_note") or ""),
+                    }
+                )
+
+            async def _avg(metric: str, from_days: int, to_days: int):
+                return await conn.fetchval(
+                    "SELECT avg(value)::float FROM life.observations "
+                    "WHERE source='meeting' AND metric=$1 "
+                    "AND observed_at >= now() - make_interval(days => $2) "
+                    "AND observed_at < now() - make_interval(days => $3)",
+                    metric,
+                    from_days,
+                    to_days,
+                )
+
+            ts_now = await _avg("talk_share_pct", 7, 0)
+            ts_prev = await _avg("talk_share_pct", 14, 7)
+            wpt_now = await _avg("words_per_turn", 7, 0)
+            wpt_prev = await _avg("words_per_turn", 14, 7)
+            # Grouped by status as well as account: the advice differs per
+            # status ("re-authorise Drive" is only right for no_drive_scope),
+            # so the formatter needs the breakdown, not one lumped count.
+            missing = await conn.fetch(
+                "SELECT COALESCE(metadata->>'account', '?') AS account, "
+                "COALESCE(metadata->>'doc_status', 'unknown') AS doc_status, "
+                "count(*) AS n "
+                "FROM knowledge_content "
+                "WHERE source_type='meeting' "
+                "AND ingested_at >= now() - interval '7 days' "
+                "AND COALESCE(metadata->>'doc_status', '') <> 'ok' "
+                "GROUP BY 1, 2"
+            )
+
+        def _r(v):
+            return round(float(v), 1) if v is not None else None
+
+        missing_by_account: dict[str, dict[str, int]] = {}
+        for row in missing:
+            missing_by_account.setdefault(row["account"], {})[row["doc_status"]] = int(row["n"])
+
+        return {
+            "meetings": meetings,
+            "talk_share_avg": _r(ts_now),
+            "talk_share_prev": _r(ts_prev),
+            "words_per_turn_avg": _r(wpt_now),
+            "words_per_turn_prev": _r(wpt_prev),
+            "missing_doc_by_account": missing_by_account,
+        }
+
+    @activity.defn
     async def log_review_digest(
         self,
         kind: str,
@@ -1010,6 +1095,60 @@ def format_key_dates(items: list[dict]) -> str:
         rel = f" ({_clip(it.get('relationship'), 24)})" if it.get("relationship") else ""
         years = f" — turning {it['years']}" if it.get("years") else ""
         lines.append(f"  • {who}{rel}: {_clip(it.get('label'), 24)} {when}{years}")
+    return "\n".join(lines)
+
+
+def format_meeting_week(data: dict) -> str:
+    """Weekly-review meetings block, or "" when there is nothing to say.
+    Deterministic — safe to call inside the workflow sandbox."""
+    data = data or {}
+    meetings = data.get("meetings") or []
+    missing = data.get("missing_doc_by_account") or {}
+    if not meetings and not missing:
+        return ""
+    lines = [f"🎙 <b>Meetings this week</b> ({len(meetings)})"]
+    for m in meetings[:8]:
+        share = m.get("talk_share_pct")
+        spoke = f"you spoke {share:.0f}%" if share is not None else "no transcript"
+        top = (m.get("contributions") or [""])[0]
+        tail = f" · {_clip(top, 70)}" if top else ""
+        lines.append(f"  • {_clip(m.get('title'), 48)} — {spoke}{tail}")
+    commitments = [c for m in meetings for c in (m.get("commitments") or [])][:5]
+    if commitments:
+        lines.append("  Commitments: " + " · ".join(_clip(c, 60) for c in commitments))
+    problems = [p for m in meetings for p in (m.get("problems_raised") or [])][:3]
+    if problems:
+        lines.append("  Problems you raised: " + " · ".join(_clip(p, 60) for p in problems))
+    ts, ts_prev = data.get("talk_share_avg"), data.get("talk_share_prev")
+    wpt, wpt_prev = data.get("words_per_turn_avg"), data.get("words_per_turn_prev")
+    if ts is not None or wpt is not None:
+        parts = []
+        if ts is not None:
+            parts.append(f"Talk share {ts:.0f}%" + (f" (last week {ts_prev:.0f}%)" if ts_prev is not None else ""))
+        if wpt is not None:
+            parts.append(f"{wpt:.0f} words per turn" + (f" (last week {wpt_prev:.0f})" if wpt_prev is not None else ""))
+        lines.append("  " + " · ".join(parts))
+    note = next((m["verbosity_note"] for m in meetings if m.get("verbosity_note")), "")
+    if note:
+        lines.append(f"  On brevity: {_clip(note, 240)}")
+    for account, counts in sorted(missing.items()):
+        # Tolerate the pre-fix flat shape {account: int} so a stale row from an
+        # in-flight deploy degrades to "unknown" instead of crashing the review.
+        counts = {"unknown": counts} if isinstance(counts, int) else (counts or {})
+        scope = counts.get("no_drive_scope", 0)
+        other = sum(n for status, n in counts.items() if status != "no_drive_scope")
+        if scope:
+            plural = "s" if scope != 1 else ""
+            lines.append(
+                f"  ⚠ {scope} meeting{plural} stored without their doc"
+                f" — re-authorise Drive for {account}"
+            )
+        if other:
+            plural = "s" if other != 1 else ""
+            statuses = ", ".join(sorted(s for s in counts if s != "no_drive_scope"))
+            lines.append(
+                f"  ⚠ {other} meeting{plural} stored without their doc ({statuses})"
+            )
     return "\n".join(lines)
 
 

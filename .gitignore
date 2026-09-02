@@ -39,6 +39,7 @@ config/.env
 
 # Pytest
 .pytest_cache/
+logs/
 
 # uv
 uv.lock

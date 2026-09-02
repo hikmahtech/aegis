@@ -5,6 +5,7 @@ from __future__ import annotations
 import uuid
 
 import pytest
+from aegis_worker.activities.review import format_meeting_week
 from aegis_worker.flows.interaction import InteractionFlow
 from aegis_worker.flows.review import (
     DailyReviewConfig,
@@ -206,6 +207,7 @@ async def test_weekly_review_flow_sends_digest_and_logs() -> None:
                 timeout,
                 apply_dec,
                 check_key_dates,
+                stub_gather_meeting_week,
             ],
         ):
             result = await client.execute_workflow(
@@ -379,6 +381,14 @@ async def test_daily_review_addresses_config_agent_id() -> None:
 # ── C3: people radar — life.people key dates ride out with the weekly review ──
 
 
+_meeting_week_payload: dict = {}
+
+
+@activity.defn(name="gather_meeting_week")
+async def stub_gather_meeting_week() -> dict:
+    return dict(_meeting_week_payload)
+
+
 def _weekly_stubs(sent: list[str], key_dates: list[dict] | None, *, fail: bool = False):
     """Weekly-review activity stubs with a configurable check_upcoming_key_dates."""
 
@@ -417,6 +427,7 @@ def _weekly_stubs(sent: list[str], key_dates: list[dict] | None, *, fail: bool =
         send_message,
         log_review_digest,
         check_upcoming_key_dates,
+        stub_gather_meeting_week,
         apply_dec,
     ]
 
@@ -457,6 +468,42 @@ async def test_weekly_review_appends_upcoming_key_dates() -> None:
 
 
 @pytest.mark.asyncio
+async def test_weekly_review_appends_meeting_block_when_present() -> None:
+    _meeting_week_payload.clear()
+    _meeting_week_payload.update(
+        {"meetings": [{"title": "Standup", "talk_share_pct": 9.0, "contributions": ["c"],
+                       "problems_raised": [], "commitments": [], "verbosity_note": ""}],
+         "talk_share_avg": 9.0, "talk_share_prev": None,
+         "words_per_turn_avg": None, "words_per_turn_prev": None, "missing_doc_by_account": {}}
+    )
+    sent: list[str] = []
+    try:
+        async with (
+            await WorkflowEnvironment.start_time_skipping() as env,
+            Worker(
+                env.client,
+                task_queue="aegis-review-meetingweek-test",
+                workflows=[WeeklyReviewFlow, InteractionFlow],
+                activities=_weekly_stubs(sent, None),
+            ),
+        ):
+            await env.client.execute_workflow(
+                WeeklyReviewFlow.run,
+                WeeklyReviewConfig(),
+                id=f"weekly-meetingweek-{uuid.uuid4()}",
+                task_queue="aegis-review-meetingweek-test",
+            )
+        assert len(sent) == 1
+        sent_text = sent[0]
+        # One message: the framed narrative still carries the meetings block.
+        assert "Weekly review — LLM framing." in sent_text
+        assert "🎙 <b>Meetings this week</b> (1)" in sent_text
+        assert "• Standup — you spoke 9% · c" in sent_text
+    finally:
+        _meeting_week_payload.clear()
+
+
+@pytest.mark.asyncio
 async def test_weekly_review_ships_when_key_dates_lookup_fails() -> None:
     """A broken/absent people registry must not cost the user their review."""
     sent: list[str] = []
@@ -479,3 +526,49 @@ async def test_weekly_review_ships_when_key_dates_lookup_fails() -> None:
     assert len(sent) == 1
     assert "Weekly review — LLM framing." in sent[0]
     assert "Coming up" not in sent[0]
+
+
+def test_format_meeting_week_renders_block_and_is_empty_without_meetings():
+    assert format_meeting_week({}) == ""
+    assert format_meeting_week({"meetings": [], "missing_doc_by_account": {}}) == ""
+    data = {
+        "meetings": [
+            {"title": "New Pipeline Standup", "talk_share_pct": 6.4,
+             "contributions": ["proposed the pull-based batch pattern"],
+             "problems_raised": ["parity script is slow"],
+             "commitments": ["move reference collections to Postgres"],
+             "verbosity_note": "Your longest turn ran 240 words; the decision landed in the first 40."},
+            {"title": "1:1", "talk_share_pct": None, "contributions": [], "problems_raised": [],
+             "commitments": [], "verbosity_note": ""},
+        ],
+        "talk_share_avg": 11.2, "talk_share_prev": 14.0,
+        "words_per_turn_avg": 38.0, "words_per_turn_prev": None,
+        "missing_doc_by_account": {"arshad-stpd": {"no_drive_scope": 2}},
+    }
+    out = format_meeting_week(data)
+    assert out.startswith("🎙 <b>Meetings this week</b> (2)")
+    assert "• New Pipeline Standup — you spoke 6% · proposed the pull-based batch pattern" in out
+    assert "• 1:1 — no transcript" in out
+    assert "Commitments: move reference collections to Postgres" in out
+    assert "Problems you raised: parity script is slow" in out
+    assert "Talk share 11% (last week 14%) · 38 words per turn" in out
+    assert "last week" in out.split("Talk share")[1].split("\n")[0]
+    assert "On brevity: Your longest turn ran 240 words" in out
+    assert "⚠ 2 meetings stored without their doc — re-authorise Drive for arshad-stpd" in out
+    # Only the warning when there were no reviews at all this week. A status
+    # that is not a missing Drive grant must NOT advise re-authorising Drive.
+    only_warn = format_meeting_week({"meetings": [], "missing_doc_by_account": {"a": {"no_link": 1}}})
+    assert only_warn.startswith("🎙 <b>Meetings this week</b> (0)")
+    assert "⚠ 1 meeting stored without their doc (no_link)" in only_warn
+    assert "re-authorise" not in only_warn
+    # Both kinds on one account: the Drive line first, then the rest.
+    both = format_meeting_week(
+        {"meetings": [], "missing_doc_by_account": {"b": {"no_drive_scope": 1, "fetch_failed": 2}}}
+    )
+    scope_line = "  ⚠ 1 meeting stored without their doc — re-authorise Drive for b"
+    other_line = "  ⚠ 2 meetings stored without their doc (fetch_failed)"
+    assert scope_line in both and other_line in both
+    assert both.index(scope_line) < both.index(other_line)
+    # A stale flat-shape row (pre-fix payload, in-flight deploy) must not crash.
+    legacy = format_meeting_week({"meetings": [], "missing_doc_by_account": {"old": 3}})
+    assert "⚠ 3 meetings stored without their doc (unknown)" in legacy

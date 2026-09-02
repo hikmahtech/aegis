@@ -27,6 +27,7 @@ from aegis.services.email_rules import (
     known_senders,
     save_email_rules,
 )
+from aegis.services.meeting_rules import get_meeting_rules, save_meeting_rules
 
 router = APIRouter(
     prefix="/api/admin/email",
@@ -55,3 +56,18 @@ async def put_triage_rules(request: Request, body: dict[str, Any]) -> dict[str, 
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return {"categories": list(CATEGORIES), **rules, "known_senders": await known_senders(pool)}
+
+
+@router.get("/meeting-rules")
+async def get_meeting_rules_route(request: Request) -> dict[str, Any]:
+    """`settings.meeting_rules` — who "you" are in a meeting transcript."""
+    return await get_meeting_rules(request.app.state.db_pool)
+
+
+@router.put("/meeting-rules")
+async def put_meeting_rules_route(request: Request, body: dict[str, Any]) -> dict[str, Any]:
+    """Replace the rules. 400 (not a silent drop) on a malformed self_names."""
+    try:
+        return await save_meeting_rules(request.app.state.db_pool, body)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
