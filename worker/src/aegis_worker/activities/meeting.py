@@ -269,14 +269,20 @@ class MeetingActivities:
                 out["doc_status"] = _classify_export_error(exc)
                 return out
             notes, utterances = split_notes_transcript(text)
+            speakers = sorted({s for s, _ in utterances})
+            # `notes` is what gets filed as knowledge_content, and the transcript
+            # must never reach it. A doc that opens on a speaker line has empty
+            # split notes, so it gets a one-line header — enough to file the row
+            # and let analysis proceed. Never fall back to the raw export: that
+            # is the whole transcript.
             out.update(
                 {
                     "doc_status": "ok",
                     "title": (name or out["title"])[:200],
                     "doc_modified_time": mtime,
-                    "notes": notes or text.strip(),
+                    "notes": notes or (f"Speakers: {', '.join(speakers)}" if utterances else ""),
                     "transcript": utterances,
-                    "speakers": sorted({s for s, _ in utterances}),
+                    "speakers": speakers,
                 }
             )
             return out

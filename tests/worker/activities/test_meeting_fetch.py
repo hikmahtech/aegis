@@ -99,6 +99,24 @@ async def test_ok_path_exports_the_doc_and_splits_transcript(monkeypatch, tmp_pa
     assert out["meeting_date"].startswith("2026-")
 
 
+async def test_a_doc_with_no_preamble_gets_a_header_not_the_transcript(monkeypatch, tmp_path, token):
+    """A doc that opens straight on a speaker line has empty split notes. `notes`
+    is filed as knowledge_content, and the transcript must never reach it."""
+    only_transcript = (
+        "A Person: hello there\nB Person: hi\nA Person: how are things\nB Person: fine\n"
+    )
+    _wire(
+        monkeypatch,
+        _payload("body", f"https://docs.google.com/document/d/{DOC_ID}"),
+        lambda *_a: ("Standup", "2026-09-01T09:06:33Z", only_transcript),
+    )
+    out = await _act(tmp_path).fetch_meeting_document("acct", MSG)
+    assert out["doc_status"] == "ok"
+    assert out["notes"] == "Speakers: A Person, B Person"
+    assert "hello there" not in out["notes"]
+    assert len(out["transcript"]) == 4
+
+
 async def test_no_link_falls_back_to_body(monkeypatch, tmp_path, token):
     _wire(monkeypatch, _payload("Plain summary body only", None), lambda *_a: pytest.fail("must not export"))
     out = await _act(tmp_path).fetch_meeting_document("acct", MSG)
