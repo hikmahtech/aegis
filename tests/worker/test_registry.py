@@ -250,10 +250,13 @@ def test_module_workflows_is_the_unflagged_registry():
         # Then +1 flow and +2 activities from MeetingNotesFlow /
         # MeetingActivities (fetch_meeting_document, analyse_meeting) — a child
         # of GmailIngestFlow's `meeting` tag fan-out, unflagged, so all three
-        # rows move.
-        (True, True, 41, 199),
-        (False, False, 33, 169),
-        (True, False, 37, 188),
+        # rows move. Then +1 activity and NO new flow from
+        # `gather_meeting_week` on the existing ReviewActivities — the weekly
+        # meetings block is SQL aggregation driven by the existing
+        # WeeklyReviewFlow, so it moves in every row.
+        (True, True, 41, 200),
+        (False, False, 33, 170),
+        (True, False, 37, 189),
     ],
 )
 def test_real_registration_passes_the_boot_check(homelab, money, flows, activities):

@@ -19,6 +19,7 @@ with workflow.unsafe.imports_passed_through():
         ReviewActivities,
         format_daily_preview,
         format_key_dates,
+        format_meeting_week,
         format_today_focus,
         format_weekly_preview,
     )
@@ -222,6 +223,22 @@ class WeeklyReviewFlow:
             key_dates_block = format_key_dates(key_dates)
             if key_dates_block:
                 narrative = f"{narrative}\n\n{key_dates_block}"
+            # Meetings block (MeetingNotesFlow's weekly digest). Same
+            # best-effort contract as key dates: a broken meeting query must
+            # never cost the user their weekly review.
+            step = "gather_meeting_week"
+            try:
+                meeting_week = await workflow.execute_activity_method(
+                    ReviewActivities.gather_meeting_week,
+                    start_to_close_timeout=TIMEOUT_FAST,
+                    retry_policy=NO_RETRY,
+                )
+            except Exception as exc:  # noqa: BLE001
+                workflow.logger.warning("weekly_meeting_week_failed err=%s", str(exc)[:200])
+                meeting_week = {}
+            meeting_block = format_meeting_week(meeting_week)
+            if meeting_block:
+                narrative = f"{narrative}\n\n{meeting_block}"
             step = "send_message"
             try:
                 await workflow.execute_activity_method(
