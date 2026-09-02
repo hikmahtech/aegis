@@ -1,7 +1,7 @@
 # Meeting notes: store, analyse, digest weekly
 
 **Date:** 2026-09-02
-**Status:** design for review, not yet implemented
+**Status:** implemented 2026-09-02 (PR pending)
 
 ## Problem
 
