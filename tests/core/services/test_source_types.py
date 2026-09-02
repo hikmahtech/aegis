@@ -61,6 +61,9 @@ VERIFIED_LITERALS = {
     "life_fact",
     "daylog",
     "daylog_rollup",
+    # MeetingNotesFlow (worker activities/meeting.py, flows/meeting_notes.py)
+    "meeting",
+    "meeting_review",
 }
 
 

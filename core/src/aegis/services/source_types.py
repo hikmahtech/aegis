@@ -116,6 +116,17 @@ SOURCE_TYPES: dict[str, SourceTypeInfo] = {
     ),
     "daylog": SourceTypeInfo("Daily log entries (life-domain, planned)"),
     "daylog_rollup": SourceTypeInfo("Rolled-up daylog summaries (life-domain, planned)"),
+    "meeting": SourceTypeInfo(
+        "Meeting notes fetched from a note-taker's linked Google Doc, or the "
+        "email body when no doc is reachable (worker activities/meeting.py, "
+        "MeetingNotesFlow). The notes are the record, so they decay slowly.",
+        decay_days=365,
+    ),
+    "meeting_review": SourceTypeInfo(
+        "Per-meeting self-review — contributions, problems raised, commitments, "
+        "one brevity note — written by MeetingNotesFlow from the user's own "
+        "transcript lines (worker activities/meeting.py)"
+    ),
 }
 
 
