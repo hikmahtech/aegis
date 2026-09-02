@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import uuid
 
+import aegis_worker.activities.review as activities_review
 import pytest
-from aegis_worker.activities.review import format_meeting_week
+from aegis_worker.activities.review import format_key_dates, format_meeting_week
 from aegis_worker.flows.interaction import InteractionFlow
 from aegis_worker.flows.review import (
     DailyReviewConfig,
@@ -528,6 +529,39 @@ async def test_weekly_review_ships_when_key_dates_lookup_fails() -> None:
     assert "Coming up" not in sent[0]
 
 
+@pytest.mark.asyncio
+async def test_weekly_review_ships_when_the_meeting_formatter_raises() -> None:
+    """The gather was guarded but the FORMAT call sat outside the try, so a
+    malformed payload failed the flow before send_message ever ran. `meetings`
+    as a dict is that payload: truthy, so the block is built, and `meetings[:8]`
+    raises TypeError."""
+    _meeting_week_payload.clear()
+    _meeting_week_payload.update({"meetings": {"not": "a list"}, "missing_doc_by_account": {}})
+    sent: list[str] = []
+    try:
+        async with (
+            await WorkflowEnvironment.start_time_skipping() as env,
+            Worker(
+                env.client,
+                task_queue="aegis-review-meetingfmt-fail",
+                workflows=[WeeklyReviewFlow, InteractionFlow],
+                activities=_weekly_stubs(sent, None),
+            ),
+        ):
+            result = await env.client.execute_workflow(
+                WeeklyReviewFlow.run,
+                WeeklyReviewConfig(),
+                id=f"weekly-meetingfmt-fail-{uuid.uuid4()}",
+                task_queue="aegis-review-meetingfmt-fail",
+            )
+        assert result["kind"] == "weekly"
+        assert len(sent) == 1
+        assert "Weekly review — LLM framing." in sent[0]
+        assert "Meetings this week" not in sent[0]
+    finally:
+        _meeting_week_payload.clear()
+
+
 def test_format_meeting_week_renders_block_and_is_empty_without_meetings():
     assert format_meeting_week({}) == ""
     assert format_meeting_week({"meetings": [], "missing_doc_by_account": {}}) == ""
@@ -572,3 +606,133 @@ def test_format_meeting_week_renders_block_and_is_empty_without_meetings():
     # A stale flat-shape row (pre-fix payload, in-flight deploy) must not crash.
     legacy = format_meeting_week({"meetings": [], "missing_doc_by_account": {"old": 3}})
     assert "⚠ 3 meetings stored without their doc (unknown)" in legacy
+
+
+@pytest.mark.asyncio
+async def test_weekly_review_ships_when_the_key_dates_formatter_raises(monkeypatch) -> None:
+    """The other half of the same guard. Driven by replacing the formatter, not
+    by a malformed activity result: `check_upcoming_key_dates` is annotated
+    `-> list[dict]`, so a wrongly-typed stub result fails payload conversion
+    OUTSIDE the workflow's try — a workflow TASK failure, which retries forever
+    and hangs under time skipping instead of failing. Both formatters come into
+    `flows.review` through `imports_passed_through()`, so they are ordinary
+    module attributes and a monkeypatch reaches the workflow — but it has to be
+    set on `activities.review`, the module that is passed through. The sandbox
+    re-imports `flows.review` itself, so a patch on THAT module is rebound to
+    the real function before the workflow runs and the test passes vacuously."""
+
+    def _boom(items):
+        raise TypeError("simulated formatter bug")
+
+    monkeypatch.setattr(activities_review, "format_key_dates", _boom)
+    hits = [{"name": "Amma", "relationship": "mother", "label": "birthday",
+             "date": "2026-08-04", "days_until": 3, "years": 60}]
+    sent: list[str] = []
+    async with (
+        await WorkflowEnvironment.start_time_skipping() as env,
+        Worker(
+            env.client,
+            task_queue="aegis-review-keydatesfmt-fail",
+            workflows=[WeeklyReviewFlow, InteractionFlow],
+            activities=_weekly_stubs(sent, hits),
+        ),
+    ):
+        result = await env.client.execute_workflow(
+            WeeklyReviewFlow.run,
+            WeeklyReviewConfig(),
+            id=f"weekly-keydatesfmt-fail-{uuid.uuid4()}",
+            task_queue="aegis-review-keydatesfmt-fail",
+        )
+    assert result["kind"] == "weekly"
+    assert len(sent) == 1
+    assert "Weekly review — LLM framing." in sent[0]
+    assert "Coming up" not in sent[0]
+
+
+def test_format_meeting_week_warns_about_meetings_filed_without_a_review():
+    """A skipped analysis was visible only in workflow_runs. The line reads in
+    plain English, not the raw enum, and pluralises like its missing-doc
+    sibling. Nothing at all — no meetings, no missing docs, no skips — is still
+    the empty string, so the weekly review appends nothing."""
+    assert format_meeting_week({"meetings": [], "missing_doc_by_account": {}, "no_review_by_reason": {}}) == ""
+    out = format_meeting_week(
+        {
+            "meetings": [],
+            "missing_doc_by_account": {},
+            "no_review_by_reason": {"self_not_matched": 3, "too_thin": 1, "llm_failed": 2},
+        }
+    )
+    assert out.startswith("🎙 <b>Meetings this week</b> (0)")
+    assert "  ⚠ 3 meetings filed without a review: no speaker matched your names" in out
+    assert "  ⚠ 1 meeting filed without a review: too little text to review" in out
+    assert "  ⚠ 2 meetings filed without a review: the review could not be generated" in out
+    # Every skip reason has a phrase; an unknown one falls back to the raw value.
+    for reason, phrase in (
+        ("no_self_names", "your names are not configured"),
+        ("no_llm", "the review could not be generated"),
+        ("analysis_failed", "the review could not be generated"),
+        ("something_new", "something_new"),
+    ):
+        line = format_meeting_week({"no_review_by_reason": {reason: 1}})
+        assert f"  ⚠ 1 meeting filed without a review: {phrase}" in line
+    # The warnings sit after the missing-doc block, which is the older signal.
+    both = format_meeting_week(
+        {
+            "missing_doc_by_account": {"acct": {"no_link": 1}},
+            "no_review_by_reason": {"self_not_matched": 1},
+        }
+    )
+    doc_line = "  ⚠ 1 meeting stored without their doc (no_link)"
+    skip_line = "  ⚠ 1 meeting filed without a review: no speaker matched your names"
+    assert both.index(doc_line) < both.index(skip_line)
+
+
+def test_format_meeting_week_escapes_every_value_it_interpolates():
+    """The weekly block is parsed as HTML downstream (comms `html_to_mrkdwn` is
+    an HTMLParser), so an `<a href>` the review model emits would arrive as a
+    real clickable Slack link and a `<` in a doc title would be swallowed.
+    Every interpolated value is escaped; the block's own tags are not."""
+    evil = '<b>bold</b> <a href="http://x">link</a>'
+    out = format_meeting_week(
+        {
+            "meetings": [
+                {
+                    "title": evil,
+                    "talk_share_pct": 9.0,
+                    "contributions": [evil],
+                    "problems_raised": [evil],
+                    "commitments": [evil],
+                    "verbosity_note": evil,
+                }
+            ],
+            "missing_doc_by_account": {evil: {"no_drive_scope": 1, "<i>odd</i>": 2}},
+        }
+    )
+    assert "<b>bold</b>" not in out
+    assert "<a href=" not in out
+    assert "<i>odd</i>" not in out
+    assert "&lt;b&gt;bold&lt;/b&gt;" in out
+    assert "&lt;a href=&quot;http://x&quot;&gt;link&lt;/a&gt;" in out
+    # …and the formatter's own markup is untouched.
+    assert out.startswith("🎙 <b>Meetings this week</b> (1)")
+
+
+def test_format_key_dates_escapes_the_people_values():
+    """Same gap, same delivered message: life.people values are free text too."""
+    out = format_key_dates(
+        [
+            {
+                "name": "<script>alert(1)</script>",
+                "relationship": "<b>mother</b>",
+                "label": "<i>birthday</i>",
+                "date": "2026-08-04",
+                "days_until": 3,
+                "years": 60,
+            }
+        ]
+    )
+    assert "<script>" not in out
+    assert "<b>mother</b>" not in out
+    assert "<i>birthday</i>" not in out
+    assert "&lt;script&gt;alert(1)&lt;/script&gt;" in out
+    assert out.startswith("🎂 <b>Coming up</b>")

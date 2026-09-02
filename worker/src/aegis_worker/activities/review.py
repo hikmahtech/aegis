@@ -11,6 +11,7 @@ See docs/superpowers/specs/2026-05-20-gtd-todoist-phase5-reviews-design.md.
 from __future__ import annotations
 
 import datetime as dt
+import html as _html
 from dataclasses import dataclass
 from typing import Any
 
@@ -59,6 +60,18 @@ _MEETING_AT = (
 # Gemini names every export "<meeting> – Notes by Gemini"; both dashes occur.
 _GEMINI_SUFFIXES = (" – Notes by Gemini", " - Notes by Gemini")
 _REVIEW_TITLE_PREFIX = "Meeting review: "
+# `analyse_meeting`'s skip reasons in the words the user thinks in. The three
+# LLM failures share a phrase because the distinction between them is an
+# operator's question, not the user's — it is in the logs either way. A reason
+# with no entry renders raw, so a new skip still surfaces instead of vanishing.
+_NO_REVIEW_PHRASES = {
+    "self_not_matched": "no speaker matched your names",
+    "no_self_names": "your names are not configured",
+    "too_thin": "too little text to review",
+    "llm_failed": "the review could not be generated",
+    "no_llm": "the review could not be generated",
+    "analysis_failed": "the review could not be generated",
+}
 
 
 def _meeting_display_title(row_title: str | None, meta_title: Any) -> str:
@@ -807,6 +820,7 @@ class ReviewActivities:
             "words_per_turn_avg": None,
             "words_per_turn_prev": None,
             "missing_doc_by_account": {},
+            "no_review_by_reason": {},
         }
         if self.db_pool is None:
             return empty
@@ -862,6 +876,19 @@ class ReviewActivities:
                 "AND COALESCE(metadata->>'doc_status', '') <> 'ok' "
                 "GROUP BY 1, 2"
             )
+            # Meetings whose analysis was skipped. Same meeting-date window as
+            # the list above, so a backfill of old meetings cannot file them
+            # under "this week". Rows with no `analysis` key at all predate the
+            # stamp and are not counted — an absent verdict is not a skip.
+            no_review = await conn.fetch(
+                "SELECT metadata->>'analysis' AS reason, count(*) AS n "
+                "FROM knowledge_content "
+                "WHERE source_type='meeting' "
+                f"AND {_MEETING_AT} >= now() - interval '7 days' "
+                "AND metadata->>'analysis' IS NOT NULL "
+                "AND metadata->>'analysis' <> 'ok' "
+                "GROUP BY 1"
+            )
 
         def _r(v):
             return round(float(v), 1) if v is not None else None
@@ -877,6 +904,7 @@ class ReviewActivities:
             "words_per_turn_avg": _r(wpt_now),
             "words_per_turn_prev": _r(wpt_prev),
             "missing_doc_by_account": missing_by_account,
+            "no_review_by_reason": {str(r["reason"]): int(r["n"]) for r in no_review},
         }
 
     @activity.defn
@@ -1124,10 +1152,10 @@ def format_key_dates(items: list[dict]) -> str:
     for it in items[:10]:
         days = it.get("days_until")
         when = "today" if days == 0 else ("tomorrow" if days == 1 else f"in {days}d")
-        who = _clip(it.get("name"), 40)
-        rel = f" ({_clip(it.get('relationship'), 24)})" if it.get("relationship") else ""
+        who = _esc(it.get("name"), 40)
+        rel = f" ({_esc(it.get('relationship'), 24)})" if it.get("relationship") else ""
         years = f" — turning {it['years']}" if it.get("years") else ""
-        lines.append(f"  • {who}{rel}: {_clip(it.get('label'), 24)} {when}{years}")
+        lines.append(f"  • {who}{rel}: {_esc(it.get('label'), 24)} {when}{years}")
     return "\n".join(lines)
 
 
@@ -1137,21 +1165,22 @@ def format_meeting_week(data: dict) -> str:
     data = data or {}
     meetings = data.get("meetings") or []
     missing = data.get("missing_doc_by_account") or {}
-    if not meetings and not missing:
+    no_review = data.get("no_review_by_reason") or {}
+    if not meetings and not missing and not no_review:
         return ""
     lines = [f"🎙 <b>Meetings this week</b> ({len(meetings)})"]
     for m in meetings[:8]:
         share = m.get("talk_share_pct")
         spoke = f"you spoke {share:.0f}%" if share is not None else "no transcript"
         top = (m.get("contributions") or [""])[0]
-        tail = f" · {_clip(top, 70)}" if top else ""
-        lines.append(f"  • {_clip(m.get('title'), 48)} — {spoke}{tail}")
+        tail = f" · {_esc(top, 70)}" if top else ""
+        lines.append(f"  • {_esc(m.get('title'), 48)} — {spoke}{tail}")
     commitments = [c for m in meetings for c in (m.get("commitments") or [])][:5]
     if commitments:
-        lines.append("  Commitments: " + " · ".join(_clip(c, 60) for c in commitments))
+        lines.append("  Commitments: " + " · ".join(_esc(c, 60) for c in commitments))
     problems = [p for m in meetings for p in (m.get("problems_raised") or [])][:3]
     if problems:
-        lines.append("  Problems you raised: " + " · ".join(_clip(p, 60) for p in problems))
+        lines.append("  Problems you raised: " + " · ".join(_esc(p, 60) for p in problems))
     ts, ts_prev = data.get("talk_share_avg"), data.get("talk_share_prev")
     wpt, wpt_prev = data.get("words_per_turn_avg"), data.get("words_per_turn_prev")
     if ts is not None or wpt is not None:
@@ -1163,7 +1192,7 @@ def format_meeting_week(data: dict) -> str:
         lines.append("  " + " · ".join(parts))
     note = next((m["verbosity_note"] for m in meetings if m.get("verbosity_note")), "")
     if note:
-        lines.append(f"  On brevity: {_clip(note, 240)}")
+        lines.append(f"  On brevity: {_esc(note, 240)}")
     for account, counts in sorted(missing.items()):
         # Tolerate the pre-fix flat shape {account: int} so a stale row from an
         # in-flight deploy degrades to "unknown" instead of crashing the review.
@@ -1174,14 +1203,22 @@ def format_meeting_week(data: dict) -> str:
             plural = "s" if scope != 1 else ""
             lines.append(
                 f"  ⚠ {scope} meeting{plural} stored without their doc"
-                f" — re-authorise Drive for {account}"
+                f" — re-authorise Drive for {_html.escape(str(account))}"
             )
         if other:
             plural = "s" if other != 1 else ""
-            statuses = ", ".join(sorted(s for s in counts if s != "no_drive_scope"))
+            statuses = ", ".join(
+                _html.escape(str(s)) for s in sorted(counts) if s != "no_drive_scope"
+            )
             lines.append(
                 f"  ⚠ {other} meeting{plural} stored without their doc ({statuses})"
             )
+    # …and meetings whose doc arrived but whose review never happened. Same
+    # shape as the missing-doc warnings, after them: that is the older signal.
+    for reason, n in sorted(no_review.items()):
+        plural = "s" if n != 1 else ""
+        phrase = _NO_REVIEW_PHRASES.get(reason) or _esc(reason, 40)
+        lines.append(f"  ⚠ {n} meeting{plural} filed without a review: {phrase}")
     return "\n".join(lines)
 
 
@@ -1218,3 +1255,16 @@ def _waiting_streak(task_id: str, prior_weeklies: list[dict]) -> int:
 def _clip(value: Any, n: int) -> str:
     s = str(value or "")
     return s if len(s) <= n else s[: n - 1] + "…"
+
+
+def _esc(value: Any, n: int) -> str:
+    """Clip, then HTML-escape — the order the weekly blocks interpolate with.
+
+    Both blocks ride out in one message that comms parses as HTML
+    (`aegis_comms.format.html_to_mrkdwn` is an HTMLParser), so an unescaped `<`
+    in a doc title is swallowed and an `<a href>` the review model emits becomes
+    a real clickable link. Escaping AFTER clipping is what keeps `_clip` from
+    cutting an entity in half and shipping a dangling `&am…`; the cost is a
+    rendered line slightly longer than `n`, which is the cheaper of the two.
+    """
+    return _html.escape(_clip(value, n))

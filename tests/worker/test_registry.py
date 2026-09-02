@@ -253,10 +253,15 @@ def test_module_workflows_is_the_unflagged_registry():
         # rows move. Then +1 activity and NO new flow from
         # `gather_meeting_week` on the existing ReviewActivities — the weekly
         # meetings block is SQL aggregation driven by the existing
-        # WeeklyReviewFlow, so it moves in every row.
-        (True, True, 41, 200),
-        (False, False, 33, 170),
-        (True, False, 37, 189),
+        # WeeklyReviewFlow, so it moves in every row. Then +1 activity and NO
+        # new flow from `record_analysis_outcome` on the existing
+        # MeetingActivities — MeetingNotesFlow stamps the analysis verdict back
+        # onto the row it already filed, so the weekly block can warn about
+        # meetings filed without a review. MeetingActivities is unflagged, so
+        # it moves in every row.
+        (True, True, 41, 201),
+        (False, False, 33, 171),
+        (True, False, 37, 190),
     ],
 )
 def test_real_registration_passes_the_boot_check(homelab, money, flows, activities):
