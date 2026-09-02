@@ -282,3 +282,105 @@ def test_a_title_case_heading_over_bullets_does_not_open_a_transcript():
     assert utt[0] == ("Ada Lovelace", "Morning all, let's start with the seams.")
     assert len(utt) == 5
     assert {s for s, _ in utt} == {"Ada Lovelace", "Sam Doe"}
+
+
+# --- The density rule must never cost us a transcript we already detected. ---
+# Filing a real transcript as `notes` is the one direction this lane forbids:
+# `analyse_meeting` then reads a transcript-less doc and hands other people's
+# words to the LLM as the user's own meeting notes. So when density finds no
+# opening, the split falls back — first to a recurring label, then to the first
+# candidate — and only a document with NO candidate at all stays wholly notes.
+
+SPARSE_WRAP = """Notes
+Ada Lovelace: First utterance line.
+continuation line 1
+continuation line 2
+continuation line 3
+continuation line 4
+Sam Doe: Next utterance.
+"""
+
+# Density fails at every speaker line — four wrapped continuations apiece — but
+# "Ada Lovelace" speaks twice and the heading label does not.
+HEADING_OVER_SPARSE_TRANSCRIPT = """Data Foundations: Session 4
+* We agreed the seam is the contract.
+* Sam raised the migration risk.
+Ada Lovelace: Morning all, and this first line
+runs on for a while
+and keeps running on
+and on again
+and once more.
+Sam Doe: The contract needs a version field
+and the migration is slow
+and the parity check is slower
+and that is all from me
+for now.
+Ada Lovelace: Agreed, let's write it up
+in an ADR before Thursday
+so the other team can read it
+ahead of the session
+next week.
+"""
+
+# The same shape with nothing to break the tie: no label recurs.
+NO_RECURRING_LABEL = """✍️ Quick notes
+Data Foundations: Session 4
+* We agreed the seam is the contract.
+* Sam raised the migration risk.
+Ada Lovelace: Morning all, and this first line
+runs on for a while
+and keeps running on
+and on again
+and once more.
+Sam Doe: The contract needs a version field
+and the migration is slow
+and the parity check is slower
+and that is all from me
+for now.
+"""
+
+
+def test_a_transcript_too_sparse_for_the_density_window_still_opens():
+    """Four wrapped continuation lines put density at 2 of 6, and the second
+    speaker sits at the end of the doc where the window is too short to pass
+    either. Without a fallback the whole transcript is filed as notes."""
+    notes, utt = split_notes_transcript(SPARSE_WRAP)
+    assert notes == "Notes"
+    assert utt == [
+        (
+            "Ada Lovelace",
+            "First utterance line. continuation line 1 continuation line 2"
+            " continuation line 3 continuation line 4",
+        ),
+        ("Sam Doe", "Next utterance."),
+    ]
+
+
+def test_a_recurring_speaker_beats_a_one_off_heading_when_density_fails():
+    notes, utt = split_notes_transcript(HEADING_OVER_SPARSE_TRANSCRIPT)
+    assert notes == (
+        "Data Foundations: Session 4\n"
+        "* We agreed the seam is the contract.\n"
+        "* Sam raised the migration risk."
+    )
+    assert [s for s, _ in utt] == ["Ada Lovelace", "Sam Doe", "Ada Lovelace"]
+    assert utt[0][1].endswith("and once more.")
+    for _, u in utt:
+        assert u not in notes
+
+
+def test_with_no_recurring_label_the_split_sacrifices_notes_never_the_transcript():
+    """The documented worst case, pinned so the failure DIRECTION is visible.
+
+    Density fails everywhere and no label recurs, so the split opens on the first
+    candidate — here the notes heading — and the headline and bullets are lost
+    into the transcript. That is the price: notes are sacrificed, a transcript is
+    never left sitting in `notes` where analyse_meeting would treat other
+    people's words as the user's own."""
+    notes, utt = split_notes_transcript(NO_RECURRING_LABEL)
+    assert notes == "✍️ Quick notes"
+    assert utt[0][0] == "Data Foundations"
+    assert "Ada Lovelace" in {s for s, _ in utt}
+    assert "Sam Doe" in {s for s, _ in utt}
+    for _, u in utt:
+        assert u not in notes

@@ -100,24 +100,59 @@ def _speaker_lines_dominate(
     return sum(1 for i in window if labels[i] in candidates) >= needed
 
 
+def _transcript_start(
+    lines: list[str],
+    labels: list[str | None],
+    candidates: set[str | None],
+    counts: dict[str, int],
+) -> int | None:
+    """Where the transcript opens, or None when the document has no candidate.
+
+    Density alone was not safe to gate on. A real transcript can fail it — four
+    wrapped continuation lines per utterance puts it at 2 of 6, and a speaker at
+    the end of the document has a window too short to pass — and rejecting every
+    candidate would file the whole transcript as `notes`. That is the one
+    direction this lane forbids: `analyse_meeting` would then read a
+    transcript-less doc and send other people's words to the LLM as the user's
+    own notes. So the choice degrades instead of failing:
+
+    1. the first candidate where speaker lines dominate (the density rule);
+    2. else the first candidate whose label RECURS — real speakers come back, a
+       notes heading usually appears once;
+    3. else the first candidate at all.
+
+    Only a document with no candidate line anywhere stays wholly notes, which is
+    still safe: there was no transcript to lose. Steps 2 and 3 can cost us the
+    notes above a speaker-shaped heading; that is the deliberate trade.
+    """
+    hits = [i for i, lab in enumerate(labels) if lab in candidates]
+    if not hits:
+        return None
+    dense = next((i for i in hits if _speaker_lines_dominate(lines, labels, i, candidates)), None)
+    if dense is not None:
+        return dense
+    return next((i for i in hits if counts.get(str(labels[i]), 0) >= 2), hits[0])
+
+
 def split_notes_transcript(text: str) -> tuple[str, list[tuple[str, str]]]:
     """(notes, [(speaker, utterance), …]).
 
-    Notes are everything before the transcript, which opens at the first
-    speaker-shaped line whose label recurs or looks like a name AND where such
-    lines go on to carry at least half the following window (see
-    `_DENSITY_WINDOW`). Inside the transcript a bare timestamp line is dropped and
-    any other non-speaker, non-blank line is a wrapped continuation of the previous
-    utterance. Not keyed on a "Transcript" heading: the Gemini export mentions that
-    word inside the notes tab too. A leading BOM is stripped first: Drive's
-    plain-text export starts with one and ``str.strip`` does not remove it, so
-    without this the notes begin with an invisible U+FEFF.
+    Notes are everything before the transcript. A candidate line — speaker-shaped,
+    with a label that recurs or looks like a name — opens it, preferring one where
+    such lines dominate what follows; `_transcript_start` holds the full rule and
+    the reason it degrades rather than rejecting every candidate. Inside the
+    transcript a bare timestamp line is dropped and any other non-speaker,
+    non-blank line is a wrapped continuation of the previous utterance. Not keyed
+    on a "Transcript" heading: the Gemini export mentions that word inside the
+    notes tab too. A leading BOM is stripped first: Drive's plain-text export
+    starts with one and ``str.strip`` does not remove it, so without this the
+    notes begin with an invisible U+FEFF.
     # ponytail: label heuristic plus a density count, no vendor knowledge. Its
-    # ceiling is now a notes heading that reads as a speaker AND sits directly on
-    # top of the transcript, with fewer than three non-speaker lines between them —
-    # then the window is dense enough and the heading opens the transcript. The
-    # upgrade path is unchanged: a vendor-keyed splitter chosen from the sending
-    # address.
+    # ceiling is a notes heading that reads as a speaker and either sits within
+    # two non-speaker lines of the transcript (dense enough to win outright) or is
+    # the only candidate left once density has failed everywhere. Either way it
+    # costs notes, never the transcript. The upgrade path is unchanged: a
+    # vendor-keyed splitter chosen from the sending address.
     """
     lines = (text or "").lstrip("\ufeff").splitlines()
     labels: list[str | None] = []
@@ -131,14 +166,7 @@ def split_notes_transcript(text: str) -> tuple[str, list[tuple[str, str]]]:
     candidates: set[str | None] = {
         lab for lab, n in counts.items() if n >= 2 or _is_name_like(lab)
     }
-    start = next(
-        (
-            i
-            for i, lab in enumerate(labels)
-            if lab in candidates and _speaker_lines_dominate(lines, labels, i, candidates)
-        ),
-        None,
-    )
+    start = _transcript_start(lines, labels, candidates, counts)
     if start is None:
         return (text or "").strip(), []
     notes = "\n".join(lines[:start]).strip()
