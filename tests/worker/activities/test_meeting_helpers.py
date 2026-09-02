@@ -236,3 +236,49 @@ def test_a_recurring_single_word_label_does_open_a_transcript():
         ("Decision", "ship the widget on Friday. More prose in between."),
         ("Decision", "hold the cache change. Final line of prose."),
     ]
+
+
+# The real export that lost its notes. The notes tab opens with the doc's own
+# title, which is speaker-shaped and name-like ("Data Foundations"), and the same
+# string comes back on an "Attachments" line. Both were candidate labels, so the
+# split opened on line 2 and folded every note into one pseudo-utterance. Only the
+# density rule — speaker lines must dominate what follows — keeps them in the notes.
+TITLED_NOTES = """✍️ Quick notes
+Data Foundations: Session 4 - Seams as Contracts
+Team walked through the seam contract for the ingest boundary.
+
+Seams as contracts
+* Ada framed the seam as the only place the two teams agree.
+* Sam raised the migration risk on the older collections.
+* Grace asked for a version field on the contract.
+
+Suggested next steps
+* Ada to write the ADR by Thursday.
+* Sam to check parity on the older collections.
+
+Attachments Data Foundations: Session 4 - Seams as Contracts
+You should review Gemini's notes to make sure they are accurate.
+Get tips and learn how Gemini takes notes.
+Please provide feedback about using Gemini.
+
+Transcript
+
+Ada Lovelace: Morning all, let's start with the seams.
+Sam Doe: The contract needs a version field before we migrate.
+Ada Lovelace: Agreed, I will write that up as an ADR.
+Sam Doe: I can review it on Thursday after the parity run.
+Ada Lovelace: Thanks, that closes it.
+"""
+
+
+def test_a_title_case_heading_over_bullets_does_not_open_a_transcript():
+    notes, utt = split_notes_transcript(TITLED_NOTES)
+    assert notes.startswith("✍️ Quick notes")
+    assert "Data Foundations: Session 4 - Seams as Contracts" in notes
+    assert "* Ada framed the seam" in notes
+    assert "* Sam to check parity" in notes
+    assert "Attachments Data Foundations" in notes
+    assert "Morning all" not in notes
+    assert utt[0] == ("Ada Lovelace", "Morning all, let's start with the seams.")
+    assert len(utt) == 5
+    assert {s for s, _ in utt} == {"Ada Lovelace", "Sam Doe"}
