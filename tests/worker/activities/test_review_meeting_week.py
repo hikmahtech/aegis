@@ -8,7 +8,7 @@ from datetime import UTC, datetime, timedelta
 import pytest
 import pytest_asyncio
 from aegis.services.observations import record_external_observation
-from aegis_worker.activities.review import ReviewActivities
+from aegis_worker.activities.review import ReviewActivities, format_meeting_week
 
 pytestmark = pytest.mark.asyncio
 PREFIX = "mw-test-"
@@ -62,3 +62,57 @@ async def test_gathers_reviews_averages_and_missing_docs(pool):
     assert out["talk_share_avg"] == 12.0 and out["talk_share_prev"] == 20.0
     assert out["words_per_turn_avg"] == 38.0 and out["words_per_turn_prev"] == 60.0
     assert out["missing_doc_by_account"] == {"acct-b": {"no_drive_scope": 1, "inaccessible": 1}}
+
+
+async def test_the_week_is_picked_by_meeting_date_not_ingest_time(pool):
+    """A backfill re-ingests old meetings, so `ingested_at` called every one of
+    them "this week" — the first backfill listed 20. Only the meeting's own date
+    makes the list right, and a malformed one must fall back, not raise."""
+    review = {"contributions": [], "problems_raised": [], "commitments": [], "verbosity_note": ""}
+    now = datetime.now(UTC)
+
+    def _held(days_ago):
+        return {"review": review, "stats": {}, "meeting_date": (now - timedelta(days=days_ago)).isoformat()}
+
+    # Backfilled today, held three weeks ago ⇒ out of the week.
+    await _content(pool, "meeting_review", "Backfilled old", _held(20), age_days=0)
+    # Filed ten days late, held two days ago ⇒ in the week.
+    await _content(pool, "meeting_review", "Late filed", _held(2), age_days=10)
+    # An unparseable meeting_date falls back to ingest time inside SQL.
+    await _content(
+        pool, "meeting_review", "Garbled date",
+        {"review": review, "stats": {}, "meeting_date": "garbage"}, age_days=0,
+    )
+    # The same expression governs the missing-doc counts over `meeting` rows.
+    await _content(
+        pool, "meeting", "Backfilled no doc",
+        {"doc_status": "no_drive_scope", "account": "acct-x",
+         "meeting_date": (now - timedelta(days=20)).isoformat()}, age_days=0,
+    )
+
+    out = await ReviewActivities(db_pool=pool).gather_meeting_week()
+    titles = [m["title"] for m in out["meetings"]]
+    assert "Backfilled old" not in titles
+    assert "Late filed" in titles
+    assert "Garbled date" in titles
+    assert "acct-x" not in out["missing_doc_by_account"]
+
+
+async def test_the_block_shows_the_meeting_title_not_the_review_prefix(pool):
+    """The review row's own title is `Meeting review: <title>`, and Gemini appends
+    " – Notes by Gemini" to every doc name, so the block read
+    "• Meeting review: Data Foundations: Session 4 - S…" with the real title
+    clipped away. Display only — the stored title is untouched."""
+    await _content(
+        pool, "meeting_review", "Meeting review: Standup – 2026/09/01 09:30 BST – Notes by Gemini",
+        {"title": "Standup – 2026/09/01 09:30 BST – Notes by Gemini",
+         "review": {"contributions": [], "problems_raised": [], "commitments": [], "verbosity_note": ""},
+         "stats": {"self": {"talk_share_pct": 9.0}}},
+    )
+    # No metadata.title (a pre-fix row): fall back to the row title, prefix and
+    # hyphen-spelled Gemini suffix stripped.
+    await _content(pool, "meeting_review", "Meeting review: Retro - Notes by Gemini", {"review": {}, "stats": {}})
+
+    out = await ReviewActivities(db_pool=pool).gather_meeting_week()
+    assert {m["title"] for m in out["meetings"]} == {"Standup – 2026/09/01 09:30 BST", "Retro"}
+    assert "• Standup – 2026/09/01 09:30 BST — you spoke 9%" in format_meeting_week(out)

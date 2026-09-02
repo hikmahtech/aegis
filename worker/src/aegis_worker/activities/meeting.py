@@ -15,6 +15,7 @@ import json
 import re
 from collections.abc import Iterable
 from dataclasses import dataclass
+from itertools import islice
 from pathlib import Path
 from typing import Any
 
@@ -30,14 +31,24 @@ _DOC_ID_RE = re.compile(r"docs\.google\.com/document/d/([A-Za-z0-9_-]+)")
 # `Speaker Name: words`. The label must start with a letter so a `10:30: …`
 # timestamp never reads as a speaker, and may not contain a colon.
 _SPEAKER_LINE_RE = re.compile(r"^([A-Za-z][^:\n]{1,59}): \S")
-# The transcript starts at the first speaker line whose LABEL is a candidate: it
-# either recurs on two or more speaker lines anywhere in the document, or it looks
-# like a person's name. Every real transcript has one or the other, so "found no
-# transcript" is safe to read as "there is none" — which is what lets the notes be
-# the whole document in that case. A lone "Decision: ship it" in the notes is
-# neither recurring nor name-like and so stays in the notes; a bulleted "* Tip: …"
-# never gets that far, because `_SPEAKER_LINE_RE` requires a leading letter.
+# The transcript starts at the first speaker line whose LABEL is a candidate AND
+# where speaker lines go on to dominate. A candidate label either recurs on two or
+# more speaker lines anywhere in the document, or looks like a person's name. Every
+# real transcript has one or the other, so "found no transcript" is safe to read as
+# "there is none" — which is what lets the notes be the whole document in that case.
+# A lone "Decision: ship it" in the notes is neither recurring nor name-like and so
+# stays in the notes; a bulleted "* Tip: …" never gets that far, because
+# `_SPEAKER_LINE_RE` requires a leading letter.
 _NAME_WORD_RE = re.compile(r"^[A-Z][A-Za-z'\-.]*$")
+# Density: a candidate label alone was not enough. A Gemini notes tab opens with
+# the doc's own title ("Data Foundations: Session 4 — …"), which is two capitalised
+# words and so name-like, and the whole notes body was swallowed into one
+# pseudo-utterance. So a candidate only opens the transcript when at least half of
+# the next `_DENSITY_WINDOW` non-blank lines (itself included, rounded up, never
+# fewer than 2) are candidate speaker lines. A heading over bullets scores 1 in 6;
+# a real transcript scores at worst 3 in 6 — every utterance wrapped over two
+# lines, or every pair separated by a timestamp line.
+_DENSITY_WINDOW = 6
 _TIMESTAMP_LINE_RE = re.compile(r"^\d{1,2}:\d{2}(:\d{2})?$")
 _SELF_LINES_CAP = 6_000
 _PROMPT_NOTES_CAP = 8_000
@@ -75,21 +86,73 @@ def _is_name_like(label: str) -> bool:
     return 1 < len(words) < 5 and all(_NAME_WORD_RE.match(w) for w in words)
 
 
+def _speaker_lines_dominate(
+    lines: list[str], labels: list[str | None], start: int, candidates: set[str | None]
+) -> bool:
+    """Do candidate speaker lines carry at least half the window at `start`?
+
+    The window is the next `_DENSITY_WINDOW` non-blank lines, `start` included,
+    and is shorter at the end of the text. Blank lines are skipped rather than
+    counted so a double-spaced transcript scores the same as a single-spaced one.
+    """
+    window = list(islice((i for i in range(start, len(lines)) if lines[i].strip()), _DENSITY_WINDOW))
+    needed = max(2, -(-len(window) // 2))
+    return sum(1 for i in window if labels[i] in candidates) >= needed
+
+
+def _transcript_start(
+    lines: list[str],
+    labels: list[str | None],
+    candidates: set[str | None],
+    counts: dict[str, int],
+) -> int | None:
+    """Where the transcript opens, or None when the document has no candidate.
+
+    Density alone was not safe to gate on. A real transcript can fail it — four
+    wrapped continuation lines per utterance puts it at 2 of 6, and a speaker at
+    the end of the document has a window too short to pass — and rejecting every
+    candidate would file the whole transcript as `notes`. That is the one
+    direction this lane forbids: `analyse_meeting` would then read a
+    transcript-less doc and send other people's words to the LLM as the user's
+    own notes. So the choice degrades instead of failing:
+
+    1. the first candidate where speaker lines dominate (the density rule);
+    2. else the first candidate whose label RECURS — real speakers come back, a
+       notes heading usually appears once;
+    3. else the first candidate at all.
+
+    Only a document with no candidate line anywhere stays wholly notes, which is
+    still safe: there was no transcript to lose. Steps 2 and 3 can cost us the
+    notes above a speaker-shaped heading; that is the deliberate trade.
+    """
+    hits = [i for i, lab in enumerate(labels) if lab in candidates]
+    if not hits:
+        return None
+    dense = next((i for i in hits if _speaker_lines_dominate(lines, labels, i, candidates)), None)
+    if dense is not None:
+        return dense
+    return next((i for i in hits if counts.get(str(labels[i]), 0) >= 2), hits[0])
+
+
 def split_notes_transcript(text: str) -> tuple[str, list[tuple[str, str]]]:
     """(notes, [(speaker, utterance), …]).
 
-    Notes are everything before the transcript, which opens at the first
-    speaker-shaped line whose label recurs or looks like a name. Inside the
+    Notes are everything before the transcript. A candidate line — speaker-shaped,
+    with a label that recurs or looks like a name — opens it, preferring one where
+    such lines dominate what follows; `_transcript_start` holds the full rule and
+    the reason it degrades rather than rejecting every candidate. Inside the
     transcript a bare timestamp line is dropped and any other non-speaker,
     non-blank line is a wrapped continuation of the previous utterance. Not keyed
     on a "Transcript" heading: the Gemini export mentions that word inside the
     notes tab too. A leading BOM is stripped first: Drive's plain-text export
     starts with one and ``str.strip`` does not remove it, so without this the
     notes begin with an invisible U+FEFF.
-    # ponytail: label heuristic, no vendor knowledge. Its ceiling is a notes
-    # heading that is both capitalised and repeated (two "Action Items:" lines),
-    # which reads as a speaker; the upgrade path is a vendor-keyed splitter
-    # chosen from the sending address.
+    # ponytail: label heuristic plus a density count, no vendor knowledge. Its
+    # ceiling is a notes heading that reads as a speaker and either sits within
+    # two non-speaker lines of the transcript (dense enough to win outright) or is
+    # the only candidate left once density has failed everywhere. Either way it
+    # costs notes, never the transcript. The upgrade path is unchanged: a
+    # vendor-keyed splitter chosen from the sending address.
     """
     lines = (text or "").lstrip("\ufeff").splitlines()
     labels: list[str | None] = []
@@ -100,8 +163,10 @@ def split_notes_transcript(text: str) -> tuple[str, list[tuple[str, str]]]:
         labels.append(label)
         if label:
             counts[label] = counts.get(label, 0) + 1
-    candidates = {lab for lab, n in counts.items() if n >= 2 or _is_name_like(lab)}
-    start = next((i for i, lab in enumerate(labels) if lab in candidates), None)
+    candidates: set[str | None] = {
+        lab for lab, n in counts.items() if n >= 2 or _is_name_like(lab)
+    }
+    start = _transcript_start(lines, labels, candidates, counts)
     if start is None:
         return (text or "").strip(), []
     notes = "\n".join(lines[:start]).strip()
