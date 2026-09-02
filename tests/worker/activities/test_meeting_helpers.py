@@ -460,14 +460,15 @@ def test_a_speaker_with_one_line_who_is_not_in_the_notes_is_kept():
     assert [s for s, _ in utt] == ["Ada Lovelace", "Sam Doe", "Oliver Cooper", "Ada Lovelace"]
 
 
-# --- Dropping a line is deleting it, so the rule is bounded on both sides. ---
-# Speech that is neither notes nor an utterance is gone with no trace, which is
-# worse than the pseudo-speaker it was meant to prevent.
+# --- The line at `start` gets the same speaker test as every other line. ---
+# Dropping a line is deleting it: speech that is neither notes nor an utterance
+# is gone with no trace. So the rule is bounded by EVIDENCE, not by position —
+# a label absent from the notes is a speaker even on one turn, and a label that
+# heads a notes line is a heading even when it opens the transcript.
 
-# The line at `start` opened the transcript, so it is speech whatever its label
-# says. Here "Ada Lovelace" heads a line in the notes AND speaks only once, so
-# the speaker test alone would drop her opening turn — and its two wrapped lines
-# after it, since there is no utterance yet for them to fold into.
+# "Ada Lovelace" heads a line in the notes AND speaks only once, so the speaker
+# test drops her opening turn — and its two wrapped lines after it, since there
+# is no utterance yet for them to fold into.
 SPEAKS_ONCE_AT_THE_START = """✍️ Quick notes
 Ada Lovelace: raised the seam contract ahead of the session.
 * Sam raised the migration risk on the older collections.
@@ -484,6 +485,55 @@ and it runs on to a second line
 and then a third.
 Sam Doe: The contract needs a version field.
 Sam Doe: And the parity run lands on Thursday.
+"""
+
+# The same shape, minus the notes `Ada Lovelace:` line. Nothing in the notes
+# claims that label, so her sole turn is speech and survives with its wrapping.
+OPENS_AND_SPEAKS_ONCE_NOT_IN_NOTES = """✍️ Quick notes
+* Ada raised the seam contract ahead of the session.
+* Sam raised the migration risk on the older collections.
+* Grace asked for a version field on the contract.
+* Ada agreed to write the ADR by Thursday.
+
+Suggested next steps
+* Sam to check parity on the older collections.
+
+Transcript
+
+Ada Lovelace: This is my one and only turn
+and it runs on to a second line
+and then a third.
+Sam Doe: The contract needs a version field.
+Sam Doe: And the parity run lands on Thursday.
+"""
+
+# The live export. The notes tab carries the doc title twice and closes with a
+# "Transcript" line; the transcript tab then opens by reprinting that title with
+# " - Transcript" appended. Density fails at both notes copies (bullets and prose
+# follow them) and passes on the reprint, so the reprint IS the line at `start`.
+REPRINTED_TITLE_AT_THE_START = """✍️ Quick notes
+Data Foundations: Session 4 - Seams as Contracts
+Team walked through the seam contract for the ingest boundary.
+
+Seams as contracts
+* Ada framed the seam as the only place the two teams agree.
+* Sam raised the migration risk on the older collections.
+
+Suggested next steps
+Data Foundations: Session 4 - Seams as Contracts
+* Sam to check parity on the older collections.
+* Ada to write the ADR by Thursday.
+You should review Gemini's notes to make sure they are accurate.
+Get tips and learn how Gemini takes notes.
+
+📖 Transcript
+
+Data Foundations: Session 4 - Seams as Contracts - Transcript
+Ada Lovelace: Morning all, let's start with the seams.
+Sam Doe: The contract needs a version field before we migrate.
+Ada Lovelace: Agreed, I will write that up as an ADR.
+Sam Doe: I can review it on Thursday after the parity run.
+Ada Lovelace: Thanks, that closes it.
 """
 
 # The reprinted title wraps onto a second line. Folding that line into the
@@ -513,17 +563,72 @@ Ada Lovelace: Thanks, that closes it.
 """
 
 
-def test_the_line_that_opens_the_transcript_is_always_a_speaker():
+def test_a_lone_opening_speaker_who_also_heads_a_notes_line_loses_that_turn():
+    """The documented ceiling of the speaker rule, pinned at its worst position.
+
+    Ada heads a `Name:` line in the notes and speaks exactly once, so nothing
+    below `start` tells the split she is a person rather than a heading the
+    note-taker reprinted. Her turn and its two wrapped lines are deleted: they
+    reach neither the notes nor an utterance.
+
+    This inverts what the old `i == start` exemption did, and the trade is
+    deliberate. Position is not evidence. Exempting the opening line cost more
+    than it saved, because a note-taker that reprints the doc title as the first
+    line of the transcript tab lands exactly there — and every such export then
+    gained a speaker who was never in the room, in `speakers`, in
+    `speaker_count` and in `meeting_words_total`. A phantom participant on every
+    meeting of that shape is worse than one lost turn from a participant who
+    never spoke again. The evidence that saves a real opening turn is the one
+    below: a person is not also a heading in the notes.
+    """
     notes, utt = split_notes_transcript(SPEAKS_ONCE_AT_THE_START)
     assert "* Sam to check parity" in notes
+    # Deleted, not relocated: the turn is in neither half of the split.
     assert "one and only turn" not in notes
-    # Her one turn survives, and so do the two lines it wraps onto: dropping the
-    # opening line would delete all three, into neither notes nor utterances.
+    assert "runs on to a second line" not in notes
+    for _, u in utt:
+        assert "one and only turn" not in u
+        assert "runs on to a second line" not in u
+        assert "and then a third" not in u
+    assert [s for s, _ in utt] == ["Sam Doe", "Sam Doe"]
+    assert utt[0] == ("Sam Doe", "The contract needs a version field.")
+
+
+def test_a_lone_opening_speaker_absent_from_the_notes_is_kept():
+    """The other side of the same evidence: no notes heading, so she is a person."""
+    notes, utt = split_notes_transcript(OPENS_AND_SPEAKS_ONCE_NOT_IN_NOTES)
+    assert "* Sam to check parity" in notes
+    assert "one and only turn" not in notes
+    # Her one turn survives, and so do the two lines it wraps onto.
     assert utt[0] == (
         "Ada Lovelace",
         "This is my one and only turn and it runs on to a second line and then a third.",
     )
     assert [s for s, _ in utt] == ["Ada Lovelace", "Sam Doe", "Sam Doe"]
+
+
+def test_a_reprinted_title_at_the_transcript_opening_is_not_a_speaker():
+    """The production case: the transcript opens on the doc's own title.
+
+    The note-taker ends its notes tab with a `Transcript` line and opens the
+    transcript tab by repeating the doc title with " - Transcript" glued on.
+    Density selects exactly that line as `start` — the real speakers follow it —
+    so an exemption keyed on position turned the title into a speaker.
+    """
+    notes, utt = split_notes_transcript(REPRINTED_TITLE_AT_THE_START)
+    # Both notes-region title lines stay in the notes.
+    assert notes.startswith("✍️ Quick notes")
+    assert notes.count("Data Foundations: Session 4 - Seams as Contracts") == 2
+    assert "* Ada framed the seam" in notes
+    assert "Get tips and learn how Gemini takes notes." in notes
+    assert "Morning all" not in notes
+    # The reprinted title is dropped whole: not a speaker, not folded anywhere.
+    assert {s for s, _ in utt} == {"Ada Lovelace", "Sam Doe"}
+    assert len(utt) == 5  # one per real speaker line
+    for _, u in utt:
+        assert "Seams as Contracts" not in u
+        assert "Transcript" not in u
+    assert utt[0] == ("Ada Lovelace", "Morning all, let's start with the seams.")
 
 
 def test_a_dropped_headings_wrapped_line_is_dropped_too_not_folded_upward():
