@@ -90,6 +90,7 @@ async def test_review_path_builds_prompt_from_own_lines_only():
     assert "Parity script is slow" in out["rendered"]
     call = llm.calls[0]
     assert call["purpose"] == "meeting_review" and call["model"] == "balanced-model"
+    assert call["agent_id"] == "sebas"  # the activity's own default, no caller override
     assert call["max_tokens"] >= 3000
     assert "parity script" in call["prompt"]
     assert "Anything blocking" not in call["prompt"]  # Ada's line never reaches the LLM
@@ -155,3 +156,30 @@ async def test_observations_written_once_even_when_run_twice(obs_pool):
     by = {r["metric"]: r["value"] for r in rows}
     assert by["turns"] == 2.0
     assert by["talk_share_pct"] == first["stats"]["self"]["talk_share_pct"]
+
+
+async def test_a_transcript_that_matches_no_self_name_skips_the_review():
+    """I1: a configured name matching nobody must not produce a review of
+    somebody else's meeting, filed and searchable under the user's name."""
+    llm = _FakeLLM(json.dumps(REVIEW))
+    out = await _act(_RulesPool(["Nobody"]), llm).analyse_meeting(DOC)
+    assert out["skipped"] == "self_not_matched"
+    assert out["observations"] == 0
+    assert llm.calls == []
+
+
+async def test_a_doc_with_no_transcript_still_reviews_the_notes():
+    """The transcript-less case is different: there is nothing to attribute
+    from, so the spec allows a notes-only review."""
+    llm = _FakeLLM(json.dumps(REVIEW))
+    doc = {**DOC, "transcript": [], "speakers": [], "doc_status": "no_link"}
+    out = await _act(_RulesPool(["Sam"]), llm).analyse_meeting(doc)
+    assert "skipped" not in out
+    assert len(llm.calls) == 1
+
+
+async def test_agent_id_argument_attributes_the_llm_spend_to_the_caller():
+    llm = _FakeLLM(json.dumps(REVIEW))
+    out = await _act(_RulesPool(["Sam"]), llm).analyse_meeting(DOC, agent_id="maou")
+    assert "skipped" not in out
+    assert llm.calls[0]["agent_id"] == "maou"

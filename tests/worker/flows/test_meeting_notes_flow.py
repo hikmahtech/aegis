@@ -10,7 +10,7 @@ from temporalio.worker import Worker
 with workflow.unsafe.imports_passed_through():
     from aegis_worker.flows.meeting_notes import MeetingNotesFlow, MeetingNotesInput
 
-_calls: dict[str, list] = {"fetch": [], "ingest": [], "analyse": []}
+_calls: dict[str, list] = {"fetch": [], "ingest": [], "analyse": [], "analyse_agent": []}
 
 
 def _reset():
@@ -42,8 +42,9 @@ async def ingest(item: dict) -> dict:
 
 def _analyse(result):
     @activity.defn(name="analyse_meeting")
-    async def analyse(doc: dict) -> dict:
+    async def analyse(doc: dict, agent_id: str = "") -> dict:
         _calls["analyse"].append(doc)
+        _calls["analyse_agent"].append(agent_id)
         return result
     return analyse
 
@@ -83,6 +84,40 @@ async def test_ok_doc_files_notes_and_review():
     assert review_item["metadata"]["review"] == {"commitments": ["x"]}
     # The doc handed to analyse carries message_id + account for the observation key.
     assert _calls["analyse"][0]["message_id"] == "gm-flow-1" and _calls["analyse"][0]["account"] == "acct"
+    # …and the flow's own agent, so llm_calls bills the review to whoever ran it.
+    assert _calls["analyse_agent"] == ["sebas"]
+
+
+@pytest.mark.asyncio
+async def test_a_failed_review_ingest_is_reported_not_called_stored():
+    _reset()
+
+    @activity.defn(name="ingest_content")
+    async def ingest_review_disabled(item: dict) -> dict:
+        _calls["ingest"].append(item)
+        if item["source_type"] == "meeting_review":
+            return {"status": "disabled"}
+        return {"status": "ok", "content_id": f"cid-{item['source_type']}"}
+
+    analysis = {"stats": {}, "observations": 1, "self_matched": True,
+                "review": {"commitments": []}, "rendered": "# Meeting review: Standup"}
+    res = await _run([_fetch(DOC_OK), ingest_review_disabled, _analyse(analysis)], "mn-review-ingest")
+    assert res["status"] == "stored_no_analysis"
+    assert res["analysis"] == "review_ingest_disabled"
+    assert res["doc_status"] == "ok" and res["content_id"] == "cid-meeting"
+    assert res["url"] == "gdoc://doc-1"
+    assert "review_content_id" not in res
+    assert len(_calls["ingest"]) == 2
+
+
+@pytest.mark.asyncio
+async def test_an_ok_export_with_empty_notes_files_nothing():
+    """A title-only row looks like a real meeting in the knowledge store."""
+    _reset()
+    doc = {**DOC_OK, "notes": "", "transcript": [], "speakers": []}
+    res = await _run([_fetch(doc), ingest, _analyse({})], "mn-empty-ok")
+    assert res == {"status": "skipped", "reason": "nothing_usable", "doc_status": "ok"}
+    assert _calls["ingest"] == [] and _calls["analyse"] == []
 
 
 @pytest.mark.asyncio

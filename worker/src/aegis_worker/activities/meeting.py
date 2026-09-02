@@ -30,13 +30,15 @@ _DOC_ID_RE = re.compile(r"docs\.google\.com/document/d/([A-Za-z0-9_-]+)")
 # `Speaker Name: words`. The label must start with a letter so a `10:30: …`
 # timestamp never reads as a speaker, and may not contain a colon.
 _SPEAKER_LINE_RE = re.compile(r"^([A-Za-z][^:\n]{1,59}): \S")
-# The transcript starts at the first speaker line that opens a window of 5
-# non-blank lines with at least 4 speaker lines in it. The window is what stops a
-# lone speaker-shaped line such as "Decision: ship it" from opening a transcript.
-# A bulleted "* Tip: …" never gets that far: `_SPEAKER_LINE_RE` requires a letter
-# first, so the bullet character already disqualifies it.
-_TRANSCRIPT_WINDOW = 5
-_TRANSCRIPT_MIN_HITS = 4
+# The transcript starts at the first speaker line whose LABEL is a candidate: it
+# either recurs on two or more speaker lines anywhere in the document, or it looks
+# like a person's name. Every real transcript has one or the other, so "found no
+# transcript" is safe to read as "there is none" — which is what lets the notes be
+# the whole document in that case. A lone "Decision: ship it" in the notes is
+# neither recurring nor name-like and so stays in the notes; a bulleted "* Tip: …"
+# never gets that far, because `_SPEAKER_LINE_RE` requires a leading letter.
+_NAME_WORD_RE = re.compile(r"^[A-Z][A-Za-z'\-.]*$")
+_TIMESTAMP_LINE_RE = re.compile(r"^\d{1,2}:\d{2}(:\d{2})?$")
 _SELF_LINES_CAP = 6_000
 _PROMPT_NOTES_CAP = 8_000
 _MIN_NOTES_FOR_REVIEW = 400
@@ -63,42 +65,59 @@ def extract_doc_id(texts: Iterable[str]) -> str | None:
     return None
 
 
+def _is_name_like(label: str) -> bool:
+    """Two to four capitalised words of letters, apostrophes, hyphens and dots.
+
+    "Ada Lovelace", "A Person" and "Mary-Jane O'Neil" are names; "Decision",
+    "Tip" and "Owner" are not, so a one-off notes heading keeps its place in the
+    notes."""
+    words = label.split()
+    return 1 < len(words) < 5 and all(_NAME_WORD_RE.match(w) for w in words)
+
+
 def split_notes_transcript(text: str) -> tuple[str, list[tuple[str, str]]]:
     """(notes, [(speaker, utterance), …]).
 
-    Notes are everything before the transcript. A non-speaker, non-blank line
-    inside the transcript is a wrapped continuation of the previous utterance.
-    Not keyed on a "Transcript" heading: the Gemini export mentions that word
-    inside the notes tab too. A leading BOM is stripped first: Drive's plain-text
-    export starts with one and ``str.strip`` does not remove it, so without this
-    the notes begin with an invisible U+FEFF.
-    # ponytail: longest-window heuristic; add a vendor-keyed splitter if a
-    # second note-taker's layout breaks it.
+    Notes are everything before the transcript, which opens at the first
+    speaker-shaped line whose label recurs or looks like a name. Inside the
+    transcript a bare timestamp line is dropped and any other non-speaker,
+    non-blank line is a wrapped continuation of the previous utterance. Not keyed
+    on a "Transcript" heading: the Gemini export mentions that word inside the
+    notes tab too. A leading BOM is stripped first: Drive's plain-text export
+    starts with one and ``str.strip`` does not remove it, so without this the
+    notes begin with an invisible U+FEFF.
+    # ponytail: label heuristic, no vendor knowledge. Its ceiling is a notes
+    # heading that is both capitalised and repeated (two "Action Items:" lines),
+    # which reads as a speaker; the upgrade path is a vendor-keyed splitter
+    # chosen from the sending address.
     """
     lines = (text or "").lstrip("\ufeff").splitlines()
-    nonblank = [i for i, ln in enumerate(lines) if ln.strip()]
-    start: int | None = None
-    for k in range(len(nonblank)):
-        window = nonblank[k : k + _TRANSCRIPT_WINDOW]
-        if len(window) < _TRANSCRIPT_MIN_HITS:
-            break
-        hits = sum(1 for i in window if _SPEAKER_LINE_RE.match(lines[i]))
-        if hits >= _TRANSCRIPT_MIN_HITS and _SPEAKER_LINE_RE.match(lines[window[0]]):
-            start = window[0]
-            break
+    labels: list[str | None] = []
+    counts: dict[str, int] = {}
+    for ln in lines:
+        m = _SPEAKER_LINE_RE.match(ln)
+        label = m.group(1).strip() if m else None
+        labels.append(label)
+        if label:
+            counts[label] = counts.get(label, 0) + 1
+    candidates = {lab for lab, n in counts.items() if n >= 2 or _is_name_like(lab)}
+    start = next((i for i, lab in enumerate(labels) if lab in candidates), None)
     if start is None:
         return (text or "").strip(), []
     notes = "\n".join(lines[:start]).strip()
     utterances: list[tuple[str, str]] = []
-    for ln in lines[start:]:
-        if not ln.strip():
+    for i in range(start, len(lines)):
+        stripped = lines[i].strip()
+        label = labels[i]
+        if not stripped:
             continue
-        if _SPEAKER_LINE_RE.match(ln):
-            speaker, utterance = ln.split(": ", 1)
-            utterances.append((speaker.strip(), utterance.strip()))
+        if label in candidates:
+            utterances.append((str(label), lines[i].split(": ", 1)[1].strip()))
+        elif _TIMESTAMP_LINE_RE.match(stripped):
+            continue
         elif utterances:
             speaker, utterance = utterances[-1]
-            utterances[-1] = (speaker, f"{utterance} {ln.strip()}")
+            utterances[-1] = (speaker, f"{utterance} {stripped}")
     return notes, utterances
 
 
@@ -334,7 +353,7 @@ class MeetingActivities:
             return merge_meeting_rules(None)
 
     @activity.defn
-    async def analyse_meeting(self, doc: dict) -> dict:
+    async def analyse_meeting(self, doc: dict, agent_id: str = "") -> dict:
         """Stats in code, numbers to life.observations, one LLM review from the
         user's own lines. A skipped analysis is a normal outcome — the notes
         are already filed by the time this runs."""
@@ -346,6 +365,12 @@ class MeetingActivities:
         utterances = [(str(u[0]), str(u[1])) for u in (doc.get("transcript") or []) if len(u) == 2]
         stats = speaker_stats(utterances, self_names) if utterances else {}
         matched = bool(stats and stats["self"]["matched"])
+        # A transcript that names nobody we recognise is a configuration error
+        # ("Arshad A." vs "Arshad Ansari"), and reviewing it anyway files a
+        # confident account of somebody else's meeting under the user's name.
+        # The transcript-less case below is different: nothing to misattribute.
+        if utterances and not matched:
+            return {"skipped": "self_not_matched", "stats": stats, "observations": 0}
         observations = await self._record_observations(doc, stats) if matched else 0
 
         notes = (doc.get("notes") or "")[:_PROMPT_NOTES_CAP]
@@ -376,7 +401,7 @@ class MeetingActivities:
                 max_tokens=_REVIEW_MAX_TOKENS,
                 db_pool=self.db_pool,
                 purpose="meeting_review",
-                agent_id=self.agent_id,
+                agent_id=agent_id or self.agent_id,
             )
             parsed = parse_llm_json((raw.get("response") or "").strip())
             if not isinstance(parsed, dict):

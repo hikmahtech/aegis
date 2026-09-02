@@ -72,11 +72,12 @@ def test_split_without_a_transcript_returns_everything_as_notes():
 
 
 def test_a_lone_speaker_shaped_line_in_the_notes_does_not_open_a_transcript():
-    """Pins the window heuristic, not just the regex.
+    """Pins the label rule, not just the regex.
 
     "Decision: ..." is speaker-shaped and, unlike the "* Tip:" bullet, is not
-    saved by the leading-"*". Only the run-of-4 rule keeps it in the notes.
-    Without it a single such line truncates the notes and swallows the rest.
+    saved by the leading-"*". Only the candidate-label rule keeps it in the
+    notes: one word is not name-like and one occurrence does not recur. Without
+    it a single such line truncates the notes and swallows the rest.
     """
     text = (
         "Quick notes\n"
@@ -140,3 +141,98 @@ def test_render_review_lists_sections_and_stats_line():
     assert "## On brevity\nLead with the decision." in out
     # No stats line when the user was not matched.
     assert "of words" not in render_review(doc, review, {"self": {"matched": False}})
+
+
+# --- Export shapes the old 5-line/4-hit window heuristic did not recognise. ---
+# Each one filed its whole transcript as `notes` (C1). The label rule opens the
+# transcript on the first speaker line whose label recurs or looks like a name.
+
+WRAPPED = """Weekly sync
+Team agreed to ship on Friday.
+
+Ada Lovelace: Morning all, let's start
+with the rollout status please.
+Sam Doe: The config store is half migrated
+and the rest lands this week.
+Ada Lovelace: Great, anything blocking
+the parity check right now?
+"""
+
+THREE_TURNS = """Quick sync
+We covered the rollout.
+
+A Person: Are we ready to ship?
+B Person: Yes, the parity check passed.
+A Person: Then let's ship it.
+"""
+
+TIMESTAMPED = """Standup notes
+Rollout is at forty percent.
+
+Ada Lovelace: Morning all, let's start.
+00:01:23
+Sam Doe: The config store is half migrated.
+00:02:05
+Ada Lovelace: Great, thanks everyone.
+"""
+
+
+def test_wrapped_utterances_still_open_a_transcript():
+    notes, utt = split_notes_transcript(WRAPPED)
+    assert notes == "Weekly sync\nTeam agreed to ship on Friday."
+    assert utt == [
+        ("Ada Lovelace", "Morning all, let's start with the rollout status please."),
+        ("Sam Doe", "The config store is half migrated and the rest lands this week."),
+        ("Ada Lovelace", "Great, anything blocking the parity check right now?"),
+    ]
+    for _, u in utt:
+        assert u not in notes
+
+
+def test_a_three_turn_meeting_is_short_but_still_a_transcript():
+    notes, utt = split_notes_transcript(THREE_TURNS)
+    assert notes == "Quick sync\nWe covered the rollout."
+    assert utt == [
+        ("A Person", "Are we ready to ship?"),
+        ("B Person", "Yes, the parity check passed."),
+        ("A Person", "Then let's ship it."),
+    ]
+    for _, u in utt:
+        assert u not in notes
+
+
+def test_timestamp_lines_between_utterances_are_dropped_not_folded():
+    notes, utt = split_notes_transcript(TIMESTAMPED)
+    assert notes == "Standup notes\nRollout is at forty percent."
+    assert utt == [
+        ("Ada Lovelace", "Morning all, let's start."),
+        ("Sam Doe", "The config store is half migrated."),
+        ("Ada Lovelace", "Great, thanks everyone."),
+    ]
+    assert "00:01:23" not in notes
+    for _, u in utt:
+        assert "00:0" not in u
+        assert u not in notes
+
+
+def test_a_recurring_single_word_label_does_open_a_transcript():
+    """The documented cost of the label rule, pinned so the trade-off is visible.
+
+    A single-word label is not name-like, so one `Decision:` line stays in the
+    notes (the test above). Two of them recur, which is exactly the signal the
+    rule uses, so they read as a transcript. The ceiling is a vendor-keyed
+    splitter; until a real export trips this, the leak it prevents costs more.
+    """
+    text = (
+        "Quick notes\n"
+        "Decision: ship the widget on Friday.\n"
+        "More prose in between.\n"
+        "Decision: hold the cache change.\n"
+        "Final line of prose.\n"
+    )
+    notes, utt = split_notes_transcript(text)
+    assert notes == "Quick notes"
+    assert utt == [
+        ("Decision", "ship the widget on Friday. More prose in between."),
+        ("Decision", "hold the cache change. Final line of prose."),
+    ]

@@ -7,7 +7,7 @@ sender-override rule on the Email triage page, so any vendor works.
 
   fetch_meeting_document(account, msg)   # Gmail body → Docs link → Drive export
     → ingest_content  source_type=meeting          (notes only, never transcript)
-    → analyse_meeting(doc)                          (stats in code, one LLM review)
+    → analyse_meeting(doc, agent_id)                (stats in code, one LLM review)
     → ingest_content  source_type=meeting_review
 
 Every downgrade is a normal result, never a failure: the notes are filed
@@ -61,7 +61,9 @@ class MeetingNotesFlow:
             doc["account"] = input.account_label
             doc_status = doc.get("doc_status") or "fetch_failed"
             notes = (doc.get("notes") or "")[:_NOTES_CAP]
-            if doc_status != "ok" and len(notes) < _MIN_BODY:
+            # Empty notes are nothing to file whatever the doc_status: `ingest_content`
+            # would fall back to the title and leave a row that looks like a meeting.
+            if not notes.strip() or (doc_status != "ok" and len(notes) < _MIN_BODY):
                 return {"status": "skipped", "reason": "nothing_usable", "doc_status": doc_status}
 
             step = "ingest_meeting"
@@ -106,7 +108,7 @@ class MeetingNotesFlow:
             try:
                 analysis = await workflow.execute_activity(
                     "analyse_meeting",
-                    args=[doc],
+                    args=[doc, input.agent_id],
                     start_to_close_timeout=TIMEOUT_LLM,
                     retry_policy=NO_RETRY,
                 )
@@ -148,6 +150,15 @@ class MeetingNotesFlow:
                 start_to_close_timeout=TIMEOUT_STANDARD,
                 retry_policy=RETRY_ONCE,
             )
+            review_status = (review_ingested or {}).get("status")
+            if review_status != "ok":
+                return {
+                    "status": "stored_no_analysis",
+                    "analysis": f"review_ingest_{review_status or 'no_result'}",
+                    "doc_status": doc_status,
+                    "content_id": content_id,
+                    "url": url,
+                }
             return {
                 "status": "stored",
                 "doc_status": doc_status,
