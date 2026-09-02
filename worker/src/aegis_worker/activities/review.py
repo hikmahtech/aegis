@@ -45,6 +45,39 @@ _LABEL_SOMEDAY = "@someday"
 _LABEL_NEXT = "@next"
 # State labels mark a task non-actionable (parked/delegated/reference).
 _STATE_LABELS = ["@waiting", "@reference", "@to-read", _LABEL_SOMEDAY]
+# When a meeting happened, for `meeting` and `meeting_review` rows alike.
+# `ingested_at` is when AEGIS filed it, which a backfill or a re-ingest resets —
+# the first backfill made all 63 meetings "this week". The regexp guard is what
+# keeps a malformed metadata value (an empty string is the common one; the flow
+# writes `meeting_date or ""`) from raising a cast error inside the weekly review:
+# it falls back to the ingest time instead. Interpolated, never parameterised —
+# it is a fixed expression with no caller input in it.
+_MEETING_AT = (
+    r"CASE WHEN metadata->>'meeting_date' ~ '^\d{4}-\d{2}-\d{2}' "
+    r"THEN (metadata->>'meeting_date')::timestamptz ELSE ingested_at END"
+)
+# Gemini names every export "<meeting> – Notes by Gemini"; both dashes occur.
+_GEMINI_SUFFIXES = (" – Notes by Gemini", " - Notes by Gemini")
+_REVIEW_TITLE_PREFIX = "Meeting review: "
+
+
+def _meeting_display_title(row_title: str | None, meta_title: Any) -> str:
+    """The meeting's own title for the weekly block.
+
+    The review row is stored as "Meeting review: <title>", so rendering the row
+    title repeated the prefix and clipped the real title away. Prefer the meeting
+    title MeetingNotesFlow puts in metadata, fall back to the row title with the
+    prefix removed, and drop the note-taker's suffix. Display only — nothing
+    stored is rewritten."""
+    title = str(meta_title or "").strip()
+    if not title:
+        title = str(row_title or "").strip()
+        if title.startswith(_REVIEW_TITLE_PREFIX):
+            title = title[len(_REVIEW_TITLE_PREFIX) :].strip()
+    for suffix in _GEMINI_SUFFIXES:
+        if title.endswith(suffix):
+            return title[: -len(suffix)].strip()
+    return title
 
 
 @dataclass
@@ -781,8 +814,8 @@ class ReviewActivities:
             rows = await conn.fetch(
                 "SELECT title, metadata FROM knowledge_content "
                 "WHERE source_type='meeting_review' "
-                "AND ingested_at >= now() - interval '7 days' "
-                "ORDER BY ingested_at DESC LIMIT 20"
+                f"AND {_MEETING_AT} >= now() - interval '7 days' "
+                f"ORDER BY {_MEETING_AT} DESC LIMIT 20"
             )
             meetings = []
             for r in rows:
@@ -792,7 +825,7 @@ class ReviewActivities:
                 me = stats.get("self") if isinstance(stats.get("self"), dict) else {}
                 meetings.append(
                     {
-                        "title": r["title"] or "",
+                        "title": _meeting_display_title(r["title"], md.get("title")),
                         "talk_share_pct": me.get("talk_share_pct"),
                         "contributions": list(review.get("contributions") or []),
                         "problems_raised": list(review.get("problems_raised") or []),
@@ -825,7 +858,7 @@ class ReviewActivities:
                 "count(*) AS n "
                 "FROM knowledge_content "
                 "WHERE source_type='meeting' "
-                "AND ingested_at >= now() - interval '7 days' "
+                f"AND {_MEETING_AT} >= now() - interval '7 days' "
                 "AND COALESCE(metadata->>'doc_status', '') <> 'ok' "
                 "GROUP BY 1, 2"
             )
