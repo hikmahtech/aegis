@@ -8,18 +8,30 @@ around Gmail, Drive, the LLM and `life.observations`.
 
 from __future__ import annotations
 
+import asyncio
+import base64
+import datetime as _dt
+import json
 import re
 from collections.abc import Iterable
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
 
 from aegis.services.meeting_rules import is_self
+from temporalio import activity
+
+from aegis_worker.activities.gmail import _build_gmail_service, _extract_text_from_part
 
 _DOC_ID_RE = re.compile(r"docs\.google\.com/document/d/([A-Za-z0-9_-]+)")
 # `Speaker Name: words`. The label must start with a letter so a `10:30: …`
 # timestamp never reads as a speaker, and may not contain a colon.
 _SPEAKER_LINE_RE = re.compile(r"^([A-Za-z][^:\n]{1,59}): \S")
 # The transcript starts at the first speaker line that opens a window of 5
-# non-blank lines with at least 4 speaker lines in it. A lone "Tip: …" bullet
-# in the notes never qualifies; a real transcript always does.
+# non-blank lines with at least 4 speaker lines in it. The window is what stops a
+# lone speaker-shaped line such as "Decision: ship it" from opening a transcript.
+# A bulleted "* Tip: …" never gets that far: `_SPEAKER_LINE_RE` requires a letter
+# first, so the bullet character already disqualifies it.
 _TRANSCRIPT_WINDOW = 5
 _TRANSCRIPT_MIN_HITS = 4
 _SELF_LINES_CAP = 6_000
@@ -143,3 +155,148 @@ def render_review(doc: dict, review: dict, stats: dict) -> str:
         lines.append("\n## On brevity")
         lines.append(str(review["verbosity_note"]))
     return "\n".join(lines).strip()
+
+
+_DRIVE_SCOPE = "https://www.googleapis.com/auth/drive.readonly"
+
+
+def _token_has_drive_scope(token_path: Path) -> bool:
+    """Cheap pre-check on the stored token so a missing scope is named, not
+    discovered as an opaque 403 a call later."""
+    try:
+        scopes = json.loads(token_path.read_text()).get("scopes") or []
+    except Exception:  # noqa: BLE001 — unreadable token reads as "no scope"
+        return False
+    return _DRIVE_SCOPE in scopes
+
+
+def _export_doc(token_path: Path, doc_id: str) -> tuple[str, str, str]:
+    """(name, modifiedTime, text/plain export). Blocking; run in a thread.
+    Separated so tests can monkeypatch it."""
+    from aegis.services.drive import _build_drive_service
+
+    svc = _build_drive_service(token_path)
+    meta = svc.files().get(fileId=doc_id, fields="name,modifiedTime").execute()
+    data = svc.files().export(fileId=doc_id, mimeType="text/plain").execute()
+    text = data.decode("utf-8", "ignore") if isinstance(data, bytes) else str(data)
+    return meta.get("name") or "", meta.get("modifiedTime") or "", text.lstrip("\ufeff")
+
+
+def _all_text_parts(payload: dict) -> list[str]:
+    """Every decoded text/* body in the MIME tree — plain AND html, because
+    Gemini puts the doc link only in the HTML part."""
+    out: list[str] = []
+
+    def walk(p: dict) -> None:
+        data = (p.get("body") or {}).get("data")
+        if data and str(p.get("mimeType", "")).startswith("text/"):
+            try:
+                out.append(base64.urlsafe_b64decode(data + "==").decode("utf-8", "replace"))
+            except Exception:  # noqa: BLE001
+                pass
+        for sub in p.get("parts") or []:
+            walk(sub)
+
+    walk(payload or {})
+    return out
+
+
+def _iso_from_ms(ms: Any) -> str:
+    try:
+        return _dt.datetime.fromtimestamp(int(ms) / 1000, tz=_dt.UTC).isoformat()
+    except (TypeError, ValueError, OSError):
+        return _dt.datetime.now(tz=_dt.UTC).isoformat()
+
+
+def _classify_export_error(exc: BaseException) -> str:
+    status = getattr(getattr(exc, "resp", None), "status", 0)
+    content = getattr(exc, "content", b"") or b""
+    if isinstance(content, str):
+        content = content.encode()
+    if status == 403 and b"insufficient" in content.lower():
+        return "no_drive_scope"
+    if status in (403, 404):
+        return "inaccessible"
+    return "fetch_failed"
+
+
+@dataclass
+class MeetingActivities:
+    gmail_credentials_file: str
+    gmail_token_dir: str
+    db_pool: Any = None
+    llm_client: Any = None
+    model_balanced: str = "gemma4:e2b"
+    agent_id: str = "sebas"
+
+    @activity.defn
+    async def fetch_meeting_document(self, account_label: str, msg: dict) -> dict:
+        """Read the email, follow its Google Docs link with the same account's
+        Drive token, split notes from transcript. Never raises: every failure
+        becomes a `doc_status` and the body (or snippet) still comes back."""
+        token_path = Path(self.gmail_token_dir) / f"{account_label}.json"
+        message_id = msg.get("id") or ""
+        base = {
+            "title": (msg.get("subject") or "").strip()[:200],
+            "meeting_date": _iso_from_ms(msg.get("internal_date_ms")),
+            "doc_id": "",
+            "doc_url": "",
+            "doc_modified_time": "",
+            "notes": "",
+            "transcript": [],
+            "speakers": [],
+            "doc_status": "no_link",
+        }
+
+        def _sync() -> dict:
+            svc = _build_gmail_service(self.gmail_credentials_file, token_path)
+            full = svc.users().messages().get(userId="me", id=message_id, format="full").execute()
+            payload = full.get("payload") or {}
+            parts = _all_text_parts(payload)
+            body = (_extract_text_from_part(payload) or (parts[0] if parts else "")).strip()
+            out = {**base, "notes": body or (msg.get("snippet") or "").strip()}
+            doc_id = extract_doc_id(parts)
+            if not doc_id:
+                return out
+            out["doc_id"] = doc_id
+            out["doc_url"] = f"https://docs.google.com/document/d/{doc_id}"
+            if not _token_has_drive_scope(token_path):
+                out["doc_status"] = "no_drive_scope"
+                return out
+            try:
+                name, mtime, text = _export_doc(token_path, doc_id)
+            except Exception as exc:  # noqa: BLE001 — mapped, never raised
+                out["doc_status"] = _classify_export_error(exc)
+                return out
+            notes, utterances = split_notes_transcript(text)
+            out.update(
+                {
+                    "doc_status": "ok",
+                    "title": (name or out["title"])[:200],
+                    "doc_modified_time": mtime,
+                    "notes": notes or text.strip(),
+                    "transcript": utterances,
+                    "speakers": sorted({s for s, _ in utterances}),
+                }
+            )
+            return out
+
+        try:
+            result = await asyncio.to_thread(_sync)
+        except Exception as exc:  # noqa: BLE001 — the Gmail read itself failed
+            activity.logger.warning(
+                "meeting_fetch_failed msg_id=%s err=%s", message_id, str(exc)[:200]
+            )
+            return {
+                **base,
+                "notes": (msg.get("snippet") or "").strip(),
+                "doc_status": "fetch_failed",
+            }
+        if result["doc_status"] != "ok":
+            activity.logger.warning(
+                "meeting_doc_%s msg_id=%s account=%s",
+                result["doc_status"],
+                message_id,
+                account_label,
+            )
+        return result
