@@ -816,17 +816,26 @@ class ReviewActivities:
             ts_prev = await _avg("talk_share_pct", 14, 7)
             wpt_now = await _avg("words_per_turn", 7, 0)
             wpt_prev = await _avg("words_per_turn", 14, 7)
+            # Grouped by status as well as account: the advice differs per
+            # status ("re-authorise Drive" is only right for no_drive_scope),
+            # so the formatter needs the breakdown, not one lumped count.
             missing = await conn.fetch(
-                "SELECT COALESCE(metadata->>'account', '?') AS account, count(*) AS n "
+                "SELECT COALESCE(metadata->>'account', '?') AS account, "
+                "COALESCE(metadata->>'doc_status', 'unknown') AS doc_status, "
+                "count(*) AS n "
                 "FROM knowledge_content "
                 "WHERE source_type='meeting' "
                 "AND ingested_at >= now() - interval '7 days' "
                 "AND COALESCE(metadata->>'doc_status', '') <> 'ok' "
-                "GROUP BY 1"
+                "GROUP BY 1, 2"
             )
 
         def _r(v):
             return round(float(v), 1) if v is not None else None
+
+        missing_by_account: dict[str, dict[str, int]] = {}
+        for row in missing:
+            missing_by_account.setdefault(row["account"], {})[row["doc_status"]] = int(row["n"])
 
         return {
             "meetings": meetings,
@@ -834,7 +843,7 @@ class ReviewActivities:
             "talk_share_prev": _r(ts_prev),
             "words_per_turn_avg": _r(wpt_now),
             "words_per_turn_prev": _r(wpt_prev),
-            "missing_doc_by_account": {r["account"]: int(r["n"]) for r in missing},
+            "missing_doc_by_account": missing_by_account,
         }
 
     @activity.defn
@@ -1122,11 +1131,24 @@ def format_meeting_week(data: dict) -> str:
     note = next((m["verbosity_note"] for m in meetings if m.get("verbosity_note")), "")
     if note:
         lines.append(f"  On brevity: {_clip(note, 240)}")
-    for account, n in sorted(missing.items()):
-        plural = "s" if n != 1 else ""
-        lines.append(
-            f"  ⚠ {n} meeting{plural} stored without their doc — re-authorise Drive for {account}"
-        )
+    for account, counts in sorted(missing.items()):
+        # Tolerate the pre-fix flat shape {account: int} so a stale row from an
+        # in-flight deploy degrades to "unknown" instead of crashing the review.
+        counts = {"unknown": counts} if isinstance(counts, int) else (counts or {})
+        scope = counts.get("no_drive_scope", 0)
+        other = sum(n for status, n in counts.items() if status != "no_drive_scope")
+        if scope:
+            plural = "s" if scope != 1 else ""
+            lines.append(
+                f"  ⚠ {scope} meeting{plural} stored without their doc"
+                f" — re-authorise Drive for {account}"
+            )
+        if other:
+            plural = "s" if other != 1 else ""
+            statuses = ", ".join(sorted(s for s in counts if s != "no_drive_scope"))
+            lines.append(
+                f"  ⚠ {other} meeting{plural} stored without their doc ({statuses})"
+            )
     return "\n".join(lines)
 
 

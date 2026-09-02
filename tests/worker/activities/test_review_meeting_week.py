@@ -61,4 +61,4 @@ async def test_gathers_reviews_averages_and_missing_docs(pool):
     assert m["problems_raised"] == ["p1"] and m["commitments"] == ["k1"] and m["verbosity_note"] == "v1"
     assert out["talk_share_avg"] == 12.0 and out["talk_share_prev"] == 20.0
     assert out["words_per_turn_avg"] == 38.0 and out["words_per_turn_prev"] == 60.0
-    assert out["missing_doc_by_account"] == {"acct-b": 2}
+    assert out["missing_doc_by_account"] == {"acct-b": {"no_drive_scope": 1, "inaccessible": 1}}

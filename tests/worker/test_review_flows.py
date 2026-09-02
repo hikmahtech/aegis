@@ -543,7 +543,7 @@ def test_format_meeting_week_renders_block_and_is_empty_without_meetings():
         ],
         "talk_share_avg": 11.2, "talk_share_prev": 14.0,
         "words_per_turn_avg": 38.0, "words_per_turn_prev": None,
-        "missing_doc_by_account": {"arshad-stpd": 2},
+        "missing_doc_by_account": {"arshad-stpd": {"no_drive_scope": 2}},
     }
     out = format_meeting_week(data)
     assert out.startswith("🎙 <b>Meetings this week</b> (2)")
@@ -555,6 +555,20 @@ def test_format_meeting_week_renders_block_and_is_empty_without_meetings():
     assert "last week" in out.split("Talk share")[1].split("\n")[0]
     assert "On brevity: Your longest turn ran 240 words" in out
     assert "⚠ 2 meetings stored without their doc — re-authorise Drive for arshad-stpd" in out
-    # Only the warning when there were no reviews at all this week.
-    only_warn = format_meeting_week({"meetings": [], "missing_doc_by_account": {"a": 1}})
-    assert only_warn.startswith("🎙 <b>Meetings this week</b> (0)") and "⚠ 1 meeting stored" in only_warn
+    # Only the warning when there were no reviews at all this week. A status
+    # that is not a missing Drive grant must NOT advise re-authorising Drive.
+    only_warn = format_meeting_week({"meetings": [], "missing_doc_by_account": {"a": {"no_link": 1}}})
+    assert only_warn.startswith("🎙 <b>Meetings this week</b> (0)")
+    assert "⚠ 1 meeting stored without their doc (no_link)" in only_warn
+    assert "re-authorise" not in only_warn
+    # Both kinds on one account: the Drive line first, then the rest.
+    both = format_meeting_week(
+        {"meetings": [], "missing_doc_by_account": {"b": {"no_drive_scope": 1, "fetch_failed": 2}}}
+    )
+    scope_line = "  ⚠ 1 meeting stored without their doc — re-authorise Drive for b"
+    other_line = "  ⚠ 2 meetings stored without their doc (fetch_failed)"
+    assert scope_line in both and other_line in both
+    assert both.index(scope_line) < both.index(other_line)
+    # A stale flat-shape row (pre-fix payload, in-flight deploy) must not crash.
+    legacy = format_meeting_week({"meetings": [], "missing_doc_by_account": {"old": 3}})
+    assert "⚠ 3 meetings stored without their doc (unknown)" in legacy
