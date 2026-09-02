@@ -521,6 +521,44 @@ class MeetingActivities:
             "rendered": render_review(doc, review, stats),
         }
 
+    @activity.defn
+    async def record_analysis_outcome(self, content_id: str, outcome: str) -> dict:
+        """Stamp the analysis verdict onto the already-stored `meeting` row.
+
+        The row is filed BEFORE the analysis runs — deliberately, so the notes
+        survive a review that never happens — which is why the outcome is
+        written back with a targeted metadata update instead of a re-ingest: a
+        re-ingest would re-embed the whole document to store one string. The
+        weekly review reads it (`gather_meeting_week`), keyed on the meeting
+        date, so a backfill cannot make an old skip "this week".
+
+        Best-effort in every direction. MeetingNotesFlow fires this and moves
+        on, so no pool, a blank id, an unknown id or a dead connection is a
+        warning and a False — never an exception, and never the flow's result.
+        """
+        if not self.db_pool or not content_id:
+            activity.logger.warning(
+                "meeting_outcome_skipped content_id=%r outcome=%s", content_id, outcome
+            )
+            return {"recorded": False}
+        try:
+            async with self.db_pool.acquire() as conn:
+                updated = await conn.fetchval(
+                    "UPDATE knowledge_content "
+                    "SET metadata = metadata || jsonb_build_object('analysis', $2::text) "
+                    "WHERE content_id = $1 RETURNING content_id",
+                    content_id,
+                    outcome,
+                )
+        except Exception as exc:  # noqa: BLE001 — best-effort, see the docstring
+            activity.logger.warning(
+                "meeting_outcome_failed content_id=%s err=%s", content_id, str(exc)[:200]
+            )
+            return {"recorded": False}
+        if updated is None:
+            activity.logger.warning("meeting_outcome_no_row content_id=%s", content_id)
+        return {"recorded": updated is not None}
+
     async def _record_observations(self, doc: dict, stats: dict) -> int:
         """One row per metric, deduped on (source, metric, external_id).
         Returns how many rows were NEW; None from the writer means seen before."""

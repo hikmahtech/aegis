@@ -607,6 +607,44 @@ def test_format_meeting_week_renders_block_and_is_empty_without_meetings():
     assert "⚠ 3 meetings stored without their doc (unknown)" in legacy
 
 
+def test_format_meeting_week_warns_about_meetings_filed_without_a_review():
+    """A skipped analysis was visible only in workflow_runs. The line reads in
+    plain English, not the raw enum, and pluralises like its missing-doc
+    sibling. Nothing at all — no meetings, no missing docs, no skips — is still
+    the empty string, so the weekly review appends nothing."""
+    assert format_meeting_week({"meetings": [], "missing_doc_by_account": {}, "no_review_by_reason": {}}) == ""
+    out = format_meeting_week(
+        {
+            "meetings": [],
+            "missing_doc_by_account": {},
+            "no_review_by_reason": {"self_not_matched": 3, "too_thin": 1, "llm_failed": 2},
+        }
+    )
+    assert out.startswith("🎙 <b>Meetings this week</b> (0)")
+    assert "  ⚠ 3 meetings filed without a review: no speaker matched your names" in out
+    assert "  ⚠ 1 meeting filed without a review: too little text to review" in out
+    assert "  ⚠ 2 meetings filed without a review: the review could not be generated" in out
+    # Every skip reason has a phrase; an unknown one falls back to the raw value.
+    for reason, phrase in (
+        ("no_self_names", "your names are not configured"),
+        ("no_llm", "the review could not be generated"),
+        ("analysis_failed", "the review could not be generated"),
+        ("something_new", "something_new"),
+    ):
+        line = format_meeting_week({"no_review_by_reason": {reason: 1}})
+        assert f"  ⚠ 1 meeting filed without a review: {phrase}" in line
+    # The warnings sit after the missing-doc block, which is the older signal.
+    both = format_meeting_week(
+        {
+            "missing_doc_by_account": {"acct": {"no_link": 1}},
+            "no_review_by_reason": {"self_not_matched": 1},
+        }
+    )
+    doc_line = "  ⚠ 1 meeting stored without their doc (no_link)"
+    skip_line = "  ⚠ 1 meeting filed without a review: no speaker matched your names"
+    assert both.index(doc_line) < both.index(skip_line)
+
+
 def test_format_meeting_week_escapes_every_value_it_interpolates():
     """The weekly block is parsed as HTML downstream (comms `html_to_mrkdwn` is
     an HTMLParser), so an `<a href>` the review model emits would arrive as a

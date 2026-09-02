@@ -38,6 +38,7 @@ async def test_empty_week_returns_empty_shape(pool):
     assert out == {
         "meetings": [], "talk_share_avg": None, "talk_share_prev": None,
         "words_per_turn_avg": None, "words_per_turn_prev": None, "missing_doc_by_account": {},
+        "no_review_by_reason": {},
     }
 
 
@@ -116,3 +117,33 @@ async def test_the_block_shows_the_meeting_title_not_the_review_prefix(pool):
     out = await ReviewActivities(db_pool=pool).gather_meeting_week()
     assert {m["title"] for m in out["meetings"]} == {"Standup – 2026/09/01 09:30 BST", "Retro"}
     assert "• Standup – 2026/09/01 09:30 BST — you spoke 9%" in format_meeting_week(out)
+
+
+async def test_meetings_filed_without_a_review_are_counted_by_meeting_date(pool):
+    """A skipped analysis was visible only in workflow_runs — 16 of the first 63
+    backfilled meetings were in that state. Counted in the SAME meeting-date
+    window as the meetings list, so a backfill cannot make an old one "this
+    week"; `analysis: ok` and a row not yet stamped are not counted at all."""
+    now = datetime.now(UTC)
+
+    def _meeting(days_ago, **extra):
+        return {
+            "doc_status": "ok",
+            "account": "acct-a",
+            "meeting_date": (now - timedelta(days=days_ago)).isoformat(),
+            **extra,
+        }
+
+    await _content(pool, "meeting", "Skipped", _meeting(2, analysis="self_not_matched"), age_days=0)
+    await _content(pool, "meeting", "Skipped 2", _meeting(3, analysis="too_thin"), age_days=0)
+    # Backfilled today, held three weeks ago ⇒ out of the window.
+    await _content(pool, "meeting", "Old skip", _meeting(20, analysis="self_not_matched"), age_days=0)
+    # Reviewed, and never stamped: neither is a warning.
+    await _content(pool, "meeting", "Reviewed", _meeting(1, analysis="ok"), age_days=0)
+    await _content(pool, "meeting", "Unstamped", _meeting(1), age_days=0)
+
+    out = await ReviewActivities(db_pool=pool).gather_meeting_week()
+    assert out["no_review_by_reason"] == {"self_not_matched": 1, "too_thin": 1}
+    block = format_meeting_week(out)
+    assert "⚠ 1 meeting filed without a review: no speaker matched your names" in block
+    assert "⚠ 1 meeting filed without a review: too little text to review" in block

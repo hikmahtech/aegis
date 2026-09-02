@@ -10,7 +10,9 @@ from temporalio.worker import Worker
 with workflow.unsafe.imports_passed_through():
     from aegis_worker.flows.meeting_notes import MeetingNotesFlow, MeetingNotesInput
 
-_calls: dict[str, list] = {"fetch": [], "ingest": [], "analyse": [], "analyse_agent": []}
+_calls: dict[str, list] = {
+    "fetch": [], "ingest": [], "analyse": [], "analyse_agent": [], "outcome": [],
+}
 
 
 def _reset():
@@ -40,6 +42,12 @@ async def ingest(item: dict) -> dict:
     return {"status": "ok", "content_id": f"cid-{item['source_type']}"}
 
 
+@activity.defn(name="record_analysis_outcome")
+async def record_outcome(content_id: str, outcome: str) -> dict:
+    _calls["outcome"].append((content_id, outcome))
+    return {"recorded": True}
+
+
 def _analyse(result):
     @activity.defn(name="analyse_meeting")
     async def analyse(doc: dict, agent_id: str = "") -> dict:
@@ -52,7 +60,12 @@ def _analyse(result):
 async def _run(stubs, wf_id):
     async with (
         await WorkflowEnvironment.start_time_skipping() as env,
-        Worker(env.client, task_queue="tq", workflows=[MeetingNotesFlow], activities=stubs),
+        Worker(
+            env.client,
+            task_queue="tq",
+            workflows=[MeetingNotesFlow],
+            activities=[*stubs, record_outcome],
+        ),
     ):
         return await env.client.execute_workflow(
             MeetingNotesFlow.run,
@@ -86,6 +99,9 @@ async def test_ok_doc_files_notes_and_review():
     assert _calls["analyse"][0]["message_id"] == "gm-flow-1" and _calls["analyse"][0]["account"] == "acct"
     # …and the flow's own agent, so llm_calls bills the review to whoever ran it.
     assert _calls["analyse_agent"] == ["sebas"]
+    # The verdict is stamped on the stored meeting row even when it succeeded —
+    # a re-run that now works has to clear a stale skip reason.
+    assert _calls["outcome"] == [("cid-meeting", "ok")]
 
 
 @pytest.mark.asyncio
@@ -118,6 +134,8 @@ async def test_an_ok_export_with_empty_notes_files_nothing():
     res = await _run([_fetch(doc), ingest, _analyse({})], "mn-empty-ok")
     assert res == {"status": "skipped", "reason": "nothing_usable", "doc_status": "ok"}
     assert _calls["ingest"] == [] and _calls["analyse"] == []
+    # Nothing was filed, so there is no row to stamp.
+    assert _calls["outcome"] == []
 
 
 @pytest.mark.asyncio
@@ -132,6 +150,20 @@ async def test_no_link_files_body_under_the_gmail_permalink_and_skipped_analysis
     assert item["url"] == "https://mail.google.com/mail/u/0/#inbox/gm-flow-1"
     assert item["title"] == DOC_OK["title"]
     assert item["metadata"]["doc_status"] == "no_link"
+    assert _calls["outcome"] == [("cid-meeting", "no_self_names")]
+
+
+@pytest.mark.asyncio
+async def test_an_unmatched_speaker_is_stamped_on_the_meeting_row():
+    """The commonest skip in production — 16 of the first 63 backfilled
+    meetings — and the weekly review can only warn about it if it is stored."""
+    _reset()
+    res = await _run(
+        [_fetch(DOC_OK), ingest, _analyse({"skipped": "self_not_matched", "stats": {}})],
+        "mn-unmatched",
+    )
+    assert res["status"] == "stored_no_analysis" and res["analysis"] == "self_not_matched"
+    assert _calls["outcome"] == [("cid-meeting", "self_not_matched")]
 
 
 @pytest.mark.asyncio
@@ -154,6 +186,7 @@ async def test_analysis_activity_failure_degrades_to_stored_no_analysis():
     res = await _run([_fetch(DOC_OK), ingest, boom], "mn-boom")
     assert res["status"] == "stored_no_analysis" and res["analysis"] == "analysis_failed"
     assert len(_calls["ingest"]) == 1
+    assert _calls["outcome"] == [("cid-meeting", "analysis_failed")]
 
 
 def test_registry_declares_the_flow_and_main_serves_the_activities():
@@ -165,3 +198,4 @@ def test_registry_declares_the_flow_and_main_serves_the_activities():
 
     assert hasattr(MeetingActivities, "fetch_meeting_document")
     assert hasattr(MeetingActivities, "analyse_meeting")
+    assert hasattr(MeetingActivities, "record_analysis_outcome")

@@ -60,6 +60,18 @@ _MEETING_AT = (
 # Gemini names every export "<meeting> – Notes by Gemini"; both dashes occur.
 _GEMINI_SUFFIXES = (" – Notes by Gemini", " - Notes by Gemini")
 _REVIEW_TITLE_PREFIX = "Meeting review: "
+# `analyse_meeting`'s skip reasons in the words the user thinks in. The three
+# LLM failures share a phrase because the distinction between them is an
+# operator's question, not the user's — it is in the logs either way. A reason
+# with no entry renders raw, so a new skip still surfaces instead of vanishing.
+_NO_REVIEW_PHRASES = {
+    "self_not_matched": "no speaker matched your names",
+    "no_self_names": "your names are not configured",
+    "too_thin": "too little text to review",
+    "llm_failed": "the review could not be generated",
+    "no_llm": "the review could not be generated",
+    "analysis_failed": "the review could not be generated",
+}
 
 
 def _meeting_display_title(row_title: str | None, meta_title: Any) -> str:
@@ -808,6 +820,7 @@ class ReviewActivities:
             "words_per_turn_avg": None,
             "words_per_turn_prev": None,
             "missing_doc_by_account": {},
+            "no_review_by_reason": {},
         }
         if self.db_pool is None:
             return empty
@@ -863,6 +876,19 @@ class ReviewActivities:
                 "AND COALESCE(metadata->>'doc_status', '') <> 'ok' "
                 "GROUP BY 1, 2"
             )
+            # Meetings whose analysis was skipped. Same meeting-date window as
+            # the list above, so a backfill of old meetings cannot file them
+            # under "this week". Rows with no `analysis` key at all predate the
+            # stamp and are not counted — an absent verdict is not a skip.
+            no_review = await conn.fetch(
+                "SELECT metadata->>'analysis' AS reason, count(*) AS n "
+                "FROM knowledge_content "
+                "WHERE source_type='meeting' "
+                f"AND {_MEETING_AT} >= now() - interval '7 days' "
+                "AND metadata->>'analysis' IS NOT NULL "
+                "AND metadata->>'analysis' <> 'ok' "
+                "GROUP BY 1"
+            )
 
         def _r(v):
             return round(float(v), 1) if v is not None else None
@@ -878,6 +904,7 @@ class ReviewActivities:
             "words_per_turn_avg": _r(wpt_now),
             "words_per_turn_prev": _r(wpt_prev),
             "missing_doc_by_account": missing_by_account,
+            "no_review_by_reason": {str(r["reason"]): int(r["n"]) for r in no_review},
         }
 
     @activity.defn
@@ -1138,7 +1165,8 @@ def format_meeting_week(data: dict) -> str:
     data = data or {}
     meetings = data.get("meetings") or []
     missing = data.get("missing_doc_by_account") or {}
-    if not meetings and not missing:
+    no_review = data.get("no_review_by_reason") or {}
+    if not meetings and not missing and not no_review:
         return ""
     lines = [f"🎙 <b>Meetings this week</b> ({len(meetings)})"]
     for m in meetings[:8]:
@@ -1185,6 +1213,12 @@ def format_meeting_week(data: dict) -> str:
             lines.append(
                 f"  ⚠ {other} meeting{plural} stored without their doc ({statuses})"
             )
+    # …and meetings whose doc arrived but whose review never happened. Same
+    # shape as the missing-doc warnings, after them: that is the older signal.
+    for reason, n in sorted(no_review.items()):
+        plural = "s" if n != 1 else ""
+        phrase = _NO_REVIEW_PHRASES.get(reason) or _esc(reason, 40)
+        lines.append(f"  ⚠ {n} meeting{plural} filed without a review: {phrase}")
     return "\n".join(lines)
 
 
