@@ -16,6 +16,21 @@ def test_merge_is_lenient_and_strips():
     assert merge({"self_names": "Sam"}) == {"self_names": []}
 
 
+def test_merge_tolerates_a_non_dict_row_instead_of_raising():
+    """The generic /api/settings editor validates nothing, so a bare string can
+    be stored under this key. Reading it must degrade, not 500 the admin GET."""
+    assert merge("Sam") == {"self_names": []}
+    assert merge(["Sam"]) == {"self_names": []}
+    assert merge(7) == {"self_names": []}
+
+
+def test_validate_rejects_a_non_dict_row():
+    with pytest.raises(ValueError):
+        validate("Sam")
+    with pytest.raises(ValueError):
+        validate(["Sam"])
+
+
 def test_validate_rejects_non_list_and_blank_entries():
     with pytest.raises(ValueError):
         validate({"self_names": "Sam"})

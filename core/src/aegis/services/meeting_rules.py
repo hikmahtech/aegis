@@ -25,9 +25,14 @@ SETTINGS_KEY = "meeting_rules"
 DEFAULT_SELF_NAMES: list[str] = []
 
 
-def merge(value: dict | None) -> dict:
-    """A stored (possibly partial) row merged over the defaults. Never raises."""
-    v = value or {}
+def merge(value: Any) -> dict:
+    """A stored (possibly partial) row merged over the defaults. Never raises.
+
+    A row that is not an object at all reads as empty rather than raising: the
+    generic ``PUT /api/settings/meeting_rules`` editor validates nothing, so a
+    bare string can reach this table, and a crash here would 500 the admin GET
+    and be swallowed into "no names" in the worker."""
+    v = value if isinstance(value, dict) else {}
     raw = v.get("self_names")
     names = (
         [str(n).strip() for n in raw if isinstance(n, str) and n.strip()]
@@ -37,8 +42,10 @@ def merge(value: dict | None) -> dict:
     return {"self_names": [*DEFAULT_SELF_NAMES, *names]}
 
 
-def validate(value: dict | None) -> dict:
+def validate(value: Any) -> dict:
     """Strict counterpart to ``merge`` for the WRITE path. Raises ValueError."""
+    if value is not None and not isinstance(value, dict):
+        raise ValueError("meeting_rules must be an object with self_names")
     v = value or {}
     raw = v.get("self_names")
     if not isinstance(raw, list):

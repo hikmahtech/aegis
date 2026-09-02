@@ -163,13 +163,18 @@ tier-resolved `model_balanced` local, never `settings.model_*`.
   - anything else → `fetch_failed`.
   Every non-ok status still returns `notes=body` so the flow can file
   something. Logged once per message at WARNING with the status.
-- Split: `split_notes_transcript(text) -> (notes, transcript, speakers)`. Pure
-  function. A transcript line is `^([^:\n]{2,60}): \S` and a speaker counts
-  only when it has ≥ 2 lines; the transcript is the longest contiguous run of
-  such lines and the notes are everything before it. Not keyed on a
-  "Transcript" heading, because the Gemini export mentions that word inside the
-  notes tab too. `# ponytail: longest-run heuristic; add a vendor-keyed
-  splitter if a second note-taker's layout breaks it.`
+- Split: `split_notes_transcript(text) -> (notes, transcript)`. Pure function. A
+  speaker-shaped line is `^([A-Za-z][^:\n]{1,59}): \S`; its label is a
+  *candidate* when it appears on ≥ 2 such lines anywhere in the document, or
+  when it looks like a person's name (2–4 capitalised words of letters, `'`,
+  `-`, `.`). The transcript opens at the first speaker-shaped line with a
+  candidate label and the notes are everything before it. Inside it, a bare
+  timestamp line is dropped and any other non-blank line folds into the previous
+  utterance. Every real transcript has a recurring or name-like label, so "no
+  candidate" is safe to read as "no transcript" and the whole text is notes.
+  Not keyed on a "Transcript" heading, because the Gemini export mentions that
+  word inside the notes tab too. `# ponytail: label heuristic; add a
+  vendor-keyed splitter if a second note-taker's layout breaks it.`
 - `meeting_date`: the email's `internal_date_ms`, ISO. Good enough for trends.
 - Runs in `asyncio.to_thread` like every other Google call in the worker.
 
@@ -184,7 +189,9 @@ tier-resolved `model_balanced` local, never `settings.model_*`.
   label, substring allowed) `talk_share_pct, words_per_turn,
   longest_turn_words`; plus `meeting_words_total, speaker_count`. No transcript
   → stats empty, analysis runs on notes alone and the verbosity note is
-  omitted.
+  omitted. A transcript that matches none of `self_names` is the opposite case
+  and stops there with `{"skipped": "self_not_matched"}`: reviewing it would
+  file a confident account of somebody else's meeting under the user's name.
 - Observations: one `record_external_observation` per metric with
   `source="meeting"`, `metric in {talk_share_pct, words_per_turn, turns}`,
   `external_id=doc_id or message_id`, `observed_at=meeting_date`,
@@ -214,10 +221,12 @@ tier-resolved `model_balanced` local, never `settings.model_*`.
 ```
 
 Read DB-first with empty defaults, so a fork ships nobody's name. Edited through
-the generic `PUT /api/settings/meeting_rules` for now. `# ponytail: generic
-settings editor; add a field on the Email triage page when a second key lands
-here.` `validate` rejects anything but a list of non-empty strings, so a typo'd
-row 400s instead of silently disabling every analysis.
+`PUT /api/admin/email/meeting-rules` with body `{"self_names": [...]}` (no
+`value` wrapper). `validate` rejects anything but a list of non-empty strings, so
+a typo'd row 400s instead of silently disabling every analysis. The generic
+`PUT /api/settings/meeting_rules` can reach the same row and validates nothing —
+`merge` therefore reads a non-object row as empty rather than raising, but do not
+send operators there.
 
 ### 5. Weekly block in `WeeklyReviewFlow`
 
@@ -338,7 +347,8 @@ the path filters.
 1. Email triage page: add sender override `gemini-notes@google.com` →
    `important_read`, tags `["meeting"]`. The override outranks the cached
    `triage_state` row.
-2. `PUT /api/settings/meeting_rules` with `self_names`.
+2. `PUT /api/admin/email/meeting-rules` with body `{"self_names": [...]}` — the
+   validating route, which 400s on a malformed list.
 3. `make aegis-release` from a pulled checkout; confirm the worker boots with
    one more flow and one more activities class.
 4. Wait for the next hourly run after a meeting, or trigger `gmail-ingest-hourly`
