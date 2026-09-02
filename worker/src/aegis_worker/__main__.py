@@ -44,6 +44,7 @@ from aegis_worker.activities.interactions import InteractionActivities
 from aegis_worker.activities.inventory import InventoryActivities
 from aegis_worker.activities.jira import JiraActivities
 from aegis_worker.activities.llm_governor import LLMGovernorActivities
+from aegis_worker.activities.meeting import MeetingActivities
 from aegis_worker.activities.memory import MemoryActivities
 from aegis_worker.activities.money import MoneyActivities, parse_bank_alert_senders
 from aegis_worker.activities.people import PeopleActivities
@@ -282,6 +283,16 @@ async def main():
         gmail_token_dir=getattr(settings, "gmail_token_dir", "config/"),
         db_pool=deps.pool,
         knowledge_connector=connectors.get("knowledge"),
+    )
+    meeting_act = MeetingActivities(
+        gmail_credentials_file=getattr(
+            settings, "gmail_credentials_file", "config/google_credentials.json"
+        ),
+        gmail_token_dir=getattr(settings, "gmail_token_dir", "config/"),
+        db_pool=deps.pool,
+        llm_client=deps.llm,
+        # Tier-resolved, same reason as GmailActivities above.
+        model_balanced=model_balanced,
     )
     # apply_enabled is the environment half of A4's two-key gate: without it,
     # `dry_run: false` on /admin/flows plans and logs but never writes.
@@ -534,6 +545,7 @@ async def main():
         calendar_act,
         gmail_act,
         drive_act,
+        meeting_act,
         memory_act,
         profile_act,
         people_act,

@@ -69,6 +69,7 @@ from aegis_worker.flows.intelligence_scan import IntelligenceScanFlow, Intellige
 from aegis_worker.flows.interaction import InteractionFlow
 from aegis_worker.flows.jira_sync import JiraSyncConfig, JiraSyncFlow
 from aegis_worker.flows.llm_spend_guard import LLMSpendGuardConfig, LLMSpendGuardFlow
+from aegis_worker.flows.meeting_notes import MeetingNotesFlow
 from aegis_worker.flows.memory_reflection import MemoryReflectionFlow, MemoryReflectionInput
 from aegis_worker.flows.money_hygiene import MoneyHygieneConfig, MoneyHygieneDailyFlow
 from aegis_worker.flows.money_process import MoneyProcessFlow
@@ -482,6 +483,8 @@ FLOWS: tuple[FlowSpec, ...] = (
         feature_flag="money_hygiene_enabled",
     ),
     FlowSpec(MoneyProcessFlow, feature_flag="money_hygiene_enabled"),
+    # Child of GmailIngestFlow (the `meeting` tag fan-out); never scheduled.
+    FlowSpec(MeetingNotesFlow),
 )
 
 # Activity classes whose *instance* main() only builds behind a feature flag.
