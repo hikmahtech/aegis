@@ -528,6 +528,39 @@ async def test_weekly_review_ships_when_key_dates_lookup_fails() -> None:
     assert "Coming up" not in sent[0]
 
 
+@pytest.mark.asyncio
+async def test_weekly_review_ships_when_the_meeting_formatter_raises() -> None:
+    """The gather was guarded but the FORMAT call sat outside the try, so a
+    malformed payload failed the flow before send_message ever ran. `meetings`
+    as a dict is that payload: truthy, so the block is built, and `meetings[:8]`
+    raises TypeError."""
+    _meeting_week_payload.clear()
+    _meeting_week_payload.update({"meetings": {"not": "a list"}, "missing_doc_by_account": {}})
+    sent: list[str] = []
+    try:
+        async with (
+            await WorkflowEnvironment.start_time_skipping() as env,
+            Worker(
+                env.client,
+                task_queue="aegis-review-meetingfmt-fail",
+                workflows=[WeeklyReviewFlow, InteractionFlow],
+                activities=_weekly_stubs(sent, None),
+            ),
+        ):
+            result = await env.client.execute_workflow(
+                WeeklyReviewFlow.run,
+                WeeklyReviewConfig(),
+                id=f"weekly-meetingfmt-fail-{uuid.uuid4()}",
+                task_queue="aegis-review-meetingfmt-fail",
+            )
+        assert result["kind"] == "weekly"
+        assert len(sent) == 1
+        assert "Weekly review — LLM framing." in sent[0]
+        assert "Meetings this week" not in sent[0]
+    finally:
+        _meeting_week_payload.clear()
+
+
 def test_format_meeting_week_renders_block_and_is_empty_without_meetings():
     assert format_meeting_week({}) == ""
     assert format_meeting_week({"meetings": [], "missing_doc_by_account": {}}) == ""

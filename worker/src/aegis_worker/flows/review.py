@@ -220,7 +220,15 @@ class WeeklyReviewFlow:
                     "weekly_key_dates_failed err=%s", str(exc)[:200]
                 )
                 key_dates = []
-            key_dates_block = format_key_dates(key_dates)
+            # The formatter is guarded too, and separately: the gather and the
+            # render are two different causes and the log has to say which.
+            try:
+                key_dates_block = format_key_dates(key_dates)
+            except Exception as exc:  # noqa: BLE001
+                workflow.logger.warning(
+                    "weekly_key_dates_format_failed err=%s", str(exc)[:200]
+                )
+                key_dates_block = ""
             if key_dates_block:
                 narrative = f"{narrative}\n\n{key_dates_block}"
             # Meetings block (MeetingNotesFlow's weekly digest). Same
@@ -236,7 +244,13 @@ class WeeklyReviewFlow:
             except Exception as exc:  # noqa: BLE001
                 workflow.logger.warning("weekly_meeting_week_failed err=%s", str(exc)[:200])
                 meeting_week = {}
-            meeting_block = format_meeting_week(meeting_week)
+            try:
+                meeting_block = format_meeting_week(meeting_week)
+            except Exception as exc:  # noqa: BLE001
+                workflow.logger.warning(
+                    "weekly_meeting_week_format_failed err=%s", str(exc)[:200]
+                )
+                meeting_block = ""
             if meeting_block:
                 narrative = f"{narrative}\n\n{meeting_block}"
             step = "send_message"
