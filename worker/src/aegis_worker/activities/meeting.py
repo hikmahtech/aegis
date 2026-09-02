@@ -18,7 +18,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from aegis.services.meeting_rules import is_self
+from aegis.llm import LLMTruncationError, parse_llm_json
+from aegis.services.meeting_rules import get_meeting_rules, is_self
+from aegis.services.meeting_rules import merge as merge_meeting_rules
+from aegis.services.observations import record_external_observation
 from temporalio import activity
 
 from aegis_worker.activities.gmail import _build_gmail_service, _extract_text_from_part
@@ -35,6 +38,20 @@ _SPEAKER_LINE_RE = re.compile(r"^([A-Za-z][^:\n]{1,59}): \S")
 _TRANSCRIPT_WINDOW = 5
 _TRANSCRIPT_MIN_HITS = 4
 _SELF_LINES_CAP = 6_000
+_PROMPT_NOTES_CAP = 8_000
+_MIN_NOTES_FOR_REVIEW = 400
+_REVIEW_MAX_TOKENS = 3000  # _reasoning_floor lifts this to 4096 on kimi/qwen
+_OBS_METRICS = ("talk_share_pct", "words_per_turn", "turns")
+_REVIEW_SYSTEM = """\
+You review ONE meeting on behalf of the person named below, for their own eyes only.
+Return JSON only, no prose around it:
+{"contributions": [...], "problems_raised": [...], "commitments": [...], "verbosity_note": "..."}
+
+- contributions: what THEY added — proposals, decisions they drove, facts they supplied. Max 5, one line each.
+- problems_raised: problems, risks or blockers THEY raised. Max 5.
+- commitments: things THEY agreed to do, with any dates mentioned. Max 5.
+- verbosity_note: one or two concrete sentences on how they could have said the same in fewer words, citing their own lines. Empty string when you were given no transcript lines.
+Use only the material provided. Never invent. Empty list when nothing applies."""
 
 
 def extract_doc_id(texts: Iterable[str]) -> str | None:
@@ -306,3 +323,125 @@ class MeetingActivities:
                 account_label,
             )
         return result
+
+    async def _load_rules(self) -> dict:
+        if not self.db_pool:
+            return merge_meeting_rules(None)
+        try:
+            return await get_meeting_rules(self.db_pool)
+        except Exception as exc:  # noqa: BLE001 — a config read must not stop the flow
+            activity.logger.warning("meeting_rules_read_failed err=%s", str(exc)[:200])
+            return merge_meeting_rules(None)
+
+    @activity.defn
+    async def analyse_meeting(self, doc: dict) -> dict:
+        """Stats in code, numbers to life.observations, one LLM review from the
+        user's own lines. A skipped analysis is a normal outcome — the notes
+        are already filed by the time this runs."""
+        rules = await self._load_rules()
+        self_names = rules["self_names"]
+        if not self_names:
+            return {"skipped": "no_self_names", "stats": {}, "observations": 0}
+
+        utterances = [(str(u[0]), str(u[1])) for u in (doc.get("transcript") or []) if len(u) == 2]
+        stats = speaker_stats(utterances, self_names) if utterances else {}
+        matched = bool(stats and stats["self"]["matched"])
+        observations = await self._record_observations(doc, stats) if matched else 0
+
+        notes = (doc.get("notes") or "")[:_PROMPT_NOTES_CAP]
+        mine = self_lines(utterances, self_names) if matched else ""
+        if len(notes) < _MIN_NOTES_FOR_REVIEW and not mine:
+            return {"skipped": "too_thin", "stats": stats, "observations": observations}
+        if not self.llm_client:
+            return {"skipped": "no_llm", "stats": stats, "observations": observations}
+
+        me = stats.get("self") or {}
+        prompt_parts = [
+            f"Person: {', '.join(self_names)}",
+            f"Meeting: {doc.get('title') or ''} ({(doc.get('meeting_date') or '')[:10]})",
+        ]
+        if matched:
+            prompt_parts.append(
+                f"Their speaking stats: {me['turns']} turns, {me['words']} words "
+                f"({me['talk_share_pct']}% of all words), {me['words_per_turn']} words per turn, "
+                f"longest turn {me['longest_turn_words']} words."
+            )
+            prompt_parts.append(f"Their own lines, in order:\n{mine}")
+        prompt_parts.append(f"Meeting notes:\n{notes}")
+        try:
+            raw = await self.llm_client.think(
+                prompt="\n\n".join(prompt_parts),
+                model=self.model_balanced,
+                system_prompt=_REVIEW_SYSTEM,
+                max_tokens=_REVIEW_MAX_TOKENS,
+                db_pool=self.db_pool,
+                purpose="meeting_review",
+                agent_id=self.agent_id,
+            )
+            parsed = parse_llm_json((raw.get("response") or "").strip())
+            if not isinstance(parsed, dict):
+                raise ValueError("unparseable meeting review")
+        except LLMTruncationError as exc:
+            activity.logger.warning("meeting_review_truncated: %s", str(exc)[:200])
+            return {"skipped": "llm_failed", "stats": stats, "observations": observations}
+        except Exception as exc:  # noqa: BLE001
+            activity.logger.warning("meeting_review_llm_failed: %s", str(exc)[:200])
+            return {"skipped": "llm_failed", "stats": stats, "observations": observations}
+
+        review = {
+            "contributions": _str_list(parsed.get("contributions")),
+            "problems_raised": _str_list(parsed.get("problems_raised")),
+            "commitments": _str_list(parsed.get("commitments")),
+            "verbosity_note": str(parsed.get("verbosity_note") or "").strip()[:600],
+        }
+        return {
+            "stats": stats,
+            "observations": observations,
+            "self_matched": matched,
+            "review": review,
+            "rendered": render_review(doc, review, stats),
+        }
+
+    async def _record_observations(self, doc: dict, stats: dict) -> int:
+        """One row per metric, deduped on (source, metric, external_id).
+        Returns how many rows were NEW; None from the writer means seen before."""
+        ext_id = str(doc.get("doc_id") or doc.get("message_id") or "")
+        if not self.db_pool or not ext_id:
+            return 0
+        observed_at = _parse_iso(doc.get("meeting_date"))
+        written = 0
+        for metric in _OBS_METRICS:
+            try:
+                row = await record_external_observation(
+                    self.db_pool,
+                    source="meeting",
+                    metric=metric,
+                    external_id=ext_id,
+                    value=stats["self"][metric],
+                    observed_at=observed_at,
+                    metadata={
+                        "title": doc.get("title") or "",
+                        "speaker_count": stats["speaker_count"],
+                    },
+                )
+            except Exception as exc:  # noqa: BLE001
+                activity.logger.warning(
+                    "meeting_observation_failed metric=%s err=%s", metric, str(exc)[:200]
+                )
+                continue
+            if row is not None:
+                written += 1
+        return written
+
+
+def _str_list(value: Any, cap: int = 5) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return [str(v).strip() for v in value if str(v).strip()][:cap]
+
+
+def _parse_iso(value: Any) -> _dt.datetime | None:
+    try:
+        return _dt.datetime.fromisoformat(str(value))
+    except (TypeError, ValueError):
+        return None
