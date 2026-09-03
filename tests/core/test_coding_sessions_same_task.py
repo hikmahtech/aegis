@@ -40,6 +40,14 @@ def test_parse_verdict_extracts_json_and_fails_closed_to_false():
     assert parse_same_task_verdict('{"same_task": "yes"}')["same_task"] is True
 
 
+def test_parse_verdict_reads_string_booleans_literally():
+    """`bool("false")` is True, which would invent a collision out of a "no"."""
+    assert parse_same_task_verdict('{"same_task": "false"}')["same_task"] is False
+    assert parse_same_task_verdict('{"same_task": "no"}')["same_task"] is False
+    assert parse_same_task_verdict('{"same_task": " TRUE "}')["same_task"] is True
+    assert parse_same_task_verdict('{"same_task": "1"}')["same_task"] is True
+
+
 def test_parse_verdict_fills_missing_keys_and_reports_unparseable():
     assert parse_same_task_verdict("no json here") == {
         "same_task": False,

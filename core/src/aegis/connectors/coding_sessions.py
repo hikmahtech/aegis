@@ -218,6 +218,21 @@ def _render(session: dict, key: str) -> str:
     return str(session.get(key) or "").strip() or "unknown"
 
 
+_TRUTHY = frozenset({"true", "yes", "1"})
+
+
+def _coerce_same_task(value: object) -> bool:
+    """`True` only for a genuine yes.
+
+    A string is read literally rather than for truthiness, because `bool("false")`
+    and `bool("no")` are both `True` — which would manufacture a collision out of
+    a model that answered no. Non-strings keep plain `bool`.
+    """
+    if isinstance(value, str):
+        return value.strip().lower() in _TRUTHY
+    return bool(value)
+
+
 def parse_same_task_verdict(text: str) -> dict:
     """The first JSON object in `text`, normalised. Fails CLOSED to `same_task=False`.
 
@@ -235,7 +250,7 @@ def parse_same_task_verdict(text: str) -> dict:
             obj = None
         if isinstance(obj, dict):
             return {
-                "same_task": bool(obj.get("same_task")),
+                "same_task": _coerce_same_task(obj.get("same_task")),
                 "session_name": str(obj.get("session_name") or ""),
                 "reason": str(obj.get("reason") or ""),
             }
