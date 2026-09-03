@@ -159,6 +159,16 @@ def test_agent_task_sweep_flow_in_schedule_map():
     assert config.cooldown_hours == 3
     assert config.max_coding == 2
 
+    # The seed row ships `config: {}`, so in a real deployment the DEFAULTS are
+    # what run — a builder that forgot a key would silently take the dataclass
+    # default instead of the configured one, and nothing else would notice.
+    _cls, config = _ACTIVITY_TYPE_MAP["AgentTaskSweepFlow"](
+        {"agent_id": "pandoras-actor", "config": {}}
+    )
+    assert (config.max_tasks, config.cooldown_hours) == (3, 6)
+    assert config.max_coding == 3
+    assert config.turn_timeout_minutes == 60
+
 
 def test_agent_task_registrations_reach_the_worker():
     """Before D6 this test AST-parsed main()'s hand-written `workflows`/
@@ -169,12 +179,15 @@ def test_agent_task_registrations_reach_the_worker():
     `check_registration()` refusing to boot on any disagreement (proved in
     tests/worker/test_registry.py).
 
-    What remains worth pinning here: these sixteen names — the thirteen
+    What remains worth pinning here: these twenty names — the seventeen
     agent_task registrations plus the three infra_ops ones added alongside the
-    infra verb (Task 4), restart-approval hook (Task 5), email verb (Task 6),
-    finance verb (Task 7) and coding verb phases 1-2 (Tasks 8-9) — are the
-    activity names the worker serves. A rename or a dropped @activity.defn
-    still breaks the flows that call them by name.
+    infra verb, the restart-approval hook, the email verb and the finance verb —
+    are the activity names the worker serves. A rename or a dropped
+    @activity.defn still breaks the flows that call them by name.
+
+    The one-shot coding verb (`run_task_investigation` / `collect_coding_run` /
+    `run_task_implementation`) is gone: the coding lane is now one persistent
+    session per task, driven by the seven task-session activities below.
     """
     served = expected_activity_names(_PROD)
     registered_flows = {c.__name__ for c in workflows_for(_PROD)}
@@ -192,9 +205,13 @@ def test_agent_task_registrations_reach_the_worker():
         "merchant_history",
         "apply_finance_decision",
         "resolve_task_repo",
-        "run_task_investigation",
-        "collect_coding_run",
-        "run_task_implementation",
+        "load_task",
+        "ensure_task_session",
+        "check_task_collision",
+        "launch_task_turn",
+        "kill_task_turn",
+        "record_task_turn",
+        "find_task_turns_due",
         "service_health",
         "service_logs",
         "restart_service",

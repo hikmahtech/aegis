@@ -469,6 +469,11 @@ async def main():
     # directly (same direct-call pattern as gmail_activities.apply_label
     # below). alert_act is constructed above, well before agent_task_act.
     agent_task_act.alert_act = alert_act
+    # check_task_collision asks a balanced-tier model whether one of the
+    # operator's own sessions is already on this task. `model_balanced` is the
+    # TIER-RESOLVED name built at the top of main(), never `settings.model_*`.
+    agent_task_act.llm_client = deps.llm
+    agent_task_act.model_balanced = model_balanced
     # triage_email needs GmailActivities.apply_label plus the set of accounts
     # to probe. Active email channels are the Gmail accounts to probe. Read
     # them from the channels table (kind='email', active) — config->>'label'

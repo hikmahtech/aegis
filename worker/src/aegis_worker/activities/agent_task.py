@@ -11,10 +11,18 @@ from __future__ import annotations
 
 import asyncio
 import re
+import shlex
 from dataclasses import dataclass, field
 from typing import Any
 
-from aegis.connectors.coding_sessions import busy_human_sessions
+from aegis.connectors.coding_sessions import (
+    build_same_task_prompt,
+    find_session,
+    human_sessions_in_repo,
+    parse_same_task_verdict,
+)
+from aegis.llm.tier import tier_to_model
+from aegis.services import task_sessions
 from aegis.services.project_repo_map import get_project_repo_map, lookup
 from temporalio import activity
 
@@ -31,6 +39,28 @@ EXCLUDED_LABELS = ["@someday", PARK_LABEL]
 # agent-assigned backlog is ~80 rows, so this is the pool, not a sample.
 # ponytail: fixed bound; move both caps into SQL if the pool ever nears it.
 _ELIGIBLE_SCAN_LIMIT = 200
+
+# The comment thread is a coding session's memory, and the whole tail is re-read
+# on every turn. 30 notes is a long day of back-and-forth; the flow, not this
+# activity, caps the RENDERED thread at 12,000 characters (newest kept).
+_TASK_NOTE_LIMIT = 30
+
+# One SSH round trip answers three git questions per session. The blocks are
+# separated by an echoed marker rather than by counting lines: a repo with fewer
+# than three commits would otherwise push status lines into the log field.
+_SESSION_GIT_LOG_LINES = 3
+_GIT_BLOCK_MARKER = "---"
+
+# Git context is gathered for at most this many human sessions, concurrently,
+# with a short per-probe timeout. All of it happens inside ONE activity's
+# start-to-close budget, so a sequential probe of several sessions would time
+# the activity out instead of degrading to a `proceed` verdict.
+_COLLISION_PROBE_LIMIT = 5
+_COLLISION_PROBE_TIMEOUT = 10
+
+# A turn's MCP mount token outlives its deadline by an hour, so a run that is
+# being killed or inspected past the deadline still has its tools.
+_TURN_TOKEN_GRACE_SECONDS = 3600
 
 # comment() retries in-activity rather than via a Temporal retry_policy, so the
 # command uuid stays stable and the Sync API dedups. A parked task's comment is
@@ -128,6 +158,25 @@ def extract_merchant(title: str) -> str:
 _TIER2_CONFIDENCE_THRESHOLD = 0.8
 
 
+def match_repo_candidate(candidates: list[dict], comment: str) -> dict | None:
+    """The candidate the operator named in a comment, or None.
+
+    An EXACT (case-insensitive) match on one of the three names a candidate is
+    known by. Deliberately not a substring or fuzzy match: this is the answer to
+    "which repo?", and the cost of a wrong pick is an unattended coding session
+    in someone else's checkout. Anything unrecognised repeats the question.
+    """
+    text = (comment or "").strip().lower()
+    if not text:
+        return None
+    for candidate in candidates:
+        for key in ("github_repo", "resource_title", "resource_path"):
+            value = str(candidate.get(key) or "").strip().lower()
+            if value and value == text:
+                return candidate
+    return None
+
+
 @dataclass
 class AgentTaskActivities:
     db_pool: Any = None
@@ -148,6 +197,13 @@ class AgentTaskActivities:
     # AlertActivities is constructed. None ⇒ tier 2/3 are skipped and
     # resolve_task_repo behaves exactly as tier-1-only (never guesses).
     alert_act: Any = None
+    # LLMClient for check_task_collision's same-task judgement, and the
+    # tier-RESOLVED balanced model name (never the tier label, and never
+    # `settings.model_*`). Both late-wired in __main__.py; None/"" degrade to a
+    # `proceed` verdict rather than raising, because a dead model must not stop
+    # the coding lane.
+    llm_client: Any = None
+    model_balanced: str = ""
 
     @activity.defn
     async def find_actionable_tasks(
@@ -158,6 +214,12 @@ class AgentTaskActivities:
         `max_coding` caps coding tasks (source_tag IS NULL + @code) within the
         batch — a kimi run takes minutes and the coding host's tmux window cap
         is 10, so an uncapped fan-out would wedge it.
+
+        A task that already has a `task_sessions` row is excluded outright: the
+        sweep only ever starts TURN ONE. Later turns come from
+        `find_task_turns_due`, keyed on the session's own `last_turn_at`
+        watermark, so without this exclusion every tick would start a second
+        first turn on a conversation that is already going.
         """
         if self.db_pool is None:
             return []
@@ -174,6 +236,9 @@ class AgentTaskActivities:
                   WHERE wr.workflow_type = 'AgentTaskFlow'
                     AND wr.todoist_task_ref = t.id
                     AND wr.started_at > now() - make_interval(hours => $3)
+              )
+              AND NOT EXISTS (
+                  SELECT 1 FROM task_sessions ts WHERE ts.task_id = t.id
               )
             ORDER BY t.updated_at ASC
             LIMIT $4
@@ -655,168 +720,536 @@ class AgentTaskActivities:
             }
         return {**empty, "candidates": candidates}
 
+    # --- task sessions: one persistent coding session per @code task ---------
+
     @activity.defn
-    async def run_task_investigation(
-        self,
-        task_id: str,
-        title: str,
-        description: str,
-        repo_path: str,
-        github_repo: str,
-    ) -> dict:
-        """Read-only coding-CLI run: understand the task and propose a plan.
+    async def load_task(self, task_id: str) -> dict:
+        """The task plus the tail of its comment thread.
 
-        Phase 1 of two. Investigating first means a misread task or wrong repo
-        costs nothing. MUST NOT write code — the prompt says so and the plan
-        card gates phase 2.
+        The webhook path carries a task id and nothing else, so the flow loads
+        the task here rather than trusting whatever a payload claimed. The
+        thread rides along because it IS the session's context: notes come back
+        oldest-first, the order a person reads them in and the order the turn
+        prompt renders them.
+
+        An unknown task is `{}`, not an error — it may have been deleted between
+        the comment that woke us and this activity, and that reads as "nothing
+        to do".
         """
-        if self.remote_script is None or not repo_path:
-            return {"status": "failed", "transcript": "", "run_id": ""}
+        if self.db_pool is None or not task_id:
+            return {}
+        row = await self.db_pool.fetchrow(
+            "SELECT id, content, description, labels, source_tag, project_id, assignee_label "
+            "FROM todoist_tasks WHERE id = $1",
+            task_id,
+        )
+        if row is None:
+            return {}
+        # `id` breaks the tie on `posted_at`: Todoist stamps a burst of notes
+        # with the same second, and an unstable sort would reorder the
+        # conversation between turns.
+        notes = await self.db_pool.fetch(
+            "SELECT content, posted_at FROM ("
+            "  SELECT id, content, posted_at FROM todoist_notes WHERE item_id = $1"
+            "  ORDER BY posted_at DESC, id DESC LIMIT $2"
+            ") recent ORDER BY posted_at ASC, id ASC",
+            task_id,
+            _TASK_NOTE_LIMIT,
+        )
+        task = dict(row)
+        task["labels"] = list(task["labels"] or [])
+        task["notes"] = [
+            {
+                "content": note["content"] or "",
+                # ISO strings rather than datetimes: the thread is rendered
+                # straight into a prompt and echoed in the flow's result
+                # summary, and both want one stable textual shape.
+                "posted_at": note["posted_at"].isoformat() if note["posted_at"] else "",
+            }
+            for note in notes
+        ]
+        return task
 
-        # Entry point of the coding lane: defer to a human already busy in this
-        # repo. The FLOW must not park on this path — parking stamps @waiting,
-        # which would retire the task over a transient collision.
-        busy = await busy_human_sessions(self.remote_script, repo_path)
-        if busy:
-            activity.logger.warning(
-                "coding_run_skipped_repo_busy repo=%s sessions=%s",
-                repo_path,
-                [s.get("name") for s in busy],
+    @activity.defn
+    async def ensure_task_session(
+        self, task_id: str, agent_id: str, task: dict, comment: str
+    ) -> dict:
+        """The task's session row, with a repo and a live worktree when known.
+
+        Called before every turn. A row that already carries a repo skips the
+        RESOLVER — re-resolving each turn would let a later LLM guess move a
+        task to a different checkout mid-conversation — but still verifies its
+        worktree, which is one idempotent SSH round trip. Without that check a
+        tree removed out of band (a manual `git worktree remove`, a disk clean)
+        would leave the row `ready` for ever while every turn launched into a
+        directory that is not there.
+
+        An unresolved task still gets its row. That row is what makes the NEXT
+        comment reach the flow at all (the webhook keys on its existence), and
+        it is how the operator answers: they name one of the returned
+        `candidates` in a comment and the following turn matches it. There is
+        no card and no guess — running an unattended coding session in the
+        wrong checkout is worse than not running one.
+
+        `set_repo` is deliberately the LAST step, after the worktree exists. A
+        row carrying a repo short-circuits to `ready` for ever, so recording one
+        whose worktree failed to build would wedge the task on a directory that
+        is not there; leaving it empty makes the next turn retry.
+        """
+        empty: dict = {"status": "unresolved", "session": None, "candidates": [], "error": ""}
+        if self.db_pool is None or not task_id:
+            return {**empty, "error": "no database pool"}
+        session = await task_sessions.create_session(
+            self.db_pool, task_id=task_id, agent_id=agent_id
+        )
+        if self.remote_script is None:
+            return {
+                **empty,
+                "session": session,
+                "error": "remote_script connector is not configured",
+            }
+        if session.get("repo"):
+            error = await self._build_task_worktree(
+                repo=str(session["repo"]),
+                worktree_path=str(session.get("worktree_path") or ""),
+                branch=str(session.get("branch") or ""),
+                host=str(session.get("host") or ""),
+            )
+            if error:
+                return {**empty, "session": session, "error": error}
+            return {"status": "ready", "session": session, "candidates": [], "error": ""}
+
+        resolved = await self.resolve_task_repo(task or {})
+        github_repo = str(resolved.get("github_repo") or "")
+        repo_path = str(resolved.get("repo_path") or "")
+        candidates = list(resolved.get("candidates") or [])
+        if not repo_path:
+            picked = match_repo_candidate(candidates, comment)
+            if picked is None:
+                return {
+                    "status": "candidates" if candidates else "unresolved",
+                    "session": session,
+                    "candidates": candidates,
+                    "error": "",
+                }
+            github_repo = str(picked.get("github_repo") or "")
+            repo_path = str(picked.get("resource_path") or "") or github_repo.split("/")[-1]
+
+        settings = await self.remote_script.coding_settings()
+        host = str(settings.get("host") or "")
+        # Sibling of the shared checkout, like the per-run worktrees, but keyed
+        # on the TASK: turn 2 has to find turn 1's uncommitted work.
+        worktree_path = (
+            f"{str(settings.get('repo_base') or '').rstrip('/')}/{repo_path}"
+            f"-aegis-wt/task-{task_id}"
+        )
+        branch = f"aegis-task/{task_id}"
+        error = await self._build_task_worktree(
+            repo=repo_path, worktree_path=worktree_path, branch=branch, host=host
+        )
+        if error:
+            return {
+                **empty,
+                "session": session,
+                "candidates": candidates,
+                "error": error,
+            }
+        await task_sessions.set_repo(
+            self.db_pool,
+            task_id,
+            repo=repo_path,
+            github_repo=github_repo,
+            worktree_path=worktree_path,
+            branch=branch,
+            host=host,
+        )
+        fresh = await task_sessions.get_session(self.db_pool, task_id)
+        return {"status": "ready", "session": fresh or session, "candidates": [], "error": ""}
+
+    async def _build_task_worktree(
+        self, *, repo: str, worktree_path: str, branch: str, host: str
+    ) -> str:
+        """Create-or-verify the task's worktree. `""` on success, else the error.
+
+        Idempotent by design on the connector side, so calling it before every
+        turn costs one cheap SSH round trip and buys the self-heal: a worktree
+        that disappeared is rebuilt on the same branch, with the task's
+        committed work still on it.
+        """
+        built = await self.remote_script.ensure_task_worktree(
+            repo=repo, worktree_path=worktree_path, branch=branch, host=host
+        )
+        if built.get("status") == "ready":
+            return ""
+        return str(built.get("error") or "the task worktree could not be created")
+
+    @activity.defn
+    async def check_task_collision(
+        self, task_id: str, repo: str, session_id: str, override: bool = False
+    ) -> dict:
+        """Who owns this task right now: `proceed`, `you_are_in_it` or `hand_to_you`.
+
+        Ownership is per TASK, not per repo. AEGIS works in its own worktree, so
+        files never collide; what collides is two executors on the same task.
+
+        1. `you_are_in_it` — the task's own session id is live in the registry,
+           so the operator has resumed this very conversation and the comment is
+           already in front of them. It beats everything and costs no LLM call.
+        2. `hand_to_you` — a person's session in the same repo looks, from its
+           branch/commits/dirty files, to be on this task. Being in the same
+           repo is NOT enough; that is why the git context is gathered at all.
+        3. `proceed` — everything else, with any human sessions reported so the
+           flow can say it is working alongside them.
+
+        `override` (the operator's `take over`) skips step 2 entirely rather
+        than ignoring its verdict: a model that keeps saying "same task" would
+        otherwise keep costing a call the operator has already overruled. Step 1
+        still applies — driving a conversation someone is sitting in is not
+        something a comment should be able to authorise.
+
+        EVERY failure path returns `proceed`. A broken inventory, an unreachable
+        host or a dead model must not become an outage of the coding lane.
+        """
+        proceed: dict = {"verdict": "proceed", "session": None, "sessions": [], "reason": ""}
+        if self.remote_script is None:
+            return {**proceed, "reason": "no remote_script connector"}
+        try:
+            inventory = await self.remote_script.list_coding_sessions() or {}
+            status = str(inventory.get("status") or "")
+            if status != "ok":
+                return {**proceed, "reason": f"inventory {status or 'unavailable'}"}
+            sessions = list(inventory.get("sessions") or [])
+
+            ours = find_session(sessions, session_id)
+            if ours is not None:
+                owner = await self._own_session_owner(task_id)
+                return {
+                    "verdict": "you_are_in_it",
+                    # OVERRIDES the registry's owner tag, which cannot answer
+                    # this question — see `_own_session_owner`.
+                    "session": {**ours, "owner": owner},
+                    "sessions": [],
+                    "reason": f"session {session_id} is live as "
+                    f"{ours.get('name') or 'unnamed'} ({owner})",
+                }
+
+            humans = human_sessions_in_repo(sessions, repo)
+            if not humans:
+                return proceed
+            if override:
+                return {**proceed, "sessions": humans, "reason": "override"}
+            if self.llm_client is None:
+                return {**proceed, "sessions": humans, "reason": "no llm client"}
+
+            title, description, owner = await self._task_identity(task_id)
+            host = str((await self.remote_script.coding_settings()).get("host") or "")
+            enriched = await self._enrich_sessions(humans, host)
+            result = await self.llm_client.think(
+                build_same_task_prompt(title, description, enriched),
+                # "balanced" is a TIER, not a model name — resolve it, never
+                # send the label upstream.
+                model=self.model_balanced or tier_to_model("balanced"),
+                max_tokens=4096,
+                db_pool=self.db_pool,
+                purpose="task_session_collision",
+                agent_id=owner,
+            )
+            verdict = parse_same_task_verdict(str(result.get("content") or ""))
+            if not verdict["same_task"]:
+                return {**proceed, "sessions": enriched, "reason": verdict["reason"]}
+            # By name, because the model answers with one. A name it invented
+            # falls back to the first session rather than to no session: the
+            # verdict was "a person is on this", and which one matters less than
+            # staying out of their way.
+            named = next(
+                (s for s in enriched if s.get("name") == verdict["session_name"]), enriched[0]
             )
             return {
-                "status": "skipped",
-                "reason": "repo_busy",
-                "transcript": "",
-                "run_id": "",
+                "verdict": "hand_to_you",
+                "session": named,
+                "sessions": enriched,
+                "reason": verdict["reason"],
             }
+        except Exception as exc:  # noqa: BLE001 — see the docstring: fails open
+            activity.logger.warning(
+                "task_collision_check_failed task_id=%s err=%s", task_id, str(exc)[:200]
+            )
+            return {**proceed, "reason": f"check failed: {str(exc)[:200]}"}
 
-        prompt = (
-            "You are investigating a task. Do NOT modify any files, do NOT commit, "
-            "do NOT create branches.\n\n"
-            f"Task: {title}\n\n{description}\n\n"
-            "Read the code and report:\n"
-            "1. What the task is actually asking for.\n"
-            "2. Which files would need to change.\n"
-            "3. A short implementation plan.\n"
-            "4. Anything that makes this ambiguous or risky.\n\n"
-            "End your final message with exactly one of:\n"
-            "     STATUS: scoped\n"
-            "     STATUS: unactionable: <why>\n"
-        )
-        settings = await self.remote_script.coding_settings()
-        started = await self.remote_script.start_kimi_run(
-            repo=repo_path,
-            prompt=prompt,
-            kimi_binary=settings.get("kimi_binary", ""),
-            github_repo=github_repo,
-        )
-        if started.get("status") != "running":
-            return {
-                "status": "failed",
-                "transcript": started.get("error", "")[:500],
-                "run_id": started.get("run_id", ""),
-            }
-        return {
-            "status": "running",
-            "transcript": "",
-            "run_id": started.get("run_id", ""),
-            "output_file": started.get("output_file", ""),
-            "host": started.get("host", ""),
-            "worktree_path": started.get("worktree_path", ""),
-        }
+    async def _own_session_owner(self, task_id: str) -> str:
+        """Who is driving the task's own live session: `"aegis"` or `"human"`.
 
-    @activity.defn
-    async def collect_coding_run(
-        self, output_file: str, host: str, max_polls: int = 40
-    ) -> dict:
-        """Poll a coding run until its STATUS footer appears, then extract text.
+        The session registry cannot answer this. Its records carry no
+        `entrypoint` field (the keys are cwd/id/kind/name/pid/sessionId/
+        startedAt/state/status), and both candidates sit in the SAME directory:
+        the take-over footer tells the operator to `cd <worktree_path> && claude
+        --resume <id>`, and that path contains `-aegis-wt/`, which is exactly
+        what `normalise_repo` tags `owner="aegis"`. So an operator takeover —
+        the case the whole rule exists to serve — would be read as one of our
+        own orphans.
 
-        Returns the ASSISTANT TRANSCRIPT, never the raw stream-json: handing raw
-        jsonl to an LLM is what made every prod verdict confidence=0.0 with
-        `{"role":"tool"` in its root_cause (fixed in #150).
+        Liveness of the LAST turn we launched is the signal that does separate
+        them: an orphan of ours is by definition still writing its output file,
+        while a takeover happens after that turn has ended.
+
+        Unknown counts as HUMAN. The aegis branch is the harsher one — no Slack
+        note, no watermark bump, and the comment re-dispatched every 15 minutes
+        — so a missing file, an unreachable host or a raising probe must not
+        land a person there.
         """
-        from aegis_worker.activities.alerts import (
-            _INVESTIGATION_OUTPUT_CAP,
-            _extract_kimi_transcript,
-            _kimi_output_complete,
+        if self.db_pool is None or self.remote_script is None:
+            return "human"
+        try:
+            row = await task_sessions.get_session(self.db_pool, task_id) or {}
+            output_file = str(row.get("last_output_file") or "")
+            if not output_file:
+                return "human"
+            alive = await self.remote_script.kimi_run_alive(
+                output_file, host=str(row.get("last_host") or "")
+            )
+        except Exception as exc:  # noqa: BLE001 — see the docstring: unknown is human
+            activity.logger.warning(
+                "task_owner_probe_failed task_id=%s err=%s", task_id, str(exc)[:200]
+            )
+            return "human"
+        return "aegis" if alive else "human"
+
+    async def _enrich_sessions(self, humans: list[dict], host: str) -> list[dict]:
+        """`humans` with git context attached, probed CONCURRENTLY.
+
+        Every probe is an SSH round trip inside one activity's start-to-close
+        budget, so probing five sessions one after another would time the whole
+        activity out — which is a hard failure, not the `proceed` this check is
+        supposed to degrade to. Hence `gather`, a short per-probe timeout, and a
+        cap on how many sessions are probed at all: past a handful the verdict
+        does not change, and the unprobed ones are still reported.
+
+        A probe that raises leaves its session unenriched (rendered `unknown`)
+        rather than failing the verdict.
+        """
+        probed = humans[:_COLLISION_PROBE_LIMIT]
+        if len(humans) > len(probed):
+            activity.logger.info(
+                "task_collision_probe_capped sessions=%s probed=%s", len(humans), len(probed)
+            )
+        results = await asyncio.gather(
+            *(self._session_git_context(human, host) for human in probed),
+            return_exceptions=True,
         )
+        enriched: list[dict] = []
+        for human, result in zip(probed, results, strict=True):
+            if isinstance(result, BaseException):
+                activity.logger.warning(
+                    "task_collision_probe_failed session=%s err=%s",
+                    human.get("name"),
+                    str(result)[:200],
+                )
+                enriched.append(dict(human))
+            else:
+                enriched.append(result)
+        # The sessions we did not probe are still the operator's, so they stay
+        # in the list the flow reports back — just without git context.
+        return enriched + [dict(h) for h in humans[_COLLISION_PROBE_LIMIT:]]
 
-        if self.remote_script is None or not output_file:
-            return {"status": "failed", "transcript": ""}
+    async def _task_identity(self, task_id: str) -> tuple[str, str, str]:
+        """`(title, description, owning agent)` — what the collision prompt and
+        the LLM spend record need, in one query."""
+        if self.db_pool is None or not task_id:
+            return "", "", ""
+        row = await self.db_pool.fetchrow(
+            "SELECT t.content, t.description, ts.agent_id FROM todoist_tasks t "
+            "LEFT JOIN task_sessions ts ON ts.task_id = t.id WHERE t.id = $1",
+            task_id,
+        )
+        if row is None:
+            return "", "", ""
+        return (row["content"] or "", row["description"] or "", row["agent_id"] or "")
 
-        latest = ""
-        for _ in range(max_polls):
-            raw = await self.remote_script.fetch_kimi_run_output(output_file, host=host)
-            if raw:
-                latest = raw
-                if _kimi_output_complete(raw):
-                    return {
-                        "status": "succeeded",
-                        "transcript": _extract_kimi_transcript(raw)[-_INVESTIGATION_OUTPUT_CAP:],
-                    }
-            # heartbeat() RAISES RuntimeError("Not in activity context") outside a
-            # Worker, unlike activity.logger which degrades silently. The unit
-            # tests call this method directly, so guard it the way comment()
-            # already does in this same file.
-            if activity.in_activity():
-                activity.heartbeat()
-            await asyncio.sleep(30)
+    async def _session_git_context(self, session: dict, host: str) -> dict:
+        """`session` plus the git facts that separate "same repo" from "same task".
 
+        One SSH round trip per session, answering three commands whose output is
+        separated by an echoed marker. Counting lines instead would put a commit
+        into the status field on any repo with fewer than three commits.
+
+        A failed probe leaves the fields ABSENT rather than blank, because
+        `build_same_task_prompt` renders a missing field as `unknown` — a blank
+        would read as "no changes", which is a claim we cannot make.
+        """
+        cwd = str(session.get("cwd") or "")
+        if not cwd:
+            return dict(session)
+        quoted = shlex.quote(cwd)
+        result = await self.remote_script.run_on_host(
+            host,
+            f"git -C {quoted} branch --show-current; echo {_GIT_BLOCK_MARKER}; "
+            f"git -C {quoted} log -{_SESSION_GIT_LOG_LINES} --oneline; "
+            f"echo {_GIT_BLOCK_MARKER}; "
+            f"git -C {quoted} status --short | head -20",
+            timeout=_COLLISION_PROBE_TIMEOUT,
+        )
+        if (result or {}).get("status") != "succeeded":
+            return dict(session)
+        blocks: list[list[str]] = [[]]
+        for raw_line in str(result.get("stdout") or "").splitlines():
+            line = raw_line.strip()
+            if line == _GIT_BLOCK_MARKER:
+                blocks.append([])
+            elif line:
+                blocks[-1].append(line)
+        blocks += [[], [], []]  # a command that printed nothing still needs a slot
         return {
-            "status": "timed_out",
-            "transcript": (
-                _extract_kimi_transcript(latest)[-_INVESTIGATION_OUTPUT_CAP:] if latest else ""
-            ),
+            **session,
+            "branch": blocks[0][0] if blocks[0] else "",
+            "log": " | ".join(blocks[1]),
+            "status_short": ", ".join(blocks[2]),
         }
 
     @activity.defn
-    async def run_task_implementation(
+    async def launch_task_turn(
         self,
-        task_id: str,
-        title: str,
-        description: str,
-        plan: str,
-        repo_path: str,
-        github_repo: str,
+        session: dict,
+        prompt: str,
+        agent_id: str,
+        resume: bool,
+        name: str,
+        turn_timeout_minutes: int,
     ) -> dict:
-        """Phase 2: implement the approved plan on a branch. Does NOT open a PR.
+        """Start one turn of the task's session. NOT idempotent — a retry is a
+        second billed CLI session, so the flow launches this exactly once.
 
-        Opening the PR is a separate gated step, so a bad implementation stays
-        local and reviewable rather than becoming a PR nobody asked for.
+        Three arguments are what make this a TURN rather than a fresh run:
+        `session_id` (the same conversation), `resume` (continue it instead of
+        creating it) and `worktree_path` (the task's own tree, which the
+        connector then neither creates nor removes). Drop any one and the result
+        is a healthy-looking run with no memory of the last turn.
+
+        The engine is forced to claude for every repo: only claude resumes a
+        session, mounts the agent's AEGIS tools and can be taken over
+        interactively with `claude --resume`.
         """
-        if self.remote_script is None or not repo_path:
-            return {"status": "failed", "transcript": "", "branch": "", "run_id": ""}
+        failed: dict = {
+            "status": "failed",
+            "run_id": "",
+            "output_file": "",
+            "host": "",
+            "engine": "",
+            "tmux_window": "",
+            "worktree_path": "",
+            "error": "",
+        }
+        if self.remote_script is None:
+            return {**failed, "error": "remote_script connector is not configured"}
+        repo = str(session.get("repo") or "")
+        if not repo:
+            return {**failed, "error": "the task session has no repo yet"}
 
-        branch = f"aegis-task/{task_id}"
-        prompt = (
-            "Implement the approved plan below. Commit your work to a new branch "
-            f"named exactly `{branch}`. Do NOT open a pull request.\n\n"
-            f"Task: {title}\n\n{description}\n\n"
-            f"Approved plan:\n{plan}\n\n"
-            "End your final message with exactly one of:\n"
-            f"     BRANCH: {github_repo.split('/')[-1]}:{branch}\n"
-            "     STATUS: implemented\n"
-            "   or STATUS: unactionable: <why>\n"
-        )
         settings = await self.remote_script.coding_settings()
         started = await self.remote_script.start_kimi_run(
-            repo=repo_path,
+            repo=repo,
             prompt=prompt,
             kimi_binary=settings.get("kimi_binary", ""),
-            github_repo=github_repo,
+            github_repo=str(session.get("github_repo") or ""),
+            engine_override="claude",
+            agent_id=agent_id,
+            session_id=str(session.get("session_id") or ""),
+            resume=bool(resume),
+            name=name,
+            worktree_path=str(session.get("worktree_path") or ""),
+            token_ttl_seconds=int(turn_timeout_minutes) * 60 + _TURN_TOKEN_GRACE_SECONDS,
         )
         if started.get("status") != "running":
             return {
-                "status": "failed",
-                "transcript": started.get("error", "")[:500],
-                "branch": "",
+                **failed,
                 "run_id": started.get("run_id", ""),
+                "engine": started.get("engine", ""),
+                "error": str(started.get("error") or "")[:500],
             }
+
+        from aegis_worker.activities.agent_run import _tmux_window_name
+
+        engine = started.get("engine", "")
+        run_id = started.get("run_id", "")
+        # Remember WHERE this turn is writing. `check_task_collision` probes
+        # that file to tell an orphan of ours from an operator who took the
+        # session over; without it every takeover reads as an orphan.
+        # Best-effort: the session is already running and this activity is
+        # NO_RETRY, so raising here would strand a live turn nobody polls.
+        task_id = str(session.get("task_id") or "")
+        if self.db_pool is not None and task_id:
+            try:
+                await task_sessions.set_last_run(
+                    self.db_pool,
+                    task_id,
+                    output_file=str(started.get("output_file") or ""),
+                    host=str(started.get("host") or ""),
+                )
+            except Exception as exc:  # noqa: BLE001
+                activity.logger.warning(
+                    "task_last_run_not_recorded task_id=%s err=%s", task_id, str(exc)[:200]
+                )
         return {
             "status": "running",
-            "transcript": "",
-            "branch": branch,
-            "run_id": started.get("run_id", ""),
+            "run_id": run_id,
             "output_file": started.get("output_file", ""),
             "host": started.get("host", ""),
+            "engine": engine,
+            # Same composition the connector's tmux launch uses, so the name we
+            # hand the operator is the name they can attach to.
+            "tmux_window": (
+                _tmux_window_name(engine, repo, run_id) if started.get("in_tmux") else ""
+            ),
+            "worktree_path": started.get("worktree_path", ""),
+            "error": "",
         }
+
+    @activity.defn
+    async def kill_task_turn(self, output_file: str, host: str) -> dict:
+        """Kill whatever process still holds this turn's output file open.
+
+        `killed: True` means the SSH round trip RAN — not that a process died.
+        The remote `fuser` may be absent, or may have found nothing to kill
+        because the turn had already exited. Treat it as "the kill was
+        attempted" and keep polling for the exit; never as proof the run is
+        gone.
+
+        The tmux window is deliberately left for inspection. An orphan run still
+        writing the same session while the next turn starts is worse than a lost
+        turn, which is why this exists at all.
+        """
+        if self.remote_script is None or not output_file:
+            return {"killed": False}
+        return {"killed": bool(await self.remote_script.kill_run(output_file, host=host))}
+
+    @activity.defn
+    async def record_task_turn(self, task_id: str, launched: bool) -> dict:
+        """Move the session's watermark past the comment this turn consumed.
+
+        EVERY verdict bumps it, including the two that hand the task back to the
+        operator: the comment has been dealt with, and the 15-minute fallback
+        sweep would otherwise re-dispatch it for ever. Only a turn that actually
+        launched a session counts towards `turns`.
+
+        `recorded: False` means no session row matched — it was cleaned up (or
+        never created) while the turn ran, so the watermark this claims to have
+        moved does not exist.
+        """
+        if self.db_pool is None or not task_id:
+            return {"recorded": False}
+        moved = await task_sessions.record_turn(self.db_pool, task_id, launched=bool(launched))
+        if not moved:
+            activity.logger.warning("task_turn_not_recorded task_id=%s", task_id)
+        return {"recorded": bool(moved)}
+
+    @activity.defn
+    async def find_task_turns_due(self, limit: int = 20) -> list[dict]:
+        """Sessions whose newest USER comment is newer than their last turn.
+
+        The Todoist webhook is the fast path; this is the sweep's fallback for a
+        missed one, so it keys on the session's own `last_turn_at` watermark and
+        NOT on the flow cooldown — a comment must not wait six hours because the
+        task ran recently.
+        """
+        if self.db_pool is None:
+            return []
+        return await task_sessions.find_turns_due(self.db_pool, limit)

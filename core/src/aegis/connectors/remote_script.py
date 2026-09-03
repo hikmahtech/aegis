@@ -46,6 +46,13 @@ _DB_CONFIG_TTL_SECONDS = 30.0
 # ".." is rejected outright to prevent path traversal.
 _SCRIPT_ID_RE = re.compile(r"^[a-zA-Z0-9_\-./]+$")
 
+# Hard ceiling on the prompt written to the run's temp file. It is a runaway
+# guard, not a product limit, and the truncation is SILENT — so it has to sit
+# well above what real callers send. The task lane's turn prompt carries a
+# task's whole comment thread, which the old 5000-byte ceiling cut mid-sentence
+# with no error anywhere.
+_PROMPT_CAP_BYTES = 24000
+
 # tmux window names for agent runs are "<engine>-<repo>-<run_id>"; the planner
 # counts only these toward the cap so the session's default shell window is
 # ignored.
@@ -160,6 +167,9 @@ def _agent_launch_flags(
     config_dir: str = "",
     mcp_config: str = "",
     gated: bool = False,
+    session_id: str = "",
+    resume: bool = False,
+    name: str = "",
 ) -> str:
     """Build the agent CLI invocation (without output redirection) for `engine`.
 
@@ -190,10 +200,25 @@ def _agent_launch_flags(
             (Bash, Edit); AEGIS's own MCP tools are gated server-side instead,
             by the `/gated` endpoint `_mcp_run_config` points the run at (#294).
 
-    `mcp_config` and `gated` are claude-only: the kimi CLI has no equivalent
-    flag pair, so a kimi run gets no mounted AEGIS tools and cannot be gated
-    (`start_kimi_run` refuses a gated kimi launch outright rather than
-    downgrading it to an ungated one).
+    `session_id` pins the run to ONE long-lived claude session, which is how a
+    Todoist task keeps its context across turns instead of re-explaining itself
+    every time. It is caller-chosen (a uuid4 minted once and stored on the
+    task's `task_sessions` row — NOT derived from the task, so a task whose
+    session was cleaned up and later restarted gets a fresh one), so the caller
+    knows the id before the run exists and can find the session again.
+    The first turn CREATES it with `--session-id <uuid>` (plus `-n <name>`, a
+    human label for the session picker); every later turn REPLAYS it with
+    `--resume <uuid>`. The two are mutually exclusive by construction:
+    `--session-id` on an existing session errors out, and `--resume` needs no
+    name because the session already has one. Emitting both would be a run that
+    either dies at argument parsing or silently starts a fresh, amnesiac
+    session — the exact failure this primitive exists to prevent.
+
+    `mcp_config`, `gated`, `session_id`, `resume` and `name` are claude-only:
+    the kimi CLI has no equivalent flags, so a kimi run gets no mounted AEGIS
+    tools, cannot be gated (`start_kimi_run` refuses a gated kimi launch
+    outright rather than downgrading it to an ungated one) and carries no
+    session across turns.
 
     claude reads the prompt from stdin; kimi takes it as a `-p` argument via
     `$(cat ...)` command substitution instead. Both emit one JSON event per
@@ -220,9 +245,18 @@ def _agent_launch_flags(
             if gated
             else " --dangerously-skip-permissions"
         )
+        session = ""
+        if session_id:
+            # One branch or the other, never both — see the session note above.
+            if resume:
+                session = f" --resume {shlex.quote(session_id)}"
+            else:
+                session = f" --session-id {shlex.quote(session_id)}"
+                if name:
+                    session += f" -n {shlex.quote(name)}"
         return (
             f"{env}{shlex.quote(binary)} --print --output-format stream-json "
-            f"--verbose{permission}{mcp} < {shlex.quote(prompt_file)}"
+            f"--verbose{session}{permission}{mcp} < {shlex.quote(prompt_file)}"
         )
     return (
         f"{shlex.quote(binary)} --output-format stream-json "
@@ -863,6 +897,10 @@ class RemoteScriptConnector:
         agent_id: str = "",
         gated: bool = False,
         token_ttl_seconds: int = 0,
+        session_id: str = "",
+        resume: bool = False,
+        name: str = "",
+        worktree_path: str = "",
     ) -> dict:
         """Start a coding-CLI run (kimi or claude) on the effective host.
 
@@ -918,6 +956,19 @@ class RemoteScriptConnector:
              tool lives and what points the run at the enforcing endpoint, so
              an unmounted gated run is an ungated run.
 
+        `session_id`/`resume`/`name` pin a claude run to one long-lived session
+        (see `_agent_launch_flags`): the task lane's turns are separate runs of
+        the same session, not separate agents.
+
+        `worktree_path`, when set, means the CALLER owns that directory: this
+        method neither creates it (no `test -d`/`git pull`/`worktree add`) nor
+        removes it on any failure path. A per-task worktree outlives the run
+        that used it — the next turn resumes into the same tree with the same
+        branch and the same uncommitted work — so the per-run ownership rule
+        below ("this method owns what it created") must not reach it. Default
+        "" keeps the per-run behaviour: provision a throwaway worktree here and
+        clean it up when nothing was launched.
+
         Reachable-host runs are wrapped in a tmux window for live attach.
         Output is always captured to `output_file` (via `tee` in tmux mode) so
         stream-json parsing is unchanged.
@@ -968,66 +1019,79 @@ class RemoteScriptConnector:
             binary = self._kimi_binary or kimi_binary
             config_dir = ""
 
-        # Phase 1: ensure repo directory is present and up-to-date
-        check = await self._exec(host, f"test -d {shlex.quote(repo_path)}", timeout=10)
-        if check["exit_code"] == -1:  # ssh error/timeout — not a missing dir
-            error = check["stderr"] or "repo check failed"
-            logger.warning("kimi_repo_check_failed", error=error)
-            return {"run_id": run_id, "status": "failed", "error": error, "engine": engine}
-        dir_exists = check["status"] == "succeeded"
+        # A caller-supplied worktree is the caller's to create, refresh and
+        # delete; this flag is what keeps every cleanup path below off it.
+        owns_worktree = not worktree_path
+        skills_src = ""
+        work_path = worktree_path
 
-        if not dir_exists:
-            error = (
-                f"Repo checkout missing on {host}: {repo_path} — "
-                "provision it via WorkspaceRepoSyncFlow (no JIT clone)"
+        if owns_worktree:
+            # Phase 1: ensure repo directory is present and up-to-date
+            check = await self._exec(host, f"test -d {shlex.quote(repo_path)}", timeout=10)
+            if check["exit_code"] == -1:  # ssh error/timeout — not a missing dir
+                error = check["stderr"] or "repo check failed"
+                logger.warning("kimi_repo_check_failed", error=error)
+                return {"run_id": run_id, "status": "failed", "error": error, "engine": engine}
+            dir_exists = check["status"] == "succeeded"
+
+            if not dir_exists:
+                error = (
+                    f"Repo checkout missing on {host}: {repo_path} — "
+                    "provision it via WorkspaceRepoSyncFlow (no JIT clone)"
+                )
+                logger.warning("kimi_repo_missing", repo=repo, repo_path=repo_path, host=host)
+                return {"run_id": run_id, "status": "failed", "error": error, "engine": engine}
+
+            await self._exec(
+                host,
+                f"git -C {shlex.quote(repo_path)} pull --ff-only --quiet 2>/dev/null || true",
+                timeout=30,
             )
-            logger.warning("kimi_repo_missing", repo=repo, repo_path=repo_path, host=host)
-            return {"run_id": run_id, "status": "failed", "error": error, "engine": engine}
 
-        await self._exec(
-            host,
-            f"git -C {shlex.quote(repo_path)} pull --ff-only --quiet 2>/dev/null || true",
-            timeout=30,
-        )
-
-        # Phase 2: create an isolated per-run worktree (sibling of the shared
-        # clone), and — for claude — seed it with AEGIS's SKILL.md runbooks in
-        # the same round trip. The fragment is rc-neutral and self-skipping, so
-        # neither an unconfigured self_repo_path nor a missing skills dir can
-        # change what this command reports.
-        worktree_path = f"{repo_path}-aegis-wt/{run_id}"
-        worktree_parent = f"{repo_path}-aegis-wt"
-        skills_src = self._skills_source_dir() if engine == "claude" else ""
-        wt_cmd = (
-            f"mkdir -p {shlex.quote(worktree_parent)} && "
-            f"git -C {shlex.quote(repo_path)} worktree add --detach {shlex.quote(worktree_path)}"
-            f"{_skills_copy_fragment(skills_src, worktree_path)}"
-        )
-        wt = await self._exec(host, wt_cmd, timeout=30)
-        if wt["status"] != "succeeded":
-            logger.warning("kimi_worktree_add_failed", repo=repo, error=wt["stderr"][:300])
-            work_path = repo_path
-            worktree_path = ""
-        else:
-            work_path = worktree_path
+            # Phase 2: create an isolated per-run worktree (sibling of the shared
+            # clone), and — for claude — seed it with AEGIS's SKILL.md runbooks in
+            # the same round trip. The fragment is rc-neutral and self-skipping, so
+            # neither an unconfigured self_repo_path nor a missing skills dir can
+            # change what this command reports.
+            worktree_path = f"{repo_path}-aegis-wt/{run_id}"
+            worktree_parent = f"{repo_path}-aegis-wt"
+            skills_src = self._skills_source_dir() if engine == "claude" else ""
+            wt_cmd = (
+                f"mkdir -p {shlex.quote(worktree_parent)} && "
+                f"git -C {shlex.quote(repo_path)} worktree add --detach "
+                f"{shlex.quote(worktree_path)}"
+                f"{_skills_copy_fragment(skills_src, worktree_path)}"
+            )
+            wt = await self._exec(host, wt_cmd, timeout=30)
+            if wt["status"] != "succeeded":
+                logger.warning("kimi_worktree_add_failed", repo=repo, error=wt["stderr"][:300])
+                work_path = repo_path
+                worktree_path = ""
+            else:
+                work_path = worktree_path
 
         # Phase 3: write prompt to temp file on remote via stdin
         prompt_file = f"/tmp/aegis-prompt-{run_id}.txt"
         output_file = f"/tmp/aegis-kimi-run-{run_id}.jsonl"
 
+        # Cut on bytes, then drop any partial character the cut created — an
+        # invalid UTF-8 tail would make the whole prompt file unreadable.
+        prompt_bytes = prompt.encode()[:_PROMPT_CAP_BYTES].decode(errors="ignore").encode()
         wrote = await self._exec(
             host,
             f"cat > {shlex.quote(prompt_file)}",
             timeout=15,
-            stdin=prompt[:5000].encode(),
+            stdin=prompt_bytes,
         )
         if wrote["exit_code"] != 0:
             logger.warning(
                 "kimi_prompt_write_failed", error=wrote["stderr"], exit_code=wrote["exit_code"]
             )
             # Nothing was launched, so nothing can be holding the worktree: this
-            # method owns what it created up to the point a process exists.
-            await self.remove_worktree(worktree_path, host=host)
+            # method owns what it created up to the point a process exists — and
+            # a caller-owned worktree is never "what it created".
+            if owns_worktree:
+                await self.remove_worktree(worktree_path, host=host)
             return {
                 "run_id": run_id,
                 "status": "failed",
@@ -1051,7 +1115,8 @@ class RemoteScriptConnector:
                 "that the run carries an agent_id."
             )
             logger.warning("gated_run_mcp_mount_missing", agent_id=agent_id, run_id=run_id)
-            await self.remove_worktree(worktree_path, host=host)
+            if owns_worktree:
+                await self.remove_worktree(worktree_path, host=host)
             return {"run_id": run_id, "status": "failed", "error": error, "engine": engine}
 
         # Phase 4: launch the agent. tmux mode → live-attachable window with
@@ -1062,7 +1127,16 @@ class RemoteScriptConnector:
         # substituted into `-p` via `$(cat ...)`), but the same rule holds
         # regardless: this launch command never redirects stdin itself.
         agent_flags = _agent_launch_flags(
-            engine, binary, work_path, prompt_file, config_dir, mcp_config, gated
+            engine,
+            binary,
+            work_path,
+            prompt_file,
+            config_dir,
+            mcp_config,
+            gated,
+            session_id=session_id,
+            resume=resume,
+            name=name,
         )
         # `nohup env …`, never `nohup VAR=… …`: nohup execs its first argument
         # as a PROGRAM, so an environment-assignment prefix (CLAUDE_CONFIG_DIR,
@@ -1091,6 +1165,9 @@ class RemoteScriptConnector:
                 config_dir=config_dir,
                 mcp_config=mcp_config,
                 gated=gated,
+                session_id=session_id,
+                resume=resume,
+                name=name,
             )
 
         if not launched_in_tmux:
@@ -1101,7 +1178,7 @@ class RemoteScriptConnector:
                 # already have forked the agent remotely, and pulling the worktree
                 # out from under a live process is worse than leaking it. A clean
                 # ssh/connect failure never started anything, so it cleans up.
-                if launch["status"] != "timed_out":
+                if owns_worktree and launch["status"] != "timed_out":
                     await self.remove_worktree(worktree_path, host=host)
                 return {
                     "run_id": run_id,
@@ -1285,10 +1362,19 @@ class RemoteScriptConnector:
         config_dir: str = "",
         mcp_config: str = "",
         gated: bool = False,
+        session_id: str = "",
+        resume: bool = False,
+        name: str = "",
     ) -> bool:
         """Launch the agent in a tmux window on `host`. Returns True if a window
         was created, False if it should fall back to detached nohup (all windows
-        live, or any tmux step errored)."""
+        live, or any tmux step errored).
+
+        `session_id`/`resume`/`name` are the claude session flags, passed
+        straight through to `_agent_launch_flags`. `name` labels the claude
+        SESSION, not the tmux window (`winname` below) — the tmux path must
+        compose the same command as the nohup fallback, or a run would carry its
+        task session only when tmux happened to be available."""
         sess = self._tmux_session
         # Round trip 1: ensure the session exists, then list its windows.
         ensure_list = (
@@ -1309,9 +1395,20 @@ class RemoteScriptConnector:
             return False
 
         winname = f"{engine}-{_sanitize_window_repo(repo)}-{run_id}"
+        agent_flags = _agent_launch_flags(
+            engine,
+            binary,
+            work_path,
+            prompt_file,
+            config_dir,
+            mcp_config,
+            gated,
+            session_id=session_id,
+            resume=resume,
+            name=name,
+        )
         inner = (
-            f"cd {shlex.quote(work_path)} && "
-            f"{_agent_launch_flags(engine, binary, work_path, prompt_file, config_dir, mcp_config, gated)} "
+            f"cd {shlex.quote(work_path)} && {agent_flags} "
             f"2>&1 | tee {shlex.quote(output_file)}"
         )
         prune = "".join(f"tmux kill-window -t {shlex.quote(pid)}; " for pid in prune_ids)
@@ -1488,6 +1585,100 @@ class RemoteScriptConnector:
             return {"stopped": False, "reason": "kill_failed", "window": window_name}
         logger.info("coding_run_stopped", run_id=run_id, window=window_name, host=target_host)
         return {"stopped": True, "reason": "", "window": window_name}
+
+    async def ensure_task_worktree(
+        self, repo: str, worktree_path: str, branch: str, host: str = ""
+    ) -> dict:
+        """Create (once) the persistent worktree a Todoist task works in.
+
+        The task lane's counterpart to `start_kimi_run`'s per-run worktree: this
+        one is keyed on the task, lives on its own branch and SURVIVES between
+        turns, so turn 2 finds turn 1's uncommitted work. Idempotent by design —
+        it is called before every turn and must be a cheap no-op after the first.
+
+        Ordering matters. The shared clone is pulled FIRST, so a first-turn
+        worktree branches off current `main` rather than off whatever the clone
+        was left at; an existing worktree then short-circuits (`exit 0`) before
+        anything can touch the branch the task is mid-way through. The pull is
+        `|| true` for the same reason it is in `start_kimi_run`: a detached
+        network or a diverged clone must not stop work that only needs the local
+        objects.
+
+        `worktree add -b <branch>` is tried first and falls back to
+        `worktree add <wt> <branch>` — the branch already exists whenever a
+        previous worktree for this task was removed but its branch kept, which is
+        what a git-level cleanup leaves behind. Skills are seeded in the same
+        round trip, by the same rc-neutral fragment the per-run path uses.
+
+        Returns {"status": "ready"|"failed", "error": str}.
+        """
+        await self._refresh_config()
+        target = host or self._host
+        repo_path = f"{self._repo_base}/{repo}" if self._repo_base else repo
+
+        check = await self._exec(target, f"test -d {shlex.quote(repo_path)}", timeout=10)
+        if check["exit_code"] == -1:  # ssh error/timeout — not a missing dir
+            error = check["stderr"] or "repo check failed"
+            logger.warning("task_worktree_repo_check_failed", repo=repo, error=error)
+            return {"status": "failed", "error": error}
+        if check["status"] != "succeeded":
+            error = (
+                f"Repo checkout missing on {target}: {repo_path} — "
+                "provision it via WorkspaceRepoSyncFlow (no JIT clone)"
+            )
+            logger.warning("task_worktree_repo_missing", repo=repo, repo_path=repo_path)
+            return {"status": "failed", "error": error}
+
+        parent = worktree_path.rsplit("/", 1)[0]
+        skills_src = self._skills_source_dir()
+        cmd = (
+            f"git -C {shlex.quote(repo_path)} pull --ff-only --quiet 2>/dev/null || true; "
+            f"[ -d {shlex.quote(worktree_path)} ] && exit 0; "
+            f"mkdir -p {shlex.quote(parent)} && "
+            f"(git -C {shlex.quote(repo_path)} worktree add -b {shlex.quote(branch)} "
+            f"{shlex.quote(worktree_path)} 2>/dev/null || "
+            f"git -C {shlex.quote(repo_path)} worktree add {shlex.quote(worktree_path)} "
+            f"{shlex.quote(branch)})"
+            f"{_skills_copy_fragment(skills_src, worktree_path)}"
+        )
+        result = await self._exec(target, cmd, timeout=60)
+        if result["status"] != "succeeded":
+            error = result["stderr"][:300] or "worktree add failed"
+            logger.warning(
+                "task_worktree_add_failed",
+                repo=repo,
+                worktree_path=worktree_path,
+                branch=branch,
+                error=error,
+            )
+            return {"status": "failed", "error": error}
+        return {"status": "ready", "error": ""}
+
+    async def kill_run(self, output_file: str, host: str = "") -> bool:
+        """Kill the agent process still writing `output_file`. Returns True when
+        the remote command ran (it says nothing about whether anything died).
+
+        The output file is the only handle a caller reliably has on a task turn:
+        a nohup launch has no window name, and even in tmux the pane may already
+        be gone. `fuser -k` kills whatever holds the file open, which is exactly
+        the run. `; true` makes the rc report the SSH round trip rather than
+        fuser's "nobody had it open" (rc 1) — a turn that already exited is a
+        successful kill, not a failure to report upward.
+        """
+        if not output_file:
+            return False
+        await self._refresh_config()
+        result = await self._exec(
+            host or self._host,
+            f"fuser -k {shlex.quote(output_file)} >/dev/null 2>&1; true",
+            timeout=15,
+        )
+        if result["status"] != "succeeded":
+            logger.warning(
+                "task_run_kill_failed", output_file=output_file, error=result["stderr"][:200]
+            )
+            return False
+        return True
 
     async def remove_worktree(self, worktree_path: str, host: str = "") -> None:
         """Best-effort cleanup of a per-run git worktree created by start_kimi_run.

@@ -272,7 +272,7 @@ user-authored:
 | `source_tag = '#alert'` | infra | Check the service's health *now* (not the alert history) → healthy: comment + complete; unhealthy: logs + a "restart?" card |
 | `source_tag = '#receipt'` | finance | Assemble the merchant's charge history → decision card ("Expected / Investigate"). No autonomous action |
 | `source_tag = '#email'` | email triage | Notification → archive + complete; genuinely needs a reply → comment + `@waiting` (the Gmail scope is `gmail.modify` — AEGIS cannot send mail) |
-| `source_tag IS NULL` + `@code` | coding | Two-phase coding run: read-only investigation → plan card → implement on a branch → PR card → open PR |
+| `source_tag IS NULL` + `@code` | coding | Task session: one persistent Claude Code session per task, one turn per comment → plan → implement on a branch when asked → draft PR when asked → `@waiting` |
 | anything else | — | Comment "no executor for this" + park. Never guessed at |
 
 ```mermaid
@@ -288,7 +288,7 @@ flowchart TD
     EM -- yes --> D2["archive + complete"]
     EM -- no --> W2["comment + @waiting"]
     V -- "#receipt" --> F1["merchant history<br/>+ decision card"] --> W3["@waiting"]
-    V -- "@code" --> K1["investigate (read-only)<br/>→ plan card → implement<br/>→ PR card → open PR"] --> W4["@waiting"]
+    V -- "@code" --> K1["task session: turn per comment<br/>→ plan → implement when asked<br/>→ draft PR when asked"] --> W4["@waiting"]
     V -- unknown --> W5["comment + @waiting"]
 ```
 
@@ -298,8 +298,26 @@ metadata, and commenting findings on the task — no gate. Restarting a service,
 implementing code, opening a PR, applying a finance decision — card first.
 Restart/finance cards use the fire-and-forget `post_resolve_activity` hook
 (`apply_restart_approval` / `apply_finance_decision`), so the child can park
-the task and exit while the card is still open; the coding flow instead awaits
-its plan/PR cards directly (safe, because the child itself is abandoned).
+the task and exit while the card is still open. The coding verb has no cards
+at all: the task's comment thread is its approval channel (see below).
+
+**Task sessions (the coding verb).** A `@code` task gets one persistent Claude
+Code session, recorded in `task_sessions` (session uuid, per-task worktree
+`<repo>-aegis-wt/task-<id>`, branch `aegis-task/<id>`). The first turn
+investigates read-only and posts a plan as a comment; every later user comment
+is the next turn of the same session (`claude -p --resume`), so "go",
+"also fix the tests" and "open a PR" all work. Comments reach the flow within a
+second through the Todoist webhook (`dispatch_task_turn`: start the workflow
+`agent-task-<id>`, or signal `comment` into a running one) and within 15
+minutes through the sweep's `find_task_turns_due` fallback, keyed on
+`task_sessions.last_turn_at`. Before each turn a collision check reads
+`claude agents --json`: if the task's own session is live the turn is skipped
+(the operator resumed it); if the operator has other sessions in the same repo,
+one LLM call decides whether they are already on this task, and if so AEGIS
+parks with a note and waits for a `take over` comment. Take a task over with
+`cd <worktree> && claude --resume <session_id>` (both are in every comment's
+footer); hand it back by commenting. `ClarifyFlow` ignores tasks that have a
+session row, so a comment never gets both a chat reply and a turn.
 
 **Every path ends completed or parked.** A task is auto-completed only when
 the work is genuinely done (service healthy, notification archived);

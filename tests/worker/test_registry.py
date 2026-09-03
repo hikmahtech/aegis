@@ -262,10 +262,17 @@ def test_module_workflows_is_the_unflagged_registry():
         # MeetingSweepFlow (meeting_sender_addresses, unstored_meeting_messages
         # on the existing MeetingActivities) — the scheduled safety net for the
         # `meeting` fan-out, which finds notes mail the `is:unread` hourly query
-        # never saw. Unflagged, so all three rows move.
-        (True, True, 42, 203),
-        (False, False, 34, 173),
-        (True, False, 38, 192),
+        # never saw. Unflagged, so all three rows move. Then +4 activities and
+        # NO new flow from the task-session lane: the three one-shot coding
+        # activities (run_task_investigation, collect_coding_run,
+        # run_task_implementation) are replaced by seven (load_task,
+        # ensure_task_session, check_task_collision, launch_task_turn,
+        # kill_task_turn, record_task_turn, find_task_turns_due) on the
+        # existing AgentTaskActivities, which is unflagged — so all three rows
+        # move by the same +4.
+        (True, True, 42, 207),
+        (False, False, 34, 177),
+        (True, False, 38, 196),
     ],
 )
 def test_real_registration_passes_the_boot_check(homelab, money, flows, activities):

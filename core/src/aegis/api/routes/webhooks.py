@@ -34,6 +34,7 @@ from aegis.services.alert_tasks import close_task_for_resolved_alert
 from aegis.services.health import record_health_push
 from aegis.services.observations import record_observation
 from aegis.services.places import record_location_push
+from aegis.services.task_sessions import dispatch_task_turn, is_user_note
 
 logger = structlog.get_logger()
 
@@ -770,6 +771,46 @@ async def todoist_webhook(
                     "todoist_webhook_note_bump_failed",
                     error=str(exc)[:200],
                 )
+            # Task-session fast path: a @code task owns a task_sessions row and
+            # every user comment on it is one turn of that task's AgentTaskFlow.
+            # The sweep (find_turns_due) would get there within a tick; this
+            # gets there in ~1s. Best-effort on purpose — a Temporal outage here
+            # must not fail the webhook (Todoist retries a non-200 for hours)
+            # nor skip the ClarifyFlow kick below; the sweep re-picks the
+            # comment either way.
+            if settings.temporal_host:
+                try:
+                    from temporalio.client import Client as _Client
+
+                    # Joined against the task, not read from the session row
+                    # alone: a completed @code task keeps its session until
+                    # CleanupFlow ages it out, and a comment on a finished task
+                    # (a "thanks", a late note) must not start a coding turn on
+                    # it. `find_turns_due` already excludes them the same way.
+                    sess = await pool.fetchrow(
+                        "SELECT ts.agent_id FROM task_sessions ts "
+                        "JOIN todoist_tasks t ON t.id = ts.task_id AND NOT t.is_completed "
+                        "WHERE ts.task_id = $1",
+                        str(item_id),
+                    )
+                    if sess and is_user_note(content):
+                        client = await _Client.connect(settings.temporal_host)
+                        outcome = await dispatch_task_turn(
+                            client,
+                            task_id=str(item_id),
+                            agent_id=sess["agent_id"],
+                            comment=content,
+                        )
+                        logger.info(
+                            "todoist_webhook_task_turn_dispatched",
+                            item_id=str(item_id)[:32],
+                            outcome=outcome,
+                        )
+                except Exception as exc:  # noqa: BLE001 — the sweep re-picks a missed turn
+                    logger.warning(
+                        "todoist_webhook_task_turn_failed",
+                        error=str(exc)[:200],
+                    )
             # Best-effort: kick ClarifyFlow now. Idempotent — flow query
             # respects last_clarified_at vs last_note_at; if no tasks need
             # clarify, the run is a 50ms no-op.
