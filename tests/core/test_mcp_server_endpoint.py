@@ -30,7 +30,9 @@ AUTH = {"X-API-Key": "test-key"}
 
 # Every `_UNSERVED_TOOLS` member is granted in the DB on purpose: the endpoint
 # must strip all of them. `call_mcp_tool` would re-enter AEGIS's MCP client; the
-# other three each launch another CLI run, which mounts this same server again.
+# next three each launch another CLI run, which mounts this same server again;
+# `stop_agent_run` and `comment_on_task` are operator actions (the membership
+# test below spells out why each one is withheld).
 TOOL_SET = [
     "whats_next",
     "capture_to_inbox",
@@ -39,6 +41,7 @@ TOOL_SET = [
     "aegis_self_diagnose",
     "investigate_resource",
     "stop_agent_run",
+    "comment_on_task",
 ]
 
 
@@ -366,20 +369,26 @@ async def test_unserved_tools_cannot_be_invoked_even_though_they_are_granted(cli
     assert "result" not in body  # nothing ran
 
 
-async def test_the_unserved_set_is_exactly_these_five(client):
+async def test_the_unserved_set_is_exactly_these_six(client):
     """A closed list, asserted by name: adding a run-spawning tool to an agent's
     `tool_set` without adding it here silently re-opens the recursion door, and
     the only way to notice is a test that pins the membership.
 
     `stop_agent_run` joined for a different reason than the rest — it does not
     spawn anything, it KILLS. A run able to call it could take out a sibling run
-    or the very run a human is waiting on, so it is operator-only too."""
+    or the very run a human is waiting on, so it is operator-only too.
+
+    `comment_on_task` is a third reason again: what it posts is a user-authored
+    note, and a user-authored note is exactly what starts a task session's next
+    turn. A run holding it could comment its own task into a self-triggering
+    loop, so it lives on the operator mount and in chat only."""
     assert set(mcp_server_mod._UNSERVED_TOOLS) == {
         "call_mcp_tool",
         "dispatch_agent_run",
         "aegis_self_diagnose",
         "investigate_resource",
         "stop_agent_run",
+        "comment_on_task",
     }
     # Every one of them is a real chat tool with a real executor — a typo here
     # would exclude nothing at all.

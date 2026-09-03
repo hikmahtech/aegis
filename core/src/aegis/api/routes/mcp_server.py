@@ -139,6 +139,8 @@ _UNSERVED_TOOLS = frozenset(
         # its siblings, or the very run a human is waiting on. Stopping is an
         # operator action, so it lives only on the operator mount.
         "stop_agent_run",
+        # A run commenting on its own task would trigger its own next turn.
+        "comment_on_task",
     }
 )
 

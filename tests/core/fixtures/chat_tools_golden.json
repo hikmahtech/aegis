@@ -946,6 +946,30 @@
   {
     "type": "function",
     "function": {
+      "name": "comment_on_task",
+      "description": "Post a comment in your own voice on a Todoist task. On a task with a coding session this starts the session's next turn.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "task_id": {
+            "type": "string",
+            "description": "the Todoist task id."
+          },
+          "text": {
+            "type": "string",
+            "description": "the comment, posted verbatim."
+          }
+        },
+        "required": [
+          "task_id",
+          "text"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
       "name": "find_reference",
       "description": "Search the \ud83d\udd16 Reference project + knowledge-service for relevant items.",
       "parameters": {

@@ -35,6 +35,7 @@ EXPECTED_TOOL_NAMES = [
     "call_mcp_tool",
     "capture_to_inbox",
     "cloud_identity",
+    "comment_on_task",
     "complete_task",
     "configure_triage",
     "create_schedule",

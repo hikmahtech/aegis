@@ -38,6 +38,7 @@ from aegis.services.tools.gtd import (
     _assignee_labels,  # noqa: F401 — re-export: imported from here by tests
     _capture_to_inbox_impl,  # noqa: F401 — re-export: routes/chat.py + routes/capture.py
     _exec_capture_to_inbox,
+    _exec_comment_on_task,
     _exec_complete_task,
     _exec_defer_task,
     _exec_find_reference,
@@ -900,6 +901,7 @@ CHAT_TOOLS = [
     _registry_schema("defer_task"),
     _registry_schema("mark_waiting"),
     _registry_schema("handoff_task"),
+    _registry_schema("comment_on_task"),
     _registry_schema("find_reference"),
     {
         "type": "function",
@@ -3088,6 +3090,7 @@ TOOL_EXECUTORS: dict[str, Any] = {
     "defer_task": _exec_defer_task,
     "mark_waiting": _exec_mark_waiting,
     "handoff_task": _exec_handoff_task,
+    "comment_on_task": _exec_comment_on_task,
     "find_reference": _exec_find_reference,
     "last_contact_with_person": _exec_last_contact_with_person,
     "query_observations": _exec_query_observations,
@@ -3129,6 +3132,7 @@ AGENT_TOOL_SETS: dict[str, set[str]] = {
         "defer_task",
         "mark_waiting",
         "handoff_task",
+        "comment_on_task",
         "find_reference",
         # People registry (life.people) — "when did I last talk to X?"
         "last_contact_with_person",
@@ -3212,6 +3216,7 @@ AGENT_TOOL_SETS: dict[str, set[str]] = {
         "complete_task",
         "defer_task",
         "handoff_task",
+        "comment_on_task",
     },
     "maou": {
         "get_quote",
