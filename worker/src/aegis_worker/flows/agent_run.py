@@ -16,7 +16,9 @@ Shape:
 
   1. launch  — NO_RETRY (see below), failure is delivered and ends the flow
   2. poll    — `workflow.sleep(30s)` → a read-only check activity, until the
-               run reports finished/failed or `timeout_minutes` elapses
+               run reports finished/failed or `timeout_minutes` elapses. The
+               loop itself is the module-level `poll_until_exit`, shared with
+               the coding lane, which decides nothing about the outcome.
   3. deliver — one chat message: header + the tail of the transcript
   4. cleanup — remove the run's per-run worktree, on EVERY terminal path
 
@@ -44,7 +46,7 @@ clock afterwards.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import timedelta
+from datetime import datetime, timedelta
 
 from temporalio import workflow
 
@@ -73,6 +75,101 @@ def _err_str(exc: BaseException) -> str:
 
 def _elapsed_str(seconds: int) -> str:
     return f"{seconds // 60}m{seconds % 60:02d}s"
+
+
+async def poll_until_exit(
+    *,
+    output_file: str,
+    host: str,
+    deadline_s: int,
+    launched_at: datetime,
+) -> dict:
+    """Poll a launched run until it exits or the deadline arrives.
+
+    Workflow code — call it from inside a `@workflow.run` method. It owns the
+    whole timing contract described in this module's docstring (#295): a bounded
+    sleep, a poll capped by `schedule_to_close_timeout` at what is left of the
+    budget, a deadline re-checked against a FRESH `workflow.now()` after every
+    poll, and no liveness probe on the first check.
+
+    It decides nothing else. `timeout` returns as soon as the deadline passes,
+    with no output — the caller chooses whether to kill the run, what to deliver
+    and what to clean up. Both lanes (AgentRunFlow and the coding lane) share
+    this loop and differ entirely in that handling.
+
+    Returns `{"status": "finished"|"failed"|"timeout", "output", "final",
+    "reason", "elapsed_s"}`. `output` is the activity's transcript as-is (it
+    caps at `_INVESTIGATION_OUTPUT_CAP` already); trimming it further for a
+    chat message is the caller's business. `final` is the run's own last
+    message, `""` when it never emitted one.
+    """
+    # The FIRST check skips the liveness probe: SSH and checkout latency mean
+    # the agent binary may not hold the output file yet, and a "dead" read
+    # there would end a healthy run at 30 seconds.
+    probe_alive = False
+    while True:
+        elapsed = int((workflow.now() - launched_at).total_seconds())
+        if elapsed >= deadline_s:
+            # This is the ONLY timeout site: every path that could burn time
+            # (the sleep, a slow or stuck poll) is bounded so control returns
+            # here rather than sailing past the deadline (#295).
+            return {
+                "status": "timeout",
+                "output": "",
+                "final": "",
+                "reason": "",
+                "elapsed_s": elapsed,
+            }
+
+        # Never sleep past the deadline: the wait is the poll interval or
+        # what is left of the budget, whichever is shorter.
+        await workflow.sleep(min(_POLL_INTERVAL, timedelta(seconds=deadline_s - elapsed)))
+        remaining_s = deadline_s - int((workflow.now() - launched_at).total_seconds())
+        if remaining_s <= 0:
+            # The deadline arrived while sleeping — report it at the top of
+            # the loop rather than spending the budget on one more poll.
+            continue
+        try:
+            check = await workflow.execute_activity_method(
+                AgentRunActivities.check_agent_run,
+                args=[output_file, host, probe_alive],
+                start_to_close_timeout=TIMEOUT_STANDARD,
+                # The load-bearing one. `start_to_close` bounds a single
+                # ATTEMPT once a worker has picked the task up; it says
+                # nothing about queue wait or about the retry sequence, so
+                # a poll that cannot complete could hold this loop — and
+                # therefore the deadline check — for hours. Capping the
+                # whole call at what is left of the budget means no poll
+                # can outlive the deadline it is supposed to be checked
+                # against.
+                schedule_to_close_timeout=timedelta(seconds=remaining_s),
+                retry_policy=STANDARD,
+            )
+        except Exception as exc:  # noqa: BLE001
+            # A poll that fails past its retries says nothing about the
+            # run itself (flaky SSH). Treat it as "still running" — the
+            # deadline at the top of the loop is what bounds this. The run id
+            # is not passed in; `output_file` carries it, which is what makes
+            # this line greppable per run.
+            workflow.logger.warning(
+                "agent_run_check_failed output_file=%s err=%s", output_file, _err_str(exc)
+            )
+            check = {"status": "running", "output": "", "reason": "", "final": ""}
+        probe_alive = True
+
+        status = str(check.get("status") or "running")
+        if status in ("finished", "failed"):
+            # Re-read the clock: `elapsed` above was sampled BEFORE the
+            # poll, and the poll is exactly where a stalled run spends its
+            # time. Reporting the stale sample is what produced
+            # `elapsed_s: 62` for a 2h17m run.
+            return {
+                "status": status,
+                "output": str(check.get("output") or ""),
+                "final": str(check.get("final") or ""),
+                "reason": str(check.get("reason") or ""),
+                "elapsed_s": int((workflow.now() - launched_at).total_seconds()),
+            }
 
 
 @dataclass
@@ -171,111 +268,71 @@ class AgentRunFlow:
         # run actually started. Sampled here, never re-based.
         launched_at = workflow.now()
 
-        # Step 2 — poll. The FIRST check skips the liveness probe: SSH and
-        # checkout latency mean the agent binary may not hold the output file
-        # yet, and a "dead" read there would end a healthy run at 30 seconds.
-        probe_alive = False
-        while True:
-            elapsed = int((workflow.now() - launched_at).total_seconds())
-            if elapsed >= deadline_s:
-                # Step 4 — deadline reached. Deliberately NOT killed. This is
-                # the ONLY timeout site: every path that could burn time (the
-                # sleep, a slow or stuck poll) is bounded so control returns
-                # here rather than sailing past the deadline (#295).
-                where = (
-                    f"tmux window `{tmux_window}` on {host}"
-                    if tmux_window
-                    else f"launched detached (no tmux window) on {host or '?'}"
-                )
-                await self._deliver(
-                    inp.agent_id,
-                    f"{purpose} — still running after {inp.timeout_minutes} min "
-                    f"(engine={engine} run={run_id}). It has NOT been stopped.\n"
-                    f"attach: {where}; output: {output_file}",
-                )
-                workflow.logger.warning("agent_run_timeout run_id=%s elapsed_s=%d", run_id, elapsed)
-                # `output_file` is passed here and NOWHERE else: the run was not
-                # stopped, so the activity has to probe before removing anything.
-                # A live run keeps its worktree (and leaks it — the lesser evil);
-                # one that died between the last poll and the deadline is swept.
-                await self._cleanup(worktree_path, output_file, host)
-                return _result(
-                    "timeout",
-                    f"still running after {inp.timeout_minutes} min",
-                    run_id,
-                    engine,
-                    host,
-                    elapsed,
-                )
+        # Step 2 — poll. The whole timing contract lives in the helper; this
+        # flow only decides what each outcome MEANS for the operator.
+        outcome = await poll_until_exit(
+            output_file=output_file,
+            host=host,
+            deadline_s=deadline_s,
+            launched_at=launched_at,
+        )
+        status = str(outcome["status"])
+        elapsed = int(outcome["elapsed_s"])
 
-            # Never sleep past the deadline: the wait is the poll interval or
-            # what is left of the budget, whichever is shorter.
-            await workflow.sleep(min(_POLL_INTERVAL, timedelta(seconds=deadline_s - elapsed)))
-            remaining_s = deadline_s - int((workflow.now() - launched_at).total_seconds())
-            if remaining_s <= 0:
-                # The deadline arrived while sleeping — report it at the top of
-                # the loop rather than spending the budget on one more poll.
-                continue
-            try:
-                check = await workflow.execute_activity_method(
-                    AgentRunActivities.check_agent_run,
-                    args=[output_file, host, probe_alive],
-                    start_to_close_timeout=TIMEOUT_STANDARD,
-                    # The load-bearing one. `start_to_close` bounds a single
-                    # ATTEMPT once a worker has picked the task up; it says
-                    # nothing about queue wait or about the retry sequence, so
-                    # a poll that cannot complete could hold this loop — and
-                    # therefore the deadline check — for hours. Capping the
-                    # whole call at what is left of the budget means no poll
-                    # can outlive the deadline it is supposed to be checked
-                    # against.
-                    schedule_to_close_timeout=timedelta(seconds=remaining_s),
-                    retry_policy=STANDARD,
-                )
-            except Exception as exc:  # noqa: BLE001
-                # A poll that fails past its retries says nothing about the
-                # run itself (flaky SSH). Treat it as "still running" — the
-                # deadline at the top of the loop is what bounds this.
-                workflow.logger.warning(
-                    "agent_run_check_failed run_id=%s err=%s", run_id, _err_str(exc)
-                )
-                check = {"status": "running", "output": "", "reason": ""}
-            probe_alive = True
+        if status == "timeout":
+            # Step 4 — deadline reached. Deliberately NOT killed.
+            where = (
+                f"tmux window `{tmux_window}` on {host}"
+                if tmux_window
+                else f"launched detached (no tmux window) on {host or '?'}"
+            )
+            await self._deliver(
+                inp.agent_id,
+                f"{purpose} — still running after {inp.timeout_minutes} min "
+                f"(engine={engine} run={run_id}). It has NOT been stopped.\n"
+                f"attach: {where}; output: {output_file}",
+            )
+            workflow.logger.warning("agent_run_timeout run_id=%s elapsed_s=%d", run_id, elapsed)
+            # `output_file` is passed here and NOWHERE else: the run was not
+            # stopped, so the activity has to probe before removing anything.
+            # A live run keeps its worktree (and leaks it — the lesser evil);
+            # one that died between the last poll and the deadline is swept.
+            await self._cleanup(worktree_path, output_file, host)
+            return _result(
+                "timeout",
+                f"still running after {inp.timeout_minutes} min",
+                run_id,
+                engine,
+                host,
+                elapsed,
+            )
 
-            status = str(check.get("status") or "running")
-            if status in ("finished", "failed"):
-                # Re-read the clock: `elapsed` above was sampled BEFORE the
-                # poll, and the poll is exactly where a stalled run spends its
-                # time. Reporting the stale sample is what produced
-                # `elapsed_s: 62` for a 2h17m run.
-                elapsed = int((workflow.now() - launched_at).total_seconds())
-                output = str(check.get("output") or "")[-_OUTPUT_TAIL:]
-                header = (
-                    f"{purpose} — {'done' if status == 'finished' else 'failed'} "
-                    f"in {_elapsed_str(elapsed)}\n"
-                    f"engine={engine} host={host or '?'} run={run_id} repo={repo}"
-                )
-                body = output or str(check.get("reason") or "no output")
-                await self._deliver(inp.agent_id, f"{header}\n\n{body}")
-                workflow.logger.info(
-                    "agent_run_flow_done run_id=%s status=%s elapsed_s=%d",
-                    run_id,
-                    status,
-                    elapsed,
-                )
-                # Both terminal statuses mean the poll already OBSERVED the
-                # process gone, so no `output_file` — re-probing would only add a
-                # round trip and a fail-open window in which a dead run's
-                # worktree survives.
-                await self._cleanup(worktree_path, "", host)
-                return _result(
-                    "ok" if status == "finished" else "failed",
-                    str(check.get("reason") or "") or None,
-                    run_id,
-                    engine,
-                    host,
-                    elapsed,
-                )
+        output = str(outcome["output"])[-_OUTPUT_TAIL:]
+        header = (
+            f"{purpose} — {'done' if status == 'finished' else 'failed'} "
+            f"in {_elapsed_str(elapsed)}\n"
+            f"engine={engine} host={host or '?'} run={run_id} repo={repo}"
+        )
+        body = output or str(outcome["reason"]) or "no output"
+        await self._deliver(inp.agent_id, f"{header}\n\n{body}")
+        workflow.logger.info(
+            "agent_run_flow_done run_id=%s status=%s elapsed_s=%d",
+            run_id,
+            status,
+            elapsed,
+        )
+        # Both terminal statuses mean the poll already OBSERVED the process
+        # gone, so no `output_file` — re-probing would only add a round trip
+        # and a fail-open window in which a dead run's worktree survives.
+        await self._cleanup(worktree_path, "", host)
+        return _result(
+            "ok" if status == "finished" else "failed",
+            str(outcome["reason"]) or None,
+            run_id,
+            engine,
+            host,
+            elapsed,
+        )
 
     async def _deliver(self, agent_id: str, text: str) -> None:
         """Send to the agent's bound channel. A delivery failure must not fail
