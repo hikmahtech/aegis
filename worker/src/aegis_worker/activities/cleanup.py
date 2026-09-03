@@ -191,7 +191,13 @@ class CleanupActivities:
 
         removed = 0
         skipped = 0
-        for row in rows:
+        for index, row in enumerate(rows, start=1):
+            # Top of the loop, so a run that skips every row still heartbeats.
+            # A worktree removal is an SSH round trip, and a long tail of them
+            # all failing is exactly the run that would otherwise time out
+            # without ever having reported progress.
+            if activity.in_activity():
+                activity.heartbeat(f"task_sessions:{index}/{len(rows)}")
             task_id = row["task_id"]
             worktree_path = row["worktree_path"] or ""
             host = row["host"] or ""
@@ -223,7 +229,6 @@ class CleanupActivities:
                 "DELETE FROM task_sessions WHERE task_id = $1", task_id
             )
             removed += 1
-            activity.heartbeat(f"task_sessions:{removed}/{len(rows)}")
 
         if removed or skipped:
             logger.info(

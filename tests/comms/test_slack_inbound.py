@@ -995,6 +995,29 @@ async def test_thread_reply_comment_rejected_posts_apology_in_thread():
     core.chat.assert_not_awaited()
 
 
+async def test_a_failing_apology_does_not_escape_the_message_handler():
+    """Two failures in a row — Core rejected the note, then Slack refused the
+    apology — must not take the message handler down with them.
+
+    The handler has already claimed this reply by returning True, so an escaping
+    exception buys nothing and costs the bolt listener.
+
+    Falsifiable: drop the try/except around `post_thread` and this raises.
+    """
+    inbound, core, adapter = _inbound()
+    core.task_by_thread.return_value = "T-1"
+    core.task_comment.return_value = False
+    adapter.post_thread.side_effect = RuntimeError("slack is down")
+
+    await inbound.on_message(
+        channel_id="CSEBAS", text="retry that", user_id="UME", ts="200.2", thread_ts="100.1"
+    )
+
+    adapter.post_thread.assert_awaited_once()
+    # The reply is still the task's, not chat's.
+    core.chat.assert_not_awaited()
+
+
 async def test_thread_reply_success_posts_no_apology():
     inbound, core, adapter = _inbound()
     core.task_by_thread.return_value = "T-1"

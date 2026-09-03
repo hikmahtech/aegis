@@ -116,6 +116,7 @@ class DeliveryActivities:
         message: str,
         chat_id: int = 0,
         thread_ref: dict | None = None,
+        thread_overflow: bool = False,
     ) -> dict:
         """Send a message to an agent's channel.
 
@@ -123,6 +124,11 @@ class DeliveryActivities:
         comms posts under it when given and to the channel when not. Omitted
         from the body entirely when there is no thread, so the request stays
         the shape it has always been on every non-threaded call site.
+
+        `thread_overflow` says this message is OPENING a thread: it has no root
+        yet, so if it chunks, comms threads chunks 2..N under chunk 1 instead of
+        leaving them in the channel where a reply under one of them would never
+        be recognised as the task's. Also omitted when false.
 
         The comms response is returned UNCHANGED because it carries
         `delivery_ref`, the ref of the message just sent: that is what a caller
@@ -136,6 +142,8 @@ class DeliveryActivities:
         body: dict = {"text": message, "agent_id": agent_id}
         if thread_ref:
             body["thread_ref"] = thread_ref
+        if thread_overflow:
+            body["thread_overflow"] = True
 
         client = self._ensure_client()
         resp = await client.post("/api/deliver/message", json=body)

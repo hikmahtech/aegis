@@ -344,21 +344,80 @@ async def test_send_voice_no_api_key_is_ok_false(monkeypatch):
     a._client.files_upload_v2.assert_not_awaited()
 
 
+def _distinct_ts(a, channel="C1", count=6):
+    """Give each chunk its own ts, so 'threaded under chunk 1' is provable."""
+    a._client.chat_postMessage.side_effect = [
+        {"ok": True, "ts": f"{i}.0", "channel": channel} for i in range(1, count + 1)
+    ]
+
+
+# Three chunks, not two: with two, "chunk 2 threads under chunk 1" and "every
+# chunk after the first threads" are the same assertion.
+_THREE_CHUNKS = "line\n" * 1400  # 7000 chars → 3 chunks at the 2800 limit
+
+
 async def test_send_message_threads_every_chunk_when_target_has_thread_ts(monkeypatch):
     """A task's turn is one thread — a chunked reply must not spill into the
     channel after the first chunk."""
     a = _adapter(monkeypatch)
-    body = "line\n" * 1000  # > 2800 chars → 2 chunks
+    _distinct_ts(a)
     await a.send_message(
-        agent_id="sebas", text=body, target={"channel": "CTASK", "thread_ts": "100.1"}
+        agent_id="sebas", text=_THREE_CHUNKS, target={"channel": "CTASK", "thread_ts": "100.1"}
     )
-    assert a._client.chat_postMessage.await_count == 2
+    assert a._client.chat_postMessage.await_count == 3
     for call in a._client.chat_postMessage.await_args_list:
         assert call.kwargs["channel"] == "CTASK"
         assert call.kwargs["thread_ts"] == "100.1"
+
+
+async def test_send_message_threads_overflow_chunks_under_the_first(monkeypatch):
+    """A message that OPENS a thread has no root, so chunk 1 becomes it.
+
+    Without this, chunks 2..N are separate top-level channel posts and a reply
+    typed under one of them carries a `ts` no task session owns — `find_by_thread`
+    misses it and the reply is routed to chat instead of to the task.
+    """
+    a = _adapter(monkeypatch)
+    _distinct_ts(a)
+
+    r = await a.send_message(
+        agent_id="sebas", text=_THREE_CHUNKS, target={"thread_overflow": True}
+    )
+
+    calls = a._client.chat_postMessage.await_args_list
+    assert len(calls) == 3
+    assert "thread_ts" not in calls[0].kwargs, "chunk 1 IS the root"
+    assert calls[1].kwargs["thread_ts"] == "1.0"
+    assert calls[2].kwargs["thread_ts"] == "1.0"
+    # The ref handed back is still chunk 1's — the root the caller stores.
+    assert r.ref.data == {"channel": "C1", "ts": "1.0"}
+
+
+async def test_thread_overflow_falls_back_to_the_agent_channel(monkeypatch):
+    """`thread_overflow` alone carries no channel; resolution is unchanged."""
+    a = _adapter(monkeypatch)
+    await a.send_message(agent_id="sebas", text="hi", target={"thread_overflow": True})
+    assert a._client.chat_postMessage.await_args.kwargs["channel"] == "C1"
 
 
 async def test_send_message_without_thread_ts_passes_no_thread(monkeypatch):
     a = _adapter(monkeypatch)
     await a.send_message(agent_id="sebas", text="hi", target={"channel": "COVERRIDE"})
     assert "thread_ts" not in a._client.chat_postMessage.await_args.kwargs
+
+
+async def test_chunks_stay_top_level_without_thread_ts_or_overflow(monkeypatch):
+    """An ordinary long agent reply is unchanged: N sibling channel posts.
+
+    Pinned because the overflow fix is one `elif` away from threading every
+    chunked message in the workspace.
+    """
+    a = _adapter(monkeypatch)
+    _distinct_ts(a)
+
+    await a.send_message(agent_id="sebas", text=_THREE_CHUNKS)
+
+    calls = a._client.chat_postMessage.await_args_list
+    assert len(calls) == 3
+    for call in calls:
+        assert "thread_ts" not in call.kwargs

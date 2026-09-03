@@ -216,20 +216,29 @@ def _activities(
 
     @activity.defn(name="send_message")
     async def send_message(
-        agent_id: str, message: str, chat_id: int = 0, thread_ref: dict | None = None
+        agent_id: str,
+        message: str,
+        chat_id: int = 0,
+        thread_ref: dict | None = None,
+        thread_overflow: bool = False,
     ) -> dict:
         events.append(("slack", message))
         # Recorded as its own event so `_bodies(events, "thread")[i]` pairs
         # with `_bodies(events, "slack")[i]` without changing the payload
         # shape every existing assertion here reads.
         events.append(("thread", thread_ref))
+        events.append(("overflow", thread_overflow))
         if slack_raises:
             raise RuntimeError("comms is down")
-        # The real response shape: `SendResult.to_response()` spreads the ref's
-        # data over `delivery_ref` AND mirrors it at the top level.
+        # PRODUCTION shape, copied from `SendResult.to_response()`:
+        # `DeliveryRef.to_dict()` spreads the ref's data FLAT beside `adapter`
+        # (there is no `data` sub-object), and `to_response` then mirrors those
+        # same keys at the top level for legacy dispatch logging. A fake that
+        # nests them proves `_thread_root` handles a shape comms never sends.
         return {
             "ok": True,
-            "delivery_ref": {"adapter": "slack", "data": {"channel": "C1", "ts": "1.1"}},
+            "used_html": False,
+            "delivery_ref": {"adapter": "slack", "channel": "C1", "ts": "1.1"},
             "channel": "C1",
             "ts": "1.1",
         }
@@ -548,6 +557,23 @@ async def test_the_first_task_message_opens_a_thread_and_remembers_its_root():
     assert note.startswith("Task tc-1: Fix phantom EPS downgrade")
     assert "STATUS: plan" in note, "the thread carries the turn's own output, not a stub"
     assert _bodies(events, "slack_ref") == [{"channel": "C1", "ts": "1.1"}]
+
+
+@pytest.mark.asyncio
+async def test_every_task_message_asks_comms_to_keep_its_chunks_threaded():
+    """A turn's output is capped at 6000 characters and Slack chunks at 2800,
+    so the message that opens a thread routinely spans three posts. Without the
+    flag, chunks 2..N land in the channel as siblings of the root, and a reply
+    typed under one of them carries a `ts` no task session owns — it is routed
+    to chat instead of back into the task.
+
+    Falsifiable: drop `thread_overflow=True` from `_mirror_to_thread` and this
+    fails while every other test in this file still passes.
+    """
+    events: list = []
+    await _run(events)
+
+    assert _bodies(events, "overflow") == [True]
 
 
 @pytest.mark.asyncio

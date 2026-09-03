@@ -664,8 +664,8 @@ _COMMENT_MAX_CHARS = 15_000
 async def _exec_comment_on_task(
     pool: asyncpg.Pool, ctx: ToolContext, *, task_id: str, text: str
 ) -> str:
-    """Post a comment in your own voice on a Todoist task. On a task with a
-    coding session this starts the session's next turn.
+    """Post a comment in your own voice on a Todoist task that has a coding
+    session, starting that session's next turn. Refused on any other task.
 
     Args:
         task_id: the Todoist task id.
@@ -673,6 +673,7 @@ async def _exec_comment_on_task(
     """
     from aegis.config import Settings
     from aegis.connectors.todoist import TodoistConnector
+    from aegis.services.task_sessions import get_session
 
     task_id = (task_id or "").strip()
     body = text or ""
@@ -680,6 +681,17 @@ async def _exec_comment_on_task(
         return "Refused: task_id and text required"
     if len(body) > _COMMENT_MAX_CHARS:
         return f"Refused: text is {len(body)} chars, over Todoist's {_COMMENT_MAX_CHARS} limit"
+    # Footer-less by design, so on a task with a coding session the note reads
+    # as the user's and starts the next turn. On a task WITHOUT one there is no
+    # turn to start and the same note is just an undecorated comment sitting in
+    # the thread — which ClarifyFlow then reads back as fresh user input and
+    # grades itself on (#353). So the guard is the tool's scope, not a nicety:
+    # this tool drives task sessions and nothing else.
+    if await get_session(pool, task_id) is None:
+        return (
+            f"Refused: task {task_id} has no coding session — "
+            "comment_on_task only drives task sessions"
+        )
     settings = Settings()
     _tk = await resolve_todoist_api_key(pool, settings)
     if not _tk:

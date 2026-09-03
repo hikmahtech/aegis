@@ -403,7 +403,11 @@ def _exit_case_activities(events: list, case: _ExitCase):
 
     @activity.defn(name="send_message")
     async def send_message(
-        agent_id: str, message: str, chat_id: int = 0, thread_ref: dict | None = None
+        agent_id: str,
+        message: str,
+        chat_id: int = 0,
+        thread_ref: dict | None = None,
+        thread_overflow: bool = False,
     ) -> dict:
         events.append(("slack", message))
         return {"ok": True}

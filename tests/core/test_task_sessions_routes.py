@@ -172,12 +172,41 @@ async def test_comment_503_when_todoist_is_not_configured(client, monkeypatch):
     assert r.status_code == 503, r.text
 
 
-async def test_comment_caps_the_text_at_15000_chars(client, sent):
-    """Todoist rejects an over-long note, which would lose the whole reply; the
-    cap keeps the first 15,000 characters instead."""
+async def test_comment_400s_over_15000_chars_instead_of_truncating(client, sent):
+    """Todoist rejects an over-long note outright, so the route refuses first.
+
+    Refusing, not clipping: the reply lands on the task under the user's name,
+    and a silently truncated one is a sentence they did not write. The caller
+    gets a 400 it can report in the thread. Same rule as the `comment_on_task`
+    chat tool, which refuses at the same length.
+
+    Falsifiable: restore `text[:MAX_NOTE_CHARS]` and this returns 200.
+    """
     r = await client.post(f"/api/admin/tasks/{_TASK}/comment", json={"text": "x" * 20000})
+    assert r.status_code == 400, r.text
+    assert "20000" in r.json()["detail"]
+    assert sent == [], "nothing reaches Todoist"
+
+
+async def test_comment_posts_at_exactly_the_cap(client, sent):
+    """The boundary is inclusive — 15,000 is what Todoist accepts."""
+    r = await client.post(f"/api/admin/tasks/{_TASK}/comment", json={"text": "x" * 15000})
     assert r.status_code == 200, r.text
     assert len(sent[0][0]["args"]["content"]) == 15000
+
+
+async def test_comment_preserves_leading_and_trailing_whitespace(client, sent):
+    """The note is the caller's exact string, not a stripped copy.
+
+    A Slack reply is routinely a fenced code block or an indented diff; the
+    layout is content. The stripped copy exists only to reject a blank reply.
+
+    Falsifiable: post `text.strip()` and this fails on the equality.
+    """
+    text = "\n```diff\n-  old = 1\n+  new = 2\n```\n\n"
+    r = await client.post(f"/api/admin/tasks/{_TASK}/comment", json={"text": text})
+    assert r.status_code == 200, r.text
+    assert sent[0][0]["args"]["content"] == text
 
 
 async def test_comment_reports_not_ok_when_todoist_rejects_the_note(client, monkeypatch):

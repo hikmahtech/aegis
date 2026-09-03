@@ -35,8 +35,11 @@ from aegis.services.todoist_config import resolve_todoist_api_key
 
 logger = structlog.get_logger()
 
-# Todoist rejects an over-long note outright, and a rejection loses the whole
-# reply. Keeping the first 15,000 characters loses the tail instead.
+# Todoist rejects an over-long note outright. We refuse first, with the length
+# in the message so the caller can split, rather than post a truncated one: this
+# route's whole contract is that what it posts is what the user typed, and a
+# silently clipped reply is worse than a rejected one. Same number and same
+# reasoning as the `comment_on_task` chat tool's `_COMMENT_MAX_CHARS`.
 MAX_NOTE_CHARS = 15_000
 
 router = APIRouter(
@@ -66,14 +69,26 @@ async def comment_on_task(
 ) -> dict[str, Any]:
     """Post `text` on the task as a plain Todoist note, exactly as given.
 
+    Exactly as given means byte for byte: the note is the caller's string, not a
+    stripped copy. A Slack reply that is a fenced code block or an indented diff
+    is content, and a route that tidied it would rewrite what the user typed.
+    The stripped copy exists only to reject a whitespace-only reply.
+
     The note counts as user-authored, so the existing `note:added` webhook picks
     it up and runs the task's next turn. 404 when the task owns no session: this
     route exists to feed a session, and a silent 200 would swallow the reply.
+    400 over `MAX_NOTE_CHARS`, so the caller learns the reply was too long
+    instead of a clipped version landing on the task under their name.
     """
     pool = request.app.state.db_pool
-    text = (body.text or "").strip()
-    if not text:
+    text = body.text or ""
+    if not text.strip():
         raise HTTPException(status_code=400, detail="text is required")
+    if len(text) > MAX_NOTE_CHARS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"text is {len(text)} chars, over Todoist's {MAX_NOTE_CHARS} limit",
+        )
     if await get_session(pool, task_id) is None:
         raise HTTPException(status_code=404, detail=f"no task session for {task_id}")
 
@@ -82,7 +97,7 @@ async def comment_on_task(
         raise HTTPException(status_code=503, detail="Todoist not configured")
 
     connector = TodoistConnector(api_key=key, db_pool=pool, timeout=10.0)
-    cmd = TodoistConnector.build_note_add_command(task_id, text[:MAX_NOTE_CHARS])
+    cmd = TodoistConnector.build_note_add_command(task_id, text)
     try:
         result = await connector.commands([cmd])
     finally:

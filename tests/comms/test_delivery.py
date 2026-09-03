@@ -120,3 +120,45 @@ async def test_deliver_message_without_thread_ref_has_no_target(monkeypatch):
 
     assert resp.status_code == 200, resp.text
     assert adapter.send_message.await_args.kwargs["target"] is None
+
+
+async def test_deliver_message_forwards_thread_overflow_with_no_root(monkeypatch):
+    """A message that OPENS a thread has no `thread_ref` yet, so the flag is the
+    only thing telling the adapter to keep the chunks together."""
+    from httpx import ASGITransport, AsyncClient
+
+    app, adapter = _thread_app(monkeypatch)
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.post(
+            "/api/deliver/message",
+            json={"text": "turn 1 finished", "agent_id": "sebas", "thread_overflow": True},
+        )
+
+    assert resp.status_code == 200, resp.text
+    # No channel key: the adapter resolves the agent's own channel, as ever.
+    assert adapter.send_message.await_args.kwargs["target"] == {"thread_overflow": True}
+
+
+async def test_deliver_message_keeps_the_root_when_both_are_given(monkeypatch):
+    from httpx import ASGITransport, AsyncClient
+
+    app, adapter = _thread_app(monkeypatch)
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.post(
+            "/api/deliver/message",
+            json={
+                "text": "turn 2 finished",
+                "agent_id": "sebas",
+                "thread_ref": {"channel": "CTASK", "ts": "100.1"},
+                "thread_overflow": True,
+            },
+        )
+
+    assert resp.status_code == 200, resp.text
+    assert adapter.send_message.await_args.kwargs["target"] == {
+        "channel": "CTASK",
+        "thread_ts": "100.1",
+        "thread_overflow": True,
+    }

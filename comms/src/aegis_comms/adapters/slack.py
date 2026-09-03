@@ -217,14 +217,31 @@ class SlackAdapter:
         channel, username, icon, _voice_id = await self._resolve(agent_id)
         channel = self._target_channel(channel, target)
         body = html_to_mrkdwn(text)
-        # `target["thread_ts"]` is a thread ROOT (a task's thread). Every chunk
-        # carries it, or a long reply would start in the thread and finish in
-        # the channel. Omitted entirely when absent so an ordinary send is
-        # unchanged.
-        thread = {"thread_ts": target["thread_ts"]} if target and target.get("thread_ts") else {}
+        # Two different ways a message stays in one thread.
+        #
+        # `target["thread_ts"]` is an EXISTING thread root (a task's thread):
+        # every chunk carries it, or a long reply would start in the thread and
+        # finish in the channel.
+        #
+        # `target["thread_overflow"]` is set on a message that OPENS a thread —
+        # it has no root yet because it is about to become one. Chunk 1 posts
+        # top-level and chunks 2..N thread under chunk 1, so a long opener is
+        # one rooted thread rather than N sibling posts. That matters beyond
+        # tidiness: a reply typed under a stray chunk carries that chunk's `ts`,
+        # which `find_by_thread` does not know, so the reply would be routed to
+        # chat instead of to the task.
+        #
+        # Neither flag set is an ordinary agent reply: unthreaded, as before.
+        thread_ts = target.get("thread_ts") if target else None
+        overflow = bool(target.get("thread_overflow")) if target else False
         first_ref: DeliveryRef | None = None
         try:
             for chunk in _split_message(body):
+                thread: dict = {}
+                if thread_ts:
+                    thread = {"thread_ts": thread_ts}
+                elif overflow and first_ref is not None:
+                    thread = {"thread_ts": first_ref.data["ts"]}
                 resp = await self._client.chat_postMessage(
                     channel=channel,
                     text=chunk,

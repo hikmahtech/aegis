@@ -702,6 +702,11 @@ class SlackInbound:
         task's, and re-routing it to an agent would answer it twice over. A
         rejection is reported in the thread rather than dropped: the user typed
         it there and nowhere else.
+
+        The apology itself is best-effort. It is already the failure path, and
+        letting a second Slack failure escape would take down the message
+        handler for a reply this method has, by returning True, taken
+        responsibility for.
         """
         task_id = await self._core.task_by_thread(channel_id, thread_ts)
         if not task_id:
@@ -710,10 +715,19 @@ class SlackInbound:
             logger.warning(
                 "slack_task_thread_comment_failed", channel=channel_id, task_id=task_id
             )
-            await self._adapter.post_thread(
-                ref=DeliveryRef("slack", {"channel": channel_id, "ts": thread_ts}),
-                text="Couldn't post that to the task; try again.",
-            )
+            try:
+                await self._adapter.post_thread(
+                    ref=DeliveryRef("slack", {"channel": channel_id, "ts": thread_ts}),
+                    text="Couldn't post that to the task; try again.",
+                )
+            except Exception as exc:  # noqa: BLE001 — the apology is never fatal
+                logger.warning(
+                    "slack_task_thread_apology_failed",
+                    channel=channel_id,
+                    ts=thread_ts,
+                    task_id=task_id,
+                    error=str(exc)[:200],
+                )
         return True
 
     # --- curated self-signal ingest (B2) ------------------------------------

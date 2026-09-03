@@ -117,6 +117,14 @@ async def _sweep(pool, connector, days: int = 7) -> dict:
     return await ActivityEnvironment().run(acts.cleanup_task_sessions, days)
 
 
+async def _sweep_recording_heartbeats(pool, connector, days: int = 7) -> tuple[dict, list]:
+    acts = CleanupActivities(db_pool=pool, remote_script=connector)
+    env = ActivityEnvironment()
+    beats: list = []
+    env.on_heartbeat = lambda *details: beats.append(details)
+    return await env.run(acts.cleanup_task_sessions, days), beats
+
+
 # ── the sweep itself ────────────────────────────────────────────────────────
 
 
@@ -264,6 +272,29 @@ async def test_row_without_a_worktree_is_deleted_with_no_connector(pool):
 
 
 # ── guards ──────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_every_row_heartbeats_including_the_skipped_ones(pool):
+    """Progress is reported per ROW, not per removal.
+
+    Each row is an SSH round trip. A sweep whose removals are all failing is
+    exactly the slow one, and heartbeating only on success meant it reported no
+    progress at all right up until Temporal timed it out.
+
+    Falsifiable: move the heartbeat back under the successful-delete branch and
+    the count drops to 0 while the removed/skipped assertion still passes.
+    """
+    await _task(pool, _DONE, completed=True)
+    await _session(pool, _DONE, age="30 days")
+    await _task(pool, _ORPHAN, completed=True)
+    await _session(pool, _ORPHAN, age="30 days")
+    rs = _RaisingRemoteScript()
+
+    result, beats = await _sweep_recording_heartbeats(pool, rs)
+
+    assert result == {"removed": 0, "skipped": 2}
+    assert len(beats) == 2, f"one heartbeat per row, got {beats}"
 
 
 @pytest.mark.asyncio

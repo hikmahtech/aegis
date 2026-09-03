@@ -846,18 +846,27 @@ class AgentTaskFlow:
             )
 
     async def _deliver(
-        self, agent_id: str, text: str, thread_ref: dict | None = None
+        self,
+        agent_id: str,
+        text: str,
+        thread_ref: dict | None = None,
+        thread_overflow: bool = False,
     ) -> dict | None:
         """Send to the agent's bound channel; never fail the flow over it.
 
         Returns the comms response — which carries the sent message's ref — or
         None when the send failed, so a caller opening a thread can tell "no
         root came back" from "there is a root".
+
+        `thread_overflow` marks a task message: a turn's output is far longer
+        than Slack's chunk limit, so without it a message that OPENS a thread
+        finishes as loose posts in the channel, and a reply under one of those
+        is not recognised as the task's.
         """
         try:
             return await workflow.execute_activity_method(
                 DeliveryActivities.send_message,
-                args=[agent_id, text, 0, thread_ref],
+                args=[agent_id, text, 0, thread_ref, thread_overflow],
                 start_to_close_timeout=TIMEOUT_FAST,
                 retry_policy=STANDARD,
             )
@@ -889,7 +898,7 @@ class AgentTaskFlow:
         header = f"Task {task_id}: {title}".strip()
         body = text if ref else f"{header}\n\n{text}"
 
-        resp = await self._deliver(agent_id, body, ref)
+        resp = await self._deliver(agent_id, body, ref, thread_overflow=True)
         if ref is not None:
             return
         root = _thread_root(resp)
@@ -1049,11 +1058,13 @@ class AgentTaskFlow:
                 # otherwise. Never opens a thread: this is a note ABOUT the
                 # task, and a root nobody replies under is a dead thread.
                 existing = session.get("slack_ref")
+                root = existing if isinstance(existing, dict) else None
                 await self._deliver(
                     agent_id,
                     f"You're in the session for task {task_id} ('{name}'); "
                     "your comment is waiting for you there.",
-                    existing if isinstance(existing, dict) else None,
+                    root,
+                    thread_overflow=root is not None,
                 )
                 return {"task_id": task_id, "verb": "coding", "status": "operator_in_session"}
 

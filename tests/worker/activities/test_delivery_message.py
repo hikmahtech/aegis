@@ -70,3 +70,40 @@ async def test_send_message_omits_thread_ref_when_there_is_no_thread(delivery):
         "text": "hello",
         "agent_id": "pandoras-actor",
     }
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_send_message_forwards_thread_overflow(delivery):
+    """The flag that keeps a thread-opening message's chunks together.
+
+    It travels WITHOUT a `thread_ref` — that is the whole point: the message
+    has no root yet because it is about to become one.
+    """
+    route = respx.post("http://comms:9000/api/deliver/message").mock(
+        return_value=Response(200, json={"ok": True})
+    )
+    env = ActivityEnvironment()
+    await env.run(delivery.send_message, "pandoras-actor", "turn 1 done", 0, None, True)
+
+    assert json.loads(route.calls.last.request.content.decode()) == {
+        "text": "turn 1 done",
+        "agent_id": "pandoras-actor",
+        "thread_overflow": True,
+    }
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_send_message_omits_thread_overflow_when_false(delivery):
+    """Absent rather than `false`, so every non-task call site sends the body it
+    has always sent."""
+    route = respx.post("http://comms:9000/api/deliver/message").mock(
+        return_value=Response(200, json={"ok": True})
+    )
+    env = ActivityEnvironment()
+    await env.run(
+        delivery.send_message, "pandoras-actor", "hi", 0, {"channel": "C1", "ts": "1.1"}, False
+    )
+
+    assert "thread_overflow" not in json.loads(route.calls.last.request.content.decode())

@@ -518,11 +518,18 @@ them code:
   worktree removed and its row deleted by `CleanupFlow`. The branch stays; it
   may back an open PR. Set to 0 to disable.
 
-The agents also need the `comment_on_task` tool — that is how a turn replies on
-the task. Grant it to every active agent that already has a tool set:
+Optionally grant the `comment_on_task` tool. A turn does **not** need it — a
+turn's own reply is posted by the flow's `comment` activity, and the tool is
+deliberately withheld from run mounts so a run cannot comment its way into
+triggering its own next turn. It is for **you and the chat agents**: it posts a
+note in your voice on a task that already has a coding session, which is what
+starts that session's next turn. It refuses any task without one.
+
+Grant it to every active agent whose tool set is an array — an agent with no
+`tool_set`, or one holding anything else, is left alone:
 
 ```sql
-UPDATE agents SET metadata = jsonb_set(metadata,'{tool_set}',(metadata->'tool_set')||'["comment_on_task"]'::jsonb) WHERE active AND metadata ? 'tool_set' AND NOT (metadata->'tool_set' @> '["comment_on_task"]'::jsonb);
+UPDATE agents SET metadata = jsonb_set(metadata,'{tool_set}',(metadata->'tool_set')||'["comment_on_task"]'::jsonb) WHERE active AND jsonb_typeof(metadata->'tool_set') = 'array' AND NOT (metadata->'tool_set' @> '["comment_on_task"]'::jsonb);
 ```
 
 ### Verify the coding host

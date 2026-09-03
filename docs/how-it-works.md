@@ -323,7 +323,9 @@ owning agent's channel (`task_sessions.slack_ref` holds the root), and a reply
 typed in that thread is posted to the task as a comment, so Slack and Todoist
 are the same conversation. From your own Claude Code session or a chat agent,
 `comment_on_task` posts in your voice (verbatim, no footer) — it is withheld
-from a run's own MCP mount so a session cannot trigger its own next turn.
+from a run's own MCP mount so a session cannot trigger its own next turn, and
+it refuses a task that has no coding session, where a footer-less note would
+start nothing and simply read back as your own words.
 `CleanupFlow` removes the worktree and the row `task_session_days` (default 7)
 after the task is completed.
 

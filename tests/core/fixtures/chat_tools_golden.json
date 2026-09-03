@@ -947,7 +947,7 @@
     "type": "function",
     "function": {
       "name": "comment_on_task",
-      "description": "Post a comment in your own voice on a Todoist task. On a task with a coding session this starts the session's next turn.",
+      "description": "Post a comment in your own voice on a Todoist task that has a coding session, starting that session's next turn. Refused on any other task.",
       "parameters": {
         "type": "object",
         "properties": {
