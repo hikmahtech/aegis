@@ -3,8 +3,9 @@
 Claude Code publishes a session registry per ``CLAUDE_CONFIG_DIR`` and exposes
 it through ``claude agents --json`` — documented for scripting and needing no
 TTY. This module turns that output into records AEGIS can reason about, and
-answers the one question the launch path asks: is a human already busy in this
-repo?
+answers the questions the launch path asks: is a human already busy in this
+repo, is this task's own session still alive, and is one of the operator's
+sessions already working on this very task?
 
 Everything here except :func:`busy_human_sessions` is pure, so the parsing rules
 are unit-testable without SSH.
@@ -152,3 +153,91 @@ async def busy_human_sessions(remote_script: object, repo: str) -> list[dict]:
         )
         return []
     return busy
+
+
+def find_session(sessions: list[dict], session_id: str) -> dict | None:
+    """The record with this `session_id`, whatever its owner or status.
+
+    Used to ask "is the task's OWN session live?" — an idle session, or one a
+    person has resumed, is still the same conversation, so no status or owner
+    filter belongs here.
+    """
+    target = (session_id or "").strip()
+    if not target:
+        return None
+    return next((s for s in sessions if s.get("session_id") == target), None)
+
+
+def human_sessions_in_repo(sessions: list[dict], repo: str) -> list[dict]:
+    """Human-owned sessions in `repo`, busy or not — `match_busy`'s any-status sibling.
+
+    Idle counts here because the question is different: not "is a person mid-
+    thought?" but "does a person already have this task open?". A session parked
+    idle on this task is exactly the collision we are looking for.
+    """
+    target = (repo or "").strip().strip("/")
+    if not target:
+        return []
+    return [s for s in sessions if s.get("owner") == "human" and s.get("repo") == target]
+
+
+def build_same_task_prompt(title: str, description: str, sessions: list[dict]) -> str:
+    """Ask a model whether any of `sessions` is already working on THIS task.
+
+    Git context (branch, last commit, dirty files) is what separates "same repo"
+    from "same task", so every field is rendered even when absent — a blank
+    would read as "no changes" rather than "not known".
+    """
+    blocks = []
+    for index, session in enumerate(sessions, start=1):
+        blocks.append(
+            f"{index}. name: {_render(session, 'name')}\n"
+            f"   cwd: {_render(session, 'cwd')}\n"
+            f"   branch: {_render(session, 'branch')}\n"
+            f"   last commit: {_render(session, 'log')}\n"
+            f"   uncommitted files: {_render(session, 'status_short')}"
+        )
+    listing = "\n".join(blocks) or "(none)"
+    return (
+        "A task is about to be handed to an automated coding agent. Decide whether "
+        "a person is already working on that SAME task in one of the sessions below.\n\n"
+        f"TASK TITLE: {title}\n"
+        f"TASK DESCRIPTION: {description or '(none)'}\n\n"
+        f"OPEN SESSIONS:\n{listing}\n\n"
+        "Being in the same repo is NOT enough — every session listed is already in "
+        "this task's repo. Answer yes only if a session's branch, last commit, "
+        "changed files or name show it is working on this task in particular.\n\n"
+        'Reply with ONE JSON object and nothing else: {"same_task": bool, '
+        '"session_name": str, "reason": str}. Put the matching session\'s name in '
+        '"session_name", or "" when "same_task" is false.'
+    )
+
+
+def _render(session: dict, key: str) -> str:
+    """A prompt field value; missing or blank reads as `unknown`, never as blank."""
+    return str(session.get(key) or "").strip() or "unknown"
+
+
+def parse_same_task_verdict(text: str) -> dict:
+    """The first JSON object in `text`, normalised. Fails CLOSED to `same_task=False`.
+
+    Models wrap JSON in prose or code fences, so the object is located rather
+    than assumed to be the whole reply. An unreadable answer must not read as a
+    collision: false means "launch", which is the pre-existing behaviour.
+    """
+    body = text or ""
+    decoder = json.JSONDecoder()
+    start = body.find("{")
+    while start >= 0:
+        try:
+            obj, _ = decoder.raw_decode(body, start)
+        except ValueError:
+            obj = None
+        if isinstance(obj, dict):
+            return {
+                "same_task": bool(obj.get("same_task")),
+                "session_name": str(obj.get("session_name") or ""),
+                "reason": str(obj.get("reason") or ""),
+            }
+        start = body.find("{", start + 1)
+    return {"same_task": False, "session_name": "", "reason": "unparseable"}
