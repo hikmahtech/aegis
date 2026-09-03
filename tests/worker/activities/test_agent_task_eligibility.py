@@ -119,3 +119,23 @@ async def test_coding_backlog_does_not_underfill_batch(db_pool, _seed):
         assert len(coding) == 1
     finally:
         await db_pool.execute("DELETE FROM todoist_tasks WHERE id = ANY($1::text[])", coding_ids)
+
+
+async def test_a_task_with_a_session_row_leaves_the_pool(db_pool, _seed):
+    """The sweep only ever starts TURN ONE. Later turns arrive through
+    `find_task_turns_due`, keyed on `last_turn_at`, so a task that already has a
+    session must drop out here — otherwise every 15-minute tick would start a
+    second first turn on a conversation that is already going.
+    """
+    await db_pool.execute(
+        "INSERT INTO task_sessions (task_id, agent_id, session_id) "
+        "VALUES ('tt-8', 'pandoras-actor', gen_random_uuid())"
+    )
+    try:
+        act = AgentTaskActivities(db_pool=db_pool)
+        ids = {r["id"] for r in await act.find_actionable_tasks(max_tasks=50)}
+        assert "tt-8" not in ids
+        # Scoped to the task that has the row — nothing else drops out.
+        assert {"tt-1", "tt-2", "tt-3"} <= ids
+    finally:
+        await db_pool.execute("DELETE FROM task_sessions WHERE task_id = 'tt-8'")

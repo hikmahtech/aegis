@@ -258,10 +258,17 @@ def test_module_workflows_is_the_unflagged_registry():
         # MeetingActivities — MeetingNotesFlow stamps the analysis verdict back
         # onto the row it already filed, so the weekly block can warn about
         # meetings filed without a review. MeetingActivities is unflagged, so
-        # it moves in every row.
-        (True, True, 41, 201),
-        (False, False, 33, 171),
-        (True, False, 37, 190),
+        # it moves in every row. Then +4 activities and NO new flow from the
+        # task-session lane: the three one-shot coding activities
+        # (run_task_investigation, collect_coding_run, run_task_implementation)
+        # are replaced by seven (load_task, ensure_task_session,
+        # check_task_collision, launch_task_turn, kill_task_turn,
+        # record_task_turn, find_task_turns_due) on the existing
+        # AgentTaskActivities, which is unflagged — so all three rows move by
+        # the same +4.
+        (True, True, 41, 205),
+        (False, False, 33, 175),
+        (True, False, 37, 194),
     ],
 )
 def test_real_registration_passes_the_boot_check(homelab, money, flows, activities):

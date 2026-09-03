@@ -4,9 +4,9 @@ Same machinery as the coding lane in ``activities/agent_task.py``
 (``RemoteScriptConnector.start_kimi_run`` on the coding host, a per-run git
 worktree, a tmux window when the host is reachable), reached the same way —
 the connector directly off ``self.remote_script``, not over core's HTTP API.
-What is dropped is the Todoist coupling: ``run_task_investigation`` /
-``run_task_implementation`` hard-code their prompts and take a ``task_id`` +
-``github_repo``, so neither could carry a free-form ask.
+What is dropped is the Todoist coupling: the task lane's own launch activity
+(``AgentTaskActivities.launch_task_turn``) takes a task session and resumes it,
+so it cannot carry a free-form ask the way this one does.
 
 Completion is detected by PROCESS EXIT, not by the ``STATUS:`` footer that
 ``alerts._kimi_output_complete`` looks for. That regex accepts a closed
@@ -20,6 +20,7 @@ fast, and for a general run it is the whole completion signal.
 
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import dataclass
 from typing import Any
@@ -50,6 +51,36 @@ _ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
 def strip_ansi(text: str) -> str:
     """Drop ANSI escape sequences from run output."""
     return _ANSI_RE.sub("", text)
+
+
+def _final_result_text(raw: str) -> str:
+    """The run's own final message: the `result` of the LAST `type: result` event.
+
+    The transcript tail is whatever happened to be written last — tool output as
+    often as prose. The CLI's result event is the only place the final assistant
+    message exists verbatim, and the task lane posts that text to Todoist as the
+    turn's answer.
+
+    The LAST one, because a resumed session can carry more than one; `""` when
+    there is none, an unparseable line, or a non-string `result`, so the caller
+    falls back to the transcript rather than to an invented answer.
+    """
+    final = ""
+    for line in (raw or "").splitlines():
+        line = line.strip()
+        if not line.startswith("{") or '"result"' not in line:
+            continue
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        if (
+            isinstance(event, dict)
+            and event.get("type") == "result"
+            and isinstance(event.get("result"), str)
+        ):
+            final = event["result"]
+    return final
 
 
 @dataclass
@@ -171,6 +202,12 @@ class AgentRunActivities:
         recoverable transcript is `failed` (early death — e.g. a bad CLI flag);
         process exit WITH a transcript is `finished`, because a general run has
         no success footer to check and partial output is still the answer.
+
+        `final` is the run's own final message when it emitted one, and `""`
+        otherwise (including while it is still running). It is not a substitute
+        for `output`: the task lane posts `final` as its comment and falls back
+        to the transcript tail, so both are returned rather than one choice
+        being made here.
         """
         from aegis_worker.activities.alerts import (
             _INVESTIGATION_OUTPUT_CAP,
@@ -178,7 +215,7 @@ class AgentRunActivities:
         )
 
         if self.remote_script is None or not output_file:
-            return {"status": "failed", "output": "", "reason": "no run to poll"}
+            return {"status": "failed", "output": "", "reason": "no run to poll", "final": ""}
 
         raw = await self.remote_script.fetch_kimi_run_output(output_file, host=host) or ""
         if probe_alive and not await self.remote_script.kimi_run_alive(output_file, host=host):
@@ -197,9 +234,15 @@ class AgentRunActivities:
                         "the agent process exited without producing any output "
                         "(early death — e.g. a CLI flag error)"
                     ),
+                    "final": "",
                 }
-            return {"status": "finished", "output": transcript, "reason": ""}
-        return {"status": "running", "output": "", "reason": ""}
+            return {
+                "status": "finished",
+                "output": transcript,
+                "reason": "",
+                "final": _final_result_text(raw),
+            }
+        return {"status": "running", "output": "", "reason": "", "final": ""}
 
     @activity.defn
     async def cleanup_agent_run(

@@ -13,7 +13,7 @@ import asyncio
 import uuid
 
 import pytest
-from aegis_worker.activities.agent_run import AgentRunActivities
+from aegis_worker.activities.agent_run import AgentRunActivities, _final_result_text
 from aegis_worker.flows.agent_run import AgentRunFlow, AgentRunInput
 from temporalio import activity
 from temporalio.testing import WorkflowEnvironment
@@ -474,6 +474,51 @@ async def test_check_finished_when_process_exited_with_output():
     out = await acts.check_agent_run("/tmp/run.jsonl", "node-a", True)
     assert out["status"] == "finished"
     assert "3 issues found" in out["output"]
+
+
+def test_final_result_text_takes_the_last_result_event():
+    """The task lane posts the run's FINAL message as a Todoist comment, and the
+    CLI's own `result` event is the only place that message exists verbatim —
+    the transcript tail is whatever happened to be written last. A resumed
+    session can emit more than one result event; the last one is this turn's."""
+    raw = "\n".join(
+        [
+            '{"type":"assistant","message":{"content":[{"type":"text","text":"thinking"}]}}',
+            '{"type":"result","subtype":"success","result":"first pass"}',
+            '{"type":"result","subtype":"success","result":"STATUS: plan"}',
+        ]
+    )
+    assert _final_result_text(raw) == "STATUS: plan"
+
+
+def test_final_result_text_is_empty_without_a_usable_result_event():
+    """No result event, unparseable output, or a non-string `result` all mean
+    "no final message" — the caller falls back to the transcript tail, so this
+    must never invent one."""
+    assert _final_result_text("") == ""
+    assert _final_result_text('{"type":"assistant","message":{}}') == ""
+    assert _final_result_text('{"type":"result","result":{"not":"a string"}}') == ""
+    assert _final_result_text('{"type":"result","result":') == ""
+
+
+@pytest.mark.asyncio
+async def test_check_finished_carries_the_final_result_event():
+    raw = (
+        '{"role":"assistant","content":[{"type":"text","text":"All done."}]}\n'
+        '{"type":"result","subtype":"success","result":"All done.\\n\\nSTATUS: plan"}'
+    )
+    acts = AgentRunActivities(remote_script=_FakeRemoteScript([raw, raw], alive=False))
+    out = await acts.check_agent_run("/tmp/run.jsonl", "node-a", True)
+    assert out["status"] == "finished"
+    assert out["final"] == "All done.\n\nSTATUS: plan"
+
+
+@pytest.mark.asyncio
+async def test_check_reports_an_empty_final_while_the_run_is_alive():
+    acts = AgentRunActivities(remote_script=_FakeRemoteScript(["partial"], alive=True))
+    out = await acts.check_agent_run("/tmp/run.jsonl", "node-a", True)
+    assert out["status"] == "running"
+    assert out["final"] == ""
 
 
 @pytest.mark.asyncio
