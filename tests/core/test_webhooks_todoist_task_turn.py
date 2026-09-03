@@ -53,12 +53,14 @@ def _signed(body: bytes, secret: str) -> str:
     return base64.b64encode(hmac.new(secret.encode(), body, hashlib.sha256).digest()).decode()
 
 
-def _mock_pool(executed: list[tuple], session_row: dict | None):
+def _mock_pool(executed: list[tuple], session_row: dict | None, queries: list[str] | None = None):
     """Pool recording conn.execute, and answering the session lookup.
 
-    `pool.fetchrow` is the session lookup (`SELECT agent_id FROM task_sessions`)
-    and `pool.fetch` is `resolve_tag("gtd")` — the webhook calls one on the pool
-    directly and the other through `acquire()`, so both have to exist.
+    `pool.fetchrow` is the session lookup (`SELECT ts.agent_id FROM
+    task_sessions ...`) and `pool.fetch` is `resolve_tag("gtd")` — the webhook
+    calls one on the pool directly and the other through `acquire()`, so both
+    have to exist. `queries` collects the lookup SQL, which is the only way to
+    assert on a filter the mock itself cannot apply.
     """
     conn = AsyncMock()
 
@@ -71,10 +73,15 @@ def _mock_pool(executed: list[tuple], session_row: dict | None):
     async def _acquire():
         yield conn
 
+    async def _fetchrow(sql, *args):
+        if queries is not None:
+            queries.append(sql)
+        return session_row
+
     pool = MagicMock()
     pool.acquire = _acquire
     pool.fetch = AsyncMock(return_value=[{"id": "sebas"}])
-    pool.fetchrow = AsyncMock(return_value=session_row)
+    pool.fetchrow = _fetchrow
     return pool
 
 
@@ -83,7 +90,7 @@ def settings():
     return Settings(**_TEST_REQUIRED_SETTINGS)
 
 
-def _make_client(settings, monkeypatch, *, session_row, fail_workflow=""):
+def _make_client(settings, monkeypatch, *, session_row, fail_workflow="", queries=None):
     """(httpx client cm, executed log, temporal start calls, signals).
 
     `fail_workflow` makes `start_workflow` raise for that workflow name only, so
@@ -120,7 +127,7 @@ def _make_client(settings, monkeypatch, *, session_row, fail_workflow=""):
     monkeypatch.setattr("temporalio.client.Client", _StubTemporalClient)
 
     app = create_app(run_lifespan=False)
-    app.state.db_pool = _mock_pool(executed, session_row)
+    app.state.db_pool = _mock_pool(executed, session_row, queries)
     app.dependency_overrides[get_settings] = lambda: settings
     return (
         AsyncClient(transport=ASGITransport(app=app), base_url="http://test"),
@@ -174,6 +181,38 @@ async def dispatch_broken(settings, monkeypatch):
     )
     async with cm as c:
         yield c, executed, starts, signals
+
+
+@pytest_asyncio.fixture(loop_scope="function")
+async def completed_task(settings, monkeypatch):
+    """A completed task: the session row still exists (CleanupFlow ages it out
+    after 7 days), so the JOIN is what has to return nothing."""
+    queries: list[str] = []
+    cm, executed, starts, signals = _make_client(
+        settings, monkeypatch, session_row=None, queries=queries
+    )
+    async with cm as c:
+        yield c, starts, queries
+
+
+async def test_a_comment_on_a_completed_task_starts_no_turn(completed_task):
+    """AEGIS never completes a coding task, so a completed one is the operator
+    saying they are done with it. A late "thanks" must not restart the session,
+    and the session row alone cannot tell — only the join to `todoist_tasks`
+    can, which is why the SQL itself is asserted.
+
+    Falsifiable: drop the join and the lookup no longer filters on completion.
+    """
+    client, starts, queries = completed_task
+    r = await _post_note(client, "thanks, that worked")
+    assert r.status_code == 200, r.text
+
+    assert _started(starts, "AgentTaskFlow") == []
+    assert queries, "the session lookup must run"
+    assert "is_completed" in queries[0], queries
+    assert "JOIN todoist_tasks" in queries[0], queries
+    # The rest of the note handling is untouched.
+    assert len(_started(starts, "ClarifyFlow")) == 1
 
 
 async def test_user_comment_on_a_session_task_dispatches_a_turn(with_session):

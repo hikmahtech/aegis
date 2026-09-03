@@ -243,8 +243,9 @@ The triggers:
   `Workflow run:`), call `dispatch_task_turn` through the Temporal client the
   handler already opens for ClarifyFlow. Best-effort, logged on failure.
 - **Sweep, later turns (fallback).** A new activity `find_task_turns_due()`
-  returns tasks with a session row whose newest user-authored note was posted
-  after `COALESCE(last_turn_at, created_at)`, with that note's text. The sweep
+  returns tasks with a session row whose user-authored notes were posted
+  after `COALESCE(last_turn_at, created_at)`, with those notes joined
+  oldest-first. The sweep
   dispatches each through `dispatch_task_turn`. This catches a missed webhook
   and also serves comments posted by `comment_on_task` when the webhook is
   down. The 6-hour cooldown does not apply to these; the watermark is

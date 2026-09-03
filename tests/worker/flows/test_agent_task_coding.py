@@ -23,12 +23,16 @@ from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import Worker
 
 with workflow.unsafe.imports_passed_through():
+    from aegis.connectors.remote_script import _PROMPT_CAP_BYTES
     from aegis_worker.flows.agent_task import (
         AgentTaskFlow,
         AgentTaskFlowInput,
         AgentTaskSweepConfig,
         AgentTaskSweepFlow,
+        _first_turn_prompt,
+        _later_turn_prompt,
         _render_thread,
+        _status_line,
     )
     from aegis_worker.shared.retry import TIMEOUT_LLM, TIMEOUT_LONG, TIMEOUT_STANDARD
 
@@ -275,6 +279,7 @@ async def test_first_turn_posts_plan_with_footer_and_parks():
     assert "aegis-task/tc-1" in launches[0]["prompt"]
 
     assert ("record", True) in events, "a launched turn must bump the session watermark"
+    assert result["status_line"] == "plan", "the turn's own STATUS verdict, on the result"
     bodies = _bodies(events, "comment")
     assert len(bodies) == 1
     assert "STATUS: plan" in bodies[0]
@@ -410,7 +415,17 @@ async def test_operator_in_session_sends_slack_note_and_does_not_park():
         events,
         collision={
             "verdict": "you_are_in_it",
-            "session": {"name": "bcp eps", "owner": "human", "cwd": "/srv/repos/bcp"},
+            # The realistic takeover: the footer AEGIS posts says `cd
+            # <worktree_path> && claude --resume <id>`, so the operator IS in
+            # the task's own `-aegis-wt/` tree — the directory the session
+            # registry tags `owner="aegis"`. Only `check_task_collision`'s
+            # liveness probe can call this a person, and the flow acts on the
+            # owner the activity reports, never on the path.
+            "session": {
+                "name": "bcp eps",
+                "owner": "human",
+                "cwd": "/srv/repos/bcp-aegis-wt/task-tc-1",
+            },
             "sessions": [],
             "reason": "session is live",
         },
@@ -602,10 +617,33 @@ async def test_launch_failure_parks_with_the_error():
         },
     )
 
-    assert ("record", True) in events
+    assert ("record", False) in events, "the comment was consumed; the watermark moves"
+    assert ("record", True) not in events, (
+        "a turn that never started is not a turn: counting it leaves `turns` at 1, "
+        "so every later turn resumes a session that was never created"
+    )
     assert "no route to host" in _bodies(events, "comment")[0]
     assert ("park", "turn failed to start") in events
     assert result["status"] == "launch_failed"
+
+
+@pytest.mark.asyncio
+async def test_a_launched_turn_is_counted_only_once_it_is_running():
+    """Two calls, in this order, around the launch: the WATERMARK moves before
+    it (the comment is consumed either way, and a watermark left behind has the
+    fallback sweep re-dispatch it every 15 minutes for ever) and the turn COUNT
+    only after the launch reported `running`.
+
+    Falsifiable: put the count back above `launch_task_turn` and the order
+    inverts.
+    """
+    events: list = []
+    await _run(events)
+
+    around = [(kind, body) for kind, body in events if kind in ("record", "launch")]
+    assert [kind for kind, _ in around[:3]] == ["record", "launch", "record"], around
+    assert around[0] == ("record", False)
+    assert around[2] == ("record", True)
 
 
 @pytest.mark.asyncio
@@ -714,6 +752,66 @@ def test_render_thread_keeps_the_newest_lines_and_says_what_it_dropped():
     assert "note 0 " not in out, "the oldest notes are the ones dropped"
     assert out.startswith("[... "), out[:80]
     assert "earlier comments omitted]" in out.splitlines()[0]
+
+
+def test_the_first_turn_prompt_fits_the_connector_cap_in_bytes():
+    """The connector cuts at `_PROMPT_CAP_BYTES` silently, and the STATUS
+    contract is the LAST thing in this prompt — so a thread sized in characters
+    is what would be delivered instead of the instructions. Non-ASCII is the
+    whole point: 700 CJK characters are 2 100 bytes, so the old 12 000-character
+    thread cap allowed a ~36 000-byte thread on its own.
+
+    Falsifiable: count the budget in characters and this fails.
+    """
+    task = dict(
+        _CODE_TASK,
+        description="д" * 20_000,
+        notes=[
+            {"content": f"note {n} " + "な" * 700, "posted_at": "2026-09-01T10:00:00+00:00"}
+            for n in range(200)
+        ],
+    )
+    prompt = _first_turn_prompt("tc-1", task, _SESSION)
+
+    assert len(prompt.encode("utf-8")) <= _PROMPT_CAP_BYTES
+    assert prompt.endswith("STATUS: unactionable: <why>"), prompt[-200:]
+    assert "STATUS: plan" in prompt
+    assert "This is your first turn on this task." in prompt
+    assert "note 199" in prompt, "the newest comment is the one that must survive"
+    assert "earlier comments omitted]" in prompt
+
+
+def test_a_20000_character_comment_is_cut_and_the_rules_survive():
+    """A later turn's quoted comment is user text with no ceiling of its own —
+    one pasted log is enough to push the session's rules off the bottom."""
+    prompt = _later_turn_prompt("tc-1", _CODE_TASK, _SESSION, ["log dump\n" + "x" * 20_000])
+
+    assert len(prompt.encode("utf-8")) <= _PROMPT_CAP_BYTES
+    assert prompt.endswith("STATUS: unactionable: <why>"), prompt[-200:]
+    assert "> log dump" in prompt, "the start of what the user said is kept"
+    assert "[…]" in prompt, "and the cut is visible rather than silent"
+
+
+def test_a_flood_of_queued_comments_keeps_the_newest_and_the_rules():
+    """Several comments fold into one turn, so per-comment caps alone do not
+    bound the prompt: six 4 000-character comments already exceed the cap."""
+    prompt = _later_turn_prompt(
+        "tc-1", _CODE_TASK, _SESSION, [f"c{n} " + "y" * 3_900 for n in range(20)]
+    )
+
+    assert len(prompt.encode("utf-8")) <= _PROMPT_CAP_BYTES
+    assert prompt.endswith("STATUS: unactionable: <why>")
+    assert "> c19 " in prompt, "the last thing the user said must survive"
+    assert "> c0 " not in prompt
+    assert "earlier comments omitted]" in prompt
+
+
+def test_status_line_takes_the_last_one_and_tolerates_none():
+    """The prompt lists the whole contract, so a model that quotes the menu back
+    before choosing would otherwise be recorded as answering with its first line."""
+    assert _status_line("STATUS: plan\nSTATUS: pr: https://x/1") == "pr: https://x/1"
+    assert _status_line("done, no footer") == ""
+    assert _status_line("  STATUS: plan") == "", "anchored: a mention mid-line is not a verdict"
 
 
 def test_render_thread_truncates_one_enormous_note():

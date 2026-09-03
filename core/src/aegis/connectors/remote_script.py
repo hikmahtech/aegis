@@ -202,8 +202,10 @@ def _agent_launch_flags(
 
     `session_id` pins the run to ONE long-lived claude session, which is how a
     Todoist task keeps its context across turns instead of re-explaining itself
-    every time. It is caller-chosen (a deterministic uuid5 of the task), so the
-    caller knows the id before the run exists and can find the session again.
+    every time. It is caller-chosen (a uuid4 minted once and stored on the
+    task's `task_sessions` row — NOT derived from the task, so a task whose
+    session was cleaned up and later restarted gets a fresh one), so the caller
+    knows the id before the run exists and can find the session again.
     The first turn CREATES it with `--session-id <uuid>` (plus `-n <name>`, a
     human label for the session picker); every later turn REPLAYS it with
     `--resume <uuid>`. The two are mutually exclusive by construction:

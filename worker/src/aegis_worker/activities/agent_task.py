@@ -922,11 +922,15 @@ class AgentTaskActivities:
 
             ours = find_session(sessions, session_id)
             if ours is not None:
+                owner = await self._own_session_owner(task_id)
                 return {
                     "verdict": "you_are_in_it",
-                    "session": ours,
+                    # OVERRIDES the registry's owner tag, which cannot answer
+                    # this question — see `_own_session_owner`.
+                    "session": {**ours, "owner": owner},
                     "sessions": [],
-                    "reason": f"session {session_id} is live as {ours.get('name') or 'unnamed'}",
+                    "reason": f"session {session_id} is live as "
+                    f"{ours.get('name') or 'unnamed'} ({owner})",
                 }
 
             humans = human_sessions_in_repo(sessions, repo)
@@ -971,6 +975,44 @@ class AgentTaskActivities:
                 "task_collision_check_failed task_id=%s err=%s", task_id, str(exc)[:200]
             )
             return {**proceed, "reason": f"check failed: {str(exc)[:200]}"}
+
+    async def _own_session_owner(self, task_id: str) -> str:
+        """Who is driving the task's own live session: `"aegis"` or `"human"`.
+
+        The session registry cannot answer this. Its records carry no
+        `entrypoint` field (the keys are cwd/id/kind/name/pid/sessionId/
+        startedAt/state/status), and both candidates sit in the SAME directory:
+        the take-over footer tells the operator to `cd <worktree_path> && claude
+        --resume <id>`, and that path contains `-aegis-wt/`, which is exactly
+        what `normalise_repo` tags `owner="aegis"`. So an operator takeover —
+        the case the whole rule exists to serve — would be read as one of our
+        own orphans.
+
+        Liveness of the LAST turn we launched is the signal that does separate
+        them: an orphan of ours is by definition still writing its output file,
+        while a takeover happens after that turn has ended.
+
+        Unknown counts as HUMAN. The aegis branch is the harsher one — no Slack
+        note, no watermark bump, and the comment re-dispatched every 15 minutes
+        — so a missing file, an unreachable host or a raising probe must not
+        land a person there.
+        """
+        if self.db_pool is None or self.remote_script is None:
+            return "human"
+        try:
+            row = await task_sessions.get_session(self.db_pool, task_id) or {}
+            output_file = str(row.get("last_output_file") or "")
+            if not output_file:
+                return "human"
+            alive = await self.remote_script.kimi_run_alive(
+                output_file, host=str(row.get("last_host") or "")
+            )
+        except Exception as exc:  # noqa: BLE001 — see the docstring: unknown is human
+            activity.logger.warning(
+                "task_owner_probe_failed task_id=%s err=%s", task_id, str(exc)[:200]
+            )
+            return "human"
+        return "aegis" if alive else "human"
 
     async def _enrich_sessions(self, humans: list[dict], host: str) -> list[dict]:
         """`humans` with git context attached, probed CONCURRENTLY.
@@ -1128,6 +1170,24 @@ class AgentTaskActivities:
 
         engine = started.get("engine", "")
         run_id = started.get("run_id", "")
+        # Remember WHERE this turn is writing. `check_task_collision` probes
+        # that file to tell an orphan of ours from an operator who took the
+        # session over; without it every takeover reads as an orphan.
+        # Best-effort: the session is already running and this activity is
+        # NO_RETRY, so raising here would strand a live turn nobody polls.
+        task_id = str(session.get("task_id") or "")
+        if self.db_pool is not None and task_id:
+            try:
+                await task_sessions.set_last_run(
+                    self.db_pool,
+                    task_id,
+                    output_file=str(started.get("output_file") or ""),
+                    host=str(started.get("host") or ""),
+                )
+            except Exception as exc:  # noqa: BLE001
+                activity.logger.warning(
+                    "task_last_run_not_recorded task_id=%s err=%s", task_id, str(exc)[:200]
+                )
         return {
             "status": "running",
             "run_id": run_id,

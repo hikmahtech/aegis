@@ -16,7 +16,11 @@ from __future__ import annotations
 
 import shlex
 
-from aegis.connectors.remote_script import RemoteScriptConnector, _agent_launch_flags
+from aegis.connectors.remote_script import (
+    _PROMPT_CAP_BYTES,
+    RemoteScriptConnector,
+    _agent_launch_flags,
+)
 
 SID = "5925e3ce-d1d9-539c-826c-011f67dcfa81"
 
@@ -56,6 +60,10 @@ class _Exec:
             if needle in cmd:
                 return res
         return {"status": "succeeded", "exit_code": 0, "stdout": "", "stderr": ""}
+
+
+def _written(ex) -> list[bytes]:
+    return [s for c, s in zip(ex.cmds, ex.stdins, strict=True) if c.startswith("cat > ")]
 
 
 def _connector():
@@ -117,8 +125,44 @@ async def test_a_long_turn_prompt_reaches_the_host_intact(monkeypatch):
         worktree_path="/repos/acme/app-aegis-wt/task-1",
         session_id=SID,
     )
-    written = [s for c_, s in zip(ex.cmds, ex.stdins, strict=True) if c_.startswith("cat > ")]
+    written = _written(ex)
     assert written and written[0] == prompt.encode()
+
+
+async def _write_prompt(monkeypatch, prompt: str) -> bytes:
+    c = _connector()
+    ex = _Exec()
+    monkeypatch.setattr(c, "_exec", ex)
+    await c.start_kimi_run(
+        repo="acme/app",
+        prompt=prompt,
+        kimi_binary="",
+        engine_override="claude",
+        worktree_path="/repos/acme/app-aegis-wt/task-1",
+        session_id=SID,
+    )
+    return _written(ex)[0]
+
+
+async def test_a_prompt_exactly_at_the_cap_is_written_whole(monkeypatch):
+    """The flow sizes its prompt against this number, so the boundary is a
+    contract between the two: at the cap nothing may be dropped."""
+    prompt = "x" * _PROMPT_CAP_BYTES
+    assert await _write_prompt(monkeypatch, prompt) == prompt.encode()
+
+
+async def test_one_byte_over_the_cap_is_cut_to_a_valid_utf8_prefix(monkeypatch):
+    """Cut on bytes, then drop the partial character the cut created. A prompt
+    file with an invalid UTF-8 tail is unreadable as a whole, so the run would
+    lose every byte rather than the last one."""
+    # 23 999 ASCII bytes plus a 2-byte character = 24 001; the cut lands INSIDE
+    # that character.
+    prompt = "x" * (_PROMPT_CAP_BYTES - 1) + "é"
+    assert len(prompt.encode()) == _PROMPT_CAP_BYTES + 1
+
+    sent = await _write_prompt(monkeypatch, prompt)
+    assert sent == b"x" * (_PROMPT_CAP_BYTES - 1)
+    sent.decode("utf-8")  # raises if the half character survived
 
 
 async def test_kill_run_uses_fuser(monkeypatch):

@@ -20,6 +20,7 @@ The two exits that do not park are deliberate and each carry their reason.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from html import escape as _esc
 from typing import Any
@@ -28,6 +29,8 @@ from temporalio import workflow
 from temporalio.exceptions import ApplicationError, WorkflowAlreadyStartedError
 
 with workflow.unsafe.imports_passed_through():
+    from aegis.connectors.remote_script import _PROMPT_CAP_BYTES
+
     from aegis_worker.activities.agent_run import AgentRunActivities
     from aegis_worker.activities.agent_task import extract_service_name, resolve_verb
     from aegis_worker.activities.delivery import DeliveryActivities
@@ -43,15 +46,29 @@ with workflow.unsafe.imports_passed_through():
         TIMEOUT_STANDARD,
     )
 
-# Per note, then over the whole rendered thread. `load_task` already caps the
-# thread at 30 notes, but one pasted stack trace can outweigh the rest of the
-# conversation, and the connector caps the whole prompt at 24 000 bytes — a
-# thread that blew that budget would silently truncate the INSTRUCTIONS at the
-# bottom. The NEWEST lines are kept (a turn needs the last thing the user said
-# far more than the first) and the drop is announced, so the model knows it is
-# reading a tail rather than the whole story.
+# The connector cuts the composed prompt at `_PROMPT_CAP_BYTES` and says
+# nothing, and the INSTRUCTIONS — the STATUS contract, the branch rules — are at
+# the BOTTOM. So everything variable is capped here first, and the thread then
+# takes whatever budget is left over in BYTES, not characters: a cap counted in
+# characters is not a cap at all once the conversation stops being ASCII (one
+# emoji or CJK character is 3-4 bytes, so a 12 000-character thread can be 40 000
+# bytes on its own). The NEWEST lines are kept — a turn needs the last thing the
+# user said far more than the first — and the drop is announced, so the model
+# knows it is reading a tail rather than the whole story.
 _THREAD_NOTE_CAP = 800
 _THREAD_RENDER_CAP = 12000
+# One pasted stack trace in a description or a comment can outweigh the entire
+# rest of the prompt. Cut per field, so no single one can crowd out the others.
+_FIELD_CAP = 4000
+# Slack for the closing instructions: the budget is computed from the prompt as
+# composed, but `title` and the footer text still vary, and running out on the
+# last line is the one failure this whole mechanism exists to prevent.
+_PROMPT_HEADROOM = 512
+_CUT_MARK = " […]"
+# The turn's own verdict, which the prompt asks for as the LAST line of the
+# final message. Anchored, so a sentence merely mentioning the word does not
+# become the recorded status.
+_STATUS_RE = re.compile(r"^STATUS:\s*(.+)$")
 # Tail of a finished turn's raw transcript, when it emitted no final message.
 _TURN_OUTPUT_TAIL = 6000
 # Tail carried by a timeout comment. Deliberately smaller: it is a fragment of
@@ -59,8 +76,34 @@ _TURN_OUTPUT_TAIL = 6000
 _TURN_TIMEOUT_TAIL = 3000
 
 
-def _render_thread(notes: list | None) -> str:
-    """The task's comment thread as `[<posted_at>] <content>` lines."""
+def _cut(text: str, cap: int = _FIELD_CAP) -> str:
+    """`text`, cut to `cap` characters with a visible mark when it was cut."""
+    value = text or ""
+    return value if len(value) <= cap else value[:cap] + _CUT_MARK
+
+
+def _fill_newest_first(lines: list[str], budget: int) -> tuple[list[str], int]:
+    """The tail of `lines` that fits in `budget` BYTES, plus how many were cut.
+
+    Newest first while filling, oldest first on the way out: the model reads a
+    conversation in order, but the end of it is what the turn has to act on.
+    """
+    kept: list[str] = []
+    used = 0
+    for line in reversed(lines):
+        cost = len(line.encode("utf-8")) + 1
+        # `kept and` keeps one line unconditionally: a budget too small for even
+        # the newest line must still deliver the last thing the user said.
+        if kept and used + cost > budget:
+            break
+        kept.append(line)
+        used += cost
+    kept.reverse()
+    return kept, len(lines) - len(kept)
+
+
+def _render_thread(notes: list | None, budget: int = _THREAD_RENDER_CAP) -> str:
+    """The task's comment thread as `[<posted_at>] <content>` lines, within `budget`."""
     lines = [
         f"[{str((note or {}).get('posted_at') or '')}] "
         f"{str((note or {}).get('content') or '')[:_THREAD_NOTE_CAP]}"
@@ -68,18 +111,35 @@ def _render_thread(notes: list | None) -> str:
     ]
     if not lines:
         return "(no comments yet)"
-    kept: list[str] = []
-    used = 0
-    for line in reversed(lines):
-        if kept and used + len(line) + 1 > _THREAD_RENDER_CAP:
-            break
-        kept.append(line)
-        used += len(line) + 1
-    kept.reverse()
-    dropped = len(lines) - len(kept)
+    kept, dropped = _fill_newest_first(lines, budget)
     if dropped:
         kept.insert(0, f"[... {dropped} earlier comments omitted]")
     return "\n".join(kept)
+
+
+def _budget_for(prompt_without_variable_block: str) -> int:
+    """Bytes left for the block that has to give way, once everything else is in."""
+    return (
+        _PROMPT_CAP_BYTES
+        - len(prompt_without_variable_block.encode("utf-8"))
+        - _PROMPT_HEADROOM
+    )
+
+
+def _status_line(text: str) -> str:
+    """The turn's own `STATUS: <verdict>` line, or `""` when it did not emit one.
+
+    The LAST match wins: the prompt lists the whole contract, so a model that
+    quotes the options back before choosing one would otherwise be recorded as
+    having answered with the first line of the menu. Not required — a turn ends
+    when the process exits, not when a footer appears — which is why an absent
+    line is `""` rather than an error.
+    """
+    for line in reversed((text or "").splitlines()):
+        match = _STATUS_RE.match(line)
+        if match:
+            return match.group(1).strip()
+    return ""
 
 
 def _first_turn_prompt(task_id: str, task: dict, session: dict) -> str:
@@ -88,11 +148,24 @@ def _first_turn_prompt(task_id: str, task: dict, session: dict) -> str:
     Read-only is not a safety rail here so much as a product one — turn 1 runs
     unattended off the sweep, before the user has said anything about this
     task beyond its title, so the only useful output is a plan to react to.
+
+    Composed twice: once without the thread, to learn how many bytes everything
+    else costs, and once with a thread rendered to fit what is left. Sizing the
+    thread by a fixed constant instead is what let the connector's silent cut
+    reach the instructions at the bottom.
     """
     title = str(task.get("content") or "")
-    description = str(task.get("description") or "")
+    description = _cut(str(task.get("description") or ""))
     branch = str(session.get("branch") or "")
-    thread = _render_thread(task.get("notes"))
+    thread = _render_thread(
+        task.get("notes"), _budget_for(_first_turn_body(task_id, title, description, branch, ""))
+    )
+    return _first_turn_body(task_id, title, description, branch, thread)
+
+
+def _first_turn_body(
+    task_id: str, title: str, description: str, branch: str, thread: str
+) -> str:
     return f"""You are working Todoist task {task_id}: {title}
 
 {description}
@@ -124,10 +197,19 @@ def _later_turn_prompt(task_id: str, task: dict, session: dict, comments: list[s
     """
     title = str(task.get("content") or "")
     branch = str(session.get("branch") or "")
-    quoted = "\n\n".join(
-        "\n".join(f"> {line}" for line in (comment.splitlines() or [""]))
+    blocks = [
+        "\n".join(f"> {line}" for line in (_cut(comment).splitlines() or [""]))
         for comment in comments
+    ]
+    kept, dropped = _fill_newest_first(
+        blocks, _budget_for(_later_turn_body(task_id, title, branch, ""))
     )
+    if dropped:
+        kept.insert(0, f"> [... {dropped} earlier comments omitted]")
+    return _later_turn_body(task_id, title, branch, "\n\n".join(kept))
+
+
+def _later_turn_body(task_id: str, title: str, branch: str, quoted: str) -> str:
     return f"""The user replied on Todoist task {task_id} ({title}):
 
 {quoted}
@@ -711,6 +793,27 @@ class AgentTaskFlow:
             retry_policy=ACT_RETRY,
         )
 
+    async def _count_launched_turn(self, task_id: str) -> None:
+        """Count a turn that actually started. Never retried, never fatal.
+
+        `turns` decides resume-vs-create and numbers the take-over footer, and
+        this call happens with a live CLI session already running. A retry would
+        count that one session twice, and an exception would fail the flow out
+        from under a turn nobody is left to poll — so both are refused. The
+        watermark this shares an activity with has already moved.
+        """
+        try:
+            await workflow.execute_activity(
+                "record_task_turn",
+                args=[task_id, True],
+                start_to_close_timeout=TIMEOUT_FAST,
+                retry_policy=NO_RETRY,
+            )
+        except Exception as exc:  # noqa: BLE001
+            workflow.logger.warning(
+                "task_turn_not_counted task_id=%s err=%s", task_id, str(exc)[:200]
+            )
+
     async def _deliver(self, agent_id: str, text: str) -> None:
         """Send to the agent's bound channel; never fail the flow over it."""
         try:
@@ -767,6 +870,7 @@ class AgentTaskFlow:
         comments = [input.comment.strip()] if input.comment.strip() else []
         comments += [c for c in self._drain() if c not in comments]
         turns_run = 0
+        status_line = ""
         session: dict = {}
 
         while True:
@@ -891,11 +995,12 @@ class AgentTaskFlow:
                 else _later_turn_prompt(task_id, task, session, comments)
             )
 
-            # Recorded BEFORE the launch, not after: a launch that fails still
+            # The WATERMARK moves before the launch: a launch that fails still
             # consumed the comment, and a watermark left behind would have the
-            # fallback sweep re-dispatch it every 15 minutes for ever.
+            # fallback sweep re-dispatch it every 15 minutes for ever. The turn
+            # COUNT does not — see below.
             self._step = "coding:record_task_turn"
-            await self._record_turn(task_id, True)
+            await self._record_turn(task_id, False)
 
             self._step = "coding:launch_task_turn"
             launched = await workflow.execute_activity(
@@ -925,6 +1030,11 @@ class AgentTaskFlow:
                     agent_id=agent_id,
                     turns=turns_run,
                 )
+            # Counted only now that a session demonstrably exists. Counting it
+            # before the launch made a FAILED first launch leave `turns` at 1,
+            # and every later turn then ran `--resume` against a session that
+            # was never created — a task poisoned by one bad launch.
+            await self._count_launched_turn(task_id)
 
             self._step = "coding:poll"
             outcome = await poll_until_exit(
@@ -955,6 +1065,10 @@ class AgentTaskFlow:
                     or str(outcome.get("reason") or "")
                     or "no output"
                 )
+
+            # The turn's own verdict, read off the message before the FYI
+            # prefix and the take-over footer are wrapped around it.
+            status_line = _status_line(body)
 
             others = verdict.get("sessions") or []
             if others:
@@ -992,6 +1106,10 @@ class AgentTaskFlow:
             status="parked",
             turns=turns_run,
             session_id=str(session.get("session_id") or ""),
+            # The last turn's own verdict (`plan`, `question: ...`, `pr: ...`),
+            # so `workflow_runs.result_summary` says what the session decided
+            # and not merely that a turn happened. "" when it emitted none.
+            status_line=status_line,
         )
 
     async def _kill_turn(self, output_file: str, host: str) -> None:

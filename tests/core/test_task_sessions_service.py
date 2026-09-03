@@ -57,6 +57,18 @@ async def test_create_is_idempotent_and_mints_one_session_id(db_pool, _clean):
     assert a["turns"] == 0 and a["repo"] == ""
 
 
+async def test_set_last_run_records_where_the_turn_writes(db_pool, _clean):
+    """The row starts empty, which is what "no turn on record" means to the
+    collision check — it must not be NULL, and it must round-trip."""
+    row = await svc.create_session(db_pool, task_id=_TASK, agent_id="pandoras-actor")
+    assert row["last_output_file"] == "" and row["last_host"] == ""
+
+    await svc.set_last_run(db_pool, _TASK, output_file="/tmp/aegis-kimi-run-r7.jsonl", host="meem")
+    row = await svc.get_session(db_pool, _TASK)
+    assert row["last_output_file"] == "/tmp/aegis-kimi-run-r7.jsonl"
+    assert row["last_host"] == "meem"
+
+
 async def test_set_repo_records_the_checkout(db_pool, _clean):
     await svc.create_session(db_pool, task_id=_TASK, agent_id="pandoras-actor")
     await svc.set_repo(
@@ -95,6 +107,33 @@ async def test_find_turns_due_sees_only_user_notes_newer_than_the_watermark(db_p
     await _note(db_pool, f"[pandoras-actor] done\n\nWorkflow run: agent-task-{_TASK}")
     await _note(db_pool, CLARIFY_NOTE_PREFIX + "2026] filed")
     await _note(db_pool, AGENT_REPLY_PREFIX + "2026 agent=sebas] hi")
+    assert await svc.find_turns_due(db_pool) == []
+
+
+async def test_find_turns_due_joins_every_unanswered_note_oldest_first(db_pool, _clean):
+    """This is the fallback for a webhook that never arrived, and an outage
+    drops a RUN of comments, not one. Returning only the newest would answer the
+    last message of a conversation the turn never read.
+
+    Falsifiable: go back to `ORDER BY posted_at DESC LIMIT 1` and only the last
+    note comes back.
+    """
+    await svc.create_session(db_pool, task_id=_TASK, agent_id="pandoras-actor")
+    # The session predates both notes, as it does in life: `created_at` is the
+    # watermark until the first turn runs.
+    await db_pool.execute(
+        "UPDATE task_sessions SET created_at = now() - interval '1 hour' WHERE task_id = $1",
+        _TASK,
+    )
+    await _note(db_pool, "use the other repo", age="30 seconds")
+    await _note(db_pool, "and open a draft PR", age="10 seconds")
+
+    due = await svc.find_turns_due(db_pool)
+    assert len(due) == 1, "still one row per task"
+    assert due[0]["comment"] == "use the other repo\n\nand open a draft PR"
+
+    # And the watermark still ends the batch.
+    await svc.record_turn(db_pool, _TASK, launched=True)
     assert await svc.find_turns_due(db_pool) == []
 
 

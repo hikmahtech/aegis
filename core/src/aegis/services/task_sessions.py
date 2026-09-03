@@ -9,10 +9,11 @@ Two things are deliberate here:
 * ``session_id`` is minted once, by ``create_session``'s ``ON CONFLICT DO
   NOTHING``. A second caller for the same task gets the *existing* row back, so
   two comments arriving together can never fork a task into two sessions.
-* ``find_turns_due`` compares the newest **user** note against the row's own
-  watermark. AEGIS's own notes are excluded in SQL rather than in Python for the
-  same reason ClarifyFlow does it (see ``aegis.clarify_note``): a machine note
-  that counted as a turn would make the task answer itself forever.
+* ``find_turns_due`` compares every **user** note against the row's own
+  watermark and hands back all of them, joined oldest-first. AEGIS's own notes
+  are excluded in SQL rather than in Python for the same reason ClarifyFlow does
+  it (see ``aegis.clarify_note``): a machine note that counted as a turn would
+  make the task answer itself forever.
 """
 
 from __future__ import annotations
@@ -27,24 +28,37 @@ from aegis.clarify_note import AGENT_REPLY_PREFIX, CLARIFY_NOTE_PREFIX
 # session_id is a uuid column; every consumer wants the string form.
 _COLS = (
     "task_id, agent_id, session_id::text AS session_id, repo, github_repo, "
-    "worktree_path, branch, host, slack_ref, turns, last_turn_at, created_at"
+    "worktree_path, branch, host, last_output_file, last_host, slack_ref, turns, "
+    "last_turn_at, created_at"
 )
 
-# The newest user note on a live task, when it is newer than the last turn we
-# ran for it. `created_at` is the watermark until the first turn, so the comment
-# that created the session does not immediately re-fire it.
+# EVERY user note on a live task that arrived after the last turn we ran for
+# it, joined oldest-first into one comment. `created_at` is the watermark until
+# the first turn, so the comment that created the session does not immediately
+# re-fire it.
+#
+# All of them, not just the newest: this is the fallback for a webhook that
+# never arrived, and a webhook outage drops a RUN of comments, not one. Handing
+# back only the last would answer the final message of a conversation the turn
+# never read. The aggregate always produces a row, so `comment IS NOT NULL` is
+# what keeps a task with nothing new out of the result — one row per task, and
+# never an empty comment. Longest wait first: `waiting_since` is the OLDEST
+# unanswered note, so a starved task cannot be pushed past the limit by a task
+# that was commented on more recently.
 _TURNS_DUE_SQL = """
-SELECT ts.task_id, ts.agent_id, n.content AS comment
+SELECT ts.task_id, ts.agent_id, n.comment
 FROM task_sessions ts
 JOIN todoist_tasks t ON t.id = ts.task_id AND NOT t.is_completed
 JOIN LATERAL (
-    SELECT content, posted_at FROM todoist_notes
+    SELECT string_agg(content, E'\\n\\n' ORDER BY posted_at, id) AS comment,
+           min(posted_at) AS waiting_since
+    FROM todoist_notes
     WHERE item_id = ts.task_id
       AND content NOT LIKE $1 AND content NOT LIKE $2
       AND content NOT LIKE '%Workflow run:%'
-    ORDER BY posted_at DESC LIMIT 1
-) n ON n.posted_at > COALESCE(ts.last_turn_at, ts.created_at)
-ORDER BY n.posted_at ASC
+      AND posted_at > COALESCE(ts.last_turn_at, ts.created_at)
+) n ON n.comment IS NOT NULL
+ORDER BY n.waiting_since ASC
 LIMIT $3
 """
 
@@ -107,6 +121,22 @@ async def set_repo(
     )
 
 
+async def set_last_run(pool: Any, task_id: str, *, output_file: str, host: str) -> None:
+    """Record the turn we just launched, so its liveness can be probed later.
+
+    This is what separates "an orphaned turn of ours is still writing" from "the
+    operator has taken this session over". Both look identical in the session
+    registry — same session id, and a cwd inside the task's own `-aegis-wt/`
+    worktree, because that is the directory the take-over footer hands out.
+    """
+    await pool.execute(
+        "UPDATE task_sessions SET last_output_file = $2, last_host = $3 WHERE task_id = $1",
+        task_id,
+        output_file,
+        host,
+    )
+
+
 async def record_turn(pool: Any, task_id: str, *, launched: bool) -> bool:
     """Move the watermark past the comment we just consumed. True when a row moved.
 
@@ -156,7 +186,12 @@ async def find_by_thread(pool: Any, channel: str, ts: str) -> str | None:
 
 
 async def find_turns_due(pool: Any, limit: int = 20) -> list[dict]:
-    """Sessions with an unanswered user comment: `[{task_id, agent_id, comment}]`."""
+    """Sessions with unanswered user comments: `[{task_id, agent_id, comment}]`.
+
+    `comment` carries EVERY note posted since the watermark, oldest first,
+    joined by a blank line — the shape `_later_turn_prompt` already quotes for a
+    batch of comments drained from the signal queue.
+    """
     rows = await pool.fetch(
         _TURNS_DUE_SQL,
         CLARIFY_NOTE_PREFIX + "%",

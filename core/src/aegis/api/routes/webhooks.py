@@ -782,8 +782,16 @@ async def todoist_webhook(
                 try:
                     from temporalio.client import Client as _Client
 
+                    # Joined against the task, not read from the session row
+                    # alone: a completed @code task keeps its session until
+                    # CleanupFlow ages it out, and a comment on a finished task
+                    # (a "thanks", a late note) must not start a coding turn on
+                    # it. `find_turns_due` already excludes them the same way.
                     sess = await pool.fetchrow(
-                        "SELECT agent_id FROM task_sessions WHERE task_id = $1", str(item_id)
+                        "SELECT ts.agent_id FROM task_sessions ts "
+                        "JOIN todoist_tasks t ON t.id = ts.task_id AND NOT t.is_completed "
+                        "WHERE ts.task_id = $1",
+                        str(item_id),
                     )
                     if sess and is_user_note(content):
                         client = await _Client.connect(settings.temporal_host)

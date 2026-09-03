@@ -104,6 +104,7 @@ class _Connector:
         launch="running",
         git_delay=0.0,
         git_error=False,
+        alive=True,
     ):
         self.sessions = sessions if sessions is not None else []
         self.worktree = worktree
@@ -111,10 +112,14 @@ class _Connector:
         self.launch = launch
         self.git_delay = git_delay
         self.git_error = git_error
+        # "boom" raises, mirroring an SSH probe that blew up rather than
+        # answering — which the activity must read as "not one of ours".
+        self.alive = alive
         self.worktree_calls: list[dict] = []
         self.launches: list[dict] = []
         self.git_calls: list[dict] = []
         self.killed: list[dict] = []
+        self.alive_calls: list[dict] = []
 
     async def coding_settings(self) -> dict:
         return {
@@ -155,6 +160,12 @@ class _Connector:
         if self.git_delay:
             await asyncio.sleep(self.git_delay)
         return {"status": "succeeded", "exit_code": 0, "stdout": self.git_stdout, "stderr": ""}
+
+    async def kimi_run_alive(self, output_file: str, host: str = "") -> bool:
+        self.alive_calls.append({"output_file": output_file, "host": host})
+        if self.alive == "boom":
+            raise RuntimeError("ssh probe exploded")
+        return bool(self.alive)
 
     async def kill_run(self, output_file: str, host: str = "") -> bool:
         self.killed.append({"output_file": output_file, "host": host})
@@ -515,6 +526,73 @@ async def test_our_own_live_session_beats_every_other_verdict(db_pool, _task):
     assert conn.git_calls == []
 
 
+async def _own_session_row(db_pool, *, output_file: str = "", host: str = "meem") -> None:
+    await svc.create_session(db_pool, task_id=_TASK, agent_id="pandoras-actor")
+    if output_file:
+        await svc.set_last_run(db_pool, _TASK, output_file=output_file, host=host)
+
+
+async def test_our_own_session_is_ours_only_while_its_last_turn_still_writes(db_pool, _task):
+    """The aegis branch of rule 1 — an orphan of ours that outlived its kill.
+
+    The registry cannot say so: `_OURS` sits in the task's `-aegis-wt/`
+    worktree, which `normalise_repo` tags `owner="aegis"` whoever is typing in
+    it. What settles it is that the last turn we launched is STILL holding its
+    output file open.
+    """
+    await _own_session_row(db_pool, output_file="/tmp/aegis-kimi-run-r1.jsonl")
+    conn = _Connector(sessions=[_OURS], alive=True)
+    out = await _collision_act(db_pool, conn).check_task_collision(
+        _TASK, "hikmah/aegis", _SESSION_ID, False
+    )
+    assert out["verdict"] == "you_are_in_it"
+    assert out["session"]["owner"] == "aegis"
+    assert conn.alive_calls == [
+        {"output_file": "/tmp/aegis-kimi-run-r1.jsonl", "host": "meem"}
+    ]
+
+
+async def test_a_takeover_in_our_own_worktree_is_a_person_not_an_orphan(db_pool, _task):
+    """The case the whole rule exists for. The footer we post tells the operator
+    to `cd <worktree_path> && claude --resume <id>` — a path containing
+    `-aegis-wt/` — so the registry tags their takeover `owner="aegis"` and the
+    flow would take the orphan path: no Slack note, no watermark bump, and the
+    comment re-dispatched every 15 minutes. A DEAD last-turn output file is what
+    says a person, not a run of ours, is holding this session.
+
+    Falsifiable: return the registry's own `owner` and this fails.
+    """
+    await _own_session_row(db_pool, output_file="/tmp/aegis-kimi-run-r1.jsonl")
+    assert _OURS["owner"] == "aegis", "the registry's tag, which must not decide this"
+    conn = _Connector(sessions=[_OURS], alive=False)
+    out = await _collision_act(db_pool, conn).check_task_collision(
+        _TASK, "hikmah/aegis", _SESSION_ID, False
+    )
+    assert out["verdict"] == "you_are_in_it"
+    assert out["session"]["owner"] == "human"
+
+
+async def test_an_unprobeable_own_session_counts_as_a_person(db_pool, _task):
+    """Two unknowns, both resolved the same way: no turn on record (the row
+    predates the first launch), and a probe that raised. The aegis branch is the
+    harsher one, so unknown must never land there."""
+    await _own_session_row(db_pool)
+    conn = _Connector(sessions=[_OURS], alive=True)
+    out = await _collision_act(db_pool, conn).check_task_collision(
+        _TASK, "hikmah/aegis", _SESSION_ID, False
+    )
+    assert out["session"]["owner"] == "human"
+    assert conn.alive_calls == [], "nothing to probe without a recorded run"
+
+    await svc.set_last_run(db_pool, _TASK, output_file="/tmp/aegis-kimi-run-r1.jsonl", host="meem")
+    broken = _Connector(sessions=[_OURS], alive="boom")
+    out = await _collision_act(db_pool, broken).check_task_collision(
+        _TASK, "hikmah/aegis", _SESSION_ID, False
+    )
+    assert out["verdict"] == "you_are_in_it"
+    assert out["session"]["owner"] == "human"
+
+
 async def test_no_human_session_in_the_repo_proceeds(db_pool, _task):
     conn = _Connector(sessions=[dict(_HUMAN, owner="aegis")], git_stdout=_GIT)
     llm = _LLM(_SAME)
@@ -759,6 +837,35 @@ async def test_launch_pins_the_turn_to_the_tasks_session_and_worktree():
     assert out["error"] == ""
 
 
+async def test_a_running_launch_records_where_the_turn_writes(db_pool, _task):
+    """`check_task_collision` probes this file to tell an orphan of ours from an
+    operator takeover, so a launch that does not record it makes every takeover
+    look like an orphan.
+
+    Falsifiable: drop the `set_last_run` call and both columns stay empty.
+    """
+    await svc.create_session(db_pool, task_id=_TASK, agent_id="pandoras-actor")
+    conn = _Connector()
+    act = AgentTaskActivities(db_pool=db_pool, remote_script=conn)
+    out = await act.launch_task_turn(_SESSION, "investigate", "pandoras-actor", False, "t", 60)
+
+    assert out["status"] == "running"
+    row = await svc.get_session(db_pool, _TASK)
+    assert row["last_output_file"] == "/tmp/aegis-kimi-run-r1.jsonl"
+    assert row["last_host"] == "meem"
+
+
+async def test_a_failed_launch_records_no_run(db_pool, _task):
+    """Nothing is writing, so nothing may claim to be: a stale output file left
+    behind by a failed launch would read as a live orphan on the next turn."""
+    await svc.create_session(db_pool, task_id=_TASK, agent_id="pandoras-actor")
+    act = AgentTaskActivities(db_pool=db_pool, remote_script=_Connector(launch="failed"))
+    await act.launch_task_turn(_SESSION, "p", "pandoras-actor", False, "n", 60)
+
+    row = await svc.get_session(db_pool, _TASK)
+    assert row["last_output_file"] == "" and row["last_host"] == ""
+
+
 async def test_a_later_turn_resumes_the_same_session():
     conn = _Connector()
     await AgentTaskActivities(remote_script=conn).launch_task_turn(
@@ -874,6 +981,7 @@ def test_fake_connector_matches_the_real_signatures():
         "list_coding_sessions",
         "run_on_host",
         "kill_run",
+        "kimi_run_alive",
         "start_kimi_run",
     ):
         real = inspect.signature(getattr(RemoteScriptConnector, name))
