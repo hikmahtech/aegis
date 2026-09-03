@@ -269,10 +269,17 @@ def test_module_workflows_is_the_unflagged_registry():
         # ensure_task_session, check_task_collision, launch_task_turn,
         # kill_task_turn, record_task_turn, find_task_turns_due) on the
         # existing AgentTaskActivities, which is unflagged — so all three rows
-        # move by the same +4.
-        (True, True, 42, 207),
-        (False, False, 34, 177),
-        (True, False, 38, 196),
+        # move by the same +4. Then +1 activity and NO new flow from
+        # `set_task_slack_ref` on the same class: the coding path mirrors every
+        # task message into one Slack thread per task, and this is what
+        # remembers that thread's root on the session row. Then +1 activity and
+        # NO new flow from `cleanup_task_sessions` on the existing
+        # CleanupActivities — the finished-session worktree sweep is a step in
+        # the existing CleanupFlow, and CleanupActivities is unflagged, so it
+        # moves in every row.
+        (True, True, 42, 209),
+        (False, False, 34, 179),
+        (True, False, 38, 198),
     ],
 )
 def test_real_registration_passes_the_boot_check(homelab, money, flows, activities):

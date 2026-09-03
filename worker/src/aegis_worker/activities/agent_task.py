@@ -1242,6 +1242,21 @@ class AgentTaskActivities:
         return {"recorded": bool(moved)}
 
     @activity.defn
+    async def set_task_slack_ref(self, task_id: str, ref: dict) -> dict:
+        """Remember the root of the task's Slack thread.
+
+        Written once, by the first task message that lands — every later
+        message threads under it, and inbound replies are routed back to the
+        task by matching on it. An empty ref is refused rather than stored: it
+        would overwrite a working root with one that matches no thread, which
+        is worse than having none.
+        """
+        if self.db_pool is None or not task_id or not ref:
+            return {"stored": False}
+        await task_sessions.set_slack_ref(self.db_pool, task_id, dict(ref))
+        return {"stored": True}
+
+    @activity.defn
     async def find_task_turns_due(self, limit: int = 20) -> list[dict]:
         """Sessions whose newest USER comment is newer than their last turn.
 

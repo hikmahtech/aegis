@@ -126,6 +126,26 @@ def _budget_for(prompt_without_variable_block: str) -> int:
     )
 
 
+def _thread_root(resp: Any) -> dict | None:
+    """`{"channel", "ts"}` for the message comms just sent, or None.
+
+    Three shapes are accepted because `SendResult.to_response()` emits more
+    than one: `delivery_ref` spreads the ref's `data` flat alongside `adapter`,
+    a `data` sub-object is the documented nesting, and the same keys are
+    mirrored at the top level for older dispatch logging. A non-Slack adapter
+    carries neither key and correctly yields None — there is no thread to open.
+    """
+    if not isinstance(resp, dict):
+        return None
+    ref = resp.get("delivery_ref")
+    ref = ref if isinstance(ref, dict) else {}
+    nested = ref.get("data")
+    for src in (nested if isinstance(nested, dict) else None, ref, resp):
+        if isinstance(src, dict) and src.get("channel") and src.get("ts"):
+            return {"channel": str(src["channel"]), "ts": str(src["ts"])}
+    return None
+
+
 def _status_line(text: str) -> str:
     """The turn's own `STATUS: <verdict>` line, or `""` when it did not emit one.
 
@@ -757,12 +777,21 @@ class AgentTaskFlow:
         status: str = "parked",
         comment: str | None = None,
         agent_id: str | None = None,
+        sess: dict | None = None,
+        title: str = "",
         **extra: Any,
     ) -> dict:
         """Shared tail for every _run_coding exit: an optional explanation
         comment, then park_task, then the terminal result dict. Every
         _run_coding branch parks — a coding task never auto-completes; even
-        an opened PR still needs human review."""
+        an opened PR still needs human review.
+
+        `sess` opts the comment into the task's Slack thread. It is a separate
+        argument rather than something read off the flow because the branches
+        that exit before a session is resolved still have a comment worth
+        mirroring — and because a comment nobody passes a session for is one
+        this tail must not try to deliver.
+        """
         if comment is not None:
             await workflow.execute_activity(
                 "comment",
@@ -770,6 +799,8 @@ class AgentTaskFlow:
                 start_to_close_timeout=TIMEOUT_STANDARD,
                 retry_policy=NO_RETRY,
             )
+            if sess is not None:
+                await self._mirror_to_thread(task_id, str(agent_id or ""), sess, comment, title)
         await workflow.execute_activity(
             "park_task",
             args=[task_id, reason],
@@ -814,18 +845,76 @@ class AgentTaskFlow:
                 "task_turn_not_counted task_id=%s err=%s", task_id, str(exc)[:200]
             )
 
-    async def _deliver(self, agent_id: str, text: str) -> None:
-        """Send to the agent's bound channel; never fail the flow over it."""
+    async def _deliver(
+        self,
+        agent_id: str,
+        text: str,
+        thread_ref: dict | None = None,
+        thread_overflow: bool = False,
+    ) -> dict | None:
+        """Send to the agent's bound channel; never fail the flow over it.
+
+        Returns the comms response — which carries the sent message's ref — or
+        None when the send failed, so a caller opening a thread can tell "no
+        root came back" from "there is a root".
+
+        `thread_overflow` marks a task message: a turn's output is far longer
+        than Slack's chunk limit, so without it a message that OPENS a thread
+        finishes as loose posts in the channel, and a reply under one of those
+        is not recognised as the task's.
+        """
         try:
-            await workflow.execute_activity_method(
+            return await workflow.execute_activity_method(
                 DeliveryActivities.send_message,
-                args=[agent_id, text],
+                args=[agent_id, text, 0, thread_ref, thread_overflow],
                 start_to_close_timeout=TIMEOUT_FAST,
                 retry_policy=STANDARD,
             )
         except Exception as exc:  # noqa: BLE001
             workflow.logger.warning(
                 "agent_task_delivery_failed agent=%s err=%s", agent_id, str(exc)[:200]
+            )
+            return None
+
+    async def _mirror_to_thread(
+        self, task_id: str, agent_id: str, sess: dict, text: str, title: str = ""
+    ) -> None:
+        """Mirror one task message into the task's Slack thread.
+
+        Todoist is where a task message is RECORDED; the thread is where the
+        operator reads it and answers, and an answer typed in the thread comes
+        back as the next turn's comment. So every comment the coding path
+        writes goes through here.
+
+        The first message for a task has no root to post under, so it becomes
+        one: it leads with the task id and title, and the ref comms hands back
+        is stored on the session row AND on `sess`, so the rest of this loop
+        threads without waiting for the next re-read of the row.
+
+        Best-effort throughout. The comment is already posted by the time this
+        runs, and a comms outage must cost the notification, never the turn.
+        """
+        ref = sess.get("slack_ref") if isinstance(sess.get("slack_ref"), dict) else None
+        header = f"Task {task_id}: {title}".strip()
+        body = text if ref else f"{header}\n\n{text}"
+
+        resp = await self._deliver(agent_id, body, ref, thread_overflow=True)
+        if ref is not None:
+            return
+        root = _thread_root(resp)
+        if root is None:
+            return
+        sess["slack_ref"] = root
+        try:
+            await workflow.execute_activity(
+                "set_task_slack_ref",
+                args=[task_id, root],
+                start_to_close_timeout=TIMEOUT_FAST,
+                retry_policy=ACT_RETRY,
+            )
+        except Exception as exc:  # noqa: BLE001
+            workflow.logger.warning(
+                "task_slack_ref_not_stored task_id=%s err=%s", task_id, str(exc)[:200]
             )
 
     async def _run_coding(self, input: AgentTaskFlowInput, task_id: str, task: dict) -> dict:
@@ -904,6 +993,8 @@ class AgentTaskFlow:
                     comment="I can't tell which repository this is about. Reply with "
                     f"one of: {names}",
                     agent_id=agent_id,
+                    sess=ensured.get("session") or {},
+                    title=title,
                     turns=turns_run,
                 )
             if status != "ready" or not ensured.get("session"):
@@ -918,6 +1009,8 @@ class AgentTaskFlow:
                     + (f": {error}" if error else "")
                     + ", so I haven't touched anything.",
                     agent_id=agent_id,
+                    sess=ensured.get("session") or {},
+                    title=title,
                     turns=turns_run,
                 )
             session = ensured["session"]
@@ -961,10 +1054,17 @@ class AgentTaskFlow:
                 # somebody is actively working. The watermark DOES move: the
                 # comment has been delivered, just not by us.
                 await self._record_turn(task_id, False)
+                # Into the task's thread when it has one, the agent channel
+                # otherwise. Never opens a thread: this is a note ABOUT the
+                # task, and a root nobody replies under is a dead thread.
+                existing = session.get("slack_ref")
+                root = existing if isinstance(existing, dict) else None
                 await self._deliver(
                     agent_id,
                     f"You're in the session for task {task_id} ('{name}'); "
                     "your comment is waiting for you there.",
+                    root,
+                    thread_overflow=root is not None,
                 )
                 return {"task_id": task_id, "verb": "coding", "status": "operator_in_session"}
 
@@ -981,6 +1081,8 @@ class AgentTaskFlow:
                     + (f" on branch `{branch}`" if branch else "")
                     + ". I'll stay out. Reply `take over` when you want me to proceed.",
                     agent_id=agent_id,
+                    sess=session,
+                    title=title,
                     turns=turns_run,
                 )
 
@@ -1028,6 +1130,8 @@ class AgentTaskFlow:
                     comment="I couldn't start a turn on this: "
                     f"{launched.get('error') or 'unknown error'}",
                     agent_id=agent_id,
+                    sess=session,
+                    title=title,
                     turns=turns_run,
                 )
             # Counted only now that a session demonstrably exists. Counting it
@@ -1093,6 +1197,10 @@ class AgentTaskFlow:
                 start_to_close_timeout=TIMEOUT_STANDARD,
                 retry_policy=NO_RETRY,
             )
+            # No `_step` marker: this cannot be the step a failure is reported
+            # at (it swallows everything), and leaving one behind would
+            # misattribute the next thing that does fail.
+            await self._mirror_to_thread(task_id, agent_id, session, body, title)
             turns_run += 1
 
             comments = self._drain()

@@ -226,6 +226,10 @@ async def main():
         db_pool=deps.pool,
         comms_url=settings.comms_url,
         api_key=settings.api_key,
+        # `cleanup_task_sessions` removes the finished sessions' worktrees on
+        # the coding host; without the connector it only prunes rows that have
+        # no worktree, and leaves the rest for the next run.
+        remote_script=connectors.get("remote_script"),
     )
     interaction_act = InteractionActivities(db_pool=deps.pool)
     run_recorder_act = RunRecorderActivities(db_pool=deps.pool)

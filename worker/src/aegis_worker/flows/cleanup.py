@@ -76,6 +76,10 @@ class CleanupConfig:
     # telegram_message_id) get channel-deleted via the comms adapter before the
     # DB row is dropped. Set to 0 to skip channel cleanup (DB prune still runs).
     dispatch_days: int = 30
+    # Release the git worktree of a coding session whose task is completed or
+    # gone and which has been idle this many days. The branch stays — it may
+    # back an open PR. Set to 0 to disable.
+    task_session_days: int = 7
 
 
 @workflow.defn
@@ -146,5 +150,25 @@ class CleanupFlow:
                     "orphan_interaction_sweep_failed error=%s", str(exc)[:200]
                 )
                 result["interactions_archived"] = -1
+
+        # Janitor: release the git worktrees of coding sessions whose task is
+        # finished. Nothing else on the coding host ever removes them, so
+        # skipping this leaves one checkout per @code task there forever.
+        # Independent of the sweeps above for the same reason they are of each
+        # other — a failure earlier must not silently stop disk being freed.
+        if config.task_session_days > 0:
+            try:
+                session_result = await workflow.execute_activity_method(
+                    CleanupActivities.cleanup_task_sessions,
+                    args=[config.task_session_days],
+                    start_to_close_timeout=TIMEOUT_LONG,
+                    retry_policy=NO_RETRY,
+                )
+                result["task_sessions"] = session_result
+            except Exception as exc:
+                workflow.logger.error(
+                    "task_session_sweep_failed error=%s", str(exc)[:200]
+                )
+                result["task_sessions"] = {"status": "failed"}
 
         return result

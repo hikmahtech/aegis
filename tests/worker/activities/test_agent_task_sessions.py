@@ -321,6 +321,38 @@ async def test_record_task_turn_without_a_pool_reports_not_recorded():
     }
 
 
+# --- set_task_slack_ref ------------------------------------------------------
+
+
+async def test_set_task_slack_ref_remembers_the_thread_root(db_pool, _task):
+    """Stored as a jsonb OBJECT, not a JSON string. Every later message posts
+    under `slack_ref->>'ts'` and inbound routing matches on it, so a
+    double-encoded value would silently open a fresh thread on every turn and
+    lose the reply route with it."""
+    await svc.create_session(db_pool, task_id=_TASK, agent_id="pandoras-actor")
+    act = AgentTaskActivities(db_pool=db_pool)
+
+    assert await act.set_task_slack_ref(_TASK, {"channel": "C1", "ts": "1.1"}) == {"stored": True}
+    assert (await svc.get_session(db_pool, _TASK))["slack_ref"] == {"channel": "C1", "ts": "1.1"}
+
+
+async def test_set_task_slack_ref_refuses_an_empty_ref(db_pool, _task):
+    """An empty ref would overwrite a real root with one that matches no
+    thread — worse than never storing one."""
+    await svc.create_session(db_pool, task_id=_TASK, agent_id="pandoras-actor")
+    act = AgentTaskActivities(db_pool=db_pool)
+    await act.set_task_slack_ref(_TASK, {"channel": "C1", "ts": "1.1"})
+
+    assert await act.set_task_slack_ref(_TASK, {}) == {"stored": False}
+    assert (await svc.get_session(db_pool, _TASK))["slack_ref"] == {"channel": "C1", "ts": "1.1"}
+
+
+async def test_set_task_slack_ref_without_a_pool_stores_nothing():
+    assert await AgentTaskActivities(db_pool=None).set_task_slack_ref(
+        _TASK, {"channel": "C1", "ts": "1.1"}
+    ) == {"stored": False}
+
+
 # --- ensure_task_session -----------------------------------------------------
 
 

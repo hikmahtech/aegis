@@ -950,3 +950,223 @@ async def test_chat_reports_transport_failure():
 
     assert "Could not reach Core API" in result["response"]
     assert "no route" in result["response"]
+
+
+# --- task threads: a reply inside a task's thread becomes a Todoist note -----
+
+
+async def test_thread_reply_on_task_thread_comments_and_skips_chat():
+    """A reply under a task thread's root is the task's next turn, not chat."""
+    inbound, core, adapter = _inbound()
+    core.task_by_thread.return_value = "T-1"
+    core.task_comment.return_value = True
+
+    await inbound.on_message(
+        channel_id="CSEBAS",
+        text="use the staging bucket",
+        user_id="UME",
+        ts="200.2",
+        thread_ts="100.1",
+    )
+
+    core.task_by_thread.assert_awaited_once_with("CSEBAS", "100.1")
+    core.task_comment.assert_awaited_once_with("T-1", "use the staging bucket")
+    # The reply belongs to the task, so nothing is routed to an agent.
+    core.chat.assert_not_awaited()
+    core.agent_reply_trigger.assert_not_awaited()
+    adapter.send_message.assert_not_awaited()
+
+
+async def test_thread_reply_comment_rejected_posts_apology_in_thread():
+    """`ok: false` (Todoist rejected the note) must not vanish silently."""
+    inbound, core, adapter = _inbound()
+    core.task_by_thread.return_value = "T-1"
+    core.task_comment.return_value = False
+
+    await inbound.on_message(
+        channel_id="CSEBAS", text="retry that", user_id="UME", ts="200.2", thread_ts="100.1"
+    )
+
+    adapter.post_thread.assert_awaited_once()
+    tkw = adapter.post_thread.await_args.kwargs
+    assert tkw["ref"] == DeliveryRef("slack", {"channel": "CSEBAS", "ts": "100.1"})
+    assert "try again" in tkw["text"].lower()
+    # Still no chat routing — the thread is a task thread either way.
+    core.chat.assert_not_awaited()
+
+
+async def test_a_failing_apology_does_not_escape_the_message_handler():
+    """Two failures in a row — Core rejected the note, then Slack refused the
+    apology — must not take the message handler down with them.
+
+    The handler has already claimed this reply by returning True, so an escaping
+    exception buys nothing and costs the bolt listener.
+
+    Falsifiable: drop the try/except around `post_thread` and this raises.
+    """
+    inbound, core, adapter = _inbound()
+    core.task_by_thread.return_value = "T-1"
+    core.task_comment.return_value = False
+    adapter.post_thread.side_effect = RuntimeError("slack is down")
+
+    await inbound.on_message(
+        channel_id="CSEBAS", text="retry that", user_id="UME", ts="200.2", thread_ts="100.1"
+    )
+
+    adapter.post_thread.assert_awaited_once()
+    # The reply is still the task's, not chat's.
+    core.chat.assert_not_awaited()
+
+
+async def test_thread_reply_success_posts_no_apology():
+    inbound, core, adapter = _inbound()
+    core.task_by_thread.return_value = "T-1"
+    core.task_comment.return_value = True
+
+    await inbound.on_message(
+        channel_id="CSEBAS", text="ok", user_id="UME", ts="200.2", thread_ts="100.1"
+    )
+
+    adapter.post_thread.assert_not_awaited()
+
+
+async def test_thread_reply_on_unknown_thread_routes_normally():
+    """Most Slack threads are not task threads — routing is unchanged."""
+    inbound, core, adapter = _inbound()
+    core.task_by_thread.return_value = None
+    core.chat.return_value = {"response": "hi back", "assistant_message_id": None}
+    adapter.send_message.return_value = SendResult(ok=True, ref=None, used_html=False)
+
+    await inbound.on_message(
+        channel_id="CSEBAS", text="hello", user_id="UME", ts="200.2", thread_ts="100.1"
+    )
+
+    core.task_by_thread.assert_awaited_once_with("CSEBAS", "100.1")
+    core.task_comment.assert_not_awaited()
+    core.chat.assert_awaited_once()
+    assert core.chat.await_args.kwargs["message"] == "hello"
+
+
+async def test_top_level_message_never_looks_up_a_thread():
+    """Slack sets thread_ts == ts on a thread ROOT; that is not a reply."""
+    inbound, core, adapter = _inbound()
+    core.chat.return_value = {"response": "hi back", "assistant_message_id": None}
+    adapter.send_message.return_value = SendResult(ok=True, ref=None, used_html=False)
+
+    await inbound.on_message(
+        channel_id="CSEBAS", text="hello", user_id="UME", ts="100.1", thread_ts="100.1"
+    )
+
+    core.task_by_thread.assert_not_awaited()
+    core.chat.assert_awaited_once()
+
+
+async def test_message_without_thread_ts_never_looks_up_a_thread():
+    inbound, core, adapter = _inbound()
+    core.chat.return_value = {"response": "hi back", "assistant_message_id": None}
+    adapter.send_message.return_value = SendResult(ok=True, ref=None, used_html=False)
+
+    await inbound.on_message(channel_id="CSEBAS", text="hello", user_id="UME", ts="100.1")
+
+    core.task_by_thread.assert_not_awaited()
+    core.chat.assert_awaited_once()
+
+
+async def test_task_thread_reply_wins_over_note_to_self():
+    """In the note-to-self channel a threaded reply is still the task's turn."""
+    core = AsyncMock()
+    adapter = AsyncMock()
+    inbound = SlackInbound(
+        adapter=adapter,
+        core=core,
+        channel_agent_map={},
+        bot_user_id="U0BOT",
+        owner_member_id="UOWNER",
+        note_to_self_channel="CNOTES",
+    )
+    core.task_by_thread.return_value = "T-1"
+    core.task_comment.return_value = True
+
+    await inbound.on_message(
+        channel_id="CNOTES",
+        text="the retry limit is 3",
+        user_id="UOWNER",
+        ts="200.2",
+        thread_ts="100.1",
+    )
+
+    core.task_comment.assert_awaited_once_with("T-1", "the retry limit is 3")
+    core.knowledge_ingest.assert_not_awaited()
+
+
+# --- SlackCoreClient task-thread calls --------------------------------------
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_task_by_thread_urlencodes_the_query():
+    core = SlackCoreClient(_settings())
+    route = respx.get("http://core/api/admin/task-sessions/by-thread").mock(
+        return_value=httpx.Response(200, json={"task_id": "T-7"})
+    )
+
+    assert await core.task_by_thread("C 1", "100.1") == "T-7"
+
+    assert route.called
+    params = route.calls.last.request.url.params
+    assert params["channel"] == "C 1"
+    assert params["ts"] == "100.1"
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_task_by_thread_returns_none_on_miss():
+    core = SlackCoreClient(_settings())
+    respx.get("http://core/api/admin/task-sessions/by-thread").mock(
+        return_value=httpx.Response(200, json={"task_id": None})
+    )
+    assert await core.task_by_thread("C1", "100.1") is None
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_task_by_thread_returns_none_when_core_fails():
+    core = SlackCoreClient(_settings())
+    respx.get("http://core/api/admin/task-sessions/by-thread").mock(
+        side_effect=httpx.ConnectError("no route")
+    )
+    assert await core.task_by_thread("C1", "100.1") is None
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_task_comment_posts_the_text_verbatim():
+    core = SlackCoreClient(_settings())
+    route = respx.post("http://core/api/admin/tasks/T-7/comment").mock(
+        return_value=httpx.Response(200, json={"ok": True, "task_id": "T-7"})
+    )
+
+    assert await core.task_comment("T-7", "use the staging bucket") is True
+    assert json.loads(route.calls.last.request.content) == {"text": "use the staging bucket"}
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_task_comment_is_false_when_core_says_not_ok():
+    """The route answers 200 with ok=false when Todoist rejects the note, so a
+    non-None body must NOT be read as success."""
+    core = SlackCoreClient(_settings())
+    respx.post("http://core/api/admin/tasks/T-7/comment").mock(
+        return_value=httpx.Response(200, json={"ok": False, "task_id": "T-7"})
+    )
+    assert await core.task_comment("T-7", "nope") is False
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_task_comment_is_false_on_404():
+    core = SlackCoreClient(_settings())
+    respx.post("http://core/api/admin/tasks/T-7/comment").mock(
+        return_value=httpx.Response(404, json={"detail": "no task session for T-7"})
+    )
+    assert await core.task_comment("T-7", "nope") is False

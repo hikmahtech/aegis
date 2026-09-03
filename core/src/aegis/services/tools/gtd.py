@@ -651,6 +651,66 @@ async def _exec_handoff_task(
     return f"Handed off {task_id} to {to_assignee}"
 
 
+# Todoist's own ceiling on a comment body. Over it the Sync API rejects the
+# whole command, so we refuse first — with the length in the message, so the
+# caller can split — rather than truncate: this tool's entire contract is that
+# what it posts is what the user wrote. Measured on the raw text for the same
+# reason the raw text is what gets posted: the number in the refusal has to
+# describe the thing that would have been sent.
+_COMMENT_MAX_CHARS = 15_000
+
+
+@aegis_tool
+async def _exec_comment_on_task(
+    pool: asyncpg.Pool, ctx: ToolContext, *, task_id: str, text: str
+) -> str:
+    """Post a comment in your own voice on a Todoist task that has a coding
+    session, starting that session's next turn. Refused on any other task.
+
+    Args:
+        task_id: the Todoist task id.
+        text: the comment, posted verbatim.
+    """
+    from aegis.config import Settings
+    from aegis.connectors.todoist import TodoistConnector
+    from aegis.services.task_sessions import get_session
+
+    task_id = (task_id or "").strip()
+    body = text or ""
+    if not task_id or not body.strip():
+        return "Refused: task_id and text required"
+    if len(body) > _COMMENT_MAX_CHARS:
+        return f"Refused: text is {len(body)} chars, over Todoist's {_COMMENT_MAX_CHARS} limit"
+    # Footer-less by design, so on a task with a coding session the note reads
+    # as the user's and starts the next turn. On a task WITHOUT one there is no
+    # turn to start and the same note is just an undecorated comment sitting in
+    # the thread — which ClarifyFlow then reads back as fresh user input and
+    # grades itself on (#353). So the guard is the tool's scope, not a nicety:
+    # this tool drives task sessions and nothing else.
+    if await get_session(pool, task_id) is None:
+        return (
+            f"Refused: task {task_id} has no coding session — "
+            "comment_on_task only drives task sessions"
+        )
+    settings = Settings()
+    _tk = await resolve_todoist_api_key(pool, settings)
+    if not _tk:
+        return "Todoist not configured"
+    connector = TodoistConnector(api_key=_tk, db_pool=pool, timeout=10.0)
+    # `body` is the caller's string unchanged — not stripped, not wrapped. No
+    # prefix and no `Workflow run:` footer either: those are what
+    # `services/task_sessions.is_user_note` reads to tell AEGIS's own notes from
+    # the user's, and only a user note starts the task session's next turn. The
+    # stripped copy above exists solely to reject a whitespace-only comment.
+    cmd = TodoistConnector.build_note_add_command(task_id, body)
+    result = await connector.commands([cmd])
+    status = TodoistConnector.check_sync_status(result, [cmd["uuid"]])
+    fail_msg = await _stage_chat_tool_outbox(pool, [cmd], status, "comment_on_task")
+    if fail_msg is not None:
+        return fail_msg
+    return f"Commented on {task_id}"
+
+
 @aegis_tool
 async def _exec_find_reference(
     pool: asyncpg.Pool, ctx: ToolContext, *, query: str, limit: int = 10

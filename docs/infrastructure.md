@@ -499,6 +499,39 @@ the run as failed, and cleans up the worktree — so there is no half-stopped
 state. "No live tmux window" is a normal answer: the run may have finished, or
 have been launched detached past the tmux window cap.
 
+### Task sessions (comment-driven coding)
+
+A `@code` Todoist task gets one persistent Claude Code session in its own git
+worktree, driven by comments on the task. Three places configure it, none of
+them code:
+
+- **Coding block** on the coding-host infra entry: **Default engine** `claude`
+  (`routing.default_engine`) and a **Default Claude account**
+  (`engines.claude.default_account`). A turn resumes a session by id, which
+  only works when every turn lands on the same engine and the same login.
+- **`activities.config` for `agent-task-15min`** — `max_coding` (default 3),
+  the ceiling on coding turns started per sweep, new and resumed together; and
+  `turn_timeout_minutes` (default 60), after which a turn is killed and
+  reported.
+- **`activities.config` for `cleanup-daily`** — `task_session_days` (default
+  7). A session whose task is completed or gone, and idle that long, has its
+  worktree removed and its row deleted by `CleanupFlow`. The branch stays; it
+  may back an open PR. Set to 0 to disable.
+
+Optionally grant the `comment_on_task` tool. A turn does **not** need it — a
+turn's own reply is posted by the flow's `comment` activity, and the tool is
+deliberately withheld from run mounts so a run cannot comment its way into
+triggering its own next turn. It is for **you and the chat agents**: it posts a
+note in your voice on a task that already has a coding session, which is what
+starts that session's next turn. It refuses any task without one.
+
+Grant it to every active agent whose tool set is an array — an agent with no
+`tool_set`, or one holding anything else, is left alone:
+
+```sql
+UPDATE agents SET metadata = jsonb_set(metadata,'{tool_set}',(metadata->'tool_set')||'["comment_on_task"]'::jsonb) WHERE active AND jsonb_typeof(metadata->'tool_set') = 'array' AND NOT (metadata->'tool_set' @> '["comment_on_task"]'::jsonb);
+```
+
 ### Verify the coding host
 
 Drive the live connector from inside the running worker — it uses the same
