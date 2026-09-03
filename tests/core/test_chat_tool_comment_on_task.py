@@ -61,6 +61,23 @@ async def test_posts_one_note_add_with_the_text_verbatim(db_pool) -> None:
 
 
 @pytest.mark.asyncio
+async def test_whitespace_and_newlines_survive_byte_for_byte(db_pool) -> None:
+    """Verbatim means the caller's exact string, whitespace included.
+
+    A Markdown code block, an indented diff, a deliberate blank first line: all
+    of them are content, and a `.strip()` on the way out would quietly rewrite
+    the comment the operator typed. The only stripping this tool does is on a
+    throwaway copy, to decide whether the comment is empty.
+    """
+    sent: list[list[dict]] = []
+    padded = "\n  leading spaces\n\n\tinner tab\n\ntrailing newlines\n\n"
+
+    await _call(db_pool, sent, task_id="T_CMT", text=padded)
+
+    assert sent[0][0]["args"]["content"] == padded
+
+
+@pytest.mark.asyncio
 async def test_the_posted_text_reads_as_a_user_note(db_pool) -> None:
     """The turn trigger, asserted through the predicate that decides it."""
     sent: list[list[dict]] = []

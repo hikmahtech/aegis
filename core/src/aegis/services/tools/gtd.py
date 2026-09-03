@@ -654,7 +654,9 @@ async def _exec_handoff_task(
 # Todoist's own ceiling on a comment body. Over it the Sync API rejects the
 # whole command, so we refuse first — with the length in the message, so the
 # caller can split — rather than truncate: this tool's entire contract is that
-# what it posts is what the user wrote.
+# what it posts is what the user wrote. Measured on the raw text for the same
+# reason the raw text is what gets posted: the number in the refusal has to
+# describe the thing that would have been sent.
 _COMMENT_MAX_CHARS = 15_000
 
 
@@ -673,8 +675,8 @@ async def _exec_comment_on_task(
     from aegis.connectors.todoist import TodoistConnector
 
     task_id = (task_id or "").strip()
-    body = (text or "").strip()
-    if not task_id or not body:
+    body = text or ""
+    if not task_id or not body.strip():
         return "Refused: task_id and text required"
     if len(body) > _COMMENT_MAX_CHARS:
         return f"Refused: text is {len(body)} chars, over Todoist's {_COMMENT_MAX_CHARS} limit"
@@ -683,9 +685,11 @@ async def _exec_comment_on_task(
     if not _tk:
         return "Todoist not configured"
     connector = TodoistConnector(api_key=_tk, db_pool=pool, timeout=10.0)
-    # No prefix and no `Workflow run:` footer, deliberately: those are what
+    # `body` is the caller's string unchanged — not stripped, not wrapped. No
+    # prefix and no `Workflow run:` footer either: those are what
     # `services/task_sessions.is_user_note` reads to tell AEGIS's own notes from
-    # the user's, and only a user note starts the task session's next turn.
+    # the user's, and only a user note starts the task session's next turn. The
+    # stripped copy above exists solely to reject a whitespace-only comment.
     cmd = TodoistConnector.build_note_add_command(task_id, body)
     result = await connector.commands([cmd])
     status = TodoistConnector.check_sync_status(result, [cmd["uuid"]])
