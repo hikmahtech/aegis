@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any
 
 from aegis.llm import LLMTruncationError, parse_llm_json
+from aegis.services.email_rules import get_email_rules
 from aegis.services.meeting_rules import get_meeting_rules, is_self
 from aegis.services.meeting_rules import merge as merge_meeting_rules
 from aegis.services.observations import record_external_observation
@@ -593,6 +594,72 @@ class MeetingActivities:
         if updated is None:
             activity.logger.warning("meeting_outcome_no_row content_id=%s", content_id)
         return {"recorded": updated is not None}
+
+    @activity.defn
+    async def meeting_sender_addresses(self) -> list[str]:
+        """Whose mail MeetingSweepFlow sweeps — derived, never configured twice.
+
+        The `meeting` tag on a `sender_overrides` rule is already what makes the
+        hourly path fan out to MeetingNotesFlow. Reading the same rules here
+        keeps one switch for both paths: adding a note-taker stays a single rule
+        on the Email triage page, no vendor name reaches this code, and an
+        install where nothing carries the tag sweeps nobody.
+
+        A domain key loses its leading `@` — Gmail's `from:` term wants
+        `example.com`, not `@example.com`. Never raises: a config read must not
+        be what stops the sweep, and an empty list is a clean no-op.
+        """
+        if not self.db_pool:
+            return []
+        try:
+            rules = await get_email_rules(self.db_pool)
+        except Exception as exc:  # noqa: BLE001 — see the docstring
+            activity.logger.warning("meeting_senders_load_failed err=%s", str(exc)[:200])
+            return []
+        addrs = {
+            key.lstrip("@")
+            for key, rule in (rules.get("sender_overrides") or {}).items()
+            if "meeting" in ((rule or {}).get("tags") or []) and key.lstrip("@")
+        }
+        return sorted(addrs)
+
+    @activity.defn
+    async def unstored_meeting_messages(self, message_ids: list[str]) -> list[str]:
+        """Of `message_ids`, the ones with no `meeting` row — in input order.
+
+        One `= ANY($1)` over the ids, never a query per message. Only
+        `source_type='meeting'` counts: the `meeting_review` row filed under the
+        same message is the review, not the notes, and the hourly path's `email`
+        copy is not the notes either.
+
+        Fails CLOSED — no pool or a dead one returns `[]`, not the whole input.
+        "I cannot tell what is already filed" must never become "file all of
+        it": that would re-ingest and re-review every meeting in the window on
+        every run. Losing one cycle is the cheaper failure, and the next run
+        recovers it.
+        """
+        ids: list[str] = []
+        for raw in message_ids or []:
+            mid = str(raw).strip()
+            if mid and mid not in ids:
+                ids.append(mid)
+        if not ids:
+            return []
+        if not self.db_pool:
+            activity.logger.warning("meeting_unstored_no_pool count=%d", len(ids))
+            return []
+        try:
+            async with self.db_pool.acquire() as conn:
+                rows = await conn.fetch(
+                    "SELECT metadata->>'message_id' AS message_id FROM knowledge_content "
+                    "WHERE source_type = 'meeting' AND metadata->>'message_id' = ANY($1::text[])",
+                    ids,
+                )
+        except Exception as exc:  # noqa: BLE001 — see the docstring
+            activity.logger.warning("meeting_unstored_failed err=%s", str(exc)[:200])
+            return []
+        stored = {r["message_id"] for r in rows}
+        return [mid for mid in ids if mid not in stored]
 
     async def _record_observations(self, doc: dict, stats: dict) -> int:
         """One row per metric, deduped on (source, metric, external_id).
