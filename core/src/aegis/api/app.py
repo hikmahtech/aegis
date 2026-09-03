@@ -282,6 +282,7 @@ def create_app(run_lifespan: bool = True, settings: Settings | None = None) -> F
         slack,
         social_auth,
         system_status,
+        task_sessions,
         temporal,
         todoist,
         webhooks,
@@ -364,6 +365,7 @@ def create_app(run_lifespan: bool = True, settings: Settings | None = None) -> F
     app.include_router(expiring_items_admin.router)
     app.include_router(assets_admin.router)
     app.include_router(todoist.router)
+    app.include_router(task_sessions.router)
 
     # Serve admin panel SPA (static files from built frontend)
     # Try multiple locations: env override, Docker (/app/admin-panel/...) and local dev.
