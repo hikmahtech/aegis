@@ -110,13 +110,32 @@ class DeliveryActivities:
         return self._client
 
     @activity.defn
-    async def send_message(self, agent_id: str, message: str, chat_id: int = 0) -> dict:
-        """Send a message to an agent's channel."""
+    async def send_message(
+        self,
+        agent_id: str,
+        message: str,
+        chat_id: int = 0,
+        thread_ref: dict | None = None,
+    ) -> dict:
+        """Send a message to an agent's channel.
+
+        `thread_ref` is the ROOT of an existing thread (`{"channel", "ts"}`) —
+        comms posts under it when given and to the channel when not. Omitted
+        from the body entirely when there is no thread, so the request stays
+        the shape it has always been on every non-threaded call site.
+
+        The comms response is returned UNCHANGED because it carries
+        `delivery_ref`, the ref of the message just sent: that is what a caller
+        opening a thread stores as its root, and there is no second way to get
+        it back.
+        """
         if not self.comms_url:
             activity.logger.warning("comms_url_not_configured")
             return {"ok": False, "error": "comms_url not configured"}
 
         body: dict = {"text": message, "agent_id": agent_id}
+        if thread_ref:
+            body["thread_ref"] = thread_ref
 
         client = self._ensure_client()
         resp = await client.post("/api/deliver/message", json=body)

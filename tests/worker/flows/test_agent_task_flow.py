@@ -402,15 +402,23 @@ def _exit_case_activities(events: list, case: _ExitCase):
         return {"killed": True}
 
     @activity.defn(name="send_message")
-    async def send_message(agent_id: str, message: str, chat_id: int = 0) -> dict:
+    async def send_message(
+        agent_id: str, message: str, chat_id: int = 0, thread_ref: dict | None = None
+    ) -> dict:
         events.append(("slack", message))
         return {"ok": True}
+
+    @activity.defn(name="set_task_slack_ref")
+    async def set_task_slack_ref(task_id: str, ref: dict) -> dict:
+        events.append(("slack_ref", ref))
+        return {"stored": True}
 
     return [
         load_task, load_task_context, comment, park_task, complete_task,
         service_health, service_logs, triage_email, merchant_history,
         ensure_task_session, check_task_collision, record_task_turn,
         launch_task_turn, check_agent_run, kill_task_turn, send_message,
+        set_task_slack_ref,
     ]
 
 

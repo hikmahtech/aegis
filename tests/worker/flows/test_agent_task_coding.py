@@ -33,6 +33,7 @@ with workflow.unsafe.imports_passed_through():
         _later_turn_prompt,
         _render_thread,
         _status_line,
+        _thread_root,
     )
     from aegis_worker.shared.retry import TIMEOUT_LLM, TIMEOUT_LONG, TIMEOUT_STANDARD
 
@@ -59,7 +60,8 @@ _SESSION = {
     "worktree_path": "/srv/repos/bcp-aegis-wt/task-tc-1",
     "branch": "aegis-task/tc-1",
     "host": "node-a",
-    "slack_ref": "",
+    # jsonb: a dict once the task's Slack thread has a root, NULL until then.
+    "slack_ref": None,
     "turns": 0,
     "last_turn_at": "",
     "created_at": "2026-09-01T09:00:00+00:00",
@@ -82,6 +84,8 @@ def _activities(
     ensure_raises: bool = False,
     collision: dict | None = None,
     launch_result: dict | None = None,
+    slack_ref: dict | None = None,
+    slack_raises: bool = False,
     never_exits: bool = False,
     timeout_tail: str = "",
     seen_first_ensure: asyncio.Event | None = None,
@@ -98,7 +102,7 @@ def _activities(
     # `turns` is the session's own watermark: record_task_turn(launched=True)
     # bumps it, which is what makes the NEXT ensure_task_session return a
     # session the flow must RESUME rather than create.
-    state = {"turns": 0, "polls": 0, "killed": False}
+    state = {"turns": 0, "polls": 0, "killed": False, "slack_ref": slack_ref}
 
     @activity.defn(name="load_task")
     async def load_task(task_id: str) -> dict:
@@ -124,7 +128,14 @@ def _activities(
             return ensure_result
         return {
             "status": "ready",
-            "session": dict(_SESSION, task_id=task_id, turns=state["turns"]),
+            # Re-read every turn in production, so a root stored by an earlier
+            # turn comes back on the row rather than living in flow memory.
+            "session": dict(
+                _SESSION,
+                task_id=task_id,
+                turns=state["turns"],
+                slack_ref=state["slack_ref"],
+            ),
             "candidates": [],
             "error": "",
         }
@@ -204,9 +215,30 @@ def _activities(
         return {"parked": True}
 
     @activity.defn(name="send_message")
-    async def send_message(agent_id: str, message: str, chat_id: int = 0) -> dict:
+    async def send_message(
+        agent_id: str, message: str, chat_id: int = 0, thread_ref: dict | None = None
+    ) -> dict:
         events.append(("slack", message))
-        return {"ok": True}
+        # Recorded as its own event so `_bodies(events, "thread")[i]` pairs
+        # with `_bodies(events, "slack")[i]` without changing the payload
+        # shape every existing assertion here reads.
+        events.append(("thread", thread_ref))
+        if slack_raises:
+            raise RuntimeError("comms is down")
+        # The real response shape: `SendResult.to_response()` spreads the ref's
+        # data over `delivery_ref` AND mirrors it at the top level.
+        return {
+            "ok": True,
+            "delivery_ref": {"adapter": "slack", "data": {"channel": "C1", "ts": "1.1"}},
+            "channel": "C1",
+            "ts": "1.1",
+        }
+
+    @activity.defn(name="set_task_slack_ref")
+    async def set_task_slack_ref(task_id: str, ref: dict) -> dict:
+        events.append(("slack_ref", ref))
+        state["slack_ref"] = ref
+        return {"stored": True}
 
     return [
         load_task,
@@ -220,6 +252,7 @@ def _activities(
         comment,
         park_task,
         send_message,
+        set_task_slack_ref,
     ]
 
 
@@ -495,6 +528,108 @@ async def test_hand_to_you_comments_and_parks_without_launching():
     assert "Reply `take over`" in bodies[0]
     assert ("park", "operator already on it") in events
     assert result["status"] == "handed_to_operator"
+
+
+@pytest.mark.asyncio
+async def test_the_first_task_message_opens_a_thread_and_remembers_its_root():
+    """Everything AEGIS says about a task belongs to ONE Slack thread. The
+    first message has no root to post under, so it BECOMES the root: it leads
+    with the task id and title, goes out with no `thread_ref`, and the ref
+    comms hands back is stored on the session row.
+
+    Falsifiable: drop the `set_task_slack_ref` call and the last assertion
+    fails while every other test here still passes.
+    """
+    events: list = []
+    await _run(events)
+
+    assert _bodies(events, "thread") == [None], "no root yet — this message IS the root"
+    note = _bodies(events, "slack")[0]
+    assert note.startswith("Task tc-1: Fix phantom EPS downgrade")
+    assert "STATUS: plan" in note, "the thread carries the turn's own output, not a stub"
+    assert _bodies(events, "slack_ref") == [{"channel": "C1", "ts": "1.1"}]
+
+
+@pytest.mark.asyncio
+async def test_a_task_that_already_has_a_thread_posts_into_it():
+    """The root lives on the session row, so a later turn — a different
+    workflow run — threads under it. Re-rooting instead would scatter one
+    conversation over a new thread per turn.
+
+    Falsifiable: ignore `session["slack_ref"]` and both the thread ref and the
+    "stored once" assertion fail.
+    """
+    events: list = []
+    await _run(events, slack_ref={"channel": "C1", "ts": "1.1"})
+
+    assert _bodies(events, "thread") == [{"channel": "C1", "ts": "1.1"}]
+    note = _bodies(events, "slack")[0]
+    assert not note.startswith("Task tc-1:"), "the title belongs to the root, not to every reply"
+    assert "STATUS: plan" in note
+    assert "slack_ref" not in _kinds(events), "the root is stored once, not rewritten each turn"
+
+
+@pytest.mark.asyncio
+async def test_the_hand_back_comment_is_mirrored_into_the_thread():
+    """Mirroring covers the comments that never launch a turn too — the ones
+    where AEGIS is waiting on a person, which are exactly the ones a Todoist
+    comment alone is too quiet for."""
+    events: list = []
+    await _run(
+        events,
+        collision={
+            "verdict": "hand_to_you",
+            "session": {"name": "bcp eps", "owner": "human", "branch": "fix/eps"},
+            "sessions": [{"name": "bcp eps", "owner": "human", "branch": "fix/eps"}],
+            "reason": "same branch",
+        },
+    )
+
+    note = _bodies(events, "slack")[0]
+    assert note.startswith("Task tc-1: Fix phantom EPS downgrade")
+    assert _bodies(events, "comment")[0] in note, "the thread says what the Todoist comment says"
+
+
+@pytest.mark.asyncio
+async def test_the_operator_note_lands_in_the_task_thread_when_there_is_one():
+    """`you_are_in_it` writes no Todoist comment, so its Slack note is the only
+    thing the operator gets — it belongs in the task's thread. It is a note,
+    not a task message, so it must never CREATE the root."""
+    events: list = []
+    await _run(
+        events,
+        slack_ref={"channel": "C1", "ts": "1.1"},
+        collision={
+            "verdict": "you_are_in_it",
+            "session": {"name": "bcp eps", "owner": "human"},
+            "sessions": [],
+            "reason": "session is live",
+        },
+    )
+
+    assert _bodies(events, "thread") == [{"channel": "C1", "ts": "1.1"}]
+    assert "your comment is waiting for you there" in _bodies(events, "slack")[0]
+    assert "slack_ref" not in _kinds(events), "a note is not a thread root"
+
+
+@pytest.mark.asyncio
+async def test_a_failing_slack_delivery_leaves_the_turn_alone():
+    """Todoist is the record of record; Slack is the notification. A comms
+    outage costs the notification and nothing else — the turn still ran, its
+    output is still commented, and the task still parks.
+
+    Falsifiable: let the delivery exception propagate and the workflow fails
+    instead of returning a parked result.
+    """
+    events: list = []
+    result = await _run(events, slack_raises=True)
+
+    assert len(_bodies(events, "comment")) == 1
+    assert "STATUS: plan" in _bodies(events, "comment")[0]
+    assert ("park", "waiting on you") in events
+    assert "slack_ref" not in _kinds(events), "nothing came back to store"
+    assert result["status"] == "parked"
+    assert result["turns"] == 1
 
 
 @pytest.mark.asyncio
@@ -817,6 +952,33 @@ def test_status_line_takes_the_last_one_and_tolerates_none():
 def test_render_thread_truncates_one_enormous_note():
     out = _render_thread([{"content": "y" * 5000, "posted_at": "2026-09-01T10:00:00+00:00"}])
     assert out.count("y") == 800
+
+
+@pytest.mark.parametrize(
+    "resp,expected",
+    [
+        # What `DeliveryRef.to_dict()` actually emits: `data` spread flat next
+        # to `adapter`. This is the PRODUCTION shape and the one a nested-only
+        # reader would silently miss, re-rooting the thread on every turn.
+        (
+            {"ok": True, "delivery_ref": {"adapter": "slack", "channel": "C1", "ts": "1.1"}},
+            {"channel": "C1", "ts": "1.1"},
+        ),
+        # The nested spelling, and the top-level back-compat mirror.
+        (
+            {"delivery_ref": {"adapter": "slack", "data": {"channel": "C2", "ts": "2.2"}}},
+            {"channel": "C2", "ts": "2.2"},
+        ),
+        ({"ok": True, "channel": "C3", "ts": "3.3"}, {"channel": "C3", "ts": "3.3"}),
+        # No thread to open: the web adapter sends nowhere a reply can land, a
+        # failed send has no ref at all, and neither may be stored as a root.
+        ({"ok": True, "delivery_ref": {"adapter": "web"}}, None),
+        ({"ok": False, "error": "comms is down"}, None),
+        (None, None),
+    ],
+)
+def test_thread_root_reads_every_shape_comms_returns(resp, expected):
+    assert _thread_root(resp) == expected
 
 
 # --- the sweep's fallback dispatcher ---------------------------------------
