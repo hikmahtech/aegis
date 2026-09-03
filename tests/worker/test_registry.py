@@ -258,10 +258,14 @@ def test_module_workflows_is_the_unflagged_registry():
         # MeetingActivities — MeetingNotesFlow stamps the analysis verdict back
         # onto the row it already filed, so the weekly block can warn about
         # meetings filed without a review. MeetingActivities is unflagged, so
-        # it moves in every row.
-        (True, True, 41, 201),
-        (False, False, 33, 171),
-        (True, False, 37, 190),
+        # it moves in every row. Then +1 flow and +2 activities from
+        # MeetingSweepFlow (meeting_sender_addresses, unstored_meeting_messages
+        # on the existing MeetingActivities) — the scheduled safety net for the
+        # `meeting` fan-out, which finds notes mail the `is:unread` hourly query
+        # never saw. Unflagged, so all three rows move.
+        (True, True, 42, 203),
+        (False, False, 34, 173),
+        (True, False, 38, 192),
     ],
 )
 def test_real_registration_passes_the_boot_check(homelab, money, flows, activities):

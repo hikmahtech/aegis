@@ -70,6 +70,7 @@ from aegis_worker.flows.interaction import InteractionFlow
 from aegis_worker.flows.jira_sync import JiraSyncConfig, JiraSyncFlow
 from aegis_worker.flows.llm_spend_guard import LLMSpendGuardConfig, LLMSpendGuardFlow
 from aegis_worker.flows.meeting_notes import MeetingNotesFlow
+from aegis_worker.flows.meeting_sweep import MeetingSweepFlow, MeetingSweepInput
 from aegis_worker.flows.memory_reflection import MemoryReflectionFlow, MemoryReflectionInput
 from aegis_worker.flows.money_hygiene import MoneyHygieneConfig, MoneyHygieneDailyFlow
 from aegis_worker.flows.money_process import MoneyProcessFlow
@@ -485,6 +486,17 @@ FLOWS: tuple[FlowSpec, ...] = (
     FlowSpec(MoneyProcessFlow, feature_flag="money_hygiene_enabled"),
     # Child of GmailIngestFlow (the `meeting` tag fan-out); never scheduled.
     FlowSpec(MeetingNotesFlow),
+    # The read-state-blind safety net for that fan-out. Not feature-flagged: it
+    # derives its sender list from the `meeting` tag on the user's own triage
+    # overrides, so it no-ops until one carries it.
+    FlowSpec(
+        MeetingSweepFlow,
+        lambda act: MeetingSweepInput(
+            agent_id=act["agent_id"],
+            lookback_days=int((act["config"] or {}).get("lookback_days", 7)),
+            max_per_account=int((act["config"] or {}).get("max_per_account", 50)),
+        ),
+    ),
 )
 
 # Activity classes whose *instance* main() only builds behind a feature flag.

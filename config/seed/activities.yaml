@@ -9,6 +9,22 @@ activities:
     config: {}
     active: true
 
+  # Safety net for the `meeting` tag fan-out. gmail-ingest-hourly only fetches
+  # is:unread, so notes mail read on a phone first is never triaged and the
+  # meeting is lost silently. This sweep re-checks the same senders regardless
+  # of read state and files anything with no `meeting` row yet. The sender list
+  # is DERIVED from the `meeting` tag on your own sender_overrides
+  # (settings.email_triage_rules, the admin Email triage page) — so it is inert
+  # until one of your rules carries that tag, and it needs no config of its own.
+  - slug: meeting-notes-sweep
+    workflow_type: MeetingSweepFlow
+    agent_id: sebas
+    schedule_cron: "20 */6 * * *"
+    config:
+      lookback_days: 7
+      max_per_account: 50
+    active: true
+
   - slug: calendar-ingest-daily
     workflow_type: CalendarIngestFlow
     agent_id: sebas
