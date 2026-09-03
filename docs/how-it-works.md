@@ -317,7 +317,15 @@ one LLM call decides whether they are already on this task, and if so AEGIS
 parks with a note and waits for a `take over` comment. Take a task over with
 `cd <worktree> && claude --resume <session_id>` (both are in every comment's
 footer); hand it back by commenting. `ClarifyFlow` ignores tasks that have a
-session row, so a comment never gets both a chat reply and a turn.
+session row, so a comment never gets both a chat reply and a turn. Every
+message the lane posts is mirrored into one Slack thread per task in the
+owning agent's channel (`task_sessions.slack_ref` holds the root), and a reply
+typed in that thread is posted to the task as a comment, so Slack and Todoist
+are the same conversation. From your own Claude Code session or a chat agent,
+`comment_on_task` posts in your voice (verbatim, no footer) — it is withheld
+from a run's own MCP mount so a session cannot trigger its own next turn.
+`CleanupFlow` removes the worktree and the row `task_session_days` (default 7)
+after the task is completed.
 
 **Every path ends completed or parked.** A task is auto-completed only when
 the work is genuinely done (service healthy, notification archived);
