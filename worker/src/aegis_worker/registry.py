@@ -196,6 +196,7 @@ FLOWS: tuple[FlowSpec, ...] = (
         CleanupFlow,
         lambda act: CleanupConfig(
             retentions=act["config"].get("retentions") or {},
+            task_session_days=int(act["config"].get("task_session_days", 7)),
         ),
     ),
     FlowSpec(InteractionFlow),

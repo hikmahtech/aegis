@@ -499,6 +499,32 @@ the run as failed, and cleans up the worktree — so there is no half-stopped
 state. "No live tmux window" is a normal answer: the run may have finished, or
 have been launched detached past the tmux window cap.
 
+### Task sessions (comment-driven coding)
+
+A `@code` Todoist task gets one persistent Claude Code session in its own git
+worktree, driven by comments on the task. Three places configure it, none of
+them code:
+
+- **Coding block** on the coding-host infra entry: **Default engine** `claude`
+  (`routing.default_engine`) and a **Default Claude account**
+  (`engines.claude.default_account`). A turn resumes a session by id, which
+  only works when every turn lands on the same engine and the same login.
+- **`activities.config` for `agent-task-15min`** — `max_coding` (default 3),
+  the ceiling on coding turns started per sweep, new and resumed together; and
+  `turn_timeout_minutes` (default 60), after which a turn is killed and
+  reported.
+- **`activities.config` for `cleanup-daily`** — `task_session_days` (default
+  7). A session whose task is completed or gone, and idle that long, has its
+  worktree removed and its row deleted by `CleanupFlow`. The branch stays; it
+  may back an open PR. Set to 0 to disable.
+
+The agents also need the `comment_on_task` tool — that is how a turn replies on
+the task. Grant it to every active agent that already has a tool set:
+
+```sql
+UPDATE agents SET metadata = jsonb_set(metadata,'{tool_set}',(metadata->'tool_set')||'["comment_on_task"]'::jsonb) WHERE active AND metadata ? 'tool_set' AND NOT (metadata->'tool_set' @> '["comment_on_task"]'::jsonb);
+```
+
 ### Verify the coding host
 
 Drive the live connector from inside the running worker — it uses the same
