@@ -135,12 +135,15 @@ class DeliveryRequest(BaseModel):
     """Message delivery request from Core/Worker.
 
     The active channel adapter (Slack) routes by the agent's channel; there is
-    no per-message chat/topic override.
+    no per-message chat/topic override, only the optional thread below.
     """
 
     text: str
     agent_id: str = "sebas"
     system_event: bool = False  # If true, send to General topic instead of agent topic
+    # An existing thread ROOT — `{"channel": ..., "ts": ...}` — to reply under,
+    # so a task's turns all land in one thread. None = post to the channel.
+    thread_ref: dict | None = None
 
 
 class DocumentAttachment(BaseModel):
@@ -262,7 +265,19 @@ def create_delivery_app(adapter: SlackAdapter, settings: CommsSettings) -> FastA
             )
             return {"ok": result.get("ok", False), "type": "system_event", **result}
 
-        send_result = await adapter.send_message(agent_id=req.agent_id, text=req.text)
+        # A malformed thread_ref degrades to a plain channel post rather than a
+        # 500 — losing the threading is recoverable, losing the message is not.
+        target = (
+            {
+                "channel": req.thread_ref.get("channel"),
+                "thread_ts": req.thread_ref.get("ts"),
+            }
+            if req.thread_ref
+            else None
+        )
+        send_result = await adapter.send_message(
+            agent_id=req.agent_id, text=req.text, target=target
+        )
         result = send_result.to_response()
         await _log_dispatch(
             settings,

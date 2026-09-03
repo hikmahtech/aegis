@@ -342,3 +342,23 @@ async def test_send_voice_no_api_key_is_ok_false(monkeypatch):
     r = await a.send_voice(agent_id="sebas", text="hi")
     assert r.ok is False
     a._client.files_upload_v2.assert_not_awaited()
+
+
+async def test_send_message_threads_every_chunk_when_target_has_thread_ts(monkeypatch):
+    """A task's turn is one thread — a chunked reply must not spill into the
+    channel after the first chunk."""
+    a = _adapter(monkeypatch)
+    body = "line\n" * 1000  # > 2800 chars → 2 chunks
+    await a.send_message(
+        agent_id="sebas", text=body, target={"channel": "CTASK", "thread_ts": "100.1"}
+    )
+    assert a._client.chat_postMessage.await_count == 2
+    for call in a._client.chat_postMessage.await_args_list:
+        assert call.kwargs["channel"] == "CTASK"
+        assert call.kwargs["thread_ts"] == "100.1"
+
+
+async def test_send_message_without_thread_ts_passes_no_thread(monkeypatch):
+    a = _adapter(monkeypatch)
+    await a.send_message(agent_id="sebas", text="hi", target={"channel": "COVERRIDE"})
+    assert "thread_ts" not in a._client.chat_postMessage.await_args.kwargs

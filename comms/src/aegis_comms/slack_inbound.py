@@ -13,10 +13,15 @@ Routing:
   (c) the channel maps to pandora → async (kimi tools run minutes);
   (d) otherwise → sync `/api/chat` with the channel's agent (default sebas).
 
+A reply inside a thread is checked against the task sessions first (GET
+/api/admin/task-sessions/by-thread): a task's thread is its conversation, so
+the reply becomes a note on the task and never reaches (a)-(d).
+
 Core-call contracts match the bot's: POST /api/chat (sync),
 POST /api/chat/agent-reply/trigger (async), POST /api/admin/capture (/capture),
 POST /api/interactions/{id}/resolve (button), GET /api/health + /api/agents
-(/status), POST /api/knowledge/ingest + PATCH the assistant row's delivery-ref.
+(/status), POST /api/knowledge/ingest + PATCH the assistant row's delivery-ref,
+GET /api/admin/task-sessions/by-thread + POST /api/admin/tasks/{id}/comment.
 """
 
 from __future__ import annotations
@@ -25,6 +30,7 @@ import hashlib
 import re
 import time
 from typing import Any
+from urllib.parse import quote, urlencode
 
 import httpx
 import structlog
@@ -458,6 +464,35 @@ class SlackCoreClient:
             timeout=30,
         )
 
+    async def task_by_thread(self, channel: str, ts: str) -> str | None:
+        """GET /api/admin/task-sessions/by-thread — the task owning a thread root.
+
+        None means "route this message normally". It covers both a miss (the
+        route answers 200 with `task_id: null`, which is the common case — most
+        threads are not task threads) and any failure, so a Core hiccup costs a
+        message its task lane rather than dropping it.
+        """
+        query = urlencode({"channel": channel, "ts": ts})
+        result = await self._get(f"/api/admin/task-sessions/by-thread?{query}")
+        if isinstance(result, dict) and result.get("task_id"):
+            return str(result["task_id"])
+        return None
+
+    async def task_comment(self, task_id: str, text: str) -> bool:
+        """POST /api/admin/tasks/{id}/comment — the reply, as a Todoist note.
+
+        Returns whether the note actually landed. The route answers **200 with
+        `{"ok": false}`** when Todoist rejects the write, so the body's own flag
+        is the answer — a non-None body is not success, and reading it as one
+        would swallow the user's reply in silence.
+        """
+        body = await self._post(
+            f"/api/admin/tasks/{quote(task_id, safe='')}/comment",
+            {"text": text},
+            timeout=30,
+        )
+        return bool((body or {}).get("ok"))
+
     async def health(self) -> dict | None:
         """GET /api/health."""
         return await self._get("/api/health")
@@ -610,11 +645,18 @@ class SlackInbound:
         user_id: str | None,
         bot_id: str | None = None,
         ts: str = "",
+        thread_ts: str = "",
     ) -> None:
         """Route a text message (sync chat vs async agent-reply).
 
         Ignores the bot's own messages (a `bot_id` is present, or `user_id`
         equals our bot user id) to avoid self-reply loops.
+
+        Task threads come first: a reply inside the thread of a task's coding
+        session is that task's next turn, not a chat message, so it is filed as
+        a Todoist note and nothing is routed to an agent. Slack sets
+        `thread_ts == ts` on a thread ROOT, which is a top-level message and not
+        a reply. A thread no task owns falls through to normal routing.
 
         Note-to-self short-circuit: in the configured note-to-self channel, the
         OWNER's own messages are filed as life facts instead of being routed to
@@ -633,11 +675,46 @@ class SlackInbound:
         if not text:
             return
 
+        if (
+            thread_ts
+            and thread_ts != ts
+            and await self._handle_task_thread_reply(
+                channel_id=channel_id, thread_ts=thread_ts, text=text
+            )
+        ):
+            return
+
         if self._is_note_to_self(channel_id=channel_id, user_id=user_id, text=text):
             await self._ingest_self_signal(channel_id=channel_id, ts=ts, text=text)
             return
 
         await self._route_and_dispatch(channel_id=channel_id, text=text)
+
+    # --- task threads (a task's coding session, one Slack thread) ------------
+
+    async def _handle_task_thread_reply(
+        self, *, channel_id: str, thread_ts: str, text: str
+    ) -> bool:
+        """Try to file a threaded reply as a note on the thread's task.
+
+        Returns True when the thread belongs to a task and the reply was dealt
+        with — including when the note was rejected, because that reply is the
+        task's, and re-routing it to an agent would answer it twice over. A
+        rejection is reported in the thread rather than dropped: the user typed
+        it there and nowhere else.
+        """
+        task_id = await self._core.task_by_thread(channel_id, thread_ts)
+        if not task_id:
+            return False
+        if not await self._core.task_comment(task_id, text):
+            logger.warning(
+                "slack_task_thread_comment_failed", channel=channel_id, task_id=task_id
+            )
+            await self._adapter.post_thread(
+                ref=DeliveryRef("slack", {"channel": channel_id, "ts": thread_ts}),
+                text="Couldn't post that to the task; try again.",
+            )
+        return True
 
     # --- curated self-signal ingest (B2) ------------------------------------
 

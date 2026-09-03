@@ -217,6 +217,11 @@ class SlackAdapter:
         channel, username, icon, _voice_id = await self._resolve(agent_id)
         channel = self._target_channel(channel, target)
         body = html_to_mrkdwn(text)
+        # `target["thread_ts"]` is a thread ROOT (a task's thread). Every chunk
+        # carries it, or a long reply would start in the thread and finish in
+        # the channel. Omitted entirely when absent so an ordinary send is
+        # unchanged.
+        thread = {"thread_ts": target["thread_ts"]} if target and target.get("thread_ts") else {}
         first_ref: DeliveryRef | None = None
         try:
             for chunk in _split_message(body):
@@ -226,6 +231,7 @@ class SlackAdapter:
                     mrkdwn=True,
                     username=username,
                     icon_emoji=icon,
+                    **thread,
                 )
                 if first_ref is None:
                     first_ref = DeliveryRef("slack", {"channel": resp["channel"], "ts": resp["ts"]})
@@ -461,6 +467,9 @@ class SlackAdapter:
                 user_id=event.get("user"),
                 bot_id=event.get("bot_id"),
                 ts=event.get("ts", ""),
+                # Present on a threaded reply (and equal to `ts` on a thread
+                # root); it is how inbound spots a reply to a task's thread.
+                thread_ts=event.get("thread_ts", ""),
             )
 
         @app.event("app_mention")
@@ -474,6 +483,7 @@ class SlackAdapter:
                 # the ONLY path an @mention takes. Omitting `ts` left the
                 # note-to-self lane with a blank dedupe key.
                 ts=event.get("ts", ""),
+                thread_ts=event.get("thread_ts", ""),
             )
 
         @app.action(re.compile(r"^interaction_"))
