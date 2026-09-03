@@ -30,6 +30,7 @@ with workflow.unsafe.imports_passed_through():
         AgentTaskSweepFlow,
         _render_thread,
     )
+    from aegis_worker.shared.retry import TIMEOUT_LLM, TIMEOUT_LONG, TIMEOUT_STANDARD
 
 _CODE_TASK = {
     "id": "tc-1",
@@ -78,8 +79,11 @@ def _activities(
     collision: dict | None = None,
     launch_result: dict | None = None,
     never_exits: bool = False,
+    timeout_tail: str = "",
     seen_first_ensure: asyncio.Event | None = None,
     release_first_ensure: asyncio.Event | None = None,
+    seen_first_poll: asyncio.Event | None = None,
+    release_first_poll: asyncio.Event | None = None,
 ):
     """Fakes for every activity the coding path calls.
 
@@ -90,7 +94,7 @@ def _activities(
     # `turns` is the session's own watermark: record_task_turn(launched=True)
     # bumps it, which is what makes the NEXT ensure_task_session return a
     # session the flow must RESUME rather than create.
-    state = {"turns": 0, "polls": 0}
+    state = {"turns": 0, "polls": 0, "killed": False}
 
     @activity.defn(name="load_task")
     async def load_task(task_id: str) -> dict:
@@ -161,7 +165,15 @@ def _activities(
     @activity.defn(name="check_agent_run")
     async def check_agent_run(output_file: str, host: str = "", probe_alive: bool = True) -> dict:
         state["polls"] += 1
-        events.append(("poll", output_file))
+        events.append(("poll", {"file": output_file, "probe_alive": probe_alive}))
+        if state["killed"]:
+            # The post-kill tail fetch, not a poll: the run is gone, and all
+            # the flow wants back is whatever it wrote before the deadline.
+            return {"status": "failed", "output": timeout_tail, "reason": "killed", "final": ""}
+        if seen_first_poll is not None and not seen_first_poll.is_set():
+            seen_first_poll.set()
+            if release_first_poll is not None:
+                await release_first_poll.wait()
         if never_exits or state["polls"] % 2 == 1:
             return {"status": "running", "output": "", "reason": "", "final": ""}
         return {
@@ -174,6 +186,7 @@ def _activities(
     @activity.defn(name="kill_task_turn")
     async def kill_task_turn(output_file: str, host: str) -> dict:
         events.append(("kill", output_file))
+        state["killed"] = True
         return {"killed": True}
 
     @activity.defn(name="comment")
@@ -339,21 +352,56 @@ async def test_comment_signal_during_turn_runs_a_second_turn():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("owner", "status", "phrase"),
-    [
-        ("human", "operator_in_session", "your comment is waiting for you there"),
-        ("aegis", "turn_still_running", "will be picked up when it finishes"),
-    ],
-)
-async def test_operator_in_session_sends_slack_note_and_does_not_park(
-    owner: str, status: str, phrase: str
-):
-    """`you_are_in_it` means the comment is already in front of whoever owns
-    the session. Commenting on Todoist would duplicate it and parking would
+async def test_comment_signal_while_the_cli_turn_runs_is_queued_not_lost():
+    """The same drain, at the moment it actually happens in production: the
+    comment lands while the CLI session itself is mid-turn, not merely while
+    the flow is setting up. Nothing can interrupt a running turn, so the only
+    correct behaviour is to queue and answer it in the next one."""
+    events: list = []
+    seen = asyncio.Event()
+    release = asyncio.Event()
+
+    async with await WorkflowEnvironment.start_time_skipping() as env:
+        queue = f"tq-{uuid.uuid4().hex[:8]}"
+        async with Worker(
+            env.client,
+            task_queue=queue,
+            workflows=[AgentTaskFlow],
+            activities=_activities(events, seen_first_poll=seen, release_first_poll=release),
+        ):
+            handle = await env.client.start_workflow(
+                AgentTaskFlow.run,
+                AgentTaskFlowInput(
+                    agent_id="pandoras-actor", todoist_task_id="tc-1", task=_CODE_TASK
+                ),
+                id=f"agent-task-tc-1-{uuid.uuid4().hex[:8]}",
+                task_queue=queue,
+            )
+            # The result call has to be OUTSTANDING while we wait: the
+            # time-skipping server only advances the clock while a client is
+            # waiting on a workflow, so without this the poll loop's 30s sleep
+            # is thirty real seconds.
+            pending = asyncio.ensure_future(handle.result())
+            await asyncio.wait_for(seen.wait(), timeout=60)
+            await handle.signal(AgentTaskFlow.comment, "also fix tests")
+            release.set()
+            result = await pending
+
+    launches = _bodies(events, "launch")
+    assert len(launches) == 2, f"a mid-turn comment must run a second turn: {_kinds(events)}"
+    assert launches[1]["resume"] is True
+    assert "> also fix tests" in launches[1]["prompt"]
+    assert _kinds(events).count("park") == 1
+    assert result["turns"] == 2
+
+
+@pytest.mark.asyncio
+async def test_operator_in_session_sends_slack_note_and_does_not_park():
+    """`you_are_in_it` with a HUMAN owner means the comment is already in front
+    of the operator. Commenting on Todoist would duplicate it and parking would
     stamp @waiting on a task somebody is actively working — so the flow does
-    neither. The watermark still moves, or the 15-minute fallback sweep
-    re-dispatches the same comment forever.
+    neither. The watermark still moves, because the comment HAS been delivered;
+    without that the 15-minute fallback sweep re-dispatches it forever.
 
     Falsifiable: add a park_task call to that branch and this fails.
     """
@@ -362,7 +410,7 @@ async def test_operator_in_session_sends_slack_note_and_does_not_park(
         events,
         collision={
             "verdict": "you_are_in_it",
-            "session": {"name": "bcp eps", "owner": owner, "cwd": "/srv/repos/bcp"},
+            "session": {"name": "bcp eps", "owner": "human", "cwd": "/srv/repos/bcp"},
             "sessions": [],
             "reason": "session is live",
         },
@@ -374,9 +422,38 @@ async def test_operator_in_session_sends_slack_note_and_does_not_park(
     assert "launch" not in _kinds(events)
     notes = _bodies(events, "slack")
     assert len(notes) == 1
-    assert phrase in notes[0]
+    assert "your comment is waiting for you there" in notes[0]
     assert "tc-1" in notes[0] and "bcp eps" in notes[0]
-    assert result["status"] == status
+    assert result["status"] == "operator_in_session"
+
+
+@pytest.mark.asyncio
+async def test_an_orphan_aegis_turn_keeps_the_comment_due():
+    """`you_are_in_it` with an AEGIS owner is a turn of our own that outlived
+    its kill. NOBODY has read the comment — not a person, and not the running
+    turn, which was launched before it existed — so the watermark must not
+    move: leaving the row due is what makes the 15-minute fallback re-dispatch
+    it once the orphan ends. There is also no one to Slack.
+
+    Falsifiable: call record_task_turn on that branch and this fails.
+    """
+    events: list = []
+    result = await _run(
+        events,
+        collision={
+            "verdict": "you_are_in_it",
+            "session": {"name": "task tc-1: Fix phantom", "owner": "aegis"},
+            "sessions": [],
+            "reason": "session is live",
+        },
+    )
+
+    assert "record" not in _kinds(events), "the comment has not been consumed by anything"
+    assert "slack" not in _kinds(events), "there is no person in this session to tell"
+    assert not _bodies(events, "comment")
+    assert "park" not in _kinds(events)
+    assert "launch" not in _kinds(events)
+    assert result["status"] == "turn_still_running"
 
 
 @pytest.mark.asyncio
@@ -427,18 +504,38 @@ async def test_timeout_kills_and_reports():
     kill matters: an orphan run still writing this session while the next turn
     starts is worse than a lost turn."""
     events: list = []
-    result = await _run(events, never_exits=True, turn_timeout_minutes=1)
+    result = await _run(
+        events,
+        never_exits=True,
+        turn_timeout_minutes=1,
+        timeout_tail="ran the migration, then hung on the lock",
+    )
 
-    assert "kill" in _kinds(events), "a timed-out turn must be asked to stop"
+    kinds = _kinds(events)
+    assert "kill" in kinds, "a timed-out turn must be asked to stop"
     bodies = _bodies(events, "comment")
     assert len(bodies) == 1
     assert "was asked to stop after 1 min" in bodies[0]
-    # poll_until_exit returns no output on a timeout, and the flow deliberately
-    # fetches nothing extra rather than paying another round trip.
-    assert "(no output captured)" in bodies[0]
+    # poll_until_exit returns NO output on a timeout, so the tail has to be
+    # fetched after the kill or every deadline comment is a bare "it stopped".
+    assert "ran the migration, then hung on the lock" in bodies[0]
+    assert kinds.index("kill") < len(kinds) - 1 - kinds[::-1].index("poll"), (
+        "the tail must be fetched AFTER the kill, or it is a stale snapshot"
+    )
+    assert _bodies(events, "poll")[-1]["probe_alive"] is False, (
+        "the tail fetch must not probe liveness on a run it just killed"
+    )
     assert "Session: " in bodies[0]
     assert ("park", "waiting on you") in events
     assert result["turns"] == 1
+
+
+@pytest.mark.asyncio
+async def test_timeout_says_so_when_the_run_wrote_nothing():
+    events: list = []
+    await _run(events, never_exits=True, turn_timeout_minutes=1, timeout_tail="")
+
+    assert "(no output captured)" in _bodies(events, "comment")[0]
 
 
 @pytest.mark.asyncio
@@ -509,6 +606,52 @@ async def test_launch_failure_parks_with_the_error():
     assert "no route to host" in _bodies(events, "comment")[0]
     assert ("park", "turn failed to start") in events
     assert result["status"] == "launch_failed"
+
+
+@pytest.mark.asyncio
+async def test_the_slow_activities_are_not_scheduled_on_the_60s_budget():
+    """Two activities in this path routinely outlast 60 seconds, and a
+    start-to-close timeout is not a retry — it surfaces as a workflow failure
+    and the generic handler PARKS the task.
+
+    `check_task_collision` makes a balanced-tier LLM call (kimi-class calls
+    pass 120s in prod) and is written to return `proceed` on every failure; at
+    60s the timeout would fire OUTSIDE that guard and park instead.
+    `ensure_task_session` runs `git worktree add` over SSH on turn 1.
+
+    Read off the workflow history rather than the source, so it is the schedule
+    the server actually saw.
+    """
+    events: list = []
+    async with await WorkflowEnvironment.start_time_skipping() as env:
+        queue = f"tq-{uuid.uuid4().hex[:8]}"
+        wf_id = f"agent-task-tc-1-{uuid.uuid4().hex[:8]}"
+        async with Worker(
+            env.client,
+            task_queue=queue,
+            workflows=[AgentTaskFlow],
+            activities=_activities(events),
+        ):
+            await env.client.execute_workflow(
+                AgentTaskFlow.run,
+                AgentTaskFlowInput(
+                    agent_id="pandoras-actor", todoist_task_id="tc-1", task=_CODE_TASK
+                ),
+                id=wf_id,
+                task_queue=queue,
+            )
+        scheduled: dict[str, int] = {}
+        async for event in env.client.get_workflow_handle(wf_id).fetch_history_events():
+            attrs = event.activity_task_scheduled_event_attributes
+            if attrs.activity_type.name:
+                scheduled[attrs.activity_type.name] = attrs.start_to_close_timeout.seconds
+
+    assert scheduled["check_task_collision"] == int(TIMEOUT_LLM.total_seconds())
+    assert scheduled["ensure_task_session"] == int(TIMEOUT_LONG.total_seconds())
+    for slow in ("check_task_collision", "ensure_task_session"):
+        assert scheduled[slow] > TIMEOUT_STANDARD.total_seconds(), (
+            f"{slow} outlasts 60s in prod; scheduling it there parks the task"
+        )
 
 
 @pytest.mark.asyncio
@@ -653,6 +796,125 @@ async def test_sweep_dispatches_due_turns_by_start_or_signal():
     assert started["timeout"] == 45, "the sweep's configured turn deadline must reach the flow"
     assert result["resumed"] == 2
     assert ("due", 3) in events, "the due limit is max_coding, whose default moved to 3"
+
+
+@pytest.mark.asyncio
+async def test_sweep_spends_max_coding_on_new_and_resumed_turns_together():
+    """`max_coding` is a ceiling on TURNS, not on first turns. A tick that
+    spawns its whole budget as new tasks must not then dispatch that many
+    resumed turns on top: both kinds land on the same coding host, and the
+    tmux window cap is what the ceiling is protecting."""
+    events: list = []
+    coding = {
+        "id": "sw-1", "content": "Fix the bug", "description": "",
+        "labels": ["@pandora", "@code"], "source_tag": None,
+        "project_id": "p1", "assignee_label": "@pandora",
+    }
+
+    @activity.defn(name="find_actionable_tasks")
+    async def find_actionable_tasks(
+        max_tasks: int = 3, cooldown_hours: int = 6, max_coding: int = 1
+    ) -> list[dict]:
+        # One coding task and one non-coding task: only the coding one spends
+        # the budget, which is what makes this test fail on a naive `spawned`.
+        return [coding, {**coding, "id": "sw-2", "source_tag": "#alert", "labels": ["@pandora"]}]
+
+    @activity.defn(name="find_task_turns_due")
+    async def find_task_turns_due(limit: int = 20) -> list[dict]:
+        events.append(("due", limit))
+        return []
+
+    async with await WorkflowEnvironment.start_time_skipping() as env:
+        queue = f"tq-{uuid.uuid4().hex[:8]}"
+        async with Worker(
+            env.client,
+            task_queue=queue,
+            workflows=[AgentTaskSweepFlow, _StubTaskFlow],
+            activities=[find_actionable_tasks, find_task_turns_due],
+        ):
+            result = await env.client.execute_workflow(
+                AgentTaskSweepFlow.run,
+                AgentTaskSweepConfig(agent_id="pandoras-actor", max_coding=1),
+                id=f"sweep-{uuid.uuid4().hex[:8]}",
+                task_queue=queue,
+            )
+
+    assert result["spawned"] == 2
+    assert result["resumed"] == 0
+    assert not events, f"the budget was spent on the new turn; no due lookup: {events}"
+
+
+@pytest.mark.asyncio
+async def test_sweep_dispatches_what_is_left_of_the_coding_budget():
+    """Two of three spent on first turns leaves one for a resumed turn."""
+    events: list = []
+    coding = {
+        "id": "sw-a", "content": "Fix the bug", "description": "",
+        "labels": ["@pandora", "@code"], "source_tag": None,
+        "project_id": "p1", "assignee_label": "@pandora",
+    }
+
+    @activity.defn(name="find_actionable_tasks")
+    async def find_actionable_tasks(
+        max_tasks: int = 3, cooldown_hours: int = 6, max_coding: int = 1
+    ) -> list[dict]:
+        return [coding, {**coding, "id": "sw-b"}]
+
+    @activity.defn(name="find_task_turns_due")
+    async def find_task_turns_due(limit: int = 20) -> list[dict]:
+        events.append(("due", limit))
+        return []
+
+    async with await WorkflowEnvironment.start_time_skipping() as env:
+        queue = f"tq-{uuid.uuid4().hex[:8]}"
+        async with Worker(
+            env.client,
+            task_queue=queue,
+            workflows=[AgentTaskSweepFlow, _StubTaskFlow],
+            activities=[find_actionable_tasks, find_task_turns_due],
+        ):
+            await env.client.execute_workflow(
+                AgentTaskSweepFlow.run,
+                AgentTaskSweepConfig(agent_id="pandoras-actor", max_coding=3),
+                id=f"sweep-{uuid.uuid4().hex[:8]}",
+                task_queue=queue,
+            )
+
+    assert events == [("due", 1)]
+
+
+@pytest.mark.asyncio
+async def test_sweep_survives_a_failing_due_lookup():
+    """The spawn loop's children are already ABANDONED and running by the time
+    the due lookup happens, so failing the sweep over it would report an outage
+    for work that is under way."""
+
+    @activity.defn(name="find_actionable_tasks")
+    async def find_actionable_tasks(
+        max_tasks: int = 3, cooldown_hours: int = 6, max_coding: int = 1
+    ) -> list[dict]:
+        return []
+
+    @activity.defn(name="find_task_turns_due")
+    async def find_task_turns_due(limit: int = 20) -> list[dict]:
+        raise RuntimeError("the database is unreachable")
+
+    async with await WorkflowEnvironment.start_time_skipping() as env:
+        queue = f"tq-{uuid.uuid4().hex[:8]}"
+        async with Worker(
+            env.client,
+            task_queue=queue,
+            workflows=[AgentTaskSweepFlow, _StubTaskFlow],
+            activities=[find_actionable_tasks, find_task_turns_due],
+        ):
+            result = await env.client.execute_workflow(
+                AgentTaskSweepFlow.run,
+                AgentTaskSweepConfig(agent_id="pandoras-actor"),
+                id=f"sweep-{uuid.uuid4().hex[:8]}",
+                task_queue=queue,
+            )
+
+    assert result == {"found": 0, "spawned": 0, "resumed": 0}
 
 
 @pytest.mark.asyncio

@@ -143,24 +143,29 @@ async def test_sweep_spawns_one_child_per_task_and_does_not_await_them():
     assert result == {"found": 3, "spawned": 3, "resumed": 0}
 
 
-# --- Issue #154: parametrised proof over all 16 AgentTaskFlow.run exit paths ---
+# --- Issue #154: parametrised proof over all 17 AgentTaskFlow.run exit paths ---
 #
 # `find_actionable_tasks` excludes @waiting, so every exit MUST complete or
 # park the task — otherwise the 6h cooldown re-picks (and re-fails) it
 # forever. This is the single mechanical proof of that invariant: one case
-# per terminal return/raise statement in AgentTaskFlow (16 total — 3 in
-# run(), 3 in _run_infra, 2 in _run_email, 2 in _run_finance, 6 in
+# per terminal return/raise statement in AgentTaskFlow (17 total — 3 in
+# run(), 3 in _run_infra, 2 in _run_email, 2 in _run_finance, 7 in
 # _run_coding; see issue #154 for the original enumeration).
 #
-# TWO exits deliberately do not park, and each carries its own terminal proof
+# THREE exits deliberately do not park, and each carries its own terminal proof
 # instead (`case.expect_terminal`):
 #   * `unknown_task` — the task was deleted before we loaded it. There is
 #     nothing to park and nothing to comment on.
-#   * `you_are_in_it` — the operator is sitting in this task's session, so the
-#     comment is already in front of them. Parking would stamp @waiting on a
-#     task somebody is actively working; what stops the fallback sweep
-#     re-dispatching the same comment is the `record_task_turn` watermark, so
-#     THAT is what the case asserts.
+#   * `you_are_in_it` with a HUMAN owner — the operator is sitting in this
+#     task's session, so the comment is already in front of them. Parking would
+#     stamp @waiting on a task somebody is actively working; what stops the
+#     fallback sweep re-dispatching the same comment is the `record_task_turn`
+#     watermark, so THAT is what the case asserts.
+#   * `you_are_in_it` with an AEGIS owner — an orphan turn of our own. The
+#     comment has been read by nobody, so this exit deliberately leaves the
+#     task IN the pool: the fallback sweep must re-dispatch it once the run
+#     ends. "No park and no watermark" is the correct terminal state here, and
+#     `test_agent_task_coding.py` pins the missing watermark specifically.
 #
 # Each case asserts the ACTUAL park/complete/record activity call fired, not
 # just the returned status string — the literal `return {...}` dict on every
@@ -285,6 +290,18 @@ _CASES = [
         expect_terminal="record",
     ),
     _ExitCase(
+        "coding_orphan_aegis_turn", _CODE_TASK,
+        {
+            "check_task_collision": {
+                "verdict": "you_are_in_it",
+                "session": {"name": "task x", "owner": "aegis"},
+                "sessions": [], "reason": "live",
+            },
+        },
+        expect_status="turn_still_running",
+        expect_terminal="none",
+    ),
+    _ExitCase(
         "coding_hand_to_you", _CODE_TASK,
         {
             "check_task_collision": {
@@ -305,7 +322,7 @@ _CASES = [
               expect_status="unknown_task", expect_terminal="none", load_from_id=True),
 ]
 
-assert len(_CASES) == 16, "one case per AgentTaskFlow exit — see issue #154"
+assert len(_CASES) == 17, "one case per AgentTaskFlow exit — see issue #154"
 
 
 def _exit_case_activities(events: list, case: _ExitCase):

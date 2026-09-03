@@ -28,6 +28,7 @@ from temporalio import workflow
 from temporalio.exceptions import ApplicationError, WorkflowAlreadyStartedError
 
 with workflow.unsafe.imports_passed_through():
+    from aegis_worker.activities.agent_run import AgentRunActivities
     from aegis_worker.activities.agent_task import extract_service_name, resolve_verb
     from aegis_worker.activities.delivery import DeliveryActivities
     from aegis_worker.flows.agent_run import poll_until_exit
@@ -37,6 +38,7 @@ with workflow.unsafe.imports_passed_through():
         NO_RETRY,
         STANDARD,
         TIMEOUT_FAST,
+        TIMEOUT_LLM,
         TIMEOUT_LONG,
         TIMEOUT_STANDARD,
     )
@@ -183,6 +185,11 @@ class AgentTaskSweepFlow:
 
             step = "spawn_children"
             spawned = 0
+            # `max_coding` is a ceiling on TURNS, new and resumed together —
+            # they land on the same coding host and the same tmux window cap.
+            # Every first turn this loop starts spends one, so the fallback
+            # dispatcher below only gets what is left.
+            coding_spawned = 0
             for task in tasks:
                 try:
                     await workflow.start_child_workflow(
@@ -197,6 +204,8 @@ class AgentTaskSweepFlow:
                         parent_close_policy=workflow.ParentClosePolicy.ABANDON,
                     )
                     spawned += 1
+                    if resolve_verb(task) == "coding":
+                        coding_spawned += 1
                 except WorkflowAlreadyStartedError:
                     continue  # a previous tick's child is still running
                 except Exception as exc:  # noqa: BLE001
@@ -211,21 +220,36 @@ class AgentTaskSweepFlow:
             # session's own `last_turn_at` watermark, NOT the 6h flow cooldown:
             # a reply must not wait six hours because the task ran recently.
             step = "dispatch_due_turns"
-            due = await workflow.execute_activity(
-                "find_task_turns_due",
-                args=[config.max_coding],
-                start_to_close_timeout=TIMEOUT_FAST,
-                retry_policy=ACT_RETRY,
-            )
             resumed = 0
-            for row in due:
-                resumed += await self._dispatch_turn(row, config)
+            budget = max(0, config.max_coding - coding_spawned)
+            if budget:
+                for row in await self._due_turns(budget):
+                    resumed += await self._dispatch_turn(row, config)
         except Exception as exc:  # noqa: BLE001
             raise ApplicationError(
                 f"agent_task_sweep_failed at step={step}: {exc!r}", non_retryable=True
             ) from exc
 
         return {"found": len(tasks), "spawned": spawned, "resumed": resumed}
+
+    async def _due_turns(self, limit: int) -> list:
+        """Tasks whose newest user comment is newer than their last turn.
+
+        Swallowed on failure: by the time this runs the spawn loop has already
+        started its children, and they are ABANDONED — failing the sweep here
+        would report an outage for work that is under way, and the next tick is
+        fifteen minutes off either way.
+        """
+        try:
+            return await workflow.execute_activity(
+                "find_task_turns_due",
+                args=[limit],
+                start_to_close_timeout=TIMEOUT_FAST,
+                retry_policy=ACT_RETRY,
+            )
+        except Exception as exc:  # noqa: BLE001
+            workflow.logger.warning("agent_task_sweep_due_fetch_failed err=%s", str(exc)[:200])
+            return []
 
     async def _dispatch_turn(self, row: dict, config: AgentTaskSweepConfig) -> int:
         """Land one due comment on its task's workflow. Returns 1 on success.
@@ -672,7 +696,6 @@ class AgentTaskFlow:
         )
         return {"task_id": task_id, "verb": "coding", "status": status, **extra}
 
-
     async def _record_turn(self, task_id: str, launched: bool) -> None:
         """Move the session's watermark past the comment this turn consumed.
 
@@ -756,7 +779,10 @@ class AgentTaskFlow:
             ensured = await workflow.execute_activity(
                 "ensure_task_session",
                 args=[task_id, agent_id, task, comments[-1] if comments else ""],
-                start_to_close_timeout=TIMEOUT_STANDARD,
+                # TIMEOUT_LONG, not STANDARD: the first turn on a big repo runs
+                # `git worktree add` over SSH, which can outlast 60s. Timing it
+                # out would surface as a park, not as a retry.
+                start_to_close_timeout=TIMEOUT_LONG,
                 retry_policy=ACT_RETRY,
             )
             status = str(ensured.get("status") or "")
@@ -801,33 +827,42 @@ class AgentTaskFlow:
                     str(session.get("session_id") or ""),
                     override,
                 ],
-                start_to_close_timeout=TIMEOUT_STANDARD,
+                # TIMEOUT_LLM: this check makes a balanced-tier call, and
+                # kimi-class calls pass 120s in prod. At 60s the activity would
+                # time out and the generic handler would PARK the task — the
+                # one outcome the "every failure path returns proceed" contract
+                # inside the activity exists to prevent.
+                start_to_close_timeout=TIMEOUT_LLM,
                 retry_policy=ACT_RETRY,
             )
             call = str(verdict.get("verdict") or "proceed")
 
             if call == "you_are_in_it":
-                # NO Todoist comment and NO park. The comment is already in
-                # front of whoever holds this session, so commenting would
-                # duplicate it and parking would stamp @waiting on a task
-                # somebody is actively working. The watermark still moves.
-                await self._record_turn(task_id, False)
                 held = verdict.get("session") or {}
                 name = str(held.get("name") or "unnamed")
                 if str(held.get("owner") or "human") == "aegis":
-                    note = (
-                        f"The previous turn on task {task_id} is still running "
-                        f"('{name}'); your comment will be picked up when it finishes."
+                    # An earlier turn of OUR OWN is still alive — an orphan the
+                    # deadline kill did not reach. Nothing has read this
+                    # comment and the running turn cannot see it either, so the
+                    # watermark must NOT move: leaving the row due is what has
+                    # the 15-minute fallback re-dispatch it once the run ends.
+                    # No Slack note, because there is no person to tell.
+                    workflow.logger.warning(
+                        "task_turn_still_running task_id=%s session=%s", task_id, name
                     )
-                    outcome = "turn_still_running"
-                else:
-                    note = (
-                        f"You're in the session for task {task_id} ('{name}'); "
-                        "your comment is waiting for you there."
-                    )
-                    outcome = "operator_in_session"
-                await self._deliver(agent_id, note)
-                return {"task_id": task_id, "verb": "coding", "status": outcome}
+                    return {"task_id": task_id, "verb": "coding", "status": "turn_still_running"}
+                # NO Todoist comment and NO park. The comment is already in
+                # front of the operator holding this session, so commenting
+                # would duplicate it and parking would stamp @waiting on a task
+                # somebody is actively working. The watermark DOES move: the
+                # comment has been delivered, just not by us.
+                await self._record_turn(task_id, False)
+                await self._deliver(
+                    agent_id,
+                    f"You're in the session for task {task_id} ('{name}'); "
+                    "your comment is waiting for you there.",
+                )
+                return {"task_id": task_id, "verb": "coding", "status": "operator_in_session"}
 
             if call == "hand_to_you":
                 await self._record_turn(task_id, False)
@@ -901,11 +936,14 @@ class AgentTaskFlow:
             if str(outcome.get("status") or "") == "timeout":
                 self._step = "coding:kill_task_turn"
                 await self._kill_turn(output_file, host)
-                # `poll_until_exit` returns no output on a timeout by design,
-                # and fetching more would cost a round trip on a run we just
-                # asked to stop. "asked to stop", never "was stopped": the kill
-                # is `fuser -k` and may have found nothing to kill.
-                tail = str(outcome.get("output") or "")[-_TURN_TIMEOUT_TAIL:]
+                # `poll_until_exit` returns NO output on a timeout — it reports
+                # the deadline and nothing else — so the tail has to be fetched
+                # here or the comment is a bare "it stopped". Fetched AFTER the
+                # kill, so what the operator reads is the last thing the run
+                # wrote. "asked to stop", never "was stopped": the kill is
+                # `fuser -k` and may have found nothing to kill.
+                self._step = "coding:timeout_tail"
+                tail = (await self._fetch_tail(output_file, host))[-_TURN_TIMEOUT_TAIL:]
                 body = (
                     f"Turn was asked to stop after {timeout_min} min (deadline). "
                     f"Output so far:\n\n{tail or '(no output captured)'}"
@@ -975,3 +1013,28 @@ class AgentTaskFlow:
             workflow.logger.warning(
                 "agent_task_kill_failed output_file=%s err=%s", output_file, str(exc)[:200]
             )
+
+    async def _fetch_tail(self, output_file: str, host: str) -> str:
+        """Whatever a timed-out turn managed to write, for its comment.
+
+        `probe_alive=False` on purpose: the run has just been asked to stop, so
+        a liveness probe would answer "dead" and the check would report a
+        failure we already know about. All this call is here for is the
+        transcript. Failure returns "" — a deadline comment without a tail is
+        worth far more than no comment at all.
+        """
+        if not output_file:
+            return ""
+        try:
+            check = await workflow.execute_activity_method(
+                AgentRunActivities.check_agent_run,
+                args=[output_file, host, False],
+                start_to_close_timeout=TIMEOUT_STANDARD,
+                retry_policy=STANDARD,
+            )
+        except Exception as exc:  # noqa: BLE001
+            workflow.logger.warning(
+                "agent_task_tail_fetch_failed output_file=%s err=%s", output_file, str(exc)[:200]
+            )
+            return ""
+        return str(check.get("output") or "")
