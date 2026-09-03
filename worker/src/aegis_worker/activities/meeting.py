@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any
 
 from aegis.llm import LLMTruncationError, parse_llm_json
+from aegis.services.email_rules import get_email_rules
 from aegis.services.meeting_rules import get_meeting_rules, is_self
 from aegis.services.meeting_rules import merge as merge_meeting_rules
 from aegis.services.observations import record_external_observation
@@ -65,6 +66,13 @@ Return JSON only, no prose around it:
 - commitments: things THEY agreed to do, with any dates mentioned. Max 5.
 - verbosity_note: one or two concrete sentences on how they could have said the same in fewer words, citing their own lines. Empty string when you were given no transcript lines.
 Use only the material provided. Never invent. Empty list when nothing applies."""
+# Appended to the prompt on the one retry below. It names the mistake and asks
+# for nothing new, so the second attempt is the same question — see the comment
+# in `analyse_meeting` for why re-asking is the whole cure.
+_REVIEW_RETRY_LINE = (
+    "Your previous reply was not valid JSON. Return only the JSON object "
+    "described above, with no prose before or after it."
+)
 
 
 def extract_doc_id(texts: Iterable[str]) -> str | None:
@@ -446,10 +454,24 @@ class MeetingActivities:
             activity.logger.warning("meeting_rules_read_failed err=%s", str(exc)[:200])
             return merge_meeting_rules(None)
 
+    async def _review_once(self, prompt: str, agent_id: str) -> Any:
+        """One review completion, parsed. Anything but a dict is unusable."""
+        raw = await self.llm_client.think(
+            prompt=prompt,
+            model=self.model_balanced,
+            system_prompt=_REVIEW_SYSTEM,
+            max_tokens=_REVIEW_MAX_TOKENS,
+            db_pool=self.db_pool,
+            purpose="meeting_review",
+            agent_id=agent_id or self.agent_id,
+        )
+        return parse_llm_json((raw.get("response") or "").strip())
+
     @activity.defn
     async def analyse_meeting(self, doc: dict, agent_id: str = "") -> dict:
         """Stats in code, numbers to life.observations, one LLM review from the
-        user's own lines. A skipped analysis is a normal outcome — the notes
+        user's own lines — retried ONCE when the reply does not parse (#363),
+        and never otherwise. A skipped analysis is a normal outcome — the notes
         are already filed by the time this runs."""
         rules = await self._load_rules()
         self_names = rules["self_names"]
@@ -487,17 +509,31 @@ class MeetingActivities:
             )
             prompt_parts.append(f"Their own lines, in order:\n{mine}")
         prompt_parts.append(f"Meeting notes:\n{notes}")
+        prompt = "\n\n".join(prompt_parts)
         try:
-            raw = await self.llm_client.think(
-                prompt="\n\n".join(prompt_parts),
-                model=self.model_balanced,
-                system_prompt=_REVIEW_SYSTEM,
-                max_tokens=_REVIEW_MAX_TOKENS,
-                db_pool=self.db_pool,
-                purpose="meeting_review",
-                agent_id=agent_id or self.agent_id,
-            )
-            parsed = parse_llm_json((raw.get("response") or "").strip())
+            parsed = await self._review_once(prompt, agent_id)
+            # A reply that does not parse is a stochastic tail, not a broken
+            # prompt or a tight budget: prod saw this call SUCCEED on the Sep 3
+            # standup — 683 output tokens, `llm_calls.status='success'`, no
+            # error — while the body failed to parse, and an unchanged re-run
+            # come back clean at 334 tokens. Roughly one call in fifty. So the
+            # cure is another roll of the dice with the mistake named, and
+            # nothing about the question changes.
+            #
+            # Capped at ONE retry — two upstream calls, the retry never retries
+            # — for the same reason as the truncation re-roll in
+            # `LLMClient.think` (#321): a tail this thin is cleared by one
+            # re-roll, and a second failure is evidence about this transcript,
+            # not more dice worth buying. Both attempts bill and both are
+            # recorded, because `think()` writes an `llm_calls` row per call.
+            # `LLMTruncationError` deliberately never reaches here: by the time
+            # `think()` raises it, it has already spent its own internal
+            # re-roll, so a retry on top would be a third upstream call.
+            if not isinstance(parsed, dict):
+                activity.logger.warning(
+                    "meeting_review_unparseable_retrying doc_id=%s", doc.get("doc_id")
+                )
+                parsed = await self._review_once(f"{prompt}\n\n{_REVIEW_RETRY_LINE}", agent_id)
             if not isinstance(parsed, dict):
                 raise ValueError("unparseable meeting review")
         except LLMTruncationError as exc:
@@ -558,6 +594,72 @@ class MeetingActivities:
         if updated is None:
             activity.logger.warning("meeting_outcome_no_row content_id=%s", content_id)
         return {"recorded": updated is not None}
+
+    @activity.defn
+    async def meeting_sender_addresses(self) -> list[str]:
+        """Whose mail MeetingSweepFlow sweeps — derived, never configured twice.
+
+        The `meeting` tag on a `sender_overrides` rule is already what makes the
+        hourly path fan out to MeetingNotesFlow. Reading the same rules here
+        keeps one switch for both paths: adding a note-taker stays a single rule
+        on the Email triage page, no vendor name reaches this code, and an
+        install where nothing carries the tag sweeps nobody.
+
+        A domain key loses its leading `@` — Gmail's `from:` term wants
+        `example.com`, not `@example.com`. Never raises: a config read must not
+        be what stops the sweep, and an empty list is a clean no-op.
+        """
+        if not self.db_pool:
+            return []
+        try:
+            rules = await get_email_rules(self.db_pool)
+        except Exception as exc:  # noqa: BLE001 — see the docstring
+            activity.logger.warning("meeting_senders_load_failed err=%s", str(exc)[:200])
+            return []
+        addrs = {
+            key.lstrip("@")
+            for key, rule in (rules.get("sender_overrides") or {}).items()
+            if "meeting" in ((rule or {}).get("tags") or []) and key.lstrip("@")
+        }
+        return sorted(addrs)
+
+    @activity.defn
+    async def unstored_meeting_messages(self, message_ids: list[str]) -> list[str]:
+        """Of `message_ids`, the ones with no `meeting` row — in input order.
+
+        One `= ANY($1)` over the ids, never a query per message. Only
+        `source_type='meeting'` counts: the `meeting_review` row filed under the
+        same message is the review, not the notes, and the hourly path's `email`
+        copy is not the notes either.
+
+        Fails CLOSED — no pool or a dead one returns `[]`, not the whole input.
+        "I cannot tell what is already filed" must never become "file all of
+        it": that would re-ingest and re-review every meeting in the window on
+        every run. Losing one cycle is the cheaper failure, and the next run
+        recovers it.
+        """
+        ids: list[str] = []
+        for raw in message_ids or []:
+            mid = str(raw).strip()
+            if mid and mid not in ids:
+                ids.append(mid)
+        if not ids:
+            return []
+        if not self.db_pool:
+            activity.logger.warning("meeting_unstored_no_pool count=%d", len(ids))
+            return []
+        try:
+            async with self.db_pool.acquire() as conn:
+                rows = await conn.fetch(
+                    "SELECT metadata->>'message_id' AS message_id FROM knowledge_content "
+                    "WHERE source_type = 'meeting' AND metadata->>'message_id' = ANY($1::text[])",
+                    ids,
+                )
+        except Exception as exc:  # noqa: BLE001 — see the docstring
+            activity.logger.warning("meeting_unstored_failed err=%s", str(exc)[:200])
+            return []
+        stored = {r["message_id"] for r in rows}
+        return [mid for mid in ids if mid not in stored]
 
     async def _record_observations(self, doc: dict, stats: dict) -> int:
         """One row per metric, deduped on (source, metric, external_id).
