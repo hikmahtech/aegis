@@ -38,14 +38,22 @@ REVIEW = {
 
 
 class _FakeLLM:
+    """One response, or a LIST consumed one per call, plus every call's kwargs.
+
+    The retry path needs a second, different reply from the same client. A
+    single response repeats on every call, so a fake that returns garbage keeps
+    returning garbage — which is what the terminal case looks like in prod.
+    """
+
     def __init__(self, response=None, exc=None):
-        self.response, self.exc, self.calls = response, exc, []
+        self.responses = list(response) if isinstance(response, list) else [response]
+        self.exc, self.calls = exc, []
 
     async def think(self, **kw):
         self.calls.append(kw)
         if self.exc:
             raise self.exc
-        return {"response": self.response}
+        return {"response": self.responses[min(len(self.calls), len(self.responses)) - 1]}
 
 
 class _RulesPool:
@@ -183,3 +191,40 @@ async def test_agent_id_argument_attributes_the_llm_spend_to_the_caller():
     out = await _act(_RulesPool(["Sam"]), llm).analyse_meeting(DOC, agent_id="maou")
     assert "skipped" not in out
     assert llm.calls[0]["agent_id"] == "maou"
+
+
+async def test_an_unparseable_review_is_retried_once_and_succeeds():
+    """#363: prod saw the call succeed and the body fail to parse, then an
+    unchanged re-run come back clean. One retry rescues that meeting."""
+    llm = _FakeLLM(["not json at all", json.dumps(REVIEW)])
+    out = await _act(_RulesPool(["Sam"]), llm).analyse_meeting(DOC)
+    assert "skipped" not in out
+    assert out["review"] == REVIEW
+    assert len(llm.calls) == 2
+    first, second = llm.calls[0]["prompt"], llm.calls[1]["prompt"]
+    assert "not valid JSON" not in first
+    assert second.startswith(first)  # the SAME call, with one corrective line added
+    assert "not valid JSON" in second[len(first) :]
+
+
+async def test_an_unparseable_review_twice_is_llm_failed():
+    llm = _FakeLLM(["not json at all", "still not json"])
+    out = await _act(_RulesPool(["Sam"]), llm).analyse_meeting(DOC)
+    assert out["skipped"] == "llm_failed"
+    assert len(llm.calls) == 2  # the retry never retries
+
+
+async def test_a_parseable_review_is_not_retried():
+    llm = _FakeLLM(json.dumps(REVIEW))
+    out = await _act(_RulesPool(["Sam"]), llm).analyse_meeting(DOC)
+    assert "skipped" not in out
+    assert len(llm.calls) == 1
+
+
+async def test_a_truncated_review_is_not_retried():
+    """`think()` has already spent its own re-roll by the time it raises, so a
+    retry here would be a third upstream call."""
+    llm = _FakeLLM(exc=LLMTruncationError("cut"))
+    out = await _act(_RulesPool(["Sam"]), llm).analyse_meeting(DOC)
+    assert out["skipped"] == "llm_failed"
+    assert len(llm.calls) == 1
