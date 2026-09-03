@@ -577,6 +577,10 @@ class _LaunchRecorder:
         agent_id: str = "",
         gated: bool = False,
         token_ttl_seconds: int = 0,
+        session_id: str = "",
+        resume: bool = False,
+        name: str = "",
+        worktree_path: str = "",
     ) -> dict:
         self.calls.append(
             {
