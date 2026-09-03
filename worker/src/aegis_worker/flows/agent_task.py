@@ -8,12 +8,19 @@ skipped Sentry polls over 41h on 2026-05-29).
 Every child ends by completing the task or parking it at @waiting. Eligibility
 excludes @waiting, so parking is what removes the task from the pool — without
 it the 6h cooldown is an infinite slow loop.
+
+The coding verb is the exception to "one child, one shot". A @code task owns a
+persistent CLI session (`task_sessions`), and this flow is where it is driven:
+one turn per batch of user comments, in a per-task worktree, resumed by
+session id. A comment that arrives while a turn is running is SIGNALLED into
+the running workflow (`comment`), queued, and drained into the next turn — so a
+task has at most one workflow (`agent-task-<id>`) and at most one live turn.
+The two exits that do not park are deliberate and each carry their reason.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import timedelta
 from html import escape as _esc
 from typing import Any
 
@@ -22,21 +29,117 @@ from temporalio.exceptions import ApplicationError, WorkflowAlreadyStartedError
 
 with workflow.unsafe.imports_passed_through():
     from aegis_worker.activities.agent_task import extract_service_name, resolve_verb
-    from aegis_worker.activities.alert_governance import (
-        CreateGithubPrInput,
-        StagePendingPrInput,
-    )
-    from aegis_worker.flows.alert_investigation import _build_repo_confirm_prompt
+    from aegis_worker.activities.delivery import DeliveryActivities
+    from aegis_worker.flows.agent_run import poll_until_exit
     from aegis_worker.flows.interaction import InteractionFlow, InteractionFlowInput
     from aegis_worker.shared.retry import (
         ACT_RETRY,
         NO_RETRY,
-        RETRY_ONCE,
-        TIMEOUT_CLAUDE,
+        STANDARD,
         TIMEOUT_FAST,
         TIMEOUT_LONG,
         TIMEOUT_STANDARD,
     )
+
+# Per note, then over the whole rendered thread. `load_task` already caps the
+# thread at 30 notes, but one pasted stack trace can outweigh the rest of the
+# conversation, and the connector caps the whole prompt at 24 000 bytes — a
+# thread that blew that budget would silently truncate the INSTRUCTIONS at the
+# bottom. The NEWEST lines are kept (a turn needs the last thing the user said
+# far more than the first) and the drop is announced, so the model knows it is
+# reading a tail rather than the whole story.
+_THREAD_NOTE_CAP = 800
+_THREAD_RENDER_CAP = 12000
+# Tail of a finished turn's raw transcript, when it emitted no final message.
+_TURN_OUTPUT_TAIL = 6000
+# Tail carried by a timeout comment. Deliberately smaller: it is a fragment of
+# a run that never concluded, not an answer.
+_TURN_TIMEOUT_TAIL = 3000
+
+
+def _render_thread(notes: list | None) -> str:
+    """The task's comment thread as `[<posted_at>] <content>` lines."""
+    lines = [
+        f"[{str((note or {}).get('posted_at') or '')}] "
+        f"{str((note or {}).get('content') or '')[:_THREAD_NOTE_CAP]}"
+        for note in (notes or [])
+    ]
+    if not lines:
+        return "(no comments yet)"
+    kept: list[str] = []
+    used = 0
+    for line in reversed(lines):
+        if kept and used + len(line) + 1 > _THREAD_RENDER_CAP:
+            break
+        kept.append(line)
+        used += len(line) + 1
+    kept.reverse()
+    dropped = len(lines) - len(kept)
+    if dropped:
+        kept.insert(0, f"[... {dropped} earlier comments omitted]")
+    return "\n".join(kept)
+
+
+def _first_turn_prompt(task_id: str, task: dict, session: dict) -> str:
+    """Turn 1: investigate only, and end with a STATUS line.
+
+    Read-only is not a safety rail here so much as a product one — turn 1 runs
+    unattended off the sweep, before the user has said anything about this
+    task beyond its title, so the only useful output is a plan to react to.
+    """
+    title = str(task.get("content") or "")
+    description = str(task.get("description") or "")
+    branch = str(session.get("branch") or "")
+    thread = _render_thread(task.get("notes"))
+    return f"""You are working Todoist task {task_id}: {title}
+
+{description}
+
+Comment thread so far (oldest first; AEGIS's own notes carry a `Workflow run:` footer):
+{thread}
+
+This is your first turn on this task. Investigate only: read the code, do NOT
+modify files, commit, or create branches. Report:
+1. What the task is actually asking for.
+2. Which files would need to change.
+3. A short implementation plan.
+4. Anything ambiguous or risky, as questions for the user.
+
+You are in a per-task worktree on branch `{branch}`. Later turns implement here
+when the user says so. End your final message with exactly one of:
+STATUS: plan
+STATUS: question: <what you need from the user>
+STATUS: unactionable: <why>"""
+
+
+def _later_turn_prompt(task_id: str, task: dict, session: dict, comments: list[str]) -> str:
+    """Turn 2+: the user's queued replies, quoted, and the session's rules.
+
+    Nothing here re-states the task: the session already holds every earlier
+    turn, so repeating the brief would fight its own memory. Several queued
+    comments are joined with a blank line — they arrived while one turn ran and
+    are answered as one.
+    """
+    title = str(task.get("content") or "")
+    branch = str(session.get("branch") or "")
+    quoted = "\n\n".join(
+        "\n".join(f"> {line}" for line in (comment.splitlines() or [""]))
+        for comment in comments
+    )
+    return f"""The user replied on Todoist task {task_id} ({title}):
+
+{quoted}
+
+Act on it. Rules for this session:
+- Implement only when the user asks. Commit to branch `{branch}` in this
+  worktree, never to the default branch.
+- Open a pull request only when the user asks, with `gh pr create --draft`.
+- Nobody can answer questions mid-turn; ask them in your final message instead.
+End your final message with exactly one of:
+STATUS: done
+STATUS: waiting: <what you need from the user>
+STATUS: pr: <url>
+STATUS: unactionable: <why>"""
 
 
 @dataclass
@@ -44,7 +147,11 @@ class AgentTaskSweepConfig:
     agent_id: str  # MUST be first — the run recorder reads it
     max_tasks: int = 3
     cooldown_hours: int = 6
-    max_coding: int = 1
+    # Counts NEW and RESUMED coding turns alike. Was 1, when a coding task cost
+    # a full investigate-plan-implement-PR arc; a turn is one bounded CLI run,
+    # so the ceiling that matters now is how many the host should run at once.
+    max_coding: int = 3
+    turn_timeout_minutes: int = 60
 
 
 @dataclass
@@ -55,6 +162,10 @@ class AgentTaskFlowInput:
     # which the eligibility cooldown query depends on.
     todoist_task_id: str
     task: dict[str, Any] = field(default_factory=dict)
+    # The comment that woke this flow. The webhook and the fallback sweep both
+    # carry one; the sweep's first turn does not.
+    comment: str = ""
+    turn_timeout_minutes: int = 60
 
 
 @workflow.defn(name="AgentTaskSweepFlow")
@@ -80,6 +191,7 @@ class AgentTaskSweepFlow:
                             agent_id=config.agent_id,
                             todoist_task_id=str(task["id"]),
                             task=task,
+                            turn_timeout_minutes=config.turn_timeout_minutes,
                         ),
                         id=f"agent-task-{task['id']}",
                         parent_close_policy=workflow.ParentClosePolicy.ABANDON,
@@ -93,24 +205,128 @@ class AgentTaskSweepFlow:
                         task["id"],
                         str(exc)[:200],
                     )
+
+            # The fallback for a missed Todoist webhook, and the only path that
+            # serves comments posted while the webhook is down. It keys on the
+            # session's own `last_turn_at` watermark, NOT the 6h flow cooldown:
+            # a reply must not wait six hours because the task ran recently.
+            step = "dispatch_due_turns"
+            due = await workflow.execute_activity(
+                "find_task_turns_due",
+                args=[config.max_coding],
+                start_to_close_timeout=TIMEOUT_FAST,
+                retry_policy=ACT_RETRY,
+            )
+            resumed = 0
+            for row in due:
+                resumed += await self._dispatch_turn(row, config)
         except Exception as exc:  # noqa: BLE001
             raise ApplicationError(
                 f"agent_task_sweep_failed at step={step}: {exc!r}", non_retryable=True
             ) from exc
 
-        return {"found": len(tasks), "spawned": spawned}
+        return {"found": len(tasks), "spawned": spawned, "resumed": resumed}
+
+    async def _dispatch_turn(self, row: dict, config: AgentTaskSweepConfig) -> int:
+        """Land one due comment on its task's workflow. Returns 1 on success.
+
+        The in-workflow half of `services/task_sessions.dispatch_task_turn`:
+        start the task's single workflow, and if it is already running signal
+        the comment into it instead. Every failure is swallowed — one
+        unreachable task must not cost the rest of the sweep, and the row stays
+        due (its watermark only moves once a turn actually consumes it).
+        """
+        task_id = str(row.get("task_id") or "")
+        comment = str(row.get("comment") or "")
+        if not task_id:
+            workflow.logger.warning("agent_task_turn_row_has_no_task_id")
+            return 0
+        wf_id = f"agent-task-{task_id}"
+        try:
+            await workflow.start_child_workflow(
+                AgentTaskFlow.run,
+                AgentTaskFlowInput(
+                    agent_id=str(row.get("agent_id") or config.agent_id),
+                    todoist_task_id=task_id,
+                    comment=comment,
+                    turn_timeout_minutes=config.turn_timeout_minutes,
+                ),
+                id=wf_id,
+                parent_close_policy=workflow.ParentClosePolicy.ABANDON,
+            )
+            return 1
+        except WorkflowAlreadyStartedError:
+            pass
+        except Exception as exc:  # noqa: BLE001
+            workflow.logger.warning(
+                "agent_task_turn_start_failed task_id=%s err=%s", task_id, str(exc)[:200]
+            )
+            return 0
+        try:
+            await workflow.get_external_workflow_handle(wf_id).signal("comment", comment)
+            return 1
+        except Exception as exc:  # noqa: BLE001
+            # The flow completed between the start attempt and the signal. The
+            # comment is still unconsumed, so the next tick starts a fresh
+            # workflow for it — 15 minutes later, not never.
+            workflow.logger.warning(
+                "agent_task_turn_signal_failed task_id=%s err=%s", task_id, str(exc)[:200]
+            )
+            return 0
 
 
 @workflow.defn(name="AgentTaskFlow")
 class AgentTaskFlow:
+    def __init__(self) -> None:
+        self._pending: list[str] = []
+        # Set by the coding path at every phase, so the generic handler below
+        # names the step that actually failed rather than "run_coding".
+        self._step = ""
+
+    @workflow.signal
+    def comment(self, text: str) -> None:
+        """A user comment that arrived while this task's flow was running.
+
+        Queued, never applied here: a signal handler runs between workflow
+        tasks, so acting on it would race the turn in flight. The coding loop
+        drains the queue after each turn.
+        """
+        text = (text or "").strip()
+        if text and text not in self._pending:
+            self._pending.append(text)
+
+    def _drain(self) -> list[str]:
+        out, self._pending = self._pending, []
+        return out
+
     @workflow.run
     async def run(self, input: AgentTaskFlowInput) -> dict:
         task = input.task
         task_id = input.todoist_task_id
-        verb = resolve_verb(task)
+        verb = "unknown"
 
-        step = "load_task_context"
+        step = "load_task"
         try:
+            if not task:
+                # The webhook and the fallback sweep carry a task id and a
+                # comment, nothing else — load the task rather than trust a
+                # payload's copy of it.
+                task = await workflow.execute_activity(
+                    "load_task",
+                    args=[task_id],
+                    start_to_close_timeout=TIMEOUT_FAST,
+                    retry_policy=ACT_RETRY,
+                )
+                if not task:
+                    # Deleted between the comment that woke us and this call.
+                    # Nothing to park, nothing to comment on.
+                    return {"task_id": task_id, "verb": "unknown", "status": "unknown_task"}
+                # The other verbs read input.task directly; keep the two views
+                # of the task identical rather than threading a second one.
+                input.task = task
+            verb = resolve_verb(task)
+
+            step = "load_task_context"
             context = await workflow.execute_activity(
                 "load_task_context",
                 args=[task_id],
@@ -132,7 +348,7 @@ class AgentTaskFlow:
 
             if verb == "coding":
                 step = "run_coding"
-                return await self._run_coding(input, task_id)
+                return await self._run_coding(input, task_id, task)
 
             # Any remaining verb parks the task rather than guessing at it.
             # The loaded source identity (when recovered) rides along in the
@@ -171,6 +387,7 @@ class AgentTaskFlow:
             # re-failed every cooldown window. Best-effort park here (own
             # try/except so a park failure can't mask the original error)
             # before re-raising with step context per repo convention.
+            step = self._step or step
             try:
                 await workflow.execute_activity(
                     "park_task",
@@ -455,297 +672,306 @@ class AgentTaskFlow:
         )
         return {"task_id": task_id, "verb": "coding", "status": status, **extra}
 
-    async def _run_coding(self, input: AgentTaskFlowInput, task_id: str) -> dict:
-        """Resolve the repo, investigate read-only, gate the plan, implement on
-        approval, then gate the PR. Every exit path parks EXCEPT a repo-busy
-        skip, which must leave the task untouched so it stays in the eligible
-        pool — a coding task never auto-completes; even an opened PR still needs
-        human review."""
-        setup = await self._investigate_coding_task(input, task_id)
-        if "plan" not in setup:
-            return setup  # early exit: parked, or a repo-busy skip that must not park
-        repo, plan = setup["repo"], setup["plan"]
 
-        # AWAIT the plan card. Safe because the sweep spawned this workflow
-        # ABANDONED — blocking here cannot starve later ticks.
-        plan_card = await workflow.execute_child_workflow(
-            InteractionFlow.run,
-            InteractionFlowInput(
-                agent_id=input.agent_id,
-                kind="choice",
-                origin="agent_task_coding_plan",
-                prompt=(
-                    # _esc() every user/agent-derived string inside an HTML tag —
-                    # repo-wide convention (_run_infra, _run_finance,
-                    # calendar_ingest, receipt_ingest, gmail_ingest all do this).
-                    # A literal `<` or `&` in a task title otherwise breaks the
-                    # comms html_to_mrkdwn parse.
-                    f"🛠 <b>{_esc(str(input.task.get('content') or ''))}</b>\n\n"
-                    f"Repo: <code>{_esc(repo['github_repo'])}</code>\n\n"
-                    f"{_esc(plan[:1200])}\n\n"
-                    "Implement this?"
-                ),
-                options={"approve": "✅ Implement", "skip": "⏭️ Not now"},
-                timeout_seconds=172800,
-                timeout_policy="archive",
-            ),
-            id=f"agent-task-plan-{task_id}",
-        )
-        if (plan_card.response or {}).get("value") != "approve":
-            return await self._park_coding(task_id, "plan not approved", status="plan_declined")
+    async def _record_turn(self, task_id: str, launched: bool) -> None:
+        """Move the session's watermark past the comment this turn consumed.
 
-        return await self._implement_and_open_pr(input, task_id, repo, plan)
-
-    async def _confirm_repo_gate0(
-        self, input: AgentTaskFlowInput, task_id: str, candidates: list[dict]
-    ) -> dict | None:
-        """Tier 3: resolve_task_repo's tiers 1-2 didn't confidently resolve a
-        repo but did surface candidates — ask rather than guess. Mirrors
-        alert_investigation.py's Gate-0 repo-confirm card (same
-        _build_repo_confirm_prompt + numbered candidate menu), blocking here
-        because AgentTaskFlow is already an ABANDONED child of the sweep (safe
-        to await, same reasoning as the plan/PR cards above).
-
-        Returns the resolved repo dict on a confirmed pick, or None on
-        decline/timeout — the caller then parks exactly as it would for a
-        fully-unresolved repo."""
-        top = candidates[:5]
-        if not top:
-            return None
-        options = {
-            str(i): f"{i + 1}. 📦 {c.get('resource_title') or c.get('github_repo') or '?'}"
-            for i, c in enumerate(top)
-        }
-        options["none"] = "❌ None of these / cancel"
-        prompt = _build_repo_confirm_prompt(
-            title=str(input.task.get("content") or ""),
-            source="agent_task",
-            severity="",
-            service="",
-            description=str(input.task.get("description") or ""),
-            task_id=task_id,
-            candidates=top,
-        )
-        picked = await workflow.execute_child_workflow(
-            InteractionFlow.run,
-            InteractionFlowInput(
-                agent_id=input.agent_id,
-                kind="choice",
-                origin="agent_task_repo_confirm",
-                prompt=prompt,
-                options=options,
-                timeout_seconds=86400,
-                timeout_policy="archive",
-            ),
-            id=f"agent-task-repo-confirm-{task_id}",
-        )
-        if getattr(picked, "status", None) == "archived":
-            return None
-        picked_val = ((picked.response or {}).get("value") or "").strip()
-        if not picked_val.isdigit() or int(picked_val) >= len(top):
-            return None
-        chosen = top[int(picked_val)]
-        chosen_repo = chosen.get("github_repo") or ""
-        return {
-            "github_repo": chosen_repo,
-            "repo_path": chosen.get("resource_path") or chosen_repo.split("/")[-1],
-            "source": "user_confirmed",
-            "candidates": [],
-        }
-
-    async def _investigate_coding_task(self, input: AgentTaskFlowInput, task_id: str) -> dict:
-        """Phase 1: resolve the repo, run a read-only investigation, and post
-        the plan as a comment. Returns the terminal result dict directly on
-        any early exit (no repo / investigation failed / empty transcript);
-        otherwise returns {"repo": repo, "plan": plan} for the plan-approval
-        gate in _run_coding."""
-        repo = await workflow.execute_activity(
-            "resolve_task_repo",
-            args=[input.task],
-            start_to_close_timeout=TIMEOUT_STANDARD,
+        EVERY coding exit calls it, including the two that hand the task
+        straight back — the comment has been dealt with, and the 15-minute
+        fallback sweep keys on this watermark, so skipping it re-dispatches the
+        same comment for ever.
+        """
+        await workflow.execute_activity(
+            "record_task_turn",
+            args=[task_id, launched],
+            start_to_close_timeout=TIMEOUT_FAST,
             retry_policy=ACT_RETRY,
         )
-        # Tier 3: tiers 1-2 didn't confidently resolve a repo but did surface
-        # candidates — ask rather than guess (Gate-0 confirm card).
-        if not repo["github_repo"] and repo.get("candidates"):
-            confirmed = await self._confirm_repo_gate0(input, task_id, repo["candidates"])
-            if confirmed is not None:
-                repo = confirmed
-        if not repo["github_repo"]:
-            return await self._park_coding(
-                task_id,
-                "repo unresolved",
-                comment="I couldn't work out which repository this task is about, so I "
-                "haven't touched anything.",
-                agent_id=input.agent_id,
+
+    async def _deliver(self, agent_id: str, text: str) -> None:
+        """Send to the agent's bound channel; never fail the flow over it."""
+        try:
+            await workflow.execute_activity_method(
+                DeliveryActivities.send_message,
+                args=[agent_id, text],
+                start_to_close_timeout=TIMEOUT_FAST,
+                retry_policy=STANDARD,
+            )
+        except Exception as exc:  # noqa: BLE001
+            workflow.logger.warning(
+                "agent_task_delivery_failed agent=%s err=%s", agent_id, str(exc)[:200]
             )
 
-        investigation = await workflow.execute_activity(
-            "run_task_investigation",
-            args=[
-                task_id,
-                str(input.task.get("content") or ""),
-                str(input.task.get("description") or ""),
-                repo["repo_path"],
-                repo["github_repo"],
-            ],
-            start_to_close_timeout=TIMEOUT_LONG,
-            retry_policy=RETRY_ONCE,
-        )
-        # A transient collision must NOT park: park_task stamps @waiting, which
-        # removes the task from find_actionable_tasks' pool until something
-        # unparks it, so a busy afternoon would retire the task for good.
-        # Returning without "plan" makes _run_coding exit; the cooldown on this
-        # workflow's terminal run row defers the retry.
-        if investigation.get("status") == "skipped":
-            return {"status": "skipped", "reason": "repo_busy", "task_id": task_id}
+    async def _run_coding(self, input: AgentTaskFlowInput, task_id: str, task: dict) -> dict:
+        """Drive the task's persistent coding session, one turn per comment batch.
 
-        if investigation.get("status") == "failed":
-            return await self._park_coding(
-                task_id,
-                "coding run failed to start",
-                comment="I couldn't start a coding run for this.",
-                agent_id=input.agent_id,
+        The loop is the feature. A turn runs; its output is posted as a task
+        comment; the pending queue is drained; a non-empty drain is the next
+        turn's comments and an empty one parks the task at @waiting. So a
+        comment posted while a turn was running folds into the next turn
+        instead of colliding with the running one or waiting for the sweep.
+
+        The session is re-read from `ensure_task_session` on EVERY iteration
+        rather than reused: `turns` decides resume-vs-create, and the worktree
+        check is what self-heals a tree removed out of band between turns.
+
+        Two exits do not park, and both are deliberate — see `you_are_in_it`
+        below and `_park_coding` for the rest.
+        """
+        agent_id = input.agent_id
+        timeout_min = max(1, int(input.turn_timeout_minutes or 60))
+
+        if "notes" not in task:
+            # The sweep's first-turn path hands over `find_actionable_tasks`
+            # rows, which are task COLUMNS only. The comment thread is the
+            # session's context — the operator's instructions usually live
+            # there, not in the title — so load it rather than open turn 1 on
+            # an empty conversation. `run()`'s webhook path already has it.
+            self._step = "coding:load_task"
+            loaded = await workflow.execute_activity(
+                "load_task",
+                args=[task_id],
+                start_to_close_timeout=TIMEOUT_FAST,
+                retry_policy=ACT_RETRY,
+            )
+            if loaded:
+                task = loaded
+        title = str(task.get("content") or "")
+
+        # The comment that woke this flow, plus anything that arrived before we
+        # got here. Deduped: the webhook and the fallback sweep can both carry
+        # the same note, and answering it twice in one prompt is noise.
+        comments = [input.comment.strip()] if input.comment.strip() else []
+        comments += [c for c in self._drain() if c not in comments]
+        turns_run = 0
+        session: dict = {}
+
+        while True:
+            # `take over` is the operator overruling the same-task check for
+            # this turn only (rule 4). Rule 1 still applies — a comment must
+            # not be able to authorise driving a session someone is sitting in.
+            override = any(c.lower().startswith("take over") for c in comments)
+
+            self._step = "coding:ensure_task_session"
+            ensured = await workflow.execute_activity(
+                "ensure_task_session",
+                args=[task_id, agent_id, task, comments[-1] if comments else ""],
+                start_to_close_timeout=TIMEOUT_STANDARD,
+                retry_policy=ACT_RETRY,
+            )
+            status = str(ensured.get("status") or "")
+            if status == "candidates":
+                await self._record_turn(task_id, False)
+                names = ", ".join(
+                    str(c.get("github_repo") or "")
+                    for c in (ensured.get("candidates") or [])
+                    if c.get("github_repo")
+                )
+                return await self._park_coding(
+                    task_id,
+                    "repo ambiguous",
+                    status="repo_ambiguous",
+                    comment="I can't tell which repository this is about. Reply with "
+                    f"one of: {names}",
+                    agent_id=agent_id,
+                    turns=turns_run,
+                )
+            if status != "ready" or not ensured.get("session"):
+                # No repo and nothing to choose between. The session row still
+                # exists, so the next comment reaches this flow and can name one.
+                await self._record_turn(task_id, False)
+                error = str(ensured.get("error") or "")
+                return await self._park_coding(
+                    task_id,
+                    "repo unresolved",
+                    comment="I couldn't work out which repository this task is about"
+                    + (f": {error}" if error else "")
+                    + ", so I haven't touched anything.",
+                    agent_id=agent_id,
+                    turns=turns_run,
+                )
+            session = ensured["session"]
+
+            self._step = "coding:check_task_collision"
+            verdict = await workflow.execute_activity(
+                "check_task_collision",
+                args=[
+                    task_id,
+                    str(session.get("repo") or ""),
+                    str(session.get("session_id") or ""),
+                    override,
+                ],
+                start_to_close_timeout=TIMEOUT_STANDARD,
+                retry_policy=ACT_RETRY,
+            )
+            call = str(verdict.get("verdict") or "proceed")
+
+            if call == "you_are_in_it":
+                # NO Todoist comment and NO park. The comment is already in
+                # front of whoever holds this session, so commenting would
+                # duplicate it and parking would stamp @waiting on a task
+                # somebody is actively working. The watermark still moves.
+                await self._record_turn(task_id, False)
+                held = verdict.get("session") or {}
+                name = str(held.get("name") or "unnamed")
+                if str(held.get("owner") or "human") == "aegis":
+                    note = (
+                        f"The previous turn on task {task_id} is still running "
+                        f"('{name}'); your comment will be picked up when it finishes."
+                    )
+                    outcome = "turn_still_running"
+                else:
+                    note = (
+                        f"You're in the session for task {task_id} ('{name}'); "
+                        "your comment is waiting for you there."
+                    )
+                    outcome = "operator_in_session"
+                await self._deliver(agent_id, note)
+                return {"task_id": task_id, "verb": "coding", "status": outcome}
+
+            if call == "hand_to_you":
+                await self._record_turn(task_id, False)
+                held = verdict.get("session") or {}
+                name = str(held.get("name") or "unnamed")
+                branch = str(held.get("branch") or "")
+                return await self._park_coding(
+                    task_id,
+                    "operator already on it",
+                    status="handed_to_operator",
+                    comment=f"You look to be on this already in session '{name}'"
+                    + (f" on branch `{branch}`" if branch else "")
+                    + ". I'll stay out. Reply `take over` when you want me to proceed.",
+                    agent_id=agent_id,
+                    turns=turns_run,
+                )
+
+            # Read BEFORE the watermark bump below: `turns` is what decides
+            # whether this turn creates the session or resumes it, and what
+            # numbers the footer the operator takes over with.
+            first = int(session.get("turns") or 0) == 0
+            turn_no = int(session.get("turns") or 0) + 1
+            prompt = (
+                _first_turn_prompt(task_id, task, session)
+                if first
+                else _later_turn_prompt(task_id, task, session, comments)
             )
 
-        collected = await workflow.execute_activity(
-            "collect_coding_run",
-            args=[investigation.get("output_file", ""), investigation.get("host", "")],
-            start_to_close_timeout=TIMEOUT_CLAUDE,
-            retry_policy=NO_RETRY,
-            heartbeat_timeout=timedelta(minutes=2),
-        )
-        plan = collected.get("transcript", "")
-        if not plan:
-            return await self._park_coding(
-                task_id,
-                "empty investigation transcript",
-                comment="The investigation produced no usable output.",
-                agent_id=input.agent_id,
+            # Recorded BEFORE the launch, not after: a launch that fails still
+            # consumed the comment, and a watermark left behind would have the
+            # fallback sweep re-dispatch it every 15 minutes for ever.
+            self._step = "coding:record_task_turn"
+            await self._record_turn(task_id, True)
+
+            self._step = "coding:launch_task_turn"
+            launched = await workflow.execute_activity(
+                "launch_task_turn",
+                args=[
+                    session,
+                    prompt,
+                    agent_id,
+                    not first,
+                    f"task {task_id}: {title[:60]}",
+                    timeout_min,
+                ],
+                start_to_close_timeout=TIMEOUT_LONG,
+                # NO_RETRY, as everywhere a CLI session is started: a retry is a
+                # SECOND billed session racing the first one's writes.
+                retry_policy=NO_RETRY,
+            )
+            output_file = str(launched.get("output_file") or "")
+            host = str(launched.get("host") or "")
+            if str(launched.get("status") or "") != "running":
+                return await self._park_coding(
+                    task_id,
+                    "turn failed to start",
+                    status="launch_failed",
+                    comment="I couldn't start a turn on this: "
+                    f"{launched.get('error') or 'unknown error'}",
+                    agent_id=agent_id,
+                    turns=turns_run,
+                )
+
+            self._step = "coding:poll"
+            outcome = await poll_until_exit(
+                output_file=output_file,
+                host=host,
+                deadline_s=timeout_min * 60,
+                launched_at=workflow.now(),
+            )
+            if str(outcome.get("status") or "") == "timeout":
+                self._step = "coding:kill_task_turn"
+                await self._kill_turn(output_file, host)
+                # `poll_until_exit` returns no output on a timeout by design,
+                # and fetching more would cost a round trip on a run we just
+                # asked to stop. "asked to stop", never "was stopped": the kill
+                # is `fuser -k` and may have found nothing to kill.
+                tail = str(outcome.get("output") or "")[-_TURN_TIMEOUT_TAIL:]
+                body = (
+                    f"Turn was asked to stop after {timeout_min} min (deadline). "
+                    f"Output so far:\n\n{tail or '(no output captured)'}"
+                )
+            else:
+                body = (
+                    str(outcome.get("final") or "")
+                    or str(outcome.get("output") or "")[-_TURN_OUTPUT_TAIL:]
+                    or str(outcome.get("reason") or "")
+                    or "no output"
+                )
+
+            others = verdict.get("sessions") or []
+            if others:
+                # Judged unrelated, but the operator should still know AEGIS is
+                # typing in the same repo they have open.
+                body = (
+                    "FYI: you have a live session in this repo "
+                    f"('{str((others[0] or {}).get('name') or 'unnamed')}'); I'm working "
+                    f"in my own worktree at {session.get('worktree_path') or ''}.\n\n"
+                ) + body
+            session_id = str(session.get("session_id") or "")
+            body += (
+                f"\n\nSession: {session_id} · turn {turn_no}\n"
+                f"Take over: cd {session.get('worktree_path') or ''} && "
+                f"claude --resume {session_id}"
             )
 
-        await workflow.execute_activity(
-            "comment",
-            args=[task_id, input.agent_id, f"Investigation in `{repo['github_repo']}`:\n\n{plan}"],
-            start_to_close_timeout=TIMEOUT_STANDARD,
-            retry_policy=NO_RETRY,
-        )
-        return {"repo": repo, "plan": plan}
-
-    async def _implement_and_open_pr(
-        self, input: AgentTaskFlowInput, task_id: str, repo: dict, plan: str
-    ) -> dict:
-        """Phase 2: implement the approved plan, then gate opening a PR."""
-        implementation = await workflow.execute_activity(
-            "run_task_implementation",
-            args=[
-                task_id,
-                str(input.task.get("content") or ""),
-                str(input.task.get("description") or ""),
-                plan,
-                repo["repo_path"],
-                repo["github_repo"],
-            ],
-            start_to_close_timeout=TIMEOUT_LONG,
-            retry_policy=NO_RETRY,
-        )
-        impl_output = await workflow.execute_activity(
-            "collect_coding_run",
-            args=[implementation.get("output_file", ""), implementation.get("host", "")],
-            start_to_close_timeout=TIMEOUT_CLAUDE,
-            retry_policy=NO_RETRY,
-            heartbeat_timeout=timedelta(minutes=2),
-        )
-        await workflow.execute_activity(
-            "comment",
-            args=[
-                task_id,
-                input.agent_id,
-                f"Implementation run finished ({impl_output.get('status')}) on branch "
-                f"`{implementation.get('branch', '?')}`.",
-            ],
-            start_to_close_timeout=TIMEOUT_STANDARD,
-            retry_policy=NO_RETRY,
-        )
-        if impl_output.get("status") != "succeeded" or not implementation.get("branch"):
-            return await self._park_coding(task_id, "implementation did not complete")
-
-        pr_card = await workflow.execute_child_workflow(
-            InteractionFlow.run,
-            InteractionFlowInput(
-                agent_id=input.agent_id,
-                kind="choice",
-                origin="agent_task_coding_pr",
-                prompt=(
-                    f"📤 Branch <code>{_esc(implementation['branch'])}</code> is ready in "
-                    f"<code>{_esc(repo['github_repo'])}</code>.\n\nOpen a PR?"
-                ),
-                options={"approve": "✅ Open PR", "skip": "⏭️ Leave the branch"},
-                timeout_seconds=172800,
-                timeout_policy="archive",
-            ),
-            id=f"agent-task-pr-{task_id}",
-        )
-        if (pr_card.response or {}).get("value") != "approve":
-            return await self._park_coding(
-                task_id, "PR not approved; branch left in place", status="pr_declined"
+            self._step = "coding:comment"
+            await workflow.execute_activity(
+                "comment",
+                args=[task_id, agent_id, body],
+                start_to_close_timeout=TIMEOUT_STANDARD,
+                retry_policy=NO_RETRY,
             )
+            turns_run += 1
 
-        # stage_pending_pr takes StagePendingPrInput and returns a PLAIN STRING
-        # pending_pr_id (alert_governance.py:103) — not a dict. `alert_fingerprint`
-        # is reused as the correlation key; for a task-driven PR that is task:<id>.
-        staged = await workflow.execute_activity(
-            "stage_pending_pr",
-            StagePendingPrInput(
-                alert_fingerprint=f"task:{task_id}",
-                repo=repo["github_repo"],
-                branch=implementation["branch"],
-                title=f"{input.task.get('content')}"[:72],
-                body=f"Implements Todoist task {task_id}.\n\n{plan[:2000]}",
-            ),
-            start_to_close_timeout=TIMEOUT_STANDARD,
-            retry_policy=ACT_RETRY,
-        )
-        pr = await workflow.execute_activity(
-            "create_github_pr",
-            CreateGithubPrInput(
-                pending_pr_id=staged,
-                repo=repo["github_repo"],
-                branch=implementation["branch"],
-                base="main",
-                host=implementation.get("host", ""),
-                repo_path=repo["repo_path"],
-            ),
-            start_to_close_timeout=TIMEOUT_LONG,
-            # NO_RETRY, matching the canonical caller (alert_investigation.py:1556):
-            # `git push` + `gh pr create` is NOT idempotent. If attempt 1 succeeds
-            # but runs past TIMEOUT_LONG, a retried attempt 2's `gh pr create` fails
-            # with "a pull request already exists" → status="failed" → this flow
-            # would then correctly-but-wrongly report pr_failed while a PR exists.
-            retry_policy=NO_RETRY,
-        )
-        # create_github_pr returns {"pr_url", "status", "error"} and can report
-        # status="failed" (push rejected, gh pr create failure, missing
-        # pending_pr row) WITHOUT raising — checking pr.get("status") is
-        # required, not just reading pr_url, or a failed PR silently reads as
-        # opened.
-        if pr.get("status") != "opened" or not pr.get("pr_url"):
-            return await self._park_coding(
-                task_id,
-                f"PR creation failed: {pr.get('error') or 'unknown error'}",
-                status="pr_failed",
-                comment=f"Implementation is on branch `{implementation['branch']}` in "
-                f"`{repo['github_repo']}`, but opening the PR failed: "
-                f"{pr.get('error') or 'unknown error'}.",
-                agent_id=input.agent_id,
-            )
+            comments = self._drain()
+            if not comments:
+                break
 
-        # @waiting, never complete: the PR still needs your review.
+        self._step = "coding:park"
         return await self._park_coding(
             task_id,
-            "PR opened, awaiting review",
-            status="pr_opened",
-            comment=f"Opened a PR: {pr['pr_url']}",
-            agent_id=input.agent_id,
-            repo=repo["github_repo"],
+            "waiting on you",
+            status="parked",
+            turns=turns_run,
+            session_id=str(session.get("session_id") or ""),
         )
+
+    async def _kill_turn(self, output_file: str, host: str) -> None:
+        """Ask a timed-out turn to stop. Failure is logged, never fatal.
+
+        The kill is best-effort by construction — `kill_task_turn` reports that
+        the command RAN, not that a process died — so the flow already cannot
+        rely on it. Letting an exception here bury the timeout comment would
+        cost the operator the one signal that says what happened.
+        """
+        try:
+            await workflow.execute_activity(
+                "kill_task_turn",
+                args=[output_file, host],
+                start_to_close_timeout=TIMEOUT_STANDARD,
+                retry_policy=STANDARD,
+            )
+        except Exception as exc:  # noqa: BLE001
+            workflow.logger.warning(
+                "agent_task_kill_failed output_file=%s err=%s", output_file, str(exc)[:200]
+            )

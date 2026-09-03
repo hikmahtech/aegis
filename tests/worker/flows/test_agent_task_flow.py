@@ -121,13 +121,17 @@ async def test_sweep_spawns_one_child_per_task_and_does_not_await_them():
     ) -> list[dict]:
         return [dict(_TASK, id=f"tf-{n}") for n in range(1, 4)]
 
+    @activity.defn(name="find_task_turns_due")
+    async def find_task_turns_due(limit: int = 20) -> list[dict]:
+        return []
+
     async with await WorkflowEnvironment.start_time_skipping() as env:
         queue = f"tq-{uuid.uuid4()}"
         async with Worker(
             env.client,
             task_queue=queue,
             workflows=[AgentTaskSweepFlow, AgentTaskFlow],
-            activities=[find_actionable_tasks],
+            activities=[find_actionable_tasks, find_task_turns_due],
         ):
             result = await env.client.execute_workflow(
                 AgentTaskSweepFlow.run,
@@ -136,51 +140,43 @@ async def test_sweep_spawns_one_child_per_task_and_does_not_await_them():
                 task_queue=queue,
             )
 
-    assert result == {"found": 3, "spawned": 3}
+    assert result == {"found": 3, "spawned": 3, "resumed": 0}
 
 
-# --- Issue #154: parametrised proof over all 17 AgentTaskFlow.run exit paths ---
+# --- Issue #154: parametrised proof over all 16 AgentTaskFlow.run exit paths ---
 #
 # `find_actionable_tasks` excludes @waiting, so every exit MUST complete or
 # park the task — otherwise the 6h cooldown re-picks (and re-fails) it
 # forever. This is the single mechanical proof of that invariant: one case
-# per terminal return/raise statement in AgentTaskFlow (17 total — 2 in
-# run(), 3 in _run_infra, 2 in _run_email, 2 in _run_finance, 8 in
-# _run_coding; see issue #154 for the full enumeration).
+# per terminal return/raise statement in AgentTaskFlow (16 total — 3 in
+# run(), 3 in _run_infra, 2 in _run_email, 2 in _run_finance, 6 in
+# _run_coding; see issue #154 for the original enumeration).
 #
-# Each case asserts the ACTUAL park/complete activity call fired, not just
-# the returned status string — the literal `return {...}` dict on every exit
-# is unchanged by deleting the park_task call above it, so asserting on the
-# return value alone would not be falsifiable.
+# TWO exits deliberately do not park, and each carries its own terminal proof
+# instead (`case.expect_terminal`):
+#   * `unknown_task` — the task was deleted before we loaded it. There is
+#     nothing to park and nothing to comment on.
+#   * `you_are_in_it` — the operator is sitting in this task's session, so the
+#     comment is already in front of them. Parking would stamp @waiting on a
+#     task somebody is actively working; what stops the fallback sweep
+#     re-dispatching the same comment is the `record_task_turn` watermark, so
+#     THAT is what the case asserts.
+#
+# Each case asserts the ACTUAL park/complete/record activity call fired, not
+# just the returned status string — the literal `return {...}` dict on every
+# exit is unchanged by deleting the park_task call above it, so asserting on
+# the return value alone would not be falsifiable.
 
-# Module-level stubs — Temporal does not allow @workflow.defn on local
-# classes (see tests/worker/test_clarify_flow_agent_spawn.py:14). Only three
-# distinct response shapes are needed across all 17 cases; which card an
-# instance is resolving is read from the InteractionFlowInput it's actually
-# given (`input.origin`), not from any external test state.
+# Module-level stub — Temporal does not allow @workflow.defn on local classes
+# (see tests/worker/test_clarify_flow_agent_spawn.py:14). One shape covers
+# every remaining card: only the infra and finance verbs raise one, and both
+# park immediately afterwards whatever the answer is. The coding verb no
+# longer cards anything — it comments and waits for the user's reply instead.
 @workflow.defn(name="InteractionFlow")
 class _StubInteractionApprove:
     @workflow.run
     async def run(self, input: InteractionFlowInput) -> InteractionResult:
         return InteractionResult(interaction_id="ia-stub", status="resolved", response={"value": "approve"})
-
-
-@workflow.defn(name="InteractionFlow")
-class _StubInteractionSkip:
-    @workflow.run
-    async def run(self, input: InteractionFlowInput) -> InteractionResult:
-        return InteractionResult(interaction_id="ia-stub", status="resolved", response={"value": "skip"})
-
-
-@workflow.defn(name="InteractionFlow")
-class _StubInteractionApprovePlanThenSkipPr:
-    """Only case needing two different cards resolved differently: plan
-    approved, then the PR card declined."""
-
-    @workflow.run
-    async def run(self, input: InteractionFlowInput) -> InteractionResult:
-        value = "approve" if input.origin == "agent_task_coding_plan" else "skip"
-        return InteractionResult(interaction_id="ia-stub", status="resolved", response={"value": value})
 
 
 _ALERT_TASK = dict(_TASK, source_tag="#alert", content="PROLONGED: redis_redis degraded for over 2 hours")
@@ -189,12 +185,18 @@ _EMAIL_TASK = dict(_TASK, source_tag="#email", content="a note")
 _FINANCE_TASK = dict(_TASK, source_tag="#receipt", content="Anomaly: something weird")
 _CODE_TASK = dict(_TASK, source_tag=None, labels=["@code"], content="Fix the bug")
 
-_REPO_OK = {"github_repo": "org/repo", "repo_path": "repo", "source": "project_map", "candidates": []}
-_INVEST_OK = {"status": "running", "transcript": "", "run_id": "r1", "output_file": "inv.jsonl", "host": "h"}
-_PLAN_OK = {"status": "succeeded", "transcript": "do the fix"}
-_IMPL_RUNNING = {
-    "status": "running", "transcript": "", "branch": "aegis-task/x",
-    "run_id": "r2", "output_file": "impl.jsonl", "host": "h",
+_SESSION = {
+    "task_id": "x", "agent_id": "pandoras-actor", "session_id": "sess-1",
+    "repo": "repo", "github_repo": "org/repo", "branch": "aegis-task/x",
+    "worktree_path": "/srv/repo-aegis-wt/task-x", "host": "h",
+    "slack_ref": "", "turns": 0, "last_turn_at": "", "created_at": "",
+}
+_ENSURE_READY = {"status": "ready", "session": _SESSION, "candidates": [], "error": ""}
+_PROCEED = {"verdict": "proceed", "session": None, "sessions": [], "reason": ""}
+_LAUNCH_OK = {
+    "status": "running", "run_id": "r1", "output_file": "turn.jsonl", "host": "h",
+    "engine": "claude", "tmux_window": "w", "worktree_path": _SESSION["worktree_path"],
+    "error": "",
 }
 
 
@@ -207,6 +209,14 @@ class _ExitCase:
     comment_raises: bool = False
     expect_raises: bool = False
     expect_status: str | None = None
+    # Which activity call proves this exit reached a terminal state. "park" and
+    # "complete" are the two label writes; "record" is the session watermark
+    # (the you_are_in_it exit, which must NOT park); "none" is a task that no
+    # longer exists to write anything to.
+    expect_terminal: str = "park"
+    # Start the flow with an EMPTY task dict — the webhook/sweep-fallback shape,
+    # which makes run() load the task through the `load_task` activity.
+    load_from_id: bool = False
 
 
 _CASES = [
@@ -244,97 +254,58 @@ _CASES = [
         expect_status="carded",
     ),
     _ExitCase(
-        "coding_no_repo", _CODE_TASK,
-        {"resolve_task_repo": {"github_repo": "", "repo_path": "", "source": "none", "candidates": []}},
-        expect_status="parked",
-    ),
-    _ExitCase(
-        "coding_investigation_failed", _CODE_TASK,
+        "coding_repo_ambiguous", _CODE_TASK,
         {
-            "resolve_task_repo": _REPO_OK,
-            "run_task_investigation": {"status": "failed", "transcript": "", "run_id": ""},
-        },
-        expect_status="parked",
-    ),
-    _ExitCase(
-        "coding_empty_transcript", _CODE_TASK,
-        {
-            "resolve_task_repo": _REPO_OK,
-            "run_task_investigation": _INVEST_OK,
-            "collect_coding_run": {"inv.jsonl": {"status": "succeeded", "transcript": ""}},
-        },
-        expect_status="parked",
-    ),
-    _ExitCase(
-        "coding_plan_declined", _CODE_TASK,
-        {
-            "resolve_task_repo": _REPO_OK,
-            "run_task_investigation": _INVEST_OK,
-            "collect_coding_run": {"inv.jsonl": _PLAN_OK},
-        },
-        interaction_stub=_StubInteractionSkip,
-        expect_status="plan_declined",
-    ),
-    _ExitCase(
-        "coding_implementation_not_succeeded", _CODE_TASK,
-        {
-            "resolve_task_repo": _REPO_OK,
-            "run_task_investigation": _INVEST_OK,
-            "collect_coding_run": {
-                "inv.jsonl": _PLAN_OK,
-                "impl.jsonl": {"status": "failed", "transcript": ""},
+            "ensure_task_session": {
+                "status": "candidates", "session": _SESSION, "error": "",
+                "candidates": [{"github_repo": "org/one"}, {"github_repo": "org/two"}],
             },
-            "run_task_implementation": _IMPL_RUNNING,
+        },
+        expect_status="repo_ambiguous",
+    ),
+    _ExitCase(
+        "coding_repo_unresolved", _CODE_TASK,
+        {
+            "ensure_task_session": {
+                "status": "unresolved", "session": None, "candidates": [], "error": "no repo",
+            },
         },
         expect_status="parked",
     ),
     _ExitCase(
-        "coding_pr_declined", _CODE_TASK,
+        "coding_you_are_in_it", _CODE_TASK,
         {
-            "resolve_task_repo": _REPO_OK,
-            "run_task_investigation": _INVEST_OK,
-            "collect_coding_run": {
-                "inv.jsonl": _PLAN_OK,
-                "impl.jsonl": {"status": "succeeded", "transcript": "done"},
+            "check_task_collision": {
+                "verdict": "you_are_in_it",
+                "session": {"name": "repo fix", "owner": "human"},
+                "sessions": [], "reason": "live",
             },
-            "run_task_implementation": _IMPL_RUNNING,
         },
-        interaction_stub=_StubInteractionApprovePlanThenSkipPr,
-        expect_status="pr_declined",
+        expect_status="operator_in_session",
+        expect_terminal="record",
     ),
     _ExitCase(
-        "coding_pr_failed", _CODE_TASK,
+        "coding_hand_to_you", _CODE_TASK,
         {
-            "resolve_task_repo": _REPO_OK,
-            "run_task_investigation": _INVEST_OK,
-            "collect_coding_run": {
-                "inv.jsonl": _PLAN_OK,
-                "impl.jsonl": {"status": "succeeded", "transcript": "done"},
+            "check_task_collision": {
+                "verdict": "hand_to_you",
+                "session": {"name": "repo fix", "owner": "human", "branch": "fix/x"},
+                "sessions": [], "reason": "same branch",
             },
-            "run_task_implementation": _IMPL_RUNNING,
-            "create_github_pr": {"pr_url": "", "status": "failed", "error": "git push failed"},
         },
-        expect_status="pr_failed",
+        expect_status="handed_to_operator",
     ),
     _ExitCase(
-        "coding_pr_opened", _CODE_TASK,
-        {
-            "resolve_task_repo": _REPO_OK,
-            "run_task_investigation": _INVEST_OK,
-            "collect_coding_run": {
-                "inv.jsonl": _PLAN_OK,
-                "impl.jsonl": {"status": "succeeded", "transcript": "done"},
-            },
-            "run_task_implementation": _IMPL_RUNNING,
-            "create_github_pr": {
-                "pr_url": "https://github.com/org/repo/pull/1", "status": "opened", "error": "",
-            },
-        },
-        expect_status="pr_opened",
+        "coding_launch_failed", _CODE_TASK,
+        {"launch_task_turn": {**_LAUNCH_OK, "status": "failed", "error": "no route to host"}},
+        expect_status="launch_failed",
     ),
+    _ExitCase("coding_turn_ran", _CODE_TASK, expect_status="parked"),
+    _ExitCase("run_unknown_task", _CODE_TASK, {"load_task": {}},
+              expect_status="unknown_task", expect_terminal="none", load_from_id=True),
 ]
 
-assert len(_CASES) == 17, "one case per AgentTaskFlow exit — see issue #154"
+assert len(_CASES) == 16, "one case per AgentTaskFlow exit — see issue #154"
 
 
 def _exit_case_activities(events: list, case: _ExitCase):
@@ -377,39 +348,52 @@ def _exit_case_activities(events: list, case: _ExitCase):
     async def merchant_history(title: str, limit: int = 6) -> dict:
         return r["merchant_history"]
 
-    @activity.defn(name="resolve_task_repo")
-    async def resolve_task_repo(task: dict) -> dict:
-        return r["resolve_task_repo"]
+    @activity.defn(name="load_task")
+    async def load_task(task_id: str) -> dict:
+        return r.get("load_task", dict(case.task, id=task_id))
 
-    @activity.defn(name="run_task_investigation")
-    async def run_task_investigation(
-        task_id: str, title: str, description: str, repo_path: str, github_repo: str
+    @activity.defn(name="ensure_task_session")
+    async def ensure_task_session(
+        task_id: str, agent_id: str, task: dict, comment: str
     ) -> dict:
-        return r["run_task_investigation"]
+        return r.get("ensure_task_session", _ENSURE_READY)
 
-    @activity.defn(name="collect_coding_run")
-    async def collect_coding_run(output_file: str, host: str, max_polls: int = 40) -> dict:
-        return r["collect_coding_run"][output_file]
-
-    @activity.defn(name="run_task_implementation")
-    async def run_task_implementation(
-        task_id: str, title: str, description: str, plan: str, repo_path: str, github_repo: str
+    @activity.defn(name="check_task_collision")
+    async def check_task_collision(
+        task_id: str, repo: str, session_id: str, override: bool = False
     ) -> dict:
-        return r["run_task_implementation"]
+        return r.get("check_task_collision", _PROCEED)
 
-    @activity.defn(name="stage_pending_pr")
-    async def stage_pending_pr(inp) -> str:
-        return "pr-uuid-stub"
+    @activity.defn(name="record_task_turn")
+    async def record_task_turn(task_id: str, launched: bool) -> dict:
+        events.append(("record", str(launched)))
+        return {"recorded": True}
 
-    @activity.defn(name="create_github_pr")
-    async def create_github_pr(inp) -> dict:
-        return r["create_github_pr"]
+    @activity.defn(name="launch_task_turn")
+    async def launch_task_turn(
+        session: dict, prompt: str, agent_id: str, resume: bool,
+        name: str, turn_timeout_minutes: int,
+    ) -> dict:
+        return r.get("launch_task_turn", _LAUNCH_OK)
+
+    @activity.defn(name="check_agent_run")
+    async def check_agent_run(output_file: str, host: str = "", probe_alive: bool = True) -> dict:
+        return {"status": "finished", "output": "done", "reason": "", "final": "STATUS: plan"}
+
+    @activity.defn(name="kill_task_turn")
+    async def kill_task_turn(output_file: str, host: str) -> dict:
+        return {"killed": True}
+
+    @activity.defn(name="send_message")
+    async def send_message(agent_id: str, message: str, chat_id: int = 0) -> dict:
+        events.append(("slack", message))
+        return {"ok": True}
 
     return [
-        load_task_context, comment, park_task, complete_task,
+        load_task, load_task_context, comment, park_task, complete_task,
         service_health, service_logs, triage_email, merchant_history,
-        resolve_task_repo, run_task_investigation, collect_coding_run,
-        run_task_implementation, stage_pending_pr, create_github_pr,
+        ensure_task_session, check_task_collision, record_task_turn,
+        launch_task_turn, check_agent_run, kill_task_turn, send_message,
     ]
 
 
@@ -433,7 +417,7 @@ async def test_every_exit_path_ends_completed_or_parked(case: _ExitCase):
             wf_input = AgentTaskFlowInput(
                 agent_id="pandoras-actor",
                 todoist_task_id=f"{case.id}-1",
-                task=dict(case.task, id=f"{case.id}-1"),
+                task={} if case.load_from_id else dict(case.task, id=f"{case.id}-1"),
             )
             if case.expect_raises:
                 with pytest.raises(WorkflowFailureError):
@@ -457,7 +441,18 @@ async def test_every_exit_path_ends_completed_or_parked(case: _ExitCase):
         return
 
     assert result["status"] == case.expect_status
-    terminal = "complete" if case.expect_status in ("resolved", "archived") else "park"
+    terminal = case.expect_terminal
+    if terminal == "park" and case.expect_status in ("resolved", "archived"):
+        terminal = "complete"
+    if terminal == "none":
+        assert not any(kind in ("park", "complete") for kind, _ in events), (
+            f"{case.id}: a task that no longer exists has nothing to label"
+        )
+        return
     assert any(kind == terminal for kind, _ in events), (
         f"{case.id}: expected a {terminal} activity call, got {events}"
     )
+    if terminal == "record":
+        assert not any(kind == "park" for kind, _ in events), (
+            f"{case.id}: this exit must NOT stamp @waiting, got {events}"
+        )

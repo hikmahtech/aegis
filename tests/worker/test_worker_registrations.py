@@ -159,6 +159,16 @@ def test_agent_task_sweep_flow_in_schedule_map():
     assert config.cooldown_hours == 3
     assert config.max_coding == 2
 
+    # The seed row ships `config: {}`, so in a real deployment the DEFAULTS are
+    # what run — a builder that forgot a key would silently take the dataclass
+    # default instead of the configured one, and nothing else would notice.
+    _cls, config = _ACTIVITY_TYPE_MAP["AgentTaskSweepFlow"](
+        {"agent_id": "pandoras-actor", "config": {}}
+    )
+    assert (config.max_tasks, config.cooldown_hours) == (3, 6)
+    assert config.max_coding == 3
+    assert config.turn_timeout_minutes == 60
+
 
 def test_agent_task_registrations_reach_the_worker():
     """Before D6 this test AST-parsed main()'s hand-written `workflows`/

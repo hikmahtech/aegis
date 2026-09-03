@@ -1,4 +1,15 @@
-"""Coding verb end to end: plan gate, implement, PR gate."""
+"""The coding verb: one persistent session per task, driven by comments.
+
+The old one-shot lane (investigate → plan card → implement → PR card) is gone.
+What this file pins is the shape that replaced it: a turn runs, its output is
+posted as a task comment with the take-over footer, and the flow parks unless a
+`comment` signal arrived while the turn was running — in which case it runs
+another turn in the SAME session.
+
+Every test asserts on the ACTIVITY CALLS the flow made, never on the returned
+status literal: the literal survives deleting the call above it, so a
+return-value assertion would pass for a flow that stopped doing the work.
+"""
 
 from __future__ import annotations
 
@@ -7,21 +18,18 @@ import uuid
 
 import pytest
 from temporalio import activity, workflow
+from temporalio.client import WorkflowFailureError
 from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import Worker
 
-# Module is `interactions` (PLURAL), and these are imported inside
-# imports_passed_through — mirror tests/worker/flows/test_alert_investigation_gates.py:22.
 with workflow.unsafe.imports_passed_through():
-    from aegis_worker.activities.interactions import (
-        ApplyTimeoutInput,
-        InsertInteractionInput,
-        InsertInteractionResult,
-        ResolveInteractionInput,
-        ResolveInteractionResult,
+    from aegis_worker.flows.agent_task import (
+        AgentTaskFlow,
+        AgentTaskFlowInput,
+        AgentTaskSweepConfig,
+        AgentTaskSweepFlow,
+        _render_thread,
     )
-    from aegis_worker.flows.agent_task import AgentTaskFlow, AgentTaskFlowInput
-    from aegis_worker.flows.interaction import InteractionFlow
 
 _CODE_TASK = {
     "id": "tc-1",
@@ -31,51 +39,142 @@ _CODE_TASK = {
     "source_tag": None,
     "project_id": "pr-bcp",
     "assignee_label": "@pandora",
+    "notes": [
+        {"content": "the screener shows two rows", "posted_at": "2026-09-01T10:00:00+00:00"},
+        {"content": "only the newest is current", "posted_at": "2026-09-01T10:05:00+00:00"},
+    ],
 }
 
-
-_REPO_OK = {
+_SESSION = {
+    "task_id": "tc-1",
+    "agent_id": "pandoras-actor",
+    "session_id": "11111111-2222-3333-4444-555555555555",
+    "repo": "stockopedia/bcp",
     "github_repo": "Stockopedia/bcp",
-    "repo_path": "Stockopedia/bcp",
-    "source": "project_map",
-    "candidates": [],
+    "worktree_path": "/srv/repos/bcp-aegis-wt/task-tc-1",
+    "branch": "aegis-task/tc-1",
+    "host": "node-a",
+    "slack_ref": "",
+    "turns": 0,
+    "last_turn_at": "",
+    "created_at": "2026-09-01T09:00:00+00:00",
 }
 
-_REPO_CANDIDATES = [
-    {
-        "resource_title": "bcp",
-        "github_repo": "Stockopedia/bcp",
-        "resource_path": "stockopedia/bcp",
-        "score": 0.6,
-    },
-    {
-        "resource_title": "aegis-core",
-        "github_repo": "hikmahtech/aegis",
-        "resource_path": "aegis",
-        "score": 0.4,
-    },
+_CANDIDATES = [
+    {"resource_title": "bcp", "github_repo": "Stockopedia/bcp", "resource_path": "bcp"},
+    {"resource_title": "aegis", "github_repo": "hikmahtech/aegis", "resource_path": "aegis"},
 ]
 
-# resolve_task_repo returning unconfirmed candidates — tier 1/2 didn't
-# confidently resolve, so the flow must raise the tier-3 Gate-0 confirm card.
-_REPO_UNCONFIRMED = {
-    "github_repo": "",
-    "repo_path": "",
-    "source": "none",
-    "candidates": _REPO_CANDIDATES,
-}
+_PROCEED = {"verdict": "proceed", "session": None, "sessions": [], "reason": ""}
+
+_FINAL = "Plan: dedupe the rows\nSTATUS: plan"
 
 
 def _activities(
     events: list,
     *,
-    pr_result: dict | None = None,
-    repo_result: dict | None = None,
-    investigation_result: dict | None = None,
+    ensure_result: dict | None = None,
+    ensure_raises: bool = False,
+    collision: dict | None = None,
+    launch_result: dict | None = None,
+    never_exits: bool = False,
+    seen_first_ensure: asyncio.Event | None = None,
+    release_first_ensure: asyncio.Event | None = None,
 ):
+    """Fakes for every activity the coding path calls.
+
+    Signatures mirror the real ones on `AgentTaskActivities` / the poll loop's
+    `AgentRunActivities.check_agent_run` — a fake that drifts from the real
+    signature is a test that proves nothing about production.
+    """
+    # `turns` is the session's own watermark: record_task_turn(launched=True)
+    # bumps it, which is what makes the NEXT ensure_task_session return a
+    # session the flow must RESUME rather than create.
+    state = {"turns": 0, "polls": 0}
+
+    @activity.defn(name="load_task")
+    async def load_task(task_id: str) -> dict:
+        events.append(("load_task", task_id))
+        return dict(_CODE_TASK, id=task_id)
+
     @activity.defn(name="load_task_context")
     async def load_task_context(task_id: str) -> dict:
         return {"external_id": "", "fingerprint": "", "gmail_message_id": ""}
+
+    @activity.defn(name="ensure_task_session")
+    async def ensure_task_session(
+        task_id: str, agent_id: str, task: dict, comment: str
+    ) -> dict:
+        events.append(("ensure", comment))
+        if ensure_raises:
+            raise RuntimeError("the coding host is unreachable")
+        if seen_first_ensure is not None and not seen_first_ensure.is_set():
+            seen_first_ensure.set()
+            if release_first_ensure is not None:
+                await release_first_ensure.wait()
+        if ensure_result is not None:
+            return ensure_result
+        return {
+            "status": "ready",
+            "session": dict(_SESSION, task_id=task_id, turns=state["turns"]),
+            "candidates": [],
+            "error": "",
+        }
+
+    @activity.defn(name="check_task_collision")
+    async def check_task_collision(
+        task_id: str, repo: str, session_id: str, override: bool = False
+    ) -> dict:
+        events.append(("collide", override))
+        return collision if collision is not None else _PROCEED
+
+    @activity.defn(name="record_task_turn")
+    async def record_task_turn(task_id: str, launched: bool) -> dict:
+        events.append(("record", launched))
+        if launched:
+            state["turns"] += 1
+        return {"recorded": True}
+
+    @activity.defn(name="launch_task_turn")
+    async def launch_task_turn(
+        session: dict,
+        prompt: str,
+        agent_id: str,
+        resume: bool,
+        name: str,
+        turn_timeout_minutes: int,
+    ) -> dict:
+        events.append(("launch", {"resume": resume, "name": name, "prompt": prompt}))
+        if launch_result is not None:
+            return launch_result
+        return {
+            "status": "running",
+            "run_id": f"r{state['turns']}",
+            "output_file": f"/tmp/aegis-task-{state['turns']}.jsonl",
+            "host": "node-a",
+            "engine": "claude",
+            "tmux_window": "claude-bcp-r1",
+            "worktree_path": session.get("worktree_path", ""),
+            "error": "",
+        }
+
+    @activity.defn(name="check_agent_run")
+    async def check_agent_run(output_file: str, host: str = "", probe_alive: bool = True) -> dict:
+        state["polls"] += 1
+        events.append(("poll", output_file))
+        if never_exits or state["polls"] % 2 == 1:
+            return {"status": "running", "output": "", "reason": "", "final": ""}
+        return {
+            "status": "finished",
+            "output": "read the loader\n" + _FINAL,
+            "reason": "",
+            "final": _FINAL,
+        }
+
+    @activity.defn(name="kill_task_turn")
+    async def kill_task_turn(output_file: str, host: str) -> dict:
+        events.append(("kill", output_file))
+        return {"killed": True}
 
     @activity.defn(name="comment")
     async def comment(task_id: str, agent_id: str, body: str) -> dict:
@@ -87,376 +186,508 @@ def _activities(
         events.append(("park", reason))
         return {"parked": True}
 
-    @activity.defn(name="resolve_task_repo")
-    async def resolve_task_repo(task: dict) -> dict:
-        return repo_result if repo_result is not None else _REPO_OK
-
-    @activity.defn(name="run_task_investigation")
-    async def run_task_investigation(
-        task_id: str, title: str, description: str, repo_path: str, github_repo: str
-    ) -> dict:
-        events.append(("investigate", repo_path))
-        if investigation_result is not None:
-            return investigation_result
-        return {
-            "status": "running",
-            "transcript": "",
-            "run_id": "r1",
-            "output_file": "/tmp/r1.jsonl",
-            "host": "node-a",
-        }
-
-    @activity.defn(name="collect_coding_run")
-    async def collect_coding_run(output_file: str, host: str, max_polls: int = 40) -> dict:
-        return {"status": "succeeded", "transcript": "Plan: dedupe the rows\nSTATUS: scoped"}
-
-    @activity.defn(name="run_task_implementation")
-    async def run_task_implementation(
-        task_id: str,
-        title: str,
-        description: str,
-        plan: str,
-        repo_path: str,
-        github_repo: str,
-    ) -> dict:
-        events.append(("implement", plan[:20]))
-        return {
-            "status": "running",
-            "transcript": "",
-            "branch": "aegis-task/tc-1",
-            "run_id": "r2",
-            "output_file": "/tmp/r2.jsonl",
-            "host": "node-a",
-        }
-
-    # stage_pending_pr returns a PLAIN STRING id, not a dict.
-    @activity.defn(name="stage_pending_pr")
-    async def stage_pending_pr(inp) -> str:
-        return "pr-uuid-stub"
-
-    @activity.defn(name="create_github_pr")
-    async def create_github_pr(inp) -> dict:
-        result = pr_result or {
-            "pr_url": "https://github.com/Stockopedia/bcp/pull/1",
-            "status": "opened",
-            "error": "",
-        }
-        events.append(("pr", result["status"]))
-        return result
-
-    # InteractionFlow's own activities. Names and input types copied from the
-    # canonical stub block in tests/worker/flows/test_alert_investigation_gates.py
-    # (~line 215) — read that file and mirror it rather than inventing names.
-    @activity.defn(name="insert_interaction")
-    async def insert_interaction(inp: InsertInteractionInput) -> InsertInteractionResult:
-        events.append(("insert_ia", inp.origin))
-        return InsertInteractionResult(interaction_id="ia-coding-test")
-
-    @activity.defn(name="send_interaction_card")
-    async def send_interaction_card(
-        interaction_id: str,
-        agent_id: str,
-        kind: str,
-        prompt: str,
-        options,
-        allow_hint: bool = False,
-    ) -> dict:
-        return {"ok": True, "message_id": 1}
-
-    @activity.defn(name="resolve_interaction")
-    async def resolve_interaction(inp: ResolveInteractionInput) -> ResolveInteractionResult:
-        return ResolveInteractionResult(already_resolved=False)
-
-    @activity.defn(name="apply_interaction_timeout")
-    async def apply_interaction_timeout(inp: ApplyTimeoutInput) -> None:
-        return None
-
-    @activity.defn(name="update_interaction_delivery_ref")
-    async def update_interaction_delivery_ref(*args) -> None:
-        return None
+    @activity.defn(name="send_message")
+    async def send_message(agent_id: str, message: str, chat_id: int = 0) -> dict:
+        events.append(("slack", message))
+        return {"ok": True}
 
     return [
+        load_task,
         load_task_context,
+        ensure_task_session,
+        check_task_collision,
+        record_task_turn,
+        launch_task_turn,
+        check_agent_run,
+        kill_task_turn,
         comment,
         park_task,
-        resolve_task_repo,
-        run_task_investigation,
-        collect_coding_run,
-        run_task_implementation,
-        stage_pending_pr,
-        create_github_pr,
-        insert_interaction,
-        send_interaction_card,
-        resolve_interaction,
-        apply_interaction_timeout,
-        update_interaction_delivery_ref,
+        send_message,
     ]
 
 
-async def test_repo_busy_skip_does_not_park_the_task():
-    """A transient collision must leave the task in the eligible pool.
+def _kinds(events: list) -> list[str]:
+    return [kind for kind, _ in events]
 
-    Every other terminal path in this branch parks (stamping @waiting, which
-    removes the task from find_actionable_tasks until something unparks it), so
-    the omission here is exactly what a later refactor would restore by accident.
+
+def _bodies(events: list, kind: str) -> list:
+    return [body for k, body in events if k == kind]
+
+
+async def _run(
+    events: list,
+    *,
+    task: dict | None = None,
+    comment: str = "",
+    turn_timeout_minutes: int = 60,
+    **fakes,
+) -> dict:
+    async with await WorkflowEnvironment.start_time_skipping() as env:
+        queue = f"tq-{uuid.uuid4().hex[:8]}"
+        async with Worker(
+            env.client,
+            task_queue=queue,
+            workflows=[AgentTaskFlow],
+            activities=_activities(events, **fakes),
+        ):
+            return await env.client.execute_workflow(
+                AgentTaskFlow.run,
+                AgentTaskFlowInput(
+                    agent_id="pandoras-actor",
+                    todoist_task_id="tc-1",
+                    task=_CODE_TASK if task is None else task,
+                    comment=comment,
+                    turn_timeout_minutes=turn_timeout_minutes,
+                ),
+                id=f"agent-task-tc-1-{uuid.uuid4().hex[:8]}",
+                task_queue=queue,
+            )
+
+
+@pytest.mark.asyncio
+async def test_first_turn_posts_plan_with_footer_and_parks():
+    """Turn 1 end to end: a fresh session is launched WITHOUT --resume, the
+    run's final message is posted as a task comment carrying the take-over
+    footer, and the task is parked at @waiting because nothing more is queued."""
+    events: list = []
+    result = await _run(events)
+
+    launches = _bodies(events, "launch")
+    assert len(launches) == 1
+    assert launches[0]["resume"] is False, "turn 1 creates the session, it does not resume one"
+    assert launches[0]["name"].startswith("task tc-1:")
+    # The first-turn prompt investigates and carries the thread it was given.
+    assert "This is your first turn on this task." in launches[0]["prompt"]
+    assert "the screener shows two rows" in launches[0]["prompt"]
+    assert "aegis-task/tc-1" in launches[0]["prompt"]
+
+    assert ("record", True) in events, "a launched turn must bump the session watermark"
+    bodies = _bodies(events, "comment")
+    assert len(bodies) == 1
+    assert "STATUS: plan" in bodies[0]
+    assert "Session: 11111111-2222-3333-4444-555555555555 · turn 1" in bodies[0]
+    assert "Take over: cd /srv/repos/bcp-aegis-wt/task-tc-1 && claude --resume" in bodies[0]
+
+    assert ("park", "waiting on you") in events
+    assert result["status"] == "parked"
+    assert result["turns"] == 1
+
+
+@pytest.mark.asyncio
+async def test_first_turn_loads_the_thread_the_sweep_did_not_carry():
+    """`find_actionable_tasks` selects task COLUMNS — no comment thread — and
+    the sweep starts every first turn, so without this load the "Comment thread
+    so far" block would be empty on the path that matters most. The
+    instructions on a parked @code task usually live in that thread."""
+    events: list = []
+    sweep_shaped = {k: v for k, v in _CODE_TASK.items() if k != "notes"}
+    await _run(events, task=sweep_shaped)
+
+    assert ("load_task", "tc-1") in events
+    prompt = _bodies(events, "launch")[0]["prompt"]
+    assert "the screener shows two rows" in prompt
+    assert "only the newest is current" in prompt
+
+
+@pytest.mark.asyncio
+async def test_comment_signal_during_turn_runs_a_second_turn():
+    """The whole point of the signal: a comment that lands WHILE a turn is
+    running queues, and is drained into a second turn on the same session
+    instead of colliding with the first or being lost.
+
+    Falsifiable: drop the post-turn `_drain()` and only one launch happens.
     """
     events: list = []
-    skipped = {
-        "status": "skipped",
-        "reason": "repo_busy",
-        "transcript": "",
-        "run_id": "",
-    }
+    seen = asyncio.Event()
+    release = asyncio.Event()
+
     async with await WorkflowEnvironment.start_time_skipping() as env:
-        queue = f"tq-{uuid.uuid4()}"
+        queue = f"tq-{uuid.uuid4().hex[:8]}"
         async with Worker(
             env.client,
             task_queue=queue,
-            workflows=[AgentTaskFlow, InteractionFlow],
-            activities=_activities(events, investigation_result=skipped),
-        ):
-            result = await env.client.execute_workflow(
-                AgentTaskFlow.run,
-                AgentTaskFlowInput(
-                    agent_id="pandoras-actor", todoist_task_id="tc-1", task=_CODE_TASK
-                ),
-                id=f"agent-task-tc-1-{uuid.uuid4()}",
-                task_queue=queue,
-            )
-
-    assert not any(kind == "park" for kind, _ in events), "a repo-busy skip must not park"
-    assert not any(kind == "comment" for kind, _ in events), "a scheduled skip must stay quiet"
-    assert not any(kind == "implement" for kind, _ in events)
-    assert not any(kind == "insert_ia" for kind, _ in events), "no card for a quiet skip"
-    assert result.get("reason") == "repo_busy"
-
-
-async def test_declined_plan_stops_before_any_implement_run():
-    """A misread task or wrong repo must cost nothing beyond the read-only run."""
-    events: list = []
-    async with await WorkflowEnvironment.start_time_skipping() as env:
-        queue = f"tq-{uuid.uuid4()}"
-        async with Worker(
-            env.client,
-            task_queue=queue,
-            workflows=[AgentTaskFlow, InteractionFlow],
-            activities=_activities(events),
-        ):
-            result = await env.client.execute_workflow(
-                AgentTaskFlow.run,
-                AgentTaskFlowInput(
-                    agent_id="pandoras-actor", todoist_task_id="tc-1", task=_CODE_TASK
-                ),
-                id=f"agent-task-tc-1-{uuid.uuid4()}",
-                task_queue=queue,
-            )
-
-    assert result["verb"] == "coding"
-    assert not any(kind == "implement" for kind, _ in events)
-    assert not any(kind == "pr" for kind, _ in events)
-    assert any(kind == "park" for kind, _ in events)
-
-
-@pytest.mark.asyncio
-async def test_approved_plan_implements_then_opens_pr_and_parks():
-    """The whole point of the verb: plan approved -> implement -> PR approved -> open PR."""
-    events: list = []
-    async with (
-        await WorkflowEnvironment.start_local() as env,
-        Worker(
-            env.client,
-            task_queue="tq-agent-task-coding",
-            workflows=[AgentTaskFlow, InteractionFlow],
-            activities=_activities(events),
-        ),
-    ):
-        wf_id = f"agent-task-tc-1-{uuid.uuid4()}"
-        handle = await env.client.start_workflow(
-            AgentTaskFlow.run,
-            AgentTaskFlowInput(
-                agent_id="pandoras-actor", todoist_task_id="tc-1", task=_CODE_TASK
-            ),
-            id=wf_id,
-            task_queue="tq-agent-task-coding",
-        )
-
-        plan_card = env.client.get_workflow_handle("agent-task-plan-tc-1")
-        for _ in range(200):
-            await asyncio.sleep(0.05)
-            if any(kind == "insert_ia" and body == "agent_task_coding_plan" for kind, body in events):
-                break
-        await plan_card.signal(InteractionFlow.submit_response, {"value": "approve"})
-
-        pr_card = env.client.get_workflow_handle("agent-task-pr-tc-1")
-        for _ in range(200):
-            await asyncio.sleep(0.05)
-            if any(kind == "insert_ia" and body == "agent_task_coding_pr" for kind, body in events):
-                break
-        await pr_card.signal(InteractionFlow.submit_response, {"value": "approve"})
-
-        result = await asyncio.wait_for(handle.result(), timeout=15.0)
-
-    assert result["verb"] == "coding"
-    assert result["status"] == "pr_opened"
-    kinds = [kind for kind, _ in events]
-    assert kinds.index("investigate") < kinds.index("implement") < kinds.index("pr")
-
-
-@pytest.mark.asyncio
-async def test_pr_creation_failure_does_not_claim_pr_opened():
-    """create_github_pr can return status=failed WITHOUT raising (push
-    rejected, gh pr create failure, missing pending_pr row). The flow must
-    not comment "Opened a PR" or return status=pr_opened in that case — a
-    silent PR failure would leave the task parked at @waiting with a comment
-    claiming a PR exists that was never actually created."""
-    events: list = []
-    async with (
-        await WorkflowEnvironment.start_local() as env,
-        Worker(
-            env.client,
-            task_queue="tq-agent-task-coding-pr-fail",
-            workflows=[AgentTaskFlow, InteractionFlow],
+            workflows=[AgentTaskFlow],
             activities=_activities(
-                events,
-                pr_result={
-                    "pr_url": "",
-                    "status": "failed",
-                    "error": "git push failed: remote rejected",
-                },
+                events, seen_first_ensure=seen, release_first_ensure=release
             ),
-        ),
-    ):
-        wf_id = f"agent-task-tc-1-{uuid.uuid4()}"
-        handle = await env.client.start_workflow(
-            AgentTaskFlow.run,
-            AgentTaskFlowInput(
-                agent_id="pandoras-actor", todoist_task_id="tc-1", task=_CODE_TASK
-            ),
-            id=wf_id,
-            task_queue="tq-agent-task-coding-pr-fail",
-        )
+        ):
+            handle = await env.client.start_workflow(
+                AgentTaskFlow.run,
+                # Empty task on purpose: this is the webhook shape, so it also
+                # proves load_task fills the thread the prompt renders.
+                AgentTaskFlowInput(agent_id="pandoras-actor", todoist_task_id="tc-1"),
+                id=f"agent-task-tc-1-{uuid.uuid4().hex[:8]}",
+                task_queue=queue,
+            )
+            # The first ensure_task_session runs AFTER the flow's initial
+            # drain, so a signal sent here can only be picked up by the
+            # post-turn drain — which is exactly the behaviour under test.
+            with env.auto_time_skipping_disabled():
+                await asyncio.wait_for(seen.wait(), timeout=30)
+                await handle.signal(AgentTaskFlow.comment, "also fix tests")
+            release.set()
+            result = await handle.result()
 
-        plan_card = env.client.get_workflow_handle("agent-task-plan-tc-1")
-        for _ in range(200):
-            await asyncio.sleep(0.05)
-            if any(kind == "insert_ia" and body == "agent_task_coding_plan" for kind, body in events):
-                break
-        await plan_card.signal(InteractionFlow.submit_response, {"value": "approve"})
-
-        pr_card = env.client.get_workflow_handle("agent-task-pr-tc-1")
-        for _ in range(200):
-            await asyncio.sleep(0.05)
-            if any(kind == "insert_ia" and body == "agent_task_coding_pr" for kind, body in events):
-                break
-        await pr_card.signal(InteractionFlow.submit_response, {"value": "approve"})
-
-        result = await asyncio.wait_for(handle.result(), timeout=15.0)
-
-    assert result["verb"] == "coding"
-    assert result["status"] != "pr_opened"
-    assert not any(
-        "Opened a PR" in body for kind, body in events if kind == "comment"
-    ), "must not claim a PR was opened when create_github_pr reported failure"
-    assert any(kind == "park" for kind, _ in events)
-
-
-# --- Issue #158: tier 3 — the Gate-0 repo-confirm card ---------------------
-#
-# resolve_task_repo returns unconfirmed `candidates` (tier 1 project-map and
-# tier 2 title/description match both missed the confidence bar). The flow
-# must ask via a Gate-0 confirm card rather than proceed on the candidates —
-# these tests prove both outcomes actually gate the investigation, not just
-# that the returned status string looks right (same falsifiability standard
-# as the rest of this file: assert on the activity call, not the literal).
+    assert ("load_task", "tc-1") in events, "the webhook shape must load the task"
+    launches = _bodies(events, "launch")
+    assert len(launches) == 2, f"expected a second turn from the queued comment: {_kinds(events)}"
+    assert launches[1]["resume"] is True, "turn 2 must RESUME the session, not start a new one"
+    assert "> also fix tests" in launches[1]["prompt"]
+    assert "This is your first turn" not in launches[1]["prompt"]
+    assert _kinds(events).count("park") == 1, "the flow parks once, after the last turn"
+    assert result["turns"] == 2
 
 
 @pytest.mark.asyncio
-async def test_gate0_confirm_approved_investigates_the_picked_repo():
-    """Candidates offered, user picks #1 (index 0, Stockopedia/bcp) — the
-    flow must proceed to investigate that repo, not park."""
+@pytest.mark.parametrize(
+    ("owner", "status", "phrase"),
+    [
+        ("human", "operator_in_session", "your comment is waiting for you there"),
+        ("aegis", "turn_still_running", "will be picked up when it finishes"),
+    ],
+)
+async def test_operator_in_session_sends_slack_note_and_does_not_park(
+    owner: str, status: str, phrase: str
+):
+    """`you_are_in_it` means the comment is already in front of whoever owns
+    the session. Commenting on Todoist would duplicate it and parking would
+    stamp @waiting on a task somebody is actively working — so the flow does
+    neither. The watermark still moves, or the 15-minute fallback sweep
+    re-dispatches the same comment forever.
+
+    Falsifiable: add a park_task call to that branch and this fails.
+    """
     events: list = []
-    async with (
-        await WorkflowEnvironment.start_local() as env,
-        Worker(
-            env.client,
-            task_queue="tq-agent-task-gate0-approve",
-            workflows=[AgentTaskFlow, InteractionFlow],
-            activities=_activities(events, repo_result=_REPO_UNCONFIRMED),
-        ),
-    ):
-        wf_id = f"agent-task-tc-1-{uuid.uuid4()}"
-        handle = await env.client.start_workflow(
-            AgentTaskFlow.run,
-            AgentTaskFlowInput(
-                agent_id="pandoras-actor", todoist_task_id="tc-1", task=_CODE_TASK
-            ),
-            id=wf_id,
-            task_queue="tq-agent-task-gate0-approve",
-        )
-
-        confirm_card = env.client.get_workflow_handle("agent-task-repo-confirm-tc-1")
-        for _ in range(200):
-            await asyncio.sleep(0.05)
-            if any(
-                kind == "insert_ia" and body == "agent_task_repo_confirm"
-                for kind, body in events
-            ):
-                break
-        await confirm_card.signal(InteractionFlow.submit_response, {"value": "0"})
-
-        plan_card = env.client.get_workflow_handle("agent-task-plan-tc-1")
-        for _ in range(200):
-            await asyncio.sleep(0.05)
-            if any(kind == "insert_ia" and body == "agent_task_coding_plan" for kind, body in events):
-                break
-        await plan_card.signal(InteractionFlow.submit_response, {"value": "skip"})
-
-        result = await asyncio.wait_for(handle.result(), timeout=15.0)
-
-    assert result["verb"] == "coding"
-    assert result["status"] == "plan_declined"
-    assert ("investigate", "stockopedia/bcp") in events, (
-        "the picked candidate's resource_path must reach run_task_investigation"
+    result = await _run(
+        events,
+        collision={
+            "verdict": "you_are_in_it",
+            "session": {"name": "bcp eps", "owner": owner, "cwd": "/srv/repos/bcp"},
+            "sessions": [],
+            "reason": "session is live",
+        },
     )
 
+    assert ("record", False) in events
+    assert not _bodies(events, "comment"), "the comment is already in the session"
+    assert "park" not in _kinds(events), "must not stamp @waiting on a live session"
+    assert "launch" not in _kinds(events)
+    notes = _bodies(events, "slack")
+    assert len(notes) == 1
+    assert phrase in notes[0]
+    assert "tc-1" in notes[0] and "bcp eps" in notes[0]
+    assert result["status"] == status
+
 
 @pytest.mark.asyncio
-async def test_gate0_confirm_declined_parks_without_investigating():
-    """User picks "None of these" — the task parks exactly like a fully
-    unresolved repo; no investigation run is ever started."""
+async def test_hand_to_you_comments_and_parks_without_launching():
+    """A person is already on this task in their own session: AEGIS says so,
+    parks, and tells them the phrase that overrides the check."""
     events: list = []
-    async with (
-        await WorkflowEnvironment.start_local() as env,
-        Worker(
-            env.client,
-            task_queue="tq-agent-task-gate0-decline",
-            workflows=[AgentTaskFlow, InteractionFlow],
-            activities=_activities(events, repo_result=_REPO_UNCONFIRMED),
-        ),
-    ):
-        wf_id = f"agent-task-tc-1-{uuid.uuid4()}"
-        handle = await env.client.start_workflow(
-            AgentTaskFlow.run,
-            AgentTaskFlowInput(
-                agent_id="pandoras-actor", todoist_task_id="tc-1", task=_CODE_TASK
-            ),
-            id=wf_id,
-            task_queue="tq-agent-task-gate0-decline",
-        )
+    result = await _run(
+        events,
+        collision={
+            "verdict": "hand_to_you",
+            "session": {"name": "bcp eps", "owner": "human", "branch": "fix/eps"},
+            "sessions": [{"name": "bcp eps", "owner": "human", "branch": "fix/eps"}],
+            "reason": "same branch",
+        },
+    )
 
-        confirm_card = env.client.get_workflow_handle("agent-task-repo-confirm-tc-1")
-        for _ in range(200):
-            await asyncio.sleep(0.05)
-            if any(
-                kind == "insert_ia" and body == "agent_task_repo_confirm"
-                for kind, body in events
-            ):
-                break
-        await confirm_card.signal(InteractionFlow.submit_response, {"value": "none"})
+    assert ("record", False) in events
+    assert "launch" not in _kinds(events), "must not run a turn against a live human session"
+    bodies = _bodies(events, "comment")
+    assert len(bodies) == 1
+    assert "session 'bcp eps'" in bodies[0]
+    assert "on branch `fix/eps`" in bodies[0]
+    assert "Reply `take over`" in bodies[0]
+    assert ("park", "operator already on it") in events
+    assert result["status"] == "handed_to_operator"
 
-        result = await asyncio.wait_for(handle.result(), timeout=15.0)
 
-    assert result["verb"] == "coding"
+@pytest.mark.asyncio
+async def test_take_over_comment_passes_override():
+    """`take over` is the operator overruling rule 2 — it has to reach the
+    collision check as override=True, or the same verdict comes back and the
+    task can never be handed back.
+
+    Falsifiable: hard-code override=False and this fails while every other
+    test still passes.
+    """
+    events: list = []
+    await _run(events, comment="take over, go ahead")
+
+    assert ("collide", True) in events
+    assert ("collide", False) not in events
+
+
+@pytest.mark.asyncio
+async def test_timeout_kills_and_reports():
+    """A turn that outlives its deadline is asked to stop and reported. The
+    kill matters: an orphan run still writing this session while the next turn
+    starts is worse than a lost turn."""
+    events: list = []
+    result = await _run(events, never_exits=True, turn_timeout_minutes=1)
+
+    assert "kill" in _kinds(events), "a timed-out turn must be asked to stop"
+    bodies = _bodies(events, "comment")
+    assert len(bodies) == 1
+    assert "was asked to stop after 1 min" in bodies[0]
+    # poll_until_exit returns no output on a timeout, and the flow deliberately
+    # fetches nothing extra rather than paying another round trip.
+    assert "(no output captured)" in bodies[0]
+    assert "Session: " in bodies[0]
+    assert ("park", "waiting on you") in events
+    assert result["turns"] == 1
+
+
+@pytest.mark.asyncio
+async def test_ambiguous_repo_lists_candidates_and_parks():
+    """Two plausible repos: ask by name rather than run an unattended coding
+    session in the wrong checkout."""
+    events: list = []
+    result = await _run(
+        events,
+        ensure_result={
+            "status": "candidates",
+            "session": dict(_SESSION, repo="", github_repo="", worktree_path="", branch=""),
+            "candidates": _CANDIDATES,
+            "error": "",
+        },
+    )
+
+    assert ("record", False) in events
+    assert "launch" not in _kinds(events)
+    bodies = _bodies(events, "comment")
+    assert len(bodies) == 1
+    assert "Stockopedia/bcp" in bodies[0] and "hikmahtech/aegis" in bodies[0]
+    assert ("park", "repo ambiguous") in events
+    assert result["status"] == "repo_ambiguous"
+
+
+@pytest.mark.asyncio
+async def test_unresolved_repo_parks_with_the_reason():
+    """No repo and no candidates: park with whatever the resolver said, so the
+    next comment can name one."""
+    events: list = []
+    result = await _run(
+        events,
+        ensure_result={
+            "status": "unresolved",
+            "session": None,
+            "candidates": [],
+            "error": "the task worktree could not be created",
+        },
+    )
+
+    assert "launch" not in _kinds(events)
+    assert "the task worktree could not be created" in _bodies(events, "comment")[0]
+    assert ("park", "repo unresolved") in events
     assert result["status"] == "parked"
-    assert not any(kind == "investigate" for kind, _ in events)
-    assert any(kind == "park" for kind, _ in events)
+
+
+@pytest.mark.asyncio
+async def test_launch_failure_parks_with_the_error():
+    """A turn that never started is reported as such — the watermark has
+    already moved, so silence here would strand the comment."""
+    events: list = []
+    result = await _run(
+        events,
+        launch_result={
+            "status": "failed",
+            "run_id": "",
+            "output_file": "",
+            "host": "",
+            "engine": "claude",
+            "tmux_window": "",
+            "worktree_path": "",
+            "error": "ssh: connect to host node-a port 22: no route to host",
+        },
+    )
+
+    assert ("record", True) in events
+    assert "no route to host" in _bodies(events, "comment")[0]
+    assert ("park", "turn failed to start") in events
+    assert result["status"] == "launch_failed"
+
+
+@pytest.mark.asyncio
+async def test_a_failing_coding_activity_parks_with_the_step_that_failed():
+    """The coding path runs inside run()'s catch-all, so a raising activity
+    must still park the task — and must name the phase, not "run_coding".
+    Without the step, every coding crash in `workflow_runs` reads the same and
+    there is nothing to grep for."""
+    events: list = []
+    async with await WorkflowEnvironment.start_time_skipping() as env:
+        queue = f"tq-{uuid.uuid4().hex[:8]}"
+        async with Worker(
+            env.client,
+            task_queue=queue,
+            workflows=[AgentTaskFlow],
+            activities=_activities(events, ensure_raises=True),
+        ):
+            with pytest.raises(WorkflowFailureError):
+                await env.client.execute_workflow(
+                    AgentTaskFlow.run,
+                    AgentTaskFlowInput(
+                        agent_id="pandoras-actor",
+                        todoist_task_id="tc-1",
+                        task=_CODE_TASK,
+                    ),
+                    id=f"agent-task-tc-1-{uuid.uuid4().hex[:8]}",
+                    task_queue=queue,
+                )
+
+    parks = _bodies(events, "park")
+    assert parks, "a crashed coding turn must still leave the task parked"
+    assert "coding:ensure_task_session" in parks[0], parks
+
+
+@pytest.mark.parametrize(
+    ("notes", "expected"),
+    [
+        ([], "(no comments yet)"),
+        ([{"content": "hi", "posted_at": "2026-09-01T10:00:00+00:00"}],
+         "[2026-09-01T10:00:00+00:00] hi"),
+    ],
+)
+def test_render_thread_shapes_each_line(notes: list, expected: str):
+    assert _render_thread(notes) == expected
+
+
+def test_render_thread_keeps_the_newest_lines_and_says_what_it_dropped():
+    """The cap exists because the connector truncates the whole prompt at
+    24 000 bytes — an uncapped thread would silently cut the INSTRUCTIONS off
+    the bottom. Dropping from the oldest end is the whole point: the last thing
+    the user said is what the turn has to act on."""
+    notes = [
+        {"content": f"note {n} " + "x" * 700, "posted_at": f"2026-09-0{n % 9 + 1}T10:00:00+00:00"}
+        for n in range(30)
+    ]
+    out = _render_thread(notes)
+
+    assert len(out) <= 13000, "the rendered thread must stay inside the cap"
+    assert "note 29" in out, "the newest note is the one that must survive"
+    assert "note 0 " not in out, "the oldest notes are the ones dropped"
+    assert out.startswith("[... "), out[:80]
+    assert "earlier comments omitted]" in out.splitlines()[0]
+
+
+def test_render_thread_truncates_one_enormous_note():
+    out = _render_thread([{"content": "y" * 5000, "posted_at": "2026-09-01T10:00:00+00:00"}])
+    assert out.count("y") == 800
+
+
+# --- the sweep's fallback dispatcher ---------------------------------------
+#
+# Registered under the REAL flow's name so the sweep's start_child_workflow
+# lands on it: what is under test is the sweep's start-or-signal dance, not
+# AgentTaskFlow itself.
+
+
+@workflow.defn(name="AgentTaskFlow")
+class _StubTaskFlow:
+    def __init__(self) -> None:
+        self._got: list[str] = []
+
+    @workflow.signal
+    def comment(self, text: str) -> None:
+        self._got.append(text)
+
+    @workflow.run
+    async def run(self, input: AgentTaskFlowInput) -> dict:
+        if input.comment:
+            self._got.append(input.comment)
+        await workflow.wait_condition(lambda: bool(self._got))
+        return {"got": self._got, "timeout": input.turn_timeout_minutes}
+
+
+@pytest.mark.asyncio
+async def test_sweep_dispatches_due_turns_by_start_or_signal():
+    """The webhook is the fast path; this is the fallback for a missed one.
+    A task with no live workflow gets one STARTED carrying the comment; a task
+    whose workflow is still running gets the comment SIGNALLED into it, which
+    is what folds a comment posted mid-turn into the next turn."""
+    events: list = []
+
+    @activity.defn(name="find_actionable_tasks")
+    async def find_actionable_tasks(
+        max_tasks: int = 3, cooldown_hours: int = 6, max_coding: int = 1
+    ) -> list[dict]:
+        events.append(("actionable", max_coding))
+        return []
+
+    @activity.defn(name="find_task_turns_due")
+    async def find_task_turns_due(limit: int = 20) -> list[dict]:
+        events.append(("due", limit))
+        return [
+            {"task_id": "td-live", "agent_id": "pandoras-actor", "comment": "please rebase"},
+            {"task_id": "td-cold", "agent_id": "pandoras-actor", "comment": "start it"},
+        ]
+
+    async with await WorkflowEnvironment.start_time_skipping() as env:
+        queue = f"tq-{uuid.uuid4().hex[:8]}"
+        async with Worker(
+            env.client,
+            task_queue=queue,
+            workflows=[AgentTaskSweepFlow, _StubTaskFlow],
+            activities=[find_actionable_tasks, find_task_turns_due],
+        ):
+            live = await env.client.start_workflow(
+                _StubTaskFlow.run,
+                AgentTaskFlowInput(agent_id="pandoras-actor", todoist_task_id="td-live"),
+                id="agent-task-td-live",
+                task_queue=queue,
+            )
+            result = await env.client.execute_workflow(
+                AgentTaskSweepFlow.run,
+                AgentTaskSweepConfig(agent_id="pandoras-actor", turn_timeout_minutes=45),
+                id=f"sweep-{uuid.uuid4().hex[:8]}",
+                task_queue=queue,
+            )
+            signalled = await live.result()
+            started = await env.client.get_workflow_handle("agent-task-td-cold").result()
+
+    assert signalled["got"] == ["please rebase"], "a live workflow takes the comment by signal"
+    assert started["got"] == ["start it"], "a cold task is started carrying the comment"
+    assert started["timeout"] == 45, "the sweep's configured turn deadline must reach the flow"
+    assert result["resumed"] == 2
+    assert ("due", 3) in events, "the due limit is max_coding, whose default moved to 3"
+
+
+@pytest.mark.asyncio
+async def test_sweep_survives_a_dispatch_failure():
+    """One bad row must not cost the rest of the sweep: a due row whose id is
+    unusable is logged and skipped, and the next row still dispatches."""
+
+    @activity.defn(name="find_actionable_tasks")
+    async def find_actionable_tasks(
+        max_tasks: int = 3, cooldown_hours: int = 6, max_coding: int = 1
+    ) -> list[dict]:
+        return []
+
+    @activity.defn(name="find_task_turns_due")
+    async def find_task_turns_due(limit: int = 20) -> list[dict]:
+        return [
+            {"task_id": "", "agent_id": "pandoras-actor", "comment": "no id"},
+            {"task_id": "td-ok", "agent_id": "pandoras-actor", "comment": "go on"},
+        ]
+
+    async with await WorkflowEnvironment.start_time_skipping() as env:
+        queue = f"tq-{uuid.uuid4().hex[:8]}"
+        async with Worker(
+            env.client,
+            task_queue=queue,
+            workflows=[AgentTaskSweepFlow, _StubTaskFlow],
+            activities=[find_actionable_tasks, find_task_turns_due],
+        ):
+            result = await env.client.execute_workflow(
+                AgentTaskSweepFlow.run,
+                AgentTaskSweepConfig(agent_id="pandoras-actor"),
+                id=f"sweep-{uuid.uuid4().hex[:8]}",
+                task_queue=queue,
+            )
+            started = await env.client.get_workflow_handle("agent-task-td-ok").result()
+
+    assert started["got"] == ["go on"]
+    assert result["resumed"] == 1
