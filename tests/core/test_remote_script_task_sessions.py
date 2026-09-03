@@ -42,14 +42,16 @@ def test_kimi_ignores_session_flags():
 
 
 class _Exec:
-    """Records every remote command; answers each with a canned result."""
+    """Records every remote command and its stdin; answers with a canned result."""
 
     def __init__(self, answers=None):
         self.cmds: list[str] = []
+        self.stdins: list[bytes] = []
         self.answers = answers or {}
 
     async def __call__(self, host, cmd, timeout, stdin=None, **kw):
         self.cmds.append(cmd)
+        self.stdins.append(stdin or b"")
         for needle, res in self.answers.items():
             if needle in cmd:
                 return res
@@ -97,6 +99,26 @@ async def test_start_run_with_caller_worktree_skips_provisioning_and_never_remov
     assert (
         "worktree add" not in joined and "worktree remove" not in joined and "git pull" not in joined
     )
+
+
+async def test_a_long_turn_prompt_reaches_the_host_intact(monkeypatch):
+    """A task turn's prompt carries the whole comment thread. The old 5000-byte
+    ceiling cut it mid-sentence and said nothing — no error, no log — so the run
+    was steered by half a conversation."""
+    c = _connector()
+    ex = _Exec()
+    monkeypatch.setattr(c, "_exec", ex)
+    prompt = "x" * 10_000
+    await c.start_kimi_run(
+        repo="acme/app",
+        prompt=prompt,
+        kimi_binary="",
+        engine_override="claude",
+        worktree_path="/repos/acme/app-aegis-wt/task-1",
+        session_id=SID,
+    )
+    written = [s for c_, s in zip(ex.cmds, ex.stdins, strict=True) if c_.startswith("cat > ")]
+    assert written and written[0] == prompt.encode()
 
 
 async def test_kill_run_uses_fuser(monkeypatch):

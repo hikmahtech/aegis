@@ -46,6 +46,13 @@ _DB_CONFIG_TTL_SECONDS = 30.0
 # ".." is rejected outright to prevent path traversal.
 _SCRIPT_ID_RE = re.compile(r"^[a-zA-Z0-9_\-./]+$")
 
+# Hard ceiling on the prompt written to the run's temp file. It is a runaway
+# guard, not a product limit, and the truncation is SILENT — so it has to sit
+# well above what real callers send. The task lane's turn prompt carries a
+# task's whole comment thread, which the old 5000-byte ceiling cut mid-sentence
+# with no error anywhere.
+_PROMPT_CAP_BYTES = 24000
+
 # tmux window names for agent runs are "<engine>-<repo>-<run_id>"; the planner
 # counts only these toward the cap so the session's default shell window is
 # ignored.
@@ -1065,11 +1072,14 @@ class RemoteScriptConnector:
         prompt_file = f"/tmp/aegis-prompt-{run_id}.txt"
         output_file = f"/tmp/aegis-kimi-run-{run_id}.jsonl"
 
+        # Cut on bytes, then drop any partial character the cut created — an
+        # invalid UTF-8 tail would make the whole prompt file unreadable.
+        prompt_bytes = prompt.encode()[:_PROMPT_CAP_BYTES].decode(errors="ignore").encode()
         wrote = await self._exec(
             host,
             f"cat > {shlex.quote(prompt_file)}",
             timeout=15,
-            stdin=prompt[:5000].encode(),
+            stdin=prompt_bytes,
         )
         if wrote["exit_code"] != 0:
             logger.warning(

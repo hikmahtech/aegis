@@ -41,14 +41,22 @@ EXCLUDED_LABELS = ["@someday", PARK_LABEL]
 _ELIGIBLE_SCAN_LIMIT = 200
 
 # The comment thread is a coding session's memory, and the whole tail is re-read
-# on every turn. 30 notes is a long day of back-and-forth and still leaves room
-# under the launch path's 5000-byte prompt cap.
+# on every turn. 30 notes is a long day of back-and-forth; the flow, not this
+# activity, caps the RENDERED thread at 12,000 characters (newest kept).
 _TASK_NOTE_LIMIT = 30
 
-# One SSH round trip answers three git questions per session, in order: the
-# branch (one line), `log -3 --oneline` (up to three) and the short status
-# (everything after).
+# One SSH round trip answers three git questions per session. The blocks are
+# separated by an echoed marker rather than by counting lines: a repo with fewer
+# than three commits would otherwise push status lines into the log field.
 _SESSION_GIT_LOG_LINES = 3
+_GIT_BLOCK_MARKER = "---"
+
+# Git context is gathered for at most this many human sessions, concurrently,
+# with a short per-probe timeout. All of it happens inside ONE activity's
+# start-to-close budget, so a sequential probe of several sessions would time
+# the activity out instead of degrading to a `proceed` verdict.
+_COLLISION_PROBE_LIMIT = 5
+_COLLISION_PROBE_TIMEOUT = 10
 
 # A turn's MCP mount token outlives its deadline by an hour, so a run that is
 # being killed or inspected past the deadline still has its tools.
@@ -737,11 +745,14 @@ class AgentTaskActivities:
         )
         if row is None:
             return {}
+        # `id` breaks the tie on `posted_at`: Todoist stamps a burst of notes
+        # with the same second, and an unstable sort would reorder the
+        # conversation between turns.
         notes = await self.db_pool.fetch(
             "SELECT content, posted_at FROM ("
-            "  SELECT content, posted_at FROM todoist_notes WHERE item_id = $1"
-            "  ORDER BY posted_at DESC LIMIT $2"
-            ") recent ORDER BY posted_at ASC",
+            "  SELECT id, content, posted_at FROM todoist_notes WHERE item_id = $1"
+            "  ORDER BY posted_at DESC, id DESC LIMIT $2"
+            ") recent ORDER BY posted_at ASC, id ASC",
             task_id,
             _TASK_NOTE_LIMIT,
         )
@@ -750,8 +761,9 @@ class AgentTaskActivities:
         task["notes"] = [
             {
                 "content": note["content"] or "",
-                # The result crosses Temporal's payload boundary; a datetime
-                # would not survive it.
+                # ISO strings rather than datetimes: the thread is rendered
+                # straight into a prompt and echoed in the flow's result
+                # summary, and both want one stable textual shape.
                 "posted_at": note["posted_at"].isoformat() if note["posted_at"] else "",
             }
             for note in notes
@@ -764,10 +776,13 @@ class AgentTaskActivities:
     ) -> dict:
         """The task's session row, with a repo and a live worktree when known.
 
-        Called before every turn, so the common case is the cheap one: a row
-        that already carries a repo comes straight back and the resolver never
-        runs. Re-resolving each turn would let a later LLM guess move a task to
-        a different checkout mid-conversation.
+        Called before every turn. A row that already carries a repo skips the
+        RESOLVER — re-resolving each turn would let a later LLM guess move a
+        task to a different checkout mid-conversation — but still verifies its
+        worktree, which is one idempotent SSH round trip. Without that check a
+        tree removed out of band (a manual `git worktree remove`, a disk clean)
+        would leave the row `ready` for ever while every turn launched into a
+        directory that is not there.
 
         An unresolved task still gets its row. That row is what makes the NEXT
         comment reach the flow at all (the webhook keys on its existence), and
@@ -787,14 +802,22 @@ class AgentTaskActivities:
         session = await task_sessions.create_session(
             self.db_pool, task_id=task_id, agent_id=agent_id
         )
-        if session.get("repo"):
-            return {"status": "ready", "session": session, "candidates": [], "error": ""}
         if self.remote_script is None:
             return {
                 **empty,
                 "session": session,
                 "error": "remote_script connector is not configured",
             }
+        if session.get("repo"):
+            error = await self._build_task_worktree(
+                repo=str(session["repo"]),
+                worktree_path=str(session.get("worktree_path") or ""),
+                branch=str(session.get("branch") or ""),
+                host=str(session.get("host") or ""),
+            )
+            if error:
+                return {**empty, "session": session, "error": error}
+            return {"status": "ready", "session": session, "candidates": [], "error": ""}
 
         resolved = await self.resolve_task_repo(task or {})
         github_repo = str(resolved.get("github_repo") or "")
@@ -821,15 +844,15 @@ class AgentTaskActivities:
             f"-aegis-wt/task-{task_id}"
         )
         branch = f"aegis-task/{task_id}"
-        built = await self.remote_script.ensure_task_worktree(
+        error = await self._build_task_worktree(
             repo=repo_path, worktree_path=worktree_path, branch=branch, host=host
         )
-        if built.get("status") != "ready":
+        if error:
             return {
                 **empty,
                 "session": session,
                 "candidates": candidates,
-                "error": str(built.get("error") or "the task worktree could not be created"),
+                "error": error,
             }
         await task_sessions.set_repo(
             self.db_pool,
@@ -842,6 +865,23 @@ class AgentTaskActivities:
         )
         fresh = await task_sessions.get_session(self.db_pool, task_id)
         return {"status": "ready", "session": fresh or session, "candidates": [], "error": ""}
+
+    async def _build_task_worktree(
+        self, *, repo: str, worktree_path: str, branch: str, host: str
+    ) -> str:
+        """Create-or-verify the task's worktree. `""` on success, else the error.
+
+        Idempotent by design on the connector side, so calling it before every
+        turn costs one cheap SSH round trip and buys the self-heal: a worktree
+        that disappeared is rebuilt on the same branch, with the task's
+        committed work still on it.
+        """
+        built = await self.remote_script.ensure_task_worktree(
+            repo=repo, worktree_path=worktree_path, branch=branch, host=host
+        )
+        if built.get("status") == "ready":
+            return ""
+        return str(built.get("error") or "the task worktree could not be created")
 
     @activity.defn
     async def check_task_collision(
@@ -899,7 +939,7 @@ class AgentTaskActivities:
 
             title, description, owner = await self._task_identity(task_id)
             host = str((await self.remote_script.coding_settings()).get("host") or "")
-            enriched = [await self._session_git_context(human, host) for human in humans]
+            enriched = await self._enrich_sessions(humans, host)
             result = await self.llm_client.think(
                 build_same_task_prompt(title, description, enriched),
                 # "balanced" is a TIER, not a model name — resolve it, never
@@ -932,6 +972,43 @@ class AgentTaskActivities:
             )
             return {**proceed, "reason": f"check failed: {str(exc)[:200]}"}
 
+    async def _enrich_sessions(self, humans: list[dict], host: str) -> list[dict]:
+        """`humans` with git context attached, probed CONCURRENTLY.
+
+        Every probe is an SSH round trip inside one activity's start-to-close
+        budget, so probing five sessions one after another would time the whole
+        activity out — which is a hard failure, not the `proceed` this check is
+        supposed to degrade to. Hence `gather`, a short per-probe timeout, and a
+        cap on how many sessions are probed at all: past a handful the verdict
+        does not change, and the unprobed ones are still reported.
+
+        A probe that raises leaves its session unenriched (rendered `unknown`)
+        rather than failing the verdict.
+        """
+        probed = humans[:_COLLISION_PROBE_LIMIT]
+        if len(humans) > len(probed):
+            activity.logger.info(
+                "task_collision_probe_capped sessions=%s probed=%s", len(humans), len(probed)
+            )
+        results = await asyncio.gather(
+            *(self._session_git_context(human, host) for human in probed),
+            return_exceptions=True,
+        )
+        enriched: list[dict] = []
+        for human, result in zip(probed, results, strict=True):
+            if isinstance(result, BaseException):
+                activity.logger.warning(
+                    "task_collision_probe_failed session=%s err=%s",
+                    human.get("name"),
+                    str(result)[:200],
+                )
+                enriched.append(dict(human))
+            else:
+                enriched.append(result)
+        # The sessions we did not probe are still the operator's, so they stay
+        # in the list the flow reports back — just without git context.
+        return enriched + [dict(h) for h in humans[_COLLISION_PROBE_LIMIT:]]
+
     async def _task_identity(self, task_id: str) -> tuple[str, str, str]:
         """`(title, description, owning agent)` — what the collision prompt and
         the LLM spend record need, in one query."""
@@ -949,10 +1026,9 @@ class AgentTaskActivities:
     async def _session_git_context(self, session: dict, host: str) -> dict:
         """`session` plus the git facts that separate "same repo" from "same task".
 
-        One SSH round trip per session, answering three commands in order: the
-        branch is the first line, `log -3` the next three, the short status the
-        rest. A shallower history shifts that split, which mislabels a field in
-        a prompt and is not worth a second round trip.
+        One SSH round trip per session, answering three commands whose output is
+        separated by an echoed marker. Counting lines instead would put a commit
+        into the status field on any repo with fewer than three commits.
 
         A failed probe leaves the fields ABSENT rather than blank, because
         `build_same_task_prompt` renders a missing field as `unknown` — a blank
@@ -964,19 +1040,27 @@ class AgentTaskActivities:
         quoted = shlex.quote(cwd)
         result = await self.remote_script.run_on_host(
             host,
-            f"git -C {quoted} branch --show-current; "
+            f"git -C {quoted} branch --show-current; echo {_GIT_BLOCK_MARKER}; "
             f"git -C {quoted} log -{_SESSION_GIT_LOG_LINES} --oneline; "
+            f"echo {_GIT_BLOCK_MARKER}; "
             f"git -C {quoted} status --short | head -20",
-            timeout=20,
+            timeout=_COLLISION_PROBE_TIMEOUT,
         )
         if (result or {}).get("status") != "succeeded":
             return dict(session)
-        lines = [line.strip() for line in str(result.get("stdout") or "").splitlines()]
+        blocks: list[list[str]] = [[]]
+        for raw_line in str(result.get("stdout") or "").splitlines():
+            line = raw_line.strip()
+            if line == _GIT_BLOCK_MARKER:
+                blocks.append([])
+            elif line:
+                blocks[-1].append(line)
+        blocks += [[], [], []]  # a command that printed nothing still needs a slot
         return {
             **session,
-            "branch": lines[0] if lines else "",
-            "log": " | ".join(x for x in lines[1 : 1 + _SESSION_GIT_LOG_LINES] if x),
-            "status_short": ", ".join(x for x in lines[1 + _SESSION_GIT_LOG_LINES :] if x),
+            "branch": blocks[0][0] if blocks[0] else "",
+            "log": " | ".join(blocks[1]),
+            "status_short": ", ".join(blocks[2]),
         }
 
     @activity.defn
@@ -1085,11 +1169,17 @@ class AgentTaskActivities:
         operator: the comment has been dealt with, and the 15-minute fallback
         sweep would otherwise re-dispatch it for ever. Only a turn that actually
         launched a session counts towards `turns`.
+
+        `recorded: False` means no session row matched — it was cleaned up (or
+        never created) while the turn ran, so the watermark this claims to have
+        moved does not exist.
         """
         if self.db_pool is None or not task_id:
             return {"recorded": False}
-        await task_sessions.record_turn(self.db_pool, task_id, launched=bool(launched))
-        return {"recorded": True}
+        moved = await task_sessions.record_turn(self.db_pool, task_id, launched=bool(launched))
+        if not moved:
+            activity.logger.warning("task_turn_not_recorded task_id=%s", task_id)
+        return {"recorded": bool(moved)}
 
     @activity.defn
     async def find_task_turns_due(self, limit: int = 20) -> list[dict]:

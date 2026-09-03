@@ -9,7 +9,9 @@ one way these tests could pass while production is broken.
 
 from __future__ import annotations
 
+import asyncio
 import inspect
+import time
 import uuid
 
 import pytest_asyncio
@@ -93,11 +95,22 @@ class _Connector:
     """Coding-host stand-in. Signatures mirror `RemoteScriptConnector` and are
     pinned by `test_fake_connector_matches_the_real_signatures` below."""
 
-    def __init__(self, *, sessions=None, worktree="ready", git_stdout="", launch="running"):
+    def __init__(
+        self,
+        *,
+        sessions=None,
+        worktree="ready",
+        git_stdout="",
+        launch="running",
+        git_delay=0.0,
+        git_error=False,
+    ):
         self.sessions = sessions if sessions is not None else []
         self.worktree = worktree
         self.git_stdout = git_stdout
         self.launch = launch
+        self.git_delay = git_delay
+        self.git_error = git_error
         self.worktree_calls: list[dict] = []
         self.launches: list[dict] = []
         self.git_calls: list[dict] = []
@@ -137,6 +150,10 @@ class _Connector:
         self, host: str, remote_cmd: str, timeout: int = 30, stdin: bytes | None = None
     ) -> dict:
         self.git_calls.append({"host": host, "cmd": remote_cmd, "timeout": timeout})
+        if self.git_error:
+            raise RuntimeError("ssh probe exploded")
+        if self.git_delay:
+            await asyncio.sleep(self.git_delay)
         return {"status": "succeeded", "exit_code": 0, "stdout": self.git_stdout, "stderr": ""}
 
     async def kill_run(self, output_file: str, host: str = "") -> bool:
@@ -279,6 +296,14 @@ async def test_record_task_turn_counts_only_launched_turns(db_pool, _task):
     assert (await svc.get_session(db_pool, _TASK))["turns"] == 1
 
 
+async def test_record_task_turn_reports_a_missing_session_row(db_pool, _task):
+    """The row can be cleaned up while a turn is running. Claiming a watermark
+    that does not exist would hide why the same comment keeps coming back."""
+    assert await AgentTaskActivities(db_pool=db_pool).record_task_turn(_TASK, True) == {
+        "recorded": False
+    }
+
+
 async def test_record_task_turn_without_a_pool_reports_not_recorded():
     assert await AgentTaskActivities(db_pool=None).record_task_turn(_TASK, True) == {
         "recorded": False
@@ -288,10 +313,7 @@ async def test_record_task_turn_without_a_pool_reports_not_recorded():
 # --- ensure_task_session -----------------------------------------------------
 
 
-async def test_ready_row_short_circuits_the_resolver(db_pool, _task):
-    """A resolved session must never re-resolve: the repo is settled, and
-    re-running the resolver every turn would let a later LLM guess move the
-    task to a different checkout mid-conversation."""
+async def _ready_row(db_pool) -> None:
     await svc.create_session(db_pool, task_id=_TASK, agent_id="pandoras-actor")
     await svc.set_repo(
         db_pool,
@@ -302,6 +324,17 @@ async def test_ready_row_short_circuits_the_resolver(db_pool, _task):
         branch=_BRANCH,
         host="meem",
     )
+
+
+async def test_ready_row_skips_the_resolver_but_still_verifies_its_worktree(db_pool, _task):
+    """A resolved session must never re-resolve: the repo is settled, and
+    re-running the resolver every turn would let a later LLM guess move the task
+    to a different checkout mid-conversation.
+
+    The worktree IS re-checked, because it can vanish under us — a manual
+    `git worktree remove`, a disk clean — and the check is an idempotent no-op
+    when it is there."""
+    await _ready_row(db_pool)
     conn = _Connector()
     act = AgentTaskActivities(db_pool=db_pool, remote_script=conn)
     calls: list = []
@@ -313,7 +346,24 @@ async def test_ready_row_short_circuits_the_resolver(db_pool, _task):
     assert out["session"]["repo"] == "hikmah/aegis"
     assert out["session"]["worktree_path"] == _WT
     assert calls == []
-    assert conn.worktree_calls == []
+    assert conn.worktree_calls == [
+        {"repo": "hikmah/aegis", "worktree_path": _WT, "branch": _BRANCH, "host": "meem"}
+    ]
+
+
+async def test_a_ready_row_whose_worktree_cannot_be_rebuilt_is_unresolved(db_pool, _task):
+    """Falsifiability pair with the test above: same ready row, and the only
+    difference is a worktree that will not build. Reporting `ready` there would
+    launch the turn into a directory that is not on the host."""
+    await _ready_row(db_pool)
+    conn = _Connector(worktree="failed")
+    act = AgentTaskActivities(db_pool=db_pool, remote_script=conn)
+    act.resolve_task_repo = _resolver(_RESOLVED, [])
+
+    out = await act.ensure_task_session(_TASK, "pandoras-actor", {"id": _TASK}, "")
+
+    assert out["status"] == "unresolved"
+    assert "checkout missing" in out["error"]
 
 
 async def test_a_resolved_repo_needs_no_comment(db_pool, _task):
@@ -433,9 +483,11 @@ _OURS = {
 }
 _GIT = (
     "fix-retry\n"
+    "---\n"
     "abc1234 cap the retry policy\n"
     "def5678 add a failing test\n"
     "0011aab scaffold\n"
+    "---\n"
     " M worker/src/aegis_worker/activities/agent_task.py\n"
     "?? notes.md\n"
 )
@@ -496,6 +548,7 @@ async def test_the_llm_hands_the_task_over_when_a_person_is_on_it(db_pool, _task
     cmd = conn.git_calls[0]["cmd"]
     assert cmd.startswith("git -C /w/hikmah/aegis branch --show-current")
     assert "log -3 --oneline" in cmd and "status --short" in cmd
+    assert cmd.count("echo ---") == 2
     prompt = llm.calls[0]["prompt"]
     assert "fix-retry" in prompt
     assert "cap the retry policy" in prompt
@@ -504,6 +557,63 @@ async def test_the_llm_hands_the_task_over_when_a_person_is_on_it(db_pool, _task
     assert llm.calls[0]["purpose"] == "task_session_collision"
     assert llm.calls[0]["max_tokens"] == 4096
     assert llm.calls[0]["agent_id"] == "pandoras-actor"
+
+
+async def test_a_shallow_history_keeps_its_commit_out_of_the_status_field(db_pool, _task):
+    """The blocks are separated by an echoed marker, not counted off as
+    "the next three lines": a repo with one commit would otherwise put two
+    status lines in the log field and the real changes nowhere."""
+    conn = _Connector(
+        sessions=[_HUMAN],
+        git_stdout="fix-retry\n---\nabc1234 the only commit\n---\n M a.py\n?? b.py\n",
+    )
+    out = await _collision_act(db_pool, conn, _LLM(_SAME)).check_task_collision(
+        _TASK, "hikmah/aegis", _SESSION_ID, False
+    )
+    assert out["session"]["branch"] == "fix-retry"
+    assert out["session"]["log"] == "abc1234 the only commit"
+    assert out["session"]["status_short"] == "M a.py, ?? b.py"
+
+
+async def test_the_git_probes_run_concurrently(db_pool, _task):
+    """Each probe is an SSH round trip inside ONE activity's start-to-close
+    budget. Run in series they add up and the activity is killed by Temporal,
+    which is a hard failure rather than the `proceed` this check degrades to."""
+    humans = [dict(_HUMAN, name=f"s{n}", session_id=f"sid-{n}") for n in range(3)]
+    conn = _Connector(sessions=humans, git_stdout=_GIT, git_delay=0.2)
+    started = time.perf_counter()
+    out = await _collision_act(db_pool, conn, _LLM(_SAME)).check_task_collision(
+        _TASK, "hikmah/aegis", _SESSION_ID, False
+    )
+    elapsed = time.perf_counter() - started
+    assert len(conn.git_calls) == 3
+    assert elapsed < 0.45, elapsed  # in series this is >= 0.6
+    assert out["verdict"] == "hand_to_you"
+
+
+async def test_only_the_first_five_sessions_are_probed_and_the_rest_still_reported(
+    db_pool, _task
+):
+    humans = [dict(_HUMAN, name=f"s{n}", session_id=f"sid-{n}") for n in range(7)]
+    conn = _Connector(sessions=humans, git_stdout=_GIT)
+    out = await _collision_act(db_pool, conn, _LLM('{"same_task": false}')).check_task_collision(
+        _TASK, "hikmah/aegis", _SESSION_ID, False
+    )
+    assert len(conn.git_calls) == 5
+    assert [s["name"] for s in out["sessions"]] == [f"s{n}" for n in range(7)]
+
+
+async def test_a_failing_probe_still_produces_a_verdict(db_pool, _task):
+    """One unreachable session must not lose the verdict — it is rendered
+    `unknown` and the model judges on what is left."""
+    conn = _Connector(sessions=[_HUMAN], git_error=True)
+    llm = _LLM(_SAME)
+    out = await _collision_act(db_pool, conn, llm).check_task_collision(
+        _TASK, "hikmah/aegis", _SESSION_ID, False
+    )
+    assert out["verdict"] == "hand_to_you"
+    assert "branch" not in out["session"]
+    assert "branch: unknown" in llm.calls[0]["prompt"]
 
 
 async def test_the_session_working_directory_is_shell_quoted(db_pool, _task):

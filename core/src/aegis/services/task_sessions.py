@@ -107,18 +107,30 @@ async def set_repo(
     )
 
 
-async def record_turn(pool: Any, task_id: str, *, launched: bool) -> None:
-    """Move the watermark past the comment we just consumed.
+async def record_turn(pool: Any, task_id: str, *, launched: bool) -> bool:
+    """Move the watermark past the comment we just consumed. True when a row moved.
 
     `last_turn_at` moves either way — a comment we looked at and did not act on
     must not be re-picked forever — but only a turn that actually launched a
     session counts towards `turns`.
+
+    False means no row matched: the session was cleaned up (or never created)
+    while the turn was running. Reporting that as a recorded turn would claim a
+    watermark that does not exist, and the caller would stop looking for the
+    reason its comment keeps coming back.
     """
-    await pool.execute(
+    tag = await pool.execute(
         "UPDATE task_sessions SET last_turn_at = now(), turns = turns + $2 WHERE task_id = $1",
         task_id,
         1 if launched else 0,
     )
+    return _rows_affected(tag) > 0
+
+
+def _rows_affected(tag: Any) -> int:
+    """Row count from an asyncpg command tag (`"UPDATE 1"`); 0 when unreadable."""
+    parts = str(tag or "").split()
+    return int(parts[-1]) if parts and parts[-1].isdigit() else 0
 
 
 async def set_slack_ref(pool: Any, task_id: str, ref: dict) -> None:
