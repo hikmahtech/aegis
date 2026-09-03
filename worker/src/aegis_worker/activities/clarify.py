@@ -459,6 +459,10 @@ class ClarifyActivities:
         note including agent replies, which would create a 15-min reply
         loop (loop fix 2026-05-27, commit cb7fce6e).
 
+        A task holding a `task_sessions` row is excluded outright: it has been
+        handed to the coding lane, where each comment is a turn of its own
+        AgentTaskFlow, so clarify must not also answer it.
+
         When gtd_clarify_enabled=false this returns [] so no downstream
         activity runs — flipping the switch must NOT post NEEDS REVIEW
         comments or bump last_clarified_at (which would poison the
@@ -609,6 +613,15 @@ class ClarifyActivities:
                               AND content NOT LIKE $4
                               AND content NOT LIKE '%Workflow run:%'
                         ), 'epoch'::timestamptz)
+                  )
+                  -- Handed over to a task session: a @code task's comments are
+                  -- turns of its own AgentTaskFlow, not clarify input. Without
+                  -- this, one comment gets BOTH — the coding turn and clarify's
+                  -- AgentChatReplyFlow — so two agents answer the same thread
+                  -- and the chat reply's note lands inside the session's
+                  -- transcript. The session row IS the handover marker.
+                  AND NOT EXISTS (
+                      SELECT 1 FROM task_sessions ts WHERE ts.task_id = t.id
                   )
                   -- Hands-off signal (inbox gate): a task the user has claimed
                   -- with @me — and hasn't addressed to an agent — is theirs to

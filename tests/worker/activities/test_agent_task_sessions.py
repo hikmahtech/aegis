@@ -803,6 +803,61 @@ async def test_kill_task_turn_without_a_connector_or_file():
     }
 
 
+# --- clarify hands the task over ---------------------------------------------
+
+
+@pytest_asyncio.fixture(loop_scope="function")
+async def _inbox(db_pool):
+    """Put the fixture task in a managed Inbox so ClarifyActivities can see it,
+    and put the settings row back afterwards — the test database is shared with
+    every other file this xdist worker runs."""
+    prior = await db_pool.fetchval(
+        "SELECT value FROM settings WHERE key = 'todoist_managed_project_ids'"
+    )
+    await db_pool.execute(
+        "INSERT INTO settings (key, value) VALUES ('todoist_managed_project_ids', $1) "
+        "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+        {"inbox": "PROJ-INBOX"},
+    )
+    await db_pool.execute(
+        "INSERT INTO todoist_projects (id, name, is_managed, raw) "
+        "VALUES ('PROJ-INBOX', 'Inbox', true, '{}'::jsonb) ON CONFLICT (id) DO NOTHING"
+    )
+    await db_pool.execute("UPDATE todoist_tasks SET project_id = 'PROJ-INBOX' WHERE id = $1", _TASK)
+    yield
+    if prior is None:
+        await db_pool.execute("DELETE FROM settings WHERE key = 'todoist_managed_project_ids'")
+    else:
+        await db_pool.execute(
+            "UPDATE settings SET value = $1 WHERE key = 'todoist_managed_project_ids'", prior
+        )
+
+
+async def test_clarify_hands_a_session_task_over_and_stops_looking_at_it(db_pool, _task, _inbox):
+    """A task with a session row must drop out of clarify's eligibility query.
+
+    Its comments are turns, and clarify's own answer to a fresh comment on an
+    agent-labelled task is to spawn AgentChatReplyFlow. Without this exclusion
+    one comment gets BOTH — a chat reply and a coding turn, two agents talking
+    over each other on the same thread, and the reply's `[Agent reply @ ` note
+    landing in the middle of the session's own transcript.
+
+    The first half of the test is the control: the same task, same comment, no
+    session row, IS returned. So a regression that removes the exclusion fails
+    here rather than passing vacuously.
+    """
+    from aegis_worker.activities.clarify import ClarifyActivities
+
+    await _note(db_pool, "use the other repo")
+    acts = ClarifyActivities(db_pool=db_pool)
+
+    assert _TASK in [r["id"] for r in await acts.find_unclassified_items(max_items=50)]
+
+    await svc.create_session(db_pool, task_id=_TASK, agent_id="pandoras-actor")
+
+    assert _TASK not in [r["id"] for r in await acts.find_unclassified_items(max_items=50)]
+
+
 # --- fake/real contracts -----------------------------------------------------
 
 
