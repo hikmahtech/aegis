@@ -8,6 +8,7 @@ interface and auth material; nothing here may ever surface them.
 from __future__ import annotations
 
 import inspect
+import time
 
 import pytest
 from aegis.connectors.coding_sessions import (
@@ -30,6 +31,40 @@ SAMPLE = """[
    "sessionId": "493b827c-a432-4c37-a5ed-dde55c25bf1a", "name": "api-2d",
    "status": "busy", "messagingSocketPath": "/run/user/1000/cc-socks/368220.sock"}
 ]"""
+
+DAY_MS = 24 * 60 * 60 * 1000
+NOW_MS = 1_757_000_000_000  # a fixed "now" so age assertions never drift
+
+
+def _interactive(**overrides):
+    """One interactive session object, as `claude agents --json` emits it."""
+    item = {
+        "pid": 368220,
+        "cwd": f"{BASE}/acme/api",
+        "kind": "interactive",
+        "sessionId": "493b827c-a432-4c37-a5ed-dde55c25bf1a",
+        "name": "api-2d",
+        "status": "busy",
+        "startedAt": NOW_MS - DAY_MS,
+        "messagingSocketPath": "/run/user/1000/cc-socks/368220.sock",
+    }
+    item.update(overrides)
+    return item
+
+
+def _bg(**overrides):
+    """One `claude --bg` job object — `state`/`id` rather than `status`/`sessionId`."""
+    item = {
+        "id": "451cebcb",
+        "cwd": f"{BASE}/acme/api",
+        "kind": "background",
+        "sessionId": "451cebcb-ab17-4454-99ca-ed14e84a1cf2",
+        "name": "build thing",
+        "state": "running",
+        "startedAt": NOW_MS - DAY_MS,
+    }
+    item.update(overrides)
+    return item
 
 
 def test_parse_skips_leading_noise():
@@ -85,12 +120,88 @@ def test_records_never_leak_private_fields():
 
 
 def test_records_read_status_and_state():
-    records = to_records(parse_agents_json(SAMPLE), "personal", BASE)
+    """`status` (interactive) and `state` (background) both land in `status`."""
+    records = to_records([_interactive(), _bg(state="running")], "personal", BASE, now_ms=NOW_MS)
     by_name = {r["name"]: r for r in records}
     assert by_name["api-2d"]["status"] == "busy"
-    assert by_name["build thing"]["status"] == "blocked"
+    assert by_name["build thing"]["status"] == "running"
     assert by_name["api-2d"]["account"] == "personal"
     assert by_name["api-2d"]["repo"] == "acme/api"
+
+
+# ── stale records (issue #369) ───────────────────────────────────────────────
+
+
+def test_sample_drops_the_blocked_background_job():
+    """The real-shape sample carries a blocked `claude --bg` job; only the person survives."""
+    records = to_records(parse_agents_json(SAMPLE), "personal", BASE)
+    assert [r["name"] for r in records] == ["api-2d"]
+
+
+@pytest.mark.parametrize("state", ["blocked", "done", "failed", "stopped", "killed", "exited"])
+def test_terminal_background_states_are_dropped(state):
+    assert to_records([_bg(state=state)], "personal", BASE, now_ms=NOW_MS) == []
+
+
+@pytest.mark.parametrize("state", ["running", "starting", "queued"])
+def test_live_background_states_are_kept(state):
+    records = to_records([_bg(state=state)], "personal", BASE, now_ms=NOW_MS)
+    assert [r["status"] for r in records] == [state]
+
+
+@pytest.mark.parametrize("state", ["Blocked", " DONE ", "Failed"])
+def test_background_states_match_case_insensitively(state):
+    assert to_records([_bg(state=state)], "personal", BASE, now_ms=NOW_MS) == []
+
+
+def test_interactive_is_never_dropped_for_its_state():
+    """Rule 1 is scoped to background jobs; the CLI prunes dead interactive sessions."""
+    records = to_records(
+        [_interactive(kind="interactive", state="blocked", status="idle")],
+        "personal",
+        BASE,
+        now_ms=NOW_MS,
+    )
+    assert [r["name"] for r in records] == ["api-2d"]
+
+
+def test_records_older_than_the_age_cap_are_dropped():
+    stale = _interactive(status="idle", startedAt=NOW_MS - 8 * DAY_MS)
+    assert to_records([stale], "personal", BASE, now_ms=NOW_MS) == []
+
+
+def test_records_inside_the_age_cap_are_kept():
+    fresh = _interactive(status="idle", startedAt=NOW_MS - 6 * DAY_MS)
+    assert [r["name"] for r in to_records([fresh], "personal", BASE, now_ms=NOW_MS)] == ["api-2d"]
+
+
+def test_started_at_as_a_string_of_digits_is_read():
+    """The CLI has emitted `startedAt` as both an int and a string."""
+    stale = _interactive(startedAt=str(NOW_MS - 8 * DAY_MS))
+    fresh = _interactive(name="fresh", startedAt=str(NOW_MS - 1 * DAY_MS))
+    kept = to_records([stale, fresh], "personal", BASE, now_ms=NOW_MS)
+    assert [r["name"] for r in kept] == ["fresh"]
+
+
+@pytest.mark.parametrize("started", [None, "", "yesterday", "2026-07-29T20:03Z", {}])
+def test_unreadable_started_at_is_kept(started):
+    """Unknown age keeps today's behaviour rather than guessing."""
+    item = _interactive()
+    item["startedAt"] = started
+    assert [r["name"] for r in to_records([item], "personal", BASE, now_ms=NOW_MS)] == ["api-2d"]
+
+
+def test_missing_started_at_is_kept():
+    item = _interactive()
+    item.pop("startedAt")
+    assert [r["name"] for r in to_records([item], "personal", BASE, now_ms=NOW_MS)] == ["api-2d"]
+
+
+def test_now_ms_defaults_to_the_wall_clock():
+    """No `now_ms` means real time — a record started now is kept, one from 2021 is not."""
+    now = int(time.time() * 1000)
+    assert to_records([_interactive(startedAt=now)], "personal", BASE)
+    assert to_records([_interactive(startedAt=1_600_000_000_000)], "personal", BASE) == []
 
 
 def test_match_busy_only_matches_busy_human_same_repo():
