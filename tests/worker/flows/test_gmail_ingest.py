@@ -604,6 +604,19 @@ async def stub_store(msg: dict, account: str) -> str:
     return f"uid-{msg['id']}"
 
 
+@activity.defn(name="fetch_message_body")
+async def stub_fetch_message_body(
+    account_label: str, message_id: str, max_chars: int = 6000
+) -> str:
+    _calls.setdefault("money_body", []).append((account_label, message_id))
+    return "Receipt from Stripe $9.99 Paid"
+
+
+@activity.defn(name="store_receipt_body")
+async def stub_store_receipt_body(receipt_id: str, body_text: str) -> None:
+    _calls.setdefault("money_store_body", []).append((receipt_id, body_text))
+
+
 @activity.defn(name="load_receipts")
 async def stub_load_receipts(ids: list[str]) -> list[dict]:
     return [
@@ -674,6 +687,8 @@ async def test_financial_tags_trigger_money_process_fanout():
         stub_resolve,
         stub_timeout,
         stub_store,
+        stub_fetch_message_body,
+        stub_store_receipt_body,
         stub_load_receipts,
         stub_classify_and_extract,
         stub_upsert_charges,
@@ -705,6 +720,10 @@ async def test_financial_tags_trigger_money_process_fanout():
     assert result["by_category"].get("important_read") == 1
     # Child fan-out fired end-to-end
     assert _calls.get("money_store") == [("msg-receipt-1", "sebas")]
+    assert _calls.get("money_body") == [("sebas", "msg-receipt-1")]
+    assert _calls.get("money_store_body") == [
+        ("uid-msg-receipt-1", "Receipt from Stripe $9.99 Paid")
+    ]
     assert _calls.get("money_extract") == [(1, "maou")]
     assert _calls.get("money_upsert") == [("sebas", 1)]
 

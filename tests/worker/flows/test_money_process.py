@@ -13,10 +13,11 @@ with workflow.unsafe.imports_passed_through():
 
 _calls: dict[str, list] = {
     "store": [],
+    "body": [],
+    "store_body": [],
     "load": [],
     "classify": [],
     "upsert": [],
-    "capture": [],
 }
 
 
@@ -41,6 +42,23 @@ _MSG = {
 async def stub_store(msg: dict, account: str) -> str:
     _calls["store"].append((msg["id"], account))
     return f"uid-{msg['id']}"
+
+
+@activity.defn(name="fetch_message_body")
+async def stub_body(account_label: str, message_id: str, max_chars: int = 6000) -> str:
+    _calls["body"].append((account_label, message_id))
+    return "Receipt from Stripe $9.99 Paid"
+
+
+@activity.defn(name="fetch_message_body")
+async def stub_body_empty(account_label: str, message_id: str, max_chars: int = 6000) -> str:
+    _calls["body"].append((account_label, message_id))
+    return ""
+
+
+@activity.defn(name="store_receipt_body")
+async def stub_store_body(receipt_id: str, body_text: str) -> None:
+    _calls["store_body"].append((receipt_id, body_text))
 
 
 @activity.defn(name="load_receipts")
@@ -85,15 +103,14 @@ async def stub_upsert(account: str, exts: list[dict]) -> int:
     return len(exts)
 
 
-@activity.defn(name="capture_to_inbox")
-async def stub_capture(
-    source_tag: str, external_id: str, title: str, description: str | None = None
-) -> str | None:
-    _calls["capture"].append((source_tag, external_id, title))
-    return f"task-{external_id}"
-
-
-_HAPPY_STUBS = [stub_store, stub_load, stub_classify_receipt, stub_upsert, stub_capture]
+_HAPPY_STUBS = [
+    stub_store,
+    stub_body,
+    stub_store_body,
+    stub_load,
+    stub_classify_receipt,
+    stub_upsert,
+]
 
 
 @pytest.mark.asyncio
@@ -121,13 +138,37 @@ async def test_charged_path():
     assert _calls["store"] == [("gmail-msg-1", "user-personal")]
     assert _calls["classify"] == [(1, "maou")]
     assert _calls["upsert"] == [("user-personal", 1)]
-    # Capture should fire once for the receipt charge.
-    assert len(_calls["capture"]) == 1
-    source_tag, ext_id, title = _calls["capture"][0]
-    assert source_tag == "#receipt"
-    assert ext_id.startswith("charge-")
-    assert "Anomaly:" in title
-    assert "Stripe" in title
+    assert _calls["body"] == [("user-personal", "gmail-msg-1")]
+    assert _calls["store_body"] == [("uid-gmail-msg-1", "Receipt from Stripe $9.99 Paid")]
+
+
+@pytest.mark.asyncio
+async def test_empty_body_is_not_stored():
+    _reset()
+    async with (
+        await WorkflowEnvironment.start_time_skipping() as env,
+        Worker(
+            env.client,
+            task_queue="tq",
+            workflows=[MoneyProcessFlow],
+            activities=[
+                stub_store,
+                stub_body_empty,
+                stub_store_body,
+                stub_load,
+                stub_classify_receipt,
+                stub_upsert,
+            ],
+        ),
+    ):
+        result = await env.client.execute_workflow(
+            MoneyProcessFlow.run,
+            MoneyProcessInput(agent_id="maou", msg=_MSG, account_label="user-personal"),
+            id="mp-empty-body",
+            task_queue="tq",
+        )
+    assert result["status"] == "charged"
+    assert _calls["store_body"] == []
 
 
 @pytest.mark.asyncio
@@ -146,7 +187,14 @@ async def test_duplicate_short_circuits():
             env.client,
             task_queue="tq",
             workflows=[MoneyProcessFlow],
-            activities=[dup_store, stub_load, stub_classify_receipt, stub_upsert],
+            activities=[
+                dup_store,
+                stub_body,
+                stub_store_body,
+                stub_load,
+                stub_classify_receipt,
+                stub_upsert,
+            ],
         ),
     ):
         result = await env.client.execute_workflow(
@@ -157,10 +205,11 @@ async def test_duplicate_short_circuits():
         )
 
     assert result["status"] == "duplicate"
+    assert _calls["body"] == []
+    assert _calls["store_body"] == []
     assert _calls["load"] == []
     assert _calls["classify"] == []
     assert _calls["upsert"] == []
-    assert _calls["capture"] == []
 
 
 @pytest.mark.asyncio
@@ -189,7 +238,14 @@ async def test_parse_failed_does_not_upsert():
             env.client,
             task_queue="tq",
             workflows=[MoneyProcessFlow],
-            activities=[stub_store, stub_load, parse_failed_classify, stub_upsert],
+            activities=[
+                stub_store,
+                stub_body,
+                stub_store_body,
+                stub_load,
+                parse_failed_classify,
+                stub_upsert,
+            ],
         ),
     ):
         result = await env.client.execute_workflow(
@@ -202,7 +258,6 @@ async def test_parse_failed_does_not_upsert():
     assert result["status"] == "parse_failed"
     # upsert_charges must NOT be called — receipt stays unparsed for the next run.
     assert _calls["upsert"] == []
-    assert _calls["capture"] == []
 
 
 @pytest.mark.asyncio
@@ -222,7 +277,14 @@ async def test_classify_raises_returns_extract_failed():
             env.client,
             task_queue="tq",
             workflows=[MoneyProcessFlow],
-            activities=[stub_store, stub_load, raising_classify, stub_upsert],
+            activities=[
+                stub_store,
+                stub_body,
+                stub_store_body,
+                stub_load,
+                raising_classify,
+                stub_upsert,
+            ],
         ),
     ):
         result = await env.client.execute_workflow(
@@ -234,7 +296,6 @@ async def test_classify_raises_returns_extract_failed():
 
     assert result["status"] == "extract_failed"
     assert _calls["upsert"] == []
-    assert _calls["capture"] == []
 
 
 @pytest.mark.asyncio
@@ -253,7 +314,14 @@ async def test_not_a_receipt_still_marks_parsed():
             env.client,
             task_queue="tq",
             workflows=[MoneyProcessFlow],
-            activities=[stub_store, stub_load, non_receipt_classify, stub_upsert],
+            activities=[
+                stub_store,
+                stub_body,
+                stub_store_body,
+                stub_load,
+                non_receipt_classify,
+                stub_upsert,
+            ],
         ),
     ):
         result = await env.client.execute_workflow(
@@ -266,5 +334,3 @@ async def test_not_a_receipt_still_marks_parsed():
     assert result["status"] == "not_a_receipt"
     # upsert_charges still called with the non-receipt so receipt_email.parsed is written.
     assert _calls["upsert"] == [("user-personal", 1)]
-    # Capture must NOT fire for non-receipts.
-    assert _calls["capture"] == []

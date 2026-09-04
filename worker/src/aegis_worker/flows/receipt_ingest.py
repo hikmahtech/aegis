@@ -170,6 +170,21 @@ class ReceiptIngestFlow:
                 if not receipts:
                     continue
 
+                body = await workflow.execute_activity(
+                    "fetch_message_body",
+                    args=[receipts[0]["account"], receipts[0]["message_id"]],
+                    start_to_close_timeout=_ACT_TIMEOUT,
+                    retry_policy=ACT_RETRY,
+                )
+                if body:
+                    await workflow.execute_activity(
+                        "store_receipt_body",
+                        args=[receipt_id, body],
+                        start_to_close_timeout=_ACT_TIMEOUT,
+                        retry_policy=ACT_RETRY,
+                    )
+                    receipts[0]["body_plain"] = body
+
                 extractions = await workflow.execute_activity(
                     "classify_and_extract",
                     args=[receipts, input.agent_id],

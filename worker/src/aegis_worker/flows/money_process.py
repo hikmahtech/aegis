@@ -9,6 +9,8 @@ Pipeline per email:
 
   store_receipt_email(msg, account)      # idempotent on message_id
     → "" means duplicate; exit.
+  fetch_message_body(account, id)         # full text for the extractor
+    → store_receipt_body(receipt_id, body); "" leaves the snippet in place.
   load_receipts([receipt_id])             # hydrate stored row
   classify_and_extract([receipt], "maou") # 1 LLM call, maou persona
     → is_receipt=False means triage false-positive; mark parsed, exit.
@@ -26,8 +28,7 @@ from datetime import timedelta
 from temporalio import workflow
 
 with workflow.unsafe.imports_passed_through():
-    from aegis_worker.activities.capture import CaptureActivities
-    from aegis_worker.shared.retry import ACT_RETRY, NO_RETRY, TIMEOUT_FAST
+    from aegis_worker.shared.retry import ACT_RETRY
 
 _ACT_TIMEOUT = timedelta(seconds=60)
 _CLASSIFY_TIMEOUT = timedelta(seconds=120)
@@ -52,6 +53,22 @@ class MoneyProcessFlow:
         )
         if not receipt_id:
             return {"status": "duplicate", "message_id": input.msg.get("id", "")}
+
+        # Full body for the extractor (spec §2 step 2). "" = fetch failed; the
+        # snippet stored by store_receipt_email is the fallback.
+        body = await workflow.execute_activity(
+            "fetch_message_body",
+            args=[input.account_label, input.msg.get("id", "")],
+            start_to_close_timeout=_ACT_TIMEOUT,
+            retry_policy=ACT_RETRY,
+        )
+        if body:
+            await workflow.execute_activity(
+                "store_receipt_body",
+                args=[receipt_id, body],
+                start_to_close_timeout=_ACT_TIMEOUT,
+                retry_policy=ACT_RETRY,
+            )
 
         receipts = await workflow.execute_activity(
             "load_receipts",
@@ -111,37 +128,8 @@ class MoneyProcessFlow:
             start_to_close_timeout=_ACT_TIMEOUT,
             retry_policy=ACT_RETRY,
         )
-
-        # Capture each new charge to the Todoist Inbox for review.
-        # receipt_id is the DB UUID for this receipt email — used as dedup key
-        # so re-processing the same email never creates a duplicate task.
-        charge_id = ext.get("receipt_id") or receipt_id
-        amount = ext.get("amount")
-        merchant = ext.get("vendor_name") or ext.get("sender_label") or "unknown"
-        currency = ext.get("currency") or ""
-        cadence = ext.get("cadence") or ""
-        amount_str = f"{amount:.2f} {currency}".strip() if amount is not None else "?"
-        title = f"Anomaly: {amount_str} {merchant}"[:120]
-        description_parts = [ext.get("category") or ""]
-        if cadence and cadence != "unknown":
-            description_parts.append(f"cadence: {cadence}")
-        if ext.get("next_due_at"):
-            description_parts.append(f"next due: {ext['next_due_at'][:10]}")
-        description = "\n".join(p for p in description_parts if p)
-        try:
-            await workflow.execute_activity_method(
-                CaptureActivities.capture_to_inbox,
-                args=["#receipt", f"charge-{charge_id}", title, description],
-                start_to_close_timeout=TIMEOUT_FAST,
-                retry_policy=NO_RETRY,
-            )
-        except Exception as exc:
-            workflow.logger.warning(
-                "money_capture_failed charge_id=%s err=%s",
-                charge_id,
-                str(exc)[:200],
-            )
-
+        # No per-receipt Todoist capture any more (spec §7.4): a successful
+        # payment is read in the weekly brief, never filed as a task.
         return {
             "status": "charged",
             "receipt_id": receipt_id,

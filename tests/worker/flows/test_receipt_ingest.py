@@ -258,8 +258,11 @@ async def test_receipt_flow_sweeps_stuck_receipts():
             }
         ]
 
+    classified_bodies: list[str] = []
+
     @activity.defn(name="classify_and_extract")
     async def classify(receipts: list[dict], agent_id: str) -> list[dict]:
+        classified_bodies.append(receipts[0]["body_plain"])
         return [
             {
                 "receipt_id": "stuck-1",
@@ -275,6 +278,17 @@ async def test_receipt_flow_sweeps_stuck_receipts():
     async def upsert(account: str, extractions: list[dict]) -> int:
         upserted.append((account, extractions))
         return len(extractions)
+
+    body_calls: list[tuple] = []
+
+    @activity.defn(name="fetch_message_body")
+    async def stub_body(account_label: str, message_id: str, max_chars: int = 6000) -> str:
+        body_calls.append((account_label, message_id))
+        return "full body"
+
+    @activity.defn(name="store_receipt_body")
+    async def stub_store_body(receipt_id: str, body_text: str) -> None:
+        return None
 
     async with (
         await WorkflowEnvironment.start_local() as env,
@@ -292,6 +306,8 @@ async def test_receipt_flow_sweeps_stuck_receipts():
                 load,
                 classify,
                 upsert,
+                stub_body,
+                stub_store_body,
             ],
         ),
     ):
@@ -307,6 +323,9 @@ async def test_receipt_flow_sweeps_stuck_receipts():
     assert len(upserted) == 1
     assert upserted[0][0] == "sebas"
     assert upserted[0][1][0]["vendor_name"] == "Stripe"
+    assert body_calls == [("sebas", "m-stuck-1")]
+    # The fetched body, not the stored snippet, is what the extractor sees.
+    assert classified_bodies == ["full body"]
 
 
 @pytest.mark.asyncio
@@ -344,6 +363,17 @@ async def test_receipt_flow_sweep_leaves_still_failing_rows_unparsed():
         upserted.append((account, extractions))
         return len(extractions)
 
+    body_calls: list[tuple] = []
+
+    @activity.defn(name="fetch_message_body")
+    async def stub_body(account_label: str, message_id: str, max_chars: int = 6000) -> str:
+        body_calls.append((account_label, message_id))
+        return "full body"
+
+    @activity.defn(name="store_receipt_body")
+    async def stub_store_body(receipt_id: str, body_text: str) -> None:
+        return None
+
     async with (
         await WorkflowEnvironment.start_local() as env,
         Worker(
@@ -360,6 +390,8 @@ async def test_receipt_flow_sweep_leaves_still_failing_rows_unparsed():
                 load,
                 classify,
                 upsert,
+                stub_body,
+                stub_store_body,
             ],
         ),
     ):
