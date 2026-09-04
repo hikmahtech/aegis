@@ -155,6 +155,16 @@ def _extract_html_from_part(part: dict) -> str:
 _URL_RE = re.compile(r"https?://\S+")
 _TAG_BLOCK_RE = re.compile(r"<(style|script)[^>]*>.*?</\1>", re.S | re.I)
 _TAG_RE = re.compile(r"<[^>]+>")
+# Tags that end a line. Everything else is INLINE and is deleted outright
+# rather than replaced by a space: HTML mailers wrap parts of a number in
+# <b>/<span>, so "Amount:<b>1,00,308</b>.53" must not become
+# "Amount: 1,00,308 .53" — the deterministic bank parsers match exact
+# phrases like "Rs.<amt> is debited" against this output.
+_BLOCK_TAG_RE = re.compile(
+    r"</?(?:br|p|div|tr|td|th|table|li|ul|ol|h[1-6]|blockquote"
+    r"|section|article|header|footer|hr)\b[^>]*>",
+    re.I,
+)
 # Space, tab, NBSP (U+00A0), then three characters that LOOK LIKE NOTHING in
 # this source line and are meant to: zero-width space (U+200B), zero-width
 # non-joiner (U+200C) and combining grapheme joiner (U+034F). HTML mailers
@@ -169,7 +179,8 @@ def html_to_text(html_src: str) -> str:
     import html as _html
 
     text = _TAG_BLOCK_RE.sub(" ", html_src)
-    text = _TAG_RE.sub(" ", text)
+    text = _BLOCK_TAG_RE.sub("\n", text)
+    text = _TAG_RE.sub("", text)
     text = _html.unescape(text)
     return _clean_text(text)
 

@@ -94,3 +94,18 @@ async def test_failure_returns_empty_string(monkeypatch, tmp_path):
     acts = _acts(monkeypatch, tmp_path, _FakeSvc({}, raise_exc=RuntimeError("gmail down")))
     body = await ActivityEnvironment().run(acts.fetch_message_body, "acct", "m1")
     assert body == ""
+
+
+def test_html_to_text_keeps_inline_amounts_intact_and_breaks_on_blocks():
+    """Inline tags must vanish, not become a space: the deterministic bank
+    parsers regex on exact phrases, and `Amount:<b>1,00,308</b>.53` used to
+    come out as `Amount: 1,00,308 .53`. Block tags still break the line."""
+    src = (
+        "<p>Amount:<b>1,00,308</b>.53</p>"
+        "<p>Due <span>07</span>/09/2026</p>"
+        "<table><tr><td>Rs.10.00</td><td>debited</td></tr></table>"
+    )
+    text = html_to_text(src)
+    assert "Amount:1,00,308.53" in text
+    assert "Due 07/09/2026" in text
+    assert "Rs.10.00\ndebited" in text or "Rs.10.00 debited" in text
