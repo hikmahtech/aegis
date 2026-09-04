@@ -99,7 +99,7 @@ def parse_hdfc_upi(sender: str, subject: str, body: str) -> MoneyEvent | None:
     amt, verb, tail, vpa, name, d, ref = m.groups()
     out = verb.startswith("debited")
     return _event(
-        "hdfc_upi_debit" if out else "hdfc_upi_credit",
+        "hdfc_upi",
         kind="transaction",
         direction="out" if out else "in",
         amount=amount_from(amt),
@@ -158,7 +158,7 @@ def parse_nkgsb(sender: str, subject: str, body: str) -> MoneyEvent | None:
     verb, amt, tail, d, ref, vpa = m.groups()
     incoming = verb == "Received"
     return _event(
-        "nkgsb_credit" if incoming else "nkgsb_debit",
+        "nkgsb",
         kind="transaction",
         direction="in" if incoming else "out",
         amount=amount_from(amt),

@@ -117,11 +117,21 @@ FIX = {
 }
 
 
+# Parser names are direction-neutral: direction lives in MoneyEvent.direction.
+# Fixture keys that name a direction map back to the one parser that owns them;
+# every other key already equals its parser name.
+_PARSER_FOR = {
+    "hdfc_upi_debit": "hdfc_upi",
+    "hdfc_upi_credit": "hdfc_upi",
+    "nkgsb_credit": "nkgsb",
+}
+
+
 def _ev(name):
     sender, subject, body = FIX[name]
     ev = bp.parse_any(sender, subject, body)
     assert ev is not None, name
-    assert ev.parser == name
+    assert ev.parser == _PARSER_FOR.get(name, name)
     assert ev.payee_key, name
     return ev
 
