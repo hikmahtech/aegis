@@ -20,8 +20,8 @@ Pipeline per email:
     → one dated Todoist task; a failure here is logged, never fatal.
   post_money_event(...)               # journal post / link, or index only
   store_money_result(...)             # stamp parsed.version = 2
-    → skipped on `books_disabled`: indexed-only is not finished, so the row
-      stays re-drivable by the weekly sweep.
+    → skipped on any `UNSTAMPED_STATUSES` result: indexed-only is not
+      finished, so the row stays re-drivable by the weekly sweep.
 
 Failures here are isolated from the parent triage run — the fan-out hook in
 GmailIngestFlow starts this with ParentClosePolicy.ABANDON.
@@ -44,6 +44,13 @@ _CLASSIFY_TIMEOUT = timedelta(seconds=120)
 # allowed `books.CLONE_TIMEOUT_S` (180s). A shorter budget times out
 # mid-clone and burns every retry attempt on the same clone.
 _POST_TIMEOUT = timedelta(seconds=240)
+
+# `post_money_event` results that mean "indexed, but NOT in the journal", so
+# the row must stay BELOW parsed.version 2 and keep being re-driven by the
+# weekly sweep. `books_disabled`: no checkout yet. `post_failed`: the books
+# refused the write (a chart mismatch, usually), which a later run can post
+# once the chart is fixed. The receipt sweep imports this list — one place.
+UNSTAMPED_STATUSES = frozenset({"books_disabled", "post_failed"})
 
 
 @dataclass
@@ -155,18 +162,20 @@ class MoneyProcessFlow:
             start_to_close_timeout=_POST_TIMEOUT,
             retry_policy=ACT_RETRY,
         )
-        if posted.get("status") == "books_disabled":
-            # Indexed but never posted — there is no books checkout yet, so
-            # this row is NOT finished. Stamping version 2 would drop it out
-            # of find_stuck_receipts for good: the payment would never reach
-            # the journal, and since find_match ignores rows with no
-            # journal_file, a later counterpart would post a SECOND block for
-            # the same payment. Leave it below version 2 for the weekly sweep.
+        status = posted.get("status")
+        if status in UNSTAMPED_STATUSES:
+            # Indexed but never posted — no checkout yet, or the books refused
+            # the write. Either way this row is NOT finished. Stamping version
+            # 2 would drop it out of find_stuck_receipts for good: the payment
+            # would never reach the journal, and since find_match ignores rows
+            # with no journal_file, a later counterpart would post a SECOND
+            # block for the same payment. Leave it below version 2.
             workflow.logger.warning(
-                "money_books_disabled receipt_id=%s — leaving unstamped",
+                "money_not_posted receipt_id=%s status=%s — leaving unstamped",
                 receipt_id,
+                status,
             )
-            return {**out, "status": "books_disabled"}
+            return {**out, "status": status}
 
         await workflow.execute_activity(
             "store_money_result",

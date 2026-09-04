@@ -495,3 +495,33 @@ async def test_a_dateless_receipt_parser_gets_its_date_from_received_at(db_pool,
     )
     assert ev["parser"] == "airtel_receipt" and ev["kind"] == "transaction"
     assert ev["occurred_on"] == "2026-09-02"  # received_at 10:00Z -> 15:30 IST
+
+
+@pytest.mark.asyncio
+async def test_a_block_the_chart_rejects_is_indexed_but_not_posted(db_pool, tmp_path):
+    """`hledger check --strict` refusing a block is not a reason to fail
+    forever. Only BooksDisabled was caught here, so a chart mismatch — an
+    undeclared commodity or account — burned all three attempts, failed the
+    workflow, and left the row below version 2 for the weekly sweep to
+    re-drive and fail again, every week. Same stuck-row class as the
+    enrichment path. The event is indexed WITHOUT a journal_file so the row
+    exists, the sweep can retry once the chart is fixed, and `find_match`
+    never offers a counterpart a block that was never written."""
+    cfg = _repo(tmp_path)
+    act = _act(db_pool, cfg)
+    journal = cfg.path / "personal" / "2026.journal"
+    before = journal.read_text()
+
+    # XYZ is three valid ISO letters and an UNDECLARED commodity: the chart
+    # declares only the rupee and the dollar.
+    ev = _bank_event(currency="XYZ")
+    r = await ActivityEnvironment().run(
+        act.post_money_event, "rid1", "v2-personal", "m-chart", ev
+    )
+
+    assert r["status"] == "post_failed"
+    assert r["journal_file"] is None and r["linked"] is None
+    row = await ji.get(db_pool, "v2-personal/m-chart")
+    assert row is not None and row["journal_file"] is None
+    assert row["linked_message_id"] is None
+    assert journal.read_text() == before  # the write reverted

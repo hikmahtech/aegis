@@ -512,6 +512,28 @@ class MoneyActivities:
             await ji.upsert(self.db_pool, msgid, mailbox, ev)
             result["status"] = "books_disabled"
             return result
+        except books.BooksError as exc:
+            # The write was refused and reverted — usually `check --strict` on
+            # a chart mismatch (an undeclared account or commodity). Retrying
+            # cannot fix that, so an uncaught error burned all three attempts,
+            # failed the workflow, and left the row below version 2 for the
+            # weekly sweep to re-drive and fail again, forever. Same stuck-row
+            # class as the enrichment path above.
+            #
+            # Index it with NO journal_file: the row exists for the admin page
+            # and dues dedupe, `find_match` will not offer a counterpart a
+            # block that was never written, and the sweep re-posts it once the
+            # chart is fixed. Deliberately NOT stamped as posted — the caller
+            # must leave it below version 2 (`UNSTAMPED_STATUSES`).
+            activity.logger.warning(
+                "money_post_failed msgid=%s error=%s: %s — indexed only, not posted",
+                msgid,
+                type(exc).__name__,
+                exc,
+            )
+            await ji.upsert(self.db_pool, msgid, mailbox, ev)
+            result["status"] = "post_failed"
+            return result
 
         if ev.amount is not None and ev.currency and ev.occurred_on is not None:
             due = await ji.find_open_due(

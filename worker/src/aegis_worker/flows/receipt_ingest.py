@@ -32,7 +32,11 @@ from temporalio.workflow import ParentClosePolicy
 with workflow.unsafe.imports_passed_through():
     from aegis_worker.activities.gmail import FetchEmailsInput, FetchEmailsResult
     from aegis_worker.flows.interaction import InteractionFlow, InteractionFlowInput
-    from aegis_worker.flows.money_process import MoneyProcessFlow, MoneyProcessInput
+    from aegis_worker.flows.money_process import (
+        UNSTAMPED_STATUSES,
+        MoneyProcessFlow,
+        MoneyProcessInput,
+    )
     from aegis_worker.shared.gmail_auth import is_auth_expired
     from aegis_worker.shared.retry import ACT_RETRY, NO_RETRY
 
@@ -260,13 +264,14 @@ class ReceiptIngestFlow:
                     start_to_close_timeout=_POST_TIMEOUT,
                     retry_policy=ACT_RETRY,
                 )
-                if posted.get("status") == "books_disabled":
-                    # No books checkout: indexed only, so the row is not
-                    # finished. Leave it below version 2 for a later sweep
-                    # and don't count it — it was not swept.
+                if posted.get("status") in UNSTAMPED_STATUSES:
+                    # Indexed only — no checkout, or the books refused the
+                    # write — so the row is not finished. Leave it below
+                    # version 2 for a later sweep and don't count it.
                     workflow.logger.warning(
-                        "receipt_sweep_books_disabled receipt_id=%s — leaving unstamped",
+                        "receipt_sweep_not_posted receipt_id=%s status=%s — leaving unstamped",
                         receipt_id,
+                        posted.get("status"),
                     )
                     continue
 

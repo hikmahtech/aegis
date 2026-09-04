@@ -302,6 +302,20 @@ async def test_body_fetch_failure_still_posts():
     assert len(_calls["result"]) == 1
 
 
+@activity.defn(name="post_money_event")
+async def stub_post_failed(
+    receipt_id: str, mailbox: str, message_id: str, event: dict, todoist_ref: str | None = None
+) -> dict:
+    _calls["post"].append((receipt_id, mailbox, message_id, event["kind"], todoist_ref))
+    return {
+        "msgid": f"{mailbox}/{message_id}",
+        "status": "post_failed",
+        "journal_file": None,
+        "linked": None,
+        "closed_due": None,
+    }
+
+
 @pytest.mark.asyncio
 async def test_books_disabled_is_not_stamped():
     """No books checkout yet: the event is indexed but never posted, so the
@@ -327,3 +341,16 @@ def test_post_money_event_outlives_a_first_write_clone():
 
     for timeout in (_POST_TIMEOUT, _SWEEP_POST_TIMEOUT):
         assert timeout.total_seconds() > CLONE_TIMEOUT_S
+
+
+@pytest.mark.asyncio
+async def test_a_rejected_block_is_not_stamped_either():
+    """`post_failed` means indexed but NOT in the journal, exactly like
+    `books_disabled`: the row must stay below version 2 so the weekly sweep
+    re-drives it once the chart is fixed. Stamping it would drop the payment
+    for good."""
+    _reset()
+    result = await _run(_stubs(post=stub_post_failed), "mp-post-failed")
+    assert result["status"] == "post_failed"
+    assert len(_calls["post"]) == 1
+    assert _calls["result"] == []
