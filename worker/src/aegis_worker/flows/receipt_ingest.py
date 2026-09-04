@@ -247,6 +247,16 @@ class ReceiptIngestFlow:
                     start_to_close_timeout=_CLASSIFY_TIMEOUT,
                     retry_policy=ACT_RETRY,
                 )
+                if posted.get("status") == "books_disabled":
+                    # No books checkout: indexed only, so the row is not
+                    # finished. Leave it below version 2 for a later sweep
+                    # and don't count it — it was not swept.
+                    workflow.logger.warning(
+                        "receipt_sweep_books_disabled receipt_id=%s — leaving unstamped",
+                        receipt_id,
+                    )
+                    continue
+
                 await workflow.execute_activity(
                     "store_money_result",
                     args=[receipt_id, event, posted.get("journal_file")],

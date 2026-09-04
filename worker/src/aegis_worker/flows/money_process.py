@@ -20,6 +20,8 @@ Pipeline per email:
     → one dated Todoist task; a failure here is logged, never fatal.
   post_money_event(...)               # journal post / link, or index only
   store_money_result(...)             # stamp parsed.version = 2
+    → skipped on `books_disabled`: indexed-only is not finished, so the row
+      stays re-drivable by the weekly sweep.
 
 Failures here are isolated from the parent triage run — the fan-out hook in
 GmailIngestFlow starts this with ParentClosePolicy.ABANDON.
@@ -148,6 +150,19 @@ class MoneyProcessFlow:
             start_to_close_timeout=_CLASSIFY_TIMEOUT,
             retry_policy=ACT_RETRY,
         )
+        if posted.get("status") == "books_disabled":
+            # Indexed but never posted — there is no books checkout yet, so
+            # this row is NOT finished. Stamping version 2 would drop it out
+            # of find_stuck_receipts for good: the payment would never reach
+            # the journal, and since find_match ignores rows with no
+            # journal_file, a later counterpart would post a SECOND block for
+            # the same payment. Leave it below version 2 for the weekly sweep.
+            workflow.logger.warning(
+                "money_books_disabled receipt_id=%s — leaving unstamped",
+                receipt_id,
+            )
+            return {**out, "status": "books_disabled"}
+
         await workflow.execute_activity(
             "store_money_result",
             args=[receipt_id, event, posted.get("journal_file")],

@@ -164,13 +164,29 @@ async def stub_post(
     }
 
 
+@activity.defn(name="post_money_event")
+async def stub_post_books_disabled(
+    receipt_id: str, mailbox: str, message_id: str, event: dict, todoist_ref: str | None = None
+) -> dict:
+    _calls["post"].append((receipt_id, mailbox, message_id, event["kind"], todoist_ref))
+    return {
+        "msgid": f"{mailbox}/{message_id}",
+        "status": "books_disabled",
+        "journal_file": None,
+        "linked": None,
+        "closed_due": None,
+    }
+
+
 @activity.defn(name="store_money_result")
 async def stub_result(receipt_id: str, event: dict, journal_file: str | None) -> None:
     _calls["result"].append((receipt_id, event["kind"], journal_file))
 
 
-def _stubs(parse=None, store=stub_store, due=stub_due, body=stub_body, load=stub_load):
-    return [store, body, stub_store_body, load, parse or _parser(_TXN), due, stub_post, stub_result]
+def _stubs(
+    parse=None, store=stub_store, due=stub_due, body=stub_body, load=stub_load, post=stub_post
+):
+    return [store, body, stub_store_body, load, parse or _parser(_TXN), due, post, stub_result]
 
 
 async def _run(stubs, wid: str) -> dict:
@@ -284,3 +300,17 @@ async def test_body_fetch_failure_still_posts():
     assert _calls["store_body"] == []
     assert _calls["parse"] == ["uid-gmail-msg-1"]
     assert len(_calls["result"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_books_disabled_is_not_stamped():
+    """No books checkout yet: the event is indexed but never posted, so the
+    row must stay BELOW version 2. Stamping it would take it out of
+    find_stuck_receipts for good — the payment would never reach the journal,
+    and because find_match skips rows with no journal_file, a later
+    counterpart would post a second block for the same payment."""
+    _reset()
+    result = await _run(_stubs(post=stub_post_books_disabled), "mp-books-off")
+    assert result["status"] == "books_disabled"
+    assert len(_calls["post"]) == 1
+    assert _calls["result"] == []
