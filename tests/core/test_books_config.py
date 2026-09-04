@@ -5,8 +5,10 @@ names, so the three list-ish knobs default to "" and are DB-configured from
 the admin Integrations page.
 """
 
+from pathlib import Path
 from types import SimpleNamespace
 
+import yaml
 from aegis.services import books
 from aegis.services.integrations_config import CONFIG_REGISTRY
 
@@ -42,3 +44,25 @@ def test_config_from_settings(tmp_path):
     assert cfg.path == tmp_path and cfg.repo_url == "git@x:y.git" and cfg.deploy_key is None
     (tmp_path / "books_deploy_key").write_text("k")
     assert books.config_from_settings(s).deploy_key == tmp_path / "books_deploy_key"
+
+
+def test_compose_gives_core_and_worker_one_books_checkout():
+    """`books_path` defaults under `/app/config`, so without a shared mount the
+    two containers keep SEPARATE checkouts: the `flock` on `.aegis.lock` no
+    longer serialises anything, and a commit whose push failed dies with the
+    container while `journal_index` still says `posted`.
+    `docs/infrastructure.md` promises one checkout, and the production stack
+    mounts `aegis_config` on both — the shipped compose file must match."""
+    root = Path(__file__).resolve().parents[2]
+    compose = yaml.safe_load((root / "docker-compose.yml").read_text())
+    at_config = {}
+    for name in ("core", "worker"):
+        mounts = [
+            v for v in (compose["services"][name].get("volumes") or [])
+            if isinstance(v, str) and v.split(":")[1:2] == ["/app/config"]
+        ]
+        assert len(mounts) == 1, f"{name} mounts nothing at /app/config"
+        at_config[name] = mounts[0].split(":")[0]
+    assert at_config["core"] == at_config["worker"], "core and worker mount different volumes"
+    # A named volume, not a host path: it is declared at the top level.
+    assert at_config["core"] in (compose.get("volumes") or {})

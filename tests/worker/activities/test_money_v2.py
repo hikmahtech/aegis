@@ -407,3 +407,65 @@ async def test_store_money_result_marks_version_2(db_pool, tmp_path):
     assert parsed["version"] == 2 and parsed["body_text"] == "b"
     assert parsed["journal_file"] == "personal/2026.journal"
     assert parsed["event"]["payee"] == "Jai shree nakoda"
+
+
+@pytest.mark.asyncio
+async def test_receipt_posts_its_own_block_when_the_matched_block_is_gone(db_pool, tmp_path):
+    """The index can outlive the journal — a lost unpushed commit, a re-clone, a
+    human revert. `find_match` only checks that the row HAS a journal_file, so
+    the enrichment then rewrites a block that is not there and `rewrite_event`
+    raises a plain BooksError. Uncaught, the activity retried forever and the
+    row stuck; an extra block is recoverable, a stuck activity is not."""
+    cfg = _repo(tmp_path)
+    act = _act(db_pool, cfg)
+    journal = cfg.path / "personal" / "2026.journal"
+    await ActivityEnvironment().run(
+        act.post_money_event, "rid1", "v2-personal", "m-bank", _bank_event()
+    )
+    journal.write_text("; p\n")  # the block the index still points at, gone
+
+    receipt = _bank_event(payee="Apple Music Individual", payee_key="apple music individual",
+                          channel="receipt", instrument=None, account="expenses:media",
+                          parser="apple_receipt", source_class="receipt",
+                          occurred_on="2026-09-03", ref=None)
+    r = await ActivityEnvironment().run(
+        act.post_money_event, "rid2", "v2-personal", "m-rcpt", receipt
+    )
+
+    assert r["status"] == "posted" and r["journal_file"] == "personal/2026.journal"
+    assert r["linked"] is None
+    assert "2026-09-03 * Apple Music Individual" in journal.read_text()
+    # The index says what actually happened: posted, not linked.
+    row = await ji.get(db_pool, "v2-personal/m-rcpt")
+    assert row["journal_file"] == "personal/2026.journal"
+    assert row["linked_message_id"] is None
+    assert (await ji.get(db_pool, "v2-personal/m-bank"))["linked_message_id"] is None
+
+
+@pytest.mark.asyncio
+async def test_bank_posts_its_own_block_when_the_matched_block_is_gone(db_pool, tmp_path):
+    """The same recovery on the other enrichment path."""
+    cfg = _repo(tmp_path)
+    act = _act(db_pool, cfg)
+    journal = cfg.path / "personal" / "2026.journal"
+    receipt = _bank_event(payee="Eleven Labs", payee_key="eleven labs", channel="receipt",
+                          instrument="card-1313", account="expenses:saas",
+                          parser="stripe_receipt", source_class="receipt", ref=None)
+    await ActivityEnvironment().run(
+        act.post_money_event, "rid1", "v2-personal", "m-rcpt", receipt
+    )
+    journal.write_text("; p\n")
+
+    bank = _bank_event(payee="ELEVENLABS", payee_key="elevenlabs", channel="card",
+                       instrument="axis-cc-1313", parser="axis_card_spend",
+                       occurred_on="2026-09-03")
+    r = await ActivityEnvironment().run(
+        act.post_money_event, "rid2", "v2-personal", "m-bank", bank
+    )
+
+    assert r["status"] == "posted" and r["journal_file"] == "personal/2026.journal"
+    assert r["linked"] is None
+    text = journal.read_text()
+    assert "2026-09-03 * ELEVENLABS" in text and "    liabilities:card:axis:1313\n" in text
+    row = await ji.get(db_pool, "v2-personal/m-bank")
+    assert row["journal_file"] == "personal/2026.journal" and row["linked_message_id"] is None

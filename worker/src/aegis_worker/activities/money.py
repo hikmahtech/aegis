@@ -441,43 +441,65 @@ class MoneyActivities:
         try:
             if cfg is None:
                 raise books.BooksDisabled("no books config")
+            linked_to: str | None = None
             if match is not None:
                 other = match["message_id"]
-                if ev.source_class == "receipt":
-                    kwargs: dict = {"add_tags": {"receipt": msgid}}
-                    if self._looks_raw(match["payee"] or "") and ev.payee:
-                        kwargs["payee"] = ev.payee
-                    if (match["account"] or "").endswith(":unknown") and (
-                        ev.account and not ev.account.endswith(":unknown")
-                    ):
-                        kwargs["account"] = ev.account
-                    try:
-                        await books.rewrite_event(other, cfg, **kwargs)
-                    except books.BooksCheckError:
-                        # The receipt's account is not in the chart. Keep the
-                        # cross-reference rather than losing the whole link.
-                        kwargs = {"add_tags": {"receipt": msgid}}
-                        await books.rewrite_event(other, cfg, **kwargs)
-                    fixed_kwargs = {
-                        k: v for k, v in kwargs.items() if k in ("payee", "account")
-                    }
-                    fixed = MoneyEvent(**{**match_to_event(match), **fixed_kwargs})
-                    if "payee" in fixed_kwargs:
-                        fixed.payee_key = payee_key(fixed.payee)
-                    await ji.upsert(self.db_pool, other, match["mailbox"], fixed)
-                else:
-                    declared = await asyncio.to_thread(books._declared_accounts_sync, cfg)
-                    inst = instrument_account(ev.instrument, declared)
-                    try:
-                        await books.rewrite_event(
-                            other, cfg, instrument_account=inst, add_tags={"bank": msgid}
-                        )
-                    except books.BooksCheckError:
-                        await books.rewrite_event(other, cfg, add_tags={"bank": msgid})
-                await ji.upsert(self.db_pool, msgid, mailbox, ev, linked=other)
-                await ji.link(self.db_pool, msgid, other)
-                result.update(status="linked", linked=other)
+                # EVERY books failure here falls back to posting this event as
+                # its own block. `find_match` proves the row HAS a journal_file,
+                # not that the block is still in the journal: a lost unpushed
+                # commit, a re-clone or a human revert leaves the index pointing
+                # at nothing, and `rewrite_event` then raises a plain BooksError.
+                # Uncaught, the activity retried that forever and the row stuck.
+                # An extra block is recoverable by hand; a stuck activity is not.
+                try:
+                    if ev.source_class == "receipt":
+                        kwargs: dict = {"add_tags": {"receipt": msgid}}
+                        if self._looks_raw(match["payee"] or "") and ev.payee:
+                            kwargs["payee"] = ev.payee
+                        if (match["account"] or "").endswith(":unknown") and (
+                            ev.account and not ev.account.endswith(":unknown")
+                        ):
+                            kwargs["account"] = ev.account
+                        try:
+                            await books.rewrite_event(other, cfg, **kwargs)
+                        except books.BooksCheckError:
+                            # The receipt's account is not in the chart. Keep the
+                            # cross-reference rather than losing the whole link.
+                            kwargs = {"add_tags": {"receipt": msgid}}
+                            await books.rewrite_event(other, cfg, **kwargs)
+                        fixed_kwargs = {
+                            k: v for k, v in kwargs.items() if k in ("payee", "account")
+                        }
+                        fixed = MoneyEvent(**{**match_to_event(match), **fixed_kwargs})
+                        if "payee" in fixed_kwargs:
+                            fixed.payee_key = payee_key(fixed.payee)
+                        await ji.upsert(self.db_pool, other, match["mailbox"], fixed)
+                    else:
+                        declared = await asyncio.to_thread(books._declared_accounts_sync, cfg)
+                        inst = instrument_account(ev.instrument, declared)
+                        try:
+                            await books.rewrite_event(
+                                other, cfg, instrument_account=inst, add_tags={"bank": msgid}
+                            )
+                        except books.BooksCheckError:
+                            await books.rewrite_event(other, cfg, add_tags={"bank": msgid})
+                    await ji.upsert(self.db_pool, msgid, mailbox, ev, linked=other)
+                    await ji.link(self.db_pool, msgid, other)
+                    linked_to = other
+                except books.BooksDisabled:
+                    raise  # the checkout is gone entirely — index only, below
+                except books.BooksError as exc:
+                    activity.logger.warning(
+                        "money_enrich_failed msgid=%s match=%s error=%s — posting its own block",
+                        msgid,
+                        other,
+                        exc,
+                    )
+            if linked_to is not None:
+                result.update(status="linked", linked=linked_to)
             else:
+                # Also the no-match path. Either way the index records what
+                # actually happened — `posted`, with the block it wrote.
                 rel = await books.post_event(ev, msgid, cfg)
                 await ji.upsert(self.db_pool, msgid, mailbox, ev, journal_file=rel)
                 result.update(status="posted", journal_file=rel)

@@ -30,6 +30,9 @@ on:
       - "config/**"
       - "migrations/**"
       - "personalities/**"
+      # tests/core/test_books_config.py asserts core and worker share one
+      # /app/config mount, which is what gives the books ONE checkout.
+      - "docker-compose.yml"
       - "pyproject.toml"
       - ".github/workflows/core.yml"
   pull_request:
@@ -50,6 +53,9 @@ on:
       - "config/**"
       - "migrations/**"
       - "personalities/**"
+      # tests/core/test_books_config.py asserts core and worker share one
+      # /app/config mount, which is what gives the books ONE checkout.
+      - "docker-compose.yml"
       - "pyproject.toml"
       - ".github/workflows/core.yml"
 
