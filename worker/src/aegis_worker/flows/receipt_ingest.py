@@ -40,6 +40,9 @@ with workflow.unsafe.imports_passed_through():
 _ACT_TIMEOUT = timedelta(seconds=60)
 _FETCH_TIMEOUT = timedelta(seconds=120)
 _CLASSIFY_TIMEOUT = timedelta(seconds=120)
+# The sweep is the backfill vehicle, so it is usually the first thing to
+# post after the books are enabled — see MoneyProcessFlow._POST_TIMEOUT.
+_POST_TIMEOUT = timedelta(seconds=240)
 
 # The receipt-shaped sender list: banks and card issuers first (they carry the
 # amount and the instrument), then the vendors whose receipts enrich them.
@@ -254,7 +257,7 @@ class ReceiptIngestFlow:
                         event,
                         todoist_ref,
                     ],
-                    start_to_close_timeout=_CLASSIFY_TIMEOUT,
+                    start_to_close_timeout=_POST_TIMEOUT,
                     retry_policy=ACT_RETRY,
                 )
                 if posted.get("status") == "books_disabled":

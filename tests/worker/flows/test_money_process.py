@@ -314,3 +314,16 @@ async def test_books_disabled_is_not_stamped():
     assert result["status"] == "books_disabled"
     assert len(_calls["post"]) == 1
     assert _calls["result"] == []
+
+
+def test_post_money_event_outlives_a_first_write_clone():
+    """The first post after the books are enabled clones the repo inside the
+    activity, which is allowed `books.CLONE_TIMEOUT_S`. An activity timeout
+    below that burns every retry attempt on the same clone. Both call sites —
+    MoneyProcessFlow and the ReceiptIngestFlow sweep — must sit above it."""
+    from aegis.services.books import CLONE_TIMEOUT_S
+    from aegis_worker.flows.money_process import _POST_TIMEOUT
+    from aegis_worker.flows.receipt_ingest import _POST_TIMEOUT as _SWEEP_POST_TIMEOUT
+
+    for timeout in (_POST_TIMEOUT, _SWEEP_POST_TIMEOUT):
+        assert timeout.total_seconds() > CLONE_TIMEOUT_S

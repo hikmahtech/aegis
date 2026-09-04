@@ -503,3 +503,28 @@ def test_missing_checkout_without_repo_url_is_disabled(tmp_path):
     cfg = books.BooksConfig(path=tmp_path / "nowhere")
     with pytest.raises(books.BooksDisabled):
         books.ensure_checkout_sync(cfg)
+
+
+@pytest.mark.skipif(not HAS_HLEDGER, reason="hledger/git not installed")
+@pytest.mark.asyncio
+async def test_the_first_write_clones_with_the_lock_already_held(tmp_path):
+    """The clone now runs INSIDE the flock, so a simultaneous first write from
+    core and worker cannot both clone. The lock file lives in the checkout and
+    a clone refuses a non-empty destination (measured: exit 128, "already
+    exists and is not an empty directory"), so it stages in a sibling
+    directory and moves the result in."""
+    origin = tmp_path / "origin.git"
+    subprocess.run(
+        ["git", "clone", "-q", "--bare", str(_repo(tmp_path).path), str(origin)], check=True
+    )
+    dest = tmp_path / "checkout"
+    cfg = books.BooksConfig(path=dest, repo_url=str(origin))
+
+    rel = await books.post_event(EV_OUT, "m/first", cfg)
+
+    assert (dest / ".git").exists(), "the clone never landed"
+    assert (dest / ".aegis.lock").exists(), "the lock the write held is gone"
+    posted = (dest / rel).read_text()
+    assert "; msgid: m/first" in posted and posted.endswith("    assets:bank:hdfc:1225\n")
+    assert not (dest.parent / f".{dest.name}.cloning").exists()  # staging cleaned up
+    assert await books.unpushed_commits(cfg) == 0  # it really pushed

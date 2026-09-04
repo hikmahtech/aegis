@@ -13,6 +13,7 @@ import base64
 import fcntl
 import os
 import re
+import shutil
 import subprocess
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -386,6 +387,10 @@ _GIT_IDENTITY = {
     "GIT_COMMITTER_EMAIL": "maou@aegis.local",
 }
 _LOCK_NAME = ".aegis.lock"
+# How long a clone may take. Every activity that can trigger the first write
+# must allow MORE than this, or it times out mid-clone and burns every retry
+# attempt on the same clone (`_POST_TIMEOUT` in the money flows).
+CLONE_TIMEOUT_S = 180
 
 
 def _env(cfg: BooksConfig) -> dict[str, str]:
@@ -429,18 +434,32 @@ def _has_remote(cfg: BooksConfig) -> bool:
 
 def ensure_checkout_sync(cfg: BooksConfig) -> None:
     """Clone if the working copy is missing. Raises BooksDisabled with no
-    repo url and no checkout."""
+    repo url and no checkout.
+
+    Called with the flock HELD (see `_write_sync`), so core and worker cannot
+    both clone on the first-ever write. That is also why the clone stages in a
+    sibling directory: the lock lives INSIDE `cfg.path` (the spec gitignores it
+    there), and a clone refuses a destination that is not empty — measured,
+    exit 128, "already exists and is not an empty directory". Nothing is moved
+    into place until the clone has succeeded.
+    """
     if (cfg.path / ".git").exists():
         return
     if not cfg.repo_url:
         raise BooksDisabled("books_repo_url is not configured and no checkout exists")
-    cfg.path.parent.mkdir(parents=True, exist_ok=True)
+    cfg.path.mkdir(parents=True, exist_ok=True)
+    staging = cfg.path.parent / f".{cfg.path.name}.cloning"
+    shutil.rmtree(staging, ignore_errors=True)
     proc = _spawn(
-        ["git", "clone", "-q", cfg.repo_url, str(cfg.path)],
-        cwd=str(cfg.path.parent), timeout=180, env=_env(cfg),
+        ["git", "clone", "-q", cfg.repo_url, str(staging)],
+        cwd=str(cfg.path.parent), timeout=CLONE_TIMEOUT_S, env=_env(cfg),
     )
     if proc.returncode != 0:
+        shutil.rmtree(staging, ignore_errors=True)
         raise BooksError(f"git clone failed: {proc.stderr.strip()[:500]}")
+    for item in staging.iterdir():
+        item.rename(cfg.path / item.name)
+    staging.rmdir()
 
 
 def _pull_sync(cfg: BooksConfig) -> None:
@@ -530,6 +549,9 @@ class _FileLock:
         self._path = cfg.path / _LOCK_NAME
 
     def __enter__(self):
+        # The directory may not exist yet: the clone happens INSIDE this lock,
+        # so the lock file has to be creatable before there is a checkout.
+        self._path.parent.mkdir(parents=True, exist_ok=True)
         self._fd = open(self._path, "w")  # noqa: SIM115 — held for the with-block
         fcntl.flock(self._fd, fcntl.LOCK_EX)
         return self
@@ -546,8 +568,10 @@ def _write_sync(
     that only learns which file it touched inside `mutate` passes the list the
     closure appends to — it is read after `mutate` returns, and the closure must
     record a path BEFORE writing it."""
-    ensure_checkout_sync(cfg)
+    # The clone is inside the lock: two processes reaching their first write at
+    # the same moment would otherwise both clone into the same directory.
     with _FileLock(cfg):
+        ensure_checkout_sync(cfg)
         _pull_sync(cfg)
         try:
             mutate()

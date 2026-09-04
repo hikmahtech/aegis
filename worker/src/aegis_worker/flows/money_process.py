@@ -39,6 +39,11 @@ with workflow.unsafe.imports_passed_through():
 
 _ACT_TIMEOUT = timedelta(seconds=60)
 _CLASSIFY_TIMEOUT = timedelta(seconds=120)
+# Longer than every other activity on purpose: the FIRST post after the
+# books are enabled clones the repo inside the activity, and that clone is
+# allowed `books.CLONE_TIMEOUT_S` (180s). A shorter budget times out
+# mid-clone and burns every retry attempt on the same clone.
+_POST_TIMEOUT = timedelta(seconds=240)
 
 
 @dataclass
@@ -147,7 +152,7 @@ class MoneyProcessFlow:
         posted = await workflow.execute_activity(
             "post_money_event",
             args=[receipt_id, input.account_label, msg_id, event, todoist_ref],
-            start_to_close_timeout=_CLASSIFY_TIMEOUT,
+            start_to_close_timeout=_POST_TIMEOUT,
             retry_policy=ACT_RETRY,
         )
         if posted.get("status") == "books_disabled":
