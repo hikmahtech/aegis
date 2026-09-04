@@ -169,7 +169,12 @@ def install_deploy_key(settings) -> Path | None:
             raise BooksError("books_deploy_key is neither PEM text nor base64 PEM") from exc
     path = Path(getattr(settings, "gmail_token_dir", "config/")) / "books_deploy_key"
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(raw + "\n")
+    # O_CREAT's mode applies only when the file is NEW, so this closes the window
+    # where a fresh key file exists world-readable; the chmod then covers the
+    # case where the path already existed with looser permissions.
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as fh:
+        fh.write(raw + "\n")
     path.chmod(0o600)
     return path
 
@@ -356,12 +361,27 @@ def _env(cfg: BooksConfig) -> dict[str, str]:
     return env
 
 
+def _spawn(
+    cmd: list[str], *, cwd: str, timeout: int, env: dict[str, str] | None = None
+) -> subprocess.CompletedProcess:
+    """`subprocess.run`, with the two non-`BooksError` escapes closed: a missing
+    binary or working copy (`OSError`) and a hung pull/push (`TimeoutExpired`).
+    Callers see one exception type, so a degraded host never escapes as a bare
+    `FileNotFoundError` through an async activity."""
+    try:
+        return subprocess.run(
+            cmd, cwd=cwd, env=env, capture_output=True, text=True, timeout=timeout
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise BooksError(f"{cmd[0]} timed out after {timeout}s") from exc
+    except OSError as exc:
+        raise BooksError(f"{cmd[0]} could not run: {exc}") from exc
+
+
 def _run(
     args: list[str], cfg: BooksConfig, *, timeout: int = 60, check: bool = True
 ) -> subprocess.CompletedProcess:
-    proc = subprocess.run(
-        args, cwd=str(cfg.path), env=_env(cfg), capture_output=True, text=True, timeout=timeout
-    )
+    proc = _spawn(args, cwd=str(cfg.path), timeout=timeout, env=_env(cfg))
     if check and proc.returncode != 0:
         raise BooksError(f"{' '.join(args[:2])} failed: {proc.stderr.strip()[:500]}")
     return proc
@@ -379,9 +399,9 @@ def ensure_checkout_sync(cfg: BooksConfig) -> None:
     if not cfg.repo_url:
         raise BooksDisabled("books_repo_url is not configured and no checkout exists")
     cfg.path.parent.mkdir(parents=True, exist_ok=True)
-    proc = subprocess.run(
+    proc = _spawn(
         ["git", "clone", "-q", cfg.repo_url, str(cfg.path)],
-        env=_env(cfg), capture_output=True, text=True, timeout=180,
+        cwd=str(cfg.path.parent), timeout=180, env=_env(cfg),
     )
     if proc.returncode != 0:
         raise BooksError(f"git clone failed: {proc.stderr.strip()[:500]}")
@@ -393,28 +413,63 @@ def _pull_sync(cfg: BooksConfig) -> None:
 
 
 def _check_sync(cfg: BooksConfig) -> None:
-    proc = subprocess.run(
-        ["hledger", "-f", cfg.main, "check", "--strict"],
-        cwd=str(cfg.path), capture_output=True, text=True, timeout=60,
+    proc = _spawn(
+        ["hledger", "-f", cfg.main, "check", "--strict"], cwd=str(cfg.path), timeout=60
     )
     if proc.returncode != 0:
         raise BooksCheckError(proc.stderr.strip()[:1000] or proc.stdout.strip()[:1000])
 
 
-def _revert_sync(cfg: BooksConfig) -> None:
-    _run(["git", "checkout", "-q", "--", "."], cfg, check=False)
-    # `-e` keeps the flock file: deleting it while another process holds it
-    # would hand the next writer a different inode and no mutual exclusion.
-    _run(["git", "clean", "-qfd", "-e", _LOCK_NAME], cfg, check=False)
+def _git_paths(cfg: BooksConfig, paths: list[str], *, on_disk_only: bool = False) -> list[str]:
+    """The pathspec git can actually act on.
+
+    The lock file is dropped by NAME rather than with a `:!` exclusion pathspec:
+    combining an exclusion with a positive pathspec makes `git add` stage
+    nothing at all for a new file, silently and with exit 0 (measured on git
+    2.x), which is how a written report would never reach a commit. And a
+    pathspec matching neither the working tree nor the index makes `git add`
+    and `git commit` fail outright, so those are dropped too — a journal file
+    the write never had to create cannot have changed.
+    """
+    wanted = [p for p in paths if p != _LOCK_NAME]
+    if not wanted or on_disk_only:
+        return wanted
+    listed = _run(["git", "ls-files", "-z", "--", *wanted], cfg, check=False).stdout
+    tracked = set(listed.split("\0"))
+    return [p for p in wanted if (cfg.path / p).exists() or p in tracked]
 
 
-def _commit_push_sync(cfg: BooksConfig, summary: str) -> bool:
-    # The lock file lives in the checkout; exclude it so it never enters history
-    # (the real books repo also .gitignores it, test repos have no .gitignore).
-    _run(["git", "add", "-A", "--", ".", f":!{_LOCK_NAME}"], cfg)
-    if _run(["git", "diff", "--cached", "--quiet"], cfg, check=False).returncode == 0:
+def _revert_sync(cfg: BooksConfig, paths: list[str]) -> None:
+    """Undo ONLY the paths this write touched. A repo-wide revert would destroy
+    a human's unrelated uncommitted edits — including the hand edit that made
+    the write fail in the first place."""
+    targets = _git_paths(cfg, paths, on_disk_only=True)
+    if not targets:
+        return
+    # One checkout per path: git aborts the WHOLE command when any pathspec
+    # names an untracked file, reverting nothing, so a new year's journal in
+    # the list would silently protect every other path from being restored.
+    for rel in targets:
+        _run(["git", "checkout", "-q", "--", rel], cfg, check=False)
+    # The lock file is outside `targets`, so `clean` cannot delete it out from
+    # under a holder — which would hand the next writer a different inode and
+    # therefore no mutual exclusion at all.
+    _run(["git", "clean", "-qfd", "--", *targets], cfg, check=False)
+
+
+def _commit_push_sync(cfg: BooksConfig, summary: str, paths: list[str]) -> bool:
+    # The empty guard is load-bearing, not defensive: `git add -A` with no
+    # positive pathspec means the whole tree, so an empty scope would sweep in
+    # every unrelated edit in the checkout.
+    scoped = _git_paths(cfg, paths)
+    if not scoped:
         return False
-    _run(["git", "commit", "-q", "-m", summary], cfg)
+    _run(["git", "add", "-A", "--", *scoped], cfg)
+    if _run(["git", "diff", "--cached", "--quiet", "--", *scoped], cfg, check=False).returncode == 0:
+        return False
+    # `commit -- <paths>` rather than a bare commit: a bare one would sweep in
+    # anything the human happened to have staged in the checkout already.
+    _run(["git", "commit", "-q", "-m", summary, "--", *scoped], cfg)
     if _has_remote(cfg):
         push = _run(["git", "push", "-q"], cfg, check=False, timeout=120)
         if push.returncode != 0:
@@ -448,7 +503,13 @@ class _FileLock:
         self._fd.close()
 
 
-def _write_sync(cfg: BooksConfig, summary: str, mutate: Callable[[], None]) -> None:
+def _write_sync(
+    cfg: BooksConfig, summary: str, mutate: Callable[[], None], paths: list[str]
+) -> None:
+    """`paths` is the write's blast radius, relative to the checkout. A caller
+    that only learns which file it touched inside `mutate` passes the list the
+    closure appends to — it is read after `mutate` returns, and the closure must
+    record a path BEFORE writing it."""
     ensure_checkout_sync(cfg)
     with _FileLock(cfg):
         _pull_sync(cfg)
@@ -456,21 +517,29 @@ def _write_sync(cfg: BooksConfig, summary: str, mutate: Callable[[], None]) -> N
             mutate()
             _check_sync(cfg)
         except Exception:
-            _revert_sync(cfg)
+            _revert_sync(cfg, paths)
             raise
-        _commit_push_sync(cfg, summary)
+        _commit_push_sync(cfg, summary, paths)
 
 
-async def _write(cfg: BooksConfig, summary: str, mutate: Callable[[], None]) -> None:
+async def _write(
+    cfg: BooksConfig, summary: str, mutate: Callable[[], None], paths: list[str]
+) -> None:
     async with _ASYNC_LOCK:
-        await asyncio.to_thread(_write_sync, cfg, summary, mutate)
+        await asyncio.to_thread(_write_sync, cfg, summary, mutate, paths)
 
 
 def _declared_accounts_sync(cfg: BooksConfig) -> set[str]:
-    proc = subprocess.run(
-        ["hledger", "-f", cfg.main, "accounts", "--declared"],
-        cwd=str(cfg.path), capture_output=True, text=True, timeout=30,
+    """The declared chart. An empty set means hledger genuinely declared nothing
+    — a failure raises, because returning `set()` for it would silently disable
+    the unknown-account fallback and let an undeclared account reach the file."""
+    proc = _spawn(
+        ["hledger", "-f", cfg.main, "accounts", "--declared"], cwd=str(cfg.path), timeout=30
     )
+    if proc.returncode != 0:
+        raise BooksError(
+            f"hledger accounts --declared failed: {proc.stderr.strip()[:300]}"
+        )
     return {line.strip() for line in proc.stdout.splitlines() if line.strip()}
 
 
@@ -486,7 +555,12 @@ def _ensure_journal_file(cfg: BooksConfig, rel: str) -> Path:
     line = f"include {rel}\n"
     if line not in text:
         marker = "include recurring.journal\n"
-        text = text.replace(marker, line + marker) if marker in text else text + line
+        if marker in text:
+            text = text.replace(marker, line + marker)
+        else:
+            # Guard the newline: appending to a main.journal whose last line has
+            # no trailing "\n" would glue the include onto it.
+            text = (text.rstrip("\n") + "\n" if text else "") + line
         main.write_text(text)
     return path
 
@@ -501,8 +575,16 @@ async def post_event(event: MoneyEvent, msgid: str, cfg: BooksConfig) -> str:
     if event.amount is None or not event.currency or event.occurred_on is None:
         raise BooksError("post_event needs amount, currency and occurred_on")
     rel = journal_rel(event.entity, event.occurred_on)
+    posted: list[str] = []
 
     def mutate() -> None:
+        # Idempotency is repo-WIDE, not per-file: a corrected date or entity
+        # sends the same msgid to a different journal, and scoping the check to
+        # `rel` would write the block a second time somewhere else.
+        for existing in journal_files(cfg):
+            if find_block(existing.read_text(), msgid):
+                posted.append(str(existing.relative_to(cfg.path)))
+                return
         declared = _declared_accounts_sync(cfg)
         counter = event.account or account_for(event.category, event.direction, event.entity)
         if declared and counter not in declared:
@@ -510,18 +592,17 @@ async def post_event(event: MoneyEvent, msgid: str, cfg: BooksConfig) -> str:
                 "in" if event.direction == "in" else "out"
             ]
         instrument = instrument_account(event.instrument, declared)
+        posted.append(rel)
         path = _ensure_journal_file(cfg, rel)
         text = path.read_text()
-        if find_block(text, msgid):
-            return
         path.write_text(append_block(text, render_transaction(event, counter, instrument, msgid)))
 
     summary = (
         f"post {event.entity} {event.occurred_on} {sanitize_payee(event.payee)} "
         f"{render_amount(event.amount, event.currency)}"
     )
-    await _write(cfg, summary, mutate)
-    return rel
+    await _write(cfg, summary, mutate, [rel, cfg.main])
+    return posted[0] if posted else rel
 
 
 async def rewrite_event(
@@ -540,53 +621,68 @@ async def rewrite_event(
             text = path.read_text()
             if find_block(text, msgid) is None:
                 continue
+            # Record before writing: `found` is also this write's git scope, so
+            # a path must be in it before the file can possibly change.
+            found.append(str(path.relative_to(cfg.path)))
             path.write_text(
                 rewrite_block(text, msgid, payee=payee, account=account,
                               instrument_account=instrument_account, add_tags=add_tags)
             )
-            found.append(str(path.relative_to(cfg.path)))
             return
         raise BooksError(f"no journal block carries msgid {msgid}")
 
-    await _write(cfg, f"reclassify {msgid}" + (f" -> {account}" if account else ""), mutate)
+    await _write(cfg, f"reclassify {msgid}" + (f" -> {account}" if account else ""), mutate, found)
     return found[0]
 
 
 async def remove_event(msgid: str, cfg: BooksConfig) -> None:
+    found: list[str] = []
+
     def mutate() -> None:
         for path in journal_files(cfg):
             text = path.read_text()
             span = find_block(text, msgid)
             if span is None:
                 continue
+            found.append(str(path.relative_to(cfg.path)))
             start, end = span
             head, tail = text[:start].rstrip("\n"), text[end:].lstrip("\n")
             path.write_text((head + "\n\n" + tail).rstrip("\n") + "\n")
             return
         raise BooksError(f"no journal block carries msgid {msgid}")
 
-    await _write(cfg, f"remove {msgid}", mutate)
+    await _write(cfg, f"remove {msgid}", mutate, found)
 
 
 async def append_prices(lines: list[str], cfg: BooksConfig) -> None:
     def mutate() -> None:
         path = cfg.path / "prices.journal"
         text = path.read_text() if path.exists() else ""
-        body = "\n".join(lines) + "\n"
+        # A push that times out leaves the commit made, so the caller retries a
+        # write that already landed — appending unconditionally would duplicate.
+        fresh = [ln for ln in lines if ln not in text.splitlines()]
+        if not fresh:
+            return
+        body = "\n".join(fresh) + "\n"
         path.write_text((text.rstrip("\n") + "\n" + body) if text else body)
 
-    await _write(cfg, f"prices {lines[0].split()[1] if lines else ''}", mutate)
+    await _write(cfg, f"prices {lines[0].split()[1] if lines else ''}", mutate, ["prices.journal"])
 
 
 async def append_rule(rule: dict, cfg: BooksConfig) -> None:
+    rel = "rules/accounts.yaml"
+
     def mutate() -> None:
-        path = cfg.path / "rules" / "accounts.yaml"
+        path = cfg.path / rel
+        if rule in load_rules(path):  # same retry-after-timeout guard
+            return
         path.parent.mkdir(parents=True, exist_ok=True)
         text = path.read_text() if path.exists() else ""
         entry = yaml.safe_dump([rule], sort_keys=False, allow_unicode=True)
         path.write_text((text.rstrip("\n") + "\n" if text else "") + entry)
 
-    await _write(cfg, f"rule: {rule.get('match')} -> {rule.get('account', 'payee only')}", mutate)
+    summary = f"rule: {rule.get('match')} -> {rule.get('account', 'payee only')}"
+    await _write(cfg, summary, mutate, [rel])
 
 
 async def write_report(rel_path: str, text: str, cfg: BooksConfig) -> None:
@@ -595,7 +691,7 @@ async def write_report(rel_path: str, text: str, cfg: BooksConfig) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(text)
 
-    await _write(cfg, f"report {rel_path}", mutate)
+    await _write(cfg, f"report {rel_path}", mutate, [rel_path])
 
 
 _READ_COMMANDS = frozenset({
@@ -628,7 +724,7 @@ async def run_hledger(args: list[str], cfg: BooksConfig, *, output_format: str =
         cmd += ["-O", output_format]
 
     def _go() -> str:
-        proc = subprocess.run(cmd, cwd=str(cfg.path), capture_output=True, text=True, timeout=30)
+        proc = _spawn(cmd, cwd=str(cfg.path), timeout=30)
         if proc.returncode != 0:
             raise BooksError(proc.stderr.strip()[:800])
         out = proc.stdout

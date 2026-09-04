@@ -100,5 +100,24 @@ jobs:
       - name: Lint
         run: ruff check core/src/ tests/core/ tests/api/ tests/integration/ tests/conftest.py
 
+      # tests/core/test_books.py exercises the real journal write protocol —
+      # append, `hledger check --strict`, revert-on-failure, commit — against a
+      # throwaway git repo, and every one of those tests SKIPS when the binary
+      # is absent. Without this step CI reports green while the books' entire
+      # safety net goes unrun, which is the #170 failure mode in another guise.
+      # Same pinned release and checksum as core/Dockerfile and worker/Dockerfile.
+      - name: Install hledger
+        env:
+          HLEDGER_VERSION: "1.52.3"
+          HLEDGER_SHA256: "d14a4fc2ac804b556f481b64e8c54efa380db1ac85b3723c9df7b1eeade74b3a"
+        run: |
+          curl -fsSL -o /tmp/hledger.tgz \
+            "https://github.com/simonmichael/hledger/releases/download/${HLEDGER_VERSION}/hledger-linux-x64.tar.gz"
+          echo "${HLEDGER_SHA256}  /tmp/hledger.tgz" | sha256sum -c -
+          tar -xzf /tmp/hledger.tgz -C /tmp hledger
+          sudo install -m 0755 /tmp/hledger /usr/local/bin/hledger
+          rm -f /tmp/hledger.tgz /tmp/hledger
+          hledger --version
+
       - name: Test
         run: pytest tests/core/ tests/api/ tests/integration/ -n auto --dist loadfile --timeout=300 -v --tb=short --cov=core/src/aegis --cov-report=term-missing --cov-report=xml

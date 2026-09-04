@@ -140,6 +140,35 @@ def test_install_deploy_key_raw_and_base64(tmp_path):
     assert books.install_deploy_key(SimpleNamespace(books_deploy_key="", gmail_token_dir=str(tmp_path))) is None
 
 
+def test_config_from_settings(tmp_path):
+    creds = tmp_path / "creds"
+    creds.mkdir()
+    s = SimpleNamespace(
+        gmail_token_dir=str(creds),
+        books_path=str(tmp_path / "books"),
+        books_repo_url="git@example.com:me/books.git",
+    )
+    cfg = books.config_from_settings(s)
+    assert cfg.path == tmp_path / "books"
+    assert cfg.repo_url == "git@example.com:me/books.git"
+    assert cfg.main == "main.journal"
+    assert cfg.deploy_key is None  # not installed yet
+    (creds / "books_deploy_key").write_text("x")
+    assert books.config_from_settings(s).deploy_key == creds / "books_deploy_key"
+    # Settings that carry none of the books fields must fall back, not raise.
+    bare = books.config_from_settings(SimpleNamespace(gmail_token_dir=str(tmp_path / "none")))
+    assert bare.path == Path("/app/config/books") and bare.repo_url == ""
+
+
+@pytest.mark.asyncio
+async def test_run_hledger_wraps_a_missing_working_copy(tmp_path):
+    """A degraded host (no hledger, no checkout) must surface as BooksError,
+    not as a bare FileNotFoundError out of an async activity."""
+    cfg = books.BooksConfig(path=tmp_path / "gone")
+    with pytest.raises(books.BooksError, match="could not run"):
+        await books.run_hledger(["bal"], cfg)
+
+
 @pytest.mark.asyncio
 async def test_run_hledger_refuses_writes_and_file_overrides(tmp_path):
     cfg = books.BooksConfig(path=tmp_path)
@@ -297,6 +326,93 @@ async def test_prices_rule_and_report_appends(tmp_path):
     assert rules[-1]["match"] == "corner store" and len(rules) == 2
     assert (cfg.path / "reports" / "weekly" / "2026-09-06.md").read_text() == "# brief\n"
     assert _commits(cfg) == 4
+
+
+def _committed_files(cfg) -> list[str]:
+    out = subprocess.run(["git", "show", "--name-only", "--format=", "HEAD"],
+                         cwd=cfg.path, capture_output=True, text=True).stdout
+    return sorted(out.split())
+
+
+@pytest.mark.skipif(not HAS_HLEDGER, reason="hledger/git not installed")
+@pytest.mark.asyncio
+async def test_writes_are_scoped_to_their_own_paths(tmp_path):
+    """A human's unrelated uncommitted work must neither be swept into a Maou
+    commit nor destroyed by a failed write's revert."""
+    cfg = _repo(tmp_path)
+    notes = cfg.path / "personal" / "notes.txt"          # untracked
+    notes.write_text("human notes\n")
+    chart = cfg.path / "accounts.journal"                # tracked, modified
+    chart.write_text(ACCOUNTS + "account expenses:handedit\n")
+
+    await books.post_event(EV_OUT, "arshad-personal/1a06cf5a", cfg)
+    assert _committed_files(cfg) == ["personal/2026.journal"]
+    assert notes.read_text() == "human notes\n"
+    assert "expenses:handedit" in chart.read_text()
+
+    with pytest.raises(books.BooksCheckError):
+        await books.rewrite_event("arshad-personal/1a06cf5a", cfg, account="expenses:nope")
+    assert notes.read_text() == "human notes\n"
+    assert "expenses:handedit" in chart.read_text()
+    assert _commits(cfg) == 2
+
+
+@pytest.mark.skipif(not HAS_HLEDGER, reason="hledger/git not installed")
+@pytest.mark.asyncio
+async def test_post_event_is_idempotent_across_year_files(tmp_path):
+    """A corrected date re-posts the same msgid into a different journal;
+    per-file idempotency would leave the id in the books twice."""
+    cfg = _repo(tmp_path)
+    rel = await books.post_event(EV_OUT, "arshad-personal/dup", cfg)
+    assert rel == "personal/2026.journal"
+    moved = EV_OUT.model_copy(update={"occurred_on": date(2027, 3, 4)})
+    assert await books.post_event(moved, "arshad-personal/dup", cfg) == rel
+    assert not (cfg.path / "personal" / "2027.journal").exists()
+    assert _commits(cfg) == 2
+    out = await books.run_hledger(["print", "tag:msgid=arshad-personal/dup"], cfg)
+    assert out.count("Jai shree nakoda") == 1
+
+
+@pytest.mark.skipif(not HAS_HLEDGER, reason="hledger/git not installed")
+@pytest.mark.asyncio
+async def test_remove_event_leaves_its_neighbours_byte_intact(tmp_path):
+    cfg = _repo(tmp_path)
+    for n in (1, 2, 3):
+        await books.post_event(
+            EV_OUT.model_copy(update={"payee": f"Payee {n}", "ref": f"ref{n}"}), f"m/{n}", cfg
+        )
+    path = cfg.path / "personal" / "2026.journal"
+    before = path.read_text()
+    first = before[slice(*books.find_block(before, "m/1"))]
+    third = before[slice(*books.find_block(before, "m/3"))]
+
+    await books.remove_event("m/2", cfg)
+
+    # Exactly one blank line between the survivors, both unchanged byte for byte.
+    assert path.read_text() == "; Personal 2026\n\n" + first + "\n" + third
+    assert books.find_block(path.read_text(), "m/2") is None
+    assert _commits(cfg) == 5
+    out = await books.run_hledger(["print"], cfg)
+    assert "Payee 1" in out and "Payee 3" in out and "Payee 2" not in out
+
+
+@pytest.mark.skipif(not HAS_HLEDGER, reason="hledger/git not installed")
+@pytest.mark.asyncio
+async def test_append_prices_and_rule_are_idempotent(tmp_path):
+    """The push happens after the commit, so a timeout makes the caller retry a
+    write that already landed."""
+    cfg = _repo(tmp_path)
+    line = "P 2026-09-05 £ ₹108.00"
+    rule = {"match": "corner store", "account": "expenses:groceries"}
+    await books.append_prices([line], cfg)
+    await books.append_rule(rule, cfg)
+    assert _commits(cfg) == 3
+
+    await books.append_prices([line], cfg)
+    await books.append_rule(dict(rule), cfg)
+    assert _commits(cfg) == 3
+    assert (cfg.path / "prices.journal").read_text().count(line) == 1
+    assert len(books.load_rules(cfg.path / "rules" / "accounts.yaml")) == 1
 
 
 def test_missing_checkout_without_repo_url_is_disabled(tmp_path):
