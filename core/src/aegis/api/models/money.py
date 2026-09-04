@@ -74,3 +74,12 @@ class MoneyEvent(BaseModel):
         """Amounts are major units at 2 places everywhere — quantize once, here,
         so the journal and every renderer agree."""
         return v.quantize(Decimal("0.01")) if v is not None else v
+
+    @field_validator("instrument", "ref", mode="after")
+    @classmethod
+    def _one_tag_line(cls, v: str | None) -> str | None:
+        """Both land on a journal tag line and `instrument` is model-supplied
+        (`_LLM_EVENT_FIELDS`), so journal syntax is stripped at the boundary
+        too. Defence in depth only — `books.sanitize_tag` is the gate that has
+        to hold, because a value can reach the writer without passing here."""
+        return re.sub(r"\s+", " ", re.sub(r"[;,\r\n]+", " ", v)).strip() if v else v

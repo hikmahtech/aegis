@@ -204,6 +204,7 @@ def parse_kv(raw: str) -> dict[str, str]:
 _INDENT = "    "
 _ACCOUNT_WIDTH = 40
 _PAYEE_MAX = 80
+_TAG_MAX = 80
 _POSTING_RE = re.compile(r"^    (\S+)(?:\s{2,}(\S.*))?$")
 
 
@@ -213,11 +214,41 @@ def sanitize_payee(payee: str) -> str:
     return text[:_PAYEE_MAX] or "unknown"
 
 
+def sanitize_tag(value: str | None) -> str:
+    """One tag value, safe to interpolate into a `; k: v, k: v` line.
+
+    EVERY value on a tag line goes through this, because some of them are
+    model-supplied: `instrument` is in `_LLM_EVENT_FIELDS`, so a steered email
+    can put anything in it, and an unsanitized newline forged a whole
+    transaction — with its own `; msgid:` line, so `find_block` resolved it —
+    that `hledger check --strict` accepted and nothing reverted.
+
+    What it removes, measured against hledger 1.52.3: a newline (starts a new
+    posting, comment or transaction), `;` (a new comment) and `,` (the tag
+    separator, so a value carrying one declares a SECOND tag). A colon is left
+    alone — hledger runs a value to the next comma or end of line, so `evil:`
+    inside a value does not become a tag, and refs like `UTR:1234` stay whole.
+    The cap bounds what a hostile value can push onto the line.
+    """
+    text = re.sub(r"[;,\r\n]+", " ", value or "")
+    text = re.sub(r"\s+", " ", text).strip()
+    return text[:_TAG_MAX].strip()
+
+
+def _safe_account(account: str) -> str:
+    """An account name that cannot break out of its posting line. hledger ends
+    an account at two spaces, a `;` or the line, so any of those inside one
+    would split the posting or open a new block. Accounts are chart-checked
+    before they get here; this is the writer refusing to be the only gate."""
+    return re.sub(r"\s{2,}", " ", re.sub(r"[;\r\n]+", " ", account or "")).strip()
+
+
 def _posting(account: str, amount: str = "") -> str:
     # hledger splits an account from its amount on TWO or more spaces, so an
     # account that padding would leave one space short of the column takes the
     # explicit two-space branch — at 39 chars `:<40` yields a single space and
     # hledger folds the amount into the account name.
+    account = _safe_account(account)
     if not amount:
         return f"{_INDENT}{account}"
     if len(account) >= _ACCOUNT_WIDTH - 1:
@@ -232,11 +263,13 @@ def render_transaction(
     amount (+ out, − in), posting 2 = instrument, no amount."""
     if event.amount is None or not event.currency or event.occurred_on is None:
         raise BooksError("render_transaction needs amount, currency and occurred_on")
-    tags = [f"channel: {event.channel}"]
-    if event.ref:
-        tags.append(f"ref: {event.ref}")
-    if event.instrument:
-        tags.append(f"instrument: {event.instrument}")
+    # Sanitized, not trusted: `instrument` comes from the model, and `channel`
+    # is only a validated Literal today — a tag line takes no raw value.
+    tags = [f"channel: {sanitize_tag(event.channel)}"]
+    for name, raw in (("ref", event.ref), ("instrument", event.instrument)):
+        value = sanitize_tag(raw)
+        if value:
+            tags.append(f"{name}: {value}")
     amount = render_amount(event.amount, event.currency, negative=(event.direction == "in"))
     lines = [
         f"{event.occurred_on.isoformat()} * {sanitize_payee(event.payee)}",
@@ -297,7 +330,10 @@ def rewrite_block(
         date_part = lines[0].split(" * ", 1)[0]
         lines[0] = f"{date_part} * {sanitize_payee(payee)}"
     if add_tags:
-        lines[2] = lines[2] + "".join(f", {k}: {v}" for k, v in add_tags.items())
+        for key, value in add_tags.items():
+            key, value = sanitize_tag(key), sanitize_tag(value)
+            if key:
+                lines[2] = lines[2] + f", {key}: {value}"
     postings = [
         i
         for i, line in enumerate(lines)

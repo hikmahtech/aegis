@@ -43,6 +43,13 @@ BLOCK_IN = (
     "    income:hikmah:stockopedia               -£6285.01\n"
     "    assets:bank:axis:9640\n"
 )
+HOSTILE_INSTRUMENT = (
+    "x\n\n2026-09-01 * ATTACKER PAYOUT\n"
+    "    ; msgid: personal/HIJACKED\n"
+    "    expenses:unknown                        \u20b999999.00\n"
+    "    assets:bank:hdfc:1225\n"
+    "\n2026-09-02 * decoy"
+)
 HEADER = "; Personal transactions, 2026.\n"
 # Exactly 39 chars: one short of the 40-column pad, so `:<40` leaves a SINGLE
 # space before the amount and hledger reads the whole thing as an account name.
@@ -75,6 +82,23 @@ def test_sanitize_payee_strips_journal_syntax():
     assert books.sanitize_payee("A ; B | C\nD") == "A B C D"
     assert books.sanitize_payee("") == "unknown"
     assert len(books.sanitize_payee("x" * 200)) == 80
+
+
+def test_sanitize_tag_strips_journal_syntax():
+    """A tag value must stay one tag value on one line. Measured against
+    hledger 1.52.3: a comma inside a value starts a NEW tag, a `;` starts a new
+    comment and a newline can start a whole new transaction. A colon does not —
+    the value runs to the next comma or end of line — so refs like `UTR:1234`
+    are left intact."""
+    assert books.sanitize_tag("upi") == "upi"
+    assert books.sanitize_tag("UTR:1234") == "UTR:1234"
+    assert books.sanitize_tag("a\nb") == "a b"
+    assert books.sanitize_tag("a; b, c\r\nd") == "a b c d"
+    assert books.sanitize_tag("  a   b  ") == "a b"
+    assert books.sanitize_tag("") == "" and books.sanitize_tag(None) == ""
+    assert len(books.sanitize_tag("x" * 200)) == 80
+    hostile = books.sanitize_tag(HOSTILE_INSTRUMENT)
+    assert not set(hostile) & set(";,\r\n")
 
 
 def test_append_and_find_block():
@@ -402,6 +426,35 @@ async def test_post_event_is_idempotent_across_year_files(tmp_path):
     assert _commits(cfg) == 2
     out = await books.run_hledger(["print", "tag:msgid=arshad-personal/dup"], cfg)
     assert out.count("Jai shree nakoda") == 1
+
+
+@pytest.mark.skipif(not HAS_HLEDGER, reason="hledger/git not installed")
+@pytest.mark.asyncio
+async def test_hostile_instrument_cannot_forge_a_transaction(tmp_path):
+    """`instrument` is model-supplied (`_LLM_EVENT_FIELDS`), so a steered email
+    can put newlines in it. Unsanitized it forged a whole ₹99,999 block, gave it
+    a msgid of its own and PASSED `check --strict`, so nothing reverted it."""
+    cfg = _repo(tmp_path)
+    ev = EV_OUT.model_copy(update={"instrument": HOSTILE_INSTRUMENT})
+    rel = await books.post_event(ev, "arshad-personal/hostile", cfg)
+    text = (cfg.path / rel).read_text()
+
+    # One transaction, one msgid, and the forged one resolves nowhere.
+    assert sum(1 for ln in text.splitlines() if ln[:1].isdigit()) == 1
+    assert text.count("; msgid:") == 1
+    assert books.find_block(text, "personal/HIJACKED") is None
+    assert books.find_block(text, "arshad-personal/hostile") is not None
+    # The real postings are still the real postings.
+    assert "    expenses:unknown                        ₹10.00\n    assets:unknown\n" in text
+
+    # ...and hledger agrees: one payee, no ₹99,999, no invented tag.
+    assert (await books.run_hledger(["payees"], cfg)).strip() == "Jai shree nakoda"
+    assert set((await books.run_hledger(["tags"], cfg)).split()) == {
+        "channel", "instrument", "msgid", "ref"
+    }
+    bal = await books.run_hledger(["bal", "expenses"], cfg)
+    assert "99999" not in bal and "10.00" in bal
+    await books.run_hledger(["check", "--strict"], cfg)  # raises if the file is broken
 
 
 @pytest.mark.skipif(not HAS_HLEDGER, reason="hledger/git not installed")
