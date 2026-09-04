@@ -611,12 +611,16 @@ Each `MoneyProcessFlow` run reports what happened to its one email: `posted`,
 two are deliberate. `books_disabled`: with no repo and no checkout the event
 reaches the index but never a journal, so the row is not finished, and
 configuring a repo later replays the whole backlog through the sweep.
-`post_failed`: the books refused the write — almost always `hledger check
---strict` on a chart mismatch, an account or a commodity nobody declared — so
-the event is indexed with no `journal_file` and the sweep re-posts it once the
-chart is fixed. Retrying in place cannot fix a chart, so the activity returns
-this instead of raising; grep the worker log for `money_post_failed` to see
-which msgid and which check. The status is in `workflow_runs.result_summary`.
+`post_failed`: the books refused the block or could not accept it, so the event
+is indexed with no `journal_file` and the weekly sweep retries it. The usual
+cause is `hledger check --strict` on a chart mismatch — an account or a
+commodity nobody declared — but the same status covers a books repo that could
+not be pulled or an hledger that is missing or broken, which is why it is named
+for the outcome and not for the check. Whatever the cause, the activity returns
+this rather than raising: an uncaught error burned all three attempts and failed
+the run every week without ever posting. Grep the worker log for
+`money_post_failed`, which names the msgid and the underlying error. The status
+is in `workflow_runs.result_summary`.
 
 ### The deploy key
 

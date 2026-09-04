@@ -525,3 +525,30 @@ async def test_a_block_the_chart_rejects_is_indexed_but_not_posted(db_pool, tmp_
     assert row is not None and row["journal_file"] is None
     assert row["linked_message_id"] is None
     assert journal.read_text() == before  # the write reverted
+
+
+@pytest.mark.asyncio
+async def test_an_undeclared_account_also_lands_in_post_failed(db_pool, tmp_path):
+    """The same handler by the other route, and the harder one to reach: an
+    undeclared account normally CANNOT fail the check, because `post_event`
+    maps one to the entity's unknown account first. It fails when the chart
+    lacks that unknown account itself — a books repo whose chart was never
+    finished — and then every personal expense is refused."""
+    cfg = _repo(tmp_path)
+    chart = cfg.path / "accounts.journal"
+    chart.write_text(ACCOUNTS.replace("account expenses:unknown\n", ""))
+    subprocess.run(
+        ["git", "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-aqm", "no unknown"],
+        cwd=cfg.path, check=True,
+    )
+    journal = cfg.path / "personal" / "2026.journal"
+    before = journal.read_text()
+
+    r = await ActivityEnvironment().run(
+        _act(db_pool, cfg).post_money_event, "rid1", "v2-personal", "m-nochart", _bank_event()
+    )
+
+    assert r["status"] == "post_failed" and r["journal_file"] is None
+    row = await ji.get(db_pool, "v2-personal/m-nochart")
+    assert row is not None and row["journal_file"] is None
+    assert journal.read_text() == before  # the write reverted
