@@ -9,6 +9,7 @@ Mapping:
   <b>/<strong>            -> *…*
   <i>/<em>                -> _…_
   <code>                  -> `…`
+  <pre>                   -> ```…``` (block)
   <a href="URL">TEXT</a>  -> <URL|TEXT>
   any other tag           -> stripped (inner text kept)
   HTML entities           -> unescaped (&amp;->&, &lt;-><, …)
@@ -25,6 +26,7 @@ _WRAP = {
     "i": ("_", "_"),
     "em": ("_", "_"),
     "code": ("`", "`"),
+    "pre": ("```\n", "\n```"),
 }
 
 
