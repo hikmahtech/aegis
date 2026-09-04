@@ -775,3 +775,95 @@ async def test_receipt_flow_sweep_does_not_stamp_a_books_disabled_row():
     assert posted == [("stuck-nobooks", "transaction")]
     assert stamped == []
     assert result["swept"] == 0
+
+
+@pytest.mark.asyncio
+async def test_receipt_flow_sweep_does_not_stamp_a_rejected_block():
+    """`post_failed` is the other half of `UNSTAMPED_STATUSES`: the books
+    refused the write (a chart mismatch, usually) so the event is indexed but
+    never reached the journal. The sweep must treat it exactly like
+    `books_disabled` — leave the row below version 2 so a later sweep re-posts
+    it once the chart is fixed, and not count it in `swept`, because it was
+    not."""
+    _reset()
+    posted: list[tuple] = []
+    stamped: list[tuple] = []
+
+    @activity.defn(name="find_stuck_receipts")
+    async def find_stuck(limit: int, older_than_days: int) -> list[str]:
+        return ["stuck-rejected"]
+
+    @activity.defn(name="load_receipts")
+    async def load(receipt_ids: list[str]) -> list[dict]:
+        return [_stuck_row("stuck-rejected")]
+
+    @activity.defn(name="parse_money_email")
+    async def parse(receipt: dict) -> dict:
+        return dict(_SWEPT_TXN)
+
+    @activity.defn(name="capture_due")
+    async def capture(event: dict, mailbox: str, message_id: str) -> str | None:
+        return None
+
+    @activity.defn(name="post_money_event")
+    async def post(
+        receipt_id: str,
+        mailbox: str,
+        message_id: str,
+        event: dict,
+        todoist_ref: str | None = None,
+    ) -> dict:
+        posted.append((receipt_id, event["kind"]))
+        return {
+            "msgid": f"{mailbox}/{message_id}",
+            "status": "post_failed",
+            "journal_file": None,
+            "linked": None,
+            "closed_due": None,
+        }
+
+    @activity.defn(name="store_money_result")
+    async def store_result(receipt_id: str, event: dict, journal_file: str | None) -> None:
+        stamped.append((receipt_id, event["kind"], journal_file))
+
+    @activity.defn(name="fetch_message_body")
+    async def stub_body(account_label: str, message_id: str, max_chars: int = 6000) -> str:
+        return "full body"
+
+    @activity.defn(name="store_receipt_body")
+    async def stub_store_body(receipt_id: str, body_text: str) -> None:
+        return None
+
+    async with (
+        await WorkflowEnvironment.start_local() as env,
+        Worker(
+            env.client,
+            task_queue="tq",
+            workflows=ALL_WORKFLOWS,
+            activities=[
+                stub_list,
+                stub_fetch,
+                stub_idem,
+                stub_cursor,
+                stub_capture,
+                find_stuck,
+                load,
+                parse,
+                capture,
+                post,
+                store_result,
+                stub_body,
+                stub_store_body,
+            ],
+        ),
+    ):
+        result = await env.client.execute_workflow(
+            ReceiptIngestFlow.run,
+            ReceiptIngestInput(agent_id="maou", aegis_ui_url="https://x"),
+            id="rec-sweep-rejected",
+            task_queue="tq",
+        )
+
+    assert posted == [("stuck-rejected", "transaction")]
+    assert stamped == []
+    assert result["swept"] == 0

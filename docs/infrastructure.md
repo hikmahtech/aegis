@@ -605,12 +605,18 @@ URL alone does nothing.
 
 Each `MoneyProcessFlow` run reports what happened to its one email: `posted`,
 `linked` (enriched the counterpart's block instead of writing a second one),
-`indexed`, `ignored` or `duplicate`. Four outcomes leave the receipt below
+`indexed`, `ignored` or `duplicate`. Five outcomes leave the receipt below
 `parsed.version = 2` so the weekly sweep re-drives it: `load_failed`,
-`extract_failed`, `parse_failed` and `books_disabled`. That last one is
-deliberate — with no repo and no checkout the event reaches the index but never a
-journal, so the row is not finished, and configuring a repo later replays the
-whole backlog through the sweep. The status is in `workflow_runs.result_summary`.
+`extract_failed`, `parse_failed`, `books_disabled` and `post_failed`. The last
+two are deliberate. `books_disabled`: with no repo and no checkout the event
+reaches the index but never a journal, so the row is not finished, and
+configuring a repo later replays the whole backlog through the sweep.
+`post_failed`: the books refused the write — almost always `hledger check
+--strict` on a chart mismatch, an account or a commodity nobody declared — so
+the event is indexed with no `journal_file` and the sweep re-posts it once the
+chart is fixed. Retrying in place cannot fix a chart, so the activity returns
+this instead of raising; grep the worker log for `money_post_failed` to see
+which msgid and which check. The status is in `workflow_runs.result_summary`.
 
 ### The deploy key
 
