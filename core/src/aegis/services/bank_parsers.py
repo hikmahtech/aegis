@@ -456,6 +456,15 @@ _AIRTEL_PAID = re.compile(rf"received a payment of Rs\.?\s*{_AMT} for your Bill 
 
 
 def parse_airtel_receipt(sender: str, subject: str, body: str) -> MoneyEvent | None:
+    """The Airtel payment receipt, which carries NO date anywhere in the body.
+
+    DEPENDENCY: this is the one `kind="transaction"` parser that returns no
+    `occurred_on`, and it works only because `MoneyActivities.parse_money_email`
+    back-fills the date from the email's `received_at` before anything writes
+    the journal. A future caller of `parse_any` that skips that step hands
+    `post_event` a dateless transaction and gets `BooksError`. Documented here
+    rather than guessed at: inventing a date would silently misdate the ledger.
+    """
     if not _from(sender, "update@airtel.com"):
         return None
     m = _AIRTEL_PAID.search(_clean(body))

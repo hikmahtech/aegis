@@ -469,3 +469,23 @@ async def test_bank_posts_its_own_block_when_the_matched_block_is_gone(db_pool, 
     assert "2026-09-03 * ELEVENLABS" in text and "    liabilities:card:axis:1313\n" in text
     row = await ji.get(db_pool, "v2-personal/m-bank")
     assert row["journal_file"] == "personal/2026.journal" and row["linked_message_id"] is None
+
+
+@pytest.mark.asyncio
+async def test_a_dateless_receipt_parser_gets_its_date_from_received_at(db_pool, tmp_path):
+    """`parse_airtel_receipt` returns a transaction with NO occurred_on — the
+    body has no date. It is postable only because parse_money_email back-fills
+    from `received_at` in the home timezone. Drop that step and `post_event`
+    raises BooksError on every Airtel payment."""
+    act = _act(db_pool, _repo(tmp_path))
+    ev = await ActivityEnvironment().run(
+        act.parse_money_email,
+        _receipt(
+            sender="Airtel <update@airtel.com>",
+            subject="Here is your Airtel payment receipt!",
+            body="Payment Reciept Dear SOMEONE . Thank you for choosing Airtel. We have "
+                 "received a payment of Rs 5306.46 for your Bill Payment.",
+        ),
+    )
+    assert ev["parser"] == "airtel_receipt" and ev["kind"] == "transaction"
+    assert ev["occurred_on"] == "2026-09-02"  # received_at 10:00Z -> 15:30 IST

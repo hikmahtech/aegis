@@ -241,6 +241,10 @@ def test_airtel_receipt():
     ev = _ev("airtel_receipt")
     assert ev.kind == "transaction" and ev.channel == "receipt"
     assert ev.amount == Decimal("5306.46") and ev.payee == "Airtel"
+    # The body carries no date, so this parser is the one transaction parser
+    # that depends on `parse_money_email` back-filling `occurred_on` from
+    # `received_at`. Without that, `post_event` raises BooksError.
+    assert ev.occurred_on is None
 
 
 @pytest.mark.parametrize(
