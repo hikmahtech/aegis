@@ -270,6 +270,30 @@ def test_default_sender_filter_includes_the_bank_senders():
     assert ReceiptIngestInput().query.startswith(DEFAULT_SENDER_FILTER)
 
 
+def test_a_blanked_sender_filter_or_window_still_defaults_in_the_query():
+    """The registry's `or DEFAULT_SENDER_FILTER` guards the SCHEDULE builder
+    only. `POST /api/admin/money/receipt_scan/run` — the documented backfill
+    route — builds this dataclass straight from the request body, so
+    `{"sender_filter": "", "max_per_account": 600}` used to mean "the whole
+    mailbox", and every message it returned was fanned out to an LLM call.
+    Defaulting inside `query` closes both paths in one place."""
+    from aegis_worker.flows.receipt_ingest import (
+        _DEFAULT_QUERY_WINDOW,
+        DEFAULT_SENDER_FILTER,
+        ReceiptIngestInput,
+    )
+
+    for blank in ("", "   ", None):
+        q = ReceiptIngestInput(sender_filter=blank).query  # type: ignore[arg-type]
+        assert q.startswith(DEFAULT_SENDER_FILTER), f"blank {blank!r} scanned everything"
+        assert ReceiptIngestInput(query_window=blank).query.endswith(  # type: ignore[arg-type]
+            _DEFAULT_QUERY_WINDOW
+        )
+    # An explicit filter still wins over the default.
+    explicit = ReceiptIngestInput(sender_filter="(from:x@y.z)", query_window="after:2026/06/30")
+    assert explicit.query == "(from:x@y.z) after:2026/06/30"
+
+
 @pytest.mark.asyncio
 async def test_receipt_flow_sweeps_stuck_receipts():
     """A stuck receipt_email id surfaced by find_stuck_receipts is re-driven

@@ -71,7 +71,17 @@ class ReceiptIngestInput:
 
     @property
     def query(self) -> str:
-        return f"{self.sender_filter} {self.query_window.strip()}"
+        """The Gmail query, with BOTH halves defaulted here rather than at the
+        caller. The registry's `or DEFAULT_SENDER_FILTER` guards the schedule
+        builder only: `POST /api/admin/money/receipt_scan/run` — the documented
+        backfill route — builds this dataclass straight from the request body,
+        so `{"sender_filter": "", "max_per_account": 600}` yielded the bare
+        query ` newer_than:14d` and fanned 600 arbitrary emails into the LLM.
+        Defaulting in the property closes the scheduled and the manual path at
+        once."""
+        sender = (self.sender_filter or "").strip() or DEFAULT_SENDER_FILTER
+        window = (self.query_window or "").strip() or _DEFAULT_QUERY_WINDOW
+        return f"{sender} {window}"
 
 
 @workflow.defn(name="ReceiptIngestFlow")
