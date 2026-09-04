@@ -5,6 +5,10 @@
 - Python 3.12+
 - Docker + Docker Compose
 - Node.js 18+ (for admin panel)
+- **hledger 1.52.3** for the books tests (`tests/core/test_books.py`,
+  `tests/worker/activities/test_money_v2.py` skip without it):
+  `curl -fsSL https://github.com/simonmichael/hledger/releases/download/1.52.3/hledger-linux-x64.tar.gz | tar -xz hledger && install -m 0755 hledger ~/.local/bin/`.
+  The images install the same pinned binary.
 
 ## Quick Start
 
