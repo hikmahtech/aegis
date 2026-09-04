@@ -44,6 +44,9 @@ BLOCK_IN = (
     "    assets:bank:axis:9640\n"
 )
 HEADER = "; Personal transactions, 2026.\n"
+# Exactly 39 chars: one short of the 40-column pad, so `:<40` leaves a SINGLE
+# space before the amount and hledger reads the whole thing as an account name.
+ACCT39 = "expenses:hikmah:professional:thirtynine"
 
 
 def test_render_transaction_exact_text():
@@ -57,6 +60,15 @@ def test_render_transaction_pads_long_accounts_with_two_spaces():
     ev = EV_OUT.model_copy(update={"payee": "x"})
     block = books.render_transaction(ev, "expenses:hikmah:professional:something:long", "assets:unknown", "m/1")
     assert "    expenses:hikmah:professional:something:long  ₹10.00\n" in block
+
+
+def test_render_transaction_pads_39_char_account_with_two_spaces():
+    """hledger needs TWO spaces between account and amount; a 39-char account
+    padded to column 40 leaves only one, so it must take the explicit branch."""
+    assert len(ACCT39) == 39
+    ev = EV_OUT.model_copy(update={"payee": "x"})
+    block = books.render_transaction(ev, ACCT39, "assets:unknown", "m/39")
+    assert f"    {ACCT39}  ₹10.00\n" in block
 
 
 def test_sanitize_payee_strips_journal_syntax():
@@ -131,8 +143,26 @@ def test_install_deploy_key_raw_and_base64(tmp_path):
 @pytest.mark.asyncio
 async def test_run_hledger_refuses_writes_and_file_overrides(tmp_path):
     cfg = books.BooksConfig(path=tmp_path)
-    for args in (["import", "x.csv"], ["add"], ["bal", "-f", "/etc/passwd"], ["reg", "--output-file=x"], ["print", "--rules", "r"]):
-        with pytest.raises(books.BooksError):
+    refused = [
+        # not a read command
+        ["import", "x.csv"], ["add"],
+        # -f / --file, as a separate arg, joined, and with `=`
+        ["bal", "-f", "/etc/passwd"], ["reg", "-f/etc/passwd"], ["reg", "--file=/etc/passwd"],
+        ["print", "--file", "/etc/passwd"],
+        # output redirection, separate and joined
+        ["reg", "--output-file=x"], ["bal", "-o", "x"], ["bal", "-ox"],
+        ["print", "--output-file", "x"],
+        # rules and config files
+        ["print", "--rules", "r"], ["bal", "--config", "c"],
+        # @ARGSFILE: hledger opens the file and splices its lines in as
+        # arguments, which re-admits -f/-o and leaks the file through stderr.
+        ["bal", "@/etc/passwd"], ["bal", "@args.txt"], ["print", "@/etc/shadow"],
+    ]
+    for args in refused:
+        # `match` matters: cfg.path holds no main.journal, so an argument that
+        # slipped through would ALSO raise BooksError — carrying hledger's own
+        # error. Only the sandbox's own message proves it never ran.
+        with pytest.raises(books.BooksError, match="not allowed"):
             await books.run_hledger(args, cfg)
 
 
@@ -151,7 +181,7 @@ account income:unknown
 account income:hikmah:stockopedia
 account income:hikmah:other
 account equity:transfers
-"""
+""" + f"account {ACCT39}\n"
 
 
 def _repo(tmp_path: Path) -> books.BooksConfig:
@@ -226,6 +256,20 @@ async def test_post_event_uses_unknown_for_undeclared_rule_account_and_instrumen
     await books.post_event(ev, "m/undeclared", cfg)
     text = (cfg.path / "personal" / "2026.journal").read_text()
     assert "    expenses:unknown                        ₹10.00\n    assets:unknown\n" in text
+
+
+@pytest.mark.skipif(not HAS_HLEDGER, reason="hledger/git not installed")
+@pytest.mark.asyncio
+async def test_39_char_account_survives_hledger_check(tmp_path):
+    """With a single separator space hledger folds the amount into the account
+    name, so `check --strict` rejects the write and post_event never commits."""
+    cfg = _repo(tmp_path)
+    ev = EV_OUT.model_copy(update={"account": ACCT39})
+    await books.post_event(ev, "m/pad39", cfg)
+    assert f"    {ACCT39}  ₹10.00\n" in (cfg.path / "personal" / "2026.journal").read_text()
+    # An exact-line match: a misparse would name the account "<ACCT39> ₹10.00".
+    assert ACCT39 in (await books.run_hledger(["accounts", "--used"], cfg)).splitlines()
+    assert _commits(cfg) == 2
 
 
 @pytest.mark.skipif(not HAS_HLEDGER, reason="hledger/git not installed")

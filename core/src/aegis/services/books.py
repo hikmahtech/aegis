@@ -209,9 +209,13 @@ def sanitize_payee(payee: str) -> str:
 
 
 def _posting(account: str, amount: str = "") -> str:
+    # hledger splits an account from its amount on TWO or more spaces, so an
+    # account that padding would leave one space short of the column takes the
+    # explicit two-space branch — at 39 chars `:<40` yields a single space and
+    # hledger folds the amount into the account name.
     if not amount:
         return f"{_INDENT}{account}"
-    if len(account) >= _ACCOUNT_WIDTH:
+    if len(account) >= _ACCOUNT_WIDTH - 1:
         return f"{_INDENT}{account}  {amount}"
     return f"{_INDENT}{account:<{_ACCOUNT_WIDTH}}{amount}"
 
@@ -599,7 +603,13 @@ _READ_COMMANDS = frozenset({
     "balancesheet", "cf", "cashflow", "accounts", "payees", "tags", "stats",
     "activity", "aregister", "check",
 })
-_FORBIDDEN_ARG_PREFIXES = ("-f", "--file", "--rules", "-o", "--output-file", "--config")
+# `@FILE` is hledger's own args-file syntax: it OPENS the file and splices its
+# lines in as arguments, which both re-admits every option denied below and
+# turns the runner into a read oracle (a missing or unreadable path comes back
+# in stderr). Denying the `@` prefix is the only way to keep the whitelist
+# meaningful. Every entry also covers its joined and `=` forms, because
+# `startswith` matches `-f/etc/passwd` and `--file=/etc/passwd` too.
+_FORBIDDEN_ARG_PREFIXES = ("-f", "--file", "--rules", "-o", "--output-file", "--config", "@")
 _OUTPUT_CAP = 12_000
 
 
