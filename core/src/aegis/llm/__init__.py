@@ -256,6 +256,32 @@ EMAILS:
 """
 
 
+# The ONLY keys `extract_money_batch` accepts from the model — exactly the
+# fields `_MONEY_EVENT_PROMPT` asks for, and it must stay in sync with that
+# list. Everything the model emits is attacker-controlled: the email body goes
+# straight into the prompt, so hostile mail can ask for any key `MoneyEvent`
+# happens to declare. Three of them decide where money lands and are
+# deliberately absent here — `account` (it wins over the category→account map,
+# `post_event` does `event.account or account_for(...)`), `entity` (picks the
+# ledger) and `ref` (free-text provenance). Those keep their model defaults for
+# the caller to set from the mailbox, as do `parser`, `source_class` and
+# `payee_key`, which the extractor forces after this filter.
+_LLM_EVENT_FIELDS = frozenset({
+    "kind",
+    "direction",
+    "amount",
+    "currency",
+    "payee",
+    "category",
+    "channel",
+    "instrument",
+    "occurred_on",
+    "due_on",
+    "is_recurring",
+    "confidence",
+})
+
+
 def _format_money_emails(receipts: list[dict]) -> str:
     """One block per email for `_MONEY_EVENT_PROMPT`.
 
@@ -916,16 +942,17 @@ class LLMClient:
             )
             raise
 
-        allowed = set(MoneyEvent.model_fields)
         out: list[dict] = []
         for i in range(len(receipts)):
             item = parsed[i] if i < len(parsed) and isinstance(parsed[i], dict) else None
             if item is None:
                 out.append(dict(stub))
                 continue
-            # Unknown keys are dropped rather than rejected: a model that
-            # invents a field must not cost us the whole event.
-            data = {k: v for k, v in item.items() if k in allowed}
+            # Keys outside the prompt's field list are dropped rather than
+            # rejected: a model that invents a field must not cost us the whole
+            # event, and one that emits `account`/`entity`/`ref` must not be
+            # able to route the money (see `_LLM_EVENT_FIELDS`).
+            data = {k: v for k, v in item.items() if k in _LLM_EVENT_FIELDS}
             if isinstance(data.get("amount"), str):
                 data["amount"] = data["amount"].replace(",", "")
             data["parser"] = "llm"

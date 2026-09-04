@@ -13,9 +13,10 @@ batch-level failure still raises so a real outage is not laundered into
 from __future__ import annotations
 
 import json
+import re
 
 import pytest
-from aegis.llm import LLMClient, LLMTruncationError
+from aegis.llm import _LLM_EVENT_FIELDS, _MONEY_EVENT_PROMPT, LLMClient, LLMTruncationError
 
 RECEIPT = {
     "id": "r1", "account": "arshad-personal", "message_id": "m1",
@@ -63,6 +64,40 @@ async def test_receipt_channel_gets_receipt_source_class_and_unknown_keys_are_dr
                 "confidence": 0.95, "bogus": 1}]
     out = await _Client(json.dumps(payload)).extract_money_batch([RECEIPT], model="m")
     assert out[0]["source_class"] == "receipt" and out[0]["amount"] == "1936.00"
+
+
+@pytest.mark.asyncio
+async def test_fields_the_prompt_never_asks_for_are_refused():
+    """The email body is spliced straight into the prompt, so every key the
+    model emits is reachable by whoever wrote the email. Three of `MoneyEvent`'s
+    fields decide where money lands and are NOT in the prompt: `account` wins
+    over the category→account map in `post_event` (`event.account or
+    account_for(...)`), `entity` picks the ledger, and `ref` is free-text
+    provenance. A model-fields allowlist admits all three. Only the twelve keys
+    the prompt actually asks for may cross this boundary; the rest keep their
+    defaults for the caller to set from the mailbox."""
+    payload = [{
+        "kind": "transaction", "direction": "out", "amount": 500, "currency": "INR",
+        "payee": "Acme", "channel": "upi",
+        "entity": "hikmah", "account": "expenses:hikmah:infra", "ref": "x",
+    }]
+    out = await _Client(json.dumps(payload)).extract_money_batch([RECEIPT], model="m")
+    ev = out[0]
+    assert ev["entity"] == "personal", "the model must not choose the ledger"
+    assert ev["account"] is None, "the model must not bypass the account map"
+    assert ev["ref"] is None
+    # The legitimate fields still land, so this is a filter and not a wipe.
+    assert ev["payee"] == "Acme" and ev["amount"] == "500.00" and ev["channel"] == "upi"
+
+
+def test_the_allowlist_matches_the_prompt():
+    """The allowlist is only safe while it equals what the prompt asks for.
+    Add a field to the prompt and forget the frozenset and the model's answer
+    is silently dropped; add it to the frozenset alone and an unasked-for key
+    becomes reachable again. Derive the prompt's list from the prompt itself so
+    neither drift can pass CI."""
+    prompted = set(re.findall(r"^- (\w+):", _MONEY_EVENT_PROMPT, re.M))
+    assert prompted == set(_LLM_EVENT_FIELDS)
 
 
 @pytest.mark.asyncio
