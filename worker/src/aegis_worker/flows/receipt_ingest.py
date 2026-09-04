@@ -5,15 +5,18 @@ Per-message money hygiene is owned by GmailIngestFlow's tag-based fan-out
 safety-net: it re-scans recent receipt-shaped mail and fans out any message
 the hourly triage missed to MoneyProcessFlow with idempotent semantics.
 
-It also runs a bounded re-attempt sweep (fix #113) over `receipt_email`
-rows that MoneyProcessFlow's fire-and-forget pipeline left permanently
-stuck — parse/extract failures that predate the 07-16 smart-tier fix.
+It also runs a bounded re-attempt sweep (fix #113) over every `receipt_email`
+row below `parsed.version` 2 — a parse failure, or any row classified by the
+pre-books v1 extractor. That makes the sweep the backfill vehicle too: point
+`query_window` at an older window, raise `sweep_limit`, and the backlog drains
+into the journal a bounded batch per run.
+
 MoneyProcessFlow can't be reused for this: it starts from `store_receipt_email`,
-which is idempotent on `message_id` and would immediately short-circuit as
-"duplicate" for an already-stored row. The sweep instead re-drives the
-already-hydrated row directly through `load_receipts` → `fetch_message_body`
-→ `store_receipt_body` → `classify_and_extract` → `upsert_charges`. The
-body fetch is best-effort: on failure the sweep classifies the stored snippet.
+which is idempotent on `message_id` and would short-circuit an already-v2 row
+as "duplicate". The sweep instead re-drives the already-hydrated row down the
+same v2 path — `load_receipts` → `fetch_message_body` → `store_receipt_body` →
+`parse_money_email` → `capture_due`? → `post_money_event` → `store_money_result`.
+The body fetch is best-effort: on failure the sweep parses the stored snippet.
 """
 
 from __future__ import annotations
@@ -38,18 +41,22 @@ _ACT_TIMEOUT = timedelta(seconds=60)
 _FETCH_TIMEOUT = timedelta(seconds=120)
 _CLASSIFY_TIMEOUT = timedelta(seconds=120)
 
-# Hardcoded receipt-shaped sender filter stays in code (versioned with tests).
-# The time window is the only knob exposed through seed config (query_window).
-_SENDER_FILTER = (
-    "(from:billing@ OR from:receipts@ OR from:no-reply@stripe.com "
-    "OR from:*@amazon.com OR from:*@razorpay.com "
-    "OR from:*@vercel.com)"
+# The receipt-shaped sender list: banks and card issuers first (they carry the
+# amount and the instrument), then the vendors whose receipts enrich them.
+# It is a DEFAULT, not a constant — `sender_filter` overrides it from seed
+# config, which is how a targeted backfill narrows or widens the scan.
+DEFAULT_SENDER_FILTER = (
+    "(from:billing@ OR from:receipts@ OR from:no-reply@stripe.com OR from:invoice+statements "
+    "OR from:*@amazon.com OR from:*@razorpay.com OR from:*@vercel.com "
+    "OR from:alerts@hdfcbank.bank.in OR from:alerts@axis.bank.in OR from:cc.statements@axis.bank.in "
+    "OR from:eforexservices@axis.bank.in OR from:alerts@nkgsb-bank.com "
+    "OR from:google-pay-noreply@google.com OR from:payments-noreply@google.com "
+    "OR from:googleplay-noreply@google.com OR from:no_reply@email.apple.com "
+    "OR from:do_not_reply@email.apple.com OR from:ebill@airtel.com OR from:update@airtel.com "
+    "OR from:invoicing@aws.com OR from:no-reply@amazonaws.com OR from:noreply@github.com "
+    "OR from:notify.cloudflare.com OR from:donotreply@intechonline.net OR from:no-reply@amazonpay.in)"
 )
 _DEFAULT_QUERY_WINDOW = "newer_than:14d"
-
-
-def _build_query(window: str) -> str:
-    return f"{_SENDER_FILTER} {window.strip()}"
 
 
 @dataclass
@@ -60,10 +67,11 @@ class ReceiptIngestInput:
     aegis_ui_url: str = ""
     sweep_limit: int = 20
     sweep_older_than_days: int = 1
+    sender_filter: str = DEFAULT_SENDER_FILTER
 
     @property
     def query(self) -> str:
-        return _build_query(self.query_window)
+        return f"{self.sender_filter} {self.query_window.strip()}"
 
 
 @workflow.defn(name="ReceiptIngestFlow")
@@ -142,12 +150,15 @@ class ReceiptIngestFlow:
         }
 
     async def _sweep_stuck_receipts(self, input: ReceiptIngestInput) -> int:
-        """Bounded re-attempt for receipt_email rows whose `parsed` result
-        is missing/failed (fix #113). Reprocesses each directly through
-        load_receipts → fetch_message_body → store_receipt_body →
-        classify_and_extract → upsert_charges — a row that fails again
-        just leaves `parsed` unset and waits for next week's sweep. The
-        body fetch is best-effort; a failure falls back to the snippet.
+        """Bounded re-attempt for receipt_email rows below `parsed.version`
+        2 — a failed parse, or a row the pre-books v1 extractor classified
+        (fix #113, widened by the books rework). Each is re-driven down the
+        same path MoneyProcessFlow uses: load_receipts → fetch_message_body
+        → store_receipt_body → parse_money_email → capture_due? →
+        post_money_event → store_money_result. A row that fails again stays
+        below version 2 and waits for next week's sweep. The body fetch is
+        best-effort; a failure falls back to the stored snippet. This is
+        also the backfill path — `sweep_limit` is the batch size.
 
         # ponytail: no per-row retry-count/backoff bookkeeping — the
         # weekly cadence + a small limit is the whole throttle. Good
@@ -198,19 +209,47 @@ class ReceiptIngestFlow:
                         str(exc)[:200],
                     )
 
-                extractions = await workflow.execute_activity(
-                    "classify_and_extract",
-                    args=[receipts, input.agent_id],
+                event = await workflow.execute_activity(
+                    "parse_money_email",
+                    args=[receipts[0]],
                     start_to_close_timeout=_CLASSIFY_TIMEOUT,
                     retry_policy=ACT_RETRY,
                 )
-                if not extractions or extractions[0].get("_parse_failed"):
-                    # Still failing — leave unparsed for next week's sweep.
+                if not event or event.get("_parse_failed"):
+                    # Still failing — leave it below version 2 for next week.
                     continue
 
+                todoist_ref = None
+                if event.get("kind") in ("due", "failed"):
+                    try:
+                        todoist_ref = await workflow.execute_activity(
+                            "capture_due",
+                            args=[event, receipts[0]["account"], receipts[0]["message_id"]],
+                            start_to_close_timeout=_ACT_TIMEOUT,
+                            retry_policy=ACT_RETRY,
+                        )
+                    except Exception as exc:
+                        workflow.logger.warning(
+                            "receipt_sweep_capture_failed receipt_id=%s err=%s",
+                            receipt_id,
+                            str(exc)[:200],
+                        )
+
+                posted = await workflow.execute_activity(
+                    "post_money_event",
+                    args=[
+                        receipt_id,
+                        receipts[0]["account"],
+                        receipts[0]["message_id"],
+                        event,
+                        todoist_ref,
+                    ],
+                    start_to_close_timeout=_CLASSIFY_TIMEOUT,
+                    retry_policy=ACT_RETRY,
+                )
                 await workflow.execute_activity(
-                    "upsert_charges",
-                    args=[receipts[0]["account"], extractions],
+                    "store_money_result",
+                    args=[receipt_id, event, posted.get("journal_file")],
                     start_to_close_timeout=_ACT_TIMEOUT,
                     retry_policy=ACT_RETRY,
                 )

@@ -1,23 +1,28 @@
-"""MoneyProcessFlow — single-email money hygiene pipeline for maou.
+"""MoneyProcessFlow — one email, one MoneyEvent, into the books (spec §2).
 
-Designed to be spawned from GmailIngestFlow as a fire-and-forget child
-workflow when a triage-classified email carries any of the financial tags
-({"financial", "payments"}). Also used by the weekly ReceiptIngestFlow
-safety-net.
+Spawned by GmailIngestFlow as a fire-and-forget child workflow when a
+triage-classified email carries any of the financial tags ({"financial",
+"payments"}), and by the weekly ReceiptIngestFlow safety-net for anything
+triage missed.
 
 Pipeline per email:
 
-  store_receipt_email(msg, account)      # idempotent on message_id
-    → "" means duplicate; exit.
-  fetch_message_body(account, id)         # full text for the extractor
-    → store_receipt_body(receipt_id, body); "" leaves the snippet in place.
-  load_receipts([receipt_id])             # hydrate stored row
-  classify_and_extract([receipt], "maou") # 1 LLM call, maou persona
-    → is_receipt=False means triage false-positive; mark parsed, exit.
-  upsert_charges(account, [ext])          # recurring_charge upsert
+  store_receipt_email(msg, account)   # idempotent on message_id
+    → "" means an already-v2 row; exit as a duplicate. A pre-v2 row comes
+      back by id so the v1 backlog re-drives through the books pipeline.
+  fetch_message_body(account, id)     # full text beats the 200-char snippet
+    → store_receipt_body(receipt_id, body); "" or a hard failure leaves the
+      snippet in place and the run continues.
+  load_receipts([receipt_id])         # hydrate the stored row
+  parse_money_email(receipt)          # deterministic parsers, else 1 LLM call
+    → `_parse_failed` leaves the row unstamped for the weekly sweep.
+  capture_due(event, mailbox, msgid)  # only kind in ("due", "failed")
+    → one dated Todoist task; a failure here is logged, never fatal.
+  post_money_event(...)               # journal post / link, or index only
+  store_money_result(...)             # stamp parsed.version = 2
 
-Failures here are isolated from the parent triage run — the fan-out
-hook in GmailIngestFlow starts this with ParentClosePolicy.ABANDON.
+Failures here are isolated from the parent triage run — the fan-out hook in
+GmailIngestFlow starts this with ParentClosePolicy.ABANDON.
 """
 
 from __future__ import annotations
@@ -45,6 +50,7 @@ class MoneyProcessInput:
 class MoneyProcessFlow:
     @workflow.run
     async def run(self, input: MoneyProcessInput) -> dict:
+        msg_id = input.msg.get("id", "")
         receipt_id = await workflow.execute_activity(
             "store_receipt_email",
             args=[input.msg, input.account_label],
@@ -52,18 +58,18 @@ class MoneyProcessFlow:
             retry_policy=ACT_RETRY,
         )
         if not receipt_id:
-            return {"status": "duplicate", "message_id": input.msg.get("id", "")}
+            return {"status": "duplicate", "message_id": msg_id}
+        out = {"receipt_id": receipt_id, "msgid": f"{input.account_label}/{msg_id}", "kind": None}
 
-        # Full body for the extractor (spec §2 step 2). "" = fetch failed; the
-        # snippet stored by store_receipt_email is the fallback.
-        # A hard failure here (timeout, or a raise before the activity's own
-        # soft-fail) must NOT kill the run: the snippet is a good enough
-        # extraction input, and losing the whole receipt to a Gmail blip is
-        # strictly worse than extracting from less text.
+        # Full body for the parser (spec §2 step 2). "" = fetch soft-failed;
+        # the snippet stored by store_receipt_email is the fallback. A HARD
+        # failure (timeout, or a raise before the activity's own soft-fail)
+        # must not kill the run either: parsing less text is strictly better
+        # than losing the whole receipt to a Gmail blip.
         try:
             body = await workflow.execute_activity(
                 "fetch_message_body",
-                args=[input.account_label, input.msg.get("id", "")],
+                args=[input.account_label, msg_id],
                 start_to_close_timeout=_ACT_TIMEOUT,
                 retry_policy=ACT_RETRY,
             )
@@ -88,61 +94,65 @@ class MoneyProcessFlow:
             retry_policy=ACT_RETRY,
         )
         if not receipts:
-            return {"status": "load_failed", "receipt_id": receipt_id}
+            return {**out, "status": "load_failed"}
 
         try:
-            extractions = await workflow.execute_activity(
-                "classify_and_extract",
-                args=[receipts, input.agent_id],
+            event = await workflow.execute_activity(
+                "parse_money_email",
+                args=[receipts[0]],
                 start_to_close_timeout=_CLASSIFY_TIMEOUT,
                 retry_policy=ACT_RETRY,
             )
         except Exception as exc:
-            # ACT_RETRY already gave us up to 3 attempts. Treat persistent
-            # failure as transient — DON'T mark parsed so the next pass
-            # re-tries. receipt_email row stays in the unparsed state.
+            # Persistent parser/LLM failure: leave the row below version 2 so
+            # the weekly sweep re-drives it.
             workflow.logger.warning(
                 "money_extract_failed receipt_id=%s err=%s",
                 receipt_id,
                 str(exc)[:200],
             )
-            return {"status": "extract_failed", "receipt_id": receipt_id}
+            return {**out, "status": "extract_failed"}
 
-        if not extractions:
-            return {"status": "extract_failed", "receipt_id": receipt_id}
-
-        ext = extractions[0]
-        # Per-item parse failure (LLM batch returned a malformed object for
-        # this receipt). Distinct from is_receipt=False — we can't trust
-        # what was extracted, so don't upsert. Leave receipt_email unparsed
-        # so it can be re-processed next run.
-        if ext.get("_parse_failed"):
+        if not event or event.get("_parse_failed"):
             workflow.logger.warning(
-                "money_parse_failed receipt_id=%s — leaving unparsed",
+                "money_parse_failed receipt_id=%s — leaving unstamped",
                 receipt_id,
             )
-            return {"status": "parse_failed", "receipt_id": receipt_id}
+            return {**out, "status": "parse_failed"}
 
-        if not ext.get("is_receipt"):
-            # Mark parsed so a re-run doesn't burn another LLM call.
-            await workflow.execute_activity(
-                "upsert_charges",
-                args=[input.account_label, [ext]],
-                start_to_close_timeout=_ACT_TIMEOUT,
-                retry_policy=ACT_RETRY,
-            )
-            return {"status": "not_a_receipt", "receipt_id": receipt_id}
+        kind = event.get("kind", "ignore")
+        out["kind"] = kind
 
-        processed = await workflow.execute_activity(
-            "upsert_charges",
-            args=[input.account_label, [ext]],
+        todoist_ref = None
+        if kind in ("due", "failed"):
+            # A bill or a failed payment is the only thing that becomes a task
+            # (spec §7.1). Todoist being down must not stop the event reaching
+            # the index — the task is the reminder, the index is the record.
+            try:
+                todoist_ref = await workflow.execute_activity(
+                    "capture_due",
+                    args=[event, input.account_label, msg_id],
+                    start_to_close_timeout=_ACT_TIMEOUT,
+                    retry_policy=ACT_RETRY,
+                )
+            except Exception as exc:
+                workflow.logger.warning(
+                    "money_capture_due_failed receipt_id=%s err=%s",
+                    receipt_id,
+                    str(exc)[:200],
+                )
+
+        posted = await workflow.execute_activity(
+            "post_money_event",
+            args=[receipt_id, input.account_label, msg_id, event, todoist_ref],
+            start_to_close_timeout=_CLASSIFY_TIMEOUT,
+            retry_policy=ACT_RETRY,
+        )
+        await workflow.execute_activity(
+            "store_money_result",
+            args=[receipt_id, event, posted.get("journal_file")],
             start_to_close_timeout=_ACT_TIMEOUT,
             retry_policy=ACT_RETRY,
         )
-        # No per-receipt Todoist capture any more (spec §7.4): a successful
-        # payment is read in the weekly brief, never filed as a task.
-        return {
-            "status": "charged",
-            "receipt_id": receipt_id,
-            "processed": processed,
-        }
+        status = "ignored" if kind == "ignore" else posted.get("status", "indexed")
+        return {**out, "status": status}

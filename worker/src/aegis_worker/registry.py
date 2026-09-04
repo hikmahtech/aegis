@@ -76,7 +76,11 @@ from aegis_worker.flows.money_hygiene import MoneyHygieneConfig, MoneyHygieneDai
 from aegis_worker.flows.money_process import MoneyProcessFlow
 from aegis_worker.flows.profile_reflection import ProfileReflectionConfig, ProfileReflectionFlow
 from aegis_worker.flows.raindrop_ingest import RaindropIngestFlow, RaindropIngestInput
-from aegis_worker.flows.receipt_ingest import ReceiptIngestFlow, ReceiptIngestInput
+from aegis_worker.flows.receipt_ingest import (
+    DEFAULT_SENDER_FILTER,
+    ReceiptIngestFlow,
+    ReceiptIngestInput,
+)
 from aegis_worker.flows.review import (
     DailyReviewConfig,
     DailyReviewFlow,
@@ -464,6 +468,8 @@ FLOWS: tuple[FlowSpec, ...] = (
             max_per_account=int(act["config"].get("max_per_account", 50)),
             query_window=act["config"].get("query_window", "newer_than:14d"),
             aegis_ui_url=act["_settings"].get("aegis_ui_url", ""),
+            sender_filter=act["config"].get("sender_filter", DEFAULT_SENDER_FILTER),
+            sweep_limit=int(act["config"].get("sweep_limit", 20)),
         ),
         feature_flag="money_hygiene_enabled",
     ),
