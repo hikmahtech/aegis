@@ -170,20 +170,30 @@ class ReceiptIngestFlow:
                 if not receipts:
                     continue
 
-                body = await workflow.execute_activity(
-                    "fetch_message_body",
-                    args=[receipts[0]["account"], receipts[0]["message_id"]],
-                    start_to_close_timeout=_ACT_TIMEOUT,
-                    retry_policy=ACT_RETRY,
-                )
-                if body:
-                    await workflow.execute_activity(
-                        "store_receipt_body",
-                        args=[receipt_id, body],
+                # The body is an enhancement. A hard failure must not send
+                # this row back to next week's sweep — fall through and
+                # classify the stored snippet instead.
+                try:
+                    body = await workflow.execute_activity(
+                        "fetch_message_body",
+                        args=[receipts[0]["account"], receipts[0]["message_id"]],
                         start_to_close_timeout=_ACT_TIMEOUT,
                         retry_policy=ACT_RETRY,
                     )
-                    receipts[0]["body_plain"] = body
+                    if body:
+                        await workflow.execute_activity(
+                            "store_receipt_body",
+                            args=[receipt_id, body],
+                            start_to_close_timeout=_ACT_TIMEOUT,
+                            retry_policy=ACT_RETRY,
+                        )
+                        receipts[0]["body_plain"] = body
+                except Exception as exc:
+                    workflow.logger.warning(
+                        "receipt_sweep_body_failed receipt_id=%s err=%s",
+                        receipt_id,
+                        str(exc)[:200],
+                    )
 
                 extractions = await workflow.execute_activity(
                     "classify_and_extract",

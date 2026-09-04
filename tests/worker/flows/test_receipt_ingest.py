@@ -13,6 +13,7 @@ from datetime import timedelta
 
 import pytest
 from temporalio import activity, workflow
+from temporalio.exceptions import ApplicationError
 from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import Worker
 
@@ -404,3 +405,100 @@ async def test_receipt_flow_sweep_leaves_still_failing_rows_unparsed():
 
     assert result["swept"] == 0
     assert upserted == []
+
+
+@pytest.mark.asyncio
+async def test_receipt_flow_sweep_survives_body_fetch_failure():
+    """Same stuck receipt, but fetch_message_body fails hard instead of
+    returning "". The body is an enhancement — the sweep must fall back to
+    the stored snippet and still classify + upsert, not abandon the row for
+    another week."""
+    _reset()
+    upserted: list[tuple[str, list[dict]]] = []
+
+    @activity.defn(name="find_stuck_receipts")
+    async def find_stuck(limit: int, older_than_days: int) -> list[str]:
+        _calls["sweep"].append((limit, older_than_days))
+        return ["stuck-3"]
+
+    @activity.defn(name="load_receipts")
+    async def load(receipt_ids: list[str]) -> list[dict]:
+        assert receipt_ids == ["stuck-3"]
+        return [
+            {
+                "id": "stuck-3",
+                "account": "sebas",
+                "message_id": "m-stuck-3",
+                "sender": "billing@stripe.com",
+                "subject": "Receipt",
+                "body_plain": "paid $9.99",
+                "received_at": "2026-06-01T00:00:00+00:00",
+            }
+        ]
+
+    classified_bodies: list[str] = []
+
+    @activity.defn(name="classify_and_extract")
+    async def classify(receipts: list[dict], agent_id: str) -> list[dict]:
+        classified_bodies.append(receipts[0]["body_plain"])
+        return [
+            {
+                "receipt_id": "stuck-3",
+                "is_receipt": True,
+                "vendor_name": "Stripe",
+                "amount": 9.99,
+                "currency": "USD",
+                "cadence": "monthly",
+            }
+        ]
+
+    @activity.defn(name="upsert_charges")
+    async def upsert(account: str, extractions: list[dict]) -> int:
+        upserted.append((account, extractions))
+        return len(extractions)
+
+    body_calls: list[tuple] = []
+
+    @activity.defn(name="fetch_message_body")
+    async def boom_body(account_label: str, message_id: str, max_chars: int = 6000) -> str:
+        body_calls.append((account_label, message_id))
+        raise ApplicationError("gmail down", non_retryable=True)
+
+    @activity.defn(name="store_receipt_body")
+    async def stub_store_body(receipt_id: str, body_text: str) -> None:
+        raise AssertionError("store_receipt_body must not run when the fetch failed")
+
+    async with (
+        await WorkflowEnvironment.start_local() as env,
+        Worker(
+            env.client,
+            task_queue="tq",
+            workflows=ALL_WORKFLOWS,
+            activities=[
+                stub_list,
+                stub_fetch,
+                stub_idem,
+                stub_cursor,
+                stub_capture,
+                find_stuck,
+                load,
+                classify,
+                upsert,
+                boom_body,
+                stub_store_body,
+            ],
+        ),
+    ):
+        result = await env.client.execute_workflow(
+            ReceiptIngestFlow.run,
+            ReceiptIngestInput(agent_id="maou", aegis_ui_url="https://x"),
+            id="rec-sweep-body-boom",
+            task_queue="tq",
+        )
+
+    assert result["swept"] == 1
+    assert body_calls == [("sebas", "m-stuck-3")]
+    # The stored snippet, not an abandoned row, is what the extractor saw.
+    assert classified_bodies == ["paid $9.99"]
+    assert len(upserted) == 1
+    assert upserted[0][0] == "sebas"

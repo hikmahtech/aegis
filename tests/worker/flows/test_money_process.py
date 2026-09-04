@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import pytest
 from temporalio import activity, workflow
+from temporalio.exceptions import ApplicationError
 from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import Worker
 
@@ -59,6 +60,12 @@ async def stub_body_empty(account_label: str, message_id: str, max_chars: int = 
 @activity.defn(name="store_receipt_body")
 async def stub_store_body(receipt_id: str, body_text: str) -> None:
     _calls["store_body"].append((receipt_id, body_text))
+
+
+@activity.defn(name="fetch_message_body")
+async def stub_body_boom(account_label: str, message_id: str, max_chars: int = 6000) -> str:
+    _calls["body"].append((account_label, message_id))
+    raise ApplicationError("gmail down", non_retryable=True)
 
 
 @activity.defn(name="load_receipts")
@@ -333,4 +340,41 @@ async def test_not_a_receipt_still_marks_parsed():
 
     assert result["status"] == "not_a_receipt"
     # upsert_charges still called with the non-receipt so receipt_email.parsed is written.
+    assert _calls["upsert"] == [("user-personal", 1)]
+
+
+@pytest.mark.asyncio
+async def test_body_fetch_failure_still_charges():
+    """The full body is an ENHANCEMENT. A hard fetch_message_body failure
+    (activity error or start_to_close timeout, not the "" soft-fail) must
+    not kill the run — the snippet stored by store_receipt_email is still
+    a perfectly good extraction input."""
+    _reset()
+    async with (
+        await WorkflowEnvironment.start_time_skipping() as env,
+        Worker(
+            env.client,
+            task_queue="tq",
+            workflows=[MoneyProcessFlow],
+            activities=[
+                stub_store,
+                stub_body_boom,
+                stub_store_body,
+                stub_load,
+                stub_classify_receipt,
+                stub_upsert,
+            ],
+        ),
+    ):
+        result = await env.client.execute_workflow(
+            MoneyProcessFlow.run,
+            MoneyProcessInput(agent_id="maou", msg=_MSG, account_label="user-personal"),
+            id="mp-body-boom",
+            task_queue="tq",
+        )
+
+    assert result["status"] == "charged"
+    assert _calls["store_body"] == []
+    # The rest of the pipeline ran on the snippet.
+    assert _calls["classify"] == [(1, "maou")]
     assert _calls["upsert"] == [("user-personal", 1)]

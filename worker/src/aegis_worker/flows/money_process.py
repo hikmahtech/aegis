@@ -56,18 +56,29 @@ class MoneyProcessFlow:
 
         # Full body for the extractor (spec §2 step 2). "" = fetch failed; the
         # snippet stored by store_receipt_email is the fallback.
-        body = await workflow.execute_activity(
-            "fetch_message_body",
-            args=[input.account_label, input.msg.get("id", "")],
-            start_to_close_timeout=_ACT_TIMEOUT,
-            retry_policy=ACT_RETRY,
-        )
-        if body:
-            await workflow.execute_activity(
-                "store_receipt_body",
-                args=[receipt_id, body],
+        # A hard failure here (timeout, or a raise before the activity's own
+        # soft-fail) must NOT kill the run: the snippet is a good enough
+        # extraction input, and losing the whole receipt to a Gmail blip is
+        # strictly worse than extracting from less text.
+        try:
+            body = await workflow.execute_activity(
+                "fetch_message_body",
+                args=[input.account_label, input.msg.get("id", "")],
                 start_to_close_timeout=_ACT_TIMEOUT,
                 retry_policy=ACT_RETRY,
+            )
+            if body:
+                await workflow.execute_activity(
+                    "store_receipt_body",
+                    args=[receipt_id, body],
+                    start_to_close_timeout=_ACT_TIMEOUT,
+                    retry_policy=ACT_RETRY,
+                )
+        except Exception as exc:
+            workflow.logger.warning(
+                "money_body_fetch_failed receipt_id=%s err=%s",
+                receipt_id,
+                str(exc)[:200],
             )
 
         receipts = await workflow.execute_activity(
