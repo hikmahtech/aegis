@@ -399,6 +399,33 @@ class MoneyActivities:
         if ev.kind != "transaction" or ev.entity == "none":
             await ji.upsert(self.db_pool, msgid, mailbox, ev, todoist_ref=todoist_ref)
             return result
+
+        # Idempotency for the whole transaction branch, because `post_event`'s
+        # own msgid guard cannot cover the linked path. `find_match` excludes
+        # already-linked rows, so a retry of the second-arriving email finds no
+        # match and falls through to `post_event` — which looks for a
+        # `; msgid: <msgid>` line that a linked email never has, since its id
+        # lives only in the counterpart's `receipt:`/`bank:` tag. The result is
+        # a second block for the same payment. Two reachable retries: Temporal
+        # re-running after `ji.link` succeeded but the due-close below raised,
+        # and the stuck sweep re-driving a row whose `store_money_result` never
+        # landed. `journal_file` wins over `linked_message_id` so a first-
+        # arriving email re-run *after* its counterpart linked still reports
+        # the `posted` it reported the first time — it does own a block.
+        existing = await ji.get(self.db_pool, msgid)
+        if existing is not None and (existing["journal_file"] or existing["linked_message_id"]):
+            if existing["journal_file"]:
+                result.update(status="posted", journal_file=existing["journal_file"])
+            else:
+                result.update(status="linked", linked=existing["linked_message_id"])
+            activity.logger.info(
+                "money_event_already_routed receipt=%s msgid=%s status=%s",
+                receipt_id,
+                msgid,
+                result["status"],
+            )
+            return result
+
         cfg = self.books_cfg
         # The bank alert and the vendor receipt for one payment are two emails
         # (spec §5.4). Whichever arrives second enriches the block the first

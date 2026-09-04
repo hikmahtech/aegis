@@ -227,6 +227,15 @@ async def test_receipt_then_bank_links_and_fixes_instrument(db_pool, tmp_path):
     text = (cfg.path / "personal" / "2026.journal").read_text()
     assert text.count("; msgid:") == 1 and "bank: v2-personal/m-bank" in text
     assert "2026-09-02 * Eleven Labs" in text
+    # A retry of the second-arriving email must not write a second block.
+    # find_match excludes already-linked rows, so the linked branch would fall
+    # through to post_event, whose msgid guard looks for a `; msgid:` line a
+    # linked email never has — duplicating the payment in the ledger.
+    r3 = await ActivityEnvironment().run(
+        act.post_money_event, "rid2", "v2-personal", "m-bank", bank
+    )
+    assert (cfg.path / "personal" / "2026.journal").read_text() == text
+    assert (r3["status"], r3["linked"]) == (r2["status"], r2["linked"])
 
 
 @pytest.mark.asyncio
@@ -277,6 +286,52 @@ async def test_payment_closes_its_open_due(db_pool, tmp_path):
     assert r["closed_due"] == "v2-personal/m-due"
     capture.complete_captured_task.assert_awaited_once_with("task-9")
     assert (await ji.get(db_pool, "v2-personal/m-due"))["linked_message_id"] == "v2-personal/m-paid"
+
+
+@pytest.mark.asyncio
+async def test_retry_after_a_failed_due_link_does_not_close_twice(db_pool, tmp_path, monkeypatch):
+    """The reachable double-close: the Todoist task is completed, then the
+    activity dies before `ji.link` records it, and Temporal retries.
+
+    A plain "run it twice" would prove nothing — the first run's `ji.link`
+    already takes the due out of `find_open_due`, so the second run skips the
+    close whether or not the short-circuit exists. The crash has to land in
+    the window between the close and the link.
+    """
+    cfg = _repo(tmp_path)
+    capture = AsyncMock()
+    capture.complete_captured_task = AsyncMock(return_value=True)
+    act = _act(db_pool, cfg, capture=capture)
+    due = _bank_event(kind="due", due_on="2026-09-07", channel="statement",
+                      payee="Axis credit card XX13", payee_key="axis credit card xx13",
+                      amount="100308.53")
+    await ActivityEnvironment().run(
+        act.post_money_event, "rid3", "v2-personal", "m-due", due, "task-9"
+    )
+    paid = _bank_event(payee="Axis credit card XX13", payee_key="axis credit card xx13",
+                       amount="100308.53", channel="imps", occurred_on="2026-09-06",
+                       account="equity:transfers")
+
+    real_link = ji.link
+    calls = {"n": 0}
+
+    async def flaky_link(pool, a, b):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("worker died after completing the Todoist task")
+        await real_link(pool, a, b)
+
+    monkeypatch.setattr("aegis_worker.activities.money.ji.link", flaky_link)
+    with pytest.raises(RuntimeError):
+        await ActivityEnvironment().run(
+            act.post_money_event, "rid5", "v2-personal", "m-paid", paid
+        )
+    r = await ActivityEnvironment().run(
+        act.post_money_event, "rid5", "v2-personal", "m-paid", paid
+    )
+    assert r["status"] == "posted" and r["journal_file"] == "personal/2026.journal"
+    capture.complete_captured_task.assert_awaited_once_with("task-9")
+    assert (cfg.path / "personal" / "2026.journal").read_text().count("; msgid:") == 1
 
 
 @pytest.mark.asyncio
