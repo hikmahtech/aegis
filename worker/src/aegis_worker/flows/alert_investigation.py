@@ -817,8 +817,27 @@ class AlertInvestigationFlow:
         # active-work signals (open PR / recent push / a matching due Todoist
         # task). If the repo is under active work, skip the investigation
         # entirely — the human is already on it. A human pick is an explicit
-        # "investigate anyway", so it bypasses the guard. INFRA alerts never
-        # reach the human pick, so the guard runs for them too (intended).
+        # "investigate anyway", so it bypasses the guard.
+        #
+        # INFRA alerts are exempt (2026-09-04). The guard's premise is that an
+        # open PR / push / due task on a repo means a human is already looking
+        # at the thing that alerted. That holds for an application repo, where
+        # the alert and the work share a subject. It does NOT hold for infra:
+        # every infra alert resolves to the one gitops repo, so a single open
+        # task there — on any unrelated thing — silently muted every swarm
+        # alert in the fleet.
+        #
+        # Two confirmed misses:
+        #   2026-08-28  a MAILGUN_API_KEY rotation task muted a
+        #               monitoring_cadvisor DockerServiceDown.
+        #   2026-08-27  the same rotation task was due while `wow` was down;
+        #               NodeDown fired for 5 d 16 h and nothing investigated it.
+        #
+        # An unattended node is exactly when the investigation matters most, so
+        # infra alerts now always investigate. Suppressing a duplicate infra
+        # alert is the dedup layer's job (check_dedup / build_alert_signature),
+        # not this guard's.
+        #
         # guard_repo is the github_repo slug when present, else the workspace
         # path (for a path-only repo the gh PR/push signals can't run and
         # degrade to no-signal, so the guard is best-effort/precision-only,
@@ -828,7 +847,7 @@ class AlertInvestigationFlow:
             guard_repo = (
                 resources_list[0].get("github_repo") or resources_list[0].get("resource_path") or ""
             )
-        if guard_repo and not _repo_from_human:
+        if guard_repo and not _repo_from_human and not _is_infra:
             aw = await self._safe_check_active_work(alert, guard_repo)
             if aw.get("active"):
                 reasons = "; ".join(aw.get("reasons") or [])

@@ -63,6 +63,7 @@ def _reset(**overrides):
             },
             "run_investigation_called": False,
             "check_active_work_called": False,
+            "resolve_infra_called": False,
             "digest_items": [],
             "system_events": [],
         }
@@ -127,6 +128,38 @@ async def stub_resolve_alert_resource(alert: dict) -> dict:
 async def stub_score_resource_relevance(alert: dict, resolved_resource_id: str) -> dict:
     # Confident path: no Gate-0 card, guard runs against the resolved repo.
     return {"confident": True, "resolved_resource_id": resolved_resource_id, "candidates": []}
+
+
+# ── infra path: remediation declines, resolve returns the one gitops repo ────
+
+
+@activity.defn(name="remediate_infra_service")
+async def stub_remediate_infra_service(alert: dict) -> dict:
+    # attempted=False → _safe_remediate_infra returns None → flow falls through
+    # to the resource resolve + guard, which is the path under test.
+    return {"attempted": False, "service": "", "recovered": False}
+
+
+@activity.defn(name="resolve_infra_resource")
+async def stub_resolve_infra_resource(alert: dict) -> dict:
+    _state["resolve_infra_called"] = True
+    return {
+        "resource_id": "RID_GITOPS",
+        "resource_title": "homelab-gitops",
+        "resource_path": "homelab-gitops",
+        "github_repo": "hikmahtech/homelab-gitops",
+        "confidence": 1.0,
+        "source": "infra",
+        "resources": [
+            {
+                "resource_id": "RID_GITOPS",
+                "resource_title": "homelab-gitops",
+                "resource_path": "homelab-gitops",
+                "github_repo": "hikmahtech/homelab-gitops",
+                "confidence": 1.0,
+            }
+        ],
+    }
 
 
 # ── the active-work check, stubbed BY NAME ───────────────────────────────────
@@ -298,6 +331,8 @@ ALL_ACTIVITIES = [
     stub_get_verification_delay,
     stub_check_alert_resolved,
     stub_resolve_alert_resource,
+    stub_remediate_infra_service,
+    stub_resolve_infra_resource,
     stub_score_resource_relevance,
     stub_check_active_work,
     stub_reresolve_with_hint,
@@ -422,3 +457,59 @@ async def test_confident_inactive_proceeds_to_investigation():
     assert resources and resources[0]["github_repo"] == "youruser/aegis"
 
     assert not any(d.get("type") == "skipped_active_work" for d in _state["digest_items"])
+
+
+@pytest.mark.asyncio
+async def test_infra_alert_bypasses_guard_even_when_repo_is_active():
+    """An INFRA alert must investigate even when its repo is under active work.
+
+    Regression for the 2026-08/09 alerting blind spot. Every infra alert
+    resolves to the single gitops repo, so an unrelated open PR / push / due
+    Todoist task on that repo silently muted the whole fleet's swarm alerts:
+
+      2026-08-28  a MAILGUN_API_KEY rotation task muted a
+                  monitoring_cadvisor DockerServiceDown.
+      2026-08-27  the same task was due while `wow` was down; NodeDown fired
+                  for 5 d 16 h and nothing ever investigated it.
+
+    active_work is deliberately returned as ACTIVE here — the identical input
+    that makes test_confident_active_skips_investigation skip. The only
+    difference is the alertname, which puts the alert in INFRA_ALERTNAMES.
+    """
+    _reset(
+        active_work_result={
+            "active": True,
+            "reasons": ["due Todoist task: Rotate MAILGUN_API_KEY"],
+        },
+    )
+
+    async with (
+        await WorkflowEnvironment.start_time_skipping() as env,
+        Worker(
+            env.client,
+            task_queue="tq-guard",
+            workflows=[AlertInvestigationFlow, InteractionFlow],
+            activities=ALL_ACTIVITIES,
+        ),
+    ):
+        result = await env.client.execute_workflow(
+            AlertInvestigationFlow.run,
+            _make_alert(
+                title="NodeDown: wow",
+                fingerprint="fp-guard-infra-1",
+                service="",
+                source="todoist-jira",
+                labels={"alertname": "NodeDown", "hostname": "wow"},
+            ),
+            id=f"alert-guard-infra-{uuid4().hex[:8]}",
+            task_queue="tq-guard",
+        )
+
+    # Took the infra path (deterministic resolve, no LLM repo-match).
+    assert _state["resolve_infra_called"] is True
+
+    # The guard must NOT have skipped it, despite active=True.
+    assert result["status"] != "skipped_active_work"
+    assert _state["run_investigation_called"] is True
+    assert not any(d.get("type") == "skipped_active_work" for d in _state["digest_items"])
+    assert not any("under active work" in e for e in _state["system_events"])
