@@ -1,10 +1,12 @@
-"""CaptureActivities — shared Todoist Inbox capture helper.
+"""CaptureActivities — shared Todoist capture helper.
 
-All Phase 2 ingest flows call CaptureActivities.capture_to_inbox at their
-emit point. The helper owns:
+Every ingest flow reaches Todoist through `_capture`: `capture_to_inbox` for
+the managed Inbox, `capture_task` for any project with an optional due date,
+`capture_due` for a books bill or failed payment (spec §7.1). The helper owns:
 
 - kill switch read (settings.todoist_capture_enabled)
-- inbox project lookup (settings.todoist_managed_project_ids['inbox'])
+- inbox project lookup (settings.todoist_managed_project_ids['inbox']) when
+  the caller named no project
 - per-source dedup (todoist_capture_idempotency)
 - Sync API command build via TodoistConnector
 - outbox fallback on retryable failure
@@ -32,23 +34,29 @@ class CaptureActivities:
     # entity -> Todoist project id for books dues (spec §10). Empty = the Inbox.
     todoist_projects: dict[str, str] = field(default_factory=dict)
 
-    @activity.defn
-    async def capture_to_inbox(
+    async def _capture(
         self,
         source_tag: str,
         external_id: str,
         title: str,
-        description: str | None = None,
-        extra_labels: list[str] | None = None,
+        description: str | None,
+        labels: list[str] | None,
+        project_id: str | None,
+        due_date: str | None,
     ) -> str | None:
-        """Idempotent Inbox capture. See module docstring.
+        """The capture body shared by every public entry point.
 
-        extra_labels: additional labels attached to the new task beyond the
-        source tag. AlertInvestigationFlow passes ["@pandora"] so the task
-        is born already-clarified — ClarifyFlow's find_unclassified_items
-        skips it (last_clarified_at is bumped after the item_add) and even
-        if the row predates that bump, the explicit @pandora ownership
-        marker tells the clarify short-circuit to leave it alone.
+        `labels`: extra labels beyond the source tag. AlertInvestigationFlow
+        passes ["@pandora"] so the task is born already-clarified —
+        ClarifyFlow's find_unclassified_items skips it (last_clarified_at is
+        bumped after the item_add) and even if the row predates that bump, the
+        explicit @pandora ownership marker tells the clarify short-circuit to
+        leave it alone.
+
+        `project_id`: None means the managed Inbox; an explicit id (a books
+        entity project, spec §7.1) skips the Inbox lookup entirely, so a
+        deployment that captures dues into real projects is not held hostage
+        by an unconfigured Inbox id.
         """
         if self.db_pool is None or self.connector is None:
             return None
@@ -69,16 +77,18 @@ class CaptureActivities:
             # asyncpg returns True. Any other shape we treat as enabled
             # unless explicitly false above.
 
-            # Inbox project id
-            managed = await conn.fetchval(
-                "SELECT value FROM settings WHERE key = 'todoist_managed_project_ids'"
-            )
-            inbox_id = (managed or {}).get("inbox") if isinstance(managed, dict) else None
-            if not inbox_id:
-                activity.logger.warning(
-                    "capture_skipped_no_inbox_id source=%s ext=%s", source_tag, external_id
+            # Inbox project id — only when the caller named no project.
+            if project_id is None:
+                managed = await conn.fetchval(
+                    "SELECT value FROM settings WHERE key = 'todoist_managed_project_ids'"
                 )
-                return None
+                inbox_id = (managed or {}).get("inbox") if isinstance(managed, dict) else None
+                if not inbox_id:
+                    activity.logger.warning(
+                        "capture_skipped_no_inbox_id source=%s ext=%s", source_tag, external_id
+                    )
+                    return None
+                project_id = inbox_id
 
             # Dedup insert. On conflict, fetch the existing ref.
             inserted = await conn.fetchval(
@@ -110,18 +120,19 @@ class CaptureActivities:
         from aegis.connectors.todoist import TodoistConnector
 
         item_labels = [source_tag]
-        if extra_labels:
+        if labels:
             # Dedup-preserving merge — Todoist tolerates dupes but
             # downstream label-set comparisons get noisy.
-            for lbl in extra_labels:
+            for lbl in labels:
                 if lbl and lbl not in item_labels:
                     item_labels.append(lbl)
 
         cmd = TodoistConnector.build_create_item_command(
-            project_id=inbox_id,
+            project_id=project_id,
             content=title[:120],
             description=description,
             labels=item_labels,
+            due_date=due_date,
         )
 
         # Submit
@@ -177,6 +188,109 @@ class CaptureActivities:
             "capture_emitted source=%s ext=%s ref=%s", source_tag, external_id, ref
         )
         return ref
+
+    @activity.defn
+    async def capture_to_inbox(
+        self,
+        source_tag: str,
+        external_id: str,
+        title: str,
+        description: str | None = None,
+        extra_labels: list[str] | None = None,
+    ) -> str | None:
+        """Idempotent Inbox capture. See module docstring."""
+        return await self._capture(
+            source_tag, external_id, title, description, extra_labels, None, None
+        )
+
+    @activity.defn
+    async def capture_task(
+        self,
+        source_tag: str,
+        external_id: str,
+        title: str,
+        description: str | None = None,
+        labels: list[str] | None = None,
+        project_id: str | None = None,
+        due_date: str | None = None,
+    ) -> str | None:
+        """Idempotent capture into any project with an optional due date (spec §7.1)."""
+        return await self._capture(
+            source_tag, external_id, title, description, labels, project_id, due_date
+        )
+
+    @activity.defn
+    async def capture_due(self, event: dict, mailbox: str, message_id: str) -> str | None:
+        """A bill, statement, autopay reminder or failed payment → one dated task (spec §7.1).
+
+        Dedupe key is `(payee_key, due_on)`, not the Gmail message id: a biller
+        that re-sends the same statement must not mint a second task.
+
+        No GTD state label. The due date is what surfaces the task, and
+        stacking `@next` on a dated item is exactly the drift the Next Actions
+        filter exists to catch.
+        """
+        from datetime import datetime, timedelta
+        from zoneinfo import ZoneInfo
+
+        from aegis.api.models.money import MoneyEvent
+        from aegis.services.money_format import fmt_money
+
+        ev = MoneyEvent(**{k: v for k, v in event.items() if not k.startswith("_")})
+        if ev.kind not in ("due", "failed") or ev.due_on is None or ev.amount is None:
+            return None
+        today = datetime.now(ZoneInfo("Asia/Kolkata")).date()
+        # A day of warning, but never a task that is born overdue.
+        due = max(ev.due_on - timedelta(days=1), today)
+        prefix = "Fix payment:" if ev.kind == "failed" else "Pay"
+        title = f"{prefix} {ev.payee} {fmt_money(ev.amount, ev.currency or '')}"
+        description = (
+            f"Due {ev.due_on.isoformat()}\n{ev.channel} · {ev.instrument or '-'}\n"
+            f"{mailbox} · gmail {message_id}"
+        )
+        return await self._capture(
+            "#bill",
+            f"{ev.payee_key}:{ev.due_on.isoformat()}",
+            title,
+            description,
+            None,
+            self.todoist_projects.get(ev.entity),
+            due.isoformat(),
+        )
+
+    @activity.defn
+    async def complete_captured_task(self, task_ref: str) -> bool:
+        """Close a captured task (a due that got paid). False for an unresolved temp ref.
+
+        An `item-…` ref is a temp_id whose item_add is still sitting in the
+        outbox — Todoist has never seen that id, so completing it would be
+        rejected. The caller keeps the due open and retries after the drain.
+        """
+        if not task_ref or task_ref.startswith("item-") or self.connector is None:
+            return False
+        from aegis.connectors.todoist import TodoistConnector
+
+        cmd = TodoistConnector.build_item_complete_command(task_ref)
+        result = await self.connector.commands([cmd])
+        status = TodoistConnector.check_sync_status(result, [cmd["uuid"]])
+        if status["ok"]:
+            return True
+        if (status["retryable"] or status["rejected_retryable"]) and self.db_pool is not None:
+            # item_complete carries no temp_id, so the command uuid is the
+            # outbox key. drain_outbox replays `command` verbatim and only
+            # reads temp_id to look up a created id, which this has none of.
+            async with self.db_pool.acquire() as conn:
+                await conn.execute(
+                    "INSERT INTO todoist_outbox (temp_id, command, status) VALUES ($1, $2, 'pending') "
+                    "ON CONFLICT (temp_id) DO NOTHING",
+                    cmd["uuid"],
+                    cmd,
+                )
+            return True
+        activity.logger.warning(
+            "complete_captured_task_rejected ref=%s err=%s", task_ref, status["envelope_error"]
+        )
+        return False
 
     @activity.defn
     async def link_email_to_task(self, msg: dict, body: str = "") -> dict:

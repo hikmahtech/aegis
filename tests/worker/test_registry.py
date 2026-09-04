@@ -282,9 +282,16 @@ def test_module_workflows_is_the_unflagged_registry():
         # unflagged, so it moves all three rows; `store_receipt_body` is on the
         # existing MoneyActivities, which IS money-flagged, so it moves only
         # the money=True row. That is why this bump is +2/+1/+1, not +2/+2/+2.
-        (True, True, 42, 211),
-        (False, False, 34, 180),
-        (True, False, 38, 199),
+        # Then +6 activities and NO new flow from the books lane, split the
+        # same way: `capture_task`, `capture_due` and `complete_captured_task`
+        # are on the existing CaptureActivities, which is unflagged, so they
+        # move all three rows; `parse_money_email`, `post_money_event` and
+        # `store_money_result` are on the money-flagged MoneyActivities, so
+        # they move only the money=True row. Hence +6/+3/+3. No new flow —
+        # MoneyProcessFlow already exists and these are its new steps.
+        (True, True, 42, 217),
+        (False, False, 34, 183),
+        (True, False, 38, 202),
     ],
 )
 def test_real_registration_passes_the_boot_check(homelab, money, flows, activities):

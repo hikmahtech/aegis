@@ -2,13 +2,20 @@
 
 from __future__ import annotations
 
+import asyncio
 import html as _html
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from decimal import Decimal
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import structlog
+from aegis.api.models.money import MoneyEvent, payee_key
+from aegis.services import books
+from aegis.services import journal_index as ji
+from aegis.services.bank_parsers import parse_any
+from aegis.services.books import UNKNOWN, account_for, instrument_account
 from aegis.services.fx import to_monthly_home
 from aegis.services.money_format import fmt_money
 from temporalio import activity
@@ -85,6 +92,14 @@ def parse_bank_alert_senders(raw: str) -> frozenset[str]:
     return frozenset(s.strip().lower() for s in (raw or "").split(",") if s.strip())
 
 
+def match_to_event(row: dict) -> dict:
+    """journal_index row → MoneyEvent kwargs (for re-upserting an enriched row)."""
+    keys = ("kind", "direction", "amount", "currency", "payee", "payee_key", "channel",
+            "instrument", "occurred_on", "due_on", "entity", "account", "parser",
+            "confidence", "source_class")
+    return {k: row[k] for k in keys if k in row and row[k] is not None}
+
+
 def _is_bank_alert_sender(*candidates: str, senders: frozenset[str]) -> bool:
     """True if any candidate sender string contains a known bank-alert domain."""
     for cand in candidates:
@@ -123,8 +138,11 @@ class MoneyActivities:
     async def store_receipt_email(self, msg: dict, account: str) -> str:
         """Insert raw email into finance.receipt_email; return UUID id.
 
-        Idempotent: ON CONFLICT (message_id) DO NOTHING. Returns empty string
-        on conflict (caller treats as "already stored").
+        Idempotent: ON CONFLICT (message_id) DO NOTHING. On conflict the row's
+        `parsed.version` decides (v2): a row that never made it through the
+        books pipeline is handed back by id so the caller re-processes it,
+        and only a `version >= 2` row is a real duplicate (empty string).
+        That is what lets the v1 backlog drain on the next ingest pass.
 
         `msg` is the Gmail dict from GmailActivities.fetch_emails:
         {id, thread_id, sender, subject, to, date, snippet, internal_date_ms}
@@ -156,7 +174,15 @@ class MoneyActivities:
                     "date_header": msg.get("date", ""),
                 },
             )
-        return str(row["id"]) if row else ""
+        if row is None:
+            async with self.db_pool.acquire() as conn:
+                existing = await conn.fetchval(
+                    "SELECT id FROM finance.receipt_email WHERE message_id = $1 "
+                    "  AND COALESCE((parsed->>'version')::int, 0) < 2",
+                    msg.get("id", ""),
+                )
+            return str(existing) if existing else ""
+        return str(row["id"])
 
     @activity.defn
     async def load_receipts(self, receipt_ids: list[str]) -> list[dict]:
@@ -210,22 +236,22 @@ class MoneyActivities:
     async def find_stuck_receipts(
         self, limit: int = 20, older_than_days: int = 1
     ) -> list[str]:
-        """Return up to `limit` receipt_email ids whose parse result is
-        missing or failed — `parsed` NULL or lacking the `is_receipt` key.
+        """Return up to `limit` receipt_email ids not yet through the books
+        pipeline — `parsed.version` below 2 (NULL `parsed` included).
 
-        Fix #113: MoneyProcessFlow is fire-and-forget — on extract/parse
-        failure it returns early without ever writing `parsed`, so these
-        rows are permanently stuck (the pre-07-16 smart-tier failures; 36
-        of them in prod, verified 0% failure since). ReceiptIngestFlow's
-        weekly sweep re-drives them through classify_and_extract +
-        upsert_charges directly. Oldest-first so the backlog drains in
-        order; `older_than_days` avoids racing a receipt that's still
-        mid-flight in its original MoneyProcessFlow run.
+        v2 widened the predicate. Fix #113 asked "did the old extractor run?"
+        (`parsed ? 'is_receipt'`); the question now is "did this email reach
+        the journal?", which only `store_money_result`'s `version: 2` stamp
+        answers. So every v1-classified row is stuck by this definition, which
+        is the point: the sweep is how the pre-books backlog gets re-parsed
+        into MoneyEvents and posted. Oldest-first so it drains in order;
+        `older_than_days` avoids racing a receipt still mid-flight in its
+        original MoneyProcessFlow run.
         """
         async with self.db_pool.acquire() as conn:
             rows = await conn.fetch(
                 "SELECT id FROM finance.receipt_email "
-                "WHERE (parsed IS NULL OR NOT (parsed ? 'is_receipt')) "
+                "WHERE COALESCE((parsed->>'version')::int, 0) < 2 "
                 "  AND received_at < NOW() - ($2 * INTERVAL '1 day') "
                 "ORDER BY received_at ASC LIMIT $1",
                 limit,
@@ -270,6 +296,205 @@ class MoneyActivities:
             # and on autopay reminders names the merchant, not the sender).
             e["sender"] = r.get("sender", "")
         return extractions
+
+    def _rules(self) -> list[dict]:
+        if self.books_cfg is None:
+            return []
+        return books.load_rules(self.books_cfg.path / "rules" / "accounts.yaml")
+
+    @activity.defn
+    async def parse_money_email(self, receipt: dict) -> dict:
+        """One MoneyEvent for one stored email (spec §2 step 3): deterministic
+        parsers, else the LLM on the full body; then mailbox entity, rules,
+        account fallback, date fallback."""
+        mailbox = receipt.get("account", "")
+        if mailbox in self.ignored_mailboxes:
+            return MoneyEvent(kind="ignore", entity="none", parser="mailbox").model_dump(
+                mode="json"
+            )
+        sender, subject = receipt.get("sender", ""), receipt.get("subject", "")
+        body = receipt.get("body_plain") or ""
+        ev = parse_any(sender, subject, body)
+        if ev is None:
+            system_prompt = None
+            if self.agent_id:
+                from aegis.services.personalities import get_personality
+
+                system_prompt = _format_agent_persona(
+                    await get_personality(self.db_pool, self.agent_id)
+                )
+            out = await self.llm.extract_money_batch(
+                [receipt],
+                model=self.extract_model,
+                system_prompt=system_prompt,
+                db_pool=self.db_pool,
+                agent_id=self.agent_id or None,
+            )
+            item = out[0] if out else {"_parse_failed": True}
+            if item.get("_parse_failed"):
+                return {"kind": "ignore", "parser": "llm", "_parse_failed": True}
+            ev = MoneyEvent(**{k: v for k, v in item.items() if not k.startswith("_")})
+
+        # The mailbox decides the entity, except where a parser recognised a
+        # business instrument — that is stronger evidence than which inbox the
+        # mail happened to land in.
+        if ev.entity != "hikmah":
+            ev.entity = self.mailbox_entities.get(mailbox, "personal")  # type: ignore[assignment]
+        rule = books.apply_rules(self._rules(), sender, ev.payee)
+        if rule:
+            if rule.get("ignore"):
+                ev.kind, ev.entity, ev.parser = "ignore", "none", f"{ev.parser}+rule"
+                ev.payee_key = payee_key(ev.payee)
+                return ev.model_dump(mode="json")
+            if rule.get("entity") in ("personal", "hikmah"):
+                ev.entity = rule["entity"]
+            if rule.get("payee"):
+                ev.payee = str(rule["payee"])
+            if rule.get("account"):
+                ev.account = str(rule["account"])
+        if not ev.account and ev.kind == "transaction":
+            side = "in" if ev.direction == "in" else "out"
+            # A guessed category on a low-confidence extraction is worse than
+            # no category: it buries a wrong classification in a real account
+            # where nobody reviews it. The unknown account is the review queue.
+            low = ev.parser == "llm" and ev.confidence < 0.8
+            ev.account = (
+                UNKNOWN["hikmah" if ev.entity == "hikmah" else "personal"][side]
+                if low
+                else account_for(ev.category, ev.direction, ev.entity)
+            )
+        if ev.occurred_on is None and ev.kind == "transaction" and receipt.get("received_at"):
+            received = datetime.fromisoformat(receipt["received_at"])
+            ev.occurred_on = received.astimezone(ZoneInfo(self.home_tz)).date()
+        ev.payee_key = payee_key(ev.payee)
+        return ev.model_dump(mode="json")
+
+    @staticmethod
+    def _looks_raw(payee: str) -> bool:
+        """A bank alert's payee that a receipt's payee would improve on — a
+        VPA, an account number, or an all-caps card-network descriptor."""
+        p = payee or ""
+        return "@" in p or p.startswith("a/c") or (p.isupper() and len(p) > 3)
+
+    @activity.defn
+    async def post_money_event(
+        self,
+        receipt_id: str,
+        mailbox: str,
+        message_id: str,
+        event: dict,
+        todoist_ref: str | None = None,
+    ) -> dict:
+        """Route one event (spec §2 step 4, §5.4, §7.1). Transactions are
+        posted or linked; everything else is indexed only."""
+        ev = MoneyEvent(**{k: v for k, v in event.items() if not k.startswith("_")})
+        msgid = ji.msgid_for(mailbox, message_id)
+        result: dict = {
+            "msgid": msgid,
+            "status": "indexed",
+            "journal_file": None,
+            "linked": None,
+            "closed_due": None,
+        }
+        if ev.kind != "transaction" or ev.entity == "none":
+            await ji.upsert(self.db_pool, msgid, mailbox, ev, todoist_ref=todoist_ref)
+            return result
+        cfg = self.books_cfg
+        # The bank alert and the vendor receipt for one payment are two emails
+        # (spec §5.4). Whichever arrives second enriches the block the first
+        # posted rather than posting a duplicate.
+        match = await ji.find_match(self.db_pool, ev, msgid)
+        try:
+            if cfg is None:
+                raise books.BooksDisabled("no books config")
+            if match is not None:
+                other = match["message_id"]
+                if ev.source_class == "receipt":
+                    kwargs: dict = {"add_tags": {"receipt": msgid}}
+                    if self._looks_raw(match["payee"] or "") and ev.payee:
+                        kwargs["payee"] = ev.payee
+                    if (match["account"] or "").endswith(":unknown") and (
+                        ev.account and not ev.account.endswith(":unknown")
+                    ):
+                        kwargs["account"] = ev.account
+                    try:
+                        await books.rewrite_event(other, cfg, **kwargs)
+                    except books.BooksCheckError:
+                        # The receipt's account is not in the chart. Keep the
+                        # cross-reference rather than losing the whole link.
+                        kwargs = {"add_tags": {"receipt": msgid}}
+                        await books.rewrite_event(other, cfg, **kwargs)
+                    fixed_kwargs = {
+                        k: v for k, v in kwargs.items() if k in ("payee", "account")
+                    }
+                    fixed = MoneyEvent(**{**match_to_event(match), **fixed_kwargs})
+                    if "payee" in fixed_kwargs:
+                        fixed.payee_key = payee_key(fixed.payee)
+                    await ji.upsert(self.db_pool, other, match["mailbox"], fixed)
+                else:
+                    declared = await asyncio.to_thread(books._declared_accounts_sync, cfg)
+                    inst = instrument_account(ev.instrument, declared)
+                    try:
+                        await books.rewrite_event(
+                            other, cfg, instrument_account=inst, add_tags={"bank": msgid}
+                        )
+                    except books.BooksCheckError:
+                        await books.rewrite_event(other, cfg, add_tags={"bank": msgid})
+                await ji.upsert(self.db_pool, msgid, mailbox, ev, linked=other)
+                await ji.link(self.db_pool, msgid, other)
+                result.update(status="linked", linked=other)
+            else:
+                rel = await books.post_event(ev, msgid, cfg)
+                await ji.upsert(self.db_pool, msgid, mailbox, ev, journal_file=rel)
+                result.update(status="posted", journal_file=rel)
+        except books.BooksDisabled:
+            # The index is the cheap half and stays useful without a checkout:
+            # the admin page, dues dedupe and matching all still work, and a
+            # later backfill has the rows to post from.
+            await ji.upsert(self.db_pool, msgid, mailbox, ev)
+            result["status"] = "books_disabled"
+            return result
+
+        if ev.amount is not None and ev.currency and ev.occurred_on is not None:
+            due = await ji.find_open_due(
+                self.db_pool, ev.payee_key, ev.amount, ev.currency, ev.occurred_on
+            )
+            if due is not None:
+                closed = True
+                if self.capture is not None:
+                    closed = await self.capture.complete_captured_task(due["todoist_ref"])
+                # Only link once the task is actually closed — linking is what
+                # takes the due out of find_open_due, so linking on a failed
+                # close would strand an open Todoist task nothing revisits.
+                if closed:
+                    await ji.link(self.db_pool, due["message_id"], msgid)
+                    result["closed_due"] = due["message_id"]
+        activity.logger.info(
+            "money_event_routed receipt=%s msgid=%s status=%s linked=%s closed_due=%s",
+            receipt_id,
+            msgid,
+            result["status"],
+            result["linked"],
+            result["closed_due"],
+        )
+        return result
+
+    @activity.defn
+    async def store_money_result(
+        self, receipt_id: str, event: dict, journal_file: str | None
+    ) -> None:
+        """Stamp the row as v2-processed (spec §2 step 5)."""
+        async with self.db_pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE finance.receipt_email "
+                "SET parsed = COALESCE(parsed, '{}'::jsonb) || $2 WHERE id = $1::uuid",
+                receipt_id,
+                {
+                    "version": 2,
+                    "event": {k: v for k, v in event.items() if not k.startswith("_")},
+                    "journal_file": journal_file,
+                },
+            )
 
     @activity.defn
     async def upsert_charges(self, account: str, extractions: list[dict]) -> int:

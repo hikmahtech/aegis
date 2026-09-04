@@ -77,7 +77,11 @@ async def test_store_receipt_email_inserts_and_returns_id(db_pool):
 
 @pytest.mark.asyncio
 async def test_store_receipt_email_idempotent(db_pool):
-    """Second insert on same message_id returns empty string (conflict)."""
+    """Second insert on the same message_id never writes a second row.
+
+    v2 changed what it *returns* (the existing id, so a pre-books row gets
+    re-processed) but not the insert contract: one row per Gmail message.
+    """
     act = _make_act(db_pool)
     async with db_pool.acquire() as conn:
         await conn.execute("DELETE FROM finance.receipt_email WHERE message_id LIKE 'rt-%'")
@@ -97,7 +101,48 @@ async def test_store_receipt_email_idempotent(db_pool):
     second = await env.run(act.store_receipt_email, msg, "sebas")
 
     assert first, "first insert should return a UUID"
-    assert second == "", "duplicate insert should return empty string"
+    assert second == first, "a pre-books row comes back by id for re-processing"
+    async with db_pool.acquire() as conn:
+        count = await conn.fetchval(
+            "SELECT count(*) FROM finance.receipt_email WHERE message_id = 'rt-2'"
+        )
+    assert count == 1, "ON CONFLICT DO NOTHING must not write a second row"
+
+
+@pytest.mark.asyncio
+async def test_store_receipt_email_returns_existing_id_for_v1_rows(db_pool):
+    """v2: a row that never reached the books pipeline is handed back for
+    re-processing; only a `parsed.version >= 2` row is a real duplicate."""
+    act = _make_act(db_pool)
+    async with db_pool.acquire() as conn:
+        await conn.execute("DELETE FROM finance.receipt_email WHERE message_id = 'rt-v1'")
+    msg = {"id": "rt-v1", "sender": "a@b", "subject": "s", "internal_date_ms": 1700000000000}
+    first = await act.store_receipt_email(msg, "sebas")
+    assert first
+    assert await act.store_receipt_email(msg, "sebas") == first  # no version → re-process
+    await db_pool.execute(
+        "UPDATE finance.receipt_email SET parsed = parsed || '{\"version\": 2}' "
+        "WHERE message_id = 'rt-v1'"
+    )
+    assert await act.store_receipt_email(msg, "sebas") == ""  # v2 → duplicate
+
+
+@pytest.mark.asyncio
+async def test_find_stuck_receipts_selects_rows_below_version_2(db_pool):
+    act = _make_act(db_pool)
+    async with db_pool.acquire() as conn:
+        await conn.execute("DELETE FROM finance.receipt_email WHERE message_id LIKE 'stuck-v%'")
+        v1 = await _insert_receipt_email(
+            conn, message_id="stuck-v1", parsed={"is_receipt": True},
+            received_days_ago=_ANCIENT_DAYS,
+        )
+        # Compare on the returned row id, not the message_id: `ids` holds uuids,
+        # so `"stuck-v2" not in ids` would pass however the predicate behaved.
+        v2 = await _insert_receipt_email(
+            conn, message_id="stuck-v2", parsed={"version": 2}, received_days_ago=_ANCIENT_DAYS
+        )
+    ids = await act.find_stuck_receipts(limit=50, older_than_days=1)
+    assert v1 in ids and v2 not in ids
 
 
 @pytest.mark.asyncio
@@ -144,11 +189,12 @@ _ANCIENT_DAYS = 99999
 
 
 @pytest.mark.asyncio
-async def test_find_stuck_receipts_selects_missing_is_receipt_key(db_pool):
-    """Fix #113: a row whose `parsed` lacks `is_receipt` (the
-    parse_failed/extract_failed short-circuit) is stuck and eligible;
-    a row that was actually classified (is_receipt present, either value)
-    is NOT — it already has a real result, refired or not."""
+async def test_find_stuck_receipts_selects_every_pre_v2_row(db_pool):
+    """v2 widened the predicate from "lacks `is_receipt`" to "`parsed.version`
+    below 2". Fix #113's rows (parsed NULL, or present but never classified)
+    are still stuck. So now is a v1-classified row — `is_receipt` says the old
+    extractor ran, not that the books pipeline ever saw it. Only a row stamped
+    `version: 2` by store_money_result is done."""
     act = _make_act(db_pool)
     async with db_pool.acquire() as conn:
         await conn.execute(
@@ -175,15 +221,23 @@ async def test_find_stuck_receipts_selects_missing_is_receipt_key(db_pool):
             parsed={"is_receipt": False},
             received_days_ago=_ANCIENT_DAYS,
         )
+        booked = await _insert_receipt_email(
+            conn,
+            message_id="stuck-sel-v2",
+            parsed={"is_receipt": True, "version": 2},
+            received_days_ago=_ANCIENT_DAYS,
+        )
 
     env = ActivityEnvironment()
     ids = await env.run(act.find_stuck_receipts, 20, 1)
 
     assert stuck_null in ids
     assert stuck_no_key in ids
+    # v1 classification is no longer a terminal state — these are stuck now.
+    assert classified_true in ids
+    assert classified_false in ids
     # WHERE-clause exclusion — safe regardless of ordering/limit/clutter.
-    assert classified_true not in ids
-    assert classified_false not in ids
+    assert booked not in ids
 
 
 @pytest.mark.asyncio
