@@ -10,7 +10,7 @@ sessions already working on this very task?
 Everything here except :func:`busy_human_sessions` is pure, so the parsing rules
 are unit-testable without SSH.
 
-Two rules are load-bearing rather than cosmetic:
+Three rules are load-bearing rather than cosmetic:
 
 * AEGIS's own headless runs register in the SAME registry (they appear with
   ``entrypoint="sdk-cli"``), so a session inside a ``-aegis-wt/`` worktree is
@@ -21,6 +21,15 @@ Two rules are load-bearing rather than cosmetic:
   private interface. This module keeps an explicit ALLOW-LIST of output fields
   rather than passing the CLI's object through, so a future CLI version cannot
   introduce a field that leaks by default.
+* Stale records are DROPPED at parse time, because the CLI prunes an
+  interactive session when its process exits but never prunes a ``claude --bg``
+  job record — a finished or blocked job stays listed until someone runs
+  ``claude rm``. So a background job in a terminal or blocked ``state`` goes,
+  and so does any session whose ``startedAt`` is older than a week. A job
+  waiting on the human is not a person mid-thought, and without this a
+  five-week-old dead job counts as "the operator has this repo open" for ever
+  (issue #369). An unreadable or absent ``startedAt`` is kept: an unknown age
+  must not be guessed at.
 """
 
 from __future__ import annotations
@@ -28,6 +37,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import time
 
 logger = logging.getLogger(__name__)
 
@@ -42,6 +52,14 @@ _AEGIS_WT_MARKER = "-aegis-wt/"
 _CLAUDE_WT_MARKER = "/.claude/worktrees/"
 
 _BUSY = "busy"
+
+# `claude --bg` job states meaning the job is finished or parked on the human.
+# The CLI keeps listing such a job until `claude rm`, so AEGIS drops it instead.
+_STALE_BACKGROUND_STATES = frozenset({"blocked", "done", "failed", "stopped", "killed", "exited"})
+_BACKGROUND = "background"
+
+# Nothing started more than a week ago is a live collision, whatever is listed.
+_MAX_SESSION_AGE_MS = 7 * 24 * 60 * 60 * 1000
 
 
 def parse_agents_json(raw: str) -> list[dict]:
@@ -84,21 +102,60 @@ def normalise_repo(cwd: str, repo_base: str) -> tuple[str, str]:
     return rel, "human"
 
 
-def to_records(parsed: list[dict], account: str, repo_base: str) -> list[dict]:
-    """Normalised records. Output fields are an allow-list — see module docstring.
+def _started_at_ms(value: object) -> int | None:
+    """``startedAt`` as epoch milliseconds, or ``None`` when it cannot be read.
+
+    The CLI has emitted this as an int and as a string of digits. Anything else
+    — absent, blank, an ISO timestamp — is an UNKNOWN age, and unknown is never
+    treated as old.
+    """
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value)
+    if isinstance(value, str):
+        try:
+            return int(value.strip())
+        except ValueError:
+            return None
+    return None
+
+
+def to_records(
+    parsed: list[dict], account: str, repo_base: str, *, now_ms: int | None = None
+) -> list[dict]:
+    """Normalised records, minus the stale ones. Output fields are an allow-list.
 
     Interactive sessions report ``status``/``sessionId``; background ones report
     ``state``/``id``. Both are read so the inventory sees the whole fleet.
+
+    Two records are dropped, both explained in the module docstring: a
+    background job in a terminal or blocked state, and any session started more
+    than ``_MAX_SESSION_AGE_MS`` ago. ``now_ms`` exists so tests can pin the
+    clock; it defaults to now.
     """
+    clock = int(time.time() * 1000) if now_ms is None else now_ms
     records: list[dict] = []
     for item in parsed:
+        name = str(item.get("name") or "")
+        kind = str(item.get("kind") or "").strip().lower()
+        state = str(item.get("state") or "").strip().lower()
+        if kind == _BACKGROUND and state in _STALE_BACKGROUND_STATES:
+            logger.debug("coding_session_dropped: name=%s reason=background_state=%s", name, state)
+            continue
+        started = _started_at_ms(item.get("startedAt"))
+        if started is not None and clock - started > _MAX_SESSION_AGE_MS:
+            logger.debug("coding_session_dropped: name=%s reason=age_ms=%s", name, clock - started)
+            continue
         cwd = str(item.get("cwd") or "")
         repo, owner = normalise_repo(cwd, repo_base)
         records.append(
             {
                 "account": account,
                 "session_id": str(item.get("sessionId") or item.get("id") or ""),
-                "name": str(item.get("name") or ""),
+                "name": name,
                 "cwd": cwd,
                 "repo": repo,
                 "status": str(item.get("status") or item.get("state") or ""),
