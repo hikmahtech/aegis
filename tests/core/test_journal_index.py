@@ -82,5 +82,14 @@ async def test_find_open_due_tolerance_and_window(db_pool):
     assert hit is not None and hit["todoist_ref"] == "task-1"
     assert await ji.find_open_due(db_pool, "axis credit card xx13", Decimal("90000.00"), "INR", date(2026, 9, 6)) is None
     assert await ji.find_open_due(db_pool, "axis credit card xx13", Decimal("100308.53"), "INR", date(2026, 12, 1)) is None
-    await ji.upsert(db_pool, "ji-due/2", "arshad-personal", due)  # no todoist_ref → not open
+    # an unrelated payee never matches — asserted while ji-due/1 is still the one open row,
+    # so only the payee filter can be rejecting it
     assert await ji.find_open_due(db_pool, "other", Decimal("100308.53"), "INR", date(2026, 9, 6)) is None
+    # ji-due/2 is the same due with no todoist_ref: same payee, currency, amount and date, so
+    # every other filter admits it and only `todoist_ref IS NOT NULL` can keep it out
+    await ji.upsert(db_pool, "ji-due/2", "arshad-personal", due)
+    hit = await ji.find_open_due(db_pool, "axis credit card xx13", Decimal("100300.00"), "INR", date(2026, 9, 6))
+    assert hit is not None and hit["message_id"] == "ji-due/1"
+    # drop the row that has one, and the query must go empty rather than fall through to ji-due/2
+    await db_pool.execute("DELETE FROM finance.journal_index WHERE message_id = 'ji-due/1'")
+    assert await ji.find_open_due(db_pool, "axis credit card xx13", Decimal("100300.00"), "INR", date(2026, 9, 6)) is None
