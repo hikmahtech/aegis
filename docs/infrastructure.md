@@ -569,6 +569,94 @@ as before using the `AEGIS_REMOTE_SCRIPT_*` / `AEGIS_KIMI_CLI_BINARY_PATH` /
 wins wholesale for the SSH identity and coding settings; disable it to fall
 back to env again.
 
+## The books (hledger)
+
+Maou keeps double-entry books as an hledger journal in a private git repo. Money
+mail becomes a journal block; bills and failed payments also become dated Todoist
+tasks. Design:
+[`superpowers/specs/2026-09-05-maou-books-design.md`](superpowers/specs/2026-09-05-maou-books-design.md).
+
+Both the core and worker images ship `hledger` 1.52.3 and `git`. The working copy
+lives at `books_path` (default `/app/config/books`) on the config volume core and
+worker share — **one** checkout, not one per container. The worker's flows write
+it; core installs the deploy key at boot and hosts the same `books.py`, so an
+`flock` on `<books_path>/.aegis.lock` serialises writes across both processes.
+Every write pulls with `--rebase --autostash`, runs `hledger check --strict`, and
+reverts just the paths it touched if that fails. A push that fails is logged, not
+raised: the commit stays local and the next write pushes it.
+
+Configure on the admin **Integrations** page, group *Books*. These are DB-owned
+settings, with the matching `AEGIS_BOOKS_*` env vars as first-boot fallback; core
+and worker must both restart to pick a change up. `books_path` is the exception —
+it is env-only (`AEGIS_BOOKS_PATH`), because it is a container path, not a choice.
+
+| Key | What it is |
+|---|---|
+| `books_repo_url` | The books repo, SSH form (`git@github.com:<org>/books.git`). Empty = posting disabled: money mail is still parsed and indexed, never written to a journal |
+| `books_deploy_key` | The private half of an ed25519 deploy key with write access on that repo. Paste the PEM or its base64 |
+| `books_ignored_mailboxes` | Comma-separated mailbox labels whose money is not yours (an employer's account, say). Their mail is classified `ignore` |
+| `books_mailbox_entities` | `label=entity,...` where entity is `personal` or `hikmah` — which set of books a mailbox's money belongs to. An unlisted mailbox is `personal` |
+| `books_todoist_projects` | `personal=<project id>,hikmah=<project id>` — where dated dues are captured. Unset = the Inbox |
+
+The whole money lane, books included, is gated on **Money Hygiene**
+(`money_hygiene_enabled` / `AEGIS_MONEY_HYGIENE_ENABLED`). With that off no money
+flow is scheduled and `MoneyActivities` is never constructed, so setting a repo
+URL alone does nothing.
+
+Each `MoneyProcessFlow` run reports what happened to its one email: `posted`,
+`linked` (enriched the counterpart's block instead of writing a second one),
+`indexed`, `ignored` or `duplicate`. Four outcomes leave the receipt below
+`parsed.version = 2` so the weekly sweep re-drives it: `load_failed`,
+`extract_failed`, `parse_failed` and `books_disabled`. That last one is
+deliberate — with no repo and no checkout the event reaches the index but never a
+journal, so the row is not finished, and configuring a repo later replays the
+whole backlog through the sweep. The status is in `workflow_runs.result_summary`.
+
+### The deploy key
+
+Generate a key pair, register the public half, paste the private half:
+
+```bash
+ssh-keygen -t ed25519 -N "" -f books_deploy_key -C aegis-books
+gh api repos/<org>/books/keys -f title=aegis \
+  -f key="$(cat books_deploy_key.pub)" -F read_only=false
+```
+
+Put the private key in `books_deploy_key` on the Integrations page and restart
+core and worker. At boot each process writes it to
+`<gmail_token_dir>/books_deploy_key` with mode 0600 and points its SSH command at
+it. The value is never logged. Rotate by replacing the setting and restarting.
+
+A malformed key does not fail boot. It logs `books_deploy_key_install_failed` and
+the process carries on with no key on disk, after which the checkout cannot
+authenticate and every journal write raises instead of posting. Grep the boot log
+for that line after setting or rotating the key.
+
+### Backfill
+
+`ReceiptIngestFlow` is the backfill vehicle. Its weekly run already sweeps every
+`finance.receipt_email` row below `parsed.version = 2` back through the books
+pipeline, oldest first; a manual run with a wider window and a bigger batch
+drains an existing backlog:
+
+```bash
+curl -X POST https://<aegis>/api/admin/money/receipt_scan/run \
+  -H "X-API-Key: $AEGIS_API_KEY" -H 'Content-Type: application/json' \
+  -d '{"query_window": "after:2026/06/30", "max_per_account": 600, "sweep_limit": 500}'
+```
+
+The body is the flow's input, so any `ReceiptIngestInput` field works. Two things
+to know. The endpoint returns 409 when Money Hygiene is off. And leave
+`sender_filter` alone unless you mean to change it — the default is the bank and
+vendor sender list, and setting it to an **empty string** does not disable
+filtering, it produces an unfiltered whole-mailbox query. Give a real filter or
+omit the key.
+
+A manual run gets no `aegis_ui_url` (only the scheduled builder injects it), so
+if a mailbox's Gmail token has expired the re-auth card it raises carries a
+relative, unusable link. Re-authorise from the Google accounts block on the admin
+**Flows** page first, or pass `aegis_ui_url` in the body.
+
 ## Chat
 
 Pandora's infra tools work against registry clusters by slug:
