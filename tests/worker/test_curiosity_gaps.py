@@ -1,9 +1,9 @@
 """A6 — CuriosityActivities.find_curiosity_gaps against a real Postgres.
 
 Covers the acceptance criteria: a charge with no memory yields a candidate and
-a memory naming the vendor removes it; a novelty_key already on a non-archived
-interaction is excluded; zero detectors firing returns []; an absent or failing
-LLM still yields the candidate with deterministic text.
+a memory naming the vendor removes it; a novelty_key already on any interaction
+is excluded; zero detectors firing returns []; an absent or failing LLM still
+yields the candidate with deterministic text.
 """
 
 from __future__ import annotations
@@ -201,13 +201,34 @@ async def test_novelty_key_on_resolved_interaction_is_excluded(clean_db):
     assert await _run(clean_db) == []
 
 
-async def test_archived_interaction_does_not_suppress(clean_db):
-    """An unanswered (timed-out) card is not an answered question."""
+async def test_archived_interaction_suppresses(clean_db):
+    """Spec §6: an unanswered card is not re-sent as a fresh card. The weekly
+    brief's unknown list is the retry channel, not another interruption."""
     await _add_charge(clean_db, "Framer")
     await _add_interaction(clean_db, "charge:framer", status="archived")
 
+    assert await _run(clean_db) == []
+
+
+async def test_vendor_name_variants_share_one_key(clean_db):
+    """'Mahavitaran (MSEDCL)' and 'Mahavitaran - Maharashtra Electricity (MSEDCL)'
+    were six cards in a month. One key, one card, biggest charge wins."""
+    await _add_charge(clean_db, "Mahavitaran (MSEDCL)", monthly=8100.0)
+    await _add_charge(clean_db, "Mahavitaran - Maharashtra Electricity (MSEDCL)", monthly=7200.0)
+
     out = await _run(clean_db)
-    assert [c["novelty_key"] for c in out] == ["charge:framer"]
+
+    assert [c["novelty_key"] for c in out] == ["charge:mahavitaran"]
+    assert out[0]["subject"] == "Mahavitaran (MSEDCL)"
+
+
+def test_charge_key_is_first_normalised_word():
+    from aegis_worker.activities.curiosity import charge_key
+
+    assert charge_key("Apple iCloud") == "apple"
+    assert charge_key("Mahavitaran - Maharashtra Electricity (MSEDCL)") == "mahavitaran"
+    assert charge_key("  1Password ") == "1password"
+    assert charge_key("") == ""
 
 
 # ------------------------------------------------------------------ empty / rank

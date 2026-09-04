@@ -13,9 +13,11 @@ has ever been told (its memories and its persona docs).
                   context (a finished project is not a gap)
 
 Each detector is independently try/excepted: a broken one costs its own
-candidates, never the run. `novelty_key` (`attendee:<email>`, `charge:<vendor>`,
-`project:<name>`) is the never-ask-twice handle — any non-archived `interactions`
-row already carrying that key removes the candidate.
+candidates, never the run. `novelty_key` (`attendee:<email>`,
+`charge:<first word of the vendor>`, `project:<name>`) is the never-ask-twice
+handle — ANY `interactions` row already carrying that key removes the candidate,
+archived included: a timed-out card is a question the owner declined once, and
+the weekly money brief is the retry channel, not another card.
 
 An optional single LLM pass rephrases the questions; the deterministic template
 is always computed first and is the fallback, so an absent or failing LLM still
@@ -44,6 +46,21 @@ _ATTENDEE_LINE_RE = re.compile(r"^Attendees:\s*(.+)$", re.MULTILINE)
 _EMAIL_RE = re.compile(r"[\w.+-]+@[\w-]+\.[\w.-]+")
 
 _DETECTORS = ("calendar_attendee", "recurring_charge", "todoist_project")
+
+_KEY_RE = re.compile(r"[^a-z0-9]+")
+
+
+def charge_key(vendor: str) -> str:
+    """First word of the lowercased, punctuation-free vendor name.
+
+    'Mahavitaran (MSEDCL)' and 'Mahavitaran - Maharashtra Electricity (MSEDCL)'
+    are the same bill; keying on the first word collapses every variant the
+    extractor has produced for one vendor (#PR1 of the books spec, §6).
+    # ponytail: first word; PR3 replaces this detector with payee_key from the
+    # journal index.
+    """
+    words = _KEY_RE.sub(" ", (vendor or "").lower()).split()
+    return words[0] if words else ""
 
 
 @dataclass
@@ -140,14 +157,15 @@ class CuriosityActivities:
         return row is not None
 
     async def _already_asked(self) -> set[str]:
-        """novelty_keys carried by any non-archived interaction — never ask twice.
+        """novelty_keys carried by ANY interaction, archived included.
 
-        Archived (timed-out) cards deliberately do NOT suppress: an unanswered
-        question is not an answered one.
+        A timed-out card is not an answered question, but re-sending it is
+        an interruption the user already declined once. The weekly money
+        brief lists unexplained charges; that is the retry channel.
         """
         rows = await self.db_pool.fetch(
             "SELECT DISTINCT metadata->>'novelty_key' AS k FROM interactions "
-            "WHERE status <> 'archived' AND metadata ? 'novelty_key'"
+            "WHERE metadata ? 'novelty_key'"
         )
         return {r["k"] for r in rows if r["k"]}
 
@@ -210,34 +228,37 @@ class CuriosityActivities:
             "FROM finance.recurring_charge WHERE status = 'active' "
             "ORDER BY monthly_home_equivalent DESC LIMIT 50"
         )
-        out: list[tuple[float, dict]] = []
+        # One candidate per key, not per row: the extractor produces several
+        # vendor spellings for one bill, and each used to be its own card.
+        best: dict[str, tuple[float, dict]] = {}
         for r in rows:
             vendor = (r["vendor_name"] or "").strip()
-            if not vendor or vendor.lower() in known:
+            key = charge_key(vendor)
+            if not key or vendor.lower() in known or key in known.split():
                 continue
             monthly = float(r["monthly_home_equivalent"] or 0)
-            out.append(
-                (
-                    # Cost is the signal — a big unexplained charge outranks a
-                    # small one, and any charge outranks a bare calendar face.
-                    10.0 + monthly,
-                    {
-                        "gap_type": "recurring_charge",
-                        "subject": vendor,
-                        "question": (
-                            f"You have an active {r['cadence']} charge from {vendor}, "
-                            "but nothing on record about why. What is it for?"
-                        ),
-                        "evidence": {
-                            "category": r["category"],
-                            "cadence": r["cadence"],
-                            "monthly_home_equivalent": monthly,
-                        },
-                        "novelty_key": f"charge:{vendor.lower()}",
+            cand = (
+                # Cost is the signal — a big unexplained charge outranks a
+                # small one, and any charge outranks a bare calendar face.
+                10.0 + monthly,
+                {
+                    "gap_type": "recurring_charge",
+                    "subject": vendor,
+                    "question": (
+                        f"You have an active {r['cadence']} charge from {vendor}, "
+                        "but nothing on record about why. What is it for?"
+                    ),
+                    "evidence": {
+                        "category": r["category"],
+                        "cadence": r["cadence"],
+                        "monthly_home_equivalent": monthly,
                     },
-                )
+                    "novelty_key": f"charge:{key}",
+                },
             )
-        return out
+            if key not in best or cand[0] > best[key][0]:
+                best[key] = cand
+        return list(best.values())
 
     async def _detect_todoist_project(self, agent_id: str, known: str) -> list[tuple[float, dict]]:
         """Where the work actually goes, with no context on what it is."""
