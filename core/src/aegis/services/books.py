@@ -58,8 +58,12 @@ _INCOME_CATEGORIES = frozenset({"salary", "interest", "refund"})
 
 
 def render_amount(amount: Decimal, currency: str, *, negative: bool = False) -> str:
-    """Journal amount: symbol-prefixed, no digit grouping, ISO suffix otherwise."""
-    q = Decimal(amount).quantize(_CENT)
+    """Journal amount: symbol-prefixed, no digit grouping, ISO suffix otherwise.
+
+    `amount` is a magnitude — the sign comes from `negative` alone, as in
+    `fmt_money`, so a negative input never double-negates.
+    """
+    q = abs(Decimal(amount).quantize(_CENT))
     code = (currency or "").upper()
     sign = "-" if negative else ""
     sym = _SYMBOL.get(code)

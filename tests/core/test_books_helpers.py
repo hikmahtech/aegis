@@ -33,6 +33,9 @@ def test_render_amount_no_grouping():
     assert render_amount(Decimal("10"), "EUR") == "€10.00"
     assert render_amount(Decimal("12"), "SGD") == "12.00 SGD"
     assert render_amount(Decimal("150"), "INR", negative=True) == "-₹150.00"
+    # The amount is a magnitude — the sign is the caller's `negative` flag, never the input.
+    assert render_amount(Decimal("-150"), "INR", negative=True) == "-₹150.00"
+    assert render_amount(Decimal("-150"), "INR") == "₹150.00"
 
 
 def test_fmt_money_is_reexported():
@@ -54,6 +57,8 @@ def test_fmt_money_is_reexported():
         ("professional", "out", "personal", "expenses:unknown"),
         ("salary", "in", "personal", "income:salary"),
         ("salary", "in", "hikmah", "income:hikmah:other"),
+        ("refund", "in", "personal", "income:refunds"),
+        ("refund", "in", "hikmah", "income:hikmah:other"),
         ("other", "out", "personal", "expenses:unknown"),
         (None, "in", "hikmah", "income:hikmah:other"),
         (None, None, "personal", "expenses:unknown"),
