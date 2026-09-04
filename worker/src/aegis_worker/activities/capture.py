@@ -16,7 +16,7 @@ empty title).
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import asyncpg
@@ -29,6 +29,8 @@ from aegis_worker.shared.todoist_write import submit_or_queue
 class CaptureActivities:
     db_pool: asyncpg.Pool | None
     connector: Any  # TodoistConnector at runtime; Any for unit tests
+    # entity -> Todoist project id for books dues (spec §10). Empty = the Inbox.
+    todoist_projects: dict[str, str] = field(default_factory=dict)
 
     @activity.defn
     async def capture_to_inbox(

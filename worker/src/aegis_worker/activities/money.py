@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import html as _html
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from decimal import Decimal
 from typing import Any
@@ -112,6 +112,12 @@ class MoneyActivities:
     # parse_bank_alert_senders. Injected from Settings.bank_alert_senders
     # (admin Integrations page, env AEGIS_BANK_ALERT_SENDERS fallback).
     bank_alert_senders: frozenset[str] = frozenset()
+    # The books (spec §5/§10). `books_cfg` is a BooksConfig; None = disabled.
+    books_cfg: Any = None
+    ignored_mailboxes: frozenset[str] = frozenset()
+    mailbox_entities: dict[str, str] = field(default_factory=dict)
+    capture: Any = None  # CaptureActivities, for dues (set after construction in __main__)
+    home_tz: str = "Asia/Kolkata"
 
     @activity.defn
     async def store_receipt_email(self, msg: dict, account: str) -> str:

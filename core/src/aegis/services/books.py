@@ -174,6 +174,26 @@ def install_deploy_key(settings) -> Path | None:
     return path
 
 
+def parse_csv_set(raw: str) -> frozenset[str]:
+    """`" a, b ,,c"` → `{"a", "b", "c"}`. Blank/None ⇒ empty."""
+    return frozenset(s.strip() for s in (raw or "").split(",") if s.strip())
+
+
+def parse_kv(raw: str) -> dict[str, str]:
+    """`"personal=6h2f, hikmah = 6h2g"` → `{"personal": "6h2f", ...}`.
+
+    Lenient by design: a malformed pair is dropped, never raised — these are
+    admin-typed strings and a typo must not take a boot path down.
+    """
+    out: dict[str, str] = {}
+    for part in (raw or "").split(","):
+        if "=" in part:
+            k, v = part.split("=", 1)
+            if k.strip() and v.strip():
+                out[k.strip()] = v.strip()
+    return out
+
+
 # ----------------------------------------------------------------- block grammar
 
 _INDENT = "    "

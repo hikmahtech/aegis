@@ -354,6 +354,19 @@ class Settings(BaseSettings):
     money_hygiene_fx_rates: dict[str, float] = Field(
         default_factory=lambda: {"USD": 84.5, "EUR": 92.0, "GBP": 108.0, "SGD": 63.0}
     )
+
+    # The books — Maou's hledger journal (spec 2026-09-05-maou-books-design.md §10).
+    # books_repo_url empty ⇒ books disabled: money events are still indexed,
+    # never posted. The three list-ish knobs are strings so the admin
+    # Integrations page can set them (DB-configured, no redeploy).
+    books_path: str = "/app/config/books"
+    books_repo_url: str = ""
+    books_deploy_key: str = ""  # private ed25519 deploy key, PEM or base64 PEM; never logged
+    books_ignored_mailboxes: str = ""  # comma-separated mailbox labels whose money is not ours
+    # "label=entity,..." — mailbox → personal|hikmah; an unlisted mailbox is personal.
+    books_mailbox_entities: str = ""
+    books_todoist_projects: str = ""  # "personal=<todoist project id>,hikmah=<id>" for dues
+
     @model_validator(mode="after")
     def _require_admin_credentials(self) -> "Settings":
         """admin_username/admin_password are required unless auth_disabled."""

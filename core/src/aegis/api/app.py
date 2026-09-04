@@ -66,6 +66,15 @@ async def lifespan(app: FastAPI):
 
     await apply_config_overrides(settings, pool)
 
+    # The books deploy key lands on disk (0600) before anything git-syncs the
+    # checkout. A bad key is a config error, not a boot failure.
+    from aegis.services.books import install_deploy_key
+
+    try:
+        install_deploy_key(settings)
+    except Exception as exc:  # noqa: BLE001 — a bad key must not block boot
+        logger.warning("books_deploy_key_install_failed", error=str(exc)[:200])
+
     from aegis.seed import load_seeds
 
     await load_seeds(pool, settings.seed_dir)
