@@ -490,7 +490,9 @@ class MoneyActivities:
                     raise  # the checkout is gone entirely — index only, below
                 except books.BooksError as exc:
                     activity.logger.warning(
-                        "money_enrich_failed msgid=%s match=%s error=%s — posting its own block",
+                        "money_enrich_failed msgid=%s match=%s error=%s — posting its own "
+                        "block instead; if the matched block does still exist this payment "
+                        "is now a DUPLICATE in the journal, remove one with remove_event",
                         msgid,
                         other,
                         exc,

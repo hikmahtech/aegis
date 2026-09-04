@@ -410,7 +410,7 @@ async def test_store_money_result_marks_version_2(db_pool, tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_receipt_posts_its_own_block_when_the_matched_block_is_gone(db_pool, tmp_path):
+async def test_receipt_posts_its_own_block_when_the_matched_block_is_gone(db_pool, tmp_path, caplog):
     """The index can outlive the journal — a lost unpushed commit, a re-clone, a
     human revert. `find_match` only checks that the row HAS a journal_file, so
     the enrichment then rewrites a block that is not there and `rewrite_event`
@@ -428,12 +428,18 @@ async def test_receipt_posts_its_own_block_when_the_matched_block_is_gone(db_poo
                           channel="receipt", instrument=None, account="expenses:media",
                           parser="apple_receipt", source_class="receipt",
                           occurred_on="2026-09-03", ref=None)
-    r = await ActivityEnvironment().run(
-        act.post_money_event, "rid2", "v2-personal", "m-rcpt", receipt
-    )
+    with caplog.at_level("WARNING", logger="temporalio.activity"):
+        r = await ActivityEnvironment().run(
+            act.post_money_event, "rid2", "v2-personal", "m-rcpt", receipt
+        )
 
     assert r["status"] == "posted" and r["journal_file"] == "personal/2026.journal"
     assert r["linked"] is None
+    # The fallback is the one path that can leave ONE payment in the journal
+    # twice, so the warning has to say so — it is the only thread the weekly
+    # brief's reader has to pull on.
+    logged = " ".join(rec.getMessage() for rec in caplog.records)
+    assert "money_enrich_failed" in logged and "duplicate" in logged.lower()
     assert "2026-09-03 * Apple Music Individual" in journal.read_text()
     # The index says what actually happened: posted, not linked.
     row = await ji.get(db_pool, "v2-personal/m-rcpt")
