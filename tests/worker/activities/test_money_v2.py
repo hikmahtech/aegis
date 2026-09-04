@@ -291,12 +291,12 @@ async def test_payment_closes_its_open_due(db_pool, tmp_path):
 @pytest.mark.asyncio
 async def test_retry_after_a_failed_due_link_does_not_close_twice(db_pool, tmp_path, monkeypatch):
     """The reachable double-close: the Todoist task is completed, then the
-    activity dies before `ji.link` records it, and Temporal retries.
+    activity dies before `ji.mark_due_paid` records it, and Temporal retries.
 
-    A plain "run it twice" would prove nothing — the first run's `ji.link`
-    already takes the due out of `find_open_due`, so the second run skips the
-    close whether or not the short-circuit exists. The crash has to land in
-    the window between the close and the link.
+    A plain "run it twice" would prove nothing — the first run's
+    `mark_due_paid` already takes the due out of `find_open_due`, so the
+    second run skips the close whether or not the short-circuit exists. The
+    crash has to land in the window between the close and that write.
     """
     cfg = _repo(tmp_path)
     capture = AsyncMock()
@@ -312,16 +312,16 @@ async def test_retry_after_a_failed_due_link_does_not_close_twice(db_pool, tmp_p
                        amount="100308.53", channel="imps", occurred_on="2026-09-06",
                        account="equity:transfers")
 
-    real_link = ji.link
+    real_mark = ji.mark_due_paid
     calls = {"n": 0}
 
-    async def flaky_link(pool, a, b):
+    async def flaky_mark(pool, due_msgid, payment_msgid):
         calls["n"] += 1
         if calls["n"] == 1:
             raise RuntimeError("worker died after completing the Todoist task")
-        await real_link(pool, a, b)
+        await real_mark(pool, due_msgid, payment_msgid)
 
-    monkeypatch.setattr("aegis_worker.activities.money.ji.link", flaky_link)
+    monkeypatch.setattr("aegis_worker.activities.money.ji.mark_due_paid", flaky_mark)
     with pytest.raises(RuntimeError):
         await ActivityEnvironment().run(
             act.post_money_event, "rid5", "v2-personal", "m-paid", paid
@@ -332,6 +332,50 @@ async def test_retry_after_a_failed_due_link_does_not_close_twice(db_pool, tmp_p
     assert r["status"] == "posted" and r["journal_file"] == "personal/2026.journal"
     capture.complete_captured_task.assert_awaited_once_with("task-9")
     assert (cfg.path / "personal" / "2026.journal").read_text().count("; msgid:") == 1
+
+
+@pytest.mark.asyncio
+async def test_closing_a_due_keeps_the_payments_own_counterpart_link(db_pool, tmp_path):
+    """The normal credit-card case: the bank alert posts first but its raw
+    payee does not match the due, so the receipt is the email that BOTH links
+    to the bank alert and closes the due. `ji.link` writes both sides, so
+    using it for the close would overwrite the receipt's link to the bank
+    alert while the bank alert still pointed back at the receipt.
+    """
+    cfg = _repo(tmp_path)
+    capture = AsyncMock()
+    capture.complete_captured_task = AsyncMock(return_value=True)
+    act = _act(db_pool, cfg, capture=capture)
+    due = _bank_event(kind="due", due_on="2026-09-07", channel="statement",
+                      payee="Axis credit card XX13", payee_key="axis credit card xx13",
+                      amount="100308.53")
+    await ActivityEnvironment().run(
+        act.post_money_event, "rid1", "v2-personal", "m-due", due, "task-9"
+    )
+    # The bank alert's payee is the card network's descriptor, so find_open_due
+    # misses and the due stays open.
+    bank = _bank_event(payee="AXISCC PMT", payee_key="axiscc pmt", amount="100308.53",
+                       channel="imps", occurred_on="2026-09-06", account="equity:transfers")
+    r1 = await ActivityEnvironment().run(
+        act.post_money_event, "rid2", "v2-personal", "m-bank", bank
+    )
+    assert r1["status"] == "posted" and r1["closed_due"] is None
+    receipt = _bank_event(payee="Axis credit card XX13", payee_key="axis credit card xx13",
+                          amount="100308.53", channel="receipt", instrument=None,
+                          account="equity:transfers", parser="axis_cc_receipt",
+                          source_class="receipt", occurred_on="2026-09-06", ref=None)
+    r2 = await ActivityEnvironment().run(
+        act.post_money_event, "rid3", "v2-personal", "m-rcpt", receipt
+    )
+    assert r2["status"] == "linked"
+    assert r2["linked"] == "v2-personal/m-bank"
+    assert r2["closed_due"] == "v2-personal/m-due"
+    rows = {k: await ji.get(db_pool, f"v2-personal/{k}") for k in ("m-bank", "m-rcpt", "m-due")}
+    # the payment keeps its own counterpart link, and the returned value agrees
+    assert rows["m-rcpt"]["linked_message_id"] == r2["linked"] == "v2-personal/m-bank"
+    assert rows["m-bank"]["linked_message_id"] == "v2-personal/m-rcpt"
+    # and the due points at the payment, so it is out of the open-due pool
+    assert rows["m-due"]["linked_message_id"] == "v2-personal/m-rcpt"
 
 
 @pytest.mark.asyncio

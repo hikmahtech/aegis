@@ -33,6 +33,10 @@ class CaptureActivities:
     connector: Any  # TodoistConnector at runtime; Any for unit tests
     # entity -> Todoist project id for books dues (spec §10). Empty = the Inbox.
     todoist_projects: dict[str, str] = field(default_factory=dict)
+    # "Is this bill overdue?" is a question about the user's day, not UTC's.
+    # Matches MoneyActivities.home_tz; both default rather than reading a
+    # setting, so change them together.
+    home_tz: str = "Asia/Kolkata"
 
     async def _capture(
         self,
@@ -239,7 +243,7 @@ class CaptureActivities:
         ev = MoneyEvent(**{k: v for k, v in event.items() if not k.startswith("_")})
         if ev.kind not in ("due", "failed") or ev.due_on is None or ev.amount is None:
             return None
-        today = datetime.now(ZoneInfo("Asia/Kolkata")).date()
+        today = datetime.now(ZoneInfo(self.home_tz)).date()
         # A day of warning, but never a task that is born overdue.
         due = max(ev.due_on - timedelta(days=1), today)
         prefix = "Fix payment:" if ev.kind == "failed" else "Pay"
@@ -281,8 +285,8 @@ class CaptureActivities:
             # reads temp_id to look up a created id, which this has none of.
             async with self.db_pool.acquire() as conn:
                 await conn.execute(
-                    "INSERT INTO todoist_outbox (temp_id, command, status) VALUES ($1, $2, 'pending') "
-                    "ON CONFLICT (temp_id) DO NOTHING",
+                    "INSERT INTO todoist_outbox (temp_id, command, status) "
+                    "VALUES ($1, $2, 'pending') ON CONFLICT (temp_id) DO NOTHING",
                     cmd["uuid"],
                     cmd,
                 )

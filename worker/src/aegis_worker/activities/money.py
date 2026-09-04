@@ -338,6 +338,13 @@ class MoneyActivities:
         # The mailbox decides the entity, except where a parser recognised a
         # business instrument — that is stronger evidence than which inbox the
         # mail happened to land in.
+        #
+        # SECURITY: only a deterministic parser may reach the `hikmah` branch.
+        # That holds because `_LLM_EVENT_FIELDS` in `aegis/llm/__init__.py`
+        # does NOT include `entity`, so an extraction can never carry one. If
+        # that allowlist ever gains `entity`, this guard stops being a guard
+        # and mail whose body says "this is a Hikmah invoice" routes itself
+        # into the business books.
         if ev.entity != "hikmah":
             ev.entity = self.mailbox_entities.get(mailbox, "personal")  # type: ignore[assignment]
         rule = books.apply_rules(self._rules(), sender, ev.payee)
@@ -490,11 +497,14 @@ class MoneyActivities:
                 closed = True
                 if self.capture is not None:
                     closed = await self.capture.complete_captured_task(due["todoist_ref"])
-                # Only link once the task is actually closed — linking is what
-                # takes the due out of find_open_due, so linking on a failed
-                # close would strand an open Todoist task nothing revisits.
+                # Only mark it paid once the task is actually closed — that is
+                # what takes the due out of find_open_due, so marking on a
+                # failed close would strand an open Todoist task nothing
+                # revisits. `mark_due_paid`, not `link`: this payment may
+                # already be linked to its own bank/receipt counterpart, and
+                # `link` writes both sides, which would overwrite that.
                 if closed:
-                    await ji.link(self.db_pool, due["message_id"], msgid)
+                    await ji.mark_due_paid(self.db_pool, due["message_id"], msgid)
                     result["closed_due"] = due["message_id"]
         activity.logger.info(
             "money_event_routed receipt=%s msgid=%s status=%s linked=%s closed_due=%s",

@@ -64,6 +64,24 @@ async def get(pool: Any, msgid: str) -> dict | None:
 
 
 async def find_match(pool: Any, event: MoneyEvent, exclude_msgid: str) -> dict | None:
+    """The bank alert / vendor receipt pair for one payment (spec §5.4), or None.
+
+    Two predicates beyond the obvious class/amount/currency/date matching, both
+    of which the caller depends on:
+
+    `entity = $8` — matching is otherwise entity-blind, so two unrelated ₹100
+    UPI payments three days apart would link, and a hikmah receipt could link
+    to a personal bank alert, after which the enrichment writes an
+    `expenses:hikmah:*` account into `personal/2026.journal`. A genuine
+    cross-entity payment is rare and is better left as two postings than
+    silently merged into the wrong book.
+
+    `journal_file IS NOT NULL` — the caller enriches a match by rewriting its
+    journal block, so a row without one is not a candidate. Rows indexed while
+    the books were disabled have no block; returning one made
+    `books.rewrite_event` raise `BooksError("no journal block carries msgid …")`,
+    which the caller does not catch, and the activity then retried forever.
+    """
     opposite = {"bank": "receipt", "receipt": "bank"}.get(event.source_class)
     if opposite is None or event.amount is None or event.occurred_on is None or not event.currency:
         return None
@@ -71,14 +89,15 @@ async def find_match(pool: Any, event: MoneyEvent, exclude_msgid: str) -> dict |
         """
         SELECT * FROM finance.journal_index
         WHERE kind = 'transaction' AND source_class = $1 AND currency = $2 AND amount = $3
-          AND occurred_on BETWEEN $4 AND $5 AND linked_message_id IS NULL AND message_id <> $6
+          AND entity = $8 AND occurred_on BETWEEN $4 AND $5
+          AND linked_message_id IS NULL AND journal_file IS NOT NULL AND message_id <> $6
         ORDER BY abs(occurred_on - $7::date) ASC, created_at ASC
         LIMIT 1
         """,
         opposite, event.currency, event.amount,
         event.occurred_on - timedelta(days=_MATCH_DAYS),
         event.occurred_on + timedelta(days=_MATCH_DAYS),
-        exclude_msgid, event.occurred_on,
+        exclude_msgid, event.occurred_on, event.entity,
     )
     return dict(row) if row else None
 
@@ -89,6 +108,24 @@ async def link(pool: Any, a: str, b: str) -> None:
         "SET linked_message_id = CASE message_id WHEN $1 THEN $2 ELSE $1 END, updated_at = now() "
         "WHERE message_id IN ($1, $2)",
         a, b,
+    )
+
+
+async def mark_due_paid(pool: Any, due_msgid: str, payment_msgid: str) -> None:
+    """Close a due by pointing it at the payment — ONE row, unlike `link`.
+
+    `link` writes both sides, which is wrong here: the paying transaction
+    usually has a counterpart of its own (a card bill payment arrives as both
+    a bank alert and a receipt), and overwriting its `linked_message_id` with
+    the due leaves the counterpart pointing back at a row that no longer
+    points at it, and the caller's returned `linked` disagreeing with the row.
+    The due → payment direction is all `find_open_due` needs to stop
+    re-offering a due that has been paid.
+    """
+    await pool.execute(
+        "UPDATE finance.journal_index SET linked_message_id = $2, updated_at = now() "
+        "WHERE message_id = $1",
+        due_msgid, payment_msgid,
     )
 
 
