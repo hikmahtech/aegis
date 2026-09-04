@@ -216,6 +216,42 @@ async def test_notify_renewal_alert_sends_str_to_maou():
 
 
 @pytest.mark.asyncio
+async def test_notify_renewal_alert_escapes_the_currency_code():
+    """The currency code is LLM-extracted, same threat model as vendor_name, and
+    reaches a parse_mode=HTML body through fmt_money's ISO-suffix branch."""
+    captured: list[dict] = []
+
+    async def fake_send(*, agent_id, message, chat_id=0, keyboard=None):
+        captured.append({"text": message, "chat_id": chat_id, "agent_id": agent_id})
+        return {"ok": True, "message_id": 1, "chat_id": -1, "topic_id": 2756, "used_html": True}
+
+    delivery = AsyncMock()
+    delivery.channel = "slack"
+    delivery.send_message = fake_send
+    act = MoneyActivities(
+        db_pool=None, llm=None, delivery=delivery, fx_rates={"USD": 84.5}, home_currency="INR"
+    )
+    await act.notify_renewal_alert(
+        {
+            "vendor_name": "Namecheap",
+            "category": "domain",
+            "currency": "<b>x</b>",
+            "account": "personal",
+            "threshold_days": 14,
+            "amount_cents": 1299,
+            "monthly_home_equivalent": 91.45,
+            "days_left": 12,
+            "next_due_at": "2026-06-06T00:00:00",
+        }
+    )
+    assert len(captured) == 1
+    # fmt_money upper-cases the ISO code, so the markup arrives as <B>X</B>.
+    assert "&lt;B&gt;X&lt;/B&gt;" in captured[0]["text"]
+    assert "<B>X</B>" not in captured[0]["text"]
+    assert "<b>x</b>" not in captured[0]["text"]
+
+
+@pytest.mark.asyncio
 async def test_notify_subscription_digest_sends_message(db_pool):
     delivery = AsyncMock()
     delivery.channel = "slack"

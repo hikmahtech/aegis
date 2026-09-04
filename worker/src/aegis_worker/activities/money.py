@@ -543,7 +543,11 @@ class MoneyActivities:
         vendor = _html.escape(str(alert.get("vendor_name", "")))
         category = _html.escape(str(alert.get("category", "")))
         account = _html.escape(str(alert.get("account", "")))
-        amount = fmt_money(Decimal(alert["amount_cents"]) / 100, alert.get("currency") or "")
+        # Escape the rendered amount, not just the fields: fmt_money's ISO-suffix
+        # branch carries the LLM-extracted currency code into the body verbatim.
+        amount = _html.escape(
+            fmt_money(Decimal(alert["amount_cents"]) / 100, alert.get("currency") or "")
+        )
         title = f"[RENEWAL][{threshold}d] {vendor}"
         body = (
             f"<b>{vendor}</b> ({category})\n"
@@ -584,8 +588,13 @@ class MoneyActivities:
         vendor = _html.escape(str(cancellation.get("vendor_name") or "subscription"))
         cadence = _html.escape(str(cancellation.get("cadence") or ""))
         account = _html.escape(str(cancellation.get("account") or ""))
-        amount = fmt_money(
-            Decimal(cancellation.get("amount_cents") or 0) / 100, cancellation.get("currency") or ""
+        # Escape the rendered amount, not just the fields: fmt_money's ISO-suffix
+        # branch carries the LLM-extracted currency code into the body verbatim.
+        amount = _html.escape(
+            fmt_money(
+                Decimal(cancellation.get("amount_cents") or 0) / 100,
+                cancellation.get("currency") or "",
+            )
         )
         last_seen = cancellation.get("last_seen_at")
         last_date = str(last_seen)[:10] if last_seen else "unknown"
