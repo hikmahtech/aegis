@@ -81,7 +81,12 @@ def render_amount(amount: Decimal, currency: str, *, negative: bool = False) -> 
     `fmt_money`, so a negative input never double-negates.
     """
     q = abs(Decimal(amount).quantize(_CENT))
-    code = (currency or "").upper()
+    # Letters only, capped at 3. `currency` is model-supplied
+    # (`_LLM_EVENT_FIELDS`) and lands on the posting line, so a newline in it
+    # used to add an attacker-chosen comment line INSIDE a committed block.
+    # `MoneyEvent` validates it too, but this module is public and a direct
+    # caller never passes through the model — the writer is the last gate.
+    code = re.sub(r"[^A-Za-z]", "", currency or "")[:3].upper()
     sign = "-" if negative else ""
     sym = _SYMBOL.get(code)
     return f"{sign}{sym}{q}" if sym else f"{sign}{q} {code}".strip()
@@ -209,8 +214,16 @@ _TAG_MAX = 80
 _POSTING_RE = re.compile(r"^    (\S+)(?:\s{2,}(\S.*))?$")
 
 
+# Every C0 control and DEL. Three of them each break a different thing: a
+# newline starts a new line, a TAB is folded into an account name and makes the
+# transaction unbalanced (measured on hledger 1.52.3 — it does NOT separate
+# account from amount), and a NUL reaches subprocess as `ValueError: embedded
+# null byte`, which is not an OSError and so escapes `_spawn`'s guard.
+_CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]+")
+
+
 def sanitize_payee(payee: str) -> str:
-    text = re.sub(r"[;|\r\n]+", " ", payee or "")
+    text = re.sub(r"[;|]+", " ", _CONTROL_RE.sub(" ", payee or ""))
     text = re.sub(r"\s+", " ", text).strip()
     return text[:_PAYEE_MAX] or "unknown"
 
@@ -231,7 +244,7 @@ def sanitize_tag(value: str | None) -> str:
     inside a value does not become a tag, and refs like `UTR:1234` stay whole.
     The cap bounds what a hostile value can push onto the line.
     """
-    text = re.sub(r"[;,\r\n]+", " ", value or "")
+    text = re.sub(r"[;,]+", " ", _CONTROL_RE.sub(" ", value or ""))
     text = re.sub(r"\s+", " ", text).strip()
     return text[:_TAG_MAX].strip()
 
@@ -239,9 +252,11 @@ def sanitize_tag(value: str | None) -> str:
 def _safe_account(account: str) -> str:
     """An account name that cannot break out of its posting line. hledger ends
     an account at two spaces, a `;` or the line, so any of those inside one
-    would split the posting or open a new block. Accounts are chart-checked
-    before they get here; this is the writer refusing to be the only gate."""
-    return re.sub(r"\s{2,}", " ", re.sub(r"[;\r\n]+", " ", account or "")).strip()
+    would split the posting or open a new block; a control character breaks it
+    differently (see `_CONTROL_RE`). Accounts are chart-checked before they get
+    here; this is the writer refusing to be the only gate."""
+    text = re.sub(r"[;]+", " ", _CONTROL_RE.sub(" ", account or ""))
+    return re.sub(r"\s{2,}", " ", text).strip()
 
 
 def _posting(account: str, amount: str = "") -> str:
@@ -501,6 +516,11 @@ def _revert_sync(cfg: BooksConfig, paths: list[str]) -> None:
     targets = _git_paths(cfg, paths, on_disk_only=True)
     if not targets:
         return
+    # Unstage first. A write can fail AFTER `git add` (the commit itself), and
+    # `git checkout -- <path>` restores from the INDEX, so a staged bad version
+    # would be "restored" straight back into the working copy. Reset also makes
+    # a newly-added file untracked again, so the `clean` below can remove it.
+    _run(["git", "reset", "-q", "HEAD", "--", *targets], cfg, check=False)
     # One checkout per path: git aborts the WHOLE command when any pathspec
     # names an untracked file, reverting nothing, so a new year's journal in
     # the list would silently protect every other path from being restored.
@@ -576,10 +596,19 @@ def _write_sync(
         try:
             mutate()
             _check_sync(cfg)
+            # Inside the try: the commit can fail too, and leaving a staged
+            # working copy behind breaks `BooksError`'s contract — the next
+            # write's `git add` would sweep the failed one into its commit.
+            _commit_push_sync(cfg, summary, paths)
+        except ValueError as exc:
+            # A NUL byte in a path or an argv entry raises ValueError, not
+            # OSError, so it is not one of the escapes `_spawn` closes. It
+            # escaped raw, from the COMMIT, with the change already staged.
+            _revert_sync(cfg, paths)
+            raise BooksError(f"books write failed: {exc}") from exc
         except Exception:
             _revert_sync(cfg, paths)
             raise
-        _commit_push_sync(cfg, summary, paths)
 
 
 async def _write(

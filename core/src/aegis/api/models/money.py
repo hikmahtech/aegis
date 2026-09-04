@@ -35,6 +35,9 @@ class ReceiptExtraction(BaseModel):
 
 
 _KEY_RE = re.compile(r"[^a-z0-9]+")
+# Journal syntax plus every C0 control and DEL — mirrors `books._CONTROL_RE`
+# (a NUL crashes subprocess, a tab and a newline break a posting line).
+_JOURNAL_UNSAFE = re.compile(r"[\x00-\x1f\x7f;,]+")
 
 
 def payee_key(payee: str) -> str:
@@ -82,4 +85,22 @@ class MoneyEvent(BaseModel):
         (`_LLM_EVENT_FIELDS`), so journal syntax is stripped at the boundary
         too. Defence in depth only — `books.sanitize_tag` is the gate that has
         to hold, because a value can reach the writer without passing here."""
-        return re.sub(r"\s+", " ", re.sub(r"[;,\r\n]+", " ", v)).strip() if v else v
+        return re.sub(r"\s+", " ", _JOURNAL_UNSAFE.sub(" ", v)).strip() if v else v
+
+    @field_validator("currency", mode="after")
+    @classmethod
+    def _iso_4217(cls, v: str | None) -> str | None:
+        """Three ASCII letters, uppercased, or nothing. `currency` is
+        model-supplied too and reaches the POSTING line through
+        `render_amount`, where a newline in it used to open an
+        attacker-chosen comment line inside the block.
+
+        ISO-4217 is the whole vocabulary and `books._SYMBOL` is keyed on
+        exactly that, so anything else is coerced to `""` rather than raised:
+        one poisoned extraction degrades that item — the event becomes
+        unpostable and the weekly sweep keeps re-driving it — instead of
+        failing the whole batch of emails around it."""
+        if not v:
+            return v
+        code = v.strip().upper()
+        return code if len(code) == 3 and code.isascii() and code.isalpha() else ""

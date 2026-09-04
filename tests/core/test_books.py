@@ -50,6 +50,7 @@ HOSTILE_INSTRUMENT = (
     "    assets:bank:hdfc:1225\n"
     "\n2026-09-02 * decoy"
 )
+HOSTILE_CURRENCY = "₹\n    ; hijacked: true"
 HEADER = "; Personal transactions, 2026.\n"
 # Exactly 39 chars: one short of the 40-column pad, so `:<40` leaves a SINGLE
 # space before the amount and hledger reads the whole thing as an account name.
@@ -99,6 +100,18 @@ def test_sanitize_tag_strips_journal_syntax():
     assert len(books.sanitize_tag("x" * 200)) == 80
     hostile = books.sanitize_tag(HOSTILE_INSTRUMENT)
     assert not set(hostile) & set(";,\r\n")
+
+
+def test_safe_account_strips_a_lone_tab():
+    """Measured against hledger 1.52.3: a lone tab does NOT separate an account
+    from its amount — hledger folds the amount into the account name and the
+    transaction comes out unbalanced ("There can't be more than one real
+    posting with no amount"). So a tab anywhere in an account breaks the write
+    rather than injecting one; it is stripped with the rest of the controls."""
+    assert books._safe_account("expenses:a\tb") == "expenses:a b"
+    assert books._safe_account("expenses:a\x00b") == "expenses:a b"
+    line = books._posting("expenses:a\tb", "₹10.00")
+    assert "\t" not in line and line.startswith("    expenses:a b") and line.endswith("₹10.00")
 
 
 def test_append_and_find_block():
@@ -503,6 +516,71 @@ def test_missing_checkout_without_repo_url_is_disabled(tmp_path):
     cfg = books.BooksConfig(path=tmp_path / "nowhere")
     with pytest.raises(books.BooksDisabled):
         books.ensure_checkout_sync(cfg)
+
+
+@pytest.mark.skipif(not HAS_HLEDGER, reason="hledger/git not installed")
+@pytest.mark.asyncio
+async def test_hostile_currency_cannot_forge_a_tag(tmp_path):
+    """`currency` is the same hole as `instrument`, one field over: it is in
+    `_LLM_EVENT_FIELDS` and `render_amount` used to interpolate it raw into the
+    posting line, so a newline landed an attacker-chosen `; hijacked: true`
+    inside a committed block with `check --strict` clean.
+
+    `model_copy` skips validators on purpose here — this test is about the
+    WRITER, which has to hold for a caller that never passed through
+    `MoneyEvent` at all. The model gate is tested separately.
+    """
+    cfg = _repo(tmp_path)
+    await books.post_event(EV_OUT, "arshad-personal/clean", cfg)
+    hostile = EV_OUT.model_copy(update={"currency": HOSTILE_CURRENCY})
+
+    raised = False
+    try:
+        await books.post_event(hostile, "arshad-personal/hostilecur", cfg)
+    except books.BooksCheckError:
+        # Sanitized, the code is three inert letters — an UNDECLARED commodity,
+        # so the strict check rejects the write and it reverts. The poisoned
+        # event never reaches the journal at all.
+        raised = True
+
+    text = (cfg.path / "personal" / "2026.journal").read_text()
+    assert "hijacked" not in text.lower(), text
+    assert sum(1 for ln in text.splitlines() if ln[:1].isdigit()) == 1
+    assert text.count("; msgid:") == 1
+    # hledger's own view, not just the file text: no invented tag.
+    assert set((await books.run_hledger(["tags"], cfg)).split()) == {
+        "channel", "instrument", "msgid", "ref"
+    }
+    await books.run_hledger(["check", "--strict"], cfg)  # raises if the file is broken
+    assert raised and _commits(cfg) == 2
+
+
+@pytest.mark.skipif(not HAS_HLEDGER, reason="hledger/git not installed")
+@pytest.mark.asyncio
+async def test_a_null_byte_reverts_and_raises_a_books_error(tmp_path):
+    """A NUL reaches subprocess as `ValueError: embedded null byte`, not
+    `OSError`, so it slips past `_spawn`'s guard and escapes raw — and it
+    escapes from the COMMIT, after `git add`, leaving the checkout
+    staged-dirty. Every books failure must leave the working copy clean.
+
+    The rules file is the honest probe: it is the one write hledger never
+    reads, so `check --strict` cannot reject the file first and mask the
+    commit. A NUL in a journal-bound field is caught earlier by the strict
+    account check, which is why that variant proves nothing here.
+    """
+    cfg = _repo(tmp_path)
+    await books.post_event(EV_OUT, "m/nul", cfg)
+    rules = cfg.path / "rules" / "accounts.yaml"
+
+    with pytest.raises(books.BooksError, match="null"):
+        await books.append_rule({"match": "corner\x00store", "account": "expenses:groceries"}, cfg)
+
+    assert not rules.exists(), "the half-written rules file survived the failure"
+    staged = subprocess.run(
+        ["git", "diff", "--cached", "--name-only"], cwd=cfg.path, capture_output=True, text=True
+    ).stdout.strip()
+    assert staged == "", f"left staged: {staged}"
+    assert _commits(cfg) == 2
 
 
 @pytest.mark.skipif(not HAS_HLEDGER, reason="hledger/git not installed")

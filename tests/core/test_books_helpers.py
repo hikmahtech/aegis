@@ -82,3 +82,39 @@ def test_instrument_account():
     assert instrument_account("axis-upi", declared) == "assets:unknown"
     assert instrument_account(None) == "assets:unknown"
     assert instrument_account("") == "assets:unknown"
+
+
+HOSTILE_CURRENCY = "\u20b9\n    ; hijacked: true"
+
+
+def _currency(value):
+    return MoneyEvent(kind="transaction", currency=value).currency
+
+
+def test_currency_accepts_only_iso_4217_codes():
+    """`currency` is in `_LLM_EVENT_FIELDS`, so a steered email chooses it, and
+    it reaches a posting line through `render_amount`. ISO-4217 is the whole
+    vocabulary and `_SYMBOL` is keyed on exactly that, so anything else is
+    coerced to "" — one bad extraction degrades that item rather than failing
+    the whole batch."""
+    assert _currency("USD") == "USD"
+    assert _currency("inr") == "INR"
+    assert _currency(" gbp ") == "GBP"
+    assert _currency("") == ""
+    assert _currency(None) is None
+    assert _currency(HOSTILE_CURRENCY) == ""
+    for bad in ("US", "USDD", "US1", "\u20b9", "US-"):
+        assert _currency(bad) == "", bad
+
+
+def test_render_amount_cannot_be_injected_through_the_currency_code():
+    """The writer is the last gate: `books.py` is a public service module, so a
+    caller that never passed through `MoneyEvent` must not be able to put a
+    second line on the posting either. Letters only, capped at 3."""
+    out = render_amount(Decimal("10"), HOSTILE_CURRENCY)
+    assert "\n" not in out and ";" not in out
+    assert out == "10.00 HIJ"
+    # ...and the legitimate codes are untouched.
+    assert render_amount(Decimal("10"), "inr") == "\u20b910.00"
+    assert render_amount(Decimal("10"), "") == "10.00"
+    assert render_amount(Decimal("10"), "USD", negative=True) == "-$10.00"
