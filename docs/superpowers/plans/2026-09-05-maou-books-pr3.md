@@ -807,4 +807,323 @@ git add -A
 git commit -m "refactor(money): delete the v1 subscription tracker, extractor and renewal machinery"
 ```
 
-<!-- CONTINUED IN TASK 4 -->
+### Task 4: The four ledger tools
+
+**Files:**
+- Create: `core/src/aegis/services/tools/ledger.py`
+- Modify: `core/src/aegis/services/chat.py` — five single-line hunks: the import block (`from aegis.services.tools.ledger import _exec_ledger_add_rule, _exec_ledger_post, _exec_ledger_query, _exec_ledger_reclassify  # noqa: F401`), four `_registry_schema("ledger_…")` entries in `CHAT_TOOLS` after `_registry_schema("find_reference")`, four `TOOL_EXECUTORS` entries after `"comment_on_task": _exec_comment_on_task,`, `AGENT_TOOL_SETS["maou"]` gains the four names, `AGENT_TOOL_SETS["sebas"]` gains `"ledger_query"`
+- Modify: `core/src/aegis/api/routes/mcp_server.py` — `_UNSERVED_TOOLS` gains `"ledger_post"`, `"ledger_reclassify"`, `"ledger_add_rule"` with a one-line comment ("a coding run has no business in the books")
+- Modify: `config/seed/agents.yaml` — maou `tool_set` gains the four, sebas gains `ledger_query`
+- Test: `tests/core/test_ledger_tools.py`
+
+**Interfaces (`@aegis_tool`, convention `(pool, ctx, *, …) -> str`):**
+
+```python
+async def _exec_ledger_query(pool, ctx, *, command: str, args: list[str] | None = None,
+                             output: Literal["text", "json", "csv"] = "text") -> str
+    """Run a read-only hledger report over the books.
+
+    Args:
+        command: hledger subcommand: bal, reg, is, bs, cf, print, accounts, payees, tags, stats, activity, aregister.
+        args: extra hledger arguments, e.g. ["-X", "₹", "-p", "thismonth", "expenses", "--depth", "2"].
+        output: text (default), json or csv.
+    """
+async def _exec_ledger_post(pool, ctx, *, date: str, payee: str, postings: list[dict], entity: str = "personal", note: str = "") -> str
+    """Record a transaction in the books by hand. Each posting is {"account": ..., "amount": ..., "currency": ...}; at most one posting may omit the amount.
+
+    Args:
+        date: YYYY-MM-DD.
+        payee: who was paid or who paid.
+        postings: two or more postings; amounts in major units.
+        entity: personal or hikmah — which set of books.
+        note: optional free text stored as a `note:` tag.
+    """
+async def _exec_ledger_reclassify(pool, ctx, *, message_id: str, account: str, payee: str | None = None) -> str
+    """Move a posting to another account (and optionally rename its payee) by its books message id (`<mailbox>/<gmail id>` or `manual/<uuid>`).
+
+    Args:
+        message_id: the msgid tag of the transaction.
+        account: a declared account, e.g. expenses:groceries.
+        payee: new display name, optional.
+    """
+async def _exec_ledger_add_rule(pool, ctx, *, match: str, account: str, entity: str | None = None, payee: str | None = None, apply: bool = True) -> str
+    """Add a payee → account rule to the books and reclassify matching unexplained postings.
+
+    Args:
+        match: case-insensitive regex tested against "<sender> | <payee>".
+        account: a declared account.
+        entity: personal or hikmah, optional.
+        payee: canonical display name, optional.
+        apply: also reclassify existing postings in an unknown account that match (default true).
+    """
+```
+
+Behaviour: `cfg = books.config_from_settings(ctx.settings)`; every `BooksError` becomes a return string starting `error: `. `ledger_query` delegates to `books.run_hledger([command, *args], cfg, output_format=output)`. `ledger_post`: validate the date, at least two postings, at most one without amount, every account in `hledger accounts --declared`, `entity in ("personal", "hikmah")`; build a `MoneyEvent(kind="transaction", channel="manual", parser="manual", …)` for the two-posting case (posting 1 = category with signed amount, posting 2 = instrument) and `books.post_event(ev, f"manual/{uuid4()}", cfg)`; for more than two postings render a multi-posting block directly via a small `books.render_manual(date, payee, postings, msgid, note)` (add it: same header lines, one posting line per entry, amounts via `render_amount`) and a new `books.post_block(block, entity, d, msgid, cfg)` that appends it under the same lock/check/commit protocol; index via `journal_index.upsert` with `parser="manual"`. `ledger_reclassify`: account must be declared; `books.rewrite_event(message_id, cfg, account=account, payee=payee)`; `UPDATE finance.journal_index SET account=$2, payee=COALESCE($3, payee), updated_at=now() WHERE message_id=$1`. `ledger_add_rule`: `re.compile(match)` must succeed, account declared; `books.append_rule({...})`; when `apply`: for each index row with `kind='transaction' AND account LIKE '%:unknown' AND journal_file IS NOT NULL` whose `"<mailbox-sender> | <payee>"` matches (the sender is not in the index — match against `payee` only, and say so in the return text), `rewrite_event(account=…, payee=payee)` + index update; return `"rule added; reclassified N postings"`.
+
+- [ ] **Step 1: Write the failing tests**
+
+```python
+# tests/core/test_ledger_tools.py
+from __future__ import annotations
+
+import shutil
+import subprocess
+from datetime import date
+from decimal import Decimal
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+import pytest_asyncio
+from aegis.api.models.money import MoneyEvent
+from aegis.services import books, journal_index as ji
+from aegis.services.chat import (
+    _exec_ledger_add_rule,
+    _exec_ledger_post,
+    _exec_ledger_query,
+    _exec_ledger_reclassify,
+)
+from aegis.services.tools.base import ToolContext
+
+HAS_HLEDGER = shutil.which("hledger") is not None and shutil.which("git") is not None
+pytestmark = pytest.mark.skipif(not HAS_HLEDGER, reason="hledger/git not installed")
+
+ACCOUNTS = """commodity ₹ 1,00,000.00
+account assets:bank:hdfc:1225
+account assets:unknown
+account expenses:unknown
+account expenses:groceries
+account expenses:saas
+account income:unknown
+"""
+
+
+def _repo(tmp_path: Path) -> books.BooksConfig:
+    root = tmp_path / "books"
+    (root / "personal").mkdir(parents=True)
+    (root / "hikmah").mkdir()
+    (root / "rules").mkdir()
+    (root / "accounts.journal").write_text(ACCOUNTS)
+    (root / "prices.journal").write_text("")
+    (root / "recurring.journal").write_text("")
+    (root / "rules" / "accounts.yaml").write_text("")
+    (root / "personal" / "2026.journal").write_text("; p\n")
+    (root / "hikmah" / "2026.journal").write_text("; h\n")
+    (root / "main.journal").write_text(
+        "include accounts.journal\ninclude prices.journal\ninclude personal/2026.journal\n"
+        "include hikmah/2026.journal\ninclude recurring.journal\n"
+    )
+    subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+    subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", "add", "-A"], cwd=root, check=True)
+    subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "init"], cwd=root, check=True)
+    return books.BooksConfig(path=root)
+
+
+def _ctx(cfg: books.BooksConfig) -> ToolContext:
+    return ToolContext(agent_id="maou", settings=SimpleNamespace(books_path=str(cfg.path), books_repo_url="", gmail_token_dir=str(cfg.path)))
+
+
+@pytest_asyncio.fixture(autouse=True)
+async def _clean(db_pool):
+    await db_pool.execute("DELETE FROM finance.journal_index WHERE mailbox IN ('tool-t', 'manual')")
+    yield
+    await db_pool.execute("DELETE FROM finance.journal_index WHERE mailbox IN ('tool-t', 'manual')")
+
+
+@pytest.mark.asyncio
+async def test_query_runs_whitelisted_reports_and_refuses_others(db_pool, tmp_path):
+    cfg = _repo(tmp_path)
+    ctx = _ctx(cfg)
+    out = await _exec_ledger_query(db_pool, {"command": "accounts", "args": ["--declared"]}, ctx)
+    assert "expenses:groceries" in out
+    out = await _exec_ledger_query(db_pool, {"command": "import", "args": ["x.csv"]}, ctx)
+    assert out.startswith("error:")
+    out = await _exec_ledger_query(db_pool, {"command": "bal", "args": ["-f", "/etc/passwd"]}, ctx)
+    assert out.startswith("error:")
+
+
+@pytest.mark.asyncio
+async def test_post_two_postings_then_reclassify(db_pool, tmp_path):
+    cfg = _repo(tmp_path)
+    ctx = _ctx(cfg)
+    out = await _exec_ledger_post(db_pool, {
+        "date": "2026-09-03", "payee": "Corner Store",
+        "postings": [{"account": "expenses:unknown", "amount": "245.50", "currency": "INR"}, {"account": "assets:bank:hdfc:1225"}],
+    }, ctx)
+    assert out.startswith("posted manual/")
+    msgid = out.split()[1]
+    text = (cfg.path / "personal" / "2026.journal").read_text()
+    assert "2026-09-03 * Corner Store" in text and f"; msgid: {msgid}" in text and "channel: manual" in text
+    row = await ji.get(db_pool, msgid)
+    assert row["parser"] == "manual" and row["amount"] == Decimal("245.50")
+
+    out = await _exec_ledger_reclassify(db_pool, {"message_id": msgid, "account": "expenses:groceries"}, ctx)
+    assert out.startswith("reclassified")
+    assert "    expenses:groceries                      ₹245.50\n" in (cfg.path / "personal" / "2026.journal").read_text()
+    assert (await ji.get(db_pool, msgid))["account"] == "expenses:groceries"
+
+    out = await _exec_ledger_reclassify(db_pool, {"message_id": msgid, "account": "expenses:nope"}, ctx)
+    assert out.startswith("error:") and "not declared" in out
+
+
+@pytest.mark.asyncio
+async def test_post_validation(db_pool, tmp_path):
+    ctx = _ctx(_repo(tmp_path))
+    bad = [
+        {"date": "2026/09/03", "payee": "x", "postings": [{"account": "expenses:unknown", "amount": "1", "currency": "INR"}, {"account": "assets:unknown"}]},
+        {"date": "2026-09-03", "payee": "x", "postings": [{"account": "expenses:unknown", "amount": "1", "currency": "INR"}]},
+        {"date": "2026-09-03", "payee": "x", "postings": [{"account": "expenses:unknown"}, {"account": "assets:unknown"}]},
+        {"date": "2026-09-03", "payee": "x", "postings": [{"account": "expenses:zzz", "amount": "1", "currency": "INR"}, {"account": "assets:unknown"}]},
+        {"date": "2026-09-03", "payee": "x", "entity": "other", "postings": [{"account": "expenses:unknown", "amount": "1", "currency": "INR"}, {"account": "assets:unknown"}]},
+    ]
+    for args in bad:
+        assert (await _exec_ledger_post(db_pool, args, ctx)).startswith("error:"), args
+
+
+@pytest.mark.asyncio
+async def test_add_rule_applies_to_unknown_postings(db_pool, tmp_path):
+    cfg = _repo(tmp_path)
+    ctx = _ctx(cfg)
+    ev = MoneyEvent(kind="transaction", direction="out", amount=Decimal("10"), currency="INR", payee="Jai shree nakoda",
+                    payee_key="jai shree nakoda", channel="upi", instrument="hdfc-1225", occurred_on=date(2026, 9, 2),
+                    entity="personal", account="expenses:unknown", parser="hdfc_upi", source_class="bank")
+    await books.post_event(ev, "tool-t/a", cfg)
+    await ji.upsert(db_pool, "tool-t/a", "tool-t", ev, journal_file="personal/2026.journal")
+    out = await _exec_ledger_add_rule(db_pool, {"match": "jai shree", "account": "expenses:groceries", "payee": "Jai Shree Stores"}, ctx)
+    assert out == "rule added; reclassified 1 postings"
+    rules = books.load_rules(cfg.path / "rules" / "accounts.yaml")
+    assert rules[-1] == {"match": "jai shree", "account": "expenses:groceries", "payee": "Jai Shree Stores"}
+    text = (cfg.path / "personal" / "2026.journal").read_text()
+    assert "* Jai Shree Stores" in text and "expenses:groceries" in text
+    assert (await ji.get(db_pool, "tool-t/a"))["account"] == "expenses:groceries"
+    assert (await _exec_ledger_add_rule(db_pool, {"match": "(", "account": "expenses:groceries"}, ctx)).startswith("error:")
+    assert (await _exec_ledger_add_rule(db_pool, {"match": "x", "account": "expenses:nope"}, ctx)).startswith("error:")
+
+
+def test_tools_are_registered_and_gated():
+    from aegis.api.routes.mcp_server import _UNSERVED_TOOLS
+    from aegis.services.chat import AGENT_TOOL_SETS, CHAT_TOOLS, TOOL_EXECUTORS
+
+    names = {t["function"]["name"] for t in CHAT_TOOLS}
+    for n in ("ledger_query", "ledger_post", "ledger_reclassify", "ledger_add_rule"):
+        assert n in names and n in TOOL_EXECUTORS and n in AGENT_TOOL_SETS["maou"]
+    assert "ledger_query" in AGENT_TOOL_SETS["sebas"]
+    assert {"ledger_post", "ledger_reclassify", "ledger_add_rule"} <= _UNSERVED_TOOLS
+    assert "ledger_query" not in _UNSERVED_TOOLS
+```
+
+- [ ] **Step 2: Run to verify failure** — ImportError from `aegis.services.chat`.
+
+- [ ] **Step 3: Implement `tools/ledger.py`** — following the interfaces above, with `from aegis.services.tools.registry import aegis_tool`, `from aegis.services.tools.base import ToolContext`, `from aegis.services import books, journal_index as ji`. Add to `books.py`:
+
+```python
+def render_manual(d: date, payee: str, postings: list[dict], msgid: str, note: str = "") -> str:
+    tags = "channel: manual" + (f", note: {sanitize_payee(note)}" if note else "")
+    lines = [f"{d.isoformat()} * {sanitize_payee(payee)}", f"{_INDENT}; msgid: {msgid}", f"{_INDENT}; {tags}"]
+    for p in postings:
+        amt = render_amount(Decimal(str(p["amount"])), p.get("currency") or "INR") if p.get("amount") not in (None, "") else ""
+        lines.append(_posting(p["account"], amt))
+    return "\n".join(lines) + "\n"
+
+
+async def post_block(block: str, entity: str, d: date, msgid: str, cfg: BooksConfig) -> str:
+    rel = journal_rel(entity, d)
+
+    def mutate() -> None:
+        path = _ensure_journal_file(cfg, rel)
+        text = path.read_text()
+        if find_block(text, msgid):
+            return
+        path.write_text(append_block(text, block))
+
+    await _write(cfg, f"post {entity} {d} manual", mutate)
+    return rel
+```
+
+`ledger_post` always uses `render_manual` + `post_block` (two or more postings alike) and indexes the first amount-bearing posting as the event (`amount`, `currency`, `account` = that posting's account, `direction` = `in` if the amount is negative else `out`, `payee_key`, `mailbox="manual"`, `parser="manual"`, `channel="manual"`, `source_class="other"`).
+
+Then the five `chat.py` hunks, the `mcp_server.py` set, and `config/seed/agents.yaml`.
+
+- [ ] **Step 4: Run, lint, minimal-diff check, commit**
+
+Run: `PYTHONPATH=core/src:worker/src:comms/src .venv/bin/python -m pytest tests/core/test_ledger_tools.py tests/core/test_chat_tools_foundation.py tests/core/test_agents_tools_route.py -n 4 --dist loadfile --timeout=300 -q 2>&1 | tail -5` — all passed. If a foundation test snapshots the tool list or counts, update it and say so in the commit.
+Run: `.venv/bin/ruff check core/src/ tests/core/` — clean; `git diff HEAD~0 -- core/src/aegis/services/chat.py | grep -c '^@@'` ≤ 5.
+
+```bash
+git add core/src/aegis/services/tools/ledger.py core/src/aegis/services/books.py core/src/aegis/services/chat.py core/src/aegis/api/routes/mcp_server.py config/seed/agents.yaml tests/core/test_ledger_tools.py
+git commit -m "feat(money): ledger_query, ledger_post, ledger_reclassify and ledger_add_rule tools"
+```
+
+---
+
+### Task 5: Curiosity asks about unknown payees and turns answers into rules
+
+**Files:**
+- Modify: `worker/src/aegis_worker/activities/curiosity.py` (`_DETECTORS`, new `_detect_unknown_payee`, delete `_detect_recurring_charge` and `charge_key`; `apply_curiosity_answer` books branch; new fields `llm: Any = None`, `model: str = ""`, `books_cfg: Any = None`)
+- Modify: `worker/src/aegis_worker/__main__.py` (`CuriosityActivities(... llm=deps.llm, model=model_balanced, books_cfg=config_from_settings(settings))`)
+- Test: `tests/worker/test_curiosity_gaps.py` (replace the charge-detector tests), `tests/worker/test_curiosity_books_answer.py` (new)
+
+**Interfaces:**
+- `_detect_unknown_payee(agent_id, known) -> list[tuple[float, dict]]`: `SELECT payee_key, max(payee) AS payee, sum(amount) AS total, count(*) AS n, max(occurred_on) AS last_on, max(channel) AS channel FROM finance.journal_index WHERE kind='transaction' AND account LIKE '%:unknown' AND occurred_on >= now() - interval '60 days' AND currency = 'INR' GROUP BY payee_key ORDER BY total DESC LIMIT 50`; skip when `payee.lower() in known`; candidate `{"gap_type": "unknown_payee", "subject": payee, "question": f"You paid {fmt_money(total,'INR')} to {payee} ({n} times, last {last_on}, {channel}). What was it for?", "evidence": {"payee_key", "total", "n", "last_on"}, "novelty_key": f"payee:{payee_key}"}`, score `10.0 + float(total)`.
+- `apply_curiosity_answer`: after `record_memory`, when `meta.get("gap_type") == "unknown_payee"` and `self.llm` and `self.books_cfg`: `accounts = (await books.run_hledger(["accounts", "--declared"], cfg)).split()`; ask `self.llm.think(prompt=…, model=self.model, max_tokens=300, purpose="books_answer_account", db_pool=self.db_pool, agent_id=agent_id)` for `{"account": "<one of the list or NONE>", "confidence": 0.0-1.0}` given the payee and the owner's answer; parse with `parse_llm_json`; if `account in accounts and confidence >= 0.8`: `books.append_rule({"match": re.escape(payee.lower()), "account": account, "payee": payee}, cfg)` then for every index row with that `payee_key` and `journal_file IS NOT NULL`: `books.rewrite_event(msgid, cfg, account=account)` + `UPDATE finance.journal_index SET account=$2 WHERE message_id=$1`; return `{"recorded": True, "rule": account, "reclassified": n}`; otherwise `{"recorded": True, "rule": None}`. Any exception in the books branch is logged (`curiosity_books_answer_failed`) and the memory write stands.
+
+- [ ] **Step 1: Tests** — in `test_curiosity_gaps.py` delete `_add_charge`, the four charge tests and `test_charge_key_is_first_normalised_word`; add `_add_unknown(pool, payee, amount, msgid)` inserting a `finance.journal_index` row (`mailbox='cur-t'`, `kind='transaction'`, `account='expenses:unknown'`, `currency='INR'`, `occurred_on=CURRENT_DATE`, `payee_key=payee_key(payee)`) and tests: `test_unknown_payee_with_no_memory_yields_candidate` (novelty key `payee:jai shree nakoda`, question contains `₹6,000.00` and the payee), `test_memory_naming_the_payee_removes_it`, `test_archived_interaction_suppresses` (unchanged logic, new key), `test_variants_group_by_payee_key` (two rows, same payee_key, one candidate with the summed total), `test_non_inr_rows_are_ignored`. Clean up `cur-t` rows in the autouse fixture.
+
+`tests/worker/test_curiosity_books_answer.py` (skipif no hledger): temp repo as in Task 4's tests; post one unknown event and index it; `CuriosityActivities(db_pool, llm=FakeLLM('{"account": "expenses:groceries", "confidence": 0.9}'), model="m", books_cfg=cfg)`; run `apply_curiosity_answer("00000000-0000-0000-0000-000000000000", {"value": "that's my grocer"}, {"gap_type": "unknown_payee", "subject": "Jai shree nakoda", "question": "q", "agent_id": "maou", "payee_key": "jai shree nakoda"})` → result `rule == "expenses:groceries"` and `reclassified == 1`; the rules file ends with the new rule; the journal block now posts to `expenses:groceries`; a second test with confidence 0.5 → `rule is None`, rules file unchanged; a third with the LLM raising → memory still recorded (`agent_memory` row exists) and `rule is None`. Include `payee_key` in the card metadata: the detector's candidate `evidence` carries it and `flows/curiosity.py` copies `top.get("evidence", {}).get("payee_key")` into `metadata["payee_key"]` (one-line flow change; update the flow test if it snapshots metadata keys).
+
+- [ ] **Step 2–4: Implement, run, lint, commit**
+
+Run: `PYTHONPATH=core/src:worker/src:comms/src .venv/bin/python -m pytest tests/worker/test_curiosity_gaps.py tests/worker/test_curiosity_books_answer.py tests/worker/test_curiosity_card_flow.py -n 4 --dist loadfile --timeout=300 -q 2>&1 | tail -5`; ruff clean.
+
+```bash
+git add worker/src/aegis_worker/activities/curiosity.py worker/src/aegis_worker/flows/curiosity.py worker/src/aegis_worker/__main__.py tests/worker/test_curiosity_gaps.py tests/worker/test_curiosity_books_answer.py tests/worker/test_curiosity_card_flow.py
+git commit -m "feat(curiosity): ask about unknown payees from the books and turn answers into rules"
+```
+
+---
+
+### Task 6: Admin Money page on the index
+
+**Files:**
+- Modify: `core/src/aegis/api/routes/money.py` (`money_state`, `money_digest`, `_FLOW_NAMES`)
+- Modify: `admin-panel/frontend/src/pages/Money.tsx` (rewrite)
+- Test: `tests/core/test_money_routes.py` (update)
+
+**Interfaces:**
+- `GET /api/admin/money/state` → `{"events": [last 100 `finance.journal_index` rows ordered by `coalesce(occurred_on, due_on) DESC, created_at DESC` with `message_id, mailbox, entity, kind, direction, amount (str), currency, payee, account, channel, instrument, occurred_on, due_on, parser, confidence, source_class, journal_file, linked_message_id, todoist_ref`], "unknown_count": int (transactions in `*:unknown`, last 60 days), "dues_open": int, "unpushed_commits": int (`books.unpushed_commits(config_from_settings(settings))`, 0 on any error), "books_configured": bool (`books_repo_url` set or checkout exists), "home_currency": str}`.
+- `GET /api/admin/money/digest` → `{"digest": {"path": "reports/monthly/<YYYY-MM>.md", "markdown": str} | None}` — the newest file under `<books_path>/reports/monthly/`, read from disk; `None` when absent.
+- `_FLOW_NAMES = {"money_brief": "MoneyBriefFlow", "month_close": "MonthCloseFlow", "receipt_scan": "ReceiptIngestFlow"}`.
+- `Money.tsx`: header counters (unknown, dues open, unpushed, books configured), three run buttons, an events table (date, entity, kind, payee, amount via a TS `fmtMoney(amount, currency)` that mirrors `fmt_money` incl. Indian grouping, account, channel, parser, links: `journal_file`, `todoist_ref`), and the latest monthly close rendered as preformatted Markdown text. Delete the charges/renewals/digest-summary code.
+
+- [ ] Tests: update `tests/core/test_money_routes.py` to seed two `journal_index` rows and assert the `state` shape and counts; `digest` returns `None` on an empty temp `books_path` and the newest file's text when two files exist; the three flow names 400/… as before. Frontend: `cd admin-panel/frontend && npm run build` must pass (no unit tests for the SPA).
+
+```bash
+git add core/src/aegis/api/routes/money.py admin-panel/frontend/src/pages/Money.tsx tests/core/test_money_routes.py
+git commit -m "feat(money): admin Money page shows the books index and the latest close"
+```
+
+---
+
+### Task 7: Docs, memory of the operator steps, full runs, PR
+
+**Files:**
+- Modify: `docs/how-it-works.md` (§5 money paragraph mentions the brief, the close and the tools; the schedule table rows from Task 3), `docs/infrastructure.md` (books subsection: tools and grants, rollout SQL for `agents.metadata.tool_set`), `CLAUDE.md` (the Books key-paths line lists the tools module), `docs/architecture/overview.md` (Maou tools list).
+- Full per-package runs, ruff, `npm run build`, PR.
+
+Rollout SQL to put in `docs/infrastructure.md` and the PR body:
+
+```sql
+UPDATE agents SET metadata = jsonb_set(metadata, '{tool_set}',
+  (metadata->'tool_set') || '["ledger_query","ledger_post","ledger_reclassify","ledger_add_rule"]'::jsonb)
+WHERE id = 'maou' AND jsonb_typeof(metadata->'tool_set') = 'array';
+UPDATE agents SET metadata = jsonb_set(metadata, '{tool_set}', (metadata->'tool_set') || '["ledger_query"]'::jsonb)
+WHERE id = 'sebas' AND jsonb_typeof(metadata->'tool_set') = 'array' AND NOT (metadata->'tool_set' @> '["ledger_query"]'::jsonb);
+```
+
+```bash
+git add docs/how-it-works.md docs/infrastructure.md docs/architecture/overview.md CLAUDE.md
+git commit -m "docs(money): brief, close, ledger tools and rollout"
+git push -u origin <branch>
+gh pr create --title "feat(money): money brief, month close, ledger tools, curiosity rules (books PR3)" --body-file /tmp/claude-1000/-home-arshad-Workspace-hikmah-aegis/4bab0db5-7fb2-462d-91e9-41a63ca50390/scratchpad/pr3-body.md
+```
+
