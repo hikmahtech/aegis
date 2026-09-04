@@ -27,7 +27,11 @@ def _indian_group(whole: str) -> str:
     return ",".join(parts) + "," + tail
 
 
-def fmt_money(amount: Decimal | int | float | str, currency: str | None) -> str:
+def fmt_money(amount: Decimal | int | float | str | None, currency: str | None) -> str:
+    # A receipt with no parsable amount formats to nothing. MoneyEvent.amount
+    # is `Decimal | None`, so this is normal input, not a caller bug.
+    if amount is None or amount == "":
+        return ""
     q = Decimal(str(amount)).quantize(_CENT, rounding=ROUND_HALF_UP)
     sign = "-" if q < 0 else ""
     whole, frac = f"{abs(q):.2f}".split(".")

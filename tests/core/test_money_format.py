@@ -29,3 +29,11 @@ def test_negative_and_rounding():
     assert fmt_money(Decimal("-5"), "INR") == "-₹5.00"
     assert fmt_money("1.005", "USD") == "$1.01"
     assert fmt_money(0.1 + 0.2, "USD") == "$0.30"
+
+
+def test_missing_amount_is_empty_string():
+    """MoneyEvent.amount is `Decimal | None` — a receipt with no parsable
+    amount formats to nothing, it does not blow up the caller."""
+    assert fmt_money(None, "INR") == ""
+    assert fmt_money("", "INR") == ""
+    assert fmt_money(None, None) == ""

@@ -10,7 +10,7 @@ from temporalio.testing import ActivityEnvironment
 
 HTML = (
     "<html><head><style>.x{color:red}</style></head><body>"
-    "<p>Dear Customer,</p><p>Rs.10.00 is debited from your account ending 1225 "
+    "<p>Dear Customer,</p><p>Rs.10.00\u200b is debited from your account ending 1225 "
     "towards VPA q203028199@ybl (Jai shree nakoda) on 02-09-26.</p>"
     "<a href='https://example.com/track?id=1'>https://example.com/track?id=1</a>"
     "<script>alert(1)</script>&nbsp;&nbsp;Regards,&amp; HDFC</body></html>"
@@ -56,6 +56,8 @@ def test_html_to_text_strips_markup_scripts_and_urls():
     assert "example.com" not in text and "<url>" in text
     assert "Regards,& HDFC" in text
     assert "  " not in text
+    # The zero-width space the mailer padded the amount with is gone.
+    assert "\u200b" not in text
 
 
 @pytest.mark.asyncio
@@ -109,3 +111,12 @@ def test_html_to_text_keeps_inline_amounts_intact_and_breaks_on_blocks():
     assert "Amount:1,00,308.53" in text
     assert "Due 07/09/2026" in text
     assert "Rs.10.00\ndebited" in text or "Rs.10.00 debited" in text
+
+
+def test_unclosed_script_or_style_does_not_leak():
+    """A truncated mailer body ends mid-<script>. Without a closing tag to
+    anchor on, the block regex used to match nothing and the raw JS/CSS fell
+    through to the extractor as text."""
+    assert html_to_text("<script>var a=1;") == ""
+    assert html_to_text("<style>.x{color:red}") == ""
+    assert html_to_text("<p>Rs.10.00 debited</p><script>var a=1;") == "Rs.10.00 debited"

@@ -153,7 +153,10 @@ def _extract_html_from_part(part: dict) -> str:
 
 
 _URL_RE = re.compile(r"https?://\S+")
-_TAG_BLOCK_RE = re.compile(r"<(style|script)[^>]*>.*?</\1>", re.S | re.I)
+# The closing tag is optional to end-of-text: a truncated mailer body can end
+# mid-<script>, and without this the block never matched and the raw JS/CSS
+# fell through to the extractor as text.
+_TAG_BLOCK_RE = re.compile(r"<(style|script)[^>]*>.*?(?:</\1>|$)", re.S | re.I)
 _TAG_RE = re.compile(r"<[^>]+>")
 # Tags that end a line. Everything else is INLINE and is deleted outright
 # rather than replaced by a space: HTML mailers wrap parts of a number in
@@ -165,12 +168,11 @@ _BLOCK_TAG_RE = re.compile(
     r"|section|article|header|footer|hr)\b[^>]*>",
     re.I,
 )
-# Space, tab, NBSP (U+00A0), then three characters that LOOK LIKE NOTHING in
-# this source line and are meant to: zero-width space (U+200B), zero-width
-# non-joiner (U+200C) and combining grapheme joiner (U+034F). HTML mailers
-# pad layout with them, so they are exactly what arrives in a bank receipt.
-# Do not "clean up" the apparently-empty run inside the class — it is the point.
-_SPACE_RE = re.compile(r"[ \t\xa0​‌͏]+")
+# Space, tab, NBSP (U+00A0), zero-width space (U+200B), zero-width non-joiner
+# (U+200C) and combining grapheme joiner (U+034F). HTML mailers pad layout with
+# the invisible three, so they are exactly what arrives in a bank receipt.
+# Written as escapes on purpose: as literal characters they are unreviewable.
+_SPACE_RE = re.compile(r"[ \t\xa0\u200b\u200c\u034f]+")
 _BLANK_RE = re.compile(r"\n\s*\n+")
 
 
