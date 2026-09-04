@@ -276,10 +276,15 @@ def test_module_workflows_is_the_unflagged_registry():
         # NO new flow from `cleanup_task_sessions` on the existing
         # CleanupActivities — the finished-session worktree sweep is a step in
         # the existing CleanupFlow, and CleanupActivities is unflagged, so it
-        # moves in every row.
-        (True, True, 42, 209),
-        (False, False, 34, 179),
-        (True, False, 38, 198),
+        # moves in every row. Then +2 activities and NO new flow from the
+        # full-email-body path, and they land in DIFFERENT rows:
+        # `fetch_message_body` is on the existing GmailActivities, which is
+        # unflagged, so it moves all three rows; `store_receipt_body` is on the
+        # existing MoneyActivities, which IS money-flagged, so it moves only
+        # the money=True row. That is why this bump is +2/+1/+1, not +2/+2/+2.
+        (True, True, 42, 211),
+        (False, False, 34, 180),
+        (True, False, 38, 199),
     ],
 )
 def test_real_registration_passes_the_boot_check(homelab, money, flows, activities):

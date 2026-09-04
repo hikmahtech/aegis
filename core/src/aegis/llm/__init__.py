@@ -208,7 +208,7 @@ def _format_receipts_for_prompt(receipts: list[dict]) -> str:
             f"--- Receipt {i + 1} ---\n"
             f"From: {r.get('sender', '')}\n"
             f"Subject: {r.get('subject', '')}\n"
-            f"Body (truncated): {(r.get('body_plain') or '')[:1500]}\n"
+            f"Body (truncated): {(r.get('body_plain') or '')[:4000]}\n"
         )
     return "\n".join(parts)
 

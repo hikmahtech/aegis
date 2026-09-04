@@ -158,13 +158,18 @@ class MoneyActivities:
 
         v3 schema has no body_plain column — snippet is stored in parsed jsonb.
         Aliased as body_plain so classify_and_extract callers remain unchanged.
+
+        Prefers the full message text `store_receipt_body` fetched over the
+        200-char Gmail snippet, which routinely cuts off before the amount.
+        Falls back to the snippet when the body fetch failed or never ran.
         """
         if not receipt_ids:
             return []
         async with self.db_pool.acquire() as conn:
             rows = await conn.fetch(
                 "SELECT id, account, message_id, sender, subject, "
-                "parsed->>'snippet' AS body_plain, received_at "
+                "COALESCE(NULLIF(parsed->>'body_text', ''), parsed->>'snippet') AS body_plain, "
+                "received_at "
                 "FROM finance.receipt_email WHERE id = ANY($1::uuid[])",
                 receipt_ids,
             )
@@ -180,6 +185,20 @@ class MoneyActivities:
             }
             for r in rows
         ]
+
+    @activity.defn
+    async def store_receipt_body(self, receipt_id: str, body_text: str) -> None:
+        """Merge the fetched full text into `parsed.body_text` (spec §2 step 2)."""
+        if not self.db_pool or not receipt_id:
+            return
+        async with self.db_pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE finance.receipt_email "
+                "SET parsed = COALESCE(parsed, '{}'::jsonb) || $2 "
+                "WHERE id = $1::uuid",
+                receipt_id,
+                {"body_text": body_text},
+            )
 
     @activity.defn
     async def find_stuck_receipts(
@@ -269,7 +288,8 @@ class MoneyActivities:
                     # Mark as parsed so we don't re-LLM it.
                     # v3 schema: no is_receipt/parsed_at columns; use parsed jsonb only.
                     await conn.execute(
-                        "UPDATE finance.receipt_email SET parsed=$2 WHERE id=$1::uuid",
+                        "UPDATE finance.receipt_email "
+                        "SET parsed = COALESCE(parsed, '{}'::jsonb) || $2 WHERE id=$1::uuid",
                         receipt_id,
                         e,
                     )
@@ -291,7 +311,8 @@ class MoneyActivities:
                         vendor_name=e.get("vendor_name", ""),
                     )
                     await conn.execute(
-                        "UPDATE finance.receipt_email SET parsed=$2 WHERE id=$1::uuid",
+                        "UPDATE finance.receipt_email "
+                        "SET parsed = COALESCE(parsed, '{}'::jsonb) || $2 WHERE id=$1::uuid",
                         receipt_id,
                         e,
                     )
@@ -314,7 +335,8 @@ class MoneyActivities:
                         vendor_name=e.get("vendor_name", ""),
                     )
                     await conn.execute(
-                        "UPDATE finance.receipt_email SET parsed=$2 WHERE id=$1::uuid",
+                        "UPDATE finance.receipt_email "
+                        "SET parsed = COALESCE(parsed, '{}'::jsonb) || $2 WHERE id=$1::uuid",
                         receipt_id,
                         e,
                     )
@@ -384,7 +406,9 @@ class MoneyActivities:
                 )
 
                 await conn.execute(
-                    "UPDATE finance.receipt_email SET parsed=$2, charge_id=$3 WHERE id=$1::uuid",
+                    "UPDATE finance.receipt_email "
+                    "SET parsed = COALESCE(parsed, '{}'::jsonb) || $2, charge_id=$3 "
+                    "WHERE id=$1::uuid",
                     receipt_id,
                     e,
                     charge_row["id"],

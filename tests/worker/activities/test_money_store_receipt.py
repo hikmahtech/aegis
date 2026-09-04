@@ -234,3 +234,52 @@ async def test_find_stuck_receipts_oldest_first(db_pool):
     assert older in ids
     assert newer in ids
     assert ids.index(older) < ids.index(newer)
+
+
+@pytest.mark.asyncio
+async def test_store_receipt_body_merges_into_parsed(db_pool):
+    act = _make_act(db_pool)
+    async with db_pool.acquire() as conn:
+        rid = await _insert_receipt_email(
+            conn, message_id="rt-body-1", parsed={"snippet": "snip"}, received_days_ago=0.1
+        )
+    await act.store_receipt_body(rid, "full body text")
+    async with db_pool.acquire() as conn:
+        parsed = await conn.fetchval(
+            "SELECT parsed FROM finance.receipt_email WHERE id = $1::uuid", rid
+        )
+    assert parsed == {"snippet": "snip", "body_text": "full body text"}
+
+
+@pytest.mark.asyncio
+async def test_load_receipts_prefers_body_text_over_snippet(db_pool):
+    act = _make_act(db_pool)
+    async with db_pool.acquire() as conn:
+        with_body = await _insert_receipt_email(
+            conn,
+            message_id="rt-body-2",
+            parsed={"snippet": "snip", "body_text": "full"},
+            received_days_ago=0.1,
+        )
+        without = await _insert_receipt_email(
+            conn, message_id="rt-body-3", parsed={"snippet": "snip only"}, received_days_ago=0.1
+        )
+    rows = await act.load_receipts([with_body, without])
+    by_id = {r["message_id"]: r["body_plain"] for r in rows}
+    assert by_id == {"rt-body-2": "full", "rt-body-3": "snip only"}
+
+
+@pytest.mark.asyncio
+async def test_upsert_charges_keeps_body_text(db_pool):
+    act = _make_act(db_pool)
+    async with db_pool.acquire() as conn:
+        rid = await _insert_receipt_email(
+            conn, message_id="rt-body-4", parsed={"body_text": "full"}, received_days_ago=0.1
+        )
+    await act.upsert_charges("_t", [{"receipt_id": rid, "is_receipt": False, "confidence": 0.9}])
+    async with db_pool.acquire() as conn:
+        parsed = await conn.fetchval(
+            "SELECT parsed FROM finance.receipt_email WHERE id = $1::uuid", rid
+        )
+    assert parsed["body_text"] == "full"
+    assert parsed["is_receipt"] is False
