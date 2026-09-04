@@ -11,8 +11,9 @@ stuck — parse/extract failures that predate the 07-16 smart-tier fix.
 MoneyProcessFlow can't be reused for this: it starts from `store_receipt_email`,
 which is idempotent on `message_id` and would immediately short-circuit as
 "duplicate" for an already-stored row. The sweep instead re-drives the
-already-hydrated row directly through `classify_and_extract` +
-`upsert_charges`.
+already-hydrated row directly through `load_receipts` → `fetch_message_body`
+→ `store_receipt_body` → `classify_and_extract` → `upsert_charges`. The
+body fetch is best-effort: on failure the sweep classifies the stored snippet.
 """
 
 from __future__ import annotations
@@ -143,8 +144,10 @@ class ReceiptIngestFlow:
     async def _sweep_stuck_receipts(self, input: ReceiptIngestInput) -> int:
         """Bounded re-attempt for receipt_email rows whose `parsed` result
         is missing/failed (fix #113). Reprocesses each directly through
-        classify_and_extract + upsert_charges — a row that fails again
-        just leaves `parsed` unset and waits for next week's sweep.
+        load_receipts → fetch_message_body → store_receipt_body →
+        classify_and_extract → upsert_charges — a row that fails again
+        just leaves `parsed` unset and waits for next week's sweep. The
+        body fetch is best-effort; a failure falls back to the snippet.
 
         # ponytail: no per-row retry-count/backoff bookkeeping — the
         # weekly cadence + a small limit is the whole throttle. Good
@@ -169,6 +172,31 @@ class ReceiptIngestFlow:
                 )
                 if not receipts:
                     continue
+
+                # The body is an enhancement. A hard failure must not send
+                # this row back to next week's sweep — fall through and
+                # classify the stored snippet instead.
+                try:
+                    body = await workflow.execute_activity(
+                        "fetch_message_body",
+                        args=[receipts[0]["account"], receipts[0]["message_id"]],
+                        start_to_close_timeout=_ACT_TIMEOUT,
+                        retry_policy=ACT_RETRY,
+                    )
+                    if body:
+                        await workflow.execute_activity(
+                            "store_receipt_body",
+                            args=[receipt_id, body],
+                            start_to_close_timeout=_ACT_TIMEOUT,
+                            retry_policy=ACT_RETRY,
+                        )
+                        receipts[0]["body_plain"] = body
+                except Exception as exc:
+                    workflow.logger.warning(
+                        "receipt_sweep_body_failed receipt_id=%s err=%s",
+                        receipt_id,
+                        str(exc)[:200],
+                    )
 
                 extractions = await workflow.execute_activity(
                     "classify_and_extract",

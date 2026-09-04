@@ -40,3 +40,11 @@ def test_combined():
 
 def test_plain_text_passthrough():
     assert html_to_mrkdwn("just plain text") == "just plain text"
+
+
+def test_pre_becomes_code_block():
+    assert html_to_mrkdwn("<pre>a  b\n c</pre>") == "```\na  b\n c\n```"
+
+
+def test_pre_inside_message_keeps_surrounding_text():
+    assert html_to_mrkdwn("<b>Week</b>\n<pre>x</pre>\nend") == "*Week*\n```\nx\n```\nend"

@@ -270,7 +270,7 @@ user-authored:
 | Selector | Verb | What happens |
 |---|---|---|
 | `source_tag = '#alert'` | infra | Check the service's health *now* (not the alert history) → healthy: comment + complete; unhealthy: logs + a "restart?" card |
-| `source_tag = '#receipt'` | finance | Assemble the merchant's charge history → decision card ("Expected / Investigate"). No autonomous action |
+| `source_tag = '#receipt'` | finance | Legacy: `#receipt` tasks are no longer created by `MoneyProcessFlow` (since 2026-09-05); an existing one still gets the merchant-history decision card |
 | `source_tag = '#email'` | email triage | Notification → archive + complete; genuinely needs a reply → comment + `@waiting` (the Gmail scope is `gmail.modify` — AEGIS cannot send mail) |
 | `source_tag IS NULL` + `@code` | coding | Task session: one persistent Claude Code session per task, one turn per comment → plan → implement on a branch when asked → draft PR when asked → `@waiting` |
 | anything else | — | Comment "no executor for this" + park. Never guessed at |

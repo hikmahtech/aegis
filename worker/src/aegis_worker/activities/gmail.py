@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -131,6 +132,67 @@ def _extract_text_from_part(part: dict) -> str:
         if text:
             return text
     return ""
+
+
+def _extract_html_from_part(part: dict) -> str:
+    """Recursively extract the first text/html part, decoded."""
+    import base64
+
+    mime = part.get("mimeType", "")
+    body_data = (part.get("body") or {}).get("data", "")
+    if mime == "text/html" and body_data:
+        try:
+            return base64.urlsafe_b64decode(body_data + "==").decode("utf-8", errors="replace")
+        except Exception:
+            return ""
+    for subpart in part.get("parts") or []:
+        text = _extract_html_from_part(subpart)
+        if text:
+            return text
+    return ""
+
+
+_URL_RE = re.compile(r"https?://\S+")
+# The closing tag is optional to end-of-text: a truncated mailer body can end
+# mid-<script>, and without this the block never matched and the raw JS/CSS
+# fell through to the extractor as text.
+_TAG_BLOCK_RE = re.compile(r"<(style|script)[^>]*>.*?(?:</\1>|$)", re.S | re.I)
+_TAG_RE = re.compile(r"<[^>]+>")
+# Tags that end a line. Everything else is INLINE and is deleted outright
+# rather than replaced by a space: HTML mailers wrap parts of a number in
+# <b>/<span>, so "Amount:<b>1,00,308</b>.53" must not become
+# "Amount: 1,00,308 .53" — the deterministic bank parsers match exact
+# phrases like "Rs.<amt> is debited" against this output.
+_BLOCK_TAG_RE = re.compile(
+    r"</?(?:br|p|div|tr|td|th|table|li|ul|ol|h[1-6]|blockquote"
+    r"|section|article|header|footer|hr)\b[^>]*>",
+    re.I,
+)
+# Space, tab, NBSP (U+00A0), zero-width space (U+200B), zero-width non-joiner
+# (U+200C) and combining grapheme joiner (U+034F). HTML mailers pad layout with
+# the invisible three, so they are exactly what arrives in a bank receipt.
+# Written as escapes on purpose: as literal characters they are unreviewable.
+_SPACE_RE = re.compile(r"[ \t\xa0\u200b\u200c\u034f]+")
+_BLANK_RE = re.compile(r"\n\s*\n+")
+
+
+def html_to_text(html_src: str) -> str:
+    """Reduce an HTML email body to readable text for the money extractor."""
+    import html as _html
+
+    text = _TAG_BLOCK_RE.sub(" ", html_src)
+    text = _BLOCK_TAG_RE.sub("\n", text)
+    text = _TAG_RE.sub("", text)
+    text = _html.unescape(text)
+    return _clean_text(text)
+
+
+def _clean_text(text: str) -> str:
+    text = _URL_RE.sub("<url>", text)
+    text = _SPACE_RE.sub(" ", text)
+    text = "\n".join(line.strip() for line in text.splitlines())
+    text = _BLANK_RE.sub("\n", text)
+    return text.strip()
 
 
 _CLASSIFY_SYSTEM = """\
@@ -484,6 +546,37 @@ class GmailActivities:
             return await asyncio.to_thread(_sync)
         except Exception as exc:
             activity.logger.warning("fetch_thread_failed thread=%s: %s", thread_id, str(exc)[:200])
+            return ""
+
+    @activity.defn
+    async def fetch_message_body(
+        self, account_label: str, message_id: str, max_chars: int = 6000
+    ) -> str:
+        """Full text of one message for the money extractor (spec §2 step 2).
+
+        text/plain part first, else text/html reduced to text. Best-effort:
+        any failure returns "" so the caller falls back to the snippet.
+        """
+        token_path = Path(self.gmail_token_dir) / f"{account_label}.json"
+
+        def _sync() -> str:
+            svc = _build_gmail_service(self.gmail_credentials_file, token_path)
+            full = svc.users().messages().get(userId="me", id=message_id, format="full").execute()
+            payload = full.get("payload") or {}
+            text = _clean_text(_extract_text_from_part(payload))
+            if not text:
+                text = html_to_text(_extract_html_from_part(payload))
+            return text[:max_chars]
+
+        try:
+            return await asyncio.to_thread(_sync)
+        except Exception as exc:  # noqa: BLE001 — body is an enhancement; never fail the flow
+            activity.logger.warning(
+                "fetch_message_body_failed account=%s msg=%s err=%s",
+                account_label,
+                message_id,
+                str(exc)[:200],
+            )
             return ""
 
     @activity.defn

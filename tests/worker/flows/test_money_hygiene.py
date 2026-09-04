@@ -13,7 +13,6 @@ with workflow.unsafe.imports_passed_through():
 
 _detect_calls: list[float] = []
 _renewal_calls: list[list] = []
-_capture_calls: list[tuple] = []
 _notify_cancel_calls: list[dict] = []
 _notify_renewal_calls: list[dict] = []
 
@@ -41,12 +40,6 @@ async def stub_renewals(thresholds_days: list) -> list[dict]:
     return list(_RENEWAL_ROWS)
 
 
-@activity.defn(name="capture_to_inbox")
-async def stub_capture(source_tag: str, external_id: str, title: str, description=None) -> str:
-    _capture_calls.append((source_tag, external_id, title))
-    return f"task-{external_id}"
-
-
 @activity.defn(name="notify_cancellation")
 async def stub_notify_cancel(cancellation: dict) -> None:
     _notify_cancel_calls.append(cancellation)
@@ -57,11 +50,11 @@ async def stub_notify_renewal(alert: dict) -> None:
     _notify_renewal_calls.append(alert)
 
 
-ALL_STUBS = [stub_detect, stub_renewals, stub_capture, stub_notify_cancel, stub_notify_renewal]
+ALL_STUBS = [stub_detect, stub_renewals, stub_notify_cancel, stub_notify_renewal]
 
 
 def _clear() -> None:
-    for lst in (_detect_calls, _renewal_calls, _capture_calls,
+    for lst in (_detect_calls, _renewal_calls,
                 _notify_cancel_calls, _notify_renewal_calls):
         lst.clear()
 
@@ -85,21 +78,16 @@ async def test_runs_both_sweeps_with_config():
     assert result == {"cancelled": 2, "renewals": 1}
     assert _detect_calls == [3.5]
     assert _renewal_calls == [[14, 7]]
-    # both sweeps capture + notify
-    assert len(_capture_calls) == 3  # 2 cancel + 1 renewal
     assert len(_notify_cancel_calls) == 2
     assert len(_notify_renewal_calls) == 1
-    ext_ids = {c[1] for c in _capture_calls}
-    assert "cancel-c1" in ext_ids and "renewal-r1-2026-07-01" in ext_ids
 
 
 @pytest.mark.asyncio
-async def test_silent_suppresses_capture_and_notify():
+async def test_silent_suppresses_notify():
     _clear()
     result = await _run(MoneyHygieneConfig(silent=True), wid="mh-2")
     # DB-state sweeps still run + count, but no user-facing output
     assert result == {"cancelled": 2, "renewals": 1}
-    assert _capture_calls == []
     assert _notify_cancel_calls == []
     assert _notify_renewal_calls == []
 
@@ -115,8 +103,23 @@ async def test_cancellation_failure_does_not_block_renewals():
 
     result = await _run(
         MoneyHygieneConfig(),
-        activities=[boom, stub_renewals, stub_capture, stub_notify_cancel, stub_notify_renewal],
+        activities=[boom, stub_renewals, stub_notify_cancel, stub_notify_renewal],
         wid="mh-3",
     )
     assert result == {"cancelled": 0, "renewals": 1}
     assert len(_notify_renewal_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_flow_never_calls_capture_to_inbox():
+    """Spec §7.4: renewals and cancellations are Slack FYIs, never Inbox tasks."""
+    _clear()
+    seen: list[str] = []
+
+    @activity.defn(name="capture_to_inbox")
+    async def trap(source_tag: str, external_id: str, title: str, description=None) -> str:
+        seen.append(title)
+        return "task"
+
+    await _run(MoneyHygieneConfig(), activities=[*ALL_STUBS, trap], wid="mh-4")
+    assert seen == []

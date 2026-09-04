@@ -5,10 +5,12 @@ from __future__ import annotations
 import html as _html
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
+from decimal import Decimal
 from typing import Any
 
 import structlog
 from aegis.services.fx import to_monthly_home
+from aegis.services.money_format import fmt_money
 from temporalio import activity
 
 from aegis_worker.activities.delivery import safe_send_message
@@ -156,13 +158,18 @@ class MoneyActivities:
 
         v3 schema has no body_plain column — snippet is stored in parsed jsonb.
         Aliased as body_plain so classify_and_extract callers remain unchanged.
+
+        Prefers the full message text `store_receipt_body` fetched over the
+        200-char Gmail snippet, which routinely cuts off before the amount.
+        Falls back to the snippet when the body fetch failed or never ran.
         """
         if not receipt_ids:
             return []
         async with self.db_pool.acquire() as conn:
             rows = await conn.fetch(
                 "SELECT id, account, message_id, sender, subject, "
-                "parsed->>'snippet' AS body_plain, received_at "
+                "COALESCE(NULLIF(parsed->>'body_text', ''), parsed->>'snippet') AS body_plain, "
+                "received_at "
                 "FROM finance.receipt_email WHERE id = ANY($1::uuid[])",
                 receipt_ids,
             )
@@ -178,6 +185,20 @@ class MoneyActivities:
             }
             for r in rows
         ]
+
+    @activity.defn
+    async def store_receipt_body(self, receipt_id: str, body_text: str) -> None:
+        """Merge the fetched full text into `parsed.body_text` (spec §2 step 2)."""
+        if not self.db_pool or not receipt_id:
+            return
+        async with self.db_pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE finance.receipt_email "
+                "SET parsed = COALESCE(parsed, '{}'::jsonb) || $2 "
+                "WHERE id = $1::uuid",
+                receipt_id,
+                {"body_text": body_text},
+            )
 
     @activity.defn
     async def find_stuck_receipts(
@@ -267,7 +288,8 @@ class MoneyActivities:
                     # Mark as parsed so we don't re-LLM it.
                     # v3 schema: no is_receipt/parsed_at columns; use parsed jsonb only.
                     await conn.execute(
-                        "UPDATE finance.receipt_email SET parsed=$2 WHERE id=$1::uuid",
+                        "UPDATE finance.receipt_email "
+                        "SET parsed = COALESCE(parsed, '{}'::jsonb) || $2 WHERE id=$1::uuid",
                         receipt_id,
                         e,
                     )
@@ -289,7 +311,8 @@ class MoneyActivities:
                         vendor_name=e.get("vendor_name", ""),
                     )
                     await conn.execute(
-                        "UPDATE finance.receipt_email SET parsed=$2 WHERE id=$1::uuid",
+                        "UPDATE finance.receipt_email "
+                        "SET parsed = COALESCE(parsed, '{}'::jsonb) || $2 WHERE id=$1::uuid",
                         receipt_id,
                         e,
                     )
@@ -312,7 +335,8 @@ class MoneyActivities:
                         vendor_name=e.get("vendor_name", ""),
                     )
                     await conn.execute(
-                        "UPDATE finance.receipt_email SET parsed=$2 WHERE id=$1::uuid",
+                        "UPDATE finance.receipt_email "
+                        "SET parsed = COALESCE(parsed, '{}'::jsonb) || $2 WHERE id=$1::uuid",
                         receipt_id,
                         e,
                     )
@@ -382,7 +406,9 @@ class MoneyActivities:
                 )
 
                 await conn.execute(
-                    "UPDATE finance.receipt_email SET parsed=$2, charge_id=$3 WHERE id=$1::uuid",
+                    "UPDATE finance.receipt_email "
+                    "SET parsed = COALESCE(parsed, '{}'::jsonb) || $2, charge_id=$3 "
+                    "WHERE id=$1::uuid",
                     receipt_id,
                     e,
                     charge_row["id"],
@@ -540,13 +566,16 @@ class MoneyActivities:
 
         vendor = _html.escape(str(alert.get("vendor_name", "")))
         category = _html.escape(str(alert.get("category", "")))
-        currency = _html.escape(str(alert.get("currency", "")))
         account = _html.escape(str(alert.get("account", "")))
-        amount = alert["amount_cents"] / 100
+        # Escape the rendered amount, not just the fields: fmt_money's ISO-suffix
+        # branch carries the LLM-extracted currency code into the body verbatim.
+        amount = _html.escape(
+            fmt_money(Decimal(alert["amount_cents"]) / 100, alert.get("currency") or "")
+        )
         title = f"[RENEWAL][{threshold}d] {vendor}"
         body = (
             f"<b>{vendor}</b> ({category})\n"
-            f"Amount: {amount:.2f} {currency}\n"
+            f"Amount: {amount}\n"
             f"Monthly {self.home_currency} equiv: "
             f"{_symbol(self.home_currency)}{alert['monthly_home_equivalent']:.0f}\n"
             f"Renews in: <b>{alert['days_left']:.0f} days</b> "
@@ -581,17 +610,22 @@ class MoneyActivities:
         Best-effort; all vendor-supplied fields HTML-escaped before
         interpolation since parse_mode=HTML treats raw <,>,& as markup."""
         vendor = _html.escape(str(cancellation.get("vendor_name") or "subscription"))
-        currency = _html.escape(str(cancellation.get("currency") or ""))
         cadence = _html.escape(str(cancellation.get("cadence") or ""))
         account = _html.escape(str(cancellation.get("account") or ""))
-        amount_cents = cancellation.get("amount_cents") or 0
-        amount = amount_cents / 100
+        # Escape the rendered amount, not just the fields: fmt_money's ISO-suffix
+        # branch carries the LLM-extracted currency code into the body verbatim.
+        amount = _html.escape(
+            fmt_money(
+                Decimal(cancellation.get("amount_cents") or 0) / 100,
+                cancellation.get("currency") or "",
+            )
+        )
         last_seen = cancellation.get("last_seen_at")
         last_date = str(last_seen)[:10] if last_seen else "unknown"
         title = f"[CANCEL] {vendor}"
         body = (
             f"<b>{vendor}</b>\n"
-            f"Amount: {amount:.2f} {currency} ({cadence})\n"
+            f"Amount: {amount} ({cadence})\n"
             f"Last seen: {last_date}\n"
             f"Account: {account}"
         )
