@@ -699,13 +699,22 @@ _READ_COMMANDS = frozenset({
     "balancesheet", "cf", "cashflow", "accounts", "payees", "tags", "stats",
     "activity", "aregister", "check",
 })
-# `@FILE` is hledger's own args-file syntax: it OPENS the file and splices its
-# lines in as arguments, which both re-admits every option denied below and
-# turns the runner into a read oracle (a missing or unreadable path comes back
-# in stderr). Denying the `@` prefix is the only way to keep the whitelist
-# meaningful. Every entry also covers its joined and `=` forms, because
-# `startswith` matches `-f/etc/passwd` and `--file=/etc/passwd` too.
-_FORBIDDEN_ARG_PREFIXES = ("-f", "--file", "--rules", "-o", "--output-file", "--config", "@")
+# hledger accepts bundled short flags and unambiguous long-flag abbreviations,
+# so this must be an exact-match allowlist, never a deny-prefix list. Measured
+# against the real binary, a `startswith` denylist of -f/-o/--file/--output-file
+# lets all three of these straight through:
+#   -Ef<path>    = -E -f <path>  → reads any file, and its parse error echoes
+#                                  the first line back through BooksError
+#   -No<path>    = -N -o <path>  → arbitrary WRITE; it succeeded and created
+#                                  the file with the report inside
+#   --fil=<path> = --file=<path> → the same read, via abbreviation
+# Anything not starting with "-" is a query term and needs no entry here.
+_ALLOWED_OPTIONS = frozenset({
+    "-X", "-b", "-e", "-p", "-M", "-W", "-D", "-Y",
+    "--depth", "--forecast", "--pivot", "--flat", "--tree", "--sort-amount",
+    "--average", "--transpose", "--no-total", "--empty", "--historical",
+    "--declared", "--used", "--strict",
+})
 _OUTPUT_CAP = 12_000
 
 
@@ -715,7 +724,17 @@ async def run_hledger(args: list[str], cfg: BooksConfig, *, output_format: str =
     if not args or args[0] not in _READ_COMMANDS:
         raise BooksError(f"hledger command not allowed: {args[:1]}")
     for a in args[1:]:
-        if a.startswith(_FORBIDDEN_ARG_PREFIXES):
+        # `@FILE` is hledger's args-file syntax: it OPENS the file and splices
+        # its lines in as arguments, re-admitting everything the allowlist keeps
+        # out, so it is refused before anything else.
+        if a.startswith("@"):
+            raise BooksError(f"hledger argument not allowed: {a}")
+        if not a.startswith("-"):
+            continue  # a query term
+        # The option token is everything before the first "=", so `--depth=2`
+        # is checked as `--depth`. A value passed separately (`--depth 2`) is
+        # then just a query term, which is why values are never consumed here.
+        if a.split("=", 1)[0] not in _ALLOWED_OPTIONS:
             raise BooksError(f"hledger argument not allowed: {a}")
     if output_format not in ("text", "json", "csv"):
         raise BooksError(f"unknown output format {output_format}")

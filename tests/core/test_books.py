@@ -186,6 +186,10 @@ async def test_run_hledger_refuses_writes_and_file_overrides(tmp_path):
         # @ARGSFILE: hledger opens the file and splices its lines in as
         # arguments, which re-admits -f/-o and leaks the file through stderr.
         ["bal", "@/etc/passwd"], ["bal", "@args.txt"], ["print", "@/etc/shadow"],
+        # Bundled short flags and long-flag abbreviations, which are why the
+        # filter is an exact-match allowlist and not a deny-prefix list.
+        ["bal", "-Ef/etc/passwd"], ["bal", "-No/tmp/pwned.txt"],
+        ["bal", "--fil=/etc/passwd"], ["bal", "--outp=/tmp/pwned.txt"],
     ]
     for args in refused:
         # `match` matters: cfg.path holds no main.journal, so an argument that
@@ -193,6 +197,15 @@ async def test_run_hledger_refuses_writes_and_file_overrides(tmp_path):
         # error. Only the sandbox's own message proves it never ran.
         with pytest.raises(books.BooksError, match="not allowed"):
             await books.run_hledger(args, cfg)
+
+    # ...and the options this codebase actually uses must still get through.
+    # cfg.path has no journal, so hledger itself fails; the point is that the
+    # failure is hledger's, not the sandbox's.
+    for args in (["bal", "--depth"], ["bal", "-X", "₹", "expenses"],
+                 ["bal", "--depth=2", "-b", "2026-01-01"], ["print", "tag:msgid=a/b"]):
+        with pytest.raises(books.BooksError) as excinfo:
+            await books.run_hledger(args, cfg)
+        assert "not allowed" not in str(excinfo.value)
 
 
 # ------------------------------------------------------------- hledger round trip
@@ -299,6 +312,24 @@ async def test_39_char_account_survives_hledger_check(tmp_path):
     # An exact-line match: a misparse would name the account "<ACCT39> ₹10.00".
     assert ACCT39 in (await books.run_hledger(["accounts", "--used"], cfg)).splitlines()
     assert _commits(cfg) == 2
+
+
+@pytest.mark.skipif(not HAS_HLEDGER, reason="hledger/git not installed")
+@pytest.mark.asyncio
+async def test_run_hledger_refuses_bundled_and_abbreviated_file_flags(tmp_path):
+    """Against the real binary. `-Ef<path>` is `-E -f <path>` and leaks the file
+    through the error; `-No<path>` is `-N -o <path>` and WRITES one; `--fil=` is
+    an accepted abbreviation of `--file=`. All three sail past a deny-prefix
+    filter, so this is the test that pins the allowlist."""
+    cfg = _repo(tmp_path)
+    secret = tmp_path / "secret.txt"
+    secret.write_text("TOPSECRET-LINE-ONE\nsecond line\n")
+    target = tmp_path / "pwned.txt"
+    for args in (["bal", f"-Ef{secret}"], ["bal", f"-No{target}"], ["bal", f"--fil={secret}"]):
+        with pytest.raises(books.BooksError, match="not allowed") as excinfo:
+            await books.run_hledger(args, cfg)
+        assert "TOPSECRET" not in str(excinfo.value)
+    assert not target.exists()
 
 
 @pytest.mark.skipif(not HAS_HLEDGER, reason="hledger/git not installed")
