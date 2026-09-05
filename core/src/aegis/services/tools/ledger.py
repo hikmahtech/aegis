@@ -26,8 +26,11 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import multiprocessing
+import os
 import re
 import time
+import warnings
 from datetime import date as date_type
 from decimal import Decimal, InvalidOperation
 from typing import Literal
@@ -95,15 +98,27 @@ _MAX_QUANTIFIERS = 6
 _QUANTIFIER_RE = re.compile(r"(?<!\\)(?<!\()[*+?]|(?<!\\)\{\d")
 # 3. The behavioural check, which is the only one that catches quantifier
 #    stacking with no group at all. The probes are worst-case shapes for a
-#    backtracking engine at a length a real payee can reach (80 chars).
+#    backtracking engine at a length a real payee can reach (80 chars), ordered
+#    SHORTEST FIRST and stopping at the first one over budget — measured,
+#    `((a+))+$` costs 0.9s at 24 characters where at 48 it would not finish this
+#    decade, so the ordering alone turns a hang into a refusal.
 #
-#    SHORTEST FIRST, and the loop stops at the first probe over budget. That
-#    ordering is what keeps this from becoming a hang if rule 1 above is ever
-#    weakened: measured, `((a+))+$` costs 0.9s at 24 characters and is refused
-#    there, where at 48 it would not have finished this decade. Rule 1 means the
-#    first probe is always fast in practice; this is the belt to its braces.
+#    It runs in a SUBPROCESS the parent kills, because `re` cannot be
+#    interrupted and the two bounds above are an argument about constants:
+#    correct today, and erodible by anyone who edits them without reading the
+#    measurements. Every layer of this particular defence has already been
+#    bypassed once (the first guard caught `(a+)+` and missed `((a+))+`), and
+#    what it protects is the money ingest lane in TWO processes, permanently,
+#    against a pattern a language model wrote and we then persisted. A kill is
+#    self-enforcing: it cannot be weakened by accident, only by deletion.
+#    The bounds above stay in front of it — they refuse fast, with a message
+#    that says what to change; this is the backstop, not the first line.
 _REGEX_BUDGET_S = 0.1
 _REGEX_PROBES = ("a" * 24 + "!", "a" * 48 + "!", "ab" * 24 + "!", "0" * 48 + " x")
+# Wall clock the probe child gets before it is killed. Far above the ~1.2s worst
+# case the bounds above allow, because a false refusal here is a real rule the
+# user cannot add; reaching it at all means those bounds have a hole.
+_REGEX_KILL_S = 10.0
 
 # One index row per reclassified posting; the journal is the record, so this
 # only keeps the index from disagreeing with it.
@@ -140,22 +155,79 @@ def _account_entity(account: str) -> str | None:
     return "hikmah" if ":hikmah:" in f"{account}:" else "personal"
 
 
-def _slow_regex_probe(pattern: str) -> str | None:
-    """The probe string this pattern is too slow on, or None.
+def _regex_probe_child(pattern: str, probes: tuple[str, ...]) -> None:
+    """Run every probe; exit 0 if all were quick, else `1 + the probe's index`.
 
-    Bounded by construction rather than by interruption: `re` cannot be
-    interrupted, so the caller's syntactic bounds (no quantified group, at most
-    `_MAX_QUANTIFIERS`) are what keep this from becoming the hang it is meant to
-    prevent. Within them the worst measured case is ~1.2s, once, on a rule that
-    is then refused.
+    The exit code IS the channel: a pipe would have to be drained by a parent
+    that may be about to kill this process, and a killed writer holding a full
+    pipe is a deadlock. An integer needs no draining.
+
+    `os._exit`, not `return`: this is a fork of a live API process, and normal
+    interpreter shutdown here would flush buffers and run cleanup belonging to
+    the parent — including its database connections.
     """
-    compiled = re.compile(pattern, re.I)
-    for probe in _REGEX_PROBES:
-        started = time.perf_counter()
-        compiled.search(probe)
-        if time.perf_counter() - started > _REGEX_BUDGET_S:
-            return probe
-    return None
+    code = 0
+    try:
+        compiled = re.compile(pattern, re.I)
+        for index, probe in enumerate(probes):
+            started = time.perf_counter()
+            compiled.search(probe)
+            if time.perf_counter() - started > _REGEX_BUDGET_S:
+                code = 1 + index
+                break
+    except Exception:  # noqa: BLE001 — anything going wrong here is a refusal
+        code = 1
+    os._exit(code)
+
+
+def _regex_too_slow(pattern: str, kill_after: float = _REGEX_KILL_S) -> str | None:
+    """Why this pattern is too slow to persist, or None if it is quick enough.
+
+    The measurement happens in a child process so that the answer does not
+    depend on the pattern cooperating: `re` holds its thread until the match
+    completes and ignores every timeout Python can express, so the only real
+    bound is a process the parent can kill. The child times each probe itself,
+    which keeps the 100ms judgment free of process-startup noise; the parent's
+    `kill_after` is purely the safety net.
+
+    Failure is a refusal, never an exception: a crashed or killed child means we
+    could not establish that the pattern is safe, and an unestablished pattern
+    does not get written to a file the worker will read forever.
+    """
+    ctx = multiprocessing.get_context(
+        "fork" if "fork" in multiprocessing.get_all_start_methods() else "spawn"
+    )
+    proc = ctx.Process(target=_regex_probe_child, args=(pattern, _REGEX_PROBES), daemon=True)
+    with warnings.catch_warnings():
+        # Python 3.12 warns that forking a multi-threaded process can deadlock
+        # the child, and it is right in general: a child that takes a lock some
+        # other thread held at fork time waits for a thread that no longer
+        # exists. It does not apply to this child, which is why the warning is
+        # silenced HERE and nowhere else — `_regex_probe_child` imports nothing,
+        # logs nothing, touches no inherited handle, and leaves through
+        # `os._exit`, so the only lock in play is the GIL, which the forking
+        # thread holds and therefore carries into the child. `spawn` would avoid
+        # the question, at about a second of interpreter startup on a tool the
+        # user is waiting on.
+        warnings.simplefilter("ignore", DeprecationWarning)
+        proc.start()
+    proc.join(kill_after)
+    if proc.is_alive():
+        proc.kill()
+        proc.join()
+        proc.close()
+        return f"did not finish within {kill_after:g}s and had to be stopped"
+    code = proc.exitcode
+    proc.close()
+    if code == 0:
+        return None
+    if code is not None and 1 <= code <= len(_REGEX_PROBES):
+        probe = _REGEX_PROBES[code - 1]
+        return (
+            f"took longer than {int(_REGEX_BUDGET_S * 1000)}ms on a "
+            f"{len(probe)}-character test string"
+        )
+    return f"could not be measured safely (the check exited {code})"
 
 
 def _manual_msgid(
@@ -411,12 +483,11 @@ async def _exec_ledger_add_rule(
             f"error: match stacks more than {_MAX_QUANTIFIERS} quantifiers (*, +, ?, {{n}}), "
             "which gets slow faster than the length of what it is matched against."
         )
-    slow_on = await asyncio.to_thread(_slow_regex_probe, match)
-    if slow_on is not None:
+    too_slow = await asyncio.to_thread(_regex_too_slow, match)
+    if too_slow is not None:
         return (
-            f"error: match took longer than {int(_REGEX_BUDGET_S * 1000)}ms on a "
-            f"{len(slow_on)}-character test string. A payee can be 80 characters, and this "
-            "rule runs against every money event from now on, so it has to be quick."
+            f"error: match {too_slow}. A payee can be 80 characters, and this rule runs "
+            "against every money event from now on, so it has to be quick."
         )
     if entity is not None and entity not in _ENTITIES:
         return f"error: entity must be one of {', '.join(_ENTITIES)}, got {entity!r}"

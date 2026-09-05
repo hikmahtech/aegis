@@ -874,6 +874,27 @@ async def test_add_rule_refuses_a_catastrophic_regex_before_persisting_it(db_poo
         assert out == "rule added; reclassified 0 postings", (pattern, out)
 
 
+def test_the_regex_check_stops_a_pattern_that_never_finishes():
+    """The backstop, tested directly because nothing that gets past the three
+    cheap bounds can reach it.
+
+    `"a*" * 40 + "$"` does not finish against a 25-character string — measured,
+    it ran past 300 seconds and hung the whole suite when the quantifier cap was
+    removed. `re` holds its thread and ignores every timeout Python can express,
+    so the only thing that can end it is killing the process it runs in. This
+    asserts that the check ANSWERS, which no in-process version can do.
+    """
+    from aegis.services.tools.ledger import _regex_too_slow
+
+    started = time.perf_counter()
+    reason = _regex_too_slow("a*" * 40 + "$", kill_after=2.0)
+    elapsed = time.perf_counter() - started
+    assert reason is not None and "did not finish" in reason, reason
+    assert elapsed < 20, elapsed
+    # And a real rule still comes back clean through the same path.
+    assert _regex_too_slow("mahavitaran.*suncity 501") is None
+
+
 @pytest.mark.asyncio
 async def test_add_rule_regex_check_is_itself_bounded(db_pool, tmp_path):
     """The timing probe cannot be interrupted — `re` has no timeout — so the
