@@ -54,13 +54,18 @@ async def test_render_money_brief_activity_returns_both_renderings():
 
 @pytest.mark.asyncio
 async def test_render_money_brief_names_the_commodity_hledger_converted_to():
-    """`build_money_brief` runs `hledger -X ₹`, so the caveat must name ₹ —
-    not whatever `home_currency` happens to say."""
+    """`build_money_brief` runs `hledger -X ₹` unconditionally, so the caveat
+    must name ₹ — not whatever `home_currency` happens to say.
+
+    `home_currency="USD"` is what makes this falsifiable: with "INR" the two
+    candidate implementations agree, because `_symbol("INR")` IS `HOME_SYMBOL`.
+    """
     out = await ActivityEnvironment().run(
-        _act(home_currency="INR").render_money_brief,
+        _act(home_currency="USD").render_money_brief,
         {**_BRIEF, "fx_unconverted": []},
     )
     assert f"converted to {HOME_SYMBOL}" in out["html"]
+    assert "converted to $" not in out["html"]
 
 
 @pytest.mark.asyncio
@@ -87,17 +92,19 @@ async def test_notify_money_message_sends_the_html_as_maou():
     delivery = _Delivery()
     act = _act()
     act.delivery = delivery
-    await ActivityEnvironment().run(
+    ok = await ActivityEnvironment().run(
         act.notify_money_message, "<b>Money brief</b>", "money_brief_notify_failed"
     )
+    assert ok is True
     assert delivery.sent == [
         {"agent_id": "maou", "message": "<b>Money brief</b>", "chat_id": 0}
     ]
 
 
 @pytest.mark.asyncio
-async def test_notify_money_message_never_raises():
-    """A dead comms server must not fail the brief — the report is still filed."""
+async def test_notify_money_message_never_raises_and_reports_the_failure():
+    """A dead comms server must not fail the brief — but the flow must not go
+    on to record `sent: true` for a message nobody received."""
 
     class Boom(_Delivery):
         async def send_message(self, **kw):
@@ -105,7 +112,36 @@ async def test_notify_money_message_never_raises():
 
     act = _act()
     act.delivery = Boom()
-    await ActivityEnvironment().run(act.notify_money_message, "<b>x</b>", "money_brief_notify_failed")
+    ok = await ActivityEnvironment().run(
+        act.notify_money_message, "<b>x</b>", "money_brief_notify_failed"
+    )
+    assert ok is False
+
+
+@pytest.mark.asyncio
+async def test_notify_money_message_reports_an_ok_false_response():
+    """Comms answered, and said no. Same outcome for the reader as a raise."""
+    act = _act()
+    act.delivery = _Delivery(ok=False)
+    ok = await ActivityEnvironment().run(
+        act.notify_money_message, "<b>x</b>", "money_brief_notify_failed"
+    )
+    assert ok is False
+
+
+@pytest.mark.asyncio
+async def test_notify_money_message_reports_a_channel_with_no_push_target():
+    """The web channel has no external push target, so nothing was sent."""
+
+    class Web(_Delivery):
+        channel = "web"
+
+    act = _act()
+    act.delivery = Web()
+    ok = await ActivityEnvironment().run(
+        act.notify_money_message, "<b>x</b>", "money_brief_notify_failed"
+    )
+    assert ok is False
 
 
 @pytest.mark.asyncio

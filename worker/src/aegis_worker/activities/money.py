@@ -1533,13 +1533,16 @@ class MoneyActivities:
         return money_render.render_month_close(close, HOME_SYMBOL)
 
     @activity.defn
-    async def notify_money_message(self, html: str, log_event: str) -> None:
+    async def notify_money_message(self, html: str, log_event: str) -> bool:
         """Push one already-rendered message to the agent's channel.
 
         The caller renders; this only delivers. `safe_send_message` never
-        raises, so a dead comms server costs the message, not the run.
+        raises, so a dead comms server costs the message, not the run — and it
+        returns whether the message actually landed, which is what the flow
+        reports as `sent`. Reporting True on the attempt would put `sent: true`
+        in `workflow_runs` for a week the user never heard from Maou.
         """
-        await safe_send_message(
+        return await safe_send_message(
             self.delivery, agent_id=self.agent_id, message=html, log_event=log_event
         )
 

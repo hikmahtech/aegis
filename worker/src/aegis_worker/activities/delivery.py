@@ -12,7 +12,7 @@ from temporalio import activity
 _logger = structlog.get_logger()
 
 
-async def safe_send_message(delivery: Any, *, agent_id: str, message: str, log_event: str) -> None:
+async def safe_send_message(delivery: Any, *, agent_id: str, message: str, log_event: str) -> bool:
     """Best-effort wrapper around `DeliveryActivities.send_message` for
     fire-and-forget notification call sites. Records the ACTUAL delivery
     outcome in `notification_log` — `sent` reflects `result.ok`, never a
@@ -29,9 +29,16 @@ async def safe_send_message(delivery: Any, *, agent_id: str, message: str, log_e
 
     Web channel (Phase C): proactive FYIs have no external push target — the
     admin surfaces (inbox / feeds) are the destination — so this no-ops.
+
+    Returns whether the message actually reached the channel. It is the same
+    `ok` that already goes into `notification_log`, handed back so a caller who
+    reports "sent" to the user is reporting delivery rather than the attempt.
+    Every path that drops the message — a non-Slack channel, a spent
+    notification budget, a raise, an `ok=false` — returns False. Callers that
+    do not care may keep ignoring it; it still never raises.
     """
     if getattr(delivery, "channel", "web") != "slack":
-        return
+        return False
     pool = getattr(delivery, "db_pool", None)
     if pool is not None:
         try:
@@ -47,7 +54,7 @@ async def safe_send_message(delivery: Any, *, agent_id: str, message: str, log_e
                     "notification_deferred", log_event=log_event, agent_id=agent_id, today=today
                 )
                 await record_notification(pool, agent_id, log_event, sent=False)
-                return
+                return False
         except Exception as exc:  # noqa: BLE001 — budget must never block delivery
             _logger.warning("notification_budget_check_failed", error=str(exc)[:200])
 
@@ -66,7 +73,7 @@ async def safe_send_message(delivery: Any, *, agent_id: str, message: str, log_e
     except Exception as exc:  # noqa: BLE001 — boundary, must not propagate
         _logger.warning(f"{log_event}_raised", error=str(exc)[:200])
         await _record(f"{log_event}_raised", sent=False)
-        return
+        return False
 
     ok = isinstance(result, dict) and bool(result.get("ok"))
     if not ok:
@@ -77,6 +84,7 @@ async def safe_send_message(delivery: Any, *, agent_id: str, message: str, log_e
             else "non_dict_result",
         )
     await _record(log_event if ok else f"{log_event}_ok_false", sent=ok)
+    return ok
 
 
 @dataclass

@@ -3,8 +3,15 @@
 Light HTML for Slack (`<b>`, `<pre>`); Markdown for the books repo. hledger
 text is quoted verbatim; only index-derived amounts go through `fmt_money`.
 
-Two shapes of bad input arrive here as normal traffic, not as caller bugs, and
-both are handled rather than defended against:
+**The two outputs are built from the same PARTS, never from each other.**
+`html.escape` defaults to `quote=True`, so an escaped string carries `&#x27;`
+and `&amp;` — fine inside a Slack message, permanent damage inside
+`reports/weekly/*.md`, where `Domino's Pizza` would be committed to the user's
+books repo as `Domino&#x27;s Pizza` every week forever. Every row below
+therefore composes its plain text once and escapes only on the way into the
+HTML list.
+
+Three shapes of bad input arrive here as normal traffic, not as caller bugs:
 
 * `fx_stale` — hledger's `-X ₹` converts nothing it has no price for and then
   writes every commodity into one cell, so the ₹ figures understate the truth.
@@ -16,6 +23,8 @@ both are handled rather than defended against:
   *string* `"None"`. `Decimal("None")` raises, and interpolating it prints the
   word "None" at the reader; both are wrong, so such a row renders without a
   fabricated amount instead.
+* a missing payee — `journal_index.payee` is nullable too (migration 026), one
+  column over, and would print the word `None` the same way.
 """
 
 from __future__ import annotations
@@ -28,6 +37,26 @@ from aegis.services.money_format import fmt_money
 
 # What a row says instead of an amount when the index has none for it.
 NO_AMOUNT = "amount unknown"
+# ...and instead of a name.
+NO_NAME = "—"
+
+# How many lines of hledger's balance table the CHAT message carries. The
+# filed Markdown report is never truncated — it is the complete record, and the
+# pointer line below sends the reader to it.
+#
+# The cap exists because the Slack adapter chunks at 2800 chars
+# (`_SLACK_MAX_CHARS`) by splitting on line boundaries with no awareness of
+# code fences, while `<pre>` becomes a triple-backtick fence. A brief that
+# overflows therefore ends message 1 mid-table with an unclosed fence and opens
+# message 2 with raw rows — the centrepiece renders mangled, and nothing logs
+# it. 20 lines of a `bal --depth 2` table is roughly 800 chars, which keeps a
+# realistic brief (payees + dues + unknowns + closed dues) inside one message.
+MAX_LEDGER_LINES = 20
+
+# Marks a row hledger PREDICTED from a `~ periodic` rule, as opposed to a due
+# the index recorded from a real bill. Both belong in one "money leaving soon"
+# list, but the reader has to be able to tell a forecast from a fact.
+FORECAST_MARK = "forecast"
 
 
 def _money(value: object, currency: str | None = "INR") -> str:
@@ -39,6 +68,9 @@ def _money(value: object, currency: str | None = "INR") -> str:
     if value is None:
         return ""
     text = str(value).strip()
+    # The known production shape, spelled out so a reader need not know that
+    # `Decimal("None")` raises. The `except` below is the backstop for
+    # anything else the column could hold.
     if text in ("", "None"):
         return ""
     try:
@@ -50,6 +82,20 @@ def _money(value: object, currency: str | None = "INR") -> str:
 def _amount(value: object, currency: str | None = "INR") -> str:
     """`_money`, but never blank — a row still has to read as a sentence."""
     return _money(value, currency) or NO_AMOUNT
+
+
+def _name(value: object) -> str:
+    """A payee/description as PLAIN text — never the word "None"."""
+    text = "" if value is None else str(value).strip()
+    return text if text and text != "None" else NO_NAME
+
+
+def _clip(text: str, limit: int = MAX_LEDGER_LINES) -> tuple[str, int]:
+    """`text` cut to `limit` lines, plus how many lines were dropped."""
+    lines = (text or "").rstrip("\n").split("\n")
+    if len(lines) <= limit:
+        return text, 0
+    return "\n".join(lines[:limit]) + "\n", len(lines) - limit
 
 
 def _fx_warning(data: dict, home_symbol: str) -> tuple[str, str] | None:
@@ -94,10 +140,20 @@ def render_money_brief(brief: dict, home_symbol: str = "₹") -> dict:
     line = f"Personal: in {_money(p.get('income') or '0')} · out {_money(p.get('expenses') or '0')}"
     line2 = f"Hikmah: in {_money(h.get('income') or '0')} · out {_money(h.get('expenses') or '0')}"
     html += [line, line2, ""]
-    md += [line, line2, ""]
+    # Bulleted in Markdown: two adjacent unbulleted lines are ONE paragraph to
+    # every Markdown renderer, so GitHub would run the two entities together.
+    md += [f"- {line}", f"- {line2}", ""]
 
     if brief.get("books_ok") and brief.get("bal_text"):
-        html += ["<b>Where it went</b>", f"<pre>{escape(brief['bal_text'])}</pre>", ""]
+        clipped, dropped = _clip(brief["bal_text"])
+        html += ["<b>Where it went</b>", f"<pre>{escape(clipped)}</pre>"]
+        if dropped:
+            html.append(
+                f"…{dropped} more lines — the full table is in "
+                f"reports/weekly/{escape(str(brief['as_of']))}.md."
+            )
+        html.append("")
+        # The filed report is the record: never clipped.
         md += ["## Where it went", "```", brief["bal_text"].rstrip("\n"), "```", ""]
     elif not brief.get("books_ok"):
         html += ["Books unavailable — index only.", ""]
@@ -108,8 +164,9 @@ def render_money_brief(brief: dict, home_symbol: str = "₹") -> dict:
         md.append("## Top payees")
         for r in brief["top_payees"][:10]:
             # hledger's own amount string — quoted, never re-formatted.
-            html.append(f"{escape(str(r['payee']))} — {escape(str(r['amount']))}")
-            md.append(f"- {r['payee']} — {r['amount']}")
+            payee, amount = _name(r.get("payee")), str(r.get("amount") or "")
+            html.append(f"{escape(payee)} — {escape(amount)}")
+            md.append(f"- {payee} — {amount}")
         html.append("")
         md.append("")
 
@@ -120,14 +177,17 @@ def render_money_brief(brief: dict, home_symbol: str = "₹") -> dict:
         kind = " · fix payment" if d.get("kind") == "failed" else ""
         task = "(task)" if d.get("todoist_ref") else "(no task)"
         amount = _amount(d.get("amount"), d.get("currency"))
-        text = f"{d['due_on']} · {escape(str(d['payee']))} · {amount}{kind} · {task}"
-        html.append(text)
-        md.append(f"- {text}")
+        payee = _name(d.get("payee"))
+        tail = f" · {amount}{kind} · {task}"
+        html.append(f"{d['due_on']} · {escape(payee)}{tail}")
+        md.append(f"- {d['due_on']} · {payee}{tail}")
         rows += 1
     for f in brief.get("forecast") or []:
-        text = f"{f['date']} · {escape(str(f['description']))} · {escape(str(f['amount']))}"
-        html.append(text)
-        md.append(f"- {text}")
+        # A forecast is hledger's PREDICTION from a `~ periodic` rule, not a
+        # bill that arrived. Marked so the reader can tell it from a due.
+        desc, amount = _name(f.get("description")), str(f.get("amount") or "")
+        html.append(f"{f['date']} · {escape(desc)} · {escape(amount)} · {FORECAST_MARK}")
+        md.append(f"- {f['date']} · {desc} · {amount} · {FORECAST_MARK}")
         rows += 1
     if rows == 0:
         html.append("Nothing due.")
@@ -140,12 +200,10 @@ def render_money_brief(brief: dict, home_symbol: str = "₹") -> dict:
         md.append("## Unexplained")
         for u in brief["unknowns"][:10]:
             amount = _amount(u.get("amount"), u.get("currency"))
-            text = (
-                f"{u['occurred_on']} · {escape(str(u['payee']))} · {amount} · "
-                f"{escape(str(u.get('channel') or '-'))}"
-            )
-            html.append(text)
-            md.append(f"- {text}")
+            payee, channel = _name(u.get("payee")), _name(u.get("channel"))
+            tail = f" · {amount} · "
+            html.append(f"{u['occurred_on']} · {escape(payee)}{tail}{escape(channel)}")
+            md.append(f"- {u['occurred_on']} · {payee}{tail}{channel}")
         hint = 'Reply with "<payee> is <account>" or use ledger_add_rule.'
         html += [escape(hint), ""]
         md += [hint, ""]
@@ -154,9 +212,10 @@ def render_money_brief(brief: dict, home_symbol: str = "₹") -> dict:
         html.append("<b>Paid this week</b>")
         md.append("## Paid this week")
         for c in brief["closed_dues"]:
-            text = f"{escape(str(c['payee']))} · {_amount(c.get('amount'), c.get('currency'))}"
-            html.append(text)
-            md.append(f"- {text}")
+            payee = _name(c.get("payee"))
+            amount = _amount(c.get("amount"), c.get("currency"))
+            html.append(f"{escape(payee)} · {amount}")
+            md.append(f"- {payee} · {amount}")
         html.append("")
         md.append("")
 
@@ -167,7 +226,7 @@ def render_money_brief(brief: dict, home_symbol: str = "₹") -> dict:
         house.append(f"{brief['low_confidence']} low-confidence LLM postings")
     if house:
         html += ["<b>Housekeeping</b>", " · ".join(house)]
-        md += ["## Housekeeping", " · ".join(house)]
+        md += ["## Housekeeping", f"- {' · '.join(house)}"]
 
     return {"html": "\n".join(html).rstrip("\n"), "markdown": "\n".join(md).rstrip("\n") + "\n"}
 
@@ -182,10 +241,16 @@ def render_month_close(close: dict, home_symbol: str = "₹") -> dict:
         md += [fx[1], ""]
 
     if close.get("books_ok"):
-        html += [
-            f"<pre>{escape(close.get('is_text') or '')}</pre>",
-            f"<pre>{escape(close.get('bs_text') or '')}</pre>",
-        ]
+        # Same fence-chunking hazard as the brief, and two statements this
+        # time. The filed report under reports/monthly/ keeps both in full.
+        for key in ("is_text", "bs_text"):
+            clipped, dropped = _clip(close.get(key) or "")
+            html.append(f"<pre>{escape(clipped)}</pre>")
+            if dropped:
+                html.append(
+                    f"…{dropped} more lines — the full statement is in "
+                    f"reports/monthly/{escape(str(close['month']))}.md."
+                )
         md += [
             "```",
             (close.get("is_text") or "").rstrip("\n"),

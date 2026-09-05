@@ -50,15 +50,19 @@ class MoneyBriefFlow:
             "render_money_brief", args=[brief], start_to_close_timeout=_FAST, retry_policy=NO_RETRY
         )
 
+        # `sent` is delivery, not dispatch: the activity hands back what
+        # `safe_send_message` observed, so a Slack outage reads as sent=False
+        # in `workflow_runs` instead of a silent lie.
         sent = False
         if not config.silent:
-            await workflow.execute_activity(
-                "notify_money_message",
-                args=[rendered["html"], "money_brief_notify_failed"],
-                start_to_close_timeout=_FAST,
-                retry_policy=NO_RETRY,
+            sent = bool(
+                await workflow.execute_activity(
+                    "notify_money_message",
+                    args=[rendered["html"], "money_brief_notify_failed"],
+                    start_to_close_timeout=_FAST,
+                    retry_policy=NO_RETRY,
+                )
             )
-            sent = True
 
         await workflow.execute_activity(
             "write_money_report",

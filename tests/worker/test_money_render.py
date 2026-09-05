@@ -9,7 +9,11 @@ brief printed `amount_cents` or the word "None" at the user.
 from __future__ import annotations
 
 from aegis_worker.activities.money import HOME_SYMBOL
-from aegis_worker.activities.money_render import render_money_brief, render_month_close
+from aegis_worker.activities.money_render import (
+    MAX_LEDGER_LINES,
+    render_money_brief,
+    render_month_close,
+)
 
 BRIEF = {
     "as_of": "2026-09-06",
@@ -108,7 +112,7 @@ def test_brief_html_has_every_section_and_major_units():
     assert "Unknown Big — ₹ 6,000.00" in html
     assert "2026-09-07 · Axis credit card XX13 · ₹1,00,308.53 · (task)" in html
     assert "2026-09-15 · Medium · ₹199.00 · fix payment · (no task)" in html
-    assert "2026-09-15 · MSEDCL Suncity 501 · ₹ 7,170.00" in html
+    assert "2026-09-15 · MSEDCL Suncity 501 · ₹ 7,170.00 · forecast" in html
     assert "2026-09-02 · Unknown Big · ₹6,000.00 · upi" in html
     assert "ledger_add_rule" in html
     assert "Airtel · ₹5,306.46" in html
@@ -123,6 +127,24 @@ def test_brief_markdown_mirrors_html():
     assert "- 2026-09-07 · Axis credit card XX13 · ₹1,00,308.53 · (task)" in md
     assert "- 2026-09-02 · Unknown Big · ₹6,000.00 · upi" in md
     assert "- Airtel · ₹5,306.46" in md
+
+
+def test_brief_markdown_bullets_every_standalone_line():
+    """Two adjacent unbulleted lines are ONE paragraph to every Markdown
+    renderer, so an unbulleted entity pair renders as `…₹6,250.00 Hikmah: in…`
+    on the GitHub view of the filed report."""
+    md = render_money_brief(BRIEF)["markdown"]
+    assert "- Personal: in ₹1,500.00 · out ₹6,250.00" in md
+    assert "- Hikmah: in ₹1,00,000.00 · out ₹262.30" in md
+    assert "- 2 unpushed commits · 1 low-confidence LLM postings" in md
+    # Nothing in the body is left as a bare line that would glue to its neighbour.
+    body = md.split("\n")
+    glued = [
+        (a, b)
+        for a, b in zip(body, body[1:], strict=False)
+        if a and b and not a.startswith(("#", "-", "`", "_", "*")) and not b.startswith(("#", "`"))
+    ]
+    assert glued == []
 
 
 def test_brief_without_books():
@@ -152,6 +174,90 @@ def test_brief_escapes_payee_markup():
     assert "&lt;b&gt;Ac &amp; Me&lt;/b&gt; — ₹ 1.00" in html
     assert "<b>Ac & Me</b>" not in html
     assert "&lt;i&gt;x&lt;/i&gt;" in html
+
+
+def test_markdown_never_carries_html_entities():
+    """The Markdown is committed to the user's books repo and kept forever, so
+    it must be the PLAIN text — not the escaped HTML reused. `html.escape`
+    defaults to quote=True, so an apostrophe becomes `&#x27;` and ordinary
+    merchants (Domino's, Levi's, Barnes & Noble) would be corrupted weekly."""
+    payee = "Domino's Pizza & Barnes & Noble"
+    out = render_money_brief(
+        {
+            **BRIEF,
+            "top_payees": [{"payee": payee, "amount": "₹ 1.00"}],
+            "dues": [
+                {
+                    "payee": payee,
+                    "amount": "199.00",
+                    "currency": "INR",
+                    "due_on": "2026-09-15",
+                    "kind": "due",
+                    "todoist_ref": None,
+                }
+            ],
+            "forecast": [{"date": "2026-09-15", "description": payee, "amount": "₹ 2.00"}],
+            "unknowns": [
+                {
+                    "payee": payee,
+                    "amount": "1.00",
+                    "currency": "INR",
+                    "occurred_on": "2026-09-02",
+                    "channel": "upi",
+                }
+            ],
+            "closed_dues": [{"payee": payee, "amount": "5.00", "currency": "INR"}],
+        }
+    )
+    md = out["markdown"]
+    for entity in ("&#x27;", "&amp;", "&quot;", "&lt;", "&gt;"):
+        assert entity not in md, f"{entity} leaked into the filed report"
+    assert md.count(payee) == 5  # top payee, due, forecast, unexplained, closed due
+    # ...and the HTML still escapes all five.
+    assert "Domino&#x27;s Pizza &amp; Barnes &amp; Noble" in out["html"]
+    assert payee not in out["html"]
+
+
+def test_forecast_rows_are_marked_as_predictions():
+    """A forecast comes from a `~ periodic` rule, a due from a real bill. They
+    share one list so the reader sees all money leaving soon — which only works
+    if a prediction is distinguishable from a fact."""
+    out = render_money_brief(BRIEF)
+    for text in (out["html"], out["markdown"]):
+        assert "MSEDCL Suncity 501 · ₹ 7,170.00 · forecast" in text
+        # The real due is NOT marked.
+        assert "Axis credit card XX13 · ₹1,00,308.53 · (task)" in text
+        assert "Axis credit card XX13 · ₹1,00,308.53 · (task) · forecast" not in text
+
+
+def test_long_ledger_table_is_clipped_in_chat_but_whole_in_the_report():
+    """The Slack adapter chunks at 2800 chars on line boundaries with no fence
+    awareness, and `<pre>` is a code fence — an overlong table would split
+    mid-fence and render mangled. The filed report keeps every row."""
+    rows = "".join(f"  ₹ {n},000.00  expenses:row{n}\n" for n in range(1, 61))
+    out = render_money_brief({**BRIEF, "bal_text": rows})
+    html, md = out["html"], out["markdown"]
+    assert html.count("expenses:row") == MAX_LEDGER_LINES
+    assert f"…{60 - MAX_LEDGER_LINES} more lines" in html
+    assert "reports/weekly/2026-09-06.md" in html
+    # Nothing is dropped from the record.
+    assert md.count("expenses:row") == 60
+    assert "more lines" not in md
+
+
+def test_short_ledger_table_is_not_clipped_or_annotated():
+    out = render_money_brief(BRIEF)
+    assert "more lines" not in out["html"]
+    assert "<pre>  ₹ 6,250.00  expenses\n</pre>" in out["html"]
+
+
+def test_month_close_clips_long_statements_in_chat_only():
+    long_is = "".join(f"  ₹ {n}.00  income:row{n}\n" for n in range(1, 41))
+    out = render_month_close({**CLOSE, "is_text": long_is})
+    assert out["html"].count("income:row") == MAX_LEDGER_LINES
+    assert f"…{40 - MAX_LEDGER_LINES} more lines" in out["html"]
+    assert "reports/monthly/2026-08.md" in out["html"]
+    assert out["markdown"].count("income:row") == 40
 
 
 def test_brief_nothing_due():
@@ -260,8 +366,46 @@ def test_unexplained_survives_a_null_amount():
             ],
         }
     )
-    assert "2026-09-02 · Mystery · amount unknown · -" in out["html"]
+    assert "2026-09-02 · Mystery · amount unknown · —" in out["html"]
     assert "None" not in out["html"]
+
+
+def test_rows_survive_a_null_payee():
+    """`journal_index.payee` is nullable too (migration 026), one column over
+    from `amount` — `str(None)` would print the word "None" at the reader."""
+    out = render_money_brief(
+        {
+            **BRIEF,
+            "top_payees": [{"payee": None, "amount": "₹ 1.00"}],
+            "dues": [
+                {
+                    "payee": None,
+                    "amount": "199.00",
+                    "currency": "INR",
+                    "due_on": "2026-09-15",
+                    "kind": "due",
+                    "todoist_ref": None,
+                }
+            ],
+            "unknowns": [
+                {
+                    "payee": None,
+                    "amount": "1.00",
+                    "currency": "INR",
+                    "occurred_on": "2026-09-02",
+                    "channel": "upi",
+                }
+            ],
+            "closed_dues": [{"payee": None, "amount": "5.00", "currency": "INR"}],
+            "forecast": [],
+        }
+    )
+    for text in (out["html"], out["markdown"]):
+        assert "None" not in text
+        assert "2026-09-15 · — · ₹199.00 · (no task)" in text
+        assert "2026-09-02 · — · ₹1.00 · upi" in text
+        assert "— · ₹5.00" in text
+        assert "— — ₹ 1.00" in text
 
 
 # --------------------------------------------------------------------------

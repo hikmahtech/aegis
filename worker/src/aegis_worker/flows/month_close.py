@@ -39,15 +39,17 @@ class MonthCloseFlow:
             "render_month_close", args=[close], start_to_close_timeout=_FAST, retry_policy=NO_RETRY
         )
 
+        # `sent` reports delivery, not dispatch — see MoneyBriefFlow.
         sent = False
         if not config.silent:
-            await workflow.execute_activity(
-                "notify_money_message",
-                args=[rendered["html"], "month_close_notify_failed"],
-                start_to_close_timeout=_FAST,
-                retry_policy=NO_RETRY,
+            sent = bool(
+                await workflow.execute_activity(
+                    "notify_money_message",
+                    args=[rendered["html"], "month_close_notify_failed"],
+                    start_to_close_timeout=_FAST,
+                    retry_policy=NO_RETRY,
+                )
             )
-            sent = True
 
         await workflow.execute_activity(
             "write_money_report",
