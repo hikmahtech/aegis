@@ -326,3 +326,50 @@ def test_is_autopay_is_false_when_the_mail_says_autopay_is_off():
         "your 200 GB storage plan automatically renews monthly for Rs 219 starting "
         "2026-08-06 12:53:33 America/Los_Angeles until cancelled"
     )
+
+
+def test_has_money_shape_gates_the_extractor():
+    """No currency anywhere means no amount to extract, so no LLM call.
+
+    Measured over all 193 LLM-parsed emails in prod on 2026-09-05: this
+    predicate is true for 56 of them and false for the other 137, and every
+    event that carried a real amount is in the 56. The mail it turns away is
+    NSE and BSE market alerts, GST portal notices, Groww digests, Amazon KDP
+    royalty reports and newsletters — financial-looking mail with no
+    transaction in it, each of which was costing a ~1,600-token extraction to
+    conclude nothing.
+
+    Deliberately case-sensitive on the letter codes: `Rs` case-insensitively
+    matches inside "hours", "years" and "customers", which would pass almost
+    every email and defeat the gate.
+    """
+    from aegis.services.bank_parsers import has_money_shape
+
+    # Real receipts and bills, all of which must still reach the extractor.
+    assert has_money_shape("Rs.10.00 is debited from your account ending 1225")
+    assert has_money_shape("Bill Amount: Rs. 55275.34 Due Date: Aug 4, 2026")
+    assert has_money_shape("Receipt from LSEG £22269.97 Paid August 2, 2026")
+    assert has_money_shape("Your bill for usage on GitHub. Bill amount: $4.00")
+    assert has_money_shape("Amount to be debited: USD 200.00")
+    # AWS writes the code flush against the number. The first version of this
+    # gate had a trailing \b and dropped this real ₹2,068.12 bill; running the
+    # predicate over the live corpus is what caught it.
+    assert has_money_shape("Your total amount is: INR2,068.12.")
+    assert has_money_shape("your subscription renews for ₹149.00/month")
+    assert has_money_shape("Transaction Amount: INR 1,00,308.53")
+
+    # The mail that was burning the budget.
+    assert not has_money_shape("NSE Circular: trading holiday on 2 October 2026")
+    assert not has_money_shape("Your GST return for August 2026 is due for filing")
+    assert not has_money_shape("Complete Your Re-KYC to Enable Withdrawals")
+    assert not has_money_shape("")
+
+    # A currency token with no digit anywhere is prose, not a receipt.
+    assert not has_money_shape("we accept USD and INR for all invoices")
+
+    # The stray '96' that html_to_text emits (issue #381) is not an amount,
+    # and this gate is what keeps it from becoming one.
+    assert not has_money_shape(
+        "96\nDeposit Completed!\nHi ARSHAD,\nYour Re-KYC is still pending, and "
+        "withdrawals remain temporarily disabled on your account."
+    )

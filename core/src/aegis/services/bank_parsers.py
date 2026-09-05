@@ -74,6 +74,38 @@ def is_autopay(text: str) -> bool:
     return bool(_AUTOPAY_RE.search(t)) and not _AUTOPAY_OFF_RE.search(t)
 
 
+# The extractor gate. Mail with no currency token anywhere cannot state an
+# amount, so there is nothing for the LLM to find and the call is pure cost.
+# That cost is not hypothetical: 324 money extractions burned 522,846 tokens
+# on 2026-09-05 and tripped the governor's kill switch, which then blocked
+# every LLM call in AEGIS — email triage included. Most of it was spent on
+# financial-LOOKING mail with no transaction in it (NSE and BSE alerts, GST
+# portal notices, Groww digests, KDP royalty reports, newsletters), because
+# triage correctly tags those `financial` and the money lane then pays full
+# price to conclude nothing.
+#
+# CASE-SENSITIVE on the letter codes, deliberately: `Rs` under IGNORECASE
+# matches inside "hours", "years" and "customers", which passes nearly every
+# email and defeats the gate entirely.
+# No trailing \b on the letter codes: AWS writes "INR2,068.12" with no space,
+# and `\bINR\b` rejects it because R and 2 are both word characters. Caught by
+# running this against the live corpus — the first version dropped that bill.
+_CURRENCY_TOKEN_RE = re.compile(r"\b(?:USD|INR|GBP|EUR|AED|SGD|Rs)|[₹$£€]")
+_DIGIT_RE = re.compile(r"[0-9]")
+
+
+def has_money_shape(text: str) -> bool:
+    """True when the mail could state an amount — a currency token and a digit.
+
+    Deliberately permissive: it decides only whether an extraction is worth
+    paying for, so a false positive costs one LLM call while a false negative
+    loses a transaction. Validated against every LLM-parsed email in prod on
+    2026-09-05 — it turns away 137 of 193 and loses no real event.
+    """
+    t = text or ""
+    return bool(_CURRENCY_TOKEN_RE.search(t)) and bool(_DIGIT_RE.search(t))
+
+
 def _date_dmy2(s: str) -> date:  # 02-09-26
     return datetime.strptime(s, "%d-%m-%y").date()
 

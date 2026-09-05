@@ -137,7 +137,8 @@ async def test_parse_llm_low_confidence_lands_in_unknown_and_rule_sets_entity(db
     act = _act(db_pool, _repo(tmp_path), llm=llm)
     ev = await ActivityEnvironment().run(
         act.parse_money_email,
-        _receipt(sender="invoice+statements@stripe.com", subject="Receipt", body="x"),
+        _receipt(sender="invoice+statements@stripe.com", subject="Receipt",
+                 body="Receipt from Eleven Labs Rs 1936.00 paid 25 August 2026"),
     )
     # the rule wins over the low-confidence unknown: entity hikmah, account from the rule
     assert ev["entity"] == "hikmah" and ev["account"] == "expenses:hikmah:saas"
@@ -149,7 +150,8 @@ async def test_parse_llm_low_confidence_lands_in_unknown_and_rule_sets_entity(db
         "entity": "personal",
     }])
     ev = await ActivityEnvironment().run(
-        act.parse_money_email, _receipt(sender="x@y.com", subject="s", body="b")
+        act.parse_money_email,
+        _receipt(sender="x@y.com", subject="s", body="Rs 50.00 paid at Some Shop"),
     )
     assert ev["account"] == "expenses:unknown" and ev["occurred_on"] == "2026-09-02"
 
@@ -162,7 +164,8 @@ async def test_parse_flags_llm_failure(db_pool, tmp_path):
     )
     act = _act(db_pool, _repo(tmp_path), llm=llm)
     ev = await ActivityEnvironment().run(
-        act.parse_money_email, _receipt(sender="a@b.c", subject="s", body="b")
+        act.parse_money_email,
+        _receipt(sender="a@b.c", subject="s", body="Rs 100.00 charged to your card"),
     )
     assert ev.get("_parse_failed") is True
 
@@ -590,3 +593,50 @@ async def test_parse_marks_a_charge_that_happens_by_itself(db_pool, tmp_path):
                  body="Your bill of Rs 8100.00 is ready. Pay by 11-08-2099."),
     )
     assert ev["autopay"] is False
+
+
+@pytest.mark.asyncio
+async def test_parse_does_not_pay_the_llm_for_mail_with_no_money_in_it(db_pool, tmp_path):
+    """Money-free mail never reaches the extractor.
+
+    On 2026-09-05 the backfill spent 522,846 tokens on 324 extractions and
+    tripped the governor's kill switch, which then blocked every LLM call in
+    AEGIS — email triage included. Most of it went on mail triage correctly
+    tags `financial` that holds no transaction: NSE and BSE alerts, GST portal
+    notices, Groww digests, KDP royalty reports.
+    """
+    llm = AsyncMock()
+    llm.extract_money_batch = AsyncMock(return_value=[])
+    act = _act(db_pool, _repo(tmp_path), llm=llm)
+
+    ev = await ActivityEnvironment().run(
+        act.parse_money_email,
+        _receipt(sender="nse_alerts@nse.co.in", subject="NSE Circular: trading holiday",
+                 body="The exchange will be closed on 2 October 2099."),
+    )
+    assert ev["kind"] == "info" and ev["parser"] == "no_amount"
+    llm.extract_money_batch.assert_not_awaited()
+
+    # The stray '96' html_to_text emits (issue #381) is not an amount either —
+    # it produced a fabricated ₹96 WazirX transaction in the live books.
+    ev = await ActivityEnvironment().run(
+        act.parse_money_email,
+        _receipt(sender="noreply@wazirx.com", subject="Complete Your Re-KYC",
+                 body="96\nDeposit Completed!\nYour Re-KYC is still pending."),
+    )
+    assert ev["kind"] == "info" and ev["parser"] == "no_amount"
+    llm.extract_money_batch.assert_not_awaited()
+
+    # A real receipt still reaches the extractor, including AWS's no-space form.
+    llm.extract_money_batch = AsyncMock(return_value=[{
+        "kind": "due", "direction": "out", "amount": "2068.12", "currency": "INR",
+        "payee": "Amazon Web Services", "payee_key": "amazon web services",
+        "channel": "bill", "confidence": 0.9, "parser": "llm", "source_class": "receipt",
+    }])
+    ev = await ActivityEnvironment().run(
+        act.parse_money_email,
+        _receipt(sender="no-reply@amazonaws.com", subject="AWS Billing Statement Available",
+                 body="Your total amount is: INR2,068.12."),
+    )
+    assert ev["kind"] == "due" and ev["amount"] == "2068.12"
+    llm.extract_money_batch.assert_awaited()
