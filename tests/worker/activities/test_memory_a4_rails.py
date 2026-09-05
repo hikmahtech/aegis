@@ -18,6 +18,7 @@ report a false pass.
 
 from __future__ import annotations
 
+import itertools
 import json
 
 import pytest
@@ -46,10 +47,19 @@ async def _snapshot(pool, agent_id: str) -> list[tuple]:
     return [tuple(r) for r in rows]
 
 
+# Row content is unique across CALLS, not just within one. `agent_memory` grew
+# a partial unique index on live `(agent_id, md5(content))` in migration 028,
+# and `test_recent_rows_are_never_touched` seeds the same agent twice — with a
+# per-call `range(n)` its "fresh" row was a byte-identical duplicate of the
+# first batch's row 0, so it was the index, not the recency rail, deciding the
+# outcome.
+_seed_seq = itertools.count()
+
+
 async def _seed_rows(pool, agent_id: str, n: int, *, age_days: int = 10) -> list[int]:
     """`n` plain rows, aged past every recency guard unless told otherwise."""
     ids = []
-    for i in range(n):
+    for i in itertools.islice(_seed_seq, n):
         ids.append(
             await pool.fetchval(
                 "INSERT INTO agent_memory (agent_id, content, importance, source, created_at) "

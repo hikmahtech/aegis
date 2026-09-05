@@ -38,11 +38,25 @@ _UNLEARNABLE_ORIGINS = frozenset({"agent_run_gate"})
 async def record_memory(
     pool: Any, agent_id: str, content: str, importance: float = 0.5, source: str = "correction"
 ) -> None:
+    """Write one durable lesson. Re-writing the same lesson is a NO-OP.
+
+    This runs inside `InteractionFlow`'s post-resolve hook, which Temporal
+    retries (`maximum_attempts=2`), and the curiosity hook's 240s books budget
+    can expire mid-flight — so attempt 2 arrives with byte-identical content
+    (issue #389). `ON CONFLICT DO NOTHING` against the partial unique index
+    from migration 028 keeps that a single belief.
+
+    Deliberately NOT a SELECT-then-INSERT: the check-then-write race is exactly
+    what a concurrent retry reproduces. The `WHERE` clause is not optional — an
+    `ON CONFLICT` arbiter for a PARTIAL index has to repeat that index's
+    predicate, or Postgres cannot infer it and raises.
+    """
     content = (content or "").strip()
     if not content:
         return
     await pool.execute(
-        "INSERT INTO agent_memory (agent_id, content, importance, source) VALUES ($1,$2,$3,$4)",
+        "INSERT INTO agent_memory (agent_id, content, importance, source) VALUES ($1,$2,$3,$4) "
+        "ON CONFLICT (agent_id, md5(content)) WHERE superseded_at IS NULL DO NOTHING",
         agent_id,
         content[:2000],
         float(importance),
@@ -250,9 +264,15 @@ _SQL_UPDATE = (
     "UPDATE agent_memory SET content = $3, importance = $4, last_consolidated_at = now() "
     "WHERE id = $2 AND agent_id = $1 AND superseded_at IS NULL"
 )
+# DO NOTHING, not a raise, on the migration-028 index. The whole plan runs in
+# ONE transaction ("applied whole or not at all"), so an ADD that restates a
+# live belief must not take every other op down with it. `INSERT 0 0` is a
+# status `_run` already reads as `no_rows_affected`, so the ledger records the
+# skip and the operator sees what happened.
 _SQL_ADD = (
     "INSERT INTO agent_memory (agent_id, content, importance, source, last_consolidated_at) "
-    "VALUES ($1, $2, $3, 'consolidation', now())"
+    "VALUES ($1, $2, $3, 'consolidation', now()) "
+    "ON CONFLICT (agent_id, md5(content)) WHERE superseded_at IS NULL DO NOTHING"
 )
 _SQL_LOG = (
     "INSERT INTO agent_memory_ops_log "

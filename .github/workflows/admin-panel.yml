@@ -1,0 +1,70 @@
+name: "Admin panel — Test"
+
+# Public repo: test only. Image build + swarm deploy live in the private
+# homelab-gitops infra repo (ansible), not here.
+
+# Until this job existed (issue #386) NOTHING in CI ran npm: a plain TypeScript
+# error in the admin SPA reached main with nothing objecting, and it stayed
+# invisible until someone opened the page. `npm run build` is `tsc -b && vite
+# build`, so the type check is the build.
+#
+# The `paths:` filter must list every input this job READS, not just the source
+# it is named after. Everything it reads is inside admin-panel/frontend —
+# src/, public/, index.html, package.json, package-lock.json, the three
+# tsconfigs, vite.config.ts and eslint.config.js — so the directory glob is the
+# complete list rather than a lazy one. Narrowing it to src/** would mean a
+# dependency bump or a tsconfig edit ran no job at all, which is not "skipped a
+# job", it is "disarmed the check that exists to validate that file" (#170).
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "admin-panel/frontend/**"
+      - ".github/workflows/admin-panel.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "admin-panel/frontend/**"
+      - ".github/workflows/admin-panel.yml"
+
+# Cancel superseded runs on the same PR branch; never cancel main pushes —
+# main is the deploy source, every merge's final state needs a verdict.
+concurrency:
+  group: admin-panel-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  test:
+    name: Build & Test
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: admin-panel/frontend
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          # Vite 8 needs 20.19+/22.12+, and money.test.ts formats en-IN
+          # amounts, which needs the full-ICU build Node ships by default.
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: admin-panel/frontend/package-lock.json
+
+      - name: Install
+        run: npm ci
+
+      # `tsc -b` first, then the bundle. This is the half of the job that
+      # closes the original gap.
+      - name: Build
+        run: npm run build
+
+      - name: Test
+        run: npm test
+
+      # `npm run lint` is deliberately NOT a step. eslint currently reports 349
+      # errors on code that predates this workflow (mostly `catch (e: any)`),
+      # so wiring it in as a gate would fail every PR from day one. Cleaning
+      # that up is its own change; adding the gate is what has to come after
+      # it, not instead of it.

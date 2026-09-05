@@ -1,0 +1,42 @@
+-- 028: one live belief per agent (issue #389).
+--
+-- `record_memory` is a plain INSERT, and it runs inside `InteractionFlow`'s
+-- post-resolve hook, which Temporal retries (`maximum_attempts=2`). The
+-- curiosity hook now carries a 240s budget for real ledger work; if that
+-- budget ever expires, attempt 2 re-runs `record_memory` and the agent
+-- believes the same thing twice. The books half of that hook is already
+-- retry-idempotent — memory was the one part that was not.
+--
+-- A unique index rather than a SELECT-then-INSERT in Python: the
+-- check-then-write race is exactly what a concurrent retry reproduces.
+--
+-- Three deliberate choices in the shape below.
+--
+-- PARTIAL on `superseded_at IS NULL`. Consolidation soft-retires a row rather
+-- than deleting it (migration 020), so a retired row and a new identical one
+-- MUST be able to coexist. A plain unique index would forbid re-learning
+-- something once withdrawn — a behaviour change disguised as a bug fix. This
+-- follows the same predicate as the existing agent_memory_live_idx.
+--
+-- Keyed on md5(content), not content. `record_memory` caps content at 2000
+-- CHARACTERS, which in a non-Latin script is ~6000 bytes, over btree's
+-- 2704-byte key limit; Postgres' own hint for that error names "a function
+-- index of an MD5 hash of the value". Indexing the raw column would turn a
+-- long memory into an exception, and `apply_curiosity_answer` calls
+-- `record_memory` bare — the raise would fail the hook and cost the owner's
+-- answer its books half. A hash collision here would silently drop one memory
+-- write; the content is the agent's own prose, not attacker-chosen, and the
+-- payoff for forging one is a single suppressed belief.
+--
+-- Keyed on agent_id first. Memory is per-agent: one agent learning a thing
+-- must not stop another learning it, and this ordering also serves an
+-- agent-scoped lookup.
+--
+-- Safe to apply with no data migration: production held 57 rows (18 live) and
+-- ZERO duplicate (agent_id, content) groups, overall or among live rows, when
+-- this was written. Idempotent — IF NOT EXISTS, so re-running (which happens
+-- if this file is ever renamed or renumbered, since schema_migrations is keyed
+-- on the FILENAME) is a no-op.
+CREATE UNIQUE INDEX IF NOT EXISTS agent_memory_live_unique_idx
+    ON agent_memory (agent_id, md5(content))
+    WHERE superseded_at IS NULL;
