@@ -340,6 +340,10 @@ async def main():
         db_pool=deps.pool,
         llm_client=deps.llm,
         model=model_balanced,
+        # The answer to an unknown-payee card becomes a rule in the books and
+        # reclassifies that payee's backlog (spec §6). Same shared checkout as
+        # MoneyActivities — books.py serialises the two on an flock.
+        books_cfg=config_from_settings(settings),
         # Interaction cards bypass safe_send_message, so CuriosityCardFlow
         # consults the notification budget itself — same knobs as delivery_act.
         budget_enabled=getattr(settings, "notification_budget_enabled", False),

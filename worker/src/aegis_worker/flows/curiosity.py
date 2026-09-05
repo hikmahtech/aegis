@@ -46,7 +46,7 @@ with workflow.unsafe.imports_passed_through():
 # finance-tagged agent, everything else to the GTD one. Resolution failure or
 # an unheld tag falls back to config.agent_id — never a crash, never silence.
 _GAP_TAG = {
-    "recurring_charge": "finance",
+    "unknown_payee": "finance",
     "calendar_attendee": "gtd",
     "todoist_project": "gtd",
 }
@@ -139,6 +139,20 @@ class CuriosityCardFlow:
             novelty_key = str(top.get("novelty_key") or "")
             child_id = f"curiosity-{_ID_SAFE.sub('_', novelty_key)[:180]}"
             options = {"aegis_ui_url": config.aegis_ui_url} if config.aegis_ui_url else None
+            metadata = {
+                "novelty_key": novelty_key,
+                "gap_type": top.get("gap_type"),
+                "subject": top.get("subject"),
+                "question": top.get("question"),
+                "agent_id": target,
+            }
+            # The money lane reclassifies the payee's backlog by `payee_key`,
+            # and the card's metadata is the only place the post-resolve hook
+            # can read one from. Without it the answer banks a memory and
+            # silently reclassifies nothing.
+            payee_key = (top.get("evidence") or {}).get("payee_key")
+            if payee_key:
+                metadata["payee_key"] = payee_key
             try:
                 await workflow.start_child_workflow(
                     InteractionFlow.run,
@@ -153,13 +167,7 @@ class CuriosityCardFlow:
                         options=options,
                         timeout_seconds=config.timeout_seconds,
                         timeout_policy="archive",
-                        metadata={
-                            "novelty_key": novelty_key,
-                            "gap_type": top.get("gap_type"),
-                            "subject": top.get("subject"),
-                            "question": top.get("question"),
-                            "agent_id": target,
-                        },
+                        metadata=metadata,
                         post_resolve_activity="apply_curiosity_answer",
                     ),
                     id=child_id,

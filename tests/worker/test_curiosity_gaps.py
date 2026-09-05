@@ -1,23 +1,35 @@
 """A6 — CuriosityActivities.find_curiosity_gaps against a real Postgres.
 
-Covers the acceptance criteria: a charge with no memory yields a candidate and
-a memory naming the vendor removes it; a novelty_key already on any interaction
-is excluded; zero detectors firing returns []; an absent or failing LLM still
-yields the candidate with deterministic text.
+Covers the acceptance criteria: an unexplained payment with no memory yields a
+candidate and a memory naming the payee removes it; a novelty_key already on
+any interaction is excluded; zero detectors firing returns []; an absent or
+failing LLM still yields the candidate with deterministic text.
+
+The money detector reads `finance.journal_index` — the books' own index of
+what was actually paid. It replaced a detector over `finance.recurring_charge`,
+a table nothing writes any more, which therefore kept asking about vendors
+that could never age out.
 """
 
 from __future__ import annotations
 
+from datetime import date, timedelta
+from decimal import Decimal
 from uuid import uuid4
 
 import pytest
 import pytest_asyncio
+from aegis.api.models.money import payee_key
 from aegis_worker.activities.curiosity import CuriosityActivities
 from temporalio.testing import ActivityEnvironment
 
 from tests.llm_stub import StubbedLLMClient
 
 AGENT = "sebas"
+# The index is keyed on nothing this file owns, and the test databases are
+# shared across suites and worktrees (one per xdist worker), so every payee
+# here carries a token no other file will produce.
+MAILBOX = "cur-t"
 
 
 @pytest_asyncio.fixture(loop_scope="function")
@@ -36,14 +48,9 @@ async def clean_db(db_pool):
 
 
 async def _wipe(conn):
-    # Children before parents: finance.renewal_alert / finance.receipt_email
-    # reference recurring_charge with no ON DELETE CASCADE, and the money tests
-    # leave alert rows behind — without this the unqualified delete below raises
-    # ForeignKeyViolationError and errors every test in this file, but only when
-    # those files land on the same xdist worker.
-    await conn.execute("DELETE FROM finance.renewal_alert")
-    await conn.execute("DELETE FROM finance.receipt_email WHERE charge_id IS NOT NULL")
-    await conn.execute("DELETE FROM finance.recurring_charge")
+    # Only this file's own rows: `journal_index` is the real books index and
+    # other suites' rows in it are none of this file's business.
+    await conn.execute("DELETE FROM finance.journal_index WHERE mailbox = $1", MAILBOX)
     await conn.execute("DELETE FROM agent_memory WHERE agent_id = $1", AGENT)
     # The soft-retirement test drives the real `apply_consolidation`, which
     # writes a ledger row per op. The ledger has no FK to agent_memory (it must
@@ -62,15 +69,30 @@ async def _wipe(conn):
     await conn.execute("DELETE FROM todoist_projects")
 
 
-async def _add_charge(pool, vendor: str, monthly: float = 900.0):
+async def _add_unknown(
+    pool,
+    payee: str,
+    amount: float = 900.0,
+    *,
+    currency: str = "INR",
+    account: str = "expenses:unknown",
+    days_ago: int = 1,
+):
+    """One payment the books could not categorise — what the detector reads."""
     await pool.execute(
-        "INSERT INTO finance.recurring_charge "
-        "(account, sender_label, vendor_name, category, amount_cents, currency, "
-        " monthly_home_equivalent, cadence, status) "
-        "VALUES ($1, $1, $2, 'software', 90000, 'INR', $3, 'monthly', 'active')",
-        f"acct-{vendor}",
-        vendor,
-        monthly,
+        "INSERT INTO finance.journal_index "
+        "(message_id, mailbox, entity, kind, direction, amount, currency, payee, payee_key, "
+        " account, channel, occurred_on, parser, source_class, journal_file) "
+        "VALUES ($1, $2, 'personal', 'transaction', 'out', $3, $4, $5, $6, $7, 'upi', $8, "
+        " 'test', 'bank', 'personal/2026.journal')",
+        f"{MAILBOX}/{uuid4()}",
+        MAILBOX,
+        Decimal(str(amount)),
+        currency,
+        payee,
+        payee_key(payee),
+        account,
+        date.today() - timedelta(days=days_ago),
     )
 
 
@@ -90,30 +112,87 @@ async def _run(pool, **kw):
     return await ActivityEnvironment().run(acts.find_curiosity_gaps, AGENT, 5)
 
 
-# --------------------------------------------------------------- charge detector
+# --------------------------------------------------------- unknown-payee detector
 
 
-async def test_active_charge_with_no_memory_yields_candidate(clean_db):
-    await _add_charge(clean_db, "Framer")
+async def test_unknown_payee_with_no_memory_yields_candidate(clean_db):
+    await _add_unknown(clean_db, "Jai shree nakoda", 6000.0)
 
     out = await _run(clean_db)
 
     assert len(out) == 1, out
-    assert out[0]["gap_type"] == "recurring_charge"
-    assert out[0]["subject"] == "Framer"
-    assert out[0]["novelty_key"] == "charge:framer"
-    assert "Framer" in out[0]["question"]
+    assert out[0]["gap_type"] == "unknown_payee"
+    assert out[0]["subject"] == "Jai shree nakoda"
+    assert out[0]["novelty_key"] == "payee:jai shree nakoda"
+    assert "Jai shree nakoda" in out[0]["question"]
+    # Through `fmt_money`, so the card reads like money and not like a float.
+    assert "\u20b96,000.00" in out[0]["question"], out[0]["question"]
+    assert out[0]["evidence"]["payee_key"] == "jai shree nakoda"
+    assert out[0]["evidence"]["n"] == 1
 
 
-async def test_memory_naming_the_vendor_removes_the_candidate(clean_db):
-    await _add_charge(clean_db, "Framer")
+async def test_memory_naming_the_payee_removes_it(clean_db):
+    await _add_unknown(clean_db, "Jai shree nakoda", 6000.0)
     await clean_db.execute(
         "INSERT INTO agent_memory (agent_id, content, importance, source) "
-        "VALUES ($1, 'Framer is where the landing pages live.', 0.8, 'curiosity')",
+        "VALUES ($1, 'Jai shree nakoda is the grocer downstairs.', 0.8, 'curiosity')",
         AGENT,
     )
 
     assert await _run(clean_db) == []
+
+
+async def test_variants_group_by_payee_key(clean_db):
+    """'Jai Shree Nakoda!' and 'jai-shree-nakoda' are one shop, so they are one
+    card carrying the combined spend — not two cards for the same payee."""
+    await _add_unknown(clean_db, "Jai Shree Nakoda!", 4000.0)
+    await _add_unknown(clean_db, "jai-shree-nakoda", 2000.0)
+
+    out = await _run(clean_db)
+
+    assert [c["novelty_key"] for c in out] == ["payee:jai shree nakoda"]
+    assert out[0]["evidence"]["n"] == 2
+    assert out[0]["evidence"]["total"] == pytest.approx(6000.0)
+    assert "\u20b96,000.00" in out[0]["question"], out[0]["question"]
+
+
+async def test_non_inr_rows_are_ignored(clean_db):
+    """The question renders one currency and sums one column; folding GBP into
+    an INR total would state a number that is simply false.
+
+    Every one of these three exclusion tests seeds a control row the detector
+    MUST return. Without it, a detector that blew up, matched nothing at all
+    or was never wired in would pass the exclusion assertion for entirely the
+    wrong reason — an empty list is not evidence of a filter.
+    """
+    await _add_unknown(clean_db, "Sterling Shop", 6000.0, currency="GBP")
+    await _add_unknown(clean_db, "Rupee Shop", 500.0)
+
+    out = await _run(clean_db)
+
+    assert [c["subject"] for c in out] == ["Rupee Shop"]
+
+
+async def test_rows_older_than_the_window_are_ignored(clean_db):
+    """60 days. A payment from last year is not a question worth interrupting
+    for, and the backlog it belongs to is the weekly brief's job."""
+    await _add_unknown(clean_db, "Stale Shop", 6000.0, days_ago=90)
+    await _add_unknown(clean_db, "Fresh Shop", 500.0, days_ago=59)
+
+    out = await _run(clean_db)
+
+    assert [c["subject"] for c in out] == ["Fresh Shop"]
+
+
+async def test_a_categorised_payment_is_not_a_gap(clean_db):
+    """`expenses:unknown` IS the review queue — a posting already filed to a
+    real account has been explained and must never be asked about."""
+    await _add_unknown(clean_db, "Filed Shop", 6000.0, account="expenses:groceries")
+    await _add_unknown(clean_db, "Queued Shop", 500.0)
+
+    out = await _run(clean_db)
+
+    assert [c["subject"] for c in out] == ["Queued Shop"]
 
 
 async def test_an_a4_retired_memory_no_longer_suppresses_the_question(clean_db):
@@ -134,8 +213,8 @@ async def test_an_a4_retired_memory_no_longer_suppresses_the_question(clean_db):
     """
     from aegis.services.memory import apply_consolidation
 
-    await _add_charge(clean_db, "Framer")
-    await _add_charge(clean_db, "Linear")
+    await _add_unknown(clean_db, "Framer")
+    await _add_unknown(clean_db, "Linear")
     retired_id = await clean_db.fetchval(
         "INSERT INTO agent_memory (agent_id, content, importance, source) "
         "VALUES ($1, 'zzsf1-Framer is where the landing pages live.', 0.8, 'curiosity') "
@@ -148,8 +227,8 @@ async def test_an_a4_retired_memory_no_longer_suppresses_the_question(clean_db):
         AGENT,
     )
 
-    # Baseline: while BOTH memories are live, BOTH charges are suppressed. This
-    # is what stops the final assertion passing because the charge detector
+    # Baseline: while BOTH memories are live, BOTH payees are suppressed. This
+    # is what stops the final assertion passing because the money detector
     # never fired, or because nothing was seeded.
     assert await _run(clean_db) == []
 
@@ -170,11 +249,11 @@ async def test_an_a4_retired_memory_no_longer_suppresses_the_question(clean_db):
 
     out = await _run(clean_db)
 
-    assert [c["novelty_key"] for c in out] == ["charge:framer"]
+    assert [c["novelty_key"] for c in out] == ["payee:framer"]
 
 
-async def test_profile_naming_the_vendor_also_removes_the_candidate(clean_db):
-    await _add_charge(clean_db, "Framer")
+async def test_profile_naming_the_payee_also_removes_the_candidate(clean_db):
+    await _add_unknown(clean_db, "Framer")
     await clean_db.execute(
         "INSERT INTO agent_personalities (agent_id, kind, content) "
         "VALUES ($1, 'user', 'He builds sites on framer.')",
@@ -188,47 +267,52 @@ async def test_profile_naming_the_vendor_also_removes_the_candidate(clean_db):
 
 
 async def test_novelty_key_on_pending_interaction_is_excluded(clean_db):
-    await _add_charge(clean_db, "Framer")
-    await _add_interaction(clean_db, "charge:framer", status="pending")
+    await _add_unknown(clean_db, "Framer")
+    await _add_interaction(clean_db, "payee:framer", status="pending")
 
     assert await _run(clean_db) == []
 
 
 async def test_novelty_key_on_resolved_interaction_is_excluded(clean_db):
-    await _add_charge(clean_db, "Framer")
-    await _add_interaction(clean_db, "charge:framer", status="resolved")
+    await _add_unknown(clean_db, "Framer")
+    await _add_interaction(clean_db, "payee:framer", status="resolved")
 
     assert await _run(clean_db) == []
+
+
+def test_rule_match_for_covers_every_punctuation_variant():
+    """The regex a card's answer turns into a permanent rule.
+
+    It is written to `rules/accounts.yaml` and then run against every incoming
+    money event in another process, forever, so its shape matters: literal
+    words, one bounded class between them, and nothing at all when there is no
+    key to build it from.
+    """
+    import re
+
+    from aegis_worker.activities.curiosity import rule_match_for
+
+    match = rule_match_for("mahavitaran msedcl")
+    assert match == "mahavitaran[^a-z0-9]+msedcl"
+    for variant in ("Mahavitaran (MSEDCL)", "Mahavitaran - MSEDCL", "mahavitaran_msedcl"):
+        assert re.search(match, variant, re.I), variant
+    assert not re.search(match, "Mahavitaran Ltd")
+
+    assert rule_match_for("") == ""
+    assert rule_match_for("   ") == ""
+    # Capped two ways, so one absurd payee cannot persist a 4KB pattern. The
+    # index does not length-cap `payee`, so both caps are reachable.
+    assert rule_match_for(" ".join(f"w{i}" for i in range(40))).count("[^a-z0-9]+") == 5
+    assert rule_match_for(" ".join("z" * 60 for _ in range(6))) == ""
 
 
 async def test_archived_interaction_suppresses(clean_db):
     """Spec §6: an unanswered card is not re-sent as a fresh card. The weekly
     brief's unknown list is the retry channel, not another interruption."""
-    await _add_charge(clean_db, "Framer")
-    await _add_interaction(clean_db, "charge:framer", status="archived")
+    await _add_unknown(clean_db, "Framer")
+    await _add_interaction(clean_db, "payee:framer", status="archived")
 
     assert await _run(clean_db) == []
-
-
-async def test_vendor_name_variants_share_one_key(clean_db):
-    """'Mahavitaran (MSEDCL)' and 'Mahavitaran - Maharashtra Electricity (MSEDCL)'
-    were six cards in a month. One key, one card, biggest charge wins."""
-    await _add_charge(clean_db, "Mahavitaran (MSEDCL)", monthly=8100.0)
-    await _add_charge(clean_db, "Mahavitaran - Maharashtra Electricity (MSEDCL)", monthly=7200.0)
-
-    out = await _run(clean_db)
-
-    assert [c["novelty_key"] for c in out] == ["charge:mahavitaran"]
-    assert out[0]["subject"] == "Mahavitaran (MSEDCL)"
-
-
-def test_charge_key_is_first_normalised_word():
-    from aegis_worker.activities.curiosity import charge_key
-
-    assert charge_key("Apple iCloud") == "apple"
-    assert charge_key("Mahavitaran - Maharashtra Electricity (MSEDCL)") == "mahavitaran"
-    assert charge_key("  1Password ") == "1password"
-    assert charge_key("") == ""
 
 
 # ------------------------------------------------------------------ empty / rank
@@ -239,9 +323,9 @@ async def test_no_gaps_returns_empty_list_not_filler(clean_db):
 
 
 async def test_limit_is_respected_and_ranked_by_cost(clean_db):
-    await _add_charge(clean_db, "Cheap", monthly=100.0)
-    await _add_charge(clean_db, "Pricey", monthly=5000.0)
-    await _add_charge(clean_db, "Middling", monthly=800.0)
+    await _add_unknown(clean_db, "Cheap", 100.0)
+    await _add_unknown(clean_db, "Pricey", 5000.0)
+    await _add_unknown(clean_db, "Middling", 800.0)
 
     acts = CuriosityActivities(db_pool=clean_db)
     out = await ActivityEnvironment().run(acts.find_curiosity_gaps, AGENT, 2)
@@ -426,7 +510,7 @@ async def test_project_task_count_excludes_completed_tasks(clean_db):
 
 async def test_broken_detector_does_not_kill_the_run(clean_db, monkeypatch):
     """One detector raising costs its own candidates, never the others'."""
-    await _add_charge(clean_db, "Framer")
+    await _add_unknown(clean_db, "Framer")
 
     async def boom(self, agent_id, known):
         raise RuntimeError("detector exploded")
@@ -459,22 +543,22 @@ class _FakeLLM:
 
 
 async def test_llm_absent_gives_deterministic_question(clean_db):
-    await _add_charge(clean_db, "Framer")
+    await _add_unknown(clean_db, "Framer")
 
     out = await _run(clean_db)
 
     assert len(out) == 1
-    assert out[0]["question"].startswith("You have an active monthly charge from Framer")
+    assert out[0]["question"].startswith("You paid ₹900.00 to Framer")
 
 
 async def test_llm_failure_degrades_to_template(clean_db):
-    await _add_charge(clean_db, "Framer")
+    await _add_unknown(clean_db, "Framer")
     llm = _FakeLLM(exc=RuntimeError("proxy down"))
 
     out = await _run(clean_db, llm_client=llm)
 
     assert len(out) == 1
-    assert out[0]["question"].startswith("You have an active monthly charge from Framer")
+    assert out[0]["question"].startswith("You paid ₹900.00 to Framer")
     assert llm.calls, "LLM should have been attempted"
 
 
@@ -482,7 +566,7 @@ async def test_llm_rephrases_and_logs_the_call(clean_db):
     """Real `LLMClient`, stubbed HTTP: the llm_calls row comes from
     `LLMClient._record_call` (issue #106), so a fake `think()` would leave
     nothing to assert on."""
-    await _add_charge(clean_db, "Framer")
+    await _add_unknown(clean_db, "Framer")
     llm = StubbedLLMClient(
         db_pool=clean_db,
         content='[{"index": 0, "question": "What do you use Framer for?"}]',
@@ -508,31 +592,31 @@ async def test_llm_rephrases_and_logs_the_call(clean_db):
 
 async def test_llm_unparseable_response_keeps_template(clean_db):
     """parse_llm_json returns None on prose — the guards must absorb that."""
-    await _add_charge(clean_db, "Framer")
+    await _add_unknown(clean_db, "Framer")
     llm = _FakeLLM(response="not json at all")
 
     out = await _run(clean_db, llm_client=llm)
 
-    assert out[0]["question"].startswith("You have an active monthly charge from Framer")
+    assert out[0]["question"].startswith("You paid ₹900.00 to Framer")
     await clean_db.execute("DELETE FROM llm_calls WHERE purpose = 'curiosity_phrasing'")
 
 
 async def test_llm_blank_question_keeps_template(clean_db):
     """A well-formed response with an empty question must not blank the card."""
-    await _add_charge(clean_db, "Framer")
+    await _add_unknown(clean_db, "Framer")
     llm = _FakeLLM(response='[{"index": 0, "question": "   "}]')
 
     out = await _run(clean_db, llm_client=llm)
 
-    assert out[0]["question"].startswith("You have an active monthly charge from Framer")
+    assert out[0]["question"].startswith("You paid ₹900.00 to Framer")
     await clean_db.execute("DELETE FROM llm_calls WHERE purpose = 'curiosity_phrasing'")
 
 
 async def test_all_candidates_suppressed_makes_no_llm_call(clean_db):
     """Detectors fired but the novelty gate ate everything — don't pay for an
     LLM call on an empty list."""
-    await _add_charge(clean_db, "Framer")
-    await _add_interaction(clean_db, "charge:framer")
+    await _add_unknown(clean_db, "Framer")
+    await _add_interaction(clean_db, "payee:framer")
     llm = _FakeLLM(response="[]")
 
     assert await _run(clean_db, llm_client=llm) == []
@@ -571,8 +655,29 @@ def test_activity_is_registered_on_the_worker():
     assert "CuriosityActivities(" in inspect.getsource(m.main)
 
 
-@pytest.mark.parametrize("kw", ["db_pool", "llm_client"])
-def test_constructor_takes_pool_and_llm(kw):
+@pytest.mark.parametrize("kw", ["db_pool", "llm_client", "books_cfg"])
+def test_constructor_takes_pool_llm_and_books(kw):
     import inspect
 
     assert kw in inspect.signature(CuriosityActivities).parameters
+
+
+def test_the_books_answer_lane_is_wired_from_settings_into_the_worker():
+    """A field main() never fills is `None` forever.
+
+    `apply_curiosity_answer`'s books branch needs ALL THREE of `llm_client`,
+    `model` and `books_cfg`; miss one and the branch is skipped on every
+    answer — no rule is ever written, nothing is ever logged as wrong, and
+    every test that constructs the class by hand still passes. So assert on
+    main()'s own construction call, not on the dataclass.
+    """
+    import inspect
+
+    import aegis_worker.__main__ as m
+
+    src = inspect.getsource(m.main)
+    start = src.index("curiosity_act = CuriosityActivities(")
+    call = src[start : src.index("\n    )", start)]
+    assert "llm_client=deps.llm" in call, call
+    assert "model=model_balanced" in call, call
+    assert "books_cfg=config_from_settings(settings)" in call, call
