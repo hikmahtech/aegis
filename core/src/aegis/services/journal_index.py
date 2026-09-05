@@ -132,14 +132,38 @@ async def mark_due_paid(pool: Any, due_msgid: str, payment_msgid: str) -> None:
 async def find_open_due(
     pool: Any, payee_key: str, amount: Decimal, currency: str, around: date
 ) -> dict | None:
+    """The open due this payment settles, or None.
+
+    Deliberately NOT conditioned on `todoist_ref IS NOT NULL`. Open means
+    unpaid — `linked_message_id IS NULL` — and that is what every "dues open"
+    count reads (`build_money_brief`, `build_month_close`, `/api/money/state`).
+    `capture_due`'s three noise guards (a zero invoice, a twin due under
+    another payee's name, an autopay notice) all index the due and withhold
+    only the Todoist task, so requiring a task ref here made every one of them
+    structurally unclosable: nothing else writes `linked_message_id` for a due,
+    so the count could only ever rise. Four of seven live bill mails were
+    autopay notices, so the first month close would have reported "still open:
+    4" for a month in which all of them were paid. The caller skips the task
+    completion when there is no ref (`route_money_event`).
+
+    A TASKED row wins the tie, which is why `todoist_ref IS NULL` leads the
+    ORDER BY. Admitting untasked dues created a tie that did not exist before:
+    one biller mailing the same bill twice gives a tasked row and a
+    twin-suppressed one with identical `payee_key`, amount and `due_on`, and
+    the payment closes exactly one of them. Picking the untasked row would
+    leave the tasked one open with a Todoist task nothing ever completes.
+    Postgres returns them in whatever order it likes without this clause — a
+    seq scan usually gives insertion order, which happens to be right, but
+    that is luck.
+    """
     row = await pool.fetchrow(
         """
         SELECT * FROM finance.journal_index
-        WHERE kind IN ('due', 'failed') AND todoist_ref IS NOT NULL AND linked_message_id IS NULL
+        WHERE kind IN ('due', 'failed') AND linked_message_id IS NULL
           AND payee_key = $1 AND currency = $2
           AND abs(amount - $3::numeric) <= $3::numeric * $4::numeric
           AND due_on BETWEEN $5 AND $6
-        ORDER BY abs(due_on - $7::date) ASC LIMIT 1
+        ORDER BY (todoist_ref IS NULL), abs(due_on - $7::date) ASC LIMIT 1
         """,
         payee_key, currency, amount, _DUE_TOLERANCE,
         around - timedelta(days=_DUE_DAYS), around + timedelta(days=_DUE_DAYS), around,

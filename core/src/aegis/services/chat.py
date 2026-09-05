@@ -71,6 +71,13 @@ from aegis.services.tools.knowledge import (
     _exec_search_knowledge,
     _knowledge_unavailable,  # noqa: F401 — re-export: kept importable from here
 )
+from aegis.services.tools.ledger import (  # noqa: F401 — re-export: imported from here by tests
+    LEDGER_WRITE_TIMEOUT_S,
+    _exec_ledger_add_rule,
+    _exec_ledger_post,
+    _exec_ledger_query,
+    _exec_ledger_reclassify,
+)
 from aegis.services.tools.registry import TOOL_REGISTRY
 from aegis.services.tools.vercel import (
     _exec_vercel_get_build_logs,
@@ -903,6 +910,12 @@ CHAT_TOOLS = [
     _registry_schema("handoff_task"),
     _registry_schema("comment_on_task"),
     _registry_schema("find_reference"),
+    # The books (Maou) — every write goes through `books.py`'s locked,
+    # `check --strict`-guarded writer; `services/tools/ledger.py`.
+    _registry_schema("ledger_query"),
+    _registry_schema("ledger_post"),
+    _registry_schema("ledger_reclassify"),
+    _registry_schema("ledger_add_rule"),
     {
         "type": "function",
         "function": {
@@ -1371,8 +1384,16 @@ _AEGIS_SELF_DIAGNOSE_OUTPUT_CAP = 8 * 1024  # last N chars returned to the LLM
 # tools: aegis_self_diagnose waits on a remote coding-CLI run for up to
 # _AEGIS_SELF_DIAGNOSE_MAX_WAIT, so it could NEVER finish inside 30s — and each
 # LLM retry then orphaned another kimi run on the coding host.
+#
+# The three ledger writers are the same failure in a worse place: `books._write`
+# runs git pull + `hledger check --strict` + commit + push inside a thread, and
+# `asyncio.wait_for` cannot cancel a thread — so a 30s cap does not stop a slow
+# write, it reports a failure while the write goes on to commit and push.
 _TOOL_TIMEOUT_OVERRIDES: dict[str, int] = {
     "aegis_self_diagnose": _AEGIS_SELF_DIAGNOSE_MAX_WAIT + 60,
+    "ledger_post": LEDGER_WRITE_TIMEOUT_S,
+    "ledger_reclassify": LEDGER_WRITE_TIMEOUT_S,
+    "ledger_add_rule": LEDGER_WRITE_TIMEOUT_S,
 }
 
 
@@ -3092,6 +3113,10 @@ TOOL_EXECUTORS: dict[str, Any] = {
     "handoff_task": _exec_handoff_task,
     "comment_on_task": _exec_comment_on_task,
     "find_reference": _exec_find_reference,
+    "ledger_query": _exec_ledger_query,
+    "ledger_post": _exec_ledger_post,
+    "ledger_reclassify": _exec_ledger_reclassify,
+    "ledger_add_rule": _exec_ledger_add_rule,
     "last_contact_with_person": _exec_last_contact_with_person,
     "query_observations": _exec_query_observations,
     # Vercel read-only (Pandora) — see PR for design notes.
@@ -3134,6 +3159,8 @@ AGENT_TOOL_SETS: dict[str, set[str]] = {
         "handoff_task",
         "comment_on_task",
         "find_reference",
+        # Read-only over the books; the three write tools are Maou's alone.
+        "ledger_query",
         # People registry (life.people) — "when did I last talk to X?"
         "last_contact_with_person",
         # Life metrics (life.observations) — "how's my weight trending?"
@@ -3234,6 +3261,11 @@ AGENT_TOOL_SETS: dict[str, set[str]] = {
         "defer_task",
         "mark_waiting",
         "handoff_task",
+        # The books — the only agent that may write them.
+        "ledger_query",
+        "ledger_post",
+        "ledger_reclassify",
+        "ledger_add_rule",
     },
 }
 

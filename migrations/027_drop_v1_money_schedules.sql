@@ -1,0 +1,28 @@
+-- 027: retire the two v1 money schedules.
+--
+-- The books rework replaces both of them:
+--
+--   money-hygiene-daily       (MoneyHygieneDailyFlow)   -> money-brief-weekly
+--   subscription-audit-monthly (SubscriptionAuditFlow)  -> money-close-monthly
+--
+-- Both v1 flows read `recurring_charge`, a table the LLM extractor filled from
+-- receipt mail. The journal is now the record: recurring commitments are
+-- `~ periodic` rules in the books, and hledger's own forecast is what the
+-- brief and the close report. Keeping the old rows scheduled would send a
+-- second, disagreeing set of money messages from a source that no longer gets
+-- written to.
+--
+-- Deleting the `activities` row is what stops the schedule: `schedule_sync`
+-- reconciles Temporal against this table, so a row that is gone here has its
+-- Temporal schedule removed on the worker's next reconcile pass (~300s).
+--
+-- Idempotent by nature — a DELETE of rows that are already gone is a no-op, so
+-- this is safe to re-run and safe on a fresh database.
+--
+-- NOTE: `config/seed/activities.yaml` still carries both rows at this
+-- migration, and `load_seeds` runs after migrations, so on a fresh boot they
+-- are re-created. Removing the flows, their seed rows and their code is the
+-- next task in this series; this migration is what clears them from an
+-- EXISTING deployment once that lands.
+
+DELETE FROM activities WHERE slug IN ('money-hygiene-daily', 'subscription-audit-monthly');

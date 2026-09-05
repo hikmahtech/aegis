@@ -82,21 +82,24 @@ activities:
       query_window: "newer_than:14d"
     active: true
 
-  # Daily recurring-charge sweep (merged cancellation-scan + renewal-radar:
-  # both ran daily off the same recurring_charge table). 09:00 UTC = 14:30 IST.
-  - slug: money-hygiene-daily
-    workflow_type: MoneyHygieneDailyFlow
+  # The weekly money brief, read off the books (spec §7.2). Sunday 03:00 UTC =
+  # 08:30 IST, an hour ahead of receipt-ingest-weekly so the brief covers the
+  # week the safety-net scan has already drained into the journal.
+  - slug: money-brief-weekly
+    workflow_type: MoneyBriefFlow
     agent_id: maou
-    schedule_cron: "0 9 * * *"
+    schedule_cron: "0 3 * * 0"
     config:
-      threshold_multiplier: 2.0
-      thresholds_days: [30, 14, 7, 0]
+      days: 7
     active: true
 
-  - slug: subscription-audit-monthly
-    workflow_type: SubscriptionAuditFlow
+  # The previous calendar month's close (spec §7.3). 1st of the month, 04:00
+  # UTC = 09:30 IST. `build_month_close` picks the month, so the cron only
+  # decides when — a manual run closes the same month on any day.
+  - slug: money-close-monthly
+    workflow_type: MonthCloseFlow
     agent_id: maou
-    schedule_cron: "0 10 1 * *"
+    schedule_cron: "0 4 1 * *"
     config: {}
     active: true
 

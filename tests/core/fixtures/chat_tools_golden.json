@@ -992,6 +992,149 @@
   {
     "type": "function",
     "function": {
+      "name": "ledger_query",
+      "description": "Run a read-only hledger report over the books.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "command": {
+            "type": "string",
+            "description": "hledger subcommand: bal, reg, is, bs, cf, print, accounts, payees, tags, stats, activity, aregister."
+          },
+          "args": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "extra hledger arguments, e.g. [\"-X\", \"\u20b9\", \"-p\", \"thismonth\", \"expenses\", \"--depth\", \"2\"]."
+          },
+          "output": {
+            "type": "string",
+            "enum": [
+              "text",
+              "json",
+              "csv"
+            ],
+            "description": "text (default), json or csv.",
+            "default": "text"
+          }
+        },
+        "required": [
+          "command"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "ledger_post",
+      "description": "Record a transaction in the books by hand. Each posting is {\"account\": ..., \"amount\": ..., \"currency\": ...}; at most one posting may omit the amount. Re-posting the same date, payee, postings and note is treated as a retry of the first call, not a second transaction \u2014 give the second one a note to record a genuine duplicate.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "date": {
+            "type": "string",
+            "description": "YYYY-MM-DD."
+          },
+          "payee": {
+            "type": "string",
+            "description": "who was paid or who paid."
+          },
+          "postings": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            },
+            "description": "two or more postings; amounts in major units. A negative amount is money coming in."
+          },
+          "entity": {
+            "type": "string",
+            "description": "personal or hikmah \u2014 which set of books.",
+            "default": "personal"
+          },
+          "note": {
+            "type": "string",
+            "description": "optional free text stored as a `note:` tag.",
+            "default": ""
+          }
+        },
+        "required": [
+          "date",
+          "payee",
+          "postings"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "ledger_reclassify",
+      "description": "Move a posting to another account (and optionally rename its payee) by its books message id (`<mailbox>/<gmail id>` for a posting from mail, or `manual/<hash>` for one `ledger_post` wrote). The new account must be one the posting's own set of books can use: an expense or income account of that entity, or any asset, liability or equity account, which both sets share.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "message_id": {
+            "type": "string",
+            "description": "the msgid tag of the transaction."
+          },
+          "account": {
+            "type": "string",
+            "description": "a declared account, e.g. expenses:groceries."
+          },
+          "payee": {
+            "type": "string",
+            "description": "new display name, optional."
+          }
+        },
+        "required": [
+          "message_id",
+          "account"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "ledger_add_rule",
+      "description": "Add a payee \u2192 account rule to the books and reclassify matching unexplained postings.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "match": {
+            "type": "string",
+            "description": "case-insensitive regex tested against \"<sender> | <payee>\"."
+          },
+          "account": {
+            "type": "string",
+            "description": "a declared account."
+          },
+          "entity": {
+            "type": "string",
+            "description": "personal or hikmah. Optional \u2014 an expense or income account already says which set of books it belongs to, so leaving this out takes the account's own entity (expenses:hikmah:* and income:hikmah:* are hikmah, any other expense or income account is personal). Asset, liability and equity accounts belong to both, and a rule on one gets no entity."
+          },
+          "payee": {
+            "type": "string",
+            "description": "canonical display name, optional."
+          },
+          "apply": {
+            "type": "boolean",
+            "description": "also reclassify existing postings in an unknown account that match (default true). Existing postings are matched on their payee alone \u2014 the sender is not in the index.",
+            "default": true
+          }
+        },
+        "required": [
+          "match",
+          "account"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
       "name": "last_contact_with_person",
       "description": "Look up someone in the people registry: when you were last in contact, how you know them, their key dates and any notes. Matches their name or any alias (nickname, maiden name, email).",
       "parameters": {

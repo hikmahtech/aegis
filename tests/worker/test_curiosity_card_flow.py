@@ -20,10 +20,13 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import asynccontextmanager
+from datetime import date, timedelta
+from decimal import Decimal
 from uuid import uuid4
 
 import pytest
 import pytest_asyncio
+from aegis.api.models.money import payee_key
 from aegis_worker.activities.curiosity import CuriosityActivities
 from aegis_worker.activities.interactions import InteractionActivities
 from aegis_worker.flows.curiosity import CuriosityCardFlow, CuriosityConfig
@@ -36,6 +39,9 @@ AGENT = "sebas"
 # Who resolve_agents hands the card to. Deliberately NOT `AGENT`, so an
 # assertion on the card's agent proves the routing hop really happened.
 FINANCE_AGENT = "curio-finance-test"
+# This file's own rows in the real books index (shared test DB — see
+# test_curiosity_gaps.py).
+MAILBOX = "cur-flow-t"
 
 
 # --------------------------------------------------------------------- fixtures
@@ -44,15 +50,9 @@ FINANCE_AGENT = "curio-finance-test"
 async def _wipe(conn):
     await conn.execute("DELETE FROM notification_log")
     await conn.execute("DELETE FROM interactions")
-    # Children before parents: finance.renewal_alert.charge_id and
-    # finance.receipt_email.charge_id both reference recurring_charge with no
-    # ON DELETE CASCADE, and the money tests leave alert rows behind. Without
-    # this the unqualified charge delete raises ForeignKeyViolationError and
-    # errors every test in this file — but only when those files happen to
-    # share an xdist worker with it.
-    await conn.execute("DELETE FROM finance.renewal_alert")
-    await conn.execute("DELETE FROM finance.receipt_email WHERE charge_id IS NOT NULL")
-    await conn.execute("DELETE FROM finance.recurring_charge")
+    # Only this file's own rows: `journal_index` is the real books index and
+    # other suites' rows in it are none of this file's business.
+    await conn.execute("DELETE FROM finance.journal_index WHERE mailbox = $1", MAILBOX)
     await conn.execute("DELETE FROM agent_memory WHERE agent_id = ANY($1)", [AGENT, FINANCE_AGENT])
     await conn.execute("DELETE FROM agent_personalities WHERE agent_id = $1", AGENT)
     await conn.execute("DELETE FROM chat_history WHERE agent_id = $1", AGENT)
@@ -87,15 +87,21 @@ async def clean_db(db_pool):
 # ---------------------------------------------------------------------- seeding
 
 
-async def _add_charge(pool, vendor: str, monthly: float = 900.0):
+async def _add_unknown(pool, payee: str, amount: float = 900.0):
+    """One payment the books could not categorise — what the money detector
+    reads (`finance.journal_index`, account `expenses:unknown`)."""
     await pool.execute(
-        "INSERT INTO finance.recurring_charge "
-        "(account, sender_label, vendor_name, category, amount_cents, currency, "
-        " monthly_home_equivalent, cadence, status) "
-        "VALUES ($1, $1, $2, 'software', 90000, 'INR', $3, 'monthly', 'active')",
-        f"acct-{vendor}",
-        vendor,
-        monthly,
+        "INSERT INTO finance.journal_index "
+        "(message_id, mailbox, entity, kind, direction, amount, currency, payee, payee_key, "
+        " account, channel, occurred_on, parser, source_class, journal_file) "
+        "VALUES ($1, $2, 'personal', 'transaction', 'out', $3, 'INR', $4, $5, "
+        " 'expenses:unknown', 'upi', $6, 'test', 'bank', 'personal/2026.journal')",
+        f"{MAILBOX}/{uuid4()}",
+        MAILBOX,
+        Decimal(str(amount)),
+        payee,
+        payee_key(payee),
+        date.today() - timedelta(days=1),
     )
 
 
@@ -118,7 +124,7 @@ async def _add_calendar_attendee(pool, email: str, events: int = 3):
         )
 
 
-async def _add_pending_curiosity_card(pool, novelty_key: str = "charge:leftover"):
+async def _add_pending_curiosity_card(pool, novelty_key: str = "payee:leftover"):
     await pool.execute(
         "INSERT INTO interactions (flow_run_id, agent_id, kind, origin, prompt, "
         "status, metadata) VALUES ($1, $2, 'input', 'curiosity', 'q?', 'pending', $3)",
@@ -237,9 +243,9 @@ async def _budget_rows(pool) -> int:
 
 @pytest.mark.asyncio
 async def test_flow_cards_the_top_gap_and_charges_the_budget(clean_db):
-    """Happy path: one unexplained charge becomes one `input` card, routed to
+    """Happy path: one unexplained payment becomes one `input` card, routed to
     the finance-tagged agent, and charged to the notification budget."""
-    await _add_charge(clean_db, "Zephyrly")
+    await _add_unknown(clean_db, "Zephyrly")
     tags: list = []
     cards: list = []
 
@@ -264,7 +270,7 @@ async def test_flow_cards_the_top_gap_and_charges_the_budget(clean_db):
                 await _wait_for(_async(lambda: len(cards)))
 
     assert result["status"] == "sent"
-    assert result["gap_type"] == "recurring_charge"
+    assert result["gap_type"] == "unknown_payee"
     assert result["subject"] == "Zephyrly"
     # A money gap is asked by the finance-tagged agent, not the flow's own agent.
     assert tags == [["finance"]]
@@ -275,8 +281,12 @@ async def test_flow_cards_the_top_gap_and_charges_the_budget(clean_db):
     assert row["kind"] == "input"
     assert row["status"] == "pending"
     assert "Zephyrly" in row["prompt"]
-    assert row["metadata"]["novelty_key"] == "charge:zephyrly"
+    assert row["metadata"]["novelty_key"] == "payee:zephyrly"
     assert row["metadata"]["subject"] == "Zephyrly"
+    # `apply_curiosity_answer` reclassifies the backlog by `payee_key`, and the
+    # card's metadata is the only place it can read one from. Without this the
+    # answer banks a memory and silently reclassifies nothing.
+    assert row["metadata"]["payee_key"] == "zephyrly"
 
     # The spec handed to the comms service is an ANSWERABLE `input` card.
     # `aegis_ui_url` is load-bearing, not decoration: aegis_comms/cards.py
@@ -305,8 +315,8 @@ async def test_flow_cards_the_top_gap_and_charges_the_budget(clean_db):
 async def test_second_run_same_day_is_budget_blocked(clean_db):
     """Acceptance: two runs in one day → the second spawns nothing and says
     `budget`; notification_log still holds exactly one sent curiosity_card."""
-    await _add_charge(clean_db, "Zephyrly")
-    await _add_charge(clean_db, "Brambleworks", monthly=100.0)
+    await _add_unknown(clean_db, "Zephyrly")
+    await _add_unknown(clean_db, "Brambleworks", 100.0)
     cards: list = []
 
     async with await WorkflowEnvironment.start_time_skipping() as env:
@@ -339,7 +349,7 @@ async def test_second_run_same_day_is_budget_blocked(clean_db):
 async def test_pending_card_blocks_a_new_question(clean_db):
     """An unanswered curiosity card suppresses the next one — with no
     notification_log row in play, so it is the pending check doing the work."""
-    await _add_charge(clean_db, "Zephyrly")
+    await _add_unknown(clean_db, "Zephyrly")
     await _add_pending_curiosity_card(clean_db)
 
     async with await WorkflowEnvironment.start_time_skipping() as env:
@@ -359,7 +369,7 @@ async def test_pending_card_blocks_a_new_question(clean_db):
 async def test_shared_notification_budget_blocks_the_card(clean_db):
     """The flow honours the SHARED daily budget too (`should_send`), not just
     its own per-day cap — a day already full of proactive FYIs stays quiet."""
-    await _add_charge(clean_db, "Zephyrly")
+    await _add_unknown(clean_db, "Zephyrly")
     await clean_db.execute(
         "INSERT INTO notification_log (agent_id, log_event, sent) VALUES ($1, 'drift', TRUE)",
         AGENT,
@@ -420,7 +430,7 @@ async def test_calendar_lane_is_refused_while_owner_emails_is_unset(clean_db):
 @pytest.mark.asyncio
 async def test_gap_detection_failure_degrades_to_skipped(clean_db):
     """An LLM/detector blow-up is a quiet day, not a failed workflow run."""
-    await _add_charge(clean_db, "Zephyrly")
+    await _add_unknown(clean_db, "Zephyrly")
 
     @activity.defn(name="find_curiosity_gaps")
     async def exploding(agent_id, limit):
@@ -513,6 +523,87 @@ async def test_apply_curiosity_answer_ignores_an_empty_answer(clean_db):
     assert (
         await clean_db.fetchval("SELECT count(*) FROM agent_memory WHERE source = 'curiosity'") == 0
     )
+
+
+# --------------------------------------------------- post-resolve time budget
+
+
+@pytest.mark.asyncio
+async def test_the_answer_hook_gets_the_books_time_budget_not_30_seconds(clean_db):
+    """A curiosity answer does real ledger work, so it cannot run on the
+    interaction default of 30s.
+
+    `apply_curiosity_answer` does `hledger accounts --declared` (30s of its
+    own), one balanced-tier LLM call, then TWO complete `books._write`
+    protocols — flock, clone-or-pull, mutate, `hledger check --strict`, commit,
+    push. `flows/money_process.py` already had to buy 240s for ONE of those,
+    with the comment that a shorter budget times out mid-clone and burns every
+    retry on the same clone.
+
+    Timing out here is not a clean retry: the work sits in `asyncio.to_thread`
+    and cannot be cancelled, so attempt 2 re-runs `record_memory` (a plain
+    INSERT — a duplicate row) and then blocks on the flock the first attempt
+    still holds. Meanwhile the novelty key is on a resolved interaction, so
+    that payee is never carded again and the owner's answer is spent.
+
+    Asserted from INSIDE the activity via `activity.info()`, so it is the
+    budget Temporal actually applied — not a source string.
+    """
+    await _add_unknown(clean_db, "Zephyrly")
+    budgets: list = []
+
+    @activity.defn(name="apply_curiosity_answer")
+    async def capture(interaction_id, response, metadata):
+        budgets.append(activity.info().start_to_close_timeout)
+        return {"recorded": True}
+
+    cur = CuriosityActivities(db_pool=clean_db, llm_client=None)
+    inter = InteractionActivities(clean_db)
+    async with await WorkflowEnvironment.start_time_skipping() as env:
+        with env.auto_time_skipping_disabled():
+            task_queue = f"tq-{uuid4().hex[:8]}"
+            async with Worker(
+                env.client,
+                task_queue=task_queue,
+                workflows=[CuriosityCardFlow, InteractionFlow],
+                activities=[
+                    cur.check_curiosity_budget,
+                    cur.find_curiosity_gaps,
+                    cur.record_curiosity_card,
+                    inter.insert_interaction,
+                    inter.resolve_interaction,
+                    inter.apply_interaction_timeout,
+                    inter.update_interaction_delivery_ref,
+                    capture,
+                    _stub_card([]),
+                    _stub_resolve([], {"finance": FINANCE_AGENT}),
+                ],
+            ):
+                result = await env.client.execute_workflow(
+                    CuriosityCardFlow.run,
+                    CuriosityConfig(agent_id=AGENT),
+                    id=f"curiosity-budget-{uuid4().hex[:8]}",
+                    task_queue=task_queue,
+                )
+                assert result["status"] == "sent", result
+                # The card child is ABANDONED and deterministic-id'd, so the
+                # owner's answer is a signal to that id.
+                handle = env.client.get_workflow_handle("curiosity-payee_zephyrly")
+                await handle.signal(InteractionFlow.submit_response, {"value": "my grocer"})
+                await _wait_for(_async(lambda: budgets))
+
+    assert budgets, "the post-resolve hook never ran — this test proves nothing"
+    assert budgets[0] == timedelta(seconds=240), budgets
+
+
+def test_other_post_resolve_hooks_keep_the_short_default():
+    """Clarify's Todoist hooks are quick API calls; they must NOT inherit the
+    ledger budget just because curiosity needed one."""
+    from aegis_worker.flows.interaction import InteractionFlowInput
+
+    assert InteractionFlowInput(
+        agent_id="a", kind="input", origin="clarify", prompt="q"
+    ).post_resolve_timeout_seconds == 30
 
 
 # ------------------------------------------------------------------ registration

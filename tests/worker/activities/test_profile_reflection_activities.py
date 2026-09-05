@@ -37,9 +37,9 @@ async def clear_global_evidence(conn):
 
     Three of its five sources are agent-scoped, and a `WHERE agent_id = 'zza2-…'`
     teardown covers them. The other two are not, and no per-agent teardown
-    anywhere ever could be: `finance.recurring_charge` / `finance.receipt_email`
-    have no `agent_id` column at all, and `_evidence_calendar` reads EVERY
-    `calendar_events_%` row in `settings`.
+    anywhere ever could be: `finance.receipt_email` has no `agent_id` column at
+    all, and `_evidence_calendar` reads EVERY `calendar_events_%` row in
+    `settings`.
 
     So any test in the suite that leaves an active charge, a recent receipt or a
     calendar KV row behind turns this file's "quiet week" assertions into
@@ -165,11 +165,10 @@ async def _seed_all_sources(pool):
         AGENT,
         {"value": "rejected", "reason": "never deploy on a Friday"},
     )
-    await pool.execute(
-        "INSERT INTO finance.recurring_charge (account, sender_label, vendor_name, category, "
-        "amount_cents, currency, cadence, status) "
-        "VALUES ('zza2-acct', 'zza2', 'Zephyrly', 'software', 100, 'INR', 'monthly', 'active')"
-    )
+    # Receipt mail only. `_evidence_finance` stopped reading
+    # `finance.recurring_charge` when the v1 tracker's writer was deleted
+    # (2026-09) — seeding that table here would be setup no assertion could
+    # depend on.
     await pool.execute(
         "INSERT INTO finance.receipt_email (message_id, account, sender, subject, received_at) "
         "VALUES ($1, 'zza2-acct', 'billing@zephyrly.test', 'Your receipt', now())",
@@ -197,7 +196,7 @@ async def test_gather_evidence_reads_every_source(clean_db):
     assert any("node daal" in c for c in out["chat"])
     assert any("single-line commit" in m for m in out["memories"])
     assert any("never deploy on a Friday" in c for c in out["corrections"])
-    assert any("Zephyrly" in f for f in out["finance"])
+    assert any("zephyrly.test" in f for f in out["finance"])
     assert any("Weekly infra review" in c for c in out["calendar"])
 
 
@@ -246,11 +245,6 @@ async def _seed_foreign_leak(pool):
     own row-prefix teardown has no reason to know about.
     """
     await pool.execute(
-        "INSERT INTO finance.recurring_charge (account, sender_label, vendor_name, category, "
-        "amount_cents, currency, cadence, status) "
-        "VALUES ('zzleak-acct', 'zzleak', 'Leakwire', 'software', 900, 'INR', 'monthly', 'active')"
-    )
-    await pool.execute(
         "INSERT INTO finance.receipt_email (message_id, account, sender, subject, received_at) "
         "VALUES ($1, 'zzleak-acct', 'billing@leakwire.test', 'Your receipt', now())",
         f"zzleak-{uuid4()}",
@@ -283,9 +277,9 @@ async def test_a_foreign_leak_cannot_survive_this_files_setup(db_pool):
         # The leak is real and IS read as this agent's evidence — without this
         # the assertion below would be "empty because nothing was seeded".
         dirty = await ActivityEnvironment().run(acts.gather_profile_evidence, AGENT, 7)
-        assert dirty["counts"]["finance"] >= 2, dirty["counts"]
+        assert dirty["counts"]["finance"] >= 1, dirty["counts"]
         assert dirty["counts"]["calendar"] >= 1, dirty["counts"]
-        assert any("Leakwire" in f for f in dirty["finance"]), dirty["finance"]
+        assert any("leakwire.test" in f for f in dirty["finance"]), dirty["finance"]
 
         # Exactly what `clean_db` runs before every test in this file.
         async with db_pool.acquire() as conn:

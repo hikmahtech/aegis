@@ -1,7 +1,7 @@
 """Task 6 — `LLMClient.extract_money_batch`, the v2 money extractor.
 
-The v1 `extract_receipts_batch` asked "is this a receipt?" over a 200-char
-snippet. This one reads the FULL body and returns one `MoneyEvent` per email,
+The v1 batch extractor (deleted 2026-09) asked "is this a receipt?" over a
+200-char snippet. This one reads the FULL body and returns one `MoneyEvent` per email,
 so a declined payment, an autopay reminder and a paid invoice stop looking
 alike. The failure semantics are what these tests pin: a truncation degrades to
 one stub per input (a bad token budget must not take MoneyProcessFlow down), a

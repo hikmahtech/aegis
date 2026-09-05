@@ -104,6 +104,31 @@ def account_for(category: str | None, direction: str | None, entity: str) -> str
     return UNKNOWN[ent][side]
 
 
+def account_entity(account: str) -> str | None:
+    """Which set of books an account belongs to, or None when it belongs to
+    both.
+
+    Only the expense and income trees carry an entity — the business side is
+    the `:hikmah:` segment (`_ACCOUNT_MAP`). Assets, liabilities and equity are
+    entity-NEUTRAL by design: `post_event` writes `assets:bank:hdfc:1225` into
+    both sets of books through `instrument_account`, which has no notion of
+    entity at all, and the chart declares `equity:transfers` precisely for a
+    move between one's own accounts. Treating those as personal would refuse a
+    real correction — a hikmah posting moved onto the shared bank account —
+    for no gain, since the hazard the callers guard against (an
+    `expenses:hikmah:*` posting filed in `personal/2026.journal`) lives
+    entirely in the two trees this does cover.
+
+    Three callers rely on it and all three guard the same hazard from a
+    different door: `ledger_reclassify` refuses a cross-entity move,
+    `ledger_add_rule` defaults an omitted `entity`, and the curiosity answer
+    hook stamps the rule it writes with no human in the loop at all.
+    """
+    if not account.startswith(("expenses:", "income:")):
+        return None
+    return "hikmah" if ":hikmah:" in f"{account}:" else "personal"
+
+
 def instrument_account(
     instrument: str | None, declared: set[str] | frozenset[str] = frozenset()
 ) -> str:
@@ -297,6 +322,40 @@ def render_transaction(
     return "\n".join(lines) + "\n"
 
 
+def render_manual(d: date, payee: str, postings: list[dict], msgid: str, note: str = "") -> str:
+    """One hand-written block: the same header lines as `render_transaction`,
+    then one posting line per entry (`{"account", "amount", "currency"}`).
+
+    Two differences from `render_transaction`, both deliberate:
+
+    A manual amount is SIGNED. `MoneyEvent` carries the sign in `direction`
+    and `render_amount` takes a magnitude plus a flag, so handing it a
+    negative straight through would render it positive — the block would still
+    balance and still pass `check --strict`, with the money pointing the wrong
+    way and no gate anywhere to catch it.
+
+    `note` goes through `sanitize_tag`, not `sanitize_payee`: it lands on the
+    TAG line, where a comma is the tag separator, so `note="x, evil: true"`
+    would declare a second tag of the caller's choosing. `sanitize_payee`
+    leaves commas alone (they are harmless in a payee).
+    """
+    tags = "channel: manual" + (f", note: {sanitize_tag(note)}" if note else "")
+    lines = [
+        f"{d.isoformat()} * {sanitize_payee(payee)}",
+        f"{_INDENT}; msgid: {msgid}",
+        f"{_INDENT}; {tags}",
+    ]
+    for p in postings:
+        raw = p.get("amount")
+        if raw in (None, ""):
+            amount = ""
+        else:
+            value = Decimal(str(raw))
+            amount = render_amount(value, p.get("currency") or "INR", negative=value < 0)
+        lines.append(_posting(str(p.get("account") or ""), amount))
+    return "\n".join(lines) + "\n"
+
+
 def iter_blocks(text: str) -> list[tuple[int, int]]:
     """(start, end) offsets of every maximal run of non-blank lines."""
     blocks: list[tuple[int, int]] = []
@@ -383,7 +442,15 @@ def load_rules(path: Path) -> list[dict]:
 
 
 def apply_rules(rules: list[dict], sender: str, payee: str) -> dict | None:
-    haystack = f"{sender or ''} | {payee or ''}"
+    # `|` is the SEPARATOR between the two halves, so it is stripped out of
+    # both of them before they are joined. The generated payee rules anchor on
+    # the payee half with `\|[^|]*`, which assumes exactly one pipe in the
+    # haystack — and a From display name may carry a literal one
+    # (`"Google Pay | Bills" <noreply@…>`), which would put the anchor's
+    # `[^|]*` inside the SENDER and re-open the sender-matching hole the anchor
+    # closes. No hand-written rule can want a literal pipe either: in a regex
+    # it means alternation, not the character.
+    haystack = f"{(sender or '').replace('|', ' ')} | {(payee or '').replace('|', ' ')}"
     for rule in rules:
         try:
             if re.search(str(rule["match"]), haystack, re.I):
@@ -694,6 +761,59 @@ async def post_event(event: MoneyEvent, msgid: str, cfg: BooksConfig) -> str:
     return posted[0] if posted else rel
 
 
+async def post_block(
+    block: str, entity: str, d: date, msgid: str, cfg: BooksConfig
+) -> tuple[str, bool]:
+    """Append an already-rendered block (`render_manual`) under the same lock /
+    `check --strict` / revert protocol as `post_event`. Returns the journal
+    file's relative path and whether this call is what wrote it.
+
+    Idempotency is repo-WIDE for the same reason as `post_event`: the msgid is
+    the only handle on the block, so a re-post with a corrected date or entity
+    must find the existing one wherever it landed.
+
+    The `created` half of the return is what lets a caller tell "I wrote it"
+    from "it was already there". A caller whose write can be retried needs
+    that: the retry is the SAME logical post, and reporting it as a fresh one
+    tells the user they now have two.
+    """
+    rel = journal_rel(entity, d)
+    posted: list[str] = []
+    created = [True]
+
+    def mutate() -> None:
+        for existing in journal_files(cfg):
+            if find_block(existing.read_text(), msgid):
+                posted.append(str(existing.relative_to(cfg.path)))
+                created[0] = False
+                return
+        # Recorded before the write: `paths` is this write's git scope.
+        posted.append(rel)
+        path = _ensure_journal_file(cfg, rel)
+        path.write_text(append_block(path.read_text(), block))
+
+    await _write(cfg, f"post {entity} {d} manual", mutate, [rel, cfg.main])
+    return (posted[0] if posted else rel), created[0]
+
+
+async def locate_event(msgid: str, cfg: BooksConfig) -> str | None:
+    """The journal file holding `msgid`, relative to the checkout, or None.
+
+    Read-only and lock-free: a caller that must know which set of books a block
+    lives in before it writes reads the journal, which is the record, rather
+    than `finance.journal_index`, which is only its index and does not cover a
+    hand-written block.
+    """
+
+    def _go() -> str | None:
+        for path in journal_files(cfg):
+            if find_block(path.read_text(), msgid):
+                return str(path.relative_to(cfg.path))
+        return None
+
+    return await asyncio.to_thread(_go)
+
+
 async def rewrite_event(
     msgid: str,
     cfg: BooksConfig,
@@ -722,6 +842,56 @@ async def rewrite_event(
 
     await _write(cfg, f"reclassify {msgid}" + (f" -> {account}" if account else ""), mutate, found)
     return found[0]
+
+
+async def rewrite_events(
+    msgids: list[str], cfg: BooksConfig, *, payee: str | None = None, account: str | None = None
+) -> tuple[list[str], list[str]]:
+    """Reclassify many blocks in ONE write. Returns (rewritten, failed) msgids.
+
+    A loop over `rewrite_event` is a loop over the whole protocol — flock, pull,
+    strict check, commit, push — per posting, which serialises every other
+    writer of the books behind it and leaves one commit per posting in the
+    history. Applying a rule to its backlog is one intent, so it is one commit.
+
+    A msgid whose block is missing or unrewritable is collected, not raised:
+    one stale index row must not revert the rewrites that did land.
+    """
+    rewritten: list[str] = []
+    failed: list[str] = []
+    touched: list[str] = []
+
+    def mutate() -> None:
+        for msgid in msgids:
+            target: tuple[Path, str] | None = None
+            for path in journal_files(cfg):
+                text = path.read_text()
+                if find_block(text, msgid) is not None:
+                    target = (path, text)
+                    break
+            if target is None:
+                failed.append(msgid)
+                continue
+            path, text = target
+            rel = str(path.relative_to(cfg.path))
+            # Recorded before the write, like `rewrite_event`: `touched` is this
+            # write's git scope AND its revert scope.
+            if rel not in touched:
+                touched.append(rel)
+            try:
+                # Rendered before it is written, so a rejected block leaves the
+                # file exactly as it was and the rest of the batch continues.
+                new_text = rewrite_block(text, msgid, payee=payee, account=account)
+            except BooksError:
+                failed.append(msgid)
+                continue
+            path.write_text(new_text)
+            rewritten.append(msgid)
+
+    if not msgids:
+        return [], []
+    await _write(cfg, f"reclassify {len(msgids)} postings -> {account}", mutate, touched)
+    return rewritten, failed
 
 
 async def remove_event(msgid: str, cfg: BooksConfig) -> None:
@@ -839,6 +1009,17 @@ async def run_hledger(args: list[str], cfg: BooksConfig, *, output_format: str =
         return out if len(out) <= _OUTPUT_CAP else out[:_OUTPUT_CAP] + "\n… (truncated)"
 
     return await asyncio.to_thread(_go)
+
+
+async def declared_accounts(cfg: BooksConfig) -> set[str]:
+    """The declared chart, for a caller that must refuse an undeclared account.
+
+    Deliberately NOT routed through `run_hledger`: that allowlist exists to
+    police a CALLER-supplied argument list, and this argv is fixed and carries
+    no caller text at all, while its 12,000-char output cap would silently drop
+    the tail of a large chart — turning a declared account into a refusal.
+    """
+    return await asyncio.to_thread(_declared_accounts_sync, cfg)
 
 
 async def unpushed_commits(cfg: BooksConfig) -> int:

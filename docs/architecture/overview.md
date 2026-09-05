@@ -36,7 +36,7 @@ To add or repurpose an agent, create it and check the capability tags that descr
 |-------------|------|------------|-----------------|
 | **Sebas** | Executive assistant | `smart` | `GmailIngestFlow`, `CalendarIngestFlow`, `TodoistSyncFlow`, `ClarifyFlow`, `DailyReviewFlow` + `WeeklyReviewFlow`, `SocialPublishFlow`, `SocialMetricsFlow`, `MemoryReflectionFlow`, `CuriosityCardFlow`, `ProfileReflectionFlow`, `ExpiryRadarFlow`, `WearableIngestFlow` |
 | **Raphael** | Research + knowledge | `smart` | `DailyBriefingFlow`, `DayLogFlow` (×3 rows: nightly / weekly / monthly), `IntelligenceScanFlow` (×3 sources), `RaindropIngestFlow`, `RssIngestFlow`, `DriveSyncFlow` |
-| **Maou** | Finance | `smart` | `MoneyProcessFlow`, `MoneyHygieneDailyFlow`, `ReceiptIngestFlow`, `SubscriptionAuditFlow` |
+| **Maou** | Finance | `smart` | `MoneyProcessFlow`, `ReceiptIngestFlow`, `MoneyBriefFlow`, `MonthCloseFlow` |
 | **Pandora's Actor** | Infrastructure | `smart` | `ServiceDriftFlow`, `CertRadarFlow`, `SentryPollFlow`, `DeliveryWatchdogFlow`, `InfraHeartbeatFlow` (2-min swarm node/service poll, transition-only alerts), `FlowHealthWatchdogFlow` (30-min watchdog over AEGIS's own flows), `LLMSpendGuardFlow`, `AgentTaskSweepFlow`, `CleanupFlow`, `WorkspaceRepoSyncFlow`, `GitHubAlertFlow` (PR notifier, webhook-driven) |
 
 **Utility flows (driven by their callers, not owner-scheduled):**
@@ -177,6 +177,8 @@ Owner-scheduled flows are listed in the Personalities table above. The remaining
 - `FlowHealthWatchdogFlow` (Pandora's Actor, every 30 min) — the watchdog over AEGIS's own flows (#226). Alerts when the most recent N runs of one `workflow_type` are all `failed` (N=2, recency-ordered — a later success breaks the chain, so a resolved incident never re-alerts), and when an active `activities` row has had no *successful* run in `3x` its own cadence (derived from `schedule_cron`). Deduped in `audit_log` (`flow_health_alert`/`flow_health_recovered`), so a flow wedged all day is one card; recovery sends a `[FLOW OK]` card and re-arms the dedup. Silence one flow with an `alert_mutes` row keyed `flow-health:<workflow_type|slug>`.
 - `WorkspaceRepoSyncFlow` (Pandora's Actor, daily) — scans the coding host's workspace for git checkouts and makes the `resources` table mirror it (one `kind='repository'` row per checkout); also reports tracked GitHub repos whose AEGIS webhook is missing/dead (`check_github_webhooks`, detection only — it never creates a hook). It reports the **change, not the level** (#142): the standing set is ~14 of 33 and never reaches zero because most tracked checkouts are client repos that shouldn't carry a homelab webhook, so only `result_summary.webhooks_newly_missing` / `webhooks_recovered` warn, diffed against the previous run's own `workflow_runs` row. The full standing list stays in `result_summary.missing_webhooks` (and the flow is chat-triggerable) so it's still readable on demand. `webhook_check_status` (`ok`/`skipped`/`failed`) marks which runs are valid diff baselines — an inconclusive run must not reset the baseline to empty.
 - `MoneyProcessFlow` (Maou, child) — one money email into the books: `store_receipt_email` → `fetch_message_body` → `store_receipt_body` → `load_receipts` → `parse_money_email` → `capture_due` (dues only) → `post_money_event` → `store_money_result`. `parse_money_email` tries the deterministic parsers first (HDFC and NKGSB alerts, the Axis card/autopay/statement/remittance family, Google Pay bills, Stripe/Apple/Airtel receipts) and falls back to one LLM call on the full body; the body fetch is best-effort, so a Gmail failure leaves the stored snippet as the parser's input. Routing is by the event's `kind`: a `transaction` is posted as a block in the hledger journal, or linked to the counterpart block when the bank alert and the vendor receipt for the same payment both arrive; a `due` or `failed` additionally becomes a dated Todoist task in the entity's project; `info` and `ignore` are indexed only. Every event lands in `finance.journal_index` — the journal is the record, that table is the index. Spawned by `GmailIngestFlow` on `financial`/`payments` tags and by the weekly `ReceiptIngestFlow` safety-net, which also re-drives every `finance.receipt_email` row below `parsed.version = 2` and is therefore the backfill vehicle. `ParentClosePolicy.ABANDON`; idempotent on `message_id` at the `store_receipt_email` step and again on the already-routed check in `post_money_event`. Design: [`2026-09-05-maou-books-design.md`](../superpowers/specs/2026-09-05-maou-books-design.md).
+- `MoneyBriefFlow` (Maou, Sunday) — the week's money in one message. Two sources, deliberately: hledger over the journal (income and expenses per entity, top payees, the next fortnight of `~ periodic` forecasts) and `finance.journal_index` for what the journal never got (postings still in an `:unknown` account, open and newly-closed dues). The hledger half is wrapped as a unit, so unreachable books cost that half and not the brief. It refreshes `prices.journal` first, best-effort — a dead quote provider costs stale rates, and any commodity with no rate is named in the message rather than silently under-counted. Sends to Maou's channel and files `reports/weekly/<date>.md` in the books repo.
+- `MonthCloseFlow` (Maou, 1st of the month) — the month that just ended: income statement with the previous month as its comparison column, balance sheet as at the 1st, the month's recurring total from the forecast, and the index counts (unknown postings, dues paid, dues still open). `build_month_close` picks the month, not the schedule, so a manual re-run on any day closes the same one. Sends and files `reports/monthly/<YYYY-MM>.md`.
 
 ### Email Triage
 
@@ -286,9 +288,9 @@ When a `todoist_task_id` is on the alert (pandora APP-<n>: clarify path), the fl
 
 ## Chat with Tool Calling
 
-`POST /api/chat` (non-streaming) and `POST /api/chat/stream` (SSE). 51 tools in `CHAT_TOOLS`, gated per-agent by `agents.metadata.tool_set` (the runtime source of truth, edited on the admin **Behavior** tab); `AGENT_TOOL_SETS` in `core/src/aegis/services/chat.py` is only the seed-time default for the four example agents, and an agent with no configured tool set falls back to the minimal read-only `_FALLBACK_TOOL_SET`.
+`POST /api/chat` (non-streaming) and `POST /api/chat/stream` (SSE). 59 tools in `CHAT_TOOLS`, gated per-agent by `agents.metadata.tool_set` (the runtime source of truth, edited on the admin **Behavior** tab); `AGENT_TOOL_SETS` in `core/src/aegis/services/chat.py` is only the seed-time default for the four example agents, and an agent with no configured tool set falls back to the minimal read-only `_FALLBACK_TOOL_SET`.
 
-`CHAT_TOOLS` and `TOOL_EXECUTORS` stay in `chat.py` as the single registry, but the executor *bodies* for extracted domains live in `core/src/aegis/services/tools/<domain>.py` (today `infra.py` and `vercel.py`); `ToolContext` lives in `services/tools/base.py` and is re-exported from `chat.py`.
+`CHAT_TOOLS` and `TOOL_EXECUTORS` stay in `chat.py` as the single registry, but the executor *bodies* for extracted domains live in `core/src/aegis/services/tools/<domain>.py` (today `infra.py`, `vercel.py` and `ledger.py`); `ToolContext` lives in `services/tools/base.py` and is re-exported from `chat.py`.
 
 Tool loop: max iterations bounded by the service config; per-tool timeout via `asyncio.wait_for` (default `tool_timeout_seconds`, with per-tool overrides in `_TOOL_TIMEOUT_OVERRIDES` for long-running tools like `aegis_self_diagnose`); result truncation per `max_bytes`. Every tool call recorded to `chat_tool_calls`.
 
@@ -296,12 +298,14 @@ Tool counts a fresh install actually gets (from `config/seed/agents.yaml`, which
 
 | Personality | Seeded (`agents.yaml`) | Fallback (`AGENT_TOOL_SETS`) |
 |-------------|------:|------:|
-| Sebas | 20 | 22 |
+| Sebas | 22 | 25 |
 | Raphael | 13 | 13 |
-| Maou | 13 | 13 |
-| Pandora's Actor | 34 | 34 |
+| Maou | 17 | 17 |
+| Pandora's Actor | 35 | 36 |
 
-`AGENT_TOOL_SETS` is only consulted when the agent's DB row carries no `tool_set` — so for the four seeded agents it is effectively dead once the seed has run. The two-tool gap matters: `query_observations` and `last_contact_with_person` read the `life` schema and are **not** seeded to anyone, so they need a manual grant on the Behavior tab before an agent can ask about your people or observations.
+`AGENT_TOOL_SETS` is only consulted when the agent's DB row carries no `tool_set` — so for the four seeded agents it is effectively dead once the seed has run. The gap matters — for Sebas it is three tools: `query_observations` and `last_contact_with_person` read the `life` schema and are **not** seeded to anyone, so they need a manual grant on the Behavior tab before an agent can ask about your people or observations (`comment_on_task` is the third).
+
+**The books' tools.** `ledger_query`, `ledger_post`, `ledger_reclassify` and `ledger_add_rule` (`services/tools/ledger.py`) read and write Maou's hledger books. `ledger_query` is read-only and every caller-supplied argument goes through `books.run_hledger`, whose **exact-match option allowlist** is the whole boundary: hledger bundles short flags (`-Ef<path>` reads a file, `-No<path>` writes one), abbreviates long ones (`--fil=`) and splices `@argsfile` contents in as arguments, so a deny-list of `-f`/`-o` prefixes cannot hold and must never be substituted. The three writers go through `books.py` — one flock, `hledger check --strict`, revert on failure — and each refuses an account the chart does not declare; they carry a `_TOOL_TIMEOUT_OVERRIDES` entry because a books write (pull, check, commit, push) outlasts the chat loop's default. `ledger_post`'s msgid is a hash of the rendered block, so a retried write finds its own block instead of posting the transaction twice. Seeded grants are all four to Maou and `ledger_query` to Sebas; the MCP server withholds the three writers from coding runs (`_UNSERVED_TOOLS`) and the operator mount serves all four. Granting them on a **running** deployment is an `agents.metadata.tool_set` write — see [`infrastructure.md`](../infrastructure.md#ledger-tools).
 
 Startup validator: Core refuses to boot if `AGENT_TOOL_SETS` references a tool that isn't in `CHAT_TOOLS` (`_validate_agent_tool_sets`), and warns on any DB `metadata.tool_set` entry naming a missing executor.
 
@@ -336,7 +340,7 @@ Slack Socket Mode (`slack_sdk`) + FastAPI delivery server (port 8081). One Slack
 
 ## Database
 
-PostgreSQL 16 + pgvector. Migrations 001 → 026 in `migrations/` (001 is the squashed baseline); auto-apply on Core startup, tracked in `schema_migrations`. Migration files are iterated on disk and already-recorded ones skipped, so the numbering is a sort key, not a version.
+PostgreSQL 16 + pgvector. Migrations 001 → 027 in `migrations/` (001 is the squashed baseline); auto-apply on Core startup, tracked in `schema_migrations`. Migration files are iterated on disk and already-recorded ones skipped, so the numbering is a sort key, not a version.
 
 **Core primitives** — `agents`, `agent_personalities`, `agent_profile_revisions` (persona edit log, revertible), `agent_memory` (+ `agent_memory_ops_log`, the consolidation audit ledger), `activities`, `interactions`, `workflow_runs`, `resources`, `channels`, `settings`, `infra`.
 
@@ -348,7 +352,7 @@ PostgreSQL 16 + pgvector. Migrations 001 → 026 in `migrations/` (001 is the sq
 
 **Knowledge (native RAG)** — `knowledge_content`, `knowledge_chunks` (pgvector embeddings), `knowledge_injection_log`.
 
-**Maou (finance)** — `finance.journal_index` (the books' index: idempotency on the Gmail message id, receipt↔bank matching, dues dedupe — amounts in it are never authoritative, run hledger), `finance.recurring_charge`, `finance.receipt_email`, `finance.renewal_alert`, `finance.subscription_digest`.
+**Maou (finance)** — `finance.journal_index` (the books' index: idempotency on the Gmail message id, receipt↔bank matching, dues dedupe — amounts in it are never authoritative, run hledger), `finance.receipt_email`, and `finance.recurring_charge` / `finance.renewal_alert` / `finance.subscription_digest` — legacy tables, unwritten since 2026-09; dropped in a follow-up.
 
 **Pandora's Actor (infra)** — `pandoras_actor.homelab_drift`, `pandoras_actor.cert_expiry`. (`pandoras_actor.backup_health` and `pandoras_actor.schedule_health` were created by the baseline and dropped again by migration 022: their producers, `BackupAuditFlow` and `ScheduleHealthFlow`, were removed when the owner-specific homelab probes were stripped, leaving the tables and their `CleanupFlow` retention entries behind as dead weight.)
 

@@ -75,7 +75,7 @@ async def _clean(db_pool):
 
 def _act(db_pool, cfg, llm=None, capture=None) -> MoneyActivities:
     return MoneyActivities(
-        db_pool=db_pool, llm=llm, delivery=None, fx_rates={}, books_cfg=cfg,
+        db_pool=db_pool, llm=llm, delivery=None, books_cfg=cfg,
         ignored_mailboxes=frozenset({"v2-stpd"}), mailbox_entities={"v2-hikmah": "hikmah"},
         capture=capture,
     )
@@ -289,6 +289,83 @@ async def test_payment_closes_its_open_due(db_pool, tmp_path):
     assert r["closed_due"] == "v2-personal/m-due"
     capture.complete_captured_task.assert_awaited_once_with("task-9")
     assert (await ji.get(db_pool, "v2-personal/m-due"))["linked_message_id"] == "v2-personal/m-paid"
+
+
+@pytest.mark.asyncio
+async def test_a_due_the_noise_guards_left_untasked_still_closes(db_pool, tmp_path):
+    """Every due `capture_due` refuses to task must still close when it is paid.
+
+    `capture_due` has three noise guards — a zero invoice, a twin obligation
+    already tasked under another payee's name, and an autopay notice — and all
+    three index the due and withhold only the Todoist task. Nothing else writes
+    `linked_message_id` for a due, and every "open dues" count in the product
+    (`build_money_brief`, `build_month_close`, `/api/money/state`) reads exactly
+    that column, so requiring a task ref to close one made all three
+    structurally unclosable and the counter monotonic. Four of seven live bill
+    mails on 2026-09-05 were autopay notices: the first month close would have
+    said "still open: 4" for a month in which every one of them was paid, and
+    that four would never have come down.
+
+    The guards are driven for real here, not assumed: each case asserts
+    `capture_due` returned no ref FIRST, so a guard that stopped firing would
+    fail this test rather than quietly make it vacuous.
+    """
+    from aegis_worker.activities.capture import CaptureActivities
+
+    cfg = _repo(tmp_path)
+    capture = AsyncMock()
+    capture.complete_captured_task = AsyncMock(return_value=True)
+    act = _act(db_pool, cfg, capture=capture)
+    guards = CaptureActivities(db_pool=db_pool, connector=AsyncMock(), todoist_projects={})
+
+    def _due(**kw):
+        return _bank_event(
+            kind="due", channel="statement", instrument=None, occurred_on=None,
+            due_on="2026-09-07", account=None, **kw,
+        )
+
+    # The twin guard needs an obligation already tasked under ANOTHER name at
+    # the same amount, currency and due date — Google Pay mirroring a biller.
+    mirror = _due(payee="Google Pay Axis cc", payee_key="google pay axis cc", amount="4242.00")
+    await ActivityEnvironment().run(
+        act.post_money_event, "rid-tw", "v2-personal", "m-mirror", mirror, "task-mirror"
+    )
+
+    cases = {
+        # A ₹0 invoice, which Cloudflare/Workspace/AWS send routinely.
+        "zero": _due(payee="Cloudflare", payee_key="cloudflare", amount="0.00"),
+        # The biller's own statement for the bill Google Pay already mirrored.
+        "twin": _due(payee="Axis credit card XX13", payee_key="axis credit card xx13",
+                     amount="4242.00"),
+        # "Pay Apple Fitness+ ₹149.00" is a task nobody can act on.
+        "autopay": _due(payee="Apple Fitness Plus", payee_key="apple fitness plus",
+                        amount="149.00", autopay=True),
+    }
+    for name, due in cases.items():
+        ref = await ActivityEnvironment().run(guards.capture_due, due, "v2-personal", f"g-{name}")
+        assert ref is None, f"the {name} guard did not fire — this test would be vacuous"
+        r = await ActivityEnvironment().run(
+            act.post_money_event, f"rid-{name}", "v2-personal", f"m-{name}", due, ref
+        )
+        assert r["status"] == "indexed"
+        row = await ji.get(db_pool, f"v2-personal/m-{name}")
+        assert row["todoist_ref"] is None and row["linked_message_id"] is None
+
+    for name, due in cases.items():
+        paid = _bank_event(
+            payee=due["payee"], payee_key=due["payee_key"], amount=due["amount"],
+            channel="imps", occurred_on="2026-09-06", account="equity:transfers",
+        )
+        r = await ActivityEnvironment().run(
+            act.post_money_event, f"rid-{name}-p", "v2-personal", f"m-{name}-paid", paid
+        )
+        assert r["closed_due"] == f"v2-personal/m-{name}", (name, r)
+        row = await ji.get(db_pool, f"v2-personal/m-{name}")
+        assert row["linked_message_id"] == f"v2-personal/m-{name}-paid"
+
+    # Nothing was sent to Todoist for a due that never had a task. A NULL ref
+    # reaching `complete_captured_task` would be a Todoist call on `None`.
+    capture.complete_captured_task.assert_not_awaited()
 
 
 @pytest.mark.asyncio

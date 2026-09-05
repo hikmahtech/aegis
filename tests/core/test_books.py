@@ -166,6 +166,33 @@ def test_rules_first_match_wins(tmp_path):
     assert books.load_rules(tmp_path / "missing.yaml") == []
 
 
+def test_rule_haystack_keeps_exactly_one_pipe():
+    """`|` separates the two halves, so it cannot also appear inside one.
+
+    The generated payee rules anchor on the payee half with `\\|[^|]*`, which
+    only pins the match to the payee if the haystack holds exactly one pipe. A
+    From display name may carry a literal one — `"Google Pay | Bills"
+    <noreply@…>` is the live shape — and that would put the anchor's `[^|]*`
+    inside the SENDER, re-opening the sender-matching hole the anchor exists to
+    close. `sanitize_payee` already strips `|`, but the sender is never
+    sanitized and `apply_rules` is handed the RAW extracted payee, so the fix
+    belongs here at the join.
+    """
+    anchored = [{"match": r"\|[^|]*mahavitaran", "account": "expenses:utilities:electricity"}]
+    # A pipe in the sender must not let the anchored pattern match on the
+    # sender's own text.
+    assert books.apply_rules(anchored, '"Google Pay | mahavitaran" <no@reply>', "Zomato") is None
+    # ...while the payee it was written for still matches.
+    assert books.apply_rules(anchored, '"Google Pay | Bills" <no@reply>', "Mahavitaran") is not None
+    # And a pipe inside the payee neither splits the haystack nor swallows the
+    # words around it.
+    assert books.apply_rules(
+        [{"match": r"\|[^|]*acme[^a-z0-9]+corp", "account": "expenses:saas"}],
+        "billing@acme.example",
+        "Acme | Corp",
+    ) is not None
+
+
 def test_install_deploy_key_raw_and_base64(tmp_path):
     pem = "-----BEGIN OPENSSH PRIVATE KEY-----\nabc\n-----END OPENSSH PRIVATE KEY-----\n"
     s = SimpleNamespace(books_deploy_key=pem, gmail_token_dir=str(tmp_path / "creds"))

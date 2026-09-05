@@ -117,7 +117,9 @@ Rules the writer and parser share:
   name, sender name). `*` always (bank-sourced or receipt-sourced is in tags).
 - Line 2: `    ; msgid: <mailbox>/<gmail message id>`. Always present. It is
   the idempotency key and the address every rewrite uses. A manual posting
-  through the tool gets `msgid: manual/<uuid4>`.
+  through the tool gets `msgid: manual/<hash>` — a SHA-256 of the rendered
+  block, never a `uuid4`, so a retried write is a retry and not a duplicate
+  transaction (§8).
 - Line 3: `    ; channel: <c>, ref: <r>, instrument: <i>` — `channel` always,
   `ref` and `instrument` when known. Extra tags allowed: `receipt: <msgid>`
   (a vendor receipt linked to this bank posting), `bank: <msgid>` (the
@@ -418,7 +420,7 @@ written from the encrypted setting at boot (section 10).
 
 ```sql
 CREATE TABLE IF NOT EXISTS finance.journal_index (
-    message_id        text PRIMARY KEY,          -- "<mailbox>/<gmail id>" or "manual/<uuid>"
+    message_id        text PRIMARY KEY,          -- "<mailbox>/<gmail id>" or "manual/<hash>"
     mailbox           text NOT NULL,
     entity            text NOT NULL,             -- personal | hikmah | none
     kind              text NOT NULL,             -- transaction | due | failed | info | ignore
@@ -477,19 +479,47 @@ There is no separate reconcile sweep; both arrival orders are handled here.
 ## 6. Curiosity and rules
 
 `CuriosityCardFlow`'s `_detect_recurring_charge` becomes
-`_detect_unknown_payee`: the top 50 `payee_key`s by summed amount in the last
-60 days whose index `account` ends in `:unknown`, novelty key
-`payee:<payee_key>`, question "You paid <fmt_money> to <payee> on <date>
-(<channel>). What was it for?". `_already_asked` counts archived cards too:
-an unanswered question is asked again only through the weekly brief's unknown
-list, never as a fresh card.
+`_detect_unknown_payee`: the top 50 `payee_key`s by summed amount in the
+last 60 days whose index `account` ends in `:unknown`, novelty key
+`payee:<payee_key>`, question "You paid <fmt_money> to <payee> (<n> times,
+last <date>, <channel>). What was it for?". The query takes outbound
+home-currency postings only (`direction = 'out'`, `currency = 'INR'`):
+`income:unknown` ends in `:unknown` too, so without that clause an
+uncategorised CREDIT is carded as money the owner paid — false, on the one
+surface allowed to interrupt them, and it steers the account-picking model
+toward an expense account for money that came in. `_already_asked` counts
+archived cards too: an unanswered question is asked again only through the
+weekly brief's unknown list, never as a fresh card.
 
-When the user answers the card, the `InteractionFlow` post-resolve hook
-`apply_books_answer` (new `MoneyActivities` activity) asks the balanced-tier
-model to pick one account from `hledger accounts` for the answer text; with
-confidence ≥ 0.8 it calls `append_rule({match: <escaped payee_key words>,
-account, payee})` and `rewrite_block` for every index row with that
-`payee_key`; otherwise the answer stays in `agent_memory` as today.
+When the user answers the card, the existing `InteractionFlow` post-resolve
+hook `apply_curiosity_answer` (`CuriosityActivities`, not `MoneyActivities`)
+asks the balanced-tier model to pick one account from the DECLARED chart for
+the answer text; with confidence ≥ 0.8 **and** the account actually in that
+chart it calls `append_rule` with that account and payee, and a `match`
+built from the payee_key's escaped words joined by `[^a-z0-9]+` and prefixed
+with `\|[^|]*` — the prefix pins the pattern to the payee half of the
+`<sender> | <payee>` haystack, because an unanchored rule from a payee
+called "Google" would re-file and rename every Google-Pay-mirrored bill. It
+then rewrites every outbound `:unknown` index row for that `payee_key` in
+ONE commit (`rewrite_events`, not a `rewrite_block` loop, which would hold
+the flock for the length of the sweep and leave one commit per posting);
+otherwise the answer stays in `agent_memory` as today. The rule carries the
+`entity` the account states (`books.account_entity`: only the expense and
+income trees have one, and `:hikmah:` is the business side), and the sweep is
+filtered on it, because a rewrite changes the account and never the file the
+block lives in — so an AWS bill that arrived in the personal mailbox and is
+answered "Hikmah infra" must leave `personal/2026.journal` alone and correct
+only the FUTURE mail. Both ledger tools refuse the same move. Two refusals
+matter.
+The account is model-chosen and NOT trusted: one the chart does not declare
+is dropped, because a rule built on it would misfile that payee's mail
+forever. And a payee whose pattern would breach the regex bounds gets NO
+rule rather than a clipped one — a truncated pattern is a prefix rule,
+broader than the question the owner answered, written unattended; the
+backlog still moves, because the sweep selects on `payee_key` and never
+consults the pattern. The books half runs after the memory write and
+swallows its own failures: the owner answered a question, and that answer
+must not be lost to a bad pull or a bad model day.
 
 ## 7. Outputs
 
@@ -511,9 +541,15 @@ thin wrapper passing the Inbox id and no date). Same
 - `due_date` = `due_on - 1 day`, or today if that is past. No GTD state label
   (the date surfaces it).
 - `close_due_if_paid`: when a `transaction` is posted whose `payee_key`
-  matches an open `#bill` capture with the same `due_on` within 45 days and an
-  amount within 1%, complete the task through the outbox
-  (`item_complete`), and note it in the brief.
+  matches an open due with the same `due_on` within 45 days and an amount
+  within 1%, complete its task through the outbox (`item_complete`), mark the
+  due paid, and note it in the brief. Open is `linked_message_id IS NULL` and
+  nothing else. `capture_due` withholds the task for a zero invoice, a twin
+  already tasked under another payee's name and an autopay notice, and all
+  three are still indexed as dues — so a due with no task ref closes exactly
+  the same way, the task completion alone being skipped. Requiring a task ref
+  would make every guarded due permanently open, and "dues open" is a count
+  that could then only rise.
 
 ### 7.2 Weekly brief: `MoneyBriefFlow`
 
@@ -530,8 +566,8 @@ before `gtd-weekly-review` at `0 3:30`). Steps:
    - `reg -X ₹ -p "last 7 days" expenses --sort-amount` top 10 outflows;
    - unknowns: index rows in `*:unknown` in the last 7 days;
    - dues: index rows `kind IN ('due','failed')` with `due_on` in the next 14
-     days and open `todoist_ref`, plus `reg --forecast=<today>..<+14d>` from
-     `recurring.journal`;
+     days and still unpaid (`linked_message_id IS NULL`), plus
+     `reg --forecast=<today>..<+14d>` from `recurring.journal`;
    - large unexplained: unknown-account rows ≥ ₹5,000;
    - housekeeping: `unpushed_commits()`, rows with `parser='llm'` and
      `confidence < 0.8` count.
@@ -565,15 +601,17 @@ the index. Sent to maou's channel and written to `reports/monthly/<YYYY-MM>.md`.
 
 | tool | signature | behaviour |
 |---|---|---|
-| `ledger_query` | `(command: str, args: list[str] = [], output: str = "text")` | `run_hledger([command, *args, …])`; `command` in `{bal, balance, reg, register, print, is, incomestatement, bs, balancesheet, cf, cashflow, accounts, payees, tags, stats, activity, aregister}`; args may not start with `-f`, `--file`, `--rules`, `-o`, `--output-file`, `--config`; `output` in `{text, json, csv}` adds `-O`. Output capped at 12,000 chars with a `… (truncated)` tail. |
-| `ledger_post` | `(date: str, payee: str, postings: list[dict], entity: str = "personal", note: str = "")` | Each posting `{"account", "amount", "currency"}`; at most one posting without amount; every account must be declared; writes `msgid: manual/<uuid4>`, `channel: manual`; indexes with `parser='manual'`. |
-| `ledger_reclassify` | `(message_id: str, account: str, payee: str | None = None)` | `rewrite_block` + index update. Refuses an undeclared account. |
-| `ledger_add_rule` | `(match: str, account: str, entity: str | None = None, payee: str | None = None, apply: bool = True)` | Validates the regex compiles and the account is declared; `append_rule`; when `apply`, reclassifies every index row in an unknown account whose `"<sender> | <payee>"` matches. Returns the count. |
+| `ledger_query` | `(command: str, args: list[str] = [], output: str = "text")` | `run_hledger([command, *args, …])`; `command` in `{bal, balance, reg, register, print, is, incomestatement, bs, balancesheet, cf, cashflow, accounts, payees, tags, stats, activity, aregister, check}`; every argument that starts with `-` must appear verbatim in an **exact-match allowlist** (`books._ALLOWED_OPTIONS`, checked on the token before any `=`), and an `@argsfile` argument is refused outright. **The allowlist is not negotiable and must never become a deny-list:** measured against the real binary, hledger bundles short flags (`-Ef<path>` reads a file, `-No<path>` WRITES one), abbreviates long ones (`--fil=` is `--file=`) and splices an `@argsfile`'s lines in as arguments — so every one of those walks straight past a `startswith` list of `-f`/`-o` prefixes. `output` in `{text, json, csv}` adds `-O`. Output capped at 12,000 chars with a `… (truncated)` tail. |
+| `ledger_post` | `(date: str, payee: str, postings: list[dict], entity: str = "personal", note: str = "")` | Each posting `{"account", "amount", "currency"}`; at most one posting without amount; every account must be declared; writes `msgid: manual/<sha256 of the entity + the rendered block, 16 hex chars>`, `channel: manual`; indexes with `parser='manual'`. **The msgid is derived from the content, never a `uuid4`:** a books write (pull, strict check, commit, push) can outlive the chat loop's timeout, and the model's natural response to a timed-out call is to make it again — with a fresh id that second call posts a DUPLICATE TRANSACTION, while a content-derived one finds the first block and writes nothing. Digesting the rendered block rather than the raw arguments is what makes `"245.50"` and `"245.5"` the same transaction. Two genuinely identical payments on one day need a distinguishing `note`. |
+| `ledger_reclassify` | `(message_id: str, account: str, payee: str | None = None)` | `rewrite_event` + index update, the index only after the journal. Refuses an undeclared account, and refuses a cross-entity move: the block is located in the journal first (`locate_event`), so an `expenses:hikmah:*` account cannot be attached to a posting filed in `personal/` — that block still balances and still passes `check --strict`, so nothing else would catch it. |
+| `ledger_add_rule` | `(match: str, account: str, entity: str | None = None, payee: str | None = None, apply: bool = True)` | Validates the regex compiles and the account is declared; `append_rule`; when `apply`, reclassifies index rows in an unknown account, in ONE commit (`rewrite_events`). Returns the count. Three bounds beyond "it compiles", because the pattern is PERSISTED and the worker then runs it against every money event, in another process, forever: at most 200 characters, no repeated group (`(a+)+`, `((a+))+`), at most 6 stacked quantifiers, and a behavioural probe in a killable subprocess as the backstop — `re` has no timeout and `apply_rules` runs on the event loop, so a slow pattern is a durable cross-process hang no caller-side timeout can interrupt. The sweep matches on the payee alone (the index has no sender), skips rows of another `entity`, and stops at 200 postings, telling the caller to narrow the rule or run it again. |
 
 Grants: all four to `maou`; `ledger_query` also to `sebas`. In
 `mcp_server.py`, `ledger_post`, `ledger_reclassify`, `ledger_add_rule` join
 `_UNSERVED_TOOLS` (a coding run has no business in the books); the operator
-mount serves all four. Rollout grants are DB writes to `agents.metadata.tool_set`.
+mount serves all four. Rollout grants are DB writes to
+`agents.metadata.tool_set` — the yaml seed only applies to an agent that has
+no tool set yet, and the SQL is in `docs/infrastructure.md` (§Ledger tools).
 
 ## 9. Admin
 

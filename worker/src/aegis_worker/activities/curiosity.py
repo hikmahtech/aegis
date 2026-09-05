@@ -7,17 +7,25 @@ has ever been told (its memories and its persona docs).
 
   (a) calendar  — an attendee who keeps showing up on ingested calendar events
                   and is never mentioned in chat_history / agent_memory / profile
-  (b) finance   — an active `finance.recurring_charge` whose vendor is never
+  (b) finance   — a payee the books could not categorise (`finance.journal_index`
+                  rows sitting in an `:unknown` account) and that is never
                   mentioned in agent_memory / profile
   (c) todoist   — a project carrying real OPEN task volume with no profile
                   context (a finished project is not a gap)
 
 Each detector is independently try/excepted: a broken one costs its own
 candidates, never the run. `novelty_key` (`attendee:<email>`,
-`charge:<first word of the vendor>`, `project:<name>`) is the never-ask-twice
-handle — ANY `interactions` row already carrying that key removes the candidate,
-archived included: a timed-out card is a question the owner declined once, and
-the weekly money brief is the retry channel, not another card.
+`payee:<payee_key>`, `project:<name>`) is the never-ask-twice handle — ANY
+`interactions` row already carrying that key removes the candidate, archived
+included: a timed-out card is a question the owner declined once, and the
+weekly money brief is the retry channel, not another card.
+
+The money lane closes the loop: when the owner answers an `unknown_payee` card,
+`apply_curiosity_answer` turns the answer into a permanent `rules/accounts.yaml`
+entry and reclassifies that payee's backlog in the journal, so the same question
+is never worth asking again (spec §6). It replaced a detector over
+`finance.recurring_charge` — a table nothing writes any more, which therefore
+kept raising cards about vendors that could never age out.
 
 An optional single LLM pass rephrases the questions; the deterministic template
 is always computed first and is the fallback, so an absent or failing LLM still
@@ -36,6 +44,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from decimal import Decimal
 from typing import Any
 
 from temporalio import activity
@@ -45,22 +54,60 @@ from temporalio import activity
 _ATTENDEE_LINE_RE = re.compile(r"^Attendees:\s*(.+)$", re.MULTILINE)
 _EMAIL_RE = re.compile(r"[\w.+-]+@[\w-]+\.[\w.-]+")
 
-_DETECTORS = ("calendar_attendee", "recurring_charge", "todoist_project")
+_DETECTORS = ("calendar_attendee", "unknown_payee", "todoist_project")
 
-_KEY_RE = re.compile(r"[^a-z0-9]+")
+# How far back the unknown-payee detector looks. A payment from last year is
+# not worth an interruption; the weekly money brief lists the older backlog.
+_UNKNOWN_DAYS = 60
+# The books hold one currency per journal, and the question states ONE summed
+# figure — mixing currencies into it would print a number that is simply false.
+_UNKNOWN_CURRENCY = "INR"
+
+# How sure the model has to be before its answer becomes a permanent rule that
+# files every future payment from this payee (spec §6).
+_RULE_CONFIDENCE = 0.8
+# Bounds on the generated rule regex, mirroring `services/tools/ledger.py`:
+# the pattern is persisted and then run against every incoming money event in
+# another process, forever. BOTH bounds refuse; neither truncates — a clipped
+# pattern is a PREFIX rule, strictly broader than the payee the owner answered
+# about, and this is the one place a rule is written with no human authoring it.
+_MAX_RULE_WORDS = 6
+_MAX_RULE_MATCH = 200
+# `books.apply_rules` matches against "<sender> | <payee>", so an unanchored
+# pattern also fires on the mail's FROM address. That is live: Google Pay
+# mirrors MSEDCL, Airtel and the rest (hence `bank_parsers.parse_gpay_bill`),
+# so an unanchored rule from a payee called "Google" would re-file — and
+# rename — every Google-Pay-mirrored bill. This prefix pins the match to the
+# payee half; the ledger tool's sweep passes an empty sender, whose haystack
+# still starts " | ", so that call site is unaffected.
+_PAYEE_HALF = r"\|[^|]*"
 
 
-def charge_key(vendor: str) -> str:
-    """First word of the lowercased, punctuation-free vendor name.
+def rule_match_for(payee_key: str) -> str:
+    """A regex matching every punctuation variant of one payee, or "".
 
-    'Mahavitaran (MSEDCL)' and 'Mahavitaran - Maharashtra Electricity (MSEDCL)'
-    are the same bill; keying on the first word collapses every variant the
-    extractor has produced for one vendor (#PR1 of the books spec, §6).
-    # ponytail: first word; PR3 replaces this detector with payee_key from the
-    # journal index.
+    The detector groups by `payee_key` precisely because one biller arrives
+    under several spellings ('Mahavitaran (MSEDCL)' and 'Mahavitaran -
+    Maharashtra Electricity (MSEDCL)' are one bill), so a rule escaping the ONE
+    spelling that happened to win the GROUP BY would leave the others in
+    `expenses:unknown` for good — and the novelty key means they are never
+    asked about again. Joining the key's words with `[^a-z0-9]+` matches them
+    all (spec §6, "escaped payee_key words").
+
+    Cheap to run and impossible to make invalid: `payee_key` yields only
+    `[a-z0-9]` words, so the result is literal words separated by one bounded
+    character class — no nesting, no alternation, and no ambiguity between
+    adjacent atoms, so no backtracking blowup.
+
+    Returns "" when there is nothing to build from or the result would breach
+    either bound. The caller then writes no rule at all — but still applies the
+    backlog, which it selects by `payee_key` and not by this pattern.
     """
-    words = _KEY_RE.sub(" ", (vendor or "").lower()).split()
-    return words[0] if words else ""
+    words = [re.escape(w) for w in (payee_key or "").split()]
+    if not words or len(words) > _MAX_RULE_WORDS:
+        return ""
+    match = _PAYEE_HALF + "[^a-z0-9]+".join(words)
+    return match if len(match) <= _MAX_RULE_MATCH else ""
 
 
 @dataclass
@@ -70,6 +117,10 @@ class CuriosityActivities:
     db_pool: Any
     llm_client: Any = None
     model: str = "gpt-oss:20b"
+    # `books.BooksConfig` — the shared hledger checkout. Filled by the worker's
+    # main(); None means the answer is banked as memory and the books are left
+    # alone, which is also what a fork with no books repo gets.
+    books_cfg: Any = None
     # Thresholds are fields, not literals, so a deployment (and a test) can say
     # what "recurring" and "frequently hit" mean without editing the detector.
     min_attendee_events: int = 3
@@ -221,44 +272,70 @@ class CuriosityActivities:
             )
         return out
 
-    async def _detect_recurring_charge(self, agent_id: str, known: str) -> list[tuple[float, dict]]:
-        """Money leaving every month for something never explained."""
+    async def _detect_unknown_payee(self, agent_id: str, known: str) -> list[tuple[float, dict]]:
+        """Money that left the account for something the books could not name.
+
+        `expenses:unknown` (and its siblings) is the books' review queue, so
+        this reads the queue itself rather than a vendor table: a posting the
+        owner has since explained leaves the queue and stops being a question,
+        with no separate bookkeeping to keep in sync.
+
+        One candidate per `payee_key`, not per posting — the same shop arrives
+        under several spellings and each used to be its own card.
+        """
+        from aegis.services.money_format import fmt_money
+
         rows = await self.db_pool.fetch(
-            "SELECT vendor_name, category, cadence, monthly_home_equivalent "
-            "FROM finance.recurring_charge WHERE status = 'active' "
-            "ORDER BY monthly_home_equivalent DESC LIMIT 50"
+            "SELECT payee_key, max(payee) AS payee, sum(amount) AS total, count(*) AS n, "
+            "max(occurred_on) AS last_on, max(channel) AS channel "
+            "FROM finance.journal_index "
+            # `direction = 'out'` is not a nicety. `income:unknown` matches
+            # `%:unknown` too, so without it an uncategorised inbound credit is
+            # carded as "You paid ₹42,000.00 to Nkgsb Bank … What was it for?"
+            # — false, on the one surface allowed to interrupt the owner, and
+            # it steers the account-picking model toward an EXPENSE account for
+            # money that came in.
+            "WHERE kind = 'transaction' AND direction = 'out' AND account LIKE '%:unknown' "
+            f"AND occurred_on >= now() - interval '{_UNKNOWN_DAYS} days' AND currency = $1 "
+            "GROUP BY payee_key ORDER BY total DESC LIMIT 50",
+            _UNKNOWN_CURRENCY,
         )
-        # One candidate per key, not per row: the extractor produces several
-        # vendor spellings for one bill, and each used to be its own card.
-        best: dict[str, tuple[float, dict]] = {}
+        out: list[tuple[float, dict]] = []
         for r in rows:
-            vendor = (r["vendor_name"] or "").strip()
-            key = charge_key(vendor)
-            if not key or vendor.lower() in known or key in known.split():
+            key = (r["payee_key"] or "").strip()
+            payee = (r["payee"] or "").strip()
+            if not key or not payee or payee.lower() in known:
                 continue
-            monthly = float(r["monthly_home_equivalent"] or 0)
-            cand = (
-                # Cost is the signal — a big unexplained charge outranks a
-                # small one, and any charge outranks a bare calendar face.
-                10.0 + monthly,
-                {
-                    "gap_type": "recurring_charge",
-                    "subject": vendor,
-                    "question": (
-                        f"You have an active {r['cadence']} charge from {vendor}, "
-                        "but nothing on record about why. What is it for?"
-                    ),
-                    "evidence": {
-                        "category": r["category"],
-                        "cadence": r["cadence"],
-                        "monthly_home_equivalent": monthly,
+            total = Decimal(r["total"] or 0)
+            n = int(r["n"] or 0)
+            last_on = r["last_on"].isoformat() if r["last_on"] else "?"
+            channel = (r["channel"] or "other").strip()
+            out.append(
+                (
+                    # Cost is the signal — a big unexplained payment outranks a
+                    # small one, and any of them outranks a bare calendar face.
+                    10.0 + float(total),
+                    {
+                        "gap_type": "unknown_payee",
+                        "subject": payee,
+                        "question": (
+                            f"You paid {fmt_money(total, _UNKNOWN_CURRENCY)} to {payee} "
+                            f"({n} time{'' if n == 1 else 's'}, last {last_on}, {channel}). "
+                            "What was it for?"
+                        ),
+                        # JSON-safe: this crosses a Temporal payload boundary
+                        # and then lands in the card's `metadata` jsonb.
+                        "evidence": {
+                            "payee_key": key,
+                            "total": float(total),
+                            "n": n,
+                            "last_on": last_on,
+                        },
+                        "novelty_key": f"payee:{key}",
                     },
-                    "novelty_key": f"charge:{key}",
-                },
+                )
             )
-            if key not in best or cand[0] > best[key][0]:
-                best[key] = cand
-        return list(best.values())
+        return out
 
     async def _detect_todoist_project(self, agent_id: str, known: str) -> list[tuple[float, dict]]:
         """Where the work actually goes, with no context on what it is."""
@@ -426,11 +503,17 @@ class CuriosityActivities:
     async def apply_curiosity_answer(
         self, interaction_id: str, response: dict | None, metadata: dict | None
     ) -> dict:
-        """InteractionFlow post-resolve hook — bank the answer as memory.
+        """InteractionFlow post-resolve hook — bank the answer as memory, and
+        for an `unknown_payee` card turn it into a books rule as well.
 
         An empty answer (the owner submitted nothing, or the card was resolved
         by something other than a typed reply) writes nothing: a memory row
         saying the owner said nothing is worse than no row.
+
+        The books half is strictly an extra. It runs after the memory is
+        written and every failure inside it is logged and swallowed, because
+        the owner answered a question and that answer must not be lost when a
+        pull, an `hledger check --strict` or the model has a bad day.
         """
         from aegis.services.memory import record_memory
 
@@ -466,4 +549,173 @@ class CuriosityActivities:
             agent_id,
             subject,
         )
-        return {"recorded": True, "agent_id": agent_id, "subject": subject}
+        out = {"recorded": True, "agent_id": agent_id, "subject": subject}
+
+        if meta.get("gap_type") == "unknown_payee" and self.llm_client and self.books_cfg:
+            try:
+                out.update(await self._apply_books_answer(agent_id, meta, subject, answer))
+            except Exception as exc:  # noqa: BLE001 — the memory write stands
+                activity.logger.warning(
+                    "curiosity_books_answer_failed id=%s subject=%s err=%s",
+                    interaction_id,
+                    subject,
+                    str(exc)[:200],
+                )
+                out.update({"rule": None, "reason": "books_failed"})
+        return out
+
+    async def _apply_books_answer(
+        self, agent_id: str, meta: dict, payee: str, answer: str
+    ) -> dict:
+        """Turn one answered unknown-payee card into a rule + a reclassification.
+
+        The account is chosen by the model but is NOT trusted: it has to be one
+        the chart already declares, or `hledger check --strict` would reject
+        every block written under it and the rule would misfile the payee's
+        mail forever. Below `_RULE_CONFIDENCE` nothing is written at all — the
+        answer is already in memory, and a wrong rule is worse than none.
+        """
+        from aegis.api.models.money import payee_key as payee_key_of
+        from aegis.llm import parse_llm_json
+        from aegis.services import books
+
+        cfg = self.books_cfg
+        # `declared_accounts`, not `run_hledger(["accounts", "--declared"])`:
+        # the latter caps its output at 12,000 characters, which would silently
+        # drop the tail of a large chart and turn a declared account into a
+        # refusal.
+        accounts = await books.declared_accounts(cfg)
+        result = await self.llm_client.think(
+            prompt=(
+                f"Payee: {payee}\n"
+                f"The owner says: {answer}\n\n"
+                "Accounts declared in the chart:\n" + "\n".join(sorted(accounts))
+            ),
+            model=self.model,
+            system_prompt=(
+                "You file a payment into one account of a double-entry chart. "
+                "Pick the single account from the list that best fits what the "
+                "owner said this payee is. Copy it EXACTLY as written; never "
+                'invent one. Answer "NONE" if none of them fits or the owner\'s '
+                "reply does not say what the payment was for. Return JSON: "
+                '{"account": "<one of the list, or NONE>", "confidence": 0.0-1.0}'
+            ),
+            max_tokens=300,
+            db_pool=self.db_pool,
+            purpose="books_answer_account",
+            agent_id=agent_id,
+        )
+        parsed = parse_llm_json(result.get("response", ""))
+        parsed = parsed if isinstance(parsed, dict) else {}
+        account = str(parsed.get("account") or "").strip()
+        try:
+            confidence = float(parsed.get("confidence") or 0.0)
+        except (TypeError, ValueError):
+            confidence = 0.0
+
+        # Membership first, so "NONE" and a hallucinated account report the
+        # reason they were actually refused for.
+        if account not in accounts:
+            activity.logger.info(
+                "curiosity_books_answer_undeclared payee=%s account=%s", payee, account[:80]
+            )
+            return {"rule": None, "reason": "undeclared"}
+        if confidence < _RULE_CONFIDENCE:
+            activity.logger.info(
+                "curiosity_books_answer_unsure payee=%s account=%s confidence=%.2f",
+                payee,
+                account,
+                confidence,
+            )
+            return {"rule": None, "reason": "low_confidence"}
+
+        # The card carries the key the detector grouped on; a card already in
+        # flight when this shipped does not, so derive it the same way.
+        key = str(meta.get("payee_key") or "").strip() or payee_key_of(payee)
+        if not key:
+            # `WHERE payee_key = ''` matches every blank-key row in the index,
+            # so an unusable key stops here — it must not even reach the
+            # backlog sweep below.
+            return {"rule": None, "reason": "no_payee_key"}
+
+        # A pattern this payee is too long to express safely means NO RULE —
+        # never a clipped one, which would be a prefix rule broader than the
+        # question the owner answered, persisted forever and applied
+        # unattended. The backlog still moves: the sweep selects on `payee_key`
+        # by exact match and never consults the pattern, so the money already
+        # sitting in `:unknown` reaches the account the owner just explained
+        # and only FUTURE events from this payee miss out. That is the cost the
+        # cap is meant to buy.
+
+        # Which books the answer names. Both ledger tools already refuse the
+        # cross-entity move this would otherwise make unattended: an AWS bill
+        # arrives in the personal mailbox, the owner says "that is the Hikmah
+        # infra bill", and `expenses:hikmah:infra` is declared and balances —
+        # so `check --strict` passes and nothing reverts, while the block sits
+        # in `personal/2026.journal` and the entity-less rule repeats it for
+        # every future AWS mail (`post_event` files by `event.entity`, which
+        # the rule never corrected). `ledger_reclassify` then REFUSES to move
+        # it back, so the repair path is narrower than the path that made it.
+        # None means an entity-neutral account (assets, liabilities, equity),
+        # which belongs to both sets of books — no stamp and no filter.
+        entity = books.account_entity(account)
+
+        match = rule_match_for(key)
+        if match:
+            # Sanitized once: this name is stored in the rule and written into
+            # every future block for this payee, so the rule, the journal and
+            # the index have to carry the same string.
+            rule = {"match": match, "account": account, "payee": books.sanitize_payee(payee)}
+            if entity:
+                rule["entity"] = entity
+            await books.append_rule(rule, cfg)
+
+        rows = await self.db_pool.fetch(
+            "SELECT message_id FROM finance.journal_index "
+            # Same `direction = 'out'` as the detector, and for the same
+            # reason: the owner was asked about money they PAID this payee, so
+            # a credit from the same name (a refund, a transfer back) is not
+            # what they explained and must not be filed to an expense account.
+            "WHERE payee_key = $1 AND kind = 'transaction' AND direction = 'out' "
+            "AND account LIKE '%:unknown' AND journal_file IS NOT NULL "
+            # And only the books the account belongs to: rewriting in place
+            # changes the account, never the file the block lives in.
+            "AND ($2::text IS NULL OR entity = $2)",
+            key,
+            entity,
+        )
+        msgids = [r["message_id"] for r in rows]
+        # ONE write for the whole backlog: one flock, one pull, one strict
+        # check, one commit, one push. A loop over `rewrite_event` would hold
+        # the books against every other writer for the length of the sweep and
+        # leave one commit per posting.
+        rewritten, failed = await books.rewrite_events(msgids, cfg, account=account)
+        for msgid in rewritten:
+            await self.db_pool.execute(
+                "UPDATE finance.journal_index SET account = $2, updated_at = now() "
+                "WHERE message_id = $1",
+                msgid,
+                account,
+            )
+        if failed:
+            activity.logger.warning(
+                "curiosity_books_reclassify_partial payee=%s failed=%d ids=%s",
+                payee,
+                len(failed),
+                failed[:10],
+            )
+        activity.logger.info(
+            "curiosity_books_answer_applied payee=%s account=%s rule=%s "
+            "reclassified=%d failed=%d",
+            payee,
+            account,
+            bool(match),
+            len(rewritten),
+            len(failed),
+        )
+        out = {"reclassified": len(rewritten), "failed": len(failed)}
+        if match:
+            return {"rule": account, **out}
+        # Backlog moved, nothing persisted — a distinct outcome from both a
+        # clean success and a refusal that did nothing.
+        return {"rule": None, "reason": "rule_refused_backlog_applied", **out}

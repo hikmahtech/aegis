@@ -46,7 +46,7 @@ with workflow.unsafe.imports_passed_through():
 # finance-tagged agent, everything else to the GTD one. Resolution failure or
 # an unheld tag falls back to config.agent_id — never a crash, never silence.
 _GAP_TAG = {
-    "recurring_charge": "finance",
+    "unknown_payee": "finance",
     "calendar_attendee": "gtd",
     "todoist_project": "gtd",
 }
@@ -56,6 +56,18 @@ _GAP_TAG = {
 _OWNER_SENSITIVE = ("calendar_attendee",)
 
 _ID_SAFE = re.compile(r"[^a-zA-Z0-9_.-]+")
+
+# `apply_curiosity_answer` is not a quick label write. For an `unknown_payee`
+# card it reads the declared chart with hledger, asks the balanced tier for an
+# account, then runs TWO complete `books._write` protocols — flock,
+# clone-or-pull, mutate, `hledger check --strict`, commit, push. The interaction
+# default of 30s cannot hold that, and `flows/money_process.py` already had to
+# buy 240s for ONE books write, with the note that a shorter budget times out
+# mid-clone and burns every retry on the same clone. Timing out here costs the
+# owner's answer outright: the thread cannot be cancelled, the retry duplicates
+# the memory row and then blocks on the flock, and the novelty key already sits
+# on a resolved interaction — so that payee is never carded again.
+_ANSWER_TIMEOUT_S = 240
 
 
 @dataclass
@@ -139,6 +151,20 @@ class CuriosityCardFlow:
             novelty_key = str(top.get("novelty_key") or "")
             child_id = f"curiosity-{_ID_SAFE.sub('_', novelty_key)[:180]}"
             options = {"aegis_ui_url": config.aegis_ui_url} if config.aegis_ui_url else None
+            metadata = {
+                "novelty_key": novelty_key,
+                "gap_type": top.get("gap_type"),
+                "subject": top.get("subject"),
+                "question": top.get("question"),
+                "agent_id": target,
+            }
+            # The money lane reclassifies the payee's backlog by `payee_key`,
+            # and the card's metadata is the only place the post-resolve hook
+            # can read one from. Without it the answer banks a memory and
+            # silently reclassifies nothing.
+            payee_key = (top.get("evidence") or {}).get("payee_key")
+            if payee_key:
+                metadata["payee_key"] = payee_key
             try:
                 await workflow.start_child_workflow(
                     InteractionFlow.run,
@@ -153,14 +179,9 @@ class CuriosityCardFlow:
                         options=options,
                         timeout_seconds=config.timeout_seconds,
                         timeout_policy="archive",
-                        metadata={
-                            "novelty_key": novelty_key,
-                            "gap_type": top.get("gap_type"),
-                            "subject": top.get("subject"),
-                            "question": top.get("question"),
-                            "agent_id": target,
-                        },
+                        metadata=metadata,
                         post_resolve_activity="apply_curiosity_answer",
+                        post_resolve_timeout_seconds=_ANSWER_TIMEOUT_S,
                     ),
                     id=child_id,
                     parent_close_policy=workflow.ParentClosePolicy.ABANDON,

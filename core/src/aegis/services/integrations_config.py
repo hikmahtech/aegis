@@ -90,13 +90,6 @@ CONFIG_REGISTRY: list[ConfigKey] = [
     ConfigKey("searxng_url", "Base URL", "Search (SearXNG)", False),
     ConfigKey("finance_provider", "Provider (yahoo | stooq)", "Finance", False),
     ConfigKey("finance_indices", "Overview indices (comma-sep symbols)", "Finance", False),
-    ConfigKey(
-        "bank_alert_senders", "Bank/card alert sender domains (comma-sep)",
-        "Finance", False,
-        help="Mail from these domains is treated as bank ALERTS (statements, autopay "
-        "reminders), never as receipts — stops fake recurring charges. "
-        "Worker restart required.",
-    ),
     ConfigKey("aegis_stack_name", "Swarm stack name (blank = show all services)", "System Monitoring", False),
     ConfigKey(
         "infra_cluster", "Infra cluster label (Prometheus `cluster` label)",

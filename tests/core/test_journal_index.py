@@ -129,6 +129,39 @@ async def test_mark_due_paid_leaves_the_payment_link_alone(db_pool):
 
 
 @pytest.mark.asyncio
+async def test_find_open_due_prefers_the_tasked_row(db_pool):
+    """When two open dues tie, the one with a Todoist task wins.
+
+    Admitting untasked dues (so `capture_due`'s noise guards stop leaving them
+    unclosable) created a tie that could not happen before: one biller mailing
+    the same bill twice gives a tasked row AND a twin-suppressed one with the
+    same `payee_key`, amount and `due_on`, so `abs(due_on - around)` cannot
+    separate them. A payment closes exactly ONE due, so picking the untasked
+    row would leave the tasked one open with a Todoist task nothing ever
+    completes — a worse failure than the one the guard removal fixed.
+
+    The untasked row is inserted FIRST on purpose: without the explicit
+    `(todoist_ref IS NULL)` key, a seq scan returns insertion order and would
+    hand back exactly the wrong row here.
+    """
+    due = MoneyEvent(kind="due", direction="out", amount=Decimal("500.00"), currency="INR",
+                     payee="Mahavitaran", payee_key="mahavitaran", channel="statement",
+                     due_on=date(2026, 9, 7), entity="personal", parser="msedcl_bill",
+                     source_class="bank")
+    await ji.upsert(db_pool, "ji-due/twin", "arshad-personal", due)
+    await ji.upsert(db_pool, "ji-due/tasked", "arshad-personal", due, todoist_ref="task-7")
+
+    hit = await ji.find_open_due(db_pool, "mahavitaran", Decimal("500.00"), "INR", date(2026, 9, 6))
+    assert hit is not None and hit["message_id"] == "ji-due/tasked", hit["message_id"]
+
+    # Once the tasked one is paid, the twin is next in line — it is open, not
+    # invisible, which is the whole point of admitting untasked dues.
+    await ji.mark_due_paid(db_pool, "ji-due/tasked", "ji-pay/x")
+    hit = await ji.find_open_due(db_pool, "mahavitaran", Decimal("500.00"), "INR", date(2026, 9, 6))
+    assert hit is not None and hit["message_id"] == "ji-due/twin"
+
+
+@pytest.mark.asyncio
 async def test_find_open_due_tolerance_and_window(db_pool):
     due = MoneyEvent(kind="due", direction="out", amount=Decimal("100308.53"), currency="INR",
                      payee="Axis credit card XX13", payee_key="axis credit card xx13",
@@ -142,11 +175,17 @@ async def test_find_open_due_tolerance_and_window(db_pool):
     # an unrelated payee never matches — asserted while ji-due/1 is still the one open row,
     # so only the payee filter can be rejecting it
     assert await ji.find_open_due(db_pool, "other", Decimal("100308.53"), "INR", date(2026, 9, 6)) is None
-    # ji-due/2 is the same due with no todoist_ref: same payee, currency, amount and date, so
-    # every other filter admits it and only `todoist_ref IS NOT NULL` can keep it out
+    # ji-due/2 is the same due with NO todoist_ref, which is what every due
+    # `capture_due` refused to task looks like — a zero invoice, a twin already
+    # tasked under another payee's name, an autopay notice. Open means unpaid
+    # (`linked_message_id IS NULL`), not "has a task": nothing else writes that
+    # column for a due, so requiring a ref here left every guarded due
+    # permanently open in the brief, the month close and the admin page.
     await ji.upsert(db_pool, "ji-due/2", "arshad-personal", due)
-    hit = await ji.find_open_due(db_pool, "axis credit card xx13", Decimal("100300.00"), "INR", date(2026, 9, 6))
-    assert hit is not None and hit["message_id"] == "ji-due/1"
-    # drop the row that has one, and the query must go empty rather than fall through to ji-due/2
     await db_pool.execute("DELETE FROM finance.journal_index WHERE message_id = 'ji-due/1'")
+    hit = await ji.find_open_due(db_pool, "axis credit card xx13", Decimal("100300.00"), "INR", date(2026, 9, 6))
+    assert hit is not None and hit["message_id"] == "ji-due/2"
+    assert hit["todoist_ref"] is None
+    # ...and paying it still takes it out of the pool, task or no task.
+    await ji.mark_due_paid(db_pool, "ji-due/2", "ji-pay/1")
     assert await ji.find_open_due(db_pool, "axis credit card xx13", Decimal("100300.00"), "INR", date(2026, 9, 6)) is None

@@ -49,6 +49,13 @@ class InteractionFlowInput:
     # and other parent-await callers leave these as None.
     metadata: dict[str, Any] | None = None
     post_resolve_activity: str | None = None
+    # How long that hook gets. The default suits the Todoist label writes
+    # clarify posts through here. A hook that writes the BOOKS needs far more:
+    # `books._write` is flock → clone-or-pull → mutate → `hledger check
+    # --strict` → commit → push, and `flows/money_process.py` already had to
+    # buy 240s for ONE of those. Raising `_ACT_TIMEOUT` globally instead would
+    # stretch every quick hook to match the slowest one.
+    post_resolve_timeout_seconds: int = 30
 
 
 @dataclass
@@ -226,7 +233,9 @@ class InteractionFlow:
                     input.post_resolve_activity,
                     args=[interaction_id, self._response or {}, input.metadata or {}],
                     retry_policy=_BEST_EFFORT_RETRY,
-                    start_to_close_timeout=_ACT_TIMEOUT,
+                    start_to_close_timeout=timedelta(
+                        seconds=max(1, input.post_resolve_timeout_seconds)
+                    ),
                 )
             except Exception as exc:  # noqa: BLE001
                 workflow.logger.warning(

@@ -140,6 +140,43 @@ async def test_a_fatal_connector_refuses_to_boot_and_names_itself(
             await pool.close()
 
 
+async def test_the_worker_builds_its_own_finance_connector(worker_settings):
+    """Core builds a `FinanceConnector`; the worker has to build one too.
+
+    `MoneyActivities.refresh_fx_prices` is the books' only source of USD/GBP/EUR
+    rates. Without the connector here it reports itself `disabled` forever and
+    every `-X ₹` figure in the money brief silently leaves foreign amounts
+    unconverted — a wrong number, not a missing one.
+    """
+    from aegis.connectors.finance import FinanceConnector
+
+    deps = await bootstrap(worker_settings)
+    try:
+        assert isinstance(deps.connectors.get("finance"), FinanceConnector)
+        assert "finance" not in deps.connector_errors
+    finally:
+        await deps.close()
+
+
+def test_the_money_activities_are_handed_the_finance_connector():
+    """Registering a connector nobody passes on is the same as not having one,
+    so the call site is pinned as well as the registration."""
+    import ast
+    import inspect
+
+    import aegis_worker.__main__ as worker_main
+
+    tree = ast.parse(inspect.getsource(worker_main))
+    calls = [
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and getattr(node.func, "id", "") == "MoneyActivities"
+    ]
+    assert len(calls) == 1, "expected exactly one MoneyActivities construction in __main__"
+    finance = [kw for kw in calls[0].keywords if kw.arg == "finance"]
+    assert finance, "MoneyActivities must be given the finance connector"
+    assert ast.unparse(finance[0].value) == "connectors.get('finance')"
+
+
 # ---------------------------------------------------------------------------
 # Use-time behaviour
 # ---------------------------------------------------------------------------

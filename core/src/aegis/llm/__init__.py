@@ -144,75 +144,6 @@ def _classify_llm_error(exc: BaseException) -> str:
     return "error"
 
 
-_BATCH_RECEIPT_PROMPT = """\
-You are extracting structured data from email receipts and renewal notices.
-
-For EACH receipt below, return one JSON object with these fields:
-- is_receipt: true ONLY if this confirms money actually charged or due — a
-  payment receipt, invoice, renewal notice, or subscription charge
-  confirmation. false for newsletters, marketing, alerts, account statements,
-  order confirmations for physical goods, AND any promotional/offer email even
-  when it quotes a figure: insurance coverage / sum-assured amounts, credit-card
-  or loan eligibility/limit offers, reward/cashback/discount amounts, "you are
-  eligible for ₹X" pitches. A number in an advertisement is NOT a charge.
-- vendor_name: human-readable display name (e.g. "Namecheap", "Zerodha").
-- sender_label: lowercased canonical id, prefer the sender domain
-  (e.g. "namecheap.com").
-- category: one of domain, saas, insurance, lease, media, infra, other.
-- amount: REQUIRED when is_receipt=true. Extract the charge amount as a
-  float. Look for patterns like "Rs. 1,234", "₹1234", "USD 29.99",
-  "$29.99", "INR 1234.00", "Total: 500", "Amount Due: 1,499". Strip
-  commas from numbers. Return null ONLY if truly no amount appears.
-- currency: ISO-3 code (INR, USD, EUR). Infer from ₹/Rs./Rupees → INR,
-  $→USD, €→EUR. Null if unknown.
-- cadence: monthly | quarterly | yearly | unknown. Infer from "annual",
-  "every month", "billed quarterly", "3 months", "1 year plan".
-- next_due_at: ISO date (YYYY-MM-DD) if explicitly stated; null otherwise.
-- is_recurring: true if this looks like a SUBSCRIPTION or UTILITY that will
-  bill again (SaaS plan, streaming, domain/hosting renewal, insurance
-  premium, electricity/water/phone bill). false if it is a ONE-OFF purchase
-  that will not repeat (a single Amazon/e-commerce order, a one-time
-  service, a single event ticket). null if you cannot tell.
-- confidence: 0.0–1.0 self-rating.
-
-IMPORTANT: When is_receipt=true you MUST provide the amount and currency that
-was actually billed/charged. Do not leave amount null for a real receipt. But
-do NOT manufacture a charge from an unrelated figure: if the only number is a
-coverage limit, eligibility/credit limit, reward, or advertised price in a
-marketing email, set is_receipt=false rather than recording it as a charge.
-
-Also set is_receipt=false (no money was actually charged to a vendor) for:
-- FAILED / declined / reversed / unsuccessful / refunded payments — a failure
-  notice ("payment failed", "failed for", "declined", "unsuccessful",
-  "reversed", "refund") means nothing was charged, not a receipt.
-- Bank/card AUTOPAY REMINDERS and ACTIVATION notices ("upcoming autopay",
-  "autopay reminder", "autopay … activated", "mandate") — a bank telling you a
-  charge is *upcoming* is a heads-up, NOT a receipt of money charged; and the
-  named merchant is the autopay target, never the email sender.
-- Credit-card STATEMENTS / bills ("new bill", "credit card bill", "statement",
-  "minimum due", "total due", "pay now") — a card statement total is the bill
-  for the whole card, not a per-vendor subscription charge.
-
-Return a JSON array with EXACTLY one object per receipt, in the same
-order. Wrap in ```json fences.
-
-RECEIPTS:
-{receipts}
-"""
-
-
-def _format_receipts_for_prompt(receipts: list[dict]) -> str:
-    parts = []
-    for i, r in enumerate(receipts):
-        parts.append(
-            f"--- Receipt {i + 1} ---\n"
-            f"From: {r.get('sender', '')}\n"
-            f"Subject: {r.get('subject', '')}\n"
-            f"Body (truncated): {(r.get('body_plain') or '')[:4000]}\n"
-        )
-    return "\n".join(parts)
-
-
 _MONEY_EVENT_PROMPT = """\
 You are the bookkeeper. For EACH email below return one JSON object describing
 the money event it carries.
@@ -317,7 +248,7 @@ class LLMClient:
             timeout=timeout,
         )
         # Optional — enables the spend-governor kill switch on generation calls
-        # (`think`/`chat`, and `extract_receipts_batch` via `think`). When None
+        # (`think`/`chat`, and `extract_money_batch` via `think`). When None
         # the client is ungoverned, which is what comms and the ad-hoc
         # backend-connectivity test client want.
         self._db_pool = db_pool
@@ -776,109 +707,6 @@ class LLMClient:
                 "completion_tokens": completion_tokens,
             }
 
-    async def extract_receipts_batch(
-        self,
-        receipts: list[dict],
-        model: str = "gemma4:e2b",
-        system_prompt: str | None = None,
-        db_pool: Any = None,
-        agent_id: str | None = None,
-    ) -> list[dict]:
-        """Classify + extract structured fields for a batch of receipts.
-
-        Sends one prompt with all N receipts, parses the JSON-array
-        response into per-receipt dicts matching the
-        `aegis.api.models.money.ReceiptExtraction` schema.
-
-        On full-batch failure (LLM error, JSON decode, wrong shape) this
-        method RAISES so the caller can decide to retry or drop. The one
-        exception is `LLMTruncationError`: when the model exhausts its token
-        budget on hidden reasoning before writing visible content, we return
-        N items each marked `_parse_failed=True` rather than crashing the
-        whole MoneyProcessFlow.  Per-item parse failure inside an
-        otherwise-OK batch is also signalled with `_parse_failed=True`.
-
-        Callers that want a fire-and-forget "always return N items" path
-        should wrap in try/except themselves; this used to swallow all
-        failures silently and let money_process upsert garbage rows.
-
-        `system_prompt` — optional persona context prepended to the
-        extraction instruction so downstream agents (maou) can steer
-        the classifier's voice/policy without changing the schema.
-
-        `agent_id` — owning agent (e.g. "maou"), threaded through to the
-        `llm_calls` row so per-agent spend/usage stays attributable (issue:
-        95% of worker-side llm_calls rows had NULL agent_id).
-
-        The spend-governor kill switch applies here transitively: this
-        delegates to `think()`, whose guard raises `LLMKillSwitchError`
-        before any HTTP call. That error is NOT converted to
-        `_parse_failed` stubs — only `LLMTruncationError` is — so a
-        spend freeze surfaces as a real failure rather than silently
-        marking every receipt unparseable.
-        """
-        from aegis.api.models.money import ReceiptExtraction
-
-        if not receipts:
-            return []
-        prompt = _BATCH_RECEIPT_PROMPT.format(receipts=_format_receipts_for_prompt(receipts))
-        try:
-            result = await self.think(
-                prompt=prompt,
-                model=model,
-                system_prompt=system_prompt,
-                max_tokens=4000,
-                db_pool=db_pool,
-                purpose="money_receipt_extraction",
-                agent_id=agent_id,
-            )
-            parsed = parse_llm_json(result.get("response", ""))
-            if not isinstance(parsed, list):
-                raise ValueError("expected JSON array")
-        except LLMTruncationError as exc:
-            # Reasoning model consumed the token budget on hidden content.
-            # Return _parse_failed stubs so MoneyProcessFlow skips these
-            # receipts without crashing the whole batch or retrying endlessly.
-            logger.warning(
-                "extract_receipts_batch_truncated",
-                error=str(exc)[:200],
-                count=len(receipts),
-            )
-            return [
-                {"is_receipt": False, "confidence": 0.0, "_parse_failed": True}
-                for _ in receipts
-            ]
-        except Exception as exc:
-            logger.warning(
-                "extract_receipts_batch_failed",
-                error=str(exc)[:200],
-                count=len(receipts),
-            )
-            raise
-
-        out: list[dict] = []
-        for i in range(len(receipts)):
-            if i < len(parsed) and isinstance(parsed[i], dict):
-                try:
-                    out.append(ReceiptExtraction(**parsed[i]).model_dump())
-                except Exception:
-                    out.append(
-                        {
-                            "is_receipt": False,
-                            "confidence": 0.0,
-                            "_parse_failed": True,
-                        }
-                    )
-            else:
-                out.append(
-                    {
-                        "is_receipt": False,
-                        "confidence": 0.0,
-                        "_parse_failed": True,
-                    }
-                )
-        return out
-
     async def extract_money_batch(
         self,
         receipts: list[dict],
@@ -889,11 +717,11 @@ class LLMClient:
     ) -> list[dict]:
         """One `MoneyEvent` dict per input email (spec §4).
 
-        The v2 extractor. It replaces the "is this a receipt?" question with
-        "what money event is this?", and reads the FULL body rather than the
-        200-char snippet `extract_receipts_batch` saw — a declined payment, an
-        autopay reminder and a paid invoice are only distinguishable further
-        down the mail.
+        The v2 extractor. It replaces the "is this a receipt?" question the
+        deleted v1 batch extractor asked with "what money event is this?", and
+        reads the FULL body rather than a 200-char snippet — a declined
+        payment, an autopay reminder and a paid invoice are only
+        distinguishable further down the mail.
 
         Failure semantics, deliberately three-way:
 
