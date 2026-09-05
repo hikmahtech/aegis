@@ -354,6 +354,10 @@ def test_an_over_long_payee_key_yields_no_rule_rather_than_a_prefix():
     owner actually answered about, persisted forever and applied unattended.
     'Payment to merchant via Google Pay UPI Zomato' clipped to its first six
     words would file every 'payment to merchant via google pay' anything.
+
+    No rule is not no work: the caller still reclassifies that payee's backlog,
+    which it selects on `payee_key` rather than on this pattern. See
+    `test_curiosity_books_answer.py::test_a_refused_rule_still_applies_the_backlog`.
     """
     from aegis_worker.activities.curiosity import rule_match_for
 

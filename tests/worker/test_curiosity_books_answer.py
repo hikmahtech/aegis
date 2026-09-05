@@ -42,6 +42,10 @@ MAILBOX = "cur-books-t"
 # rewritten against a tmp repo that does not hold it.
 PAYEE = "Jai shree zzt5nakoda"
 KEY = payee_key(PAYEE)
+# Eight words, so `rule_match_for` refuses to build a pattern for it — a
+# six-word clip would be a prefix rule matching every "payment to merchant via
+# zzt5long pay" anything, forever, with nobody having authored it.
+LONG_PAYEE = "Payment to merchant via zzt5long Pay UPI Zomato"
 
 ACCOUNTS = """commodity ₹ 1,00,000.00
 account assets:bank:hdfc:1225
@@ -92,6 +96,16 @@ def _commits(cfg: books.BooksConfig) -> int:
 
 def _rules(cfg: books.BooksConfig) -> list[dict]:
     return books.load_rules(cfg.path / "rules" / "accounts.yaml")
+
+
+def _rules_text(cfg: books.BooksConfig) -> str:
+    """The raw file, because `load_rules` drops any entry with a falsy `match`.
+
+    "no rule was written" asserted through `load_rules` alone would be blind to
+    a rule that WAS appended with an empty pattern — inert, but still a junk
+    line committed to the books on every refused answer.
+    """
+    return (cfg.path / "rules" / "accounts.yaml").read_text()
 
 
 def _journal(cfg: books.BooksConfig) -> str:
@@ -516,6 +530,71 @@ async def test_another_payee_is_left_alone(clean_db, tmp_path):
     assert out["reclassified"] == 1
     assert await _account_of(clean_db, mine) == "expenses:groceries"
     assert await _account_of(clean_db, other) == "expenses:unknown"
+
+
+async def test_a_refused_rule_still_applies_the_backlog(clean_db, tmp_path):
+    """No pattern does not mean no work.
+
+    The sweep selects index rows on `payee_key`, an exact match — it never
+    consults the regex. So when the word cap refuses to persist a pattern, the
+    money already sitting in `expenses:unknown` can still move to the account
+    the owner just explained. Only FUTURE events from this payee miss out,
+    which is exactly the cost the cap is meant to buy: neither an over-broad
+    persisted prefix nor an answer spent for nothing.
+    """
+    cfg = _repo(tmp_path)
+    msgids = [await _post(clean_db, cfg, payee=LONG_PAYEE, day=d) for d in (2, 3)]
+    llm = FakeLLM('{"account": "expenses:groceries", "confidence": 0.9}')
+
+    out = await _apply(
+        clean_db,
+        cfg,
+        llm,
+        meta=_meta(subject=LONG_PAYEE, payee_key=payee_key(LONG_PAYEE)),
+    )
+
+    # Distinguishable from a clean success, and from a refusal that did nothing.
+    assert out["rule"] is None
+    assert out["reason"] == "rule_refused_backlog_applied"
+    assert out["reclassified"] == 2
+    assert out["failed"] == 0
+
+    assert _rules(cfg) == [], "a prefix rule was persisted after all"
+    assert _rules_text(cfg) == "", "the rules file was written to anyway"
+    assert "expenses:unknown" not in _journal(cfg)
+    for msgid in msgids:
+        assert await _account_of(clean_db, msgid) == "expenses:groceries"
+    assert len(await _memories(clean_db)) == 1
+
+
+async def test_a_payee_with_no_usable_key_touches_nothing(clean_db, tmp_path):
+    """An empty key must not reach the sweep — not even to apply a backlog.
+
+    `WHERE payee_key = ''` matches every blank-key row in the index, so the
+    "apply the backlog anyway" path above has to stop short of it or one
+    unparseable payee reclassifies a pile of unrelated postings.
+    """
+    cfg = _repo(tmp_path)
+    blank = ji.msgid_for(MAILBOX, uuid4().hex)
+    await clean_db.execute(
+        "INSERT INTO finance.journal_index "
+        "(message_id, mailbox, entity, kind, direction, amount, currency, payee, payee_key, "
+        " account, channel, occurred_on, parser, source_class, journal_file) "
+        "VALUES ($1, $2, 'personal', 'transaction', 'out', 10, 'INR', '!!!', '', "
+        " 'expenses:unknown', 'upi', '2026-09-02', 'test', 'bank', 'personal/2026.journal')",
+        blank,
+        MAILBOX,
+    )
+    llm = FakeLLM('{"account": "expenses:groceries", "confidence": 0.9}')
+
+    out = await _apply(clean_db, cfg, llm, meta=_meta(subject="!!!", payee_key=""))
+
+    assert out["rule"] is None
+    assert out["reason"] == "no_payee_key"
+    assert "reclassified" not in out
+    assert await _account_of(clean_db, blank) == "expenses:unknown"
+    assert _rules_text(cfg) == ""
+    assert len(await _memories(clean_db)) == 1
 
 
 async def test_a_credit_from_the_same_payee_is_left_alone(clean_db, tmp_path):

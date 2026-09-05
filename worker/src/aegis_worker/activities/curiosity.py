@@ -100,8 +100,8 @@ def rule_match_for(payee_key: str) -> str:
     adjacent atoms, so no backtracking blowup.
 
     Returns "" when there is nothing to build from or the result would breach
-    either bound. The caller then writes no rule at all: the answer is already
-    banked as memory, and no rule beats a rule broader than the question.
+    either bound. The caller then writes no rule at all — but still applies the
+    backlog, which it selects by `payee_key` and not by this pattern.
     """
     words = [re.escape(w) for w in (payee_key or "").split()]
     if not words or len(words) > _MAX_RULE_WORDS:
@@ -632,15 +632,27 @@ class CuriosityActivities:
         # The card carries the key the detector grouped on; a card already in
         # flight when this shipped does not, so derive it the same way.
         key = str(meta.get("payee_key") or "").strip() or payee_key_of(payee)
-        match = rule_match_for(key)
-        if not match:
-            return {"rule": None, "reason": "no_match_key"}
+        if not key:
+            # `WHERE payee_key = ''` matches every blank-key row in the index,
+            # so an unusable key stops here — it must not even reach the
+            # backlog sweep below.
+            return {"rule": None, "reason": "no_payee_key"}
 
-        # Sanitized once: this name is stored in the rule and written into
-        # every future block for this payee, so the rule, the journal and the
-        # index have to carry the same string.
-        rule = {"match": match, "account": account, "payee": books.sanitize_payee(payee)}
-        await books.append_rule(rule, cfg)
+        # A pattern this payee is too long to express safely means NO RULE —
+        # never a clipped one, which would be a prefix rule broader than the
+        # question the owner answered, persisted forever and applied
+        # unattended. The backlog still moves: the sweep selects on `payee_key`
+        # by exact match and never consults the pattern, so the money already
+        # sitting in `:unknown` reaches the account the owner just explained
+        # and only FUTURE events from this payee miss out. That is the cost the
+        # cap is meant to buy.
+        match = rule_match_for(key)
+        if match:
+            # Sanitized once: this name is stored in the rule and written into
+            # every future block for this payee, so the rule, the journal and
+            # the index have to carry the same string.
+            rule = {"match": match, "account": account, "payee": books.sanitize_payee(payee)}
+            await books.append_rule(rule, cfg)
 
         rows = await self.db_pool.fetch(
             "SELECT message_id FROM finance.journal_index "
@@ -673,10 +685,17 @@ class CuriosityActivities:
                 failed[:10],
             )
         activity.logger.info(
-            "curiosity_books_answer_applied payee=%s account=%s reclassified=%d failed=%d",
+            "curiosity_books_answer_applied payee=%s account=%s rule=%s "
+            "reclassified=%d failed=%d",
             payee,
             account,
+            bool(match),
             len(rewritten),
             len(failed),
         )
-        return {"rule": account, "reclassified": len(rewritten), "failed": len(failed)}
+        out = {"reclassified": len(rewritten), "failed": len(failed)}
+        if match:
+            return {"rule": account, **out}
+        # Backlog moved, nothing persisted — a distinct outcome from both a
+        # clean success and a refusal that did nothing.
+        return {"rule": None, "reason": "rule_refused_backlog_applied", **out}
