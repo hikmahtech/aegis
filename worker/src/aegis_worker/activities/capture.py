@@ -243,6 +243,15 @@ class CaptureActivities:
         ev = MoneyEvent(**{k: v for k, v in event.items() if not k.startswith("_")})
         if ev.kind not in ("due", "failed") or ev.due_on is None or ev.amount is None:
             return None
+        # A zero invoice is not a bill. Cloudflare, Google Workspace and AWS all
+        # send ₹0/$0 invoices routinely, and "Pay Cloudflare $0.00" is exactly the
+        # noise the books lane exists to remove — the event is still indexed and
+        # still shows up in the brief, it just does not interrupt anyone.
+        if ev.amount == 0:
+            activity.logger.info(
+                "capture_due_skipped_zero_amount payee=%s due_on=%s", ev.payee, ev.due_on
+            )
+            return None
         today = datetime.now(ZoneInfo(self.home_tz)).date()
         # A day of warning, but never a task that is born overdue.
         due = max(ev.due_on - timedelta(days=1), today)
