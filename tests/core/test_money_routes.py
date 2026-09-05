@@ -153,20 +153,28 @@ def books_dir(tmp_path) -> Path:
     return tmp_path / "books"
 
 
-@pytest_asyncio.fixture(loop_scope="function")
-async def real_client(db_pool, books_dir):
-    """httpx client on a real pool — TestClient's own event loop would
-    InterfaceError on the shared asyncpg pool."""
-    await _cleanup(db_pool)
+def _real_app(db_pool, **settings_over):
     app = create_app(run_lifespan=False)
     app.state.db_pool = db_pool
     app.state.temporal_client = AsyncMock()
-    app.dependency_overrides[get_settings] = lambda: _settings(books_path=str(books_dir))
-    async with AsyncClient(
+    app.dependency_overrides[get_settings] = lambda: _settings(**settings_over)
+    return app
+
+
+def _real_client(app) -> AsyncClient:
+    """httpx client — TestClient's own event loop would InterfaceError on the
+    shared asyncpg pool."""
+    return AsyncClient(
         transport=ASGITransport(app=app),
         base_url="http://test",
         headers={"X-API-Key": "test-key"},
-    ) as c:
+    )
+
+
+@pytest_asyncio.fixture(loop_scope="function")
+async def real_client(db_pool, books_dir):
+    await _cleanup(db_pool)
+    async with _real_client(_real_app(db_pool, books_path=str(books_dir))) as c:
         yield c
     await _cleanup(db_pool)
 
@@ -174,9 +182,15 @@ async def real_client(db_pool, books_dir):
 async def test_money_state_returns_index_events_newest_first(real_client, db_pool):
     """GET /state serialises journal_index rows, newest effective date first.
 
-    The date a row sorts on is `coalesce(occurred_on, due_on)`: a due has no
-    `occurred_on` at all, so ordering on `occurred_on` alone would bury every
-    unpaid bill at the bottom of the page under a NULL.
+    Three things are pinned by the ordering assertion:
+
+    * the date a row sorts on is `coalesce(occurred_on, due_on)` — a due has no
+      `occurred_on` at all, so ordering on `occurred_on` alone would bury every
+      unpaid bill at the bottom of the page under a NULL;
+    * `NULLS LAST` — both columns are nullable with no CHECK, and Postgres puts
+      NULLs FIRST on a `DESC`, so a row with neither date would otherwise take
+      the top of the page and push a real event off the 100-row limit;
+    * `DESC` itself.
     """
     await _seed(db_pool, suffix="old", occurred_on="2026-08-01")
     await _seed(
@@ -191,15 +205,20 @@ async def test_money_state_returns_index_events_newest_first(real_client, db_poo
         journal_file=None,
         todoist_ref="8123456789",
     )
+    # Neither date. Nothing stops the writer indexing one of these, and it is
+    # the row `NULLS LAST` exists for.
+    await _seed(db_pool, suffix="undated", kind="ignore", occurred_on=None, due_on=None)
 
     resp = await real_client.get("/api/admin/money/state")
 
     assert resp.status_code == 200, resp.text
     body = resp.json()
     mine = [e for e in body["events"] if e["message_id"].startswith(PREFIX)]
-    assert [e["message_id"] for e in mine] == [f"{PREFIX}due", f"{PREFIX}old"]
+    assert [e["message_id"] for e in mine] == [
+        f"{PREFIX}due", f"{PREFIX}old", f"{PREFIX}undated",
+    ]
 
-    due, old = mine
+    due, old, _undated = mine
     # Amount crosses the wire as the STRING the ledger wrote. A float would
     # round-trip 95301.29 through binary and the page would then disagree with
     # the journal on the last paisa.
@@ -288,6 +307,27 @@ async def test_money_state_books_configured_when_checkout_exists(real_client, bo
     assert body["books_configured"] is True
 
 
+async def test_money_state_books_configured_from_repo_url_before_first_clone(
+    db_pool, books_dir
+):
+    """A configured repo url counts even before the first clone has landed.
+
+    That is the state a fresh deployment sits in for as long as the clone
+    takes — and it is the exact screen the operator is watching during setup.
+    Reporting "Books configured: No" there, under the red "events are indexed
+    but never posted" banner, says the opposite of the truth.
+    """
+    assert not books_dir.exists()
+    app = _real_app(
+        db_pool, books_path=str(books_dir), books_repo_url="git@github.com:me/books.git"
+    )
+
+    async with _real_client(app) as c:
+        body = (await c.get("/api/admin/money/state")).json()
+
+    assert body["books_configured"] is True
+
+
 async def test_money_digest_none_when_reports_dir_missing(real_client, books_dir):
     """No books checkout at all ⇒ {digest: None}."""
     assert not books_dir.exists()
@@ -298,14 +338,18 @@ async def test_money_digest_none_when_reports_dir_missing(real_client, books_dir
     assert resp.json() == {"digest": None}
 
 
-async def test_money_digest_none_when_reports_dir_empty(real_client, books_dir):
-    """The directory existing but holding no close is also None.
+async def test_money_digest_none_when_reports_dir_holds_no_close(real_client, books_dir):
+    """A readable directory with no `.md` in it is also None.
 
-    Separate from the missing-directory case deliberately: that one exits on
-    the OSError branch, so on its own it would still pass if the listing code
-    were deleted entirely.
+    The file is what makes this test say something. An EMPTY directory would
+    not: `except OSError: return None` returns exactly the value the assertion
+    expects, so pointing the listing at a path that always raises would leave
+    the test green. A non-`.md` file can only be skipped by a listing that
+    actually ran, so this pins the suffix filter and the branch at once.
     """
-    (books_dir / "reports" / "monthly").mkdir(parents=True)
+    monthly = books_dir / "reports" / "monthly"
+    monthly.mkdir(parents=True)
+    (monthly / "README.txt").write_text("not a close", encoding="utf-8")
 
     assert (await real_client.get("/api/admin/money/digest")).json() == {"digest": None}
 

@@ -118,8 +118,14 @@ def _latest_close_sync(base: Path) -> dict | None:
     """
     try:
         names = sorted(p.name for p in base.iterdir() if p.is_file() and p.suffix == ".md")
-    except OSError:
+    except (FileNotFoundError, NotADirectoryError):
         return None  # no checkout yet, or reports/ has never been written
+    except OSError as exc:
+        # Everything else — a permissions error, an I/O error, a half-finished
+        # clone — renders identically to "no close filed yet". Say so in the
+        # log, or the page quietly reports an empty month forever.
+        logger.warning("money_digest_list_failed dir=%s error=%s", base, str(exc)[:200])
+        return None
     if not names:
         return None
     newest = names[-1]

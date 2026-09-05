@@ -162,7 +162,11 @@ export default function Money() {
         </div>
         <div className="stat-item">
           <span className="stat-value">{data?.dues_open ?? '—'}</span>
-          <span className="stat-label">Dues open</span>
+          {/* The window is in the label because the month close rendered
+              lower down this same page reports its own, month-scoped
+              "still open" — two different right answers, three hundred
+              pixels apart, on a page whose job is to be trustworthy. */}
+          <span className="stat-label">Dues open · all time</span>
         </div>
         <div className="stat-item">
           <span className="stat-value">{data?.unpushed_commits ?? '—'}</span>
