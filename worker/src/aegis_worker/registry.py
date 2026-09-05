@@ -72,8 +72,10 @@ from aegis_worker.flows.llm_spend_guard import LLMSpendGuardConfig, LLMSpendGuar
 from aegis_worker.flows.meeting_notes import MeetingNotesFlow
 from aegis_worker.flows.meeting_sweep import MeetingSweepFlow, MeetingSweepInput
 from aegis_worker.flows.memory_reflection import MemoryReflectionFlow, MemoryReflectionInput
+from aegis_worker.flows.money_brief import MoneyBriefConfig, MoneyBriefFlow
 from aegis_worker.flows.money_hygiene import MoneyHygieneConfig, MoneyHygieneDailyFlow
 from aegis_worker.flows.money_process import MoneyProcessFlow
+from aegis_worker.flows.month_close import MonthCloseConfig, MonthCloseFlow
 from aegis_worker.flows.profile_reflection import ProfileReflectionConfig, ProfileReflectionFlow
 from aegis_worker.flows.raindrop_ingest import RaindropIngestFlow, RaindropIngestInput
 from aegis_worker.flows.receipt_ingest import (
@@ -495,6 +497,23 @@ FLOWS: tuple[FlowSpec, ...] = (
         feature_flag="money_hygiene_enabled",
     ),
     FlowSpec(MoneyProcessFlow, feature_flag="money_hygiene_enabled"),
+    FlowSpec(
+        MoneyBriefFlow,
+        lambda act: MoneyBriefConfig(
+            agent_id=act["agent_id"],
+            days=int(act["config"].get("days", 7)),
+            silent=bool(act["config"].get("silent", False)),
+        ),
+        feature_flag="money_hygiene_enabled",
+    ),
+    FlowSpec(
+        MonthCloseFlow,
+        lambda act: MonthCloseConfig(
+            agent_id=act["agent_id"],
+            silent=bool(act["config"].get("silent", False)),
+        ),
+        feature_flag="money_hygiene_enabled",
+    ),
     # Child of GmailIngestFlow (the `meeting` tag fan-out); never scheduled.
     FlowSpec(MeetingNotesFlow),
     # The read-state-blind safety net for that fan-out. Not feature-flagged: it

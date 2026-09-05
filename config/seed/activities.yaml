@@ -100,6 +100,27 @@ activities:
     config: {}
     active: true
 
+  # The weekly money brief, read off the books (spec §7.2). Sunday 03:00 UTC =
+  # 08:30 IST, an hour ahead of receipt-ingest-weekly so the brief covers the
+  # week the safety-net scan has already drained into the journal.
+  - slug: money-brief-weekly
+    workflow_type: MoneyBriefFlow
+    agent_id: maou
+    schedule_cron: "0 3 * * 0"
+    config:
+      days: 7
+    active: true
+
+  # The previous calendar month's close (spec §7.3). 1st of the month, 04:00
+  # UTC = 09:30 IST. `build_month_close` picks the month, so the cron only
+  # decides when — a manual run closes the same month on any day.
+  - slug: money-close-monthly
+    workflow_type: MonthCloseFlow
+    agent_id: maou
+    schedule_cron: "0 4 1 * *"
+    config: {}
+    active: true
+
   # Social publishing — a Todoist task (@publish + platform labels, due time =
   # post time) becomes a post after an approval card. Ships inert: the
   # social_publishing_enabled settings row (migration 005) defaults to false.

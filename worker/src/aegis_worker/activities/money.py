@@ -23,6 +23,7 @@ from aegis.services.fx import to_monthly_home
 from aegis.services.money_format import fmt_money
 from temporalio import activity
 
+from aegis_worker.activities import money_render
 from aegis_worker.activities.delivery import safe_send_message
 
 _ONE_DAY = timedelta(days=1)
@@ -1511,3 +1512,49 @@ class MoneyActivities:
             month_first, last,
         ))
         return close
+
+    # --------------------------------------------------------- brief output
+
+    # Rendering is a pure function in `money_render`; these thin activities
+    # exist so a workflow can reach it without importing it into the sandbox.
+    #
+    # `HOME_SYMBOL`, not `_symbol(self.home_currency)`: it is the commodity
+    # `build_money_brief` hands to `hledger -X`, so it is the one
+    # `unconverted_commodities` measured against. Naming a different currency
+    # in the "no exchange rate for …" caveat would describe a conversion that
+    # never ran.
+
+    @activity.defn
+    async def render_money_brief(self, brief: dict) -> dict:
+        return money_render.render_money_brief(brief, HOME_SYMBOL)
+
+    @activity.defn
+    async def render_month_close(self, close: dict) -> dict:
+        return money_render.render_month_close(close, HOME_SYMBOL)
+
+    @activity.defn
+    async def notify_money_message(self, html: str, log_event: str) -> None:
+        """Push one already-rendered message to the agent's channel.
+
+        The caller renders; this only delivers. `safe_send_message` never
+        raises, so a dead comms server costs the message, not the run.
+        """
+        await safe_send_message(
+            self.delivery, agent_id=self.agent_id, message=html, log_event=log_event
+        )
+
+    @activity.defn
+    async def write_money_report(self, rel_path: str, text: str) -> None:
+        """File a rendered report in the books repo. Best effort.
+
+        No checkout configured (`books_cfg is None`) means the lane is running
+        index-only, and a `BooksError` means the write was refused and already
+        reverted — neither is worth failing the brief that was just delivered.
+        """
+        if self.books_cfg is None:
+            logger.info("money_report_skipped_no_books", path=rel_path)
+            return
+        try:
+            await books.write_report(rel_path, text, self.books_cfg)
+        except books.BooksError as exc:
+            logger.warning("money_report_write_failed", path=rel_path, error=str(exc)[:200])

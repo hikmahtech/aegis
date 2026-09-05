@@ -8,7 +8,9 @@ from __future__ import annotations
 
 from aegis_worker.flows.cert_radar import CertRadarConfig, CertRadarFlow
 from aegis_worker.flows.daily_briefing import DailyBriefingConfig, DailyBriefingFlow
+from aegis_worker.flows.money_brief import MoneyBriefConfig, MoneyBriefFlow
 from aegis_worker.flows.money_hygiene import MoneyHygieneConfig, MoneyHygieneDailyFlow
+from aegis_worker.flows.month_close import MonthCloseConfig, MonthCloseFlow
 from aegis_worker.flows.receipt_ingest import (
     DEFAULT_SENDER_FILTER,
     ReceiptIngestFlow,
@@ -64,6 +66,41 @@ def test_subscription_audit_flow_mapper_resolves():
     )
     assert workflow_cls is SubscriptionAuditFlow
     assert isinstance(cfg, SubscriptionAuditConfig)
+    assert cfg.silent is False
+
+
+def test_money_brief_flow_mapper_resolves():
+    mapper = _ACTIVITY_TYPE_MAP["MoneyBriefFlow"]
+    workflow_cls, cfg = mapper(
+        _act("money-brief-weekly", "MoneyBriefFlow", {"days": 14, "silent": True})
+    )
+    assert workflow_cls is MoneyBriefFlow
+    assert isinstance(cfg, MoneyBriefConfig)
+    assert cfg.agent_id == "maou"
+    assert cfg.days == 14
+    assert cfg.silent is True
+
+
+def test_money_brief_flow_mapper_defaults_to_a_week_and_speaks():
+    """A brief nobody is sent is a brief nobody reads: `silent` defaults off."""
+    mapper = _ACTIVITY_TYPE_MAP["MoneyBriefFlow"]
+    _, cfg = mapper(_act("money-brief-weekly", "MoneyBriefFlow", {}))
+    assert cfg.days == 7
+    assert cfg.silent is False
+
+
+def test_month_close_flow_mapper_resolves():
+    mapper = _ACTIVITY_TYPE_MAP["MonthCloseFlow"]
+    workflow_cls, cfg = mapper(_act("money-close-monthly", "MonthCloseFlow", {"silent": True}))
+    assert workflow_cls is MonthCloseFlow
+    assert isinstance(cfg, MonthCloseConfig)
+    assert cfg.agent_id == "maou"
+    assert cfg.silent is True
+
+
+def test_month_close_flow_mapper_defaults():
+    mapper = _ACTIVITY_TYPE_MAP["MonthCloseFlow"]
+    _, cfg = mapper(_act("money-close-monthly", "MonthCloseFlow", {}))
     assert cfg.silent is False
 
 

@@ -24,12 +24,18 @@ def test_gated_type_skipped_when_flag_off():
     s = _Flags(homelab_enabled=False, money_hygiene_enabled=False)
     assert _disabled_by_feature_flag("CertRadarFlow", s) == "homelab_enabled"
     assert _disabled_by_feature_flag("MoneyHygieneDailyFlow", s) == "money_hygiene_enabled"
+    # The whole money lane is one gate: the brief and the close read the books
+    # and would schedule against a workflow type the worker never registered.
+    assert _disabled_by_feature_flag("MoneyBriefFlow", s) == "money_hygiene_enabled"
+    assert _disabled_by_feature_flag("MonthCloseFlow", s) == "money_hygiene_enabled"
 
 
 def test_gated_type_allowed_when_flag_on():
     s = _Flags(homelab_enabled=True, money_hygiene_enabled=True)
     assert _disabled_by_feature_flag("CertRadarFlow", s) is None
     assert _disabled_by_feature_flag("SubscriptionAuditFlow", s) is None
+    assert _disabled_by_feature_flag("MoneyBriefFlow", s) is None
+    assert _disabled_by_feature_flag("MonthCloseFlow", s) is None
 
 
 def test_ungated_type_never_blocked():

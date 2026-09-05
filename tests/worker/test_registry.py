@@ -293,7 +293,13 @@ def test_module_workflows_is_the_unflagged_registry():
         # data layer (`refresh_fx_prices`, `build_money_brief`,
         # `build_month_close`). All three are on the money-flagged
         # MoneyActivities, so only the money=True row moves: +3/+0/+0.
-        (True, True, 42, 220),
+        # Then +2 flows and +4 activities from the rendering half of the same
+        # lane: MoneyBriefFlow and MonthCloseFlow, plus render_money_brief,
+        # render_month_close, notify_money_message and write_money_report on
+        # the money-flagged MoneyActivities. Both flows are money-flagged too,
+        # so again only the money=True row moves: +2 flows / +4 activities,
+        # and +0/+0 for the other two.
+        (True, True, 44, 224),
         (False, False, 34, 183),
         (True, False, 38, 202),
     ],
