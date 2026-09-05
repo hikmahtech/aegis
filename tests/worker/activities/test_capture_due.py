@@ -116,6 +116,24 @@ async def test_capture_due_ignores_non_dues(db_pool):
     assert await ActivityEnvironment().run(acts.capture_due, non_due, "m", "x") is None
     no_date = {**DUE, "due_on": None}
     assert await ActivityEnvironment().run(acts.capture_due, no_date, "m", "x") is None
+    no_amount = {**DUE, "amount": None}
+    assert await ActivityEnvironment().run(acts.capture_due, no_amount, "m", "x") is None
+    connector.commands.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_capture_due_ignores_a_zero_invoice(db_pool):
+    """A ₹0 invoice is not a bill.
+
+    Cloudflare, Google Workspace and AWS all send zero invoices routinely, and
+    "Pay Cloudflare $0.00" is the noise this lane exists to remove. Seen live
+    on 2026-09-05: a $0.00 Cloudflare invoice produced a real Todoist task.
+    The event is still indexed and still reaches the brief.
+    """
+    acts, connector = _acts(db_pool)
+    for zero in ("0.00", "0", 0):
+        ev = {**DUE, "amount": zero, "payee": "Cloudflare", "payee_key": "cloudflare"}
+        assert await ActivityEnvironment().run(acts.capture_due, ev, "m", "x") is None
     connector.commands.assert_not_awaited()
 
 
