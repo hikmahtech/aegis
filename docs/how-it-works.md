@@ -67,7 +67,7 @@ point of the project is that you replace it with your own:
 |---|---|---|
 | **Sebas** | Executive assistant — GTD, email, calendar, reviews | `gtd` |
 | **Raphael** | Research and knowledge — briefings, ingest, scans | `research` |
-| **Maou** | Finance — receipts, recurring charges, market data | `finance` |
+| **Maou** | Finance — money mail into the hledger books, the weekly brief and the monthly close, market data | `finance` |
 | **Pandora's Actor** | Infrastructure — alerts, swarm/k8s, coding runs | `infra` |
 
 (There is also an inactive virtual `system` agent that only exists to satisfy a

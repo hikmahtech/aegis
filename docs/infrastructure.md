@@ -667,6 +667,60 @@ if a mailbox's Gmail token has expired the re-auth card it raises carries a
 relative, unusable link. Re-authorise from the Google accounts block on the admin
 **Flows** page first, or pass `aegis_ui_url` in the body.
 
+### Ledger tools
+
+Four chat tools work the books (`core/src/aegis/services/tools/ledger.py`). Ask
+Maou in chat; there is no separate UI.
+
+| Tool | What it does |
+|---|---|
+| `ledger_query` | A read-only hledger report — `bal`, `reg`, `is`, `bs`, `cf`, `print`, `accounts`, `payees`, `tags`, `stats`, `activity`, `aregister`, `check`. Text, JSON or CSV, capped at 12,000 characters |
+| `ledger_post` | Records one transaction by hand. Two or more postings, at most one without an amount |
+| `ledger_reclassify` | Moves one posting to another account by its msgid, and optionally renames the payee |
+| `ledger_add_rule` | Appends a rule to `rules/accounts.yaml` and, unless you say otherwise, refiles the postings already sitting in an `:unknown` account that it matches |
+
+Every write goes through `books.py`: one flock, `hledger check --strict`, and a
+revert of just the paths it touched when the check fails. All three writers
+refuse an account the chart does not declare — the chart is yours, and the
+strict check would reject the block anyway.
+
+Three behaviours are worth knowing before you use them.
+
+- **A re-post is a retry, not a second transaction.** `ledger_post` derives the
+  msgid from the rendered block, so calling it again with the same date, payee,
+  postings and note finds the first block and writes nothing. That is what makes
+  a timed-out write safe to repeat. A genuine second identical payment needs a
+  distinguishing `note`.
+- **`ledger_add_rule` refuses a slow regex.** The pattern is persisted and the
+  worker then runs it against every money event, in another process, forever, so
+  a pattern that repeats a group, stacks quantifiers or simply measures slow is
+  turned away with a message saying what to change.
+- **One sweep is capped at 200 postings**, written as a single commit. Past that
+  the tool asks to be run again rather than rewriting the whole backlog in one
+  unreviewable change.
+
+`ledger_query` is the only one a coding run can reach; the MCP server withholds
+the three writers. The operator mount serves all four.
+
+**Granting them is a database write.** `config/seed/agents.yaml` grants all four
+to Maou and `ledger_query` to Sebas, but the seed merges only keys the agent's
+`metadata` does not already have — and any deployment that has run once already
+has a `tool_set`. So the yaml is a first-boot default, and an existing
+deployment needs the grant applied itself:
+
+```sql
+UPDATE agents SET metadata = jsonb_set(metadata, '{tool_set}',
+  (metadata->'tool_set') || '["ledger_query","ledger_post","ledger_reclassify","ledger_add_rule"]'::jsonb)
+WHERE id = 'maou' AND jsonb_typeof(metadata->'tool_set') = 'array'
+  AND NOT (metadata->'tool_set' @> '["ledger_post"]'::jsonb);
+UPDATE agents SET metadata = jsonb_set(metadata, '{tool_set}', (metadata->'tool_set') || '["ledger_query"]'::jsonb)
+WHERE id = 'sebas' AND jsonb_typeof(metadata->'tool_set') = 'array' AND NOT (metadata->'tool_set' @> '["ledger_query"]'::jsonb);
+```
+
+Both statements skip an agent that already has the grant, so they are safe to
+re-run. The admin **Agents → Behavior** tab does the same thing by hand. Core
+reads `tool_set` per request, so no restart is needed.
+
 ## Chat
 
 Pandora's infra tools work against registry clusters by slug:
