@@ -8,17 +8,18 @@ has ever been told (its memories and its persona docs).
   (a) calendar  — an attendee who keeps showing up on ingested calendar events
                   and is never mentioned in chat_history / agent_memory / profile
   (b) finance   — a payee the books could not categorise (`finance.journal_index`
-                  rows sitting in an `:unknown` account) and that is never
-                  mentioned in agent_memory / profile
+                  rows sitting in an `:unknown` account, money out or money in)
+                  and that is never mentioned in agent_memory / profile
   (c) todoist   — a project carrying real OPEN task volume with no profile
                   context (a finished project is not a gap)
 
 Each detector is independently try/excepted: a broken one costs its own
 candidates, never the run. `novelty_key` (`attendee:<email>`,
-`payee:<payee_key>`, `project:<name>`) is the never-ask-twice handle — ANY
-`interactions` row already carrying that key removes the candidate, archived
-included: a timed-out card is a question the owner declined once, and the
-weekly money brief is the retry channel, not another card.
+`payee:<payee_key>` for money out, `payee-in:<payee_key>` for money in,
+`project:<name>`) is the never-ask-twice handle — ANY `interactions` row
+already carrying that key removes the candidate, archived included: a timed-out
+card is a question the owner declined once, and the weekly money brief is the
+retry channel, not another card.
 
 The money lane closes the loop: when the owner answers an `unknown_payee` card,
 `apply_curiosity_answer` turns the answer into a permanent `rules/accounts.yaml`
@@ -133,10 +134,14 @@ def books_answer_report(payee: str, out: dict) -> str | None:
 
     parts = [f"<b>{name}</b> → <code>{escape(account)}</code>. The rule is saved."]
     if skipped:
+        # The VERB agrees too. `postings()` pluralises the noun and an adjacent
+        # literal verb does not follow it, which is how "1 existing posting sit
+        # in the other set of books" got written into the same commit as the
+        # fix for "1 low-confidence LLM postings".
         parts.append(
-            f"{postings(skipped)} sit in the other set of books: changing the account "
-            "cannot change the journal file the block lives in, so I left them where "
-            "they are. They need a hand edit."
+            f"{postings(skipped)} {'sits' if skipped == 1 else 'sit'} in the other set of "
+            "books: changing the account cannot change the journal file the block lives "
+            "in, so I left them where they are. They need a hand edit."
         )
     if failed:
         parts.append(f"{failed} posting{'' if failed == 1 else 's'} could not be rewritten.")
@@ -374,18 +379,28 @@ class CuriosityActivities:
             return {}
 
     async def _detect_unknown_payee(self, agent_id: str, known: str) -> list[tuple[float, dict]]:
-        """Money that left the account for something the books could not name.
+        """Money the books could not name — out of the account or into it.
 
-        `expenses:unknown` (and its siblings) is the books' review queue, so
+        `expenses:unknown` and `income:unknown` are the books' review queue, so
         this reads the queue itself rather than a vendor table: a posting the
         owner has since explained leaves the queue and stops being a question,
         with no separate bookkeeping to keep in sync.
 
-        One candidate per `payee_key`, not per posting and not per currency —
-        the same shop arrives under several spellings, the novelty key is the
-        payee, and the rule the answer writes is per payee too. Splitting the
-        card by currency would ask the same question twice and let the second
-        copy suppress itself on the first one's key.
+        One candidate per `(payee_key, direction)`, not per posting and not per
+        currency. Per payee, because the same shop arrives under several
+        spellings and the rule the answer writes is per payee; per DIRECTION,
+        because the two are different questions with different answers — the
+        backlog sweep files a credit and a debit to different halves of the
+        chart, and one card cannot stand for both.
+
+        Money that came IN is asked about as money that came in. Carding it as
+        "You paid ₹42,000.00 to Nkgsb Bank" was false on the one surface
+        allowed to interrupt the owner, and it steered the account-picking
+        model toward an EXPENSE account for money that arrived — but the answer
+        to that is to say the true thing, not to skip the money (issue #387
+        review). Uncategorised income is worth asking about for exactly the
+        reason uncategorised spend is, and on 2026-09-05 every foreign unknown
+        in the live index was inbound.
 
         The AMOUNTS are grouped per currency and stay that way (issue #387).
         Restricting the detector to rupees was how a foreign unexplained
@@ -398,16 +413,14 @@ class CuriosityActivities:
         from aegis.services.money_format import currency_symbol, fmt_money
 
         rows = await self.db_pool.fetch(
-            "SELECT payee_key, max(payee) AS payee, currency, sum(amount) AS total, "
+            "SELECT payee_key, max(payee) AS payee, currency, direction, sum(amount) AS total, "
             "count(*) AS n, max(occurred_on) AS last_on, max(channel) AS channel "
             "FROM finance.journal_index "
-            # `direction = 'out'` is not a nicety. `income:unknown` matches
-            # `%:unknown` too, so without it an uncategorised inbound credit is
-            # carded as "You paid ₹42,000.00 to Nkgsb Bank … What was it for?"
-            # — false, on the one surface allowed to interrupt the owner, and
-            # it steers the account-picking model toward an EXPENSE account for
-            # money that came in.
-            "WHERE kind = 'transaction' AND direction = 'out' AND account LIKE '%:unknown' "
+            "WHERE kind = 'transaction' AND account LIKE '%:unknown' "
+            # Only the two directions the question can be phrased for. A NULL
+            # or unrecognised direction has no true sentence available, and
+            # picking one would put a guess in front of the owner.
+            "  AND direction IN ('in', 'out') "
             f"AND occurred_on >= now() - interval '{_UNKNOWN_DAYS} days' "
             # Both columns are nullable, and both are load-bearing here. A NULL
             # amount sums to NULL and used to render as "You paid ₹0.00 to HDFC
@@ -417,7 +430,7 @@ class CuriosityActivities:
             # without guessing which one it is, and guessing "the home one" is
             # the assumption this detector just stopped making.
             "  AND amount IS NOT NULL AND currency IS NOT NULL "
-            "GROUP BY payee_key, currency ORDER BY total DESC LIMIT 50"
+            "GROUP BY payee_key, currency, direction ORDER BY total DESC LIMIT 50"
         )
         rates = self._home_rates()
 
@@ -432,21 +445,23 @@ class CuriosityActivities:
                 return total
             return total * rates.get(currency_symbol(currency), Decimal(1))
 
-        # Fold the per-(payee, currency) rows into one candidate per payee.
-        # Insertion order is the query's `total DESC`, which only matters as a
-        # stable starting point — the amounts below are re-sorted by value.
-        folded: dict[str, dict] = {}
+        # Fold the per-(payee, currency, direction) rows into one candidate per
+        # (payee, direction). Insertion order is the query's `total DESC`,
+        # which only matters as a stable starting point — the amounts below are
+        # re-sorted by value.
+        folded: dict[tuple[str, str], dict] = {}
         for r in rows:
             key = (r["payee_key"] or "").strip()
             payee = (r["payee"] or "").strip()
             currency = (r["currency"] or "").strip().upper()
+            direction = (r["direction"] or "").strip()
             total = Decimal(r["total"])
             if not key or not payee or not currency or total <= 0:
                 continue
             if payee.lower() in known:
                 continue
             c = folded.setdefault(
-                key,
+                (key, direction),
                 {"payee": payee, "totals": {}, "n": 0, "last_on": None, "channel": None,
                  "rank": Decimal(0)},
             )
@@ -461,7 +476,7 @@ class CuriosityActivities:
                 c["channel"] = (r["channel"] or "other").strip()
 
         out: list[tuple[float, dict]] = []
-        for key, c in folded.items():
+        for (key, direction), c in folded.items():
             payee, n = c["payee"], c["n"]
             last_on = c["last_on"].isoformat() if c["last_on"] else "?"
             # Biggest first, in home-commodity terms, so the sentence leads
@@ -470,30 +485,43 @@ class CuriosityActivities:
                 c["totals"].items(), key=lambda kv: in_home(kv[1], kv[0]), reverse=True
             )
             amounts = [fmt_money(total, currency) for currency, total in ordered]
-            paid = amounts[0] if len(amounts) == 1 else ", ".join(amounts[:-1]) + f" and {amounts[-1]}"
+            sums = amounts[0] if len(amounts) == 1 else ", ".join(amounts[:-1]) + f" and {amounts[-1]}"
+            moved = (
+                f"You paid {sums} to {payee}"
+                if direction == "out"
+                else f"You received {sums} from {payee}"
+            )
+            asked = "What was it for?" if direction == "out" else "What was it?"
             out.append(
                 (
                     # Cost is the signal — a big unexplained payment outranks a
                     # small one, and any of them outranks a bare calendar face.
+                    # Money arriving unexplained is worth the same attention as
+                    # money leaving unexplained, so both use this scale.
                     10.0 + float(c["rank"]),
                     {
                         "gap_type": "unknown_payee",
                         "subject": payee,
                         "question": (
-                            f"You paid {paid} to {payee} "
+                            f"{moved} "
                             f"({n} time{'' if n == 1 else 's'}, last {last_on}, {c['channel']}). "
-                            "What was it for?"
+                            f"{asked}"
                         ),
                         # JSON-safe: this crosses a Temporal payload boundary
                         # and then lands in the card's `metadata` jsonb. One
                         # entry per currency, never a sum across them.
                         "evidence": {
                             "payee_key": key,
+                            "direction": direction,
                             "totals": {cur: float(t) for cur, t in ordered},
                             "n": n,
                             "last_on": last_on,
                         },
-                        "novelty_key": f"payee:{key}",
+                        # Outbound keeps the key it has always had, so every
+                        # payee already asked about (or declined) stays
+                        # suppressed. Inbound is a different question about the
+                        # same name and needs its own.
+                        "novelty_key": f"payee:{key}" if direction == "out" else f"payee-in:{key}",
                     },
                 )
             )
@@ -757,6 +785,12 @@ class CuriosityActivities:
         from aegis.services import books
 
         cfg = self.books_cfg
+        # Which half of the books the card asked about. A card raised before
+        # the inbound lane shipped carries no direction and was outbound by
+        # construction, and anything unrecognised is treated the same way —
+        # never guessed into the income half.
+        direction = "in" if str(meta.get("direction") or "").strip() == "in" else "out"
+        moved = "a payment the owner made" if direction == "out" else "money the owner received"
         # `declared_accounts`, not `run_hledger(["accounts", "--declared"])`:
         # the latter caps its output at 12,000 characters, which would silently
         # drop the tail of a large chart and turn a declared account into a
@@ -765,16 +799,17 @@ class CuriosityActivities:
         result = await self.llm_client.think(
             prompt=(
                 f"Payee: {payee}\n"
+                f"Direction: {moved}\n"
                 f"The owner says: {answer}\n\n"
                 "Accounts declared in the chart:\n" + "\n".join(sorted(accounts))
             ),
             model=self.model,
             system_prompt=(
-                "You file a payment into one account of a double-entry chart. "
+                f"You file {moved} into one account of a double-entry chart. "
                 "Pick the single account from the list that best fits what the "
                 "owner said this payee is. Copy it EXACTLY as written; never "
                 'invent one. Answer "NONE" if none of them fits or the owner\'s '
-                "reply does not say what the payment was for. Return JSON: "
+                "reply does not say what it was for. Return JSON: "
                 '{"account": "<one of the list, or NONE>", "confidence": 0.0-1.0}'
             ),
             max_tokens=300,
@@ -849,13 +884,15 @@ class CuriosityActivities:
 
         rows = await self.db_pool.fetch(
             "SELECT message_id, entity FROM finance.journal_index "
-            # Same `direction = 'out'` as the detector, and for the same
-            # reason: the owner was asked about money they PAID this payee, so
-            # a credit from the same name (a refund, a transfer back) is not
-            # what they explained and must not be filed to an expense account.
-            "WHERE payee_key = $1 AND kind = 'transaction' AND direction = 'out' "
+            # The card's OWN direction, which is the whole reason the detector
+            # cards the two separately. The owner was asked about money moving
+            # one way; money from the same name moving the other way (a refund,
+            # a transfer back) is not what they explained, and filing a credit
+            # to an expense account puts it in the wrong half of the books.
+            "WHERE payee_key = $1 AND kind = 'transaction' AND direction = $2 "
             "AND account LIKE '%:unknown' AND journal_file IS NOT NULL",
             key,
+            direction,
         )
         # Only the books the account belongs to: rewriting in place changes the
         # account, never the file the block lives in. The entity split happens
@@ -885,9 +922,10 @@ class CuriosityActivities:
                 failed[:10],
             )
         activity.logger.info(
-            "curiosity_books_answer_applied payee=%s account=%s rule=%s "
+            "curiosity_books_answer_applied payee=%s direction=%s account=%s rule=%s "
             "reclassified=%d failed=%d skipped_other_entity=%d",
             payee,
+            direction,
             account,
             bool(match),
             len(rewritten),

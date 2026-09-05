@@ -750,6 +750,67 @@ async def test_a_credit_from_the_same_payee_is_left_alone(clean_db, tmp_path):
     assert await _account_of(clean_db, refund) == "income:unknown"
 
 
+async def test_an_inbound_answer_files_the_credit_and_leaves_the_debit(clean_db, tmp_path):
+    """The mirror of the test above, and the half that used to be unreachable.
+
+    Money that came in is now carded as money that came in (issue #387
+    review), so the hook has to sweep the half the card actually asked about.
+    The `direction` in the card's metadata is the only thing that says which —
+    without it this would file a credit to an expense account, which is money
+    in the wrong half of the books.
+    """
+    cfg = _repo(tmp_path)
+    _declare(cfg, "income:people")
+    paid = await _post(clean_db, cfg)
+    received = await _post(clean_db, cfg, day=6)
+    await clean_db.execute(
+        "UPDATE finance.journal_index SET direction = 'in', account = 'income:unknown' "
+        "WHERE message_id = $1",
+        received,
+    )
+    llm = FakeLLM('{"account": "income:people", "confidence": 0.9}')
+
+    out = await _apply(clean_db, cfg, llm, meta=_meta(direction="in"))
+
+    assert out["rule"] == "income:people"
+    assert out["reclassified"] == 1
+    assert await _account_of(clean_db, received) == "income:people"
+    # The debit from the same name is not what the owner explained.
+    assert await _account_of(clean_db, paid) == "expenses:unknown"
+    # The prompt told the model which way the money went, or it would be
+    # picking an account for a payment that never happened.
+    blob = f"{llm.calls[0]['prompt']}\n{llm.calls[0].get('system_prompt') or ''}"
+    assert "money the owner received" in blob, blob
+
+
+async def test_a_card_with_no_direction_is_treated_as_money_going_out(clean_db, tmp_path):
+    """Every card raised before the inbound lane shipped carries no
+    `direction`, and every one of them was outbound. Anything unrecognised
+    takes the same road — the income half is never reached by a guess.
+
+    A repo and a payee of its own per case: the backlog sweep selects across
+    the whole index by `payee_key`, so a shared payee would have each run
+    trying to rewrite the previous run's blocks in a repo that does not hold
+    them.
+    """
+    for i, value in enumerate((None, "", "sideways")):
+        cfg = _repo(tmp_path / f"d{i}")
+        payee = f"Zzt5dir{i} Shop"
+        msgid = await _post(clean_db, cfg, payee=payee)
+        llm = FakeLLM('{"account": "expenses:groceries", "confidence": 0.9}')
+        meta = _meta(subject=payee, payee_key=payee_key(payee))
+        if value is not None:
+            meta["direction"] = value
+
+        out = await _apply(clean_db, cfg, llm, meta=meta)
+
+        assert out["reclassified"] == 1, value
+        assert await _account_of(clean_db, msgid) == "expenses:groceries", value
+        blob = f"{llm.calls[0]['prompt']}\n{llm.calls[0].get('system_prompt') or ''}"
+        assert "a payment the owner made" in blob, value
+        assert "money the owner received" not in blob, value
+
+
 async def test_a_rule_from_an_answer_never_fires_on_the_sender(clean_db, tmp_path):
     """`apply_rules` matches "<sender> | <payee>", and this is the only place a
     rule is written with no human authoring the regex — so the pattern it
@@ -811,7 +872,12 @@ async def test_a_cross_entity_answer_says_what_it_left_behind(clean_db, tmp_path
     assert PAYEE in said and "expenses:hikmah:infra" in said
     # The three things the owner needs: the rule stands, one posting did not
     # move, and only a person can move it.
-    assert "1 existing posting" in said, said
+    #
+    # Asserted PAST the noun, deliberately. "1 existing posting" alone stops
+    # one word short of the verb and passes on "1 existing posting sit in the
+    # other set of books" — which is what this file asserted, in the same
+    # commit as the fix for "1 low-confidence LLM postings".
+    assert "1 existing posting sits in the other set of books" in said, said
     assert "rule is saved" in said and "hand edit" in said, said
 
 
@@ -834,12 +900,15 @@ async def test_an_answer_the_model_could_not_file_is_reported(clean_db, tmp_path
     """Every refusal in this hook was equally silent, not only the
     cross-entity one: an undeclared account, an unsure model and an
     unreachable checkout all returned a dict nobody read."""
-    for response, phrase in (
+    # The loop index, not `hash(response)`: `hash()` on a str is per-process
+    # randomised, so two of the three could collide and `_repo`'s
+    # `mkdir(parents=True)` would raise on an existing directory.
+    for i, (response, phrase) in enumerate((
         ('{"account": "expenses:snacks", "confidence": 1.0}', "an account in the chart"),
         ('{"account": "expenses:groceries", "confidence": 0.4}', "not sure enough"),
         ('{"account": "NONE", "confidence": 1.0}', "an account in the chart"),
-    ):
-        cfg = _repo(tmp_path / f"r{abs(hash(response)) % 9999}")
+    )):
+        cfg = _repo(tmp_path / f"r{i}")
         await _post(clean_db, cfg)
         delivery = FakeDelivery()
 
@@ -904,3 +973,34 @@ async def test_no_delivery_wired_still_answers_and_never_raises(clean_db, tmp_pa
     out = await _apply(clean_db, cfg, llm, delivery=None)
 
     assert out["rule"] == "expenses:hikmah:infra" and out["skipped_other_entity"] == 1
+
+
+def test_the_report_agrees_with_itself_on_number():
+    """Noun AND verb, both ways.
+
+    `books_answer_report` is pure, so the plural side needs no fixture — which
+    matters, because reaching it through the books would take two postings in
+    the other set of books, and the SINGULAR is the case that shipped wrong.
+    """
+    from aegis_worker.activities.curiosity import books_answer_report
+
+    one = books_answer_report(PAYEE, {"rule": "expenses:hikmah:infra", "skipped_other_entity": 1})
+    assert "1 existing posting sits in the other set of books" in one, one
+    assert "postings" not in one and " sit " not in one, one
+
+    two = books_answer_report(PAYEE, {"rule": "expenses:hikmah:infra", "skipped_other_entity": 2})
+    assert "2 existing postings sit in the other set of books" in two, two
+
+    # The other counted nouns the same sentence-builder writes.
+    assert "1 posting could not be rewritten" in books_answer_report(
+        PAYEE, {"rule": "expenses:groceries", "failed": 1}
+    )
+    assert "2 postings could not be rewritten" in books_answer_report(
+        PAYEE, {"rule": "expenses:groceries", "failed": 2}
+    )
+    assert "1 existing posting still moved" in books_answer_report(
+        PAYEE, {"rule": None, "reason": "rule_refused_backlog_applied", "reclassified": 1}
+    )
+    assert "2 existing postings still moved" in books_answer_report(
+        PAYEE, {"rule": None, "reason": "rule_refused_backlog_applied", "reclassified": 2}
+    )

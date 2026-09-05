@@ -287,6 +287,10 @@ async def test_flow_cards_the_top_gap_and_charges_the_budget(clean_db):
     # card's metadata is the only place it can read one from. Without this the
     # answer banks a memory and silently reclassifies nothing.
     assert row["metadata"]["payee_key"] == "zephyrly"
+    # `direction` rides along for the same reason: the same payee can owe two
+    # questions (money out, money in) and the hook has to sweep the half this
+    # card asked about, or a credit lands in an expense account.
+    assert row["metadata"]["direction"] == "out"
 
     # The spec handed to the comms service is an ANSWERABLE `input` card.
     # `aegis_ui_url` is load-bearing, not decoration: aegis_comms/cards.py

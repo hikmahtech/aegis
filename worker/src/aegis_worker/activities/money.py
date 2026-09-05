@@ -883,11 +883,28 @@ class MoneyActivities:
             }
             for r in unknowns
         ]
-        brief["large_unexplained"] = [
-            u for u in brief["unknowns"]
-            if u["currency"] == LARGE_UNEXPLAINED_CURRENCY
-            and Decimal(u["amount"]) >= LARGE_UNEXPLAINED_MIN
-        ]
+        # Its own aggregate, NOT a filter over `unknowns` (issue #391). That
+        # list is `ORDER BY amount DESC LIMIT 15`, so a week with more than 15
+        # unexplained rows would have made this the total of the top 15 and
+        # called it the total — the one number in the brief whose whole job is
+        # to be the real one. The renderer never sees the rows, only this.
+        #
+        # `abs()` on both sides because `journal_index.amount` is a magnitude
+        # with the sign carried by `direction`, and a stray negative would
+        # otherwise cancel against a real one instead of adding to it.
+        large = await self.db_pool.fetchrow(
+            "SELECT count(*) AS n, coalesce(sum(abs(amount)), 0) AS total "
+            "FROM finance.journal_index "
+            "WHERE kind = 'transaction' AND account LIKE '%:unknown' AND occurred_on >= $1 "
+            "  AND amount IS NOT NULL AND currency = $2 AND abs(amount) >= $3",
+            since,
+            LARGE_UNEXPLAINED_CURRENCY,
+            LARGE_UNEXPLAINED_MIN,
+        )
+        brief["large_unexplained"] = {
+            "count": int(large["n"] or 0),
+            "total": str(large["total"] or 0),
+        }
         dues = await self.db_pool.fetch(
             "SELECT message_id, payee, payee_key, amount, currency, due_on, kind, todoist_ref "
             "FROM finance.journal_index "

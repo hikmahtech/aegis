@@ -622,6 +622,18 @@ the run every week without ever posting. Grep the worker log for
 `money_post_failed`, which names the msgid and the underlying error. The status
 is in `workflow_runs.result_summary`.
 
+The admin **Money** page carries two review counters, and each one means
+something narrower than its label. *Unexplained* counts transactions still
+sitting in an `:unknown` account, over a rolling 60 days. *Dues open* counts
+bills and failed payments nothing has been linked to — **excluding a
+zero-amount invoice**, which is not an obligation and which nothing can ever
+close (a payment matches a due on its amount, and no ₹0 payment mail arrives).
+`capture_due` already refuses to raise a task for one, so counting it as
+outstanding was the index disagreeing with that. A due whose amount the
+extractor never got is a different thing and IS still counted: a bill of
+unknown size is still a bill, and it is the counter's job to say so. Both rows
+stay in the events table either way — the index records what arrived.
+
 ### The deploy key
 
 Generate a key pair, register the public half, paste the private half:

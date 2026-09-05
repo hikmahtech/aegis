@@ -162,9 +162,19 @@ class CuriosityCardFlow:
             # and the card's metadata is the only place the post-resolve hook
             # can read one from. Without it the answer banks a memory and
             # silently reclassifies nothing.
-            payee_key = (top.get("evidence") or {}).get("payee_key")
+            #
+            # `direction` rides along for the same reason: the same payee can
+            # owe two different questions (money out, money in), and the hook
+            # has to sweep the half the card actually asked about — a credit
+            # filed to an expense account is money in the wrong half of the
+            # books. Absent ⇒ the hook assumes `out`, which is what every card
+            # raised before this shipped was.
+            evidence = top.get("evidence") or {}
+            payee_key = evidence.get("payee_key")
             if payee_key:
                 metadata["payee_key"] = payee_key
+            if evidence.get("direction"):
+                metadata["direction"] = evidence["direction"]
             try:
                 await workflow.start_child_workflow(
                     InteractionFlow.run,

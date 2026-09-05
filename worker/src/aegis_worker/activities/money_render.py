@@ -113,36 +113,40 @@ def _count(n: int, noun: str) -> str:
 
 
 def _large_unexplained_line(brief: dict) -> str:
-    """What the biggest unexplained payments of the week add up to, or `""`.
+    """What the biggest unexplained postings of the week add up to, or `""`.
 
-    `build_money_brief` has computed `large_unexplained` every week since the
-    lane shipped and nothing read it (issue #391). Rendered, it has to earn the
+    `build_money_brief` computed `large_unexplained` every week since the lane
+    shipped and nothing read it (issue #391). Rendered, it has to earn the
     line: the Unexplained rows below already carry each amount and each payee,
     so repeating the biggest of them says nothing new. The total does — it is
-    the one figure in this section that no row carries, and it survives the
-    10-row cut on the list.
+    the one figure in this section that no row carries, and it survives both
+    the 10-row render cut and the 15-row query cut on that list.
 
-    A row whose amount does not parse is left out of BOTH the count and the
-    total: `journal_index.amount` is nullable and arrives here as the string
-    "None" (see the module docstring), and counting a row that contributed
-    nothing would print "3 payments" over the sum of two.
+    Which is why it takes a `{count, total}` aggregate and not the list: the
+    data layer counts the whole week in SQL, so this cannot be handed a
+    truncated set and total it as though it were everything.
+
+    "Postings", not "payments": the Unexplained list has always been
+    direction-agnostic (`income:unknown` matches `%:unknown` too), so money
+    that came IN is in this total as well.
     """
-    total, n = Decimal("0"), 0
-    for row in brief.get("large_unexplained") or []:
-        text = str(row.get("amount") or "").strip()
-        if text in ("", "None"):
-            continue
-        try:
-            total += abs(Decimal(text))
-        except (InvalidOperation, ArithmeticError, ValueError):
-            continue
-        n += 1
-    if n == 0:
+    large = brief.get("large_unexplained")
+    if not isinstance(large, dict):
+        # A brief built before this shape existed carried a list here. Render
+        # nothing rather than a number derived from a payload that means
+        # something else.
+        return ""
+    try:
+        n = int(large.get("count") or 0)
+        total = abs(Decimal(str(large.get("total") or "0")))
+    except (InvalidOperation, ArithmeticError, ValueError, TypeError):
+        return ""
+    if n <= 0 or total <= 0:
         return ""
     cut = fmt_money(LARGE_UNEXPLAINED_MIN, LARGE_UNEXPLAINED_CURRENCY)
     return (
-        f"{fmt_money(total, LARGE_UNEXPLAINED_CURRENCY)} in "
-        f"{_count(n, 'payment')} of {cut} or more"
+        f"{fmt_money(total, LARGE_UNEXPLAINED_CURRENCY)} across "
+        f"{_count(n, 'posting')} of {cut} or more"
     )
 
 

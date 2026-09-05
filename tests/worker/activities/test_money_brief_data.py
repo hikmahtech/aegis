@@ -253,7 +253,16 @@ async def test_build_money_brief_reads_books_and_index(db_pool, tmp_path):
     assert unknowns[1]["amount"] == "6000.00"
     assert unknowns[1]["occurred_on"] == today.isoformat()
     assert unknowns[1]["channel"] == "upi"
-    assert [u["msgid"] for u in _mine(brief["large_unexplained"])] == ["brief-t/a"]
+    # `large_unexplained` is a table-wide aggregate (issue #391), so it is a
+    # delta like `low_confidence` above. Only `brief-t/a` qualifies: /g is
+    # under the cut and /h is dollars, and a cut that ignored `currency` would
+    # flag ₹9,000 that was never spent.
+    assert (
+        brief["large_unexplained"]["count"] == baseline["large_unexplained"]["count"] + 1
+    )
+    assert Decimal(brief["large_unexplained"]["total"]) - Decimal(
+        baseline["large_unexplained"]["total"]
+    ) == Decimal("6000.00")
     assert [d["msgid"] for d in dues] == ["brief-t/d"]
     assert dues[0]["todoist_ref"] == "t1" and dues[0]["kind"] == "due"
     assert [c["msgid"] for c in _mine(brief["closed_dues"])] == ["brief-t/f"]
@@ -360,6 +369,7 @@ async def test_an_unknown_with_no_amount_does_not_take_the_whole_brief_down(db_p
     the weekly brief then failed on every retry with nothing saying why.
     """
     act = _act(db_pool, books.BooksConfig(path=tmp_path / "none"))
+    baseline = await ActivityEnvironment().run(act.build_money_brief, 7)
     await ji.upsert(db_pool, "brief-t/nul", "brief-t",
                     _ev(amount=None, currency="INR", payee="Amountless", payee_key="amountless"))
     await ji.upsert(db_pool, "brief-t/ok", "brief-t",
@@ -368,7 +378,14 @@ async def test_an_unknown_with_no_amount_does_not_take_the_whole_brief_down(db_p
     brief = await ActivityEnvironment().run(act.build_money_brief, 7)
 
     assert [u["msgid"] for u in _mine(brief["unknowns"])] == ["brief-t/ok"]
-    assert [u["msgid"] for u in _mine(brief["large_unexplained"])] == ["brief-t/ok"]
+    # The amountless row is out of the aggregate too — `sum()` over it is NULL,
+    # and counting it would put a row behind a total it contributed nothing to.
+    assert (
+        brief["large_unexplained"]["count"] == baseline["large_unexplained"]["count"] + 1
+    )
+    assert Decimal(brief["large_unexplained"]["total"]) - Decimal(
+        baseline["large_unexplained"]["total"]
+    ) == Decimal("7000.00")
 
 
 @pytest.mark.asyncio
@@ -412,6 +429,7 @@ async def test_large_unexplained_cuts_at_the_constant_the_brief_names(db_pool, t
     and this pins the boundary: at the cut is in, one paisa under is out.
     """
     act = _act(db_pool, books.BooksConfig(path=tmp_path / "none"))
+    baseline = await ActivityEnvironment().run(act.build_money_brief, 7)
     cut = LARGE_UNEXPLAINED_MIN
     await ji.upsert(db_pool, "brief-t/at", "brief-t",
                     _ev(amount=cut, payee="At the cut", payee_key="at the cut"))
@@ -421,7 +439,40 @@ async def test_large_unexplained_cuts_at_the_constant_the_brief_names(db_pool, t
     brief = await ActivityEnvironment().run(act.build_money_brief, 7)
 
     assert [u["msgid"] for u in _mine(brief["unknowns"])] == ["brief-t/at", "brief-t/under"]
-    assert [u["msgid"] for u in _mine(brief["large_unexplained"])] == ["brief-t/at"]
+    assert (
+        brief["large_unexplained"]["count"] == baseline["large_unexplained"]["count"] + 1
+    )
+    assert Decimal(brief["large_unexplained"]["total"]) - Decimal(
+        baseline["large_unexplained"]["total"]
+    ) == cut
+
+
+@pytest.mark.asyncio
+async def test_the_large_unexplained_total_is_the_week_and_not_the_rendered_rows(
+    db_pool, tmp_path
+):
+    """The figure the reader is handed has to be the real one (issue #391).
+
+    `unknowns` is `ORDER BY amount DESC LIMIT 15` and the renderer prints 10 of
+    those, so a total derived from the list understates every week with more
+    than 15 unexplained rows. 16 rows here, all over the cut: the list is
+    capped at 15 and the aggregate is not.
+    """
+    act = _act(db_pool, books.BooksConfig(path=tmp_path / "none"))
+    baseline = await ActivityEnvironment().run(act.build_money_brief, 7)
+    for i in range(16):
+        await ji.upsert(db_pool, f"brief-t/many{i:02d}", "brief-t",
+                        _ev(amount=Decimal("6000"), payee=f"Shop {i}", payee_key=f"shop {i}"))
+
+    brief = await ActivityEnvironment().run(act.build_money_brief, 7)
+
+    assert len(_mine(brief["unknowns"])) == 15, "the row cap moved; this test is now blind"
+    assert (
+        brief["large_unexplained"]["count"] == baseline["large_unexplained"]["count"] + 16
+    )
+    assert Decimal(brief["large_unexplained"]["total"]) - Decimal(
+        baseline["large_unexplained"]["total"]
+    ) == Decimal("96000.00")
 
 
 @pytest.mark.skipif(not HAS_HLEDGER, reason="hledger/git not installed")
@@ -470,7 +521,8 @@ async def test_build_money_brief_without_books_still_reports_index(db_pool, tmp_
     assert brief["entities"]["personal"] == {"income": "0", "expenses": "0"}
     assert brief["fx_stale"] is False and brief["fx_unconverted"] == []
     assert [d["msgid"] for d in _mine(brief["dues"])] == ["brief-t/z"]
-    assert _mine(brief["unknowns"]) == [] and _mine(brief["large_unexplained"]) == []
+    assert _mine(brief["unknowns"]) == []
+    assert brief["large_unexplained"] == {"count": 0, "total": "0"}
     assert _mine(brief["closed_dues"]) == []
 
 

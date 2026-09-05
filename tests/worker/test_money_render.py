@@ -35,16 +35,10 @@ BRIEF = {
             "channel": "upi",
         }
     ],
-    "large_unexplained": [
-        {
-            "msgid": "m/a",
-            "payee": "Unknown Big",
-            "amount": "6000.00",
-            "currency": "INR",
-            "occurred_on": "2026-09-02",
-            "channel": "upi",
-        }
-    ],
+    # An aggregate over the WHOLE week, not the rendered rows — the data layer
+    # counts it in SQL so a week with more unexplained rows than the query's
+    # LIMIT cannot understate this figure (issue #391).
+    "large_unexplained": {"count": 1, "total": "6000.00"},
     "dues": [
         {
             "msgid": "m/d",
@@ -322,21 +316,39 @@ _BIG = [
 ]
 
 
+_BIG_TOTAL = {"count": 2, "total": "48000.00"}
+
+
 def test_unexplained_leads_with_the_total_of_the_large_ones():
     """`large_unexplained` crossed the activity boundary every week and was
     read only by tests (issue #391). Rendered, it has to say something the row
     list below does not: the rows carry each amount, only this line carries
     what they add up to and how far over the attention cut they are.
     """
-    out = render_money_brief({**BRIEF, "unknowns": _BIG, "large_unexplained": _BIG})
+    out = render_money_brief({**BRIEF, "unknowns": _BIG, "large_unexplained": _BIG_TOTAL})
 
-    line = "₹48,000.00 in 2 payments of ₹5,000.00 or more"
+    line = "₹48,000.00 across 2 postings of ₹5,000.00 or more"
     assert line in out["html"]
     # Bulleted, or CommonMark folds it into the heading's first list item.
     assert f"- {line}" in out["markdown"]
     # Above the rows: the reader meets the size before the detail.
     md = out["markdown"].split("\n")
     assert md.index(f"- {line}") < md.index("- 2026-09-02 · Unknown Big · ₹6,000.00 · upi")
+
+
+def test_the_lead_line_is_not_a_sum_of_the_rows_it_leads():
+    """The whole point of the SQL aggregate (issue #391 review).
+
+    `unknowns` is `LIMIT 15` and the render cut is 10, so any figure derived
+    from the rows understates a busy week. Here the count and the total are
+    larger than anything the visible rows could add up to, and the line still
+    has to report them.
+    """
+    out = render_money_brief(
+        {**BRIEF, "unknowns": _BIG, "large_unexplained": {"count": 31, "total": "412500.00"}}
+    )
+
+    assert "₹4,12,500.00 across 31 postings of ₹5,000.00 or more" in out["html"]
 
 
 def test_the_large_unexplained_cut_is_the_one_the_query_filtered_on():
@@ -347,35 +359,42 @@ def test_the_large_unexplained_cut_is_the_one_the_query_filtered_on():
     from aegis.services.money_format import fmt_money
     from aegis_worker.activities.money import LARGE_UNEXPLAINED_MIN
 
-    out = render_money_brief({**BRIEF, "unknowns": _BIG, "large_unexplained": _BIG})
+    out = render_money_brief({**BRIEF, "unknowns": _BIG, "large_unexplained": _BIG_TOTAL})
 
     assert f"of {fmt_money(LARGE_UNEXPLAINED_MIN, 'INR')} or more" in out["markdown"]
 
 
-def test_one_large_payment_is_one_payment():
+def test_one_large_posting_is_one_posting():
     out = render_money_brief(BRIEF)
-    assert "₹6,000.00 in 1 payment of ₹5,000.00 or more" in out["html"]
+    assert "₹6,000.00 across 1 posting of ₹5,000.00 or more" in out["html"]
+    assert "postings" not in out["html"].split("Housekeeping")[0]
 
 
 def test_no_large_unexplained_means_no_lead_line():
     """Small unexplained rows still list; nothing claims a big one exists."""
-    out = render_money_brief({**BRIEF, "large_unexplained": []})
+    out = render_money_brief({**BRIEF, "large_unexplained": {"count": 0, "total": "0"}})
     assert "Unexplained" in out["html"] and "or more" not in out["html"]
     assert "or more" not in out["markdown"]
 
 
-def test_a_large_row_with_an_unparsable_amount_is_left_out_of_the_total():
-    """`journal_index.amount` is nullable and reaches this layer as the string
-    "None" (the module docstring's second shape). Counting such a row would
-    print `1 payment` next to a total it contributed nothing to."""
-    out = render_money_brief(
-        {
-            **BRIEF,
-            "unknowns": _BIG,
-            "large_unexplained": [*_BIG, {**_BIG[0], "msgid": "m/c", "amount": None}],
-        }
-    )
-    assert "₹48,000.00 in 2 payments of ₹5,000.00 or more" in out["html"]
+def test_a_brief_from_before_the_aggregate_renders_no_line_rather_than_a_wrong_one():
+    """A workflow already in flight when this shipped carries the old LIST
+    here. Totalling it would be the truncated figure the aggregate exists to
+    replace, so the line is simply absent for one week instead."""
+    out = render_money_brief({**BRIEF, "large_unexplained": [{"amount": "6000.00"}]})
+    assert "or more" not in out["html"] and "or more" not in out["markdown"]
+    # ...and the section it leads still renders.
+    assert "Unexplained" in out["html"]
+
+
+def test_an_unparsable_aggregate_renders_no_line():
+    """`total` crosses a Temporal payload boundary as a string. Neither a
+    missing key nor rubbish in it may print the word "None" at the reader or
+    raise inside a pure renderer."""
+    for large in ({"count": 2}, {"count": 2, "total": "None"}, {"count": "?", "total": "1"}):
+        out = render_money_brief({**BRIEF, "large_unexplained": large})
+        assert "or more" not in out["html"], large
+        assert "None" not in out["html"], large
 
 
 # --------------------------------------------------------------------------

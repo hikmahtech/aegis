@@ -77,7 +77,7 @@ async def _add_unknown(
     currency: str | None = "INR",
     account: str = "expenses:unknown",
     days_ago: int = 1,
-    direction: str = "out",
+    direction: str | None = "out",
 ):
     """One payment the books could not categorise — what the detector reads."""
     await pool.execute(
@@ -263,13 +263,15 @@ async def test_rows_older_than_the_window_are_ignored(clean_db):
     assert [c["subject"] for c in out] == ["Fresh Shop"]
 
 
-async def test_money_that_came_in_is_never_carded_as_money_you_paid(clean_db):
-    """`income:unknown` matches `%:unknown` too, and the card says "You paid".
+async def test_money_that_came_in_is_carded_as_money_that_came_in(clean_db):
+    """"You paid ₹42,000.00 to Nkgsb Bank … What was it for?" is false, on the
+    one surface allowed to interrupt the owner, and it steers the
+    account-picking model toward an expense account for money that came IN.
 
-    An uncategorised inbound credit would produce "You paid ₹42,000.00 to
-    Nkgsb Bank … What was it for?" — false, on the one surface allowed to
-    interrupt the owner, and it steers the account-picking model toward an
-    expense account for money that came IN.
+    The answer is to say the true thing, not to skip the money (issue #387
+    review): uncategorised income is worth asking about for exactly the reason
+    uncategorised spend is, and on 2026-09-05 every foreign unknown in the live
+    index was inbound.
     """
     await _add_unknown(
         clean_db, "Nkgsb Bank", 42000.0, account="income:unknown", direction="in"
@@ -278,7 +280,46 @@ async def test_money_that_came_in_is_never_carded_as_money_you_paid(clean_db):
 
     out = await _run(clean_db)
 
-    assert [c["subject"] for c in out] == ["Queued Shop"]
+    assert [c["subject"] for c in out] == ["Nkgsb Bank", "Queued Shop"]
+    inbound = out[0]["question"]
+    assert "You received ₹42,000.00 from Nkgsb Bank" in inbound, inbound
+    assert "You paid" not in inbound and "What was it for?" not in inbound, inbound
+    assert out[0]["evidence"]["direction"] == "in"
+    # Its own novelty key, so the outbound question about the same name is
+    # still available and neither suppresses the other.
+    assert out[0]["novelty_key"] == "payee-in:nkgsb bank"
+    assert out[1]["novelty_key"] == "payee:queued shop"
+
+
+async def test_the_two_directions_are_two_questions_about_one_name(clean_db):
+    """Money out and money in are different questions with different answers —
+    the backlog sweep files a credit and a debit to different halves of the
+    chart, so one card cannot stand for both."""
+    await _add_unknown(clean_db, "Both Ways", 900.0, direction="out")
+    await _add_unknown(clean_db, "Both Ways", 400.0, account="income:unknown", direction="in")
+
+    out = await _run(clean_db)
+
+    assert sorted(c["novelty_key"] for c in out) == ["payee-in:both ways", "payee:both ways"]
+    paid = next(c for c in out if c["evidence"]["direction"] == "out")
+    got = next(c for c in out if c["evidence"]["direction"] == "in")
+    assert "You paid ₹900.00 to Both Ways" in paid["question"], paid["question"]
+    assert "You received ₹400.00 from Both Ways" in got["question"], got["question"]
+    # And neither total swallowed the other's money.
+    assert paid["evidence"]["totals"] == {"INR": pytest.approx(900.0)}
+    assert got["evidence"]["totals"] == {"INR": pytest.approx(400.0)}
+
+
+async def test_a_posting_with_no_direction_is_never_carded(clean_db):
+    """`direction` is nullable, and there is no true sentence for a row that
+    does not say which way the money went. Guessing one would put "You paid"
+    in front of the owner on no evidence."""
+    await _add_unknown(clean_db, "Directionless", 9000.0, direction=None)
+    await _add_unknown(clean_db, "Rupee Shop", 500.0)
+
+    out = await _run(clean_db)
+
+    assert [c["subject"] for c in out] == ["Rupee Shop"]
 
 
 async def test_a_categorised_payment_is_not_a_gap(clean_db):
