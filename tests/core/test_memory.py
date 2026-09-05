@@ -255,3 +255,132 @@ async def test_consolidation_add_of_a_live_belief_is_a_logged_skip(mem_agent):
     assert op["applied"] is False
     assert op["skip_reason"] == "no_rows_affected"
     await mem_agent.execute("DELETE FROM agent_memory_ops_log WHERE agent_id = $1", _AID)
+
+
+async def test_consolidation_update_onto_a_live_belief_is_a_logged_skip(mem_agent):
+    """The THIRD writer. `_SQL_UPDATE` rewrites a live row's content, and
+    collapsing two near-duplicate beliefs onto one canonical text is precisely
+    what consolidation exists to do — so after migration 028 this is the op
+    most likely to hit the index, not the least.
+
+    `apply_consolidation` has no try/except around `_run`, so an unguarded
+    raise here aborts the whole one-transaction plan and propagates: the exact
+    outcome `_SQL_ADD` is guarded against. Same answer, same skip path.
+
+    Dead while `memory_consolidation_apply_enabled` is unset (every pass is a
+    dry run, which writes no agent_memory statement at all) and live the day
+    that gate is opened.
+    """
+    await record_memory(mem_agent, _AID, "the owner banks with HDFC")
+    victim = await mem_agent.fetchval(
+        "INSERT INTO agent_memory (agent_id, content, importance, source) "
+        "VALUES ($1, 'the owner uses an HDFC account', 0.6, 'correction') RETURNING id",
+        _AID,
+    )
+
+    out = await apply_consolidation(
+        mem_agent,
+        _AID,
+        [
+            {
+                "op": "UPDATE",
+                "id": victim,
+                "content": "the owner banks with HDFC",
+                "importance": 0.7,
+                "apply": True,
+            }
+        ],
+        run_id="r-389-upd",
+        dry_run=False,
+    )
+
+    assert out == {"applied": 0, "logged": 1, "dry_run": False}
+    row = await mem_agent.fetchrow(
+        "SELECT content, importance FROM agent_memory WHERE id = $1", victim
+    )
+    assert row["content"] == "the owner uses an HDFC account"
+    assert row["importance"] == pytest.approx(0.6)
+    op = await mem_agent.fetchrow(
+        "SELECT applied, skip_reason FROM agent_memory_ops_log WHERE run_id = 'r-389-upd'"
+    )
+    assert op["applied"] is False
+    assert op["skip_reason"] == "no_rows_affected"
+    await mem_agent.execute("DELETE FROM agent_memory_ops_log WHERE agent_id = $1", _AID)
+
+
+async def test_consolidation_update_still_applies_when_nothing_collides(mem_agent):
+    """The guard on `_SQL_UPDATE` must block a COLLISION, not every update.
+
+    Three shapes that must all still write, each of which a too-broad guard
+    would silently turn into a permanent no-op:
+
+    * a rewrite to text no live row holds — the ordinary merge;
+    * a rewrite matching a SUPERSEDED row, since the index is partial and a
+      retired belief must not veto the live one;
+    * an importance-only edit, where the row's new content equals its OWN
+      content — the `id <> $2` exclusion is what keeps the row from finding
+      itself and refusing.
+    """
+    plain = await mem_agent.fetchval(
+        "INSERT INTO agent_memory (agent_id, content, importance, source) "
+        "VALUES ($1, 'draft belief one', 0.5, 'correction') RETURNING id",
+        _AID,
+    )
+    onto_retired = await mem_agent.fetchval(
+        "INSERT INTO agent_memory (agent_id, content, importance, source) "
+        "VALUES ($1, 'draft belief two', 0.5, 'correction') RETURNING id",
+        _AID,
+    )
+    unchanged = await mem_agent.fetchval(
+        "INSERT INTO agent_memory (agent_id, content, importance, source, superseded_at) "
+        "VALUES ($1, 'a belief since withdrawn', 0.5, 'correction', now()) RETURNING id",
+        _AID,
+    )
+    keeps_content = await mem_agent.fetchval(
+        "INSERT INTO agent_memory (agent_id, content, importance, source) "
+        "VALUES ($1, 'a belief worth more than it says', 0.4, 'correction') RETURNING id",
+        _AID,
+    )
+
+    out = await apply_consolidation(
+        mem_agent,
+        _AID,
+        [
+            {"op": "UPDATE", "id": plain, "content": "one canonical belief", "apply": True},
+            {
+                "op": "UPDATE",
+                "id": onto_retired,
+                "content": "a belief since withdrawn",
+                "apply": True,
+            },
+            {
+                "op": "UPDATE",
+                "id": keeps_content,
+                "content": "a belief worth more than it says",
+                "importance": 0.9,
+                "apply": True,
+            },
+        ],
+        run_id="r-389-upd-ok",
+        dry_run=False,
+    )
+
+    assert out["applied"] == 3, out
+    assert (
+        await mem_agent.fetchval("SELECT content FROM agent_memory WHERE id = $1", plain)
+        == "one canonical belief"
+    )
+    assert (
+        await mem_agent.fetchval("SELECT content FROM agent_memory WHERE id = $1", onto_retired)
+        == "a belief since withdrawn"
+    )
+    assert await mem_agent.fetchval(
+        "SELECT importance FROM agent_memory WHERE id = $1", keeps_content
+    ) == pytest.approx(0.9)
+    # The retired row is untouched and still retired — it vetoed nothing and
+    # was resurrected by nothing.
+    assert (
+        await mem_agent.fetchval("SELECT superseded_at FROM agent_memory WHERE id = $1", unchanged)
+        is not None
+    )
+    await mem_agent.execute("DELETE FROM agent_memory_ops_log WHERE agent_id = $1", _AID)

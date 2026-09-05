@@ -260,15 +260,30 @@ _SQL_RETIRE = (
     "last_consolidated_at = now() "
     "WHERE id = $2 AND agent_id = $1 AND superseded_at IS NULL"
 )
+# The two writing ops both step around the migration-028 unique index instead
+# of raising on it. That is not politeness: the whole plan runs in ONE
+# transaction ("applied whole or not at all"), so one collision would take
+# every other op in the plan down with it and propagate out of
+# `apply_consolidation`, which has no try/except around `_run`. Both forms
+# below leave a "touched no row" status (`UPDATE 0` / `INSERT 0 0`), which
+# `_run` already reads as `no_rows_affected` — so the op lands on the existing
+# skip path and the ledger records what happened.
+#
+# UPDATE needs a hand-written NOT EXISTS rather than ON CONFLICT, which UPDATE
+# does not have. Note the three parts of the predicate, all load-bearing:
+# `superseded_at IS NULL` because the index is partial and a retired row must
+# not veto a live rewrite; `id <> $2` so a row rewriting its OWN content (an
+# importance-only edit) does not find itself and refuse; and `md5()` on both
+# sides to match the index's key exactly.
+#
+# UPDATE is the op MOST likely to hit the index, not the least: collapsing two
+# near-duplicate beliefs onto one canonical text is what consolidation is for.
 _SQL_UPDATE = (
     "UPDATE agent_memory SET content = $3, importance = $4, last_consolidated_at = now() "
-    "WHERE id = $2 AND agent_id = $1 AND superseded_at IS NULL"
+    "WHERE id = $2 AND agent_id = $1 AND superseded_at IS NULL "
+    "AND NOT EXISTS (SELECT 1 FROM agent_memory a2 WHERE a2.agent_id = $1 "
+    "AND md5(a2.content) = md5($3::text) AND a2.superseded_at IS NULL AND a2.id <> $2)"
 )
-# DO NOTHING, not a raise, on the migration-028 index. The whole plan runs in
-# ONE transaction ("applied whole or not at all"), so an ADD that restates a
-# live belief must not take every other op down with it. `INSERT 0 0` is a
-# status `_run` already reads as `no_rows_affected`, so the ledger records the
-# skip and the operator sees what happened.
 _SQL_ADD = (
     "INSERT INTO agent_memory (agent_id, content, importance, source, last_consolidated_at) "
     "VALUES ($1, $2, $3, 'consolidation', now()) "

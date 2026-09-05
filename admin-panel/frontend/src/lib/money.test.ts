@@ -6,13 +6,15 @@
  * that says what they both produce. Every `expected` in AGREED below was
  * COMPUTED by running the Python function on that exact input, not written by
  * hand, and `tests/core/test_money_format.py` pins the Python side of the same
- * contract. Change one implementation and its table fails; change the format
- * on purpose and you have to update both, which is the point.
+ * contract. Editing either implementation fails its own table, and
+ * `admin-panel.yml` lists money_format.py in its `paths:` so a change to the
+ * Python side runs this file too.
  *
- * The DIVERGES block is the other half of the story: three inputs where the
- * two deliberately do NOT agree. They are recorded here so a later reader does
- * not "fix" them into agreement and quietly give the browser a second opinion
- * about rounding.
+ * The last two `describe` blocks are the other half of the story: the inputs
+ * where the two deliberately do NOT agree — JavaScript truncates where Python
+ * rounds, and passes unparseable input through where Python raises. They are
+ * spelled out so a later reader does not "fix" them into agreement and quietly
+ * give the browser a second opinion about rounding.
  */
 
 import { describe, expect, it } from 'vitest';

@@ -47,12 +47,20 @@ async def _snapshot(pool, agent_id: str) -> list[tuple]:
     return [tuple(r) for r in rows]
 
 
-# Row content is unique across CALLS, not just within one. `agent_memory` grew
-# a partial unique index on live `(agent_id, md5(content))` in migration 028,
-# and `test_recent_rows_are_never_touched` seeds the same agent twice — with a
-# per-call `range(n)` its "fresh" row was a byte-identical duplicate of the
-# first batch's row 0, so it was the index, not the recency rail, deciding the
-# outcome.
+# Row content is unique across CALLS, not just within one.
+#
+# `test_recent_rows_are_never_touched` seeds the same agent twice, and a
+# per-call `range(n)` made its "fresh" row byte-identical to the first batch's
+# row 0. That cost the old assertions nothing — `decide_ops` and
+# `_protection_reason` key on id, created_at, importance and the gmail marker,
+# and nothing in either compares content across rows — so those tests were
+# sound as written.
+#
+# It is migration 028 that makes it matter: a partial unique index on live
+# `(agent_id, md5(content))` turns the second call's INSERT into a
+# UniqueViolationError. The test would ERROR in the fixture rather than pass
+# falsely, so this is a required consequence of the migration, not a repair of
+# a test that was proving nothing.
 _seed_seq = itertools.count()
 
 

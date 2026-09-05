@@ -9,23 +9,35 @@ name: "Admin panel — Test"
 # build`, so the type check is the build.
 #
 # The `paths:` filter must list every input this job READS, not just the source
-# it is named after. Everything it reads is inside admin-panel/frontend —
-# src/, public/, index.html, package.json, package-lock.json, the three
-# tsconfigs, vite.config.ts and eslint.config.js — so the directory glob is the
-# complete list rather than a lazy one. Narrowing it to src/** would mean a
-# dependency bump or a tsconfig edit ran no job at all, which is not "skipped a
-# job", it is "disarmed the check that exists to validate that file" (#170).
+# it is named after. Two groups.
+#
+# Everything the build reads is inside admin-panel/frontend — src/, public/,
+# index.html, package.json, package-lock.json, the three tsconfigs,
+# vite.config.ts and eslint.config.js — so the directory glob is the complete
+# list rather than a lazy one. Narrowing it to src/** would mean a dependency
+# bump or a tsconfig edit ran no job at all, which is not "skipped a job", it is
+# "disarmed the check that exists to validate that file" (#170).
+#
+# Then money_format.py, which is not a build input at all but IS an input to
+# `src/lib/money.test.ts`: that file's case table asserts what the PYTHON
+# formatter produces. Without this entry the drift protection runs in only one
+# direction — editing the Python side runs core.yml (which pins the Python half
+# and knows nothing about the table here) and never runs this job, so the two
+# implementations could part company in exactly the direction most likely to
+# move. This is the #170 rule applied to a cross-language input.
 
 on:
   push:
     branches: [main]
     paths:
       - "admin-panel/frontend/**"
+      - "core/src/aegis/services/money_format.py"
       - ".github/workflows/admin-panel.yml"
   pull_request:
     branches: [main]
     paths:
       - "admin-panel/frontend/**"
+      - "core/src/aegis/services/money_format.py"
       - ".github/workflows/admin-panel.yml"
 
 # Cancel superseded runs on the same PR branch; never cancel main pushes —
