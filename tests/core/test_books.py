@@ -160,10 +160,16 @@ def test_rules_first_match_wins(tmp_path):
         "- match: 'amazon'\n  account: expenses:shopping\n"
     )
     rules = books.load_rules(p)
-    assert books.apply_rules(rules, "invoicing@aws.com", "AMAZON WEB SERVICES")["payee"] == "Amazon Web Services"
-    assert books.apply_rules(rules, "x@amazon.in", "Amazon")["account"] == "expenses:shopping"
-    assert books.apply_rules(rules, "data@stockopedia.com", "LSEG Billing")["ignore"] is True
-    assert books.apply_rules(rules, "a@b.com", "Nobody") is None
+    assert books.apply_rules(
+        rules, "invoicing@aws.com", "AMAZON WEB SERVICES", direction="out"
+    )["payee"] == "Amazon Web Services"
+    assert books.apply_rules(
+        rules, "x@amazon.in", "Amazon", direction="out"
+    )["account"] == "expenses:shopping"
+    assert books.apply_rules(
+        rules, "data@stockopedia.com", "LSEG Billing", direction="in"
+    )["ignore"] is True
+    assert books.apply_rules(rules, "a@b.com", "Nobody", direction="out") is None
     assert books.load_rules(tmp_path / "missing.yaml") == []
 
 
@@ -228,6 +234,83 @@ def test_load_rules_accepts_every_shape_a_real_rule_uses(tmp_path):
     assert len(books.load_rules(p)) == 5
 
 
+def test_a_rule_with_no_direction_matches_money_moving_either_way(tmp_path):
+    """The backwards-compatibility guarantee for issue #396.
+
+    Every rule in the live `rules/accounts.yaml` — all 28 of them on
+    2026-09-06 — is written without a `direction`, so an absent field has to go
+    on meaning "either way" exactly as it did before the field existed.
+    """
+    p = tmp_path / "accounts.yaml"
+    p.write_text("- match: 'amazon'\n  account: expenses:shopping\n")
+    rules = books.load_rules(p)
+
+    for direction in ("out", "in", None):
+        assert books.apply_rules(rules, "", "Amazon", direction=direction) == rules[0], direction
+
+
+def test_a_directional_rule_only_fires_on_its_own_direction(tmp_path):
+    """`apply_rules` had no notion of direction, and `parse_money_email` sets
+    `ev.account` from whatever it returns — so a rule written from an inbound
+    curiosity answer (`income:people`) filed the next payment TO that name into
+    `income:people`. Balanced, `check --strict` clean, not `%:unknown`, so it
+    never reached the Unexplained queue or the detector again.
+    """
+    p = tmp_path / "accounts.yaml"
+    p.write_text(
+        "- match: 'muhammed amin'\n  account: income:people\n  direction: in\n"
+        "- match: 'jai shree'\n  account: expenses:groceries\n  direction: out\n"
+    )
+    rules = books.load_rules(p)
+
+    assert books.apply_rules(rules, "", "Muhammed Amin", direction="in") == rules[0]
+    assert books.apply_rules(rules, "", "Muhammed Amin", direction="out") is None
+    assert books.apply_rules(rules, "", "Jai Shree Nakoda", direction="out") == rules[1]
+    assert books.apply_rules(rules, "", "Jai Shree Nakoda", direction="in") is None
+
+
+def test_an_event_of_unknown_direction_never_matches_a_directional_rule(tmp_path):
+    """`MoneyEvent.direction` is `Literal["in","out"] | None`, so "we do not
+    know" is a real input.
+
+    It must not satisfy a rule that names a direction: a rule that misses falls
+    back to `account_for`, which files the row in `:unknown` where the brief
+    and the detector both find it. A rule that fires on a guess files it
+    somewhere plausible and silently wrong, which nothing ever surfaces.
+    """
+    p = tmp_path / "accounts.yaml"
+    p.write_text(
+        "- match: 'muhammed amin'\n  account: income:people\n  direction: in\n"
+        "- match: 'amazon'\n  account: expenses:shopping\n"
+    )
+    rules = books.load_rules(p)
+
+    assert books.apply_rules(rules, "", "Muhammed Amin", direction=None) is None
+    # ...while the agnostic rule in the same file still matches.
+    assert books.apply_rules(rules, "", "Amazon", direction=None) == rules[1]
+
+
+def test_load_rules_skips_a_rule_whose_direction_is_not_a_direction(tmp_path):
+    """Same reasoning as the regex bounds (issue #390): the guarantee is about
+    what RUNS. `direction: sideways` cannot be honoured, and reading it as
+    "either way" would silently widen a rule its author meant to narrow.
+    """
+    p = tmp_path / "accounts.yaml"
+    p.write_text(
+        "- match: 'sideways shop'\n  account: expenses:shopping\n  direction: sideways\n"
+        "- match: 'listy shop'\n  account: expenses:shopping\n  direction: [in, out]\n"
+        "- match: 'good shop'\n  account: expenses:shopping\n  direction: out\n"
+    )
+
+    with capture_logs() as logs:
+        rules = books.load_rules(p)
+
+    assert [r["match"] for r in rules] == ["good shop"]
+    skipped = [ln for ln in logs if ln["event"] == "books_rule_skipped"]
+    assert [ln["match"] for ln in skipped] == ["sideways shop", "listy shop"]
+    assert all("direction" in ln["reason"] for ln in skipped), skipped
+
+
 def test_latest_prices_reads_the_newest_rate_per_commodity(tmp_path):
     """`prices.journal` is append-only and seeded with config defaults, so the
     same symbol appears many times and only the newest line is the rate. Used
@@ -269,15 +352,20 @@ def test_rule_haystack_keeps_exactly_one_pipe():
     anchored = [{"match": r"\|[^|]*mahavitaran", "account": "expenses:utilities:electricity"}]
     # A pipe in the sender must not let the anchored pattern match on the
     # sender's own text.
-    assert books.apply_rules(anchored, '"Google Pay | mahavitaran" <no@reply>', "Zomato") is None
+    assert books.apply_rules(
+        anchored, '"Google Pay | mahavitaran" <no@reply>', "Zomato", direction="out"
+    ) is None
     # ...while the payee it was written for still matches.
-    assert books.apply_rules(anchored, '"Google Pay | Bills" <no@reply>', "Mahavitaran") is not None
+    assert books.apply_rules(
+        anchored, '"Google Pay | Bills" <no@reply>', "Mahavitaran", direction="out"
+    ) is not None
     # And a pipe inside the payee neither splits the haystack nor swallows the
     # words around it.
     assert books.apply_rules(
         [{"match": r"\|[^|]*acme[^a-z0-9]+corp", "account": "expenses:saas"}],
         "billing@acme.example",
         "Acme | Corp",
+        direction="out",
     ) is not None
 
 

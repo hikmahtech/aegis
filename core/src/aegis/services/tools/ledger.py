@@ -508,6 +508,7 @@ async def _exec_ledger_add_rule(
     match: str,
     account: str,
     entity: str | None = None,
+    direction: str | None = None,
     payee: str | None = None,
     apply: bool = True,
 ) -> str:
@@ -517,6 +518,7 @@ async def _exec_ledger_add_rule(
         match: case-insensitive regex tested against "<sender> | <payee>".
         account: a declared account.
         entity: personal or hikmah. Optional — an expense or income account already says which set of books it belongs to, so leaving this out takes the account's own entity (expenses:hikmah:* and income:hikmah:* are hikmah, any other expense or income account is personal). Asset, liability and equity accounts belong to both, and a rule on one gets no entity.
+        direction: in or out. Optional, and NOT inferred from the account — leaving it out means the rule files this payee whichever way the money moves, which is what every rule written before this field existed does. Give it when the same name moves money both ways and the two belong in different accounts (a person you both pay and are paid by), so a payment is not filed to the income account you picked for a credit.
         payee: canonical display name, optional.
         apply: also reclassify existing postings in an unknown account that match (default true). Existing postings are matched on their payee alone — the sender is not in the index.
     """
@@ -539,6 +541,13 @@ async def _exec_ledger_add_rule(
         )
     if entity is not None and entity not in _ENTITIES:
         return f"error: entity must be one of {', '.join(_ENTITIES)}, got {entity!r}"
+    # Refused here rather than written and then skipped by `load_rules`, which
+    # is what an unusable direction earns on the way back in (issue #396).
+    if direction is not None and direction not in books.RULE_DIRECTIONS:
+        return (
+            f"error: direction must be one of {', '.join(books.RULE_DIRECTIONS)} "
+            f"(or left out for either), got {direction!r}"
+        )
     try:
         declared = await books.declared_accounts(cfg)
     except books.BooksError as exc:
@@ -563,6 +572,16 @@ async def _exec_ledger_add_rule(
     rule: dict = {"match": match, "account": account}
     if entity:
         rule["entity"] = entity
+    # Never derived from the account, unlike `entity` above. An entity is a
+    # property of the ACCOUNT (`expenses:hikmah:*` IS hikmah), so deriving it
+    # states a fact the account already carries. A direction is a property of
+    # the EVENT: a refund credited back to `expenses:shopping` is a legitimate
+    # inbound posting to an expense account, and an `assets:*` or
+    # `equity:transfers` rule has to match a transfer moving either way.
+    # Deriving `out` from an expense account would silently narrow every such
+    # rule and stop it matching what it matches today.
+    if direction:
+        rule["direction"] = direction
     if payee:
         rule["payee"] = payee
     try:
@@ -573,7 +592,7 @@ async def _exec_ledger_add_rule(
         return "rule added; reclassified 0 postings"
 
     rows = await pool.fetch(
-        "SELECT message_id, payee, entity FROM finance.journal_index "
+        "SELECT message_id, payee, entity, direction FROM finance.journal_index "
         "WHERE kind = 'transaction' AND account LIKE '%:unknown' AND journal_file IS NOT NULL"
     )
     targets: list[str] = []
@@ -585,8 +604,10 @@ async def _exec_ledger_add_rule(
         if entity and row["entity"] != entity:
             continue
         # `apply_rules` with an empty sender, so one matcher serves both this
-        # sweep and the pipeline that applies the rule to new mail.
-        if not books.apply_rules([rule], "", row["payee"] or ""):
+        # sweep and the pipeline that applies the rule to new mail — and with
+        # the posting's OWN direction, so a rule that names one sweeps only the
+        # half of the backlog it will go on filing (issue #396).
+        if not books.apply_rules([rule], "", row["payee"] or "", direction=row["direction"]):
             continue
         targets.append(row["message_id"])
     capped = len(targets) > _MAX_APPLY

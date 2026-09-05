@@ -451,7 +451,11 @@ class MoneyActivities:
         # into the business books.
         if ev.entity != "hikmah":
             ev.entity = self.mailbox_entities.get(mailbox, "personal")  # type: ignore[assignment]
-        rule = books.apply_rules(self._rules(), sender, ev.payee)
+        # `ev.direction`, because a rule may name one (issue #396): a rule from
+        # an inbound answer must not file this payee's next PAYMENT into an
+        # income account. `ev.direction` is nullable and that is passed through
+        # honestly — an unknown direction satisfies no directional rule.
+        rule = books.apply_rules(self._rules(), sender, ev.payee, direction=ev.direction)
         if rule:
             if rule.get("ignore"):
                 ev.kind, ev.entity, ev.parser = "ignore", "none", f"{ev.parser}+rule"

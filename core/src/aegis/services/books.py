@@ -496,13 +496,37 @@ def rule_match_problem(match: str) -> str | None:
     return None
 
 
+# Which way the money moved. A rule may name one, and then fires only on an
+# event moving that way (issue #396); a rule that names none is agnostic, which
+# is what every rule written before the field existed means and has to go on
+# meaning.
+RULE_DIRECTIONS = ("in", "out")
+
+
+def rule_direction_problem(rule: dict) -> str | None:
+    """Why this rule's `direction` cannot be honoured, or None.
+
+    Absent is fine — that is the agnostic rule. Anything present that is not
+    `in` or `out` is NOT read as agnostic: reading it that way would silently
+    widen a rule whose author meant to narrow it, which is the opposite of what
+    they wrote.
+    """
+    if "direction" not in rule or rule.get("direction") is None:
+        return None
+    value = rule["direction"]
+    if isinstance(value, str) and value.strip().lower() in RULE_DIRECTIONS:
+        return None
+    return f"names a direction that is not {' or '.join(RULE_DIRECTIONS)}: {str(value)[:40]!r}"
+
+
 def load_rules(path: Path) -> list[dict]:
     """The rules in `path` that are safe to run, in file order.
 
-    A rule whose pattern fails `rule_match_problem` is SKIPPED and named in a
-    warning, not repaired and not raised on: the file is the user's, the rest
-    of it is still good, and a loader that refused the whole file on one bad
-    line would de-categorise every payee at once.
+    A rule whose pattern fails `rule_match_problem`, or whose `direction` fails
+    `rule_direction_problem`, is SKIPPED and named in a warning — not repaired
+    and not raised on: the file is the user's, the rest of it is still good,
+    and a loader that refused the whole file on one bad line would
+    de-categorise every payee at once.
     """
     if not Path(path).exists():
         return []
@@ -511,7 +535,7 @@ def load_rules(path: Path) -> list[dict]:
     for rule in data:
         if not isinstance(rule, dict) or not rule.get("match"):
             continue
-        problem = rule_match_problem(str(rule["match"]))
+        problem = rule_match_problem(str(rule["match"])) or rule_direction_problem(rule)
         if problem:
             # Named, because a rule that silently stops applying shows up as a
             # miscategorised payment with nothing pointing at the cause.
@@ -526,7 +550,25 @@ def load_rules(path: Path) -> list[dict]:
     return out
 
 
-def apply_rules(rules: list[dict], sender: str, payee: str) -> dict | None:
+def apply_rules(
+    rules: list[dict], sender: str, payee: str, *, direction: str | None
+) -> dict | None:
+    """The first rule matching this event, or None.
+
+    `direction` is REQUIRED and keyword-only, because the answer genuinely
+    depends on it and a default would be a trap either way (issue #396). A rule
+    naming a direction fires only on an event moving that way: without that,
+    a rule written from an inbound curiosity answer (`income:people`) filed the
+    next payment TO that name into `income:people` — balanced, `check --strict`
+    clean, and never `%:unknown`, so neither the brief's Unexplained list nor
+    the curiosity detector ever saw it again.
+
+    `None` means the caller does not know which way the money went
+    (`MoneyEvent.direction` is nullable), and it satisfies no directional rule.
+    A rule that MISSES falls back to `account_for`, which files the row in
+    `:unknown` where both of those surfaces find it; a rule that fires on a
+    guess files it somewhere plausible and silently wrong.
+    """
     # `|` is the SEPARATOR between the two halves, so it is stripped out of
     # both of them before they are joined. The generated payee rules anchor on
     # the payee half with `\|[^|]*`, which assumes exactly one pipe in the
@@ -536,7 +578,11 @@ def apply_rules(rules: list[dict], sender: str, payee: str) -> dict | None:
     # closes. No hand-written rule can want a literal pipe either: in a regex
     # it means alternation, not the character.
     haystack = f"{(sender or '').replace('|', ' ')} | {(payee or '').replace('|', ' ')}"
+    moved = (direction or "").strip().lower()
     for rule in rules:
+        wanted = rule.get("direction")
+        if wanted is not None and str(wanted).strip().lower() != moved:
+            continue
         try:
             if re.search(str(rule["match"]), haystack, re.I):
                 return rule

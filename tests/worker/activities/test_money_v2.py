@@ -157,6 +157,57 @@ async def test_parse_llm_low_confidence_lands_in_unknown_and_rule_sets_entity(db
 
 
 @pytest.mark.asyncio
+async def test_a_directional_rule_does_not_file_the_other_direction(db_pool, tmp_path):
+    """The pipeline half of issue #396.
+
+    A rule written from an inbound curiosity answer names `income:people`. The
+    next PAYMENT to that name must not be filed there: it would balance, pass
+    `hledger check --strict`, and never be `%:unknown` — so neither the brief's
+    Unexplained list nor the curiosity detector would ever see it again.
+
+    Both halves are asserted, because "the rule did not fire" is also what a
+    broken regex, a missing rules file or a detector that never ran look like.
+    """
+    cfg = _repo(tmp_path)
+    (cfg.path / "rules" / "accounts.yaml").write_text(
+        "- match: 'muhammed amin'\n  account: income:people\n  direction: in\n"
+    )
+    llm = AsyncMock()
+
+    def _extracted(direction):
+        return [{
+            "kind": "transaction", "direction": direction, "amount": "4750.00",
+            "currency": "INR", "payee": "Muhammed Amin", "payee_key": "muhammed amin",
+            "channel": "upi", "confidence": 0.9, "parser": "llm", "source_class": "bank",
+            "entity": "personal", "occurred_on": "2026-09-02",
+        }]
+
+    llm.extract_money_batch = AsyncMock(return_value=_extracted("in"))
+    act = _act(db_pool, cfg, llm=llm)
+    got = await ActivityEnvironment().run(
+        act.parse_money_email,
+        _receipt(sender="x@y.com", subject="credited", body="Rs 4750.00 credited"),
+    )
+    assert got["account"] == "income:people", "the rule never fired at all"
+
+    llm.extract_money_batch = AsyncMock(return_value=_extracted("out"))
+    paid = await ActivityEnvironment().run(
+        act.parse_money_email,
+        _receipt(sender="x@y.com", subject="debited", body="Rs 4750.00 debited"),
+    )
+    assert paid["account"] == "expenses:unknown"
+
+    # An event whose direction the extractor never established satisfies no
+    # directional rule either — `:unknown` is where the owner can still see it.
+    llm.extract_money_batch = AsyncMock(return_value=_extracted(None))
+    unsure = await ActivityEnvironment().run(
+        act.parse_money_email,
+        _receipt(sender="x@y.com", subject="something", body="Rs 4750.00 moved"),
+    )
+    assert unsure["account"] == "expenses:unknown"
+
+
+@pytest.mark.asyncio
 async def test_parse_flags_llm_failure(db_pool, tmp_path):
     llm = AsyncMock()
     llm.extract_money_batch = AsyncMock(

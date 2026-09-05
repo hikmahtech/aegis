@@ -422,7 +422,9 @@ def _matches(match: str, sender: str, payee: str) -> bool:
     """`books.apply_rules`' own haystack, so this tests the real matching."""
     from aegis.services import books
 
-    return books.apply_rules([{"match": match, "account": "x"}], sender, payee) is not None
+    return books.apply_rules(
+        [{"match": match, "account": "x"}], sender, payee, direction="out"
+    ) is not None
 
 
 def test_rule_match_for_covers_every_punctuation_variant():

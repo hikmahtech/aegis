@@ -213,8 +213,21 @@ string `"<sender> | <payee>"` where `sender` is the email From header and
 ```
 
 Fields: `match` (required), `account`, `entity` (`personal` | `hikmah`),
-`payee` (canonical display name), `ignore: true`. A rule with only `match`
-and `payee` normalises the name without deciding the account.
+`direction` (`in` | `out`), `payee` (canonical display name), `ignore: true`.
+A rule with only `match` and `payee` normalises the name without deciding the
+account.
+
+`direction` is optional and means "only when the money moved this way"
+(issue #396). Left out, the rule fires either way, which is what every rule
+written before the field existed means. Give it when the same name moves money
+both ways and the two belong in different accounts — a person you both pay and
+are paid by — so a payment is not filed into the income account you picked for
+a credit. It is never inferred from the account: a refund credited back to
+`expenses:shopping` is a legitimate inbound posting, and an `assets:*` or
+`equity:transfers` rule has to match a transfer moving either way. The
+curiosity answer hook is the exception and always stamps one, because it knows
+which way the card asked and no human reviews what it writes. A rule whose
+`direction` is neither value is skipped on load, with a warning naming it.
 
 The initial file ships with the rules that follow directly from the evidence
 gathered on 2026-09-05 (AWS, Google Workspace, Airtel Xstream, Eleven Labs,

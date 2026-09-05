@@ -512,6 +512,11 @@ async def test_money_brief_counts_commits_the_books_have_not_pushed(db_pool, tmp
 @pytest.mark.asyncio
 async def test_build_money_brief_without_books_still_reports_index(db_pool, tmp_path):
     act = _act(db_pool, books.BooksConfig(path=tmp_path / "none"))
+    # `large_unexplained` is a table-wide aggregate with nothing to scope it
+    # by, so it is a delta like every other count in this file. Asserted flat
+    # it passes sequentially and fails the moment a sibling suite leaves an
+    # unexplained row in the shared `aegis_test_gwN` database.
+    baseline = await ActivityEnvironment().run(act.build_money_brief, 7)
     await ji.upsert(db_pool, "brief-t/z", "brief-t",
                     _ev(kind="due", due_on=date.today(), payee="X", payee_key="x"),
                     todoist_ref="t")
@@ -522,7 +527,8 @@ async def test_build_money_brief_without_books_still_reports_index(db_pool, tmp_
     assert brief["fx_stale"] is False and brief["fx_unconverted"] == []
     assert [d["msgid"] for d in _mine(brief["dues"])] == ["brief-t/z"]
     assert _mine(brief["unknowns"]) == []
-    assert brief["large_unexplained"] == {"count": 0, "total": "0"}
+    # A due is not an unexplained posting, so this row moves neither number.
+    assert brief["large_unexplained"] == baseline["large_unexplained"]
     assert _mine(brief["closed_dues"]) == []
 
 

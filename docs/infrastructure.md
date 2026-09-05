@@ -711,7 +711,19 @@ Three behaviours are worth knowing before you use them.
   hand-edit into the file is held to the same standard as one the tool wrote:
   it is skipped, with a warning naming it (`books_rule_skipped`), rather than
   run. The timing probe is write-time only — it forks a process, which is not a
-  price the ingest lane can pay per rule per email.
+  price the ingest lane can pay per rule per email. The same loader skips a
+  rule whose optional `direction` is neither `in` nor `out`.
+- **A rule may name a direction, and by default does not.** `direction: in` or
+  `direction: out` makes the rule fire only on money moving that way; leaving
+  it out means either way, which is what every rule written before the field
+  existed means. Reach for it when the same name moves money both ways and the
+  two belong in different accounts — a person you both pay and are paid by —
+  so a payment is not filed into the income account you picked for a credit.
+  It is never derived from the account: a refund credited back to
+  `expenses:shopping` is a legitimate inbound posting, and a transfer rule on
+  `assets:*` has to match both ways. The curiosity answer hook always stamps
+  one, because it knows which way its card asked and nobody reviews what it
+  writes.
 - **One sweep is capped at 200 postings**, written as a single commit. Past that
   the tool asks to be run again rather than rewriting the whole backlog in one
   unreviewable change.

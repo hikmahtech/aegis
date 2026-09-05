@@ -1115,6 +1115,10 @@
             "type": "string",
             "description": "personal or hikmah. Optional \u2014 an expense or income account already says which set of books it belongs to, so leaving this out takes the account's own entity (expenses:hikmah:* and income:hikmah:* are hikmah, any other expense or income account is personal). Asset, liability and equity accounts belong to both, and a rule on one gets no entity."
           },
+          "direction": {
+            "type": "string",
+            "description": "in or out. Optional, and NOT inferred from the account \u2014 leaving it out means the rule files this payee whichever way the money moves, which is what every rule written before this field existed does. Give it when the same name moves money both ways and the two belong in different accounts (a person you both pay and are paid by), so a payment is not filed to the income account you picked for a credit."
+          },
           "payee": {
             "type": "string",
             "description": "canonical display name, optional."

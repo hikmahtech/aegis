@@ -306,10 +306,14 @@ async def test_confident_answer_writes_a_rule_and_reclassifies_the_backlog(clean
     assert len(rules) == 1, rules
     assert rules[0]["account"] == "expenses:groceries"
     assert rules[0]["payee"] == PAYEE
+    # The card asked about money going out, so the rule says so (issue #396):
+    # a later credit from this name must not be filed to an expense account.
+    assert rules[0]["direction"] == "out"
+    assert books.apply_rules(rules, "", PAYEE, direction="in") is None
     # The account states which set of books it belongs to, so the rule says so
     # too — see `test_a_business_account_never_rewrites_the_personal_books`.
     assert rules[0]["entity"] == "personal"
-    assert books.apply_rules(rules, "alerts@hdfcbank.net", PAYEE) == rules[0]
+    assert books.apply_rules(rules, "alerts@hdfcbank.net", PAYEE, direction="out") == rules[0]
 
     # The journal block itself moved — this is the record, not the index.
     text = _journal(cfg)
@@ -777,6 +781,18 @@ async def test_an_inbound_answer_files_the_credit_and_leaves_the_debit(clean_db,
     assert await _account_of(clean_db, received) == "income:people"
     # The debit from the same name is not what the owner explained.
     assert await _account_of(clean_db, paid) == "expenses:unknown"
+
+    # ...and neither is the NEXT one (issue #396). The rule carries the
+    # direction the card asked about, so a later payment TO this name is not
+    # filed into the income account the owner picked for a credit — which
+    # would balance, pass `check --strict`, never be `%:unknown`, and so
+    # never reach the Unexplained list or the detector again. Prod's three
+    # inbound candidates are person-to-person UPI names: exactly the payees
+    # who move money both ways.
+    rules = _rules(cfg)
+    assert rules[0]["direction"] == "in", rules[0]
+    assert books.apply_rules(rules, "", PAYEE, direction="in") == rules[0]
+    assert books.apply_rules(rules, "", PAYEE, direction="out") is None
     # The prompt told the model which way the money went, or it would be
     # picking an account for a payment that never happened.
     blob = f"{llm.calls[0]['prompt']}\n{llm.calls[0].get('system_prompt') or ''}"
@@ -822,9 +838,11 @@ async def test_a_rule_from_an_answer_never_fires_on_the_sender(clean_db, tmp_pat
     await _apply(clean_db, cfg, llm)
 
     rules = _rules(cfg)
-    assert books.apply_rules(rules, "", PAYEE) == rules[0]
+    assert books.apply_rules(rules, "", PAYEE, direction="out") == rules[0]
     # A mail whose FROM happens to carry the payee's words, about someone else.
-    assert books.apply_rules(rules, f"{KEY.replace(' ', '-')}@bank.example", "Mahavitaran") is None
+    assert books.apply_rules(
+        rules, f"{KEY.replace(' ', '-')}@bank.example", "Mahavitaran", direction="out"
+    ) is None
 
 
 async def test_a_payee_spelling_variant_matches_the_rule(clean_db, tmp_path):
@@ -840,8 +858,8 @@ async def test_a_payee_spelling_variant_matches_the_rule(clean_db, tmp_path):
 
     rules = _rules(cfg)
     for variant in (PAYEE, PAYEE.upper(), "JAI-SHREE-ZZT5NAKODA", "Jai  Shree  Zzt5nakoda"):
-        assert books.apply_rules(rules, "", variant) == rules[0], variant
-    assert books.apply_rules(rules, "", "Some Other Shop") is None
+        assert books.apply_rules(rules, "", variant, direction="out") == rules[0], variant
+    assert books.apply_rules(rules, "", "Some Other Shop", direction="out") is None
 
 
 # ------------------------------------------- what the owner is told (issue #384)

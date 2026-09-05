@@ -880,6 +880,17 @@ class CuriosityActivities:
             rule = {"match": match, "account": account, "payee": books.sanitize_payee(payee)}
             if entity:
                 rule["entity"] = entity
+            # ALWAYS stamped here, unlike `ledger_add_rule` where it is opt-in
+            # (issue #396). The owner answered about money moving ONE way, this
+            # is the one writer with no human reviewing the rule, and the
+            # payees it writes rules for are person-to-person UPI names — the
+            # ones most likely to move money both ways. Without the stamp, an
+            # answer of `income:people` files that name's next PAYMENT into
+            # `income:people`: balanced, `check --strict` clean, never
+            # `%:unknown`, so neither the brief nor this detector sees it
+            # again. The other direction stays uncategorised and cardable,
+            # which is the outcome the owner can still act on.
+            rule["direction"] = direction
             await books.append_rule(rule, cfg)
 
         rows = await self.db_pool.fetch(
