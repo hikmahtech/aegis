@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import shutil
 import subprocess
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from unittest.mock import AsyncMock
+from zoneinfo import ZoneInfo
 
 import pytest
 import pytest_asyncio
@@ -106,11 +107,42 @@ async def _clean(db_pool):
     await db_pool.execute("DELETE FROM finance.journal_index WHERE mailbox = 'brief-t'")
 
 
+def _today() -> date:
+    """"Today" as `MoneyActivities` computes it — in its own `home_tz`.
+
+    NOT `date.today()`, which is the RUNNER's timezone. Every window in this
+    file (`as_of`, the 7-day brief, the 14-day forecast, the month the close
+    covers, the `P <date>` price lines) is derived by the activity from
+    `datetime.now(ZoneInfo(self.home_tz))`, so a test that builds the same
+    window from the runner's clock agrees only while the runner is in IST.
+    CI is UTC: for the 5.5 hours a day the two disagree on the date, the
+    activity says the 6th and the runner says the 5th, and every dated
+    assertion here fails at once. Measured on PR #397, job at 19:40 UTC.
+
+    Read off the class rather than an instance because `_repo(tmp_path, …)`
+    anchors the journal before any activity exists, and `_act` never overrides
+    the field — the same clock has to build the fixture and read the result.
+    (`tests/worker/activities/test_capture_due.py::_today` is the same fix on
+    the same trap, one file over.)
+    """
+    return datetime.now(ZoneInfo(MoneyActivities.home_tz)).date()
+
+
+def _prev_month_last() -> date:
+    """The last day of the month `build_month_close` closes.
+
+    On the activity's clock too: at a month boundary the runner and the
+    activity disagree about which month is "previous", which breaks these
+    tests the same way and only on those days.
+    """
+    return _today().replace(day=1) - timedelta(days=1)
+
+
 def _ev(**kw) -> MoneyEvent:
     base = {
         "kind": "transaction", "direction": "out", "amount": Decimal("10"), "currency": "INR",
         "payee": "Shop", "payee_key": "shop", "channel": "upi", "instrument": "hdfc-1225",
-        "occurred_on": date.today(), "entity": "personal", "account": "expenses:unknown",
+        "occurred_on": _today(), "entity": "personal", "account": "expenses:unknown",
         "parser": "hdfc_upi", "source_class": "bank",
     }
     return MoneyEvent(**{**base, **kw})
@@ -191,7 +223,7 @@ def test_a_mixed_commodity_cell_never_reports_a_foreign_amount_as_rupees():
 @pytest.mark.skipif(not HAS_HLEDGER, reason="hledger/git not installed")
 @pytest.mark.asyncio
 async def test_build_money_brief_reads_books_and_index(db_pool, tmp_path):
-    today = date.today()
+    today = _today()
     cfg = _repo(tmp_path, today, recurring_from=today)
     act = _act(db_pool, cfg)
     # `low_confidence` is a table-wide count with nothing to scope it by, so it
@@ -283,7 +315,7 @@ async def test_money_brief_says_so_when_a_rate_is_missing_instead_of_lying(db_po
 
     Reachable on a fresh books repo, or any week the quote provider is down.
     """
-    today = date.today()
+    today = _today()
     cfg = _repo(tmp_path, today, prices="")
     await books.post_event(
         _ev(amount=Decimal("300"), account="expenses:saas", payee="Shop", payee_key="shop"),
@@ -307,7 +339,7 @@ async def test_money_brief_says_so_when_a_rate_is_missing_instead_of_lying(db_po
 async def test_month_close_says_so_when_a_rate_is_missing(db_pool, tmp_path):
     """Same trap on the close, where `is_rows` and `recurring_total` read the
     same mixed cells."""
-    prev_last = date.today().replace(day=1) - timedelta(days=1)
+    prev_last = _prev_month_last()
     cfg = _repo(tmp_path, prev_last, prices="")
     await books.post_event(
         _ev(amount=Decimal("300"), occurred_on=prev_last, account="expenses:saas", payee="Shop",
@@ -332,7 +364,7 @@ async def test_a_foreign_forecast_marks_the_brief_stale_on_its_own(db_pool, tmp_
     report never sees: a periodic rule bills in a currency nothing has spent
     yet. There is no real transaction here at all, so only the forecast sweep
     can raise the flag."""
-    today = date.today()
+    today = _today()
     cfg = _repo(tmp_path, today, prices="", recurring=(
         f"~ monthly from {today.isoformat()}  Foreign Sub\n"
         "    expenses:saas                 $9.99\n    liabilities:card:axis:1313\n"
@@ -350,7 +382,7 @@ async def test_a_foreign_recurring_charge_marks_the_close_stale_and_counts_as_ze
 ):
     """Same for the close: `recurring_total` is rupees, so a $9.99 rule adds
     nothing to it — and the reader has to be told that is why."""
-    prev_last = date.today().replace(day=1) - timedelta(days=1)
+    prev_last = _prev_month_last()
     cfg = _repo(tmp_path, prev_last, prices="", recurring=(
         f"~ monthly from {prev_last.replace(day=1).isoformat()}  Foreign Sub\n"
         "    expenses:saas                 $9.99\n    liabilities:card:axis:1313\n"
@@ -403,7 +435,7 @@ async def test_month_close_open_dues_leave_out_a_zero_invoice_but_keep_an_unsize
     so a sibling suite's row must not be able to fail this.
     """
     act = _act(db_pool, books.BooksConfig(path=tmp_path / "none"))
-    last = date.today().replace(day=1) - timedelta(days=1)
+    last = _prev_month_last()
     base = await ActivityEnvironment().run(act.build_month_close)
 
     await ji.upsert(db_pool, "brief-t/mz", "brief-t",
@@ -481,7 +513,7 @@ async def test_money_brief_forecast_reaches_the_far_edge_of_the_window(db_pool, 
     """hledger's `--forecast=A..B` excludes B, so the window has to end one day
     past the last day the brief claims to cover — otherwise a charge exactly a
     fortnight out is silently missing from the fortnight's forecast."""
-    today = date.today()
+    today = _today()
     edge = today + timedelta(days=14)
     cfg = _repo(tmp_path, today, recurring_from=edge)
     brief = await ActivityEnvironment().run(_act(db_pool, cfg).build_money_brief, 7)
@@ -495,7 +527,7 @@ async def test_money_brief_counts_commits_the_books_have_not_pushed(db_pool, tmp
     """`unpushed` is the "the journal is only on this box" warning, and its
     default is also 0 — so it is only worth anything if a real un-pushed
     commit shows up as one."""
-    cfg = _repo(tmp_path, date.today())
+    cfg = _repo(tmp_path, _today())
     git = ["git", "-c", "user.name=t", "-c", "user.email=t@t"]
     origin = tmp_path / "origin.git"
     subprocess.run(["git", "init", "--bare", "-q", str(origin)], check=True)
@@ -518,7 +550,7 @@ async def test_build_money_brief_without_books_still_reports_index(db_pool, tmp_
     # unexplained row in the shared `aegis_test_gwN` database.
     baseline = await ActivityEnvironment().run(act.build_money_brief, 7)
     await ji.upsert(db_pool, "brief-t/z", "brief-t",
-                    _ev(kind="due", due_on=date.today(), payee="X", payee_key="x"),
+                    _ev(kind="due", due_on=_today(), payee="X", payee_key="x"),
                     todoist_ref="t")
     brief = await ActivityEnvironment().run(act.build_money_brief, 7)
     assert brief["books_ok"] is False and brief["bal_text"] == ""
@@ -542,7 +574,7 @@ async def test_no_books_config_at_all_degrades_instead_of_crashing(db_pool):
     assert brief["books_ok"] is False and brief["bal_text"] == ""
     close = await ActivityEnvironment().run(act.build_month_close)
     assert close["books_ok"] is False and close["is_text"] == ""
-    assert close["month"] == (date.today().replace(day=1) - timedelta(days=1)).strftime("%Y-%m")
+    assert close["month"] == (_prev_month_last()).strftime("%Y-%m")
 
 
 def test_drop_forecast_duplicates_keeps_a_row_it_cannot_compare():
@@ -648,7 +680,7 @@ async def test_forecast_drops_only_the_obligations_the_books_already_carry(db_po
     Seven rules, three of which the index already accounts for. The four that
     survive are named, not counted: a shorter list is not the claim.
     """
-    today = date.today()
+    today = _today()
     paid = today - timedelta(days=2)
     cfg = _repo(tmp_path, today, recurring="".join(
         f"~ monthly from {when.isoformat()}  {desc}\n"
@@ -728,7 +760,7 @@ async def test_forecast_never_stretches_one_obligation_over_two_predictions(db_p
     ₹5306.46 bill accounts for all of it. `Twin Sub` is TWO charges; one ₹500
     bill accounts for one of them and the other must still be warned about.
     """
-    today = date.today()
+    today = _today()
     cfg = _repo(tmp_path, today, recurring=(
         f"~ monthly from {today.isoformat()}  Split Rule\n"
         "    expenses:saas                 ₹3000.00\n"
@@ -775,7 +807,7 @@ async def test_low_confidence_counts_postings_not_every_uncertain_row(db_pool, t
     await ji.upsert(db_pool, "brief-t/lc-unposted", "brief-t",
                     _ev(payee="Never Posted", payee_key="never posted", **common))
     await ji.upsert(db_pool, "brief-t/lc-due", "brief-t",
-                    _ev(kind="due", due_on=date.today(), payee="A Bill", payee_key="a bill",
+                    _ev(kind="due", due_on=_today(), payee="A Bill", payee_key="a bill",
                         channel="bill", **common))
     # ...and the one that is really a posting.
     await ji.upsert(db_pool, "brief-t/lc-posted", "brief-t",
@@ -795,7 +827,7 @@ async def test_low_confidence_counts_postings_not_every_uncertain_row(db_pool, t
 @pytest.mark.skipif(not HAS_HLEDGER, reason="hledger/git not installed")
 @pytest.mark.asyncio
 async def test_build_month_close(db_pool, tmp_path):
-    today = date.today()
+    today = _today()
     first = today.replace(day=1)
     prev_last = first - timedelta(days=1)
     cfg = _repo(tmp_path, prev_last)
@@ -844,7 +876,7 @@ async def test_month_close_forecast_covers_the_last_day_of_the_month(db_pool, tm
     """Same exclusive-end trap as the brief: a charge on the 31st belongs to
     the month being closed, so the forecast window has to end on the 1st of the
     NEXT month, not on the month's own last day."""
-    prev_last = date.today().replace(day=1) - timedelta(days=1)
+    prev_last = _prev_month_last()
     cfg = _repo(tmp_path, prev_last, recurring_from=prev_last)
     close = await ActivityEnvironment().run(_act(db_pool, cfg).build_month_close)
     assert close["books_ok"] is True
@@ -854,7 +886,7 @@ async def test_month_close_forecast_covers_the_last_day_of_the_month(db_pool, tm
 @pytest.mark.skipif(not HAS_HLEDGER, reason="hledger/git not installed")
 @pytest.mark.asyncio
 async def test_refresh_fx_prices_appends_p_lines(db_pool, tmp_path):
-    cfg = _repo(tmp_path, date.today())
+    cfg = _repo(tmp_path, _today())
     finance = AsyncMock()
     finance.get_quotes = AsyncMock(return_value=[
         {"symbol": "USDINR=X", "price": 84.1},
@@ -866,8 +898,8 @@ async def test_refresh_fx_prices_appends_p_lines(db_pool, tmp_path):
     assert out["written"] == 2 and out["errors"] == ["EURINR=X: timeout"]
     finance.get_quotes.assert_awaited_once_with(["USDINR=X", "GBPINR=X", "EURINR=X"])
     text = (cfg.path / "prices.journal").read_text()
-    assert f"P {date.today().isoformat()} $ ₹84.10\n" in text
-    assert f"P {date.today().isoformat()} £ ₹106.25\n" in text
+    assert f"P {_today().isoformat()} $ ₹84.10\n" in text
+    assert f"P {_today().isoformat()} £ ₹106.25\n" in text
     act_none = _act(db_pool, cfg, finance=None)
     assert (await ActivityEnvironment().run(act_none.refresh_fx_prices)) == {
         "written": 0, "errors": ["disabled"]}
@@ -876,7 +908,7 @@ async def test_refresh_fx_prices_appends_p_lines(db_pool, tmp_path):
 @pytest.mark.skipif(not HAS_HLEDGER, reason="hledger/git not installed")
 @pytest.mark.asyncio
 async def test_refresh_fx_prices_never_raises_when_the_provider_fails(db_pool, tmp_path):
-    cfg = _repo(tmp_path, date.today())
+    cfg = _repo(tmp_path, _today())
     finance = AsyncMock()
     finance.get_quotes = AsyncMock(side_effect=RuntimeError("upstream 503"))
     out = await ActivityEnvironment().run(_act(db_pool, cfg, finance=finance).refresh_fx_prices)
@@ -909,7 +941,7 @@ async def test_refresh_fx_prices_survives_a_books_error_it_was_not_told_about(
     on `.aegis.lock` escapes as a bare `OSError`. The next task calls this as
     best-effort, so it has to come back as a value, not an exception.
     """
-    cfg = _repo(tmp_path, date.today())
+    cfg = _repo(tmp_path, _today())
     finance = AsyncMock()
     finance.get_quotes = AsyncMock(return_value=[{"symbol": "USDINR=X", "price": 84.1}])
     monkeypatch.setattr(
