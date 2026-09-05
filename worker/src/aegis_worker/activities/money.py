@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import csv
 import html as _html
+import io
+import re
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from decimal import Decimal
@@ -73,6 +76,41 @@ def _previous_month_window(today: date) -> tuple[date, date]:
     return period_start, period_end
 
 
+_NUM_RE = re.compile(r"-?[\d,]+(?:\.\d+)?")
+
+
+def parse_hledger_csv(text: str) -> list[list[str]]:
+    """`-O csv` output as rows. Blank lines dropped; nothing else interpreted."""
+    return [row for row in csv.reader(io.StringIO(text)) if row]
+
+
+def amount_from_cell(cell: str) -> Decimal:
+    """"₹ 1,234.56" → Decimal("1234.56"). No number ⇒ Decimal("0").
+
+    hledger writes an empty cell for a period with no activity and a bare "0"
+    for a zeroed total, so "unparseable" here means "nothing happened", not an
+    error. The narrow/non-breaking spaces are stripped first: they are
+    hledger's digit-group separator under some commodity formats, and left in
+    place they end the match after the first group ("1 234.56" → 1).
+    """
+    text = (cell or "").replace("\u00a0", "").replace("\u202f", "")
+    m = _NUM_RE.search(text)
+    return Decimal(m.group(0).replace(",", "")) if m else Decimal("0")
+
+
+def _is_account_cell(cell: str) -> bool:
+    """True when a CSV first column names an account, not a report label.
+
+    hledger's csv carries the report's own rows in the same shape as the
+    account rows — "Total:", "Net:", the `is` report's "Revenues"/"Expenses"
+    headers and its title line. "Total:" contains a colon, so a bare
+    `":" in cell` test lets the grand total through and doubles every entity
+    subtotal; an account name never ends in one (that would be an empty final
+    component), which is what separates the two.
+    """
+    return ":" in cell and not cell.endswith(":")
+
+
 logger = structlog.get_logger()
 
 
@@ -133,6 +171,9 @@ class MoneyActivities:
     mailbox_entities: dict[str, str] = field(default_factory=dict)
     capture: Any = None  # CaptureActivities, for dues (set after construction in __main__)
     home_tz: str = "Asia/Kolkata"
+    # FinanceConnector — keyless FX quotes for the books' price file. None =
+    # no provider wired, and `refresh_fx_prices` reports itself disabled.
+    finance: Any = None
 
     @activity.defn
     async def store_receipt_email(self, msg: dict, account: str) -> str:
@@ -1122,3 +1163,251 @@ class MoneyActivities:
             message=f"<b>Monthly money digest</b>\n{body}",
             log_event="subscription_digest_notify_failed",
         )
+
+    # ------------------------------------------------------------------ books
+
+    # Yahoo's FX pair → the hledger commodity symbol its rate prices.
+    _FX_SYMBOLS = {"USDINR=X": "$", "GBPINR=X": "£", "EURINR=X": "€"}
+
+    @activity.defn
+    async def refresh_fx_prices(self) -> dict:
+        """Weekly P lines from the keyless quote provider (spec §7.2 step 1).
+
+        Never raises: the brief that calls this is worth sending with stale
+        rates, and a quote provider is the least reliable thing in the lane.
+        """
+        if self.finance is None or self.books_cfg is None:
+            return {"written": 0, "errors": ["disabled"]}
+        today = datetime.now(ZoneInfo(self.home_tz)).date().isoformat()
+        lines: list[str] = []
+        errors: list[str] = []
+        try:
+            quotes = await self.finance.get_quotes(list(self._FX_SYMBOLS))
+        except Exception as exc:  # noqa: BLE001 — a dead provider is not a flow failure
+            return {"written": 0, "errors": [f"quotes: {str(exc)[:120]}"]}
+        for q in quotes or []:
+            sym = self._FX_SYMBOLS.get(str(q.get("symbol")))
+            price = q.get("price")
+            if sym and isinstance(price, int | float) and not isinstance(price, bool) and price > 0:
+                lines.append(f"P {today} {sym} ₹{Decimal(str(price)).quantize(Decimal('0.01'))}")
+            else:
+                errors.append(f"{q.get('symbol')}: {q.get('error') or 'no price'}")
+        if lines:
+            try:
+                await books.append_prices(lines, self.books_cfg)
+            except books.BooksError as exc:
+                return {"written": 0, "errors": [*errors, f"books: {str(exc)[:120]}"]}
+        return {"written": len(lines), "errors": errors}
+
+    async def _hl(self, args: list[str], fmt: str = "text") -> str:
+        """One read-only hledger call through the allowlisted runner."""
+        return await books.run_hledger(args, self.books_cfg, output_format=fmt)
+
+    @activity.defn
+    async def build_money_brief(self, days: int = 7) -> dict:
+        """Everything the weekly money brief renders (spec §7.2).
+
+        Two independent sources: hledger over the journal (the record) and the
+        Postgres index (the only place that knows what was never posted). The
+        journal half is wrapped as a unit — with the books unreachable the
+        brief still ships the index half rather than nothing, which is what
+        keeps an unconfigured or mid-clone checkout from silencing the lane.
+        """
+        today = datetime.now(ZoneInfo(self.home_tz)).date()
+        since = today - timedelta(days=days)
+        end = (today + timedelta(days=1)).isoformat()
+        brief: dict = {
+            "as_of": today.isoformat(),
+            "since": since.isoformat(),
+            "books_ok": True,
+            "entities": {
+                "personal": {"income": "0", "expenses": "0"},
+                "hikmah": {"income": "0", "expenses": "0"},
+            },
+            "by_account": [],
+            "top_payees": [],
+            "forecast": [],
+            "bal_text": "",
+            "unpushed": 0,
+        }
+        try:
+            if self.books_cfg is None:
+                raise books.BooksDisabled("books_cfg is not set on MoneyActivities")
+            bal_args = [
+                "bal", "-X", "₹", "-b", since.isoformat(), "-e", end,
+                "income", "expenses", "--depth", "2",
+            ]
+            rows = parse_hledger_csv(await self._hl(bal_args, "csv"))
+            for row in rows[1:]:
+                if len(row) < 2 or not _is_account_cell(row[0]):
+                    continue
+                account, balance = row[0], row[1]
+                ent = (
+                    "hikmah"
+                    if account.startswith(("expenses:hikmah", "income:hikmah"))
+                    else "personal"
+                )
+                side = "income" if account.startswith("income") else "expenses"
+                brief["entities"][ent][side] = str(
+                    Decimal(brief["entities"][ent][side]) + amount_from_cell(balance)
+                )
+                brief["by_account"].append({"account": account, "balance": balance})
+            payees = parse_hledger_csv(await self._hl([
+                "bal", "-X", "₹", "-b", since.isoformat(), "-e", end,
+                "expenses", "--pivot", "payee", "--flat", "--sort-amount",
+            ], "csv"))
+            brief["top_payees"] = [
+                {"payee": r[0], "amount": r[1]}
+                for r in payees[1:]
+                if len(r) >= 2 and r[0].lower() != "total:"
+            ][:10]
+            # `--forecast=A..B` excludes B, so the window ends the day AFTER the
+            # last day the brief covers — otherwise a charge exactly a
+            # fortnight out is missing from the fortnight it is meant to warn
+            # about.
+            fc = parse_hledger_csv(await self._hl([
+                "reg", "-X", "₹",
+                f"--forecast={today.isoformat()}..{(today + timedelta(days=15)).isoformat()}",
+                "-b", today.isoformat(), "-e", (today + timedelta(days=15)).isoformat(),
+                "expenses", "tag:generated-transaction",
+            ], "csv"))
+            # reg -O csv: txnidx, date, code, description, account, amount, total
+            brief["forecast"] = [
+                {"date": r[1], "description": r[3], "amount": r[5]} for r in fc[1:] if len(r) >= 6
+            ]
+            brief["bal_text"] = await self._hl(bal_args)
+            brief["unpushed"] = await books.unpushed_commits(self.books_cfg)
+        except books.BooksError as exc:
+            logger.warning("money_brief_books_unavailable", error=str(exc)[:200])
+            brief["books_ok"] = False
+            brief["bal_text"] = ""
+        unknowns = await self.db_pool.fetch(
+            "SELECT message_id, payee, amount, currency, occurred_on, channel "
+            "FROM finance.journal_index "
+            "WHERE kind = 'transaction' AND account LIKE '%:unknown' AND occurred_on >= $1 "
+            "ORDER BY amount DESC NULLS LAST LIMIT 15",
+            since,
+        )
+        brief["unknowns"] = [
+            {
+                "msgid": r["message_id"], "payee": r["payee"], "amount": str(r["amount"]),
+                "currency": r["currency"], "occurred_on": r["occurred_on"].isoformat(),
+                "channel": r["channel"],
+            }
+            for r in unknowns
+        ]
+        brief["large_unexplained"] = [
+            u for u in brief["unknowns"]
+            if u["currency"] == "INR" and Decimal(u["amount"]) >= 5000
+        ]
+        dues = await self.db_pool.fetch(
+            "SELECT message_id, payee, amount, currency, due_on, kind, todoist_ref "
+            "FROM finance.journal_index "
+            "WHERE kind IN ('due','failed') AND linked_message_id IS NULL "
+            "  AND due_on BETWEEN $1 AND $2 ORDER BY due_on",
+            today - timedelta(days=7), today + timedelta(days=14),
+        )
+        brief["dues"] = [
+            {
+                "msgid": r["message_id"], "payee": r["payee"], "amount": str(r["amount"]),
+                "currency": r["currency"], "due_on": r["due_on"].isoformat(), "kind": r["kind"],
+                "todoist_ref": r["todoist_ref"],
+            }
+            for r in dues
+        ]
+        closed = await self.db_pool.fetch(
+            "SELECT message_id, payee, amount, currency, due_on FROM finance.journal_index "
+            "WHERE kind IN ('due','failed') AND linked_message_id IS NOT NULL "
+            "  AND updated_at >= $1 ORDER BY due_on",
+            since,
+        )
+        brief["closed_dues"] = [
+            {
+                "msgid": r["message_id"], "payee": r["payee"], "amount": str(r["amount"]),
+                "currency": r["currency"],
+                "due_on": r["due_on"].isoformat() if r["due_on"] else None,
+            }
+            for r in closed
+        ]
+        brief["low_confidence"] = int(await self.db_pool.fetchval(
+            "SELECT count(*) FROM finance.journal_index "
+            "WHERE parser = 'llm' AND confidence < 0.8 AND created_at >= $1",
+            since,
+        ))
+        return brief
+
+    @activity.defn
+    async def build_month_close(self) -> dict:
+        """The previous calendar month's close (spec §7.3).
+
+        The window is computed here rather than borrowed: the month being
+        closed is the one BEFORE today's, and the income statement carries the
+        month before that as its comparison column.
+        """
+        today = datetime.now(ZoneInfo(self.home_tz)).date()
+        this_first = today.replace(day=1)
+        last = this_first - timedelta(days=1)
+        month_first = last.replace(day=1)
+        prev_first = (month_first - timedelta(days=1)).replace(day=1)
+        close: dict = {
+            "month": last.strftime("%Y-%m"),
+            "books_ok": True,
+            "is_text": "",
+            "bs_text": "",
+            "is_rows": [],
+            "recurring_total": "0",
+        }
+        try:
+            if self.books_cfg is None:
+                raise books.BooksDisabled("books_cfg is not set on MoneyActivities")
+            is_args = [
+                "is", "-X", "₹", "-M", "-b", prev_first.isoformat(), "-e", this_first.isoformat(),
+                "--depth", "2",
+            ]
+            close["is_text"] = await self._hl(is_args)
+            close["bs_text"] = await self._hl([
+                "bs", "-X", "₹", "-e", this_first.isoformat(), "--depth", "2",
+            ])
+            rows = parse_hledger_csv(await self._hl(is_args, "csv"))
+            # is -M -O csv: a title line, then Account/<month>/<month>, then the
+            # account rows interleaved with Revenues/Expenses/Total:/Net: labels.
+            close["is_rows"] = [
+                {"account": r[0], "prev": r[1], "month": r[2]}
+                for r in rows
+                if len(r) >= 3 and _is_account_cell(r[0])
+            ]
+            # Exclusive end again: `..this_first` is what covers the month's
+            # own last day, which is exactly when a month-end charge lands.
+            fc = parse_hledger_csv(await self._hl([
+                "bal", "-X", "₹",
+                f"--forecast={month_first.isoformat()}..{this_first.isoformat()}",
+                "-b", month_first.isoformat(), "-e", this_first.isoformat(),
+                "expenses", "tag:generated-transaction", "--depth", "1",
+            ], "csv"))
+            total = sum(
+                (amount_from_cell(r[1]) for r in fc[1:] if len(r) >= 2 and r[0].lower() != "total:"),
+                Decimal("0"),
+            )
+            close["recurring_total"] = str(total.quantize(Decimal("0.01")))
+        except books.BooksError as exc:
+            logger.warning("month_close_books_unavailable", error=str(exc)[:200])
+            close["books_ok"] = False
+        close["unknown_count"] = int(await self.db_pool.fetchval(
+            "SELECT count(*) FROM finance.journal_index "
+            "WHERE kind = 'transaction' AND account LIKE '%:unknown' "
+            "  AND occurred_on BETWEEN $1 AND $2",
+            month_first, last,
+        ))
+        close["dues_paid"] = int(await self.db_pool.fetchval(
+            "SELECT count(*) FROM finance.journal_index "
+            "WHERE kind IN ('due','failed') AND linked_message_id IS NOT NULL "
+            "  AND due_on BETWEEN $1 AND $2",
+            month_first, last,
+        ))
+        close["dues_open"] = int(await self.db_pool.fetchval(
+            "SELECT count(*) FROM finance.journal_index "
+            "WHERE kind IN ('due','failed') AND linked_message_id IS NULL "
+            "  AND due_on BETWEEN $1 AND $2",
+            month_first, last,
+        ))
+        return close

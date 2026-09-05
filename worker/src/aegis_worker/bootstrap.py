@@ -247,6 +247,21 @@ async def bootstrap(settings: Settings | None = None) -> WorkerDeps:
 
     _register_connector(connectors, connector_errors, "social", _social)
 
+    # Finance — keyless market data. Core builds one too (api/app.py); the
+    # worker needs its own because `MoneyActivities.refresh_fx_prices` writes
+    # the books' price file, and without a connector here every non-INR amount
+    # in the money brief would silently stay unconverted.
+    def _finance() -> Any:
+        from aegis.connectors.finance import FinanceConnector
+
+        return FinanceConnector(
+            provider=getattr(settings, "finance_provider", "yahoo"),
+            indices=getattr(settings, "finance_indices", ""),
+            db_pool=pool,
+        )
+
+    _register_connector(connectors, connector_errors, "finance", _finance)
+
     import httpx
 
     http_client = httpx.AsyncClient(

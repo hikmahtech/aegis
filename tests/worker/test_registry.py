@@ -289,7 +289,11 @@ def test_module_workflows_is_the_unflagged_registry():
         # `store_money_result` are on the money-flagged MoneyActivities, so
         # they move only the money=True row. Hence +6/+3/+3. No new flow —
         # MoneyProcessFlow already exists and these are its new steps.
-        (True, True, 42, 217),
+        # Then +3 activities and NO new flow from the money brief / month close
+        # data layer (`refresh_fx_prices`, `build_money_brief`,
+        # `build_month_close`). All three are on the money-flagged
+        # MoneyActivities, so only the money=True row moves: +3/+0/+0.
+        (True, True, 42, 220),
         (False, False, 34, 183),
         (True, False, 38, 202),
     ],

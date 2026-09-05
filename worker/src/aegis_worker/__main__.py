@@ -263,6 +263,7 @@ async def main():
             books_cfg=config_from_settings(settings),
             ignored_mailboxes=parse_csv_set(getattr(settings, "books_ignored_mailboxes", "")),
             mailbox_entities=parse_kv(getattr(settings, "books_mailbox_entities", "")),
+            finance=connectors.get("finance"),
         )
 
     channel_act = ChannelActivities(db_pool=deps.pool)
