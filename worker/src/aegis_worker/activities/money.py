@@ -14,7 +14,7 @@ import structlog
 from aegis.api.models.money import MoneyEvent, payee_key
 from aegis.services import books
 from aegis.services import journal_index as ji
-from aegis.services.bank_parsers import is_autopay, parse_any
+from aegis.services.bank_parsers import has_money_shape, is_autopay, parse_any
 from aegis.services.books import UNKNOWN, account_for, instrument_account
 from aegis.services.fx import to_monthly_home
 from aegis.services.money_format import fmt_money
@@ -315,6 +315,22 @@ class MoneyActivities:
         sender, subject = receipt.get("sender", ""), receipt.get("subject", "")
         body = receipt.get("body_plain") or ""
         ev = parse_any(sender, subject, body)
+        if ev is None and not has_money_shape(f"{subject}\n{body}"):
+            # No currency token anywhere, so there is no amount to extract and
+            # the extraction is pure cost. This is the budget guard: 324 money
+            # extractions burned 522,846 tokens on 2026-09-05 and tripped the
+            # governor's kill switch, which blocks EVERY LLM call in AEGIS —
+            # email triage included. Most of that was spent on mail triage
+            # correctly tags `financial` but which holds no transaction: NSE
+            # and BSE alerts, GST portal notices, Groww digests, KDP royalty
+            # reports, newsletters. Indexed as `info` so the row is still a
+            # record and still stamps version 2 rather than re-sweeping.
+            activity.logger.info(
+                "parse_money_skipped_no_amount sender=%s subject=%s", sender, subject[:80]
+            )
+            return MoneyEvent(kind="info", parser="no_amount", confidence=1.0).model_dump(
+                mode="json"
+            )
         if ev is None:
             system_prompt = None
             if self.agent_id:
