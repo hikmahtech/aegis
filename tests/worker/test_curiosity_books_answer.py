@@ -14,6 +14,7 @@ does reach the write.
 
 from __future__ import annotations
 
+import inspect
 import shutil
 import subprocess
 from datetime import date
@@ -27,6 +28,7 @@ from aegis.api.models.money import MoneyEvent, payee_key
 from aegis.services import books
 from aegis.services import journal_index as ji
 from aegis_worker.activities.curiosity import CuriosityActivities
+from aegis_worker.activities.delivery import DeliveryActivities
 from temporalio.testing import ActivityEnvironment
 
 HAS_HLEDGER = shutil.which("hledger") is not None and shutil.which("git") is not None
@@ -228,8 +230,42 @@ def _meta(**over) -> dict:
     return meta
 
 
-async def _apply(pool, cfg, llm, meta=None, answer="that's my grocer"):
-    acts = CuriosityActivities(db_pool=pool, llm_client=llm, model="m", books_cfg=cfg)
+class FakeDelivery:
+    """Stand-in for DeliveryActivities as `safe_send_message` uses it.
+
+    `test_fake_delivery_matches_the_real_class` pins this against the real
+    class so the fake cannot drift into testing nothing.
+    """
+
+    channel = "slack"
+    db_pool = None  # skips the notification-budget path in safe_send_message
+
+    def __init__(self):
+        self.sent: list[str] = []
+
+    async def send_message(self, *, agent_id: str, message: str, chat_id: int = 0) -> dict:
+        self.sent.append(message)
+        return {"ok": True}
+
+
+def test_fake_delivery_matches_the_real_class():
+    """The fake must expose what safe_send_message actually reads off the real
+    DeliveryActivities: a `channel` attribute, a `db_pool` attribute and a
+    keyword-only send_message(agent_id, message, chat_id)."""
+    real = inspect.signature(DeliveryActivities.send_message).parameters
+    fake = inspect.signature(FakeDelivery.send_message).parameters
+    for name in ("agent_id", "message", "chat_id"):
+        assert name in real, f"DeliveryActivities.send_message lost {name}"
+        assert name in fake, f"FakeDelivery.send_message lost {name}"
+    fields = set(DeliveryActivities.__dataclass_fields__)
+    assert {"channel", "db_pool"} <= fields
+    assert hasattr(FakeDelivery, "channel") and hasattr(FakeDelivery, "db_pool")
+
+
+async def _apply(pool, cfg, llm, meta=None, answer="that's my grocer", delivery=None):
+    acts = CuriosityActivities(
+        db_pool=pool, llm_client=llm, model="m", books_cfg=cfg, delivery=delivery
+    )
     iid = await _card(pool)
     return await ActivityEnvironment().run(
         acts.apply_curiosity_answer, iid, {"value": answer}, meta or _meta()
@@ -270,10 +306,14 @@ async def test_confident_answer_writes_a_rule_and_reclassifies_the_backlog(clean
     assert len(rules) == 1, rules
     assert rules[0]["account"] == "expenses:groceries"
     assert rules[0]["payee"] == PAYEE
+    # The card asked about money going out, so the rule says so (issue #396):
+    # a later credit from this name must not be filed to an expense account.
+    assert rules[0]["direction"] == "out"
+    assert books.apply_rules(rules, "", PAYEE, direction="in") is None
     # The account states which set of books it belongs to, so the rule says so
     # too — see `test_a_business_account_never_rewrites_the_personal_books`.
     assert rules[0]["entity"] == "personal"
-    assert books.apply_rules(rules, "alerts@hdfcbank.net", PAYEE) == rules[0]
+    assert books.apply_rules(rules, "alerts@hdfcbank.net", PAYEE, direction="out") == rules[0]
 
     # The journal block itself moved — this is the record, not the index.
     text = _journal(cfg)
@@ -714,6 +754,79 @@ async def test_a_credit_from_the_same_payee_is_left_alone(clean_db, tmp_path):
     assert await _account_of(clean_db, refund) == "income:unknown"
 
 
+async def test_an_inbound_answer_files_the_credit_and_leaves_the_debit(clean_db, tmp_path):
+    """The mirror of the test above, and the half that used to be unreachable.
+
+    Money that came in is now carded as money that came in (issue #387
+    review), so the hook has to sweep the half the card actually asked about.
+    The `direction` in the card's metadata is the only thing that says which —
+    without it this would file a credit to an expense account, which is money
+    in the wrong half of the books.
+    """
+    cfg = _repo(tmp_path)
+    _declare(cfg, "income:people")
+    paid = await _post(clean_db, cfg)
+    received = await _post(clean_db, cfg, day=6)
+    await clean_db.execute(
+        "UPDATE finance.journal_index SET direction = 'in', account = 'income:unknown' "
+        "WHERE message_id = $1",
+        received,
+    )
+    llm = FakeLLM('{"account": "income:people", "confidence": 0.9}')
+
+    out = await _apply(clean_db, cfg, llm, meta=_meta(direction="in"))
+
+    assert out["rule"] == "income:people"
+    assert out["reclassified"] == 1
+    assert await _account_of(clean_db, received) == "income:people"
+    # The debit from the same name is not what the owner explained.
+    assert await _account_of(clean_db, paid) == "expenses:unknown"
+
+    # ...and neither is the NEXT one (issue #396). The rule carries the
+    # direction the card asked about, so a later payment TO this name is not
+    # filed into the income account the owner picked for a credit — which
+    # would balance, pass `check --strict`, never be `%:unknown`, and so
+    # never reach the Unexplained list or the detector again. Prod's three
+    # inbound candidates are person-to-person UPI names: exactly the payees
+    # who move money both ways.
+    rules = _rules(cfg)
+    assert rules[0]["direction"] == "in", rules[0]
+    assert books.apply_rules(rules, "", PAYEE, direction="in") == rules[0]
+    assert books.apply_rules(rules, "", PAYEE, direction="out") is None
+    # The prompt told the model which way the money went, or it would be
+    # picking an account for a payment that never happened.
+    blob = f"{llm.calls[0]['prompt']}\n{llm.calls[0].get('system_prompt') or ''}"
+    assert "money the owner received" in blob, blob
+
+
+async def test_a_card_with_no_direction_is_treated_as_money_going_out(clean_db, tmp_path):
+    """Every card raised before the inbound lane shipped carries no
+    `direction`, and every one of them was outbound. Anything unrecognised
+    takes the same road — the income half is never reached by a guess.
+
+    A repo and a payee of its own per case: the backlog sweep selects across
+    the whole index by `payee_key`, so a shared payee would have each run
+    trying to rewrite the previous run's blocks in a repo that does not hold
+    them.
+    """
+    for i, value in enumerate((None, "", "sideways")):
+        cfg = _repo(tmp_path / f"d{i}")
+        payee = f"Zzt5dir{i} Shop"
+        msgid = await _post(clean_db, cfg, payee=payee)
+        llm = FakeLLM('{"account": "expenses:groceries", "confidence": 0.9}')
+        meta = _meta(subject=payee, payee_key=payee_key(payee))
+        if value is not None:
+            meta["direction"] = value
+
+        out = await _apply(clean_db, cfg, llm, meta=meta)
+
+        assert out["reclassified"] == 1, value
+        assert await _account_of(clean_db, msgid) == "expenses:groceries", value
+        blob = f"{llm.calls[0]['prompt']}\n{llm.calls[0].get('system_prompt') or ''}"
+        assert "a payment the owner made" in blob, value
+        assert "money the owner received" not in blob, value
+
+
 async def test_a_rule_from_an_answer_never_fires_on_the_sender(clean_db, tmp_path):
     """`apply_rules` matches "<sender> | <payee>", and this is the only place a
     rule is written with no human authoring the regex — so the pattern it
@@ -725,9 +838,11 @@ async def test_a_rule_from_an_answer_never_fires_on_the_sender(clean_db, tmp_pat
     await _apply(clean_db, cfg, llm)
 
     rules = _rules(cfg)
-    assert books.apply_rules(rules, "", PAYEE) == rules[0]
+    assert books.apply_rules(rules, "", PAYEE, direction="out") == rules[0]
     # A mail whose FROM happens to carry the payee's words, about someone else.
-    assert books.apply_rules(rules, f"{KEY.replace(' ', '-')}@bank.example", "Mahavitaran") is None
+    assert books.apply_rules(
+        rules, f"{KEY.replace(' ', '-')}@bank.example", "Mahavitaran", direction="out"
+    ) is None
 
 
 async def test_a_payee_spelling_variant_matches_the_rule(clean_db, tmp_path):
@@ -743,5 +858,167 @@ async def test_a_payee_spelling_variant_matches_the_rule(clean_db, tmp_path):
 
     rules = _rules(cfg)
     for variant in (PAYEE, PAYEE.upper(), "JAI-SHREE-ZZT5NAKODA", "Jai  Shree  Zzt5nakoda"):
-        assert books.apply_rules(rules, "", variant) == rules[0], variant
-    assert books.apply_rules(rules, "", "Some Other Shop") is None
+        assert books.apply_rules(rules, "", variant, direction="out") == rules[0], variant
+    assert books.apply_rules(rules, "", "Some Other Shop", direction="out") is None
+
+
+# ------------------------------------------- what the owner is told (issue #384)
+
+
+async def test_a_cross_entity_answer_says_what_it_left_behind(clean_db, tmp_path):
+    """The refusal above is correct and was invisible (issue #384).
+
+    `InteractionFlow` discards the post-resolve activity's return value and
+    the card is an ABANDONED child nobody awaits, so nothing carried
+    `reclassified: 0` anywhere a person could see it. The owner answered "that
+    is the Hikmah infra bill" and watched nothing happen — and no automated
+    path could recover: the novelty key retires the card, `ledger_reclassify`
+    refuses the same move by design, and the brief's Unexplained list is a
+    7-day window.
+    """
+    cfg = _repo(tmp_path)
+    _declare(cfg, "expenses:hikmah:infra")
+    await _post(clean_db, cfg)  # entity=personal
+    delivery = FakeDelivery()
+    llm = FakeLLM('{"account": "expenses:hikmah:infra", "confidence": 0.95}')
+
+    out = await _apply(clean_db, cfg, llm, delivery=delivery)
+
+    assert out["reclassified"] == 0 and out["skipped_other_entity"] == 1
+    assert len(delivery.sent) == 1, delivery.sent
+    said = delivery.sent[0]
+    assert PAYEE in said and "expenses:hikmah:infra" in said
+    # The three things the owner needs: the rule stands, one posting did not
+    # move, and only a person can move it.
+    #
+    # Asserted PAST the noun, deliberately. "1 existing posting" alone stops
+    # one word short of the verb and passes on "1 existing posting sit in the
+    # other set of books" — which is what this file asserted, in the same
+    # commit as the fix for "1 low-confidence LLM postings".
+    assert "1 existing posting sits in the other set of books" in said, said
+    assert "rule is saved" in said and "hand edit" in said, said
+
+
+async def test_an_answer_that_lands_completely_says_nothing(clean_db, tmp_path):
+    """Silence is the success signal. The payee leaves the Unexplained list in
+    the next brief and the card is resolved in the admin, so an extra push per
+    answered question would spend the notification budget on nothing."""
+    cfg = _repo(tmp_path)
+    await _post(clean_db, cfg)
+    delivery = FakeDelivery()
+    llm = FakeLLM('{"account": "expenses:groceries", "confidence": 0.9}')
+
+    out = await _apply(clean_db, cfg, llm, delivery=delivery)
+
+    assert out["reclassified"] == 1 and out["skipped_other_entity"] == 0
+    assert delivery.sent == []
+
+
+async def test_an_answer_the_model_could_not_file_is_reported(clean_db, tmp_path):
+    """Every refusal in this hook was equally silent, not only the
+    cross-entity one: an undeclared account, an unsure model and an
+    unreachable checkout all returned a dict nobody read."""
+    # The loop index, not `hash(response)`: `hash()` on a str is per-process
+    # randomised, so two of the three could collide and `_repo`'s
+    # `mkdir(parents=True)` would raise on an existing directory.
+    for i, (response, phrase) in enumerate((
+        ('{"account": "expenses:snacks", "confidence": 1.0}', "an account in the chart"),
+        ('{"account": "expenses:groceries", "confidence": 0.4}', "not sure enough"),
+        ('{"account": "NONE", "confidence": 1.0}', "an account in the chart"),
+    )):
+        cfg = _repo(tmp_path / f"r{i}")
+        await _post(clean_db, cfg)
+        delivery = FakeDelivery()
+
+        out = await _apply(clean_db, cfg, FakeLLM(response), delivery=delivery)
+
+        assert out["rule"] is None, response
+        assert len(delivery.sent) == 1, (response, delivery.sent)
+        assert phrase in delivery.sent[0], (response, delivery.sent[0])
+        # The answer is not lost, and the message says so.
+        assert "saved" in delivery.sent[0]
+
+
+async def test_a_refused_rule_that_moved_the_backlog_says_both_halves(clean_db, tmp_path):
+    """The backlog moved but nothing was persisted, so future mail from this
+    payee still lands in `:unknown`. Only this message can tell the owner
+    that."""
+    cfg = _repo(tmp_path)
+    await _post(clean_db, cfg, payee=LONG_PAYEE)
+    delivery = FakeDelivery()
+    llm = FakeLLM('{"account": "expenses:groceries", "confidence": 0.9}')
+
+    out = await _apply(
+        clean_db, cfg, llm,
+        meta=_meta(subject=LONG_PAYEE, payee_key=payee_key(LONG_PAYEE)),
+        delivery=delivery,
+    )
+
+    assert out["reason"] == "rule_refused_backlog_applied" and out["reclassified"] == 1
+    assert len(delivery.sent) == 1, delivery.sent
+    assert "1 existing posting" in delivery.sent[0], delivery.sent[0]
+    assert "no rule" in delivery.sent[0].lower(), delivery.sent[0]
+
+
+async def test_a_dead_delivery_never_costs_the_answer(clean_db, tmp_path):
+    """`safe_send_message` swallows everything, and the hook must too: the
+    memory, the rule and the reclassification are all already done by the time
+    this runs, so a comms outage costs the message and nothing else."""
+    class Exploding(FakeDelivery):
+        async def send_message(self, **kwargs):
+            raise RuntimeError("comms is down")
+
+    cfg = _repo(tmp_path)
+    _declare(cfg, "expenses:hikmah:infra")
+    msgid = await _post(clean_db, cfg)
+    llm = FakeLLM('{"account": "expenses:hikmah:infra", "confidence": 0.95}')
+
+    out = await _apply(clean_db, cfg, llm, delivery=Exploding())
+
+    assert out["rule"] == "expenses:hikmah:infra"
+    assert out["skipped_other_entity"] == 1
+    assert await _account_of(clean_db, msgid) == "expenses:unknown"
+    assert len(await _memories(clean_db)) == 1
+
+
+async def test_no_delivery_wired_still_answers_and_never_raises(clean_db, tmp_path):
+    """A fork with no comms server, and the default in every existing test."""
+    cfg = _repo(tmp_path)
+    _declare(cfg, "expenses:hikmah:infra")
+    await _post(clean_db, cfg)
+    llm = FakeLLM('{"account": "expenses:hikmah:infra", "confidence": 0.95}')
+
+    out = await _apply(clean_db, cfg, llm, delivery=None)
+
+    assert out["rule"] == "expenses:hikmah:infra" and out["skipped_other_entity"] == 1
+
+
+def test_the_report_agrees_with_itself_on_number():
+    """Noun AND verb, both ways.
+
+    `books_answer_report` is pure, so the plural side needs no fixture — which
+    matters, because reaching it through the books would take two postings in
+    the other set of books, and the SINGULAR is the case that shipped wrong.
+    """
+    from aegis_worker.activities.curiosity import books_answer_report
+
+    one = books_answer_report(PAYEE, {"rule": "expenses:hikmah:infra", "skipped_other_entity": 1})
+    assert "1 existing posting sits in the other set of books" in one, one
+    assert "postings" not in one and " sit " not in one, one
+
+    two = books_answer_report(PAYEE, {"rule": "expenses:hikmah:infra", "skipped_other_entity": 2})
+    assert "2 existing postings sit in the other set of books" in two, two
+
+    # The other counted nouns the same sentence-builder writes.
+    assert "1 posting could not be rewritten" in books_answer_report(
+        PAYEE, {"rule": "expenses:groceries", "failed": 1}
+    )
+    assert "2 postings could not be rewritten" in books_answer_report(
+        PAYEE, {"rule": "expenses:groceries", "failed": 2}
+    )
+    assert "1 existing posting still moved" in books_answer_report(
+        PAYEE, {"rule": None, "reason": "rule_refused_backlog_applied", "reclassified": 1}
+    )
+    assert "2 existing postings still moved" in books_answer_report(
+        PAYEE, {"rule": None, "reason": "rule_refused_backlog_applied", "reclassified": 2}
+    )

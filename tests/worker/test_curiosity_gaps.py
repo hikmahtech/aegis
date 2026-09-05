@@ -72,12 +72,12 @@ async def _wipe(conn):
 async def _add_unknown(
     pool,
     payee: str,
-    amount: float = 900.0,
+    amount: float | None = 900.0,
     *,
-    currency: str = "INR",
+    currency: str | None = "INR",
     account: str = "expenses:unknown",
     days_ago: int = 1,
-    direction: str = "out",
+    direction: str | None = "out",
 ):
     """One payment the books could not categorise — what the detector reads."""
     await pool.execute(
@@ -88,7 +88,7 @@ async def _add_unknown(
         " 'test', 'bank', 'personal/2026.journal')",
         f"{MAILBOX}/{uuid4()}",
         MAILBOX,
-        Decimal(str(amount)),
+        None if amount is None else Decimal(str(amount)),
         currency,
         payee,
         payee_key(payee),
@@ -154,20 +154,97 @@ async def test_variants_group_by_payee_key(clean_db):
 
     assert [c["novelty_key"] for c in out] == ["payee:jai shree nakoda"]
     assert out[0]["evidence"]["n"] == 2
-    assert out[0]["evidence"]["total"] == pytest.approx(6000.0)
+    assert out[0]["evidence"]["totals"] == {"INR": pytest.approx(6000.0)}
     assert "\u20b96,000.00" in out[0]["question"], out[0]["question"]
 
 
-async def test_non_inr_rows_are_ignored(clean_db):
-    """The question renders one currency and sums one column; folding GBP into
-    an INR total would state a number that is simply false.
-
-    Every one of these three exclusion tests seeds a control row the detector
-    MUST return. Without it, a detector that blew up, matched nothing at all
-    or was never wired in would pass the exclusion assertion for entirely the
-    wrong reason — an empty list is not evidence of a filter.
+async def test_a_foreign_payment_is_carded_in_its_own_currency(clean_db):
+    """A `currency = 'INR'` filter meant an unexplained foreign payment was
+    never carded, so it was never ruled, so it stayed in `:unknown` for good
+    (issue #387). `fmt_money` renders any currency; only the SUM had to be
+    kept inside one.
     """
-    await _add_unknown(clean_db, "Sterling Shop", 6000.0, currency="GBP")
+    await _add_unknown(clean_db, "Sterling Shop", 500.0, currency="GBP")
+    await _add_unknown(clean_db, "Rupee Shop", 400.0)
+
+    out = await _run(clean_db)
+
+    assert [c["subject"] for c in out] == ["Sterling Shop", "Rupee Shop"]
+    assert "£500.00" in out[0]["question"], out[0]["question"]
+    assert out[0]["novelty_key"] == "payee:sterling shop"
+    assert out[0]["evidence"]["totals"] == {"GBP": pytest.approx(500.0)}
+
+
+async def test_two_currencies_for_one_payee_are_never_added_together(clean_db):
+    """One payee, one card — the novelty key is the payee and the rule the
+    answer writes is per payee, so splitting the card per currency would ask
+    twice and let the second question suppress itself.
+
+    The AMOUNTS stay apart: ₹1,000 and $50 is not ₹1,050 and not $1,050, and
+    there is no number that is both.
+    """
+    await _add_unknown(clean_db, "Two Ways", 1000.0)
+    await _add_unknown(clean_db, "Two Ways", 50.0, currency="USD")
+
+    out = await _run(clean_db)
+
+    assert [c["novelty_key"] for c in out] == ["payee:two ways"]
+    question = out[0]["question"]
+    assert "₹1,000.00" in question and "$50.00" in question, question
+    for wrong in ("₹1,050.00", "$1,050.00", "1050"):
+        assert wrong not in question, (wrong, question)
+    assert out[0]["evidence"]["totals"] == {
+        "INR": pytest.approx(1000.0), "USD": pytest.approx(50.0)
+    }
+    assert out[0]["evidence"]["n"] == 2
+
+
+async def test_a_foreign_payment_outranks_a_bigger_rupee_number_once_converted(
+    clean_db, tmp_path
+):
+    """$200 is ₹18,000 at the rate the lane's own `prices.journal` carries, so
+    ranking on the raw number would put a ₹5,000 shop first every time and
+    bury every dollar row behind the whole rupee backlog — one card a day, and
+    a novelty key that retires a payee permanently.
+
+    Converted for RANKING only; the question still says $200.00.
+    """
+    from aegis.services import books
+
+    (tmp_path / "prices.journal").write_text("P 2026-09-05 $ ₹90.00\n")
+    await _add_unknown(clean_db, "Dollar Vendor", 200.0, currency="USD")
+    await _add_unknown(clean_db, "Rupee Shop", 5000.0)
+
+    ranked = await _run(clean_db, books_cfg=books.BooksConfig(path=tmp_path))
+
+    assert [c["subject"] for c in ranked] == ["Dollar Vendor", "Rupee Shop"]
+    assert "$200.00" in ranked[0]["question"] and "18,000" not in ranked[0]["question"]
+
+    # With no rate to convert by, the foreign row ranks at its own magnitude —
+    # understating it, which is the documented fallback and still cards it.
+    unranked = await _run(clean_db, books_cfg=books.BooksConfig(path=tmp_path / "gone"))
+    assert [c["subject"] for c in unranked] == ["Rupee Shop", "Dollar Vendor"]
+
+
+async def test_a_payment_with_no_amount_is_not_a_question_about_zero(clean_db):
+    """`journal_index.amount` is nullable, `sum()` over NULLs is NULL, and the
+    old detector turned that into "You paid ₹0.00 to HDFC Bank … What was it
+    for?" — live, on 2026-09-05, for four rows across two payees. A payment
+    with no number is not a cost signal and not a question.
+    """
+    await _add_unknown(clean_db, "Sizeless Bank", None)
+    await _add_unknown(clean_db, "Rupee Shop", 500.0)
+
+    out = await _run(clean_db)
+
+    assert [c["subject"] for c in out] == ["Rupee Shop"]
+
+
+async def test_a_payment_with_no_currency_is_not_rendered_as_rupees(clean_db):
+    """`journal_index.currency` is nullable too. Rendering such a row costs a
+    guess about which currency it is, and guessing "the home one" is exactly
+    the assumption issue #387 exists to remove."""
+    await _add_unknown(clean_db, "Currencyless Shop", 9000.0, currency=None)
     await _add_unknown(clean_db, "Rupee Shop", 500.0)
 
     out = await _run(clean_db)
@@ -186,13 +263,15 @@ async def test_rows_older_than_the_window_are_ignored(clean_db):
     assert [c["subject"] for c in out] == ["Fresh Shop"]
 
 
-async def test_money_that_came_in_is_never_carded_as_money_you_paid(clean_db):
-    """`income:unknown` matches `%:unknown` too, and the card says "You paid".
+async def test_money_that_came_in_is_carded_as_money_that_came_in(clean_db):
+    """"You paid ₹42,000.00 to Nkgsb Bank … What was it for?" is false, on the
+    one surface allowed to interrupt the owner, and it steers the
+    account-picking model toward an expense account for money that came IN.
 
-    An uncategorised inbound credit would produce "You paid ₹42,000.00 to
-    Nkgsb Bank … What was it for?" — false, on the one surface allowed to
-    interrupt the owner, and it steers the account-picking model toward an
-    expense account for money that came IN.
+    The answer is to say the true thing, not to skip the money (issue #387
+    review): uncategorised income is worth asking about for exactly the reason
+    uncategorised spend is, and on 2026-09-05 every foreign unknown in the live
+    index was inbound.
     """
     await _add_unknown(
         clean_db, "Nkgsb Bank", 42000.0, account="income:unknown", direction="in"
@@ -201,7 +280,46 @@ async def test_money_that_came_in_is_never_carded_as_money_you_paid(clean_db):
 
     out = await _run(clean_db)
 
-    assert [c["subject"] for c in out] == ["Queued Shop"]
+    assert [c["subject"] for c in out] == ["Nkgsb Bank", "Queued Shop"]
+    inbound = out[0]["question"]
+    assert "You received ₹42,000.00 from Nkgsb Bank" in inbound, inbound
+    assert "You paid" not in inbound and "What was it for?" not in inbound, inbound
+    assert out[0]["evidence"]["direction"] == "in"
+    # Its own novelty key, so the outbound question about the same name is
+    # still available and neither suppresses the other.
+    assert out[0]["novelty_key"] == "payee-in:nkgsb bank"
+    assert out[1]["novelty_key"] == "payee:queued shop"
+
+
+async def test_the_two_directions_are_two_questions_about_one_name(clean_db):
+    """Money out and money in are different questions with different answers —
+    the backlog sweep files a credit and a debit to different halves of the
+    chart, so one card cannot stand for both."""
+    await _add_unknown(clean_db, "Both Ways", 900.0, direction="out")
+    await _add_unknown(clean_db, "Both Ways", 400.0, account="income:unknown", direction="in")
+
+    out = await _run(clean_db)
+
+    assert sorted(c["novelty_key"] for c in out) == ["payee-in:both ways", "payee:both ways"]
+    paid = next(c for c in out if c["evidence"]["direction"] == "out")
+    got = next(c for c in out if c["evidence"]["direction"] == "in")
+    assert "You paid ₹900.00 to Both Ways" in paid["question"], paid["question"]
+    assert "You received ₹400.00 from Both Ways" in got["question"], got["question"]
+    # And neither total swallowed the other's money.
+    assert paid["evidence"]["totals"] == {"INR": pytest.approx(900.0)}
+    assert got["evidence"]["totals"] == {"INR": pytest.approx(400.0)}
+
+
+async def test_a_posting_with_no_direction_is_never_carded(clean_db):
+    """`direction` is nullable, and there is no true sentence for a row that
+    does not say which way the money went. Guessing one would put "You paid"
+    in front of the owner on no evidence."""
+    await _add_unknown(clean_db, "Directionless", 9000.0, direction=None)
+    await _add_unknown(clean_db, "Rupee Shop", 500.0)
+
+    out = await _run(clean_db)
+
+    assert [c["subject"] for c in out] == ["Rupee Shop"]
 
 
 async def test_a_categorised_payment_is_not_a_gap(clean_db):
@@ -304,7 +422,9 @@ def _matches(match: str, sender: str, payee: str) -> bool:
     """`books.apply_rules`' own haystack, so this tests the real matching."""
     from aegis.services import books
 
-    return books.apply_rules([{"match": match, "account": "x"}], sender, payee) is not None
+    return books.apply_rules(
+        [{"match": match, "account": "x"}], sender, payee, direction="out"
+    ) is not None
 
 
 def test_rule_match_for_covers_every_punctuation_variant():
@@ -368,6 +488,34 @@ def test_an_over_long_payee_key_yields_no_rule_rather_than_a_prefix():
     assert rule_match_for("a b c d e f g") == ""
     # ...and the length cap refuses independently of the word count.
     assert rule_match_for(" ".join("z" * 60 for _ in range(3))) == ""
+
+
+def test_a_generated_rule_is_always_safe_for_the_loader_to_run():
+    """A written-and-then-skipped rule is worse than no rule at all.
+
+    `load_rules` now refuses to RUN a pattern that breaches the regex bounds
+    (issue #390). A generated pattern that breached them would still be
+    committed to the books, the card would still be retired by its novelty
+    key, and the file would carry a rule that does nothing — with a warning in
+    a log nobody reads. So the generator holds itself to the loader's bounds.
+
+    They sit flush: the join puts one quantifier in each gap between words plus
+    the anchor's own `*`, so `_MAX_RULE_WORDS` words is exactly
+    `books.MAX_RULE_QUANTIFIERS` quantifiers. Raise either number alone and the
+    other breaks.
+    """
+    from aegis.services import books
+    from aegis_worker.activities.curiosity import _MAX_RULE_WORDS, rule_match_for
+
+    biggest = rule_match_for(" ".join(f"w{i}" for i in range(_MAX_RULE_WORDS)))
+    # Non-vacuity: the largest allowed key really does yield a pattern, so the
+    # sweep below is not just checking that everything came back empty.
+    assert biggest != ""
+    assert len(books._QUANTIFIER_RE.findall(biggest)) == books.MAX_RULE_QUANTIFIERS
+
+    for words in range(0, _MAX_RULE_WORDS + 4):
+        match = rule_match_for(" ".join(f"word{i}" for i in range(words)))
+        assert match == "" or books.rule_match_problem(match) is None, (words, match)
 
 
 async def test_archived_interaction_suppresses(clean_db):

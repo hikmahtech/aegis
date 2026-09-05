@@ -1103,6 +1103,118 @@ async def test_add_rule_defaults_the_entity_from_the_account(db_pool, tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_add_rule_never_infers_a_direction_from_the_account(db_pool, tmp_path):
+    """`direction` is optional and is NOT defaulted the way `entity` is
+    (issue #396).
+
+    The two look alike and are not. An entity is a property of the ACCOUNT —
+    `expenses:hikmah:*` is hikmah by definition — so deriving it states a fact
+    the account already carries. An account never says which way the money
+    went, only what the posting is for.
+
+    The chart says as much: `equity:transfers` is declared "between own
+    accounts when the far side is unknown", and `post_event` writes `assets:*`
+    and `liabilities:card:*` through `instrument_account`, which has no notion
+    of direction at all — so a rule on one of those has to match both ways.
+    That is the case asserted below, on `assets:unknown`. Deriving `out` from
+    an expense account would also be a mass silent narrowing: 26 of the 28
+    rules in the live file point at `expenses:*` and none of their authors
+    asked for a direction.
+    """
+    cfg = _repo(tmp_path)
+    ctx = _ctx(cfg)
+
+    await _exec_ledger_add_rule(
+        db_pool,
+        {"match": f"undirected {TOKEN}", "account": "expenses:groceries", "apply": False},
+        ctx,
+    )
+    rules = books.load_rules(cfg.path / "rules" / "accounts.yaml")
+    assert "direction" not in rules[-1], rules[-1]
+    # ...and an undirected rule still matches money moving either way.
+    for way in ("out", "in", None):
+        assert books.apply_rules(
+            [rules[-1]], "", f"Undirected {TOKEN}", direction=way
+        ) == rules[-1], way
+
+    # The account the docstring rests on: `assets:unknown` is what
+    # `instrument_account` returns for a receipt with no known paying
+    # instrument, it belongs to BOTH sets of books, and money moves against it
+    # in both directions. A derived direction would half-blind this rule.
+    await _exec_ledger_add_rule(
+        db_pool,
+        {"match": f"neutral {TOKEN}", "account": "assets:unknown", "apply": False},
+        ctx,
+    )
+    rules = books.load_rules(cfg.path / "rules" / "accounts.yaml")
+    assert "direction" not in rules[-1] and books.account_entity("assets:unknown") is None
+    for way in ("out", "in"):
+        assert books.apply_rules(
+            [rules[-1]], "", f"Neutral {TOKEN}", direction=way
+        ) == rules[-1], way
+
+    # An explicit direction is stamped and honoured.
+    await _exec_ledger_add_rule(
+        db_pool,
+        {
+            "match": f"inbound {TOKEN}",
+            "account": "expenses:groceries",
+            "direction": "in",
+            "apply": False,
+        },
+        ctx,
+    )
+    rules = books.load_rules(cfg.path / "rules" / "accounts.yaml")
+    assert rules[-1]["direction"] == "in", rules[-1]
+    assert books.apply_rules([rules[-1]], "", f"Inbound {TOKEN}", direction="in") == rules[-1]
+    assert books.apply_rules([rules[-1]], "", f"Inbound {TOKEN}", direction="out") is None
+
+
+@pytest.mark.asyncio
+async def test_add_rule_refuses_a_direction_that_is_not_one(db_pool, tmp_path):
+    """Same shape as the entity check one line above it: a typo must not reach
+    the file, where the loader would then skip the whole rule."""
+    cfg = _repo(tmp_path)
+    rules_path = cfg.path / "rules" / "accounts.yaml"
+    before = rules_path.read_text()
+
+    out = await _exec_ledger_add_rule(
+        db_pool,
+        {"match": f"typo {TOKEN}", "account": "expenses:groceries", "direction": "sideways"},
+        _ctx(cfg),
+    )
+
+    assert out.startswith("error:") and "direction" in out, out
+    assert rules_path.read_text() == before
+
+
+@pytest.mark.asyncio
+async def test_add_rule_sweeps_only_its_own_direction(db_pool, tmp_path):
+    """The sweep has to agree with the rule it just wrote, or the tool reports
+    reclassifying postings the rule will never file again."""
+    cfg = _repo(tmp_path)
+    ctx = _ctx(cfg)
+    paid = _unknown_event()
+    got = _unknown_event()
+    got.direction = "in"
+    got.account = "income:unknown"
+    await books.post_event(paid, "tool-t/dirout", cfg)
+    await books.post_event(got, "tool-t/dirin", cfg)
+    await ji.upsert(db_pool, "tool-t/dirout", "tool-t", paid, journal_file="personal/2026.journal")
+    await ji.upsert(db_pool, "tool-t/dirin", "tool-t", got, journal_file="personal/2026.journal")
+
+    out = await _exec_ledger_add_rule(
+        db_pool,
+        {"match": f"jai shree {TOKEN}", "account": "expenses:groceries", "direction": "out"},
+        ctx,
+    )
+
+    assert out == "rule added; reclassified 1 postings", out
+    assert (await ji.get(db_pool, "tool-t/dirout"))["account"] == "expenses:groceries"
+    assert (await ji.get(db_pool, "tool-t/dirin"))["account"] == "income:unknown"
+
+
+@pytest.mark.asyncio
 async def test_add_rule_index_payee_matches_the_journal(db_pool, tmp_path):
     """`;` is journal syntax, so the writer strips it — and an index that kept
     the raw name would disagree with the record for `find_match` and the admin

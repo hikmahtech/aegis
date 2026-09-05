@@ -79,43 +79,34 @@ _MAX_APPLY = 200
 # rule in `rules/accounts.yaml` against every incoming money event, forever, in
 # another process. So the budget is not "this call" — it is every future call
 # in two services.
-_MAX_MATCH_LEN = 200
-
-# Three bounds, in the order they are applied. `re` has no timeout and
-# `books.apply_rules` runs `re.search` synchronously on the event loop, so a
-# slow pattern hangs the whole process and `asyncio.wait_for` cannot interrupt
-# it — which is why the pattern is measured BEFORE it is persisted.
 #
-# 1. ANY quantified group. Exponential backtracking needs nested quantification,
-#    and nesting needs a group — so this removes the whole exponential class in
-#    one rule. A guard that only caught self-nesting (`(a+)+`) missed `((a+))+`,
-#    which was measured still running after 20s on a 31-character input.
-_QUANTIFIED_GROUP_RE = re.compile(r"\)\s*[*+{?]")
-# 2. How many quantifiers may stack. Without a group the cost is polynomial in
-#    the number of them, and the probe below has to terminate. Measured on
-#    CPython 3.12, `("a" * 48 + "!")` against `"a*" * k + "$"`:
-#      k=4 → 0.015s   k=5 → 0.14s   k=6 → 1.15s   k=8 → 55s
-#    so 6 is what keeps the probe's own worst case near a second.
-_MAX_QUANTIFIERS = 6
-# The `?` of `(?:`/`(?i)` is not a quantifier, and `\*` is a literal.
-_QUANTIFIER_RE = re.compile(r"(?<!\\)(?<!\()[*+?]|(?<!\\)\{\d")
-# 3. The behavioural check, which is the only one that catches quantifier
-#    stacking with no group at all. The probes are worst-case shapes for a
-#    backtracking engine at a length a real payee can reach (80 chars), ordered
-#    SHORTEST FIRST and stopping at the first one over budget — measured,
-#    `((a+))+$` costs 0.9s at 24 characters where at 48 it would not finish this
-#    decade, so the ordering alone turns a hang into a refusal.
+# The three static bounds — a length cap, no quantified group, a quantifier cap
+# — live in `books.rule_match_problem`, because the same three are applied
+# again when the file is LOADED (issue #390): a rule hand-edited into the yaml,
+# or written before those bounds existed, never passed through here. One
+# implementation, two call sites; this one turns its answer into a sentence the
+# model can act on.
 #
-#    It runs in a SUBPROCESS the parent kills, because `re` cannot be
-#    interrupted and the two bounds above are an argument about constants:
-#    correct today, and erodible by anyone who edits them without reading the
-#    measurements. Every layer of this particular defence has already been
-#    bypassed once (the first guard caught `(a+)+` and missed `((a+))+`), and
-#    what it protects is the money ingest lane in TWO processes, permanently,
-#    against a pattern a language model wrote and we then persisted. A kill is
-#    self-enforcing: it cannot be weakened by accident, only by deletion.
-#    The bounds above stay in front of it — they refuse fast, with a message
-#    that says what to change; this is the backstop, not the first line.
+# The BEHAVIOURAL check below stays here, and here only, because it forks a
+# killable subprocess: one fork per rule per incoming email is not a price the
+# ingest lane can pay, so it is a write-time gate on top of the static bounds
+# the loader can afford. It is also the only check that catches quantifier
+# stacking with no group at all. The probes are worst-case shapes for a
+# backtracking engine at a length a real payee can reach (80 chars), ordered
+# SHORTEST FIRST and stopping at the first one over budget — measured,
+# `((a+))+$` costs 0.9s at 24 characters where at 48 it would not finish this
+# decade, so the ordering alone turns a hang into a refusal.
+#
+# It runs in a SUBPROCESS the parent kills, because `re` cannot be interrupted
+# and the static bounds are an argument about constants: correct today, and
+# erodible by anyone who edits them without reading the measurements. Every
+# layer of this particular defence has already been bypassed once (the first
+# guard caught `(a+)+` and missed `((a+))+`), and what it protects is the money
+# ingest lane in TWO processes, permanently, against a pattern a language model
+# wrote and we then persisted. A kill is self-enforcing: it cannot be weakened
+# by accident, only by deletion. The static bounds stay in front of it — they
+# refuse fast, with a message that says what to change; this is the backstop,
+# not the first line.
 _REGEX_BUDGET_S = 0.1
 _REGEX_PROBES = ("a" * 24 + "!", "a" * 48 + "!", "ab" * 24 + "!", "0" * 48 + " x")
 # Wall clock the probe child gets before it is killed. Far above the ~1.2s worst
@@ -517,6 +508,7 @@ async def _exec_ledger_add_rule(
     match: str,
     account: str,
     entity: str | None = None,
+    direction: str | None = None,
     payee: str | None = None,
     apply: bool = True,
 ) -> str:
@@ -526,32 +518,21 @@ async def _exec_ledger_add_rule(
         match: case-insensitive regex tested against "<sender> | <payee>".
         account: a declared account.
         entity: personal or hikmah. Optional — an expense or income account already says which set of books it belongs to, so leaving this out takes the account's own entity (expenses:hikmah:* and income:hikmah:* are hikmah, any other expense or income account is personal). Asset, liability and equity accounts belong to both, and a rule on one gets no entity.
+        direction: in or out. Optional, and NOT inferred from the account — leaving it out means the rule files this payee whichever way the money moves, which is what every rule written before this field existed does. Give it when the same name moves money both ways and the two belong in different accounts (a person you both pay and are paid by), so a payment is not filed to the income account you picked for a credit.
         payee: canonical display name, optional.
         apply: also reclassify existing postings in an unknown account that match (default true). Existing postings are matched on their payee alone — the sender is not in the index.
     """
     cfg = books.config_from_settings(ctx.settings)
-    try:
-        re.compile(match)
-    except re.error as exc:
-        return f"error: {match!r} is not a valid regex: {exc}"
     # This pattern is persisted, and the worker then runs it against every
     # incoming money event in another process, forever. `re` has no timeout and
     # matching happens on the event loop, so a catastrophic pattern is a durable
-    # cross-process hang that no caller-side timeout can interrupt. Both bounds
-    # are checked BEFORE the rule reaches the file.
-    if len(match) > _MAX_MATCH_LEN:
-        return f"error: match is longer than {_MAX_MATCH_LEN} characters"
-    if _QUANTIFIED_GROUP_RE.search(match):
-        return (
-            "error: match repeats a group (e.g. `(a+)+`, `(ab)*`, `(a|a)+`) — repeating a "
-            "group can take exponential time, and this rule runs against every money event "
-            "from now on. Write it without repeating the group."
-        )
-    if len(_QUANTIFIER_RE.findall(match)) > _MAX_QUANTIFIERS:
-        return (
-            f"error: match stacks more than {_MAX_QUANTIFIERS} quantifiers (*, +, ?, {{n}}), "
-            "which gets slow faster than the length of what it is matched against."
-        )
+    # cross-process hang that no caller-side timeout can interrupt. Every bound
+    # is checked BEFORE the rule reaches the file — and the same three static
+    # ones are checked AGAIN when the file is read, by the loader that hands
+    # them to `re.search` (issue #390).
+    problem = books.rule_match_problem(match)
+    if problem:
+        return f"error: match {problem}"
     too_slow = await asyncio.to_thread(_regex_too_slow, match)
     if too_slow is not None:
         return (
@@ -560,6 +541,13 @@ async def _exec_ledger_add_rule(
         )
     if entity is not None and entity not in _ENTITIES:
         return f"error: entity must be one of {', '.join(_ENTITIES)}, got {entity!r}"
+    # Refused here rather than written and then skipped by `load_rules`, which
+    # is what an unusable direction earns on the way back in (issue #396).
+    if direction is not None and direction not in books.RULE_DIRECTIONS:
+        return (
+            f"error: direction must be one of {', '.join(books.RULE_DIRECTIONS)} "
+            f"(or left out for either), got {direction!r}"
+        )
     try:
         declared = await books.declared_accounts(cfg)
     except books.BooksError as exc:
@@ -584,6 +572,22 @@ async def _exec_ledger_add_rule(
     rule: dict = {"match": match, "account": account}
     if entity:
         rule["entity"] = entity
+    # Never derived from the account, unlike `entity` above. An entity is a
+    # property of the ACCOUNT — `expenses:hikmah:*` IS hikmah — so deriving it
+    # states a fact the account already carries. A direction is not: an account
+    # says what a posting is FOR, never which way the money went.
+    #
+    # The chart says so itself. `equity:transfers` is declared "between own
+    # accounts when the far side is unknown", and a transfer moves either way;
+    # `post_event` writes `assets:*` and `liabilities:card:*` through
+    # `instrument_account`, which has no notion of direction at all. Deriving
+    # `out` from an expense account would also be a mass silent narrowing:
+    # 26 of the 28 rules in the live file point at `expenses:*` and not one of
+    # their authors asked for a direction. The two that would escape are the
+    # case in miniature — one is `ignore: true` with no account, and the other
+    # files `liabilities:emi:bajaj`, a liability money moves against both ways.
+    if direction:
+        rule["direction"] = direction
     if payee:
         rule["payee"] = payee
     try:
@@ -594,7 +598,7 @@ async def _exec_ledger_add_rule(
         return "rule added; reclassified 0 postings"
 
     rows = await pool.fetch(
-        "SELECT message_id, payee, entity FROM finance.journal_index "
+        "SELECT message_id, payee, entity, direction FROM finance.journal_index "
         "WHERE kind = 'transaction' AND account LIKE '%:unknown' AND journal_file IS NOT NULL"
     )
     targets: list[str] = []
@@ -606,8 +610,10 @@ async def _exec_ledger_add_rule(
         if entity and row["entity"] != entity:
             continue
         # `apply_rules` with an empty sender, so one matcher serves both this
-        # sweep and the pipeline that applies the rule to new mail.
-        if not books.apply_rules([rule], "", row["payee"] or ""):
+        # sweep and the pipeline that applies the rule to new mail — and with
+        # the posting's OWN direction, so a rule that names one sweeps only the
+        # half of the backlog it will go on filing (issue #396).
+        if not books.apply_rules([rule], "", row["payee"] or "", direction=row["direction"]):
             continue
         targets.append(row["message_id"])
     capped = len(targets) > _MAX_APPLY

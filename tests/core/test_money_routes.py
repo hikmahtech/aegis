@@ -286,6 +286,46 @@ async def test_money_state_counts_unknowns_and_open_dues(real_client, db_pool):
     assert body["dues_open"] == base["dues_open"] + 1
 
 
+async def test_a_zero_invoice_is_never_an_open_due(real_client, db_pool):
+    """A ₹0 due can never close, so counting it is a number that only rises.
+
+    `find_open_due` matches on amount and only a ₹0 PAYMENT would settle a ₹0
+    due — none arrives. `capture_due` already refuses to task a zero invoice
+    ("a zero invoice is not a bill"), so the row being counted as an
+    outstanding obligation is the index disagreeing with that decision. Live
+    on 2026-09-05: one such row, a Cloudflare $0.00 invoice from July,
+    permanently on the admin page and carrying a Todoist task from before the
+    guard shipped.
+    """
+    base = (await real_client.get("/api/admin/money/state")).json()
+    await _seed(db_pool, suffix="z0", kind="due", amount="0", occurred_on=None,
+                due_on="2026-09-20")
+    await _seed(db_pool, suffix="zr", kind="due", amount="500.00", occurred_on=None,
+                due_on="2026-09-21")
+
+    body = (await real_client.get("/api/admin/money/state")).json()
+
+    assert body["dues_open"] == base["dues_open"] + 1
+
+
+async def test_a_due_whose_amount_never_parsed_is_still_open(real_client, db_pool):
+    """`AND amount > 0` is NULL for a NULL amount, so the obvious spelling of
+    the fix above ALSO drops every due the extractor could not size — 20 of
+    the 41 live open dues on 2026-09-05.
+
+    That is a different thing from a zero invoice: a bill of unknown size is
+    still a bill, and hiding it from the only counter that names it would lose
+    real money off the page.
+    """
+    base = (await real_client.get("/api/admin/money/state")).json()
+    await _seed(db_pool, suffix="znull", kind="due", amount=None, occurred_on=None,
+                due_on="2026-09-22")
+
+    body = (await real_client.get("/api/admin/money/state")).json()
+
+    assert body["dues_open"] == base["dues_open"] + 1
+
+
 async def test_money_state_reports_books_config(real_client, books_dir):
     """`books_configured` is False with no repo url and no checkout, and
     `unpushed_commits` is 0 rather than a 500 when the path does not exist."""

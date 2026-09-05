@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import shutil
 import subprocess
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from unittest.mock import AsyncMock
+from zoneinfo import ZoneInfo
 
 import pytest
 import pytest_asyncio
@@ -15,6 +16,7 @@ from aegis.api.models.money import MoneyEvent
 from aegis.services import books
 from aegis.services import journal_index as ji
 from aegis_worker.activities.money import (
+    LARGE_UNEXPLAINED_MIN,
     MoneyActivities,
     amount_from_cell,
     commodity_of,
@@ -105,11 +107,42 @@ async def _clean(db_pool):
     await db_pool.execute("DELETE FROM finance.journal_index WHERE mailbox = 'brief-t'")
 
 
+def _today() -> date:
+    """"Today" as `MoneyActivities` computes it — in its own `home_tz`.
+
+    NOT `date.today()`, which is the RUNNER's timezone. Every window in this
+    file (`as_of`, the 7-day brief, the 14-day forecast, the month the close
+    covers, the `P <date>` price lines) is derived by the activity from
+    `datetime.now(ZoneInfo(self.home_tz))`, so a test that builds the same
+    window from the runner's clock agrees only while the runner is in IST.
+    CI is UTC: for the 5.5 hours a day the two disagree on the date, the
+    activity says the 6th and the runner says the 5th, and every dated
+    assertion here fails at once. Measured on PR #397, job at 19:40 UTC.
+
+    Read off the class rather than an instance because `_repo(tmp_path, …)`
+    anchors the journal before any activity exists, and `_act` never overrides
+    the field — the same clock has to build the fixture and read the result.
+    (`tests/worker/activities/test_capture_due.py::_today` is the same fix on
+    the same trap, one file over.)
+    """
+    return datetime.now(ZoneInfo(MoneyActivities.home_tz)).date()
+
+
+def _prev_month_last() -> date:
+    """The last day of the month `build_month_close` closes.
+
+    On the activity's clock too: at a month boundary the runner and the
+    activity disagree about which month is "previous", which breaks these
+    tests the same way and only on those days.
+    """
+    return _today().replace(day=1) - timedelta(days=1)
+
+
 def _ev(**kw) -> MoneyEvent:
     base = {
         "kind": "transaction", "direction": "out", "amount": Decimal("10"), "currency": "INR",
         "payee": "Shop", "payee_key": "shop", "channel": "upi", "instrument": "hdfc-1225",
-        "occurred_on": date.today(), "entity": "personal", "account": "expenses:unknown",
+        "occurred_on": _today(), "entity": "personal", "account": "expenses:unknown",
         "parser": "hdfc_upi", "source_class": "bank",
     }
     return MoneyEvent(**{**base, **kw})
@@ -140,6 +173,29 @@ def test_csv_helpers():
     assert amount_from_cell("0") == Decimal("0") and amount_from_cell("") == Decimal("0")
 
 
+def test_a_narrow_space_digit_group_is_not_read_as_the_first_group_alone():
+    """hledger's digit-group separator is a NARROW NO-BREAK SPACE under some
+    commodity formats — `₹ 1 234.56`, not `₹ 1,234.56`.
+
+    `_NUM_RE` stops at the first non-digit, so an unstripped separator turns
+    ₹1,234.56 into ₹1: a right-looking number, three orders of magnitude out,
+    on the line that becomes the brief's headline "out" figure. Both the
+    NO-BREAK SPACE (U+00A0) and the NARROW NO-BREAK SPACE (U+202F) reach here.
+    """
+    nbsp, narrow = " ", " "
+    assert amount_from_cell(f"₹ 1{nbsp}234.56") == Decimal("1234.56")
+    assert amount_from_cell(f"₹ 1{narrow}234.56") == Decimal("1234.56")
+    # Indian grouping, where losing the separator costs five digits, not three.
+    assert amount_from_cell(f"₹{nbsp}1{nbsp}00{nbsp}000.00") == Decimal("100000.00")
+    assert split_amount_cell(f"₹{nbsp}1{nbsp}00{nbsp}000.00") == ["₹100000.00"]
+    # And the mixed-commodity cell still splits on the ", " that joins its
+    # parts, with the foreign part still recognised as foreign.
+    mixed = f"${narrow}50.00, ₹{narrow}300.00"
+    assert split_amount_cell(mixed) == ["$50.00", "₹300.00"]
+    assert amount_from_cell(mixed) == Decimal("300.00")
+    assert unconverted_commodities(mixed) == ["$"]
+
+
 def test_a_mixed_commodity_cell_never_reports_a_foreign_amount_as_rupees():
     """The exact cell hledger writes when `-X ₹` has no price for `$`.
 
@@ -167,7 +223,7 @@ def test_a_mixed_commodity_cell_never_reports_a_foreign_amount_as_rupees():
 @pytest.mark.skipif(not HAS_HLEDGER, reason="hledger/git not installed")
 @pytest.mark.asyncio
 async def test_build_money_brief_reads_books_and_index(db_pool, tmp_path):
-    today = date.today()
+    today = _today()
     cfg = _repo(tmp_path, today, recurring_from=today)
     act = _act(db_pool, cfg)
     # `low_confidence` is a table-wide count with nothing to scope it by, so it
@@ -229,7 +285,16 @@ async def test_build_money_brief_reads_books_and_index(db_pool, tmp_path):
     assert unknowns[1]["amount"] == "6000.00"
     assert unknowns[1]["occurred_on"] == today.isoformat()
     assert unknowns[1]["channel"] == "upi"
-    assert [u["msgid"] for u in _mine(brief["large_unexplained"])] == ["brief-t/a"]
+    # `large_unexplained` is a table-wide aggregate (issue #391), so it is a
+    # delta like `low_confidence` above. Only `brief-t/a` qualifies: /g is
+    # under the cut and /h is dollars, and a cut that ignored `currency` would
+    # flag ₹9,000 that was never spent.
+    assert (
+        brief["large_unexplained"]["count"] == baseline["large_unexplained"]["count"] + 1
+    )
+    assert Decimal(brief["large_unexplained"]["total"]) - Decimal(
+        baseline["large_unexplained"]["total"]
+    ) == Decimal("6000.00")
     assert [d["msgid"] for d in dues] == ["brief-t/d"]
     assert dues[0]["todoist_ref"] == "t1" and dues[0]["kind"] == "due"
     assert [c["msgid"] for c in _mine(brief["closed_dues"])] == ["brief-t/f"]
@@ -250,7 +315,7 @@ async def test_money_brief_says_so_when_a_rate_is_missing_instead_of_lying(db_po
 
     Reachable on a fresh books repo, or any week the quote provider is down.
     """
-    today = date.today()
+    today = _today()
     cfg = _repo(tmp_path, today, prices="")
     await books.post_event(
         _ev(amount=Decimal("300"), account="expenses:saas", payee="Shop", payee_key="shop"),
@@ -274,7 +339,7 @@ async def test_money_brief_says_so_when_a_rate_is_missing_instead_of_lying(db_po
 async def test_month_close_says_so_when_a_rate_is_missing(db_pool, tmp_path):
     """Same trap on the close, where `is_rows` and `recurring_total` read the
     same mixed cells."""
-    prev_last = date.today().replace(day=1) - timedelta(days=1)
+    prev_last = _prev_month_last()
     cfg = _repo(tmp_path, prev_last, prices="")
     await books.post_event(
         _ev(amount=Decimal("300"), occurred_on=prev_last, account="expenses:saas", payee="Shop",
@@ -299,7 +364,7 @@ async def test_a_foreign_forecast_marks_the_brief_stale_on_its_own(db_pool, tmp_
     report never sees: a periodic rule bills in a currency nothing has spent
     yet. There is no real transaction here at all, so only the forecast sweep
     can raise the flag."""
-    today = date.today()
+    today = _today()
     cfg = _repo(tmp_path, today, prices="", recurring=(
         f"~ monthly from {today.isoformat()}  Foreign Sub\n"
         "    expenses:saas                 $9.99\n    liabilities:card:axis:1313\n"
@@ -317,7 +382,7 @@ async def test_a_foreign_recurring_charge_marks_the_close_stale_and_counts_as_ze
 ):
     """Same for the close: `recurring_total` is rupees, so a $9.99 rule adds
     nothing to it — and the reader has to be told that is why."""
-    prev_last = date.today().replace(day=1) - timedelta(days=1)
+    prev_last = _prev_month_last()
     cfg = _repo(tmp_path, prev_last, prices="", recurring=(
         f"~ monthly from {prev_last.replace(day=1).isoformat()}  Foreign Sub\n"
         "    expenses:saas                 $9.99\n    liabilities:card:axis:1313\n"
@@ -336,6 +401,7 @@ async def test_an_unknown_with_no_amount_does_not_take_the_whole_brief_down(db_p
     the weekly brief then failed on every retry with nothing saying why.
     """
     act = _act(db_pool, books.BooksConfig(path=tmp_path / "none"))
+    baseline = await ActivityEnvironment().run(act.build_money_brief, 7)
     await ji.upsert(db_pool, "brief-t/nul", "brief-t",
                     _ev(amount=None, currency="INR", payee="Amountless", payee_key="amountless"))
     await ji.upsert(db_pool, "brief-t/ok", "brief-t",
@@ -344,7 +410,101 @@ async def test_an_unknown_with_no_amount_does_not_take_the_whole_brief_down(db_p
     brief = await ActivityEnvironment().run(act.build_money_brief, 7)
 
     assert [u["msgid"] for u in _mine(brief["unknowns"])] == ["brief-t/ok"]
-    assert [u["msgid"] for u in _mine(brief["large_unexplained"])] == ["brief-t/ok"]
+    # The amountless row is out of the aggregate too — `sum()` over it is NULL,
+    # and counting it would put a row behind a total it contributed nothing to.
+    assert (
+        brief["large_unexplained"]["count"] == baseline["large_unexplained"]["count"] + 1
+    )
+    assert Decimal(brief["large_unexplained"]["total"]) - Decimal(
+        baseline["large_unexplained"]["total"]
+    ) == Decimal("7000.00")
+
+
+@pytest.mark.asyncio
+async def test_month_close_open_dues_leave_out_a_zero_invoice_but_keep_an_unsized_one(
+    db_pool, tmp_path
+):
+    """"still open" has to be something a payment could close (issue #385).
+
+    A ₹0 due never can — `find_open_due` matches on amount and no ₹0 payment
+    mail arrives — and `capture_due` has already refused to task it. A due
+    whose amount the extractor never got is a different thing: a real bill of
+    unknown size, and dropping it would take real money off the close.
+
+    Asserted as deltas: these counters are table-wide inside the month window,
+    so a sibling suite's row must not be able to fail this.
+    """
+    act = _act(db_pool, books.BooksConfig(path=tmp_path / "none"))
+    last = _prev_month_last()
+    base = await ActivityEnvironment().run(act.build_month_close)
+
+    await ji.upsert(db_pool, "brief-t/mz", "brief-t",
+                    _ev(kind="due", amount=Decimal("0"), due_on=last, occurred_on=None,
+                        payee="Zero invoice", payee_key="zero invoice", channel="bill"))
+    await ji.upsert(db_pool, "brief-t/mn", "brief-t",
+                    _ev(kind="due", amount=None, due_on=last, occurred_on=None,
+                        payee="Unsized bill", payee_key="unsized bill", channel="bill"))
+    await ji.upsert(db_pool, "brief-t/mr", "brief-t",
+                    _ev(kind="due", amount=Decimal("450"), due_on=last, occurred_on=None,
+                        payee="Real bill", payee_key="real bill", channel="bill"))
+
+    close = await ActivityEnvironment().run(act.build_month_close)
+
+    assert close["month"] == last.strftime("%Y-%m")
+    assert close["dues_open"] == base["dues_open"] + 2
+
+
+@pytest.mark.asyncio
+async def test_large_unexplained_cuts_at_the_constant_the_brief_names(db_pool, tmp_path):
+    """The renderer prints "of ₹5,000.00 or more" (issue #391), so the WHERE
+    clause has to mean exactly that. Both sides read `LARGE_UNEXPLAINED_MIN`,
+    and this pins the boundary: at the cut is in, one paisa under is out.
+    """
+    act = _act(db_pool, books.BooksConfig(path=tmp_path / "none"))
+    baseline = await ActivityEnvironment().run(act.build_money_brief, 7)
+    cut = LARGE_UNEXPLAINED_MIN
+    await ji.upsert(db_pool, "brief-t/at", "brief-t",
+                    _ev(amount=cut, payee="At the cut", payee_key="at the cut"))
+    await ji.upsert(db_pool, "brief-t/under", "brief-t",
+                    _ev(amount=cut - Decimal("0.01"), payee="Under", payee_key="under"))
+
+    brief = await ActivityEnvironment().run(act.build_money_brief, 7)
+
+    assert [u["msgid"] for u in _mine(brief["unknowns"])] == ["brief-t/at", "brief-t/under"]
+    assert (
+        brief["large_unexplained"]["count"] == baseline["large_unexplained"]["count"] + 1
+    )
+    assert Decimal(brief["large_unexplained"]["total"]) - Decimal(
+        baseline["large_unexplained"]["total"]
+    ) == cut
+
+
+@pytest.mark.asyncio
+async def test_the_large_unexplained_total_is_the_week_and_not_the_rendered_rows(
+    db_pool, tmp_path
+):
+    """The figure the reader is handed has to be the real one (issue #391).
+
+    `unknowns` is `ORDER BY amount DESC LIMIT 15` and the renderer prints 10 of
+    those, so a total derived from the list understates every week with more
+    than 15 unexplained rows. 16 rows here, all over the cut: the list is
+    capped at 15 and the aggregate is not.
+    """
+    act = _act(db_pool, books.BooksConfig(path=tmp_path / "none"))
+    baseline = await ActivityEnvironment().run(act.build_money_brief, 7)
+    for i in range(16):
+        await ji.upsert(db_pool, f"brief-t/many{i:02d}", "brief-t",
+                        _ev(amount=Decimal("6000"), payee=f"Shop {i}", payee_key=f"shop {i}"))
+
+    brief = await ActivityEnvironment().run(act.build_money_brief, 7)
+
+    assert len(_mine(brief["unknowns"])) == 15, "the row cap moved; this test is now blind"
+    assert (
+        brief["large_unexplained"]["count"] == baseline["large_unexplained"]["count"] + 16
+    )
+    assert Decimal(brief["large_unexplained"]["total"]) - Decimal(
+        baseline["large_unexplained"]["total"]
+    ) == Decimal("96000.00")
 
 
 @pytest.mark.skipif(not HAS_HLEDGER, reason="hledger/git not installed")
@@ -353,7 +513,7 @@ async def test_money_brief_forecast_reaches_the_far_edge_of_the_window(db_pool, 
     """hledger's `--forecast=A..B` excludes B, so the window has to end one day
     past the last day the brief claims to cover — otherwise a charge exactly a
     fortnight out is silently missing from the fortnight's forecast."""
-    today = date.today()
+    today = _today()
     edge = today + timedelta(days=14)
     cfg = _repo(tmp_path, today, recurring_from=edge)
     brief = await ActivityEnvironment().run(_act(db_pool, cfg).build_money_brief, 7)
@@ -367,7 +527,7 @@ async def test_money_brief_counts_commits_the_books_have_not_pushed(db_pool, tmp
     """`unpushed` is the "the journal is only on this box" warning, and its
     default is also 0 — so it is only worth anything if a real un-pushed
     commit shows up as one."""
-    cfg = _repo(tmp_path, date.today())
+    cfg = _repo(tmp_path, _today())
     git = ["git", "-c", "user.name=t", "-c", "user.email=t@t"]
     origin = tmp_path / "origin.git"
     subprocess.run(["git", "init", "--bare", "-q", str(origin)], check=True)
@@ -384,8 +544,13 @@ async def test_money_brief_counts_commits_the_books_have_not_pushed(db_pool, tmp
 @pytest.mark.asyncio
 async def test_build_money_brief_without_books_still_reports_index(db_pool, tmp_path):
     act = _act(db_pool, books.BooksConfig(path=tmp_path / "none"))
+    # `large_unexplained` is a table-wide aggregate with nothing to scope it
+    # by, so it is a delta like every other count in this file. Asserted flat
+    # it passes sequentially and fails the moment a sibling suite leaves an
+    # unexplained row in the shared `aegis_test_gwN` database.
+    baseline = await ActivityEnvironment().run(act.build_money_brief, 7)
     await ji.upsert(db_pool, "brief-t/z", "brief-t",
-                    _ev(kind="due", due_on=date.today(), payee="X", payee_key="x"),
+                    _ev(kind="due", due_on=_today(), payee="X", payee_key="x"),
                     todoist_ref="t")
     brief = await ActivityEnvironment().run(act.build_money_brief, 7)
     assert brief["books_ok"] is False and brief["bal_text"] == ""
@@ -393,7 +558,9 @@ async def test_build_money_brief_without_books_still_reports_index(db_pool, tmp_
     assert brief["entities"]["personal"] == {"income": "0", "expenses": "0"}
     assert brief["fx_stale"] is False and brief["fx_unconverted"] == []
     assert [d["msgid"] for d in _mine(brief["dues"])] == ["brief-t/z"]
-    assert _mine(brief["unknowns"]) == [] and _mine(brief["large_unexplained"]) == []
+    assert _mine(brief["unknowns"]) == []
+    # A due is not an unexplained posting, so this row moves neither number.
+    assert brief["large_unexplained"] == baseline["large_unexplained"]
     assert _mine(brief["closed_dues"]) == []
 
 
@@ -407,7 +574,7 @@ async def test_no_books_config_at_all_degrades_instead_of_crashing(db_pool):
     assert brief["books_ok"] is False and brief["bal_text"] == ""
     close = await ActivityEnvironment().run(act.build_month_close)
     assert close["books_ok"] is False and close["is_text"] == ""
-    assert close["month"] == (date.today().replace(day=1) - timedelta(days=1)).strftime("%Y-%m")
+    assert close["month"] == (_prev_month_last()).strftime("%Y-%m")
 
 
 def test_drop_forecast_duplicates_keeps_a_row_it_cannot_compare():
@@ -513,7 +680,7 @@ async def test_forecast_drops_only_the_obligations_the_books_already_carry(db_po
     Seven rules, three of which the index already accounts for. The four that
     survive are named, not counted: a shorter list is not the claim.
     """
-    today = date.today()
+    today = _today()
     paid = today - timedelta(days=2)
     cfg = _repo(tmp_path, today, recurring="".join(
         f"~ monthly from {when.isoformat()}  {desc}\n"
@@ -593,7 +760,7 @@ async def test_forecast_never_stretches_one_obligation_over_two_predictions(db_p
     ₹5306.46 bill accounts for all of it. `Twin Sub` is TWO charges; one ₹500
     bill accounts for one of them and the other must still be warned about.
     """
-    today = date.today()
+    today = _today()
     cfg = _repo(tmp_path, today, recurring=(
         f"~ monthly from {today.isoformat()}  Split Rule\n"
         "    expenses:saas                 ₹3000.00\n"
@@ -640,7 +807,7 @@ async def test_low_confidence_counts_postings_not_every_uncertain_row(db_pool, t
     await ji.upsert(db_pool, "brief-t/lc-unposted", "brief-t",
                     _ev(payee="Never Posted", payee_key="never posted", **common))
     await ji.upsert(db_pool, "brief-t/lc-due", "brief-t",
-                    _ev(kind="due", due_on=date.today(), payee="A Bill", payee_key="a bill",
+                    _ev(kind="due", due_on=_today(), payee="A Bill", payee_key="a bill",
                         channel="bill", **common))
     # ...and the one that is really a posting.
     await ji.upsert(db_pool, "brief-t/lc-posted", "brief-t",
@@ -660,7 +827,7 @@ async def test_low_confidence_counts_postings_not_every_uncertain_row(db_pool, t
 @pytest.mark.skipif(not HAS_HLEDGER, reason="hledger/git not installed")
 @pytest.mark.asyncio
 async def test_build_month_close(db_pool, tmp_path):
-    today = date.today()
+    today = _today()
     first = today.replace(day=1)
     prev_last = first - timedelta(days=1)
     cfg = _repo(tmp_path, prev_last)
@@ -709,7 +876,7 @@ async def test_month_close_forecast_covers_the_last_day_of_the_month(db_pool, tm
     """Same exclusive-end trap as the brief: a charge on the 31st belongs to
     the month being closed, so the forecast window has to end on the 1st of the
     NEXT month, not on the month's own last day."""
-    prev_last = date.today().replace(day=1) - timedelta(days=1)
+    prev_last = _prev_month_last()
     cfg = _repo(tmp_path, prev_last, recurring_from=prev_last)
     close = await ActivityEnvironment().run(_act(db_pool, cfg).build_month_close)
     assert close["books_ok"] is True
@@ -719,7 +886,7 @@ async def test_month_close_forecast_covers_the_last_day_of_the_month(db_pool, tm
 @pytest.mark.skipif(not HAS_HLEDGER, reason="hledger/git not installed")
 @pytest.mark.asyncio
 async def test_refresh_fx_prices_appends_p_lines(db_pool, tmp_path):
-    cfg = _repo(tmp_path, date.today())
+    cfg = _repo(tmp_path, _today())
     finance = AsyncMock()
     finance.get_quotes = AsyncMock(return_value=[
         {"symbol": "USDINR=X", "price": 84.1},
@@ -731,8 +898,8 @@ async def test_refresh_fx_prices_appends_p_lines(db_pool, tmp_path):
     assert out["written"] == 2 and out["errors"] == ["EURINR=X: timeout"]
     finance.get_quotes.assert_awaited_once_with(["USDINR=X", "GBPINR=X", "EURINR=X"])
     text = (cfg.path / "prices.journal").read_text()
-    assert f"P {date.today().isoformat()} $ ₹84.10\n" in text
-    assert f"P {date.today().isoformat()} £ ₹106.25\n" in text
+    assert f"P {_today().isoformat()} $ ₹84.10\n" in text
+    assert f"P {_today().isoformat()} £ ₹106.25\n" in text
     act_none = _act(db_pool, cfg, finance=None)
     assert (await ActivityEnvironment().run(act_none.refresh_fx_prices)) == {
         "written": 0, "errors": ["disabled"]}
@@ -741,7 +908,7 @@ async def test_refresh_fx_prices_appends_p_lines(db_pool, tmp_path):
 @pytest.mark.skipif(not HAS_HLEDGER, reason="hledger/git not installed")
 @pytest.mark.asyncio
 async def test_refresh_fx_prices_never_raises_when_the_provider_fails(db_pool, tmp_path):
-    cfg = _repo(tmp_path, date.today())
+    cfg = _repo(tmp_path, _today())
     finance = AsyncMock()
     finance.get_quotes = AsyncMock(side_effect=RuntimeError("upstream 503"))
     out = await ActivityEnvironment().run(_act(db_pool, cfg, finance=finance).refresh_fx_prices)
@@ -774,7 +941,7 @@ async def test_refresh_fx_prices_survives_a_books_error_it_was_not_told_about(
     on `.aegis.lock` escapes as a bare `OSError`. The next task calls this as
     best-effort, so it has to come back as a value, not an exception.
     """
-    cfg = _repo(tmp_path, date.today())
+    cfg = _repo(tmp_path, _today())
     finance = AsyncMock()
     finance.get_quotes = AsyncMock(return_value=[{"symbol": "USDINR=X", "price": 84.1}])
     monkeypatch.setattr(

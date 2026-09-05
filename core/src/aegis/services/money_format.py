@@ -13,6 +13,17 @@ _SYMBOL = {"INR": "₹", "USD": "$", "GBP": "£", "EUR": "€"}
 _CENT = Decimal("0.01")
 
 
+def currency_symbol(currency: str | None) -> str:
+    """The hledger commodity symbol for an ISO code, or `""`.
+
+    `journal_index.currency` holds ISO codes and `prices.journal` is keyed on
+    the symbol, so anything joining the two needs this map — and it needs the
+    SAME one the formatter uses, or a rate would be looked up for a commodity
+    the reader was never shown.
+    """
+    return _SYMBOL.get((currency or "").upper(), "")
+
+
 def _indian_group(whole: str) -> str:
     """'100308' -> '1,00,308'; '1234' -> '1,234'; '999' -> '999'."""
     if len(whole) <= 3:

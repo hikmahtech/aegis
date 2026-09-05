@@ -622,6 +622,18 @@ the run every week without ever posting. Grep the worker log for
 `money_post_failed`, which names the msgid and the underlying error. The status
 is in `workflow_runs.result_summary`.
 
+The admin **Money** page carries two review counters, and each one means
+something narrower than its label. *Unexplained* counts transactions still
+sitting in an `:unknown` account, over a rolling 60 days. *Dues open* counts
+bills and failed payments nothing has been linked to — **excluding a
+zero-amount invoice**, which is not an obligation and which nothing can ever
+close (a payment matches a due on its amount, and no ₹0 payment mail arrives).
+`capture_due` already refuses to raise a task for one, so counting it as
+outstanding was the index disagreeing with that. A due whose amount the
+extractor never got is a different thing and IS still counted: a bill of
+unknown size is still a bill, and it is the counter's job to say so. Both rows
+stay in the events table either way — the index records what arrived.
+
 ### The deploy key
 
 Generate a key pair, register the public half, paste the private half:
@@ -694,7 +706,27 @@ Three behaviours are worth knowing before you use them.
 - **`ledger_add_rule` refuses a slow regex.** The pattern is persisted and the
   worker then runs it against every money event, in another process, forever, so
   a pattern that repeats a group, stacks quantifiers or simply measures slow is
-  turned away with a message saying what to change.
+  turned away with a message saying what to change. The first three of those
+  bounds are applied AGAIN when `rules/accounts.yaml` is read, so a rule you
+  hand-edit into the file is held to the same standard as one the tool wrote:
+  it is skipped, with a warning naming it (`books_rule_skipped`), rather than
+  run. The timing probe is write-time only — it forks a process, which is not a
+  price the ingest lane can pay per rule per email. The same loader skips a
+  rule whose optional `direction` is neither `in` nor `out`.
+- **A rule may name a direction, and by default does not.** `direction: in` or
+  `direction: out` makes the rule fire only on money moving that way; leaving
+  it out means either way, which is what every rule written before the field
+  existed means. Reach for it when the same name moves money both ways and the
+  two belong in different accounts — a person you both pay and are paid by —
+  so a payment is not filed into the income account you picked for a credit.
+  It is never derived from the account, because an account says what a posting
+  is *for*, not which way the money went. The chart says so itself:
+  `equity:transfers` is declared "between own accounts when the far side is
+  unknown", and a transfer moves either way. Deriving `out` from an expense
+  account would also narrow 26 of the 28 rules in the live file at a stroke,
+  none of whose authors asked for it. The curiosity answer hook is the
+  exception and always stamps one, because it knows which way its card asked
+  and nobody reviews what it writes.
 - **One sweep is capped at 200 postings**, written as a single commit. Past that
   the tool asks to be run again rather than rewriting the whole backlog in one
   unreviewable change.

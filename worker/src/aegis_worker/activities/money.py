@@ -23,6 +23,12 @@ from temporalio import activity
 from aegis_worker.activities import money_render
 from aegis_worker.activities.delivery import safe_send_message
 
+# The cut for `large_unexplained`, owned by the renderer because the renderer
+# is what tells the reader the number. Re-exported here so a caller reading the
+# data layer sees the same name (issue #391).
+LARGE_UNEXPLAINED_CURRENCY = money_render.LARGE_UNEXPLAINED_CURRENCY
+LARGE_UNEXPLAINED_MIN = money_render.LARGE_UNEXPLAINED_MIN
+
 
 def _format_agent_persona(persona: dict) -> str | None:
     """Render soul + user kinds from a get_personality() dict, or None if empty.
@@ -445,7 +451,11 @@ class MoneyActivities:
         # into the business books.
         if ev.entity != "hikmah":
             ev.entity = self.mailbox_entities.get(mailbox, "personal")  # type: ignore[assignment]
-        rule = books.apply_rules(self._rules(), sender, ev.payee)
+        # `ev.direction`, because a rule may name one (issue #396): a rule from
+        # an inbound answer must not file this payee's next PAYMENT into an
+        # income account. `ev.direction` is nullable and that is passed through
+        # honestly — an unknown direction satisfies no directional rule.
+        rule = books.apply_rules(self._rules(), sender, ev.payee, direction=ev.direction)
         if rule:
             if rule.get("ignore"):
                 ev.kind, ev.entity, ev.parser = "ignore", "none", f"{ev.parser}+rule"
@@ -877,10 +887,28 @@ class MoneyActivities:
             }
             for r in unknowns
         ]
-        brief["large_unexplained"] = [
-            u for u in brief["unknowns"]
-            if u["currency"] == "INR" and Decimal(u["amount"]) >= 5000
-        ]
+        # Its own aggregate, NOT a filter over `unknowns` (issue #391). That
+        # list is `ORDER BY amount DESC LIMIT 15`, so a week with more than 15
+        # unexplained rows would have made this the total of the top 15 and
+        # called it the total — the one number in the brief whose whole job is
+        # to be the real one. The renderer never sees the rows, only this.
+        #
+        # `abs()` on both sides because `journal_index.amount` is a magnitude
+        # with the sign carried by `direction`, and a stray negative would
+        # otherwise cancel against a real one instead of adding to it.
+        large = await self.db_pool.fetchrow(
+            "SELECT count(*) AS n, coalesce(sum(abs(amount)), 0) AS total "
+            "FROM finance.journal_index "
+            "WHERE kind = 'transaction' AND account LIKE '%:unknown' AND occurred_on >= $1 "
+            "  AND amount IS NOT NULL AND currency = $2 AND abs(amount) >= $3",
+            since,
+            LARGE_UNEXPLAINED_CURRENCY,
+            LARGE_UNEXPLAINED_MIN,
+        )
+        brief["large_unexplained"] = {
+            "count": int(large["n"] or 0),
+            "total": str(large["total"] or 0),
+        }
         dues = await self.db_pool.fetch(
             "SELECT message_id, payee, payee_key, amount, currency, due_on, kind, todoist_ref "
             "FROM finance.journal_index "
@@ -1037,10 +1065,14 @@ class MoneyActivities:
             "  AND due_on BETWEEN $1 AND $2",
             month_first, last,
         ))
+        # `ji.OPEN_DUE_SQL` is the same predicate `/api/admin/money/state`
+        # carries: a ₹0 due is not an obligation and can never close, so
+        # "still open: 1" for a month in which nothing was owed is a number
+        # that only rises (issue #385).
         close["dues_open"] = int(await self.db_pool.fetchval(
             "SELECT count(*) FROM finance.journal_index "
             "WHERE kind IN ('due','failed') AND linked_message_id IS NULL "
-            "  AND due_on BETWEEN $1 AND $2",
+            f"  AND due_on BETWEEN $1 AND $2 AND {ji.OPEN_DUE_SQL}",
             month_first, last,
         ))
         return close
