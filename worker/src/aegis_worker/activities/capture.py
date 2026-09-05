@@ -252,6 +252,35 @@ class CaptureActivities:
                 "capture_due_skipped_zero_amount payee=%s due_on=%s", ev.payee, ev.due_on
             )
             return None
+        # One bill, one task — even when two senders announce it. The dedupe
+        # key below is the payee, but the same obligation routinely arrives
+        # under two names: Google Pay mirrors a biller ("Axis Bank Credit Card
+        # cc") and the biller emails its own statement ("Axis credit card
+        # XX13"). Seen live 2026-09-05: both became tasks for one ₹95,301.29
+        # bill. Money and date identify an obligation better than a name does,
+        # so an already-tasked due for the same amount, currency and due date
+        # wins and this one is indexed only.
+        if self.db_pool is not None and ev.currency:
+            async with self.db_pool.acquire() as conn:
+                twin = await conn.fetchval(
+                    "SELECT payee FROM finance.journal_index "
+                    "WHERE kind IN ('due', 'failed') AND todoist_ref IS NOT NULL "
+                    "  AND due_on = $1 AND currency = $2 AND amount = $3 "
+                    "LIMIT 1",
+                    ev.due_on,
+                    ev.currency,
+                    ev.amount,
+                )
+            if twin is not None:
+                activity.logger.info(
+                    "capture_due_skipped_duplicate payee=%s twin=%s due_on=%s amount=%s",
+                    ev.payee,
+                    twin,
+                    ev.due_on,
+                    ev.amount,
+                )
+                return None
+
         today = datetime.now(ZoneInfo(self.home_tz)).date()
         # A day of warning, but never a task that is born overdue.
         due = max(ev.due_on - timedelta(days=1), today)

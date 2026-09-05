@@ -138,6 +138,50 @@ async def test_capture_due_ignores_a_zero_invoice(db_pool):
 
 
 @pytest.mark.asyncio
+async def test_capture_due_skips_a_bill_another_sender_already_tasked(db_pool, monkeypatch):
+    """One bill, one task, even when two senders announce it.
+
+    Seen live 2026-09-05: Google Pay's "New bill from Axis Bank Credit Card cc"
+    and the Axis statement's own "Axis credit card XX13" are the same
+    ₹95,301.29 due 2026-08-07, but the payee-keyed dedupe saw two names and
+    made two tasks. Money and date identify the obligation; the name does not.
+    """
+    await db_pool.execute("DELETE FROM todoist_capture_idempotency WHERE source_tag = '#bill'")
+    await db_pool.execute("DELETE FROM finance.journal_index WHERE mailbox = 'dup-t'")
+    await db_pool.execute(
+        "INSERT INTO finance.journal_index "
+        "  (message_id, mailbox, entity, kind, amount, currency, payee, payee_key, "
+        "   due_on, parser, source_class, todoist_ref) "
+        "VALUES ('dup-t/first', 'dup-t', 'personal', 'due', 95301.29, 'INR', "
+        "        'Axis credit card XX13', 'axis credit card xx13', '2026-08-07', "
+        "        'axis_cc_statement', 'bank', 'task-already-there')"
+    )
+    acts, connector = _acts(db_pool)
+    twin = {
+        **DUE, "payee": "Axis Bank Credit Card cc", "payee_key": "axis bank credit card cc",
+        "amount": "95301.29", "currency": "INR", "due_on": "2026-08-07", "parser": "gpay_bill",
+    }
+    assert await ActivityEnvironment().run(acts.capture_due, twin, "m", "x") is None
+    connector.commands.assert_not_awaited()
+
+    # A genuinely different bill on the same date still gets its own task.
+    monkeypatch.setattr(
+        "aegis.connectors.todoist.TodoistConnector.check_sync_status",
+        staticmethod(
+            lambda result, uuids: {
+                "ok": True, "retryable": False, "rejected_retryable": False,
+                "rejected": {}, "envelope_error": None,
+            }
+        ),
+    )
+    connector.commands = AsyncMock(return_value={"data": {"temp_id_mapping": {}}})
+    other = {**twin, "payee": "Someone Else", "payee_key": "someone else", "amount": "42.00"}
+    await ActivityEnvironment().run(acts.capture_due, other, "m", "y")
+    connector.commands.assert_awaited()
+    await db_pool.execute("DELETE FROM finance.journal_index WHERE mailbox = 'dup-t'")
+
+
+@pytest.mark.asyncio
 async def test_complete_captured_task(db_pool, monkeypatch):
     acts, connector = _acts(db_pool)
     monkeypatch.setattr(
