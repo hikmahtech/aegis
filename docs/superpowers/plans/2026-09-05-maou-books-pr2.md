@@ -2866,7 +2866,9 @@ def _bank_event(**kw):
 async def test_post_then_receipt_links_and_enriches(db_pool, tmp_path):
     cfg = _repo(tmp_path)
     act = _act(db_pool, cfg)
-    r = await ActivityEnvironment().run(act.post_money_event, "rid1", "v2-personal", "m-bank", _bank_event())
+    # A bank alert whose payee is a bare VPA — the "raw" shape a receipt may improve on.
+    bank = _bank_event(payee="q203028199@ybl", payee_key="q203028199 ybl")
+    r = await ActivityEnvironment().run(act.post_money_event, "rid1", "v2-personal", "m-bank", bank)
     assert r["status"] == "posted" and r["journal_file"] == "personal/2026.journal"
     receipt = _bank_event(payee="Apple Music Individual", payee_key="apple music individual",
                           channel="receipt", instrument=None, account="expenses:media",

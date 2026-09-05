@@ -196,6 +196,31 @@ CONFIG_REGISTRY: list[ConfigKey] = [
         "NOT let any agent call these tools — that is granted separately. Core restart "
         "required.",
     ),
+    ConfigKey(
+        "books_repo_url", "Repo URL (git@github.com:org/books.git)", "Books", False,
+        help="The hledger books repo Maou writes to. Empty = books disabled (money mail is "
+        "indexed, never posted). SSH form; the deploy key below must have write access. "
+        "Core + worker restart required.",
+    ),
+    ConfigKey(
+        "books_deploy_key", "Deploy key (private, ed25519)", "Books", True,
+        help="Paste the PEM (multi-line) or its base64. Written to the credentials dir "
+        "with mode 0600 at boot; never logged.",
+    ),
+    ConfigKey(
+        "books_ignored_mailboxes", "Ignored mailboxes (comma-separated labels)", "Books", False,
+        help="Money mail in these mailboxes is not yours (e.g. an employer's account).",
+    ),
+    ConfigKey(
+        "books_mailbox_entities",
+        "Mailbox → entity (label=personal|hikmah, comma-separated)", "Books", False,
+        help="Which set of books a mailbox's money belongs to. Unlisted = personal.",
+    ),
+    ConfigKey(
+        "books_todoist_projects", "Todoist projects for dues (personal=<id>,hikmah=<id>)",
+        "Books", False,
+        help="Bills and failed payments become dated tasks here. Unset = the Inbox.",
+    ),
 ]
 _BY_KEY = {c.key: c for c in CONFIG_REGISTRY}
 

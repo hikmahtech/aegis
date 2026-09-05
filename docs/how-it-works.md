@@ -140,7 +140,7 @@ The shipped schedule set (`config/seed/activities.yaml` — all crons UTC):
 
 | Slug | Cron | Flow | Agent | What it does |
 |---|---|---|---|---|
-| `gmail-ingest-hourly` | `0 * * * *` | `GmailIngestFlow` | Sebas | Fetch + classify new mail (window `is:unread newer_than:7d` plus a forward-only cursor). Only `important_action` interrupts you — a Todoist Inbox task, and the mail kept unread; it is guarded twice, by a notification-subject cap and by a live re-read of unread state, so mail you already read never produces a task. `important_read` is labelled IMPORTANT and **marked read**; everything else is marked read with IMPORTANT stripped. Tune it on the admin **Email triage** page. Tag fan-out spawns `MoneyProcessFlow` for `financial`/`payments` mail. With Integrations → Features → **Passive people enrichment** on, each sender is also folded into `life.people`: it learns their address as an alias and moves `last_contact` forward, but it **never creates a person** — an inbox is unbounded and mostly transactional |
+| `gmail-ingest-hourly` | `0 * * * *` | `GmailIngestFlow` | Sebas | Fetch + classify new mail (window `is:unread newer_than:7d` plus a forward-only cursor). Only `important_action` interrupts you — a Todoist Inbox task, and the mail kept unread; it is guarded twice, by a notification-subject cap and by a live re-read of unread state, so mail you already read never produces a task. `important_read` is labelled IMPORTANT and **marked read**; everything else is marked read with IMPORTANT stripped. Tune it on the admin **Email triage** page. Tag fan-out spawns `MoneyProcessFlow` for `financial`/`payments` mail, which parses it into a money event and posts it to Maou's hledger books. With Integrations → Features → **Passive people enrichment** on, each sender is also folded into `life.people`: it learns their address as an alias and moves `last_contact` forward, but it **never creates a person** — an inbox is unbounded and mostly transactional |
 | `delivery-watchdog-hourly` | `0 * * * *` | `DeliveryWatchdogFlow` | Pandora's Actor | Finds interaction cards that were never delivered; checks comms liveness |
 | `flow-health-watchdog-30m` | `7,37 * * * *` | `FlowHealthWatchdogFlow` | Pandora's Actor | Watches AEGIS's own flows: 2 consecutive failed runs of one `workflow_type` (recency-ordered, so a later success clears it), or an active schedule with no *successful* run in 3x its own cadence. One deduped card per fault, a `[FLOW OK]` card on recovery. Mute one with `INSERT INTO alert_mutes (mute_key, muted_until) VALUES ('flow-health:<subject>', now() + interval '2 days')` |
 | `rss-ingest-hourly` | `30 * * * *` | `RssIngestFlow` | Raphael | RSS feeds → knowledge store |
@@ -173,7 +173,7 @@ The shipped schedule set (`config/seed/activities.yaml` — all crons UTC):
 |---|---|---|---|---|
 | `profile-reflection-weekly` | `23 2 * * 0` | `ProfileReflectionFlow` | Sebas | Proposes one revision of the agent's own **user-context persona doc** from the week's evidence (chat, memories, resolved-interaction corrections, finance, calendar) and sends it as a `draft_review` card. **Nothing is written until you press Approve** — the admin panel shows the proposed document, lets you edit it, and Approve applies exactly what is in the editor; Reject writes nothing and banks your reason as a lesson. Every applied patch lands an `agent_profile_revisions` row (`source='profile_reflection'`) and is revertible. Quiet week, LLM failure, or an unchanged proposal ⇒ no card |
 | `gtd-weekly-review` | `30 3 * * 0` | `WeeklyReviewFlow` | Sebas | Weekly review digest (Sunday) |
-| `receipt-ingest-weekly` | `0 5 * * 0` | `ReceiptIngestFlow` | Maou | 14-day receipt safety net behind the hourly tag fan-out |
+| `receipt-ingest-weekly` | `0 5 * * 0` | `ReceiptIngestFlow` | Maou | Two jobs. It re-scans 14 days of receipt-shaped mail as a safety net behind the hourly tag fan-out, and it sweeps stored receipts that never reached the journal — every `finance.receipt_email` row below `parsed.version = 2`, oldest first, `sweep_limit` rows (default 20) per run. That sweep is also the backfill vehicle: widen `query_window` and raise `sweep_limit` in the row's config and the backlog drains a batch a run. Gated on **Money Hygiene** |
 | `subscription-audit-monthly` | `0 10 1 * *` | `SubscriptionAuditFlow` | Maou | Monthly subscription audit digest |
 | `daylog-weekly` | `20 20 * * 0` | `DayLogFlow` (`mode: weekly`) | Raphael | Condenses the ISO week's day logs into one `aegis://daylog/week/<iso-week>` entry (`source_type='daylog_rollup'`). Sunday, after that day's own 19:00 nightly entry |
 | `daylog-monthly` | `20 21 28-31 * *` | `DayLogFlow` (`mode: monthly`) | Raphael | Same for the calendar month → `aegis://daylog/month/<yyyy-mm>`. Cron has no last-day operator, so it fires on 28-31 and the flow drops every run but the real month end |
@@ -181,9 +181,9 @@ The shipped schedule set (`config/seed/activities.yaml` — all crons UTC):
 Not in this table because they're **event-driven, not scheduled**:
 `InteractionFlow` (spawned by any flow needing a decision),
 `AlertInvestigationFlow` (webhooks + pollers, [§7](#7-the-alert-pipeline)),
-`MoneyProcessFlow` (per-email child), `AgentChatReplyFlow` (Todoist comment
-replies), `AgentTaskFlow` (per-task child of the sweep), and `GitHubAlertFlow`
-(GitHub PR webhook notifier).
+`MoneyProcessFlow` (per-email child: one money email into the books),
+`AgentChatReplyFlow` (Todoist comment replies), `AgentTaskFlow` (per-task child
+of the sweep), and `GitHubAlertFlow` (GitHub PR webhook notifier).
 
 Note the **ship-active-but-inert** pattern: `social-publish-5min`,
 `llm-spend-guard-15min`, `drive-sync-raphael`, `wearable-ingest-6h`,

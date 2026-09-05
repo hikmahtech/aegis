@@ -633,29 +633,49 @@ async def stub_load_receipts(ids: list[str]) -> list[dict]:
     ]
 
 
-@activity.defn(name="classify_and_extract")
-async def stub_classify_and_extract(receipts: list[dict], agent_id: str) -> list[dict]:
-    _calls.setdefault("money_extract", []).append((len(receipts), agent_id))
-    return [
-        {
-            "is_receipt": True,
-            "vendor_name": "Stripe",
-            "sender_label": "stripe.com",
-            "category": "saas",
-            "amount": 9.99,
-            "currency": "USD",
-            "cadence": "monthly",
-            "confidence": 0.95,
-            "receipt_id": r["id"],
-        }
-        for r in receipts
-    ]
+@activity.defn(name="parse_money_email")
+async def stub_parse_money_email(receipt: dict) -> dict:
+    _calls.setdefault("money_parse", []).append(receipt["id"])
+    return {
+        "kind": "transaction",
+        "direction": "out",
+        "amount": "9.99",
+        "currency": "USD",
+        "payee": "Stripe",
+        "payee_key": "stripe",
+        "channel": "card",
+        "occurred_on": "2026-09-02",
+        "entity": "personal",
+        "account": "expenses:software",
+        "parser": "llm",
+        "confidence": 0.95,
+        "source_class": "receipt",
+    }
 
 
-@activity.defn(name="upsert_charges")
-async def stub_upsert_charges(account: str, exts: list[dict]) -> int:
-    _calls.setdefault("money_upsert", []).append((account, len(exts)))
-    return len(exts)
+@activity.defn(name="post_money_event")
+async def stub_post_money_event(
+    receipt_id: str,
+    mailbox: str,
+    message_id: str,
+    event: dict,
+    todoist_ref: str | None = None,
+) -> dict:
+    _calls.setdefault("money_post", []).append((receipt_id, mailbox, event["kind"]))
+    return {
+        "msgid": f"{mailbox}/{message_id}",
+        "status": "posted",
+        "journal_file": "personal/2026.journal",
+        "linked": None,
+        "closed_due": None,
+    }
+
+
+@activity.defn(name="store_money_result")
+async def stub_store_money_result(
+    receipt_id: str, event: dict, journal_file: str | None
+) -> None:
+    _calls.setdefault("money_stamped", []).append((receipt_id, journal_file))
 
 
 @pytest.mark.asyncio
@@ -690,8 +710,9 @@ async def test_financial_tags_trigger_money_process_fanout():
         stub_fetch_message_body,
         stub_store_receipt_body,
         stub_load_receipts,
-        stub_classify_and_extract,
-        stub_upsert_charges,
+        stub_parse_money_email,
+        stub_post_money_event,
+        stub_store_money_result,
     ]
 
     async with (
@@ -713,7 +734,7 @@ async def test_financial_tags_trigger_money_process_fanout():
         # Parent returns immediately (ABANDON); give the child a moment to run.
         for _ in range(100):
             await asyncio.sleep(0.05)
-            if _calls.get("money_upsert"):
+            if _calls.get("money_stamped"):
                 break
 
     assert result["processed"] == 1
@@ -724,8 +745,9 @@ async def test_financial_tags_trigger_money_process_fanout():
     assert _calls.get("money_store_body") == [
         ("uid-msg-receipt-1", "Receipt from Stripe $9.99 Paid")
     ]
-    assert _calls.get("money_extract") == [(1, "maou")]
-    assert _calls.get("money_upsert") == [("sebas", 1)]
+    assert _calls.get("money_parse") == ["uid-msg-receipt-1"]
+    assert _calls.get("money_post") == [("uid-msg-receipt-1", "sebas", "transaction")]
+    assert _calls.get("money_stamped") == [("uid-msg-receipt-1", "personal/2026.journal")]
 
 
 @pytest.mark.asyncio
@@ -750,7 +772,7 @@ async def test_no_tags_skips_money_fanout():
         )
 
     assert not _calls.get("money_store")
-    assert not _calls.get("money_upsert")
+    assert not _calls.get("money_post")
 
 
 # ---------------------------------------------------------------------------

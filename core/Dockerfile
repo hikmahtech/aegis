@@ -28,7 +28,7 @@ FROM python:3.12-slim
 # curl: healthcheck. openssh-client: RemoteScriptConnector SSHes to node-a
 # for infrastructure chat tools and the claude_code task handler.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    curl openssh-client && rm -rf /var/lib/apt/lists/*
+    curl openssh-client git && rm -rf /var/lib/apt/lists/*
 
 # kubectl: infra registry k8s ops (services/infra.py runs it against the
 # per-entry kubeconfig stored encrypted in the DB).
@@ -37,6 +37,17 @@ ARG KUBECTL_VERSION=v1.31.4
 RUN curl -fsSL -o /usr/local/bin/kubectl \
     "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/${TARGETARCH}/kubectl" \
     && chmod +x /usr/local/bin/kubectl
+
+# hledger — the books (spec 2026-09-05-maou-books-design.md §10). Static
+# release binary, pinned by version and checksum.
+ARG HLEDGER_VERSION=1.52.3
+ARG HLEDGER_SHA256=d14a4fc2ac804b556f481b64e8c54efa380db1ac85b3723c9df7b1eeade74b3a
+RUN curl -fsSL -o /tmp/hledger.tgz \
+      "https://github.com/simonmichael/hledger/releases/download/${HLEDGER_VERSION}/hledger-linux-x64.tar.gz" \
+    && echo "${HLEDGER_SHA256}  /tmp/hledger.tgz" | sha256sum -c - \
+    && tar -xzf /tmp/hledger.tgz -C /tmp hledger \
+    && install -m 0755 /tmp/hledger /usr/local/bin/hledger \
+    && rm -f /tmp/hledger.tgz /tmp/hledger
 
 # Optional cloud CLIs — needed only when a registered kubeconfig authenticates
 # via an exec plugin (EKS: `aws eks get-token`, GKE: gke-gcloud-auth-plugin).

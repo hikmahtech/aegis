@@ -76,7 +76,11 @@ from aegis_worker.flows.money_hygiene import MoneyHygieneConfig, MoneyHygieneDai
 from aegis_worker.flows.money_process import MoneyProcessFlow
 from aegis_worker.flows.profile_reflection import ProfileReflectionConfig, ProfileReflectionFlow
 from aegis_worker.flows.raindrop_ingest import RaindropIngestFlow, RaindropIngestInput
-from aegis_worker.flows.receipt_ingest import ReceiptIngestFlow, ReceiptIngestInput
+from aegis_worker.flows.receipt_ingest import (
+    DEFAULT_SENDER_FILTER,
+    ReceiptIngestFlow,
+    ReceiptIngestInput,
+)
 from aegis_worker.flows.review import (
     DailyReviewConfig,
     DailyReviewFlow,
@@ -462,8 +466,13 @@ FLOWS: tuple[FlowSpec, ...] = (
         lambda act: ReceiptIngestInput(
             agent_id=act["agent_id"],
             max_per_account=int(act["config"].get("max_per_account", 50)),
-            query_window=act["config"].get("query_window", "newer_than:14d"),
+            # `or`, not a .get default: a key present but blank must fall back
+            # too. An empty sender_filter is a whole-mailbox query, and every
+            # message it returns is fanned out to MoneyProcessFlow's LLM call.
+            query_window=act["config"].get("query_window") or "newer_than:14d",
             aegis_ui_url=act["_settings"].get("aegis_ui_url", ""),
+            sender_filter=act["config"].get("sender_filter") or DEFAULT_SENDER_FILTER,
+            sweep_limit=int(act["config"].get("sweep_limit", 20)),
         ),
         feature_flag="money_hygiene_enabled",
     ),

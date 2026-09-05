@@ -213,6 +213,93 @@ def _format_receipts_for_prompt(receipts: list[dict]) -> str:
     return "\n".join(parts)
 
 
+_MONEY_EVENT_PROMPT = """\
+You are the bookkeeper. For EACH email below return one JSON object describing
+the money event it carries.
+
+Fields:
+- kind: "transaction" (money actually moved: a receipt, payment confirmation,
+  debit or credit alert), "due" (a bill, card statement, autopay reminder or
+  deadline asking for payment by a date), "failed" (a declined, failed or
+  reversed payment that needs fixing), "info" (statement available, KYC,
+  balance or account notice with no money moving), "ignore" (newsletter,
+  marketing, offers, anything else).
+- direction: "out" (you paid) or "in" (you received); null for info/ignore.
+- amount: number in MAJOR units (245.50, never 24550). Strip commas. Null if none.
+- currency: ISO code. ₹ / Rs / INR -> INR, $ -> USD, £ -> GBP, € -> EUR.
+- payee: the other party (merchant, biller, person, sender of funds) as a
+  display name, never an email address.
+- category: one of saas, media, infra, internet, electricity, mobile,
+  groceries, food, transport, shopping, health, insurance, fees, tax,
+  professional, ads, people, salary, interest, refund, other.
+- channel: one of upi, imps, neft, card, autopay, remittance, receipt, bill,
+  statement, other.
+- instrument: the paying or receiving account as hdfc-1225 (bank + last 4
+  digits), axis-cc-1313 (credit card), card-1313 (card, bank unknown), or null.
+- occurred_on: date money moved, YYYY-MM-DD, or null.
+- due_on: payment-due or fix-by date, YYYY-MM-DD, or null.
+- is_recurring: true for a subscription or utility that bills again, false
+  for a one-off, null if unsure.
+- confidence: 0.0-1.0.
+
+Rules: a number in an advertisement, offer, insurance cover or credit limit
+is NOT a charge (kind ignore). An autopay reminder or a card statement is
+"due", never "transaction". A failed, declined or reversed payment is
+"failed"; a refund you received is a "transaction" with direction "in". A
+statement delivered as a PDF with no figures in the text is "info".
+
+Return a JSON array with EXACTLY one object per email, in the same order,
+inside ```json fences.
+
+EMAILS:
+{emails}
+"""
+
+
+# The ONLY keys `extract_money_batch` accepts from the model — exactly the
+# fields `_MONEY_EVENT_PROMPT` asks for, and it must stay in sync with that
+# list. Everything the model emits is attacker-controlled: the email body goes
+# straight into the prompt, so hostile mail can ask for any key `MoneyEvent`
+# happens to declare. Three of them decide where money lands and are
+# deliberately absent here — `account` (it wins over the category→account map,
+# `post_event` does `event.account or account_for(...)`), `entity` (picks the
+# ledger) and `ref` (free-text provenance). Those keep their model defaults for
+# the caller to set from the mailbox, as do `parser`, `source_class` and
+# `payee_key`, which the extractor forces after this filter.
+_LLM_EVENT_FIELDS = frozenset({
+    "kind",
+    "direction",
+    "amount",
+    "currency",
+    "payee",
+    "category",
+    "channel",
+    "instrument",
+    "occurred_on",
+    "due_on",
+    "is_recurring",
+    "confidence",
+})
+
+
+def _format_money_emails(receipts: list[dict]) -> str:
+    """One block per email for `_MONEY_EVENT_PROMPT`.
+
+    The body is the FULL plain text (capped at 4000 chars), not the 200-char
+    snippet v1 classified on: the due date, the last-4 of the card and the
+    "declined" wording all live below the fold.
+    """
+    parts = []
+    for i, r in enumerate(receipts):
+        parts.append(
+            f"--- Email {i + 1} ---\n"
+            f"From: {r.get('sender', '')}\n"
+            f"Subject: {r.get('subject', '')}\n"
+            f"Body: {(r.get('body_plain') or '')[:4000]}\n"
+        )
+    return "\n".join(parts)
+
+
 class LLMClient:
     """Async LLM client using OpenAI-compatible API."""
 
@@ -790,6 +877,95 @@ class LLMClient:
                         "_parse_failed": True,
                     }
                 )
+        return out
+
+    async def extract_money_batch(
+        self,
+        receipts: list[dict],
+        model: str = "gemma4:e2b",
+        system_prompt: str | None = None,
+        db_pool: Any = None,
+        agent_id: str | None = None,
+    ) -> list[dict]:
+        """One `MoneyEvent` dict per input email (spec §4).
+
+        The v2 extractor. It replaces the "is this a receipt?" question with
+        "what money event is this?", and reads the FULL body rather than the
+        200-char snippet `extract_receipts_batch` saw — a declined payment, an
+        autopay reminder and a paid invoice are only distinguishable further
+        down the mail.
+
+        Failure semantics, deliberately three-way:
+
+        * `LLMTruncationError` — the token budget went on hidden reasoning, so
+          nothing came back for anyone. One `_parse_failed` stub per input, no
+          raise: a bad budget must not take the whole flow down.
+        * any other batch-level failure (upstream error, non-JSON, not an
+          array, `LLMKillSwitchError`) — RAISES, so an outage or a spend
+          freeze surfaces instead of quietly reading as "nothing to book".
+        * a per-item shape failure inside an otherwise-good batch — a stub for
+          that item only; its siblings still book.
+
+        Callers must therefore check `_parse_failed` before writing a row.
+        """
+        from aegis.api.models.money import MoneyEvent, payee_key
+
+        if not receipts:
+            return []
+        stub = {"kind": "ignore", "parser": "llm", "_parse_failed": True}
+        prompt = _MONEY_EVENT_PROMPT.format(emails=_format_money_emails(receipts))
+        try:
+            result = await self.think(
+                prompt=prompt,
+                model=model,
+                system_prompt=system_prompt,
+                max_tokens=4000,
+                db_pool=db_pool,
+                purpose="money_event_extraction",
+                agent_id=agent_id,
+            )
+            parsed = parse_llm_json(result.get("response", ""))
+            if not isinstance(parsed, list):
+                raise ValueError("expected JSON array")
+        except LLMTruncationError as exc:
+            logger.warning(
+                "extract_money_batch_truncated",
+                error=str(exc)[:200],
+                count=len(receipts),
+            )
+            return [dict(stub) for _ in receipts]
+        except Exception as exc:
+            logger.warning(
+                "extract_money_batch_failed",
+                error=str(exc)[:200],
+                count=len(receipts),
+            )
+            raise
+
+        out: list[dict] = []
+        for i in range(len(receipts)):
+            item = parsed[i] if i < len(parsed) and isinstance(parsed[i], dict) else None
+            if item is None:
+                out.append(dict(stub))
+                continue
+            # Keys outside the prompt's field list are dropped rather than
+            # rejected: a model that invents a field must not cost us the whole
+            # event, and one that emits `account`/`entity`/`ref` must not be
+            # able to route the money (see `_LLM_EVENT_FIELDS`).
+            data = {k: v for k, v in item.items() if k in _LLM_EVENT_FIELDS}
+            if isinstance(data.get("amount"), str):
+                data["amount"] = data["amount"].replace(",", "")
+            data["parser"] = "llm"
+            data["source_class"] = (
+                "receipt" if data.get("channel") in ("receipt", "bill") else "other"
+            )
+            try:
+                ev = MoneyEvent(**data)
+            except Exception:
+                out.append(dict(stub))
+                continue
+            ev.payee_key = payee_key(ev.payee)
+            out.append(ev.model_dump(mode="json"))
         return out
 
     async def embed(

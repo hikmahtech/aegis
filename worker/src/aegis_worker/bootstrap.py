@@ -147,6 +147,15 @@ async def bootstrap(settings: Settings | None = None) -> WorkerDeps:
 
     await apply_config_overrides(settings, pool)
 
+    # The books deploy key lands on disk (0600) before any flow git-syncs the
+    # checkout. A bad key is a config error, not a boot failure.
+    from aegis.services.books import install_deploy_key
+
+    try:
+        install_deploy_key(settings)
+    except Exception as exc:  # noqa: BLE001 — a bad key must not block boot
+        logger.warning("books_deploy_key_install_failed", error=str(exc)[:200])
+
     # LLM client + tier map from the configurable backend (DB → env fallback).
     # Cap the fast tier at 2 concurrent calls — it typically shares a GPU with
     # everything else aegis hosts, and bursts serialise through ollama

@@ -10,6 +10,7 @@ import asyncio
 import os
 
 import structlog
+from aegis.services.books import config_from_settings, parse_csv_set, parse_kv
 from temporalio.client import Client
 from temporalio.contrib.opentelemetry import TracingInterceptor
 from temporalio.worker import Worker
@@ -259,6 +260,9 @@ async def main():
             bank_alert_senders=parse_bank_alert_senders(
                 getattr(settings, "bank_alert_senders", "")
             ),
+            books_cfg=config_from_settings(settings),
+            ignored_mailboxes=parse_csv_set(getattr(settings, "books_ignored_mailboxes", "")),
+            mailbox_entities=parse_kv(getattr(settings, "books_mailbox_entities", "")),
         )
 
     channel_act = ChannelActivities(db_pool=deps.pool)
@@ -438,7 +442,12 @@ async def main():
     capture_act = CaptureActivities(
         db_pool=deps.pool,
         connector=todoist_connector,
+        todoist_projects=parse_kv(getattr(settings, "books_todoist_projects", "")),
     )
+    # Dues are captured as Todoist tasks; MoneyActivities is built earlier, so
+    # the link is made here rather than at construction.
+    if money_act is not None:
+        money_act.capture = capture_act
     jira_act = JiraActivities(
         db_pool=deps.pool,
         connector=todoist_connector,

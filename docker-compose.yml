@@ -17,6 +17,14 @@ services:
       # Set AEGIS_CHANNEL=slack + `docker compose --profile slack up` for Slack.
       AEGIS_CHANNEL: ${AEGIS_CHANNEL:-web}
       AEGIS_COMMS_URL: http://comms:8081
+    # Core and worker share ONE /app/config, as the production stack does. The
+    # books checkout (`books_path`, default /app/config/books) lives here, and
+    # a per-container copy would mean two checkouts: the flock on .aegis.lock
+    # would serialise nothing, and a commit whose push failed would die with
+    # the container while journal_index still says `posted`. A NAMED volume,
+    # so the image's config/seed is copied in the first time it is created.
+    volumes:
+      - aegis-config:/app/config
     ports:
       - "8080:8080"
     healthcheck:
@@ -39,6 +47,10 @@ services:
       AEGIS_TEMPORAL_HOST: temporal:7233
       AEGIS_CHANNEL: ${AEGIS_CHANNEL:-web}
       AEGIS_COMMS_URL: http://comms:8081
+    # The same volume as core — see the note there. The worker's flows are the
+    # books' main writer; core installs the deploy key and hosts the tools.
+    volumes:
+      - aegis-config:/app/config
     depends_on:
       core: { condition: service_healthy }
       temporal: { condition: service_healthy }
@@ -141,6 +153,9 @@ services:
 volumes:
   postgres-data:
   ollama-data:
+  # Shared /app/config for core and worker: OAuth token files, the books
+  # deploy key and the books checkout itself.
+  aegis-config:
 
 networks:
   aegis-net:

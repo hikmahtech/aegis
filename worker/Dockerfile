@@ -37,13 +37,24 @@ FROM python:3.12-slim
 # client binary so ServiceDriftFlow can run `docker --context ... service ls`.
 ARG DOCKER_CLI_VERSION=27.3.1
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    openssh-client curl ffmpeg openssl tini \
+    openssh-client curl ffmpeg openssl tini git \
     && curl -fsSL "https://download.docker.com/linux/static/stable/x86_64/docker-${DOCKER_CLI_VERSION}.tgz" \
         | tar -xz -C /tmp \
     && mv /tmp/docker/docker /usr/local/bin/docker \
     && chmod 0755 /usr/local/bin/docker \
     && rm -rf /tmp/docker \
     && rm -rf /var/lib/apt/lists/*
+
+# hledger — the books (spec 2026-09-05-maou-books-design.md §10). Static
+# release binary, pinned by version and checksum.
+ARG HLEDGER_VERSION=1.52.3
+ARG HLEDGER_SHA256=d14a4fc2ac804b556f481b64e8c54efa380db1ac85b3723c9df7b1eeade74b3a
+RUN curl -fsSL -o /tmp/hledger.tgz \
+      "https://github.com/simonmichael/hledger/releases/download/${HLEDGER_VERSION}/hledger-linux-x64.tar.gz" \
+    && echo "${HLEDGER_SHA256}  /tmp/hledger.tgz" | sha256sum -c - \
+    && tar -xzf /tmp/hledger.tgz -C /tmp hledger \
+    && install -m 0755 /tmp/hledger /usr/local/bin/hledger \
+    && rm -f /tmp/hledger.tgz /tmp/hledger
 
 WORKDIR /app
 COPY --from=builder /opt/venv /opt/venv

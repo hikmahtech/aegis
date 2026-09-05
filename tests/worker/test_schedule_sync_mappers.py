@@ -9,6 +9,11 @@ from __future__ import annotations
 from aegis_worker.flows.cert_radar import CertRadarConfig, CertRadarFlow
 from aegis_worker.flows.daily_briefing import DailyBriefingConfig, DailyBriefingFlow
 from aegis_worker.flows.money_hygiene import MoneyHygieneConfig, MoneyHygieneDailyFlow
+from aegis_worker.flows.receipt_ingest import (
+    DEFAULT_SENDER_FILTER,
+    ReceiptIngestFlow,
+    ReceiptIngestInput,
+)
 from aegis_worker.flows.service_drift import ServiceDriftConfig, ServiceDriftFlow
 from aegis_worker.flows.subscription_audit import (
     SubscriptionAuditConfig,
@@ -139,3 +144,49 @@ def test_workspace_repo_sync_flow_mapper_defaults():
     mapper = _ACTIVITY_TYPE_MAP["WorkspaceRepoSyncFlow"]
     _, cfg = mapper(_act("ws-sync", "WorkspaceRepoSyncFlow", {}))
     assert cfg.min_repos == 5
+
+
+def test_receipt_ingest_mapper_takes_an_explicit_sender_filter():
+    """A backfill narrows the scan by overriding the sender filter and window."""
+    mapper = _ACTIVITY_TYPE_MAP["ReceiptIngestFlow"]
+    workflow_cls, cfg = mapper(
+        _act(
+            "receipt-ingest-weekly",
+            "ReceiptIngestFlow",
+            {
+                "sender_filter": "(from:x@y.z)",
+                "query_window": "after:2026/06/30",
+                "sweep_limit": 200,
+            },
+        )
+    )
+    assert workflow_cls is ReceiptIngestFlow
+    assert isinstance(cfg, ReceiptIngestInput)
+    assert cfg.sender_filter == "(from:x@y.z)"
+    assert cfg.query == "(from:x@y.z) after:2026/06/30"
+    assert cfg.sweep_limit == 200
+
+
+def test_receipt_ingest_mapper_falls_back_on_an_empty_sender_filter():
+    """A blank `sender_filter` must NOT mean "no filter" — that query matches
+    the whole mailbox, and every message in it would be fanned out to
+    MoneyProcessFlow and its LLM call. Same for a blank window."""
+    mapper = _ACTIVITY_TYPE_MAP["ReceiptIngestFlow"]
+    _, cfg = mapper(
+        _act(
+            "receipt-ingest-weekly",
+            "ReceiptIngestFlow",
+            {"sender_filter": "", "query_window": ""},
+        )
+    )
+    assert cfg.sender_filter == DEFAULT_SENDER_FILTER
+    assert cfg.query_window == "newer_than:14d"
+    assert cfg.query == f"{DEFAULT_SENDER_FILTER} newer_than:14d"
+
+
+def test_receipt_ingest_mapper_defaults():
+    mapper = _ACTIVITY_TYPE_MAP["ReceiptIngestFlow"]
+    _, cfg = mapper(_act("receipt-ingest-weekly", "ReceiptIngestFlow", {}))
+    assert cfg.sender_filter == DEFAULT_SENDER_FILTER
+    assert cfg.query_window == "newer_than:14d"
+    assert cfg.sweep_limit == 20

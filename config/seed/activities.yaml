@@ -69,8 +69,11 @@ activities:
 
   # Maou — weekly receipt safety-net. Per-message money hygiene is owned by
   # GmailIngestFlow's tag-based fan-out (financial/payments → MoneyProcessFlow).
-  # This run only catches anything the hourly triage missed. The receipt-shaped
-  # sender filter is hardcoded in the flow; only the time window is configurable.
+  # This run only catches anything the hourly triage missed, then sweeps every
+  # receipt_email row still below parsed.version 2 back through the same path.
+  # The sender filter defaults to the bank + vendor senders in the flow;
+  # override with `sender_filter`. `query_window` and `sweep_limit` are the
+  # knobs for a backfill.
   - slug: receipt-ingest-weekly
     workflow_type: ReceiptIngestFlow
     agent_id: maou

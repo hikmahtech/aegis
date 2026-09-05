@@ -122,5 +122,24 @@ jobs:
       - name: Lint
         run: ruff check worker/src/ tests/worker/
 
+      # The money activities drive the journal writer against a real hledger,
+      # and those tests SKIP without the binary — a green run that proved
+      # nothing. Same pinned release and checksum as both Dockerfiles and
+      # .github/workflows/core.yml. Only this job: the flows job mocks its
+      # activities, so it needs hledger only if a flow test ever writes a
+      # journal for real.
+      - name: Install hledger
+        env:
+          HLEDGER_VERSION: "1.52.3"
+          HLEDGER_SHA256: "d14a4fc2ac804b556f481b64e8c54efa380db1ac85b3723c9df7b1eeade74b3a"
+        run: |
+          curl -fsSL -o /tmp/hledger.tgz \
+            "https://github.com/simonmichael/hledger/releases/download/${HLEDGER_VERSION}/hledger-linux-x64.tar.gz"
+          echo "${HLEDGER_SHA256}  /tmp/hledger.tgz" | sha256sum -c -
+          tar -xzf /tmp/hledger.tgz -C /tmp hledger
+          sudo install -m 0755 /tmp/hledger /usr/local/bin/hledger
+          rm -f /tmp/hledger.tgz /tmp/hledger
+          hledger --version
+
       - name: Test
         run: pytest tests/worker/ --ignore=tests/worker/flows -n auto --dist loadfile --timeout=300 -v --tb=short --cov=worker/src/aegis_worker --cov-report=term-missing --cov-report=xml
