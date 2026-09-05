@@ -525,6 +525,87 @@ async def test_apply_curiosity_answer_ignores_an_empty_answer(clean_db):
     )
 
 
+# --------------------------------------------------- post-resolve time budget
+
+
+@pytest.mark.asyncio
+async def test_the_answer_hook_gets_the_books_time_budget_not_30_seconds(clean_db):
+    """A curiosity answer does real ledger work, so it cannot run on the
+    interaction default of 30s.
+
+    `apply_curiosity_answer` does `hledger accounts --declared` (30s of its
+    own), one balanced-tier LLM call, then TWO complete `books._write`
+    protocols — flock, clone-or-pull, mutate, `hledger check --strict`, commit,
+    push. `flows/money_process.py` already had to buy 240s for ONE of those,
+    with the comment that a shorter budget times out mid-clone and burns every
+    retry on the same clone.
+
+    Timing out here is not a clean retry: the work sits in `asyncio.to_thread`
+    and cannot be cancelled, so attempt 2 re-runs `record_memory` (a plain
+    INSERT — a duplicate row) and then blocks on the flock the first attempt
+    still holds. Meanwhile the novelty key is on a resolved interaction, so
+    that payee is never carded again and the owner's answer is spent.
+
+    Asserted from INSIDE the activity via `activity.info()`, so it is the
+    budget Temporal actually applied — not a source string.
+    """
+    await _add_unknown(clean_db, "Zephyrly")
+    budgets: list = []
+
+    @activity.defn(name="apply_curiosity_answer")
+    async def capture(interaction_id, response, metadata):
+        budgets.append(activity.info().start_to_close_timeout)
+        return {"recorded": True}
+
+    cur = CuriosityActivities(db_pool=clean_db, llm_client=None)
+    inter = InteractionActivities(clean_db)
+    async with await WorkflowEnvironment.start_time_skipping() as env:
+        with env.auto_time_skipping_disabled():
+            task_queue = f"tq-{uuid4().hex[:8]}"
+            async with Worker(
+                env.client,
+                task_queue=task_queue,
+                workflows=[CuriosityCardFlow, InteractionFlow],
+                activities=[
+                    cur.check_curiosity_budget,
+                    cur.find_curiosity_gaps,
+                    cur.record_curiosity_card,
+                    inter.insert_interaction,
+                    inter.resolve_interaction,
+                    inter.apply_interaction_timeout,
+                    inter.update_interaction_delivery_ref,
+                    capture,
+                    _stub_card([]),
+                    _stub_resolve([], {"finance": FINANCE_AGENT}),
+                ],
+            ):
+                result = await env.client.execute_workflow(
+                    CuriosityCardFlow.run,
+                    CuriosityConfig(agent_id=AGENT),
+                    id=f"curiosity-budget-{uuid4().hex[:8]}",
+                    task_queue=task_queue,
+                )
+                assert result["status"] == "sent", result
+                # The card child is ABANDONED and deterministic-id'd, so the
+                # owner's answer is a signal to that id.
+                handle = env.client.get_workflow_handle("curiosity-payee_zephyrly")
+                await handle.signal(InteractionFlow.submit_response, {"value": "my grocer"})
+                await _wait_for(_async(lambda: budgets))
+
+    assert budgets, "the post-resolve hook never ran — this test proves nothing"
+    assert budgets[0] == timedelta(seconds=240), budgets
+
+
+def test_other_post_resolve_hooks_keep_the_short_default():
+    """Clarify's Todoist hooks are quick API calls; they must NOT inherit the
+    ledger budget just because curiosity needed one."""
+    from aegis_worker.flows.interaction import InteractionFlowInput
+
+    assert InteractionFlowInput(
+        agent_id="a", kind="input", origin="clarify", prompt="q"
+    ).post_resolve_timeout_seconds == 30
+
+
 # ------------------------------------------------------------------ registration
 
 

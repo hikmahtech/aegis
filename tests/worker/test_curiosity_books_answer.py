@@ -518,6 +518,43 @@ async def test_another_payee_is_left_alone(clean_db, tmp_path):
     assert await _account_of(clean_db, other) == "expenses:unknown"
 
 
+async def test_a_credit_from_the_same_payee_is_left_alone(clean_db, tmp_path):
+    """The owner explained money they PAID this payee. A credit from the same
+    name — a refund, a transfer back — is not what they explained, and filing
+    it to an expense account would put income in the wrong half of the books."""
+    cfg = _repo(tmp_path)
+    paid = await _post(clean_db, cfg)
+    refund = await _post(clean_db, cfg, day=6)
+    await clean_db.execute(
+        "UPDATE finance.journal_index SET direction = 'in', account = 'income:unknown' "
+        "WHERE message_id = $1",
+        refund,
+    )
+    llm = FakeLLM('{"account": "expenses:groceries", "confidence": 0.9}')
+
+    out = await _apply(clean_db, cfg, llm)
+
+    assert out["reclassified"] == 1
+    assert await _account_of(clean_db, paid) == "expenses:groceries"
+    assert await _account_of(clean_db, refund) == "income:unknown"
+
+
+async def test_a_rule_from_an_answer_never_fires_on_the_sender(clean_db, tmp_path):
+    """`apply_rules` matches "<sender> | <payee>", and this is the only place a
+    rule is written with no human authoring the regex — so the pattern it
+    persists has to be pinned to the payee half of that haystack."""
+    cfg = _repo(tmp_path)
+    await _post(clean_db, cfg)
+    llm = FakeLLM('{"account": "expenses:groceries", "confidence": 0.9}')
+
+    await _apply(clean_db, cfg, llm)
+
+    rules = _rules(cfg)
+    assert books.apply_rules(rules, "", PAYEE) == rules[0]
+    # A mail whose FROM happens to carry the payee's words, about someone else.
+    assert books.apply_rules(rules, f"{KEY.replace(' ', '-')}@bank.example", "Mahavitaran") is None
+
+
 async def test_a_payee_spelling_variant_matches_the_rule(clean_db, tmp_path):
     """One biller arrives under several spellings — that is why the detector
     groups by `payee_key` at all. A rule escaping ONE spelling would leave the

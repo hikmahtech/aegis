@@ -77,13 +77,14 @@ async def _add_unknown(
     currency: str = "INR",
     account: str = "expenses:unknown",
     days_ago: int = 1,
+    direction: str = "out",
 ):
     """One payment the books could not categorise — what the detector reads."""
     await pool.execute(
         "INSERT INTO finance.journal_index "
         "(message_id, mailbox, entity, kind, direction, amount, currency, payee, payee_key, "
         " account, channel, occurred_on, parser, source_class, journal_file) "
-        "VALUES ($1, $2, 'personal', 'transaction', 'out', $3, $4, $5, $6, $7, 'upi', $8, "
+        "VALUES ($1, $2, 'personal', 'transaction', $9, $3, $4, $5, $6, $7, 'upi', $8, "
         " 'test', 'bank', 'personal/2026.journal')",
         f"{MAILBOX}/{uuid4()}",
         MAILBOX,
@@ -93,6 +94,7 @@ async def _add_unknown(
         payee_key(payee),
         account,
         date.today() - timedelta(days=days_ago),
+        direction,
     )
 
 
@@ -182,6 +184,24 @@ async def test_rows_older_than_the_window_are_ignored(clean_db):
     out = await _run(clean_db)
 
     assert [c["subject"] for c in out] == ["Fresh Shop"]
+
+
+async def test_money_that_came_in_is_never_carded_as_money_you_paid(clean_db):
+    """`income:unknown` matches `%:unknown` too, and the card says "You paid".
+
+    An uncategorised inbound credit would produce "You paid ₹42,000.00 to
+    Nkgsb Bank … What was it for?" — false, on the one surface allowed to
+    interrupt the owner, and it steers the account-picking model toward an
+    expense account for money that came IN.
+    """
+    await _add_unknown(
+        clean_db, "Nkgsb Bank", 42000.0, account="income:unknown", direction="in"
+    )
+    await _add_unknown(clean_db, "Queued Shop", 500.0)
+
+    out = await _run(clean_db)
+
+    assert [c["subject"] for c in out] == ["Queued Shop"]
 
 
 async def test_a_categorised_payment_is_not_a_gap(clean_db):
@@ -280,6 +300,13 @@ async def test_novelty_key_on_resolved_interaction_is_excluded(clean_db):
     assert await _run(clean_db) == []
 
 
+def _matches(match: str, sender: str, payee: str) -> bool:
+    """`books.apply_rules`' own haystack, so this tests the real matching."""
+    from aegis.services import books
+
+    return books.apply_rules([{"match": match, "account": "x"}], sender, payee) is not None
+
+
 def test_rule_match_for_covers_every_punctuation_variant():
     """The regex a card's answer turns into a permanent rule.
 
@@ -288,22 +315,55 @@ def test_rule_match_for_covers_every_punctuation_variant():
     words, one bounded class between them, and nothing at all when there is no
     key to build it from.
     """
-    import re
-
     from aegis_worker.activities.curiosity import rule_match_for
 
     match = rule_match_for("mahavitaran msedcl")
-    assert match == "mahavitaran[^a-z0-9]+msedcl"
+    assert match == r"\|[^|]*mahavitaran[^a-z0-9]+msedcl"
     for variant in ("Mahavitaran (MSEDCL)", "Mahavitaran - MSEDCL", "mahavitaran_msedcl"):
-        assert re.search(match, variant, re.I), variant
-    assert not re.search(match, "Mahavitaran Ltd")
+        assert _matches(match, "", variant), variant
+    assert not _matches(match, "", "Mahavitaran Ltd")
 
     assert rule_match_for("") == ""
     assert rule_match_for("   ") == ""
-    # Capped two ways, so one absurd payee cannot persist a 4KB pattern. The
-    # index does not length-cap `payee`, so both caps are reachable.
-    assert rule_match_for(" ".join(f"w{i}" for i in range(40))).count("[^a-z0-9]+") == 5
-    assert rule_match_for(" ".join("z" * 60 for _ in range(6))) == ""
+
+
+def test_a_rule_never_matches_on_the_sender_alone():
+    """`apply_rules` matches against "<sender> | <payee>", so an unanchored
+    pattern fires on the mail's FROM address too.
+
+    That is not academic: Google Pay mirrors MSEDCL, Airtel and the rest
+    (`bank_parsers.parse_gpay_bill` exists for it), so one confident answer
+    about a payee called "Google" would re-file — and rename — every
+    Google-Pay-mirrored bill. This is the first place a rule is written with
+    no human authoring the regex, so it is anchored to the payee half.
+    """
+    from aegis_worker.activities.curiosity import rule_match_for
+
+    match = rule_match_for("google")
+
+    assert _matches(match, "", "Google Play")
+    assert _matches(match, "noreply@google.com", "Google Play")
+    # Same mail, a payee the rule was never answered about.
+    assert not _matches(match, "google-pay-noreply@google.com", "Mahavitaran (MSEDCL)")
+
+
+def test_an_over_long_payee_key_yields_no_rule_rather_than_a_prefix():
+    """Both caps REFUSE; neither truncates.
+
+    A truncated pattern is a prefix rule — strictly broader than the payee the
+    owner actually answered about, persisted forever and applied unattended.
+    'Payment to merchant via Google Pay UPI Zomato' clipped to its first six
+    words would file every 'payment to merchant via google pay' anything.
+    """
+    from aegis_worker.activities.curiosity import rule_match_for
+
+    assert rule_match_for("payment to merchant via google pay upi zomato") == ""
+    assert rule_match_for(" ".join(f"w{i}" for i in range(40))) == ""
+    # Six words is still fine; it is the seventh that refuses.
+    assert rule_match_for("a b c d e f") != ""
+    assert rule_match_for("a b c d e f g") == ""
+    # ...and the length cap refuses independently of the word count.
+    assert rule_match_for(" ".join("z" * 60 for _ in range(3))) == ""
 
 
 async def test_archived_interaction_suppresses(clean_db):

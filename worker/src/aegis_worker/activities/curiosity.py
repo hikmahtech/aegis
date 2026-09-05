@@ -68,9 +68,19 @@ _UNKNOWN_CURRENCY = "INR"
 _RULE_CONFIDENCE = 0.8
 # Bounds on the generated rule regex, mirroring `services/tools/ledger.py`:
 # the pattern is persisted and then run against every incoming money event in
-# another process, forever.
+# another process, forever. BOTH bounds refuse; neither truncates — a clipped
+# pattern is a PREFIX rule, strictly broader than the payee the owner answered
+# about, and this is the one place a rule is written with no human authoring it.
 _MAX_RULE_WORDS = 6
 _MAX_RULE_MATCH = 200
+# `books.apply_rules` matches against "<sender> | <payee>", so an unanchored
+# pattern also fires on the mail's FROM address. That is live: Google Pay
+# mirrors MSEDCL, Airtel and the rest (hence `bank_parsers.parse_gpay_bill`),
+# so an unanchored rule from a payee called "Google" would re-file — and
+# rename — every Google-Pay-mirrored bill. This prefix pins the match to the
+# payee half; the ledger tool's sweep passes an empty sender, whose haystack
+# still starts " | ", so that call site is unaffected.
+_PAYEE_HALF = r"\|[^|]*"
 
 
 def rule_match_for(payee_key: str) -> str:
@@ -86,10 +96,17 @@ def rule_match_for(payee_key: str) -> str:
 
     Cheap to run and impossible to make invalid: `payee_key` yields only
     `[a-z0-9]` words, so the result is literal words separated by one bounded
-    character class — no nesting, no alternation, no backtracking blowup.
+    character class — no nesting, no alternation, and no ambiguity between
+    adjacent atoms, so no backtracking blowup.
+
+    Returns "" when there is nothing to build from or the result would breach
+    either bound. The caller then writes no rule at all: the answer is already
+    banked as memory, and no rule beats a rule broader than the question.
     """
-    words = [re.escape(w) for w in (payee_key or "").split()[:_MAX_RULE_WORDS]]
-    match = "[^a-z0-9]+".join(words)
+    words = [re.escape(w) for w in (payee_key or "").split()]
+    if not words or len(words) > _MAX_RULE_WORDS:
+        return ""
+    match = _PAYEE_HALF + "[^a-z0-9]+".join(words)
     return match if len(match) <= _MAX_RULE_MATCH else ""
 
 
@@ -272,7 +289,13 @@ class CuriosityActivities:
             "SELECT payee_key, max(payee) AS payee, sum(amount) AS total, count(*) AS n, "
             "max(occurred_on) AS last_on, max(channel) AS channel "
             "FROM finance.journal_index "
-            "WHERE kind = 'transaction' AND account LIKE '%:unknown' "
+            # `direction = 'out'` is not a nicety. `income:unknown` matches
+            # `%:unknown` too, so without it an uncategorised inbound credit is
+            # carded as "You paid ₹42,000.00 to Nkgsb Bank … What was it for?"
+            # — false, on the one surface allowed to interrupt the owner, and
+            # it steers the account-picking model toward an EXPENSE account for
+            # money that came in.
+            "WHERE kind = 'transaction' AND direction = 'out' AND account LIKE '%:unknown' "
             f"AND occurred_on >= now() - interval '{_UNKNOWN_DAYS} days' AND currency = $1 "
             "GROUP BY payee_key ORDER BY total DESC LIMIT 50",
             _UNKNOWN_CURRENCY,
@@ -621,8 +644,12 @@ class CuriosityActivities:
 
         rows = await self.db_pool.fetch(
             "SELECT message_id FROM finance.journal_index "
-            "WHERE payee_key = $1 AND kind = 'transaction' AND account LIKE '%:unknown' "
-            "AND journal_file IS NOT NULL",
+            # Same `direction = 'out'` as the detector, and for the same
+            # reason: the owner was asked about money they PAID this payee, so
+            # a credit from the same name (a refund, a transfer back) is not
+            # what they explained and must not be filed to an expense account.
+            "WHERE payee_key = $1 AND kind = 'transaction' AND direction = 'out' "
+            "AND account LIKE '%:unknown' AND journal_file IS NOT NULL",
             key,
         )
         msgids = [r["message_id"] for r in rows]

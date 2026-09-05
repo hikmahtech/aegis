@@ -57,6 +57,18 @@ _OWNER_SENSITIVE = ("calendar_attendee",)
 
 _ID_SAFE = re.compile(r"[^a-zA-Z0-9_.-]+")
 
+# `apply_curiosity_answer` is not a quick label write. For an `unknown_payee`
+# card it reads the declared chart with hledger, asks the balanced tier for an
+# account, then runs TWO complete `books._write` protocols — flock,
+# clone-or-pull, mutate, `hledger check --strict`, commit, push. The interaction
+# default of 30s cannot hold that, and `flows/money_process.py` already had to
+# buy 240s for ONE books write, with the note that a shorter budget times out
+# mid-clone and burns every retry on the same clone. Timing out here costs the
+# owner's answer outright: the thread cannot be cancelled, the retry duplicates
+# the memory row and then blocks on the flock, and the novelty key already sits
+# on a resolved interaction — so that payee is never carded again.
+_ANSWER_TIMEOUT_S = 240
+
 
 @dataclass
 class CuriosityConfig:
@@ -169,6 +181,7 @@ class CuriosityCardFlow:
                         timeout_policy="archive",
                         metadata=metadata,
                         post_resolve_activity="apply_curiosity_answer",
+                        post_resolve_timeout_seconds=_ANSWER_TIMEOUT_S,
                     ),
                     id=child_id,
                     parent_close_policy=workflow.ParentClosePolicy.ABANDON,
