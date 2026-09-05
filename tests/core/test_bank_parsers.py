@@ -276,3 +276,24 @@ def test_amount_and_currency_helpers():
     assert bp.currency_from("USD") == "USD" and bp.currency_from("$") == "USD"
     assert bp.currency_from("GBP") == "GBP" and bp.currency_from("£") == "GBP"
     assert bp.currency_from("€") == "EUR" and bp.currency_from("xyz") is None
+
+def test_is_autopay_reads_the_phrasings_real_mail_uses():
+    """Grounded in the four autopay notices that became chores on 2026-09-05.
+
+    Each string below is copied from a live email body or subject; the
+    non-autopay ones are the real bills that must keep their task.
+    """
+    from aegis.services.bank_parsers import is_autopay
+
+    assert is_autopay("Confirmation required to process Auto Pay")
+    assert is_autopay("your auto debit payment is due. Amount to be debited: USD 200.00")
+    assert is_autopay("your subscription automatically renews for Rs 149.00/month")
+    assert is_autopay("scheduled to automatically renew on 2026-07-20")
+    assert is_autopay("your 200 GB storage plan automatically renews monthly")
+    assert is_autopay("We automatically renewed registration for the domain")
+
+    # The real bills, which still need a task.
+    assert not is_autopay("New bill from Axis Bank Credit Card. Pay now on Google Pay")
+    assert not is_autopay("Bill Amount: Rs. 55275.34 Due Date: Aug 4, 2026 Pay Now")
+    assert not is_autopay("Your electricity bill for August is ready. Pay by 11-08-2026")
+    assert not is_autopay("")

@@ -552,3 +552,41 @@ async def test_an_undeclared_account_also_lands_in_post_failed(db_pool, tmp_path
     row = await ji.get(db_pool, "v2-personal/m-nochart")
     assert row is not None and row["journal_file"] is None
     assert journal.read_text() == before  # the write reverted
+
+
+@pytest.mark.asyncio
+async def test_parse_marks_a_charge_that_happens_by_itself(db_pool, tmp_path):
+    """The notices that became chores live on 2026-09-05 all say so in the
+    body: Apple "automatically renews", AWS "scheduled to automatically
+    renew", Axis "auto debit payment is due". None of them is a bill anyone
+    has to pay, so the parse stamps them and `capture_due` drops the task.
+    """
+    llm = AsyncMock()
+    llm.extract_money_batch = AsyncMock(return_value=[{
+        "kind": "due", "direction": "out", "amount": "149.00", "currency": "INR",
+        "payee": "Apple Fitness+", "payee_key": "apple fitness", "channel": "bill",
+        "due_on": "2099-07-14", "confidence": 0.9, "parser": "llm",
+        "source_class": "receipt",
+    }])
+    act = _act(db_pool, _repo(tmp_path), llm=llm)
+    ev = await ActivityEnvironment().run(
+        act.parse_money_email,
+        _receipt(sender="no_reply@apple.com", subject="Your Subscription Renewal",
+                 body="Starting from 14 July 2099, your subscription automatically "
+                      "renews for Rs 149.00/month."),
+    )
+    assert ev["kind"] == "due" and ev["autopay"] is True
+
+    # A real bill keeps its task: nothing in it says the money moves by itself.
+    llm.extract_money_batch = AsyncMock(return_value=[{
+        "kind": "due", "direction": "out", "amount": "8100.00", "currency": "INR",
+        "payee": "Mahavitaran", "payee_key": "mahavitaran", "channel": "bill",
+        "due_on": "2099-08-11", "confidence": 0.9, "parser": "llm",
+        "source_class": "receipt",
+    }])
+    ev = await ActivityEnvironment().run(
+        act.parse_money_email,
+        _receipt(sender="billing@mahadiscom.in", subject="Your electricity bill",
+                 body="Your bill of Rs 8100.00 is ready. Pay by 11-08-2099."),
+    )
+    assert ev["autopay"] is False
