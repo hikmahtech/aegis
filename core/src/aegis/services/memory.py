@@ -38,11 +38,25 @@ _UNLEARNABLE_ORIGINS = frozenset({"agent_run_gate"})
 async def record_memory(
     pool: Any, agent_id: str, content: str, importance: float = 0.5, source: str = "correction"
 ) -> None:
+    """Write one durable lesson. Re-writing the same lesson is a NO-OP.
+
+    This runs inside `InteractionFlow`'s post-resolve hook, which Temporal
+    retries (`maximum_attempts=2`), and the curiosity hook's 240s books budget
+    can expire mid-flight — so attempt 2 arrives with byte-identical content
+    (issue #389). `ON CONFLICT DO NOTHING` against the partial unique index
+    from migration 028 keeps that a single belief.
+
+    Deliberately NOT a SELECT-then-INSERT: the check-then-write race is exactly
+    what a concurrent retry reproduces. The `WHERE` clause is not optional — an
+    `ON CONFLICT` arbiter for a PARTIAL index has to repeat that index's
+    predicate, or Postgres cannot infer it and raises.
+    """
     content = (content or "").strip()
     if not content:
         return
     await pool.execute(
-        "INSERT INTO agent_memory (agent_id, content, importance, source) VALUES ($1,$2,$3,$4)",
+        "INSERT INTO agent_memory (agent_id, content, importance, source) VALUES ($1,$2,$3,$4) "
+        "ON CONFLICT (agent_id, md5(content)) WHERE superseded_at IS NULL DO NOTHING",
         agent_id,
         content[:2000],
         float(importance),
@@ -246,13 +260,34 @@ _SQL_RETIRE = (
     "last_consolidated_at = now() "
     "WHERE id = $2 AND agent_id = $1 AND superseded_at IS NULL"
 )
+# The two writing ops both step around the migration-028 unique index instead
+# of raising on it. That is not politeness: the whole plan runs in ONE
+# transaction ("applied whole or not at all"), so one collision would take
+# every other op in the plan down with it and propagate out of
+# `apply_consolidation`, which has no try/except around `_run`. Both forms
+# below leave a "touched no row" status (`UPDATE 0` / `INSERT 0 0`), which
+# `_run` already reads as `no_rows_affected` — so the op lands on the existing
+# skip path and the ledger records what happened.
+#
+# UPDATE needs a hand-written NOT EXISTS rather than ON CONFLICT, which UPDATE
+# does not have. Note the three parts of the predicate, all load-bearing:
+# `superseded_at IS NULL` because the index is partial and a retired row must
+# not veto a live rewrite; `id <> $2` so a row rewriting its OWN content (an
+# importance-only edit) does not find itself and refuse; and `md5()` on both
+# sides to match the index's key exactly.
+#
+# UPDATE is the op MOST likely to hit the index, not the least: collapsing two
+# near-duplicate beliefs onto one canonical text is what consolidation is for.
 _SQL_UPDATE = (
     "UPDATE agent_memory SET content = $3, importance = $4, last_consolidated_at = now() "
-    "WHERE id = $2 AND agent_id = $1 AND superseded_at IS NULL"
+    "WHERE id = $2 AND agent_id = $1 AND superseded_at IS NULL "
+    "AND NOT EXISTS (SELECT 1 FROM agent_memory a2 WHERE a2.agent_id = $1 "
+    "AND md5(a2.content) = md5($3::text) AND a2.superseded_at IS NULL AND a2.id <> $2)"
 )
 _SQL_ADD = (
     "INSERT INTO agent_memory (agent_id, content, importance, source, last_consolidated_at) "
-    "VALUES ($1, $2, $3, 'consolidation', now())"
+    "VALUES ($1, $2, $3, 'consolidation', now()) "
+    "ON CONFLICT (agent_id, md5(content)) WHERE superseded_at IS NULL DO NOTHING"
 )
 _SQL_LOG = (
     "INSERT INTO agent_memory_ops_log "
