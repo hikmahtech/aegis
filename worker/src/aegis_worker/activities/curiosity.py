@@ -81,9 +81,10 @@ _MAX_RULE_MATCH = 200
 # rename — every Google-Pay-mirrored bill. This prefix pins the match to the
 # payee half, which is the answer FOR A RULE NOBODY REVIEWS: the owner named
 # one payee, so the rule may only mean that payee. `ledger_add_rule` writes
-# unanchored rules on purpose (six live rules key on the sender's address, and
-# a human is in that loop) and its sweep now runs them against the real sender,
-# so both writers are matched against the same haystack a real event brings.
+# unanchored rules on purpose — five live rules carry an address literal that
+# appears in no payee, and more of them match live mail only through the
+# sender, with a human in that loop — and its sweep now runs them against the
+# real sender, so both writers see the haystack a real event brings.
 _PAYEE_HALF = r"\|[^|]*"
 
 

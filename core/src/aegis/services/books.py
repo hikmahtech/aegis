@@ -242,10 +242,12 @@ _PAYEE_MAX = 80
 _TAG_MAX = 80
 # How much of a From header a rule may be matched against. Looser than
 # `_PAYEE_MAX` on purpose: a sender's discriminating part is the address at the
-# END (`invoicing@aws\.com`, `ebill@airtel\.com` and four more live rules key
-# on one), so a tight clip would silently stop those matching behind a long
-# display name. Measured over 400 live receipts, the longest sender is 77
-# characters, so this is headroom rather than a limit anything meets.
+# END, and five live rules carry an address literal (`invoicing@aws\.com`,
+# `ebill@airtel\.com`, `@stockopedia\.com`, `resend\.com`, `registrar\.amazon`)
+# that appears in no payee — so a tight clip would silently stop those matching
+# behind a long display name. Measured over 400 live receipts, the longest
+# sender is 77 characters, so this is headroom rather than a limit anything
+# meets.
 _SENDER_MAX = 200
 _POSTING_RE = re.compile(r"^    (\S+)(?:\s{2,}(\S.*))?$")
 

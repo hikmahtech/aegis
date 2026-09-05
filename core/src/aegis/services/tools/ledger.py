@@ -686,8 +686,6 @@ async def _exec_ledger_add_rule(
             sender_only.append(row["message_id"])
     capped = len(targets) > _MAX_APPLY
     targets = targets[:_MAX_APPLY]
-    kept = set(targets)
-    sender_hits = sum(1 for m in sender_only if m in kept)
     try:
         # ONE write for the whole backlog: one flock, one strict check, one
         # commit, one push. Per-posting writes would hold the books against
@@ -707,6 +705,13 @@ async def _exec_ledger_add_rule(
     # thinking about Google, not about every bill Google Pay mirrors. Naming
     # the sender-only share turns the number into something the caller can act
     # on while the rule is still one edit old.
+    #
+    # Counted over `rewritten`, NOT over `targets`: the sentence beside it says
+    # how many postings MOVED, so a share taken from the wider set would read
+    # as "reclassified 2 postings (1 failed); 3 matched the sender" — true,
+    # since matching is not moving, and unreadable as anything but a mistake.
+    moved_ids = set(rewritten)
+    sender_hits = sum(1 for m in sender_only if m in moved_ids)
     if sender_hits:
         tail += (
             f"; {sender_hits} matched the sender rather than the payee, "

@@ -637,6 +637,50 @@ async def test_a_failure_after_the_rule_is_written_does_not_claim_otherwise(
     assert "expenses:unknown" in _journal(cfg)
 
 
+async def test_a_backlog_failure_with_no_rule_still_says_nothing_was_written(
+    clean_db, tmp_path, monkeypatch
+):
+    """The INVERSE lie, and the reason the split above is conditional.
+
+    `rule_match_for` returns "" for a payee key too long to turn into a safe
+    pattern, and then `append_rule` is never called. If the same failure were
+    reported the same way, the owner would be told the rule is saved when
+    nothing at all was written — the exact bug fixed above, pointing the other
+    way. So the handler re-raises when no rule was written, and the caller's
+    "nothing was written" sentence is correct again.
+
+    The over-long payee makes this reachable in production, not hypothetical:
+    it is the shape `test_a_refused_rule_still_applies_the_backlog` covers, one
+    failed pull later.
+    """
+    cfg = _repo(tmp_path)
+    msgid = await _post(clean_db, cfg, payee=LONG_PAYEE)
+    llm = FakeLLM('{"account": "expenses:groceries", "confidence": 0.9}')
+    delivery = FakeDelivery()
+
+    async def boom(*_a, **_k):
+        raise books.BooksError("pull failed: the remote moved on")
+
+    monkeypatch.setattr(books, "rewrite_events", boom)
+
+    out = await _apply(
+        clean_db,
+        cfg,
+        llm,
+        delivery=delivery,
+        meta=_meta(subject=LONG_PAYEE, payee_key=payee_key(LONG_PAYEE)),
+    )
+
+    # Nothing reached the file, so the generic sentence is the true one.
+    assert _rules_text(cfg).strip() == "", _rules_text(cfg)
+    assert out["recorded"] is True
+    assert out["rule"] is None
+    assert out["reason"] == "books_failed"
+    assert not out.get("backlog_failed")
+    assert delivery.sent and "nothing was written" in delivery.sent[0], delivery.sent
+    assert await _account_of(clean_db, msgid) == "expenses:unknown"
+
+
 # --------------------------------------------------------------- lane is gated
 
 

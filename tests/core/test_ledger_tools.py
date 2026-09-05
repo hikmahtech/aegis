@@ -739,17 +739,23 @@ async def test_post_refuses_an_account_the_other_books_own(db_pool, tmp_path):
 
     before = _journals(cfg)
     commits = _commits(cfg)
-    for entity, account in (("hikmah", "expenses:saas"), ("personal", "expenses:hikmah:saas")):
+    # EVERY posting is checked, not just the first. The second case puts the
+    # offending account LAST, behind an entity-neutral bank posting — a model
+    # writes `[assets:bank:…, expenses:hikmah:saas]` as readily as the reverse,
+    # and a check narrowed to `accounts[:1]` passes the first case alone.
+    for entity, account, offender_last in (
+        ("hikmah", "expenses:saas", False),
+        ("personal", "expenses:hikmah:saas", True),
+    ):
+        wrong = {"account": account, "amount": "5", "currency": "INR"}
+        bank = {"account": "assets:bank:hdfc:1225"}
         out = await _exec_ledger_post(
             db_pool,
             {
                 "date": "2026-09-04",
                 "payee": "Wrong books",
                 "entity": entity,
-                "postings": [
-                    {"account": account, "amount": "5", "currency": "INR"},
-                    {"account": "assets:bank:hdfc:1225"},
-                ],
+                "postings": [bank, wrong] if offender_last else [wrong, bank],
             },
             ctx,
         )
@@ -1168,9 +1174,14 @@ async def test_add_rule_sweeps_with_the_sender_the_worker_will_use(db_pool, tmp_
     mirrored = _unknown_event(payee=f"Electricity board {TOKEN}")
     await books.post_event(mirrored, "tool-t/zzt4m", cfg)
     await ji.upsert(db_pool, "tool-t/zzt4m", "tool-t", mirrored, journal_file="personal/2026.journal")
+    # Upserted, like every other write in this file: the test databases are
+    # keyed on the xdist worker alone, so a row left behind by a crashed run in
+    # another suite or worktree must not turn this into a duplicate-key error.
     await db_pool.execute(
         "INSERT INTO finance.receipt_email (message_id, account, sender, subject, received_at) "
-        "VALUES ($1, 'tool-t', $2, 'bill', now())",
+        "VALUES ($1, 'tool-t', $2, 'bill', now()) "
+        "ON CONFLICT (message_id) DO UPDATE "
+        "SET sender = EXCLUDED.sender, account = EXCLUDED.account",
         "zzt4m",  # `<mailbox>/<gmail id>` — the sweep joins on the half after the slash
         f"Zzt4pay Bills {TOKEN} <noreply@zzt4pay.example>",
     )

@@ -385,10 +385,11 @@ def test_rule_haystack_is_bounded():
     80 is not an arbitrary number: `sanitize_payee` clips the payee to it, so
     text past the cap is text the journal will never carry. The sender half
     gets its own, looser bound — it is a From header, whose discriminating
-    part is the address at the END (`invoicing@aws\\.com`, `ebill@airtel\\.com`
-    and four more live rules key on one), so clipping it as tightly would
-    silently stop those rules matching behind a long display name. Measured
-    over 400 live receipts, the longest sender is 77 characters.
+    part is the address at the END, and five live rules carry an address
+    literal (`invoicing@aws\\.com`, `ebill@airtel\\.com`, `@stockopedia\\.com`,
+    `resend\\.com`, `registrar\\.amazon`) that appears in no payee. Clipping the
+    sender as tightly would silently stop those matching behind a long display
+    name. Measured over 400 live receipts, the longest sender is 77 characters.
     """
     rules = [{"match": "needle", "account": "expenses:groceries"}]
     assert books.apply_rules(rules, "", "x" * 60 + " needle", direction="out") is not None
