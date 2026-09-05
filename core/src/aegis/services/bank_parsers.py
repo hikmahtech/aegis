@@ -45,16 +45,33 @@ def currency_from(token: str) -> str | None:
 # ("automatically renews monthly") and AWS ("scheduled to automatically
 # renew"). Deliberately NOT model-supplied — `_LLM_EVENT_FIELDS` must never
 # gain this, or a crafted body could silence a real bill.
-_AUTOPAY_RE = re.compile(
-    r"auto[\s-]?(?:pay|debit|renew)"
-    r"|automatic(?:ally)?[\s-]+(?:renew|debit|charg|pay)",
+_AUTO = r"(?:auto[\s-]?(?:pay|debit|renew)\w*|automatic(?:ally)?[\s-]+(?:renew|debit|charg|pay)\w*)"
+_AUTOPAY_RE = re.compile(_AUTO, re.I)
+
+# ...except when the mail says autopay is OFF, where the same words carry the
+# opposite meaning. GitHub's monthly bill reads "auto-pay for recurring
+# payments is currently disabled for your account due to the new RBI
+# regulation" — a real $4.00 somebody has to pay by hand. Caught in prod
+# minutes after the first version of this shipped.
+#
+# The two mistakes do not cost the same: a phantom task is noise, a suppressed
+# bill is a missed payment. So the negation wins, it is matched in either word
+# order, and the vocabulary stays narrow — "cancelled" is deliberately absent
+# because "renews monthly ... until cancelled" is ordinary subscription
+# boilerplate, not a switch being off. Sentence punctuation bounds the window
+# so a negation two sentences away cannot reach back.
+_AUTOPAY_OFF = r"(?:disabled|deactivated|not enabled|turned off|switched off|unavailable)"
+_AUTOPAY_OFF_RE = re.compile(
+    rf"{_AUTO}[^.!?]{{0,80}}?\b{_AUTOPAY_OFF}\b"
+    rf"|\b{_AUTOPAY_OFF}\b[^.!?]{{0,40}}?{_AUTO}",
     re.I,
 )
 
 
 def is_autopay(text: str) -> bool:
     """True when the mail says the charge happens without the user acting."""
-    return bool(_AUTOPAY_RE.search(text or ""))
+    t = text or ""
+    return bool(_AUTOPAY_RE.search(t)) and not _AUTOPAY_OFF_RE.search(t)
 
 
 def _date_dmy2(s: str) -> date:  # 02-09-26
