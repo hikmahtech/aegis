@@ -459,6 +459,49 @@ def test_drop_forecast_duplicates_matches_on_the_normalised_payee():
     assert drop_forecast_duplicates(other, ob) == other
 
 
+def test_drop_forecast_duplicates_retires_one_row_per_obligation():
+    """One real bill accounts for one predicted charge, not for every charge
+    that looks like it.
+
+    Two `~ periodic` rules for the same payee at the same size on the same day
+    — a duplicated line in `recurring.journal`, or two subscriptions billed
+    alike — are two charges. Testing every row against the whole obligation
+    list with nothing consumed lets a single ₹500 due silence both, and the
+    second charge then appears in the brief nowhere at all. That is the one way
+    this filter can hide money rather than merely repeat it.
+    """
+    ob = [("twin sub", Decimal("500.00"), date(2026, 9, 6))]
+    rows = [
+        {"txnidx": "1", "date": "2026-09-06", "description": "Twin Sub", "amount": "₹ 500.00"},
+        {"txnidx": "2", "date": "2026-09-06", "description": "Twin Sub", "amount": "₹ 500.00"},
+    ]
+    assert drop_forecast_duplicates(rows, ob) == [rows[1]]
+    # Two real bills do account for both.
+    assert drop_forecast_duplicates(rows, ob * 2) == []
+
+
+def test_drop_forecast_duplicates_compares_a_whole_predicted_transaction():
+    """`reg` reports POSTINGS, so a rule that splits one charge across two
+    expense accounts arrives as two rows. Compared one at a time neither
+    equals the bill, and the duplicate survives twice over."""
+    split = [
+        {"txnidx": "1", "date": "2026-09-06", "description": "Split Rule", "amount": "₹ 3000.00"},
+        {"txnidx": "1", "date": "2026-09-06", "description": "Split Rule", "amount": "₹ 2306.46"},
+    ]
+    whole = [("split rule", Decimal("5306.46"), date(2026, 9, 6))]
+    assert drop_forecast_duplicates(split, whole) == []
+    # A component of the charge is not the charge: an obligation that matches
+    # only one posting must retire neither row.
+    part = [("split rule", Decimal("3000.00"), date(2026, 9, 6))]
+    assert drop_forecast_duplicates(split, part) == split
+    # One member the report could not value in rupees makes the TOTAL unknown,
+    # so the whole transaction is kept — a partial sum is not a total.
+    mixed = [{**split[0], "amount": "$ 40.00"}, split[1]]
+    assert drop_forecast_duplicates(
+        mixed, [("split rule", Decimal("2306.46"), date(2026, 9, 6))]
+    ) == mixed
+
+
 @pytest.mark.skipif(not HAS_HLEDGER, reason="hledger/git not installed")
 @pytest.mark.asyncio
 async def test_forecast_drops_only_the_obligations_the_books_already_carry(db_pool, tmp_path):
@@ -484,6 +527,7 @@ async def test_forecast_drops_only_the_obligations_the_books_already_carry(db_po
             ("Eleven Labs", "1936.00", today),
             ("Medium", "199.00", today),
             ("Overseas Sub", "336.40", today),
+            ("Post Failed", "410.00", today),
         )
     ))
     # Dropped: an OPEN due for the same obligation, two lines above it in the
@@ -500,7 +544,14 @@ async def test_forecast_drops_only_the_obligations_the_books_already_carry(db_po
     # Dropped: a payment that landed two days ago and never had a due mail.
     await ji.upsert(db_pool, "brief-t/fc-grocer", "brief-t",
                     _ev(amount=Decimal("250.00"), occurred_on=paid, payee="Grocer Weekly",
-                        payee_key="grocer weekly"))
+                        payee_key="grocer weekly"), journal_file="personal/2026.journal")
+    # Kept: a transaction the writer REFUSED. It is indexed but has no journal
+    # block, so it is in none of the brief's other sections and in none of
+    # hledger's totals. Letting it silence the forecast is the one way the
+    # reader could end up seeing this money nowhere at all.
+    await ji.upsert(db_pool, "brief-t/fc-refused", "brief-t",
+                    _ev(amount=Decimal("410.00"), occurred_on=paid, payee="Post Failed",
+                        payee_key="post failed"))
     # Kept: same payee, different amount. The bill is not the rule's guess.
     await ji.upsert(db_pool, "brief-t/fc-eleven", "brief-t",
                     _ev(kind="due", due_on=today, payee="Eleven Labs", payee_key="eleven labs",
@@ -523,12 +574,50 @@ async def test_forecast_drops_only_the_obligations_the_books_already_carry(db_po
     # this test must not be able to pass because the books never opened.
     assert brief["books_ok"] is True
     assert sorted(r["description"] for r in brief["forecast"]) == [
-        "Eleven Labs", "Medium", "Musaffa", "Overseas Sub",
+        "Eleven Labs", "Medium", "Musaffa", "Overseas Sub", "Post Failed",
     ]
     # The genuine unmatched warning keeps its own date and amount.
     musaffa = next(r for r in brief["forecast"] if r["description"] == "Musaffa")
     assert musaffa["date"] == (today + timedelta(days=10)).isoformat()
     assert amount_from_cell(musaffa["amount"]) == Decimal("275.00")
+
+
+@pytest.mark.skipif(not HAS_HLEDGER, reason="hledger/git not installed")
+@pytest.mark.asyncio
+async def test_forecast_never_stretches_one_obligation_over_two_predictions(db_pool, tmp_path):
+    """The two shapes where hledger writes more rows than there are charges,
+    or more charges than there are bills — through the real `reg` output,
+    because both turn on the `txnidx` column the CSV reader has to carry.
+
+    `Split Rule` is ONE predicted charge written as two postings; the single
+    ₹5306.46 bill accounts for all of it. `Twin Sub` is TWO charges; one ₹500
+    bill accounts for one of them and the other must still be warned about.
+    """
+    today = date.today()
+    cfg = _repo(tmp_path, today, recurring=(
+        f"~ monthly from {today.isoformat()}  Split Rule\n"
+        "    expenses:saas                 ₹3000.00\n"
+        "    expenses:groceries            ₹2306.46\n    liabilities:card:axis:1313\n"
+        f"~ monthly from {today.isoformat()}  Twin Sub\n"
+        "    expenses:saas                 ₹500.00\n    liabilities:card:axis:1313\n"
+        f"~ monthly from {today.isoformat()}  Twin Sub\n"
+        "    expenses:saas                 ₹500.00\n    liabilities:card:axis:1313\n"
+    ))
+    await ji.upsert(db_pool, "brief-t/fc-split", "brief-t",
+                    _ev(kind="due", due_on=today, payee="Split Rule", payee_key="split rule",
+                        amount=Decimal("5306.46"), channel="bill"))
+    await ji.upsert(db_pool, "brief-t/fc-twin", "brief-t",
+                    _ev(kind="due", due_on=today, payee="Twin Sub", payee_key="twin sub",
+                        amount=Decimal("500.00"), channel="bill"))
+
+    brief = await ActivityEnvironment().run(_act(db_pool, cfg).build_money_brief, 7)
+
+    assert brief["books_ok"] is True
+    # Both halves of the split charge are gone; exactly one of the twins is
+    # left. A `Split Rule` row surviving means the postings were compared one
+    # at a time; two `Twin Sub` rows means one bill was spent twice.
+    assert [r["description"] for r in brief["forecast"]] == ["Twin Sub"]
+    assert amount_from_cell(brief["forecast"][0]["amount"]) == Decimal("500.00")
 
 
 @pytest.mark.asyncio

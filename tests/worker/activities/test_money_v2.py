@@ -729,9 +729,10 @@ async def test_a_transaction_with_no_amount_is_not_a_transaction(db_pool, tmp_pa
     Every amount-bearing transaction in the live index is posted and every
     amountless one is not, so these are not lost money and not an extraction
     failure to retry — the amount is simply absent from the mail. Left labelled
-    `transaction` they inflate the transaction count, sit in the index as rows
-    nothing can ever post, and keep turning up as `find_match` counterparts for
-    real payments.
+    `transaction` they inflate the transaction count and sit in the index as
+    rows nothing can ever post, and they never stop costing: the writer refuses
+    them, `post_failed` leaves `parsed.version` below 2, and the stuck-receipt
+    sweep re-extracts the same mail every week.
     """
     llm = AsyncMock()
     llm.extract_money_batch = AsyncMock(return_value=[{
