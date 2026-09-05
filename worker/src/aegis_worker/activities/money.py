@@ -1,14 +1,13 @@
-"""Money Hygiene activities — receipt parse, charge upsert, alerts, audit."""
+"""Money activities — receipt parse, journal posting, brief and month close."""
 
 from __future__ import annotations
 
 import asyncio
 import csv
-import html as _html
 import io
 import re
 from dataclasses import dataclass, field
-from datetime import date, datetime, timedelta
+from datetime import datetime, timedelta
 from decimal import Decimal
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -19,14 +18,10 @@ from aegis.services import books
 from aegis.services import journal_index as ji
 from aegis.services.bank_parsers import has_money_shape, is_autopay, parse_any
 from aegis.services.books import UNKNOWN, account_for, instrument_account
-from aegis.services.fx import to_monthly_home
-from aegis.services.money_format import fmt_money
 from temporalio import activity
 
 from aegis_worker.activities import money_render
 from aegis_worker.activities.delivery import safe_send_message
-
-_ONE_DAY = timedelta(days=1)
 
 # Display symbol for digest rendering, keyed by ISO currency code. Unknown
 # codes fall back to "<CODE> " (e.g. "CHF ") via _symbol() below.
@@ -61,20 +56,6 @@ def _format_agent_persona(persona: dict) -> str | None:
     if u:
         parts.append(f"## User Context\n\n{u}")
     return "\n\n".join(parts) if parts else None
-
-
-def _previous_month_window(today: date) -> tuple[date, date]:
-    """Return (period_start, period_end) for the calendar month BEFORE `today`.
-
-    period_start = first day of previous month.
-    period_end = last day of previous month (= first-of-this-month minus 1 day).
-
-    Pure stdlib so we don't need python-dateutil.
-    """
-    first_of_this = today.replace(day=1)
-    period_end = first_of_this - _ONE_DAY
-    period_start = period_end.replace(day=1)
-    return period_start, period_end
 
 
 _NUM_RE = re.compile(r"-?[\d,]+(?:\.\d+)?")
@@ -173,22 +154,6 @@ def _is_account_cell(cell: str) -> bool:
 logger = structlog.get_logger()
 
 
-# Bank / card-alert sender domains. Mail from these addresses is transactional
-# *alerts* (autopay reminders, failed-payment notices, credit-card statements),
-# NOT vendor receipts — yet they quote figures the extractor can mistake for a
-# recurring charge (verified prod offenders: an autopay reminder or card
-# statement minting a fake recurring charge, a failed payment-gateway notice).
-# The LLM prompt hardening is best-effort; this is the belt-and-suspenders
-# deterministic guard. Match is case-insensitive substring. Configured via
-# Settings.bank_alert_senders (admin Integrations page; AEGIS_BANK_ALERT_SENDERS
-# env fallback), injected into MoneyActivities at worker bootstrap — default
-# empty means the guard is a clean no-op until a self-hoster adds their own
-# bank's domains.
-def parse_bank_alert_senders(raw: str) -> frozenset[str]:
-    """Comma-separated domains -> normalized frozenset (lowercased, stripped)."""
-    return frozenset(s.strip().lower() for s in (raw or "").split(",") if s.strip())
-
-
 def match_to_event(row: dict) -> dict:
     """journal_index row → MoneyEvent kwargs (for re-upserting an enriched row)."""
     keys = ("kind", "direction", "amount", "currency", "payee", "payee_key", "channel",
@@ -197,33 +162,17 @@ def match_to_event(row: dict) -> dict:
     return {k: row[k] for k in keys if k in row and row[k] is not None}
 
 
-def _is_bank_alert_sender(*candidates: str, senders: frozenset[str]) -> bool:
-    """True if any candidate sender string contains a known bank-alert domain."""
-    for cand in candidates:
-        if not cand:
-            continue
-        low = cand.lower()
-        if any(domain in low for domain in senders):
-            return True
-    return False
-
-
 @dataclass
 class MoneyActivities:
     db_pool: Any
     llm: Any  # LLMClient (for Haiku batch extraction)
     delivery: Any  # DeliveryActivities
-    fx_rates: dict[str, float]
     agent_id: str = "maou"
     home_currency: str = "INR"
     # Receipt extraction needs reliable structured JSON. The local fast model
     # (gemma4:e2b) parse-failed ~81% of receipt-shaped mail in prod — wire the
     # smart tier here (worker __main__) so money data stops silently dropping.
     extract_model: str = "gemma4:e2b"
-    # Bank/card alert sender domains — deterministic guard; see
-    # parse_bank_alert_senders. Injected from Settings.bank_alert_senders
-    # (admin Integrations page, env AEGIS_BANK_ALERT_SENDERS fallback).
-    bank_alert_senders: frozenset[str] = frozenset()
     # The books (spec §5/§10). `books_cfg` is a BooksConfig; None = disabled.
     books_cfg: Any = None
     ignored_mailboxes: frozenset[str] = frozenset()
@@ -288,8 +237,8 @@ class MoneyActivities:
     async def load_receipts(self, receipt_ids: list[str]) -> list[dict]:
         """Read raw receipt rows for parsing. Returns plain dicts (not records).
 
-        v3 schema has no body_plain column — snippet is stored in parsed jsonb.
-        Aliased as body_plain so classify_and_extract callers remain unchanged.
+        v3 schema has no body_plain column — snippet is stored in parsed jsonb
+        and aliased as body_plain, which is the key the extractor reads.
 
         Prefers the full message text `store_receipt_body` fetched over the
         200-char Gmail snippet, which routinely cuts off before the amount.
@@ -358,44 +307,6 @@ class MoneyActivities:
                 older_than_days,
             )
         return [str(r["id"]) for r in rows]
-
-    @activity.defn
-    async def classify_and_extract(
-        self, receipts: list[dict], agent_id: str = ""
-    ) -> list[dict]:
-        """Single LLM batch call → one extraction per receipt.
-
-        `agent_id` — when set, loads the agent's persona (soul + user
-        kinds, DB-first via aegis.services.personalities) and passes it
-        as system context so the extractor reflects that agent's
-        voice/policy (e.g. maou for subscription classification).
-
-        Returns list of dicts with the receipt's `id` echoed as
-        `receipt_id` so upsert_charges can correlate the extraction
-        back to its source row.
-        """
-        if not receipts:
-            return []
-        system_prompt = None
-        if agent_id:
-            from aegis.services.personalities import get_personality
-
-            persona = await get_personality(self.db_pool, agent_id)
-            system_prompt = _format_agent_persona(persona)
-        extractions = await self.llm.extract_receipts_batch(
-            receipts,
-            model=self.extract_model,
-            system_prompt=system_prompt,
-            db_pool=self.db_pool,
-            agent_id=agent_id or None,
-        )
-        for r, e in zip(receipts, extractions, strict=False):
-            e["receipt_id"] = r["id"]
-            # Echo the real email sender so upsert_charges can deterministically
-            # skip bank/card-alert senders (the LLM's sender_label is best-effort
-            # and on autopay reminders names the merchant, not the sender).
-            e["sender"] = r.get("sender", "")
-        return extractions
 
     def _rules(self) -> list[dict]:
         if self.books_cfg is None:
@@ -701,527 +612,6 @@ class MoneyActivities:
                     "journal_file": journal_file,
                 },
             )
-
-    @activity.defn
-    async def upsert_charges(self, account: str, extractions: list[dict]) -> int:
-        """For each extraction, link `finance.receipt_email` and (when
-        is_receipt=True and is_recurring is not False) upsert
-        `finance.recurring_charge` keyed on
-        (account, sender_label, amount_cents, currency).
-
-        Cadence is upgrade-only ('unknown' may be replaced; explicit
-        cadence is preserved). A previously-cancelled charge flips back
-        to 'active' the moment a fresh receipt arrives. Returns the
-        total number of receipts processed (receipts + non-receipts).
-        """
-        processed = 0
-        async with self.db_pool.acquire() as conn:
-            for e in extractions:
-                receipt_id = e.get("receipt_id")
-                if not receipt_id:
-                    continue
-
-                if not e.get("is_receipt"):
-                    # Mark as parsed so we don't re-LLM it.
-                    # v3 schema: no is_receipt/parsed_at columns; use parsed jsonb only.
-                    await conn.execute(
-                        "UPDATE finance.receipt_email "
-                        "SET parsed = COALESCE(parsed, '{}'::jsonb) || $2 WHERE id=$1::uuid",
-                        receipt_id,
-                        e,
-                    )
-                    processed += 1
-                    continue
-
-                # Deterministic bank/card-alert guard: never mint a recurring
-                # charge from a bank/card alert sender (autopay reminders,
-                # failed-payment notices, card statements). Belt-and-suspenders
-                # behind the LLM prompt hardening. Mark parsed so we don't re-LLM.
-                if _is_bank_alert_sender(
-                    e.get("sender", ""), e.get("sender_label", ""), senders=self.bank_alert_senders
-                ):
-                    logger.info(
-                        "money_skip_bank_alert_sender",
-                        receipt_id=receipt_id,
-                        sender=e.get("sender", ""),
-                        sender_label=e.get("sender_label", ""),
-                        vendor_name=e.get("vendor_name", ""),
-                    )
-                    await conn.execute(
-                        "UPDATE finance.receipt_email "
-                        "SET parsed = COALESCE(parsed, '{}'::jsonb) || $2 WHERE id=$1::uuid",
-                        receipt_id,
-                        e,
-                    )
-                    processed += 1
-                    continue
-
-                # One-off purchase, not a subscription/utility (#113): mint
-                # no recurring_charge row so it doesn't sit as a fake
-                # "active subscription" forever. The receipt itself is
-                # still stored/marked parsed. A missing/uncertain flag
-                # (None — model didn't answer, or pre-fix extractions that
-                # predate this field) is treated conservatively as
-                # recurring, preserving prior behaviour for ambiguous
-                # cases. Existing prod one-off rows are NOT reclassified
-                # here — see PR description for the manual prune.
-                if e.get("is_recurring") is False:
-                    logger.info(
-                        "money_skip_one_off",
-                        receipt_id=receipt_id,
-                        vendor_name=e.get("vendor_name", ""),
-                    )
-                    await conn.execute(
-                        "UPDATE finance.receipt_email "
-                        "SET parsed = COALESCE(parsed, '{}'::jsonb) || $2 WHERE id=$1::uuid",
-                        receipt_id,
-                        e,
-                    )
-                    processed += 1
-                    continue
-
-                amount = e.get("amount") or 0
-                amount_cents = int(round(amount * 100))
-                currency = (e.get("currency") or self.home_currency).upper()
-                cadence = e.get("cadence") or "unknown"
-                monthly_home = to_monthly_home(
-                    amount,
-                    currency,
-                    cadence,
-                    self.fx_rates,
-                    self.home_currency,
-                )
-
-                next_due_raw = e.get("next_due_at")
-                next_due_at: datetime | None = None
-                if next_due_raw:
-                    try:
-                        next_due_at = datetime.fromisoformat(next_due_raw)
-                    except (TypeError, ValueError):
-                        next_due_at = None
-
-                # Cadence merge: prefer the more-specific cadence whenever
-                # known. If the stored row is 'unknown' and the new extraction
-                # has a real cadence, upgrade. If the stored row has a real
-                # cadence, keep it (don't let a later 'unknown' extraction
-                # erase what we know). Symmetric form so a real→unknown
-                # sequence preserves the real cadence the same way unknown→
-                # real upgrades it.
-                charge_row = await conn.fetchrow(
-                    "INSERT INTO finance.recurring_charge "
-                    "(account, sender_label, vendor_name, category, amount_cents, "
-                    " currency, monthly_home_equivalent, cadence, "
-                    " first_seen_at, last_seen_at, next_due_at) "
-                    "VALUES ($1,$2,$3,$4,$5,$6,$7,$8,NOW(),NOW(),$9) "
-                    "ON CONFLICT (account, sender_label, amount_cents, currency) "
-                    "DO UPDATE SET "
-                    "  last_seen_at = NOW(), "
-                    "  next_due_at = COALESCE(EXCLUDED.next_due_at, "
-                    "                          finance.recurring_charge.next_due_at), "
-                    "  cadence = CASE "
-                    "    WHEN finance.recurring_charge.cadence='unknown' "
-                    "         AND EXCLUDED.cadence != 'unknown' THEN EXCLUDED.cadence "
-                    "    WHEN finance.recurring_charge.cadence != 'unknown' "
-                    "         THEN finance.recurring_charge.cadence "
-                    "    ELSE EXCLUDED.cadence "
-                    "  END, "
-                    "  monthly_home_equivalent = EXCLUDED.monthly_home_equivalent, "
-                    "  status = CASE WHEN finance.recurring_charge.status='cancelled' "
-                    "                THEN 'active' "
-                    "                ELSE finance.recurring_charge.status END, "
-                    "  updated_at = NOW() "
-                    "RETURNING id",
-                    account,
-                    e.get("sender_label", ""),
-                    e.get("vendor_name", ""),
-                    e.get("category", "other"),
-                    amount_cents,
-                    currency,
-                    monthly_home,
-                    cadence,
-                    next_due_at,
-                )
-
-                await conn.execute(
-                    "UPDATE finance.receipt_email "
-                    "SET parsed = COALESCE(parsed, '{}'::jsonb) || $2, charge_id=$3 "
-                    "WHERE id=$1::uuid",
-                    receipt_id,
-                    e,
-                    charge_row["id"],
-                )
-                processed += 1
-        return processed
-
-    @activity.defn
-    async def detect_cancellations(
-        self, threshold_multiplier: float = 2.0
-    ) -> list[dict]:
-        """Mark active charges as cancelled when no receipt seen for
-        threshold_multiplier × cadence_interval. Skips cadence='unknown'.
-
-        Returns a list of the newly-cancelled charge rows (id, vendor_name,
-        amount_cents, currency, cadence, last_seen_at, account) so callers
-        can capture or notify per subscription.
-        """
-        async with self.db_pool.acquire() as conn:
-            rows = await conn.fetch(
-                """
-                UPDATE finance.recurring_charge
-                SET status = 'cancelled', updated_at = NOW()
-                WHERE status = 'active'
-                  AND cadence IN ('monthly', 'quarterly', 'yearly')
-                  AND last_seen_at < NOW() - (
-                    CASE cadence
-                      WHEN 'monthly'   THEN INTERVAL '1 month'
-                      WHEN 'quarterly' THEN INTERVAL '3 months'
-                      WHEN 'yearly'    THEN INTERVAL '12 months'
-                      ELSE NULL
-                    END * $1
-                  )
-                RETURNING id, vendor_name, amount_cents, currency,
-                          cadence, last_seen_at, account
-                """,
-                threshold_multiplier,
-            )
-        return [dict(r) for r in rows]
-
-    @activity.defn
-    async def evaluate_renewal_alerts(self, thresholds: list[int]) -> list[dict]:
-        """Insert one renewal_alert row for the lowest not-yet-alerted
-        threshold each active, due-soon charge has crossed. Returns the NEW
-        alert payloads (for notification).
-
-        Fix #113: dedup used to be scoped to a UTC day (partial unique
-        index on charge_id/threshold_days/day(fired_at)) so an
-        already-crossed threshold re-fired every single day forever (166
-        rows in 3 weeks from only 7 charges). Dedup is now scoped to the
-        renewal cycle instead — (charge_id, threshold_days, next_due_at),
-        checked across ALL time, not just today — so a threshold, once
-        alerted for a given next_due_at, never re-fires for that same
-        cycle. Only the single lowest never-alerted crossed threshold
-        fires per call: a charge that jumps past several thresholds at
-        once (freshly imported, already overdue) gets one alert, not a
-        burst, matching the "at most one alert" cadence the downstream
-        Slack 7-day guard and Todoist charge_id+next_due_at dedupe already
-        assume. The day-scoped ON CONFLICT clause stays as a
-        race-condition backstop; it must still match the original index
-        expression exactly.
-        """
-        new_alerts: list[dict] = []
-        async with self.db_pool.acquire() as conn:
-            # Past-due window guard (14 days): a charge whose next_due_at
-            # slipped weeks ago should NOT keep firing the 0-day alert
-            # forever. The 14-day floor gives one final pass after the
-            # due date and then drops the row out of the eligible set.
-            charges = await conn.fetch(
-                "SELECT id, account, vendor_name, category, amount_cents, "
-                "currency, monthly_home_equivalent, next_due_at, "
-                "EXTRACT(EPOCH FROM (next_due_at - NOW())) / 86400 AS days_left "
-                "FROM finance.recurring_charge "
-                "WHERE status = 'active' AND next_due_at IS NOT NULL "
-                "  AND next_due_at >= NOW() - INTERVAL '14 days'"
-            )
-            for c in charges:
-                days_left = float(c["days_left"])
-                crossed = sorted(t for t in thresholds if days_left <= t)
-                if not crossed:
-                    continue
-
-                fired_rows = await conn.fetch(
-                    "SELECT threshold_days FROM finance.renewal_alert "
-                    "WHERE charge_id = $1 AND next_due_at = $2 "
-                    "  AND threshold_days = ANY($3::int[])",
-                    c["id"],
-                    c["next_due_at"],
-                    crossed,
-                )
-                fired = {r["threshold_days"] for r in fired_rows}
-                not_yet_fired = [t for t in crossed if t not in fired]
-                if not not_yet_fired:
-                    continue
-                t = min(not_yet_fired)
-
-                row = await conn.fetchrow(
-                    "INSERT INTO finance.renewal_alert "
-                    "(charge_id, threshold_days, next_due_at) VALUES ($1, $2, $3) "
-                    "ON CONFLICT (charge_id, threshold_days, "
-                    "             ((fired_at AT TIME ZONE 'UTC')::date)) "
-                    "DO NOTHING RETURNING id",
-                    c["id"],
-                    t,
-                    c["next_due_at"],
-                )
-                if row is not None:
-                    new_alerts.append(
-                        {
-                            "alert_id": str(row["id"]),
-                            "charge_id": str(c["id"]),
-                            "threshold_days": t,
-                            "vendor_name": c["vendor_name"],
-                            "category": c["category"],
-                            "amount_cents": c["amount_cents"],
-                            "currency": c["currency"],
-                            "monthly_home_equivalent": float(c["monthly_home_equivalent"]),
-                            "days_left": round(days_left, 1),
-                            "next_due_at": c["next_due_at"].isoformat(),
-                            "account": c["account"],
-                        }
-                    )
-        return new_alerts
-
-    @activity.defn
-    async def notify_renewal_alert(self, alert: dict) -> None:
-        """Send chat card to Maou's channel. Best-effort — every user-controlled
-        string is HTML-escaped because parse_mode=HTML treats raw <,>,& as
-        markup and a single bad char fails the send.
-
-        Send-level dedup: skip the send if the same
-        (charge_id, threshold_days) was notified within the last 7 days.
-        The DB-level partial unique index already dedups the Inbox capture
-        side per UTC day; this 7-day window is the send-only guard so
-        the user doesn't get pinged for the same upcoming renewal multiple
-        days in a row when evaluate_renewal_alerts re-inserts the row for
-        a new threshold band or after a past-due slip.
-        """
-        charge_id = alert.get("charge_id")
-        threshold = alert["threshold_days"]
-        alert_id = alert.get("alert_id")
-        if charge_id and self.db_pool is not None:
-            async with self.db_pool.acquire() as conn:
-                recent = await conn.fetchval(
-                    "SELECT 1 FROM finance.renewal_alert "
-                    "WHERE charge_id = $1::uuid AND threshold_days = $2 "
-                    "  AND last_notified_at IS NOT NULL "
-                    "  AND last_notified_at > NOW() - INTERVAL '7 days' "
-                    "LIMIT 1",
-                    str(charge_id),
-                    int(threshold),
-                )
-            if recent:
-                return
-
-        vendor = _html.escape(str(alert.get("vendor_name", "")))
-        category = _html.escape(str(alert.get("category", "")))
-        account = _html.escape(str(alert.get("account", "")))
-        # Escape the rendered amount, not just the fields: fmt_money's ISO-suffix
-        # branch carries the LLM-extracted currency code into the body verbatim.
-        amount = _html.escape(
-            fmt_money(Decimal(alert["amount_cents"]) / 100, alert.get("currency") or "")
-        )
-        title = f"[RENEWAL][{threshold}d] {vendor}"
-        body = (
-            f"<b>{vendor}</b> ({category})\n"
-            f"Amount: {amount}\n"
-            f"Monthly {self.home_currency} equiv: "
-            f"{_symbol(self.home_currency)}{alert['monthly_home_equivalent']:.0f}\n"
-            f"Renews in: <b>{alert['days_left']:.0f} days</b> "
-            f"({alert['next_due_at'][:10]})\n"
-            f"Account: {account}"
-        )
-        # Title is internal-only ("[RENEWAL][30d] vendor") so it joins the
-        # already-escaped body without further escaping. Body content is
-        # vendor-supplied — escaping happens above where each field is built.
-        await safe_send_message(
-            self.delivery,
-            agent_id=self.agent_id,
-            message=f"<b>{title}</b>\n{body}",
-            log_event="renewal_notify_failed",
-        )
-
-        # Stamp the row so the next 7d window of evaluate runs short-circuits.
-        # Best-effort: an unsuccessful send still benefits from this
-        # stamp because safe_send_message swallows failures — the caller's
-        # capture-to-inbox path is the durable record either way.
-        if alert_id and self.db_pool is not None:
-            async with self.db_pool.acquire() as conn:
-                await conn.execute(
-                    "UPDATE finance.renewal_alert SET last_notified_at = NOW() "
-                    "WHERE id = $1::uuid",
-                    str(alert_id),
-                )
-
-    @activity.defn
-    async def notify_cancellation(self, cancellation: dict) -> None:
-        """Send chat card to Maou's channel for a silently-cancelled charge.
-        Best-effort; all vendor-supplied fields HTML-escaped before
-        interpolation since parse_mode=HTML treats raw <,>,& as markup."""
-        vendor = _html.escape(str(cancellation.get("vendor_name") or "subscription"))
-        cadence = _html.escape(str(cancellation.get("cadence") or ""))
-        account = _html.escape(str(cancellation.get("account") or ""))
-        # Escape the rendered amount, not just the fields: fmt_money's ISO-suffix
-        # branch carries the LLM-extracted currency code into the body verbatim.
-        amount = _html.escape(
-            fmt_money(
-                Decimal(cancellation.get("amount_cents") or 0) / 100,
-                cancellation.get("currency") or "",
-            )
-        )
-        last_seen = cancellation.get("last_seen_at")
-        last_date = str(last_seen)[:10] if last_seen else "unknown"
-        title = f"[CANCEL] {vendor}"
-        body = (
-            f"<b>{vendor}</b>\n"
-            f"Amount: {amount} ({cadence})\n"
-            f"Last seen: {last_date}\n"
-            f"Account: {account}"
-        )
-        await safe_send_message(
-            self.delivery,
-            agent_id=self.agent_id,
-            message=f"<b>{title}</b>\n{body}",
-            log_event="cancellation_notify_failed",
-        )
-
-    @activity.defn
-    async def build_subscription_digest(self) -> dict:
-        """Aggregate active charges into a monthly digest, persist + return.
-
-        Period covered = the calendar month BEFORE today. Idempotent on
-        (period_start, period_end) — re-running the same month UPDATES
-        the existing row instead of inserting a duplicate.
-        """
-        today = date.today()
-        period_start, period_end = _previous_month_window(today)
-
-        async with self.db_pool.acquire() as conn:
-            active = await conn.fetch(
-                "SELECT vendor_name, category, currency, amount_cents, "
-                "       monthly_home_equivalent, last_seen_at, first_seen_at, "
-                "       status "
-                "FROM finance.recurring_charge WHERE status = 'active'"
-            )
-            new_this = await conn.fetch(
-                "SELECT vendor_name, monthly_home_equivalent "
-                "FROM finance.recurring_charge "
-                "WHERE first_seen_at >= $1 AND first_seen_at < $2",
-                period_start,
-                period_end,
-            )
-            cancelled_this = await conn.fetch(
-                "SELECT vendor_name, monthly_home_equivalent "
-                "FROM finance.recurring_charge "
-                "WHERE status='cancelled' "
-                "  AND updated_at >= $1 AND updated_at < $2",
-                period_start,
-                period_end,
-            )
-
-        by_category: dict[str, dict] = {}
-        total = 0.0
-        for r in active:
-            inr = float(r["monthly_home_equivalent"])
-            total += inr
-            cat = r["category"] or "other"
-            slot = by_category.setdefault(cat, {"total_inr": 0.0, "count": 0})
-            slot["total_inr"] += inr
-            slot["count"] += 1
-
-        top_spenders = sorted(
-            (
-                {
-                    "vendor_name": r["vendor_name"],
-                    "monthly_home_equivalent": float(r["monthly_home_equivalent"]),
-                }
-                for r in active
-            ),
-            key=lambda x: x["monthly_home_equivalent"],
-            reverse=True,
-        )[:10]
-
-        digest = {
-            "period_start": period_start.isoformat(),
-            "period_end": period_end.isoformat(),
-            "total_monthly_inr": round(total, 2),
-            "active_count": len(active),
-            "by_category": {
-                k: {"total_inr": round(v["total_inr"], 2), "count": v["count"]}
-                for k, v in by_category.items()
-            },
-            "new_this_month": [
-                {
-                    "vendor_name": r["vendor_name"],
-                    "monthly_home_equivalent": float(r["monthly_home_equivalent"]),
-                }
-                for r in new_this
-            ],
-            "cancelled_this_month": [
-                {
-                    "vendor_name": r["vendor_name"],
-                    "monthly_home_equivalent": float(r["monthly_home_equivalent"]),
-                }
-                for r in cancelled_this
-            ],
-            "top_spenders": top_spenders,
-        }
-
-        async with self.db_pool.acquire() as conn:
-            await conn.execute(
-                "INSERT INTO finance.subscription_digest "
-                "(period_start, period_end, summary) VALUES ($1,$2,$3) "
-                "ON CONFLICT (period_start, period_end) DO UPDATE SET "
-                "  summary = EXCLUDED.summary, sent_at = NOW()",
-                period_start,
-                period_end,
-                digest,
-            )
-        return digest
-
-    @activity.defn
-    async def notify_subscription_digest(self, digest: dict) -> None:
-        """Send chat digest to Maou's channel. Best-effort.
-
-        Every user-controlled string (vendor names, categories) is
-        HTML-escaped because parse_mode=HTML treats raw <,>,& as markup.
-        """
-        period_start = _html.escape(str(digest.get("period_start", "")))
-        period_end = _html.escape(str(digest.get("period_end", "")))
-        total = float(digest.get("total_monthly_inr", 0.0))
-        active_count = int(digest.get("active_count", 0))
-        sym = _symbol(self.home_currency)
-
-        lines = [
-            f"<b>Monthly subscription audit</b> ({period_start} → {period_end})",
-            f"Active charges: <b>{active_count}</b>",
-            f"Total monthly burn: <b>{sym}{total:.0f}</b>",
-            "",
-            "<b>By category:</b>",
-        ]
-        by_category = digest.get("by_category") or {}
-        for cat, info in sorted(
-            by_category.items(),
-            key=lambda kv: kv[1]["total_inr"],
-            reverse=True,
-        ):
-            lines.append(
-                f"  {_html.escape(str(cat))}: {sym}{info['total_inr']:.0f} ({info['count']} charges)"
-            )
-
-        top = digest.get("top_spenders") or []
-        if top:
-            lines.append("")
-            lines.append("<b>Top 10 spenders:</b>")
-            for s in top[:10]:
-                lines.append(
-                    f"  {_html.escape(str(s['vendor_name']))}: "
-                    f"{sym}{float(s['monthly_home_equivalent']):.0f}"
-                )
-
-        new_this = digest.get("new_this_month") or []
-        cancelled_this = digest.get("cancelled_this_month") or []
-        if new_this:
-            lines.append("")
-            lines.append(f"<b>New this month:</b> {len(new_this)}")
-        if cancelled_this:
-            lines.append(f"<b>Cancelled this month:</b> {len(cancelled_this)}")
-
-        body = "\n".join(lines)
-        await safe_send_message(
-            self.delivery,
-            agent_id=self.agent_id,
-            message=f"<b>Monthly money digest</b>\n{body}",
-            log_event="subscription_digest_notify_failed",
-        )
 
     # ------------------------------------------------------------------ books
 

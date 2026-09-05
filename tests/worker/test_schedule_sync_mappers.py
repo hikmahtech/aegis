@@ -9,7 +9,6 @@ from __future__ import annotations
 from aegis_worker.flows.cert_radar import CertRadarConfig, CertRadarFlow
 from aegis_worker.flows.daily_briefing import DailyBriefingConfig, DailyBriefingFlow
 from aegis_worker.flows.money_brief import MoneyBriefConfig, MoneyBriefFlow
-from aegis_worker.flows.money_hygiene import MoneyHygieneConfig, MoneyHygieneDailyFlow
 from aegis_worker.flows.month_close import MonthCloseConfig, MonthCloseFlow
 from aegis_worker.flows.receipt_ingest import (
     DEFAULT_SENDER_FILTER,
@@ -17,10 +16,6 @@ from aegis_worker.flows.receipt_ingest import (
     ReceiptIngestInput,
 )
 from aegis_worker.flows.service_drift import ServiceDriftConfig, ServiceDriftFlow
-from aegis_worker.flows.subscription_audit import (
-    SubscriptionAuditConfig,
-    SubscriptionAuditFlow,
-)
 from aegis_worker.flows.workspace_repo_sync import WorkspaceRepoSyncFlow, WorkspaceRepoSyncInput
 from aegis_worker.schedule_sync import _ACTIVITY_TYPE_MAP
 
@@ -34,39 +29,6 @@ def _act(slug: str, workflow_type: str, config: dict) -> dict:
         "config": config,
         "_settings": {"aegis_ui_url": ""},
     }
-
-
-def test_money_hygiene_flow_mapper_resolves():
-    mapper = _ACTIVITY_TYPE_MAP["MoneyHygieneDailyFlow"]
-    workflow_cls, cfg = mapper(
-        _act(
-            "money-hygiene-daily",
-            "MoneyHygieneDailyFlow",
-            {"threshold_multiplier": 3.5, "thresholds_days": [30, 14, 7, 0]},
-        )
-    )
-    assert workflow_cls is MoneyHygieneDailyFlow
-    assert isinstance(cfg, MoneyHygieneConfig)
-    assert cfg.thresholds_days == [30, 14, 7, 0]
-    assert cfg.threshold_multiplier == 3.5
-    assert cfg.silent is False
-
-
-def test_money_hygiene_flow_mapper_uses_defaults():
-    mapper = _ACTIVITY_TYPE_MAP["MoneyHygieneDailyFlow"]
-    _, cfg = mapper(_act("money-hygiene-daily", "MoneyHygieneDailyFlow", {}))
-    assert cfg.thresholds_days == [30, 14, 7, 0]
-    assert cfg.threshold_multiplier == 2.0
-
-
-def test_subscription_audit_flow_mapper_resolves():
-    mapper = _ACTIVITY_TYPE_MAP["SubscriptionAuditFlow"]
-    workflow_cls, cfg = mapper(
-        _act("subscription-audit-monthly", "SubscriptionAuditFlow", {})
-    )
-    assert workflow_cls is SubscriptionAuditFlow
-    assert isinstance(cfg, SubscriptionAuditConfig)
-    assert cfg.silent is False
 
 
 def test_money_brief_flow_mapper_resolves():

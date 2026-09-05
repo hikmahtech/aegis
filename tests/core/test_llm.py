@@ -5,7 +5,6 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 from aegis.llm import (
-    _BATCH_RECEIPT_PROMPT,
     LLMClient,
     LLMTruncationError,
     _classify_llm_error,
@@ -29,37 +28,6 @@ def test_parse_llm_json_handles_fences_prose_arrays_and_garbage():
     assert parse_llm_json("") is None
     assert parse_llm_json("not json at all") is None
     assert parse_llm_json("{broken") is None
-
-
-def test_batch_receipt_prompt_asks_for_is_recurring():
-    """Fix #113: the prompt must instruct the model to distinguish a
-    recurring subscription/utility from a one-off purchase, so
-    upsert_charges can skip minting a fake subscription for a one-off."""
-    prompt = _BATCH_RECEIPT_PROMPT.lower()
-    assert "is_recurring" in prompt
-    assert "one-off" in prompt
-
-
-def test_batch_receipt_prompt_has_bank_alert_exclusions():
-    """Regression guard: the receipt prompt must keep the is_receipt=false rules
-    for failed payments, autopay reminders, and card statements so a bank
-    notification can't be minted into a recurring charge. If these silently
-    disappear the prod offenders (failed razorpay, axis autopay, card bill)
-    come back."""
-    prompt = _BATCH_RECEIPT_PROMPT.lower()
-    for keyword in (
-        "payment failed",
-        "declined",
-        "reversed",
-        "refund",
-        "upcoming autopay",
-        "autopay reminder",
-        "mandate",
-        "new bill",
-        "statement",
-        "minimum due",
-    ):
-        assert keyword in prompt, f"missing exclusion keyword: {keyword!r}"
 
 
 async def test_think_returns_response():
@@ -212,125 +180,6 @@ async def test_think_concurrency_limit_does_not_throttle_other_models():
     assert client._semaphore_for("gemma4:e2b") is client._semaphore_for("gemma4:e2b")
 
 
-# ----------------- extract_receipts_batch error surfacing --------
-
-
-async def test_extract_receipts_batch_raises_on_llm_error():
-    """Bundle E: outer exception (LLM call / JSON decode) must propagate up
-    so MoneyProcessFlow can decide not to upsert. Used to silently return
-    N is_receipt=False items."""
-    client = LLMClient(base_url="http://localhost:4000/v1", api_key="test")
-
-    async def boom(*args, **kwargs):
-        raise RuntimeError("LiteLLM upstream 502")
-
-    receipts = [
-        {
-            "id": "r1",
-            "sender": "billing@stripe.com",
-            "subject": "receipt",
-            "body_plain": "...",
-        }
-    ]
-    with (
-        patch.object(client, "think", side_effect=boom),
-        pytest.raises(RuntimeError, match="LiteLLM upstream 502"),
-    ):
-        await client.extract_receipts_batch(receipts, model="gemma4:e2b")
-
-
-async def test_extract_receipts_batch_marks_parse_failed_per_item():
-    """Bundle E: when LLM returns a JSON array but individual items don't
-    conform to ReceiptExtraction schema, mark _parse_failed=True on those
-    rows. Healthy items still get returned populated."""
-    client = LLMClient(base_url="http://localhost:4000/v1", api_key="test")
-
-    async def stub_think(*args, **kwargs):
-        return {
-            "response": (
-                '```json\n'
-                '[{"is_receipt": true, "vendor_name": "Stripe", "sender_label": "stripe.com", '
-                '"category": "saas", "amount": 9.99, "currency": "USD", "cadence": "monthly", '
-                '"confidence": 0.9}, '
-                '"this is not a dict"]\n'
-                '```'
-            ),
-            "model": "gemma4:e2b",
-            "prompt_tokens": 0,
-            "completion_tokens": 0,
-        }
-
-    receipts = [
-        {"id": "r1", "sender": "a", "subject": "b", "body_plain": "c"},
-        {"id": "r2", "sender": "a", "subject": "b", "body_plain": "c"},
-    ]
-    with patch.object(client, "think", side_effect=stub_think):
-        out = await client.extract_receipts_batch(receipts, model="gemma4:e2b")
-    assert len(out) == 2
-    assert out[0]["is_receipt"] is True
-    assert "_parse_failed" not in out[0]
-    assert out[1]["is_receipt"] is False
-    assert out[1].get("_parse_failed") is True
-
-
-async def test_extract_receipts_batch_passes_through_is_recurring():
-    """Fix #113: is_recurring survives ReceiptExtraction validation and is
-    echoed back per item, so upsert_charges can act on it."""
-    client = LLMClient(base_url="http://localhost:4000/v1", api_key="test")
-
-    async def stub_think(*args, **kwargs):
-        return {
-            "response": (
-                '```json\n'
-                '[{"is_receipt": true, "vendor_name": "Amazon", "sender_label": "amazon.com", '
-                '"category": "other", "amount": 12.99, "currency": "USD", "cadence": "unknown", '
-                '"is_recurring": false, "confidence": 0.9}, '
-                '{"is_receipt": true, "vendor_name": "Netflix", "sender_label": "netflix.com", '
-                '"category": "media", "amount": 6.99, "currency": "USD", "cadence": "monthly", '
-                '"is_recurring": true, "confidence": 0.95}]\n'
-                '```'
-            ),
-            "model": "gemma4:e2b",
-            "prompt_tokens": 0,
-            "completion_tokens": 0,
-        }
-
-    receipts = [
-        {"id": "r1", "sender": "a", "subject": "b", "body_plain": "c"},
-        {"id": "r2", "sender": "a", "subject": "b", "body_plain": "c"},
-    ]
-    with patch.object(client, "think", side_effect=stub_think):
-        out = await client.extract_receipts_batch(receipts, model="gemma4:e2b")
-    assert out[0]["is_recurring"] is False
-    assert out[1]["is_recurring"] is True
-
-
-async def test_extract_receipts_batch_is_recurring_defaults_to_none():
-    """A response that omits is_recurring entirely (older prompt version,
-    or model just didn't answer) must default to None, not False — so
-    upsert_charges' conservative "treat as recurring" fallback applies."""
-    client = LLMClient(base_url="http://localhost:4000/v1", api_key="test")
-
-    async def stub_think(*args, **kwargs):
-        return {
-            "response": (
-                '```json\n'
-                '[{"is_receipt": true, "vendor_name": "Namecheap", "sender_label": "namecheap.com", '
-                '"category": "domain", "amount": 12.99, "currency": "USD", "cadence": "yearly", '
-                '"confidence": 0.9}]\n'
-                '```'
-            ),
-            "model": "gemma4:e2b",
-            "prompt_tokens": 0,
-            "completion_tokens": 0,
-        }
-
-    receipts = [{"id": "r1", "sender": "a", "subject": "b", "body_plain": "c"}]
-    with patch.object(client, "think", side_effect=stub_think):
-        out = await client.extract_receipts_batch(receipts, model="gemma4:e2b")
-    assert out[0]["is_recurring"] is None
-
-
 # --------------- LLMTruncationError / reasoning-model guard ---------------
 
 
@@ -393,41 +242,3 @@ async def test_think_does_not_raise_truncation_when_finish_reason_is_stop_and_em
         result = await client.think("hello", model="gpt-oss:20b")
     # Returns empty string — NOT a truncation error; caller decides what to do.
     assert result["response"] == ""
-
-
-async def test_extract_receipts_batch_returns_parse_failed_stubs_on_truncation():
-    """When think() raises LLMTruncationError, extract_receipts_batch must NOT
-    re-raise.  It returns N _parse_failed stubs so MoneyProcessFlow skips the
-    batch without crashing through all 3 Temporal retries."""
-    client = LLMClient(base_url="http://localhost:4000/v1", api_key="test")
-    receipts = [
-        {"id": "r1", "sender": "billing@stripe.com", "subject": "Invoice", "body_plain": "..."},
-        {"id": "r2", "sender": "noreply@razorpay.com", "subject": "Payment", "body_plain": "..."},
-    ]
-
-    async def truncated_think(*args, **kwargs):
-        raise LLMTruncationError("model=gpt-oss:20b returned empty content with finish_reason=length")
-
-    with patch.object(client, "think", side_effect=truncated_think):
-        out = await client.extract_receipts_batch(receipts, model="gpt-oss:20b")
-
-    assert len(out) == 2
-    for item in out:
-        assert item["is_receipt"] is False
-        assert item["_parse_failed"] is True
-
-
-async def test_extract_receipts_batch_still_raises_on_other_llm_errors():
-    """Non-truncation LLM failures (e.g. 502 upstream) still propagate so
-    MoneyProcessFlow can retry via Temporal's retry policy."""
-    client = LLMClient(base_url="http://localhost:4000/v1", api_key="test")
-    receipts = [{"id": "r1", "sender": "a", "subject": "b", "body_plain": "c"}]
-
-    async def network_error(*args, **kwargs):
-        raise RuntimeError("LiteLLM upstream 502")
-
-    with (
-        patch.object(client, "think", side_effect=network_error),
-        pytest.raises(RuntimeError, match="502"),
-    ):
-        await client.extract_receipts_batch(receipts, model="gpt-oss:20b")

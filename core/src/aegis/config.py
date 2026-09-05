@@ -203,11 +203,6 @@ class Settings(BaseSettings):
     # stray env can grant write access on its own. Turning this back off kills
     # writes fleet-wide on the next worker restart, no DB edit needed.
     memory_consolidation_apply_enabled: bool = False
-    # Bank / card-alert sender domains (comma-separated, case-insensitive
-    # substring match). Deterministic guard in Money Hygiene that stops bank
-    # statements / autopay reminders from minting fake recurring charges.
-    # Empty = guard off. Editable from the admin Integrations page.
-    bank_alert_senders: str = ""
     # Per-alert runbook directory — baked into the worker image at /app/runbooks.
     runbooks_dir: str = "/app/runbooks"
     # Swarm stack name AEGIS itself is deployed as. The System Monitoring page
@@ -347,13 +342,8 @@ class Settings(BaseSettings):
 
     # Money Hygiene (Maou)
     money_hygiene_enabled: bool = False
-    # Currency all Money-Hygiene charges normalize to; drives the digest
-    # symbol. A self-hoster sets this AND matching fx rates below.
+    # Currency the books report in; drives the money brief's symbol.
     home_currency: str = "INR"
-    # Fallback FX rates, foreign currency -> home_currency.
-    money_hygiene_fx_rates: dict[str, float] = Field(
-        default_factory=lambda: {"USD": 84.5, "EUR": 92.0, "GBP": 108.0, "SGD": 63.0}
-    )
 
     # The books — Maou's hledger journal (spec 2026-09-05-maou-books-design.md §10).
     # books_repo_url empty ⇒ books disabled: money events are still indexed,

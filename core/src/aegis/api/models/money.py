@@ -1,4 +1,4 @@
-"""Pydantic models for Money Hygiene (Maou) — receipt extraction shape."""
+"""Pydantic models for the money lane (Maou) — the parsed money-event shape."""
 
 from __future__ import annotations
 
@@ -8,31 +8,6 @@ from decimal import Decimal
 from typing import Literal
 
 from pydantic import BaseModel, field_validator
-
-
-class ReceiptExtraction(BaseModel):
-    """Per-receipt structured output from the Haiku batch classifier.
-
-    Used by `LLMClient.extract_receipts_batch` and consumed by
-    `MoneyActivities.upsert_charges`.
-    """
-
-    is_receipt: bool
-    vendor_name: str = ""
-    sender_label: str = ""
-    category: Literal["domain", "saas", "insurance", "lease", "media", "infra", "other"] = "other"
-    amount: float | None = None
-    currency: str | None = None
-    cadence: Literal["monthly", "quarterly", "yearly", "unknown"] = "unknown"
-    next_due_at: str | None = None
-    confidence: float = 0.0
-    # True = subscription/utility that will bill again; False = one-off
-    # purchase (e.g. a single Amazon order) that should never be minted as
-    # a recurring_charge (#113). None = model didn't answer / pre-fix
-    # extraction — upsert_charges treats that conservatively as recurring,
-    # preserving prior behaviour for ambiguous cases.
-    is_recurring: bool | None = None
-
 
 _KEY_RE = re.compile(r"[^a-z0-9]+")
 # Journal syntax plus every C0 control and DEL — mirrors `books._CONTROL_RE`

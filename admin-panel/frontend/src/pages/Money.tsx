@@ -204,13 +204,6 @@ export default function Money() {
           <h2 style={{ margin: 0, fontSize: 16, fontWeight: 600 }}>
             Upcoming renewal alerts
           </h2>
-          <button
-            className="btn"
-            disabled={running === 'money_hygiene'}
-            onClick={() => void recheck('money_hygiene')}
-          >
-            {running === 'money_hygiene' ? 'Running…' : '↻ Re-run money hygiene'}
-          </button>
         </div>
         <div className="table-scroll">
           <table className="data-table">
@@ -252,13 +245,6 @@ export default function Money() {
           <h2 style={{ margin: 0, fontSize: 16, fontWeight: 600 }}>
             Latest monthly digest
           </h2>
-          <button
-            className="btn"
-            disabled={running === 'subscription_audit'}
-            onClick={() => void recheck('subscription_audit')}
-          >
-            {running === 'subscription_audit' ? 'Running…' : '↻ Re-run audit'}
-          </button>
         </div>
         {!digest && (
           <div className="empty" style={{ padding: 16 }}>No digest generated yet.</div>

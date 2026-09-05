@@ -138,7 +138,7 @@ def test_money_digest_returns_latest_when_present(app, client):
     assert body["digest"]["summary"]["total_monthly_inr"] == 12345.67
 
 
-@pytest.mark.parametrize("flow", ["money_hygiene", "subscription_audit"])
+@pytest.mark.parametrize("flow", ["receipt_scan"])
 def test_money_trigger_run_dispatches_workflow(app, client, monkeypatch, flow):
     """POST /{flow}/run delegates to _start_workflow for each known flow."""
     calls = []
@@ -165,7 +165,7 @@ def test_money_trigger_run_409_when_disabled(app, client, settings):
     settings.money_hygiene_enabled = False
     app.dependency_overrides[get_settings] = lambda: settings
 
-    resp = client.post("/api/admin/money/money_hygiene/run")
+    resp = client.post("/api/admin/money/receipt_scan/run")
 
     assert resp.status_code == 409
     assert "disabled" in resp.json()["detail"].lower()
@@ -175,13 +175,26 @@ def test_money_trigger_run_503_when_no_temporal(app, client):
     """POST /{flow}/run returns 503 when temporal_client is None."""
     app.state.temporal_client = None
 
-    resp = client.post("/api/admin/money/money_hygiene/run")
+    resp = client.post("/api/admin/money/receipt_scan/run")
 
     assert resp.status_code == 503
 
 
-def test_money_trigger_run_400_for_unknown_flow(app, client):
+@pytest.mark.parametrize(
+    "flow",
+    [
+        "bogus_flow",
+        # The v1 subscription flows, deleted 2026-09. The route must not
+        # advertise a workflow type the worker no longer registers: a 200 here
+        # would start a workflow nothing is listening for, and it would sit in
+        # Temporal until it timed out. The dispatch test above cannot catch
+        # this — it monkeypatches _start_workflow, so it never reads the map.
+        "money_hygiene",
+        "subscription_audit",
+    ],
+)
+def test_money_trigger_run_400_for_unknown_flow(app, client, flow):
     """POST /{unknown}/run returns 400 for unrecognized flow names."""
-    resp = client.post("/api/admin/money/bogus_flow/run")
+    resp = client.post(f"/api/admin/money/{flow}/run")
 
     assert resp.status_code == 400

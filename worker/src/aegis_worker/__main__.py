@@ -47,7 +47,7 @@ from aegis_worker.activities.jira import JiraActivities
 from aegis_worker.activities.llm_governor import LLMGovernorActivities
 from aegis_worker.activities.meeting import MeetingActivities
 from aegis_worker.activities.memory import MemoryActivities
-from aegis_worker.activities.money import MoneyActivities, parse_bank_alert_senders
+from aegis_worker.activities.money import MoneyActivities
 from aegis_worker.activities.people import PeopleActivities
 from aegis_worker.activities.profile import ProfileActivities
 from aegis_worker.activities.raindrop import RaindropActivities
@@ -253,13 +253,9 @@ async def main():
             db_pool=deps.pool,
             llm=deps.llm,
             delivery=delivery_act,
-            fx_rates=getattr(settings, "money_hygiene_fx_rates", {}),
             home_currency=getattr(settings, "home_currency", "INR"),
             # balanced (kimi) — the Anthropic API smart tier is reserved for chat
             extract_model=model_balanced,
-            bank_alert_senders=parse_bank_alert_senders(
-                getattr(settings, "bank_alert_senders", "")
-            ),
             books_cfg=config_from_settings(settings),
             ignored_mailboxes=parse_csv_set(getattr(settings, "books_ignored_mailboxes", "")),
             mailbox_entities=parse_kv(getattr(settings, "books_mailbox_entities", "")),

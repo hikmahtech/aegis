@@ -41,7 +41,6 @@ def _make_act(db_pool):
         db_pool=db_pool,
         llm=None,
         delivery=None,
-        fx_rates={},
     )
 
 
@@ -152,7 +151,6 @@ async def test_store_receipt_email_no_pool():
         db_pool=None,
         llm=None,
         delivery=None,
-        fx_rates={},
     )
     env = ActivityEnvironment()
     result = await env.run(act.store_receipt_email, {"id": "x"}, "sebas")
@@ -322,18 +320,3 @@ async def test_load_receipts_prefers_body_text_over_snippet(db_pool):
     by_id = {r["message_id"]: r["body_plain"] for r in rows}
     assert by_id == {"rt-body-2": "full", "rt-body-3": "snip only"}
 
-
-@pytest.mark.asyncio
-async def test_upsert_charges_keeps_body_text(db_pool):
-    act = _make_act(db_pool)
-    async with db_pool.acquire() as conn:
-        rid = await _insert_receipt_email(
-            conn, message_id="rt-body-4", parsed={"body_text": "full"}, received_days_ago=0.1
-        )
-    await act.upsert_charges("_t", [{"receipt_id": rid, "is_receipt": False, "confidence": 0.9}])
-    async with db_pool.acquire() as conn:
-        parsed = await conn.fetchval(
-            "SELECT parsed FROM finance.receipt_email WHERE id = $1::uuid", rid
-        )
-    assert parsed["body_text"] == "full"
-    assert parsed["is_receipt"] is False

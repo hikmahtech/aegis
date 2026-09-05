@@ -299,7 +299,16 @@ def test_module_workflows_is_the_unflagged_registry():
         # the money-flagged MoneyActivities. Both flows are money-flagged too,
         # so again only the money=True row moves: +2 flows / +4 activities,
         # and +0/+0 for the other two.
-        (True, True, 44, 224),
+        # Then MINUS 2 flows and MINUS 8 activities: the v1 subscription
+        # tracker is deleted. MoneyHygieneDailyFlow and SubscriptionAuditFlow
+        # go, and with them upsert_charges, classify_and_extract,
+        # detect_cancellations, evaluate_renewal_alerts, notify_renewal_alert,
+        # notify_cancellation, build_subscription_digest and
+        # notify_subscription_digest. All eight are on the money-flagged
+        # MoneyActivities and both flows are money-flagged, so — like every
+        # bump above — only the money=True row moves: -2/-8, and 0 for the
+        # other two, which never counted them in the first place.
+        (True, True, 42, 216),
         (False, False, 34, 183),
         (True, False, 38, 202),
     ],

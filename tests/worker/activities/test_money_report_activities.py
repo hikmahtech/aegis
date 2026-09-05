@@ -26,7 +26,7 @@ class _Delivery:
 
 
 def _act(**kw) -> MoneyActivities:
-    return MoneyActivities(db_pool=None, llm=None, delivery=None, fx_rates={}, **kw)
+    return MoneyActivities(db_pool=None, llm=None, delivery=None, **kw)
 
 
 _BRIEF = {

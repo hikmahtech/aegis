@@ -73,7 +73,6 @@ from aegis_worker.flows.meeting_notes import MeetingNotesFlow
 from aegis_worker.flows.meeting_sweep import MeetingSweepFlow, MeetingSweepInput
 from aegis_worker.flows.memory_reflection import MemoryReflectionFlow, MemoryReflectionInput
 from aegis_worker.flows.money_brief import MoneyBriefConfig, MoneyBriefFlow
-from aegis_worker.flows.money_hygiene import MoneyHygieneConfig, MoneyHygieneDailyFlow
 from aegis_worker.flows.money_process import MoneyProcessFlow
 from aegis_worker.flows.month_close import MonthCloseConfig, MonthCloseFlow
 from aegis_worker.flows.profile_reflection import ProfileReflectionConfig, ProfileReflectionFlow
@@ -94,7 +93,6 @@ from aegis_worker.flows.sentry_poll import SentryPollFlow, SentryPollInput
 from aegis_worker.flows.service_drift import ServiceDriftConfig, ServiceDriftFlow
 from aegis_worker.flows.social_metrics import SocialMetricsConfig, SocialMetricsFlow
 from aegis_worker.flows.social_publish import SocialPublishConfig, SocialPublishFlow
-from aegis_worker.flows.subscription_audit import SubscriptionAuditConfig, SubscriptionAuditFlow
 from aegis_worker.flows.todoist_sync import TodoistSyncConfig, TodoistSyncFlow
 from aegis_worker.flows.wearable_ingest import WearableIngestFlow, WearableIngestInput
 from aegis_worker.flows.workspace_repo_sync import WorkspaceRepoSyncFlow, WorkspaceRepoSyncInput
@@ -475,24 +473,6 @@ FLOWS: tuple[FlowSpec, ...] = (
             aegis_ui_url=act["_settings"].get("aegis_ui_url", ""),
             sender_filter=act["config"].get("sender_filter") or DEFAULT_SENDER_FILTER,
             sweep_limit=int(act["config"].get("sweep_limit", 20)),
-        ),
-        feature_flag="money_hygiene_enabled",
-    ),
-    FlowSpec(
-        MoneyHygieneDailyFlow,
-        lambda act: MoneyHygieneConfig(
-            agent_id=act["agent_id"],
-            silent=bool(act["config"].get("silent", False)),
-            threshold_multiplier=float(act["config"].get("threshold_multiplier", 2.0)),
-            thresholds_days=act["config"].get("thresholds_days", [30, 14, 7, 0]),
-        ),
-        feature_flag="money_hygiene_enabled",
-    ),
-    FlowSpec(
-        SubscriptionAuditFlow,
-        lambda act: SubscriptionAuditConfig(
-            agent_id=act["agent_id"],
-            silent=bool(act["config"].get("silent", False)),
         ),
         feature_flag="money_hygiene_enabled",
     ),

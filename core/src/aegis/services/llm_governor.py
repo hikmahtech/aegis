@@ -12,7 +12,7 @@ editable through the generic admin Settings editor — neither is in
     (e.g. ``"claude,gpt-4"`` to budget only the paid models); empty = all.
 
 ``llm_kill_switch`` ``{"active": false, "reason": "", "set_by": ""}``
-    While ``active``, ``LLMClient.think``/``chat``/``extract_receipts_batch``
+    While ``active``, ``LLMClient.think``/``chat``/``extract_money_batch``
     raise ``LLMKillSwitchError`` instead of calling the model. Embeddings are
     deliberately exempt (knowledge search must survive a spend freeze).
     ``set_by`` is ``"governor"`` for an automatic trip and anything else

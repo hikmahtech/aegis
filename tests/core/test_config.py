@@ -103,20 +103,19 @@ def test_homelab_probe_fields_deleted():
         "money_hygiene_haiku_batch",
         "money_hygiene_cancellation_threshold_multiplier",
         "money_hygiene_alert_thresholds_days",
+        # v1 subscription tracker, deleted 2026-09: the books carry FX as `P`
+        # price lines and the bank-alert guard is now `bank_parsers`.
+        "money_hygiene_fx_rates",
+        "bank_alert_senders",
     ):
         assert not hasattr(s, gone), f"{gone} should have been deleted"
 
 
-def test_money_hygiene_settings_defaults():
-    """Money Hygiene settings load with the spec'd defaults."""
+def test_money_settings_defaults():
+    """The money lane's settings load with the spec'd defaults."""
     s = Settings(**_REQUIRED)
     assert s.money_hygiene_enabled is False
     assert s.home_currency == "INR"
-    assert "USD" in s.money_hygiene_fx_rates
-    assert s.money_hygiene_fx_rates["USD"] == 84.5
-    assert s.money_hygiene_fx_rates["EUR"] == 92.0
-    assert s.money_hygiene_fx_rates["GBP"] == 108.0
-    assert s.money_hygiene_fx_rates["SGD"] == 63.0
 
 
 def test_comma_separated_list_fields_parse_from_env(monkeypatch):

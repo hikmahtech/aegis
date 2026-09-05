@@ -75,7 +75,7 @@ async def _clean(db_pool):
 
 def _act(db_pool, cfg, llm=None, capture=None) -> MoneyActivities:
     return MoneyActivities(
-        db_pool=db_pool, llm=llm, delivery=None, fx_rates={}, books_cfg=cfg,
+        db_pool=db_pool, llm=llm, delivery=None, books_cfg=cfg,
         ignored_mailboxes=frozenset({"v2-stpd"}), mailbox_entities={"v2-hikmah": "hikmah"},
         capture=capture,
     )

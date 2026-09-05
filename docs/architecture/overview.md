@@ -36,7 +36,7 @@ To add or repurpose an agent, create it and check the capability tags that descr
 |-------------|------|------------|-----------------|
 | **Sebas** | Executive assistant | `smart` | `GmailIngestFlow`, `CalendarIngestFlow`, `TodoistSyncFlow`, `ClarifyFlow`, `DailyReviewFlow` + `WeeklyReviewFlow`, `SocialPublishFlow`, `SocialMetricsFlow`, `MemoryReflectionFlow`, `CuriosityCardFlow`, `ProfileReflectionFlow`, `ExpiryRadarFlow`, `WearableIngestFlow` |
 | **Raphael** | Research + knowledge | `smart` | `DailyBriefingFlow`, `DayLogFlow` (×3 rows: nightly / weekly / monthly), `IntelligenceScanFlow` (×3 sources), `RaindropIngestFlow`, `RssIngestFlow`, `DriveSyncFlow` |
-| **Maou** | Finance | `smart` | `MoneyProcessFlow`, `MoneyHygieneDailyFlow`, `ReceiptIngestFlow`, `SubscriptionAuditFlow` |
+| **Maou** | Finance | `smart` | `MoneyProcessFlow`, `ReceiptIngestFlow`, `MoneyBriefFlow`, `MonthCloseFlow` |
 | **Pandora's Actor** | Infrastructure | `smart` | `ServiceDriftFlow`, `CertRadarFlow`, `SentryPollFlow`, `DeliveryWatchdogFlow`, `InfraHeartbeatFlow` (2-min swarm node/service poll, transition-only alerts), `FlowHealthWatchdogFlow` (30-min watchdog over AEGIS's own flows), `LLMSpendGuardFlow`, `AgentTaskSweepFlow`, `CleanupFlow`, `WorkspaceRepoSyncFlow`, `GitHubAlertFlow` (PR notifier, webhook-driven) |
 
 **Utility flows (driven by their callers, not owner-scheduled):**
@@ -348,7 +348,7 @@ PostgreSQL 16 + pgvector. Migrations 001 → 026 in `migrations/` (001 is the sq
 
 **Knowledge (native RAG)** — `knowledge_content`, `knowledge_chunks` (pgvector embeddings), `knowledge_injection_log`.
 
-**Maou (finance)** — `finance.journal_index` (the books' index: idempotency on the Gmail message id, receipt↔bank matching, dues dedupe — amounts in it are never authoritative, run hledger), `finance.recurring_charge`, `finance.receipt_email`, `finance.renewal_alert`, `finance.subscription_digest`.
+**Maou (finance)** — `finance.journal_index` (the books' index: idempotency on the Gmail message id, receipt↔bank matching, dues dedupe — amounts in it are never authoritative, run hledger), `finance.receipt_email`, and `finance.recurring_charge` / `finance.renewal_alert` / `finance.subscription_digest` — legacy tables, unwritten since 2026-09; dropped in a follow-up.
 
 **Pandora's Actor (infra)** — `pandoras_actor.homelab_drift`, `pandoras_actor.cert_expiry`. (`pandoras_actor.backup_health` and `pandoras_actor.schedule_health` were created by the baseline and dropped again by migration 022: their producers, `BackupAuditFlow` and `ScheduleHealthFlow`, were removed when the owner-specific homelab probes were stripped, leaving the tables and their `CleanupFlow` retention entries behind as dead weight.)
 

@@ -116,7 +116,7 @@ def _ev(**kw) -> MoneyEvent:
 
 def _act(db_pool, cfg, finance=None) -> MoneyActivities:
     return MoneyActivities(
-        db_pool=db_pool, llm=None, delivery=None, fx_rates={}, books_cfg=cfg, finance=finance
+        db_pool=db_pool, llm=None, delivery=None, books_cfg=cfg, finance=finance
     )
 
 
