@@ -24,9 +24,10 @@ four rules hold the module together and every one of them is load-bearing:
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
-import json
 import re
+import time
 from datetime import date as date_type
 from decimal import Decimal, InvalidOperation
 from typing import Literal
@@ -49,6 +50,10 @@ _ENTITIES = ("personal", "hikmah")
 # `quantize()` further down. Nothing real is a trillion of anything.
 _MAX_AMOUNT = Decimal("1e12")
 
+# Placeholder msgid used while rendering the block a msgid is derived FROM.
+# Constant, so it contributes nothing to the digest.
+_MSGID_SEED = "manual/0"
+
 # How long a books WRITE may take, from `books.py`'s own budgets: clone (180s,
 # first write only) + pull (120s) + `check --strict` (60s) + commit (60s) +
 # push (120s). The chat loop's default is `tool_timeout_seconds` = 30, and
@@ -69,12 +74,36 @@ _MAX_APPLY = 200
 # another process. So the budget is not "this call" — it is every future call
 # in two services.
 _MAX_MATCH_LEN = 200
-# A quantifier applied to a group that already contains one (`(a+)+`, `(?:a*)*`,
-# `(a{1,3})+`) or to an alternation (`(a|a)+`) is the shape whose backtracking
-# is exponential. `re` has no timeout and `books.apply_rules` runs `re.search`
-# synchronously on the event loop, so such a pattern hangs the whole process and
-# `asyncio.wait_for` cannot interrupt it.
-_NESTED_QUANTIFIER_RE = re.compile(r"\([^()]*[*+}|][^()]*\)[*+{]")
+
+# Three bounds, in the order they are applied. `re` has no timeout and
+# `books.apply_rules` runs `re.search` synchronously on the event loop, so a
+# slow pattern hangs the whole process and `asyncio.wait_for` cannot interrupt
+# it — which is why the pattern is measured BEFORE it is persisted.
+#
+# 1. ANY quantified group. Exponential backtracking needs nested quantification,
+#    and nesting needs a group — so this removes the whole exponential class in
+#    one rule. A guard that only caught self-nesting (`(a+)+`) missed `((a+))+`,
+#    which was measured still running after 20s on a 31-character input.
+_QUANTIFIED_GROUP_RE = re.compile(r"\)\s*[*+{?]")
+# 2. How many quantifiers may stack. Without a group the cost is polynomial in
+#    the number of them, and the probe below has to terminate. Measured on
+#    CPython 3.12, `("a" * 48 + "!")` against `"a*" * k + "$"`:
+#      k=4 → 0.015s   k=5 → 0.14s   k=6 → 1.15s   k=8 → 55s
+#    so 6 is what keeps the probe's own worst case near a second.
+_MAX_QUANTIFIERS = 6
+# The `?` of `(?:`/`(?i)` is not a quantifier, and `\*` is a literal.
+_QUANTIFIER_RE = re.compile(r"(?<!\\)(?<!\()[*+?]|(?<!\\)\{\d")
+# 3. The behavioural check, which is the only one that catches quantifier
+#    stacking with no group at all. The probes are worst-case shapes for a
+#    backtracking engine at a length a real payee can reach (80 chars).
+#
+#    SHORTEST FIRST, and the loop stops at the first probe over budget. That
+#    ordering is what keeps this from becoming a hang if rule 1 above is ever
+#    weakened: measured, `((a+))+$` costs 0.9s at 24 characters and is refused
+#    there, where at 48 it would not have finished this decade. Rule 1 means the
+#    first probe is always fast in practice; this is the belt to its braces.
+_REGEX_BUDGET_S = 0.1
+_REGEX_PROBES = ("a" * 24 + "!", "a" * 48 + "!", "ab" * 24 + "!", "0" * 48 + " x")
 
 # One index row per reclassified posting; the journal is the record, so this
 # only keeps the index from disagreeing with it.
@@ -91,11 +120,42 @@ def _undeclared(account: str) -> str:
     )
 
 
-def _account_entity(account: str) -> str:
-    """Which set of books an account belongs to. The chart puts the business
-    accounts under a `hikmah` segment (`books._ACCOUNT_MAP`); everything else
-    is personal."""
+def _account_entity(account: str) -> str | None:
+    """Which set of books an account belongs to, or None when it belongs to
+    both.
+
+    Only the expense and income trees carry an entity — the business side is
+    the `:hikmah:` segment (`books._ACCOUNT_MAP`). Assets, liabilities and
+    equity are entity-NEUTRAL by design: `post_event` writes
+    `assets:bank:hdfc:1225` into both sets of books through
+    `instrument_account`, which has no notion of entity at all, and the chart
+    declares `equity:transfers` precisely for a move between one's own
+    accounts. Treating those as personal would refuse a real correction — a
+    hikmah posting moved onto the shared bank account — for no gain, since the
+    hazard the caller guards against (an `expenses:hikmah:*` posting filed in
+    `personal/2026.journal`) lives entirely in the two trees this does cover.
+    """
+    if not account.startswith(("expenses:", "income:")):
+        return None
     return "hikmah" if ":hikmah:" in f"{account}:" else "personal"
+
+
+def _slow_regex_probe(pattern: str) -> str | None:
+    """The probe string this pattern is too slow on, or None.
+
+    Bounded by construction rather than by interruption: `re` cannot be
+    interrupted, so the caller's syntactic bounds (no quantified group, at most
+    `_MAX_QUANTIFIERS`) are what keep this from becoming the hang it is meant to
+    prevent. Within them the worst measured case is ~1.2s, once, on a rule that
+    is then refused.
+    """
+    compiled = re.compile(pattern, re.I)
+    for probe in _REGEX_PROBES:
+        started = time.perf_counter()
+        compiled.search(probe)
+        if time.perf_counter() - started > _REGEX_BUDGET_S:
+            return probe
+    return None
 
 
 def _manual_msgid(
@@ -109,28 +169,24 @@ def _manual_msgid(
     transaction in the ledger. Deriving the id from the content makes the
     second call find the first one's block and write nothing.
 
+    What is digested is the RENDERED BLOCK, not the caller's arguments. The
+    journal stores normalized values — a quantized amount, a defaulted
+    currency, a sanitized payee and note — so digesting the raw text would give
+    `"245.50"` and `"245.5"` different ids for a byte-identical block and let
+    the duplicate through anyway. An LLM re-issuing a timed-out call is not
+    byte-stable, so that is the realistic retry, not an exotic one. Hashing the
+    block makes "same id" mean exactly "same journal entry", and keeps meaning
+    that if `render_manual` changes.
+
+    `entity` is digested alongside it because it picks the FILE, and the same
+    block in the two sets of books is two different transactions.
+
     The trade is that two genuinely identical transactions on the same day
     collapse into one; the tool says so in its description, and a distinguishing
-    `note` (which is part of this digest) records the second.
+    `note` (which is part of the block) records the second.
     """
-    material = json.dumps(
-        [
-            entity,
-            d.isoformat(),
-            payee,
-            note,
-            [
-                [
-                    str(p.get("account") or ""),
-                    str(p.get("amount") if p.get("amount") not in (None, "") else ""),
-                    str(p.get("currency") or ""),
-                ]
-                for p in postings
-            ],
-        ],
-        sort_keys=True,
-    )
-    return f"manual/{hashlib.sha256(material.encode()).hexdigest()[:16]}"
+    body = books.render_manual(d, payee, postings, _MSGID_SEED, note)
+    return f"manual/{hashlib.sha256(f'{entity}\n{body}'.encode()).hexdigest()[:16]}"
 
 
 @aegis_tool
@@ -246,13 +302,18 @@ async def _exec_ledger_post(
         parser="manual",
         source_class="other",
     )
-    # Indexed even when the block was already there: the first attempt may have
-    # committed the write and then been abandoned before it reached the index,
-    # which is exactly the state a retry has to repair. `ji.upsert` is
-    # idempotent on the msgid.
-    await ji.upsert(pool, msgid, "manual", event, journal_file=rel)
     if not created:
+        # The block was already there. Index it only if the row is MISSING —
+        # that is the state a retry has to repair (the first attempt committed
+        # the journal and was abandoned before it reached the index). Upserting
+        # unconditionally would instead drag the index backwards: a reclassify
+        # between the two posts moved the row's account, and `ji.upsert` sets
+        # `account = EXCLUDED.account`, so the re-post would reset it while the
+        # journal correctly keeps the new one.
+        if await ji.get(pool, msgid) is None:
+            await ji.upsert(pool, msgid, "manual", event, journal_file=rel)
         return f"already posted as {msgid} in {rel}; nothing was written twice"
+    await ji.upsert(pool, msgid, "manual", event, journal_file=rel)
     return f"posted {msgid} to {rel}"
 
 
@@ -260,7 +321,7 @@ async def _exec_ledger_post(
 async def _exec_ledger_reclassify(
     pool: asyncpg.Pool, ctx: ToolContext, *, message_id: str, account: str, payee: str | None = None
 ) -> str:
-    """Move a posting to another account (and optionally rename its payee) by its books message id (`<mailbox>/<gmail id>` or `manual/<uuid>`). The new account must belong to the same set of books the posting is filed in.
+    """Move a posting to another account (and optionally rename its payee) by its books message id (`<mailbox>/<gmail id>` or `manual/<uuid>`). The new account must be one the posting's own set of books can use: an expense or income account of that entity, or any asset, liability or equity account, which both sets share.
 
     Args:
         message_id: the msgid tag of the transaction.
@@ -287,9 +348,10 @@ async def _exec_ledger_reclassify(
     if located is None:
         return f"error: no journal block carries msgid {message_id}"
     filed_in = located.split("/")[0]
-    if _account_entity(account) != filed_in:
+    belongs_to = _account_entity(account)
+    if belongs_to is not None and belongs_to != filed_in:
         return (
-            f"error: {account} belongs to the {_account_entity(account)} books but "
+            f"error: {account} belongs to the {belongs_to} books but "
             f"{message_id} is filed in {located}. Moving a posting between "
             "entities means moving the block, which this tool does not do."
         )
@@ -338,11 +400,23 @@ async def _exec_ledger_add_rule(
     # are checked BEFORE the rule reaches the file.
     if len(match) > _MAX_MATCH_LEN:
         return f"error: match is longer than {_MAX_MATCH_LEN} characters"
-    if _NESTED_QUANTIFIER_RE.search(match):
+    if _QUANTIFIED_GROUP_RE.search(match):
         return (
-            "error: match repeats a group that already repeats (e.g. `(a+)+`, `(a|a)+`) — "
-            "that pattern can take exponential time, and this rule runs against every "
-            "money event from now on. Write it without the outer repetition."
+            "error: match repeats a group (e.g. `(a+)+`, `(ab)*`, `(a|a)+`) — repeating a "
+            "group can take exponential time, and this rule runs against every money event "
+            "from now on. Write it without repeating the group."
+        )
+    if len(_QUANTIFIER_RE.findall(match)) > _MAX_QUANTIFIERS:
+        return (
+            f"error: match stacks more than {_MAX_QUANTIFIERS} quantifiers (*, +, ?, {{n}}), "
+            "which gets slow faster than the length of what it is matched against."
+        )
+    slow_on = await asyncio.to_thread(_slow_regex_probe, match)
+    if slow_on is not None:
+        return (
+            f"error: match took longer than {int(_REGEX_BUDGET_S * 1000)}ms on a "
+            f"{len(slow_on)}-character test string. A payee can be 80 characters, and this "
+            "rule runs against every money event from now on, so it has to be quick."
         )
     if entity is not None and entity not in _ENTITIES:
         return f"error: entity must be one of {', '.join(_ENTITIES)}, got {entity!r}"

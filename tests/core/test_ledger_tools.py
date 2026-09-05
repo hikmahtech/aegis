@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import shutil
 import subprocess
+import time
 from datetime import date
 from decimal import Decimal
 from pathlib import Path
@@ -181,6 +182,7 @@ async def test_query_refuses_the_argument_forms_hledger_would_honour(db_pool, tm
         [f"@{secret}"],  # args-file expansion
         [f"--rules-file={secret}"],
         ["--output-file", str(victim)],
+        ["-o", str(victim)],
         ["-f", str(secret)],
         ["--file", str(secret)],
     ]
@@ -316,6 +318,42 @@ async def test_reclassify_refuses_to_cross_entities(db_pool, tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_reclassify_allows_the_accounts_both_entities_share(db_pool, tmp_path):
+    """Assets, liabilities and equity are entity-neutral by design — the chart
+    declares ONE `assets:bank:hdfc:1225`, and `books.instrument_account` writes
+    it into both sets of books with no notion of entity. Refusing a hikmah
+    posting onto a shared account would be a false refusal on a real correction
+    (a mis-filed transfer), and it is not the hazard the guard exists for."""
+    cfg = _repo(tmp_path)
+    ctx = _ctx(cfg)
+    out = await _exec_ledger_post(
+        db_pool,
+        {
+            "date": "2026-09-03",
+            "payee": "Vendor",
+            "entity": "hikmah",
+            "postings": [
+                {"account": "expenses:unknown", "amount": "9", "currency": "INR"},
+                {"account": "assets:bank:hdfc:1225"},
+            ],
+        },
+        ctx,
+    )
+    msgid = out.split()[1]
+    # A shared account: allowed even though the block is in the hikmah books.
+    shared = await _exec_ledger_reclassify(
+        db_pool, {"message_id": msgid, "account": "assets:unknown"}, ctx
+    )
+    assert shared.startswith("reclassified"), shared
+    assert "assets:unknown" in (cfg.path / "hikmah" / "2026.journal").read_text()
+    # A personal EXPENSE account: still refused, which is the real hazard.
+    crossed = await _exec_ledger_reclassify(
+        db_pool, {"message_id": msgid, "account": "expenses:groceries"}, ctx
+    )
+    assert crossed.startswith("error:") and "hikmah/2026.journal" in crossed, crossed
+
+
+@pytest.mark.asyncio
 async def test_reclassify_unknown_message_id_is_an_error(db_pool, tmp_path):
     ctx = _ctx(_repo(tmp_path))
     out = await _exec_ledger_reclassify(
@@ -443,6 +481,91 @@ async def test_reposting_the_same_transaction_is_a_retry_not_a_duplicate(db_pool
     third = await _exec_ledger_post(db_pool, {**args, "note": "second coffee"}, ctx)
     assert third.startswith("posted manual/") and third.split()[1] != msgid, third
     assert (cfg.path / "personal" / "2026.journal").read_text().count("* Corner Store") == 2
+
+
+@pytest.mark.asyncio
+async def test_the_retry_key_is_the_block_not_the_caller_s_typing(db_pool, tmp_path):
+    """The journal stores NORMALIZED values — a quantized amount, a defaulted
+    currency, a sanitized payee and note — so a msgid digested from the raw
+    arguments gives `"245.50"` and `"245.5"` different ids for a byte-identical
+    block, and the duplicate lands anyway. An LLM re-issuing a timed-out call is
+    not byte-stable, so these ARE the retry."""
+    cfg = _repo(tmp_path)
+    ctx = _ctx(cfg)
+    variants = [
+        [
+            {"account": "expenses:unknown", "amount": "245.50", "currency": "INR"},
+            {"account": "assets:bank:hdfc:1225"},
+        ],
+        # same amount, written differently
+        [
+            {"account": "expenses:unknown", "amount": "245.5", "currency": "INR"},
+            {"account": "assets:bank:hdfc:1225"},
+        ],
+        # currency omitted — the journal defaults it to INR
+        [
+            {"account": "expenses:unknown", "amount": "245.50"},
+            {"account": "assets:bank:hdfc:1225"},
+        ],
+        # currency in lower case — the journal upper-cases it
+        [
+            {"account": "expenses:unknown", "amount": "245.500", "currency": "inr"},
+            {"account": "assets:bank:hdfc:1225"},
+        ],
+        # a blank amount is a blank amount however it is spelled
+        [
+            {"account": "expenses:unknown", "amount": "245.50", "currency": "INR"},
+            {"account": "assets:bank:hdfc:1225", "amount": ""},
+        ],
+    ]
+    outs = []
+    for postings in variants:
+        outs.append(
+            await _exec_ledger_post(
+                db_pool,
+                {"date": "2026-09-03", "payee": "Corner  Store ", "postings": postings},
+                ctx,
+            )
+        )
+    assert outs[0].startswith("posted manual/"), outs[0]
+    for out in outs[1:]:
+        assert out.startswith("already posted as "), out
+        assert outs[0].split()[1] in out, out
+    text = (cfg.path / "personal" / "2026.journal").read_text()
+    assert text.count("; msgid: ") == 1, text
+
+
+@pytest.mark.asyncio
+async def test_a_repost_never_drags_the_index_back(db_pool, tmp_path):
+    """Post, reclassify, then re-post the identical transaction. The journal
+    keeps the reclassified account, so an unconditional re-index would reset the
+    row to the account the transaction was first filed under and leave the index
+    disagreeing with the record."""
+    cfg = _repo(tmp_path)
+    ctx = _ctx(cfg)
+    args = {
+        "date": "2026-09-03",
+        "payee": "Corner Store",
+        "postings": [
+            {"account": "expenses:unknown", "amount": "245.50", "currency": "INR"},
+            {"account": "assets:bank:hdfc:1225"},
+        ],
+    }
+    msgid = (await _exec_ledger_post(db_pool, args, ctx)).split()[1]
+    await _exec_ledger_reclassify(
+        db_pool, {"message_id": msgid, "account": "expenses:groceries"}, ctx
+    )
+    again = await _exec_ledger_post(db_pool, args, ctx)
+    assert again.startswith("already posted as "), again
+    assert "expenses:groceries" in (cfg.path / "personal" / "2026.journal").read_text()
+    assert (await ji.get(db_pool, msgid))["account"] == "expenses:groceries"
+
+    # …and the repair case still repairs: an index row lost after the journal
+    # was written must come back on the retry.
+    await db_pool.execute("DELETE FROM finance.journal_index WHERE message_id = $1", msgid)
+    repaired = await _exec_ledger_post(db_pool, args, ctx)
+    assert repaired.startswith("already posted as "), repaired
+    assert (await ji.get(db_pool, msgid)) is not None
 
 
 @pytest.mark.asyncio
@@ -720,19 +843,50 @@ async def test_add_rule_refuses_a_catastrophic_regex_before_persisting_it(db_poo
     ctx = _ctx(cfg)
     rules_path = cfg.path / "rules" / "accounts.yaml"
     before = rules_path.read_text()
-    for pattern in ("(a+)+$", "(?:a*)*b", "(a{1,3})+x", "(ab|ab)+c"):
+    # Every quantified group, not only the self-nesting ones: `((a+))+` slipped
+    # past a guard that required the group to hold no parens, and was measured
+    # still running after 20 SECONDS against a 31-character input.
+    for pattern in ("(a+)+$", "(?:a*)*b", "(a{1,3})+x", "(ab|ab)+c", "((a+))+$", "((ab)*)*"):
         out = await _exec_ledger_add_rule(
             db_pool, {"match": pattern, "account": "expenses:groceries", "apply": False}, ctx
         )
-        assert "repeats a group that already repeats" in out, (pattern, out)
+        assert "repeats a group" in out, (pattern, out)
+    # Stacked quantifiers with NO group at all — no syntactic rule about groups
+    # can see these, which is why the pattern is also timed before it is stored.
+    for pattern in ("a*a*a*a*a*a*a*$", "a*a*a*a*a*$"):
+        out = await _exec_ledger_add_rule(
+            db_pool, {"match": pattern, "account": "expenses:groceries", "apply": False}, ctx
+        )
+        assert out.startswith("error:"), (pattern, out)
     assert rules_path.read_text() == before
     # The shapes a real rule uses must still be accepted, or the guard is just
-    # a ban on regexes: alternation, a bounded group, a character-class repeat.
-    for pattern in ("amazon web services|invoicing@aws\\.com", "mahavitaran.*suncity 501", "a+b"):
+    # a ban on regexes: alternation, a wildcard, a plain repeat, an inline flag.
+    for pattern in (
+        "amazon web services|invoicing@aws\\.com",
+        "mahavitaran.*suncity 501",
+        "a+b",
+        "^(hdfc|icici).*upi",
+        "[0-9]+ payment",
+    ):
         out = await _exec_ledger_add_rule(
             db_pool, {"match": pattern, "account": "expenses:groceries", "apply": False}, ctx
         )
         assert out == "rule added; reclassified 0 postings", (pattern, out)
+
+
+@pytest.mark.asyncio
+async def test_add_rule_regex_check_is_itself_bounded(db_pool, tmp_path):
+    """The timing probe cannot be interrupted — `re` has no timeout — so the
+    syntactic bounds in front of it are what stop the CHECK from becoming the
+    hang it exists to prevent. Whatever the pattern, answering must be quick."""
+    ctx = _ctx(_repo(tmp_path))
+    started = time.perf_counter()
+    for pattern in ("((a+))+$", "a*" * 40 + "$", "(a|a)+$", "a*a*a*a*a*a*$"):
+        out = await _exec_ledger_add_rule(
+            db_pool, {"match": pattern, "account": "expenses:groceries", "apply": False}, ctx
+        )
+        assert out.startswith("error:"), (pattern, out)
+    assert time.perf_counter() - started < 10, "the guard took longer than the rules it refuses"
 
 
 @pytest.mark.asyncio
