@@ -717,3 +717,79 @@ async def test_parse_does_not_pay_the_llm_for_mail_with_no_money_in_it(db_pool, 
     )
     assert ev["kind"] == "due" and ev["amount"] == "2068.12"
     llm.extract_money_batch.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_transaction_with_no_amount_is_not_a_transaction(db_pool, tmp_path):
+    """14 live index rows are notification mail the extractor called a
+    `transaction` with no amount in it (issue #394): Anthropic "Your Max
+    subscription is confirmed", Route 53 "Automatic renewal succeeded", Amazon
+    Pay "Update on refund processed".
+
+    Every amount-bearing transaction in the live index is posted and every
+    amountless one is not, so these are not lost money and not an extraction
+    failure to retry — the amount is simply absent from the mail. Left labelled
+    `transaction` they inflate the transaction count and sit in the index as
+    rows nothing can ever post, and they never stop costing: the writer refuses
+    them, `post_failed` leaves `parsed.version` below 2, and the stuck-receipt
+    sweep re-extracts the same mail every week.
+    """
+    llm = AsyncMock()
+    llm.extract_money_batch = AsyncMock(return_value=[{
+        "kind": "transaction", "direction": "out", "amount": None, "currency": None,
+        "payee": "Anthropic", "payee_key": "anthropic", "channel": "card",
+        "confidence": 0.6, "parser": "llm", "source_class": "other",
+    }])
+    act = _act(db_pool, _repo(tmp_path), llm=llm)
+    confirmation = _receipt(
+        sender="billing@anthropic.com", subject="Your Max subscription is confirmed",
+        body="Your Max subscription is confirmed. Your plan renews at $200.00 a month.",
+    )
+    ev = await ActivityEnvironment().run(act.parse_money_email, confirmation)
+
+    assert ev["kind"] == "info"
+    # Why it is info, and the mail it came from, both survive the demotion.
+    assert ev["parser"] == "llm+no_amount" and ev["payee"] == "Anthropic"
+    # No account and no date were invented for it: both fallbacks are for
+    # transactions, and inventing them is what made these rows look postable.
+    assert ev["account"] is None and ev["occurred_on"] is None
+
+    # The same extractor output WITH an amount is still a transaction, so the
+    # gate is keyed on the missing amount and not on the kind.
+    llm.extract_money_batch = AsyncMock(return_value=[{
+        "kind": "transaction", "direction": "out", "amount": "200.00", "currency": "USD",
+        "payee": "Anthropic", "payee_key": "anthropic", "channel": "card",
+        "confidence": 0.6, "parser": "llm", "source_class": "other",
+    }])
+    ev = await ActivityEnvironment().run(act.parse_money_email, confirmation)
+    assert ev["kind"] == "transaction" and ev["amount"] == "200.00"
+    assert ev["occurred_on"] == "2026-09-02"
+
+    # A due with no amount stays a due: an obligation whose size the mail did
+    # not state is still an obligation worth surfacing, and `capture_due`
+    # already refuses to raise a task for one.
+    llm.extract_money_batch = AsyncMock(return_value=[{
+        "kind": "due", "direction": "out", "amount": None, "currency": "INR",
+        "payee": "Mahavitaran", "payee_key": "mahavitaran", "channel": "bill",
+        "due_on": "2099-08-11", "confidence": 0.9, "parser": "llm", "source_class": "receipt",
+    }])
+    ev = await ActivityEnvironment().run(
+        act.parse_money_email,
+        _receipt(sender="billing@mahadiscom.in", subject="Your electricity bill",
+                 body="Your bill is ready. Pay Rs. 0.00 shown online by 11-08-2099."),
+    )
+    assert ev["kind"] == "due" and ev["amount"] is None and ev["parser"] == "llm"
+
+    # ...and so does a failed payment. That is the backstop that catches an
+    # automatic debit which did not go through.
+    llm.extract_money_batch = AsyncMock(return_value=[{
+        "kind": "failed", "direction": "out", "amount": None, "currency": "INR",
+        "payee": "Mahavitaran", "payee_key": "mahavitaran", "channel": "bill",
+        "confidence": 0.9, "parser": "llm", "source_class": "receipt",
+    }])
+    ev = await ActivityEnvironment().run(
+        act.parse_money_email,
+        _receipt(sender="billing@mahadiscom.in", subject="Payment failed",
+                 body="We could not collect Rs. 0.00 from your account."),
+    )
+    assert ev["kind"] == "failed" and ev["amount"] is None

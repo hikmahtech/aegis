@@ -7,7 +7,7 @@ import csv
 import io
 import re
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from decimal import Decimal
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -134,6 +134,95 @@ def _is_account_cell(cell: str) -> bool:
 
 
 logger = structlog.get_logger()
+
+# How far a real record may sit from the day a `~ periodic` rule predicts and
+# still be the same obligation. The rule's anchor day is hand-written and the
+# bill is paid a day or two either side of it, so exact-date matching would
+# leave every near miss duplicated. Three days is what `journal_index`
+# already calls "the same money recorded twice" (`_MATCH_DAYS`), and it is the
+# cautious end of the range: widening it removes more duplicate lines but
+# brings the PREVIOUS cycle's payment within reach of the NEXT one's warning,
+# and a warning lost is a payment missed.
+#
+# It does assume nothing recurs faster than once a week. A rule shorter than
+# twice this — `~ every 3 days`, say — puts last cycle's payment inside the
+# tolerance of the next prediction and silences it. Every live rule is
+# `~ monthly`, and a weekly one is still safe at 3; anything faster needs this
+# number reconsidered rather than inherited.
+_FORECAST_MATCH_DAYS = 3
+
+
+def drop_forecast_duplicates(
+    forecast: list[dict], obligations: list[tuple[str, Decimal, date]]
+) -> list[dict]:
+    """The forecast rows the books do not already carry (issue #393).
+
+    A forecast is hledger's prediction from a `~ periodic` rule; it fires
+    whether or not the real bill has arrived and whether or not the money has
+    already gone. The first live brief therefore listed Apple iCloud+ and
+    MSEDCL Suncity twice — once as a due extracted from an email, once as a
+    prediction of the same payment — and warned about an Airtel charge printed
+    three lines below under "Paid this week".
+
+    `obligations` is `(payee_key, absolute amount, the day it is expected or
+    moved)` for every due, settled due and posted payment the index knows
+    about in this brief's window. A predicted charge is dropped when one of
+    them has the same key, the same amount and a date within
+    `_FORECAST_MATCH_DAYS`.
+
+    A *charge*, not a row, and each obligation retires at most one of them.
+    `reg` reports POSTINGS, so one predicted transaction that splits across two
+    expense accounts arrives as two rows sharing a `txnidx`; compared one at a
+    time neither equals the bill. And two rules for the same payee at the same
+    size on the same day are two charges — one bill accounting for both would
+    take the second out of the brief altogether, which is the only way this
+    filter can hide money instead of merely repeating it.
+
+    Every uncertainty keeps the row: the forecast exists to warn about money
+    the books have not otherwise seen, so a duplicate line costs a moment and
+    a dropped line costs a payment. That is why the amount is compared in the
+    home commodity only (`amount_from_cell` reports nothing for a cell `-X`
+    could not convert, and 336.40 dollars is not ₹336.40), why one unconvertible
+    posting keeps its whole transaction — a partial sum is not a total — why a
+    description that normalises to nothing matches nothing, and why a date
+    hledger did not write is never assumed to be near anything.
+    """
+    # Postings of one predicted transaction, in the order hledger wrote them.
+    # A row with no `txnidx` stands alone rather than joining anything by
+    # date and description: two identical rules would otherwise merge into one
+    # charge, which is the mistake this grouping exists to prevent.
+    groups: dict[object, list[int]] = {}
+    for i, row in enumerate(forecast):
+        txn = str(row.get("txnidx") or "")
+        groups.setdefault(txn or ("unkeyed", i), []).append(i)
+
+    unused = list(obligations)
+    dropped: set[int] = set()
+    for members in groups.values():
+        rows = [forecast[i] for i in members]
+        key = payee_key(str(rows[0].get("description") or ""))
+        try:
+            when = date.fromisoformat(str(rows[0].get("date") or ""))
+        except ValueError:
+            continue
+        parts = [amount_from_cell(str(r.get("amount") or "")) for r in rows]
+        if not key or not all(parts):
+            continue
+        amount = abs(sum(parts, Decimal(0)))
+        match = next(
+            (
+                j
+                for j, (ob_key, ob_amount, ob_when) in enumerate(unused)
+                if key == ob_key
+                and amount == ob_amount
+                and abs((when - ob_when).days) <= _FORECAST_MATCH_DAYS
+            ),
+            None,
+        )
+        if match is not None:
+            unused.pop(match)
+            dropped.update(members)
+    return [row for i, row in enumerate(forecast) if i not in dropped]
 
 
 def match_to_event(row: dict) -> dict:
@@ -368,6 +457,29 @@ class MoneyActivities:
                 ev.payee = str(rule["payee"])
             if rule.get("account"):
                 ev.account = str(rule["account"])
+        # A transaction with no amount is not a transaction (issue #394). The
+        # same shape as the `has_money_shape` gate above, one step later: that
+        # one reads the mail, this one reads what came back. 14 live rows are
+        # notification mail the extractor labelled `transaction` with nothing
+        # to post — Anthropic "Your Max subscription is confirmed", Route 53
+        # "Automatic renewal succeeded", Amazon Pay "Update on refund
+        # processed". Every amount-bearing transaction in the live index IS
+        # posted and every amountless one is not, so this is not lost money and
+        # not an extraction failure to retry: the number is genuinely absent
+        # from the mail. Left as `transaction` they inflate the transaction
+        # count and sit in the index permanently unpostable — and worse, they
+        # never settle. `books.post_event` refuses an amountless event, which
+        # `post_money_event` reports as `post_failed`; that is in
+        # `UNSTAMPED_STATUSES`, so `parsed.version` never reaches 2, and
+        # `find_stuck_receipts` has no lower date bound — it re-drives and
+        # re-extracts the same mail week after week, paying the extractor each
+        # time. As `info` the row indexes, stamps, and is done with.
+        #
+        # `due` and `failed` are deliberately NOT demoted: an obligation whose
+        # size the mail did not state is still an obligation worth surfacing,
+        # and `capture_due` already refuses to raise a task for a zero.
+        if ev.kind == "transaction" and ev.amount is None:
+            ev.kind, ev.parser = "info", f"{ev.parser}+no_amount"
         if not ev.account and ev.kind == "transaction":
             side = "in" if ev.direction == "in" else "out"
             # A guessed category on a low-confidence extraction is worse than
@@ -723,8 +835,12 @@ class MoneyActivities:
                 "expenses", "tag:generated-transaction",
             ], "csv"))
             # reg -O csv: txnidx, date, code, description, account, amount, total
+            # `txnidx` is carried because these are POSTINGS: a rule splitting
+            # one charge across two expense accounts writes two rows, and only
+            # this column says they are the same predicted transaction.
             brief["forecast"] = [
-                {"date": r[1], "description": r[3], "amount": r[5]} for r in fc[1:] if len(r) >= 6
+                {"txnidx": r[0], "date": r[1], "description": r[3], "amount": r[5]}
+                for r in fc[1:] if len(r) >= 6
             ]
             for row in brief["forecast"]:
                 unconverted.update(unconverted_commodities(row["amount"]))
@@ -766,7 +882,7 @@ class MoneyActivities:
             if u["currency"] == "INR" and Decimal(u["amount"]) >= 5000
         ]
         dues = await self.db_pool.fetch(
-            "SELECT message_id, payee, amount, currency, due_on, kind, todoist_ref "
+            "SELECT message_id, payee, payee_key, amount, currency, due_on, kind, todoist_ref "
             "FROM finance.journal_index "
             "WHERE kind IN ('due','failed') AND linked_message_id IS NULL "
             "  AND due_on BETWEEN $1 AND $2 ORDER BY due_on",
@@ -781,7 +897,8 @@ class MoneyActivities:
             for r in dues
         ]
         closed = await self.db_pool.fetch(
-            "SELECT message_id, payee, amount, currency, due_on FROM finance.journal_index "
+            "SELECT message_id, payee, payee_key, amount, currency, due_on "
+            "FROM finance.journal_index "
             "WHERE kind IN ('due','failed') AND linked_message_id IS NOT NULL "
             "  AND updated_at >= $1 ORDER BY due_on",
             since,
@@ -794,9 +911,47 @@ class MoneyActivities:
             }
             for r in closed
         ]
+        # The forecast warns about money leaving that the books have not
+        # otherwise seen, so anything they HAVE seen is struck off it (issue
+        # #393): the dues and closed dues just fetched, plus the payments that
+        # already posted in this brief's window. Only home-commodity rows take
+        # part — the forecast is reported `-X ₹`, so a foreign amount there is
+        # a converted number that no index row can be compared against.
+        #
+        # `journal_file IS NOT NULL` on the payments is what makes "the books
+        # have seen it" true. A transaction the writer REFUSED is indexed with
+        # no block, so it is in none of the other sections of this brief and in
+        # none of hledger's totals: letting it retire a forecast row would put
+        # that money nowhere the reader can see it.
+        if brief["forecast"]:
+            settled = await self.db_pool.fetch(
+                "SELECT payee_key, amount, currency, occurred_on FROM finance.journal_index "
+                "WHERE kind = 'transaction' AND amount IS NOT NULL "
+                "  AND journal_file IS NOT NULL "
+                "  AND occurred_on IS NOT NULL AND occurred_on >= $1",
+                since,
+            )
+            obligations = [
+                (r["payee_key"], abs(Decimal(r["amount"])), when)
+                for rows, day in ((dues, "due_on"), (closed, "due_on"), (settled, "occurred_on"))
+                for r in rows
+                if (when := r[day]) is not None
+                and r["amount"] is not None
+                and r["payee_key"]
+                and (r["currency"] or "").upper() == self.home_currency.upper()
+            ]
+            brief["forecast"] = drop_forecast_duplicates(brief["forecast"], obligations)
+        # Postings, not rows (issue #394). The first live brief said "53
+        # low-confidence LLM postings" when exactly one low-confidence row had
+        # reached the journal: over half of the 53 was the extractor's doubt
+        # about mail that is not a money event at all, and the rest never
+        # posted. `journal_file IS NOT NULL` is the whole difference between a
+        # categorisation the user could go and fix and a number that means
+        # nothing.
         brief["low_confidence"] = int(await self.db_pool.fetchval(
             "SELECT count(*) FROM finance.journal_index "
-            "WHERE parser = 'llm' AND confidence < 0.8 AND created_at >= $1",
+            "WHERE parser = 'llm' AND confidence < 0.8 AND journal_file IS NOT NULL "
+            "  AND created_at >= $1",
             since,
         ))
         return brief
