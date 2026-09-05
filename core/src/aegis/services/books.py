@@ -297,6 +297,40 @@ def render_transaction(
     return "\n".join(lines) + "\n"
 
 
+def render_manual(d: date, payee: str, postings: list[dict], msgid: str, note: str = "") -> str:
+    """One hand-written block: the same header lines as `render_transaction`,
+    then one posting line per entry (`{"account", "amount", "currency"}`).
+
+    Two differences from `render_transaction`, both deliberate:
+
+    A manual amount is SIGNED. `MoneyEvent` carries the sign in `direction`
+    and `render_amount` takes a magnitude plus a flag, so handing it a
+    negative straight through would render it positive — the block would still
+    balance and still pass `check --strict`, with the money pointing the wrong
+    way and no gate anywhere to catch it.
+
+    `note` goes through `sanitize_tag`, not `sanitize_payee`: it lands on the
+    TAG line, where a comma is the tag separator, so `note="x, evil: true"`
+    would declare a second tag of the caller's choosing. `sanitize_payee`
+    leaves commas alone (they are harmless in a payee).
+    """
+    tags = "channel: manual" + (f", note: {sanitize_tag(note)}" if note else "")
+    lines = [
+        f"{d.isoformat()} * {sanitize_payee(payee)}",
+        f"{_INDENT}; msgid: {msgid}",
+        f"{_INDENT}; {tags}",
+    ]
+    for p in postings:
+        raw = p.get("amount")
+        if raw in (None, ""):
+            amount = ""
+        else:
+            value = Decimal(str(raw))
+            amount = render_amount(value, p.get("currency") or "INR", negative=value < 0)
+        lines.append(_posting(str(p.get("account") or ""), amount))
+    return "\n".join(lines) + "\n"
+
+
 def iter_blocks(text: str) -> list[tuple[int, int]]:
     """(start, end) offsets of every maximal run of non-blank lines."""
     blocks: list[tuple[int, int]] = []
@@ -694,6 +728,32 @@ async def post_event(event: MoneyEvent, msgid: str, cfg: BooksConfig) -> str:
     return posted[0] if posted else rel
 
 
+async def post_block(block: str, entity: str, d: date, msgid: str, cfg: BooksConfig) -> str:
+    """Append an already-rendered block (`render_manual`) under the same lock /
+    `check --strict` / revert protocol as `post_event`. Returns the journal
+    file's relative path.
+
+    Idempotency is repo-WIDE for the same reason as `post_event`: the msgid is
+    the only handle on the block, so a re-post with a corrected date or entity
+    must find the existing one wherever it landed.
+    """
+    rel = journal_rel(entity, d)
+    posted: list[str] = []
+
+    def mutate() -> None:
+        for existing in journal_files(cfg):
+            if find_block(existing.read_text(), msgid):
+                posted.append(str(existing.relative_to(cfg.path)))
+                return
+        # Recorded before the write: `paths` is this write's git scope.
+        posted.append(rel)
+        path = _ensure_journal_file(cfg, rel)
+        path.write_text(append_block(path.read_text(), block))
+
+    await _write(cfg, f"post {entity} {d} manual", mutate, [rel, cfg.main])
+    return posted[0] if posted else rel
+
+
 async def rewrite_event(
     msgid: str,
     cfg: BooksConfig,
@@ -839,6 +899,17 @@ async def run_hledger(args: list[str], cfg: BooksConfig, *, output_format: str =
         return out if len(out) <= _OUTPUT_CAP else out[:_OUTPUT_CAP] + "\n… (truncated)"
 
     return await asyncio.to_thread(_go)
+
+
+async def declared_accounts(cfg: BooksConfig) -> set[str]:
+    """The declared chart, for a caller that must refuse an undeclared account.
+
+    Deliberately NOT routed through `run_hledger`: that allowlist exists to
+    police a CALLER-supplied argument list, and this argv is fixed and carries
+    no caller text at all, while its 12,000-char output cap would silently drop
+    the tail of a large chart — turning a declared account into a refusal.
+    """
+    return await asyncio.to_thread(_declared_accounts_sync, cfg)
 
 
 async def unpushed_commits(cfg: BooksConfig) -> int:

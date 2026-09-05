@@ -71,6 +71,12 @@ from aegis.services.tools.knowledge import (
     _exec_search_knowledge,
     _knowledge_unavailable,  # noqa: F401 — re-export: kept importable from here
 )
+from aegis.services.tools.ledger import (  # noqa: F401 — re-export: imported from here by tests
+    _exec_ledger_add_rule,
+    _exec_ledger_post,
+    _exec_ledger_query,
+    _exec_ledger_reclassify,
+)
 from aegis.services.tools.registry import TOOL_REGISTRY
 from aegis.services.tools.vercel import (
     _exec_vercel_get_build_logs,
@@ -903,6 +909,12 @@ CHAT_TOOLS = [
     _registry_schema("handoff_task"),
     _registry_schema("comment_on_task"),
     _registry_schema("find_reference"),
+    # The books (Maou) — every write goes through `books.py`'s locked,
+    # `check --strict`-guarded writer; `services/tools/ledger.py`.
+    _registry_schema("ledger_query"),
+    _registry_schema("ledger_post"),
+    _registry_schema("ledger_reclassify"),
+    _registry_schema("ledger_add_rule"),
     {
         "type": "function",
         "function": {
@@ -3092,6 +3104,10 @@ TOOL_EXECUTORS: dict[str, Any] = {
     "handoff_task": _exec_handoff_task,
     "comment_on_task": _exec_comment_on_task,
     "find_reference": _exec_find_reference,
+    "ledger_query": _exec_ledger_query,
+    "ledger_post": _exec_ledger_post,
+    "ledger_reclassify": _exec_ledger_reclassify,
+    "ledger_add_rule": _exec_ledger_add_rule,
     "last_contact_with_person": _exec_last_contact_with_person,
     "query_observations": _exec_query_observations,
     # Vercel read-only (Pandora) — see PR for design notes.
@@ -3134,6 +3150,8 @@ AGENT_TOOL_SETS: dict[str, set[str]] = {
         "handoff_task",
         "comment_on_task",
         "find_reference",
+        # Read-only over the books; the three write tools are Maou's alone.
+        "ledger_query",
         # People registry (life.people) — "when did I last talk to X?"
         "last_contact_with_person",
         # Life metrics (life.observations) — "how's my weight trending?"
@@ -3234,6 +3252,11 @@ AGENT_TOOL_SETS: dict[str, set[str]] = {
         "defer_task",
         "mark_waiting",
         "handoff_task",
+        # The books — the only agent that may write them.
+        "ledger_query",
+        "ledger_post",
+        "ledger_reclassify",
+        "ledger_add_rule",
     },
 }
 

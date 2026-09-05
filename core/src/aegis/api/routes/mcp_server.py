@@ -141,6 +141,10 @@ _UNSERVED_TOOLS = frozenset(
         "stop_agent_run",
         # A run commenting on its own task would trigger its own next turn.
         "comment_on_task",
+        # A coding run has no business writing the books; `ledger_query` stays.
+        "ledger_post",
+        "ledger_reclassify",
+        "ledger_add_rule",
     }
 )
 
