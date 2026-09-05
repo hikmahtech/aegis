@@ -72,6 +72,7 @@ from aegis.services.tools.knowledge import (
     _knowledge_unavailable,  # noqa: F401 — re-export: kept importable from here
 )
 from aegis.services.tools.ledger import (  # noqa: F401 — re-export: imported from here by tests
+    LEDGER_WRITE_TIMEOUT_S,
     _exec_ledger_add_rule,
     _exec_ledger_post,
     _exec_ledger_query,
@@ -1383,8 +1384,16 @@ _AEGIS_SELF_DIAGNOSE_OUTPUT_CAP = 8 * 1024  # last N chars returned to the LLM
 # tools: aegis_self_diagnose waits on a remote coding-CLI run for up to
 # _AEGIS_SELF_DIAGNOSE_MAX_WAIT, so it could NEVER finish inside 30s — and each
 # LLM retry then orphaned another kimi run on the coding host.
+#
+# The three ledger writers are the same failure in a worse place: `books._write`
+# runs git pull + `hledger check --strict` + commit + push inside a thread, and
+# `asyncio.wait_for` cannot cancel a thread — so a 30s cap does not stop a slow
+# write, it reports a failure while the write goes on to commit and push.
 _TOOL_TIMEOUT_OVERRIDES: dict[str, int] = {
     "aegis_self_diagnose": _AEGIS_SELF_DIAGNOSE_MAX_WAIT + 60,
+    "ledger_post": LEDGER_WRITE_TIMEOUT_S,
+    "ledger_reclassify": LEDGER_WRITE_TIMEOUT_S,
+    "ledger_add_rule": LEDGER_WRITE_TIMEOUT_S,
 }
 
 

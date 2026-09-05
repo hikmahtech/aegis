@@ -83,6 +83,45 @@ def _journals(cfg: books.BooksConfig) -> dict[str, str]:
     return {str(p.relative_to(cfg.path)): p.read_text() for p in books.journal_files(cfg)}
 
 
+def _commits(cfg: books.BooksConfig) -> int:
+    proc = subprocess.run(
+        ["git", "rev-list", "--count", "HEAD"],
+        cwd=cfg.path,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return int(proc.stdout.strip())
+
+
+# Unique to this file. `ledger_add_rule`'s sweep selects across the WHOLE
+# `finance.journal_index`, and this repo's test databases are keyed on the xdist
+# worker alone — so they are shared between tests/core and tests/worker, and
+# between two agents in two worktrees. A common payee like "Corner Store" would
+# let a foreign `%:unknown` row match this test's rule, be rewritten against a
+# tmp repo that does not hold it, and turn the exact-count assertions into
+# "N failed".
+TOKEN = "zzt4nakoda"
+
+
+def _unknown_event(payee: str = f"Jai shree {TOKEN}") -> MoneyEvent:
+    return MoneyEvent(
+        kind="transaction",
+        direction="out",
+        amount=Decimal("10"),
+        currency="INR",
+        payee=payee,
+        payee_key=payee.lower(),
+        channel="upi",
+        instrument="hdfc-1225",
+        occurred_on=date(2026, 9, 2),
+        entity="personal",
+        account="expenses:unknown",
+        parser="hdfc_upi",
+        source_class="bank",
+    )
+
+
 @pytest_asyncio.fixture(loop_scope="function", autouse=True)
 async def _clean(db_pool):
     await db_pool.execute("DELETE FROM finance.journal_index WHERE mailbox IN ('tool-t', 'manual')")
@@ -96,10 +135,12 @@ async def test_query_runs_whitelisted_reports_and_refuses_others(db_pool, tmp_pa
     ctx = _ctx(cfg)
     out = await _exec_ledger_query(db_pool, {"command": "accounts", "args": ["--declared"]}, ctx)
     assert "expenses:groceries" in out
+    # The wording, not just `error:` — see the next test for why a bare
+    # `startswith("error:")` cannot fail here.
     out = await _exec_ledger_query(db_pool, {"command": "import", "args": ["x.csv"]}, ctx)
-    assert out.startswith("error:")
+    assert out.startswith("error: hledger command not allowed"), out
     out = await _exec_ledger_query(db_pool, {"command": "bal", "args": ["-f", "/etc/passwd"]}, ctx)
-    assert out.startswith("error:")
+    assert out.startswith("error: hledger argument not allowed"), out
 
 
 @pytest.mark.asyncio
@@ -107,6 +148,18 @@ async def test_query_refuses_the_argument_forms_hledger_would_honour(db_pool, tm
     """The allowlist is exact-match because hledger bundles short flags, expands
     `@argsfile` and abbreviates long flags. Each of these was measured to work
     against the real binary, so a deny-prefix list lets them through.
+
+    Asserting `startswith("error:")` here would be a BLIND test, which is why
+    every case pins the refusal's own wording instead. Measured: with the
+    allowlist deleted, `-Ef<path>` and `--fil=<path>` still make hledger exit
+    non-zero — it reads the file and fails to parse it — so the tool returns an
+    `error:` string either way, while hledger's stderr echoes the first line of
+    the file it just read. A narrowing regression (someone re-permitting `-f` so
+    a report can be scoped to one journal) would leave a bare-`error:` test
+    green and hand the model the first line of any file on the host.
+
+    So: the refusal must be `run_hledger`'s, the secret file's marker must not
+    come back in the output, and the write case's target must not exist.
 
     The plain `bal` above every refusal is what makes this non-vacuous: the
     fixture reaches a working hledger, so the refusals are the allowlist and
@@ -117,18 +170,24 @@ async def test_query_refuses_the_argument_forms_hledger_would_honour(db_pool, tm
     ok = await _exec_ledger_query(db_pool, {"command": "bal", "args": ["expenses"]}, ctx)
     assert not ok.startswith("error:"), ok
 
+    marker = "zz-ledger-secret-marker-t4"
+    secret = tmp_path / "secret.txt"
+    secret.write_text(f"{marker}\nsecond line\n")
     victim = tmp_path / "written-by-hledger.txt"
     hostile = [
-        ["-Ef/etc/passwd"],  # bundled: -E -f <path> — reads any file
+        [f"-Ef{secret}"],  # bundled: -E -f <path> — reads any file
         [f"-No{victim}"],  # bundled: -N -o <path> — arbitrary WRITE
-        ["--fil=/etc/passwd"],  # long-flag abbreviation of --file=
-        ["@/etc/passwd"],  # args-file expansion
-        ["--rules-file=/etc/passwd"],
+        [f"--fil={secret}"],  # long-flag abbreviation of --file=
+        [f"@{secret}"],  # args-file expansion
+        [f"--rules-file={secret}"],
         ["--output-file", str(victim)],
+        ["-f", str(secret)],
+        ["--file", str(secret)],
     ]
     for args in hostile:
         out = await _exec_ledger_query(db_pool, {"command": "bal", "args": args}, ctx)
-        assert out.startswith("error:"), (args, out)
+        assert out.startswith("error: hledger argument not allowed"), (args, out)
+        assert marker not in out, (args, out)
     assert not victim.exists(), "hledger was allowed to write a file"
 
 
@@ -214,6 +273,49 @@ async def test_reclassify_renames_the_payee(db_pool, tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_reclassify_refuses_to_cross_entities(db_pool, tmp_path):
+    """The hazard `ledger_add_rule`'s sweep guards, reachable here in one call:
+    `expenses:hikmah:saas` is declared and the block still balances, so neither
+    the chart check nor `check --strict` objects — and a personal posting ends
+    up counted in the business books while its block stays in
+    `personal/2026.journal`."""
+    cfg = _repo(tmp_path)
+    (cfg.path / "accounts.journal").write_text(ACCOUNTS + "account expenses:hikmah:saas\n")
+    subprocess.run(
+        ["git", "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qam", "chart"],
+        cwd=cfg.path,
+        check=True,
+    )
+    ctx = _ctx(cfg)
+    out = await _exec_ledger_post(
+        db_pool,
+        {
+            "date": "2026-09-03",
+            "payee": "Shop",
+            "postings": [
+                {"account": "expenses:unknown", "amount": "5", "currency": "INR"},
+                {"account": "assets:bank:hdfc:1225"},
+            ],
+        },
+        ctx,
+    )
+    msgid = out.split()[1]
+    before = _journals(cfg)
+    crossed = await _exec_ledger_reclassify(
+        db_pool, {"message_id": msgid, "account": "expenses:hikmah:saas"}, ctx
+    )
+    assert crossed.startswith("error:") and "personal/2026.journal" in crossed, crossed
+    assert _journals(cfg) == before
+    assert (await ji.get(db_pool, msgid))["account"] == "expenses:unknown"
+    # Same-entity moves are untouched by the guard.
+    assert (
+        await _exec_ledger_reclassify(
+            db_pool, {"message_id": msgid, "account": "expenses:groceries"}, ctx
+        )
+    ).startswith("reclassified")
+
+
+@pytest.mark.asyncio
 async def test_reclassify_unknown_message_id_is_an_error(db_pool, tmp_path):
     ctx = _ctx(_repo(tmp_path))
     out = await _exec_ledger_reclassify(
@@ -275,14 +377,86 @@ async def test_post_validation(db_pool, tmp_path):
     for args in bad:
         assert (await _exec_ledger_post(db_pool, args, ctx)).startswith("error:"), args
     assert _journals(cfg) == before, "a refused post still wrote to the journal"
-    # The tool's own chart check, in its own words: `hledger check --strict`
-    # would also reject `expenses:zzz`, but only after the write, the revert
-    # and a message about a "strict check" that the model cannot act on.
-    undeclared = await _exec_ledger_post(db_pool, bad[3], ctx)
-    assert "is not declared in the chart" in undeclared, undeclared
+    # Three of these would ALSO be refused by `hledger check --strict` inside
+    # the writer, after the write and the revert, so `startswith("error:")`
+    # alone cannot tell whether this tool's own check still exists. Each one
+    # therefore pins the wording only this tool produces.
+    assert "at least two postings" in await _exec_ledger_post(db_pool, bad[1], ctx)
+    assert "at most one posting may omit" in await _exec_ledger_post(db_pool, bad[2], ctx)
+    assert "is not declared in the chart" in await _exec_ledger_post(db_pool, bad[3], ctx)
     assert await db_pool.fetchval(
         "SELECT count(*) FROM finance.journal_index WHERE mailbox = 'manual'"
     ) == 0
+
+
+@pytest.mark.asyncio
+async def test_post_refuses_a_decimal_that_is_not_a_number(db_pool, tmp_path):
+    """`Decimal` builds NaN, Infinity and 1e400 without complaint; each one then
+    raises `InvalidOperation` inside `quantize()` several frames down, and the
+    model gets an exception repr instead of a sentence."""
+    cfg = _repo(tmp_path)
+    ctx = _ctx(cfg)
+    before = _journals(cfg)
+    for amount in ("NaN", "Infinity", "-Infinity", "1e400"):
+        out = await _exec_ledger_post(
+            db_pool,
+            {
+                "date": "2026-09-03",
+                "payee": "x",
+                "postings": [
+                    {"account": "expenses:unknown", "amount": amount, "currency": "INR"},
+                    {"account": "assets:bank:hdfc:1225"},
+                ],
+            },
+            ctx,
+        )
+        assert "is not a usable amount" in out, (amount, out)
+    assert _journals(cfg) == before
+
+
+@pytest.mark.asyncio
+async def test_reposting_the_same_transaction_is_a_retry_not_a_duplicate(db_pool, tmp_path):
+    """The 30s chat-tool cap cannot cancel the thread `books._write` runs in, so
+    a write can commit after the model was told it timed out. A `uuid4()` msgid
+    would make the model's natural retry a SECOND copy of the transaction; a
+    content-derived one makes it find the first block and write nothing."""
+    cfg = _repo(tmp_path)
+    ctx = _ctx(cfg)
+    args = {
+        "date": "2026-09-03",
+        "payee": "Corner Store",
+        "postings": [
+            {"account": "expenses:unknown", "amount": "245.50", "currency": "INR"},
+            {"account": "assets:bank:hdfc:1225"},
+        ],
+    }
+    first = await _exec_ledger_post(db_pool, args, ctx)
+    assert first.startswith("posted manual/"), first
+    second = await _exec_ledger_post(db_pool, args, ctx)
+    assert second.startswith("already posted as manual/"), second
+    msgid = first.split()[1]
+    assert msgid in second
+    text = (cfg.path / "personal" / "2026.journal").read_text()
+    assert text.count("* Corner Store") == 1
+    assert text.count(f"; msgid: {msgid}") == 1
+    # A genuine second identical transaction is recorded by distinguishing it.
+    third = await _exec_ledger_post(db_pool, {**args, "note": "second coffee"}, ctx)
+    assert third.startswith("posted manual/") and third.split()[1] != msgid, third
+    assert (cfg.path / "personal" / "2026.journal").read_text().count("* Corner Store") == 2
+
+
+@pytest.mark.asyncio
+async def test_the_write_tools_have_a_timeout_that_fits_a_books_write(db_pool, tmp_path):
+    """`asyncio.wait_for` cannot cancel the thread the write runs in, so a cap
+    below the writer's own budget does not prevent the commit — it only
+    misreports it. Pinned the same way `aegis_self_diagnose`'s override is."""
+    from aegis.services import books as books_mod
+    from aegis.services.chat import _TOOL_TIMEOUT_OVERRIDES
+
+    floor = books_mod.CLONE_TIMEOUT_S + 120 + 60 + 60 + 120
+    for name in ("ledger_post", "ledger_reclassify", "ledger_add_rule"):
+        assert _TOOL_TIMEOUT_OVERRIDES.get(name, 0) >= floor, name
+    assert "ledger_query" not in _TOOL_TIMEOUT_OVERRIDES
 
 
 @pytest.mark.asyncio
@@ -463,32 +637,22 @@ async def test_post_note_cannot_declare_a_second_tag(db_pool, tmp_path):
 async def test_add_rule_applies_to_unknown_postings(db_pool, tmp_path):
     cfg = _repo(tmp_path)
     ctx = _ctx(cfg)
-    ev = MoneyEvent(
-        kind="transaction",
-        direction="out",
-        amount=Decimal("10"),
-        currency="INR",
-        payee="Jai shree nakoda",
-        payee_key="jai shree nakoda",
-        channel="upi",
-        instrument="hdfc-1225",
-        occurred_on=date(2026, 9, 2),
-        entity="personal",
-        account="expenses:unknown",
-        parser="hdfc_upi",
-        source_class="bank",
-    )
+    ev = _unknown_event()
     await books.post_event(ev, "tool-t/a", cfg)
     await ji.upsert(db_pool, "tool-t/a", "tool-t", ev, journal_file="personal/2026.journal")
     out = await _exec_ledger_add_rule(
         db_pool,
-        {"match": "jai shree", "account": "expenses:groceries", "payee": "Jai Shree Stores"},
+        {
+            "match": f"jai shree {TOKEN}",
+            "account": "expenses:groceries",
+            "payee": "Jai Shree Stores",
+        },
         ctx,
     )
     assert out == "rule added; reclassified 1 postings"
     rules = books.load_rules(cfg.path / "rules" / "accounts.yaml")
     assert rules[-1] == {
-        "match": "jai shree",
+        "match": f"jai shree {TOKEN}",
         "account": "expenses:groceries",
         "payee": "Jai Shree Stores",
     }
@@ -504,6 +668,28 @@ async def test_add_rule_applies_to_unknown_postings(db_pool, tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_add_rule_sweeps_the_backlog_in_one_commit(db_pool, tmp_path):
+    """Per-posting writes would take the flock, pull, strict-check, commit and
+    push once EACH — serialising the worker's money flows behind the sweep and
+    leaving one commit per posting. Two matching postings must cost exactly two
+    commits: the rule, then the batch."""
+    cfg = _repo(tmp_path)
+    ctx = _ctx(cfg)
+    for n in ("d", "e"):
+        ev = _unknown_event()
+        await books.post_event(ev, f"tool-t/{n}", cfg)
+        await ji.upsert(db_pool, f"tool-t/{n}", "tool-t", ev, journal_file="personal/2026.journal")
+    before = _commits(cfg)
+    out = await _exec_ledger_add_rule(
+        db_pool, {"match": f"jai shree {TOKEN}", "account": "expenses:groceries"}, ctx
+    )
+    assert out == "rule added; reclassified 2 postings"
+    assert _commits(cfg) - before == 2, "one commit for the rule, one for the whole sweep"
+    for n in ("d", "e"):
+        assert (await ji.get(db_pool, f"tool-t/{n}"))["account"] == "expenses:groceries"
+
+
+@pytest.mark.asyncio
 async def test_add_rule_refusals_write_nothing(db_pool, tmp_path):
     """A refused rule must not reach `rules/accounts.yaml` — the refusal is the
     only thing standing between a model-authored regex and a permanent
@@ -512,38 +698,54 @@ async def test_add_rule_refusals_write_nothing(db_pool, tmp_path):
     ctx = _ctx(cfg)
     rules_path = cfg.path / "rules" / "accounts.yaml"
     before = rules_path.read_text()
-    assert (
-        await _exec_ledger_add_rule(db_pool, {"match": "(", "account": "expenses:groceries"}, ctx)
-    ).startswith("error:")
-    assert (
-        await _exec_ledger_add_rule(db_pool, {"match": "x", "account": "expenses:nope"}, ctx)
-    ).startswith("error:")
+    for args in (
+        {"match": "(", "account": "expenses:groceries"},
+        {"match": "x", "account": "expenses:nope"},
+        {"match": "x" * 201, "account": "expenses:groceries"},
+        {"match": "x", "account": "expenses:groceries", "entity": "other"},
+    ):
+        assert (await _exec_ledger_add_rule(db_pool, args, ctx)).startswith("error:"), args
     assert rules_path.read_text() == before
+
+
+@pytest.mark.asyncio
+async def test_add_rule_refuses_a_catastrophic_regex_before_persisting_it(db_pool, tmp_path):
+    """`re` has no timeout and `books.apply_rules` runs `re.search` on the event
+    loop, so an exponential pattern hangs the whole Core process and
+    `asyncio.wait_for` cannot interrupt it. Worse, the rule is then committed to
+    `rules/accounts.yaml` and the WORKER runs it against every incoming money
+    event from then on — a durable, cross-process hang authored by a model. So
+    it has to be refused before it reaches the file."""
+    cfg = _repo(tmp_path)
+    ctx = _ctx(cfg)
+    rules_path = cfg.path / "rules" / "accounts.yaml"
+    before = rules_path.read_text()
+    for pattern in ("(a+)+$", "(?:a*)*b", "(a{1,3})+x", "(ab|ab)+c"):
+        out = await _exec_ledger_add_rule(
+            db_pool, {"match": pattern, "account": "expenses:groceries", "apply": False}, ctx
+        )
+        assert "repeats a group that already repeats" in out, (pattern, out)
+    assert rules_path.read_text() == before
+    # The shapes a real rule uses must still be accepted, or the guard is just
+    # a ban on regexes: alternation, a bounded group, a character-class repeat.
+    for pattern in ("amazon web services|invoicing@aws\\.com", "mahavitaran.*suncity 501", "a+b"):
+        out = await _exec_ledger_add_rule(
+            db_pool, {"match": pattern, "account": "expenses:groceries", "apply": False}, ctx
+        )
+        assert out == "rule added; reclassified 0 postings", (pattern, out)
 
 
 @pytest.mark.asyncio
 async def test_add_rule_without_apply_leaves_postings_alone(db_pool, tmp_path):
     cfg = _repo(tmp_path)
     ctx = _ctx(cfg)
-    ev = MoneyEvent(
-        kind="transaction",
-        direction="out",
-        amount=Decimal("10"),
-        currency="INR",
-        payee="Jai shree nakoda",
-        payee_key="jai shree nakoda",
-        channel="upi",
-        instrument="hdfc-1225",
-        occurred_on=date(2026, 9, 2),
-        entity="personal",
-        account="expenses:unknown",
-        parser="hdfc_upi",
-        source_class="bank",
-    )
+    ev = _unknown_event()
     await books.post_event(ev, "tool-t/b", cfg)
     await ji.upsert(db_pool, "tool-t/b", "tool-t", ev, journal_file="personal/2026.journal")
     out = await _exec_ledger_add_rule(
-        db_pool, {"match": "jai shree", "account": "expenses:groceries", "apply": False}, ctx
+        db_pool,
+        {"match": f"jai shree {TOKEN}", "account": "expenses:groceries", "apply": False},
+        ctx,
     )
     assert out == "rule added; reclassified 0 postings"
     assert "expenses:unknown" in (cfg.path / "personal" / "2026.journal").read_text()
@@ -558,30 +760,35 @@ async def test_add_rule_skips_a_posting_in_the_other_entity(db_pool, tmp_path):
     `personal/2026.journal`."""
     cfg = _repo(tmp_path)
     ctx = _ctx(cfg)
-    ev = MoneyEvent(
-        kind="transaction",
-        direction="out",
-        amount=Decimal("10"),
-        currency="INR",
-        payee="Jai shree nakoda",
-        payee_key="jai shree nakoda",
-        channel="upi",
-        instrument="hdfc-1225",
-        occurred_on=date(2026, 9, 2),
-        entity="personal",
-        account="expenses:unknown",
-        parser="hdfc_upi",
-        source_class="bank",
-    )
+    ev = _unknown_event()
     await books.post_event(ev, "tool-t/c", cfg)
     await ji.upsert(db_pool, "tool-t/c", "tool-t", ev, journal_file="personal/2026.journal")
     out = await _exec_ledger_add_rule(
         db_pool,
-        {"match": "jai shree", "account": "expenses:groceries", "entity": "hikmah"},
+        {"match": f"jai shree {TOKEN}", "account": "expenses:groceries", "entity": "hikmah"},
         ctx,
     )
     assert out == "rule added; reclassified 0 postings"
     assert (await ji.get(db_pool, "tool-t/c"))["account"] == "expenses:unknown"
+
+
+@pytest.mark.asyncio
+async def test_add_rule_index_payee_matches_the_journal(db_pool, tmp_path):
+    """`;` is journal syntax, so the writer strips it — and an index that kept
+    the raw name would disagree with the record for `find_match` and the admin
+    page."""
+    cfg = _repo(tmp_path)
+    ctx = _ctx(cfg)
+    ev = _unknown_event()
+    await books.post_event(ev, "tool-t/f", cfg)
+    await ji.upsert(db_pool, "tool-t/f", "tool-t", ev, journal_file="personal/2026.journal")
+    await _exec_ledger_add_rule(
+        db_pool,
+        {"match": f"jai shree {TOKEN}", "account": "expenses:groceries", "payee": "A;B"},
+        ctx,
+    )
+    assert "* A B" in (cfg.path / "personal" / "2026.journal").read_text()
+    assert (await ji.get(db_pool, "tool-t/f"))["payee"] == "A B"
 
 
 @pytest.mark.asyncio

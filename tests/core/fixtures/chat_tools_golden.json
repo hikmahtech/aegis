@@ -1029,7 +1029,7 @@
     "type": "function",
     "function": {
       "name": "ledger_post",
-      "description": "Record a transaction in the books by hand. Each posting is {\"account\": ..., \"amount\": ..., \"currency\": ...}; at most one posting may omit the amount.",
+      "description": "Record a transaction in the books by hand. Each posting is {\"account\": ..., \"amount\": ..., \"currency\": ...}; at most one posting may omit the amount. Re-posting the same date, payee, postings and note is treated as a retry of the first call, not a second transaction \u2014 give the second one a note to record a genuine duplicate.",
       "parameters": {
         "type": "object",
         "properties": {
@@ -1071,7 +1071,7 @@
     "type": "function",
     "function": {
       "name": "ledger_reclassify",
-      "description": "Move a posting to another account (and optionally rename its payee) by its books message id (`<mailbox>/<gmail id>` or `manual/<uuid>`).",
+      "description": "Move a posting to another account (and optionally rename its payee) by its books message id (`<mailbox>/<gmail id>` or `manual/<uuid>`). The new account must belong to the same set of books the posting is filed in.",
       "parameters": {
         "type": "object",
         "properties": {

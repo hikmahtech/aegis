@@ -728,22 +728,31 @@ async def post_event(event: MoneyEvent, msgid: str, cfg: BooksConfig) -> str:
     return posted[0] if posted else rel
 
 
-async def post_block(block: str, entity: str, d: date, msgid: str, cfg: BooksConfig) -> str:
+async def post_block(
+    block: str, entity: str, d: date, msgid: str, cfg: BooksConfig
+) -> tuple[str, bool]:
     """Append an already-rendered block (`render_manual`) under the same lock /
     `check --strict` / revert protocol as `post_event`. Returns the journal
-    file's relative path.
+    file's relative path and whether this call is what wrote it.
 
     Idempotency is repo-WIDE for the same reason as `post_event`: the msgid is
     the only handle on the block, so a re-post with a corrected date or entity
     must find the existing one wherever it landed.
+
+    The `created` half of the return is what lets a caller tell "I wrote it"
+    from "it was already there". A caller whose write can be retried needs
+    that: the retry is the SAME logical post, and reporting it as a fresh one
+    tells the user they now have two.
     """
     rel = journal_rel(entity, d)
     posted: list[str] = []
+    created = [True]
 
     def mutate() -> None:
         for existing in journal_files(cfg):
             if find_block(existing.read_text(), msgid):
                 posted.append(str(existing.relative_to(cfg.path)))
+                created[0] = False
                 return
         # Recorded before the write: `paths` is this write's git scope.
         posted.append(rel)
@@ -751,7 +760,25 @@ async def post_block(block: str, entity: str, d: date, msgid: str, cfg: BooksCon
         path.write_text(append_block(path.read_text(), block))
 
     await _write(cfg, f"post {entity} {d} manual", mutate, [rel, cfg.main])
-    return posted[0] if posted else rel
+    return (posted[0] if posted else rel), created[0]
+
+
+async def locate_event(msgid: str, cfg: BooksConfig) -> str | None:
+    """The journal file holding `msgid`, relative to the checkout, or None.
+
+    Read-only and lock-free: a caller that must know which set of books a block
+    lives in before it writes reads the journal, which is the record, rather
+    than `finance.journal_index`, which is only its index and does not cover a
+    hand-written block.
+    """
+
+    def _go() -> str | None:
+        for path in journal_files(cfg):
+            if find_block(path.read_text(), msgid):
+                return str(path.relative_to(cfg.path))
+        return None
+
+    return await asyncio.to_thread(_go)
 
 
 async def rewrite_event(
@@ -782,6 +809,56 @@ async def rewrite_event(
 
     await _write(cfg, f"reclassify {msgid}" + (f" -> {account}" if account else ""), mutate, found)
     return found[0]
+
+
+async def rewrite_events(
+    msgids: list[str], cfg: BooksConfig, *, payee: str | None = None, account: str | None = None
+) -> tuple[list[str], list[str]]:
+    """Reclassify many blocks in ONE write. Returns (rewritten, failed) msgids.
+
+    A loop over `rewrite_event` is a loop over the whole protocol — flock, pull,
+    strict check, commit, push — per posting, which serialises every other
+    writer of the books behind it and leaves one commit per posting in the
+    history. Applying a rule to its backlog is one intent, so it is one commit.
+
+    A msgid whose block is missing or unrewritable is collected, not raised:
+    one stale index row must not revert the rewrites that did land.
+    """
+    rewritten: list[str] = []
+    failed: list[str] = []
+    touched: list[str] = []
+
+    def mutate() -> None:
+        for msgid in msgids:
+            target: tuple[Path, str] | None = None
+            for path in journal_files(cfg):
+                text = path.read_text()
+                if find_block(text, msgid) is not None:
+                    target = (path, text)
+                    break
+            if target is None:
+                failed.append(msgid)
+                continue
+            path, text = target
+            rel = str(path.relative_to(cfg.path))
+            # Recorded before the write, like `rewrite_event`: `touched` is this
+            # write's git scope AND its revert scope.
+            if rel not in touched:
+                touched.append(rel)
+            try:
+                # Rendered before it is written, so a rejected block leaves the
+                # file exactly as it was and the rest of the batch continues.
+                new_text = rewrite_block(text, msgid, payee=payee, account=account)
+            except BooksError:
+                failed.append(msgid)
+                continue
+            path.write_text(new_text)
+            rewritten.append(msgid)
+
+    if not msgids:
+        return [], []
+    await _write(cfg, f"reclassify {len(msgids)} postings -> {account}", mutate, touched)
+    return rewritten, failed
 
 
 async def remove_event(msgid: str, cfg: BooksConfig) -> None:
