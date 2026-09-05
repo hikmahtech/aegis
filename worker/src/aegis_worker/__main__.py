@@ -342,8 +342,15 @@ async def main():
         model=model_balanced,
         # The answer to an unknown-payee card becomes a rule in the books and
         # reclassifies that payee's backlog (spec §6). Same shared checkout as
-        # MoneyActivities — books.py serialises the two on an flock.
+        # MoneyActivities — books.py serialises the two on an flock. The
+        # checkout is also where `prices.journal` lives, which is what lets
+        # the unknown-payee detector rank a dollar row against a rupee one.
         books_cfg=config_from_settings(settings),
+        home_currency=getattr(settings, "home_currency", "INR"),
+        # The books half of an answer refuses in several ways, and every one of
+        # them used to be invisible: InteractionFlow discards the post-resolve
+        # activity's return value and the card is an ABANDONED child (#384).
+        delivery=delivery_act,
         # Interaction cards bypass safe_send_message, so CuriosityCardFlow
         # consults the notification budget itself — same knobs as delivery_act.
         budget_enabled=getattr(settings, "notification_budget_enabled", False),

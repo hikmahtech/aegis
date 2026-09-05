@@ -14,6 +14,7 @@ does reach the write.
 
 from __future__ import annotations
 
+import inspect
 import shutil
 import subprocess
 from datetime import date
@@ -27,6 +28,7 @@ from aegis.api.models.money import MoneyEvent, payee_key
 from aegis.services import books
 from aegis.services import journal_index as ji
 from aegis_worker.activities.curiosity import CuriosityActivities
+from aegis_worker.activities.delivery import DeliveryActivities
 from temporalio.testing import ActivityEnvironment
 
 HAS_HLEDGER = shutil.which("hledger") is not None and shutil.which("git") is not None
@@ -228,8 +230,42 @@ def _meta(**over) -> dict:
     return meta
 
 
-async def _apply(pool, cfg, llm, meta=None, answer="that's my grocer"):
-    acts = CuriosityActivities(db_pool=pool, llm_client=llm, model="m", books_cfg=cfg)
+class FakeDelivery:
+    """Stand-in for DeliveryActivities as `safe_send_message` uses it.
+
+    `test_fake_delivery_matches_the_real_class` pins this against the real
+    class so the fake cannot drift into testing nothing.
+    """
+
+    channel = "slack"
+    db_pool = None  # skips the notification-budget path in safe_send_message
+
+    def __init__(self):
+        self.sent: list[str] = []
+
+    async def send_message(self, *, agent_id: str, message: str, chat_id: int = 0) -> dict:
+        self.sent.append(message)
+        return {"ok": True}
+
+
+def test_fake_delivery_matches_the_real_class():
+    """The fake must expose what safe_send_message actually reads off the real
+    DeliveryActivities: a `channel` attribute, a `db_pool` attribute and a
+    keyword-only send_message(agent_id, message, chat_id)."""
+    real = inspect.signature(DeliveryActivities.send_message).parameters
+    fake = inspect.signature(FakeDelivery.send_message).parameters
+    for name in ("agent_id", "message", "chat_id"):
+        assert name in real, f"DeliveryActivities.send_message lost {name}"
+        assert name in fake, f"FakeDelivery.send_message lost {name}"
+    fields = set(DeliveryActivities.__dataclass_fields__)
+    assert {"channel", "db_pool"} <= fields
+    assert hasattr(FakeDelivery, "channel") and hasattr(FakeDelivery, "db_pool")
+
+
+async def _apply(pool, cfg, llm, meta=None, answer="that's my grocer", delivery=None):
+    acts = CuriosityActivities(
+        db_pool=pool, llm_client=llm, model="m", books_cfg=cfg, delivery=delivery
+    )
     iid = await _card(pool)
     return await ActivityEnvironment().run(
         acts.apply_curiosity_answer, iid, {"value": answer}, meta or _meta()
@@ -745,3 +781,126 @@ async def test_a_payee_spelling_variant_matches_the_rule(clean_db, tmp_path):
     for variant in (PAYEE, PAYEE.upper(), "JAI-SHREE-ZZT5NAKODA", "Jai  Shree  Zzt5nakoda"):
         assert books.apply_rules(rules, "", variant) == rules[0], variant
     assert books.apply_rules(rules, "", "Some Other Shop") is None
+
+
+# ------------------------------------------- what the owner is told (issue #384)
+
+
+async def test_a_cross_entity_answer_says_what_it_left_behind(clean_db, tmp_path):
+    """The refusal above is correct and was invisible (issue #384).
+
+    `InteractionFlow` discards the post-resolve activity's return value and
+    the card is an ABANDONED child nobody awaits, so nothing carried
+    `reclassified: 0` anywhere a person could see it. The owner answered "that
+    is the Hikmah infra bill" and watched nothing happen — and no automated
+    path could recover: the novelty key retires the card, `ledger_reclassify`
+    refuses the same move by design, and the brief's Unexplained list is a
+    7-day window.
+    """
+    cfg = _repo(tmp_path)
+    _declare(cfg, "expenses:hikmah:infra")
+    await _post(clean_db, cfg)  # entity=personal
+    delivery = FakeDelivery()
+    llm = FakeLLM('{"account": "expenses:hikmah:infra", "confidence": 0.95}')
+
+    out = await _apply(clean_db, cfg, llm, delivery=delivery)
+
+    assert out["reclassified"] == 0 and out["skipped_other_entity"] == 1
+    assert len(delivery.sent) == 1, delivery.sent
+    said = delivery.sent[0]
+    assert PAYEE in said and "expenses:hikmah:infra" in said
+    # The three things the owner needs: the rule stands, one posting did not
+    # move, and only a person can move it.
+    assert "1 existing posting" in said, said
+    assert "rule is saved" in said and "hand edit" in said, said
+
+
+async def test_an_answer_that_lands_completely_says_nothing(clean_db, tmp_path):
+    """Silence is the success signal. The payee leaves the Unexplained list in
+    the next brief and the card is resolved in the admin, so an extra push per
+    answered question would spend the notification budget on nothing."""
+    cfg = _repo(tmp_path)
+    await _post(clean_db, cfg)
+    delivery = FakeDelivery()
+    llm = FakeLLM('{"account": "expenses:groceries", "confidence": 0.9}')
+
+    out = await _apply(clean_db, cfg, llm, delivery=delivery)
+
+    assert out["reclassified"] == 1 and out["skipped_other_entity"] == 0
+    assert delivery.sent == []
+
+
+async def test_an_answer_the_model_could_not_file_is_reported(clean_db, tmp_path):
+    """Every refusal in this hook was equally silent, not only the
+    cross-entity one: an undeclared account, an unsure model and an
+    unreachable checkout all returned a dict nobody read."""
+    for response, phrase in (
+        ('{"account": "expenses:snacks", "confidence": 1.0}', "an account in the chart"),
+        ('{"account": "expenses:groceries", "confidence": 0.4}', "not sure enough"),
+        ('{"account": "NONE", "confidence": 1.0}', "an account in the chart"),
+    ):
+        cfg = _repo(tmp_path / f"r{abs(hash(response)) % 9999}")
+        await _post(clean_db, cfg)
+        delivery = FakeDelivery()
+
+        out = await _apply(clean_db, cfg, FakeLLM(response), delivery=delivery)
+
+        assert out["rule"] is None, response
+        assert len(delivery.sent) == 1, (response, delivery.sent)
+        assert phrase in delivery.sent[0], (response, delivery.sent[0])
+        # The answer is not lost, and the message says so.
+        assert "saved" in delivery.sent[0]
+
+
+async def test_a_refused_rule_that_moved_the_backlog_says_both_halves(clean_db, tmp_path):
+    """The backlog moved but nothing was persisted, so future mail from this
+    payee still lands in `:unknown`. Only this message can tell the owner
+    that."""
+    cfg = _repo(tmp_path)
+    await _post(clean_db, cfg, payee=LONG_PAYEE)
+    delivery = FakeDelivery()
+    llm = FakeLLM('{"account": "expenses:groceries", "confidence": 0.9}')
+
+    out = await _apply(
+        clean_db, cfg, llm,
+        meta=_meta(subject=LONG_PAYEE, payee_key=payee_key(LONG_PAYEE)),
+        delivery=delivery,
+    )
+
+    assert out["reason"] == "rule_refused_backlog_applied" and out["reclassified"] == 1
+    assert len(delivery.sent) == 1, delivery.sent
+    assert "1 existing posting" in delivery.sent[0], delivery.sent[0]
+    assert "no rule" in delivery.sent[0].lower(), delivery.sent[0]
+
+
+async def test_a_dead_delivery_never_costs_the_answer(clean_db, tmp_path):
+    """`safe_send_message` swallows everything, and the hook must too: the
+    memory, the rule and the reclassification are all already done by the time
+    this runs, so a comms outage costs the message and nothing else."""
+    class Exploding(FakeDelivery):
+        async def send_message(self, **kwargs):
+            raise RuntimeError("comms is down")
+
+    cfg = _repo(tmp_path)
+    _declare(cfg, "expenses:hikmah:infra")
+    msgid = await _post(clean_db, cfg)
+    llm = FakeLLM('{"account": "expenses:hikmah:infra", "confidence": 0.95}')
+
+    out = await _apply(clean_db, cfg, llm, delivery=Exploding())
+
+    assert out["rule"] == "expenses:hikmah:infra"
+    assert out["skipped_other_entity"] == 1
+    assert await _account_of(clean_db, msgid) == "expenses:unknown"
+    assert len(await _memories(clean_db)) == 1
+
+
+async def test_no_delivery_wired_still_answers_and_never_raises(clean_db, tmp_path):
+    """A fork with no comms server, and the default in every existing test."""
+    cfg = _repo(tmp_path)
+    _declare(cfg, "expenses:hikmah:infra")
+    await _post(clean_db, cfg)
+    llm = FakeLLM('{"account": "expenses:hikmah:infra", "confidence": 0.95}')
+
+    out = await _apply(clean_db, cfg, llm, delivery=None)
+
+    assert out["rule"] == "expenses:hikmah:infra" and out["skipped_other_entity"] == 1

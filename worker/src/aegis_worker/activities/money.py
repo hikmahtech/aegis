@@ -23,6 +23,12 @@ from temporalio import activity
 from aegis_worker.activities import money_render
 from aegis_worker.activities.delivery import safe_send_message
 
+# The cut for `large_unexplained`, owned by the renderer because the renderer
+# is what tells the reader the number. Re-exported here so a caller reading the
+# data layer sees the same name (issue #391).
+LARGE_UNEXPLAINED_CURRENCY = money_render.LARGE_UNEXPLAINED_CURRENCY
+LARGE_UNEXPLAINED_MIN = money_render.LARGE_UNEXPLAINED_MIN
+
 
 def _format_agent_persona(persona: dict) -> str | None:
     """Render soul + user kinds from a get_personality() dict, or None if empty.
@@ -879,7 +885,8 @@ class MoneyActivities:
         ]
         brief["large_unexplained"] = [
             u for u in brief["unknowns"]
-            if u["currency"] == "INR" and Decimal(u["amount"]) >= 5000
+            if u["currency"] == LARGE_UNEXPLAINED_CURRENCY
+            and Decimal(u["amount"]) >= LARGE_UNEXPLAINED_MIN
         ]
         dues = await self.db_pool.fetch(
             "SELECT message_id, payee, payee_key, amount, currency, due_on, kind, todoist_ref "
@@ -1037,10 +1044,14 @@ class MoneyActivities:
             "  AND due_on BETWEEN $1 AND $2",
             month_first, last,
         ))
+        # `ji.OPEN_DUE_SQL` is the same predicate `/api/admin/money/state`
+        # carries: a ₹0 due is not an obligation and can never close, so
+        # "still open: 1" for a month in which nothing was owed is a number
+        # that only rises (issue #385).
         close["dues_open"] = int(await self.db_pool.fetchval(
             "SELECT count(*) FROM finance.journal_index "
             "WHERE kind IN ('due','failed') AND linked_message_id IS NULL "
-            "  AND due_on BETWEEN $1 AND $2",
+            f"  AND due_on BETWEEN $1 AND $2 AND {ji.OPEN_DUE_SQL}",
             month_first, last,
         ))
         return close

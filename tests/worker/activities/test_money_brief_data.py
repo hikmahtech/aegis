@@ -15,6 +15,7 @@ from aegis.api.models.money import MoneyEvent
 from aegis.services import books
 from aegis.services import journal_index as ji
 from aegis_worker.activities.money import (
+    LARGE_UNEXPLAINED_MIN,
     MoneyActivities,
     amount_from_cell,
     commodity_of,
@@ -138,6 +139,29 @@ def test_csv_helpers():
     assert amount_from_cell("₹ 1,234.56") == Decimal("1234.56")
     assert amount_from_cell("₹ -140.00") == Decimal("-140.00")
     assert amount_from_cell("0") == Decimal("0") and amount_from_cell("") == Decimal("0")
+
+
+def test_a_narrow_space_digit_group_is_not_read_as_the_first_group_alone():
+    """hledger's digit-group separator is a NARROW NO-BREAK SPACE under some
+    commodity formats — `₹ 1 234.56`, not `₹ 1,234.56`.
+
+    `_NUM_RE` stops at the first non-digit, so an unstripped separator turns
+    ₹1,234.56 into ₹1: a right-looking number, three orders of magnitude out,
+    on the line that becomes the brief's headline "out" figure. Both the
+    NO-BREAK SPACE (U+00A0) and the NARROW NO-BREAK SPACE (U+202F) reach here.
+    """
+    nbsp, narrow = " ", " "
+    assert amount_from_cell(f"₹ 1{nbsp}234.56") == Decimal("1234.56")
+    assert amount_from_cell(f"₹ 1{narrow}234.56") == Decimal("1234.56")
+    # Indian grouping, where losing the separator costs five digits, not three.
+    assert amount_from_cell(f"₹{nbsp}1{nbsp}00{nbsp}000.00") == Decimal("100000.00")
+    assert split_amount_cell(f"₹{nbsp}1{nbsp}00{nbsp}000.00") == ["₹100000.00"]
+    # And the mixed-commodity cell still splits on the ", " that joins its
+    # parts, with the foreign part still recognised as foreign.
+    mixed = f"${narrow}50.00, ₹{narrow}300.00"
+    assert split_amount_cell(mixed) == ["$50.00", "₹300.00"]
+    assert amount_from_cell(mixed) == Decimal("300.00")
+    assert unconverted_commodities(mixed) == ["$"]
 
 
 def test_a_mixed_commodity_cell_never_reports_a_foreign_amount_as_rupees():
@@ -345,6 +369,59 @@ async def test_an_unknown_with_no_amount_does_not_take_the_whole_brief_down(db_p
 
     assert [u["msgid"] for u in _mine(brief["unknowns"])] == ["brief-t/ok"]
     assert [u["msgid"] for u in _mine(brief["large_unexplained"])] == ["brief-t/ok"]
+
+
+@pytest.mark.asyncio
+async def test_month_close_open_dues_leave_out_a_zero_invoice_but_keep_an_unsized_one(
+    db_pool, tmp_path
+):
+    """"still open" has to be something a payment could close (issue #385).
+
+    A ₹0 due never can — `find_open_due` matches on amount and no ₹0 payment
+    mail arrives — and `capture_due` has already refused to task it. A due
+    whose amount the extractor never got is a different thing: a real bill of
+    unknown size, and dropping it would take real money off the close.
+
+    Asserted as deltas: these counters are table-wide inside the month window,
+    so a sibling suite's row must not be able to fail this.
+    """
+    act = _act(db_pool, books.BooksConfig(path=tmp_path / "none"))
+    last = date.today().replace(day=1) - timedelta(days=1)
+    base = await ActivityEnvironment().run(act.build_month_close)
+
+    await ji.upsert(db_pool, "brief-t/mz", "brief-t",
+                    _ev(kind="due", amount=Decimal("0"), due_on=last, occurred_on=None,
+                        payee="Zero invoice", payee_key="zero invoice", channel="bill"))
+    await ji.upsert(db_pool, "brief-t/mn", "brief-t",
+                    _ev(kind="due", amount=None, due_on=last, occurred_on=None,
+                        payee="Unsized bill", payee_key="unsized bill", channel="bill"))
+    await ji.upsert(db_pool, "brief-t/mr", "brief-t",
+                    _ev(kind="due", amount=Decimal("450"), due_on=last, occurred_on=None,
+                        payee="Real bill", payee_key="real bill", channel="bill"))
+
+    close = await ActivityEnvironment().run(act.build_month_close)
+
+    assert close["month"] == last.strftime("%Y-%m")
+    assert close["dues_open"] == base["dues_open"] + 2
+
+
+@pytest.mark.asyncio
+async def test_large_unexplained_cuts_at_the_constant_the_brief_names(db_pool, tmp_path):
+    """The renderer prints "of ₹5,000.00 or more" (issue #391), so the WHERE
+    clause has to mean exactly that. Both sides read `LARGE_UNEXPLAINED_MIN`,
+    and this pins the boundary: at the cut is in, one paisa under is out.
+    """
+    act = _act(db_pool, books.BooksConfig(path=tmp_path / "none"))
+    cut = LARGE_UNEXPLAINED_MIN
+    await ji.upsert(db_pool, "brief-t/at", "brief-t",
+                    _ev(amount=cut, payee="At the cut", payee_key="at the cut"))
+    await ji.upsert(db_pool, "brief-t/under", "brief-t",
+                    _ev(amount=cut - Decimal("0.01"), payee="Under", payee_key="under"))
+
+    brief = await ActivityEnvironment().run(act.build_money_brief, 7)
+
+    assert [u["msgid"] for u in _mine(brief["unknowns"])] == ["brief-t/at", "brief-t/under"]
+    assert [u["msgid"] for u in _mine(brief["large_unexplained"])] == ["brief-t/at"]
 
 
 @pytest.mark.skipif(not HAS_HLEDGER, reason="hledger/git not installed")

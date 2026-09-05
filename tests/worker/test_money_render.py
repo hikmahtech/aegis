@@ -136,7 +136,7 @@ def test_brief_markdown_bullets_every_standalone_line():
     md = render_money_brief(BRIEF)["markdown"]
     assert "- Personal: in ₹1,500.00 · out ₹6,250.00" in md
     assert "- Hikmah: in ₹1,00,000.00 · out ₹262.30" in md
-    assert "- 2 unpushed commits · 1 low-confidence LLM postings" in md
+    assert "- 2 unpushed commits · 1 low-confidence LLM posting" in md
     # Nothing in the body is left as a bare line that would glue to its
     # neighbour. What may FOLLOW a line without folding into it is fixed by
     # CommonMark: a heading, a list item and a fence all interrupt a
@@ -288,6 +288,94 @@ def test_brief_nothing_due():
 def test_brief_housekeeping_omitted_when_clean():
     out = render_money_brief({**BRIEF, "unpushed": 0, "low_confidence": 0})
     assert "Housekeeping" not in out["html"] and "Housekeeping" not in out["markdown"]
+
+
+def test_housekeeping_counts_agree_with_themselves_on_number():
+    """The live brief of 2026-09-05 read "1 low-confidence LLM postings".
+
+    Both counters routinely sit at 1 — one unpushed commit, one guessed
+    posting — so the plural is the case the reader sees most weeks, and this
+    lane exists to make the system say exactly what it means.
+    """
+    one = render_money_brief({**BRIEF, "unpushed": 1, "low_confidence": 1})
+    assert "1 unpushed commit · 1 low-confidence LLM posting" in one["html"]
+    assert "- 1 unpushed commit · 1 low-confidence LLM posting" in one["markdown"]
+    assert "commits" not in one["html"] and "postings" not in one["html"]
+
+    many = render_money_brief({**BRIEF, "unpushed": 2, "low_confidence": 3})
+    assert "2 unpushed commits · 3 low-confidence LLM postings" in many["html"]
+
+
+# --------------------------------------------------------------------------
+# the large-unexplained lead line (issue #391)
+# --------------------------------------------------------------------------
+
+_BIG = [
+    {
+        "msgid": "m/a", "payee": "Unknown Big", "amount": "6000.00", "currency": "INR",
+        "occurred_on": "2026-09-02", "channel": "upi",
+    },
+    {
+        "msgid": "m/b", "payee": "Jai Shree Nakoda", "amount": "42000.00", "currency": "INR",
+        "occurred_on": "2026-09-03", "channel": "upi",
+    },
+]
+
+
+def test_unexplained_leads_with_the_total_of_the_large_ones():
+    """`large_unexplained` crossed the activity boundary every week and was
+    read only by tests (issue #391). Rendered, it has to say something the row
+    list below does not: the rows carry each amount, only this line carries
+    what they add up to and how far over the attention cut they are.
+    """
+    out = render_money_brief({**BRIEF, "unknowns": _BIG, "large_unexplained": _BIG})
+
+    line = "₹48,000.00 in 2 payments of ₹5,000.00 or more"
+    assert line in out["html"]
+    # Bulleted, or CommonMark folds it into the heading's first list item.
+    assert f"- {line}" in out["markdown"]
+    # Above the rows: the reader meets the size before the detail.
+    md = out["markdown"].split("\n")
+    assert md.index(f"- {line}") < md.index("- 2026-09-02 · Unknown Big · ₹6,000.00 · upi")
+
+
+def test_the_large_unexplained_cut_is_the_one_the_query_filtered_on():
+    """The wording names a number, and a number in prose drifts from the number
+    in the WHERE clause silently. Both sides read `LARGE_UNEXPLAINED_MIN`, so
+    this pins the rendered text to the constant rather than to a literal.
+    """
+    from aegis.services.money_format import fmt_money
+    from aegis_worker.activities.money import LARGE_UNEXPLAINED_MIN
+
+    out = render_money_brief({**BRIEF, "unknowns": _BIG, "large_unexplained": _BIG})
+
+    assert f"of {fmt_money(LARGE_UNEXPLAINED_MIN, 'INR')} or more" in out["markdown"]
+
+
+def test_one_large_payment_is_one_payment():
+    out = render_money_brief(BRIEF)
+    assert "₹6,000.00 in 1 payment of ₹5,000.00 or more" in out["html"]
+
+
+def test_no_large_unexplained_means_no_lead_line():
+    """Small unexplained rows still list; nothing claims a big one exists."""
+    out = render_money_brief({**BRIEF, "large_unexplained": []})
+    assert "Unexplained" in out["html"] and "or more" not in out["html"]
+    assert "or more" not in out["markdown"]
+
+
+def test_a_large_row_with_an_unparsable_amount_is_left_out_of_the_total():
+    """`journal_index.amount` is nullable and reaches this layer as the string
+    "None" (the module docstring's second shape). Counting such a row would
+    print `1 payment` next to a total it contributed nothing to."""
+    out = render_money_brief(
+        {
+            **BRIEF,
+            "unknowns": _BIG,
+            "large_unexplained": [*_BIG, {**_BIG[0], "msgid": "m/c", "amount": None}],
+        }
+    )
+    assert "₹48,000.00 in 2 payments of ₹5,000.00 or more" in out["html"]
 
 
 # --------------------------------------------------------------------------

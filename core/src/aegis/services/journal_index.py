@@ -129,6 +129,26 @@ async def mark_due_paid(pool: Any, due_msgid: str, payment_msgid: str) -> None:
     )
 
 
+# The extra predicate every "how many dues are still open?" counter carries
+# (issue #385). Not `amount > 0`, which is the obvious spelling and the wrong
+# one: `>` is NULL for a NULL amount, so it would ALSO drop every due the
+# extractor could not size — 20 of the 41 live open dues on 2026-09-05, each a
+# real bill of unknown size. `IS DISTINCT FROM 0` says only what is meant.
+#
+# A ₹0 due is excluded because it can never close: `find_open_due` matches on
+# amount and only a ₹0 PAYMENT would settle it, and no such mail arrives. The
+# system has already decided such a row is not an obligation — `capture_due`
+# refuses to task it, "a zero invoice is not a bill" — so a counter calling it
+# an outstanding obligation is the index contradicting that decision, and one
+# that can only ever rise.
+#
+# The row itself stays indexed as `kind='due'`, because that is what the mail
+# WAS: the index is a record of what arrived, the events table still shows it,
+# and the brief still lists it in its window. Only the count of things you
+# still owe leaves it out.
+OPEN_DUE_SQL = "amount IS DISTINCT FROM 0"
+
+
 async def find_open_due(
     pool: Any, payee_key: str, amount: Decimal, currency: str, around: date
 ) -> dict | None:

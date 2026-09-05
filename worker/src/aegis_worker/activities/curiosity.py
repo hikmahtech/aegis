@@ -45,9 +45,12 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from decimal import Decimal
+from html import escape
 from typing import Any
 
 from temporalio import activity
+
+from aegis_worker.activities.delivery import safe_send_message
 
 # `Attendees: a@x.com, b@y.com` — the line `calendar_event_to_content` writes
 # (core/src/aegis/services/claims.py) into the chunk text of every ingested event.
@@ -59,9 +62,6 @@ _DETECTORS = ("calendar_attendee", "unknown_payee", "todoist_project")
 # How far back the unknown-payee detector looks. A payment from last year is
 # not worth an interruption; the weekly money brief lists the older backlog.
 _UNKNOWN_DAYS = 60
-# The books hold one currency per journal, and the question states ONE summed
-# figure — mixing currencies into it would print a number that is simply false.
-_UNKNOWN_CURRENCY = "INR"
 
 # How sure the model has to be before its answer becomes a permanent rule that
 # files every future payment from this payee (spec §6).
@@ -83,6 +83,66 @@ _MAX_RULE_MATCH = 200
 _PAYEE_HALF = r"\|[^|]*"
 
 
+# Why no rule was written, in the owner's words. Keyed on the `reason` each
+# refusal branch in `_apply_books_answer` sets, so a new branch that forgets to
+# add an entry gets the generic sentence rather than silence.
+_NO_RULE_SAID = {
+    "undeclared": "I could not match that to an account in the chart, so I wrote no rule.",
+    "low_confidence": "I was not sure enough which account that is, so I wrote no rule.",
+    "no_payee_key": "That card carries no usable payee key, so I filed nothing.",
+    "books_failed": "The books would not take it — nothing was written.",
+    "rule_refused_backlog_applied": (
+        "The payee name is too long to turn into a safe pattern, so there is no rule and "
+        "the next payment from it will need filing again."
+    ),
+}
+_NO_RULE_FALLBACK = "I could not turn that into a books rule."
+
+
+def books_answer_report(payee: str, out: dict) -> str | None:
+    """What to tell the owner about the books half of their answer, or None.
+
+    Silence is the success signal (issue #384). A clean outcome — a rule
+    written, nothing failed, nothing left behind — already shows: the payee
+    drops off the brief's Unexplained list and the card reads resolved in the
+    admin. An extra push per answered question would spend the notification
+    budget saying what the next brief says anyway.
+
+    Everything else was invisible before this, and unrecoverable by any
+    automated path once it happened: `InteractionFlow` discards the
+    post-resolve activity's return value, the card is an ABANDONED child that
+    nobody awaits, the novelty key stops the question ever being asked again,
+    and `ledger_reclassify` refuses the cross-entity move by design. So the
+    hook has to say it itself.
+    """
+    account = str(out.get("rule") or "")
+    skipped = int(out.get("skipped_other_entity") or 0)
+    failed = int(out.get("failed") or 0)
+    moved = int(out.get("reclassified") or 0)
+    if account and not skipped and not failed:
+        return None
+    name = escape(payee or "that payee")
+
+    def postings(n: int) -> str:
+        return f"{n} existing posting{'' if n == 1 else 's'}"
+
+    if not account:
+        why = _NO_RULE_SAID.get(str(out.get("reason") or ""), _NO_RULE_FALLBACK)
+        tail = f" {postings(moved)} still moved." if moved else ""
+        return f"<b>{name}</b> — {why}{tail} Your answer is saved as a memory."
+
+    parts = [f"<b>{name}</b> → <code>{escape(account)}</code>. The rule is saved."]
+    if skipped:
+        parts.append(
+            f"{postings(skipped)} sit in the other set of books: changing the account "
+            "cannot change the journal file the block lives in, so I left them where "
+            "they are. They need a hand edit."
+        )
+    if failed:
+        parts.append(f"{failed} posting{'' if failed == 1 else 's'} could not be rewritten.")
+    return " ".join(parts)
+
+
 def rule_match_for(payee_key: str) -> str:
     """A regex matching every punctuation variant of one payee, or "".
 
@@ -102,12 +162,27 @@ def rule_match_for(payee_key: str) -> str:
     Returns "" when there is nothing to build from or the result would breach
     either bound. The caller then writes no rule at all — but still applies the
     backlog, which it selects by `payee_key` and not by this pattern.
+
+    The last check is the LOADER's, and it is not belt-and-braces. `load_rules`
+    skips a rule whose pattern breaches the regex bounds (issue #390), so a
+    generated pattern that breached them would be committed to the books and
+    then never run — strictly worse than writing nothing, because the card is
+    retired either way and the file now carries a rule that does not work. The
+    two caps sit flush against each other: the join puts one quantifier in
+    every gap between words, plus the anchor's own `*`, so `_MAX_RULE_WORDS`
+    words is exactly `books.MAX_RULE_QUANTIFIERS` quantifiers. Raising either
+    number alone would breach the other, silently, and this is where that
+    stops.
     """
+    from aegis.services import books
+
     words = [re.escape(w) for w in (payee_key or "").split()]
     if not words or len(words) > _MAX_RULE_WORDS:
         return ""
     match = _PAYEE_HALF + "[^a-z0-9]+".join(words)
-    return match if len(match) <= _MAX_RULE_MATCH else ""
+    if len(match) > _MAX_RULE_MATCH or books.rule_match_problem(match) is not None:
+        return ""
+    return match
 
 
 @dataclass
@@ -121,6 +196,14 @@ class CuriosityActivities:
     # main(); None means the answer is banked as memory and the books are left
     # alone, which is also what a fork with no books repo gets.
     books_cfg: Any = None
+    # The commodity `prices.journal` quotes every rate in. Used to RANK
+    # unexplained payments across currencies (issue #387); never rendered.
+    # Same default as MoneyActivities.home_currency — change them together.
+    home_currency: str = "INR"
+    # `DeliveryActivities` — how the books half of an answer reports back
+    # (issue #384). None means it cannot, which is a fork with no comms and
+    # every existing unit test; the outcome is still returned and logged.
+    delivery: Any = None
     # Thresholds are fields, not literals, so a deployment (and a test) can say
     # what "recurring" and "frequently hit" mean without editing the detector.
     min_attendee_events: int = 3
@@ -272,6 +355,24 @@ class CuriosityActivities:
             )
         return out
 
+    def _home_rates(self) -> dict[str, Decimal]:
+        """Commodity symbol → its rate in the home commodity, or `{}`.
+
+        Ranking only, never a figure the owner is shown. Failure is `{}` — a
+        fork with no books, a fresh checkout, a week the quote provider was
+        down — and the caller degrades to native magnitudes rather than
+        skipping a row.
+        """
+        if self.books_cfg is None:
+            return {}
+        try:
+            from aegis.services import books
+
+            return books.latest_prices(self.books_cfg)
+        except Exception as exc:  # noqa: BLE001 — a rank is not worth a failed run
+            activity.logger.warning("curiosity_prices_unreadable err=%s", str(exc)[:200])
+            return {}
+
     async def _detect_unknown_payee(self, agent_id: str, known: str) -> list[tuple[float, dict]]:
         """Money that left the account for something the books could not name.
 
@@ -280,14 +381,25 @@ class CuriosityActivities:
         owner has since explained leaves the queue and stops being a question,
         with no separate bookkeeping to keep in sync.
 
-        One candidate per `payee_key`, not per posting — the same shop arrives
-        under several spellings and each used to be its own card.
+        One candidate per `payee_key`, not per posting and not per currency —
+        the same shop arrives under several spellings, the novelty key is the
+        payee, and the rule the answer writes is per payee too. Splitting the
+        card by currency would ask the same question twice and let the second
+        copy suppress itself on the first one's key.
+
+        The AMOUNTS are grouped per currency and stay that way (issue #387).
+        Restricting the detector to rupees was how a foreign unexplained
+        payment came to be never carded, so never ruled, so never categorised;
+        adding the currencies together instead would state a number that is
+        simply false. So the question names each currency's own total, and
+        only the RANK converts — through the rates the lane already refreshes
+        into `prices.journal` every week.
         """
-        from aegis.services.money_format import fmt_money
+        from aegis.services.money_format import currency_symbol, fmt_money
 
         rows = await self.db_pool.fetch(
-            "SELECT payee_key, max(payee) AS payee, sum(amount) AS total, count(*) AS n, "
-            "max(occurred_on) AS last_on, max(channel) AS channel "
+            "SELECT payee_key, max(payee) AS payee, currency, sum(amount) AS total, "
+            "count(*) AS n, max(occurred_on) AS last_on, max(channel) AS channel "
             "FROM finance.journal_index "
             # `direction = 'out'` is not a nicety. `income:unknown` matches
             # `%:unknown` too, so without it an uncategorised inbound credit is
@@ -296,38 +408,88 @@ class CuriosityActivities:
             # it steers the account-picking model toward an EXPENSE account for
             # money that came in.
             "WHERE kind = 'transaction' AND direction = 'out' AND account LIKE '%:unknown' "
-            f"AND occurred_on >= now() - interval '{_UNKNOWN_DAYS} days' AND currency = $1 "
-            "GROUP BY payee_key ORDER BY total DESC LIMIT 50",
-            _UNKNOWN_CURRENCY,
+            f"AND occurred_on >= now() - interval '{_UNKNOWN_DAYS} days' "
+            # Both columns are nullable, and both are load-bearing here. A NULL
+            # amount sums to NULL and used to render as "You paid ₹0.00 to HDFC
+            # Bank" — live on 2026-09-05, four rows across two payees: a
+            # statement of fact that is not a fact, on the one surface allowed
+            # to interrupt. A NULL currency cannot be rendered as money at all
+            # without guessing which one it is, and guessing "the home one" is
+            # the assumption this detector just stopped making.
+            "  AND amount IS NOT NULL AND currency IS NOT NULL "
+            "GROUP BY payee_key, currency ORDER BY total DESC LIMIT 50"
         )
-        out: list[tuple[float, dict]] = []
+        rates = self._home_rates()
+
+        def in_home(total: Decimal, currency: str) -> Decimal:
+            """`total` valued in the home commodity, for RANKING only.
+
+            No rate ⇒ the native magnitude, which understates a strong
+            currency and is the honest degradation: it still ranks, still
+            cards, and never reaches a number the owner reads.
+            """
+            if currency.upper() == self.home_currency.upper():
+                return total
+            return total * rates.get(currency_symbol(currency), Decimal(1))
+
+        # Fold the per-(payee, currency) rows into one candidate per payee.
+        # Insertion order is the query's `total DESC`, which only matters as a
+        # stable starting point — the amounts below are re-sorted by value.
+        folded: dict[str, dict] = {}
         for r in rows:
             key = (r["payee_key"] or "").strip()
             payee = (r["payee"] or "").strip()
-            if not key or not payee or payee.lower() in known:
+            currency = (r["currency"] or "").strip().upper()
+            total = Decimal(r["total"])
+            if not key or not payee or not currency or total <= 0:
                 continue
-            total = Decimal(r["total"] or 0)
-            n = int(r["n"] or 0)
-            last_on = r["last_on"].isoformat() if r["last_on"] else "?"
-            channel = (r["channel"] or "other").strip()
+            if payee.lower() in known:
+                continue
+            c = folded.setdefault(
+                key,
+                {"payee": payee, "totals": {}, "n": 0, "last_on": None, "channel": None,
+                 "rank": Decimal(0)},
+            )
+            c["totals"][currency] = c["totals"].get(currency, Decimal(0)) + total
+            c["n"] += int(r["n"] or 0)
+            c["rank"] += in_home(total, currency)
+            if r["last_on"] and (c["last_on"] is None or r["last_on"] > c["last_on"]):
+                c["last_on"] = r["last_on"]
+            # The channel of the biggest group, which is the one the question's
+            # amounts lead with.
+            if c["channel"] is None:
+                c["channel"] = (r["channel"] or "other").strip()
+
+        out: list[tuple[float, dict]] = []
+        for key, c in folded.items():
+            payee, n = c["payee"], c["n"]
+            last_on = c["last_on"].isoformat() if c["last_on"] else "?"
+            # Biggest first, in home-commodity terms, so the sentence leads
+            # with the amount that earned the card.
+            ordered = sorted(
+                c["totals"].items(), key=lambda kv: in_home(kv[1], kv[0]), reverse=True
+            )
+            amounts = [fmt_money(total, currency) for currency, total in ordered]
+            paid = amounts[0] if len(amounts) == 1 else ", ".join(amounts[:-1]) + f" and {amounts[-1]}"
             out.append(
                 (
                     # Cost is the signal — a big unexplained payment outranks a
                     # small one, and any of them outranks a bare calendar face.
-                    10.0 + float(total),
+                    10.0 + float(c["rank"]),
                     {
                         "gap_type": "unknown_payee",
                         "subject": payee,
                         "question": (
-                            f"You paid {fmt_money(total, _UNKNOWN_CURRENCY)} to {payee} "
-                            f"({n} time{'' if n == 1 else 's'}, last {last_on}, {channel}). "
+                            f"You paid {paid} to {payee} "
+                            f"({n} time{'' if n == 1 else 's'}, last {last_on}, {c['channel']}). "
                             "What was it for?"
                         ),
                         # JSON-safe: this crosses a Temporal payload boundary
-                        # and then lands in the card's `metadata` jsonb.
+                        # and then lands in the card's `metadata` jsonb. One
+                        # entry per currency, never a sum across them.
                         "evidence": {
                             "payee_key": key,
-                            "total": float(total),
+                            "totals": {cur: float(t) for cur, t in ordered},
                             "n": n,
                             "last_on": last_on,
                         },
@@ -562,6 +724,21 @@ class CuriosityActivities:
                     str(exc)[:200],
                 )
                 out.update({"rule": None, "reason": "books_failed"})
+            # Say what happened, when what happened is not what the owner would
+            # assume from having answered (issue #384). Outside the try above,
+            # so a books failure is reported rather than being the one outcome
+            # that stays silent. `safe_send_message` never raises: by this
+            # point the memory, the rule and the reclassification are all
+            # already done, so a comms outage costs the message and nothing
+            # else.
+            report = books_answer_report(subject, out)
+            if report:
+                await safe_send_message(
+                    self.delivery,
+                    agent_id=agent_id,
+                    message=report,
+                    log_event="curiosity_books_answer",
+                )
         return out
 
     async def _apply_books_answer(
@@ -671,20 +848,23 @@ class CuriosityActivities:
             await books.append_rule(rule, cfg)
 
         rows = await self.db_pool.fetch(
-            "SELECT message_id FROM finance.journal_index "
+            "SELECT message_id, entity FROM finance.journal_index "
             # Same `direction = 'out'` as the detector, and for the same
             # reason: the owner was asked about money they PAID this payee, so
             # a credit from the same name (a refund, a transfer back) is not
             # what they explained and must not be filed to an expense account.
             "WHERE payee_key = $1 AND kind = 'transaction' AND direction = 'out' "
-            "AND account LIKE '%:unknown' AND journal_file IS NOT NULL "
-            # And only the books the account belongs to: rewriting in place
-            # changes the account, never the file the block lives in.
-            "AND ($2::text IS NULL OR entity = $2)",
+            "AND account LIKE '%:unknown' AND journal_file IS NOT NULL",
             key,
-            entity,
         )
-        msgids = [r["message_id"] for r in rows]
+        # Only the books the account belongs to: rewriting in place changes the
+        # account, never the file the block lives in. The entity split happens
+        # HERE rather than in the WHERE clause so the rows left behind can be
+        # COUNTED — that count is the whole of what the owner is told about a
+        # cross-entity answer, and a query that never returned them could not
+        # produce it (issue #384).
+        msgids = [r["message_id"] for r in rows if entity is None or r["entity"] == entity]
+        skipped_other_entity = len(rows) - len(msgids)
         # ONE write for the whole backlog: one flock, one pull, one strict
         # check, one commit, one push. A loop over `rewrite_event` would hold
         # the books against every other writer for the length of the sweep and
@@ -706,14 +886,19 @@ class CuriosityActivities:
             )
         activity.logger.info(
             "curiosity_books_answer_applied payee=%s account=%s rule=%s "
-            "reclassified=%d failed=%d",
+            "reclassified=%d failed=%d skipped_other_entity=%d",
             payee,
             account,
             bool(match),
             len(rewritten),
             len(failed),
+            skipped_other_entity,
         )
-        out = {"reclassified": len(rewritten), "failed": len(failed)}
+        out = {
+            "reclassified": len(rewritten),
+            "failed": len(failed),
+            "skipped_other_entity": skipped_other_entity,
+        }
         if match:
             return {"rule": account, **out}
         # Backlog moved, nothing persisted — a distinct outcome from both a

@@ -15,6 +15,7 @@ from aegis.api.deps import get_settings
 from aegis.api.routes._flow_trigger import require_temporal_client, start_named_workflow
 from aegis.config import Settings
 from aegis.services import books
+from aegis.services.journal_index import OPEN_DUE_SQL
 
 logger = logging.getLogger(__name__)
 
@@ -89,7 +90,7 @@ async def money_state(request: Request, settings: Settings = Depends(get_setting
         )
         dues_open = await conn.fetchval(
             "SELECT count(*) FROM finance.journal_index "
-            "WHERE kind IN ('due','failed') AND linked_message_id IS NULL"
+            f"WHERE kind IN ('due','failed') AND linked_message_id IS NULL AND {OPEN_DUE_SQL}"
         )
     cfg = books.config_from_settings(settings)
     try:

@@ -14,6 +14,7 @@ from types import SimpleNamespace
 import pytest
 from aegis.api.models.money import MoneyEvent
 from aegis.services import books
+from structlog.testing import capture_logs
 
 HAS_HLEDGER = shutil.which("hledger") is not None and shutil.which("git") is not None
 
@@ -164,6 +165,93 @@ def test_rules_first_match_wins(tmp_path):
     assert books.apply_rules(rules, "data@stockopedia.com", "LSEG Billing")["ignore"] is True
     assert books.apply_rules(rules, "a@b.com", "Nobody") is None
     assert books.load_rules(tmp_path / "missing.yaml") == []
+
+
+def test_load_rules_skips_a_pattern_that_is_unsafe_to_run(tmp_path):
+    """The guarantee has to be about what RUNS, not about what was written
+    (issue #390).
+
+    `ledger_add_rule` checks these bounds at write time, but `apply_rules`
+    runs every rule in the file with `re.search` against every incoming money
+    event, synchronously, in the worker. A pattern hand-written or written
+    before the bounds existed is not covered by a write-time check, and `re`
+    has no timeout: a catastrophic one hangs the ingest lane permanently,
+    across processes.
+
+    The surviving rules matter as much as the dropped one — a `load_rules`
+    that returned `[]` on any bad file would "pass" this by breaking the
+    books entirely.
+    """
+    p = tmp_path / "accounts.yaml"
+    p.write_text(
+        "- match: '(a+)+$'\n  account: expenses:groceries\n"          # repeats a group
+        "- match: 'a*a*a*a*a*a*a*$'\n  account: expenses:groceries\n"  # stacks quantifiers
+        "- match: '" + "x" * 201 + "'\n  account: expenses:groceries\n"  # over the length cap
+        "- match: '('\n  account: expenses:groceries\n"                # not a regex at all
+        "- match: 'mahavitaran.*suncity 501'\n  account: expenses:utilities:electricity\n"
+        "- match: 'amazon web services|invoicing@aws\\.com'\n  account: expenses:hikmah:infra\n"
+    )
+
+    with capture_logs() as logs:
+        rules = books.load_rules(p)
+
+    assert [r["match"] for r in rules] == [
+        "mahavitaran.*suncity 501",
+        "amazon web services|invoicing@aws\\.com",
+    ]
+    # Named, not merely dropped: a rule that silently stops applying is a
+    # miscategorisation with nothing pointing at its cause.
+    skipped = [ln for ln in logs if ln["event"] == "books_rule_skipped"]
+    assert [ln["match"][:12] for ln in skipped] == ["(a+)+$", "a*a*a*a*a*a*", "x" * 12, "("]
+    assert "repeats a group" in skipped[0]["reason"]
+    assert "stacks more than 6 quantifiers" in skipped[1]["reason"]
+    assert skipped[2]["reason"] == "is longer than 200 characters"
+    assert skipped[3]["reason"].startswith("is not a valid regex:")
+
+
+def test_load_rules_accepts_every_shape_a_real_rule_uses(tmp_path):
+    """The live `rules/accounts.yaml` of 2026-09-05, in shape: alternation, an
+    escaped dot, a wildcard, and the anchored pattern `rule_match_for`
+    generates. A validator that refused any of these would silently
+    de-categorise the whole ledger on the next email."""
+    p = tmp_path / "accounts.yaml"
+    p.write_text(
+        "- match: 'lseg billing|lseg helpdesk|@stockopedia\\.com'\n  ignore: true\n"
+        "- match: 'apple.*icloud|icloud'\n  account: expenses:saas\n"
+        "- match: 'amazonpay.*toll|toll'\n  account: expenses:transport\n"
+        "- match: 'mahavitaran.*suncity 501|msedcl.*suncity 501'\n"
+        "  account: expenses:utilities:electricity\n"
+        "- match: '\\|[^|]*mahavitaran[^a-z0-9]+msedcl'\n"
+        "  account: expenses:utilities:electricity\n"
+    )
+
+    assert len(books.load_rules(p)) == 5
+
+
+def test_latest_prices_reads_the_newest_rate_per_commodity(tmp_path):
+    """`prices.journal` is append-only and seeded with config defaults, so the
+    same symbol appears many times and only the newest line is the rate. Used
+    to RANK index rows across currencies (issue #387) — hledger stays the
+    authority on every figure that is reported."""
+    (tmp_path / "prices.journal").write_text(
+        "; FX prices, appended weekly.\n"
+        "P 2026-09-01 $ ₹84.50\n"
+        "P 2026-09-01 £ ₹108.00\n"
+        "P 2026-09-05 $ ₹94.49\n"
+        "P 2026-09-05 € ₹109.73\n"
+        "P 2026-09-05 £ 127.76\n"          # no symbol on the rate
+        "P not-a-date $ ₹1.00\n"           # not a price line
+        "P 2026-09-06 ¥ ₹0\n"              # a zero rate divides nothing
+        "not a price line at all\n"
+    )
+
+    rates = books.latest_prices(books.BooksConfig(path=tmp_path))
+
+    assert rates == {
+        "$": Decimal("94.49"), "£": Decimal("127.76"), "€": Decimal("109.73")
+    }
+    # No checkout at all is `{}`, not a crash: that is a fresh deployment.
+    assert books.latest_prices(books.BooksConfig(path=tmp_path / "gone")) == {}
 
 
 def test_rule_haystack_keeps_exactly_one_pipe():

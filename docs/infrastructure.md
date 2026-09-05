@@ -694,7 +694,12 @@ Three behaviours are worth knowing before you use them.
 - **`ledger_add_rule` refuses a slow regex.** The pattern is persisted and the
   worker then runs it against every money event, in another process, forever, so
   a pattern that repeats a group, stacks quantifiers or simply measures slow is
-  turned away with a message saying what to change.
+  turned away with a message saying what to change. The first three of those
+  bounds are applied AGAIN when `rules/accounts.yaml` is read, so a rule you
+  hand-edit into the file is held to the same standard as one the tool wrote:
+  it is skipped, with a warning naming it (`books_rule_skipped`), rather than
+  run. The timing probe is write-time only — it forks a process, which is not a
+  price the ingest lane can pay per rule per email.
 - **One sweep is capped at 200 postings**, written as a single commit. Past that
   the tool asks to be run again rather than rewriting the whole backlog in one
   unreviewable change.

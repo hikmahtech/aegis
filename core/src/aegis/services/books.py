@@ -18,7 +18,7 @@ import subprocess
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import date
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 import structlog
@@ -434,11 +434,96 @@ def journal_files(cfg: BooksConfig) -> list[Path]:
 
 # ----------------------------------------------------------------- rules
 
+# Bounds on a rule's `match`. They live HERE, next to the loader that enforces
+# them, because the guarantee has to be about what RUNS rather than about what
+# was written (issue #390): `ledger_add_rule` checks a pattern before it
+# persists one, but `apply_rules` runs every rule in the file against every
+# incoming money event, and a rule hand-edited into `rules/accounts.yaml` — or
+# written before these bounds existed — never passed that check.
+#
+# `re` has no timeout and `apply_rules` runs `re.search` synchronously on the
+# event loop, so a catastrophic pattern is not a slow call; it is a permanent
+# hang of the ingest lane, in every process that loads the file.
+MAX_RULE_MATCH_LEN = 200
+# Three bounds, in the order they are applied.
+#
+# 1. ANY quantified group. Exponential backtracking needs nested quantification,
+#    and nesting needs a group — so this removes the whole exponential class in
+#    one rule. A guard that only caught self-nesting (`(a+)+`) missed `((a+))+`,
+#    which was measured still running after 20s on a 31-character input.
+_QUANTIFIED_GROUP_RE = re.compile(r"\)\s*[*+{?]")
+# 2. How many quantifiers may stack. Without a group the cost is polynomial in
+#    the number of them. Measured on CPython 3.12, `("a" * 48 + "!")` against
+#    `"a*" * k + "$"`:  k=4 → 0.015s   k=5 → 0.14s   k=6 → 1.15s   k=8 → 55s
+#    so 6 is what keeps the worst case near a second.
+MAX_RULE_QUANTIFIERS = 6
+# The `?` of `(?:`/`(?i)` is not a quantifier, and `\*` is a literal.
+_QUANTIFIER_RE = re.compile(r"(?<!\\)(?<!\()[*+?]|(?<!\\)\{\d")
+# 3. A behavioural timing probe, which is the only check that catches
+#    quantifier stacking with no group at all. It lives in
+#    `services/tools/ledger.py` and runs at WRITE time only: it forks a
+#    killable subprocess, and one fork per rule per incoming email is not a
+#    price the ingest lane can pay. The two static bounds above are what the
+#    loader can afford, and between them they bound the worst case at about a
+#    second per rule.
+
+
+def rule_match_problem(match: str) -> str | None:
+    """Why `match` is unsafe to run, phrased to follow the word "match", or
+    None when it is fine.
+
+    One implementation, two callers: `load_rules` skips a rule that fails it,
+    and `ledger_add_rule` refuses to write one. Anything added here therefore
+    applies to both the file on disk and the next rule a model proposes.
+    """
+    try:
+        re.compile(match)
+    except re.error as exc:
+        return f"is not a valid regex: {exc}"
+    if len(match) > MAX_RULE_MATCH_LEN:
+        return f"is longer than {MAX_RULE_MATCH_LEN} characters"
+    if _QUANTIFIED_GROUP_RE.search(match):
+        return (
+            "repeats a group (e.g. `(a+)+`, `(ab)*`, `(a|a)+`) — repeating a group can take "
+            "exponential time, and this rule runs against every money event from now on. "
+            "Write it without repeating the group."
+        )
+    if len(_QUANTIFIER_RE.findall(match)) > MAX_RULE_QUANTIFIERS:
+        return (
+            f"stacks more than {MAX_RULE_QUANTIFIERS} quantifiers (*, +, ?, {{n}}), "
+            "which gets slow faster than the length of what it is matched against."
+        )
+    return None
+
+
 def load_rules(path: Path) -> list[dict]:
+    """The rules in `path` that are safe to run, in file order.
+
+    A rule whose pattern fails `rule_match_problem` is SKIPPED and named in a
+    warning, not repaired and not raised on: the file is the user's, the rest
+    of it is still good, and a loader that refused the whole file on one bad
+    line would de-categorise every payee at once.
+    """
     if not Path(path).exists():
         return []
     data = yaml.safe_load(Path(path).read_text()) or []
-    return [r for r in data if isinstance(r, dict) and r.get("match")]
+    out: list[dict] = []
+    for rule in data:
+        if not isinstance(rule, dict) or not rule.get("match"):
+            continue
+        problem = rule_match_problem(str(rule["match"]))
+        if problem:
+            # Named, because a rule that silently stops applying shows up as a
+            # miscategorised payment with nothing pointing at the cause.
+            logger.warning(
+                "books_rule_skipped",
+                path=str(path),
+                match=str(rule["match"])[:120],
+                reason=problem[:200],
+            )
+            continue
+        out.append(rule)
+    return out
 
 
 def apply_rules(rules: list[dict], sender: str, payee: str) -> dict | None:
@@ -926,6 +1011,52 @@ async def append_prices(lines: list[str], cfg: BooksConfig) -> None:
         path.write_text((text.rstrip("\n") + "\n" + body) if text else body)
 
     await _write(cfg, f"prices {lines[0].split()[1] if lines else ''}", mutate, ["prices.journal"])
+
+
+# `P 2026-09-05 £ ₹127.76` — the shape `refresh_fx_prices` appends, and the
+# shape the seed defaults ship. The rate is read out of the remainder rather
+# than assumed to be one token, so `₹ 127.76` parses the same way.
+_PRICE_RE = re.compile(r"^P\s+(\d{4}-\d{2}-\d{2})\s+(\S+)\s+(.+?)\s*$")
+_PRICE_NUM_RE = re.compile(r"[\d,]+(?:\.\d+)?")
+
+
+def latest_prices(cfg: BooksConfig) -> dict[str, Decimal]:
+    """The newest rate per commodity in `prices.journal`, keyed by SYMBOL.
+
+    Read-only and lock-free, like `load_rules`: the file is append-only and a
+    half-written line loses one rate, never a number. An absent or unreadable
+    file is `{}` — the caller must have something sensible to do without a
+    rate, because there is genuinely no rate on a fresh checkout or after a
+    week the quote provider was down.
+
+    hledger is the authority on these prices for every REPORTED figure; this
+    exists for the callers that rank index rows, which hledger never sees.
+    """
+    path = cfg.path / "prices.journal"
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return {}
+    seen: dict[str, tuple[str, Decimal]] = {}
+    for line in text.splitlines():
+        m = _PRICE_RE.match(line.strip())
+        if not m:
+            continue
+        when, symbol, rest = m.group(1), m.group(2), m.group(3)
+        num = _PRICE_NUM_RE.search(rest)
+        if not num:
+            continue
+        try:
+            rate = Decimal(num.group(0).replace(",", ""))
+        except InvalidOperation:
+            continue
+        if rate <= 0:
+            continue
+        # Newest wins, and the LAST line wins a tie: `append_prices` writes one
+        # line per refresh, so same-day lines are oldest-first in the file.
+        if symbol not in seen or when >= seen[symbol][0]:
+            seen[symbol] = (when, rate)
+    return {symbol: rate for symbol, (_, rate) in seen.items()}
 
 
 async def append_rule(rule: dict, cfg: BooksConfig) -> None:

@@ -58,6 +58,18 @@ MAX_LEDGER_LINES = 20
 # list, but the reader has to be able to tell a forecast from a fact.
 FORECAST_MARK = "forecast"
 
+# The cut for a "large" unexplained posting (spec §7.2, "unknown-account rows
+# ≥ ₹5,000"). It lives HERE, in the renderer, and `build_money_brief` imports
+# it for its filter — because this is the number the reader is TOLD, and a
+# number in prose drifts from the number in the WHERE clause without a word of
+# warning. The renderer already imports nothing from `money`, so this is the
+# only direction that does not make a cycle.
+#
+# INR-only, deliberately: the line below states a SUM, and a sum across
+# currencies is not a smaller truth, it is a false number.
+LARGE_UNEXPLAINED_MIN = Decimal("5000")
+LARGE_UNEXPLAINED_CURRENCY = "INR"
+
 
 def _money(value: object, currency: str | None = "INR") -> str:
     """Formatted major units, or `""` when there is no amount to show.
@@ -88,6 +100,50 @@ def _name(value: object) -> str:
     """A payee/description as PLAIN text — never the word "None"."""
     text = "" if value is None else str(value).strip()
     return text if text and text != "None" else NO_NAME
+
+
+def _count(n: int, noun: str) -> str:
+    """`1 commit` / `2 commits`.
+
+    The live brief of 2026-09-05 said "1 low-confidence LLM postings". Both
+    housekeeping counters sit at 1 most weeks, so the plural is the case the
+    reader actually meets.
+    """
+    return f"{n} {noun}" if n == 1 else f"{n} {noun}s"
+
+
+def _large_unexplained_line(brief: dict) -> str:
+    """What the biggest unexplained payments of the week add up to, or `""`.
+
+    `build_money_brief` has computed `large_unexplained` every week since the
+    lane shipped and nothing read it (issue #391). Rendered, it has to earn the
+    line: the Unexplained rows below already carry each amount and each payee,
+    so repeating the biggest of them says nothing new. The total does — it is
+    the one figure in this section that no row carries, and it survives the
+    10-row cut on the list.
+
+    A row whose amount does not parse is left out of BOTH the count and the
+    total: `journal_index.amount` is nullable and arrives here as the string
+    "None" (see the module docstring), and counting a row that contributed
+    nothing would print "3 payments" over the sum of two.
+    """
+    total, n = Decimal("0"), 0
+    for row in brief.get("large_unexplained") or []:
+        text = str(row.get("amount") or "").strip()
+        if text in ("", "None"):
+            continue
+        try:
+            total += abs(Decimal(text))
+        except (InvalidOperation, ArithmeticError, ValueError):
+            continue
+        n += 1
+    if n == 0:
+        return ""
+    cut = fmt_money(LARGE_UNEXPLAINED_MIN, LARGE_UNEXPLAINED_CURRENCY)
+    return (
+        f"{fmt_money(total, LARGE_UNEXPLAINED_CURRENCY)} in "
+        f"{_count(n, 'payment')} of {cut} or more"
+    )
 
 
 def _clip(text: str, limit: int = MAX_LEDGER_LINES) -> tuple[str, int]:
@@ -198,6 +254,11 @@ def render_money_brief(brief: dict, home_symbol: str = "₹") -> dict:
     if brief.get("unknowns"):
         html.append("<b>Unexplained</b>")
         md.append("## Unexplained")
+        # Above the rows: the size of the problem before its detail.
+        large = _large_unexplained_line(brief)
+        if large:
+            html.append(escape(large))
+            md.append(f"- {large}")
         for u in brief["unknowns"][:10]:
             amount = _amount(u.get("amount"), u.get("currency"))
             payee, channel = _name(u.get("payee")), _name(u.get("channel"))
@@ -226,9 +287,9 @@ def render_money_brief(brief: dict, home_symbol: str = "₹") -> dict:
 
     house = []
     if brief.get("unpushed"):
-        house.append(f"{brief['unpushed']} unpushed commits")
+        house.append(_count(int(brief["unpushed"]), "unpushed commit"))
     if brief.get("low_confidence"):
-        house.append(f"{brief['low_confidence']} low-confidence LLM postings")
+        house.append(_count(int(brief["low_confidence"]), "low-confidence LLM posting"))
     if house:
         html += ["<b>Housekeeping</b>", " · ".join(house)]
         md += ["## Housekeeping", f"- {' · '.join(house)}"]
