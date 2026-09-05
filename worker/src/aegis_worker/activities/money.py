@@ -77,6 +77,18 @@ def _previous_month_window(today: date) -> tuple[date, date]:
 
 
 _NUM_RE = re.compile(r"-?[\d,]+(?:\.\d+)?")
+# The commodity token of one amount: everything that is not a digit, a
+# separator or a sign. Matches "$", "₹" and an ISO suffix like "CHF" alike.
+_COMMODITY_RE = re.compile(r"[^\s\d,.+-]+")
+# hledger joins the commodities of an unconvertible balance with a comma AND a
+# space. A digit-group comma never has a space after it, so this splits the
+# parts without ever cutting "1,00,000.00" in half.
+_PART_SPLIT_RE = re.compile(r",\s+")
+# Everything in this lane is reported `-X ₹`, so the home commodity's symbol
+# is the one amount in a cell that needs no conversion. Defined once and used
+# by BOTH the hledger arguments and the parser: if those drift, every foreign
+# amount silently becomes a rupee amount.
+HOME_SYMBOL = "₹"
 
 
 def parse_hledger_csv(text: str) -> list[list[str]]:
@@ -84,18 +96,64 @@ def parse_hledger_csv(text: str) -> list[list[str]]:
     return [row for row in csv.reader(io.StringIO(text)) if row]
 
 
-def amount_from_cell(cell: str) -> Decimal:
-    """"₹ 1,234.56" → Decimal("1234.56"). No number ⇒ Decimal("0").
+def split_amount_cell(cell: str) -> list[str]:
+    """One CSV amount cell as its per-commodity parts.
 
-    hledger writes an empty cell for a period with no activity and a bare "0"
-    for a zeroed total, so "unparseable" here means "nothing happened", not an
-    error. The narrow/non-breaking spaces are stripped first: they are
-    hledger's digit-group separator under some commodity formats, and left in
-    place they end the match after the first group ("1 234.56" → 1).
+    `-X ₹` converts nothing it has no price for, and hledger then writes
+    the balance as EVERY commodity at once in a single cell —
+    "$ 50.00, ₹ 300.00" — which is what makes a naive first-number read
+    report $50 of spend as ₹50.
+
+    Non-breaking spaces are stripped first: they are hledger's digit-group
+    separator under some commodity formats, and left in place they end a
+    number match after the first group ("1 234.56" → 1).
     """
     text = (cell or "").replace("\u00a0", "").replace("\u202f", "")
-    m = _NUM_RE.search(text)
-    return Decimal(m.group(0).replace(",", "")) if m else Decimal("0")
+    return [part for part in _PART_SPLIT_RE.split(text.strip()) if part.strip()]
+
+
+def commodity_of(part: str) -> str:
+    """The commodity token of one amount part; "" for a bare number like "0"."""
+    m = _COMMODITY_RE.search(part)
+    return m.group(0) if m else ""
+
+
+def unconverted_commodities(cell: str) -> list[str]:
+    """Commodity tokens in a cell that are NOT the home commodity, in order.
+
+    Non-empty means the cell carries money the report could not value in
+    ₹ — there is no price for it in `prices.journal` — so every
+    home-currency figure derived from that cell understates reality and has to
+    say so.
+    """
+    out: list[str] = []
+    for part in split_amount_cell(cell):
+        token = commodity_of(part)
+        if token and token != HOME_SYMBOL and token not in out:
+            out.append(token)
+    return out
+
+
+def amount_from_cell(cell: str) -> Decimal:
+    """The HOME-commodity amount in a CSV cell. Decimal("0") when there is none.
+
+    "₹ 1,234.56" → 1234.56, "0" → 0, "" → 0, and the mixed
+    "$ 50.00, ₹ 300.00" → 300.00, never 50.00. A part in another commodity
+    is worth an unknown number of rupees, so it contributes nothing here and
+    is reported separately by `unconverted_commodities`: an understated total
+    the reader is warned about beats a confident wrong one.
+
+    A single part carrying no commodity token at all is taken at face value —
+    hledger's bare "0" is the only unlabelled shape it writes.
+    """
+    for part in split_amount_cell(cell):
+        token = commodity_of(part)
+        if token and token != HOME_SYMBOL:
+            continue
+        m = _NUM_RE.search(part)
+        if m:
+            return Decimal(m.group(0).replace(",", ""))
+    return Decimal("0")
 
 
 def _is_account_cell(cell: str) -> bool:
@@ -1173,8 +1231,13 @@ class MoneyActivities:
     async def refresh_fx_prices(self) -> dict:
         """Weekly P lines from the keyless quote provider (spec §7.2 step 1).
 
-        Never raises: the brief that calls this is worth sending with stale
-        rates, and a quote provider is the least reliable thing in the lane.
+        Never raises. The brief that calls this is worth sending with stale
+        rates, a quote provider is the least reliable thing in the lane, and
+        the books write can fail OUTSIDE the errors `books.py` names: the
+        flock is taken before `_write_sync`'s try block, so a permission or
+        disk error on `.aegis.lock` escapes as a bare `OSError`. Both the
+        fetch and the write therefore catch `Exception`, not `BooksError` —
+        only `BaseException` (cancellation, interrupt) still propagates.
         """
         if self.finance is None or self.books_cfg is None:
             return {"written": 0, "errors": ["disabled"]}
@@ -1195,7 +1258,7 @@ class MoneyActivities:
         if lines:
             try:
                 await books.append_prices(lines, self.books_cfg)
-            except books.BooksError as exc:
+            except Exception as exc:  # noqa: BLE001 — see the docstring
                 return {"written": 0, "errors": [*errors, f"books: {str(exc)[:120]}"]}
         return {"written": len(lines), "errors": errors}
 
@@ -1229,12 +1292,18 @@ class MoneyActivities:
             "forecast": [],
             "bal_text": "",
             "unpushed": 0,
+            # Non-empty ⇒ some figure above is in the wrong ballpark because
+            # `prices.journal` has no rate for that commodity. The renderer
+            # must say so; a confident wrong headline is worse than a caveat.
+            "fx_unconverted": [],
+            "fx_stale": False,
         }
+        unconverted: set[str] = set()
         try:
             if self.books_cfg is None:
                 raise books.BooksDisabled("books_cfg is not set on MoneyActivities")
             bal_args = [
-                "bal", "-X", "₹", "-b", since.isoformat(), "-e", end,
+                "bal", "-X", HOME_SYMBOL, "-b", since.isoformat(), "-e", end,
                 "income", "expenses", "--depth", "2",
             ]
             rows = parse_hledger_csv(await self._hl(bal_args, "csv"))
@@ -1242,6 +1311,7 @@ class MoneyActivities:
                 if len(row) < 2 or not _is_account_cell(row[0]):
                     continue
                 account, balance = row[0], row[1]
+                unconverted.update(unconverted_commodities(balance))
                 ent = (
                     "hikmah"
                     if account.startswith(("expenses:hikmah", "income:hikmah"))
@@ -1253,7 +1323,7 @@ class MoneyActivities:
                 )
                 brief["by_account"].append({"account": account, "balance": balance})
             payees = parse_hledger_csv(await self._hl([
-                "bal", "-X", "₹", "-b", since.isoformat(), "-e", end,
+                "bal", "-X", HOME_SYMBOL, "-b", since.isoformat(), "-e", end,
                 "expenses", "--pivot", "payee", "--flat", "--sort-amount",
             ], "csv"))
             brief["top_payees"] = [
@@ -1261,12 +1331,15 @@ class MoneyActivities:
                 for r in payees[1:]
                 if len(r) >= 2 and r[0].lower() != "total:"
             ][:10]
+            # No sweep over `top_payees`: it is the same expense postings the
+            # `bal` above already reported, pivoted by payee instead of by
+            # account, so it can never carry a commodity that one missed.
             # `--forecast=A..B` excludes B, so the window ends the day AFTER the
             # last day the brief covers — otherwise a charge exactly a
             # fortnight out is missing from the fortnight it is meant to warn
             # about.
             fc = parse_hledger_csv(await self._hl([
-                "reg", "-X", "₹",
+                "reg", "-X", HOME_SYMBOL,
                 f"--forecast={today.isoformat()}..{(today + timedelta(days=15)).isoformat()}",
                 "-b", today.isoformat(), "-e", (today + timedelta(days=15)).isoformat(),
                 "expenses", "tag:generated-transaction",
@@ -1275,17 +1348,31 @@ class MoneyActivities:
             brief["forecast"] = [
                 {"date": r[1], "description": r[3], "amount": r[5]} for r in fc[1:] if len(r) >= 6
             ]
+            for row in brief["forecast"]:
+                unconverted.update(unconverted_commodities(row["amount"]))
             brief["bal_text"] = await self._hl(bal_args)
             brief["unpushed"] = await books.unpushed_commits(self.books_cfg)
         except books.BooksError as exc:
             logger.warning("money_brief_books_unavailable", error=str(exc)[:200])
             brief["books_ok"] = False
             brief["bal_text"] = ""
+        if unconverted:
+            logger.warning("money_brief_fx_stale", commodities=sorted(unconverted))
+        brief["fx_unconverted"] = sorted(unconverted)
+        brief["fx_stale"] = bool(unconverted)
+        # `amount IS NOT NULL` is load-bearing, not tidiness: a transaction the
+        # writer refused (no amount) is still indexed by `post_money_event`
+        # with `account='expenses:unknown'` and an `occurred_on`, so it matches
+        # every other clause here. `str(None)` then made `Decimal(u["amount"])`
+        # in `large_unexplained` raise `InvalidOperation`, which is not a
+        # `BooksError`, so the whole brief died and Temporal retried it forever
+        # with nothing saying why.
         unknowns = await self.db_pool.fetch(
             "SELECT message_id, payee, amount, currency, occurred_on, channel "
             "FROM finance.journal_index "
             "WHERE kind = 'transaction' AND account LIKE '%:unknown' AND occurred_on >= $1 "
-            "ORDER BY amount DESC NULLS LAST LIMIT 15",
+            "  AND amount IS NOT NULL "
+            "ORDER BY amount DESC LIMIT 15",
             since,
         )
         brief["unknowns"] = [
@@ -1356,17 +1443,23 @@ class MoneyActivities:
             "bs_text": "",
             "is_rows": [],
             "recurring_total": "0",
+            # Same contract as the brief: non-empty means `is_rows` and
+            # `recurring_total` understate the month because those commodities
+            # have no rate in `prices.journal`.
+            "fx_unconverted": [],
+            "fx_stale": False,
         }
+        unconverted: set[str] = set()
         try:
             if self.books_cfg is None:
                 raise books.BooksDisabled("books_cfg is not set on MoneyActivities")
             is_args = [
-                "is", "-X", "₹", "-M", "-b", prev_first.isoformat(), "-e", this_first.isoformat(),
+                "is", "-X", HOME_SYMBOL, "-M", "-b", prev_first.isoformat(), "-e", this_first.isoformat(),
                 "--depth", "2",
             ]
             close["is_text"] = await self._hl(is_args)
             close["bs_text"] = await self._hl([
-                "bs", "-X", "₹", "-e", this_first.isoformat(), "--depth", "2",
+                "bs", "-X", HOME_SYMBOL, "-e", this_first.isoformat(), "--depth", "2",
             ])
             rows = parse_hledger_csv(await self._hl(is_args, "csv"))
             # is -M -O csv: a title line, then Account/<month>/<month>, then the
@@ -1376,22 +1469,29 @@ class MoneyActivities:
                 for r in rows
                 if len(r) >= 3 and _is_account_cell(r[0])
             ]
+            for row in close["is_rows"]:
+                unconverted.update(unconverted_commodities(row["prev"]))
+                unconverted.update(unconverted_commodities(row["month"]))
             # Exclusive end again: `..this_first` is what covers the month's
             # own last day, which is exactly when a month-end charge lands.
             fc = parse_hledger_csv(await self._hl([
-                "bal", "-X", "₹",
+                "bal", "-X", HOME_SYMBOL,
                 f"--forecast={month_first.isoformat()}..{this_first.isoformat()}",
                 "-b", month_first.isoformat(), "-e", this_first.isoformat(),
                 "expenses", "tag:generated-transaction", "--depth", "1",
             ], "csv"))
-            total = sum(
-                (amount_from_cell(r[1]) for r in fc[1:] if len(r) >= 2 and r[0].lower() != "total:"),
-                Decimal("0"),
-            )
+            recurring = [r for r in fc[1:] if len(r) >= 2 and r[0].lower() != "total:"]
+            for r in recurring:
+                unconverted.update(unconverted_commodities(r[1]))
+            total = sum((amount_from_cell(r[1]) for r in recurring), Decimal("0"))
             close["recurring_total"] = str(total.quantize(Decimal("0.01")))
         except books.BooksError as exc:
             logger.warning("month_close_books_unavailable", error=str(exc)[:200])
             close["books_ok"] = False
+        if unconverted:
+            logger.warning("month_close_fx_stale", commodities=sorted(unconverted))
+        close["fx_unconverted"] = sorted(unconverted)
+        close["fx_stale"] = bool(unconverted)
         close["unknown_count"] = int(await self.db_pool.fetchval(
             "SELECT count(*) FROM finance.journal_index "
             "WHERE kind = 'transaction' AND account LIKE '%:unknown' "
