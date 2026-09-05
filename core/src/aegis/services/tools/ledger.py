@@ -26,9 +26,12 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import math
 import multiprocessing
 import os
 import re
+import signal
+import threading
 import time
 import warnings
 from datetime import date as date_type
@@ -120,6 +123,42 @@ _REGEX_PROBES = ("a" * 24 + "!", "a" * 48 + "!", "ab" * 24 + "!", "0" * 48 + " x
 # user cannot add; reaching it at all means those bounds have a hole.
 _REGEX_KILL_S = 10.0
 
+# The probe child's exit codes. `1` is reserved for "it crashed" and is NOT a
+# probe index, because `_bootstrap`'s own generic handler also exits 1: sharing
+# the code made a `MemoryError` (or a broken `spawn` bootstrap) report itself as
+# a slow 9-character probe — a confident, wrong diagnostic that sent the reader
+# after a performance problem that did not exist.
+_CODE_CRASHED = 1
+_CODE_SLOW = 2
+
+# One byte is the whole channel: `os._exit(256)` truncates to 0, which would
+# report a slow pattern as safe. Enforced at import rather than left as a note,
+# because "keep this list short" is exactly the kind of rule that erodes.
+if _CODE_SLOW + len(_REGEX_PROBES) > 255:
+    raise RuntimeError("too many regex probes to encode in an exit code")
+
+# One probe at a time per process. `multiprocessing` reaps children through
+# shared state — every `Process.start()` calls `process._cleanup()`, which polls
+# OTHER threads' process objects — so concurrent probes race each other's
+# `waitpid`. Measured at concurrency 8: 10 `ValueError: Cannot close a process
+# while it is still running` in 240 calls, one false "did not finish" on a child
+# that had already exited, and 28 `os.kill` calls on a pid that was no longer
+# ours. The first of those escapes as an exception from a function whose
+# docstring promises never to raise, and the last can signal an unrelated
+# process. Serialising removes the race itself rather than catching its
+# symptoms, and caps concurrent fork cost as a side effect.
+_PROBE_LOCK = threading.Lock()
+
+
+def _close_quietly(proc) -> None:
+    """`Process.close()`, which polls and so can still lose a `waitpid` race to
+    something outside this module. Releasing the handle is a courtesy; failing
+    to is not worth an exception from a refusal path."""
+    try:
+        proc.close()
+    except ValueError:
+        pass
+
 # One index row per reclassified posting; the journal is the record, so this
 # only keeps the index from disagreeing with it.
 _REINDEX_SQL = (
@@ -155,17 +194,55 @@ def _account_entity(account: str) -> str | None:
     return "hikmah" if ":hikmah:" in f"{account}:" else "personal"
 
 
-def _regex_probe_child(pattern: str, probes: tuple[str, ...]) -> None:
-    """Run every probe; exit 0 if all were quick, else `1 + the probe's index`.
+def _regex_probe_child(pattern: str, probes: tuple[str, ...], alarm_s: int) -> None:
+    """Run every probe and report through the exit code. Runs in a FORK of a
+    live API process.
 
-    The exit code IS the channel: a pipe would have to be drained by a parent
-    that may be about to kill this process, and a killed writer holding a full
-    pipe is a deadlock. An integer needs no draining.
+    **The rule for editing this function: it must not import, log, allocate a
+    lock, or use anything it inherited from the parent.** A fork carries the
+    parent's locks in whatever state the other threads left them, and the
+    threads that would release them do not exist here — so a `logger.info` on a
+    handler another thread held mid-emit deadlocks this process, and that is a
+    deadlock inside the code whose only purpose is not hanging. `re`,
+    `time.perf_counter`, `signal` and `os._exit` are the whole safe vocabulary.
+    (One inherited handle is already touched before this runs, by
+    `multiprocessing` itself: `_close_stdin` swaps the child's stdin for
+    `/dev/null`. That is its business, not ours.)
 
-    `os._exit`, not `return`: this is a fork of a live API process, and normal
-    interpreter shutdown here would flush buffers and run cleanup belonging to
-    the parent — including its database connections.
+    The exit code IS the channel: `_CODE_CRASHED` for a failure, `_CODE_SLOW +
+    index` for a probe over budget, 0 when every probe was quick. A pipe would
+    have to be drained by a parent that may be about to kill the writer, and a
+    killed writer holding a full pipe is a deadlock; an integer needs no
+    draining.
+
+    `os._exit` is NOT what stops interpreter shutdown — `popen_fork` already
+    wraps `_bootstrap` in `finally: os._exit(...)`, so the parent's `atexit`
+    handlers never run here either way. What this line actually skips is the
+    tail of `BaseProcess._bootstrap`, and specifically `util._flush_std_streams`:
+    the child holds a COPY of the parent's stdout/stderr buffers as they stood
+    at fork, and flushing them prints the parent's un-flushed output a second
+    time.
+
+    `signal.alarm` is the child's own deadline, and it exists because
+    `daemon=True` does not bound anything: daemon children are killed by
+    `util._exit_function`, an `atexit` handler, which a `SIGKILL`ed parent never
+    runs — measured, an orphan spun at 100% for 115 seconds after its parent
+    died. SIGALRM's default action terminates, so the bound lives in the process
+    that has to honour it rather than in one that may be gone.
     """
+    # The DISPOSITION is inherited state too, and a deadline that depends on the
+    # parent's is not a deadline. Measured: under pytest-timeout (which installs
+    # a SIGALRM handler) the alarm arrived as an ordinary Python exception, was
+    # caught by the `except` below, and reported itself as a crash instead of
+    # terminating. SIG_DFL is what makes the signal kill this process.
+    try:
+        signal.signal(signal.SIGALRM, signal.SIG_DFL)
+    except (ValueError, OSError):
+        # Only the main thread may set a disposition. `_bootstrap` has already
+        # made this one main, so this is the belt to that braces: the inherited
+        # handler still ends the process, just via the crash code.
+        pass
+    signal.alarm(alarm_s)
     code = 0
     try:
         compiled = re.compile(pattern, re.I)
@@ -173,10 +250,10 @@ def _regex_probe_child(pattern: str, probes: tuple[str, ...]) -> None:
             started = time.perf_counter()
             compiled.search(probe)
             if time.perf_counter() - started > _REGEX_BUDGET_S:
-                code = 1 + index
+                code = _CODE_SLOW + index
                 break
-    except Exception:  # noqa: BLE001 — anything going wrong here is a refusal
-        code = 1
+    except BaseException:  # noqa: BLE001 — MemoryError and friends included
+        code = _CODE_CRASHED
     os._exit(code)
 
 
@@ -192,41 +269,53 @@ def _regex_too_slow(pattern: str, kill_after: float = _REGEX_KILL_S) -> str | No
 
     Failure is a refusal, never an exception: a crashed or killed child means we
     could not establish that the pattern is safe, and an unestablished pattern
-    does not get written to a file the worker will read forever.
+    does not get written to a file the worker will read forever. That promise is
+    what `_PROBE_LOCK` is for — see the comment on it.
     """
     ctx = multiprocessing.get_context(
         "fork" if "fork" in multiprocessing.get_all_start_methods() else "spawn"
     )
-    proc = ctx.Process(target=_regex_probe_child, args=(pattern, _REGEX_PROBES), daemon=True)
-    with warnings.catch_warnings():
-        # Python 3.12 warns that forking a multi-threaded process can deadlock
-        # the child, and it is right in general: a child that takes a lock some
-        # other thread held at fork time waits for a thread that no longer
-        # exists. It does not apply to this child, which is why the warning is
-        # silenced HERE and nowhere else — `_regex_probe_child` imports nothing,
-        # logs nothing, touches no inherited handle, and leaves through
-        # `os._exit`, so the only lock in play is the GIL, which the forking
-        # thread holds and therefore carries into the child. `spawn` would avoid
-        # the question, at about a second of interpreter startup on a tool the
-        # user is waiting on.
-        warnings.simplefilter("ignore", DeprecationWarning)
-        proc.start()
-    proc.join(kill_after)
-    if proc.is_alive():
-        proc.kill()
-        proc.join()
-        proc.close()
-        return f"did not finish within {kill_after:g}s and had to be stopped"
-    code = proc.exitcode
-    proc.close()
+    proc = ctx.Process(
+        target=_regex_probe_child,
+        args=(pattern, _REGEX_PROBES, math.ceil(kill_after) + 1),
+        daemon=True,
+    )
+    with _PROBE_LOCK:
+        with warnings.catch_warnings():
+            # Python 3.12 warns that forking a multi-threaded process can
+            # deadlock the child, and it is right in general. It does not apply
+            # to this child, which is why the warning is silenced HERE and
+            # nowhere else: `_regex_probe_child`'s docstring carries the rule
+            # that keeps it true, and the reviewer ran 240 concurrent probes
+            # against threads spinning on a logging handler without one
+            # deadlocking. `spawn` would avoid the question, at about a second
+            # of interpreter startup on a tool the user is waiting on.
+            warnings.simplefilter("ignore", DeprecationWarning)
+            proc.start()
+        proc.join(kill_after)
+        # `exitcode`, not `is_alive()`: both poll, but this reads the value the
+        # decision is actually made on, so a poll that loses its race reports
+        # "still running" once rather than "alive" and then a stale code.
+        code = proc.exitcode
+        if code is None:
+            proc.kill()
+            proc.join()
+            code = proc.exitcode
+            _close_quietly(proc)
+            return f"did not finish within {kill_after:g}s and had to be stopped"
+        _close_quietly(proc)
     if code == 0:
         return None
-    if code is not None and 1 <= code <= len(_REGEX_PROBES):
-        probe = _REGEX_PROBES[code - 1]
+    if _CODE_SLOW <= code < _CODE_SLOW + len(_REGEX_PROBES):
+        probe = _REGEX_PROBES[code - _CODE_SLOW]
         return (
             f"took longer than {int(_REGEX_BUDGET_S * 1000)}ms on a "
             f"{len(probe)}-character test string"
         )
+    if code == -signal.SIGALRM:
+        # The child's own deadline fired, which means the parent's did not —
+        # an orphaned child bounding itself. Same answer, different enforcer.
+        return f"did not finish within {kill_after:g}s and had to be stopped"
     return f"could not be measured safely (the check exited {code})"
 
 

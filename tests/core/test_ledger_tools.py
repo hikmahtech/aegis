@@ -11,8 +11,11 @@ reason. Each refusal test therefore first proves the same call shape succeeds
 from __future__ import annotations
 
 import shutil
+import signal
 import subprocess
+import threading
 import time
+import warnings
 from datetime import date
 from decimal import Decimal
 from pathlib import Path
@@ -893,6 +896,92 @@ def test_the_regex_check_stops_a_pattern_that_never_finishes():
     assert elapsed < 20, elapsed
     # And a real rule still comes back clean through the same path.
     assert _regex_too_slow("mahavitaran.*suncity 501") is None
+
+
+def test_concurrent_regex_checks_never_raise():
+    """`_regex_too_slow` promises a refusal, never an exception, and it forks —
+    so it inherits `multiprocessing`'s shared reaping. Every `Process.start()`
+    runs `process._cleanup()`, which polls OTHER threads' process objects, and a
+    poll that loses its `waitpid` race leaves `Process.close()` raising
+    `ValueError: Cannot close a process while it is still running`. That escapes
+    `asyncio.to_thread` and out of `_exec_ledger_add_rule`, which has no
+    try/except — a raised exception in the chat loop is a failed turn.
+
+    Measured at concurrency 8 without serialisation: 10 raises in 240 calls.
+    """
+    from aegis.services.tools.ledger import _regex_too_slow
+
+    results: list[object] = []
+    errors: list[BaseException] = []
+
+    def _worker() -> None:
+        for _ in range(20):
+            try:
+                results.append(_regex_too_slow("mahavitaran.*suncity 501"))
+            except BaseException as exc:  # noqa: BLE001 — the thing under test
+                errors.append(exc)
+
+    threads = [threading.Thread(target=_worker) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(120)
+    assert not errors, errors[:3]
+    assert len(results) == 160
+    # Not merely "no exception" — every answer has to be the RIGHT one, or a
+    # race that silently reported a good pattern as slow would pass this.
+    assert all(r is None for r in results), [r for r in results if r is not None][:3]
+
+
+def test_a_crashed_probe_says_so_instead_of_blaming_the_pattern():
+    """`1` is reserved for a crash and is not a probe index. `_bootstrap`'s own
+    generic handler also exits 1, so sharing the code made a `MemoryError` — or
+    a broken spawn — report itself as a slow 9-character probe: a confident,
+    wrong diagnostic pointing at a performance problem that does not exist."""
+    from aegis.services.tools import ledger as ledger_mod
+
+    original = ledger_mod._REGEX_PROBES
+    # The child inherits this through the fork, and iterating None raises there.
+    ledger_mod._REGEX_PROBES = None
+    try:
+        reason = ledger_mod._regex_too_slow("mahavitaran.*suncity 501")
+    finally:
+        ledger_mod._REGEX_PROBES = original
+    assert reason is not None
+    assert "could not be measured" in reason, reason
+    assert "took longer" not in reason, reason
+
+
+def test_the_probe_child_bounds_itself_when_the_parent_is_gone():
+    """`daemon=True` bounds nothing on its own: it is enforced by
+    `multiprocessing.util._exit_function`, an `atexit` handler that a SIGKILLed
+    parent never runs. The child is then orphaned to PID 1 with no deadline —
+    measured, one spun at 100% for 115 seconds after its parent died.
+
+    So the child carries its own `signal.alarm`. This runs it with NO parent
+    supervision at all and requires it to die by SIGALRM regardless.
+    """
+    import multiprocessing
+
+    from aegis.services.tools import ledger as ledger_mod
+
+    ctx = multiprocessing.get_context("fork")
+    proc = ctx.Process(
+        target=ledger_mod._regex_probe_child,
+        args=("a*" * 40 + "$", ledger_mod._REGEX_PROBES, 2),
+        daemon=True,
+    )
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", DeprecationWarning)
+        proc.start()
+    try:
+        proc.join(30)
+        assert not proc.is_alive(), "the child outlived its own alarm"
+        assert proc.exitcode == -signal.SIGALRM, proc.exitcode
+    finally:
+        if proc.is_alive():
+            proc.kill()
+            proc.join()
 
 
 @pytest.mark.asyncio
