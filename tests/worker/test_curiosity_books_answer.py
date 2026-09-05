@@ -589,6 +589,98 @@ async def test_a_broken_checkout_still_banks_the_memory(clean_db, tmp_path):
     assert len(await _memories(clean_db)) == 1
 
 
+async def test_a_failure_after_the_rule_is_written_does_not_claim_otherwise(
+    clean_db, tmp_path, monkeypatch
+):
+    """"Nothing was written" has to be true when it is said.
+
+    `books_failed` covers everything the books half can throw, and it tells the
+    owner "The books would not take it — nothing was written." That is right
+    for a failed LLM call, an unreadable chart or a refused `append_rule`. It
+    is a LIE once `append_rule` has returned: the rule is committed and pushed,
+    it will file this payee's mail from now on, and the owner has just been
+    told it does not exist — on the one surface that exists because nothing
+    else reports this lane (the card is an abandoned child, the novelty key
+    stops the question being asked again).
+
+    The two tests above are the control: both fail BEFORE the rule is written
+    and both still say `books_failed`, so this is a split in the outcome, not a
+    renaming of it.
+    """
+    cfg = _repo(tmp_path)
+    msgid = await _post(clean_db, cfg)
+    llm = FakeLLM('{"account": "expenses:groceries", "confidence": 0.9}')
+    delivery = FakeDelivery()
+
+    async def boom(*_a, **_k):
+        raise books.BooksError("pull failed: the remote moved on")
+
+    monkeypatch.setattr(books, "rewrite_events", boom)
+
+    out = await _apply(clean_db, cfg, llm, delivery=delivery)
+
+    # The rule really is in the file — this is what makes the old sentence a lie.
+    rules = _rules(cfg)
+    assert len(rules) == 1 and rules[0]["account"] == "expenses:groceries", rules
+    assert out["recorded"] is True
+    assert out["rule"] == "expenses:groceries"
+    assert out["backlog_failed"] is True
+    assert out.get("reason") != "books_failed"
+
+    assert delivery.sent, "the owner was told nothing about a half-applied answer"
+    said = delivery.sent[0]
+    assert "nothing was written" not in said, said
+    assert "The rule is saved" in said and "could not be moved" in said, said
+
+    # ...and the backlog genuinely did not move, which is what it now says.
+    assert await _account_of(clean_db, msgid) == "expenses:unknown"
+    assert "expenses:unknown" in _journal(cfg)
+
+
+async def test_a_backlog_failure_with_no_rule_still_says_nothing_was_written(
+    clean_db, tmp_path, monkeypatch
+):
+    """The INVERSE lie, and the reason the split above is conditional.
+
+    `rule_match_for` returns "" for a payee key too long to turn into a safe
+    pattern, and then `append_rule` is never called. If the same failure were
+    reported the same way, the owner would be told the rule is saved when
+    nothing at all was written — the exact bug fixed above, pointing the other
+    way. So the handler re-raises when no rule was written, and the caller's
+    "nothing was written" sentence is correct again.
+
+    The over-long payee makes this reachable in production, not hypothetical:
+    it is the shape `test_a_refused_rule_still_applies_the_backlog` covers, one
+    failed pull later.
+    """
+    cfg = _repo(tmp_path)
+    msgid = await _post(clean_db, cfg, payee=LONG_PAYEE)
+    llm = FakeLLM('{"account": "expenses:groceries", "confidence": 0.9}')
+    delivery = FakeDelivery()
+
+    async def boom(*_a, **_k):
+        raise books.BooksError("pull failed: the remote moved on")
+
+    monkeypatch.setattr(books, "rewrite_events", boom)
+
+    out = await _apply(
+        clean_db,
+        cfg,
+        llm,
+        delivery=delivery,
+        meta=_meta(subject=LONG_PAYEE, payee_key=payee_key(LONG_PAYEE)),
+    )
+
+    # Nothing reached the file, so the generic sentence is the true one.
+    assert _rules_text(cfg).strip() == "", _rules_text(cfg)
+    assert out["recorded"] is True
+    assert out["rule"] is None
+    assert out["reason"] == "books_failed"
+    assert not out.get("backlog_failed")
+    assert delivery.sent and "nothing was written" in delivery.sent[0], delivery.sent
+    assert await _account_of(clean_db, msgid) == "expenses:unknown"
+
+
 # --------------------------------------------------------------- lane is gated
 
 

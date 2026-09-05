@@ -1050,7 +1050,7 @@
           },
           "entity": {
             "type": "string",
-            "description": "personal or hikmah \u2014 which set of books.",
+            "description": "personal or hikmah \u2014 which set of books. Every expense and income account already belongs to one of them (expenses:hikmah:* and income:hikmah:* are hikmah, any other is personal), so the entity has to agree with the accounts posted; asset, liability and equity accounts belong to both and fit either.",
             "default": "personal"
           },
           "note": {
@@ -1125,7 +1125,7 @@
           },
           "apply": {
             "type": "boolean",
-            "description": "also reclassify existing postings in an unknown account that match (default true). Existing postings are matched on their payee alone \u2014 the sender is not in the index.",
+            "description": "also reclassify existing postings in an unknown account that match (default true). They are matched exactly as future mail will be, against \"<sender> | <payee>\", so the count is the rule's real reach over the backlog; the reply says how many matched only because of the sender.",
             "default": true
           }
         },
