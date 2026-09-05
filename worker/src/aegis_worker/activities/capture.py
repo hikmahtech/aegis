@@ -252,6 +252,21 @@ class CaptureActivities:
                 "capture_due_skipped_zero_amount payee=%s due_on=%s", ev.payee, ev.due_on
             )
             return None
+        # A charge that takes itself is not a chore. Seen live 2026-09-05: four
+        # of seven bill tasks were autopay notices — Anthropic on Axis
+        # auto-debit, both Apple subscriptions, an AWS domain auto-renewal —
+        # and each mail said so in as many words. "Pay Apple Fitness+ ₹149.00"
+        # is a task nobody can act on. Only `due` is suppressed: a `failed`
+        # event means the automatic debit did NOT go through, and that is the
+        # backstop which makes dropping the reminder safe.
+        if ev.kind == "due" and ev.autopay:
+            activity.logger.info(
+                "capture_due_skipped_autopay payee=%s due_on=%s amount=%s",
+                ev.payee,
+                ev.due_on,
+                ev.amount,
+            )
+            return None
         # One bill, one task — even when two senders announce it. The dedupe
         # key below is the payee, but the same obligation routinely arrives
         # under two names: Google Pay mirrors a biller ("Axis Bank Credit Card

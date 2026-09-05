@@ -37,6 +37,26 @@ def currency_from(token: str) -> str | None:
     return _CURRENCY.get((token or "").strip().lower())
 
 
+# An email that says the money moves on its own. A due built from one is a
+# heads-up, not a chore — there is nothing for anyone to do, and if the debit
+# fails the bank says so in a separate mail that becomes a `failed` event with
+# its own task. Anchored on the phrasings the real mail uses: Axis autopay
+# notices ("Auto Pay", "auto debit payment is due"), Apple renewals
+# ("automatically renews monthly") and AWS ("scheduled to automatically
+# renew"). Deliberately NOT model-supplied — `_LLM_EVENT_FIELDS` must never
+# gain this, or a crafted body could silence a real bill.
+_AUTOPAY_RE = re.compile(
+    r"auto[\s-]?(?:pay|debit|renew)"
+    r"|automatic(?:ally)?[\s-]+(?:renew|debit|charg|pay)",
+    re.I,
+)
+
+
+def is_autopay(text: str) -> bool:
+    """True when the mail says the charge happens without the user acting."""
+    return bool(_AUTOPAY_RE.search(text or ""))
+
+
 def _date_dmy2(s: str) -> date:  # 02-09-26
     return datetime.strptime(s, "%d-%m-%y").date()
 

@@ -138,6 +138,42 @@ async def test_capture_due_ignores_a_zero_invoice(db_pool):
 
 
 @pytest.mark.asyncio
+async def test_capture_due_skips_a_charge_that_happens_by_itself(db_pool, monkeypatch):
+    """A charge that takes itself is not a chore.
+
+    Four of the seven bill tasks on 2026-09-05 were autopay notices — Anthropic
+    via Axis auto-debit, Apple Fitness+, Apple iCloud+ and an AWS domain
+    auto-renewal. Every one of them said in the mail that the money moves
+    without anyone acting, and "Pay Apple Fitness+ ₹149.00" is a chore nobody
+    can do. The event is still indexed and still reaches the brief.
+    """
+    await db_pool.execute("DELETE FROM todoist_capture_idempotency WHERE source_tag = '#bill'")
+    acts, connector = _acts(db_pool)
+    auto = {
+        **DUE, "payee": "Apple Fitness+", "payee_key": "apple fitness",
+        "amount": "149.37", "due_on": "2099-07-14", "autopay": True,
+    }
+    assert await ActivityEnvironment().run(acts.capture_due, auto, "m", "x") is None
+    connector.commands.assert_not_awaited()
+
+    # A failed automatic debit is exactly what DOES need a task — that is the
+    # backstop that makes suppressing the reminder safe.
+    monkeypatch.setattr(
+        "aegis.connectors.todoist.TodoistConnector.check_sync_status",
+        staticmethod(
+            lambda result, uuids: {
+                "ok": True, "retryable": False, "rejected_retryable": False,
+                "rejected": {}, "envelope_error": None,
+            }
+        ),
+    )
+    connector.commands = AsyncMock(return_value={"data": {"temp_id_mapping": {}}})
+    await ActivityEnvironment().run(acts.capture_due, {**auto, "kind": "failed"}, "m", "y")
+    connector.commands.assert_awaited()
+    assert connector.commands.await_args.args[0][0]["args"]["content"].startswith("Fix payment:")
+
+
+@pytest.mark.asyncio
 async def test_capture_due_skips_a_bill_another_sender_already_tasked(db_pool, monkeypatch):
     """One bill, one task, even when two senders announce it.
 

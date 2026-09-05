@@ -67,6 +67,14 @@ class MoneyEvent(BaseModel):
     category: str | None = None
     ref: str | None = None
     is_recurring: bool | None = None
+    # The mail says the money moves without anyone acting — an autopay notice,
+    # a subscription that renews itself. Set by the WRITER from the body text
+    # (`bank_parsers.is_autopay`), never by the model: `_LLM_EVENT_FIELDS` must
+    # not gain it, or a crafted body could silence a real bill. A due carrying
+    # this is a heads-up, not a chore, so `capture_due` indexes it without a
+    # task; a `failed` event still tasks, which is the backstop when an
+    # automatic debit does not go through.
+    autopay: bool = False
     parser: str = "llm"
     confidence: float = 1.0
     source_class: Literal["bank", "receipt", "other"] = "other"

@@ -14,7 +14,7 @@ import structlog
 from aegis.api.models.money import MoneyEvent, payee_key
 from aegis.services import books
 from aegis.services import journal_index as ji
-from aegis.services.bank_parsers import parse_any
+from aegis.services.bank_parsers import is_autopay, parse_any
 from aegis.services.books import UNKNOWN, account_for, instrument_account
 from aegis.services.fx import to_monthly_home
 from aegis.services.money_format import fmt_money
@@ -374,6 +374,13 @@ class MoneyActivities:
             received = datetime.fromisoformat(receipt["received_at"])
             ev.occurred_on = received.astimezone(ZoneInfo(self.home_tz)).date()
         ev.payee_key = payee_key(ev.payee)
+        # Does this mail say the money moves on its own? Read from the text
+        # here, where the body still exists — `capture_due` sees only the
+        # event. Deliberately NOT `ev.channel == "autopay"`: `channel` is in
+        # `_LLM_EVENT_FIELDS`, so a crafted body could claim it and silence a
+        # real bill's task. The deterministic autopay parsers need no such
+        # help — their own anchor phrases ("Upcoming AutoPay") match here.
+        ev.autopay = is_autopay(f"{subject}\n{body}")
         return ev.model_dump(mode="json")
 
     @staticmethod
