@@ -174,26 +174,6 @@ def _undeclared(account: str) -> str:
     )
 
 
-def _account_entity(account: str) -> str | None:
-    """Which set of books an account belongs to, or None when it belongs to
-    both.
-
-    Only the expense and income trees carry an entity — the business side is
-    the `:hikmah:` segment (`books._ACCOUNT_MAP`). Assets, liabilities and
-    equity are entity-NEUTRAL by design: `post_event` writes
-    `assets:bank:hdfc:1225` into both sets of books through
-    `instrument_account`, which has no notion of entity at all, and the chart
-    declares `equity:transfers` precisely for a move between one's own
-    accounts. Treating those as personal would refuse a real correction — a
-    hikmah posting moved onto the shared bank account — for no gain, since the
-    hazard the caller guards against (an `expenses:hikmah:*` posting filed in
-    `personal/2026.journal`) lives entirely in the two trees this does cover.
-    """
-    if not account.startswith(("expenses:", "income:")):
-        return None
-    return "hikmah" if ":hikmah:" in f"{account}:" else "personal"
-
-
 def _regex_probe_child(pattern: str, probes: tuple[str, ...], alarm_s: int) -> None:
     """Run every probe and report through the exit code. Runs in a FORK of a
     live API process.
@@ -509,7 +489,7 @@ async def _exec_ledger_reclassify(
     if located is None:
         return f"error: no journal block carries msgid {message_id}"
     filed_in = located.split("/")[0]
-    belongs_to = _account_entity(account)
+    belongs_to = books.account_entity(account)
     if belongs_to is not None and belongs_to != filed_in:
         return (
             f"error: {account} belongs to the {belongs_to} books but "
@@ -545,7 +525,7 @@ async def _exec_ledger_add_rule(
     Args:
         match: case-insensitive regex tested against "<sender> | <payee>".
         account: a declared account.
-        entity: personal or hikmah, optional.
+        entity: personal or hikmah. Optional — an expense or income account already says which set of books it belongs to, so leaving this out takes the account's own entity (expenses:hikmah:* and income:hikmah:* are hikmah, any other expense or income account is personal). Asset, liability and equity accounts belong to both, and a rule on one gets no entity.
         payee: canonical display name, optional.
         apply: also reclassify existing postings in an unknown account that match (default true). Existing postings are matched on their payee alone — the sender is not in the index.
     """
@@ -586,6 +566,16 @@ async def _exec_ledger_add_rule(
         return f"error: {exc}"
     if account not in declared:
         return _undeclared(account)
+    # An omitted entity is not "both books" — it is an unstated one, and the
+    # account itself states it. Without this default a caller can persist an
+    # `expenses:hikmah:*` rule with no entity, and every future mail from that
+    # payee then gets the hikmah account written into whichever journal the
+    # MAILBOX chose: `post_event` files by `event.entity`, which the rule never
+    # corrected. Same permanent drift `ledger_reclassify` refuses above, one
+    # door along. An explicit entity still wins — the caller may be filing a
+    # shared bank account's rule against one set of books.
+    if entity is None:
+        entity = books.account_entity(account)
 
     # Sanitized once, as in `ledger_post`: this name is written to the journal
     # by the rewrite below AND stored in the rule for every future event, so the

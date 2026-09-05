@@ -777,9 +777,12 @@ async def test_add_rule_applies_to_unknown_postings(db_pool, tmp_path):
     )
     assert out == "rule added; reclassified 1 postings"
     rules = books.load_rules(cfg.path / "rules" / "accounts.yaml")
+    # `entity` was not passed: an expense account states which set of books it
+    # belongs to, so the rule is stamped with it rather than left unstated.
     assert rules[-1] == {
         "match": f"jai shree {TOKEN}",
         "account": "expenses:groceries",
+        "entity": "personal",
         "payee": "Jai Shree Stores",
     }
     text = (cfg.path / "personal" / "2026.journal").read_text()
@@ -1034,6 +1037,69 @@ async def test_add_rule_skips_a_posting_in_the_other_entity(db_pool, tmp_path):
     )
     assert out == "rule added; reclassified 0 postings"
     assert (await ji.get(db_pool, "tool-t/c"))["account"] == "expenses:unknown"
+
+
+@pytest.mark.asyncio
+async def test_add_rule_defaults_the_entity_from_the_account(db_pool, tmp_path):
+    """An omitted entity is an unstated one, not "both books".
+
+    Left unstated, an `expenses:hikmah:*` rule writes the business account into
+    whichever journal the MAILBOX picked — `post_event` files by
+    `event.entity`, which the rule never corrected — so every future mail from
+    that payee repeats it, silently and unattended. It is the same permanent
+    drift `test_reclassify_refuses_to_cross_entities` covers, one door along,
+    and this door is the one a model can walk through by simply omitting an
+    optional argument.
+    """
+    cfg = _repo(tmp_path)
+    (cfg.path / "accounts.journal").write_text(ACCOUNTS + "account expenses:hikmah:saas\n")
+    subprocess.run(
+        ["git", "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qam", "chart"],
+        cwd=cfg.path,
+        check=True,
+    )
+    ctx = _ctx(cfg)
+    ev = _unknown_event()  # entity=personal
+    await books.post_event(ev, "tool-t/g", cfg)
+    await ji.upsert(db_pool, "tool-t/g", "tool-t", ev, journal_file="personal/2026.journal")
+
+    out = await _exec_ledger_add_rule(
+        db_pool, {"match": f"jai shree {TOKEN}", "account": "expenses:hikmah:saas"}, ctx
+    )
+
+    assert out == "rule added; reclassified 0 postings"
+    rules = books.load_rules(cfg.path / "rules" / "accounts.yaml")
+    assert rules[-1]["entity"] == "hikmah", rules[-1]
+    # The personal block and its index row are untouched — the derived entity
+    # reaches the sweep, not just the file.
+    assert (await ji.get(db_pool, "tool-t/g"))["account"] == "expenses:unknown"
+    assert "expenses:hikmah:saas" not in (cfg.path / "personal" / "2026.journal").read_text()
+
+    # An entity-NEUTRAL account (assets, liabilities, equity) belongs to both
+    # sets of books, so it is stamped with neither. `post_event` writes
+    # `assets:*` into both through `instrument_account`, which has no notion of
+    # entity at all, and stamping one would refuse a real correction.
+    await _exec_ledger_add_rule(
+        db_pool,
+        {"match": f"neutral {TOKEN}", "account": "assets:unknown", "apply": False},
+        ctx,
+    )
+    rules = books.load_rules(cfg.path / "rules" / "accounts.yaml")
+    assert "entity" not in rules[-1], rules[-1]
+
+    # An explicit entity still wins over the derived one.
+    await _exec_ledger_add_rule(
+        db_pool,
+        {
+            "match": f"explicit {TOKEN}",
+            "account": "expenses:hikmah:saas",
+            "entity": "personal",
+            "apply": False,
+        },
+        ctx,
+    )
+    rules = books.load_rules(cfg.path / "rules" / "accounts.yaml")
+    assert rules[-1]["entity"] == "personal", rules[-1]
 
 
 @pytest.mark.asyncio

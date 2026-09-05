@@ -104,6 +104,31 @@ def account_for(category: str | None, direction: str | None, entity: str) -> str
     return UNKNOWN[ent][side]
 
 
+def account_entity(account: str) -> str | None:
+    """Which set of books an account belongs to, or None when it belongs to
+    both.
+
+    Only the expense and income trees carry an entity — the business side is
+    the `:hikmah:` segment (`_ACCOUNT_MAP`). Assets, liabilities and equity are
+    entity-NEUTRAL by design: `post_event` writes `assets:bank:hdfc:1225` into
+    both sets of books through `instrument_account`, which has no notion of
+    entity at all, and the chart declares `equity:transfers` precisely for a
+    move between one's own accounts. Treating those as personal would refuse a
+    real correction — a hikmah posting moved onto the shared bank account —
+    for no gain, since the hazard the callers guard against (an
+    `expenses:hikmah:*` posting filed in `personal/2026.journal`) lives
+    entirely in the two trees this does cover.
+
+    Three callers rely on it and all three guard the same hazard from a
+    different door: `ledger_reclassify` refuses a cross-entity move,
+    `ledger_add_rule` defaults an omitted `entity`, and the curiosity answer
+    hook stamps the rule it writes with no human in the loop at all.
+    """
+    if not account.startswith(("expenses:", "income:")):
+        return None
+    return "hikmah" if ":hikmah:" in f"{account}:" else "personal"
+
+
 def instrument_account(
     instrument: str | None, declared: set[str] | frozenset[str] = frozenset()
 ) -> str:
@@ -417,7 +442,15 @@ def load_rules(path: Path) -> list[dict]:
 
 
 def apply_rules(rules: list[dict], sender: str, payee: str) -> dict | None:
-    haystack = f"{sender or ''} | {payee or ''}"
+    # `|` is the SEPARATOR between the two halves, so it is stripped out of
+    # both of them before they are joined. The generated payee rules anchor on
+    # the payee half with `\|[^|]*`, which assumes exactly one pipe in the
+    # haystack — and a From display name may carry a literal one
+    # (`"Google Pay | Bills" <noreply@…>`), which would put the anchor's
+    # `[^|]*` inside the SENDER and re-open the sender-matching hole the anchor
+    # closes. No hand-written rule can want a literal pipe either: in a regex
+    # it means alternation, not the character.
+    haystack = f"{(sender or '').replace('|', ' ')} | {(payee or '').replace('|', ' ')}"
     for rule in rules:
         try:
             if re.search(str(rule["match"]), haystack, re.I):

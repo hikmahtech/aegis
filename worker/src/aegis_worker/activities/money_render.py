@@ -204,9 +204,14 @@ def render_money_brief(brief: dict, home_symbol: str = "₹") -> dict:
             tail = f" · {amount} · "
             html.append(f"{u['occurred_on']} · {escape(payee)}{tail}{escape(channel)}")
             md.append(f"- {u['occurred_on']} · {payee}{tail}{channel}")
-        hint = 'Reply with "<payee> is <account>" or use ledger_add_rule.'
-        html += [escape(hint), ""]
-        md += [hint, ""]
+        # Bulleted and backticked in Markdown, and BOTH halves matter. Left
+        # unbulleted the line is a lazy continuation of the last unexplained
+        # bullet, so GitHub renders it INSIDE that list item; left bare the
+        # placeholders are HTML tags to CommonMark and the only "how to fix
+        # this" sentence in the whole report comes out as `Reply with " is "`.
+        # This report is committed to the books repo every week.
+        html += [escape('Reply with "<payee> is <account>" or use ledger_add_rule.'), ""]
+        md += ["- Reply with `<payee> is <account>`, or use `ledger_add_rule`.", ""]
 
     if brief.get("closed_dues"):
         html.append("<b>Paid this week</b>")

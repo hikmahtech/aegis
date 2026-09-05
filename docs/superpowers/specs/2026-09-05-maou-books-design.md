@@ -503,7 +503,14 @@ called "Google" would re-file and rename every Google-Pay-mirrored bill. It
 then rewrites every outbound `:unknown` index row for that `payee_key` in
 ONE commit (`rewrite_events`, not a `rewrite_block` loop, which would hold
 the flock for the length of the sweep and leave one commit per posting);
-otherwise the answer stays in `agent_memory` as today. Two refusals matter.
+otherwise the answer stays in `agent_memory` as today. The rule carries the
+`entity` the account states (`books.account_entity`: only the expense and
+income trees have one, and `:hikmah:` is the business side), and the sweep is
+filtered on it, because a rewrite changes the account and never the file the
+block lives in — so an AWS bill that arrived in the personal mailbox and is
+answered "Hikmah infra" must leave `personal/2026.journal` alone and correct
+only the FUTURE mail. Both ledger tools refuse the same move. Two refusals
+matter.
 The account is model-chosen and NOT trusted: one the chart does not declare
 is dropped, because a rule built on it would misfile that payee's mail
 forever. And a payee whose pattern would breach the regex bounds gets NO
@@ -534,9 +541,15 @@ thin wrapper passing the Inbox id and no date). Same
 - `due_date` = `due_on - 1 day`, or today if that is past. No GTD state label
   (the date surfaces it).
 - `close_due_if_paid`: when a `transaction` is posted whose `payee_key`
-  matches an open `#bill` capture with the same `due_on` within 45 days and an
-  amount within 1%, complete the task through the outbox
-  (`item_complete`), and note it in the brief.
+  matches an open due with the same `due_on` within 45 days and an amount
+  within 1%, complete its task through the outbox (`item_complete`), mark the
+  due paid, and note it in the brief. Open is `linked_message_id IS NULL` and
+  nothing else. `capture_due` withholds the task for a zero invoice, a twin
+  already tasked under another payee's name and an autopay notice, and all
+  three are still indexed as dues — so a due with no task ref closes exactly
+  the same way, the task completion alone being skipped. Requiring a task ref
+  would make every guarded due permanently open, and "dues open" is a count
+  that could then only rise.
 
 ### 7.2 Weekly brief: `MoneyBriefFlow`
 
@@ -553,8 +566,8 @@ before `gtd-weekly-review` at `0 3:30`). Steps:
    - `reg -X ₹ -p "last 7 days" expenses --sort-amount` top 10 outflows;
    - unknowns: index rows in `*:unknown` in the last 7 days;
    - dues: index rows `kind IN ('due','failed')` with `due_on` in the next 14
-     days and open `todoist_ref`, plus `reg --forecast=<today>..<+14d>` from
-     `recurring.journal`;
+     days and still unpaid (`linked_message_id IS NULL`), plus
+     `reg --forecast=<today>..<+14d>` from `recurring.journal`;
    - large unexplained: unknown-account rows ≥ ₹5,000;
    - housekeeping: `unpushed_commits()`, rows with `parser='llm'` and
      `confidence < 0.8` count.

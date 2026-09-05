@@ -721,6 +721,16 @@ Both statements skip an agent that already has the grant, so they are safe to
 re-run. The admin **Agents → Behavior** tab does the same thing by hand. Core
 reads `tool_set` per request, so no restart is needed.
 
+**The persona is a second database write.** Granting the tools does not tell
+Maou they exist. Her prompt is the `agent_personalities` row, and
+`personalities/maou/*.md` in this repo only seeds it on a deployment's first
+boot — so an existing deployment still describes the v1 subscription tracker
+this release deleted, and describes no books, no journal and no ledger tool.
+Copy the updated `personalities/maou/SOUL.md` into the **soul** document on the
+admin **Agents → Maou** page (or `PUT /api/admin/agents/maou/personality`).
+Without it she has four tools she has never been told about, and the model
+picks them up only if a message happens to name one.
+
 ## Chat
 
 Pandora's infra tools work against registry clusters by slug:

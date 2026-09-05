@@ -1113,7 +1113,7 @@
           },
           "entity": {
             "type": "string",
-            "description": "personal or hikmah, optional."
+            "description": "personal or hikmah. Optional \u2014 an expense or income account already says which set of books it belongs to, so leaving this out takes the account's own entity (expenses:hikmah:* and income:hikmah:* are hikmah, any other expense or income account is personal). Asset, liability and equity accounts belong to both, and a rule on one gets no entity."
           },
           "payee": {
             "type": "string",

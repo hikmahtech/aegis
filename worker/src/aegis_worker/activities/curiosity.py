@@ -646,12 +646,28 @@ class CuriosityActivities:
         # sitting in `:unknown` reaches the account the owner just explained
         # and only FUTURE events from this payee miss out. That is the cost the
         # cap is meant to buy.
+
+        # Which books the answer names. Both ledger tools already refuse the
+        # cross-entity move this would otherwise make unattended: an AWS bill
+        # arrives in the personal mailbox, the owner says "that is the Hikmah
+        # infra bill", and `expenses:hikmah:infra` is declared and balances —
+        # so `check --strict` passes and nothing reverts, while the block sits
+        # in `personal/2026.journal` and the entity-less rule repeats it for
+        # every future AWS mail (`post_event` files by `event.entity`, which
+        # the rule never corrected). `ledger_reclassify` then REFUSES to move
+        # it back, so the repair path is narrower than the path that made it.
+        # None means an entity-neutral account (assets, liabilities, equity),
+        # which belongs to both sets of books — no stamp and no filter.
+        entity = books.account_entity(account)
+
         match = rule_match_for(key)
         if match:
             # Sanitized once: this name is stored in the rule and written into
             # every future block for this payee, so the rule, the journal and
             # the index have to carry the same string.
             rule = {"match": match, "account": account, "payee": books.sanitize_payee(payee)}
+            if entity:
+                rule["entity"] = entity
             await books.append_rule(rule, cfg)
 
         rows = await self.db_pool.fetch(
@@ -661,8 +677,12 @@ class CuriosityActivities:
             # a credit from the same name (a refund, a transfer back) is not
             # what they explained and must not be filed to an expense account.
             "WHERE payee_key = $1 AND kind = 'transaction' AND direction = 'out' "
-            "AND account LIKE '%:unknown' AND journal_file IS NOT NULL",
+            "AND account LIKE '%:unknown' AND journal_file IS NOT NULL "
+            # And only the books the account belongs to: rewriting in place
+            # changes the account, never the file the block lives in.
+            "AND ($2::text IS NULL OR entity = $2)",
             key,
+            entity,
         )
         msgids = [r["message_id"] for r in rows]
         # ONE write for the whole backlog: one flock, one pull, one strict

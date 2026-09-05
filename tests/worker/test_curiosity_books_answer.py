@@ -52,6 +52,7 @@ account assets:bank:hdfc:1225
 account assets:unknown
 account expenses:unknown
 account expenses:groceries
+account expenses:hikmah:unknown
 account income:unknown
 """
 
@@ -181,6 +182,29 @@ async def _post(pool, cfg: books.BooksConfig, payee: str = PAYEE, day: int = 2) 
     return msgid
 
 
+async def _post_hikmah(pool, cfg: books.BooksConfig, day: int = 2) -> str:
+    """The same payee in the OTHER set of books, in `hikmah/2026.journal`."""
+    ev = _event(day=day)
+    ev.entity = "hikmah"
+    ev.account = "expenses:hikmah:unknown"
+    msgid = ji.msgid_for(MAILBOX, uuid4().hex)
+    rel = await books.post_event(ev, msgid, cfg)
+    assert rel.startswith("hikmah/"), rel
+    await ji.upsert(pool, msgid, MAILBOX, ev, journal_file=rel)
+    return msgid
+
+
+def _declare(cfg: books.BooksConfig, account: str) -> None:
+    """Add one account to the chart and commit it, so a clean checkout has it."""
+    path = cfg.path / "accounts.journal"
+    path.write_text(path.read_text() + f"account {account}\n")
+    subprocess.run(
+        ["git", "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qam", "chart"],
+        cwd=cfg.path,
+        check=True,
+    )
+
+
 async def _card(pool) -> str:
     row = await pool.fetchrow(
         "INSERT INTO interactions (flow_run_id, agent_id, kind, origin, prompt, status) "
@@ -246,6 +270,9 @@ async def test_confident_answer_writes_a_rule_and_reclassifies_the_backlog(clean
     assert len(rules) == 1, rules
     assert rules[0]["account"] == "expenses:groceries"
     assert rules[0]["payee"] == PAYEE
+    # The account states which set of books it belongs to, so the rule says so
+    # too — see `test_a_business_account_never_rewrites_the_personal_books`.
+    assert rules[0]["entity"] == "personal"
     assert books.apply_rules(rules, "alerts@hdfcbank.net", PAYEE) == rules[0]
 
     # The journal block itself moved — this is the record, not the index.
@@ -258,6 +285,75 @@ async def test_confident_answer_writes_a_rule_and_reclassifies_the_backlog(clean
 
     # The answer is still banked as memory, as it was before the books lane.
     assert len(await _memories(clean_db)) == 1
+
+
+async def test_a_business_account_never_rewrites_the_personal_books(clean_db, tmp_path):
+    """The unattended twin of `ledger_reclassify`'s cross-entity refusal.
+
+    Live shape: AWS bills arrive in the personal mailbox, so they are
+    `entity=personal` in `personal/2026.journal`. The card asks about them, the
+    owner says "that is the Hikmah infra bill", and the model returns a
+    declared `expenses:hikmah:*`. Every check downstream passes — the account
+    is in the chart and each block still balances, so `check --strict` is happy
+    and nothing reverts — and the business account is now sitting in the
+    personal journal. `ledger_reclassify` then REFUSES to move it back, so the
+    repair path is narrower than the path that made the mess.
+
+    Two things have to hold: the sweep leaves the other set of books alone, and
+    the rule carries the entity so `post_event` files FUTURE mail from this
+    payee in the right journal instead of repeating this forever.
+    """
+    cfg = _repo(tmp_path)
+    _declare(cfg, "expenses:hikmah:infra")
+    msgid = await _post(clean_db, cfg)  # entity=personal
+    llm = FakeLLM('{"account": "expenses:hikmah:infra", "confidence": 0.95}')
+
+    out = await _apply(clean_db, cfg, llm)
+
+    assert out["rule"] == "expenses:hikmah:infra"
+    assert out["reclassified"] == 0, "a personal block was rewritten to a business account"
+    assert out["failed"] == 0
+    # The journal is the record: the personal block is exactly as it was.
+    assert "expenses:hikmah:infra" not in _journal(cfg)
+    assert "expenses:unknown" in _journal(cfg)
+    assert await _account_of(clean_db, msgid) == "expenses:unknown"
+    # And the rule stops the next AWS mail repeating it.
+    assert _rules(cfg)[0]["entity"] == "hikmah"
+
+
+async def test_the_sweep_stays_inside_the_account_s_own_books(clean_db, tmp_path):
+    """Same payee, one posting in each set of books, and a personal account
+    answered. Only the personal one moves — rewriting changes the account, never
+    the file the block lives in."""
+    cfg = _repo(tmp_path)
+    mine = await _post(clean_db, cfg)
+    theirs = await _post_hikmah(clean_db, cfg)
+    llm = FakeLLM('{"account": "expenses:groceries", "confidence": 0.9}')
+
+    out = await _apply(clean_db, cfg, llm)
+
+    assert out["reclassified"] == 1
+    assert await _account_of(clean_db, mine) == "expenses:groceries"
+    assert await _account_of(clean_db, theirs) == "expenses:hikmah:unknown"
+    assert "expenses:groceries" not in (cfg.path / "hikmah" / "2026.journal").read_text()
+
+
+async def test_an_entity_neutral_account_sweeps_both_books(clean_db, tmp_path):
+    """Assets, liabilities and equity belong to BOTH sets of books —
+    `post_event` writes `assets:*` into either through `instrument_account`,
+    which has no notion of entity — so neither the rule nor the sweep may
+    narrow to one. Stamping them personal would refuse a real correction."""
+    cfg = _repo(tmp_path)
+    mine = await _post(clean_db, cfg)
+    theirs = await _post_hikmah(clean_db, cfg)
+    llm = FakeLLM('{"account": "assets:unknown", "confidence": 0.9}')
+
+    out = await _apply(clean_db, cfg, llm)
+
+    assert out["reclassified"] == 2, out
+    assert await _account_of(clean_db, mine) == "assets:unknown"
+    assert await _account_of(clean_db, theirs) == "assets:unknown"
+    assert "entity" not in _rules(cfg)[0], _rules(cfg)[0]
 
 
 async def test_the_prompt_carries_the_declared_chart_and_is_billed(clean_db, tmp_path):

@@ -23,24 +23,6 @@ from temporalio import activity
 from aegis_worker.activities import money_render
 from aegis_worker.activities.delivery import safe_send_message
 
-# Display symbol for digest rendering, keyed by ISO currency code. Unknown
-# codes fall back to "<CODE> " (e.g. "CHF ") via _symbol() below.
-_CURRENCY_SYMBOL = {
-    "INR": "₹",
-    "USD": "$",
-    "EUR": "€",
-    "GBP": "£",
-    "JPY": "¥",
-    "SGD": "S$",
-    "AUD": "A$",
-    "CAD": "C$",
-}
-
-
-def _symbol(code: str) -> str:
-    """Digest currency symbol for `code`, or "<CODE> " if unmapped."""
-    return _CURRENCY_SYMBOL.get(code, f"{code} ")
-
 
 def _format_agent_persona(persona: dict) -> str | None:
     """Render soul + user kinds from a get_personality() dict, or None if empty.
@@ -575,7 +557,12 @@ class MoneyActivities:
             )
             if due is not None:
                 closed = True
-                if self.capture is not None:
+                # No task ref means `capture_due` indexed the due and withheld
+                # the Todoist task — a zero invoice, a twin under another
+                # payee's name, or an autopay notice. There is nothing to
+                # close, so closing is not a precondition for marking it paid;
+                # requiring one is what kept those dues open forever.
+                if self.capture is not None and due["todoist_ref"]:
                     closed = await self.capture.complete_captured_task(due["todoist_ref"])
                 # Only mark it paid once the task is actually closed — that is
                 # what takes the due out of find_open_due, so marking on a
@@ -908,8 +895,8 @@ class MoneyActivities:
     # Rendering is a pure function in `money_render`; these thin activities
     # exist so a workflow can reach it without importing it into the sandbox.
     #
-    # `HOME_SYMBOL`, not `_symbol(self.home_currency)`: it is the commodity
-    # `build_money_brief` hands to `hledger -X`, so it is the one
+    # `HOME_SYMBOL`, not a symbol derived from `self.home_currency`: it is the
+    # commodity `build_money_brief` hands to `hledger -X`, so it is the one
     # `unconverted_commodities` measured against. Naming a different currency
     # in the "no exchange rate for …" caveat would describe a conversion that
     # never ran.

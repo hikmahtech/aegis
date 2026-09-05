@@ -137,14 +137,34 @@ def test_brief_markdown_bullets_every_standalone_line():
     assert "- Personal: in ₹1,500.00 · out ₹6,250.00" in md
     assert "- Hikmah: in ₹1,00,000.00 · out ₹262.30" in md
     assert "- 2 unpushed commits · 1 low-confidence LLM postings" in md
-    # Nothing in the body is left as a bare line that would glue to its neighbour.
+    # Nothing in the body is left as a bare line that would glue to its
+    # neighbour. What may FOLLOW a line without folding into it is fixed by
+    # CommonMark: a heading, a list item and a fence all interrupt a
+    # paragraph, and everything else is a lazy continuation. A bullet is NOT
+    # exempt as the FIRST line of the pair — a bare line after a bullet is
+    # folded into that list item, which is exactly how the "<payee> is
+    # <account>" hint came to render inside the last unexplained row. The old
+    # `-` exemption here made this sweep blind to the one defect it was
+    # written to catch.
     body = md.split("\n")
     glued = [
         (a, b)
         for a, b in zip(body, body[1:], strict=False)
-        if a and b and not a.startswith(("#", "-", "`", "_", "*")) and not b.startswith(("#", "`"))
+        if a and b and not a.startswith(("#", "`")) and not b.startswith(("#", "-", "`"))
     ]
     assert glued == []
+
+
+def test_brief_markdown_hint_is_a_bullet_with_backticked_placeholders():
+    """The only "how to fix this" sentence in the report, and it is committed
+    to the books repo every week. Unbulleted it is a lazy continuation of the
+    last unexplained row and renders INSIDE it; unbackticked, CommonMark takes
+    `<payee>` and `<account>` for HTML tags and drops them, leaving
+    `Reply with " is "`."""
+    md = render_money_brief(BRIEF)["markdown"]
+    assert "- Reply with `<payee> is <account>`, or use `ledger_add_rule`." in md
+    # The raw placeholders never reach the Markdown outside a code span.
+    assert '"<payee> is <account>"' not in md
 
 
 def test_brief_without_books():
