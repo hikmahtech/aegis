@@ -129,6 +129,39 @@ async def test_mark_due_paid_leaves_the_payment_link_alone(db_pool):
 
 
 @pytest.mark.asyncio
+async def test_find_open_due_prefers_the_tasked_row(db_pool):
+    """When two open dues tie, the one with a Todoist task wins.
+
+    Admitting untasked dues (so `capture_due`'s noise guards stop leaving them
+    unclosable) created a tie that could not happen before: one biller mailing
+    the same bill twice gives a tasked row AND a twin-suppressed one with the
+    same `payee_key`, amount and `due_on`, so `abs(due_on - around)` cannot
+    separate them. A payment closes exactly ONE due, so picking the untasked
+    row would leave the tasked one open with a Todoist task nothing ever
+    completes — a worse failure than the one the guard removal fixed.
+
+    The untasked row is inserted FIRST on purpose: without the explicit
+    `(todoist_ref IS NULL)` key, a seq scan returns insertion order and would
+    hand back exactly the wrong row here.
+    """
+    due = MoneyEvent(kind="due", direction="out", amount=Decimal("500.00"), currency="INR",
+                     payee="Mahavitaran", payee_key="mahavitaran", channel="statement",
+                     due_on=date(2026, 9, 7), entity="personal", parser="msedcl_bill",
+                     source_class="bank")
+    await ji.upsert(db_pool, "ji-due/twin", "arshad-personal", due)
+    await ji.upsert(db_pool, "ji-due/tasked", "arshad-personal", due, todoist_ref="task-7")
+
+    hit = await ji.find_open_due(db_pool, "mahavitaran", Decimal("500.00"), "INR", date(2026, 9, 6))
+    assert hit is not None and hit["message_id"] == "ji-due/tasked", hit["message_id"]
+
+    # Once the tasked one is paid, the twin is next in line — it is open, not
+    # invisible, which is the whole point of admitting untasked dues.
+    await ji.mark_due_paid(db_pool, "ji-due/tasked", "ji-pay/x")
+    hit = await ji.find_open_due(db_pool, "mahavitaran", Decimal("500.00"), "INR", date(2026, 9, 6))
+    assert hit is not None and hit["message_id"] == "ji-due/twin"
+
+
+@pytest.mark.asyncio
 async def test_find_open_due_tolerance_and_window(db_pool):
     due = MoneyEvent(kind="due", direction="out", amount=Decimal("100308.53"), currency="INR",
                      payee="Axis credit card XX13", payee_key="axis credit card xx13",
