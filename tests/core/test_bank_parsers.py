@@ -297,3 +297,32 @@ def test_is_autopay_reads_the_phrasings_real_mail_uses():
     assert not is_autopay("Bill Amount: Rs. 55275.34 Due Date: Aug 4, 2026 Pay Now")
     assert not is_autopay("Your electricity bill for August is ready. Pay by 11-08-2026")
     assert not is_autopay("")
+
+
+def test_is_autopay_is_false_when_the_mail_says_autopay_is_off():
+    """The phrase can carry the opposite meaning, and that is a real bill.
+
+    Caught in prod minutes after the first version shipped: GitHub's monthly
+    bill says "auto-pay for recurring payments is currently disabled for your
+    account due to the new RBI regulation" — autopay words, autopay switched
+    OFF, $4.00 somebody has to pay by hand. The two mistakes do not cost the
+    same: a phantom task is noise, a suppressed bill is a missed payment, so
+    anything negated stays a chore.
+    """
+    from aegis.services.bank_parsers import is_autopay
+
+    assert not is_autopay(
+        "Your bill for usage on GitHub is available to pay. Bill amount: $4.00 "
+        "Payment due by September 2, 2026. Please note that auto-pay for recurring "
+        "payments is currently disabled for your account due to the new RBI regulation."
+    )
+    assert not is_autopay("We have turned off auto-renew for this subscription")
+    assert not is_autopay("automatic payment is not enabled on your account")
+
+    # "until cancelled" is subscription boilerplate, NOT a statement that
+    # autopay is off — Apple's iCloud+ renewal notice carries it verbatim and
+    # must stay suppressed.
+    assert is_autopay(
+        "your 200 GB storage plan automatically renews monthly for Rs 219 starting "
+        "2026-08-06 12:53:33 America/Los_Angeles until cancelled"
+    )
