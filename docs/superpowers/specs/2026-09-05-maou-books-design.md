@@ -222,12 +222,17 @@ account.
 written before the field existed means. Give it when the same name moves money
 both ways and the two belong in different accounts — a person you both pay and
 are paid by — so a payment is not filed into the income account you picked for
-a credit. It is never inferred from the account: a refund credited back to
-`expenses:shopping` is a legitimate inbound posting, and an `assets:*` or
-`equity:transfers` rule has to match a transfer moving either way. The
-curiosity answer hook is the exception and always stamps one, because it knows
-which way the card asked and no human reviews what it writes. A rule whose
-`direction` is neither value is skipped on load, with a warning naming it.
+a credit. It is never inferred from the account, because an account says what
+a posting is *for*, not which way the money went. The chart says so itself:
+`equity:transfers` is declared "between own accounts when the far side is
+unknown", and a transfer moves either way; `post_event` writes `assets:*` and
+`liabilities:card:*` through `instrument_account`, which has no notion of
+direction at all. Inferring `out` from an expense account would also be a mass
+silent narrowing — 26 of the 28 rules in the live file point at `expenses:*`,
+and not one of their authors asked for a direction. The curiosity answer hook
+is the exception and always stamps one, because it knows which way the card
+asked and no human reviews what it writes. A rule whose `direction` is neither
+value is skipped on load, with a warning naming it.
 
 The initial file ships with the rules that follow directly from the evidence
 gathered on 2026-09-05 (AWS, Google Workspace, Airtel Xstream, Eleven Labs,

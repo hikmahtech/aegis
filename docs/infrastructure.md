@@ -719,11 +719,14 @@ Three behaviours are worth knowing before you use them.
   existed means. Reach for it when the same name moves money both ways and the
   two belong in different accounts — a person you both pay and are paid by —
   so a payment is not filed into the income account you picked for a credit.
-  It is never derived from the account: a refund credited back to
-  `expenses:shopping` is a legitimate inbound posting, and a transfer rule on
-  `assets:*` has to match both ways. The curiosity answer hook always stamps
-  one, because it knows which way its card asked and nobody reviews what it
-  writes.
+  It is never derived from the account, because an account says what a posting
+  is *for*, not which way the money went. The chart says so itself:
+  `equity:transfers` is declared "between own accounts when the far side is
+  unknown", and a transfer moves either way. Deriving `out` from an expense
+  account would also narrow 26 of the 28 rules in the live file at a stroke,
+  none of whose authors asked for it. The curiosity answer hook is the
+  exception and always stamps one, because it knows which way its card asked
+  and nobody reviews what it writes.
 - **One sweep is capped at 200 postings**, written as a single commit. Past that
   the tool asks to be run again rather than rewriting the whole backlog in one
   unreviewable change.

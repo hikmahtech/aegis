@@ -1109,12 +1109,17 @@ async def test_add_rule_never_infers_a_direction_from_the_account(db_pool, tmp_p
 
     The two look alike and are not. An entity is a property of the ACCOUNT —
     `expenses:hikmah:*` is hikmah by definition — so deriving it states a fact
-    the account already carries. A direction is a property of the EVENT: a
-    refund credited back to `expenses:shopping` is a legitimate inbound
-    posting to an expense account, and an `assets:*` or `equity:transfers` rule
-    has to match a transfer moving either way. Deriving `out` from an expense
-    account would silently narrow every such rule and stop it matching the
-    refunds it matches today.
+    the account already carries. An account never says which way the money
+    went, only what the posting is for.
+
+    The chart says as much: `equity:transfers` is declared "between own
+    accounts when the far side is unknown", and `post_event` writes `assets:*`
+    and `liabilities:card:*` through `instrument_account`, which has no notion
+    of direction at all — so a rule on one of those has to match both ways.
+    That is the case asserted below, on `assets:unknown`. Deriving `out` from
+    an expense account would also be a mass silent narrowing: 26 of the 28
+    rules in the live file point at `expenses:*` and none of their authors
+    asked for a direction.
     """
     cfg = _repo(tmp_path)
     ctx = _ctx(cfg)
@@ -1130,6 +1135,22 @@ async def test_add_rule_never_infers_a_direction_from_the_account(db_pool, tmp_p
     for way in ("out", "in", None):
         assert books.apply_rules(
             [rules[-1]], "", f"Undirected {TOKEN}", direction=way
+        ) == rules[-1], way
+
+    # The account the docstring rests on: `assets:unknown` is what
+    # `instrument_account` returns for a receipt with no known paying
+    # instrument, it belongs to BOTH sets of books, and money moves against it
+    # in both directions. A derived direction would half-blind this rule.
+    await _exec_ledger_add_rule(
+        db_pool,
+        {"match": f"neutral {TOKEN}", "account": "assets:unknown", "apply": False},
+        ctx,
+    )
+    rules = books.load_rules(cfg.path / "rules" / "accounts.yaml")
+    assert "direction" not in rules[-1] and books.account_entity("assets:unknown") is None
+    for way in ("out", "in"):
+        assert books.apply_rules(
+            [rules[-1]], "", f"Neutral {TOKEN}", direction=way
         ) == rules[-1], way
 
     # An explicit direction is stamped and honoured.

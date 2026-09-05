@@ -573,13 +573,19 @@ async def _exec_ledger_add_rule(
     if entity:
         rule["entity"] = entity
     # Never derived from the account, unlike `entity` above. An entity is a
-    # property of the ACCOUNT (`expenses:hikmah:*` IS hikmah), so deriving it
-    # states a fact the account already carries. A direction is a property of
-    # the EVENT: a refund credited back to `expenses:shopping` is a legitimate
-    # inbound posting to an expense account, and an `assets:*` or
-    # `equity:transfers` rule has to match a transfer moving either way.
-    # Deriving `out` from an expense account would silently narrow every such
-    # rule and stop it matching what it matches today.
+    # property of the ACCOUNT — `expenses:hikmah:*` IS hikmah — so deriving it
+    # states a fact the account already carries. A direction is not: an account
+    # says what a posting is FOR, never which way the money went.
+    #
+    # The chart says so itself. `equity:transfers` is declared "between own
+    # accounts when the far side is unknown", and a transfer moves either way;
+    # `post_event` writes `assets:*` and `liabilities:card:*` through
+    # `instrument_account`, which has no notion of direction at all. Deriving
+    # `out` from an expense account would also be a mass silent narrowing:
+    # 26 of the 28 rules in the live file point at `expenses:*` and not one of
+    # their authors asked for a direction. The two that would escape are the
+    # case in miniature — one is `ignore: true` with no account, and the other
+    # files `liabilities:emi:bajaj`, a liability money moves against both ways.
     if direction:
         rule["direction"] = direction
     if payee:
