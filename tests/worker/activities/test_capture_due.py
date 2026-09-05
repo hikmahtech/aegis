@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-from datetime import date, timedelta
+from datetime import datetime, timedelta
 from unittest.mock import AsyncMock
+from zoneinfo import ZoneInfo
 
 import pytest
 import pytest_asyncio
@@ -30,6 +31,16 @@ async def _capture_settings(db_pool):
         "INSERT INTO settings (key, value) VALUES ('todoist_capture_enabled', 'true'::jsonb) "
         "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value"
     )
+
+
+def _today(acts: CaptureActivities):
+    """"Today" as `capture_due` computes it — in the activity's own `home_tz`.
+
+    `date.today()` is the RUNNER's timezone, so this test passed locally (IST)
+    and failed in CI (UTC) for the ~5.5 hours a day the two disagree on the
+    date. The floor being asserted is the activity's, so read its clock.
+    """
+    return datetime.now(ZoneInfo(acts.home_tz)).date()
 
 
 def _acts(db_pool, projects=None):
@@ -89,12 +100,12 @@ async def test_capture_due_failed_kind_and_past_due_date(db_pool, monkeypatch):
     connector.commands = AsyncMock(return_value={"data": {"temp_id_mapping": {}}})
     ev = {
         **DUE, "kind": "failed", "payee": "Medium", "payee_key": "medium", "amount": "199.00",
-        "due_on": (date.today() - timedelta(days=3)).isoformat(), "entity": "hikmah",
+        "due_on": (_today(acts) - timedelta(days=3)).isoformat(), "entity": "hikmah",
     }
     await ActivityEnvironment().run(acts.capture_due, ev, "arshad-hikmah", "m2")
     cmd = connector.commands.await_args.args[0][0]
     assert cmd["args"]["content"] == "Fix payment: Medium ₹199.00"
-    assert cmd["args"]["due"] == {"date": date.today().isoformat()}
+    assert cmd["args"]["due"] == {"date": _today(acts).isoformat()}
     assert "project_id" in cmd["args"]  # Inbox fallback when the entity has no project
 
 
