@@ -6,6 +6,7 @@ from __future__ import annotations
 import base64
 import shutil
 import subprocess
+import time
 from datetime import date
 from decimal import Decimal
 from pathlib import Path
@@ -367,6 +368,43 @@ def test_rule_haystack_keeps_exactly_one_pipe():
         "Acme | Corp",
         direction="out",
     ) is not None
+
+
+def test_rule_haystack_is_bounded():
+    """The rule guards bound the PATTERN; this bounds what it is run against.
+
+    `ledger_add_rule` refuses a slow pattern by timing it against probes at
+    "a length a real payee can reach (80 chars)", and `rule_match_problem`
+    caps the pattern's length and quantifiers. None of that bounds the
+    HAYSTACK, and `MoneyEvent.payee` has no cap at all — it comes back from an
+    extractor allowed 4,000 tokens. Measured on `a.*b.*c$`, which passes every
+    one of those guards: 1.1s on a 2,000-character payee, 9s on 4,000 and
+    ~71s on 8,000, synchronously on the worker's event loop, for every
+    incoming money event.
+
+    80 is not an arbitrary number: `sanitize_payee` clips the payee to it, so
+    text past the cap is text the journal will never carry. The sender half
+    gets its own, looser bound — it is a From header, whose discriminating
+    part is the address at the END (`invoicing@aws\\.com`, `ebill@airtel\\.com`
+    and four more live rules key on one), so clipping it as tightly would
+    silently stop those rules matching behind a long display name. Measured
+    over 400 live receipts, the longest sender is 77 characters.
+    """
+    rules = [{"match": "needle", "account": "expenses:groceries"}]
+    assert books.apply_rules(rules, "", "x" * 60 + " needle", direction="out") is not None
+    assert books.apply_rules(rules, "", "x" * 200 + " needle", direction="out") is None
+    assert books.apply_rules(rules, "x" * 400 + " needle", "Zomato", direction="out") is None
+    # A real From header is nowhere near either bound, address included.
+    assert books.apply_rules(
+        rules, '"Needle Bank Alerts" <alerts@needle.example>', "Zomato", direction="out"
+    ) is not None
+
+    # And the bound is what makes the slow pattern above harmless. Without it
+    # this call takes about nine seconds.
+    slow = [{"match": "a.*b.*c$", "account": "expenses:groceries"}]
+    started = time.perf_counter()
+    assert books.apply_rules(slow, "", "ab" * 2000, direction="out") is None
+    assert time.perf_counter() - started < 1.0, "the haystack reached the rule uncapped"
 
 
 def test_install_deploy_key_raw_and_base64(tmp_path):

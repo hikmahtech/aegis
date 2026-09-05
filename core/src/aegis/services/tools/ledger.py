@@ -157,6 +157,32 @@ _REINDEX_SQL = (
     "updated_at = now() WHERE message_id = $1"
 )
 
+# The unexplained backlog, WITH the sender the worker matches on.
+#
+# `apply_rules` runs against `"<From header> | <payee>"`, so a sweep with an
+# empty sender previews a narrower rule than the one being persisted: the live
+# file carries bare words (`apple`, `medium`, `docker`, `github`, `reddit`),
+# and Google Pay mirrors MSEDCL, Airtel and the rest, so `match: "google"`
+# re-files bills whose payee never says Google. The sender is not a column on
+# `journal_index` — it lives on the receipt this posting came from, keyed on
+# the gmail id, which is the half of `<mailbox>/<gmail id>` after the slash.
+# A LEFT join, because a hand-written `manual/<hash>` block has no receipt and
+# genuinely has no sender; `''` is what production passes for those too. The
+# `<> ''` is the join's own floor: `split_part` returns the empty string for a
+# msgid with no slash, and joining that to an empty receipt id would hand one
+# posting another mail's sender.
+_SWEEP_SQL = """
+SELECT ji.message_id, ji.payee, ji.entity, ji.direction,
+       COALESCE(re.sender, '') AS sender
+  FROM finance.journal_index ji
+  LEFT JOIN finance.receipt_email re
+         ON re.message_id = split_part(ji.message_id, '/', 2)
+        AND re.message_id <> ''
+ WHERE ji.kind = 'transaction'
+   AND ji.account LIKE '%:unknown'
+   AND ji.journal_file IS NOT NULL
+"""
+
 
 def _undeclared(account: str) -> str:
     return (
@@ -361,7 +387,7 @@ async def _exec_ledger_post(
         date: YYYY-MM-DD.
         payee: who was paid or who paid.
         postings: two or more postings; amounts in major units. A negative amount is money coming in.
-        entity: personal or hikmah — which set of books.
+        entity: personal or hikmah — which set of books. Every expense and income account already belongs to one of them (expenses:hikmah:* and income:hikmah:* are hikmah, any other is personal), so the entity has to agree with the accounts posted; asset, liability and equity accounts belong to both and fit either.
         note: optional free text stored as a `note:` tag.
     """
     cfg = books.config_from_settings(ctx.settings)
@@ -405,6 +431,28 @@ async def _exec_ledger_post(
     missing = sorted({a for a in accounts if a not in declared})
     if missing:
         return _undeclared(", ".join(missing))
+    # The THIRD door onto the entity split, and the one that was open. The
+    # chart check above says the account exists; it says nothing about which
+    # set of books owns it, so `entity="hikmah"` with `expenses:groceries`
+    # balanced, passed `check --strict` and wrote a personal account into
+    # `hikmah/2026.journal` — where `ledger_reclassify` then REFUSES to correct
+    # it, because its own cross-entity guard blocks the move. The repair path
+    # was narrower than the path that made the mess.
+    #
+    # `account_entity` returns None for the asset, liability and equity trees,
+    # which both sets of books share by design (`post_event` writes
+    # `assets:bank:*` into either through `instrument_account`), so those go on
+    # working under any entity — the hazard lives entirely in the two trees
+    # that carry an entity.
+    misfiled = sorted({a for a in accounts if (books.account_entity(a) or entity) != entity})
+    if misfiled:
+        other = "hikmah" if entity == "personal" else "personal"
+        return (
+            f"error: {', '.join(misfiled)} {'belongs' if len(misfiled) == 1 else 'belong'} "
+            f"to the {other} books, and this transaction is being filed under {entity}. "
+            f"Post it under {other}, or pick a {entity} expense or income account — "
+            "asset, liability and equity accounts belong to both."
+        )
 
     # Sanitized once, here, so the index and the journal carry the same name —
     # `render_manual` would otherwise sanitize only its half of the pair.
@@ -520,7 +568,7 @@ async def _exec_ledger_add_rule(
         entity: personal or hikmah. Optional — an expense or income account already says which set of books it belongs to, so leaving this out takes the account's own entity (expenses:hikmah:* and income:hikmah:* are hikmah, any other expense or income account is personal). Asset, liability and equity accounts belong to both, and a rule on one gets no entity.
         direction: in or out. Optional, and NOT inferred from the account — leaving it out means the rule files this payee whichever way the money moves, which is what every rule written before this field existed does. Give it when the same name moves money both ways and the two belong in different accounts (a person you both pay and are paid by), so a payment is not filed to the income account you picked for a credit.
         payee: canonical display name, optional.
-        apply: also reclassify existing postings in an unknown account that match (default true). Existing postings are matched on their payee alone — the sender is not in the index.
+        apply: also reclassify existing postings in an unknown account that match (default true). They are matched exactly as future mail will be, against "<sender> | <payee>", so the count is the rule's real reach over the backlog; the reply says how many matched only because of the sender.
     """
     cfg = books.config_from_settings(ctx.settings)
     # This pattern is persisted, and the worker then runs it against every
@@ -560,10 +608,29 @@ async def _exec_ledger_add_rule(
     # payee then gets the hikmah account written into whichever journal the
     # MAILBOX chose: `post_event` files by `event.entity`, which the rule never
     # corrected. Same permanent drift `ledger_reclassify` refuses above, one
-    # door along. An explicit entity still wins — the caller may be filing a
-    # shared bank account's rule against one set of books.
+    # door along.
+    #
+    # An explicit entity that CONTRADICTS the account is refused rather than
+    # honoured. It used to win, on the reasoning that the caller might be
+    # filing a shared bank account's rule against one set of books — but that
+    # is exactly the case where `account_entity` returns None and there is
+    # nothing to contradict. Where it returns an entity, the account has
+    # already stated the answer, and a rule saying otherwise stamps every
+    # future mail from that payee with one entity while pointing at the other
+    # one's account: `post_event` files by `event.entity`, so the block lands
+    # in the wrong journal and the sweep below rewrites the backlog to match.
+    # An explicit entity that AGREES is still accepted, and so is any entity on
+    # an entity-neutral account.
+    belongs_to = books.account_entity(account)
     if entity is None:
-        entity = books.account_entity(account)
+        entity = belongs_to
+    elif belongs_to is not None and belongs_to != entity:
+        return (
+            f"error: {account} belongs to the {belongs_to} books, but this rule says "
+            f"entity {entity}. Leave the entity out and the account's own is used, or "
+            f"name a {entity} account — asset, liability and equity accounts belong "
+            "to both."
+        )
 
     # Sanitized once, as in `ledger_post`: this name is written to the journal
     # by the rewrite below AND stored in the rule for every future event, so the
@@ -597,11 +664,9 @@ async def _exec_ledger_add_rule(
     if not apply:
         return "rule added; reclassified 0 postings"
 
-    rows = await pool.fetch(
-        "SELECT message_id, payee, entity, direction FROM finance.journal_index "
-        "WHERE kind = 'transaction' AND account LIKE '%:unknown' AND journal_file IS NOT NULL"
-    )
+    rows = await pool.fetch(_SWEEP_SQL)
     targets: list[str] = []
+    sender_only: list[str] = []
     for row in rows:
         # A rule that names an entity must not move a posting in the OTHER set
         # of books: the account would change while the block stayed in the
@@ -609,15 +674,20 @@ async def _exec_ledger_add_rule(
         # `personal/2026.journal`.
         if entity and row["entity"] != entity:
             continue
-        # `apply_rules` with an empty sender, so one matcher serves both this
-        # sweep and the pipeline that applies the rule to new mail — and with
+        # The SAME haystack production will use — `"<sender> | <payee>"` — and
         # the posting's OWN direction, so a rule that names one sweeps only the
         # half of the backlog it will go on filing (issue #396).
-        if not books.apply_rules([rule], "", row["payee"] or "", direction=row["direction"]):
+        text = row["payee"] or ""
+        moved = row["direction"]
+        if not books.apply_rules([rule], row["sender"], text, direction=moved):
             continue
         targets.append(row["message_id"])
+        if row["sender"] and not books.apply_rules([rule], "", text, direction=moved):
+            sender_only.append(row["message_id"])
     capped = len(targets) > _MAX_APPLY
     targets = targets[:_MAX_APPLY]
+    kept = set(targets)
+    sender_hits = sum(1 for m in sender_only if m in kept)
     try:
         # ONE write for the whole backlog: one flock, one strict check, one
         # commit, one push. Per-posting writes would hold the books against
@@ -632,6 +702,16 @@ async def _exec_ledger_add_rule(
     if failed:
         logger.warning("ledger_add_rule_rewrite_failed", msgids=failed[:20], count=len(failed))
     tail = f" ({len(failed)} failed)" if failed else ""
+    # The count alone cannot warn: a rule matching the SENDER reaches payees
+    # whose names are nothing like it, and the caller who wrote `google` was
+    # thinking about Google, not about every bill Google Pay mirrors. Naming
+    # the sender-only share turns the number into something the caller can act
+    # on while the rule is still one edit old.
+    if sender_hits:
+        tail += (
+            f"; {sender_hits} matched the sender rather than the payee, "
+            "so this rule is wider than its name"
+        )
     if capped:
         tail += f"; stopped at the {_MAX_APPLY}-posting limit, run again to continue"
     return f"rule added; reclassified {len(rewritten)} postings{tail}"

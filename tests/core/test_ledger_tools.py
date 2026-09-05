@@ -43,6 +43,7 @@ account assets:unknown
 account expenses:unknown
 account expenses:groceries
 account expenses:saas
+account expenses:hikmah:saas
 account income:unknown
 """
 
@@ -128,9 +129,16 @@ def _unknown_event(payee: str = f"Jai shree {TOKEN}") -> MoneyEvent:
 
 @pytest_asyncio.fixture(loop_scope="function", autouse=True)
 async def _clean(db_pool):
-    await db_pool.execute("DELETE FROM finance.journal_index WHERE mailbox IN ('tool-t', 'manual')")
+    await _wipe(db_pool)
     yield
+    await _wipe(db_pool)
+
+
+async def _wipe(db_pool) -> None:
     await db_pool.execute("DELETE FROM finance.journal_index WHERE mailbox IN ('tool-t', 'manual')")
+    # The sweep reads each posting's sender off `finance.receipt_email`, so
+    # this file writes rows there too; `account` carries the mailbox name.
+    await db_pool.execute("DELETE FROM finance.receipt_email WHERE account = 'tool-t'")
 
 
 @pytest.mark.asyncio
@@ -285,12 +293,6 @@ async def test_reclassify_refuses_to_cross_entities(db_pool, tmp_path):
     up counted in the business books while its block stays in
     `personal/2026.journal`."""
     cfg = _repo(tmp_path)
-    (cfg.path / "accounts.journal").write_text(ACCOUNTS + "account expenses:hikmah:saas\n")
-    subprocess.run(
-        ["git", "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qam", "chart"],
-        cwd=cfg.path,
-        check=True,
-    )
     ctx = _ctx(cfg)
     out = await _exec_ledger_post(
         db_pool,
@@ -326,7 +328,13 @@ async def test_reclassify_allows_the_accounts_both_entities_share(db_pool, tmp_p
     declares ONE `assets:bank:hdfc:1225`, and `books.instrument_account` writes
     it into both sets of books with no notion of entity. Refusing a hikmah
     posting onto a shared account would be a false refusal on a real correction
-    (a mis-filed transfer), and it is not the hazard the guard exists for."""
+    (a mis-filed transfer), and it is not the hazard the guard exists for.
+
+    The posting is opened on `expenses:hikmah:saas`, not `expenses:unknown`:
+    the two unknown accounts are per-entity too (`expenses:unknown` is the
+    personal one, `expenses:hikmah:unknown` the business one), so opening it on
+    the personal one under `entity="hikmah"` would be the very misfiling
+    `test_post_refuses_an_account_the_other_books_own` now refuses."""
     cfg = _repo(tmp_path)
     ctx = _ctx(cfg)
     out = await _exec_ledger_post(
@@ -336,7 +344,7 @@ async def test_reclassify_allows_the_accounts_both_entities_share(db_pool, tmp_p
             "payee": "Vendor",
             "entity": "hikmah",
             "postings": [
-                {"account": "expenses:unknown", "amount": "9", "currency": "INR"},
+                {"account": "expenses:hikmah:saas", "amount": "9", "currency": "INR"},
                 {"account": "assets:bank:hdfc:1225"},
             ],
         },
@@ -683,7 +691,10 @@ async def test_post_writes_to_the_named_entity(db_pool, tmp_path):
             "payee": "Vendor",
             "entity": "hikmah",
             "postings": [
-                {"account": "expenses:saas", "amount": "9", "currency": "INR"},
+                # Entity-neutral accounts (assets, liabilities, equity) belong
+                # to both sets of books, so the pair below is legitimate under
+                # either entity — see the refusal test that follows.
+                {"account": "expenses:hikmah:saas", "amount": "9", "currency": "INR"},
                 {"account": "assets:bank:hdfc:1225"},
             ],
         },
@@ -692,6 +703,61 @@ async def test_post_writes_to_the_named_entity(db_pool, tmp_path):
     assert out.endswith("hikmah/2026.journal"), out
     assert "Vendor" in (cfg.path / "hikmah" / "2026.journal").read_text()
     assert "Vendor" not in (cfg.path / "personal" / "2026.journal").read_text()
+
+
+@pytest.mark.asyncio
+async def test_post_refuses_an_account_the_other_books_own(db_pool, tmp_path):
+    """The THIRD door onto the entity split, and the one nothing guarded.
+
+    `ledger_reclassify` refuses a cross-entity move and `ledger_add_rule`
+    derives the entity from the account, but `ledger_post` validated only that
+    every account was declared. So `entity="hikmah"` with `expenses:saas`
+    balanced, passed `check --strict` and wrote a PERSONAL account into
+    `hikmah/2026.journal` — where `ledger_reclassify` then refuses to correct
+    it, because its own guard blocks the move. The repair path was narrower
+    than the path that made the mess.
+
+    The positive control comes first, on the same call shape, so the refusal
+    below cannot be passing for an unrelated reason.
+    """
+    cfg = _repo(tmp_path)
+    ctx = _ctx(cfg)
+    good = await _exec_ledger_post(
+        db_pool,
+        {
+            "date": "2026-09-04",
+            "payee": "Right books",
+            "entity": "hikmah",
+            "postings": [
+                {"account": "expenses:hikmah:saas", "amount": "7", "currency": "INR"},
+                {"account": "assets:bank:hdfc:1225"},
+            ],
+        },
+        ctx,
+    )
+    assert good.endswith("hikmah/2026.journal"), good
+
+    before = _journals(cfg)
+    commits = _commits(cfg)
+    for entity, account in (("hikmah", "expenses:saas"), ("personal", "expenses:hikmah:saas")):
+        out = await _exec_ledger_post(
+            db_pool,
+            {
+                "date": "2026-09-04",
+                "payee": "Wrong books",
+                "entity": entity,
+                "postings": [
+                    {"account": account, "amount": "5", "currency": "INR"},
+                    {"account": "assets:bank:hdfc:1225"},
+                ],
+            },
+            ctx,
+        )
+        assert out.startswith("error:") and account in out, (entity, account, out)
+    # Nothing was written and nothing was committed — the refusal is before the
+    # write, not a write that was reverted.
+    assert _journals(cfg) == before
+    assert _commits(cfg) == commits
 
 
 @pytest.mark.asyncio
@@ -1024,7 +1090,12 @@ async def test_add_rule_skips_a_posting_in_the_other_entity(db_pool, tmp_path):
     """A rule that names an entity must not move a posting in the other set of
     books: the account would change but the block would stay in the wrong
     journal file, which is how an `expenses:hikmah:*` posting lands in
-    `personal/2026.journal`."""
+    `personal/2026.journal`.
+
+    The rule's account is entity-NEUTRAL here, which is the only shape where an
+    explicit entity is still a free choice: a shared bank account filed against
+    one set of books. An `expenses:hikmah:*` account would carry the same
+    entity by itself and would not prove the explicit one reached the sweep."""
     cfg = _repo(tmp_path)
     ctx = _ctx(cfg)
     ev = _unknown_event()
@@ -1032,11 +1103,86 @@ async def test_add_rule_skips_a_posting_in_the_other_entity(db_pool, tmp_path):
     await ji.upsert(db_pool, "tool-t/c", "tool-t", ev, journal_file="personal/2026.journal")
     out = await _exec_ledger_add_rule(
         db_pool,
-        {"match": f"jai shree {TOKEN}", "account": "expenses:groceries", "entity": "hikmah"},
+        {"match": f"jai shree {TOKEN}", "account": "assets:unknown", "entity": "hikmah"},
         ctx,
     )
     assert out == "rule added; reclassified 0 postings"
     assert (await ji.get(db_pool, "tool-t/c"))["account"] == "expenses:unknown"
+
+
+@pytest.mark.asyncio
+async def test_add_rule_sweeps_only_unexplained_postings(db_pool, tmp_path):
+    """The sweep exists to file the `%:unknown` backlog, and only that.
+
+    A posting already in a real account is a decision somebody made — by hand,
+    by an earlier rule, or by answering a curiosity card — and a new rule that
+    happened to match its payee must not silently overwrite it. Nothing pinned
+    that on this path: the reviewer's mutation dropping `AND account LIKE
+    '%:unknown'` from the query left every test in the tool suite passing.
+    """
+    cfg = _repo(tmp_path)
+    ctx = _ctx(cfg)
+    unknown = _unknown_event()
+    await books.post_event(unknown, "tool-t/u", cfg)
+    await ji.upsert(db_pool, "tool-t/u", "tool-t", unknown, journal_file="personal/2026.journal")
+    # The same payee, already filed. `post_event` writes the account off the
+    # event, so this block is in `expenses:saas` from the start.
+    settled = _unknown_event()
+    settled.account = "expenses:saas"
+    await books.post_event(settled, "tool-t/s", cfg)
+    await ji.upsert(db_pool, "tool-t/s", "tool-t", settled, journal_file="personal/2026.journal")
+    assert (await ji.get(db_pool, "tool-t/s"))["account"] == "expenses:saas"
+
+    out = await _exec_ledger_add_rule(
+        db_pool, {"match": f"jai shree {TOKEN}", "account": "expenses:groceries"}, ctx
+    )
+
+    assert out == "rule added; reclassified 1 postings", out
+    assert (await ji.get(db_pool, "tool-t/u"))["account"] == "expenses:groceries"
+    # The settled posting is untouched in the index AND in the journal.
+    assert (await ji.get(db_pool, "tool-t/s"))["account"] == "expenses:saas"
+    assert "expenses:saas" in (cfg.path / "personal" / "2026.journal").read_text()
+
+
+@pytest.mark.asyncio
+async def test_add_rule_sweeps_with_the_sender_the_worker_will_use(db_pool, tmp_path):
+    """The sweep previews the rule that actually goes live.
+
+    Production matches `"<From header> | <payee>"` (`money.py`), so a bare-word
+    rule fires on the SENDER too — Google Pay mirrors MSEDCL, Airtel and the
+    rest, and the live rules file already carries `apple`, `medium`, `docker`,
+    `github` and `reddit`. Sweeping with an empty sender made
+    "reclassified N postings" understate the rule's reach on exactly the rules
+    most likely to have too much of it.
+
+    So the sweep joins the sender back in, and says how many postings only the
+    sender explains — which is the warning the count on its own cannot be.
+    """
+    cfg = _repo(tmp_path)
+    ctx = _ctx(cfg)
+    # Two unexplained postings from the same biller: one whose payee names it,
+    # one where only the From header does — the Google-Pay-mirror shape.
+    named = _unknown_event(payee=f"Zzt4pay Bills {TOKEN}")
+    await books.post_event(named, "tool-t/zzt4n", cfg)
+    await ji.upsert(db_pool, "tool-t/zzt4n", "tool-t", named, journal_file="personal/2026.journal")
+    mirrored = _unknown_event(payee=f"Electricity board {TOKEN}")
+    await books.post_event(mirrored, "tool-t/zzt4m", cfg)
+    await ji.upsert(db_pool, "tool-t/zzt4m", "tool-t", mirrored, journal_file="personal/2026.journal")
+    await db_pool.execute(
+        "INSERT INTO finance.receipt_email (message_id, account, sender, subject, received_at) "
+        "VALUES ($1, 'tool-t', $2, 'bill', now())",
+        "zzt4m",  # `<mailbox>/<gmail id>` — the sweep joins on the half after the slash
+        f"Zzt4pay Bills {TOKEN} <noreply@zzt4pay.example>",
+    )
+
+    out = await _exec_ledger_add_rule(
+        db_pool, {"match": f"zzt4pay bills {TOKEN}", "account": "expenses:groceries"}, ctx
+    )
+
+    assert out.startswith("rule added; reclassified 2 postings"), out
+    assert "1 matched the sender" in out, out
+    assert (await ji.get(db_pool, "tool-t/zzt4n"))["account"] == "expenses:groceries"
+    assert (await ji.get(db_pool, "tool-t/zzt4m"))["account"] == "expenses:groceries"
 
 
 @pytest.mark.asyncio
@@ -1052,12 +1198,6 @@ async def test_add_rule_defaults_the_entity_from_the_account(db_pool, tmp_path):
     optional argument.
     """
     cfg = _repo(tmp_path)
-    (cfg.path / "accounts.journal").write_text(ACCOUNTS + "account expenses:hikmah:saas\n")
-    subprocess.run(
-        ["git", "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qam", "chart"],
-        cwd=cfg.path,
-        check=True,
-    )
     ctx = _ctx(cfg)
     ev = _unknown_event()  # entity=personal
     await books.post_event(ev, "tool-t/g", cfg)
@@ -1087,19 +1227,43 @@ async def test_add_rule_defaults_the_entity_from_the_account(db_pool, tmp_path):
     rules = books.load_rules(cfg.path / "rules" / "accounts.yaml")
     assert "entity" not in rules[-1], rules[-1]
 
-    # An explicit entity still wins over the derived one.
+    # An explicit entity that AGREES with the account is accepted — that is
+    # the positive control for the refusal below, on the same call shape.
     await _exec_ledger_add_rule(
         db_pool,
         {
-            "match": f"explicit {TOKEN}",
+            "match": f"agrees {TOKEN}",
+            "account": "expenses:hikmah:saas",
+            "entity": "hikmah",
+            "apply": False,
+        },
+        ctx,
+    )
+    rules = books.load_rules(cfg.path / "rules" / "accounts.yaml")
+    assert rules[-1]["entity"] == "hikmah", rules[-1]
+
+    # An explicit entity that CONTRADICTS the account is refused. It used to
+    # win, and the reason given was a shared bank account — but that case is
+    # exactly the neutral-account one above, where there is no contradiction to
+    # detect. Honoured here, it persists a rule stamping every future mail from
+    # this payee `entity: personal` while pointing at a hikmah account:
+    # `post_event` files by `event.entity`, so the block lands in
+    # `personal/2026.journal` carrying `expenses:hikmah:saas`, and
+    # `ledger_reclassify` then refuses to move it back.
+    before = (cfg.path / "rules" / "accounts.yaml").read_text()
+    out = await _exec_ledger_add_rule(
+        db_pool,
+        {
+            "match": f"contradicts {TOKEN}",
             "account": "expenses:hikmah:saas",
             "entity": "personal",
             "apply": False,
         },
         ctx,
     )
-    rules = books.load_rules(cfg.path / "rules" / "accounts.yaml")
-    assert rules[-1]["entity"] == "personal", rules[-1]
+    assert out.startswith("error:") and "expenses:hikmah:saas" in out, out
+    # Refused BEFORE the write, not written and then argued with.
+    assert (cfg.path / "rules" / "accounts.yaml").read_text() == before
 
 
 @pytest.mark.asyncio

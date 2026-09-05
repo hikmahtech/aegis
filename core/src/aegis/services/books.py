@@ -119,10 +119,14 @@ def account_entity(account: str) -> str | None:
     `expenses:hikmah:*` posting filed in `personal/2026.journal`) lives
     entirely in the two trees this does cover.
 
-    Three callers rely on it and all three guard the same hazard from a
-    different door: `ledger_reclassify` refuses a cross-entity move,
-    `ledger_add_rule` defaults an omitted `entity`, and the curiosity answer
-    hook stamps the rule it writes with no human in the loop at all.
+    Four callers rely on it and all four guard the same hazard from a different
+    door: `ledger_post` refuses to write an account into the other set of
+    books, `ledger_reclassify` refuses a cross-entity move, `ledger_add_rule`
+    defaults an omitted `entity` and refuses one that contradicts the account,
+    and the curiosity answer hook stamps the rule it writes with no human in
+    the loop at all. `ledger_post` was the door that stood open: its write
+    balanced and passed `check --strict`, and `ledger_reclassify` then refused
+    to undo it, so the repair path was narrower than the path in.
     """
     if not account.startswith(("expenses:", "income:")):
         return None
@@ -236,6 +240,13 @@ _INDENT = "    "
 _ACCOUNT_WIDTH = 40
 _PAYEE_MAX = 80
 _TAG_MAX = 80
+# How much of a From header a rule may be matched against. Looser than
+# `_PAYEE_MAX` on purpose: a sender's discriminating part is the address at the
+# END (`invoicing@aws\.com`, `ebill@airtel\.com` and four more live rules key
+# on one), so a tight clip would silently stop those matching behind a long
+# display name. Measured over 400 live receipts, the longest sender is 77
+# characters, so this is headroom rather than a limit anything meets.
+_SENDER_MAX = 200
 _POSTING_RE = re.compile(r"^    (\S+)(?:\s{2,}(\S.*))?$")
 
 
@@ -577,7 +588,23 @@ def apply_rules(
     # `[^|]*` inside the SENDER and re-open the sender-matching hole the anchor
     # closes. No hand-written rule can want a literal pipe either: in a regex
     # it means alternation, not the character.
-    haystack = f"{(sender or '').replace('|', ' ')} | {(payee or '').replace('|', ' ')}"
+    # Both halves are CLIPPED, because the guards on a rule bound the pattern
+    # and nothing bounds what it is run against. `rule_match_problem` caps the
+    # pattern's length and quantifiers and `ledger_add_rule` times it against
+    # probes "at a length a real payee can reach (80 chars)" — but
+    # `MoneyEvent.payee` has no cap at all: it comes back from an extractor
+    # allowed 4,000 tokens. Measured on `a.*b.*c$`, which passes every one of
+    # those guards, 1.1s on a 2,000-character payee and ~71s on 8,000 — here,
+    # synchronously on the worker's event loop, once per rule per event.
+    #
+    # 80 for the payee is not a new number: `sanitize_payee` clips it there, so
+    # anything past it is text the journal will never carry and no rule should
+    # be able to key on. The sender gets its own, looser bound — see
+    # `_SENDER_MAX`.
+    haystack = (
+        f"{(sender or '')[:_SENDER_MAX].replace('|', ' ')} | "
+        f"{(payee or '')[:_PAYEE_MAX].replace('|', ' ')}"
+    )
     moved = (direction or "").strip().lower()
     for rule in rules:
         wanted = rule.get("direction")

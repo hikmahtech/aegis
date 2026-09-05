@@ -79,8 +79,11 @@ _MAX_RULE_MATCH = 200
 # mirrors MSEDCL, Airtel and the rest (hence `bank_parsers.parse_gpay_bill`),
 # so an unanchored rule from a payee called "Google" would re-file — and
 # rename — every Google-Pay-mirrored bill. This prefix pins the match to the
-# payee half; the ledger tool's sweep passes an empty sender, whose haystack
-# still starts " | ", so that call site is unaffected.
+# payee half, which is the answer FOR A RULE NOBODY REVIEWS: the owner named
+# one payee, so the rule may only mean that payee. `ledger_add_rule` writes
+# unanchored rules on purpose (six live rules key on the sender's address, and
+# a human is in that loop) and its sweep now runs them against the real sender,
+# so both writers are matched against the same haystack a real event brings.
 _PAYEE_HALF = r"\|[^|]*"
 
 
@@ -120,7 +123,11 @@ def books_answer_report(payee: str, out: dict) -> str | None:
     skipped = int(out.get("skipped_other_entity") or 0)
     failed = int(out.get("failed") or 0)
     moved = int(out.get("reclassified") or 0)
-    if account and not skipped and not failed:
+    # The rule was written and the backlog sweep then threw. Silence would be
+    # read as the clean outcome, and the generic failure sentence claims the
+    # rule does not exist — so this outcome has to say both halves itself.
+    backlog_failed = bool(out.get("backlog_failed"))
+    if account and not skipped and not failed and not backlog_failed:
         return None
     name = escape(payee or "that payee")
 
@@ -133,6 +140,11 @@ def books_answer_report(payee: str, out: dict) -> str | None:
         return f"<b>{name}</b> — {why}{tail} Your answer is saved as a memory."
 
     parts = [f"<b>{name}</b> → <code>{escape(account)}</code>. The rule is saved."]
+    if backlog_failed:
+        parts.append(
+            "The postings already in the books could not be moved and are still "
+            "unexplained, so they need doing by hand; the rule will file the next one."
+        )
     if skipped:
         # The VERB agrees too. `postings()` pluralises the noun and an adjacent
         # literal verb does not follow it, which is how "1 existing posting sit
@@ -893,38 +905,62 @@ class CuriosityActivities:
             rule["direction"] = direction
             await books.append_rule(rule, cfg)
 
-        rows = await self.db_pool.fetch(
-            "SELECT message_id, entity FROM finance.journal_index "
-            # The card's OWN direction, which is the whole reason the detector
-            # cards the two separately. The owner was asked about money moving
-            # one way; money from the same name moving the other way (a refund,
-            # a transfer back) is not what they explained, and filing a credit
-            # to an expense account puts it in the wrong half of the books.
-            "WHERE payee_key = $1 AND kind = 'transaction' AND direction = $2 "
-            "AND account LIKE '%:unknown' AND journal_file IS NOT NULL",
-            key,
-            direction,
-        )
-        # Only the books the account belongs to: rewriting in place changes the
-        # account, never the file the block lives in. The entity split happens
-        # HERE rather than in the WHERE clause so the rows left behind can be
-        # COUNTED — that count is the whole of what the owner is told about a
-        # cross-entity answer, and a query that never returned them could not
-        # produce it (issue #384).
-        msgids = [r["message_id"] for r in rows if entity is None or r["entity"] == entity]
-        skipped_other_entity = len(rows) - len(msgids)
-        # ONE write for the whole backlog: one flock, one pull, one strict
-        # check, one commit, one push. A loop over `rewrite_event` would hold
-        # the books against every other writer for the length of the sweep and
-        # leave one commit per posting.
-        rewritten, failed = await books.rewrite_events(msgids, cfg, account=account)
-        for msgid in rewritten:
-            await self.db_pool.execute(
-                "UPDATE finance.journal_index SET account = $2, updated_at = now() "
-                "WHERE message_id = $1",
-                msgid,
-                account,
+        # Everything past the `append_rule` above is inside this, because the
+        # caller's single handler reports any exception from this method as
+        # "The books would not take it — nothing was written." That is true of
+        # a failed LLM call, an unreadable chart or a refused `append_rule`,
+        # and a LIE once the rule is committed and pushed: it will file this
+        # payee's mail from now on, and the owner has been told it does not
+        # exist on the only surface that reports this lane at all. Catching
+        # here is what lets the two outcomes be told apart; when no rule was
+        # written the exception goes on up, where that sentence is correct.
+        try:
+            rows = await self.db_pool.fetch(
+                "SELECT message_id, entity FROM finance.journal_index "
+                # The card's OWN direction, which is the whole reason the
+                # detector cards the two separately. The owner was asked about
+                # money moving one way; money from the same name moving the
+                # other way (a refund, a transfer back) is not what they
+                # explained, and filing a credit to an expense account puts it
+                # in the wrong half of the books.
+                "WHERE payee_key = $1 AND kind = 'transaction' AND direction = $2 "
+                "AND account LIKE '%:unknown' AND journal_file IS NOT NULL",
+                key,
+                direction,
             )
+            # Only the books the account belongs to: rewriting in place changes
+            # the account, never the file the block lives in. The entity split
+            # happens HERE rather than in the WHERE clause so the rows left
+            # behind can be COUNTED — that count is the whole of what the owner
+            # is told about a cross-entity answer, and a query that never
+            # returned them could not produce it (issue #384).
+            msgids = [r["message_id"] for r in rows if entity is None or r["entity"] == entity]
+            skipped_other_entity = len(rows) - len(msgids)
+            # ONE write for the whole backlog: one flock, one pull, one strict
+            # check, one commit, one push. A loop over `rewrite_event` would
+            # hold the books against every other writer for the length of the
+            # sweep and leave one commit per posting.
+            rewritten, failed = await books.rewrite_events(msgids, cfg, account=account)
+            for msgid in rewritten:
+                await self.db_pool.execute(
+                    "UPDATE finance.journal_index SET account = $2, updated_at = now() "
+                    "WHERE message_id = $1",
+                    msgid,
+                    account,
+                )
+        except Exception as exc:  # noqa: BLE001 — the rule's fate decides the sentence
+            if not match:
+                raise
+            activity.logger.warning(
+                "curiosity_books_backlog_failed payee=%s account=%s err=%s",
+                payee,
+                account,
+                str(exc)[:200],
+            )
+            # `rewrite_events` reverts its own write, so the backlog is exactly
+            # where it was — which is what the owner is now told, alongside the
+            # rule that really was saved.
+            return {"rule": account, "backlog_failed": True}
         if failed:
             activity.logger.warning(
                 "curiosity_books_reclassify_partial payee=%s failed=%d ids=%s",
