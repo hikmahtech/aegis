@@ -1071,7 +1071,7 @@
     "type": "function",
     "function": {
       "name": "ledger_reclassify",
-      "description": "Move a posting to another account (and optionally rename its payee) by its books message id (`<mailbox>/<gmail id>` or `manual/<uuid>`). The new account must be one the posting's own set of books can use: an expense or income account of that entity, or any asset, liability or equity account, which both sets share.",
+      "description": "Move a posting to another account (and optionally rename its payee) by its books message id (`<mailbox>/<gmail id>` for a posting from mail, or `manual/<hash>` for one `ledger_post` wrote). The new account must be one the posting's own set of books can use: an expense or income account of that entity, or any asset, liability or equity account, which both sets share.",
       "parameters": {
         "type": "object",
         "properties": {

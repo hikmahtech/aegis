@@ -117,7 +117,9 @@ Rules the writer and parser share:
   name, sender name). `*` always (bank-sourced or receipt-sourced is in tags).
 - Line 2: `    ; msgid: <mailbox>/<gmail message id>`. Always present. It is
   the idempotency key and the address every rewrite uses. A manual posting
-  through the tool gets `msgid: manual/<uuid4>`.
+  through the tool gets `msgid: manual/<hash>` — a SHA-256 of the rendered
+  block, never a `uuid4`, so a retried write is a retry and not a duplicate
+  transaction (§8).
 - Line 3: `    ; channel: <c>, ref: <r>, instrument: <i>` — `channel` always,
   `ref` and `instrument` when known. Extra tags allowed: `receipt: <msgid>`
   (a vendor receipt linked to this bank posting), `bank: <msgid>` (the
@@ -418,7 +420,7 @@ written from the encrypted setting at boot (section 10).
 
 ```sql
 CREATE TABLE IF NOT EXISTS finance.journal_index (
-    message_id        text PRIMARY KEY,          -- "<mailbox>/<gmail id>" or "manual/<uuid>"
+    message_id        text PRIMARY KEY,          -- "<mailbox>/<gmail id>" or "manual/<hash>"
     mailbox           text NOT NULL,
     entity            text NOT NULL,             -- personal | hikmah | none
     kind              text NOT NULL,             -- transaction | due | failed | info | ignore

@@ -482,7 +482,7 @@ async def _exec_ledger_post(
 async def _exec_ledger_reclassify(
     pool: asyncpg.Pool, ctx: ToolContext, *, message_id: str, account: str, payee: str | None = None
 ) -> str:
-    """Move a posting to another account (and optionally rename its payee) by its books message id (`<mailbox>/<gmail id>` or `manual/<uuid>`). The new account must be one the posting's own set of books can use: an expense or income account of that entity, or any asset, liability or equity account, which both sets share.
+    """Move a posting to another account (and optionally rename its payee) by its books message id (`<mailbox>/<gmail id>` for a posting from mail, or `manual/<hash>` for one `ledger_post` wrote). The new account must be one the posting's own set of books can use: an expense or income account of that entity, or any asset, liability or equity account, which both sets share.
 
     Args:
         message_id: the msgid tag of the transaction.
