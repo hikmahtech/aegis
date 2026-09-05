@@ -413,11 +413,19 @@ class ProfileActivities:
         return out
 
     async def _evidence_finance(self, agent_id: str, days: int) -> list[str]:
-        charges = await self.db_pool.fetch(
-            "SELECT vendor_name, category, cadence FROM finance.recurring_charge "
-            "WHERE status = 'active' ORDER BY last_seen_at DESC LIMIT $1",
-            self.max_finance,
-        )
+        """The week's money mail.
+
+        This used to add a second half, the active rows of
+        `finance.recurring_charge`. That table lost its last writer when the v1
+        subscription tracker was deleted (2026-09) and was kept only so its
+        history survives, so the half would have contributed the SAME frozen
+        set of pre-2026-09 vendors to every week's evidence forever — read by
+        the LLM as "this is what the user pays for now", and never ageing out.
+        A stale half-answer inside an otherwise-live bundle is worse than a
+        missing one: nothing downstream can tell the two apart. The books
+        (`finance.journal_index` + the hledger journal) are the record now;
+        wiring them in here is a real change, not a line this task can smuggle.
+        """
         receipts = await self.db_pool.fetch(
             "SELECT sender, subject FROM finance.receipt_email "
             "WHERE received_at >= now() - make_interval(days => $1) "
@@ -425,15 +433,9 @@ class ProfileActivities:
             days,
             self.max_finance,
         )
-        out = [
-            f"recurring: {r['vendor_name']} ({r['category']}, {r['cadence']})"
-            for r in charges
-            if (r["vendor_name"] or "").strip()
-        ]
-        out += [
+        return [
             f"receipt: {str(r['sender'])[:80]} — {str(r['subject'] or '')[:120]}" for r in receipts
         ]
-        return out
 
     async def _evidence_calendar(self, agent_id: str, days: int) -> list[str]:
         """Events from the `calendar_events_%` settings KV rows —

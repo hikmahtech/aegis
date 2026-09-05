@@ -22,6 +22,19 @@ def test_extract_merchant(title, expected):
 
 @pytest_asyncio.fixture(loop_scope="function")
 async def _charges(db_pool):
+    """Pre-2026-09 rows, hand-written because NOTHING WRITES THEM ANY MORE.
+
+    `upsert_charges` was the only writer of `finance.recurring_charge` and the
+    only thing that ever stamped `receipt_email.charge_id`; it was deleted with
+    the rest of the v1 subscription tracker. The tables were deliberately kept,
+    so they still hold exactly this shape of row from before that date, and
+    reading them is precisely what `merchant_history` is left doing.
+
+    So this fixture is not simulating a reachable write path — there is none.
+    It is simulating the frozen residue, which is the only input the verb can
+    ever get. That is why the assertions below pin the retired-source warning
+    rather than just the numbers: the numbers alone would say the lane works.
+    """
     await db_pool.execute("DELETE FROM finance.receipt_email WHERE message_id LIKE 'test-el-%'")
     await db_pool.execute("DELETE FROM finance.recurring_charge WHERE vendor_name = 'Eleven Labs'")
     # ONE charge signature (the table is upsert-keyed, 001_baseline.sql:726),
@@ -54,9 +67,37 @@ async def test_merchant_history_returns_prior_charges(db_pool, _charges):
     assert result["merchant"] == "Eleven Labs"
     assert len(result["charges"]) == 2
     assert "22" in result["summary"]
+    # A hit is still a frozen hit. `_run_finance` renders this summary straight
+    # into the Todoist comment AND the decision card, so the caveat has to
+    # travel with the numbers — history that stops in 2026-09 presented as
+    # current history is how "this charge looks normal" gets decided wrongly.
+    assert "retired" in result["summary"]
+
+
+async def test_merchant_history_never_reports_a_bare_empty_history(db_pool):
+    """A merchant with no frozen rows must not read as "this merchant is new".
+
+    This is the failure the deletion created: `receipt_email.charge_id` has no
+    writer left, so the join misses for EVERY merchant first seen after
+    2026-09. The old summary said "no prior charges on record" — a confident
+    claim about money, made from a source that stopped being written.
+    """
+    act = AgentTaskActivities(db_pool=db_pool)
+    result = await act.merchant_history("Anomaly: ? Nobody Ever Heard Of This Co")
+
+    assert result["merchant"] == "Nobody Ever Heard Of This Co"
+    assert result["charges"] == []
+    assert "no prior charges on record" not in result["summary"]
+    assert "retired" in result["summary"]
 
 
 async def test_merchant_history_unknown_merchant_is_empty_not_error(db_pool):
+    """An unparseable title is a different answer from an empty history.
+
+    It returns a blank summary, not the retired-source note, because the flow
+    branches on the empty `merchant` and never shows this to anyone — it
+    comments "I couldn't tell which merchant this is about" and parks.
+    """
     result = await AgentTaskActivities(db_pool=db_pool).merchant_history("Something unrelated")
     assert result == {"merchant": "", "charges": [], "summary": ""}
 

@@ -5,6 +5,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from aegis.api.app import create_app
 from aegis.api.deps import get_settings
+from aegis.api.routes import money as money_routes
 from aegis.config import Settings
 from fastapi.testclient import TestClient
 
@@ -136,6 +137,19 @@ def test_money_digest_returns_latest_when_present(app, client):
     assert body["digest"] is not None
     assert body["digest"]["period_start"] == "2026-03-01"
     assert body["digest"]["summary"]["total_monthly_inr"] == 12345.67
+
+
+def test_money_flow_names_still_offers_receipt_scan():
+    """`receipt_scan` must stay in the map, and only a real read proves it.
+
+    The dispatch test below monkeypatches `_start_workflow`, so the handler
+    never reads `_FLOW_NAMES` there — deleting an entry keeps that test green.
+    The 400 test only proves retired names are ABSENT. Neither notices a live
+    name going missing, and `docs/infrastructure.md` documents
+    `POST /api/admin/money/receipt_scan/run` as the backfill command, so
+    dropping it would 400 the one manual trigger the money lane still has.
+    """
+    assert "receipt_scan" in money_routes._FLOW_NAMES
 
 
 @pytest.mark.parametrize("flow", ["receipt_scan"])

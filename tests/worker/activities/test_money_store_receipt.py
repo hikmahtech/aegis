@@ -319,4 +319,3 @@ async def test_load_receipts_prefers_body_text_over_snippet(db_pool):
     rows = await act.load_receipts([with_body, without])
     by_id = {r["message_id"]: r["body_plain"] for r in rows}
     assert by_id == {"rt-body-2": "full", "rt-body-3": "snip only"}
-

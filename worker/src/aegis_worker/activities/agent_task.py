@@ -116,11 +116,27 @@ def extract_service_name(title: str) -> str:
     return ""
 
 
-# #receipt task title shapes, as clarify actually produces them in prod.
+# #receipt task title shapes. LEGACY: the v1 subscription tracker's renewal
+# and cancellation sweeps were the only things that ever wrote these titles,
+# and they are gone (2026-09). No new task carries one, so these patterns exist
+# only to still parse the `#receipt` tasks already sitting in Todoist. A title
+# that matches none of them yields "", which routes the finance verb to its
+# "I couldn't tell which merchant this is about" park — the honest outcome.
 _MERCHANT_PATTERNS = (
     re.compile(r"^Anomaly:\s*\?\s*(.+?)\s*$", re.I),
     re.compile(r"^Anomaly:\s*[\d.,]+\s+\w+\s+(.+?)\s*$", re.I),
     re.compile(r"^Renewal in [\d.]+ days:\s*(.+?)\s*\([^)]*\)\s*$", re.I),
+)
+
+
+# Stamped on every `merchant_history` summary — the two tables it reads have
+# had no writer since the v1 subscription tracker was deleted. Both the Todoist
+# comment and the decision card render that summary verbatim, so this is what
+# stops a frozen answer being read as a current one.
+_RETIRED_SOURCE = (
+    "source retired 2026-09: finance.recurring_charge is frozen and no receipt "
+    "stored since then is linked to it, so this covers nothing recent — the "
+    "hledger books are the record now"
 )
 
 
@@ -555,21 +571,30 @@ class AgentTaskActivities:
 
     @activity.defn
     async def merchant_history(self, title: str, limit: int = 6) -> dict:
-        """Prior charges for the merchant this task names.
+        """Prior charges for the merchant this task names, from a RETIRED source.
 
         The value of this verb is assembled context, not an autonomous
         decision — whether a charge is legitimate is the user's call.
+
+        Every answer carries `_RETIRED_SOURCE` because this reads two frozen
+        tables. Nothing has written `finance.recurring_charge` or stamped
+        `finance.receipt_email.charge_id` since the v1 subscription tracker was
+        deleted (2026-09), so the join below can only ever match receipts
+        stored before that date. A bare "no prior charges on record" would
+        therefore mean "we stopped looking", while the operator — or an agent
+        summarising this for them — would read it as "this merchant is new".
+        Both are decision-grade claims about money, so neither is made silently.
         """
         merchant = extract_merchant(title)
         if not merchant or self.db_pool is None:
             return {"merchant": "", "charges": [], "summary": ""}
         # `recurring_charge` is UPSERT-keyed on
         # (account, sender_label, amount_cents, currency) — one row per charge
-        # SIGNATURE with last_seen_at bumped in place (money.py:250-252) — so a
-        # merchant billing a steady amount has exactly ONE row and no history.
-        # `receipt_email` IS append-only (one row per receipt, unique on
-        # message_id), so join through its charge_id FK for the canonical vendor
-        # and read each receipt's own amount from the `parsed` extraction.
+        # SIGNATURE with last_seen_at bumped in place — so a merchant billing a
+        # steady amount has exactly ONE row and no history. `receipt_email` IS
+        # append-only (one row per receipt, unique on message_id), so join
+        # through its charge_id FK for the canonical vendor and read each
+        # receipt's own amount from the `parsed` extraction.
         rows = await self.db_pool.fetch(
             """
             SELECT re.received_at,
@@ -593,10 +618,10 @@ class AgentTaskActivities:
             }
             for r in rows
         ]
-        summary = (
-            "; ".join(f"{c['amount']:g} {c['currency']} on {c['last_seen_at'][:10]}" for c in charges)
-            or "no prior charges on record"
+        found = "; ".join(
+            f"{c['amount']:g} {c['currency']} on {c['last_seen_at'][:10]}" for c in charges
         )
+        summary = f"{found} ({_RETIRED_SOURCE})" if found else f"nothing found — {_RETIRED_SOURCE}"
         return {"merchant": merchant, "charges": charges, "summary": summary}
 
     @activity.defn
