@@ -118,3 +118,70 @@ async def test_truncation_returns_stubs_and_other_errors_raise():
 @pytest.mark.asyncio
 async def test_empty_input_is_empty_output():
     assert await _Client("[]").extract_money_batch([], model="m") == []
+
+
+@pytest.mark.asyncio
+async def test_a_null_field_ignore_answer_is_a_correct_answer_not_a_parse_failure():
+    """#411. For marketing and notice mail the prompt asks for `kind: "ignore"`
+    and the model answers exactly that, with every other field null.
+
+    `MoneyEvent` gives `payee` and `channel` non-null defaults (`""`,
+    `"other"`), so an explicit `null` was REJECTED and the item fell through to
+    the `_parse_failed` stub. The booked outcome (`ignore`) was right by
+    accident while the record said the model had failed — and `_parse_failed`
+    is the number used to judge a model on this lane, so 13 of 24 correct
+    answers in a live replay read as failures.
+    """
+    payload = [{
+        "kind": "ignore", "direction": None, "amount": None, "currency": None,
+        "payee": None, "category": None, "channel": None, "instrument": None,
+        "occurred_on": None, "due_on": None, "is_recurring": None, "confidence": None,
+    }]
+    out = await _Client(json.dumps(payload)).extract_money_batch([RECEIPT], model="m")
+    ev = out[0]
+    assert "_parse_failed" not in ev, "a correct ignore is not a parse failure"
+    assert ev["kind"] == "ignore" and ev["parser"] == "llm"
+    # The nulls fall back to the model's own defaults rather than being stored.
+    assert ev["payee"] == "" and ev["payee_key"] == "" and ev["channel"] == "other"
+    assert ev["amount"] is None and ev["confidence"] == 1.0
+
+
+@pytest.mark.asyncio
+async def test_a_real_transaction_is_untouched_by_the_null_drop():
+    """The other half: dropping nulls must not drop VALUES. Every field the
+    model actually filled still lands, including the ones a `None` sibling
+    sits next to."""
+    payload = [{
+        "kind": "transaction", "direction": "out", "amount": "1,936.00", "currency": "inr",
+        "payee": "Eleven Labs", "category": "software", "channel": "card",
+        "instrument": None, "occurred_on": "2026-08-25", "due_on": None,
+        "is_recurring": True, "confidence": 0.95,
+    }]
+    out = await _Client(json.dumps(payload)).extract_money_batch([RECEIPT], model="m")
+    ev = out[0]
+    assert "_parse_failed" not in ev
+    assert ev["kind"] == "transaction" and ev["direction"] == "out"
+    assert ev["amount"] == "1936.00" and ev["currency"] == "INR"
+    assert ev["payee"] == "Eleven Labs" and ev["payee_key"] == "eleven labs"
+    assert ev["category"] == "software" and ev["channel"] == "card"
+    assert ev["occurred_on"] == "2026-08-25" and ev["is_recurring"] is True
+    assert ev["confidence"] == 0.95
+
+
+@pytest.mark.asyncio
+async def test_a_genuinely_malformed_item_is_still_a_parse_failure():
+    """The null-drop must not launder real breakage into a bookable event.
+
+    Three shapes that are still failures: an unparseable amount, an item that
+    is not an object at all, and a null `kind` — the one field with no default,
+    so dropping it leaves pydantic to reject a missing required field rather
+    than inventing one.
+    """
+    for payload in (
+        [{"kind": "transaction", "amount": "abc", "payee": "Acme"}],
+        ["not an object"],
+        [{"kind": None, "payee": "Acme", "amount": 10}],
+    ):
+        out = await _Client(json.dumps(payload)).extract_money_batch([RECEIPT], model="m")
+        assert out[0]["_parse_failed"] is True, payload
+        assert out[0]["kind"] == "ignore"
