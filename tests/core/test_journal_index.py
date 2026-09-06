@@ -189,3 +189,67 @@ async def test_find_open_due_tolerance_and_window(db_pool):
     # ...and paying it still takes it out of the pool, task or no task.
     await ji.mark_due_paid(db_pool, "ji-due/2", "ji-pay/1")
     assert await ji.find_open_due(db_pool, "axis credit card xx13", Decimal("100300.00"), "INR", date(2026, 9, 6)) is None
+
+
+@pytest.mark.asyncio
+async def test_upsert_stores_the_reference_and_never_nulls_it(db_pool):
+    """`ref` is the transaction reference (UPI RRN, IMPS/NEFT/SWIFT), the exact
+    key a bank statement's narration carries. It is the one parsed column that
+    COALESCEs on conflict: a re-index that could not read it must not erase
+    what a better parser already found, and a different one still wins.
+    """
+    ev = _bank(ref="529012345678")
+    await ji.upsert(db_pool, "ji-ref/1", "arshad-personal", ev)
+    assert (await ji.get(db_pool, "ji-ref/1"))["ref"] == "529012345678"
+
+    # The LLM path never sets `ref`, and `match_to_event` used to rebuild an
+    # enriched row without it. Neither may wipe the stored reference.
+    await ji.upsert(db_pool, "ji-ref/1", "arshad-personal", _bank(ref=None, payee="Shop"))
+    row = await ji.get(db_pool, "ji-ref/1")
+    assert row["ref"] == "529012345678" and row["payee"] == "Shop"
+
+    # A reference that IS read again wins, even a corrected one.
+    await ji.upsert(db_pool, "ji-ref/1", "arshad-personal", _bank(ref="600099998888"))
+    assert (await ji.get(db_pool, "ji-ref/1"))["ref"] == "600099998888"
+
+
+@pytest.mark.asyncio
+async def test_upsert_canonicalises_the_instrument_against_the_chart(db_pool):
+    """One account, one instrument spelling in the index.
+
+    `card-1313` (a vendor receipt: the digits, not the bank) and `axis-cc-1313`
+    (the bank's own alert) are the same card, and a statement matcher grouping
+    on this column has to see one card, not two.
+    """
+    declared = {"liabilities:card:axis:1313", "assets:bank:nkgsb:843"}
+    await ji.upsert(
+        db_pool, "ji-inst/1", "arshad-personal",
+        _bank(instrument="card-1313", parser="stripe_receipt", source_class="receipt"),
+        declared=declared,
+    )
+    await ji.upsert(
+        db_pool, "ji-inst/2", "arshad-personal",
+        _bank(instrument="axis-cc-1313", parser="axis_card_spend"), declared=declared,
+    )
+    await ji.upsert(
+        db_pool, "ji-inst/3", "arshad-personal",
+        _bank(instrument="nkgsb-0843", parser="nkgsb"), declared=declared,
+    )
+    spellings = [
+        (await ji.get(db_pool, f"ji-inst/{n}"))["instrument"] for n in (1, 2, 3)
+    ]
+    assert spellings == ["axis-cc-1313", "axis-cc-1313", "nkgsb-843"]
+
+    # An instrument the chart cannot resolve is stored EXACTLY as parsed:
+    # `hdfc-0325` is a real account the user has not declared yet.
+    await ji.upsert(
+        db_pool, "ji-inst/4", "arshad-personal",
+        _bank(instrument="hdfc-0325"), declared=declared,
+    )
+    assert (await ji.get(db_pool, "ji-inst/4"))["instrument"] == "hdfc-0325"
+
+    # No chart passed (books disabled) leaves the spelling alone too.
+    await ji.upsert(
+        db_pool, "ji-inst/5", "arshad-personal", _bank(instrument="card-1313"),
+    )
+    assert (await ji.get(db_pool, "ji-inst/5"))["instrument"] == "card-1313"
