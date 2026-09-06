@@ -70,6 +70,11 @@ _MIN_MEMORIES_TO_APPLY = 10
 # would break that idempotence, so consolidation never touches one.
 _DEDUPE_MARKER = "[gmail:"
 
+# "only DELETE a row whose every fact survives in … an UPDATE you also emit"
+# asks for a merge split across two ops, and the model picks the order it emits
+# them in. That used to decide whether the merged wording survived (#399);
+# `apply_consolidation` now runs a plan's retires before its writes, so the
+# instruction is safe in either order and needs no ordering rule of its own.
 _SYSTEM_PROMPT = (
     "You consolidate an AI agent's long-term memory. You are given a JSON array "
     "of memory rows: {id, content, importance, source}. Propose the smallest set "

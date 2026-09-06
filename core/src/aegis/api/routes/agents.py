@@ -92,6 +92,16 @@ async def get_agent_memory_ops(
     (`UPDATE agent_memory SET superseded_at = NULL, superseded_by = NULL
     WHERE id = …`), intentionally not exposed as a route.
 
+    That un-retire is NOT unconditional. Migration 028 put a unique index on
+    live `(agent_id, md5(content))`, so it raises `UniqueViolationError` when a
+    live row of the same agent already holds the identical text — which is
+    exactly what a merge leaves behind. Look for the twin first, and retire or
+    reword it before restoring:
+
+        SELECT id FROM agent_memory
+         WHERE agent_id = :agent AND superseded_at IS NULL
+           AND md5(content) = (SELECT md5(content) FROM agent_memory WHERE id = :id);
+
     This endpoint is intentionally curl/ops-only, no UI consumer.
     """
     pool = request.app.state.db_pool
