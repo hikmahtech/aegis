@@ -76,6 +76,7 @@ from jsonschema.exceptions import ValidationError as JSONSchemaValidationError
 from aegis.api.auth import security, verify_auth
 from aegis.api.deps import get_settings
 from aegis.config import Settings
+from aegis.llm.tier import tier_to_model_or
 from aegis.mcp_manager import _PROTOCOL_VERSION as MCP_PROTOCOL_VERSION
 from aegis.observability import record_tool_call
 from aegis.services.agents import get_agent
@@ -983,7 +984,7 @@ def _tool_context(request: Request, agent_id: str, settings: Settings) -> ToolCo
         remote_script_connector=getattr(state, "remote_script_connector", None),
         vercel_connector=getattr(state, "vercel_connector", None),
         mcp_manager=getattr(state, "mcp_manager", None),
-        model_light=getattr(settings, "model_fast", "gemma4:e2b"),
+        model_light=tier_to_model_or("fast", getattr(settings, "model_fast", "gemma4:e2b")),
     )
 
 
