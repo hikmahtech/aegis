@@ -218,7 +218,14 @@ class _Connector:
 
 
 class _LLM:
-    """`LLMClient.think` stand-in; `reply` may be an exception to raise."""
+    """`LLMClient.think` stand-in; `reply` may be an exception to raise.
+
+    The reply goes under `response`, which is the key the real `think()`
+    returns. It used to be `content`, a key `LLMClient` has never returned, and
+    that one word made every collision test in this file unfalsifiable: the
+    activity read `content` too, so fake and production agreed on a shape the
+    real client never produces (#413).
+    """
 
     def __init__(self, reply):
         self.reply = reply
@@ -245,7 +252,7 @@ class _LLM:
         )
         if isinstance(self.reply, Exception):
             raise self.reply
-        return {"content": self.reply}
+        return {"response": self.reply}
 
 
 # --- load_task ---------------------------------------------------------------
@@ -669,6 +676,66 @@ async def test_the_llm_hands_the_task_over_when_a_person_is_on_it(db_pool, _task
     assert llm.calls[0]["agent_id"] == "pandoras-actor"
 
 
+class _RealShapeLLM:
+    """`think()` returning EXACTLY what `LLMClient._think_once` returns.
+
+    Written out in full, and deliberately not reusing `_LLM`: the bug in #413
+    was a shared wrong assumption between the activity and the fake, so a test
+    that pins the real shape has to state that shape itself.
+    """
+
+    def __init__(self, reply: str):
+        self.reply = reply
+        self.calls: list[dict] = []
+
+    async def think(self, prompt: str, model: str = "gemma4:e2b", **kw) -> dict:
+        self.calls.append({"prompt": prompt, "model": model, **kw})
+        return {
+            "response": self.reply,
+            "model": model,
+            "prompt_tokens": 100,
+            "completion_tokens": 20,
+        }
+
+
+async def test_the_verdict_is_read_from_the_key_think_actually_returns(db_pool, _task):
+    """#413. The check read `result["content"]`; `think()` returns `response`.
+
+    So the verdict string was always `""`, `parse_same_task_verdict` failed
+    closed to `same_task: False`, and EVERY collision check answered "no
+    collision" — the LLM billed, the answer discarded, and an agent run
+    launched into a repo a person was working in.
+
+    Falsifiable: put the reply back under `content` in the fake above, or read
+    `content` in the activity, and this fails.
+    """
+    await svc.create_session(db_pool, task_id=_TASK, agent_id="pandoras-actor")
+    conn = _Connector(sessions=[_HUMAN], git_stdout=_GIT)
+    llm = _RealShapeLLM(_SAME)
+    out = await _collision_act(db_pool, conn, llm).check_task_collision(
+        _TASK, "hikmah/aegis", _SESSION_ID, False
+    )
+    assert out["verdict"] == "hand_to_you"
+    assert out["session"]["name"] == "fix-retry"
+    assert out["reason"] == "same branch"
+    assert len(llm.calls) == 1
+
+
+async def test_a_no_collision_answer_in_the_same_key_still_proceeds(db_pool, _task):
+    """The other half. Reading the right key must not turn every answer into a
+    hand-over — a model that says "different task" still launches the run, and
+    its stated reason is what the flow reports."""
+    await svc.create_session(db_pool, task_id=_TASK, agent_id="pandoras-actor")
+    conn = _Connector(sessions=[_HUMAN], git_stdout=_GIT)
+    llm = _RealShapeLLM('{"same_task": false, "reason": "different feature"}')
+    out = await _collision_act(db_pool, conn, llm).check_task_collision(
+        _TASK, "hikmah/aegis", _SESSION_ID, False
+    )
+    assert out["verdict"] == "proceed"
+    assert out["reason"] == "different feature"
+    assert [s["name"] for s in out["sessions"]] == ["fix-retry"]
+
+
 async def test_a_shallow_history_keeps_its_commit_out_of_the_status_field(db_pool, _task):
     """The blocks are separated by an echoed marker, not counted off as
     "the next three lines": a repo with one commit would otherwise put two
@@ -1026,3 +1093,32 @@ def test_fake_connector_matches_the_real_signatures():
     kwargs = {"prompt": "p", "model": "m", "max_tokens": 10, "purpose": "x", "agent_id": "a"}
     real_think.bind(None, **kwargs)
     fake_think.bind(None, **kwargs)
+
+
+def test_the_fakes_return_the_keys_think_really_returns():
+    """The signature pin above covers what goes IN. #413 was about what comes
+    OUT: both `_LLM` and the activity read `content`, a key `LLMClient` has
+    never returned, so the fake agreed with the bug.
+
+    The real keys are read off `_think_once`'s own `return` statements rather
+    than restated here, so renaming `response` upstream fails this test instead
+    of leaving a fake quietly standing for a shape that no longer exists.
+    """
+    import ast
+    import inspect as _inspect
+    import textwrap
+
+    from aegis.llm import LLMClient
+
+    tree = ast.parse(textwrap.dedent(_inspect.getsource(LLMClient._think_once)))
+    real_keys = {
+        k.value
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Return) and isinstance(node.value, ast.Dict)
+        for k in node.value.keys
+        if isinstance(k, ast.Constant)
+    }
+    assert "response" in real_keys, real_keys
+    for fake in (_LLM("x"), _RealShapeLLM("x")):
+        returned = set(asyncio.run(fake.think("p")))
+        assert returned <= real_keys, f"{type(fake).__name__} returns {returned - real_keys}"
