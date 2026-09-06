@@ -4,8 +4,8 @@
 
 tiers:
   fast:     "gemma4:e2b"              # quick chat, tight-loop classification (local ollama on meem)
-  balanced: "kimi-k2.5"               # default chat + most flows — Kimi-for-Coding via LiteLLM (flat-rate, tool-calling). Replaced gpt-oss:20b, whose host (ollama-2 on asif) was decommissioned 2026-08.
-  smart:    "claude-opus"             # Claude Opus via the Max-subscription bridge (max-proxy on meem) — chat only. The bridge strips tools, so tool-bearing turns swap to balanced (chat.py _TOOL_INCAPABLE_MODELS). The Anthropic API key was retired 2026-09-06.
+  balanced: "bedrock-glm-4.7-flash"   # most flows — GLM 4.7 Flash on Amazon Bedrock (ap-south-1) via LiteLLM: tool-capable, $0.08/$0.48 per MTok. Replaced the weekly-limited Kimi coding plan (kimi-k2.5, still the LiteLLM fallback) on 2026-09-06.
+  smart:    "bedrock-kimi-k2.5"       # agent chat — Kimi K2.5 on Amazon Bedrock (ap-south-1) via LiteLLM: tool-capable, no weekly limit. Alias name must keep "kimi" so llm/__init__.py's reasoning floor applies. Replaced the tool-stripping max-proxy bridge (claude-opus) the same day.
 
 litellm:
   # base_url is set by env: AEGIS_LITELLM_URL

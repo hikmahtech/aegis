@@ -268,10 +268,10 @@ async def classify_intent(message: str, llm, settings, pool=None) -> dict:
 #   - Real Anthropic-API aliases (versioned names such as claude-sonnet-5,
 #     claude-haiku-4.5) hit `anthropic/...` with a real key and are fully
 #     tool-capable. They were REMOVED from the proxy on 2026-09-06 (key
-#     retired after a pay-as-you-go bill); `smart` now resolves to the
-#     bridge alias claude-opus (config/models.yaml), so every tool-bearing
-#     smart-tier turn takes the balanced-tier swap below BY DESIGN. If a
-#     versioned alias ever comes back, it must stay out of this set.
+#     retired after a pay-as-you-go bill). `smart` now resolves to
+#     bedrock-kimi-k2.5 (config/models.yaml) — tool-capable, so it must
+#     stay OUT of this set; the bridge alias claude-opus held the tier for a
+#     single day and swapped every tool-bearing turn down to balanced.
 # Do NOT turn this into a `claude-` prefix check — that would also catch a
 # versioned, tool-capable name and silently downgrade every tool-bearing
 # smart-tier chat turn to the balanced tier for no reason. Match must stay
