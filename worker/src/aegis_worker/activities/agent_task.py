@@ -979,7 +979,10 @@ class AgentTaskActivities:
                 purpose="task_session_collision",
                 agent_id=owner,
             )
-            verdict = parse_same_task_verdict(str(result.get("content") or ""))
+            # `response` is the key `think()` returns; `content` (what this read
+            # until #413) is one the client has never had, so every verdict was
+            # the empty string parsing closed to "no collision".
+            verdict = parse_same_task_verdict(str(result.get("response") or ""))
             if not verdict["same_task"]:
                 return {**proceed, "sessions": enriched, "reason": verdict["reason"]}
             # By name, because the model answers with one. A name it invented
