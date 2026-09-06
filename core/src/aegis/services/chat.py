@@ -18,7 +18,7 @@ from jsonschema import Draft202012Validator
 from jsonschema.exceptions import ValidationError as JSONSchemaValidationError
 
 from aegis.llm import parse_llm_json
-from aegis.llm.tier import resolve_model_for_agent, tier_to_model
+from aegis.llm.tier import resolve_model_for_agent, tier_to_model, tier_to_model_or
 from aegis.mcp_manager import MCPError
 from aegis.observability import log_audit, record_llm_call, record_tool_call
 from aegis.services.source_types import DEFAULT_DECAY_DAYS, get_decay_days
@@ -235,7 +235,9 @@ async def classify_intent(message: str, llm, settings, pool=None) -> dict:
         return {"agent_id": kw, "reason": "keyword", "method": "keyword"}
     if llm is None:
         return {"agent_id": "sebas", "reason": "no_llm", "method": "default"}
-    model = getattr(settings, "model_fast", "gemma4:e2b") if settings else "gemma4:e2b"
+    # The tier map, not the raw env field it falls back to (#414).
+    stale = getattr(settings, "model_fast", "gemma4:e2b") if settings else "gemma4:e2b"
+    model = tier_to_model_or("fast", stale)
     descriptions = await _agent_intent_descriptions(pool)
     # Accept any routable active agent the LLM names — keyword map OR intent
     # description — so a custom agent reachable only via intent_description isn't
@@ -4008,7 +4010,7 @@ async def send_message(
         remote_script_connector=remote_script_connector,
         vercel_connector=vercel_connector,
         mcp_manager=mcp_manager,
-        model_light=getattr(settings, "model_fast", "gemma4:e2b"),
+        model_light=tier_to_model_or("fast", getattr(settings, "model_fast", "gemma4:e2b")),
     )
 
     # Tool-calling loop

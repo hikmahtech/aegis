@@ -37,6 +37,27 @@ def tier_to_model(tier: str) -> str:
     return _TIERS[tier]
 
 
+def tier_to_model_or(tier: str, fallback: str) -> str:
+    """`tier_to_model(tier)`, degrading to `fallback` when the map cannot answer.
+
+    For callers on a request path. The tier map is installed at boot, so a
+    request that arrives first — or a backend whose map omits the tier — must
+    still be served; a KeyError escaping into the chat front door would take it
+    down. `fallback` is the caller's own pre-tier-map value, which is the raw
+    `settings.model_*` env field, so behaviour before the tiers load is exactly
+    what it was.
+
+    What this is NOT is a licence to read that field directly (#414): the env
+    field is what `services/llm_backend.py` falls back TO after the DB row and
+    `config/models.yaml` have both failed to answer, so a site that reads it
+    without asking the map first silently follows a stale deploy's env.
+    """
+    try:
+        return tier_to_model(tier)
+    except KeyError:
+        return fallback
+
+
 async def resolve_model_for_agent(pool: Any, agent_id: str) -> str:
     """Return the fully-qualified model string for an agent based on its tier.
 

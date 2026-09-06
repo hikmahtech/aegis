@@ -179,7 +179,10 @@ async def bootstrap(settings: Settings | None = None) -> WorkerDeps:
         base_url=backend["base_url"],
         api_key=backend["api_key"],
         timeout=settings.litellm_timeout,
-        concurrency_limits={settings.model_fast: 2},
+        # Keyed on what `fast` RESOLVES to, not on the raw env field the tier
+        # map merely falls back to (#414): when the two differ the cap lands
+        # on a model nobody calls and the real fast model runs unthrottled.
+        concurrency_limits={backend["tiers"].get("fast") or settings.model_fast: 2},
         db_pool=pool,
     )
 
