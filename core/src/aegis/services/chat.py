@@ -265,13 +265,15 @@ async def classify_intent(message: str, llm, settings, pool=None) -> dict:
 #     array from the upstream request — the model never sees the tool
 #     definitions and responds in plain text (often hallucinating that no
 #     tools are available). THESE are what `_TOOL_INCAPABLE_MODELS` matches.
-#   - Real Anthropic-API aliases (versioned names): claude-sonnet-5,
-#     claude-haiku-4.5. These hit `anthropic/...` directly with a real API
-#     key and `model_info.supports_function_calling: true` — fully
-#     tool-capable. `smart` currently resolves to claude-sonnet-5
-#     (config/models.yaml), so it is deliberately NOT in this set.
-# Do NOT turn this into a `claude-` prefix check — that would also catch the
-# versioned, tool-capable names and silently downgrade every tool-bearing
+#   - Real Anthropic-API aliases (versioned names such as claude-sonnet-5,
+#     claude-haiku-4.5) hit `anthropic/...` with a real key and are fully
+#     tool-capable. They were REMOVED from the proxy on 2026-09-06 (key
+#     retired after a pay-as-you-go bill); `smart` now resolves to the
+#     bridge alias claude-opus (config/models.yaml), so every tool-bearing
+#     smart-tier turn takes the balanced-tier swap below BY DESIGN. If a
+#     versioned alias ever comes back, it must stay out of this set.
+# Do NOT turn this into a `claude-` prefix check — that would also catch a
+# versioned, tool-capable name and silently downgrade every tool-bearing
 # smart-tier chat turn to the balanced tier for no reason. Match must stay
 # an exact-name set of the three bridge aliases.
 # When an agent has tools to call and the resolved model is one of these,

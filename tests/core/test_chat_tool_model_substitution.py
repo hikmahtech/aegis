@@ -20,14 +20,15 @@ whatever's actually configured, with a safe no-op if `balanced` isn't
 resolvable (rather than crashing the chat request).
 
 NOTE, because this was gotten wrong once already during the D1 work: the
-exact-match set is intentional and correct. `claude-sonnet-5` and
-`claude-haiku-4.5` are DIFFERENT LiteLLM model entries -- real Anthropic-API
-aliases (infra: ansible/roles/ollama/templates/litellm-config.yaml.j2,
-`model_info.supports_function_calling: true`), not the max-proxy bridge --
-and `smart` resolves to `claude-sonnet-5` today. A `claude-` prefix check
-would also catch those versioned, tool-capable names and silently downgrade
-every tool-bearing smart-tier chat turn to `balanced` for no reason. Do not
-"fix" this into a prefix check again; the tests below pin both directions.
+exact-match set is intentional and correct. Versioned names such as
+`claude-sonnet-5` / `claude-haiku-4.5` were DIFFERENT LiteLLM model entries
+-- real Anthropic-API aliases with `model_info.supports_function_calling:
+true` -- not the max-proxy bridge. Those aliases were removed from the proxy
+on 2026-09-06 (the Anthropic key was retired) and `smart` now resolves to the
+bridge alias `claude-opus`, so a tool-bearing smart-tier turn takes the
+balanced swap by design. The versioned-name tests below still pin the other
+direction so that a `claude-` prefix check can never sneak back in: if a
+real-API alias returns, it must pass through with its tools intact.
 """
 
 from __future__ import annotations
@@ -132,11 +133,12 @@ def _mock_llm():
 
 @pytest.mark.asyncio
 async def test_smart_tier_versioned_claude_model_is_left_unchanged() -> None:
-    """Pandora (smart-tier -> claude-sonnet-5, the live config/models.yaml
-    value) has tools (trigger_workflow, etc.). claude-sonnet-5 is a real
-    Anthropic-API alias with `supports_function_calling: true`
-    (litellm-config.yaml.j2), NOT the max-proxy bridge, so send_message must
-    call llm_client.chat with the model UNCHANGED. Regression guard against
+    """Pandora (smart-tier -> claude-sonnet-5 in this module's fixture) has
+    tools (trigger_workflow, etc.). A versioned real-Anthropic-API alias is
+    tool-capable, NOT the max-proxy bridge, so send_message must call
+    llm_client.chat with the model UNCHANGED. The live config/models.yaml
+    smart tier is the bridge alias `claude-opus` since 2026-09-06; this test
+    keeps the versioned-name direction pinned as a regression guard against
     re-introducing a `claude-` prefix check, which would silently downgrade
     every tool-bearing smart-tier chat turn to `balanced` for no reason."""
     pool = _mock_pool("smart")
