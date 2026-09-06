@@ -78,7 +78,7 @@ _REASONING_MIN_TOKENS = 4096
 # back to the caller's raw budget, so add new reasoning models here when the
 # tier map moves — a missing entry is silent, not loud (that is exactly how
 # qwen3.5:9b came to run briefing_frame at a raw 2000 and fail 3/3).
-_REASONING_MODELS = ("kimi", "qwen")
+_REASONING_MODELS = ("kimi", "qwen", "glm")
 
 # One-shot re-roll budget for a call that came back EMPTY with
 # finish_reason=length. Deliberately NOT a new floor: 30 days of prod kimi-k2.5

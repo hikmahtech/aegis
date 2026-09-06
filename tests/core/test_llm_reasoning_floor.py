@@ -21,6 +21,13 @@ def test_floor_never_shrinks_a_budget():
         assert _reasoning_floor("kimi-k2.5", budget) >= budget
 
 
+def test_glm_is_floored_too():
+    # GLM 4.7 Flash (bedrock-glm-4.7-flash, the balanced tier since 2026-09-06)
+    # is a thinking model too; a raw sub-floor budget would clip its visible
+    # output the same way it did for qwen3.5:9b.
+    assert _reasoning_floor("bedrock-glm-4.7-flash", 2000) == _REASONING_MIN_TOKENS
+
+
 def test_qwen_is_floored_too():
     # qwen3.5:9b ran briefing_frame at a raw max_tokens=2000 and returned empty
     # content on 100% of calls, because the floor matched only "kimi". A
