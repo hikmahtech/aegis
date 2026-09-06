@@ -7,11 +7,13 @@ admin page. Never treat `amount` here as authoritative; run hledger.
 
 from __future__ import annotations
 
+from collections.abc import Collection
 from datetime import date, timedelta
 from decimal import Decimal
 from typing import Any
 
 from aegis.api.models.money import MoneyEvent
+from aegis.services import books
 
 _MATCH_DAYS = 3
 _DUE_DAYS = 45
@@ -31,19 +33,39 @@ async def upsert(
     journal_file: str | None = None,
     linked: str | None = None,
     todoist_ref: str | None = None,
+    declared: Collection[str] = (),
 ) -> None:
+    """Write one index row.
+
+    `declared` is the chart (`books.declared_accounts`), and it is here rather
+    than in the parsers because this is the single door EVERY row comes
+    through: the deterministic parsers, the LLM extraction that never touches
+    `bank_parsers` at all, and the manual `ledger_post`. It buys one canonical
+    instrument spelling per account — see `books.canonical_instrument`.
+    Omitting it is safe and means "no chart to hand": the instrument is then
+    stored exactly as parsed.
+    """
     await pool.execute(
         """
         INSERT INTO finance.journal_index
           (message_id, mailbox, entity, kind, direction, amount, currency, payee, payee_key,
-           account, channel, instrument, occurred_on, due_on, parser, confidence, source_class,
-           journal_file, linked_message_id, todoist_ref)
-        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)
+           account, channel, instrument, ref, occurred_on, due_on, parser, confidence,
+           source_class, journal_file, linked_message_id, todoist_ref)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21)
         ON CONFLICT (message_id) DO UPDATE SET
           mailbox = EXCLUDED.mailbox, entity = EXCLUDED.entity, kind = EXCLUDED.kind,
           direction = EXCLUDED.direction, amount = EXCLUDED.amount, currency = EXCLUDED.currency,
           payee = EXCLUDED.payee, payee_key = EXCLUDED.payee_key, account = EXCLUDED.account,
           channel = EXCLUDED.channel, instrument = EXCLUDED.instrument,
+          -- COALESCE, not EXCLUDED, alone among the parsed columns. A
+          -- reference is a fact about the payment, not a verdict about it: a
+          -- re-index that reads it again reads the same digits, and one that
+          -- cannot read them at all (the LLM path never sets `ref`, and
+          -- `match_to_event` rebuilds an enriched row from a subset of
+          -- columns) must not erase what a better parser already found. A
+          -- genuinely different reference still wins — COALESCE only refuses
+          -- to overwrite with NULL.
+          ref = COALESCE(EXCLUDED.ref, journal_index.ref),
           occurred_on = EXCLUDED.occurred_on, due_on = EXCLUDED.due_on, parser = EXCLUDED.parser,
           confidence = EXCLUDED.confidence, source_class = EXCLUDED.source_class,
           journal_file = COALESCE(EXCLUDED.journal_file, journal_index.journal_file),
@@ -52,7 +74,8 @@ async def upsert(
           updated_at = now()
         """,
         msgid, mailbox, event.entity, event.kind, event.direction, event.amount, event.currency,
-        event.payee, event.payee_key, event.account, event.channel, event.instrument,
+        event.payee, event.payee_key, event.account, event.channel,
+        books.canonical_instrument(event.instrument, declared), event.ref,
         event.occurred_on, event.due_on, event.parser, float(event.confidence), event.source_class,
         journal_file, linked, todoist_ref,
     )

@@ -2,7 +2,13 @@ from decimal import Decimal
 
 import pytest
 from aegis.api.models.money import MoneyEvent, payee_key
-from aegis.services.books import account_for, fmt_money, instrument_account, render_amount
+from aegis.services.books import (
+    account_for,
+    canonical_instrument,
+    fmt_money,
+    instrument_account,
+    render_amount,
+)
 
 
 def test_payee_key_normalises():
@@ -82,6 +88,68 @@ def test_instrument_account():
     assert instrument_account("axis-upi", declared) == "assets:unknown"
     assert instrument_account(None) == "assets:unknown"
     assert instrument_account("") == "assets:unknown"
+
+
+def test_instrument_account_tolerates_a_zero_padded_tail():
+    """`nkgsb-0843` and `nkgsb-843` are one account, and the padded spelling
+    used to resolve to `assets:unknown` — where ₹53,774.56 of real money sits.
+
+    The chart still decides. An account the user has not declared stays
+    unknown, because `hledger check --strict` rejects an undeclared account,
+    and the DECLARED spelling is what comes back for the same reason.
+    """
+    declared = {
+        "assets:bank:nkgsb:843",
+        "assets:bank:icici:143",
+        "assets:bank:hdfc:1225",
+        "assets:bank:axis:9640",
+        "liabilities:card:axis:1313",
+    }
+    assert instrument_account("nkgsb-0843", declared) == "assets:bank:nkgsb:843"
+    assert instrument_account("icici-0143", declared) == "assets:bank:icici:143"
+    assert instrument_account("card-01313", declared) == "liabilities:card:axis:1313"
+    assert instrument_account("hdfc-0325", declared) == "assets:unknown"
+    assert instrument_account("icici-9954", declared) == "assets:unknown"
+    # Leading zeros ONLY. A comparison that ignores length is a different bug:
+    # a one-digit tail must never reach a three-digit account.
+    assert instrument_account("axis-1", declared) == "assets:unknown"
+    assert instrument_account("icici-43", declared) == "assets:unknown"
+    assert instrument_account("card-313", declared) == "assets:unknown"
+
+
+def test_canonical_instrument_gives_one_spelling_per_account():
+    """One card, one spelling. `card-1313` (a receipt, which knows the digits
+    but not the bank) and `axis-cc-1313` (the bank's own alert) are the same
+    card, and both must group as one.
+    """
+    declared = {
+        "assets:bank:nkgsb:843",
+        "assets:bank:icici:143",
+        "assets:bank:hdfc:1225",
+        "liabilities:card:axis:1313",
+    }
+    assert canonical_instrument("card-1313", declared) == "axis-cc-1313"
+    assert canonical_instrument("axis-cc-1313", declared) == "axis-cc-1313"
+    assert canonical_instrument("nkgsb-0843", declared) == "nkgsb-843"
+    assert canonical_instrument("hdfc-1225", declared) == "hdfc-1225"
+    # Whatever comes back still resolves to the account it was derived from.
+    for raw in ("card-1313", "axis-cc-1313", "nkgsb-0843", "icici-0143", "hdfc-1225"):
+        assert instrument_account(canonical_instrument(raw, declared), declared) == (
+            instrument_account(raw, declared)
+        )
+    # An instrument the chart cannot resolve is kept EXACTLY as parsed, never
+    # rewritten and never dropped: `hdfc-0325` is a real account the user has
+    # not declared yet, and losing it would hide that from them.
+    assert canonical_instrument("hdfc-0325", declared) == "hdfc-0325"
+    assert canonical_instrument("axis-upi", declared) == "axis-upi"
+    assert canonical_instrument("card-9999", declared) == "card-9999"
+    # No chart to hand (books disabled) changes nothing.
+    assert canonical_instrument("card-1313") == "card-1313"
+    assert canonical_instrument("nkgsb-0843") == "nkgsb-0843"
+    assert canonical_instrument(None, declared) is None
+    # A derived spelling that would read back as a DIFFERENT account is
+    # refused: the bank segment here carries the "-" the spelling splits on.
+    assert canonical_instrument("card-77", {"liabilities:card:hdfc-bank:77"}) == "card-77"
 
 
 HOSTILE_CURRENCY = "\u20b9\n    ; hijacked: true"

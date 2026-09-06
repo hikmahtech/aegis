@@ -234,7 +234,7 @@ def drop_forecast_duplicates(
 def match_to_event(row: dict) -> dict:
     """journal_index row → MoneyEvent kwargs (for re-upserting an enriched row)."""
     keys = ("kind", "direction", "amount", "currency", "payee", "payee_key", "channel",
-            "instrument", "occurred_on", "due_on", "entity", "account", "parser",
+            "instrument", "ref", "occurred_on", "due_on", "entity", "account", "parser",
             "confidence", "source_class")
     return {k: row[k] for k in keys if k in row and row[k] is not None}
 
@@ -521,6 +521,26 @@ class MoneyActivities:
         p = payee or ""
         return "@" in p or p.startswith("a/c") or (p.isupper() and len(p) > 3)
 
+    async def _declared_chart(self) -> frozenset[str]:
+        """The declared chart, or empty when the books are unreachable.
+
+        Reading it costs an hledger run, and the index write only needs it to
+        canonicalise an instrument spelling, so a failure degrades that one
+        convenience rather than stopping the row being indexed — the half that
+        is designed to work with no checkout at all (`books_disabled`).
+        `books._spawn` turns a missing binary or working copy into a
+        `BooksError`, so that is the whole failure surface.
+        """
+        if self.books_cfg is None:
+            return frozenset()
+        try:
+            return frozenset(
+                await asyncio.to_thread(books._declared_accounts_sync, self.books_cfg)
+            )
+        except books.BooksError as exc:
+            activity.logger.warning("declared_chart_unavailable error=%s", exc)
+            return frozenset()
+
     @activity.defn
     async def post_money_event(
         self,
@@ -534,6 +554,10 @@ class MoneyActivities:
         posted or linked; everything else is indexed only."""
         ev = MoneyEvent(**{k: v for k, v in event.items() if not k.startswith("_")})
         msgid = ji.msgid_for(mailbox, message_id)
+        # Only read the chart when there is an instrument to canonicalise --
+        # most events have none (199 of 245 live rows), and each read spawns
+        # hledger.
+        declared = await self._declared_chart() if ev.instrument else frozenset()
         result: dict = {
             "msgid": msgid,
             "status": "indexed",
@@ -542,7 +566,9 @@ class MoneyActivities:
             "closed_due": None,
         }
         if ev.kind != "transaction" or ev.entity == "none":
-            await ji.upsert(self.db_pool, msgid, mailbox, ev, todoist_ref=todoist_ref)
+            await ji.upsert(
+                self.db_pool, msgid, mailbox, ev, todoist_ref=todoist_ref, declared=declared
+            )
             return result
 
         # Idempotency for the whole transaction branch, because `post_event`'s
@@ -611,17 +637,28 @@ class MoneyActivities:
                         fixed = MoneyEvent(**{**match_to_event(match), **fixed_kwargs})
                         if "payee" in fixed_kwargs:
                             fixed.payee_key = payee_key(fixed.payee)
-                        await ji.upsert(self.db_pool, other, match["mailbox"], fixed)
+                        await ji.upsert(
+                            self.db_pool, other, match["mailbox"], fixed, declared=declared
+                        )
                     else:
-                        declared = await asyncio.to_thread(books._declared_accounts_sync, cfg)
-                        inst = instrument_account(ev.instrument, declared)
+                        # Reuse the chart the index read, but fall back to a
+                        # read that RAISES: an empty chart here would write
+                        # `assets:unknown` over the counterpart's instrument
+                        # posting, where an unreadable chart is meant to drop
+                        # to the tag-only rewrite below.
+                        chart = declared or await asyncio.to_thread(
+                            books._declared_accounts_sync, cfg
+                        )
+                        inst = instrument_account(ev.instrument, chart)
                         try:
                             await books.rewrite_event(
                                 other, cfg, instrument_account=inst, add_tags={"bank": msgid}
                             )
                         except books.BooksCheckError:
                             await books.rewrite_event(other, cfg, add_tags={"bank": msgid})
-                    await ji.upsert(self.db_pool, msgid, mailbox, ev, linked=other)
+                    await ji.upsert(
+                        self.db_pool, msgid, mailbox, ev, linked=other, declared=declared
+                    )
                     await ji.link(self.db_pool, msgid, other)
                     linked_to = other
                 except books.BooksDisabled:
@@ -641,13 +678,15 @@ class MoneyActivities:
                 # Also the no-match path. Either way the index records what
                 # actually happened — `posted`, with the block it wrote.
                 rel = await books.post_event(ev, msgid, cfg)
-                await ji.upsert(self.db_pool, msgid, mailbox, ev, journal_file=rel)
+                await ji.upsert(
+                    self.db_pool, msgid, mailbox, ev, journal_file=rel, declared=declared
+                )
                 result.update(status="posted", journal_file=rel)
         except books.BooksDisabled:
             # The index is the cheap half and stays useful without a checkout:
             # the admin page, dues dedupe and matching all still work, and a
             # later backfill has the rows to post from.
-            await ji.upsert(self.db_pool, msgid, mailbox, ev)
+            await ji.upsert(self.db_pool, msgid, mailbox, ev, declared=declared)
             result["status"] = "books_disabled"
             return result
         except books.BooksError as exc:
@@ -669,7 +708,7 @@ class MoneyActivities:
                 type(exc).__name__,
                 exc,
             )
-            await ji.upsert(self.db_pool, msgid, mailbox, ev)
+            await ji.upsert(self.db_pool, msgid, mailbox, ev, declared=declared)
             result["status"] = "post_failed"
             return result
 

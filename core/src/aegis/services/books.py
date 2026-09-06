@@ -15,7 +15,7 @@ import os
 import re
 import shutil
 import subprocess
-from collections.abc import Callable
+from collections.abc import Callable, Collection
 from dataclasses import dataclass
 from datetime import date
 from decimal import Decimal, InvalidOperation
@@ -133,20 +133,57 @@ def account_entity(account: str) -> str | None:
     return "hikmah" if ":hikmah:" in f"{account}:" else "personal"
 
 
+def _same_tail(a: str, b: str) -> bool:
+    """Two account tails naming one account.
+
+    Leading zeros only, stripped on BOTH sides, so a padded instrument finds an
+    unpadded chart and an unpadded instrument finds a padded one. It is
+    deliberately NOT a numeric comparison: `1` and `143` are both numbers and
+    are different accounts, and reading the tails as integers would merge them.
+    Non-digit tails (`axis-upi`) compare as plain strings.
+    """
+    if a == b:
+        return True
+    if not (a.isascii() and a.isdigit() and b.isascii() and b.isdigit()):
+        return False
+    return a.lstrip("0") == b.lstrip("0")
+
+
+def _declared_with_tail(declared: Collection[str], prefix: str, tail: str) -> str | None:
+    """The declared account under `prefix` whose last segment names `tail`.
+
+    Sorted, so a chart that declares two candidates always picks the same one.
+    """
+    for acct in sorted(declared):
+        if acct.startswith(prefix) and _same_tail(acct.rpartition(":")[2], tail):
+            return acct
+    return None
+
+
 def instrument_account(
-    instrument: str | None, declared: set[str] | frozenset[str] = frozenset()
+    instrument: str | None, declared: Collection[str] = frozenset()
 ) -> str:
     """`hdfc-1225` → `assets:bank:hdfc:1225`, `axis-cc-1313` → `liabilities:card:axis:1313`,
-    `card-1313` → the declared `liabilities:card:*:1313`, else `assets:unknown`."""
+    `card-1313` → the declared `liabilities:card:*:1313`, else `assets:unknown`.
+
+    A declared account whose tail differs from the instrument's only by leading
+    zeros is the same account, and the DECLARED spelling is what comes back --
+    `hledger check --strict` rejects anything else. Banks write the tail both
+    ways: NKGSB mails `X0843` and the chart declares `843`, and the padded
+    spelling used to miss the string comparison and land in `assets:unknown`,
+    which is where ₹53,774.56 of real money went.
+
+    The chart still decides. An instrument the chart does not declare in any
+    spelling stays `assets:unknown`, because inventing an account here is what
+    `check --strict` would refuse on the way out.
+    """
     if not instrument:
         return "assets:unknown"
     parts = instrument.lower().split("-")
     if len(parts) == 2 and parts[0] == "card":
-        tail = parts[1]
-        for acct in sorted(declared):
-            if acct.startswith("liabilities:card:") and acct.endswith(f":{tail}"):
-                return acct
-        return "assets:unknown"
+        # The bank is unknown (a card receipt gives only the last digits), so
+        # the chart supplies it.
+        return _declared_with_tail(declared, "liabilities:card:", parts[1]) or "assets:unknown"
     if len(parts) == 3 and parts[1] == "cc":
         computed = f"liabilities:card:{parts[0]}:{parts[2]}"
     elif len(parts) == 2:
@@ -155,9 +192,46 @@ def instrument_account(
         return "assets:unknown"
     # An empty `declared` means "no chart to check against" (unit tests);
     # with a chart, an undeclared instrument must not break `check --strict`.
-    if declared and computed not in declared:
-        return "assets:unknown"
-    return computed
+    if not declared or computed in declared:
+        return computed
+    head, _, tail = computed.rpartition(":")
+    return _declared_with_tail(declared, f"{head}:", tail) or "assets:unknown"
+
+
+def canonical_instrument(
+    instrument: str | None, declared: Collection[str] = frozenset()
+) -> str | None:
+    """One instrument spelling per account: the form derived from the account.
+
+    `card-1313` and `axis-cc-1313` are the same credit card written twice --
+    the vendor receipt knows the last four digits and not the bank, the bank's
+    own alert knows both — and `nkgsb-0843` and `nkgsb-843` are one savings
+    account written with and without the pad. `instrument_account` resolves all
+    four correctly, so the postings are right; anything that GROUPS or MATCHES
+    on the instrument STRING still sees two cards and two banks, which is what
+    a statement matcher does per account.
+
+    An instrument the chart cannot resolve comes back UNCHANGED, never dropped:
+    `hdfc-0325` is a real account the user has not declared yet, and hiding it
+    would hide that. So is one seen with no chart to hand at all — with an
+    empty `declared` this returns its argument.
+    """
+    if not instrument:
+        return instrument
+    account = instrument_account(instrument, declared)
+    if account == "assets:unknown":
+        return instrument
+    head, _, tail = account.rpartition(":")
+    if head.startswith("assets:bank:"):
+        canon = f"{head.split(':')[2]}-{tail}"
+    elif head.startswith("liabilities:card:"):
+        canon = f"{head.split(':')[2]}-cc-{tail}"
+    else:
+        return instrument
+    # Never store a spelling that resolves somewhere else. The derived form is
+    # split on "-" when it is read back, so a bank segment containing one
+    # (`standard-chartered`) would come back as a different account, or none.
+    return canon if instrument_account(canon, declared) == account else instrument
 
 
 # ----------------------------------------------------------------- errors/config
@@ -744,7 +818,7 @@ def _revert_sync(cfg: BooksConfig, paths: list[str]) -> None:
     if not targets:
         return
     # Unstage first. A write can fail AFTER `git add` (the commit itself), and
-    # `git checkout -- <path>` restores from the INDEX, so a staged bad version
+    # `git checkout — <path>` restores from the INDEX, so a staged bad version
     # would be "restored" straight back into the working copy. Reset also makes
     # a newly-added file untracked again, so the `clean` below can remove it.
     _run(["git", "reset", "-q", "HEAD", "--", *targets], cfg, check=False)
@@ -769,7 +843,7 @@ def _commit_push_sync(cfg: BooksConfig, summary: str, paths: list[str]) -> bool:
     _run(["git", "add", "-A", "--", *scoped], cfg)
     if _run(["git", "diff", "--cached", "--quiet", "--", *scoped], cfg, check=False).returncode == 0:
         return False
-    # `commit -- <paths>` rather than a bare commit: a bare one would sweep in
+    # `commit — <paths>` rather than a bare commit: a bare one would sweep in
     # anything the human happened to have staged in the checkout already.
     _run(["git", "commit", "-q", "-m", summary, "--", *scoped], cfg)
     if _has_remote(cfg):
