@@ -21,10 +21,16 @@ import structlog
 import yaml
 
 from aegis.crypto import decrypt_secret, encrypt_secret
+from aegis.llm.routes import merge_routes
 
 logger = structlog.get_logger()
 
 SETTINGS_KEY = "llm_backend"
+# Purpose → category → model routing (see `aegis/llm/routes.py`). A partial
+# override in this `settings` row is merged OVER the `routes:` block in
+# config/models.yaml, so the DB can retune one category without restating the
+# file. There is no admin UI for it yet — write the row directly.
+ROUTES_SETTINGS_KEY = "llm_routes"
 _CACHE_TTL = 30.0
 _cache: dict[str, Any] = {"data": None, "ts": 0.0}
 
@@ -54,6 +60,46 @@ def _env_tiers(settings: Any) -> dict[str, str]:
         "balanced": settings.model_balanced,
         "smart": settings.model_smart,
     }
+
+
+def _env_routes(settings: Any) -> dict[str, Any]:
+    """The `routes:` block of config/models.yaml, or `{}` when absent.
+
+    Unreadable file, no `routes:` key, wrong shape — all resolve to "no
+    routing", which is the pre-routing behaviour. Never raises: a fork with no
+    models.yaml must still boot.
+    """
+    try:
+        data = yaml.safe_load(Path(settings.models_yaml_path).read_text()) or {}
+        routes = data.get("routes")
+        if isinstance(routes, dict) and routes:
+            return {
+                "categories": dict(routes.get("categories") or {}),
+                "purposes": dict(routes.get("purposes") or {}),
+            }
+    except Exception:
+        pass
+    return {}
+
+
+async def _db_routes(pool: Any) -> dict[str, Any] | None:
+    """The `llm_routes` settings row, or None. Never raises — a bad config read
+    must not stop the process booting."""
+    try:
+        row = await pool.fetchrow(
+            "SELECT value FROM settings WHERE key = $1", ROUTES_SETTINGS_KEY
+        )
+        if row and row["value"]:
+            value = row["value"]
+            if isinstance(value, str):  # pool without a jsonb codec
+                import json
+
+                value = json.loads(value)
+            if isinstance(value, dict):
+                return value
+    except Exception as exc:  # noqa: BLE001 — never break boot on a config read
+        logger.warning("llm_routes_read_failed", error=str(exc)[:200])
+    return None
 
 
 def _env_backend(settings: Any) -> dict[str, Any]:
@@ -89,6 +135,10 @@ async def get_llm_backend(pool: Any, settings: Any, *, use_cache: bool = True) -
         logger.warning("llm_backend_read_failed", error=str(exc)[:200])
     if data is None:
         data = _env_backend(settings)
+    # Routing is independent of which backend won: the yaml block is the base
+    # and the `llm_routes` row is a partial override on top of it, whether the
+    # models/keys came from the DB or the env.
+    data["routes"] = merge_routes(_env_routes(settings), await _db_routes(pool))
     _cache.update(data=data, ts=now)
     return data
 

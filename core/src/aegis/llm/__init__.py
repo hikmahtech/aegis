@@ -317,8 +317,23 @@ class LLMClient:
         nobody added to `_REASONING_MODELS`, which therefore gets no floor at
         all and fails silently (#255), and a symptom-keyed retry rescues it
         without anyone having to notice first.
+
+        A `purpose` mapped in the routing table (`llm/routes.py`) overrides the
+        caller's `model` and may ask for JSON-constrained output. `chat()` is
+        deliberately NOT routed: there the model is part of the agent's
+        identity, and the tool-calling loop would change brains mid-turn.
         """
         await self._check_kill_switch()
+
+        # Routing runs BEFORE the floor so the floor is computed against the
+        # model that will actually be called. A routed reasoning model left on
+        # the caller's raw budget is precisely the #255 silent-empty failure.
+        routed, json_mode = route_for_purpose(purpose)
+        if routed and routed != model:
+            logger.info("llm_route_applied", purpose=purpose, from_model=model, to_model=routed)
+            model = routed
+        response_format = {"type": "json_object"} if json_mode else None
+
         max_tokens = _reasoning_floor(model, max_tokens)
 
         messages: list[dict[str, Any]] = []
@@ -340,6 +355,7 @@ class LLMClient:
                 purpose,
                 agent_id,
                 retry_budget=retry_budget,
+                response_format=response_format,
             )
         except LLMTruncationError:
             if retry_budget is None:
@@ -361,6 +377,7 @@ class LLMClient:
             purpose,
             agent_id,
             retry_budget=None,
+            response_format=response_format,
         )
 
     async def _think_once(
@@ -373,6 +390,7 @@ class LLMClient:
         agent_id: str | None,
         *,
         retry_budget: int | None,
+        response_format: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """One upstream completion for `think()`; raises on empty truncation.
 
@@ -387,6 +405,15 @@ class LLMClient:
         import time
 
         sem = self._semaphore_for(model)
+        create_kwargs: dict[str, Any] = {
+            "model": model,
+            "messages": messages,
+            "max_tokens": max_tokens,
+        }
+        # Absent, not None: providers that do not know the parameter reject a
+        # request that carries the key with a null value.
+        if response_format is not None:
+            create_kwargs["response_format"] = response_format
         with _tracer.start_as_current_span("llm.call") as span:
             span.set_attribute("llm.model", model)
             span.set_attribute("llm.operation", "think")
@@ -396,17 +423,9 @@ class LLMClient:
             try:
                 if sem is not None:
                     async with sem:
-                        completion = await self._client.chat.completions.create(
-                            model=model,
-                            messages=messages,
-                            max_tokens=max_tokens,
-                        )
+                        completion = await self._client.chat.completions.create(**create_kwargs)
                 else:
-                    completion = await self._client.chat.completions.create(
-                        model=model,
-                        messages=messages,
-                        max_tokens=max_tokens,
-                    )
+                    completion = await self._client.chat.completions.create(**create_kwargs)
             except Exception as exc:
                 span.set_attribute("llm.status", "error")
                 await self._record_call(
@@ -839,7 +858,15 @@ class LLMClient:
         await self._client.close()
 
 
-# Imported after LLMClient to avoid intra-package circular imports.
+# Imported after LLMClient to avoid intra-package circular imports. Both
+# modules are leaves (they import nothing from `aegis.llm`), so the names are
+# resolved from module globals by the time `think()` runs.
+from aegis.llm.routes import (  # noqa: E402
+    get_routes,
+    merge_routes,
+    route_for_purpose,
+    set_routes,
+)
 from aegis.llm.tier import (  # noqa: E402
     resolve_model_for_agent,
     set_model_tiers,
@@ -850,8 +877,12 @@ __all__ = [
     "LLMClient",
     "LLMKillSwitchError",
     "LLMTruncationError",
+    "get_routes",
+    "merge_routes",
     "parse_llm_json",
     "resolve_model_for_agent",
+    "route_for_purpose",
     "set_model_tiers",
+    "set_routes",
     "tier_to_model",
 ]

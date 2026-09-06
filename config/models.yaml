@@ -7,6 +7,40 @@ tiers:
   balanced: "bedrock-glm-4.7-flash"   # most flows — GLM 4.7 Flash on Amazon Bedrock (ap-south-1) via LiteLLM: tool-capable, $0.08/$0.48 per MTok. Replaced the weekly-limited Kimi coding plan (kimi-k2.5, still the LiteLLM fallback) on 2026-09-06.
   smart:    "bedrock-kimi-k2.5"       # agent chat — Kimi K2.5 on Amazon Bedrock (ap-south-1) via LiteLLM: tool-capable, no weekly limit. Alias name must keep "kimi" so llm/__init__.py's reasoning floor applies. Replaced the tool-stripping max-proxy bridge (claude-opus) the same day.
 
+# Purpose → category → model. Applied by LLMClient.think() only (the tool-calling
+# chat path stays on the agent's tier). An unmapped purpose keeps the caller's
+# tier model. A `settings` row keyed `llm_routes` (same shape, partial) is merged
+# over this at boot; the worker needs a restart to pick up a change.
+# `json: true` sends response_format json_object, which Ollama honours as
+# constrained JSON output — use it only for purposes whose caller parses JSON.
+# Every purpose below was checked against its call site: the extract/classify
+# members all run their reply through parse_llm_json (or an equivalent), and the
+# write members all consume the prose as-is.
+routes:
+  categories:
+    extract:  {model: "qwen3.5:9b", json: true}             # structured JSON from documents, local
+    classify: {model: "qwen3.5:9b", json: true}             # short labels / scores, local
+    write:    {model: "bedrock-glm-4.7-flash"}              # prose the user reads
+  purposes:
+    money_event_extraction: extract
+    memory_consolidation: extract
+    alert_resource_resolution: extract
+    content_route_suggest: extract
+    persona_draft: extract                                  # parses {soul, operating_notes, user_context}
+    review_frame: extract                                   # parses {narrative, order}
+    meeting_review: extract                                 # parses the review object
+    curiosity_phrasing: extract                             # parses [{index, question}]
+    gmail_classification: classify
+    clarify_classification: classify
+    intel_score_significance: classify
+    alert_assessment: classify
+    task_session_collision: classify
+    books_answer_account: classify
+    daylog_narrative: write
+    daylog_rollup: write
+    alert_investigation: write                              # prose verdict, keyword-scanned
+    briefing_frame: write                                   # the morning narrative, no JSON
+
 litellm:
   # base_url is set by env: AEGIS_LITELLM_URL
   # Prefer http://litellm:4000 inside the swarm network; fall back to

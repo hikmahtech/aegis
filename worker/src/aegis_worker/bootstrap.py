@@ -160,11 +160,21 @@ async def bootstrap(settings: Settings | None = None) -> WorkerDeps:
     # Cap the fast tier at 2 concurrent calls — it typically shares a GPU with
     # everything else aegis hosts, and bursts serialise through ollama
     # compounding tail latency.
-    from aegis.llm import set_model_tiers
+    from aegis.llm import set_model_tiers, set_routes
     from aegis.services.llm_backend import get_llm_backend
 
     backend = await get_llm_backend(pool, settings)
     set_model_tiers(backend["tiers"])
+    try:
+        routes = set_routes(backend.get("routes"))
+        logger.info(
+            "llm_routes_loaded",
+            categories=len(routes["categories"]),
+            purposes=len(routes["purposes"]),
+        )
+    except Exception as exc:  # noqa: BLE001 — a bad routing table must not block boot
+        set_routes(None)
+        logger.warning("llm_routes_invalid", error=str(exc)[:200])
     llm = LLMClient(
         base_url=backend["base_url"],
         api_key=backend["api_key"],
