@@ -17,7 +17,7 @@ from pydantic import ValidationError
 from aegis.api.deps import get_settings
 from aegis.config import Settings
 from aegis.db import create_pool, run_migrations
-from aegis.llm import LLMClient, set_model_tiers
+from aegis.llm import LLMClient, set_model_tiers, set_routes
 from aegis.services.chat import _validate_agent_tool_sets
 
 logger = structlog.get_logger()
@@ -101,6 +101,16 @@ async def lifespan(app: FastAPI):
     backend = await get_llm_backend(pool, settings)
     set_model_tiers(backend["tiers"])
     logger.info("model_tiers_loaded", tiers=sorted(backend["tiers"]), source=backend["source"])
+    try:
+        routes = set_routes(backend.get("routes"))
+        logger.info(
+            "llm_routes_loaded",
+            categories=len(routes["categories"]),
+            purposes=len(routes["purposes"]),
+        )
+    except Exception as exc:  # noqa: BLE001 — a bad routing table must not block boot
+        set_routes(None)
+        logger.warning("llm_routes_invalid", error=str(exc)[:200])
     app.state.llm_backend = backend
     llm = LLMClient(
         base_url=backend["base_url"],

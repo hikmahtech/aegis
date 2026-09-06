@@ -1,11 +1,57 @@
-# v3 LLM tier → Ollama model mapping. Read by the chat pipeline and by every
-# flow that calls LiteLLM. Model tags must exist on the homelab Ollama library
-# before deploy — Phase 1 checklist: `curl http://ollama:11434/api/tags | jq`.
+# v3 LLM tier → LiteLLM model-alias mapping. Read by the chat pipeline and by
+# every flow that calls LiteLLM. Every alias must exist on the shared proxy
+# (homelab-gitops: ansible/roles/ollama/templates/litellm-config.yaml.j2).
+# Since 2026-09-06 all three tiers are Amazon Bedrock (ap-south-1): a live
+# replay of 36 real money mails and 24 inbox mails put Kimi K2.5 at 32/36
+# extractions and made it the triage reference; GLM 4.7 Flash managed 24/36 and
+# agreed with Kimi on 9/24 triage verdicts; the local 8GB models (gemma4:e4b
+# 13/36, qwen3.5:9b too slow once it reasons) are out of judgement work and
+# keep only embeddings.
 
 tiers:
-  fast:     "gemma4:e2b"              # quick chat, tight-loop classification (local ollama on meem)
-  balanced: "bedrock-glm-4.7-flash"   # most flows — GLM 4.7 Flash on Amazon Bedrock (ap-south-1) via LiteLLM: tool-capable, $0.08/$0.48 per MTok. Replaced the weekly-limited Kimi coding plan (kimi-k2.5, still the LiteLLM fallback) on 2026-09-06.
-  smart:    "bedrock-kimi-k2.5"       # agent chat — Kimi K2.5 on Amazon Bedrock (ap-south-1) via LiteLLM: tool-capable, no weekly limit. Alias name must keep "kimi" so llm/__init__.py's reasoning floor applies. Replaced the tool-stripping max-proxy bridge (claude-opus) the same day.
+  fast:     "bedrock-glm-4.7-flash"   # tight loops, knowledge answers — $0.08/$0.48 per MTok
+  balanced: "bedrock-kimi-k2.5"       # most flows — Kimi K2.5, tool-capable, no weekly limit. The kimi-k2.5 coding-plan alias is the LiteLLM fallback.
+  smart:    "bedrock-kimi-k2.5"       # agent chat — same model; alias name must keep "kimi" so llm/__init__.py's reasoning floor applies
+
+# Purpose → category → model. Applied by LLMClient.think() only (the tool-calling
+# chat path stays on the agent's tier). An unmapped purpose keeps the caller's
+# tier model. A `settings` row keyed `llm_routes` (same shape, partial) is merged
+# over this at boot; the worker needs a restart to pick up a change.
+# `json: true` sends response_format json_object (Ollama honours it as
+# constrained output). Deliberately OFF everywhere today: the money prompt asks
+# for a JSON array and json_object mode returned a lone object instead.
+# Every purpose below was checked against its call site: the extract/classify
+# members all run their reply through parse_llm_json (or an equivalent), and the
+# write members all consume the prose as-is. Today the judgement categories all
+# resolve to the balanced model on purpose — the value of the layer is that a
+# category can be moved (here, or via the `llm_routes` settings row) without
+# touching the tiers; `bulk` is the cheap lane for backfills.
+routes:
+  categories:
+    extract:  {model: "bedrock-kimi-k2.5"}                 # structured JSON from documents (money, reviews, plans)
+    classify: {model: "bedrock-kimi-k2.5"}                 # short labels / scores / routing verdicts
+    write:    {model: "bedrock-kimi-k2.5"}                 # prose the user reads
+    bulk:     {model: "bedrock-glm-4.7-flash"}             # backfills and replays where cost beats the odd miss; no purpose yet
+  purposes:
+    intent_route: classify                                  # which agent answers a chat message — a verdict, not a fast-tier reply
+    money_event_extraction: extract
+    memory_consolidation: extract
+    alert_resource_resolution: extract
+    content_route_suggest: extract
+    persona_draft: extract                                  # parses {soul, operating_notes, user_context}
+    review_frame: extract                                   # parses {narrative, order}
+    meeting_review: extract                                 # parses the review object
+    curiosity_phrasing: extract                             # parses [{index, question}]
+    gmail_classification: classify
+    clarify_classification: classify
+    intel_score_significance: classify
+    alert_assessment: classify
+    task_session_collision: classify
+    books_answer_account: classify
+    daylog_narrative: write
+    daylog_rollup: write
+    alert_investigation: write                              # prose verdict, keyword-scanned
+    briefing_frame: write                                   # the morning narrative, no JSON
 
 litellm:
   # base_url is set by env: AEGIS_LITELLM_URL

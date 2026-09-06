@@ -9,17 +9,20 @@ from __future__ import annotations
 
 from typing import Any
 
+import structlog
 from fastapi import APIRouter, Depends, Request
 
 from aegis.api.auth import verify_auth
 from aegis.api.deps import get_settings
 from aegis.config import Settings
-from aegis.llm import LLMClient, set_model_tiers
+from aegis.llm import LLMClient, set_model_tiers, set_routes
 from aegis.services.llm_backend import (
     PROVIDER_PRESETS,
     get_llm_backend,
     save_llm_backend,
 )
+
+logger = structlog.get_logger()
 
 router = APIRouter(prefix="/api/admin/llm-backend", dependencies=[Depends(verify_auth)])
 
@@ -57,6 +60,14 @@ async def put_backend(
     # Live-reload core's client + tier map (the worker picks up on next restart).
     backend = await get_llm_backend(pool, settings, use_cache=False)
     set_model_tiers(backend["tiers"])
+    # Routes ride along: this is the one place core re-resolves the backend, so
+    # skipping them here would leave an edited `llm_routes` row invisible to
+    # core until a restart while the tiers refreshed.
+    try:
+        set_routes(backend.get("routes"))
+    except Exception as exc:  # noqa: BLE001 — a bad routing table must not fail the save
+        set_routes(None)
+        logger.warning("llm_routes_invalid", error=str(exc)[:200])
     # db_pool=pool keeps the spend-governor kill switch wired through a
     # live backend swap — without it, saving a backend would silently
     # replace app.state.llm with an ungoverned client until the next restart.

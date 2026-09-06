@@ -46,8 +46,8 @@ class Settings(BaseSettings):
     # missing and one of them silently becomes the live model, so a
     # decommissioned name here is a live hazard: both of these said
     # `gpt-oss:20b` for weeks after its host (ollama-2 on asif) left the swarm.
-    model_fast: str = "gemma4:e2b"  # quick replies, low latency
-    model_balanced: str = "bedrock-glm-4.7-flash"  # default chat + most flows (Bedrock via LiteLLM)
+    model_fast: str = "bedrock-glm-4.7-flash"  # quick replies, low latency (Bedrock via LiteLLM)
+    model_balanced: str = "bedrock-kimi-k2.5"  # default chat + most flows (Bedrock via LiteLLM)
     model_smart: str = "bedrock-kimi-k2.5"  # long-context synthesis, Raphael (Bedrock via LiteLLM)
     # Active-work guard: lookback window for open-PR / recent-push / in-flight signals.
     active_work_lookback_hours: int = 48
