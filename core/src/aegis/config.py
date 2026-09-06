@@ -48,7 +48,7 @@ class Settings(BaseSettings):
     # `gpt-oss:20b` for weeks after its host (ollama-2 on asif) left the swarm.
     model_fast: str = "gemma4:e2b"  # quick replies, low latency
     model_balanced: str = "kimi-k2.5"  # default chat + most flows
-    model_smart: str = "claude-sonnet-5"  # long-context synthesis, Raphael
+    model_smart: str = "claude-opus"  # long-context synthesis, Raphael (max-proxy bridge alias)
     # Active-work guard: lookback window for open-PR / recent-push / in-flight signals.
     active_work_lookback_hours: int = 48
     # Path to config/models.yaml — loaded at startup by app.lifespan.

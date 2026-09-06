@@ -5,7 +5,7 @@
 tiers:
   fast:     "gemma4:e2b"              # quick chat, tight-loop classification (local ollama on meem)
   balanced: "kimi-k2.5"               # default chat + most flows — Kimi-for-Coding via LiteLLM (flat-rate, tool-calling). Replaced gpt-oss:20b, whose host (ollama-2 on asif) was decommissioned 2026-08.
-  smart:    "claude-sonnet-5"         # Anthropic API via LiteLLM — reserved for chat; background flows should use balanced
+  smart:    "claude-opus"             # Claude Opus via the Max-subscription bridge (max-proxy on meem) — chat only. The bridge strips tools, so tool-bearing turns swap to balanced (chat.py _TOOL_INCAPABLE_MODELS). The Anthropic API key was retired 2026-09-06.
 
 litellm:
   # base_url is set by env: AEGIS_LITELLM_URL
