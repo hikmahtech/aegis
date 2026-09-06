@@ -799,7 +799,19 @@ class LLMClient:
             # rejected: a model that invents a field must not cost us the whole
             # event, and one that emits `account`/`entity`/`ref` must not be
             # able to route the money (see `_LLM_EVENT_FIELDS`).
-            data = {k: v for k, v in item.items() if k in _LLM_EVENT_FIELDS}
+            # An explicit `null` means "the model had nothing for this field",
+            # which is what its DEFAULT already says — so drop the key and let
+            # the default apply rather than sending `None` into a `str` or a
+            # `Literal` and losing the whole event (#411). This is how the
+            # prompt's own `kind: "ignore"` answer arrives: every other field
+            # null. Before the drop each correct ignore was rejected, booked as
+            # the `_parse_failed` stub, and counted against the model in the
+            # one metric used to judge this lane. `kind` is the only field with
+            # no default, so a null `kind` still fails validation — a missing
+            # required field, which is a real parse failure.
+            data = {
+                k: v for k, v in item.items() if k in _LLM_EVENT_FIELDS and v is not None
+            }
             if isinstance(data.get("amount"), str):
                 data["amount"] = data["amount"].replace(",", "")
             data["parser"] = "llm"
