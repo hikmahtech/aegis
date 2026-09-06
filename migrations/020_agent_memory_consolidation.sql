@@ -7,7 +7,11 @@
 --
 --   * superseded_at / superseded_by turn "DELETE" into a soft retire. The row
 --     stays SELECT-able forever; only the read helpers filter it out. Undo is
---     `UPDATE agent_memory SET superseded_at = NULL, superseded_by = NULL`.
+--     `UPDATE agent_memory SET superseded_at = NULL, superseded_by = NULL`,
+--     which since migration 028 RAISES if a live row of the same agent already
+--     holds identical content — the shape a merge leaves behind. Retire or
+--     reword that live twin first; the undo is still available, just not
+--     unconditional.
 --   * agent_memory_ops_log records every op the planner PROPOSED — in dry-run
 --     as well as apply mode — with the before/after content, so the prior
 --     state of a mutated row can be reconstructed from the log alone.
@@ -63,7 +67,9 @@ CREATE TABLE IF NOT EXISTS agent_memory_ops_log (
     dry_run          boolean NOT NULL,
     applied          boolean NOT NULL DEFAULT false,
     -- Why an op was not applied: 'quota_exceeded', 'protected_recent',
-    -- 'protected_importance', 'protected_dedupe_marker', 'apply_disabled', …
+    -- 'protected_importance', 'protected_dedupe_marker', 'apply_disabled',
+    -- 'duplicate_live_content' (a live row already holds this text — also
+    -- written on a dry run, as a prediction), 'no_rows_affected', …
     skip_reason      text,
     created_at       timestamptz NOT NULL DEFAULT now()
 );

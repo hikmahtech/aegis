@@ -266,8 +266,11 @@ _SQL_RETIRE = (
 # every other op in the plan down with it and propagate out of
 # `apply_consolidation`, which has no try/except around `_run`. Both forms
 # below leave a "touched no row" status (`UPDATE 0` / `INSERT 0 0`), which
-# `_run` already reads as `no_rows_affected` — so the op lands on the existing
-# skip path and the ledger records what happened.
+# `_run` reads as a skip — so the op lands on the existing skip path and the
+# ledger records what happened.
+#
+# Neither guard can see the rest of the plan, which is why the plan is
+# reordered before it runs — see `_retires_first`.
 #
 # UPDATE needs a hand-written NOT EXISTS rather than ON CONFLICT, which UPDATE
 # does not have. Note the three parts of the predicate, all load-bearing:
@@ -296,6 +299,65 @@ _SQL_LOG = (
     "VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)"
 )
 
+# `skip_reason` for a write the live-content index refused. It used to share
+# `no_rows_affected` with the older cause (the row stopped being a live row of
+# this agent between the pre-image read and the write), and the two want
+# different responses from an operator: one says the belief is already held,
+# the other says the plan disagreed with itself or lost a race.
+_SKIP_DUPLICATE = "duplicate_live_content"
+
+# Does a LIVE row of this agent already hold this text, ignoring the ids in $3?
+# Used only to explain a skip, never to authorise a write — the index is what
+# enforces uniqueness.
+_SQL_LIVE_DUPLICATE = (
+    "SELECT 1 FROM agent_memory WHERE agent_id = $1 AND md5(content) = md5($2::text) "
+    "AND superseded_at IS NULL AND id <> ALL($3::bigint[]) LIMIT 1"
+)
+# Why did `_SQL_UPDATE` touch no row? Its WHERE clause has two halves that can
+# fail, and this asks them in the order the UPDATE does: the row must still be
+# a live row of this agent, and only then can the duplicate guard be the cause.
+# One round trip, on the skip path only.
+_SQL_UPDATE_SKIP_REASON = (
+    "SELECT CASE"
+    " WHEN NOT EXISTS (SELECT 1 FROM agent_memory WHERE id = $2 AND agent_id = $1"
+    "   AND superseded_at IS NULL) THEN 'no_rows_affected'"
+    " WHEN EXISTS (SELECT 1 FROM agent_memory WHERE agent_id = $1"
+    "   AND md5(content) = md5($3::text) AND superseded_at IS NULL AND id <> $2)"
+    f" THEN '{_SKIP_DUPLICATE}'"
+    " ELSE 'no_rows_affected' END"
+)
+
+
+def _retires_first(decisions: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """A plan's soft-retires run before its writes, whatever order the model
+    emitted them in (issue #399).
+
+    A merge is `UPDATE survivor → <the donor's wording>` plus `DELETE donor`,
+    and both writing statements refuse to collide with a LIVE row holding that
+    wording. Emitted UPDATE-first, the donor is still live when the UPDATE
+    runs, so the UPDATE is skipped as a duplicate — and the DELETE then retires
+    the donor anyway. The merged wording leaves the live set entirely while
+    `applied` still counts the DELETE. `[ADD "X", DELETE <the row holding X>]`
+    is the same shape and worse: it ends with no live row holding X at all.
+    `_SYSTEM_PROMPT` in the worker's planner actively asks for that order
+    ("only DELETE a row whose every fact survives in … an UPDATE you also
+    emit"), so it is the expected shape, not a corner case.
+
+    Retiring first makes the plan mean the same thing in either order. The
+    alternative — telling the guard to ignore ids this plan retires — cannot
+    work on its own: the guard is not what enforces uniqueness, the partial
+    unique index is, so an UPDATE waved past the guard while the donor is still
+    live raises UniqueViolationError (measured), and with no try/except around
+    `_run` that aborts every other op in the plan.
+
+    `sorted` is stable, so ops within each half keep the model's order. One
+    consequence is deliberate: a self-contradictory plan that both retires and
+    rewrites the SAME row now retires it and the rewrite touches nothing. The
+    row ends retired either way, and the rewrite's text is still in
+    `agent_memory_ops_log.after_content`.
+    """
+    return sorted(decisions, key=lambda d: 0 if d.get("op") == "DELETE" else 1)
+
 
 async def apply_consolidation(
     pool: Any,
@@ -314,7 +376,9 @@ async def apply_consolidation(
     only the two invariants that must hold no matter what the policy said:
 
     * every mutation is scoped to `agent_id` in SQL (see the constants above);
-    * a DELETE op is a SOFT RETIRE, never a row removal.
+    * a DELETE op is a SOFT RETIRE, never a row removal;
+    * the plan's retires run before its writes (`_retires_first`), so a merge
+      means the same thing whichever order the model emitted it in.
 
     `dry_run=True` writes NOTHING to `agent_memory` — only the ledger rows that
     record what would have happened. That is the intended long-running mode.
@@ -342,12 +406,21 @@ async def apply_consolidation(
         )
         pre = {int(r["id"]): r for r in rows}
 
+    # Ids this plan retires. Needed only by the dry-run prediction below: in
+    # apply mode the retire has already happened by the time a write runs, so
+    # the retired row is no longer live and cannot look like a rival belief.
+    retiring = [
+        int(d["id"])
+        for d in decisions
+        if d.get("op") == "DELETE" and d.get("apply") and int(d.get("id") or 0) in pre
+    ]
+
     applied = 0
     logged = 0
 
-    async def _run(exec_one: Any) -> None:
+    async def _run(exec_one: Any, fetch_one: Any) -> None:
         nonlocal applied, logged
-        for d in decisions:
+        for d in _retires_first(decisions):
             op = d["op"]
             memory_id = d.get("id")
             before = pre.get(int(memory_id)) if memory_id is not None else None
@@ -381,8 +454,30 @@ async def apply_consolidation(
                 did = op != "NOOP" and bool(status) and not status.endswith(" 0")
                 if did:
                     applied += 1
+                elif op == "ADD":
+                    # A plain INSERT touches no row for exactly one reason:
+                    # ON CONFLICT DO NOTHING fired. No probe needed.
+                    skip_reason = skip_reason or _SKIP_DUPLICATE
+                elif op == "UPDATE":
+                    skip_reason = skip_reason or await fetch_one(
+                        _SQL_UPDATE_SKIP_REASON, agent_id, int(memory_id), d["content"]
+                    )
                 elif op != "NOOP":
                     skip_reason = skip_reason or "no_rows_affected"
+            elif dry_run and op in ("ADD", "UPDATE") and bool(d.get("apply")) and not skip_reason:
+                # A dry run issues no agent_memory statement, so without this
+                # the ledger — the week of evidence read before the apply gate
+                # is opened — could never show the live-content guard firing.
+                # It is a PREDICTION: the row still says applied=false like
+                # every other dry-run row, and it discounts the rows this same
+                # plan retires, which apply mode would have retired first.
+                ignore = list(retiring)
+                if memory_id is not None:
+                    ignore.append(int(memory_id))
+                if await fetch_one(
+                    _SQL_LIVE_DUPLICATE, agent_id, d.get("content") or "", ignore
+                ):
+                    skip_reason = _SKIP_DUPLICATE
 
             await exec_one(
                 _SQL_LOG,
@@ -401,12 +496,12 @@ async def apply_consolidation(
             logged += 1
 
     if dry_run:
-        # Ledger-only: no agent_memory statement is reachable from here, so
-        # there is nothing to make atomic.
-        await _run(pool.execute)
+        # Ledger-only: no agent_memory WRITE is reachable from here (the
+        # duplicate prediction is a SELECT), so there is nothing to make atomic.
+        await _run(pool.execute, pool.fetchval)
     else:
         async with pool.acquire() as conn, conn.transaction():
-            await _run(conn.execute)
+            await _run(conn.execute, conn.fetchval)
 
     logger.info(
         "agent_memory_consolidation_logged",

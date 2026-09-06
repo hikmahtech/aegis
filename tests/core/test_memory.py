@@ -233,7 +233,9 @@ async def test_consolidation_add_of_a_live_belief_is_a_logged_skip(mem_agent):
     So an ADD colliding with the new index must not RAISE: that would roll back
     every other op in the plan. It takes the path the module already has for a
     statement that touched no row — `applied=False` plus a `skip_reason` on the
-    ledger — so an operator reading the ledger sees what happened.
+    ledger — so an operator reading the ledger sees what happened, and since
+    #399 that reason names the index rather than sharing `no_rows_affected`
+    with a row that vanished under the plan.
     """
     await record_memory(mem_agent, _AID, "invoices from Zephyrly are groceries")
 
@@ -253,7 +255,7 @@ async def test_consolidation_add_of_a_live_belief_is_a_logged_skip(mem_agent):
         "SELECT applied, skip_reason FROM agent_memory_ops_log WHERE run_id = 'r-389'"
     )
     assert op["applied"] is False
-    assert op["skip_reason"] == "no_rows_affected"
+    assert op["skip_reason"] == "duplicate_live_content"
     await mem_agent.execute("DELETE FROM agent_memory_ops_log WHERE agent_id = $1", _AID)
 
 
@@ -304,7 +306,7 @@ async def test_consolidation_update_onto_a_live_belief_is_a_logged_skip(mem_agen
         "SELECT applied, skip_reason FROM agent_memory_ops_log WHERE run_id = 'r-389-upd'"
     )
     assert op["applied"] is False
-    assert op["skip_reason"] == "no_rows_affected"
+    assert op["skip_reason"] == "duplicate_live_content"
     await mem_agent.execute("DELETE FROM agent_memory_ops_log WHERE agent_id = $1", _AID)
 
 
@@ -384,3 +386,215 @@ async def test_consolidation_update_still_applies_when_nothing_collides(mem_agen
         is not None
     )
     await mem_agent.execute("DELETE FROM agent_memory_ops_log WHERE agent_id = $1", _AID)
+
+
+# --------------------------------------------------------------------------
+# #399 — a plan must mean the same thing whatever order the model emits it in.
+# --------------------------------------------------------------------------
+
+_ORDERS = [
+    pytest.param(False, id="writer_first"),  # the order the system prompt nudges
+    pytest.param(True, id="delete_first"),
+]
+
+
+async def _live(pool) -> list[tuple[int, str]]:
+    rows = await pool.fetch(
+        "SELECT id, content FROM agent_memory WHERE agent_id = $1 AND superseded_at IS NULL "
+        "ORDER BY id",
+        _AID,
+    )
+    return [(int(r["id"]), r["content"]) for r in rows]
+
+
+@pytest.mark.parametrize("delete_first", _ORDERS)
+async def test_consolidation_merge_survives_either_plan_order(mem_agent, delete_first):
+    """The canonical merge: rewrite the survivor to the wording that already
+    lives on the row being retired, and retire that row.
+
+    Emitted UPDATE-first, the UPDATE collided with the still-live donor, was
+    skipped as a duplicate, and the DELETE then retired the donor anyway — so
+    the merged wording left the live set entirely while `applied` still said 1.
+    Same plan, model-chosen order, different memory.
+    """
+    survivor = await mem_agent.fetchval(
+        "INSERT INTO agent_memory (agent_id, content, importance, source) "
+        "VALUES ($1, 'the owner banks with HDFC', 0.6, 'correction') RETURNING id",
+        _AID,
+    )
+    donor = await mem_agent.fetchval(
+        "INSERT INTO agent_memory (agent_id, content, importance, source) "
+        "VALUES ($1, 'the owner banks with HDFC (salary account)', 0.5, 'correction') "
+        "RETURNING id",
+        _AID,
+    )
+    update = {
+        "op": "UPDATE",
+        "id": survivor,
+        "content": "the owner banks with HDFC (salary account)",
+        "importance": 0.7,
+        "apply": True,
+    }
+    retire = {"op": "DELETE", "id": donor, "merged_into": survivor, "apply": True}
+    plan = [retire, update] if delete_first else [update, retire]
+
+    out = await apply_consolidation(mem_agent, _AID, plan, run_id="r-399-upd", dry_run=False)
+
+    assert out["applied"] == 2, out
+    assert await _live(mem_agent) == [(survivor, "the owner banks with HDFC (salary account)")]
+    assert (
+        await mem_agent.fetchval("SELECT superseded_by FROM agent_memory WHERE id = $1", donor)
+        == survivor
+    )
+    log = {
+        r["op"]: (r["applied"], r["skip_reason"])
+        for r in await mem_agent.fetch(
+            "SELECT op, applied, skip_reason FROM agent_memory_ops_log WHERE run_id = 'r-399-upd'"
+        )
+    }
+    assert log == {"UPDATE": (True, None), "DELETE": (True, None)}
+
+
+@pytest.mark.parametrize("delete_first", _ORDERS)
+async def test_consolidation_add_survives_either_plan_order(mem_agent, delete_first):
+    """The ADD shape of the same bug, and the worse one: emitted ADD-first the
+    insert hit the live-content index, was dropped, and the DELETE then retired
+    the only row that held the text — leaving ZERO live rows carrying it while
+    `applied` reported 1."""
+    donor = await mem_agent.fetchval(
+        "INSERT INTO agent_memory (agent_id, content, importance, source) "
+        "VALUES ($1, 'renewals are due in March', 0.5, 'correction') RETURNING id",
+        _AID,
+    )
+    add = {"op": "ADD", "content": "renewals are due in March", "importance": 0.7, "apply": True}
+    retire = {"op": "DELETE", "id": donor, "apply": True}
+    plan = [retire, add] if delete_first else [add, retire]
+
+    out = await apply_consolidation(mem_agent, _AID, plan, run_id="r-399-add", dry_run=False)
+
+    assert out["applied"] == 2, out
+    live = await _live(mem_agent)
+    assert [c for _, c in live] == ["renewals are due in March"]
+    assert live[0][0] != donor, "the retired row must not be the one still live"
+
+
+async def test_consolidation_duplicate_skip_has_its_own_reason(mem_agent):
+    """A write skipped because a live row already holds the text is a different
+    event from a row that vanished under the plan, and the dry-run ledger is
+    the evidence an operator reads before opening the apply gate. Both used to
+    log `no_rows_affected`."""
+    await record_memory(mem_agent, _AID, "the owner drives a diesel")
+    rival = await mem_agent.fetchval(
+        "INSERT INTO agent_memory (agent_id, content, importance, source) "
+        "VALUES ($1, 'the owner drives a car', 0.5, 'correction') RETURNING id",
+        _AID,
+    )
+
+    out = await apply_consolidation(
+        mem_agent,
+        _AID,
+        [
+            {"op": "ADD", "content": "the owner drives a diesel", "apply": True},
+            {"op": "UPDATE", "id": rival, "content": "the owner drives a diesel", "apply": True},
+        ],
+        run_id="r-399-dup",
+        dry_run=False,
+    )
+
+    assert out["applied"] == 0, out
+    assert {
+        r["op"]: r["skip_reason"]
+        for r in await mem_agent.fetch(
+            "SELECT op, skip_reason FROM agent_memory_ops_log WHERE run_id = 'r-399-dup'"
+        )
+    } == {"ADD": "duplicate_live_content", "UPDATE": "duplicate_live_content"}
+
+
+async def test_consolidation_row_retired_by_its_own_plan_is_not_a_duplicate(mem_agent):
+    """The OTHER cause of a zero-row write keeps the old reason.
+
+    A plan that retires a row and also rewrites it is self-contradictory; the
+    retire wins (it runs first) and the rewrite touches nothing. Nothing
+    collided, so calling that a duplicate would send an operator hunting for a
+    rival belief that does not exist.
+
+    `rival` makes BOTH causes true at once — the row is gone AND a live row
+    holds the text the rewrite wanted. The UPDATE's own WHERE clause fails on
+    the row first and never reaches its duplicate guard, so that is the reason
+    reported; asking the two questions in the order the statement asks them is
+    what keeps the ledger honest here.
+    """
+    doomed = await mem_agent.fetchval(
+        "INSERT INTO agent_memory (agent_id, content, importance, source) "
+        "VALUES ($1, 'a belief in two minds', 0.5, 'correction') RETURNING id",
+        _AID,
+    )
+    rival = await mem_agent.fetchval(
+        "INSERT INTO agent_memory (agent_id, content, importance, source) "
+        "VALUES ($1, 'a belief rewritten', 0.5, 'correction') RETURNING id",
+        _AID,
+    )
+
+    out = await apply_consolidation(
+        mem_agent,
+        _AID,
+        [
+            {"op": "UPDATE", "id": doomed, "content": "a belief rewritten", "apply": True},
+            {"op": "DELETE", "id": doomed, "apply": True},
+        ],
+        run_id="r-399-gone",
+        dry_run=False,
+    )
+
+    assert out["applied"] == 1, out
+    assert await _live(mem_agent) == [(rival, "a belief rewritten")]
+    assert {
+        r["op"]: r["skip_reason"]
+        for r in await mem_agent.fetch(
+            "SELECT op, skip_reason FROM agent_memory_ops_log WHERE run_id = 'r-399-gone'"
+        )
+    } == {"UPDATE": "no_rows_affected", "DELETE": None}
+
+
+async def test_dry_run_ledger_shows_which_writes_the_index_would_refuse(mem_agent):
+    """Dry run is the long-running mode and its ledger is the flip decision's
+    evidence. It writes no `agent_memory` statement, so before this it could
+    not show the guard firing at all — every approved op logged a bare
+    `applied=false` whether it would have written or been refused.
+
+    The prediction must also account for the plan's own retirements, or it
+    reports a skip that apply mode would not perform.
+    """
+    await record_memory(mem_agent, _AID, "a belief with a rival")
+    donor = await mem_agent.fetchval(
+        "INSERT INTO agent_memory (agent_id, content, importance, source) "
+        "VALUES ($1, 'a belief this plan retires', 0.5, 'correction') RETURNING id",
+        _AID,
+    )
+
+    out = await apply_consolidation(
+        mem_agent,
+        _AID,
+        [
+            {"op": "ADD", "content": "a belief with a rival", "apply": True},
+            {"op": "ADD", "content": "a belief this plan retires", "apply": True},
+            {"op": "ADD", "content": "a belief nobody holds", "apply": True},
+            {"op": "DELETE", "id": donor, "apply": True},
+        ],
+        run_id="r-399-dry",
+        dry_run=True,
+    )
+
+    assert out == {"applied": 0, "logged": 4, "dry_run": True}
+    assert len(await _live(mem_agent)) == 2, "a dry run writes nothing"
+    assert {
+        r["after_content"]: r["skip_reason"]
+        for r in await mem_agent.fetch(
+            "SELECT after_content, skip_reason FROM agent_memory_ops_log "
+            "WHERE run_id = 'r-399-dry' AND op = 'ADD'"
+        )
+    } == {
+        "a belief with a rival": "duplicate_live_content",
+        "a belief this plan retires": None,
+        "a belief nobody holds": None,
+    }
