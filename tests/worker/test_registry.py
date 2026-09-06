@@ -308,9 +308,15 @@ def test_module_workflows_is_the_unflagged_registry():
         # MoneyActivities and both flows are money-flagged, so — like every
         # bump above — only the money=True row moves: -2/-8, and 0 for the
         # other two, which never counted them in the first place.
-        (True, True, 42, 216),
-        (False, False, 34, 183),
-        (True, False, 38, 202),
+        # Then +1 flow in every row and +1 activity in the money row only:
+        # BooksWriteFlow carries a chat tool's books write on its own workflow
+        # (issue #388) and is unflagged, because a flow that is not registered
+        # cannot fail — its tasks would simply never be picked up — while the
+        # `books_write` activity it calls is on the money-flagged
+        # MoneyActivities. So +1/+1/+1 flows and +1/+0/+0 activities.
+        (True, True, 43, 217),
+        (False, False, 35, 183),
+        (True, False, 39, 202),
     ],
 )
 def test_real_registration_passes_the_boot_check(homelab, money, flows, activities):

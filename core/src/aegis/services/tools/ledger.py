@@ -20,12 +20,19 @@ four rules hold the module together and every one of them is load-bearing:
 * **Nothing writes a journal file directly.** Every mutation goes through
   `books.py`, which holds the flock, runs `hledger check --strict` and reverts
   the write when it fails.
+* **A write is validated here and PERFORMED somewhere else.** The three
+  writers refuse what they can refuse — an undeclared account, the wrong set of
+  books, a catastrophic regex — and then hand the write to `BooksWriteFlow`,
+  which runs `services/ledger_write.py` inside a Temporal activity. The tool
+  waits `LEDGER_WRITE_WAIT_S` for it and relays whatever it says. Issue #388:
+  the write's own budget is 540s, the whole chat turn gets 600s, and
+  `asyncio.wait_for` cannot cancel the thread `books._write` runs in — so
+  keeping the write on this side could only ever misreport it, never stop it.
 """
 
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import math
 import multiprocessing
 import os
@@ -35,15 +42,13 @@ import threading
 import time
 import warnings
 from datetime import date as date_type
-from decimal import Decimal, InvalidOperation
 from typing import Literal
 
 import asyncpg
 import structlog
 
-from aegis.api.models.money import MoneyEvent, payee_key
 from aegis.services import books
-from aegis.services import journal_index as ji
+from aegis.services import ledger_write as lw
 from aegis.services.tools.base import ToolContext
 from aegis.services.tools.registry import aegis_tool
 
@@ -51,29 +56,27 @@ logger = structlog.get_logger()
 
 _ENTITIES = ("personal", "hikmah")
 
-# A ledger amount, bounded. `Decimal` happily builds NaN, Infinity and 1e400;
-# all three survive a bare constructor and then raise `InvalidOperation` inside
-# `quantize()` further down. Nothing real is a trillion of anything.
-_MAX_AMOUNT = Decimal("1e12")
+# How long the tool waits on the write's workflow before it answers "still
+# running". Sized from the measured fast path, not from a round number: two
+# GitHub round trips at 2.4s each (`git ls-remote`, this host), `hledger check
+# --strict` at 0.03-0.16s over 500-5,000 transactions, and a local commit —
+# about 5s, plus the Temporal hop. Twenty seconds is ~4x that, and it sits ten
+# seconds under the chat loop's 30s default so the model always gets a sentence
+# instead of a timeout error. Slower than this means the flock is held by
+# another write (the ingest lane posts receipts through the same checkout); the
+# workflow keeps going and reports the outcome to the agent's channel itself.
+LEDGER_WRITE_WAIT_S = 20
 
-# Placeholder msgid used while rendering the block a msgid is derived FROM.
-# Constant, so it contributes nothing to the digest.
-_MSGID_SEED = "manual/0"
+# The chat loop's per-tool cap for the three writers. It exists only so a
+# lowered `tool_timeout_seconds` cannot cut the wait above short — the WRITE is
+# no longer on this budget at all (issue #388), which is why this is 30s and
+# not the 540s a books write may take.
+LEDGER_TOOL_TIMEOUT_S = LEDGER_WRITE_WAIT_S + 10
 
-# How long a books WRITE may take, from `books.py`'s own budgets: clone (180s,
-# first write only) + pull (120s) + `check --strict` (60s) + commit (60s) +
-# push (120s). The chat loop's default is `tool_timeout_seconds` = 30, and
-# `asyncio.wait_for` cannot cancel the thread `books._write` runs in — so a 30s
-# cap does not stop a slow write, it only tells the model the write failed
-# while it goes on to commit and push. The stable msgid below covers what is
-# left: a retry of an abandoned call finds its own block and writes nothing.
-LEDGER_WRITE_TIMEOUT_S = books.CLONE_TIMEOUT_S + 120 + 60 + 60 + 120
-
-# Ceiling on one `ledger_add_rule` sweep. The rewrites are batched into a single
-# commit, but `{"match": ".", ...}` would still rewrite the whole unknown
-# backlog in one unreviewable change; past this the model is told to narrow the
-# rule (or run it again) rather than being handed the entire ledger.
-_MAX_APPLY = 200
+# Core never imports worker code, so the flow is started by NAME with a plain
+# dict on the queue the worker serves — the same seam as `dispatch_agent_run`.
+_BOOKS_WRITE_FLOW = "BooksWriteFlow"
+_TASK_QUEUE = "aegis-main"
 
 # `match` is a model-authored regex that is PERSISTED: the worker runs every
 # rule in `rules/accounts.yaml` against every incoming money event, forever, in
@@ -149,39 +152,6 @@ def _close_quietly(proc) -> None:
         proc.close()
     except ValueError:
         pass
-
-# One index row per reclassified posting; the journal is the record, so this
-# only keeps the index from disagreeing with it.
-_REINDEX_SQL = (
-    "UPDATE finance.journal_index SET account = $2, payee = COALESCE($3, payee), "
-    "updated_at = now() WHERE message_id = $1"
-)
-
-# The unexplained backlog, WITH the sender the worker matches on.
-#
-# `apply_rules` runs against `"<From header> | <payee>"`, so a sweep with an
-# empty sender previews a narrower rule than the one being persisted: the live
-# file carries bare words (`apple`, `medium`, `docker`, `github`, `reddit`),
-# and Google Pay mirrors MSEDCL, Airtel and the rest, so `match: "google"`
-# re-files bills whose payee never says Google. The sender is not a column on
-# `journal_index` — it lives on the receipt this posting came from, keyed on
-# the gmail id, which is the half of `<mailbox>/<gmail id>` after the slash.
-# A LEFT join, because a hand-written `manual/<hash>` block has no receipt and
-# genuinely has no sender; `''` is what production passes for those too. The
-# `<> ''` is the join's own floor: `split_part` returns the empty string for a
-# msgid with no slash, and joining that to an empty receipt id would hand one
-# posting another mail's sender.
-_SWEEP_SQL = """
-SELECT ji.message_id, ji.payee, ji.entity, ji.direction,
-       COALESCE(re.sender, '') AS sender
-  FROM finance.journal_index ji
-  LEFT JOIN finance.receipt_email re
-         ON re.message_id = split_part(ji.message_id, '/', 2)
-        AND re.message_id <> ''
- WHERE ji.kind = 'transaction'
-   AND ji.account LIKE '%:unknown'
-   AND ji.journal_file IS NOT NULL
-"""
 
 
 def _undeclared(account: str) -> str:
@@ -316,35 +286,76 @@ def _regex_too_slow(pattern: str, kill_after: float = _REGEX_KILL_S) -> str | No
     return f"could not be measured safely (the check exited {code})"
 
 
-def _manual_msgid(
-    entity: str, d: date_type, payee: str, postings: list[dict], note: str
-) -> str:
-    """A msgid derived from the transaction itself, so a re-post is a RETRY.
+async def _dispatch_books_write(ctx: ToolContext, op: str, payload: dict) -> str:
+    """Hand a validated write to `BooksWriteFlow` and wait a short while for it.
 
-    A `uuid4()` here would be fresh on every call, which means `post_block`'s
-    idempotency scan can never match and the model's natural response to a
-    timed-out write — call it again — puts a second copy of the same
-    transaction in the ledger. Deriving the id from the content makes the
-    second call find the first one's block and write nothing.
+    Returns the sentence the model relays, and never raises. Three outcomes:
+    the write finished inside the wait and the writer's own sentence comes
+    back; it did not, and the model is told it is still running under an id;
+    or it could not be queued at all, in which case NOTHING was written.
 
-    What is digested is the RENDERED BLOCK, not the caller's arguments. The
-    journal stores normalized values — a quantized amount, a defaulted
-    currency, a sanitized payee and note — so digesting the raw text would give
-    `"245.50"` and `"245.5"` different ids for a byte-identical block and let
-    the duplicate through anyway. An LLM re-issuing a timed-out call is not
-    byte-stable, so that is the realistic retry, not an exotic one. Hashing the
-    block makes "same id" mean exactly "same journal entry", and keeps meaning
-    that if `render_manual` changes.
+    The workflow id is derived from the write's own content, so a retried chat
+    turn — or a model re-issuing a call it believes timed out — attaches to the
+    write already in flight instead of starting a second one.
 
-    `entity` is digested alongside it because it picks the FILE, and the same
-    block in the two sets of books is two different transactions.
-
-    The trade is that two genuinely identical transactions on the same day
-    collapse into one; the tool says so in its description, and a distinguishing
-    `note` (which is part of the block) records the second.
+    There is deliberately no in-process fallback for an unreachable Temporal.
+    Doing the write here is exactly what issue #388 moved away: the chat loop
+    cannot cancel it, so a slow write would still be reported as a failure
+    while it went on to commit and push. A refusal writes nothing and says so,
+    which is the only failure mode a ledger should have.
     """
-    body = books.render_manual(d, payee, postings, _MSGID_SEED, note)
-    return f"manual/{hashlib.sha256(f'{entity}\n{body}'.encode()).hexdigest()[:16]}"
+    from temporalio.exceptions import WorkflowAlreadyStartedError
+
+    client = ctx.temporal_client
+    if client is None:
+        return (
+            "error: the books write could not be queued — Temporal is not reachable. "
+            "Nothing was written; try again once it is back."
+        )
+    workflow_id = lw.write_workflow_id(op, payload)
+    reattached = False
+    try:
+        handle = await client.start_workflow(
+            _BOOKS_WRITE_FLOW,
+            {
+                "agent_id": ctx.agent_id or "maou",
+                "op": op,
+                "payload": payload,
+                "reply_after_seconds": LEDGER_WRITE_WAIT_S,
+            },
+            id=workflow_id,
+            task_queue=_TASK_QUEUE,
+        )
+    except WorkflowAlreadyStartedError:
+        reattached = True
+        handle = client.get_workflow_handle(workflow_id)
+    except Exception as exc:  # noqa: BLE001 — a dispatch failure is an answer, not a crash
+        logger.warning("books_write_dispatch_failed", op=op, error=str(exc)[:200])
+        return (
+            f"error: the books write could not be queued: {str(exc)[:200]}. "
+            "Nothing was written."
+        )
+    try:
+        result = await asyncio.wait_for(handle.result(), timeout=LEDGER_WRITE_WAIT_S)
+    except TimeoutError:
+        # Cancelling `handle.result()` stops the WAIT, not the workflow: the
+        # write carries on and reports itself to the agent's channel.
+        logger.info(
+            "books_write_still_running", op=op, workflow_id=workflow_id, reattached=reattached
+        )
+        return (
+            f"the books write is still running as {workflow_id} — longer than "
+            f"{LEDGER_WRITE_WAIT_S}s, which usually means it is queued behind another "
+            "write. It will finish on its own and report the outcome here. Do not "
+            "run it again."
+        )
+    except Exception as exc:  # noqa: BLE001 — the workflow failed; say so, don't raise
+        logger.warning(
+            "books_write_failed", op=op, workflow_id=workflow_id, error=str(exc)[:200]
+        )
+        return f"error: the books write failed: {str(exc)[:200]}"
+    message = result.get("message") if isinstance(result, dict) else None
+    return str(message) if message else f"the books write {workflow_id} reported nothing"
 
 
 @aegis_tool
@@ -404,25 +415,11 @@ async def _exec_ledger_post(
     accounts = [str(p.get("account") or "").strip() for p in postings]
     if not all(accounts):
         return "error: every posting needs an account"
-    amounts: list[Decimal | None] = []
-    for p in postings:
-        raw = p.get("amount")
-        if raw in (None, ""):
-            amounts.append(None)
-            continue
-        try:
-            value = Decimal(str(raw))
-        except (InvalidOperation, ValueError):
-            return f"error: {raw!r} is not an amount"
-        # `Decimal` accepts NaN, Infinity and 1e400 — all of which pass a bare
-        # constructor call and then raise `InvalidOperation` inside
-        # `quantize()`, several frames down in the renderer, where the model
-        # gets an exception repr instead of a sentence it can act on.
-        if not value.is_finite() or abs(value) >= _MAX_AMOUNT:
-            return f"error: {raw!r} is not a usable amount"
-        amounts.append(value)
-    if sum(1 for a in amounts if a is None) > 1:
-        return "error: at most one posting may omit its amount"
+    # The same parse the writer will do, so a refusal here says what the write
+    # would have said rather than a second opinion about the same number.
+    _, problem = lw.parse_amounts(postings)
+    if problem:
+        return f"error: {problem}"
 
     try:
         declared = await books.declared_accounts(cfg)
@@ -454,47 +451,19 @@ async def _exec_ledger_post(
             "asset, liability and equity accounts belong to both."
         )
 
-    # Sanitized once, here, so the index and the journal carry the same name —
-    # `render_manual` would otherwise sanitize only its half of the pair.
-    payee = books.sanitize_payee(payee)
-    msgid = _manual_msgid(entity, occurred_on, payee, postings, note)
-    block = books.render_manual(occurred_on, payee, postings, msgid, note)
-    try:
-        rel, created = await books.post_block(block, entity, occurred_on, msgid, cfg)
-    except books.BooksError as exc:
-        return f"error: {exc}"
-
-    # The index keys on the first amount-bearing posting: it is the one the
-    # money moved to or from, and the blank posting has no amount to record.
-    lead = next(i for i, a in enumerate(amounts) if a is not None)
-    signed = amounts[lead]
-    event = MoneyEvent(
-        kind="transaction",
-        direction="in" if signed < 0 else "out",
-        amount=abs(signed),
-        currency=str(postings[lead].get("currency") or "INR"),
-        payee=payee,
-        payee_key=payee_key(payee),
-        channel="manual",
-        occurred_on=occurred_on,
-        entity=entity,
-        account=accounts[lead],
-        parser="manual",
-        source_class="other",
+    return await _dispatch_books_write(
+        ctx,
+        "post",
+        {
+            "entity": entity,
+            "date": occurred_on.isoformat(),
+            # RAW: `ledger_write` sanitizes, so the journal, the index and the
+            # msgid all take one pass over the same string.
+            "payee": payee,
+            "postings": postings,
+            "note": note,
+        },
     )
-    if not created:
-        # The block was already there. Index it only if the row is MISSING —
-        # that is the state a retry has to repair (the first attempt committed
-        # the journal and was abandoned before it reached the index). Upserting
-        # unconditionally would instead drag the index backwards: a reclassify
-        # between the two posts moved the row's account, and `ji.upsert` sets
-        # `account = EXCLUDED.account`, so the re-post would reset it while the
-        # journal correctly keeps the new one.
-        if await ji.get(pool, msgid) is None:
-            await ji.upsert(pool, msgid, "manual", event, journal_file=rel)
-        return f"already posted as {msgid} in {rel}; nothing was written twice"
-    await ji.upsert(pool, msgid, "manual", event, journal_file=rel)
-    return f"posted {msgid} to {rel}"
 
 
 @aegis_tool
@@ -535,17 +504,9 @@ async def _exec_ledger_reclassify(
             f"{message_id} is filed in {located}. Moving a posting between "
             "entities means moving the block, which this tool does not do."
         )
-    try:
-        rel = await books.rewrite_event(message_id, cfg, account=account, payee=payee)
-    except books.BooksError as exc:
-        return f"error: {exc}"
-    # After the journal, never before: the journal is the record, and an index
-    # row updated for a rewrite that then failed would describe a posting that
-    # does not exist.
-    await pool.execute(
-        _REINDEX_SQL, message_id, account, books.sanitize_payee(payee) if payee else None
+    return await _dispatch_books_write(
+        ctx, "reclassify", {"message_id": message_id, "account": account, "payee": payee}
     )
-    return f"reclassified {message_id} -> {account} in {rel}"
 
 
 @aegis_tool
@@ -657,66 +618,4 @@ async def _exec_ledger_add_rule(
         rule["direction"] = direction
     if payee:
         rule["payee"] = payee
-    try:
-        await books.append_rule(rule, cfg)
-    except books.BooksError as exc:
-        return f"error: {exc}"
-    if not apply:
-        return "rule added; reclassified 0 postings"
-
-    rows = await pool.fetch(_SWEEP_SQL)
-    targets: list[str] = []
-    sender_only: list[str] = []
-    for row in rows:
-        # A rule that names an entity must not move a posting in the OTHER set
-        # of books: the account would change while the block stayed in the
-        # wrong journal file, which is how `expenses:hikmah:*` lands in
-        # `personal/2026.journal`.
-        if entity and row["entity"] != entity:
-            continue
-        # The SAME haystack production will use — `"<sender> | <payee>"` — and
-        # the posting's OWN direction, so a rule that names one sweeps only the
-        # half of the backlog it will go on filing (issue #396).
-        text = row["payee"] or ""
-        moved = row["direction"]
-        if not books.apply_rules([rule], row["sender"], text, direction=moved):
-            continue
-        targets.append(row["message_id"])
-        if row["sender"] and not books.apply_rules([rule], "", text, direction=moved):
-            sender_only.append(row["message_id"])
-    capped = len(targets) > _MAX_APPLY
-    targets = targets[:_MAX_APPLY]
-    try:
-        # ONE write for the whole backlog: one flock, one strict check, one
-        # commit, one push. Per-posting writes would hold the books against
-        # every other writer for the length of the sweep.
-        rewritten, failed = await books.rewrite_events(
-            targets, cfg, account=account, payee=payee
-        )
-    except books.BooksError as exc:
-        return f"error: rule added, but reclassifying failed: {exc}"
-    for msgid in rewritten:
-        await pool.execute(_REINDEX_SQL, msgid, account, payee)
-    if failed:
-        logger.warning("ledger_add_rule_rewrite_failed", msgids=failed[:20], count=len(failed))
-    tail = f" ({len(failed)} failed)" if failed else ""
-    # The count alone cannot warn: a rule matching the SENDER reaches payees
-    # whose names are nothing like it, and the caller who wrote `google` was
-    # thinking about Google, not about every bill Google Pay mirrors. Naming
-    # the sender-only share turns the number into something the caller can act
-    # on while the rule is still one edit old.
-    #
-    # Counted over `rewritten`, NOT over `targets`: the sentence beside it says
-    # how many postings MOVED, so a share taken from the wider set would read
-    # as "reclassified 2 postings (1 failed); 3 matched the sender" — true,
-    # since matching is not moving, and unreadable as anything but a mistake.
-    moved_ids = set(rewritten)
-    sender_hits = sum(1 for m in sender_only if m in moved_ids)
-    if sender_hits:
-        tail += (
-            f"; {sender_hits} matched the sender rather than the payee, "
-            "so this rule is wider than its name"
-        )
-    if capped:
-        tail += f"; stopped at the {_MAX_APPLY}-posting limit, run again to continue"
-    return f"rule added; reclassified {len(rewritten)} postings{tail}"
+    return await _dispatch_books_write(ctx, "add_rule", {"rule": rule, "apply": apply})

@@ -696,6 +696,15 @@ revert of just the paths it touched when the check fails. All three writers
 refuse an account the chart does not declare — the chart is yours, and the
 strict check would reject the block anyway.
 
+The write itself does not happen in the chat turn. The three writers validate
+what they can, hand the write to `BooksWriteFlow` on the worker, and wait 20
+seconds. Nearly always that is enough and you get the answer in the reply. When
+it is not — usually because another write holds the flock — Maou says the write
+is still running and names its workflow id, and the flow sends you the outcome
+when it lands. Two consequences worth knowing: asking twice for the same write
+attaches to the one already running rather than starting a second, and with
+Temporal unreachable a write is refused outright rather than half-done.
+
 Three behaviours are worth knowing before you use them.
 
 - **A re-post is a retry, not a second transaction.** `ledger_post` derives the

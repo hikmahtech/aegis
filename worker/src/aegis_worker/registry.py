@@ -51,6 +51,7 @@ from aegis_worker.flows.agent_task import (
     AgentTaskSweepFlow,
 )
 from aegis_worker.flows.alert_investigation import AlertInvestigationFlow
+from aegis_worker.flows.books_write import BooksWriteFlow
 from aegis_worker.flows.calendar_ingest import CalendarIngestFlow, CalendarIngestInput
 from aegis_worker.flows.cert_radar import CertRadarConfig, CertRadarFlow
 from aegis_worker.flows.clarify import ClarifyConfig, ClarifyFlow
@@ -169,6 +170,10 @@ FLOWS: tuple[FlowSpec, ...] = (
     ),
     FlowSpec(AgentTaskFlow),
     FlowSpec(AlertInvestigationFlow),
+    # Event-driven: started by the three ledger write tools with a workflow id
+    # derived from the write's own content (issue #388). No schedule config and
+    # no activities.yaml row — nothing but a chat tool ever starts it.
+    FlowSpec(BooksWriteFlow),
     FlowSpec(
         CalendarIngestFlow,
         lambda act: CalendarIngestInput(

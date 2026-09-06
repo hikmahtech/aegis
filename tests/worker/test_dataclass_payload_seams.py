@@ -24,7 +24,9 @@ import pytest
 from aegis.api.routes.mcp_server import _handle_approve_tool_use
 from aegis.services.chat import _exec_dispatch_agent_run
 from aegis.services.tools.base import ToolContext
+from aegis.services.tools.ledger import LEDGER_WRITE_WAIT_S, _dispatch_books_write
 from aegis_worker.flows.agent_run import AgentRunInput
+from aegis_worker.flows.books_write import BooksWriteInput
 from aegis_worker.flows.interaction import InteractionFlowInput
 
 
@@ -119,6 +121,48 @@ async def test_approval_card_payload_keys_are_all_interaction_flow_input_fields(
     assert payload["kind"] == "choice"
     assert payload["timeout_policy"] == "archive"
     assert set(payload["options"]) == {"approve", "deny"}
+
+
+@pytest.mark.asyncio
+async def test_books_write_payload_keys_are_all_books_write_input_fields():
+    """The three ledger writers → `BooksWriteFlow(BooksWriteInput)`.
+
+    Every field here fails silently in a way that reads as success. A dropped
+    `op` or `payload` makes the flow report "unknown books write ''" for a
+    transaction the user was told to expect; a dropped `reply_after_seconds`
+    leaves the flow on its own default, which is what decides whether the user
+    ever hears about a slow write.
+    """
+    client = _capturing_client()
+    client.start_workflow.return_value.result = AsyncMock(
+        return_value={"ok": True, "message": "posted manual/abc to personal/2026.journal"}
+    )
+    write = {
+        "entity": "personal",
+        "date": "2026-09-06",
+        "payee": "Corner Store",
+        "postings": [
+            {"account": "expenses:groceries", "amount": "245.50", "currency": "INR"},
+            {"account": "assets:bank:hdfc:1225"},
+        ],
+        "note": "",
+    }
+    out = await _dispatch_books_write(_ctx(client), "post", write)
+    assert out == "posted manual/abc to personal/2026.journal"
+
+    payload = _start_payload(client)
+    unknown = set(payload) - _field_names(BooksWriteInput)
+    assert unknown == set(), f"keys Temporal would silently drop: {sorted(unknown)}"
+    missing = _field_names(BooksWriteInput) - set(payload)
+    assert missing == set(), f"fields left on their default: {sorted(missing)}"
+
+    assert payload["op"] == "post"
+    assert payload["payload"] == write
+    assert payload["reply_after_seconds"] == LEDGER_WRITE_WAIT_S
+    # The id is the write's own content hash, so a retried turn re-attaches.
+    _, kwargs = client.start_workflow.call_args
+    assert kwargs["id"].startswith("books-write-post-")
+    assert kwargs["task_queue"] == "aegis-main"
 
 
 def test_the_converter_really_does_ignore_unknown_keys():
