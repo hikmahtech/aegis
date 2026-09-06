@@ -14,7 +14,7 @@ from zoneinfo import ZoneInfo
 
 import structlog
 from aegis.api.models.money import MoneyEvent, payee_key
-from aegis.services import books
+from aegis.services import books, ledger_write
 from aegis.services import journal_index as ji
 from aegis.services.bank_parsers import has_money_shape, is_autopay, parse_any
 from aegis.services.books import UNKNOWN, account_for, instrument_account
@@ -723,6 +723,32 @@ class MoneyActivities:
             )
 
     # ------------------------------------------------------------------ books
+
+    @activity.defn
+    async def books_write(self, op: str, payload: dict) -> dict:
+        """One books write on behalf of a chat tool (issue #388).
+
+        `BooksWriteFlow` calls this; the write itself is
+        `aegis.services.ledger_write`, the same module the tool validated
+        against, so the tool's refusals and the writer's behaviour cannot
+        drift. Returns `{"ok", "message"}` — a books-level refusal comes back
+        as `ok: False` with the sentence the model should relay, never as a
+        raise, because a raise here is a Temporal retry of a write that was
+        deliberately turned down.
+
+        Books unconfigured on the WORKER is worth saying out loud: the tool
+        reached its own checkout well enough to validate the call and dispatch
+        it, so this is a split configuration, not an idle lane.
+        """
+        if self.books_cfg is None:
+            return {
+                "ok": False,
+                "message": (
+                    "error: the books are not configured on the worker, so the write "
+                    "could not run. Nothing was written."
+                ),
+            }
+        return await ledger_write.perform_write(op, payload, self.db_pool, self.books_cfg)
 
     # Yahoo's FX pair → the hledger commodity symbol its rate prices.
     _FX_SYMBOLS = {"USDINR=X": "$", "GBPINR=X": "£", "EURINR=X": "€"}
