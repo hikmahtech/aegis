@@ -38,6 +38,7 @@ import asyncpg
 import structlog
 
 from aegis.connectors.todoist import TodoistConnector
+from aegis.services import work_sessions
 from aegis.services.agents import resolve_tag
 from aegis.services.hub import _active_suppression, _aware, get_problem
 from aegis.services.todoist_config import resolve_todoist_api_key
@@ -45,7 +46,7 @@ from aegis.services.tools.gtd import _capture_to_inbox_impl
 
 logger = structlog.get_logger()
 
-# The literal token clarify's loop guard and `task_sessions.is_user_note` key on.
+# The literal token clarify's loop guard and `work_sessions.is_user_note` key on.
 FOOTER = "\n\nWorkflow run: problem-hub"
 SOURCE_TAG = "#alert"
 COLLAPSE_WINDOW = timedelta(minutes=30)
@@ -70,6 +71,7 @@ def render_block(
     *,
     window: dict[str, Any] | None = None,
     links: list[dict[str, Any]] | None = None,
+    sessions: list[dict[str, Any]] | None = None,
 ) -> str:
     """The status block for a task description. Pure."""
     lines = [
@@ -89,8 +91,23 @@ def render_block(
     ]
     if refs:
         lines.append("Links: " + " · ".join(refs))
+    for sess in sessions or []:
+        lines.append("Session: " + session_line(sess))
     lines.append("<!-- /aegis:problem -->")
     return "\n".join(lines)
+
+
+def session_line(sess: dict[str, Any]) -> str:
+    """One registry row as the block and `task_context` show it:
+    `aegis active (work) · seen 2026-09-07 10:12 UTC · <summary>`."""
+    who = str(sess.get("owner") or "aegis")
+    account = str(sess.get("account") or "")
+    head = f"{who} {sess.get('status') or 'active'}" + (f" ({account})" if account else "")
+    seen = sess.get("last_seen_at") or sess.get("last_turn_at")
+    if seen:
+        head += f" · seen {_ts(seen)}"
+    summary = str(sess.get("summary") or "").strip()
+    return f"{head} · {summary[:160]}" if summary else head
 
 
 def merge_block(description: str | None, block: str) -> str:
@@ -193,6 +210,15 @@ async def _uncomplete_task(pool: asyncpg.Pool, task_id: str) -> bool:
     return True
 
 
+async def retire_task(
+    pool: asyncpg.Pool, task_id: str, note: str, *, settings: Any = None
+) -> bool:
+    """Complete a task the hub no longer needs (its problem was merged away),
+    with a note saying where the work went. True when the completion queued."""
+    await _post_note(pool, settings, task_id, note)
+    return await _complete_task(pool, task_id)
+
+
 async def _set_task(pool: asyncpg.Pool, problem_id: str, task_id: str) -> None:
     await pool.execute(
         "UPDATE problems SET todoist_task_id = $2 WHERE id = $1::uuid", problem_id, task_id
@@ -286,7 +312,10 @@ async def project(
             problem_id,
         )
     ]
-    block = render_block(p, window=dict(window) if window else None, links=links)
+    sessions = await work_sessions.list_for_task(pool, task_id) if task_id else []
+    block = render_block(
+        p, window=dict(window) if window else None, links=links, sessions=sessions
+    )
 
     if not task_id:
         latest = await pool.fetchval(

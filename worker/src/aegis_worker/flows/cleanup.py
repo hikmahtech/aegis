@@ -158,16 +158,16 @@ class CleanupFlow:
         if config.task_session_days > 0:
             try:
                 session_result = await workflow.execute_activity_method(
-                    CleanupActivities.cleanup_task_sessions,
+                    CleanupActivities.cleanup_work_sessions,
                     args=[config.task_session_days],
                     start_to_close_timeout=TIMEOUT_LONG,
                     retry_policy=NO_RETRY,
                 )
-                result["task_sessions"] = session_result
+                result["work_sessions"] = session_result
             except Exception as exc:
                 workflow.logger.error(
                     "task_session_sweep_failed error=%s", str(exc)[:200]
                 )
-                result["task_sessions"] = {"status": "failed"}
+                result["work_sessions"] = {"status": "failed"}
 
         return result

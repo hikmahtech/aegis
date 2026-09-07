@@ -43,7 +43,7 @@ async def _stub_orphans(threshold_days: int) -> dict:
     return {"archived": 1, "threshold_days": threshold_days}
 
 
-@activity.defn(name="cleanup_task_sessions")
+@activity.defn(name="cleanup_work_sessions")
 async def _stub_sessions(days: int) -> dict:
     _record("sessions", days)
     return {"removed": 2, "skipped": 1}
@@ -55,7 +55,7 @@ async def _stub_prune_boom(config: dict) -> dict:
     raise RuntimeError("relation does not exist")
 
 
-@activity.defn(name="cleanup_task_sessions")
+@activity.defn(name="cleanup_work_sessions")
 async def _stub_sessions_boom(days: int) -> dict:
     _record("sessions", days)
     raise RuntimeError("ssh: no route to host")
@@ -82,7 +82,7 @@ async def test_task_session_sweep_runs_and_lands_under_its_own_key():
     result = await _run(CleanupConfig(retentions={"audit_log": 90}, task_session_days=14))
 
     assert _calls["sessions"] == [14]
-    assert result["task_sessions"] == {"removed": 2, "skipped": 1}
+    assert result["work_sessions"] == {"removed": 2, "skipped": 1}
     # The neighbouring steps still reported their own results.
     assert result["audit_log"] == 3
     assert result["interactions_archived"] == 1
@@ -93,7 +93,7 @@ async def test_default_window_is_seven_days():
     result = await _run(CleanupConfig(retentions={"audit_log": 90}))
 
     assert _calls["sessions"] == [7]
-    assert result["task_sessions"] == {"removed": 2, "skipped": 1}
+    assert result["work_sessions"] == {"removed": 2, "skipped": 1}
 
 
 @pytest.mark.asyncio
@@ -103,7 +103,7 @@ async def test_zero_days_skips_the_sweep_entirely():
     result = await _run(CleanupConfig(retentions={"audit_log": 90}, task_session_days=0))
 
     assert "sessions" not in _calls
-    assert "task_sessions" not in result
+    assert "work_sessions" not in result
 
 
 @pytest.mark.asyncio
@@ -116,7 +116,7 @@ async def test_sweep_failure_is_marked_not_fatal():
         _stub_sessions_boom,
     )
 
-    assert result["task_sessions"] == {"status": "failed"}
+    assert result["work_sessions"] == {"status": "failed"}
     # The steps before it still reported — one broken sweep is not a broken run.
     assert result["audit_log"] == 3
     assert result["interactions_archived"] == 1
@@ -135,4 +135,4 @@ async def test_prune_failure_does_not_suppress_the_sweep():
     )
 
     assert result["prune_status"] == "failed"
-    assert result["task_sessions"] == {"removed": 2, "skipped": 1}
+    assert result["work_sessions"] == {"removed": 2, "skipped": 1}

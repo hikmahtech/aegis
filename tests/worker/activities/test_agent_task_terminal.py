@@ -209,3 +209,20 @@ async def test_comment_does_not_retry_a_per_command_rejection(db_pool, _seed):
     assert result["ok"] is False
     assert "command_rejected" in str(result["error"])
     assert len(calls) == 1, "a permanent rejection must NOT be retried"
+
+
+async def test_park_task_writes_the_reason_to_the_session_row(db_pool, _seed):
+    """The registry says why a task is parked (`task_context` reads it), not
+    only the worker log — and a task with no coding session still parks."""
+    from aegis.services import work_sessions
+
+    act = AgentTaskActivities(db_pool=db_pool)
+    assert (await act.park_task("tm-1", "no session here"))["parked"] is True
+    await db_pool.execute("DELETE FROM work_sessions WHERE task_id = 'tm-1'")
+    try:
+        await work_sessions.create_session(db_pool, task_id="tm-1", agent_id="pandoras-actor")
+        assert (await act.park_task("tm-1", "waiting on you: pr: #12"))["parked"] is True
+        row = await work_sessions.get_session(db_pool, "tm-1")
+        assert row["status"] == "parked" and row["summary"] == "waiting on you: pr: #12"
+    finally:
+        await db_pool.execute("DELETE FROM work_sessions WHERE task_id = 'tm-1'")

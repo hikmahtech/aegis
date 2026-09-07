@@ -22,7 +22,7 @@ import pytest
 import pytest_asyncio
 from aegis.connectors.todoist import TodoistConnector
 from aegis.services.chat import ToolContext, _exec_comment_on_task
-from aegis.services.task_sessions import create_session, is_user_note
+from aegis.services.work_sessions import create_session, is_user_note
 
 COMMENT = "Use the retry helper in http.py, not a bare loop.\n\nWorkflow run of the mill."
 
@@ -35,11 +35,11 @@ _NO_SESSION = "T_CMT_NONE"
 async def sessions(db_pool):
     """`_TASK` has a coding session for the whole file; `_NO_SESSION` never does."""
     for task in (_TASK, _NO_SESSION):
-        await db_pool.execute("DELETE FROM task_sessions WHERE task_id = $1", task)
+        await db_pool.execute("DELETE FROM work_sessions WHERE task_id = $1", task)
     await create_session(db_pool, task_id=_TASK, agent_id="pandoras-actor")
     yield
     for task in (_TASK, _NO_SESSION):
-        await db_pool.execute("DELETE FROM task_sessions WHERE task_id = $1", task)
+        await db_pool.execute("DELETE FROM work_sessions WHERE task_id = $1", task)
 
 
 def _fake_connector(sent: list[list[dict]]):

@@ -1,7 +1,7 @@
 # Problem hub: one record for every alert, investigation and session
 
 **Date:** 2026-09-07
-**Status:** approved; PRs 1, 2, 3a and 3b shipped (see §12)
+**Status:** approved; PRs 1, 2, 3a, 3b, 4a, 4b and 5a shipped (see §12)
 
 ## Problem
 
@@ -96,7 +96,7 @@ Measured against the tree on 2026-09-07:
 Four tables; `task_sessions` widens in place. Each lands with its first reader:
 `problems`, `problem_events` and `problem_links` in `030_problem_hub.sql` (PR 1),
 `service_state` in `031_service_state.sql` (PR 2), and the `work_sessions`
-widening in `032_work_sessions.sql` (PR 5) — a renamed table with no code on
+widening in `034_work_sessions.sql` (PR 5a; 032 and 033 were taken) — a renamed table with no code on
 it yet would break the coding lane between PRs.
 
 ```sql
@@ -550,7 +550,8 @@ it replaces, so the tree never carries two ways to do one thing.
 | 3b | Alertmanager, Sentry and heartbeat producers call `ingest_alert`; clarify and `investigate_resource` keep starting the flow, whose step 0 ingests for them; `AlertInvestigationFlow` takes `problem_id`; `scripts/hub_backfill.py`. | `alert_mutes` (alert pipeline's use), `infra_heartbeat_state` re-investigation maps, steps 1–2.8, `check_dedup`, `build_alert_signature`, `close_task_for_resolved_alert`, `log_alert`, `check_alert_resolved`, `record_heartbeat_resolved`, the title-regex `get_verification_delay`. `alert_dedup_index` is unread from here and dropped in PR 6, after the backfill has read its recurrence counts. |
 | 4a | `services/hub_watch.py::reconcile_findings` (findings in, fresh problems and recoveries out); flow health, stuck social posts and the LLM governor on it; migration 032 drops `alert_mutes`. | three copies of the `audit_log` dedupe SQL (two here, the third went in 3b), `alert_mutes` and its four key namespaces, the watchdogs' `dedup_hours` / `recovery_hours` knobs, the llm_dead new-evidence rule (an open problem is one problem) |
 | 4b | The delivery watchdog (undelivered cards, the comms probe), service drift and cert expiry on `reconcile_findings`; the infra verb parks non-service problems. | the hand-rolled comms task, `resolve_comms_inbound_alert`, the hourly undelivered re-card. `ServiceDriftFlow.recheck_delay_seconds` and `FlowHealthConfig.min_stale_minutes` STAY: they filter unplanned restarts, which no declared window covers. The expiry radar is not a producer: its ledger claims a human ack card, not an alert. |
-| 5 | `work_sessions` columns, `account` at resume, `task_context`, `report_progress`, `merge_problems`, status block, subtasks from plans, collision as lookup, GitHub-issue projection for `repo` subjects. | SSH git-context fan-out, LLM same-task judge, `_own_session_owner`, `hand_to_you`, `STATUS:` scraping into `result_summary`, title parsing in `_run_infra` |
+| 5a | Migration 034: `task_sessions` → `work_sessions` with `id`, `problem_id`, `account`, `engine`, `owner`, `status`, `summary`, `last_seen_at` and a partial unique index on the live AEGIS row. `account` recorded at launch and used at resume; `park_task` writes its reason to the row; collision is a registry lookup (`turn_still_running` / `you_are_in_it` / `proceed`) with a 15-minute liveness cross-check (`reconcile_work_sessions`); `task_context`, `report_progress` and `merge_problems` tools, granted to all four agents and withheld from run mounts; sessions on the status block. | the SSH git-context fan-out (`_enrich_sessions`, `_session_git_context`), the LLM same-task judge (`build_same_task_prompt`, `parse_same_task_verdict`, `find_session`, `human_sessions_in_repo`, `_task_identity`, and `AgentTaskActivities.llm_client`/`model_balanced`), `_own_session_owner`, the `hand_to_you` verdict and its exit |
+| 5b | Plan steps as Todoist subtasks; GitHub-issue projection for `repo` subjects. | `STATUS:` scraping into `result_summary` where the registry now says it |
 | 6 | Admin Problems page, digest from events, `CleanupFlow` close and re-project sweeps. | `build_alert_digest`'s buffer reader |
 | 7 | Operator hooks (dotfiles, documented in `docs/infrastructure.md`), runbook updates, `docs/how-it-works.md` section. | — |
 
@@ -570,15 +571,17 @@ Together they close #341 and the remainder of #279.
    Then verify with the queries in `docs/infrastructure.md`: no open task
    without a problem, no open problem with two tasks, the eight #341
    duplicates merged to one.
-4. PR 5: grant the four tools to the four agents' `metadata.tool_set` (a DB
-   step, as always), install the hooks, open one `@code` task from a fresh
-   Claude session and confirm `task_context` shows the previous AEGIS turn.
+4. PR 5a: grant `task_context`, `report_progress` and `merge_problems` to the
+   four agents' `metadata.tool_set` (a DB step, as always — the seed only
+   applies to an agent with no `tool_set` yet), then open one `@code` task
+   from a fresh Claude session and confirm `task_context` shows the previous
+   AEGIS turn. The hooks that call `report_progress` automatically are PR 7.
 
 ## Files touched
 
 | Area | Files |
 |---|---|
-| Migrations | `migrations/030_problem_hub.sql`, `031_service_state.sql`, `032_work_sessions.sql` |
+| Migrations | `migrations/030_problem_hub.sql`, `031_service_state.sql`, `033_drop_alert_mutes.sql`, `034_work_sessions.sql` |
 | Core | `services/hub.py` (new), `services/tools/hub.py` (new), `services/chat.py` (four schemas, four registry entries), `services/alert_tasks.py` (folded into hub), `services/task_sessions.py` → `work_sessions.py`, `api/routes/hub.py` (new), `api/routes/webhooks.py` (deploy events, producers), `api/routes/mcp_server.py` (`_UNSERVED_TOOLS`), `connectors/remote_script.py` (`account` returned from launch) |
 | Worker | `flows/alert_investigation.py`, `flows/infra_heartbeat.py`, `flows/flow_health.py`, `flows/delivery_watchdog.py`, `flows/service_drift.py`, `flows/cert_radar.py`, `flows/expiry_radar.py`, `flows/social_metrics.py`, `flows/llm_spend_guard.py`, `flows/github_alert.py`, `flows/sentry_poll.py`, `flows/clarify.py`, `flows/agent_task.py`, `flows/cleanup.py`, `activities/alerts.py`, `activities/homelab.py`, `activities/flow_health.py`, `activities/social.py`, `activities/agent_task.py`, `activities/cleanup.py`, `activities/briefing.py`; `activework/` deleted |
 | Admin | `admin-panel/frontend/src/pages/Problems.tsx` (new), `Overview.tsx` (count) |

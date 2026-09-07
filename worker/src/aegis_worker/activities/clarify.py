@@ -459,7 +459,7 @@ class ClarifyActivities:
         note including agent replies, which would create a 15-min reply
         loop (loop fix 2026-05-27, commit cb7fce6e).
 
-        A task holding a `task_sessions` row is excluded outright: it has been
+        A task holding a `work_sessions` row is excluded outright: it has been
         handed to the coding lane, where each comment is a turn of its own
         AgentTaskFlow, so clarify must not also answer it.
 
@@ -621,7 +621,7 @@ class ClarifyActivities:
                   -- and the chat reply's note lands inside the session's
                   -- transcript. The session row IS the handover marker.
                   AND NOT EXISTS (
-                      SELECT 1 FROM task_sessions ts WHERE ts.task_id = t.id
+                      SELECT 1 FROM work_sessions ts WHERE ts.task_id = t.id AND ts.owner = 'aegis'
                   )
                   -- Hands-off signal (inbox gate): a task the user has claimed
                   -- with @me — and hasn't addressed to an agent — is theirs to

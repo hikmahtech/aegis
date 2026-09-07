@@ -728,6 +728,101 @@
   {
     "type": "function",
     "function": {
+      "name": "task_context",
+      "description": "What to read first when picking up a task: the problem behind it, its recent events, every session on it (AEGIS's and yours) with their summaries, its links and any deploy window, plus the command that takes AEGIS's session over. Give the Todoist task id or the problem id.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "task_id": {
+            "type": "string",
+            "description": "the Todoist task id (the number in the task's URL, or `task-<id>` in a worktree path).",
+            "default": ""
+          },
+          "problem_id": {
+            "type": "string",
+            "description": "the problem's uuid, when you have it instead of the task.",
+            "default": ""
+          }
+        }
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "report_progress",
+      "description": "Register your own session on a task with a one-line summary of where you are. It lands as a comment on the task and a line in its status block, and while your session is `active` AEGIS stays out of the task. A task with no problem on the hub gets one. Call it when you start, when you hand back, and when you are done.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "task_id": {
+            "type": "string",
+            "description": "the Todoist task id."
+          },
+          "summary": {
+            "type": "string",
+            "description": "one line: what you did or where you stopped."
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "active",
+              "parked",
+              "done"
+            ],
+            "description": "active (you are on it) | parked (stepped away, AEGIS may resume) | done.",
+            "default": "active"
+          },
+          "session_id": {
+            "type": "string",
+            "description": "your Claude session id, if you know it \u2014 lets the host's session list confirm you are live.",
+            "default": ""
+          },
+          "pr_url": {
+            "type": "string",
+            "description": "a pull request you opened, linked to the problem.",
+            "default": ""
+          },
+          "account": {
+            "type": "string",
+            "description": "the CLAUDE_CONFIG_DIR account label you run under, if not the default.",
+            "default": ""
+          }
+        },
+        "required": [
+          "task_id",
+          "summary"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "merge_problems",
+      "description": "Fold one problem into another when they are the same outage under two names: events, links and sessions move to the kept problem, the merged one closes with a link back, and its task is completed with a note. Only do this when you are sure \u2014 a wrong merge hides an outage.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "keep_id": {
+            "type": "string",
+            "description": "the problem to keep (uuid)."
+          },
+          "merge_id": {
+            "type": "string",
+            "description": "the duplicate to fold into it (uuid)."
+          }
+        },
+        "required": [
+          "keep_id",
+          "merge_id"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
       "name": "aegis_self_diagnose",
       "description": "Investigate / fix AEGIS itself by driving the kimi CLI over SSH on node-a against the AEGIS source checkout. The kimi run has full Shell / Read / Glob / WriteFile permissions. Use this when the user asks about AEGIS's own behavior, bugs, or improvements. For code FIXES, kimi MUST create a branch (`aegis-fix/<slug>`), commit, push, and open a PR via `gh pr create` \u2014 never direct-commit to main. The tool waits up to 8 minutes for kimi's STATUS footer; if the run exceeds that, the partial output is returned with a `still_running` flag so the user can ask for a follow-up.",
       "parameters": {

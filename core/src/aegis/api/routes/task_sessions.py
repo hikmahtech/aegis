@@ -8,7 +8,7 @@ Two things here are load-bearing.
 
 The note is written **verbatim** — no author prefix, no ``Workflow run:``
 footer. That footer (and the clarify/agent-reply prefixes) is exactly what
-``services/task_sessions.is_user_note`` uses to tell AEGIS's own comments from
+``services/work_sessions.is_user_note`` uses to tell AEGIS's own comments from
 the user's, so a helpfully-decorated note would land in Todoist and never start
 a turn. Nothing on this path may add to the text.
 
@@ -30,8 +30,8 @@ from aegis.api.auth import verify_auth
 from aegis.api.deps import get_settings
 from aegis.config import Settings
 from aegis.connectors.todoist import TodoistConnector
-from aegis.services.task_sessions import find_by_thread, get_session
 from aegis.services.todoist_config import resolve_todoist_api_key
+from aegis.services.work_sessions import find_by_thread, get_session
 
 logger = structlog.get_logger()
 

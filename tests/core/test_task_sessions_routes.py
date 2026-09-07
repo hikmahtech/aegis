@@ -2,7 +2,7 @@
 
 The load-bearing assertion in this file is that the comment route stores the
 text **verbatim**. A note carrying the `Workflow run:` footer (or either agent
-prefix) is AEGIS's own comment and `task_sessions.is_user_note` filters it out,
+prefix) is AEGIS's own comment and `work_sessions.is_user_note` filters it out,
 so a route that helpfully prefixed the author would post a note that never
 starts a turn — the reply would land in Todoist and nothing would happen.
 """
@@ -19,7 +19,7 @@ from aegis.api.auth import verify_auth
 from aegis.api.deps import get_settings
 from aegis.config import Settings
 from aegis.connectors.todoist import TodoistConnector
-from aegis.services import task_sessions as svc
+from aegis.services import work_sessions as svc
 
 pytestmark = pytest.mark.asyncio
 
@@ -45,7 +45,7 @@ def settings():
 async def app(db_pool, settings):
     """The real Core app, so the test proves the router is registered in app.py."""
     for task in (_TASK, _OTHER):
-        await db_pool.execute("DELETE FROM task_sessions WHERE task_id = $1", task)
+        await db_pool.execute("DELETE FROM work_sessions WHERE task_id = $1", task)
     await svc.create_session(db_pool, task_id=_TASK, agent_id="pandoras-actor")
     await svc.set_slack_ref(db_pool, _TASK, {"channel": "C-TASKS", "ts": "1756900000.000100"})
 
@@ -55,7 +55,7 @@ async def app(db_pool, settings):
     created.dependency_overrides[verify_auth] = lambda: True
     yield created
     for task in (_TASK, _OTHER):
-        await db_pool.execute("DELETE FROM task_sessions WHERE task_id = $1", task)
+        await db_pool.execute("DELETE FROM work_sessions WHERE task_id = $1", task)
 
 
 @pytest_asyncio.fixture(loop_scope="function")
@@ -266,11 +266,11 @@ async def test_by_thread_ignores_a_session_with_no_slack_ref(client, db_pool):
 async def test_comment_survives_a_task_id_with_odd_characters(client, sent, db_pool):
     """Todoist v1 ids are opaque strings, not digits."""
     task_id = f"6X{uuid.uuid4().hex[:8]}"
-    await db_pool.execute("DELETE FROM task_sessions WHERE task_id = $1", task_id)
+    await db_pool.execute("DELETE FROM work_sessions WHERE task_id = $1", task_id)
     await svc.create_session(db_pool, task_id=task_id, agent_id="pandoras-actor")
     try:
         r = await client.post(f"/api/admin/tasks/{task_id}/comment", json={"text": "go"})
         assert r.status_code == 200, r.text
         assert sent[0][0]["args"]["item_id"] == task_id
     finally:
-        await db_pool.execute("DELETE FROM task_sessions WHERE task_id = $1", task_id)
+        await db_pool.execute("DELETE FROM work_sessions WHERE task_id = $1", task_id)

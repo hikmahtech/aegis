@@ -148,20 +148,23 @@ async def test_sweep_spawns_one_child_per_task_and_does_not_await_them():
 # `find_actionable_tasks` excludes @waiting, so every exit MUST complete or
 # park the task — otherwise the 6h cooldown re-picks (and re-fails) it
 # forever. This is the single mechanical proof of that invariant: one case
-# per terminal return/raise statement in AgentTaskFlow (17 total — 3 in
-# run(), 3 in _run_infra, 2 in _run_email, 2 in _run_finance, 7 in
-# _run_coding; see issue #154 for the original enumeration).
+# per terminal return/raise statement in AgentTaskFlow (16 total — 3 in
+# run(), 3 in _run_infra, 2 in _run_email, 2 in _run_finance, 6 in
+# _run_coding; see issue #154 for the original enumeration. PR 5 of the
+# problem hub deleted the "handed to operator" exit: an operator who wants
+# AEGIS out of a task says so with `report_progress`, which is what the
+# `you_are_in_it` exit below reads).
 #
 # THREE exits deliberately do not park, and each carries its own terminal proof
 # instead (`case.expect_terminal`):
 #   * `unknown_task` — the task was deleted before we loaded it. There is
 #     nothing to park and nothing to comment on.
-#   * `you_are_in_it` with a HUMAN owner — the operator is sitting in this
-#     task's session, so the comment is already in front of them. Parking would
+#   * `you_are_in_it` — the operator's own session is registered active on
+#     the task, so the comment is already in front of them. Parking would
 #     stamp @waiting on a task somebody is actively working; what stops the
 #     fallback sweep re-dispatching the same comment is the `record_task_turn`
 #     watermark, so THAT is what the case asserts.
-#   * `you_are_in_it` with an AEGIS owner — an orphan turn of our own. The
+#   * `turn_still_running` — an orphan turn of our own. The
 #     comment has been read by nobody, so this exit deliberately leaves the
 #     task IN the pool: the fallback sweep must re-dispatch it once the run
 #     ends. "No park and no watermark" is the correct terminal state here, and
@@ -197,7 +200,7 @@ _SESSION = {
     "slack_ref": "", "turns": 0, "last_turn_at": "", "created_at": "",
 }
 _ENSURE_READY = {"status": "ready", "session": _SESSION, "candidates": [], "error": ""}
-_PROCEED = {"verdict": "proceed", "session": None, "sessions": [], "reason": ""}
+_PROCEED = {"verdict": "proceed", "session": None, "reason": ""}
 _LAUNCH_OK = {
     "status": "running", "run_id": "r1", "output_file": "turn.jsonl", "host": "h",
     "engine": "claude", "tmux_window": "w", "worktree_path": _SESSION["worktree_path"],
@@ -282,8 +285,8 @@ _CASES = [
         {
             "check_task_collision": {
                 "verdict": "you_are_in_it",
-                "session": {"name": "repo fix", "owner": "human"},
-                "sessions": [], "reason": "live",
+                "session": {"name": "repo fix", "owner": "operator", "account": "personal"},
+                "reason": "operator session (personal) active on the task",
             },
         },
         expect_status="operator_in_session",
@@ -293,24 +296,13 @@ _CASES = [
         "coding_orphan_aegis_turn", _CODE_TASK,
         {
             "check_task_collision": {
-                "verdict": "you_are_in_it",
+                "verdict": "turn_still_running",
                 "session": {"name": "task x", "owner": "aegis"},
-                "sessions": [], "reason": "live",
+                "reason": "the last turn is still writing /tmp/x.jsonl",
             },
         },
         expect_status="turn_still_running",
         expect_terminal="none",
-    ),
-    _ExitCase(
-        "coding_hand_to_you", _CODE_TASK,
-        {
-            "check_task_collision": {
-                "verdict": "hand_to_you",
-                "session": {"name": "repo fix", "owner": "human", "branch": "fix/x"},
-                "sessions": [], "reason": "same branch",
-            },
-        },
-        expect_status="handed_to_operator",
     ),
     _ExitCase(
         "coding_launch_failed", _CODE_TASK,
@@ -322,7 +314,7 @@ _CASES = [
               expect_status="unknown_task", expect_terminal="none", load_from_id=True),
 ]
 
-assert len(_CASES) == 17, "one case per AgentTaskFlow exit — see issue #154"
+assert len(_CASES) == 16, "one case per AgentTaskFlow exit — see issue #154"
 
 
 def _exit_case_activities(events: list, case: _ExitCase):
@@ -376,9 +368,7 @@ def _exit_case_activities(events: list, case: _ExitCase):
         return r.get("ensure_task_session", _ENSURE_READY)
 
     @activity.defn(name="check_task_collision")
-    async def check_task_collision(
-        task_id: str, repo: str, session_id: str, override: bool = False
-    ) -> dict:
+    async def check_task_collision(task_id: str, override: bool = False) -> dict:
         return r.get("check_task_collision", _PROCEED)
 
     @activity.defn(name="record_task_turn")

@@ -1,14 +1,15 @@
-"""aegis.services.task_sessions — row lifecycle, due-turn query, dispatch dance."""
+"""aegis.services.work_sessions — row lifecycle, due-turn query, dispatch dance."""
 
 from __future__ import annotations
 
 import uuid
+from datetime import timedelta
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 import pytest_asyncio
 from aegis.clarify_note import AGENT_REPLY_PREFIX, CLARIFY_NOTE_PREFIX
-from aegis.services import task_sessions as svc
+from aegis.services import work_sessions as svc
 from temporalio.exceptions import WorkflowAlreadyStartedError
 
 _TASK = "ts-task-1"
@@ -17,7 +18,7 @@ _TASK = "ts-task-1"
 @pytest_asyncio.fixture(loop_scope="function")
 async def _clean(db_pool):
     for sql in (
-        "DELETE FROM task_sessions WHERE task_id = $1",
+        "DELETE FROM work_sessions WHERE task_id = $1",
         "DELETE FROM todoist_notes WHERE item_id = $1",
         "DELETE FROM todoist_tasks WHERE id = $1",
     ):
@@ -29,7 +30,7 @@ async def _clean(db_pool):
     )
     yield
     for sql in (
-        "DELETE FROM task_sessions WHERE task_id = $1",
+        "DELETE FROM work_sessions WHERE task_id = $1",
         "DELETE FROM todoist_notes WHERE item_id = $1",
         "DELETE FROM todoist_tasks WHERE id = $1",
     ):
@@ -122,7 +123,7 @@ async def test_find_turns_due_joins_every_unanswered_note_oldest_first(db_pool, 
     # The session predates both notes, as it does in life: `created_at` is the
     # watermark until the first turn runs.
     await db_pool.execute(
-        "UPDATE task_sessions SET created_at = now() - interval '1 hour' WHERE task_id = $1",
+        "UPDATE work_sessions SET created_at = now() - interval '1 hour' WHERE task_id = $1",
         _TASK,
     )
     await _note(db_pool, "use the other repo", age="30 seconds")
@@ -185,3 +186,110 @@ async def test_dispatch_starts_then_signals_then_restarts():
     handle.signal = AsyncMock(side_effect=RuntimeError("workflow execution already completed"))
     client.start_workflow = AsyncMock(side_effect=[WorkflowAlreadyStartedError("x", "y"), None])
     assert await svc.dispatch_task_turn(client, task_id="t1", agent_id="a", comment="again") == "started"
+
+
+# --- the registry widening (PR 5) ---------------------------------------------
+
+
+async def test_set_last_run_records_account_and_engine_and_keeps_them_when_blank(db_pool, _clean):
+    await svc.create_session(db_pool, task_id=_TASK, agent_id="pandoras-actor")
+    await svc.set_last_run(db_pool, _TASK, output_file="/tmp/r1", host="meem", account="work")
+    row = await svc.get_session(db_pool, _TASK)
+    assert row["account"] == "work" and row["engine"] == "claude" and row["status"] == "active"
+    assert row["last_seen_at"] is not None
+    await svc.set_last_run(db_pool, _TASK, output_file="/tmp/r2", host="meem")
+    row = await svc.get_session(db_pool, _TASK)
+    assert row["account"] == "work", "a launch that could not say keeps the recorded account"
+    assert row["last_output_file"] == "/tmp/r2"
+
+
+async def test_set_state_writes_the_park_reason_to_the_aegis_row(db_pool, _clean):
+    assert not await svc.set_state(db_pool, _TASK, status="parked", summary="x"), "no row yet"
+    await svc.create_session(db_pool, task_id=_TASK, agent_id="pandoras-actor")
+    assert await svc.set_state(db_pool, _TASK, status="parked", summary="waiting on you: plan")
+    row = await svc.get_session(db_pool, _TASK)
+    assert row["status"] == "parked" and row["summary"] == "waiting on you: plan"
+    with pytest.raises(ValueError):
+        await svc.set_state(db_pool, _TASK, status="bogus", summary="")
+
+
+async def test_create_session_inherits_the_tasks_problem(db_pool, _clean):
+    from aegis.services.hub import Event, ingest_event
+    from aegis.services.hub_project import link_task
+
+    r = await ingest_event(
+        db_pool,
+        Event(source="heartbeat", external_id=f"ws-{uuid.uuid4().hex[:8]}", kind="occurrence",
+              title="down", klass="DockerServiceDown", subject=f"svc_{uuid.uuid4().hex[:6]}"),
+    )
+    await link_task(db_pool, r.problem_id, _TASK)
+    row = await svc.create_session(db_pool, task_id=_TASK, agent_id="pandoras-actor")
+    assert row["problem_id"] == r.problem_id
+
+
+async def test_a_done_aegis_row_makes_room_for_a_fresh_session(db_pool, _clean):
+    """The unique index is partial: a `done` AEGIS row is history, and the next
+    `create_session` mints a new conversation rather than resuming a finished one."""
+    first = await svc.create_session(db_pool, task_id=_TASK, agent_id="pandoras-actor")
+    await svc.set_state(db_pool, _TASK, status="done", summary="shipped")
+    assert await svc.get_session(db_pool, _TASK) is None
+    second = await svc.create_session(db_pool, task_id=_TASK, agent_id="pandoras-actor")
+    assert second["session_id"] != first["session_id"]
+    assert [r["status"] for r in await svc.list_for_task(db_pool, _TASK)] == ["done", "active"]
+
+
+async def test_operator_rows_upsert_per_account_and_never_shadow_the_aegis_row(db_pool, _clean):
+    aegis = await svc.create_session(db_pool, task_id=_TASK, agent_id="pandoras-actor")
+    a = await svc.upsert_operator_session(
+        db_pool, task_id=_TASK, account="personal", status="active", summary="looking", session_id="not-a-uuid"
+    )
+    assert a["owner"] == "operator" and a["agent_id"] == "" and a["account"] == "personal"
+    uuid.UUID(a["session_id"])  # minted when the reporter could not say
+    b = await svc.upsert_operator_session(
+        db_pool, task_id=_TASK, account="personal", status="parked", summary="lunch",
+        session_id="aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee", host="meem",
+    )
+    assert b["id"] == a["id"] and b["status"] == "parked" and b["summary"] == "lunch"
+    assert b["session_id"] == "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee" and b["host"] == "meem"
+    c = await svc.upsert_operator_session(db_pool, task_id=_TASK, account="work", status="active", summary="w")
+    assert c["id"] not in {a["id"], aegis["id"]}
+    assert (await svc.get_session(db_pool, _TASK))["id"] == aegis["id"], "the AEGIS row is untouched"
+    assert [r["owner"] for r in await svc.list_for_task(db_pool, _TASK)] == ["aegis", "operator", "operator"]
+    assert await svc.find_turns_due(db_pool) == [], "operator rows never become turns"
+    # A done row is history: the next report from that account starts a new one.
+    await svc.upsert_operator_session(db_pool, task_id=_TASK, account="work", status="done", summary="d")
+    d = await svc.upsert_operator_session(db_pool, task_id=_TASK, account="work", status="active", summary="again")
+    assert d["id"] != c["id"]
+    with pytest.raises(ValueError):
+        await svc.upsert_operator_session(db_pool, task_id=_TASK, account="work", status="odd", summary="")
+
+
+async def test_live_operator_sessions_is_bounded_by_status_and_window(db_pool, _clean):
+    await svc.upsert_operator_session(db_pool, task_id=_TASK, account="personal", status="active", summary="s")
+    assert [r["account"] for r in await svc.live_operator_sessions(db_pool, _TASK)] == ["personal"]
+    await db_pool.execute(
+        "UPDATE work_sessions SET last_seen_at = now() - interval '31 minutes' WHERE task_id = $1", _TASK
+    )
+    assert await svc.live_operator_sessions(db_pool, _TASK) == []
+    assert len(await svc.live_operator_sessions(db_pool, _TASK, within=timedelta(hours=1))) == 1
+    await svc.upsert_operator_session(db_pool, task_id=_TASK, account="personal", status="parked", summary="s")
+    assert await svc.live_operator_sessions(db_pool, _TASK, within=timedelta(hours=1)) == []
+
+
+async def test_reconcile_touches_listed_rows_and_parks_quiet_unlisted_ones(db_pool, _clean):
+    live = await svc.upsert_operator_session(
+        db_pool, task_id=_TASK, account="personal", status="active", summary="s",
+        session_id="aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+    )
+    gone = await svc.upsert_operator_session(db_pool, task_id=_TASK, account="work", status="active", summary="s")
+    fresh = await svc.upsert_operator_session(db_pool, task_id=_TASK, account="other", status="active", summary="s")
+    await db_pool.execute(
+        "UPDATE work_sessions SET last_seen_at = now() - interval '2 hours' WHERE id = ANY($1::uuid[])",
+        [uuid.UUID(live["id"]), uuid.UUID(gone["id"])],
+    )
+    out = await svc.reconcile_operator_sessions(db_pool, [live["session_id"], "zzz"])
+    assert out == {"refreshed": 1, "parked": 1}
+    status = {r["account"]: r["status"] for r in await svc.list_for_task(db_pool, _TASK)}
+    assert status == {"personal": "active", "work": "parked", "other": "active"}
+    assert fresh["status"] == "active"
+    assert await svc.reconcile_operator_sessions(db_pool, []) == {"refreshed": 0, "parked": 0}

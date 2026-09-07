@@ -302,24 +302,28 @@ the task and exit while the card is still open. The coding verb has no cards
 at all: the task's comment thread is its approval channel (see below).
 
 **Task sessions (the coding verb).** A `@code` task gets one persistent Claude
-Code session, recorded in `task_sessions` (session uuid, per-task worktree
-`<repo>-aegis-wt/task-<id>`, branch `aegis-task/<id>`). The first turn
+Code session, recorded in `work_sessions` (session uuid, per-task worktree
+`<repo>-aegis-wt/task-<id>`, branch `aegis-task/<id>`, and the
+`CLAUDE_CONFIG_DIR` account the turn ran under, so a later `--resume` uses the
+same login). The first turn
 investigates read-only and posts a plan as a comment; every later user comment
 is the next turn of the same session (`claude -p --resume`), so "go",
 "also fix the tests" and "open a PR" all work. Comments reach the flow within a
 second through the Todoist webhook (`dispatch_task_turn`: start the workflow
 `agent-task-<id>`, or signal `comment` into a running one) and within 15
 minutes through the sweep's `find_task_turns_due` fallback, keyed on
-`task_sessions.last_turn_at`. Before each turn a collision check reads
-`claude agents --json`: if the task's own session is live the turn is skipped
-(the operator resumed it); if the operator has other sessions in the same repo,
-one LLM call decides whether they are already on this task, and if so AEGIS
-parks with a note and waits for a `take over` comment. Take a task over with
+`work_sessions.last_turn_at`. Before each turn a collision check reads the
+registry: if AEGIS's own last turn is still writing its output file the comment
+is left due for the next sweep, and if one of your sessions has reported itself
+active on the task (`report_progress`, within 30 minutes) AEGIS stays out and
+tells you in Slack. `take over` in a comment overrides your own row. A
+15-minute sweep cross-checks the registry against `claude agents --json` and
+parks a session the host no longer lists. Take a task over with
 `cd <worktree> && claude --resume <session_id>` (both are in every comment's
 footer); hand it back by commenting. `ClarifyFlow` ignores tasks that have a
 session row, so a comment never gets both a chat reply and a turn. Every
 message the lane posts is mirrored into one Slack thread per task in the
-owning agent's channel (`task_sessions.slack_ref` holds the root), and a reply
+owning agent's channel (`work_sessions.slack_ref` holds the root), and a reply
 typed in that thread is posted to the task as a comment, so Slack and Todoist
 are the same conversation. From your own Claude Code session or a chat agent,
 `comment_on_task` posts in your voice (verbatim, no footer) — it is withheld
@@ -328,6 +332,15 @@ it refuses a task that has no coding session, where a footer-less note would
 start nothing and simply read back as your own words.
 `CleanupFlow` removes the worktree and the row `task_session_days` (default 7)
 after the task is completed.
+
+**From your own session.** Three tools put a session on the record: `task_context`
+reads the problem behind a task, its recent events, every session on it and the
+command that takes AEGIS's over; `report_progress` registers your session with a
+one-line summary, which becomes a comment on the task and a line in its status
+block (and gives a plain `@code` task a problem if it has none); `merge_problems`
+folds a duplicate problem into the one to keep. All three are withheld from a
+coding run's own mount — a run that could report progress could mark its own task
+done.
 
 **Every path ends completed or parked.** A task is auto-completed only when
 the work is genuinely done (service healthy, notification archived);

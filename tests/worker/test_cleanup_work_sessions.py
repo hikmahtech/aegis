@@ -1,4 +1,4 @@
-"""CleanupActivities.cleanup_task_sessions — the finished-session worktree sweep.
+"""CleanupActivities.cleanup_work_sessions — the finished-session worktree sweep.
 
 Runs against the real test database, because the whole activity IS a predicate:
 "task completed or gone, AND idle longer than N days". A mocked pool would let
@@ -17,7 +17,7 @@ import inspect
 import pytest
 import pytest_asyncio
 from aegis.connectors.remote_script import RemoteScriptConnector
-from aegis.services import task_sessions as svc
+from aegis.services import work_sessions as svc
 from aegis_worker.activities.cleanup import CleanupActivities
 from temporalio.testing import ActivityEnvironment
 
@@ -54,7 +54,7 @@ class _RaisingRemoteScript:
 
 
 async def _purge(pool) -> None:
-    await pool.execute("DELETE FROM task_sessions WHERE task_id = ANY($1::text[])", list(_ALL))
+    await pool.execute("DELETE FROM work_sessions WHERE task_id = ANY($1::text[])", list(_ALL))
     await pool.execute("DELETE FROM todoist_tasks WHERE id = ANY($1::text[])", list(_ALL))
 
 
@@ -99,7 +99,7 @@ async def _session(
     # $2::text::interval, not $2::interval — a bare interval cast makes asyncpg
     # infer the parameter as an interval and demand a timedelta.
     await pool.execute(
-        "UPDATE task_sessions SET last_turn_at = now() - $2::text::interval, "
+        "UPDATE work_sessions SET last_turn_at = now() - $2::text::interval, "
         "created_at = now() - $2::text::interval WHERE task_id = $1",
         task_id,
         age,
@@ -108,13 +108,13 @@ async def _session(
 
 async def _exists(pool, task_id: str) -> bool:
     return bool(
-        await pool.fetchval("SELECT 1 FROM task_sessions WHERE task_id = $1", task_id)
+        await pool.fetchval("SELECT 1 FROM work_sessions WHERE task_id = $1", task_id)
     )
 
 
 async def _sweep(pool, connector, days: int = 7) -> dict:
     acts = CleanupActivities(db_pool=pool, remote_script=connector)
-    return await ActivityEnvironment().run(acts.cleanup_task_sessions, days)
+    return await ActivityEnvironment().run(acts.cleanup_work_sessions, days)
 
 
 async def _sweep_recording_heartbeats(pool, connector, days: int = 7) -> tuple[dict, list]:
@@ -122,7 +122,7 @@ async def _sweep_recording_heartbeats(pool, connector, days: int = 7) -> tuple[d
     env = ActivityEnvironment()
     beats: list = []
     env.on_heartbeat = lambda *details: beats.append(details)
-    return await env.run(acts.cleanup_task_sessions, days), beats
+    return await env.run(acts.cleanup_work_sessions, days), beats
 
 
 # ── the sweep itself ────────────────────────────────────────────────────────
@@ -300,7 +300,7 @@ async def test_every_row_heartbeats_including_the_skipped_ones(pool):
 @pytest.mark.asyncio
 async def test_no_pool_returns_zeroes():
     acts = CleanupActivities(db_pool=None, remote_script=_FakeRemoteScript())
-    result = await ActivityEnvironment().run(acts.cleanup_task_sessions, 7)
+    result = await ActivityEnvironment().run(acts.cleanup_work_sessions, 7)
     assert result == {"removed": 0, "skipped": 0}
 
 
