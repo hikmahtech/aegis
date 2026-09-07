@@ -73,6 +73,45 @@ class HubActivities:
         return {"delay_seconds": hub.verify_seconds(str(labels.get("alertname") or ""))}
 
     @activity.defn
+    async def ingest_finding(self, inp: dict) -> dict:
+        """One finding from a workflow that has no activity of its own on the
+        hub (the LLM governor's budget edge). `inp` carries `source`, `klass`,
+        `subject`, `subject_kind`, `title`, `severity`, `payload` and
+        `resolved`; the occurrence id is the finding at this instant."""
+        if self.db_pool is None:
+            return {"problem_id": None, "action": "no_pool", "investigate": False}
+        now = datetime.now(UTC)
+        resolved = bool(inp.get("resolved"))
+        klass, subject = hub.slug(str(inp.get("klass") or "")), hub.slug(str(inp.get("subject") or ""))
+        result = await hub.ingest_event(
+            self.db_pool,
+            hub.Event(
+                source=str(inp.get("source") or "manual"),
+                external_id=f"{inp.get('source')}:{klass}:{subject}@{now.isoformat()}"
+                + ("@resolved" if resolved else ""),
+                kind="resolved" if resolved else "occurrence",
+                title=str(inp.get("title") or f"{klass}: {subject}")[:500],
+                subject=subject,
+                subject_kind=str(inp.get("subject_kind") or "service"),
+                klass=klass,
+                severity=str(inp.get("severity") or "warning"),
+                payload=dict(inp.get("payload") or {}),
+                occurred_at=now,
+            ),
+            now=now,
+        )
+        if result.problem_id:
+            try:
+                await hub_project.project(self.db_pool, result.problem_id, now=now)
+            except Exception as exc:  # noqa: BLE001 — the sweep retries projection
+                activity.logger.warning(
+                    "ingest_finding_project_failed problem=%s err=%s",
+                    result.problem_id,
+                    str(exc)[:200],
+                )
+        return result.to_dict()
+
+    @activity.defn
     async def problem_status(self, problem_id: str) -> dict:
         """What the hub currently knows about a problem — the investigation
         flow's replacement for polling `audit_log` for a resolved row."""

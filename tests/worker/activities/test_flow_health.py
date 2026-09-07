@@ -15,12 +15,10 @@ import inspect
 import pytest
 import structlog
 from aegis.db import run_migrations
+from aegis.services.hub import get_problem, mute_problem
 from aegis_worker.activities.delivery import DeliveryActivities
 from aegis_worker.activities.flow_health import (
-    ALERT_ACTION,
     LLM_SUBJECT_PREFIX,
-    MUTE_PREFIX,
-    RECOVERY_ACTION,
     FlowHealthActivities,
     cron_interval_minutes,
 )
@@ -40,8 +38,11 @@ async def _prep(db_pool):
         await conn.execute("DELETE FROM workflow_runs WHERE workflow_type LIKE 'zzwd-%'")
         await conn.execute("DELETE FROM workflow_runs WHERE workflow_id LIKE 'scheduled-zzwd-%'")
         await conn.execute("DELETE FROM activities WHERE slug LIKE 'zzwd-%'")
-        await conn.execute("DELETE FROM audit_log WHERE actor = 'flow-health-watchdog'")
-        await conn.execute("DELETE FROM alert_mutes WHERE mute_key LIKE 'flow-health:zzwd-%'")
+        # every subject is `zzwd-…`; close its problems so a test starts clean
+        await conn.execute(
+            "UPDATE problems SET status = 'closed', closed_at = now() "
+            "WHERE subject_kind = 'flow' AND subject LIKE '%zzwd-%' AND closed_at IS NULL"
+        )
         await conn.execute("DELETE FROM llm_calls WHERE purpose LIKE 'zzwd-%'")
 
 
@@ -265,7 +266,7 @@ async def test_the_resolved_2026_08_02_incident_does_not_re_alert(db_pool):
         "six historical failures already followed by two successes must not alert"
     )
 
-    report = await env.run(act.report_flow_health, found, "pandoras-actor", 12, 168)
+    report = await env.run(act.report_flow_health, found, "pandoras-actor")
     assert report["alerted"] == 0
     assert delivery.sent == [], "a resolved incident produced a card"
 
@@ -677,10 +678,9 @@ async def test_dead_llm_no_pool_degrades(db_pool):
 
 @pytest.mark.asyncio
 async def test_a_dead_purpose_alerts_through_the_existing_plumbing(db_pool):
-    """No new notification path: a dead purpose rides the same card, the same
-    audit-log dedup and the same mute key as a failing flow. The card names the
-    purpose and hands over the query that applies to IT, not the workflow_runs
-    one."""
+    """No new notification path: a dead purpose rides the same card and the
+    same hub problem rules as a failing flow. The card names the purpose and
+    hands over the query that applies to IT, not the workflow_runs one."""
     await _prep(db_pool)
     await _llm_row(db_pool, PURPOSE_A, "error", 60 * 24 * 7)
     await _llm_row(db_pool, PURPOSE_A, "error", 60 * 24 * 2)
@@ -690,8 +690,8 @@ async def test_a_dead_purpose_alerts_through_the_existing_plumbing(db_pool):
 
     findings = await env.run(act.find_dead_llm_purposes)
     findings = [f for f in findings if f["purpose"] == PURPOSE_A]
-    first = await env.run(act.report_flow_health, findings, "pandoras-actor", 12, 168)
-    second = await env.run(act.report_flow_health, findings, "pandoras-actor", 12, 168)
+    first = await env.run(act.report_flow_health, findings, "pandoras-actor")
+    second = await env.run(act.report_flow_health, findings, "pandoras-actor")
 
     assert (first["alerted"], second["alerted"]) == (1, 0), "a wedged purpose alerts once"
     assert second["deduped"] == 1
@@ -729,7 +729,7 @@ async def test_a_wedged_flow_produces_exactly_one_alert(db_pool):
     act = _acts(db_pool, delivery)
 
     results = [
-        await env.run(act.report_flow_health, [_finding()], "pandoras-actor", 12, 168)
+        await env.run(act.report_flow_health, [_finding()], "pandoras-actor")
         for _ in range(48)
     ]
     assert sum(r["alerted"] for r in results) == 1
@@ -739,30 +739,12 @@ async def test_a_wedged_flow_produces_exactly_one_alert(db_pool):
 
     async with db_pool.acquire() as conn:
         n = await conn.fetchval(
-            "SELECT count(*) FROM audit_log WHERE action = $1 AND target_id = $2",
-            ALERT_ACTION,
-            TYPE_A,
+            "SELECT count(*) FROM problems WHERE subject = $1 AND closed_at IS NULL", TYPE_A
         )
-    assert n == 1
-
-
-@pytest.mark.asyncio
-async def test_dedup_expires_after_the_window(db_pool):
-    """Proves the dedup is time-bounded, not permanent — a fault still open
-    after `dedup_hours` re-alerts once."""
-    await _prep(db_pool)
-    env = ActivityEnvironment()
-    delivery = FakeDelivery()
-    act = _acts(db_pool, delivery)
-    await env.run(act.report_flow_health, [_finding()], "pandoras-actor", 12, 168)
-    async with db_pool.acquire() as conn:
-        await conn.execute(
-            "UPDATE audit_log SET created_at = now() - interval '13 hours' "
-            "WHERE actor = 'flow-health-watchdog'"
+        occurrences = await conn.fetchval(
+            "SELECT occurrences FROM problems WHERE subject = $1 AND closed_at IS NULL", TYPE_A
         )
-    r = await env.run(act.report_flow_health, [_finding()], "pandoras-actor", 12, 168)
-    assert r["alerted"] == 1
-    assert len(delivery.sent) == 2
+    assert n == 1 and occurrences == 48, "one problem, every tick counted on it"
 
 
 def _llm_finding(last_call_at: str, subject: str = LLM_SUBJECT_PREFIX + PURPOSE_A) -> dict:
@@ -785,76 +767,55 @@ def _llm_finding(last_call_at: str, subject: str = LLM_SUBJECT_PREFIX + PURPOSE_
 
 
 @pytest.mark.asyncio
-async def test_a_dead_llm_purpose_stays_quiet_until_it_is_called_again(db_pool):
-    """A weekly purpose must not re-alert on the clock.
-
-    `llm_dead` is a streak over the purpose's own last N `llm_calls` rows, so
-    the verdict cannot change until the purpose is CALLED again. The 12h clock
-    dedup made daylog_rollup send ~14 identical cards between 2026-08-16 and
-    08-23 while it waited for its next weekly run. Past the dedup window with
-    no new call it must still be silent; a call landing after the last alert is
-    what makes it speak.
-    """
+async def test_a_dead_llm_purpose_is_one_open_problem_however_often_it_is_seen(db_pool):
+    """A weekly purpose must not re-alert on the clock. On the hub the purpose
+    is one open problem: every later finding — with or without a new call —
+    is an occurrence on it, never a second card, until it recovers."""
     await _prep(db_pool)
     env = ActivityEnvironment()
     delivery = FakeDelivery()
     act = _acts(db_pool, delivery)
     stale_call = "2026-01-01T00:00:00+00:00"
 
-    first = await env.run(act.report_flow_health, [_llm_finding(stale_call)], "a", 12, 168)
+    first = await env.run(act.report_flow_health, [_llm_finding(stale_call)], "a")
     assert first["alerted"] == 1
-
-    # Age the alert well past the 12h dedup window. A `failing` finding would
-    # re-alert here (test_dedup_expires_after_the_window); this one must not,
-    # because no call has landed since.
-    async with db_pool.acquire() as conn:
-        await conn.execute(
-            "UPDATE audit_log SET created_at = now() - interval '72 hours' "
-            "WHERE actor = 'flow-health-watchdog'"
-        )
-    quiet = await env.run(act.report_flow_health, [_llm_finding(stale_call)], "a", 12, 168)
-    assert quiet["alerted"] == 0, "re-alerted a dead LLM purpose with no new evidence"
-    assert quiet["deduped"] == 1
-    assert len(delivery.sent) == 1, f"sent {len(delivery.sent)} cards, expected 1"
-
-    # A new failed call AFTER that alert is new evidence — speak up.
+    quiet = await env.run(act.report_flow_health, [_llm_finding(stale_call)], "a")
+    assert quiet["alerted"] == 0 and quiet["deduped"] == 1
     fresh = dt.datetime.now(dt.UTC).isoformat()
-    again = await env.run(act.report_flow_health, [_llm_finding(fresh)], "a", 12, 168)
-    assert again["alerted"] == 1, "stayed silent after a new call failed"
-    assert len(delivery.sent) == 2
+    again = await env.run(act.report_flow_health, [_llm_finding(fresh)], "a")
+    assert again["alerted"] == 0 and again["deduped"] == 1
+    assert len(delivery.sent) == 1, f"sent {len(delivery.sent)} cards, expected 1"
 
 
 @pytest.mark.asyncio
 async def test_recovery_is_announced_and_re_arms_the_alert(db_pool):
     """Recovery is observable two ways at once: the operator gets a [FLOW OK]
-    card, and the audit row it writes is what re-arms dedup — so the same flow
-    breaking again alerts again instead of being suppressed."""
+    card, and the problem is resolved on the hub — so the same flow breaking
+    again reopens it and alerts again instead of being suppressed."""
     await _prep(db_pool)
     env = ActivityEnvironment()
     delivery = FakeDelivery()
     act = _acts(db_pool, delivery)
 
-    assert (await env.run(act.report_flow_health, [_finding()], "a", 12, 168))["alerted"] == 1
+    assert (await env.run(act.report_flow_health, [_finding()], "a"))["alerted"] == 1
 
-    recovered = await env.run(act.report_flow_health, [], "a", 12, 168)
+    recovered = await env.run(act.report_flow_health, [], "a")
     assert recovered["recovered"] == 1
     assert len(delivery.sent) == 2
     assert "FLOW OK" in delivery.sent[1] and TYPE_A in delivery.sent[1]
     async with db_pool.acquire() as conn:
-        n = await conn.fetchval(
-            "SELECT count(*) FROM audit_log WHERE action = $1 AND target_id = $2",
-            RECOVERY_ACTION,
-            TYPE_A,
+        status = await conn.fetchval(
+            "SELECT status FROM problems WHERE subject = $1 AND closed_at IS NULL", TYPE_A
         )
-    assert n == 1
+    assert status == "resolved"
 
-    # Re-armed: the SAME subject, still inside the 12h dedup window, alerts.
-    again = await env.run(act.report_flow_health, [_finding()], "a", 12, 168)
+    # Re-armed: the SAME subject, inside the reopen window, alerts.
+    again = await env.run(act.report_flow_health, [_finding()], "a")
     assert again["alerted"] == 1
     assert len(delivery.sent) == 3
 
     # ...and does not re-announce a recovery that was already announced.
-    quiet = await env.run(act.report_flow_health, [_finding()], "a", 12, 168)
+    quiet = await env.run(act.report_flow_health, [_finding()], "a")
     assert quiet == {"alerted": 0, "deduped": 1, "muted": 0, "recovered": 0}
 
 
@@ -866,45 +827,30 @@ async def test_no_recovery_notice_without_a_prior_alert(db_pool):
     env = ActivityEnvironment()
     delivery = FakeDelivery()
     act = _acts(db_pool, delivery)
-    r = await env.run(act.report_flow_health, [], "a", 12, 168)
+    r = await env.run(act.report_flow_health, [], "a")
     assert r == {"alerted": 0, "deduped": 0, "muted": 0, "recovered": 0}
     assert delivery.sent == []
 
 
 @pytest.mark.asyncio
-async def test_an_active_mute_silences_a_subject(db_pool):
+async def test_a_muted_problem_silences_its_subject(db_pool):
+    """Muting is a property of the problem: a muted problem that recovers and
+    breaks again inside the mute is counted, never carded."""
     await _prep(db_pool)
     env = ActivityEnvironment()
     delivery = FakeDelivery()
     act = _acts(db_pool, delivery)
+    assert (await env.run(act.report_flow_health, [_finding()], "a"))["alerted"] == 1
     async with db_pool.acquire() as conn:
-        await conn.execute(
-            "INSERT INTO alert_mutes (mute_key, muted_until) VALUES ($1, now() + interval '1 day')",
-            MUTE_PREFIX + TYPE_A,
+        pid = await conn.fetchval(
+            "SELECT id::text FROM problems WHERE subject = $1 AND closed_at IS NULL", TYPE_A
         )
-    r = await env.run(act.report_flow_health, [_finding()], "a", 12, 168)
-    assert r["muted"] == 1
-    assert r["alerted"] == 0
-    assert delivery.sent == []
-
-
-@pytest.mark.asyncio
-async def test_an_expired_mute_does_not_silence(db_pool):
-    """Guard-independence: the mute lookup and the dedup lookup must each be
-    provably load-bearing. This one isolates `muted_until > now()`."""
-    await _prep(db_pool)
-    env = ActivityEnvironment()
-    delivery = FakeDelivery()
-    act = _acts(db_pool, delivery)
-    async with db_pool.acquire() as conn:
-        await conn.execute(
-            "INSERT INTO alert_mutes (mute_key, muted_until) VALUES ($1, now() - interval '1 hour')",
-            MUTE_PREFIX + TYPE_A,
-        )
-    r = await env.run(act.report_flow_health, [_finding()], "a", 12, 168)
-    assert r["muted"] == 0
-    assert r["alerted"] == 1
-    assert len(delivery.sent) == 1
+    await mute_problem(db_pool, pid, hours=24, by="test")
+    await env.run(act.report_flow_health, [], "a")  # recovers while muted
+    r = await env.run(act.report_flow_health, [_finding()], "a")
+    assert r["muted"] == 1 and r["alerted"] == 0
+    assert len(delivery.sent) == 2  # the first card and the recovery only
+    assert (await get_problem(db_pool, pid))["occurrences"] == 2
 
 
 @pytest.mark.asyncio
@@ -915,7 +861,7 @@ async def test_one_card_carries_every_fresh_subject(db_pool):
     delivery = FakeDelivery()
     act = _acts(db_pool, delivery)
     r = await env.run(
-        act.report_flow_health, [_finding(TYPE_A), _finding(TYPE_B)], "a", 12, 168
+        act.report_flow_health, [_finding(TYPE_A), _finding(TYPE_B)], "a"
     )
     assert r["alerted"] == 2
     assert len(delivery.sent) == 1
@@ -925,5 +871,22 @@ async def test_one_card_carries_every_fresh_subject(db_pool):
 @pytest.mark.asyncio
 async def test_report_without_pool_degrades(db_pool):
     env = ActivityEnvironment()
-    r = await env.run(_acts(None).report_flow_health, [_finding()], "a", 12, 168)
+    r = await env.run(_acts(None).report_flow_health, [_finding()], "a")
     assert r == {"alerted": 0, "deduped": 0, "muted": 0, "recovered": 0}
+
+
+@pytest.mark.asyncio
+async def test_the_card_carries_the_mute_hint_and_the_task_side_gets_a_problem(db_pool):
+    await _prep(db_pool)
+    env = ActivityEnvironment()
+    delivery = FakeDelivery()
+    act = _acts(db_pool, delivery)
+    await env.run(act.report_flow_health, [_finding()], "a")
+    assert "UPDATE problems SET muted_until" in delivery.sent[0]
+    async with db_pool.acquire() as conn:
+        p = await conn.fetchrow(
+            "SELECT class, subject_kind, title FROM problems WHERE subject = $1 AND closed_at IS NULL",
+            TYPE_A,
+        )
+    assert (p["class"], p["subject_kind"]) == ("flow_failing", "flow")
+    assert p["title"] == f"Flow {TYPE_A} keeps failing"

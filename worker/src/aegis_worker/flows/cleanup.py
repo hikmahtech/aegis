@@ -27,7 +27,6 @@ _DEFAULT_RETENTIONS: dict[str, int] = {
     "ingest_idempotency": 60,
     "gtd_clarify_log": 180,
     "alert_dedup_index": 60,
-    "alert_mutes": 30,
     "pending_prs": 30,
     # inserted unconditionally per webhook (webhooks.py) / per knowledge
     # injection — unbounded growth otherwise (issue #120).

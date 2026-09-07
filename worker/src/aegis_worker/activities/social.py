@@ -26,6 +26,7 @@ import asyncpg
 from aegis.connectors.todoist import TodoistConnector
 from aegis.observability import log_audit
 from aegis.services import social_channels
+from aegis.services.hub_watch import mute_hint, reconcile_findings
 from temporalio import activity
 
 from aegis_worker.activities.delivery import safe_send_message
@@ -59,17 +60,10 @@ CLOSE_ACTOR = "social-publish"
 # stuck-post watchdog (#225) — constants
 # ---------------------------------------------------------------------------
 
-#: `audit_log` actions/target — the dedup substrate, same as
-#: `FlowHealthActivities` (issue #226). `alert_dedup_index` is deliberately NOT
-#: used: its `task_id` is NOT NULL and joined against `todoist_tasks`, and this
-#: watchdog notifies with a plain chat card, not a @pandora task.
-STUCK_ALERT_ACTION = "social_stuck_alert"
-STUCK_RECOVERY_ACTION = "social_stuck_recovered"
-STUCK_TARGET_TYPE = "social_post"
-#: `alert_mutes.mute_key` prefix — silence one known-stuck post with
-#: `INSERT INTO alert_mutes (mute_key, muted_until) VALUES ('social-stuck:<postiz id>', ...)`.
-STUCK_MUTE_PREFIX = "social-stuck:"
-STUCK_ACTOR = "social-stuck-watchdog"
+#: The hub source and class of a stuck post; the subject is the Postiz post
+#: id. The hub dedupes and re-arms (same rules as `FlowHealthActivities`).
+STUCK_HUB_SOURCE = "social"
+STUCK_HUB_CLASS = "stuck_post"
 
 #: The only Postiz state that means "this post actually went out". Everything
 #: else past its `schedule_at` — QUEUE, ERROR, DRAFT, or the `unknown` we write
@@ -151,37 +145,6 @@ LIMIT $2
 # Resolved-aware dedup, mirroring `flow_health._SUPPRESSED_SQL`/`_OPEN_SQL`: an
 # alert suppresses the next one only while no recovery row was written after it,
 # so a post that gets stuck, publishes, and gets stuck again alerts twice.
-_STUCK_SUPPRESSED_SQL = f"""
-SELECT DISTINCT a.target_id
-FROM audit_log a
-WHERE a.action = '{STUCK_ALERT_ACTION}'
-  AND a.target_type = '{STUCK_TARGET_TYPE}'
-  AND a.target_id = ANY($1::text[])
-  AND a.created_at > now() - make_interval(hours => $2)
-  AND NOT EXISTS (
-      SELECT 1 FROM audit_log r
-      WHERE r.action = '{STUCK_RECOVERY_ACTION}'
-        AND r.target_type = '{STUCK_TARGET_TYPE}'
-        AND r.target_id = a.target_id
-        AND r.created_at > a.created_at
-  )
-"""
-
-_STUCK_OPEN_SQL = f"""
-SELECT DISTINCT a.target_id
-FROM audit_log a
-WHERE a.action = '{STUCK_ALERT_ACTION}'
-  AND a.target_type = '{STUCK_TARGET_TYPE}'
-  AND a.created_at > now() - make_interval(hours => $1)
-  AND NOT EXISTS (
-      SELECT 1 FROM audit_log r
-      WHERE r.action = '{STUCK_RECOVERY_ACTION}'
-        AND r.target_type = '{STUCK_TARGET_TYPE}'
-        AND r.target_id = a.target_id
-        AND r.created_at > a.created_at
-  )
-"""
-
 
 def _stuck_card(title: str, body: str) -> str:
     return f"<b>{_html.escape(title)}</b>\n{_html.escape(body)}"
@@ -1038,58 +1001,44 @@ class SocialActivities:
         return out
 
     @activity.defn
-    async def report_stuck_posts(
-        self,
-        findings: list[dict],
-        agent_id: str = "sebas",
-        dedup_hours: int = 168,
-        recovery_hours: int = 720,
-    ) -> dict:
+    async def report_stuck_posts(self, findings: list[dict], agent_id: str = "sebas") -> dict:
         """Notify about NEW stuck posts, and about posts that finally published.
 
-        One chat card per run, not one per post. A subject already alerted
-        within `dedup_hours` with no recovery since is silent, so a post wedged
-        for a week produces one alert, not seven. `dedup_hours` defaults above
-        the flow's own 24h cadence — a shorter window would not dedup at all.
+        The problem hub decides what is new: each stuck post is an occurrence
+        on its `stuck_post` problem, and only a finding that created or
+        reopened one earns a card — a post wedged for a week produces one
+        alert, not seven. A post no longer found stuck resolves its problem,
+        which is the recovery notice.
 
         Must be called even when `findings` is empty: that is exactly when the
-        recovery notice fires, and the recovery row is what re-arms dedup.
+        recovery notice fires.
         """
         result = {"alerted": 0, "deduped": 0, "muted": 0, "recovered": 0}
         if self.db_pool is None:
             return result
 
-        subjects = [s for s in (str(f.get("subject") or "") for f in findings) if s]
-
-        async with self.db_pool.acquire() as conn:
-            muted: set[str] = set()
-            suppressed: set[str] = set()
-            if subjects:
-                muted = {
-                    row["mute_key"][len(STUCK_MUTE_PREFIX) :]
-                    for row in await conn.fetch(
-                        "SELECT mute_key FROM alert_mutes "
-                        "WHERE mute_key = ANY($1::text[]) AND muted_until > now()",
-                        [STUCK_MUTE_PREFIX + s for s in subjects],
-                    )
-                }
-                suppressed = {
-                    row["target_id"]
-                    for row in await conn.fetch(_STUCK_SUPPRESSED_SQL, subjects, dedup_hours)
-                }
-            open_subjects = {
-                row["target_id"] for row in await conn.fetch(_STUCK_OPEN_SQL, recovery_hours)
+        hub_findings = [
+            {
+                **f,
+                "klass": STUCK_HUB_CLASS,
+                "subject": str(f.get("subject") or ""),
+                "title": f"Post {f.get('subject')} stuck in Postiz ({f.get('state', '?')})",
+                "severity": "warning",
+                "payload": {k: v for k, v in f.items() if k != "subject"},
             }
-
-        fresh = [
-            f
             for f in findings
             if f.get("subject")
-            and f["subject"] not in muted
-            and f["subject"] not in suppressed
         ]
-        result["muted"] = sum(1 for f in findings if f.get("subject") in muted)
-        result["deduped"] = sum(1 for f in findings if f.get("subject") in suppressed)
+        outcome = await reconcile_findings(
+            self.db_pool,
+            source=STUCK_HUB_SOURCE,
+            subject_kind="post",
+            classes=[STUCK_HUB_CLASS],
+            findings=hub_findings,
+        )
+        fresh = outcome["fresh"]
+        result["deduped"] = outcome["attached"] + outcome["suppressed"]
+        result["muted"] = outcome["muted"]
 
         if fresh:
             body = (
@@ -1099,8 +1048,7 @@ class SocialActivities:
                 "`temporal task-queue describe --task-queue main`. "
                 "`docker service update --force postiz_postiz` revives it — reschedule "
                 "overdue posts BEFORE reviving or they all publish at once.\n"
-                f"Silence one: INSERT INTO alert_mutes (mute_key, muted_until) "
-                f"VALUES ('{STUCK_MUTE_PREFIX}<postiz post id>', now() + interval '2 days');"
+                + mute_hint([f["problem_id"] for f in fresh])
             )
             await safe_send_message(
                 self.delivery,
@@ -1108,10 +1056,9 @@ class SocialActivities:
                 message=_stuck_card(f"[SOCIAL] {len(fresh)} post(s) stuck in Postiz", body),
                 log_event="social_stuck_notify_failed",
             )
-            await self._audit_stuck(STUCK_ALERT_ACTION, fresh)
             result["alerted"] = len(fresh)
 
-        recovered = sorted(open_subjects - set(subjects))
+        recovered = sorted(r["subject"] for r in outcome["resolved"])
         if recovered:
             await safe_send_message(
                 self.delivery,
@@ -1122,22 +1069,6 @@ class SocialActivities:
                 ),
                 log_event="social_stuck_recovery_notify_failed",
             )
-            await self._audit_stuck(
-                STUCK_RECOVERY_ACTION, [{"subject": s, "state": "recovered"} for s in recovered]
-            )
             result["recovered"] = len(recovered)
 
         return result
-
-    async def _audit_stuck(self, action: str, findings: list[dict]) -> None:
-        from aegis.observability import log_audit
-
-        for f in findings:
-            await log_audit(
-                self.db_pool,
-                actor=STUCK_ACTOR,
-                action=action,
-                target_type=STUCK_TARGET_TYPE,
-                target_id=str(f["subject"]),
-                details={k: v for k, v in f.items() if k != "subject"},
-            )

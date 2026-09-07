@@ -15,7 +15,7 @@ async def _prep(db_pool):
     each test to avoid pytest fixture sequencing issues with the pool."""
     await run_migrations(db_pool)
     async with db_pool.acquire() as conn:
-        await conn.execute("TRUNCATE alert_mutes, pending_prs")
+        await conn.execute("TRUNCATE pending_prs")
 
 
 @pytest.mark.asyncio

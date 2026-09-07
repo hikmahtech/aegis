@@ -24,8 +24,8 @@ purpose. Its whole input is `metrics.state`, which only step 1 produces, so
 running it anywhere else means either checking a stale snapshot or duplicating
 the Postiz calls. Sharing the flow also means no new schedule, no new seed row,
 and detection that is by construction reading a state fetched seconds earlier.
-Its detection/alert split, `audit_log` dedup, `alert_mutes` support and
-recovery-notice re-arm all follow `FlowHealthWatchdogFlow` (#226).
+Its detection/alert split and recovery notice follow `FlowHealthWatchdogFlow`
+(#226); since PR 4a the problem hub does the dedupe and the re-arm.
 """
 
 from __future__ import annotations
@@ -59,9 +59,6 @@ class SocialMetricsConfig:
     #: cadence sets latency.
     stuck_after_hours: int = 6
     max_stuck: int = 50
-    #: Above the 24h cadence on purpose: a shorter window would never dedup.
-    dedup_hours: int = 168
-    recovery_hours: int = 720
     check_stuck: bool = True
 
 
@@ -108,7 +105,7 @@ class SocialMetricsFlow:
         # dedup, so the next real alert would be delayed by a whole cycle.
         report = await workflow.execute_activity_method(
             SocialActivities.report_stuck_posts,
-            args=[stuck, config.agent_id, config.dedup_hours, config.recovery_hours],
+            args=[stuck, config.agent_id],
             start_to_close_timeout=TIMEOUT_FAST,
             retry_policy=NO_RETRY,
         )

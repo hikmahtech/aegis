@@ -167,6 +167,9 @@ async def test_check_llm_budget_under_budget_with_no_switch_is_quiet(db_pool):
 # --- flow (edge-triggered alerting) -------------------------------------------
 
 
+hub_calls: list[dict] = []
+
+
 async def _run_flow(budget_result: dict) -> list[str]:
     """Run LLMSpendGuardFlow against a stubbed activity; return alerts sent."""
     import uuid
@@ -177,6 +180,7 @@ async def _run_flow(budget_result: dict) -> list[str]:
     from temporalio.worker import Worker
 
     sent: list[str] = []
+    hub_calls.clear()
 
     @activity.defn(name="check_llm_budget")
     async def check_llm_budget() -> dict:
@@ -187,13 +191,18 @@ async def _run_flow(budget_result: dict) -> list[str]:
         sent.append(message)
         return {"ok": True}
 
+    @activity.defn(name="ingest_finding")
+    async def ingest_finding(inp: dict) -> dict:
+        hub_calls.append(inp)
+        return {"problem_id": "prob-llm", "action": "created", "investigate": True}
+
     async with await WorkflowEnvironment.start_time_skipping() as env:
         task_queue = f"tq-{uuid.uuid4().hex[:8]}"
         async with Worker(
             env.client,
             task_queue=task_queue,
             workflows=[LLMSpendGuardFlow],
-            activities=[check_llm_budget, send_system_event],
+            activities=[check_llm_budget, send_system_event, ingest_finding],
         ):
             await env.client.execute_workflow(
                 LLMSpendGuardFlow.run,
@@ -209,6 +218,9 @@ async def test_flow_alerts_on_breach():
         {"breached": True, "cleared": False, "tokens": 9, "budget": 1, "message": "over budget"}
     )
     assert sent == ["over budget"]
+    assert [(c["klass"], c["subject"], c["resolved"]) for c in hub_calls] == [
+        ("budget_breached", "llm-budget", False)
+    ]
 
 
 async def test_flow_alerts_on_clear():

@@ -23,6 +23,7 @@ with workflow.unsafe.imports_passed_through():
     from temporalio.exceptions import ApplicationError
 
     from aegis_worker.activities.delivery import DeliveryActivities
+    from aegis_worker.activities.hub import HubActivities
     from aegis_worker.activities.llm_governor import LLMGovernorActivities
     from aegis_worker.shared.retry import ACT_RETRY, NO_RETRY, TIMEOUT_FAST
 
@@ -56,8 +57,30 @@ class LLMSpendGuardFlow:
 
         # Edge-triggered: the activity reports breached/cleared only on the
         # tick that actually flips the switch, so a sustained breach doesn't
-        # re-alert every 15 minutes.
+        # re-alert every 15 minutes. The breach is a problem on the hub too —
+        # one task, resolved when the switch clears — and a hub failure never
+        # costs the operator the system event.
         if out.get("breached") or out.get("cleared"):
+            try:
+                await workflow.execute_activity_method(
+                    HubActivities.ingest_finding,
+                    args=[
+                        {
+                            "source": "llm_governor",
+                            "klass": "budget_breached",
+                            "subject": "llm-budget",
+                            "subject_kind": "budget",
+                            "title": "LLM kill switch engaged: rolling-24h token budget exceeded",
+                            "severity": "critical",
+                            "payload": {"tokens": out.get("tokens"), "budget": out.get("budget")},
+                            "resolved": bool(out.get("cleared")),
+                        }
+                    ],
+                    start_to_close_timeout=TIMEOUT_FAST,
+                    retry_policy=NO_RETRY,
+                )
+            except Exception:
+                workflow.logger.warning("llm_spend_guard_hub_failed")
             try:
                 await workflow.execute_activity_method(
                     DeliveryActivities.send_system_event,
