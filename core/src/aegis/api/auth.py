@@ -5,6 +5,7 @@ Single-user system: API key via X-API-Key header or Basic auth.
 
 from __future__ import annotations
 
+import hmac
 import secrets
 
 from fastapi import Depends, HTTPException, Request, status
@@ -58,3 +59,22 @@ async def verify_auth(
         detail="Invalid credentials",
         headers={"WWW-Authenticate": "Basic"},
     )
+
+
+def alert_token_ok(request: Request, secret: str) -> bool:
+    """True if the request presents ``secret`` in either accepted header:
+    ``X-Alert-Token: <secret>`` or ``Authorization: Bearer <secret>``.
+
+    Shared by the alert webhook and the hub events route — the same senders
+    (alertmanager, grafana, deploy jobs) use both. Both headers are compared
+    with ``hmac.compare_digest`` so neither is a timing oracle. The
+    Authorization scheme is matched case-insensitively because "Bearer" is a
+    case-insensitive token per RFC 7235, while the credential itself is
+    compared exactly.
+    """
+    if hmac.compare_digest(request.headers.get("X-Alert-Token") or "", secret):
+        return True
+
+    authorization = request.headers.get("Authorization") or ""
+    scheme, _, credential = authorization.partition(" ")
+    return scheme.lower() == "bearer" and hmac.compare_digest(credential.strip(), secret)

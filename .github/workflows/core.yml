@@ -127,3 +127,10 @@ jobs:
 
       - name: Test
         run: pytest tests/core/ tests/api/ tests/integration/ -n auto --dist loadfile --timeout=300 -v --tb=short --cov=core/src/aegis --cov-report=term-missing --cov-report=xml
+
+      # The problem hub (services/hub.py) is where coverage starts being
+      # enforced rather than merely reported: it is pure functions over rows,
+      # so 90% is cheap, and every spoke that migrates onto it inherits the
+      # gate. Ratchet the per-package threshold up as spokes move; never down.
+      - name: Hub coverage gate
+        run: pytest tests/core/test_hub_correlate.py tests/core/test_hub_transitions.py tests/core/test_hub_ingest.py tests/core/test_hub_route.py -p no:cacheprovider --timeout=300 --tb=short --cov=aegis.services.hub --cov-fail-under=90 --cov-report=term-missing
