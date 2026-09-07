@@ -1,0 +1,14 @@
+-- Drop the pre-hub alert dedupe table, now that the backfill has read it.
+--
+-- `alert_dedup_index` (migration 001) held one row per alert signature and was
+-- how AEGIS decided whether an alert was a duplicate. The problem hub replaced
+-- that with `problems.correlation_key` in PR 3b, and nothing in the code has
+-- read the table since.
+--
+-- It was kept one release longer for `scripts/hub_backfill.py`, which reads
+-- `occurrence_count` to seed the problems it creates from open alert tasks.
+-- That backfill ran in production on 2026-09-08, so the last reader is gone.
+--
+-- The recurrence history it held now lives in `problems.occurrences` and in
+-- `problem_events`, one row per occurrence.
+DROP TABLE IF EXISTS alert_dedup_index;

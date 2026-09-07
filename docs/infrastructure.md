@@ -343,15 +343,28 @@ Once, after the PR that moved the alert producers onto the hub deploys, turn
 every open `#alert` task AEGIS created before it into a problem that owns that
 task — otherwise the next occurrence of a known alert creates a second task:
 
+Run it in the **worker** container, not core: it imports `aegis_worker` for
+the same `extract_service_name` the coding lane uses, and the core image does
+not carry that package. It reads the database URL from the container's own
+environment.
+
 ```bash
-# dry run first; --apply writes. Duplicate tasks for one problem are completed
-# through the outbox and the oldest stays.
-python scripts/hub_backfill.py --database-url "$AEGIS_DATABASE_URL"
-python scripts/hub_backfill.py --database-url "$AEGIS_DATABASE_URL" --apply
+# on the node running the worker
+W=$(docker ps --filter name=aegis_worker -q | head -1)
+docker cp scripts/hub_backfill.py $W:/tmp/hub_backfill.py
+docker exec $W python /tmp/hub_backfill.py            # dry run
+docker exec $W python /tmp/hub_backfill.py --apply    # writes
 ```
 
-It reads the retired `alert_dedup_index` for recurrence counts while the table
-still exists, which is why that table is dropped only after this has run.
+Read the dry run before applying. A task whose class and subject it cannot
+read gets an empty key and therefore its own problem — check that the ones it
+DID key match what the producer computes, because a task keyed differently
+from its producer will be duplicated by the next occurrence rather than
+attached to.
+
+It read the retired `alert_dedup_index` for recurrence counts while that table
+existed. Migration 037 dropped it after the 2026-09-08 backfill, so a later run
+seeds every problem it creates at one occurrence.
 
 ### Rolling the problem hub out
 
@@ -365,9 +378,9 @@ The hub replaces the old alert dedupe machinery in place, so the order matters.
    `POST /api/hub/service-state` at the top and bottom of a rollout. Held back
    until now on purpose: merging it can trigger a deploy, and the endpoint has
    to exist first.
-3. **Run the backfill** (see above), dry run then `--apply`. It reads
-   `alert_dedup_index` for recurrence counts, which is why that table is still
-   there.
+3. **Run the backfill** (see above), dry run then `--apply`, in the worker
+   container. Read the dry run first: a task it keys differently from its
+   producer will be duplicated by the next occurrence rather than attached to.
 4. **Grant the tools.** `config/seed/agents.yaml` only seeds an agent with no
    `metadata.tool_set`, so a running deployment needs the SQL below.
 5. **Check it.** The admin **Problems** page is the fastest look: the live
@@ -398,10 +411,9 @@ WHERE last_seen_at > now() - interval '24 hours' GROUP BY 1 ORDER BY 2 DESC;
 SELECT subject, state, until_at, set_by FROM service_state ORDER BY updated_at DESC;
 ```
 
-**After the backfill has run**, `alert_dedup_index` has no reader left and can
-be dropped by a follow-up migration. Do not drop it before: the backfill is the
-last thing that reads its recurrence counts, and a problem backfilled without
-them starts at one occurrence however long it has really been broken.
+`alert_dedup_index` was dropped by migration 037 after the 2026-09-08
+backfill, which was its last reader. The recurrence history it held is now
+`problems.occurrences` and one `problem_events` row per occurrence.
 
 ## System monitoring (`hosts_aegis`)
 

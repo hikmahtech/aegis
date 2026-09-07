@@ -9,10 +9,22 @@ Dry-run by default: prints what it would do. `--apply` writes.
 
     python scripts/hub_backfill.py --database-url postgresql://... [--apply]
 
-Reads, when present, the retired `alert_dedup_index` for recurrence counts —
-the table is dropped by a later migration, after this has run. Duplicate tasks
+Read the retired `alert_dedup_index` for recurrence counts when it was still
+there; migration 037 dropped it once this had run, and the lookup below is
+guarded, so a later run simply seeds every problem at one occurrence. Duplicate tasks
 for one problem (same correlation key) are completed through the outbox; the
 oldest stays as the problem's task.
+
+Run it in the WORKER container, not core: it imports `aegis_worker` for the
+same `extract_service_name` the coding lane uses, and the core image does not
+carry that package.
+
+    docker exec <aegis_worker> python /tmp/hub_backfill.py [--apply]
+
+A task whose class and subject cannot be read gets an EMPTY key and therefore
+its own problem. That is deliberate: a shared fallback key would merge
+unrelated alerts, and the hub's own rule is that creating a duplicate is
+recoverable while attaching to the wrong problem hides an outage.
 """
 
 from __future__ import annotations
@@ -43,7 +55,16 @@ def classify(title: str, fingerprint: str, service_from_title: str) -> tuple[str
         return "NodeDown", (node.group(1) if node else ""), "node"
     if service_from_title and _SERVICE_DOWN.search(title):
         return "DockerServiceDown", service_from_title, "service"
-    return "manual", service_from_title, "service" if service_from_title else ""
+    if service_from_title:
+        return "manual", service_from_title, "service"
+    # Neither a class nor a subject could be read out of this task. Returning
+    # `manual` with no subject would key it `manual::` — a key that matches no
+    # producer's, and that EVERY other unparseable task also matches, so a run
+    # folds a dozen unrelated alerts into one problem. Two empty strings key it
+    # `''` instead, which `correlation_key` defines as "creates, never
+    # attaches". Found in production on 2026-09-08: two nodes' overlay alerts
+    # were merged into one problem by this line.
+    return "", "", ""
 
 
 async def main(argv: list[str]) -> int:

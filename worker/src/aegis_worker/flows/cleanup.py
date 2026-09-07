@@ -27,10 +27,6 @@ _DEFAULT_RETENTIONS: dict[str, int] = {
     "workflow_runs": 90,
     "ingest_idempotency": 60,
     "gtd_clarify_log": 180,
-    # Read by nothing in the code since PR 3b of the problem hub, but still read
-    # by scripts/hub_backfill.py for recurrence counts until that has run in
-    # production. Dropped in PR 7, after the backfill.
-    "alert_dedup_index": 60,
     "pending_prs": 30,
     # inserted unconditionally per webhook (webhooks.py) / per knowledge
     # injection — unbounded growth otherwise (issue #120).
