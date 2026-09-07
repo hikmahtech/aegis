@@ -1,15 +1,11 @@
 # tests/worker/activities/test_alert_governance.py
 from __future__ import annotations
 
-import datetime as _dt
-
 import pytest
 from aegis.db import run_migrations
 from aegis_worker.activities.alert_governance import (
     AlertGovernanceActivities,
-    CheckMuteInput,
     StagePendingPrInput,
-    WriteMuteInput,
 )
 from temporalio.testing import ActivityEnvironment
 
@@ -20,57 +16,6 @@ async def _prep(db_pool):
     await run_migrations(db_pool)
     async with db_pool.acquire() as conn:
         await conn.execute("TRUNCATE alert_mutes, pending_prs")
-
-
-@pytest.mark.asyncio
-async def test_check_mute_returns_false_when_no_row(db_pool):
-    await _prep(db_pool)
-    act = AlertGovernanceActivities(db_pool=db_pool)
-    env = ActivityEnvironment()
-    muted = await env.run(
-        act.check_alert_mute,
-        CheckMuteInput(mute_key="github:youruser/aegis:ci-test"),
-    )
-    assert muted is False
-
-
-@pytest.mark.asyncio
-async def test_write_then_check_mute(db_pool):
-    await _prep(db_pool)
-    act = AlertGovernanceActivities(db_pool=db_pool)
-    env = ActivityEnvironment()
-    await env.run(
-        act.write_alert_mute,
-        WriteMuteInput(
-            mute_key="github:youruser/aegis:ci-test",
-            ttl_seconds=3600,
-            reason="active_dev",
-            created_by="interaction-abc",
-        ),
-    )
-    muted = await env.run(
-        act.check_alert_mute,
-        CheckMuteInput(mute_key="github:youruser/aegis:ci-test"),
-    )
-    assert muted is True
-
-
-@pytest.mark.asyncio
-async def test_expired_mute_treated_as_not_muted(db_pool):
-    await _prep(db_pool)
-    act = AlertGovernanceActivities(db_pool=db_pool)
-    env = ActivityEnvironment()
-    async with db_pool.acquire() as conn:
-        await conn.execute(
-            "INSERT INTO alert_mutes (mute_key, muted_until) VALUES ($1, $2)",
-            "github:youruser/aegis:expired",
-            _dt.datetime.now(_dt.UTC) - _dt.timedelta(seconds=1),
-        )
-    muted = await env.run(
-        act.check_alert_mute,
-        CheckMuteInput(mute_key="github:youruser/aegis:expired"),
-    )
-    assert muted is False
 
 
 @pytest.mark.asyncio

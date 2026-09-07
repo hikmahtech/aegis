@@ -1,4 +1,4 @@
-"""Tests for new AlertActivities: check_alert_resolved, get_verification_delay,
+"""Tests for AlertActivities:
 run_investigation, assess_investigation."""
 
 import json
@@ -57,65 +57,7 @@ def mock_remote_script():
 # --- check_alert_resolved ---
 
 
-async def test_check_alert_resolved_found(mock_db_pool):
-    """Returns resolved=True when a matching resolved alert exists in window."""
-    mock_db_pool.fetchrow.return_value = {"id": "log-entry-1"}
-    activities = AlertActivities(db_pool=mock_db_pool)
-    env = ActivityEnvironment()
-    result = await env.run(activities.check_alert_resolved, "fp-abc", 10)
-    assert result["resolved"] is True
-    sql = mock_db_pool.fetchrow.call_args[0][0]
-    assert "resolved" in sql
-    assert "alert_received" in sql
-
-
-async def test_check_alert_resolved_not_found(mock_db_pool):
-    """Returns resolved=False when no matching resolved alert exists."""
-    mock_db_pool.fetchrow.return_value = None
-    activities = AlertActivities(db_pool=mock_db_pool)
-    env = ActivityEnvironment()
-    result = await env.run(activities.check_alert_resolved, "fp-abc", 10)
-    assert result["resolved"] is False
-
-
 # --- get_verification_delay ---
-
-
-async def test_get_verification_delay_service_down():
-    """ServiceDown pattern gets 300s delay."""
-    activities = AlertActivities()
-    env = ActivityEnvironment()
-    alert = {"title": "ServiceDown: aegis-core", "severity": "critical"}
-    result = await env.run(activities.get_verification_delay, alert)
-    assert result["delay_seconds"] == 300
-    assert "reason" in result
-
-
-async def test_get_verification_delay_disk_critical():
-    """DiskCritical pattern gets 0s (immediate)."""
-    activities = AlertActivities()
-    env = ActivityEnvironment()
-    alert = {"title": "DiskCritical on node-a", "severity": "critical"}
-    result = await env.run(activities.get_verification_delay, alert)
-    assert result["delay_seconds"] == 0
-
-
-async def test_get_verification_delay_pipeline():
-    """Pipeline pattern gets 600s delay."""
-    activities = AlertActivities()
-    env = ActivityEnvironment()
-    alert = {"title": "Pipeline success rate drop", "severity": "warning"}
-    result = await env.run(activities.get_verification_delay, alert)
-    assert result["delay_seconds"] == 600
-
-
-async def test_get_verification_delay_default():
-    """Unknown pattern gets default 180s delay."""
-    activities = AlertActivities()
-    env = ActivityEnvironment()
-    alert = {"title": "SomeRandomAlert", "severity": "warning"}
-    result = await env.run(activities.get_verification_delay, alert)
-    assert result["delay_seconds"] == 180
 
 
 # --- run_investigation ---

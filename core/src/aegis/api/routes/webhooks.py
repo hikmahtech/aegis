@@ -19,6 +19,7 @@ import hmac
 import json as _json
 import time as _time
 import uuid as _uuid
+from datetime import UTC, datetime
 
 import structlog
 from fastapi import APIRouter, Depends, Header, HTTPException, Request
@@ -30,9 +31,10 @@ from aegis.api.routes.interactions import get_workflow_client
 from aegis.clarify_note import AGENT_REPLY_PREFIX, CLARIFY_NOTE_PREFIX
 from aegis.config import Settings
 from aegis.observability import log_audit
+from aegis.services import hub_project
 from aegis.services.agents import resolve_tag
-from aegis.services.alert_tasks import close_task_for_resolved_alert
 from aegis.services.health import record_health_push
+from aegis.services.hub import event_from_alert, ingest_event
 from aegis.services.observations import record_observation
 from aegis.services.places import record_location_push
 from aegis.services.task_sessions import dispatch_task_turn, is_user_note
@@ -554,10 +556,12 @@ async def alert_webhook(
     a flood starves every other flow. Set the secret whenever this endpoint is
     reachable by anything you don't trust (#88, #304).
 
-    Body: Alertmanager v2 or Grafana Unified Alerting JSON. Each alert
-    in the payload spawns one AlertInvestigationFlow child. Dedup'd via
-    ingest_idempotency on the alert's fingerprint (or a derived one if
-    missing).
+    Body: Alertmanager v2 or Grafana Unified Alerting JSON. Every alert —
+    firing or resolved — is recorded on the problem hub
+    (`services/hub.py`), which decides whether it is a new problem, a
+    repeat, suppressed by a deploy window, or muted. Only a new (or
+    returning) problem starts an AlertInvestigationFlow; a resolved one
+    resolves its problem, and the projector closes the task.
     """
     # Blank secret = open, the legacy default: the `and` short-circuits before
     # alert_token_ok, so an unconfigured deployment never rejects.
@@ -619,45 +623,6 @@ async def alert_webhook(
         if not fingerprint:
             fingerprint = f"alertmanager:{alertname}:{instance}"
 
-        # Only "firing" alerts trigger investigation; "resolved" ones are noise
-        # for the pipeline — but we still record a resolved audit row (same
-        # shape as record_heartbeat_resolved) so check_alert_resolved's
-        # self-resolve machinery works for alertmanager alerts too, not just
-        # heartbeat ones. Best-effort: a DB hiccup must never break the webhook.
-        status = a.get("status", "firing")
-        if status == "resolved":
-            try:
-                await log_audit(
-                    pool,
-                    actor="alert:alertmanager",
-                    action="alert_received",
-                    target_type="alert",
-                    target_id=fingerprint,
-                    details={"resolved": "true"},
-                )
-            except Exception:
-                logger.warning("alert_webhook_resolved_audit_failed", fingerprint=fingerprint)
-            # The audit row only re-arms dedup; close the task this alert
-            # spawned too, or it outlives its incident indefinitely (#279).
-            await close_task_for_resolved_alert(pool, fingerprint)
-            skipped += 1
-            continue
-
-        # Idempotency claim
-        async with pool.acquire() as conn:
-            claimed = await conn.fetchval(
-                """
-                INSERT INTO ingest_idempotency (source_type, external_id)
-                VALUES ('alertmanager', $1)
-                ON CONFLICT DO NOTHING
-                RETURNING external_id
-                """,
-                fingerprint,
-            )
-        if claimed is None:
-            skipped += 1
-            continue
-
         alert = {
             "source": "alertmanager",
             "title": annotations.get("summary") or alertname or "Alert",
@@ -669,10 +634,40 @@ async def alert_webhook(
             "raw_payload": a,
         }
 
+        status = a.get("status", "firing")
+        now = datetime.now(UTC)
+        try:
+            result = await ingest_event(
+                pool,
+                event_from_alert(alert, occurred_at=now, resolved=(status == "resolved")),
+                now=now,
+            )
+        except Exception as exc:  # noqa: BLE001 — never 500 the sender; alertmanager retries
+            logger.warning(
+                "alert_webhook_ingest_failed", fingerprint=fingerprint, error=str(exc)[:200]
+            )
+            skipped += 1
+            continue
+        task_id = None
+        if result.problem_id:
+            # Best-effort: the sweep re-projects anything this misses.
+            try:
+                projected = await hub_project.project(
+                    pool, result.problem_id, settings=settings, now=now
+                )
+                task_id = projected.get("task_id")
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "alert_webhook_project_failed", problem_id=result.problem_id, error=str(exc)[:200]
+                )
+        if status == "resolved" or not result.investigate:
+            skipped += 1
+            continue
+
         await temporal.start_workflow(
             "AlertInvestigationFlow",
-            alert,
-            id=f"alertmanager-{fingerprint}",
+            {**alert, "problem_id": result.problem_id, "todoist_task_id": task_id},
+            id=f"investigate-{result.problem_id}-{result.occurrences}",
             task_queue="aegis-main",
         )
         started += 1

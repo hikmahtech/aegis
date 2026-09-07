@@ -385,9 +385,10 @@ async def test_clarify_flow_spawns_alert_investigation_for_pandora_path() -> Non
     pandora_investigation; ClarifyFlow fires AlertInvestigationFlow as
     an abandoned child instead of InteractionFlow.
 
-    The child's check_dedup is stubbed to return is_duplicate=True so
-    AlertInvestigationFlow returns early — we only care that the spawn
-    issued successfully (counter increment).
+    The child's `ingest_alert` (its step-0 call to the problem hub) is
+    stubbed to answer investigate=False so AlertInvestigationFlow returns
+    early — we only care that the spawn issued successfully (counter
+    increment).
     """
     async with await WorkflowEnvironment.start_time_skipping() as env:
         client: Client = env.client
@@ -396,11 +397,12 @@ async def test_clarify_flow_spawns_alert_investigation_for_pandora_path() -> Non
 
         spawned_alerts: list[dict] = []
 
-        @activity.defn(name="check_dedup")
-        async def check_dedup(fingerprint: str, hours: int):
-            # Capture the alert that was passed and short-circuit the
-            # child workflow so we don't need to register every activity.
-            return {"is_duplicate": True}
+        @activity.defn(name="ingest_alert")
+        async def ingest_alert(alert: dict, resolved: bool = False) -> dict:
+            # Short-circuit the child workflow so we don't need to register
+            # every activity: the hub says this is a repeat.
+            spawned_alerts.append(alert)
+            return {"problem_id": "prob-c", "action": "attached", "investigate": False}
 
         @activity.defn(name="send_system_event")
         async def send_system_event(msg: str):
@@ -470,7 +472,7 @@ async def test_clarify_flow_spawns_alert_investigation_for_pandora_path() -> Non
                 classify_one,
                 apply_outcome,
                 log_classification,
-                check_dedup,
+                ingest_alert,
                 send_system_event,
             ],
         ):

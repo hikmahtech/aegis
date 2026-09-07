@@ -40,14 +40,11 @@ _state: dict = {}
 
 
 def _reset(**overrides):
+    _hub_reset()
     _calls.clear()
     _state.clear()
     _state.update(
         {
-            "muted": False,
-            "check_dedup_result": {"is_duplicate": False},
-            "delay_result": {"delay_seconds": 0, "reason": "test"},
-            "resolved_check_result": {"resolved": False},
             "resource_result": {
                 "resource_id": "res-1",
                 "resource_title": "aegis",
@@ -85,51 +82,6 @@ def _reset(**overrides):
 # ---------------------------------------------------------------------------
 # Stub activities  (shared across all tests in this module)
 # ---------------------------------------------------------------------------
-
-
-@activity.defn(name="check_alert_mute")
-async def stub_check_alert_mute(inp) -> bool:
-    _calls.setdefault("mute_check", []).append(inp)
-    return _state.get("muted", False)
-
-
-@activity.defn(name="write_alert_mute")
-async def stub_write_alert_mute(inp) -> None:
-    _calls.setdefault("mute_write", []).append(inp)
-
-
-@activity.defn(name="check_dedup")
-async def stub_check_dedup(fingerprint: str, hours: int) -> dict:
-    return _state["check_dedup_result"]
-
-
-@activity.defn(name="find_open_task_for_signature")
-async def stub_find_open_task_for_signature(signature: str) -> str | None:
-    # No existing open task bound to this signature → investigation proceeds.
-    return _state.get("open_task_for_signature")
-
-
-@activity.defn(name="record_signature_new_task")
-async def stub_record_signature_new_task(signature: str, task_id: str) -> None:
-    return None
-
-
-@activity.defn(name="record_signature_recurrence")
-async def stub_record_signature_recurrence(signature: str) -> None:
-    return None
-
-
-@activity.defn(name="get_verification_delay")
-async def stub_get_verification_delay(alert: dict) -> dict:
-    _calls.setdefault("delay_called", []).append(True)
-    return _state["delay_result"]
-
-
-@activity.defn(name="check_alert_resolved")
-async def stub_check_alert_resolved(
-    fingerprint: str, window_minutes: int, since_iso: str = ""
-) -> dict:
-    return _state["resolved_check_result"]
 
 
 @activity.defn(name="resolve_alert_resource")
@@ -191,11 +143,6 @@ async def stub_assess_investigation(alert: dict, investigation_output: str) -> d
 
         raise ApplicationError("simulated assess StartToClose timeout", non_retryable=True)
     return _state["assess_result"]
-
-
-@activity.defn(name="log_alert")
-async def stub_log_alert(alert: dict) -> None:
-    _calls.setdefault("log_alert", []).append(alert)
 
 
 @activity.defn(name="send_system_event")
@@ -270,17 +217,80 @@ async def stub_get_alert_routing_config() -> dict:
     return {"infra_cluster": ""}
 
 
+# ── problem hub stubs (PR 3b) ───────────────────────────────────────────────
+# The flow no longer owns an alert's identity: it asks the hub. These stand in
+# for HubActivities; `_HUB["resolved"]` makes `problem_status` report the
+# problem as resolved, `_HUB["investigate"]` is what `ingest_alert` answers.
+_HUB: dict = {
+    "ingest": [],
+    "status": [],
+    "record": [],
+    "mute": [],
+    "resolved": False,
+    "investigate": True,
+    "delay": 0,
+}
+
+
+@activity.defn(name="ingest_alert")
+async def stub_ingest_alert(alert: dict, resolved: bool = False) -> dict:
+    _HUB["ingest"].append((alert.get("fingerprint"), resolved))
+    return {
+        "problem_id": "prob-1",
+        "action": "created",
+        "key": "k",
+        "occurrences": 1,
+        "suppressed": False,
+        "investigate": _HUB["investigate"],
+        "todoist_task_id": alert.get("todoist_task_id") or "task-hub-1",
+    }
+
+
+@activity.defn(name="problem_status")
+async def stub_problem_status(problem_id: str) -> dict:
+    _HUB["status"].append(problem_id)
+    return {
+        "found": True,
+        "status": "resolved" if _HUB["resolved"] else "open",
+        "resolved": _HUB["resolved"],
+        "occurrences": 1,
+        "todoist_task_id": "task-hub-1",
+    }
+
+
+@activity.defn(name="record_investigation")
+async def stub_record_investigation(inp: dict) -> dict:
+    _HUB["record"].append(inp)
+    return {"recorded": True, "status_changed": True}
+
+
+@activity.defn(name="mute_problem")
+async def stub_mute_problem(problem_id: str, hours: float, by: str = "") -> dict:
+    _HUB["mute"].append((problem_id, hours))
+    return {"muted_until": "2026-09-08T12:00:00+00:00"}
+
+
+@activity.defn(name="verification_delay")
+async def stub_verification_delay(alert: dict) -> dict:
+    return {"delay_seconds": _HUB["delay"]}
+
+
+def _hub_reset() -> None:
+    for key in ("ingest", "status", "record", "mute"):
+        _HUB[key].clear()
+    _HUB["resolved"] = False
+    _HUB["investigate"] = True
+    _HUB["delay"] = 0
+
+
 ALL_STUBS = [
+    stub_ingest_alert,
+    stub_problem_status,
+    stub_record_investigation,
+    stub_mute_problem,
+    stub_verification_delay,
     stub_resolve_agents,
     stub_get_alert_routing_config,
-    stub_check_alert_mute,
-    stub_write_alert_mute,
-    stub_check_dedup,
-    stub_find_open_task_for_signature,
-    stub_record_signature_new_task,
-    stub_record_signature_recurrence,
-    stub_get_verification_delay,
-    stub_check_alert_resolved,
     stub_resolve_alert_resource,
     stub_resolve_infra_resource,
     stub_score_resource_relevance,
@@ -288,7 +298,6 @@ ALL_STUBS = [
     stub_investigate,
     stub_run_investigation,
     stub_assess_investigation,
-    stub_log_alert,
     stub_send_system_event,
     stub_send_message,
     stub_accumulate_digest,
@@ -330,37 +339,6 @@ _GATE2_CHILD_PREFIX = f"gate2-{_SAFE_FINGERPRINT}-"
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.asyncio
-async def test_existing_mute_short_circuits():
-    """check_alert_mute=True → status=muted; no InteractionFlow spawned at all."""
-    _reset(muted=True)
-
-    async with (
-        await WorkflowEnvironment.start_time_skipping() as env,
-        Worker(
-            env.client,
-            task_queue="tq-gates",
-            workflows=[AlertInvestigationFlow, InteractionFlow],
-            activities=ALL_STUBS,
-        ),
-    ):
-        result = await env.client.execute_workflow(
-            AlertInvestigationFlow.run,
-            _make_alert(),
-            id="gate-mute-existing",
-            task_queue="tq-gates",
-        )
-
-    assert result["status"] == "muted"
-    # No InteractionFlow (Gate 2) was ever invoked
-    assert not _calls.get("insert_ia"), (
-        f"insert_interaction should not have been called, got: {_calls.get('insert_ia')}"
-    )
-    # Investigation never ran
-    assert not _calls.get("delay_called")
-    assert not _calls.get("investigate_called")
-
-
 # ---------------------------------------------------------------------------
 # Gate 2 helpers
 # ---------------------------------------------------------------------------
@@ -388,7 +366,7 @@ async def _drive_to_gate2(env, handle, workflow_id: str):
 @pytest.mark.asyncio
 async def test_gate2_open_all_prs_stages_pending_pr():
     """Gate 2 value=open_all_prs → stage_pending_pr called with the alert's repo."""
-    _reset(muted=False)
+    _reset()
 
     async with (
         await WorkflowEnvironment.start_local() as env,
@@ -482,7 +460,7 @@ async def test_gate2_skip_pr_creates_task_without_pending_pr():
 @pytest.mark.asyncio
 async def test_gate2_discard_returns_without_task_or_pr():
     """Gate 2 value=discard → status=gate2_discarded; no task, no pending_pr."""
-    _reset(muted=False)
+    _reset()
 
     async with (
         await WorkflowEnvironment.start_local() as env,
@@ -517,43 +495,6 @@ async def test_gate2_discard_returns_without_task_or_pr():
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.asyncio
-async def test_gate2_discard_logs_to_audit_log():
-    """Gate 2 value=discard must still call log_alert before returning. Without
-    this, a re-fire of the same alert would not be caught by step-2 dedup
-    (check_dedup reads audit_log) and would spawn a duplicate investigation
-    even though the user already explicitly discarded the proposed fix."""
-    _reset(muted=False)
-
-    async with (
-        await WorkflowEnvironment.start_local() as env,
-        Worker(
-            env.client,
-            task_queue="tq-gates",
-            workflows=[AlertInvestigationFlow, InteractionFlow],
-            activities=ALL_STUBS,
-        ),
-    ):
-        wf_id = "gate2-discard-audit-test"
-        handle = await env.client.start_workflow(
-            AlertInvestigationFlow.run,
-            _make_alert(),
-            id=wf_id,
-            task_queue="tq-gates",
-        )
-
-        gate2_handle = await _drive_to_gate2(env, handle, wf_id)
-        assert len(_calls.get("insert_ia", [])) >= 1, "Gate 2 child never started"
-
-        await gate2_handle.signal(InteractionFlow.submit_response, {"value": "discard"})
-
-        result = await asyncio.wait_for(handle.result(), timeout=15.0)
-
-    assert result["status"] == "gate2_discarded"
-    logged = _calls.get("log_alert", [])
-    assert logged, "log_alert must be called on the discard branch (audit dedup)"
-
-
 # ---------------------------------------------------------------------------
 # Test 8: Alertmanager alert + kimi branches → Gate 2 fires (non-requires_approval)
 # ---------------------------------------------------------------------------
@@ -562,7 +503,7 @@ async def test_gate2_discard_logs_to_audit_log():
 @pytest.mark.asyncio
 async def test_alertmanager_kimi_triggers_gate2():
     """Non-requires_approval alert with kimi branches → Gate 2 fires for all sources."""
-    _reset(muted=False)
+    _reset()
     _state["run_investigation_result"] = {
         "status": "succeeded",
         "output": "Kimi found OOM in ClickHouse config",
@@ -656,7 +597,7 @@ async def test_gate2_open_prs_branch_keyed_by_github_repo_name():
     rather than the checkout-dir basename. When the two differ (e.g. checkout
     `hikmah/quantamental-data-platform` for `hikmahtech/em-credibility-monitor`)
     the old basename-only index silently opened 0 PRs (issue #270)."""
-    _reset(muted=False)
+    _reset()
     _state["run_investigation_result"] = {
         "status": "succeeded",
         "output": "fix committed",
@@ -724,49 +665,10 @@ async def test_gate2_open_prs_branch_keyed_by_github_repo_name():
 
 
 @pytest.mark.asyncio
-async def test_gate2_mute_24h_writes_alert_mute():
-    """Gate 2 `mute_24h` choice triggers write_alert_mute and falls through
-    to the verdict-comment path (status='logged'). Replaces the loop of
-    "comments after comments" with an explicit user-driven mute."""
-    _reset(muted=False)
-
-    async with (
-        await WorkflowEnvironment.start_local() as env,
-        Worker(
-            env.client,
-            task_queue="tq-gates",
-            workflows=[AlertInvestigationFlow, InteractionFlow],
-            activities=ALL_STUBS,
-        ),
-    ):
-        wf_id = "gate2-mute-24h-test"
-        handle = await env.client.start_workflow(
-            AlertInvestigationFlow.run,
-            _make_alert(),
-            id=wf_id,
-            task_queue="tq-gates",
-        )
-
-        gate2_handle = await _drive_to_gate2(env, handle, wf_id)
-        await gate2_handle.signal(InteractionFlow.submit_response, {"value": "mute_24h"})
-
-        result = await asyncio.wait_for(handle.result(), timeout=15.0)
-
-    assert result["status"] != "gate2_discarded"
-    mute_calls = _calls.get("mute_write", [])
-    assert mute_calls, "write_alert_mute should have been called on mute_24h"
-    # ttl_seconds == 24h
-    args = mute_calls[0]
-    ttl = args["ttl_seconds"] if isinstance(args, dict) else args.ttl_seconds
-    assert ttl == 86400
-    assert not _calls.get("stage_pending_pr"), "PRs must NOT be opened on mute"
-
-
-@pytest.mark.asyncio
 async def test_gate2_ack_logs_acknowledgement_without_pr():
     """Gate 2 `ack` choice falls through to the normal verdict-comment +
     chat-info path. No PRs created, no mute written."""
-    _reset(muted=False)
+    _reset()
 
     async with (
         await WorkflowEnvironment.start_local() as env,
@@ -791,7 +693,7 @@ async def test_gate2_ack_logs_acknowledgement_without_pr():
         result = await asyncio.wait_for(handle.result(), timeout=15.0)
 
     assert result["status"] != "gate2_discarded"
-    assert not _calls.get("mute_write"), "Ack should NOT trigger a mute"
+    assert not _HUB["mute"], "Ack should NOT trigger a mute"
     assert not _calls.get("stage_pending_pr"), "Ack should NOT open PRs"
 
 
@@ -805,7 +707,7 @@ async def test_alertmanager_kimi_no_branches_still_fires_gate2_for_decision():
     is what triggered the "comments after comments, no chat approval
     prompt" feedback from the user.
     """
-    _reset(muted=False)
+    _reset()
     _state["run_investigation_result"] = {
         "status": "succeeded",
         "output": "No code fix — purely infra memory issue",
@@ -874,7 +776,7 @@ async def test_kimi_failure_falls_back_to_llm_investigate():
     """When run_investigation returns non-succeeded (e.g. missing repo dir,
     no clone_url), the flow must call investigate() instead of feeding the
     error string to Haiku as the investigation output."""
-    _reset(muted=False)
+    _reset()
     _state["run_investigation_result"] = {
         "status": "failed",
         "output": "Repo directory does not exist on remote: /home/user/Workspace/trading-system-pipeline",
@@ -952,7 +854,7 @@ async def test_inconclusive_verdict_sets_inconclusive_status():
     """When the kimi run reported insufficient evidence and Haiku returns
     `inconclusive`, the final status must surface that honestly instead of
     falling into the actionable bucket."""
-    _reset(muted=False)
+    _reset()
     _state["run_investigation_result"] = {
         "status": "succeeded",
         "output": (
@@ -1035,7 +937,7 @@ async def test_assess_timeout_degrades_to_inconclusive():
     out 3× and the workflow failed with a bare "Activity task timed out",
     leaving the user with only the "investigation has begun" note.
     """
-    _reset(muted=False, assess_raises=True)
+    _reset(assess_raises=True)
     _state["run_investigation_result"] = {
         "status": "succeeded",
         "output": "Investigation found the exec_info typo in notifications/__init__.py",

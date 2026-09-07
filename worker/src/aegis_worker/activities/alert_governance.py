@@ -6,7 +6,6 @@ before Gate 1 fires. Mute keys follow "<source>:<service>:<subkey>".
 
 from __future__ import annotations
 
-import datetime as _dt
 import shlex
 from dataclasses import dataclass
 from typing import Any
@@ -15,19 +14,6 @@ import structlog
 from temporalio import activity
 
 logger = structlog.get_logger()
-
-
-@dataclass
-class CheckMuteInput:
-    mute_key: str
-
-
-@dataclass
-class WriteMuteInput:
-    mute_key: str
-    ttl_seconds: int
-    reason: str = ""
-    created_by: str = ""
 
 
 @dataclass
@@ -59,45 +45,6 @@ class CreateGithubPrInput:
 class AlertGovernanceActivities:
     db_pool: Any
     remote_script: Any = None  # RemoteScriptConnector — optional; needed for create_github_pr
-
-    @activity.defn
-    async def check_alert_mute(self, input: CheckMuteInput) -> bool:
-        if not self.db_pool or not input.mute_key:
-            return False
-        async with self.db_pool.acquire() as conn:
-            row = await conn.fetchrow(
-                "SELECT muted_until FROM alert_mutes WHERE mute_key = $1",
-                input.mute_key,
-            )
-        if not row:
-            return False
-        return row["muted_until"] > _dt.datetime.now(_dt.UTC)
-
-    @activity.defn
-    async def write_alert_mute(self, input: WriteMuteInput) -> None:
-        if not self.db_pool or not input.mute_key:
-            return
-        until = _dt.datetime.now(_dt.UTC) + _dt.timedelta(seconds=input.ttl_seconds)
-        async with self.db_pool.acquire() as conn:
-            await conn.execute(
-                """
-                INSERT INTO alert_mutes (mute_key, muted_until, reason, created_by)
-                VALUES ($1, $2, $3, $4)
-                ON CONFLICT (mute_key) DO UPDATE SET
-                    muted_until = EXCLUDED.muted_until,
-                    reason = EXCLUDED.reason,
-                    created_by = EXCLUDED.created_by
-                """,
-                input.mute_key,
-                until,
-                input.reason,
-                input.created_by,
-            )
-        activity.logger.info(
-            "alert_mute_written",
-            mute_key=input.mute_key,
-            muted_until=until.isoformat(),
-        )
 
     @activity.defn
     async def stage_pending_pr(self, input: StagePendingPrInput) -> str:

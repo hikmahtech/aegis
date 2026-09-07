@@ -1,31 +1,35 @@
-"""AlertInvestigationFlow — smart alert pipeline with verification delay.
+"""AlertInvestigationFlow — investigate one problem the hub handed over.
 
-Every run anchors to a Todoist task. Either the caller passes an existing
-``alert.todoist_task_id`` (clarify-APP path: classify_one routed a Jira
-ticket to pandora_investigation) or the flow creates one in step 2.7 via
-``CaptureActivities.capture_to_inbox`` with `extra_labels=["@pandora"]`.
+Since PR 3b the flow no longer owns an alert's identity: the problem hub
+(`aegis.services.hub`) decides whether a signal is new, a repeat, suppressed
+or muted, and a producer starts this flow only when the hub says
+`investigate`. The input is the alert dict every producer builds, plus
+``problem_id`` and the hub's ``todoist_task_id`` (the task the hub projected,
+or the one clarify / a chat tool anchored the alert to). A caller that
+predates the hub may omit `problem_id`; step 0 ingests the alert itself and
+returns early when the hub would not have investigated.
 
 Pipeline:
-
-1.   Skip if resolved on arrival
-2.   Dedup check (24h window) via `audit_log` + signature key
-2.5. Mute short-circuit (per-source/service/workflow key)
-2.6. Ensure Todoist track-task exists (reuse `todoist_task_id` if given,
-     else `capture_to_inbox(#alert, ..., ["@pandora"])`)
-3.   Verification delay → re-check if alert self-resolved
-4.   Resolve alert to resource (repo) via `resolve_alert_resource`
+0.   Hub identity (`ingest_alert` when the caller gave no problem_id)
+2.6. Escalating heads-up ping
+3.   Verification delay by class (`hub.verify_seconds`) → `problem_status`
+     re-check; a problem the hub already saw resolved ends here
+4.   Resolve alert to resource (repo) via `resolve_alert_resource`;
+     infra alerts try the one-shot auto-restart first
 5.   Gather knowledge context (runbooks, prior incidents)
-6.   Investigate: Kimi if `resource_path` available, else LLM fallback
-7.   Haiku assessment → structured verdict (actionable / not_actionable /
+6.   Investigate: coding CLI if `resource_path` available, else LLM fallback
+7.   Assessment → structured verdict (actionable / not_actionable /
      inconclusive / self_resolved)
-8.   Apply verdict (label task, mute, stage PR — depending on verdict shape)
-8.5. Post `[Pandora] Investigation complete — <verdict>` final-comment on
-     the track-task via `AlertActivities.post_task_note`
+7.5. Gate 2 card (Open PR / Run fix / Mute 24h / Acknowledge / Discard);
+     escalating alerts race the card against the hub seeing the problem
+     resolve
+8.5. Post the final report on the task via `AlertActivities.post_task_note`
 9.   Notify via chat (links to the Todoist task)
-10.  Log investigation to `audit_log`
+10.  Record the outcome on the problem (`record_investigation`)
 
-Start-comment (`[Pandora] Investigation started`) is posted between
-steps 2.7 and 3.
+Every transition the flow makes is recorded on the problem
+(investigating → waiting_human / fixing / resolved) so the timeline, the
+digest and the next session read one record.
 """
 
 from __future__ import annotations
@@ -44,19 +48,16 @@ with workflow.unsafe.imports_passed_through():
     from aegis_worker.activities.agent_registry import AgentRegistryActivities
     from aegis_worker.activities.alert_governance import (
         AlertGovernanceActivities,
-        CheckMuteInput,
         CreateGithubPrInput,
         StagePendingPrInput,
-        WriteMuteInput,
     )
     from aegis_worker.activities.alerts import (
         AlertActivities,
-        build_alert_signature,
         extract_proposed_commands,
         is_infra_alert,
     )
-    from aegis_worker.activities.capture import CaptureActivities
     from aegis_worker.activities.delivery import DeliveryActivities
+    from aegis_worker.activities.hub import HubActivities
     from aegis_worker.flows.interaction import InteractionFlow, InteractionFlowInput
     from aegis_worker.shared.retry import (
         FAST,
@@ -78,16 +79,6 @@ _MAX_HINT_ROUNDS = 3
 def _safe_workflow_id_segment(text: str, max_len: int = 60) -> str:
     """Replace characters illegal in Temporal workflow IDs with dashes."""
     return re.sub(r"[^a-zA-Z0-9._\-]", "-", text)[:max_len]
-
-
-def _build_mute_key(alert: dict) -> str:
-    source = alert.get("source", "")
-    service = alert.get("service", "")
-    labels = alert.get("labels") or {}
-    subkey = labels.get("workflow", "")  # GH workflow_run → workflow name
-    if not source or not service:
-        return ""
-    return f"{source}:{service}:{subkey}"
 
 
 def _build_repo_confirm_prompt(
@@ -236,8 +227,45 @@ class AlertInvestigationFlow:
         except Exception:
             workflow.logger.warning("alert_post_task_note_failed task_id=%s", task_id)
 
+    async def _record(
+        self,
+        problem_id: str,
+        status: str,
+        text: str,
+        *,
+        step: str,
+        payload: dict | None = None,
+    ) -> None:
+        """Best-effort `record_investigation`: the outcome lands on the
+        problem's timeline and moves its status; the flow already posted the
+        text on the task itself, so the projector will not repeat it."""
+        if not problem_id:
+            return
+        try:
+            await workflow.execute_activity_method(
+                HubActivities.record_investigation,
+                args=[
+                    {
+                        "problem_id": problem_id,
+                        "status": status,
+                        "text": text,
+                        # Idempotent per flow run and step: a replayed or
+                        # retried step records once.
+                        "external_id": f"{workflow.info().workflow_id}:{step}",
+                        "posted": True,
+                        "payload": payload or {},
+                    }
+                ],
+                start_to_close_timeout=TIMEOUT_STANDARD,
+                retry_policy=NO_RETRY,
+            )
+        except Exception as exc:  # noqa: BLE001
+            workflow.logger.warning(
+                "alert_record_investigation_failed step=%s err=%s", step, str(exc)[:200]
+            )
+
     async def _safe_remediate_infra(
-        self, alert: dict, track_task_id: str, title: str, source: str
+        self, alert: dict, track_task_id: str, title: str, source: str, problem_id: str
     ) -> dict | None:
         """Try a one-shot auto-restart for a remediable swarm-service alert.
 
@@ -281,9 +309,16 @@ class AlertInvestigationFlow:
                 )
             except Exception:
                 pass
+            await self._record(
+                problem_id,
+                "resolved",
+                f"Auto-remediated: docker service update --force {service} and it recovered.",
+                step="auto_remediated",
+            )
             return {
                 "status": "auto_remediated",
                 "task_id": track_task_id,
+                "problem_id": problem_id,
                 "service": service,
                 "command": rem.get("command", ""),
             }
@@ -303,15 +338,10 @@ class AlertInvestigationFlow:
         fingerprint = alert.get("fingerprint", "")
         severity = alert.get("severity", "unknown")
         source = alert.get("source", "unknown")
-        # Escalating infra alerts (NodeDown / HeartbeatCollectFailed — Task 4
-        # marks alert["escalate"]). Resolved early so both the heads-up ping and
-        # the signature-dedup attach-and-continue path below can branch on it.
+        # Escalating infra alerts (NodeDown / HeartbeatCollectFailed — the
+        # heartbeat marks alert["escalate"]). Drives the heads-up ping and the
+        # escalating Gate-2 card.
         _escalate = bool(alert.get("escalate"))
-        # Flow start instant — passed as `since_iso` to check_alert_resolved so
-        # the self-resolve rechecks only count recoveries during THIS run, not a
-        # previous flap's stale resolved row (which would instantly close the
-        # gate). workflow.now() is deterministic/replay-safe.
-        flow_start_iso = workflow.now().isoformat()
 
         # Owner of the alert pipeline = whoever holds the `infra` behavior tag
         # (issue #36). Every delivery/attribution/child-interaction below is
@@ -333,45 +363,54 @@ class AlertInvestigationFlow:
             f"🔍 Alert investigation started: <b>{_html_escape(title)}</b> ({severity}/{source})"
         )
 
-        # ── Step 1: Skip if resolved on arrival ──
-        if alert.get("resolved"):
-            workflow.logger.info("alert_resolved_skip title=%s", title)
-            await self._safe_event(f"⏭ AlertInvestigation — resolved, skipping: {title}")
-            return {"status": "skipped_resolved", "task_id": None}
-
-        # ── Step 2: Dedup check ──
-        if fingerprint:
-            dedup = await workflow.execute_activity_method(
-                AlertActivities.check_dedup,
-                args=[fingerprint, 24],
+        # ── Step 0: Hub identity ──
+        # The producer normally ingested the alert and handed us the problem
+        # (and the task the hub projected). A caller that did not — an older
+        # start site, a test — gets the same treatment here, and stops when
+        # the hub would not have investigated (repeat occurrence, suppressed,
+        # muted).
+        problem_id = str(alert.get("problem_id") or "")
+        track_task_id: str | None = str(alert.get("todoist_task_id") or "") or None
+        if not problem_id:
+            ingested = await workflow.execute_activity_method(
+                HubActivities.ingest_alert,
+                args=[alert, False],
+                start_to_close_timeout=TIMEOUT_STANDARD,
+                retry_policy=FAST,
+            )
+            problem_id = str(ingested.get("problem_id") or "")
+            track_task_id = track_task_id or ingested.get("todoist_task_id") or None
+            if not ingested.get("investigate", True):
+                workflow.logger.info(
+                    "alert_investigation_skipped_by_hub title=%s action=%s",
+                    title,
+                    ingested.get("action"),
+                )
+                await self._safe_event(
+                    f"⏭ AlertInvestigation — hub says {ingested.get('action')}, skipping: {title}"
+                )
+                return {
+                    "status": "skipped_by_hub",
+                    "hub_action": ingested.get("action"),
+                    "problem_id": problem_id or None,
+                    "task_id": None,
+                    "todoist_task_id": track_task_id,
+                }
+        elif not track_task_id:
+            status_now = await workflow.execute_activity_method(
+                HubActivities.problem_status,
+                args=[problem_id],
                 start_to_close_timeout=TIMEOUT_FAST,
                 retry_policy=FAST,
             )
-            if dedup.get("is_duplicate"):
-                workflow.logger.info("alert_dedup_skip fingerprint=%s", fingerprint)
-                await self._safe_event(f"⏭ AlertInvestigation — duplicate, skipping: {title}")
-                return {"status": "skipped_duplicate", "task_id": None}
-
-        # ── Step 2.5: Mute short-circuit ──
-        mute_key = _build_mute_key(alert)
-        if mute_key:
-            muted = await workflow.execute_activity(
-                "check_alert_mute",
-                CheckMuteInput(mute_key=mute_key),
-                start_to_close_timeout=TIMEOUT_FAST,
-                retry_policy=FAST,
-            )
-            if muted:
-                workflow.logger.info(f"alert_muted mute_key={mute_key} title={title}")
-                await self._safe_event(f"🔕 Muted: {_html_escape(title)}")
-                return {"status": "muted", "task_id": None}
+            track_task_id = status_now.get("todoist_task_id") or None
 
         # ── Step 2.6: Escalating heads-up ping ──
         # Escalating infra alerts (NodeDown / HeartbeatCollectFailed) get an
         # immediate heads-up chat ping so the owner knows a decision card is
-        # coming and will be nagged until acked. Placed AFTER resolved-skip,
-        # dedup, and mute so it never fires for an alert that's already
-        # resolved-on-arrival, deduped, or muted. Non-escalating alerts skip it.
+        # coming and will be nagged until acked. The hub already filtered
+        # repeats, suppressed and muted problems before this flow started, so
+        # the ping is never noise. Non-escalating alerts skip it.
         if _escalate:
             await self._safe_send_message(
                 agent_id=agent_id,
@@ -384,7 +423,7 @@ class AlertInvestigationFlow:
             )
 
         # ── Step 2.65: Routing config — infra_cluster (#91) ──
-        # is_infra_alert/build_alert_signature can't read Settings/DB from
+        # is_infra_alert can't read Settings/DB from
         # workflow code, so fetch the configured cluster label once here via
         # a tiny activity. workflow.patched guards in-flight runs started
         # before this change so they keep replaying the pre-patch (env-only)
@@ -400,169 +439,45 @@ class AlertInvestigationFlow:
             infra_cluster = routing.get("infra_cluster") or ""
             owner_mention = routing.get("slack_owner_member_id") or ""
 
-        # ── Step 2.7: Signature dedup — attach to existing open task ──
-        # Sentry mints a new issue id per stack-frame variation, so
-        # check_dedup (fingerprint-exact) lets each variation through.
-        # build_alert_signature collapses variations onto a single key
-        # like sentry-class:<service>:<error_class>. If an open @pandora
-        # task is already bound to this signature, post a recurrence
-        # note and skip a duplicate investigation. Caller-supplied
-        # todoist_task_id (clarify-APP path) bypasses signature dedup —
-        # the caller has explicitly anchored to a specific task.
-        signature = build_alert_signature(alert, infra_cluster)
-        signature_task_id: str | None = None
-        if signature and not alert.get("todoist_task_id"):
-            existing_task_id = await workflow.execute_activity_method(
-                AlertActivities.find_open_task_for_signature,
-                args=[signature],
-                start_to_close_timeout=TIMEOUT_FAST,
-                retry_policy=FAST,
-            )
-            if existing_task_id:
-                workflow.logger.info(
-                    "alert_signature_dedup_hit signature=%s task_id=%s fingerprint=%s escalate=%s",
-                    signature,
-                    existing_task_id,
-                    fingerprint,
-                    _escalate,
-                )
-                recurrence_note = (
-                    f"⚠️ Another occurrence of this error class\n"
-                    f"Title: {title[:200]}\n"
-                    f"Fingerprint: {fingerprint or '-'}"
-                )
-                await self._safe_post_note(existing_task_id, recurrence_note)
-                await workflow.execute_activity_method(
-                    AlertActivities.record_signature_recurrence,
-                    args=[signature],
-                    start_to_close_timeout=TIMEOUT_FAST,
-                    retry_policy=NO_RETRY,
-                )
-                if _escalate:
-                    # Escalating alerts must NOT be silently suppressed on a
-                    # recurrence: a real re-outage that re-uses the same
-                    # signature still needs a decision card + escalation. Attach
-                    # to the existing task and CONTINUE the pipeline (verification
-                    # delay → investigation → escalating Gate-2). log_alert is
-                    # left to step 10 at the end of this run.
-                    signature_task_id = existing_task_id
-                    await self._safe_event(
-                        "🪞 AlertInvestigation — recurrence (escalating), continuing "
-                        f"on existing task: {_html_escape(title)}"
-                    )
-                else:
-                    # Non-escalating: early-exit (attach recurrence note + skip).
-                    # Write the per-fingerprint dedup audit row so a re-fire of
-                    # THIS exact issue short-circuits at step 2 (check_dedup)
-                    # instead of repeating the signature lookup.
-                    try:
-                        await workflow.execute_activity_method(
-                            AlertActivities.log_alert,
-                            args=[alert],
-                            start_to_close_timeout=TIMEOUT_FAST,
-                            retry_policy=NO_RETRY,
-                        )
-                    except Exception:
-                        pass
-                    await self._safe_event(
-                        "🪞 AlertInvestigation — recurrence, attached to existing "
-                        f"task: {_html_escape(title)}"
-                    )
-                    return {
-                        "status": "skipped_signature_dedup",
-                        "task_id": None,
-                        "todoist_task_id": existing_task_id,
-                        "signature": signature,
-                        "verdict": None,
-                        "resource": None,
-                        "investigation": "",
-                    }
-
-        # ── Step 2.8: Ensure todoist track-task exists ──
-        # Either the caller passed an existing task_id (clarify-APP path), the
-        # escalating signature-dedup path above attached to an open task, OR we
-        # create one now in the Inbox tagged @pandora. The same task receives
-        # start- and final-comments and shows up in the user's Pandora filter
-        # while the investigation runs.
-        track_task_id: str | None = alert.get("todoist_task_id") or signature_task_id or None
-        if not track_task_id:
-            capture_title = title[:120]
-            capture_description = (alert.get("description") or "")[:2000]
-            capture_external_id = (
-                f"alert-{fingerprint}"
-                if fingerprint
-                else f"alert-{_safe_workflow_id_segment(title)}"
-            )
-            try:
-                track_task_id = await workflow.execute_activity_method(
-                    CaptureActivities.capture_to_inbox,
-                    args=[
-                        "#alert",
-                        capture_external_id,
-                        capture_title,
-                        capture_description,
-                        ["@pandora"],
-                    ],
-                    start_to_close_timeout=TIMEOUT_FAST,
-                    retry_policy=NO_RETRY,
-                )
-            except Exception as exc:
-                workflow.logger.warning(
-                    "alert_track_task_capture_failed alert=%s err=%s",
-                    title,
-                    str(exc)[:200],
-                )
-                track_task_id = None
-            if track_task_id and track_task_id.startswith("item-"):
-                # Outbox path — comments to a temp_id will fail, log and
-                # carry on; final-comment will retry by then. The audit
-                # row in todoist_capture_idempotency will be backfilled
-                # with the real id once outbox drains.
-                workflow.logger.info("alert_track_task_outbox temp_id=%s", track_task_id)
-            # Bind signature → newly-created task so future variations
-            # attach to this task instead of spawning duplicates. Skipped
-            # for outbox temp_ids — the next occurrence will rebind once
-            # the real task id lands.
-            if signature and track_task_id and not track_task_id.startswith("item-"):
-                await workflow.execute_activity_method(
-                    AlertActivities.record_signature_new_task,
-                    args=[signature, track_task_id],
-                    start_to_close_timeout=TIMEOUT_FAST,
-                    retry_policy=NO_RETRY,
-                )
-
         # ── Step 3: Verification delay ──
-        delay_result = await workflow.execute_activity_method(
-            AlertActivities.get_verification_delay,
+        # A flat per-class wait (`hub.verify_seconds`, served by the hub
+        # activity so tests can shorten it) before spending any effort, then
+        # ask the hub whether the problem already resolved — a blip that
+        # self-heals costs nothing. The hub is the record: the alertmanager
+        # `resolved` webhook and the heartbeat's recovery both land there as
+        # `resolved` events, so the hub is asked even with no delay.
+        delay = await workflow.execute_activity_method(
+            HubActivities.verification_delay,
             args=[alert],
             start_to_close_timeout=TIMEOUT_FAST,
             retry_policy=NO_RETRY,
         )
-        delay_seconds = delay_result.get("delay_seconds", 0)
-
-        if delay_seconds > 0:
-            workflow.logger.info(
-                "alert_verification_delay seconds=%d reason=%s",
-                delay_seconds,
-                delay_result.get("reason", ""),
-            )
-            await self._safe_event(
-                f"⏳ AlertInvestigation — waiting {delay_seconds}s verification: {title}"
-            )
-            await workflow.sleep(timedelta(seconds=delay_seconds))
-
-            # Re-check if alert self-resolved during the delay. Bound the lookup
-            # to this run's start (since_iso) so it only counts a recovery that
-            # arrived during THIS firing, never a previous flap's resolved row.
-            window_minutes = delay_seconds // 60 + 2
-            resolved_check = await workflow.execute_activity_method(
-                AlertActivities.check_alert_resolved,
-                args=[fingerprint, window_minutes, flow_start_iso],
-                start_to_close_timeout=TIMEOUT_FAST,
-                retry_policy=FAST,
-            )
+        delay_seconds = int(delay.get("delay_seconds") or 0)
+        if problem_id:
+            if delay_seconds > 0:
+                workflow.logger.info("alert_verification_delay seconds=%d", delay_seconds)
+                await self._safe_event(
+                    f"⏳ AlertInvestigation — waiting {delay_seconds}s verification: {title}"
+                )
+                await workflow.sleep(timedelta(seconds=delay_seconds))
+            # A hub that cannot answer must not kill the run: "unknown" is
+            # "not resolved yet", and the investigation goes ahead.
+            try:
+                resolved_check = await workflow.execute_activity_method(
+                    HubActivities.problem_status,
+                    args=[problem_id],
+                    start_to_close_timeout=TIMEOUT_FAST,
+                    retry_policy=FAST,
+                )
+            except Exception as exc:  # noqa: BLE001
+                workflow.logger.warning(
+                    "alert_verification_status_failed problem_id=%s err=%s",
+                    problem_id,
+                    str(exc)[:200],
+                )
+                resolved_check = {"resolved": False}
             if resolved_check.get("resolved"):
-                workflow.logger.info("alert_self_resolved fingerprint=%s", fingerprint)
+                workflow.logger.info("alert_self_resolved problem_id=%s", problem_id)
                 await self._safe_event(
                     f"✅ AlertInvestigation — self-resolved during delay: {title}"
                 )
@@ -579,21 +494,16 @@ class AlertInvestigationFlow:
                     )
                 except Exception:
                     pass
-                # Write a dedup record so a flapping alert (re-fires within
-                # the dedup window) is short-circuited by check_dedup
-                # instead of spinning up another full investigation.
-                try:
-                    await workflow.execute_activity_method(
-                        AlertActivities.log_alert,
-                        args=[alert],
-                        start_to_close_timeout=TIMEOUT_FAST,
-                        retry_policy=NO_RETRY,
-                    )
-                except Exception:
-                    pass
+                await self._record(
+                    problem_id,
+                    "resolved",
+                    "Self-resolved during the verification delay.",
+                    step="self_resolved",
+                )
                 return {
                     "status": "self_resolved",
                     "task_id": None,
+                    "problem_id": problem_id,
                     "todoist_task_id": track_task_id,
                     "verdict": None,
                     "resource": None,
@@ -613,7 +523,7 @@ class AlertInvestigationFlow:
             # the service recovers we're done (and never burn the kimi budget).
             # Crash-loops are excluded by the activity — restarting them churns.
             remediation = await self._safe_remediate_infra(
-                alert, track_task_id or "", title, source
+                alert, track_task_id or "", title, source, problem_id
             )
             if remediation is not None:
                 return remediation
@@ -796,6 +706,13 @@ class AlertInvestigationFlow:
                     }
                 ]
                 resource_title = chosen_c.get("resource_title")
+
+        await self._record(
+            problem_id,
+            "investigating",
+            f"Investigation started against {resource_title or 'no resource'}.",
+            step="investigating",
+        )
 
         # ── Step 4.5: Post start-comment on the track-task ──
         # We have the resource picked now, which is the useful piece of
@@ -1176,6 +1093,12 @@ class AlertInvestigationFlow:
                 f"gate2-{_safe_workflow_id_segment(alert.get('fingerprint') or '')}"
                 f"-{workflow.info().workflow_id}"
             )
+            await self._record(
+                problem_id,
+                "waiting_human",
+                f"Decision card posted: {verdict_status}.",
+                step="gate2",
+            )
             if not _escalate:
                 # Unchanged path: spawn + await the decision card. In-flight
                 # prod runs replay through exactly this branch.
@@ -1184,10 +1107,10 @@ class AlertInvestigationFlow:
                 )
             else:
                 # Escalating alert: race the decision card against the alert
-                # self-resolving. Poll check_alert_resolved every 3 min; if the
-                # underlying condition clears while we await the human, auto-close
-                # the card (signal self_resolved) so we stop nagging the owner
-                # about an alert that already recovered.
+                # self-resolving. Ask the hub every 3 min; if the problem
+                # resolved while we await the human, auto-close the card
+                # (signal self_resolved) so we stop nagging the owner about an
+                # alert that already recovered.
                 handle = await workflow.start_child_workflow(
                     InteractionFlow.run, gate_input, id=gate_id
                 )
@@ -1213,11 +1136,8 @@ class AlertInvestigationFlow:
                     # tick or the human's decision.
                     try:
                         recheck = await workflow.execute_activity_method(
-                            AlertActivities.check_alert_resolved,
-                            # since_iso=flow_start: a resolved row from a
-                            # PREVIOUS flap must NOT auto-close this run's gate —
-                            # only a recovery during THIS run counts.
-                            args=[fingerprint, 10, flow_start_iso],
+                            HubActivities.problem_status,
+                            args=[problem_id],
                             start_to_close_timeout=TIMEOUT_FAST,
                             retry_policy=FAST,
                         )
@@ -1263,18 +1183,16 @@ class AlertInvestigationFlow:
                     track_task_id or "",
                     "✅ Self-resolved while awaiting your decision — card closed automatically.",
                 )
-                try:
-                    await workflow.execute_activity_method(
-                        AlertActivities.log_alert,
-                        args=[alert],
-                        start_to_close_timeout=TIMEOUT_FAST,
-                        retry_policy=NO_RETRY,
-                    )
-                except Exception:
-                    pass
+                await self._record(
+                    problem_id,
+                    "resolved",
+                    "Self-resolved while awaiting the decision card.",
+                    step="self_resolved_during_gate",
+                )
                 return {
                     "status": "self_resolved_during_gate",
                     "task_id": None,
+                    "problem_id": problem_id,
                     "todoist_task_id": track_task_id,
                 }
             if v2 == "run_fix" and proposed_cmds:
@@ -1352,8 +1270,8 @@ class AlertInvestigationFlow:
                 if not exec_result.get("refused"):
                     await workflow.sleep(timedelta(seconds=180))
                     post_check = await workflow.execute_activity_method(
-                        AlertActivities.check_alert_resolved,
-                        args=[fingerprint, 5],
+                        HubActivities.problem_status,
+                        args=[problem_id],
                         start_to_close_timeout=TIMEOUT_FAST,
                         retry_policy=FAST,
                     )
@@ -1364,15 +1282,14 @@ class AlertInvestigationFlow:
                         "confirms recovery; investigate further if it re-fires."
                     )
                     await self._safe_post_note(track_task_id or "", verdict_note)
-                try:
-                    await workflow.execute_activity_method(
-                        AlertActivities.log_alert,
-                        args=[alert],
-                        start_to_close_timeout=TIMEOUT_FAST,
-                        retry_policy=NO_RETRY,
+                    await self._record(
+                        problem_id,
+                        "resolved" if post_check.get("resolved") else "waiting_human",
+                        outcome_note,
+                        step="run_fix",
                     )
-                except Exception:
-                    pass
+                else:
+                    await self._record(problem_id, "waiting_human", outcome_note, step="run_fix")
                 return {
                     # A refused run (read-only host, no commands, ...) never
                     # executed anything — surface it distinctly in workflow_runs
@@ -1390,57 +1307,32 @@ class AlertInvestigationFlow:
                     track_task_id or "",
                     voice_line(agent_id, "fix_discarded"),
                 )
-                # The discard branch returned without logging — meaning the
-                # alert never landed in audit_log, so a re-fire would not
-                # be caught by step-2 dedup. Record it now. KG persistence
-                # is intentionally skipped: a user-discarded fix shouldn't
-                # poison future recall as a "prior diagnosis".
-                try:
-                    await workflow.execute_activity_method(
-                        AlertActivities.log_alert,
-                        args=[alert],
-                        start_to_close_timeout=TIMEOUT_FAST,
-                        retry_policy=NO_RETRY,
-                    )
-                except Exception:
-                    pass
+                # KG persistence is intentionally skipped: a user-discarded
+                # fix shouldn't poison future recall as a "prior diagnosis".
+                await self._record(
+                    problem_id, "waiting_human", "Proposed fix discarded.", step="discard"
+                )
                 return {
                     "status": "gate2_discarded",
                     "task_id": None,
+                    "problem_id": problem_id,
                     "todoist_task_id": track_task_id,
                 }
             if v2 == "mute_24h":
-                # Mute the alert family for 24h, then fall through to the
-                # normal verdict-comment + chat-info path so the user
+                # Mute the problem for 24h — occurrences are still counted,
+                # nothing is projected or investigated — then fall through to
+                # the normal verdict-comment + chat-info path so the user
                 # still has the full verdict on Todoist.
-                if mute_key:
-                    try:
-                        await workflow.execute_activity(
-                            "write_alert_mute",
-                            WriteMuteInput(
-                                mute_key=mute_key,
-                                ttl_seconds=86400,
-                                reason="user_mute_24h_post_verdict",
-                                created_by=g2.interaction_id,
-                            ),
-                            start_to_close_timeout=TIMEOUT_FAST,
-                            retry_policy=FAST,
-                        )
-                    except Exception:
-                        workflow.logger.warning(
-                            "alert_post_verdict_mute_failed mute_key=%s", mute_key
-                        )
-                else:
-                    workflow.logger.warning(
-                        "alert_post_verdict_mute_unavailable_no_key title=%s", title
+                try:
+                    await workflow.execute_activity_method(
+                        HubActivities.mute_problem,
+                        args=[problem_id, 24, g2.interaction_id],
+                        start_to_close_timeout=TIMEOUT_FAST,
+                        retry_policy=FAST,
                     )
-                    # Surface the silent-bail to the user's track-task so
-                    # the empty-mute_key case isn't indistinguishable from
-                    # a successful mute. Falls through to the normal
-                    # verdict path below.
-                    await self._safe_post_note(
-                        track_task_id or "",
-                        "🔕 Couldn't apply 24h mute (no mute_key); ignored",
+                except Exception:
+                    workflow.logger.warning(
+                        "alert_post_verdict_mute_failed problem_id=%s", problem_id
                     )
                 await self._safe_post_note(
                     track_task_id or "",
@@ -1537,6 +1429,13 @@ class AlertInvestigationFlow:
                             track_task_id,
                             f"{voice_head}\n\n{links_plain}",
                         )
+                    await self._record(
+                        problem_id,
+                        "fixing",
+                        f"{n} PR(s) opened: " + ", ".join(pr_urls),
+                        step="prs_opened",
+                        payload={"pr_urls": pr_urls},
+                    )
                 elif branches:
                     # User approved PRs and fix branches exist, yet none
                     # opened (mapping miss or create_github_pr failure).
@@ -1707,16 +1606,20 @@ class AlertInvestigationFlow:
         except Exception as exc:
             workflow.logger.warning("alert_verdict_voice_failed err=%s", str(exc)[:200])
 
-        # ── Step 10: Log investigation ──
-        try:
-            await workflow.execute_activity_method(
-                AlertActivities.log_alert,
-                args=[alert],
-                start_to_close_timeout=TIMEOUT_FAST,
-                retry_policy=NO_RETRY,
-            )
-        except Exception:
-            pass
+        # ── Step 10: Record the outcome on the problem ──
+        # `resolved` closes the problem; anything else leaves it with the
+        # human, who has the full report on the task.
+        await self._record(
+            problem_id,
+            "resolved" if final_status == "resolved" else "waiting_human",
+            f"{final_status}: {(verdict.get('root_cause') or '')[:300]}",
+            step="final",
+            payload={
+                "verdict": verdict_status,
+                "resource": resource_title,
+                "investigation_source": investigation_source,
+            },
+        )
 
         workflow.logger.info(
             "alert_investigation_complete",
@@ -1734,6 +1637,7 @@ class AlertInvestigationFlow:
 
         return {
             "status": final_status,
+            "problem_id": problem_id,
             "verdict": verdict,
             "resource": resource_title,
             "investigation": investigation_output[:500],

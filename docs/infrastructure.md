@@ -337,6 +337,22 @@ Three writers, all of which land on the same row:
   the safety net for a deploy job that crashed before posting `ok`.
   `maintenance` rows are never auto-cleared.
 
+### Backfilling the hub from the open alert tasks
+
+Once, after the PR that moved the alert producers onto the hub deploys, turn
+every open `#alert` task AEGIS created before it into a problem that owns that
+task — otherwise the next occurrence of a known alert creates a second task:
+
+```bash
+# dry run first; --apply writes. Duplicate tasks for one problem are completed
+# through the outbox and the oldest stays.
+python scripts/hub_backfill.py --database-url "$AEGIS_DATABASE_URL"
+python scripts/hub_backfill.py --database-url "$AEGIS_DATABASE_URL" --apply
+```
+
+It reads the retired `alert_dedup_index` for recurrence counts while the table
+still exists, which is why that table is dropped by a later migration.
+
 ## System monitoring (`hosts_aegis`)
 
 The admin **System monitoring** page shows the live health of AEGIS's *own*

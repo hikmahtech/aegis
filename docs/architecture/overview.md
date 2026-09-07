@@ -256,22 +256,20 @@ Specialist flows subscribe to tag subsets and run as abandoned children:
 
 ### Alert Investigation
 
-`AlertInvestigationFlow` is the unified investigation pipeline. Steps:
+`AlertInvestigationFlow` investigates one problem the hub handed over. Since PR 3b it no longer owns an alert's identity: the producer (the alertmanager webhook, `SentryPollFlow`, `InfraHeartbeatFlow`, clarify's content routes) records the alert on the hub with `ingest_alert` / `ingest_event`, and starts the flow only when the hub answers `investigate` — a new or returning problem, not suppressed, not muted. The input is the alert dict plus `problem_id` and the hub's `todoist_task_id`. Steps:
 
-1. Skip if alert already resolved on arrival.
-2. **Signature dedup** — `build_alert_signature` collapses Sentry stack-frame variations to `sentry-class:<service>:<metadata.type>`; if an open `@pandora` task with the same signature exists, post "another occurrence" comment and exit early.
-3. **Fingerprint dedup** — filters `audit_log` on `action='alert_investigated'`.
-4. **Mute short-circuit** — `check_alert_mute` against `alert_mutes`.
-5. **Gate 1** (`requires_approval` only) — `InteractionFlow` child: Investigate / Skip / Mute 24h.
-6. **Verification delay** — per-severity sleep + `check_alert_resolved` recheck.
-7. **Resource resolution** — deterministic service-match then LLM picks the owning repo from the `resources` table. `metadata.path` is the repo's workspace-relative checkout path (e.g. `acme/bcp`), maintained by `WorkspaceRepoSyncFlow` — there is no per-run JIT clone; a missing checkout fails the kimi path and falls back to the LLM-only investigation.
-8. **Knowledge context** — `gather_alert_knowledge` prepends `runbooks/<AlertName>.md` (if present and non-stub), then appends prior-incident context from KS.
-9. **Investigation** — coding-CLI (kimi/claude) via `run_investigation` when a `resource_path` is available; LLM fallback otherwise. The run executes on the effective host (the configured kimi host when reachable, else the base coding host — see [`infrastructure.md`](../infrastructure.md)); that host is threaded back through the read-back poll, worktree cleanup, and PR push so they all happen where the branch was made.
-10. **Haiku assessment** → structured verdict: `resolved` / `not_actionable` / `actionable` / `inconclusive`.
-11. **Gate 2** (non-Jira, non-self-resolved verdicts) — Open PR(s) / Run fix (infra alerts whose investigation ends with a `PROPOSED_COMMANDS:` footer — human-approved SSH execution, read_only-gated, note overrides the commands) / Mute 24h / Acknowledge / Discard via Slack. Jira-source runs (`source=='todoist-jira'`) bypass Gate 2 by contract.
-12. Comms notification (Slack) + Todoist task comment + audit log write.
+1. **Hub identity** — a caller that gave no `problem_id` is ingested here and the flow stops when the hub would not have investigated.
+2. **Verification delay** — a flat per-class wait (`hub.verify_seconds`), then `problem_status`: a problem the hub already saw resolve ends here.
+3. **Resource resolution** — deterministic service-match then LLM picks the owning repo from the `resources` table; infra alerts resolve to the gitops repo and try the one-shot auto-restart first.
+4. **Knowledge context** — `gather_alert_knowledge` prepends `runbooks/<AlertName>.md` (if present and non-stub), then appends prior-incident context from KS.
+5. **Investigation** — coding-CLI (kimi/claude) via `run_investigation` when a `resource_path` is available; LLM fallback otherwise.
+6. **Assessment** → structured verdict: `resolved` / `not_actionable` / `actionable` / `inconclusive`.
+7. **Gate 2** — Open PR(s) / Run fix / Mute 24h (mutes the problem) / Acknowledge / Discard via Slack; escalating alerts race the card against the hub seeing the problem resolve.
+8. Comms notification (Slack) + the full report as a Todoist comment + `record_investigation` on the problem.
 
-When a `todoist_task_id` is on the alert (pandora APP-<n>: clarify path), the flow attaches to the existing task; otherwise `capture_to_inbox(extra_labels=["@pandora"])` creates one upfront. Start + final comments are posted via `AlertActivities.post_task_note`.
+Every transition the flow makes (`investigating` → `waiting_human` / `fixing` / `resolved`) is a `state_change` on the problem, so the timeline, the digest and the next session read one record.
+
+When a `todoist_task_id` is on the alert (pandora APP-<n>: clarify path, or the `investigate_resource` chat tool), the hub adopts that task as the problem's; otherwise the projector creates one. Start + final comments are posted via `AlertActivities.post_task_note`.
 
 ## Connectors
 
@@ -361,7 +359,7 @@ PostgreSQL 16 + pgvector. Migrations 001 → 027 in `migrations/` (001 is the sq
 
 **Social publishing** — `social_accounts`, `social_outbox`.
 
-**Alert governance** — `alert_mutes`, `pending_prs`, `alert_dedup_index` (Sentry signature dedup). Being replaced by the problem hub below, one producer at a time (spec: `docs/superpowers/specs/2026-09-07-problem-hub-design.md`).
+**Alert governance** — `pending_prs`; `alert_mutes` is read only by the flow-health and social watchdogs until PR 4 moves them onto the hub; `alert_dedup_index` is unread since PR 3b and is dropped after `scripts/hub_backfill.py` has run.
 
 **Problem hub** — `problems` (one row per thing that is wrong, identified by `services/hub.py::correlation_key`, never by a Todoist task), `problem_events` (every occurrence, resolution, report and note, idempotent on `(source, external_id)`), `problem_links` (task / issue / PR / run / session refs, and the `problem` link a rolled-over problem keeps to its predecessor). Written only through `hub.ingest_event` and `POST /api/hub/events`. The Todoist task is a *projection* of the problem (`services/hub_project.py`, PR 3a): created through the idempotent capture with `external_id = problem-<id>` once the problem earns attention, then kept up to date with comments — occurrences collapsed to one "N more" per 30 min, a resolve closes the task (never one the user claimed with `@me`), a recurrence reopens it — and a status block re-rendered whole between `<!-- aegis:problem -->` markers in the description. Nothing is read back from the task. `problems.metadata` holds the projection watermark (`projected_event_id`, `pending_occurrences`, `block_hash`). Migration 030 (PR 1) ships the tables dark; producers move onto them in PR 3b. `service_state` (migration 031, PR 2) is what is happening to a subject right now — `deploying` / `maintenance` suppress (an occurrence inside the window is stored, counted and never projected; the problem sits `suppressed` until `HubSweepFlow` promotes it once the window passes without a resolution), `degraded` is information, `ok` deletes the row; `subject = '*'` is a wildcard. Written by the Ansible deploy role over `POST /api/hub/service-state`, the `set_service_state` chat tool, and the heartbeat, which clears a `deploying` row once the service has converged.
 

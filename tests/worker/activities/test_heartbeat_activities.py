@@ -82,15 +82,6 @@ async def test_write_then_read_roundtrip_shape():
 
 
 @pytest.mark.asyncio
-async def test_record_heartbeat_resolved_writes_alert_received_resolved_row():
-    pool = AsyncMock()
-    act = _act(db_pool=pool)
-    await act.record_heartbeat_resolved("aegis-heartbeat:NodeDown:noon")
-    # log_audit inserts into audit_log; assert via the pool call it makes
-    assert pool.execute.await_count + pool.fetchrow.await_count + pool.fetchval.await_count >= 1
-
-
-@pytest.mark.asyncio
 async def test_ping_deadman_noop_without_url():
     result = await _act().ping_deadman()
     assert result == {"pinged": False}

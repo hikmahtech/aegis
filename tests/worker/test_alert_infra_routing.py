@@ -15,7 +15,6 @@ from unittest.mock import AsyncMock
 import pytest
 from aegis_worker.activities.alerts import (
     AlertActivities,
-    build_alert_signature,
     is_infra_alert,
 )
 from aegis_worker.activities.interactions import (
@@ -136,61 +135,6 @@ def test_is_infra_alert_dagster_pipeline_failure():
 # ---------------------------------------------------------------------------
 
 
-def test_build_signature_infra_alert_collapses_by_cluster_alertname():
-    """NodeDown across different instances should map to one signature."""
-    alert_a = {
-        "source": "alertmanager",
-        "service": "node-b",
-        "labels": {"alertname": "NodeDown", "cluster": "homelab-swarm", "instance": "node-b"},
-    }
-    alert_b = {
-        "source": "alertmanager",
-        "service": "node-a",
-        "labels": {"alertname": "NodeDown", "cluster": "homelab-swarm", "instance": "node-a"},
-    }
-    sig_a = build_alert_signature(alert_a)
-    sig_b = build_alert_signature(alert_b)
-    # Both collapse to the same signature (cluster, not instance)
-    assert sig_a == sig_b
-    assert "nodedown" in sig_a
-    assert "homelab-swarm" in sig_a
-    # instance/service NOT in the key
-    assert "node-b" not in sig_a
-    assert "node-a" not in sig_b
-
-
-def test_build_signature_infra_alert_different_alertname_different_sig():
-    alert_nodedown = {
-        "source": "alertmanager",
-        "labels": {"alertname": "NodeDown", "cluster": "homelab-swarm"},
-    }
-    alert_servicedown = {
-        "source": "alertmanager",
-        "labels": {"alertname": "DockerServiceDown", "cluster": "homelab-swarm"},
-    }
-    assert build_alert_signature(alert_nodedown) != build_alert_signature(alert_servicedown)
-
-
-def test_build_signature_sentry_alert_unchanged():
-    """Existing Sentry signature behaviour must not be broken."""
-    alert = {
-        "source": "sentry",
-        "service": "bcp",
-        "raw_payload": {"metadata": {"type": "KeyError", "value": "foo"}},
-    }
-    assert build_alert_signature(alert) == "sentry-class:bcp:KeyError"
-
-
-def test_build_alert_signature_infra_cluster_param():
-    alert = {
-        "source": "alertmanager",
-        "labels": {"alertname": "SomeAppAlert", "cluster": "my-swarm", "instance": "node-a"},
-    }
-    # cluster match only via the explicit param now
-    assert build_alert_signature(alert, infra_cluster="my-swarm").startswith("infra-class:")
-    assert build_alert_signature(alert) != build_alert_signature(alert, infra_cluster="my-swarm")
-
-
 async def test_get_alert_routing_config_activity():
     act = AlertActivities(infra_cluster="homelab-swarm", slack_owner_member_id="U042")
     env = ActivityEnvironment()
@@ -198,18 +142,6 @@ async def test_get_alert_routing_config_activity():
         "infra_cluster": "homelab-swarm",
         "slack_owner_member_id": "U042",
     }
-
-
-def test_build_signature_non_infra_alertmanager_uses_service():
-    """Non-infra alertmanager alerts still key on service."""
-    alert = {
-        "source": "alertmanager",
-        "service": "my-app",
-        "labels": {"alertname": "SomeAppAlert"},
-    }
-    sig = build_alert_signature(alert)
-    assert "my-app" in sig
-    assert "someappalert" in sig
 
 
 # ---------------------------------------------------------------------------
@@ -315,9 +247,6 @@ def _reset_flow(**overrides):
     _flow_state.clear()
     _flow_state.update(
         {
-            "check_dedup_result": {"is_duplicate": False},
-            "delay_result": {"delay_seconds": 0, "reason": "test"},
-            "resolved_check_result": {"resolved": False},
             "resolve_infra_result": {
                 "resource_id": "homelab-res-1",
                 "resource_title": "infra-gitops",
@@ -367,45 +296,12 @@ def _reset_flow(**overrides):
             "score_resource_called": False,
             "run_investigation_called": False,
             "investigate_called": False,
-            "capture_return_id": "real-captured-infra-1",
         }
     )
     _flow_state.update(overrides)
 
 
 # ── Stub activities ──────────────────────────────────────────────────────────
-
-
-@activity.defn(name="check_dedup")
-async def _stub_check_dedup(fingerprint: str, hours: int) -> dict:
-    return _flow_state["check_dedup_result"]
-
-
-@activity.defn(name="find_open_task_for_signature")
-async def _stub_find_open_task(signature: str) -> str | None:
-    return None
-
-
-@activity.defn(name="record_signature_new_task")
-async def _stub_record_new_task(signature: str, task_id: str) -> None:
-    return None
-
-
-@activity.defn(name="record_signature_recurrence")
-async def _stub_record_recurrence(signature: str) -> None:
-    return None
-
-
-@activity.defn(name="get_verification_delay")
-async def _stub_verification_delay(alert: dict) -> dict:
-    return _flow_state["delay_result"]
-
-
-@activity.defn(name="check_alert_resolved")
-async def _stub_check_alert_resolved(
-    fingerprint: str, window_minutes: int, since_iso: str = ""
-) -> dict:
-    return _flow_state["resolved_check_result"]
 
 
 @activity.defn(name="resolve_infra_resource")
@@ -450,11 +346,6 @@ async def _stub_assess_investigation(alert: dict, investigation_output: str) -> 
     return _flow_state["assess_result"]
 
 
-@activity.defn(name="log_alert")
-async def _stub_log_alert(alert: dict) -> None:
-    pass
-
-
 @activity.defn(name="send_system_event")
 async def _stub_send_system_event(msg: str) -> None:
     pass
@@ -467,30 +358,9 @@ async def _stub_send_message(
     _flow_state.setdefault("sends", []).append(agent_id)
 
 
-@activity.defn(name="check_alert_mute")
-async def _stub_check_alert_mute(_inp) -> bool:
-    return False
-
-
-@activity.defn(name="write_alert_mute")
-async def _stub_write_alert_mute(_inp) -> None:
-    pass
-
-
 @activity.defn(name="accumulate_digest_item")
 async def _stub_accumulate_digest_item(payload: dict) -> None:
     pass
-
-
-@activity.defn(name="capture_to_inbox")
-async def _stub_capture_to_inbox(
-    source_tag: str,
-    external_id: str,
-    title: str,
-    description: str | None = None,
-    extra_labels: list[str] | None = None,
-) -> str | None:
-    return _flow_state.get("capture_return_id", "real-captured-1")
 
 
 @activity.defn(name="post_task_note")
@@ -557,16 +427,79 @@ async def _stub_resolve_agents(tags):
     return {t: mapping.get(t) for t in tags}
 
 
+# ── problem hub stubs (PR 3b) ───────────────────────────────────────────────
+# The flow no longer owns an alert's identity: it asks the hub. These stand in
+# for HubActivities; `_HUB["resolved"]` makes `problem_status` report the
+# problem as resolved, `_HUB["investigate"]` is what `ingest_alert` answers.
+_HUB: dict = {
+    "ingest": [],
+    "status": [],
+    "record": [],
+    "mute": [],
+    "resolved": False,
+    "investigate": True,
+    "delay": 0,
+}
+
+
+@activity.defn(name="ingest_alert")
+async def stub_ingest_alert(alert: dict, resolved: bool = False) -> dict:
+    _HUB["ingest"].append((alert.get("fingerprint"), resolved))
+    return {
+        "problem_id": "prob-1",
+        "action": "created",
+        "key": "k",
+        "occurrences": 1,
+        "suppressed": False,
+        "investigate": _HUB["investigate"],
+        "todoist_task_id": alert.get("todoist_task_id") or "task-hub-1",
+    }
+
+
+@activity.defn(name="problem_status")
+async def stub_problem_status(problem_id: str) -> dict:
+    _HUB["status"].append(problem_id)
+    return {
+        "found": True,
+        "status": "resolved" if _HUB["resolved"] else "open",
+        "resolved": _HUB["resolved"],
+        "occurrences": 1,
+        "todoist_task_id": "task-hub-1",
+    }
+
+
+@activity.defn(name="record_investigation")
+async def stub_record_investigation(inp: dict) -> dict:
+    _HUB["record"].append(inp)
+    return {"recorded": True, "status_changed": True}
+
+
+@activity.defn(name="mute_problem")
+async def stub_mute_problem(problem_id: str, hours: float, by: str = "") -> dict:
+    _HUB["mute"].append((problem_id, hours))
+    return {"muted_until": "2026-09-08T12:00:00+00:00"}
+
+
+@activity.defn(name="verification_delay")
+async def stub_verification_delay(alert: dict) -> dict:
+    return {"delay_seconds": _HUB["delay"]}
+
+
+def _hub_reset() -> None:
+    for key in ("ingest", "status", "record", "mute"):
+        _HUB[key].clear()
+    _HUB["resolved"] = False
+    _HUB["investigate"] = True
+    _HUB["delay"] = 0
+
+
 _ALL_FLOW_ACTIVITIES = [
+    stub_ingest_alert,
+    stub_problem_status,
+    stub_record_investigation,
+    stub_mute_problem,
+    stub_verification_delay,
     _stub_resolve_agents,
-    _stub_check_alert_mute,
-    _stub_write_alert_mute,
-    _stub_check_dedup,
-    _stub_find_open_task,
-    _stub_record_new_task,
-    _stub_record_recurrence,
-    _stub_verification_delay,
-    _stub_check_alert_resolved,
     _stub_resolve_infra_resource,
     _stub_resolve_alert_resource,
     _stub_score_resource_relevance,
@@ -574,11 +507,9 @@ _ALL_FLOW_ACTIVITIES = [
     _stub_run_investigation,
     _stub_investigate,
     _stub_assess_investigation,
-    _stub_log_alert,
     _stub_send_system_event,
     _stub_send_message,
     _stub_accumulate_digest_item,
-    _stub_capture_to_inbox,
     _stub_post_task_note,
     _stub_upload_kimi_log,
     _stub_record_verdict_to_kg,

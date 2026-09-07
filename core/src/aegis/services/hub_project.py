@@ -205,6 +205,25 @@ async def _set_task(pool: asyncpg.Pool, problem_id: str, task_id: str) -> None:
     )
 
 
+async def link_task(pool: asyncpg.Pool, problem_id: str, task_id: str) -> bool:
+    """Adopt an existing task (a hand-captured one clarify routed, or the task
+    a chat tool was invoked on) as the problem's task, when it has none. The
+    watermark moves to the latest event: what happened before the link is on
+    the task already in the user's own words. False when the problem already
+    has a task."""
+    p = await get_problem(pool, problem_id)
+    if p is None or p["todoist_task_id"] or not task_id:
+        return False
+    await _set_task(pool, problem_id, task_id)
+    latest = await pool.fetchval(
+        "SELECT COALESCE(max(id), 0) FROM problem_events WHERE problem_id = $1::uuid", problem_id
+    )
+    meta = dict(p["metadata"] or {})
+    meta.update(projected_event_id=int(latest), pending_occurrences=0)
+    await _save_meta(pool, problem_id, meta)
+    return True
+
+
 async def _save_meta(pool: asyncpg.Pool, problem_id: str, meta: dict[str, Any]) -> None:
     await pool.execute("UPDATE problems SET metadata = $2 WHERE id = $1::uuid", problem_id, meta)
 

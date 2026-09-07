@@ -4,7 +4,7 @@ import json
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from aegis_worker.activities.alerts import AlertActivities, build_alert_signature
+from aegis_worker.activities.alerts import AlertActivities
 from temporalio.testing import ActivityEnvironment
 
 from tests.llm_stub import StubbedLLMClient
@@ -35,43 +35,6 @@ def mock_llm():
     return llm
 
 
-async def test_check_dedup_no_match(mock_db_pool):
-    """check_dedup returns False when no recently investigated alert exists."""
-    activities = AlertActivities(db_pool=mock_db_pool)
-    env = ActivityEnvironment()
-    result = await env.run(activities.check_dedup, "fp-123", 24)
-    assert result["is_duplicate"] is False
-    sql = mock_db_pool.fetchrow.call_args[0][0]
-    assert "alert_investigated" in sql
-
-
-async def test_check_dedup_match(mock_db_pool):
-    """check_dedup returns True when recently investigated alert exists."""
-    mock_db_pool.fetchrow.return_value = {"id": "existing"}
-    activities = AlertActivities(db_pool=mock_db_pool)
-    env = ActivityEnvironment()
-    result = await env.run(activities.check_dedup, "fp-123", 24)
-    assert result["is_duplicate"] is True
-
-
-async def test_check_dedup_anchors_on_investigated(mock_db_pool):
-    """check_dedup anchors on 'alert_investigated' — a bare 'alert_received' row
-    is not itself an investigation. The resolved-aware query does reference
-    'alert_received', but only to EXCLUDE a recovery that landed after the
-    latest investigation (a recovery re-arms dedup so a later real incident is
-    not suppressed)."""
-    mock_db_pool.fetchrow.return_value = None
-    activities = AlertActivities(db_pool=mock_db_pool)
-    env = ActivityEnvironment()
-    result = await env.run(activities.check_dedup, "fp-123", 24)
-    assert result["is_duplicate"] is False
-    sql = mock_db_pool.fetchrow.call_args[0][0]
-    assert "alert_investigated" in sql
-    # Resolved-exclusion subquery keys on a resolved alert_received row.
-    assert "alert_received" in sql
-    assert "resolved" in sql
-
-
 async def test_investigate_returns_assessment(mock_db_pool, mock_llm):
     """investigate calls LLM and returns actionability assessment."""
     activities = AlertActivities(db_pool=mock_db_pool, llm_client=mock_llm)
@@ -91,15 +54,6 @@ async def test_investigate_no_llm():
     result = await env.run(activities.investigate, alert, "")
     assert result["investigation"] == "LLM not available"
     assert result["actionable"] is True  # Conservative default
-
-
-async def test_log_alert(mock_db_pool):
-    """log_alert writes to audit_log."""
-    activities = AlertActivities(db_pool=mock_db_pool)
-    env = ActivityEnvironment()
-    alert = {"title": "Test", "severity": "info", "source": "test", "fingerprint": "fp-test"}
-    await env.run(activities.log_alert, alert)
-    mock_db_pool.execute.assert_called_once()
 
 
 async def test_gather_alert_knowledge_prepends_runbook(tmp_path):
@@ -1142,61 +1096,6 @@ async def test_run_investigation_removes_worktree_on_success(mock_db_pool, mock_
     )
 
 
-# --- build_alert_signature: alertmanager dedup signature ---------------------
-
-
-def test_build_alert_signature_alertmanager_stable_across_fingerprints():
-    """An alertmanager alert with service+alertname gets a stable signature,
-    and a SAME logical alert with a DIFFERENT fingerprint collapses onto it."""
-    alert_a = {
-        "source": "alertmanager",
-        "service": "equities_fundamentals_pipeline",
-        "fingerprint": "fp-aaa",
-        "labels": {"alertname": "DagsterRunFailed"},
-    }
-    alert_b = {
-        "source": "alertmanager",
-        "service": "equities_fundamentals_pipeline",
-        "fingerprint": "fp-bbb",  # different fingerprint, same logical alert
-        "labels": {"alertname": "DagsterRunFailed"},
-    }
-    sig_a = build_alert_signature(alert_a)
-    sig_b = build_alert_signature(alert_b)
-    assert sig_a.startswith("alertmanager-class:")
-    assert sig_a != ""
-    assert sig_a == sig_b
-
-
-def test_build_alert_signature_alertmanager_falls_back_to_title_slug():
-    """When no alertname label is present, the signature is derived from a
-    slugified title (still stable, non-empty)."""
-    alert = {
-        "source": "prometheus",
-        "service": "node-a",
-        "title": "Disk usage above 90% on /var partition!!!",
-    }
-    sig = build_alert_signature(alert)
-    assert sig.startswith("prometheus-class:node-a:")
-    assert sig != ""
-    # slugified: lowercased, no punctuation runs
-    assert "!!!" not in sig
-    assert sig == sig.lower()
-
-
-def test_build_alert_signature_sentry_unchanged():
-    """Sentry alerts still produce their sentry-class signature."""
-    alert = {
-        "source": "sentry",
-        "service": "bcp",
-        "raw_payload": {"metadata": {"type": "IncompatiblePeer"}},
-    }
-    assert build_alert_signature(alert) == "sentry-class:bcp:IncompatiblePeer"
-
-
-def test_build_alert_signature_empty_when_nothing_stable():
-    """No service AND no alertname AND no title → empty signature."""
-    alert = {"source": "alertmanager", "fingerprint": "fp-xyz", "labels": {}}
-    assert build_alert_signature(alert) == ""
 
 
 # --- assess_investigation: nested-JSON unwrap + inconclusive guard -----------

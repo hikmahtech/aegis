@@ -322,9 +322,19 @@ def test_module_workflows_is_the_unflagged_registry():
         # activities in each row.
         # Then +1 activity in every row from PR 3a: HubActivities gains
         # `project_pending` (the Todoist projector, unflagged). No new flow.
-        (True, True, 44, 219),
-        (False, False, 36, 185),
-        (True, False, 40, 204),
+        # Then PR 3b: HubActivities gains ingest_alert, problem_status,
+        # record_investigation, mute_problem and stale_stuck_problems (+5,
+        # unflagged) while AlertActivities loses check_dedup,
+        # find_open_task_for_signature, record_signature_recurrence,
+        # record_signature_new_task, log_alert, check_alert_resolved and
+        # get_verification_delay (−7, unflagged), AlertGovernanceActivities
+        # loses check_alert_mute and write_alert_mute (−2, unflagged), and
+        # HomelabActivities loses record_heartbeat_resolved (−1, homelab
+        # flagged). So −4 in every row and one more off the two homelab rows.
+        # ...plus HubActivities.verification_delay (+1, unflagged).
+        (True, True, 44, 215),
+        (False, False, 36, 182),
+        (True, False, 40, 200),
     ],
 )
 def test_real_registration_passes_the_boot_check(homelab, money, flows, activities):

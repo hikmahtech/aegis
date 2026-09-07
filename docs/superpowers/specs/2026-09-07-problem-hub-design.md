@@ -1,7 +1,7 @@
 # Problem hub: one record for every alert, investigation and session
 
 **Date:** 2026-09-07
-**Status:** proposed design, not yet implemented
+**Status:** approved; PRs 1, 2, 3a and 3b shipped (see §12)
 
 ## Problem
 
@@ -547,7 +547,7 @@ it replaces, so the tree never carries two ways to do one thing.
 | 1 | Migration 030 (`problems`, `problem_events`, `problem_links`), `hub.py` (ingest, correlate, transitions, `event_from_alert`), `POST /api/hub/events`, `auth.alert_token_ok` shared with the alert webhook, tests, coverage gate. Dark: no producer calls it. | nothing |
 | 2 | Migration 031 `service_state`; suppression and promotion in `hub.py`; `POST /api/hub/service-state`; the Ansible hook (homelab-gitops PR); `set_service_state` tool; `HubSweepFlow` (promotes expired suppressions); heartbeat converge-clear. | active-work guard, `activework/`, `ActiveWorkActivities`, `active_work_lookback_hours` |
 | 3a | The projector (`services/hub_project.py`): task creation through the idempotent capture, collapsed occurrence comments, close on resolve / reopen on recurrence, the status block; `HubSweepFlow` projects what is pending; `load_task_context` reads the problem behind a task so the infra verb no longer parses titles. | nothing (dark until 3b: the hub still has no alert producer) |
-| 3b | Alertmanager, Sentry, heartbeat and clarify producers call `ingest_event`; `AlertInvestigationFlow` takes `problem_id`; backfill script. | `alert_dedup_index`, `alert_mutes` (alert pipeline's use), `alert_digest_buffer` skip types, `infra_heartbeat_state` re-investigation maps, steps 1–2.8, `check_dedup`, `build_alert_signature`, `close_task_for_resolved_alert`, `log_alert`, `check_alert_resolved`, the title-regex `get_verification_delay` |
+| 3b | Alertmanager, Sentry and heartbeat producers call `ingest_alert`; clarify and `investigate_resource` keep starting the flow, whose step 0 ingests for them; `AlertInvestigationFlow` takes `problem_id`; `scripts/hub_backfill.py`. | `alert_mutes` (alert pipeline's use), `infra_heartbeat_state` re-investigation maps, steps 1–2.8, `check_dedup`, `build_alert_signature`, `close_task_for_resolved_alert`, `log_alert`, `check_alert_resolved`, `record_heartbeat_resolved`, the title-regex `get_verification_delay`. `alert_dedup_index` is unread from here and dropped in PR 6, after the backfill has read its recurrence counts. |
 | 4 | Flow health, delivery, drift, cert, expiry, social, LLM governor producers. | three copies of the `audit_log` dedupe SQL, the hand-rolled comms task, `homelab_drift.alert_key` day bucket, `cert_expiry.last_alert_threshold`, `ServiceDriftFlow.recheck_delay_seconds`, `FlowHealthConfig.min_stale_minutes` |
 | 5 | `work_sessions` columns, `account` at resume, `task_context`, `report_progress`, `merge_problems`, status block, subtasks from plans, collision as lookup, GitHub-issue projection for `repo` subjects. | SSH git-context fan-out, LLM same-task judge, `_own_session_owner`, `hand_to_you`, `STATUS:` scraping into `result_summary`, title parsing in `_run_infra` |
 | 6 | Admin Problems page, digest from events, `CleanupFlow` close and re-project sweeps. | `build_alert_digest`'s buffer reader |

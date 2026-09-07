@@ -9,7 +9,6 @@ listing entirely (#131); the confirmed-stuck re-investigation (#138).
 from __future__ import annotations
 
 import uuid
-from datetime import datetime, timedelta
 
 from temporalio import activity, workflow
 from temporalio.testing import WorkflowEnvironment
@@ -49,9 +48,28 @@ async def _write(state: dict) -> None:
     _calls["written"].append(state)
 
 
-@activity.defn(name="record_heartbeat_resolved")
-async def _resolved(fingerprint: str) -> None:
-    _calls["resolved"].append(fingerprint)
+@activity.defn(name="ingest_alert")
+async def _ingest(alert: dict, resolved: bool = False) -> dict:
+    """The hub. A resolved transition lands in `_calls["resolved"]` by
+    fingerprint (what the old resolved-row activity recorded); a firing one
+    is always a new, investigable problem here."""
+    if resolved:
+        _calls["resolved"].append(alert["fingerprint"])
+        return {"problem_id": "prob-r", "action": "resolved", "investigate": False}
+    _calls.setdefault("ingested", []).append(alert["fingerprint"])
+    return {
+        "problem_id": f"prob-{alert['fingerprint']}",
+        "action": "created",
+        "investigate": True,
+        "occurrences": 1,
+        "todoist_task_id": None,
+    }
+
+
+@activity.defn(name="stale_stuck_problems")
+async def _stale(subjects: list[str], hours: float) -> list[dict]:
+    _calls.setdefault("stale_queries", []).append((list(subjects), hours))
+    return [r for r in _state.get("stale", []) if r["subject"] in subjects]
 
 
 @activity.defn(name="ping_deadman")
@@ -84,7 +102,7 @@ class _StubAlertFlow:
         return {"status": "stub"}
 
 
-_ACTS = [_collect, _read, _write, _resolved, _ping, _routing, _quiet_notify, _clear_deploys]
+_ACTS = [_collect, _read, _write, _ingest, _stale, _ping, _routing, _quiet_notify, _clear_deploys]
 
 
 async def _run(config: InfraHeartbeatConfig | None = None) -> dict:
@@ -168,17 +186,13 @@ async def test_stuck_service_needs_two_consecutive_ticks():
     assert alert["escalate"] is False
 
 
-async def test_confirmed_stuck_service_recovery_writes_resolved():
-    """Both fingerprints: a service that was re-investigated (#138) owns a live
-    ServiceDownProlonged escalation as well, and it needs its own resolved row
-    or it keeps nagging after the outage is over."""
+async def test_confirmed_stuck_service_recovery_resolves_the_problem():
+    """One problem per service on the hub: DockerServiceDown and its PROLONGED
+    re-investigations share it, so one resolve ends both."""
     prior = {"nodes": {}, "stuck": ["svc_a"], "confirmed": ["svc_a"], "fail_count": 0}
     _reset({"ok": True, "nodes": {}, "stuck": [], "error": ""}, prior)
     await _run()
-    assert _calls["resolved"] == [
-        _hb_fingerprint("DockerServiceDown", "svc_a"),
-        _hb_fingerprint("ServiceDownProlonged", "svc_a"),
-    ]
+    assert _calls["resolved"] == [_hb_fingerprint("DockerServiceDown", "svc_a")]
 
 
 async def test_collect_failure_threshold_fires_once_and_no_ping():
@@ -249,20 +263,6 @@ async def test_non_quiet_node_still_alerts_when_quiet_list_set():
     assert result["alerts_spawned"] == 1
     assert _calls["spawned"][0]["fingerprint"] == _hb_fingerprint("NodeDown", "noon")
     assert _calls["quiet"] == []
-
-
-def _backdate(state: dict, key: str, svc: str, hours: float) -> dict:
-    """Rewind one per-service clock in a state dict the flow itself wrote.
-
-    Reads back the stamp `workflow.now()` produced instead of inventing one
-    from pytest's clock, so these tests don't depend on the time-skipping test
-    server sharing a wall clock with the test process.
-    """
-    out = {**state, key: dict(state.get(key) or {})}
-    out[key][svc] = (
-        datetime.fromisoformat(out[key][svc]) - timedelta(hours=hours)
-    ).isoformat()
-    return out
 
 
 # --------------------------------------------------------------------------
@@ -337,117 +337,78 @@ async def test_empty_node_listing_keeps_the_last_good_node_map():
 # --------------------------------------------------------------------------
 
 
-async def test_confirmed_stuck_service_reinvestigates_once_not_every_tick():
-    """miniflux_miniflux sat `confirmed` for >24h with no retry and nobody told.
+# --------------------------------------------------------------------------
+# #138 — a confirmed-stuck service is re-investigated on the hub's say-so
+# --------------------------------------------------------------------------
 
-    Asserts the COUNT across three consecutive polls: the re-investigation must
-    fire exactly once, not once every 2 minutes.
-    """
+
+async def test_stale_stuck_service_is_reinvestigated_on_its_own_problem():
     svc = "miniflux_miniflux"
     collect = {"ok": True, "nodes": {"baa": "Ready"}, "stuck": [svc], "error": ""}
-
-    # Tick 1 — already confirmed when this code shipped: clock starts now.
     prior = {"nodes": {}, "stuck": [svc], "confirmed": [svc], "fail_count": 0}
     _reset(collect, prior)
-    first = await _run()
-    assert first["services_reinvestigated"] == 0
-    assert _calls["spawned"] == []
-    seeded = _calls["written"][0]
-    assert svc in seeded["confirmed_at"]
-
-    # Tick 2 — same service, 30h of being stuck later.
-    aged = _backdate(seeded, "confirmed_at", svc, 30)
-    _reset(collect, aged)
-    second = await _run()
-    assert second["services_reinvestigated"] == 1
+    _state["stale"] = [{"id": "prob-old", "subject": svc, "hours": 30.0}]
+    result = await _run()
+    assert result["services_reinvestigated"] == 1
+    assert _calls["stale_queries"] == [([svc], 24.0)]
     assert len(_calls["spawned"]) == 1
     alert = _calls["spawned"][0]
     assert alert["labels"]["alertname"] == "ServiceDownProlonged"
     assert alert["labels"]["service_name"] == svc
-    assert alert["fingerprint"] == _hb_fingerprint("ServiceDownProlonged", svc)
+    assert alert["problem_id"] == "prob-old"
     assert alert["escalate"] is True
-    after = _calls["written"][0]
-    assert svc in after["reinvestigated_at"]
-
-    # Tick 3 — the very next poll, still stuck, still past the threshold.
-    _reset(collect, after)
-    third = await _run()
-    assert third["services_reinvestigated"] == 0
-    assert _calls["spawned"] == []
+    # a re-investigation is not a new occurrence: nothing was ingested for it
+    assert _calls.get("ingested", []) == []
+    # and the state row carries no clocks any more
+    assert "confirmed_at" not in _calls["written"][0]
 
 
-async def test_service_confirmed_recently_is_not_reinvestigated():
-    """The threshold itself: 2h of being stuck is not `restuck_hours`. Without
-    it every confirmed service would re-alert on the tick after confirmation —
-    exactly the 2-minute noise transition-only logic exists to avoid."""
+async def test_hub_says_nothing_is_stale_so_nothing_is_reinvestigated():
     svc = "koyra-drwhome_drwhome-jobs"
     collect = {"ok": True, "nodes": {"baa": "Ready"}, "stuck": [svc], "error": ""}
     prior = {"nodes": {}, "stuck": [svc], "confirmed": [svc], "fail_count": 0}
     _reset(collect, prior)
-    await _run()
-    aged = _backdate(_calls["written"][0], "confirmed_at", svc, 2)
-    _reset(collect, aged)
-    result = await _run(InfraHeartbeatConfig(restuck_hours=24))
+    result = await _run()
     assert result["services_reinvestigated"] == 0
+    assert _calls["stale_queries"] == [([svc], 24.0)]
     assert _calls["spawned"] == []
 
 
-async def test_reinvestigation_repeats_after_the_dedup_window_expires():
-    """The ratchet is a delay, not a permanent silence."""
-    svc = "ollama_ollama-2"
-    collect = {"ok": True, "nodes": {"baa": "Ready"}, "stuck": [svc], "error": ""}
-    prior = {
-        "nodes": {},
-        "stuck": [svc],
-        "confirmed": [svc],
-        "confirmed_at": {},
-        "reinvestigated_at": {},
-        "fail_count": 0,
-    }
-    _reset(collect, prior)
-    await _run()
-    aged = _backdate(_calls["written"][0], "confirmed_at", svc, 60)
-    _reset(collect, aged)
-    await _run()
-    once = _calls["written"][0]
-    assert once["reinvestigated_at"][svc]
-
-    # Another 30h with no recovery.
-    aged_again = _backdate(once, "reinvestigated_at", svc, 30)
-    _reset(collect, aged_again)
-    again = await _run()
-    assert again["services_reinvestigated"] == 1
-    assert len(_calls["spawned"]) == 1
-    assert _calls["spawned"][0]["labels"]["alertname"] == "ServiceDownProlonged"
-
-
-async def test_restuck_hours_zero_disables_reinvestigation():
+async def test_restuck_hours_zero_never_asks_the_hub():
     svc = "koyracloud_redis"
     collect = {"ok": True, "nodes": {"baa": "Ready"}, "stuck": [svc], "error": ""}
     prior = {"nodes": {}, "stuck": [svc], "confirmed": [svc], "fail_count": 0}
     _reset(collect, prior)
-    await _run(InfraHeartbeatConfig(restuck_hours=0))
-    aged = _backdate(_calls["written"][0], "confirmed_at", svc, 240)
-    _reset(collect, aged)
+    _state["stale"] = [{"id": "prob-old", "subject": svc, "hours": 240.0}]
     result = await _run(InfraHeartbeatConfig(restuck_hours=0))
     assert result["services_reinvestigated"] == 0
+    assert "stale_queries" not in _calls
     assert _calls["spawned"] == []
 
 
-async def test_recovered_service_drops_its_clocks():
-    """A service that recovers must lose confirmed_at/reinvestigated_at, or a
-    later re-break would inherit a stale clock and re-investigate instantly."""
-    svc = "svc_flappy"
-    prior = {
-        "nodes": {"baa": "Ready"},
-        "stuck": [svc],
-        "confirmed": [svc],
-        "confirmed_at": {svc: "2026-01-01T00:00:00+00:00"},
-        "reinvestigated_at": {svc: "2026-01-01T00:00:00+00:00"},
-        "fail_count": 0,
-    }
-    _reset({"ok": True, "nodes": {"baa": "Ready"}, "stuck": [], "error": ""}, prior)
-    await _run()
-    written = _calls["written"][0]
-    assert written["confirmed_at"] == {}
-    assert written["reinvestigated_at"] == {}
+async def test_firing_transition_the_hub_declines_spawns_nothing():
+    """A repeat the hub attaches (investigate=False) starts no child."""
+    _reset({"ok": True, "nodes": {"baa": "Ready", "noon": "Down"}, "stuck": [], "error": ""})
+
+    @activity.defn(name="ingest_alert")
+    async def _decline(alert: dict, resolved: bool = False) -> dict:
+        return {"problem_id": "prob-x", "action": "attached", "investigate": False}
+
+    acts = [a for a in _ACTS if a is not _ingest] + [_decline]
+    async with (
+        await WorkflowEnvironment.start_time_skipping() as env,
+        Worker(
+            env.client,
+            task_queue=f"hb-{uuid.uuid4()}",
+            workflows=[InfraHeartbeatFlow, _StubAlertFlow],
+            activities=acts,
+        ) as worker,
+    ):
+        result = await env.client.execute_workflow(
+            InfraHeartbeatFlow.run,
+            InfraHeartbeatConfig(),
+            id=f"hb-{uuid.uuid4()}",
+            task_queue=worker.task_queue,
+        )
+    assert result["alerts_spawned"] == 0
+    assert _calls["spawned"] == []

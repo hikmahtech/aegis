@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import uuid
 from contextlib import asynccontextmanager
 from unittest.mock import AsyncMock, MagicMock
 
@@ -32,6 +33,33 @@ def settings():
 
 
 @pytest.fixture
+def fake_hub(monkeypatch):
+    """The problem hub without a database: one problem per fingerprint, a
+    repeat of the same occurrence id is a duplicate, a resolved event with no
+    problem is ignored, and nothing is projected. Lets the token / size / cap
+    tests keep their mock pool."""
+    from aegis.services.hub import IngestResult
+
+    seen: set[str] = set()
+
+    async def _ingest(pool, event, *, now=None):
+        fp = event.payload.get("fingerprint") or "x"
+        if event.kind == "resolved":
+            return IngestResult(None, "ignored", "k")
+        if event.external_id in seen:
+            return IngestResult(f"prob-{fp}", "duplicate", "k")
+        seen.add(event.external_id)
+        return IngestResult(f"prob-{fp}", "created", "k", occurrences=1)
+
+    async def _project(pool, problem_id, **kw):
+        return {"task_id": None}
+
+    monkeypatch.setattr("aegis.api.routes.webhooks.ingest_event", _ingest)
+    monkeypatch.setattr("aegis.services.hub_project.project", _project)
+    return seen
+
+
+@pytest.fixture
 def temporal_stub():
     handle = MagicMock()
     handle.id = "wf-alert-1"
@@ -56,9 +84,9 @@ def _mock_pool(fetchval_return=None):
 
 
 @pytest_asyncio.fixture(loop_scope="function")
-async def alert_client(settings, temporal_stub):
-    """Mock-pool client; fetchval returns the fingerprint (claim succeeds)."""
-    pool, _ = _mock_pool(fetchval_return="am-test-1")
+async def alert_client(settings, temporal_stub, fake_hub):
+    """Mock-pool client over the fake hub."""
+    pool, _ = _mock_pool()
     app = create_app(run_lifespan=False)
     app.state.db_pool = pool
     app.dependency_overrides[get_settings] = lambda: settings
@@ -87,12 +115,13 @@ async def test_alertmanager_firing_spawns_flow(alert_client):
     temporal.start_workflow.assert_awaited_once()
     call = temporal.start_workflow.call_args
     assert call.args[0] == "AlertInvestigationFlow"
-    assert call.kwargs["id"] == "alertmanager-am-test-1"
+    assert call.kwargs["id"] == "investigate-prob-am-test-1-1"
     assert call.kwargs["task_queue"] == "aegis-main"
     alert = call.args[1]
     assert alert["source"] == "alertmanager"
     assert alert["severity"] == "critical"
     assert alert["service"] == "node-a"
+    assert alert["problem_id"] == "prob-am-test-1"
 
 
 async def test_resolved_alert_skipped(alert_client):
@@ -108,10 +137,10 @@ async def test_resolved_alert_skipped(alert_client):
     temporal.start_workflow.assert_not_awaited()
 
 
-async def test_duplicate_fingerprint_skipped(settings, temporal_stub):
-    """First call claims the row (fetchval returns value); second returns None."""
-    # First call: fetchval returns fingerprint string (INSERT succeeded)
-    pool_first, conn_first = _mock_pool(fetchval_return="am-dup-1")
+async def test_duplicate_fingerprint_skipped(settings, temporal_stub, fake_hub):
+    """The same occurrence (fingerprint + startsAt) twice: the hub reports a
+    duplicate the second time and nothing starts."""
+    pool_first, conn_first = _mock_pool()
     app = create_app(run_lifespan=False)
     app.state.db_pool = pool_first
     app.dependency_overrides[get_settings] = lambda: settings
@@ -125,6 +154,7 @@ async def test_duplicate_fingerprint_skipped(settings, temporal_stub):
                     "labels": {"alertname": "Mem", "instance": "node-a"},
                     "annotations": {"summary": "memory"},
                     "fingerprint": "am-dup-1",
+                    "startsAt": "2026-09-07T10:00:00Z",
                 }
             ]
         }
@@ -167,18 +197,9 @@ async def test_bad_json_returns_400(alert_client):
     assert resp.status_code == 400
 
 
-async def test_multiple_alerts_mixed_status(settings, temporal_stub):
+async def test_multiple_alerts_mixed_status(settings, temporal_stub, fake_hub):
     """Two firing + one resolved: started=2, skipped=1."""
-    # fetchval returns non-None twice for the two firing alerts
-    conn = AsyncMock()
-    conn.fetchval = AsyncMock(side_effect=["m1", "m2"])
-
-    @asynccontextmanager
-    async def _acquire():
-        yield conn
-
-    pool = MagicMock()
-    pool.acquire = _acquire
+    pool, _ = _mock_pool()
 
     app = create_app(run_lifespan=False)
     app.state.db_pool = pool
@@ -210,7 +231,7 @@ async def test_bare_single_alert_dict_handled(alert_client):
     resp = await c.post("/api/webhooks/alert", content=json.dumps(payload))
     assert resp.json()["started"] == 1
     call = temporal.start_workflow.call_args
-    assert call.kwargs["id"] == "alertmanager-single-1"
+    assert call.kwargs["id"] == "investigate-prob-single-1-1"
 
 
 # ---------------------------------------------------------------------------
@@ -226,50 +247,44 @@ async def alert_client_real_db(db_pool, settings, temporal_stub):
     app.dependency_overrides[get_workflow_client] = lambda: temporal_stub
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
         yield c, temporal_stub
-    async with db_pool.acquire() as conn:
-        await conn.execute("DELETE FROM ingest_idempotency WHERE source_type = 'alertmanager'")
 
 
-async def test_resolved_alert_writes_resolved_audit_row(alert_client_real_db, db_pool):
-    """A `status=resolved` alertmanager payload is skipped for investigation but
-    now writes an `alert_received`/resolved=true audit row so check_alert_resolved
-    (self-resolve) works for alertmanager alerts, not just heartbeat ones."""
+async def test_firing_then_resolved_lands_on_one_problem(alert_client_real_db, db_pool):
+    """A firing payload creates the problem and starts the investigation; the
+    `status=resolved` payload for the same alert resolves that problem and
+    starts nothing."""
     client, temporal = alert_client_real_db
-    fp = "am-resolved-audit-1"
-    async with db_pool.acquire() as conn:
-        await conn.execute("DELETE FROM audit_log WHERE target_id = $1", fp)
+    fp = f"am-{uuid.uuid4().hex[:10]}"
+    firing = {
+        "status": "firing",
+        "labels": {"alertname": "HighCPU", "instance": fp},
+        "fingerprint": fp,
+        "startsAt": "2026-09-07T10:00:00Z",
+    }
+    resp = await client.post("/api/webhooks/alert", content=json.dumps({"alerts": [firing]}).encode())
+    assert resp.json() == {"accepted": True, "started": 1, "skipped": 0, "dropped": 0}
+    problem_id = temporal.start_workflow.call_args.args[1]["problem_id"]
+    assert temporal.start_workflow.call_args.kwargs["id"] == f"investigate-{problem_id}-1"
 
-    payload = json.dumps(
-        {"alerts": [{"status": "resolved", "labels": {"alertname": "HighCPU"}, "fingerprint": fp}]}
-    ).encode()
-    resp = await client.post("/api/webhooks/alert", content=payload)
+    resolved = {**firing, "status": "resolved", "endsAt": "2026-09-07T10:30:00Z"}
+    resp = await client.post("/api/webhooks/alert", content=json.dumps({"alerts": [resolved]}).encode())
     assert resp.json() == {"accepted": True, "started": 0, "skipped": 1, "dropped": 0}
-    temporal.start_workflow.assert_not_awaited()
-
-    async with db_pool.acquire() as conn:
-        row = await conn.fetchrow(
-            "SELECT actor, action, details FROM audit_log "
-            "WHERE target_id = $1 AND action = 'alert_received'",
-            fp,
-        )
-    assert row is not None
-    assert row["actor"] == "alert:alertmanager"
-    details = row["details"]
-    if isinstance(details, str):
-        details = json.loads(details)
-    assert details.get("resolved") == "true"
-
-    async with db_pool.acquire() as conn:
-        await conn.execute("DELETE FROM audit_log WHERE target_id = $1", fp)
+    assert temporal.start_workflow.await_count == 1
+    row = await db_pool.fetchrow(
+        "SELECT status, occurrences FROM problems WHERE id = $1::uuid", problem_id
+    )
+    assert row["status"] == "resolved" and row["occurrences"] == 1
 
 
 async def test_duplicate_fingerprint_real_db(alert_client_real_db):
     client, temporal = alert_client_real_db
+    fp = f"am-real-dup-{uuid.uuid4().hex[:8]}"
     alert = {
         "status": "firing",
-        "labels": {"alertname": "RealDup", "instance": "node-a"},
+        "labels": {"alertname": "RealDup", "instance": fp},
         "annotations": {"summary": "real dup test"},
-        "fingerprint": "am-real-dup-1",
+        "fingerprint": fp,
+        "startsAt": "2026-09-07T10:00:00Z",
     }
     payload = json.dumps({"alerts": [alert]}).encode()
     r1 = await client.post("/api/webhooks/alert", content=payload)
@@ -290,13 +305,13 @@ async def test_duplicate_fingerprint_real_db(alert_client_real_db):
 
 
 @pytest_asyncio.fixture(loop_scope="function")
-async def token_client(temporal_stub):
+async def token_client(temporal_stub, fake_hub):
     """Client factory parametrised by the configured secret."""
 
     @asynccontextmanager
     async def _build(secret: str):
         settings = Settings(**{**_TEST_SETTINGS, "alert_webhook_secret": secret})
-        pool, _ = _mock_pool(fetchval_return="tok-1")
+        pool, _ = _mock_pool()
         app = create_app(run_lifespan=False)
         app.state.db_pool = pool
         app.dependency_overrides[get_settings] = lambda: settings
