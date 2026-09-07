@@ -130,6 +130,46 @@ export const api = {
   deletePerson: (id: string) =>
     apiFetch<any>(`/api/admin/people/${id}`, { method: 'DELETE' }),
 
+  // The problem hub (services/hub.py). Every mutation below is the same
+  // function the chat tools and the worker call, so the page cannot grow a
+  // second idea of what a transition means.
+  listProblems: (params?: { status?: string; subject?: string; includeClosed?: boolean }) => {
+    const q = new URLSearchParams();
+    if (params?.status) q.set('status', params.status);
+    if (params?.subject) q.set('subject', params.subject);
+    if (params?.includeClosed) q.set('include_closed', 'true');
+    q.set('limit', '200');
+    return apiFetch<{ problems: any[] }>(`/api/admin/problems?${q.toString()}`);
+  },
+  getProblem: (id: string) => apiFetch<any>(`/api/admin/problems/${id}`),
+  problemDigest: (hours = 24) =>
+    apiFetch<any>(`/api/admin/problems/digest?hours=${hours}`),
+  muteProblem: (id: string, hours: number) =>
+    apiFetch<any>(`/api/admin/problems/${id}/mute`, {
+      method: 'POST',
+      body: JSON.stringify({ hours }),
+    }),
+  resolveProblem: (id: string, reason: string) =>
+    apiFetch<any>(`/api/admin/problems/${id}/resolve`, {
+      method: 'POST',
+      body: JSON.stringify({ reason }),
+    }),
+  closeProblem: (id: string) =>
+    apiFetch<any>(`/api/admin/problems/${id}/close`, { method: 'POST' }),
+  mergeProblems: (keepId: string, mergeId: string) =>
+    apiFetch<any>(`/api/admin/problems/${keepId}/merge`, {
+      method: 'POST',
+      body: JSON.stringify({ merge_id: mergeId }),
+    }),
+  listServiceState: () => apiFetch<{ windows: any[] }>('/api/admin/service-state'),
+  setServiceState: (body: {
+    subject: string;
+    state: string;
+    subject_kind?: string;
+    minutes?: number;
+    note?: string;
+  }) => apiFetch<any>('/api/admin/service-state', { method: 'PUT', body: JSON.stringify(body) }),
+
   // Expiry radar registry (life.expiring_items — passports, policies, warranties)
   listExpiringItems: (params?: { kind?: string; dueWithin?: number }) => {
     const q = new URLSearchParams();

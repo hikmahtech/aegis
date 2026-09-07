@@ -10,6 +10,8 @@ const P: Record<string, JSX.Element> = {
   // ── Navigation ──────────────────────────────────────────────────────────
   overview: <><rect x="3" y="3" width="7" height="9" rx="1.5" /><rect x="14" y="3" width="7" height="5" rx="1.5" /><rect x="14" y="12" width="7" height="9" rx="1.5" /><rect x="3" y="16" width="7" height="5" rx="1.5" /></>,
   inbox: <><path d="M4 13h4l1.5 3h5L16 13h4" /><path d="M5.5 5h13l2.5 8v5a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-5z" /></>,
+  // A siren: what the hub raises. Two arcs and a body, legible at 16px.
+  problems: <><path d="M12 4a5 5 0 0 0-5 5v6h10V9a5 5 0 0 0-5-5z" /><path d="M4.5 19h15" /><path d="M3 8.5 4.8 7" /><path d="M21 8.5 19.2 7" /><path d="M12 2v1.5" /></>,
   workflows: <><circle cx="6" cy="5" r="2.5" /><circle cx="18" cy="12" r="2.5" /><circle cx="6" cy="19" r="2.5" /><path d="M6 7.5v9" /><path d="M8.5 5H13a2.5 2.5 0 0 1 2.5 2.5v2" /><path d="M8.5 19H13a2.5 2.5 0 0 0 2.5-2.5v-2" /></>,
   chat: <><path d="M20 15a2 2 0 0 1-2 2H8l-4 4V6a2 2 0 0 1 2-2h12a2 2 0 0 1 2 2z" /></>,
   knowledge: <><path d="M4 5.5A2.5 2.5 0 0 1 6.5 3H19v15H6.5A2.5 2.5 0 0 0 4 20.5z" /><path d="M4 18.5A2.5 2.5 0 0 1 6.5 21H19" /><path d="M8.5 7.5h6" /><path d="M8.5 11h4" /></>,
