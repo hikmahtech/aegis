@@ -462,7 +462,7 @@ class AgentTaskFlow:
 
             if verb == "infra":
                 step = "run_infra"
-                return await self._run_infra(input, task_id)
+                return await self._run_infra(input, task_id, context)
 
             if verb == "email":
                 step = "run_email"
@@ -531,16 +531,17 @@ class AgentTaskFlow:
 
         return {"task_id": task_id, "verb": verb, "status": "parked"}
 
-    async def _run_infra(self, input: AgentTaskFlowInput, task_id: str) -> dict:
+    async def _run_infra(self, input: AgentTaskFlowInput, task_id: str, context: dict) -> dict:
         """Check live service state; investigate and gate a restart if broken.
 
-        Deliberately does NOT replay alert history: only 12 of 42 open #alert
-        tasks have an alert_dedup_index row, and the 30 without one are exactly
-        the PROLONGED bulk. Every such title names a service, so asking Docker
-        about current state covers all of them.
+        A task the problem hub projected carries its subject in `context`
+        (`problems.subject`); a hand-written one falls back to parsing the
+        title, which every alert title names a service in. Neither path
+        replays alert history: asking Docker about the current state covers
+        both.
         """
         title = str(input.task.get("content") or "")
-        service = extract_service_name(title)
+        service = str((context or {}).get("subject") or "") or extract_service_name(title)
         if not service:
             await workflow.execute_activity(
                 "comment",

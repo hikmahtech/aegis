@@ -8,7 +8,7 @@ SQL of its own.
 from __future__ import annotations
 
 import asyncpg
-from aegis.services import hub
+from aegis.services import hub, hub_project
 from temporalio import activity
 
 
@@ -24,6 +24,19 @@ class HubActivities:
             return {"promoted": 0, "problem_ids": []}
         ids = await hub.promote_expired_suppressions(self.db_pool)
         return {"promoted": len(ids), "problem_ids": ids}
+
+    @activity.defn
+    async def project_pending(self) -> dict:
+        """Bring every problem's Todoist task up to date with its events
+        (`hub_project.project_pending`). Run by `HubSweepFlow`."""
+        if self.db_pool is None:
+            return {"projected": 0, "created": 0, "errors": 0}
+        results = await hub_project.project_pending(self.db_pool)
+        return {
+            "projected": sum(1 for r in results if "skipped" not in r and "error" not in r),
+            "created": sum(1 for r in results if r.get("created")),
+            "errors": sum(1 for r in results if "error" in r),
+        }
 
     @activity.defn
     async def clear_converged_deploys(self, stuck_services: list[str]) -> dict:

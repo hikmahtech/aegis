@@ -16,7 +16,7 @@ from temporalio import workflow
 
 with workflow.unsafe.imports_passed_through():
     from aegis_worker.activities.hub import HubActivities
-    from aegis_worker.shared.retry import FAST, TIMEOUT_FAST
+    from aegis_worker.shared.retry import FAST, NO_RETRY, TIMEOUT_FAST, TIMEOUT_STANDARD
 
 
 @dataclass
@@ -33,4 +33,17 @@ class HubSweepFlow:
             start_to_close_timeout=TIMEOUT_FAST,
             retry_policy=FAST,
         )
-        return {"promoted": int(promoted.get("promoted") or 0)}
+        # Then project: a problem promoted a moment ago gets its task in the
+        # same tick, and any comment a producer's inline projection could not
+        # post is retried here.
+        projected = await workflow.execute_activity_method(
+            HubActivities.project_pending,
+            start_to_close_timeout=TIMEOUT_STANDARD,
+            retry_policy=NO_RETRY,
+        )
+        return {
+            "promoted": int(promoted.get("promoted") or 0),
+            "projected": int(projected.get("projected") or 0),
+            "created": int(projected.get("created") or 0),
+            "errors": int(projected.get("errors") or 0),
+        }

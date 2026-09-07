@@ -320,9 +320,11 @@ def test_module_workflows_is_the_unflagged_registry():
         # are unflagged, and the same PR deletes ActiveWorkActivities'
         # single `check_active_work` — so +1/+1/+1 flows, and +2−1 = +1
         # activities in each row.
-        (True, True, 44, 218),
-        (False, False, 36, 184),
-        (True, False, 40, 203),
+        # Then +1 activity in every row from PR 3a: HubActivities gains
+        # `project_pending` (the Todoist projector, unflagged). No new flow.
+        (True, True, 44, 219),
+        (False, False, 36, 185),
+        (True, False, 40, 204),
     ],
 )
 def test_real_registration_passes_the_boot_check(homelab, money, flows, activities):

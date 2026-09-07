@@ -423,3 +423,13 @@ class TodoistConnector(HTTPConnector):
             "uuid": str(uuid.uuid4()),
             "args": {"id": item_id},
         }
+
+    @staticmethod
+    def build_item_uncomplete_command(item_id: str) -> dict:
+        """item_uncomplete — reopen a completed task. The problem hub uses it
+        when a problem recurs inside its reopen window after its task closed."""
+        return {
+            "type": "item_uncomplete",
+            "uuid": str(uuid.uuid4()),
+            "args": {"id": item_id},
+        }

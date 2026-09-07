@@ -133,4 +133,4 @@ jobs:
       # so 90% is cheap, and every spoke that migrates onto it inherits the
       # gate. Ratchet the per-package threshold up as spokes move; never down.
       - name: Hub coverage gate
-        run: pytest tests/core/test_hub_correlate.py tests/core/test_hub_transitions.py tests/core/test_hub_ingest.py tests/core/test_hub_route.py tests/core/test_hub_service_state.py tests/core/test_tools_hub.py -p no:cacheprovider --timeout=300 --tb=short --cov=aegis.services.hub --cov-fail-under=90 --cov-report=term-missing
+        run: pytest tests/core/test_hub_correlate.py tests/core/test_hub_transitions.py tests/core/test_hub_ingest.py tests/core/test_hub_route.py tests/core/test_hub_service_state.py tests/core/test_tools_hub.py tests/core/test_hub_project.py -p no:cacheprovider --timeout=300 --tb=short --cov=aegis.services.hub --cov=aegis.services.hub_project --cov-fail-under=90 --cov-report=term-missing
