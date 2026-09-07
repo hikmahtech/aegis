@@ -248,6 +248,49 @@ def test_airtel_receipt():
 
 
 @pytest.mark.parametrize(
+    "name",
+    [
+        "axis_card_spend",
+        "axis_autopay_done",
+        "axis_autopay_reminder",
+        "axis_cc_statement",
+        "gpay_bill",
+        "stripe_receipt",
+        "apple_receipt",
+        "airtel_bill",
+        "airtel_receipt",
+    ],
+)
+def test_parsers_whose_mail_carries_no_bank_reference_leave_ref_empty(name):
+    """The #433 audit, pinned: these nine mails carry no transaction reference.
+
+    `ref` is the exact-match key against the reference inside a bank statement
+    narration (the UPI RRN, the IMPS reference, the NEFT/RTGS UTR). It is only
+    worth setting when the email quotes that same number. These fixtures are
+    the real 2026-09 mail, and none of them does:
+
+    - the dues (`axis_autopay_reminder`, `axis_cc_statement`, `gpay_bill`,
+      `airtel_bill`) describe money that has not moved yet, so no reference
+      exists at all;
+    - `axis_card_spend` quotes merchant, amount, card tail and available
+      limit — no approval code or RRN;
+    - `axis_autopay_done` quotes an `AutoPay ID`, which is the e-mandate id,
+      identical for every month of the subscription — a wrong exact-match
+      key, not a transaction reference;
+    - `stripe_receipt` and `apple_receipt` quote the vendor's own receipt /
+      invoice / order numbers, which never appear in a bank narration;
+    - `airtel_receipt` carries only the amount — the transaction detail lives
+      in the attached PDF the parser never sees.
+
+    Each of those mails also carries a tempting long digit run (the Stripe
+    receipt number, Apple's SAC, the Airtel relationship number). Pinning
+    `ref is None` here is what stops a future "fix" from minting one of those
+    into an exact-match key and mis-attributing a payment.
+    """
+    assert _ev(name).ref is None
+
+
+@pytest.mark.parametrize(
     "sender,subject,body",
     [
         (
