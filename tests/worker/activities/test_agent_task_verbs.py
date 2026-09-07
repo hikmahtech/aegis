@@ -72,4 +72,26 @@ async def test_load_task_context_gmail_message_id(db_pool, _ctx_seed):
 
 async def test_load_task_context_missing_row_is_empty(db_pool, _ctx_seed):
     ctx = await AgentTaskActivities(db_pool=db_pool).load_task_context("ct-absent")
-    assert ctx == {"external_id": "", "fingerprint": "", "gmail_message_id": ""}
+    assert ctx == {
+        "external_id": "",
+        "fingerprint": "",
+        "gmail_message_id": "",
+        "problem_id": "",
+        "subject": "",
+    }
+
+
+async def test_load_task_context_reads_the_hub_problem_behind_a_task(db_pool, _ctx_seed):
+    """A task the problem hub projected carries its subject exactly, so the
+    infra verb does not have to parse the title."""
+    pid = await db_pool.fetchval(
+        "INSERT INTO problems (correlation_key, class, subject, subject_kind, title, todoist_task_id) "
+        "VALUES ('dockerservicedown:service:ct_svc', 'dockerservicedown', 'ct_svc', 'service', "
+        "'t', 'ct-3') RETURNING id::text"
+    )
+    try:
+        ctx = await AgentTaskActivities(db_pool=db_pool).load_task_context("ct-3")
+        assert ctx["problem_id"] == pid and ctx["subject"] == "ct_svc"
+        assert ctx["external_id"] == "" and ctx["fingerprint"] == ""
+    finally:
+        await db_pool.execute("DELETE FROM problems WHERE id = $1::uuid", pid)

@@ -15,12 +15,18 @@ _calls: list[int] = []
 
 @activity.defn(name="promote_expired_suppressions")
 async def _promote() -> dict:
-    _calls.append(1)
+    _calls.append("promote")
     return {"promoted": 2, "problem_ids": ["a", "b"]}
 
 
+@activity.defn(name="project_pending")
+async def _project() -> dict:
+    _calls.append("project")
+    return {"projected": 3, "created": 1, "errors": 0}
+
+
 @pytest.mark.asyncio
-async def test_sweep_promotes_and_reports():
+async def test_sweep_promotes_then_projects_and_reports():
     _calls.clear()
     async with (
         await WorkflowEnvironment.start_time_skipping() as env,
@@ -28,7 +34,7 @@ async def test_sweep_promotes_and_reports():
             env.client,
             task_queue=f"hub-{uuid.uuid4()}",
             workflows=[HubSweepFlow],
-            activities=[_promote],
+            activities=[_promote, _project],
         ) as worker,
     ):
         out = await env.client.execute_workflow(
@@ -37,5 +43,6 @@ async def test_sweep_promotes_and_reports():
             id=f"hub-{uuid.uuid4()}",
             task_queue=worker.task_queue,
         )
-    assert out == {"promoted": 2}
-    assert _calls == [1]
+    assert out == {"promoted": 2, "projected": 3, "created": 1, "errors": 0}
+    # promotion first, so a just-promoted problem gets its task in the same tick
+    assert _calls == ["promote", "project"]

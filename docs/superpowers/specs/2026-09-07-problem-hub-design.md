@@ -546,14 +546,16 @@ it replaces, so the tree never carries two ways to do one thing.
 |---|---|---|
 | 1 | Migration 030 (`problems`, `problem_events`, `problem_links`), `hub.py` (ingest, correlate, transitions, `event_from_alert`), `POST /api/hub/events`, `auth.alert_token_ok` shared with the alert webhook, tests, coverage gate. Dark: no producer calls it. | nothing |
 | 2 | Migration 031 `service_state`; suppression and promotion in `hub.py`; `POST /api/hub/service-state`; the Ansible hook (homelab-gitops PR); `set_service_state` tool; `HubSweepFlow` (promotes expired suppressions); heartbeat converge-clear. | active-work guard, `activework/`, `ActiveWorkActivities`, `active_work_lookback_hours` |
-| 3 | Alertmanager, Sentry, heartbeat and clarify producers call `ingest_event`; projector to Todoist; `AlertInvestigationFlow` takes `problem_id`. | `alert_dedup_index`, `alert_mutes`, `alert_digest_buffer`, `infra_heartbeat_state` maps, steps 1–2.8, `check_dedup`, `build_alert_signature`, `close_task_for_resolved_alert` (moved), the title-regex `get_verification_delay` |
+| 3a | The projector (`services/hub_project.py`): task creation through the idempotent capture, collapsed occurrence comments, close on resolve / reopen on recurrence, the status block; `HubSweepFlow` projects what is pending; `load_task_context` reads the problem behind a task so the infra verb no longer parses titles. | nothing (dark until 3b: the hub still has no alert producer) |
+| 3b | Alertmanager, Sentry, heartbeat and clarify producers call `ingest_event`; `AlertInvestigationFlow` takes `problem_id`; backfill script. | `alert_dedup_index`, `alert_mutes` (alert pipeline's use), `alert_digest_buffer` skip types, `infra_heartbeat_state` re-investigation maps, steps 1–2.8, `check_dedup`, `build_alert_signature`, `close_task_for_resolved_alert`, `log_alert`, `check_alert_resolved`, the title-regex `get_verification_delay` |
 | 4 | Flow health, delivery, drift, cert, expiry, social, LLM governor producers. | three copies of the `audit_log` dedupe SQL, the hand-rolled comms task, `homelab_drift.alert_key` day bucket, `cert_expiry.last_alert_threshold`, `ServiceDriftFlow.recheck_delay_seconds`, `FlowHealthConfig.min_stale_minutes` |
 | 5 | `work_sessions` columns, `account` at resume, `task_context`, `report_progress`, `merge_problems`, status block, subtasks from plans, collision as lookup, GitHub-issue projection for `repo` subjects. | SSH git-context fan-out, LLM same-task judge, `_own_session_owner`, `hand_to_you`, `STATUS:` scraping into `result_summary`, title parsing in `_run_infra` |
 | 6 | Admin Problems page, digest from events, `CleanupFlow` close and re-project sweeps. | `build_alert_digest`'s buffer reader |
 | 7 | Operator hooks (dotfiles, documented in `docs/infrastructure.md`), runbook updates, `docs/how-it-works.md` section. | — |
 
-PR 3 is the large one. It is also the one that closes #341 and #355 and the
-remainder of #279, so it is worth the size.
+PR 3 is the large one, so it ships as 3a (the projector, dark) and 3b (the
+producers and the investigation flow, which is where the deletions happen).
+Together they close #341 and the remainder of #279.
 
 ### 13. Rollout
 

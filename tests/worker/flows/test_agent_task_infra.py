@@ -27,10 +27,10 @@ _ALERT_TASK = {
 }
 
 
-def _base_activities(events: list, *, healthy: bool):
+def _base_activities(events: list, *, healthy: bool, context: dict | None = None):
     @activity.defn(name="load_task_context")
     async def load_task_context(task_id: str) -> dict:
-        return {"external_id": "alert-abc", "fingerprint": "abc", "gmail_message_id": ""}
+        return context or {"external_id": "alert-abc", "fingerprint": "abc", "gmail_message_id": ""}
 
     @activity.defn(name="comment")
     async def comment(task_id: str, agent_id: str, body: str) -> dict:
@@ -49,6 +49,7 @@ def _base_activities(events: list, *, healthy: bool):
 
     @activity.defn(name="service_health")
     async def service_health(service_name: str) -> dict:
+        events.append(("health", service_name))
         return {"found": True, "healthy": healthy, "detail": "1/1" if healthy else "0/1"}
 
     @activity.defn(name="service_logs")
@@ -120,6 +121,30 @@ async def test_healthy_service_completes_task_without_a_card():
     assert result["status"] == "resolved"
     assert any(kind == "complete" for kind, _ in events)
     assert not any(kind == "restart" for kind, _ in events)
+
+
+async def test_hub_subject_wins_over_an_unparseable_title():
+    """A task the problem hub projected carries `subject` in its context; the
+    title is not parsed at all, so a title with no service name still works."""
+    events: list = []
+    task = {**_ALERT_TASK, "content": "Something odd is going on"}
+    context = {"external_id": "", "fingerprint": "", "gmail_message_id": "", "problem_id": "p1", "subject": "redis_redis"}
+    async with await WorkflowEnvironment.start_time_skipping() as env:
+        queue = f"tq-{uuid.uuid4()}"
+        async with Worker(
+            env.client,
+            task_queue=queue,
+            workflows=[AgentTaskFlow, InteractionFlow],
+            activities=_base_activities(events, healthy=True, context=context),
+        ):
+            result = await env.client.execute_workflow(
+                AgentTaskFlow.run,
+                AgentTaskFlowInput(agent_id="pandoras-actor", todoist_task_id="ti-1", task=task),
+                id=f"agent-task-ti-1-{uuid.uuid4()}",
+                task_queue=queue,
+            )
+    assert result["status"] == "resolved" and result["service"] == "redis_redis"
+    assert ("health", "redis_redis") in events
 
 
 async def test_unhealthy_service_investigates_and_parks_pending_approval():

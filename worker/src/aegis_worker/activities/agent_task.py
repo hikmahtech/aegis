@@ -288,22 +288,38 @@ class AgentTaskActivities:
         coverage in prod (41/42 #alert, 30/30 #email). external_id is prefixed
         by source: `alert-<fingerprint>`, `gmail-<message_id>`.
         """
-        empty = {"external_id": "", "fingerprint": "", "gmail_message_id": ""}
+        empty = {
+            "external_id": "",
+            "fingerprint": "",
+            "gmail_message_id": "",
+            "problem_id": "",
+            "subject": "",
+        }
         if self.db_pool is None or not task_id:
             return empty
+        # A task the problem hub projected knows its subject exactly
+        # (`problems.subject`), so the infra verb need not parse the title.
+        problem = await self.db_pool.fetchrow(
+            "SELECT id::text AS id, subject FROM problems WHERE todoist_task_id = $1 "
+            "ORDER BY first_seen_at DESC LIMIT 1",
+            task_id,
+        )
         external_id = await self.db_pool.fetchval(
             "SELECT external_id FROM todoist_capture_idempotency "
             "WHERE todoist_task_ref = $1 ORDER BY captured_at DESC LIMIT 1",
             task_id,
         )
-        if not external_id:
+        if not external_id and problem is None:
             return empty
+        external_id = external_id or ""
         return {
             "external_id": external_id,
             "fingerprint": external_id[len("alert-") :] if external_id.startswith("alert-") else "",
             "gmail_message_id": (
                 external_id[len("gmail-") :] if external_id.startswith("gmail-") else ""
             ),
+            "problem_id": problem["id"] if problem else "",
+            "subject": problem["subject"] if problem else "",
         }
 
     # --- terminal states ---
