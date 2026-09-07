@@ -11,6 +11,7 @@ export const NAV: NavSection[] = [
     items: [
       { path: '/', label: 'Overview', icon: 'overview' },
       { path: '/interactions', label: 'Interactions', icon: 'inbox' },
+      { path: '/problems', label: 'Problems', icon: 'problems' },
       { path: '/workflows', label: 'Workflows', icon: 'workflows' },
       { path: '/chat', label: 'Chat', icon: 'chat' },
     ],

@@ -21,6 +21,7 @@ import Money from './pages/Money';
 import EmailTriage from './pages/EmailTriage';
 import Todoist from './pages/Todoist';
 import Overview from './pages/Overview';
+import Problems from './pages/Problems';
 import People from './pages/People';
 import ExpiringItems from './pages/ExpiringItems';
 import Assets from './pages/Assets';
@@ -43,6 +44,7 @@ export default function App() {
           <Route path="/" element={<Overview />} />
           <Route path="/interactions" element={<Interactions />} />
           <Route path="/interactions/:id" element={<InteractionDetail />} />
+          <Route path="/problems" element={<Problems />} />
           <Route path="/workflows" element={<Workflows />} />
           <Route path="/workflows/:id" element={<WorkflowDetail />} />
           <Route path="/flows" element={<Flows />} />

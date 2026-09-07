@@ -370,7 +370,9 @@ The hub replaces the old alert dedupe machinery in place, so the order matters.
    there.
 4. **Grant the tools.** `config/seed/agents.yaml` only seeds an agent with no
    `metadata.tool_set`, so a running deployment needs the SQL below.
-5. **Check it.** The queries below should all come back empty or sensible.
+5. **Check it.** The admin **Problems** page is the fastest look: the live
+   list, what each problem's timeline says, and the windows in force. The
+   queries below answer the same questions in SQL.
 
 ```sql
 -- 4. grant the hub's operator tools to every agent whose tool set is an array
