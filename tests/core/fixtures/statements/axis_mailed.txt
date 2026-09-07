@@ -1,0 +1,39 @@
+                     STATEMENT BETWEEN 01/07/2026 AND 31/07/2026 FOR A/C: XXXXXXXXXXX4321
+
+( 4321 )
+MR. SPECIMEN ACCOUNTHOLDER                                                              Scheme Name          : SB - EXAMPLE SAVINGS
+12A EXAMPLE HOUSE, SAMPLE ROAD                                                          Currency             : INR
+NOWHERE , SPECIMENSTAN                                                                  Cust ID              : 900000001
+400000                                                                                  A/C Open Date        : 01-01-2020
+
+ Tran Date     Value Date   Transaction Details                         Chq. No.    Debit      Credit        Balance               I nit B r .
+                          OPENING BALANCE :                                                               10000.00
+                            POS/EXAMPLESTORE/MUMBAI/010726/09:12/
+ 01/07/2026    01/07/2026                                                             300.00                     9700.00    Kalyan,Mumb
+                            412345678901
+ 02/07/2026    02/07/2026   UPI/P2A/612345678901/SPECIMEN /EXAM/UPI/                             1500.00        11200.00    Kalyan,Mumb
+                            CreditCard Payment XXXX 1313
+ 03/07/2026    03/07/2026                                                            2500.00                     8700.00    Kalyan,Mumb
+                            UPI/P2M/712345678901/EXAMPLE SHOP/EXAM
+ 05/07/2026    05/07/2026                                                              50.00                     8650.00    Kalyan,Mumb
+                            /BANK/abcdef//1x2/
+                            UPI/P2M/812345678901/EXAMPLE SHOP/EXAM
+ 05/07/2026    05/07/2026                                                              50.00                     8600.00    Kalyan,Mumb
+                            /BANK/abcdef//1x2/
+                     STATEMENT BETWEEN 01/07/2026 AND 31/07/2026 FOR A/C: XXXXXXXXXXX4321
+
+Tran Date    Value Date   Transaction Details                         Chq. No.     Debit      Credit       Balance              I nit B r .
+                          OPENING BALANCE :                                                              8600.00
+                          BRN-CASH DEP SELF
+10/07/2026   10/07/2026                                                                         5000.00       13600.00    Kalyan,Mumb
+                          NEFT/AXISP00123456/SPECIMEN SUPPLIES
+12/07/2026   12/07/2026                                                             1200.00                   12400.00    Kalyan,Mumb
+
+                          TRANSACTION TOTAL DR/CR:                                4100.00        6500.00
+                          CLOSING BALANCE :                                                                         12400.00
+                     STATEMENT BETWEEN 01/07/2026 AND 31/07/2026 FOR A/C: XXXXXXXXXXX4321
+
+                                                               Legends used in the Statement
+ CWDR                     Cash Withdrawal Through ATM             Int. Pd.                Interest paid to customer
+
+                                                                     ++++End Of Statement++++

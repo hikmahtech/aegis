@@ -18,6 +18,7 @@ The sync Drive API is run in a worker thread so the async route isn't blocked.
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any
 
@@ -35,6 +36,35 @@ _GOOGLE_EXPORT = {
     "application/vnd.google-apps.presentation": ("text/plain", ".txt"),
 }
 _SUPPORTED_EXTS = {".pdf", ".txt", ".md", ".markdown", ".html", ".htm", ".csv", ".json", ".rst"}
+
+
+# Two scopes, two jobs (statement spec §5.5): `drive.readonly` is what lets
+# AEGIS SEE a file the owner dropped into a folder, `drive.file` only what it
+# created itself. A token minted before a scope was added simply lacks it, so
+# check the granted scopes and DEGRADE — `MeetingNotesFlow` reports
+# `doc_status=no_drive_scope` and stores what it has rather than failing, and
+# every other Drive reader must do the same. A silent zero ("the folder is
+# empty") is the one outcome that must never happen.
+DRIVE_READONLY_SCOPE = "https://www.googleapis.com/auth/drive.readonly"
+DRIVE_FILE_SCOPE = "https://www.googleapis.com/auth/drive.file"
+NO_SCOPE = "no_drive_scope"
+SCOPE_OK = "ok"
+
+
+def token_scopes(token_path: Path) -> list[str]:
+    """The scopes stored on an OAuth token file; empty when it cannot be read."""
+    try:
+        scopes = json.loads(Path(token_path).read_text()).get("scopes") or []
+    except Exception:  # noqa: BLE001 — an unreadable token reads as "no scopes"
+        return []
+    return [str(s) for s in scopes]
+
+
+def scope_status(token_path: Path, scope: str = DRIVE_READONLY_SCOPE) -> str:
+    """`SCOPE_OK` or `NO_SCOPE` — never an exception, so a caller reports a
+    missing scope by name instead of discovering it as an opaque 403 a call
+    later, and never mistakes it for "there was nothing there"."""
+    return SCOPE_OK if scope in token_scopes(token_path) else NO_SCOPE
 
 
 def _build_drive_service(token_path: Path):

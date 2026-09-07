@@ -30,6 +30,11 @@ FROM python:3.12-slim
 #   curl — health
 #   ffmpeg — media
 #   openssl — Homelab Guardian cert radar TLS probe
+#   poppler-utils — `pdftotext -layout`, which is what turns an Axis statement
+#          PDF into rows: it reconstructs the table, while pdfminer (already a
+#          Python dep) returns it column-by-column and rebuilt ZERO complete
+#          rows from three real statements. Reading the PDF from stdin also
+#          keeps the password out of argv, where /proc could read it.
 #   tini — PID-1 init that reaps zombies left over when a subprocess's child
 #          (e.g. ssh spawned by `docker --context`) outlives its parent.
 #          Without tini, Python is PID 1 and never waitpid()s those grandchildren.
@@ -37,7 +42,7 @@ FROM python:3.12-slim
 # client binary so ServiceDriftFlow can run `docker --context ... service ls`.
 ARG DOCKER_CLI_VERSION=27.3.1
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    openssh-client curl ffmpeg openssl tini git \
+    openssh-client curl ffmpeg openssl tini git poppler-utils \
     && curl -fsSL "https://download.docker.com/linux/static/stable/x86_64/docker-${DOCKER_CLI_VERSION}.tgz" \
         | tar -xz -C /tmp \
     && mv /tmp/docker/docker /usr/local/bin/docker \

@@ -125,6 +125,17 @@ jobs:
           rm -f /tmp/hledger.tgz /tmp/hledger
           hledger --version
 
+      # poppler-utils gives `pdftotext`, which is how a statement PDF becomes
+      # rows. Same reasoning as hledger above: the end-to-end tests in
+      # tests/core/test_statement_pdf_text.py SKIP when the binary is absent, so
+      # without this step CI is green while the extraction path goes unrun.
+      # It is one apt package and it is in worker/Dockerfile for the same job.
+      - name: Install poppler-utils
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends poppler-utils
+          pdftotext -v
+
       - name: Test
         run: pytest tests/core/ tests/api/ tests/integration/ -n auto --dist loadfile --timeout=300 -v --tb=short --cov=core/src/aegis --cov-report=term-missing --cov-report=xml
 

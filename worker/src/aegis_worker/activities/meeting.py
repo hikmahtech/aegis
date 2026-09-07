@@ -11,7 +11,6 @@ from __future__ import annotations
 import asyncio
 import base64
 import datetime as _dt
-import json
 import re
 from collections.abc import Iterable
 from dataclasses import dataclass
@@ -295,17 +294,13 @@ def render_review(doc: dict, review: dict, stats: dict) -> str:
     return "\n".join(lines).strip()
 
 
-_DRIVE_SCOPE = "https://www.googleapis.com/auth/drive.readonly"
-
-
 def _token_has_drive_scope(token_path: Path) -> bool:
     """Cheap pre-check on the stored token so a missing scope is named, not
-    discovered as an opaque 403 a call later."""
-    try:
-        scopes = json.loads(token_path.read_text()).get("scopes") or []
-    except Exception:  # noqa: BLE001 — unreadable token reads as "no scope"
-        return False
-    return _DRIVE_SCOPE in scopes
+    discovered as an opaque 403 a call later. One implementation, in
+    `aegis.services.drive`, so every Drive reader degrades the same way."""
+    from aegis.services.drive import NO_SCOPE, scope_status
+
+    return scope_status(token_path) != NO_SCOPE
 
 
 def _export_doc(token_path: Path, doc_id: str) -> tuple[str, str, str]:
