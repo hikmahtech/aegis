@@ -282,6 +282,7 @@ def create_app(run_lifespan: bool = True, settings: Settings | None = None) -> F
         gmail_reauth,
         health,
         homelab,
+        hub,
         infra,
         infra_admin,
         integrations,
@@ -375,6 +376,7 @@ def create_app(run_lifespan: bool = True, settings: Settings | None = None) -> F
     app.include_router(market.router)
     app.include_router(overview.router)
     app.include_router(homelab.router)
+    app.include_router(hub.router)
     app.include_router(money.router)
     app.include_router(infra.router)
     app.include_router(infra_admin.router)

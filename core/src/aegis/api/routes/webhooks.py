@@ -24,6 +24,7 @@ import structlog
 from fastapi import APIRouter, Depends, Header, HTTPException, Request
 from temporalio.client import Client
 
+from aegis.api.auth import alert_token_ok
 from aegis.api.deps import get_settings
 from aegis.api.routes.interactions import get_workflow_client
 from aegis.clarify_note import AGENT_REPLY_PREFIX, CLARIFY_NOTE_PREFIX
@@ -524,22 +525,6 @@ async def sentry_webhook(
     }
 
 
-def _alert_token_ok(request: Request, secret: str) -> bool:
-    """True if the request presents ``secret`` in either accepted header.
-
-    Both are compared with ``hmac.compare_digest`` so neither is a timing
-    oracle. The Authorization scheme is matched case-insensitively because
-    "Bearer" is a case-insensitive token per RFC 7235, while the credential
-    itself is compared exactly.
-    """
-    if hmac.compare_digest(request.headers.get("X-Alert-Token") or "", secret):
-        return True
-
-    authorization = request.headers.get("Authorization") or ""
-    scheme, _, credential = authorization.partition(" ")
-    return scheme.lower() == "bearer" and hmac.compare_digest(credential.strip(), secret)
-
-
 @router.post("/alert")
 async def alert_webhook(
     request: Request,
@@ -575,8 +560,8 @@ async def alert_webhook(
     missing).
     """
     # Blank secret = open, the legacy default: the `and` short-circuits before
-    # _alert_token_ok, so an unconfigured deployment never rejects.
-    if settings.alert_webhook_secret and not _alert_token_ok(
+    # alert_token_ok, so an unconfigured deployment never rejects.
+    if settings.alert_webhook_secret and not alert_token_ok(
         request, settings.alert_webhook_secret
     ):
         logger.warning("alert_webhook_bad_token")

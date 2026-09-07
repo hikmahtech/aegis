@@ -51,6 +51,10 @@ _ALLOWLIST_EXACT = {
 }
 _ALLOWLIST_PREFIXES = (
     "/api/webhooks/",  # each verifies its own HMAC / shared secret
+    # The problem hub's ingress (`routes/hub.py`) is a webhook in all but path:
+    # the same senders as /api/webhooks/alert, gated by the same
+    # `alert_webhook_secret` through `auth.alert_token_ok`.
+    "/api/hub/",
     "/assets",  # hashed JS/CSS for the SPA shell, StaticFiles mount
 )
 

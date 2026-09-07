@@ -361,7 +361,9 @@ PostgreSQL 16 + pgvector. Migrations 001 → 027 in `migrations/` (001 is the sq
 
 **Social publishing** — `social_accounts`, `social_outbox`.
 
-**Alert governance** — `alert_mutes`, `pending_prs`, `alert_dedup_index` (Sentry signature dedup).
+**Alert governance** — `alert_mutes`, `pending_prs`, `alert_dedup_index` (Sentry signature dedup). Being replaced by the problem hub below, one producer at a time (spec: `docs/superpowers/specs/2026-09-07-problem-hub-design.md`).
+
+**Problem hub** — `problems` (one row per thing that is wrong, identified by `services/hub.py::correlation_key`, never by a Todoist task), `problem_events` (every occurrence, resolution, report and note, idempotent on `(source, external_id)`), `problem_links` (task / issue / PR / run / session refs, and the `problem` link a rolled-over problem keeps to its predecessor). Written only through `hub.ingest_event` and `POST /api/hub/events`. Migration 030 (PR 1) ships the tables dark; producers move onto them from PR 3.
 
 **Reviews / notifications** — `review_digest_log`, `notification_log`.
 

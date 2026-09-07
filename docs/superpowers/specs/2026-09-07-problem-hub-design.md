@@ -93,7 +93,11 @@ Measured against the tree on 2026-09-07:
 
 ### 1. Entities
 
-Migration `030_problem_hub.sql`. Four tables; `task_sessions` widens in place.
+Four tables; `task_sessions` widens in place. Each lands with its first reader:
+`problems`, `problem_events` and `problem_links` in `030_problem_hub.sql` (PR 1),
+`service_state` in `031_service_state.sql` (PR 2), and the `work_sessions`
+widening in `032_work_sessions.sql` (PR 5) — a renamed table with no code on
+it yet would break the coding lane between PRs.
 
 ```sql
 CREATE TABLE IF NOT EXISTS problems (
@@ -528,7 +532,7 @@ it replaces, so the tree never carries two ways to do one thing.
 
 | PR | Ships | Deletes |
 |---|---|---|
-| 1 | Migration 030, `hub.py` (ingest, correlate, transitions), `POST /api/hub/events`, tests, coverage gate. Dark: no producer calls it. | nothing |
+| 1 | Migration 030 (`problems`, `problem_events`, `problem_links`), `hub.py` (ingest, correlate, transitions, `event_from_alert`), `POST /api/hub/events`, `auth.alert_token_ok` shared with the alert webhook, tests, coverage gate. Dark: no producer calls it. | nothing |
 | 2 | `service_state`: GitHub deploy events, Ansible hook (homelab-gitops PR), `set_service_state` tool, suppression in ingest, heartbeat clear. | title-regex verification delay, `recheck_delay_seconds`, `min_stale_minutes`, active-work guard and `activework/` |
 | 3 | Alertmanager, Sentry, heartbeat and clarify producers call `ingest_event`; projector to Todoist; `AlertInvestigationFlow` takes `problem_id`. | `alert_dedup_index`, `alert_mutes`, `alert_digest_buffer`, `infra_heartbeat_state` maps, steps 1–2.8, `check_dedup`, `build_alert_signature`, `close_task_for_resolved_alert` (moved) |
 | 4 | Flow health, delivery, drift, cert, expiry, social, LLM governor producers. | three copies of the `audit_log` dedupe SQL, the hand-rolled comms task, `homelab_drift.alert_key` day bucket, `cert_expiry.last_alert_threshold` |
@@ -559,7 +563,7 @@ remainder of #279, so it is worth the size.
 
 | Area | Files |
 |---|---|
-| Migration | `migrations/030_problem_hub.sql` |
+| Migrations | `migrations/030_problem_hub.sql`, `031_service_state.sql`, `032_work_sessions.sql` |
 | Core | `services/hub.py` (new), `services/tools/hub.py` (new), `services/chat.py` (four schemas, four registry entries), `services/alert_tasks.py` (folded into hub), `services/task_sessions.py` → `work_sessions.py`, `api/routes/hub.py` (new), `api/routes/webhooks.py` (deploy events, producers), `api/routes/mcp_server.py` (`_UNSERVED_TOOLS`), `connectors/remote_script.py` (`account` returned from launch) |
 | Worker | `flows/alert_investigation.py`, `flows/infra_heartbeat.py`, `flows/flow_health.py`, `flows/delivery_watchdog.py`, `flows/service_drift.py`, `flows/cert_radar.py`, `flows/expiry_radar.py`, `flows/social_metrics.py`, `flows/llm_spend_guard.py`, `flows/github_alert.py`, `flows/sentry_poll.py`, `flows/clarify.py`, `flows/agent_task.py`, `flows/cleanup.py`, `activities/alerts.py`, `activities/homelab.py`, `activities/flow_health.py`, `activities/social.py`, `activities/agent_task.py`, `activities/cleanup.py`, `activities/briefing.py`; `activework/` deleted |
 | Admin | `admin-panel/frontend/src/pages/Problems.tsx` (new), `Overview.tsx` (count) |
