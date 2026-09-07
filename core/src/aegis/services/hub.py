@@ -953,3 +953,165 @@ async def merge_problems(
         "events_moved": int(parts[-1]) if parts and parts[-1].isdigit() else 0,
         "merged_task_id": merged["todoist_task_id"] or "",
     }
+
+
+# --- digest, close sweep and admin reads (PR 6) -------------------------------
+
+
+async def digest(
+    pool: asyncpg.Pool, *, hours: float = 24.0, now: datetime | None = None
+) -> dict[str, Any]:
+    """What the hub saw in the last ``hours``, from the events themselves.
+
+    This replaces the `alert_digest_buffer` settings row, which was written by
+    the investigation flow at four call sites and read once a day: an item
+    appended by a flow that then failed was in the digest anyway, and one the
+    flow never reached was missing from it forever. The problems and their
+    events are the record, so the digest is a query over them and can be asked
+    for twice.
+
+    Returns counts plus the problems themselves, newest first, so the caller
+    can render prose without a second round trip.
+    """
+    now = now or _utcnow()
+    since = now - timedelta(hours=max(float(hours), 0.0))
+    rows = await pool.fetch(
+        "SELECT p.id::text AS id, p.title, p.class, p.subject, p.subject_kind, p.severity, "
+        "       p.status, p.occurrences, p.first_seen_at, p.last_seen_at, p.resolved_at, "
+        "       p.muted_until, p.todoist_task_id, "
+        "       (p.first_seen_at >= $1) AS is_new, "
+        "       EXISTS (SELECT 1 FROM problem_events e WHERE e.problem_id = p.id "
+        "               AND e.kind = 'investigation' AND e.occurred_at >= $1) AS investigated "
+        "FROM problems p "
+        "WHERE EXISTS (SELECT 1 FROM problem_events e WHERE e.problem_id = p.id "
+        "              AND e.occurred_at >= $1) "
+        "ORDER BY p.last_seen_at DESC",
+        since,
+    )
+    problems = [dict(r) for r in rows]
+    live = [p for p in problems if p["status"] in LIVE_STATUSES]
+    counts = {
+        "total": len(problems),
+        "new": sum(1 for p in problems if p["is_new"]),
+        "open": sum(1 for p in live if p["status"] not in {"suppressed"}),
+        "suppressed": sum(1 for p in problems if p["status"] == "suppressed"),
+        "muted": sum(
+            1
+            for p in problems
+            if p["muted_until"] is not None and _aware(p["muted_until"], now) > now
+        ),
+        "resolved": sum(1 for p in problems if p["status"] in {"resolved", "closed"}),
+        "investigated": sum(1 for p in problems if p["investigated"]),
+        "occurrences": sum(int(p["occurrences"] or 0) for p in problems),
+    }
+    return {"since": since, "counts": counts, "problems": problems}
+
+
+async def close_resolved(
+    pool: asyncpg.Pool, *, days: float = 7.0, limit: int = 200, now: datetime | None = None
+) -> list[str]:
+    """Close problems resolved longer than ``days`` ago. Returns their ids.
+
+    Closing is what frees the correlation key for a genuinely new problem with
+    the same subject: the partial unique index covers open keys only. A
+    resolved problem is kept live for the reopen window and then some, so a
+    service that flaps back the same week attaches to its own history rather
+    than starting a fresh one.
+
+    The cutoff is INCLUSIVE, so ``days=0`` means "everything resolved, now" —
+    which is what the admin panel's close button asks for on a problem it has
+    just resolved. A strict comparison there closed nothing at all.
+    """
+    now = now or _utcnow()
+    cutoff = now - timedelta(days=max(float(days), 0.0))
+    rows = await pool.fetch(
+        "UPDATE problems SET status = 'closed', closed_at = $1 "
+        "WHERE id IN (SELECT id FROM problems WHERE status = 'resolved' AND closed_at IS NULL "
+        "             AND resolved_at IS NOT NULL AND resolved_at <= $2 "
+        "             ORDER BY resolved_at LIMIT $3) "
+        "RETURNING id::text AS id",
+        now,
+        cutoff,
+        max(1, int(limit)),
+    )
+    ids = [r["id"] for r in rows]
+    for problem_id in ids:
+        await pool.execute(
+            "INSERT INTO problem_events (problem_id, source, external_id, kind, severity, "
+            "payload, occurred_at) VALUES ($1::uuid, 'hub', $2, 'state_change', 'info', $3, $4) "
+            "ON CONFLICT (source, external_id) DO NOTHING",
+            problem_id,
+            f"close:{problem_id}:{now.isoformat()}",
+            {"action": "close", "reason": f"resolved more than {days:g} days ago"},
+            now,
+        )
+    if ids:
+        logger.info("hub_problems_closed", count=len(ids), days=days)
+    return ids
+
+
+async def list_problems(
+    pool: asyncpg.Pool,
+    *,
+    status: str = "",
+    subject: str = "",
+    include_closed: bool = False,
+    limit: int = 100,
+    offset: int = 0,
+) -> list[dict[str, Any]]:
+    """Problems for the admin list, newest activity first. Live only unless
+    ``include_closed``; ``status`` narrows to one status."""
+    where = ["TRUE" if include_closed else "p.closed_at IS NULL"]
+    args: list[Any] = []
+    if status:
+        args.append(status)
+        where.append(f"p.status = ${len(args)}")
+    if subject:
+        args.append(_slug(subject))
+        where.append(f"p.subject = ${len(args)}")
+    args.extend([max(1, min(int(limit), 500)), max(0, int(offset))])
+    rows = await pool.fetch(
+        "SELECT p.id::text AS id, p.correlation_key, p.class, p.subject, p.subject_kind, "
+        "       p.title, p.severity, p.status, p.first_seen_at, p.last_seen_at, p.occurrences, "
+        "       p.muted_until, p.resolved_at, p.closed_at, p.todoist_task_id, p.github_issue "
+        f"FROM problems p WHERE {' AND '.join(where)} "
+        f"ORDER BY p.last_seen_at DESC LIMIT ${len(args) - 1} OFFSET ${len(args)}",
+        *args,
+    )
+    return [dict(r) for r in rows]
+
+
+async def problem_detail(
+    pool: asyncpg.Pool, problem_id: str, *, events: int = 50
+) -> dict[str, Any] | None:
+    """One problem with everything hanging off it: its events, its links, its
+    sessions and the window suppressing it, if any."""
+    from aegis.services import work_sessions
+
+    problem = await get_problem(pool, problem_id)
+    if problem is None:
+        return None
+    async with pool.acquire() as conn:
+        window = await _active_suppression(
+            conn, problem["subject"], problem["subject_kind"], _utcnow()
+        )
+    links = [
+        dict(r)
+        for r in await pool.fetch(
+            "SELECT link_kind, ref, created_at FROM problem_links "
+            "WHERE problem_id = $1::uuid ORDER BY created_at",
+            problem_id,
+        )
+    ]
+    sessions = (
+        await work_sessions.list_for_task(pool, problem["todoist_task_id"])
+        if problem["todoist_task_id"]
+        else []
+    )
+    return {
+        "problem": problem,
+        "events": await list_events(pool, problem_id, limit=events),
+        "links": links,
+        "sessions": sessions,
+        "window": dict(window) if window else None,
+    }

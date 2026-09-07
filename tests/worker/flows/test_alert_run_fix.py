@@ -199,11 +199,6 @@ async def stub_send_voice(agent_id: str, text: str) -> dict:
     return {"ok": True}
 
 
-@activity.defn(name="accumulate_digest_item")
-async def stub_accumulate_digest(item: dict) -> None:
-    pass
-
-
 @activity.defn(name="run_remediation_commands")
 async def stub_run_remediation_commands(commands: list[str], host: str = "") -> dict:
     _calls.setdefault("run_remediation_args", []).append((commands, host))
@@ -339,7 +334,6 @@ ALL_STUBS = [
     stub_send_system_event,
     stub_send_message,
     stub_send_voice,
-    stub_accumulate_digest,
     stub_run_remediation_commands,
     stub_insert_interaction,
     stub_send_card,

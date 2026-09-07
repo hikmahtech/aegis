@@ -6,7 +6,6 @@ import asyncio
 import contextlib
 import json
 import re
-from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -2046,82 +2045,3 @@ class AlertActivities:
             activity.logger.warning("record_verdict_to_kg_failed: %s", str(exc)[:200])
             return {"ingested": False, "reason": str(exc)[:200]}
 
-    async def _read_digest_buffer(self) -> dict:
-        """Read + normalize the alert digest buffer from settings.
-
-        Returns a dict shaped {"items": [...]}, defaulting to an empty
-        buffer when the row is missing or malformed.
-        """
-        raw = await self.db_pool.fetchval(
-            "SELECT value::text FROM settings WHERE key = 'alert_digest_buffer'"
-        )
-        buffer = json.loads(raw) if raw else {"items": []}
-        if not isinstance(buffer, dict):
-            buffer = {"items": []}
-        return buffer
-
-    @activity.defn
-    async def accumulate_digest_item(self, item: dict) -> None:
-        """Append item to the alert digest buffer in settings table."""
-        if not self.db_pool:
-            return
-
-        buffer = await self._read_digest_buffer()
-        items = buffer.get("items", [])
-        items.append(item)
-        # Cap at 500 to prevent unbounded growth
-        if len(items) > 500:
-            items = items[-500:]
-        buffer["items"] = items
-
-        await self.db_pool.execute(
-            "INSERT INTO settings (key, value, updated_at) VALUES ('alert_digest_buffer', $1, NOW()) "
-            "ON CONFLICT (key) DO UPDATE SET value = $1, updated_at = NOW()",
-            buffer,
-        )
-
-    @activity.defn
-    async def build_alert_digest(self) -> dict:
-        """Build a formatted digest from the alert buffer and clear it.
-
-        Returns: {message: str, count: int}
-        """
-        if not self.db_pool:
-            return {"message": "", "count": 0}
-
-        buffer = await self._read_digest_buffer()
-        items = buffer.get("items", [])
-
-        if not items:
-            return {"message": "", "count": 0}
-
-        # Group by type
-        type_labels = {
-            "auto_remediated": "Auto-Remediated (restart)",
-            "self_resolved": "Self-Resolved",
-            "sentry_suppressed": "Sentry Suppressed",
-            "not_actionable": "Not Actionable",
-        }
-
-        sections = []
-        for item_type, label in type_labels.items():
-            type_items = [i for i in items if i.get("type") == item_type]
-            if not type_items:
-                continue
-            # Count by title
-            title_counts = Counter(i.get("title", "Unknown")[:100] for i in type_items)
-            lines = [
-                f"  - {title} (x{count})" if count > 1 else f"  - {title}"
-                for title, count in title_counts.most_common()
-            ]
-            sections.append(f"<b>{label}</b> ({len(type_items)}):\n" + "\n".join(lines))
-
-        message = "<b>Alert Digest</b>\n\n" + "\n\n".join(sections)
-
-        # Clear buffer
-        await self.db_pool.execute(
-            "INSERT INTO settings (key, value, updated_at) VALUES ('alert_digest_buffer', '{\"items\": []}'::jsonb, NOW()) "
-            "ON CONFLICT (key) DO UPDATE SET value = '{\"items\": []}'::jsonb, updated_at = NOW()"
-        )
-
-        return {"message": message, "count": len(items)}

@@ -1,0 +1,16 @@
+-- Drop the daily digest's accumulator row.
+--
+-- `settings.alert_digest_buffer` was appended to at four points in the
+-- investigation flow and read once a day. It made the digest a record of what
+-- a flow remembered to append rather than of what happened: an item written by
+-- a branch that then failed was in the digest anyway, and one whose branch was
+-- never reached was missing from it forever. From PR 6 the digest is a query
+-- over `problem_events`, so the row has no writer and no reader.
+--
+-- `alert_dedup_index` is NOT dropped here even though nothing in the code
+-- reads it any more: `scripts/hub_backfill.py` reads its `occurrence_count` to
+-- seed the problems it creates from open alert tasks, and that backfill has
+-- not run in production yet. Dropping the table before it runs would silently
+-- cost every backfilled problem its recurrence history. It goes in PR 7, after
+-- the backfill.
+DELETE FROM settings WHERE key = 'alert_digest_buffer';

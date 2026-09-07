@@ -46,6 +46,8 @@ async def test_no_pool_is_a_quiet_noop():
         "recorded": False,
         "steps": 2,
     }
+    assert await env.run(act.build_digest, 24.0) == {"message": "", "count": 0}
+    assert await env.run(act.close_resolved_problems, 7.0) == {"closed": 0, "problem_ids": []}
     assert await env.run(act.stale_stuck_problems, ["a"], 24.0) == []
     out = await env.run(
         act.reconcile_findings,
@@ -223,3 +225,46 @@ async def test_record_plan_needs_two_steps_and_a_known_task(db_pool):
         act.record_plan, {"task_id": f"zz-gone-{uuid.uuid4().hex[:4]}", "steps": ["a", "b"]}
     )
     assert missing["recorded"] is False
+
+
+async def test_build_digest_renders_what_the_window_saw(db_pool):
+    """The briefing's message, straight from the events. No buffer to fill and
+    none to clear, so asking twice gives the same answer — which is what makes
+    a re-run of the briefing safe."""
+    env = ActivityEnvironment()
+    act = HubActivities(db_pool=db_pool)
+    # Everything already in the shared test database is aged out of the window.
+    await db_pool.execute(
+        "UPDATE problem_events SET occurred_at = now() - interval '40 days' "
+        "WHERE occurred_at > now() - interval '2 days'"
+    )
+    s = f"svc_{uuid.uuid4().hex[:8]}"
+    await env.run(act.ingest_alert, _alert(s), False)
+
+    out = await env.run(act.build_digest, 24.0)
+    assert out["count"] == 1
+    assert "<b>Problem digest</b> (last 24h)" in out["message"]
+    assert "1 problems saw activity: 1 new" in out["message"]
+    assert f"Service {s} down" in out["message"] and "🆕" in out["message"]
+    assert out == await env.run(act.build_digest, 24.0), "asking twice is the same answer"
+
+    quiet = await env.run(act.build_digest, 0.0)
+    assert quiet == {"message": "", "count": 0}, "an empty window says nothing at all"
+
+
+async def test_close_resolved_problems_sweeps_old_resolutions(db_pool):
+    env = ActivityEnvironment()
+    act = HubActivities(db_pool=db_pool)
+    s = f"svc_{uuid.uuid4().hex[:8]}"
+    ingested = await env.run(act.ingest_alert, _alert(s), False)
+    pid = ingested["problem_id"]
+    await env.run(act.ingest_alert, _alert(s), True)
+    await db_pool.execute(
+        "UPDATE problems SET resolved_at = now() - interval '30 days' WHERE id = $1::uuid", pid
+    )
+
+    out = await env.run(act.close_resolved_problems, 7.0)
+    assert pid in out["problem_ids"] and out["closed"] >= 1
+    assert (await get_problem(db_pool, pid))["status"] == "closed"
+    assert pid not in (await env.run(act.close_resolved_problems, 7.0))["problem_ids"]
+    assert (await env.run(act.close_resolved_problems, -1.0)) == {"closed": 0, "problem_ids": []}

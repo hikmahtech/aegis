@@ -20,6 +20,9 @@ import asyncpg
 from aegis.services import hub, hub_project, hub_watch
 from temporalio import activity
 
+# The briefing message names this many problems; the rest are a count.
+_DIGEST_LIST_CAP = 12
+
 
 class HubActivities:
     def __init__(self, db_pool: asyncpg.Pool | None) -> None:
@@ -253,6 +256,59 @@ class HubActivities:
             )
             return {"recorded": False, "steps": len(steps)}
         return {"recorded": True, "steps": len(steps), "problem_id": problem["id"]}
+
+    @activity.defn
+    async def build_digest(self, hours: float = 24.0) -> dict:
+        """The day's problems, rendered for the briefing. One query over
+        `problem_events` — there is no buffer to accumulate into and none to
+        clear, so asking twice gives the same answer and a flow that died
+        half-way through an investigation is still represented by what it
+        actually recorded.
+
+        Returns `{message, count}`: the shape the briefing already sends, so
+        the delivery side is unchanged.
+        """
+        if self.db_pool is None:
+            return {"message": "", "count": 0}
+        out = await hub.digest(self.db_pool, hours=hours)
+        counts = out["counts"]
+        if not counts["total"]:
+            return {"message": "", "count": 0}
+        head = (
+            f"<b>Problem digest</b> (last {hours:g}h)\n\n"
+            f"{counts['total']} problems saw activity: {counts['new']} new, "
+            f"{counts['open']} still open, {counts['resolved']} resolved, "
+            f"{counts['investigated']} investigated. "
+            f"{counts['occurrences']} occurrences in total."
+        )
+        if counts["suppressed"] or counts["muted"]:
+            head += (
+                f" Not raised: {counts['suppressed']} suppressed by a window, "
+                f"{counts['muted']} muted."
+            )
+        lines = []
+        for p in out["problems"][:_DIGEST_LIST_CAP]:
+            mark = "🆕" if p["is_new"] else "•"
+            subject = p["subject"] or p["subject_kind"] or "-"
+            lines.append(
+                f"{mark} {p['title'][:100]} — {subject} · {p['status']} · "
+                f"{p['occurrences']}×"
+            )
+        more = len(out["problems"]) - len(lines)
+        if more > 0:
+            lines.append(f"… and {more} more")
+        return {"message": head + "\n\n" + "\n".join(lines), "count": counts["total"]}
+
+    @activity.defn
+    async def close_resolved_problems(self, days: float = 7.0) -> dict:
+        """Retire problems resolved longer than `days` ago. Closing frees the
+        correlation key: the unique index covers OPEN keys, so a service that
+        breaks again next month starts a fresh problem instead of reopening a
+        month-old one. Run nightly by `CleanupFlow`."""
+        if self.db_pool is None or float(days) < 0:
+            return {"closed": 0, "problem_ids": []}
+        ids = await hub.close_resolved(self.db_pool, days=days)
+        return {"closed": len(ids), "problem_ids": ids}
 
     @activity.defn
     async def mute_problem(self, problem_id: str, hours: float, by: str = "gate2") -> dict:

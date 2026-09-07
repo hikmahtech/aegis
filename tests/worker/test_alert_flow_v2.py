@@ -141,11 +141,6 @@ async def stub_update_task_status(
     pass
 
 
-@activity.defn(name="accumulate_digest_item")
-async def stub_accumulate_digest_item(payload: dict) -> None:
-    pass
-
-
 @activity.defn(name="post_task_note")
 async def stub_post_task_note(
     task_id: str,
@@ -311,7 +306,6 @@ ALL_ACTIVITIES = [
     stub_assess_investigation,
     stub_send_system_event,
     stub_send_message,
-    stub_accumulate_digest_item,
     stub_post_task_note,
     stub_upload_kimi_log,
     stub_insert_interaction_v2,

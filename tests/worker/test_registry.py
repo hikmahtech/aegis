@@ -343,6 +343,11 @@ def test_module_workflows_is_the_unflagged_registry():
         # `cleanup_work_sessions` (±0). No new flow.
         # PR 5b: HubActivities.record_plan (+1, unflagged) — a coding turn's
         # plan becomes subtasks through the projector. No new flow.
+        # PR 6a: HubActivities gains `build_digest` and `close_resolved_problems`
+        # (+2, unflagged) while AlertActivities loses `accumulate_digest_item`
+        # and `build_alert_digest` (−2, unflagged) — the digest is a query over
+        # `problem_events` now, not a settings buffer four branches appended
+        # to. Net 0 in every row, and no new flow.
         (True, True, 44, 217),
         (False, False, 36, 186),
         (True, False, 40, 202),

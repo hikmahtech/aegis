@@ -8,6 +8,7 @@ from temporalio import workflow
 
 with workflow.unsafe.imports_passed_through():
     from aegis_worker.activities.cleanup import CleanupActivities
+    from aegis_worker.activities.hub import HubActivities
     from aegis_worker.shared.retry import NO_RETRY, TIMEOUT_LONG
 
 
@@ -26,6 +27,9 @@ _DEFAULT_RETENTIONS: dict[str, int] = {
     "workflow_runs": 90,
     "ingest_idempotency": 60,
     "gtd_clarify_log": 180,
+    # Read by nothing in the code since PR 3b of the problem hub, but still read
+    # by scripts/hub_backfill.py for recurrence counts until that has run in
+    # production. Dropped in PR 7, after the backfill.
     "alert_dedup_index": 60,
     "pending_prs": 30,
     # inserted unconditionally per webhook (webhooks.py) / per knowledge
@@ -79,6 +83,10 @@ class CleanupConfig:
     # gone and which has been idle this many days. The branch stays — it may
     # back an open PR. Set to 0 to disable.
     task_session_days: int = 7
+    # Close problems resolved longer ago than this. Closing frees the
+    # correlation key, so the same service breaking next month is a new
+    # problem rather than a reopened old one. Set to 0 to disable.
+    problem_close_days: float = 7.0
 
 
 @workflow.defn
@@ -169,5 +177,21 @@ class CleanupFlow:
                     "task_session_sweep_failed error=%s", str(exc)[:200]
                 )
                 result["work_sessions"] = {"status": "failed"}
+
+        # The problem hub's close sweep. Last, and independent of everything
+        # above for the same reason those are independent of each other: a
+        # failed prune must not leave resolved problems holding their keys.
+        if config.problem_close_days > 0:
+            try:
+                closed = await workflow.execute_activity_method(
+                    HubActivities.close_resolved_problems,
+                    args=[config.problem_close_days],
+                    start_to_close_timeout=TIMEOUT_LONG,
+                    retry_policy=NO_RETRY,
+                )
+                result["problems_closed"] = closed
+            except Exception as exc:
+                workflow.logger.error("problem_close_sweep_failed error=%s", str(exc)[:200])
+                result["problems_closed"] = {"status": "failed"}
 
         return result

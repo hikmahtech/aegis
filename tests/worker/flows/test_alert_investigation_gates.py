@@ -157,11 +157,6 @@ async def stub_send_message(
     pass
 
 
-@activity.defn(name="accumulate_digest_item")
-async def stub_accumulate_digest(item: dict) -> None:
-    pass
-
-
 # --- InteractionFlow activities ---
 
 
@@ -300,7 +295,6 @@ ALL_STUBS = [
     stub_assess_investigation,
     stub_send_system_event,
     stub_send_message,
-    stub_accumulate_digest,
     stub_insert_interaction,
     stub_send_card,
     stub_resolve,
