@@ -47,7 +47,17 @@ class HubActivities:
                 "muted": False,
             }
         now = datetime.now(UTC)
-        event = hub.event_from_alert(alert, occurred_at=now, resolved=resolved)
+        # An occurrence id that survives a retry of THIS activity task. Temporal
+        # keeps the activity id across attempts, so the second attempt of an
+        # ingest that already committed comes back `duplicate` instead of
+        # minting a second occurrence and answering `investigate=False`.
+        occurrence_key = ""
+        if activity.in_activity():
+            info = activity.info()
+            occurrence_key = f"{info.workflow_id}:{info.activity_id}"
+        event = hub.event_from_alert(
+            alert, occurred_at=now, resolved=resolved, occurrence_key=occurrence_key
+        )
         result = await hub.ingest_event(self.db_pool, event, now=now)
         task_id = str(alert.get("todoist_task_id") or "") or None
         if result.problem_id and task_id:
@@ -318,14 +328,23 @@ class HubActivities:
         return {"muted_until": until.isoformat() if until else None}
 
     @activity.defn
-    async def stale_stuck_problems(self, subjects: list[str], hours: float) -> list[dict]:
+    async def stale_stuck_problems(
+        self, subjects: list[str], hours: float, classes: list[str] | None = None
+    ) -> list[dict]:
         """Among `subjects` (services the heartbeat sees stuck right now), the
         ones whose open problem is older than `hours` and has had no
-        investigation event in that long — due for a re-investigation."""
+        investigation event in that long — due for a re-investigation.
+
+        `classes` is what keeps the answer to the question the caller asked:
+        the heartbeat means "this service is still down", not "anything ever
+        recorded about this service"."""
         if self.db_pool is None or not subjects:
             return []
         rows = await hub.stale_open_problems(
-            self.db_pool, [hub.slug(x) for x in subjects], hours=hours
+            self.db_pool,
+            [hub.slug(x) for x in subjects],
+            hours=hours,
+            classes=list(classes) if classes else None,
         )
         return rows
 

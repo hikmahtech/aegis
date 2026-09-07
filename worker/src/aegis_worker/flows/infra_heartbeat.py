@@ -2,18 +2,19 @@
 
 Emits mostly on state transitions, never on unchanged steady state:
 - node → Down (first sight counts)          → NodeDown alert (escalate)
-- node Down → Ready                          → resolved audit row
-- node Down → gone from `docker node ls`     → resolved audit row (#131)
+- node Down → Ready                          → resolved event on the problem
+- node Down → gone from `docker node ls`     → resolved event (#131)
 - service stuck 2 consecutive ticks          → DockerServiceDown alert
   (routes into the existing auto-remediation in AlertInvestigationFlow)
 - service confirmed-stuck > `restuck_hours`  → ServiceDownProlonged alert (#138)
-- confirmed-stuck service converged          → resolved audit row
+- confirmed-stuck service converged          → resolved event on the problem
 - collect failed `fail_threshold` in a row   → HeartbeatCollectFailed alert
-- collect recovered                          → its resolved audit row
+- collect recovered                          → its resolved event
 
-Recovery writes the same audit_log row shape the Alertmanager webhook writes
-(action=alert_received, details.resolved=true), so check_alert_resolved and
-the whole self-resolve machinery work unchanged for heartbeat alerts.
+Recovery is `_resolve()` → `HubActivities.ingest_alert(resolved=True)`: the
+hub closes the problem and the projector closes its task. The audit-log rows
+and `check_alert_resolved` this flow used to write and read are gone with the
+rest of the pre-hub dedupe machinery.
 
 Children are spawned ABANDONED (sentry_poll pattern) — investigations carry
 human gates and must outlive this 2-min tick. Dead-man ping fires only on a
@@ -299,7 +300,14 @@ class InfraHeartbeatFlow:
             try:
                 stale = await workflow.execute_activity_method(
                     HubActivities.stale_stuck_problems,
-                    args=[sorted(confirmed_now), float(config.restuck_hours)],
+                    # The classes the heartbeat itself raises for a stuck
+                    # service — asking without them returned that service's
+                    # unrelated problems too.
+                    args=[
+                        sorted(confirmed_now),
+                        float(config.restuck_hours),
+                        ["dockerservicedown", "servicedownprolonged"],
+                    ],
                     start_to_close_timeout=TIMEOUT_FAST,
                     retry_policy=FAST,
                 )

@@ -10,6 +10,7 @@ wherever this port is reachable by anything you do not trust.
 
 from __future__ import annotations
 
+import uuid
 from datetime import datetime
 from typing import Any
 
@@ -87,7 +88,10 @@ class EventBody(BaseModel):
     severity: str = "warning"
     payload: dict[str, Any] = Field(default_factory=dict)
     occurred_at: datetime | None = None
-    problem_id: str | None = None
+    # A uuid, validated here: `ingest_event` casts it to `uuid` in SQL, so a
+    # malformed one used to reach asyncpg and surface as a 500 rather than
+    # the 400 a caller can act on.
+    problem_id: uuid.UUID | None = None
 
 
 @router.post("/events")

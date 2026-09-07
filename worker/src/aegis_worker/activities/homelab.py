@@ -396,16 +396,16 @@ class HomelabActivities:
 
     @staticmethod
     def _default_heartbeat_state() -> dict:
-        # confirmed_at / reinvestigated_at: {service: iso8601} clocks behind the
-        # re-investigate path for confirmed-stuck services (#138). Merged over
-        # the stored value in read_heartbeat_state, so a state row written
-        # before they existed reads back as empty maps rather than KeyError.
+        # The per-service `confirmed_at` / `reinvestigated_at` clocks behind
+        # the #138 re-investigate path are GONE: the problem hub knows when a
+        # problem was first seen and when it was last investigated, so
+        # `HubActivities.stale_stuck_problems` answers that question instead.
+        # A state row still carrying them reads back with the extra keys and
+        # nothing looks at them.
         return {
             "nodes": {},
             "stuck": [],
             "confirmed": [],
-            "confirmed_at": {},
-            "reinvestigated_at": {},
             "fail_count": 0,
         }
 

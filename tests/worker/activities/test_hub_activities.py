@@ -3,11 +3,19 @@ and the one seam every producer crosses (`ingest_alert`)."""
 
 from __future__ import annotations
 
+import dataclasses
 import uuid
 from datetime import UTC, datetime, timedelta
 
 import pytest
-from aegis.services.hub import Event, get_problem, ingest_event, list_events, set_service_state
+from aegis.services.hub import (
+    Event,
+    get_problem,
+    ingest_event,
+    list_events,
+    set_service_state,
+    set_status,
+)
 from aegis_worker.activities.hub import HubActivities
 from temporalio.testing import ActivityEnvironment
 
@@ -16,6 +24,33 @@ pytestmark = pytest.mark.asyncio
 # The activities run on the real clock, so a seeded window must be over in
 # real time, not merely relative to a fixed test "now".
 LONG_AGO = datetime(2026, 9, 7, 12, 0, tzinfo=UTC) - timedelta(days=30)
+
+
+def _attempt(activity_id: str = "1", attempt: int = 1) -> ActivityEnvironment:
+    """An environment whose `Info` is what a real one carries across the
+    attempts of ONE activity task: same workflow id, same activity id, a
+    higher attempt number."""
+    env = ActivityEnvironment()
+    env.info = dataclasses.replace(
+        ActivityEnvironment.default_info(),
+        workflow_id="hb-fixed",
+        activity_id=activity_id,
+        attempt=attempt,
+    )
+    return env
+
+
+def _stale_occ(subject: str, klass: str) -> Event:
+    return Event(
+        source="heartbeat",
+        external_id=f"{subject}:{klass}:{uuid.uuid4().hex[:8]}",
+        kind="occurrence",
+        title=f"{klass} on {subject}",
+        klass=klass,
+        subject=subject,
+        severity="critical",
+        occurred_at=LONG_AGO,
+    )
 
 
 def _alert(subject: str, **kw) -> dict:
@@ -268,3 +303,65 @@ async def test_close_resolved_problems_sweeps_old_resolutions(db_pool):
     assert (await get_problem(db_pool, pid))["status"] == "closed"
     assert pid not in (await env.run(act.close_resolved_problems, 7.0))["problem_ids"]
     assert (await env.run(act.close_resolved_problems, -1.0)) == {"closed": 0, "problem_ids": []}
+
+
+# --- what the end-of-programme validation found (PR 8) ------------------------
+
+
+async def test_a_retried_ingest_does_not_mint_a_second_occurrence(db_pool):
+    """A heartbeat alert carries no timestamp of its own, so the occurrence id
+    used to take the wall clock — and a Temporal RETRY of an ingest that had
+    already committed minted a second occurrence, which attaches instead of
+    creating and answers `investigate=False`. The alert then had a task and no
+    investigation.
+
+    Temporal keeps the activity id across attempts of one activity task, so
+    that is what the id is derived from. Falsifiable: drop `occurrence_key` and
+    the second attempt reports `attached` with `investigate` False.
+    """
+    act = HubActivities(db_pool=db_pool)
+    s = f"svc_{uuid.uuid4().hex[:8]}"
+    alert = _alert(s)
+
+    # Two ATTEMPTS of one activity task: same workflow id, same activity id.
+    first = await _attempt(attempt=1).run(act.ingest_alert, alert, False)
+    retry = await _attempt(attempt=2).run(act.ingest_alert, alert, False)
+
+    assert first["action"] == "created" and first["investigate"] is True
+    assert retry["problem_id"] == first["problem_id"]
+    assert retry["action"] == "duplicate"
+    assert retry["investigate"] is False, "a retry must not start a second investigation"
+    assert (await get_problem(db_pool, first["problem_id"]))["occurrences"] == 1
+
+    # A genuinely NEW occurrence — a different activity task — still counts.
+    again = await _attempt(activity_id="99").run(act.ingest_alert, alert, False)
+    assert again["action"] == "attached"
+    assert (await get_problem(db_pool, first["problem_id"]))["occurrences"] == 2
+
+
+async def test_stale_stuck_problems_only_answers_about_the_classes_asked_for(db_pool):
+    """The heartbeat means "this service is still down". Matching on the
+    subject alone also returned that service's memory alert and any problem
+    parked on a gate card, and each came back as a re-investigation."""
+    env = ActivityEnvironment()
+    act = HubActivities(db_pool=db_pool)
+    s = f"svc_{uuid.uuid4().hex[:8]}"
+    down = await ingest_event(db_pool, _stale_occ(s, "DockerServiceDown"), now=LONG_AGO)
+    memory = await ingest_event(db_pool, _stale_occ(s, "HostOutOfMemory"), now=LONG_AGO)
+    carded = await ingest_event(db_pool, _stale_occ(s, "ServiceDownProlonged"), now=LONG_AGO)
+    await set_status(db_pool, carded.problem_id, "waiting_human", reason="gate 2 is open")
+
+    ids = [
+        r["id"]
+        for r in await env.run(
+            act.stale_stuck_problems, [s], 1.0, ["dockerservicedown", "servicedownprolonged"]
+        )
+    ]
+
+    assert down.problem_id in ids
+    assert memory.problem_id not in ids, "a different class is a different problem"
+    assert carded.problem_id not in ids, "someone is answering its card"
+
+    # No class list is still the old, wide question — for a caller that means it.
+    wide = [r["id"] for r in await env.run(act.stale_stuck_problems, [s], 1.0, None)]
+    assert memory.problem_id in wide

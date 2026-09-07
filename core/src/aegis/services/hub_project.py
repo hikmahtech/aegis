@@ -243,24 +243,36 @@ async def ensure_problem_for_task(
     from aegis.services.hub import Event, find_problem_for_task, get_problem, ingest_event
 
     problem = await find_problem_for_task(pool, task_id)
-    if problem is not None:
+    # A closed problem is history: its projection is over, so a note attached
+    # to it would land nowhere. The task gets a fresh one instead.
+    if problem is not None and problem["closed_at"] is None:
         return problem
     row = await pool.fetchrow("SELECT content FROM todoist_tasks WHERE id = $1", task_id)
     if row is None:
         return None
+    # The event id is what makes two callers racing for one task idempotent,
+    # so it stays derived from the task — but the CLOSED problem's id is part
+    # of it, or the claim made by the first problem would answer `duplicate`
+    # for ever and the task could never have a second one.
+    external_id = f"task-{task_id}" + (f"@{problem['id']}" if problem is not None else "")
     try:
         result = await ingest_event(
             pool,
             Event(
                 source=source,
-                external_id=f"task-{task_id}",
+                external_id=external_id,
                 kind="occurrence",
                 title=str(row["content"] or f"Task {task_id}")[:200],
-                subject=subject or f"task-{task_id}",
+                # The TASK is the subject, never the repo. Keying a manual
+                # problem on the repo made every task in one repo the same
+                # problem: the second task's session notes, PR links and
+                # comments all landed on the first task. The repo is context,
+                # so it rides in the payload.
+                subject=f"task-{task_id}",
                 subject_kind="repo",
                 klass="manual",
                 severity="info",
-                payload={"task_id": task_id},
+                payload={"task_id": task_id, "github_repo": subject},
             ),
         )
     except ValueError as exc:
