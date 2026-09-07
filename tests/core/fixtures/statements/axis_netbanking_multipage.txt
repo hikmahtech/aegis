@@ -1,0 +1,30 @@
+
+             Statement of Account No :918020012344321 for the period (From : 01-07-2026 To : 31-07-2026)
+
+MR. SPECIMEN ACCOUNTHOLDER                        Cust ID : 900000001
+
+Tran Date    Chq No                   Particulars                  Debit          Credit         Balance          Init.
+
+                      OPENING BALANCE                                                                 10,000.00
+01-07-2026            POS/EXAMPLESTORE/MUMBAI/010726                   300.00                          9,700.00  KLYN
+                      412345678901
+02-07-2026            UPI/P2A/612345678901/SPECIMEN                                1,500.00           11,200.00  KLYN
+03-07-2026            CreditCard Payment XXXX 1313                   2,500.00                          8,700.00  KLYN
+05-07-2026   UPI/P2M/712345678901/SHOP                         50.00             8,650.00 KLYN
+             /BANK/abcdef//1x2/
+             SPECIMEN SUPPLIES LTD
+06-07-2026   NEFT/AXISP00123456/SUPPLIES                               200.00    8,850.00 KLYN
+07-07-2026   BRN-CHARGES GST                                  150.00             8,700.00 KLYN
+10-07-2026   ATM/CWDR/EXAMPLE                              100.00    8,600.00 KLYN
+11-07-2026   BILL 01.02.2024 ELEC                           25.00    8,575.00 KLYN
+             CONSUMER 90000123
+             SWEEP TO DEPOSIT
+12-07-2026   IMPS/612345678902/SWEEP                   8,574.65           .35 KLYN
+20-07-2026             NEFT/AXISP00123457/REFUND                                           1,000.00             1,000.35
+21-07-2026             BRN-CASH WDL SELF                                     500.00                               500.35
+
+                       TRANSACTION TOTAL                                 12,199.65      2,700.00
+                       CLOSING BALANCE                                                                           500.35
+
+ CWDR                     Cash Withdrawal Through ATM
+                                            ++++ End of Statement ++++
