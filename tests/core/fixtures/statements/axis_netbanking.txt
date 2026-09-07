@@ -1,0 +1,14 @@
+
+             Statement of Account No :918020012344321 for the period (From : 01-07-2026 To : 31-07-2026)
+
+Tran Date    Chq No                   Particulars                  Debit          Credit         Balance          Init.
+                          OPENING BALANCE                                                              10000.00
+01-07-2026                            POS/EXAMPLESTORE/MUMBAI/010726   300.00                           9700.00
+02-07-2026                            UPI/P2A/612345678901/SPECIMEN                 1500.00            11200.00
+03-07-2026                            CreditCard Payment XXXX 1313    2500.00                           8700.00
+
+                          TRANSACTION TOTAL                             2800.00       1500.00
+                          CLOSING BALANCE                                                                   8700.00
+
+                                                       ++++ End of Statement ++++
+

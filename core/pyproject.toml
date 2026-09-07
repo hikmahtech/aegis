@@ -21,6 +21,9 @@ dependencies = [
     "structlog>=24.4.0",
     "temporalio>=1.7.0",
     "pdfminer.six>=20231228",
+    # Statement PDFs are encrypted; pikepdf decrypts them IN MEMORY so no
+    # decrypted file is written and no password reaches argv (spec §5.2).
+    "pikepdf>=9.0",
     "trafilatura>=1.12.0",
     "youtube-transcript-api>=1.0.0",
     "python-multipart>=0.0.9",
