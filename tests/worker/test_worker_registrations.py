@@ -212,6 +212,7 @@ def test_agent_task_registrations_reach_the_worker():
         "kill_task_turn",
         "record_task_turn",
         "find_task_turns_due",
+        "reconcile_work_sessions",
         "service_health",
         "service_logs",
         "restart_service",

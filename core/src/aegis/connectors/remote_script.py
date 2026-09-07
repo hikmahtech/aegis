@@ -203,7 +203,7 @@ def _agent_launch_flags(
     `session_id` pins the run to ONE long-lived claude session, which is how a
     Todoist task keeps its context across turns instead of re-explaining itself
     every time. It is caller-chosen (a uuid4 minted once and stored on the
-    task's `task_sessions` row — NOT derived from the task, so a task whose
+    task's `work_sessions` row — NOT derived from the task, so a task whose
     session was cleaned up and later restarted gets a fresh one), so the caller
     knows the id before the run exists and can find the session again.
     The first turn CREATES it with `--session-id <uuid>` (plus `-n <name>`, a
@@ -717,6 +717,16 @@ class RemoteScriptConnector:
 
     # ── engine routing ───────────────────────────────────────────────────────
 
+    def _claude_account_label(self, config_dir: str) -> str:
+        """The account label a CLAUDE_CONFIG_DIR was configured under; '' for
+        the host's default login or a dir no account names."""
+        if not config_dir:
+            return ""
+        for label, path in (self._claude_config_dirs or {}).items():
+            if path == config_dir:
+                return str(label)
+        return ""
+
     def _claude_config_dir_for(self, account: str) -> str:
         """CLAUDE_CONFIG_DIR for a named account (default account when empty);
         '' means the host's default ~/.claude login."""
@@ -974,7 +984,7 @@ class RemoteScriptConnector:
         stream-json parsing is unchanged.
 
         Returns {"run_id", "repo", "repo_path", "output_file", "status": "running",
-        "worktree_path", "host", "in_tmux", "engine"} on launch success, or
+        "worktree_path", "host", "in_tmux", "engine", "claude_account"} on launch success, or
         {"run_id", "status": "failed", "error": ...} on error.
         """
         import uuid
@@ -1013,11 +1023,16 @@ class RemoteScriptConnector:
                 config_dir = route_config_dir
             else:
                 config_dir = self._claude_config_dir_for("")
+            # The label behind `config_dir`, reported back so a task session
+            # records the account it was created under: `--resume` on another
+            # profile is a fresh, amnesiac session.
+            account_label = self._claude_account_label(config_dir)
         else:
             host, use_tmux = await self._resolve_kimi_host()
             # DB-configured kimi binary wins over the caller's env-derived path.
             binary = self._kimi_binary or kimi_binary
             config_dir = ""
+            account_label = ""
 
         # A caller-supplied worktree is the caller's to create, refresh and
         # delete; this flag is what keeps every cleanup path below off it.
@@ -1216,6 +1231,7 @@ class RemoteScriptConnector:
             "host": host,
             "in_tmux": launched_in_tmux,
             "engine": engine,
+            "claude_account": account_label,
         }
 
     def _skills_source_dir(self) -> str:

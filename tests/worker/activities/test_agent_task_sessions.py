@@ -1,6 +1,6 @@
-"""Task-lane activities: session bootstrap, collision verdict, turn launch.
+"""Task-lane activities: session bootstrap, collision lookup, turn launch.
 
-The DB-backed tests run against the real test database (`task_sessions`,
+The DB-backed tests run against the real test database (`work_sessions`,
 `todoist_tasks`, `todoist_notes`). Everything that would reach the coding host
 or an LLM uses a fake whose signature is pinned to the real class at the bottom
 of this file — a fake that has drifted from the class it stands in for is the
@@ -11,11 +11,10 @@ from __future__ import annotations
 
 import asyncio
 import inspect
-import time
 import uuid
 
 import pytest_asyncio
-from aegis.services import task_sessions as svc
+from aegis.services import work_sessions as svc
 from aegis_worker.activities.agent_task import AgentTaskActivities
 
 _TASK = "ats-1"
@@ -48,7 +47,7 @@ _UNRESOLVED = {"github_repo": "", "repo_path": "", "source": "none", "candidates
 
 
 async def _purge(db_pool) -> None:
-    await db_pool.execute("DELETE FROM task_sessions WHERE task_id = $1", _TASK)
+    await db_pool.execute("DELETE FROM work_sessions WHERE task_id = $1", _TASK)
     await db_pool.execute("DELETE FROM todoist_notes WHERE item_id = $1", _TASK)
     await db_pool.execute("DELETE FROM todoist_tasks WHERE id = $1", _TASK)
 
@@ -202,6 +201,7 @@ class _Connector:
                 "resume": resume,
                 "name": name,
                 "worktree_path": worktree_path,
+                "claude_account": claude_account,
             }
         )
         if self.launch != "running":
@@ -214,45 +214,10 @@ class _Connector:
             "engine": "claude",
             "in_tmux": True,
             "worktree_path": worktree_path,
+            # The label the connector resolved the launch to — what the row
+            # records and the next turn resumes under.
+            "claude_account": claude_account or "work",
         }
-
-
-class _LLM:
-    """`LLMClient.think` stand-in; `reply` may be an exception to raise.
-
-    The reply goes under `response`, which is the key the real `think()`
-    returns. It used to be `content`, a key `LLMClient` has never returned, and
-    that one word made every collision test in this file unfalsifiable: the
-    activity read `content` too, so fake and production agreed on a shape the
-    real client never produces (#413).
-    """
-
-    def __init__(self, reply):
-        self.reply = reply
-        self.calls: list[dict] = []
-
-    async def think(
-        self,
-        prompt: str,
-        model: str = "gemma4:e2b",
-        system_prompt: str | None = None,
-        max_tokens: int = 2000,
-        db_pool=None,
-        purpose: str | None = None,
-        agent_id: str | None = None,
-    ) -> dict:
-        self.calls.append(
-            {
-                "prompt": prompt,
-                "model": model,
-                "max_tokens": max_tokens,
-                "purpose": purpose,
-                "agent_id": agent_id,
-            }
-        )
-        if isinstance(self.reply, Exception):
-            raise self.reply
-        return {"response": self.reply}
 
 
 # --- load_task ---------------------------------------------------------------
@@ -511,58 +476,12 @@ async def test_ensure_without_a_connector_is_unresolved(db_pool, _task):
 
 # --- check_task_collision ----------------------------------------------------
 
-_HUMAN = {
-    "account": "personal",
-    "session_id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
-    "name": "fix-retry",
-    "cwd": "/w/hikmah/aegis",
-    "repo": "hikmah/aegis",
-    "status": "idle",
-    "kind": "",
-    "owner": "human",
-}
-_OURS = {
-    "account": "personal",
-    "session_id": _SESSION_ID,
-    "name": f"task {_TASK}: Fix the retry policy",
-    "cwd": _WT,
-    "repo": "hikmah/aegis",
-    "status": "busy",
-    "kind": "",
-    "owner": "aegis",
-}
-_GIT = (
-    "fix-retry\n"
-    "---\n"
-    "abc1234 cap the retry policy\n"
-    "def5678 add a failing test\n"
-    "0011aab scaffold\n"
-    "---\n"
-    " M worker/src/aegis_worker/activities/agent_task.py\n"
-    "?? notes.md\n"
-)
-_SAME = '{"same_task": true, "session_name": "fix-retry", "reason": "same branch"}'
+_OPERATOR_SID = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+_OUTPUT = "/tmp/aegis-kimi-run-r1.jsonl"
 
 
-def _collision_act(db_pool, conn, llm=None, model_balanced="kimi-k2.5"):
-    return AgentTaskActivities(
-        db_pool=db_pool, remote_script=conn, llm_client=llm, model_balanced=model_balanced
-    )
-
-
-async def test_our_own_live_session_beats_every_other_verdict(db_pool, _task):
-    """Rule 1. The operator has resumed THIS task's session, so the comment is
-    already in front of them — asking an LLM anything would be wasted, and any
-    other verdict would double-drive one conversation."""
-    conn = _Connector(sessions=[_HUMAN, _OURS], git_stdout=_GIT)
-    llm = _LLM(_SAME)
-    out = await _collision_act(db_pool, conn, llm).check_task_collision(
-        _TASK, "hikmah/aegis", _SESSION_ID, False
-    )
-    assert out["verdict"] == "you_are_in_it"
-    assert out["session"]["name"] == _OURS["name"]
-    assert llm.calls == []
-    assert conn.git_calls == []
+def _collision_act(db_pool, conn):
+    return AgentTaskActivities(db_pool=db_pool, remote_script=conn)
 
 
 async def _own_session_row(db_pool, *, output_file: str = "", host: str = "meem") -> None:
@@ -571,325 +490,202 @@ async def _own_session_row(db_pool, *, output_file: str = "", host: str = "meem"
         await svc.set_last_run(db_pool, _TASK, output_file=output_file, host=host)
 
 
-async def test_our_own_session_is_ours_only_while_its_last_turn_still_writes(db_pool, _task):
-    """The aegis branch of rule 1 — an orphan of ours that outlived its kill.
-
-    The registry cannot say so: `_OURS` sits in the task's `-aegis-wt/`
-    worktree, which `normalise_repo` tags `owner="aegis"` whoever is typing in
-    it. What settles it is that the last turn we launched is STILL holding its
-    output file open.
-    """
-    await _own_session_row(db_pool, output_file="/tmp/aegis-kimi-run-r1.jsonl")
-    conn = _Connector(sessions=[_OURS], alive=True)
-    out = await _collision_act(db_pool, conn).check_task_collision(
-        _TASK, "hikmah/aegis", _SESSION_ID, False
+async def _operator_row(db_pool, *, status: str = "active", account: str = "personal") -> dict:
+    return await svc.upsert_operator_session(
+        db_pool,
+        task_id=_TASK,
+        account=account,
+        status=status,
+        summary="halfway through the retry cap",
+        session_id=_OPERATOR_SID,
     )
-    assert out["verdict"] == "you_are_in_it"
-    assert out["session"]["owner"] == "aegis"
-    assert conn.alive_calls == [
-        {"output_file": "/tmp/aegis-kimi-run-r1.jsonl", "host": "meem"}
-    ]
 
 
-async def test_a_takeover_in_our_own_worktree_is_a_person_not_an_orphan(db_pool, _task):
-    """The case the whole rule exists for. The footer we post tells the operator
-    to `cd <worktree_path> && claude --resume <id>` — a path containing
-    `-aegis-wt/` — so the registry tags their takeover `owner="aegis"` and the
-    flow would take the orphan path: no Slack note, no watermark bump, and the
-    comment re-dispatched every 15 minutes. A DEAD last-turn output file is what
-    says a person, not a run of ours, is holding this session.
-
-    Falsifiable: return the registry's own `owner` and this fails.
-    """
-    await _own_session_row(db_pool, output_file="/tmp/aegis-kimi-run-r1.jsonl")
-    assert _OURS["owner"] == "aegis", "the registry's tag, which must not decide this"
-    conn = _Connector(sessions=[_OURS], alive=False)
-    out = await _collision_act(db_pool, conn).check_task_collision(
-        _TASK, "hikmah/aegis", _SESSION_ID, False
-    )
-    assert out["verdict"] == "you_are_in_it"
-    assert out["session"]["owner"] == "human"
-
-
-async def test_an_unprobeable_own_session_counts_as_a_person(db_pool, _task):
-    """Two unknowns, both resolved the same way: no turn on record (the row
-    predates the first launch), and a probe that raised. The aegis branch is the
-    harsher one, so unknown must never land there."""
+async def test_nothing_on_the_task_proceeds(db_pool, _task):
     await _own_session_row(db_pool)
-    conn = _Connector(sessions=[_OURS], alive=True)
-    out = await _collision_act(db_pool, conn).check_task_collision(
-        _TASK, "hikmah/aegis", _SESSION_ID, False
-    )
-    assert out["session"]["owner"] == "human"
+    conn = _Connector(alive=True)
+    out = await _collision_act(db_pool, conn).check_task_collision(_TASK, False)
+    assert out["verdict"] == "proceed"
     assert conn.alive_calls == [], "nothing to probe without a recorded run"
 
-    await svc.set_last_run(db_pool, _TASK, output_file="/tmp/aegis-kimi-run-r1.jsonl", host="meem")
-    broken = _Connector(sessions=[_OURS], alive="boom")
-    out = await _collision_act(db_pool, broken).check_task_collision(
-        _TASK, "hikmah/aegis", _SESSION_ID, False
-    )
+
+async def test_our_own_orphan_turn_is_still_running(db_pool, _task):
+    """Rule 1. The last turn AEGIS launched is still holding its output file
+    open — an orphan the deadline kill did not reach. A `--resume` beside it
+    would have two runs writing one session."""
+    await _own_session_row(db_pool, output_file=_OUTPUT)
+    conn = _Connector(alive=True)
+    out = await _collision_act(db_pool, conn).check_task_collision(_TASK, False)
+    assert out["verdict"] == "turn_still_running"
+    assert out["session"]["owner"] == "aegis"
+    assert out["session"]["session_id"] == (await svc.get_session(db_pool, _TASK))["session_id"]
+    assert conn.alive_calls == [{"output_file": _OUTPUT, "host": "meem"}]
+
+
+async def test_a_finished_turn_is_not_an_orphan(db_pool, _task):
+    await _own_session_row(db_pool, output_file=_OUTPUT)
+    out = await _collision_act(db_pool, _Connector(alive=False)).check_task_collision(_TASK)
+    assert out["verdict"] == "proceed"
+
+
+async def test_an_unprobeable_turn_proceeds(db_pool, _task):
+    """A probe that raised is "not running": the launch that follows fails on
+    its own terms if the host really is down, and a comment must not be held
+    back for ever by a probe that cannot answer."""
+    await _own_session_row(db_pool, output_file=_OUTPUT)
+    out = await _collision_act(db_pool, _Connector(alive="boom")).check_task_collision(_TASK)
+    assert out["verdict"] == "proceed"
+
+
+async def test_an_active_operator_session_means_you_are_in_it(db_pool, _task):
+    """Rule 2. The operator's own session reported itself on the task with
+    `report_progress`, so the comment is already in front of them — and the
+    verdict names the session so the Slack note can."""
+    await _own_session_row(db_pool)
+    await _operator_row(db_pool)
+    out = await _collision_act(db_pool, _Connector(alive=False)).check_task_collision(_TASK)
     assert out["verdict"] == "you_are_in_it"
-    assert out["session"]["owner"] == "human"
+    assert out["session"]["owner"] == "operator"
+    assert out["session"]["account"] == "personal"
+    assert out["session"]["session_id"] == _OPERATOR_SID
+    assert out["session"]["name"] == "halfway through the retry cap"
+    assert "personal" in out["reason"]
 
 
-async def test_no_human_session_in_the_repo_proceeds(db_pool, _task):
-    conn = _Connector(sessions=[dict(_HUMAN, owner="aegis")], git_stdout=_GIT)
-    llm = _LLM(_SAME)
-    out = await _collision_act(db_pool, conn, llm).check_task_collision(
-        _TASK, "hikmah/aegis", _SESSION_ID, False
-    )
-    assert out["verdict"] == "proceed"
-    assert out["sessions"] == []
-    assert llm.calls == []
-
-
-async def test_the_llm_hands_the_task_over_when_a_person_is_on_it(db_pool, _task):
-    # The flow always ensures the session before it checks for a collision, so
-    # the row is there and the LLM spend is attributed to the owning agent.
-    await svc.create_session(db_pool, task_id=_TASK, agent_id="pandoras-actor")
-    conn = _Connector(sessions=[_HUMAN], git_stdout=_GIT)
-    llm = _LLM(_SAME)
-    out = await _collision_act(db_pool, conn, llm).check_task_collision(
-        _TASK, "hikmah/aegis", _SESSION_ID, False
-    )
-    assert out["verdict"] == "hand_to_you"
-    assert out["session"]["name"] == "fix-retry"
-    assert out["session"]["branch"] == "fix-retry"
-    assert out["reason"] == "same branch"
-
-    # One SSH round trip per candidate session, and its output reaches the
-    # prompt: "same repo" is not a collision, so branch/commits/dirty files are
-    # the whole basis for the verdict.
-    assert len(conn.git_calls) == 1
-    assert conn.git_calls[0]["host"] == "meem"
-    cmd = conn.git_calls[0]["cmd"]
-    assert cmd.startswith("git -C /w/hikmah/aegis branch --show-current")
-    assert "log -3 --oneline" in cmd and "status --short" in cmd
-    assert cmd.count("echo ---") == 2
-    prompt = llm.calls[0]["prompt"]
-    assert "fix-retry" in prompt
-    assert "cap the retry policy" in prompt
-    assert "notes.md" in prompt
-    assert "Fix the retry policy" in prompt  # the task title
-    assert llm.calls[0]["purpose"] == "task_session_collision"
-    assert llm.calls[0]["max_tokens"] == 4096
-    assert llm.calls[0]["agent_id"] == "pandoras-actor"
-
-
-class _RealShapeLLM:
-    """`think()` returning EXACTLY what `LLMClient._think_once` returns.
-
-    Written out in full, and deliberately not reusing `_LLM`: the bug in #413
-    was a shared wrong assumption between the activity and the fake, so a test
-    that pins the real shape has to state that shape itself.
-    """
-
-    def __init__(self, reply: str):
-        self.reply = reply
-        self.calls: list[dict] = []
-
-    async def think(self, prompt: str, model: str = "gemma4:e2b", **kw) -> dict:
-        self.calls.append({"prompt": prompt, "model": model, **kw})
-        return {
-            "response": self.reply,
-            "model": model,
-            "prompt_tokens": 100,
-            "completion_tokens": 20,
-        }
-
-
-async def test_the_verdict_is_read_from_the_key_think_actually_returns(db_pool, _task):
-    """#413. The check read `result["content"]`; `think()` returns `response`.
-
-    So the verdict string was always `""`, `parse_same_task_verdict` failed
-    closed to `same_task: False`, and EVERY collision check answered "no
-    collision" — the LLM billed, the answer discarded, and an agent run
-    launched into a repo a person was working in.
-
-    Falsifiable: put the reply back under `content` in the fake above, or read
-    `content` in the activity, and this fails.
-    """
-    await svc.create_session(db_pool, task_id=_TASK, agent_id="pandoras-actor")
-    conn = _Connector(sessions=[_HUMAN], git_stdout=_GIT)
-    llm = _RealShapeLLM(_SAME)
-    out = await _collision_act(db_pool, conn, llm).check_task_collision(
-        _TASK, "hikmah/aegis", _SESSION_ID, False
-    )
-    assert out["verdict"] == "hand_to_you"
-    assert out["session"]["name"] == "fix-retry"
-    assert out["reason"] == "same branch"
-    assert len(llm.calls) == 1
-
-
-async def test_a_no_collision_answer_in_the_same_key_still_proceeds(db_pool, _task):
-    """The other half. Reading the right key must not turn every answer into a
-    hand-over — a model that says "different task" still launches the run, and
-    its stated reason is what the flow reports."""
-    await svc.create_session(db_pool, task_id=_TASK, agent_id="pandoras-actor")
-    conn = _Connector(sessions=[_HUMAN], git_stdout=_GIT)
-    llm = _RealShapeLLM('{"same_task": false, "reason": "different feature"}')
-    out = await _collision_act(db_pool, conn, llm).check_task_collision(
-        _TASK, "hikmah/aegis", _SESSION_ID, False
-    )
-    assert out["verdict"] == "proceed"
-    assert out["reason"] == "different feature"
-    assert [s["name"] for s in out["sessions"]] == ["fix-retry"]
-
-
-async def test_a_shallow_history_keeps_its_commit_out_of_the_status_field(db_pool, _task):
-    """The blocks are separated by an echoed marker, not counted off as
-    "the next three lines": a repo with one commit would otherwise put two
-    status lines in the log field and the real changes nowhere."""
-    conn = _Connector(
-        sessions=[_HUMAN],
-        git_stdout="fix-retry\n---\nabc1234 the only commit\n---\n M a.py\n?? b.py\n",
-    )
-    out = await _collision_act(db_pool, conn, _LLM(_SAME)).check_task_collision(
-        _TASK, "hikmah/aegis", _SESSION_ID, False
-    )
-    assert out["session"]["branch"] == "fix-retry"
-    assert out["session"]["log"] == "abc1234 the only commit"
-    assert out["session"]["status_short"] == "M a.py, ?? b.py"
-
-
-async def test_the_git_probes_run_concurrently(db_pool, _task):
-    """Each probe is an SSH round trip inside ONE activity's start-to-close
-    budget. Run in series they add up and the activity is killed by Temporal,
-    which is a hard failure rather than the `proceed` this check degrades to."""
-    humans = [dict(_HUMAN, name=f"s{n}", session_id=f"sid-{n}") for n in range(3)]
-    conn = _Connector(sessions=humans, git_stdout=_GIT, git_delay=0.2)
-    started = time.perf_counter()
-    out = await _collision_act(db_pool, conn, _LLM(_SAME)).check_task_collision(
-        _TASK, "hikmah/aegis", _SESSION_ID, False
-    )
-    elapsed = time.perf_counter() - started
-    assert len(conn.git_calls) == 3
-    assert elapsed < 0.45, elapsed  # in series this is >= 0.6
-    assert out["verdict"] == "hand_to_you"
-
-
-async def test_only_the_first_five_sessions_are_probed_and_the_rest_still_reported(
-    db_pool, _task
-):
-    humans = [dict(_HUMAN, name=f"s{n}", session_id=f"sid-{n}") for n in range(7)]
-    conn = _Connector(sessions=humans, git_stdout=_GIT)
-    out = await _collision_act(db_pool, conn, _LLM('{"same_task": false}')).check_task_collision(
-        _TASK, "hikmah/aegis", _SESSION_ID, False
-    )
-    assert len(conn.git_calls) == 5
-    assert [s["name"] for s in out["sessions"]] == [f"s{n}" for n in range(7)]
-
-
-async def test_a_failing_probe_still_produces_a_verdict(db_pool, _task):
-    """One unreachable session must not lose the verdict — it is rendered
-    `unknown` and the model judges on what is left."""
-    conn = _Connector(sessions=[_HUMAN], git_error=True)
-    llm = _LLM(_SAME)
-    out = await _collision_act(db_pool, conn, llm).check_task_collision(
-        _TASK, "hikmah/aegis", _SESSION_ID, False
-    )
-    assert out["verdict"] == "hand_to_you"
-    assert "branch" not in out["session"]
-    assert "branch: unknown" in llm.calls[0]["prompt"]
-
-
-async def test_the_session_working_directory_is_shell_quoted(db_pool, _task):
-    """The cwd comes from `claude agents --json` on the coding host — a path
-    AEGIS did not choose — and it is spliced into a remote shell command."""
-    conn = _Connector(sessions=[dict(_HUMAN, cwd="/w/my repo; rm -rf x")], git_stdout=_GIT)
-    await _collision_act(db_pool, conn, _LLM(_SAME)).check_task_collision(
-        _TASK, "hikmah/aegis", _SESSION_ID, False
-    )
-    assert conn.git_calls[0]["cmd"].startswith("git -C '/w/my repo; rm -rf x' branch")
-
-
-async def test_hand_to_you_falls_back_to_the_first_session_when_the_name_is_unknown(
-    db_pool, _task
-):
-    conn = _Connector(sessions=[_HUMAN], git_stdout=_GIT)
-    llm = _LLM('{"same_task": true, "session_name": "something else", "reason": "r"}')
-    out = await _collision_act(db_pool, conn, llm).check_task_collision(
-        _TASK, "hikmah/aegis", _SESSION_ID, False
-    )
-    assert out["verdict"] == "hand_to_you"
-    assert out["session"]["name"] == "fix-retry"
-
-
-async def test_an_unrelated_human_session_proceeds_but_is_reported(db_pool, _task):
-    """Rule 3: the turn runs, and the sessions come back so the flow can warn
-    the operator that it is working alongside them."""
-    conn = _Connector(sessions=[_HUMAN], git_stdout=_GIT)
-    llm = _LLM('{"same_task": false, "session_name": "", "reason": "different feature"}')
-    out = await _collision_act(db_pool, conn, llm).check_task_collision(
-        _TASK, "hikmah/aegis", _SESSION_ID, False
-    )
-    assert out["verdict"] == "proceed"
-    assert [s["name"] for s in out["sessions"]] == ["fix-retry"]
-
-
-async def test_take_over_skips_the_same_task_check(db_pool, _task):
-    """Rule 4. The override must not merely ignore a `hand_to_you` verdict — it
-    must not ASK, or a model that keeps saying "same task" would keep costing a
-    call the operator has already overruled."""
-    conn = _Connector(sessions=[_HUMAN], git_stdout=_GIT)
-    llm = _LLM(_SAME)
-    out = await _collision_act(db_pool, conn, llm).check_task_collision(
-        _TASK, "hikmah/aegis", _SESSION_ID, True
-    )
-    assert out["verdict"] == "proceed"
-    assert llm.calls == []
-    assert conn.git_calls == []
-    assert [s["name"] for s in out["sessions"]] == ["fix-retry"]
-
-
-async def test_a_failing_llm_proceeds(db_pool, _task):
-    conn = _Connector(sessions=[_HUMAN], git_stdout=_GIT)
-    llm = _LLM(RuntimeError("model is down"))
-    out = await _collision_act(db_pool, conn, llm).check_task_collision(
-        _TASK, "hikmah/aegis", _SESSION_ID, False
-    )
+async def test_a_parked_or_stale_operator_session_proceeds(db_pool, _task):
+    await _own_session_row(db_pool)
+    await _operator_row(db_pool, status="parked")
+    out = await _collision_act(db_pool, _Connector()).check_task_collision(_TASK)
     assert out["verdict"] == "proceed"
 
+    await _operator_row(db_pool, status="active")
+    await db_pool.execute(
+        "UPDATE work_sessions SET last_seen_at = now() - interval '2 hours' "
+        "WHERE task_id = $1 AND owner = 'operator'",
+        _TASK,
+    )
+    out = await _collision_act(db_pool, _Connector()).check_task_collision(_TASK)
+    assert out["verdict"] == "proceed", "an active row past the window is not a person in the task"
 
-async def test_no_llm_client_proceeds(db_pool, _task):
-    conn = _Connector(sessions=[_HUMAN], git_stdout=_GIT)
-    out = await _collision_act(db_pool, conn, None).check_task_collision(
-        _TASK, "hikmah/aegis", _SESSION_ID, False
+
+async def test_take_over_overrides_the_operator_row_but_not_an_orphan(db_pool, _task):
+    """Rule 4. `take over` is the operator overruling their own registry row —
+    but it cannot authorise driving over a turn of ours that is still running."""
+    await _own_session_row(db_pool)
+    await _operator_row(db_pool)
+    out = await _collision_act(db_pool, _Connector()).check_task_collision(_TASK, True)
+    assert out["verdict"] == "proceed" and out["reason"] == "override"
+
+    await svc.set_last_run(db_pool, _TASK, output_file=_OUTPUT, host="meem")
+    out = await _collision_act(db_pool, _Connector(alive=True)).check_task_collision(_TASK, True)
+    assert out["verdict"] == "turn_still_running"
+
+
+async def test_the_orphan_check_beats_the_operator_row(db_pool, _task):
+    await _own_session_row(db_pool, output_file=_OUTPUT)
+    await _operator_row(db_pool)
+    out = await _collision_act(db_pool, _Connector(alive=True)).check_task_collision(_TASK)
+    assert out["verdict"] == "turn_still_running"
+
+
+async def test_no_pool_proceeds():
+    out = await AgentTaskActivities(remote_script=_Connector()).check_task_collision(_TASK)
+    assert out == {"verdict": "proceed", "session": None, "reason": "no database pool"}
+
+
+async def test_a_broken_registry_read_proceeds(_task):
+    class _BoomPool:
+        async def fetchrow(self, *a, **k):
+            raise RuntimeError("connection reset")
+
+    out = await AgentTaskActivities(db_pool=_BoomPool(), remote_script=None).check_task_collision(
+        _TASK
     )
     assert out["verdict"] == "proceed"
+    assert out["reason"].startswith("check failed: ")
 
 
-async def test_a_broken_inventory_proceeds(db_pool, _task):
-    for sessions in ("boom", "unavailable"):
-        conn = _Connector(sessions=sessions)
-        out = await _collision_act(db_pool, conn, _LLM(_SAME)).check_task_collision(
-            _TASK, "hikmah/aegis", _SESSION_ID, False
-        )
-        assert out["verdict"] == "proceed", sessions
+# --- reconcile_work_sessions -------------------------------------------------
 
 
-async def test_no_connector_proceeds(db_pool, _task):
-    out = await _collision_act(db_pool, None, _LLM(_SAME)).check_task_collision(
-        _TASK, "hikmah/aegis", _SESSION_ID, False
+async def _seen_ago(db_pool, account: str, interval: str) -> None:
+    await db_pool.execute(
+        "UPDATE work_sessions SET last_seen_at = now() - $3::text::interval "
+        "WHERE task_id = $1 AND owner = 'operator' AND account = $2",
+        _TASK,
+        account,
+        interval,
     )
-    assert out["verdict"] == "proceed"
 
 
-async def test_an_empty_model_balanced_resolves_through_the_tier_map(db_pool, _task):
-    """`balanced` is a TIER, not a model name. Sending the literal upstream is a
-    guaranteed 404 on a path that then fails open, so the collision check would
-    silently stop working."""
-    from aegis.llm.tier import set_model_tiers
+async def _operator_status(db_pool, account: str) -> str:
+    return await db_pool.fetchval(
+        "SELECT status FROM work_sessions WHERE task_id = $1 AND owner = 'operator' "
+        "AND account = $2",
+        _TASK,
+        account,
+    )
 
-    previous = set_model_tiers({"balanced": "kimi-k2.5"})
-    try:
-        conn = _Connector(sessions=[_HUMAN], git_stdout=_GIT)
-        llm = _LLM(_SAME)
-        act = _collision_act(db_pool, conn, llm, model_balanced="")
-        await act.check_task_collision(_TASK, "hikmah/aegis", _SESSION_ID, False)
-        assert llm.calls[0]["model"] == "kimi-k2.5"
-    finally:
-        set_model_tiers(previous)
+
+async def test_reconcile_parks_stale_operator_rows_the_host_does_not_list(db_pool, _task):
+    """`report_progress` said active; `claude agents --json` says whether the
+    session still exists. Listed → touched. Unlisted and quiet past the window
+    → parked, so `task_context` stops showing a session that ended without a
+    final report."""
+    live = await _operator_row(db_pool, account="personal")
+    gone = await svc.upsert_operator_session(
+        db_pool,
+        task_id=_TASK,
+        account="work",
+        status="active",
+        summary="x",
+        session_id="bbbbbbbb-bbbb-cccc-dddd-eeeeeeeeeeee",
+    )
+    await _seen_ago(db_pool, "personal", "2 hours")
+    await _seen_ago(db_pool, "work", "2 hours")
+    conn = _Connector(sessions=[dict(_HUMAN, session_id=live["session_id"])])
+    out = await AgentTaskActivities(db_pool=db_pool, remote_script=conn).reconcile_work_sessions()
+    assert out == {"refreshed": 1, "parked": 1, "inventory": "ok"}
+    assert await _operator_status(db_pool, "personal") == "active"
+    assert await _operator_status(db_pool, "work") == "parked"
+    seen = await db_pool.fetchval(
+        "SELECT last_seen_at > now() - interval '1 minute' FROM work_sessions WHERE id = $1::uuid",
+        live["id"],
+    )
+    assert seen, "a listed session's row is touched"
+    assert gone["status"] == "active", "the row was active before the sweep"
+
+
+async def test_reconcile_leaves_a_recent_unlisted_row_alone(db_pool, _task):
+    """The hook may not know the session id, so an unlisted row is only stale
+    once it has also gone quiet — a fresh report is proof enough on its own."""
+    await _operator_row(db_pool)
+    out = await AgentTaskActivities(db_pool=db_pool, remote_script=_Connector()).reconcile_work_sessions()
+    assert out == {"refreshed": 0, "parked": 0, "inventory": "ok"}
+    assert await _operator_status(db_pool, "personal") == "active"
+
+
+async def test_reconcile_fails_open_without_an_inventory(db_pool, _task):
+    await _operator_row(db_pool)
+    await _seen_ago(db_pool, "personal", "2 hours")
+    for conn in (_Connector(sessions="unavailable"), _Connector(sessions="boom"), None):
+        out = await AgentTaskActivities(db_pool=db_pool, remote_script=conn).reconcile_work_sessions()
+        assert out["parked"] == 0 and out["inventory"] != "ok", conn
+    assert await _operator_status(db_pool, "personal") == "active"
+    out = await AgentTaskActivities(remote_script=_Connector()).reconcile_work_sessions()
+    assert out["inventory"] == "no database pool"
+
+
+_HUMAN = {
+    "account": "personal",
+    "session_id": _OPERATOR_SID,
+    "name": "fix-retry",
+    "cwd": "/w/hikmah/aegis",
+    "repo": "hikmah/aegis",
+    "status": "idle",
+    "kind": "",
+    "owner": "human",
+}
 
 
 # --- launch_task_turn / kill_task_turn ---------------------------------------
@@ -952,6 +748,31 @@ async def test_a_running_launch_records_where_the_turn_writes(db_pool, _task):
     row = await svc.get_session(db_pool, _TASK)
     assert row["last_output_file"] == "/tmp/aegis-kimi-run-r1.jsonl"
     assert row["last_host"] == "meem"
+
+
+async def test_a_running_launch_records_the_account_it_resolved(db_pool, _task):
+    """The row remembers the CLAUDE_CONFIG_DIR label the connector picked, so
+    the next turn's `--resume` runs under the same profile. An empty label
+    (the host's default login) keeps whatever the row had."""
+    await svc.create_session(db_pool, task_id=_TASK, agent_id="pandoras-actor")
+    await svc.set_repo(
+        db_pool, _TASK, repo="hikmah/aegis", github_repo="hikmahtech/aegis",
+        worktree_path=_WT, branch=_BRANCH, host="meem",
+    )
+    act = AgentTaskActivities(db_pool=db_pool, remote_script=_Connector())
+    await act.launch_task_turn(_SESSION, "investigate", "pandoras-actor", False, "t", 60)
+    row = await svc.get_session(db_pool, _TASK)
+    assert row["account"] == "work" and row["engine"] == "claude"
+    assert row["status"] == "active"
+
+
+async def test_a_later_turn_resumes_under_the_recorded_account():
+    conn = _Connector()
+    await AgentTaskActivities(remote_script=conn).launch_task_turn(
+        dict(_SESSION, turns=1, account="personal"), "go", "pandoras-actor", True, "t", 30
+    )
+    assert conn.launches[0]["claude_account"] == "personal"
+    assert conn.launches[0]["resume"] is True
 
 
 async def test_a_failed_launch_records_no_run(db_pool, _task):
@@ -1072,7 +893,6 @@ def test_fake_connector_matches_the_real_signatures():
     on either one leaves every test in this file passing against a fake that no
     longer resembles what production calls."""
     from aegis.connectors.remote_script import RemoteScriptConnector
-    from aegis.llm import LLMClient
 
     for name in (
         "coding_settings",
@@ -1086,39 +906,3 @@ def test_fake_connector_matches_the_real_signatures():
         real = inspect.signature(getattr(RemoteScriptConnector, name))
         fake = inspect.signature(getattr(_Connector, name))
         assert list(fake.parameters) == list(real.parameters), name
-
-    real_think = inspect.signature(LLMClient.think)
-    fake_think = inspect.signature(_LLM.think)
-    assert list(fake_think.parameters) == list(real_think.parameters)
-    kwargs = {"prompt": "p", "model": "m", "max_tokens": 10, "purpose": "x", "agent_id": "a"}
-    real_think.bind(None, **kwargs)
-    fake_think.bind(None, **kwargs)
-
-
-def test_the_fakes_return_the_keys_think_really_returns():
-    """The signature pin above covers what goes IN. #413 was about what comes
-    OUT: both `_LLM` and the activity read `content`, a key `LLMClient` has
-    never returned, so the fake agreed with the bug.
-
-    The real keys are read off `_think_once`'s own `return` statements rather
-    than restated here, so renaming `response` upstream fails this test instead
-    of leaving a fake quietly standing for a shape that no longer exists.
-    """
-    import ast
-    import inspect as _inspect
-    import textwrap
-
-    from aegis.llm import LLMClient
-
-    tree = ast.parse(textwrap.dedent(_inspect.getsource(LLMClient._think_once)))
-    real_keys = {
-        k.value
-        for node in ast.walk(tree)
-        if isinstance(node, ast.Return) and isinstance(node.value, ast.Dict)
-        for k in node.value.keys
-        if isinstance(k, ast.Constant)
-    }
-    assert "response" in real_keys, real_keys
-    for fake in (_LLM("x"), _RealShapeLLM("x")):
-        returned = set(asyncio.run(fake.think("p")))
-        assert returned <= real_keys, f"{type(fake).__name__} returns {returned - real_keys}"

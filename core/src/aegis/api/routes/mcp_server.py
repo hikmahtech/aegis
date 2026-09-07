@@ -145,6 +145,11 @@ _UNSERVED_TOOLS = frozenset(
         # A run that can open a maintenance window can silence the alert
         # about itself. Declaring one is an operator action.
         "set_service_state",
+        # An AEGIS turn reports through its own activity; a run that could
+        # register a session on its task could mark that task done. And a
+        # merge hides a problem — a person's call.
+        "report_progress",
+        "merge_problems",
         # A coding run has no business writing the books; `ledger_query` stays.
         "ledger_post",
         "ledger_reclassify",

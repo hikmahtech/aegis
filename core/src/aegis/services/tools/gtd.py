@@ -673,7 +673,7 @@ async def _exec_comment_on_task(
     """
     from aegis.config import Settings
     from aegis.connectors.todoist import TodoistConnector
-    from aegis.services.task_sessions import get_session
+    from aegis.services.work_sessions import get_session
 
     task_id = (task_id or "").strip()
     body = text or ""
@@ -699,7 +699,7 @@ async def _exec_comment_on_task(
     connector = TodoistConnector(api_key=_tk, db_pool=pool, timeout=10.0)
     # `body` is the caller's string unchanged — not stripped, not wrapped. No
     # prefix and no `Workflow run:` footer either: those are what
-    # `services/task_sessions.is_user_note` reads to tell AEGIS's own notes from
+    # `services/work_sessions.is_user_note` reads to tell AEGIS's own notes from
     # the user's, and only a user note starts the task session's next turn. The
     # stripped copy above exists solely to reject a whitespace-only comment.
     cmd = TodoistConnector.build_note_add_command(task_id, body)

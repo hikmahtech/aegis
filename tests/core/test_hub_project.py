@@ -13,7 +13,7 @@ from types import SimpleNamespace
 import pytest
 import pytest_asyncio
 from aegis.connectors.todoist import TodoistConnector
-from aegis.services import hub_project
+from aegis.services import hub_project, work_sessions
 from aegis.services.hub import Event, get_problem, ingest_event, set_service_state
 from aegis.services.hub_project import (
     COLLAPSE_WINDOW,
@@ -420,3 +420,43 @@ async def test_project_pending_survives_one_bad_problem(db_pool, inbox, todoist,
     results = await project_pending(db_pool, now=NOW)
     mine = [x for x in results if x["problem_id"] == r.problem_id]
     assert mine and mine[0]["error"].startswith("todoist exploded")
+
+
+# --- sessions in the block (PR 5) ----------------------------------------------
+
+
+def test_render_block_lists_the_sessions_on_the_task():
+    p = {
+        "id": "abc", "status": "open", "occurrences": 1, "first_seen_at": NOW, "last_seen_at": NOW,
+        "subject": "s", "subject_kind": "service", "severity": "warning", "class": "x",
+    }
+    block = render_block(
+        p,
+        sessions=[
+            {"owner": "aegis", "status": "parked", "account": "work", "last_seen_at": NOW, "summary": "waiting on you: plan"},
+            {"owner": "operator", "status": "active", "account": "", "last_seen_at": None, "summary": ""},
+        ],
+    )
+    assert "Session: aegis parked (work) · seen 2026-09-07 12:00 UTC · waiting on you: plan" in block
+    assert "Session: operator active\n" in block
+    assert render_block(p).count("Session:") == 0
+
+
+async def test_projection_rerenders_the_block_when_a_session_registers(db_pool, inbox, todoist):
+    s = _subject()
+    r = await ingest_event(db_pool, _occ(s, 1), now=NOW)
+    task = (await project(db_pool, r.problem_id, now=NOW))["task_id"]
+    await _mirror_task(db_pool, task)
+    await work_sessions.upsert_operator_session(
+        db_pool, task_id=task, account="personal", status="active", summary="checking the mounts",
+        problem_id=r.problem_id,
+    )
+    out = await project(db_pool, r.problem_id, now=NOW)
+    assert out["comments"] == 0
+    cmd = await db_pool.fetchval(
+        "SELECT command FROM todoist_outbox WHERE temp_id = $1", f"problem-desc-{task}"
+    )
+    assert cmd is not None, "a new session line is a changed block"
+    assert cmd["type"] == "item_update"
+    assert "Session: operator active (personal)" in cmd["args"]["description"]
+    assert "checking the mounts" in cmd["args"]["description"]

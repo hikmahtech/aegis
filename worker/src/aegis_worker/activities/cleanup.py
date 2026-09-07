@@ -79,7 +79,7 @@ class CleanupActivities:
     db_pool: Any = None
     comms_url: str = ""
     api_key: str = ""
-    # RemoteScriptConnector — needed only by `cleanup_task_sessions`, which is
+    # RemoteScriptConnector — needed only by `cleanup_work_sessions`, which is
     # why it is optional: every other activity here is pure SQL.
     remote_script: Any = None
 
@@ -137,11 +137,11 @@ class CleanupActivities:
         return {"archived": archived, "threshold_days": days_int}
 
     @activity.defn
-    async def cleanup_task_sessions(self, days: int = 7) -> dict:
+    async def cleanup_work_sessions(self, days: int = 7) -> dict:
         """Release the git worktrees of coding sessions whose task is finished.
 
         Each `@code` Todoist task holds one persistent Claude Code session in
-        its own worktree on the coding host (`task_sessions`, migration 025).
+        its own worktree on the coding host (`work_sessions`, migrations 025 and 034).
         Nothing else ever removes those directories, so without this sweep the
         host accumulates one checkout per task, forever.
 
@@ -160,7 +160,7 @@ class CleanupActivities:
         Returns ``{removed: int, skipped: int}``.
         """
         if not self.db_pool:
-            logger.warning("cleanup_task_sessions_no_db_pool")
+            logger.warning("cleanup_work_sessions_no_db_pool")
             return {"removed": 0, "skipped": 0}
         try:
             days_int = int(days)
@@ -169,13 +169,13 @@ class CleanupActivities:
         if days_int <= 0:
             # 0 is the operator's off switch; a negative window would reach
             # into the future and sweep live sessions.
-            logger.warning("cleanup_task_sessions_disabled", days=days)
+            logger.warning("cleanup_work_sessions_disabled", days=days)
             return {"removed": 0, "skipped": 0}
 
         rows = await self.db_pool.fetch(
             """
             SELECT ts.task_id, ts.worktree_path, ts.host
-            FROM task_sessions ts
+            FROM work_sessions ts
             LEFT JOIN todoist_tasks t ON t.id = ts.task_id
             WHERE (t.id IS NULL OR t.is_completed)
               AND COALESCE(ts.last_turn_at, ts.created_at)
@@ -192,7 +192,7 @@ class CleanupActivities:
             # all failing is exactly the run that would otherwise time out
             # without ever having reported progress.
             if activity.in_activity():
-                activity.heartbeat(f"task_sessions:{index}/{len(rows)}")
+                activity.heartbeat(f"work_sessions:{index}/{len(rows)}")
             task_id = row["task_id"]
             worktree_path = row["worktree_path"] or ""
             host = row["host"] or ""
@@ -221,13 +221,13 @@ class CleanupActivities:
                     skipped += 1
                     continue
             await self.db_pool.execute(
-                "DELETE FROM task_sessions WHERE task_id = $1", task_id
+                "DELETE FROM work_sessions WHERE task_id = $1", task_id
             )
             removed += 1
 
         if removed or skipped:
             logger.info(
-                "cleanup_task_sessions_done",
+                "cleanup_work_sessions_done",
                 removed=removed,
                 skipped=skipped,
                 idle_days=days_int,

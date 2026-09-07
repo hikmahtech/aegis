@@ -48,7 +48,12 @@ from aegis.services.tools.gtd import (
     _exec_mark_waiting,
     _exec_whats_next,
 )
-from aegis.services.tools.hub import _exec_set_service_state
+from aegis.services.tools.hub import (
+    _exec_merge_problems,
+    _exec_report_progress,
+    _exec_set_service_state,
+    _exec_task_context,
+)
 from aegis.services.tools.infra import (
     _INFRA_CONTEXTS_K8S,  # noqa: F401 — re-export: tests mutate this set in place
     _exec_cloud_identity,
@@ -833,8 +838,12 @@ CHAT_TOOLS = [
             },
         },
     },
-    # Problem hub — deploy / maintenance windows; `services/tools/hub.py`.
+    # Problem hub — deploy / maintenance windows, the session registry and
+    # merges; `services/tools/hub.py`.
     _registry_schema("set_service_state"),
+    _registry_schema("task_context"),
+    _registry_schema("report_progress"),
+    _registry_schema("merge_problems"),
     {
         "type": "function",
         "function": {
@@ -3109,6 +3118,9 @@ TOOL_EXECUTORS: dict[str, Any] = {
     "cloud_identity": _exec_cloud_identity,
     "run_infra_script": _exec_run_infra_script,
     "set_service_state": _exec_set_service_state,
+    "task_context": _exec_task_context,
+    "report_progress": _exec_report_progress,
+    "merge_problems": _exec_merge_problems,
     "aegis_self_diagnose": _exec_aegis_self_diagnose,
     "investigate_resource": _exec_investigate_resource,
     "list_interactions": _exec_list_interactions,
@@ -3156,6 +3168,11 @@ AGENT_TOOL_SETS: dict[str, set[str]] = {
         "search_knowledge",
         "configure_triage",
         "remember_this",
+        # Problem hub, the session registry: read a task's context, register
+        # a session on it, fold a duplicate problem away.
+        "task_context",
+        "report_progress",
+        "merge_problems",
         "list_interactions",  # NEW (Phase 5 PR 1)
         # Phase 3 GTD tools
         "capture_to_inbox",
@@ -3187,6 +3204,11 @@ AGENT_TOOL_SETS: dict[str, set[str]] = {
         "research_topic",
         "track_topic",
         "remember_this",
+        # Problem hub, the session registry: read a task's context, register
+        # a session on it, fold a duplicate problem away.
+        "task_context",
+        "report_progress",
+        "merge_problems",
         # Phase 3 GTD tools (research-leaning subset)
         "capture_to_inbox",
         "list_next_actions",
@@ -3211,6 +3233,11 @@ AGENT_TOOL_SETS: dict[str, set[str]] = {
         "update_runbook",
         "configure_triage",
         "remember_this",
+        # Problem hub, the session registry: read a task's context, register
+        # a session on it, fold a duplicate problem away.
+        "task_context",
+        "report_progress",
+        "merge_problems",
         "list_interactions",
         # Infrastructure tools — full surface across swarm swarm + acme k8s/argocd:
         "list_nodes",
@@ -3263,6 +3290,11 @@ AGENT_TOOL_SETS: dict[str, set[str]] = {
         "get_finance_news",
         "search_knowledge",
         "remember_this",
+        # Problem hub, the session registry: read a task's context, register
+        # a session on it, fold a duplicate problem away.
+        "task_context",
+        "report_progress",
+        "merge_problems",
         "list_interactions",  # NEW (Phase 5 PR 1)
         # Phase 3 GTD tools (full set minus find_reference — maou queries
         # market data instead of the reference store)

@@ -171,3 +171,37 @@ async def test_kill_run_uses_fuser(monkeypatch):
     monkeypatch.setattr(c, "_exec", ex)
     assert await c.kill_run("/tmp/aegis-kimi-run-1.jsonl") is True
     assert "fuser -k /tmp/aegis-kimi-run-1.jsonl" in ex.cmds[-1]
+
+
+async def test_a_launch_reports_the_account_label_it_resolved(monkeypatch):
+    """The task session records the label so a later `--resume` runs under the
+    same profile; the connector is the only thing that knows which dir the
+    routing landed on, so it says so."""
+    c = _connector()
+    c._claude_config_dirs = {"work": "/home/u/.claude-work", "personal": "/home/u/.claude-personal"}
+    c._claude_default_account = "work"
+    ex = _Exec()
+    monkeypatch.setattr(c, "_exec", ex)
+
+    async def no_mount(*a, **k):
+        return ""
+
+    monkeypatch.setattr(c, "_mount_mcp_config", no_mount)
+    out = await c.start_kimi_run(
+        repo="acme/app", prompt="hi", kimi_binary="", engine_override="claude",
+        worktree_path="/repos/acme/app-aegis-wt/task-1", session_id=SID,
+    )
+    assert out["status"] == "running" and out["claude_account"] == "work"
+    out = await c.start_kimi_run(
+        repo="acme/app", prompt="hi", kimi_binary="", engine_override="claude",
+        worktree_path="/repos/acme/app-aegis-wt/task-1", session_id=SID, resume=True,
+        claude_account="personal",
+    )
+    assert out["claude_account"] == "personal"
+    assert "CLAUDE_CONFIG_DIR=/home/u/.claude-personal" in ex.cmds[-1]
+    c._claude_default_account = ""
+    out = await c.start_kimi_run(
+        repo="acme/app", prompt="hi", kimi_binary="", engine_override="claude",
+        worktree_path="/repos/acme/app-aegis-wt/task-1", session_id=SID,
+    )
+    assert out["claude_account"] == "", "the host's default login has no label"

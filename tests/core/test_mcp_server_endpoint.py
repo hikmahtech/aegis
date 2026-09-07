@@ -44,6 +44,8 @@ TOOL_SET = [
     "stop_agent_run",
     "comment_on_task",
     "set_service_state",
+    "report_progress",
+    "merge_problems",
     "ledger_post",
     "ledger_reclassify",
     "ledger_add_rule",
@@ -396,7 +398,12 @@ async def test_the_unserved_set_is_exactly_these_ten(client):
 
     `set_service_state` is a fifth: it opens a deploy/maintenance window that
     stops the problem hub raising anything about a subject. A run that could
-    open one could silence the alert about itself, so it is operator-only."""
+    open one could silence the alert about itself, so it is operator-only.
+
+    `report_progress` and `merge_problems` are the sixth and seventh: an AEGIS
+    turn reports through its own activity, so a run holding `report_progress`
+    could only mark its own task done; and a merge hides a problem, which is a
+    person's call."""
     assert set(mcp_server_mod._UNSERVED_TOOLS) == {
         "call_mcp_tool",
         "dispatch_agent_run",
@@ -405,6 +412,8 @@ async def test_the_unserved_set_is_exactly_these_ten(client):
         "stop_agent_run",
         "comment_on_task",
         "set_service_state",
+        "report_progress",
+        "merge_problems",
         "ledger_post",
         "ledger_reclassify",
         "ledger_add_rule",

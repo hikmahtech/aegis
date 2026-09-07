@@ -35,7 +35,7 @@ with workflow.unsafe.imports_passed_through():
         _status_line,
         _thread_root,
     )
-    from aegis_worker.shared.retry import TIMEOUT_LLM, TIMEOUT_LONG, TIMEOUT_STANDARD
+    from aegis_worker.shared.retry import TIMEOUT_LONG, TIMEOUT_STANDARD
 
 _CODE_TASK = {
     "id": "tc-1",
@@ -72,7 +72,7 @@ _CANDIDATES = [
     {"resource_title": "aegis", "github_repo": "hikmahtech/aegis", "resource_path": "aegis"},
 ]
 
-_PROCEED = {"verdict": "proceed", "session": None, "sessions": [], "reason": ""}
+_PROCEED = {"verdict": "proceed", "session": None, "reason": ""}
 
 _FINAL = "Plan: dedupe the rows\nSTATUS: plan"
 
@@ -141,9 +141,7 @@ def _activities(
         }
 
     @activity.defn(name="check_task_collision")
-    async def check_task_collision(
-        task_id: str, repo: str, session_id: str, override: bool = False
-    ) -> dict:
+    async def check_task_collision(task_id: str, override: bool = False) -> dict:
         events.append(("collide", override))
         return collision if collision is not None else _PROCEED
 
@@ -327,8 +325,10 @@ async def test_first_turn_posts_plan_with_footer_and_parks():
     assert "STATUS: plan" in bodies[0]
     assert "Session: 11111111-2222-3333-4444-555555555555 · turn 1" in bodies[0]
     assert "Take over: cd /srv/repos/bcp-aegis-wt/task-tc-1 && claude --resume" in bodies[0]
+    # The park reason carries the turn's verdict: `park_task` writes it to the
+    # session row, which is what `task_context` shows a later session.
 
-    assert ("park", "waiting on you") in events
+    assert ("park", "waiting on you: plan") in events
     assert result["status"] == "parked"
     assert result["turns"] == 1
 
@@ -444,11 +444,13 @@ async def test_comment_signal_while_the_cli_turn_runs_is_queued_not_lost():
 
 @pytest.mark.asyncio
 async def test_operator_in_session_sends_slack_note_and_does_not_park():
-    """`you_are_in_it` with a HUMAN owner means the comment is already in front
-    of the operator. Commenting on Todoist would duplicate it and parking would
+    """`you_are_in_it` means the operator's own session reported itself
+    active on the task (`report_progress`), so the comment is already in
+    front of them. Commenting on Todoist would duplicate it and parking would
     stamp @waiting on a task somebody is actively working — so the flow does
-    neither. The watermark still moves, because the comment HAS been delivered;
-    without that the 15-minute fallback sweep re-dispatches it forever.
+    neither. The watermark still moves, because the comment HAS been
+    delivered; without that the 15-minute fallback sweep re-dispatches it
+    forever.
 
     Falsifiable: add a park_task call to that branch and this fails.
     """
@@ -457,19 +459,8 @@ async def test_operator_in_session_sends_slack_note_and_does_not_park():
         events,
         collision={
             "verdict": "you_are_in_it",
-            # The realistic takeover: the footer AEGIS posts says `cd
-            # <worktree_path> && claude --resume <id>`, so the operator IS in
-            # the task's own `-aegis-wt/` tree — the directory the session
-            # registry tags `owner="aegis"`. Only `check_task_collision`'s
-            # liveness probe can call this a person, and the flow acts on the
-            # owner the activity reports, never on the path.
-            "session": {
-                "name": "bcp eps",
-                "owner": "human",
-                "cwd": "/srv/repos/bcp-aegis-wt/task-tc-1",
-            },
-            "sessions": [],
-            "reason": "session is live",
+            "session": {"name": "bcp eps", "owner": "operator", "account": "personal"},
+            "reason": "operator session (personal) active on the task",
         },
     )
 
@@ -486,11 +477,11 @@ async def test_operator_in_session_sends_slack_note_and_does_not_park():
 
 @pytest.mark.asyncio
 async def test_an_orphan_aegis_turn_keeps_the_comment_due():
-    """`you_are_in_it` with an AEGIS owner is a turn of our own that outlived
-    its kill. NOBODY has read the comment — not a person, and not the running
-    turn, which was launched before it existed — so the watermark must not
-    move: leaving the row due is what makes the 15-minute fallback re-dispatch
-    it once the orphan ends. There is also no one to Slack.
+    """`turn_still_running` is a turn of our own that outlived its kill.
+    NOBODY has read the comment — not a person, and not the running turn,
+    which was launched before it existed — so the watermark must not move:
+    leaving the row due is what makes the 15-minute fallback re-dispatch it
+    once the orphan ends. There is also no one to Slack.
 
     Falsifiable: call record_task_turn on that branch and this fails.
     """
@@ -498,10 +489,9 @@ async def test_an_orphan_aegis_turn_keeps_the_comment_due():
     result = await _run(
         events,
         collision={
-            "verdict": "you_are_in_it",
-            "session": {"name": "task tc-1: Fix phantom", "owner": "aegis"},
-            "sessions": [],
-            "reason": "session is live",
+            "verdict": "turn_still_running",
+            "session": {"name": "task tc-1", "owner": "aegis"},
+            "reason": "the last turn is still writing /tmp/aegis-kimi-run-r0.jsonl",
         },
     )
 
@@ -511,32 +501,6 @@ async def test_an_orphan_aegis_turn_keeps_the_comment_due():
     assert "park" not in _kinds(events)
     assert "launch" not in _kinds(events)
     assert result["status"] == "turn_still_running"
-
-
-@pytest.mark.asyncio
-async def test_hand_to_you_comments_and_parks_without_launching():
-    """A person is already on this task in their own session: AEGIS says so,
-    parks, and tells them the phrase that overrides the check."""
-    events: list = []
-    result = await _run(
-        events,
-        collision={
-            "verdict": "hand_to_you",
-            "session": {"name": "bcp eps", "owner": "human", "branch": "fix/eps"},
-            "sessions": [{"name": "bcp eps", "owner": "human", "branch": "fix/eps"}],
-            "reason": "same branch",
-        },
-    )
-
-    assert ("record", False) in events
-    assert "launch" not in _kinds(events), "must not run a turn against a live human session"
-    bodies = _bodies(events, "comment")
-    assert len(bodies) == 1
-    assert "session 'bcp eps'" in bodies[0]
-    assert "on branch `fix/eps`" in bodies[0]
-    assert "Reply `take over`" in bodies[0]
-    assert ("park", "operator already on it") in events
-    assert result["status"] == "handed_to_operator"
 
 
 @pytest.mark.asyncio
@@ -603,11 +567,11 @@ async def test_the_hand_back_comment_is_mirrored_into_the_thread():
     events: list = []
     await _run(
         events,
-        collision={
-            "verdict": "hand_to_you",
-            "session": {"name": "bcp eps", "owner": "human", "branch": "fix/eps"},
-            "sessions": [{"name": "bcp eps", "owner": "human", "branch": "fix/eps"}],
-            "reason": "same branch",
+        ensure_result={
+            "status": "candidates",
+            "session": _SESSION,
+            "candidates": _CANDIDATES,
+            "error": "",
         },
     )
 
@@ -627,9 +591,8 @@ async def test_the_operator_note_lands_in_the_task_thread_when_there_is_one():
         slack_ref={"channel": "C1", "ts": "1.1"},
         collision={
             "verdict": "you_are_in_it",
-            "session": {"name": "bcp eps", "owner": "human"},
-            "sessions": [],
-            "reason": "session is live",
+            "session": {"name": "bcp eps", "owner": "operator"},
+            "reason": "operator session active on the task",
         },
     )
 
@@ -652,7 +615,7 @@ async def test_a_failing_slack_delivery_leaves_the_turn_alone():
 
     assert len(_bodies(events, "comment")) == 1
     assert "STATUS: plan" in _bodies(events, "comment")[0]
-    assert ("park", "waiting on you") in events
+    assert ("park", "waiting on you: plan") in events
     assert "slack_ref" not in _kinds(events), "nothing came back to store"
     assert result["status"] == "parked"
     assert result["turns"] == 1
@@ -808,15 +771,12 @@ async def test_a_launched_turn_is_counted_only_once_it_is_running():
 
 
 @pytest.mark.asyncio
-async def test_the_slow_activities_are_not_scheduled_on_the_60s_budget():
-    """Two activities in this path routinely outlast 60 seconds, and a
-    start-to-close timeout is not a retry — it surfaces as a workflow failure
-    and the generic handler PARKS the task.
-
-    `check_task_collision` makes a balanced-tier LLM call (kimi-class calls
-    pass 120s in prod) and is written to return `proceed` on every failure; at
-    60s the timeout would fire OUTSIDE that guard and park instead.
-    `ensure_task_session` runs `git worktree add` over SSH on turn 1.
+async def test_the_slow_activity_is_not_scheduled_on_the_60s_budget():
+    """`ensure_task_session` runs `git worktree add` over SSH on turn 1, which
+    routinely outlasts 60 seconds — and a start-to-close timeout is not a
+    retry, it surfaces as a workflow failure and the generic handler PARKS
+    the task. `check_task_collision`, by contrast, is a registry read plus one
+    bounded liveness probe since PR 5, and sits on the standard budget.
 
     Read off the workflow history rather than the source, so it is the schedule
     the server actually saw.
@@ -845,12 +805,11 @@ async def test_the_slow_activities_are_not_scheduled_on_the_60s_budget():
             if attrs.activity_type.name:
                 scheduled[attrs.activity_type.name] = attrs.start_to_close_timeout.seconds
 
-    assert scheduled["check_task_collision"] == int(TIMEOUT_LLM.total_seconds())
     assert scheduled["ensure_task_session"] == int(TIMEOUT_LONG.total_seconds())
-    for slow in ("check_task_collision", "ensure_task_session"):
-        assert scheduled[slow] > TIMEOUT_STANDARD.total_seconds(), (
-            f"{slow} outlasts 60s in prod; scheduling it there parks the task"
-        )
+    assert scheduled["ensure_task_session"] > TIMEOUT_STANDARD.total_seconds(), (
+        "ensure_task_session outlasts 60s in prod; scheduling it there parks the task"
+    )
+    assert scheduled["check_task_collision"] == int(TIMEOUT_STANDARD.total_seconds())
 
 
 @pytest.mark.asyncio

@@ -10,7 +10,7 @@ excludes @waiting, so parking is what removes the task from the pool — without
 it the 6h cooldown is an infinite slow loop.
 
 The coding verb is the exception to "one child, one shot". A @code task owns a
-persistent CLI session (`task_sessions`), and this flow is where it is driven:
+persistent CLI session (`work_sessions`), and this flow is where it is driven:
 one turn per batch of user comments, in a per-task worktree, resumed by
 session id. A comment that arrives while a turn is running is SIGNALLED into
 the running workflow (`comment`), queued, and drained into the next turn — so a
@@ -41,7 +41,6 @@ with workflow.unsafe.imports_passed_through():
         NO_RETRY,
         STANDARD,
         TIMEOUT_FAST,
-        TIMEOUT_LLM,
         TIMEOUT_LONG,
         TIMEOUT_STANDARD,
     )
@@ -327,12 +326,29 @@ class AgentTaskSweepFlow:
             if budget:
                 for row in await self._due_turns(budget):
                     resumed += await self._dispatch_turn(row, config)
+
+            # The registry's liveness cross-check: an operator session that
+            # ended without a final `report_progress` is parked once the host
+            # no longer lists it. Swallowed for the same reason `_due_turns`
+            # is — the children above are already running.
+            step = "reconcile_work_sessions"
+            await self._reconcile_sessions()
         except Exception as exc:  # noqa: BLE001
             raise ApplicationError(
                 f"agent_task_sweep_failed at step={step}: {exc!r}", non_retryable=True
             ) from exc
 
         return {"found": len(tasks), "spawned": spawned, "resumed": resumed}
+
+    async def _reconcile_sessions(self) -> None:
+        try:
+            await workflow.execute_activity(
+                "reconcile_work_sessions",
+                start_to_close_timeout=TIMEOUT_STANDARD,
+                retry_policy=NO_RETRY,
+            )
+        except Exception as exc:  # noqa: BLE001
+            workflow.logger.warning("work_sessions_reconcile_failed err=%s", str(exc)[:200])
 
     async def _due_turns(self, limit: int) -> list:
         """Tasks whose newest user comment is newer than their last turn.
@@ -356,7 +372,7 @@ class AgentTaskSweepFlow:
     async def _dispatch_turn(self, row: dict, config: AgentTaskSweepConfig) -> int:
         """Land one due comment on its task's workflow. Returns 1 on success.
 
-        The in-workflow half of `services/task_sessions.dispatch_task_turn`:
+        The in-workflow half of `services/work_sessions.dispatch_task_turn`:
         start the task's single workflow, and if it is already running signal
         the comment into it instead. Every failure is swallowed — one
         unreachable task must not cost the rest of the sweep, and the row stays
@@ -837,7 +853,7 @@ class AgentTaskFlow:
     async def _record_turn(self, task_id: str, launched: bool) -> None:
         """Move the session's watermark past the comment this turn consumed.
 
-        EVERY coding exit calls it, including the two that hand the task
+        EVERY coding exit calls it, including the one that hands the task
         straight back — the comment has been dealt with, and the 15-minute
         fallback sweep keys on this watermark, so skipping it re-dispatches the
         same comment for ever.
@@ -956,7 +972,7 @@ class AgentTaskFlow:
         check is what self-heals a tree removed out of band between turns.
 
         Two exits do not park, and both are deliberate — see `you_are_in_it`
-        below and `_park_coding` for the rest.
+        and `turn_still_running` below, and `_park_coding` for the rest.
         """
         agent_id = input.agent_id
         timeout_min = max(1, int(input.turn_timeout_minutes or 60))
@@ -1043,41 +1059,38 @@ class AgentTaskFlow:
             self._step = "coding:check_task_collision"
             verdict = await workflow.execute_activity(
                 "check_task_collision",
-                args=[
-                    task_id,
-                    str(session.get("repo") or ""),
-                    str(session.get("session_id") or ""),
-                    override,
-                ],
-                # TIMEOUT_LLM: this check makes a balanced-tier call, and
-                # kimi-class calls pass 120s in prod. At 60s the activity would
-                # time out and the generic handler would PARK the task — the
-                # one outcome the "every failure path returns proceed" contract
-                # inside the activity exists to prevent.
-                start_to_close_timeout=TIMEOUT_LLM,
+                args=[task_id, override],
+                # A registry read plus one SSH liveness probe. Every failure
+                # path inside returns `proceed`; a timeout here would surface
+                # as a park instead, which is why the probe is bounded.
+                start_to_close_timeout=TIMEOUT_STANDARD,
                 retry_policy=ACT_RETRY,
             )
             call = str(verdict.get("verdict") or "proceed")
 
+            if call == "turn_still_running":
+                # An earlier turn of OUR OWN is still alive — an orphan the
+                # deadline kill did not reach. Nothing has read this comment
+                # and the running turn cannot see it either, so the watermark
+                # must NOT move: leaving the row due is what has the 15-minute
+                # fallback re-dispatch it once the run ends. No Slack note,
+                # because there is no person to tell.
+                workflow.logger.warning(
+                    "task_turn_still_running task_id=%s reason=%s",
+                    task_id,
+                    str(verdict.get("reason") or ""),
+                )
+                return {"task_id": task_id, "verb": "coding", "status": "turn_still_running"}
+
             if call == "you_are_in_it":
                 held = verdict.get("session") or {}
                 name = str(held.get("name") or "unnamed")
-                if str(held.get("owner") or "human") == "aegis":
-                    # An earlier turn of OUR OWN is still alive — an orphan the
-                    # deadline kill did not reach. Nothing has read this
-                    # comment and the running turn cannot see it either, so the
-                    # watermark must NOT move: leaving the row due is what has
-                    # the 15-minute fallback re-dispatch it once the run ends.
-                    # No Slack note, because there is no person to tell.
-                    workflow.logger.warning(
-                        "task_turn_still_running task_id=%s session=%s", task_id, name
-                    )
-                    return {"task_id": task_id, "verb": "coding", "status": "turn_still_running"}
-                # NO Todoist comment and NO park. The comment is already in
-                # front of the operator holding this session, so commenting
-                # would duplicate it and parking would stamp @waiting on a task
-                # somebody is actively working. The watermark DOES move: the
-                # comment has been delivered, just not by us.
+                # NO Todoist comment and NO park. The operator's own session
+                # reported itself active on this task, so the comment is
+                # already in front of them: commenting would duplicate it and
+                # parking would stamp @waiting on a task somebody is actively
+                # working. The watermark DOES move: the comment has been
+                # delivered, just not by us.
                 await self._record_turn(task_id, False)
                 # Into the task's thread when it has one, the agent channel
                 # otherwise. Never opens a thread: this is a note ABOUT the
@@ -1092,24 +1105,6 @@ class AgentTaskFlow:
                     thread_overflow=root is not None,
                 )
                 return {"task_id": task_id, "verb": "coding", "status": "operator_in_session"}
-
-            if call == "hand_to_you":
-                await self._record_turn(task_id, False)
-                held = verdict.get("session") or {}
-                name = str(held.get("name") or "unnamed")
-                branch = str(held.get("branch") or "")
-                return await self._park_coding(
-                    task_id,
-                    "operator already on it",
-                    status="handed_to_operator",
-                    comment=f"You look to be on this already in session '{name}'"
-                    + (f" on branch `{branch}`" if branch else "")
-                    + ". I'll stay out. Reply `take over` when you want me to proceed.",
-                    agent_id=agent_id,
-                    sess=session,
-                    title=title,
-                    turns=turns_run,
-                )
 
             # Read BEFORE the watermark bump below: `turns` is what decides
             # whether this turn creates the session or resumes it, and what
@@ -1199,15 +1194,6 @@ class AgentTaskFlow:
             # prefix and the take-over footer are wrapped around it.
             status_line = _status_line(body)
 
-            others = verdict.get("sessions") or []
-            if others:
-                # Judged unrelated, but the operator should still know AEGIS is
-                # typing in the same repo they have open.
-                body = (
-                    "FYI: you have a live session in this repo "
-                    f"('{str((others[0] or {}).get('name') or 'unnamed')}'); I'm working "
-                    f"in my own worktree at {session.get('worktree_path') or ''}.\n\n"
-                ) + body
             session_id = str(session.get("session_id") or "")
             body += (
                 f"\n\nSession: {session_id} · turn {turn_no}\n"
@@ -1235,7 +1221,10 @@ class AgentTaskFlow:
         self._step = "coding:park"
         return await self._park_coding(
             task_id,
-            "waiting on you",
+            # The reason lands on the session row (`park_task` writes it), so
+            # it carries the turn's own verdict: "waiting on you: pr: #12" is
+            # what a session opened on the task later reads first.
+            f"waiting on you: {status_line}" if status_line else "waiting on you",
             status="parked",
             turns=turns_run,
             session_id=str(session.get("session_id") or ""),

@@ -825,3 +825,131 @@ def event_from_alert(
         },
         occurred_at=occurred_at,
     )
+
+
+# --- operator-side helpers (PR 5) --------------------------------------------
+
+
+async def find_problem_for_task(pool: asyncpg.Pool, task_id: str) -> dict[str, Any] | None:
+    """The problem behind a Todoist task: the one whose task it is, else the
+    newest one linked to it. Live problems win over closed ones."""
+    if not task_id:
+        return None
+    row = await pool.fetchrow(
+        "SELECT p.id::text AS id FROM problems p "
+        "LEFT JOIN problem_links l ON l.problem_id = p.id AND l.link_kind = 'todoist_task' "
+        "WHERE p.todoist_task_id = $1 OR l.ref = $1 "
+        "ORDER BY (p.closed_at IS NULL) DESC, p.last_seen_at DESC LIMIT 1",
+        task_id,
+    )
+    return await get_problem(pool, row["id"]) if row else None
+
+
+async def add_link(pool: asyncpg.Pool, problem_id: str, link_kind: str, ref: str) -> bool:
+    """Attach a reference (a PR url, an issue, another problem). True when new."""
+    ref = (ref or "").strip()
+    if not ref:
+        return False
+    tag = await pool.execute(
+        "INSERT INTO problem_links (problem_id, link_kind, ref) VALUES ($1::uuid, $2, $3) "
+        "ON CONFLICT DO NOTHING",
+        problem_id,
+        link_kind,
+        ref[:500],
+    )
+    return str(tag).endswith(" 1")
+
+
+async def merge_problems(
+    pool: asyncpg.Pool, keep_id: str, merge_id: str, *, by: str, now: datetime | None = None
+) -> dict[str, Any]:
+    """Fold ``merge_id`` into ``keep_id``: its events, links and sessions move,
+    its occurrences count on the kept problem, and it closes with a `problem`
+    link back so the history reads both ways. Only a person calls this — a
+    wrong merge hides an outage, so the hub never merges on its own.
+
+    Raises ValueError when either problem is missing, they are the same, or the
+    kept one is already closed. The merged problem's own Todoist task is
+    returned so the caller can retire it; the hub never touches Todoist.
+    """
+    now = now or _utcnow()
+    if keep_id == merge_id:
+        raise ValueError("keep_id and merge_id are the same problem")
+    async with pool.acquire() as conn, conn.transaction():
+        keep = await conn.fetchrow(
+            "SELECT id::text AS id, status, severity, closed_at FROM problems "
+            "WHERE id = $1::uuid FOR UPDATE",
+            keep_id,
+        )
+        merged = await conn.fetchrow(
+            "SELECT id::text AS id, status, severity, occurrences, first_seen_at, "
+            "last_seen_at, todoist_task_id, closed_at FROM problems WHERE id = $1::uuid FOR UPDATE",
+            merge_id,
+        )
+        if keep is None or merged is None:
+            raise ValueError("both problems must exist")
+        if keep["closed_at"] is not None:
+            raise ValueError(f"problem {keep_id} is closed; merge into a live problem")
+        moved_events = await conn.execute(
+            "UPDATE problem_events SET problem_id = $1::uuid WHERE problem_id = $2::uuid",
+            keep_id,
+            merge_id,
+        )
+        # The merged task stays the merged problem's (the caller retires it);
+        # everything else the merged problem pointed at now hangs off the kept
+        # one too.
+        await conn.execute(
+            "INSERT INTO problem_links (problem_id, link_kind, ref) "
+            "SELECT $1::uuid, link_kind, ref FROM problem_links "
+            "WHERE problem_id = $2::uuid AND link_kind <> 'todoist_task' AND ref <> $3 "
+            "ON CONFLICT DO NOTHING",
+            keep_id,
+            merge_id,
+            keep_id,
+        )
+        for a, b in ((keep_id, merge_id), (merge_id, keep_id)):
+            await conn.execute(
+                "INSERT INTO problem_links (problem_id, link_kind, ref) "
+                "VALUES ($1::uuid, 'problem', $2) ON CONFLICT DO NOTHING",
+                a,
+                b,
+            )
+        await conn.execute(
+            "UPDATE work_sessions SET problem_id = $1::uuid WHERE problem_id = $2::uuid",
+            keep_id,
+            merge_id,
+        )
+        await conn.execute(
+            "UPDATE problems SET occurrences = occurrences + $2, "
+            "first_seen_at = LEAST(first_seen_at, $3), last_seen_at = GREATEST(last_seen_at, $4) "
+            "WHERE id = $1::uuid",
+            keep_id,
+            int(merged["occurrences"] or 0),
+            merged["first_seen_at"],
+            merged["last_seen_at"],
+        )
+        if merged["closed_at"] is None:
+            await conn.execute(
+                "UPDATE problems SET status = 'closed', closed_at = $2, "
+                "resolved_at = COALESCE(resolved_at, $2) WHERE id = $1::uuid",
+                merge_id,
+                now,
+            )
+        await conn.execute(
+            "INSERT INTO problem_events (problem_id, source, external_id, kind, severity, "
+            "payload, occurred_at) VALUES ($1::uuid, 'hub', $2, 'state_change', $3, $4, $5) "
+            "ON CONFLICT (source, external_id) DO NOTHING",
+            keep_id,
+            f"merge:{keep_id}:{merge_id}:{now.isoformat()}",
+            keep["severity"],
+            {"action": "merge", "merged": merge_id, "by": by[:100], "status": keep["status"]},
+            now,
+        )
+    logger.info("hub_problems_merged", keep_id=keep_id, merge_id=merge_id, by=by)
+    parts = str(moved_events).split()
+    return {
+        "keep_id": keep_id,
+        "merge_id": merge_id,
+        "events_moved": int(parts[-1]) if parts and parts[-1].isdigit() else 0,
+        "merged_task_id": merged["todoist_task_id"] or "",
+    }

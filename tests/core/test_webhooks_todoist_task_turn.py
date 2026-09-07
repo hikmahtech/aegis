@@ -1,6 +1,6 @@
 """Todoist note webhook → immediate task turn for a task that has a session.
 
-A `@code` task owns a `task_sessions` row, and every user comment on it is one
+A `@code` task owns a `work_sessions` row, and every user comment on it is one
 turn of that task's `AgentTaskFlow`. The sweep (`find_turns_due`) would get
 there eventually; this fast path gets there in ~1s.
 
@@ -57,7 +57,7 @@ def _mock_pool(executed: list[tuple], session_row: dict | None, queries: list[st
     """Pool recording conn.execute, and answering the session lookup.
 
     `pool.fetchrow` is the session lookup (`SELECT ts.agent_id FROM
-    task_sessions ...`) and `pool.fetch` is `resolve_tag("gtd")` — the webhook
+    work_sessions ...`) and `pool.fetch` is `resolve_tag("gtd")` — the webhook
     calls one on the pool directly and the other through `acquire()`, so both
     have to exist. `queries` collects the lookup SQL, which is the only way to
     assert on a filter the mock itself cannot apply.

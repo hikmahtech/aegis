@@ -128,7 +128,7 @@ async def test_a_task_with_a_session_row_leaves_the_pool(db_pool, _seed):
     second first turn on a conversation that is already going.
     """
     await db_pool.execute(
-        "INSERT INTO task_sessions (task_id, agent_id, session_id) "
+        "INSERT INTO work_sessions (task_id, agent_id, session_id) "
         "VALUES ('tt-8', 'pandoras-actor', gen_random_uuid())"
     )
     try:
@@ -138,4 +138,4 @@ async def test_a_task_with_a_session_row_leaves_the_pool(db_pool, _seed):
         # Scoped to the task that has the row — nothing else drops out.
         assert {"tt-1", "tt-2", "tt-3"} <= ids
     finally:
-        await db_pool.execute("DELETE FROM task_sessions WHERE task_id = 'tt-8'")
+        await db_pool.execute("DELETE FROM work_sessions WHERE task_id = 'tt-8'")

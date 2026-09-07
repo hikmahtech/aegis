@@ -273,7 +273,7 @@ def test_module_workflows_is_the_unflagged_registry():
         # `set_task_slack_ref` on the same class: the coding path mirrors every
         # task message into one Slack thread per task, and this is what
         # remembers that thread's root on the session row. Then +1 activity and
-        # NO new flow from `cleanup_task_sessions` on the existing
+        # NO new flow from `cleanup_work_sessions` on the existing
         # CleanupActivities — the finished-session worktree sweep is a step in
         # the existing CleanupFlow, and CleanupActivities is unflagged, so it
         # moves in every row. Then +2 activities and NO new flow from the
@@ -336,9 +336,14 @@ def test_module_workflows_is_the_unflagged_registry():
         # PR 4b: HubActivities.reconcile_findings (+1, unflagged) while
         # HomelabActivities loses alert_comms_inbound_down and
         # resolve_comms_inbound_alert (−2, homelab flagged).
-        (True, True, 44, 215),
-        (False, False, 36, 184),
-        (True, False, 40, 200),
+        # PR 5a: AgentTaskActivities.reconcile_work_sessions (+1, unflagged) —
+        # the session registry's liveness cross-check, run by the existing
+        # AgentTaskSweepFlow. `check_task_collision` stays (same name, now a
+        # registry lookup) and `cleanup_task_sessions` is renamed
+        # `cleanup_work_sessions` (±0). No new flow.
+        (True, True, 44, 216),
+        (False, False, 36, 185),
+        (True, False, 40, 201),
     ],
 )
 def test_real_registration_passes_the_boot_check(homelab, money, flows, activities):

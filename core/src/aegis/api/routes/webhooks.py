@@ -37,7 +37,7 @@ from aegis.services.health import record_health_push
 from aegis.services.hub import event_from_alert, ingest_event
 from aegis.services.observations import record_observation
 from aegis.services.places import record_location_push
-from aegis.services.task_sessions import dispatch_task_turn, is_user_note
+from aegis.services.work_sessions import dispatch_task_turn, is_user_note
 
 logger = structlog.get_logger()
 
@@ -751,7 +751,7 @@ async def todoist_webhook(
                     "todoist_webhook_note_bump_failed",
                     error=str(exc)[:200],
                 )
-            # Task-session fast path: a @code task owns a task_sessions row and
+            # Task-session fast path: a @code task owns a work_sessions row and
             # every user comment on it is one turn of that task's AgentTaskFlow.
             # The sweep (find_turns_due) would get there within a tick; this
             # gets there in ~1s. Best-effort on purpose — a Temporal outage here
@@ -768,9 +768,9 @@ async def todoist_webhook(
                     # (a "thanks", a late note) must not start a coding turn on
                     # it. `find_turns_due` already excludes them the same way.
                     sess = await pool.fetchrow(
-                        "SELECT ts.agent_id FROM task_sessions ts "
+                        "SELECT ts.agent_id FROM work_sessions ts "
                         "JOIN todoist_tasks t ON t.id = ts.task_id AND NOT t.is_completed "
-                        "WHERE ts.task_id = $1",
+                        "WHERE ts.task_id = $1 AND ts.owner = 'aegis' AND ts.status <> 'done'",
                         str(item_id),
                     )
                     if sess and is_user_note(content):
