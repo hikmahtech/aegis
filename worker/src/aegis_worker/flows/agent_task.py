@@ -68,6 +68,13 @@ _CUT_MARK = " […]"
 # final message. Anchored, so a sentence merely mentioning the word does not
 # become the recorded status.
 _STATUS_RE = re.compile(r"^STATUS:\s*(.+)$")
+# The plan block a first turn is asked for: the `PLAN:` marker, then one
+# numbered step per line. A marker rather than a heuristic over the whole
+# message, because every turn's report is itself a numbered list — parsing
+# that would turn 'which files would change' into a checklist.
+_PLAN_MARKER_RE = re.compile(r"^\s*PLAN:\s*$")
+_PLAN_STEP_RE = re.compile(r"^\s*\d+[.)]\s+(\S.*)$")
+_MAX_PLAN_STEPS = 12
 # Tail of a finished turn's raw transcript, when it emitted no final message.
 _TURN_OUTPUT_TAIL = 6000
 # Tail carried by a timeout comment. Deliberately smaller: it is a fragment of
@@ -161,6 +168,34 @@ def _status_line(text: str) -> str:
     return ""
 
 
+def _plan_steps(text: str) -> list[str]:
+    """The steps under the LAST `PLAN:` marker, or `[]` when the turn wrote none.
+
+    The last marker wins for the same reason `_status_line` reads the last
+    STATUS line: a model that quotes the instructions back before answering
+    would otherwise have its example parsed as the plan. Collection stops at
+    the first line that is neither a numbered step nor blank, so the footer and
+    the STATUS line never become steps.
+    """
+    lines = (text or "").splitlines()
+    start = None
+    for index, line in enumerate(lines):
+        if _PLAN_MARKER_RE.match(line):
+            start = index + 1
+    if start is None:
+        return []
+    steps: list[str] = []
+    for line in lines[start:]:
+        match = _PLAN_STEP_RE.match(line)
+        if match:
+            steps.append(match.group(1).strip())
+            if len(steps) == _MAX_PLAN_STEPS:
+                break
+        elif line.strip():
+            break
+    return steps
+
+
 def _first_turn_prompt(task_id: str, task: dict, session: dict) -> str:
     """Turn 1: investigate only, and end with a STATUS line.
 
@@ -196,7 +231,9 @@ This is your first turn on this task. Investigate only: read the code, do NOT
 modify files, commit, or create branches. Report:
 1. What the task is actually asking for.
 2. Which files would need to change.
-3. A short implementation plan.
+3. A short implementation plan, written as its own block: a line reading
+   exactly `PLAN:` followed by one numbered step per line. Each step is one
+   piece of work someone could tick off.
 4. Anything ambiguous or risky, as questions for the user.
 
 You are in a per-task worktree on branch `{branch}`. Later turns implement here
@@ -1190,9 +1227,17 @@ class AgentTaskFlow:
                     or "no output"
                 )
 
-            # The turn's own verdict, read off the message before the FYI
-            # prefix and the take-over footer are wrapped around it.
+            # The turn's own verdict, read off the message before the
+            # take-over footer is wrapped around it.
             status_line = _status_line(body)
+            # A plan becomes a checklist on the task: the projector opens one
+            # subtask per step, and whoever does the work ticks them off with
+            # `report_progress(step_done=N)`. Best-effort — the plan is already
+            # posted as the comment below either way.
+            steps = _plan_steps(body)
+            if len(steps) > 1:
+                self._step = "coding:record_plan"
+                await self._record_plan(task_id, steps, body, turn_no)
 
             session_id = str(session.get("session_id") or "")
             body += (
@@ -1233,6 +1278,34 @@ class AgentTaskFlow:
             # and not merely that a turn happened. "" when it emitted none.
             status_line=status_line,
         )
+
+    async def _record_plan(
+        self, task_id: str, steps: list[str], text: str, turn_no: int
+    ) -> None:
+        """Hand the turn's plan to the hub, which turns it into subtasks.
+
+        Swallowed on failure and never retried into a second checklist: the
+        turn has run and its plan is about to be posted as a comment, so a hub
+        that is unreachable costs the checklist and nothing else.
+        """
+        try:
+            await workflow.execute_activity(
+                "record_plan",
+                args=[
+                    {
+                        "task_id": task_id,
+                        "steps": steps,
+                        "text": text[:2000],
+                        "external_id": f"plan:{workflow.info().workflow_id}:{turn_no}",
+                    }
+                ],
+                start_to_close_timeout=TIMEOUT_STANDARD,
+                retry_policy=NO_RETRY,
+            )
+        except Exception as exc:  # noqa: BLE001
+            workflow.logger.warning(
+                "task_plan_not_recorded task_id=%s err=%s", task_id, str(exc)[:200]
+            )
 
     async def _kill_turn(self, output_file: str, host: str) -> None:
         """Ask a timed-out turn to stop. Failure is logged, never fatal.

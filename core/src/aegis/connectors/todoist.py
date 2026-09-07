@@ -375,6 +375,20 @@ class TodoistConnector(HTTPConnector):
         }
 
     @staticmethod
+    def build_subtask_add_command(parent_id: str, content: str) -> dict:
+        """item_add under an existing task — the problem hub's plan steps.
+
+        `parent_id` is what makes it a subtask rather than a second task in the
+        Inbox; no project is given, because a subtask inherits its parent's.
+        """
+        return {
+            "type": "item_add",
+            "uuid": str(uuid.uuid4()),
+            "temp_id": f"item-{uuid.uuid4()}",
+            "args": {"parent_id": parent_id, "content": content},
+        }
+
+    @staticmethod
     def build_note_add_command(
         item_id: str,
         content: str,

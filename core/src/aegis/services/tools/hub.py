@@ -38,6 +38,7 @@ from aegis.services.hub import (
     merge_problems,
     set_service_state,
 )
+from aegis.services.hub_project import ensure_problem_for_task
 from aegis.services.tools.base import ToolContext
 from aegis.services.tools.registry import aegis_tool
 
@@ -225,8 +226,9 @@ async def _exec_report_progress(
     session_id: str = "",
     pr_url: str = "",
     account: str = "",
+    step_done: int = 0,
 ) -> str:
-    """Register your own session on a task with a one-line summary of where you are. It lands as a comment on the task and a line in its status block, and while your session is `active` AEGIS stays out of the task. A task with no problem on the hub gets one. Call it when you start, when you hand back, and when you are done.
+    """Register your own session on a task with a one-line summary of where you are. It lands as a comment on the task and a line in its status block, and while your session is `active` AEGIS stays out of the task. A task with no problem on the hub gets one. Call it when you start, when you finish a plan step, when you hand back, and when you are done.
 
     Args:
         task_id: the Todoist task id.
@@ -235,6 +237,7 @@ async def _exec_report_progress(
         session_id: your Claude session id, if you know it — lets the host's session list confirm you are live.
         pr_url: a pull request you opened, linked to the problem.
         account: the CLAUDE_CONFIG_DIR account label you run under, if not the default.
+        step_done: the number of the plan step you just finished, which ticks off its subtask.
     """
     task_id = (task_id or "").strip()
     summary = (summary or "").strip()
@@ -247,33 +250,18 @@ async def _exec_report_progress(
     problem = await find_problem_for_task(pool, task_id)
     created = False
     if problem is None:
-        # A plain @code task: give it a problem so the registry and the
-        # timeline work for every task, not only alert-born ones.
+        # A plain @code task: give it a problem so the registry, the timeline
+        # and the plan steps work for every task, not only alert-born ones.
         aegis_row = await work_sessions.get_session(pool, task_id)
-        subject = str((aegis_row or {}).get("github_repo") or "") or f"task-{task_id}"
-        try:
-            result = await ingest_event(
-                pool,
-                Event(
-                    source="session",
-                    external_id=f"task-{task_id}",
-                    kind="occurrence",
-                    title=str(task["content"] or f"Task {task_id}")[:200],
-                    subject=subject,
-                    subject_kind="repo",
-                    klass="manual",
-                    severity="info",
-                    payload={"task_id": task_id},
-                ),
-            )
-        except ValueError as exc:
-            return f"Refused: {exc}"
-        if not result.problem_id:
+        problem = await ensure_problem_for_task(
+            pool,
+            task_id,
+            subject=str((aegis_row or {}).get("github_repo") or ""),
+            settings=ctx.settings,
+        )
+        if problem is None:
             return "Refused: the hub did not record a problem for this task"
-        await hub_project.link_task(pool, result.problem_id, task_id)
-        problem = await get_problem(pool, result.problem_id)
         created = True
-    assert problem is not None
     pid = problem["id"]
 
     account = (account or "").strip() or "operator"
@@ -305,6 +293,9 @@ async def _exec_report_progress(
                     "account": account,
                     "pr_url": pr_url.strip(),
                     "session_id": row.get("session_id") or "",
+                    # The projector ticks the step's subtask off when it
+                    # projects this note; 0 means "no step".
+                    "step_done": max(0, int(step_done or 0)),
                 },
             ),
         )
@@ -319,6 +310,9 @@ async def _exec_report_progress(
         logger.warning("report_progress_project_failed", problem_id=pid, error=str(exc)[:200])
 
     head = f"Recorded on task {task_id}: {status} ({account}) — {summary[:120]}"
+    progress = await hub_project._step_progress(pool, pid)
+    if progress:
+        head += f"\nPlan steps: {progress}."
     if created:
         head += f"\nCreated problem {pid} for it."
     if linked:

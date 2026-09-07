@@ -42,6 +42,10 @@ async def test_no_pool_is_a_quiet_noop():
     assert (await env.run(act.problem_status, "p"))["found"] is False
     assert (await env.run(act.record_investigation, {"problem_id": "p", "status": "x", "text": "t"})) == {"recorded": False}
     assert (await env.run(act.mute_problem, "p", 24, "x")) == {"muted_until": None}
+    assert await env.run(act.record_plan, {"task_id": "T1", "steps": ["a", "b"]}) == {
+        "recorded": False,
+        "steps": 2,
+    }
     assert await env.run(act.stale_stuck_problems, ["a"], 24.0) == []
     out = await env.run(
         act.reconcile_findings,
@@ -174,3 +178,48 @@ async def test_reconcile_findings_round_trip(db_pool):
     assert (await get_problem(db_pool, pid))["severity"] == "critical"
     gone = await env.run(act.reconcile_findings, {**inp, "findings": []})
     assert [r["problem_id"] for r in gone["resolved"]] == [pid]
+
+
+async def test_record_plan_gives_a_plain_task_a_problem_and_its_steps(db_pool):
+    """A coding turn's plan lands on the task's problem, creating one when the
+    task is a plain `@code` task nobody alerted about. The projector turns the
+    steps into subtasks; here we pin the event, which is what it reads."""
+    env = ActivityEnvironment()
+    act = HubActivities(db_pool=db_pool)
+    task = f"zzp-{uuid.uuid4().hex[:6]}"
+    await db_pool.execute(
+        "INSERT INTO todoist_tasks (id, content, labels, is_completed, updated_at) "
+        "VALUES ($1, 'Fix the retry policy', ARRAY['@pandora','@code'], false, now())",
+        task,
+    )
+    out = await env.run(
+        act.record_plan,
+        {"task_id": task, "steps": ["Add the index", "Backfill"], "text": "PLAN:\n1. ...",
+         "external_id": f"plan:{task}:1"},
+    )
+    assert out["recorded"] is True and out["steps"] == 2
+    p = await get_problem(db_pool, out["problem_id"])
+    assert p["class"] == "manual" and p["todoist_task_id"] == task
+    plans = [e for e in await list_events(db_pool, p["id"]) if e["kind"] == "plan"]
+    assert len(plans) == 1
+    assert plans[0]["payload"]["steps"] == ["Add the index", "Backfill"]
+    assert plans[0]["payload"]["posted"] is True, "the turn already commented the plan"
+
+    # Same external id, same turn: one plan, not two.
+    again = await env.run(
+        act.record_plan,
+        {"task_id": task, "steps": ["Add the index", "Backfill"], "external_id": f"plan:{task}:1"},
+    )
+    assert again["recorded"] is True
+    assert len([e for e in await list_events(db_pool, p["id"]) if e["kind"] == "plan"]) == 1
+
+
+async def test_record_plan_needs_two_steps_and_a_known_task(db_pool):
+    env = ActivityEnvironment()
+    act = HubActivities(db_pool=db_pool)
+    assert (await env.run(act.record_plan, {"task_id": "T", "steps": ["one"]}))["recorded"] is False
+    assert (await env.run(act.record_plan, {"steps": ["a", "b"]}))["recorded"] is False
+    missing = await env.run(
+        act.record_plan, {"task_id": f"zz-gone-{uuid.uuid4().hex[:4]}", "steps": ["a", "b"]}
+    )
+    assert missing["recorded"] is False

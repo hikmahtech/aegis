@@ -206,6 +206,55 @@ class HubActivities:
         return {"recorded": True, "status_changed": moved}
 
     @activity.defn
+    async def record_plan(self, inp: dict) -> dict:
+        """Record a coding turn's plan on the task's problem, creating the
+        problem when the task is a plain `@code` one. The projector turns two
+        or more steps into subtasks the operator (or a later turn) ticks off.
+
+        Keys: `task_id`, `steps` (list), `text` (the plan as posted, already on
+        the task as a comment), `external_id` (idempotency).
+
+        Best-effort by contract: a turn that ran and posted its plan must not
+        fail because the checklist could not be written."""
+        task_id = str(inp.get("task_id") or "")
+        steps = [str(s) for s in (inp.get("steps") or [])]
+        if self.db_pool is None or not task_id or len(steps) < 2:
+            return {"recorded": False, "steps": len(steps)}
+        now = datetime.now(UTC)
+        try:
+            problem = await hub_project.ensure_problem_for_task(
+                self.db_pool, task_id, subject=str(inp.get("subject") or "")
+            )
+            if problem is None:
+                return {"recorded": False, "steps": len(steps)}
+            await hub.ingest_event(
+                self.db_pool,
+                hub.Event(
+                    source="session",
+                    external_id=str(inp.get("external_id") or f"plan:{task_id}:{now.isoformat()}"),
+                    kind="plan",
+                    title=problem["title"],
+                    severity="info",
+                    problem_id=problem["id"],
+                    payload={
+                        "text": str(inp.get("text") or "")[:2000],
+                        "steps": steps,
+                        # The turn already posted the plan as a task comment.
+                        "posted": True,
+                    },
+                    occurred_at=now,
+                ),
+                now=now,
+            )
+            await hub_project.project(self.db_pool, problem["id"], now=now)
+        except Exception as exc:  # noqa: BLE001 — the turn's own output is what matters
+            activity.logger.warning(
+                "record_plan_failed task_id=%s err=%s", task_id, str(exc)[:200]
+            )
+            return {"recorded": False, "steps": len(steps)}
+        return {"recorded": True, "steps": len(steps), "problem_id": problem["id"]}
+
+    @activity.defn
     async def mute_problem(self, problem_id: str, hours: float, by: str = "gate2") -> dict:
         if self.db_pool is None or not problem_id:
             return {"muted_until": None}

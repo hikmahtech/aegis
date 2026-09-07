@@ -21,6 +21,11 @@ What a projection does, in order:
    claimed it with `@me`); a `reopen` or `promote` reopens it.
 3. **Re-renders the status block** in the description, replaced whole between
    its markers, only when its content changed.
+4. **Turns a plan into subtasks.** A `plan` event carrying two or more
+   ``steps`` creates one Todoist subtask per step under the problem's task,
+   linked as ``plan_step`` so the same plan never creates them twice; a later
+   event carrying ``step_done`` completes that step's subtask. One step is not
+   a plan, so it stays a comment.
 
 Comments carry the ``Workflow run:`` token so `is_user_note` and clarify keep
 excluding them, and a comment that fails to post leaves the watermark where it
@@ -56,6 +61,11 @@ PROJECTED_STATUSES = frozenset(
 )
 _BLOCK_RE = re.compile(r"<!-- aegis:problem [^>]*-->.*?<!-- /aegis:problem -->", re.S)
 _HISTORY_KINDS = frozenset({"investigation", "plan", "session_note", "human_note"})
+# A plan of one step is a sentence, not a plan; more than this and the
+# subtask list is noise rather than a checklist.
+_MIN_PLAN_STEPS = 2
+_MAX_PLAN_STEPS = 12
+_STEP_CAP = 200
 _FALLBACK_LABEL = "@pandora"
 _DESCRIPTION_CAP = 2000
 
@@ -72,6 +82,7 @@ def render_block(
     window: dict[str, Any] | None = None,
     links: list[dict[str, Any]] | None = None,
     sessions: list[dict[str, Any]] | None = None,
+    steps: str = "",
 ) -> str:
     """The status block for a task description. Pure."""
     lines = [
@@ -91,6 +102,8 @@ def render_block(
     ]
     if refs:
         lines.append("Links: " + " · ".join(refs))
+    if steps:
+        lines.append("Steps: " + steps)
     for sess in sessions or []:
         lines.append("Session: " + session_line(sess))
     lines.append("<!-- /aegis:problem -->")
@@ -108,6 +121,155 @@ def session_line(sess: dict[str, Any]) -> str:
         head += f" · seen {_ts(seen)}"
     summary = str(sess.get("summary") or "").strip()
     return f"{head} · {summary[:160]}" if summary else head
+
+
+def plan_steps(payload: dict[str, Any]) -> list[str]:
+    """The step list on a `plan` payload, cleaned and bounded. `[]` when the
+    payload carries no plan worth a checklist."""
+    raw = payload.get("steps")
+    if not isinstance(raw, list):
+        return []
+    steps = [str(s).strip()[:_STEP_CAP] for s in raw if str(s).strip()]
+    return steps[:_MAX_PLAN_STEPS] if len(steps) >= _MIN_PLAN_STEPS else []
+
+
+async def _step_links(pool: asyncpg.Pool, problem_id: str) -> list[dict[str, Any]]:
+    """The problem's plan steps, in order: ``[{index, task_id}]``. The ref is
+    ``<index>:<subtask id>`` so the order survives without a column."""
+    rows = await pool.fetch(
+        "SELECT ref FROM problem_links WHERE problem_id = $1::uuid AND link_kind = 'plan_step'",
+        problem_id,
+    )
+    out = []
+    for r in rows:
+        index, _, task_id = str(r["ref"]).partition(":")
+        if index.isdigit() and task_id:
+            out.append({"index": int(index), "task_id": task_id})
+    return sorted(out, key=lambda s: s["index"])
+
+
+async def _create_plan_steps(
+    pool: asyncpg.Pool, settings: Any, problem_id: str, task_id: str, steps: list[str]
+) -> int:
+    """One subtask per step, linked as `plan_step`. Idempotent: a problem that
+    already has steps keeps them, because a re-plan that recreated them would
+    orphan whatever the session has already ticked off.
+
+    Created through the connector rather than the outbox: the subtask's real id
+    is what the link stores, and an outbox temp id would leave the step
+    unclosable until the sync drained.
+    """
+    if not steps or await _step_links(pool, problem_id):
+        return 0
+    try:
+        key = await resolve_todoist_api_key(pool, settings or _settings())
+        if not key:
+            return 0
+        connector = TodoistConnector(api_key=key, db_pool=pool, timeout=10.0)
+        cmds = [TodoistConnector.build_subtask_add_command(task_id, s) for s in steps]
+        try:
+            result = await connector.commands(cmds)
+        finally:
+            await connector.close()
+        status = TodoistConnector.check_sync_status(result, [c["uuid"] for c in cmds])
+        if not status["ok"]:
+            logger.warning("hub_project_steps_failed", task_id=task_id, status=status)
+            return 0
+        mapping = ((result or {}).get("data") or {}).get("temp_id_mapping") or {}
+    except Exception as exc:  # noqa: BLE001 — a plan is worth a comment even with no subtasks
+        logger.warning("hub_project_steps_failed", task_id=task_id, error=str(exc)[:200])
+        return 0
+    made = 0
+    for index, cmd in enumerate(cmds, start=1):
+        real = str(mapping.get(cmd["temp_id"]) or "")
+        if not real:
+            continue
+        await pool.execute(
+            "INSERT INTO problem_links (problem_id, link_kind, ref) "
+            "VALUES ($1::uuid, 'plan_step', $2) ON CONFLICT DO NOTHING",
+            problem_id,
+            f"{index}:{real}",
+        )
+        made += 1
+    logger.info("hub_project_steps_created", problem_id=problem_id, steps=made)
+    return made
+
+
+async def _complete_step(pool: asyncpg.Pool, problem_id: str, index: int) -> bool:
+    """Tick off step `index` (1-based). False when there is no such step."""
+    step = next((s for s in await _step_links(pool, problem_id) if s["index"] == index), None)
+    if step is None:
+        return False
+    await _queue(
+        pool,
+        f"problem-step-{step['task_id']}",
+        TodoistConnector.build_item_complete_command(step["task_id"]),
+    )
+    await pool.execute(
+        "UPDATE todoist_tasks SET is_completed = true, updated_at = now() WHERE id = $1",
+        step["task_id"],
+    )
+    return True
+
+
+async def _step_progress(pool: asyncpg.Pool, problem_id: str) -> str:
+    """`"2/5 done"` for the status block, or `""` when there is no plan."""
+    steps = await _step_links(pool, problem_id)
+    if not steps:
+        return ""
+    done = await pool.fetchval(
+        "SELECT count(*) FROM todoist_tasks WHERE id = ANY($1::text[]) AND is_completed",
+        [s["task_id"] for s in steps],
+    )
+    return f"{int(done or 0)}/{len(steps)} done"
+
+
+async def ensure_problem_for_task(
+    pool: asyncpg.Pool,
+    task_id: str,
+    *,
+    source: str = "session",
+    subject: str = "",
+    settings: Any = None,
+) -> dict[str, Any] | None:
+    """The problem behind a Todoist task, creating a `manual` one when the task
+    has none. This is what lets the hub carry a plain `@code` task: a session
+    registry, a timeline and a plan need a problem to hang off, and a task the
+    user wrote by hand has no alert behind it.
+
+    Returns the problem, or None when the task is unknown or the hub refused
+    the event.
+    """
+    from aegis.services.hub import Event, find_problem_for_task, get_problem, ingest_event
+
+    problem = await find_problem_for_task(pool, task_id)
+    if problem is not None:
+        return problem
+    row = await pool.fetchrow("SELECT content FROM todoist_tasks WHERE id = $1", task_id)
+    if row is None:
+        return None
+    try:
+        result = await ingest_event(
+            pool,
+            Event(
+                source=source,
+                external_id=f"task-{task_id}",
+                kind="occurrence",
+                title=str(row["content"] or f"Task {task_id}")[:200],
+                subject=subject or f"task-{task_id}",
+                subject_kind="repo",
+                klass="manual",
+                severity="info",
+                payload={"task_id": task_id},
+            ),
+        )
+    except ValueError as exc:
+        logger.warning("hub_problem_for_task_refused", task_id=task_id, error=str(exc)[:200])
+        return None
+    if not result.problem_id:
+        return None
+    await link_task(pool, result.problem_id, task_id)
+    return await get_problem(pool, result.problem_id)
 
 
 def merge_block(description: str | None, block: str) -> str:
@@ -166,15 +328,24 @@ async def _post_note(pool: asyncpg.Pool, settings: Any, task_id: str, text: str)
         return False
 
 
-async def _queue(pool: asyncpg.Pool, temp_id: str, command: dict) -> None:
+async def _queue(
+    pool: asyncpg.Pool, temp_id: str, command: dict, *, supersede: bool = False
+) -> None:
     """Re-armable outbox insert (the `agent_task._queue_command` contract): a
     row already drained to a terminal status is re-armed, a pending one is
-    left alone."""
+    left alone.
+
+    ``supersede`` overwrites a pending row too, and is for a command that
+    REPLACES its predecessor rather than adding to it — the status block, whose
+    every write is the whole description. Without it the newer block is dropped
+    on the floor: the queue keeps the older command, while `block_hash` records
+    the new one as written, so no later projection ever queues it again.
+    """
     await pool.execute(
         "INSERT INTO todoist_outbox (temp_id, command, status) VALUES ($1, $2, 'pending') "
         "ON CONFLICT (temp_id) DO UPDATE "
         "SET command = EXCLUDED.command, status = 'pending', attempt_count = 0 "
-        "WHERE todoist_outbox.status <> 'pending'",
+        + ("" if supersede else "WHERE todoist_outbox.status <> 'pending'"),
         temp_id,
         command,
     )
@@ -314,7 +485,11 @@ async def project(
     ]
     sessions = await work_sessions.list_for_task(pool, task_id) if task_id else []
     block = render_block(
-        p, window=dict(window) if window else None, links=links, sessions=sessions
+        p,
+        window=dict(window) if window else None,
+        links=links,
+        sessions=sessions,
+        steps=await _step_progress(pool, problem_id),
     )
 
     if not task_id:
@@ -377,6 +552,13 @@ async def project(
                 reopen, close = True, False
         elif e["kind"] in _HISTORY_KINDS and not payload.get("posted"):
             comments.append(_history_text(e["kind"], payload))
+        if e["kind"] == "plan":
+            steps = plan_steps(payload)
+            if steps:
+                await _create_plan_steps(pool, settings, problem_id, task_id, steps)
+        done = payload.get("step_done")
+        if isinstance(done, int) and done > 0:
+            await _complete_step(pool, problem_id, done)
 
     last_comment_at = meta.get("last_occurrence_comment_at")
     if pending and (
@@ -406,6 +588,17 @@ async def project(
     elif reopen:
         await _uncomplete_task(pool, task_id)
 
+    # Re-read after the loop: a plan just created its subtasks, and a step
+    # just ticked off changes the count the block reports.
+    progress = await _step_progress(pool, problem_id)
+    if progress and f"Steps: {progress}" not in block:
+        block = render_block(
+            p,
+            window=dict(window) if window else None,
+            links=links,
+            sessions=sessions,
+            steps=progress,
+        )
     block_hash = hashlib.sha1(block.encode()).hexdigest()
     if meta.get("block_hash") != block_hash:
         current = await pool.fetchval("SELECT description FROM todoist_tasks WHERE id = $1", task_id)
@@ -415,6 +608,7 @@ async def project(
             TodoistConnector.build_item_update_command(
                 task_id, description=merge_block(current, block)[:_DESCRIPTION_CAP]
             ),
+            supersede=True,
         )
         meta["block_hash"] = block_hash
 
