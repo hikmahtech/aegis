@@ -42,40 +42,22 @@ was confirmed. Forcing #131 into the time-based path would delay a resolve that
 should be immediate; forcing #138 into the diff would not fix it at all.
 
 **Alert volume for the #138 re-investigation.** Transition-only logic exists so
-a known-bad service is not re-alerted every 2 minutes, so the re-investigate
-path is gated three ways, following `FlowHealthWatchdogFlow`:
-
-1. threshold — a service must have been `confirmed` for `restuck_hours`
-   (default 24h) before it is eligible at all;
-2. dedup — `reinvestigated_at` in the heartbeat state row ratchets forward on
-   every successful spawn, so one confirmed-stuck service yields at most ONE
-   re-investigation per `restuck_hours`, not one per tick. That ledger lives in
-   the state row rather than `audit_log` because the threshold already forces
-   this flow to remember a per-service timestamp — a second ledger would be two
-   guards for one rule. (`alert_dedup_index` is the wrong substrate regardless:
-   its `task_id` is NOT NULL and joined to `todoist_tasks`, so it dedups
-   @pandora Todoist tasks, not alerts.) `AlertInvestigationFlow`'s own
-   resolved-aware `check_dedup` is an independent downstream backstop;
-3. mutes — `AlertInvestigationFlow` step 2.5 already short-circuits on
-   `alert_mutes` with `_build_mute_key` = `aegis-heartbeat:<service>:`, so the
-   operator kill switch is the existing one and the alert body prints it.
-
-The re-investigation reuses the existing `ServiceDownProlonged` alertname
-(Prometheus has the same-named 2h rule for exactly this "prolonged outage the
-5m alert failed to get actioned" case) rather than re-firing DockerServiceDown:
-a distinct alertname means a distinct fingerprint, which is what keeps it from
-being swallowed by the original alert's own 24h fingerprint dedup, while the
-shared signature (`infra-class:<cluster>:servicedownprolonged:<svc>`) still
-collapses it onto one @pandora task. It is `escalate=True` — being down for a
+a known-bad service is not re-alerted every 2 minutes. Since the problem hub
+(PR 3b) the gate is one question to the hub: `stale_stuck_problems` returns the
+still-stuck services whose open problem is older than `restuck_hours` and has
+had no investigation event in that long. The hub records every investigation
+(`record_investigation`), so the per-service clocks this flow used to keep in
+its settings row are gone, and a re-investigation runs on the SAME problem the
+first one did — one task, one timeline. The `ServiceDownProlonged` alertname
+is kept for the flow's escalation behaviour (`escalate=True`: being down for a
 day with the first investigation dead is precisely the case #138 says nobody
-ever heard about.
+ever heard about) and for the Prometheus rule of the same name.
 """
 
 from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from datetime import datetime
 
 from temporalio import workflow
 
@@ -92,23 +74,6 @@ def _safe_id_segment(text: str, max_len: int = 60) -> str:
 
 def _hb_fingerprint(alertname: str, subject: str) -> str:
     return f"aegis-heartbeat:{alertname}:{subject}"
-
-
-def _hours_since(iso: object, now: datetime) -> float | None:
-    """Hours between an ISO stamp written by a previous tick and `now`.
-
-    None means "no usable stamp" — absent, or unparseable/naive from a
-    hand-edited state row. The single caller re-stamps it to `now` rather than
-    guessing an age, so neither a first sighting nor a corrupt value can make a
-    service look old enough to re-investigate.
-    """
-    try:
-        then = datetime.fromisoformat(str(iso))
-    except (TypeError, ValueError):
-        return None
-    if then.tzinfo is None:
-        return None
-    return (now - then).total_seconds() / 3600.0
 
 
 def build_heartbeat_alert(
@@ -159,18 +124,60 @@ class InfraHeartbeatConfig:
 
 @workflow.defn
 class InfraHeartbeatFlow:
-    async def _spawn(self, alert: dict) -> bool:
-        """ABANDONED child; an already-running same-id child is benign."""
-        # Deterministic per-transition stamp (workflow.now() is deterministic
-        # inside a workflow) so a LATER transition of the same node/service
-        # never collides with a completed/running earlier child — that
-        # collision is what let a genuine re-fire get silently dropped as an
-        # already-started duplicate. Fingerprints stay deterministic (recovery
-        # audit rows must still match), only the child workflow id is unique.
+    async def _ingest(self, alert: dict, *, resolved: bool) -> dict:
+        """Record a transition on the problem hub. Never raises: a hub outage
+        must not stop the heartbeat's own state from advancing."""
+        try:
+            return await workflow.execute_activity_method(
+                HubActivities.ingest_alert,
+                args=[alert, resolved],
+                start_to_close_timeout=TIMEOUT_STANDARD,
+                retry_policy=FAST,
+            )
+        except Exception as exc:  # noqa: BLE001
+            workflow.logger.warning(
+                "heartbeat_hub_ingest_failed fp=%s err=%s", alert.get("fingerprint"), str(exc)[:200]
+            )
+            return {"problem_id": None, "investigate": False, "action": "error"}
+
+    async def _resolve(self, alertname: str, subject: str, cluster: str, service_name: str = "") -> None:
+        alert = build_heartbeat_alert(
+            alertname, subject, cluster, f"{alertname} resolved: {subject}", "", escalate=False,
+            service_name=service_name,
+        )
+        await self._ingest(alert, resolved=True)
+
+    async def _spawn(self, alert: dict, *, problem_id: str | None = None) -> bool:
+        """Record the transition on the hub, then start the investigation as
+        an ABANDONED child when the hub wants one. `problem_id` is given for
+        a re-investigation of a problem the hub already holds."""
+        if problem_id is None:
+            ingested = await self._ingest(alert, resolved=False)
+            if not ingested.get("investigate"):
+                workflow.logger.info(
+                    "heartbeat_hub_skip fp=%s action=%s",
+                    alert.get("fingerprint"),
+                    ingested.get("action"),
+                )
+                return False
+            problem_id = ingested.get("problem_id")
+            alert = {
+                **alert,
+                "problem_id": problem_id,
+                "todoist_task_id": ingested.get("todoist_task_id"),
+            }
+            suffix = str(ingested.get("occurrences") or 1)
+        else:
+            alert = {**alert, "problem_id": problem_id}
+            suffix = "re" + workflow.now().strftime("%Y%m%d%H%M%S")
+        # Deterministic per-transition id (workflow.now() is deterministic
+        # inside a workflow) so a later transition never collides with an
+        # earlier child.
         stamp = workflow.now().strftime("%Y%m%d%H%M%S")
         child_id = (
-            f"aegis-heartbeat-{_safe_id_segment(alert['labels']['alertname'].lower())}-"
-            f"{_safe_id_segment(alert['fingerprint'].rsplit(':', 1)[-1])}-{stamp}"
+            f"investigate-{problem_id or _safe_id_segment(alert['fingerprint'])}-{suffix}"
+            if problem_id
+            else f"aegis-heartbeat-{_safe_id_segment(alert['fingerprint'])}-{stamp}"
         )
         try:
             await workflow.start_child_workflow(
@@ -283,41 +290,21 @@ class InfraHeartbeatFlow:
         confirmed_now = (prev_confirmed | new_confirmed) & cur_stuck
         recovered_services = prev_confirmed - cur_stuck
 
-        # #138: per-service clocks for the confirmed-stuck set. `confirmed_at`
-        # is stamped once (it answers "how long has this been broken");
-        # `reinvestigated_at` ratchets on each re-investigation and is what
-        # makes the re-investigate path fire once per restuck_hours instead of
-        # once per 2-min tick. Both are pruned to `confirmed_now`, so a service
-        # that recovers loses its clocks and starts fresh if it breaks again.
-        now = workflow.now()
-        now_iso = now.isoformat()
-        confirmed_at = {
-            svc: ts
-            for svc, ts in (prior.get("confirmed_at") or {}).items()
-            if svc in confirmed_now
-        }
-        reinvestigated_at = {
-            svc: ts
-            for svc, ts in (prior.get("reinvestigated_at") or {}).items()
-            if svc in confirmed_now
-        }
-        stale_stuck: list[str] = []
-        for svc in sorted(confirmed_now):
-            stuck_for = _hours_since(confirmed_at.get(svc), now)
-            if stuck_for is None:
-                # First sighting on this clock — including every service that
-                # was already `confirmed` when this change shipped. Start the
-                # clock now rather than treating an unknown age as infinite,
-                # which would alert on every known-bad service the moment the
-                # deploy lands.
-                confirmed_at[svc] = now_iso
-                continue
-            if config.restuck_hours <= 0 or stuck_for < config.restuck_hours:
-                continue
-            last = _hours_since(reinvestigated_at.get(svc), now)
-            if last is not None and last < config.restuck_hours:
-                continue
-            stale_stuck.append(svc)
+        # #138: a service still stuck after `restuck_hours` is re-investigated,
+        # once per `restuck_hours`. The hub knows when each problem was first
+        # seen and when it was last investigated, so the per-service clocks
+        # that used to live in the heartbeat state row are gone.
+        stale: list[dict] = []
+        if config.restuck_hours > 0 and confirmed_now:
+            try:
+                stale = await workflow.execute_activity_method(
+                    HubActivities.stale_stuck_problems,
+                    args=[sorted(confirmed_now), float(config.restuck_hours)],
+                    start_to_close_timeout=TIMEOUT_FAST,
+                    retry_policy=FAST,
+                )
+            except Exception as exc:  # noqa: BLE001
+                workflow.logger.warning("heartbeat_stale_lookup_failed err=%s", str(exc)[:200])
 
         quiet = set(config.quiet_nodes or [])
         quiet_notified = 0
@@ -354,48 +341,33 @@ class InfraHeartbeatFlow:
             if await self._spawn(alert):
                 spawned += 1
         reinvestigated = 0
-        for svc in stale_stuck:
-            hours = int(_hours_since(confirmed_at[svc], now) or 0)  # never None here
+        for row in stale:
+            svc = str(row.get("subject") or "")
+            hours = int(row.get("hours") or 0)
             alert = build_heartbeat_alert(
                 "ServiceDownProlonged",
                 svc,
                 cluster,
                 f"PROLONGED: {svc} still down after {hours}h",
-                f"{svc} has been below desired replicas since {confirmed_at[svc]} "
-                f"({hours}h) and the original investigation never resolved it. "
-                f"Re-investigating; this repeats at most once every "
-                f"{config.restuck_hours}h. Silence it with: INSERT INTO alert_mutes "
-                f"(mute_key, muted_until) VALUES ('aegis-heartbeat:{svc}:', "
-                f"now() + interval '7 days');",
+                f"{svc} has been below desired replicas for {hours}h and the original "
+                f"investigation never resolved it. Re-investigating; this repeats at "
+                f"most once every {config.restuck_hours}h. Silence it with the problem's "
+                f"Mute 24h card, or `set_service_state` for a longer window.",
                 escalate=True,
                 service_name=svc,
             )
-            if await self._spawn(alert):
-                spawned += 1
+            if await self._spawn(alert, problem_id=str(row.get("id") or "")):
                 reinvestigated += 1
-                # Ratchet BEFORE the state write below — this is the dedup, and
-                # only a spawn that actually started may consume the budget.
-                reinvestigated_at[svc] = now_iso
 
         for node in nodes_vanished:
-            await workflow.execute_activity_method(
-                HomelabActivities.record_heartbeat_resolved,
-                args=[_hb_fingerprint("NodeDown", node)],
-                start_to_close_timeout=TIMEOUT_FAST,
-                retry_policy=NO_RETRY,
-            )
+            await self._resolve("NodeDown", node, cluster)
             workflow.logger.info(
                 "heartbeat_node_vanished_while_down node=%s — NodeDown resolved", node
             )
         for node in nodes_recovered:
             # Resolved row written for quiet nodes too — harmless, and it
             # closes out any alert fired before the node was quieted.
-            await workflow.execute_activity_method(
-                HomelabActivities.record_heartbeat_resolved,
-                args=[_hb_fingerprint("NodeDown", node)],
-                start_to_close_timeout=TIMEOUT_FAST,
-                retry_policy=NO_RETRY,
-            )
+            await self._resolve("NodeDown", node, cluster)
             if node in quiet:
                 await workflow.execute_activity_method(
                     HomelabActivities.notify_node_transition,
@@ -405,23 +377,11 @@ class InfraHeartbeatFlow:
                 )
                 quiet_notified += 1
         for svc in sorted(recovered_services):
-            # Both fingerprints: a service that was re-investigated owns a live
-            # ServiceDownProlonged escalation too, and it needs the same
-            # resolved row or it nags after the outage is over.
-            for alertname in ("DockerServiceDown", "ServiceDownProlonged"):
-                await workflow.execute_activity_method(
-                    HomelabActivities.record_heartbeat_resolved,
-                    args=[_hb_fingerprint(alertname, svc)],
-                    start_to_close_timeout=TIMEOUT_FAST,
-                    retry_policy=NO_RETRY,
-                )
+            # One problem per service on the hub: DockerServiceDown and its
+            # PROLONGED re-investigations share it, so one resolve ends both.
+            await self._resolve("DockerServiceDown", svc, cluster, service_name=svc)
         if int(prior.get("fail_count") or 0) >= config.fail_threshold:
-            await workflow.execute_activity_method(
-                HomelabActivities.record_heartbeat_resolved,
-                args=[_hb_fingerprint("HeartbeatCollectFailed", "collect")],
-                start_to_close_timeout=TIMEOUT_FAST,
-                retry_policy=NO_RETRY,
-            )
+            await self._resolve("HeartbeatCollectFailed", "collect", cluster)
 
         await workflow.execute_activity_method(
             HomelabActivities.write_heartbeat_state,
@@ -434,8 +394,6 @@ class InfraHeartbeatFlow:
                     "nodes": cur_nodes or prev_nodes,
                     "stuck": sorted(cur_stuck),
                     "confirmed": sorted(confirmed_now),
-                    "confirmed_at": confirmed_at,
-                    "reinvestigated_at": reinvestigated_at,
                     "fail_count": 0,
                 }
             ],

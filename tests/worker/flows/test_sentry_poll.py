@@ -36,7 +36,7 @@ class _BlockingAlertInvestigationFlow:
         return {}
 
 
-_calls: dict[str, list] = {"read_c": [], "fetch": [], "to_alert": [], "idem": [], "write_c": []}
+_calls: dict[str, list] = {"read_c": [], "fetch": [], "to_alert": [], "ingest": [], "write_c": []}
 
 
 @activity.defn(name="read_sentry_cursor")
@@ -72,10 +72,16 @@ async def stub_to_alert(issue: dict) -> dict:
     }
 
 
-@activity.defn(name="ingest_idempotency_claim")
-async def stub_idem(source_type: str, external_id: str) -> bool:
-    _calls["idem"].append((source_type, external_id))
-    return True
+@activity.defn(name="ingest_alert")
+async def stub_ingest(alert: dict, resolved: bool = False) -> dict:
+    _calls["ingest"].append((alert["fingerprint"], resolved))
+    return {
+        "problem_id": f"prob-{alert['fingerprint']}",
+        "action": "created",
+        "investigate": True,
+        "occurrences": 1,
+        "todoist_task_id": None,
+    }
 
 
 @activity.defn(name="write_sentry_cursor")
@@ -83,7 +89,7 @@ async def stub_write(issue_id: str) -> None:
     _calls["write_c"].append(issue_id)
 
 
-ALL_STUBS = [stub_read_cursor, stub_fetch, stub_to_alert, stub_idem, stub_write]
+ALL_STUBS = [stub_read_cursor, stub_fetch, stub_to_alert, stub_ingest, stub_write]
 
 
 def _reset():
@@ -154,9 +160,10 @@ async def test_webhook_mode_single_issue():
 async def test_duplicate_issue_skipped():
     _reset()
 
-    @activity.defn(name="ingest_idempotency_claim")
-    async def dup(source_type: str, external_id: str) -> bool:
-        return False
+    @activity.defn(name="ingest_alert")
+    async def dup(alert: dict, resolved: bool = False) -> dict:
+        # A repeat occurrence: the hub attaches it and wants no investigation.
+        return {"problem_id": "prob-x", "action": "attached", "investigate": False}
 
     async with (
         await WorkflowEnvironment.start_time_skipping() as env,

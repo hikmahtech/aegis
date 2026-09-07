@@ -8,7 +8,6 @@ import json
 import re
 from collections import Counter
 from dataclasses import dataclass
-from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -132,89 +131,6 @@ def is_infra_alert(alert: dict, infra_cluster: str = "") -> bool:
         return True
     alertname = (labels.get("alertname") or "").strip().lower()
     return alertname in INFRA_ALERTNAMES
-
-
-def build_alert_signature(alert: dict, infra_cluster: str = "") -> str:
-    """Derive a coarse cluster key for related alerts (beyond fingerprint).
-
-    Sentry mints a fresh issue id for every stack-frame variation of the
-    same underlying error, so check_dedup (which keys on the exact
-    fingerprint) lets each variation through as a new investigation.
-    This signature groups by (project_slug, error_class) so all the
-    variations of e.g. paramiko `IncompatiblePeer` collapse onto a single
-    open task. Returns "" when no stable signature can be derived; the
-    caller then falls back to fingerprint-only dedup.
-
-    alertmanager/prometheus/grafana re-fire each occurrence with a fresh
-    `fingerprint`, so they bypass fingerprint dedup the same way and create
-    duplicate tasks/investigations. They get a stable signature keyed on
-    `service` + the alert's `alertname` label (or a slugified title), so all
-    re-fires of e.g. a Dagster pipeline failure collapse onto one open task.
-
-    Infra/swarm alerts (is_infra_alert) key the signature on the literal
-    `infra-class:{cluster}:{alertname}` (NOT instance/service, and NOT
-    source-interpolated) so a NodeDown storm across node-b/node-a/node-d
-    collapses to ONE signature and the dedup gate prevents duplicate
-    investigations regardless of which source (alertmanager/prometheus/
-    grafana/aegis-heartbeat) reported it.
-    """
-    source = (alert.get("source") or "").strip()
-    if source == "sentry":
-        raw = alert.get("raw_payload") or {}
-        if not isinstance(raw, dict):
-            return ""
-        metadata = raw.get("metadata") or {}
-        if not isinstance(metadata, dict):
-            return ""
-        error_class = (metadata.get("type") or "").strip()
-        service = (alert.get("service") or "").strip()
-        if not error_class or not service:
-            return ""
-        return f"sentry-class:{service}:{error_class}"
-
-    if source in {"alertmanager", "prometheus", "grafana", "aegis-heartbeat"}:
-        labels = alert.get("labels") or {}
-        alertname = ""
-        if isinstance(labels, dict):
-            alertname = (labels.get("alertname") or "").strip()
-
-        # Infra/swarm storm collapse: key on cluster+alertname, NOT instance/service,
-        # so one outage (N nodes down) maps to ONE signature and one open task.
-        # The prefix is a literal ("infra-class"), NOT source-interpolated, so a
-        # heartbeat-detected outage and an Alertmanager-pushed one collapse onto
-        # the same signature instead of spawning duplicate investigations.
-        if is_infra_alert(alert, infra_cluster):
-            cluster = (labels.get("cluster") or "").strip() if isinstance(labels, dict) else ""
-            subkey = alertname.lower()
-            if not subkey:
-                title = (alert.get("title") or "").strip()
-                subkey = re.sub(r"[^a-z0-9]+", "-", title.lower()).strip("-")[:40]
-            # Remediable per-service classes (DockerServiceDown / ...) must NOT
-            # collapse across services: two stuck services need separate
-            # signatures → separate @pandora tasks → each gets its own
-            # auto-remediation. Extend the subkey with the service when present.
-            if subkey in _REMEDIABLE_ALERTNAMES:
-                svc = (
-                    labels.get("service_name")
-                    or labels.get("service")
-                    or alert.get("service")
-                    or ""
-                ).strip()
-                if svc:
-                    subkey = f"{subkey}:{svc}"
-            return f"infra-class:{cluster or 'infra'}:{subkey}"
-
-        service = (alert.get("service") or "").strip()
-        subkey = alertname.lower()
-        if not subkey:
-            title = (alert.get("title") or "").strip()
-            slug = re.sub(r"[^a-z0-9]+", "-", title.lower()).strip("-")
-            subkey = slug[:40]
-        if not service and not subkey:
-            return ""
-        return f"{source}-class:{service}:{subkey}"
-
-    return ""
 
 
 # Caps for the human-approved remediation-command path (Gate 2 "Run fix"):
@@ -880,110 +796,6 @@ class AlertActivities:
         }
 
     @activity.defn
-    async def check_dedup(self, fingerprint: str, window_hours: int = 24) -> dict:
-        """Resolved-aware dedup: a duplicate ONLY if investigated within the
-        window AND not recovered since.
-
-        Heartbeat fingerprints are deterministic, so a 03:00 flap that
-        self-resolves leaves an `alert_investigated` row that — with plain
-        window dedup — would suppress a genuine 09:00 outage of the same class
-        for 24h (no card, no escalation). A recovery row (`alert_received` with
-        details.resolved='true') created AFTER the latest investigation is
-        evidence of a NEW incident, so we only report a duplicate when the most
-        recent in-window investigation has NO resolved row after it.
-        """
-        if not self.db_pool or not fingerprint:
-            return {"is_duplicate": False}
-
-        row = await self.db_pool.fetchrow(
-            "SELECT ai.created_at FROM audit_log ai "
-            "WHERE ai.target_type = 'alert' AND ai.target_id = $1 "
-            "AND ai.action = 'alert_investigated' "
-            "AND ai.created_at > NOW() - INTERVAL '1 hour' * $2 "
-            "AND NOT EXISTS ("
-            "  SELECT 1 FROM audit_log ar "
-            "  WHERE ar.target_type = 'alert' AND ar.target_id = $1 "
-            "  AND ar.action = 'alert_received' AND ar.details->>'resolved' = 'true' "
-            "  AND ar.created_at > ai.created_at"
-            ") "
-            "ORDER BY ai.created_at DESC LIMIT 1",
-            fingerprint,
-            window_hours,
-        )
-        return {"is_duplicate": row is not None}
-
-    @activity.defn
-    async def find_open_task_for_signature(self, signature: str) -> str | None:
-        """Return the task_id of the open @pandora task that owns this
-        signature, or None if no open task is bound to it.
-
-        Joins alert_dedup_index against todoist_tasks so a completed
-        (is_completed=true) or deleted task falls through and the next
-        occurrence creates a fresh task. A stale binding to a deleted
-        Todoist task (missing from the projection) also falls through.
-        """
-        if not self.db_pool or not signature:
-            return None
-        row = await self.db_pool.fetchrow(
-            """
-            SELECT adi.task_id
-            FROM alert_dedup_index adi
-            JOIN todoist_tasks tt ON tt.id = adi.task_id
-            WHERE adi.signature = $1 AND tt.is_completed = FALSE
-            LIMIT 1
-            """,
-            signature,
-        )
-        return row["task_id"] if row else None
-
-    @activity.defn
-    async def record_signature_recurrence(self, signature: str) -> None:
-        """Bump occurrence_count + last_seen_at for an existing signature.
-
-        No-op when the row is missing (race against task deletion); the
-        caller has already posted the recurrence note on the existing
-        task and the next occurrence will rebind via record_signature_new_task.
-        """
-        if not self.db_pool or not signature:
-            return
-        await self.db_pool.execute(
-            """
-            UPDATE alert_dedup_index
-            SET last_seen_at = now(),
-                occurrence_count = occurrence_count + 1
-            WHERE signature = $1
-            """,
-            signature,
-        )
-
-    @activity.defn
-    async def record_signature_new_task(self, signature: str, task_id: str) -> None:
-        """Bind a signature to a freshly-captured @pandora task.
-
-        Upserts because the prior task for this signature may have been
-        completed/deleted: in that case the index still holds the stale
-        task_id and the next alert should rebind to the new one. The
-        UPSERT resets first_seen_at and occurrence_count so the new task's
-        recurrence stats start fresh.
-        """
-        if not self.db_pool or not signature or not task_id:
-            return
-        await self.db_pool.execute(
-            """
-            INSERT INTO alert_dedup_index
-                (signature, task_id, first_seen_at, last_seen_at, occurrence_count)
-            VALUES ($1, $2, now(), now(), 1)
-            ON CONFLICT (signature) DO UPDATE SET
-                task_id = EXCLUDED.task_id,
-                first_seen_at = now(),
-                last_seen_at = now(),
-                occurrence_count = 1
-            """,
-            signature,
-            task_id,
-        )
-
-    @activity.defn
     async def investigate(self, alert: dict, agent_system_prompt: str = "") -> dict:
         """Use LLM to investigate the alert and assess root cause."""
         title = alert.get("title", "Unknown")
@@ -1110,23 +922,6 @@ class AlertActivities:
                 activity.logger.warning("gather_alert_knowledge_kg_failed err=%s", str(exc)[:200])
 
         return "\n\n".join(parts)
-
-    @activity.defn
-    async def log_alert(self, alert: dict) -> None:
-        """Log alert to audit_log for dedup tracking."""
-        if not self.db_pool:
-            return
-        await log_audit(
-            self.db_pool,
-            actor=f"alert:{alert.get('source', 'unknown')}",
-            action="alert_investigated",
-            target_type="alert",
-            target_id=alert.get("fingerprint", ""),
-            details={
-                "title": alert.get("title", "")[:100],
-                "severity": alert.get("severity", ""),
-            },
-        )
 
     @activity.defn
     async def resolve_infra_resource(self, alert: dict) -> dict:
@@ -1798,76 +1593,6 @@ class AlertActivities:
         except Exception as exc:
             activity.logger.warning(f"reresolve_with_hint_failed error={exc}")
             return empty
-
-    @activity.defn
-    async def check_alert_resolved(
-        self, fingerprint: str, window_minutes: int = 10, since_iso: str = ""
-    ) -> dict:
-        """Check if a matching resolve event arrived.
-
-        With `since_iso` (an ISO-8601 timestamp) set, only recoveries created
-        strictly after that instant count — callers pass the flow's own start
-        time so a PREVIOUS flap's resolved row can't instantly (and wrongly)
-        close this run's gate. Empty `since_iso` keeps the legacy rolling
-        `window_minutes` behaviour for other callers (backward compat).
-        """
-        if not self.db_pool or not fingerprint:
-            return {"resolved": False}
-
-        if since_iso:
-            # asyncpg binds timestamptz params as datetime objects, never raw
-            # strings (caught in prod 2026-07-26: TypeError killed every
-            # investigation at the verification recheck).
-            try:
-                since_dt = datetime.fromisoformat(since_iso)
-            except ValueError:
-                activity.logger.warning(
-                    "check_alert_resolved_bad_since_iso value=%s", since_iso[:50]
-                )
-                return {"resolved": False}
-            row = await self.db_pool.fetchrow(
-                "SELECT id FROM audit_log WHERE target_type = 'alert' AND target_id = $1 "
-                "AND action = 'alert_received' AND details->>'resolved' = 'true' "
-                "AND created_at > $2 LIMIT 1",
-                fingerprint,
-                since_dt,
-            )
-        else:
-            row = await self.db_pool.fetchrow(
-                "SELECT id FROM audit_log WHERE target_type = 'alert' AND target_id = $1 "
-                "AND action = 'alert_received' AND details->>'resolved' = 'true' "
-                "AND created_at > NOW() - INTERVAL '1 minute' * $2 LIMIT 1",
-                fingerprint,
-                window_minutes,
-            )
-        return {"resolved": row is not None}
-
-    @activity.defn
-    async def get_verification_delay(self, alert: dict) -> dict:
-        """Determine how long to wait before investigating an alert.
-
-        Pattern-based defaults keyed off the alert title — deterministic and
-        offline. The previous KG-lookup tier was speculative (no custom delay
-        was ever stored) and added a per-alert KS network call under a 15s
-        activity timeout, so a slow proxy could time the whole activity out and
-        fail the investigation. Dropped.
-        """
-        title_lower = alert.get("title", "").lower()
-
-        # Service/core/node down → 5 minutes
-        if re.search(r"(service|core|node)\s*down", title_lower):
-            return {"delay_seconds": 300, "reason": "Service down pattern — 5 min verification"}
-
-        # Pipeline / success rate → 10 minutes
-        if re.search(r"(pipeline|success\s*rate)", title_lower):
-            return {"delay_seconds": 600, "reason": "Pipeline pattern — 10 min verification"}
-
-        # Disk / storage / memory / OOM → immediate
-        if re.search(r"(disk|storage|memory|oom)", title_lower):
-            return {"delay_seconds": 0, "reason": "Resource exhaustion — immediate investigation"}
-
-        # Default
-        return {"delay_seconds": 180, "reason": "Default verification delay — 3 min"}
 
     @activity.defn
     async def run_investigation(

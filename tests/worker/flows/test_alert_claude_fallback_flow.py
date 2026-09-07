@@ -113,7 +113,7 @@ async def test_kimi_failure_retries_claude_and_uses_its_output():
     """kimi times out (engine=kimi) → flow retries with engine_override='claude';
     the succeeding claude result is what feeds assess (not kimi's output, and the
     LLM fallback never runs)."""
-    _reset(muted=False)
+    _reset()
     _state.clear()
     _state["kimi_result"] = {
         "status": "timed_out",
@@ -144,7 +144,7 @@ async def test_kimi_failure_retries_claude_and_uses_its_output():
 async def test_kimi_failure_then_claude_failure_degrades_to_llm():
     """Both coding-CLI attempts fail → the original (kimi) result stands and the
     flow falls through to the LLM-only investigate()."""
-    _reset(muted=False)
+    _reset()
     _state.clear()
     _state["kimi_result"] = {
         "status": "failed",
@@ -191,7 +191,7 @@ async def test_run_investigation_raise_synthesizes_no_fallback_engine():
     budget and a second full attempt would double the walltime. Proven by
     run_investigation being invoked exactly once (engine_override="") — a
     claude retry never fires even though status != succeeded."""
-    _reset(muted=False)
+    _reset()
     _state.clear()
 
     result = await _run_to_completion(

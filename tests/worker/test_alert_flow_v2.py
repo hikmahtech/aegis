@@ -29,12 +29,10 @@ _state: dict = {}
 
 
 def _reset(**overrides):
+    _hub_reset()
     _state.clear()
     _state.update(
         {
-            "check_dedup_result": {"is_duplicate": False},
-            "delay_result": {"delay_seconds": 0, "reason": "test"},
-            "resolved_check_result": {"resolved": False},
             "resource_result": {
                 "resource_id": "res-1",
                 "resource_title": "aegis",
@@ -75,9 +73,6 @@ def _reset(**overrides):
             "run_investigation_called": False,
             "investigate_called": False,
             "assess_called": False,
-            "capture_called": False,
-            "capture_extra_labels": [],
-            "capture_return_id": "real-captured-1",
             "posted_notes": [],
         }
     )
@@ -87,38 +82,6 @@ def _reset(**overrides):
 # ---------------------------------------------------------------------------
 # Stub activities
 # ---------------------------------------------------------------------------
-
-
-@activity.defn(name="check_dedup")
-async def stub_check_dedup(fingerprint: str, hours: int) -> dict:
-    return _state["check_dedup_result"]
-
-
-@activity.defn(name="find_open_task_for_signature")
-async def stub_find_open_task_for_signature(signature: str) -> str | None:
-    return None
-
-
-@activity.defn(name="record_signature_new_task")
-async def stub_record_signature_new_task(signature: str, task_id: str) -> None:
-    return None
-
-
-@activity.defn(name="record_signature_recurrence")
-async def stub_record_signature_recurrence(signature: str) -> None:
-    return None
-
-
-@activity.defn(name="get_verification_delay")
-async def stub_get_verification_delay(alert: dict) -> dict:
-    return _state["delay_result"]
-
-
-@activity.defn(name="check_alert_resolved")
-async def stub_check_alert_resolved(
-    fingerprint: str, window_minutes: int, since_iso: str = ""
-) -> dict:
-    return _state["resolved_check_result"]
 
 
 @activity.defn(name="resolve_alert_resource")
@@ -154,12 +117,6 @@ async def stub_assess_investigation(alert: dict, investigation_output: str) -> d
     return _state["assess_result"]
 
 
-@activity.defn(name="log_alert")
-async def stub_log_alert(alert: dict) -> None:
-    _state["log_alert_called"] = True
-    _state.setdefault("log_alert_fingerprints", []).append(alert.get("fingerprint"))
-
-
 @activity.defn(name="send_system_event")
 async def stub_send_system_event(msg: str) -> None:
     pass
@@ -184,32 +141,9 @@ async def stub_update_task_status(
     pass
 
 
-@activity.defn(name="check_alert_mute")
-async def stub_check_alert_mute_v2(_inp) -> bool:
-    return False
-
-
-@activity.defn(name="write_alert_mute")
-async def stub_write_alert_mute_v2(_inp) -> None:
-    pass
-
-
 @activity.defn(name="accumulate_digest_item")
 async def stub_accumulate_digest_item(payload: dict) -> None:
     pass
-
-
-@activity.defn(name="capture_to_inbox")
-async def stub_capture_to_inbox(
-    source_tag: str,
-    external_id: str,
-    title: str,
-    description: str | None = None,
-    extra_labels: list[str] | None = None,
-) -> str | None:
-    _state["capture_called"] = True
-    _state["capture_extra_labels"] = list(extra_labels or [])
-    return _state.get("capture_return_id", "real-captured-1")
 
 
 @activity.defn(name="post_task_note")
@@ -295,28 +229,89 @@ async def stub_get_alert_routing_config() -> dict:
     return {"infra_cluster": ""}
 
 
+# ── problem hub stubs (PR 3b) ───────────────────────────────────────────────
+# The flow no longer owns an alert's identity: it asks the hub. These stand in
+# for HubActivities; `_HUB["resolved"]` makes `problem_status` report the
+# problem as resolved, `_HUB["investigate"]` is what `ingest_alert` answers.
+_HUB: dict = {
+    "ingest": [],
+    "status": [],
+    "record": [],
+    "mute": [],
+    "resolved": False,
+    "investigate": True,
+    "delay": 0,
+}
+
+
+@activity.defn(name="ingest_alert")
+async def stub_ingest_alert(alert: dict, resolved: bool = False) -> dict:
+    _HUB["ingest"].append((alert.get("fingerprint"), resolved))
+    return {
+        "problem_id": "prob-1",
+        "action": "created",
+        "key": "k",
+        "occurrences": 1,
+        "suppressed": False,
+        "investigate": _HUB["investigate"],
+        "todoist_task_id": alert.get("todoist_task_id") or "task-hub-1",
+    }
+
+
+@activity.defn(name="problem_status")
+async def stub_problem_status(problem_id: str) -> dict:
+    _HUB["status"].append(problem_id)
+    return {
+        "found": True,
+        "status": "resolved" if _HUB["resolved"] else "open",
+        "resolved": _HUB["resolved"],
+        "occurrences": 1,
+        "todoist_task_id": "task-hub-1",
+    }
+
+
+@activity.defn(name="record_investigation")
+async def stub_record_investigation(inp: dict) -> dict:
+    _HUB["record"].append(inp)
+    return {"recorded": True, "status_changed": True}
+
+
+@activity.defn(name="mute_problem")
+async def stub_mute_problem(problem_id: str, hours: float, by: str = "") -> dict:
+    _HUB["mute"].append((problem_id, hours))
+    return {"muted_until": "2026-09-08T12:00:00+00:00"}
+
+
+@activity.defn(name="verification_delay")
+async def stub_verification_delay(alert: dict) -> dict:
+    return {"delay_seconds": _HUB["delay"]}
+
+
+def _hub_reset() -> None:
+    for key in ("ingest", "status", "record", "mute"):
+        _HUB[key].clear()
+    _HUB["resolved"] = False
+    _HUB["investigate"] = True
+    _HUB["delay"] = 0
+
+
 ALL_ACTIVITIES = [
+    stub_ingest_alert,
+    stub_problem_status,
+    stub_record_investigation,
+    stub_mute_problem,
+    stub_verification_delay,
     stub_resolve_agents,
     stub_get_alert_routing_config,
-    stub_check_alert_mute_v2,
-    stub_write_alert_mute_v2,
-    stub_check_dedup,
-    stub_find_open_task_for_signature,
-    stub_record_signature_new_task,
-    stub_record_signature_recurrence,
-    stub_get_verification_delay,
-    stub_check_alert_resolved,
     stub_resolve_alert_resource,
     stub_score_resource_relevance,
     stub_gather_alert_knowledge,
     stub_run_investigation,
     stub_investigate,
     stub_assess_investigation,
-    stub_log_alert,
     stub_send_system_event,
     stub_send_message,
     stub_accumulate_digest_item,
-    stub_capture_to_inbox,
     stub_post_task_note,
     stub_upload_kimi_log,
     stub_insert_interaction_v2,
@@ -347,11 +342,10 @@ def _make_alert(**overrides) -> dict:
 
 
 async def test_flow_self_resolved_during_delay():
-    """Alert with verification delay -> check_alert_resolved returns True -> self_resolved."""
-    _reset(
-        delay_result={"delay_seconds": 60, "reason": "test delay"},
-        resolved_check_result={"resolved": True},
-    )
+    """Alert with verification delay -> the hub reports resolved -> self_resolved."""
+    _reset()
+    _HUB["delay"] = 60
+    _HUB["resolved"] = True
 
     async with (
         await WorkflowEnvironment.start_time_skipping() as env,
@@ -378,7 +372,6 @@ async def test_flow_self_resolved_during_delay():
 async def test_flow_resolved_by_investigation():
     """Alert -> no delay -> investigate -> assess returns resolved -> no task."""
     _reset(
-        delay_result={"delay_seconds": 0, "reason": "immediate"},
         assess_result={
             "status": "resolved",
             "root_cause": "Transient spike, self-recovered",
@@ -479,72 +472,10 @@ async def test_flow_actionable_verdict_goes_through_gate2():
 # ── Pandora ↔ Todoist task-binding (2026-05-20) ────────────────────────
 
 
-async def test_flow_existing_todoist_task_id_skips_capture():
-    """When alert.todoist_task_id is provided (clarify-APP path), the flow
-    does NOT call capture_to_inbox; comments target the existing task.
-
-    Under `start_time_skipping` Gate-2 archives in 48h immediately, so the
-    flow returns `gate2_archived` before the final-comment fires. The
-    start-comment ("investigation has begun") still lands, and the gate-2
-    archived skip-comment also targets the existing task — both prove the
-    binding works."""
-    _reset()
-    async with (
-        await WorkflowEnvironment.start_time_skipping() as env,
-        Worker(
-            env.client,
-            task_queue="test-q",
-            workflows=[AlertInvestigationFlow, InteractionFlow],
-            activities=ALL_ACTIVITIES,
-        ),
-    ):
-        result = await env.client.execute_workflow(
-            AlertInvestigationFlow.run,
-            _make_alert(todoist_task_id="EXISTING_TASK_42"),
-            id="test-existing-task-skip-capture",
-            task_queue="test-q",
-        )
-    assert result["status"] == "gate2_archived"
-    assert result["todoist_task_id"] == "EXISTING_TASK_42"
-    assert _state["capture_called"] is False
-    note_targets = {n["task_id"] for n in _state["posted_notes"]}
-    assert "EXISTING_TASK_42" in note_targets
-    contents = [n["content"] for n in _state["posted_notes"]]
-    # Start-comment still fires before Gate-2.
-    assert any("investigation has begun" in c.lower() for c in contents)
-
-
-async def test_flow_no_task_id_captures_with_pandora_label():
-    """When no todoist_task_id, the flow creates one via capture_to_inbox
-    with extra_labels including @pandora — and comments are addressed to
-    the returned id."""
-    _reset(capture_return_id="real-new-task-99")
-    async with (
-        await WorkflowEnvironment.start_time_skipping() as env,
-        Worker(
-            env.client,
-            task_queue="test-q",
-            workflows=[AlertInvestigationFlow, InteractionFlow],
-            activities=ALL_ACTIVITIES,
-        ),
-    ):
-        result = await env.client.execute_workflow(
-            AlertInvestigationFlow.run,
-            _make_alert(),
-            id="test-no-task-id-captures",
-            task_queue="test-q",
-        )
-    assert _state["capture_called"] is True
-    assert "@pandora" in _state["capture_extra_labels"]
-    assert result["todoist_task_id"] == "real-new-task-99"
-    note_targets = {n["task_id"] for n in _state["posted_notes"]}
-    assert "real-new-task-99" in note_targets
-
-
 async def test_flow_outbox_temp_id_skips_note_posting():
-    """If capture lands in outbox (returns temp_id like `item-...`), the
-    flow gracefully skips note posting (real id isn't available yet)."""
-    _reset(capture_return_id="item-temp-1")
+    """If the hub's task is still an outbox temp id (`item-...`), the flow
+    gracefully skips note posting (the real id isn't available yet)."""
+    _reset()
     async with (
         await WorkflowEnvironment.start_time_skipping() as env,
         Worker(
@@ -556,12 +487,11 @@ async def test_flow_outbox_temp_id_skips_note_posting():
     ):
         await env.client.execute_workflow(
             AlertInvestigationFlow.run,
-            _make_alert(),
+            _make_alert(todoist_task_id="item-temp-1"),
             id="test-outbox-temp-id",
             task_queue="test-q",
         )
-    # Capture happened but no notes were posted (temp_id guard)
-    assert _state["capture_called"] is True
+    # No notes were posted (temp_id guard)
     assert len(_state["posted_notes"]) == 0
 
 
@@ -751,36 +681,6 @@ async def test_flow_resource_tag_filter_passes_through():
 # ── Audit fixes: self-resolve dedup + Gate-2 source-guard ──
 
 
-async def test_flow_self_resolved_writes_log_alert_for_dedup():
-    """Self-resolved alerts must call log_alert so the 24h dedup window
-    short-circuits flapping re-deliveries. Pre-fix: self_resolved skipped
-    log_alert → dedup leak → every re-fire spun up a full investigation."""
-    _reset(
-        delay_result={"delay_seconds": 60, "reason": "test delay"},
-        resolved_check_result={"resolved": True},
-    )
-
-    async with (
-        await WorkflowEnvironment.start_time_skipping() as env,
-        Worker(
-            env.client,
-            task_queue="test-q",
-            workflows=[AlertInvestigationFlow, InteractionFlow],
-            activities=ALL_ACTIVITIES,
-        ),
-    ):
-        await env.client.execute_workflow(
-            AlertInvestigationFlow.run,
-            _make_alert(),
-            id="test-self-resolved-dedup",
-            task_queue="test-q",
-        )
-
-    assert _state.get("log_alert_called") is True, (
-        "self_resolved path must call log_alert to register the dedup record"
-    )
-
-
 async def test_flow_jira_source_skips_gate2_even_with_branches():
     """For source='todoist-jira', kimi MAY accidentally emit a BRANCH: line
     despite the scoping prompt forbidding fixes. The flow must NOT enter
@@ -789,7 +689,6 @@ async def test_flow_jira_source_skips_gate2_even_with_branches():
     Verified by asserting the workflow terminates in 'logged' status with
     no Gate-2 child workflow spawned."""
     _reset(
-        delay_result={"delay_seconds": 0, "reason": "immediate"},
         run_investigation_result={
             # Branches present + kimi succeeded — the unguarded code path
             # would have spawned Gate-2 here.

@@ -356,14 +356,14 @@ health alone is not expressible today.
 ### Infra heartbeat & escalation
 
 `InfraHeartbeatFlow` (schedule `infra-heartbeat-2m`, gated by `homelab_enabled`) polls
-`docker node ls` + `docker service ls` every 2 min and spawns investigations on state
-transitions only. Recovery transitions write an `alert_received` / `resolved=true` audit
-row; the `/api/webhooks/alert` handler writes the identical row for alertmanager
-`status=resolved` payloads, so `check_alert_resolved` (self-resolve) works for both
-heartbeat and alertmanager alerts. Those recovery rows also **re-arm dedup**: a class that
-flapped and recovered is no longer treated as a duplicate, so a genuine later outage of the
-same class still spawns a fresh investigation (`check_dedup` only suppresses when the
-latest investigation has no recovery after it).
+`docker node ls` + `docker service ls` every 2 min and records state transitions on the
+problem hub (`ingest_alert`): a node or service going down is an occurrence, one coming back
+is a `resolved` event on the same problem, and only a new or returning problem starts an
+investigation. The `/api/webhooks/alert` handler does the same for alertmanager `firing`
+and `resolved` payloads, so a heartbeat-detected and an alertmanager-pushed outage of the
+same service are one problem (`dockerservicedown:service:<name>`) with one task. A service
+still stuck after `restuck_hours` is re-investigated on that same problem, once per
+`restuck_hours` (`stale_stuck_problems`).
 
 **Cross-source dedup invariant:** a heartbeat-detected outage and an alertmanager-pushed
 one collapse onto ONE signature (`infra-class:<cluster>:<alertname>`) only when the

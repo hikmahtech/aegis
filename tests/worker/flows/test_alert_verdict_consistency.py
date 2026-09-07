@@ -140,7 +140,7 @@ async def test_branches_with_inconclusive_verdict_renders_actionable():
     """kimi produced a fix branch BUT assess returned `inconclusive`. The final
     track-task note must NOT contain the "too thin"/"inconclusive" wording — it
     must render an actionable / PR outcome consistent with the staged fix."""
-    _reset(muted=False)
+    _reset()
     _state_local.clear()
     _state_local["run_investigation_result"] = {
         "status": "succeeded",
@@ -208,7 +208,7 @@ async def test_branches_with_inconclusive_verdict_renders_actionable():
 async def test_branches_with_not_actionable_verdict_renders_actionable():
     """Same reconciliation for a `not_actionable` verdict when a fix branch
     exists — promoted to actionable."""
-    _reset(muted=False)
+    _reset()
     _state_local.clear()
     _state_local["run_investigation_result"] = {
         "status": "succeeded",
@@ -266,7 +266,7 @@ async def test_investigation_failure_posts_closure_note():
     raises → the flow must post a closure note to the track-task and return a
     terminal `investigation_failed` status, instead of dying silently after the
     Step-4.5 'investigation has begun' note."""
-    _reset(muted=False)
+    _reset()
     _state_local.clear()
     _state_local["run_investigation_result"] = {
         "status": "failed",

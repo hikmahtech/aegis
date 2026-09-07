@@ -428,16 +428,18 @@ flowchart TD
 
 The steps that make it trustworthy:
 
-- **Dedup, twice.** A signature index collapses variations of the same failure
-  class (Sentry stack-frame noise → `sentry-class:<service>:<type>`); if an
-  open alert task with the same signature exists, the new occurrence becomes a
-  comment on it, not a new investigation. A fingerprint check against
-  `audit_log` catches exact re-fires. Recovery events **re-arm** dedup, so a
-  class that flapped and recovered still gets a fresh investigation next time.
-- **Mutes** (`alert_mutes`) short-circuit early — "Mute 24h" on a card writes
-  one.
-- **Verification delay.** A per-severity sleep and a resolved re-check before
-  spending any investigation effort — self-healing blips cost nothing.
+- **The problem hub decides what is new.** Every alert — firing or resolved,
+  from Alertmanager, Sentry, the heartbeat, or a hand-captured task — is
+  recorded on a `problems` row (`services/hub.py`, spec
+  `docs/superpowers/specs/2026-09-07-problem-hub-design.md`), keyed by one
+  correlation function, never by a task. A repeat of an open problem is
+  counted and commented; only a new or returning problem starts an
+  investigation. A deploy or maintenance window (`service_state`) suppresses;
+  "Mute 24h" on a card mutes the *problem*. A `resolved` event resolves it and
+  the projector closes the task, so nothing outlives its incident (#279, #341).
+- **Verification delay.** A per-class sleep, then the hub is asked whether the
+  problem already resolved, before spending any investigation effort —
+  self-healing blips cost nothing.
 - **Repo resolution.** Deterministic service-name matching, then an LLM pick,
   against the `resources` table — which `workspace-repo-sync-daily` keeps
   mirroring your coding host's actual checkouts. No JIT cloning: a repo AEGIS
@@ -454,8 +456,10 @@ The steps that make it trustworthy:
   on the host — refused when the infra registry entry is `read_only`; a typed
   note overrides the command list), mute, acknowledge, or discard.
 
-Everything lands as a comment trail on a `@pandora`-labelled Todoist task plus
-an `audit_log` row, so the incident history lives where you already look.
+Everything lands on the problem's timeline (`problem_events`) and, projected
+from it, as a comment trail on a `@pandora`-labelled Todoist task — so the
+incident history lives where you already look, and the next session reads one
+record.
 Escalation @-mentions and a dead-man ping URL for the heartbeat are configured
 on the admin **Integrations** page. See
 [`production.md`](production.md#alert-routing-inbound-webhooks) for webhook

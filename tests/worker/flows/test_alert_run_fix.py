@@ -54,16 +54,13 @@ def _esc_alert() -> dict:
 
 
 def _reset(**overrides):
+    _hub_reset()
     _calls.clear()
     _state.clear()
     _state.update(
         {
-            "muted": False,
-            "check_dedup_result": {"is_duplicate": False},
-            "delay_result": {"delay_seconds": 0, "reason": "test"},
             # Post-fix verification succeeds — the run_fix branch's
             # check_alert_resolved(fingerprint, 5) call after the 180s wait.
-            "resolved_check_result": {"resolved": True},
             "resource_result": {
                 "resource_id": "res-homelab",
                 "resource_title": "Homelab GitOps",
@@ -126,59 +123,6 @@ async def stub_get_alert_routing_config() -> dict:
     return _state["routing"]
 
 
-@activity.defn(name="check_alert_mute")
-async def stub_check_alert_mute(inp) -> bool:
-    _calls.setdefault("mute_check", []).append(inp)
-    return _state.get("muted", False)
-
-
-@activity.defn(name="write_alert_mute")
-async def stub_write_alert_mute(inp) -> None:
-    _calls.setdefault("mute_write", []).append(inp)
-
-
-@activity.defn(name="check_dedup")
-async def stub_check_dedup(fingerprint: str, hours: int) -> dict:
-    return _state["check_dedup_result"]
-
-
-@activity.defn(name="find_open_task_for_signature")
-async def stub_find_open_task_for_signature(signature: str) -> str | None:
-    return _state.get("open_task_for_signature")
-
-
-@activity.defn(name="record_signature_new_task")
-async def stub_record_signature_new_task(signature: str, task_id: str) -> None:
-    return None
-
-
-@activity.defn(name="record_signature_recurrence")
-async def stub_record_signature_recurrence(signature: str) -> None:
-    return None
-
-
-@activity.defn(name="capture_to_inbox")
-async def stub_capture_to_inbox(
-    project: str, external_id: str, title: str, description: str, labels: list[str]
-) -> str:
-    _calls.setdefault("capture", []).append(external_id)
-    return "task-runfix-1"
-
-
-@activity.defn(name="get_verification_delay")
-async def stub_get_verification_delay(alert: dict) -> dict:
-    _calls.setdefault("delay_called", []).append(True)
-    return _state["delay_result"]
-
-
-@activity.defn(name="check_alert_resolved")
-async def stub_check_alert_resolved(
-    fingerprint: str, window_minutes: int, since_iso: str = ""
-) -> dict:
-    _calls.setdefault("resolved_checks", []).append((fingerprint, window_minutes, since_iso))
-    return _state["resolved_check_result"]
-
-
 @activity.defn(name="resolve_infra_resource")
 async def stub_resolve_infra_resource(alert: dict) -> dict:
     _calls.setdefault("infra_resource_called", []).append(True)
@@ -235,11 +179,6 @@ async def stub_record_verdict_to_kg(*args, **kwargs) -> None:
 async def stub_post_task_note(*args, **kwargs) -> dict:
     _calls.setdefault("notes", []).append(args)
     return {}
-
-
-@activity.defn(name="log_alert")
-async def stub_log_alert(alert: dict) -> None:
-    _calls.setdefault("log_alert", []).append(alert)
 
 
 @activity.defn(name="send_system_event")
@@ -313,18 +252,80 @@ async def stub_timeout(inp: ApplyTimeoutInput) -> None:
     return None
 
 
+# ── problem hub stubs (PR 3b) ───────────────────────────────────────────────
+# The flow no longer owns an alert's identity: it asks the hub. These stand in
+# for HubActivities; `_HUB["resolved"]` makes `problem_status` report the
+# problem as resolved, `_HUB["investigate"]` is what `ingest_alert` answers.
+_HUB: dict = {
+    "ingest": [],
+    "status": [],
+    "record": [],
+    "mute": [],
+    "resolved": False,
+    "investigate": True,
+    "delay": 0,
+}
+
+
+@activity.defn(name="ingest_alert")
+async def stub_ingest_alert(alert: dict, resolved: bool = False) -> dict:
+    _HUB["ingest"].append((alert.get("fingerprint"), resolved))
+    return {
+        "problem_id": "prob-1",
+        "action": "created",
+        "key": "k",
+        "occurrences": 1,
+        "suppressed": False,
+        "investigate": _HUB["investigate"],
+        "todoist_task_id": alert.get("todoist_task_id") or "task-hub-1",
+    }
+
+
+@activity.defn(name="problem_status")
+async def stub_problem_status(problem_id: str) -> dict:
+    _HUB["status"].append(problem_id)
+    return {
+        "found": True,
+        "status": "resolved" if _HUB["resolved"] else "open",
+        "resolved": _HUB["resolved"],
+        "occurrences": 1,
+        "todoist_task_id": "task-hub-1",
+    }
+
+
+@activity.defn(name="record_investigation")
+async def stub_record_investigation(inp: dict) -> dict:
+    _HUB["record"].append(inp)
+    return {"recorded": True, "status_changed": True}
+
+
+@activity.defn(name="mute_problem")
+async def stub_mute_problem(problem_id: str, hours: float, by: str = "") -> dict:
+    _HUB["mute"].append((problem_id, hours))
+    return {"muted_until": "2026-09-08T12:00:00+00:00"}
+
+
+@activity.defn(name="verification_delay")
+async def stub_verification_delay(alert: dict) -> dict:
+    return {"delay_seconds": _HUB["delay"]}
+
+
+def _hub_reset() -> None:
+    for key in ("ingest", "status", "record", "mute"):
+        _HUB[key].clear()
+    _HUB["resolved"] = False
+    _HUB["investigate"] = True
+    _HUB["delay"] = 0
+
+
 ALL_STUBS = [
+    stub_ingest_alert,
+    stub_problem_status,
+    stub_record_investigation,
+    stub_mute_problem,
+    stub_verification_delay,
     stub_resolve_agents,
     stub_get_alert_routing_config,
-    stub_check_alert_mute,
-    stub_write_alert_mute,
-    stub_check_dedup,
-    stub_find_open_task_for_signature,
-    stub_record_signature_new_task,
-    stub_record_signature_recurrence,
-    stub_capture_to_inbox,
-    stub_get_verification_delay,
-    stub_check_alert_resolved,
     stub_resolve_infra_resource,
     stub_resolve_alert_resource,
     stub_remediate_infra_service,
@@ -335,7 +336,6 @@ ALL_STUBS = [
     stub_assess_investigation,
     stub_record_verdict_to_kg,
     stub_post_task_note,
-    stub_log_alert,
     stub_send_system_event,
     stub_send_message,
     stub_send_voice,

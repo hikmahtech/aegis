@@ -40,6 +40,23 @@ class SentryPollInput:
     limit: int = 25
 
 
+def _with_problem(alert: dict, ingested: dict) -> dict:
+    return {
+        **alert,
+        "problem_id": ingested.get("problem_id"),
+        "todoist_task_id": ingested.get("todoist_task_id"),
+    }
+
+
+def _child_id(alert: dict, ingested: dict) -> str:
+    """One investigation per problem occurrence. Without a hub (no pool) the
+    fingerprint keeps the old per-issue id."""
+    pid = ingested.get("problem_id")
+    if pid:
+        return f"investigate-{pid}-{ingested.get('occurrences') or 1}"
+    return f"sentry-alert-{alert['fingerprint']}"
+
+
 @workflow.defn(name="SentryPollFlow")
 class SentryPollFlow:
     @workflow.run
@@ -59,14 +76,19 @@ class SentryPollFlow:
             retry_policy=ACT_RETRY,
         )
 
-        new = await workflow.execute_activity(
-            "ingest_idempotency_claim",
-            args=["sentry", alert["fingerprint"]],
+        ingested = await workflow.execute_activity(
+            "ingest_alert",
+            args=[alert, False],
             start_to_close_timeout=_ACT_TIMEOUT,
             retry_policy=ACT_RETRY,
         )
-        if not new:
-            return {"mode": "webhook", "investigated": 0, "reason": "duplicate"}
+        if not ingested.get("investigate"):
+            return {
+                "mode": "webhook",
+                "investigated": 0,
+                "reason": str(ingested.get("action") or "not_investigable"),
+            }
+        alert = _with_problem(alert, ingested)
 
         # Fire-and-forget: AlertInvestigationFlow contains a human-in-the-loop
         # Gate-2 that can stay pending for hours/days. We must NOT await it or
@@ -75,7 +97,7 @@ class SentryPollFlow:
         await workflow.start_child_workflow(
             AlertInvestigationFlow.run,
             alert,
-            id=f"sentry-alert-{alert['fingerprint']}",
+            id=_child_id(alert, ingested),
             parent_close_policy=workflow.ParentClosePolicy.ABANDON,
         )
         return {"mode": "webhook", "investigated": 1}
@@ -104,14 +126,15 @@ class SentryPollFlow:
                 start_to_close_timeout=_ACT_TIMEOUT,
                 retry_policy=ACT_RETRY,
             )
-            new = await workflow.execute_activity(
-                "ingest_idempotency_claim",
-                args=["sentry", alert["fingerprint"]],
+            ingested = await workflow.execute_activity(
+                "ingest_alert",
+                args=[alert, False],
                 start_to_close_timeout=_ACT_TIMEOUT,
                 retry_policy=ACT_RETRY,
             )
-            if not new:
+            if not ingested.get("investigate"):
                 continue
+            alert = _with_problem(alert, ingested)
             try:
                 # Fire-and-forget. The poll's job is to DETECT new issues and
                 # DISPATCH an investigation per issue, then advance the cursor —
@@ -127,7 +150,7 @@ class SentryPollFlow:
                 await workflow.start_child_workflow(
                     AlertInvestigationFlow.run,
                     alert,
-                    id=f"sentry-alert-{alert['fingerprint']}",
+                    id=_child_id(alert, ingested),
                     parent_close_policy=workflow.ParentClosePolicy.ABANDON,
                 )
                 investigated += 1

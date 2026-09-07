@@ -97,7 +97,36 @@ _SEGMENT_CAP = 80
 # subject (node name or service) lives only there, not in the labels.
 _HEARTBEAT_FP_RE = re.compile(r"^aegis-heartbeat:([^:]+):(.*)$")
 _NODE_CLASSES = frozenset({"nodedown"})
-_SOURCE_ALIASES = {"aegis-heartbeat": "heartbeat"}
+# The alert dicts today's producers build carry these `source` values; the
+# hub keys events on its own closed vocabulary. Anything else is `manual`.
+_SOURCE_ALIASES = {
+    "aegis-heartbeat": "heartbeat",
+    "todoist-jira": "chat",
+    "todoist-chat": "chat",
+    "todoist-infra": "chat",
+}
+
+# How long an investigation waits before spending effort, by class, so a
+# blip that self-resolves costs nothing. Was a regex over the alert title;
+# the class is the same information without the guessing. Resource
+# exhaustion (disk / memory / OOM) investigates at once.
+VERIFY_SECONDS_DEFAULT = 180
+_VERIFY_SECONDS = {
+    "nodedown": 300,
+    "dockerservicedown": 300,
+    "servicedownprolonged": 0,
+    "heartbeatcollectfailed": 0,
+}
+_VERIFY_AT_ONCE = ("disk", "storage", "memory", "oom")
+
+
+def verify_seconds(klass: str) -> int:
+    k = _slug(klass)
+    if k in _VERIFY_SECONDS:
+        return _VERIFY_SECONDS[k]
+    if any(word in k for word in _VERIFY_AT_ONCE):
+        return 0
+    return VERIFY_SECONDS_DEFAULT
 
 
 @dataclass(frozen=True)
@@ -131,8 +160,20 @@ class IngestResult:
     # and counted, but nothing downstream should notify on it.
     suppressed: bool = False
 
+    @property
+    def investigate(self) -> bool:
+        """Whether this event should start an investigation: the hub decides,
+        the producer dispatches. A problem is investigated when it appears
+        (or comes back), never on a repeat occurrence, never while suppressed
+        or muted."""
+        return (
+            self.action in {"created", "reopened", "rolled_over", "promoted"}
+            and not self.suppressed
+            and not self.muted
+        )
+
     def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        return {**asdict(self), "investigate": self.investigate}
 
 
 @dataclass(frozen=True)
@@ -146,6 +187,12 @@ class Decision:
 
 def _slug(text: str, cap: int = _SEGMENT_CAP) -> str:
     return _SLUG_RE.sub("-", (text or "").strip().lower()).strip("-")[:cap]
+
+
+def slug(text: str) -> str:
+    """The hub's normalisation of a subject or class, for callers that must
+    match what `correlation_key` stored."""
+    return _slug(text)
 
 
 def _utcnow() -> datetime:
@@ -559,6 +606,34 @@ async def clear_converged_deploys(
     return cleared
 
 
+async def stale_open_problems(
+    pool: asyncpg.Pool, subjects: list[str], *, hours: float, now: datetime | None = None
+) -> list[dict[str, Any]]:
+    """Live problems on ``subjects`` first seen more than ``hours`` ago with no
+    `investigation` event in that long: due for a re-investigation. The
+    heartbeat asks this for the services it still sees stuck, which replaces
+    the per-service clocks it used to keep in a settings row."""
+    if not subjects:
+        return []
+    now = now or _utcnow()
+    cutoff = now - timedelta(hours=max(float(hours), 0.0))
+    rows = await pool.fetch(
+        "SELECT p.id::text AS id, p.subject, p.class, p.first_seen_at, p.occurrences "
+        "FROM problems p WHERE p.closed_at IS NULL AND p.status = ANY($3::text[]) "
+        "  AND p.subject = ANY($1::text[]) AND p.first_seen_at < $2 "
+        "  AND NOT EXISTS (SELECT 1 FROM problem_events e WHERE e.problem_id = p.id "
+        "                  AND e.kind = 'investigation' AND e.occurred_at >= $2) "
+        "ORDER BY p.first_seen_at",
+        subjects,
+        cutoff,
+        sorted(LIVE_STATUSES - {"suppressed"}),
+    )
+    return [
+        {**dict(r), "hours": round((now - _aware(r["first_seen_at"], now)).total_seconds() / 3600, 1)}
+        for r in rows
+    ]
+
+
 async def promote_expired_suppressions(
     pool: asyncpg.Pool, *, now: datetime | None = None
 ) -> list[str]:
@@ -593,6 +668,90 @@ async def promote_expired_suppressions(
     return promoted
 
 
+async def set_status(
+    pool: asyncpg.Pool,
+    problem_id: str,
+    status: str,
+    *,
+    reason: str,
+    source: str = "investigation",
+    now: datetime | None = None,
+) -> bool:
+    """Move a live problem to ``status`` (an investigation's own transitions:
+    investigating / waiting_human / fixing / resolved), writing the
+    state_change event. False when the problem is missing, closed, or already
+    there. Never resurrects a closed problem."""
+    if status not in STATUSES or status == "closed":
+        raise ValueError(f"cannot set status {status!r}")
+    now = now or _utcnow()
+    async with pool.acquire() as conn, conn.transaction():
+        row = await conn.fetchrow(
+            "SELECT status, severity FROM problems WHERE id = $1::uuid AND closed_at IS NULL "
+            "FOR UPDATE",
+            problem_id,
+        )
+        if row is None or row["status"] == status:
+            return False
+        await conn.execute(
+            "UPDATE problems SET status = $2, "
+            "resolved_at = CASE WHEN $2 = 'resolved' THEN $3 ELSE resolved_at END "
+            "WHERE id = $1::uuid",
+            problem_id,
+            status,
+            now,
+        )
+        await conn.execute(
+            "INSERT INTO problem_events (problem_id, source, external_id, kind, severity, "
+            "payload, occurred_at) VALUES ($1::uuid, 'hub', $2, 'state_change', $3, $4, $5) "
+            "ON CONFLICT (source, external_id) DO NOTHING",
+            problem_id,
+            f"{source}:{problem_id}:{status}:{now.isoformat()}",
+            row["severity"],
+            {"action": "set_status", "status": status, "reason": reason[:300]},
+            now,
+        )
+    logger.info("hub_status_set", problem_id=problem_id, status=status, reason=reason[:80])
+    return True
+
+
+async def mute_problem(
+    pool: asyncpg.Pool,
+    problem_id: str,
+    *,
+    hours: float,
+    by: str,
+    reason: str = "",
+    now: datetime | None = None,
+) -> datetime | None:
+    """Silence a problem until ``now + hours``: occurrences are still recorded
+    and counted, nothing is projected or investigated. Replaces `alert_mutes`
+    for the alert pipeline — the mute key *is* the problem. Returns the new
+    `muted_until`, or None when the problem is missing or closed."""
+    now = now or _utcnow()
+    until = now + timedelta(hours=max(float(hours), 0.0))
+    async with pool.acquire() as conn, conn.transaction():
+        row = await conn.fetchrow(
+            "UPDATE problems SET muted_until = $2 WHERE id = $1::uuid AND closed_at IS NULL "
+            "RETURNING severity",
+            problem_id,
+            until,
+        )
+        if row is None:
+            return None
+        await conn.execute(
+            "INSERT INTO problem_events (problem_id, source, external_id, kind, severity, "
+            "payload, occurred_at) VALUES ($1::uuid, 'hub', $2, 'state_change', $3, $4, $5) "
+            "ON CONFLICT (source, external_id) DO NOTHING",
+            problem_id,
+            f"mute:{problem_id}:{now.isoformat()}",
+            row["severity"],
+            {"action": "mute", "until": until.isoformat(), "by": by, "reason": reason[:300]},
+            now,
+        )
+    logger.info("hub_problem_muted", problem_id=problem_id, until=until.isoformat(), by=by)
+    return until
+
+
 def event_from_alert(
     alert: dict[str, Any],
     *,
@@ -607,7 +766,10 @@ def event_from_alert(
     an alertmanager fingerprint is stable per label set and a rule that fires
     again next week is a new occurrence, not a duplicate.
     """
-    source = _SOURCE_ALIASES.get(str(alert.get("source") or ""), str(alert.get("source") or ""))
+    raw_source = str(alert.get("source") or "").strip()
+    source = _SOURCE_ALIASES.get(raw_source, raw_source)
+    if source not in SOURCES:
+        source = "manual"
     labels = alert.get("labels") if isinstance(alert.get("labels"), dict) else {}
     raw = alert.get("raw_payload") if isinstance(alert.get("raw_payload"), dict) else {}
     fingerprint = str(alert.get("fingerprint") or "").strip()
@@ -638,7 +800,12 @@ def event_from_alert(
             subject = str(alert.get("service") or "").strip()
             subject_kind = "service" if subject else ""
 
-    stamp = str(raw.get("endsAt" if resolved else "startsAt") or occurred_at.isoformat())
+    if source == "sentry":
+        # An issue reaches the hub twice — webhook and the 30-min poll — with
+        # the same `lastSeen`; that is one occurrence, not two.
+        stamp = str(raw.get("lastSeen") or raw.get("firstSeen") or occurred_at.isoformat())
+    else:
+        stamp = str(raw.get("endsAt" if resolved else "startsAt") or occurred_at.isoformat())
     external_id = f"{fingerprint or _slug(str(alert.get('title') or 'alert'))}@{stamp}"
     if resolved:
         external_id += "@resolved"
