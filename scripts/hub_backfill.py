@@ -9,8 +9,9 @@ Dry-run by default: prints what it would do. `--apply` writes.
 
     python scripts/hub_backfill.py --database-url postgresql://... [--apply]
 
-Reads, when present, the retired `alert_dedup_index` for recurrence counts —
-the table is dropped by a later migration, after this has run. Duplicate tasks
+Read the retired `alert_dedup_index` for recurrence counts when it was still
+there; migration 037 dropped it once this had run, and the lookup below is
+guarded, so a later run simply seeds every problem at one occurrence. Duplicate tasks
 for one problem (same correlation key) are completed through the outbox; the
 oldest stays as the problem's task.
 

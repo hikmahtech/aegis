@@ -259,7 +259,6 @@ _EXPANDED_TABLES = [
     "workflow_runs",
     "ingest_idempotency",
     "gtd_clarify_log",
-    "alert_dedup_index",
     "pending_prs",
     "pandoras_actor.homelab_drift",
     "pandoras_actor.cert_expiry",
@@ -289,14 +288,16 @@ def test_agent_profile_revisions_is_actually_prunable():
 
 def test_expanded_tables_use_correct_timestamp_columns():
     """The timestamp column chosen per table must match the migration:
-    workflow_runs → started_at, alert_dedup_index → last_seen_at,
-    pandoras_actor.* → detected_at
-    (homelab_drift) or checked_at (cert_expiry)."""
+    workflow_runs → started_at, pandoras_actor.* → detected_at
+    (homelab_drift) or checked_at (cert_expiry).
+
+    `alert_dedup_index` was in this list until migration 037 dropped the table
+    — the problem hub replaced it, and pruning a table that is not there
+    errors."""
     expected = {
         "workflow_runs": "started_at",
         "ingest_idempotency": "created_at",
         "gtd_clarify_log": "created_at",
-        "alert_dedup_index": "last_seen_at",
         "pending_prs": "created_at",
         "pandoras_actor.homelab_drift": "detected_at",
         "pandoras_actor.cert_expiry": "checked_at",
