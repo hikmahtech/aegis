@@ -688,6 +688,46 @@
   {
     "type": "function",
     "function": {
+      "name": "set_service_state",
+      "description": "Declare a swarm service or node deploying, in maintenance, degraded, or ok again. While a subject is deploying or in maintenance the problem hub records what it sees there but raises nothing; `ok` ends the window early.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "subject": {
+            "type": "string",
+            "description": "the swarm service (`stack_service`) or node name, or `*` for everything."
+          },
+          "state": {
+            "type": "string",
+            "enum": [
+              "deploying",
+              "maintenance",
+              "degraded",
+              "ok"
+            ],
+            "description": "deploying | maintenance | degraded | ok."
+          },
+          "minutes": {
+            "type": "integer",
+            "description": "how long the window lasts; ignored for ok.",
+            "default": 30
+          },
+          "note": {
+            "type": "string",
+            "description": "why \u2014 shown on every problem the window suppresses.",
+            "default": ""
+          }
+        },
+        "required": [
+          "subject",
+          "state"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
       "name": "aegis_self_diagnose",
       "description": "Investigate / fix AEGIS itself by driving the kimi CLI over SSH on node-a against the AEGIS source checkout. The kimi run has full Shell / Read / Glob / WriteFile permissions. Use this when the user asks about AEGIS's own behavior, bugs, or improvements. For code FIXES, kimi MUST create a branch (`aegis-fix/<slug>`), commit, push, and open a PR via `gh pr create` \u2014 never direct-commit to main. The tool waits up to 8 minutes for kimi's STATUS footer; if the run exceeds that, the partial output is returned with a `still_running` flag so the user can ask for a follow-up.",
       "parameters": {
@@ -762,8 +802,8 @@
               "chat",
               "manual"
             ],
-            "default": "chat",
-            "description": "Where the capture originated (tags as #<source>)"
+            "description": "Where the capture originated (tags as #<source>)",
+            "default": "chat"
           },
           "description": {
             "type": "string",
@@ -803,8 +843,8 @@
           },
           "limit": {
             "type": "integer",
-            "default": 25,
-            "description": "Max rows to return"
+            "description": "Max rows to return",
+            "default": 25
           }
         }
       }

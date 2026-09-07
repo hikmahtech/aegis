@@ -92,6 +92,38 @@ async def test_second_post_attaches_and_returns_the_same_problem(hub_client):
     assert second["key"] == f"deploy_failed:service:{body['subject']}"
 
 
+async def test_service_state_round_trip_and_suppression(hub_client):
+    h = {"X-Alert-Token": "s3cret"}
+    svc = f"svc_{uuid.uuid4().hex[:8]}"
+    r = await hub_client.post(
+        "/api/hub/service-state",
+        json={"subject": svc, "state": "deploying", "minutes": 15, "set_by": "ansible", "note": "release"},
+        headers=h,
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["state"] == "deploying" and r.json()["set_by"] == "ansible"
+    # an occurrence during the window is suppressed
+    ev = _body(subject=svc, **{"class": "dockerservicedown"})
+    r = await hub_client.post("/api/hub/events", json=ev, headers=h)
+    assert r.json()["suppressed"] is True
+    # ok clears
+    r = await hub_client.post(
+        "/api/hub/service-state", json={"subject": svc, "state": "ok", "set_by": "ansible"}, headers=h
+    )
+    assert r.json() == {"subject": svc, "subject_kind": "service", "state": "ok", "cleared": True}
+
+
+async def test_service_state_rejects_without_token_and_bad_state(hub_client):
+    r = await hub_client.post("/api/hub/service-state", json={"subject": "x", "state": "deploying"})
+    assert r.status_code == 401
+    r = await hub_client.post(
+        "/api/hub/service-state",
+        json={"subject": "x", "state": "sideways"},
+        headers={"X-Alert-Token": "s3cret"},
+    )
+    assert r.status_code == 400 and "unknown state" in r.json()["detail"]
+
+
 async def test_missing_pool_is_a_503(db_pool):
     async with _client(None) as c:
         r = await c.post("/api/hub/events", json=_body())

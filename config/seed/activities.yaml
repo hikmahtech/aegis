@@ -421,6 +421,14 @@ activities:
   # unseen). Minutes 7/37 are odd, not multiples of 5, so they miss every
   # */2, */5, */15 and */30 stepper as well as the busy :00 minute; hour is
   # unrestricted, so no daily slot is contended either.
+  # Problem hub housekeeping (spec 2026-09-07 §5): opens every `suppressed`
+  # problem whose deploy/maintenance window passed without a resolution.
+  # 3-58/5 dodges the */5 stepper other schedules sit on.
+  - slug: hub-sweep-5m
+    workflow_type: HubSweepFlow
+    agent_id: pandoras-actor
+    schedule_cron: "3-58/5 * * * *"
+    config: {}
   - slug: flow-health-watchdog-30m
     workflow_type: FlowHealthWatchdogFlow
     agent_id: pandoras-actor

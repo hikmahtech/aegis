@@ -70,6 +70,12 @@ async def _routing() -> dict:
     return {"infra_cluster": "homelab-swarm"}
 
 
+@activity.defn(name="clear_converged_deploys")
+async def _clear_deploys(stuck: list[str]) -> dict:
+    _calls.setdefault("clear_deploys", []).append(stuck)
+    return {"cleared": ["aegis_core"] if not stuck else []}
+
+
 @workflow.defn(name="AlertInvestigationFlow", sandboxed=False)
 class _StubAlertFlow:
     @workflow.run
@@ -78,7 +84,7 @@ class _StubAlertFlow:
         return {"status": "stub"}
 
 
-_ACTS = [_collect, _read, _write, _resolved, _ping, _routing, _quiet_notify]
+_ACTS = [_collect, _read, _write, _resolved, _ping, _routing, _quiet_notify, _clear_deploys]
 
 
 async def _run(config: InfraHeartbeatConfig | None = None) -> dict:
@@ -111,6 +117,24 @@ async def test_node_down_fires_once_with_escalate():
     assert alert["labels"]["cluster"] == "homelab-swarm"
     assert _calls["pinged"] == 1
     assert _calls["written"][0]["nodes"] == {"baa": "Ready", "noon": "Down"}
+
+
+async def test_tick_asks_the_hub_to_clear_converged_deploys():
+    prior = {"nodes": {"baa": "Ready"}, "stuck": ["x_svc"], "confirmed": [], "fail_count": 0}
+    _reset({"ok": True, "nodes": {"baa": "Ready"}, "stuck": ["x_svc"], "error": ""}, prior)
+    result = await _run()
+    assert _calls["clear_deploys"] == [["x_svc"]]
+    assert result["deploys_cleared"] == 0
+    _reset({"ok": True, "nodes": {"baa": "Ready"}, "stuck": [], "error": ""})
+    result = await _run()
+    assert _calls["clear_deploys"] == [[]]
+    assert result["deploys_cleared"] == 1
+
+
+async def test_collect_failure_never_asks_the_hub():
+    _reset({"ok": False, "nodes": {}, "stuck": [], "error": "ssh"})
+    await _run()
+    assert "clear_deploys" not in _calls
 
 
 async def test_steady_down_fires_nothing():

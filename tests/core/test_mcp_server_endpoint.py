@@ -43,6 +43,7 @@ TOOL_SET = [
     "investigate_resource",
     "stop_agent_run",
     "comment_on_task",
+    "set_service_state",
     "ledger_post",
     "ledger_reclassify",
     "ledger_add_rule",
@@ -373,7 +374,7 @@ async def test_unserved_tools_cannot_be_invoked_even_though_they_are_granted(cli
     assert "result" not in body  # nothing ran
 
 
-async def test_the_unserved_set_is_exactly_these_nine(client):
+async def test_the_unserved_set_is_exactly_these_ten(client):
     """A closed list, asserted by name: adding a run-spawning tool to an agent's
     `tool_set` without adding it here silently re-opens the recursion door, and
     the only way to notice is a test that pins the membership.
@@ -391,7 +392,11 @@ async def test_the_unserved_set_is_exactly_these_nine(client):
     in and add rules to a git-backed financial ledger. A coding run has no
     business writing the books, and unlike the rest of this set the damage is
     to the user's records rather than to AEGIS. `ledger_query` is read-only and
-    stays served."""
+    stays served.
+
+    `set_service_state` is a fifth: it opens a deploy/maintenance window that
+    stops the problem hub raising anything about a subject. A run that could
+    open one could silence the alert about itself, so it is operator-only."""
     assert set(mcp_server_mod._UNSERVED_TOOLS) == {
         "call_mcp_tool",
         "dispatch_agent_run",
@@ -399,6 +404,7 @@ async def test_the_unserved_set_is_exactly_these_nine(client):
         "investigate_resource",
         "stop_agent_run",
         "comment_on_task",
+        "set_service_state",
         "ledger_post",
         "ledger_reclassify",
         "ledger_add_rule",

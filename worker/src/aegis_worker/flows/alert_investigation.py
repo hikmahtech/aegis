@@ -41,7 +41,6 @@ with workflow.unsafe.imports_passed_through():
 
     from aegis.personalities import voice_line
 
-    from aegis_worker.activities.active_work import ActiveWorkActivities
     from aegis_worker.activities.agent_registry import AgentRegistryActivities
     from aegis_worker.activities.alert_governance import (
         AlertGovernanceActivities,
@@ -236,18 +235,6 @@ class AlertInvestigationFlow:
             )
         except Exception:
             workflow.logger.warning("alert_post_task_note_failed task_id=%s", task_id)
-
-    async def _safe_check_active_work(self, alert: dict, repo: str) -> dict:
-        try:
-            return await workflow.execute_activity_method(
-                ActiveWorkActivities.check_active_work,
-                args=[alert, repo],
-                start_to_close_timeout=TIMEOUT_STANDARD,
-                retry_policy=RETRY_ONCE,
-            )
-        except Exception as exc:
-            workflow.logger.warning("alert_active_work_check_failed err=%s", str(exc)[:200])
-            return {"active": False, "reasons": []}
 
     async def _safe_remediate_infra(
         self, alert: dict, track_task_id: str, title: str, source: str
@@ -698,7 +685,6 @@ class AlertInvestigationFlow:
         # resolved deterministically (no LLM ambiguity) so there is nothing to
         # confirm, and blocking with a "Which repo?" card for every NodeDown
         # storm is pure noise.
-        _repo_from_human = False
         if resources_list and not _is_infra:
             resolved_rid = resources_list[0].get("resource_id") or ""
             rel = await workflow.execute_activity_method(
@@ -810,68 +796,6 @@ class AlertInvestigationFlow:
                     }
                 ]
                 resource_title = chosen_c.get("resource_title")
-                _repo_from_human = True
-
-        # ── Active-work guard: skip a repo that's under active work ──
-        # Unless the operator just hand-picked the repo at Gate-0, check the
-        # active-work signals (open PR / recent push / a matching due Todoist
-        # task). If the repo is under active work, skip the investigation
-        # entirely — the human is already on it. A human pick is an explicit
-        # "investigate anyway", so it bypasses the guard.
-        #
-        # INFRA alerts are exempt (2026-09-04). The guard's premise is that an
-        # open PR / push / due task on a repo means a human is already looking
-        # at the thing that alerted. That holds for an application repo, where
-        # the alert and the work share a subject. It does NOT hold for infra:
-        # every infra alert resolves to the one gitops repo, so a single open
-        # task there — on any unrelated thing — silently muted every swarm
-        # alert in the fleet.
-        #
-        # Two confirmed misses:
-        #   2026-08-28  a MAILGUN_API_KEY rotation task muted a
-        #               monitoring_cadvisor DockerServiceDown.
-        #   2026-08-27  the same rotation task was due while `wow` was down;
-        #               NodeDown fired for 5 d 16 h and nothing investigated it.
-        #
-        # An unattended node is exactly when the investigation matters most, so
-        # infra alerts now always investigate. Suppressing a duplicate infra
-        # alert is the dedup layer's job (check_dedup / build_alert_signature),
-        # not this guard's.
-        #
-        # guard_repo is the github_repo slug when present, else the workspace
-        # path (for a path-only repo the gh PR/push signals can't run and
-        # degrade to no-signal, so the guard is best-effort/precision-only,
-        # never a false skip).
-        guard_repo = ""
-        if resources_list:
-            guard_repo = (
-                resources_list[0].get("github_repo") or resources_list[0].get("resource_path") or ""
-            )
-        if guard_repo and not _repo_from_human and not _is_infra:
-            aw = await self._safe_check_active_work(alert, guard_repo)
-            if aw.get("active"):
-                reasons = "; ".join(aw.get("reasons") or [])
-                await self._safe_event(f"⏸ Skipped {guard_repo} — under active work: {reasons}")
-                if track_task_id:
-                    await self._safe_post_note(
-                        track_task_id,
-                        f"⏸ Investigation skipped — {guard_repo} is under active work: {reasons}",
-                    )
-                try:
-                    await workflow.execute_activity_method(
-                        AlertActivities.accumulate_digest_item,
-                        args=[{"type": "skipped_active_work", "title": title, "source": source}],
-                        start_to_close_timeout=TIMEOUT_FAST,
-                        retry_policy=NO_RETRY,
-                    )
-                except Exception:
-                    pass
-                return {
-                    "status": "skipped_active_work",
-                    "task_id": track_task_id,
-                    "resolved_repo": guard_repo,
-                    "active_work_reasons": aw.get("reasons") or [],
-                }
 
         # ── Step 4.5: Post start-comment on the track-task ──
         # We have the resource picked now, which is the useful piece of

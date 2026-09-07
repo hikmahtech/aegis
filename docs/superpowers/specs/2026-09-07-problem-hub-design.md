@@ -303,18 +303,27 @@ and the daily digest (§9) is a query.
 
 `service_state` is the "deploying now" tracker. Writers:
 
-- **GitHub webhook.** `deployment` and `deployment_status` set
+- **GitHub webhook** (deferred; not in PR 2). Neither of this deployment's
+  deploy paths — Ansible, or a hand-run `docker service update` — emits
+  GitHub deployment events, and the image-build `workflow_run` completes
+  hours before a manual rollout, so a writer here would be dead code or
+  wrong. Add it when a repo actually uses the Deployments API. The design as
+  it would work: `deployment` and `deployment_status` set
   `deploying` on the repo's mapped subject (via `project_repo_map` and the
   `resources` row's `service` metadata) with `until_at = now() + 15 min`;
   `deployment_status=success|failure` clears or marks `degraded`. `workflow_run`
   `completed` on the image-build workflow of a tracked repo sets `deploying`
   for the same window, because the swarm rollout follows it.
-- **Ansible.** The homelab-gitops deploy role gains one `uri` task at the top
+- **Ansible.** The homelab-gitops AEGIS role gains one `uri` task at the top
   and one at the bottom, posting `{"subject": "<stack>_<service>", "state":
   "deploying"|"ok", "set_by": "ansible"}` to `/api/hub/service-state`. That
   role owns every service env already; this is the natural place.
 - **Chat tool** `set_service_state(subject, state, minutes, note)` for
   maintenance windows. Granted to the `infra` capability holder.
+- **Sweep.** `HubSweepFlow` (every 5 min) opens every `suppressed` problem
+  whose window has passed with no `resolved` event. The heartbeat only
+  emits on transitions, so without the sweep a service that broke during a
+  deploy and stayed broken would surface only at the 24h re-investigation.
 - **Heartbeat.** When it sees a subject in `deploying` converge (desired
   replicas met for 2 ticks) it clears the state. When `until_at` passes without
   convergence, it does nothing: the next occurrence promotes.
@@ -326,7 +335,10 @@ projected. An occurrence that arrives after `until_at`, or a `resolved` that
 never comes, promotes the problem to `open` and projects with "seen during
 deploy, still failing".
 
-This retires: the active-work guard and `activework/` (#355), the title-regex
+This retires: the active-work guard and `activework/` (#355) in PR 2, and —
+each in the PR that moves its producer onto the hub, because until then the
+producer still notifies directly and the incidental delay is its only
+deploy tolerance — the title-regex
 verification delay, `ServiceDriftFlow.recheck_delay_seconds`, and
 `FlowHealthConfig.min_stale_minutes`. `alert_investigation.py` shrinks by the
 guard block and step 3.
@@ -533,9 +545,9 @@ it replaces, so the tree never carries two ways to do one thing.
 | PR | Ships | Deletes |
 |---|---|---|
 | 1 | Migration 030 (`problems`, `problem_events`, `problem_links`), `hub.py` (ingest, correlate, transitions, `event_from_alert`), `POST /api/hub/events`, `auth.alert_token_ok` shared with the alert webhook, tests, coverage gate. Dark: no producer calls it. | nothing |
-| 2 | `service_state`: GitHub deploy events, Ansible hook (homelab-gitops PR), `set_service_state` tool, suppression in ingest, heartbeat clear. | title-regex verification delay, `recheck_delay_seconds`, `min_stale_minutes`, active-work guard and `activework/` |
-| 3 | Alertmanager, Sentry, heartbeat and clarify producers call `ingest_event`; projector to Todoist; `AlertInvestigationFlow` takes `problem_id`. | `alert_dedup_index`, `alert_mutes`, `alert_digest_buffer`, `infra_heartbeat_state` maps, steps 1–2.8, `check_dedup`, `build_alert_signature`, `close_task_for_resolved_alert` (moved) |
-| 4 | Flow health, delivery, drift, cert, expiry, social, LLM governor producers. | three copies of the `audit_log` dedupe SQL, the hand-rolled comms task, `homelab_drift.alert_key` day bucket, `cert_expiry.last_alert_threshold` |
+| 2 | Migration 031 `service_state`; suppression and promotion in `hub.py`; `POST /api/hub/service-state`; the Ansible hook (homelab-gitops PR); `set_service_state` tool; `HubSweepFlow` (promotes expired suppressions); heartbeat converge-clear. | active-work guard, `activework/`, `ActiveWorkActivities`, `active_work_lookback_hours` |
+| 3 | Alertmanager, Sentry, heartbeat and clarify producers call `ingest_event`; projector to Todoist; `AlertInvestigationFlow` takes `problem_id`. | `alert_dedup_index`, `alert_mutes`, `alert_digest_buffer`, `infra_heartbeat_state` maps, steps 1–2.8, `check_dedup`, `build_alert_signature`, `close_task_for_resolved_alert` (moved), the title-regex `get_verification_delay` |
+| 4 | Flow health, delivery, drift, cert, expiry, social, LLM governor producers. | three copies of the `audit_log` dedupe SQL, the hand-rolled comms task, `homelab_drift.alert_key` day bucket, `cert_expiry.last_alert_threshold`, `ServiceDriftFlow.recheck_delay_seconds`, `FlowHealthConfig.min_stale_minutes` |
 | 5 | `work_sessions` columns, `account` at resume, `task_context`, `report_progress`, `merge_problems`, status block, subtasks from plans, collision as lookup, GitHub-issue projection for `repo` subjects. | SSH git-context fan-out, LLM same-task judge, `_own_session_owner`, `hand_to_you`, `STATUS:` scraping into `result_summary`, title parsing in `_run_infra` |
 | 6 | Admin Problems page, digest from events, `CleanupFlow` close and re-project sweeps. | `build_alert_digest`'s buffer reader |
 | 7 | Operator hooks (dotfiles, documented in `docs/infrastructure.md`), runbook updates, `docs/how-it-works.md` section. | — |

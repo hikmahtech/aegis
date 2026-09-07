@@ -142,6 +142,9 @@ _UNSERVED_TOOLS = frozenset(
         "stop_agent_run",
         # A run commenting on its own task would trigger its own next turn.
         "comment_on_task",
+        # A run that can open a maintenance window can silence the alert
+        # about itself. Declaring one is an operator action.
+        "set_service_state",
         # A coding run has no business writing the books; `ledger_query` stays.
         "ledger_post",
         "ledger_reclassify",

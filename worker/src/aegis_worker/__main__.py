@@ -15,7 +15,6 @@ from temporalio.client import Client
 from temporalio.contrib.opentelemetry import TracingInterceptor
 from temporalio.worker import Worker
 
-from aegis_worker.activities.active_work import ActiveWorkActivities
 from aegis_worker.activities.agent_registry import AgentRegistryActivities
 from aegis_worker.activities.agent_run import AgentRunActivities
 from aegis_worker.activities.agent_task import AgentTaskActivities
@@ -38,6 +37,7 @@ from aegis_worker.activities.expiring_items import ExpiringItemsActivities
 from aegis_worker.activities.flow_health import FlowHealthActivities
 from aegis_worker.activities.gmail import GmailActivities
 from aegis_worker.activities.homelab import HomelabActivities
+from aegis_worker.activities.hub import HubActivities
 from aegis_worker.activities.infra_ops import InfraOpsActivities
 from aegis_worker.activities.intel_scan import IntelScanActivities
 from aegis_worker.activities.intelligence import IntelligenceActivities
@@ -146,11 +146,7 @@ async def main():
     # Create activity instances with real dependencies + connectors
     connectors = deps.connectors
 
-    active_work_act = ActiveWorkActivities(
-        db_pool=deps.pool,
-        remote_script=connectors.get("remote_script"),
-        lookback_hours=settings.active_work_lookback_hours,
-    )
+    hub_act = HubActivities(db_pool=deps.pool)
     alert_governance_act = AlertGovernanceActivities(
         db_pool=deps.pool,
         remote_script=connectors.get("remote_script"),
@@ -555,7 +551,7 @@ async def main():
     # means constructing it above and naming it here, and check_registration()
     # below refuses to boot if you forget.
     activities = collect_activities(
-        active_work_act,
+        hub_act,
         agent_registry_act,
         alert_governance_act,
         alert_act,

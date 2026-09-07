@@ -314,9 +314,15 @@ def test_module_workflows_is_the_unflagged_registry():
         # cannot fail — its tasks would simply never be picked up — while the
         # `books_write` activity it calls is on the money-flagged
         # MoneyActivities. So +1/+1/+1 flows and +1/+0/+0 activities.
-        (True, True, 43, 217),
-        (False, False, 35, 183),
-        (True, False, 39, 202),
+        # Then +1 flow and +1 activity in every row from the problem hub's
+        # PR 2: HubSweepFlow and the two HubActivities it and the heartbeat
+        # call (`promote_expired_suppressions`, `clear_converged_deploys`)
+        # are unflagged, and the same PR deletes ActiveWorkActivities'
+        # single `check_active_work` — so +1/+1/+1 flows, and +2−1 = +1
+        # activities in each row.
+        (True, True, 44, 218),
+        (False, False, 36, 184),
+        (True, False, 40, 203),
     ],
 )
 def test_real_registration_passes_the_boot_check(homelab, money, flows, activities):

@@ -49,8 +49,6 @@ class Settings(BaseSettings):
     model_fast: str = "bedrock-glm-4.7-flash"  # quick replies, low latency (Bedrock via LiteLLM)
     model_balanced: str = "bedrock-kimi-k2.5"  # default chat + most flows (Bedrock via LiteLLM)
     model_smart: str = "bedrock-kimi-k2.5"  # long-context synthesis, Raphael (Bedrock via LiteLLM)
-    # Active-work guard: lookback window for open-PR / recent-push / in-flight signals.
-    active_work_lookback_hours: int = 48
     # Path to config/models.yaml — loaded at startup by app.lifespan.
     # Override via AEGIS_MODELS_YAML_PATH if running from a non-standard layout.
     models_yaml_path: str = "config/models.yaml"

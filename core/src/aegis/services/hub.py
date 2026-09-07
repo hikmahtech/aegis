@@ -75,9 +75,21 @@ KINDS = frozenset(
     {"occurrence", "resolved", "investigation", "plan", "session_note", "human_note"}
 )
 SEVERITIES = frozenset({"critical", "error", "warning", "info"})
-# Problem statuses. `suppressed` (deploy window) arrives with PR 2.
-LIVE_STATUSES = frozenset({"open", "investigating", "waiting_human", "fixing", "verifying"})
+# Problem statuses. `suppressed` = seen while its subject was deploying or in
+# maintenance (see `service_state`); it is live, counted, and not projected.
+LIVE_STATUSES = frozenset(
+    {"open", "investigating", "waiting_human", "fixing", "verifying", "suppressed"}
+)
 STATUSES = LIVE_STATUSES | {"resolved", "closed"}
+# `service_state.state`. The first two suppress; `degraded` and `ok` are
+# information (`ok` clears the row).
+SERVICE_STATES = frozenset({"deploying", "maintenance", "degraded", "ok"})
+SUPPRESSING_STATES = frozenset({"deploying", "maintenance"})
+# A `deploying` row the deploy job never cleared is cleared by the heartbeat
+# once the service has converged and the row is at least this old — two
+# heartbeat ticks, so a row set just before a rollout starts is not cleared
+# by the pre-rollout snapshot.
+CONVERGE_GRACE = timedelta(minutes=4)
 
 _SLUG_RE = re.compile(r"[^a-z0-9_.]+")
 _SEGMENT_CAP = 80
@@ -115,6 +127,9 @@ class IngestResult:
     key: str
     occurrences: int = 0
     muted: bool = False
+    # True when the event landed inside a deploy/maintenance window: stored
+    # and counted, but nothing downstream should notify on it.
+    suppressed: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -193,22 +208,30 @@ def decide(
     *,
     now: datetime,
     reopen_window: timedelta = REOPEN_WINDOW,
+    suppressed: bool = False,
 ) -> Decision:
     """The transition table. ``current`` is the open-or-resolved problem
     holding the event's key (or the one it named), ``None`` when there is none.
+    ``suppressed`` says the event's subject is inside a deploy/maintenance
+    window right now.
 
     Pure, so the whole matrix is unit-tested without a database.
     """
     if kind == "occurrence":
+        target = "suppressed" if suppressed else "open"
         if current is None or current["status"] == "closed":
-            return Decision("create", "open")
+            return Decision("create", target)
+        if current["status"] == "suppressed":
+            # Still inside the window: another quiet occurrence. Outside it:
+            # the deploy did not fix this, so it becomes a real open problem.
+            return Decision("attach") if suppressed else Decision("promote", "open")
         if current["status"] in LIVE_STATUSES:
             return Decision("attach")
         # resolved
         resolved_at = _aware(current.get("resolved_at"), now)
         if now - resolved_at <= reopen_window:
-            return Decision("reopen", "open")
-        return Decision("rollover", "open")
+            return Decision("reopen", target)
+        return Decision("rollover", target)
     if kind == "resolved":
         if current is None or current["status"] in {"resolved", "closed"}:
             # Nothing to resolve. A resolved event on an already-resolved
@@ -304,10 +327,23 @@ async def ingest_event(
         else:
             current = None
 
-        d = decide(current, event.kind, now=now)
+        suppression = None
+        if event.kind == "occurrence":
+            suppression = await _active_suppression(
+                conn, _slug(event.subject), _slug(event.subject_kind) or "service", now
+            )
+        d = decide(current, event.kind, now=now, suppressed=suppression is not None)
         if d.action == "ignore":
             return IngestResult(None, "ignored", key)
 
+        payload = dict(event.payload or {})
+        if suppression is not None:
+            payload["suppressed_by"] = {
+                "state": suppression["state"],
+                "set_by": suppression["set_by"],
+                "note": suppression["note"],
+                "until_at": suppression["until_at"].isoformat() if suppression["until_at"] else None,
+            }
         muted = False
         if d.action in {"create", "rollover"}:
             if d.action == "rollover":
@@ -341,7 +377,7 @@ async def ingest_event(
             problem_id = current["id"]
             muted_until = current.get("muted_until")
             muted = muted_until is not None and _aware(muted_until, now) > now
-            if d.action in {"attach", "reopen"}:
+            if d.action in {"attach", "reopen", "promote"}:
                 occurrences = await conn.fetchval(
                     "UPDATE problems SET occurrences = occurrences + 1, "
                     "last_seen_at = GREATEST(last_seen_at, $2), "
@@ -372,7 +408,7 @@ async def ingest_event(
             event.external_id,
             event.kind,
             severity,
-            event.payload or {},
+            payload,
             occurred_at,
         )
         if d.status is not None:
@@ -394,6 +430,7 @@ async def ingest_event(
         "attach": "attached",
         "reopen": "reopened",
         "rollover": "rolled_over",
+        "promote": "promoted",
         "resolve": "resolved",
         "note": "noted",
     }[d.action]
@@ -405,7 +442,155 @@ async def ingest_event(
         problem_id=problem_id,
         key=key,
     )
-    return IngestResult(problem_id, action, key, occurrences=occurrences, muted=muted)
+    return IngestResult(
+        problem_id,
+        action,
+        key,
+        occurrences=occurrences,
+        muted=muted,
+        suppressed=suppression is not None,
+    )
+
+
+async def _active_suppression(
+    conn: asyncpg.Connection, subject: str, subject_kind: str, now: datetime
+) -> asyncpg.Record | None:
+    """The `service_state` row that suppresses ``subject`` right now, if any.
+    An exact match wins over the `*` wildcard (a whole-kind or global
+    maintenance window, e.g. a planned power cut)."""
+    return await conn.fetchrow(
+        "SELECT subject, subject_kind, state, until_at, set_by, note FROM service_state "
+        "WHERE state = ANY($4::text[]) AND (until_at IS NULL OR until_at > $3) "
+        "AND ((subject = $1 AND subject_kind = $2) "
+        "     OR (subject = '*' AND subject_kind IN ($2, '*'))) "
+        "ORDER BY (subject = '*') LIMIT 1",
+        subject,
+        subject_kind,
+        now,
+        sorted(SUPPRESSING_STATES),
+    )
+
+
+async def set_service_state(
+    pool: asyncpg.Pool,
+    subject: str,
+    state: str,
+    *,
+    subject_kind: str = "service",
+    minutes: int | None = None,
+    until_at: datetime | None = None,
+    set_by: str,
+    note: str = "",
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """Declare what is happening to ``subject``. ``ok`` clears the row; the
+    other states upsert it, open-ended unless ``minutes`` or ``until_at`` is
+    given. Raises ``ValueError`` on an unknown state or empty subject."""
+    state = (state or "").strip().lower()
+    if state not in SERVICE_STATES:
+        raise ValueError(f"unknown state {state!r}")
+    subj = "*" if (subject or "").strip() == "*" else _slug(subject)
+    kind = "*" if (subject_kind or "").strip() == "*" else (_slug(subject_kind) or "service")
+    if not subj:
+        raise ValueError("subject is required")
+    if not (set_by or "").strip():
+        raise ValueError("set_by is required")
+    now = now or _utcnow()
+    if state == "ok":
+        cleared = await pool.fetchval(
+            "DELETE FROM service_state WHERE subject = $1 AND subject_kind = $2 RETURNING subject",
+            subj,
+            kind,
+        )
+        logger.info("service_state_cleared", subject=subj, subject_kind=kind, set_by=set_by)
+        return {"subject": subj, "subject_kind": kind, "state": "ok", "cleared": cleared is not None}
+    if until_at is None and minutes is not None:
+        until_at = now + timedelta(minutes=max(int(minutes), 1))
+    row = await pool.fetchrow(
+        "INSERT INTO service_state (subject, subject_kind, state, until_at, set_by, note, updated_at) "
+        "VALUES ($1, $2, $3, $4, $5, $6, $7) "
+        "ON CONFLICT (subject, subject_kind) DO UPDATE SET state = EXCLUDED.state, "
+        "until_at = EXCLUDED.until_at, set_by = EXCLUDED.set_by, note = EXCLUDED.note, "
+        "updated_at = EXCLUDED.updated_at "
+        "RETURNING subject, subject_kind, state, until_at, set_by, note, updated_at",
+        subj,
+        kind,
+        state,
+        _aware(until_at, now) if until_at else None,
+        set_by.strip(),
+        (note or "").strip()[:500],
+        now,
+    )
+    logger.info("service_state_set", subject=subj, subject_kind=kind, state=state, set_by=set_by)
+    return dict(row)
+
+
+async def list_service_states(
+    pool: asyncpg.Pool, *, now: datetime | None = None
+) -> list[dict[str, Any]]:
+    """Every row still in force: open-ended, or with an `until_at` in the future."""
+    rows = await pool.fetch(
+        "SELECT subject, subject_kind, state, until_at, set_by, note, updated_at "
+        "FROM service_state WHERE until_at IS NULL OR until_at > $1 "
+        "ORDER BY updated_at DESC",
+        now or _utcnow(),
+    )
+    return [dict(r) for r in rows]
+
+
+async def clear_converged_deploys(
+    pool: asyncpg.Pool, stuck_subjects: list[str], *, now: datetime | None = None
+) -> list[str]:
+    """Clear `deploying` service rows whose service is no longer below its
+    desired replicas — the safety net for a deploy job that crashed before
+    posting `ok`. Rows younger than ``CONVERGE_GRACE`` and the `*` wildcard
+    are left alone."""
+    now = now or _utcnow()
+    rows = await pool.fetch(
+        "DELETE FROM service_state WHERE state = 'deploying' AND subject_kind = 'service' "
+        "AND subject <> '*' AND NOT (subject = ANY($1::text[])) AND updated_at < $2 "
+        "RETURNING subject",
+        [_slug(x) for x in stuck_subjects],
+        now - CONVERGE_GRACE,
+    )
+    cleared = [r["subject"] for r in rows]
+    if cleared:
+        logger.info("service_state_converged", subjects=cleared)
+    return cleared
+
+
+async def promote_expired_suppressions(
+    pool: asyncpg.Pool, *, now: datetime | None = None
+) -> list[str]:
+    """Every `suppressed` problem whose window has passed becomes `open`: the
+    deploy or maintenance did not make it go away. Returns the promoted ids."""
+    now = now or _utcnow()
+    promoted: list[str] = []
+    async with pool.acquire() as conn, conn.transaction():
+        rows = await conn.fetch(
+            "SELECT id::text AS id, subject, subject_kind, severity FROM problems "
+            "WHERE status = 'suppressed' AND closed_at IS NULL FOR UPDATE"
+        )
+        for row in rows:
+            if await _active_suppression(conn, row["subject"], row["subject_kind"], now):
+                continue
+            await conn.execute(
+                "UPDATE problems SET status = 'open' WHERE id = $1::uuid", row["id"]
+            )
+            await conn.execute(
+                "INSERT INTO problem_events (problem_id, source, external_id, kind, severity, "
+                "payload, occurred_at) VALUES ($1::uuid, 'hub', $2, 'state_change', $3, $4, $5) "
+                "ON CONFLICT (source, external_id) DO NOTHING",
+                row["id"],
+                f"promote:{row['id']}:{now.isoformat()}",
+                row["severity"],
+                {"action": "promote", "status": "open", "reason": "suppression_expired"},
+                now,
+            )
+            promoted.append(row["id"])
+    if promoted:
+        logger.info("hub_suppressions_promoted", count=len(promoted))
+    return promoted
 
 
 def event_from_alert(
