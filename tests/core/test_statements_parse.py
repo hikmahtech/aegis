@@ -37,6 +37,15 @@ def netbanking() -> str:
     return (FIXTURES / "axis_netbanking.txt").read_text()
 
 
+@pytest.fixture
+def multipage() -> str:
+    """The netbanking layout over four pages: a printed column header on page
+    one only, then three pages of rows at three different shifted offsets —
+    page three printing ONE amount column, which position cannot tell debit
+    from credit."""
+    return (FIXTURES / "axis_netbanking_multipage.txt").read_text()
+
+
 def parse(text: str, **kw):
     return parse_axis_statement(text, file_sha256="fixture-sha", **kw)
 
@@ -47,6 +56,15 @@ def drop_line(text: str, needle: str) -> str:
     hits = [i for i, line in enumerate(lines) if needle in line]
     assert len(hits) == 1, f"{needle!r} matched {len(hits)} lines"
     del lines[hits[0]]
+    return "".join(lines)
+
+
+def insert_after(text: str, needle: str, line: str) -> str:
+    """Add `line` straight after the one line containing `needle`."""
+    lines = text.splitlines(keepends=True)
+    hits = [i for i, existing in enumerate(lines) if needle in existing]
+    assert len(hits) == 1, f"{needle!r} matched {len(hits)} lines"
+    lines.insert(hits[0] + 1, line.rstrip() + "\n")
     return "".join(lines)
 
 
@@ -125,12 +143,17 @@ def test_a_statement_whose_bank_totals_disagree_is_refused(mailed):
     assert out.rows == ()
 
 
-def test_a_page_of_rows_with_no_column_header_is_refused_not_read_through_a_stale_map(mailed):
+def test_a_page_of_rows_with_no_header_is_read_through_its_own_geometry(mailed):
+    # Never through the PREVIOUS page's map, which is how a credit becomes a
+    # debit. Page two of the mailed fixture sits at its own offsets, so
+    # dropping its header leaves a page that has to be inferred from its rows.
     without = drop_line(mailed, "Tran Date    Value Date")  # page two's header
     out = parse(without)
-    assert (out.status, out.reason) == (REFUSED, "no_column_header")
-    assert out.diagnostics["headerless_pages"] == [1]
-    assert out.rows == ()
+    assert (out.status, out.reason) == (PARSED, "")
+    assert out.diagnostics["inferred_column_pages"] == [1]
+    # ...and reads exactly what the printed header read.
+    expected = [(r.occurred_on, r.direction, r.amount) for r in parse(mailed).rows]
+    assert [(r.occurred_on, r.direction, r.amount) for r in out.rows] == expected
 
 
 def test_a_row_dated_outside_the_period_is_refused(mailed):
@@ -335,3 +358,236 @@ def test_statement_id_is_the_account_and_the_period():
         statements.statement_id_for("axis-4321", date(2026, 7, 1), date(2026, 7, 31))
         == "axis-4321/2026-07-01..2026-07-31"
     )
+
+
+# ------------------------------------- the netbanking layout over many pages
+#
+# The mailed layout reprints its column header on every page. The netbanking
+# layout prints it once and then shifts each later page, so 48 of the 49 pages
+# of a real FY statement carry rows under no header of their own. Those pages
+# get their offsets from their own rows. Where that leaves ONE amount column
+# the direction cannot be read from position — `pdftotext` closes an empty
+# column up, so a debit-only page is laid out exactly like a credit-only one —
+# and the running balance decides instead. Which is why every test below that
+# touches an inferred direction ends at the bank's own printed totals: derive a
+# direction from the balances and the balance checks agree by construction.
+
+
+def test_the_multipage_netbanking_statement_parses_every_page(multipage):
+    out = parse(multipage)
+    assert (out.status, out.reason) == (PARSED, "")
+    assert out.instrument == "axis-4321"
+    assert (out.opening_balance, out.closing_balance) == (
+        Decimal("10000.00"),
+        Decimal("500.35"),
+    )
+    assert [(r.occurred_on.day, r.direction, str(r.amount)) for r in out.rows] == [
+        (1, "out", "300.00"),
+        (2, "in", "1500.00"),
+        (3, "out", "2500.00"),
+        (5, "out", "50.00"),
+        (6, "in", "200.00"),
+        (7, "out", "150.00"),
+        (10, "out", "100.00"),
+        (11, "out", "25.00"),
+        (12, "out", "8574.65"),
+        (20, "in", "1000.00"),
+        (21, "out", "500.00"),
+    ]
+    assert out.diagnostics["withdrawals"] == "12199.65"
+    assert out.diagnostics["deposits"] == "2700.00"
+
+
+def test_the_result_names_the_pages_whose_columns_were_inferred(multipage):
+    # A reviewer has to be able to see which pages were read through a map the
+    # parser worked out and which through one the bank printed.
+    out = parse(multipage)
+    assert out.diagnostics["inferred_column_pages"] == [1, 2, 3]
+    assert out.diagnostics["ambiguous_column_pages"] == [2]
+
+
+def test_a_printed_header_is_never_second_guessed(mailed):
+    out = parse(mailed)
+    assert out.diagnostics["inferred_column_pages"] == []
+    assert out.diagnostics["ambiguous_column_pages"] == []
+    assert out.diagnostics["inferred_direction_rows"] == 0
+
+
+def test_a_page_with_two_amount_columns_takes_its_direction_from_position(multipage):
+    # Pages two and four print a debit column AND a credit column, so position
+    # says which side each row is and the balance is left free to check it.
+    # Only page three's three rows are settled by the balance.
+    out = parse(multipage)
+    assert out.diagnostics["inferred_direction_rows"] == 3
+    directional = [r for r in out.rows if r.occurred_on.day in (5, 6, 7, 20, 21)]
+    assert [r.direction for r in directional] == ["out", "in", "out", "in", "out"]
+
+
+def test_an_inferred_page_reads_its_narration_and_its_reference(multipage):
+    # The narration is display only, but `ref` comes out of it and the matcher
+    # joins on `ref` — so a narration column inferred a few characters wrong
+    # loses the UPI or NEFT reference on every row of the page. The wrapped
+    # lines print above and below their own date line and each lands on the
+    # nearer row.
+    rows = {r.occurred_on.day: (r.narration, r.ref) for r in parse(multipage).rows}
+    assert rows[5] == ("UPI/P2M/712345678901/SHOP /BANK/ABCDEF//1X2/", "712345678901")
+    assert rows[6] == ("SPECIMEN SUPPLIES LTD NEFT/AXISP00123456/SUPPLIES", "AXISP00123456")
+    assert rows[12] == ("SWEEP TO DEPOSIT IMPS/612345678902/SWEEP", "612345678902")
+    assert rows[20] == ("NEFT/AXISP00123457/REFUND", "AXISP00123457")
+
+
+def test_an_amount_printed_short_of_its_column_still_belongs_to_it(multipage):
+    # `pdftotext` lays a proportional font onto a character grid, so a
+    # right-aligned column's end offsets move by a character or two from row to
+    # row. The 12th prints two characters left of the other two amounts on its
+    # page; read as a column of its own it would give that page two amount
+    # columns and turn the other two rows into credits.
+    out = parse(multipage)
+    assert out.diagnostics["ambiguous_column_pages"] == [2]
+    twelfth = next(r for r in out.rows if r.occurred_on == date(2026, 7, 12))
+    assert (twelfth.direction, str(twelfth.amount)) == ("out", "8574.65")
+
+
+def test_a_money_shaped_token_in_a_narration_does_not_become_an_amount_column(multipage):
+    # The 11th carries `01.02.2024` in its narration, far left of the columns.
+    # The geometry reads a row's LAST TWO numbers, so that token cannot make a
+    # one-column page look like a two-column one and flip every row's side.
+    assert "BILL 01.02.2024 ELEC" in multipage
+    out = parse(multipage)
+    assert out.diagnostics["ambiguous_column_pages"] == [2]
+    eleventh = next(r for r in out.rows if r.occurred_on == date(2026, 7, 11))
+    assert (eleventh.direction, str(eleventh.amount)) == ("out", "25.00")
+
+
+def test_a_balance_below_one_rupee_is_read_and_not_dropped(multipage):
+    # Axis prints a sub-rupee running balance without its leading zero (`.35`),
+    # which two rows of the real FY2024-25 statement do. Read as no balance,
+    # the row is unreadable and the whole statement is refused.
+    assert "         .35 " in multipage
+    twelfth = next(r for r in parse(multipage).rows if r.occurred_on == date(2026, 7, 12))
+    assert twelfth.balance_after == Decimal("0.35")
+
+
+# ----------------------------------------- the check that has to be able to fail
+
+
+def flip_one_ambiguous_row(text: str) -> str:
+    """Make the 10th read as a CREDIT of 100.00 instead of a debit, by moving
+    its balance up instead of down and carrying the shift through every later
+    balance. The page prints one amount column, so nothing about the row's
+    printed position changes — only the running balance, which is the only
+    thing that decides its side."""
+    text = edit_line(text, "10-07-2026", "8,600.00", "8,800.00")
+    text = edit_line(text, "11-07-2026", "8,575.00", "8,775.00")
+    text = edit_line(text, "12-07-2026", "      .35", "   200.35")
+    text = edit_line(text, "20-07-2026", "1,000.35", "1,200.35")
+    text = edit_line(text, "21-07-2026", "500.35", "700.35")
+    return edit_line(text, "CLOSING BALANCE", "500.35", "700.35")
+
+
+def test_a_wrong_inferred_direction_is_caught_by_the_banks_own_totals(multipage):
+    out = parse(flip_one_ambiguous_row(multipage))
+    assert (out.status, out.reason) == (REFUSED, "totals_mismatch")
+    assert out.rows == ()
+    # The direction moved by 100.00, so the printed debit total is 100.00 high
+    # and the printed credit total 100.00 low against what was read.
+    assert out.diagnostics["withdrawals"] == "12099.65"
+    assert out.diagnostics["deposits"] == "2800.00"
+    assert out.diagnostics["printed_debit"] == "12199.65"
+    assert out.diagnostics["printed_credit"] == "2700.00"
+
+
+def test_the_balance_checks_cannot_catch_a_wrong_inferred_direction(multipage):
+    # The reason the test above has to exist. The direction came OUT of the
+    # running balance, so putting it back into the running balance proves
+    # nothing: on the same tampered statement §6.2's identity still holds
+    # exactly and every row's balance still moves by its own amount. A check
+    # that cannot fail is worse than no check, because it reads as safety.
+    out = parse(flip_one_ambiguous_row(multipage))
+    opening, closing = out.opening_balance, out.closing_balance
+    deposits = Decimal(out.diagnostics["deposits"])
+    withdrawals = Decimal(out.diagnostics["withdrawals"])
+    assert closing - opening == deposits - withdrawals
+    assert out.reason != "arithmetic"
+    assert out.reason != "balance_chain"
+
+
+def test_an_ambiguous_page_with_no_printed_totals_is_refused(multipage):
+    # No independent evidence, so nothing to check the inference against. The
+    # statement is refused rather than read on the strength of a tautology.
+    out = parse(drop_line(multipage, "TRANSACTION TOTAL"))
+    assert (out.status, out.reason) == (REFUSED, "no_independent_totals")
+    assert out.rows == ()
+    assert out.diagnostics["inferred_direction_rows"] == 3
+
+
+def test_a_statement_with_no_inferred_direction_still_needs_no_printed_totals(mailed):
+    # The gate is on the inference, not on every statement: where the printed
+    # columns say which side a row is, the balance checks are real checks.
+    out = parse(drop_line(mailed, "TRANSACTION TOTAL"))
+    assert (out.status, out.reason) == (PARSED, "")
+    assert len(out.rows) == 7
+
+
+def test_an_ambiguous_row_whose_balance_fits_neither_side_is_refused(multipage):
+    out = parse(edit_line(multipage, "11-07-2026", "8,575.00", "8,570.00"))
+    assert (out.status, out.reason) == (REFUSED, "undetermined_direction")
+    assert out.rows == ()
+
+
+# ------------------------------------------- when the geometry will not resolve
+
+
+def test_a_headerless_page_whose_balances_split_in_two_is_refused(multipage):
+    # One row's running balance printed six characters left of the others. The
+    # page no longer has one balance column, so it has no readable geometry —
+    # and a page with no readable geometry is refused, exactly as a page with
+    # no header was before.
+    broken = edit_line(
+        multipage, "07-07-2026", "150.00             8,700.00", "150.00       8,700.00      "
+    )
+    out = parse(broken)
+    assert (out.status, out.reason) == (REFUSED, "no_column_header")
+    assert out.diagnostics["headerless_pages"] == [1]
+    assert out.rows == ()
+
+
+def test_a_headerless_page_with_three_amount_columns_is_refused(multipage):
+    # Two amount columns are Debit and Credit. Three are not a layout this
+    # parser knows, so it refuses rather than picking two of them.
+    # The third row's amount printed eight characters left of the other two.
+    broken = edit_line(multipage, "07-07-2026", "        150.00", "150.00        ")
+    out = parse(broken)
+    assert (out.status, out.reason) == (REFUSED, "no_column_header")
+    assert out.diagnostics["headerless_pages"] == [1]
+
+
+def test_a_zero_amount_row_on_an_ambiguous_page_is_refused_not_guessed(multipage):
+    # Nothing moves the balance, so both sides fit and the running balance
+    # cannot choose. Adding the row leaves every later balance and both printed
+    # totals untouched, so this is the ONE thing the statement now fails on.
+    nil = "12-07-2026   REVERSAL NIL VALUE".ljust(61) + "0.00".ljust(13) + ".35 KLYN"
+    out = parse(insert_after(multipage, "IMPS/612345678902/SWEEP", nil))
+    assert (out.status, out.reason) == (REFUSED, "undetermined_direction")
+    assert out.diagnostics["rows_read"] == 12
+    assert out.rows == ()
+
+
+@pytest.mark.parametrize(
+    "printed,expected",
+    [
+        ("8,574.65", ["8574.65"]),
+        ("-1,200.00", ["-1200.00"]),
+        # Axis drops the leading zero on a balance below one rupee. Read as no
+        # number at all, the row loses its running balance and the statement is
+        # refused — which is what the real FY2024-25 statement did.
+        (".35", ["0.35"]),
+        # A date in a narration is one spurious token, never two: without the
+        # lookbehind `01.02.2024` also yields `.20`.
+        ("BILL 01.02.2024 ELEC", ["1.02"]),
+        ("CONSUMER 90000123", []),
+    ],
+)
+def test_what_the_parser_reads_as_a_money_token(printed, expected):
+    found = statements._NUM.findall(printed)
+    assert [str(statements._amount(token)) for token in found] == expected

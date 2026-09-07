@@ -21,6 +21,17 @@ a manual dry run got it wrong first:
   `TRANSACTION TOTAL` that must equal the sums too. A statement that fails is
   **refused whole** — `rows` comes back empty — because a parser that quietly
   returns fewer rows than the statement holds is the worst outcome in this lane.
+* **A page prints its own columns, or they are inferred from its own rows.**
+  The mailed layout reprints the column header on every page; the netbanking
+  layout prints it once and then shifts every later page, so 48 of the 49
+  pages of a real FY statement hold rows under no header. Those pages get
+  their offsets from their own numbers (`_infer_columns`). Where that leaves
+  ONE amount column, position cannot tell a debit from a credit — `pdftotext`
+  closes an empty column up — so the direction comes from the running balance,
+  and the statement is then refused unless the bank printed its own debit and
+  credit totals to check it against. Deriving a direction from the balances
+  makes the balance checks agree by construction; only a figure the bank
+  printed itself can falsify the result.
 * **`row_id` is layout-independent** (§8.3): instrument, transaction date,
   direction, amount, running balance and the occurrence index within that group.
   The narration is display only — `pdftotext -layout` wraps and truncates it by
@@ -181,7 +192,13 @@ def identify_axis(text: str) -> tuple[StatementHeader | None, str]:
 # from each column-header line and applied to the rows that follow it.
 _DATE_LABEL = "Tran Date"
 _NARRATION_LABELS = ("Transaction Details", "Particulars")
-_NUM = re.compile(r"-?\d[\d,]*\.\d{2}")
+# A money token. The integer part is OPTIONAL because Axis prints a balance
+# below one rupee with no leading zero — `.35`, not `0.35` — which two rows of
+# the real FY2024-25 netbanking statement do. Without it those rows carry no
+# running balance, read as unreadable, and the whole 1,619-row statement is
+# refused. The lookbehind stops that widening from also matching the tail of
+# something already read: `.07` out of `01.07.2026` is a date, not money.
+_NUM = re.compile(r"(?<![\d.])-?(?:\d[\d,]*)?\.\d{2}")
 _ROW_DATE = re.compile(r"(\d{2}[-/]\d{2}[-/]\d{4})")
 _OPENING = re.compile(r"^\s*OPENING BALANCE\s*:?\s", re.I)
 _CLOSING = re.compile(r"^\s*CLOSING BALANCE\s*:?\s", re.I)
@@ -198,6 +215,14 @@ _LOOSE_ROW = re.compile(r"^\s{0,6}\d{2}[-/]\d{2}[-/]\d{4}\s")
 _COL_SLACK = 10
 #: How far a row's transaction date may sit from the `Tran Date` label.
 _DATE_SLACK = 4
+#: `dd-mm-yyyy` — the width of a printed transaction date.
+_DATE_WIDTH = 10
+#: Two right-aligned numbers share a column when their end offsets are this
+#: close. Measured on the real 48-page netbanking statement: one column's end
+#: offsets wobble by at most 2 characters (`pdftotext` lays a proportional font
+#: onto a character grid), and the nearest two DIFFERENT amount columns ever
+#: came was 7. 4 sits between the two with room on both sides.
+_CLUSTER_GAP = 4
 
 
 @dataclass(frozen=True)
@@ -208,6 +233,12 @@ class _Columns:
     debit_end: int
     credit_end: int
     balance_end: int
+    #: False when the page prints ONE amount column. `debit_end` and
+    #: `credit_end` then both hold that column, position cannot say which side
+    #: of the ledger it is, and the direction is resolved from the running
+    #: balance instead — which `parse_axis_statement` only allows when the bank
+    #: printed its own debit and credit totals to check the result against.
+    directional: bool = True
 
 
 def _column_map(line: str) -> _Columns | None:
@@ -233,6 +264,122 @@ def _column_map(line: str) -> _Columns | None:
     )
 
 
+def _cluster(offsets: Sequence[int]) -> list[list[int]]:
+    """Sorted offsets, split wherever the step between them exceeds the gap."""
+    groups: list[list[int]] = []
+    for offset in sorted(offsets):
+        if groups and offset - groups[-1][-1] <= _CLUSTER_GAP:
+            groups[-1].append(offset)
+        else:
+            groups.append([offset])
+    return groups
+
+
+def _first_text(line: str, start: int) -> int | None:
+    """The offset of the first non-space character at or after `start`."""
+    rest = line[start:]
+    stripped = rest.lstrip()
+    return start + len(rest) - len(stripped) if stripped else None
+
+
+def _infer_columns(page: str) -> _Columns | None:
+    """The column offsets of a page that carries rows but reprints no header.
+
+    The mailed Axis layout reprints its column header on every page. The
+    netbanking layout prints it once, on page one, and then shifts each page's
+    offsets — so 48 of the 49 pages of a real FY statement hold rows under no
+    header of their own, and the file used to be refused whole.
+
+    The geometry comes from the page's own rows. Every row of a savings or
+    current account statement ends in its running balance, so the LAST number
+    on a row is the balance and the one before it is the amount. That per-row
+    ordering, rather than a distance threshold, is what keeps a stray number
+    inside a narration out of the column map — the real statement has 12 of
+    them. The balance offsets must then form exactly ONE column, and the amount
+    offsets form either:
+
+    * **two** columns — Axis prints `Debit` to the left of `Credit`, so the
+      left one is the debit and the direction is read from position, exactly as
+      it is under a printed header; or
+    * **one**, and position cannot say which side it is. `pdftotext` closes an
+      empty column up, so a debit-only page is laid out identically to a
+      credit-only one: on the real statement the single amount column sits
+      11-13 characters from the balance whether it is a debit column or a
+      credit column. Such a page comes back `directional=False` and its rows
+      get their direction from the running balance instead.
+
+    `None` means the page could not be inferred — too many amount columns, a
+    split balance column, no readable row — and the caller then refuses it, the
+    same outcome a headerless page had before.
+
+    There is deliberately no "are these two columns too close together?" guard.
+    Right-aligned money columns are separated by the width of the right one, so
+    the closest two can print is three or four characters, which is exactly the
+    span a legitimate sub-rupee balance occupies — such a guard would refuse a
+    real page and could never be shown to catch a wrong one.
+    """
+    dates: list[int] = []
+    amount_ends: list[int] = []
+    amount_starts: list[int] = []
+    balance_ends: list[int] = []
+    text_starts: list[int] = []
+    for line in page.splitlines():
+        if _LOOSE_ROW.match(line):
+            date = _ROW_DATE.search(line)
+            if date is None:
+                continue
+            dates.append(date.start())
+            numbers = list(_NUM.finditer(line))
+            if len(numbers) < 2:
+                # Not enough to place a column. The row itself is left to the
+                # parse loop, which reports it as `unreadable_row`.
+                continue
+            amount_ends.append(numbers[-2].end())
+            amount_starts.append(numbers[-2].start())
+            balance_ends.append(numbers[-1].end())
+            after_date = _first_text(line, date.end())
+            if after_date is not None:
+                text_starts.append(after_date)
+        elif line.strip() and not _NUM.search(line):
+            # A wrapped narration: it prints in the narration column too, and
+            # on this layout it is the only other thing on the page.
+            first = _first_text(line, 0)
+            if first is not None:
+                text_starts.append(first)
+    if not amount_ends:
+        return None
+
+    balance_groups = _cluster(balance_ends)
+    if len(balance_groups) != 1:
+        return None
+    # Every member of a cluster sits within `_CLUSTER_GAP` of its neighbours
+    # and `_COL_SLACK` is more than twice that, so which member stands for the
+    # column cannot change what any number is read as. Take the edge the column
+    # is aligned on: the right for money, the left for the date.
+    balance_end = max(balance_groups[0])
+    amount_groups = _cluster(amount_ends)
+    if len(amount_groups) > 2:
+        return None
+    directional = len(amount_groups) == 2
+    debit_end = max(amount_groups[0])
+    credit_end = max(amount_groups[-1])
+
+    date_start = min(dates)
+    narration_end = min(amount_starts)
+    floor = date_start + _DATE_WIDTH
+    inside = [start for start in text_starts if floor <= start < narration_end]
+    narration_start = min(inside) if inside else floor
+    return _Columns(
+        date_start=date_start,
+        narration_start=narration_start,
+        narration_end=max(narration_start, narration_end),
+        debit_end=debit_end,
+        credit_end=credit_end,
+        balance_end=balance_end,
+        directional=directional,
+    )
+
+
 def _amount(token: str) -> Decimal:
     try:
         return Decimal(token.replace(",", "")).quantize(_CENT)
@@ -245,9 +392,15 @@ def _columned_numbers(line: str, cols: _Columns) -> dict[str, Decimal]:
 
     A number that ends near no column (a terminal id inside a narration, a
     branch code) is ignored; a column that gets two numbers keeps neither, so
-    the row reads as unparseable rather than as half of itself.
+    the row reads as unparseable rather than as half of itself. On a page whose
+    one amount column has no known side the amount comes back under `amount`,
+    never under a guessed `debit`.
     """
-    targets = {"debit": cols.debit_end, "credit": cols.credit_end, "balance": cols.balance_end}
+    targets = (
+        {"debit": cols.debit_end, "credit": cols.credit_end, "balance": cols.balance_end}
+        if cols.directional
+        else {"amount": cols.debit_end, "balance": cols.balance_end}
+    )
     out: dict[str, Decimal] = {}
     clashed: set[str] = set()
     for match in _NUM.finditer(line):
@@ -490,19 +643,30 @@ def parse_axis_statement(
     unreadable: list[int] = []
     reprinted: list[int] = []
     headerless_pages: list[int] = []
+    inferred_pages: list[int] = []
+    ambiguous_pages: list[int] = []
     index = -1
     stopped = False
 
     # The column map is PER PAGE. `pdftotext -layout` sizes each column to the
     # widest thing on that page, so the offsets move from page to page — the
-    # mailed layout reprints its header on every page and is read page by page,
-    # and a page carrying rows with no header of its own is refused rather than
-    # read through a stale map, which is how a credit becomes a debit.
+    # mailed layout reprints its header on every page and is read page by page.
+    # A page that prints no header of its own is never read through the
+    # PREVIOUS page's map, which is how a credit becomes a debit: its offsets
+    # are inferred from its own rows, and a page whose geometry will not resolve
+    # is refused exactly as it was before.
     for page_number, page in enumerate(text.split("\f")):
         if stopped:
             break
+        lines = page.splitlines()
         cols: _Columns | None = None
-        for line in page.splitlines():
+        if not any(_column_map(line) is not None for line in lines):
+            cols = _infer_columns(page)
+            if cols is not None:
+                inferred_pages.append(page_number)
+                if not cols.directional:
+                    ambiguous_pages.append(page_number)
+        for line in lines:
             index += 1
             mapped = _column_map(line)
             if mapped is not None:
@@ -534,16 +698,26 @@ def parse_axis_statement(
                 if cell and not numbers:
                     continuations.append((index, cell))
                 continue
-            debit, credit = numbers.get("debit"), numbers.get("credit")
             balance = numbers.get("balance")
-            if (debit is None) == (credit is None) or balance is None:
-                unreadable.append(index)
-                continue
-            amount = debit if debit is not None else credit
+            direction: str | None
+            if cols.directional:
+                debit, credit = numbers.get("debit"), numbers.get("credit")
+                if (debit is None) == (credit is None) or balance is None:
+                    unreadable.append(index)
+                    continue
+                amount = debit if debit is not None else credit
+                direction = "out" if debit is not None else "in"
+            else:
+                # One amount column, side unknown. The direction is left for
+                # the running balance to settle, below.
+                amount = numbers.get("amount")
+                if amount is None or balance is None:
+                    unreadable.append(index)
+                    continue
+                direction = None
             if amount < 0:
                 unreadable.append(index)
                 continue
-            direction = "out" if debit is not None else "in"
             # A page-boundary reprint: Axis printed the last row of one page
             # again at the top of the next (seen in the real April 2026
             # statement), and its own TRANSACTION TOTAL counts it once. The
@@ -596,6 +770,36 @@ def parse_axis_statement(
     for rec in records:
         rec["narration"] = " ".join(cell for _, cell in sorted(rec["narration"]))
 
+    # A row off an ambiguous page arrives with no direction, because its page
+    # prints one amount column and `pdftotext` lays a debit-only page out
+    # exactly like a credit-only one. The running balance is the only thing on
+    # such a page that can say which side a row is, so it decides.
+    #
+    # And BECAUSE it decides, the §6.2 identity below stops being a check on
+    # these rows: derive each direction from the balances and the balances
+    # agree by construction, so a check that can never fail would sit in the
+    # code reading like safety. The bank's own printed debit and credit totals
+    # are the independent evidence, and a statement that carries none is
+    # refused rather than trusted — see `no_independent_totals`.
+    inferred_directions = 0
+    undetermined: list[int] = []
+    if opening is not None:
+        running = opening
+        for position, rec in enumerate(records):
+            if rec["direction"] is None:
+                inferred_directions += 1
+                delta = rec["balance_after"] - running
+                if rec["amount"] > 0 and delta == rec["amount"]:
+                    rec["direction"] = "in"
+                elif rec["amount"] > 0 and delta == -rec["amount"]:
+                    rec["direction"] = "out"
+                else:
+                    # A zero amount reads both ways and a balance that moved by
+                    # something else reads neither. Both are refusals: a
+                    # direction is posted money, never a guess.
+                    undetermined.append(position)
+            running = rec["balance_after"]
+
     deposits = sum((r["amount"] for r in records if r["direction"] == "in"), Decimal("0"))
     withdrawals = sum((r["amount"] for r in records if r["direction"] == "out"), Decimal("0"))
     diagnostics: dict[str, Any] = {
@@ -604,6 +808,12 @@ def parse_axis_statement(
         "deposits": str(deposits),
         "withdrawals": str(withdrawals),
         "layout": header.layout,
+        # Which pages were read through a map inferred from their own rows
+        # rather than one the bank printed, and which of those could not be
+        # told debit from credit by position alone.
+        "inferred_column_pages": sorted(set(inferred_pages)),
+        "ambiguous_column_pages": sorted(set(ambiguous_pages)),
+        "inferred_direction_rows": inferred_directions,
     }
 
     def refuse(why: str, **extra: Any) -> ParsedStatement:
@@ -622,10 +832,21 @@ def parse_axis_statement(
         return refuse("unreadable_row", unreadable_lines=unreadable[:10])
     if opening is None or closing is None:
         return refuse("missing_balance_anchor")
+    if undetermined:
+        return refuse("undetermined_direction", undetermined_rows=undetermined[:10])
     outside = [r["occurred_on"].isoformat() for r in records
                if not header.period_start <= r["occurred_on"] <= header.period_end]
     if outside:
         return refuse("row_outside_period", outside_dates=sorted(set(outside))[:10])
+    # The gate on the inference above. A direction taken from the running
+    # balance makes both balance checks below tautological for that row, so a
+    # statement holding one has to be checked against a figure the bank printed
+    # itself. Axis prints `TRANSACTION TOTAL` with separate debit and credit
+    # sides on both layouts, including the last page of a 48-page netbanking
+    # statement; a statement that does not is refused rather than read on the
+    # strength of a check that cannot fail.
+    if inferred_directions and not printed_totals:
+        return refuse("no_independent_totals")
     # §6.2 — every statement carries its own proof, and this is the check that
     # earns it: the amounts and directions above are read from the printed
     # columns, so a dropped, mis-columned or double-read row breaks the
