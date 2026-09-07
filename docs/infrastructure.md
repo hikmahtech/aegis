@@ -294,6 +294,49 @@ Pandora gets two read-only tools:
   profile?". Errors (missing CLI, bad credentials, unknown slug) come back as
   plain tool errors, never crashes.
 
+## Service state (deploy and maintenance windows)
+
+The problem hub (`services/hub.py`, spec
+`docs/superpowers/specs/2026-09-07-problem-hub-design.md`) keeps a
+`service_state` row per subject saying what is happening to it right now.
+While a subject is `deploying` or in `maintenance`, every occurrence the hub
+ingests for it is stored and counted but raises nothing; the problem it
+creates sits in status `suppressed`. When the window passes without a
+`resolved` event, `HubSweepFlow` (every 5 min) opens the problem: the deploy
+did not make it go away. `degraded` is information only; `ok` clears the row.
+`subject: "*"` is a wildcard for a whole kind (`subject_kind: node`) or, with
+`subject_kind: "*"`, everything — a planned power cut.
+
+Three writers, all of which land on the same row:
+
+- **The deploy job.** `POST /api/hub/service-state`, authenticated like the
+  alert webhook (`X-Alert-Token` or `Authorization: Bearer`, the
+  `alert_webhook_secret`). The Ansible role that deploys AEGIS posts
+  `deploying` for `aegis_core`, `aegis_worker` and `aegis_comms` before the
+  stack deploy and `ok` after the services are up. A hand-run
+  `docker service update` deserves the same two calls:
+
+  ```bash
+  curl -sS -X POST "$AEGIS_URL/api/hub/service-state" \
+    -H "X-Alert-Token: $AEGIS_ALERT_WEBHOOK_SECRET" -H 'Content-Type: application/json' \
+    -d '{"subject": "chatapp_app", "state": "deploying", "minutes": 15, "set_by": "operator", "note": "rolling latest"}'
+  # ... docker --context swarm-baa service update --image ... --force chatapp_app ...
+  curl -sS -X POST "$AEGIS_URL/api/hub/service-state" \
+    -H "X-Alert-Token: $AEGIS_ALERT_WEBHOOK_SECRET" -H 'Content-Type: application/json' \
+    -d '{"subject": "chatapp_app", "state": "ok", "set_by": "operator"}'
+  ```
+
+  `minutes` bounds the window; omit it for open-ended and rely on `ok`.
+- **Chat.** `set_service_state(subject, state, minutes, note)`, granted to
+  the `infra` capability holder (seeded for `pandoras-actor`; a running
+  deployment adds it to `agents.metadata.tool_set`). Withheld from coding
+  runs on the MCP mount: a run that could open a window could silence the
+  alert about itself.
+- **The heartbeat.** A `deploying` service row older than two ticks whose
+  service is no longer below its desired replicas is cleared automatically —
+  the safety net for a deploy job that crashed before posting `ok`.
+  `maintenance` rows are never auto-cleared.
+
 ## System monitoring (`hosts_aegis`)
 
 The admin **System monitoring** page shows the live health of AEGIS's *own*

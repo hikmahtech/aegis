@@ -151,12 +151,6 @@ async def stub_reresolve_with_hint(alert: dict, hint: str) -> dict:
     return {"confident": False, "candidates": []}
 
 
-@activity.defn(name="check_active_work")
-async def stub_check_active_work(alert: dict, repo: str) -> dict:
-    _state["check_active_work_called"] = True
-    return {"active": False, "reasons": []}
-
-
 @activity.defn(name="gather_alert_knowledge")
 async def stub_gather_alert_knowledge(title: str, project: str, alert_name: str = "") -> str:
     return ""
@@ -299,7 +293,6 @@ ALL_ACTIVITIES = [
     stub_resolve_alert_resource,
     stub_score_resource_relevance,
     stub_reresolve_with_hint,
-    stub_check_active_work,
     stub_gather_alert_knowledge,
     stub_run_investigation,
     stub_investigate,

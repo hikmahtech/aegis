@@ -48,6 +48,7 @@ from aegis.services.tools.gtd import (
     _exec_mark_waiting,
     _exec_whats_next,
 )
+from aegis.services.tools.hub import _exec_set_service_state
 from aegis.services.tools.infra import (
     _INFRA_CONTEXTS_K8S,  # noqa: F401 — re-export: tests mutate this set in place
     _exec_cloud_identity,
@@ -832,6 +833,8 @@ CHAT_TOOLS = [
             },
         },
     },
+    # Problem hub — deploy / maintenance windows; `services/tools/hub.py`.
+    _registry_schema("set_service_state"),
     {
         "type": "function",
         "function": {
@@ -3105,6 +3108,7 @@ TOOL_EXECUTORS: dict[str, Any] = {
     "list_cloud_accounts": _exec_list_cloud_accounts,
     "cloud_identity": _exec_cloud_identity,
     "run_infra_script": _exec_run_infra_script,
+    "set_service_state": _exec_set_service_state,
     "aegis_self_diagnose": _exec_aegis_self_diagnose,
     "investigate_resource": _exec_investigate_resource,
     "list_interactions": _exec_list_interactions,
@@ -3196,6 +3200,9 @@ AGENT_TOOL_SETS: dict[str, set[str]] = {
     },
     "pandoras-actor": {
         "trigger_workflow",
+        # Problem hub: declare a deploy/maintenance window so the hub
+        # records what it sees there without raising it.
+        "set_service_state",
         # Heavy lane, repo-agnostic: investigate/analyse anything in a headless
         # CLI run. investigate_resource stays the code-fix-with-Gate-2 path.
         "dispatch_agent_run",

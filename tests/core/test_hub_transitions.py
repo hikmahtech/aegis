@@ -53,6 +53,28 @@ def test_decide(current, kind, action, status):
     assert (d.action, d.status) == (action, status)
 
 
+@pytest.mark.parametrize(
+    ("current", "suppressed", "action", "status"),
+    [
+        # inside a deploy/maintenance window
+        (None, True, "create", "suppressed"),
+        (_p("open"), True, "attach", None),
+        (_p("suppressed"), True, "attach", None),
+        (_p("resolved", timedelta(hours=1)), True, "reopen", "suppressed"),
+        (_p("resolved", timedelta(hours=48)), True, "rollover", "suppressed"),
+        # window over: a suppressed problem that recurs is real
+        (_p("suppressed"), False, "promote", "open"),
+    ],
+)
+def test_decide_with_suppression(current, suppressed, action, status):
+    d = decide(current, "occurrence", now=NOW, suppressed=suppressed)
+    assert (d.action, d.status) == (action, status)
+
+
+def test_resolved_on_a_suppressed_problem_resolves_it():
+    assert decide(_p("suppressed"), "resolved", now=NOW) == decide(_p("open"), "resolved", now=NOW)
+
+
 def test_reopen_window_is_a_parameter():
     p = _p("resolved", timedelta(hours=2))
     assert decide(p, "occurrence", now=NOW, reopen_window=timedelta(hours=1)).action == "rollover"

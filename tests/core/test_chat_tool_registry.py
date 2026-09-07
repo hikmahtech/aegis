@@ -76,6 +76,7 @@ EXPECTED_TOOL_NAMES = [
     "restart_service",
     "run_infra_script",
     "search_knowledge",
+    "set_service_state",
     "social_timeline",
     "stop_agent_run",
     "sync_argocd_app",

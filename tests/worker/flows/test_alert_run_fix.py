@@ -198,11 +198,6 @@ async def stub_remediate_infra_service(alert: dict) -> dict:
     return {"attempted": False}
 
 
-@activity.defn(name="check_active_work")
-async def stub_check_active_work(alert: dict, repo: str) -> dict:
-    return {"active": False, "reasons": []}
-
-
 @activity.defn(name="score_resource_relevance")
 async def stub_score_resource_relevance(alert: dict, resolved_resource_id: str) -> dict:
     return {"confident": True, "resolved_resource_id": resolved_resource_id, "candidates": []}
@@ -333,7 +328,6 @@ ALL_STUBS = [
     stub_resolve_infra_resource,
     stub_resolve_alert_resource,
     stub_remediate_infra_service,
-    stub_check_active_work,
     stub_score_resource_relevance,
     stub_gather_alert_knowledge,
     stub_investigate,

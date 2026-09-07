@@ -81,6 +81,7 @@ from temporalio import workflow
 
 with workflow.unsafe.imports_passed_through():
     from aegis_worker.activities.homelab import HomelabActivities
+    from aegis_worker.activities.hub import HubActivities
     from aegis_worker.flows.alert_investigation import AlertInvestigationFlow
     from aegis_worker.shared.retry import FAST, NO_RETRY, TIMEOUT_FAST, TIMEOUT_STANDARD
 
@@ -234,6 +235,22 @@ class InfraHeartbeatFlow:
         prev_stuck = set(prior.get("stuck") or [])
         prev_confirmed = set(prior.get("confirmed") or [])
         cur_stuck = set(current.get("stuck") or [])
+
+        # A `deploying` window the deploy job never closed (it crashed, or
+        # the operator rolled a service by hand) ends once the service has
+        # converged. Safety net only — the deploy role posts `ok` itself —
+        # so it never fails the tick.
+        deploys_cleared = 0
+        try:
+            cleared = await workflow.execute_activity_method(
+                HubActivities.clear_converged_deploys,
+                args=[sorted(cur_stuck)],
+                start_to_close_timeout=TIMEOUT_FAST,
+                retry_policy=NO_RETRY,
+            )
+            deploys_cleared = len(cleared.get("cleared") or [])
+        except Exception as exc:  # noqa: BLE001 — housekeeping, never the tick
+            workflow.logger.warning("heartbeat_clear_deploys_failed err=%s", str(exc)[:200])
 
         nodes_down, nodes_recovered = [], []
         for name, status in cur_nodes.items():
@@ -440,4 +457,5 @@ class InfraHeartbeatFlow:
             "services_confirmed_stuck": len(new_confirmed),
             "services_reinvestigated": reinvestigated,
             "services_recovered": len(recovered_services),
+            "deploys_cleared": deploys_cleared,
         }

@@ -5,13 +5,12 @@ present the top candidates with a free-text hint affordance (allow_hint=True for
 the first _MAX_HINT_ROUNDS rounds); if the operator replies `hint:<text>`,
 re-run Gate-0 resolution via reresolve_with_hint and re-present; otherwise honour
 the pick (an index) or cancel. A human pick rebuilds resources_list, sets
-`_repo_from_human=True`, and — critically — BYPASSES the active-work guard
-(an explicit "investigate anyway").
+`_repo_from_human=True`.
 
 Tests (start_local so we can signal the child InteractionFlow at each round):
   • test_hint_loop_then_pick: round 0 → `hint:owner/repo` → reresolve_with_hint
     called → round 1 → pick index 0 → investigation runs against the picked
-    repo, and check_active_work is NEVER called (guard bypassed on human pick).
+    repo.
   • test_allow_hint_false_once_max_rounds_reached: after _MAX_HINT_ROUNDS hints
     the card for the final round is constructed with allow_hint=False (asserted
     via the send_interaction_card stub which captures the flag per round).
@@ -94,7 +93,6 @@ def _reset(**overrides):
             },
             "run_investigation_called": False,
             "run_investigation_resources": None,
-            "check_active_work_called": False,
             "reresolve_calls": [],
             "card_allow_hints": [],  # allow_hint flag per send_interaction_card call
         }
@@ -164,12 +162,6 @@ async def stub_score_resource_relevance(alert: dict, resolved_resource_id: str) 
 async def stub_reresolve_with_hint(alert: dict, hint: str) -> dict:
     _state.setdefault("reresolve_calls", []).append(hint)
     return _state["reresolve_result"]
-
-
-@activity.defn(name="check_active_work")
-async def stub_check_active_work(alert: dict, repo: str) -> dict:
-    _state["check_active_work_called"] = True
-    return {"active": False, "reasons": []}
 
 
 @activity.defn(name="gather_alert_knowledge")
@@ -325,7 +317,6 @@ ALL_ACTIVITIES = [
     stub_resolve_alert_resource,
     stub_score_resource_relevance,
     stub_reresolve_with_hint,
-    stub_check_active_work,
     stub_gather_alert_knowledge,
     stub_run_investigation,
     stub_investigate,
@@ -391,8 +382,7 @@ async def _wait_running(client, child_id: str, attempts: int = 200) -> bool:
 async def test_hint_loop_then_pick():
     """not-confident → Gate-0 round 0 → reply `hint:owner/repo` →
     reresolve_with_hint called → round 1 → pick index 0 (the hint candidate) →
-    investigation runs against owner/repo, and check_active_work is NEVER called
-    (guard bypassed because the operator hand-picked the repo)."""
+    investigation runs against owner/repo."""
     _reset()
     parent_id = f"alert-hint-pick-{uuid4().hex[:8]}"
     round0_id = f"repo-confirm-{_safe('fp-hint-1')}-{parent_id}"
@@ -437,11 +427,6 @@ async def test_hint_loop_then_pick():
     resources = _state["run_investigation_resources"]
     assert resources and resources[0]["github_repo"] == "owner/repo"
     assert result["status"] != "repo_unconfirmed"
-    assert result["status"] != "skipped_active_work"
-
-    # GUARD BYPASS: a human pick is an explicit "investigate anyway" — the
-    # active-work check must NOT run.
-    assert _state["check_active_work_called"] is False
 
 
 @pytest.mark.asyncio
@@ -503,4 +488,3 @@ async def test_allow_hint_false_once_max_rounds_reached():
     # `none` at the capped round → no repo confirmed → clean abort.
     assert result["status"] == "repo_unconfirmed"
     assert _state["run_investigation_called"] is False
-    assert _state["check_active_work_called"] is False

@@ -20,11 +20,58 @@ from pydantic import BaseModel, ConfigDict, Field
 from aegis.api.auth import alert_token_ok
 from aegis.api.deps import get_settings
 from aegis.config import Settings
-from aegis.services.hub import Event, ingest_event
+from aegis.services.hub import Event, ingest_event, set_service_state
 
 logger = structlog.get_logger()
 
 router = APIRouter(prefix="/api/hub", tags=["hub"])
+
+
+def _check_token(request: Request, settings: Settings, what: str) -> None:
+    if settings.alert_webhook_secret and not alert_token_ok(
+        request, settings.alert_webhook_secret
+    ):
+        logger.warning(f"hub_{what}_bad_token")
+        raise HTTPException(status_code=401, detail="bad_token")
+
+
+def _pool(request: Request):
+    pool = request.app.state.db_pool
+    if pool is None:
+        raise HTTPException(status_code=503, detail="db_unavailable")
+    return pool
+
+
+class ServiceStateBody(BaseModel):
+    subject: str
+    subject_kind: str = "service"
+    state: str
+    minutes: int | None = None
+    note: str = ""
+    set_by: str = "api"
+
+
+@router.post("/service-state")
+async def post_service_state(
+    body: ServiceStateBody,
+    request: Request,
+    settings: Settings = Depends(get_settings),
+) -> dict[str, Any]:
+    """Declare a subject deploying / in maintenance / degraded / ok. The
+    Ansible deploy role calls this at the top and bottom of a rollout."""
+    _check_token(request, settings, "service_state")
+    try:
+        return await set_service_state(
+            _pool(request),
+            body.subject,
+            body.state,
+            subject_kind=body.subject_kind,
+            minutes=body.minutes,
+            set_by=body.set_by,
+            note=body.note,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 class EventBody(BaseModel):
@@ -49,16 +96,9 @@ async def post_event(
     request: Request,
     settings: Settings = Depends(get_settings),
 ) -> dict[str, Any]:
-    if settings.alert_webhook_secret and not alert_token_ok(
-        request, settings.alert_webhook_secret
-    ):
-        logger.warning("hub_event_bad_token")
-        raise HTTPException(status_code=401, detail="bad_token")
-    pool = request.app.state.db_pool
-    if pool is None:
-        raise HTTPException(status_code=503, detail="db_unavailable")
+    _check_token(request, settings, "event")
     try:
-        result = await ingest_event(pool, Event(**body.model_dump(by_alias=False)))
+        result = await ingest_event(_pool(request), Event(**body.model_dump(by_alias=False)))
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return result.to_dict()

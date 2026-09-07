@@ -65,6 +65,7 @@ from aegis_worker.flows.expiry_radar import ExpiryRadarConfig, ExpiryRadarFlow
 from aegis_worker.flows.flow_health import FlowHealthConfig, FlowHealthWatchdogFlow
 from aegis_worker.flows.github_alert import GitHubAlertFlow
 from aegis_worker.flows.gmail_ingest import GmailIngestFlow, GmailIngestInput
+from aegis_worker.flows.hub_sweep import HubSweepConfig, HubSweepFlow
 from aegis_worker.flows.infra_heartbeat import InfraHeartbeatConfig, InfraHeartbeatFlow
 from aegis_worker.flows.intelligence_scan import IntelligenceScanFlow, IntelligenceScanInput
 from aegis_worker.flows.interaction import InteractionFlow
@@ -411,6 +412,12 @@ FLOWS: tuple[FlowSpec, ...] = (
     # Watchdog over AEGIS's own scheduled flows (#226). Deliberately NOT behind
     # homelab_enabled: it watches workflow_runs, which every install has, and
     # the silent-failure gap it closes is not homelab-specific.
+    # The problem hub's housekeeping tick. Not behind homelab_enabled: the hub
+    # ingests from every producer, not only the swarm ones.
+    FlowSpec(
+        HubSweepFlow,
+        lambda act: HubSweepConfig(agent_id=act["agent_id"]),
+    ),
     FlowSpec(
         FlowHealthWatchdogFlow,
         lambda act: FlowHealthConfig(
