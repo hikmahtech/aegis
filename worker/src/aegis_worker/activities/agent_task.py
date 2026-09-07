@@ -294,13 +294,15 @@ class AgentTaskActivities:
             "gmail_message_id": "",
             "problem_id": "",
             "subject": "",
+            "subject_kind": "",
         }
         if self.db_pool is None or not task_id:
             return empty
         # A task the problem hub projected knows its subject exactly
         # (`problems.subject`), so the infra verb need not parse the title.
         problem = await self.db_pool.fetchrow(
-            "SELECT id::text AS id, subject FROM problems WHERE todoist_task_id = $1 "
+            "SELECT id::text AS id, subject, subject_kind FROM problems "
+            "WHERE todoist_task_id = $1 "
             "ORDER BY first_seen_at DESC LIMIT 1",
             task_id,
         )
@@ -320,6 +322,7 @@ class AgentTaskActivities:
             ),
             "problem_id": problem["id"] if problem else "",
             "subject": problem["subject"] if problem else "",
+            "subject_kind": problem["subject_kind"] if problem else "",
         }
 
     # --- terminal states ---

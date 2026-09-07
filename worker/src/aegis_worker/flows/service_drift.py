@@ -8,7 +8,12 @@ from temporalio import workflow
 
 with workflow.unsafe.imports_passed_through():
     from aegis_worker.activities.homelab import HomelabActivities
+    from aegis_worker.activities.hub import HubActivities
     from aegis_worker.shared.retry import FAST, NO_RETRY, TIMEOUT_FAST, TIMEOUT_STANDARD
+
+# Every drift_type `_compute_drift_inline` can produce: what the hub resolves
+# when a service stops drifting.
+DRIFT_CLASSES = ["replicas", "oom_exit"]
 
 
 @dataclass
@@ -68,8 +73,48 @@ class ServiceDriftFlow:
                 start_to_close_timeout=TIMEOUT_FAST,
                 retry_policy=FAST,
             )
+            # The hub owns identity: one `replicas` / `oom_exit` problem per
+            # service, resolved when the drift clears. A card goes out only for
+            # a drift that created or reopened its problem, so a service that
+            # drifts all day is one card. `homelab_drift` stays as the admin
+            # page's and the briefing's history.
+            hub_fresh: set[tuple[str, str]] = set()
+            try:
+                outcome = await workflow.execute_activity_method(
+                    HubActivities.reconcile_findings,
+                    args=[
+                        {
+                            "source": "drift",
+                            "subject_kind": "service",
+                            "classes": DRIFT_CLASSES,
+                            "findings": [
+                                {
+                                    "klass": d["drift_type"],
+                                    "subject": d["service_name"],
+                                    "title": (
+                                        f"{d['service_name']}: {d['drift_type']} drift "
+                                        f"(expected {d['expected']}, actual {d['actual']})"
+                                    ),
+                                    "severity": "critical" if d["severity"] == "critical" else "warning",
+                                    "payload": {k: v for k, v in d.items() if k != "service_name"},
+                                }
+                                for d in drifts
+                            ],
+                        }
+                    ],
+                    start_to_close_timeout=TIMEOUT_STANDARD,
+                    retry_policy=NO_RETRY,
+                )
+                hub_fresh = {
+                    (str(f.get("klass")), str(f.get("subject"))) for f in outcome.get("fresh") or []
+                }
+            except Exception as exc:  # noqa: BLE001 — a hub outage must not hide a drift
+                workflow.logger.warning("service_drift_hub_failed err=%s", str(exc)[:200])
+                hub_fresh = {(d["drift_type"], d["service_name"]) for d in drifts}
             if not config.silent:
                 for d in drifts:
+                    if (d["drift_type"], d["service_name"]) not in hub_fresh:
+                        continue
                     # notify_drift uses safe_send_message internally and
                     # never raises — no wrapping try/except needed.
                     await workflow.execute_activity_method(

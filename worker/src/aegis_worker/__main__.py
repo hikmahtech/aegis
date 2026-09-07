@@ -508,10 +508,6 @@ async def main():
     # track-task via alert_act.post_task_note. The dataclass declared
     # todoist_connector=None upstream; wire the live connector now.
     alert_act.todoist_connector = todoist_connector
-    # HomelabActivities.alert_comms_inbound_down creates Todoist tasks;
-    # wire the connector now (after it's been instantiated above).
-    if homelab_act is not None:
-        homelab_act.todoist_connector = todoist_connector
     clarify_act = ClarifyActivities(
         db_pool=deps.pool,
         todoist_connector=todoist_connector,

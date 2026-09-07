@@ -147,6 +147,32 @@ async def test_hub_subject_wins_over_an_unparseable_title():
     assert ("health", "redis_redis") in events
 
 
+async def test_non_service_problem_parks_without_touching_docker():
+    """A flow, purpose, comms or domain problem the hub projected has no
+    service to check or restart: the verb says so and parks."""
+    events: list = []
+    task = {**_ALERT_TASK, "content": "Flow GmailIngestFlow keeps failing"}
+    context = {"external_id": "", "fingerprint": "", "gmail_message_id": "", "problem_id": "p1", "subject": "gmailingestflow", "subject_kind": "flow"}
+    async with await WorkflowEnvironment.start_time_skipping() as env:
+        queue = f"tq-{uuid.uuid4()}"
+        async with Worker(
+            env.client,
+            task_queue=queue,
+            workflows=[AgentTaskFlow, InteractionFlow],
+            activities=_base_activities(events, healthy=True, context=context),
+        ):
+            result = await env.client.execute_workflow(
+                AgentTaskFlow.run,
+                AgentTaskFlowInput(agent_id="pandoras-actor", todoist_task_id="ti-1", task=task),
+                id=f"agent-task-ti-1-{uuid.uuid4()}",
+                task_queue=queue,
+            )
+    assert result == {"task_id": "ti-1", "verb": "infra", "status": "parked", "kind": "flow"}
+    assert not any(kind == "health" for kind, _ in events)
+    assert any(kind == "comment" and "flow problem" in body for kind, body in events)
+    assert any(kind == "park" and "flow problem" in reason for kind, reason in events)
+
+
 async def test_unhealthy_service_investigates_and_parks_pending_approval():
     """A restart-approval card is spawned; the task parks meanwhile so the
     next tick doesn't re-select it while the card is still open."""

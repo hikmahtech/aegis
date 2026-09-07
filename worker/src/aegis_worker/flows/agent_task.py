@@ -541,6 +541,30 @@ class AgentTaskFlow:
         both.
         """
         title = str(input.task.get("content") or "")
+        kind = str((context or {}).get("subject_kind") or "")
+        if kind and kind != "service":
+            # A flow, a purpose, the comms probe, a domain, a post: the hub
+            # projected it as a task so the human sees it, but there is no
+            # swarm service to check or restart. Say so and park.
+            await workflow.execute_activity(
+                "comment",
+                args=[
+                    task_id,
+                    input.agent_id,
+                    f"This is a {kind} problem ({(context or {}).get('subject')}); "
+                    "there is no service to check or restart, so I have no automatic "
+                    "action for it.",
+                ],
+                start_to_close_timeout=TIMEOUT_STANDARD,
+                retry_policy=NO_RETRY,
+            )
+            await workflow.execute_activity(
+                "park_task",
+                args=[task_id, f"no automatic action for a {kind} problem"],
+                start_to_close_timeout=TIMEOUT_FAST,
+                retry_policy=ACT_RETRY,
+            )
+            return {"task_id": task_id, "verb": "infra", "status": "parked", "kind": kind}
         service = str((context or {}).get("subject") or "") or extract_service_name(title)
         if not service:
             await workflow.execute_activity(

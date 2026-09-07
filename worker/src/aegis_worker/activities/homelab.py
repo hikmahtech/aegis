@@ -14,7 +14,6 @@ from typing import Any
 
 import httpx
 import structlog
-from aegis.observability import log_audit
 from temporalio import activity
 
 from aegis_worker.activities.delivery import safe_send_message
@@ -48,7 +47,6 @@ class HomelabActivities:
     homelab: Any  # HomelabConnector
     delivery: Any  # DeliveryActivities
     agent_id: str = "pandoras-actor"
-    todoist_connector: Any = None  # TodoistConnector; wired in __main__ when available
     heartbeat_ping_url: str = ""  # healthchecks.io dead-man URL; "" = disabled
     infra_cluster: str = ""       # Prometheus cluster label for synthetic alerts
 
@@ -216,11 +214,9 @@ class HomelabActivities:
         await self._notify_card(self.agent_id, title, body, "homelab_notify_undelivered_failed")
 
     # ------------------------------------------------------------------
-    # Comms inbound-channel health check
+    # Comms inbound-channel health check (the alert itself is the delivery
+    # watchdog's `comms_inbound_down` problem on the hub)
     # ------------------------------------------------------------------
-
-    _POLLING_ALERT_DEDUP_HOURS = 12  # do not re-alert within this window
-    _POLLING_ALERT_ACTION = "comms_inbound_alert"
 
     @activity.defn
     async def check_comms_inbound_health(self, comms_url: str) -> dict:
@@ -263,184 +259,6 @@ class HomelabActivities:
             "last_ok_seconds_ago": inbound.get("last_ok_seconds_ago"),
             "last_error": inbound.get("last_error"),
         }
-
-    @activity.defn
-    async def alert_comms_inbound_down(
-        self, last_ok_seconds_ago: int | None, last_error: str | None
-    ) -> bool:
-        """Create a Todoist Inbox task alerting that the comms inbound channel is down.
-
-        One open task at a time: while the task from the previous alert is still
-        uncompleted, this is a no-op. A fixed time window is only the fallback for
-        when Todoist did not hand back an id, because an unresolvable outage on a
-        pure time window mints a fresh task forever (8 duplicates over 4 days in
-        prod, 2026-08-23..27). `resolve_comms_inbound_alert` closes the task when
-        inbound recovers, which is what re-arms this.
-
-        Returns True if a task was created, False if suppressed or if capture is
-        unavailable.
-
-        Uses Todoist (not the chat channel) as the alert surface because the
-        chat channel itself is the thing that's down.
-        """
-        if not self.db_pool:
-            return False
-
-
-        async with self.db_pool.acquire() as conn:
-            previous = await conn.fetchrow(
-                "SELECT created_at, details->>'task_ref' AS task_ref FROM audit_log "
-                "WHERE action = $1 ORDER BY created_at DESC LIMIT 1",
-                self._POLLING_ALERT_ACTION,
-            )
-            if previous is not None and previous["task_ref"]:
-                still_open = await conn.fetchval(
-                    "SELECT 1 FROM todoist_tasks WHERE id = $1 AND NOT is_completed",
-                    previous["task_ref"],
-                )
-                if still_open:
-                    activity.logger.info(
-                        "comms_inbound_alert_suppressed task_open=%s", previous["task_ref"]
-                    )
-                    return False
-            elif previous is not None:
-                # No id recorded (create raced the sync, or Todoist returned no
-                # mapping) — fall back to the time window so a missing id cannot
-                # turn the hourly watchdog into hourly task spam.
-                recent = await conn.fetchval(
-                    "SELECT 1 FROM audit_log WHERE action = $1 "
-                    "AND created_at > NOW() - INTERVAL '1 hour' * $2 LIMIT 1",
-                    self._POLLING_ALERT_ACTION,
-                    self._POLLING_ALERT_DEDUP_HOURS,
-                )
-                if recent:
-                    activity.logger.info(
-                        "comms_inbound_alert_deduped within_%dh",
-                        self._POLLING_ALERT_DEDUP_HOURS,
-                    )
-                    return False
-
-        # Build human-readable label for last_ok
-        okstr = "never" if last_ok_seconds_ago is None else f"{last_ok_seconds_ago}s ago"
-
-        description_parts = [f"Last ok: {okstr}"]
-        if last_error:
-            description_parts.append(f"Error: {last_error[:200]}")
-
-        # Use capture_to_inbox via direct Todoist path so we avoid an activity
-        # dependency cycle (CaptureActivities is a separate dataclass).
-        # Replicate the minimal capture logic: find inbox project + add task.
-        from aegis.connectors.todoist import TodoistConnector
-
-        async with self.db_pool.acquire() as conn:
-            managed = await conn.fetchval(
-                "SELECT value FROM settings WHERE key = 'todoist_managed_project_ids'"
-            )
-            kill = await conn.fetchval(
-                "SELECT value FROM settings WHERE key = 'todoist_capture_enabled'"
-            )
-        inbox_id = (managed or {}).get("inbox") if isinstance(managed, dict) else None
-        if kill is False or (isinstance(kill, dict) and kill.get("value") is False):
-            activity.logger.warning("comms_inbound_alert_capture_disabled")
-            return False
-        if not inbox_id:
-            activity.logger.warning("comms_inbound_alert_no_inbox_id")
-            return False
-        if self.todoist_connector is None:
-            activity.logger.warning("comms_inbound_alert_no_todoist_connector")
-            return False
-
-        title = (
-            f"\U0001f6a8 AEGIS inbound comms is DOWN (last ok {okstr})"
-            " — button taps and messages are not being received"
-        )
-        # `#alert` is the source tag and it is load-bearing: todoist.py's
-        # _pick_source_tag reads it off the labels, and agent_task.resolve_verb
-        # maps source_tag -> verb. Without it the task lands with source_tag NULL,
-        # resolves to verb "unknown", and AgentTaskFlow parks it with @waiting
-        # having done nothing — which is what happened to all 8 duplicates in
-        # prod between 2026-08-23 and 08-27.
-        cmd = TodoistConnector.build_create_item_command(
-            project_id=inbox_id,
-            content=title[:120],
-            description="\n".join(description_parts),
-            labels=["#alert", "@pandora"],
-        )
-        result = await self.todoist_connector.commands([cmd])
-        status = TodoistConnector.check_sync_status(result, [cmd["uuid"]])
-        if not status["ok"]:
-            # Don't write the dedup audit row on failure — the next watchdog
-            # tick retries instead of going silent.
-            activity.logger.warning(
-                "comms_inbound_alert_create_failed status=%s", str(status)[:200]
-            )
-            return False
-
-        mapping = (result.get("data") or {}).get("temp_id_mapping") or {}
-        task_ref = mapping.get(cmd["temp_id"])
-        await log_audit(
-            self.db_pool,
-            actor="delivery-watchdog",
-            action=self._POLLING_ALERT_ACTION,
-            target_type="comms",
-            target_id="polling",
-            details={
-                "task_ref": task_ref,
-                "last_ok_seconds_ago": last_ok_seconds_ago,
-                "last_error": last_error,
-            },
-        )
-        activity.logger.info(
-            "comms_inbound_alert_created last_ok=%s task_ref=%s", okstr, task_ref
-        )
-        return True
-
-    @activity.defn
-    async def resolve_comms_inbound_alert(self) -> bool:
-        """Complete the open inbound-down task once inbound is healthy again.
-
-        Without this the alert task stays open forever and the open-task guard in
-        `alert_comms_inbound_down` would then suppress every future outage alert.
-        Returns True if a task was completed.
-        """
-        if not self.db_pool or self.todoist_connector is None:
-            return False
-
-        from aegis.connectors.todoist import TodoistConnector
-
-        async with self.db_pool.acquire() as conn:
-            task_ref = await conn.fetchval(
-                "SELECT details->>'task_ref' FROM audit_log WHERE action = $1 "
-                "ORDER BY created_at DESC LIMIT 1",
-                self._POLLING_ALERT_ACTION,
-            )
-            if not task_ref:
-                return False
-            still_open = await conn.fetchval(
-                "SELECT 1 FROM todoist_tasks WHERE id = $1 AND NOT is_completed", task_ref
-            )
-        if not still_open:
-            return False
-
-        cmd = TodoistConnector.build_item_complete_command(task_ref)
-        result = await self.todoist_connector.commands([cmd])
-        status = TodoistConnector.check_sync_status(result, [cmd["uuid"]])
-        if not status["ok"]:
-            activity.logger.warning(
-                "comms_inbound_resolve_failed task_ref=%s status=%s",
-                task_ref,
-                str(status)[:200],
-            )
-            return False
-
-        # Optimistic local update — the guard reads todoist_tasks, and waiting for
-        # the 5-min sync would let the next watchdog tick suppress a real alert.
-        await self.db_pool.execute(
-            "UPDATE todoist_tasks SET is_completed = true, updated_at = now() WHERE id = $1",
-            task_ref,
-        )
-        activity.logger.info("comms_inbound_alert_resolved task_ref=%s", task_ref)
-        return True
 
     @activity.defn
     async def collect_services(self) -> dict:
