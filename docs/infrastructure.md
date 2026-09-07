@@ -343,12 +343,24 @@ Once, after the PR that moved the alert producers onto the hub deploys, turn
 every open `#alert` task AEGIS created before it into a problem that owns that
 task — otherwise the next occurrence of a known alert creates a second task:
 
+Run it in the **worker** container, not core: it imports `aegis_worker` for
+the same `extract_service_name` the coding lane uses, and the core image does
+not carry that package. It reads the database URL from the container's own
+environment.
+
 ```bash
-# dry run first; --apply writes. Duplicate tasks for one problem are completed
-# through the outbox and the oldest stays.
-python scripts/hub_backfill.py --database-url "$AEGIS_DATABASE_URL"
-python scripts/hub_backfill.py --database-url "$AEGIS_DATABASE_URL" --apply
+# on the node running the worker
+W=$(docker ps --filter name=aegis_worker -q | head -1)
+docker cp scripts/hub_backfill.py $W:/tmp/hub_backfill.py
+docker exec $W python /tmp/hub_backfill.py            # dry run
+docker exec $W python /tmp/hub_backfill.py --apply    # writes
 ```
+
+Read the dry run before applying. A task whose class and subject it cannot
+read gets an empty key and therefore its own problem — check that the ones it
+DID key match what the producer computes, because a task keyed differently
+from its producer will be duplicated by the next occurrence rather than
+attached to.
 
 It reads the retired `alert_dedup_index` for recurrence counts while the table
 still exists, which is why that table is dropped only after this has run.
