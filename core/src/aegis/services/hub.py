@@ -724,8 +724,8 @@ async def mute_problem(
     now: datetime | None = None,
 ) -> datetime | None:
     """Silence a problem until ``now + hours``: occurrences are still recorded
-    and counted, nothing is projected or investigated. Replaces `alert_mutes`
-    for the alert pipeline — the mute key *is* the problem. Returns the new
+    and counted, nothing is projected or investigated. The mute key *is* the
+    problem (the old `alert_mutes` table and its four key namespaces are gone). Returns the new
     `muted_until`, or None when the problem is missing or closed."""
     now = now or _utcnow()
     until = now + timedelta(hours=max(float(hours), 0.0))

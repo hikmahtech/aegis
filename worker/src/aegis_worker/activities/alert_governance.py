@@ -1,7 +1,8 @@
-"""Alert governance activities — mute check/write for AlertInvestigationFlow.
+"""Alert governance activities — the PR half of Gate 2.
 
-A non-expired row in alert_mutes short-circuits the investigation pipeline
-before Gate 1 fires. Mute keys follow "<source>:<service>:<subkey>".
+`stage_pending_pr` records a proposed fix branch and `create_github_pr` opens
+it once the operator approves. Mutes used to live here too; since the problem
+hub they are `problems.muted_until` (`HubActivities.mute_problem`).
 """
 
 from __future__ import annotations

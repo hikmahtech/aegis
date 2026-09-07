@@ -41,7 +41,7 @@ deleted from the code whose final calls happened to fail keeps matching "its
 last calls all failed" forever, because no newer call will ever arrive to
 clear it. It stops matching once its last call is older than
 `staleness_hours`. Until then it behaves like any other unfixed fault — one
-card per `dedup_hours`, silenced with one `alert_mutes` row — which is the
+open problem on the hub, one card, silenced by muting the problem — which is the
 same deal a permanently stale schedule already gets from detector 2, except
 this one expires on its own. That is the accepted cost of not gating on
 cadence: the alternative (deriving each purpose's expected interval from its
@@ -50,15 +50,11 @@ would silently stop the detector firing, which is precisely the failure this
 rewrite exists to remove. A loud fault that expires beats a quiet one that
 does not.
 
-Alerting is deduped in `audit_log` (`flow_health_alert` /
-`flow_health_recovered`), the same substrate `DeliveryWatchdogFlow` uses for
-its comms-outage half. `alert_dedup_index` is deliberately NOT used: its
-`task_id` is NOT NULL and joined against `todoist_tasks`, i.e. it dedups
-@pandora *Todoist tasks* raised by the alert-investigation pipeline, and this
-watchdog notifies with a plain chat card instead. Dedup is resolved-aware
-(same shape as `AlertActivities.check_dedup`): a `flow_health_recovered` row
-written after the last alert re-arms the subject, so a flow that breaks,
-recovers and breaks again alerts twice — while a flow that stays wedged for a
+Alerting is deduped by the problem hub (`aegis.services.hub_watch`): each
+finding is an occurrence on its `flow_failing` / `flow_stale` / `llm_dead`
+problem and only a new or returning problem earns a card, a finding that
+disappears resolves its problem (the recovery notice), and a problem that
+recurs after recovering alerts again — while a flow that stays wedged for a
 day alerts once, not 288 times.
 """
 
@@ -67,26 +63,22 @@ from __future__ import annotations
 import html as _html
 import re
 from dataclasses import dataclass
-from datetime import datetime
 from typing import Any
 
 import structlog
+from aegis.services.hub_watch import mute_hint, reconcile_findings
 from temporalio import activity
 
 from aegis_worker.activities.delivery import safe_send_message
 
 logger = structlog.get_logger()
 
-ALERT_ACTION = "flow_health_alert"
-RECOVERY_ACTION = "flow_health_recovered"
-TARGET_TYPE = "flow"
-#: `alert_mutes.mute_key` prefix — mute a known-broken flow with
-#: `INSERT INTO alert_mutes (mute_key, muted_until) VALUES ('flow-health:<subject>', ...)`.
-MUTE_PREFIX = "flow-health:"
-ACTOR = "flow-health-watchdog"
-#: Namespace for detector 3's subjects. Dedup, mutes and recovery all key on
-#: the bare `subject` string, so an LLM purpose has to be unambiguous against a
-#: `workflow_type` and an `activities.slug` sharing that keyspace.
+#: The hub source and the three problem classes this watchdog produces. A
+#: problem of one of these classes with no current finding has recovered.
+HUB_SOURCE = "flow_health"
+HUB_CLASSES = {"failing": "flow_failing", "stale": "flow_stale", "llm_dead": "llm_dead"}
+#: Namespace for detector 3's subjects: an LLM purpose has to be unambiguous
+#: against a `workflow_type` and an `activities.slug` sharing the keyspace.
 LLM_SUBJECT_PREFIX = "llm-purpose:"
 
 _MINUTES_PER_DAY = 1440
@@ -274,101 +266,20 @@ HAVING count(*) = $1
 ORDER BY purpose
 """
 
-# Resolved-aware: an alert only suppresses a new one while no recovery row was
-# written after it.
-#
-# Returns WHEN each subject was last alerted, not just whether — `$2` is the
-# lookback (wide enough to see alerts older than the dedup window) and `$3` is
-# the dedup window itself, so `within_dedup` still answers the clock question
-# while `last_alert_at` lets the caller answer the evidence question for
-# `llm_dead`. Both bounds stay in SQL: one clock, no tz round-tripping.
-_SUPPRESSED_SQL = f"""
-SELECT a.target_id,
-       max(a.created_at) AS last_alert_at,
-       max(a.created_at) > now() - make_interval(hours => $3) AS within_dedup
-FROM audit_log a
-WHERE a.action = '{ALERT_ACTION}'
-  AND a.target_type = '{TARGET_TYPE}'
-  AND a.target_id = ANY($1::text[])
-  AND a.created_at > now() - make_interval(hours => $2)
-  AND NOT EXISTS (
-      SELECT 1 FROM audit_log r
-      WHERE r.action = '{RECOVERY_ACTION}'
-        AND r.target_type = '{TARGET_TYPE}'
-        AND r.target_id = a.target_id
-        AND r.created_at > a.created_at
-  )
-GROUP BY a.target_id
-"""
-
-def _as_utc(value: Any) -> datetime | None:
-    """An ISO string from a finding as an aware datetime, or None.
-
-    None on anything unparseable OR tz-naive, deliberately. The only caller
-    compares this against a `timestamptz` out of Postgres, and comparing an
-    aware and a naive datetime raises `TypeError` — inside `report_flow_health`,
-    which runs NO_RETRY, so that exception would swallow the very alert the
-    watchdog exists to send. Unknown ⇒ fall back to the clock rule.
-    """
-    if not isinstance(value, str):
-        return None
-    try:
-        parsed = datetime.fromisoformat(value)
-    except ValueError:
-        return None
-    return parsed if parsed.tzinfo is not None else None
-
-
-def _is_suppressed(finding: dict, prior: dict[str, Any]) -> bool:
-    """Has the operator already been told this, with nothing new since?
-
-    Two rules, because the two detector families produce new evidence on
-    different clocks:
-
-    * Workflow findings (failing/stale) are re-evaluated every watchdog tick
-      against fresh `workflow_runs` rows, so "don't repeat within
-      `dedup_hours`" is the right bound.
-    * An `llm_dead` finding cannot change until the purpose is CALLED again —
-      the verdict is a streak over that purpose's own last N `llm_calls` rows
-      (#321/#327). Re-alerting on a clock therefore says nothing new: a weekly
-      purpose that broke on Saturday re-alerted every 12h for seven days, ~14
-      identical cards for one fault (daylog_rollup, 2026-08-16 → 08-23), and it
-      could not possibly recover before its next weekly run. So it stays silent
-      until a call lands AFTER the last alert, then alerts on that new evidence.
-
-    The dedup window still applies underneath, so a purpose called every minute
-    cannot alert every tick. Unknown `last_call_at` falls through to the clock
-    rule rather than going silent — this must fail LOUD.
-    """
-    subject = finding.get("subject")
-    row = prior.get(subject) if subject else None
-    if row is None:
-        return False
-    if finding.get("kind") == "llm_dead":
-        last_call = _as_utc(finding.get("last_call_at"))
-        if last_call is not None and row["last_alert_at"] >= last_call:
-            return True
-    return bool(row["within_dedup"])
-
-
-_OPEN_SQL = f"""
-SELECT DISTINCT a.target_id
-FROM audit_log a
-WHERE a.action = '{ALERT_ACTION}'
-  AND a.target_type = '{TARGET_TYPE}'
-  AND a.created_at > now() - make_interval(hours => $1)
-  AND NOT EXISTS (
-      SELECT 1 FROM audit_log r
-      WHERE r.action = '{RECOVERY_ACTION}'
-        AND r.target_type = '{TARGET_TYPE}'
-        AND r.target_id = a.target_id
-        AND r.created_at > a.created_at
-  )
-"""
-
 
 def _card(title: str, body: str) -> str:
     return f"<b>{_html.escape(title)}</b>\n{_html.escape(body)}"
+
+
+def _title(finding: dict) -> str:
+    """The problem's title: what a task called this would say."""
+    subject = finding.get("subject", "?")
+    kind = finding.get("kind")
+    if kind == "llm_dead":
+        return f"LLM purpose {finding.get('purpose', subject)} keeps failing"
+    if kind == "stale":
+        return f"Flow {subject} has not run successfully"
+    return f"Flow {subject} keeps failing"
 
 
 def _describe(finding: dict) -> str:
@@ -561,18 +472,17 @@ class FlowHealthActivities:
     # -- alerting ----------------------------------------------------------
 
     @activity.defn
-    async def report_flow_health(
-        self,
-        findings: list[dict],
-        agent_id: str = "pandoras-actor",
-        dedup_hours: int = 12,
-        recovery_hours: int = 168,
-    ) -> dict:
+    async def report_flow_health(self, findings: list[dict], agent_id: str = "pandoras-actor") -> dict:
         """Notify about NEW unhealthy flows and about flows that recovered.
 
-        One chat card per run, not one per finding, and a subject already
-        alerted within `dedup_hours` (with no recovery since) is silent — so a
-        flow wedged for a day produces one alert, not one per watchdog tick.
+        The problem hub decides what is new: every finding is an occurrence on
+        its problem (`flow_failing` / `flow_stale` / `llm_dead`, subject the
+        flow or purpose), and only a finding that created or reopened a
+        problem earns a card — so a flow wedged for a day produces one alert,
+        not one per watchdog tick, and a dead purpose called again while its
+        problem is open is counted, not re-announced. A problem whose finding
+        has gone is resolved, which is the recovery notice and what lets the
+        same flow alert again next time.
 
         Must be called even when `findings` is empty: that is precisely when
         recovery notices fire.
@@ -581,48 +491,28 @@ class FlowHealthActivities:
         if not self.db_pool:
             return result
 
-        subjects = [str(f.get("subject") or "") for f in findings]
-        subjects = [s for s in subjects if s]
-
-        async with self.db_pool.acquire() as conn:
-            muted: set[str] = set()
-            suppressed: set[str] = set()
-            if subjects:
-                muted = {
-                    row["mute_key"][len(MUTE_PREFIX) :]
-                    for row in await conn.fetch(
-                        "SELECT mute_key FROM alert_mutes "
-                        "WHERE mute_key = ANY($1::text[]) AND muted_until > now()",
-                        [MUTE_PREFIX + s for s in subjects],
-                    )
-                }
-                prior = {
-                    row["target_id"]: row
-                    for row in await conn.fetch(
-                        _SUPPRESSED_SQL,
-                        subjects,
-                        max(dedup_hours, recovery_hours),
-                        dedup_hours,
-                    )
-                }
-                suppressed = {
-                    str(f.get("subject"))
-                    for f in findings
-                    if f.get("subject") and _is_suppressed(f, prior)
-                }
-            open_subjects = {
-                row["target_id"] for row in await conn.fetch(_OPEN_SQL, recovery_hours)
+        hub_findings = [
+            {
+                "klass": HUB_CLASSES.get(str(f.get("kind")), "flow_failing"),
+                "subject": str(f.get("subject") or ""),
+                "title": _title(f),
+                "severity": "warning",
+                "payload": {k: v for k, v in f.items() if k != "subject"},
+                **f,
             }
-
-        fresh = [
-            f
             for f in findings
             if f.get("subject")
-            and f["subject"] not in muted
-            and f["subject"] not in suppressed
         ]
-        result["muted"] = sum(1 for f in findings if f.get("subject") in muted)
-        result["deduped"] = sum(1 for f in findings if f.get("subject") in suppressed)
+        outcome = await reconcile_findings(
+            self.db_pool,
+            source=HUB_SOURCE,
+            subject_kind="flow",
+            classes=sorted(set(HUB_CLASSES.values())),
+            findings=hub_findings,
+        )
+        fresh = outcome["fresh"]
+        result["deduped"] = outcome["attached"] + outcome["suppressed"]
+        result["muted"] = outcome["muted"]
 
         if fresh:
             body = (
@@ -640,23 +530,16 @@ class FlowHealthActivities:
                     "FROM llm_calls WHERE purpose = '<purpose>' "
                     "ORDER BY created_at DESC LIMIT 10;"
                 )
-            body += (
-                f"\nSilence one: INSERT INTO alert_mutes (mute_key, muted_until) "
-                f"VALUES ('{MUTE_PREFIX}<subject>', now() + interval '2 days');"
-            )
+            body += "\n" + mute_hint([f["problem_id"] for f in fresh])
             await safe_send_message(
                 self.delivery,
                 agent_id=agent_id,
                 message=_card(f"[FLOW] {len(fresh)} unhealthy flow(s)", body),
                 log_event="flow_health_notify_failed",
             )
-            await self._audit(ALERT_ACTION, fresh)
             result["alerted"] = len(fresh)
 
-        # Recovery: previously alerted and no longer detected as unhealthy.
-        # Writing the recovery row is what re-arms dedup, so this is both the
-        # operator-visible signal AND the reason the next break alerts again.
-        recovered = sorted(open_subjects - set(subjects))
+        recovered = sorted(r["subject"] for r in outcome["resolved"])
         if recovered:
             await safe_send_message(
                 self.delivery,
@@ -668,22 +551,6 @@ class FlowHealthActivities:
                 ),
                 log_event="flow_health_recovery_notify_failed",
             )
-            await self._audit(
-                RECOVERY_ACTION, [{"subject": s, "kind": "recovered"} for s in recovered]
-            )
             result["recovered"] = len(recovered)
 
         return result
-
-    async def _audit(self, action: str, findings: list[dict]) -> None:
-        from aegis.observability import log_audit
-
-        for f in findings:
-            await log_audit(
-                self.db_pool,
-                actor=ACTOR,
-                action=action,
-                target_type=TARGET_TYPE,
-                target_id=str(f["subject"]),
-                details={k: v for k, v in f.items() if k != "subject"},
-            )

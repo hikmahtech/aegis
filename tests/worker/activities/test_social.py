@@ -12,12 +12,10 @@ import respx
 from aegis.config import Settings
 from aegis.connectors.social import SocialConnector
 from aegis.crypto import decrypt_secret, encrypt_secret
+from aegis.services.hub import mute_problem
 from aegis_worker.activities.delivery import DeliveryActivities
 from aegis_worker.activities.social import (
     CLOSE_ACTION,
-    STUCK_ALERT_ACTION,
-    STUCK_MUTE_PREFIX,
-    STUCK_RECOVERY_ACTION,
     SocialActivities,
     _normalize_link,
 )
@@ -1369,10 +1367,9 @@ async def stuck_env(social_env):
 
     async def _clean(conn):
         await conn.execute(
-            "DELETE FROM audit_log WHERE actor = 'social-stuck-watchdog' "
-            "AND target_id LIKE 'zzsa-%'"
+            "UPDATE problems SET status = 'closed', closed_at = now() "
+            "WHERE subject_kind = 'post' AND subject LIKE 'zzsa-%' AND closed_at IS NULL"
         )
-        await conn.execute("DELETE FROM alert_mutes WHERE mute_key LIKE 'social-stuck:zzsa-%'")
 
     async with social_env.acquire() as conn:
         await _clean(conn)
@@ -1922,31 +1919,30 @@ async def test_find_stuck_posts_without_pool_returns_empty():
 
 async def test_stuck_alert_fires_once_not_on_every_sweep(stuck_env):
     """THE dedup property, as a count. Twenty sweeps of the same stuck post
-    must produce exactly one card and exactly one audit row."""
+    must produce exactly one card and exactly one open problem."""
     delivery = _FakeDelivery()
     act = SocialActivities(db_pool=stuck_env, delivery=delivery)
     env = ActivityEnvironment()
     results = [
-        await env.run(act.report_stuck_posts, [_finding()], "sebas", 168, 720) for _ in range(20)
+        await env.run(act.report_stuck_posts, [_finding()], "sebas") for _ in range(20)
     ]
     assert sum(r["alerted"] for r in results) == 1
     assert sum(r["deduped"] for r in results) == 19
     assert len(delivery.sent) == 1
     assert (
         await stuck_env.fetchval(
-            "SELECT count(*) FROM audit_log WHERE action = $1 AND target_id = $2",
-            STUCK_ALERT_ACTION,
-            "zzsa-pz-1",
+            "SELECT count(*) FROM problems WHERE subject = 'zzsa-pz-1' AND closed_at IS NULL"
         )
         == 1
     )
+    assert "UPDATE problems SET muted_until" in delivery.sent[0]
 
 
 async def test_stuck_alert_card_names_the_post_and_its_state(stuck_env):
     delivery = _FakeDelivery()
     act = SocialActivities(db_pool=stuck_env, delivery=delivery)
     await ActivityEnvironment().run(
-        act.report_stuck_posts, [_finding("zzsa-pz-card", state="unknown")], "sebas", 168, 720
+        act.report_stuck_posts, [_finding("zzsa-pz-card", state="unknown")], "sebas"
     )
     assert len(delivery.sent) == 1
     card = delivery.sent[0]
@@ -1972,8 +1968,6 @@ async def test_stuck_card_shows_postiz_publish_date_beside_what_aegis_asked_for(
             )
         ],
         "sebas",
-        168,
-        720,
     )
     card = delivery.sent[0]
     assert "2026-08-03T05:30:00+00:00" in card  # Postiz's authoritative time
@@ -1990,64 +1984,42 @@ async def test_stuck_card_says_so_when_postiz_returned_no_publish_date(stuck_env
         act.report_stuck_posts,
         [_finding("zzsa-pz-nopub", state="unknown", postiz_publish_date=None)],
         "sebas",
-        168,
-        720,
     )
     card = delivery.sent[0]
     assert "2026-07-30T07:30:00+00:00" in card
     assert "no publishDate" in card
 
 
-async def test_stuck_dedup_expires_after_the_window(stuck_env):
-    """The dedup is time-bounded, not permanent: a post still stuck after
-    `dedup_hours` gets one more nag."""
-    act = SocialActivities(db_pool=stuck_env, delivery=_FakeDelivery())
-    env = ActivityEnvironment()
-    first = await env.run(act.report_stuck_posts, [_finding()], "sebas", 168, 720)
-    assert first["alerted"] == 1
-    async with stuck_env.acquire() as conn:
-        await conn.execute(
-            "UPDATE audit_log SET created_at = now() - interval '169 hours' "
-            "WHERE action = $1 AND target_id = $2",
-            STUCK_ALERT_ACTION,
-            "zzsa-pz-1",
-        )
-    again = await env.run(act.report_stuck_posts, [_finding()], "sebas", 168, 720)
-    assert (again["alerted"], again["deduped"]) == (1, 0)
-
-
 async def test_stuck_recovery_notifies_and_re_arms_dedup(stuck_env):
     """A post that finally publishes drops out of findings: that sends the
-    recovery card, and the recovery audit row is what lets the SAME post alert
-    again if it gets stuck a second time inside the dedup window."""
+    recovery card and resolves the problem, which is what lets the SAME post
+    alert again if it gets stuck a second time."""
     delivery = _FakeDelivery()
     act = SocialActivities(db_pool=stuck_env, delivery=delivery)
     env = ActivityEnvironment()
-    first = await env.run(act.report_stuck_posts, [_finding()], "sebas", 168, 720)
+    first = await env.run(act.report_stuck_posts, [_finding()], "sebas")
     assert first["alerted"] == 1
 
-    recovered = await env.run(act.report_stuck_posts, [], "sebas", 168, 720)
+    recovered = await env.run(act.report_stuck_posts, [], "sebas")
     assert recovered == {"alerted": 0, "deduped": 0, "muted": 0, "recovered": 1}
     assert (
         await stuck_env.fetchval(
-            "SELECT count(*) FROM audit_log WHERE action = $1 AND target_id = $2",
-            STUCK_RECOVERY_ACTION,
-            "zzsa-pz-1",
+            "SELECT status FROM problems WHERE subject = 'zzsa-pz-1' AND closed_at IS NULL"
         )
-        == 1
+        == "resolved"
     )
     assert "1 post(s) published" in delivery.sent[-1]
 
-    again = await env.run(act.report_stuck_posts, [_finding()], "sebas", 168, 720)
+    again = await env.run(act.report_stuck_posts, [_finding()], "sebas")
     assert (again["alerted"], again["deduped"]) == (1, 0)
     # ...and having re-alerted, it is deduped again.
-    quiet = await env.run(act.report_stuck_posts, [_finding()], "sebas", 168, 720)
+    quiet = await env.run(act.report_stuck_posts, [_finding()], "sebas")
     assert quiet == {"alerted": 0, "deduped": 1, "muted": 0, "recovered": 0}
 
 
 async def test_stuck_recovery_is_silent_when_nothing_was_ever_alerted(stuck_env):
     act = SocialActivities(db_pool=stuck_env, delivery=_FakeDelivery())
-    assert await ActivityEnvironment().run(act.report_stuck_posts, [], "sebas", 168, 720) == {
+    assert await ActivityEnvironment().run(act.report_stuck_posts, [], "sebas") == {
         "alerted": 0,
         "deduped": 0,
         "muted": 0,
@@ -2055,58 +2027,42 @@ async def test_stuck_recovery_is_silent_when_nothing_was_ever_alerted(stuck_env)
     }
 
 
-async def test_active_mute_suppresses_the_stuck_alert(stuck_env):
-    """Guard independence #1: the mute alone must suppress, with an empty
-    audit_log so dedup cannot be what did it."""
-    async with stuck_env.acquire() as conn:
-        await conn.execute(
-            "INSERT INTO alert_mutes (mute_key, muted_until) VALUES ($1, now() + interval '1 day')",
-            STUCK_MUTE_PREFIX + "zzsa-pz-1",
-        )
+async def test_a_muted_problem_suppresses_the_stuck_alert(stuck_env):
+    """Muting is a property of the problem: a muted post that publishes and
+    gets stuck again inside the mute is counted, never carded."""
     delivery = _FakeDelivery()
     act = SocialActivities(db_pool=stuck_env, delivery=delivery)
-    r = await ActivityEnvironment().run(act.report_stuck_posts, [_finding()], "sebas", 168, 720)
+    env = ActivityEnvironment()
+    assert (await env.run(act.report_stuck_posts, [_finding()], "sebas"))["alerted"] == 1
+    pid = await stuck_env.fetchval(
+        "SELECT id::text FROM problems WHERE subject = 'zzsa-pz-1' AND closed_at IS NULL"
+    )
+    await mute_problem(stuck_env, pid, hours=24, by="test")
+    await env.run(act.report_stuck_posts, [], "sebas")
+    r = await env.run(act.report_stuck_posts, [_finding()], "sebas")
     assert r == {"alerted": 0, "deduped": 0, "muted": 1, "recovered": 0}
-    assert delivery.sent == []
-
-
-async def test_expired_mute_does_not_suppress_the_stuck_alert(stuck_env):
-    """Guard independence #2: the mute lookup is `muted_until > now()`, not
-    "a row exists" — an expired mute must let the alert through, which also
-    proves the previous test's suppression came from the mute's freshness."""
-    async with stuck_env.acquire() as conn:
-        await conn.execute(
-            "INSERT INTO alert_mutes (mute_key, muted_until) "
-            "VALUES ($1, now() - interval '1 hour')",
-            STUCK_MUTE_PREFIX + "zzsa-pz-1",
-        )
-    act = SocialActivities(db_pool=stuck_env, delivery=_FakeDelivery())
-    r = await ActivityEnvironment().run(act.report_stuck_posts, [_finding()], "sebas", 168, 720)
-    assert r == {"alerted": 1, "deduped": 0, "muted": 0, "recovered": 0}
+    assert len(delivery.sent) == 2
 
 
 async def test_stuck_report_without_pool_is_a_no_op():
     act = SocialActivities(db_pool=None, delivery=_FakeDelivery())
-    r = await ActivityEnvironment().run(act.report_stuck_posts, [_finding()], "sebas", 168, 720)
+    r = await ActivityEnvironment().run(act.report_stuck_posts, [_finding()], "sebas")
     assert r == {"alerted": 0, "deduped": 0, "muted": 0, "recovered": 0}
 
 
-async def test_two_stuck_posts_are_one_card_but_two_audit_rows(stuck_env):
+async def test_two_stuck_posts_are_one_card_but_two_problems(stuck_env):
     delivery = _FakeDelivery()
     act = SocialActivities(db_pool=stuck_env, delivery=delivery)
     r = await ActivityEnvironment().run(
         act.report_stuck_posts,
         [_finding("zzsa-pz-a"), _finding("zzsa-pz-b")],
         "sebas",
-        168,
-        720,
     )
     assert r["alerted"] == 2
     assert len(delivery.sent) == 1
     assert (
         await stuck_env.fetchval(
-            "SELECT count(*) FROM audit_log WHERE action = $1 AND target_id LIKE 'zzsa-pz-%'",
-            STUCK_ALERT_ACTION,
+            "SELECT count(*) FROM problems WHERE subject LIKE 'zzsa-pz-%' AND closed_at IS NULL"
         )
         == 2
     )

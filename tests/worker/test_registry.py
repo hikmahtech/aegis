@@ -332,9 +332,10 @@ def test_module_workflows_is_the_unflagged_registry():
         # HomelabActivities loses record_heartbeat_resolved (−1, homelab
         # flagged). So −4 in every row and one more off the two homelab rows.
         # ...plus HubActivities.verification_delay (+1, unflagged).
-        (True, True, 44, 215),
-        (False, False, 36, 182),
-        (True, False, 40, 200),
+        # PR 4a: HubActivities.ingest_finding (+1, unflagged).
+        (True, True, 44, 216),
+        (False, False, 36, 183),
+        (True, False, 40, 201),
     ],
 )
 def test_real_registration_passes_the_boot_check(homelab, money, flows, activities):

@@ -40,13 +40,8 @@ def _stubs(
         return list(stuck or [])
 
     @activity.defn(name="report_stuck_posts")
-    async def report_stuck_posts(
-        findings: list[dict],
-        agent_id: str = "sebas",
-        dedup_hours: int = 168,
-        recovery_hours: int = 720,
-    ) -> dict:
-        report_calls.append((findings, agent_id, dedup_hours, recovery_hours))
+    async def report_stuck_posts(findings: list[dict], agent_id: str = "sebas") -> dict:
+        report_calls.append((findings, agent_id))
         return {"alerted": len(findings), "deduped": 0, "muted": 0, "recovered": 0}
 
     return [refresh_post_metrics, find_stuck_posts, report_stuck_posts]
@@ -82,14 +77,12 @@ async def test_refresh_then_stuck_check_then_report(temporal_env):
             max_rows=111,
             stuck_after_hours=9,
             max_stuck=7,
-            dedup_hours=48,
-            recovery_hours=99,
         ),
         _stubs(refresh, stuck, report, stuck=found),
     )
     assert refresh == [(21, 60, 111)]
     assert stuck == [(9, 7)]
-    assert report == [(found, "sebas", 48, 99)]
+    assert report == [(found, "sebas")]
     assert result == {
         "refreshed": 3,
         "failed": 1,
@@ -111,7 +104,7 @@ async def test_report_still_runs_with_no_findings_so_recovery_can_fire(temporal_
         SocialMetricsConfig(agent_id="sebas"),
         _stubs(refresh, stuck, report, stuck=[]),
     )
-    assert report == [([], "sebas", 168, 720)]
+    assert report == [([], "sebas")]
     assert result["stuck"] == 0
     assert result["stuck_status"] == "ok"
 

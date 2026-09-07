@@ -28,11 +28,6 @@ _TIMESTAMP_COLUMNS: dict[str, str] = {
     "workflow_runs": "started_at",
     "gtd_clarify_log": "created_at",
     "alert_dedup_index": "last_seen_at",
-    # alert_mutes: `muted_until` is the row's "dead by" timestamp. Once the
-    # mute is past, the row has no remaining purpose, so we prune by it
-    # rather than by created_at (which would keep dead mutes alive for the
-    # full retention window past their actual expiry).
-    "alert_mutes": "muted_until",
     "pending_prs": "created_at",
     # todoist_webhook_events records receipt time as `received_at`, not
     # `created_at` (migration 001).

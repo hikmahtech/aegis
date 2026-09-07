@@ -260,7 +260,6 @@ _EXPANDED_TABLES = [
     "ingest_idempotency",
     "gtd_clarify_log",
     "alert_dedup_index",
-    "alert_mutes",
     "pending_prs",
     "pandoras_actor.homelab_drift",
     "pandoras_actor.cert_expiry",
@@ -291,14 +290,13 @@ def test_agent_profile_revisions_is_actually_prunable():
 def test_expanded_tables_use_correct_timestamp_columns():
     """The timestamp column chosen per table must match the migration:
     workflow_runs → started_at, alert_dedup_index → last_seen_at,
-    alert_mutes → muted_until (dead-by), pandoras_actor.* → detected_at
+    pandoras_actor.* → detected_at
     (homelab_drift) or checked_at (cert_expiry)."""
     expected = {
         "workflow_runs": "started_at",
         "ingest_idempotency": "created_at",
         "gtd_clarify_log": "created_at",
         "alert_dedup_index": "last_seen_at",
-        "alert_mutes": "muted_until",
         "pending_prs": "created_at",
         "pandoras_actor.homelab_drift": "detected_at",
         "pandoras_actor.cert_expiry": "checked_at",
@@ -323,20 +321,6 @@ async def test_prune_uses_started_at_for_workflow_runs():
     assert "DELETE FROM workflow_runs" in sql
     assert "started_at <" in sql
     assert "created_at" not in sql
-
-
-async def test_prune_uses_muted_until_for_alert_mutes():
-    """alert_mutes prunes by `muted_until` so expired mutes drop as soon
-    as they're past, not after the full retention window from creation."""
-    pool = AsyncMock()
-    pool.fetchval = AsyncMock(return_value=True)
-    pool.execute = AsyncMock(return_value="DELETE 0")
-    activities = CleanupActivities(db_pool=pool)
-    env = ActivityEnvironment()
-    await env.run(activities.prune_old_records, {"retentions": {"alert_mutes": 30}})
-    sql = pool.execute.await_args.args[0]
-    assert "DELETE FROM alert_mutes" in sql
-    assert "muted_until <" in sql
 
 
 async def test_prune_handles_schema_qualified_table_names():

@@ -4,7 +4,7 @@ Issue #226. AEGIS alerts richly on *infrastructure* (ServiceDrift, CertRadar,
 InfraHeartbeat, SentryPoll, DeliveryWatchdog) but had nothing watching its own
 flows, so `TodoistSyncFlow` could fail six times in a row (2026-08-02) in total
 silence. Shaped after `DeliveryWatchdogFlow`: cheap detect activity, cheap
-notify activity, everything deduped so a sustained fault is one alert.
+notify activity; the problem hub dedupes, so a sustained fault is one alert.
 
 Watches every `workflow_type` in `workflow_runs`, not only scheduled ones —
 a child flow (AlertInvestigation, AgentTask) failing every attempt is the same
@@ -58,8 +58,6 @@ class FlowHealthConfig:
     # Floor under the stale threshold so a 2-min schedule does not alert
     # 6 minutes into a worker redeploy.
     min_stale_minutes: int = 60
-    dedup_hours: int = 12
-    recovery_hours: int = 168
     check_stale: bool = True
     # Detector 3 (#321): a purpose whose most recent `llm_consecutive` calls
     # ALL failed. Cadence-independent on purpose — this shipped as "2 calls, 0
@@ -139,12 +137,7 @@ class FlowHealthWatchdogFlow:
         # alerted flow gets its recovery notice.
         report = await workflow.execute_activity_method(
             FlowHealthActivities.report_flow_health,
-            args=[
-                findings,
-                config.agent_id,
-                config.dedup_hours,
-                config.recovery_hours,
-            ],
+            args=[findings, config.agent_id],
             start_to_close_timeout=TIMEOUT_FAST,
             retry_policy=NO_RETRY,
         )

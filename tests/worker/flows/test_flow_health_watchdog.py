@@ -62,13 +62,8 @@ def _make_dead_llm(rows, boom: bool = False):
 
 
 @activity.defn(name="report_flow_health")
-async def stub_report(
-    findings: list[dict],
-    agent_id: str = "pandoras-actor",
-    dedup_hours: int = 12,
-    recovery_hours: int = 168,
-) -> dict:
-    _report_calls.append((findings, agent_id, dedup_hours, recovery_hours))
+async def stub_report(findings: list[dict], agent_id: str = "pandoras-actor") -> dict:
+    _report_calls.append((findings, agent_id))
     return {"alerted": len(findings), "deduped": 0, "muted": 0, "recovered": 0}
 
 
@@ -114,13 +109,13 @@ async def test_every_detector_feeds_one_report():
         "zzwd-type-a",
     ]
     assert len(_report_calls) == 1, "three detectors, still one card"
-    findings, agent_id, dedup_hours, recovery_hours = _report_calls[0]
+    findings, agent_id = _report_calls[0]
     assert [f["subject"] for f in findings] == [
         "zzwd-type-a",
         "zzwd-sched-a",
         "llm-purpose:zzwd-purpose-a",
     ]
-    assert (agent_id, dedup_hours, recovery_hours) == ("pandoras-actor", 12, 168)
+    assert agent_id == "pandoras-actor"
     assert result["alerted"] == 3
 
 
@@ -134,8 +129,6 @@ async def test_config_knobs_reach_the_detectors():
         lookback_hours=9,
         stale_multiplier=7.5,
         min_stale_minutes=11,
-        dedup_hours=5,
-        recovery_hours=13,
         llm_consecutive=6,
         llm_staleness_hours=3,
     )
@@ -143,7 +136,7 @@ async def test_config_knobs_reach_the_detectors():
     assert _failing_calls == [(4, 9)]
     assert _stale_calls == [(7.5, 11)]
     assert _llm_calls == [(6, 3)]
-    assert _report_calls[0][1:] == ("sebas", 5, 13)
+    assert _report_calls[0][1] == "sebas"
 
 
 def test_the_flow_defaults_match_the_detector_defaults():

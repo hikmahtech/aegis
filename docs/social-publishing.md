@@ -128,10 +128,10 @@ them on the row:
   their `schedule_at` with no PUBLISHED confirmation, and `report_stuck_posts` sends
   one `[SOCIAL] N post(s) stuck in Postiz` card carrying the remediation text (a Postiz
   instance showing "0 pollers" needs
-  `docker service update --force <stack>_postiz`). Deduped for `dedup_hours` (168) via
-  `audit_log` `social_stuck_alert`; a `[SOCIAL OK]` recovery notice re-arms it within
-  `recovery_hours` (720). Silence it with an `alert_mutes` row keyed
-  `social-stuck:<subject>`. The watchdog is best-effort — a failure returns
+  `docker service update --force <stack>_postiz`). Deduped by the problem hub: one
+  `stuck_post` problem per Postiz post id, a `[SOCIAL OK]` recovery notice when it
+  finally publishes, and a repeat alert only if it gets stuck again. Silence one by
+  muting its problem. The watchdog is best-effort — a failure returns
   `stuck_status: "check_failed"` rather than taking the metrics refresh down, and
   reporting is **skipped** (not called with an empty list) when detection failed, so a
   detection outage can't fire bogus recovery notices.
