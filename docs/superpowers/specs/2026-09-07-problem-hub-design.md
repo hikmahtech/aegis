@@ -1,7 +1,7 @@
 # Problem hub: one record for every alert, investigation and session
 
 **Date:** 2026-09-07
-**Status:** approved; every code PR shipped (1, 2, 3a, 3b, 4a, 4b, 5a, 5b, 6a, 7). 6b was dropped and 6c (the admin page) rides the operator's UI pass — see §12.
+**Status:** approved; every code PR shipped (1, 2, 3a, 3b, 4a, 4b, 5a, 5b, 6a, 7, 8). 6b was dropped and 6c (the admin page) rides the operator's UI pass — see §12. §12a records what the spec described and the code deliberately does not do.
 
 ## Problem
 
@@ -588,11 +588,31 @@ it replaces, so the tree never carries two ways to do one thing.
 | ~~6b~~ **dropped** | GitHub-issue projection for `repo` subjects. Deferred out of 5b: nothing produces a `repo` subject without a task today (Sentry keys on the service, and a `report_progress` problem already has its task), so the surface would have shipped with no producer — dead code by the programme's own rule. It was then dropped rather than deferred again. The producer never materialised and building one would have been a product decision nobody asked for: an alert's subject is the service, not the repo, and re-keying it on the repo would change every correlation key mid-flight; a `report_progress` problem already owns its Todoist task; and an investigation that names a repo already has Gate 2's "Open PR" and a `github_pr` link for the code half. Filing alert-born defects as GitHub issues automatically is a change to how the operator's day works, not a refactor, so it stays out until asked for. Adding it later is a branch in `hub_project.project` on `subject_kind` plus a `gh issue create` over the existing SSH connector — an afternoon, on top of everything else being in place. | — |
 | 6a | `hub.digest` / `close_resolved` / `list_problems` / `problem_detail`; `HubActivities.build_digest` and `close_resolved_problems`; the nightly close sweep on `CleanupFlow` (`problem_close_days`, default 7); admin routes `GET /api/admin/problems`, `/problems/digest`, `/problems/{id}` and `POST /problems/{id}/mute\|resolve\|close\|merge`, `GET/PUT /api/admin/service-state`, every mutation calling the hub's own transition. Migration 035 drops `settings.alert_digest_buffer`. | `AlertActivities.build_alert_digest`, `accumulate_digest_item`, `_read_digest_buffer` and the four investigation call sites that fed it |
 | 6c | The admin Problems **page** itself (`Problems.tsx`), with the rest of the UI pass the operator asked for at the end of the programme. | — |
+| 8 | What the end-of-programme validation found: a manual problem keyed per TASK rather than per repo (two `@code` tasks in one repo were one problem); a merge no longer replays the duplicate's timeline (a moved `resolve` completed the kept problem's live task); leaving `resolved` clears `resolved_at` and reopens the task; the admin close button closes ONE problem; the duplicate claim is read under the advisory lock; `ingest_alert` is idempotent across a Temporal retry (a retried heartbeat ingest used to cost the alert its investigation); `stale_stuck_problems` filters by class and skips `waiting_human`; the events route 400s on a malformed `problem_id`; the projection sweep gets a budget it can finish in. | `problems.github_issue` (no writer since 6b was dropped, migration 036), the heartbeat state's dead `confirmed_at` / `reinvestigated_at` clocks, `hub.find_open_problem` |
 | 7 | The `SessionStart` / `Stop` hook script and its wiring, documented in `docs/infrastructure.md` (it lives in the operator's dotfiles, not this repo); the rollout runbook with its ordering and verification queries; `docs/architecture/overview.md` and `docs/how-it-works.md` brought up to date. | — |
 
 PR 3 is the large one, so it ships as 3a (the projector, dark) and 3b (the
 producers and the investigation flow, which is where the deletions happen).
 Together they close #341 and the remainder of #279.
+
+### 12a. What the spec described and the code does not do
+
+Written at the end of the programme, from a full audit of the shipped diff
+against this document. Each of these is a deliberate omission, not an
+oversight found later — but none of them was written down at the time, which
+is the actual failure this section fixes.
+
+| Spec said | Shipped | Why |
+|---|---|---|
+| §6: a problem projects only once it passes an attention `threshold_for_class` (default 1, `flow_stale` 2) | No threshold. Projection gates on status and mute only, so every open problem earns a task on its first occurrence. | The classes that would have used a threshold above 1 got recovery semantics instead (`hub_watch.reconcile_findings` resolves a finding that goes away), which removes the noise the threshold existed to remove. A threshold on top would delay a real outage's task for no gain. |
+| §3: a `''`-key event gets a balanced-tier "possibly the same as" suggestion, written as a `problem_links(kind='problem')` row | Not built. An uncorrelated event creates. | The suggestion is only useful if someone reads it, and the surface that would show it is the admin page, which is not built either. Creating is the safe default the spec itself argues for, and `merge_problems` undoes a duplicate by hand. |
+| Files touched: `collapse_window`, `reopen_window`, per-class `verify_seconds` and thresholds as `activities.config` on the hub sweep row | Python constants (`REOPEN_WINDOW`, `_VERIFY_SECONDS`, `COLLAPSE_WINDOW`) | They describe what an outage is rather than what an operator prefers, and no deployment has wanted a different value. Moving one to config is a two-line change when one does. |
+| §8: `pending_prs` gains a `problem_id` column; `alert_fingerprint` stays one release | `pending_prs` unchanged, still keyed on `alert_fingerprint` | The staging path never needed the problem: `record_investigation` already links a staged PR to its problem through `payload.pr_urls`. Adding a column to key on would have been a second identity for the same thing. |
+| §8: the heartbeat's `escalate` flag becomes `severity='critical'` on the event and the flow reads it from the problem | `escalate` still travels on the alert dict; every heartbeat alert is already `severity='critical'` | Severity and escalation turned out to be different questions — every heartbeat alert is critical, but only some escalate — so collapsing them would have lost the distinction the gate-2 race depends on. |
+| §8: "`ingest_event` starts the flow as an abandoned child" | The producer starts it, on `IngestResult.investigate` | Only a workflow can start a child workflow; `ingest_event` is a service function called from activities and from Core. The hub still DECIDES; it just cannot be the one to start. Recorded in `CLAUDE.md` and §12's PR 3b row from the start, but §8's own text was never corrected. |
+| §7: `report_progress` takes `account` from the mount's identity and `host` from the connection | Both are caller-supplied; `account` defaults to the literal `"operator"` | The MCP mount authenticates an agent, not a login: it does not know which `CLAUDE_CONFIG_DIR` the caller runs under. The session hook sends it instead (`docs/infrastructure.md`), which is the only place that actually knows. |
+
+One correction to §12 itself: the 4a row says "migration 032 drops `alert_mutes`". It is `033_drop_alert_mutes.sql` — 032 was taken by a parallel PR. §1 and the files table already say 033.
 
 ### 13. Rollout
 

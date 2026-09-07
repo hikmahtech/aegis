@@ -67,8 +67,8 @@ async def _ingest(alert: dict, resolved: bool = False) -> dict:
 
 
 @activity.defn(name="stale_stuck_problems")
-async def _stale(subjects: list[str], hours: float) -> list[dict]:
-    _calls.setdefault("stale_queries", []).append((list(subjects), hours))
+async def _stale(subjects: list[str], hours: float, classes: list[str] | None = None) -> list[dict]:
+    _calls.setdefault("stale_queries", []).append((list(subjects), hours, list(classes or [])))
     return [r for r in _state.get("stale", []) if r["subject"] in subjects]
 
 
@@ -350,7 +350,12 @@ async def test_stale_stuck_service_is_reinvestigated_on_its_own_problem():
     _state["stale"] = [{"id": "prob-old", "subject": svc, "hours": 30.0}]
     result = await _run()
     assert result["services_reinvestigated"] == 1
-    assert _calls["stale_queries"] == [([svc], 24.0)]
+    assert _calls["stale_queries"] == [
+        ([svc], 24.0, ["dockerservicedown", "servicedownprolonged"])
+    ], (
+        "the classes are the question: without them the same subject's unrelated "
+        "problems came back and were re-investigated as still stuck"
+    )
     assert len(_calls["spawned"]) == 1
     alert = _calls["spawned"][0]
     assert alert["labels"]["alertname"] == "ServiceDownProlonged"
@@ -370,7 +375,12 @@ async def test_hub_says_nothing_is_stale_so_nothing_is_reinvestigated():
     _reset(collect, prior)
     result = await _run()
     assert result["services_reinvestigated"] == 0
-    assert _calls["stale_queries"] == [([svc], 24.0)]
+    assert _calls["stale_queries"] == [
+        ([svc], 24.0, ["dockerservicedown", "servicedownprolonged"])
+    ], (
+        "the classes are the question: without them the same subject's unrelated "
+        "problems came back and were re-investigated as still stuck"
+    )
     assert _calls["spawned"] == []
 
 

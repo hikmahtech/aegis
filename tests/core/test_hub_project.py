@@ -14,7 +14,13 @@ import pytest
 import pytest_asyncio
 from aegis.connectors.todoist import TodoistConnector
 from aegis.services import hub_project, work_sessions
-from aegis.services.hub import Event, get_problem, ingest_event, set_service_state
+from aegis.services.hub import (
+    Event,
+    get_problem,
+    ingest_event,
+    merge_problems,
+    set_service_state,
+)
 from aegis.services.hub_project import (
     COLLAPSE_WINDOW,
     FOOTER,
@@ -617,3 +623,35 @@ async def test_a_pending_description_update_is_superseded_not_dropped(db_pool, i
         f"problem-desc-{task}",
     )
     assert "seen 3×" in (desc or ""), "the queued row carries the newest block"
+
+
+# --- a merge does not replay the duplicate's history (PR 8) --------------------
+
+
+async def test_merging_a_resolved_duplicate_does_not_close_the_kept_task(db_pool, inbox, todoist):
+    """The merged problem's events move to the kept one. They are history:
+    replaying them posted the duplicate's whole timeline as comments, and a
+    moved `resolve` completed the kept problem's task while the problem was
+    still open.
+
+    Falsifiable: drop the watermark bump in `merge_problems` and the kept task
+    is completed by the next projection.
+    """
+    keep = await ingest_event(db_pool, _occ(_subject(), 1), now=NOW)
+    keep_task = (await project(db_pool, keep.problem_id, now=NOW))["task_id"]
+    await _mirror_task(db_pool, keep_task)
+
+    dup_subject = _subject()
+    dup = await ingest_event(db_pool, _occ(dup_subject, 1), now=NOW)
+    await ingest_event(db_pool, _resolved(dup_subject, 2), now=NOW)
+    assert (await get_problem(db_pool, dup.problem_id))["status"] == "resolved"
+
+    await merge_problems(db_pool, keep.problem_id, dup.problem_id, by="admin", now=NOW)
+    out = await project(db_pool, keep.problem_id, now=NOW + timedelta(minutes=1))
+
+    assert out["comments"] == 0, "the duplicate's timeline is history, not news"
+    assert (
+        await db_pool.fetchval("SELECT is_completed FROM todoist_tasks WHERE id = $1", keep_task)
+        is False
+    ), "the kept problem is open; its task must stay open"
+    assert (await get_problem(db_pool, keep.problem_id))["status"] == "open"

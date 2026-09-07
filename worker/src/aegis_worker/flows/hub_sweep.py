@@ -16,7 +16,7 @@ from temporalio import workflow
 
 with workflow.unsafe.imports_passed_through():
     from aegis_worker.activities.hub import HubActivities
-    from aegis_worker.shared.retry import FAST, NO_RETRY, TIMEOUT_FAST, TIMEOUT_STANDARD
+    from aegis_worker.shared.retry import FAST, NO_RETRY, TIMEOUT_FAST, TIMEOUT_LONG
 
 
 @dataclass
@@ -38,7 +38,11 @@ class HubSweepFlow:
         # post is retried here.
         projected = await workflow.execute_activity_method(
             HubActivities.project_pending,
-            start_to_close_timeout=TIMEOUT_STANDARD,
+            # LONG, not STANDARD: a sweep can project up to 50 problems, each
+            # one or more Todoist calls with a 10s connector timeout, so a slow
+            # Todoist used to time the activity out — and with NO_RETRY that
+            # failed the whole sweep every five minutes.
+            start_to_close_timeout=TIMEOUT_LONG,
             retry_policy=NO_RETRY,
         )
         return {

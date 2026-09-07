@@ -15,13 +15,15 @@ from __future__ import annotations
 
 from typing import Any
 
+import structlog
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
 
 from aegis.api.auth import verify_auth
 from aegis.observability import log_audit
+from aegis.services import hub_project
 from aegis.services.hub import (
-    close_resolved,
+    close_problem,
     digest,
     list_problems,
     list_service_states,
@@ -31,6 +33,8 @@ from aegis.services.hub import (
     set_service_state,
     set_status,
 )
+
+logger = structlog.get_logger()
 
 router = APIRouter(prefix="/api/admin", dependencies=[Depends(verify_auth)], tags=["problems"])
 
@@ -142,12 +146,21 @@ async def post_resolve(request: Request, problem_id: str, body: CloseBody) -> di
 @router.post("/problems/{problem_id}/close")
 async def post_close(request: Request, problem_id: str) -> dict[str, Any]:
     """Close a resolved problem now instead of waiting for the nightly sweep,
-    which frees its correlation key for a genuinely new problem."""
-    closed = await close_resolved(_pool(request), days=0, limit=500)
-    if problem_id not in closed:
-        raise HTTPException(status_code=409, detail="problem_not_resolved")
-    await _audit(request, "problem_closed", problem_id, {"also_closed": len(closed) - 1})
-    return {"problem_id": problem_id, "closed": True, "also_closed": len(closed) - 1}
+    which frees its correlation key for a genuinely new problem.
+
+    Projected first, and only this problem: a closed problem is never
+    projected again, so closing one whose resolution has not reached its task
+    yet would leave that task open for ever with no closing comment.
+    """
+    pool = _pool(request)
+    try:
+        await hub_project.project(pool, problem_id)
+    except Exception as exc:  # noqa: BLE001 — Todoist being down must not block the close
+        logger.warning("problem_close_project_failed", problem_id=problem_id, error=str(exc)[:200])
+    if not await close_problem(pool, problem_id):
+        raise HTTPException(status_code=409, detail="problem_not_found_or_not_resolved")
+    await _audit(request, "problem_closed", problem_id, {})
+    return {"problem_id": problem_id, "closed": True}
 
 
 @router.post("/problems/{problem_id}/merge")

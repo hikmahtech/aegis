@@ -22,8 +22,9 @@ Three rules the rest of the codebase relies on:
   "duplicate" forever.
 * **Attaching to the wrong problem hides an outage; creating a duplicate is
   recoverable.** So every doubt resolves to "create": an event with no class
-  and no subject gets an empty key and is never auto-attached, and the fuzzy
-  (LLM) match the spec describes only ever *suggests* (PR 5).
+  and no subject gets an empty key and is never auto-attached. The fuzzy
+  (LLM) "possibly the same as" match the spec sketched was never built: an
+  unmatched key creates, and a wrong duplicate is merged by hand.
 
 Core and the worker both import this module (the worker already imports
 ``aegis.services.*``), so the two packages cannot drift on what a problem is.
@@ -42,8 +43,10 @@ import structlog
 logger = structlog.get_logger()
 
 # An occurrence within this long after a problem resolved reopens it; one
-# after it closes the old problem and starts a new one linked to it. Becomes
-# an `activities.config` key on the hub sweep row in PR 6.
+# after it closes the old problem and starts a new one linked to it. A
+# constant on purpose: it describes what an outage IS rather than an operator
+# preference, and no deployment has wanted a different one. It becomes an
+# `activities.config` key on the hub sweep row when one does.
 REOPEN_WINDOW = timedelta(hours=24)
 
 # Closed vocabularies. A producer outside these is a wiring mistake, and the
@@ -296,7 +299,7 @@ async def get_problem(pool: asyncpg.Pool, problem_id: str) -> dict[str, Any] | N
     row = await pool.fetchrow(
         "SELECT id::text AS id, correlation_key, class, subject, subject_kind, title, "
         "severity, status, first_seen_at, last_seen_at, occurrences, muted_until, "
-        "resolved_at, closed_at, todoist_task_id, github_issue, metadata "
+        "resolved_at, closed_at, todoist_task_id, metadata "
         "FROM problems WHERE id = $1::uuid",
         problem_id,
     )
@@ -335,6 +338,13 @@ async def ingest_event(
     severity = normalize_severity(event.severity)
 
     async with pool.acquire() as conn, conn.transaction():
+        # The lock comes FIRST, and the duplicate claim is read under it.
+        # Checked before the lock, two simultaneous deliveries of one event
+        # both saw "not a duplicate", then serialised here and both counted an
+        # occurrence — while the second event insert silently did nothing. A
+        # retry was always safe; concurrent delivery was not.
+        if key and not event.problem_id:
+            await conn.execute("SELECT pg_advisory_xact_lock(hashtext($1))", key)
         dup = await conn.fetchval(
             "SELECT problem_id::text FROM problem_events WHERE source = $1 AND external_id = $2",
             event.source,
@@ -351,7 +361,6 @@ async def ingest_event(
             )
             current = dict(current) if current else None
         elif key:
-            await conn.execute("SELECT pg_advisory_xact_lock(hashtext($1))", key)
             current = await conn.fetchrow(
                 "SELECT id::text AS id, status, resolved_at, muted_until, occurrences "
                 "FROM problems WHERE correlation_key = $1 AND closed_at IS NULL FOR UPDATE",
@@ -361,11 +370,16 @@ async def ingest_event(
         else:
             current = None
 
+        # The kind a new problem is STORED with, so the suppression lookup and
+        # the sweep that promotes it later ask the same question. They used to
+        # differ for a subject-less event ("service" here, "" in the row),
+        # which let a window suppress an occurrence that the next sweep then
+        # promoted while the window was still in force.
+        subject_slug = _slug(event.subject)
+        kind_slug = _slug(event.subject_kind) or ("service" if subject_slug else "")
         suppression = None
         if event.kind == "occurrence":
-            suppression = await _active_suppression(
-                conn, _slug(event.subject), _slug(event.subject_kind) or "service", now
-            )
+            suppression = await _active_suppression(conn, subject_slug, kind_slug, now)
         d = decide(current, event.kind, now=now, suppressed=suppression is not None)
         if d.action == "ignore":
             return IngestResult(None, "ignored", key)
@@ -392,8 +406,8 @@ async def ingest_event(
                 "VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $8, 1) RETURNING id::text",
                 key,
                 _slug(event.klass) or "manual",
-                _slug(event.subject),
-                _slug(event.subject_kind) or ("service" if _slug(event.subject) else ""),
+                subject_slug,
+                kind_slug,
                 event.title.strip()[:500],
                 severity,
                 d.status,
@@ -594,12 +608,23 @@ async def clear_converged_deploys(
 
 
 async def stale_open_problems(
-    pool: asyncpg.Pool, subjects: list[str], *, hours: float, now: datetime | None = None
+    pool: asyncpg.Pool,
+    subjects: list[str],
+    *,
+    hours: float,
+    classes: list[str] | None = None,
+    now: datetime | None = None,
 ) -> list[dict[str, Any]]:
     """Live problems on ``subjects`` first seen more than ``hours`` ago with no
     `investigation` event in that long: due for a re-investigation. The
     heartbeat asks this for the services it still sees stuck, which replaces
-    the per-service clocks it used to keep in a settings row."""
+    the per-service clocks it used to keep in a settings row.
+
+    ``classes`` narrows it to the kinds of problem the caller means. Without
+    it the subject alone matched, so a heartbeat asking about a stuck service
+    also got back that service's unrelated memory alert and re-investigated
+    it as "still stuck" — and a `waiting_human` problem sitting on an open
+    gate card was re-investigated underneath the person answering it."""
     if not subjects:
         return []
     now = now or _utcnow()
@@ -608,12 +633,17 @@ async def stale_open_problems(
         "SELECT p.id::text AS id, p.subject, p.class, p.first_seen_at, p.occurrences "
         "FROM problems p WHERE p.closed_at IS NULL AND p.status = ANY($3::text[]) "
         "  AND p.subject = ANY($1::text[]) AND p.first_seen_at < $2 "
+        "  AND ($4::text[] IS NULL OR p.class = ANY($4::text[])) "
         "  AND NOT EXISTS (SELECT 1 FROM problem_events e WHERE e.problem_id = p.id "
         "                  AND e.kind = 'investigation' AND e.occurred_at >= $2) "
         "ORDER BY p.first_seen_at",
         subjects,
         cutoff,
-        sorted(LIVE_STATUSES - {"suppressed"}),
+        # `waiting_human` is excluded with `suppressed`: a problem sitting on
+        # an open gate card is waiting for a person, not for another
+        # investigation to talk over them.
+        sorted(LIVE_STATUSES - {"suppressed", "waiting_human"}),
+        [_slug(c) for c in classes] if classes else None,
     )
     return [
         {**dict(r), "hours": round((now - _aware(r["first_seen_at"], now)).total_seconds() / 3600, 1)}
@@ -679,13 +709,23 @@ async def set_status(
         )
         if row is None or row["status"] == status:
             return False
+        # Coming BACK from `resolved` is a reopen: the stale `resolved_at` has
+        # to go, or `close_resolved` never retires the problem and the
+        # projector leaves its task completed while the problem is live again.
+        # The event says `reopen` so the projector uncompletes the task — an
+        # investigation that reports `fixing` after the alert cleared used to
+        # leave a closed task on an open problem, and the next occurrence
+        # attached to it in silence.
+        reopening = row["status"] == "resolved" and status in LIVE_STATUSES
         await conn.execute(
             "UPDATE problems SET status = $2, "
-            "resolved_at = CASE WHEN $2 = 'resolved' THEN $3 ELSE resolved_at END "
+            "resolved_at = CASE WHEN $2 = 'resolved' THEN $3 WHEN $4 THEN NULL "
+            "ELSE resolved_at END "
             "WHERE id = $1::uuid",
             problem_id,
             status,
             now,
+            reopening,
         )
         await conn.execute(
             "INSERT INTO problem_events (problem_id, source, external_id, kind, severity, "
@@ -694,7 +734,11 @@ async def set_status(
             problem_id,
             f"{source}:{problem_id}:{status}:{now.isoformat()}",
             row["severity"],
-            {"action": "set_status", "status": status, "reason": reason[:300]},
+            {
+                "action": "reopen" if reopening else "set_status",
+                "status": status,
+                "reason": reason[:300],
+            },
             now,
         )
     logger.info("hub_status_set", problem_id=problem_id, status=status, reason=reason[:80])
@@ -744,6 +788,7 @@ def event_from_alert(
     *,
     occurred_at: datetime,
     resolved: bool = False,
+    occurrence_key: str = "",
 ) -> Event:
     """Translate the alert dict every current producer builds (alertmanager,
     grafana, sentry, heartbeat, clarify's synthetic alerts) into an
@@ -793,7 +838,13 @@ def event_from_alert(
         stamp = str(raw.get("lastSeen") or raw.get("firstSeen") or occurred_at.isoformat())
     else:
         stamp = str(raw.get("endsAt" if resolved else "startsAt") or occurred_at.isoformat())
-    external_id = f"{fingerprint or _slug(str(alert.get('title') or 'alert'))}@{stamp}"
+    # `occurrence_key` is for a caller that has a stamp of its own which
+    # survives a retry. Alertmanager and Sentry payloads carry one
+    # (`startsAt`, `lastSeen`); a heartbeat or a synthetic alert does not, so
+    # without this the wall clock went into the id and a RETRIED ingest minted
+    # a second occurrence — which attaches instead of creating, answers
+    # `investigate=False`, and silently costs the alert its investigation.
+    external_id = f"{fingerprint or _slug(str(alert.get('title') or 'alert'))}@{occurrence_key or stamp}"
     if resolved:
         external_id += "@resolved"
     return Event(
@@ -881,6 +932,21 @@ async def merge_problems(
             "UPDATE problem_events SET problem_id = $1::uuid WHERE problem_id = $2::uuid",
             keep_id,
             merge_id,
+        )
+        # The moved events are HISTORY, not news. Without moving the kept
+        # problem's watermark past them, the next projection replays the
+        # duplicate's whole timeline as comments — and a moved `resolve`
+        # completes the kept problem's task while the problem is still open.
+        latest = await conn.fetchval(
+            "SELECT COALESCE(max(id), 0) FROM problem_events WHERE problem_id = $1::uuid",
+            keep_id,
+        )
+        await conn.execute(
+            "UPDATE problems SET metadata = jsonb_set(metadata, '{projected_event_id}', "
+            "to_jsonb(GREATEST(COALESCE((metadata->>'projected_event_id')::bigint, 0), $2::bigint))) "
+            "WHERE id = $1::uuid",
+            keep_id,
+            int(latest or 0),
         )
         # The merged task stays the merged problem's (the caller retires it);
         # everything else the merged problem pointed at now hangs off the kept
@@ -1037,6 +1103,43 @@ async def close_resolved(
     return ids
 
 
+async def close_problem(
+    pool: asyncpg.Pool, problem_id: str, *, now: datetime | None = None
+) -> bool:
+    """Close ONE resolved problem. False when it is missing, already closed, or
+    not resolved.
+
+    The admin panel's close button used to call ``close_resolved(days=0)``,
+    which closes every resolved problem in the database — including ones whose
+    resolution has not been projected yet, and a closed problem is never
+    projected again, so their tasks were left open with no closing comment.
+    """
+    now = now or _utcnow()
+    async with pool.acquire() as conn, conn.transaction():
+        row = await conn.fetchrow(
+            "SELECT status FROM problems WHERE id = $1::uuid AND closed_at IS NULL FOR UPDATE",
+            problem_id,
+        )
+        if row is None or row["status"] != "resolved":
+            return False
+        await conn.execute(
+            "UPDATE problems SET status = 'closed', closed_at = $2 WHERE id = $1::uuid",
+            problem_id,
+            now,
+        )
+        await conn.execute(
+            "INSERT INTO problem_events (problem_id, source, external_id, kind, severity, "
+            "payload, occurred_at) VALUES ($1::uuid, 'hub', $2, 'state_change', 'info', $3, $4) "
+            "ON CONFLICT (source, external_id) DO NOTHING",
+            problem_id,
+            f"close:{problem_id}:{now.isoformat()}",
+            {"action": "close", "reason": "closed by hand"},
+            now,
+        )
+    logger.info("hub_problem_closed", problem_id=problem_id)
+    return True
+
+
 async def list_problems(
     pool: asyncpg.Pool,
     *,
@@ -1060,7 +1163,7 @@ async def list_problems(
     rows = await pool.fetch(
         "SELECT p.id::text AS id, p.correlation_key, p.class, p.subject, p.subject_kind, "
         "       p.title, p.severity, p.status, p.first_seen_at, p.last_seen_at, p.occurrences, "
-        "       p.muted_until, p.resolved_at, p.closed_at, p.todoist_task_id, p.github_issue "
+        "       p.muted_until, p.resolved_at, p.closed_at, p.todoist_task_id "
         f"FROM problems p WHERE {' AND '.join(where)} "
         f"ORDER BY p.last_seen_at DESC LIMIT ${len(args) - 1} OFFSET ${len(args)}",
         *args,

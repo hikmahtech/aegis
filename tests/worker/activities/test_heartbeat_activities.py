@@ -50,25 +50,30 @@ async def test_read_heartbeat_state_defaults_when_unset():
         "nodes": {},
         "stuck": [],
         "confirmed": [],
-        "confirmed_at": {},
-        "reinvestigated_at": {},
         "fail_count": 0,
     }
 
 
 @pytest.mark.asyncio
-async def test_read_heartbeat_state_backfills_clocks_missing_from_a_pre_138_row():
-    """A state row written before #138 has no confirmed_at/reinvestigated_at.
-    The default-merge must supply them, or the flow KeyErrors on the first tick
-    after deploy."""
+async def test_read_heartbeat_state_keeps_a_row_that_still_carries_the_old_clocks():
+    """The per-service `confirmed_at` / `reinvestigated_at` clocks behind the
+    #138 re-investigate path are gone — the hub answers that question now
+    (`stale_stuck_problems`). A state row still carrying them must read back
+    without complaint; the extra keys simply go unread."""
     pool = AsyncMock()
     pool.fetchrow.return_value = {
-        "value": {"nodes": {"baa": "Ready"}, "stuck": ["a"], "confirmed": ["a"], "fail_count": 0}
+        "value": {
+            "nodes": {"baa": "Ready"},
+            "stuck": ["a"],
+            "confirmed": ["a"],
+            "confirmed_at": {"a": "2026-09-01T00:00:00+00:00"},
+            "reinvestigated_at": {},
+            "fail_count": 0,
+        }
     }
     state = await _act(db_pool=pool).read_heartbeat_state()
-    assert state["confirmed_at"] == {}
-    assert state["reinvestigated_at"] == {}
-    assert state["confirmed"] == ["a"]
+    assert state["confirmed"] == ["a"] and state["stuck"] == ["a"]
+    assert state["nodes"] == {"baa": "Ready"}
 
 
 @pytest.mark.asyncio

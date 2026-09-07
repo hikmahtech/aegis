@@ -1,0 +1,11 @@
+-- Drop `problems.github_issue`, a column with no writer.
+--
+-- It was to hold `owner/repo#N` for a problem projected as a GitHub issue
+-- instead of a Todoist task. That projection (PR 6b of the problem hub) was
+-- dropped: nothing produces a repo-subject problem without a task, so the
+-- surface would have shipped with no producer.
+--
+-- `problem_links` already carries a `github_issue` link kind, which is where
+-- an issue ref belongs if the projection is ever built — one problem can be
+-- linked to several, and a link needs no schema change to add.
+ALTER TABLE problems DROP COLUMN IF EXISTS github_issue;

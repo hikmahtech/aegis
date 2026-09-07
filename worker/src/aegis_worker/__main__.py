@@ -629,10 +629,10 @@ async def main():
     # single outage (N nodes/services down) can dispatch N concurrent
     # AlertInvestigationFlows all hammering the LiteLLM proxy simultaneously
     # (whose backends may be the same infra that's down). Capping at 10
-    # queues bursts rather than letting them saturate the proxy. The signature
-    # dedup in the flow (build_alert_signature / find_open_task_for_signature)
-    # is the primary storm-collapse fix; this cap is a safety net for bursts
-    # that arrive before dedup fires.
+    # queues bursts rather than letting them saturate the proxy. The problem
+    # hub's correlation key is the primary storm-collapse fix — a storm of one
+    # outage is one problem and one investigation — and this cap is the safety
+    # net for a burst of genuinely different problems.
     worker = Worker(
         client,
         task_queue=TASK_QUEUE,
