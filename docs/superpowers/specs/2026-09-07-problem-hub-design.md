@@ -1,7 +1,7 @@
 # Problem hub: one record for every alert, investigation and session
 
 **Date:** 2026-09-07
-**Status:** approved; PRs 1, 2, 3a, 3b, 4a, 4b, 5a, 5b and 6a shipped (see §12)
+**Status:** approved; every code PR shipped (1, 2, 3a, 3b, 4a, 4b, 5a, 5b, 6a, 7). 6b was dropped and 6c (the admin page) rides the operator's UI pass — see §12.
 
 ## Problem
 
@@ -585,10 +585,10 @@ it replaces, so the tree never carries two ways to do one thing.
 | 4b | The delivery watchdog (undelivered cards, the comms probe), service drift and cert expiry on `reconcile_findings`; the infra verb parks non-service problems. | the hand-rolled comms task, `resolve_comms_inbound_alert`, the hourly undelivered re-card. `ServiceDriftFlow.recheck_delay_seconds` and `FlowHealthConfig.min_stale_minutes` STAY: they filter unplanned restarts, which no declared window covers. The expiry radar is not a producer: its ledger claims a human ack card, not an alert. |
 | 5a | Migration 034: `task_sessions` → `work_sessions` with `id`, `problem_id`, `account`, `engine`, `owner`, `status`, `summary`, `last_seen_at` and a partial unique index on the live AEGIS row. `account` recorded at launch and used at resume; `park_task` writes its reason to the row; collision is a registry lookup (`turn_still_running` / `you_are_in_it` / `proceed`) with a 15-minute liveness cross-check (`reconcile_work_sessions`); `task_context`, `report_progress` and `merge_problems` tools, granted to all four agents and withheld from run mounts; sessions on the status block. | the SSH git-context fan-out (`_enrich_sessions`, `_session_git_context`), the LLM same-task judge (`build_same_task_prompt`, `parse_same_task_verdict`, `find_session`, `human_sessions_in_repo`, `_task_identity`, and `AgentTaskActivities.llm_client`/`model_balanced`), `_own_session_owner`, the `hand_to_you` verdict and its exit |
 | 5b | Plan steps as Todoist subtasks (`plan_step` links, `PLAN:` block parsed off the turn, `record_plan`), `report_progress(step_done=N)` ticks one off, step progress on the status block, `ensure_problem_for_task` shared by the tool and the activity, and the outbox description write now supersedes a pending one. | the duplicated "give a plain task a problem" block in `tools/hub.py` |
-| 6b (moved in) | GitHub-issue projection for `repo` subjects. Deferred out of 5b: nothing produces a `repo` subject without a task today (Sentry keys on the service, and a `report_progress` problem already has its task), so the surface would have shipped with no producer — dead code by the programme's own rule. It lands with its producer: an investigation verdict that names a repo. | — |
+| ~~6b~~ **dropped** | GitHub-issue projection for `repo` subjects. Deferred out of 5b: nothing produces a `repo` subject without a task today (Sentry keys on the service, and a `report_progress` problem already has its task), so the surface would have shipped with no producer — dead code by the programme's own rule. It was then dropped rather than deferred again. The producer never materialised and building one would have been a product decision nobody asked for: an alert's subject is the service, not the repo, and re-keying it on the repo would change every correlation key mid-flight; a `report_progress` problem already owns its Todoist task; and an investigation that names a repo already has Gate 2's "Open PR" and a `github_pr` link for the code half. Filing alert-born defects as GitHub issues automatically is a change to how the operator's day works, not a refactor, so it stays out until asked for. Adding it later is a branch in `hub_project.project` on `subject_kind` plus a `gh issue create` over the existing SSH connector — an afternoon, on top of everything else being in place. | — |
 | 6a | `hub.digest` / `close_resolved` / `list_problems` / `problem_detail`; `HubActivities.build_digest` and `close_resolved_problems`; the nightly close sweep on `CleanupFlow` (`problem_close_days`, default 7); admin routes `GET /api/admin/problems`, `/problems/digest`, `/problems/{id}` and `POST /problems/{id}/mute\|resolve\|close\|merge`, `GET/PUT /api/admin/service-state`, every mutation calling the hub's own transition. Migration 035 drops `settings.alert_digest_buffer`. | `AlertActivities.build_alert_digest`, `accumulate_digest_item`, `_read_digest_buffer` and the four investigation call sites that fed it |
 | 6c | The admin Problems **page** itself (`Problems.tsx`), with the rest of the UI pass the operator asked for at the end of the programme. | — |
-| 7 | Operator hooks (dotfiles, documented in `docs/infrastructure.md`), runbook updates, `docs/how-it-works.md` section. | — |
+| 7 | The `SessionStart` / `Stop` hook script and its wiring, documented in `docs/infrastructure.md` (it lives in the operator's dotfiles, not this repo); the rollout runbook with its ordering and verification queries; `docs/architecture/overview.md` and `docs/how-it-works.md` brought up to date. | — |
 
 PR 3 is the large one, so it ships as 3a (the projector, dark) and 3b (the
 producers and the investigation flow, which is where the deletions happen).
@@ -611,6 +611,14 @@ Together they close #341 and the remainder of #279.
    applies to an agent with no `tool_set` yet), then open one `@code` task
    from a fresh Claude session and confirm `task_context` shows the previous
    AEGIS turn. The hooks that call `report_progress` automatically are PR 7.
+5. After the backfill has run, drop `alert_dedup_index`: it is the last reader
+   of that table's recurrence counts. The migration is deliberately NOT in any
+   PR above, because migrations apply on Core startup and would therefore run
+   BEFORE the backfill on the very deploy that ships them.
+
+The whole ordering, the grant SQL and the verification queries are in
+`docs/infrastructure.md` under "Rolling the problem hub out". That is the
+runbook to follow; this list is the summary.
 
 ## Files touched
 

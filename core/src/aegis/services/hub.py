@@ -303,19 +303,6 @@ async def get_problem(pool: asyncpg.Pool, problem_id: str) -> dict[str, Any] | N
     return dict(row) if row else None
 
 
-async def find_open_problem(pool: asyncpg.Pool, key: str) -> dict[str, Any] | None:
-    """The problem currently holding ``key``: open, or resolved but not yet
-    closed. ``None`` for an empty key — uncorrelated problems are never found."""
-    if not key:
-        return None
-    row = await pool.fetchrow(
-        "SELECT id::text AS id, status, resolved_at, muted_until, occurrences "
-        "FROM problems WHERE correlation_key = $1 AND closed_at IS NULL",
-        key,
-    )
-    return dict(row) if row else None
-
-
 async def list_events(
     pool: asyncpg.Pool, problem_id: str, limit: int = 50
 ) -> list[dict[str, Any]]:
