@@ -26,8 +26,8 @@ _TIMESTAMP_COLUMNS: dict[str, str] = {
     "governance_decision_log": "created_at",
     "ingest_idempotency": "created_at",
     "workflow_runs": "started_at",
-    "gtd_clarify_log": "created_at",
     "alert_dedup_index": "last_seen_at",
+    "gtd_clarify_log": "created_at",
     "pending_prs": "created_at",
     # todoist_webhook_events records receipt time as `received_at`, not
     # `created_at` (migration 001).

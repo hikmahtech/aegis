@@ -62,9 +62,9 @@ def _stubs(sent, committed, fail_send=False, resolve_map=None, market_calls=None
         sent.append((agent_id, message))
         return {"ok": True}
 
-    @activity.defn(name="build_alert_digest")
-    async def digest():
-        return {"count": 0}
+    @activity.defn(name="build_digest")
+    async def digest(hours: float = 24.0):
+        return {"count": 0, "message": ""}
 
     @activity.defn(name="ingest_briefing")
     async def ingest(text, date):

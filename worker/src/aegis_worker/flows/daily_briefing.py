@@ -17,9 +17,9 @@ from temporalio import workflow
 
 with workflow.unsafe.imports_passed_through():
     from aegis_worker.activities.agent_registry import AgentRegistryActivities
-    from aegis_worker.activities.alerts import AlertActivities
     from aegis_worker.activities.briefing import BriefingActivities
     from aegis_worker.activities.delivery import DeliveryActivities
+    from aegis_worker.activities.hub import HubActivities
     from aegis_worker.shared.retry import (
         NO_RETRY,
         RETRY_ONCE,
@@ -137,10 +137,12 @@ class DailyBriefingFlow:
             except Exception:
                 workflow.logger.warning("briefing_voice_failed")
 
-        # infra alert digest (kept)
+        # The problem hub's own digest: one query over the day's events,
+        # rather than a settings buffer four investigation branches appended to.
         try:
             digest = await workflow.execute_activity_method(
-                AlertActivities.build_alert_digest,
+                HubActivities.build_digest,
+                args=[24.0],
                 start_to_close_timeout=TIMEOUT_FAST, retry_policy=NO_RETRY,
             )
             if digest.get("count", 0) > 0:

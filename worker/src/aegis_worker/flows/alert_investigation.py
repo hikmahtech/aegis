@@ -300,15 +300,6 @@ class AlertInvestigationFlow:
                 f"{_html_escape(service)}</code> and the service recovered to "
                 f"running ≥ desired. No code investigation needed.",
             )
-            try:
-                await workflow.execute_activity_method(
-                    AlertActivities.accumulate_digest_item,
-                    args=[{"type": "auto_remediated", "title": title, "source": source}],
-                    start_to_close_timeout=TIMEOUT_FAST,
-                    retry_policy=NO_RETRY,
-                )
-            except Exception:
-                pass
             await self._record(
                 problem_id,
                 "resolved",
@@ -485,15 +476,6 @@ class AlertInvestigationFlow:
                     track_task_id or "",
                     voice_line(agent_id, "investigation_self_resolved"),
                 )
-                try:
-                    await workflow.execute_activity_method(
-                        AlertActivities.accumulate_digest_item,
-                        args=[{"type": "self_resolved", "title": title, "source": source}],
-                        start_to_close_timeout=TIMEOUT_FAST,
-                        retry_policy=NO_RETRY,
-                    )
-                except Exception:
-                    pass
                 await self._record(
                     problem_id,
                     "resolved",
@@ -685,15 +667,6 @@ class AlertInvestigationFlow:
                         "🤔 Skipped — couldn't confirm which repository this "
                         "belongs to, so I did not start a code investigation.",
                     )
-                    try:
-                        await workflow.execute_activity_method(
-                            AlertActivities.accumulate_digest_item,
-                            args=[{"type": "not_actionable", "title": title, "source": source}],
-                            start_to_close_timeout=TIMEOUT_FAST,
-                            retry_policy=NO_RETRY,
-                        )
-                    except Exception:
-                        pass
                     return {"status": "repo_unconfirmed", "task_id": track_task_id}
 
                 resources_list = [
@@ -1464,15 +1437,6 @@ class AlertInvestigationFlow:
             final_status = "resolved"
         elif verdict_status == "not_actionable":
             final_status = "not_actionable"
-            try:
-                await workflow.execute_activity_method(
-                    AlertActivities.accumulate_digest_item,
-                    args=[{"type": "not_actionable", "title": title, "source": source}],
-                    start_to_close_timeout=TIMEOUT_FAST,
-                    retry_policy=NO_RETRY,
-                )
-            except Exception:
-                pass
         elif verdict_status == "inconclusive":
             final_status = "inconclusive"
 

@@ -43,6 +43,18 @@ async def _stub_orphans(threshold_days: int) -> dict:
     return {"archived": 1, "threshold_days": threshold_days}
 
 
+@activity.defn(name="close_resolved_problems")
+async def _stub_close_problems(days: float) -> dict:
+    _record("close_problems", days)
+    return {"closed": 3, "problem_ids": ["a", "b", "c"]}
+
+
+@activity.defn(name="close_resolved_problems")
+async def _stub_close_problems_boom(days: float) -> dict:
+    _record("close_problems", days)
+    raise RuntimeError("the hub is unreachable")
+
+
 @activity.defn(name="cleanup_work_sessions")
 async def _stub_sessions(days: int) -> dict:
     _record("sessions", days)
@@ -63,7 +75,13 @@ async def _stub_sessions_boom(days: int) -> dict:
 
 async def _run(config: CleanupConfig, *activities) -> dict:
     _calls.clear()
-    acts = list(activities) or [_stub_dispatches, _stub_prune, _stub_orphans, _stub_sessions]
+    acts = list(activities) or [
+        _stub_dispatches,
+        _stub_prune,
+        _stub_orphans,
+        _stub_sessions,
+        _stub_close_problems,
+    ]
     tq = f"tq-{uuid4().hex[:8]}"
     async with (
         await WorkflowEnvironment.start_time_skipping() as env,
@@ -136,3 +154,31 @@ async def test_prune_failure_does_not_suppress_the_sweep():
 
     assert result["prune_status"] == "failed"
     assert result["work_sessions"] == {"removed": 2, "skipped": 1}
+
+
+async def test_the_problem_close_sweep_runs_last_and_lands_under_its_own_key():
+    """Closing a resolved problem frees its correlation key, so the sweep has
+    to run even on a night the retention prune failed — the same independence
+    every other sweep in this flow has."""
+    result = await _run(CleanupConfig(retentions={"audit_log": 90}, problem_close_days=14))
+    assert _calls["close_problems"] == [14]
+    assert result["problems_closed"] == {"closed": 3, "problem_ids": ["a", "b", "c"]}
+
+
+async def test_the_close_sweep_is_off_at_zero():
+    result = await _run(CleanupConfig(retentions={"audit_log": 90}, problem_close_days=0))
+    assert "close_problems" not in _calls
+    assert "problems_closed" not in result
+
+
+async def test_a_failing_close_sweep_is_reported_not_fatal():
+    result = await _run(
+        CleanupConfig(retentions={"audit_log": 90}),
+        _stub_dispatches,
+        _stub_prune,
+        _stub_orphans,
+        _stub_sessions,
+        _stub_close_problems_boom,
+    )
+    assert result["problems_closed"] == {"status": "failed"}
+    assert result["work_sessions"] == {"removed": 2, "skipped": 1}, "the earlier sweeps still ran"

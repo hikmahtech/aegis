@@ -296,6 +296,7 @@ def create_app(run_lifespan: bool = True, settings: Settings | None = None) -> F
         observability,
         overview,
         people_admin,
+        problems_admin,
         references,
         resources,
         settings,
@@ -377,6 +378,7 @@ def create_app(run_lifespan: bool = True, settings: Settings | None = None) -> F
     app.include_router(overview.router)
     app.include_router(homelab.router)
     app.include_router(hub.router)
+    app.include_router(problems_admin.router)
     app.include_router(money.router)
     app.include_router(infra.router)
     app.include_router(infra_admin.router)

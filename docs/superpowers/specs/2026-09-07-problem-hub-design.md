@@ -1,7 +1,7 @@
 # Problem hub: one record for every alert, investigation and session
 
 **Date:** 2026-09-07
-**Status:** approved; PRs 1, 2, 3a, 3b, 4a, 4b, 5a and 5b shipped (see §12)
+**Status:** approved; PRs 1, 2, 3a, 3b, 4a, 4b, 5a, 5b and 6a shipped (see §12)
 
 ## Problem
 
@@ -497,12 +497,28 @@ and says so in its comment.
 24 h, grouped by status, with suppressed and muted counts. The
 `settings.alert_digest_buffer` row goes.
 
+Why it matters beyond tidiness: the buffer recorded what a flow *remembered to
+append*. An item written by a branch that then failed was in the digest anyway,
+and one whose branch was never reached was missing from it forever — and the
+read cleared it, so a re-run of the briefing reported an empty day. The query
+is over what actually happened and can be asked twice.
+
 One admin page, **Problems**: open problems by severity and `last_seen_at`,
 each expanding to its event timeline, links and sessions; `service_state` as a
 strip at the top with a clear button. Routes: `GET /api/admin/problems`,
 `GET /api/admin/problems/{id}`, `POST /api/admin/problems/{id}/close|mute|merge`,
 `GET/PUT /api/admin/service-state`. Mutations are the same functions the tools
 call.
+
+Shipped in 6a as the routes, plus `GET /api/admin/problems/digest` (the
+briefing's own query, so the page and the message cannot disagree) and a
+`resolve` mutation the spec had not named — the panel needs a way to say "this
+is fixed" without waiting for a producer to send a `resolved` event. The page
+itself is 6c, with the wider UI pass.
+
+The close sweep's cutoff is INCLUSIVE, which is what lets the panel's close
+button retire a problem it has just resolved; a strict comparison closed
+nothing at all in that case.
 
 ### 10. Error handling
 
@@ -569,8 +585,9 @@ it replaces, so the tree never carries two ways to do one thing.
 | 4b | The delivery watchdog (undelivered cards, the comms probe), service drift and cert expiry on `reconcile_findings`; the infra verb parks non-service problems. | the hand-rolled comms task, `resolve_comms_inbound_alert`, the hourly undelivered re-card. `ServiceDriftFlow.recheck_delay_seconds` and `FlowHealthConfig.min_stale_minutes` STAY: they filter unplanned restarts, which no declared window covers. The expiry radar is not a producer: its ledger claims a human ack card, not an alert. |
 | 5a | Migration 034: `task_sessions` → `work_sessions` with `id`, `problem_id`, `account`, `engine`, `owner`, `status`, `summary`, `last_seen_at` and a partial unique index on the live AEGIS row. `account` recorded at launch and used at resume; `park_task` writes its reason to the row; collision is a registry lookup (`turn_still_running` / `you_are_in_it` / `proceed`) with a 15-minute liveness cross-check (`reconcile_work_sessions`); `task_context`, `report_progress` and `merge_problems` tools, granted to all four agents and withheld from run mounts; sessions on the status block. | the SSH git-context fan-out (`_enrich_sessions`, `_session_git_context`), the LLM same-task judge (`build_same_task_prompt`, `parse_same_task_verdict`, `find_session`, `human_sessions_in_repo`, `_task_identity`, and `AgentTaskActivities.llm_client`/`model_balanced`), `_own_session_owner`, the `hand_to_you` verdict and its exit |
 | 5b | Plan steps as Todoist subtasks (`plan_step` links, `PLAN:` block parsed off the turn, `record_plan`), `report_progress(step_done=N)` ticks one off, step progress on the status block, `ensure_problem_for_task` shared by the tool and the activity, and the outbox description write now supersedes a pending one. | the duplicated "give a plain task a problem" block in `tools/hub.py` |
-| 6 (moved in) | GitHub-issue projection for `repo` subjects. Deferred out of 5b: nothing produces a `repo` subject without a task today (Sentry keys on the service, and a `report_progress` problem already has its task), so the surface would have shipped with no producer — dead code by the programme's own rule. It lands with its producer: an investigation verdict that names a repo. | — |
-| 6 | Admin Problems page, digest from events, `CleanupFlow` close and re-project sweeps, the GitHub-issue projection above. | `build_alert_digest`'s buffer reader |
+| 6b (moved in) | GitHub-issue projection for `repo` subjects. Deferred out of 5b: nothing produces a `repo` subject without a task today (Sentry keys on the service, and a `report_progress` problem already has its task), so the surface would have shipped with no producer — dead code by the programme's own rule. It lands with its producer: an investigation verdict that names a repo. | — |
+| 6a | `hub.digest` / `close_resolved` / `list_problems` / `problem_detail`; `HubActivities.build_digest` and `close_resolved_problems`; the nightly close sweep on `CleanupFlow` (`problem_close_days`, default 7); admin routes `GET /api/admin/problems`, `/problems/digest`, `/problems/{id}` and `POST /problems/{id}/mute\|resolve\|close\|merge`, `GET/PUT /api/admin/service-state`, every mutation calling the hub's own transition. Migration 035 drops `settings.alert_digest_buffer`. | `AlertActivities.build_alert_digest`, `accumulate_digest_item`, `_read_digest_buffer` and the four investigation call sites that fed it |
+| 6c | The admin Problems **page** itself (`Problems.tsx`), with the rest of the UI pass the operator asked for at the end of the programme. | — |
 | 7 | Operator hooks (dotfiles, documented in `docs/infrastructure.md`), runbook updates, `docs/how-it-works.md` section. | — |
 
 PR 3 is the large one, so it ships as 3a (the projector, dark) and 3b (the

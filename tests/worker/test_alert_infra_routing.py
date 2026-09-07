@@ -358,11 +358,6 @@ async def _stub_send_message(
     _flow_state.setdefault("sends", []).append(agent_id)
 
 
-@activity.defn(name="accumulate_digest_item")
-async def _stub_accumulate_digest_item(payload: dict) -> None:
-    pass
-
-
 @activity.defn(name="post_task_note")
 async def _stub_post_task_note(
     task_id: str,
@@ -509,7 +504,6 @@ _ALL_FLOW_ACTIVITIES = [
     _stub_assess_investigation,
     _stub_send_system_event,
     _stub_send_message,
-    _stub_accumulate_digest_item,
     _stub_post_task_note,
     _stub_upload_kimi_log,
     _stub_record_verdict_to_kg,
