@@ -341,9 +341,11 @@ def test_module_workflows_is_the_unflagged_registry():
         # AgentTaskSweepFlow. `check_task_collision` stays (same name, now a
         # registry lookup) and `cleanup_task_sessions` is renamed
         # `cleanup_work_sessions` (±0). No new flow.
-        (True, True, 44, 216),
-        (False, False, 36, 185),
-        (True, False, 40, 201),
+        # PR 5b: HubActivities.record_plan (+1, unflagged) — a coding turn's
+        # plan becomes subtasks through the projector. No new flow.
+        (True, True, 44, 217),
+        (False, False, 36, 186),
+        (True, False, 40, 202),
     ],
 )
 def test_real_registration_passes_the_boot_check(homelab, money, flows, activities):

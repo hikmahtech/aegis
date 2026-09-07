@@ -460,3 +460,160 @@ async def test_projection_rerenders_the_block_when_a_session_registers(db_pool, 
     assert cmd["type"] == "item_update"
     assert "Session: operator active (personal)" in cmd["args"]["description"]
     assert "checking the mounts" in cmd["args"]["description"]
+
+
+# --- plan steps become subtasks (PR 5b) ----------------------------------------
+
+
+def _plan(problem_id: str, steps: list[str], **kw) -> Event:
+    return Event(
+        source="session",
+        external_id=f"plan-{uuid.uuid4().hex[:8]}",
+        kind="plan",
+        title="plan",
+        problem_id=problem_id,
+        payload={"text": "the plan", "steps": steps, **kw},
+    )
+
+
+def test_plan_steps_needs_two_and_caps_at_twelve():
+    assert hub_project.plan_steps({}) == []
+    assert hub_project.plan_steps({"steps": "not a list"}) == []
+    assert hub_project.plan_steps({"steps": ["only one"]}) == [], "one step is a sentence"
+    assert hub_project.plan_steps({"steps": ["a", "  ", "b"]}) == ["a", "b"]
+    assert len(hub_project.plan_steps({"steps": [f"s{n}" for n in range(20)]})) == 12
+
+
+async def test_a_plan_opens_one_subtask_per_step_once(db_pool, inbox, todoist):
+    s = _subject()
+    r = await ingest_event(db_pool, _occ(s, 1), now=NOW)
+    task = (await project(db_pool, r.problem_id, now=NOW))["task_id"]
+    await _mirror_task(db_pool, task)
+
+    await ingest_event(db_pool, _plan(r.problem_id, ["Add the index", "Backfill rows"]), now=NOW)
+    out = await project(db_pool, r.problem_id, now=NOW)
+
+    adds = [c for c in _cmds(todoist, "item_add") if c["args"].get("parent_id")]
+    assert [c["args"]["content"] for c in adds] == ["Add the index", "Backfill rows"]
+    assert {c["args"]["parent_id"] for c in adds} == {task}
+    refs = sorted(
+        r0["ref"]
+        for r0 in await db_pool.fetch(
+            "SELECT ref FROM problem_links WHERE problem_id = $1::uuid AND link_kind = 'plan_step'",
+            r.problem_id,
+        )
+    )
+    assert len(refs) == 2 and refs[0].startswith("1:") and refs[1].startswith("2:")
+    assert out["comments"] == 1, "the plan is still commented"
+
+    # A second plan does not open a second checklist — the first one may
+    # already be half ticked off.
+    await ingest_event(db_pool, _plan(r.problem_id, ["Rewrite it all", "Again"]), now=NOW)
+    await project(db_pool, r.problem_id, now=NOW)
+    assert len([c for c in _cmds(todoist, "item_add") if c["args"].get("parent_id")]) == 2
+
+
+async def test_the_block_reports_step_progress_and_a_step_can_be_ticked_off(db_pool, inbox, todoist):
+    s = _subject()
+    r = await ingest_event(db_pool, _occ(s, 1), now=NOW)
+    task = (await project(db_pool, r.problem_id, now=NOW))["task_id"]
+    await _mirror_task(db_pool, task)
+    await ingest_event(db_pool, _plan(r.problem_id, ["one", "two"]), now=NOW)
+    await project(db_pool, r.problem_id, now=NOW)
+    step_ids = [
+        str(row["ref"]).split(":", 1)[1]
+        for row in await db_pool.fetch(
+            "SELECT ref FROM problem_links WHERE problem_id = $1::uuid AND link_kind = 'plan_step' "
+            "ORDER BY ref",
+            r.problem_id,
+        )
+    ]
+    for sid in step_ids:
+        await _mirror_task(db_pool, sid)
+    desc = await db_pool.fetchval(
+        "SELECT command->'args'->>'description' FROM todoist_outbox WHERE temp_id = $1",
+        f"problem-desc-{task}",
+    )
+    assert "Steps: 0/2 done" in (desc or "")
+
+    # A session reports the first step finished.
+    await ingest_event(
+        db_pool,
+        Event(source="session", external_id=f"note-{uuid.uuid4().hex[:8]}", kind="session_note",
+              title="x", problem_id=r.problem_id,
+              payload={"text": "index is in", "step_done": 1}),
+        now=NOW,
+    )
+    await project(db_pool, r.problem_id, now=NOW + timedelta(minutes=1))
+
+    assert await db_pool.fetchval(
+        "SELECT is_completed FROM todoist_tasks WHERE id = $1", step_ids[0]
+    ) is True
+    queued = await db_pool.fetchval(
+        "SELECT count(*) FROM todoist_outbox WHERE temp_id = $1", f"problem-step-{step_ids[0]}"
+    )
+    assert queued == 1
+    desc = await db_pool.fetchval(
+        "SELECT command->'args'->>'description' FROM todoist_outbox WHERE temp_id = $1",
+        f"problem-desc-{task}",
+    )
+    assert "Steps: 1/2 done" in (desc or "")
+    # A step number nobody planned is a no-op, not a crash.
+    assert await hub_project._complete_step(db_pool, r.problem_id, 9) is False
+
+
+async def test_a_plan_on_a_problem_with_no_task_waits(db_pool, inbox, todoist, monkeypatch):
+    """No task, no subtasks: the plan is recorded and the checklist opens on
+    the next projection, once the task exists."""
+    s = _subject()
+    r = await ingest_event(db_pool, _occ(s, 1), now=NOW)
+    await ingest_event(db_pool, _plan(r.problem_id, ["one", "two"]), now=NOW)
+    out = await project(db_pool, r.problem_id, now=NOW)
+    assert out["created"] is True
+    assert [c for c in _cmds(todoist, "item_add") if c["args"].get("parent_id")] == []
+    await _mirror_task(db_pool, out["task_id"])
+    await project(db_pool, r.problem_id, now=NOW)
+    assert len([c for c in _cmds(todoist, "item_add") if c["args"].get("parent_id")]) == 0, (
+        "the plan predates the task, so it is on the description, not a comment"
+    )
+
+
+async def test_ensure_problem_for_task_creates_one_manual_problem(db_pool, inbox, todoist):
+    task = f"zze-{uuid.uuid4().hex[:6]}"
+    assert await hub_project.ensure_problem_for_task(db_pool, task) is None, "unknown task"
+    await _mirror_task(db_pool, task)
+    await db_pool.execute("UPDATE todoist_tasks SET content = 'Fix the flaky test' WHERE id = $1", task)
+    p = await hub_project.ensure_problem_for_task(db_pool, task, subject="hikmahtech/aegis")
+    assert p is not None and p["class"] == "manual" and p["subject_kind"] == "repo"
+    assert p["title"] == "Fix the flaky test" and p["todoist_task_id"] == task
+    again = await hub_project.ensure_problem_for_task(db_pool, task)
+    assert again["id"] == p["id"], "the second call finds the first one"
+
+
+async def test_a_pending_description_update_is_superseded_not_dropped(db_pool, inbox, todoist):
+    """The status block is written whole every time, so a newer one REPLACES a
+    queued older one. The outbox otherwise leaves a pending row alone, and the
+    block hash is recorded as written either way — so without superseding, the
+    newer block is lost and no later projection ever queues it again.
+
+    Falsifiable: drop `supersede=True` and the queued description stays at the
+    first block.
+    """
+    s = _subject()
+    r = await ingest_event(db_pool, _occ(s, 1), now=NOW)
+    task = (await project(db_pool, r.problem_id, now=NOW))["task_id"]
+    await _mirror_task(db_pool, task)
+    await ingest_event(db_pool, _occ(s, 2), now=NOW)
+    await project(db_pool, r.problem_id, now=NOW + timedelta(minutes=1))
+    assert await db_pool.fetchval(
+        "SELECT status FROM todoist_outbox WHERE temp_id = $1", f"problem-desc-{task}"
+    ) == "pending"
+
+    await ingest_event(db_pool, _occ(s, 3), now=NOW)
+    await project(db_pool, r.problem_id, now=NOW + timedelta(hours=1))
+
+    desc = await db_pool.fetchval(
+        "SELECT command->'args'->>'description' FROM todoist_outbox WHERE temp_id = $1",
+        f"problem-desc-{task}",
+    )
+    assert "seen 3×" in (desc or ""), "the queued row carries the newest block"

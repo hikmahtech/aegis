@@ -751,7 +751,7 @@
     "type": "function",
     "function": {
       "name": "report_progress",
-      "description": "Register your own session on a task with a one-line summary of where you are. It lands as a comment on the task and a line in its status block, and while your session is `active` AEGIS stays out of the task. A task with no problem on the hub gets one. Call it when you start, when you hand back, and when you are done.",
+      "description": "Register your own session on a task with a one-line summary of where you are. It lands as a comment on the task and a line in its status block, and while your session is `active` AEGIS stays out of the task. A task with no problem on the hub gets one. Call it when you start, when you finish a plan step, when you hand back, and when you are done.",
       "parameters": {
         "type": "object",
         "properties": {
@@ -787,6 +787,11 @@
             "type": "string",
             "description": "the CLAUDE_CONFIG_DIR account label you run under, if not the default.",
             "default": ""
+          },
+          "step_done": {
+            "type": "integer",
+            "description": "the number of the plan step you just finished, which ticks off its subtask.",
+            "default": 0
           }
         },
         "required": [

@@ -10,7 +10,7 @@ import uuid
 from datetime import UTC, datetime, timedelta
 
 import pytest
-from aegis.services import work_sessions
+from aegis.services import hub_project, work_sessions
 from aegis.services.chat import TOOL_EXECUTORS
 from aegis.services.hub import (
     Event,
@@ -257,3 +257,40 @@ async def test_merge_problems_tool_merges_and_retires_the_duplicate_task(db_pool
 
     assert (await _exec_merge_problems(db_pool, {"keep_id": "x", "merge_id": dup.problem_id}, CTX)).startswith("Refused: keep_id and merge_id must be")
     assert (await _exec_merge_problems(db_pool, {"keep_id": keep.problem_id, "merge_id": keep.problem_id}, CTX)).startswith("Refused: keep_id and merge_id are the same")
+
+
+async def test_report_progress_ticks_off_a_plan_step(db_pool, monkeypatch):
+    """`step_done` is how a session says a plan step is finished: the note
+    carries it, the projector completes that subtask, and the reply says where
+    the checklist stands."""
+    await _no_todoist(monkeypatch)
+    task = f"zzs-{uuid.uuid4().hex[:6]}"
+    await _task(db_pool, task)
+    problem = await hub_project.ensure_problem_for_task(db_pool, task)
+    assert problem is not None
+    # Two steps, linked the way the projector links them.
+    for index, step_task in ((1, f"{task}-s1"), (2, f"{task}-s2")):
+        await _task(db_pool, step_task, content=f"step {index}")
+        await db_pool.execute(
+            "INSERT INTO problem_links (problem_id, link_kind, ref) "
+            "VALUES ($1::uuid, 'plan_step', $2) ON CONFLICT DO NOTHING",
+            problem["id"],
+            f"{index}:{step_task}",
+        )
+
+    out = await _exec_report_progress(
+        db_pool, {"task_id": task, "summary": "index is in", "step_done": 1}, CTX
+    )
+    assert "Plan steps: 1/2 done." in out
+    assert await db_pool.fetchval(
+        "SELECT is_completed FROM todoist_tasks WHERE id = $1", f"{task}-s1"
+    ) is True
+    assert await db_pool.fetchval(
+        "SELECT is_completed FROM todoist_tasks WHERE id = $1", f"{task}-s2"
+    ) is False
+    note = [e for e in await list_events(db_pool, problem["id"]) if e["kind"] == "session_note"][0]
+    assert note["payload"]["step_done"] == 1
+
+    # No step number means no tick, and the reply still reports the checklist.
+    out = await _exec_report_progress(db_pool, {"task_id": task, "summary": "thinking"}, CTX)
+    assert "Plan steps: 1/2 done." in out

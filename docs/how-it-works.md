@@ -333,6 +333,13 @@ start nothing and simply read back as your own words.
 `CleanupFlow` removes the worktree and the row `task_session_days` (default 7)
 after the task is completed.
 
+**Plans become checklists.** A turn that writes its plan under a `PLAN:` line
+(one numbered step per line) has those steps opened as Todoist subtasks under
+the task, and the status block counts them (`Steps: 1/3 done`). Tick one off
+with `report_progress(step_done=2)` from whichever session did the work. The
+list is created once: a later plan comments but never reopens a checklist
+somebody is part-way through.
+
 **From your own session.** Three tools put a session on the record: `task_context`
 reads the problem behind a task, its recent events, every session on it and the
 command that takes AEGIS's over; `report_progress` registers your session with a

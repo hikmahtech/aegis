@@ -1,7 +1,7 @@
 # Problem hub: one record for every alert, investigation and session
 
 **Date:** 2026-09-07
-**Status:** approved; PRs 1, 2, 3a, 3b, 4a, 4b and 5a shipped (see §12)
+**Status:** approved; PRs 1, 2, 3a, 3b, 4a, 4b, 5a and 5b shipped (see §12)
 
 ## Problem
 
@@ -374,9 +374,20 @@ comment immediately. Comments keep the `Workflow run:` footer so
 
 **Plan steps become subtasks.** A `plan` event whose payload carries
 `steps: [...]` with more than one entry creates Todoist subtasks
-(`build_item_add_command` with `parent_id`), each linked as `todoist_task`
-with the step index in `ref`. A session completing a step reports it (§7) and
-the projector completes the subtask.
+(`build_subtask_add_command` with `parent_id`), each linked as `plan_step`
+with `ref = '<index>:<subtask id>'`. A session completing a step reports it
+(§7, `report_progress(step_done=N)`) and the projector completes the subtask.
+
+Shipped in 5b with two deviations. The link kind is `plan_step`, not
+`todoist_task`: the parent lookup (`find_problem_for_task`) matches on a
+`todoist_task` ref, and a subtask ref there would answer it with the wrong
+task. And the checklist is created ONCE per problem — a re-plan comments but
+does not reopen a list somebody may already have ticked off.
+
+The producer is the coding lane: a turn is asked to write its plan under a
+`PLAN:` marker, one numbered step per line, and `_plan_steps` reads the last
+such block. A marker rather than a heuristic, because the whole first-turn
+report is itself a numbered list.
 
 **The status block.** The task description carries one block between markers,
 replaced whole on every projection, the way `books.py` renders journal blocks:
@@ -446,6 +457,12 @@ within 30 min is `you_are_in_it`; otherwise `proceed`. `list_coding_sessions`
 fan-out, the LLM same-task judge and `_own_session_owner` are deleted. The
 `hand_to_you` verdict goes with them: an operator who wants AEGIS out of a
 task says so with `report_progress(status='active')` or `handoff_task`.
+
+**Kept from 5b's delete list.** `_status_line` still reaches
+`workflow_runs.result_summary`. The scrape is no longer identity-bearing — the
+verdict now also feeds the session row's park reason and the plan event — but
+`result_summary` is the only PER-RUN record of what a turn decided, and the
+registry is per task. Deleting it would cost flow history for nothing.
 
 ### 8. Investigation as a worker
 
@@ -551,8 +568,9 @@ it replaces, so the tree never carries two ways to do one thing.
 | 4a | `services/hub_watch.py::reconcile_findings` (findings in, fresh problems and recoveries out); flow health, stuck social posts and the LLM governor on it; migration 032 drops `alert_mutes`. | three copies of the `audit_log` dedupe SQL (two here, the third went in 3b), `alert_mutes` and its four key namespaces, the watchdogs' `dedup_hours` / `recovery_hours` knobs, the llm_dead new-evidence rule (an open problem is one problem) |
 | 4b | The delivery watchdog (undelivered cards, the comms probe), service drift and cert expiry on `reconcile_findings`; the infra verb parks non-service problems. | the hand-rolled comms task, `resolve_comms_inbound_alert`, the hourly undelivered re-card. `ServiceDriftFlow.recheck_delay_seconds` and `FlowHealthConfig.min_stale_minutes` STAY: they filter unplanned restarts, which no declared window covers. The expiry radar is not a producer: its ledger claims a human ack card, not an alert. |
 | 5a | Migration 034: `task_sessions` → `work_sessions` with `id`, `problem_id`, `account`, `engine`, `owner`, `status`, `summary`, `last_seen_at` and a partial unique index on the live AEGIS row. `account` recorded at launch and used at resume; `park_task` writes its reason to the row; collision is a registry lookup (`turn_still_running` / `you_are_in_it` / `proceed`) with a 15-minute liveness cross-check (`reconcile_work_sessions`); `task_context`, `report_progress` and `merge_problems` tools, granted to all four agents and withheld from run mounts; sessions on the status block. | the SSH git-context fan-out (`_enrich_sessions`, `_session_git_context`), the LLM same-task judge (`build_same_task_prompt`, `parse_same_task_verdict`, `find_session`, `human_sessions_in_repo`, `_task_identity`, and `AgentTaskActivities.llm_client`/`model_balanced`), `_own_session_owner`, the `hand_to_you` verdict and its exit |
-| 5b | Plan steps as Todoist subtasks; GitHub-issue projection for `repo` subjects. | `STATUS:` scraping into `result_summary` where the registry now says it |
-| 6 | Admin Problems page, digest from events, `CleanupFlow` close and re-project sweeps. | `build_alert_digest`'s buffer reader |
+| 5b | Plan steps as Todoist subtasks (`plan_step` links, `PLAN:` block parsed off the turn, `record_plan`), `report_progress(step_done=N)` ticks one off, step progress on the status block, `ensure_problem_for_task` shared by the tool and the activity, and the outbox description write now supersedes a pending one. | the duplicated "give a plain task a problem" block in `tools/hub.py` |
+| 6 (moved in) | GitHub-issue projection for `repo` subjects. Deferred out of 5b: nothing produces a `repo` subject without a task today (Sentry keys on the service, and a `report_progress` problem already has its task), so the surface would have shipped with no producer — dead code by the programme's own rule. It lands with its producer: an investigation verdict that names a repo. | — |
+| 6 | Admin Problems page, digest from events, `CleanupFlow` close and re-project sweeps, the GitHub-issue projection above. | `build_alert_digest`'s buffer reader |
 | 7 | Operator hooks (dotfiles, documented in `docs/infrastructure.md`), runbook updates, `docs/how-it-works.md` section. | — |
 
 PR 3 is the large one, so it ships as 3a (the projector, dark) and 3b (the

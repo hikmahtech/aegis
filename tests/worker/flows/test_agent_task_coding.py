@@ -74,7 +74,13 @@ _CANDIDATES = [
 
 _PROCEED = {"verdict": "proceed", "session": None, "reason": ""}
 
-_FINAL = "Plan: dedupe the rows\nSTATUS: plan"
+_FINAL = (
+    "Here is what I found.\n\n"
+    "PLAN:\n"
+    "1. Add the unique index\n"
+    "2. Backfill the duplicate rows\n"
+    "STATUS: plan"
+)
 
 
 def _activities(
@@ -92,6 +98,8 @@ def _activities(
     release_first_ensure: asyncio.Event | None = None,
     seen_first_poll: asyncio.Event | None = None,
     release_first_poll: asyncio.Event | None = None,
+    plan_raises: bool = False,
+    final: str = "",
 ):
     """Fakes for every activity the coding path calls.
 
@@ -189,12 +197,20 @@ def _activities(
                 await release_first_poll.wait()
         if never_exits or state["polls"] % 2 == 1:
             return {"status": "running", "output": "", "reason": "", "final": ""}
+        last = final or _FINAL
         return {
             "status": "finished",
-            "output": "read the loader\n" + _FINAL,
+            "output": "read the loader\n" + last,
             "reason": "",
-            "final": _FINAL,
+            "final": last,
         }
+
+    @activity.defn(name="record_plan")
+    async def record_plan(inp: dict) -> dict:
+        events.append(("plan", inp))
+        if plan_raises:
+            raise RuntimeError("the hub is unreachable")
+        return {"recorded": True, "steps": len(inp.get("steps") or [])}
 
     @activity.defn(name="kill_task_turn")
     async def kill_task_turn(output_file: str, host: str) -> dict:
@@ -255,6 +271,7 @@ def _activities(
         record_task_turn,
         launch_task_turn,
         check_agent_run,
+        record_plan,
         kill_task_turn,
         comment,
         park_task,
@@ -1198,3 +1215,70 @@ async def test_sweep_survives_a_dispatch_failure():
 
     assert started["got"] == ["go on"]
     assert result["resumed"] == 1
+
+
+# --- the plan becomes a checklist (PR 5b) ------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_a_turns_plan_is_recorded_as_steps():
+    """A turn that writes a PLAN block hands its steps to the hub, which turns
+    them into subtasks. The steps are the parsed lines, not the whole message,
+    and the id is per turn so a retried workflow cannot open two checklists."""
+    events: list = []
+    await _run(events)
+
+    plans = _bodies(events, "plan")
+    assert len(plans) == 1
+    assert plans[0]["steps"] == ["Add the unique index", "Backfill the duplicate rows"]
+    assert plans[0]["task_id"] == "tc-1"
+    assert plans[0]["external_id"].endswith(":1"), "keyed on the turn, so a replay is idempotent"
+    assert "PLAN:" in plans[0]["text"]
+    # The plan still reaches the user as the turn's comment.
+    assert "PLAN:" in _bodies(events, "comment")[0]
+
+
+@pytest.mark.asyncio
+async def test_a_turn_without_a_plan_records_none():
+    events: list = []
+    await _run(events, final="Nothing to do here.\nSTATUS: unactionable: no repo")
+    assert "plan" not in _kinds(events)
+
+
+@pytest.mark.asyncio
+async def test_a_failing_plan_record_leaves_the_turn_alone():
+    """The plan is already posted as the comment. A hub that cannot take the
+    checklist costs the checklist, not the turn.
+
+    Falsifiable: let the exception propagate and the workflow fails instead of
+    returning a parked result.
+    """
+    events: list = []
+    result = await _run(events, plan_raises=True)
+    assert ("park", "waiting on you: plan") in events
+    assert result["status"] == "parked" and result["turns"] == 1
+
+
+def test_plan_steps_reads_the_last_marked_block_only():
+    """Every turn's report is itself a numbered list, so only the block under
+    `PLAN:` counts — and the LAST one, because a model that quotes the
+    instruction back would otherwise have its example parsed as the plan."""
+    from aegis_worker.flows.agent_task import _plan_steps
+
+    assert _plan_steps("1. not a plan\n2. still not") == []
+    assert _plan_steps("") == []
+    body = (
+        "You asked for:\nPLAN:\n1. the example\n\n"
+        "Here is mine.\n"
+        "PLAN:\n"
+        "1. Add the index\n"
+        "2) Backfill rows\n"
+        "3. Ship it\n"
+        "\n"
+        "STATUS: plan\n"
+        "Session: abc · turn 1"
+    )
+    assert _plan_steps(body) == ["Add the index", "Backfill rows", "Ship it"]
+    # A blank line inside the block is tolerated; prose ends it.
+    assert _plan_steps("PLAN:\n1. one\n\n2. two\nSo that is the plan.") == ["one", "two"]
+    assert len(_plan_steps("PLAN:\n" + "".join(f"{n}. step\n" for n in range(1, 20)))) == 12
