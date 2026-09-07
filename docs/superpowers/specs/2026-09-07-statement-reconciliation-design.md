@@ -12,149 +12,111 @@ resolution), PR #418 (`drive.file` scope)
 ## 1. Why
 
 The books record what the banks **emailed**. Nothing checks them against what the banks
-actually **did**.
+actually **did**. Two consequences, both live today:
 
-Two consequences, both live today:
+- **The books are incomplete.** Cash withdrawals, bank charges, interest credits and auto-debits
+  that send no alert are simply absent, and `assets:unknown` holds ₹53,774.56 — the largest rupee
+  balance in the journal.
+- **The books overstate their own certainty.** `render_transaction` hardcodes `*` (cleared) on every
+  block, so all 34 journal transactions claim to be bank-cleared though not one has ever been
+  reconciled with a bank, and `hledger bal --cleared` returns everything.
 
-- **The books are incomplete.** Cash withdrawals, bank charges, interest credits and
-  auto-debits that send no alert are simply absent. `assets:unknown` currently holds
-  ₹53,774.56 — the largest rupee balance in the journal.
-- **The books overstate their own certainty.** `render_transaction` hardcodes `*` (cleared)
-  on every block. All 34 journal transactions claim to be bank-cleared and not one has ever
-  been reconciled with a bank. `hledger bal --cleared` therefore returns everything, which
-  makes the flag meaningless.
-
-A bank statement fixes both. It is the complete record for its account and period, and it is
-the only artefact that can promote a guess to a confirmed fact.
+A bank statement fixes both: it is the complete record for its account and period, and the only
+artefact that can promote a guess to a fact.
 
 ## 2. Scope
 
-**In scope:** Axis and HDFC, savings/current and credit card, from FY2026-27 to date and
-forward. Intake from a Drive folder and from statement emails. Parsing, matching, posting,
-balance assertions, a monthly digest, and monitoring.
+**In scope:** Axis and HDFC, savings/current and credit card, FY2026-27 to date and forward; intake
+from a Drive folder and from statement emails; parsing, matching, posting, one balance check per
+statement, a monthly digest and monitoring.
 
-**Out of scope, tracked separately:**
+Three changes to existing code are in scope, because the lane cannot work without them: a
+status-aware `rewrite_block`, `render_transaction` emitting `!`, and six report filters added to
+`books._ALLOWED_OPTIONS` (`-P`, `-C`, `-U`, `--pending`, `--cleared`, `--unmarked`) — all in §9.1.
 
-- Backfilling `ref`/`instrument` on the 264 existing index rows (issue #406).
-- Reposting the journal blocks already written against `assets:unknown` (issue #407).
-- The index rows carrying no instrument at all (issue #408).
-- The Notion Income/Expense import (subsystem B of the wider plan).
-- Invoice generation (subsystem D).
+**Out of scope, tracked separately:** backfilling `ref`/`instrument` on the 264 existing index rows
+(#406); reposting the blocks already written against `assets:unknown` (#407); the index rows with no
+instrument (#408); the Notion Income/Expense import; invoice generation.
 
 ## 3. Decisions already taken
 
 | Decision | Choice | Rationale |
 |---|---|---|
+| Posting engine | `books.post_event`, the path the email lane already uses | An `hledger import` block lands in `main.journal` with its msgid on the header line, so no `books.py` function can find it and no index row exists — §9.2 |
+| Balance checking | One closing-balance check per statement | Per-row assertions turn a late email into a books-wide write outage — §9.3 |
 | Unmatched rows | Rules first, one digest per statement | ~40–60/month would arrive uncategorised; a card per row is a chore that gets abandoned by month two |
 | Cards | In from the start | The transfer trap has to be designed once, correctly; retrofitting it risks double-counting |
 | Intake | Drive folder **and** email attachments | AEGIS holds statement password components; the owner accepted that trade explicitly |
 | History depth | FY2026-27 to date, then forward | Overlaps the live email lane, so the matcher is exercised on real data immediately |
 | Kids' accounts | Assets, in the books | Guardian-managed; transfers not expenses. Already how `hdfc:0236` was declared |
-| Posting engine | `hledger import` for unmatched rows | Native CSV rules, and it converts a running-balance column into a per-row balance assertion for free |
 
 ## 4. Architecture
 
 Two subsystems separated by a filesystem boundary. That seam is deliberate: when a number is
-wrong you can look in the folder and immediately tell an intake problem from a parsing one.
-The current money lane has no such seam, which is why every past defect took so long to place.
+wrong you look in the folder and tell an intake problem from a parsing one.
 
 ```
 A1 — keep the folder true
-   statement email (tagged `statement`)  ─┐
-   Gmail history backfill                 ├─→ fetch → decrypt → identify account → file
-   a file the owner drops in by hand     ─┘                                          │
-                                                                                     ▼
-                                              Drive: aegis-accounting/<instrument>/<period>
-                                                                                     │
-A2 — turn the folder into books                                                      ▼
-   parse (deterministic) → finance.statement_rows → match against journal_index
-                                                    ╱                      ╲
-                                            matched                     unmatched
-                                               │                             │
-                                       promote `!` → `*`            generated CSV + rules
-                                       (text surgery)                        │
-                                                                   hledger import (inside
-                                                                   books.py's write envelope)
-                                                                             │
-                                                                     digest of rows that
-                                                                     landed in :unknown
+  a statement email (tagged `statement`), a Gmail backfill, or a file dropped in by hand
+    → fetch → decrypt → identify the account from its header
+    → file into Drive: aegis-accounting/<instrument>/
+A2 — turn the folder into books
+  parse (deterministic) → finance.statement_rows → match against journal_index
+    matched   → rewrite_event(status="*"), fixing assets:unknown
+    ambiguous → digest only: nothing posted, no candidate promoted
+    unmatched → books.post_event, msgid `stmt/<row_id>`, plus a journal_index row
+  then one closing-balance check per statement, inside books.py's flock +
+  `hledger check --strict` + revert envelope
 ```
 
 ### 4.1 The Drive folder
 
-`aegis-accounting/` — id `1vqjqowKcLJAyKMwLkIgNX4eaUoSvE7cR`, owned by
-`arshad@hikmahtechnologies.com`. One subfolder per declared bank or card account, **named
-exactly as the chart's instrument spelling** so `aegis-accounting/nkgsb-843/` and
-`assets:bank:nkgsb:843` share one string:
+`aegis-accounting/`, one subfolder per declared account, **named exactly as the chart's instrument
+spelling** so `aegis-accounting/nkgsb-843/` and `assets:bank:nkgsb:843` share one string:
+`axis-9640`, `axis-cc-1313`, `axis-cc-1747`, `hdfc-1225`, `hdfc-0236`, `hdfc-0325`, `nkgsb-843`,
+`icici-143`. The instrument → folder-id map is a `settings` row, not a constant in the code: this
+repo is public and folder ids are one operator's. Each entry also carries a **default entity**
+(`personal` or `hikmah`), because asset and liability accounts are entity-neutral and
+`journal_rel(entity, date)` needs one to pick a file — without it a row on the Hikmah current account
+posts `expenses:unknown` into `personal/2026.journal`. An empty subfolder says visibly that no
+statement has arrived for that account, so do not delete empty ones. **The folder name is a
+cross-check, never the identifier**: the account is read from inside the statement, and a file whose
+contents name a different account than its folder is a misfile, to be reported and not imported.
 
-| Subfolder | Drive id |
-|---|---|
-| `axis-9640` | `1FyKPdq4EqYtqaHJ2R7wXppLbV6enIzQ9` |
-| `axis-cc-1313` | `11K8nGoLUJzmYdXT0TbAxeKnLzxDvtV1-` |
-| `axis-cc-1747` | `1cIp_95LRFx3O_UBue8QRIwnnCwHI_Mja` |
-| `hdfc-1225` | `13qktwynA_z49E03pLh_HLb8KfQHoLmKS` |
-| `hdfc-0236` | `1GCorasyvI7li9CxS_H02KGA_k4sZkQ_6` |
-| `hdfc-0325` | `13Go71BAN9K7wvObMdq_SMIY2FZ9tCkqH` |
-| `nkgsb-843` | `1QogU8hKkoTvKCSSf8wQMQJOMrSbWYQy7` |
-| `icici-143` | `109M2zVUcJLYz6jdNKsT2Hi3UUVLOu0JN` |
-
-An empty subfolder is a visible statement that no statement has ever arrived for that
-account. Do not delete empty ones.
-
-**The folder name is a cross-check, never the identifier.** The account is read from inside
-the statement; a file whose contents name a different account than its folder is a misfile
-and must be reported, not imported.
-
-**Hard constraint.** This folder must never be the folder `DriveSyncFlow` ingests. That flow
-chunks and embeds its folder into the knowledge store, and statements carry full account
-numbers, customer IDs and a PAN in the clear. Today the separation holds structurally —
-`DriveSyncFlow` watches `1ijgXkU7CYv-LN6ljDR2HIpGWYWgHCOnQ` on `arshad-personal`, a
-different folder on a different account. The ingest must nevertheless **refuse to run**
-against the tracked folder id rather than trust configuration to stay correct.
+**Hard constraint.** This folder must never be the folder `DriveSyncFlow` ingests: that flow chunks
+and embeds its folder into the knowledge store, and statements carry full account numbers, customer
+IDs and a PAN in the clear. The ingest must **refuse to run** against `DriveSyncFlow`'s configured
+folder id, read from `activities.config` at run time — never against a hardcoded id.
 
 ## 5. A1 — intake
 
 ### 5.1 Triggers
 
-One implementation, three ways in:
-
-1. **Live.** `GmailIngestFlow` already fans out per tag: `financial`/`payments` →
-   `MoneyProcessFlow`, `meeting` → `MeetingNotesFlow`. A `statement` tag →
-   `StatementFileFlow` is the third instance of that pattern. Apply the tag through
-   `sender_overrides`, which short-circuits the LLM entirely, so tagging a bank costs
-   nothing per email and no model can get it wrong.
-2. **Backfill.** The same activity over a Gmail history query. Bounded, and it can only
-   reach back as far as the bank keeps the data (see §5.4).
-3. **By hand.** The owner drops a file in. Nothing special: A2 reads the folder, not the
-   mailbox.
+One implementation, three ways in. **Live:** `GmailIngestFlow` already fans out per tag
+(`financial`/`payments` → `MoneyProcessFlow`, `meeting` → `MeetingNotesFlow`), so a `statement` tag →
+`StatementFileFlow` is the third instance of that pattern; apply the tag through `sender_overrides`,
+which short-circuits the LLM, so tagging a bank costs nothing per email and no model can get it
+wrong. **Backfill:** the same activity over a Gmail history query, reaching back only as far as the
+bank keeps the data (§5.4). **By hand:** the owner drops a file in; A2 reads the folder, not mail.
 
 ### 5.2 Per-bank retrieval
 
-**Axis** — the statement is an attached, encrypted PDF. Decrypt in memory with `pikepdf`,
-extract text with `pdftotext -layout` reading the decrypted bytes from **stdin**.
+**Axis** — an attached, encrypted PDF. Decrypt in memory with `pikepdf`, then extract text with
+`pdftotext -layout` reading the decrypted bytes from **stdin**. Two measured reasons:
+`pdftotext -layout` reconstructs table rows, while `pdfminer` — already a dependency — returns the
+table column-by-column and rebuilt **zero** complete rows from three real statements; and
+`-upw <password>` puts the password in argv, readable from `/proc`, whereas `-layout - -` reads
+stdin and writes no decrypted PDF to disk. **New dependencies:** `pikepdf` and `poppler-utils` (one
+line in `worker/Dockerfile`'s apt list, today only `openssh-client curl ffmpeg openssl tini git`).
 
-Two reasons for that shape, both measured:
-
-- `pdftotext -layout` reconstructs table rows; `pdfminer` — already a dependency — returns
-  the table column-by-column and rebuilt **zero** complete rows from three real statements.
-  A line regex over `pdfminer` output pairs a narration with someone else's amount.
-- `pdftotext -upw <password>` puts the password in argv, readable from `/proc` by anything
-  sharing the PID namespace. `pdftotext -layout - -` reads from stdin, and no decrypted PDF
-  is ever written to disk.
-
-**New dependencies:** `pikepdf` (Python) and `poppler-utils` (one line in
-`worker/Dockerfile`'s apt list, which today installs only
-`openssh-client curl ffmpeg openssl tini git`).
-
-**HDFC** — the statement email carries **no attachment**. It links to a JSP behind a password
-form, a server token and two encryption layers. The full procedure is in
-`hdfc-smartstatement-recipe.md` and is verified end to end. The response is an **HTML table**,
-which needs no column reconstruction at all — HDFC is the easier bank to parse.
+**HDFC** — the statement email carries **no attachment**. It links to a JSP behind a password form, a
+server token and two encryption layers; `hdfc-smartstatement-recipe.md` has the full procedure,
+verified end to end. The response is an **HTML table**, so HDFC is the easier bank to parse.
 
 ### 5.3 Passwords — derive, do not store
 
-Every scheme observed is `<first 4 letters of a name, uppercase, spaces and periods removed>`
-plus one variable part:
+Every scheme observed is `<first 4 letters of a name, uppercase, spaces and periods removed>` plus
+one variable part:
 
 | Statement | Variable part |
 |---|---|
@@ -162,32 +124,29 @@ plus one variable part:
 | Axis card | DDMM of birth — or the card's last four |
 | HDFC | DDMM of birth — or the first four digits of the customer ID |
 
-Store the **components** encrypted (`crypto.encrypt_secret`, the `{"enc": {...}}` shape every
-other AEGIS secret uses), not password strings, and derive candidates at use time, trying
-each in order. Both banks offer two options; a stored string breaks the day a bank switches
-which one it uses, whereas a derived list falls through to the second. One date of birth
-covers every bank instead of being retyped per statement.
+Store the **components** encrypted (`crypto.encrypt_secret`, the `{"enc": {...}}` shape every other
+AEGIS secret uses), not password strings, and derive candidates at use time, trying each in order:
+both banks offer two options, so a stored string breaks the day a bank switches which one it uses
+while a derived list falls through to the second. Verified 2026-09-07: 15 of 15 real statements
+opened from derived components. The password never enters a log, an error or the digest — a failure
+reads "the September Axis card statement could not be opened" and names the account.
 
-Verified on 2026-09-07: 15 of 15 real statements opened from derived components.
-
-The password never enters a log, an error message or the digest. A failure reads "the
-September Axis card statement could not be opened" and names the account, nothing more.
+This is build step 1, not step 7: the 12 Axis statements already in the folder are the emailed PDFs,
+so nothing parses until derivation works.
 
 ### 5.4 HDFC links expire
 
-A statement job is purged server-side after roughly three months. The page still renders and
-the token still issues, but the POST returns `input XML file not existed` with **HTTP 200**.
+A statement job is purged server-side after roughly three months. The page still renders and the
+token still issues, but the POST returns `input XML file not existed` with **HTTP 200**. Therefore
+**HDFC ingest runs on arrival, driven by the statement email — never as a periodic sweep over an old
+mailbox.** A sweep that falls behind loses statements permanently, and fails silently at that.
 
-Therefore **HDFC ingest runs on arrival, driven by the statement email — never as a periodic
-sweep over an old mailbox.** A sweep that falls behind loses statements permanently and fails
-silently, because the fetch succeeds.
+### 5.5 Drive scopes
 
-### 5.5 Drive write
-
-Requires `drive.file`, granted on `arshad-hikmah` only (PR #418). `drive.readonly` is what
-lets AEGIS see files the owner dropped in; `drive.file` is what lets it add one. A token
-minted before a scope existed simply lacks it — check granted scopes and degrade the way
-`MeetingNotesFlow` does with `doc_status=no_drive_scope`, rather than failing.
+Two scopes, two jobs. `drive.file` (granted on `arshad-hikmah` by PR #418) lets AEGIS add a file;
+`drive.readonly` lets it see a file the owner dropped in, since `drive.file` sees only files the app
+itself created — so build step 1 needs `drive.readonly` on the hikmah token first. A token minted
+before a scope existed lacks it: check granted scopes, and degrade with `doc_status=no_drive_scope`.
 
 ## 6. A2 — parsing
 
@@ -223,12 +182,18 @@ mis-columned or double-read. Verified on a real HDFC statement: deposits minus w
 came to 98,999.65 against a closing-balance delta of 99,000.00, differing by exactly the 0.35
 charge on the row the delta excludes.
 
+**Cards use the same check with different arithmetic:** `closing due = opening due + purchases −
+payments`. They carry opening due, purchases, payments and closing due, and usually no per-row
+running balance at all — which is why §8.3 keys their rows differently.
+
 ### 6.3 No model, anywhere in the parse
 
-Both banks print fixed, labelled columns. A language model near a number is how a ledger
-becomes confidently wrong, and this lane has already burned 522,846 tokens in one day to
-conclude nothing. The only optional model use in the whole design is *suggesting* accounts in
-the digest, and even that is a convenience over the rules engine, not a dependency.
+Both banks print fixed, labelled columns. A language model near a number is how a ledger becomes
+confidently wrong, and this lane has already burned 522,846 tokens in one day to conclude nothing.
+The only optional model use is *suggesting* accounts in the digest — a convenience over the rules
+engine, not a dependency — so the lane adds no model spend and should eventually remove some: 125 of
+186 model calls in production `finance.journal_index` on 2026-09-06 (67%) produced rows that are
+neither a transaction nor a bill — and statements cover every transaction, where email covers few.
 
 ## 7. Data model
 
@@ -236,146 +201,210 @@ the digest, and even that is a convenience over the rules engine, not a dependen
 CREATE TABLE IF NOT EXISTS finance.statement_rows (
     row_id        text PRIMARY KEY,   -- see §8.3
     instrument    text NOT NULL,      -- canonical spelling, matches the chart
-    occurred_on   date NOT NULL,
-    value_date    date,
-    narration     text NOT NULL,
+    occurred_on   date NOT NULL,      -- the transaction date, never the value date
+    narration     text NOT NULL,      -- normalised: uppercase, whitespace collapsed
     ref           text,               -- UTR / RRN parsed out of the narration
     direction     text NOT NULL,      -- 'in' | 'out'
     amount        numeric(14,2) NOT NULL,
-    balance       numeric(14,2),      -- running balance, feeds the assertion
+    balance_after numeric(14,2),      -- running balance; NULL on cards
     statement_id  text NOT NULL,      -- bank + account + period
+    file_sha256   text NOT NULL,      -- the source file; a regenerated period is a 2nd file
     matched_msgid text,               -- journal_index.message_id when matched
-    posted_at     timestamptz,        -- set when hledger import wrote it
-    skip_reason   text,               -- 'ambiguous' | 'transfer_counterpart' | …
+    candidates    jsonb,              -- msgids an ambiguous row could not choose between
+    posted_at     timestamptz,        -- set when post_event wrote a block for this row
+    skip_reason   text,               -- 'ambiguous' | 'transfer_counterpart' | 'reversal' | …
     created_at    timestamptz NOT NULL DEFAULT now()
 );
 CREATE INDEX ON finance.statement_rows (instrument, occurred_on);
 CREATE INDEX ON finance.statement_rows (ref) WHERE ref IS NOT NULL;
 ```
 
-`posted_at` is the single record of what has been posted. It is the idempotency ledger, not
-hledger's `.latest` file — see §8.4.
+`posted_at` is a marker for the digest, not the idempotency ledger. Idempotency is the msgid inside
+the block: `post_event` finds `stmt/<row_id>` and will not write it twice, which survives a crash
+between the journal commit and the Postgres stamp — a `posted_at` check alone does not.
 
 ## 8. The matcher
 
 ### 8.1 Passes
 
-One statement row matches at most one journal transaction, and each journal transaction can
-be claimed only once. Passes run strongest key first; a claimed transaction leaves the pool.
+One statement row matches at most one journal transaction, and each journal transaction can be
+claimed only once; passes run strongest key first, and a claimed transaction leaves the pool. Never
+match across direction or on amount alone, and compare instruments through `canonical_instrument()`
+on both sides — live index rows carry `card-1313`, `nkgsb-0843`, `nkgsb-8443` and `axis-1`.
 
 | Pass | Key | Outcome |
 |---|---|---|
 | 1 | `ref` — the UPI RRN in the narration against `journal_index.ref` | exact match |
 | 2 | instrument + direction + amount + date window, exactly one candidate | match |
-| 3 | as pass 2, more than one candidate | **no match — ambiguous** |
+| 2b | as pass 2, over candidates with `instrument IS NULL`, scoped to the instrument's entity | match |
+| 3 | more than one candidate in pass 2 or 2b | **no match — ambiguous** |
 
-Never match across instruments, never across direction, never on amount alone.
+**Pass 2b is what makes §1 true.** Ten of the 34 live blocks carry no instrument at all
+(`channel: receipt`/`other`, posted against `assets:unknown`) — the rows this lane exists to fix.
+Without it each stays unmatched, posts a second block against the real bank account, and the expense
+is counted twice, uncaught by any balance check because the receipt's block sits on
+`assets:unknown`. Promotion has to move it (§9.1).
 
-Pass 3 is deliberate. Two ₹500 UPI payments in one week are indistinguishable, and choosing
-one silently mis-attributes a payment.
+**Pass 3 is deliberate:** two ₹500 UPI payments in one week are indistinguishable, and choosing one
+mis-attributes a payment silently. **Pass 1 is nearly dead for the backfill period**, because
+`journal_index.ref` is filled only by the deterministic parsers and the LLM path never sets it — so
+pass 2 does almost all the work for FY2026-27, and §8.2's report must count pass-2 matches or it
+describes a few dozen rows while reading as evidence about all of them.
 
 ### 8.2 The date window
 
-A POS swipe emails at swipe time and posts one to three days later; a UPI transfer posts
-same-day. The default is asymmetric — journal date within `[statement_date − 4, +1]` — and it
-is **configurable, because it is a guess.** The first run must report the observed
-distribution of date deltas per bank so the window is tuned from evidence. That report is a
-deliverable, not a nicety.
+One window for the whole lane: reuse `journal_index._MATCH_DAYS` (3 days, symmetric) rather than a
+second constant, because the receipt↔bank and statement↔journal pairs are the same guess about the
+same lag — a POS swipe emails at swipe time and posts one to three days later, a UPI transfer
+same-day. It is still a guess, so the first run must report the observed distribution of date deltas
+per bank, and `_MATCH_DAYS` changes only from that measurement. The report is a deliverable.
 
-### 8.3 `row_id`, and why the occurrence index matters
+### 8.3 `row_id`
 
 ```
-row_id = sha256(instrument, occurred_on, amount, narration, occurrence_index)
+row_id = sha256(instrument, occurred_on, direction, amount, balance_after, occurrence_index)
 ```
 
-`occurrence_index` counts within the `(instrument, occurred_on, amount, narration)` group.
-Without it, two genuinely separate ₹50 payments on the same day collapse into one row and
-money vanishes from the books. Because the group is defined by content rather than by which
-file it came from, overlapping statements covering the same day produce identical ids and
-therefore dedupe correctly.
+`occurred_on` is the **transaction date**, not the value date: HDFC prints both, and the running
+balance is in transaction-date order. **The running balance is in the key because it is
+bank-authoritative and layout-independent, and narration is not** — §6.1 documents two Axis layouts
+for one account, `pdftotext -layout` wraps and truncates long UPI narrations by column width, and
+the backfill (netbanking) overlaps the live lane (mailed monthly) by design, so a narration-keyed id
+hashes the same row twice across that overlap and posts the money twice. Keep a normalised narration
+for display and the rules, nothing else. `direction` is in the key because a same-day debit and
+credit sharing one narration would otherwise share a group and take ids by order.
 
-**This assumes statements begin and end on day boundaries.** Both banks do. A statement
-starting mid-day would break the index and must be rejected.
+`occurrence_index` counts within the `(instrument, occurred_on, direction, amount, balance_after)`
+group; without it two genuinely separate ₹50 payments on one day collapse into a single row and
+money vanishes from the books. The group is content-defined rather than file-defined, so overlapping
+statements covering the same day produce identical ids and dedupe correctly. **Cards have no running
+balance** and fall back to the normalised narration in that slot. **This assumes statements begin
+and end on day boundaries** — both banks do; a statement starting mid-day must be rejected.
 
-### 8.4 Do not also rely on hledger's `.latest`
+### 8.4 Cards — the transfer trap
 
-`hledger import` maintains a `.latest` marker and skips by **date**, not content — an
-overlapping import would silently drop legitimately new rows on a date it has already seen.
-Two idempotency systems in disagreement is worse than one. The generated CSV is therefore
-written to a temp directory **outside the books repo**, so `.latest` lands there and is
-discarded, and `statement_rows.posted_at` is authoritative.
+A bank statement's `CreditCard Payment XXXX 1313` and the card statement's payment credit are the
+same money seen twice: post both independently and the payment is double-counted while every card
+purchase goes missing. **Rule: a transfer between two accounts the owner holds is posted from the
+bank side only.** The card-side row matches that posting rather than creating its own, marked
+`skip_reason = 'transfer_counterpart'`. This row ↔ row matching is a distinct component from row ↔
+journal, and the one to write tests for first.
 
-### 8.5 Cards — the transfer trap
+**Own-account detection runs before the rules, not after.** Pull the last four digits out of the
+narration and look them up against the declared `liabilities:card:*` and `assets:bank:*` accounts
+with `_declared_with_tail`; a hit sets the counter account directly. Left to the rules,
+`CreditCard Payment XXXX 1313` matches nothing, lands in `expenses:unknown`, and the card liability
+drifts by the full bill every month. The email lane posts card bills and IMPS transfers to
+`equity:transfers`, so promotion of such a block rewrites it to the far side the pair proves.
 
-A bank statement's `CreditCard Payment XXXX 1313` and the card statement's payment credit are
-the same money seen twice. Post both independently and the payment is double-counted while
-every card purchase goes missing.
+### 8.5 Foreign currency, and reversals
 
-**Rule: a transfer between two accounts the owner holds is posted from the bank side only.**
-The card-side row matches against that posting rather than creating its own, and is marked
-`skip_reason = 'transfer_counterpart'`.
+**Foreign currency.** The live journal posts `$200.00`, `$4.00`, `$29.00`, `$5.89` and `-£6285.01`
+against `liabilities:card:axis:1313` and `assets:bank:axis:9640`, while the card statement shows
+them in ₹ with a markup. Amount equality never matches across currencies, so each would become an
+unmatched row and post again in rupees — and nothing catches it downstream, because hledger's `=`
+assertion is **per commodity**: an account can hold a permanent dollar balance beside a correct
+rupee one and still pass. Match a foreign-currency candidate when
+`abs(stmt − journal × latest_prices[symbol]) ≤ 5%`, the FX markup band, and on promotion rewrite the
+posting to cost notation, `$4.00 @@ ₹338.12`. The £ remittances are the same case in reverse.
 
-This is statement-row ↔ statement-row matching, a distinct component from row ↔ journal, and
-the one to write tests for first.
+**Reversals.** A failed UPI is a debit and a same-day re-credit with the same narration, and the
+email lane records it as `kind='failed'`, which is not a transaction — so both rows would be
+unmatched and post as an `expenses:unknown` + `income:unknown` pair that sits in the digest forever.
+Pair same-day, equal-amount, opposite-direction rows sharing a ref or narration and post both to one
+counter account tagged `reversal`: net zero, balance intact. Refunds already match on pass 2.
 
 ## 9. Posting
 
 ### 9.1 Pending until proven
 
-- Email-sourced transactions post as `!` (pending) — an honest claim, since nothing has
-  verified them. **This changes `render_transaction`, which hardcodes `*` today.**
-- A matching statement row promotes `!` → `*` by text surgery on the block found by msgid,
-  adding a `stmt:` tag for provenance — same flock, same `hledger check --strict`, same
-  revert on failure.
-- Statement rows with no email counterpart post as `*` directly. The bank is the source.
+Email-sourced transactions post as `!` (pending) — an honest claim, since nothing has verified them;
+a statement row with no email counterpart posts `*`, because the bank is the source. **This changes
+`render_transaction`, which hardcodes `*` today.** `render_manual` stays `*`: a hand-typed
+`ledger_post` is the owner asserting the fact, and its `manual_msgid` is a hash of the rendered
+block, so changing that rendering breaks idempotency for a retry straddling the deploy. A matching
+statement row promotes `!` → `*` through
+`rewrite_event(msgid, status="*", add_tags={"stmt": statement_id})` — same flock, same
+`hledger check --strict`, same revert on failure — and **also fixes the account**: when the matched
+block's second posting is `assets:unknown` (pass 2b), rewrite it to the statement's account, as
+`money.py:652–658` does for the receipt↔bank pair, or the promoted block leaves the bank account
+short and §9.3's check fails.
 
-`hledger bal -P assets:bank:hdfc:1225` then answers "what does AEGIS believe that the bank
-has not confirmed?", and a transaction that never gets promoted stays pending forever — a
-report you can run, rather than a silent wrong number.
+**`rewrite_block` must parse the status first.** Today it splits the header on the literal `" * "`;
+on a pending block it finds nothing, keeps the whole header as the date part and writes
+`2026-09-02 ! Jai shree nakoda * Corner Store` — a pending transaction whose description has
+swallowed the old payee, which `check --strict` accepts and nothing reverts. Every `rewrite_event`
+caller hits this on the first `!` block: receipt↔bank enrichment, `ledger_reclassify`, the
+`ledger_add_rule` sweep, the curiosity answer hook. Parse with
+`^(\d{4}-\d{2}-\d{2})\s+([*!])?\s*(.*)$` and add a `status=` kwarg. **The 34 blocks already written
+stay `*` unless rewritten**, so the step that flips the rendering also does a one-off `*`→`!` pass
+over them; without it §1's complaint survives for everything posted so far.
 
-### 9.2 Balance assertions come free
+`hledger bal -P --pending assets:bank:hdfc:1225` then answers "what does AEGIS believe the bank has
+not confirmed?", and a transaction never promoted stays pending forever — a report you can run
+rather than a silent wrong number. That is why `_ALLOWED_OPTIONS` gains the six filters from §2.
 
-`hledger import` converts a `balance` CSV field into a per-row balance assertion:
+### 9.2 Unmatched rows post through `post_event`
 
-```
-2026-08-14 * UPI/P2M/312228170275/AUTO POINT/Paytm Pay/UPI
-    assets:bank:hdfc:1225      ₹-11500.00 = ₹114256.58
-    expenses:transport          ₹11500.00
-```
+Each unmatched row becomes a `MoneyEvent(kind='transaction', channel='statement',
+source_class='bank', instrument=…, ref=…)` with msgid `stmt/<row_id>`, written by `books.post_event`
+and indexed by `journal_index.upsert(mailbox='statement')` — the same path the email lane uses.
+`hledger import` is not the engine, for three measured reasons: it appends to `main.journal`, which
+`books.journal_files()` never globs, and writes the msgid on the header line where `find_block`'s
+needle (`    ; msgid: <id>`) can never match; it writes no `journal_index` row, so
+`ledger_reclassify`, the `ledger_add_rule` sweep and the brief's Unexplained list cannot see an
+imported row at all; and it cannot choose a file per row, which §4.1's entity map requires.
 
-That is far stronger than one assertion per statement: the books fail at the exact row where
-they diverge from the bank.
+**The account comes from `books.apply_rules(rules, "", narration, direction=…)`, in Python.** One
+rule vocabulary is right; generating an hledger `.rules` file to get it is not, because hledger's
+`if` conditions cannot express the rules `accounts.yaml` already holds:
 
-Matched rows carry no assertion, leaving holes in the chain. That is acceptable — balances are
-cumulative, so the next asserted row still catches any drift the holes let through.
+| yaml / Python regex | hledger `if` |
+|---|---|
+| `(?i)`, `(?:…)`, `(?=…)`, `(?<!…)`, `.*?` | **hard error** — the file is refused, so one such rule fails every import |
+| `\d`, `\w` | **silently never match** |
+| `$` on a payee pattern | anchors the whole CSV record, not the field |
+| bare `if` scope | matches any column — `\-50` hit the amount, `^2026` hit the date |
+| `\|[^\|]*…`, which `rule_match_for` writes | 0 hits — a CSV record has no pipe |
+| `direction` | needs an extra `& %withdrawal .` condition per rule |
+| `entity` | picks a file; hledger cannot |
 
-**Caveat.** HDFC's own footnote says its closing balance includes funds under clearing and
-excludes anything under lien. Assert on Axis first, where opening and closing rows are clean,
-and treat HDFC's as advisory until a few months have been observed.
+The live rules file happens to translate today, using only `|`, `\.` and `.*`; the next rule
+`ledger_add_rule` or the curiosity detector writes may not, and nothing validates that.
+`apply_rules` is direction-aware and runs the haystack the sweep runs. Own-account detection (§8.4)
+runs before it; a row that neither resolves lands in `expenses:unknown` and in the digest, where
+`ledger_reclassify` can move it — which works only because there is an index row.
 
-### 9.3 One rule vocabulary, generated
+### 9.3 One closing-balance check per statement
 
-`hledger import` needs a `.csv.rules` file mapping narration → account. Hand-maintaining one
-per bank would create a second rule system beside `rules/accounts.yaml`, and "Airtel" would
-have to be taught twice.
+After posting a statement, inside the write envelope, compare hledger's balance for the account at
+the statement's closing date against the statement's closing balance and raise `BooksCheckError` on
+a mismatch; `books.py` then reverts the whole write. Cards use the arithmetic in §6.2.
 
-**Generate the `.rules` file from `accounts.yaml` at import time.** One source of truth, still
-user-editable and version-controlled, and a rule added through the existing `ledger_add_rule`
-chat tool starts applying to statements automatically.
+**No per-row balance assertions**, for one reason above all: `_check_sync` runs
+`hledger check --strict` on **every** write, so one stale assertion is a books-wide write outage —
+the email lane, `ledger_post`, `ledger_add_rule` and prices all fail and revert until a human edits
+the journal by hand. They go stale routinely, because a matched row keeps its email date, up to
+`_MATCH_DAYS` before the bank's, while hledger evaluates an assertion against every posting to that
+account dated on or before it. Verified: the bank shows −100 then −50 on the 10th, the email for the
+second is dated the 9th, and `check --strict` fails on the *first* row ("asserted ₹900, calculated
+₹850"). On equal dates the outcome depends on include and append order, which nothing controls. One
+check per statement survives both.
 
-### 9.4 Inside the write envelope
+**The ordering rule that follows:** once a period is reconciled for an account, an email-lane
+transaction dated inside it is index-only — matched to a statement row, or flagged in the digest —
+never posted. The statement is complete, so anything later is already in it or is a discrepancy.
 
-`hledger import` writes to the journal, so it runs inside `books.py`'s flock +
-`check --strict` + revert envelope. It must **not** go through `books.run_hledger`, whose
-exact-match option allowlist exists to police *model-authored* arguments. This argv is built
-entirely by our code, exactly as `books.declared_accounts` already is.
+**Caveat.** HDFC's own footnote says its closing balance includes funds under clearing and excludes
+anything under lien, so check Axis first and treat HDFC's as advisory for a few months.
 
-### 9.5 Ambiguous rows still post
+### 9.4 Ambiguous rows are not posted
 
-Forced by §9.2, not preference: a row left unposted breaks the running-balance chain and every
-later assertion fails. An ambiguous row posts to `expenses:unknown` with
-`skip_reason='ambiguous'` and appears in the digest. The books stay balanced and the
-uncertainty is visible rather than hidden.
+An ambiguous row means two or more journal transactions already carry this amount on this instrument
+in the window. **One of them is this row**, so posting it adds a third copy of the money that the
+balance already includes through the candidate. Store `skip_reason='ambiguous'` with the candidate
+msgids in `candidates`, list the row and its candidates in the digest, and promote none until a
+person picks: the books stay balanced, §9.3's check still passes, the uncertainty stays visible.
 
 ## 10. Failure modes
 
@@ -383,106 +412,70 @@ uncertainty is visible rather than hidden.
 |---|---|---|
 | Wrong password | All derived candidates fail | Report the statement and account; never silently skip |
 | Bank changes narration format | §6.2 arithmetic check fails | Refuse the whole statement |
-| Unknown header format | Matches no pattern | `UNIDENTIFIED`, reported, not guessed |
-| Statement in the wrong folder | Contents name a different account than the folder | Report the misfile; do not import |
-| Balance assertion fails | `hledger check --strict` rejects the write | `books.py` reverts; surface which row |
+| Unknown header, or a file in the wrong folder | Matches no pattern, or its contents name another account | `UNIDENTIFIED` or misfile — reported, never guessed at and never imported |
+| Closing balance disagrees | The §9.3 check, inside the write envelope | `BooksCheckError`; the whole statement reverts; alert |
 | HDFC job purged | `input XML file not existed`, HTTP 200 | Permanent — do not retry |
 | Lost session on HDFC fetch | `Internal Error occured` | Retry from the `CRSGetToken` step |
 | Drive/Gmail scope missing | Granted-scope check before use | Degrade like `no_drive_scope`, never a silent zero |
-| Duplicate ingestion | `row_id` collision | Skip; three dedupe layers (file, statement, row) |
-| Flow dies mid-import | Temporal retry | `posted_at` makes the re-run idempotent |
+| Duplicate ingestion, or a flow dying mid-post | `row_id`, then the msgid already in a block | `post_event` skips; the re-run is idempotent whether or not `posted_at` was stamped |
 
-Distinguishing the three HDFC failure bodies matters: only a short body after a valid token is
-worth trying another password for.
+Only a short body after a valid token is worth another password — distinguish the three HDFC bodies.
 
 ## 11. Monitoring
 
-Four checks, all on existing alert machinery:
-
-1. **Coverage** — for each declared account, did a statement arrive for last month? Catches a
-   bank silently stopping, which would otherwise go unnoticed for a year.
-2. **Assertion failures** — an immediate alert, not a log line. This is the point of the lane.
-3. **Match rate** — tracked per bank per month; a sharp drop means a narration format changed.
-4. **Stuck files** — a file in the folder unparsed for more than a day.
+Two alerts, both on existing machinery. **Coverage** — did a statement arrive last month for each
+declared account? That catches a bank silently stopping, which would otherwise pass unnoticed for a
+year. **Closing-balance mismatch** — immediate, not a log line; the point of the lane. The match rate
+per bank, and any file left unparsed for over a day, are digest lines rather than alerts.
 
 ## 12. Testing
 
-Every test must be **falsifiable**: break the code it covers, watch it fail, revert. This
-session has found thirteen tests that passed while proving nothing. The recurring shapes are
-an assertion inside a swallowing `try/except`; an assertion routed through a lenient reader;
-an assertion that stops one word short; and a test that passes because a fallback happens to
-give the right answer for the wrong reason.
+Every test must be **falsifiable**: break the code it covers, watch it fail, revert — this session
+found thirteen tests in this repo that passed while proving nothing. Fixtures come from real
+statements, structurally faithful and numerically altered. The tests this design earns:
 
-Specific tests this design earns:
+- **A dropped row fails the arithmetic check** — remove one row, the statement is refused.
+- **The `Credit Card` trap.** A current-account fixture containing a `CreditCard Payment` narration
+  still identifies as the current account.
+- **The subject-line trap.** A statement whose subject says August and header says July files as
+  July, and **both Axis header formats** identify the same account.
+- **A matched row dated before its bank row** does not fail the next write.
+- **`rewrite_block` on a `!` block** leaves a well-formed header: status still `!`, payee replaced,
+  description not swallowed.
+- **A `$4.00` journal candidate matches a `₹338` statement row**, and promotion writes cost notation.
+- **An ambiguous row is not posted** — two candidates at equal distance give no match, no block and
+  an unchanged journal.
+- **A `CreditCard Payment` bank row credits the card liability**, not `expenses:unknown`, and a bank
+  + card statement pair for the same payment posts it once.
+- **Double import.** The same statement twice, and overlapping statements in two different layouts,
+  leave the row count unchanged — while **two identical payments on one day** produce two rows.
 
-- **Fixtures from real statements, structurally faithful and numerically altered.** Real
-  layout, substituted account numbers and amounts.
-- **A dropped row fails the arithmetic check.** Remove one row from a fixture; the statement
-  must be refused.
-- **The `Credit Card` trap.** A current-account fixture containing a `CreditCard Payment`
-  narration must still identify as the current account.
-- **The subject-line trap.** A statement whose subject says August and whose header says July
-  must be filed as July.
-- **Both Axis header formats** identify the same account.
-- **The transfer trap.** A bank + card statement pair for the same payment posts it once.
-- **Double import.** The same statement twice leaves the row count unchanged.
-- **Overlapping statements.** A monthly and an annual covering the same period produce no
-  duplicate rows.
-- **Two identical payments on one day** produce two rows, not one.
-- **Ambiguity never guesses.** Two candidates at equal distance produce no match.
-
-## 13. Cost, and what "lean" means
-
-**This lane adds no meaningful model spend.** Parsing is fully deterministic.
-
-It also creates the opportunity to reduce the existing spend, and the numbers say where:
-
-Production `finance.journal_index`, counted 2026-09-06 (the backfill was still running, so
-absolute counts drift; the ratio is the point):
-
-```
-llm → info          92      125 of 186 model calls — 67% — produce
-llm → ignore        33      rows that are neither a transaction nor
-llm → due           27      a bill, and so never reach the books
-llm → transaction   26
-llm → failed         8
-deterministic       20      rows won by the 13 hand-written parsers
-free (gate/mailbox) 56      has_money_shape and mailbox rules: no call at all
-```
-
-Two thirds of the money lane's model spend produces nothing that reaches the books. Every
-statement narration format taught to the parser is a deterministic parser that replaces a
-model call, and statements cover 100% of transactions where email covers a fraction. Once
-statements are authoritative for completeness, the email lane's job narrows to payee
-enrichment and bill detection — which is where the leaning should be aimed, in a separate
-piece of work, once this lane is carrying the load.
-
-## 14. Open questions
+## 13. Open questions
 
 1. **Is there an Axis personal savings account, and should it send statements?** The monthly
-   `statements@axis.bank.in` mail is the Hikmah Technologies *current* account (9640) —
-   established 2026-09-07 by reading the covering email, which addresses "MS. HIKMAH
-   TECHNOLOGIES" and names a Current Account. No Axis personal savings statement arrives.
-2. **`axis-cc-1747`, `icici-143`, `nkgsb-843`** have declared accounts and no statements. Are
-   these live accounts to register for e-statements, or dormant?
-3. **HSBC** — declared in the chart (`assets:bank:hsbc`, `liabilities:card:hsbc`), no
-   instrument ever seen in production, no folder created. Live or not?
-4. **The date window default** must be replaced by a measured value after the first run.
+   `statements@axis.bank.in` mail is the Hikmah Technologies *current* account (9640). No Axis
+   personal savings statement arrives.
+2. **`axis-cc-1747`, `icici-143`, `nkgsb-843`** have declared accounts and no statements. Live
+   accounts to register for e-statements, or dormant?
+3. **HSBC** — declared in the chart (`assets:bank:hsbc`, `liabilities:card:hsbc`), no instrument ever
+   seen in production, no folder created. Live or not?
+4. **The date window** stays at `_MATCH_DAYS` until step 3's measurement says otherwise.
 
-## 15. Build order
+## 14. Build order
 
-1. `finance.statement_rows` + the Axis PDF parser + the header-anchor identification, with the
-   arithmetic check. No posting yet — parse the 12 Axis statements already in the folder and
-   report what they contain.
-2. The HDFC HTML parser, against the 3 statements already in the folder.
-3. The matcher, run in report-only mode against the live journal. Publish the date-delta
-   distribution. **Nothing is written to the books in steps 1–3.**
-4. `render_transaction` emits `!`; the promotion pass; balance assertions.
-5. `hledger import` of unmatched rows, with the generated rules file.
-6. The transfer matcher for cards.
-7. A1 intake: `statement` tag fan-out, the HDFC retrieval, Drive upload.
-8. The digest and the four monitoring checks.
+1. The migration, password derivation (§5.3), the `drive.readonly` scope check (§5.5), the Axis PDF
+   parser and header-anchor identification (§6.1), with the arithmetic check (§6.2).
+2. The HDFC HTML parser, per `hdfc-smartstatement-recipe.md`, against the 3 statements already in
+   the folder.
+3. The matcher in report-only mode against the live journal, **including the NULL-instrument (pass
+   2b) and foreign-currency (§8.5) candidate classes**, so the published date-delta distribution
+   covers the rows that will match. **Nothing is written to the books in steps 1–3.**
+4. `rewrite_block` status support, `render_transaction` emitting `!`, and the one-off `*`→`!` rewrite
+   of the existing email-sourced blocks (§9.1).
+5. Posting through `post_event`, with the closing-balance check (§9.2, §9.3).
+6. The transfer matcher and own-account detection for cards (§8.4).
+7. A1 intake: the `statement` tag fan-out, HDFC retrieval, Drive upload.
+8. The digest and the two alerts (§11).
 
-Steps 1–3 are safe to build and run against production data without touching the ledger, and
-they are where every remaining unknown lives. That is deliberate: the first three steps buy
-the evidence the rest of the design is currently assuming.
+Steps 1–3 are safe to run against production data without touching the ledger, and they are where
+every remaining unknown lives — deliberately, because they buy the evidence the rest assumes.
