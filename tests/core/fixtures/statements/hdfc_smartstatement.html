@@ -1,0 +1,215 @@
+<!DOCTYPE html>
+<!--
+  HDFC SmartStatement fixture — structurally faithful, numerically FALSE.
+
+  The markup mirrors a real decrypted SmartStatement page: the same header
+  block (`Customer ID:`, the bare `Statement Period` label with its split
+  `From`/`To` pair, then the glued `Statement Period:From dd/mm/yyyy To
+  dd/mm/yyyy` line), the same account number hidden inside a
+  `<select><option>` and printed twice, the same summary block, and the same
+  nine-column transaction table carrying two unlabelled trailing columns
+  (`COL8`, `COL9`) after `Closing Balance`. Dates in the `Date` column use
+  slashes and the `Value date` column uses dashes, exactly as the bank prints
+  them, and the two differ on most rows so a parser reading the wrong one is
+  caught. One column header is deliberately wrapped across two lines, the way
+  generated markup wraps a long cell.
+
+  Every number, name and account digit here is invented. No real statement,
+  and nothing derived from one, is committed.
+
+  The statement's own arithmetic closes: closing minus opening equals the
+  printed credit total minus the printed debit total, and the running balance
+  moves by each row's own amount. No literal amount is repeated in this
+  comment, so a test that rewrites one rewrites exactly one place.
+-->
+<html>
+<head><title>Account Statement</title></head>
+<body>
+<div class="container">
+
+  <div class="row" id="DIV_8_START_ROW">
+    <div class="col-md-3"><p id="P_Cust_ID">Customer ID:</p></div>
+    <div class="col-md-9"><p id="P_Cust_ID1">900000001</p></div>
+  </div>
+  <div id="DIV_8C_START">
+    <div class="col-md-9"><p id="P_Statement_Period">Statement Period</p></div>
+    <form role="form" id="FORM_START_PRINT" ENCTYPE="text/plain">
+      <button type="submit" id="P_PRINT_BUTTON" value="Save as PDF">Save as PDF</button>
+    </form>
+    <div class="col-md-2"><p id="P_From">From</p></div>
+    <div class="col-md-2"><p id="P_To">To</p></div>
+    <div class="col-md-2"><p id="P_From_Date">12/07/2026</p></div>
+    <div class="col-md-2"><p id="P_To_Date">11/08/2026</p></div>
+  </div>
+
+  <div class="row" id="DIV_39_START_ROW">
+    <div class="col-md-6"><p id="PlainText550007">Account Statement</p></div>
+    <div class="col-md-6"><p id="PlainText553699">Statement Period:From 12/07/2026 To 11/08/2026</p></div>
+  </div>
+
+  <div class="row" id="DIV_40_START_ROW">
+    <div id="DIV_4001_START">
+      <div class="col-md-3"><p id="PlainText553700">Type of Account</p></div>
+      <div class="col-md-3">
+        <select id="Combo8" name="Combo8" title="" class="form-control">
+          <option value="0">Savings Account</option>
+        </select>
+      </div>
+    </div>
+    <div id="DIV_4002_START">
+      <div class="col-md-3"><p id="PlainText553701">Account number</p></div>
+      <div class="col-md-3">
+        <select id="Combo9" name="Combo9" title="" class="form-control">
+          <option value="0">50100999999999</option>
+        </select>
+      </div>
+    </div>
+    <div id="DIV_4003_START">
+      <div class="col-md-4"><p id="PlainText553702">Product Type</p></div>
+      <div class="col-md-4"><p id="PlainText553703">SPECIMEN S/A - EXAMPLE</p></div>
+      <div class="col-md-2"><button type="button" id="VIEW_pt">View</button></div>
+    </div>
+  </div>
+
+  <div class="row" id="DIV_40B_START_ROW">
+    <div class="col-md-6"><p id="PlainText550009">Expense Analysis</p></div>
+    <div id="STMT1_DIV_START">
+      <div class="col-md-4"><p id="PlainText550010">Type of account</p></div>
+      <div class="col-md-4">
+        <select id="Combo_type" name="Combo_type" title="" class="form-control">
+          <option value="0">Savings Account</option>
+        </select>
+      </div>
+      <div class="col-md-4"><p id="Pt_accuntnum">Account number</p></div>
+      <div class="col-md-4">
+        <select id="Combo_ac" name="Combo_ac" title="" class="form-control">
+          <option value="0">50100999999999</option>
+        </select>
+      </div>
+    </div>
+    <div class="col-md-2"><button type="button" id="VIEW_sa">View</button></div>
+  </div>
+
+  <!-- A layout table with no rows of its own, as the real page carries many. -->
+  <table></table>
+
+  <div class="row" id="DIV_41_START_ROW">
+    <div class="col-md-6"><p id="PlainText55007324">Account Statement</p></div>
+    <div id="DIV_3112_START">
+      <div class="col-md-3"><p id="PlainText550013">Opening Balance</p></div>
+      <div class="col-md-3"><p id="PlainText1550013_2">10,000.00</p></div>
+    </div>
+    <div id="DIV_3113_START">
+      <div class="col-md-3"><p id="PlainText550013_1">Debit Amount</p></div>
+      <div class="col-md-3"><p id="PlainText1550013_1">7,350.00</p></div>
+    </div>
+    <div id="DIV_3114_START">
+      <div class="col-md-3"><p id="PlainText550013_3">Credit Amount</p></div>
+      <div class="col-md-3"><p id="PlainText1550013_3">1,00,000.00</p></div>
+    </div>
+    <div id="DIV_3115_START">
+      <div class="col-md-3"><p id="PlainText553165">Closing Balance</p></div>
+      <div class="col-md-3"><p id="PlainText1553165">1,02,650.00</p></div>
+    </div>
+    <div id="DIV_3116_START">
+      <div class="col-md-3"><p id="PlainText553166">Debit Count</p></div>
+      <div class="col-md-3"><p id="PlainText1553166">5</p></div>
+    </div>
+    <div id="DIV_3117_START">
+      <div class="col-md-3"><p id="PlainText553167">Credit Count</p></div>
+      <div class="col-md-3"><p id="PlainText1553167">1</p></div>
+    </div>
+  </div>
+
+  <table class="table table-striped table-bordered" id="Table76">
+    <thead>
+      <tr>
+        <th class="th0">Date</th>
+        <th class="th1">Transaction details</th>
+        <th class="th2">Cheque/Ref
+            No</th>
+        <th class="th3">Value date</th>
+        <th class="th4">Withdrawal</th>
+        <th class="th5">Deposit</th>
+        <th class="th6">Closing Balance</th>
+        <th class="th7">COL8</th>
+        <th class="th8">COL9</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td class="c0">12/07/2026</td>
+        <td class="c1">UPI-987654321012-SPECIMEN STORE.-EXAM-XXXXXXXXXX4321-PAYMENT</td>
+        <td class="c2">987654321012</td>
+        <td class="c3">13-07-2026</td>
+        <td class="c4">250.00</td>
+        <td class="c5">-</td>
+        <td class="c6">9,750.00</td>
+        <td class="c7">0.00</td>
+        <td class="c8">Specimen</td>
+      </tr>
+      <tr>
+        <td class="c0">15/07/2026</td>
+        <td class="c1">NEFT CR-EXAM0000123-SPECIMEN PAYER-ACCOUNTHOLDER<br>N123456789012345</td>
+        <td class="c2">N123456789012345</td>
+        <td class="c3">16-07-2026</td>
+        <td class="c4">-</td>
+        <td class="c5">1,00,000.00</td>
+        <td class="c6">1,09,750.00</td>
+        <td class="c7">0.00</td>
+        <td class="c8">Specimen</td>
+      </tr>
+      <tr>
+        <td class="c0">18/07/2026</td>
+        <td class="c1">CreditCard Payment XXXX 1313</td>
+        <td class="c2">556677889900</td>
+        <td class="c3">19-07-2026</td>
+        <td class="c4">5,000.00</td>
+        <td class="c5">-</td>
+        <td class="c6">1,04,750.00</td>
+        <td class="c7">0.00</td>
+        <td class="c8">Specimen Br</td>
+      </tr>
+      <tr>
+        <td class="c0">20/07/2026</td>
+        <td class="c1">ATW-412345678901-SPECIMEN ATM-EXAM</td>
+        <td class="c2">-</td>
+        <td class="c3">20-07-2026</td>
+        <td class="c4">2,000.00</td>
+        <td class="c5">-</td>
+        <td class="c6">1,02,750.00</td>
+        <td class="c7">0.00</td>
+        <td class="c8">Specimen</td>
+      </tr>
+      <tr>
+        <td class="c0">25/07/2026</td>
+        <td class="c1">SPECIMEN LOCKER CHARGE&nbsp;&nbsp;INCL GST</td>
+        <td class="c2">000123</td>
+        <td class="c3">26-07-2026</td>
+        <td class="c4">50.00</td>
+        <td class="c5">-</td>
+        <td class="c6">1,02,700.00</td>
+        <td class="c7">0.00</td>
+        <td class="c8">Specimen</td>
+      </tr>
+      <tr>
+        <td class="c0">28/07/2026</td>
+        <td class="c1">UPI-SPECIMEN SHOP-EXAM-XXXXXXXXXX4321-SHOP</td>
+        <td class="c2">-</td>
+        <td class="c3">29-07-2026</td>
+        <td class="c4">50.00</td>
+        <td class="c5">-</td>
+        <td class="c6">1,02,650.00</td>
+        <td class="c7">0.00</td>
+        <td class="c8">Specimen</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <div class="row" id="DIV_FOOTER">
+    <p id="PlainText_footer">This is a computer generated statement and does not require a signature.</p>
+  </div>
+
+</div>
+</body>
+</html>
