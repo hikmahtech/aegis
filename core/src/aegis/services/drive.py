@@ -5,6 +5,12 @@ Reuses the Gmail OAuth token (same per-account token file under
 which is added to `gmail_reauth._SCOPES`. Re-authorize the account once after
 deploying for Drive reads to work.
 
+That list also carries `drive.file`, which this module does not use: it is for
+writing, and nothing here writes. A token minted before a scope was added simply
+lacks it, so check the granted scopes rather than assuming — `MeetingNotesFlow`
+already reports a missing Drive scope as `doc_status=no_drive_scope` instead of
+failing, and a writer should degrade the same way.
+
 Google Docs/Sheets/Slides are exported to text; ordinary files (pdf/txt/md/…)
 are downloaded; each is run through the shared `content_extract` then ingested.
 The sync Drive API is run in a worker thread so the async route isn't blocked.

@@ -36,6 +36,14 @@ _SCOPES = [
     # Read-only Drive — used by the knowledge /ingest-drive seeder. Adding this
     # means each account must be re-authorized once for Drive reads to work.
     "https://www.googleapis.com/auth/drive.readonly",
+    # Write access limited to files AEGIS itself created, so the statement lane
+    # can file a decrypted statement into the accounting folder. `drive.file`
+    # cannot read or modify anything AEGIS did not create — the pairing with
+    # `drive.readonly` above is deliberate: readonly is what lets it SEE a
+    # statement the owner dropped in by hand, and `drive.file` is what lets it
+    # add one, without granting the broad `drive` scope that would let it touch
+    # every file in the account.
+    "https://www.googleapis.com/auth/drive.file",
 ]
 
 
