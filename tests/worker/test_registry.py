@@ -333,9 +333,12 @@ def test_module_workflows_is_the_unflagged_registry():
         # flagged). So −4 in every row and one more off the two homelab rows.
         # ...plus HubActivities.verification_delay (+1, unflagged).
         # PR 4a: HubActivities.ingest_finding (+1, unflagged).
-        (True, True, 44, 216),
-        (False, False, 36, 183),
-        (True, False, 40, 201),
+        # PR 4b: HubActivities.reconcile_findings (+1, unflagged) while
+        # HomelabActivities loses alert_comms_inbound_down and
+        # resolve_comms_inbound_alert (−2, homelab flagged).
+        (True, True, 44, 215),
+        (False, False, 36, 184),
+        (True, False, 40, 200),
     ],
 )
 def test_real_registration_passes_the_boot_check(homelab, money, flows, activities):

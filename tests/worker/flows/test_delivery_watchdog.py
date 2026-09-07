@@ -1,4 +1,4 @@
-"""DeliveryWatchdogFlow — surface silently-undelivered interaction cards."""
+"""DeliveryWatchdogFlow — undelivered cards and the comms probe, on the hub."""
 
 from __future__ import annotations
 
@@ -18,8 +18,8 @@ with workflow.unsafe.imports_passed_through():
 
 _find_calls: list[tuple] = []
 _notify_calls: list[list] = []
-_alert_calls: list[tuple] = []
-_resolve_calls: list[bool] = []
+_hub_calls: list[dict] = []
+_hub: dict = {"open": set()}  # classes the fake hub currently holds open
 
 
 def _make_find(rows):
@@ -44,25 +44,35 @@ def _make_health(health: dict):
     return stub_health
 
 
-@activity.defn(name="alert_comms_inbound_down")
-async def stub_alert(last_ok_seconds_ago: int | None, last_error: str | None) -> bool:
-    _alert_calls.append((last_ok_seconds_ago, last_error))
-    return True
+@activity.defn(name="reconcile_findings")
+async def stub_reconcile(inp: dict) -> dict:
+    """A one-problem-per-class hub: a class is fresh when it was not open,
+    resolved when it was open and is missing from the findings."""
+    _hub_calls.append(inp)
+    seen = {f["klass"] for f in inp["findings"]}
+    fresh = [
+        {**f, "problem_id": f"prob-{f['klass']}"}
+        for f in inp["findings"]
+        if f["klass"] not in _hub["open"]
+    ]
+    resolved = [
+        {"klass": k, "subject": "x", "problem_id": f"prob-{k}"}
+        for k in inp["classes"]
+        if k in _hub["open"] and k not in seen
+    ]
+    _hub["open"] = (_hub["open"] | seen) - {r["klass"] for r in resolved}
+    return {"fresh": fresh, "attached": 0, "muted": 0, "suppressed": 0, "resolved": resolved}
 
 
-def _make_resolve(returns: bool):
-    @activity.defn(name="resolve_comms_inbound_alert")
-    async def stub_resolve() -> bool:
-        _resolve_calls.append(returns)
-        return returns
-
-    return stub_resolve
+def _reset(open_classes: set[str] | None = None) -> None:
+    _find_calls.clear()
+    _notify_calls.clear()
+    _hub_calls.clear()
+    _hub["open"] = set(open_classes or set())
 
 
-async def _run(find_stub, config, wf_id, health_stub=None, alert_stub=None, resolve_stub=None):
-    activities = [find_stub, stub_notify, health_stub or _make_health({"status": "ok"})]
-    activities.append(alert_stub or stub_alert)
-    activities.append(resolve_stub or _make_resolve(False))
+async def _run(find_stub, config, wf_id, health_stub=None):
+    activities = [find_stub, stub_notify, health_stub or _make_health({"status": "ok"}), stub_reconcile]
     async with (
         await WorkflowEnvironment.start_time_skipping() as env,
         Worker(
@@ -79,86 +89,110 @@ async def _run(find_stub, config, wf_id, health_stub=None, alert_stub=None, reso
 
 @pytest.mark.asyncio
 async def test_notifies_when_undelivered_found():
-    _find_calls.clear()
-    _notify_calls.clear()
+    _reset()
     rows = [{"id": "i1", "origin": "alert_confirm_repo", "status": "pending"}]
     result = await _run(_make_find(rows), DeliveryWatchdogConfig(), "dw-1")
     assert result == {"undelivered": 1, "comms_inbound_status": "ok"}
     assert len(_notify_calls) == 1
     assert _find_calls == [(120, 24)]
+    finding = _hub_calls[0]["findings"][0]
+    assert (finding["klass"], finding["subject"]) == ("undelivered_cards", "interactions")
+    assert finding["payload"] == {"count": 1, "by_origin": {"alert_confirm_repo": 1}}
+    assert _hub_calls[0]["classes"] == ["undelivered_cards", "comms_inbound_down"]
+
+
+@pytest.mark.asyncio
+async def test_an_open_undelivered_problem_is_not_recarded_every_hour():
+    _reset(open_classes={"undelivered_cards"})
+    rows = [{"id": "i1", "origin": "alert_confirm_repo", "status": "pending"}]
+    result = await _run(_make_find(rows), DeliveryWatchdogConfig(), "dw-1b")
+    assert result["undelivered"] == 1
+    assert _notify_calls == []
 
 
 @pytest.mark.asyncio
 async def test_silent_when_none_undelivered():
-    _find_calls.clear()
-    _notify_calls.clear()
+    _reset()
     result = await _run(_make_find([]), DeliveryWatchdogConfig(), "dw-2")
     assert result == {"undelivered": 0, "comms_inbound_status": "ok"}
     assert _notify_calls == []
+    assert _hub_calls[0]["findings"] == []
 
 
 @pytest.mark.asyncio
 async def test_records_comms_down_and_alerted():
     """A down comms status must surface in result_summary alongside whether
-    the alert activity actually fired — this half of the watchdog was
-    previously invisible (issue #120)."""
-    _find_calls.clear()
-    _notify_calls.clear()
-    _alert_calls.clear()
-    _resolve_calls.clear()
+    the hub raised it — this half of the watchdog was previously invisible
+    (issue #120). No chat card: the chat channel is the thing that is down."""
+    _reset()
     health = {"status": "down", "last_ok_seconds_ago": 900, "last_error": "socket closed"}
     result = await _run(
-        _make_find([]),
-        DeliveryWatchdogConfig(),
-        "dw-3",
-        health_stub=_make_health(health),
+        _make_find([]), DeliveryWatchdogConfig(), "dw-3", health_stub=_make_health(health)
     )
     assert result == {
         "undelivered": 0,
         "comms_inbound_status": "down",
         "comms_inbound_alerted": True,
     }
-    assert _alert_calls == [(900, "socket closed")]
-    # Recovery-only work must not run on a down tick.
-    assert _resolve_calls == []
+    finding = _hub_calls[0]["findings"][0]
+    assert (finding["klass"], finding["subject"], finding["severity"]) == (
+        "comms_inbound_down",
+        "polling",
+        "critical",
+    )
+    assert "last ok 900s ago" in finding["title"]
+    assert finding["payload"] == {"last_ok_seconds_ago": 900, "last_error": "socket closed"}
+    assert _notify_calls == []
 
 
 @pytest.mark.asyncio
-async def test_healthy_tick_closes_the_open_alert_task():
-    """Recovery completes the outage task. Without this the task stays open
-    forever and the open-task guard suppresses every later outage alert."""
-    _find_calls.clear()
-    _notify_calls.clear()
-    _resolve_calls.clear()
+async def test_sustained_outage_is_one_problem():
+    _reset(open_classes={"comms_inbound_down"})
+    health = {"status": "down", "last_ok_seconds_ago": None, "last_error": None}
     result = await _run(
-        _make_find([]), DeliveryWatchdogConfig(), "dw-4", resolve_stub=_make_resolve(True)
+        _make_find([]), DeliveryWatchdogConfig(), "dw-3b", health_stub=_make_health(health)
     )
+    assert result["comms_inbound_alerted"] is False
+    assert "last ok never" in _hub_calls[0]["findings"][0]["title"]
+
+
+@pytest.mark.asyncio
+async def test_healthy_tick_resolves_the_open_outage():
+    """Recovery resolves the problem, which closes its task. Without this the
+    task stays open forever."""
+    _reset(open_classes={"comms_inbound_down"})
+    result = await _run(_make_find([]), DeliveryWatchdogConfig(), "dw-4")
     assert result == {
         "undelivered": 0,
         "comms_inbound_status": "ok",
         "comms_inbound_resolved": True,
     }
-    assert _resolve_calls == [True]
 
 
 @pytest.mark.asyncio
 async def test_records_comms_check_failed_without_crashing_watchdog():
     """A failing health check must not fail the whole watchdog run — it
-    should degrade to a visible status instead."""
-    _find_calls.clear()
-    _notify_calls.clear()
+    degrades to a visible status, and says nothing about the comms class to
+    the hub (neither reported nor resolved)."""
+    _reset(open_classes={"comms_inbound_down"})
 
     @activity.defn(name="check_comms_inbound_health")
     async def failing_health(comms_url: str) -> dict:
         raise RuntimeError("connection refused")
 
-    result = await _run(
-        _make_find([]),
-        DeliveryWatchdogConfig(),
-        "dw-4",
-        health_stub=failing_health,
-    )
+    result = await _run(_make_find([]), DeliveryWatchdogConfig(), "dw-5", health_stub=failing_health)
     assert result == {"undelivered": 0, "comms_inbound_status": "check_failed"}
+    assert _hub_calls[0]["classes"] == ["undelivered_cards"]
+
+
+@pytest.mark.asyncio
+async def test_silent_config_records_but_never_cards():
+    _reset()
+    rows = [{"id": "i1", "origin": "x", "status": "pending"}]
+    result = await _run(_make_find(rows), DeliveryWatchdogConfig(silent=True), "dw-6")
+    assert result["undelivered"] == 1
+    assert _notify_calls == []
+    assert _hub_calls[0]["findings"][0]["klass"] == "undelivered_cards"
 
 
 # ----- activity (real Postgres) ---------------------------------------------

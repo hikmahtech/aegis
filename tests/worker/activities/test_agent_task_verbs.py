@@ -78,6 +78,7 @@ async def test_load_task_context_missing_row_is_empty(db_pool, _ctx_seed):
         "gmail_message_id": "",
         "problem_id": "",
         "subject": "",
+        "subject_kind": "",
     }
 
 

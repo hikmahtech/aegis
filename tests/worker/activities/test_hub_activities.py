@@ -43,6 +43,11 @@ async def test_no_pool_is_a_quiet_noop():
     assert (await env.run(act.record_investigation, {"problem_id": "p", "status": "x", "text": "t"})) == {"recorded": False}
     assert (await env.run(act.mute_problem, "p", 24, "x")) == {"muted_until": None}
     assert await env.run(act.stale_stuck_problems, ["a"], 24.0) == []
+    out = await env.run(
+        act.reconcile_findings,
+        {"source": "drift", "subject_kind": "service", "classes": ["replicas"], "findings": [{"klass": "replicas", "subject": "s", "title": "t"}]},
+    )
+    assert out["fresh"][0]["problem_id"] is None and out["resolved"] == []
 
 
 async def test_ingest_alert_creates_then_attaches_and_resolves(db_pool):
@@ -151,3 +156,21 @@ async def test_promote_and_clear_round_trip(db_pool):
     await set_service_state(db_pool, t, "deploying", set_by="ansible", now=LONG_AGO)
     out = await env.run(act.clear_converged_deploys, [])
     assert t in out["cleared"]
+
+
+async def test_reconcile_findings_round_trip(db_pool):
+    env = ActivityEnvironment()
+    act = HubActivities(db_pool=db_pool)
+    s = f"svc_{uuid.uuid4().hex[:8]}"
+    inp = {
+        "source": "drift",
+        "subject_kind": "service",
+        "classes": ["replicas", "oom_exit"],
+        "findings": [{"klass": "replicas", "subject": s, "title": f"{s} replicas", "severity": "critical"}],
+    }
+    first = await env.run(act.reconcile_findings, inp)
+    assert [f["subject"] for f in first["fresh"]] == [s]
+    pid = first["fresh"][0]["problem_id"]
+    assert (await get_problem(db_pool, pid))["severity"] == "critical"
+    gone = await env.run(act.reconcile_findings, {**inp, "findings": []})
+    assert [r["problem_id"] for r in gone["resolved"]] == [pid]

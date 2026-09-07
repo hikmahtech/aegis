@@ -68,11 +68,31 @@ async def stub_notify(payload: dict) -> None:
     _notify_calls.append(payload)
 
 
+_hub_calls: list[dict] = []
+
+
+@activity.defn(name="reconcile_findings")
+async def stub_reconcile(inp: dict) -> dict:
+    """Every finding is fresh unless its (class, subject) is in `_hub_open`."""
+    _hub_calls.append(inp)
+    fresh = [
+        {**f, "problem_id": "p"}
+        for f in inp["findings"]
+        if (f["klass"], f["subject"]) not in _hub_open
+    ]
+    return {"fresh": fresh, "attached": 0, "muted": 0, "suppressed": 0, "resolved": []}
+
+
+_hub_open: set[tuple[str, str]] = set()
+
+
 def _reset() -> None:
     _collect_calls.clear()
     _persist_calls.clear()
     _resolve_calls.clear()
     _notify_calls.clear()
+    _hub_calls.clear()
+    _hub_open.clear()
 
 
 async def _run(collect_stub, config: ServiceDriftConfig, wf_id: str) -> dict:
@@ -82,7 +102,7 @@ async def _run(collect_stub, config: ServiceDriftConfig, wf_id: str) -> dict:
             env.client,
             task_queue="tq",
             workflows=[ServiceDriftFlow],
-            activities=[collect_stub, stub_persist, stub_resolve, stub_notify],
+            activities=[collect_stub, stub_persist, stub_resolve, stub_notify, stub_reconcile],
         ),
     ):
         return await env.client.execute_workflow(
@@ -165,3 +185,17 @@ async def test_recheck_disabled_when_delay_zero():
 
     assert len(_collect_calls) == 1, "delay=0 must not re-collect"
     assert len(_notify_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_drift_the_hub_already_holds_is_not_recarded():
+    """The hub owns identity: a service that drifts all day is one card."""
+    _reset()
+    _hub_open.add(("replicas", "web_app"))
+    snap = _collected(_service("web_app", 2, 0))
+    result = await _run(_make_collect([snap, snap]), ServiceDriftConfig(recheck_delay_seconds=0), "sd-hub")
+    assert result["drifts_new"] == 1
+    assert _notify_calls == []
+    assert _hub_calls[0]["source"] == "drift" and _hub_calls[0]["classes"] == ["replicas", "oom_exit"]
+    f = _hub_calls[0]["findings"][0]
+    assert (f["klass"], f["subject"], f["severity"]) == ("replicas", "web_app", "critical")

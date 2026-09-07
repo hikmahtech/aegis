@@ -17,7 +17,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 
 import asyncpg
-from aegis.services import hub, hub_project
+from aegis.services import hub, hub_project, hub_watch
 from temporalio import activity
 
 
@@ -110,6 +110,29 @@ class HubActivities:
                     str(exc)[:200],
                 )
         return result.to_dict()
+
+    @activity.defn
+    async def reconcile_findings(self, inp: dict) -> dict:
+        """A watchdog's current findings in, fresh problems and recoveries out
+        (`hub_watch.reconcile_findings`). `inp` carries `source`,
+        `subject_kind`, `classes` and `findings`. Without a pool every finding
+        is fresh, so a flow still runs end to end."""
+        findings = list(inp.get("findings") or [])
+        if self.db_pool is None:
+            return {
+                "fresh": [{**f, "problem_id": None} for f in findings],
+                "attached": 0,
+                "muted": 0,
+                "suppressed": 0,
+                "resolved": [],
+            }
+        return await hub_watch.reconcile_findings(
+            self.db_pool,
+            source=str(inp.get("source") or "manual"),
+            subject_kind=str(inp.get("subject_kind") or "service"),
+            classes=[str(c) for c in (inp.get("classes") or [])],
+            findings=findings,
+        )
 
     @activity.defn
     async def problem_status(self, problem_id: str) -> dict:
