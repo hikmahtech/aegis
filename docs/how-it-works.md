@@ -347,7 +347,10 @@ one-line summary, which becomes a comment on the task and a line in its status
 block (and gives a plain `@code` task a problem if it has none); `merge_problems`
 folds a duplicate problem into the one to keep. All three are withheld from a
 coding run's own mount — a run that could report progress could mark its own task
-done.
+done. Two hooks in your own `~/.claude/settings.json` call `report_progress` at
+the start and end of a session in a task worktree, so the registry stays right
+without you thinking about it; the script is in
+[`infrastructure.md`](infrastructure.md), because it lives in your dotfiles.
 
 **Every path ends completed or parked.** A task is auto-completed only when
 the work is genuinely done (service healthy, notification archived);

@@ -14,7 +14,6 @@ from datetime import UTC, datetime, timedelta
 import pytest
 from aegis.services.hub import (
     Event,
-    find_open_problem,
     get_problem,
     ingest_event,
     list_events,
@@ -54,6 +53,20 @@ def _resolved(subject: str, n: int = 1, **kw) -> Event:
 
 def _subject() -> str:
     return f"svc_{uuid.uuid4().hex[:8]}"
+
+
+async def _holder(pool, key: str) -> str | None:
+    """The id of the live problem holding `key`, or None.
+
+    The hub has no production reader for this — `ingest_event` does the lookup
+    inside its own transaction — so the query lives here, with the tests that
+    assert on it.
+    """
+    if not key:
+        return None
+    return await pool.fetchval(
+        "SELECT id::text FROM problems WHERE correlation_key = $1 AND closed_at IS NULL", key
+    )
 
 
 async def test_first_occurrence_creates_an_open_problem(db_pool):
@@ -109,14 +122,14 @@ async def test_resolved_resolves_the_open_problem(db_pool):
     assert p["status"] == "resolved"
     assert p["resolved_at"] == NOW + timedelta(minutes=2)
     # still holds the key until closed
-    assert (await find_open_problem(db_pool, p["correlation_key"]))["id"] == r.problem_id
+    assert await _holder(db_pool, p["correlation_key"]) == r.problem_id
 
 
 async def test_resolved_with_no_problem_is_ignored_and_stores_nothing(db_pool):
     s = _subject()
     r = await ingest_event(db_pool, _resolved(s), now=NOW)
     assert r == r.__class__(None, "ignored", f"dockerservicedown:service:{s}")
-    assert await find_open_problem(db_pool, r.key) is None
+    assert await _holder(db_pool, r.key) is None
     assert await db_pool.fetchval(
         "SELECT count(*) FROM problem_events WHERE source='heartbeat' AND external_id=$1",
         f"{s}@1@resolved",
@@ -152,7 +165,7 @@ async def test_occurrence_after_the_window_rolls_over_to_a_new_linked_problem(db
     )
     assert link["ref"] == r.problem_id
     # the key now belongs to the new one
-    assert (await find_open_problem(db_pool, new["correlation_key"]))["id"] == again.problem_id
+    assert await _holder(db_pool, new["correlation_key"]) == again.problem_id
 
 
 async def test_note_kinds_attach_to_a_named_problem_and_never_create(db_pool):
@@ -189,7 +202,7 @@ async def test_note_kind_can_find_its_problem_by_key(db_pool):
 
 
 async def test_empty_key_is_never_found(db_pool):
-    assert await find_open_problem(db_pool, "") is None
+    assert await _holder(db_pool, "") is None
 
 
 async def test_uncorrelated_events_each_create_a_problem(db_pool):

@@ -351,7 +351,55 @@ python scripts/hub_backfill.py --database-url "$AEGIS_DATABASE_URL" --apply
 ```
 
 It reads the retired `alert_dedup_index` for recurrence counts while the table
-still exists, which is why that table is dropped by a later migration.
+still exists, which is why that table is dropped only after this has run.
+
+### Rolling the problem hub out
+
+The hub replaces the old alert dedupe machinery in place, so the order matters.
+
+1. **Deploy the images.** Migrations 030-035 apply on Core startup: the
+   `problems` / `problem_events` / `problem_links` tables, `service_state`, the
+   `work_sessions` widening, and the drops of `alert_mutes` and the digest
+   buffer. Nothing else is needed for alerts to start flowing onto the hub.
+2. **Merge the Ansible hook** (homelab-gitops) that posts
+   `POST /api/hub/service-state` at the top and bottom of a rollout. Held back
+   until now on purpose: merging it can trigger a deploy, and the endpoint has
+   to exist first.
+3. **Run the backfill** (see above), dry run then `--apply`. It reads
+   `alert_dedup_index` for recurrence counts, which is why that table is still
+   there.
+4. **Grant the tools.** `config/seed/agents.yaml` only seeds an agent with no
+   `metadata.tool_set`, so a running deployment needs the SQL below.
+5. **Check it.** The queries below should all come back empty or sensible.
+
+```sql
+-- 4. grant the hub's operator tools to every agent whose tool set is an array
+UPDATE agents SET metadata = jsonb_set(metadata,'{tool_set}',
+  (metadata->'tool_set') || '["task_context","report_progress","merge_problems"]'::jsonb)
+WHERE active AND jsonb_typeof(metadata->'tool_set') = 'array'
+  AND NOT (metadata->'tool_set' @> '["task_context"]'::jsonb);
+
+-- 5a. every open alert task should belong to exactly one problem
+SELECT t.id, t.content FROM todoist_tasks t
+LEFT JOIN problems p ON p.todoist_task_id = t.id
+WHERE t.source_tag = '#alert' AND NOT t.is_completed AND p.id IS NULL;
+
+-- 5b. no live problem should hold two tasks
+SELECT problem_id, count(*) FROM problem_links
+WHERE link_kind = 'todoist_task' GROUP BY 1 HAVING count(*) > 1;
+
+-- 5c. what the hub has seen since the deploy
+SELECT status, count(*), sum(occurrences) FROM problems
+WHERE last_seen_at > now() - interval '24 hours' GROUP BY 1 ORDER BY 2 DESC;
+
+-- 5d. windows in force (should be empty outside a deploy)
+SELECT subject, state, until_at, set_by FROM service_state ORDER BY updated_at DESC;
+```
+
+**After the backfill has run**, `alert_dedup_index` has no reader left and can
+be dropped by a follow-up migration. Do not drop it before: the backfill is the
+last thing that reads its recurrence counts, and a problem backfilled without
+them starts at one occurrence however long it has really been broken.
 
 ## System monitoring (`hosts_aegis`)
 
@@ -557,6 +605,92 @@ Stopping kills the run's tmux window. The flow notices on its next poll, reports
 the run as failed, and cleans up the worktree — so there is no half-stopped
 state. "No live tmux window" is a normal answer: the run may have finished, or
 have been launched detached past the tmux window cap.
+
+### Putting your own sessions on the record (the session hooks)
+
+`work_sessions` is the registry of who is on which task: AEGIS's own coding
+turns write to it, and your sessions write to it through `report_progress` on
+the operator mount. While your row says `active`, AEGIS stays out of that task
+and tells you in Slack that your comment is waiting for you in the session you
+already have open.
+
+That only works if something calls the tool. A tool nobody calls is a tool that
+does not exist, so wire two hooks into your own `~/.claude/settings.json` —
+they live in your dotfiles, not in this repo, because they are about your
+machine:
+
+```json
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "~/.claude/hooks/aegis-session.sh start"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "~/.claude/hooks/aegis-session.sh stop"
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+The script decides whether the session is on an AEGIS task at all, and says
+nothing when it is not:
+
+```bash
+#!/usr/bin/env bash
+# ~/.claude/hooks/aegis-session.sh — tell AEGIS which task this session is on.
+set -euo pipefail
+
+# A task session runs in `<repo>-aegis-wt/task-<id>`; anything else is not on
+# a task unless AEGIS_TASK says so. Silence is the correct answer for an
+# ordinary session in an ordinary checkout.
+task="${AEGIS_TASK:-}"
+if [ -z "$task" ]; then
+  case "$PWD" in
+    *-aegis-wt/task-*) task="${PWD##*/task-}" ;;
+    *) exit 0 ;;
+  esac
+fi
+
+case "${1:-start}" in
+  start)  status=active; summary="opened a session here" ;;
+  stop)   status=parked; summary="stepped away" ;;
+esac
+
+curl -fsS -X POST "$AEGIS_URL/api/mcp-server/pandoras-actor/operator" \
+  -H "X-API-Key: $AEGIS_API_KEY" -H "Content-Type: application/json" \
+  -d "$(jq -nc --arg t "$task" --arg s "$summary" --arg st "$status" \
+        --arg sid "${CLAUDE_SESSION_ID:-}" --arg acct "$(basename "${CLAUDE_CONFIG_DIR:-$HOME/.claude}")" \
+        '{jsonrpc:"2.0",id:1,method:"tools/call",params:{name:"report_progress",
+          arguments:{task_id:$t,summary:$s,status:$st,session_id:$sid,account:$acct}}}')" \
+  >/dev/null || true
+```
+
+Three things about it are deliberate. It **fails open** (`|| true`): a hook
+that breaks your session because AEGIS is down is worse than an unrecorded
+session. It sends the **account** (`CLAUDE_CONFIG_DIR`'s basename), which is
+what lets a later AEGIS turn resume under the same login. And `stop` parks
+rather than finishing: only you know whether the work is done, and
+`report_progress(status='done')` from inside a session is how you say so.
+
+Without the hooks the tools still work — call `task_context` and
+`report_progress` by hand — but the registry then only knows what you remember
+to tell it.
 
 ### Task sessions (comment-driven coding)
 
