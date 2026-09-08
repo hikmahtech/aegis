@@ -19,18 +19,39 @@ from aegis.services.llm_governor import llm_spend_last_24h
 pytestmark = pytest.mark.asyncio
 
 
-def test_the_cost_is_the_sum_of_the_three_headers_the_proxy_sends():
-    """Measured against the live proxy: it splits the figure across input,
-    output and tool usage rather than sending one total."""
+def test_the_cost_is_the_total_the_proxy_states_after_any_discount():
+    """Measured against the live proxy: it sends a combined total AND the
+    components AND a pre-discount `-original`. The total is the one to keep —
+    summing components would report the pre-discount figure the moment a
+    discount is configured.
+
+    Falsifiable: sum the components instead and this returns 1.52e-06 for the
+    discounted call below, which is what the call did NOT cost."""
     assert _cost_from_headers(
         {
-            "x-litellm-response-cost-input": "9.6e-07",
+            "x-litellm-response-cost": "1.52e-06",
+            "x-litellm-response-cost-original": "1.52e-06",
+            "x-litellm-response-cost-input": "5.6e-07",
             "x-litellm-response-cost-output": "9.6e-07",
             "x-litellm-response-cost-tool-usage": "0.0",
         }
+    ) == pytest.approx(1.52e-06)
+    # Discounted: the components still add to the ORIGINAL, and the total is
+    # what was actually charged.
+    assert _cost_from_headers(
+        {
+            "x-litellm-response-cost": "0.5",
+            "x-litellm-response-cost-original": "1.0",
+            "x-litellm-response-cost-input": "0.4",
+            "x-litellm-response-cost-output": "0.6",
+        }
+    ) == pytest.approx(0.5)
+    # A proxy version with no combined total falls back to the components.
+    assert _cost_from_headers(
+        {"x-litellm-response-cost-input": "9.6e-07", "x-litellm-response-cost-output": "9.6e-07"}
     ) == pytest.approx(1.92e-06)
     # A local model really is free; that is a 0.0, not an absence.
-    assert _cost_from_headers({"x-litellm-response-cost-input": "0"}) == 0.0
+    assert _cost_from_headers({"x-litellm-response-cost": "0"}) == 0.0
 
 
 def test_a_backend_that_prices_nothing_reports_none_not_zero():

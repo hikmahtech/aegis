@@ -232,16 +232,25 @@ def _format_money_emails(receipts: list[dict]) -> str:
 
 
 
-# LiteLLM prices every call it serves — Bedrock included — and returns the
-# result on the response, split across these three headers. Reading them is
-# how AEGIS knows what it spent WITHOUT keeping a price list of its own, which
-# would have to track five providers and would silently drift from the thing
+# LiteLLM prices every call it serves — Bedrock included, from the per-token
+# rates in its own config — and states the result on the response. Reading it
+# is how AEGIS knows what it spent WITHOUT keeping a price list of its own,
+# which would have to track five providers and would drift from the thing
 # actually doing the billing.
 #
-# A backend that is not the proxy sends none of them, and `None` is the honest
-# answer there: a spend query can then tell "not priced" from "cost nothing",
-# which a 0.0 would hide. A local ollama model does return a real 0.0.
-_COST_HEADERS = (
+# `x-litellm-response-cost` is the figure to take: it is the total AFTER any
+# discount or margin the proxy applies, and the proxy also sends
+# `-original` (pre-discount) and the `-input` / `-output` / `-tool-usage`
+# components beside it. Summing the components instead would report the
+# pre-discount number the moment a discount is configured, and would go stale
+# the moment LiteLLM adds a fourth component. The components are the fallback
+# for a proxy version that sends no combined total.
+#
+# A backend that is not the proxy sends none of these, and `None` is the
+# honest answer there: a spend query can then tell "not priced" from "cost
+# nothing", which a 0.0 would hide. A local ollama model returns a real 0.0.
+_COST_TOTAL_HEADER = "x-litellm-response-cost"
+_COST_COMPONENT_HEADERS = (
     "x-litellm-response-cost-input",
     "x-litellm-response-cost-output",
     "x-litellm-response-cost-tool-usage",
@@ -249,25 +258,32 @@ _COST_HEADERS = (
 
 
 def _cost_from_headers(headers: Any) -> float | None:
-    """Total dollars for one call, or None when the backend priced nothing."""
+    """Dollars for one call, or None when the backend priced nothing."""
     if headers is None:
         return None
+    try:
+        total_raw = headers.get(_COST_TOTAL_HEADER)
+        components = [headers.get(name) for name in _COST_COMPONENT_HEADERS]
+    except Exception:  # noqa: BLE001 — a mapping-like that will not answer
+        return None
+
+    if total_raw is not None:
+        try:
+            return float(total_raw)
+        except (TypeError, ValueError):
+            # Present but unreadable is a proxy contract change, not a free
+            # call: say "unknown" rather than "0".
+            return None
+
     total = 0.0
     seen = False
-    for name in _COST_HEADERS:
-        raw = None
-        try:
-            raw = headers.get(name)
-        except Exception:  # noqa: BLE001 — a mapping-like that will not answer
-            return None
+    for raw in components:
         if raw is None:
             continue
         try:
             total += float(raw)
             seen = True
         except (TypeError, ValueError):
-            # A header that is present but unparseable is a proxy contract
-            # change, not a free call: say "unknown" rather than "0".
             return None
     return total if seen else None
 
