@@ -47,15 +47,23 @@ def test_brief_requires_auth(unauth_client):
 
 
 def test_brief_returns_counts(client, app):
+    """The alert number is the HUB's, not a count of investigation runs: the
+    hub starts a flow only for a new or returning problem, so a deduped or
+    suppressed alert started none and the old tile read zero while a service
+    was flapping."""
     pool = app.state.db_pool
-    pool.fetchval = AsyncMock(side_effect=[1, 2])
+    pool.fetchval = AsyncMock(side_effect=[1, 4, 9])
     resp = client.get("/api/overview/brief")
     assert resp.status_code == 200
     body = resp.json()
     assert body == {
         "pending_interactions": 1,
-        "recent_alerts_24h": 2,
+        "open_problems": 4,
+        "occurrences_24h": 9,
     }
+    asked = " ".join(str(c.args[0]) for c in pool.fetchval.await_args_list)
+    assert "FROM problems" in asked and "FROM problem_events" in asked
+    assert "AlertInvestigationFlow" not in asked
 
 
 def test_status_returns_last_workflow_runs(client, app):

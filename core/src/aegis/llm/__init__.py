@@ -231,6 +231,80 @@ def _format_money_emails(receipts: list[dict]) -> str:
     return "\n".join(parts)
 
 
+
+# LiteLLM prices every call it serves — Bedrock included, from the per-token
+# rates in its own config — and states the result on the response. Reading it
+# is how AEGIS knows what it spent WITHOUT keeping a price list of its own,
+# which would have to track five providers and would drift from the thing
+# actually doing the billing.
+#
+# `x-litellm-response-cost` is the figure to take: it is the total AFTER any
+# discount or margin the proxy applies, and the proxy also sends
+# `-original` (pre-discount) and the `-input` / `-output` / `-tool-usage`
+# components beside it. Summing the components instead would report the
+# pre-discount number the moment a discount is configured, and would go stale
+# the moment LiteLLM adds a fourth component. The components are the fallback
+# for a proxy version that sends no combined total.
+#
+# A backend that is not the proxy sends none of these, and `None` is the
+# honest answer there: a spend query can then tell "not priced" from "cost
+# nothing", which a 0.0 would hide. A local ollama model returns a real 0.0.
+_COST_TOTAL_HEADER = "x-litellm-response-cost"
+_COST_COMPONENT_HEADERS = (
+    "x-litellm-response-cost-input",
+    "x-litellm-response-cost-output",
+    "x-litellm-response-cost-tool-usage",
+)
+
+
+def _cost_from_headers(headers: Any) -> float | None:
+    """Dollars for one call, or None when the backend priced nothing."""
+    if headers is None:
+        return None
+    try:
+        total_raw = headers.get(_COST_TOTAL_HEADER)
+        components = [headers.get(name) for name in _COST_COMPONENT_HEADERS]
+    except Exception:  # noqa: BLE001 — a mapping-like that will not answer
+        return None
+
+    if total_raw is not None:
+        try:
+            return float(total_raw)
+        except (TypeError, ValueError):
+            # Present but unreadable is a proxy contract change, not a free
+            # call: say "unknown" rather than "0".
+            return None
+
+    total = 0.0
+    seen = False
+    for raw in components:
+        if raw is None:
+            continue
+        try:
+            total += float(raw)
+            seen = True
+        except (TypeError, ValueError):
+            return None
+    return total if seen else None
+
+
+async def _create_with_cost(client: Any, kwargs: dict[str, Any]) -> tuple[Any, float | None]:
+    """Place one completion and report what the proxy said it cost.
+
+    `with_raw_response` is what exposes the headers, and every production call
+    goes through it. The branch is on the CLIENT TYPE rather than on whether
+    the attribute exists, because a test double answers to any attribute at
+    all: asking a mock for `with_raw_response` gets a mock, and the call would
+    fail deep inside the client instead of falling back here.
+
+    A client that is not the real SDK reports no cost, stored as NULL —
+    "nobody priced this", never a zero that would flatter a spend total.
+    """
+    if not isinstance(client, AsyncOpenAI):
+        return await client.chat.completions.create(**kwargs), None
+    raw = await client.chat.completions.with_raw_response.create(**kwargs)
+    return raw.parse(), _cost_from_headers(getattr(raw, "headers", None))
+
 class LLMClient:
     """Async LLM client using OpenAI-compatible API."""
 
@@ -423,9 +497,9 @@ class LLMClient:
             try:
                 if sem is not None:
                     async with sem:
-                        completion = await self._client.chat.completions.create(**create_kwargs)
+                        completion, cost_usd = await _create_with_cost(self._client, create_kwargs)
                 else:
-                    completion = await self._client.chat.completions.create(**create_kwargs)
+                    completion, cost_usd = await _create_with_cost(self._client, create_kwargs)
             except Exception as exc:
                 span.set_attribute("llm.status", "error")
                 await self._record_call(
@@ -491,6 +565,10 @@ class LLMClient:
                     completion_tokens=completion_tokens,
                     status="error",
                     error=recorded[:500],
+                    # Billed: the model ran and spent its budget on hidden
+                    # reasoning. A truncation that costs money and records no
+                    # cost would understate exactly the calls worth finding.
+                    cost_usd=cost_usd,
                 )
                 raise LLMTruncationError(detail)
 
@@ -523,6 +601,7 @@ class LLMClient:
                 _t0,
                 prompt_tokens=prompt_tokens,
                 completion_tokens=completion_tokens,
+                cost_usd=cost_usd,
                 status="clipped" if clipped else "success",
                 error=(
                     f"clipped: model={model} hit finish_reason=length after "
@@ -560,6 +639,7 @@ class LLMClient:
         completion_tokens: int = 0,
         status: str = "success",
         error: str | None = None,
+        cost_usd: float | None = None,
     ) -> None:
         """Write one `llm_calls` row for a generation call. Never raises.
 
@@ -606,6 +686,7 @@ class LLMClient:
                 agent_id=agent_id,
                 status=status,
                 error=error,
+                cost_usd=cost_usd,
             )
         except Exception:
             logger.warning("record_llm_call_failed", model=model, purpose=purpose)
@@ -657,9 +738,9 @@ class LLMClient:
             try:
                 if sem is not None:
                     async with sem:
-                        completion = await self._client.chat.completions.create(**kwargs)
+                        completion, cost_usd = await _create_with_cost(self._client, kwargs)
                 else:
-                    completion = await self._client.chat.completions.create(**kwargs)
+                    completion, cost_usd = await _create_with_cost(self._client, kwargs)
             except Exception as exc:
                 span.set_attribute("llm.status", "error")
                 await self._record_call(
@@ -707,6 +788,7 @@ class LLMClient:
                 _t0,
                 prompt_tokens=prompt_tokens,
                 completion_tokens=completion_tokens,
+                cost_usd=cost_usd,
             )
 
             logger.debug(

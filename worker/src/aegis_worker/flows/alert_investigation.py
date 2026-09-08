@@ -1345,7 +1345,7 @@ class AlertInvestigationFlow:
                         "stage_pending_pr",
                         StagePendingPrInput(
                             interaction_id=g2.interaction_id,
-                            alert_fingerprint=alert.get("fingerprint", ""),
+                            problem_id=problem_id,
                             repo=github_repo,
                             branch=branch_name,
                             title="AEGIS-proposed fix",

@@ -16,9 +16,22 @@ export default function ModelsProviders() {
   const [error, setError] = useState<Error | null>(null);
   const [testResult, setTestResult] = useState<any>(null);
   const [busy, setBusy] = useState(false);
+  const [spend, setSpend] = useState<any>(null);
+  const [spendBy, setSpendBy] = useState<'model' | 'purpose' | 'agent_id'>('model');
+  const [spendHours, setSpendHours] = useState(24);
+
+  async function loadSpend(hours = spendHours, by = spendBy) {
+    try {
+      setSpend(await api.llmSpend(hours, by));
+    } catch {
+      // A spend figure is worth having and never worth failing the page for.
+      setSpend(null);
+    }
+  }
 
   async function load() {
     try {
+      void loadSpend();
       const b = await api.getLlmBackend();
       setProvider(b.provider || 'custom');
       setBaseUrl(b.base_url || '');
@@ -67,6 +80,63 @@ export default function ModelsProviders() {
         One OpenAI-compatible endpoint + a model per tier. Current source: <code>{source}</code>.
       </p>
       <ErrorBanner error={error} onDismiss={() => setError(null)} />
+
+      {/* What it costs. The figures are the LiteLLM proxy's own per-call
+          pricing, recorded on every call — AEGIS keeps no price list. */}
+      <div className="card" style={{ marginTop: 12 }}>
+        <div className="section-header-row">
+          <h3 style={{ marginBottom: 0 }}>
+            Spend · ${(spend?.total_usd ?? 0).toFixed(4)}
+          </h3>
+          <div style={{ display: 'flex', gap: 8 }}>
+            <select
+              value={spendHours}
+              onChange={e => { const h = Number(e.target.value); setSpendHours(h); void loadSpend(h, spendBy); }}
+            >
+              <option value={24}>last 24h</option>
+              <option value={168}>last 7 days</option>
+              <option value={720}>last 30 days</option>
+            </select>
+            <select
+              value={spendBy}
+              onChange={e => { const b = e.target.value as typeof spendBy; setSpendBy(b); void loadSpend(spendHours, b); }}
+            >
+              <option value="model">by model</option>
+              <option value="purpose">by purpose</option>
+              <option value="agent_id">by agent</option>
+            </select>
+          </div>
+        </div>
+        {!spend && <p className="meta">no spend recorded yet</p>}
+        {spend && (
+          <>
+            {(spend.groups || []).slice(0, 12).map((g: any) => (
+              <div
+                key={g.key}
+                style={{ display: 'flex', justifyContent: 'space-between', gap: 12, fontSize: 13 }}
+              >
+                <code>{g.key}</code>
+                <span className="meta">
+                  ${g.usd.toFixed(4)} · {g.calls} calls · {g.tokens.toLocaleString()} tokens
+                  {g.unpriced ? ` · ${g.unpriced} unpriced` : ''}
+                </span>
+              </div>
+            ))}
+            {spend.unpriced_calls > 0 && (
+              <p className="meta" style={{ marginTop: 8 }}>
+                {spend.unpriced_calls} call{spend.unpriced_calls === 1 ? '' : 's'} carry no price —
+                a backend that is not the LiteLLM proxy, or a call that failed before reaching a
+                model. They are counted here, not in the total.
+              </p>
+            )}
+            <p className="meta" style={{ marginTop: 8 }}>
+              Priced by the LiteLLM proxy per call, so this covers every model it serves including
+              Bedrock. It is AEGIS&apos;s own accounting of what it asked for, not a reconciliation
+              of the provider invoice.
+            </p>
+          </>
+        )}
+      </div>
 
       <div className="card" style={{ marginTop: 12, display: 'flex', flexDirection: 'column', gap: 10 }}>
         <div className="cfg-row">

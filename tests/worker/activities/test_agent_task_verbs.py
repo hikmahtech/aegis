@@ -58,25 +58,26 @@ async def _ctx_seed(db_pool):
     await db_pool.execute("DELETE FROM todoist_capture_idempotency WHERE todoist_task_ref LIKE 'ct-%'")
 
 
-async def test_load_task_context_alert_fingerprint(db_pool, _ctx_seed):
+async def test_load_task_context_reads_the_capture_source(db_pool, _ctx_seed):
+    """The alert lane's own id is on the row, but only as `external_id`: the
+    `fingerprint` this used to split out was the pre-hub identity, and nothing
+    has looked an alert up by one since the hub replaced that lookup."""
     ctx = await AgentTaskActivities(db_pool=db_pool).load_task_context("ct-1")
-    assert ctx["fingerprint"] == "a2827e4213f4dae4"
+    assert ctx["external_id"] == "alert-a2827e4213f4dae4"
     assert ctx["gmail_message_id"] == ""
+    assert "fingerprint" not in ctx and "problem_id" not in ctx
 
 
 async def test_load_task_context_gmail_message_id(db_pool, _ctx_seed):
     ctx = await AgentTaskActivities(db_pool=db_pool).load_task_context("ct-2")
     assert ctx["gmail_message_id"] == "19f761cbfd89d8c8"
-    assert ctx["fingerprint"] == ""
 
 
 async def test_load_task_context_missing_row_is_empty(db_pool, _ctx_seed):
     ctx = await AgentTaskActivities(db_pool=db_pool).load_task_context("ct-absent")
     assert ctx == {
         "external_id": "",
-        "fingerprint": "",
         "gmail_message_id": "",
-        "problem_id": "",
         "subject": "",
         "subject_kind": "",
     }
@@ -92,7 +93,8 @@ async def test_load_task_context_reads_the_hub_problem_behind_a_task(db_pool, _c
     )
     try:
         ctx = await AgentTaskActivities(db_pool=db_pool).load_task_context("ct-3")
-        assert ctx["problem_id"] == pid and ctx["subject"] == "ct_svc"
-        assert ctx["external_id"] == "" and ctx["fingerprint"] == ""
+        assert ctx["subject"] == "ct_svc" and ctx["subject_kind"] == "service"
+        assert ctx["external_id"] == ""
+        assert pid
     finally:
         await db_pool.execute("DELETE FROM problems WHERE id = $1::uuid", pid)

@@ -141,7 +141,7 @@ the checklist to work through after a deploy.
 | Subsystem | What it needs | Where |
 |---|---|---|
 | Social publishing | `social_publishing_enabled` + a connected account | Integrations / Settings |
-| LLM spend governor | a non-zero `daily_token_budget` (defaults to 0) | Settings |
+| LLM spend governor | a non-zero `daily_token_budget` or `daily_usd_budget` in `settings.llm_governor` (both default to 0) | Settings |
 | Drive sync | a `folder_id` on `drive-sync-raphael` | admin **Flows** |
 | Wearable ingest | `oura_api_token` **and** an active `wearable` channel row | Integrations + Channels |
 | Expiry radar | at least one `life.expiring_items` row (empty registry = silent) | admin **Expiring Items** / **Assets** |
@@ -366,9 +366,16 @@ still stuck after `restuck_hours` is re-investigated on that same problem, once 
 `restuck_hours` (`stale_stuck_problems`).
 
 **Cross-source dedup invariant:** a heartbeat-detected outage and an alertmanager-pushed
-one collapse onto ONE signature (`infra-class:<cluster>:<alertname>`) only when the
-`infra_cluster` setting equals the Prometheus `cluster` label — otherwise they key on
-different clusters and dedup won't merge them.
+one collapse onto ONE problem when they produce the same correlation key,
+`{class}:{subject_kind}:{subject}` — for a down service, `dockerservicedown:service:<name>`.
+The class comes from the alert name and the subject from the service or node, both
+slugged, so what has to match across sources is the SERVICE NAME and the alert name, not
+the cluster. The old `infra-class:<cluster>:<alertname>` signature is gone with the rest of
+the pre-hub dedupe, and `infra_cluster` no longer affects whether two alerts merge.
+
+Two sources that name the same service differently will still make two problems. That is
+recoverable: fold one into the other with `merge_problems`, or the Merge button on the
+admin **Problems** page.
 
 Configure on the admin Integrations page (worker restart required):
 

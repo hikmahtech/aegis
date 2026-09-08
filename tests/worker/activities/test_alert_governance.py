@@ -26,7 +26,7 @@ async def test_stage_pending_pr_creates_row(db_pool):
     pr_id = await env.run(
         act.stage_pending_pr,
         StagePendingPrInput(
-            alert_fingerprint="github:workflow_run:youruser/aegis:abc12345",
+            problem_id="",
             repo="youruser/aegis",
             branch="fix/null-check",
             title="fix: null check in foo()",
@@ -87,7 +87,7 @@ async def test_create_github_pr_push_failure_does_not_crash_on_logging(db_pool):
     pr_id = await env.run(
         act.stage_pending_pr,
         StagePendingPrInput(
-            alert_fingerprint="chat-investigate:acme/bcp:exec-info",
+            problem_id="",
             repo="acme/bcp",
             branch="aegis-fix/chat-investigate-x",
             title="fix: remove invalid exec_info kwarg",

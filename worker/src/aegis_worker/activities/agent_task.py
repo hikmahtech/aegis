@@ -254,17 +254,25 @@ class AgentTaskActivities:
 
     @activity.defn
     async def load_task_context(self, task_id: str) -> dict:
-        """Recover the source identity a task was captured from.
+        """What the flow needs to know about where a task came from.
 
         `todoist_capture_idempotency` links task → external_id with near-total
         coverage in prod (41/42 #alert, 30/30 #email). external_id is prefixed
-        by source: `alert-<fingerprint>`, `gmail-<message_id>`.
+        by source: `alert-<fingerprint>`, `gmail-<message_id>`, which is why
+        the mail lane can read a message id back out of it.
+
+        `subject` / `subject_kind` come from the problem behind the task, so
+        the infra verb resolves a service from `problems.subject` instead of
+        parsing it out of a title.
+
+        Every key here has a reader. The alert `fingerprint` this used to
+        return was the pre-hub identity — nothing has looked one up since the
+        problem hub replaced that lookup, and the problem id it also returned
+        was never read either: `subject` is what the verb actually needs.
         """
         empty = {
             "external_id": "",
-            "fingerprint": "",
             "gmail_message_id": "",
-            "problem_id": "",
             "subject": "",
             "subject_kind": "",
         }
@@ -288,11 +296,9 @@ class AgentTaskActivities:
         external_id = external_id or ""
         return {
             "external_id": external_id,
-            "fingerprint": external_id[len("alert-") :] if external_id.startswith("alert-") else "",
             "gmail_message_id": (
                 external_id[len("gmail-") :] if external_id.startswith("gmail-") else ""
             ),
-            "problem_id": problem["id"] if problem else "",
             "subject": problem["subject"] if problem else "",
             "subject_kind": problem["subject_kind"] if problem else "",
         }

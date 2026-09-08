@@ -20,6 +20,7 @@ from aegis.services.hub import (
     ingest_event,
     merge_problems,
     set_service_state,
+    set_status,
 )
 from aegis.services.hub_project import (
     COLLAPSE_WINDOW,
@@ -655,3 +656,34 @@ async def test_merging_a_resolved_duplicate_does_not_close_the_kept_task(db_pool
         is False
     ), "the kept problem is open; its task must stay open"
     assert (await get_problem(db_pool, keep.problem_id))["status"] == "open"
+
+
+# --- a resolve closes the task whichever path reached it (PR 9) ---------------
+
+
+async def test_resolving_by_status_closes_the_task_like_a_resolved_alert(db_pool, inbox, todoist):
+    """`set_status(..., 'resolved')` is how an investigation and the admin
+    panel's Resolve button finish a problem. It used to write `set_status`,
+    which the projector ignores, so the problem read resolved while its task
+    stayed open with no closing comment — the human saw nothing.
+
+    Falsifiable: write `set_status` for a resolve again and the task stays
+    open and uncommented.
+    """
+    s = _subject()
+    r = await ingest_event(db_pool, _occ(s, 1), now=NOW)
+    task = (await project(db_pool, r.problem_id, now=NOW))["task_id"]
+    await _mirror_task(db_pool, task)
+
+    assert await set_status(db_pool, r.problem_id, "resolved", reason="fixed by hand", now=NOW)
+    out = await project(db_pool, r.problem_id, now=NOW + timedelta(minutes=1))
+
+    assert out["comments"] == 1
+    note = _cmds(todoist, "note_add")[-1]["args"]["content"]
+    assert "Resolved" in note and "Closing this task" in note
+    assert await db_pool.fetchval(
+        "SELECT is_completed FROM todoist_tasks WHERE id = $1", task
+    ) is True
+    assert await db_pool.fetchval(
+        "SELECT count(*) FROM todoist_outbox WHERE temp_id = $1", f"problem-close-{task}"
+    ) == 1

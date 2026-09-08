@@ -123,6 +123,35 @@ def _filter_patterns(model_filter: str) -> list[str]:
     return [f"%{part.strip()}%" for part in model_filter.split(",") if part.strip()]
 
 
+async def llm_spend_last_24h(pool: Any, model_filter: str = "") -> dict[str, Any]:
+    """What the last 24h cost, as the LiteLLM proxy priced each call.
+
+    Returns ``{"usd": float, "priced": int, "unpriced": int}``. `unpriced` is
+    the number of calls with no cost recorded — a backend that is not the
+    proxy, or a call that failed before reaching a model. It is reported
+    rather than folded into the total, because "we spent $0.40" and "we spent
+    $0.40 that we know of, on 12 of 300 calls" are different statements and
+    only one of them is safe to budget against.
+    """
+    sql = (
+        "SELECT COALESCE(SUM(cost_usd), 0)::float8 AS usd, "
+        "       count(*) FILTER (WHERE cost_usd IS NOT NULL) AS priced, "
+        "       count(*) FILTER (WHERE cost_usd IS NULL) AS unpriced "
+        "FROM llm_calls WHERE created_at > NOW() - INTERVAL '24 hours'"
+    )
+    patterns = _filter_patterns(model_filter)
+    if patterns:
+        sql += " AND model ILIKE ANY($1::text[])"
+        row = await pool.fetchrow(sql, patterns)
+    else:
+        row = await pool.fetchrow(sql)
+    return {
+        "usd": float(row["usd"] or 0.0),
+        "priced": int(row["priced"] or 0),
+        "unpriced": int(row["unpriced"] or 0),
+    }
+
+
 async def llm_tokens_last_24h(pool: Any, model_filter: str = "") -> int:
     """Total input+output tokens recorded in ``llm_calls`` over the last 24h.
 
