@@ -249,32 +249,52 @@ export default function Problems() {
               {!detail && <p className="meta">loading…</p>}
               {detail && detail.problem && detail.problem.id === p.id && (
                 <>
-                  <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginBottom: 12 }}>
-                    <button className="btn btn-sm" disabled={busy !== ''}
-                      onClick={() => act(() => api.muteProblem(p.id, 24), 'mute')}>
+                  <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginBottom: 6 }}>
+                    <button
+                      className="btn btn-sm"
+                      disabled={busy !== ''}
+                      title="Stop raising this for 24 hours. Occurrences are still recorded and still counted; nothing is investigated and nothing is commented until it lapses."
+                      onClick={() => act(() => api.muteProblem(p.id, 24), 'mute')}
+                    >
                       Mute 24h
                     </button>
-                    <button className="btn btn-sm" disabled={busy !== '' || p.status === 'resolved'}
-                      onClick={() => act(() => api.resolveProblem(p.id, 'resolved from the admin panel'), 'resolve')}>
+                    <button
+                      className="btn btn-sm"
+                      disabled={busy !== '' || p.status === 'resolved'}
+                      title="Say this is fixed. The task gets a closing comment and is completed; a recurrence within 24 hours reopens this same problem."
+                      onClick={() => act(() => api.resolveProblem(p.id, 'resolved from the admin panel'), 'resolve')}
+                    >
                       Resolve
                     </button>
-                    <button className="btn btn-sm" disabled={busy !== '' || p.status !== 'resolved'}
-                      onClick={() => act(() => api.closeProblem(p.id), 'close')}>
+                    <button
+                      className="btn btn-sm"
+                      disabled={busy !== '' || p.status !== 'resolved'}
+                      title="Retire a resolved problem now instead of waiting for the nightly sweep. This frees its key, so the same thing breaking again starts a fresh problem rather than reopening this one."
+                      onClick={() => act(() => api.closeProblem(p.id), 'close')}
+                    >
                       Close
                     </button>
+                  </div>
+                  <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center', marginBottom: 12 }}>
+                    <span className="meta">Same thing under another name? Paste the duplicate&apos;s id:</span>
                     <input
                       className="mono"
                       style={{ maxWidth: '22rem' }}
                       value={mergeInto}
                       onChange={e => setMergeInto(e.target.value)}
-                      placeholder="duplicate problem id to fold into this one"
+                      placeholder="problem id of the duplicate"
+                      aria-label="Problem id of the duplicate to fold into this one"
                     />
-                    <button className="btn btn-sm" disabled={busy !== '' || !mergeInto.trim()}
+                    <button
+                      className="btn btn-sm"
+                      disabled={busy !== '' || !mergeInto.trim()}
+                      title="Move that problem's events, links and sessions onto this one and close it, with a link back. Its own task is completed with a note pointing here."
                       onClick={() => act(async () => {
                         await api.mergeProblems(p.id, mergeInto.trim());
                         setMergeInto('');
-                      }, 'merge')}>
-                      Merge in
+                      }, 'merge')}
+                    >
+                      Fold into this problem
                     </button>
                   </div>
 

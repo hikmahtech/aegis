@@ -735,7 +735,17 @@ async def set_status(
             f"{source}:{problem_id}:{status}:{now.isoformat()}",
             row["severity"],
             {
-                "action": "reopen" if reopening else "set_status",
+                # `resolve` and `reopen` are the two words the PROJECTOR acts
+                # on: it closes a task on one and reopens it on the other.
+                # Writing `set_status` for a move into `resolved` left the
+                # problem resolved and its task open with no closing comment —
+                # so an investigation that ended `resolved`, and the admin
+                # panel's Resolve button, both said nothing to the human
+                # looking at the task. A resolve reached this way is the same
+                # event as a resolve reached by an incoming `resolved` alert.
+                "action": (
+                    "reopen" if reopening else ("resolve" if status == "resolved" else "set_status")
+                ),
                 "status": status,
                 "reason": reason[:300],
             },

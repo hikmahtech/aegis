@@ -115,7 +115,12 @@ async def test_set_status_moves_a_live_problem_and_records_it(db_pool):
     p = await get_problem(db_pool, r.problem_id)
     assert p["status"] == "resolved" and p["resolved_at"] == NOW + timedelta(hours=1)
     changes = [e["payload"] for e in await list_events(db_pool, r.problem_id) if e["kind"] == "state_change"]
-    assert [c["status"] for c in changes if c.get("action") == "set_status"] == ["resolved", "investigating"]
+    # A move into `resolved` is written as `resolve`, the same word an
+    # incoming resolved alert writes — it is what the projector closes a task
+    # on, so a resolve reached from an investigation or the admin panel says
+    # the same thing on the task as one reached from the producer.
+    assert [c["status"] for c in changes if c.get("action") == "set_status"] == ["investigating"]
+    assert [c["status"] for c in changes if c.get("action") == "resolve"] == ["resolved"]
 
 
 async def test_set_status_rejects_closed_and_bad_values(db_pool):
