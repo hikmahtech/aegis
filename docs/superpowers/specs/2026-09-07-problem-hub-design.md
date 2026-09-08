@@ -664,12 +664,23 @@ key, which is why the judgement is fenced in on every side: same class, same
 subject kind, a model that has to say yes, and a fold that is reversible
 because nothing is deleted.
 
+Shipped and exercised in production on 2026-09-08. The first sweep found both
+live clusters and took them apart correctly, which is the behaviour to hold it
+to: it folded five `stuck_post` problems ("all posts are stuck in the same
+queue … a single queue drainage issue rather than individual post failures")
+and refused three `swarmoverlayblackhole` ones ("different hosts …, different
+overlay networks …, and different endpoint counts suggest independent network
+partitioning issues"). Both judgements together cost $0.0009. The runbook —
+reading the groups, forgetting a verdict, unpicking a fold — is
+`docs/infrastructure.md` under "Groups: one problem for the same failure on
+many things".
+
 ## Files touched
 
 | Area | Files |
 |---|---|
-| Migrations | `migrations/030_problem_hub.sql`, `031_service_state.sql`, `033_drop_alert_mutes.sql`, `034_work_sessions.sql` |
-| Core | `services/hub.py` (new), `services/tools/hub.py` (new), `services/chat.py` (four schemas, four registry entries), `services/alert_tasks.py` (folded into hub), `services/task_sessions.py` → `work_sessions.py`, `api/routes/hub.py` (new), `api/routes/webhooks.py` (deploy events, producers), `api/routes/mcp_server.py` (`_UNSERVED_TOOLS`), `connectors/remote_script.py` (`account` returned from launch) |
+| Migrations | `migrations/030_problem_hub.sql`, `031_service_state.sql`, `033_drop_alert_mutes.sql`, `034_work_sessions.sql`, `040_problem_groups.sql` (§14) |
+| Core | `services/hub.py` (new), `services/hub_group.py` (new, §14), `services/tools/hub.py` (new), `services/chat.py` (four schemas, four registry entries), `services/alert_tasks.py` (folded into hub), `services/task_sessions.py` → `work_sessions.py`, `api/routes/hub.py` (new), `api/routes/webhooks.py` (deploy events, producers), `api/routes/mcp_server.py` (`_UNSERVED_TOOLS`), `connectors/remote_script.py` (`account` returned from launch) |
 | Worker | `flows/alert_investigation.py`, `flows/infra_heartbeat.py`, `flows/flow_health.py`, `flows/delivery_watchdog.py`, `flows/service_drift.py`, `flows/cert_radar.py`, `flows/expiry_radar.py`, `flows/social_metrics.py`, `flows/llm_spend_guard.py`, `flows/github_alert.py`, `flows/sentry_poll.py`, `flows/clarify.py`, `flows/agent_task.py`, `flows/cleanup.py`, `activities/alerts.py`, `activities/homelab.py`, `activities/flow_health.py`, `activities/social.py`, `activities/agent_task.py`, `activities/cleanup.py`, `activities/briefing.py`; `activework/` deleted |
 | Admin | `admin-panel/frontend/src/pages/Problems.tsx` (new), `Overview.tsx` (count) |
 | Seed | `config/seed/activities.yaml` (`collapse_window`, `reopen_window`, per-class `verify_seconds` and thresholds on the hub sweep row) |

@@ -415,6 +415,104 @@ SELECT subject, state, until_at, set_by FROM service_state ORDER BY updated_at D
 backfill, which was its last reader. The recurrence history it held is now
 `problems.occurrences` and one `problem_events` row per occurrence.
 
+### Groups: one problem for the same failure on many things
+
+Six Postiz posts wedged in the same queue used to be six problems and six
+Todoist tasks. `HubSweepFlow` now folds a cluster like that into one **group**
+problem, and every later occurrence of the class joins it instead of opening
+another task. Migration 040 adds the `problems.group_key` column and the
+partial unique index that keeps one live group per class and kind.
+
+**How a group happens.** Every five minutes the sweep looks for three or more
+live, ungrouped problems sharing a class and a subject kind, seen in the last
+72 hours. If it finds one, it spends a single `think()` call (purpose
+`hub_group_judge`, so it shows on the admin **Models** page like any other)
+asking whether they are one condition. Only a yes folds them. A no is cached
+in `settings.hub_group_verdicts` for 24 hours and re-asked early only if the
+cluster grew, so the sweep does not re-price the same question every tick —
+most ticks make no call at all. At most two clusters are judged per tick.
+
+The first run in production, 2026-09-08, is the shape to expect:
+
+```
+stuck_post:post              grouped=true  n=5
+  "All posts are stuck in the same queue (Postiz QUEUE), indicating a single
+   queue drainage issue rather than individual post failures."
+swarmoverlayblackhole:service grouped=false n=3
+  "Different hosts (pop-think-os, daal, meem), different overlay networks
+   (monitoring vs traefik_public), and different endpoint counts suggest
+   independent network partitioning issues requiring separate investigation."
+```
+
+Both judgements cost $0.0009 together.
+
+**What you see.** The surviving task is renamed for what it now covers ("5
+posts stuck in Postiz QUEUE"), gets a comment naming the members folded in,
+and its status block gains a `Group:` line and a `problem:` link per member.
+Each swallowed task is completed with a note pointing at the survivor. A card
+goes to the infra agent's channel saying what was grouped and why.
+
+**What it will never do**, enforced in code rather than left to the judge:
+group across classes; group the `manual` class (those problems ARE hand-written
+`@code` tasks, and folding two would move one task's sessions and PR links onto
+another); or group on the count alone.
+
+**Recovery.** `hub_watch.reconcile_findings` resolves a group only when its
+watchdog stops finding *any* member of the class — a group's `*` subject is
+never among the findings, so without that it would resolve every tick.
+
+```sql
+-- which groups exist, and what each swallowed
+SELECT id, group_key, title, status, occurrences, todoist_task_id FROM problems
+WHERE group_key IS NOT NULL AND closed_at IS NULL;
+
+SELECT payload FROM problem_events
+WHERE payload->>'action' = 'grouped' ORDER BY id DESC LIMIT 5;
+
+-- clusters the next sweep would consider (mirrors hub_group.candidates)
+SELECT class, subject_kind, count(*) FROM problems
+WHERE closed_at IS NULL AND status NOT IN ('resolved','closed') AND group_key IS NULL
+  AND class <> '' AND class <> 'manual' AND subject <> '' AND subject_kind <> ''
+  AND last_seen_at >= now() - interval '72 hours'
+GROUP BY 1,2 HAVING count(*) >= 3;
+
+-- what the judge has already decided
+SELECT jsonb_pretty(value) FROM settings WHERE key = 'hub_group_verdicts';
+```
+
+**To unpick a group**, take the members from its timeline (the `grouped` event
+lists their subjects, and `problem_links` holds their ids) and reopen the ones
+that deserve their own problem. Nothing was deleted: each member is a closed
+problem with its events moved onto the group and a link back.
+
+**To make the sweep forget a verdict** — you disagree, or the situation
+changed — delete that key from the cache and it asks again on the next tick:
+
+```sql
+UPDATE settings SET value = value - 'stuck_post:post', updated_at = now()
+WHERE key = 'hub_group_verdicts';
+```
+
+**To stop it grouping one particular cluster**, write the "no" yourself. The
+sweep honours a cached verdict, so a hand-written one keeps it away for 24
+hours at a time, and for good while the member count stays at or below what
+you record:
+
+```sql
+UPDATE settings SET value = value || jsonb_build_object(
+  'stuck_post:post', jsonb_build_object(
+    'decided_at', now()::text, 'grouped', false,
+    'member_count', 999, 'reason', 'operator: keep these separate')),
+  updated_at = now()
+WHERE key = 'hub_group_verdicts';
+```
+
+There is no threshold knob on the sweep's `activities.config` row yet
+(`HubSweepConfig` carries the fields; the registry does not populate them —
+issue #448). Until it does, the verdict cache above is the control, and
+turning the whole sweep off is not an alternative: it also stops suppression
+promotion and projection.
+
 ## System monitoring (`hosts_aegis`)
 
 The admin **System monitoring** page shows the live health of AEGIS's *own*
