@@ -1,7 +1,8 @@
 # Bank statement ingest and reconciliation — design
 
 **Date:** 2026-09-07
-**Status:** design, approved in outline; not implemented
+**Status:** steps 1-3 built and deployed; steps 4-9 not started
+**Amended:** 2026-09-09 — see §15, which supersedes §11 and revises §9.4 and the build order
 **Owner lane:** Maou / money
 **Builds on:** `2026-09-05-maou-books-design.md` (the books), PR #409 (`ref` column, instrument
 resolution), PR #418 (`drive.file` scope)
@@ -400,6 +401,10 @@ anything under lien, so check Axis first and treat HDFC's as advisory for a few 
 
 ### 9.4 Ambiguous rows are not posted
 
+> **Revised by §15.6.** The rule stands. What is added is a
+> destination for the uncertainty — a hub finding, and eventually a card — instead of a digest
+> line nobody actions.
+
 An ambiguous row means two or more journal transactions already carry this amount on this instrument
 in the window. **One of them is this row**, so posting it adds a third copy of the money that the
 balance already includes through the candidate. Store `skip_reason='ambiguous'` with the candidate
@@ -422,6 +427,11 @@ person picks: the books stay balanced, §9.3's check still passes, the uncertain
 Only a short body after a valid token is worth another password — distinguish the three HDFC bodies.
 
 ## 11. Monitoring
+
+> **Superseded by §15.4.** The "existing machinery" this section assumed did not
+> exist for the money lane. It does now — the problem hub — and both alerts plus their recovery
+> collapse into one `reconcile_findings` call. The requirements below still hold; the mechanism
+> does not.
 
 Two alerts, both on existing machinery. **Coverage** — did a statement arrive last month for each
 declared account? That catches a bank silently stopping, which would otherwise pass unnoticed for a
@@ -463,6 +473,9 @@ statements, structurally faithful and numerically altered. The tests this design
 
 ## 14. Build order
 
+> **Revised by §15.9.** Steps 1-3 are built. Step 4b is new, step 8 mostly
+> disappears, and an optional step 9 is added.
+
 1. The migration, password derivation (§5.3), the `drive.readonly` scope check (§5.5), the Axis PDF
    parser and header-anchor identification (§6.1), with the arithmetic check (§6.2).
 2. The HDFC HTML parser, per `hdfc-smartstatement-recipe.md`, against the 3 statements already in
@@ -479,3 +492,135 @@ statements, structurally faithful and numerically altered. The tests this design
 
 Steps 1–3 are safe to run against production data without touching the ledger, and they are where
 every remaining unknown lives — deliberately, because they buy the evidence the rest assumes.
+
+---
+
+## 15. Amendment 2026-09-09 — this lane rides the problem hub
+
+### 15.1 Why this is an amendment
+
+The books shipped 2026-09-05. The problem hub's design landed 2026-09-07. This spec was written
+the same day, and the two never met: no file in the money lane calls `hub.ingest_event`, money
+never opens an `interactions` card, and `hub.SOURCES` — a closed vocabulary — has no money entry.
+
+So §9 and §11 hand-roll four primitives the hub already owns, and one of them was a live bug.
+`post_money_event` gated `mark_due_paid` on the Todoist close succeeding; `mark_due_paid` has one
+caller and nothing re-drives it, so every close failure left a paid bill in every "dues open"
+count forever (#449, fixed in #450). The hub's rule — the task is a projection, never the
+identity — is exactly what was missing.
+
+Steps 1–3 are built and unaffected. This amendment changes steps 5, 8 and 9.4, and adds a small
+step 4b.
+
+### 15.2 What the hub already owns
+
+| Concern | Hub mechanism |
+|---|---|
+| Identity | `correlation_key = '{class}:{subject_kind}:{subject}'`, one pure function |
+| Idempotency | `UNIQUE (source, external_id)` on `problem_events`, read under an advisory lock taken **first** |
+| One-open-per-thing | Partial unique index `problems_open_key … WHERE closed_at IS NULL`, never application code |
+| Human surface | `hub_project.project` renders a Todoist task; `problem_links` is the only reverse lookup; nothing is ever parsed back |
+| Lifecycle | `decide()`, a pure transition table; every transition also writes a `state_change` row, so the timeline is a query, never a diff |
+| Recovery | `hub_watch.reconcile_findings` resolves the **complement** of the current findings set, in the same call |
+| Many victims, one cause | `hub_group` folds them into one problem |
+| Noise | `service_state` windows and `muted_until` record and count everything, and withhold only projection |
+
+### 15.3 Prerequisite — new build step 4b
+
+Small, and everything below depends on it:
+
+1. Add `"money"` to `hub.SOURCES`. Precedent: `expiry` (cert_radar) and `social` (stuck posts)
+   already ride the hub and neither is infrastructure.
+2. One `Event` builder in the money lane mapping a reconciliation finding to a hub event.
+   Classes, all deterministic: `closing_balance`, `unmatched_rows`, `ambiguous_row`,
+   `statement_missing`, `unparsed_file`, `unscoped_instrument`, `missing_rate`,
+   `password_failed`. `subject_kind` is `instrument` for account-scoped findings and
+   `statement` for file-scoped ones.
+
+### 15.4 §11 Monitoring is replaced, not extended
+
+§11 named two alerts and assumed "existing machinery" that does not exist for this lane. It does
+now, and it is one call rather than two alert paths.
+
+`match_statements` **already returns the findings set** — `MatchRun.unscoped_instruments`,
+`MatchRun.missing_rates`, and the per-statement `StatementSummary` counts. The reconciliation
+sweep hands them to `hub_watch.reconcile_findings(source="money", subject_kind="instrument",
+classes=[…], findings=[…])`, and three things follow for free:
+
+- a new finding becomes a problem and earns a Todoist task;
+- a finding that has **gone** since the last tick resolves itself — there is no close path to
+  write, which is the half every hand-rolled watchdog gets wrong;
+- coverage ("no statement last month for a declared account") is a finding like any other, and
+  stops being one the day the statement lands.
+
+The closing-balance mismatch of §9.3 is an event rather than a finding: it happens on arrival,
+not on a sweep, so `BooksCheckError` becomes an `ingest_event` with `klass="closing_balance"`,
+`severity="critical"`, `subject=<statement_id>`.
+
+**Deleted from the plan:** the bespoke alert wiring. **Kept:** the monthly digest, which is a
+report, not an alert.
+
+### 15.5 Grouping is what makes step 5 survivable
+
+Step 5 posts roughly 959 transactions into books that hold 34. The number was frightening
+because 959 things cannot be reviewed. Grouped, they are one problem per account —
+"214 unmatched rows on `axis-cc-1313`" — with a live count that falls as the chart and the rules
+improve, and the 215th row joins it instead of opening another task. Without grouping, step 5 is
+a nagging machine and would be abandoned in week one, exactly as §3 predicted for per-row cards.
+
+**Do not copy `hub_group`'s LLM judge.** The hub pays for a model call because three services
+crash-looping may be three unrelated causes. Here the grouping key is deterministic by
+construction — same instrument, same `skip_reason` — so `find_group_candidates` → `apply_group` runs with the
+`judge_group` call omitted and no cached verdict.
+
+One rule to carry over verbatim: a group's subject is `*` and can never appear among the
+findings, so it recovers only when its class stops being found **at all**. Check membership by
+class, not by subject, or the group resolves on every single tick.
+
+### 15.6 §9.4 gains a destination, and keeps its rule
+
+The rule does not change: an ambiguous row is still not posted, for the reason §9.4 gives — one
+of the candidates already carries this money. What changes is that the uncertainty now has
+somewhere to go instead of a digest line nobody actions. An ambiguous row is a
+`klass="ambiguous_row"` finding; resolution is a person picking a candidate, through an
+`InteractionFlow` card carrying the numbered candidates.
+
+Sequence it, though: a card per row is the chore §3 rejected, and at 959 rows it would be worse
+than the digest. Group first, keep ambiguous rows report-only, and turn the card on once the
+residue is small enough to be a handful a month.
+
+### 15.7 What NOT to take from the hub
+
+- **`AlertInvestigationFlow`'s investigation half.** A closing-balance mismatch is not a code
+  bug, so the coding-CLI step and the repo resolver are wrong here. Take the identity and, if
+  anything, the Gate-2 card. The simplest correct version starts no flow at all: ingest, project,
+  done.
+- **`class='manual'` non-groupability.** That rule protects a hand-written task's sessions and PR
+  links. Nothing here has those.
+- **The 30-minute collapse window.** Statements arrive monthly; there is nothing to collapse.
+
+### 15.8 Two rules the hub learned the hard way, which apply here
+
+- **A money-lane comment needs its own recognisable footer.** Every hub comment carries
+  `Workflow run: problem-hub` so clarify's loop guard and `work_sessions.is_user_note` exclude
+  it. A projector without one re-reads its own comments as human signal — the self-grading loop
+  that made 39 of 39 "user corrections" fake.
+- **Every guard fails open, and records what it suppresses.** `service_state` failing to read
+  suppresses nothing rather than hiding real occurrences. #449 was the opposite: a Todoist API
+  failure decided whether the books believed a bill was paid. When a check about *noise* can
+  change what the *record* says, it is in the wrong place.
+
+### 15.9 The build order this replaces
+
+| Step | §14 said | Now |
+|---|---|---|
+| 4 | `!` status, `rewrite_block`, one-off rewrite | unchanged |
+| **4b** | — | **new:** `"money"` in `hub.SOURCES` + the money `Event` builder |
+| 5 | post through `post_event` + closing-balance check | + `ingest_event` on mismatch; + grouped `unmatched_rows` findings |
+| 6 | transfer matcher, own-account detection | unchanged |
+| 7 | A1 intake | unchanged; `password_failed` and `unparsed_file` become findings |
+| 8 | digest and two alerts | **mostly deleted** — `reconcile_findings` + deterministic grouping. Digest stays |
+| **9** | — | **new, optional:** the ambiguous-row card, once the residue is small |
+
+Net: one step of bespoke alerting removed, one small step added, and step 5 becomes reviewable at
+959 rows instead of unusable.
