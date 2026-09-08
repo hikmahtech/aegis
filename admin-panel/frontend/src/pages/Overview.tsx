@@ -68,9 +68,13 @@ export default function Overview() {
           <span className="stat-value">{brief?.pending_interactions ?? '—'}</span>
           <span className="stat-label">Pending decisions</span>
         </div>
+        <Link to="/problems" className="stat-item">
+          <span className="stat-value">{brief?.open_problems ?? '—'}</span>
+          <span className="stat-label">Open problems</span>
+        </Link>
         <div className="stat-item">
-          <span className="stat-value">{brief?.recent_alerts_24h ?? '—'}</span>
-          <span className="stat-label">Alerts · 24h</span>
+          <span className="stat-value">{brief?.occurrences_24h ?? '—'}</span>
+          <span className="stat-label">Occurrences · 24h</span>
         </div>
         <div className="stat-item">
           <span className="stat-value">{agents.length || '—'}</span>

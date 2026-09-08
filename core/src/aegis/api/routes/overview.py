@@ -22,17 +22,31 @@ async def get_brief(request: Request) -> dict[str, Any]:
     pending_interactions = await pool.fetchval(
         "SELECT count(*) FROM interactions WHERE status = 'pending'"
     )
-    recent_alerts = (
+    # Both numbers come from the problem hub, which is the thing that knows.
+    # This used to count `AlertInvestigationFlow` runs and call them alerts —
+    # but the hub starts a flow only for a NEW or returning problem, so an
+    # alert that deduped onto an open problem, or that a deploy window
+    # suppressed, started no flow and went uncounted. The tile read zero while
+    # a service was flapping.
+    open_problems = (
         await pool.fetchval(
-            "SELECT count(*) FROM workflow_runs "
-            "WHERE workflow_type = 'AlertInvestigationFlow' "
-            "AND started_at > now() - interval '24 hours'"
+            "SELECT count(*) FROM problems WHERE closed_at IS NULL "
+            "AND status NOT IN ('resolved', 'suppressed') "
+            "AND (muted_until IS NULL OR muted_until <= now())"
+        )
+        or 0
+    )
+    occurrences_24h = (
+        await pool.fetchval(
+            "SELECT count(*) FROM problem_events WHERE kind = 'occurrence' "
+            "AND occurred_at > now() - interval '24 hours'"
         )
         or 0
     )
     return {
         "pending_interactions": pending_interactions or 0,
-        "recent_alerts_24h": recent_alerts,
+        "open_problems": open_problems,
+        "occurrences_24h": occurrences_24h,
     }
 
 
