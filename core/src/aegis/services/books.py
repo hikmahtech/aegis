@@ -324,6 +324,24 @@ _TAG_MAX = 80
 # meets.
 _SENDER_MAX = 200
 _POSTING_RE = re.compile(r"^    (\S+)(?:\s{2,}(\S.*))?$")
+# One transaction header: date, an OPTIONAL status flag, the payee.
+#
+# `rewrite_block` used to reach the payee with `lines[0].split(" * ", 1)[0]`,
+# which finds nothing on a pending block — so the whole header became the
+# "date part" and a rewrite produced `2026-09-02 ! Old Payee * New Payee`.
+# hledger reads that as a pending transaction whose DESCRIPTION is
+# "Old Payee * New Payee", `check --strict` accepts it, and nothing reverts.
+# Every `rewrite_event` caller hits it on the first `!` block: receipt<->bank
+# enrichment, `ledger_reclassify`, the `ledger_add_rule` sweep and the
+# curiosity answer hook.
+_HEADER_RE = re.compile(r"^(\d{4}-\d{2}-\d{2})\s+([*!])?\s*(.*)$")
+
+# What may stand between the date and the payee. Unmarked (neither flag) is
+# legal hledger and is what a hand-edited block may carry, so it is readable —
+# but it is not writable here: a caller asking for a status is asking for one
+# of these two, and silently accepting anything else would put arbitrary text
+# in the one position that decides what `--cleared` and `--pending` report.
+_STATUSES = ("*", "!")
 
 
 # Every C0 control and DEL. Three of them each break a different thing: a
@@ -400,7 +418,16 @@ def render_transaction(
             tags.append(f"{name}: {value}")
     amount = render_amount(event.amount, event.currency, negative=(event.direction == "in"))
     lines = [
-        f"{event.occurred_on.isoformat()} * {sanitize_payee(event.payee)}",
+        # `!` (pending), not `*` (cleared). Nothing has verified this: it came
+        # from an email the bank sent, not from the bank's own statement. Every
+        # block written before this change claimed to be bank-cleared, so
+        # `hledger bal --cleared` returned the whole journal and the flag
+        # carried no information at all. A statement row promotes it to `*`
+        # through `rewrite_event(status="*")`. `render_manual` stays `*`: a
+        # hand-typed `ledger_post` is the owner asserting the fact — and its
+        # msgid is a hash of the rendered block, so changing that rendering
+        # would break idempotency for a retry straddling the deploy.
+        f"{event.occurred_on.isoformat()} ! {sanitize_payee(event.payee)}",
         f"{_INDENT}; msgid: {msgid}",
         f"{_INDENT}; {', '.join(tags)}",
         _posting(counter_account, amount),
@@ -482,15 +509,33 @@ def rewrite_block(
     account: str | None = None,
     instrument_account: str | None = None,
     add_tags: dict[str, str] | None = None,
+    status: str | None = None,
 ) -> str:
+    """Rewrite one block in place.
+
+    `status` is the cleared/pending flag: `*` once a bank statement has proved
+    the transaction, `!` while nothing has. Omitting it KEEPS whatever the
+    block carries, which is what every caller that only means to change a
+    payee or an account wants — promotion is a separate decision from
+    reclassification, and a rewrite that quietly cleared a pending block would
+    be this lane asserting the very fact it exists to check.
+    """
+    if status is not None and status not in _STATUSES:
+        raise BooksError(f"status must be one of {_STATUSES}, not {status!r}")
     span = find_block(text, msgid)
     if span is None:
         raise BooksError(f"no journal block carries msgid {msgid}")
     start, end = span
     lines = text[start:end].rstrip("\n").split("\n")
-    if payee:
-        date_part = lines[0].split(" * ", 1)[0]
-        lines[0] = f"{date_part} * {sanitize_payee(payee)}"
+    if payee or status:
+        header = _HEADER_RE.match(lines[0])
+        if header is None:
+            raise BooksError(f"block {msgid} has an unreadable header: {lines[0][:60]!r}")
+        day, had_status, had_payee = header.groups()
+        # An unmarked block being given a payee becomes `*`, which is what it
+        # already meant to hledger before this function learned about status.
+        flag = status or had_status or "*"
+        lines[0] = f"{day} {flag} {sanitize_payee(payee) if payee else had_payee}"
     if add_tags:
         for key, value in add_tags.items():
             key, value = sanitize_tag(key), sanitize_tag(value)
@@ -1056,6 +1101,7 @@ async def rewrite_event(
     account: str | None = None,
     instrument_account: str | None = None,
     add_tags: dict[str, str] | None = None,
+    status: str | None = None,
 ) -> str:
     found: list[str] = []
 
@@ -1069,7 +1115,8 @@ async def rewrite_event(
             found.append(str(path.relative_to(cfg.path)))
             path.write_text(
                 rewrite_block(text, msgid, payee=payee, account=account,
-                              instrument_account=instrument_account, add_tags=add_tags)
+                              instrument_account=instrument_account, add_tags=add_tags,
+                              status=status)
             )
             return
         raise BooksError(f"no journal block carries msgid {msgid}")

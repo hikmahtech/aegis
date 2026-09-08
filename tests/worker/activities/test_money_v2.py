@@ -249,7 +249,7 @@ async def test_post_then_receipt_links_and_enriches(db_pool, tmp_path):
     assert r2["status"] == "linked" and r2["linked"] == "v2-personal/m-bank"
     assert r2["journal_file"] is None
     text = (cfg.path / "personal" / "2026.journal").read_text()
-    assert "2026-09-02 * Apple Music Individual" in text
+    assert "2026-09-02 ! Apple Music Individual" in text
     assert "    expenses:media                          ₹10.00\n    assets:bank:hdfc:1225\n" in text
     assert "receipt: v2-personal/m-rcpt" in text
     assert text.count("; msgid:") == 1
@@ -280,7 +280,7 @@ async def test_receipt_then_bank_links_and_fixes_instrument(db_pool, tmp_path):
     assert r2["status"] == "linked" and r2["linked"] == "v2-personal/m-rcpt"
     text = (cfg.path / "personal" / "2026.journal").read_text()
     assert text.count("; msgid:") == 1 and "bank: v2-personal/m-bank" in text
-    assert "2026-09-02 * Eleven Labs" in text
+    assert "2026-09-02 ! Eleven Labs" in text
     # A retry of the second-arriving email must not write a second block.
     # find_match excludes already-linked rows, so the linked branch would fall
     # through to post_event, whose msgid guard looks for a `; msgid:` line a
@@ -571,7 +571,7 @@ async def test_receipt_posts_its_own_block_when_the_matched_block_is_gone(db_poo
     # brief's reader has to pull on.
     logged = " ".join(rec.getMessage() for rec in caplog.records)
     assert "money_enrich_failed" in logged and "duplicate" in logged.lower()
-    assert "2026-09-03 * Apple Music Individual" in journal.read_text()
+    assert "2026-09-03 ! Apple Music Individual" in journal.read_text()
     # The index says what actually happened: posted, not linked.
     row = await ji.get(db_pool, "v2-personal/m-rcpt")
     assert row["journal_file"] == "personal/2026.journal"
@@ -603,7 +603,7 @@ async def test_bank_posts_its_own_block_when_the_matched_block_is_gone(db_pool, 
     assert r["status"] == "posted" and r["journal_file"] == "personal/2026.journal"
     assert r["linked"] is None
     text = journal.read_text()
-    assert "2026-09-03 * ELEVENLABS" in text and "    liabilities:card:axis:1313\n" in text
+    assert "2026-09-03 ! ELEVENLABS" in text and "    liabilities:card:axis:1313\n" in text
     row = await ji.get(db_pool, "v2-personal/m-bank")
     assert row["journal_file"] == "personal/2026.journal" and row["linked_message_id"] is None
 

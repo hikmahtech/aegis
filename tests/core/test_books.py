@@ -32,14 +32,14 @@ EV_IN = MoneyEvent(
 )
 
 BLOCK_OUT = (
-    "2026-09-02 * Jai shree nakoda\n"
+    "2026-09-02 ! Jai shree nakoda\n"
     "    ; msgid: arshad-personal/1a06cf5a\n"
     "    ; channel: upi, ref: 128932002048, instrument: hdfc-1225\n"
     "    expenses:unknown                        ₹10.00\n"
     "    assets:bank:hdfc:1225\n"
 )
 BLOCK_IN = (
-    "2026-09-02 * Stockopedia Ltd\n"
+    "2026-09-02 ! Stockopedia Ltd\n"
     "    ; msgid: arshad-personal/1a0659e3\n"
     "    ; channel: remittance, ref: GBC02096KFMGNXTS, instrument: axis-9640\n"
     "    income:hikmah:stockopedia               -£6285.01\n"
@@ -134,7 +134,7 @@ def test_rewrite_block_payee_account_instrument_and_tags():
         instrument_account="assets:bank:hdfc:0236", add_tags={"receipt": "arshad-personal/zz"},
     )
     assert out == HEADER + "\n" + (
-        "2026-09-02 * Corner Store\n"
+        "2026-09-02 ! Corner Store\n"
         "    ; msgid: arshad-personal/1a06cf5a\n"
         "    ; channel: upi, ref: 128932002048, instrument: hdfc-1225, receipt: arshad-personal/zz\n"
         "    expenses:groceries                      ₹10.00\n"
@@ -848,3 +848,85 @@ async def test_the_first_write_clones_with_the_lock_already_held(tmp_path):
     assert "; msgid: m/first" in posted and posted.endswith("    assets:bank:hdfc:1225\n")
     assert not (dest.parent / f".{dest.name}.cloning").exists()  # staging cleaned up
     assert await books.unpushed_commits(cfg) == 0  # it really pushed
+
+
+# ------------------------------------------------------- status flag (spec 9.1)
+
+def test_a_rewrite_keeps_a_pending_block_pending_and_does_not_swallow_the_payee():
+    """The bug this fixes, exactly.
+
+    `rewrite_block` reached the payee with `lines[0].split(" * ", 1)[0]`. On a
+    pending block there is no `" * "`, so the WHOLE header became the date part
+    and the result was `2026-09-02 ! Jai shree nakoda * Corner Store` — a
+    pending transaction whose description had eaten the old payee. hledger
+    parses that happily, `check --strict` accepts it, and nothing reverts, so
+    it is silent corruption rather than a failure.
+
+    Every `rewrite_event` caller reaches this on the first `!` block: the
+    receipt<->bank enrichment, `ledger_reclassify`, the `ledger_add_rule` sweep
+    and the curiosity answer hook.
+    """
+    text = books.append_block(HEADER, BLOCK_OUT)
+    out = books.rewrite_block(text, "arshad-personal/1a06cf5a", payee="Corner Store")
+    header = [ln for ln in out.split("\n") if ln.startswith("2026-09-02")][0]
+    assert header == "2026-09-02 ! Corner Store"
+    assert "Jai shree nakoda" not in out
+
+
+def test_a_statement_promotes_a_pending_block_to_cleared():
+    """Promotion is the point of the reconciliation lane: `!` is what AEGIS
+    believes from an email, `*` is what a bank statement proved."""
+    text = books.append_block(HEADER, BLOCK_OUT)
+    out = books.rewrite_block(
+        text, "arshad-personal/1a06cf5a", status="*", add_tags={"stmt": "axis-9640/2026-07"}
+    )
+    assert "2026-09-02 * Jai shree nakoda" in out
+    assert "stmt: axis-9640/2026-07" in out
+
+
+def test_a_rewrite_that_says_nothing_about_status_changes_nothing_about_status():
+    """Reclassifying an account is not evidence about whether the bank cleared
+    it. A rewrite that quietly promoted would be this lane asserting the very
+    fact it exists to check."""
+    text = books.append_block(HEADER, BLOCK_OUT)
+    out = books.rewrite_block(
+        text, "arshad-personal/1a06cf5a", account="expenses:groceries"
+    )
+    assert "2026-09-02 ! Jai shree nakoda" in out
+
+
+def test_an_unmarked_block_being_renamed_becomes_cleared():
+    """Unmarked is legal hledger and a hand-edited block may carry it. It has
+    always MEANT cleared to every report this repo runs, so a rename must not
+    silently reinterpret the block as pending."""
+    unmarked = BLOCK_OUT.replace("2026-09-02 ! ", "2026-09-02 ", 1)
+    text = books.append_block(HEADER, unmarked)
+    out = books.rewrite_block(text, "arshad-personal/1a06cf5a", payee="Corner Store")
+    assert "2026-09-02 * Corner Store" in out
+
+
+def test_a_status_that_is_not_a_status_is_refused():
+    """`status` lands in the one header position that decides what `--cleared`
+    and `--pending` report, so it is an allowlist, not a passthrough."""
+    text = books.append_block(HEADER, BLOCK_OUT)
+    with pytest.raises(books.BooksError, match="status must be one of"):
+        books.rewrite_block(text, "arshad-personal/1a06cf5a", status="x")
+    with pytest.raises(books.BooksError, match="status must be one of"):
+        books.rewrite_block(text, "arshad-personal/1a06cf5a", status="* Fake Payee")
+
+
+def test_a_hand_written_block_is_still_cleared():
+    """`render_manual` deliberately does NOT follow `render_transaction` to
+    `!`: a hand-typed `ledger_post` is the owner asserting the fact. Its msgid
+    is also a SHA-256 of the rendered block, so changing this rendering would
+    break idempotency for a retry that straddled the deploy — a second copy of
+    the transaction, which is the failure `ledger_post`'s hashed msgid exists
+    to prevent."""
+    block = books.render_manual(
+        date(2026, 9, 2),
+        "Corner Store",
+        [{"account": "expenses:groceries", "amount": "10.00", "currency": "INR"},
+         {"account": "assets:bank:hdfc:1225", "amount": "-10.00", "currency": "INR"}],
+        "manual-abc",
+    )
+    assert block.startswith("2026-09-02 * Corner Store")

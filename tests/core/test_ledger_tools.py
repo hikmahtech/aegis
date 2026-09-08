@@ -326,7 +326,7 @@ async def test_reclassify_renames_the_payee(db_pool, tmp_path):
         ctx,
     )
     text = (cfg.path / "personal" / "2026.journal").read_text()
-    assert "2026-09-03 * Jai Shree Stores" in text and "PAYTM*NAKODA" not in text
+    assert "2026-09-03 * Jai Shree Stores" in text  # manual block: render_manual stays `*` and "PAYTM*NAKODA" not in text
     assert (await ji.get(db_pool, msgid))["payee"] == "Jai Shree Stores"
 
 
@@ -1025,7 +1025,7 @@ async def test_add_rule_applies_to_unknown_postings(db_pool, tmp_path):
         "payee": "Jai Shree Stores",
     }
     text = (cfg.path / "personal" / "2026.journal").read_text()
-    assert "* Jai Shree Stores" in text and "expenses:groceries" in text
+    assert "! Jai Shree Stores" in text and "expenses:groceries" in text
     assert (await ji.get(db_pool, "tool-t/a"))["account"] == "expenses:groceries"
     assert (
         await _exec_ledger_add_rule(db_pool, {"match": "(", "account": "expenses:groceries"}, ctx)
@@ -1571,7 +1571,7 @@ async def test_add_rule_index_payee_matches_the_journal(db_pool, tmp_path):
         {"match": f"jai shree {TOKEN}", "account": "expenses:groceries", "payee": "A;B"},
         ctx,
     )
-    assert "* A B" in (cfg.path / "personal" / "2026.journal").read_text()
+    assert "! A B" in (cfg.path / "personal" / "2026.journal").read_text()
     assert (await ji.get(db_pool, "tool-t/f"))["payee"] == "A B"
 
 
