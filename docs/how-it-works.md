@@ -463,6 +463,22 @@ The steps that make it trustworthy:
   investigation. A deploy or maintenance window (`service_state`) suppresses;
   "Mute 24h" on a card mutes the *problem*. A `resolved` event resolves it and
   the projector closes the task, so nothing outlives its incident (#279, #341).
+- **The same failure on many things becomes one problem.** Six posts wedged in
+  one Postiz queue arrived as six problems and six tasks. They are one
+  condition with one fix, so the five-minute `HubSweepFlow` notices three or
+  more live problems sharing a class and a kind of subject, asks the model
+  whether they are one condition, and — only on a yes — folds them into a
+  single **group** problem. The survivor is renamed for what it now covers,
+  the others are merged in and their tasks closed with a note pointing at it,
+  and a card in Slack says what happened and why. From then on the next stuck
+  post joins the group rather than opening another task, and the group
+  recovers when the watchdog stops finding any member.
+
+  What it will not do: group across classes, group hand-written `@code` tasks
+  (their problems are `manual`, and each is its own piece of work), or group on
+  the count alone — a "no" from the judge stands until the cluster grows. To
+  unpick one, open the group on the admin **Problems** page: every member it
+  swallowed is linked from its timeline.
 - **Verification delay.** A per-class sleep, then the hub is asked whether the
   problem already resolved, before spending any investigation effort —
   self-healing blips cost nothing.

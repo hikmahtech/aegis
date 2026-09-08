@@ -41,6 +41,10 @@ const eventLabel = (e: any): string => {
 
 const eventText = (e: any): string => {
   const p = e.payload || {};
+  if (p.action === 'grouped') {
+    const members = (p.members || []).join(', ');
+    return `${p.member_count || 0} folded into one problem${members ? `: ${members}` : ''}`;
+  }
   return String(p.text || p.summary || p.reason || p.title || '').slice(0, 400);
 };
 
@@ -234,9 +238,22 @@ export default function Problems() {
               <span className={`badge badge-${p.severity === 'critical' || p.severity === 'error' ? 'error' : 'neutral'}`}>
                 {p.severity}
               </span>{' '}
+              {p.group_key && (
+                <>
+                  <span className="badge badge-type" title={
+                    `One problem for every ${p.class} on a ${p.subject_kind || 'subject'}. ` +
+                    'The next one joins it instead of opening another task.'
+                  }>
+                    group
+                  </span>{' '}
+                </>
+              )}
               <strong>{p.title}</strong>
               <div className="meta">
-                {p.status} · {p.subject || '—'} ({p.subject_kind || '—'}) · class {p.class} ·{' '}
+                {p.status} ·{' '}
+                {p.group_key
+                  ? `every ${p.class} on a ${p.subject_kind || 'subject'}`
+                  : `${p.subject || '—'} (${p.subject_kind || '—'}) · class ${p.class}`} ·{' '}
                 seen {p.occurrences}× · last {ago(p.last_seen_at)}
                 {p.muted_until && new Date(p.muted_until) > new Date() ? ` · muted until ${ts(p.muted_until)}` : ''}
               </div>

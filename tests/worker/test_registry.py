@@ -362,9 +362,12 @@ def test_books_write_flow_is_gated_on_money_hygiene():
         # and `build_alert_digest` (−2, unflagged) — the digest is a query over
         # `problem_events` now, not a settings buffer four branches appended
         # to. Net 0 in every row, and no new flow.
-        (True, True, 44, 217),
-        (False, False, 35, 186),
-        (True, False, 39, 202),
+        # Then +3 activities and NO new flow from the hub's grouping step
+        # (find_group_candidates, judge_group, apply_group), which rides
+        # HubSweepFlow. Unflagged, so all three rows move.
+        (True, True, 44, 220),
+        (False, False, 35, 189),
+        (True, False, 39, 205),
     ],
 )
 def test_real_registration_passes_the_boot_check(homelab, money, flows, activities):

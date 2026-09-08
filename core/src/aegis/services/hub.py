@@ -22,9 +22,18 @@ Three rules the rest of the codebase relies on:
   "duplicate" forever.
 * **Attaching to the wrong problem hides an outage; creating a duplicate is
   recoverable.** So every doubt resolves to "create": an event with no class
-  and no subject gets an empty key and is never auto-attached. The fuzzy
-  (LLM) "possibly the same as" match the spec sketched was never built: an
-  unmatched key creates, and a wrong duplicate is merged by hand.
+  and no subject gets an empty key and is never auto-attached. There is no
+  fuzzy "possibly the same as" match on the way in — an unmatched key creates.
+
+The one exception to that last rule is a **group** (:func:`group_key`), and it
+is exact rather than fuzzy. When the same failure keeps happening to different
+entities — six Postiz posts wedged in one queue — an operator or the sweep's
+LLM judge folds those problems into a single group problem keyed on the class
+and the kind of subject alone. From then on an occurrence of that class whose
+own key has no problem is *absorbed* by the group, so the seventh stuck post
+joins the group instead of opening a seventh task. Absorption applies to
+occurrences only, and only within one class and subject kind: the hub still
+never guesses that two different failures are the same one.
 
 Core and the worker both import this module (the worker already imports
 ``aegis.services.*``), so the two packages cannot drift on what a problem is.
@@ -48,6 +57,10 @@ logger = structlog.get_logger()
 # preference, and no deployment has wanted a different one. It becomes an
 # `activities.config` key on the hub sweep row when one does.
 REOPEN_WINDOW = timedelta(hours=24)
+
+# The subject a group problem carries. `_slug` can only produce `[a-z0-9-]`,
+# so no real subject can ever collide with a group's correlation key.
+GROUP_SUBJECT = "*"
 
 # Closed vocabularies. A producer outside these is a wiring mistake, and the
 # route turns the ValueError into a 400 rather than minting a problem of an
@@ -162,6 +175,9 @@ class IngestResult:
     # True when the event landed inside a deploy/maintenance window: stored
     # and counted, but nothing downstream should notify on it.
     suppressed: bool = False
+    # True when the event's own key had no problem and a group problem for its
+    # class took it. The caller learns which problem from `problem_id`.
+    absorbed: bool = False
 
     @property
     def investigate(self) -> bool:
@@ -238,6 +254,36 @@ def correlation_key(event: Event) -> str:
     return f"{klass or 'manual'}:{kind}:{subject}"
 
 
+def group_key(klass: str, subject_kind: str) -> str:
+    """``'{class}:{subject_kind}'`` — a group problem's identity.
+
+    A group stands for one failure happening to many entities, so it is keyed
+    on what the failure is and what kind of thing it happens to, never on
+    which entity it happened to this time.
+
+    ``''`` — not groupable — in three cases, and each one matters:
+
+    * no subject kind: there is no "many entities" to speak of;
+    * no class: an event the hub could not classify is the last thing that
+      should be swept into a group with others it merely resembles;
+    * class ``manual``: that is what `hub_project.ensure_problem_for_task`
+      mints for a hand-written task, whose subject is the task itself. Three
+      open ``@code`` tasks are three pieces of work, never one condition, and
+      folding them would move one task's sessions, PRs and comments onto
+      another.
+    """
+    k = _slug(klass)
+    kind = _slug(subject_kind)
+    if not k or k == "manual" or not kind:
+        return ""
+    return f"{k}:{kind}"
+
+
+def group_correlation_key(gkey: str) -> str:
+    """The ``correlation_key`` a group problem holds, from its group key."""
+    return f"{gkey}:{GROUP_SUBJECT}"
+
+
 def validate_event(event: Event) -> None:
     """Raise ``ValueError`` on an event the hub must not store."""
     if event.source not in SOURCES:
@@ -299,7 +345,7 @@ async def get_problem(pool: asyncpg.Pool, problem_id: str) -> dict[str, Any] | N
     row = await pool.fetchrow(
         "SELECT id::text AS id, correlation_key, class, subject, subject_kind, title, "
         "severity, status, first_seen_at, last_seen_at, occurrences, muted_until, "
-        "resolved_at, closed_at, todoist_task_id, metadata "
+        "resolved_at, closed_at, todoist_task_id, group_key, metadata "
         "FROM problems WHERE id = $1::uuid",
         problem_id,
     )
@@ -377,6 +423,28 @@ async def ingest_event(
         # promoted while the window was still in force.
         subject_slug = _slug(event.subject)
         kind_slug = _slug(event.subject_kind) or ("service" if subject_slug else "")
+
+        # No problem holds this key. Before creating one, ask whether a GROUP
+        # problem has claimed this class of failure: six posts stuck in one
+        # queue are one condition, and once they have been folded into a group
+        # the seventh belongs there too rather than opening a seventh task.
+        # Occurrences only — a `resolved` for one member says nothing about
+        # the group, which recovers when its watchdog stops finding any member
+        # (see hub_watch.reconcile_findings).
+        absorbed = False
+        group: dict[str, Any] | None = None
+        if current is None and event.kind == "occurrence" and not event.problem_id:
+            gkey = group_key(event.klass, kind_slug)
+            if gkey:
+                row = await conn.fetchrow(
+                    "SELECT id::text AS id, status, resolved_at, muted_until, occurrences, "
+                    "title, group_key FROM problems "
+                    "WHERE group_key = $1 AND closed_at IS NULL FOR UPDATE",
+                    gkey,
+                )
+                if row is not None:
+                    current, group, absorbed = dict(row), dict(row), True
+
         suppression = None
         if event.kind == "occurrence":
             suppression = await _active_suppression(conn, subject_slug, kind_slug, now)
@@ -385,6 +453,11 @@ async def ingest_event(
             return IngestResult(None, "ignored", key)
 
         payload = dict(event.payload or {})
+        if absorbed:
+            # Which entity this occurrence was about. The group's own subject
+            # is `*`, so without this the timeline could not name the member.
+            payload["member_subject"] = subject_slug
+            payload["member_key"] = key
         if suppression is not None:
             payload["suppressed_by"] = {
                 "state": suppression["state"],
@@ -400,18 +473,26 @@ async def ingest_event(
                     current["id"],
                     now,
                 )
+            # A rollover of a GROUP stays a group. The old one resolved longer
+            # ago than the reopen window, so this occurrence starts a fresh
+            # problem — but the condition is the same one somebody already
+            # decided was shared, and re-keying it on this member's subject
+            # would throw that away and make the sweep re-judge the cluster
+            # from scratch.
+            rolled_group = group if (absorbed and d.action == "rollover") else None
             problem_id = await conn.fetchval(
                 "INSERT INTO problems (correlation_key, class, subject, subject_kind, title, "
-                "severity, status, first_seen_at, last_seen_at, occurrences) "
-                "VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $8, 1) RETURNING id::text",
-                key,
+                "severity, status, first_seen_at, last_seen_at, occurrences, group_key) "
+                "VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $8, 1, $9) RETURNING id::text",
+                group_correlation_key(rolled_group["group_key"]) if rolled_group else key,
                 _slug(event.klass) or "manual",
-                subject_slug,
+                GROUP_SUBJECT if rolled_group else subject_slug,
                 kind_slug,
-                event.title.strip()[:500],
+                (rolled_group["title"] if rolled_group else event.title.strip())[:500],
                 severity,
                 d.status,
                 occurred_at,
+                rolled_group["group_key"] if rolled_group else None,
             )
             occurrences = 1
             if d.action == "rollover":
@@ -489,6 +570,7 @@ async def ingest_event(
         action=action,
         problem_id=problem_id,
         key=key,
+        absorbed=absorbed,
     )
     return IngestResult(
         problem_id,
@@ -497,6 +579,7 @@ async def ingest_event(
         occurrences=occurrences,
         muted=muted,
         suppressed=suppression is not None,
+        absorbed=absorbed,
     )
 
 
@@ -913,8 +996,13 @@ async def merge_problems(
 ) -> dict[str, Any]:
     """Fold ``merge_id`` into ``keep_id``: its events, links and sessions move,
     its occurrences count on the kept problem, and it closes with a `problem`
-    link back so the history reads both ways. Only a person calls this — a
-    wrong merge hides an outage, so the hub never merges on its own.
+    link back so the history reads both ways.
+
+    A wrong merge hides an outage, so there are exactly two callers: a person
+    on the admin Problems page, and `hub_group.upgrade`, which folds problems
+    of ONE class and subject kind into a group of that class after an LLM has
+    agreed they are the same condition. The hub still never merges two
+    different failures on a resemblance.
 
     Raises ValueError when either problem is missing, they are the same, or the
     kept one is already closed. The merged problem's own Todoist task is
@@ -1173,7 +1261,7 @@ async def list_problems(
     rows = await pool.fetch(
         "SELECT p.id::text AS id, p.correlation_key, p.class, p.subject, p.subject_kind, "
         "       p.title, p.severity, p.status, p.first_seen_at, p.last_seen_at, p.occurrences, "
-        "       p.muted_until, p.resolved_at, p.closed_at, p.todoist_task_id "
+        "       p.muted_until, p.resolved_at, p.closed_at, p.todoist_task_id, p.group_key "
         f"FROM problems p WHERE {' AND '.join(where)} "
         f"ORDER BY p.last_seen_at DESC LIMIT ${len(args) - 1} OFFSET ${len(args)}",
         *args,
