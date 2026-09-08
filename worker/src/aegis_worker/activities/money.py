@@ -717,23 +717,43 @@ class MoneyActivities:
                 self.db_pool, ev.payee_key, ev.amount, ev.currency, ev.occurred_on
             )
             if due is not None:
-                closed = True
                 # No task ref means `capture_due` indexed the due and withheld
                 # the Todoist task — a zero invoice, a twin under another
                 # payee's name, or an autopay notice. There is nothing to
                 # close, so closing is not a precondition for marking it paid;
                 # requiring one is what kept those dues open forever.
-                if self.capture is not None and due["todoist_ref"]:
-                    closed = await self.capture.complete_captured_task(due["todoist_ref"])
-                # Only mark it paid once the task is actually closed — that is
-                # what takes the due out of find_open_due, so marking on a
-                # failed close would strand an open Todoist task nothing
-                # revisits. `mark_due_paid`, not `link`: this payment may
-                # already be linked to its own bank/receipt counterpart, and
-                # `link` writes both sides, which would overwrite that.
-                if closed:
-                    await ji.mark_due_paid(self.db_pool, due["message_id"], msgid)
-                    result["closed_due"] = due["message_id"]
+                #
+                # The same is true of a close that FAILS, which is what this
+                # used to gate on (#449). The Todoist task is a projection of
+                # the due, not the due itself, so whether Todoist accepted the
+                # close is not evidence about whether the money moved — and
+                # every failure mode here is permanent, because `mark_due_paid`
+                # has one caller and nothing re-drives it: an `item-…` ref
+                # queues no completion at all, a task the user deleted is a
+                # 4xx, and a *retryable* failure closes the task later through
+                # the outbox while still returning False here. The comment this
+                # replaces promised a retry after the drain that does not
+                # exist, so each of those left a paid bill sitting in every
+                # "dues open" count forever, clearable only by hand.
+                #
+                # An unclosed task is the recoverable failure of the two: it is
+                # visible to the user, who can close it, and it is logged here.
+                # `mark_due_paid`, not `link`: this payment may already be
+                # linked to its own bank/receipt counterpart, and `link` writes
+                # both sides, which would overwrite that.
+                if (
+                    self.capture is not None
+                    and due["todoist_ref"]
+                    and not await self.capture.complete_captured_task(due["todoist_ref"])
+                ):
+                    activity.logger.warning(
+                        "money_due_task_unclosed due=%s task=%s — the due is marked "
+                        "paid regardless; close the Todoist task by hand",
+                        due["message_id"],
+                        due["todoist_ref"],
+                    )
+                await ji.mark_due_paid(self.db_pool, due["message_id"], msgid)
+                result["closed_due"] = due["message_id"]
         activity.logger.info(
             "money_event_routed receipt=%s msgid=%s status=%s linked=%s closed_due=%s",
             receipt_id,
