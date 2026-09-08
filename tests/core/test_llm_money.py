@@ -69,23 +69,27 @@ async def test_receipt_channel_gets_receipt_source_class_and_unknown_keys_are_dr
 @pytest.mark.asyncio
 async def test_fields_the_prompt_never_asks_for_are_refused():
     """The email body is spliced straight into the prompt, so every key the
-    model emits is reachable by whoever wrote the email. Three of `MoneyEvent`'s
+    model emits is reachable by whoever wrote the email. Two of `MoneyEvent`'s
     fields decide where money lands and are NOT in the prompt: `account` wins
     over the category→account map in `post_event` (`event.account or
-    account_for(...)`), `entity` picks the ledger, and `ref` is free-text
-    provenance. A model-fields allowlist admits all three. Only the twelve keys
-    the prompt actually asks for may cross this boundary; the rest keep their
-    defaults for the caller to set from the mailbox."""
+    account_for(...)`), and `entity` picks the ledger. A model-fields allowlist
+    admits both. Only the keys the prompt actually asks for may cross this
+    boundary; the rest keep their defaults for the caller to set from the
+    mailbox.
+
+    `ref` used to be refused here too, as free-text provenance. It is asked for
+    now (#433) and guarded differently — see the `_ref_from_body` tests below —
+    because it became the matcher's exact join key, so the risk changed shape
+    from "routes the money" to "matches the wrong payment"."""
     payload = [{
         "kind": "transaction", "direction": "out", "amount": 500, "currency": "INR",
         "payee": "Acme", "channel": "upi",
-        "entity": "hikmah", "account": "expenses:hikmah:infra", "ref": "x",
+        "entity": "hikmah", "account": "expenses:hikmah:infra",
     }]
     out = await _Client(json.dumps(payload)).extract_money_batch([RECEIPT], model="m")
     ev = out[0]
     assert ev["entity"] == "personal", "the model must not choose the ledger"
     assert ev["account"] is None, "the model must not bypass the account map"
-    assert ev["ref"] is None
     # The legitimate fields still land, so this is a filter and not a wipe.
     assert ev["payee"] == "Acme" and ev["amount"] == "500.00" and ev["channel"] == "upi"
 
@@ -185,3 +189,87 @@ async def test_a_genuinely_malformed_item_is_still_a_parse_failure():
         out = await _Client(json.dumps(payload)).extract_money_batch([RECEIPT], model="m")
         assert out[0]["_parse_failed"] is True, payload
         assert out[0]["kind"] == "ignore"
+
+
+# ---------------------------------------------------------------- ref (#433)
+
+
+class _AnyClient(_Client):
+    """`_Client` pins the prompt against the module's own RECEIPT fixture.
+    These tests use a different email, so they assert the prompt separately."""
+
+    async def think(self, **kw):
+        assert kw["purpose"] == "money_event_extraction"
+        assert "UPI transaction reference no" in kw["prompt"]
+        return {"response": self._response}
+
+
+_UPI = {
+    "id": "r2", "account": "arshad-personal", "message_id": "m2",
+    "sender": "HDFC Bank <alerts@hdfcbank.bank.in>",
+    "subject": "You have done a UPI txn",
+    "body_plain": (
+        "Rs.450.00 is debited from your account ending 1225 towards VPA "
+        "corner@okaxis on 05-09-26. UPI transaction reference no: 526112345678."
+    ),
+    "received_at": "2026-09-05T10:00:00+00:00",
+}
+
+
+@pytest.mark.asyncio
+async def test_a_reference_the_email_prints_is_kept():
+    """The point of admitting `ref` at all (#433): this path writes 188 of 264
+    index rows and never set one, so pass 1 of the matcher — an exact join
+    against the reference in a statement narration — found 0 matches in 2,580
+    statement rows of which 83% carry a reference."""
+    payload = [{
+        "kind": "transaction", "direction": "out", "amount": 450, "currency": "INR",
+        "payee": "Corner Store", "channel": "upi", "ref": "526112345678",
+    }]
+    out = await _AnyClient(json.dumps(payload)).extract_money_batch([_UPI], model="m")
+    assert out[0]["ref"] == "526112345678"
+
+
+@pytest.mark.asyncio
+async def test_a_reference_the_email_does_not_print_is_dropped():
+    """A hallucinated reference is worse than none. A blank falls through to
+    pass 2 (instrument + amount + a 3-day window) like every row does today; a
+    wrong one is a confident EXACT match to somebody else's payment, and pass 1
+    is trusted over every later pass.
+
+    The rest of the event must survive — the guard drops one field, it does not
+    reject the extraction.
+    """
+    payload = [{
+        "kind": "transaction", "direction": "out", "amount": 450, "currency": "INR",
+        "payee": "Corner Store", "channel": "upi", "ref": "999988887777",
+    }]
+    out = await _AnyClient(json.dumps(payload)).extract_money_batch([_UPI], model="m")
+    assert out[0]["ref"] is None
+    assert out[0]["amount"] == "450.00" and out[0]["payee"] == "Corner Store"
+
+
+@pytest.mark.asyncio
+async def test_a_reformatted_reference_is_still_the_same_reference():
+    """Banks reprint one number with spaces or hyphens and the model reformats
+    it again, so the containment test runs on alphanumerics only. Without this
+    the guard would reject real references for cosmetic reasons — which looks
+    exactly like the bug it is meant to prevent."""
+    payload = [{
+        "kind": "transaction", "direction": "out", "amount": 450, "currency": "INR",
+        "payee": "Corner Store", "channel": "upi", "ref": "5261-1234 5678",
+    }]
+    out = await _AnyClient(json.dumps(payload)).extract_money_batch([_UPI], model="m")
+    assert out[0]["ref"] == "5261-1234 5678", "kept verbatim, compared normalised"
+
+
+@pytest.mark.asyncio
+async def test_a_reference_too_short_to_be_evidence_is_dropped():
+    """The digits 450 appear in this body, so containment alone would pass
+    them. A join key that short matches by chance, which is not matching."""
+    payload = [{
+        "kind": "transaction", "direction": "out", "amount": 450, "currency": "INR",
+        "payee": "Corner Store", "channel": "upi", "ref": "450",
+    }]
+    out = await _AnyClient(json.dumps(payload)).extract_money_batch([_UPI], model="m")
+    assert out[0]["ref"] is None
