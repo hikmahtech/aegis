@@ -844,3 +844,47 @@ async def test_a_transaction_with_no_amount_is_not_a_transaction(db_pool, tmp_pa
                  body="We could not collect Rs. 0.00 from your account."),
     )
     assert ev["kind"] == "failed" and ev["amount"] is None
+
+
+@pytest.mark.asyncio
+async def test_a_due_whose_task_will_not_close_is_still_marked_paid(db_pool, tmp_path):
+    """A failed Todoist close must not strand the due (#449).
+
+    `complete_captured_task` returns False for three permanent conditions —
+    an `item-…` ref whose create is still in the outbox, a task the user
+    deleted (a 4xx), and a retryable failure that the outbox drains later —
+    and `mark_due_paid` has one caller that nothing re-drives. Gating the
+    mark on the close therefore left the paid bill in every "dues open"
+    count forever.
+
+    The assertion is on `linked_message_id`, not on the returned dict: that
+    column is what `find_open_due` reads, so it is the thing that decides
+    whether the brief keeps asking about a bill already paid.
+    """
+    cfg = _repo(tmp_path)
+    capture = AsyncMock()
+    capture.complete_captured_task = AsyncMock(return_value=False)
+    act = _act(db_pool, cfg, capture=capture)
+    due = _bank_event(kind="due", due_on="2026-09-07", channel="statement",
+                      payee="Axis credit card XX13", payee_key="axis credit card xx13",
+                      amount="100308.53")
+    await ActivityEnvironment().run(
+        act.post_money_event, "rid3", "v2-personal", "m-due", due, "item-tmp-1"
+    )
+    paid = _bank_event(payee="Axis credit card XX13", payee_key="axis credit card xx13",
+                       amount="100308.53", channel="imps", occurred_on="2026-09-06",
+                       account="equity:transfers")
+    r = await ActivityEnvironment().run(
+        act.post_money_event, "rid5", "v2-personal", "m-paid", paid
+    )
+
+    capture.complete_captured_task.assert_awaited_once_with("item-tmp-1")
+    assert r["closed_due"] == "v2-personal/m-due"
+    assert (await ji.get(db_pool, "v2-personal/m-due"))["linked_message_id"] == "v2-personal/m-paid"
+
+    # And it is genuinely out of the open-due pool, not merely stamped: a
+    # second identical payment must find nothing left to close.
+    again = await ActivityEnvironment().run(
+        act.post_money_event, "rid6", "v2-personal", "m-paid-2", paid
+    )
+    assert again["closed_due"] is None
