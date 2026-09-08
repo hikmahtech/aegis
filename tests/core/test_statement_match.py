@@ -634,3 +634,49 @@ async def test_a_loaded_candidate_matches_a_statement_row_end_to_end(db_pool, _c
     row = make_row(10, "500.00", instrument="nkgsb-843")
     outcome = only(run([row], loaded))
     assert outcome.matched_pass == PASS_WINDOW and outcome.delta_days == 1
+
+
+def test_a_card_used_for_both_entities_matches_candidates_from_both():
+    """An account does not have one entity.
+
+    Measured on production 2026-09-07: `axis-cc-1313` carries 6 hikmah and 5
+    personal transactions. With a single declared entity, pass 2b saw only the
+    half that matched it — and pass 2b exists precisely to reach blockless
+    rows no instrument-aware pass can see, so declaring either value silently
+    threw away half the card's reach.
+    """
+    rows = [
+        make_row(10, "500.00", instrument="axis-cc-1313"),
+        make_row(11, "700.00", instrument="axis-cc-1313"),
+    ]
+    pool = [
+        make_candidate("m/personal", 10, "500.00", instrument=None, entity="personal"),
+        make_candidate("m/hikmah", 11, "700.00", instrument=None, entity="hikmah"),
+    ]
+    result = run(rows, pool, entity_for_instrument={"axis-cc-1313": ["personal", "hikmah"]})
+    got = {o.msgid for o in result.outcomes if o.matched}
+    assert got == {"m/personal", "m/hikmah"}
+    assert all(o.matched_pass == PASS_WINDOW_NO_INSTRUMENT for o in result.outcomes)
+    assert result.unscoped_instruments == ()
+
+
+def test_a_declared_set_still_excludes_an_entity_not_in_it():
+    """Widening is per account, not a general loosening: a set of one is still
+    a scope, and a three-entity world does not become entity-blind because one
+    card is shared."""
+    row = make_row(10, "500.00", instrument="axis-cc-1313")
+    candidate = make_candidate("m/1", 10, "500.00", instrument=None, entity="hikmah")
+    result = run([row], [candidate], entity_for_instrument={"axis-cc-1313": ["personal"]})
+    assert only(result).matched_pass is None
+
+
+def test_an_empty_entity_set_is_no_declaration_at_all():
+    """`{"axis-cc-1313": []}` reads as "I have not decided yet", and the wrong
+    reading of it is "match anything" — which is how a hikmah payment lands in
+    `personal/2026.journal`. It must behave exactly like the missing key:
+    pass 2b skipped, and the instrument reported."""
+    row = make_row(10, "500.00", instrument="axis-cc-1313")
+    candidate = make_candidate("m/1", 10, "500.00", instrument=None, entity="personal")
+    result = run([row], [candidate], entity_for_instrument={"axis-cc-1313": []})
+    assert only(result).matched_pass is None
+    assert result.unscoped_instruments == ("axis-cc-1313",)

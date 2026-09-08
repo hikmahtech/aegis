@@ -167,6 +167,11 @@ Fields:
   statement, other.
 - instrument: the paying or receiving account as hdfc-1225 (bank + last 4
   digits), axis-cc-1313 (credit card), card-1313 (card, bank unknown), or null.
+- ref: the bank's own reference for this payment, COPIED EXACTLY from the
+  email — a UPI transaction reference / RRN, an IMPS reference, a NEFT or
+  RTGS UTR, an ARN. Only a number the email actually prints; null if the
+  email shows none. Never a card number, an order id, an invoice number, an
+  OTP or anything you compose yourself.
 - occurred_on: date money moved, YYYY-MM-DD, or null.
 - due_on: payment-due or fix-by date, YYYY-MM-DD, or null.
 - is_recurring: true for a subscription or utility that bills again, false
@@ -191,12 +196,24 @@ EMAILS:
 # fields `_MONEY_EVENT_PROMPT` asks for, and it must stay in sync with that
 # list. Everything the model emits is attacker-controlled: the email body goes
 # straight into the prompt, so hostile mail can ask for any key `MoneyEvent`
-# happens to declare. Three of them decide where money lands and are
+# happens to declare. Two of them decide where money lands and are
 # deliberately absent here — `account` (it wins over the category→account map,
-# `post_event` does `event.account or account_for(...)`), `entity` (picks the
-# ledger) and `ref` (free-text provenance). Those keep their model defaults for
-# the caller to set from the mailbox, as do `parser`, `source_class` and
-# `payee_key`, which the extractor forces after this filter.
+# `post_event` does `event.account or account_for(...)`) and `entity` (picks
+# the ledger). Those keep their model defaults for the caller to set from the
+# mailbox, as do `parser`, `source_class` and `payee_key`, which the extractor
+# forces after this filter.
+#
+# `ref` WAS in that list, as "free-text provenance". It stopped being that
+# when the statement matcher shipped (#432): `ref` is now pass 1, an exact
+# join between a journal block and a bank statement row, and 83% of statement
+# rows carry one while 0% of journal blocks did — because only 4 of 13
+# deterministic parsers extract one and this path, which produces 188 of 264
+# index rows, never did (#433). So it is admitted, under one condition the
+# code enforces rather than trusts: `_ref_from_body` keeps the model's answer
+# only when those characters actually appear in the mail it was read from. A
+# reference is the one field where a hallucination is worse than a blank —
+# a blank falls through to pass 2's heuristic, while a wrong reference is a
+# confident EXACT match to the wrong payment.
 _LLM_EVENT_FIELDS = frozenset({
     "kind",
     "direction",
@@ -206,11 +223,51 @@ _LLM_EVENT_FIELDS = frozenset({
     "category",
     "channel",
     "instrument",
+    "ref",
     "occurred_on",
     "due_on",
     "is_recurring",
     "confidence",
 })
+
+
+# A reference compared for identity, not for display: banks reprint the same
+# number with spaces, hyphens or a "UTR" prefix, and the model reformats it
+# again. Everything that is not a letter or a digit goes, and case with it.
+_REF_NOISE = re.compile(r"[^0-9A-Za-z]+")
+
+# Below this length a "reference" is not evidence. A UPI RRN is 12 digits, an
+# IMPS reference 9-12, a NEFT/RTGS UTR 16-22; a 4-character string appears by
+# chance in almost any email body, so accepting one would let the guard pass
+# on a value that means nothing and hand pass 1 a junk key to join on.
+_REF_MIN = 6
+
+
+def _refkey(text: str) -> str:
+    return _REF_NOISE.sub("", text or "").upper()
+
+
+def _ref_from_body(ref: object, receipt: dict) -> str | None:
+    """``ref`` if the email really prints it, else None.
+
+    The model is asked to COPY a reference, not to produce one, so this is the
+    check that the answer is a copy. It is deliberately a containment test on
+    the normalised text rather than a format test: the shapes differ per bank
+    and per rail, and a format allowlist would silently drop the real
+    references it had not met yet — the failure this whole issue is about.
+
+    Rejecting is cheap. A dropped reference costs pass 1 one row, which then
+    matches on instrument + amount + date like every row does today. A kept
+    hallucination costs an exact match to the WRONG payment, and pass 1 trusts
+    its answer over every later pass.
+    """
+    if not isinstance(ref, str):
+        return None
+    needle = _refkey(ref)
+    if len(needle) < _REF_MIN:
+        return None
+    hay = _refkey(f"{receipt.get('subject', '')}\n{receipt.get('body_plain') or ''}")
+    return ref if needle in hay else None
 
 
 def _format_money_emails(receipts: list[dict]) -> str:
@@ -896,6 +953,17 @@ class LLMClient:
             }
             if isinstance(data.get("amount"), str):
                 data["amount"] = data["amount"].replace(",", "")
+            if "ref" in data:
+                verified = _ref_from_body(data["ref"], receipts[i])
+                if verified is None:
+                    logger.info(
+                        "extract_money_ref_rejected",
+                        reason="not in body",
+                        length=len(str(data["ref"])),
+                    )
+                    del data["ref"]
+                else:
+                    data["ref"] = verified
             data["parser"] = "llm"
             data["source_class"] = (
                 "receipt" if data.get("channel") in ("receipt", "bill") else "other"

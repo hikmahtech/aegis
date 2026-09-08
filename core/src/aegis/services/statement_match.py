@@ -211,12 +211,40 @@ def _ordered(
     return sorted(pairs, key=lambda p: (p[0].occurred_on, p[0].direction, p[0].amount, p[0].row_id))
 
 
+def _entity_set(value: str | Collection[str] | None) -> frozenset[str]:
+    """The entities pass 2b will accept for one instrument.
+
+    An account does NOT have one entity, which is what the single-string
+    version assumed. Measured on production 2026-09-07: `axis-cc-1313` carries
+    6 hikmah and 5 personal transactions, so declaring either one hid the other
+    half of the card from pass 2b — the pass that exists precisely to reach the
+    blockless rows an instrument-aware pass cannot see.
+
+    A string still works and means a set of one, because most accounts really
+    are single-entity and saying so is the honest declaration. An empty value
+    is the same as no declaration at all: pass 2b does not run, and the
+    instrument is reported in `unscoped_instruments` rather than matched
+    entity-blind. That refusal is the important half — matching pass 2b without
+    a scope is how a hikmah payment lands in `personal/2026.journal`.
+
+    This is the MATCHING scope, and it is deliberately not the posting default.
+    Spec §4.1 needs exactly one entity per account to choose a journal file,
+    and that stays one value: a row must land in one book. Widening the set
+    that may be *considered* is not licence to widen the one that is *written*.
+    """
+    if value is None:
+        return frozenset()
+    if isinstance(value, str):
+        return frozenset({value}) if value else frozenset()
+    return frozenset(e for e in value if e)
+
+
 def match_statements(
     rows: Sequence[StatementRow],
     candidates: Sequence[Candidate],
     *,
     declared: Collection[str] = (),
-    entity_for_instrument: Mapping[str, str] | None = None,
+    entity_for_instrument: Mapping[str, str | Collection[str]] | None = None,
     rates: Mapping[str, Decimal] | None = None,
     window_days: int = journal_index._MATCH_DAYS,
     currency: str = STATEMENT_CURRENCY,
@@ -228,9 +256,13 @@ def match_statements(
     offered to the August one.
     """
     rates = rates or {}
+    # An empty set needs no filtering out: `_pass_candidates` reads this with
+    # `entities.get(instrument) or frozenset()`, so a declared-but-empty entry
+    # and a missing one are already the same thing — pass 2b skipped, the
+    # instrument reported.
     entities = {
-        (_canonical(inst, declared) or inst): entity
-        for inst, entity in (entity_for_instrument or {}).items()
+        (_canonical(inst, declared) or inst): _entity_set(e)
+        for inst, e in (entity_for_instrument or {}).items()
     }
     pool = [
         Candidate(
@@ -349,7 +381,7 @@ def _pass_candidates(
     pool: Sequence[Candidate],
     *,
     claimed: Mapping[str, str],
-    entities: Mapping[str, str],
+    entities: Mapping[str, frozenset[str]],
     rates: Mapping[str, Decimal],
     missing_rates: set[str],
     unscoped: set[str],
@@ -362,10 +394,10 @@ def _pass_candidates(
     single-candidate pass claims the same transaction, on every run.
     """
     row_ref = _norm_ref(row.ref)
-    entity = entities.get(instrument)
+    allowed_entities = entities.get(instrument) or frozenset()
     if pass_name == PASS_REF and row_ref is None:
         return []
-    if pass_name == PASS_WINDOW_NO_INSTRUMENT and entity is None:
+    if pass_name == PASS_WINDOW_NO_INSTRUMENT and not allowed_entities:
         unscoped.add(instrument)
         return []
     found: list[Candidate] = []
@@ -385,7 +417,7 @@ def _pass_candidates(
         else:  # pass 2b — no instrument at all, scoped to the account's entity
             if candidate.instrument is not None:
                 continue
-            if candidate.entity != entity:
+            if candidate.entity not in allowed_entities:
                 continue
         if abs((row.occurred_on - candidate.occurred_on).days) > window_days:
             continue
