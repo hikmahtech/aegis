@@ -36,6 +36,7 @@ what that constant should be — not as a second constant.
 
 from __future__ import annotations
 
+import re
 from collections import Counter
 from collections.abc import Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass
@@ -88,6 +89,9 @@ class Candidate:
     occurred_on: date
     instrument: str | None = None
     ref: str | None = None
+    #: Which extractor produced this row. Pass 1 reads it for one decision and
+    #: nothing else — see `_ref_is_located`.
+    parser: str | None = None
 
 
 @dataclass(frozen=True)
@@ -147,8 +151,29 @@ def bank_of(instrument: str) -> str:
     return instrument.split("-", 1)[0] if instrument else "unknown"
 
 
+# Everything that is not a letter or a digit, which is the difference between
+# the same reference as three systems print it: a bank writes
+# "UTR 5261-1234-5678", its statement narration writes "526112345678", and the
+# extractor copies whichever it was shown.
+_REF_NOISE = re.compile(r"[^0-9A-Za-z]+")
+
+
 def _norm_ref(ref: str | None) -> str | None:
-    text = (ref or "").strip().upper()
+    """One reference reduced to what makes it the same reference.
+
+    This runs on BOTH sides of the pass-1 join, and it has to: `llm._ref_from_body`
+    verifies a model's answer against the mail on alphanumerics but stores the
+    string verbatim, so a reference the model copied with the bank's own spacing
+    ("UTR 5261-1234-5678") never equalled the statement's bare digits under the
+    old `strip().upper()`. Pass 1 then found nothing, silently — the join simply
+    missed, which is indistinguishable from "this row has no counterpart", so the
+    lift #433 was built to buy would have been invisibly smaller with no error
+    anywhere to say why.
+
+    Collisions this could newly create are references that differ only in
+    punctuation, which are the same reference.
+    """
+    text = _REF_NOISE.sub("", ref or "").upper()
     return text or None
 
 
@@ -167,6 +192,38 @@ def _rate_for(currency: str, rates: Mapping[str, Decimal]) -> Decimal | None:
     if symbol and symbol in rates:
         return rates[symbol]
     return rates.get(currency)
+
+
+def _ref_is_located(candidate: Candidate) -> bool:
+    """True when this candidate's reference was READ OUT OF the mail rather than
+    lifted from a known position in it.
+
+    A deterministic parser takes the reference from a fixed slot in a bank's own
+    alert — `_HDFC_UPI` captures the digits after "UPI transaction reference
+    no.:" — so the number it returns is, by construction, this payment's
+    reference. That is why pass 1 was designed to match on the reference alone:
+    neither instrument nor date window is required, which is the whole reason it
+    runs first.
+
+    An extracted reference is a different object with the same name. `llm`'s
+    `_ref_from_body` can only verify that the characters appear somewhere in the
+    mail; it cannot tell whose payment they name. A merchant receipt echoing a
+    previous order's bank reference, or a summary listing several RRNs, yields a
+    real reference belonging to a DIFFERENT payment — and since only 4 of 13
+    deterministic parsers set `ref`, the genuine block usually has none to
+    compete with, so the wrong block would be pass 1's sole candidate and win
+    outright. Pass 1 outranks every later pass, so step 5 would promote the
+    wrong block to `*` and post the real row again as a duplicate.
+
+    Direction already blocks the commonest shape (a refund quoting the original
+    UTR is `in` against an `out`). The amount is the cheap witness for the rest.
+
+    Scoped rather than blanket deliberately: requiring corroboration everywhere
+    would break the deterministic case, where a card auth and its settlement can
+    legitimately differ by a tip and the reference is the thing that knows they
+    are one payment.
+    """
+    return (candidate.parser or "") == "llm"
 
 
 def _amount_matches(
@@ -274,6 +331,7 @@ def match_statements(
             occurred_on=c.occurred_on,
             instrument=_canonical(c.instrument, declared),
             ref=_norm_ref(c.ref),
+            parser=c.parser,
         )
         for c in candidates
     ]
@@ -408,8 +466,20 @@ def _pass_candidates(
         if candidate.direction != row.direction:
             continue
         if pass_name == PASS_REF:
-            if candidate.ref == row_ref:
-                found.append(candidate)
+            if candidate.ref != row_ref:
+                continue
+            # An EXTRACTED reference needs the amount to agree as well; a parsed
+            # one does not. See `_ref_is_located` for why the two are different
+            # objects despite the shared column.
+            if _ref_is_located(candidate) and not _amount_matches(
+                row.amount,
+                candidate,
+                currency=currency,
+                rates=rates,
+                missing_rates=missing_rates,
+            ):
+                continue
+            found.append(candidate)
             continue
         if pass_name == PASS_WINDOW:
             if candidate.instrument != instrument:
@@ -510,7 +580,8 @@ async def load_candidates(
     """
     records = await pool.fetch(
         """
-        SELECT message_id, entity, direction, amount, currency, instrument, ref, occurred_on
+        SELECT message_id, entity, direction, amount, currency, instrument, ref, occurred_on,
+               parser
         FROM finance.journal_index
         WHERE kind = 'transaction' AND journal_file IS NOT NULL
           AND amount IS NOT NULL AND direction IS NOT NULL AND occurred_on IS NOT NULL
@@ -530,6 +601,7 @@ async def load_candidates(
             occurred_on=r["occurred_on"],
             instrument=_canonical(r["instrument"], declared),
             ref=_norm_ref(r["ref"]),
+            parser=r["parser"],
         )
         for r in records
     )

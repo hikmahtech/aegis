@@ -88,6 +88,7 @@ def make_candidate(
     currency: str = "INR",
     entity: str = "personal",
     ref: str | None = None,
+    parser: str | None = None,
 ) -> Candidate:
     return Candidate(
         msgid=msgid,
@@ -98,6 +99,7 @@ def make_candidate(
         occurred_on=date(2026, 7, day),
         instrument=instrument,
         ref=ref,
+        parser=parser,
     )
 
 
@@ -680,3 +682,70 @@ def test_an_empty_entity_set_is_no_declaration_at_all():
     result = run([row], [candidate], entity_for_instrument={"axis-cc-1313": []})
     assert only(result).matched_pass is None
     assert result.unscoped_instruments == ("axis-cc-1313",)
+
+
+def test_pass_1_will_not_match_a_real_reference_belonging_to_another_payment():
+    """A reference is issued by someone else's system and arrives in mail this
+    code does not control, so "these digits are in the email" is never "these
+    digits name THIS payment". A refund quoting the original UTR, a card
+    summary listing several RRNs, a merchant echoing a previous order's bank
+    ref — each puts a real reference for a different payment on a block, and
+    `llm._ref_from_body` can only check the characters are present.
+
+    Without the amount check this block wins pass 1 outright: only 4 of 13
+    deterministic parsers set `ref`, so the genuine block usually has none to
+    compete with. Pass 1 outranks every later pass, so step 5 would promote the
+    wrong block to `*` and post the real row again — the money counted twice, by
+    the pass that is meant to be the exact one.
+    """
+    row = make_row(10, "500.00", instrument="hdfc-1225", ref="526112345678")
+    wrong = make_candidate(
+        "m/other", 10, "9500.00", instrument="hdfc-1225", ref="526112345678", parser="llm"
+    )
+    assert only(run([row], [wrong])).matched_pass is None
+
+    # And the scope of that rule: a reference a deterministic parser lifted from
+    # a bank's own structured alert IS this payment's reference, so pass 1 still
+    # matches on it alone — a card auth and its settlement can differ by a tip.
+    parsed = make_candidate(
+        "m/parsed", 10, "9500.00", instrument="hdfc-1225", ref="526112345678",
+        parser="hdfc_upi",
+    )
+    assert only(run([row], [parsed])).matched_pass == PASS_REF
+
+
+def test_pass_1_still_matches_when_the_amount_agrees():
+    """The pin that keeps the test above honest: the amount check must not have
+    simply disabled pass 1."""
+    row = make_row(10, "500.00", instrument="hdfc-1225", ref="526112345678")
+    right = make_candidate(
+        "m/real", 10, "500.00", instrument="hdfc-1225", ref="526112345678", parser="llm"
+    )
+    outcome = only(run([row], [right]))
+    assert outcome.matched_pass == PASS_REF and outcome.msgid == "m/real"
+
+
+def test_a_reference_spelt_with_the_bank_s_own_spacing_still_joins():
+    """`_norm_ref` runs on both sides. The extractor stores what the mail
+    printed (`llm._ref_from_body` verifies on alphanumerics but keeps the
+    string verbatim), while a statement narration carries bare digits — so
+    without a shared normalisation pass 1 silently misses every LLM-sourced
+    reference, which is indistinguishable from having no counterpart."""
+    row = make_row(10, "500.00", instrument="hdfc-1225", ref="526112345678")
+    spaced = make_candidate(
+        "m/real", 10, "500.00", instrument="hdfc-1225", ref="5261-1234 5678", parser="llm"
+    )
+    assert only(run([row], [spaced])).matched_pass == PASS_REF
+
+    # Only punctuation is noise. A leading label is NOT stripped, and must not
+    # be: real references begin with letters — a NEFT UTR like `SBIN0000123456`,
+    # the Axis remittance SWIFT ref `GBC…` — so an alpha-prefix rule would
+    # quietly corrupt them into a different number.
+    labelled = make_candidate(
+        "m/labelled", 10, "500.00", instrument="hdfc-1225", ref="UTR 5261-1234 5678",
+        parser="llm",
+    )
+    # It does not join in pass 1 — and pass 2 still catches it on instrument,
+    # amount and date, which is the fallback working as designed rather than a
+    # lost row.
+    assert only(run([row], [labelled])).matched_pass == PASS_WINDOW

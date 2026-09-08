@@ -930,3 +930,77 @@ def test_a_hand_written_block_is_still_cleared():
         "manual-abc",
     )
     assert block.startswith("2026-09-02 * Corner Store")
+
+
+@pytest.mark.skipif(not HAS_HLEDGER, reason="hledger/git not installed")
+@pytest.mark.asyncio
+async def test_promotion_goes_all_the_way_through_the_write_path(tmp_path):
+    """`rewrite_block` is where the status is written, but no caller reaches it
+    directly: the lane goes through `rewrite_event`, which takes the flock,
+    pulls, runs `check --strict` and commits.
+
+    Every other status test calls `rewrite_block`, so deleting `status=status`
+    from `rewrite_event`'s call left all of them green while promotion did
+    nothing — the parameter accepted, ignored, and silently dropped one layer
+    down. This asserts through hledger's own output, which is the only reader
+    that matters.
+    """
+    cfg = _repo(tmp_path)
+    rel = await books.post_event(EV_OUT, "arshad-personal/1a06cf5a", cfg)
+    assert rel
+
+    pending = await books.run_hledger(["print", "--pending", "expenses"], cfg)
+    assert "Jai shree nakoda" in pending
+    cleared = await books.run_hledger(["print", "--cleared", "expenses"], cfg)
+    assert "Jai shree nakoda" not in cleared
+
+    await books.rewrite_event(
+        "arshad-personal/1a06cf5a", cfg, status="*", add_tags={"stmt": "axis-9640/2026-07"}
+    )
+
+    cleared = await books.run_hledger(["print", "--cleared", "expenses"], cfg)
+    assert "Jai shree nakoda" in cleared and "stmt" in cleared
+    pending = await books.run_hledger(["print", "--pending", "expenses"], cfg)
+    assert "Jai shree nakoda" not in pending
+
+
+@pytest.mark.skipif(not HAS_HLEDGER, reason="hledger/git not installed")
+@pytest.mark.asyncio
+async def test_the_bulk_path_forwards_status_too(tmp_path):
+    """`rewrite_events` is the tool the one-off `*` -> `!` pass over the
+    pre-existing blocks will use (spec §9.1). Same untested-plumbing risk as
+    above, and here it is worse: that pass is a single write over every block in
+    the journal, so a dropped `status` is a no-op commit that looks like it
+    worked."""
+    cfg = _repo(tmp_path)
+    await books.post_event(EV_OUT, "arshad-personal/1a06cf5a", cfg)
+    await books.post_event(EV_IN, "arshad-personal/1a0659e3", cfg)
+
+    rewritten, failed = await books.rewrite_events(
+        ["arshad-personal/1a06cf5a", "arshad-personal/1a0659e3"],
+        cfg,
+        status="*",
+        message="reconcile: promote the July statement",
+    )
+    assert failed == [] and len(rewritten) == 2
+
+    cleared = await books.run_hledger(["print", "--cleared"], cfg)
+    assert "Jai shree nakoda" in cleared and "Stockopedia Ltd" in cleared
+    assert "Jai shree nakoda" not in await books.run_hledger(["print", "--pending"], cfg)
+
+
+@pytest.mark.skipif(not HAS_HLEDGER, reason="hledger/git not installed")
+@pytest.mark.asyncio
+async def test_a_status_filter_is_reachable_from_the_query_tool(tmp_path):
+    """The six filters are in `_ALLOWED_OPTIONS` so that `ledger_query` — the
+    only way anything asks hledger a question — can ask the one question this
+    lane exists to answer. Without them the flag is written and then unreadable
+    by every consumer: the brief, the month close, the admin page and the chat
+    tool alike."""
+    cfg = _repo(tmp_path)
+    await books.post_event(EV_OUT, "arshad-personal/1a06cf5a", cfg)
+    for flag in ("-P", "--pending", "-C", "--cleared", "-U", "--unmarked"):
+        await books.run_hledger(["bal", flag, "expenses"], cfg)
+
+    with pytest.raises(books.BooksError, match="not allowed"):
+        await books.run_hledger(["bal", "--pendingx", "expenses"], cfg)

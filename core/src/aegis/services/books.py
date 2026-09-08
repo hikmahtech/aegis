@@ -403,10 +403,34 @@ def _posting(account: str, amount: str = "") -> str:
 
 
 def render_transaction(
-    event: MoneyEvent, counter_account: str, instrument_acct: str, msgid: str
+    event: MoneyEvent,
+    counter_account: str,
+    instrument_acct: str,
+    msgid: str,
+    status: str = "!",
 ) -> str:
     """One journal block (spec §1 grammar). Posting 1 = category with signed
-    amount (+ out, − in), posting 2 = instrument, no amount."""
+    amount (+ out, − in), posting 2 = instrument, no amount.
+
+    `status` defaults to `!` (pending) because the default caller is the email
+    lane, and an email is a claim: the bank sent an alert, nothing has checked
+    it against the bank's own statement. Every block written before this claimed
+    `*` (cleared), so `hledger bal --cleared` returned the whole journal and the
+    flag carried no information at all.
+
+    Step 5 passes `status="*"` when it posts a row that came FROM a statement
+    (spec §9.2): there the bank is the source, so the block is proven the moment
+    it is written and there is nothing left to promote. Hardcoding `!` here
+    would have written every bank-proven row as unverified — the whole point of
+    the lane, inverted, on its first run.
+
+    `render_manual` is deliberately not parameterised: a hand-typed
+    `ledger_post` is the owner asserting the fact, and its msgid is a SHA-256 of
+    the rendered block, so changing that rendering would break idempotency for a
+    retry straddling the deploy.
+    """
+    if status not in _STATUSES:
+        raise BooksError(f"status must be one of {_STATUSES}, not {status!r}")
     if event.amount is None or not event.currency or event.occurred_on is None:
         raise BooksError("render_transaction needs amount, currency and occurred_on")
     # Sanitized, not trusted: `instrument` comes from the model, and `channel`
@@ -418,16 +442,7 @@ def render_transaction(
             tags.append(f"{name}: {value}")
     amount = render_amount(event.amount, event.currency, negative=(event.direction == "in"))
     lines = [
-        # `!` (pending), not `*` (cleared). Nothing has verified this: it came
-        # from an email the bank sent, not from the bank's own statement. Every
-        # block written before this change claimed to be bank-cleared, so
-        # `hledger bal --cleared` returned the whole journal and the flag
-        # carried no information at all. A statement row promotes it to `*`
-        # through `rewrite_event(status="*")`. `render_manual` stays `*`: a
-        # hand-typed `ledger_post` is the owner asserting the fact — and its
-        # msgid is a hash of the rendered block, so changing that rendering
-        # would break idempotency for a retry straddling the deploy.
-        f"{event.occurred_on.isoformat()} ! {sanitize_payee(event.payee)}",
+        f"{event.occurred_on.isoformat()} {status} {sanitize_payee(event.payee)}",
         f"{_INDENT}; msgid: {msgid}",
         f"{_INDENT}; {', '.join(tags)}",
         _posting(counter_account, amount),
@@ -532,8 +547,14 @@ def rewrite_block(
         if header is None:
             raise BooksError(f"block {msgid} has an unreadable header: {lines[0][:60]!r}")
         day, had_status, had_payee = header.groups()
-        # An unmarked block being given a payee becomes `*`, which is what it
-        # already meant to hledger before this function learned about status.
+        # An unmarked block being given a payee becomes `*`. Not because
+        # unmarked MEANS cleared — it does not; hledger treats unmarked as a
+        # third status with its own `-U` filter — but because that is what this
+        # function did before it learned about status, and a rename is not the
+        # place to reinterpret a block's verification state. Nothing in this
+        # repo writes an unmarked block, so the only way to have one is a hand
+        # edit; changing what a rename does to it is a separate decision from
+        # fixing the corruption bug, and it is not this function's to take.
         flag = status or had_status or "*"
         lines[0] = f"{day} {flag} {sanitize_payee(payee) if payee else had_payee}"
     if add_tags:
@@ -1126,7 +1147,13 @@ async def rewrite_event(
 
 
 async def rewrite_events(
-    msgids: list[str], cfg: BooksConfig, *, payee: str | None = None, account: str | None = None
+    msgids: list[str],
+    cfg: BooksConfig,
+    *,
+    payee: str | None = None,
+    account: str | None = None,
+    status: str | None = None,
+    message: str | None = None,
 ) -> tuple[list[str], list[str]]:
     """Reclassify many blocks in ONE write. Returns (rewritten, failed) msgids.
 
@@ -1137,6 +1164,12 @@ async def rewrite_events(
 
     A msgid whose block is missing or unrewritable is collected, not raised:
     one stale index row must not revert the rewrites that did land.
+
+    `status` is here for the same reason the rest is: the one-off `*` -> `!`
+    pass over the blocks written before this lane existed (spec §9.1) is one
+    intent over ~34 blocks, and a loop over `rewrite_event` would leave 34
+    commits and hold the flock 34 times. `message` lets that pass say what it
+    is in the history instead of claiming to be a reclassify.
     """
     rewritten: list[str] = []
     failed: list[str] = []
@@ -1162,7 +1195,9 @@ async def rewrite_events(
             try:
                 # Rendered before it is written, so a rejected block leaves the
                 # file exactly as it was and the rest of the batch continues.
-                new_text = rewrite_block(text, msgid, payee=payee, account=account)
+                new_text = rewrite_block(
+                    text, msgid, payee=payee, account=account, status=status
+                )
             except BooksError:
                 failed.append(msgid)
                 continue
@@ -1171,7 +1206,9 @@ async def rewrite_events(
 
     if not msgids:
         return [], []
-    await _write(cfg, f"reclassify {len(msgids)} postings -> {account}", mutate, touched)
+    await _write(
+        cfg, message or f"reclassify {len(msgids)} postings -> {account}", mutate, touched
+    )
     return rewritten, failed
 
 
@@ -1300,6 +1337,16 @@ _ALLOWED_OPTIONS = frozenset({
     "--depth", "--forecast", "--pivot", "--flat", "--tree", "--sort-amount",
     "--average", "--transpose", "--no-total", "--empty", "--historical",
     "--declared", "--used", "--strict",
+    # Status filters (spec §2, §9.1). Without these the `!`/`*` distinction is
+    # written and then unreadable: `ledger_query` is the only way to ask hledger
+    # anything, so "what has the bank not confirmed?" — the question the whole
+    # reconciliation lane exists to answer — had no way to be asked.
+    #
+    # Safe to admit for the same reason the rest of this set is: every entry is
+    # an exact match, never a prefix. hledger bundles short flags (`-Ef<path>`
+    # reads a file, `-No<path>` WRITES one), so `-P` here admits exactly `-P`
+    # and nothing that merely starts with it.
+    "-P", "-C", "-U", "--pending", "--cleared", "--unmarked",
 })
 _OUTPUT_CAP = 12_000
 

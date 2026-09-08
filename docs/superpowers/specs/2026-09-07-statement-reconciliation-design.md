@@ -557,6 +557,20 @@ The closing-balance mismatch of §9.3 is an event rather than a finding: it happ
 not on a sweep, so `BooksCheckError` becomes an `ingest_event` with `klass="closing_balance"`,
 `severity="critical"`, `subject=<statement_id>`.
 
+**That distinction is load-bearing and was left ambiguous in the first draft of this section.**
+`reconcile_findings` resolves any problem whose class is in its `classes` list and which is not
+among this tick's findings. An arrival-time class therefore must **not** appear in the sweep's
+`classes`: include it and every mismatch is resolved on the very next tick, because the sweep never
+"finds" a thing it does not produce. So `closing_balance` is ingested directly, resolved directly
+(by the next statement for that account reconciling), and never handed to the sweep. Sweep-produced
+classes — `unmatched_rows`, `unscoped_instrument`, `statement_missing` — are the only ones in
+`classes`.
+
+The same care applies to `subject_kind`. `reconcile_findings` takes exactly one per call, so the
+`statement`-scoped classes (`unparsed_file`, `password_failed`) need their **own** call with their
+own `classes` list. Mixing them into the instrument-scoped call would let each set resolve the
+other, because neither appears among the other's findings.
+
 **Deleted from the plan:** the bespoke alert wiring. **Kept:** the monthly digest, which is a
 report, not an alert.
 
@@ -568,14 +582,30 @@ because 959 things cannot be reviewed. Grouped, they are one problem per account
 improve, and the 215th row joins it instead of opening another task. Without grouping, step 5 is
 a nagging machine and would be abandoned in week one, exactly as §3 predicted for per-row cards.
 
-**Do not copy `hub_group`'s LLM judge.** The hub pays for a model call because three services
-crash-looping may be three unrelated causes. Here the grouping key is deterministic by
-construction — same instrument, same `skip_reason` — so `find_group_candidates` → `apply_group` runs with the
-`judge_group` call omitted and no cached verdict.
+**Correction (2026-09-09, after review).** The paragraph above originally said to reuse
+`hub_group` with the judge omitted. That was wrong twice, and the mistake is worth keeping visible
+because it is easy to make again.
 
-One rule to carry over verbatim: a group's subject is `*` and can never appear among the
-findings, so it recovers only when its class stops being found **at all**. Check membership by
-class, not by subject, or the group resolves on every single tick.
+First, **the grouping is already done by the correlation key.** A finding whose subject is the
+instrument produces one problem per account by construction —
+`unmatched_rows:instrument:axis-cc-1313` — with the row count in the title and `payload`. That IS
+"214 unmatched rows on axis-cc-1313". `hub_group` adds nothing to it.
+
+Second, **`hub_group` would actively make it worse.** `hub_group.candidates` clusters live problems
+by `(class, subject_kind)` across three or more *different subjects*, and it has **no source
+filter**. So once three instruments carry `unmatched_rows`, the existing `HubSweepFlow` offers the
+cluster to the billed `judge_group` on its next tick, and a "yes" folds every account into a single
+`unmatched_rows:instrument:*` group — the exact opposite of one problem per account, and reached
+without this lane doing anything at all.
+
+So the requirement is the reverse of what was written: **money findings must be kept out of the
+sweep's grouping**, by a `source` filter in `hub_group.candidates` or by an explicit non-groupable
+rule of the kind `class = 'manual'` already has. Whichever is chosen, it is a change to
+`hub_group`, and it belongs to step 8 rather than being free.
+
+The one rule that does carry over unchanged: a group's subject is `*` and can never appear among
+the findings, so it recovers only when its class stops being found **at all** — check membership by
+class, not by subject.
 
 ### 15.6 §9.4 gains a destination, and keeps its rule
 
@@ -614,7 +644,7 @@ residue is small enough to be a handful a month.
 
 | Step | §14 said | Now |
 |---|---|---|
-| 4 | `!` status, `rewrite_block`, one-off rewrite | unchanged |
+| 4 | `!` status, `rewrite_block`, one-off rewrite | **not unchanged** — see §15.10 |
 | **4b** | — | **new:** `"money"` in `hub.SOURCES` + the money `Event` builder |
 | 5 | post through `post_event` + closing-balance check | + `ingest_event` on mismatch; + grouped `unmatched_rows` findings |
 | 6 | transfer matcher, own-account detection | unchanged |
@@ -624,3 +654,44 @@ residue is small enough to be a handful a month.
 
 Net: one step of bespoke alerting removed, one small step added, and step 5 becomes reviewable at
 959 rows instead of unusable.
+
+
+### 15.10 What step 4 shipped, and what it left (2026-09-09)
+
+PRs #453 and the follow-up did the code: `rewrite_block` parses the header and takes `status=`,
+`rewrite_events` takes `status=` and `message=` so the one-off pass has a bulk tool,
+`render_transaction` takes `status` (defaulting to `!`), and `_ALLOWED_OPTIONS` gained the six
+status filters §2 named. A review caught three things the first cut got wrong, all now fixed:
+
+- **`render_transaction` hardcoded `!`.** §9.1 says a statement row with no email counterpart posts
+  `*`, because the bank is the source. Step 5 posts those through `post_event`, so every
+  bank-proven row would have been written "unverified" — the lane's purpose inverted on its first
+  run. It is a parameter now.
+- **The reference key did not join.** `llm._ref_from_body` verified the model's answer on
+  alphanumerics but stored it verbatim, while `statement_match._norm_ref` only stripped and
+  uppercased — so a reference copied with the bank's own spacing never equalled the statement's
+  bare digits. Pass 1 silently found nothing, which is indistinguishable from "no counterpart". One
+  normalisation now runs on both sides. A leading label is deliberately **not** stripped: real
+  references begin with letters (`SBIN0000123456`, the Axis SWIFT `GBC…`).
+- **Pass 1 could join the wrong payment.** It matched on reference and direction alone, which was
+  right while only deterministic parsers set `ref` — those lift it from a fixed slot in a bank's own
+  alert. An extracted reference is a different object with the same name: `_ref_from_body` can only
+  check the characters are in the mail, never whose payment they name. An extracted reference now
+  needs the amount to agree; a parsed one still matches alone, because a card auth and its
+  settlement can differ by a tip and the reference is what knows they are one payment.
+
+**Still outstanding, and both need the owner's say-so** because they write to `hikmahtech/books`:
+the one-off `*`→`!` pass over the blocks written before this lane existed (§9.1 — without it an old
+unproven `*` is indistinguishable from a step-5-proven one), and step 5 itself.
+
+**Two gaps this review named that are still open**, and the next builder will hit them:
+
+1. **§9.3's closing-balance check has a date problem.** A promoted block keeps its *email* date, up
+   to `_MATCH_DAYS` before the bank's, so hledger's balance at the statement close counts a block
+   dated 31 July whose bank posting is 2 August, and excludes the reverse. The check then misses by
+   exactly those amounts and reverts the whole statement's write. `rewrite_block` has no `date=` to
+   align a promoted block to the bank's date. This is the one that makes step 5 un-shippable rather
+   than merely noisy, and it is unsolved.
+2. **The "reconciled through" watermark has no home.** §9.3's ordering rule — an email transaction
+   dated inside a reconciled period is index-only — needs a per-account watermark. Nothing in
+   `migrations/` stores one and `post_money_event` has no such gate.
