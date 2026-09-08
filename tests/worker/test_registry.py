@@ -204,6 +204,18 @@ def test_module_workflows_is_the_unflagged_registry():
     ]
 
 
+def test_books_write_flow_is_gated_on_money_hygiene():
+    """Issue #403: BooksWriteFlow's only activity, books_write, lives on
+    MoneyActivities, which main() builds only when money_hygiene_enabled is
+    on. An unflagged registration means the workflow schedules an activity no
+    worker serves, and the task sits unassigned until the 540s timeout. The
+    flow must be registered iff the flag is on."""
+    spec = next(s for s in FLOWS if s.name == "BooksWriteFlow")
+    assert spec.feature_flag == "money_hygiene_enabled"
+    assert "BooksWriteFlow" in {c.__name__ for c in workflows_for(_flags(money=True))}
+    assert "BooksWriteFlow" not in {c.__name__ for c in workflows_for(_flags(money=False))}
+
+
 # --------------------------------------------------------------------------
 # the real registration passes — and the counts have not moved
 # --------------------------------------------------------------------------
@@ -310,10 +322,12 @@ def test_module_workflows_is_the_unflagged_registry():
         # other two, which never counted them in the first place.
         # Then +1 flow in every row and +1 activity in the money row only:
         # BooksWriteFlow carries a chat tool's books write on its own workflow
-        # (issue #388) and is unflagged, because a flow that is not registered
-        # cannot fail — its tasks would simply never be picked up — while the
-        # `books_write` activity it calls is on the money-flagged
-        # MoneyActivities. So +1/+1/+1 flows and +1/+0/+0 activities.
+        # (issue #388) and the `books_write` activity it calls is on the
+        # money-flagged MoneyActivities. So +1/+1/+1 flows and +1/+0/+0
+        # activities. Then #403 gates BooksWriteFlow itself on
+        # money_hygiene_enabled — its only activity is unserved when the flag
+        # is off, so the flow must not be registered either — moving it OUT of
+        # the money=False rows: −1 flow for those two, activities unchanged.
         # Then +1 flow and +1 activity in every row from the problem hub's
         # PR 2: HubSweepFlow and the two HubActivities it and the heartbeat
         # call (`promote_expired_suppressions`, `clear_converged_deploys`)
@@ -349,8 +363,8 @@ def test_module_workflows_is_the_unflagged_registry():
         # `problem_events` now, not a settings buffer four branches appended
         # to. Net 0 in every row, and no new flow.
         (True, True, 44, 217),
-        (False, False, 36, 186),
-        (True, False, 40, 202),
+        (False, False, 35, 186),
+        (True, False, 39, 202),
     ],
 )
 def test_real_registration_passes_the_boot_check(homelab, money, flows, activities):

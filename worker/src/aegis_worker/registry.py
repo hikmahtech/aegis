@@ -173,8 +173,12 @@ FLOWS: tuple[FlowSpec, ...] = (
     FlowSpec(AlertInvestigationFlow),
     # Event-driven: started by the three ledger write tools with a workflow id
     # derived from the write's own content (issue #388). No schedule config and
-    # no activities.yaml row — nothing but a chat tool ever starts it.
-    FlowSpec(BooksWriteFlow),
+    # no activities.yaml row — nothing but a chat tool ever starts it. Gated on
+    # money_hygiene_enabled (issue #403): its only activity, books_write, lives
+    # on MoneyActivities, which main() only builds when the flag is on — an
+    # ungated registration meant the activity task sat unserved for the full
+    # 540s timeout on money-off installs.
+    FlowSpec(BooksWriteFlow, feature_flag="money_hygiene_enabled"),
     FlowSpec(
         CalendarIngestFlow,
         lambda act: CalendarIngestInput(
