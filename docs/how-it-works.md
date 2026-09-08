@@ -217,6 +217,11 @@ The structure AEGIS manages is deliberately minimal:
   the agent's channel (`AgentChatReplyFlow`).
 - Context labels (`@5min`, `@deep`, `@code`, …) and pre-seeded filter views
   come from `config/seed/todoist.yaml` at bootstrap.
+- **Talking to an agent creates nothing.** A Slack message to an agent is a
+  conversation. The agent answers, and captures a task only if the exchange
+  left real work behind — it calls `capture_to_inbox` itself. The route used
+  to capture every message before the agent had read it, which turned passing
+  questions into a permanent inbox.
 
 `ClarifyFlow` (every 15 min) pulls **only** from the Inbox and classifies each
 unprocessed task — trash / reference / someday / 2-minute / next-action —

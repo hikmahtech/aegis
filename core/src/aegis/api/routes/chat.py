@@ -11,93 +11,12 @@ from pydantic import BaseModel
 from aegis.api.auth import verify_auth
 from aegis.api.sql_filters import build_where
 from aegis.services.chat import (
-    _capture_to_inbox_impl,
     classify_intent,
     send_message,
     synthesize_agent_reply,
 )
 
 router = APIRouter(prefix="/api/chat", dependencies=[Depends(verify_auth)])
-
-# Agent id → Todoist label, used to tag the task captured from a chat ask
-# ask so it's owned by the right agent and anchors that agent's downstream
-# workflows. Agents absent here (none today) skip capture and stay taskless.
-_AGENT_TODOIST_LABEL = {
-    "pandoras-actor": "@pandora",
-    "sebas": "@sebas",
-    "raphael": "@raphael",
-    "maou": "@maou",
-}
-
-
-async def _task_is_completed(pool: Any, task_id: str) -> bool:
-    """True only when the task EXISTS in the local projection AND is completed.
-
-    A missing row is treated as open: a just-created task hasn't synced into
-    `todoist_tasks` yet, and we must not discard the fresh capture we just made.
-    """
-    try:
-        async with pool.acquire() as conn:
-            row = await conn.fetchrow(
-                "SELECT is_completed FROM todoist_tasks WHERE id = $1", task_id
-            )
-    except Exception:  # noqa: BLE001 — best-effort; on error assume open
-        return False
-    return bool(row and row["is_completed"])
-
-
-async def _capture_chat_ask_as_task(
-    pool: Any, target_agent: str, message: str, thread_id: str
-) -> str | None:
-    """Capture a chat ask as a Todoist task owned by `target_agent`.
-
-    Returns the real Todoist task id to anchor the reply (and any workflow the
-    agent spawns) to, or None to stay in taskless DM mode. Best-effort: any
-    failure — kill-switch off, no inbox, no api key, a transient outbox temp-id,
-    an unknown agent, or a raised exception — degrades to None so the DM reply
-    still reaches the user.
-
-    The capture is keyed on the DM `thread_id` (stable per user+agent), so a
-    multi-turn conversation maps to ONE task that accumulates every reply +
-    spawned-workflow link, rather than spawning a fresh task per message. If
-    that thread's task has since been completed, the reused id would mirror onto
-    a task the user no longer sees — so a fresh task is captured under a unique
-    key instead, starting a new conversation thread.
-    """
-    label = _AGENT_TODOIST_LABEL.get(target_agent)
-    if pool is None or label is None:
-        return None
-    from uuid import uuid4
-
-    msg = (message or "").strip()
-    title = msg[:120] or "(chat)"
-    description = msg if len(msg) > 120 else None
-    base_key = thread_id or uuid4().hex
-    try:
-        ref = await _capture_to_inbox_impl(
-            pool=pool,
-            source_tag="#chat",
-            external_id=f"tg-chat:{base_key}",
-            title=title,
-            description=description,
-            extra_labels=[label],
-        )
-        if ref and not ref.startswith("item-") and await _task_is_completed(pool, ref):
-            ref = await _capture_to_inbox_impl(
-                pool=pool,
-                source_tag="#chat",
-                external_id=f"tg-chat:{base_key}:{uuid4().hex[:8]}",
-                title=title,
-                description=description,
-                extra_labels=[label],
-            )
-    except Exception:  # noqa: BLE001 — anchoring is best-effort, never block the reply
-        return None
-    # Only anchor to a real Todoist id; an outbox temp-id ("item-…") can't take
-    # comments yet, so treat it as taskless.
-    if ref and not ref.startswith("item-"):
-        return ref
-    return None
 
 
 @router.post("/dispatches")
@@ -359,11 +278,7 @@ class AgentReplyTriggerRequest(BaseModel):
     """Body for POST /api/chat/agent-reply/trigger (bot → core → temporal).
 
     The chat DM @mention handler hits this endpoint to spawn
-    `AgentChatReplyFlow` for the named agent. The endpoint captures the ask as
-    a `#chat` Todoist task owned by the agent and anchors the flow to it
-    (so the reply is mirrored there and any spawned workflow lands its links +
-    logs on the same task); it falls back to taskless mode — Todoist-mirror
-    step skipped — only when capture can't produce a usable task id.
+    `AgentChatReplyFlow` for the named agent, always taskless.
 
     `reply_chat_id` is the legacy chat id to reply into (positive for DMs,
     negative for groups). `thread_id` is the conversation grouping key used
@@ -382,29 +297,38 @@ async def post_agent_reply_trigger(
     body: AgentReplyTriggerRequest,
     request: Request,
 ) -> dict[str, Any]:
-    """Capture the chat ask as a Todoist task, then spawn AgentChatReplyFlow
-    anchored to it.
+    """Spawn AgentChatReplyFlow for a chat ask. No task is created.
 
-    The ask becomes a `#chat`-tagged task owned by the target agent so
-    Todoist is the hub for every workflow: the reply is mirrored to the task as
-    a comment AND any workflow the agent spawns (e.g. `investigate_resource` →
-    AlertInvestigationFlow) anchors to the same task, landing its Temporal links
-    and kimi transcript there. If capture can't produce a real task id the flow
-    falls back to taskless DM mode (reply still delivered).
+    A message to an agent is a conversation, not a commitment. This endpoint
+    used to capture every one as a `#chat` Todoist task before the flow
+    started, on the theory that Todoist should anchor the reply and anything
+    the agent went on to spawn. In practice it turned questions into chores:
+    a stable per-conversation key meant the first task was reused, but once
+    the user completed it every later message minted a fresh task under a
+    random key, so one Slack channel accumulated 29 tasks named after
+    passing questions.
 
-    Returns 202 on accept with `{workflow_id, target_agent, task_id}`. The reply
-    lands in chat asynchronously (Temporal handles durability + the 600s
-    synthesize ceiling). If the Temporal client isn't wired in app state,
-    returns 503 — the bot's caller treats this as "service down, fall back to
-    sync /api/chat".
+    The agent decides instead. It holds `capture_to_inbox` and calls it when
+    the exchange produced work worth keeping; when it does not, the
+    conversation leaves nothing behind. The flow runs in its documented
+    taskless mode (`task_id=None`): the Todoist mirror and error-comment
+    steps are skipped and the reply reaches the user over the agent's
+    channel.
+
+    The task path is not gone — ClarifyFlow still starts the same flow WITH a
+    task id when the user comments on a Todoist task, and that reply is still
+    mirrored there.
+
+    Returns 202 on accept with `{workflow_id, target_agent, task_id}`, where
+    `task_id` is always null. The reply lands in chat asynchronously (Temporal
+    handles durability + the 600s synthesize ceiling). If the Temporal client
+    isn't wired in app state, returns 503 — the bot's caller treats this as
+    "service down, fall back to sync /api/chat".
     """
     temporal = getattr(request.app.state, "temporal_client", None)
     if temporal is None:
         raise HTTPException(status_code=503, detail="temporal client not configured")
     from uuid import uuid4
-
-    pool = getattr(request.app.state, "db_pool", None)
-    task_id = await _capture_chat_ask_as_task(pool, body.target_agent, body.message, body.thread_id)
 
     workflow_id = f"agent-chat-reply-dm-{body.target_agent}-{uuid4().hex[:12]}"
     await temporal.start_workflow(
@@ -413,7 +337,7 @@ async def post_agent_reply_trigger(
             "target_agent": body.target_agent,
             "synthetic_user_message": body.message,
             "thread_id": body.thread_id,
-            "task_id": task_id,
+            "task_id": None,
             "reply_chat_id": body.reply_chat_id,
         },
         id=workflow_id,
@@ -422,5 +346,7 @@ async def post_agent_reply_trigger(
     return {
         "workflow_id": workflow_id,
         "target_agent": body.target_agent,
-        "task_id": task_id,
+        # Always null. Kept in the shape so the comms client, which logs it,
+        # does not need a release in lockstep with this one.
+        "task_id": None,
     }

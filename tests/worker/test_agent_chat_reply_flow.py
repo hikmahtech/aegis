@@ -378,8 +378,10 @@ async def test_taskless_dm_path_skips_todoist_mirror():
 
 @pytest.mark.asyncio
 async def test_taskless_dm_synthesize_failure_skips_error_comment():
-    """DM path + synth failure: must NOT post error comment (no task to post to)."""
+    """DM path + synth failure: no error comment (there is no task), and the
+    person hears about it in the channel instead of the turn vanishing."""
     error_post_called = {"hit": False}
+    sent: list[str] = []
 
     @activity.defn(name="synthesize_reply")
     async def synth(agent_id, message, thread_id, task_id):
@@ -387,6 +389,7 @@ async def test_taskless_dm_synthesize_failure_skips_error_comment():
 
     @activity.defn(name="send_message")
     async def deliver(agent_id, message, chat_id=0, keyboard=None):
+        sent.append(message)
         return {"ok": True, "message_id": 1}
 
     @activity.defn(name="post_agent_reply_comment")
@@ -421,3 +424,5 @@ async def test_taskless_dm_synthesize_failure_skips_error_comment():
     assert result["status"] == "error"
     assert "upstream blew up" in (result["reason"] or "")
     assert error_post_called["hit"] is False, "DM path must NOT fire error-comment activity"
+    assert sent, "a failed chat reply must still say something in the channel"
+    assert "upstream blew up" in sent[0]

@@ -25,29 +25,17 @@ def auth_headers():
     return {"Authorization": f"Basic {creds}"}
 
 
-async def test_agent_reply_trigger_captures_task_and_anchors_workflow(
-    app, auth_headers, monkeypatch
-):
-    """POST /api/chat/agent-reply/trigger captures the ask as a `#chat`
-    Todoist task owned by the agent, then starts AgentChatReplyFlow anchored to
-    that task id (so the reply + any spawned workflow land on it)."""
-    captured: dict = {}
+async def test_agent_reply_trigger_creates_no_task(app, auth_headers, monkeypatch):
+    """A chat ask is a conversation, not a chore: the route captures nothing
+    and starts the flow taskless.
 
-    async def _fake_capture(*, pool, source_tag, external_id, title, description, extra_labels):
-        captured.update(
-            source_tag=source_tag,
-            external_id=external_id,
-            title=title,
-            extra_labels=extra_labels,
-        )
-        return "real-task-123"
-
-    monkeypatch.setattr("aegis.api.routes.chat._capture_to_inbox_impl", _fake_capture, raising=True)
-    # Freshly-created task isn't in the projection yet → treated as open.
+    The route used to capture every message as a `#chat` task before the flow
+    ran. The capture core is patched here and asserted unused, so a
+    re-introduction by any path fails rather than quietly filling the inbox.
+    """
+    capture = AsyncMock(return_value="task-should-not-exist")
     monkeypatch.setattr(
-        "aegis.api.routes.chat._task_is_completed",
-        AsyncMock(return_value=False),
-        raising=True,
+        "aegis.services.tools.gtd._capture_to_inbox_impl", capture, raising=True
     )
 
     fake_handle = MagicMock()
@@ -73,35 +61,29 @@ async def test_agent_reply_trigger_captures_task_and_anchors_workflow(
     body = resp.json()
     assert body["target_agent"] == "pandoras-actor"
     assert body["workflow_id"].startswith("agent-chat-reply-dm-pandoras-actor-")
-    assert body["task_id"] == "real-task-123"
+    assert body["task_id"] is None
+    capture.assert_not_awaited()
 
-    # Capture tagged the task #chat + owned by the agent, keyed on the DM
-    # thread so a multi-turn conversation maps to one task.
-    assert captured["source_tag"] == "#chat"
-    assert captured["extra_labels"] == ["@pandora"]
-    assert captured["title"] == "why is gmail-ingest dropping emails?"
-    assert captured["external_id"] == "tg-chat:chat-12345-pandoras-actor"
-
-    # Workflow anchored to the captured task.
     call = fake_temporal.start_workflow.call_args
     assert call.args[0] == "AgentChatReplyFlow"
     payload = call.args[1]
     assert payload["target_agent"] == "pandoras-actor"
-    assert payload["task_id"] == "real-task-123"
+    assert payload["task_id"] is None
     assert payload["reply_chat_id"] == 12345
     assert payload["thread_id"] == "chat-12345-pandoras-actor"
     assert call.kwargs["task_queue"] == "aegis-main"
 
 
-async def test_agent_reply_trigger_taskless_when_capture_unavailable(
-    app, auth_headers, monkeypatch
-):
-    """Capture returning None (kill-switch off / no inbox / no api key) →
-    workflow runs taskless (reply still delivered)."""
+async def test_agent_reply_trigger_repeat_asks_stay_taskless(app, auth_headers, monkeypatch):
+    """Several turns in one conversation leave nothing behind.
+
+    This is the failure the change fixes: the old thread-keyed capture reused
+    one task until the user completed it, then minted a fresh task per message
+    forever — 29 of them from a single Slack channel.
+    """
+    capture = AsyncMock(return_value="task-should-not-exist")
     monkeypatch.setattr(
-        "aegis.api.routes.chat._capture_to_inbox_impl",
-        AsyncMock(return_value=None),
-        raising=True,
+        "aegis.services.tools.gtd._capture_to_inbox_impl", capture, raising=True
     )
     fake_temporal = MagicMock()
     fake_temporal.start_workflow = AsyncMock(return_value=MagicMock())
@@ -109,95 +91,24 @@ async def test_agent_reply_trigger_taskless_when_capture_unavailable(
 
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as client:
-        resp = await client.post(
-            "/api/chat/agent-reply/trigger",
-            headers=auth_headers,
-            json={
-                "target_agent": "sebas",
-                "message": "remind me later",
-                "thread_id": "chat-9-sebas",
-                "reply_chat_id": 9,
-            },
-        )
+        for message in ("can we just restart it", "why is our read only?", "and now?"):
+            resp = await client.post(
+                "/api/chat/agent-reply/trigger",
+                headers=auth_headers,
+                json={
+                    "target_agent": "sebas",
+                    "message": message,
+                    "thread_id": "slack-C0BBX9UN996-sebas",
+                    "reply_chat_id": 9,
+                },
+            )
+            assert resp.status_code == 200, resp.text
+            assert resp.json()["task_id"] is None
 
-    assert resp.status_code == 200, resp.text
-    assert resp.json()["task_id"] is None
-    payload = fake_temporal.start_workflow.call_args.args[1]
-    assert payload["task_id"] is None
-
-
-async def test_agent_reply_trigger_taskless_on_outbox_temp_id(app, auth_headers, monkeypatch):
-    """A transient capture that returns an outbox temp-id ("item-…") can't take
-    comments yet → stay taskless rather than anchoring to an unusable id."""
-    monkeypatch.setattr(
-        "aegis.api.routes.chat._capture_to_inbox_impl",
-        AsyncMock(return_value="item-abc-temp"),
-        raising=True,
-    )
-    fake_temporal = MagicMock()
-    fake_temporal.start_workflow = AsyncMock(return_value=MagicMock())
-    app.state.temporal_client = fake_temporal
-
-    transport = ASGITransport(app=app)
-    async with AsyncClient(transport=transport, base_url="http://test") as client:
-        resp = await client.post(
-            "/api/chat/agent-reply/trigger",
-            headers=auth_headers,
-            json={
-                "target_agent": "raphael",
-                "message": "x",
-                "thread_id": "t",
-                "reply_chat_id": 1,
-            },
-        )
-
-    assert resp.status_code == 200, resp.text
-    assert resp.json()["task_id"] is None
-    assert fake_temporal.start_workflow.call_args.args[1]["task_id"] is None
-
-
-async def test_agent_reply_trigger_recaptures_when_thread_task_completed(app, auth_headers, monkeypatch):
-    """If the thread's reused task has been completed, anchor to a freshly
-    captured task instead of mirroring onto one the user no longer sees."""
-    external_ids: list[str] = []
-
-    async def _fake_capture(*, pool, source_tag, external_id, title, description, extra_labels):
-        external_ids.append(external_id)
-        # First call (thread-keyed) returns the stale/completed task; the
-        # re-capture (suffixed key) returns a fresh one.
-        return "stale-done-task" if len(external_ids) == 1 else "fresh-task-2"
-
-    monkeypatch.setattr(
-        "aegis.api.routes.chat._capture_to_inbox_impl", _fake_capture, raising=True
-    )
-    monkeypatch.setattr(
-        "aegis.api.routes.chat._task_is_completed",
-        AsyncMock(return_value=True),
-        raising=True,
-    )
-    fake_temporal = MagicMock()
-    fake_temporal.start_workflow = AsyncMock(return_value=MagicMock())
-    app.state.temporal_client = fake_temporal
-
-    transport = ASGITransport(app=app)
-    async with AsyncClient(transport=transport, base_url="http://test") as client:
-        resp = await client.post(
-            "/api/chat/agent-reply/trigger",
-            headers=auth_headers,
-            json={
-                "target_agent": "pandoras-actor",
-                "message": "back again",
-                "thread_id": "chat-7-pandoras-actor",
-                "reply_chat_id": 7,
-            },
-        )
-
-    assert resp.status_code == 200, resp.text
-    assert resp.json()["task_id"] == "fresh-task-2"
-    # Thread key first, then a uniquely-suffixed key for the fresh task.
-    assert external_ids[0] == "tg-chat:chat-7-pandoras-actor"
-    assert external_ids[1].startswith("tg-chat:chat-7-pandoras-actor:")
-    assert fake_temporal.start_workflow.call_args.args[1]["task_id"] == "fresh-task-2"
+    assert capture.await_count == 0
+    assert fake_temporal.start_workflow.await_count == 3
+    for call in fake_temporal.start_workflow.await_args_list:
+        assert call.args[1]["task_id"] is None
 
 
 async def test_agent_reply_trigger_503_when_temporal_unavailable(app, auth_headers):

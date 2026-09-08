@@ -20,9 +20,11 @@ degrade to message_id=None and still post the Todoist comment
 (or degrade silently on the DM path).
 
 TASKLESS MODE: when `task_id is None`, the Todoist mirror + error-comment
-steps are skipped entirely. The bot path uses this for DMs where there
-is no Todoist anchor. The active comms adapter (Slack) routes the reply by
-the agent's channel.
+steps are skipped entirely and a failure is reported in the agent's channel
+instead. This is the whole chat path: a message to an agent creates no task,
+and the agent captures one itself (`capture_to_inbox`) only when the exchange
+leaves work behind. The active comms adapter (Slack) routes the reply by the
+agent's channel.
 """
 
 from __future__ import annotations
@@ -114,6 +116,24 @@ class AgentChatReplyFlow:
                     start_to_close_timeout=TIMEOUT_FAST,
                     retry_policy=NO_RETRY,
                 )
+            else:
+                # No task to carry the bad news, and a chat ask now never
+                # creates one — so say it in the channel the person asked in
+                # rather than dropping the turn on the floor.
+                try:
+                    await workflow.execute_activity_method(
+                        DeliveryActivities.send_message,
+                        args=[
+                            inp.target_agent,
+                            f"I couldn't answer that one: {err_msg[:200]}",
+                        ],
+                        start_to_close_timeout=TIMEOUT_FAST,
+                        retry_policy=STANDARD,
+                    )
+                except Exception as send_exc:  # noqa: BLE001 — already failing
+                    workflow.logger.warning(
+                        "agent_chat_reply_error_notice_failed err=%s", _err_str(send_exc)
+                    )
             return {
                 "status": "error",
                 "reason": err_msg,
