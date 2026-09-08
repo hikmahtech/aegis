@@ -428,26 +428,29 @@ investigate.)
 
 ```mermaid
 flowchart TD
-    AM["Alertmanager / Grafana<br/>POST /api/webhooks/alert"] --> AI
-    SN["Sentry webhook<br/>+ sentry-poll-30m"] --> AI
-    HB["infra-heartbeat-2m<br/>(state transitions)"] --> AI
-    TT["Todoist task<br/>(content route)"] --> AI
-    AI["AlertInvestigationFlow"] --> RS{"already resolved?"}
-    RS -- yes --> X1["exit"]
-    RS -- no --> DD{"duplicate?<br/>signature + fingerprint"}
-    DD -- yes --> X2["comment on the existing task, exit"]
-    DD -- no --> MU{"muted?"}
-    MU -- yes --> X3["exit"]
-    MU -- no --> G1["Gate 1 (severity-gated):<br/>Investigate / Skip / Mute 24h"]
-    G1 --> VD["verification delay<br/>+ re-check resolved"]
-    VD --> RR["resolve the owning repo<br/>(resources table)"]
+    AM["Alertmanager / Grafana<br/>POST /api/webhooks/alert"] --> HUB
+    SN["Sentry webhook<br/>+ sentry-poll-30m"] --> HUB
+    HB["infra-heartbeat-2m<br/>(state transitions)"] --> HUB
+    TT["Todoist task<br/>(content route)"] --> HUB
+    HUB["problem hub: ingest_event<br/>key = class:subject_kind:subject"] --> DEC{"new or returning?"}
+    DEC -- "no: same open problem" --> X2["occurrence counted,<br/>task commented, no flow"]
+    DEC -- "suppressed by a<br/>deploy window" --> X3["stored, not raised"]
+    DEC -- "muted" --> X4["stored, not raised"]
+    DEC -- yes --> AI["AlertInvestigationFlow(problem_id)"]
+    AI --> VD["verification wait (per class)<br/>then ask the hub: resolved yet?"]
+    VD -- resolved --> X5["exit; the hub closed the task"]
+    VD -- "still wrong" --> RR["resolve the owning repo<br/>(resources table)"]
     RR --> KC["runbook + prior-incident context"]
     KC --> IV["investigate: coding CLI on the repo,<br/>LLM-only fallback"]
     IV --> VE{"verdict"}
-    VE -- "resolved /<br/>not_actionable" --> NO["notify + task comment + audit log"]
+    VE -- "resolved /<br/>not_actionable" --> NO["record_investigation:<br/>event on the problem, task comment"]
     VE -- "actionable /<br/>inconclusive" --> G2["Gate 2 card: Open PR / Run fix /<br/>Mute 24h / Acknowledge / Discard"]
     G2 --> NO
 ```
+
+The flow no longer decides whether an alert is new — the hub does, before the
+flow starts. Dedupe, muting and suppression all happen at `ingest_event`, and
+the flow is handed a `problem_id` it records against.
 
 The steps that make it trustworthy:
 

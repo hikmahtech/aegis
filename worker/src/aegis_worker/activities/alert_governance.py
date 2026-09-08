@@ -19,7 +19,10 @@ logger = structlog.get_logger()
 
 @dataclass
 class StagePendingPrInput:
-    alert_fingerprint: str
+    # The problem this PR is a fix for. It replaced `alert_fingerprint`, which
+    # every staged PR wrote and nothing ever read — the last place an alert's
+    # identity was a fingerprint rather than the problem it belongs to.
+    problem_id: str
     repo: str
     branch: str
     title: str
@@ -55,13 +58,13 @@ class AlertGovernanceActivities:
             pr_id = await conn.fetchval(
                 """
                 INSERT INTO pending_prs
-                    (interaction_id, alert_fingerprint, repo, branch,
+                    (interaction_id, problem_id, repo, branch,
                      title, body, diff, kimi_session_id)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                VALUES ($1, $2::uuid, $3, $4, $5, $6, $7, $8)
                 RETURNING id
                 """,
                 input.interaction_id,
-                input.alert_fingerprint,
+                input.problem_id or None,
                 input.repo,
                 input.branch,
                 input.title,
