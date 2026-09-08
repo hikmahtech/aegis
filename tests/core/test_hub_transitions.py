@@ -110,3 +110,42 @@ def test_validate_event_rejects(bad):
 def test_validate_event_accepts_a_minimal_event():
     validate_event(_ev())
     validate_event(_ev(problem_id="abc", kind="human_note"))
+
+
+def test_the_hub_accepts_a_money_finding():
+    """`SOURCES` is a closed vocabulary and `validate_event` raises on anything
+    outside it, so the money lane cannot report a reconciliation finding at all
+    until its source exists (spec 2026-09-07 §15.3).
+
+    Asserted through `validate_event` rather than by reading the frozenset,
+    because membership is not the requirement — being able to build a real
+    finding is. A `closing_balance` mismatch on one statement is the shape the
+    lane will produce: an account-scoped subject, so `reconcile_findings` can
+    resolve it by absence when a later statement agrees.
+    """
+    validate_event(
+        Event(
+            source="money",
+            external_id="stmt/axis-9640/2026-07",
+            kind="occurrence",
+            title="Closing balance disagrees on axis-9640 2026-07",
+            subject="axis-9640",
+            subject_kind="instrument",
+            klass="closing_balance",
+            severity="critical",
+        )
+    )
+
+
+def test_a_source_outside_the_vocabulary_is_still_refused():
+    """The pin that makes the test above mean something: `validate_event` is a
+    real gate, not a no-op that would accept any string."""
+    with pytest.raises(ValueError, match="unknown source"):
+        validate_event(
+            Event(
+                source="reconciliation",  # plausible, and not the agreed name
+                external_id="x",
+                kind="occurrence",
+                title="t",
+            )
+        )
