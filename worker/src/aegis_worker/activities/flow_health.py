@@ -539,7 +539,7 @@ class FlowHealthActivities:
             )
             result["alerted"] = len(fresh)
 
-        recovered = sorted(r["subject"] for r in outcome["resolved"])
+        recovered = sorted(r.get("label") or r["subject"] for r in outcome["resolved"])
         if recovered:
             await safe_send_message(
                 self.delivery,

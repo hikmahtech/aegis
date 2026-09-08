@@ -146,7 +146,14 @@ async def main():
     # Create activity instances with real dependencies + connectors
     connectors = deps.connectors
 
-    hub_act = HubActivities(db_pool=deps.pool)
+    hub_act = HubActivities(
+        db_pool=deps.pool,
+        llm_client=deps.llm,
+        # `model_balanced` (the tier-resolved local), not a raw settings field.
+        # The grouping judge reads a dozen alert titles and answers yes or no;
+        # the balanced tier is sized for exactly that.
+        model=model_balanced,
+    )
     alert_governance_act = AlertGovernanceActivities(
         db_pool=deps.pool,
         remote_script=connectors.get("remote_script"),
@@ -205,6 +212,8 @@ async def main():
     # so the readings never cross a boundary (#215). Wired after construction
     # because delivery_act does not exist yet above.
     briefing_act.delivery = delivery_act
+    # Same reason: the sweep's grouping step says so in the channel.
+    hub_act.delivery = delivery_act
     content_act = ContentActivities(
         knowledge_connector=connectors.get("knowledge"),
         db_pool=deps.pool,

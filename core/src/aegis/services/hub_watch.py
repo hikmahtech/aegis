@@ -9,7 +9,9 @@ question asked once:
 
 * every finding is an occurrence on its problem (new or attached);
 * every live problem of the watchdog's classes that is **not** among the
-  findings any more is resolved;
+  findings any more is resolved — except a GROUP problem, which stands for a
+  whole class rather than one subject and so recovers only when the watchdog
+  stops finding ANY member of that class;
 * a finding is *fresh* — worth a card — only when the hub says so
   (`IngestResult.investigate`: a new or returning problem, not suppressed,
   not muted).
@@ -93,19 +95,29 @@ async def reconcile_findings(
 
     resolved: list[dict[str, Any]] = []
     rows = await pool.fetch(
-        "SELECT id::text AS id, class, subject FROM problems "
+        "SELECT id::text AS id, class, subject, title, group_key FROM problems "
         "WHERE closed_at IS NULL AND status NOT IN ('resolved', 'closed') "
         "  AND subject_kind = $1 AND class = ANY($2::text[])",
         slug(subject_kind) or "service",
         [slug(c) for c in classes],
     )
+    still_failing = {klass for klass, _ in seen}
     for row in rows:
-        if (row["class"], row["subject"]) in seen:
+        if row["group_key"]:
+            # A group's subject is `*` and can never be among the findings. It
+            # recovers when its class does: one post publishing does not mean
+            # the queue drained.
+            if row["class"] in still_failing:
+                continue
+        elif (row["class"], row["subject"]) in seen:
             continue
         result = await ingest_event(
             pool,
             Event(
                 source=source,
+                # Name the problem outright rather than re-deriving it from a
+                # subject: a group's subject does not correlate back to it.
+                problem_id=row["id"],
                 external_id=f"{source}:{row['class']}:{row['subject']}@{now.isoformat()}@resolved",
                 kind="resolved",
                 title=f"{row['class']} recovered: {row['subject']}",
@@ -117,7 +129,17 @@ async def reconcile_findings(
             now=now,
         )
         if result.action == "resolved":
-            resolved.append({"subject": row["subject"], "klass": row["class"], "problem_id": row["id"]})
+            resolved.append(
+                {
+                    # `label` is what a recovery card should print: a group's
+                    # subject is `*`, which names nothing to a reader.
+                    "subject": row["subject"],
+                    "label": row["title"] if row["group_key"] else row["subject"],
+                    "klass": row["class"],
+                    "problem_id": row["id"],
+                    "group": bool(row["group_key"]),
+                }
+            )
             to_project.append(row["id"])
 
     if project:

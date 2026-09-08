@@ -15,18 +15,36 @@ start a child workflow.
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from typing import Any
 
 import asyncpg
-from aegis.services import hub, hub_project, hub_watch
+from aegis.services import hub, hub_group, hub_project, hub_watch
 from temporalio import activity
+
+from aegis_worker.activities.delivery import safe_send_message
 
 # The briefing message names this many problems; the rest are a count.
 _DIGEST_LIST_CAP = 12
+# How many members a grouping judge is shown. Enough to see a pattern; a
+# hundred stuck posts do not read differently from twelve.
+_GROUP_PROMPT_CAP = 12
 
 
 class HubActivities:
-    def __init__(self, db_pool: asyncpg.Pool | None) -> None:
+    def __init__(
+        self,
+        db_pool: asyncpg.Pool | None,
+        llm_client: Any = None,
+        model: str = "",
+        delivery: Any = None,
+    ) -> None:
         self.db_pool = db_pool
+        # Only the grouping judge needs a model. Everything else here is SQL,
+        # so a worker with no LLM wired still runs the whole sweep — it just
+        # never proposes a group.
+        self.llm_client = llm_client
+        self.model = model
+        self.delivery = delivery
 
     @activity.defn
     async def ingest_alert(self, alert: dict, resolved: bool = False) -> dict:
@@ -378,3 +396,207 @@ class HubActivities:
             return {"cleared": []}
         cleared = await hub.clear_converged_deploys(self.db_pool, list(stuck_services or []))
         return {"cleared": cleared}
+
+    # --- grouping: the same failure on many entities -------------------------
+
+    @activity.defn
+    async def find_group_candidates(
+        self, min_members: int = 0, hours: float = 0.0
+    ) -> list[dict]:
+        """Clusters of live problems that share a class and a subject kind.
+
+        A candidate, not a verdict — `judge_group` decides. A cluster with a
+        standing verdict that has not grown since is dropped here rather than
+        re-priced every sweep.
+        """
+        if self.db_pool is None:
+            return []
+        found = await hub_group.candidates(
+            self.db_pool,
+            min_members=int(min_members) or hub_group.MIN_MEMBERS,
+            hours=float(hours) or hub_group.WINDOW_HOURS,
+        )
+        out: list[dict] = []
+        for cluster in found:
+            verdict = await hub_group.recent_verdict(
+                self.db_pool, cluster["group_key"], cluster["member_count"]
+            )
+            if verdict is not None:
+                continue
+            out.append(
+                {
+                    "class": cluster["class"],
+                    "subject_kind": cluster["subject_kind"],
+                    "group_key": cluster["group_key"],
+                    "member_count": cluster["member_count"],
+                    "members": [
+                        {
+                            "id": m["id"],
+                            "subject": m["subject"],
+                            "title": m["title"],
+                            "severity": m["severity"],
+                            "occurrences": int(m["occurrences"] or 0),
+                            "first_seen_at": m["first_seen_at"].isoformat(),
+                        }
+                        for m in cluster["members"]
+                    ],
+                }
+            )
+        activity.logger.info("hub_group_candidates found=%d", len(out))
+        return out
+
+    @activity.defn
+    async def judge_group(self, candidate: dict) -> dict:
+        """Ask the model whether these problems are one condition, and what to
+        call it.
+
+        NO_RETRY at the call site: this is a billed call, and a second opinion
+        on the same cluster is worth less than the money it costs. A model that
+        will not answer, or is not wired, declines — the problems stay separate,
+        which is the safe direction. The verdict is recorded either way so the
+        next sweep does not ask again until the cluster grows.
+        """
+        members = candidate.get("members") or []
+        gkey = str(candidate.get("group_key") or "")
+        no = {"group": False, "title": "", "reason": "", "group_key": gkey}
+        if self.db_pool is None or not gkey or len(members) < 2:
+            return no
+        if not self.llm_client or not self.model:
+            return {**no, "reason": "no model wired"}
+
+        listed = "\n".join(
+            f"- {m.get('subject')}: {str(m.get('title'))[:120]} "
+            f"(seen {m.get('occurrences')}x)"
+            for m in members[:_GROUP_PROMPT_CAP]
+        )
+        prompt = (
+            "These open problems share a class and a kind of subject. Decide "
+            "whether they are ONE condition affecting several things, or "
+            "several unrelated problems that happen to look alike.\n\n"
+            f"Class: {candidate.get('class')}\n"
+            f"Kind of subject: {candidate.get('subject_kind')}\n"
+            f"Count: {candidate.get('member_count')}\n"
+            f"Members:\n{listed}\n\n"
+            "Say yes only when one fix would clear all of them — a queue that "
+            "stopped draining, a host that went down, one broken integration. "
+            "Say no when each needs its own diagnosis, even if the wording "
+            "matches.\n"
+            'Return JSON only: {"same_condition": true|false, "title": '
+            '"<short title for the shared problem, naming the count and what '
+            'is affected>", "reason": "<one sentence>"}'
+        )
+        try:
+            result = await self.llm_client.think(
+                prompt,
+                model=self.model,
+                system_prompt=(
+                    "You are a site reliability engineer deciding whether "
+                    "several alerts are one incident."
+                ),
+                db_pool=self.db_pool,
+                purpose="hub_group_judge",
+                agent_id="pandoras-actor",
+            )
+        except Exception as exc:  # noqa: BLE001 — a judge that will not answer says no
+            activity.logger.warning("hub_group_judge_failed error=%s", str(exc)[:200])
+            return {**no, "reason": f"judge failed: {str(exc)[:120]}"}
+
+        from aegis.llm import parse_llm_json
+
+        parsed = parse_llm_json(result.get("response") or "")
+        if not isinstance(parsed, dict):
+            activity.logger.warning("hub_group_judge_unparseable")
+            return {**no, "reason": "unparseable verdict"}
+        agreed = bool(parsed.get("same_condition"))
+        title = str(parsed.get("title") or "").strip()[:200]
+        reason = str(parsed.get("reason") or "").strip()[:300]
+        await hub_group.record_verdict(
+            self.db_pool,
+            gkey,
+            grouped=agreed,
+            member_count=int(candidate.get("member_count") or len(members)),
+            reason=reason,
+        )
+        activity.logger.info(
+            "hub_group_judged key=%s group=%s reason=%s", gkey, agreed, reason[:120]
+        )
+        return {"group": agreed, "title": title, "reason": reason, "group_key": gkey}
+
+    @activity.defn
+    async def apply_group(self, candidate: dict, verdict: dict) -> dict:
+        """Fold the cluster into one group problem, retire the tasks it
+        swallowed, project the survivor and say so in the channel.
+
+        NO_RETRY at the call site: it merges, closes tasks and posts. It is
+        written to be safe to run again anyway — `hub_group.upgrade` folds into
+        the group that already exists — but a silent second Slack card is not
+        worth the retry.
+        """
+        if self.db_pool is None:
+            return {"grouped": False, "reason": "no pool"}
+        members = candidate.get("members") or []
+        title = str(verdict.get("title") or "").strip()
+        if not title:
+            kind = candidate.get("subject_kind") or "subject"
+            title = f"{len(members)} {kind}s: {candidate.get('class')}"
+        try:
+            result = await hub_group.upgrade(
+                self.db_pool,
+                klass=str(candidate.get("class") or ""),
+                subject_kind=str(candidate.get("subject_kind") or ""),
+                title=title,
+                member_ids=[str(m.get("id")) for m in members if m.get("id")],
+                by="hub-sweep",
+            )
+        except ValueError as exc:
+            activity.logger.warning("hub_group_upgrade_refused error=%s", str(exc)[:200])
+            return {"grouped": False, "reason": str(exc)[:200]}
+
+        # Retire the tasks the folded problems owned: leaving them open is the
+        # very thing grouping exists to stop.
+        retired = 0
+        for merged in result["merged"]:
+            task_id = merged.get("task_id") or ""
+            if not task_id:
+                continue
+            try:
+                if await hub_project.retire_task(
+                    self.db_pool,
+                    task_id,
+                    f"Folded into one problem: {title}. Work it there.",
+                ):
+                    retired += 1
+            except Exception as exc:  # noqa: BLE001 — the group still stands
+                activity.logger.warning(
+                    "hub_group_retire_failed task_id=%s error=%s", task_id, str(exc)[:200]
+                )
+        try:
+            await hub_project.project(self.db_pool, result["problem_id"])
+        except Exception as exc:  # noqa: BLE001 — the sweep re-projects
+            activity.logger.warning("hub_group_project_failed error=%s", str(exc)[:200])
+
+        subjects = [s for s in result["subjects"] if s]
+        body = (
+            f"{title}\n\n"
+            f"{len(subjects)} problems of class `{result['class']}` were the same "
+            "condition, so they are now one problem and one task:\n"
+            + "\n".join(f"  {s}" for s in subjects[:12])
+            + ("\n  …" if len(subjects) > 12 else "")
+            + f"\n\n{retired} task(s) closed. A new one joins this problem instead "
+            "of opening another.\n"
+            + (f"Why: {verdict.get('reason')}" if verdict.get("reason") else "")
+        )
+        await safe_send_message(
+            self.delivery,
+            agent_id="pandoras-actor",
+            message=f"[PROBLEM GROUPED] {title}\n\n{body}",
+            log_event="hub_group_notify_failed",
+        )
+        return {
+            "grouped": True,
+            "problem_id": result["problem_id"],
+            "group_key": result["group_key"],
+            "title": title,
+            "folded": len(result["merged"]),
+            "tasks_retired": retired,
+        }

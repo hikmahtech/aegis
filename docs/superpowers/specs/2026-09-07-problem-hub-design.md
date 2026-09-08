@@ -605,7 +605,7 @@ is the actual failure this section fixes.
 | Spec said | Shipped | Why |
 |---|---|---|
 | §6: a problem projects only once it passes an attention `threshold_for_class` (default 1, `flow_stale` 2) | No threshold. Projection gates on status and mute only, so every open problem earns a task on its first occurrence. | The classes that would have used a threshold above 1 got recovery semantics instead (`hub_watch.reconcile_findings` resolves a finding that goes away), which removes the noise the threshold existed to remove. A threshold on top would delay a real outage's task for no gain. |
-| §3: a `''`-key event gets a balanced-tier "possibly the same as" suggestion, written as a `problem_links(kind='problem')` row | Not built. An uncorrelated event creates. | The suggestion is only useful if someone reads it, and the surface that would show it is the admin page, which is not built either. Creating is the safe default the spec itself argues for, and `merge_problems` undoes a duplicate by hand. |
+| §3: a `''`-key event gets a balanced-tier "possibly the same as" suggestion, written as a `problem_links(kind='problem')` row | Not built as a suggestion. An uncorrelated event still creates; §14 shipped the LLM judgement in a narrower, acting form instead. | A suggestion is only worth writing if someone reads it. What the operator actually wanted was for the hub to ACT on the pattern — see §14, which restricts the judgement to one class and one subject kind and therefore never has to guess that two different failures are the same one. |
 | Files touched: `collapse_window`, `reopen_window`, per-class `verify_seconds` and thresholds as `activities.config` on the hub sweep row | Python constants (`REOPEN_WINDOW`, `_VERIFY_SECONDS`, `COLLAPSE_WINDOW`) | They describe what an outage is rather than what an operator prefers, and no deployment has wanted a different value. Moving one to config is a two-line change when one does. |
 | §8: `pending_prs` gains a `problem_id` column; `alert_fingerprint` stays one release | `pending_prs` unchanged, still keyed on `alert_fingerprint` | The staging path never needed the problem: `record_investigation` already links a staged PR to its problem through `payload.pr_urls`. Adding a column to key on would have been a second identity for the same thing. |
 | §8: the heartbeat's `escalate` flag becomes `severity='critical'` on the event and the flow reads it from the problem | `escalate` still travels on the alert dict; every heartbeat alert is already `severity='critical'` | Severity and escalation turned out to be different questions — every heartbeat alert is critical, but only some escalate — so collapsing them would have lost the distinction the gate-2 race depends on. |
@@ -639,6 +639,30 @@ One correction to §12 itself: the 4a row says "migration 032 drops `alert_mutes
 The whole ordering, the grant SQL and the verification queries are in
 `docs/infrastructure.md` under "Rolling the problem hub out". That is the
 runbook to follow; this list is the summary.
+
+### 14. Groups: the same failure on many entities (added 2026-09-08)
+
+Six Postiz posts wedged in one queue produced six problems and six Todoist
+tasks. The hub was behaving exactly as specified — `find_stuck_posts` sets the
+subject to the individual Postiz post id, so six subjects are six correlation
+keys — and the result was still wrong: one stalled worker, six chores.
+
+A **group** is a problem whose subject is the whole class.
+
+| | |
+|---|---|
+| Identity | `group_key = '{class}:{subject_kind}'` (migration 040), correlation key `'{class}:{subject_kind}:*'`. `*` is not a character `_slug` can produce, so no real subject collides. |
+| Absorption | In `ingest_event`: an **occurrence** whose own key has no problem, and whose class has a live group, attaches to the group with `payload.member_subject` naming the entity. Occurrences only — one member recovering says nothing about the group. |
+| Recovery | `hub_watch.reconcile_findings` resolves a group only when its watchdog finds **no** member of the class. A group's `*` is never among the findings, so without this it would resolve every tick. |
+| Who decides | `HubSweepFlow`: `find_group_candidates` (≥3 live ungrouped problems of one class and kind, seen in 72h) → `judge_group` (one `think()` call, NO_RETRY, purpose `hub_group_judge`) → `apply_group`. A refusal, an unparseable answer or no model wired all mean "leave them separate". |
+| Folding | `hub_group.upgrade`: the oldest member becomes the group and keeps its task, history and sessions; the rest go through `merge_problems`, and their tasks are retired with a note pointing at the survivor. One `state_change` event with `action='grouped'` records why; the projector renames the task and comments. |
+| Cost control | A verdict is cached in `settings.hub_group_verdicts` for 24h, and re-asked early only if the cluster grew. Most sweeps make no model call. |
+| Never | Across classes. On class `manual` — those are hand-written tasks, and folding two would move one task's sessions and PR links onto another. On the count alone. |
+
+This is the one place the hub attaches on a judgement rather than an exact
+key, which is why the judgement is fenced in on every side: same class, same
+subject kind, a model that has to say yes, and a fold that is reversible
+because nothing is deleted.
 
 ## Files touched
 

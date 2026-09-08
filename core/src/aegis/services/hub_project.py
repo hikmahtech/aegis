@@ -92,6 +92,14 @@ def render_block(
         f"Subject: {problem['subject'] or '-'} ({problem['subject_kind'] or '-'}) · "
         f"{problem['severity']} · class {problem['class']}",
     ]
+    if problem.get("group_key"):
+        # A group stands for a whole class, so its subject is `*`. Say what it
+        # covers instead, and that the next one joins it rather than opening
+        # another task.
+        lines.append(
+            f"Group: every {problem['class']} on a {problem['subject_kind'] or 'subject'} · "
+            "new ones join this problem"
+        )
     if window:
         until = f"until {_ts(window['until_at'])}" if window.get("until_at") else "until cleared"
         lines.append(f"Window: {window['state']} {until} (set by {window['set_by']})")
@@ -529,6 +537,7 @@ async def project(
             projected_at=now.isoformat(),
             pending_occurrences=0,
             block_hash=hashlib.sha1(block.encode()).hexdigest(),
+            projected_title=p["title"],
         )
         await _save_meta(pool, problem_id, meta)
         logger.info("hub_project_task_created", problem_id=problem_id, task_id=task_id)
@@ -543,7 +552,7 @@ async def project(
     )
     pending = int(meta.get("pending_occurrences") or 0)
     comments: list[str] = []
-    close = reopen = False
+    close = reopen = renamed = False
     for e in events:
         payload = e["payload"] or {}
         if e["kind"] == "occurrence":
@@ -551,7 +560,17 @@ async def project(
                 pending += 1
         elif e["kind"] == "state_change":
             action = payload.get("action")
-            if action == "resolve":
+            if action == "grouped":
+                members = [str(m) for m in (payload.get("members") or []) if m]
+                shown = ", ".join(members[:8]) + ("…" if len(members) > 8 else "")
+                comments.append(
+                    f"🧩 Same thing on {payload.get('member_count') or len(members)} "
+                    f"{p['subject_kind'] or 'subject'}s, so this task now covers all of them"
+                    + (f": {shown}." if shown else ".")
+                    + " The others were folded in and closed; the next one lands here."
+                )
+                renamed = True
+            elif action == "resolve":
                 comments.append(f"✅ Resolved at {_ts(e['occurred_at'])}. Closing this task.")
                 close, reopen = True, False
             elif action in {"reopen", "promote"}:
@@ -611,15 +630,27 @@ async def project(
             sessions=sessions,
             steps=progress,
         )
+    # The problem's title only changes when the hub rewrites it — today that
+    # is a group upgrade, where "Post cms4k… stuck in Postiz" has to become
+    # "6 posts stuck in Postiz" or the task lies about its own scope. A task
+    # projected before this existed has no recorded title, so it is renamed
+    # only on an event that actually renamed the problem; nothing else
+    # overwrites a title a person may have edited.
+    prior_title = meta.get("projected_title")
+    rename = renamed or (prior_title is not None and prior_title != p["title"])
     block_hash = hashlib.sha1(block.encode()).hexdigest()
-    if meta.get("block_hash") != block_hash:
+    if meta.get("block_hash") != block_hash or rename:
         current = await pool.fetchval("SELECT description FROM todoist_tasks WHERE id = $1", task_id)
+        fields: dict[str, Any] = {
+            "description": merge_block(current, block)[:_DESCRIPTION_CAP]
+        }
+        if rename:
+            fields["content"] = p["title"][:120]
+            meta["projected_title"] = p["title"]
         await _queue(
             pool,
             f"problem-desc-{task_id}",
-            TodoistConnector.build_item_update_command(
-                task_id, description=merge_block(current, block)[:_DESCRIPTION_CAP]
-            ),
+            TodoistConnector.build_item_update_command(task_id, **fields),
             supersede=True,
         )
         meta["block_hash"] = block_hash
