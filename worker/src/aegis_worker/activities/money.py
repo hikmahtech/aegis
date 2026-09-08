@@ -727,14 +727,15 @@ class MoneyActivities:
                 # used to gate on (#449). The Todoist task is a projection of
                 # the due, not the due itself, so whether Todoist accepted the
                 # close is not evidence about whether the money moved — and
-                # every failure mode here is permanent, because `mark_due_paid`
-                # has one caller and nothing re-drives it: an `item-…` ref
-                # queues no completion at all, a task the user deleted is a
-                # 4xx, and a *retryable* failure closes the task later through
-                # the outbox while still returning False here. The comment this
-                # replaces promised a retry after the drain that does not
-                # exist, so each of those left a paid bill sitting in every
-                # "dues open" count forever, clearable only by hand.
+                # both failure modes here are permanent, because
+                # `mark_due_paid` has one caller and nothing re-drives it: an
+                # `item-…` ref queues no completion at all, and a task the user
+                # deleted is a permanent 4xx. (A *retryable* failure is fine —
+                # `complete_captured_task` queues it to the outbox and returns
+                # True.) The comment this replaces promised a retry after the
+                # drain that does not exist, so each of the two left a paid
+                # bill sitting in every "dues open" count forever, clearable
+                # only by hand.
                 #
                 # An unclosed task is the recoverable failure of the two: it is
                 # visible to the user, who can close it, and it is logged here.

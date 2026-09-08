@@ -17,6 +17,7 @@ import re
 
 import pytest
 from aegis.llm import _LLM_EVENT_FIELDS, _MONEY_EVENT_PROMPT, LLMClient, LLMTruncationError
+from aegis.services.statement_match import _norm_ref
 
 RECEIPT = {
     "id": "r1", "account": "arshad-personal", "message_id": "m1",
@@ -250,17 +251,29 @@ async def test_a_reference_the_email_does_not_print_is_dropped():
 
 
 @pytest.mark.asyncio
-async def test_a_reformatted_reference_is_still_the_same_reference():
-    """Banks reprint one number with spaces or hyphens and the model reformats
-    it again, so the containment test runs on alphanumerics only. Without this
-    the guard would reject real references for cosmetic reasons — which looks
-    exactly like the bug it is meant to prevent."""
+async def test_a_reformatted_reference_still_joins_to_the_statement():
+    """Banks reprint one number with spaces or hyphens and the model copies
+    whichever spelling it was shown, so the containment test runs on
+    alphanumerics only — otherwise the guard would reject real references for
+    cosmetic reasons, which looks exactly like the bug it prevents.
+
+    The assertion that matters is the JOIN, not the field. An earlier version
+    of this test asserted only that the value was "kept verbatim", which was
+    true and useless: `statement_match._norm_ref` merely stripped and uppercased,
+    so `"5261-1234 5678"` never equalled the statement's `"526112345678"` and
+    pass 1 silently found nothing. The test passed while the feature it covered
+    did not work — a missed join looks identical to "this row has no
+    counterpart", so nothing anywhere would have said why.
+    """
     payload = [{
         "kind": "transaction", "direction": "out", "amount": 450, "currency": "INR",
         "payee": "Corner Store", "channel": "upi", "ref": "5261-1234 5678",
     }]
     out = await _AnyClient(json.dumps(payload)).extract_money_batch([_UPI], model="m")
-    assert out[0]["ref"] == "5261-1234 5678", "kept verbatim, compared normalised"
+    assert out[0]["ref"] == "5261-1234 5678", "stored as the mail spelt it"
+    assert _norm_ref(out[0]["ref"]) == _norm_ref("526112345678"), (
+        "and joins the statement's bare digits in pass 1"
+    )
 
 
 @pytest.mark.asyncio

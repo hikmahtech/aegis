@@ -847,20 +847,21 @@ async def test_a_transaction_with_no_amount_is_not_a_transaction(db_pool, tmp_pa
 
 
 @pytest.mark.asyncio
-async def test_a_due_whose_task_will_not_close_is_still_marked_paid(db_pool, tmp_path):
+async def test_a_due_whose_task_will_not_close_is_still_marked_paid(db_pool, tmp_path, caplog):
     """A failed Todoist close must not strand the due (#449).
 
-    `complete_captured_task` returns False for three permanent conditions —
-    an `item-…` ref whose create is still in the outbox, a task the user
-    deleted (a 4xx), and a retryable failure that the outbox drains later —
-    and `mark_due_paid` has one caller that nothing re-drives. Gating the
-    mark on the close therefore left the paid bill in every "dues open"
-    count forever.
+    `complete_captured_task` returns False for two permanent conditions — an
+    `item-…` ref whose create is still in the outbox, and a task the user
+    deleted (a 4xx) — and `mark_due_paid` has one caller that nothing
+    re-drives. Gating the mark on the close therefore left the paid bill in
+    every "dues open" count forever. (A retryable failure is not one of them:
+    that path queues to the outbox and returns True.)
 
     The assertion is on `linked_message_id`, not on the returned dict: that
     column is what `find_open_due` reads, so it is the thing that decides
     whether the brief keeps asking about a bill already paid.
     """
+    caplog.set_level("WARNING")
     cfg = _repo(tmp_path)
     capture = AsyncMock()
     capture.complete_captured_task = AsyncMock(return_value=False)
@@ -880,6 +881,10 @@ async def test_a_due_whose_task_will_not_close_is_still_marked_paid(db_pool, tmp
 
     capture.complete_captured_task.assert_awaited_once_with("item-tmp-1")
     assert r["closed_due"] == "v2-personal/m-due"
+    # The warning is the ONLY signal that a Todoist task was left open, so it is
+    # part of the behaviour, not decoration: without this the log can be deleted
+    # and the test stays green.
+    assert "money_due_task_unclosed" in caplog.text, caplog.text
     assert (await ji.get(db_pool, "v2-personal/m-due"))["linked_message_id"] == "v2-personal/m-paid"
 
     # And it is genuinely out of the open-due pool, not merely stamped: a
