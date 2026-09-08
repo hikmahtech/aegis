@@ -231,6 +231,9 @@ async def _exec_capture_to_inbox(
     description: str | None = None,
 ) -> str:
     """Drop a task into the Todoist Inbox. The task gets a #chat source tag by default unless 'source' is given.
+    Capture only what someone has to come back to: a commitment, a follow-up, a piece of work that outlives
+    this conversation. A question you have just answered is not a task. Nothing else in a chat creates a task,
+    so if the exchange leaves real work behind, this is the call that records it.
 
     Args:
         text: Task title
