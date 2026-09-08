@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Depends, HTTPException, Request
 
 from aegis.api.auth import verify_auth
 from aegis.api.sql_filters import build_where
@@ -55,11 +55,52 @@ async def llm_stats(
                    COALESCE(SUM(input_tokens), 0) as total_prompt_tokens,
                    COALESCE(SUM(output_tokens), 0) as total_completion_tokens,
                    COALESCE(AVG(latency_ms), 0)::int as avg_latency_ms,
-                   COALESCE(MAX(latency_ms), 0) as max_latency_ms
+                   COALESCE(MAX(latency_ms), 0) as max_latency_ms,
+                   COALESCE(SUM(cost_usd), 0)::float8 as total_cost_usd,
+                   COUNT(*) FILTER (WHERE cost_usd IS NULL) as unpriced_calls
             FROM llm_calls{where}""",
         *params,
     )
     return dict(row)
+
+
+@router.get("/llm-spend")
+async def llm_spend(
+    request: Request,
+    hours: float = 24.0,
+    group_by: str = "model",
+) -> dict[str, Any]:
+    """What the last `hours` cost, grouped by `model`, `purpose` or `agent_id`.
+
+    The cost is the one the LiteLLM proxy computed per call, so this is
+    AEGIS's own accounting of what it asked for — not a reconciliation of the
+    provider's invoice, which prices caching and rounding its own way.
+
+    `unpriced` counts calls with no cost recorded (a backend that is not the
+    proxy, or a call that failed before reaching a model). It is reported
+    beside the total rather than folded into it: a spend figure that silently
+    treats unknown as zero is the one that gets believed and is wrong.
+    """
+    if group_by not in {"model", "purpose", "agent_id"}:
+        raise HTTPException(status_code=400, detail="group_by must be model, purpose or agent_id")
+    pool = request.app.state.db_pool
+    rows = await pool.fetch(
+        f"SELECT COALESCE({group_by}, '(none)') AS key, count(*) AS calls, "
+        "       COALESCE(SUM(cost_usd), 0)::float8 AS usd, "
+        "       COALESCE(SUM(COALESCE(input_tokens,0) + COALESCE(output_tokens,0)), 0) AS tokens, "
+        "       count(*) FILTER (WHERE cost_usd IS NULL) AS unpriced "
+        "FROM llm_calls WHERE created_at > now() - make_interval(secs => $1) "
+        "GROUP BY 1 ORDER BY usd DESC, calls DESC",
+        max(0.0, float(hours)) * 3600.0,
+    )
+    groups = [dict(r) for r in rows]
+    return {
+        "hours": hours,
+        "group_by": group_by,
+        "total_usd": round(sum(g["usd"] for g in groups), 6),
+        "unpriced_calls": sum(g["unpriced"] for g in groups),
+        "groups": groups,
+    }
 
 
 @router.get("/connector-calls")

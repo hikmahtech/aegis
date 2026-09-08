@@ -130,6 +130,11 @@ export const api = {
   deletePerson: (id: string) =>
     apiFetch<any>(`/api/admin/people/${id}`, { method: 'DELETE' }),
 
+  // What the last N hours of LLM calls cost, as the LiteLLM proxy priced
+  // each one. `unpriced_calls` is reported beside the total, never folded in.
+  llmSpend: (hours = 24, groupBy: 'model' | 'purpose' | 'agent_id' = 'model') =>
+    apiFetch<any>(`/api/observability/llm-spend?hours=${hours}&group_by=${groupBy}`),
+
   // The problem hub (services/hub.py). Every mutation below is the same
   // function the chat tools and the worker call, so the page cannot grow a
   // second idea of what a transition means.

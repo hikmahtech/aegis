@@ -16,17 +16,23 @@ async def record_llm_call(
     agent_id: str | None = None,
     status: str = "success",
     error: str | None = None,
+    cost_usd: float | None = None,
 ) -> None:
     """Record an LLM call to the llm_calls table. Never raises.
 
     `status` is "success" | "timeout" | "error". Failure rows let us
     measure the actual failure rate — success-only logging hides outages.
+
+    `cost_usd` is what the LiteLLM proxy said the call cost, taken off the
+    response headers. `None` means nobody priced it — a backend that is not
+    the proxy, or a failed call that never reached a model — and is stored as
+    NULL rather than 0 so a spend total cannot quietly under-report.
     """
     try:
         await pool.execute(
             "INSERT INTO llm_calls (model, input_tokens, output_tokens, "
-            "latency_ms, purpose, agent_id, status, error) "
-            "VALUES ($1,$2,$3,$4,$5,$6,$7,$8)",
+            "latency_ms, purpose, agent_id, status, error, cost_usd) "
+            "VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)",
             model,
             prompt_tokens,
             completion_tokens,
@@ -35,6 +41,7 @@ async def record_llm_call(
             agent_id,
             status,
             error,
+            cost_usd,
         )
     except Exception:
         logger.warning("record_llm_call_failed", model=model, purpose=purpose)

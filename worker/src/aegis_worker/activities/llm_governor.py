@@ -42,6 +42,7 @@ class LLMGovernorActivities:
         from aegis.services.llm_governor import (
             get_governor_config,
             get_kill_switch,
+            llm_spend_last_24h,
             llm_tokens_last_24h,
             set_kill_switch,
         )
@@ -52,13 +53,21 @@ class LLMGovernorActivities:
             "already_active": False,
             "tokens": 0,
             "budget": 0,
+            "usd": 0.0,
+            "usd_budget": 0.0,
             "message": "",
         }
 
         config = await get_governor_config(self.db_pool)
         budget = int(config.get("daily_token_budget") or 0)
+        # A dollar budget is the one that means something across models whose
+        # prices differ by an order of magnitude: a million tokens of a cheap
+        # model and a million of an expensive one trip the same token budget
+        # while costing very different amounts. Either budget alone can
+        # freeze; the message names whichever broke.
+        usd_budget = float(config.get("daily_usd_budget") or 0)
         model_filter = config.get("model_filter") or ""
-        if budget <= 0:
+        if budget <= 0 and usd_budget <= 0:
             # Governor disabled — the default for any deployment that never
             # configures it. Touch nothing (not even to clear an existing
             # switch: disabling the budget is not "approve all spend").
@@ -66,15 +75,30 @@ class LLMGovernorActivities:
             return quiet
 
         tokens = await llm_tokens_last_24h(self.db_pool, model_filter)
+        spend = await llm_spend_last_24h(self.db_pool, model_filter)
         switch = await get_kill_switch(self.db_pool, use_cache=False)
         scope = model_filter or "all models"
-        result = {**quiet, "tokens": tokens, "budget": budget}
+        result = {
+            **quiet,
+            "tokens": tokens,
+            "budget": budget,
+            "usd": round(spend["usd"], 4),
+            "usd_budget": usd_budget,
+            "unpriced_calls": spend["unpriced"],
+        }
+        over_tokens = budget > 0 and tokens > budget
+        over_usd = usd_budget > 0 and spend["usd"] > usd_budget
 
-        if tokens > budget:
+        if over_tokens or over_usd:
             if switch.get("active"):
                 # Already frozen (by us or by a human) — stay quiet.
                 return {**result, "already_active": True}
-            reason = f"rolling-24h tokens {tokens:,} exceeded budget {budget:,} ({scope})"
+            reason = (
+                f"rolling-24h spend ${spend['usd']:.2f} exceeded budget "
+                f"${usd_budget:.2f} ({scope})"
+                if over_usd
+                else f"rolling-24h tokens {tokens:,} exceeded budget {budget:,} ({scope})"
+            )
             await set_kill_switch(self.db_pool, active=True, reason=reason, set_by="governor")
             await log_audit(
                 self.db_pool,

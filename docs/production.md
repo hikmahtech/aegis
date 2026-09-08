@@ -141,7 +141,7 @@ the checklist to work through after a deploy.
 | Subsystem | What it needs | Where |
 |---|---|---|
 | Social publishing | `social_publishing_enabled` + a connected account | Integrations / Settings |
-| LLM spend governor | a non-zero `daily_token_budget` (defaults to 0) | Settings |
+| LLM spend governor | a non-zero `daily_token_budget` or `daily_usd_budget` in `settings.llm_governor` (both default to 0) | Settings |
 | Drive sync | a `folder_id` on `drive-sync-raphael` | admin **Flows** |
 | Wearable ingest | `oura_api_token` **and** an active `wearable` channel row | Integrations + Channels |
 | Expiry radar | at least one `life.expiring_items` row (empty registry = silent) | admin **Expiring Items** / **Assets** |
