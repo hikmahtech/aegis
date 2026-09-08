@@ -84,6 +84,13 @@ SOURCES = frozenset(
         "investigation",
         "session",
         "manual",
+        # Reconciliation findings: a statement whose closing balance disagrees
+        # with the books, an account no statement arrived for, a file nothing
+        # could parse, an instrument pass 2b has no entity scope for. The money
+        # lane predates the hub by two days and never met it, so it grew its
+        # own dedupe, its own noise guards and no alert path at all — see §15
+        # of the statement-reconciliation spec, which puts it back here.
+        "money",
         "hub",  # the hub's own state_change rows
     }
 )
