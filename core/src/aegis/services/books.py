@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import csv
 import fcntl
 import os
 import re
@@ -17,7 +18,7 @@ import shutil
 import subprocess
 from collections.abc import Callable, Collection
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, timedelta
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
@@ -525,6 +526,7 @@ def rewrite_block(
     instrument_account: str | None = None,
     add_tags: dict[str, str] | None = None,
     status: str | None = None,
+    on: date | None = None,
 ) -> str:
     """Rewrite one block in place.
 
@@ -534,6 +536,30 @@ def rewrite_block(
     payee or an account wants — promotion is a separate decision from
     reclassification, and a rewrite that quietly cleared a pending block would
     be this lane asserting the very fact it exists to check.
+
+    `on` re-dates the block, and exists for exactly one caller: promotion.
+
+    A block written from an email carries the date the EMAIL said, which is a
+    guess — the matcher allows the bank's own date to differ by up to
+    `_MATCH_DAYS` either way, and it routinely does. That guess is harmless
+    until §9.3's closing-balance check runs, and then it is not: hledger
+    evaluates a balance over every posting dated on or before the statement's
+    closing day, so a block dated 31 July for a payment the bank posted on
+    2 August is counted in July's balance when the bank counted it in August,
+    and the reverse for the other direction. The check then misses by exactly
+    those amounts, raises `BooksCheckError`, and reverts the ENTIRE statement's
+    write — every row of it, for one boundary-straddling transaction.
+
+    Promotion is the moment the guess becomes unnecessary: the statement row IS
+    the bank saying when the money moved, which is the whole premise of the
+    lane. So a promoted block takes the bank's date. Nothing else may pass
+    `on` — a reclassify has learned nothing about when the money moved, and
+    `find_block` keys on the msgid rather than the date, so a block stays
+    findable across the change.
+
+    hledger does not require dates to be ordered within a file, and
+    `_check_sync` runs `check --strict` (accounts and commodities), not
+    `check ordereddates`, so re-dating in place needs no re-sort.
     """
     if status is not None and status not in _STATUSES:
         raise BooksError(f"status must be one of {_STATUSES}, not {status!r}")
@@ -542,7 +568,7 @@ def rewrite_block(
         raise BooksError(f"no journal block carries msgid {msgid}")
     start, end = span
     lines = text[start:end].rstrip("\n").split("\n")
-    if payee or status:
+    if payee or status or on:
         header = _HEADER_RE.match(lines[0])
         if header is None:
             raise BooksError(f"block {msgid} has an unreadable header: {lines[0][:60]!r}")
@@ -556,7 +582,8 @@ def rewrite_block(
         # edit; changing what a rename does to it is a separate decision from
         # fixing the corruption bug, and it is not this function's to take.
         flag = status or had_status or "*"
-        lines[0] = f"{day} {flag} {sanitize_payee(payee) if payee else had_payee}"
+        when = on.isoformat() if on else day
+        lines[0] = f"{when} {flag} {sanitize_payee(payee) if payee else had_payee}"
     if add_tags:
         for key, value in add_tags.items():
             key, value = sanitize_tag(key), sanitize_tag(value)
@@ -985,6 +1012,66 @@ async def _write(
         await asyncio.to_thread(_write_sync, cfg, summary, mutate, paths)
 
 
+def cleared_movement_sync(
+    cfg: BooksConfig, account: str, start: date, end: date
+) -> Decimal:
+    """How much `account` moved between `start` and `end`, counting only
+    postings a bank statement has proved (`*`).
+
+    Sync and callable from inside a `mutate` closure — after the blocks are
+    written and before `_write_sync` commits — which is what lets step 5's
+    check revert a statement.
+
+    Three choices here are the whole reason the check works at all:
+
+    **Movement, not a running balance.** A cumulative balance at the closing
+    date needs every earlier period to be reconciled too, so the first
+    statement of an account could never pass and a gap anywhere would break
+    every later one. A period's movement stands on its own.
+
+    **`--cleared`, so a pending block cannot break it.** An email-sourced block
+    carries the date the EMAIL said, up to `_MATCH_DAYS` off the bank's. At a
+    month boundary that puts a transaction the bank posted on 2 August inside
+    July, and a status-blind check would then fail July for a block July's
+    statement says nothing about — reverting a statement in which nothing was
+    wrong. `!` means exactly "no statement has vouched for this", so excluding
+    it is not a workaround; it is the flag doing its job.
+
+    **`-e` is exclusive**, so the end date is the day after the one asked
+    about. Passing the closing date itself silently omits every transaction on
+    it, and a statement's last day is rarely empty.
+
+    A non-zero exit raises rather than returning zero: zero reads as "nothing
+    moved", which against a real statement is a disagreement, and would revert
+    a whole statement for a broken hledger call.
+    """
+    proc = _spawn(
+        [
+            "hledger", "-f", cfg.main, "balance", account,
+            "-b", start.isoformat(),
+            "-e", (end + timedelta(days=1)).isoformat(),
+            "--cleared", "-X", _SYMBOL["INR"], "--no-total", "--flat", "-O", "csv",
+        ],
+        cwd=str(cfg.path),
+        timeout=30,
+    )
+    if proc.returncode != 0:
+        raise BooksError(
+            f"cleared movement for {account} {start}..{end} failed: "
+            f"{proc.stderr.strip()[:300]}"
+        )
+    total = Decimal("0")
+    for line in proc.stdout.splitlines()[1:]:      # skip the csv header
+        parts = list(csv.reader([line]))
+        if not parts or len(parts[0]) < 2:
+            continue
+        cell = parts[0][1].replace("\u00a0", "").replace("\u202f", "")
+        digits = re.sub(r"[^\d.\-]", "", cell)
+        if digits not in ("", "-", ".", "-."):
+            total += Decimal(digits)
+    return total
+
+
 def _declared_accounts_sync(cfg: BooksConfig) -> set[str]:
     """The declared chart. An empty set means hledger genuinely declared nothing
     — a failure raises, because returning `set()` for it would silently disable
@@ -1021,9 +1108,16 @@ def _ensure_journal_file(cfg: BooksConfig, rel: str) -> Path:
     return path
 
 
-async def post_event(event: MoneyEvent, msgid: str, cfg: BooksConfig) -> str:
+async def post_event(
+    event: MoneyEvent, msgid: str, cfg: BooksConfig, *, status: str = "!"
+) -> str:
     """Append one transaction block. Idempotent on msgid. Returns the
-    journal file's relative path."""
+    journal file's relative path.
+
+    `status` defaults to `!` for the email lane, which is a claim. Step 5 posts
+    a row that came FROM a bank statement and passes `*`: there the bank is the
+    source, so the block is proven the moment it is written.
+    """
     if event.kind != "transaction" or event.entity == "none":
         raise BooksError(
             f"post_event needs a transaction with an entity, got {event.kind}/{event.entity}"
@@ -1051,7 +1145,11 @@ async def post_event(event: MoneyEvent, msgid: str, cfg: BooksConfig) -> str:
         posted.append(rel)
         path = _ensure_journal_file(cfg, rel)
         text = path.read_text()
-        path.write_text(append_block(text, render_transaction(event, counter, instrument, msgid)))
+        path.write_text(
+            append_block(
+                text, render_transaction(event, counter, instrument, msgid, status)
+            )
+        )
 
     summary = (
         f"post {event.entity} {event.occurred_on} {sanitize_payee(event.payee)} "
@@ -1123,6 +1221,7 @@ async def rewrite_event(
     instrument_account: str | None = None,
     add_tags: dict[str, str] | None = None,
     status: str | None = None,
+    on: date | None = None,
 ) -> str:
     found: list[str] = []
 
@@ -1137,7 +1236,7 @@ async def rewrite_event(
             path.write_text(
                 rewrite_block(text, msgid, payee=payee, account=account,
                               instrument_account=instrument_account, add_tags=add_tags,
-                              status=status)
+                              status=status, on=on)
             )
             return
         raise BooksError(f"no journal block carries msgid {msgid}")
