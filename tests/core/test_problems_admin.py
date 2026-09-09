@@ -183,8 +183,16 @@ async def test_service_state_round_trip(client, db_pool):
 
 
 async def test_the_digest_route_is_the_briefing_query(client, db_pool):
+    # A REAL timestamp, not the module's fixed `NOW`. The digest's window is
+    # relative to the wall clock, so an event stamped `NOW + 1min`
+    # (2026-09-08 09:01) sat inside `hours=24` only while the wall clock was
+    # within a day of it. On 2026-09-09 09:01 UTC it fell out, and this test
+    # began failing for everyone, permanently — a time bomb, not a flake.
+    # Passing `now=` to `ingest_event` was never enough: the event row takes its
+    # timestamp from `Event.occurred_at`, which `_occ` fills from `NOW`.
+    real_now = datetime.now(UTC)
     s = _subject()
-    r = await ingest_event(db_pool, _occ(s), now=datetime.now(UTC))
+    r = await ingest_event(db_pool, _occ(s, occurred_at=real_now), now=real_now)
     body = (await client.get("/api/admin/problems/digest?hours=24")).json()
     assert body["counts"]["total"] >= 1
     assert r.problem_id in [p["id"] for p in body["problems"]]
