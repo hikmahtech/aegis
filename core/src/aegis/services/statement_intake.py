@@ -26,6 +26,7 @@ import structlog
 
 from aegis.services import drive
 from aegis.services.statements import (
+    PARSED,
     ParsedStatement,
     file_digest,
     parse_axis_statement,
@@ -63,7 +64,7 @@ class IntakeReport:
 
     @property
     def failures(self) -> list[FileOutcome]:
-        return [o for o in self.outcomes if o.status != "ok"]
+        return [o for o in self.outcomes if o.status != PARSED]
 
 
 def parse_bytes(
@@ -141,7 +142,7 @@ async def intake_folder(
         for f in drive._list_folder(svc, folder_id):
             outcome = FileOutcome(
                 file_id=f.get("id", ""), title=f.get("name", ""), folder=instrument,
-                status="ok",
+                status=PARSED,
             )
             try:
                 data = drive._download(svc, f)
@@ -151,7 +152,12 @@ async def intake_folder(
                 report.outcomes.append(outcome)
                 continue
 
-            if statement.status != "ok":
+            # `PARSED`, not a "ok" string of this module's own invention. The
+            # first cut hardcoded "ok" and threw away all 15 real statements as
+            # failures — and its tests agreed, because the fixtures invented the
+            # same wrong constant. Import the vocabulary from the module that
+            # defines it and neither can drift.
+            if statement.status != PARSED:
                 outcome.status, outcome.reason = statement.status, statement.reason
                 report.outcomes.append(outcome)
                 continue
