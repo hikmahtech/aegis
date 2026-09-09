@@ -9,10 +9,20 @@ from __future__ import annotations
 
 from datetime import date
 from decimal import Decimal
+from pathlib import Path
 
 import pytest
 from aegis.services import statement_intake as si
-from aegis.services.statements import ParsedStatement, StatementRow, row_id_for
+from aegis.services.statement_intake import FileOutcome, IntakeReport
+from aegis.services.statements import (
+    PARSED,
+    ParsedStatement,
+    StatementRow,
+    parse_axis_statement,
+    row_id_for,
+)
+
+FIXTURES = Path(__file__).parent / "fixtures" / "statements"
 
 
 def _row(day: int, amount: str, *, instrument="hdfc-1225", direction="out",
@@ -34,7 +44,7 @@ def _row(day: int, amount: str, *, instrument="hdfc-1225", direction="out",
 
 def _statement(rows, instrument="hdfc-1225") -> ParsedStatement:
     return ParsedStatement(
-        status="ok", instrument=instrument,
+        status=PARSED, instrument=instrument,
         period_start=date(2026, 7, 1), period_end=date(2026, 7, 31),
         opening_balance=Decimal("0"), closing_balance=Decimal("0"),
         rows=tuple(rows), statement_id=f"{instrument}/2026-07-01..2026-07-31",
@@ -116,7 +126,7 @@ def test_the_bytes_decide_the_parser_not_the_filename():
         si.parse_bytes(b"%PDF-1.4\nnot really a pdf", title="hdfc_statement.html")
 
     hdfc = si.parse_bytes(b"<html><body>nothing here</body></html>", title="axis.pdf")
-    assert hdfc.status != "ok" and hdfc.instrument is None
+    assert hdfc.status != PARSED and hdfc.instrument is None
 
 
 @pytest.mark.asyncio
@@ -178,7 +188,7 @@ async def test_one_unreadable_file_does_not_abandon_the_rest(db_pool, monkeypatc
     assert len(report.outcomes) == 2
     assert report.outcomes[0].status == si.UNREADABLE
     assert "password" in report.outcomes[0].reason
-    assert report.outcomes[1].status == "ok" and report.outcomes[1].rows == 1
+    assert report.outcomes[1].status == PARSED and report.outcomes[1].rows == 1
     assert report.stored == 1, "the readable one still landed"
 
 
@@ -198,9 +208,35 @@ async def test_a_dry_run_stores_nothing_but_still_reports(db_pool, monkeypatch):
     report = await si.intake_folder(db_pool, __import__("pathlib").Path("/tmp/t.json"),
                                     {"hdfc-1225": "folder-id"}, dry_run=True)
 
-    assert report.outcomes[0].status == "ok" and report.outcomes[0].rows == 1
+    assert report.outcomes[0].status == PARSED and report.outcomes[0].rows == 1
     assert report.stored == 0
     n = await db_pool.fetchval(
         "SELECT count(*) FROM finance.statement_rows WHERE instrument = 'hdfc-1225'"
     )
     assert n == 0
+
+
+def test_intake_agrees_with_the_parsers_about_what_success_looks_like():
+    """The bug the rest of this file could not catch.
+
+    `intake_folder` originally compared `statement.status` against a literal
+    "ok" of its own invention, so every one of the fifteen real statements in
+    the Drive folder was recorded as a failure and none was imported. The tests
+    passed throughout, because their `_statement()` helper invented the same
+    wrong constant — the fixtures agreed with the bug.
+
+    So this test refuses to build a statement. It runs a REAL fixture through
+    the real parser and asserts the status intake treats as success is the
+    status the parser actually emits. A future rename of `PARSED` breaks this
+    test; a divergence between the two modules cannot survive it.
+    """
+    text = (FIXTURES / "axis_mailed.txt").read_text()
+    parsed = parse_axis_statement(text, file_sha256="fixture")
+    assert parsed.status == PARSED, "the parser's own verdict on a good statement"
+    assert parsed.rows, "and it found rows, so this is not a vacuous pass"
+
+    # The value intake gates on, taken from the same place rather than retyped.
+    assert si.PARSED is PARSED
+    assert IntakeReport(outcomes=[FileOutcome(
+        file_id="f", title="t", folder="axis-9640", status=parsed.status
+    )]).failures == [], "a really-parsed statement is not a failure"
