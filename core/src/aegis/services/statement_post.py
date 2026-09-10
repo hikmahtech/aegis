@@ -461,15 +461,24 @@ def check_window(statement: ParsedStatement) -> tuple[date | None, date | None]:
       first row. Post those statements in any order but oldest-first and the
       older one counts a newer row and reverts.
 
-    A statement with no rows falls back to the printed period. `post_statement`
-    returns before the check in that case — no rows means no writes — so this
-    is what a direct caller gets, and the period is the only window it could
-    mean.
+    A statement with no rows falls back to the printed period, which is the only
+    window it could mean. That is a real case, not a degenerate one: a card with
+    no transactions in a month still prints an opening and a closing figure, and
+    the check has to be able to agree that nothing moved.
     """
     days = [r.occurred_on for r in statement.rows]
     if not days:
         return statement.period_start, statement.period_end
     return min(days), max(days)
+
+
+def _checkable(statement) -> bool:
+    """Whether §9.3 has figures to stand on: a period, and a movement the bank
+    claims. The check and the "is there anything to do at all?" guard ask the
+    same question, and asking it in two places is how they drift apart."""
+    if not statement.period_start or not statement.period_end:
+        return False
+    return expected_movement(statement) is not None
 
 
 async def post_statement(
@@ -515,7 +524,15 @@ async def post_statement(
         result.posted = [msgid_for(r.row_id) for r in plan_.posts]
         result.promoted = [m for m, _ in plan_.promotions]
         return result
-    if not plan_.writes:
+    if not plan_.writes and not _checkable(statement):
+        # Writing nothing is not a reason to skip §9.3 (#461). A statement whose
+        # every row is a `transfer_counterpart` writes nothing — not because it
+        # is empty, but because the far side already put that money in the
+        # books — and the check is what proves the far side landed the right
+        # amount against THIS account. Returning here also left `balance_checked`
+        # false, and `reconcile_statements` only moves the watermark on a true,
+        # so such a statement was re-attempted on every tick, for ever.
+        # Only a statement with no figures to check against stops here.
         logger.info("statement_post_nothing_to_do", statement=plan_.statement_id)
         return result
 
@@ -719,10 +736,7 @@ async def post_statement(
             result.indexed.append((msgid, event, rel))
 
         # §9.3, inside the envelope so a disagreement reverts the statement.
-        if not statement.period_start or not statement.period_end:
-            result.balance_reason = _NO_BALANCE
-            return
-        if expected_movement(statement) is None:
+        if not _checkable(statement):
             result.balance_reason = _NO_BALANCE
             return
         # Both figures go in as hledger reports them. `movement_disagreement`
