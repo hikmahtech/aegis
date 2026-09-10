@@ -388,6 +388,31 @@ def _counter_account(block: str) -> str:
     return ""
 
 
+def check_window(statement: ParsedStatement) -> tuple[date, date]:
+    """The dates §9.3's cleared-movement check must span for this statement.
+
+    The printed period and the rows it holds are not the same window, and on a
+    card they are reliably different: all three real Axis card statements run
+    their transactions from `period_start - 2` to `period_end - 1`, because the
+    period is billing dates while the rows are posting dates. Ask hledger for
+    the printed period alone and the first two days' blocks fall outside it, the
+    movement comes up short by exactly those rows, and a correct statement
+    reverts.
+
+    So the window is the UNION of the two, never the intersection. Widening is
+    the safe direction here: every block this statement writes is dated at one
+    of its own rows, so the union is guaranteed to contain all of them, while
+    narrowing to the row span could exclude a block posted earlier in the period
+    that the statement does account for. The previous statement's rows stop
+    before this one's first row, so the union does not reach them.
+    """
+    days = [r.occurred_on for r in statement.rows]
+    return (
+        min([statement.period_start, *days]),
+        max([statement.period_end, *days]),
+    )
+
+
 async def post_statement(
     statement: ParsedStatement,
     outcomes: dict[str, RowOutcome],
@@ -598,9 +623,7 @@ async def post_statement(
         if expected_movement(statement) is None:
             result.balance_reason = _NO_BALANCE
             return
-        raw = books.cleared_movement_sync(
-            cfg, acct, statement.period_start, statement.period_end
-        )
+        raw = books.cleared_movement_sync(cfg, acct, *check_window(statement))
         # A card is a liability: hledger reports it negative when you owe,
         # while the statement prints what you owe as a positive number. One
         # side has to be negated and it happens here, once, rather than in

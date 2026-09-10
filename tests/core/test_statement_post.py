@@ -831,3 +831,54 @@ async def test_a_transfer_straddling_a_month_boundary_does_not_break_either_chec
     text = (cfg.path / "personal" / "2026.journal").read_text()
     assert text.count("₹100000.00") == 1
     assert "2026-07-31 * IMPS/612345678907/TO XXXXXXXXXX1225" in text
+
+
+def _dated_row(instrument: str, occurred: date, amount: str) -> StatementRow:
+    """A row on any date, unlike `_row`, which is fixed to July."""
+    money = Decimal(amount)
+    return StatementRow(
+        row_id=row_id_for(
+            instrument=instrument, occurred_on=occurred, direction="out",
+            amount=money, balance_after=None, occurrence_index=0, narration="CARD",
+        ),
+        instrument=instrument, occurred_on=occurred, narration="CARD", ref=None,
+        direction="out", amount=money, balance_after=None,
+        statement_id=f"{instrument}/x", file_sha256="fixture",
+    )
+
+
+def _periodic(instrument, start, end, rows) -> ParsedStatement:
+    return ParsedStatement(
+        status="ok", instrument=instrument, period_start=start, period_end=end,
+        opening_balance=Decimal("0"), closing_balance=Decimal("0"),
+        rows=tuple(rows), statement_id=f"{instrument}/{start}..{end}",
+        file_sha256="fixture",
+    )
+
+
+def test_the_check_window_covers_rows_outside_the_printed_period():
+    """§9.3 asks hledger for the union of the printed period and the rows.
+
+    An Axis card statement bills 20/07-18/08 and posts its transactions from
+    18/07 to 17/08 — the period is billing dates, the rows are posting dates.
+    Ask for the printed period alone and the first two days' blocks sit outside
+    it, the cleared movement comes up short by exactly those rows, and a
+    statement that was never wrong reverts.
+    """
+    stmt = _periodic(
+        "axis-cc-1313", date(2026, 7, 20), date(2026, 8, 18),
+        [
+            _dated_row("axis-cc-1313", date(2026, 7, 18), "100.00"),
+            _dated_row("axis-cc-1313", date(2026, 8, 17), "200.00"),
+        ],
+    )
+    assert statement_post.check_window(stmt) == (date(2026, 7, 18), date(2026, 8, 18))
+
+
+def test_the_check_window_is_the_printed_period_when_rows_fall_inside_it():
+    """A bank statement's rows sit inside its period, so nothing widens."""
+    stmt = _periodic(
+        "hdfc-1225", date(2026, 7, 12), date(2026, 8, 11),
+        [_dated_row("hdfc-1225", date(2026, 7, 20), "50.00")],
+    )
+    assert statement_post.check_window(stmt) == (date(2026, 7, 12), date(2026, 8, 11))
