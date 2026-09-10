@@ -79,6 +79,24 @@ _MIN_TAIL, _MAX_TAIL = 3, 6
 
 _DIGIT_RUN = re.compile(r"\d+")
 
+#: A run of digits that a mask character introduces. Guard 2 refuses to read a
+#: tail out of the END of a longer number, because every reference number in a
+#: narration is a long unbroken run and a suffix scan reads a tail out of all of
+#: them. But that refusal also threw away the commonest real shape:
+#: `IMPS/P2A/612345678901/<name>/X071225/HDFCBANKLTD/` is a genuine transfer to
+#: the owner's own `…1225`, and `books._same_tail` strips leading zeros only, so
+#: `1225` never equalled `071225`. Production holds over ₹400,000 of these.
+#:
+#: The mask is what separates the two, and not by luck: a bank PRINTS a masked
+#: account number with its mask and prints a reference bare after a separator.
+#: So a suffix match is allowed only here — `X071225` yes, `/612345678901/` no,
+#: which leaves guard 2 fully intact for every reference number.
+#:
+#: The mask width varies within one bank and a space may follow it: `X071225`,
+#: `XX 1313`, `XXXX 1313`, `XXXXXXXXXXX9640` are all real. A regex fixed at four
+#: `X`s misses half the rows.
+_MASKED_RUN = re.compile(r"[X*]+\s*(\d+)")
+
 #: The narration must say this is a transfer before a tail in it is read as an
 #: account. This is a deliberate extra condition, beyond what §8.4 asks for.
 #:
@@ -146,14 +164,19 @@ def own_account(
     text = normalise_narration(narration)
     if not _MARKER_RE.search(text):
         return None
+    own = [a for a in sorted(declared) if a.startswith(_OWN_PREFIXES)]
     found: set[str] = set()
     for run in _DIGIT_RUN.findall(text):
         if not (_MIN_TAIL <= len(run) <= _MAX_TAIL):
             continue
-        for account in sorted(declared):
-            if account.startswith(_OWN_PREFIXES) and books._same_tail(
-                account.rpartition(":")[2], run
-            ):
+        for account in own:
+            if books._same_tail(account.rpartition(":")[2], run):
+                found.add(account)
+    # The masked suffix, which whole-run matching alone cannot reach.
+    for run in _MASKED_RUN.findall(text):
+        for account in own:
+            tail = account.rpartition(":")[2]
+            if len(run) > len(tail) and run.endswith(tail):
                 found.add(account)
     found.discard(exclude or "")
     return found.pop() if len(found) == 1 else None

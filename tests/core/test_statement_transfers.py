@@ -16,6 +16,7 @@ from __future__ import annotations
 from datetime import date
 from decimal import Decimal
 
+import pytest
 from aegis.services import statement_transfers as transfers
 from aegis.services.statements import StatementRow, row_id_for
 
@@ -299,3 +300,43 @@ def test_an_undeclared_clearing_account_falls_back_and_still_nets_to_zero():
     assert transfers.reversal_account(chart, "personal") == "expenses:unknown"
     assert transfers.reversal_account(chart, "hikmah") == "expenses:hikmah:unknown"
     assert transfers.reversal_account(DECLARED, "personal") == "equity:transfers"
+
+
+#: Every own-account shape production actually prints, and what each must
+#: resolve to. One table so the whole decision surface is readable at once —
+#: the two rejections matter as much as the four matches, and both directions
+#: of the guard were got wrong first.
+_REAL_NARRATIONS = [
+    # A masked account number whose visible digits run past the chart's tail.
+    # `books._same_tail` strips leading zeros only, so `1225` never equalled
+    # `071225` and this — the commonest shape, over ₹400,000 of transfers into
+    # the owner's own HDFC account — silently missed.
+    ("IMPS/P2A/612345678901/SPECIMEN NAME/X071225/HDFCBANKLTD/", "assets:bank:hdfc:1225"),
+    # Eleven mask characters, no space.
+    ("IMPS-612345678901-SPECIMEN CO.-UTIB-XXXXXXXXXXX9640-IMPS", "assets:bank:axis:9640"),
+    # The mask width varies within one bank and a space may follow it.
+    ("CREDITCARD PAYMENT XXXX 1313 REF#HZMXVP0W9EQHO3", "liabilities:card:axis:1313"),
+    ("CREDITCARD PAYMENT XX 1313 REF#VQWJY7KMAO4B86", "liabilities:card:axis:1313"),
+    # A DATE written ddmmyy contains a declared tail. Filing this as a transfer
+    # to a child's savings account passes every downstream check, because the
+    # account is real — which is why the marker gate exists.
+    ("POS/GOOGLE PLAY SER C/612345678901/010325/14:22/612345678901", None),
+    # A third party whose own masked tail does not name a declared account.
+    ("IMPS/P2A/612345678901/OTHER PARTY/ X180925/ALLAHABADBANK/OTHER", None),
+    # A bare reference number that happens to END in a declared tail. No mask,
+    # so the suffix path must not reach it — this is what guard 2 protects and
+    # what the masked-suffix path must not undo.
+    ("IMPS/P2A/612345671225/SPECIMEN NAME/OTHERBANK/", None),
+]
+
+
+@pytest.mark.parametrize("narration,expected", _REAL_NARRATIONS)
+def test_own_account_over_every_real_narration_shape(narration, expected):
+    declared = {
+        "assets:bank:hdfc:1225",
+        "assets:bank:hdfc:0325",
+        "assets:bank:hdfc:0236",
+        "assets:bank:axis:9640",
+        "liabilities:card:axis:1313",
+    }
+    assert transfers.own_account(narration, declared) == expected
