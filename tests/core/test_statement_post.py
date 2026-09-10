@@ -769,3 +769,65 @@ async def test_promotion_leaves_an_account_that_is_not_the_clearing_one_alone(tm
     text = (cfg.path / "personal" / "2026.journal").read_text()
     assert "expenses:groceries" in text
     assert "liabilities:card:axis:1313" not in text
+
+
+@pytest.mark.asyncio
+async def test_a_transfer_straddling_a_month_boundary_does_not_break_either_check(tmp_path):
+    """The block carries the POSTING side's date, and the two banks are a day
+    or two apart.
+
+    Axis pays on 31 July; HDFC credits on 2 August. The block is dated 31 July,
+    so the money is in the books and NOT in August's cleared movement — and
+    August's statement is the one holding the counterpart. Treating "in the
+    books" as "in this period" leaves August short by exactly the transfer and
+    reverts a statement in which nothing was wrong. Card bills paid at month
+    end make this the common shape, not the exotic one.
+    """
+    cfg = _repo(tmp_path)
+    july_row = _row(31, "100000.00", instrument="axis-9640", balance="-100000.00",
+                    narration="IMPS/612345678907/TO XXXXXXXXXX1225")
+    july = _statement([july_row], "-100000.00", instrument="axis-9640")
+
+    august_credit = StatementRow(
+        row_id=row_id_for(
+            instrument="hdfc-1225", occurred_on=date(2026, 8, 2), direction="in",
+            amount=Decimal("100000.00"), balance_after=Decimal("100000.00"),
+            occurrence_index=0, narration="IMPS/612345678907/FROM XXXXXXXXXXX9640",
+        ),
+        instrument="hdfc-1225", occurred_on=date(2026, 8, 2),
+        narration="IMPS/612345678907/FROM XXXXXXXXXXX9640", ref=None, direction="in",
+        amount=Decimal("100000.00"), balance_after=Decimal("100000.00"),
+        statement_id="hdfc-1225/2026-08-01..2026-08-31", file_sha256="fixture",
+    )
+    august_salary = StatementRow(
+        row_id=row_id_for(
+            instrument="hdfc-1225", occurred_on=date(2026, 8, 5), direction="in",
+            amount=Decimal("1000.00"), balance_after=Decimal("101000.00"),
+            occurrence_index=0, narration="SALARY",
+        ),
+        instrument="hdfc-1225", occurred_on=date(2026, 8, 5), narration="SALARY", ref=None,
+        direction="in", amount=Decimal("1000.00"), balance_after=Decimal("101000.00"),
+        statement_id="hdfc-1225/2026-08-01..2026-08-31", file_sha256="fixture",
+    )
+    august = ParsedStatement(
+        status="ok", instrument="hdfc-1225",
+        period_start=date(2026, 8, 1), period_end=date(2026, 8, 31),
+        opening_balance=Decimal("0"), closing_balance=Decimal("101000.00"),
+        rows=(august_credit, august_salary),
+        statement_id="hdfc-1225/2026-08-01..2026-08-31", file_sha256="fixture",
+    )
+
+    first = await statement_post.post_statement(
+        july, {}, cfg, entity="personal", peer_rows=august.rows,
+    )
+    second = await statement_post.post_statement(
+        august, {}, cfg, entity="personal", peer_rows=july.rows,
+    )
+
+    assert len(first.posted) == 1 and first.balance_reason == ""
+    assert (august_credit.row_id, TRANSFER) in second.skipped
+    assert second.balance_checked is True and second.balance_reason == ""
+
+    text = (cfg.path / "personal" / "2026.journal").read_text()
+    assert text.count("₹100000.00") == 1
+    assert "2026-07-31 * IMPS/612345678907/TO XXXXXXXXXX1225" in text

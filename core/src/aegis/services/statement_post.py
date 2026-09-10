@@ -33,6 +33,7 @@ from __future__ import annotations
 
 from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass, field
+from datetime import date
 from decimal import Decimal
 from typing import Any
 
@@ -75,10 +76,12 @@ ALREADY_POSTED = "already_posted"
 #: * `TRANSFER` — the FAR statement's row put this money in the books, under
 #:   its own msgid, touching this account. Adding it back would make the check
 #:   over by exactly that amount and revert a statement that was never wrong.
-#:   That is only true once the far block exists, though, and the far statement
-#:   may not have run yet — so `post_statement` looks in the journal and adds
-#:   the row back when it is genuinely not there. That is the one conditional
-#:   case, and it is decided at its own site rather than by this set.
+#:   That is only true once the far block exists and is dated inside this
+#:   period, though, and the far statement may not have run yet — so
+#:   `post_statement` looks in the journal (`_far_block`, `_in_period`) and adds
+#:   the row back when the money is genuinely not in this period's cleared
+#:   total. That is the one conditional case, and it is decided at its own site
+#:   rather than by this set.
 _NEVER_WRITTEN = frozenset({AMBIGUOUS, PROMOTION_BLOCK_MISSING})
 
 
@@ -325,10 +328,10 @@ def _declared_before_write(cfg: books.BooksConfig) -> set[str]:
     return books._declared_accounts_sync(cfg)
 
 
-def _far_in_books(
+def _far_block(
     cfg: books.BooksConfig, leg: PairedRow, outcomes: Mapping[str, RowOutcome]
-) -> bool:
-    """Is the other half of this transfer already a block in the journal?
+) -> tuple[bool, date | None]:
+    """Is the other half of this transfer already a block, and when is it dated?
 
     Decidable without the database, which is what makes the two statements
     order-independent. Two ways the far row can be in the books, and the second
@@ -336,6 +339,11 @@ def _far_in_books(
     `stmt/<row_id>` msgid, OR the matcher may have matched it to a block the
     email lane wrote — in which case that block, not a new one, is where the
     money is.
+
+    The date comes back because a transfer's block carries the POSTING side's
+    date, and the two banks are a day or two apart — see `_in_period`. `None`
+    means the header could not be read, which only a hand-edited block can
+    manage.
     """
     wanted = [msgid_for(leg.peer_row_id)]
     peer = outcomes.get(leg.peer_row_id)
@@ -343,9 +351,32 @@ def _far_in_books(
         wanted.append(peer.msgid)
     for path in books.journal_files(cfg):
         text = path.read_text()
-        if any(books.find_block(text, msgid) for msgid in wanted):
-            return True
-    return False
+        for msgid in wanted:
+            span = books.find_block(text, msgid)
+            if span is not None:
+                header = books._HEADER_RE.match(text[span[0]:span[1]].splitlines()[0])
+                return True, date.fromisoformat(header.group(1)) if header else None
+    return False, None
+
+
+def _in_period(when: date | None, statement: ParsedStatement) -> bool:
+    """Does a block dated `when` fall inside this statement's period?
+
+    A transfer's block carries the date of the side that POSTED it, and the two
+    banks are a day or two apart. Straddle a month boundary — a card bill paid
+    on the 31st and credited on the 2nd, which is most card bills — and the
+    money is genuinely in the books while being outside THIS period's cleared
+    movement. The counterpart then has to be added back like any unwritten row,
+    or the check misses by exactly the transfer and reverts a statement in
+    which nothing was wrong.
+
+    An unreadable header, or a statement with no period, counts as inside. That
+    is the direction that fails loudly: if the block really was outside, the
+    check disagrees and says so, rather than quietly excusing a missing row.
+    """
+    if when is None or statement.period_start is None or statement.period_end is None:
+        return True
+    return statement.period_start <= when <= statement.period_end
 
 
 def _counter_account(block: str) -> str:
@@ -432,15 +463,16 @@ async def post_statement(
                 continue
             if reason in _NEVER_WRITTEN:
                 unwritten[0] += signed(row)
-            elif reason == TRANSFER and not _far_in_books(
-                cfg, plan_.paired[row_id], outcomes
-            ):
-                # This side is not the one that posts (§8.4), and the far
-                # statement has not run yet — so nothing has put this money in
-                # the journal, and the check has to be told. The row stays
-                # skipped: posting it here is exactly the double count the pair
-                # exists to prevent, and the far statement will write it.
-                unwritten[0] += signed(row)
+            elif reason == TRANSFER:
+                found, when = _far_block(cfg, plan_.paired[row_id], outcomes)
+                if not found or not _in_period(when, statement):
+                    # Either the far statement has not run yet, or its block is
+                    # dated outside this period. Both mean the money is not in
+                    # this period's cleared movement, and the check has to be
+                    # told. The row stays skipped either way: posting it is
+                    # exactly the double count the pair exists to prevent, and
+                    # the far statement will write it.
+                    unwritten[0] += signed(row)
 
         for msgid, row in plan_.promotions:
             for path in books.journal_files(cfg):
@@ -493,14 +525,19 @@ async def post_statement(
 
         for row in plan_.posts:
             leg = plan_.paired.get(row.row_id)
-            if leg is not None and leg.kind == TRANSFER and _far_in_books(cfg, leg, outcomes):
-                # This side is the one §8.4 nominates to post, but the far side
-                # got there first — its own row, or the email block the matcher
-                # gave it. The money is in the books once and must stay that
-                # way, whichever statement the operator ran first. NOT added to
-                # `unwritten`: it IS in the cleared total.
-                result.skipped.append((row.row_id, TRANSFER))
-                continue
+            if leg is not None and leg.kind == TRANSFER:
+                found, when = _far_block(cfg, leg, outcomes)
+                if found:
+                    # This side is the one §8.4 nominates to post, but the far
+                    # side got there first — its own row, or the email block
+                    # the matcher gave it. The money is in the books once and
+                    # must stay that way, whichever statement the operator ran
+                    # first. It is in the cleared total unless the far block is
+                    # dated outside this period.
+                    result.skipped.append((row.row_id, TRANSFER))
+                    if not _in_period(when, statement):
+                        unwritten[0] += signed(row)
+                    continue
             event = event_for(
                 row,
                 entity,
