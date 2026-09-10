@@ -695,3 +695,90 @@ unproven `*` is indistinguishable from a step-5-proven one), and step 5 itself.
 2. **The "reconciled through" watermark has no home.** §9.3's ordering rule — an email transaction
    dated inside a reconciled period is index-only — needs a per-account watermark. Nothing in
    `migrations/` stores one and `post_money_event` has no such gate.
+
+### 15.11 What steps 5–8 shipped, and what the real data changed (2026-09-10)
+
+**Both gaps §15.10 left open are closed.**
+
+1. **The closing-balance date problem is solved, and not the way §15.10 assumed.** It named the
+   fix as a `date=` on `rewrite_block` so a promoted block could be pulled onto the bank's date.
+   `rewrite_block` gained that (`on=`) and step 5 uses it — but the check itself was redesigned as
+   well, and that is the half that mattered. §9.3's original "balance at the statement close" is
+   cumulative, so an account's very first statement could never pass and one gap anywhere broke
+   every statement after it. It is now **movement over the period** — `hledger balance --cleared`
+   between the period's dates — which stands alone, so a backfill runs in any order and a missing
+   month costs only that month. `--cleared` is what makes it honest: an unproven `!` block does
+   not count toward a figure whose whole job is to say whether the bank agrees.
+2. **The watermark has a home**: `finance.reconciled_through`, one row per account, advanced only
+   forward and only in SQL — a backfill posts statements in whatever order the operator has them,
+   so reconciling June after July must not un-reconcile July. `post_money_event` reads it and
+   indexes rather than posts an email transaction dated inside a reconciled period.
+
+   The gate sits at the site that writes a NEW block, deliberately **not** at the top of the
+   method. A late email that links to a block its counterpart already posted (§5.4) is the lane
+   working as designed and must still enrich it; only a fresh block is a duplicate. An early
+   return turns away both, and reads as correct.
+
+**A credit-card statement supports the closing-balance check after all.** The lane was built
+assuming it could not — `statement_post._NO_BALANCE` exists for exactly that case — because a card
+prints no running balance. It prints something better: `Previous Balance` and `Total Payment Due`
+as figures of their own, and its own row of totals (`- Payments - Credits + Purchase + Cash Advance
++ Other Debit&Charges`) which reconciles to the rupee. So §6.2's self-validating check on a card is
+stronger than a running balance, not weaker: the parsed `Cr` rows must sum to the bank's payments
+plus credits and the `Dr` rows to its purchases plus charges, and only a figure the bank printed
+itself can falsify the parse.
+
+Two consequences worth stating, because both were assumptions the code carried:
+
+- `finance.statement_rows` stored no opening or closing balance. A bank statement's could be
+  re-derived from the first row's running balance; a card's cannot. Those figures were read at
+  intake and thrown away. `finance.statements` (migration 042) is where they now live, and it is
+  also what makes §15.4's `statement_missing` finding answerable — coverage is a question about
+  statements, and only their rows were stored.
+- A card row prints its foreign original beside the rupee charge (`( USD 5.89 )`). §8.5 otherwise
+  has to reach it through `prices.journal` and a 5% band, and the live rates are current rates:
+  a 2024 remittance whose narration says `GBP 6293.48` implies about ₹102 against a file that says
+  ₹127.76 — 25% apart, so historical foreign rows never match through the price file. Where the
+  bank printed the original, use the original.
+
+**Own-account detection (§8.4) cannot be a tail scan, and the production narrations say why.**
+Both failure directions are real and both were found in live data:
+
+- `POS/GOOGLE PLAY SER C/…/010325/14:22/…` — `010325` is a date written ddmmyy. It contains
+  `0325`, which is a declared account. A tail scan files a Google Play purchase into a child's
+  savings account, and §9.3's check still passes, because both accounts are real. **A wrong
+  own-account match is invisible to every downstream guard.**
+- `IMPS/P2A/…/MOHAMMEDARSHADANS AR/X071225/HDFCBANKLTD/` — a genuine transfer to the owner's own
+  `hdfc-1225`, where `1225` sits inside the longer run `071225`. The obvious guard against the
+  first case ("the digits must not be part of a longer run") throws this one away.
+
+What separates them is not the digits. It is that a real own-account reference carries a **mask
+marker** — and the marker's width varies within one bank: `X071225`, `CREDITCARD PAYMENT XX 1313`,
+`CREDITCARD PAYMENT XXXX 1313`, `HIKMAHTECHNOLOGIES.-UTIB-XXXXXXXXXXX9640-IMPS`. A regex fixed at
+four `X`s misses half the rows. The second condition is the **bank named in the narration**, which
+is present far more often than not (`HDFCBANKLTD`, `ALLAHABADBANK`, `CANARABANK`) and is what
+refuses a third party whose masked tail happens to collide.
+
+The card side of a card payment names neither account nor bank — `BBPS PAYMENT RECEIVED - BD…` —
+so it gets its own rule rather than being forced through the tail matcher: a credit on a card
+statement announcing a payment received is the counterpart of a bank-side `CREDITCARD PAYMENT`
+row, because a card bill is never paid by a third party.
+
+**Row↔row pairing must not be what decides the counter account.** Production holds at least six
+`IMPS/P2A/…/X071225/HDFCBANKLTD/` rows at exactly ₹100,005.90, and more at ₹5,005.90, ₹10,005.90,
+₹20,005.90 (twice), ₹25,005.90 and ₹30,005.90. Amount-and-window pairing across two statements
+cannot tell those apart and does not need to: own-account detection already gives both sides the
+right accounts, and pairing is left with the one job it can do reliably — deciding which side
+posts and which side skips as `transfer_counterpart`. A wrong pairing among identical transfers
+must therefore be harmless, and that is a property to test rather than to assume.
+
+**One correction to §15.10's `unwritten` accounting**, which step 6 makes reachable. §9.3 adds
+deliberately-unwritten rows back into the comparison so a statement containing an ambiguous row
+does not fail by exactly its amount. A `transfer_counterpart` row is the opposite case: the far
+side of the pair put that money in the books, so it IS in the cleared total, and adding it back
+would revert a statement that was never wrong. "Skipped" is not one category — the question is
+whether the money reached the journal, and the two answers differ per reason.
+
+**Open question 2 has half an answer.** `axis-cc-1747` has a configured Drive folder and zero
+files in it, so `axis-cc-1313` is the only card that sends statements. `icici-143` and `nkgsb-843`
+are still unanswered.
