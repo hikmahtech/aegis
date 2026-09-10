@@ -122,6 +122,12 @@ class PostResult:
     journal_files: list[str] = field(default_factory=list)
     balance_checked: bool = False
     balance_reason: str = ""
+    #: What each posted block actually holds: `(msgid, event, journal file)`.
+    #: The caller needs it to write the `finance.journal_index` row, and only
+    #: this loop knows which counter account won — own-account detection, a
+    #: proven pair, or the rules. Recomputing it outside would be a second
+    #: implementation of that decision, free to drift from this one.
+    indexed: list[tuple[str, MoneyEvent, str]] = field(default_factory=list)
 
 
 def plan(
@@ -654,6 +660,7 @@ async def post_statement(
                     )
                 )
             result.posted.append(msgid)
+            result.indexed.append((msgid, event, rel))
 
         # §9.3, inside the envelope so a disagreement reverts the statement.
         if not statement.period_start or not statement.period_end:

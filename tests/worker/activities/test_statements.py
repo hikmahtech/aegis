@@ -102,6 +102,10 @@ async def _statement(pool, instrument, start, end, opening, closing, rows):
 
 
 _WIPE = (
+    # The lane now indexes what it posts, so a row survives into the next test
+    # and the matcher offers it as a candidate — which quietly changes what the
+    # next statement does.
+    "DELETE FROM finance.journal_index WHERE mailbox IN ('statement','st-box')",
     "DELETE FROM finance.statement_rows WHERE file_sha256 = 't'",
     "DELETE FROM finance.statements WHERE file_sha256 = 't'",
     "DELETE FROM finance.reconciled_through WHERE instrument IN ('hdfc-1225','axis-9640')",
@@ -340,3 +344,38 @@ def test_coverage_says_nothing_while_the_month_is_still_young():
     assert statements_mod._coverage_findings(
         seen, statement_findings, today=date(2026, 8, 2)
     ) == []
+
+
+async def test_a_statement_posted_block_is_indexed_so_a_late_receipt_cannot_duplicate_it(
+    clean, tmp_path
+):
+    """§7, §9.2: what the lane posts must reach `finance.journal_index`.
+
+    Without the row the block is invisible to the rest of the money lane. The
+    expensive consequence is a double count: a vendor receipt arriving after the
+    statement posted the payment finds no counterpart, because
+    `journal_index.find_match` requires `journal_file IS NOT NULL`, so it posts
+    a SECOND block for money the books already hold — and §9.3 cannot see it,
+    because both blocks sit inside the period and the movement still adds up.
+    The cheaper consequences: the row is never a matcher candidate again, so its
+    account's unmatched count can never fall, and `ledger_reclassify` reads the
+    index, so the block cannot be moved by chat.
+    """
+    cfg = _repo(tmp_path)
+    sid = await _statement(clean, "hdfc-1225", "2026-07-01", "2026-07-31", "0", "-500", 1)
+    await _row(clean, "hdfc-1225", "2026-07-10", "out", "500.00", "ATM WITHDRAWAL", sid, "-500")
+
+    out = await ActivityEnvironment().run(_act(clean, cfg).reconcile_statements, True, "")
+    assert out["posted"] == 1
+
+    row = await clean.fetchrow(
+        "SELECT * FROM finance.journal_index WHERE mailbox = 'statement'"
+    )
+    assert row is not None, "the posted block has no index row"
+    assert row["journal_file"], "an index row with no journal_file is not a counterpart"
+    assert row["amount"] == Decimal("500.00")
+    assert row["direction"] == "out"
+    assert row["instrument"] == "hdfc-1225"
+    assert row["occurred_on"] == date(2026, 7, 10)
+    # The account the poster actually chose, not one recomputed by the caller.
+    assert row["account"] == "expenses:fees"

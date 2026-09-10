@@ -28,6 +28,12 @@ from temporalio import activity
 
 logger = structlog.get_logger()
 
+#: The `mailbox` a statement-posted index row carries. Not a real mailbox —
+#: the row came from a bank statement, not from mail — but `journal_index`
+#: requires one, and a distinct value is what makes these rows findable and
+#: keeps them out of any per-mailbox count.
+_STATEMENT_MAILBOX = "statement"
+
 #: The settings row holding `{"accounts": {instrument: {folder_id, entities,
 #: post_entity}}}`. One row rather than one setting per account: the folder ids
 #: and the entity scope are read together on every run and drift apart if they
@@ -140,6 +146,7 @@ class StatementActivities:
         before letting a schedule touch the books.
         """
         from aegis.services import books, statement_findings, statement_match, statement_post
+        from aegis.services import journal_index as ji
         from aegis.services.reconciled import mark_reconciled
 
         accounts = await _folder_config(self.db_pool)
@@ -260,6 +267,26 @@ class StatementActivities:
                     }
                 )
                 continue
+
+            # §7 and §9.2: a statement-posted block gets an index row like any
+            # other. Without one, three things break, and the first is a real
+            # double count: a vendor receipt arriving after the statement posted
+            # the payment finds no counterpart — `journal_index.find_match`
+            # requires `journal_file IS NOT NULL` — so it posts a SECOND block
+            # for money the books already hold, and §9.3 cannot see it because
+            # both blocks are inside the period. The other two: the row is never
+            # a matcher candidate again, so its account's "N unmatched rows"
+            # count can never fall; and `ledger_reclassify` reads the index, so
+            # a statement-posted `expenses:unknown` cannot be moved by chat.
+            for msgid, event, journal_file in result.indexed:
+                await ji.upsert(
+                    self.db_pool,
+                    msgid,
+                    _STATEMENT_MAILBOX,
+                    event,
+                    journal_file=journal_file,
+                    declared=declared,
+                )
 
             posted += len(result.posted)
             promoted += len(result.promoted)
