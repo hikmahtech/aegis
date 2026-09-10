@@ -929,6 +929,59 @@ async def test_transaction_inside_reconciled_period_is_indexed_not_posted(db_poo
 
 
 @pytest.mark.asyncio
+async def test_reconciled_period_still_links_a_match_but_not_a_fresh_block(db_pool, tmp_path):
+    # The watermark only stops a NEW block. A late email that LINKS to a
+    # block its counterpart already posted (spec §5.4) is the lane working
+    # as designed and must go through even when its own date falls inside a
+    # period reconciled AFTER that first block was written; an email with no
+    # counterpart to link to, dated the same way, is what the watermark
+    # exists to stop.
+    #
+    # The linking email below carries its OWN instrument (`axis-cc-1313`,
+    # mirroring `test_receipt_then_bank_links_and_fixes_instrument`) — that
+    # is the case that actually distinguishes "gate before find_match" (the
+    # reviewed-away version, which would turn this away) from "gate only the
+    # new-block path" (this one): an instrument-less event never reaches the
+    # gate at all, so it would pass either way and prove nothing.
+    cfg = _repo(tmp_path)
+    act = _act(db_pool, cfg)
+    receipt = _bank_event(payee="Eleven Labs", payee_key="eleven labs", channel="receipt",
+                          instrument="card-1313", account="expenses:saas",
+                          parser="stripe_receipt", source_class="receipt", ref=None)
+    r = await ActivityEnvironment().run(
+        act.post_money_event, "rid1", "v2-personal", "m-rcpt", receipt
+    )
+    assert r["status"] == "posted"
+    # Reconciled AFTER the block above was already written — this is the
+    # realistic order: the statement arrives once both the original email
+    # and its late counterpart could plausibly have shown up.
+    await reconciled.mark_reconciled(
+        db_pool, "axis-cc-1313", date(2026, 9, 5), statement_id="stmt-test"
+    )
+    bank = _bank_event(payee="ELEVENLABS", payee_key="elevenlabs", channel="card",
+                       instrument="axis-cc-1313", parser="axis_card_spend",
+                       occurred_on="2026-09-03")  # inside the reconciled period
+    r2 = await ActivityEnvironment().run(
+        act.post_money_event, "rid2", "v2-personal", "m-bank", bank
+    )
+    assert r2["status"] == "linked" and r2["linked"] == "v2-personal/m-rcpt"
+    text = (cfg.path / "personal" / "2026.journal").read_text()
+    assert "bank: v2-personal/m-bank" in text and text.count("; msgid:") == 1
+
+    # A THIRD email, same reconciled period, same instrument, with no
+    # counterpart to link to — this is the case the watermark is for, and it
+    # must still be gated.
+    unmatched = _bank_event(payee="Random Merchant", payee_key="random merchant",
+                            channel="card", occurred_on="2026-09-04",
+                            instrument="axis-cc-1313")
+    r3 = await ActivityEnvironment().run(
+        act.post_money_event, "rid3", "v2-personal", "m-unmatched", unmatched
+    )
+    assert r3["status"] == "reconciled"
+    assert (cfg.path / "personal" / "2026.journal").read_text() == text
+
+
+@pytest.mark.asyncio
 async def test_transaction_on_the_watermark_date_itself_is_gated_too(db_pool, tmp_path):
     # "Through" is inclusive — the statement's own closing date is covered by it.
     cfg = _repo(tmp_path)

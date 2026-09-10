@@ -541,6 +541,39 @@ class MoneyActivities:
             activity.logger.warning("declared_chart_unavailable error=%s", exc)
             return frozenset()
 
+    async def _reconciled_watermark(self, ev: MoneyEvent, declared: frozenset[str]) -> date | None:
+        """The watermark date `ev` is gated behind, or None to let it post.
+
+        §9.3's ordering rule (spec, "reconciled through" watermark, §15.10
+        item 2): once a period is reconciled for an account, a transaction
+        dated on or before it is already in the statement that proved it, so
+        a NEW block for it would count the money twice. Only an event WITH an
+        instrument has a watermark to check: 199 of 245 live index rows carry
+        none (#408), so gating on a missing one would gate almost nothing or
+        almost everything, and it is deliberately never gated.
+
+        Fails open: an unreadable watermark also returns None. A check about
+        bookkeeping ORDER must never decide whether the money gets recorded
+        at all — the same shape #449 already burned once with a check about
+        noise deciding what the record said.
+
+        The caller decides WHEN to ask: this only tells it whether `ev`'s own
+        date is covered, not whether posting is otherwise safe.
+        """
+        if not ev.instrument or ev.occurred_on is None:
+            return None
+        canon_instrument = books.canonical_instrument(ev.instrument, declared)
+        try:
+            watermark = await reconciled.reconciled_through(self.db_pool, canon_instrument)
+        except Exception as exc:  # noqa: BLE001 — fail open, see docstring
+            activity.logger.warning(
+                "reconciled_watermark_unreadable instrument=%s error=%s — posting as normal",
+                canon_instrument,
+                exc,
+            )
+            return None
+        return watermark if watermark is not None and ev.occurred_on <= watermark else None
+
     @activity.defn
     async def post_money_event(
         self,
@@ -596,44 +629,6 @@ class MoneyActivities:
                 result["status"],
             )
             return result
-
-        # §9.3's ordering rule (spec, "reconciled through" watermark, §15.10
-        # item 2): once a period is reconciled for an account, a transaction
-        # dated inside it is already in the statement that proved it — post
-        # it again and the balance counts the money twice. Only an event WITH
-        # an instrument has a watermark to check: 199 of 245 live index rows
-        # carry none (#408), so gating on a missing one would gate almost
-        # nothing or almost everything, and it is deliberately never gated.
-        #
-        # The gate fails open. A watermark that cannot be read posts as
-        # normal — a check about bookkeeping ORDER must never decide whether
-        # the money gets recorded at all, the same shape #449 already burned
-        # once with a check about noise deciding what the record said.
-        if ev.instrument and ev.occurred_on is not None:
-            canon_instrument = books.canonical_instrument(ev.instrument, declared)
-            try:
-                watermark = await reconciled.reconciled_through(self.db_pool, canon_instrument)
-            except Exception as exc:  # noqa: BLE001 — fail open, see above
-                activity.logger.warning(
-                    "reconciled_watermark_unreadable instrument=%s error=%s — posting as normal",
-                    canon_instrument,
-                    exc,
-                )
-                watermark = None
-            if watermark is not None and ev.occurred_on <= watermark:
-                await ji.upsert(
-                    self.db_pool, msgid, mailbox, ev, todoist_ref=todoist_ref, declared=declared
-                )
-                result["status"] = "reconciled"
-                activity.logger.info(
-                    "money_event_reconciled_period msgid=%s instrument=%s occurred_on=%s "
-                    "watermark=%s — indexed, not posted",
-                    msgid,
-                    canon_instrument,
-                    ev.occurred_on,
-                    watermark,
-                )
-                return result
 
         cfg = self.books_cfg
         # The bank alert and the vendor receipt for one payment are two emails
@@ -713,8 +708,35 @@ class MoneyActivities:
             if linked_to is not None:
                 result.update(status="linked", linked=linked_to)
             else:
-                # Also the no-match path. Either way the index records what
-                # actually happened — `posted`, with the block it wrote.
+                # Also the no-match path, and the "match found but enrichment
+                # failed" path above (logged as a possible duplicate). Either
+                # way this is about to WRITE A NEW BLOCK, which is exactly
+                # what the reconciled-through watermark exists to stop.
+                #
+                # Deliberately checked HERE and not before `find_match`
+                # above: a late email that LINKS to a block its counterpart
+                # already posted before the period closed is the lane
+                # working as designed (spec §5.4) and must still be allowed
+                # to enrich that block. Only a genuinely new block is gated —
+                # move this back to an early return and it also turns away
+                # every late enrichment, which is not what the watermark is
+                # for.
+                watermark = await self._reconciled_watermark(ev, declared)
+                if watermark is not None:
+                    await ji.upsert(
+                        self.db_pool, msgid, mailbox, ev, todoist_ref=todoist_ref, declared=declared
+                    )
+                    result["status"] = "reconciled"
+                    activity.logger.info(
+                        "money_event_reconciled_period msgid=%s occurred_on=%s watermark=%s "
+                        "— indexed, not posted",
+                        msgid,
+                        ev.occurred_on,
+                        watermark,
+                    )
+                    return result
+                # Either way the index records what actually happened —
+                # `posted`, with the block it wrote.
                 rel = await books.post_event(ev, msgid, cfg)
                 await ji.upsert(
                     self.db_pool, msgid, mailbox, ev, journal_file=rel, declared=declared
