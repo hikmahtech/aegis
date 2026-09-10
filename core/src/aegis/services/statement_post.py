@@ -574,6 +574,22 @@ async def post_statement(
                 # Without it a block dated three days off the bank's lands on
                 # the wrong side of the closing date and the check below fails
                 # for every row of the statement.
+                # §8.5. The email lane records what the vendor billed —
+                # `$200.00` — because that is what the receipt says. hledger
+                # then holds dollars in the CARD account, and `-X ₹` cannot
+                # value them without a price dated on or before the posting;
+                # production has none, so the whole statement reverted.
+                #
+                # The statement row is the rupee figure the bank actually
+                # charged, so promotion records it as the posting's cost.
+                # hledger balances on the cost, which makes the other posting
+                # rupees and the instrument account single-commodity again.
+                # A market price could not do this job: it would value the
+                # dollars at a rate, and the card's FX spread means that rate
+                # is not what was charged — the check would still miss, just
+                # by less.
+                outcome = outcomes.get(row.row_id)
+                cost = row.amount if outcome is not None and outcome.foreign else None
                 path.write_text(
                     books.rewrite_block(
                         text,
@@ -581,6 +597,7 @@ async def post_statement(
                         status="*",
                         on=row.occurred_on,
                         account=far,
+                        cost=cost,
                         add_tags={"stmt": plan_.statement_id},
                     )
                 )

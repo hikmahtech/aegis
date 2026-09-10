@@ -390,6 +390,34 @@ def _safe_account(account: str) -> str:
     return re.sub(r"\s{2,}", " ", text).strip()
 
 
+#: A posting amount that already carries a cost. hledger writes the total cost
+#: after `@@`; `@` would be a UNIT price, which for `$200.00 @ ₹19091.99` means
+#: nineteen thousand rupees PER DOLLAR.
+_COST_RE = re.compile(r"^(.*?)\s*@@?\s*.*$")
+
+
+def with_cost(amount: str, cost: Decimal, symbol: str = "₹") -> str:
+    """`$200.00` + 19091.99 -> `$200.00 @@ ₹19091.99` (spec §8.5).
+
+    The rupee figure a foreign posting really cost. Two things follow, and the
+    second is the point:
+
+    hledger BALANCES on the cost, so the other posting of the block becomes
+    rupees — the instrument account stops holding dollars at all. That is what
+    lets §9.3's check run: `cleared_movement_sync` asks for one commodity, and
+    a foreign balance it cannot price is the thing that made it refuse.
+
+    And it needs no price directive. A `P` line is a market rate on a date and
+    would value $200 at whatever the file says; `@@` records what the bank
+    actually charged. Those differ by the card's FX spread, so a price can make
+    the check pass only by accident, while the cost makes it exact.
+
+    An amount that already carries a cost has it REPLACED: the statement is the
+    authority on what the money cost, and a re-run must land on the same text.
+    """
+    return f"{_COST_RE.sub(r'\1', amount.strip())} @@ {symbol}{cost}"
+
+
 def _posting(account: str, amount: str = "") -> str:
     # hledger splits an account from its amount on TWO or more spaces, so an
     # account that padding would leave one space short of the column takes the
@@ -527,6 +555,7 @@ def rewrite_block(
     add_tags: dict[str, str] | None = None,
     status: str | None = None,
     on: date | None = None,
+    cost: Decimal | None = None,
 ) -> str:
     """Rewrite one block in place.
 
@@ -610,9 +639,15 @@ def rewrite_block(
     ]
     if len(postings) < 2:
         raise BooksError(f"block {msgid} has fewer than two postings")
-    if account:
+    if account or cost is not None:
         m = _POSTING_RE.match(lines[postings[0]])
-        lines[postings[0]] = _posting(account, m.group(2) if m and m.group(2) else "")
+        had = m.group(2) if m and m.group(2) else ""
+        # `cost` needs an amount to attach to. A blank first posting means
+        # hledger was inferring it, and there is nothing to price.
+        if cost is not None and had:
+            had = with_cost(had, cost)
+        lines[postings[0]] = _posting(account or _POSTING_RE.match(
+            lines[postings[0]]).group(1), had)
     if instrument_account:
         lines[postings[1]] = _posting(instrument_account)
     return text[:start] + "\n".join(lines) + "\n" + text[end:]

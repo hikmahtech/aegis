@@ -875,3 +875,49 @@ an argument `post_statement` does not take would have killed the whole lane on i
 run. Component tests do not compose into integration tests, and the review's most useful single
 observation was a coverage note, not a defect: `worker/src/aegis_worker/activities/statements.py`
 had zero.
+
+
+### 15.13 §8.5's cost notation, built (2026-09-10)
+
+§8.5 said promotion should "rewrite the posting to cost notation, `$4.00 @@ ₹338.12`". It was not
+built, and the first live posting run showed exactly what it costs: two statements reverted, and
+the hub said why.
+
+```
+axis-9640/2026-08:  no price for £ — hledger says £ 5722.20, ₹ -717108.82
+axis-cc-1313:       no price for $ — hledger says $ -220.00, ₹ 17210.29
+```
+
+The email lane records what the *receipt* says — `expenses:hikmah:saas  $200.00` — so the
+BALANCING posting, the card, holds dollars. `hledger -X ₹` needs a price dated on or before a
+posting to value it, and `prices.journal` held prices only from 2026-09-05, after every one of
+those transactions.
+
+**The tempting fix is wrong.** Backdating a `P` line makes the check run, and it will still fail.
+The check compares the books against the bank to the rupee; a market price values $200 at a rate,
+and the card's FX spread means that rate is not what the bank charged. On 2026-08-14 the card
+statement says ₹19,091.99 for USD 200.00 — ₹95.46 — while the price file says ₹94.49. Any rate
+that made the check pass would have been reverse-engineered from the answer.
+
+**Cost notation needs no price at all, and that is the point.** hledger balances a transaction on
+its cost, so `$200.00 @@ ₹19091.99` makes the other posting `₹-19091.99`. The instrument account
+stops holding a foreign commodity, so there is nothing left to value. Verified against hledger
+before building, including for a negative posting — `-£5722.20 @@ ₹731000.00` balances to
+`₹731000.00` — because the remittances are credits and it was not obvious that `@@` would take
+them.
+
+Where the rupee figure comes from is the part that only works now: the card statement prints
+`( USD 200.00 )` beside the rupee charge, and the parser stores both. §8.5 assumed the matcher
+would have to reach a rate through `prices.journal`; for a card it never has to.
+
+**One asymmetry to keep in mind**, because it is why the matcher offered a candidate hledger then
+refused to value: `books.latest_prices` is DATE-BLIND — the newest price per symbol — while
+hledger's `-X` is date-aware. The matcher can match a foreign candidate the ledger cannot price.
+
+`with_cost` REPLACES an existing cost rather than appending, and strips a unit price (`@`) as well
+as a total (`@@`), so a second promotion of the same block lands on the same text. `@` on a
+foreign posting would be a unit rate — `$200.00 @ ₹19091.99` claims nineteen thousand rupees per
+dollar — so the two spellings must not be confused.
+
+Only a posting the matcher marked `foreign` gets a cost. `₹1936.00 @@ ₹1936.00` is noise when the
+figures agree and a lie when they do not.
