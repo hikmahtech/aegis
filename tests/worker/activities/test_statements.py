@@ -22,6 +22,7 @@ import pytest
 import pytest_asyncio
 from aegis.services import books
 from aegis.services.statements import row_id_for
+from aegis_worker.activities import statements as statements_mod
 from aegis_worker.activities.statements import StatementActivities
 from temporalio.testing import ActivityEnvironment
 
@@ -300,3 +301,42 @@ async def test_a_transfer_sees_the_far_block_its_email_counterpart_promoted(clea
         "SELECT through_date FROM finance.reconciled_through WHERE instrument = $1",
         "hdfc-1225",
     ) == date(2026, 7, 31)
+
+
+def test_coverage_never_reports_an_account_that_has_never_sent_a_statement():
+    """`axis-cc-1747`, `icici-143` and `nkgsb-843` are declared, have a Drive
+    folder, and have never produced a file. Asking "did one arrive last month?"
+    of those opens three problems and three Todoist tasks that no statement can
+    ever resolve. Coverage means a bank that STOPPED, which is only a question
+    about a bank that started."""
+    from aegis.services import statement_findings
+
+    class _S:
+        def __init__(self, instrument, end):
+            self.instrument, self.period_end = instrument, end
+
+    seen = [
+        _S("hdfc-1225", date(2026, 7, 31)),   # sent last month — covered
+        _S("axis-9640", date(2026, 6, 30)),   # sent before, silent last month
+    ]
+    out = statements_mod._coverage_findings(
+        seen, statement_findings, today=date(2026, 8, 20)
+    )
+    assert [f["subject"] for f in out] == ["axis-9640"]
+
+
+def test_coverage_says_nothing_while_the_month_is_still_young():
+    """A statement for last month arrives within days of it closing. Asking on
+    the 2nd flips every account to missing and resolves it again a week later —
+    one Todoist task per account per month, saying only that the calendar
+    turned over."""
+    from aegis.services import statement_findings
+
+    class _S:
+        def __init__(self, instrument, end):
+            self.instrument, self.period_end = instrument, end
+
+    seen = [_S("axis-9640", date(2026, 6, 30))]
+    assert statements_mod._coverage_findings(
+        seen, statement_findings, today=date(2026, 8, 2)
+    ) == []

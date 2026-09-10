@@ -298,13 +298,8 @@ class StatementActivities:
         # classes, and it has to be: `statement_missing` is one of them, so a
         # sweep that produced no coverage findings would resolve every open
         # "no statement arrived" problem for the reason that it never looked.
-        period = _last_month(date.today())
-        findings = statement_findings.match_findings(
-            run
-        ) + statement_findings.missing_statement_findings(
-            accounts,
-            {s.instrument for s in statements if s.period_end.strftime("%Y-%m") == period},
-            period=period,
+        findings = statement_findings.match_findings(run) + _coverage_findings(
+            statements, statement_findings, today=date.today()
         )
         swept = await statement_findings.sweep(
             self.db_pool,
@@ -373,6 +368,40 @@ async def load_statements(pool: Any) -> list[Any]:
             )
         )
     return out
+
+
+#: How long after a month ends before a missing statement is a finding rather
+#: than a statement that has not arrived yet. Both banks send within days of the
+#: period closing, so asking on the 1st would flip every account to missing and
+#: resolve it again a few days later — a Todoist task per account per month
+#: that says nothing except that the calendar turned over.
+_COVERAGE_GRACE_DAYS = 8
+
+
+def _coverage_findings(statements, findings_mod, *, today: date) -> list[dict]:
+    """§15.4's `statement_missing`: which accounts stopped sending.
+
+    Two rules, and the first is the one that matters. **An account that has
+    NEVER sent a statement is not a coverage failure.** `axis-cc-1747`,
+    `icici-143` and `nkgsb-843` are declared and configured with a Drive folder
+    and have never produced a file — asking "did one arrive last month?" of
+    those opens three problems and three Todoist tasks that no statement can
+    ever resolve. Coverage is about a bank that has stopped, which is only
+    answerable for a bank that had started.
+
+    Second, wait out `_COVERAGE_GRACE_DAYS` after the month closes before
+    asking, so the answer is "it never came" rather than "it is the 2nd".
+    """
+    period_end_month = _last_month(today)
+    first_of_month = today.replace(day=1)
+    if (today - first_of_month).days < _COVERAGE_GRACE_DAYS:
+        # Still inside the grace window: say nothing, and — crucially — hand the
+        # sweep no `statement_missing` findings, which resolves any that are
+        # open. That is correct: we are not currently claiming any are missing.
+        return []
+    ever = {s.instrument for s in statements}
+    covered = {s.instrument for s in statements if s.period_end.strftime("%Y-%m") == period_end_month}
+    return findings_mod.missing_statement_findings(ever, covered, period=period_end_month)
 
 
 def _last_month(today: date) -> str:
