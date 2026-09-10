@@ -93,10 +93,8 @@ def parse_bytes(
     sha = file_digest(data)
     if data[:4] == _PDF_MAGIC:
         text = pdf_text(data)
-        parse = (
-            parse_axis_card_statement if is_axis_card_statement(text) else parse_axis_statement
-        )
-        return parse(text, file_sha256=sha, subject=title, declared=declared)
+        axis = parse_axis_card_statement if is_axis_card_statement(text) else parse_axis_statement
+        return axis(text, file_sha256=sha, subject=title, declared=declared)
     return parse_hdfc_statement(
         data.decode("utf-8", "replace"), file_sha256=sha, subject=title, declared=declared
     )
