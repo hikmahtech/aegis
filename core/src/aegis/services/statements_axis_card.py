@@ -369,6 +369,7 @@ def parse_axis_card_statement(
     records: list[dict[str, Any]] = []
     unreadable: list[int] = []
     fx_rows = 0
+    fx_ambiguous = 0
     for index, line in enumerate(text.split(END_MARKER)[0].splitlines()):
         row = _ROW.match(line)
         if row is None:
@@ -384,14 +385,22 @@ def parse_axis_card_statement(
         except ValueError:
             unreadable.append(index)
             continue
-        if amount <= 0:
-            # Zero reads as neither side and negative is not a shape the card
-            # prints. Both are refusals: a direction is posted money.
+        if amount < 0:
+            # Not a shape the card prints — it states the side in a suffix
+            # instead. A ZERO is left alone deliberately: its direction is
+            # printed like any other row's, so it is readable, and refusing a
+            # whole statement over a cosmetic ₹0.00 line would cost far more
+            # than carrying it.
             unreadable.append(index)
             continue
         fx = _FX.findall(narration)
         if len(fx) == 1:
             fx_rows += 1
+        elif len(fx) > 1:
+            # Never seen: one bracket per row on all three real statements. It
+            # is counted rather than guessed at, so a layout change that starts
+            # printing two is visible instead of quietly dropping both.
+            fx_ambiguous += 1
         records.append(
             {
                 "occurred_on": occurred_on,
@@ -419,6 +428,7 @@ def parse_axis_card_statement(
         "withdrawals": str(charges),
         "layout": LAYOUT,
         "fx_rows": fx_rows,
+        "fx_ambiguous_rows": fx_ambiguous,
         "row_date_min": min(days).isoformat() if days else "",
         "row_date_max": max(days).isoformat() if days else "",
     }
