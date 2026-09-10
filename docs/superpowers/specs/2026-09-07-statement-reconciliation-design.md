@@ -807,3 +807,71 @@ whether the money reached the journal, and the two answers differ per reason.
 **Open question 2 has half an answer.** `axis-cc-1747` has a configured Drive folder and zero
 files in it, so `axis-cc-1313` is the only card that sends statements. `icici-143` and `nkgsb-843`
 are still unanswered.
+
+
+### 15.12 Correction — what §15.11 got wrong, and the review that found it (2026-09-10)
+
+§15.11 was written from the design and not from the code. An adversarial review executed against
+this branch, and two of its claims were false. Both corrections are here rather than edited into
+§15.11, because a spec that quietly rewrites itself teaches nothing.
+
+**§15.11 claimed a "bank named in the narration" guard on `own_account`. There was none.** The
+function required a transfer marker and a 3-to-6-digit run and nothing else, so ordinary invoice,
+PO, flat and reference numbers matched the declared three-digit tails. Executed against the real
+chart:
+
+```
+NEFT/…/ACME PVT LTD/INV 143              -> assets:bank:icici:143
+RTGS/…/CLIENT CO/PO 236                  -> assets:bank:hdfc:0236
+IMPS/…/RAVI KUMAR/FLAT 325/              -> assets:bank:hdfc:0325
+IMPS/…/RAVI KUMAR/XXXXXX1225/ICICIBANK/  -> assets:bank:hdfc:1225
+```
+
+A client paying an invoice is then recorded as a transfer from the owner's own account: the income
+disappears, the other account drifts, and **both closing-balance checks still pass**, because both
+accounts are real and the journal balances. This is the failure mode the module docstring already
+named as its worst case, and the code did not implement the guard against it.
+
+The rule now has five conditions, and two are new: a mask must **introduce** the digits (with a
+lookbehind, because a bare `X` inside a word makes `TRF TO MAX 843` a transfer), and a bank named
+in the field straight after the account must be **our** bank — tested structurally by whether that
+field contains `BANK`, with the chart supplying which bank is ours. `_MAX_TAIL` is gone: the cap
+existed to stop a bare reference being read as a tail, the mask does that now for a run of any
+length, and 6 happened to be exactly the longest run in evidence.
+
+**§15.11 claimed the check window's overlap broke "every card statement after the first". It does
+not.** Measured: posting May then June in order passes even against the unfixed code, because the
+union window's end overlaps the *next* statement's first row, so the damage needs the newer
+statement to be in the journal already. That happens when a backfill posts out of order — post
+June then May and May reverts by June's first row. The bug is real; the claim about when it fires
+was wrong, and the difference matters because order-independence is a property §15.11 claims for
+this lane and that overlap was quietly breaking.
+
+**The window is the row span alone**, not its union with the printed period. Same reasoning as
+before and one step further: `expected_movement` is `closing − opening`, and in both layouts the
+opening figure is the balance immediately before the first row, so the movement is the rows'
+movement and nothing else.
+
+**Three defects the review found that §15.11 did not anticipate at all:**
+
+- **`unwritten` was never flipped for a liability.** `cleared` was, in `post_statement`; the
+  add-back was not, so any card statement with a skipped row missed by twice that row. A suite of
+  28 tests passed with the liability logic deleted, because none ran the check on a card that had
+  printed balances. `movement_disagreement` now takes `liability` and flips both figures itself —
+  one place to remember instead of two.
+- **`cleared_movement_sync` parsed a multi-commodity cell into a wrong number.** With `-X ₹` and no
+  price, hledger prints `"$4.00, ₹0"`, which a strip-to-digits parser reads as `4.000` — a clean
+  parse, not a crash, so a try/except around `Decimal` would not have caught it. Detection is
+  structural now, and an unpriceable commodity raises `BooksCheckError` naming it.
+- **A statement-posted block was never indexed.** §7 and §9.2 both require it, and without it a
+  vendor receipt arriving after the statement posts finds no counterpart — `find_match` requires
+  `journal_file IS NOT NULL` — and posts a second block for money the books already hold, invisible
+  to §9.3 because both sit inside the period. It also meant a posted row stayed a matcher candidate
+  for ever, so §15.5's promise that the unmatched count falls was false.
+
+**The lesson worth keeping.** Every one of these lived in the seam between components whose own
+tests were thorough: the activity that calls the poster had no tests at all, and a `TypeError` on
+an argument `post_statement` does not take would have killed the whole lane on its first scheduled
+run. Component tests do not compose into integration tests, and the review's most useful single
+observation was a coverage note, not a defect: `worker/src/aegis_worker/activities/statements.py`
+had zero.
