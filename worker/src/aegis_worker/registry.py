@@ -111,6 +111,30 @@ ActivityRow = dict[str, Any]
 ScheduleConfig = Callable[[ActivityRow], Any]
 
 
+def _int(config: dict[str, Any], key: str, default: int) -> int:
+    """A numeric `activities.config` value, or the default when it is not one.
+
+    35 mapper fields below read a number out of operator-editable JSON, and
+    `int("")` raises. Clearing a numeric field on the admin Activities page
+    stores exactly that, and so does pasting a config with a blank value during
+    a backfill — after which this row's mapper raised, `sync_schedules` lost
+    the rest of its loop, and it repeated every 300 seconds (#373).
+
+    A blank field means "I do not want to set this", which is what the default
+    already says, so falling back is the honest reading rather than a guess.
+    It is logged every tick because a config the operator believes they changed
+    and which is silently ignored is its own kind of wrong.
+    """
+    raw = config.get(key, default)
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        logger.warning(
+            "activity_config_not_a_number", key=key, value=str(raw)[:40], using=default
+        )
+        return default
+
+
 class RegistrationError(RuntimeError):
     """A flow/activity is declared but not fully wired (or vice versa).
 
@@ -167,10 +191,10 @@ FLOWS: tuple[FlowSpec, ...] = (
         AgentTaskSweepFlow,
         lambda act: AgentTaskSweepConfig(
             agent_id=act["agent_id"],
-            max_tasks=int(act["config"].get("max_tasks", 3)),
-            cooldown_hours=int(act["config"].get("cooldown_hours", 6)),
-            max_coding=int(act["config"].get("max_coding", 3)),
-            turn_timeout_minutes=int(act["config"].get("turn_timeout_minutes", 60)),
+            max_tasks=_int(act["config"], "max_tasks", 3),
+            cooldown_hours=_int(act["config"], "cooldown_hours", 6),
+            max_coding=_int(act["config"], "max_coding", 3),
+            turn_timeout_minutes=_int(act["config"], "turn_timeout_minutes", 60),
         ),
     ),
     FlowSpec(AgentTaskFlow),
@@ -187,7 +211,7 @@ FLOWS: tuple[FlowSpec, ...] = (
         CalendarIngestFlow,
         lambda act: CalendarIngestInput(
             agent_id=act["agent_id"],
-            horizon_days=int(act["config"].get("horizon_days", 30)),
+            horizon_days=_int(act["config"], "horizon_days", 30),
         ),
     ),
     FlowSpec(
@@ -206,7 +230,7 @@ FLOWS: tuple[FlowSpec, ...] = (
         DayLogFlow,
         lambda act: DayLogConfig(
             agent_id=act["agent_id"],
-            day_offset=int(act["config"].get("day_offset", 0)),
+            day_offset=_int(act["config"], "day_offset", 0),
             mode=str(act["config"].get("mode", "daily")),
         ),
     ),
@@ -214,7 +238,7 @@ FLOWS: tuple[FlowSpec, ...] = (
         CleanupFlow,
         lambda act: CleanupConfig(
             retentions=act["config"].get("retentions") or {},
-            task_session_days=int(act["config"].get("task_session_days", 7)),
+            task_session_days=_int(act["config"], "task_session_days", 7),
         ),
     ),
     FlowSpec(InteractionFlow),
@@ -227,7 +251,7 @@ FLOWS: tuple[FlowSpec, ...] = (
         GmailIngestFlow,
         lambda act: GmailIngestInput(
             agent_id=act["agent_id"],
-            max_per_account=int(act["config"].get("max_per_account", 50)),
+            max_per_account=_int(act["config"], "max_per_account", 50),
             # 7d, not 2d: the `after:<cursor>` guard means a wider window costs
             # nothing on a healthy run, but it is the only thing that recovers
             # mail missed while the flow was down or the 50/run cap truncated.
@@ -253,7 +277,7 @@ FLOWS: tuple[FlowSpec, ...] = (
         WearableIngestFlow,
         lambda act: WearableIngestInput(
             agent_id=act["agent_id"],
-            lookback_days=int((act["config"] or {}).get("lookback_days", 7)),
+            lookback_days=_int(act["config"] or {}, "lookback_days", 7),
         ),
     ),
     FlowSpec(
@@ -280,7 +304,7 @@ FLOWS: tuple[FlowSpec, ...] = (
         MemoryReflectionFlow,
         lambda act: MemoryReflectionInput(
             agent_id=act["agent_id"],
-            keep=int((act["config"] or {}).get("keep", 50)),
+            keep=_int(act["config"] or {}, "keep", 50),
             # Fail closed: an existing DB row predating A3 has neither key, and
             # `activities.config` is DB-owned (seed.py never overwrites it), so
             # enabling consolidation on a live deploy is a deliberate edit on
@@ -291,8 +315,8 @@ FLOWS: tuple[FlowSpec, ...] = (
             # the strictest quota and no hard purge without any operator action.
             dry_run=bool((act["config"] or {}).get("dry_run", True)),
             max_ops_pct=float((act["config"] or {}).get("max_ops_pct", 0.25)),
-            min_age_hours=int((act["config"] or {}).get("min_age_hours", 24)),
-            retire_grace_days=int((act["config"] or {}).get("retire_grace_days", 0)),
+            min_age_hours=_int(act["config"] or {}, "min_age_hours", 24),
+            retire_grace_days=_int(act["config"] or {}, "retire_grace_days", 0),
         ),
     ),
     FlowSpec(
@@ -301,8 +325,8 @@ FLOWS: tuple[FlowSpec, ...] = (
             agent_id=act["agent_id"],
             source=act["config"].get("source", "hn"),
             topics=list(act["config"].get("topics") or []),
-            max_results=int(act["config"].get("max_results", 20)),
-            significance_threshold=int(act["config"].get("significance_threshold", 4)),
+            max_results=_int(act["config"], "max_results", 20),
+            significance_threshold=_int(act["config"], "significance_threshold", 4),
         ),
     ),
     FlowSpec(
@@ -310,7 +334,7 @@ FLOWS: tuple[FlowSpec, ...] = (
         lambda act: JiraSyncConfig(
             agent_id=act["agent_id"],
             key_pattern=str(act["config"].get("key_pattern", DEFAULT_KEY_PATTERN)),
-            max_tasks=int(act["config"].get("max_tasks", 100)),
+            max_tasks=_int(act["config"], "max_tasks", 100),
             dry_run=bool(act["config"].get("dry_run", False)),
         ),
     ),
@@ -319,7 +343,7 @@ FLOWS: tuple[FlowSpec, ...] = (
         lambda act: SentryPollInput(
             agent_id=act["agent_id"],
             mode=act["config"].get("mode", "poll"),
-            limit=int(act["config"].get("limit", 25)),
+            limit=_int(act["config"], "limit", 25),
         ),
     ),
     FlowSpec(
@@ -351,28 +375,28 @@ FLOWS: tuple[FlowSpec, ...] = (
         WorkspaceRepoSyncFlow,
         lambda act: WorkspaceRepoSyncInput(
             agent_id=act["agent_id"],
-            min_repos=int(act["config"].get("min_repos", 5)),
+            min_repos=_int(act["config"], "min_repos", 5),
         ),
     ),
     FlowSpec(
         SocialPublishFlow,
         lambda act: SocialPublishConfig(
             agent_id=act["agent_id"],
-            lookahead_minutes=int(act["config"].get("lookahead_minutes", 10)),
-            default_post_hour=int(act["config"].get("default_post_hour", 9)),
-            channel_sync_minutes=int(act["config"].get("channel_sync_minutes", 60)),
-            max_retire=int(act["config"].get("max_retire", 20)),
+            lookahead_minutes=_int(act["config"], "lookahead_minutes", 10),
+            default_post_hour=_int(act["config"], "default_post_hour", 9),
+            channel_sync_minutes=_int(act["config"], "channel_sync_minutes", 60),
+            max_retire=_int(act["config"], "max_retire", 20),
         ),
     ),
     FlowSpec(
         SocialMetricsFlow,
         lambda act: SocialMetricsConfig(
             agent_id=act["agent_id"],
-            window_days=int(act["config"].get("window_days", 14)),
-            lookahead_days=int(act["config"].get("lookahead_days", 45)),
-            max_rows=int(act["config"].get("max_rows", 200)),
-            stuck_after_hours=int(act["config"].get("stuck_after_hours", 6)),
-            max_stuck=int(act["config"].get("max_stuck", 50)),
+            window_days=_int(act["config"], "window_days", 14),
+            lookahead_days=_int(act["config"], "lookahead_days", 45),
+            max_rows=_int(act["config"], "max_rows", 200),
+            stuck_after_hours=_int(act["config"], "stuck_after_hours", 6),
+            max_stuck=_int(act["config"], "max_stuck", 50),
             check_stuck=bool(act["config"].get("check_stuck", True)),
         ),
     ),
@@ -384,9 +408,9 @@ FLOWS: tuple[FlowSpec, ...] = (
         CuriosityCardFlow,
         lambda act: CuriosityConfig(
             agent_id=act["agent_id"],
-            max_per_day=int(act["config"].get("max_per_day", 1)),
-            limit=int(act["config"].get("limit", 5)),
-            timeout_seconds=int(act["config"].get("timeout_seconds", 2 * 86400)),
+            max_per_day=_int(act["config"], "max_per_day", 1),
+            limit=_int(act["config"], "limit", 5),
+            timeout_seconds=_int(act["config"], "timeout_seconds", 2 * 86400),
             aegis_ui_url=act["_settings"].get("aegis_ui_url", ""),
         ),
     ),
@@ -398,9 +422,9 @@ FLOWS: tuple[FlowSpec, ...] = (
         ProfileReflectionFlow,
         lambda act: ProfileReflectionConfig(
             agent_id=act["agent_id"],
-            lookback_days=int((act["config"] or {}).get("lookback_days", 7)),
-            max_per_day=int((act["config"] or {}).get("max_per_day", 1)),
-            timeout_seconds=int((act["config"] or {}).get("timeout_seconds", 7 * 86400)),
+            lookback_days=_int(act["config"] or {}, "lookback_days", 7),
+            max_per_day=_int(act["config"] or {}, "max_per_day", 1),
+            timeout_seconds=_int(act["config"] or {}, "timeout_seconds", 7 * 86400),
             aegis_ui_url=act["_settings"].get("aegis_ui_url", ""),
         ),
     ),
@@ -411,8 +435,8 @@ FLOWS: tuple[FlowSpec, ...] = (
         ExpiryRadarFlow,
         lambda act: ExpiryRadarConfig(
             agent_id=act["agent_id"],
-            lookahead_days=int(act["config"].get("lookahead_days", 400)),
-            max_cards=int(act["config"].get("max_cards", 5)),
+            lookahead_days=_int(act["config"], "lookahead_days", 400),
+            max_cards=_int(act["config"], "max_cards", 5),
         ),
     ),
     # Watchdog over AEGIS's own scheduled flows (#226). Deliberately NOT behind
@@ -428,14 +452,14 @@ FLOWS: tuple[FlowSpec, ...] = (
         FlowHealthWatchdogFlow,
         lambda act: FlowHealthConfig(
             agent_id=act["agent_id"],
-            consecutive_failures=int((act["config"] or {}).get("consecutive_failures", 2)),
-            lookback_hours=int((act["config"] or {}).get("lookback_hours", 24)),
+            consecutive_failures=_int(act["config"] or {}, "consecutive_failures", 2),
+            lookback_hours=_int(act["config"] or {}, "lookback_hours", 24),
             stale_multiplier=float((act["config"] or {}).get("stale_multiplier", 3.0)),
-            min_stale_minutes=int((act["config"] or {}).get("min_stale_minutes", 60)),
+            min_stale_minutes=_int(act["config"] or {}, "min_stale_minutes", 60),
             check_stale=bool((act["config"] or {}).get("check_stale", True)),
             check_llm=bool((act["config"] or {}).get("check_llm", True)),
-            llm_consecutive=int((act["config"] or {}).get("llm_consecutive", 2)),
-            llm_staleness_hours=int((act["config"] or {}).get("llm_staleness_hours", 720)),
+            llm_consecutive=_int(act["config"] or {}, "llm_consecutive", 2),
+            llm_staleness_hours=_int(act["config"] or {}, "llm_staleness_hours", 720),
             silent=bool((act["config"] or {}).get("silent", False)),
         ),
     ),
@@ -444,7 +468,7 @@ FLOWS: tuple[FlowSpec, ...] = (
         ServiceDriftFlow,
         lambda act: ServiceDriftConfig(
             silent=bool(act["config"].get("silent", False)),
-            recheck_delay_seconds=int(act["config"].get("recheck_delay_seconds", 120)),
+            recheck_delay_seconds=_int(act["config"], "recheck_delay_seconds", 120),
         ),
         feature_flag="homelab_enabled",
     ),
@@ -460,8 +484,8 @@ FLOWS: tuple[FlowSpec, ...] = (
         DeliveryWatchdogFlow,
         lambda act: DeliveryWatchdogConfig(
             silent=bool(act["config"].get("silent", False)),
-            threshold_seconds=int(act["config"].get("threshold_seconds", 120)),
-            window_hours=int(act["config"].get("window_hours", 24)),
+            threshold_seconds=_int(act["config"], "threshold_seconds", 120),
+            window_hours=_int(act["config"], "window_hours", 24),
             comms_url=act["_settings"].get("comms_url", ""),
         ),
         feature_flag="homelab_enabled",
@@ -470,9 +494,9 @@ FLOWS: tuple[FlowSpec, ...] = (
         InfraHeartbeatFlow,
         lambda act: InfraHeartbeatConfig(
             agent_id=act["agent_id"],
-            fail_threshold=int(act["config"].get("fail_threshold", 3)),
+            fail_threshold=_int(act["config"], "fail_threshold", 3),
             quiet_nodes=[str(n) for n in (act["config"].get("quiet_nodes") or [])],
-            restuck_hours=int(act["config"].get("restuck_hours", 24)),
+            restuck_hours=_int(act["config"], "restuck_hours", 24),
         ),
         feature_flag="homelab_enabled",
     ),
@@ -481,14 +505,14 @@ FLOWS: tuple[FlowSpec, ...] = (
         ReceiptIngestFlow,
         lambda act: ReceiptIngestInput(
             agent_id=act["agent_id"],
-            max_per_account=int(act["config"].get("max_per_account", 50)),
+            max_per_account=_int(act["config"], "max_per_account", 50),
             # `or`, not a .get default: a key present but blank must fall back
             # too. An empty sender_filter is a whole-mailbox query, and every
             # message it returns is fanned out to MoneyProcessFlow's LLM call.
             query_window=act["config"].get("query_window") or "newer_than:14d",
             aegis_ui_url=act["_settings"].get("aegis_ui_url", ""),
             sender_filter=act["config"].get("sender_filter") or DEFAULT_SENDER_FILTER,
-            sweep_limit=int(act["config"].get("sweep_limit", 20)),
+            sweep_limit=_int(act["config"], "sweep_limit", 20),
         ),
         feature_flag="money_hygiene_enabled",
     ),
@@ -497,7 +521,7 @@ FLOWS: tuple[FlowSpec, ...] = (
         MoneyBriefFlow,
         lambda act: MoneyBriefConfig(
             agent_id=act["agent_id"],
-            days=int(act["config"].get("days", 7)),
+            days=_int(act["config"], "days", 7),
             silent=bool(act["config"].get("silent", False)),
         ),
         feature_flag="money_hygiene_enabled",
@@ -532,8 +556,8 @@ FLOWS: tuple[FlowSpec, ...] = (
         MeetingSweepFlow,
         lambda act: MeetingSweepInput(
             agent_id=act["agent_id"],
-            lookback_days=int((act["config"] or {}).get("lookback_days", 7)),
-            max_per_account=int((act["config"] or {}).get("max_per_account", 50)),
+            lookback_days=_int(act["config"] or {}, "lookback_days", 7),
+            max_per_account=_int(act["config"] or {}, "max_per_account", 50),
         ),
     ),
 )

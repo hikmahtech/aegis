@@ -8,7 +8,7 @@ import asyncpg
 import structlog
 from aegis.config import Settings
 from aegis.connectors.search import SearchConnector
-from aegis.db import create_pool
+from aegis.db import create_pool, wait_for_migrations
 from aegis.llm import LLMClient
 
 logger = structlog.get_logger()
@@ -140,6 +140,13 @@ async def bootstrap(settings: Settings | None = None) -> WorkerDeps:
     # Database pool (with JSONB codec)
     pool = await create_pool(settings.database_url)
     logger.info("worker_db_pool_created")
+
+    # The stack rolls core and worker together and only core migrates, so
+    # without this the worker can serve activities against a schema that is
+    # seconds behind its own code (#445). Waits for the migrations THIS image
+    # ships; fails open, so a stuck migration delays boot rather than blocking
+    # it. Everything below reads the database, starting with the next line.
+    await wait_for_migrations(pool)
 
     # Overlay UI-set integration config (tokens/secrets) over env before the
     # connectors below are built from `settings`.

@@ -130,9 +130,30 @@ async def sync_schedules(
             logger.warning("schedule_unknown_type", activity=act_name, type=act_type)
             continue
 
-        workflow_cls, flow_config = mapper(act)
         schedule_id = act_name
+        # BEFORE the mapper, and that ordering is the point. An id missing from
+        # this set is an orphan, and an orphan is DELETED below — so a row whose
+        # config will not map must still be claimed here, or one unusable field
+        # would tear down a schedule that is running perfectly well on the last
+        # config that did map.
         expected_ids.add(schedule_id)
+
+        try:
+            workflow_cls, flow_config = mapper(act)
+        except Exception as exc:  # noqa: BLE001 — one row, not the whole tick
+            # `registry._int` already absorbs the common case, a numeric field
+            # an operator cleared. This is the general form of the same bug
+            # (#373): the mapper runs inside the loop, and until now nothing
+            # here caught it, so ONE unusable config aborted `sync_schedules`
+            # after that row — skipping every activity sorting after it and
+            # skipping orphan pruning — and did it again every 300 seconds.
+            logger.warning(
+                "schedule_config_unusable",
+                activity=act_name,
+                type=act_type,
+                error=f"{type(exc).__name__}: {exc}"[:200],
+            )
+            continue
 
         # Fingerprint of everything the schedule is built from, embedded in
         # the action's workflow-id prefix. describe() hands that prefix back,
