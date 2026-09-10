@@ -34,6 +34,7 @@ account assets:bank:hdfc:1225
 account assets:bank:axis:9640
 account liabilities:card:axis:1313
 account expenses:unknown
+account assets:unknown
 account income:unknown
 account expenses:fees
 account equity:transfers
@@ -471,3 +472,43 @@ async def test_a_statement_posted_block_is_indexed_so_a_late_receipt_cannot_dupl
     assert row["occurred_on"] == date(2026, 7, 10)
     # The account the poster actually chose, not one recomputed by the caller.
     assert row["account"] == "expenses:fees"
+
+
+async def test_a_promoted_block_tells_the_index_which_account_paid(clean, tmp_path):
+    """#408. A vendor receipt names what you bought, never what paid for it —
+    of the twelve amount-bearing NULL-instrument rows in the live index, not
+    one of their emails prints a card tail. Promotion already rewrites the
+    block's `assets:unknown` posting to the statement's account, so the journal
+    knows; the index row was the only thing left saying it did not, and the
+    journal is the record while this table is only its index.
+    """
+    cfg = _repo(tmp_path)
+    await clean.execute(
+        "INSERT INTO finance.journal_index (message_id, mailbox, entity, kind, direction, "
+        "amount, currency, payee, payee_key, occurred_on, parser, source_class, journal_file) "
+        "VALUES ('st-apple','st-box','hikmah','transaction','out',219,'INR','Apple','apple',"
+        "'2026-07-06','llm','receipt','hikmah/2026.journal')"
+    )
+    (cfg.path / "hikmah" / "2026.journal").write_text(
+        "; h\n\n"
+        "2026-07-06 ! Apple\n"
+        "    ; msgid: st-apple\n"
+        "    ; channel: receipt\n"
+        "    expenses:unknown          ₹219.00\n"
+        "    assets:unknown           ₹-219.00\n"
+    )
+    subprocess.run(
+        ["git", "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qam", "seed"],
+        cwd=cfg.path, check=True,
+    )
+    sid = await _statement(clean, "axis-9640", "2026-07-01", "2026-07-31", "0", "-219", 1)
+    await _row(clean, "axis-9640", "2026-07-06", "out", "219.00", "APPLE SERVICES", sid, "-219")
+
+    out = await ActivityEnvironment().run(_act(clean, cfg).reconcile_statements, True, "")
+    assert out["promoted"] == 1, out
+
+    ledger = (cfg.path / "hikmah" / "2026.journal").read_text()
+    assert "assets:bank:axis:9640" in ledger, ledger
+    assert await clean.fetchval(
+        "SELECT instrument FROM finance.journal_index WHERE message_id = 'st-apple'"
+    ) == "axis-9640"

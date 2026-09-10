@@ -52,7 +52,7 @@ import hashlib
 import re
 import subprocess
 from collections.abc import Collection, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
 from io import BytesIO
@@ -282,6 +282,53 @@ def _first_text(line: str, start: int) -> int | None:
     return start + len(rest) - len(stripped) if stripped else None
 
 
+def _row_text_after_date(line: str) -> int | None:
+    """The offset of the first text after a transaction row's own date."""
+    if not _LOOSE_ROW.match(line):
+        return None
+    date_match = _ROW_DATE.search(line)
+    return None if date_match is None else _first_text(line, date_match.end())
+
+
+def _widen_narration(cols: _Columns, header: str, page: str) -> _Columns:
+    """Move `narration_start` out to where the page's own rows print (#428).
+
+    A column header names a column; it does not promise the rows below it are
+    flush with the label. On the Axis netbanking layout they are not: measured
+    on the real FY2024-25 statement, `Particulars` prints at offset 38 and the
+    rows print at 22, so a map built from the label alone cut the first 16
+    characters off every narration on that page — and with them the UPI/NEFT
+    reference `extract_ref` reads, which is what pass 1 of the matcher joins on.
+    It cost 23 of that statement's 1,619 rows their reference. Only the one page
+    per netbanking statement that prints a header was affected: `_infer_columns`
+    takes this same measurement for the 48 that print none, which is how page
+    one came to disagree with the rest of its own statement.
+
+    Two bounds keep the widening honest, and the second is why the header line
+    is needed here rather than just the rows:
+
+    * The label is the CEILING, so this only ever widens the cell leftwards. A
+      narration cell may safely begin in the whitespace before its text — it is
+      stripped — so a row that prints flush with or right of its label needs no
+      adjustment and gets none.
+    * The end of the PREVIOUS label on the header line is the floor, because
+      whatever prints left of that belongs to another column. The mailed layout
+      is the case that needs it: `Transaction Details` sits at 28 with a
+      `Value Date` column ending at 25, and its rows print their value date at
+      15 — measure from the date alone and every mailed narration would swallow
+      a second date. The same bound keeps a cheque number in the `Chq No`
+      column the netbanking layout prints at 13, whose rows here happen to
+      leave it blank.
+    """
+    floor = len(header[: cols.narration_start].rstrip())
+    starts = [
+        start
+        for start in (_row_text_after_date(line) for line in page.splitlines())
+        if start is not None and floor <= start < cols.narration_start
+    ]
+    return cols if not starts else replace(cols, narration_start=min(starts))
+
+
 def _infer_columns(page: str) -> _Columns | None:
     """The column offsets of a page that carries rows but reprints no header.
 
@@ -337,7 +384,7 @@ def _infer_columns(page: str) -> _Columns | None:
             amount_ends.append(numbers[-2].end())
             amount_starts.append(numbers[-2].start())
             balance_ends.append(numbers[-1].end())
-            after_date = _first_text(line, date.end())
+            after_date = _row_text_after_date(line)
             if after_date is not None:
                 text_starts.append(after_date)
         elif line.strip() and not _NUM.search(line):
@@ -684,7 +731,7 @@ def parse_axis_statement(
             index += 1
             mapped = _column_map(line)
             if mapped is not None:
-                cols = mapped
+                cols = _widen_narration(mapped, line, page)
                 continue
             if cols is None:
                 if _LOOSE_ROW.match(line) and _NUM.search(line):

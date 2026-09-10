@@ -293,6 +293,15 @@ class StatementActivities:
                     declared=declared,
                 )
 
+            # Promotion just rewrote every `assets:unknown` posting in these
+            # blocks to this statement's account, so the journal now names the
+            # account and the index still says NULL (#408). The journal is the
+            # record; leaving the index disagreeing with it is how "which
+            # account paid for this?" gets a wrong answer from the cheap side.
+            await ji.name_instrument(
+                self.db_pool, result.promoted, statement.instrument, declared=declared
+            )
+
             posted += len(result.posted)
             promoted += len(result.promoted)
             results.append(

@@ -158,6 +158,18 @@ _URL_RE = re.compile(r"https?://\S+")
 # fell through to the extractor as text.
 _TAG_BLOCK_RE = re.compile(r"<(style|script)[^>]*>.*?(?:</\1>|$)", re.S | re.I)
 _TAG_RE = re.compile(r"<[^>]+>")
+# An HTML comment is not text. Outlook's conditional comments are why this
+# matters: a downlevel-HIDDEN block (`<!--[if gte mso 9]>…<![endif]-->`) carries
+# markup no mail client renders, and with no comment handling the tag regexes
+# below strip its tags and keep the TEXT between them. Every mailer that ships
+# the standard MSO boilerplate therefore contributed a bare `96` — the value in
+# `<o:PixelsPerInch>96</o:PixelsPerInch>` — as the FIRST token of the body, and
+# the extractor read it as an amount and posted it (#381: 26 of 318 stored
+# bodies, eight unrelated senders, one fabricated ₹96 transaction in the books).
+# Non-greedy on purpose: stopping at the first `-->` is what keeps a
+# downlevel-REVEALED block (`<!--[if !mso]><!-->real content<!--<![endif]-->`)
+# showing the content it exists to reveal.
+_COMMENT_RE = re.compile(r"<!--.*?-->", re.S)
 # Tags that end a line. Everything else is INLINE and is deleted outright
 # rather than replaced by a space: HTML mailers wrap parts of a number in
 # <b>/<span>, so "Amount:<b>1,00,308</b>.53" must not become
@@ -181,6 +193,10 @@ def html_to_text(html_src: str) -> str:
     import html as _html
 
     text = _TAG_BLOCK_RE.sub(" ", html_src)
+    # After the style/script sweep, not before: a script body may legally carry
+    # `-->` (it is a JS line comment) and old stylesheets wrap themselves in
+    # `<!--`…`-->`, either of which would end a comment in the wrong place.
+    text = _COMMENT_RE.sub("", text)
     text = _BLOCK_TAG_RE.sub("\n", text)
     text = _TAG_RE.sub("", text)
     text = _html.unescape(text)
