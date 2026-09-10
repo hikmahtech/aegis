@@ -191,10 +191,19 @@ class StatementActivities:
             try:
                 result = await statement_post.post_statement(
                     statement,
-                    {rid: o for rid, o in outcomes.items() if o.statement_id == statement.statement_id},
+                    {
+                        rid: o
+                        for rid, o in outcomes.items()
+                        if o.statement_id == statement.statement_id
+                    },
                     self.books_cfg,
                     entity=account.get("post_entity") or "personal",
                     rules=rules,
+                    declared=declared,
+                    # Every row of every OTHER account, so §8.4 can see both
+                    # sides of a transfer. Passing this statement's own rows
+                    # back would let a row pair with itself.
+                    peer_rows=[r for r in rows if r.instrument != statement.instrument],
                     liability=books.instrument_account(
                         statement.instrument, declared
                     ).startswith("liabilities:"),
