@@ -17,7 +17,8 @@ Three rules keep the grouping honest:
   one failure has more than one victim. The ``manual`` class — a hand-written
   task's problem — is never groupable at all: three ``@code`` tasks are three
   pieces of work, and folding them would move one task's sessions and PR links
-  onto another.
+  onto another. Whole sources opt out the same way, through
+  :data:`NON_GROUPABLE_SOURCES`.
 * **A judge, not a rule.** The count alone is a candidate, not a verdict —
   three services crash-looping for three unrelated reasons must stay three
   problems. :func:`candidates` finds clusters; the caller (the sweep's LLM
@@ -53,6 +54,30 @@ logger = structlog.get_logger()
 # Two of a kind is a coincidence. Three is a pattern worth asking about — and
 # it is only ever a question: the judge still has to agree.
 MIN_MEMBERS = 3
+# Sources whose problems are never offered as a cluster, for the same reason
+# `class = 'manual'` is not: each of their problems is individually actionable
+# and folding would destroy that.
+#
+# `money`: a reconciliation finding is keyed on the account, so
+# `unmatched_rows:instrument:axis-cc-1313` IS "214 unmatched rows on
+# axis-cc-1313" and the 215th row joins it. The grouping is already done by the
+# correlation key. `candidates` clusters on (class, subject_kind) alone and has
+# no idea whose problems they are, so once three accounts carry `unmatched_rows`
+# the sweep would offer them to the billed judge and a "yes" would fold every
+# account into one `unmatched_rows:instrument:*` problem — one task for the
+# whole backlog, which is the opposite of what the lane needs, and reached
+# without the money lane doing anything at all.
+#
+# `problems` has no source column: the source lives on `problem_events`, so the
+# rule is a NOT EXISTS rather than a migration. Naming a source rather than a
+# list of class names keeps this from drifting every time the money lane adds
+# a class.
+#
+# This changes nothing about how a group that DOES exist recovers: a group's
+# subject is `*` and can never appear among a watchdog's findings, so
+# `hub_watch.reconcile_findings` checks a group's membership by CLASS, not by
+# subject. That rule is unchanged and still correct.
+NON_GROUPABLE_SOURCES = frozenset({"money"})
 # How far back a member may have been last seen and still count towards a
 # cluster. Longer than the daily watchdogs so a once-a-day finding still
 # accumulates; short enough that last month's incident does not.
@@ -63,6 +88,12 @@ WINDOW_HOURS = 72.0
 VERDICT_TTL_HOURS = 24.0
 _VERDICT_KEY = "hub_group_verdicts"
 _SEVERITY_ORDER = ("info", "warning", "error", "critical")
+# The `NON_GROUPABLE_SOURCES` rule as SQL. Both queries in `candidates` pass the
+# source list as `$4`, so the fragment is shared rather than written twice.
+_NOT_FROM_NON_GROUPABLE = (
+    "NOT EXISTS (SELECT 1 FROM problem_events e "
+    "WHERE e.problem_id = problems.id AND e.source = ANY($4::text[]))"
+)
 
 
 def _utcnow() -> datetime:
@@ -99,10 +130,12 @@ async def candidates(
         "WHERE closed_at IS NULL AND status = ANY($1::text[]) AND group_key IS NULL "
         "  AND class <> '' AND class <> 'manual' AND subject <> '' AND subject_kind <> '' "
         "  AND last_seen_at >= $2 "
+        f"  AND {_NOT_FROM_NON_GROUPABLE} "
         "GROUP BY 1, 2 HAVING count(*) >= $3 ORDER BY count(*) DESC",
         sorted(LIVE_STATUSES),
         since,
         floor,
+        sorted(NON_GROUPABLE_SOURCES),
     )
     out: list[dict[str, Any]] = []
     for row in rows:
@@ -113,10 +146,12 @@ async def candidates(
                 "       first_seen_at, last_seen_at, todoist_task_id FROM problems "
                 "WHERE closed_at IS NULL AND status = ANY($1::text[]) AND group_key IS NULL "
                 "  AND class = $2 AND subject_kind = $3 AND subject <> '' "
+                f"  AND {_NOT_FROM_NON_GROUPABLE} "
                 "ORDER BY first_seen_at",
                 sorted(LIVE_STATUSES),
                 row["class"],
                 row["subject_kind"],
+                sorted(NON_GROUPABLE_SOURCES),
             )
         ]
         if len(members) < floor:

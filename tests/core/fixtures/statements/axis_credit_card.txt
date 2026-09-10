@@ -1,0 +1,83 @@
+                                                                                                                 MY ZONE CREDIT CARD STATEMENT
+
+MS SPECIMEN CARDHOLDER
+1 EXAMPLE HOUSE,
+,
+SAMPLE ROAD NOWHERE
+NOWHERE CITY 400000
+
+
+
+
+                                                                                              PAYMENT SUMMARY
+       Total Payment Due                           Minimum Payment Due                               Statement Period                                Payment Due Date                               Statement Generation Date
+          44,453.36 Dr                                    11,114.00 Dr                           20/07/2026 - 18/08/2026                         07/09/2026                                         18/08/2026
+
+       Credit Card Number                                 Credit Limit                              Available Credit Limit                           Available Cash Limit                           For hassle free payments register for
+       400000******9876                                     300,000.00                                        255,546.64                                           0.00                           Auto-Debit facility on 18605005555
+
+
+               Previous Balance - Payments - Credits + Purchase + Cash Advance + Other Debit&Charges =Total Payment Due                                                             Making only the minimum payment every
+                                                                                                                                                                                     month would result in the repayment stretching
+     30,000.00 Dr                 30,000.00               1,120.00          44,450.00                 0.00                      1,123.36              44,453.36 Dr                  over years with consequent interest payment
+
+                                                                                                      Account Summary
+       DATE                                    TRANSACTION DETAILS                            MERCHANT CATEGORY                                                                                                AMOUNT (Rs.)
+                     Card No: 400000******9876                      Name MS SPECIMEN CARDHOLDER
+ 18/07/2026            EXAMPLE VAULT,TORONTO             ( USD 9.99 )                 RETAIL STORES                                                                                                                          900.00 Dr
+ 19/07/2026            FOREIGN CURRENCY TRANSACTION FEE                                                                                                                                                                       31.50 Dr
+ 19/07/2026            GST                                                                                                                                                                                                     5.67 Dr
+ 20/07/2026            SPECIMEN GROCERS,NAVI MUMBAI                                   DEPT STORES                                                                                                                          1,250.00 Dr
+ 21/07/2026            DCC MARKUP                                                                                                                                                                                              4.13 Dr
+ 21/07/2026            GST                                                                                                                                                                                                     2.36 Dr
+ 21/07/2026            GST                                                                                                                                                                                                     2.36 Dr
+ 25/07/2026            SAMPLE FUEL STOP,MUMBAI                                        FUEL                                                                                                                                 2,000.00 Dr
+ 27/07/2026            FUEL CASHBACK REBATES                                                                                                                                                                                  20.00 Cr
+
+
+
+               Your cheque should be payable to Axis Bank Card No.400000******9876 . Please write your NAME & TELEPHONE No. on the reverse of the cheque.
+               Axis Bank Maharashtra GST registration no.: 00XXXXX0000X0XX.
+
+IMPORTANT MESSAGE
+* GST will be applicable on all fee, charges, interest and other charges as per prevailing provisions under the GST Act.
+
+    eDGE REWARD                  BALANCE AS             CUSTOMER ID
+       POINTS                      ON DATE
+          12345                    15-08-2026              900000001
+
+                                                                                                                                                                                                        Page : 1 of 3
+                                                                    MY ZONE CREDIT CARD STATEMENT
+    DATE                                TRANSACTION DETAILS                                 MERCHANT CATEGORY   AMOUNT (Rs.)
+02/08/2026   BBPS PAYMENT RECEIVED - BD000000EXAMPLEAAAA1                                                            30,000.00 Cr
+03/08/2026   NOWHERE SOFTWARE,NOWHERE.CO          ( USD 20.00 )                      MISCELLANEOUS                    1,800.00 Dr
+04/08/2026   FOREIGN CURRENCY TRANSACTION FEE                                                                            63.00 Dr
+04/08/2026   GST                                                                                                         11.34 Dr
+09/08/2026   EMI INTEREST - 2/6, REF# 11223344                                       UTILITIES                          850.00 Dr
+09/08/2026   GST                                                                                                        153.00 Dr
+09/08/2026   EMI PRINCIPAL - 2/6, REF# 11223344                                      UTILITIES                       12,500.00 Dr
+12/08/2026   SPECIMEN SOFTWARE,COVINA             ( USD 12.34 )                      MISCELLANEOUS                    1,100.00 Cr
+15/08/2026   EXAMPLE APPLIANCES,MUMBAI                                               ELECTRONICS                     26,000.00 Dr
+                                                                   EMI BALANCES
+             EXAMPLE APPLIANCES LTD                                                  11223344                 62,500.00
+                                                        **** End of Statement ****
+                                                                 MY ZONE CREDIT CARD STATEMENT
+
+   Finance Charge calculation                                                               Schedule of charges
+If a card holder avails of the revolving facility of the credit card and hence chooses to   Particulars                            Charges
+account. You have purchased household goods for Rs. 25000.00 on 12th June and
+withdrawn cash from ATM for Rs. 5000.00 on 15th June. Your monthly statement is on          Finance Charges(Retail & Cash)         3.75% p.m. (55.55% per annum)
+20th of every month. On 20th June, you would be levied interest on Rs. 5000.00 cash
+days*3.75%*12 months/365days= Rs.36.99 your due date for 20th June statement is
+ Total Interest charged on 20th July                                          1265.11
+
+  Minimum Amount Due Calculation
+
+Txn Date     Type                              Cr/Db MAD Contribution          Amount
+25th Sep     Purchase                          Db                    2%          5000
+1st Oct      Joining Fees                      Db                  100%          1000
+1st Oct      GST on Joining Fees               Db                  100%           180
+                                                     Total Amount Due            8813.65
+                                                    Minimum Amount Due          1953.65
+
+MAD = 2%*(5000+2000) + 100%*(1000+180+500+18+36.99+6.66) = 1953.65

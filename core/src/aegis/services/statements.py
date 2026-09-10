@@ -486,6 +486,15 @@ class StatementRow:
     balance_after: Decimal | None
     statement_id: str
     file_sha256: str
+    #: The original amount of a transaction charged abroad, where the bank
+    #: printed it (§8.5). Only the card layout does — `( USD 5.89 )` beside the
+    #: rupee charge — and it is the exact figure the journal block holds, so
+    #: keeping it saves the matcher from converting a rupee amount back through
+    #: a rate production does not have. `amount` stays the rupee amount that
+    #: hit the account; these two are never a substitute for it, and they are
+    #: deliberately NOT part of `row_id` (§8.3 fixes what is).
+    fx_currency: str | None = None
+    fx_amount: Decimal | None = None
 
 
 @dataclass(frozen=True)
@@ -578,6 +587,11 @@ def assign_row_ids(
                 balance_after=balance,
                 statement_id=statement_id,
                 file_sha256=file_sha256,
+                # Optional, and absent from every record the two bank-account
+                # parsers build: only a card prints the original of a foreign
+                # charge (§8.5).
+                fx_currency=rec.get("fx_currency"),
+                fx_amount=rec.get("fx_amount"),
             )
         )
     return tuple(rows)

@@ -16,11 +16,14 @@ from aegis.services import statement_intake as si
 from aegis.services.statement_intake import FileOutcome, IntakeReport
 from aegis.services.statements import (
     PARSED,
+    REFUSED,
     ParsedStatement,
     StatementRow,
     parse_axis_statement,
     row_id_for,
 )
+from aegis.services.statements_axis_card import LAYOUT as CARD_LAYOUT
+from aegis.services.statements_axis_card import parse_axis_card_statement
 
 FIXTURES = Path(__file__).parent / "fixtures" / "statements"
 
@@ -107,6 +110,73 @@ async def test_a_re_import_does_not_erase_matching_work(db_pool):
         "SELECT matched_msgid, posted_at FROM finance.statement_rows WHERE row_id = $1", row_id
     )
     assert kept["matched_msgid"] == "mail/1" and kept["posted_at"] is not None
+
+
+@pytest.mark.asyncio
+async def test_a_card_rows_foreign_original_survives_the_store(db_pool):
+    """§8.5. The card prints `( USD 9.99 )` beside the rupee charge, and that is
+    the exact figure the journal block holds. Parsing it and then dropping it at
+    the INSERT would leave the matcher converting rupees back through a rate
+    production does not have — so this asserts it comes back out of Postgres,
+    not merely off the parser.
+    """
+    await db_pool.execute("DELETE FROM finance.statement_rows WHERE instrument = 'axis-cc-9876'")
+    text = (FIXTURES / "axis_credit_card.txt").read_text()
+    parsed = parse_axis_card_statement(text, file_sha256="fixture")
+    assert parsed.status == PARSED, parsed.reason
+
+    await si.store_rows(db_pool, parsed)
+
+    stored = await db_pool.fetch(
+        "SELECT narration, amount, fx_currency, fx_amount FROM finance.statement_rows "
+        "WHERE instrument = 'axis-cc-9876' AND fx_currency IS NOT NULL ORDER BY occurred_on"
+    )
+    assert [(r["fx_currency"], str(r["fx_amount"])) for r in stored] == [
+        ("USD", "9.99"),
+        ("USD", "20.00"),
+        ("USD", "12.34"),
+    ]
+    assert all(r["amount"] > r["fx_amount"] for r in stored), "amount stays the rupee charge"
+
+    rupee_rows = await db_pool.fetchval(
+        "SELECT count(*) FROM finance.statement_rows "
+        "WHERE instrument = 'axis-cc-9876' AND fx_currency IS NULL"
+    )
+    assert rupee_rows == 15, "and a domestic row carries no original"
+
+
+def test_an_axis_pdf_reaches_the_parser_its_own_header_anchor_names(monkeypatch):
+    """§6.1 decides which Axis parser a PDF goes to — the whole-line card
+    anchor, never the title and never a substring. Both directions, because a
+    dispatch that always picks one is right half the time by accident.
+    """
+    card = (FIXTURES / "axis_credit_card.txt").read_text()
+    account = (FIXTURES / "axis_mailed.txt").read_text()
+
+    monkeypatch.setattr(si, "pdf_text", lambda data, *a, **kw: card)
+    out = si.parse_bytes(b"%PDF-1.7 pretend", title="axis current account july.pdf")
+    assert (out.status, out.instrument) == (PARSED, "axis-cc-9876")
+    assert out.diagnostics["layout"] == CARD_LAYOUT
+
+    monkeypatch.setattr(si, "pdf_text", lambda data, *a, **kw: account)
+    out = si.parse_bytes(b"%PDF-1.7 pretend", title="credit card statement.pdf")
+    assert (out.status, out.instrument) == (PARSED, "axis-4321")
+    assert out.diagnostics["layout"] == "axis_mailed"
+
+
+def test_a_card_statement_that_fails_its_check_keeps_its_own_reason(monkeypatch):
+    """A card statement that cannot be trusted must say why. Trying the card
+    parser and falling back to the account parser on any failure would answer
+    `no_header_anchor`, which points a human at the wrong problem.
+    """
+    card = (FIXTURES / "axis_credit_card.txt").read_text()
+    broken = card.replace("2,000.00 Dr", "2,000.00 Cr")
+    monkeypatch.setattr(si, "pdf_text", lambda data, *a, **kw: broken)
+
+    out = si.parse_bytes(b"%PDF-1.7 pretend", title="statement.pdf")
+    assert out.status == REFUSED
+    assert out.reason == "totals_mismatch"
+    assert out.instrument == "axis-cc-9876", "it still knows whose statement it refused"
 
 
 def test_the_bytes_decide_the_parser_not_the_filename():

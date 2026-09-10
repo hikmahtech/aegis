@@ -313,6 +313,56 @@ async def test_hand_written_tasks_are_never_a_cluster(db_pool):
     assert [c for c in await candidates(db_pool, now=NOW) if c["class"] == "manual"] == []
 
 
+async def test_a_non_groupable_source_is_never_offered_as_a_cluster(db_pool):
+    """Money's findings are already one problem per account by construction, so
+    folding three accounts into one `unmatched_rows:instrument:*` problem would
+    replace the whole point of the lane with a single task — and `candidates`
+    clusters on (class, subject_kind) alone, so it would happen on the next
+    sweep tick without the money lane doing anything at all."""
+    from aegis.services import statement_findings as sf
+
+    instruments = [f"zzacct-{uuid.uuid4().hex[:8]}" for _ in range(3)]
+    await reconcile_findings(
+        db_pool,
+        source=sf.SOURCE,
+        subject_kind=sf.INSTRUMENT,
+        classes=list(sf.INSTRUMENT_CLASSES),
+        findings=[
+            {
+                "klass": sf.UNMATCHED_ROWS,
+                "subject": i,
+                "title": f"3 unmatched rows on {i}",
+            }
+            for i in instruments
+        ],
+        now=NOW,
+        project=False,
+    )
+    mine = set(instruments)
+    for cluster in await candidates(db_pool, now=NOW):
+        assert not (mine & {m["subject"] for m in cluster["members"]}), cluster["class"]
+
+
+async def test_the_same_shape_from_another_source_still_clusters(db_pool):
+    """The control for the test above: the exclusion is by SOURCE, not by
+    shape. Three problems of one class on three instruments from a watchdog
+    that IS groupable are still offered."""
+    klass = _klass()
+    subjects = [f"zzacct-{uuid.uuid4().hex[:8]}" for _ in range(3)]
+    await reconcile_findings(
+        db_pool,
+        source="flow_health",
+        subject_kind="instrument",
+        classes=[klass],
+        findings=[{"klass": klass, "subject": s, "title": f"{klass}: {s}"} for s in subjects],
+        now=NOW,
+        project=False,
+    )
+    found = [c for c in await candidates(db_pool, now=NOW) if c["class"] == klass]
+    assert len(found) == 1
+    assert sorted(m["subject"] for m in found[0]["members"]) == sorted(subjects)
+
+
 async def test_a_group_that_rolls_over_is_still_a_group(db_pool):
     """The group resolved long ago and the condition is back. That starts a
     fresh problem — and it must still be the group, or the sweep would have to

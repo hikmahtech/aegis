@@ -95,6 +95,10 @@ from aegis_worker.flows.sentry_poll import SentryPollFlow, SentryPollInput
 from aegis_worker.flows.service_drift import ServiceDriftConfig, ServiceDriftFlow
 from aegis_worker.flows.social_metrics import SocialMetricsConfig, SocialMetricsFlow
 from aegis_worker.flows.social_publish import SocialPublishConfig, SocialPublishFlow
+from aegis_worker.flows.statement_reconcile import (
+    StatementReconcileConfig,
+    StatementReconcileFlow,
+)
 from aegis_worker.flows.todoist_sync import TodoistSyncConfig, TodoistSyncFlow
 from aegis_worker.flows.wearable_ingest import WearableIngestFlow, WearableIngestInput
 from aegis_worker.flows.workspace_repo_sync import WorkspaceRepoSyncFlow, WorkspaceRepoSyncInput
@@ -506,6 +510,19 @@ FLOWS: tuple[FlowSpec, ...] = (
         ),
         feature_flag="money_hygiene_enabled",
     ),
+    # The statement lane's tick (spec §14 step 7). `post` ships FALSE: a
+    # schedule must not write to the books before an operator has read a dry
+    # run of what it would write.
+    FlowSpec(
+        StatementReconcileFlow,
+        lambda act: StatementReconcileConfig(
+            agent_id=act["agent_id"],
+            post=bool(act["config"].get("post", False)),
+            since=str(act["config"].get("since", "") or ""),
+            silent=bool(act["config"].get("silent", False)),
+        ),
+        feature_flag="money_hygiene_enabled",
+    ),
     # Child of GmailIngestFlow (the `meeting` tag fan-out); never scheduled.
     FlowSpec(MeetingNotesFlow),
     # The read-state-blind safety net for that fan-out. Not feature-flagged: it
@@ -526,6 +543,10 @@ FLOWS: tuple[FlowSpec, ...] = (
 ACTIVITY_CLASS_FLAGS: dict[str, str] = {
     "HomelabActivities": "homelab_enabled",
     "MoneyActivities": "money_hygiene_enabled",
+    # Same flag as the rest of the money lane: the statement activities write
+    # to the same books through the same flock, and a money-off install must
+    # not serve their task queue either.
+    "StatementActivities": "money_hygiene_enabled",
 }
 
 
