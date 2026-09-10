@@ -1,4 +1,5 @@
-"""Migration 032 — `finance.statement_rows` has the shape spec §7 gives it."""
+"""Migrations 032 and 042 — `finance.statement_rows` has the shape spec §7
+gives it, plus the two foreign-currency columns §8.5 earned."""
 
 import pytest
 
@@ -6,6 +7,10 @@ import pytest
 # cannot hold `balance_after` (NULL on cards) or `candidates` (the msgids an
 # ambiguous row could not choose between) silently loses what the matcher and
 # the digest are built on, so this is pinned rather than smoke-tested.
+#
+# `fx_currency`/`fx_amount` (migration 042) hold the original of a card charge
+# made abroad, which only the card layout prints. Without them the matcher has
+# to convert a rupee amount back through a rate production does not have.
 EXPECTED = {
     "row_id": ("text", "NO"),
     "instrument": ("text", "NO"),
@@ -22,6 +27,8 @@ EXPECTED = {
     "posted_at": ("timestamp with time zone", "YES"),
     "skip_reason": ("text", "YES"),
     "created_at": ("timestamp with time zone", "NO"),
+    "fx_currency": ("text", "YES"),
+    "fx_amount": ("numeric", "YES"),
 }
 
 
@@ -39,11 +46,12 @@ async def test_the_money_columns_keep_two_decimal_places(db_pool):
     rows = await db_pool.fetch(
         "SELECT column_name, numeric_precision, numeric_scale FROM information_schema.columns "
         "WHERE table_schema='finance' AND table_name='statement_rows' "
-        "AND column_name IN ('amount','balance_after')"
+        "AND column_name IN ('amount','balance_after','fx_amount')"
     )
     assert {r["column_name"]: (r["numeric_precision"], r["numeric_scale"]) for r in rows} == {
         "amount": (14, 2),
         "balance_after": (14, 2),
+        "fx_amount": (14, 2),
     }
 
 

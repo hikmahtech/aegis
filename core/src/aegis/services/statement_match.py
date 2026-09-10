@@ -63,9 +63,12 @@ DUPLICATE = "duplicate_row"
 #: §8.5's foreign-currency band — the FX markup a card adds on top of the rate.
 FX_BAND = Decimal("0.05")
 
-#: Both banks in scope print rupees, and `finance.statement_rows` has no
-#: currency column: a statement amount IS in this currency. Anything else on the
-#: journal side is the §8.5 candidate class, matched through `books.latest_prices`.
+#: Both banks in scope print rupees, so `statement_rows.amount` IS in this
+#: currency. Anything else on the journal side is the §8.5 candidate class,
+#: matched through `books.latest_prices`. The card parser also stores the
+#: original of a charge made abroad in `fx_currency`/`fx_amount` where the bank
+#: printed it — the exact figure the journal block holds, and a route to §8.5
+#: that needs no rate. Nothing here reads them yet.
 STATEMENT_CURRENCY = "INR"
 
 

@@ -32,6 +32,10 @@ from aegis.services.statements import (
     parse_axis_statement,
     pdf_text,
 )
+from aegis.services.statements_axis_card import (
+    is_axis_card_statement,
+    parse_axis_card_statement,
+)
 from aegis.services.statements_hdfc import parse_hdfc_statement
 
 logger = structlog.get_logger()
@@ -75,12 +79,24 @@ def parse_bytes(
     Dispatched on the bytes: a PDF is Axis (HDFC mails no attachment and its
     SmartStatement arrives as HTML), anything else is tried as HDFC HTML. The
     file's NAME is deliberately not consulted — see the module docstring.
+
+    Axis sends two different PDFs, and the **header anchor** picks between them
+    (§6.1) — never a substring, and never the title. `is_axis_card_statement`
+    asks one question: does the file carry the card's whole-line
+    `Card No: … Name …` anchor? A savings or current statement does not, even
+    the ones carrying a `CreditCard Payment` narration row, which is the
+    misfiling this rule exists to stop. Asking before parsing rather than
+    falling back afterwards also keeps the card parser's own refusal reason:
+    a card statement that fails its arithmetic must say so, not come back
+    `no_header_anchor` from the bank-account parser.
     """
     sha = file_digest(data)
     if data[:4] == _PDF_MAGIC:
-        return parse_axis_statement(
-            pdf_text(data), file_sha256=sha, subject=title, declared=declared
+        text = pdf_text(data)
+        parse = (
+            parse_axis_card_statement if is_axis_card_statement(text) else parse_axis_statement
         )
+        return parse(text, file_sha256=sha, subject=title, declared=declared)
     return parse_hdfc_statement(
         data.decode("utf-8", "replace"), file_sha256=sha, subject=title, declared=declared
     )
@@ -98,7 +114,9 @@ async def store_rows(pool: Any, statement: ParsedStatement) -> tuple[int, int]:
     Deliberately DO NOTHING rather than DO UPDATE. A row that is already here
     may have been matched or posted since — `matched_msgid`, `posted_at`,
     `skip_reason` — and re-importing the file must not erase that work. The
-    parsed columns cannot have changed anyway: they are what the hash is over.
+    parsed columns cannot have changed anyway: they are what the hash is over,
+    and the two that are not — `fx_currency`/`fx_amount` — are read out of the
+    narration, which is itself in the hash on the card rows that carry them.
     """
     if not statement.rows:
         return 0, 0
@@ -108,13 +126,13 @@ async def store_rows(pool: Any, statement: ParsedStatement) -> tuple[int, int]:
             """
             INSERT INTO finance.statement_rows
               (row_id, instrument, occurred_on, narration, ref, direction, amount,
-               balance_after, statement_id, file_sha256)
-            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+               balance_after, statement_id, file_sha256, fx_currency, fx_amount)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
             ON CONFLICT (row_id) DO NOTHING
             """,
             row.row_id, row.instrument, row.occurred_on, row.narration, row.ref,
             row.direction, row.amount, row.balance_after, row.statement_id,
-            row.file_sha256,
+            row.file_sha256, row.fx_currency, row.fx_amount,
         )
         if result.endswith("1"):
             stored += 1
