@@ -585,10 +585,24 @@ def rewrite_block(
         when = on.isoformat() if on else day
         lines[0] = f"{when} {flag} {sanitize_payee(payee) if payee else had_payee}"
     if add_tags:
+        # The LAST comment line, found rather than assumed. `render_transaction`
+        # always emits `; channel: …` as line 2, so a hardcoded index worked for
+        # every block this repo writes — but a hand-edited block, or one that
+        # only carries `; msgid:`, put the tag on a POSTING instead
+        # (`equity:transfers  ₹100000.00, stmt: …`), which hledger rejects. The
+        # `check --strict` guard catches it and reverts, so nothing is
+        # corrupted; what is lost is the whole statement's write, blamed on a
+        # promotion that looked fine.
+        comments = [
+            i for i, line in enumerate(lines) if line.startswith(f"{_INDENT};")
+        ]
+        if not comments:
+            lines.insert(1, f"{_INDENT};")
+            comments = [1]
         for key, value in add_tags.items():
             key, value = sanitize_tag(key), sanitize_tag(value)
             if key:
-                lines[2] = lines[2] + f", {key}: {value}"
+                lines[comments[-1]] = lines[comments[-1]] + f", {key}: {value}"
     postings = [
         i
         for i, line in enumerate(lines)

@@ -23,7 +23,10 @@ from datetime import date, timedelta
 from pathlib import Path
 from typing import Any
 
+import structlog
 from temporalio import activity
+
+logger = structlog.get_logger()
 
 #: The settings row holding `{"accounts": {instrument: {folder_id, entities,
 #: post_entity}}}`. One row rather than one setting per account: the folder ids
@@ -185,21 +188,23 @@ class StatementActivities:
             if not scope.covers(statement):
                 results.append({"statement": statement.statement_id, "status": "out_of_scope"})
                 continue
-            if not post:
-                continue
             account = accounts.get(statement.instrument) or {}
             try:
                 result = await statement_post.post_statement(
                     statement,
-                    {
-                        rid: o
-                        for rid, o in outcomes.items()
-                        if o.statement_id == statement.statement_id
-                    },
+                    # The WHOLE outcome set, not this statement's slice.
+                    # `plan` looks rows up by id and ignores the rest, but
+                    # `_far_block` reads the FAR row's outcome to find the block
+                    # its email counterpart promoted — and the far row belongs
+                    # to another statement by definition. Filtering here made
+                    # that lookup always miss in production, so a transfer whose
+                    # posting side was email-matched reverted the counterpart's
+                    # statement for ever, while the test passed because it hands
+                    # over the full dict.
+                    outcomes,
                     self.books_cfg,
                     entity=account.get("post_entity") or "personal",
                     rules=rules,
-                    declared=declared,
                     # Every row of every OTHER account, so §8.4 can see both
                     # sides of a transfer. Passing this statement's own rows
                     # back would let a row pair with itself.
@@ -207,6 +212,9 @@ class StatementActivities:
                     liability=books.instrument_account(
                         statement.instrument, declared
                     ).startswith("liabilities:"),
+                    # `post` false still runs the plan, so a person can read
+                    # what the lane WOULD write before letting it write.
+                    dry_run=not post,
                 )
             except books.BooksCheckError as exc:
                 # §15.4: a closing-balance mismatch is an arrival-time event,
@@ -220,6 +228,37 @@ class StatementActivities:
                     reason=str(exc),
                 )
                 results.append({"statement": statement.statement_id, "status": "reverted"})
+                continue
+            except Exception as exc:  # noqa: BLE001 — one statement, not the run
+                # Anything else — a commodity hledger cannot price, a parser
+                # surprise — is this statement's problem and must not take the
+                # rest of the run with it. The flow is NO_RETRY, so an escaping
+                # exception costs the findings sweep, the digest and every
+                # statement after this one in the loop, daily.
+                logger.warning(
+                    "statement_post_failed",
+                    statement=statement.statement_id,
+                    error=f"{type(exc).__name__}: {exc}"[:300],
+                )
+                results.append(
+                    {
+                        "statement": statement.statement_id,
+                        "status": "failed",
+                        "reason": f"{type(exc).__name__}: {exc}"[:300],
+                    }
+                )
+                continue
+
+            if not post:
+                results.append(
+                    {
+                        "statement": statement.statement_id,
+                        "status": "would_post",
+                        "posted": len(result.posted),
+                        "promoted": len(result.promoted),
+                        "skipped": [list(s) for s in result.skipped],
+                    }
+                )
                 continue
 
             posted += len(result.posted)
