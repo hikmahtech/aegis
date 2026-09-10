@@ -415,6 +415,24 @@ def _counter_account(block: str) -> str:
     return ""
 
 
+#: What `books.instrument_account` returns when it cannot resolve an
+#: instrument — a receipt that named no account at all, or an instrument
+#: spelling the chart does not carry (#407).
+_UNRESOLVED_INSTRUMENT = "assets:unknown"
+
+
+def _instrument_posting(block: str) -> str:
+    """The account on a block's SECOND posting line — the instrument side."""
+    seen = 0
+    for line in block.splitlines():
+        if line.startswith(books._INDENT) and not line.startswith(f"{books._INDENT};"):
+            seen += 1
+            if seen == 2:
+                match = books._POSTING_RE.match(line)
+                return match.group(1) if match else ""
+    return ""
+
+
 def check_window(statement: ParsedStatement) -> tuple[date | None, date | None]:
     """The dates §9.3's cleared-movement check must span for this statement.
 
@@ -561,6 +579,26 @@ async def post_statement(
                 # grows by the bill every month. Only `equity:transfers` is
                 # rewritten: a block already naming a real account was decided
                 # by something with more evidence than this.
+                # A block the email lane could not place sits on
+                # `assets:unknown` — a vendor receipt naming no account, or an
+                # instrument the chart spells differently (#407). The statement
+                # is the bank saying this money moved through THIS account, so
+                # promotion moves the posting there. Without it the block never
+                # touches the instrument, §9.3's movement comes up short by
+                # exactly those rows, and the whole statement reverts: two such
+                # blocks, ₹99.00 and ₹1047.83, were the entire ₹1146.83 gap on
+                # the first live card statement.
+                #
+                # Only the placeholder is rewritten, for the same reason as
+                # `equity:transfers` below: a block already naming a real
+                # account was decided by something with more evidence than a
+                # matcher's date-and-amount guess.
+                instrument = (
+                    books.instrument_account(statement.instrument, declared)
+                    if _instrument_posting(text[span[0]:span[1]])
+                    == _UNRESOLVED_INSTRUMENT
+                    else None
+                )
                 leg = plan_.paired.get(row.row_id)
                 far = (
                     leg.account
@@ -597,6 +635,7 @@ async def post_statement(
                         status="*",
                         on=row.occurred_on,
                         account=far,
+                        instrument_account=instrument,
                         cost=cost,
                         add_tags={"stmt": plan_.statement_id},
                     )
