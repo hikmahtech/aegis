@@ -25,12 +25,15 @@ HAS_HLEDGER = shutil.which("hledger") is not None and shutil.which("git") is not
 pytestmark = pytest.mark.skipif(not HAS_HLEDGER, reason="hledger/git not installed")
 
 ACCOUNTS = """commodity ₹ 1,00,000.00
+commodity $ 1000.00
+commodity £ 1000.00
 account assets:bank:hdfc:1225
 account assets:bank:axis:9640
 account liabilities:card:axis:1313
 account assets:unknown
 account expenses:unknown
 account expenses:groceries
+account expenses:media
 account expenses:fees
 account income:unknown
 account equity:transfers
@@ -1107,3 +1110,58 @@ async def test_a_counterpart_inside_the_rows_but_outside_the_printed_period(tmp_
     assert second.balance_checked is True and second.balance_reason == ""
     text = (cfg.path / "personal" / "2026.journal").read_text()
     assert text.count("₹2500.00") == 1, "one block for one movement"
+
+
+async def test_a_foreign_block_promoted_with_its_cost_lets_the_check_run(tmp_path):
+    """§8.5 end to end, and the reason two live statements reverted.
+
+    The email lane wrote `$200.00` because that is what the receipt said. The
+    card account then held DOLLARS, `hledger -X ₹` had no price dated on or
+    before the posting to value them with, and `cleared_movement_sync` refused
+    the whole statement rather than parse a mixed cell into a wrong number.
+
+    Promotion now records the rupee figure the bank charged as the posting's
+    cost. hledger balances on the cost, the card account becomes rupees, and
+    the check can finally run — and it is EXACT, which a market price could
+    never be: the card's FX spread means the rate that values $200 is not the
+    rate that was charged.
+    """
+    cfg = _repo(tmp_path)
+    (cfg.path / "personal" / "2026.journal").write_text(
+        "; p\n\n"
+        "2026-07-14 ! Anthropic\n"
+        "    ; msgid: mail/anthropic\n"
+        "    ; channel: receipt, instrument: axis-cc-1313\n"
+        "    expenses:media                          $200.00\n"
+        "    liabilities:card:axis:1313\n"
+    )
+    subprocess.run(
+        ["git", "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qam", "seed"],
+        cwd=cfg.path, check=True,
+    )
+    row = _row(14, "19091.99", narration="ANTHROPIC* CLAUDE SUB", instrument="axis-cc-1313")
+    stmt = _card_statement([row], "0", "19091.99")
+    outcome = RowOutcome(
+        row_id=row.row_id, statement_id=stmt.statement_id, instrument="axis-cc-1313",
+        occurred_on=row.occurred_on, matched_pass=PASS_WINDOW, msgid="mail/anthropic",
+        delta_days=0, foreign=True,
+    )
+
+    result = await statement_post.post_statement(
+        stmt, {row.row_id: outcome}, cfg, entity="personal", liability=True
+    )
+
+    assert result.promoted == ["mail/anthropic"], result
+    assert result.balance_checked, result
+    assert result.balance_reason == "", result.balance_reason
+    text = (cfg.path / "personal" / "2026.journal").read_text()
+    assert "$200.00 @@ ₹19091.99" in text, text
+    # hledger agrees the card now holds rupees and nothing else.
+    out = subprocess.run(
+        ["hledger", "-f", str(cfg.path / cfg.main), "balance",
+         "liabilities:card:axis:1313", "-X", "₹", "--no-total", "--flat"],
+        capture_output=True, text=True, cwd=str(cfg.path),
+    ).stdout
+    assert "$" not in out, out
+    # hledger prints the commodity's own digit grouping — `₹ -19,091.99`.
+    assert "19091.99" in out.replace(",", ""), out
