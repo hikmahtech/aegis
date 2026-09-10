@@ -40,6 +40,11 @@ _STATEMENT_MAILBOX = "statement"
 #: are edited apart.
 FOLDER_SETTING = "integration:statement_folders"
 
+#: The `YYYY-MM` the reconciliation digest was last produced for. A month, not
+#: a timestamp: what the cadence needs to know is which report has already been
+#: written, and that survives a tick missed on the 1st.
+DIGEST_SETTING = "statement_digest_month"
+
 
 async def _folder_config(pool: Any) -> dict:
     """The account map, or `{}` when the lane has never been configured.
@@ -351,7 +356,9 @@ class StatementActivities:
                 }
                 for k, v in swept.items()
             },
-            "digest": statement_findings.monthly_digest(run),
+            "digest": await _due_digest(
+                self.db_pool, statement_findings, run, today=date.today()
+            ),
         }
 
 
@@ -419,7 +426,7 @@ def _coverage_findings(statements, findings_mod, *, today: date) -> list[dict]:
     Second, wait out `_COVERAGE_GRACE_DAYS` after the month closes before
     asking, so the answer is "it never came" rather than "it is the 2nd".
     """
-    period_end_month = _last_month(today)
+    month_start, month_end = _last_month(today)
     first_of_month = today.replace(day=1)
     if (today - first_of_month).days < _COVERAGE_GRACE_DAYS:
         # Still inside the grace window: say nothing, and — crucially — hand the
@@ -427,20 +434,67 @@ def _coverage_findings(statements, findings_mod, *, today: date) -> list[dict]:
         # open. That is correct: we are not currently claiming any are missing.
         return []
     ever = {s.instrument for s in statements}
-    covered = {s.instrument for s in statements if s.period_end.strftime("%Y-%m") == period_end_month}
-    return findings_mod.missing_statement_findings(ever, covered, period=period_end_month)
+    # A statement covers a month when its period spans the MIDDLE of it. A
+    # bank's billing period is its own business: HDFC bills the 5th to the 4th,
+    # so `2026-08-05..09-04` covers all but four days of August while ENDING in
+    # September. Comparing end months called that account missing every month it
+    # reported on time (#463) — two live false tasks no statement could resolve.
+    # Plain overlap would fix that and break the other direction, because July's
+    # `07-05..08-04` overlaps August too and would cover for an August that
+    # never came. The midpoint is what makes exactly one statement per cycle
+    # answer for each month, whatever day the bank bills on.
+    midpoint = month_start.replace(day=15)
+    covered = {
+        s.instrument
+        for s in statements
+        if s.period_start <= midpoint <= s.period_end
+    }
+    return findings_mod.missing_statement_findings(
+        ever, covered, period=month_start.strftime("%Y-%m")
+    )
 
 
-def _last_month(today: date) -> str:
-    """The calendar month before `today`, as `YYYY-MM`.
+async def _due_digest(pool: Any, findings_mod, run, *, today: date) -> str:
+    """The digest, at most once a month (#464).
+
+    §15.4 keeps `monthly_digest` as the periodic READ on how the lane is doing —
+    the findings are the actionable surface. The flow ticks daily and produced
+    it on every tick: a long per-account list whose counts barely move between
+    days, which teaches the reader to skip exactly the report they should read.
+
+    The marker is the month the digest was produced FOR, not the day it went
+    out. A tick missed on the 1st still produces the month's report on the 2nd,
+    and two ticks on the same day produce one. A schedule running `silent`
+    still spends the month's marker on a digest the flow drops — that is what
+    silent asks for, and the alternative is teaching this activity about a
+    delivery decision that belongs to the flow.
+    """
+    month = today.strftime("%Y-%m")
+    if await pool.fetchval("SELECT value FROM settings WHERE key = $1", DIGEST_SETTING) == month:
+        return ""
+    digest = findings_mod.monthly_digest(run, period=month)
+    await pool.execute(
+        "INSERT INTO settings (key, value, updated_at) VALUES ($1, $2, NOW()) "
+        "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()",
+        DIGEST_SETTING,
+        # The bare string: the pool's jsonb codec applies `json.dumps` itself,
+        # and pre-dumping it here lands a double-encoded scalar that never
+        # compares equal to the month on the next tick.
+        month,
+    )
+    return digest
+
+
+def _last_month(today: date) -> tuple[date, date]:
+    """The first and last day of the calendar month before `today`.
 
     Coverage asks "did a statement arrive for last month?" rather than "for
     this month": a statement for the current month has not been sent yet, so
     asking about it would report every account as missing, every day, until
     the month ended.
     """
-    first = today.replace(day=1)
-    return (first - timedelta(days=1)).strftime("%Y-%m")
+    last = today.replace(day=1) - timedelta(days=1)
+    return last.replace(day=1), last
 
 
 def _entity_map(accounts: Mapping[str, Any]) -> dict[str, Any]:

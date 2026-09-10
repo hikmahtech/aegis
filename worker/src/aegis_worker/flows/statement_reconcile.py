@@ -80,6 +80,9 @@ class StatementReconcileFlow:
             retry_policy=NO_RETRY,
         )
 
+        # Empty on all but one tick a month: the activity holds the marker and
+        # decides when the digest is due (#464). The flow's only say is
+        # `silent`, which is about delivery, not cadence.
         sent = False
         digest = reconcile.get("digest") or ""
         if digest and not config.silent:

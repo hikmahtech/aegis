@@ -110,6 +110,10 @@ _WIPE = (
     "DELETE FROM finance.statements WHERE file_sha256 = 't'",
     "DELETE FROM finance.reconciled_through WHERE instrument IN ('hdfc-1225','axis-9640')",
     "DELETE FROM settings WHERE key = 'integration:statement_folders'",
+    # The digest's once-a-month marker. A leftover from one test makes the next
+    # one's run produce no digest at all, which is the shape of a passing test
+    # that proves nothing.
+    "DELETE FROM settings WHERE key = 'statement_digest_month'",
 )
 
 
@@ -307,6 +311,13 @@ async def test_a_transfer_sees_the_far_block_its_email_counterpart_promoted(clea
     ) == date(2026, 7, 31)
 
 
+class _S:
+    """The two fields `_coverage_findings` reads off a stored statement."""
+
+    def __init__(self, instrument, start, end):
+        self.instrument, self.period_start, self.period_end = instrument, start, end
+
+
 def test_coverage_never_reports_an_account_that_has_never_sent_a_statement():
     """`axis-cc-1747`, `icici-143` and `nkgsb-843` are declared, have a Drive
     folder, and have never produced a file. Asking "did one arrive last month?"
@@ -315,13 +326,9 @@ def test_coverage_never_reports_an_account_that_has_never_sent_a_statement():
     about a bank that started."""
     from aegis.services import statement_findings
 
-    class _S:
-        def __init__(self, instrument, end):
-            self.instrument, self.period_end = instrument, end
-
     seen = [
-        _S("hdfc-1225", date(2026, 7, 31)),   # sent last month — covered
-        _S("axis-9640", date(2026, 6, 30)),   # sent before, silent last month
+        _S("hdfc-1225", date(2026, 7, 1), date(2026, 7, 31)),   # sent last month
+        _S("axis-9640", date(2026, 6, 1), date(2026, 6, 30)),   # silent since June
     ]
     out = statements_mod._coverage_findings(
         seen, statement_findings, today=date(2026, 8, 20)
@@ -336,14 +343,70 @@ def test_coverage_says_nothing_while_the_month_is_still_young():
     turned over."""
     from aegis.services import statement_findings
 
-    class _S:
-        def __init__(self, instrument, end):
-            self.instrument, self.period_end = instrument, end
-
-    seen = [_S("axis-9640", date(2026, 6, 30))]
+    seen = [_S("axis-9640", date(2026, 6, 1), date(2026, 6, 30))]
     assert statements_mod._coverage_findings(
         seen, statement_findings, today=date(2026, 8, 2)
     ) == []
+
+
+async def test_the_digest_is_produced_once_a_month_not_once_a_day(clean):
+    """#464. The flow ticks daily. `monthly_digest` is §15.4's periodic READ on
+    how the lane is doing — a long per-account list whose counts barely move
+    between days — so sending it daily teaches the reader to skip it, which is
+    the one thing the hub design is trying to avoid.
+
+    The marker is the month, not the day: a tick missed on the 1st still
+    produces the report on the 2nd, and two ticks on one day produce one."""
+    from aegis.services import statement_findings
+    from aegis.services.statement_match import MatchRun
+
+    run = MatchRun(outcomes=(), summaries=(), claimed={})
+
+    first = await statements_mod._due_digest(
+        clean, statement_findings, run, today=date(2026, 9, 1)
+    )
+    assert "Reconciliation digest — 2026-09" in first
+
+    # Same month, later day: the flow ticked again and there is nothing new to
+    # report. An empty digest is what stops the flow sending one.
+    assert await statements_mod._due_digest(
+        clean, statement_findings, run, today=date(2026, 9, 2)
+    ) == ""
+    assert await statements_mod._due_digest(
+        clean, statement_findings, run, today=date(2026, 9, 30)
+    ) == ""
+
+    # The month turns over. Note the day: the first tick of October is the 1st
+    # here, but a missed tick would make it the 2nd and the report still lands.
+    assert "2026-10" in await statements_mod._due_digest(
+        clean, statement_findings, run, today=date(2026, 10, 2)
+    )
+
+
+def test_coverage_accepts_a_billing_period_that_ends_in_the_following_month():
+    """#463. HDFC bills the 5th to the 4th, so August's statement is
+    `2026-08-05..2026-09-04` — it covers all but four days of August and ENDS
+    in September. Comparing end months reported it missing every month it
+    arrived on time, and no statement could ever resolve that. A statement
+    covers a month when its period OVERLAPS the month.
+
+    Both alignments are pinned here — the 5th-to-4th shape and the calendar
+    shape — because the previous fix got one right by breaking the other. So is
+    the other direction: JULY's 5th-to-4th statement overlaps August as well,
+    and must not answer for an August that never arrived."""
+    from aegis.services import statement_findings
+
+    seen = [
+        _S("hdfc-0236", date(2026, 8, 5), date(2026, 9, 4)),    # August's, 5th-to-4th
+        _S("axis-9640", date(2026, 8, 1), date(2026, 8, 31)),   # August's, calendar
+        _S("hdfc-1225", date(2026, 7, 5), date(2026, 8, 4)),    # JULY's — August never came
+        _S("icici-143", date(2026, 6, 1), date(2026, 6, 30)),   # silent since June
+    ]
+    out = statements_mod._coverage_findings(
+        seen, statement_findings, today=date(2026, 9, 20)
+    )
+    assert [f["subject"] for f in out] == ["hdfc-1225", "icici-143"]
+    assert out[0]["payload"]["period"] == "2026-08"
 
 
 async def test_a_statement_posted_block_is_indexed_so_a_late_receipt_cannot_duplicate_it(

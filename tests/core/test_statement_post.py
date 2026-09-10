@@ -554,6 +554,78 @@ async def test_the_balance_check_passes_on_a_statement_holding_a_counterpart(tmp
 
 
 @pytest.mark.asyncio
+async def test_a_statement_of_nothing_but_counterparts_is_still_balance_checked(tmp_path):
+    """#461. `post_statement` returned before the check whenever the run wrote
+    nothing. That guard predates step 6, when the only way to write nothing was
+    to have no rows — but a statement whose every row is a
+    `transfer_counterpart` also writes nothing, and it is not empty. It is a
+    statement whose money the far side already put in the books.
+
+    Two things went with the check. Nothing was ever written here, so the whole
+    check reduces to whether the far side moved the amount the bank printed
+    against THIS account — see the falsification below, which is the only
+    question an all-counterpart statement can answer and was never asked. And
+    `reconcile_statements` moves the watermark only on `balance_checked`, so
+    the statement was re-attempted every tick, for ever.
+
+    Note the `_imps_pair` fixture above carries a salary row for this reason —
+    it says so — which is the workaround this removes.
+    """
+    cfg = _repo(tmp_path)
+    axis_row = _row(4, "100000.00", instrument="axis-9640", balance="-100000.00",
+                    narration="IMPS/612345678905/TO XXXXXXXXXX1225")
+    hdfc_row = _row(4, "100000.00", direction="in", balance="100000.00",
+                    narration="IMPS/612345678905/FROM XXXXXXXXXXX9640")
+    axis = _statement([axis_row], "-100000.00", instrument="axis-9640")
+    hdfc = _statement([hdfc_row], "100000.00")
+
+    await statement_post.post_statement(
+        axis, {}, cfg, entity="personal", peer_rows=hdfc.rows,
+    )
+    result = await statement_post.post_statement(
+        hdfc, {}, cfg, entity="personal", peer_rows=axis.rows,
+    )
+
+    assert result.posted == [] and result.promoted == []
+    assert (hdfc_row.row_id, TRANSFER) in result.skipped
+    assert result.balance_checked is True, "writing nothing is not a reason to skip §9.3"
+    assert result.balance_reason == ""
+    # And the money is in the books exactly once, which is what it was checked
+    # against — not against a second copy this statement wrote to have something
+    # to check.
+    assert (cfg.path / "personal" / "2026.journal").read_text().count("₹100000.00") == 1
+
+
+@pytest.mark.asyncio
+async def test_the_counterpart_only_check_can_actually_fail(tmp_path):
+    """The falsification of the test above — a check that cannot fail proves
+    nothing, and this one nearly could not.
+
+    The far side landed ₹1,00,000 against this account and the bank says the
+    period moved ₹1,10,000. Nothing here was written, `unwritten` is zero
+    because the far block is real and inside the window, so the whole check
+    comes down to whether the far side moved the amount the bank printed. That
+    is the one question an all-counterpart statement exists to answer, and
+    before #461 it was never asked.
+    """
+    cfg = _repo(tmp_path)
+    axis_row = _row(4, "100000.00", instrument="axis-9640", balance="-100000.00",
+                    narration="IMPS/612345678905/TO XXXXXXXXXX1225")
+    hdfc_row = _row(4, "100000.00", direction="in", balance="100000.00",
+                    narration="IMPS/612345678905/FROM XXXXXXXXXXX9640")
+    axis = _statement([axis_row], "-100000.00", instrument="axis-9640")
+    wrong = _statement([hdfc_row], "110000.00")
+
+    await statement_post.post_statement(
+        axis, {}, cfg, entity="personal", peer_rows=[hdfc_row],
+    )
+    with pytest.raises(books.BooksCheckError):
+        await statement_post.post_statement(
+            wrong, {}, cfg, entity="personal", peer_rows=axis.rows,
+        )
+
+
+@pytest.mark.asyncio
 async def test_adding_a_counterpart_back_would_revert_a_correct_statement(tmp_path, monkeypatch):
     """The falsification of the test above, kept rather than done once by hand.
 
