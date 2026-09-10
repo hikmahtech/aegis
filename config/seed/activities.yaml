@@ -119,6 +119,7 @@ activities:
     schedule_cron: "30 5 * * *"
     config:
       post: false
+      since: "2026-07-01"
       silent: false
     active: false
 

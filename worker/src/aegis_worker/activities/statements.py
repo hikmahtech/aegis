@@ -17,7 +17,9 @@ reported failure, never a silent zero.
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping
 from dataclasses import dataclass
+from datetime import date
 from pathlib import Path
 from typing import Any
 
@@ -102,6 +104,151 @@ class StatementActivities:
             ],
         }
 
+    @activity.defn
+    async def reconcile_statements(self, post: bool = False, since: str = "") -> dict:
+        """Match every stored row, post what is not yet reconciled, report the rest.
+
+        One activity for the whole run, not one per statement. The journal pool
+        is shared across statements by design (spec §8.1): a transaction claimed
+        by July's statement must not be offered to August's, and that is only
+        true if they are matched together. Splitting the match per statement
+        would also put a few thousand rows and their candidates through the
+        workflow history on every hop.
+
+        `post` false is a real run that writes nothing: it matches, it reports
+        findings, and it produces the digest. That is the mode a person reads
+        before letting a schedule touch the books.
+        """
+        from aegis.services import books, statement_findings, statement_match, statement_post
+        from aegis.services.reconciled import mark_reconciled
+
+        accounts = await _folder_config(self.db_pool)
+        if not accounts or self.books_cfg is None:
+            return {"status": "skipped", "reason": "not_configured", "statements": 0}
+
+        statements = await load_statements(self.db_pool)
+        rows = [r for s in statements for r in s.rows]
+        if not rows:
+            return {"status": "ok", "statements": 0, "posted": 0, "promoted": 0, "findings": {}}
+
+        declared = await books.declared_accounts(self.books_cfg)
+        rules = books.load_rules(self.books_cfg.path / "rules" / "accounts.yaml")
+        # Without these every foreign-currency candidate reports itself
+        # unrateable and §8.5 silently matches nothing. The rates exist; a
+        # caller that forgets to pass them gets a clean-looking run with a
+        # whole class of rows missing from it.
+        rates = books.latest_prices(self.books_cfg)
+
+        run = statement_match.match_statements(
+            rows,
+            await statement_match.load_candidates(
+                self.db_pool,
+                start=min(r.occurred_on for r in rows),
+                end=max(r.occurred_on for r in rows),
+                declared=declared,
+            ),
+            declared=declared,
+            entity_for_instrument=_entity_map(accounts),
+            rates=rates,
+        )
+        outcomes = {o.row_id: o for o in run.outcomes}
+
+        scope = _Scope(since=date.fromisoformat(since) if since else None)
+        done = {
+            r["statement_id"]
+            for r in await self.db_pool.fetch(
+                "SELECT statement_id FROM finance.statements WHERE reconciled_at IS NOT NULL"
+            )
+        }
+        posted = promoted = 0
+        results: list[dict] = []
+        for statement in statements:
+            if statement.statement_id in done:
+                continue
+            if not scope.covers(statement):
+                results.append({"statement": statement.statement_id, "status": "out_of_scope"})
+                continue
+            if not post:
+                continue
+            account = accounts.get(statement.instrument) or {}
+            try:
+                result = await statement_post.post_statement(
+                    statement,
+                    {rid: o for rid, o in outcomes.items() if o.statement_id == statement.statement_id},
+                    self.books_cfg,
+                    entity=account.get("post_entity") or "personal",
+                    rules=rules,
+                    liability=books.instrument_account(
+                        statement.instrument, declared
+                    ).startswith("liabilities:"),
+                )
+            except books.BooksCheckError as exc:
+                # §15.4: a closing-balance mismatch is an arrival-time event,
+                # not a sweep finding. The whole statement reverted; the
+                # problem stays open until a later statement for this account
+                # reconciles.
+                await statement_findings.record_closing_balance(
+                    self.db_pool,
+                    statement_id=statement.statement_id,
+                    instrument=statement.instrument,
+                    reason=str(exc),
+                )
+                results.append({"statement": statement.statement_id, "status": "reverted"})
+                continue
+
+            posted += len(result.posted)
+            promoted += len(result.promoted)
+            results.append(
+                {
+                    "statement": statement.statement_id,
+                    "status": "posted",
+                    "posted": len(result.posted),
+                    "promoted": len(result.promoted),
+                    "balance_checked": result.balance_checked,
+                }
+            )
+            # Only a statement the bank's own figures agreed with may move the
+            # watermark. A card with no printed balances proves itself through
+            # §6.2's arithmetic instead, which the parser already ran — but a
+            # statement that could not be checked at all must not close a
+            # period against later email evidence.
+            if result.balance_checked:
+                await mark_reconciled(
+                    self.db_pool,
+                    statement.instrument,
+                    statement.period_end,
+                    statement_id=statement.statement_id,
+                )
+                await self.db_pool.execute(
+                    "UPDATE finance.statements SET reconciled_at = now() WHERE statement_id = $1",
+                    statement.statement_id,
+                )
+            await statement_findings.clear_closing_balance(
+                self.db_pool,
+                statement_id=statement.statement_id,
+                instrument=statement.instrument,
+            )
+
+        findings = statement_findings.match_findings(run)
+        swept = await statement_findings.sweep(
+            self.db_pool,
+            findings,
+            # Say which kinds this tick evaluated. A kind left out arrives as an
+            # empty findings list, and an empty list is what resolves every open
+            # problem of that kind — so a match-only run that stayed quiet would
+            # report every locked statement as fixed.
+            kinds=(statement_findings.INSTRUMENT, statement_findings.CURRENCY),
+        )
+        return {
+            "status": "ok",
+            "statements": len(statements),
+            "posted": posted,
+            "promoted": promoted,
+            "results": results,
+            "findings": {k: v.get("fresh_count", v) for k, v in swept.items()},
+            "digest": statement_findings.monthly_digest(run),
+        }
+
 
 async def load_statements(pool: Any) -> list[Any]:
     """Every stored statement, rebuilt with its rows attached.
@@ -143,3 +290,25 @@ async def load_statements(pool: Any) -> list[Any]:
             )
         )
     return out
+
+
+def _entity_map(accounts: Mapping[str, Any]) -> dict[str, Any]:
+    """instrument -> the entities pass 2b may consider for it (spec §8.1)."""
+    return {k: v.get("entities") or [] for k, v in accounts.items()}
+
+
+@dataclass
+class _Scope:
+    """Which statements this run is allowed to post.
+
+    A Drive folder holds every statement the bank ever sent, and spec §2 scopes
+    the lane to the period the books cover. The folder currently holds an
+    FY2024-25 Axis statement of 1,619 rows that predates the books by two
+    years: posting it is a decision about what the ledger is FOR, not something
+    a schedule should do because the file happened to be there.
+    """
+
+    since: date | None = None
+
+    def covers(self, statement: Any) -> bool:
+        return self.since is None or statement.period_start >= self.since

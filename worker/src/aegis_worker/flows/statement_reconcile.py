@@ -47,6 +47,13 @@ class StatementReconcileConfig:
     agent_id: str = "maou"
     #: Write to the books. Off until an operator has read a dry run.
     post: bool = False
+    #: ISO date. Statements whose period starts before it are matched and
+    #: reported but never posted. The Drive folder holds every statement the
+    #: bank ever sent, including an FY2024-25 Axis statement of 1,619 rows that
+    #: predates the books by two years — posting that is a decision about what
+    #: the ledger is for, not something a schedule does because the file is
+    #: there. Empty means no limit.
+    since: str = ""
     #: Send the digest to the agent's channel.
     silent: bool = False
 
@@ -68,7 +75,7 @@ class StatementReconcileFlow:
         # as its own work. A failure here is for a human to read.
         reconcile = await workflow.execute_activity(
             "reconcile_statements",
-            args=[config.post],
+            args=[config.post, config.since],
             start_to_close_timeout=_RECONCILE,
             retry_policy=NO_RETRY,
         )

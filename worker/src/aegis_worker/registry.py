@@ -518,6 +518,7 @@ FLOWS: tuple[FlowSpec, ...] = (
         lambda act: StatementReconcileConfig(
             agent_id=act["agent_id"],
             post=bool(act["config"].get("post", False)),
+            since=str(act["config"].get("since", "") or ""),
             silent=bool(act["config"].get("silent", False)),
         ),
         feature_flag="money_hygiene_enabled",
