@@ -26,20 +26,34 @@ so out loud: a substring check on `Credit Card` once misfiled nine current
 account statements. A bare four-digit scan is the same class of bug, but worse,
 because it fails SILENTLY — the money lands in an asset or liability account the
 owner really holds, so §9.3's closing-balance check still passes and nothing
-downstream ever asks again. Four conditions guard it, and every one of them was
+downstream ever asks again. Five conditions guard it, and every one of them was
 written against a narration that really appears in the fixtures:
 
 1. **A transfer marker** must be in the narration. See `_MARKER_RE`.
-2. **The digits must be a whole run**, not a slice of a longer one. Every real
-   reference is a long unbroken number — `UPI/P2A/612345678901/…`,
-   `ATW-412345678901-…` — and a slice-based scan reads a tail out of every one
-   of them.
-3. **Exactly one declared account may match**, after the row's own account is
+2. **A mask must introduce the digits.** `XXXX 1313` yes, `INV 143` no. A bank
+   prints a masked account number WITH its mask and prints a reference bare
+   after a separator, so the mask is what tells the two apart. See
+   `_MASKED_RUN`.
+3. **A bank named right after the account must be OUR bank.**
+   `X071225/HDFCBANKLTD/` and `X0843/CANARABANK/` are the same shape, both
+   masked, and only the bank name says the second is a stranger's. See
+   `_foreign_bank_named`.
+4. **Exactly one declared account may match**, after the row's own account is
    removed. Two matches is a chart that spells one tail twice, and picking one
    is a coin toss.
-4. **Never the row's own account.** `UPI-987654321012-SPECIMEN STORE.-EXAM-
+5. **Never the row's own account.** `UPI-987654321012-SPECIMEN STORE.-EXAM-
    XXXXXXXXXX4321-PAYMENT` on the `…4321` statement echoes the payer's own
    masked number, which is the account the row is already posted against.
+
+Guards 2 and 3 are what an adversarial read of the first version found missing.
+The chart declares three-digit tails (`icici-143`, `nkgsb-843`) and, after
+zero-stripping, `0236` and `0325` answer to bare `236` and `325`. So `INV 143`,
+`PO 236`, `FLAT 325` and `TRF TO FD 843.00` each resolved to a real account the
+owner holds. A client paying an invoice was recorded as the owner moving their
+own money: the income vanished, `icici:143` drifted negative, and BOTH
+closing-balance checks still passed, because both accounts are real and the
+journal balances. `icici-143` and `nkgsb-843` send no statements at all, so
+that side is never independently checked either.
 """
 
 from __future__ import annotations
@@ -71,31 +85,48 @@ CLEARING_ACCOUNT = "equity:transfers"
 #: transfer between accounts the owner holds.
 _OWN_PREFIXES = ("assets:bank:", "liabilities:card:")
 
-#: A masked account tail is three to six digits: the chart declares `843`,
-#: `143`, `1225`, `9640`, `1313`, and a bank writes a padded `X0843` for the
-#: first of those. Nothing shorter is a tail and nothing longer is either — a
-#: longer run is a reference, an amount or a date.
-_MIN_TAIL, _MAX_TAIL = 3, 6
-
-_DIGIT_RUN = re.compile(r"\d+")
-
-#: A run of digits that a mask character introduces. Guard 2 refuses to read a
-#: tail out of the END of a longer number, because every reference number in a
-#: narration is a long unbroken run and a suffix scan reads a tail out of all of
-#: them. But that refusal also threw away the commonest real shape:
-#: `IMPS/P2A/612345678901/<name>/X071225/HDFCBANKLTD/` is a genuine transfer to
-#: the owner's own `…1225`, and `books._same_tail` strips leading zeros only, so
-#: `1225` never equalled `071225`. Production holds over ₹400,000 of these.
+#: Fewer visible digits than this is not an account tail. The chart's shortest
+#: is three (`icici-143`, `nkgsb-843`).
 #:
-#: The mask is what separates the two, and not by luck: a bank PRINTS a masked
-#: account number with its mask and prints a reference bare after a separator.
-#: So a suffix match is allowed only here — `X071225` yes, `/612345678901/` no,
-#: which leaves guard 2 fully intact for every reference number.
+#: It stays at three. Raising it to four would make those two accounts silently
+#: unmatchable, which is a different bug wearing the same fix. What stops a
+#: three-digit collision is guard 2, not a length: `INV 143` carries no mask,
+#: so it is not read as an account at all.
+#:
+#: There is no maximum any more. The old one capped a run at six digits to stop
+#: a bare reference number being read as a tail — a job guard 2 now does
+#: completely, and does better, since a bare run of ANY length is refused. A cap
+#: at six was also exactly the longest run ever seen (`X071225`), so the next
+#: bank that prints seven would have missed.
+_MIN_TAIL = 3
+
+#: A run of digits that a mask introduces — the ONLY thing read as an account
+#: number. This is guard 2, and it is what makes the difference between a
+#: masked account and a reference structural rather than lucky: a bank PRINTS a
+#: masked account number with its mask, and prints a reference bare after a
+#: separator. `XXXX 1313` yes, `INV 143` no, `/612345678901/` no.
+#:
+#: The digits may run PAST the chart's own tail, so a suffix match is allowed
+#: here and nowhere else. `IMPS/P2A/612345678901/<name>/X071225/HDFCBANKLTD/`
+#: is a genuine transfer to the owner's own `…1225`, and `books._same_tail`
+#: strips leading zeros only, so `1225` never equalled `071225`. Production
+#: holds over ₹400,000 of these.
 #:
 #: The mask width varies within one bank and a space may follow it: `X071225`,
 #: `XX 1313`, `XXXX 1313`, `XXXXXXXXXXX9640` are all real. A regex fixed at four
 #: `X`s misses half the rows.
-_MASKED_RUN = re.compile(r"[X*]+\s*(\d+)")
+#:
+#: A mask is a field of its own, so it never starts inside a word. Without the
+#: lookbehind a single `X` makes `TRF TO MAX 843` a transfer to the owner's
+#: NKGSB account — the same false positive the guard exists to stop, reached
+#: through the guard itself.
+_MASKED_RUN = re.compile(r"(?<![A-Z0-9])[X*]+\s*(\d+)")
+
+#: The field a bank prints immediately after a masked account number. These
+#: formats separate fields with `/`, `-` or a space: `X071225/HDFCBANKLTD/`,
+#: `X0843/CANARABANK/`, `XXXXXXXXXXX9640-IMPS`, `XXXX 1313 REF#…`. One
+#: separator, then the field up to the next one.
+_NEXT_FIELD = re.compile(r"[\s/|,:-]+([A-Z][A-Z0-9.&']*)")
 
 #: The narration must say this is a transfer before a tail in it is read as an
 #: account. This is a deliberate extra condition, beyond what §8.4 asks for.
@@ -109,9 +140,11 @@ _MASKED_RUN = re.compile(r"[X*]+\s*(\d+)")
 #:
 #: Every narration in the class carries a marker, because a marker is how banks
 #: label a transfer: `CREDITCARD PAYMENT XXXX 1313`, `IMPS/…`, `NEFT/…`,
-#: `SWEEP TO DEPOSIT`. What the marker turns away is the shape that has no other
-#: guard: a third-party UPI handle or merchant string that happens to end in a
-#: standalone group of digits matching a declared tail.
+#: `SWEEP TO DEPOSIT`. What the marker turns away is the shape guard 2 cannot,
+#: because it carries a real mask: a card purchase printing the masked CARD
+#: number, `POS XXXX 1313 SPECIMEN STORE`. That is a purchase, not a transfer.
+#: On the card's own statement `exclude` would remove it; on a bank statement
+#: nothing else would.
 #:
 #: Word-bounded and case-sensitive against the normalised (uppercase) narration.
 #: `\bFT\b` does not fire inside `GIFT`; `IGNORECASE` would let `ft` in a street
@@ -140,6 +173,40 @@ class PairedRow:
     posts: bool
 
 
+def _foreign_bank_named(text: str, after: int, account: str) -> bool:
+    """Does the field right after a masked account name a DIFFERENT bank?
+
+    `X071225/HDFCBANKLTD/` is the owner's own HDFC account and
+    `X0843/CANARABANK/` is a stranger's. The two shapes are identical — same
+    marker, same mask, same digits answering to a declared tail — and only the
+    bank name separates them. So where the narration names a bank there, it
+    must be the bank the CHART puts on the candidate: `assets:bank:hdfc:1225`
+    → `hdfc` → `HDFC` inside `HDFCBANKLTD`. That side of the test needs no
+    vocabulary at all; the chart supplies it.
+
+    Deciding the field IS a bank name is structural too, not a list of banks. A
+    list would have to name every bank in India and would still miss the next
+    one. India's Banking Regulation Act makes a banking company carry `bank` in
+    its registered name, and this field prints that name, so every bank in the
+    evidence carries it — `HDFCBANKLTD`, `ICICIBANK`, `CANARABANK`,
+    `ALLAHABADBANK` — while nothing else ever seen at this position does:
+    `IMPS`, `REF`, `TO`, `PAYMENT`, `TRANSFER`.
+
+    Two things it deliberately does not do, both failing towards a miss rather
+    than a false match. A four-letter IFSC code (`UTIB`, `CNRB`) carries no
+    `BANK` and is not read as one, because at this position it is
+    indistinguishable from `IMPS` or `NEFT` — and the one real narration that
+    prints a code puts it BEFORE the account, where this never looks. And a
+    chart segment the bank does not spell out would read as a different bank
+    and refuse; the row then falls through to `books.apply_rules`, lands in
+    `expenses:unknown` and stays reclassifiable, which is the cheap failure.
+    """
+    field = _NEXT_FIELD.match(text, after)
+    if not field or "BANK" not in field.group(1):
+        return False
+    return account.split(":")[2].upper() not in field.group(1)
+
+
 def own_account(
     narration: str, declared: Collection[str], *, exclude: str | None = None
 ) -> str | None:
@@ -149,12 +216,18 @@ def own_account(
     the row's own instrument account: a row cannot be a transfer to itself, and
     a UPI narration routinely echoes the payer's own masked number.
 
-    The module docstring lists the four guards and the evidence for each. Two
+    The module docstring lists the five guards and the evidence for each. Three
     implementation notes:
 
+    A mask is the only way in. There is no bare-digit pass, so an invoice, a
+    purchase order, a flat number and a fixed-deposit amount cannot name an
+    account however well their digits line up with the chart.
+
     `books._same_tail` rather than `books._declared_with_tail`, which is the
-    same comparison but returns the FIRST of several matches. Guard 3 needs to
-    know there were several, so it counts them here instead.
+    same comparison but returns the FIRST of several matches. Guard 4 needs to
+    know there were several, so it counts them here instead. Beside it sits the
+    suffix rule for a masked run that is LONGER than the chart's tail: the mask
+    hides the front of the number, so the chart's tail is its last digits.
 
     The tails are collected across the whole narration before anything is
     decided. A narration naming both accounts — the payer's own and the
@@ -166,18 +239,17 @@ def own_account(
         return None
     own = [a for a in sorted(declared) if a.startswith(_OWN_PREFIXES)]
     found: set[str] = set()
-    for run in _DIGIT_RUN.findall(text):
-        if not (_MIN_TAIL <= len(run) <= _MAX_TAIL):
+    for mask in _MASKED_RUN.finditer(text):
+        run = mask.group(1)
+        if len(run) < _MIN_TAIL:
             continue
         for account in own:
-            if books._same_tail(account.rpartition(":")[2], run):
-                found.add(account)
-    # The masked suffix, which whole-run matching alone cannot reach.
-    for run in _MASKED_RUN.findall(text):
-        for account in own:
             tail = account.rpartition(":")[2]
-            if len(run) > len(tail) and run.endswith(tail):
-                found.add(account)
+            if not (books._same_tail(tail, run) or (len(run) > len(tail) and run.endswith(tail))):
+                continue
+            if _foreign_bank_named(text, mask.end(), account):
+                continue
+            found.add(account)
     found.discard(exclude or "")
     return found.pop() if len(found) == 1 else None
 

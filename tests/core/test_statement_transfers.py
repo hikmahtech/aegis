@@ -4,11 +4,16 @@ Row ↔ row matching, with no repo and no journal: these are the decisions the
 writer in `statement_post` then acts on, and §8.4 says they are the ones to
 test first.
 
-Every case here is falsifiable against a specific line of the module. The three
-guards on `own_account` each have a test that a naive implementation passes and
-this one does not — a substring scan resolves the invoice number, a
-marker-blind scan resolves the merchant handle, a self-blind scan resolves the
-payer's own masked account.
+Every case here is falsifiable against a specific line of the module. Each
+guard on `own_account` has a test that a naive implementation passes and this
+one does not — a substring scan resolves the invoice number, a marker-blind
+scan resolves the merchant handle, a mask-blind scan resolves `INV 143` into
+the owner's ICICI account, a bank-blind scan resolves a stranger's
+`X0843/CANARABANK/` into the owner's NKGSB account, and a self-blind scan
+resolves the payer's own masked account.
+
+`_REAL_NARRATIONS` at the foot of the file is the whole decision surface in one
+table, judged against the real chart.
 """
 
 from __future__ import annotations
@@ -127,12 +132,12 @@ def test_a_declared_tail_inside_a_longer_number_does_not_resolve():
 
 
 def test_a_third_party_handle_carrying_a_declared_tail_does_not_resolve():
-    """Guard 1, and the one a marker-blind scan fails.
+    """A merchant's UPI handle carrying a declared tail, refused twice over.
 
-    `9640` here IS a standalone group of digits — it survives guard 2 — and it
-    is a declared account tail. What it is not is a transfer: it is a merchant's
-    UPI handle. The narration never says the money moved between two accounts
-    the owner holds, so the tail in it is not read as one.
+    `9640` here is a declared account tail sitting in a merchant handle. Guard 1
+    turns it away because `UPI` is not a transfer marker, and guard 2 turns it
+    away because nothing masks the digits. `POS XXXX 1313 SPECIMEN STORE` in
+    `_REAL_NARRATIONS` is the case only guard 1 can reach.
     """
     assert transfers.own_account("UPI/P2M/712345678901/SHOP-9640@YBL/PAY", DECLARED) is None
 
@@ -302,41 +307,119 @@ def test_an_undeclared_clearing_account_falls_back_and_still_nets_to_zero():
     assert transfers.reversal_account(DECLARED, "personal") == "equity:transfers"
 
 
-#: Every own-account shape production actually prints, and what each must
-#: resolve to. One table so the whole decision surface is readable at once —
-#: the two rejections matter as much as the four matches, and both directions
-#: of the guard were got wrong first.
+#: The real chart (§"Chart of accounts"), so the table below is judged against
+#: the accounts that actually exist — including the two THREE-digit tails,
+#: which are where this went wrong.
+REAL_CHART = frozenset(
+    {
+        "assets:bank:hdfc:1225",
+        "assets:bank:hdfc:0236",
+        "assets:bank:hdfc:0325",
+        "assets:bank:nkgsb:843",
+        "assets:bank:axis:9640",
+        "assets:bank:icici:143",
+        "assets:bank:hsbc",
+        "liabilities:card:axis:1313",
+        "liabilities:card:axis:1747",
+        "liabilities:card:hsbc",
+    }
+)
+
+#: Every own-account shape production prints, and what each must resolve to.
+#: One table so the whole decision surface is readable at once — the rejections
+#: matter more than the matches, and both directions of the guard were got
+#: wrong first.
+#:
+#: No `exclude` here, so each shape is judged on the narration alone. The
+#: row's-own-account rule has its own test, above.
 _REAL_NARRATIONS = [
+    # ------------------------------------------------ must resolve
     # A masked account number whose visible digits run past the chart's tail.
     # `books._same_tail` strips leading zeros only, so `1225` never equalled
     # `071225` and this — the commonest shape, over ₹400,000 of transfers into
-    # the owner's own HDFC account — silently missed.
+    # the owner's own HDFC account — silently missed. The bank named after it
+    # is ours, so guard 3 lets it through.
     ("IMPS/P2A/612345678901/SPECIMEN NAME/X071225/HDFCBANKLTD/", "assets:bank:hdfc:1225"),
-    # Eleven mask characters, no space.
+    # Eleven mask characters, no space. The field after the account is `IMPS`,
+    # not a bank, so guard 3 does not apply — and must not, or every narration
+    # that names no bank would be refused.
     ("IMPS-612345678901-SPECIMEN CO.-UTIB-XXXXXXXXXXX9640-IMPS", "assets:bank:axis:9640"),
-    # The mask width varies within one bank and a space may follow it.
+    # The mask width varies within one bank and a space may follow it. `REF#…`
+    # is not a bank name either.
     ("CREDITCARD PAYMENT XXXX 1313 REF#HZMXVP0W9EQHO3", "liabilities:card:axis:1313"),
     ("CREDITCARD PAYMENT XX 1313 REF#VQWJY7KMAO4B86", "liabilities:card:axis:1313"),
+    # ------------------------------------------------ must NOT resolve
+    # The four that money coming IN gets wrong. A client pays Hikmah and writes
+    # the invoice, PO or flat number in the narration; the digits answer to a
+    # declared tail after zero-stripping. Recorded as a transfer, the income
+    # disappears and the far account drifts — and both closing-balance checks
+    # still pass, because both accounts are real. No mask, so no match.
+    ("NEFT/N226092112345678/ACME PVT LTD/INV 143", None),
+    ("NEFT/N226092112345678/ACME PVT LTD/INV-843", None),
+    ("RTGS/UTIBR52024090812345/CLIENT CO/PO 236", None),
+    ("IMPS/P2A/612345678901/RAVI KUMAR/FLAT 325/", None),
+    # An AMOUNT that contains a declared tail. Same reason: no mask.
+    ("TRF TO FD 843.00 CHARGES", None),
+    # An IFSC branch code carries the bank's own digits. `ICIC0DC0143` ends in
+    # `143`, which is the chart's ICICI tail, and the code is not masked.
+    ("NEFT CR-ICIC0DC0143-SOME PAYER-PAYMENT", None),
+    # A single `X` INSIDE a word is not a mask. Without the lookbehind on
+    # `_MASKED_RUN` this reaches the NKGSB account through the mask guard
+    # itself.
+    ("TRF TO MAX 843 SPECIMEN", None),
+    # A masked number with NO transfer marker — the one shape only guard 1 can
+    # reach. A card purchase prints the masked CARD number, and it collides
+    # with the declared card tail. On the card's own statement `exclude` would
+    # remove it; on a bank statement nothing else would.
+    ("POS XXXX 1313 SPECIMEN STORE", None),
+    # The two the mask cannot catch, because they carry one. Both are somebody
+    # else's account, and only the bank named right after the number says so.
+    ("IMPS/P2A/612345678901/RAVI KUMAR/XXXXXX1225/ICICIBANK/", None),
+    ("IMPS/P2A/612345678901/RAVI KUMAR/X0843/CANARABANK/", None),
+    # A third party whose masked tail happens not to name a declared account —
+    # refused twice over, by the digits and by `ALLAHABADBANK`.
+    ("IMPS/P2A/612345678901/OTHER PARTY/ X180925/ALLAHABADBANK/OTHER", None),
     # A DATE written ddmmyy contains a declared tail. Filing this as a transfer
     # to a child's savings account passes every downstream check, because the
     # account is real — which is why the marker gate exists.
     ("POS/GOOGLE PLAY SER C/612345678901/010325/14:22/612345678901", None),
-    # A third party whose own masked tail does not name a declared account.
-    ("IMPS/P2A/612345678901/OTHER PARTY/ X180925/ALLAHABADBANK/OTHER", None),
     # A bare reference number that happens to END in a declared tail. No mask,
-    # so the suffix path must not reach it — this is what guard 2 protects and
-    # what the masked-suffix path must not undo.
+    # so the suffix rule must not reach it.
     ("IMPS/P2A/612345671225/SPECIMEN NAME/OTHERBANK/", None),
 ]
 
 
 @pytest.mark.parametrize("narration,expected", _REAL_NARRATIONS)
 def test_own_account_over_every_real_narration_shape(narration, expected):
-    declared = {
-        "assets:bank:hdfc:1225",
-        "assets:bank:hdfc:0325",
-        "assets:bank:hdfc:0236",
-        "assets:bank:axis:9640",
-        "liabilities:card:axis:1313",
-    }
-    assert transfers.own_account(narration, declared) == expected
+    assert transfers.own_account(narration, REAL_CHART) == expected
+
+
+def test_a_masked_number_followed_by_another_bank_is_not_ours():
+    """Guard 3, stated on its own because the table cannot show the contrast.
+
+    Two narrations of the SAME shape — marker, mask, digits answering to a
+    declared tail — and the bank name is the only thing that separates the
+    owner's own account from a stranger's.
+    """
+    ours = "IMPS/P2A/612345678901/SPECIMEN NAME/X071225/HDFCBANKLTD/"
+    theirs = "IMPS/P2A/612345678901/RAVI KUMAR/XXXXXX1225/ICICIBANK/"
+    assert transfers.own_account(ours, REAL_CHART) == "assets:bank:hdfc:1225"
+    assert transfers.own_account(theirs, REAL_CHART) is None
+
+
+def test_a_three_digit_tail_still_resolves_when_the_narration_earns_it():
+    """The minimum tail stays at three.
+
+    `icici-143` and `nkgsb-843` are real declared accounts. Raising `_MIN_TAIL`
+    to four would make the false positives above disappear by making these two
+    unmatchable, which is a different bug wearing the same fix. Masked and with
+    our own bank named, they resolve.
+    """
+    assert (
+        transfers.own_account("SWEEP TO DEPOSIT X0843", REAL_CHART)
+        == "assets:bank:nkgsb:843"
+    )
+    assert (
+        transfers.own_account("NEFT/N226092112345678/SELF/XXXXXX143/ICICIBANK/", REAL_CHART)
+        == "assets:bank:icici:143"
+    )
