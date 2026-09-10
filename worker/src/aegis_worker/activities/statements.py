@@ -411,6 +411,12 @@ async def load_statements(pool: Any) -> list[Any]:
 #: that says nothing except that the calendar turned over.
 _COVERAGE_GRACE_DAYS = 8
 
+#: How long an account may stay quiet before its next statement is overdue. A
+#: month plus slack for a bank that bills on the 31st — the question is "has
+#: this account had time to send another?", and 35 days is the shortest span
+#: for which the answer is yes whatever day of the month it bills on.
+_CYCLE_DAYS = 35
+
 
 def _coverage_findings(statements, findings_mod, *, today: date) -> list[dict]:
     """§15.4's `statement_missing`: which accounts stopped sending.
@@ -449,8 +455,19 @@ def _coverage_findings(statements, findings_mod, *, today: date) -> list[dict]:
         for s in statements
         if s.period_start <= midpoint <= s.period_end
     }
+    # And do not ask an account about a month whose statement its own cycle has
+    # not had time to produce. HDFC bills the 12th to the 11th, so August's
+    # statement is only ISSUED on 11 September — the calendar grace above opens
+    # the question on the 9th, and the account is reported missing for two days
+    # every month and then resolves. `_COVERAGE_GRACE_DAYS` waits out the
+    # month; this waits out the ACCOUNT, which is the thing actually sending.
+    latest: dict[str, date] = {}
+    for s in statements:
+        if s.period_end > latest.get(s.instrument, date.min):
+            latest[s.instrument] = s.period_end
+    fresh = {i for i, end in latest.items() if (today - end).days < _CYCLE_DAYS}
     return findings_mod.missing_statement_findings(
-        ever, covered, period=month_start.strftime("%Y-%m")
+        ever, covered | fresh, period=month_start.strftime("%Y-%m")
     )
 
 

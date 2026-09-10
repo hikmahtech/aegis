@@ -383,6 +383,35 @@ async def test_the_digest_is_produced_once_a_month_not_once_a_day(clean):
     )
 
 
+def test_coverage_waits_out_the_accounts_own_cycle_not_just_the_calendar():
+    """The live case #463's fix moved rather than removed, caught by checking
+    the fix against the real statement table before calling it done.
+
+    `hdfc-1225` bills the 12th to the 11th. The statement covering August is
+    `2026-08-12..2026-09-11`, ISSUED on 11 September — but the calendar grace
+    opens the question on the 9th, so the account is reported missing on the
+    9th and 10th and resolves on the 11th. Every month. That is the same
+    monthly false task #463 was filed to remove, two days long instead of
+    permanent.
+
+    `_COVERAGE_GRACE_DAYS` waits out the MONTH. This waits out the ACCOUNT,
+    which is the thing actually sending, and it works for any billing day.
+    """
+    from aegis.services import statement_findings
+
+    # 31 days since it last reported: not yet overdue, whatever the month says.
+    recent = [_S("hdfc-1225", date(2026, 7, 12), date(2026, 8, 11))]
+    assert statements_mod._coverage_findings(
+        recent, statement_findings, today=date(2026, 9, 11)
+    ) == []
+
+    # Still nothing five weeks later, and now it really has stopped.
+    out = statements_mod._coverage_findings(
+        recent, statement_findings, today=date(2026, 9, 20)
+    )
+    assert [f["subject"] for f in out] == ["hdfc-1225"]
+
+
 def test_coverage_accepts_a_billing_period_that_ends_in_the_following_month():
     """#463. HDFC bills the 5th to the 4th, so August's statement is
     `2026-08-05..2026-09-04` — it covers all but four days of August and ENDS
