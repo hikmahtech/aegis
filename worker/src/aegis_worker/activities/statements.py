@@ -40,6 +40,11 @@ _STATEMENT_MAILBOX = "statement"
 #: are edited apart.
 FOLDER_SETTING = "integration:statement_folders"
 
+#: The `YYYY-MM` the reconciliation digest was last produced for. A month, not
+#: a timestamp: what the cadence needs to know is which report has already been
+#: written, and that survives a tick missed on the 1st.
+DIGEST_SETTING = "statement_digest_month"
+
 
 async def _folder_config(pool: Any) -> dict:
     """The account map, or `{}` when the lane has never been configured.
@@ -351,7 +356,9 @@ class StatementActivities:
                 }
                 for k, v in swept.items()
             },
-            "digest": statement_findings.monthly_digest(run),
+            "digest": await _due_digest(
+                self.db_pool, statement_findings, run, today=date.today()
+            ),
         }
 
 
@@ -445,6 +452,37 @@ def _coverage_findings(statements, findings_mod, *, today: date) -> list[dict]:
     return findings_mod.missing_statement_findings(
         ever, covered, period=month_start.strftime("%Y-%m")
     )
+
+
+async def _due_digest(pool: Any, findings_mod, run, *, today: date) -> str:
+    """The digest, at most once a month (#464).
+
+    §15.4 keeps `monthly_digest` as the periodic READ on how the lane is doing —
+    the findings are the actionable surface. The flow ticks daily and produced
+    it on every tick: a long per-account list whose counts barely move between
+    days, which teaches the reader to skip exactly the report they should read.
+
+    The marker is the month the digest was produced FOR, not the day it went
+    out. A tick missed on the 1st still produces the month's report on the 2nd,
+    and two ticks on the same day produce one. A schedule running `silent`
+    still spends the month's marker on a digest the flow drops — that is what
+    silent asks for, and the alternative is teaching this activity about a
+    delivery decision that belongs to the flow.
+    """
+    month = today.strftime("%Y-%m")
+    if await pool.fetchval("SELECT value FROM settings WHERE key = $1", DIGEST_SETTING) == month:
+        return ""
+    digest = findings_mod.monthly_digest(run, period=month)
+    await pool.execute(
+        "INSERT INTO settings (key, value, updated_at) VALUES ($1, $2, NOW()) "
+        "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()",
+        DIGEST_SETTING,
+        # The bare string: the pool's jsonb codec applies `json.dumps` itself,
+        # and pre-dumping it here lands a double-encoded scalar that never
+        # compares equal to the month on the next tick.
+        month,
+    )
+    return digest
 
 
 def _last_month(today: date) -> tuple[date, date]:

@@ -113,6 +113,11 @@ activities:
   # start posting on a schedule until an operator has read what a dry run would
   # write. Turn `active` on to see the findings and the digest; turn `post` on
   # after that.
+  #
+  # `silent` withholds the digest, not the findings — those always reach the
+  # hub. It defaults off because the digest is now produced once a month
+  # (#464), which is the cadence a report on how the lane is doing deserves;
+  # daily is what made it unreadable.
   - slug: money-statements-reconcile
     workflow_type: StatementReconcileFlow
     agent_id: maou

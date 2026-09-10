@@ -110,6 +110,10 @@ _WIPE = (
     "DELETE FROM finance.statements WHERE file_sha256 = 't'",
     "DELETE FROM finance.reconciled_through WHERE instrument IN ('hdfc-1225','axis-9640')",
     "DELETE FROM settings WHERE key = 'integration:statement_folders'",
+    # The digest's once-a-month marker. A leftover from one test makes the next
+    # one's run produce no digest at all, which is the shape of a passing test
+    # that proves nothing.
+    "DELETE FROM settings WHERE key = 'statement_digest_month'",
 )
 
 
@@ -343,6 +347,40 @@ def test_coverage_says_nothing_while_the_month_is_still_young():
     assert statements_mod._coverage_findings(
         seen, statement_findings, today=date(2026, 8, 2)
     ) == []
+
+
+async def test_the_digest_is_produced_once_a_month_not_once_a_day(clean):
+    """#464. The flow ticks daily. `monthly_digest` is §15.4's periodic READ on
+    how the lane is doing — a long per-account list whose counts barely move
+    between days — so sending it daily teaches the reader to skip it, which is
+    the one thing the hub design is trying to avoid.
+
+    The marker is the month, not the day: a tick missed on the 1st still
+    produces the report on the 2nd, and two ticks on one day produce one."""
+    from aegis.services import statement_findings
+    from aegis.services.statement_match import MatchRun
+
+    run = MatchRun(outcomes=(), summaries=(), claimed={})
+
+    first = await statements_mod._due_digest(
+        clean, statement_findings, run, today=date(2026, 9, 1)
+    )
+    assert "Reconciliation digest — 2026-09" in first
+
+    # Same month, later day: the flow ticked again and there is nothing new to
+    # report. An empty digest is what stops the flow sending one.
+    assert await statements_mod._due_digest(
+        clean, statement_findings, run, today=date(2026, 9, 2)
+    ) == ""
+    assert await statements_mod._due_digest(
+        clean, statement_findings, run, today=date(2026, 9, 30)
+    ) == ""
+
+    # The month turns over. Note the day: the first tick of October is the 1st
+    # here, but a missed tick would make it the 2nd and the report still lands.
+    assert "2026-10" in await statements_mod._due_digest(
+        clean, statement_findings, run, today=date(2026, 10, 2)
+    )
 
 
 def test_coverage_accepts_a_billing_period_that_ends_in_the_following_month():
