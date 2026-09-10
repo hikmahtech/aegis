@@ -419,7 +419,7 @@ def _coverage_findings(statements, findings_mod, *, today: date) -> list[dict]:
     Second, wait out `_COVERAGE_GRACE_DAYS` after the month closes before
     asking, so the answer is "it never came" rather than "it is the 2nd".
     """
-    period_end_month = _last_month(today)
+    month_start, month_end = _last_month(today)
     first_of_month = today.replace(day=1)
     if (today - first_of_month).days < _COVERAGE_GRACE_DAYS:
         # Still inside the grace window: say nothing, and — crucially — hand the
@@ -427,20 +427,36 @@ def _coverage_findings(statements, findings_mod, *, today: date) -> list[dict]:
         # open. That is correct: we are not currently claiming any are missing.
         return []
     ever = {s.instrument for s in statements}
-    covered = {s.instrument for s in statements if s.period_end.strftime("%Y-%m") == period_end_month}
-    return findings_mod.missing_statement_findings(ever, covered, period=period_end_month)
+    # A statement covers a month when its period spans the MIDDLE of it. A
+    # bank's billing period is its own business: HDFC bills the 5th to the 4th,
+    # so `2026-08-05..09-04` covers all but four days of August while ENDING in
+    # September. Comparing end months called that account missing every month it
+    # reported on time (#463) — two live false tasks no statement could resolve.
+    # Plain overlap would fix that and break the other direction, because July's
+    # `07-05..08-04` overlaps August too and would cover for an August that
+    # never came. The midpoint is what makes exactly one statement per cycle
+    # answer for each month, whatever day the bank bills on.
+    midpoint = month_start.replace(day=15)
+    covered = {
+        s.instrument
+        for s in statements
+        if s.period_start <= midpoint <= s.period_end
+    }
+    return findings_mod.missing_statement_findings(
+        ever, covered, period=month_start.strftime("%Y-%m")
+    )
 
 
-def _last_month(today: date) -> str:
-    """The calendar month before `today`, as `YYYY-MM`.
+def _last_month(today: date) -> tuple[date, date]:
+    """The first and last day of the calendar month before `today`.
 
     Coverage asks "did a statement arrive for last month?" rather than "for
     this month": a statement for the current month has not been sent yet, so
     asking about it would report every account as missing, every day, until
     the month ended.
     """
-    first = today.replace(day=1)
-    return (first - timedelta(days=1)).strftime("%Y-%m")
+    last = today.replace(day=1) - timedelta(days=1)
+    return last.replace(day=1), last
 
 
 def _entity_map(accounts: Mapping[str, Any]) -> dict[str, Any]:
