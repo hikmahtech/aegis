@@ -14,7 +14,7 @@ from zoneinfo import ZoneInfo
 
 import structlog
 from aegis.api.models.money import MoneyEvent, payee_key
-from aegis.services import books, ledger_write
+from aegis.services import books, ledger_write, reconciled
 from aegis.services import journal_index as ji
 from aegis.services.bank_parsers import has_money_shape, is_autopay, parse_any
 from aegis.services.books import UNKNOWN, account_for, instrument_account
@@ -596,6 +596,44 @@ class MoneyActivities:
                 result["status"],
             )
             return result
+
+        # §9.3's ordering rule (spec, "reconciled through" watermark, §15.10
+        # item 2): once a period is reconciled for an account, a transaction
+        # dated inside it is already in the statement that proved it — post
+        # it again and the balance counts the money twice. Only an event WITH
+        # an instrument has a watermark to check: 199 of 245 live index rows
+        # carry none (#408), so gating on a missing one would gate almost
+        # nothing or almost everything, and it is deliberately never gated.
+        #
+        # The gate fails open. A watermark that cannot be read posts as
+        # normal — a check about bookkeeping ORDER must never decide whether
+        # the money gets recorded at all, the same shape #449 already burned
+        # once with a check about noise deciding what the record said.
+        if ev.instrument and ev.occurred_on is not None:
+            canon_instrument = books.canonical_instrument(ev.instrument, declared)
+            try:
+                watermark = await reconciled.reconciled_through(self.db_pool, canon_instrument)
+            except Exception as exc:  # noqa: BLE001 — fail open, see above
+                activity.logger.warning(
+                    "reconciled_watermark_unreadable instrument=%s error=%s — posting as normal",
+                    canon_instrument,
+                    exc,
+                )
+                watermark = None
+            if watermark is not None and ev.occurred_on <= watermark:
+                await ji.upsert(
+                    self.db_pool, msgid, mailbox, ev, todoist_ref=todoist_ref, declared=declared
+                )
+                result["status"] = "reconciled"
+                activity.logger.info(
+                    "money_event_reconciled_period msgid=%s instrument=%s occurred_on=%s "
+                    "watermark=%s — indexed, not posted",
+                    msgid,
+                    canon_instrument,
+                    ev.occurred_on,
+                    watermark,
+                )
+                return result
 
         cfg = self.books_cfg
         # The bank alert and the vendor receipt for one payment are two emails
