@@ -103,6 +103,25 @@ activities:
     config: {}
     active: true
 
+  # The statement lane (spec §14 step 7). Daily at 05:30 UTC = 11:00 IST —
+  # statements arrive monthly, but intake is idempotent on `row_id`, so a daily
+  # tick costs a Drive listing and finds a statement the day it lands rather
+  # than up to a month later.
+  #
+  # `post: false` and `active: false` are BOTH deliberate. The flow writes to
+  # `hikmahtech/books`, and neither a fresh fork nor this deployment should
+  # start posting on a schedule until an operator has read what a dry run would
+  # write. Turn `active` on to see the findings and the digest; turn `post` on
+  # after that.
+  - slug: money-statements-reconcile
+    workflow_type: StatementReconcileFlow
+    agent_id: maou
+    schedule_cron: "30 5 * * *"
+    config:
+      post: false
+      silent: false
+    active: false
+
   # Social publishing — a Todoist task (@publish + platform labels, due time =
   # post time) becomes a post after an approval card. Ships inert: the
   # social_publishing_enabled settings row (migration 005) defaults to false.

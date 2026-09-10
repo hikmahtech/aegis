@@ -121,6 +121,42 @@ async def store_rows(pool: Any, statement: ParsedStatement) -> tuple[int, int]:
     return stored, len(statement.rows) - stored
 
 
+async def store_statement(pool: Any, statement: ParsedStatement) -> None:
+    """Persist the statement itself, beside its rows.
+
+    The period's opening and closing balances live here and nowhere else. A
+    bank statement's could be re-derived from the first row's running balance,
+    but a card's cannot — a card prints no running balance and states its
+    opening and closing as figures of their own — so throwing them away at
+    intake would leave §9.3's check with nothing to stand on for cards.
+
+    `DO UPDATE` rather than `DO NOTHING`, unlike the rows. A statement row is
+    immutable content (its id is a hash of it) and may have been matched or
+    posted since, so re-importing must not erase that work. A statement's own
+    figures are the same figures on a re-import of the same period, and a bank
+    that reissues a corrected statement for a period we have already read
+    should win — but `reconciled_at` is left alone, because whether we
+    reconciled it is our record, not the bank's.
+    """
+    await pool.execute(
+        """
+        INSERT INTO finance.statements
+          (statement_id, instrument, period_start, period_end,
+           opening_balance, closing_balance, file_sha256, rows)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+        ON CONFLICT (statement_id) DO UPDATE
+        SET opening_balance = EXCLUDED.opening_balance,
+            closing_balance = EXCLUDED.closing_balance,
+            file_sha256     = EXCLUDED.file_sha256,
+            rows            = EXCLUDED.rows
+        """,
+        statement.statement_id, statement.instrument,
+        statement.period_start, statement.period_end,
+        statement.opening_balance, statement.closing_balance,
+        statement.file_sha256, len(statement.rows),
+    )
+
+
 async def intake_folder(
     pool: Any,
     token_path: Path,
@@ -178,6 +214,7 @@ async def intake_folder(
             outcome.statement_id = statement.statement_id
             outcome.rows = len(statement.rows)
             if not dry_run:
+                await store_statement(pool, statement)
                 stored, existing = await store_rows(pool, statement)
                 report.stored += stored
                 report.skipped_existing += existing

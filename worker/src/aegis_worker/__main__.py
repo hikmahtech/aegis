@@ -48,6 +48,7 @@ from aegis_worker.activities.llm_governor import LLMGovernorActivities
 from aegis_worker.activities.meeting import MeetingActivities
 from aegis_worker.activities.memory import MemoryActivities
 from aegis_worker.activities.money import MoneyActivities
+from aegis_worker.activities.statements import StatementActivities
 from aegis_worker.activities.people import PeopleActivities
 from aegis_worker.activities.profile import ProfileActivities
 from aegis_worker.activities.raindrop import RaindropActivities
@@ -265,6 +266,19 @@ async def main():
             ignored_mailboxes=parse_csv_set(getattr(settings, "books_ignored_mailboxes", "")),
             mailbox_entities=parse_kv(getattr(settings, "books_mailbox_entities", "")),
             finance=connectors.get("finance"),
+        )
+
+    # The statement lane rides the same flag as the rest of the money lane: it
+    # writes to the same books through the same flock, so a money-off install
+    # must not serve its activity tasks either.
+    statement_act = None
+    if settings.money_hygiene_enabled:
+        statement_act = StatementActivities(
+            db_pool=deps.pool,
+            gmail_token_dir=getattr(settings, "gmail_token_dir", "config/"),
+            books_cfg=config_from_settings(settings),
+            statement_account=getattr(settings, "statement_drive_account", "")
+            or "arshad-hikmah",
         )
 
     channel_act = ChannelActivities(db_pool=deps.pool)
@@ -567,6 +581,7 @@ async def main():
         calendar_act,
         gmail_act,
         drive_act,
+        statement_act,
         meeting_act,
         memory_act,
         profile_act,
