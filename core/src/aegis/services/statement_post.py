@@ -76,12 +76,12 @@ ALREADY_POSTED = "already_posted"
 #: * `TRANSFER` — the FAR statement's row put this money in the books, under
 #:   its own msgid, touching this account. Adding it back would make the check
 #:   over by exactly that amount and revert a statement that was never wrong.
-#:   That is only true once the far block exists and is dated inside this
-#:   period, though, and the far statement may not have run yet — so
-#:   `post_statement` looks in the journal (`_far_block`, `_in_period`) and adds
-#:   the row back when the money is genuinely not in this period's cleared
-#:   total. That is the one conditional case, and it is decided at its own site
-#:   rather than by this set.
+#:   That is only true once the far block exists and is dated inside the
+#:   window the check runs over, though, and the far statement may not have run
+#:   yet — so `post_statement` looks in the journal (`_far_block`,
+#:   `_in_window`) and adds the row back when the money is genuinely not in
+#:   that window's cleared total. That is the one conditional case, and it is
+#:   decided at its own site rather than by this set.
 _NEVER_WRITTEN = frozenset({AMBIGUOUS, PROMOTION_BLOCK_MISSING})
 
 
@@ -275,9 +275,19 @@ def expected_movement(statement: ParsedStatement) -> Decimal | None:
 
 
 def movement_disagreement(
-    cleared: Decimal, statement: ParsedStatement, unwritten: Decimal
+    cleared: Decimal, statement: ParsedStatement, unwritten: Decimal, *, liability: bool
 ) -> tuple[bool, str]:
     """Whether the books now disagree with the bank over this period.
+
+    **The one place a card's sign is flipped, and it flips BOTH figures.**
+    hledger reports a liability negative when you owe; a card statement prints
+    what you owe as a positive number, so the two figures coming from the books
+    — the cleared movement and the unwritten total, which `signed()` also
+    builds in hledger's convention — have to be turned round before they meet
+    `expected_movement`. `liability` is keyword-only and has no default so a
+    caller cannot forget it, and both flips happen here so nobody can do one
+    and not the other: that miss made the check wrong by TWICE any skipped row,
+    and a card's own payment row is skipped on every statement.
 
     Movement over the period, not a balance at its close. A cumulative balance
     would require every earlier period of the account to have been reconciled
@@ -301,6 +311,8 @@ def movement_disagreement(
     expected = expected_movement(statement)
     if expected is None:
         return False, _NO_BALANCE
+    if liability:
+        cleared, unwritten = -cleared, -unwritten
     delta = cleared + unwritten - expected
     if delta == 0:
         return False, ""
@@ -341,7 +353,7 @@ def _far_block(
     money is.
 
     The date comes back because a transfer's block carries the POSTING side's
-    date, and the two banks are a day or two apart — see `_in_period`. `None`
+    date, and the two banks are a day or two apart — see `_in_window`. `None`
     means the header could not be read, which only a hand-edited block can
     manage.
     """
@@ -359,8 +371,8 @@ def _far_block(
     return False, None
 
 
-def _in_period(when: date | None, statement: ParsedStatement) -> bool:
-    """Does a block dated `when` fall inside this statement's period?
+def _in_window(when: date | None, window: tuple[date | None, date | None]) -> bool:
+    """Does a block dated `when` fall inside the window the check runs over?
 
     A transfer's block carries the date of the side that POSTED it, and the two
     banks are a day or two apart. Straddle a month boundary — a card bill paid
@@ -370,13 +382,22 @@ def _in_period(when: date | None, statement: ParsedStatement) -> bool:
     or the check misses by exactly the transfer and reverts a statement in
     which nothing was wrong.
 
-    An unreadable header, or a statement with no period, counts as inside. That
-    is the direction that fails loudly: if the block really was outside, the
-    check disagrees and says so, rather than quietly excusing a missing row.
+    **It takes the window, not the statement, and that is the point.** The
+    question here is only ever "does hledger count this block in the figure the
+    check compares?", so it has to be asked of the same dates hledger was
+    asked. Asking the printed period instead makes a block in a day the window
+    covers and the period does not — which is most of a card's first days —
+    counted in the cleared movement AND added back on top of it. The caller
+    computes the window once and passes it to both, so the two cannot drift.
+
+    An unreadable header, or a window with no dates, counts as inside. That is
+    the direction that fails loudly: if the block really was outside, the check
+    disagrees and says so, rather than quietly excusing a missing row.
     """
-    if when is None or statement.period_start is None or statement.period_end is None:
+    start, end = window
+    if when is None or start is None or end is None:
         return True
-    return statement.period_start <= when <= statement.period_end
+    return start <= when <= end
 
 
 def _counter_account(block: str) -> str:
@@ -388,29 +409,43 @@ def _counter_account(block: str) -> str:
     return ""
 
 
-def check_window(statement: ParsedStatement) -> tuple[date, date]:
+def check_window(statement: ParsedStatement) -> tuple[date | None, date | None]:
     """The dates §9.3's cleared-movement check must span for this statement.
 
-    The printed period and the rows it holds are not the same window, and on a
-    card they are reliably different: all three real Axis card statements run
-    their transactions from `period_start - 2` to `period_end - 1`, because the
-    period is billing dates while the rows are posting dates. Ask hledger for
-    the printed period alone and the first two days' blocks fall outside it, the
-    movement comes up short by exactly those rows, and a correct statement
-    reverts.
+    **The rows, not the printed period.** The two are not the same window, and
+    on a card they are reliably different: all three real Axis card statements
+    run their transactions from `period_start - 2` to `period_end - 1`, because
+    the period is billing dates while the rows are posting dates.
 
-    So the window is the UNION of the two, never the intersection. Widening is
-    the safe direction here: every block this statement writes is dated at one
-    of its own rows, so the union is guaranteed to contain all of them, while
-    narrowing to the row span could exclude a block posted earlier in the period
-    that the statement does account for. The previous statement's rows stop
-    before this one's first row, so the union does not reach them.
+    The row span is the arithmetically correct window, and the reason is what
+    `expected_movement` measures. It is `closing_balance - opening_balance`,
+    and in both layouts the opening figure is the balance IMMEDIATELY BEFORE
+    THE FIRST ROW — a bank statement's is re-derived from the first row's
+    `balance_after` minus that row, and a card's `Previous Balance` is the
+    previous statement's closing. So the movement the bank claims is the rows'
+    movement. The empty days at either end of a printed period belong to no row
+    of this statement and to no block it writes.
+
+    Both other candidates count somebody else's rows:
+
+    * the printed period alone drops a card's first two days, the movement
+      comes up short by exactly those rows, and a correct statement reverts;
+    * the union of the two runs to `period_end`, and the NEXT statement's rows
+      start the day the period ends — measured on the real Axis card
+      statements, whose row spans are contiguous and never overlap (18/05-17/06,
+      18/06-17/07, 18/07-17/08) while every union window ends on the next one's
+      first row. Post those statements in any order but oldest-first and the
+      older one counts a newer row and reverts.
+
+    A statement with no rows falls back to the printed period. `post_statement`
+    returns before the check in that case — no rows means no writes — so this
+    is what a direct caller gets, and the period is the only window it could
+    mean.
     """
     days = [r.occurred_on for r in statement.rows]
-    return (
-        min([statement.period_start, *days]),
-        max([statement.period_end, *days]),
-    )
+    if not days:
+        return statement.period_start, statement.period_end
+    return min(days), max(days)
 
 
 async def post_statement(
@@ -432,10 +467,10 @@ async def post_statement(
     balance check unable to undo the rows that had already landed. Here a
     disagreement reverts everything.
 
-    `liability` says this instrument is a card. hledger reports a card negative
-    when you owe; the statement prints what you owe as a positive number, so one
-    side has to be negated and it is done here, once, rather than in
-    `balance_disagreement` where every reader would have to remember it.
+    `liability` says this instrument is a card. It is passed straight to
+    `movement_disagreement`, which is the single place the sign is turned
+    round — every figure the check compares goes through that one function, so
+    there is no way to flip one and forget another.
 
     `peer_rows` is every statement row known for OTHER accounts — one read of
     `finance.statement_rows` in production. It is what lets §8.4's transfer
@@ -480,6 +515,10 @@ async def post_statement(
     def mutate() -> None:
         declared = books._declared_accounts_sync(cfg)
         acct = books.instrument_account(statement.instrument, declared)
+        # ONE window, computed once. hledger is asked for it, and so is every
+        # "did the far side of this transfer land in it?" question below — a
+        # block counted by one and not the other is counted twice.
+        window = check_window(statement)
         by_id = {row.row_id: row for row in statement.rows}
         unwritten[0] = Decimal("0")
         for row_id, reason in plan_.skipped:
@@ -490,11 +529,11 @@ async def post_statement(
                 unwritten[0] += signed(row)
             elif reason == TRANSFER:
                 found, when = _far_block(cfg, plan_.paired[row_id], outcomes)
-                if not found or not _in_period(when, statement):
-                    # Either the far statement has not run yet, or its block is
-                    # dated outside this period. Both mean the money is not in
-                    # this period's cleared movement, and the check has to be
-                    # told. The row stays skipped either way: posting it is
+                if not found or not _in_window(when, window):
+                    # Either the far statement has not run yet, or its block
+                    # is dated outside this window. Both mean the money is not
+                    # in the cleared movement the check compares, and it has to
+                    # be told. The row stays skipped either way: posting it is
                     # exactly the double count the pair exists to prevent, and
                     # the far statement will write it.
                     unwritten[0] += signed(row)
@@ -557,10 +596,10 @@ async def post_statement(
                     # side got there first — its own row, or the email block
                     # the matcher gave it. The money is in the books once and
                     # must stay that way, whichever statement the operator ran
-                    # first. It is in the cleared total unless the far block is
-                    # dated outside this period.
+                    # first. It is in the cleared total unless the far block
+                    # is dated outside this window.
                     result.skipped.append((row.row_id, TRANSFER))
-                    if not _in_period(when, statement):
+                    if not _in_window(when, window):
                         unwritten[0] += signed(row)
                     continue
             event = event_for(
@@ -623,13 +662,12 @@ async def post_statement(
         if expected_movement(statement) is None:
             result.balance_reason = _NO_BALANCE
             return
-        raw = books.cleared_movement_sync(cfg, acct, *check_window(statement))
-        # A card is a liability: hledger reports it negative when you owe,
-        # while the statement prints what you owe as a positive number. One
-        # side has to be negated and it happens here, once, rather than in
-        # every function that reads a figure.
-        cleared = -raw if liability else raw
-        disagrees, reason = movement_disagreement(cleared, statement, unwritten[0])
+        # Both figures go in as hledger reports them. `movement_disagreement`
+        # is the one place a card's sign is turned round, and it turns BOTH.
+        raw = books.cleared_movement_sync(cfg, acct, *window)
+        disagrees, reason = movement_disagreement(
+            raw, statement, unwritten[0], liability=liability
+        )
         result.balance_checked = True
         if disagrees:
             raise books.BooksCheckError(reason)

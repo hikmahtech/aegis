@@ -1004,3 +1004,59 @@ async def test_a_status_filter_is_reachable_from_the_query_tool(tmp_path):
 
     with pytest.raises(books.BooksError, match="not allowed"):
         await books.run_hledger(["bal", "--pendingx", "expenses"], cfg)
+
+
+# ------------------------------------------------- the cleared-movement check
+
+
+@pytest.mark.skipif(not HAS_HLEDGER, reason="hledger/git not installed")
+def test_a_commodity_hledger_cannot_price_is_a_check_error_naming_it(tmp_path):
+    """`-X ₹` leaves a commodity it has no rate for alone, and exits 0.
+
+    The cell then reads `"$-4.00, ₹-100.00"`, which stripped to digits is
+    `-4.00-100.00` and raises `decimal.InvalidOperation` — not a `BooksError`,
+    so it escapes `_write_sync`'s revert path as itself and the statement
+    caller's `except BooksCheckError` misses it. Under NO_RETRY the whole run
+    dies at that statement, and this is live: production holds `$` and `£`
+    blocks on `axis-9640` whose dates `prices.journal` does not cover.
+
+    A `BooksCheckError` naming the commodity reverts that one statement, is
+    recorded as a finding, and lets the run carry on.
+    """
+    cfg = _repo(tmp_path)
+    (cfg.path / "personal" / "2026.journal").write_text(
+        "; Personal 2026\n"
+        "2026-07-05 * Foreign charge\n"
+        "    expenses:unknown          $4.00\n"
+        "    assets:bank:axis:9640\n\n"
+        "2026-07-06 * Local charge\n"
+        "    expenses:unknown          ₹100.00\n"
+        "    assets:bank:axis:9640\n"
+    )
+
+    with pytest.raises(books.BooksCheckError) as excinfo:
+        books.cleared_movement_sync(
+            cfg, "assets:bank:axis:9640", date(2026, 7, 1), date(2026, 7, 31)
+        )
+    assert "$" in str(excinfo.value)
+
+
+@pytest.mark.skipif(not HAS_HLEDGER, reason="hledger/git not installed")
+def test_a_rupee_only_movement_still_reads_its_thousands_separators(tmp_path):
+    """The guard above must not fire on the ordinary case. `₹` is the one
+    commodity the check is asked in, and a comma inside a number is a
+    separator, not a second commodity."""
+    cfg = _repo(tmp_path)
+    (cfg.path / "personal" / "2026.journal").write_text(
+        "; Personal 2026\n"
+        "2026-07-06 * Local charge\n"
+        "    expenses:unknown          ₹12,345.67\n"
+        "    assets:bank:axis:9640\n\n"
+        "2026-07-07 ! Pending, so not counted\n"
+        "    expenses:unknown          ₹500.00\n"
+        "    assets:bank:axis:9640\n"
+    )
+
+    assert books.cleared_movement_sync(
+        cfg, "assets:bank:axis:9640", date(2026, 7, 1), date(2026, 7, 31)
+    ) == Decimal("-12345.67")

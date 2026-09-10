@@ -419,6 +419,7 @@ person picks: the books stay balanced, §9.3's check still passes, the uncertain
 | Bank changes narration format | §6.2 arithmetic check fails | Refuse the whole statement |
 | Unknown header, or a file in the wrong folder | Matches no pattern, or its contents name another account | `UNIDENTIFIED` or misfile — reported, never guessed at and never imported |
 | Closing balance disagrees | The §9.3 check, inside the write envelope | `BooksCheckError`; the whole statement reverts; alert |
+| A commodity hledger cannot price | The §9.3 check's `hledger balance -X ₹` returns a multi-commodity cell, exit 0 | `BooksCheckError` naming the commodity; that statement reverts and the run carries on. Never take the ₹ part alone — that understates the movement and passes a wrong ledger |
 | HDFC job purged | `input XML file not existed`, HTTP 200 | Permanent — do not retry |
 | Lost session on HDFC fetch | `Internal Error occured` | Retry from the `CRSGetToken` step |
 | Drive/Gmail scope missing | Granted-scope check before use | Degrade like `no_drive_scope`, never a silent zero |
@@ -705,10 +706,34 @@ unproven `*` is indistinguishable from a step-5-proven one), and step 5 itself.
    `rewrite_block` gained that (`on=`) and step 5 uses it — but the check itself was redesigned as
    well, and that is the half that mattered. §9.3's original "balance at the statement close" is
    cumulative, so an account's very first statement could never pass and one gap anywhere broke
-   every statement after it. It is now **movement over the period** — `hledger balance --cleared`
-   between the period's dates — which stands alone, so a backfill runs in any order and a missing
-   month costs only that month. `--cleared` is what makes it honest: an unproven `!` block does
-   not count toward a figure whose whole job is to say whether the bank agrees.
+   every statement after it. It is now **movement over the rows** — `hledger balance --cleared`
+   between the first and last row dates — which stands alone, so a backfill runs in any order and
+   a missing month costs only that month. `--cleared` is what makes it honest: an unproven `!`
+   block does not count toward a figure whose whole job is to say whether the bank agrees.
+
+   **The window is the row span, not the printed period, and not the union of the two.**
+   `expected_movement` is `closing_balance - opening_balance`, and in both layouts the opening
+   figure is the balance immediately before the first row — a bank statement's is re-derived from
+   the first row's `balance_after` minus that row, a card's `Previous Balance` is the previous
+   statement's closing. So the movement the bank claims is the ROWS' movement. The printed period
+   alone drops a card's first two days (its rows run `period_start - 2` to `period_end - 1`), and
+   the union runs to `period_end`, which is the day the NEXT statement's rows begin: measured on
+   the three real Axis card statements, whose row spans are contiguous and never overlap
+   (18/05-17/06, 18/06-17/07, 18/07-17/08) while every union window ends on the next one's first
+   row. That union broke the order-independence this same paragraph claims.
+
+   **The same window answers "did the far side of this transfer land?"** A `transfer_counterpart`
+   is added back only when its block is outside the figure hledger returned, so that question must
+   be asked of the dates hledger was asked. Asked of the printed period instead, a far block dated
+   in a day the window covers and the period does not is counted in the movement AND added back on
+   top of it. `post_statement` computes one window and passes it to both.
+
+   **And a card's sign is flipped in exactly one place.** hledger reports a liability negative when
+   you owe and a card statement prints what you owe as positive, so BOTH figures the check compares
+   — the cleared movement and the unwritten total, which `signed()` also builds in hledger's
+   convention — are turned round together, inside `movement_disagreement`. Flipping one and not the
+   other makes the check wrong by twice any skipped row, and a card's own payment row is skipped on
+   every statement.
 2. **The watermark has a home**: `finance.reconciled_through`, one row per account, advanced only
    forward and only in SQL — a backfill posts statements in whatever order the operator has them,
    so reconciling June after July must not un-reconcile July. `post_money_event` reads it and
