@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 from pathlib import Path
@@ -97,6 +98,69 @@ async def create_pool(database_url: str, min_size: int = 2, max_size: int = 10) 
     )
     logger.info("db_pool_created", min_size=min_size, max_size=max_size)
     return pool
+
+
+async def wait_for_migrations(
+    pool: asyncpg.Pool,
+    migrations_dir: str | Path = "migrations",
+    *,
+    timeout_s: float = 60.0,
+    poll_s: float = 1.0,
+) -> bool:
+    """Block until the database holds every migration THIS image ships (#445).
+
+    Core applies migrations on startup and the worker does not wait for it, but
+    the stack rolls both at once. On the 2026-09-08 deploy the worker came up at
+    10:00:14 and `check_llm_budget` fired at 10:00:17, while migration 039 —
+    which adds the column that activity reads — did not apply until 10:00:21.
+    Three failures, `UndefinedColumnError`, and nothing to distinguish them from
+    a real fault in the alert stream. It recurs on every release carrying a
+    migration the worker's own code depends on, and widens with each one.
+
+    The image's own `migrations/` directory is the right thing to wait for, not
+    "is Core up": it names exactly the schema this build was written against, so
+    a worker rolled BACK to an older image does not sit waiting for migrations
+    it neither ships nor needs.
+
+    Fails OPEN. Returns False on timeout and lets the caller start anyway,
+    because a worker that refuses to boot is a worse outcome than the few
+    seconds of activity failures this exists to avoid — the flow-health
+    watchdog runs in the worker too. 60s is an order of magnitude more than the
+    7-second window that was actually observed.
+    """
+    expected = sorted(p.name for p in Path(migrations_dir).glob("*.sql"))
+    if not expected:
+        # A dev worker started from another directory, or an image that ships
+        # no migrations. Nothing to wait for and nothing to warn about.
+        return True
+
+    deadline = time.monotonic() + timeout_s
+    missing: list[str] = []
+    while True:
+        try:
+            applied = {
+                r["filename"]
+                for r in await pool.fetch(
+                    "SELECT filename FROM schema_migrations WHERE filename = ANY($1::text[])",
+                    expected,
+                )
+            }
+        except asyncpg.exceptions.UndefinedTableError:
+            # A database Core has never migrated at all. Not ready, not an error.
+            applied = set()
+        missing = [name for name in expected if name not in applied]
+        if not missing:
+            return True
+        if time.monotonic() >= deadline:
+            logger.warning(
+                "migrations_wait_timed_out",
+                waited_s=timeout_s,
+                missing=missing[:5],
+                missing_count=len(missing),
+            )
+            return False
+        logger.info("migrations_waiting", missing_count=len(missing), next=missing[0])
+        await asyncio.sleep(poll_s)
 
 
 async def run_migrations(pool: asyncpg.Pool, migrations_dir: str | Path = "migrations") -> None:
