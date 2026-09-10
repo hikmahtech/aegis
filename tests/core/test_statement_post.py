@@ -18,6 +18,7 @@ from pathlib import Path
 import pytest
 from aegis.services import books, statement_post
 from aegis.services.statement_match import AMBIGUOUS, PASS_WINDOW, RowOutcome
+from aegis.services.statement_transfers import REVERSAL, TRANSFER
 from aegis.services.statements import ParsedStatement, StatementRow, row_id_for
 
 HAS_HLEDGER = shutil.which("hledger") is not None and shutil.which("git") is not None
@@ -25,6 +26,7 @@ pytestmark = pytest.mark.skipif(not HAS_HLEDGER, reason="hledger/git not install
 
 ACCOUNTS = """commodity ₹ 1,00,000.00
 account assets:bank:hdfc:1225
+account assets:bank:axis:9640
 account liabilities:card:axis:1313
 account assets:unknown
 account expenses:unknown
@@ -395,3 +397,437 @@ async def test_a_transaction_on_the_closing_day_is_inside_the_period(tmp_path):
     )
     assert len(result.posted) == 2
     assert result.balance_checked is True and result.balance_reason == ""
+
+
+# ----------------------------------------------- step 6: transfers, reversals
+
+
+def _card_pair():
+    """One card bill, printed on both statements (§8.4).
+
+    The bank statement names the card — `CREDITCARD PAYMENT XXXX 1313` — and
+    the card statement's credit names nothing, which is the whole reason §8.4
+    posts a card payment from the bank side. The card also carries a purchase,
+    so its run has something to write and the skip is visible beside it.
+    """
+    bank_row = _row(3, "2500.00", narration="CREDITCARD PAYMENT XXXX 1313", balance="-2500.00")
+    card_payment = _row(4, "2500.00", direction="in", instrument="axis-cc-1313",
+                        narration="PAYMENT RECEIVED THANK YOU")
+    card_purchase = _row(6, "900.00", narration="AMAZON", instrument="axis-cc-1313")
+    return (
+        _statement([bank_row], "-2500.00"),
+        _statement([card_payment, card_purchase], None, instrument="axis-cc-1313"),
+    )
+
+
+def _movement(cfg, account):
+    return books.cleared_movement_sync(cfg, account, date(2026, 7, 1), date(2026, 7, 31))
+
+
+@pytest.mark.asyncio
+async def test_a_creditcard_payment_row_credits_the_card_not_expenses_unknown(tmp_path):
+    """§8.4, and the half that works with no card statement at all.
+
+    Left to `books.apply_rules`, `CREDITCARD PAYMENT XXXX 1313` matches
+    nothing, lands in `expenses:unknown`, and the card liability drifts by the
+    full bill every month — the account is never credited, so hledger says the
+    owner still owes money that was paid.
+    """
+    cfg = _repo(tmp_path)
+    rows = [_row(3, "2500.00", narration="CREDITCARD PAYMENT XXXX 1313", balance="-2500.00")]
+    result = await statement_post.post_statement(
+        _statement(rows, "-2500.00"), {}, cfg, entity="personal",
+    )
+    assert len(result.posted) == 1
+    assert result.balance_checked is True and result.balance_reason == ""
+
+    text = (cfg.path / "personal" / "2026.journal").read_text()
+    assert "liabilities:card:axis:1313" in text
+    assert "expenses:unknown" not in text
+    assert _movement(cfg, "liabilities:card:axis:1313") == Decimal("2500.00")
+
+
+@pytest.mark.asyncio
+async def test_the_bank_row_posts_the_transfer_and_the_card_row_skips(tmp_path):
+    """Bank statement first, then the card. §8.4's own ordering."""
+    cfg = _repo(tmp_path)
+    bank, card = _card_pair()
+
+    first = await statement_post.post_statement(
+        bank, {}, cfg, entity="personal", peer_rows=card.rows,
+    )
+    second = await statement_post.post_statement(
+        card, {}, cfg, entity="personal", liability=True, peer_rows=bank.rows,
+    )
+
+    assert len(first.posted) == 1
+    assert (card.rows[0].row_id, TRANSFER) in second.skipped
+    assert len(second.posted) == 1, "the purchase, and not the payment"
+
+    text = (cfg.path / "personal" / "2026.journal").read_text()
+    assert text.count("₹2500.00") == 1, "one block for one movement"
+    assert _movement(cfg, "liabilities:card:axis:1313") == Decimal("1600.00")
+    assert _movement(cfg, "assets:bank:hdfc:1225") == Decimal("-2500.00")
+
+
+@pytest.mark.asyncio
+async def test_the_card_statement_first_still_posts_the_transfer_once(tmp_path):
+    """The same pair in the other order, and the requirement that matters.
+
+    The operator picks the order, so neither statement may depend on having run
+    first. The card row is not the side that posts (§8.4), so running it first
+    writes nothing for the payment and leaves the bank statement to do it — and
+    the books end in exactly the state the other order produced.
+    """
+    cfg = _repo(tmp_path)
+    bank, card = _card_pair()
+
+    first = await statement_post.post_statement(
+        card, {}, cfg, entity="personal", liability=True, peer_rows=bank.rows,
+    )
+    second = await statement_post.post_statement(
+        bank, {}, cfg, entity="personal", peer_rows=card.rows,
+    )
+
+    assert (card.rows[0].row_id, TRANSFER) in first.skipped
+    assert len(first.posted) == 1, "the purchase, and not the payment"
+    assert len(second.posted) == 1
+
+    text = (cfg.path / "personal" / "2026.journal").read_text()
+    assert text.count("₹2500.00") == 1, "one block for one movement"
+    assert _movement(cfg, "liabilities:card:axis:1313") == Decimal("1600.00")
+    assert _movement(cfg, "assets:bank:hdfc:1225") == Decimal("-2500.00")
+
+
+def _imps_pair():
+    """₹1,00,000 out of the Axis current account and into HDFC, printed twice.
+
+    Both narrations name the other account, so §8.4's "the side that names"
+    rule ties and the `out` side breaks it — the Axis statement posts. The HDFC
+    statement carries a salary row as well, so its closing-balance check has
+    something to run against beside the counterpart.
+    """
+    axis_row = _row(4, "100000.00", instrument="axis-9640", balance="-100000.00",
+                    narration="IMPS/612345678905/TO XXXXXXXXXX1225")
+    salary = _row(2, "1000.00", direction="in", narration="SALARY", balance="1000.00")
+    hdfc_imps = _row(4, "100000.00", direction="in", balance="101000.00",
+                     narration="IMPS/612345678905/FROM XXXXXXXXXXX9640")
+    return (
+        _statement([axis_row], "-100000.00", instrument="axis-9640"),
+        _statement([salary, hdfc_imps], "101000.00"),
+    )
+
+
+@pytest.mark.asyncio
+async def test_the_balance_check_passes_on_a_statement_holding_a_counterpart(tmp_path):
+    """The `unwritten` accounting, which is the subtle half of step 6.
+
+    A `transfer_counterpart` is the opposite of an ambiguous row. The far
+    statement put that money in the books, against THIS account, so it is in the
+    cleared total already. Adding it back — which is what every other skip
+    needs — would make the check over by exactly ₹1,00,000 and revert a
+    statement in which nothing was wrong.
+    """
+    cfg = _repo(tmp_path)
+    axis, hdfc = _imps_pair()
+
+    first = await statement_post.post_statement(
+        axis, {}, cfg, entity="personal", peer_rows=hdfc.rows,
+    )
+    second = await statement_post.post_statement(
+        hdfc, {}, cfg, entity="personal", peer_rows=axis.rows,
+    )
+
+    assert len(first.posted) == 1 and first.balance_reason == ""
+    assert (hdfc.rows[1].row_id, TRANSFER) in second.skipped
+    assert len(second.posted) == 1, "the salary, and not the transfer"
+    assert second.balance_checked is True and second.balance_reason == ""
+
+    text = (cfg.path / "personal" / "2026.journal").read_text()
+    assert text.count("₹100000.00") == 1
+    assert text.count("income:unknown") == 1, "the salary only; a transfer is not income"
+    assert _movement(cfg, "assets:bank:hdfc:1225") == Decimal("101000.00")
+    assert _movement(cfg, "assets:bank:axis:9640") == Decimal("-100000.00")
+
+
+@pytest.mark.asyncio
+async def test_adding_a_counterpart_back_would_revert_a_correct_statement(tmp_path, monkeypatch):
+    """The falsification of the test above, kept rather than done once by hand.
+
+    Put `transfer_counterpart` in the "money never reached the journal" set —
+    the shape every other skip has — and the statement above fails by exactly
+    the transfer's amount and reverts. This is what pins `_NEVER_WRITTEN` down:
+    without it, treating all skips alike passes every other test in this file.
+    """
+    cfg = _repo(tmp_path)
+    axis, hdfc = _imps_pair()
+    await statement_post.post_statement(axis, {}, cfg, entity="personal", peer_rows=hdfc.rows)
+
+    monkeypatch.setattr(
+        statement_post, "_NEVER_WRITTEN", statement_post._NEVER_WRITTEN | {TRANSFER}
+    )
+    with pytest.raises(books.BooksCheckError, match="difference 100000"):
+        await statement_post.post_statement(
+            hdfc, {}, cfg, entity="personal", peer_rows=axis.rows,
+        )
+
+
+@pytest.mark.asyncio
+async def test_a_reversal_pair_nets_to_zero_and_leaves_the_balance_intact(tmp_path):
+    """§8.5. A failed UPI is a debit and a same-day re-credit, and the email
+    lane records it as `kind='failed'` — not a transaction, so it posts no
+    block and both rows arrive here unmatched. Rules alone would file them as
+    `expenses:unknown` + `income:unknown`, a pair that sits in the digest
+    forever and makes both totals wrong by ₹500."""
+    cfg = _repo(tmp_path)
+    debit = _row(3, "500.00", ref="612345678906", balance="-500.00",
+                 narration="UPI/P2M/612345678906/SHOP")
+    credit = _row(3, "500.00", direction="in", ref="612345678906", balance="0.00",
+                  narration="UPI/P2M/612345678906/SHOP REVERSAL")
+    spend = _row(5, "100.00", narration="SHOP", balance="-100.00")
+
+    result = await statement_post.post_statement(
+        _statement([debit, credit, spend], "-100.00"), {}, cfg, entity="personal",
+    )
+
+    assert len(result.posted) == 3, "both legs post; a reversal hides nothing"
+    assert result.balance_checked is True and result.balance_reason == ""
+
+    text = (cfg.path / "personal" / "2026.journal").read_text()
+    assert "income:unknown" not in text
+    assert text.count("equity:transfers") == 2
+    assert f"{REVERSAL}: {credit.row_id}" in text, "each leg names the other"
+    assert _movement(cfg, "equity:transfers") == Decimal("0")
+    assert _movement(cfg, "assets:bank:hdfc:1225") == Decimal("-100.00")
+
+
+@pytest.mark.asyncio
+async def test_promotion_moves_an_equity_transfers_block_to_the_card(tmp_path):
+    """§8.4's last sentence. The email lane posts a card bill to
+    `equity:transfers`, because a debit alert cannot say where the money went.
+    The pair can, so promoting such a block moves the posting to the card —
+    otherwise the liability is never credited and the clearing account grows by
+    the bill every month."""
+    cfg = _repo(tmp_path)
+    from aegis.api.models.money import MoneyEvent
+    await books.post_event(
+        MoneyEvent(
+            kind="transaction", direction="out", amount=Decimal("2500.00"), currency="INR",
+            payee="Card Bill", channel="imps", instrument="hdfc-1225",
+            occurred_on=date(2026, 7, 2), entity="personal", account="equity:transfers",
+            source_class="bank",
+        ),
+        "mail/card", cfg,
+    )
+    bank_row = _row(3, "2500.00", narration="CREDITCARD PAYMENT XXXX 1313", balance="-2500.00")
+    card_row = _row(4, "2500.00", direction="in", instrument="axis-cc-1313",
+                    narration="PAYMENT RECEIVED THANK YOU")
+    outcomes = {bank_row.row_id: RowOutcome(
+        row_id=bank_row.row_id, statement_id="s", instrument="hdfc-1225",
+        occurred_on=date(2026, 7, 3), matched_pass=PASS_WINDOW, msgid="mail/card", delta_days=1,
+    )}
+
+    result = await statement_post.post_statement(
+        _statement([bank_row], "-2500.00"), outcomes, cfg,
+        entity="personal", peer_rows=[card_row],
+    )
+
+    assert result.promoted == ["mail/card"] and result.posted == []
+    text = (cfg.path / "personal" / "2026.journal").read_text()
+    assert "2026-07-03 * Card Bill" in text
+    assert "liabilities:card:axis:1313" in text
+    assert "equity:transfers" not in text
+    assert _movement(cfg, "liabilities:card:axis:1313") == Decimal("2500.00")
+
+
+@pytest.mark.asyncio
+async def test_a_promoted_block_is_what_the_far_statement_sees(tmp_path):
+    """The other way a transfer reaches the books: not a `stmt/` block, but an
+    email block the matcher gave to the far row and the far statement promoted.
+    A counterpart check that only looked for `stmt/<row_id>` would miss it,
+    post the money a second time, and fail this statement's own check."""
+    cfg = _repo(tmp_path)
+    from aegis.api.models.money import MoneyEvent
+    await books.post_event(
+        MoneyEvent(
+            kind="transaction", direction="out", amount=Decimal("100000.00"), currency="INR",
+            payee="IMPS Transfer", channel="imps", instrument="axis-9640",
+            occurred_on=date(2026, 7, 3), entity="personal", account="equity:transfers",
+            source_class="bank",
+        ),
+        "mail/imps", cfg,
+    )
+    axis, hdfc = _imps_pair()
+    outcomes = {axis.rows[0].row_id: RowOutcome(
+        row_id=axis.rows[0].row_id, statement_id="s", instrument="axis-9640",
+        occurred_on=date(2026, 7, 4), matched_pass=PASS_WINDOW, msgid="mail/imps", delta_days=1,
+    )}
+
+    first = await statement_post.post_statement(
+        axis, outcomes, cfg, entity="personal", peer_rows=hdfc.rows,
+    )
+    second = await statement_post.post_statement(
+        hdfc, outcomes, cfg, entity="personal", peer_rows=axis.rows,
+    )
+
+    assert first.promoted == ["mail/imps"] and first.posted == []
+    assert (hdfc.rows[1].row_id, TRANSFER) in second.skipped
+    assert second.balance_checked is True and second.balance_reason == ""
+
+    text = (cfg.path / "personal" / "2026.journal").read_text()
+    assert text.count("₹100000.00") == 1
+    assert "equity:transfers" not in text, "the pair proved the far account"
+    assert _movement(cfg, "assets:bank:hdfc:1225") == Decimal("101000.00")
+    assert _movement(cfg, "assets:bank:axis:9640") == Decimal("-100000.00")
+
+
+@pytest.mark.asyncio
+async def test_a_third_party_row_carrying_a_declared_tail_still_goes_to_the_rules(tmp_path):
+    """The guard that keeps own-account detection from being the §6.1 bug.
+
+    `1234196405` is an invoice number that contains `9640`, a declared account
+    tail. Resolving it would move a supplier payment into a bank account the
+    owner holds — and the closing-balance check would still pass, because both
+    accounts are real and the block still balances. Nothing downstream would
+    ever ask again.
+    """
+    cfg = _repo(tmp_path)
+    rows = [_row(4, "1200.00", balance="-1200.00",
+                 narration="NEFT/AXISP00123456/INVOICE 1234196405 SPECIMEN SUPPLIES")]
+    result = await statement_post.post_statement(
+        _statement(rows, "-1200.00"), {}, cfg, entity="personal",
+    )
+    assert len(result.posted) == 1
+    text = (cfg.path / "personal" / "2026.journal").read_text()
+    assert "expenses:unknown" in text
+    assert "assets:bank:axis:9640" not in text
+
+
+@pytest.mark.asyncio
+async def test_a_far_statement_arriving_later_does_not_post_the_money_twice(tmp_path):
+    """The strongest form of the ordering requirement.
+
+    The HDFC statement is posted before the Axis one has been parsed at all, so
+    there are no peer rows and no pair — own-account detection alone puts the
+    transfer in the books, with both accounts right. When the Axis statement
+    does arrive it is the side §8.4 nominates to post, and it must still not
+    post: the money is already there, under the other row's msgid.
+    """
+    cfg = _repo(tmp_path)
+    axis, hdfc = _imps_pair()
+
+    blind = await statement_post.post_statement(hdfc, {}, cfg, entity="personal")
+    assert len(blind.posted) == 2, "no peers, no pair — the credit posts on its own"
+    assert blind.balance_checked is True and blind.balance_reason == ""
+
+    later = await statement_post.post_statement(
+        axis, {}, cfg, entity="personal", peer_rows=hdfc.rows,
+    )
+    assert later.posted == []
+    assert (axis.rows[0].row_id, TRANSFER) in later.skipped
+    assert later.balance_checked is True and later.balance_reason == ""
+
+    text = (cfg.path / "personal" / "2026.journal").read_text()
+    assert text.count("₹100000.00") == 1
+    assert _movement(cfg, "assets:bank:axis:9640") == Decimal("-100000.00")
+    assert _movement(cfg, "assets:bank:hdfc:1225") == Decimal("101000.00")
+
+
+@pytest.mark.asyncio
+async def test_promotion_leaves_an_account_that_is_not_the_clearing_one_alone(tmp_path):
+    """Only `equity:transfers` is rewritten.
+
+    A block already naming a real account was decided by something with more
+    evidence than a tail in a narration — a rule, or the owner's own
+    `ledger_reclassify`. A pair is not licence to overwrite that.
+    """
+    cfg = _repo(tmp_path)
+    from aegis.api.models.money import MoneyEvent
+    await books.post_event(
+        MoneyEvent(
+            kind="transaction", direction="out", amount=Decimal("2500.00"), currency="INR",
+            payee="Card Bill", channel="imps", instrument="hdfc-1225",
+            occurred_on=date(2026, 7, 2), entity="personal", account="expenses:groceries",
+            source_class="bank",
+        ),
+        "mail/card", cfg,
+    )
+    bank_row = _row(3, "2500.00", narration="CREDITCARD PAYMENT XXXX 1313", balance="-2500.00")
+    card_row = _row(4, "2500.00", direction="in", instrument="axis-cc-1313",
+                    narration="PAYMENT RECEIVED THANK YOU")
+    outcomes = {bank_row.row_id: RowOutcome(
+        row_id=bank_row.row_id, statement_id="s", instrument="hdfc-1225",
+        occurred_on=date(2026, 7, 3), matched_pass=PASS_WINDOW, msgid="mail/card", delta_days=1,
+    )}
+
+    result = await statement_post.post_statement(
+        _statement([bank_row], "-2500.00"), outcomes, cfg,
+        entity="personal", peer_rows=[card_row],
+    )
+
+    assert result.promoted == ["mail/card"]
+    text = (cfg.path / "personal" / "2026.journal").read_text()
+    assert "expenses:groceries" in text
+    assert "liabilities:card:axis:1313" not in text
+
+
+@pytest.mark.asyncio
+async def test_a_transfer_straddling_a_month_boundary_does_not_break_either_check(tmp_path):
+    """The block carries the POSTING side's date, and the two banks are a day
+    or two apart.
+
+    Axis pays on 31 July; HDFC credits on 2 August. The block is dated 31 July,
+    so the money is in the books and NOT in August's cleared movement — and
+    August's statement is the one holding the counterpart. Treating "in the
+    books" as "in this period" leaves August short by exactly the transfer and
+    reverts a statement in which nothing was wrong. Card bills paid at month
+    end make this the common shape, not the exotic one.
+    """
+    cfg = _repo(tmp_path)
+    july_row = _row(31, "100000.00", instrument="axis-9640", balance="-100000.00",
+                    narration="IMPS/612345678907/TO XXXXXXXXXX1225")
+    july = _statement([july_row], "-100000.00", instrument="axis-9640")
+
+    august_credit = StatementRow(
+        row_id=row_id_for(
+            instrument="hdfc-1225", occurred_on=date(2026, 8, 2), direction="in",
+            amount=Decimal("100000.00"), balance_after=Decimal("100000.00"),
+            occurrence_index=0, narration="IMPS/612345678907/FROM XXXXXXXXXXX9640",
+        ),
+        instrument="hdfc-1225", occurred_on=date(2026, 8, 2),
+        narration="IMPS/612345678907/FROM XXXXXXXXXXX9640", ref=None, direction="in",
+        amount=Decimal("100000.00"), balance_after=Decimal("100000.00"),
+        statement_id="hdfc-1225/2026-08-01..2026-08-31", file_sha256="fixture",
+    )
+    august_salary = StatementRow(
+        row_id=row_id_for(
+            instrument="hdfc-1225", occurred_on=date(2026, 8, 5), direction="in",
+            amount=Decimal("1000.00"), balance_after=Decimal("101000.00"),
+            occurrence_index=0, narration="SALARY",
+        ),
+        instrument="hdfc-1225", occurred_on=date(2026, 8, 5), narration="SALARY", ref=None,
+        direction="in", amount=Decimal("1000.00"), balance_after=Decimal("101000.00"),
+        statement_id="hdfc-1225/2026-08-01..2026-08-31", file_sha256="fixture",
+    )
+    august = ParsedStatement(
+        status="ok", instrument="hdfc-1225",
+        period_start=date(2026, 8, 1), period_end=date(2026, 8, 31),
+        opening_balance=Decimal("0"), closing_balance=Decimal("101000.00"),
+        rows=(august_credit, august_salary),
+        statement_id="hdfc-1225/2026-08-01..2026-08-31", file_sha256="fixture",
+    )
+
+    first = await statement_post.post_statement(
+        july, {}, cfg, entity="personal", peer_rows=august.rows,
+    )
+    second = await statement_post.post_statement(
+        august, {}, cfg, entity="personal", peer_rows=july.rows,
+    )
+
+    assert len(first.posted) == 1 and first.balance_reason == ""
+    assert (august_credit.row_id, TRANSFER) in second.skipped
+    assert second.balance_checked is True and second.balance_reason == ""
+
+    text = (cfg.path / "personal" / "2026.journal").read_text()
+    assert text.count("₹100000.00") == 1
+    assert "2026-07-31 * IMPS/612345678907/TO XXXXXXXXXX1225" in text
