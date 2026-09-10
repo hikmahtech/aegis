@@ -81,6 +81,50 @@ async def upsert(
     )
 
 
+async def name_instrument(
+    pool: Any, msgids: Collection[str], instrument: str, *, declared: Collection[str] = ()
+) -> int:
+    """Say which account paid, for rows that did not know (#408).
+
+    A vendor receipt names what you bought, not what paid for it. Measured on
+    the live index: of the twelve amount-bearing transaction rows with no
+    instrument, NOT ONE of their emails prints a card tail, a masked number, or
+    even the words "credit card" — Apple, Amazon Pay, Docker, Groww, GoDaddy
+    simply do not say. So there is nothing for a parser to widen onto and
+    nothing for the extractor to try harder at; asking either to produce an
+    instrument here is asking it to invent one, and a payment posted to the
+    wrong account is worse than one posted to `assets:unknown`.
+
+    The bank is the one witness that knows, and by the time this is called it
+    has already spoken: `statement_post` promoted these blocks, which rewrites
+    an `assets:unknown` posting to the account the statement belongs to. That
+    left the journal naming the account and the index still saying NULL — and
+    the journal is the record while this table is only its index, so the index
+    was simply wrong. This is the index catching up with what the books say.
+
+    `instrument IS NULL` in the predicate is the whole safety argument: a row
+    whose mail DID name an account was decided by evidence about that payment,
+    and a statement covering the same day and amount must never relabel it.
+    """
+    if not msgids:
+        return 0
+    return int(
+        await pool.fetchval(
+            """
+            WITH named AS (
+                UPDATE finance.journal_index
+                   SET instrument = $2, updated_at = now()
+                 WHERE message_id = ANY($1::text[]) AND instrument IS NULL
+             RETURNING 1
+            )
+            SELECT count(*) FROM named
+            """,
+            list(msgids),
+            books.canonical_instrument(instrument, declared),
+        )
+    )
+
+
 async def get(pool: Any, msgid: str) -> dict | None:
     row = await pool.fetchrow("SELECT * FROM finance.journal_index WHERE message_id = $1", msgid)
     return dict(row) if row else None

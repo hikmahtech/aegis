@@ -120,3 +120,37 @@ def test_unclosed_script_or_style_does_not_leak():
     assert html_to_text("<script>var a=1;") == ""
     assert html_to_text("<style>.x{color:red}") == ""
     assert html_to_text("<p>Rs.10.00 debited</p><script>var a=1;") == "Rs.10.00 debited"
+
+
+def test_an_outlook_conditional_comment_does_not_donate_its_text_as_an_amount():
+    """#381. The MSO boilerplate sits in a downlevel-hidden comment, so nothing
+    renders it — but the tag regexes strip its tags and used to keep the text,
+    putting a bare `96` at position 0 of the body. That is the strongest
+    position for an extractor looking for an amount, and it posted one."""
+    src = (
+        "<html><head>"
+        '<meta name="viewport" content="width=device-width">'
+        "<!--[if gte mso 9]><xml>"
+        "<o:OfficeDocumentSettings><o:AllowPNG/>"
+        "<o:PixelsPerInch>96</o:PixelsPerInch>"
+        "</o:OfficeDocumentSettings></xml><![endif]-->"
+        "<title>Email Template</title></head>"
+        "<body><p>Reminder: Complete Your Re-KYC to Enable Withdrawals</p></body></html>"
+    )
+    text = html_to_text(src)
+    assert not text.startswith("96")
+    assert "96" not in text
+    assert text.startswith("Email Template")
+
+
+def test_a_downlevel_revealed_comment_keeps_the_content_it_reveals():
+    """The other half of the same idiom: `<!--[if !mso]><!-->` opens a comment
+    that closes immediately, so everything after it IS rendered mail. Stopping
+    at the first `-->` is what keeps it — a greedy sweep to the last `-->`
+    would swallow the body between the two markers."""
+    src = (
+        "<!--[if !mso]><!-->"
+        "<p>Rs.10.00 debited from your account</p>"
+        "<!--<![endif]-->"
+    )
+    assert html_to_text(src) == "Rs.10.00 debited from your account"

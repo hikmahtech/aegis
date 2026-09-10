@@ -253,3 +253,36 @@ async def test_upsert_canonicalises_the_instrument_against_the_chart(db_pool):
         db_pool, "ji-inst/5", "arshad-personal", _bank(instrument="card-1313"),
     )
     assert (await ji.get(db_pool, "ji-inst/5"))["instrument"] == "card-1313"
+
+
+@pytest.mark.asyncio
+async def test_a_statement_names_the_account_for_a_receipt_that_never_did(db_pool):
+    """#408. An Apple or Amazon Pay receipt says what you bought, never what
+    paid for it — checked on the live index, not one of those bodies prints a
+    card tail. The statement is the bank saying this money moved through THIS
+    account, and promotion has already rewritten the journal block to say so,
+    so the index row is the only thing left claiming not to know."""
+    await ji.upsert(
+        db_pool, "ji-apple/1", "arshad-personal",
+        _bank(instrument=None, parser="llm", payee="Apple"),
+        journal_file="personal/2026.journal",
+    )
+    assert (await ji.get(db_pool, "ji-apple/1"))["instrument"] is None
+    named = await ji.name_instrument(db_pool, ["ji-apple/1"], "axis-9640")
+    assert named == 1
+    assert (await ji.get(db_pool, "ji-apple/1"))["instrument"] == "axis-9640"
+
+
+@pytest.mark.asyncio
+async def test_a_statement_never_relabels_an_account_the_mail_already_named(db_pool):
+    """The safety half. A row whose own mail named the paying account was
+    decided by evidence about that payment; a statement that happens to cover
+    the same day and amount is a date-and-amount coincidence away from moving
+    a payment onto the wrong account, and moving it would be silent."""
+    await ji.upsert(
+        db_pool, "ji-hdfc/1", "arshad-personal", _bank(),  # instrument hdfc-1225
+        journal_file="personal/2026.journal",
+    )
+    named = await ji.name_instrument(db_pool, ["ji-hdfc/1", "ji-absent/9"], "axis-9640")
+    assert named == 0
+    assert (await ji.get(db_pool, "ji-hdfc/1"))["instrument"] == "hdfc-1225"

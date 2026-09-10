@@ -591,3 +591,28 @@ def test_a_zero_amount_row_on_an_ambiguous_page_is_refused_not_guessed(multipage
 def test_what_the_parser_reads_as_a_money_token(printed, expected):
     found = statements._NUM.findall(printed)
     assert [str(statements._amount(token)) for token in found] == expected
+
+
+def test_a_header_page_reads_its_narration_where_the_rows_print_it(multipage):
+    """#428. Page one prints `Particulars` at 38 and its rows at 22, so a map
+    built from the label alone cut 16 characters off every narration on that
+    page — and with them the reference the matcher joins on. Live proof: the
+    real FY2024-25 statement's first 23 rows read `1526/CEX WEBUY YES BANK LTD`
+    and `MENTS BANK`, every one of them with a NULL ref, and row 24 — the first
+    on a page whose columns are inferred — reads whole."""
+    rows = {r.occurred_on.day: (r.narration, r.ref) for r in parse(multipage).rows}
+    assert rows[1][0].startswith("POS/EXAMPLESTORE")
+    assert rows[2] == ("412345678901 UPI/P2A/612345678901/SPECIMEN", "612345678901")
+
+
+def test_the_column_left_of_the_narration_is_not_swallowed_into_it(mailed):
+    """The other half of #428, and why the floor comes off the header line
+    rather than off the date. The mailed layout puts `Value Date` between the
+    transaction date and `Transaction Details`, so the first text after a row's
+    date is a SECOND DATE, not the narration. Measure from the date alone and
+    every one of these seven narrations gains a value date — mid-string, not at
+    the front, because a wrapped line prints above its own dated line and sorts
+    before it. Nothing in this statement legitimately prints `dd/mm/yyyy` in a
+    narration, so the row's own date appearing in its text is the tell."""
+    for row in parse(mailed).rows:
+        assert row.occurred_on.strftime("%d/%m/%Y") not in row.narration, row.narration
