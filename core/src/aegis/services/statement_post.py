@@ -5,7 +5,7 @@ single `books._write` envelope, so `hledger check --strict` and the
 closing-balance check below both guard the whole thing and a failure reverts
 every row of it rather than leaving a half-reconciled account.
 
-Three things happen to a statement's rows, decided entirely by the matcher:
+Four things happen to a statement's rows:
 
 * a **matched** row promotes its journal block — `!` becomes `*`, the block
   takes the bank's date, and a `stmt:` tag records which statement proved it;
@@ -15,6 +15,13 @@ Three things happen to a statement's rows, decided entirely by the matcher:
 * an **ambiguous** row is posted by nobody. §9.4: one of its candidates
   already carries this money, so posting would add a third copy that the
   balance already counts through the candidate. It is recorded and left.
+* a **transfer counterpart** is a row the far statement's row already put in
+  the books (§8.4). Both statements print the same movement, so posting both
+  counts the money twice.
+
+The first three come from the matcher, which compares a row with the journal.
+The fourth comes from `statement_transfers`, which compares a row with another
+statement's row — a different question, in its own module.
 
 The closing-balance check is the point of the whole lane, and it runs INSIDE
 `mutate` — before `_write_sync` reaches `_check_sync` — so raising reverts the
@@ -24,6 +31,7 @@ able to run it honestly.
 
 from __future__ import annotations
 
+from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import Any
@@ -31,8 +39,9 @@ from typing import Any
 import structlog
 
 from aegis.api.models.money import MoneyEvent, payee_key
-from aegis.services import books
+from aegis.services import books, statement_transfers
 from aegis.services.statement_match import AMBIGUOUS, RowOutcome
+from aegis.services.statement_transfers import REVERSAL, TRANSFER, PairedRow
 from aegis.services.statements import ParsedStatement, StatementRow
 
 logger = structlog.get_logger()
@@ -46,6 +55,31 @@ MSGID_PREFIX = "stmt"
 #: A card statement prints no running balance, so §9.3's balance check has
 #: nothing to stand on and §6.2's arithmetic is the proof instead.
 _NO_BALANCE = "no_closing_balance"
+
+#: The index said a block existed and it does not. Recorded, not raised.
+PROMOTION_BLOCK_MISSING = "promotion_block_missing"
+
+#: An earlier run of this statement already wrote this row's block.
+ALREADY_POSTED = "already_posted"
+
+#: Skip reasons whose money NEVER REACHED THE JOURNAL. `movement_disagreement`
+#: adds these back, because the bank really moved them and a check that left
+#: them out would fail by exactly their amount and revert a statement in which
+#: nothing was wrong.
+#:
+#: The set is explicit because the skips are not alike, and two of them are the
+#: opposite case:
+#:
+#: * `ALREADY_POSTED` — an earlier run wrote this row as a `*` block. It is in
+#:   the period and in the cleared total.
+#: * `TRANSFER` — the FAR statement's row put this money in the books, under
+#:   its own msgid, touching this account. Adding it back would make the check
+#:   over by exactly that amount and revert a statement that was never wrong.
+#:   That is only true once the far block exists, though, and the far statement
+#:   may not have run yet — so `post_statement` looks in the journal and adds
+#:   the row back when it is genuinely not there. That is the one conditional
+#:   case, and it is decided at its own site rather than by this set.
+_NEVER_WRITTEN = frozenset({AMBIGUOUS, PROMOTION_BLOCK_MISSING})
 
 
 def msgid_for(row_id: str) -> str:
@@ -67,6 +101,9 @@ class PostPlan:
     posts: tuple[StatementRow, ...] = ()
     promotions: tuple[tuple[str, StatementRow], ...] = ()   # (msgid, the row that proved it)
     skipped: tuple[tuple[str, str], ...] = ()               # (row_id, reason)
+    #: row_id -> the row ↔ row pair that decided this row's counter account
+    #: (§8.4, §8.5). Covers rows in `posts` AND rows skipped as `TRANSFER`.
+    paired: Mapping[str, PairedRow] = field(default_factory=dict)
 
     @property
     def writes(self) -> int:
@@ -89,6 +126,8 @@ def plan(
     outcomes: dict[str, RowOutcome],
     *,
     entity: str,
+    declared: Collection[str] = (),
+    peer_rows: Sequence[StatementRow] = (),
 ) -> PostPlan:
     """What this statement will do, without touching anything.
 
@@ -96,7 +135,25 @@ def plan(
     all is treated as unmatched rather than skipped: the matcher not having
     reached a row is not evidence that the books already hold it, and silently
     dropping it would leave the closing balance short with no line saying why.
+
+    `peer_rows` is every statement row known for OTHER accounts, which is what
+    lets §8.4's transfer pairing run. None supplied means no pairs, not a
+    degraded answer — see `statement_transfers.find_transfers`.
+
+    A matched row promotes even when it is half of a pair: it HAS a block, and
+    that block is where the money already is. The pair still has a say, because
+    the far account it proves is what the promotion rewrites `equity:transfers`
+    to (§8.4's last sentence).
     """
+    paired = dict(statement_transfers.find_reversals(statement.rows, declared, entity=entity))
+    for row_id, leg in statement_transfers.find_transfers(
+        statement.rows, peer_rows, declared
+    ).items():
+        # A reversal wins on a row that is somehow in both. It is the tighter
+        # key — same instrument, same day, same reference — and both of its
+        # legs post, so it can never hide money the way a wrong skip would.
+        paired.setdefault(row_id, leg)
+
     posts: list[StatementRow] = []
     promotions: list[tuple[str, StatementRow]] = []
     skipped: list[tuple[str, str]] = []
@@ -110,6 +167,10 @@ def plan(
         if outcome is not None and outcome.matched and outcome.msgid:
             promotions.append((outcome.msgid, row))
             continue
+        leg = paired.get(row.row_id)
+        if leg is not None and not leg.posts:
+            skipped.append((row.row_id, TRANSFER))
+            continue
         posts.append(row)
     return PostPlan(
         statement_id=statement.statement_id,
@@ -118,21 +179,42 @@ def plan(
         posts=tuple(posts),
         promotions=tuple(promotions),
         skipped=tuple(skipped),
+        paired=paired,
     )
 
 
-def event_for(row: StatementRow, entity: str, rules: list[dict[str, Any]]) -> MoneyEvent:
+def event_for(
+    row: StatementRow,
+    entity: str,
+    rules: list[dict[str, Any]],
+    *,
+    declared: Collection[str] = (),
+    account: str | None = None,
+) -> MoneyEvent:
     """One unmatched statement row as a `MoneyEvent` (spec §9.2).
 
     `source_class='bank'` and `channel='statement'`: this came from the bank's
     own record, which is what lets `post_statement` write it `*`.
 
-    The account comes from `books.apply_rules` in Python, over the narration.
-    Not an hledger `.rules` file — §9.2 has the table of why: the yaml rules
-    already in use spell things hledger's `if` conditions cannot express
-    (`(?i)`, `\\d`, lookarounds), several would be a hard error and several
-    more would silently never match, and hledger cannot choose a file per row,
-    which the entity map requires.
+    The counter account is decided in three steps, strongest evidence first.
+
+    **`account`**, when a row ↔ row pair proved the far side. A pair is two
+    statements agreeing, which outranks anything read out of one narration.
+
+    **Own-account detection**, next — BEFORE the rules, which §8.4 is explicit
+    about and gives the reason for: left to the rules,
+    `CREDITCARD PAYMENT XXXX 1313` matches nothing, lands in `expenses:unknown`
+    and the card liability drifts by the full bill every month. A hit ends the
+    decision; the rules are not consulted at all, because a rule cannot know
+    that a counter account is one the owner holds and a merchant pattern that
+    happened to fire would take the transfer somewhere plausible and wrong.
+
+    **`books.apply_rules`**, in Python, over the narration. Not an hledger
+    `.rules` file — §9.2 has the table of why: the yaml rules already in use
+    spell things hledger's `if` conditions cannot express (`(?i)`, `\\d`,
+    lookarounds), several would be a hard error and several more would silently
+    never match, and hledger cannot choose a file per row, which the entity map
+    requires.
     """
     event = MoneyEvent(
         kind="transaction",
@@ -150,6 +232,15 @@ def event_for(row: StatementRow, entity: str, rules: list[dict[str, Any]]) -> Mo
         confidence=1.0,
     )
     event.payee_key = payee_key(event.payee)
+    if account:
+        event.account = account
+        return event
+    own = statement_transfers.own_account(
+        row.narration, declared, exclude=books.instrument_account(row.instrument, declared)
+    )
+    if own:
+        event.account = own
+        return event
     rule = books.apply_rules(rules, "", event.payee, direction=event.direction)
     if rule:
         if rule.get("payee"):
@@ -192,14 +283,14 @@ def movement_disagreement(
     means a backfill can be run in any order and a missing month costs only
     that month.
 
-    `unwritten` is the signed total of rows this statement deliberately did NOT
-    write — today only the ambiguous ones (§9.4). They are real money the bank
-    moved, so leaving them out of the comparison would make every statement
-    containing one fail by exactly their amount, and reverting on that would be
-    punishing the lane for its own correct caution. They are added back, which
-    keeps the check about "did the rows that should have landed, land?" rather
-    than "is the account complete?" — a different and unanswerable question
-    while any row is ambiguous.
+    `unwritten` is the signed total of rows whose money never reached the
+    journal — see `_NEVER_WRITTEN` for which skips those are, and which are the
+    opposite case. They are real money the bank moved, so leaving them out of
+    the comparison would make every statement containing one fail by exactly
+    their amount, and reverting on that would be punishing the lane for its own
+    correct caution. They are added back, which keeps the check about "did the
+    rows that should have landed, land?" rather than "is the account complete?"
+    — a different and unanswerable question while any row is ambiguous.
 
     A statement with no printed balances (a card) has nothing to check against;
     §6.2's arithmetic over its own rows is the proof there.
@@ -218,6 +309,54 @@ def movement_disagreement(
     )
 
 
+def _declared_before_write(cfg: books.BooksConfig) -> set[str]:
+    """The chart, read before the write envelope opens.
+
+    `plan` needs it to resolve own-account tails, and the plan is what decides
+    whether there is anything to write at all. A checkout that does not exist
+    yet — the clone happens INSIDE the envelope — has no chart to read, and an
+    empty set is the honest answer for it: own-account detection resolves
+    nothing and every row falls through to the rules, which is where it would
+    have gone anyway. `mutate` re-reads the chart after the pull, and that copy
+    is the one the writes are checked against.
+    """
+    if not (cfg.path / cfg.main).exists():
+        return set()
+    return books._declared_accounts_sync(cfg)
+
+
+def _far_in_books(
+    cfg: books.BooksConfig, leg: PairedRow, outcomes: Mapping[str, RowOutcome]
+) -> bool:
+    """Is the other half of this transfer already a block in the journal?
+
+    Decidable without the database, which is what makes the two statements
+    order-independent. Two ways the far row can be in the books, and the second
+    is not optional: the far statement may have posted the row under its own
+    `stmt/<row_id>` msgid, OR the matcher may have matched it to a block the
+    email lane wrote — in which case that block, not a new one, is where the
+    money is.
+    """
+    wanted = [msgid_for(leg.peer_row_id)]
+    peer = outcomes.get(leg.peer_row_id)
+    if peer is not None and peer.matched and peer.msgid:
+        wanted.append(peer.msgid)
+    for path in books.journal_files(cfg):
+        text = path.read_text()
+        if any(books.find_block(text, msgid) for msgid in wanted):
+            return True
+    return False
+
+
+def _counter_account(block: str) -> str:
+    """The account on a block's FIRST posting line — the counter account."""
+    for line in block.splitlines():
+        if line.startswith(books._INDENT) and not line.startswith(f"{books._INDENT};"):
+            match = books._POSTING_RE.match(line)
+            return match.group(1) if match else ""
+    return ""
+
+
 async def post_statement(
     statement: ParsedStatement,
     outcomes: dict[str, RowOutcome],
@@ -227,6 +366,7 @@ async def post_statement(
     rules: list[dict[str, Any]] | None = None,
     liability: bool = False,
     dry_run: bool = False,
+    peer_rows: Sequence[StatementRow] = (),
 ) -> PostResult:
     """Post and promote one statement, then prove the result against the bank.
 
@@ -241,10 +381,18 @@ async def post_statement(
     side has to be negated and it is done here, once, rather than in
     `balance_disagreement` where every reader would have to remember it.
 
-    `dry_run` computes and returns the plan without opening the repo, which is
-    what a person should look at before the first statement of a backfill.
+    `peer_rows` is every statement row known for OTHER accounts — one read of
+    `finance.statement_rows` in production. It is what lets §8.4's transfer
+    pairing see both halves of one movement; without it a pair is simply not
+    found, and the row posts with whatever account its own narration proves.
+
+    `dry_run` computes and returns the plan without writing, which is what a
+    person should look at before the first statement of a backfill.
     """
-    plan_ = plan(statement, outcomes, entity=entity)
+    declared = _declared_before_write(cfg)
+    plan_ = plan(
+        statement, outcomes, entity=entity, declared=declared, peer_rows=peer_rows
+    )
     result = PostResult(
         statement_id=plan_.statement_id, skipped=list(plan_.skipped)
     )
@@ -266,31 +414,60 @@ async def post_statement(
     # Signed money this statement moved that is NOT in the cleared total, so
     # the check can tell "a row did not land" from "a row was deliberately left
     # alone". A one-element list because `mutate` is a closure and this has to
-    # survive out of it. Filled at each skip site rather than reconstructed
-    # afterwards from `result.skipped`, because the two skip reasons differ in
-    # exactly this respect and a reconstruction has to re-derive which is which:
-    # an ambiguous or missing-block row never reached the journal, while an
-    # `already_posted` row is in the period as a `*` block from an earlier run
-    # and IS in the cleared total.
+    # survive out of it. Decided per skip REASON, from `_NEVER_WRITTEN`, rather
+    # than by treating every skip alike: an ambiguous or missing-block row never
+    # reached the journal, while an `already_posted` row is in the period as a
+    # `*` block from an earlier run and IS in the cleared total — and a transfer
+    # counterpart is the same case, once its far side exists.
     unwritten = [Decimal("0")]
 
     def mutate() -> None:
         declared = books._declared_accounts_sync(cfg)
         acct = books.instrument_account(statement.instrument, declared)
-        unwritten[0] = sum(
-            (signed(r) for r in statement.rows
-             if any(rid == r.row_id for rid, _ in plan_.skipped)),
-            Decimal("0"),
-        )
+        by_id = {row.row_id: row for row in statement.rows}
+        unwritten[0] = Decimal("0")
+        for row_id, reason in plan_.skipped:
+            row = by_id.get(row_id)
+            if row is None:
+                continue
+            if reason in _NEVER_WRITTEN:
+                unwritten[0] += signed(row)
+            elif reason == TRANSFER and not _far_in_books(
+                cfg, plan_.paired[row_id], outcomes
+            ):
+                # This side is not the one that posts (§8.4), and the far
+                # statement has not run yet — so nothing has put this money in
+                # the journal, and the check has to be told. The row stays
+                # skipped: posting it here is exactly the double count the pair
+                # exists to prevent, and the far statement will write it.
+                unwritten[0] += signed(row)
 
         for msgid, row in plan_.promotions:
             for path in books.journal_files(cfg):
                 text = path.read_text()
-                if books.find_block(text, msgid) is None:
+                span = books.find_block(text, msgid)
+                if span is None:
                     continue
                 rel = str(path.relative_to(cfg.path))
                 if rel not in touched:
                     touched.append(rel)
+                # §8.4's last sentence. The email lane posts a card bill or an
+                # IMPS transfer to `equity:transfers`, because an alert cannot
+                # tell which account the money went to. The pair can, so a
+                # promotion that has one moves the posting to it — otherwise
+                # the card liability is never credited and the clearing account
+                # grows by the bill every month. Only `equity:transfers` is
+                # rewritten: a block already naming a real account was decided
+                # by something with more evidence than this.
+                leg = plan_.paired.get(row.row_id)
+                far = (
+                    leg.account
+                    if leg is not None
+                    and leg.kind == TRANSFER
+                    and _counter_account(text[span[0]:span[1]])
+                    == statement_transfers.CLEARING_ACCOUNT
+                    else None
+                )
                 # The bank's date, not the email's: see `rewrite_block`'s `on`.
                 # Without it a block dated three days off the bank's lands on
                 # the wrong side of the closing date and the check below fails
@@ -301,6 +478,7 @@ async def post_statement(
                         msgid,
                         status="*",
                         on=row.occurred_on,
+                        account=far,
                         add_tags={"stmt": plan_.statement_id},
                     )
                 )
@@ -310,11 +488,26 @@ async def post_statement(
                 # The index said there was a block and there is not. Recorded,
                 # not raised: one stale index row must not revert a whole
                 # statement, and the row stays visible as a skip.
-                result.skipped.append((row.row_id, "promotion_block_missing"))
+                result.skipped.append((row.row_id, PROMOTION_BLOCK_MISSING))
                 unwritten[0] += signed(row)
 
         for row in plan_.posts:
-            event = event_for(row, entity, rules)
+            leg = plan_.paired.get(row.row_id)
+            if leg is not None and leg.kind == TRANSFER and _far_in_books(cfg, leg, outcomes):
+                # This side is the one §8.4 nominates to post, but the far side
+                # got there first — its own row, or the email block the matcher
+                # gave it. The money is in the books once and must stay that
+                # way, whichever statement the operator ran first. NOT added to
+                # `unwritten`: it IS in the cleared total.
+                result.skipped.append((row.row_id, TRANSFER))
+                continue
+            event = event_for(
+                row,
+                entity,
+                rules,
+                declared=declared,
+                account=leg.account if leg is not None else None,
+            )
             msgid = msgid_for(row.row_id)
             rel = books.journal_rel(event.entity, event.occurred_on)
             already = False
@@ -323,7 +516,7 @@ async def post_statement(
                     already = True
                     break
             if already:
-                result.skipped.append((row.row_id, "already_posted"))
+                result.skipped.append((row.row_id, ALREADY_POSTED))
                 continue
             counter = event.account or books.account_for(
                 event.category, event.direction, event.entity
@@ -349,6 +542,16 @@ async def post_statement(
                     ),
                 )
             )
+            if leg is not None and leg.kind == REVERSAL:
+                # §8.5. `render_transaction` builds its tag line from the
+                # event's own fields and has no room for one more, so the tag
+                # goes on through the sanctioned rewriter. The peer's row_id is
+                # the only thing linking the two legs in the journal.
+                path.write_text(
+                    books.rewrite_block(
+                        path.read_text(), msgid, add_tags={REVERSAL: leg.peer_row_id}
+                    )
+                )
             result.posted.append(msgid)
 
         # §9.3, inside the envelope so a disagreement reverts the statement.
