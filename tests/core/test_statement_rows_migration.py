@@ -1,4 +1,4 @@
-"""Migrations 032 and 042 — `finance.statement_rows` has the shape spec §7
+"""Migrations 032 and 043 — `finance.statement_rows` has the shape spec §7
 gives it, plus the two foreign-currency columns §8.5 earned."""
 
 import pytest
@@ -8,7 +8,7 @@ import pytest
 # ambiguous row could not choose between) silently loses what the matcher and
 # the digest are built on, so this is pinned rather than smoke-tested.
 #
-# `fx_currency`/`fx_amount` (migration 042) hold the original of a card charge
+# `fx_currency`/`fx_amount` (migration 043) hold the original of a card charge
 # made abroad, which only the card layout prints. Without them the matcher has
 # to convert a rupee amount back through a rate production does not have.
 EXPECTED = {
