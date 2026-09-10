@@ -1012,6 +1012,14 @@ async def _write(
         await asyncio.to_thread(_write_sync, cfg, summary, mutate, paths)
 
 
+#: Every commodity named in a balance cell. Anything that is not part of a
+#: number is a symbol or a code — `₹`, `$`, `£`, `USD`. Reading the symbols is
+#: how a multi-commodity cell is told from a rupee one with thousands
+#: separators; trying to parse the digits and catching the failure is not, as
+#: `"$4.00, ₹0"` strips to `4.000` and parses cleanly into a wrong answer.
+_COMMODITY_RE = re.compile(r"[^\d\s.,+-]+")
+
+
 def cleared_movement_sync(
     cfg: BooksConfig, account: str, start: date, end: date
 ) -> Decimal:
@@ -1044,6 +1052,21 @@ def cleared_movement_sync(
     A non-zero exit raises rather than returning zero: zero reads as "nothing
     moved", which against a real statement is a disagreement, and would revert
     a whole statement for a broken hledger call.
+
+    **A commodity `-X ₹` could not price raises `BooksCheckError`.** With no
+    rate for a commodity on the dates involved, hledger leaves it alone and
+    prints a multi-commodity cell — `"$-4.00, ₹-100.00"` — and it exits 0 while
+    doing it. This is live: production holds `$` and `£` blocks on `axis-9640`
+    and `axis-cc-1313`, and `prices.journal` carries current rates, not the
+    historical ones those blocks need. Two answers were available and both are
+    wrong: stripping the cell to digits gives `-4.00-100.00` and raises
+    `decimal.InvalidOperation`, which is not a `BooksError`, so it escapes
+    `_write_sync` as itself, the statement caller's `except BooksCheckError`
+    misses it and the whole run dies at the first statement — and `axis-9640`
+    sorts first. Taking the `₹` part and dropping the rest understates the
+    movement and lets a wrong ledger pass the only check that guards it. So the
+    statement reverts, the caller records a finding naming the commodity, and
+    the run carries on.
     """
     proc = _spawn(
         [
@@ -1066,6 +1089,15 @@ def cleared_movement_sync(
         if not parts or len(parts[0]) < 2:
             continue
         cell = parts[0][1].replace("\u00a0", "").replace("\u202f", "")
+        unpriced = {
+            symbol for symbol in _COMMODITY_RE.findall(cell) if symbol != _SYMBOL["INR"]
+        }
+        if unpriced:
+            raise BooksCheckError(
+                f"cleared movement for {account} {start}..{end} is not all "
+                f"{_SYMBOL['INR']}: no price for {', '.join(sorted(unpriced))} "
+                f"on these dates — hledger says {cell}"
+            )
         digits = re.sub(r"[^\d.\-]", "", cell)
         if digits not in ("", "-", ".", "-."):
             total += Decimal(digits)

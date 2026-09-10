@@ -833,16 +833,21 @@ async def test_a_transfer_straddling_a_month_boundary_does_not_break_either_chec
     assert "2026-07-31 * IMPS/612345678907/TO XXXXXXXXXX1225" in text
 
 
-def _dated_row(instrument: str, occurred: date, amount: str) -> StatementRow:
-    """A row on any date, unlike `_row`, which is fixed to July."""
+def _dated_row(instrument: str, occurred: date, amount: str, *,
+               direction="out", narration="CARD") -> StatementRow:
+    """A row on any date, unlike `_row`, which is fixed to July.
+
+    No `balance_after`: a card prints no running balance, and this is the
+    helper the card tests use.
+    """
     money = Decimal(amount)
     return StatementRow(
         row_id=row_id_for(
-            instrument=instrument, occurred_on=occurred, direction="out",
-            amount=money, balance_after=None, occurrence_index=0, narration="CARD",
+            instrument=instrument, occurred_on=occurred, direction=direction,
+            amount=money, balance_after=None, occurrence_index=0, narration=narration,
         ),
-        instrument=instrument, occurred_on=occurred, narration="CARD", ref=None,
-        direction="out", amount=money, balance_after=None,
+        instrument=instrument, occurred_on=occurred, narration=narration, ref=None,
+        direction=direction, amount=money, balance_after=None,
         statement_id=f"{instrument}/x", file_sha256="fixture",
     )
 
@@ -856,14 +861,15 @@ def _periodic(instrument, start, end, rows) -> ParsedStatement:
     )
 
 
-def test_the_check_window_covers_rows_outside_the_printed_period():
-    """§9.3 asks hledger for the union of the printed period and the rows.
+def test_the_check_window_is_the_rows_not_the_printed_period():
+    """§9.3 asks hledger for the span the ROWS cover.
 
     An Axis card statement bills 20/07-18/08 and posts its transactions from
     18/07 to 17/08 — the period is billing dates, the rows are posting dates.
-    Ask for the printed period alone and the first two days' blocks sit outside
-    it, the cleared movement comes up short by exactly those rows, and a
-    statement that was never wrong reverts.
+    Ask for the printed period and the first two days' blocks sit outside it,
+    the cleared movement comes up short by exactly those rows, and a statement
+    that was never wrong reverts. Ask for the union and the window runs to
+    18/08, which is the day the NEXT statement's rows start.
     """
     stmt = _periodic(
         "axis-cc-1313", date(2026, 7, 20), date(2026, 8, 18),
@@ -872,13 +878,232 @@ def test_the_check_window_covers_rows_outside_the_printed_period():
             _dated_row("axis-cc-1313", date(2026, 8, 17), "200.00"),
         ],
     )
-    assert statement_post.check_window(stmt) == (date(2026, 7, 18), date(2026, 8, 18))
+    assert statement_post.check_window(stmt) == (date(2026, 7, 18), date(2026, 8, 17))
 
 
-def test_the_check_window_is_the_printed_period_when_rows_fall_inside_it():
-    """A bank statement's rows sit inside its period, so nothing widens."""
+def test_the_check_window_narrows_to_the_rows_inside_a_bank_period():
+    """A bank statement's rows sit inside its period, and the window follows
+    them there. The opening balance is the balance immediately before the first
+    row, so the movement the bank claims is the rows' movement — the empty days
+    at either end of the period belong to no row and to no block."""
     stmt = _periodic(
         "hdfc-1225", date(2026, 7, 12), date(2026, 8, 11),
         [_dated_row("hdfc-1225", date(2026, 7, 20), "50.00")],
     )
+    assert statement_post.check_window(stmt) == (date(2026, 7, 20), date(2026, 7, 20))
+
+
+def test_a_statement_with_no_rows_falls_back_to_its_period():
+    """Nothing to span. `post_statement` returns before the check in this case
+    — there is nothing to write — so this is what a direct caller gets."""
+    stmt = _periodic("hdfc-1225", date(2026, 7, 12), date(2026, 8, 11), [])
     assert statement_post.check_window(stmt) == (date(2026, 7, 12), date(2026, 8, 11))
+
+
+# ------------------------------------------- the check on a liability (§9.3)
+
+
+def _card_statement(rows, opening, closing, *,
+                    start=date(2026, 7, 1), end=date(2026, 7, 31)) -> ParsedStatement:
+    """A card statement carrying the balances §15.11 says a card really prints.
+
+    `_card_pair`'s card has `closing=None`, so every card test above stops
+    before the check runs. That was the gap: the closing-balance check had
+    never once run on a liability, and the sign flip that makes it work on one
+    could be deleted with the whole file still green.
+
+    `opening` and `closing` are what the card OWED, positive — the convention
+    `Previous Balance` and `Total Payment Due` are printed in.
+    """
+    return ParsedStatement(
+        status="ok", instrument="axis-cc-1313", period_start=start, period_end=end,
+        opening_balance=Decimal(opening), closing_balance=Decimal(closing),
+        rows=tuple(rows), statement_id=f"axis-cc-1313/{start}..{end}", file_sha256="fixture",
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_card_statement_with_printed_balances_passes_the_check(tmp_path):
+    """The plainest liability case: two purchases, nothing skipped.
+
+    hledger reports a card negative when you owe and the statement prints what
+    you owe as a positive number, so the cleared movement has to be negated
+    before it meets the printed figures. Without that the books look like they
+    moved -150 against a bank that says +150.
+    """
+    cfg = _repo(tmp_path)
+    rows = [
+        _dated_row("axis-cc-1313", date(2026, 7, 5), "100.00"),
+        _dated_row("axis-cc-1313", date(2026, 7, 6), "50.00"),
+    ]
+    result = await statement_post.post_statement(
+        _card_statement(rows, "0", "150.00"), {}, cfg, entity="personal", liability=True,
+    )
+
+    assert len(result.posted) == 2
+    assert result.balance_checked is True and result.balance_reason == ""
+    assert _movement(cfg, "liabilities:card:axis:1313") == Decimal("-150.00")
+
+
+@pytest.mark.asyncio
+async def test_a_skipped_row_on_a_card_is_added_back_in_the_card_s_own_sign(tmp_path):
+    """`unwritten` is accumulated with `signed()`, which is hledger's
+    convention, so it needs the same flip the cleared movement gets.
+
+    A card with one ambiguous ₹100 purchase and one posted ₹50 purchase, going
+    from 0 owed to 150 owed. Flip one figure and not the other and the check
+    misses by TWICE the skipped row — it reported "difference -200" — so every
+    card statement holding a single skip reverted, and the row it reverted on
+    was usually the card's own payment.
+    """
+    cfg = _repo(tmp_path)
+    rows = [
+        _dated_row("axis-cc-1313", date(2026, 7, 5), "100.00"),
+        _dated_row("axis-cc-1313", date(2026, 7, 6), "50.00"),
+    ]
+    outcomes = {rows[0].row_id: RowOutcome(
+        row_id=rows[0].row_id, statement_id="s", instrument="axis-cc-1313",
+        occurred_on=date(2026, 7, 5), skip_reason=AMBIGUOUS, candidates=("m/a", "m/b"),
+    )}
+
+    result = await statement_post.post_statement(
+        _card_statement(rows, "0", "150.00"), outcomes, cfg,
+        entity="personal", liability=True,
+    )
+
+    assert result.skipped == [(rows[0].row_id, AMBIGUOUS)]
+    assert len(result.posted) == 1
+    assert result.balance_checked is True and result.balance_reason == ""
+
+
+@pytest.mark.asyncio
+async def test_a_card_running_before_its_bank_statement_still_checks_out(tmp_path):
+    """The production shape, and the one that ran every day.
+
+    Statements post in `(instrument, period_end)` order, so `axis-cc-1313` runs
+    before every `hdfc-*`: the card's payment credit is skipped as a transfer
+    counterpart with the far block not yet written, and its ₹2,500 is added
+    back as money that never reached the journal. In the card's own sign that
+    is -2,500 — the payment REDUCED what was owed. Left in hledger's sign it
+    read +2,500 and the check reported "the bank moved -1600.00, the books
+    moved 900.00 with 2500.00 left unwritten — difference 5000.00".
+    """
+    cfg = _repo(tmp_path)
+    bank_row = _row(3, "2500.00", narration="CREDITCARD PAYMENT XXXX 1313", balance="-2500.00")
+    payment = _dated_row("axis-cc-1313", date(2026, 7, 4), "2500.00",
+                         direction="in", narration="PAYMENT RECEIVED THANK YOU")
+    purchase = _dated_row("axis-cc-1313", date(2026, 7, 6), "900.00", narration="AMAZON")
+
+    result = await statement_post.post_statement(
+        _card_statement([payment, purchase], "2500.00", "900.00"), {}, cfg,
+        entity="personal", liability=True, peer_rows=[bank_row],
+    )
+
+    assert (payment.row_id, TRANSFER) in result.skipped
+    assert len(result.posted) == 1, "the purchase, and not the payment"
+    assert result.balance_checked is True and result.balance_reason == ""
+
+
+# ------------------------- the window and the previous statement's rows (§9.3)
+
+
+def _may_and_june_cards():
+    """Two consecutive Axis card statements, on the real dates.
+
+    The row spans are contiguous and never overlap — 18/05-17/06, 18/06-17/07 —
+    while each printed period runs to the day the NEXT statement's rows start.
+    """
+    may = _card_statement(
+        [
+            _dated_row("axis-cc-1313", date(2026, 5, 18), "100.00"),
+            _dated_row("axis-cc-1313", date(2026, 6, 17), "200.00"),
+        ],
+        "0", "300.00", start=date(2026, 5, 20), end=date(2026, 6, 18),
+    )
+    june = _card_statement(
+        [
+            _dated_row("axis-cc-1313", date(2026, 6, 18), "400.00"),
+            _dated_row("axis-cc-1313", date(2026, 7, 17), "500.00"),
+        ],
+        "300.00", "1200.00", start=date(2026, 6, 20), end=date(2026, 7, 18),
+    )
+    return may, june
+
+
+@pytest.mark.asyncio
+async def test_consecutive_card_statements_both_check_out_in_order(tmp_path):
+    cfg = _repo(tmp_path)
+    may, june = _may_and_june_cards()
+
+    first = await statement_post.post_statement(
+        may, {}, cfg, entity="personal", liability=True,
+    )
+    second = await statement_post.post_statement(
+        june, {}, cfg, entity="personal", liability=True,
+    )
+
+    assert first.balance_checked is True and first.balance_reason == ""
+    assert second.balance_checked is True and second.balance_reason == ""
+
+
+@pytest.mark.asyncio
+async def test_an_older_statement_posted_later_does_not_count_the_newer_one(tmp_path):
+    """§15.11's stated property: a backfill runs in any order.
+
+    The operator drops the May statement into Drive after June's is already
+    posted. May's rows stop on 17/06 and June's start on 18/06 — but May's
+    printed period runs to 18/06, so a window that unions the two counts June's
+    first row in May's movement and reverts a statement in which nothing was
+    wrong. The row span holds no such day.
+    """
+    cfg = _repo(tmp_path)
+    may, june = _may_and_june_cards()
+
+    first = await statement_post.post_statement(
+        june, {}, cfg, entity="personal", liability=True,
+    )
+    second = await statement_post.post_statement(
+        may, {}, cfg, entity="personal", liability=True,
+    )
+
+    assert first.balance_checked is True and first.balance_reason == ""
+    assert second.balance_checked is True and second.balance_reason == ""
+
+
+@pytest.mark.asyncio
+async def test_a_counterpart_inside_the_rows_but_outside_the_printed_period(tmp_path):
+    """The check window and the counterpart test have to be ONE window.
+
+    The bank pays the card bill on 19/07. The card's period starts on 20/07 and
+    its rows start on 18/07, so that block is inside the window hledger is
+    asked for and outside the printed period. Ask the printed period whether
+    the counterpart landed and the answer is "no": its ₹2,500 is added back on
+    top of a cleared movement that already counts it, and a correct statement
+    reverts by exactly the transfer.
+    """
+    cfg = _repo(tmp_path)
+    bank_row = _row(19, "2500.00", narration="CREDITCARD PAYMENT XXXX 1313", balance="-2500.00")
+    bank = _statement([bank_row], "-2500.00")
+    payment = _dated_row("axis-cc-1313", date(2026, 7, 21), "2500.00",
+                         direction="in", narration="PAYMENT RECEIVED THANK YOU")
+    card = _card_statement(
+        [
+            _dated_row("axis-cc-1313", date(2026, 7, 18), "100.00"),
+            payment,
+            _dated_row("axis-cc-1313", date(2026, 8, 17), "200.00"),
+        ],
+        "2500.00", "300.00", start=date(2026, 7, 20), end=date(2026, 8, 18),
+    )
+
+    first = await statement_post.post_statement(
+        bank, {}, cfg, entity="personal", peer_rows=card.rows,
+    )
+    second = await statement_post.post_statement(
+        card, {}, cfg, entity="personal", liability=True, peer_rows=bank.rows,
+    )
+
+    assert first.balance_reason == ""
+    assert (payment.row_id, TRANSFER) in second.skipped
+    assert second.balance_checked is True and second.balance_reason == ""
+    text = (cfg.path / "personal" / "2026.journal").read_text()
+    assert text.count("₹2500.00") == 1, "one block for one movement"
