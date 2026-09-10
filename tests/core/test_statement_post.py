@@ -1165,3 +1165,84 @@ async def test_a_foreign_block_promoted_with_its_cost_lets_the_check_run(tmp_pat
     assert "$" not in out, out
     # hledger prints the commodity's own digit grouping — `₹ -19,091.99`.
     assert "19091.99" in out.replace(",", ""), out
+
+
+async def test_promotion_moves_an_unplaceable_block_onto_the_account_it_proves(tmp_path):
+    """A receipt that named no account posts to `assets:unknown` (#407).
+
+    The statement is the bank saying the money moved through THIS account, so
+    promotion moves the posting there. Skip it and the block never touches the
+    instrument: §9.3's movement comes up short by exactly those rows and the
+    whole statement reverts. On the first live card statement two such blocks —
+    ₹99.00 and ₹1047.83 — were the entire ₹1146.83 gap.
+    """
+    cfg = _repo(tmp_path)
+    (cfg.path / "personal" / "2026.journal").write_text(
+        "; p\n\n"
+        "2026-07-23 ! GoDaddy\n"
+        "    ; msgid: mail/godaddy\n"
+        "    ; channel: receipt\n"
+        "    expenses:media                          ₹99.00\n"
+        "    assets:unknown\n"
+    )
+    subprocess.run(
+        ["git", "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qam", "seed"],
+        cwd=cfg.path, check=True,
+    )
+    row = _row(23, "99.00", narration="GODADDY,MUMBAI", instrument="axis-cc-1313")
+    stmt = _card_statement([row], "0", "99.00")
+    outcome = RowOutcome(
+        row_id=row.row_id, statement_id=stmt.statement_id, instrument="axis-cc-1313",
+        occurred_on=row.occurred_on, matched_pass=PASS_WINDOW, msgid="mail/godaddy",
+        delta_days=0,
+    )
+
+    result = await statement_post.post_statement(
+        stmt, {row.row_id: outcome}, cfg, entity="personal", liability=True
+    )
+
+    assert result.promoted == ["mail/godaddy"], result
+    assert result.balance_checked and result.balance_reason == "", result.balance_reason
+    text = (cfg.path / "personal" / "2026.journal").read_text()
+    assert "liabilities:card:axis:1313" in text, text
+    assert "assets:unknown" not in text, text
+
+
+async def test_promotion_leaves_a_real_instrument_account_alone(tmp_path):
+    """Only the placeholder moves.
+
+    A block already naming a real account was decided by something with more
+    evidence than a matcher's date-and-amount guess, so a promotion must not
+    overwrite it — that would let one wrong match silently move money between
+    two accounts the owner really holds.
+    """
+    cfg = _repo(tmp_path)
+    (cfg.path / "personal" / "2026.journal").write_text(
+        "; p\n\n"
+        "2026-07-23 ! GoDaddy\n"
+        "    ; msgid: mail/godaddy\n"
+        "    ; channel: receipt, instrument: hdfc-1225\n"
+        "    expenses:media                          ₹99.00\n"
+        "    assets:bank:hdfc:1225\n"
+    )
+    subprocess.run(
+        ["git", "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qam", "seed"],
+        cwd=cfg.path, check=True,
+    )
+    row = _row(23, "99.00", narration="GODADDY,MUMBAI", instrument="axis-cc-1313")
+    # No printed closing balance, so §9.3's check does not run: leaving the
+    # block on hdfc WOULD fail it, and a revert would hide the very thing this
+    # test is about by restoring the file either way.
+    stmt = _statement([row], None, instrument="axis-cc-1313")
+    outcome = RowOutcome(
+        row_id=row.row_id, statement_id=stmt.statement_id, instrument="axis-cc-1313",
+        occurred_on=row.occurred_on, matched_pass=PASS_WINDOW, msgid="mail/godaddy",
+        delta_days=0,
+    )
+    result = await statement_post.post_statement(
+        stmt, {row.row_id: outcome}, cfg, entity="personal", liability=True
+    )
+    assert result.promoted == ["mail/godaddy"], result
+    text = (cfg.path / "personal" / "2026.journal").read_text()
+    assert "assets:bank:hdfc:1225" in text, text
+    assert "liabilities:card" not in text, text
