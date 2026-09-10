@@ -365,7 +365,11 @@ def test_books_write_flow_is_gated_on_money_hygiene():
         # Then +3 activities and NO new flow from the hub's grouping step
         # (find_group_candidates, judge_group, apply_group), which rides
         # HubSweepFlow. Unflagged, so all three rows move.
-        (True, True, 44, 220),
+        # The statement lane's tick (spec §14 step 7): StatementReconcileFlow
+        # (+1 flow) and StatementActivities' intake_statements and
+        # reconcile_statements (+2 activities). Both are money-flagged, so only
+        # the money-on row moves.
+        (True, True, 45, 222),
         (False, False, 35, 189),
         (True, False, 39, 205),
     ],

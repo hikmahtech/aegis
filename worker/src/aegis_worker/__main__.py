@@ -48,7 +48,6 @@ from aegis_worker.activities.llm_governor import LLMGovernorActivities
 from aegis_worker.activities.meeting import MeetingActivities
 from aegis_worker.activities.memory import MemoryActivities
 from aegis_worker.activities.money import MoneyActivities
-from aegis_worker.activities.statements import StatementActivities
 from aegis_worker.activities.people import PeopleActivities
 from aegis_worker.activities.profile import ProfileActivities
 from aegis_worker.activities.raindrop import RaindropActivities
@@ -57,6 +56,7 @@ from aegis_worker.activities.rss import RssActivities
 from aegis_worker.activities.runs_v3 import RunRecorderActivities
 from aegis_worker.activities.sentry_ingest import SentryIngestActivities
 from aegis_worker.activities.social import SocialActivities
+from aegis_worker.activities.statements import StatementActivities
 from aegis_worker.activities.todoist import TodoistActivities
 from aegis_worker.activities.wearable import WearableActivities
 from aegis_worker.bootstrap import bootstrap

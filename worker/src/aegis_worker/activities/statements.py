@@ -19,7 +19,7 @@ from __future__ import annotations
 import json
 from collections.abc import Mapping
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -88,11 +88,28 @@ class StatementActivities:
             declared=declared,
             dry_run=dry_run,
         )
+        # §15.4: the statement-scoped classes get their OWN `reconcile_findings`
+        # call. Folded into the instrument-scoped one, each set would resolve
+        # the other — neither appears among the other's findings.
+        from aegis.services import statement_findings
+
+        swept = await statement_findings.sweep(
+            self.db_pool,
+            statement_findings.intake_findings(report),
+            kinds=(statement_findings.STATEMENT,),
+        )
         return {
             "status": "ok",
             "files": len(report.outcomes),
             "stored": report.stored,
             "existing": report.skipped_existing,
+            "findings": {
+                k: {
+                    "fresh": len(v.get("fresh") or []),
+                    "resolved": len(v.get("resolved") or []),
+                }
+                for k, v in swept.items()
+            },
             "failures": [
                 {
                     "file": o.title,
@@ -229,14 +246,26 @@ class StatementActivities:
                 instrument=statement.instrument,
             )
 
-        findings = statement_findings.match_findings(run)
+        # Coverage is swept in the SAME call as the rest of the instrument
+        # classes, and it has to be: `statement_missing` is one of them, so a
+        # sweep that produced no coverage findings would resolve every open
+        # "no statement arrived" problem for the reason that it never looked.
+        period = _last_month(date.today())
+        findings = statement_findings.match_findings(
+            run
+        ) + statement_findings.missing_statement_findings(
+            accounts,
+            {s.instrument for s in statements if s.period_end.strftime("%Y-%m") == period},
+            period=period,
+        )
         swept = await statement_findings.sweep(
             self.db_pool,
             findings,
             # Say which kinds this tick evaluated. A kind left out arrives as an
             # empty findings list, and an empty list is what resolves every open
             # problem of that kind — so a match-only run that stayed quiet would
-            # report every locked statement as fixed.
+            # report every locked statement as fixed. The `statement` kind is
+            # intake's to sweep, not this activity's.
             kinds=(statement_findings.INSTRUMENT, statement_findings.CURRENCY),
         )
         return {
@@ -245,7 +274,13 @@ class StatementActivities:
             "posted": posted,
             "promoted": promoted,
             "results": results,
-            "findings": {k: v.get("fresh_count", v) for k, v in swept.items()},
+            "findings": {
+                k: {
+                    "fresh": len(v.get("fresh") or []),
+                    "resolved": len(v.get("resolved") or []),
+                }
+                for k, v in swept.items()
+            },
             "digest": statement_findings.monthly_digest(run),
         }
 
@@ -290,6 +325,18 @@ async def load_statements(pool: Any) -> list[Any]:
             )
         )
     return out
+
+
+def _last_month(today: date) -> str:
+    """The calendar month before `today`, as `YYYY-MM`.
+
+    Coverage asks "did a statement arrive for last month?" rather than "for
+    this month": a statement for the current month has not been sent yet, so
+    asking about it would report every account as missing, every day, until
+    the month ended.
+    """
+    first = today.replace(day=1)
+    return (first - timedelta(days=1)).strftime("%Y-%m")
 
 
 def _entity_map(accounts: Mapping[str, Any]) -> dict[str, Any]:

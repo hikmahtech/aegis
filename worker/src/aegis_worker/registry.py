@@ -543,6 +543,10 @@ FLOWS: tuple[FlowSpec, ...] = (
 ACTIVITY_CLASS_FLAGS: dict[str, str] = {
     "HomelabActivities": "homelab_enabled",
     "MoneyActivities": "money_hygiene_enabled",
+    # Same flag as the rest of the money lane: the statement activities write
+    # to the same books through the same flock, and a money-off install must
+    # not serve their task queue either.
+    "StatementActivities": "money_hygiene_enabled",
 }
 
 
