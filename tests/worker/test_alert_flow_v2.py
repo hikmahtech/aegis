@@ -397,10 +397,9 @@ async def test_flow_resolved_by_investigation():
 
 
 async def test_flow_actionable_verdict_logs_only():
-    """v3 has no tasks table; "actionable" verdict goes through Gate-2.
-    Under `start_time_skipping`, the 48h Gate-2 timer fires immediately —
-    archived Gate-2 is treated as terminal (sub-fix 2 of workflow-leanness
-    sweep): we do NOT auto-emit the verdict ping for an unattended decision."""
+    """An `actionable` verdict with no fix branch and no commands has nothing
+    a card could approve, so it is logged with no Gate-2 card (#500): the
+    verdict goes on the task and the timeline, and the run ends `logged`."""
     _reset(
         assess_result={
             "status": "actionable",
@@ -426,15 +425,17 @@ async def test_flow_actionable_verdict_logs_only():
             task_queue="test-q",
         )
 
-    assert result["status"] == "gate2_archived"
+    assert result["status"] == "logged"
+    assert result["decision_card"] is False
 
 
 async def test_flow_actionable_verdict_goes_through_gate2():
-    """v3 has no tasks table; an `actionable` verdict goes through Gate-2.
-    Under `start_time_skipping` the 48h Gate-2 timer fires immediately,
-    producing `gate2_archived`. `auto_fixable` was removed as a valid
-    Haiku verdict status during the workflow-leanness sweep — `actionable`
-    covers everything that needs a fix."""
+    """An `actionable` verdict whose investigation staged a fix branch goes
+    through Gate-2: there is a PR to approve. Under `start_time_skipping` the
+    48h Gate-2 timer fires immediately, producing `gate2_archived`.
+    `auto_fixable` was removed as a valid Haiku verdict status during the
+    workflow-leanness sweep — `actionable` covers everything that needs a
+    fix."""
     _reset(
         assess_result={
             "status": "actionable",
@@ -443,6 +444,11 @@ async def test_flow_actionable_verdict_goes_through_gate2():
             "confidence": 0.9,
         },
     )
+    _state["run_investigation_result"] = {
+        **_state["run_investigation_result"],
+        "branch": "aegis-fix/null-check",
+        "branches": {"aegis": "aegis-fix/null-check"},
+    }
 
     async with (
         await WorkflowEnvironment.start_time_skipping() as env,
