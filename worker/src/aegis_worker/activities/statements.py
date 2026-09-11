@@ -489,9 +489,12 @@ async def record_outcomes(pool: Any, outcomes: Iterable[Any]) -> int:
     **A record, never an input.** Nothing reads these columns back into a match
     or a post: every tick re-decides every row from the journal as it stands,
     and a stored match read back as evidence would outlive the evidence for it.
-    That holds for `skip_reason` too — no loader reads it, so the matcher's
-    `ambiguous` stored there is a record like the rest, not a standing skip. A
-    reader added later would turn it into one.
+
+    `skip_reason` is deliberately not written. `candidates` with no
+    `matched_msgid` already records "ambiguous", and spec §8.4 makes the poster
+    the column's owner (`transfer_counterpart`): a matcher writing its own
+    verdict there would wipe the poster's value every tick, through the guard
+    below, the day that writer lands.
 
     Only a row whose verdict CHANGED is written: the tick runs daily over every
     stored row, and rewriting ~2,800 of them to the values they already hold is
@@ -508,7 +511,6 @@ async def record_outcomes(pool: Any, outcomes: Iterable[Any]) -> int:
             "row_id": o.row_id,
             "matched_msgid": o.msgid if o.matched else None,
             "candidates": list(o.candidates) or None,
-            "skip_reason": o.skip_reason,
         }
         for o in outcomes
     ]
@@ -518,14 +520,12 @@ async def record_outcomes(pool: Any, outcomes: Iterable[Any]) -> int:
         """
         UPDATE finance.statement_rows AS sr
            SET matched_msgid = v.matched_msgid,
-               candidates    = v.candidates,
-               skip_reason   = v.skip_reason
+               candidates    = v.candidates
           FROM jsonb_to_recordset($1::jsonb)
-               AS v(row_id text, matched_msgid text, candidates jsonb, skip_reason text)
+               AS v(row_id text, matched_msgid text, candidates jsonb)
          WHERE sr.row_id = v.row_id
            AND (sr.matched_msgid IS DISTINCT FROM v.matched_msgid
-             OR sr.candidates    IS DISTINCT FROM v.candidates
-             OR sr.skip_reason   IS DISTINCT FROM v.skip_reason)
+             OR sr.candidates    IS DISTINCT FROM v.candidates)
         """,
         batch,
     )

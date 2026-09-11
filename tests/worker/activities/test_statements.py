@@ -691,7 +691,9 @@ async def test_the_matchers_verdict_is_recorded_on_its_row(clean, tmp_path):
     assert got[matched]["candidates"] is None
     assert got[ambiguous]["matched_msgid"] is None
     assert got[ambiguous]["candidates"] == ["st-amb-1", "st-amb-2"]
-    assert got[ambiguous]["skip_reason"] == "ambiguous"
+    # Candidates with no match already say "ambiguous". `skip_reason` is the
+    # poster's column (spec §8.4), and the matcher leaves it alone.
+    assert got[ambiguous]["skip_reason"] is None
     assert got[unmatched]["matched_msgid"] is None
     assert got[unmatched]["candidates"] is None
 
@@ -755,8 +757,8 @@ async def test_a_reconciled_statements_record_survives_the_next_tick(clean, tmp_
     over its rows every tick, and from then on it sees the lane's own `stmt/`
     blocks as candidates: R1, matched to the email block on the tick that
     posted, came back the next day ambiguous between that email and R2's own
-    block — the one fact #470 keeps, gone — and R2 read as skipped for
-    ambiguity while also posted."""
+    block — the one fact #470 keeps, gone — and R2, which the lane posted, came
+    back with candidates as though nothing had been decided."""
     cfg = _repo(tmp_path)
     await _indexed(clean, "st-e", "hdfc-1225", "2026-07-11", "437.19")
     (cfg.path / "personal" / "2026.journal").write_text(
