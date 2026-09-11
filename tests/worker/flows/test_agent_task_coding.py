@@ -119,7 +119,11 @@ def _activities(
 
     @activity.defn(name="load_task_context")
     async def load_task_context(task_id: str) -> dict:
-        return {"external_id": "", "fingerprint": "", "gmail_message_id": ""}
+        # The real activity's shape. Since #344 the verb comes back from it,
+        # because a setting can change a tag's verb and a workflow cannot read
+        # the database.
+        return {"external_id": "", "gmail_message_id": "", "subject": "", "subject_kind": "",
+                "verb": "coding"}
 
     @activity.defn(name="ensure_task_session")
     async def ensure_task_session(

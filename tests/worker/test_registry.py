@@ -373,9 +373,13 @@ def test_books_write_flow_is_gated_on_money_hygiene():
         # HubActivities.reconcile_completed_tasks, a step on the existing
         # HubSweepFlow that resolves a problem whose task a person completed.
         # Unflagged, so all three rows move.
-        (True, True, 45, 223),
-        (False, False, 35, 190),
-        (True, False, 39, 206),
+        # Then +2 activities and NO new flow from #344: `prepare_agent_ask`
+        # (the `ask` verb's input) and `plan_infra_task` (the infra verb's
+        # plan, by the problem behind the task) on the existing
+        # AgentTaskActivities, which is unflagged — so all three rows move.
+        (True, True, 45, 225),
+        (False, False, 35, 192),
+        (True, False, 39, 208),
     ],
 )
 def test_real_registration_passes_the_boot_check(homelab, money, flows, activities):

@@ -11,10 +11,12 @@ from __future__ import annotations
 
 import asyncio
 import re
+import time
 from dataclasses import dataclass, field
 from typing import Any
 
-from aegis.services import work_sessions
+import httpx
+from aegis.services import hub, work_sessions
 from aegis.services.project_repo_map import get_project_repo_map, lookup
 from temporalio import activity
 
@@ -58,28 +60,105 @@ _COMMENT_RETRY_SECONDS = 2
 # source_tag IS NULL (i.e. the task is user-authored). Clarify put a stray
 # @code label on a real #email task in prod, and treating that as "run a
 # coding agent on this email" would be nonsense.
-_VERB_BY_SOURCE_TAG = {
+#
+# EVERY tag AEGIS captures under has an entry: a verb, or an explicit None
+# meaning "decided: nothing here works these". That is the `_GTD_STATE_FOR`
+# contract from clarify (#139), and test_agent_task_verbs.py derives the tag
+# vocabulary from `gtd_rules.SOURCE_TAGS` and the hub's tags, so a new tag
+# added without a decision fails CI instead of silently parking (#344).
+#
+# These are generic defaults. A deployment changes any of them with the
+# `agent_task_verbs` settings row, merged over this table by `merge_verbs`.
+#
+# `ask` hands the task to the agent it is assigned to, through that agent's
+# own chat path — `AgentChatReplyFlow`, the executor clarify already uses when
+# you comment on an agent's task. A `#chat`, `#research`, `#calendar` or
+# `#manual` task given to an agent is a request to that agent; before #344 all
+# four resolved to no verb, got "No executor for this task type" and parked
+# with nothing done (prod: an outage question given to the infra agent, an
+# article given to the research agent).
+UNTAGGED = "untagged"  # the settings key for a task with no source tag
+DEFAULT_VERBS: dict[str, str | None] = {
     "#alert": "infra",
     "#receipt": "finance",
     "#email": "email",
+    "#chat": "ask",
+    "#research": "ask",
+    "#calendar": "ask",
+    "#manual": "ask",
+    # A hand-written task carrying an agent's label and no `@code`: somebody
+    # gave it to that agent, which is the same request a `#manual` task is.
+    UNTAGGED: "ask",
+    # Maou raises these and the user acts on them. `EXCLUDED_LABELS` keeps the
+    # sweep off them before a verb is ever resolved; this says why.
+    "#money": None,
 }
+# The verbs a tag may be routed to. `coding` is not one: it is chosen by the
+# `@code` label on an untagged task, never by a tag.
+VERBS = frozenset({"infra", "email", "finance", "ask"})
+VERBS_SETTING = "agent_task_verbs"
 
-# Swarm service names as they appear in real prod alert titles.
+
+def merge_verbs(value: Any) -> dict[str, str | None]:
+    """`DEFAULT_VERBS` with the `agent_task_verbs` settings row merged over it.
+
+    Lenient on read, like every settings merge in AEGIS: an entry that names a
+    verb this lane does not have is ignored, so a typo in the row cannot turn
+    a tag that works into one that parks. None is honoured — it is how a
+    deployment says "leave these tasks to me".
+    """
+    merged = dict(DEFAULT_VERBS)
+    if not isinstance(value, dict):
+        return merged
+    for tag, verb in value.items():
+        if verb is None or verb in VERBS:
+            merged[str(tag)] = verb
+    return merged
+
+
+async def load_verbs(pool: Any) -> dict[str, str | None]:
+    """The effective verb table. A failed read is the defaults, never an
+    outage of the lane."""
+    if pool is None:
+        return dict(DEFAULT_VERBS)
+    try:
+        value = await pool.fetchval("SELECT value FROM settings WHERE key = $1", VERBS_SETTING)
+    except Exception as exc:  # noqa: BLE001 — routing must never break on a config read
+        activity.logger.warning("agent_task_verbs_read_failed err=%s", str(exc)[:200])
+        return dict(DEFAULT_VERBS)
+    return merge_verbs(value)
+
+
+# Swarm service names as they appear in real prod alert titles, and in the
+# heartbeat's own (flows/infra_heartbeat.py). A task the hub projected never
+# needs these — its problem names the subject — but one that predates the hub
+# has only its title.
 _SERVICE_PATTERNS = (
-    re.compile(r"^PROLONGED:\s+(\S+)\s+degraded", re.I),
+    re.compile(r"^PROLONGED:\s+(\S+)\s+(?:degraded|still\s+down)", re.I),
     re.compile(r"^Service\s+(\S+)\s+has\s+fewer\s+tasks", re.I),
+    re.compile(r"^Service\s+(\S+)\s+down\b", re.I),
     re.compile(r"^([A-Za-z][\w.-]*)\s+is\s+down\b", re.I),
 )
+_NODE_PATTERN = re.compile(r"^Swarm\s+node\s+(\S+)\s+down\b", re.I)
 
 
-def resolve_verb(task: dict) -> str:
-    """Verb for a task: from source_tag, or @code when source_tag is NULL."""
+def resolve_verb(task: dict, verbs: dict[str, str | None] | None = None) -> str:
+    """Verb for a task: its source tag's, or `coding` for an untagged `@code` task.
+
+    `verbs` is the effective table (`load_verbs`); None is the shipped one. A
+    tag the table maps to None resolves to `none` (decided: nothing works it)
+    and a tag it does not know to `unknown` (nobody decided). Both park, and
+    the run's summary says which.
+    """
+    table = DEFAULT_VERBS if verbs is None else verbs
     source_tag = task.get("source_tag")
-    if source_tag:
-        return _VERB_BY_SOURCE_TAG.get(source_tag, "unknown")
-    if "@code" in (task.get("labels") or []):
-        return "coding"
-    return "unknown"
+    if not source_tag:
+        if "@code" in (task.get("labels") or []):
+            return "coding"
+        source_tag = UNTAGGED
+    if source_tag not in table:
+        return "unknown"
+    return table[source_tag] or "none"
 
 
 def extract_service_name(title: str) -> str:
@@ -95,6 +174,12 @@ def extract_service_name(title: str) -> str:
             # or another system used.
             return match.group(1).lower() if "_" not in match.group(1) else match.group(1)
     return ""
+
+
+def extract_node_name(title: str) -> str:
+    """Swarm node named by the heartbeat's node-down title, or ''."""
+    match = _NODE_PATTERN.match((title or "").strip())
+    return match.group(1) if match else ""
 
 
 # #receipt task title shapes. LEGACY: the v1 subscription tracker's renewal
@@ -172,6 +257,152 @@ def match_repo_candidate(candidates: list[dict], comment: str) -> dict | None:
             if value and value == text:
                 return candidate
     return None
+
+
+# --- the `ask` verb and the infra verb's plan (#344) ------------------------
+
+# How much of a thread, a description, a verdict or a runbook a message
+# quotes. Per field, so one pasted stack trace cannot crowd out the rest.
+_ASK_NOTE_LIMIT = 15
+_ASK_NOTE_CAP = 800
+_FIELD_CAP = 2000
+_QUOTE_CAP = 400
+_RUNBOOK_CAP = 1200
+_GROUP_MEMBER_CAP = 12
+# One GET, bounded well inside the plan activity's 60s start-to-close.
+_PROBE_TIMEOUT_S = 10.0
+
+
+def _cut(text: str, cap: int) -> str:
+    value = (text or "").strip()
+    return value if len(value) <= cap else value[:cap].rstrip() + " […]"
+
+
+def _at(value: Any) -> str:
+    return f"{value:%Y-%m-%d %H:%M} UTC" if hasattr(value, "strftime") else str(value or "")
+
+
+def _ask_message(task: dict) -> str:
+    """The turn the sweep sends an agent when it hands over a task.
+
+    Read-only is a product rule, the same one the coding lane's turn 1 keeps:
+    nobody is in this conversation when the sweep asks, so the turn may look
+    and answer but not change anything. A change waits for the user's
+    go-ahead — a reply on the task, which clarify's comment channel carries to
+    the agent while the task is in the Inbox, or a message in its channel —
+    where the person asking is the approval.
+    """
+    notes = list(task.get("notes") or [])[-_ASK_NOTE_LIMIT:]
+    thread = "\n".join(
+        f"[{n.get('posted_at') or ''}] {str(n.get('content') or '')[:_ASK_NOTE_CAP]}"
+        for n in notes
+    )
+    description = _cut(str(task.get("description") or ""), _FIELD_CAP)
+    return (
+        f"Todoist task {task.get('id')} was given to you: {task.get('content') or ''}\n\n"
+        + (f"{description}\n\n" if description else "")
+        + "Comment thread so far (oldest first; AEGIS's own notes carry a "
+        "`Workflow run:` footer or an `[Agent reply @` header):\n"
+        + (thread or "(no comments yet)")
+        + "\n\nNobody is waiting in a chat for this: the task queue is handing you "
+        "the task. Work it with read-only steps: look things up, check, investigate, "
+        "and answer. Do not restart, deploy, delete, merge, send, complete or change "
+        "anything. If it needs a change, say exactly what you would do and ask the "
+        "user to reply on the task to go ahead. Your answer is posted on the task."
+    )
+
+
+# A task with no problem on the hub has no timeline to read.
+_NO_FACTS: dict = {
+    "sources": frozenset(),
+    "alertname": "",
+    "url": "",
+    "description": "",
+    "verdict": None,
+}
+
+
+def _report(handler: str, kind: str, parts: list[str], reason: str) -> dict:
+    """A plan the flow posts as one comment before parking the task once."""
+    return {
+        "action": "report",
+        "handler": handler,
+        "kind": kind,
+        "comment": "\n\n".join(p for p in parts if p),
+        "reason": reason,
+    }
+
+
+def _verdict_line(problem: dict | None, facts: dict) -> str:
+    """The hub's latest investigation finding, quoted, or that there is none.
+
+    Read from the problem's timeline, never re-run: the investigation is the
+    hub's, started once when the problem appeared (`IngestResult.investigate`).
+    """
+    if problem is None:
+        return ""
+    row = facts.get("verdict")
+    if row is None:
+        return "No investigation has reported on it yet."
+    payload = row["payload"] if isinstance(row["payload"], dict) else {}
+    text = _cut(str(payload.get("text") or payload.get("status") or ""), _QUOTE_CAP)
+    resource = str(payload.get("resource") or "")
+    line = f"The investigation said ({_at(row['occurred_at'])}): {text}"
+    return line + (f" (looked at {resource})" if resource else "")
+
+
+def _timeline_line(problem: dict | None) -> str:
+    if problem is None:
+        return ""
+    status = str(problem.get("status") or "")
+    head = f"The hub has this problem as {status}. " if status in ("resolved", "closed") else ""
+    return (
+        f"{head}Full timeline: problem {problem['id']} on the admin Problems page, "
+        "or `task_context` from a session."
+    )
+
+
+def _alert_says(facts: dict) -> str:
+    description = str(facts.get("description") or "")
+    return f"The alert says: {_cut(description, _QUOTE_CAP)}" if description else ""
+
+
+# What a person does about a problem of one of AEGIS's own kinds. Generic
+# AEGIS vocabulary (the producers are AEGIS's flow-health, comms and social
+# watchdogs), not anything a deployment names.
+_TODO_BY_KIND = {
+    "flow": (
+        "What to do: open the flow's recent failed runs on the admin Workflows page "
+        "(a failing LLM purpose also shows on the Models page) and fix what they show. "
+        "The watchdog resolves this problem when the failures stop."
+    ),
+    "comms": (
+        "What to do: check that the comms service is running and that its chat tokens "
+        "are valid (admin Slack page). The watchdog resolves this problem when messages "
+        "arrive again."
+    ),
+    "post": (
+        "What to do: check the social scheduler's worker and its queue. The watchdog "
+        "resolves this problem when the posts publish."
+    ),
+}
+
+
+async def _probe(url: str) -> dict:
+    """One GET against `url`: its status and time, or why it did not answer."""
+    started = time.monotonic()
+    try:
+        async with httpx.AsyncClient(timeout=_PROBE_TIMEOUT_S, follow_redirects=True) as client:
+            response = await client.get(url)
+    except Exception as exc:  # noqa: BLE001 — a failed probe IS the finding
+        return {"ok": False, "status": 0, "ms": 0,
+                "error": f"{type(exc).__name__}: {str(exc)[:160]}"}
+    return {
+        "ok": response.status_code < 400,
+        "status": response.status_code,
+        "ms": int((time.monotonic() - started) * 1000),
+        "error": "",
+    }
 
 
 @dataclass
@@ -271,15 +502,32 @@ class AgentTaskActivities:
         return was the pre-hub identity — nothing has looked one up since the
         problem hub replaced that lookup, and the problem id it also returned
         was never read either: `subject` is what the verb actually needs.
+
+        `verb` is the task's verb under the effective table (`load_verbs`): a
+        settings row can change it, and the flow cannot read the database, so
+        it is decided here (#344). `unknown` for a task not in the mirror.
         """
         empty = {
             "external_id": "",
             "gmail_message_id": "",
             "subject": "",
             "subject_kind": "",
+            "verb": "unknown",
         }
         if self.db_pool is None or not task_id:
             return empty
+        row = await self.db_pool.fetchrow(
+            "SELECT source_tag, labels FROM todoist_tasks WHERE id = $1", task_id
+        )
+        verb = (
+            resolve_verb(
+                {"source_tag": row["source_tag"], "labels": list(row["labels"] or [])},
+                await load_verbs(self.db_pool),
+            )
+            if row is not None
+            else "unknown"
+        )
+        empty["verb"] = verb
         # A task the problem hub projected knows its subject exactly
         # (`problems.subject`), so the infra verb need not parse the title.
         problem = await self.db_pool.fetchrow(
@@ -303,6 +551,7 @@ class AgentTaskActivities:
             ),
             "subject": problem["subject"] if problem else "",
             "subject_kind": problem["subject_kind"] if problem else "",
+            "verb": verb,
         }
 
     # --- terminal states ---
@@ -659,6 +908,387 @@ class AgentTaskActivities:
             "agent_task_finance_no_action interaction_id=%s choice=%s", interaction_id, choice
         )
         return {"applied": "none"}
+
+    # --- the `ask` verb (#344) -------------------------------------------------
+
+    @activity.defn
+    async def prepare_agent_ask(self, task_id: str) -> dict:
+        """The `ask` verb's input: which agent the task goes to, and what to say.
+
+        The agent is the one the task is assigned to, found in the agent
+        registry by its `mention_aliases` (`agents.metadata`, defaulting to the
+        agent's id) — the lookup clarify's comment channel makes — so nothing
+        here names an agent. The thread id is that channel's too, so a later
+        reply on the task continues this conversation.
+
+        An empty `agent_id` comes with `comment` (what a person does next) and
+        `reason` (why the task parks).
+        """
+        from aegis_worker.activities.clarify import get_agent_registry
+
+        nobody = {"agent_id": "", "message": "", "thread_id": "", "comment": "", "reason": ""}
+        task = await self.load_task(task_id)
+        if not task:
+            return {**nobody, "reason": "the task is not in the Todoist mirror"}
+        label = str(task.get("assignee_label") or "")
+        registry = await get_agent_registry(self.db_pool)
+        agent_id = next(
+            (aid for aid in sorted(registry) if label and label in registry[aid].get("aliases", [])),
+            "",
+        )
+        if not agent_id:
+            named = label or "this task's label"
+            return {
+                **nobody,
+                "comment": (
+                    f"No active agent answers to {named}, so nobody here can pick this up. "
+                    "Give the task to an agent that exists, or take it yourself (@me) and "
+                    "complete it when it is done."
+                ),
+                "reason": f"no active agent answers to {named}",
+            }
+        return {
+            "agent_id": agent_id,
+            "message": _ask_message(task),
+            "thread_id": f"todoist-task-{task_id}",
+            "comment": "",
+            "reason": "",
+        }
+
+    # --- the infra verb's plan (#344) ------------------------------------------
+
+    @activity.defn
+    async def plan_infra_task(self, task_id: str, title: str) -> dict:
+        """What the infra verb can usefully do for this task.
+
+        Decided from the problem behind the task (`hub.find_problem_for_task`);
+        the title is read only when the hub has no problem for it. Before, the
+        verb understood swarm services and nothing else: a Dagster failure ran
+        `docker service ps dagster` and got a restart card for a service that
+        does not exist, and every other kind parked with an apology — 85 of 110
+        runs in the fortnight to 2026-09-11 did nothing.
+
+        Returns one of two plans:
+
+        * `{"action": "service", "service", "health"}` — a service the swarm
+          runs. `health` is `service_health`'s answer; the flow completes a
+          healthy one and cards a restart for an unhealthy one, as before.
+        * `{"action": "report", "handler", "kind", "comment", "reason"}` —
+          anything else. Every handler is read-only: it reads the hub, reads
+          the heartbeat's last sample, or probes a URL once, and says what a
+          person does next. The flow posts `comment` and parks with `reason`.
+
+        Money problems keep the answer they had: they are Maou's (#497).
+        """
+        problem = (
+            await hub.find_problem_for_task(self.db_pool, task_id)
+            if self.db_pool is not None and task_id
+            else None
+        )
+        if problem is None:
+            return await self._plan_from_title(title, None, _NO_FACTS) or self._plan_manual(
+                None, _NO_FACTS
+            )
+        facts = await self._problem_facts(problem["id"])
+        kind = str(problem.get("subject_kind") or "")
+        subject = str(problem.get("subject") or "")
+        if "money" in facts["sources"]:
+            return _report(
+                "money",
+                kind,
+                [
+                    f"This is a {kind} problem ({subject}); there is no service to check or "
+                    "restart, so I have no automatic action for it."
+                ],
+                f"no automatic action for a {kind} problem",
+            )
+        if subject == hub.GROUP_SUBJECT or problem.get("group_key"):
+            return await self._plan_group(problem, facts)
+        if kind == "node" and subject:
+            return await self._plan_node(problem, facts, subject)
+        if facts["url"]:
+            return await self._plan_endpoint(problem, facts, facts["url"])
+        if facts["sources"] and facts["sources"] <= {"sentry"}:
+            return self._plan_exception(problem, facts)
+        if kind == "service" and subject:
+            return await self._plan_service(subject, problem, facts)
+        if kind in ("", hub.TASK_SUBJECT_KIND, "repo") or problem.get("class") == "manual":
+            # The subject is the task itself, or nothing: the title may still
+            # name a service or a node.
+            return await self._plan_from_title(title, problem, facts) or self._plan_manual(
+                problem, facts
+            )
+        return self._plan_kind(problem, facts)
+
+    async def _problem_facts(self, problem_id: str) -> dict:
+        """What the timeline says about a problem: who reported it, what the
+        latest alert carried, and the investigation's latest finding."""
+        sources = {
+            r["source"]
+            for r in await self.db_pool.fetch(
+                "SELECT DISTINCT source FROM problem_events "
+                "WHERE problem_id = $1::uuid AND kind = 'occurrence'",
+                problem_id,
+            )
+        }
+        payload = await self.db_pool.fetchval(
+            "SELECT payload FROM problem_events WHERE problem_id = $1::uuid "
+            "AND kind = 'occurrence' ORDER BY occurred_at DESC, id DESC LIMIT 1",
+            problem_id,
+        )
+        # The closing verdict wins over a later "investigation started" line:
+        # it is the finding a person acts on.
+        verdict = await self.db_pool.fetchrow(
+            "SELECT payload, occurred_at FROM problem_events WHERE problem_id = $1::uuid "
+            "AND kind = 'investigation' "
+            "ORDER BY (payload ? 'verdict') DESC, occurred_at DESC, id DESC LIMIT 1",
+            problem_id,
+        )
+        payload = payload if isinstance(payload, dict) else {}
+        labels = payload.get("labels") if isinstance(payload.get("labels"), dict) else {}
+        instance = str(labels.get("instance") or "")
+        return {
+            "sources": sources,
+            "alertname": str(labels.get("alertname") or ""),
+            "url": instance if instance.startswith(("http://", "https://")) else "",
+            "description": str(payload.get("description") or ""),
+            "verdict": verdict,
+        }
+
+    async def _plan_service(self, service: str, problem: dict | None, facts: dict) -> dict:
+        """A service the swarm runs goes to the flow's check; anything else is
+        reported. `restart_service` would refuse a name the swarm does not run
+        anyway, so the card it used to get could never have worked."""
+        if self.infra_ops is None:
+            health = {"found": False, "healthy": False, "detail": "no swarm connection wired"}
+        else:
+            health = await self.infra_ops.service_health(service)
+        if health.get("found"):
+            return {"action": "service", "service": service, "health": health,
+                    "handler": "service", "kind": "service"}
+        detail = str(health.get("detail") or "not found")
+        return _report(
+            "no_swarm_service",
+            str((problem or {}).get("subject_kind") or "service"),
+            [
+                f"I can't check `{service}` as a swarm service ({detail}), so there is "
+                "nothing here to restart and I have not offered a restart.",
+                _alert_says(facts),
+                _verdict_line(problem, facts),
+                "What to do: act on what the investigation found, in the system that "
+                "raised the alert, then complete this task.",
+                _timeline_line(problem),
+            ],
+            f"{service} is not a swarm service I can check ({detail[:80]})",
+        )
+
+    async def _plan_node(self, problem: dict | None, facts: dict, node: str) -> dict:
+        """The heartbeat's last sample of the node, from its own settings row.
+
+        Never a Docker or SSH command: a node that is down cannot answer
+        either, and the heartbeat already asks the swarm's managers every tick.
+        """
+        from aegis_worker.activities.homelab import HomelabActivities
+
+        row = (
+            await self.db_pool.fetchrow(
+                "SELECT value, updated_at FROM settings WHERE key = $1",
+                HomelabActivities._HEARTBEAT_STATE_KEY,
+            )
+            if self.db_pool is not None
+            else None
+        )
+        value = row["value"] if row is not None and isinstance(row["value"], dict) else {}
+        nodes = value.get("nodes") if isinstance(value.get("nodes"), dict) else {}
+        status = str(nodes.get(node) or "")
+        if row is None:
+            seen = f"The heartbeat has no sample yet, so I can't say whether `{node}` is up."
+        elif not status:
+            seen = f"The heartbeat's last sample ({_at(row['updated_at'])}) does not list `{node}`."
+        else:
+            seen = f"Node `{node}`: the heartbeat's last sample ({_at(row['updated_at'])}) has it {status}."
+        fails = int(value.get("fail_count") or 0)
+        if fails:
+            seen += (
+                f" The heartbeat has failed to reach the swarm {fails} time(s) in a row "
+                "since then, so that sample may be old."
+            )
+        if status == "Ready":
+            todo = (
+                "What to do: nothing, unless it drops again. The heartbeat resolves this "
+                "problem, and that closes this task."
+            )
+            reason = f"node {node} is Ready again"
+        else:
+            todo = (
+                "What to do: check the machine itself, power and network first, then "
+                "Docker once it answers. The heartbeat resolves this problem when it sees "
+                "the node Ready."
+            )
+            reason = f"node {node} is {status or 'not in the heartbeat'}; a person has to look at it"
+        return _report(
+            "node",
+            "node",
+            [
+                seen,
+                "I ran nothing against the node: a machine that is down cannot answer "
+                "Docker or SSH.",
+                _verdict_line(problem, facts),
+                todo,
+                await self._runbook(facts.get("alertname") or ""),
+                _timeline_line(problem),
+            ],
+            reason,
+        )
+
+    async def _plan_endpoint(self, problem: dict, facts: dict, url: str) -> dict:
+        """One GET against the URL the alert probes, and what that says."""
+        probe = await _probe(url)
+        if probe["ok"]:
+            seen = f"{url} answered {probe['status']} in {probe['ms']} ms just now."
+            todo = (
+                "What to do: nothing, unless it fails again. The alert resolves on its "
+                "own, and that closes this task."
+            )
+            reason = f"{url} answers again"
+        else:
+            seen = (
+                f"{url} answered {probe['status']} just now."
+                if probe["status"]
+                else f"{url} did not answer just now: {probe['error']}."
+            )
+            todo = (
+                "What to do: check the route to it (proxy, DNS, TLS certificate) and "
+                "the service behind it."
+            )
+            reason = f"{url} still fails ({probe['status'] or probe['error'][:60]})"
+        return _report(
+            "endpoint",
+            str(problem.get("subject_kind") or ""),
+            [seen, _verdict_line(problem, facts), todo, _timeline_line(problem)],
+            reason,
+        )
+
+    def _plan_exception(self, problem: dict, facts: dict) -> dict:
+        """An error Sentry reported. A restart does not fix code or data, and a
+        project that happens to share a swarm service's name would otherwise be
+        found "healthy" and have its task closed."""
+        subject = str(problem.get("subject") or "")
+        return _report(
+            "exception",
+            str(problem.get("subject_kind") or ""),
+            [
+                f"This is an application error Sentry reported for `{subject}`, not a "
+                "service that is down. A restart would not fix it, so I have not checked "
+                "or offered one.",
+                _alert_says(facts),
+                _verdict_line(problem, facts),
+                "What to do: fix the code or data the investigation points at, then "
+                "complete this task.",
+                _timeline_line(problem),
+            ],
+            "an application error; the fix is in the code or data",
+        )
+
+    async def _plan_group(self, problem: dict, facts: dict) -> dict:
+        """One problem standing for many members: who they are, from the hub."""
+        rows = await self.db_pool.fetch(
+            "SELECT DISTINCT m FROM ("
+            "  SELECT jsonb_array_elements_text(payload->'members') AS m FROM problem_events"
+            "   WHERE problem_id = $1::uuid AND kind = 'state_change'"
+            "     AND payload->>'action' = 'grouped' AND jsonb_typeof(payload->'members') = 'array'"
+            "  UNION ALL"
+            "  SELECT payload->>'member_subject' FROM problem_events"
+            "   WHERE problem_id = $1::uuid AND kind = 'occurrence'"
+            ") s WHERE m IS NOT NULL AND m <> '' ORDER BY m",
+            problem["id"],
+        )
+        members = [r["m"] for r in rows]
+        kind = str(problem.get("subject_kind") or "")
+        listed = ", ".join(f"`{m}`" for m in members[:_GROUP_MEMBER_CAP])
+        if len(members) > _GROUP_MEMBER_CAP:
+            listed += f" and {len(members) - _GROUP_MEMBER_CAP} more"
+        times = int(problem.get("occurrences") or 0)
+        return _report(
+            "group",
+            kind,
+            [
+                f"This one problem stands for {len(members)} {kind or 'subject'}s with the "
+                f"same failure (`{problem.get('class')}`): {listed or 'none recorded'}. "
+                f"Seen {times} time(s) in all, last at {_at(problem.get('last_seen_at'))}.",
+                _verdict_line(problem, facts),
+                "What to do: one fix should clear all of them, so work it here. The "
+                "members' own tasks were closed into this one, and a new member joins it "
+                "instead of opening another.",
+                _timeline_line(problem),
+            ],
+            f"a group of {len(members)} {kind}s; the shared fix is a person's call",
+        )
+
+    def _plan_kind(self, problem: dict, facts: dict) -> dict:
+        """A kind of AEGIS's own (a flow, the comms probe, a post) or one this
+        lane has no check for: the finding and what a person does."""
+        kind = str(problem.get("subject_kind") or "")
+        subject = str(problem.get("subject") or "")
+        todo = _TODO_BY_KIND.get(kind) or (
+            "What to do: act on what the investigation found, then complete this task. "
+            f"This lane has no check of its own for a {kind or 'problem of this'} kind."
+        )
+        return _report(
+            kind or "other",
+            kind,
+            [
+                f"This is a {kind} problem (`{subject}`), not a swarm service, so there is "
+                "nothing here to check or restart.",
+                _alert_says(facts),
+                _verdict_line(problem, facts),
+                todo,
+                _timeline_line(problem),
+            ],
+            f"a {kind} problem; the fix is a person's",
+        )
+
+    async def _plan_from_title(self, title: str, problem: dict | None, facts: dict) -> dict | None:
+        """A service or node the title names, when the problem names none."""
+        service = extract_service_name(title)
+        if service:
+            return await self._plan_service(service, problem, facts)
+        node = extract_node_name(title)
+        if node:
+            return await self._plan_node(problem, facts, node)
+        return None
+
+    def _plan_manual(self, problem: dict | None, facts: dict) -> dict:
+        return _report(
+            "manual",
+            str((problem or {}).get("subject_kind") or ""),
+            [
+                "Nothing on this task names a service, node or URL I can check.",
+                _verdict_line(problem, facts),
+                "What to do: reply on this task with what you want done, or do it "
+                "yourself and complete the task.",
+                _timeline_line(problem),
+            ],
+            "nothing on the task names something to check",
+        )
+
+    async def _runbook(self, alertname: str) -> str:
+        """The runbook for this alert, cut short, when the deployment has one.
+
+        Read through AlertActivities, which owns where runbooks live (the
+        infra coding block's `runbooks_dir`, else the image's) and skips a
+        stub. Best-effort: a missing runbook is a shorter comment, not a
+        failure.
+        """
+        if not alertname or self.alert_act is None:
+            return ""
+        try:
+            folder = await self.alert_act._effective_runbooks_dir()
+            text = self.alert_act._read_runbook(alertname, folder)
+        except Exception as exc:  # noqa: BLE001
+            activity.logger.warning("agent_task_runbook_read_failed err=%s", str(exc)[:200])
+            return ""
+        return f"Runbook ({alertname}):\n{_cut(text, _RUNBOOK_CAP)}" if text else ""
 
     @activity.defn
     async def resolve_task_repo(self, task: dict) -> dict:
