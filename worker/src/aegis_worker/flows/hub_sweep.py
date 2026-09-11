@@ -1,14 +1,18 @@
 """HubSweepFlow — the problem hub's housekeeping tick.
 
-Three things, in order:
+Four things, in order:
 
 1. Open every `suppressed` problem whose deploy or maintenance window has
    passed without a `resolved` event. The heartbeat only emits on transitions,
    so a service that broke during a deploy and stayed broken would otherwise
    surface only at the 24h re-investigation.
-2. Project: bring each problem's Todoist task up to date with its events, and
+2. Read completed tasks back: a live problem whose Todoist task a person
+   completed resolves, and a task the hub closed before the problem came
+   back is reopened. Nothing else reads a completion back, so without this
+   the problem stayed live for good while its task sat closed (#473).
+3. Project: bring each problem's Todoist task up to date with its events, and
    create the task for anything promoted a moment ago.
-3. Group: when several live problems share a class and a kind of subject, ask
+4. Group: when several live problems share a class and a kind of subject, ask
    the model whether they are one condition, and fold them into a single
    problem when they are. Six posts wedged in one Postiz queue were six
    problems and six tasks; grouped, they are one task, and the seventh stuck
@@ -39,6 +43,9 @@ with workflow.unsafe.imports_passed_through():
 # and a sweep that runs every five minutes has no reason to spend four model
 # calls at once.
 _MAX_JUDGED_PER_TICK = 2
+# The patch id for step 2. The sweep runs every five minutes, so a worker
+# deployed mid-run replays a history that has no such activity in it.
+PATCH_COMPLETED_TASKS = "hub-sweep-completed-tasks"
 
 
 @dataclass
@@ -58,6 +65,16 @@ class HubSweepFlow:
             start_to_close_timeout=TIMEOUT_FAST,
             retry_policy=FAST,
         )
+        # Then read completions back: a task a person ticked off resolves its
+        # problem, before projection, so the resolve reaches the task in this
+        # tick. FAST retries are safe — nothing is touched twice.
+        completed: dict = {}
+        if workflow.patched(PATCH_COMPLETED_TASKS):
+            completed = await workflow.execute_activity_method(
+                HubActivities.reconcile_completed_tasks,
+                start_to_close_timeout=TIMEOUT_FAST,
+                retry_policy=FAST,
+            )
         # Then project: a problem promoted a moment ago gets its task in the
         # same tick, and any comment a producer's inline projection could not
         # post is retried here.
@@ -103,6 +120,8 @@ class HubSweepFlow:
 
         return {
             "promoted": int(promoted.get("promoted") or 0),
+            "task_completed": int(completed.get("resolved") or 0),
+            "task_reopened": int(completed.get("tasks_reopened") or 0),
             "projected": int(projected.get("projected") or 0),
             "created": int(projected.get("created") or 0),
             "errors": int(projected.get("errors") or 0),

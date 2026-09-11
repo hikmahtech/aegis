@@ -369,9 +369,13 @@ def test_books_write_flow_is_gated_on_money_hygiene():
         # (+1 flow) and StatementActivities' intake_statements and
         # reconcile_statements (+2 activities). Both are money-flagged, so only
         # the money-on row moves.
-        (True, True, 45, 222),
-        (False, False, 35, 189),
-        (True, False, 39, 205),
+        # Then +1 activity and NO new flow from #473:
+        # HubActivities.reconcile_completed_tasks, a step on the existing
+        # HubSweepFlow that resolves a problem whose task a person completed.
+        # Unflagged, so all three rows move.
+        (True, True, 45, 223),
+        (False, False, 35, 190),
+        (True, False, 39, 206),
     ],
 )
 def test_real_registration_passes_the_boot_check(homelab, money, flows, activities):

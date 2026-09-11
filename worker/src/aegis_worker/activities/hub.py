@@ -376,6 +376,23 @@ class HubActivities:
         return {"promoted": len(ids), "problem_ids": ids}
 
     @activity.defn
+    async def reconcile_completed_tasks(self) -> dict:
+        """Resolve every live problem whose Todoist task a person completed,
+        and reopen a task whose completion is the hub's own close from before
+        the problem came back (`hub_project.reconcile_completed_tasks`). Run
+        by `HubSweepFlow` before projection. Safe to retry: a problem already
+        resolved, or a task already reopened, is not touched twice."""
+        if self.db_pool is None:
+            return {"resolved": 0, "problem_ids": [], "tasks_reopened": 0}
+        rows = await hub_project.reconcile_completed_tasks(self.db_pool)
+        resolved = [r["problem_id"] for r in rows if r["action"] == "resolved"]
+        return {
+            "resolved": len(resolved),
+            "problem_ids": resolved,
+            "tasks_reopened": sum(1 for r in rows if r["action"] == "task_reopened"),
+        }
+
+    @activity.defn
     async def project_pending(self) -> dict:
         """Bring every problem's Todoist task up to date with its events
         (`hub_project.project_pending`). Run by `HubSweepFlow`."""

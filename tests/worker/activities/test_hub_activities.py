@@ -69,6 +69,11 @@ async def test_no_pool_is_a_quiet_noop():
     env = ActivityEnvironment()
     act = HubActivities(db_pool=None)
     assert await env.run(act.promote_expired_suppressions) == {"promoted": 0, "problem_ids": []}
+    assert await env.run(act.reconcile_completed_tasks) == {
+        "resolved": 0,
+        "problem_ids": [],
+        "tasks_reopened": 0,
+    }
     assert await env.run(act.clear_converged_deploys, ["x"]) == {"cleared": []}
     assert await env.run(act.project_pending) == {"projected": 0, "created": 0, "errors": 0}
     ingested = await env.run(act.ingest_alert, _alert("s", todoist_task_id="T1"), False)
@@ -197,6 +202,30 @@ async def test_promote_and_clear_round_trip(db_pool):
     await set_service_state(db_pool, t, "deploying", set_by="ansible", now=LONG_AGO)
     out = await env.run(act.clear_converged_deploys, [])
     assert t in out["cleared"]
+
+
+async def test_reconcile_completed_tasks_round_trip(db_pool):
+    """The sweep's step 2 on its real path: a task a person ticked off in
+    Todoist (the sync mirrors it `is_completed`) resolves its problem, and a
+    retry of the activity changes nothing more."""
+    env = ActivityEnvironment()
+    act = HubActivities(db_pool=db_pool)
+    s = f"svc_{uuid.uuid4().hex[:8]}"
+    task = f"zzc-{uuid.uuid4().hex[:8]}"
+    await db_pool.execute(
+        "INSERT INTO todoist_tasks (id, content, labels, is_completed, updated_at) "
+        "VALUES ($1, 'down', ARRAY['#alert','@pandora'], false, now())",
+        task,
+    )
+    pid = (await env.run(act.ingest_alert, _alert(s, todoist_task_id=task), False))["problem_id"]
+    await set_status(db_pool, pid, "waiting_human", reason="gate 2 is open")
+    assert pid not in (await env.run(act.reconcile_completed_tasks))["problem_ids"]
+
+    await db_pool.execute("UPDATE todoist_tasks SET is_completed = true WHERE id = $1", task)
+    out = await env.run(act.reconcile_completed_tasks)
+    assert pid in out["problem_ids"] and out["resolved"] >= 1
+    assert (await env.run(act.problem_status, pid))["resolved"] is True
+    assert pid not in (await env.run(act.reconcile_completed_tasks))["problem_ids"]
 
 
 async def test_reconcile_findings_round_trip(db_pool):

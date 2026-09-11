@@ -513,6 +513,69 @@ issue #448). Until it does, the verdict cache above is the control, and
 turning the whole sweep off is not an alternative: it also stops suppression
 promotion and projection.
 
+### A problem and its task stay in step
+
+The task is a view of the problem, and four rules keep the two agreeing
+(#473):
+
+- **Completing the task resolves the problem.** Every five minutes
+  `HubSweepFlow` looks for live problems whose task the Todoist mirror shows
+  completed — ticked off in Todoist, or through the `complete_task` chat tool
+  — and resolves them. The timeline records it as a `resolve` with the reason
+  "its Todoist task was completed by a person, not by the hub", and the task
+  gets one comment saying so. If the problem comes back within the 24-hour
+  reopen window, the problem reopens and so does the task; after that it is a
+  new problem with a new task.
+
+  Not every completed task on a live problem is a person's doing. When the
+  completion is **older than the problem's latest return**, it is the hub's
+  own close, and the reopen that followed never reached Todoist: the sweep
+  reopens the task instead. That happens because TodoistSyncFlow applies
+  Todoist's changes before it drains the outbox, so the mirror can be a tick
+  stale when the projector reads it (prod problem 2140a366 kept a closed task
+  for three days this way). A return the task has **not been told about yet**
+  — under a mute, or inside a deploy window — is left alone until the
+  projector may tell it.
+- **A mute silences occurrences and returns, not recovery.** A muted problem
+  that resolves still closes its task, within one sweep, with one comment.
+  Occurrences under a mute are counted on the problem and never commented.
+  A problem that comes back under a mute stays quiet — the Problems page and
+  the digest still show it open — and its task reopens, with one comment,
+  when the mute ends.
+- **A problem that is over before it has a task never gets one.** Something
+  that failed inside a deploy window and recovered before it ended is
+  recorded and counted, and creates nothing. If it comes back, it gets its
+  task then.
+- **A backlog is told once.** When several resolves and returns wait for one
+  projection (a long mute, Todoist down), the task gets one comment for where
+  things ended up — "Resolved … It came back 4 times since the last update" —
+  not one per turn. Occurrences were already collapsed to one "N more"
+  comment per 30 minutes.
+
+Two smaller gaps close with them. A task created through the outbox (Todoist
+had a transient error at capture) is found by the real id the drain stores
+on its `todoist_outbox` row; the projector used to wait for that id on the
+capture idempotency row, where the drain never writes it. And a problem that
+resolves before the next TodoistSyncFlow has mirrored its new task still has
+that task closed; the close used to be refused for a task missing from the
+mirror.
+
+To check for drift by hand:
+
+```sql
+-- a live problem whose task is completed: the next sweep resolves it, or
+-- reopens the task, unless a return is still waiting to reach the task
+SELECT p.id, p.status, p.class, p.subject, t.completed_at FROM problems p
+JOIN todoist_tasks t ON t.id = p.todoist_task_id
+WHERE p.closed_at IS NULL AND p.status NOT IN ('resolved','closed') AND t.is_completed;
+
+-- a resolved problem whose task is still open: expected only for a task
+-- somebody claimed with @me
+SELECT p.id, p.class, p.subject, p.resolved_at, t.assignee_label, p.muted_until
+FROM problems p JOIN todoist_tasks t ON t.id = p.todoist_task_id
+WHERE p.closed_at IS NULL AND p.status = 'resolved' AND NOT t.is_completed;
+```
+
 ## System monitoring (`hosts_aegis`)
 
 The admin **System monitoring** page shows the live health of AEGIS's *own*

@@ -468,6 +468,9 @@ The steps that make it trustworthy:
   investigation. A deploy or maintenance window (`service_state`) suppresses;
   "Mute 24h" on a card mutes the *problem*. A `resolved` event resolves it and
   the projector closes the task, so nothing outlives its incident (#279, #341).
+  It works the other way too: completing the task resolves the problem, and a
+  mute silences occurrences but never a recovery — a muted problem that
+  resolves still closes its task (#473).
 - **The same failure on many things becomes one problem.** Six posts wedged in
   one Postiz queue arrived as six problems and six tasks. They are one
   condition with one fix, so the five-minute `HubSweepFlow` notices three or
