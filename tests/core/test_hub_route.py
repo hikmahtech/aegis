@@ -39,7 +39,7 @@ async def hub_client(db_pool):
 
 def _body(**kw) -> dict:
     return {
-        "source": "ansible",
+        "source": "manual",
         "external_id": f"deploy-{uuid.uuid4()}",
         "kind": "occurrence",
         "title": "deploy failed",

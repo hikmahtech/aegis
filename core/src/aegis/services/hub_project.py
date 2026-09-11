@@ -73,7 +73,7 @@ PROJECTED_STATUSES = frozenset(
     {"open", "investigating", "waiting_human", "fixing", "verifying", "resolved"}
 )
 _BLOCK_RE = re.compile(r"<!-- aegis:problem [^>]*-->.*?<!-- /aegis:problem -->", re.S)
-_HISTORY_KINDS = frozenset({"investigation", "plan", "session_note", "human_note"})
+_HISTORY_KINDS = frozenset({"investigation", "plan", "session_note"})
 # A plan of one step is a sentence, not a plan; more than this and the
 # subtask list is noise rather than a checklist.
 _MIN_PLAN_STEPS = 2
@@ -499,7 +499,6 @@ def _history_text(kind: str, payload: dict[str, Any]) -> str:
         "investigation": "🔍 Investigation",
         "plan": "🗺 Plan",
         "session_note": "💻 Session",
-        "human_note": "🗒 Note",
     }[kind]
     return f"{head}: {text}" if text else head
 
@@ -563,11 +562,7 @@ async def project(
         # marked seen and nothing is created. Creating one moved the
         # watermark past the resolve, and that task never closed (#473). A
         # later occurrence reopens the problem, and THAT projects a task.
-        meta.update(
-            projected_event_id=int(latest_event_id),
-            projected_at=now.isoformat(),
-            pending_occurrences=0,
-        )
+        meta.update(projected_event_id=int(latest_event_id), pending_occurrences=0)
         await _save_meta(pool, problem_id, meta)
         return {"problem_id": problem_id, "skipped": "resolved_without_task"}
 
@@ -611,7 +606,6 @@ async def project(
         # before creation is not replayed as comments.
         meta.update(
             projected_event_id=int(latest_event_id),
-            projected_at=now.isoformat(),
             pending_occurrences=0,
             block_hash=hashlib.sha1(block.encode()).hexdigest(),
             projected_title=p["title"],
@@ -772,7 +766,6 @@ async def project(
 
     meta.update(
         projected_event_id=int(events[-1]["id"]) if events else max(since, 0),
-        projected_at=now.isoformat(),
         pending_occurrences=pending,
     )
     await _save_meta(pool, problem_id, meta)

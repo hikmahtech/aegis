@@ -413,18 +413,17 @@ async def upgrade(
             keeper, rows = rows[0], rows[1:]
             keeper_id = keeper["id"]
             severity = worst([keeper["severity"], *[r["severity"] for r in rows]])
+            # The keeper's own subject is overwritten with `*`; the `grouped`
+            # event below keeps it, first in its `members`.
             await conn.execute(
                 "UPDATE problems SET group_key = $2, correlation_key = $3, subject = $4, "
-                "title = $5, severity = $6, "
-                "metadata = jsonb_set(metadata, '{grouped_from}', to_jsonb($7::text)) "
-                "WHERE id = $1::uuid",
+                "title = $5, severity = $6 WHERE id = $1::uuid",
                 keeper_id,
                 gkey,
                 group_correlation_key(gkey),
                 GROUP_SUBJECT,
                 title or f"{klass} on several {subject_kind}s",
                 severity,
-                keeper["subject"],
             )
             folded = [keeper["subject"]]
         else:

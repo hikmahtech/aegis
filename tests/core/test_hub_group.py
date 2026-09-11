@@ -155,7 +155,6 @@ async def test_upgrade_folds_members_into_one_problem(db_pool):
     assert group["subject"] == "*"
     assert group["title"] == "3 posts stuck in Postiz"
     assert group["occurrences"] == 3
-    assert group["metadata"]["grouped_from"] == "a"
     # The others are closed, with a link back.
     for pid in ids[1:]:
         assert (await get_problem(db_pool, pid))["status"] == "closed"
@@ -168,6 +167,8 @@ async def test_upgrade_folds_members_into_one_problem(db_pool):
     ]
     assert len(grouped) == 1
     assert grouped[0]["payload"]["member_count"] == 3
+    # The keeper's own subject was overwritten with `*`; the event keeps it.
+    assert grouped[0]["payload"]["members"][0] == "a"
 
 
 async def test_a_group_absorbs_the_next_one_instead_of_opening_a_task(db_pool):

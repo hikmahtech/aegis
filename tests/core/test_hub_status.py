@@ -91,7 +91,7 @@ def test_slug_is_the_hub_normalisation():
 
 
 def test_synthetic_alert_sources_map_onto_the_vocabulary():
-    for src, expect in (("todoist-jira", "chat"), ("todoist-chat", "chat"), ("todoist-infra", "chat"), ("bogus", "manual"), ("grafana", "grafana")):
+    for src, expect in (("todoist-jira", "chat"), ("todoist-chat", "chat"), ("todoist-infra", "chat"), ("bogus", "manual"), ("grafana", "manual"), ("alertmanager", "alertmanager")):
         e = event_from_alert({"source": src, "title": "t", "fingerprint": "f", "labels": {"alertname": "X"}}, occurred_at=NOW)
         assert e.source == expect, src
 

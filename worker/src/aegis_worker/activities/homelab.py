@@ -31,17 +31,6 @@ def _format_card(title: str, body: str) -> str:
 
 
 @dataclass
-class DriftRecord:
-    service_name: str
-    stack_name: str
-    drift_type: str
-    expected: dict
-    actual: dict
-    severity: str
-    alert_key: str
-
-
-@dataclass
 class HomelabActivities:
     db_pool: Any
     homelab: Any  # HomelabConnector

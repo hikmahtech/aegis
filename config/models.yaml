@@ -46,7 +46,6 @@ routes:
     clarify_classification: classify
     intel_score_significance: classify
     alert_assessment: classify
-    task_session_collision: classify
     books_answer_account: classify
     daylog_narrative: write
     daylog_rollup: write

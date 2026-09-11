@@ -30,7 +30,6 @@ from temporalio.exceptions import WorkflowAlreadyStartedError
 
 from aegis.clarify_note import AGENT_REPLY_PREFIX, CLARIFY_NOTE_PREFIX
 
-OWNERS = frozenset({"aegis", "operator"})
 STATUSES = frozenset({"active", "parked", "done"})
 
 # An operator row counts as "in the session" for this long after it was last

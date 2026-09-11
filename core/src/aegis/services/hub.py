@@ -67,12 +67,13 @@ TASK_SUBJECT_KIND = "task"
 
 # Closed vocabularies. A producer outside these is a wiring mistake, and the
 # route turns the ValueError into a 400 rather than minting a problem of an
-# unknown origin that no digest query would ever group.
+# unknown origin that no digest query would ever group. Every entry has a
+# producer: add a source with the code that sends it, not before. (Grafana and
+# Prometheus alerts arrive through Alertmanager's webhook as `alertmanager`;
+# the Ansible role and a deploy job write `service_state`, not events.)
 SOURCES = frozenset(
     {
         "alertmanager",
-        "prometheus",
-        "grafana",
         "sentry",
         "heartbeat",
         "flow_health",
@@ -81,8 +82,6 @@ SOURCES = frozenset(
         "expiry",
         "social",
         "llm_governor",
-        "github",
-        "ansible",
         "chat",
         "investigation",
         "session",
@@ -97,9 +96,7 @@ SOURCES = frozenset(
         "hub",  # the hub's own state_change rows
     }
 )
-KINDS = frozenset(
-    {"occurrence", "resolved", "investigation", "plan", "session_note", "human_note"}
-)
+KINDS = frozenset({"occurrence", "resolved", "investigation", "plan", "session_note"})
 SEVERITIES = frozenset({"critical", "error", "warning", "info"})
 # Problem statuses. `suppressed` = seen while its subject was deploying or in
 # maintenance (see `service_state`); it is live, counted, and not projected.
@@ -348,8 +345,8 @@ def decide(
             # problem is still worth keeping as history.
             return Decision("ignore" if current is None else "note")
         return Decision("resolve", "resolved")
-    # investigation / plan / session_note / human_note: history on a problem
-    # the producer named or the key found. Never creates.
+    # investigation / plan / session_note: history on a problem the producer
+    # named or the key found. Never creates.
     if current is None:
         return Decision("ignore")
     return Decision("note")

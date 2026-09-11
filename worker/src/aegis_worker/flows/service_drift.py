@@ -130,9 +130,9 @@ class ServiceDriftFlow:
 
 
 def _compute_drift_inline(collected: dict, today: str = "") -> list[dict]:
-    """Pure function - same shape as HomelabActivities.compute_drift so it
-    can run inside the workflow context without a side-effecting activity.
-    Returns list[dict] (DriftRecord serialized).
+    """Pure function, so it can run inside the workflow context without a
+    side-effecting activity. Returns one dict per drift: service_name,
+    stack_name, drift_type, expected, actual, severity, alert_key.
     today: ISO date string (YYYY-MM-DD) passed from workflow.now() to avoid
     calling date.today() inside the workflow sandbox."""
     if not today:
