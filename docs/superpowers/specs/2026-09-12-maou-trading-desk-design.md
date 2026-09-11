@@ -1,7 +1,8 @@
 # Maou's trading desk, paper mode — design
 
 **Date:** 2026-09-12
-**Status:** design approved in conversation; not built
+**Status:** built and reviewed on branch `worktree-maou-trading-desk` (2026-09-12); awaiting merge,
+deploy, and the two upstream dependencies below
 **Owner lane:** Maou / money
 **Builds on:** `2026-09-05-maou-books-design.md` (the books), the problem hub
 (`2026-09-07-problem-hub-design.md`), the monthly close (`MonthCloseFlow`)
