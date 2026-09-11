@@ -1,6 +1,6 @@
 """HubSweepFlow — the problem hub's housekeeping tick.
 
-Four things, in order:
+Five things, in order:
 
 1. Open every `suppressed` problem whose deploy or maintenance window has
    passed without a `resolved` event. The heartbeat only emits on transitions,
@@ -10,9 +10,13 @@ Four things, in order:
    completed resolves, and a task the hub closed before the problem came
    back is reopened. Nothing else reads a completion back, so without this
    the problem stayed live for good while its task sat closed (#473).
-3. Project: bring each problem's Todoist task up to date with its events, and
+3. Settle merged fixes (#502): a `verifying` problem — an investigation's fix
+   PR merged — resolves once its alert has stayed clear for
+   `fix_verify_hours`, and goes back to `open` when the alert comes back
+   later than `fix_grace_hours` after the merge (`hub_fix.verify_fixes`).
+4. Project: bring each problem's Todoist task up to date with its events, and
    create the task for anything promoted a moment ago.
-4. Group: when several live problems share a class and a kind of subject, ask
+5. Group: when several live problems share a class and a kind of subject, ask
    the model whether they are one condition, and fold them into a single
    problem when they are. Six posts wedged in one Postiz queue were six
    problems and six tasks; grouped, they are one task, and the seventh stuck
@@ -43,9 +47,10 @@ with workflow.unsafe.imports_passed_through():
 # and a sweep that runs every five minutes has no reason to spend four model
 # calls at once.
 _MAX_JUDGED_PER_TICK = 2
-# The patch id for step 2. The sweep runs every five minutes, so a worker
-# deployed mid-run replays a history that has no such activity in it.
+# The patch ids for steps 2 and 3. The sweep runs every five minutes, so a
+# worker deployed mid-run replays a history that has no such activity in it.
 PATCH_COMPLETED_TASKS = "hub-sweep-completed-tasks"
+PATCH_FIX_VERIFICATION = "hub-sweep-fix-verification"
 
 
 @dataclass
@@ -54,6 +59,11 @@ class HubSweepConfig:
     # Both 0 mean "the service defaults" (3 members, seen in the last 72h).
     group_min_members: int = 0
     group_window_hours: float = 0.0
+    # Step 3: how long a merged fix's alert must stay clear before the problem
+    # resolves, and how long after the merge an occurrence is still put down
+    # to the old code (`fix_verify_hours` / `fix_grace_hours` on the row).
+    fix_verify_hours: float = 24.0
+    fix_grace_hours: float = 1.0
 
 
 @workflow.defn
@@ -75,6 +85,21 @@ class HubSweepFlow:
                 start_to_close_timeout=TIMEOUT_FAST,
                 retry_policy=FAST,
             )
+        # Then settle merged fixes, also before projection, so the resolve or
+        # the "it came back" reaches the task in this tick. A failure here is
+        # logged, not raised: projection matters more than a verdict that
+        # the next tick can reach just as well.
+        verified: dict = {}
+        if workflow.patched(PATCH_FIX_VERIFICATION):
+            try:
+                verified = await workflow.execute_activity_method(
+                    HubActivities.verify_fixes,
+                    args=[config.fix_verify_hours, config.fix_grace_hours],
+                    start_to_close_timeout=TIMEOUT_FAST,
+                    retry_policy=FAST,
+                )
+            except Exception as exc:  # noqa: BLE001
+                workflow.logger.warning("hub_sweep_verify_fixes_failed err=%s", str(exc)[:200])
         # Then project: a problem promoted a moment ago gets its task in the
         # same tick, and any comment a producer's inline projection could not
         # post is retried here.
@@ -122,6 +147,8 @@ class HubSweepFlow:
             "promoted": int(promoted.get("promoted") or 0),
             "task_completed": int(completed.get("resolved") or 0),
             "task_reopened": int(completed.get("tasks_reopened") or 0),
+            "fix_resolved": int(verified.get("resolved") or 0),
+            "fix_reopened": int(verified.get("reopened") or 0),
             "projected": int(projected.get("projected") or 0),
             "created": int(projected.get("created") or 0),
             "errors": int(projected.get("errors") or 0),
