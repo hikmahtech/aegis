@@ -146,9 +146,11 @@ class StatementActivities:
         would also put a few thousand rows and their candidates through the
         workflow history on every hop.
 
-        `post` false is a real run that writes nothing: it matches, it reports
-        findings, and it produces the digest. That is the mode a person reads
-        before letting a schedule touch the books.
+        `post` false is a real run that writes nothing to the books: it matches,
+        it reports findings, and it produces the digest. It still writes outside
+        them — the matcher's record on `statement_rows`, the findings sweep, and
+        the month's digest marker. That is the mode a person reads before
+        letting a schedule touch the books.
         """
         from aegis.services import books, statement_findings, statement_match, statement_post
         from aegis.services import journal_index as ji
