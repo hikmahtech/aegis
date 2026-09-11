@@ -100,7 +100,8 @@ async def _statement(pool, instrument, start, end, opening, closing, rows):
         "opening_balance, closing_balance, file_sha256, rows) VALUES ($1,$2,$3,$4,$5,$6,'t',$7) "
         "ON CONFLICT (statement_id) DO NOTHING",
         sid, instrument, date.fromisoformat(start), date.fromisoformat(end),
-        Decimal(opening), Decimal(closing), rows,
+        # None is a statement that printed no balances, so §9.3 cannot check it.
+        *(Decimal(v) if v is not None else None for v in (opening, closing)), rows,
     )
     return sid
 
@@ -667,6 +668,27 @@ async def test_an_unreconciled_statement_in_scope_keeps_its_row_findings(
     await ActivityEnvironment().run(_act(clean, cfg).reconcile_statements, False, "2026-07-01")
 
     assert _row_findings(seen, "hdfc-1225") == [sf.AMBIGUOUS_ROW, sf.UNMATCHED_ROWS]
+
+
+async def test_a_row_posted_in_a_statement_that_cannot_be_checked_raises_no_finding(
+    clean, tmp_path, monkeypatch
+):
+    """A statement with no printed balances gives §9.3 nothing to check, so it
+    posts its rows and stays open. A row it just posted is in the books all the
+    same. Counted as unmatched, it opened a task that closed the next day, when
+    the row matched its own block."""
+    cfg = _repo(tmp_path)
+    sid = await _statement(clean, "hdfc-1225", "2026-07-01", "2026-07-31", None, None, 1)
+    await _row(clean, "hdfc-1225", "2026-07-14", "out", "120.00", "POS CORNER STORE", sid)
+    seen = _spy_on_sweep(monkeypatch)
+
+    out = await ActivityEnvironment().run(_act(clean, cfg).reconcile_statements, True, "")
+
+    [result] = out["results"]
+    assert (result["status"], result["posted"], result["balance_checked"]) == (
+        "posted", 1, False
+    ), out
+    assert _row_findings(seen, "hdfc-1225") == []
 
 
 async def test_the_matchers_verdict_is_recorded_on_its_row(clean, tmp_path):

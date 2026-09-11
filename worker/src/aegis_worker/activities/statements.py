@@ -204,6 +204,9 @@ class StatementActivities:
         )
         posted = promoted = 0
         results: list[dict] = []
+        #: Row ids this tick wrote a block for, whether or not their statement
+        #: could then be balance-checked.
+        wrote: set[str] = set()
         for statement in statements:
             if statement.statement_id in done:
                 continue
@@ -307,11 +310,15 @@ class StatementActivities:
             # `stmt/<row_id>` msgid inside the block and survives a crash
             # between the journal commit and this stamp. Only where NULL: a
             # row's first stamp stands.
-            if result.posted:
+            rows_written = [
+                m.removeprefix(f"{statement_post.MSGID_PREFIX}/") for m in result.posted
+            ]
+            wrote.update(rows_written)
+            if rows_written:
                 await self.db_pool.execute(
                     "UPDATE finance.statement_rows SET posted_at = now() "
                     "WHERE row_id = ANY($1::text[]) AND posted_at IS NULL",
-                    [m.removeprefix(f"{statement_post.MSGID_PREFIX}/") for m in result.posted],
+                    rows_written,
                 )
 
             # Promotion just rewrote every `assets:unknown` posting in these
@@ -371,7 +378,11 @@ class StatementActivities:
         #
         # Reconciled is read AFTER the loop, so a statement this tick reconciled
         # counts: its rows were unmatched a moment before the loop posted them.
-        # Only the per-statement parts are narrowed; unscoped instruments and
+        # So does a row this tick posted in a statement that stays open because
+        # it printed no balances to check: the row is in the books, and counted
+        # as unmatched it opened a task that closed the next day, when it matched
+        # its own block. Only the per-statement parts are narrowed, and the
+        # summaries are rebuilt from the outcomes left; unscoped instruments and
         # missing rates are about accounts and currencies and stay whole, and
         # coverage below reads every statement.
         reconciled = {
@@ -385,11 +396,10 @@ class StatementActivities:
             for s in statements
             if scope.covers(s) and s.statement_id not in reconciled
         }
-        run = replace(
-            run,
-            summaries=tuple(s for s in run.summaries if s.statement_id in open_ids),
-            outcomes=tuple(o for o in run.outcomes if o.statement_id in open_ids),
+        left = tuple(
+            o for o in run.outcomes if o.statement_id in open_ids and o.row_id not in wrote
         )
+        run = replace(run, outcomes=left, summaries=statement_match.summarise(left))
 
         # Coverage rides the SAME call as the matcher's classes, because
         # `statement_missing` is an instrument class. That alone is not enough:
