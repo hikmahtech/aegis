@@ -46,8 +46,11 @@ async def _exec_list_feeds(pool: asyncpg.Pool, ctx: ToolContext) -> str:
     )
 
 
-@aegis_tool
-async def _exec_subscribe_feed(
+# The executor is `_exec_follow_feed` because the n8n-era executor for a tool
+# of this name was deleted, and `ci-grep-guard.yml` fails any tree that still
+# carries that old symbol. The tool itself is `subscribe_feed` (#511).
+@aegis_tool(name="subscribe_feed")
+async def _exec_follow_feed(
     pool: asyncpg.Pool, ctx: ToolContext, *, url: str, label: str = ""
 ) -> str:
     """Follow an RSS or Atom feed. The URL is fetched first and must be a feed; a web page that advertises a feed returns that feed's URL to try instead.

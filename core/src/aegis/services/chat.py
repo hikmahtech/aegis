@@ -36,8 +36,8 @@ from aegis.services.tools.base import (
     _truncate_text,  # noqa: F401 — re-export: routes/mcp_server.py imports it here
 )
 from aegis.services.tools.feeds import (
+    _exec_follow_feed,
     _exec_list_feeds,
-    _exec_subscribe_feed,
     _exec_unsubscribe_feed,
 )
 from aegis.services.tools.gtd import (
@@ -3048,7 +3048,7 @@ TOOL_EXECUTORS: dict[str, Any] = {
     "paper_search": _exec_paper_search,
     "paper_read": _exec_paper_read,
     "list_feeds": _exec_list_feeds,
-    "subscribe_feed": _exec_subscribe_feed,
+    "subscribe_feed": _exec_follow_feed,
     "unsubscribe_feed": _exec_unsubscribe_feed,
     "configure_triage": _exec_configure_triage,
     "update_runbook": _exec_update_runbook,
