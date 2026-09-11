@@ -421,6 +421,9 @@ class AlertInvestigationFlow:
         # behavior instead of non-deterministically diverging mid-history.
         infra_cluster = ""
         owner_mention = ""
+        # None = the pre-#498 built-in infra list, which is what a history
+        # recorded before the list moved to the DB must replay against.
+        infra_alertnames: list[str] | None = None
         if workflow.patched("infra-cluster-from-settings"):
             routing = await workflow.execute_activity_method(
                 AlertActivities.get_alert_routing_config,
@@ -429,6 +432,8 @@ class AlertInvestigationFlow:
             )
             infra_cluster = routing.get("infra_cluster") or ""
             owner_mention = routing.get("slack_owner_member_id") or ""
+            if workflow.patched("infra-alertnames-from-settings"):
+                infra_alertnames = routing.get("infra_alertnames")
 
         # ── Step 3: Verification delay ──
         # A flat per-class wait (`hub.verify_seconds`, served by the hub
@@ -496,7 +501,7 @@ class AlertInvestigationFlow:
         # Infra/swarm alerts (NodeDown, DockerServiceDown, cluster=homelab-swarm, ...)
         # have no application code repo. Resolve them deterministically to
         # infra-gitops, skipping the LLM repo-match entirely.
-        _is_infra = is_infra_alert(alert, infra_cluster)
+        _is_infra = is_infra_alert(alert, infra_cluster, infra_alertnames)
         if _is_infra:
             # ── Step 4.0: Auto-remediation (force-restart) ──
             # A swarm service below desired replicas is usually a stuck/unplaced
@@ -566,6 +571,19 @@ class AlertInvestigationFlow:
         # always carries a matching resources entry.
         resources_list = resource.get("resources") or []
 
+        # ── Step 4.3: A label claim is application code (#498) ──
+        # A repository claimed this alert by label (resources.metadata.
+        # alert_labels) — e.g. a Dagster failure whose job the pipeline repo
+        # owns, although "Dagster Pipeline Failure" is on the infra list. It is
+        # a bug in that repo: investigate it as code (fix branch allowed, no
+        # swarm framing) and skip Gate-0, because the claim is the operator's
+        # explicit mapping and the content scorer cannot confirm it.
+        claimed = resource.get("source") == "label_claim" and workflow.patched(
+            "alert-label-claims"
+        )
+        if claimed:
+            _is_infra = False
+
         # ── Step 4.4: Gate-0 — confirm the repo is relevant before kimi ──
         # resolve_alert_resource matches on alert.service. For the chat path
         # the service IS the pandora-picked repo, so the match is tautological
@@ -576,8 +594,9 @@ class AlertInvestigationFlow:
         # Infra alerts skip Gate-0 entirely: the infra-gitops resource was
         # resolved deterministically (no LLM ambiguity) so there is nothing to
         # confirm, and blocking with a "Which repo?" card for every NodeDown
-        # storm is pure noise.
-        if resources_list and not _is_infra:
+        # storm is pure noise. A label claim (Step 4.3) skips it for the same
+        # reason: nothing is ambiguous about an explicit mapping.
+        if resources_list and not _is_infra and not claimed:
             resolved_rid = resources_list[0].get("resource_id") or ""
             rel = await workflow.execute_activity_method(
                 AlertActivities.score_resource_relevance,

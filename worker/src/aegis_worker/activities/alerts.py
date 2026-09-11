@@ -13,6 +13,7 @@ from typing import Any
 from aegis.llm import parse_llm_json
 from aegis.observability import log_audit
 from aegis.security import SPOTLIGHT_INSTRUCTION, assess_rule_of_two, spotlight
+from aegis.services.infra_alert_routing import get_infra_alert_routing
 from temporalio import activity
 
 # Cap on Kimi investigation output kept in the activity return value.
@@ -40,19 +41,21 @@ _KIMI_BRANCH_RE = re.compile(r"^BRANCH:\s*(.+)$", re.MULTILINE)
 _JIRA_SOURCE = "todoist-jira"
 
 
-# Alertnames that identify infra/swarm alerts. Checked lowercase.
-# These alerts have no application code repo — route directly to infra-gitops.
-INFRA_ALERTNAMES: frozenset[str] = frozenset(
+# Which alertnames are infra, and which repo investigates them, is DB config:
+# the `infra_alert_routing` settings row merged over a generic default
+# (`aegis.services.infra_alert_routing`, #498). The flow reads the effective
+# list through `get_alert_routing_config` and passes it to `is_infra_alert`.
+#
+# REPLAY ONLY — do not add to this, and do not read it for a new alert. It is
+# the built-in list as it stood before #498, frozen, for AlertInvestigationFlow
+# histories recorded before then: their routing config carried no list, and
+# replaying them against anything else would classify an alert differently,
+# schedule a different activity and wedge the workflow. Delete it once no run
+# started before #498 is open (the Gate-2 card times out after 48h).
+_PRE_498_INFRA_ALERTNAMES: frozenset[str] = frozenset(
     {
         "nodedown",
         "dockerservicedown",
-        # Prometheus' 2h escalation of DockerServiceDown, and the alertname
-        # InfraHeartbeatFlow re-fires under for a service confirmed-stuck past
-        # `restuck_hours` (#138). It was already in _REMEDIABLE_ALERTNAMES but
-        # missing here, and _safe_remediate_infra only runs inside the
-        # is_infra_alert branch — so with `infra_cluster` unset (its default)
-        # every ServiceDownProlonged went down the LLM repo-match path and
-        # never got its force-restart.
         "servicedownprolonged",
         "heartbeatcollectfailed",
         "lokidown",
@@ -75,23 +78,6 @@ INFRA_ALERTNAMES: frozenset[str] = frozenset(
     }
 )
 
-# Slug / github_repo of the resource that infra alerts route to.
-# ponytail: these two constants are a per-fork configuration point, not a
-# real default — `resources` rows for kind='repository' are NOT seeded from
-# YAML, they're auto-created by WorkspaceRepoSyncFlow scanning the workspace
-# host, which slugs a repo as `repo-<checkout-dirname>` (see
-# activities/inventory.py). "example/infra-gitops" is the upstream
-# placeholder; a fork whose swarm-config repo has any other name/path (this
-# deployment's is checked out as `infra-gitops` -> homelab-gitops, giving
-# slug `repo-homelab-gitops` / github_repo `hikmahtech/homelab-gitops`) must
-# update these two lines to match, or resolve_infra_resource's DB lookup
-# below silently finds no row and every infra-classified alert (Fixes #119:
-# confirmed via read-only prod query that this exact mismatch was why
-# CriticalEndpointDown/Dagster-Pipeline-Failure alerts always landed on
-# resource_source="none") dead-ends on the no-repo-access investigate() path.
-_HOMELAB_GITOPS_SLUG = "repo-homelab-gitops"
-_HOMELAB_GITOPS_REPO = "hikmahtech/homelab-gitops"
-
 # Infra alert classes safe to auto-remediate with a `service update --force`.
 # A force-restart reschedules a stuck/unplaced task (the DockerServiceDown /
 # ServiceDownProlonged case). ServiceCrashLooping is deliberately EXCLUDED —
@@ -110,17 +96,23 @@ _REMEDIATION_HEARTBEAT_INTERVAL_S = 15
 _HINT_REPO_RE = re.compile(r"^[\w.-]+/[\w.-]+$")
 
 
-def is_infra_alert(alert: dict, infra_cluster: str = "") -> bool:
+def is_infra_alert(
+    alert: dict, infra_cluster: str = "", infra_alertnames: list[str] | None = None
+) -> bool:
     """Return True when the alert is an infrastructure / swarm alert.
 
-    Matches on alertname (checked against INFRA_ALERTNAMES) OR on the
-    `cluster` label equalling `infra_cluster` (Settings.infra_cluster — admin
-    Integrations page, AEGIS_INFRA_CLUSTER env fallback; blank ⇒ cluster
-    matching is off). Callers pass the value explicitly — workflows fetch it
-    once via AlertActivities.get_alert_routing_config since they can't read
-    Settings/DB directly. Infra alerts have no application code repo and
-    should be routed directly to infra-gitops instead of going through the
-    LLM repo-match.
+    Matches on alertname (against `infra_alertnames`, the effective list from
+    the `infra_alert_routing` settings row) OR on the `cluster` label equalling
+    `infra_cluster` (Settings.infra_cluster — admin Integrations page,
+    AEGIS_INFRA_CLUSTER env fallback; blank ⇒ cluster matching is off). Callers
+    pass both explicitly — workflows fetch them once via
+    AlertActivities.get_alert_routing_config since they can't read the DB.
+    `infra_alertnames=None` means a history recorded before the list moved to
+    the DB, and replays against `_PRE_498_INFRA_ALERTNAMES`.
+
+    Infra alerts have no application code repo, so they skip the repo match
+    and go to the infra repo — unless a repository claims them by label
+    (`resources.metadata.alert_labels`), which the resolver checks first.
     """
     labels = alert.get("labels") or {}
     if not isinstance(labels, dict):
@@ -128,8 +120,13 @@ def is_infra_alert(alert: dict, infra_cluster: str = "") -> bool:
     cluster = (labels.get("cluster") or "").strip()
     if infra_cluster and cluster == infra_cluster:
         return True
+    names = (
+        _PRE_498_INFRA_ALERTNAMES
+        if infra_alertnames is None
+        else {str(n).strip().lower() for n in infra_alertnames}
+    )
     alertname = (labels.get("alertname") or "").strip().lower()
-    return alertname in INFRA_ALERTNAMES
+    return alertname in names
 
 
 # Caps for the human-approved remediation-command path (Gate 2 "Run fix"):
@@ -555,6 +552,58 @@ def _deterministic_resource_match(alert: dict, rows: list) -> dict | None:
     return _coding_match(row["id"], row["title"], meta, 1.0)
 
 
+# ---------------------------------------------------------------------------
+# Label claims — checked first by both resolvers (#498)
+# ---------------------------------------------------------------------------
+
+# Only coding-enabled repositories that declare claims. The allow-list matters
+# twice here: a claim sends the alert to a fix-capable coding run.
+_CLAIM_ROWS_SQL = (
+    "SELECT id, title, metadata FROM resources "
+    "WHERE kind = 'repository' AND metadata->>'coding_enabled' = 'true' "
+    "AND jsonb_typeof(metadata->'alert_labels') = 'object' ORDER BY slug"
+)
+
+
+def _label_claims(alert: dict, rows: list) -> list[tuple[Any, dict]]:
+    """Every row whose `metadata.alert_labels` claims this alert.
+
+    `alert_labels` maps a label name to the values it claims, e.g.
+    `{"code_location": ["analytics"]}` or `{"pipeline_name": ["etl_daily"]}`.
+    A row claims the alert when ANY of its labels carries one of its values.
+    Names match exactly (Prometheus label names are case-sensitive); values
+    match stripped and case-insensitively. An empty label value never matches.
+
+    This is the explicit, operator-configured mapping from an alert to the repo
+    whose code it is about — for alerts whose alertname is shared by every
+    repo (a Dagster pipeline failure names the job, not the repo), and which
+    the free-text tiers deliberately cannot place.
+    """
+    labels = alert.get("labels") or {}
+    if not isinstance(labels, dict):
+        return []
+    have = {
+        str(k): v.strip().casefold()
+        for k, v in labels.items()
+        if isinstance(v, str) and v.strip()
+    }
+    if not have:
+        return []
+    claimed: list[tuple[Any, dict]] = []
+    for row in rows:
+        meta = _decode_metadata(row)
+        claims = meta.get("alert_labels")
+        if not isinstance(claims, dict):
+            continue
+        for key, values in claims.items():
+            wanted = values if isinstance(values, list) else [values]
+            got = have.get(str(key))
+            if got and got in {str(w).strip().casefold() for w in wanted if w is not None}:
+                claimed.append((row, meta))
+                break
+    return claimed
+
+
 @dataclass
 class AlertActivities:
     """Activities for alert investigation."""
@@ -603,11 +652,39 @@ class AlertActivities:
     @activity.defn
     async def get_alert_routing_config(self) -> dict:
         """Settings-derived routing knobs for the flow (workflows can't read
-        Settings/DB — mirror of the AgentRegistryActivities pattern)."""
+        Settings/DB — mirror of the AgentRegistryActivities pattern).
+
+        `infra_alertnames` is the effective infra list from the
+        `infra_alert_routing` settings row (generic defaults when unset)."""
+        routing = await get_infra_alert_routing(self.db_pool)
         return {
             "infra_cluster": self.infra_cluster,
             "slack_owner_member_id": self.slack_owner_member_id,
+            "infra_alertnames": routing["alertnames"],
         }
+
+    async def _claimed_resource(self, alert: dict) -> dict | None:
+        """The one coding-enabled repository that claims this alert by label,
+        or None. Two claimants is a config mistake, not a coin toss: it is
+        logged and claims nothing, so the alert takes its normal path. A DB
+        error also claims nothing — a claim is an override, never a gate."""
+        try:
+            rows = await self.db_pool.fetch(_CLAIM_ROWS_SQL)
+        except Exception as exc:  # noqa: BLE001
+            activity.logger.warning("alert_label_claim_db_failed err=%s", str(exc)[:200])
+            return None
+        claims = _label_claims(alert, rows)
+        if len(claims) > 1:
+            activity.logger.warning(
+                "alert_label_claim_ambiguous fingerprint=%s repos=%s",
+                alert.get("fingerprint", ""),
+                [str(meta.get("github_repo") or row["title"]) for row, meta in claims],
+            )
+            return None
+        if not claims:
+            return None
+        row, meta = claims[0]
+        return _coding_match(row["id"], row["title"], meta, 1.0)
 
     async def _effective_runbooks_dir(self) -> str:
         """Runbooks dir, DB-first: the infra coding block (via the connector)
@@ -924,18 +1001,23 @@ class AlertActivities:
 
     @activity.defn
     async def resolve_infra_resource(self, alert: dict) -> dict:
-        """Deterministically resolve an infra/swarm alert to the infra-gitops resource.
+        """Deterministically resolve an infra/swarm alert to the infra repo.
 
         Infra alerts (alertmanager NodeDown, DockerServiceDown, etc.) have no
-        application code repo — they should always investigate against the
-        infra-gitops ansible/swarm config. This activity looks up the
-        infra-gitops resource row directly (by slug or github_repo) and
-        returns it in the same dict shape as resolve_alert_resource so the
-        flow can proceed to run_investigation without going through the LLM
-        repo-match or Gate-0.
+        application code repo — they investigate against the infra repo's
+        ansible/swarm config: the repository resource whose github_repo is the
+        `repo` of the `infra_alert_routing` settings row. Returned in the same
+        dict shape as resolve_alert_resource so the flow can go straight to
+        run_investigation without the LLM repo-match or Gate-0.
 
-        Falls back to the null-resource dict if the row is missing from the
-        DB (→ LLM-only investigate() path instead of failing).
+        First, a repository that claims the alert by label wins (#498): an
+        alertname shared by every pipeline ("Dagster Pipeline Failure") is on
+        the infra list, but the repo whose job failed can claim its own
+        failures. That result carries source="label_claim", and the flow then
+        investigates it as application code.
+
+        Falls back to the null-resource dict when no infra repo is configured
+        or its row is missing (→ LLM-only investigate() path, not a failure).
         """
         null_result = {
             "resource_id": None,
@@ -948,13 +1030,24 @@ class AlertActivities:
         }
         if not self.db_pool:
             return null_result
+        claimed = await self._claimed_resource(alert)
+        if claimed is not None:
+            return {**claimed, "source": "label_claim", "resources": [claimed]}
+        repo = (await get_infra_alert_routing(self.db_pool))["repo"]
+        if not repo:
+            activity.logger.warning(
+                "resolve_infra_resource_no_repo — set `repo` in the "
+                "infra_alert_routing setting (PUT /api/admin/infra-alert-routing)"
+            )
+            return null_result
         try:
+            # Prefer the row with a checkout path: without one the coding run
+            # has nowhere to cd and degrades to the LLM-only path.
             row = await self.db_pool.fetchrow(
                 "SELECT id, title, metadata FROM resources "
-                "WHERE slug = $1 OR metadata->>'github_repo' = $2 "
-                "LIMIT 1",
-                _HOMELAB_GITOPS_SLUG,
-                _HOMELAB_GITOPS_REPO,
+                "WHERE kind = 'repository' AND lower(metadata->>'github_repo') = lower($1) "
+                "ORDER BY (metadata->>'path') IS NULL, slug LIMIT 1",
+                repo,
             )
         except Exception as exc:
             activity.logger.warning(
@@ -962,16 +1055,14 @@ class AlertActivities:
             )
             return null_result
         if not row:
-            activity.logger.warning(
-                "resolve_infra_resource_not_found slug=%s", _HOMELAB_GITOPS_SLUG
-            )
+            activity.logger.warning("resolve_infra_resource_not_found repo=%s", repo)
             return null_result
         meta = _decode_metadata(row)
         matched = {
             "resource_id": str(row["id"]),
             "resource_title": row["title"],
             "resource_path": meta.get("path") or "",
-            "github_repo": meta.get("github_repo") or _HOMELAB_GITOPS_REPO,
+            "github_repo": meta.get("github_repo") or repo,
             "confidence": 1.0,
         }
         return {**matched, "source": "infra", "resources": [matched]}
@@ -1149,8 +1240,9 @@ class AlertActivities:
         """Map an alert to matching resources using KG cache then LLM, with rule-based expansion.
 
         Returns backward-compatible top-level fields plus a 'resources' list for multi-repo
-        investigation. source: "knowledge" | "sentry_project" | "service_match" |
-        "deterministic" | "llm" | "llm_unconfirmed" | "auto_registered" | "none"
+        investigation. source: "label_claim" | "knowledge" | "sentry_project" |
+        "service_match" | "deterministic" | "llm" | "llm_unconfirmed" |
+        "auto_registered" | "none"
         """
         null_result = {
             "resource_id": None,
@@ -1164,6 +1256,13 @@ class AlertActivities:
 
         if not self.db_pool:
             return null_result
+
+        # Tier 0: a repository that claims the alert by label. The operator's
+        # explicit mapping beats every inference below, and it holds whether
+        # or not the alertname is on the infra list (#498).
+        claimed = await self._claimed_resource(alert)
+        if claimed is not None:
+            return {**claimed, "source": "label_claim", "resources": [claimed]}
 
         fingerprint = alert.get("fingerprint", "")
         kg_query = f"alert:{fingerprint} relates_to resource"

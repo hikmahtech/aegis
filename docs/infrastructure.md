@@ -752,6 +752,89 @@ key is pasted.)
    > have a workspace checkout:
    > `UPDATE resources SET metadata = jsonb_set(metadata,'{coding_enabled}','true') WHERE kind='repository' AND metadata->>'path' IS NOT NULL;`
 
+### Which repo an alert is investigated in
+
+`AlertInvestigationFlow` picks the repo in this order:
+
+1. **A label claim.** A repository with **Enable alert / Sentry
+   investigation** on can claim alerts by label. Put it in the resource's
+   **Additional metadata (JSON)** box:
+
+   ```json
+   {"alert_labels": {"code_location": ["analytics"]}}
+   ```
+
+   That claims every alert whose `code_location` label is `analytics`. List
+   more labels to claim on any of them. Label names match exactly; values
+   match case-insensitively. A claimed alert is investigated in that repo as
+   application code: the run may stage a fix branch, it is not told it is
+   looking at a swarm problem, and Gate-0 is skipped because the mapping is
+   yours. This holds even when the alertname is on the infra list below. If
+   two repos claim one alert, neither gets it, and the worker logs
+   `alert_label_claim_ambiguous`.
+2. **Infra alerts** go to the infra repo, investigate-only, after the one safe
+   force-restart.
+3. **Everything else** goes down the ladder: Sentry project slug, service
+   name, token match, then the LLM, with Gate-0 confirming the pick.
+
+#### The infra list and the infra repo
+
+Both live in the `infra_alert_routing` settings row. Read and replace it over
+the admin API:
+
+```bash
+curl -sS -H "X-API-Key: $AEGIS_API_KEY" "$AEGIS_URL/api/admin/infra-alert-routing"
+curl -sS -X PUT "$AEGIS_URL/api/admin/infra-alert-routing" \
+  -H "X-API-Key: $AEGIS_API_KEY" -H 'Content-Type: application/json' \
+  -d '{"extra_alertnames": ["Dagster Pipeline Failure", "ClickHouseDown"], "repo": "acme/infra-gitops"}'
+```
+
+- `extra_alertnames` are added to the built-in list, which `GET` returns as
+  `default_alertnames`: the alerts AEGIS's heartbeat raises (`NodeDown`,
+  `DockerServiceDown`, `ServiceDownProlonged`, `HeartbeatCollectFailed`) plus
+  common host, container and monitoring-stack alerts. Anything specific to
+  your setup goes here. Names are compared lowercased.
+- `repo` is the `owner/name` (the resource's GitHub repo) that infra alerts
+  are investigated in. Unset means infra alerts get an LLM-only investigation.
+- `PUT` replaces the whole row and answers 400 on a bad value. The worker
+  picks a change up within 30 seconds; no restart.
+
+#### Example: Dagster pipeline failures
+
+Every Dagster job in every code location raises the same alertname, so the
+alertname cannot say which repo broke. Keep it on the infra list, because a
+run that dies before any step runs (user code unreachable, run worker killed)
+is an infra problem. Then let each pipeline repo claim its own failures.
+
+The label to claim on is the code location. Dagster records it on every run
+as the `.dagster/repository` tag (`__repository__@<location>`). Have your
+alert rule export it, but only when a step failed, so a run-level failure
+keeps going to the infra repo. For a Grafana rule that selects from `runs r`
+with the `STEP_FAILURE` event joined as `e`, add to the `SELECT`:
+
+```sql
+COALESCE(
+  CASE WHEN e.step_key IS NOT NULL THEN
+    (SELECT split_part(rt.value, '@', 2) FROM run_tags rt
+      WHERE rt.run_id = r.run_id AND rt.key = '.dagster/repository' LIMIT 1)
+  END,
+  '-'
+) AS code_location
+```
+
+Then claim each location on its repo:
+
+```sql
+UPDATE resources
+SET metadata = metadata || '{"alert_labels": {"code_location": ["analytics"]}}'::jsonb
+WHERE kind = 'repository' AND metadata->>'github_repo' = 'acme/analytics-pipeline';
+```
+
+Before the rule exports the location, a repo can claim by job name instead,
+`{"alert_labels": {"pipeline_name": ["etl_daily", "etl_weekly"]}}`. That list
+needs updating as jobs are added, and it cannot claim `__ASSET_JOB`, which
+has the same name in every code location.
+
 ### Session inventory
 
 Before starting a coding run, AEGIS can check whether one of your own Claude

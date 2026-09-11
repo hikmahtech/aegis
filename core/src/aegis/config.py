@@ -168,9 +168,9 @@ class Settings(BaseSettings):
     # Prometheus/Alertmanager `cluster` label value that marks an alert as an
     # infra/swarm alert (routed straight to infra-gitops, skipping the LLM
     # repo-match). Blank ⇒ the cluster-label fast path is off; alertname
-    # matching (INFRA_ALERTNAMES) still classifies infra alerts. Set this to
-    # your own cluster label to also route by cluster. Editable from the
-    # admin Integrations page.
+    # matching (the `infra_alert_routing` settings row) still classifies infra
+    # alerts. Set this to your own cluster label to also route by cluster.
+    # Editable from the admin Integrations page.
     infra_cluster: str = ""
     infra_heartbeat_ping_url: str = ""  # healthchecks.io dead-man URL ("" = off)
     slack_owner_member_id: str = ""  # Slack member id for escalation @-mentions ("" = no mention)

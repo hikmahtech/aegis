@@ -13,6 +13,8 @@ from __future__ import annotations
 from unittest.mock import AsyncMock
 
 import pytest
+from aegis.services import infra_alert_routing
+from aegis.services.infra_alert_routing import DEFAULT_INFRA_ALERTNAMES
 from aegis_worker.activities.alerts import (
     AlertActivities,
     is_infra_alert,
@@ -122,11 +124,16 @@ def test_is_infra_alert_no_labels():
     assert is_infra_alert(alert) is False
 
 
-def test_is_infra_alert_dagster_pipeline_failure():
+def test_is_infra_alert_dagster_pipeline_failure_is_setup_config_not_a_default():
+    """A Dagster alert is infra only because this deployment says so in the
+    `infra_alert_routing` row (#498). The code default names nobody's setup;
+    a history recorded before the move (no list) still replays as infra."""
     alert = {
         "source": "alertmanager",
         "labels": {"alertname": "Dagster Pipeline Failure"},
     }
+    assert is_infra_alert(alert, "", sorted(DEFAULT_INFRA_ALERTNAMES)) is False
+    assert is_infra_alert(alert, "", ["dagster pipeline failure"]) is True
     assert is_infra_alert(alert) is True
 
 
@@ -135,12 +142,23 @@ def test_is_infra_alert_dagster_pipeline_failure():
 # ---------------------------------------------------------------------------
 
 
+@pytest.fixture(autouse=True)
+def _fresh_routing_cache():
+    """The infra routing read is cached 30s per process; never let one test's
+    row leak into the next."""
+    infra_alert_routing._cache.update(value=None, ts=0.0)
+    yield
+    infra_alert_routing._cache.update(value=None, ts=0.0)
+
+
 async def test_get_alert_routing_config_activity():
     act = AlertActivities(infra_cluster="homelab-swarm", slack_owner_member_id="U042")
     env = ActivityEnvironment()
     assert await env.run(act.get_alert_routing_config) == {
         "infra_cluster": "homelab-swarm",
         "slack_owner_member_id": "U042",
+        # No pool: the generic defaults, never an empty list.
+        "infra_alertnames": sorted(DEFAULT_INFRA_ALERTNAMES),
     }
 
 
@@ -157,62 +175,61 @@ def mock_db_pool():
     return pool
 
 
-async def test_resolve_infra_resource_found(mock_db_pool):
-    """Returns infra-gitops resource when row exists."""
-    import json
-
-    mock_db_pool.fetchrow.return_value = {
-        "id": "aaaabbbb-cccc-dddd-eeee-111122223333",
-        "title": "infra-gitops",
-        "metadata": json.dumps({"path": "infra-gitops", "github_repo": "example/infra-gitops"}),
-    }
-    activities = AlertActivities(db_pool=mock_db_pool)
-    env = ActivityEnvironment()
-    alert = {
-        "source": "alertmanager",
-        "labels": {"alertname": "NodeDown", "cluster": "homelab-swarm"},
-    }
-    result = await env.run(activities.resolve_infra_resource, alert)
-    assert result["source"] == "infra"
-    assert result["confidence"] == 1.0
-    assert result["github_repo"] == "example/infra-gitops"
-    assert len(result["resources"]) == 1
-    assert result["resource_id"] is not None
+async def _infra_routing(db_pool, repo: str) -> None:
+    await db_pool.execute("DELETE FROM settings WHERE key = 'infra_alert_routing'")
+    if repo:
+        await db_pool.execute(
+            "INSERT INTO settings (key, value, updated_at) VALUES ('infra_alert_routing', $1, NOW())",
+            {"repo": repo},
+        )
+    infra_alert_routing._cache.update(value=None, ts=0.0)
 
 
-async def test_resolve_infra_resource_queries_deployed_slug_and_repo(mock_db_pool):
-    """Regression guard for #119: resolve_infra_resource's DB lookup must
-    target THIS deployment's actual homelab-gitops-equivalent resource
-    (`repo-homelab-gitops` / `hikmahtech/homelab-gitops`, confirmed via
-    read-only prod query), not the upstream placeholder
-    (`repo-infra-gitops` / `example/infra-gitops`) — that mismatch was why
-    EVERY infra-classified alert (NodeDown, CriticalEndpointDown, Dagster
-    Pipeline Failure, ...) silently resolved to source="none" in prod: the
-    WHERE clause never found a matching row."""
-    mock_db_pool.fetchrow.return_value = None
-    activities = AlertActivities(db_pool=mock_db_pool)
-    env = ActivityEnvironment()
-    alert = {"source": "alertmanager", "labels": {"alertname": "NodeDown"}}
-    await env.run(activities.resolve_infra_resource, alert)
+async def test_resolve_infra_resource_found(db_pool):
+    """Resolves to the repository the `infra_alert_routing` row names.
 
-    args, _ = mock_db_pool.fetchrow.call_args
-    queried_slug, queried_repo = args[1], args[2]
-    assert queried_slug == "repo-homelab-gitops"
-    assert queried_repo == "hikmahtech/homelab-gitops"
-    assert queried_slug != "repo-infra-gitops"
-    assert queried_repo != "example/infra-gitops"
+    This was #119: the infra repo used to be a slug/repo pair hard-coded for
+    one deployment, and a mismatch sent every infra alert to source="none".
+    It is now configuration, so a fork points it at its own repo."""
+    await db_pool.execute("DELETE FROM resources WHERE slug = 'test-infra-gitops'")
+    rid = await db_pool.fetchval(
+        "INSERT INTO resources (kind, slug, title, metadata) VALUES "
+        "('repository', 'test-infra-gitops', 'infra-gitops', $1) RETURNING id",
+        {"path": "ops/infra-gitops", "github_repo": "example/infra-gitops"},
+    )
+    await _infra_routing(db_pool, "example/infra-gitops")
+    try:
+        alert = {
+            "source": "alertmanager",
+            "labels": {"alertname": "NodeDown", "cluster": "homelab-swarm"},
+        }
+        result = await ActivityEnvironment().run(
+            AlertActivities(db_pool=db_pool).resolve_infra_resource, alert
+        )
+        assert result["source"] == "infra"
+        assert result["confidence"] == 1.0
+        assert result["github_repo"] == "example/infra-gitops"
+        assert result["resource_id"] == str(rid)
+        assert result["resource_path"] == "ops/infra-gitops"
+        assert len(result["resources"]) == 1
+    finally:
+        await db_pool.execute("DELETE FROM resources WHERE slug = 'test-infra-gitops'")
+        await _infra_routing(db_pool, "")
 
 
-async def test_resolve_infra_resource_not_found_returns_null(mock_db_pool):
-    """Falls back to null-resource when infra-gitops row is missing."""
-    mock_db_pool.fetchrow.return_value = None
-    activities = AlertActivities(db_pool=mock_db_pool)
-    env = ActivityEnvironment()
-    alert = {"source": "alertmanager", "labels": {"alertname": "NodeDown"}}
-    result = await env.run(activities.resolve_infra_resource, alert)
-    assert result["source"] == "none"
-    assert result["confidence"] == 0.0
-    assert result["resources"] == []
+async def test_resolve_infra_resource_not_found_returns_null(db_pool):
+    """Falls back to null-resource when the configured repo has no row."""
+    await _infra_routing(db_pool, "example/no-such-repo")
+    try:
+        alert = {"source": "alertmanager", "labels": {"alertname": "NodeDown"}}
+        result = await ActivityEnvironment().run(
+            AlertActivities(db_pool=db_pool).resolve_infra_resource, alert
+        )
+        assert result["source"] == "none"
+        assert result["confidence"] == 0.0
+        assert result["resources"] == []
+    finally:
+        await _infra_routing(db_pool, "")
 
 
 async def test_resolve_infra_resource_no_pool():
@@ -332,6 +349,13 @@ async def _stub_gather_knowledge(title: str, project: str, alert_name: str = "")
 @activity.defn(name="run_investigation")
 async def _stub_run_investigation(alert: dict, resources: list[dict], runbook: str, *_a) -> dict:
     _flow_state["run_investigation_called"] = True
+    # _a = (engine_override, allow_fix); runbook is the knowledge context the
+    # flow built, infra framing included.
+    _flow_state["run_investigation_args"] = {
+        "resources": resources,
+        "runbook": runbook,
+        "allow_fix": _a[1] if len(_a) > 1 else True,
+    }
     return _flow_state["run_investigation_result"]
 
 
@@ -382,7 +406,11 @@ async def _stub_record_verdict_to_kg(alert: dict, verdict: dict, investigation_o
 
 @activity.defn(name="get_alert_routing_config")
 async def _stub_get_alert_routing_config() -> dict:
-    return {"infra_cluster": _flow_state.get("infra_cluster", "")}
+    routing = {"infra_cluster": _flow_state.get("infra_cluster", "")}
+    # Absent unless a test sets it — the shape a pre-#498 history recorded.
+    if _flow_state.get("infra_alertnames") is not None:
+        routing["infra_alertnames"] = _flow_state["infra_alertnames"]
+    return routing
 
 
 @activity.defn(name="insert_interaction")
@@ -695,3 +723,115 @@ async def test_custom_infra_agent_receives_delivery():
     assert addressed, "expected at least one agent-addressed action"
     assert all(a == "custom-ops" for a in addressed)
     assert "pandoras-actor" not in addressed
+
+
+# ── Issue #498: a claimed Dagster failure is investigated as application code ──
+
+# The infra framing the flow prepends to the knowledge context (Step 5.5).
+_INFRA_HINT = "Docker Swarm / homelab infrastructure alert"
+
+# The shape AlertInvestigationFlow receives for a Dagster run failure in prod.
+_DAGSTER_LABELS = {
+    "alertname": "Dagster Pipeline Failure",
+    "service": "dagster",
+    "severity": "critical",
+    "pipeline_name": "crypto_ml_training",
+    "asset_or_job": "crypto_ml_training",
+    "failed_step": "ml__crypto__training__crypto_ml_training",
+    "error_class": "InvalidOperationError",
+    "run_id": "16b4476d-5803-4f03-827c-7845a1ff894f",
+    "partition_key": "2026-09-01",
+    "backfill_id": "-",
+    "grafana_folder": "Infrastructure",
+}
+
+_PIPELINE_REPO_RESOURCE = {
+    "resource_id": "pipeline-res-1",
+    "resource_title": "acme/trading-pipeline",
+    "resource_path": "code/trading-pipeline",
+    "github_repo": "acme/trading-pipeline",
+    "engine": "",
+    "claude_account": "",
+    "confidence": 1.0,
+}
+
+
+def _make_dagster_alert() -> dict:
+    return _make_infra_alert(
+        title="Dagster Failed: crypto_ml_training [2026-09-01]",
+        fingerprint="dagster-fp-001",
+        service="",
+        description="Job name: crypto_ml_training\nError Type: InvalidOperationError",
+        labels=dict(_DAGSTER_LABELS),
+    )
+
+
+async def _run_dagster_flow(workflow_id: str) -> dict:
+    async with (
+        await WorkflowEnvironment.start_time_skipping() as env,
+        Worker(
+            env.client,
+            task_queue=f"q-{workflow_id}",
+            workflows=[AlertInvestigationFlow, InteractionFlow],
+            activities=_ALL_FLOW_ACTIVITIES,
+        ),
+    ):
+        return await env.client.execute_workflow(
+            AlertInvestigationFlow.run,
+            _make_dagster_alert(),
+            id=workflow_id,
+            task_queue=f"q-{workflow_id}",
+        )
+
+
+async def test_claimed_dagster_failure_is_investigated_as_application_code():
+    """Dagster is on the infra list, but the pipeline repo claims this job. The
+    run goes to that repo, may stage a fix, and is not told it is looking at a
+    swarm problem. Gate-0 is skipped: the claim is the operator's explicit
+    mapping, and the scorer would ask "which repo?" for every Dagster failure."""
+    _hub_reset()
+    _reset_flow(
+        infra_alertnames=["nodedown", "dagster pipeline failure"],
+        resolve_infra_result={
+            **_PIPELINE_REPO_RESOURCE,
+            "source": "label_claim",
+            "resources": [_PIPELINE_REPO_RESOURCE],
+        },
+    )
+
+    await _run_dagster_flow("test-dagster-claimed")
+
+    assert _flow_state.get("resolve_infra_called") is True
+    assert _flow_state.get("resolve_alert_resource_called") is not True
+    assert _flow_state.get("score_resource_called") is not True
+    args = _flow_state["run_investigation_args"]
+    assert args["resources"][0]["github_repo"] == "acme/trading-pipeline"
+    assert args["allow_fix"] is True
+    assert _INFRA_HINT not in args["runbook"]
+
+
+async def test_unclaimed_dagster_failure_keeps_the_infra_investigation():
+    """No repo claims it: it stays an investigate-only infra run, as before."""
+    _hub_reset()
+    _reset_flow(infra_alertnames=["nodedown", "dagster pipeline failure"])
+
+    await _run_dagster_flow("test-dagster-unclaimed")
+
+    assert _flow_state.get("resolve_infra_called") is True
+    assert _flow_state.get("score_resource_called") is not True
+    args = _flow_state["run_investigation_args"]
+    assert args["resources"][0]["github_repo"] == "example/infra-gitops"
+    assert args["allow_fix"] is False
+    assert _INFRA_HINT in args["runbook"]
+
+
+async def test_the_configured_list_decides_infra_inside_the_flow():
+    """Take Dagster off the infra list in the DB and the flow sends its
+    failures down the normal resolution ladder, not to the infra repo."""
+    _hub_reset()
+    _reset_flow(infra_alertnames=["nodedown"])
+
+    await _run_dagster_flow("test-dagster-not-infra")
+
+    assert _flow_state.get("resolve_alert_resource_called") is True
+    assert _flow_state.get("resolve_infra_called") is not True
