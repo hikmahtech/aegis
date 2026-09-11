@@ -85,8 +85,6 @@ CONFIG_REGISTRY: list[ConfigKey] = [
         "Blank = the flow reports token_missing and never calls the API. "
         "Worker restart required.",
     ),
-    ConfigKey("miniflux_url", "Base URL", "RSS (Miniflux)", False),
-    ConfigKey("miniflux_api_key", "API key", "RSS (Miniflux)", True),
     ConfigKey("searxng_url", "Base URL", "Search (SearXNG)", False),
     ConfigKey("finance_provider", "Provider (yahoo | stooq)", "Finance", False),
     ConfigKey("finance_indices", "Overview indices (comma-sep symbols)", "Finance", False),

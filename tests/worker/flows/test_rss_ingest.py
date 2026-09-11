@@ -107,7 +107,33 @@ async def stub_cursor(kind, identifier, key, value) -> None:
     _calls["cursor"].append((kind, identifier, key, value))
 
 
-ALL_STUBS = [stub_list, stub_fetch, stub_idem, stub_content, stub_ingest, stub_cursor]
+# The feed record and the hub (#511). Answered here so these tests exercise
+# the ingest path; the tests below that pass their own list take the degrade
+# path of an unregistered activity, which must not change the result either.
+@activity.defn(name="load_gate_terms")
+async def stub_terms() -> list[str]:
+    return []
+
+
+@activity.defn(name="record_feed_entries")
+async def stub_record_entries(channel_id: str, rows: list[dict]) -> int:
+    return len(rows)
+
+
+@activity.defn(name="record_feed_run")
+async def stub_record_run(channel_id: str, outcome: dict) -> dict:
+    return {"fetch_failures": 0 if outcome.get("ok") else 1}
+
+
+@activity.defn(name="reconcile_findings")
+async def stub_reconcile(inp: dict) -> dict:
+    return {"fresh": [], "attached": 0, "muted": 0, "suppressed": 0, "resolved": []}
+
+
+FEED_STUBS = [stub_terms, stub_record_entries, stub_record_run, stub_reconcile]
+ALL_STUBS = [
+    stub_list, stub_fetch, stub_idem, stub_content, stub_ingest, stub_cursor, *FEED_STUBS
+]
 
 
 def _reset():

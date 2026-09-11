@@ -605,6 +605,28 @@ class BriefingActivities:
         return f"{narrative}\n\n{failures}" if failures else narrative
 
     @activity.defn
+    async def feed_review_line(self) -> str:
+        """The monthly "drop it?" line for the research agent (#511).
+
+        Names the active feeds with at least 90 days of history that no prompt
+        used in the last 90 days, and says how to drop one. "" when every feed
+        earns its keep, or none is old enough to judge.
+        """
+        if not self.db_pool:
+            return ""
+        from aegis.services import feeds
+
+        rows = await feeds.unused_feeds(self.db_pool)
+        if not rows:
+            return ""
+        names = ", ".join(r["label"] for r in rows[:8])
+        more = f" and {len(rows) - 8} more" if len(rows) > 8 else ""
+        return (
+            f"Feeds no prompt used in 90 days: {names}{more}. "
+            'Drop any? Tell me "unsubscribe <name>".'
+        )
+
+    @activity.defn
     async def deliver_briefing(self, agent_id: str, message: str) -> dict:
         """Render the health block and send the briefing, in ONE activity.
 

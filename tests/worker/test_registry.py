@@ -393,9 +393,14 @@ def test_books_write_flow_is_gated_on_money_hygiene():
         # new ResearchActivities class — research_gather, research_read,
         # research_synthesize, research_save, research_task_problem. Unflagged,
         # so all three rows move.
-        (True, True, 46, 234),
-        (False, False, 36, 201),
-        (True, False, 40, 217),
+        # Then +5 activities and NO new flow from #511/#512: the feed record
+        # (`load_gate_terms`, `record_feed_entries`, `record_feed_run` on
+        # RssActivities), `store_feed_abstract` on ContentActivities and
+        # `feed_review_line` on BriefingActivities. Unflagged, so all three
+        # rows move.
+        (True, True, 46, 239),
+        (False, False, 36, 206),
+        (True, False, 40, 222),
     ],
 )
 def test_real_registration_passes_the_boot_check(homelab, money, flows, activities):

@@ -224,6 +224,8 @@ export const api = {
     apiFetch<any>(`/api/admin/channels/${id}`, { method: 'PATCH', body: JSON.stringify(patch) }),
   deleteChannel: (id: string) =>
     apiFetch<any>(`/api/admin/channels/${id}`, { method: 'DELETE' }),
+  // Per-feed worth, measured (#511): entries, stored, used in prompts, fetch health.
+  feedStats: () => apiFetch<any[]>('/api/admin/channels/feed-stats'),
 
   // Knowledge
   knowledgeAsk: (question: string) =>

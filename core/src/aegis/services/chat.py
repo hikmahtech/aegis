@@ -35,6 +35,11 @@ from aegis.services.tools.base import (
     _truncate_result,
     _truncate_text,  # noqa: F401 — re-export: routes/mcp_server.py imports it here
 )
+from aegis.services.tools.feeds import (
+    _exec_list_feeds,
+    _exec_subscribe_feed,
+    _exec_unsubscribe_feed,
+)
 from aegis.services.tools.gtd import (
     _assignee_labels,  # noqa: F401 — re-export: imported from here by tests
     _capture_to_inbox_impl,  # noqa: F401 — re-export: routes/chat.py + routes/capture.py
@@ -483,6 +488,10 @@ CHAT_TOOLS = [
     _registry_schema("read_url"),
     _registry_schema("paper_search"),
     _registry_schema("paper_read"),
+    # The feed list (#511), generated from services/tools/feeds.py.
+    _registry_schema("list_feeds"),
+    _registry_schema("subscribe_feed"),
+    _registry_schema("unsubscribe_feed"),
     {
         "type": "function",
         "function": {
@@ -1432,6 +1441,8 @@ _TOOL_TIMEOUT_OVERRIDES: dict[str, int] = {
     "read_url": FETCH_TOOL_TIMEOUT_S,
     "paper_search": FETCH_TOOL_TIMEOUT_S,
     "paper_read": FETCH_TOOL_TIMEOUT_S,
+    # subscribe_feed fetches the URL to check it is a feed (#511).
+    "subscribe_feed": FETCH_TOOL_TIMEOUT_S,
 }
 
 
@@ -3036,6 +3047,9 @@ TOOL_EXECUTORS: dict[str, Any] = {
     "read_url": _exec_read_url,
     "paper_search": _exec_paper_search,
     "paper_read": _exec_paper_read,
+    "list_feeds": _exec_list_feeds,
+    "subscribe_feed": _exec_subscribe_feed,
+    "unsubscribe_feed": _exec_unsubscribe_feed,
     "configure_triage": _exec_configure_triage,
     "update_runbook": _exec_update_runbook,
     "list_nodes": _exec_list_nodes,
@@ -3142,6 +3156,10 @@ AGENT_TOOL_SETS: dict[str, set[str]] = {
         "read_url",
         "paper_search",
         "paper_read",
+        # The feed list (#511): see it, add a feed, drop one.
+        "list_feeds",
+        "subscribe_feed",
+        "unsubscribe_feed",
         "track_topic",
         "remember_this",
         # Problem hub, the session registry: read a task's context, register

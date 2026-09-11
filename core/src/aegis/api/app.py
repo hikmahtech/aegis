@@ -85,14 +85,6 @@ async def lifespan(app: FastAPI):
 
     await warn_unknown_tool_refs(pool)
 
-    try:
-        from aegis.services.rss_seeder import seed_rss_from_miniflux
-
-        count = await seed_rss_from_miniflux(pool, settings)
-        logger.info("miniflux_rss_seed_complete", count=count)
-    except Exception as exc:
-        logger.warning("miniflux_seed_failed", error=str(exc)[:200])
-
     app.state.db_pool = pool
 
     # LLM client + tier map from the configurable backend (DB → env fallback).
