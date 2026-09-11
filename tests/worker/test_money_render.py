@@ -562,3 +562,31 @@ def test_month_close_without_books():
 def test_month_close_escapes_statement_text():
     out = render_month_close({**CLOSE, "is_text": "a < b & c", "bs_text": "BS"})
     assert "<pre>a &lt; b &amp; c</pre>" in out["html"]
+
+
+_DESK = {
+    "since": "2026-09-15", "weeks": 14, "capital": 100000.0, "value": 104230.0, "after_tax": 103410.0,
+    "benchmark": "SHARIABEES.NS", "benchmark_value": 102100.0, "context": "^NSEI", "context_value": 101300.0,
+    "mean_gap": 0.0015, "t": 0.8, "label": "no evidence yet", "below_expectation": False,
+    "expected_excess_pa": 0.06, "holdings": ["TCS", "INFY"], "cash_pct": 0.12, "filled": 23, "costs": 612.0,
+    "cancelled": {"no_cash": 1}, "held_back": {"held_stale": 1, "held_suspect": 1}, "ansaar_prices": 1,
+    "moves": [{"symbol": "XYZ", "day": "2026-11-03", "move": -0.51}],
+}
+
+
+def test_month_close_renders_the_desk_section():
+    out = render_month_close({"month": "2026-09", "books_ok": False, "desk": _DESK})
+    assert "<b>Trading desk (paper)</b>" in out["html"]
+    md = out["markdown"]
+    assert "## Trading desk (paper)" in md
+    assert "14 weeks since 2026-09-15" in md
+    assert "t = 0.8: no evidence yet" in md
+    assert "Holding 2 names, 12% cash: TCS, INFY" in md
+    assert "Days held back: 2 (1 stale, 1 suspect)." in md
+    assert "Cancelled: 1 no_cash." in md
+    assert "Check: XYZ moved -51% on 2026-11-03. Possible bad price or missing split." in md
+
+
+def test_month_close_without_a_desk_has_no_desk_section():
+    out = render_month_close({"month": "2026-09", "books_ok": False})
+    assert "Trading desk" not in out["markdown"] and "Trading desk" not in out["html"]

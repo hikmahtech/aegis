@@ -301,6 +301,35 @@ def render_money_brief(brief: dict, home_symbol: str = "₹") -> dict:
     return {"html": "\n".join(html).rstrip("\n"), "markdown": "\n".join(md).rstrip("\n") + "\n"}
 
 
+def desk_lines(desk: dict) -> list[str]:
+    """The trading desk's month-close section (desk spec §9), one line each."""
+    lines = [
+        f"{desk['weeks']} weeks since {desk['since']}. Capital {_money(desk['capital'])}.",
+        f"Value {_money(desk['value'])} (after tax {_money(desk['after_tax'])}) · "
+        f"{desk['benchmark']} {_money(desk['benchmark_value'])} · {desk['context']} {_money(desk['context_value'])}",
+        f"Weekly gap to {desk['benchmark']}: {desk['mean_gap']:+.2%} on average, "
+        f"t = {desk['t']:.1f}: {desk['label']}",
+        f"Holding {len(desk['holdings'])} names, {desk['cash_pct']:.0%} cash"
+        + (f": {', '.join(desk['holdings'][:12])}" if desk["holdings"] else "."),
+        f"This month: {desk['filled']} orders filled, {_money(desk['costs'])} in costs.",
+    ]
+    if desk["cancelled"]:
+        lines.append("Cancelled: " + ", ".join(f"{n} {why}" for why, n in sorted(desk["cancelled"].items())) + ".")
+    held_back = desk["held_back"]
+    if held_back:
+        lines.append(
+            f"Days held back: {sum(held_back.values())} "
+            f"({held_back.get('held_stale', 0)} stale, {held_back.get('held_suspect', 0)} suspect)."
+        )
+    if desk["ansaar_prices"]:
+        lines.append(f"Prices from ansaar: {desk['ansaar_prices']}.")
+    lines += [
+        f"Check: {m['symbol']} moved {m['move']:+.0%} on {m['day']}. Possible bad price or missing split."
+        for m in desk["moves"]
+    ]
+    return lines
+
+
 def render_month_close(close: dict, home_symbol: str = "₹") -> dict:
     html = [f"<b>Month close · {close['month']}</b>"]
     md = [f"# Month close · {close['month']}", ""]
@@ -341,4 +370,9 @@ def render_month_close(close: dict, home_symbol: str = "₹") -> dict:
     ]
     html += lines
     md += [f"- {ln}" for ln in lines]
+    desk = close.get("desk")
+    if desk:
+        dl = desk_lines(desk)
+        html += ["", "<b>Trading desk (paper)</b>", *(escape(ln) for ln in dl)]
+        md += ["", "## Trading desk (paper)", "", *(f"- {ln}" for ln in dl)]
     return {"html": "\n".join(html), "markdown": "\n".join(md) + "\n"}

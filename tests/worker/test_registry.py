@@ -388,7 +388,10 @@ def test_books_write_flow_is_gated_on_money_hygiene():
         # Then +1 activity and NO new flow from #508: `load_tracked_topics` on
         # the existing IntelligenceActivities (the topics `track_topic` saves),
         # a step of IntelligenceScanFlow. Unflagged, so all three rows move.
-        (True, True, 45, 229),
+        # Then +1 flow and +1 activity from Maou's paper trading desk:
+        # TradingDeskFlow and TradingDeskActivities.desk_tick, both on the money
+        # flag, so only the money-on row moves.
+        (True, True, 46, 230),
         (False, False, 35, 196),
         (True, False, 39, 212),
     ],
