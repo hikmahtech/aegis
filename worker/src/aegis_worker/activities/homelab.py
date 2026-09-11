@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import html as _html
 from dataclasses import dataclass
-from datetime import UTC
+from datetime import UTC, datetime
 from typing import Any
 
 import httpx
@@ -280,19 +280,43 @@ class HomelabActivities:
     _CERT_THRESHOLDS = (14, 7, 0)  # days
 
     @activity.defn
-    async def probe_and_upsert_cert(self, domain: str) -> dict | None:
-        """Probe TLS, upsert pandoras_actor.cert_expiry row, return alert payload if
-        a new threshold crossed."""
-        from datetime import datetime
+    async def probe_and_upsert_cert(self, domain: str) -> dict:
+        """Probe TLS, upsert the pandoras_actor.cert_expiry row, and report the cert.
 
+        Returns ``{"domain", "days", "not_after", "threshold"}`` for every cert
+        it can read. ``threshold`` is the 14/7/0-day mark this probe crossed
+        for the first time on this cert, else ``None``. The flow sends its
+        Slack card on ``threshold`` (once per mark) and builds its hub finding
+        from ``days`` (every day inside 14 days, #475). A renewed cert has a
+        new serial, so it gets a new row and its thresholds start again.
+
+        An unreachable domain returns ``{"domain", "error", "unreachable":
+        True}``, plus the ``days`` and ``not_after`` of the last cert seen for
+        it, when there is one. A probe that could not connect has not seen a
+        renewal, so the flow keeps an expiring problem open rather than
+        resolving it on a network blip.
+
+        Until #475 this returned ``None`` on any day nothing was crossed. A
+        history recorded then still replays through CertRadarFlow, which
+        treats ``None`` as "nothing to report".
+        """
         env = await self.homelab.probe_tls(domain)
         if not env["ok"]:
-            return {"domain": domain, "error": env["error"], "unreachable": True}
+            report: dict = {"domain": domain, "error": env["error"], "unreachable": True}
+            async with self.db_pool.acquire() as conn:
+                last_seen = await conn.fetchval(
+                    "SELECT not_after FROM pandoras_actor.cert_expiry "
+                    "WHERE domain=$1 ORDER BY checked_at DESC LIMIT 1",
+                    domain,
+                )
+            if last_seen is not None:
+                report.update(days=_days_until(last_seen), not_after=last_seen.isoformat())
+            return report
         info = env["data"]
         not_after = info["not_after"]
         if not_after.tzinfo is None:
             not_after = not_after.replace(tzinfo=UTC)
-        days = int((not_after - datetime.now(UTC)).total_seconds() // 86400)
+        days = _days_until(not_after)
         async with self.db_pool.acquire() as conn:
             prev = await conn.fetchrow(
                 "SELECT last_alert_threshold FROM pandoras_actor.cert_expiry "
@@ -328,14 +352,12 @@ class HomelabActivities:
                 days,
                 crossed,
             )
-        if crossed is not None:
-            return {
-                "domain": domain,
-                "days": days,
-                "threshold": crossed,
-                "not_after": not_after.isoformat(),
-            }
-        return None
+        return {
+            "domain": domain,
+            "days": days,
+            "threshold": crossed,
+            "not_after": not_after.isoformat(),
+        }
 
     @activity.defn
     async def notify_cert_alert(self, alert: dict) -> None:
@@ -486,6 +508,11 @@ class HomelabActivities:
                 f"it is on the quiet_nodes list (expected downtime)."
             )
         await self._notify_card(self.agent_id, title, body, "homelab_notify_node_transition_failed")
+
+
+def _days_until(not_after: datetime) -> int:
+    """Whole days until a cert's notAfter; negative once it has expired."""
+    return int((not_after - datetime.now(UTC)).total_seconds() // 86400)
 
 
 def _parse_rowcount(status: str) -> int:

@@ -1,4 +1,16 @@
-"""CertRadarFlow - daily TLS expiry probe for public domains."""
+"""CertRadarFlow - daily TLS expiry probe for public domains.
+
+Two outputs with two different triggers:
+
+* the hub finding is level-triggered. A cert inside 14 days, or a domain the
+  probe cannot reach, is a finding on every run, because
+  `reconcile_findings` reads a finding that goes missing as recovery. A
+  renewed cert produces none, and that is what resolves its problem (#475).
+* the Slack card is edge-triggered. It goes out when the probe crosses a
+  14/7/0-day mark for the first time on a cert (the sticky
+  `last_alert_threshold` in `pandoras_actor.cert_expiry`), and on every
+  unreachable probe, as it always has.
+"""
 
 from __future__ import annotations
 
@@ -10,6 +22,9 @@ with workflow.unsafe.imports_passed_through():
     from aegis_worker.activities.homelab import HomelabActivities
     from aegis_worker.activities.hub import HubActivities
     from aegis_worker.shared.retry import FAST, NO_RETRY, TIMEOUT_FAST, TIMEOUT_STANDARD
+
+# Inside the widest card threshold a cert is a finding every day.
+_EXPIRING_WITHIN_DAYS = max(HomelabActivities._CERT_THRESHOLDS)
 
 
 @dataclass
@@ -27,7 +42,7 @@ class CertRadarFlow:
         try:
             for domain in config.domains:
                 try:
-                    alert = await workflow.execute_activity_method(
+                    report = await workflow.execute_activity_method(
                         HomelabActivities.probe_and_upsert_cert,
                         args=[domain],
                         start_to_close_timeout=TIMEOUT_STANDARD,
@@ -35,31 +50,47 @@ class CertRadarFlow:
                     )
                 except Exception:
                     continue
-                if alert is None:
+                # Replay: before #475 the probe returned None on a day nothing
+                # was crossed, and a dict only on a crossing or an unreachable
+                # probe. The code below takes both old shapes down the path
+                # the old code did, so a replay issues the same commands.
+                if report is None:
                     continue
                 # One `cert_expiring` / `cert_unreachable` problem per domain
-                # on the hub; the 14→7→0 day crossings are occurrences on it,
-                # and a renewed cert (no finding) resolves it.
-                if alert.get("unreachable"):
+                # on the hub: every run inside the window is an occurrence on
+                # it, and a renewed cert (no finding) resolves it.
+                unreachable = bool(report.get("unreachable"))
+                if unreachable:
                     findings.append(
                         {
                             "klass": "cert_unreachable",
                             "subject": domain,
                             "title": f"TLS probe of {domain} failed",
                             "severity": "warning",
-                            "payload": {"error": alert.get("error", "")},
+                            "payload": {"error": report.get("error", "")},
                         }
                     )
-                else:
+                # An unreachable report carries the last cert seen, when there
+                # was one: an outage is no evidence of a renewal.
+                days = report.get("days")
+                if days is not None and days <= _EXPIRING_WITHIN_DAYS:
+                    # The date, not a day count: the problem keeps the title
+                    # it opened with, and it now stays open for days.
+                    expires_on = str(report["not_after"])[:10]
                     findings.append(
                         {
                             "klass": "cert_expiring",
                             "subject": domain,
-                            "title": f"Certificate for {domain} expires in {alert['days']} day(s)",
-                            "severity": "critical" if alert["days"] <= 7 else "warning",
-                            "payload": {k: v for k, v in alert.items() if k != "domain"},
+                            "title": f"Certificate for {domain} expires on {expires_on}",
+                            "severity": "critical" if days <= 7 else "warning",
+                            "payload": {k: v for k, v in report.items() if k != "domain"},
                         }
                     )
+                # The card goes out on a first crossing and on every
+                # unreachable probe. A quiet day inside the window is a
+                # finding and nothing more.
+                if not unreachable and report.get("threshold") is None:
+                    continue
                 if config.silent:
                     continue
                 alerts += 1
@@ -73,7 +104,7 @@ class CertRadarFlow:
                 try:
                     await workflow.execute_activity_method(
                         HomelabActivities.notify_cert_alert,
-                        args=[alert],
+                        args=[report],
                         start_to_close_timeout=TIMEOUT_FAST,
                         retry_policy=NO_RETRY,
                     )
