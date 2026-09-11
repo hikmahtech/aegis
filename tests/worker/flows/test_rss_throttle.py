@@ -68,7 +68,28 @@ def _stubs(cap):
     async def cursor(kind, identifier, key, value) -> None:
         _seen["cursor"].append(value)
 
-    return [list_channels, fetch, claim, release, content, cursor]
+    # The feed record and the hub (#511): answered, not part of what this
+    # file tests.
+    @activity.defn(name="load_gate_terms")
+    async def terms() -> list[str]:
+        return []
+
+    @activity.defn(name="record_feed_entries")
+    async def record_entries(channel_id, rows) -> int:
+        return len(rows)
+
+    @activity.defn(name="record_feed_run")
+    async def record_run(channel_id, outcome) -> dict:
+        return {"fetch_failures": 0}
+
+    @activity.defn(name="reconcile_findings")
+    async def reconcile(inp) -> dict:
+        return {}
+
+    return [
+        list_channels, fetch, claim, release, content, cursor,
+        terms, record_entries, record_run, reconcile,
+    ]
 
 
 async def _run(cap, wf_id: str) -> dict:

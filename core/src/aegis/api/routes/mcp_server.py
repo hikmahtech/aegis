@@ -257,6 +257,9 @@ _READ_ONLY_TOOLS = frozenset(
         "get_market_overview",
         "get_quote",
         "last_contact_with_person",
+        # The feed list and what each feed is worth (#511). Not the two
+        # feed writers: subscribing and unsubscribing change what is polled.
+        "list_feeds",
         "list_interactions",
         "list_next_actions",
         "list_projects",

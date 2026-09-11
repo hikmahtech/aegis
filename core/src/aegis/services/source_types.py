@@ -79,6 +79,10 @@ SOURCE_TYPES: dict[str, SourceTypeInfo] = {
         "HTML article extracted via content.py's detect_content_type/fetch_and_extract path"
     ),
     "pdf": SourceTypeInfo("PDF extracted via content.py's detect_content_type path"),
+    "abstract": SourceTypeInfo(
+        "An RSS entry stored as its title and summary only, nothing fetched "
+        "(worker content.py store_feed_abstract; feed ingest mode abstract/gate, #512)"
+    ),
     "image": SourceTypeInfo(
         "Image URL detected by content.py's detect_content_type (no OCR; fallback text only)"
     ),

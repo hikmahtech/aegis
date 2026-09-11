@@ -99,6 +99,10 @@ SOURCES = frozenset(
         # The hub's own state_change rows, and the sweep's verdict on a
         # merged fix (`hub_fix.verify_fixes`).
         "hub",
+        # An RSS feed that stopped fetching (`feed_failing`, three fetches in
+        # a row) or stopped publishing (`feed_stale`): RssIngestFlow's
+        # findings (#511). The research agent owns the feed list.
+        "feeds",
     }
 )
 KINDS = frozenset({"occurrence", "resolved", "investigation", "plan", "session_note"})

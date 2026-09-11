@@ -105,6 +105,27 @@ async def stub_cursor(kind, identifier, key, value) -> None:
     _calls["cursor"].append((identifier, key, value))
 
 
+# The feed record and the hub (#511): answered, not part of what this file tests.
+@activity.defn(name="load_gate_terms")
+async def stub_terms() -> list[str]:
+    return []
+
+
+@activity.defn(name="record_feed_entries")
+async def stub_record_entries(channel_id, rows) -> int:
+    return len(rows)
+
+
+@activity.defn(name="record_feed_run")
+async def stub_record_run(channel_id, outcome) -> dict:
+    return {"fetch_failures": 0}
+
+
+@activity.defn(name="reconcile_findings")
+async def stub_reconcile(inp) -> dict:
+    return {}
+
+
 async def _run(content_stub, wf_id: str) -> dict:
     for v in _calls.values():
         v.clear()
@@ -114,7 +135,10 @@ async def _run(content_stub, wf_id: str) -> dict:
             env.client,
             task_queue="tq",
             workflows=[RssIngestFlow],
-            activities=[stub_list, stub_fetch, stub_idem, stub_release, content_stub, stub_cursor],
+            activities=[
+                stub_list, stub_fetch, stub_idem, stub_release, content_stub, stub_cursor,
+                stub_terms, stub_record_entries, stub_record_run, stub_reconcile,
+            ],
         ),
     ):
         return await env.client.execute_workflow(

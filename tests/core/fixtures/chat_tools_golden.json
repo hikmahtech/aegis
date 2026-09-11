@@ -387,6 +387,60 @@
   {
     "type": "function",
     "function": {
+      "name": "list_feeds",
+      "description": "List the RSS feeds Raphael follows and what each is worth: entries and stored documents in the last 30 days, how many of its documents a prompt used in the last 30 and 90 days, its ingest mode, its last entry and any fetch failures.",
+      "parameters": {
+        "type": "object",
+        "properties": {}
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "subscribe_feed",
+      "description": "Follow an RSS or Atom feed. The URL is fetched first and must be a feed; a web page that advertises a feed returns that feed's URL to try instead.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "url": {
+            "type": "string",
+            "description": "The feed's URL."
+          },
+          "label": {
+            "type": "string",
+            "description": "A short name for the feed. Defaults to the feed's own title.",
+            "default": ""
+          }
+        },
+        "required": [
+          "url"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "unsubscribe_feed",
+      "description": "Stop following an RSS feed. Its history is kept, and following it again resumes it.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "feed": {
+            "type": "string",
+            "description": "The feed's URL or its label, as list_feeds shows it."
+          }
+        },
+        "required": [
+          "feed"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
       "name": "configure_triage",
       "description": "Read or update triage configuration: ignored Sentry projects, ignored email domains, notification mode, burst threshold.",
       "parameters": {

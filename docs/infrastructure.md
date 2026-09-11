@@ -1705,6 +1705,115 @@ stack's own services. A public page that *redirects* inward is not caught — th
 fetcher follows redirects itself — and whatever comes back goes to the model
 only.
 
+## Feeds (Raphael)
+
+AEGIS owns the RSS list (#511). `channels(kind='rss')` is what `RssIngestFlow`
+polls every hour at :30, and nothing seeds it: the Miniflux seeder is gone. It
+read Miniflux's feed list once at core startup, Miniflux sat dead from
+2026-03-28 for five and a half months, and nobody noticed. Add and drop feeds
+on Admin → Channels, or ask Raphael (`subscribe_feed`, `unsubscribe_feed`).
+
+### What each feed is worth
+
+`feed_entries` (migration 045) records every entry a run stored or failed,
+with the knowledge row it produced. Joining that to
+`knowledge_injection_log.content_ids` tells you which feeds' documents a chat
+prompt actually used. Admin → Channels shows it per feed, and so do
+`list_feeds` and `GET /api/admin/channels/feed-stats`:
+
+- entries and stored documents in the last 30 days, plus how many were
+  abstract only;
+- documents used in the last 30 and 90 days;
+- the last entry, the backlog and consecutive fetch failures.
+
+Only chat writes the injection log, so "used" is a floor.
+
+On the 1st of each month, Raphael's briefing names the active feeds that have
+90 days of history and no use in that time. The migration backfills history
+by host (an arXiv entry lives on arxiv.org). A feed whose links point
+elsewhere, like Hacker News, starts its history at the deploy.
+
+### Ingest modes (#512)
+
+`channels.config.ingest` is set per feed:
+
+| Mode | What a new entry costs |
+|---|---|
+| `full` (default) | The page or PDF is fetched and stored (`process_content`). |
+| `abstract` | One row from the title and summary the feed already carries. Nothing is fetched. |
+| `gate` | Full text when the title or summary names a topic term, the abstract otherwise. |
+
+The topic terms are every active intel scan's `topics` plus the topics tracked
+from chat (`intelligence_topics`), matched as whole words and case-insensitive.
+No LLM is involved.
+
+`full` is the default because of what the measurements showed, not by
+accident. Over the 30 days to 2026-09-12:
+
+- **arXiv:** 1,889 papers and 89,669 chunks, which is 90% of all RSS chunks.
+  Prompts used 14 of the papers.
+- **The topic gate on arXiv:** it would pass 41% of papers, only about 2.3x
+  fewer chunks.
+- **The topic gate on the other feeds:** it would have kept the full text of
+  only 2 of the 10 documents a prompt used.
+
+So gating is opt-in, and **arXiv is the feed to set to `abstract`**. That is
+one chunk per paper, about 47x fewer chunks, and the full paper stays one
+`paper_read` away.
+
+```sql
+UPDATE channels SET config = config || '{"ingest": "abstract"}'::jsonb
+WHERE kind = 'rss' AND identifier = 'https://arxiv.org/rss/cs.AI';
+```
+
+An abstract row is cheap, so on that feed you can also raise
+`max_entries_per_run` (30 today) to clear the arXiv backlog.
+
+### When a feed breaks
+
+- **Failing:** three fetches in a row that fail (an HTTP error, or a response
+  that is not a feed) are a `feeds` hub finding of class `feed_failing`. It is
+  checked every run. Before #511, feedparser turned all of these into an empty
+  parse, which looked like a quiet feed.
+- **Stale:** no new entry for `channels.config.stale_after_days` days (default
+  30) is a `feed_stale` finding, checked once a day at 03:30 UTC.
+- **Recovery:** both resolve themselves when the feed recovers
+  (`hub_watch.reconcile_findings`). The problem's subject is the feed URL, and
+  the research agent owns the `feeds` source.
+
+A `process_content` that returns `status: error` now counts as a failure. The
+entry's claim is released and the cursor is fenced, so the next run retries it
+instead of counting it as ingested.
+
+### Retention (dry run only)
+
+`GET /api/admin/channels/retention-preview?older_than_days=N` counts what one
+rule would remove, and changes nothing. The rule: a PDF that no prompt used,
+ingested more than N days ago, keeps its first chunk and drops the rest.
+
+On 2026-09-12 with N=30 that is 8,297 PDFs and 362,153 of 500,055 chunks,
+freeing about 530 MB of text and 1 GB of vectors from a 4.8 GB table. Every
+PDF dates from 2026-07-01 or later, so nothing is older than 90 days yet.
+Deleting anything is a separate, explicit decision.
+
+### Setting it up on an existing deployment
+
+1. Grant the three tools. The DB `tool_set` wins over the seed:
+   ```sql
+   UPDATE agents SET metadata = jsonb_set(metadata, '{tool_set}',
+     (metadata->'tool_set') || '["list_feeds","subscribe_feed","unsubscribe_feed"]'::jsonb)
+   WHERE id = 'raphael' AND NOT (metadata->'tool_set' ? 'list_feeds');
+   ```
+2. Set arXiv to `abstract` (the SQL above).
+3. Optional cleanup of the rows the removed Miniflux integration left behind
+   (harmless if kept):
+   ```sql
+   DELETE FROM settings WHERE key IN
+     ('integration:miniflux_url', 'integration:miniflux_api_key', 'connector_health:miniflux');
+   ```
+   Removing the Miniflux stack itself (Portainer, stack `miniflux`) is a
+   separate call.
+
 ## Troubleshooting
 
 | Symptom | Cause |

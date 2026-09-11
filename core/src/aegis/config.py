@@ -103,8 +103,6 @@ class Settings(BaseSettings):
     sentry_token: str = ""
     sentry_org: str = ""
     sentry_projects: str = ""  # comma-separated Sentry project IDs; empty = all
-    miniflux_url: str = ""
-    miniflux_api_key: str = ""
     searxng_url: str = "http://localhost:8888"
     gmail_accounts: str = ""  # "name1:email1,name2:email2"
     gmail_credentials_file: str = "config/google_credentials.json"
