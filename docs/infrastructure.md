@@ -430,7 +430,8 @@ backfill, which was its last reader. The recurrence history it held is now
 
 - **Only the alert source makes a problem live again.** An investigation
   adds notes; it does not decide. If the alert clears while an investigation
-  is still running, the verdict and its decision card still arrive and the
+  is still running, the verdict (and its decision card, if it has one) still
+  arrive and the
   verdict is on the problem's timeline, but the problem stays `resolved` and
   its task stays closed. The worker logs `hub_status_held` when this happens.
   If the thing breaks again within a day, the next occurrence reopens the
@@ -775,7 +776,8 @@ key is pasted.)
    two repos claim one alert, neither gets it, and the worker logs
    `alert_label_claim_ambiguous`.
 2. **Infra alerts** go to the infra repo, investigate-only, after the one safe
-   force-restart.
+   force-restart (once per problem per hour; see
+   [below](#when-pandora-asks-you-and-the-automatic-restart)).
 3. **Everything else** goes down the ladder: Sentry project slug, service
    name, token match, then the LLM, with Gate-0 confirming the pick.
 
@@ -908,6 +910,66 @@ Two things with similar names are not this. The `update_runbook` chat tool
 stores text in the knowledge store, where an investigation may find it through
 the prior-incident search, but it is never the runbook. And resources of kind
 `runbook` are not read by investigations at all.
+
+### When Pandora asks you, and the automatic restart
+
+**A decision card only when there is a decision (#500).** After a verdict,
+`AlertInvestigationFlow` posts a Gate-2 card only when the card can do
+something:
+
+- the investigation staged a fix branch (**Open PR**),
+- it proposed commands (**Run fix**),
+- the alert escalates (a node down, the heartbeat unable to reach the swarm),
+  which nags until you ack it, or
+- the problem came back right after an automatic restart (below).
+
+Any other verdict is told, not asked. It goes on the problem's task as a
+comment, on the problem's timeline, and to chat as the usual verdict ping,
+and the problem waits for you the way it did after an **Acknowledge**. The
+task comment says no card was sent. To silence a problem that keeps coming
+back, use **Mute** on the admin **Problems** page, the same 24-hour mute the
+card had; for a longer window use `set_service_state`. The verdict's status
+does not decide: an `actionable` verdict with no branch and no commands is
+work for you, but nothing a card could approve.
+
+`workflow_runs.result_summary` says what happened: `decision_card` (true or
+false) and `restart_repeat`. To count cards per investigation:
+
+```sql
+SELECT result_summary->>'decision_card' AS card, count(*)
+FROM workflow_runs
+WHERE workflow_type = 'AlertInvestigationFlow' AND started_at > now() - interval '14 days'
+  AND result_summary ? 'decision_card'
+GROUP BY 1;
+```
+
+**One automatic restart per problem per window (#501).** A `DockerServiceDown`
+or `ServiceDownProlonged` alert gets one `docker service update --force`
+before anyone is asked. The flow records each attempt on the problem, with
+what `docker service ps` said straight after it, recovered or not. If the
+same problem comes back inside the window, it is not restarted again: a
+restart that did not hold will not hold the second time either. Instead the
+task gets a comment with the first restart's evidence and what changed since
+(the tasks that are new, such as one the scheduler could not place), the
+investigation is told not to propose the same restart, and one card goes out
+whatever the verdict says. The problem is the identity, not the service
+name, except that a restart of one service in a group problem does not count
+against another.
+
+The window is 60 minutes. Change it, or set `0` to restart every time as
+before, in the `alert_remediation` settings row. The worker reads it on every
+restart, so a change applies to the next alert; no restart. A value that is
+not a whole number of minutes counts as 60.
+
+```sql
+INSERT INTO settings (key, value)
+VALUES ('alert_remediation', '{"repeat_window_minutes": 60}')
+ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now();
+```
+
+Both changes are behind `workflow.patched` ids, `gate2-only-for-decisions`
+and `auto-restart-once-per-window`, so a run that was waiting on its card
+when the worker was redeployed finishes the way it started.
 
 ### Session inventory
 

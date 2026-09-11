@@ -491,12 +491,17 @@ flowchart TD
     DEC -- yes --> AI["AlertInvestigationFlow(problem_id)"]
     AI --> VD["verification wait (per class)<br/>then ask the hub: resolved yet?"]
     VD -- resolved --> X5["exit; the hub closed the task"]
-    VD -- "still wrong" --> RR["resolve the owning repo<br/>(resources table)"]
+    VD -- "still wrong" --> RS{"service below replicas?"}
+    RS -- "no" --> RR["resolve the owning repo<br/>(resources table)"]
+    RS -- "yes, first time<br/>this hour" --> FR["one automatic<br/>force-restart"]
+    FR -- recovered --> X6["exit; the problem resolves"]
+    FR -- "did not recover" --> RR
+    RS -- "back within the hour<br/>of a restart" --> RR
     RR --> KC["runbook + prior-incident context"]
     KC --> IV["investigate: coding CLI on the repo,<br/>LLM-only fallback"]
-    IV --> VE{"verdict"}
-    VE -- "resolved /<br/>not_actionable" --> NO["record_investigation:<br/>event on the problem, task comment"]
-    VE -- "actionable /<br/>inconclusive" --> G2["Gate 2 card: Open PR / Run fix /<br/>Mute 24h / Acknowledge / Discard"]
+    IV --> VE{"anything to decide?"}
+    VE -- "no" --> NO["record_investigation:<br/>event on the problem, task comment,<br/>chat ping"]
+    VE -- "fix branch / commands /<br/>escalating / restart<br/>did not stick" --> G2["Gate 2 card: Open PR / Run fix /<br/>Mute 24h / Acknowledge / Discard"]
     G2 --> NO
 ```
 
@@ -537,6 +542,14 @@ The steps that make it trustworthy:
 - **Verification delay.** A per-class sleep, then the hub is asked whether the
   problem already resolved, before spending any investigation effort —
   self-healing blips cost nothing.
+- **One automatic restart per problem per hour.** A swarm service below its
+  replicas gets one `docker service update --force` first; that fixes most
+  flaps. If the same problem is back within the hour, it is not restarted
+  again: the task gets the first restart's evidence (what `docker service ps`
+  said) and what changed, the investigation is told the restart already
+  failed, and one card goes out (#501). The window is the
+  `alert_remediation` settings row; see
+  [`infrastructure.md`](infrastructure.md#when-pandora-asks-you-and-the-automatic-restart).
 - **Repo resolution.** Deterministic service-name matching, then an LLM pick,
   against the `resources` table — which `workspace-repo-sync-daily` keeps
   mirroring your coding host's actual checkouts. No JIT cloning: a repo AEGIS
@@ -552,7 +565,11 @@ The steps that make it trustworthy:
 - **Gate 2** puts every consequential outcome behind a card: open the
   proposed PR(s), **Run fix** (execute the investigation's proposed commands
   on the host — refused when the infra registry entry is `read_only`; a typed
-  note overrides the command list), mute, acknowledge, or discard.
+  note overrides the command list), mute, acknowledge, or discard. A card
+  goes out only when there is such a decision, or the alert escalates, or a
+  restart did not stick (#500). A verdict with nothing to decide is told, not
+  asked: a comment on the task, an event on the timeline and a chat ping.
+  Mute such a problem from the admin **Problems** page.
 
 Everything lands on the problem's timeline (`problem_events`) and, projected
 from it, as a comment trail on a `@pandora`-labelled Todoist task — so the
