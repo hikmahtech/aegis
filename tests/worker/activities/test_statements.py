@@ -512,3 +512,26 @@ async def test_a_promoted_block_tells_the_index_which_account_paid(clean, tmp_pa
     assert await clean.fetchval(
         "SELECT instrument FROM finance.journal_index WHERE message_id = 'st-apple'"
     ) == "axis-9640"
+
+
+async def test_an_unmatched_row_reaches_its_task_with_its_amount_and_narration(clean, tmp_path):
+    """A money task used to say only how many rows, never which. The matcher's
+    outcomes carry no amount or narration, so the activity hands the rows to
+    `match_findings`; without them the task names each row by an id no bank
+    prints."""
+    cfg = _repo(tmp_path)
+    sid = await _statement(clean, "hdfc-1225", "2026-07-01", "2026-07-31", "0", "-640", 1)
+    rid = await _row(
+        clean, "hdfc-1225", "2026-07-12", "out", "640.00", "ZOMATO ORDER 7781", sid, "-640"
+    )
+
+    out = await ActivityEnvironment().run(_act(clean, cfg).reconcile_statements, False, "")
+    assert out["status"] == "ok", out
+
+    payload = await clean.fetchval(
+        "SELECT e.payload FROM problem_events e JOIN problems p ON p.id = e.problem_id "
+        "WHERE p.correlation_key = 'unmatched_rows:instrument:hdfc-1225' "
+        "AND e.kind = 'occurrence' ORDER BY e.id DESC LIMIT 1"
+    )
+    assert "2026-07-12 · out · 640.00 · ZOMATO ORDER 7781" in payload["description"]
+    assert payload["row_ids"] == [rid]

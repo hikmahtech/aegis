@@ -85,6 +85,11 @@ _FALLBACK_LABEL = "@pandora"
 _DESCRIPTION_CAP = 2000
 # What the timeline says when a completed task resolved its problem.
 TASK_COMPLETED_REASON = "its Todoist task was completed by a person, not by the hub"
+# The `source` that resolve is written with, which starts its `state_change`
+# external id `todoist:`. No ingested event can start that way — `todoist` is
+# not in `hub.SOURCES` — so the prefix tells a person's completion apart from
+# every other resolve without matching on the reason's wording.
+TASK_COMPLETED_SOURCE = "todoist"
 # Where the admin Integrations page stores `books_todoist_projects`
 # (`integrations_config`, prefix `integration:`).
 _BOOKS_PROJECTS_SETTING = "integration:books_todoist_projects"
@@ -954,7 +959,12 @@ async def reconcile_completed_tasks(
                 if await _uncomplete_task(pool, r["todoist_task_id"]):
                     out.append({**row, "action": "task_reopened"})
             elif await set_status(
-                pool, r["id"], "resolved", reason=TASK_COMPLETED_REASON, source="todoist", now=now
+                pool,
+                r["id"],
+                "resolved",
+                reason=TASK_COMPLETED_REASON,
+                source=TASK_COMPLETED_SOURCE,
+                now=now,
             ):
                 out.append({**row, "action": "resolved"})
         except Exception as exc:  # noqa: BLE001 — one bad problem must not stop the sweep

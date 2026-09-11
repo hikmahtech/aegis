@@ -339,7 +339,11 @@ class StatementActivities:
         # classes, and it has to be: `statement_missing` is one of them, so a
         # sweep that produced no coverage findings would resolve every open
         # "no statement arrived" problem for the reason that it never looked.
-        findings = statement_findings.match_findings(run) + _coverage_findings(
+        findings = statement_findings.match_findings(
+            # The rows, so each task can name its rows by date, amount and
+            # narration — the outcomes carry only an id and a date.
+            run, rows={r.row_id: r for s in statements for r in s.rows}
+        ) + _coverage_findings(
             statements, statement_findings, today=date.today()
         )
         swept = await statement_findings.sweep(
