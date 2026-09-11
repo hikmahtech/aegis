@@ -501,7 +501,7 @@ flowchart TD
     KC --> IV["investigate: coding CLI on the repo,<br/>LLM-only fallback"]
     IV --> VE{"anything to decide?"}
     VE -- "no" --> NO["record_investigation:<br/>event on the problem, task comment,<br/>chat ping"]
-    VE -- "fix branch / commands /<br/>escalating / restart<br/>did not stick" --> G2["Gate 2 card: Open PR / Run fix /<br/>Mute 24h / Acknowledge / Discard"]
+    VE -- "fix branch / actionable<br/>with commands / escalating /<br/>restart did not stick" --> G2["Gate 2 card: Open PR / Run fix /<br/>Mute 24h / Acknowledge / Discard"]
     G2 --> NO
 ```
 
@@ -567,9 +567,11 @@ The steps that make it trustworthy:
   on the host — refused when the infra registry entry is `read_only`; a typed
   note overrides the command list), mute, acknowledge, or discard. A card
   goes out only when there is such a decision, or the alert escalates, or a
-  restart did not stick (#500). A verdict with nothing to decide is told, not
-  asked: a comment on the task, an event on the timeline and a chat ping.
-  Mute such a problem from the admin **Problems** page.
+  restart did not stick (#500). Proposed commands count only on an
+  `actionable` verdict (#518); on any other they go on the task comment, not
+  run. A verdict with nothing to decide is told, not asked: a comment on the
+  task, an event on the timeline and a chat ping. Mute such a problem from the
+  admin **Problems** page.
 
 Everything lands on the problem's timeline (`problem_events`) and, projected
 from it, as a comment trail on a `@pandora`-labelled Todoist task — so the

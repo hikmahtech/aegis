@@ -918,7 +918,8 @@ the prior-incident search, but it is never the runbook. And resources of kind
 something:
 
 - the investigation staged a fix branch (**Open PR**),
-- it proposed commands (**Run fix**),
+- the verdict is `actionable` and the investigation proposed commands
+  (**Run fix**),
 - the alert escalates (a node down, the heartbeat unable to reach the swarm),
   which nags until you ack it, or
 - the problem came back right after an automatic restart (below).
@@ -928,9 +929,15 @@ comment, on the problem's timeline, and to chat as the usual verdict ping,
 and the problem waits for you the way it did after an **Acknowledge**. The
 task comment says no card was sent. To silence a problem that keeps coming
 back, use **Mute** on the admin **Problems** page, the same 24-hour mute the
-card had; for a longer window use `set_service_state`. The verdict's status
-does not decide: an `actionable` verdict with no branch and no commands is
-work for you, but nothing a card could approve.
+card had; for a longer window use `set_service_state`.
+
+Commands earn a card only on an `actionable` verdict (#518). On an
+`inconclusive` verdict they are a guess, and on a "no action needed" one they
+contradict it: in the two weeks before this rule, 22 such cards drew 17 bare
+acks and one **Run fix**. They go on the task comment instead, marked as not
+run, so you can still run them by hand. Without commands the status earns no
+card at all: an `actionable` verdict with no branch is work for you, but
+nothing a card could approve.
 
 `workflow_runs.result_summary` says what happened: `decision_card` (true or
 false) and `restart_repeat`. To count cards per investigation:
