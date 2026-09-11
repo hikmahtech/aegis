@@ -180,7 +180,7 @@ Point your alert sources at Core (all HMAC/secret-verified, auth-exempt):
 
 - `POST /api/webhooks/sentry` — Sentry (plus the scheduled `SentryPollFlow`)
 - `POST /api/webhooks/alert` — Grafana / Alertmanager-shaped payloads
-- `POST /api/webhooks/github` — PR notifications (`GitHubAlertFlow`)
+- `POST /api/webhooks/github` — PR notifications, and the merge or close of a fix PR an investigation opened (`GitHubAlertFlow`, #502). Subscribe the webhook to **Pull requests** on every repo Pandora can open a fix PR in; without it a problem stays `fixing` after its PR merges
 - `POST /api/webhooks/todoist` — Todoist sync events
 - **AEGIS heartbeat (2-min poll)** → `InfraHeartbeatFlow` → `AlertInvestigationFlow` on
   node/service transitions (source `aegis-heartbeat`)
