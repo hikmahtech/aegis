@@ -204,6 +204,22 @@ async def test_yahoo_down_writes_no_plan_and_raises_a_source_error(pool):
     assert await open_problems(pool) == [("desk_source_error", "yahoo")]
 
 
+async def test_a_failed_morning_resolves_nothing_it_did_not_check(pool):
+    """A run that stops early checked only itself, so it must leave every other
+    problem alone. Resolving one would complete its task and raise it again the
+    next good morning (spec §3)."""
+    finance = market({"TCS.NS": [bar(FRI, 3000.0), bar(MON, 3000.0)]})
+    await run(pool, FakeAnsaar({FRI: []}), finance, MON)
+    assert await open_problems(pool) == [("desk_decisions_stale", "decisions")]
+
+    out = await run(pool, FakeAnsaar({FRI: []}), FakeFinance(fail=True), MON)
+    assert out["skipped"] == "yahoo"
+    assert await open_problems(pool) == [
+        ("desk_decisions_stale", "decisions"),
+        ("desk_source_error", "yahoo"),
+    ]
+
+
 async def test_a_vanished_holding_class_holds_the_portfolio(pool):
     await filled(pool, THU, "TCS", "buy", 3, 3000.0)
     finance = market({"TCS.NS": [bar(THU, 3000.0), bar(FRI, 3000.0)], "GOLDBEES.NS": [bar(FRI, 100.0)]})
@@ -246,6 +262,15 @@ async def test_a_stored_close_is_never_rewritten(pool):
 async def test_store_bars_never_keeps_today(pool):
     await td._store_bars(pool, "TCS.NS", [bar(FRI, 3000.0), bar(MON, 3010.0)], "yahoo", MON)
     assert await pool.fetchval("SELECT count(*) FROM finance.desk_prices WHERE symbol = 'TCS.NS'") == 1
+
+
+async def test_two_desk_names_for_one_yahoo_symbol_both_get_the_bars(pool):
+    """The desk holds this ETF under its NSE name and names the benchmark in
+    Yahoo's form. Both ask for SHARIABEES.NS, so both must come back with its bars."""
+    await td._store_bars(pool, "SHARIABEES.NS", [bar(FRI, 400.0), bar(MON, 402.0)], "yahoo", TUE)
+    bars = await td._bars(pool, {"SHARIABEES", "SHARIABEES.NS"})
+    assert [b.day for b in bars["SHARIABEES"]] == [FRI, MON]
+    assert bars["SHARIABEES"] == bars["SHARIABEES.NS"]
 
 
 async def test_a_symbol_yahoo_lacks_is_priced_from_ansaar_and_marked(pool):

@@ -45,7 +45,10 @@ class AnsaarClient(HTTPConnector):
                 if not self._token:
                     raise AnsaarError("client-token: no token in the response")
             resp = await client.get(path, params=params, headers={"Authorization": f"Bearer {self._token}"})
-        except httpx.HTTPError as exc:
+        except (httpx.HTTPError, ValueError) as exc:
+            # A ValueError here is the token response's body not being JSON. The
+            # message names the path and the problem, and the secret never
+            # leaves the token request's body.
             await self._record(path, "error", int((time.monotonic() - t0) * 1000), type(exc).__name__)
             raise AnsaarError(f"{path}: {type(exc).__name__}") from exc
         except AnsaarError as exc:
@@ -54,8 +57,13 @@ class AnsaarClient(HTTPConnector):
         if resp.status_code != 200:
             await self._record(path, "error", int((time.monotonic() - t0) * 1000), f"HTTP {resp.status_code}")
             raise AnsaarError(f"{path}: HTTP {resp.status_code}")
+        try:
+            body = resp.json() or {}
+        except ValueError as exc:
+            await self._record(path, "error", int((time.monotonic() - t0) * 1000), type(exc).__name__)
+            raise AnsaarError(f"{path}: the response was not JSON") from exc
         await self._record(path, "ok", int((time.monotonic() - t0) * 1000))
-        return resp.json() or {}
+        return body
 
     async def decisions(self, day: date) -> tuple[list[dict], dict]:
         """``trade_decisions`` rows for exactly ``day`` (ansaar-data #30) and the meta."""

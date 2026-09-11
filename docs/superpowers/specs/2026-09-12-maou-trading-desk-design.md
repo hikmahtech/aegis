@@ -420,9 +420,9 @@ Live mode is not built here. This design keeps the step to live small:
 4. The owner sets `ansaar_url` and pastes `ansaar_service_secret` on the admin Integrations page.
 5. Set `active = true` on `trading-desk-daily` (a DB write; ask first).
 6. Validate on the first run:
-   - it copied the last trading day's decisions
-   - the first plan matches a hand calculation from those rows
+   - it copied the last trading day's decisions, and read those rows: they must include
+     equities. Until pipeline #355 is fixed only ETF rows arrive, and nothing holds the desk
+     back — the checks pass and it buys ETFs. The missing-equity check cannot catch that on
+     day one, because it fires on an equity the desk holds and on day one it holds nothing.
+   - the first plan matches a hand calculation from the rows that were copied
    - the next morning filled the orders at Yahoo's close
-
-   If step 2 or 3 is not done yet, the desk raises `desk_decisions_stale` and trades nothing. That
-   is the expected first result, and it proves the alarm works.

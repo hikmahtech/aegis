@@ -59,6 +59,17 @@ async def test_a_bad_status_on_the_data_call_is_an_ansaar_error():
 
 
 @respx.mock
+async def test_a_body_that_is_not_json_is_an_ansaar_error():
+    _token()
+    respx.get(f"{BASE}/api/execution/trade-decisions").mock(
+        return_value=httpx.Response(200, text="<html>maintenance</html>")
+    )
+    with pytest.raises(AnsaarError, match="trade-decisions") as exc:
+        await AnsaarClient(BASE, "s3cret").decisions(date(2026, 9, 11))
+    assert "s3cret" not in str(exc.value)
+
+
+@respx.mock
 async def test_prices_come_back_oldest_first_from_the_right_path():
     _token()
     eq = respx.get(f"{BASE}/api/equities/prices/M%26M").mock(

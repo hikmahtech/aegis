@@ -154,8 +154,15 @@ async def _refresh(
 
 async def _bars(pool: asyncpg.Pool, symbols: set[str]) -> dict[str, list[dm.Bar]]:
     """Stored bars keyed by the desk's symbol: NSE form for instruments, and the
-    benchmarks as named. Each list is sorted by day."""
-    by_yahoo = {yahoo_symbol(s): s for s in symbols}
+    benchmarks as named. Each list is sorted by day.
+
+    Two desk names can share one Yahoo symbol: the desk holds SHARIABEES and
+    names its benchmark SHARIABEES.NS, and both are SHARIABEES.NS to Yahoo. So
+    each Yahoo symbol carries every name that asked for it, and its bars go to
+    all of them."""
+    by_yahoo: dict[str, list[str]] = defaultdict(list)
+    for s in symbols:
+        by_yahoo[yahoo_symbol(s)].append(s)
     rows = await pool.fetch(
         "SELECT symbol, date, close, split_ratio, dividend, source FROM finance.desk_prices "
         "WHERE symbol = ANY($1::text[]) ORDER BY symbol, date",
@@ -163,9 +170,9 @@ async def _bars(pool: asyncpg.Pool, symbols: set[str]) -> dict[str, list[dm.Bar]
     )
     out: dict[str, list[dm.Bar]] = {s: [] for s in symbols}
     for r in rows:
-        out[by_yahoo[r["symbol"]]].append(
-            dm.Bar(r["date"], _f(r["close"]), _f(r["split_ratio"]), _f(r["dividend"]), r["source"])
-        )
+        stored = dm.Bar(r["date"], _f(r["close"]), _f(r["split_ratio"]), _f(r["dividend"]), r["source"])
+        for name in by_yahoo[r["symbol"]]:
+            out[name].append(stored)
     return out
 
 
@@ -292,16 +299,22 @@ async def run_tick(
     """One morning's run (spec §3). Idempotent: a second run on the same day
     changes nothing and raises the same problems."""
     today = today or datetime.now(MARKET_TZ).date()
-    out, findings = await _tick(pool, ansaar, finance, today)
+    out, findings, checked = await _tick(pool, ansaar, finance, today)
     unique = list({(f["klass"], f["subject"]): f for f in findings}.values())
+    # Resolve only inside the classes this run checked. A run that stopped early
+    # looked at nothing else, so resolving one of those problems would complete
+    # its task and raise it again on the next good morning (spec §3).
     await hub_watch.reconcile_findings(
-        pool, source=SOURCE, subject_kind=SUBJECT_KIND, classes=DAILY_CLASSES, findings=unique, project=project
+        pool, source=SOURCE, subject_kind=SUBJECT_KIND, classes=checked, findings=unique, project=project
     )
     out["findings"] = sorted(f["klass"] for f in unique)
     return out
 
 
-async def _tick(pool: asyncpg.Pool, ansaar: Any, finance: Any, today: date) -> tuple[dict, list[dict]]:
+async def _tick(pool: asyncpg.Pool, ansaar: Any, finance: Any, today: date) -> tuple[dict, list[dict], list[str]]:
+    """The run's outcome, its findings, and the classes it actually checked. A
+    run that stops early checked only the thing that stopped it, so it names no
+    class and nothing of its own is resolved."""
     rules = await load_rules(pool)
     out: dict[str, Any] = {"today": today.isoformat()}
     if rules.mode != "paper":
@@ -311,7 +324,7 @@ async def _tick(pool: asyncpg.Pool, ansaar: Any, finance: Any, today: date) -> t
                 "Only paper mode exists. Set mode back to paper in the trading-desk-daily config. "
                 "Nothing was traded.",
             )
-        ]
+        ], []
 
     # 1. Find the day.
     try:
@@ -323,7 +336,7 @@ async def _tick(pool: asyncpg.Pool, ansaar: Any, finance: Any, today: date) -> t
                 f"Fetching {INDEX} failed ({type(exc).__name__}), so the desk couldn't tell which "
                 "day to trade. Nothing was traded.",
             )
-        ]
+        ], []
     index_days = [b.day for b in (await _bars(pool, {INDEX}))[INDEX] if b.close is not None]
     day = dm.last_trading_day(index_days, today)
     if day is None:
@@ -332,7 +345,7 @@ async def _tick(pool: asyncpg.Pool, ansaar: Any, finance: Any, today: date) -> t
                 "desk_source_error", "yahoo", "Trading desk: no market days from Yahoo",
                 f"Yahoo returned no {INDEX} bars before {today}. Nothing was traded.",
             )
-        ]
+        ], []
     if (today - day).days > STALE_INDEX_DAYS:
         # Yahoo answers 200 with no data when it rate-limits, which raises
         # nothing and would leave the desk quietly idle on an old date.
@@ -342,7 +355,7 @@ async def _tick(pool: asyncpg.Pool, ansaar: Any, finance: Any, today: date) -> t
                 f"The last {INDEX} bar the desk has is {day}, more than {STALE_INDEX_DAYS} days "
                 f"before {today}. Yahoo may be refusing data without saying so. Nothing was traded.",
             )
-        ]
+        ], []
     out["day"] = day.isoformat()
 
     # 2. Copy.
@@ -448,7 +461,7 @@ async def _tick(pool: asyncpg.Pool, ansaar: Any, finance: Any, today: date) -> t
                         f"{latest or 'the desk bought it'}. The desk values it at cost until one arrives.",
                     )
                 )
-    return out, findings
+    return out, findings, DAILY_CLASSES
 
 
 # --- the monthly close ---------------------------------------------------------
