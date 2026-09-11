@@ -837,6 +837,11 @@ Then, in any session: *"what's running on the coding host?"* (`list_coding_sessi
 *"have sebas look at this Todoist task"* (`dispatch_agent_run`), *"stop run
 a1b2c3"* (`stop_agent_run`).
 
+The mount is POST-only. The client also sends a GET to ask for a server
+stream; that answers 405, which is how the MCP transport says "no stream". A
+404 there would mean "your session is gone" — which is what the GET got until
+#476, when it fell through to the admin panel's catch-all.
+
 **This endpoint requires a real API key even when `AEGIS_AUTH_DISABLED=true`**,
 and refuses a run's mount token outright. That asymmetry is the design: the
 credential it needs is never written to the coding host, so a run cannot escalate
@@ -862,9 +867,18 @@ and tells you in Slack that your comment is waiting for you in the session you
 already have open.
 
 That only works if something calls the tool. A tool nobody calls is a tool that
-does not exist, so wire two hooks into your own `~/.claude/settings.json` —
-they live in your dotfiles, not in this repo, because they are about your
-machine:
+does not exist, so wire two hooks into your Claude settings — they live in your
+dotfiles, not in this repo, because they are about your machine.
+
+**Which settings file.** Claude Code reads its settings, and finds its hooks,
+in its config directory: `${CLAUDE_CONFIG_DIR:-$HOME/.claude}`. That is
+`~/.claude` only when `CLAUDE_CONFIG_DIR` is unset. If you run more than one
+login — say `CLAUDE_CONFIG_DIR=~/.claude-personal` for one account and the
+default for another — each directory has its own `settings.json`, and the
+hooks must go into every one you use, or the sessions under the others are
+never recorded. So the file to edit is
+`${CLAUDE_CONFIG_DIR:-$HOME/.claude}/settings.json`, once per config
+directory, and the script goes in that directory's `hooks/`:
 
 ```json
 {
@@ -875,7 +889,7 @@ machine:
         "hooks": [
           {
             "type": "command",
-            "command": "~/.claude/hooks/aegis-session.sh start"
+            "command": "\"${CLAUDE_CONFIG_DIR:-$HOME/.claude}/hooks/aegis-session.sh\" start"
           }
         ]
       }
@@ -886,7 +900,7 @@ machine:
         "hooks": [
           {
             "type": "command",
-            "command": "~/.claude/hooks/aegis-session.sh stop"
+            "command": "\"${CLAUDE_CONFIG_DIR:-$HOME/.claude}/hooks/aegis-session.sh\" stop"
           }
         ]
       }
@@ -895,13 +909,36 @@ machine:
 }
 ```
 
-The script decides whether the session is on an AEGIS task at all, and says
-nothing when it is not:
+**Where the script gets `AEGIS_URL` and `AEGIS_API_KEY`.** A hook sees only
+the environment of the `claude` process that runs it, so both must be set
+there — exported from your shell profile, or from a private file the profile
+sources. Never put them in the repo or in this settings file.
+
+- `AEGIS_URL` is the Core URL you gave `claude mcp add` above, without the
+  `/api/mcp-server/...` path.
+- `AEGIS_API_KEY` is the key in that entry's `X-API-Key` header: Core's API
+  key (`AEGIS_API_KEY` on Core, or the one generated under Integrations →
+  **API Key** in the admin panel). It has to be a real key. The operator mount
+  refuses to run without one even when Core has `AEGIS_AUTH_DISABLED=true`,
+  and refuses a run's mount token outright.
+
+If either is missing the script exits quietly rather than failing your session.
+
+**When it does anything.** The script records a session only when it starts
+inside a task worktree — a directory matching `*-aegis-wt/task-*`, which is
+where AEGIS's own coding sessions run — or when `AEGIS_TASK` is set. Anywhere
+else it says nothing, so an ordinary session in your own checkout never lands
+in the registry. To put one on the record, start it with
+`AEGIS_TASK=<todoist task id> claude`.
 
 ```bash
 #!/usr/bin/env bash
-# ~/.claude/hooks/aegis-session.sh — tell AEGIS which task this session is on.
+# ${CLAUDE_CONFIG_DIR:-$HOME/.claude}/hooks/aegis-session.sh
+# Tell AEGIS which task this session is on.
 set -euo pipefail
+
+# Without a URL and a real key there is nothing to tell; stay out of the way.
+[ -n "${AEGIS_URL:-}" ] && [ -n "${AEGIS_API_KEY:-}" ] || exit 0
 
 # A task session runs in `<repo>-aegis-wt/task-<id>`; anything else is not on
 # a task unless AEGIS_TASK says so. Silence is the correct answer for an

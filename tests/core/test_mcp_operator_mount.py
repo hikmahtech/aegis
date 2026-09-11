@@ -130,6 +130,32 @@ async def test_operator_mount_still_withholds_the_mcp_passthrough(client):
     assert "call_mcp_tool" not in _names(resp)
 
 
+async def test_every_mount_answers_get_with_405_behind_the_spa(db_pool, agent_row, tmp_path, monkeypatch):
+    """Claude Code's MCP client probes the URL it mounted with a GET, asking
+    for a server stream. The streamable-HTTP spec's answer for "none" is 405.
+
+    The operator mount had no GET route, so in production — where the admin
+    SPA's catch-all is registered — the GET fell through to it and came back
+    404, which the spec reserves for "your session is gone" (#476). Hence the
+    synthetic dist: without the catch-all, Starlette's own 405 hides the gap.
+    """
+    dist = tmp_path / "dist"
+    (dist / "assets").mkdir(parents=True)
+    (dist / "index.html").write_text("<html></html>")
+    monkeypatch.setenv("AEGIS_ADMIN_DIST_DIR", str(dist))
+    app = create_app(run_lifespan=False)
+    settings = _settings()
+    app.dependency_overrides[get_settings] = lambda: settings
+    app.state.settings = settings
+    app.state.db_pool = db_pool
+    headers = {"X-API-Key": ADMIN_KEY}
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        for suffix in ("", "/gated", "/operator"):
+            got = await c.get(f"/api/mcp-server/{AGENT}{suffix}", headers=headers)
+            assert got.status_code == 405, (suffix, got.status_code, got.text)
+            assert "POST" in got.headers.get("allow", ""), suffix
+
+
 async def test_the_run_mount_still_withholds_run_spawning_tools(client):
     """Falsifiability control: the recursion guard is untouched on a run mount."""
     token = mint_mount_token(AGENT, SECRET)
