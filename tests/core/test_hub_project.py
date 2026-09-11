@@ -18,10 +18,13 @@ from aegis.services.hub import (
     Event,
     get_problem,
     ingest_event,
+    list_events,
     merge_problems,
+    mute_problem,
     set_service_state,
     set_status,
 )
+from aegis.services.hub_group import upgrade
 from aegis.services.hub_project import (
     COLLAPSE_WINDOW,
     FOOTER,
@@ -69,12 +72,14 @@ def _resolved(subject: str, n: int) -> Event:
 @pytest.fixture
 def todoist(monkeypatch):
     """Record every Sync command; accept them all; mint an id per item_add."""
-    state = {"batches": [], "fail_notes": False}
+    state = {"batches": [], "fail_notes": False, "fail_adds": False}
 
     async def fake_commands(self, commands):
         state["batches"].append(commands)
         if state["fail_notes"] and any(c["type"] == "note_add" for c in commands):
             return {"ok": False, "error": "boom", "retryable": True}
+        if state["fail_adds"] and any(c["type"] == "item_add" for c in commands):
+            return {"ok": False, "error": "503", "retryable": True}
         mapping = {c["temp_id"]: f"T{uuid.uuid4().hex[:10]}" for c in commands if "temp_id" in c}
         return {
             "ok": True,
@@ -687,3 +692,498 @@ async def test_resolving_by_status_closes_the_task_like_a_resolved_alert(db_pool
     assert await db_pool.fetchval(
         "SELECT count(*) FROM todoist_outbox WHERE temp_id = $1", f"problem-close-{task}"
     ) == 1
+
+
+# --- a problem and its task stay in step (#473) --------------------------------
+
+
+async def _complete_by_hand(db_pool, task_id: str) -> None:
+    """What TodoistSyncFlow writes when a person ticks the task off in Todoist:
+    the item comes back `checked`, so the mirror row turns completed."""
+    await db_pool.execute(
+        "UPDATE todoist_tasks SET is_completed = true, completed_at = now(), updated_at = now() "
+        "WHERE id = $1",
+        task_id,
+    )
+
+
+async def _is_completed(db_pool, task_id: str) -> bool:
+    return bool(
+        await db_pool.fetchval("SELECT is_completed FROM todoist_tasks WHERE id = $1", task_id)
+    )
+
+
+def _notes_on(todoist, task_id: str) -> list[str]:
+    """Comment texts posted on one task, footer stripped."""
+    return [
+        c["args"]["content"].removesuffix(FOOTER)
+        for c in _cmds(todoist, "note_add")
+        if c["args"]["item_id"] == task_id
+    ]
+
+
+async def _resolved_by_task(db_pool, now) -> list[str]:
+    return [
+        r["problem_id"]
+        for r in await hub_project.reconcile_completed_tasks(db_pool, now=now)
+        if r["action"] == "resolved"
+    ]
+
+
+async def test_a_task_a_person_completes_resolves_its_problem(db_pool, inbox, todoist):
+    """Prod on 2026-09-11 had three `waiting_human` problems whose tasks were
+    completed on 09-08. Nothing read the completion back, and the heartbeat's
+    stale-problem query skips `waiting_human`, so they counted as open on the
+    Problems page and in the digest for good — and a new occurrence on one
+    of them would have attached to a closed task in silence.
+
+    Falsifiable: skip the `set_status` in `reconcile_completed_tasks` and the
+    problem stays `waiting_human`.
+    """
+    s = _subject()
+    r = await ingest_event(db_pool, _occ(s, 1), now=NOW)
+    task = (await project(db_pool, r.problem_id, now=NOW))["task_id"]
+    await _mirror_task(db_pool, task)
+    assert await set_status(db_pool, r.problem_id, "waiting_human", reason="gate 2 is open", now=NOW)
+    await project(db_pool, r.problem_id, now=NOW)
+    await _complete_by_hand(db_pool, task)
+
+    later = NOW + timedelta(minutes=5)
+    assert r.problem_id in await _resolved_by_task(db_pool, later)
+
+    p = await get_problem(db_pool, r.problem_id)
+    assert p["status"] == "resolved" and p["resolved_at"] == later
+    change = [e for e in await list_events(db_pool, r.problem_id) if e["kind"] == "state_change"][0]
+    assert change["payload"]["action"] == "resolve", "the word the projector acts on"
+    assert change["payload"]["reason"] == hub_project.TASK_COMPLETED_REASON
+
+    # The projector records it on the task once, and has nothing to close.
+    out = await project(db_pool, r.problem_id, now=later)
+    assert out["comments"] == 1
+    assert _notes_on(todoist, task)[-1] == (
+        "✅ Resolved at 2026-09-07 12:05 UTC. This task was already completed."
+    )
+    assert await db_pool.fetchval(
+        "SELECT count(*) FROM todoist_outbox WHERE temp_id = $1", f"problem-close-{task}"
+    ) == 0
+
+    # A second sweep finds nothing left to do.
+    assert r.problem_id not in await _resolved_by_task(db_pool, later)
+
+
+async def test_a_problem_that_comes_back_after_a_person_completed_it_reopens_the_task(
+    db_pool, inbox, todoist
+):
+    """Completing the task is the person's word that it is over. If it is not,
+    the next occurrence reopens the problem through the ordinary path, and the
+    projector un-completes the task, so the return is not lost on a closed one."""
+    s = _subject()
+    r = await ingest_event(db_pool, _occ(s, 1), now=NOW)
+    task = (await project(db_pool, r.problem_id, now=NOW))["task_id"]
+    await _mirror_task(db_pool, task)
+    await _complete_by_hand(db_pool, task)
+    done_at = NOW + timedelta(minutes=5)
+    assert r.problem_id in await _resolved_by_task(db_pool, done_at)
+    await project(db_pool, r.problem_id, now=done_at)
+
+    back = NOW + timedelta(hours=1)
+    again = await ingest_event(db_pool, _occ(s, 2, occurred_at=back), now=back)
+    assert again.problem_id == r.problem_id and again.action == "reopened"
+    await project(db_pool, r.problem_id, now=back)
+
+    assert (
+        "🔁 Back at 2026-09-07 13:00 UTC: recurred inside the reopen window."
+        in _notes_on(todoist, task)
+    )
+    assert not await _is_completed(db_pool, task)
+    cmd = await db_pool.fetchval(
+        "SELECT command FROM todoist_outbox WHERE temp_id = $1", f"problem-reopen-{task}"
+    )
+    assert cmd["type"] == "item_uncomplete" and cmd["args"]["id"] == task
+
+
+async def test_a_task_the_hub_closed_is_never_taken_for_a_person(db_pool, inbox, todoist):
+    """The hub completes a task only when its problem resolves — but the
+    problem can come back while the projector is not allowed to say so yet:
+    under a mute, or inside a deploy window. Then it is live, its task is the
+    one the HUB closed, and the reopen waits behind the watermark. Resolving
+    it would swallow the return; inside a window, the failure the deploy
+    caused would never be promoted at all.
+
+    Falsifiable: drop the pending-reopen clause from the predicate and both
+    problems are resolved.
+    """
+    muted, windowed = _subject(), _subject()
+    ids, tasks = {}, {}
+    for s in (muted, windowed):
+        r = await ingest_event(db_pool, _occ(s, 1), now=NOW)
+        task = (await project(db_pool, r.problem_id, now=NOW))["task_id"]
+        await _mirror_task(db_pool, task)
+        await ingest_event(db_pool, _resolved(s, 2), now=NOW)
+        await project(db_pool, r.problem_id, now=NOW)
+        assert await _is_completed(db_pool, task), "the hub closed it on the resolve"
+        ids[s], tasks[s] = r.problem_id, task
+
+    back = NOW + timedelta(hours=1)
+    await mute_problem(db_pool, ids[muted], hours=24, by="gate2", now=NOW)
+    await ingest_event(db_pool, _occ(muted, 3, occurred_at=back), now=back)
+    assert (await project(db_pool, ids[muted], now=back))["skipped"] == "muted"
+
+    await set_service_state(db_pool, windowed, "deploying", minutes=30, set_by="ansible", now=back)
+    await ingest_event(db_pool, _occ(windowed, 3, occurred_at=back), now=back)
+    assert (await get_problem(db_pool, ids[windowed]))["status"] == "suppressed"
+
+    touched = {
+        r["problem_id"]
+        for r in await hub_project.reconcile_completed_tasks(
+            db_pool, now=back + timedelta(minutes=5)
+        )
+    }
+    assert ids[muted] not in touched and ids[windowed] not in touched
+    assert (await get_problem(db_pool, ids[muted]))["status"] == "open"
+    assert (await get_problem(db_pool, ids[windowed]))["status"] == "suppressed"
+    # Nor are the tasks reopened behind the mute's or the window's back: the
+    # projector does that when it may.
+    assert await _is_completed(db_pool, tasks[muted])
+    assert await _is_completed(db_pool, tasks[windowed])
+
+
+async def test_the_hubs_own_close_from_before_a_return_is_undone_not_resolved(
+    db_pool, inbox, todoist
+):
+    """Prod 2140a366, 2026-09-08, step by step. The alert resolved and the
+    hub queued the close. TodoistSyncFlow applies Todoist's changes BEFORE
+    it drains the outbox, so its next tick first wrote the task back as open
+    in the mirror, then sent the close. Forty seconds later an investigation
+    moved the problem to `waiting_human` — a return — and the projector's
+    reopen read that stale "open" and sent nothing. The next diff brought
+    the close in as "completed", and the task stayed closed on a live
+    problem for three days. The issue took it for a person's completion.
+
+    The completion is older than the return, so it is the hub's own close:
+    the task is reopened, as the projector meant, and the problem stays
+    live. A person completing it afterwards still resolves it.
+
+    Falsifiable: treat every completion as a person's and the problem is
+    resolved on the hub's own close.
+    """
+    s = _subject()
+    r = await ingest_event(db_pool, _occ(s, 1), now=NOW)
+    task = (await project(db_pool, r.problem_id, now=NOW))["task_id"]
+    await _mirror_task(db_pool, task)
+    await ingest_event(db_pool, _resolved(s, 2), now=NOW)
+    await project(db_pool, r.problem_id, now=NOW)  # the hub queues its close
+    # The sync's apply, before its drain: Todoist has not closed it yet.
+    await db_pool.execute("UPDATE todoist_tasks SET is_completed = false WHERE id = $1", task)
+    closed_at = await db_pool.fetchval("SELECT clock_timestamp()")  # the drain closes it
+
+    assert await set_status(db_pool, r.problem_id, "waiting_human", reason="card posted")
+    await project(db_pool, r.problem_id, now=NOW + timedelta(minutes=3))
+    assert await db_pool.fetchval(
+        "SELECT count(*) FROM todoist_outbox WHERE temp_id = $1", f"problem-reopen-{task}"
+    ) == 0, "the stale mirror said open, so the reopen sent nothing"
+
+    # The next diff brings the close in, stamped before the return.
+    await db_pool.execute(
+        "UPDATE todoist_tasks SET is_completed = true, completed_at = $2 WHERE id = $1",
+        task,
+        closed_at,
+    )
+    done = await hub_project.reconcile_completed_tasks(db_pool, now=NOW + timedelta(minutes=5))
+
+    assert {"problem_id": r.problem_id, "task_id": task, "was": "waiting_human",
+            "action": "task_reopened"} in done
+    assert (await get_problem(db_pool, r.problem_id))["status"] == "waiting_human"
+    assert not await _is_completed(db_pool, task)
+    cmd = await db_pool.fetchval(
+        "SELECT command FROM todoist_outbox WHERE temp_id = $1", f"problem-reopen-{task}"
+    )
+    assert cmd["type"] == "item_uncomplete" and cmd["args"]["id"] == task
+
+    # A person completing it after the return is their word on it.
+    await db_pool.execute(
+        "UPDATE todoist_tasks SET is_completed = true, completed_at = clock_timestamp() "
+        "WHERE id = $1",
+        task,
+    )
+    assert r.problem_id in await _resolved_by_task(db_pool, NOW + timedelta(minutes=10))
+
+
+async def test_a_task_still_in_the_outbox_is_left_alone(db_pool, inbox, todoist):
+    """An `item-…` ref is a capture the sync has not drained yet: there is no
+    real task behind it to have been completed. The mirror holds no row for a
+    temp id today; this is the row a future placeholder would add."""
+    s = _subject()
+    r = await ingest_event(db_pool, _occ(s, 1), now=NOW)
+    temp = f"item-{s}"
+    await db_pool.execute(
+        "UPDATE problems SET todoist_task_id = $2 WHERE id = $1::uuid", r.problem_id, temp
+    )
+    await _mirror_task(db_pool, temp, completed=True)
+    assert r.problem_id not in await _resolved_by_task(db_pool, NOW)
+    assert (await get_problem(db_pool, r.problem_id))["status"] == "open"
+
+
+async def test_a_hand_written_task_and_a_group_follow_the_same_rule(db_pool, inbox, todoist):
+    """A `manual` problem IS a hand-written `@code` task, so a person finishing
+    the task finishes the problem. A group is one condition behind one task:
+    completing that task resolves it, and the next member's occurrence reopens
+    it and its task, the way it would any other problem."""
+    code_task = f"zzm-{uuid.uuid4().hex[:6]}"
+    await _mirror_task(db_pool, code_task)
+    manual = await hub_project.ensure_problem_for_task(db_pool, code_task, subject="o/r")
+    assert manual is not None and manual["class"] == "manual"
+
+    klass = f"zzgrp{uuid.uuid4().hex[:8]}"
+
+    def stuck(subject: str, at: datetime) -> Event:
+        return Event(
+            source="social",
+            external_id=f"social:{klass}:{subject}@{at.isoformat()}",
+            kind="occurrence",
+            title=f"Post {subject} stuck",
+            subject=subject,
+            subject_kind="post",
+            klass=klass,
+            occurred_at=at,
+        )
+
+    members = []
+    for subject in ("a", "b", "c"):
+        r = await ingest_event(db_pool, stuck(subject, NOW), now=NOW)
+        await _mirror_task(db_pool, (await project(db_pool, r.problem_id, now=NOW))["task_id"])
+        members.append(r.problem_id)
+    group = await upgrade(
+        db_pool, klass=klass, subject_kind="post", title="3 posts stuck",
+        member_ids=members, by="test", now=NOW,
+    )
+    await project(db_pool, group["problem_id"], now=NOW)
+    group_task = (await get_problem(db_pool, group["problem_id"]))["todoist_task_id"]
+
+    await _complete_by_hand(db_pool, code_task)
+    await _complete_by_hand(db_pool, group_task)
+    later = NOW + timedelta(minutes=5)
+    resolved = await _resolved_by_task(db_pool, later)
+    assert manual["id"] in resolved and group["problem_id"] in resolved
+    await project(db_pool, group["problem_id"], now=later)
+
+    back = NOW + timedelta(hours=1)
+    fourth = await ingest_event(db_pool, stuck("d", back), now=back)
+    assert fourth.problem_id == group["problem_id"] and fourth.action == "reopened"
+    await project(db_pool, group["problem_id"], now=back)
+    assert not await _is_completed(db_pool, group_task)
+
+
+async def test_a_problem_that_resolves_while_muted_still_closes_its_task(db_pool, inbox, todoist):
+    """Prod on 2026-09-11: 586cbacb and 6f15709b resolved on 09-10 under a mute
+    that ran to 09-11 15:14, and their tasks stayed open the whole time. A
+    mute that outlasted `problem_close_days` would have let the close sweep
+    retire the problem first, and the task would never have closed at all.
+
+    A mute silences what a problem DOES, not its recovery: the sweep still
+    closes the task, and the occurrences stay silent.
+
+    Falsifiable: put back the sweep's mute filter (or the projector's muted
+    skip) and the task stays open.
+    """
+    s = _subject()
+    r = await ingest_event(db_pool, _occ(s, 1), now=NOW)
+    task = (await project(db_pool, r.problem_id, now=NOW))["task_id"]
+    await _mirror_task(db_pool, task)
+    await mute_problem(db_pool, r.problem_id, hours=24, by="gate2", now=NOW)
+    for n in (2, 3):
+        await ingest_event(db_pool, _occ(s, n), now=NOW)
+    await ingest_event(db_pool, _resolved(s, 4), now=NOW)
+
+    results = await project_pending(db_pool, now=NOW + timedelta(minutes=10))
+
+    mine = [x for x in results if x["problem_id"] == r.problem_id]
+    assert mine and mine[0].get("comments") == 1
+    assert _notes_on(todoist, task) == ["✅ Resolved at 2026-09-07 12:04 UTC. Closing this task."]
+    assert await _is_completed(db_pool, task)
+    p = await get_problem(db_pool, r.problem_id)
+    assert p["metadata"]["pending_occurrences"] == 0, "the mute swallowed them"
+    latest = await db_pool.fetchval(
+        "SELECT max(id) FROM problem_events WHERE problem_id = $1::uuid", r.problem_id
+    )
+    assert p["metadata"]["projected_event_id"] == latest
+
+
+async def test_a_problem_flapping_under_a_mute_closes_with_one_comment(db_pool, inbox, todoist):
+    """586cbacb's real backlog behind its mute: five resolves, four reopens and
+    six occurrences. Told turn by turn that is ten comments the moment the
+    projector reaches it. A batch is told as where it ends, once.
+
+    Falsifiable: comment on every resolve and reopen again and this batch
+    posts five comments.
+    """
+    s = _subject()
+    r = await ingest_event(db_pool, _occ(s, 1), now=NOW)
+    task = (await project(db_pool, r.problem_id, now=NOW))["task_id"]
+    await _mirror_task(db_pool, task)
+    await mute_problem(db_pool, r.problem_id, hours=24, by="gate2", now=NOW)
+    for n in (2, 3, 4, 5, 6):
+        at = NOW + timedelta(minutes=n)
+        event = _resolved(s, n) if n % 2 == 0 else _occ(s, n, occurred_at=at)
+        await ingest_event(db_pool, event, now=at)
+
+    out = await project(db_pool, r.problem_id, now=NOW + timedelta(minutes=10))
+
+    assert out["comments"] == 1
+    assert _notes_on(todoist, task) == [
+        "✅ Resolved at 2026-09-07 12:06 UTC. Closing this task. "
+        "It came back twice since the last update."
+    ]
+    assert await _is_completed(db_pool, task)
+
+
+async def test_a_return_under_a_mute_waits_for_the_mute_to_end(db_pool, inbox, todoist):
+    """A mute means "stop telling me about this until then", and reopening the
+    task would put it back on the person's list, which is telling them. So a
+    problem that comes back under a mute stays quiet — the problem row says
+    open, the Problems page and the digest show it — and the task reopens,
+    with one comment, when the mute ends."""
+    s = _subject()
+    r = await ingest_event(db_pool, _occ(s, 1), now=NOW)
+    task = (await project(db_pool, r.problem_id, now=NOW))["task_id"]
+    await _mirror_task(db_pool, task)
+    await ingest_event(db_pool, _resolved(s, 2), now=NOW)
+    await project(db_pool, r.problem_id, now=NOW)
+    await mute_problem(db_pool, r.problem_id, hours=2, by="gate2", now=NOW)
+
+    back = NOW + timedelta(minutes=30)
+    await ingest_event(db_pool, _occ(s, 3, occurred_at=back), now=back)
+    before = len(_notes_on(todoist, task))
+    assert (await project(db_pool, r.problem_id, now=back))["skipped"] == "muted"
+    assert len(_notes_on(todoist, task)) == before
+    assert await _is_completed(db_pool, task), "still closed while the mute holds"
+
+    ended = NOW + timedelta(hours=3)
+    assert r.problem_id in {x["problem_id"] for x in await project_pending(db_pool, now=ended)}
+    assert (
+        "🔁 Back at 2026-09-07 12:30 UTC: recurred inside the reopen window."
+        in _notes_on(todoist, task)
+    )
+    assert not await _is_completed(db_pool, task)
+
+
+async def test_a_backlog_of_turns_is_told_as_where_it_ends(db_pool, inbox, todoist):
+    """The same collapse without a mute: a projection that could not run for a
+    while (Todoist down) comes back to resolve, reopen, resolve, reopen. One
+    occurrence summary and one "back" comment that says it cleared in between,
+    not five comments.
+
+    Falsifiable: comment on every turn again and this posts five.
+    """
+    s = _subject()
+    r = await ingest_event(db_pool, _occ(s, 1), now=NOW)
+    task = (await project(db_pool, r.problem_id, now=NOW))["task_id"]
+    await _mirror_task(db_pool, task)
+    for n in (2, 3, 4, 5):
+        at = NOW + timedelta(minutes=n)
+        event = _resolved(s, n) if n % 2 == 0 else _occ(s, n, occurred_at=at)
+        await ingest_event(db_pool, event, now=at)
+
+    out = await project(db_pool, r.problem_id, now=NOW + timedelta(minutes=10))
+
+    assert out["comments"] == 2
+    notes = _notes_on(todoist, task)
+    assert notes[0].startswith("⚠️ 2 more occurrences (3 in total)")
+    assert notes[1] == (
+        "🔁 Back at 2026-09-07 12:05 UTC: recurred inside the reopen window. "
+        "It had cleared twice since the last update."
+    )
+    assert not await _is_completed(db_pool, task)
+
+
+async def test_a_resolve_before_the_first_sync_still_closes_the_task(db_pool, inbox, todoist):
+    """The hub creates its task through the Sync API, and the mirror row only
+    appears on the next TodoistSyncFlow tick, up to five minutes later. A
+    problem that recovered inside that gap had its close dropped — the close
+    refused a task it could not find in the mirror — while the projector
+    moved its watermark past the resolve, so nothing ever tried again.
+
+    Falsifiable: refuse a task with no mirror row again and nothing is queued.
+    """
+    s = _subject()
+    r = await ingest_event(db_pool, _occ(s, 1), now=NOW)
+    task = (await project(db_pool, r.problem_id, now=NOW))["task_id"]
+    # No `_mirror_task`: the sync has not seen the task yet.
+    await ingest_event(db_pool, _resolved(s, 2), now=NOW)
+    await project(db_pool, r.problem_id, now=NOW + timedelta(minutes=2))
+
+    assert _notes_on(todoist, task) == ["✅ Resolved at 2026-09-07 12:02 UTC. Closing this task."]
+    cmd = await db_pool.fetchval(
+        "SELECT command FROM todoist_outbox WHERE temp_id = $1", f"problem-close-{task}"
+    )
+    assert cmd is not None and cmd["type"] == "item_complete" and cmd["args"]["id"] == task
+
+
+async def test_a_task_created_through_the_outbox_is_found_once_the_drain_commits_it(
+    db_pool, inbox, todoist
+):
+    """A capture that meets a transient Todoist error goes through the outbox,
+    and the problem holds the `item-…` temp id. The drain records the real id
+    on the outbox row (`committed_id`) and nowhere else, but the projector
+    only looked on the capture idempotency row, which keeps the temp id for
+    good. So the problem waited for ever, and its real task was never
+    commented on or closed. Prod 92cdd766 (2026-09-11) resolved five minutes
+    after its task was created this way, and that task is still open.
+
+    Falsifiable: drop the `committed_id` lookup and the projection still says
+    `task_pending_outbox`.
+    """
+    s = _subject()
+    r = await ingest_event(db_pool, _occ(s, 1), now=NOW)
+    todoist["fail_adds"] = True
+    temp = (await project(db_pool, r.problem_id, now=NOW))["task_id"]
+    todoist["fail_adds"] = False
+    assert temp.startswith("item-")
+    assert (await project(db_pool, r.problem_id, now=NOW))["skipped"] == "task_pending_outbox"
+
+    # What drain_outbox writes once Todoist accepts the queued item_add.
+    real = f"T{uuid.uuid4().hex[:10]}"
+    await db_pool.execute(
+        "UPDATE todoist_outbox SET status = 'committed', committed_id = $2 WHERE temp_id = $1",
+        temp,
+        real,
+    )
+    await _mirror_task(db_pool, real)
+    await ingest_event(db_pool, _resolved(s, 2), now=NOW)
+    out = await project(db_pool, r.problem_id, now=NOW + timedelta(minutes=5))
+
+    assert out.get("task_id") == real
+    assert (await get_problem(db_pool, r.problem_id))["todoist_task_id"] == real
+    assert _notes_on(todoist, real) == ["✅ Resolved at 2026-09-07 12:02 UTC. Closing this task."]
+    assert await _is_completed(db_pool, real)
+
+
+async def test_a_problem_that_resolved_before_it_had_a_task_never_gets_one(db_pool, inbox, todoist):
+    """A service that failed inside its deploy window and recovered before the
+    window ended is `suppressed`, then `resolved`, and never had a task. The
+    sweep used to create one anyway — for a problem that was already over —
+    and move the watermark past the resolve, so that task never closed.
+
+    Falsifiable: drop the resolved-without-task branch and the sweep creates
+    the task.
+    """
+    s = _subject()
+    await set_service_state(db_pool, s, "deploying", minutes=15, set_by="ansible", now=NOW)
+    r = await ingest_event(db_pool, _occ(s, 1), now=NOW)
+    assert (await get_problem(db_pool, r.problem_id))["status"] == "suppressed"
+    await ingest_event(db_pool, _resolved(s, 5), now=NOW + timedelta(minutes=5))
+    assert (await get_problem(db_pool, r.problem_id))["status"] == "resolved"
+
+    after = NOW + timedelta(minutes=20)
+    mine = [x for x in await project_pending(db_pool, now=after) if x["problem_id"] == r.problem_id]
+
+    assert mine and mine[0].get("skipped") == "resolved_without_task"
+    assert not [c for c in _cmds(todoist, "item_add") if c["args"]["content"] == f"Service {s} down"]
+    assert (await get_problem(db_pool, r.problem_id))["todoist_task_id"] is None
+    assert r.problem_id not in {x["problem_id"] for x in await project_pending(db_pool, now=after)}
+
+    # If it comes back it is a real problem again, and gets its task.
+    back = NOW + timedelta(hours=1)
+    again = await ingest_event(db_pool, _occ(s, 6, occurred_at=back), now=back)
+    assert again.action == "reopened"
+    assert (await project(db_pool, r.problem_id, now=back))["created"] is True

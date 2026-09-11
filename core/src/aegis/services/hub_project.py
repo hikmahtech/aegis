@@ -3,22 +3,29 @@
 Spec: docs/superpowers/specs/2026-09-07-problem-hub-design.md §6.
 
 The problem (`services/hub.py`) is the record; the task is a *view* of it.
-Nothing here is ever read back — the status block in the task description is
-for the human and for a session that has only the task in front of it, and the
-only thing that flows from Todoist into AEGIS is a user's own comment, over the
-webhook that already exists.
+The status block in the task description is never read back — it is for the
+human and for a session that has only the task in front of it. Two things
+flow from Todoist into AEGIS: a user's own comment, over the webhook that
+already exists, and a task somebody completed, which
+:func:`reconcile_completed_tasks` turns into a resolve — or, when the
+completion turns out to be the hub's own close from before a return, undoes
+(#473).
 
 What a projection does, in order:
 
 1. **Ensures the task** once the problem is worth a human's attention: any
-   projected status (§4), not suppressed, not muted. Created through the same
-   idempotent capture the chat tools use, with `external_id = problem-<id>`,
-   so a retried projection finds its own task.
+   projected status (§4) short of `resolved`, not suppressed, not muted. A
+   problem that is already over when it is first projected gets no task.
+   Created through the same idempotent capture the chat tools use, with
+   `external_id = problem-<id>`, so a retried projection finds its own task.
 2. **Comments, never new tasks.** Every event since the last projection
    becomes a comment — except occurrences, which are collapsed to one
    "N more" comment per ``COLLAPSE_WINDOW`` so a flapping service cannot flood
-   the thread. A `resolve` transition closes the task (unless the user has
-   claimed it with `@me`); a `reopen` or `promote` reopens it.
+   the thread, and resolves and reopens, which are told once, as where the
+   batch ends. A `resolve` closes the task (unless the user has claimed it
+   with `@me`); a `reopen` or `promote` reopens it. A mute silences
+   occurrences and returns, never a recovery: a muted problem that resolves
+   still closes its task.
 3. **Re-renders the status block** in the description, replaced whole between
    its markers, only when its content changed.
 4. **Turns a plan into subtasks.** A `plan` event carrying two or more
@@ -45,7 +52,13 @@ import structlog
 from aegis.connectors.todoist import TodoistConnector
 from aegis.services import work_sessions
 from aegis.services.agents import resolve_tag
-from aegis.services.hub import _active_suppression, _aware, get_problem
+from aegis.services.hub import (
+    LIVE_STATUSES,
+    _active_suppression,
+    _aware,
+    get_problem,
+    set_status,
+)
 from aegis.services.todoist_config import resolve_todoist_api_key
 from aegis.services.tools.gtd import _capture_to_inbox_impl
 
@@ -68,6 +81,8 @@ _MAX_PLAN_STEPS = 12
 _STEP_CAP = 200
 _FALLBACK_LABEL = "@pandora"
 _DESCRIPTION_CAP = 2000
+# What the timeline says when a completed task resolved its problem.
+TASK_COMPLETED_REASON = "its Todoist task was completed by a person, not by the hub"
 
 
 def _ts(value: Any) -> str:
@@ -377,7 +392,12 @@ async def _complete_task(pool: asyncpg.Pool, task_id: str) -> bool:
     row = await pool.fetchrow(
         "SELECT assignee_label, is_completed FROM todoist_tasks WHERE id = $1", task_id
     )
-    if row is None or row["is_completed"] or row["assignee_label"] == "@me":
+    # No mirror row means the hub created this task less than a sync ago:
+    # nobody can have claimed it yet. Refusing to close it here dropped the
+    # close for good, because the projector moves its watermark past the
+    # resolve either way — a problem that recovered within five minutes of
+    # its task being created left that task open (#473).
+    if row is not None and (row["is_completed"] or row["assignee_label"] == "@me"):
         return False
     await _queue(
         pool, f"problem-close-{task_id}", TodoistConnector.build_item_complete_command(task_id)
@@ -445,6 +465,10 @@ async def _save_meta(pool: asyncpg.Pool, problem_id: str, meta: dict[str, Any]) 
     await pool.execute("UPDATE problems SET metadata = $2 WHERE id = $1::uuid", problem_id, meta)
 
 
+def _times(n: int) -> str:
+    return {1: "once", 2: "twice"}.get(n, f"{n} times")
+
+
 def _history_text(kind: str, payload: dict[str, Any]) -> str:
     text = str(payload.get("text") or payload.get("summary") or "").strip()
     head = {
@@ -471,7 +495,13 @@ async def project(
         return {"problem_id": problem_id, "skipped": "missing"}
     if p["status"] not in PROJECTED_STATUSES:
         return {"problem_id": problem_id, "skipped": p["status"]}
-    if p["muted_until"] is not None and _aware(p["muted_until"], now) > now:
+    # A mute silences what a problem does, not its recovery. A live muted
+    # problem is left alone — its events, a return included, wait behind the
+    # watermark and are told once when the mute ends — but a resolved one
+    # still closes its task. Skipping that too kept the task open until the
+    # mute ended, and for good when the mute outlasted the close sweep (#473).
+    muted = p["muted_until"] is not None and _aware(p["muted_until"], now) > now
+    if muted and p["status"] != "resolved":
         return {"problem_id": problem_id, "skipped": "muted"}
     meta: dict[str, Any] = dict(p["metadata"] or {})
     latest_event_id = await pool.fetchval(
@@ -480,9 +510,11 @@ async def project(
 
     task_id = p["todoist_task_id"]
     if task_id and task_id.startswith("item-"):
-        # Created through the outbox: the real id lands on the idempotency row
-        # once TodoistSyncFlow drains it. Until then there is nothing to
-        # comment on.
+        # Created through the outbox. Until TodoistSyncFlow drains it there is
+        # nothing to comment on. The drain writes the real id on the outbox
+        # row (`committed_id`) and never on the capture idempotency row, so
+        # waiting for the idempotency row alone waited for ever: the task was
+        # created and never commented on or closed (#473, prod 92cdd766).
         real = await pool.fetchval(
             "SELECT todoist_task_ref FROM todoist_capture_idempotency "
             "WHERE source_tag = $1 AND external_id = $2",
@@ -490,9 +522,30 @@ async def project(
             f"problem-{problem_id}",
         )
         if not real or real.startswith("item-"):
+            real = await pool.fetchval(
+                "SELECT committed_id FROM todoist_outbox "
+                "WHERE temp_id = $1 AND status = 'committed'",
+                task_id,
+            )
+        if not real or real.startswith("item-"):
             return {"problem_id": problem_id, "task_id": task_id, "skipped": "task_pending_outbox"}
         task_id = real
         await _set_task(pool, problem_id, task_id)
+
+    if not task_id and p["status"] == "resolved":
+        # It came and went before it earned a task: seen only inside a deploy
+        # window, or its inline projection failed and it recovered before the
+        # sweep. A task born closed tells nobody anything, so the events are
+        # marked seen and nothing is created. Creating one moved the
+        # watermark past the resolve, and that task never closed (#473). A
+        # later occurrence reopens the problem, and THAT projects a task.
+        meta.update(
+            projected_event_id=int(latest_event_id),
+            projected_at=now.isoformat(),
+            pending_occurrences=0,
+        )
+        await _save_meta(pool, problem_id, meta)
+        return {"problem_id": problem_id, "skipped": "resolved_without_task"}
 
     async with pool.acquire() as conn:
         window = await _active_suppression(conn, p["subject"], p["subject_kind"], now)
@@ -550,13 +603,21 @@ async def project(
         problem_id,
         since,
     )
-    pending = int(meta.get("pending_occurrences") or 0)
+    # Under a mute an occurrence is counted on the problem and told nowhere,
+    # including the ones still waiting for the collapse window: the task is
+    # about to close, and "3 more occurrences" is exactly what the mute is for.
+    pending = 0 if muted else int(meta.get("pending_occurrences") or 0)
     comments: list[str] = []
     close = reopen = renamed = False
+    # Resolves and returns are told as where the batch ENDS, once. One comment
+    # per turn let a backlog burst out: 586cbacb had five resolves and four
+    # reopens waiting behind its mute, ten comments the moment it ended.
+    turn: asyncpg.Record | None = None
+    cleared = returned = 0
     for e in events:
         payload = e["payload"] or {}
         if e["kind"] == "occurrence":
-            if not payload.get("suppressed_by"):
+            if not payload.get("suppressed_by") and not muted:
                 pending += 1
         elif e["kind"] == "state_change":
             action = payload.get("action")
@@ -571,16 +632,13 @@ async def project(
                 )
                 renamed = True
             elif action == "resolve":
-                comments.append(f"✅ Resolved at {_ts(e['occurred_at'])}. Closing this task.")
-                close, reopen = True, False
+                turn, close, reopen = e, True, False
+                cleared += 1
             elif action in {"reopen", "promote"}:
-                why = (
-                    "seen during a deploy window and still failing after it"
-                    if action == "promote"
-                    else "recurred inside the reopen window"
-                )
-                comments.append(f"🔁 Back at {_ts(e['occurred_at'])}: {why}.")
-                reopen, close = True, False
+                turn, close, reopen = e, False, True
+                # A promote after a reopen inside a deploy window is the same
+                # return, told twice by the hub; only a reopen counts one.
+                returned += action == "reopen"
         elif e["kind"] in _HISTORY_KINDS and not payload.get("posted"):
             comments.append(_history_text(e["kind"], payload))
         if e["kind"] == "plan":
@@ -590,6 +648,39 @@ async def project(
         done = payload.get("step_done")
         if isinstance(done, int) and done > 0:
             await _complete_step(pool, problem_id, done)
+
+    if muted and reopen:
+        # The problem was resolved when it was read and has come back since.
+        # A return under a mute waits for the mute to end, like any other.
+        return {"problem_id": problem_id, "task_id": task_id, "skipped": "muted"}
+    if turn is not None:
+        at = _ts(turn["occurred_at"])
+        text = ""
+        if close:
+            already = await pool.fetchval(
+                "SELECT is_completed FROM todoist_tasks WHERE id = $1", task_id
+            )
+            if not already:
+                text = f"✅ Resolved at {at}. Closing this task."
+            elif not muted:
+                # A person completed it (and this resolve is that completion,
+                # read back), or the hub did on an earlier resolve and the
+                # return in between never reached the task. Nothing to close.
+                # Under a mute there is nothing worth saying at all.
+                text = f"✅ Resolved at {at}. This task was already completed."
+            if text and returned:
+                text += f" It came back {_times(returned)} since the last update."
+        else:
+            why = (
+                "seen during a deploy window and still failing after it"
+                if (turn["payload"] or {}).get("action") == "promote"
+                else "recurred inside the reopen window"
+            )
+            text = f"🔁 Back at {at}: {why}."
+            if cleared:
+                text += f" It had cleared {_times(cleared)} since the last update."
+        if text:
+            comments.append(text)
 
     last_comment_at = meta.get("last_occurrence_comment_at")
     if pending and (
@@ -672,13 +763,18 @@ async def project_pending(
     now: datetime | None = None,
 ) -> list[dict[str, Any]]:
     """Every problem whose task is missing, still an outbox temp id, or behind
-    its events — newest activity first. Run by `HubSweepFlow`."""
+    its events — newest activity first. Run by `HubSweepFlow`.
+
+    A muted problem is swept once it has resolved, so its task closes under
+    the mute; a resolved problem with no task is swept once, to mark its
+    events seen, and never gets one."""
     now = now or datetime.now(UTC)
     rows = await pool.fetch(
         "SELECT id::text AS id FROM problems p "
         "WHERE p.closed_at IS NULL AND p.status = ANY($1::text[]) "
-        "  AND (p.muted_until IS NULL OR p.muted_until <= $2) "
-        "  AND (p.todoist_task_id IS NULL OR p.todoist_task_id LIKE 'item-%' "
+        "  AND (p.muted_until IS NULL OR p.muted_until <= $2 OR p.status = 'resolved') "
+        "  AND ((p.todoist_task_id IS NULL AND p.status <> 'resolved') "
+        "       OR p.todoist_task_id LIKE 'item-%' "
         "       OR COALESCE((p.metadata->>'pending_occurrences')::int, 0) > 0 "
         "       OR EXISTS (SELECT 1 FROM problem_events e WHERE e.problem_id = p.id "
         "                  AND e.id > COALESCE((p.metadata->>'projected_event_id')::bigint, 0))) "
@@ -694,4 +790,80 @@ async def project_pending(
         except Exception as exc:  # noqa: BLE001 — one bad problem must not stop the sweep
             logger.warning("hub_project_failed", problem_id=r["id"], error=str(exc)[:200])
             out.append({"problem_id": r["id"], "error": str(exc)[:200]})
+    return out
+
+
+async def reconcile_completed_tasks(
+    pool: asyncpg.Pool, *, limit: int = 50, now: datetime | None = None
+) -> list[dict[str, Any]]:
+    """Make a completed task and its live problem agree again. Run by
+    `HubSweepFlow`, before projection, so what changes reaches the task in
+    the same tick. Returns one row per problem touched, with ``action``
+    `resolved` or `task_reopened`.
+
+    Nothing used to read a completion back: a task ticked off in Todoist, or
+    through the `complete_task` chat tool, left its problem live for good —
+    counted as open on the Problems page and in the digest, and with the
+    heartbeat's re-investigation skipping `waiting_human`, never looked at
+    again (#473). The completion is somebody's word, and the question is
+    whose, and about what:
+
+    * **Completed after the problem's last return** (or it never returned):
+      a person — or an agent acting on a person's decision — finished the
+      work. The problem resolves through the hub's own transition. If it is
+      not over, the next occurrence reopens it and the projector reopens
+      the task.
+    * **Completed before the last return, which the projector has already
+      told:** the completion is the hub's own close, and the reopen that
+      followed never stuck. TodoistSyncFlow applies Todoist's changes before
+      it drains the outbox, so the mirror can be a tick stale either way: the
+      projector's reopen can find it still "open" and send nothing (prod
+      2140a366), or a close drained on one tick comes back as "completed" on
+      the next, after the reopen. The task is reopened, which is what the
+      projector meant to do. Taking this for a person's completion would
+      swallow the return.
+    * **A return the projector has not told yet** — under a mute, or inside a
+      deploy window — is left alone: the task is still the one the hub
+      closed, and the projector reopens it when it may.
+
+    Group problems and `manual` ones (hand-written `@code` tasks) follow the
+    same rules. An `item-…` ref is a capture the sync has not drained, so
+    there is no real task behind it to have been completed.
+    """
+    now = now or datetime.now(UTC)
+    rows = await pool.fetch(
+        "SELECT p.id::text AS id, p.status, p.todoist_task_id, "
+        "       EXISTS (SELECT 1 FROM problem_events e WHERE e.problem_id = p.id "
+        "               AND e.kind = 'state_change' "
+        "               AND e.payload->>'action' IN ('reopen', 'promote') "
+        "               AND e.created_at > t.completed_at) AS came_back_since "
+        "FROM problems p JOIN todoist_tasks t ON t.id = p.todoist_task_id "
+        "WHERE p.closed_at IS NULL AND p.status = ANY($1::text[]) AND t.is_completed "
+        "  AND p.todoist_task_id NOT LIKE 'item-%' "
+        "  AND NOT EXISTS (SELECT 1 FROM problem_events e WHERE e.problem_id = p.id "
+        "        AND e.kind = 'state_change' AND e.payload->>'action' IN ('reopen', 'promote') "
+        "        AND e.id > COALESCE((p.metadata->>'projected_event_id')::bigint, 0)) "
+        "ORDER BY p.last_seen_at DESC LIMIT $2",
+        sorted(LIVE_STATUSES),
+        limit,
+    )
+    out: list[dict[str, Any]] = []
+    for r in rows:
+        row = {"problem_id": r["id"], "task_id": r["todoist_task_id"], "was": r["status"]}
+        try:
+            if r["came_back_since"]:
+                if await _uncomplete_task(pool, r["todoist_task_id"]):
+                    out.append({**row, "action": "task_reopened"})
+            elif await set_status(
+                pool, r["id"], "resolved", reason=TASK_COMPLETED_REASON, source="todoist", now=now
+            ):
+                out.append({**row, "action": "resolved"})
+        except Exception as exc:  # noqa: BLE001 — one bad problem must not stop the sweep
+            logger.warning("hub_task_completion_failed", problem_id=r["id"], error=str(exc)[:200])
+    if out:
+        logger.info(
+            "hub_task_completions_reconciled",
+            resolved=sum(1 for o in out if o["action"] == "resolved"),
+            task_reopened=sum(1 for o in out if o["action"] == "task_reopened"),
+        )
     return out
