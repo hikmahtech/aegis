@@ -1074,19 +1074,24 @@ async def add_link(pool: asyncpg.Pool, problem_id: str, link_kind: str, ref: str
 async def merge_problems(
     pool: asyncpg.Pool, keep_id: str, merge_id: str, *, by: str, now: datetime | None = None
 ) -> dict[str, Any]:
-    """Fold ``merge_id`` into ``keep_id``: its events, links and sessions move,
-    its occurrences count on the kept problem, and it closes with a `problem`
-    link back so the history reads both ways.
+    """Fold ``merge_id`` into ``keep_id``: its events and links move, its
+    occurrences count on the kept problem, and it closes with a `problem` link
+    back so the history reads both ways. Its `work_sessions` rows are
+    re-pointed too, but nothing reads `work_sessions.problem_id` — sessions are
+    listed by task, so they stay on the merged problem's task.
 
-    A wrong merge hides an outage, so there are exactly two callers: a person
-    on the admin Problems page, and `hub_group.upgrade`, which folds problems
-    of ONE class and subject kind into a group of that class after an LLM has
-    agreed they are the same condition. The hub still never merges two
-    different failures on a resemblance.
+    A wrong merge hides an outage, so every caller is a deliberate decision:
+    a person on the admin Problems page; a person or agent through the
+    `merge_problems` chat tool (withheld from coding runs); and
+    `hub_group.upgrade`, which folds problems of ONE class and subject kind into
+    a group of that class after an LLM has agreed they are the same condition,
+    or into a group that already stands for the class. The hub still never
+    merges two different failures on a resemblance.
 
     Raises ValueError when either problem is missing, they are the same, or the
     kept one is already closed. The merged problem's own Todoist task is
-    returned so the caller can retire it; the hub never touches Todoist.
+    returned so the caller can retire it (`hub_project.retire_merged_task`);
+    the hub never touches Todoist.
     """
     now = now or _utcnow()
     if keep_id == merge_id:
