@@ -93,7 +93,12 @@ SOURCES = frozenset(
         # own dedupe, its own noise guards and no alert path at all — see §15
         # of the statement-reconciliation spec, which puts it back here.
         "money",
-        "hub",  # the hub's own state_change rows
+        # A fix PR an investigation opened was merged or closed: the GitHub
+        # webhook, through `hub_fix.record_pr_closed` (#502).
+        "github",
+        # The hub's own state_change rows, and the sweep's verdict on a
+        # merged fix (`hub_fix.verify_fixes`).
+        "hub",
     }
 )
 KINDS = frozenset({"occurrence", "resolved", "investigation", "plan", "session_note"})
