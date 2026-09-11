@@ -11,6 +11,7 @@ where a live fill is posted to the books, which is the live spec's job.
 from __future__ import annotations
 
 import math
+import statistics
 from bisect import bisect_right
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -496,3 +497,120 @@ def fill_orders(
             cash -= qty * px + costs
         results.append(FillResult(o.id, "filled", fill_day, qty, px, costs, bar.source))
     return results
+
+
+MIN_WEEKS = 12
+
+
+@dataclass(frozen=True)
+class Stats:
+    n: int
+    mean: float
+    sd: float
+    t: float
+
+
+def desk_values(
+    fills: list[Fill], bars: dict[str, list[Bar]], capital: float, days: list[date]
+) -> list[tuple[date, float]]:
+    """The desk's value at each day's close. `ponytail:` replays from scratch
+    per day, O(days x fills); fine for years of a daily desk."""
+    return [(d, value(replay(fills, bars, capital, d), bars, d)) for d in days]
+
+
+def benchmark_values(
+    series: list[Bar], capital: float, cost_pct: float, days: list[date]
+) -> list[tuple[date, float]]:
+    """``capital`` put into one instrument at the first day's close, paying one
+    buy cost, then held: splits adjust the units and dividends go to cash (spec §8)."""
+    if not days:
+        return []
+    start = close_on(series, days[0])
+    if not start:
+        return []
+    units = capital * (1 - cost_pct) / start
+    cash = 0.0
+    last = days[0]
+    out: list[tuple[date, float]] = []
+    for d in days:
+        for b in series:
+            if last < b.day <= d:
+                if b.split_ratio:
+                    units *= b.split_ratio
+                if b.dividend:
+                    cash += units * b.dividend
+        last = max(last, d)
+        out.append((d, units * (close_on(series, d) or 0.0) + cash))
+    return out
+
+
+def _week_ends(values: list[tuple[date, float]]) -> dict[tuple[int, int], float]:
+    ends: dict[tuple[int, int], float] = {}
+    for d, v in values:  # in date order, so the week's last day wins
+        iso = d.isocalendar()
+        ends[(iso.year, iso.week)] = v
+    return ends
+
+
+def weekly_excess(desk: list[tuple[date, float]], bench: list[tuple[date, float]]) -> list[float]:
+    """The desk's return minus the benchmark's, one per ISO week, from each
+    week's last value to the next (spec §8)."""
+    a, b = _week_ends(desk), _week_ends(bench)
+    weeks = sorted(set(a) & set(b))
+    return [
+        (a[cur] / a[prev] - 1) - (b[cur] / b[prev] - 1)
+        for prev, cur in zip(weeks, weeks[1:], strict=False)
+        if a[prev] and b[prev]
+    ]
+
+
+def stats(xs: list[float]) -> Stats:
+    n = len(xs)
+    if n < 2:
+        return Stats(n, xs[0] if xs else 0.0, 0.0, 0.0)
+    mean = statistics.fmean(xs)
+    sd = statistics.stdev(xs)
+    return Stats(n, mean, sd, mean / sd * math.sqrt(n) if sd > 0 else 0.0)
+
+
+def label(s: Stats) -> str:
+    """How much weight to give the result, in words (spec §8)."""
+    if s.n < MIN_WEEKS:
+        return "too early"
+    if s.t <= -2:
+        return "clearly behind the benchmark"
+    if s.t <= -1:
+        return "behind the benchmark"
+    if s.t < 1:
+        return "no evidence yet"
+    if s.t < 2:
+        return "suggestive"
+    return "strong"
+
+
+def below_expectation(s: Stats, expected_excess_pa: float) -> bool:
+    """True when live results are more than two standard errors below the
+    weekly excess the backtest implies (spec §8)."""
+    if s.n < MIN_WEEKS:
+        return False
+    weekly = (1 + expected_excess_pa) ** (1 / 52) - 1
+    return s.mean + 2 * s.sd / math.sqrt(s.n) < weekly
+
+
+def big_moves(
+    bars: dict[str, list[Bar]], symbols: set[str], start: date, end: date
+) -> list[tuple[str, date, float]]:
+    """Closes that moved more than 50% from the previous close, inside
+    ``start``..``end``, with no split recorded that day: likely a bad price."""
+    out: list[tuple[str, date, float]] = []
+    for symbol in sorted(symbols):
+        prev: float | None = None
+        for b in bars.get(symbol, []):
+            if b.close is None:
+                continue
+            if prev and start <= b.day <= end and not b.split_ratio:
+                move = b.close / prev - 1
+                if abs(move) > 0.5:
+                    out.append((symbol, b.day, move))
+            prev = b.close
+    return out
