@@ -896,9 +896,8 @@ directory, and the script goes in that directory's `hooks/`:
         ]
       }
     ],
-    "Stop": [
+    "SessionEnd": [
       {
-        "matcher": "*",
         "hooks": [
           {
             "type": "command",
@@ -910,6 +909,10 @@ directory, and the script goes in that directory's `hooks/`:
   }
 }
 ```
+
+Use `SessionEnd`, not `Stop`, for the second hook. `Stop` fires at the end of
+every reply, so it would mark a session you are still sitting in as `parked`
+after its first answer, and AEGIS would stop keeping out of that task.
 
 **Where the script gets `AEGIS_URL` and `AEGIS_API_KEY`.** A hook sees only
 the environment of the `claude` process that runs it, so both must be set
@@ -925,6 +928,12 @@ sources. Never put them in the repo or in this settings file.
   and refuses a run's mount token outright.
 
 If either is missing the script exits quietly rather than failing your session.
+
+- `AEGIS_ACCOUNT` is the **account name** AEGIS uses for this config
+  directory — the key under `engines.claude.config_dirs` in the coding-host
+  block (for example `personal` for `~/.claude-personal`). It is not the
+  directory's name: AEGIS resumes a session under an account by that key, so
+  sending `.claude-personal` would match nothing. Set it per config directory.
 
 **When it does anything.** The script records a session only when it starts
 inside a task worktree — a directory matching `*-aegis-wt/task-*`, which is
@@ -942,13 +951,19 @@ set -euo pipefail
 # Without a URL and a real key there is nothing to tell; stay out of the way.
 [ -n "${AEGIS_URL:-}" ] && [ -n "${AEGIS_API_KEY:-}" ] || exit 0
 
+# Claude Code hands a hook its session id and working directory as JSON on
+# stdin; there is no CLAUDE_SESSION_ID variable.
+input=$(cat)
+cwd=$(jq -r '.cwd // empty' <<<"$input"); cwd=${cwd:-$PWD}
+sid=$(jq -r '.session_id // empty' <<<"$input")
+
 # A task session runs in `<repo>-aegis-wt/task-<id>`; anything else is not on
 # a task unless AEGIS_TASK says so. Silence is the correct answer for an
 # ordinary session in an ordinary checkout.
 task="${AEGIS_TASK:-}"
 if [ -z "$task" ]; then
-  case "$PWD" in
-    *-aegis-wt/task-*) task="${PWD##*/task-}" ;;
+  case "$cwd" in
+    *-aegis-wt/task-*) task="${cwd##*-aegis-wt/task-}"; task="${task%%/*}" ;;
     *) exit 0 ;;
   esac
 fi
@@ -956,21 +971,26 @@ fi
 case "${1:-start}" in
   start)  status=active; summary="opened a session here" ;;
   stop)   status=parked; summary="stepped away" ;;
+  *)      exit 0 ;;
 esac
 
-curl -fsS -X POST "$AEGIS_URL/api/mcp-server/pandoras-actor/operator" \
-  -H "X-API-Key: $AEGIS_API_KEY" -H "Content-Type: application/json" \
-  -d "$(jq -nc --arg t "$task" --arg s "$summary" --arg st "$status" \
-        --arg sid "${CLAUDE_SESSION_ID:-}" --arg acct "$(basename "${CLAUDE_CONFIG_DIR:-$HOME/.claude}")" \
-        '{jsonrpc:"2.0",id:1,method:"tools/call",params:{name:"report_progress",
-          arguments:{task_id:$t,summary:$s,status:$st,session_id:$sid,account:$acct}}}')" \
-  >/dev/null || true
+body=$(jq -nc --arg t "$task" --arg s "$summary" --arg st "$status" --arg sid "$sid" \
+  --arg acct "${AEGIS_ACCOUNT:-$(basename "${CLAUDE_CONFIG_DIR:-$HOME/.claude}")}" \
+  '{jsonrpc:"2.0",id:1,method:"tools/call",params:{name:"report_progress",
+    arguments:{task_id:$t,summary:$s,status:$st,session_id:$sid,account:$acct}}}')
+
+# The key goes to curl on stdin (-K -), not on the command line, where any
+# local user could read it from the process list.
+printf 'header = "X-API-Key: %s"\n' "$AEGIS_API_KEY" |
+  curl -fsS -m 5 -K - -X POST "$AEGIS_URL/api/mcp-server/pandoras-actor/operator" \
+    -H "Content-Type: application/json" -d "$body" >/dev/null || true
 ```
 
 Three things about it are deliberate. It **fails open** (`|| true`): a hook
 that breaks your session because AEGIS is down is worse than an unrecorded
-session. It sends the **account** (`CLAUDE_CONFIG_DIR`'s basename), which is
-what lets a later AEGIS turn resume under the same login. And `stop` parks
+session. It sends the **account** (`AEGIS_ACCOUNT`, the coding block's name
+for this login), which is what lets a later AEGIS turn resume under the same
+login. And `stop` parks
 rather than finishing: only you know whether the work is done, and
 `report_progress(status='done')` from inside a session is how you say so.
 
