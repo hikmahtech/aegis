@@ -284,6 +284,20 @@ activities:
     config: {account: "primary", folder_id: "", recurse: true, source_type: "drive"}
     active: true
 
+  # Raphael — the Calibre library index (#510): one metadata row per book in
+  # the knowledge store (never the text), refreshed daily. Unchanged books are
+  # skipped by fingerprint; a book that left Calibre is removed and named in
+  # the run summary. Ships ACTIVE but INERT: until Integrations has a
+  # calibre-web user and password the run reports `not_configured`. Minute :41
+  # is odd (the */2 stepper never lands on it) and used by no other row; 03:41
+  # UTC is after the 03:30 rows and well ahead of the 04:30 briefing.
+  - slug: calibre-sync-daily
+    workflow_type: CalibreSyncFlow
+    agent_id: raphael
+    schedule_cron: "41 3 * * *"
+    config: {}
+    active: true
+
   # Phase 4 — nightly per-agent memory consolidation (caps each agent's
   # agent_memory at `keep` rows; the learning loop writes corrections live).
   # consolidate: run the A4 planner first — it PROPOSES ADD/UPDATE/DELETE/NOOP

@@ -12,6 +12,7 @@ import asyncio
 from dataclasses import dataclass
 from typing import Any
 
+from aegis.services import library
 from aegis.services import research as rs
 from temporalio import activity
 
@@ -54,6 +55,8 @@ class ResearchActivities:
             except Exception as exc:  # noqa: BLE001 — a slow store costs its part, not the run
                 errors.append(f"knowledge: {str(exc)[:200]}")
 
+        books = await self._library(question, errors)
+
         web: list[dict] = []
         if self.search_connector is None:
             errors.append("web: search is not configured")
@@ -77,7 +80,61 @@ class ResearchActivities:
                 to_read.append(url)
             if len(to_read) >= rs.PAGES_TO_READ[depth]:
                 break
-        return {"kg": kg, "web": web, "papers": papers, "to_read": to_read, "errors": errors}
+        return {
+            "kg": kg,
+            "books": books,
+            "web": web,
+            "papers": papers,
+            "to_read": to_read,
+            "errors": errors,
+        }
+
+    async def _library(self, question: str, errors: list[str]) -> list[dict]:
+        """Books from the Calibre library index that speak to the question, and
+        for the closest one — if it is close enough — the passages that match
+        (#510). A library that cannot be read is an `errors` line, never a
+        failed step."""
+        if self.knowledge_connector is None:
+            return []
+        try:
+            hits = await self.knowledge_connector.search(
+                question, limit=library.RESEARCH_BOOK_HITS, source_type=library.BOOK_SOURCE_TYPE
+            )
+        except Exception as exc:  # noqa: BLE001 — a slow store costs its part, not the run
+            errors.append(f"library: {str(exc)[:200]}")
+            return []
+        books = [
+            {**b, "url": library.book_url(b["id"])}
+            for b in (library.book_hit(h) for h in hits or [])
+            if b["id"] is not None
+        ]
+        if not books or books[0]["similarity"] < library.RESEARCH_PASSAGE_MIN_SIMILARITY:
+            return books
+        conn, _reason = library.connector_or_reason(self.settings)
+        if conn is None:
+            return books
+        try:
+            read = await asyncio.wait_for(
+                library.read_book(
+                    conn,
+                    books[0]["id"],
+                    query=question,
+                    pdf_scan_pages=library.RESEARCH_PDF_SCAN_PAGES,
+                ),
+                timeout=library.RESEARCH_LIBRARY_READ_S,
+            )
+        except Exception as exc:  # noqa: BLE001 — the book's description still counts
+            errors.append(f"library: {str(exc)[:200]}")
+            return books
+        passages = read.get("passages") or []
+        if passages:
+            books[0]["cite"] = passages[0]["cite"]
+            books[0]["passage"] = "\n\n".join(
+                f"({p['cite']}) {p['text']}" for p in passages
+            )[: library.RESEARCH_PASSAGE_CHARS]
+        elif read.get("error"):
+            errors.append(f"library: {read['error']}")
+        return books
 
     @activity.defn
     async def research_read(self, urls: list[str]) -> dict:
@@ -100,7 +157,11 @@ class ResearchActivities:
         nothing found, no model, a failed call — and the flow saves only a True
         one, so an apology is never stored as research (#508)."""
         sources = rs.build_sources(
-            pages, gathered.get("papers") or [], gathered.get("web") or [], gathered.get("kg") or []
+            pages,
+            gathered.get("papers") or [],
+            gathered.get("web") or [],
+            gathered.get("kg") or [],
+            books=gathered.get("books") or [],
         )
         public = rs.public_sources(sources)
         if not sources:

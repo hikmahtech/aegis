@@ -1814,6 +1814,61 @@ Deleting anything is a separate, explicit decision.
    Removing the Miniflux stack itself (Portainer, stack `miniflux`) is a
    separate call.
 
+## The Calibre library (Raphael)
+
+Raphael reads your Calibre library through calibre-web's OPDS catalogue (#510):
+`library_search`, `library_book`, `library_read` and `library_suggest`, and
+`ResearchFlow` quotes a passage from the closest book when one speaks to the
+question. **Calibre is the record; the knowledge store is only an index of it**
+— one `source_type='book'` row per book (title, authors, tags, description),
+never the text. A book's text is read on demand, bounded, cited and not stored:
+arXiv PDFs were 93% of the corpus's chunks and 78 of 10,284 were ever used, so
+bulk text is exactly what not to index.
+
+- **Code:** `connectors/calibre.py` (the OPDS client), `services/library.py`
+  (everything the tools and flows share: EPUB chapters and PDF pages, passage
+  search, the index row), `services/tools/library.py`, and the worker's
+  `CalibreActivities` + `CalibreSyncFlow`.
+- **Never the public host.** `calibre.hikmahtech.in` is behind Cloudflare
+  Access: every path, `/opds` included, 302s to a login page — the trap that
+  broke Miniflux (#70). The connector refuses that host and treats any redirect
+  as an error. Use the internal address `http://calibre-web_calibre-web:8083`:
+  aegis-core and the worker both sit on the `traefik_public` overlay with
+  calibre-web.
+- **Reading:** EPUB is read by chapter (the book's own table of contents names
+  them), PDF by page (at most 30 pages a read; a query scans the first 150, or
+  the first 60 inside research). MOBI and AZW3 cannot be read. Files over 80 MB
+  are refused.
+- **The index:** `CalibreSyncFlow` runs daily at 03:41 UTC (`calibre-sync-daily`).
+  It adds new books, re-embeds a book only when its metadata changed (a
+  fingerprint in the row's metadata), and removes the row of a book that left
+  Calibre, naming it in the run summary — unless the catalogue came back less
+  than half the size of the index, which it refuses to trust
+  (`removal_withheld`).
+
+### Setting it up
+
+1. In calibre-web (Admin → Users → Add new user), create a user for AEGIS:
+   allow **download**; do not allow upload, edit, delete or admin. Basic auth
+   and OPDS are on by default.
+2. On AEGIS's Integrations page, group **Calibre (library)**: set the user and
+   password, and leave the URL at the internal default. Core uses the new
+   values at once; restart the worker for `CalibreSyncFlow`.
+3. Grant Raphael the four tools. The DB `tool_set` wins over the seed:
+
+   ```sql
+   UPDATE agents SET metadata = jsonb_set(metadata, '{tool_set}',
+     (metadata->'tool_set') || '["library_search","library_book","library_read","library_suggest"]'::jsonb)
+   WHERE id = 'raphael' AND NOT (metadata->'tool_set' ? 'library_search');
+   ```
+4. Build the index once without waiting for 03:41: trigger the
+   `calibre-sync-daily` schedule (Temporal UI, or `temporal schedule trigger
+   --schedule-id calibre-sync-daily`). The summary reports `books`, `added`,
+   `updated`, `unchanged` and `failed`.
+
+Until step 2 the tools answer "not configured" and the flow reports
+`not_configured`; both are the intended inert state.
+
 ## Troubleshooting
 
 | Symptom | Cause |

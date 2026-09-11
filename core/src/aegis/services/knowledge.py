@@ -185,6 +185,17 @@ class KnowledgeStore:
         )
         return {"content_id": content_id, "status": "ok", "chunks_total": len(chunks)}
 
+    async def delete_content(self, content_id: str) -> bool:
+        """Remove one document; its chunks go with it (ON DELETE CASCADE).
+
+        Only for an index whose record lives elsewhere — a book that left
+        Calibre (#510). True when a row was removed.
+        """
+        result = await self._pool.execute(
+            "DELETE FROM knowledge_content WHERE content_id = $1", content_id
+        )
+        return str(result).endswith(" 1")
+
     # --- Read ---
 
     async def search(

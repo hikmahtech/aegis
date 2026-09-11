@@ -61,6 +61,20 @@ CONFIG_REGISTRY: list[ConfigKey] = [
     ConfigKey("elevenlabs_api_key", "API key", "Voice (ElevenLabs)", True),
     ConfigKey("raindrop_api_token", "API token", "Raindrop", True),
     ConfigKey(
+        "calibre_url", "calibre-web URL (internal)", "Calibre (library)", False,
+        help="Default http://calibre-web_calibre-web:8083, the internal swarm address. "
+        "Never the public calibre host: Cloudflare Access answers every path there with "
+        "a login redirect, and AEGIS refuses it. Core applies a change on save; "
+        "CalibreSyncFlow (the worker) on restart.",
+    ),
+    ConfigKey(
+        "calibre_user", "calibre-web user", "Calibre (library)", False,
+        help="A dedicated read-only calibre-web user for AEGIS: download allowed, no "
+        "upload, edit or delete. Blank = the library tools say not configured and "
+        "CalibreSyncFlow reports not_configured.",
+    ),
+    ConfigKey("calibre_password", "calibre-web password", "Calibre (library)", True),
+    ConfigKey(
         "jira_base_url", "Site URL (https://yours.atlassian.net)", "Jira", False,
         help="JiraSyncFlow closes a Todoist task once its issue has a resolution. "
         "It exists because Jira sends NO notification for a transition you make "

@@ -21,6 +21,7 @@ from aegis.llm import parse_llm_json
 from aegis.llm.tier import resolve_model_for_agent, tier_to_model, tier_to_model_or
 from aegis.mcp_manager import MCPError
 from aegis.observability import log_audit, record_llm_call, record_tool_call
+from aegis.services.library import LIBRARY_READ_TIMEOUT_S
 from aegis.services.research import FETCH_TOOL_TIMEOUT_S, RESEARCH_TOOL_TIMEOUT_S
 from aegis.services.source_types import DEFAULT_DECAY_DAYS, get_decay_days
 from aegis.services.tools.base import (
@@ -89,6 +90,12 @@ from aegis.services.tools.ledger import (  # noqa: F401 — re-export: imported 
     _exec_ledger_post,
     _exec_ledger_query,
     _exec_ledger_reclassify,
+)
+from aegis.services.tools.library import (
+    _exec_library_book,
+    _exec_library_read,
+    _exec_library_search,
+    _exec_library_suggest,
 )
 from aegis.services.tools.registry import TOOL_REGISTRY
 from aegis.services.tools.research import (  # noqa: F401 — re-export: imported from here by tests
@@ -492,6 +499,11 @@ CHAT_TOOLS = [
     _registry_schema("list_feeds"),
     _registry_schema("subscribe_feed"),
     _registry_schema("unsubscribe_feed"),
+    # The Calibre library (#510), generated from services/tools/library.py.
+    _registry_schema("library_search"),
+    _registry_schema("library_book"),
+    _registry_schema("library_read"),
+    _registry_schema("library_suggest"),
     {
         "type": "function",
         "function": {
@@ -1443,6 +1455,12 @@ _TOOL_TIMEOUT_OVERRIDES: dict[str, int] = {
     "paper_read": FETCH_TOOL_TIMEOUT_S,
     # subscribe_feed fetches the URL to check it is a feed (#511).
     "subscribe_feed": FETCH_TOOL_TIMEOUT_S,
+    # The library tools reach calibre-web; a read downloads one book and
+    # extracts it, which a long PDF can stretch well past a minute (#510).
+    "library_search": FETCH_TOOL_TIMEOUT_S,
+    "library_book": FETCH_TOOL_TIMEOUT_S,
+    "library_read": LIBRARY_READ_TIMEOUT_S,
+    "library_suggest": FETCH_TOOL_TIMEOUT_S,
 }
 
 
@@ -3050,6 +3068,10 @@ TOOL_EXECUTORS: dict[str, Any] = {
     "list_feeds": _exec_list_feeds,
     "subscribe_feed": _exec_follow_feed,
     "unsubscribe_feed": _exec_unsubscribe_feed,
+    "library_search": _exec_library_search,
+    "library_book": _exec_library_book,
+    "library_read": _exec_library_read,
+    "library_suggest": _exec_library_suggest,
     "configure_triage": _exec_configure_triage,
     "update_runbook": _exec_update_runbook,
     "list_nodes": _exec_list_nodes,
@@ -3160,6 +3182,11 @@ AGENT_TOOL_SETS: dict[str, set[str]] = {
         "list_feeds",
         "subscribe_feed",
         "unsubscribe_feed",
+        # The Calibre library (#510): search it, read from it, suggest books.
+        "library_search",
+        "library_book",
+        "library_read",
+        "library_suggest",
         "track_topic",
         "remember_this",
         # Problem hub, the session registry: read a task's context, register

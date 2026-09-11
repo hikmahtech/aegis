@@ -300,6 +300,14 @@ class Settings(BaseSettings):
     content_extraction_enabled: bool = True
     raindrop_api_token: str = ""
 
+    # Calibre library (#510). The internal swarm address by default — never the
+    # public host, which is behind Cloudflare Access (a login redirect on every
+    # path). User and password blank = the library tools say "not configured"
+    # and CalibreSyncFlow reports not_configured. DB-first via Integrations.
+    calibre_url: str = "http://calibre-web_calibre-web:8083"
+    calibre_user: str = ""
+    calibre_password: str = ""
+
     # Jira (JiraSyncFlow). Any of the three blank = the flow reports
     # `not_configured` and issues no request. Basic auth: the Atlassian ACCOUNT
     # EMAIL plus an API token from id.atlassian.com/manage-profile/security/
