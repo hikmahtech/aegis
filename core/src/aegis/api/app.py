@@ -299,6 +299,7 @@ def create_app(run_lifespan: bool = True, settings: Settings | None = None) -> F
         problems_admin,
         references,
         resources,
+        runbooks_admin,
         settings,
         slack,
         social_auth,
@@ -387,6 +388,7 @@ def create_app(run_lifespan: bool = True, settings: Settings | None = None) -> F
     app.include_router(people_admin.router)
     app.include_router(expiring_items_admin.router)
     app.include_router(assets_admin.router)
+    app.include_router(runbooks_admin.router)
     app.include_router(todoist.router)
     app.include_router(task_sessions.router)
 
