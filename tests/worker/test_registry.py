@@ -381,9 +381,12 @@ def test_books_write_flow_is_gated_on_money_hygiene():
         # the existing AlertActivities (was this problem restarted inside the
         # window?), a step of AlertInvestigationFlow. Unflagged, so all three
         # rows move.
-        (True, True, 45, 226),
-        (False, False, 35, 193),
-        (True, False, 39, 209),
+        # Then +1 activity and NO new flow from #508: `load_tracked_topics` on
+        # the existing IntelligenceActivities (the topics `track_topic` saves),
+        # a step of IntelligenceScanFlow. Unflagged, so all three rows move.
+        (True, True, 45, 227),
+        (False, False, 35, 194),
+        (True, False, 39, 210),
     ],
 )
 def test_real_registration_passes_the_boot_check(homelab, money, flows, activities):

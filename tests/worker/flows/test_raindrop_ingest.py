@@ -284,3 +284,37 @@ async def test_raindrop_content_failure_still_advances():
     assert result["todoist_committed"] == 0
     assert result["outbox_staged"] == 0
     assert result["capture_failed"] == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("poll_status", "expected"),
+    [("ok", "no_new_bookmarks"), ("not_configured", "not_configured")],
+)
+async def test_raindrop_says_why_a_poll_found_nothing(poll_status, expected):
+    """#508: 360 runs of a bare `bookmarks: 0` could not tell a missing token
+    from a quiet account. An empty run now says which."""
+    _reset()
+
+    @activity.defn(name="poll_bookmarks")
+    async def empty_poll(inp: PollBookmarksInput) -> PollBookmarksResult:
+        return PollBookmarksResult(status=poll_status)
+
+    async with (
+        await WorkflowEnvironment.start_time_skipping() as env,
+        Worker(
+            env.client,
+            task_queue="tq",
+            workflows=[RaindropIngestFlow],
+            activities=[stub_list, empty_poll, stub_idem, stub_content, stub_cursor, stub_capture],
+        ),
+    ):
+        result = await env.client.execute_workflow(
+            RaindropIngestFlow.run,
+            RaindropIngestInput(),
+            id=f"r-empty-{poll_status}",
+            task_queue="tq",
+        )
+    assert result["bookmarks"] == 0
+    assert result["status"] == expected
+    assert _calls["cursor"] == []  # nothing fetched, cursor untouched

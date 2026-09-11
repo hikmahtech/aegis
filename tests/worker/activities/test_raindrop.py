@@ -138,6 +138,8 @@ async def test_poll_with_empty_token_returns_empty():
     )
     assert result.bookmarks == []
     assert result.latest_created is None
+    # #508: an empty poll says it had no token, rather than reading as "nothing new".
+    assert result.status == "not_configured"
 
 
 @pytest.mark.asyncio

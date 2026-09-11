@@ -64,7 +64,12 @@ async def stub_capture(
     return f"task-{external_id}"
 
 
-ALL_STUBS = [stub_search, stub_dedup, stub_score, stub_ingest, stub_capture]
+@activity.defn(name="load_tracked_topics")
+async def stub_tracked() -> list[str]:
+    return []
+
+
+ALL_STUBS = [stub_search, stub_dedup, stub_score, stub_ingest, stub_capture, stub_tracked]
 
 
 def _reset():
@@ -145,7 +150,14 @@ async def test_scan_degrades_when_score_fails():
             env.client,
             task_queue="tq",
             workflows=[IntelligenceScanFlow],
-            activities=[stub_search, stub_dedup, failing_score, stub_ingest, stub_capture],
+            activities=[
+                stub_search,
+                stub_dedup,
+                failing_score,
+                stub_ingest,
+                stub_capture,
+                stub_tracked,
+            ],
         ),
     ):
         # Must NOT raise — the workflow completes (degraded) rather than failing.
@@ -192,7 +204,14 @@ async def test_scan_degrades_when_dedup_fails_and_still_ingests():
             env.client,
             task_queue="tq",
             workflows=[IntelligenceScanFlow],
-            activities=[stub_search, failing_dedup, stub_score, stub_ingest, stub_capture],
+            activities=[
+                stub_search,
+                failing_dedup,
+                stub_score,
+                stub_ingest,
+                stub_capture,
+                stub_tracked,
+            ],
         ),
     ):
         # Must NOT raise — the workflow completes (degraded) rather than failing.
@@ -237,7 +256,14 @@ async def test_scan_surfaces_partial_search_degradation():
             env.client,
             task_queue="tq",
             workflows=[IntelligenceScanFlow],
-            activities=[partial_search, stub_dedup, stub_score, stub_ingest, stub_capture],
+            activities=[
+                partial_search,
+                stub_dedup,
+                stub_score,
+                stub_ingest,
+                stub_capture,
+                stub_tracked,
+            ],
         ),
     ):
         result = await env.client.execute_workflow(
@@ -270,7 +296,7 @@ async def test_scan_all_deduped():
             env.client,
             task_queue="tq",
             workflows=[IntelligenceScanFlow],
-            activities=[stub_search, empty_dedup, stub_score, stub_ingest],
+            activities=[stub_search, empty_dedup, stub_score, stub_ingest, stub_tracked],
         ),
     ):
         result = await env.client.execute_workflow(
@@ -282,3 +308,117 @@ async def test_scan_all_deduped():
     assert result["raw"] == 3
     assert result["novel"] == 0
     assert result["ingested"] == 0
+
+
+# --------------------------------------------------------------------------
+# #508 — topics tracked from chat reach the search.
+# --------------------------------------------------------------------------
+
+
+async def _run_with(activities: list, inp: IntelligenceScanInput, wf_id: str) -> dict:
+    async with (
+        await WorkflowEnvironment.start_time_skipping() as env,
+        Worker(
+            env.client,
+            task_queue="tq",
+            workflows=[IntelligenceScanFlow],
+            activities=activities,
+        ),
+    ):
+        return await env.client.execute_workflow(
+            IntelligenceScanFlow.run, inp, id=wf_id, task_queue="tq"
+        )
+
+
+def _recording_search(searched: list):
+    @activity.defn(name="search_source")
+    async def recording_search(inp: SearchSourceInput) -> SearchSourceResult:
+        searched.append(list(inp.topics))
+        return SearchSourceResult(source=inp.source, items=[])
+
+    return recording_search
+
+
+@pytest.mark.asyncio
+async def test_scan_searches_topics_tracked_from_chat():
+    """A tracked topic is searched after the configured ones; one already
+    configured (in any case) is not searched twice."""
+    _reset()
+    searched: list = []
+
+    @activity.defn(name="load_tracked_topics")
+    async def tracked() -> list[str]:
+        return ["bitcoin", "AI", "ethereum"]
+
+    result = await _run_with(
+        [_recording_search(searched), tracked, stub_dedup, stub_score, stub_ingest, stub_capture],
+        IntelligenceScanInput(source="hn", topics=["ai", "rust"]),
+        "is-tracked",
+    )
+    assert searched == [["ai", "rust", "bitcoin", "ethereum"]]
+    assert result["tracked_topics"] == 2
+
+
+@pytest.mark.asyncio
+async def test_scan_runs_on_tracked_topics_alone():
+    """A scan row with no configured topics still searches the tracked ones."""
+    _reset()
+    searched: list = []
+
+    @activity.defn(name="load_tracked_topics")
+    async def tracked() -> list[str]:
+        return ["bitcoin"]
+
+    result = await _run_with(
+        [_recording_search(searched), tracked, stub_dedup, stub_score, stub_ingest, stub_capture],
+        IntelligenceScanInput(source="news", topics=[]),
+        "is-tracked-only",
+    )
+    assert searched == [["bitcoin"]]
+    assert result["tracked_topics"] == 1
+
+
+@pytest.mark.asyncio
+async def test_scan_keeps_its_configured_topics_when_the_tracked_read_fails():
+    """A failed read of the tracked topics is not a failed scan."""
+    _reset()
+    searched: list = []
+
+    @activity.defn(name="load_tracked_topics")
+    async def failing_tracked() -> list[str]:
+        raise RuntimeError("settings read failed")
+
+    result = await _run_with(
+        [
+            _recording_search(searched),
+            failing_tracked,
+            stub_dedup,
+            stub_score,
+            stub_ingest,
+            stub_capture,
+        ],
+        IntelligenceScanInput(source="hn", topics=["ai"]),
+        "is-tracked-degraded",
+    )
+    assert searched == [["ai"]]
+    assert result["tracked_topics_degraded"] is True
+    assert "tracked_topics" not in result
+
+
+@pytest.mark.asyncio
+async def test_scan_reports_items_read_from_their_page():
+    """`fetched` rides from the ingest activity into the run summary."""
+    _reset()
+
+    @activity.defn(name="ingest_intelligence")
+    async def fetching_ingest(items: list[dict]) -> dict:
+        return {"ingested": len(items), "fetched": len(items), "skipped_no_text": 0}
+
+    result = await _run_with(
+        [stub_search, stub_dedup, stub_score, fetching_ingest, stub_capture, stub_tracked],
+        IntelligenceScanInput(source="news", topics=["world"], significance_threshold=4),
+        "is-fetched",
+    )
+    assert result["ingested"] == 1
+    assert result["fetched"] == 1
+    assert "skipped_no_text" not in result  # zeros are omitted
