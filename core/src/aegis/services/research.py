@@ -511,11 +511,17 @@ async def paper_read(
 
 
 def build_sources(
-    pages: list[dict], papers: list[dict], web: list[dict], kg: list[dict], cap: int = 30
+    pages: list[dict],
+    papers: list[dict],
+    web: list[dict],
+    kg: list[dict],
+    cap: int = 30,
+    books: list[dict] | None = None,
 ) -> list[dict]:
     """The numbered source list the answer cites. Pages actually read come
-    first (the strongest evidence), then papers, search snippets, and what the
-    knowledge store already held. One number per URL."""
+    first (the strongest evidence), then books from the Calibre library (#510;
+    a passage when one was read, else the book's description), papers, search
+    snippets, and what the knowledge store already held. One number per URL."""
     out: list[dict] = []
     seen: set[str] = set()
 
@@ -538,6 +544,13 @@ def build_sources(
 
     for p in pages:
         add("page", p.get("title"), p.get("url"), str(p.get("text") or "")[:PAGE_CHARS])
+    for b in books or []:
+        add(
+            "book",
+            b.get("cite") or b.get("title"),
+            b.get("url"),
+            str(b.get("passage") or b.get("summary") or "")[:PAGE_CHARS],
+        )
     for p in papers:
         add("paper", p.get("title"), p.get("url"), p.get("abstract"))
     for r in web:
@@ -550,7 +563,7 @@ def build_sources(
 def synthesis_prompt(question: str, context: str, sources: list[dict]) -> str:
     blocks = "\n\n".join(
         f"[{s['n']}] {s['title']}"
-        + (f" <{s['url']}>" if s["url"] and not s["url"].startswith("aegis://") else "")
+        + (f" <{s['url']}>" if s["url"].startswith("http") else "")
         + f" ({s['kind']})\n{s['text']}"
         for s in sources
     )
@@ -578,7 +591,9 @@ def render_report(answer: str, sources: list[dict], *, limit_chars: int = REPORT
         lines += ["", "Sources:"]
         for s in listed[:20]:
             url = s.get("url") or ""
-            shown = "" if url.startswith("aegis://") else url
+            # Only a public link is shown: an aegis:// or calibre:// key means
+            # nothing to a reader (#510).
+            shown = url if url.startswith("http") else ""
             lines.append(f"[{s['n']}] {s['title']}" + (f" — {shown}" if shown else ""))
     text = "\n".join(lines)
     return text if len(text) <= limit_chars else text[: limit_chars - 2] + " …"

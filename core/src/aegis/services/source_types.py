@@ -131,6 +131,13 @@ SOURCE_TYPES: dict[str, SourceTypeInfo] = {
         "one brevity note — written by MeetingNotesFlow from the user's own "
         "transcript lines (worker activities/meeting.py)"
     ),
+    # A book's metadata does not go stale the way news does, and its row is
+    # only rewritten when the book changes — so it barely decays.
+    "book": SourceTypeInfo(
+        "One row per Calibre book — title, authors, tags, description, never the "
+        "text — kept in step with the library by CalibreSyncFlow (#510)",
+        decay_days=3650,
+    ),
 }
 
 

@@ -441,6 +441,126 @@
   {
     "type": "function",
     "function": {
+      "name": "library_search",
+      "description": "Search the Calibre book library by title, author, tag or subject. Returns each book's id (for library_book and library_read), title, authors, tags, formats and a short description.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "query": {
+            "type": "string",
+            "description": "Words from a title, an author, a tag or the subject. Blank lists the newest books.",
+            "default": ""
+          },
+          "author": {
+            "type": "string",
+            "description": "Only books by an author whose name contains this.",
+            "default": ""
+          },
+          "tag": {
+            "type": "string",
+            "description": "Only books with a tag containing this, e.g. machine-learning.",
+            "default": ""
+          },
+          "limit": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 25,
+            "description": "How many books (1-25).",
+            "default": 10
+          }
+        }
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "library_book",
+      "description": "One book from the Calibre library: its metadata, full description and formats, and for an EPUB its table of contents.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "book_id": {
+            "type": "integer",
+            "description": "The book's id, from library_search or library_suggest."
+          }
+        },
+        "required": [
+          "book_id"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "library_read",
+      "description": "Read from a book in the Calibre library. Give a query to get the passages that best match it, a section (chapter number or title) for an EPUB, or pages (e.g. 12-18) for a PDF; with none of these it returns the opening. Every result names the book and chapter or pages to cite. Nothing is saved.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "book_id": {
+            "type": "integer",
+            "description": "The book's id, from library_search or library_suggest."
+          },
+          "section": {
+            "type": "string",
+            "description": "EPUB only: a chapter number or part of its title.",
+            "default": ""
+          },
+          "pages": {
+            "type": "string",
+            "description": "PDF only: a page or a range, e.g. 12-18 (at most 30 pages).",
+            "default": ""
+          },
+          "query": {
+            "type": "string",
+            "description": "Return the passages that best match this instead of a whole section.",
+            "default": ""
+          },
+          "max_chars": {
+            "type": "integer",
+            "minimum": 1000,
+            "maximum": 40000,
+            "description": "The most characters of text to return (1000-40000).",
+            "default": 12000
+          }
+        },
+        "required": [
+          "book_id"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "library_suggest",
+      "description": "Suggest books from the Calibre library for a topic, best match first.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "topic": {
+            "type": "string",
+            "description": "What the books should be about."
+          },
+          "limit": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 15,
+            "description": "How many books (1-15).",
+            "default": 5
+          }
+        },
+        "required": [
+          "topic"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
       "name": "configure_triage",
       "description": "Read or update triage configuration: ignored Sentry projects, ignored email domains, notification mode, burst threshold.",
       "parameters": {

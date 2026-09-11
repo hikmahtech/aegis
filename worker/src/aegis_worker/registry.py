@@ -53,6 +53,7 @@ from aegis_worker.flows.agent_task import (
 from aegis_worker.flows.alert_investigation import AlertInvestigationFlow
 from aegis_worker.flows.books_write import BooksWriteFlow
 from aegis_worker.flows.calendar_ingest import CalendarIngestFlow, CalendarIngestInput
+from aegis_worker.flows.calibre_sync import CalibreSyncConfig, CalibreSyncFlow
 from aegis_worker.flows.cert_radar import CertRadarConfig, CertRadarFlow
 from aegis_worker.flows.clarify import ClarifyConfig, ClarifyFlow
 from aegis_worker.flows.cleanup import CleanupConfig, CleanupFlow
@@ -286,6 +287,12 @@ FLOWS: tuple[FlowSpec, ...] = (
     # derived from the question, and as a child of AgentTaskFlow's `research`
     # verb. No schedule config and no activities.yaml row.
     FlowSpec(ResearchFlow),
+    # The Calibre library index (#510): one metadata row per book, daily.
+    # Inert (reports not_configured) until Integrations has a calibre-web user.
+    FlowSpec(
+        CalibreSyncFlow,
+        lambda act: CalibreSyncConfig(agent_id=act["agent_id"]),
+    ),
     FlowSpec(
         RssIngestFlow,
         lambda act: RssIngestInput(agent_id=act["agent_id"]),

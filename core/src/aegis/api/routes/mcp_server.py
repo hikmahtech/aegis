@@ -257,6 +257,12 @@ _READ_ONLY_TOOLS = frozenset(
         "get_market_overview",
         "get_quote",
         "last_contact_with_person",
+        # The Calibre library (#510): search, one book, a read, suggestions —
+        # read from calibre-web and returned, never stored.
+        "library_book",
+        "library_read",
+        "library_search",
+        "library_suggest",
         # The feed list and what each feed is worth (#511). Not the two
         # feed writers: subscribing and unsubscribing change what is polled.
         "list_feeds",
