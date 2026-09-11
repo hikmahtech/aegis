@@ -212,7 +212,8 @@ CONFIG_REGISTRY: list[ConfigKey] = [
     ConfigKey(
         "books_todoist_projects", "Todoist projects for dues (personal=<id>,hikmah=<id>)",
         "Books", False,
-        help="Bills and failed payments become dated tasks here. Unset = the Inbox.",
+        help="Bills and failed payments become dated tasks here, and Maou's money problem "
+        "tasks (#money) go to the personal project. Unset = the Inbox.",
     ),
 ]
 _BY_KEY = {c.key: c for c in CONFIG_REGISTRY}
