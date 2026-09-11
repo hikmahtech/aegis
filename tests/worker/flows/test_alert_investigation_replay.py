@@ -91,6 +91,24 @@ async def test_an_open_card_for_a_verdict_with_nothing_to_decide():
     await _replays(history)
 
 
+async def test_an_answered_card_for_commands_on_an_inconclusive_verdict():
+    """#518 made commands on a verdict that is not actionable a no-card case
+    too, under the same `gate2-only-for-decisions` guard. The old flow
+    carded this one with Run fix."""
+    h.reset()
+    h.S.run_investigation = {
+        **h.S.run_investigation,
+        "output": "Unclear.\n\nPROPOSED_COMMANDS:\n- docker service ps shop_web\n",
+    }
+    h.S.verdict = {**h.S.verdict, "status": "inconclusive"}
+    alert = h.app_alert(
+        title="Host out of memory", source="alertmanager", labels={"alertname": "HostOutOfMemory"}
+    )
+    history = await _record(AlertInvestigationFlowPre500, alert)
+    assert len(h.S.cards) == 1 and "run_fix" in h.S.cards[0].options
+    await _replays(history)
+
+
 async def test_a_second_automatic_restart():
     """The old flow restarts whatever happened before; the new one would
     look the problem up first. The recorded restart must win."""
@@ -129,12 +147,21 @@ async def test_a_restart_that_did_not_recover_then_a_card():
 
 @pytest.mark.parametrize(
     "scenario",
-    ["no_card", "restart_repeat", "first_restart"],
+    ["no_card", "no_card_with_commands", "restart_repeat", "first_restart"],
 )
 async def test_the_new_flow_replays_its_own_histories(scenario):
     h.reset()
     if scenario == "no_card":
         alert = h.app_alert()
+    elif scenario == "no_card_with_commands":
+        h.S.run_investigation = {
+            **h.S.run_investigation,
+            "output": "Unclear.\n\nPROPOSED_COMMANDS:\n- docker service ps shop_web\n",
+        }
+        h.S.verdict = {**h.S.verdict, "status": "inconclusive"}
+        alert = h.app_alert(
+            title="Host out of memory", source="alertmanager", labels={"alertname": "HostOutOfMemory"}
+        )
     else:
         alert = h.service_down_alert()
         if scenario == "restart_repeat":

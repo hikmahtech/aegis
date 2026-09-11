@@ -23,9 +23,10 @@ Pipeline:
 7.   Assessment → structured verdict (actionable / not_actionable /
      inconclusive / self_resolved)
 7.5. Gate 2 card (Open PR / Run fix / Mute 24h / Acknowledge / Discard),
-     only when there is a decision (#500): a fix branch, proposed commands,
-     an escalating alert, or a restart that did not stick. Escalating alerts
-     race the card against the hub seeing the problem resolve
+     only when there is a decision (#500): a fix branch, an actionable
+     verdict's proposed commands (#518), an escalating alert, or a restart
+     that did not stick. Escalating alerts race the card against the hub
+     seeing the problem resolve
 8.5. Post the final report on the task via `AlertActivities.post_task_note`
 9.   Notify via chat (links to the Todoist task)
 10.  Record the outcome on the problem (`record_investigation`)
@@ -96,19 +97,38 @@ def _safe_workflow_id_segment(text: str, max_len: int = 60) -> str:
 
 
 def gate2_needs_decision(
-    *, branches: dict, proposed_cmds: list[str], escalate: bool, restart_repeat: bool
+    *,
+    branches: dict,
+    proposed_cmds: list[str],
+    escalate: bool,
+    restart_repeat: bool,
+    verdict_status: str,
 ) -> bool:
     """Whether a verdict earns a Gate-2 card (#500). Only when the card itself
-    can do something: open a fix PR, run proposed commands, take the ack an
-    escalating alert nags for, or hand over a restart that did not stick
-    (#501). A card with only Mute and Acknowledge asks nothing: in the two
-    weeks before this rule, 27 of the 38 answered verdict cards were a bare
-    `ack`.
+    can do something: open a fix PR, take the ack an escalating alert nags
+    for, hand over a restart that did not stick (#501), or run the proposed
+    commands of an actionable verdict (#518). A card with only Mute and
+    Acknowledge asks nothing: in the two weeks before this rule, 27 of the 38
+    answered verdict cards were a bare `ack`.
 
-    The verdict status is deliberately not an input. `actionable` with no
-    branch and no commands is work for a person, but nothing a card can
-    approve, so it lives on the task like the rest."""
-    return bool(branches) or bool(proposed_cmds) or escalate or restart_repeat
+    "Actionable" is `verdict_status == "actionable"` as Step 7a leaves it (a
+    fix branch promotes an inconclusive or not_actionable verdict to
+    actionable), which is the status the card's head renders as
+    "Investigation — actionable". The 14-day replay in #516 classified past
+    cards by that head: 36 of 68 would have been sent.
+
+    Commands count only on an actionable verdict. On an `inconclusive` one
+    they are a guess, and on a `not_actionable` one they contradict the
+    verdict; in those two weeks 22 such cards drew 17 bare acks and one Run
+    fix. The flow puts them on the task comment instead, for a person to run
+    by hand. Without commands the status earns nothing: `actionable` with no
+    branch is work for a person, but nothing a card can approve."""
+    return (
+        bool(branches)
+        or escalate
+        or restart_repeat
+        or (bool(proposed_cmds) and verdict_status == "actionable")
+    )
 
 
 def _task_line(t: dict) -> str:
@@ -1180,10 +1200,12 @@ class AlertInvestigationFlow:
 
         # ── Step 7.5: Gate 2 — post-verdict decision gate ──
         # A card only when there is a decision (#500): a fix branch to open,
-        # proposed commands to run, an escalating alert that nags until acked,
-        # or a restart that did not stick (#501). See `gate2_needs_decision`.
+        # an actionable verdict's proposed commands to run (#518), an
+        # escalating alert that nags until acked, or a restart that did not
+        # stick (#501). See `gate2_needs_decision`.
         # Anything else is told rather than asked: the verdict comment on the
-        # task (Step 8.5), the problem's timeline (Step 10) and the chat ping
+        # task (Step 8.5, with any proposed commands, not run), the problem's
+        # timeline (Step 10) and the chat ping
         # (Step 9) — what an `ack` used to lead to, without the ack. Before
         # #500 every non-Jira, non-resolved verdict got a card (2026-05-22,
         # when chat had no verdict at all), and 27 of 38 answers were a bare
@@ -1211,7 +1233,11 @@ class AlertInvestigationFlow:
             extract_proposed_commands(investigation_output) if _is_infra else []
         )
         # Asked only when the answer can change something, so a run that does
-        # carry a decision replays exactly as it did before the patch.
+        # carry a decision replays exactly as it did before the patch. #518's
+        # stricter rule (commands only on an actionable verdict) sits under
+        # the same id: it only skips more cards, and the guard is asked
+        # exactly where one is skipped, so a history without the marker still
+        # takes the card path it recorded.
         no_decision_card = (
             not gate_skipped
             and not gate2_needs_decision(
@@ -1219,6 +1245,7 @@ class AlertInvestigationFlow:
                 proposed_cmds=proposed_cmds,
                 escalate=_escalate,
                 restart_repeat=restart_repeat is not None,
+                verdict_status=verdict_status,
             )
             and workflow.patched(_PATCH_NO_CARD)
         )
@@ -1749,6 +1776,14 @@ class AlertInvestigationFlow:
             if kimi_attachment_name:
                 final_msg = f"{final_msg}\n\n📎 Transcript: {kimi_attachment_name}"
             if no_decision_card:
+                if proposed_cmds:
+                    # Carded only on an actionable verdict (#518); here they
+                    # are a suggestion, kept where a person can still use it.
+                    cmd_lines = "\n".join(f"  - {c}" for c in proposed_cmds)
+                    final_msg += (
+                        "\n\nThe investigation proposed these commands. I have not "
+                        f"run them; run them by hand if you agree:\n{cmd_lines}"
+                    )
                 final_msg += (
                     "\n\nNothing here needs your decision, so I sent no card. "
                     "If it keeps coming back, mute it on the Problems page."
