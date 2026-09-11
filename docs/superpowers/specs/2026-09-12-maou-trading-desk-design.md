@@ -44,6 +44,10 @@ score. Also a monthly report section and hub problems.
 - Live orders on Zerodha Kite (§15 lists the seams this design leaves for it).
 - The owner's investment plan: monthly amount, emergency fund, the long-term SIP core.
 - Holdings from the CDSL eCAS.
+- Grading and explaining decisions. The owner decided on 2026-09-12 that the pipeline closes each
+  decision and records its outcome, and ansaar-data serves both. A separate AEGIS lane writes a
+  post-mortem on each losing decision and a weekly review that files improvements as pipeline
+  issues. That lane uses the model; the desk does neither.
 - Crypto: turned off by config (India taxes it at 30% with 1% TDS on each sale and no loss
   set-off, and its model was retrained on 2026-09-10 and has not been re-verified).
 
@@ -64,8 +68,13 @@ One idempotent activity does the steps below in order. Running it twice in a day
    `ON CONFLICT DO NOTHING`. A copy is never updated, so the record stays as it was served even if
    the pipeline later rewrites its history. The copy is made whatever the checks later decide.
 3. **Prices.** Fetch recent daily bars from Yahoo for every held symbol, every symbol in the
-   copied decisions, and both benchmarks. Upsert them into `finance.desk_prices`. Raw closes never
-   change; an upsert only refreshes `adjclose` after a later dividend.
+   copied decisions, every symbol with a pending order, and both benchmarks. Store them in
+   `finance.desk_prices`. A stored close is **never overwritten**, because Yahoo rewrites past
+   closes after a split: RELIANCE's 2024 bonus shows as about ₹1,338 for days that traded at about
+   ₹2,677. So the first fetch of a day, made the morning after it, is the raw price the desk needs,
+   and a later fetch would be split-adjusted. A bar for today or later is never stored, because it
+   could be an intraday price. Split and dividend events are filled in if a later fetch has them
+   and the stored row doesn't.
 4. **Fill.** Fill each pending paper order at the close of its fill day (§6). If that close is not
    out yet, leave the order pending.
 5. **Plan.** If no plan exists yet for that date and no order is pending, run the checks (§5). If
@@ -73,8 +82,12 @@ One idempotent activity does the steps below in order. Running it twice in a day
    whatever the outcome, in the same transaction as its orders, so a date is acted on once.
 6. **Report.** Reconcile the daily problem classes on the hub (§10).
 
-The pipeline writes decisions for weekend dates too (2026-09-06 and 09-07 have rows). The desk only
-ever reads the decisions for the last trading day, so those rows are ignored.
+The pipeline writes decisions for weekend dates too (Saturday 2026-09-05 and Sunday 09-06 have
+rows). The desk only ever reads the decisions for the last trading day, so those rows are ignored.
+
+**Findings are stored with the plan.** A plan row keeps the findings its step produced. A second run
+on the same day re-raises exactly those, instead of re-deriving them. If it re-derived them, a rerun
+after ansaar recovered would resolve a problem that is still true for that day.
 
 ## 4. Sizing orders
 
@@ -164,9 +177,12 @@ response.
 
 - **Start:** the first fill date. Paper capital is `capital` (default ₹1,00,000).
 - **Benchmark:** `SHARIABEES.NS` (the Nifty 50 Shariah ETF), the fair comparison for a halal
-  investor. It's bought with the same capital at the start close, pays one buy cost, and is valued
-  by the ratio of Yahoo's adjusted closes, so dividends count. It trades thinly; a missing close
-  uses the last close on or before that date.
+  investor. It's bought with the same capital at the start close and pays one buy cost. From then
+  on it's held the way the desk holds: its splits adjust the units, and its dividends are paid as
+  cash. It trades thinly; a missing close uses the last close on or before that date.
+- **No adjusted closes anywhere.** Yahoo rescales its adjusted close after every later dividend,
+  so a value stored in September and one fetched in December are in different scales, and their
+  ratio is wrong by the dividend.
 - **Context:** `^NSEI` (Nifty 50) as a price index, shown and never used for a verdict.
 - **Weekly excess:** the desk's weekly return (after costs, before tax) minus SHARIABEES's, measured
   from the last close of one ISO week to the last close of the next.
@@ -223,7 +239,7 @@ map in `hub_project`). A problem resolves itself on the first run that no longer
 
 ## 11. Data
 
-`migrations/044_trading_desk.sql` (renumber if another PR takes 044 first):
+`migrations/045_trading_desk.sql` (renumber if another PR takes 045 first):
 
 ```sql
 CREATE TABLE IF NOT EXISTS finance.desk_decisions (
@@ -248,7 +264,8 @@ CREATE TABLE IF NOT EXISTS finance.desk_plans (
     data_date date PRIMARY KEY,
     mode text NOT NULL,
     outcome text NOT NULL CHECK (outcome IN ('orders', 'no_change', 'held_stale', 'held_suspect')),
-    note text,
+    findings jsonb NOT NULL DEFAULT '[]'::jsonb,
+    skipped jsonb NOT NULL DEFAULT '[]'::jsonb,
     planned_at timestamptz NOT NULL DEFAULT now()
 );
 
@@ -256,6 +273,8 @@ CREATE TABLE IF NOT EXISTS finance.desk_orders (
     id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
     mode text NOT NULL CHECK (mode IN ('paper', 'live')),
     data_date date NOT NULL REFERENCES finance.desk_plans (data_date),
+    seq smallint NOT NULL,
+    created_day date NOT NULL,
     symbol text NOT NULL,
     asset_class text NOT NULL,
     side text NOT NULL CHECK (side IN ('buy', 'sell')),
@@ -278,7 +297,6 @@ CREATE TABLE IF NOT EXISTS finance.desk_prices (
     symbol text NOT NULL,
     date date NOT NULL,
     close numeric,
-    adjclose numeric,
     split_ratio numeric,
     dividend numeric,
     source text NOT NULL,
@@ -286,6 +304,8 @@ CREATE TABLE IF NOT EXISTS finance.desk_prices (
 );
 ```
 
+- **`seq`** is an order's place in its plan: sells first, then buys in rank order. Fills follow it.
+  **`created_day`** is the IST date the order was planned, which is what its fill day counts from.
 - **Derived on read, never stored:** positions, cash, lots, value history, tax. The number of fills
   is small (hundreds a year), and a stored copy would be one more thing to drift.
 - **Symbols:** `desk_prices.symbol` uses Yahoo's form (`<NSE symbol>.NS`, or `^NSEI`). Orders and
@@ -339,7 +359,7 @@ expected_excess_pa: 0.06
 | `worker/src/aegis_worker/registry.py` | One `FlowSpec` |
 | `config/seed/activities.yaml` | The `trading-desk-daily` row (Maou, inactive) |
 | `worker/src/aegis_worker/activities/money.py`, `money_render.py` | Monthly close: the desk section and the warning check |
-| `migrations/044_trading_desk.sql` | §11 |
+| `migrations/045_trading_desk.sql` | §11 |
 | `core/src/aegis/services/integrations_config.py`, `core/src/aegis/config.py` | §12 connection keys |
 | `CLAUDE.md` | One paragraph in the books section describing the lane |
 
