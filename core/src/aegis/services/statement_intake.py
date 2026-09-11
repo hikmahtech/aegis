@@ -65,6 +65,10 @@ class IntakeReport:
     outcomes: list[FileOutcome] = field(default_factory=list)
     stored: int = 0
     skipped_existing: int = 0
+    #: Rows already stored whose narration or `ref` a newer parser read better
+    #: (#428). Separate from `stored` because nothing NEW arrived — reporting
+    #: them together would read as a statement growing rows on a re-read.
+    refreshed: int = 0
 
     @property
     def failures(self) -> list[FileOutcome]:
@@ -100,41 +104,75 @@ def parse_bytes(
     )
 
 
-async def store_rows(pool: Any, statement: ParsedStatement) -> tuple[int, int]:
-    """Persist one statement's rows. Returns (stored, already present).
+async def store_rows(pool: Any, statement: ParsedStatement) -> tuple[int, int, int]:
+    """Persist one statement's rows. Returns (stored, unchanged, refreshed).
 
     `row_id` is a content hash over instrument, date, direction, amount,
-    balance and occurrence index, so `ON CONFLICT DO NOTHING` is the whole
+    balance and occurrence index, so the conflict clause is the whole
     idempotency story: a re-sent statement, an overlapping period, and the same
     file downloaded twice all collapse, while two identical payments on one day
     stay two rows because their occurrence index differs.
 
-    Deliberately DO NOTHING rather than DO UPDATE. A row that is already here
-    may have been matched or posted since — `matched_msgid`, `posted_at`,
-    `skip_reason` — and re-importing the file must not erase that work. The
-    parsed columns cannot have changed anyway: they are what the hash is over,
-    and the two that are not — `fx_currency`/`fx_amount` — are read out of the
-    narration, which is itself in the hash on the card rows that carry them.
+    **`narration` and `ref` are refreshed; nothing else is.** This used to be a
+    flat `DO NOTHING`, on the reasoning that a stored row's parsed columns
+    cannot have changed because they are what the hash is over. That is not
+    true of these two. §8.3 keys a BANK row on its running balance and
+    deliberately not on its narration — a narration-keyed id would hash the
+    same transaction twice across the two Axis layouts — so narration, and the
+    `ref` read out of it, are the parsed columns a better parser CAN change.
+    #428 was exactly that: the FY2024-25 statement's first 23 rows were stored
+    with 16 characters cut off the front and a NULL `ref`, and with `DO NOTHING`
+    the fix could never reach them however many times the file was re-read.
+
+    A card row is unaffected either way: it has no running balance, so
+    `row_id_for` falls back to the narration and a changed one is a different
+    row, never a conflict to refresh.
+
+    What must NOT be touched is the work done to a row since it was stored —
+    `matched_msgid`, `posted_at`, `skip_reason` — which is why this sets two
+    named columns rather than the row. `ref` COALESCEs for the same reason
+    `journal_index.upsert` does: a reference is a fact about the payment, not a
+    verdict about it, so a re-read that cannot find one must not erase what a
+    better parser already did.
+
+    The `WHERE` matters at this size. Without it every intake run would rewrite
+    all ~2,800 stored rows to the values they already hold, twice a day, for
+    nothing but table bloat.
     """
     if not statement.rows:
-        return 0, 0
-    stored = 0
+        return 0, 0, 0
+    stored = refreshed = 0
     for row in statement.rows:
-        result = await pool.execute(
+        # True = inserted, False = refreshed, None = already correct. `xmax = 0`
+        # is how a RETURNING clause tells an insert from an update.
+        inserted = await pool.fetchval(
             """
-            INSERT INTO finance.statement_rows
+            INSERT INTO finance.statement_rows AS sr
               (row_id, instrument, occurred_on, narration, ref, direction, amount,
                balance_after, statement_id, file_sha256, fx_currency, fx_amount)
             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
-            ON CONFLICT (row_id) DO NOTHING
+            ON CONFLICT (row_id) DO UPDATE
+               SET narration = EXCLUDED.narration,
+                   ref       = COALESCE(EXCLUDED.ref, sr.ref)
+             WHERE sr.narration IS DISTINCT FROM EXCLUDED.narration
+                OR sr.ref      IS DISTINCT FROM COALESCE(EXCLUDED.ref, sr.ref)
+            RETURNING (xmax = 0)
             """,
             row.row_id, row.instrument, row.occurred_on, row.narration, row.ref,
             row.direction, row.amount, row.balance_after, row.statement_id,
             row.file_sha256, row.fx_currency, row.fx_amount,
         )
-        if result.endswith("1"):
+        if inserted is True:
             stored += 1
-    return stored, len(statement.rows) - stored
+        elif inserted is False:
+            refreshed += 1
+    if refreshed:
+        logger.info(
+            "statement_rows_refreshed",
+            statement=statement.statement_id,
+            rows=refreshed,
+        )
+    return stored, len(statement.rows) - stored - refreshed, refreshed
 
 
 async def store_statement(pool: Any, statement: ParsedStatement) -> None:
@@ -231,9 +269,10 @@ async def intake_folder(
             outcome.rows = len(statement.rows)
             if not dry_run:
                 await store_statement(pool, statement)
-                stored, existing = await store_rows(pool, statement)
+                stored, existing, refreshed = await store_rows(pool, statement)
                 report.stored += stored
                 report.skipped_existing += existing
+                report.refreshed += refreshed
             report.outcomes.append(outcome)
 
     logger.info(
@@ -242,5 +281,6 @@ async def intake_folder(
         failures=len(report.failures),
         stored=report.stored,
         existing=report.skipped_existing,
+        refreshed=report.refreshed,
     )
     return report

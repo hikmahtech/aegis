@@ -7,6 +7,7 @@ and a PAN in the clear.
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import date
 from decimal import Decimal
 from pathlib import Path
@@ -62,11 +63,11 @@ async def test_rows_are_stored_once_however_often_the_file_arrives(db_pool):
     await db_pool.execute("DELETE FROM finance.statement_rows WHERE instrument = 'hdfc-1225'")
     stmt = _statement([_row(2, "100.00"), _row(3, "200.00")])
 
-    stored, existing = await si.store_rows(db_pool, stmt)
-    assert (stored, existing) == (2, 0)
+    stored, existing, refreshed = await si.store_rows(db_pool, stmt)
+    assert (stored, existing, refreshed) == (2, 0, 0)
 
-    stored, existing = await si.store_rows(db_pool, stmt)
-    assert (stored, existing) == (0, 2), "the second import adds nothing"
+    stored, existing, refreshed = await si.store_rows(db_pool, stmt)
+    assert (stored, existing, refreshed) == (0, 2, 0), "the second import changes nothing"
 
     n = await db_pool.fetchval(
         "SELECT count(*) FROM finance.statement_rows WHERE instrument = 'hdfc-1225'"
@@ -84,16 +85,16 @@ async def test_two_identical_payments_on_one_day_stay_two_rows(db_pool):
         _row(4, "50.00", narration="COFFEE", occurrence=0),
         _row(4, "50.00", narration="COFFEE", occurrence=1),
     ])
-    stored, _ = await si.store_rows(db_pool, stmt)
+    stored, _, _ = await si.store_rows(db_pool, stmt)
     assert stored == 2
 
 
 @pytest.mark.asyncio
 async def test_a_re_import_does_not_erase_matching_work(db_pool):
-    """`ON CONFLICT DO NOTHING`, never DO UPDATE. A row that is already here may
-    have been matched or posted since; re-importing the file must not wipe
-    `matched_msgid` or `posted_at`. The parsed columns cannot have changed
-    anyway — they are what the hash is over."""
+    """A row that is already here may have been matched or posted since, and
+    re-importing the file must not wipe `matched_msgid` or `posted_at`. The
+    conflict clause refreshes `narration` and `ref` and names no other column,
+    so the work done to a row since it was stored survives."""
     await db_pool.execute("DELETE FROM finance.statement_rows WHERE instrument = 'hdfc-1225'")
     stmt = _statement([_row(2, "100.00")])
     await si.store_rows(db_pool, stmt)
@@ -310,3 +311,107 @@ def test_intake_agrees_with_the_parsers_about_what_success_looks_like():
     assert IntakeReport(outcomes=[FileOutcome(
         file_id="f", title="t", folder="axis-9640", status=parsed.status
     )]).failures == [], "a really-parsed statement is not a failure"
+
+
+def _bank_row(narration: str, ref: str | None) -> StatementRow:
+    """A row with a running balance, so §8.3 keys it on the BALANCE and the
+    narration is free to change — which is the whole case below."""
+    row = _row(9, "300.00", narration=narration, balance="9700.00")
+    return replace(row, narration=narration, ref=ref)
+
+
+@pytest.mark.asyncio
+async def test_a_better_parser_reaches_rows_that_are_already_stored(db_pool):
+    """#428. The FY2024-25 statement's first 23 rows were stored with 16
+    characters cut off the front and a NULL `ref` — `1526/CEX WEBUY YES BANK
+    LTD` where the bank printed `UPI/P2M/…1526/CEX WEBUY…`. With a flat
+    `DO NOTHING` the parser fix could never reach them however many times the
+    file was re-read, because `row_id` keys a bank row on its balance and the
+    id therefore did not change either.
+    """
+    await db_pool.execute("DELETE FROM finance.statement_rows WHERE instrument = 'hdfc-1225'")
+    clipped = _statement([_bank_row("1526/CEX WEBUY YES BANK LTD", None)])
+    stored, _, _ = await si.store_rows(db_pool, clipped)
+    assert stored == 1
+
+    whole = _statement([_bank_row("UPI/P2M/412345678901526/CEX WEBUY", "412345678901526")])
+    assert whole.rows[0].row_id == clipped.rows[0].row_id, "the id must not depend on narration"
+
+    stored, existing, refreshed = await si.store_rows(db_pool, whole)
+    assert (stored, existing, refreshed) == (0, 0, 1)
+
+    row = await db_pool.fetchrow(
+        "SELECT narration, ref FROM finance.statement_rows WHERE row_id = $1",
+        whole.rows[0].row_id,
+    )
+    assert row["narration"] == "UPI/P2M/412345678901526/CEX WEBUY"
+    assert row["ref"] == "412345678901526"
+
+
+@pytest.mark.asyncio
+async def test_a_refresh_leaves_the_work_done_to_the_row_alone(db_pool):
+    """The refresh names two columns, so a row that has been matched and posted
+    keeps both. Re-parsing a file must never un-reconcile an account."""
+    await db_pool.execute("DELETE FROM finance.statement_rows WHERE instrument = 'hdfc-1225'")
+    await si.store_rows(db_pool, _statement([_bank_row("CLIPPED", None)]))
+    row_id = _bank_row("CLIPPED", None).row_id
+    await db_pool.execute(
+        "UPDATE finance.statement_rows SET matched_msgid = $2, posted_at = now(), "
+        "skip_reason = $3 WHERE row_id = $1",
+        row_id, "mail/1", "ambiguous",
+    )
+
+    _, _, refreshed = await si.store_rows(
+        db_pool, _statement([_bank_row("UPI/P2M/999/WHOLE", "999")])
+    )
+    assert refreshed == 1
+
+    kept = await db_pool.fetchrow(
+        "SELECT narration, matched_msgid, posted_at, skip_reason "
+        "FROM finance.statement_rows WHERE row_id = $1",
+        row_id,
+    )
+    assert kept["narration"] == "UPI/P2M/999/WHOLE", "the narration did not refresh"
+    assert kept["matched_msgid"] == "mail/1"
+    assert kept["posted_at"] is not None
+    assert kept["skip_reason"] == "ambiguous"
+
+
+@pytest.mark.asyncio
+async def test_a_re_read_that_finds_no_reference_does_not_erase_one(db_pool):
+    """The same rule `journal_index.upsert` follows: a reference is a fact about
+    the payment, not a verdict about it. The mailed and netbanking layouts
+    truncate a narration differently, so the file that can read the UTR and the
+    file that cannot are both legitimate re-reads of the same transaction."""
+    await db_pool.execute("DELETE FROM finance.statement_rows WHERE instrument = 'hdfc-1225'")
+    row_id = _bank_row("x", None).row_id
+    await si.store_rows(db_pool, _statement([_bank_row("NEFT/AXISP00123456/RENT", "AXISP00123456")]))
+
+    await si.store_rows(db_pool, _statement([_bank_row("NEFT/AXISP0012345", None)]))
+
+    row = await db_pool.fetchrow(
+        "SELECT narration, ref FROM finance.statement_rows WHERE row_id = $1", row_id
+    )
+    assert row["narration"] == "NEFT/AXISP0012345", "narration takes the newest read"
+    assert row["ref"] == "AXISP00123456", "a reference already found was erased"
+
+
+@pytest.mark.asyncio
+async def test_an_unchanged_row_is_not_rewritten(db_pool):
+    """Intake re-downloads and re-parses every file on every run. Without the
+    `WHERE` on the conflict clause, each run would rewrite all ~2,800 stored
+    rows to the values they already hold — twice a day, for table bloat."""
+    await db_pool.execute("DELETE FROM finance.statement_rows WHERE instrument = 'hdfc-1225'")
+    stmt = _statement([_bank_row("UPI/P2M/999/SHOP", "999")])
+    await si.store_rows(db_pool, stmt)
+    before = await db_pool.fetchval(
+        "SELECT xmin::text FROM finance.statement_rows WHERE row_id = $1", stmt.rows[0].row_id
+    )
+
+    stored, existing, refreshed = await si.store_rows(db_pool, stmt)
+
+    assert (stored, existing, refreshed) == (0, 1, 0)
+    after = await db_pool.fetchval(
+        "SELECT xmin::text FROM finance.statement_rows WHERE row_id = $1", stmt.rows[0].row_id
+    )
+    assert after == before, "the row was rewritten with the values it already held"
