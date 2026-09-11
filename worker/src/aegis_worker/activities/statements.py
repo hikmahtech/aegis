@@ -425,7 +425,11 @@ class StatementActivities:
         # class `unevaluated` leaves its problems alone while the rest of the
         # kind still resolves.
         coverage = _coverage_findings(statements, statement_findings, today=date.today())
-        findings = statement_findings.match_findings(run) + (coverage or [])
+        findings = statement_findings.match_findings(
+            # The rows, so each task can name its rows by date, amount and
+            # narration — the outcomes carry only an id and a date.
+            run, rows={r.row_id: r for s in statements for r in s.rows}
+        ) + (coverage or [])
         swept = await statement_findings.sweep(
             self.db_pool,
             findings,

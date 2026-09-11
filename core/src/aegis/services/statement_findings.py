@@ -52,11 +52,11 @@ import asyncpg
 import structlog
 
 from aegis.services import hub_project
-from aegis.services.hub import Event, IngestResult, correlation_key, ingest_event
+from aegis.services.hub import Event, IngestResult, correlation_key, ingest_event, slug
 from aegis.services.hub_watch import reconcile_findings
 from aegis.services.statement_intake import IntakeReport
-from aegis.services.statement_match import MatchRun, bank_of
-from aegis.services.statements import StatementLocked
+from aegis.services.statement_match import AMBIGUOUS, MatchRun, RowOutcome, bank_of
+from aegis.services.statements import StatementLocked, StatementRow
 
 logger = structlog.get_logger()
 
@@ -143,6 +143,19 @@ _SEVERITY = {CLOSING_BALANCE: "critical", PASSWORD_FAILED: "error"}
 #: are there so a reader can start somewhere.
 _EXAMPLE_CAP = 10
 _TITLE_CAP = 500
+#: How many ids `row_ids` may carry. Every one rides in every occurrence, daily.
+#: ponytail: past the cap the list is left out and the finding is never taken as
+#: acknowledged, so an account that far behind is reported every run. Store the
+#: ids once per problem if one ever gets there.
+_ROW_ID_CAP = 2000
+#: The row classes: their items are rows, so an acknowledgement is per row.
+_ROW_CLASSES = frozenset({UNMATCHED_ROWS, AMBIGUOUS_ROW})
+#: The last line of every swept money task. A person completing the task is
+#: what `_acknowledged` reads.
+_ACK_LINE = (
+    "Ticking this off tells Maou you have dealt with it. "
+    "It stays quiet until something new turns up."
+)
 
 
 def severity_for(klass: str) -> str:
@@ -184,10 +197,64 @@ def _plural(n: int, one: str, many: str) -> str:
     return one if n == 1 else many
 
 
+# --- what a task says -------------------------------------------------------
+#
+# `hub_project.project` builds a new task's body from the occurrence's
+# `description`. Without one a money task was the status block alone: it never
+# said which rows, or what to do.
+
+
+def _describe(*parts: str) -> str:
+    """A task body: what is wrong, what to do, and how to make it stay quiet."""
+    return "\n\n".join([*(p for p in parts if p), _ACK_LINE])
+
+
+def _row_line(outcome: RowOutcome, rows: Mapping[str, StatementRow] | None) -> str:
+    """`2026-08-03 · out · 1234.00 · UPI/AMAZON PAY…`, what a person looks for
+    on the statement. A row the caller did not hand over is named by its id."""
+    row = (rows or {}).get(outcome.row_id)
+    if row is None:
+        return f"{outcome.occurred_on.isoformat()} · row {outcome.row_id}"
+    narration = " ".join(str(row.narration or "").split())[:60]
+    return f"{row.occurred_on.isoformat()} · {row.direction} · {row.amount} · {narration}"
+
+
+def _row_list(
+    outcomes: Sequence[RowOutcome],
+    rows: Mapping[str, StatementRow] | None,
+    *,
+    candidates: bool = False,
+) -> str:
+    """The first `_EXAMPLE_CAP` rows by date, then how many more there are."""
+    shown = sorted(outcomes, key=lambda o: (o.occurred_on, o.row_id))
+    lines = []
+    for o in shown[:_EXAMPLE_CAP]:
+        line = _row_line(o, rows)
+        if candidates:
+            n = len(o.candidates)
+            line += f" · {n} {_plural(n, 'candidate', 'candidates')}"
+        lines.append(line)
+    if len(shown) > _EXAMPLE_CAP:
+        lines.append(f"and {len(shown) - _EXAMPLE_CAP} more")
+    return "\n".join(lines)
+
+
+def _row_ids(outcomes: Sequence[RowOutcome], klass: str, instrument: str) -> list[str] | None:
+    """Every row id, for `_acknowledged`, or None past `_ROW_ID_CAP` — and
+    `finding` leaves a None out of the payload."""
+    ids = sorted({o.row_id for o in outcomes})
+    if len(ids) <= _ROW_ID_CAP:
+        return ids
+    logger.warning("money_finding_row_ids_capped", klass=klass, instrument=instrument, rows=len(ids))
+    return None
+
+
 # --- builders ---------------------------------------------------------------
 
 
-def match_findings(run: MatchRun) -> list[dict[str, Any]]:
+def match_findings(
+    run: MatchRun, *, rows: Mapping[str, StatementRow] | None = None
+) -> list[dict[str, Any]]:
     """Everything one match run found wrong, as findings.
 
     Counts are **per instrument, not per statement**. A run usually covers
@@ -196,11 +263,26 @@ def match_findings(run: MatchRun) -> list[dict[str, Any]]:
     when August is imported — a count that moves for reasons unrelated to the
     work. Per instrument it is the account's whole backlog and only the rules
     getting better makes it fall.
+
+    ``rows`` is every statement row by id. An outcome carries a row's id and
+    date but not its amount or narration, and those are what let a person find
+    the row on the statement; without them a row is named by its id.
     """
     unmatched: dict[str, int] = {}
     ambiguous: dict[str, int] = {}
     examples: dict[str, list[dict[str, Any]]] = {}
     statements: dict[str, list[str]] = {}
+    # The rows behind each count, per instrument, by the same filters as the
+    # summary's counts (`statement_match.summarise`), so the ids and the number
+    # in the title always agree.
+    instrument_of = {s.statement_id: (s.instrument or "").strip() for s in run.summaries}
+    unmatched_rows: dict[str, list[RowOutcome]] = {}
+    ambiguous_rows: dict[str, list[RowOutcome]] = {}
+    for o in run.outcomes:
+        if o.skip_reason == AMBIGUOUS:
+            ambiguous_rows.setdefault(instrument_of.get(o.statement_id, ""), []).append(o)
+        elif not o.matched and o.skip_reason is None:
+            unmatched_rows.setdefault(instrument_of.get(o.statement_id, ""), []).append(o)
 
     for summary in run.summaries:
         instrument = (summary.instrument or "").strip()
@@ -224,33 +306,54 @@ def match_findings(run: MatchRun) -> list[dict[str, Any]]:
 
     out: list[dict[str, Any]] = []
     for instrument in sorted(statements):
-        rows = unmatched.get(instrument, 0)
-        if rows:
+        count = unmatched.get(instrument, 0)
+        if count:
+            listed = unmatched_rows.get(instrument, [])
             out.append(
                 finding(
                     UNMATCHED_ROWS,
                     instrument,
-                    f"{rows} unmatched {_plural(rows, 'row', 'rows')} on {instrument}",
+                    f"{count} unmatched {_plural(count, 'row', 'rows')} on {instrument}",
                     payload={
-                        "rows": rows,
+                        "rows": count,
                         "statements": sorted(statements[instrument])[:_EXAMPLE_CAP],
+                        "row_ids": _row_ids(listed, UNMATCHED_ROWS, instrument),
+                        "description": _describe(
+                            f"{count} {_plural(count, 'row', 'rows')} on {instrument} "
+                            f"{_plural(count, 'matches', 'match')} nothing in the books:\n"
+                            + _row_list(listed, rows),
+                            "Post each one you recognise, for example by asking Maou in chat. "
+                            "If the books already hold one under another date or amount, fix "
+                            "that entry instead.",
+                        ),
                     },
                 )
             )
-        rows = ambiguous.get(instrument, 0)
-        if rows:
+        count = ambiguous.get(instrument, 0)
+        if count:
             # §15.6: report-only for now. The eventual resolution is a person
             # picking a candidate through an InteractionFlow card, but a card
             # per row at 959 rows is worse than the digest it replaces, so the
             # card waits until the residue is a handful a month.
+            listed = ambiguous_rows.get(instrument, [])
             out.append(
                 finding(
                     AMBIGUOUS_ROW,
                     instrument,
-                    f"{rows} ambiguous {_plural(rows, 'row', 'rows')} on {instrument}",
+                    f"{count} ambiguous {_plural(count, 'row', 'rows')} on {instrument}",
                     payload={
-                        "rows": rows,
+                        "rows": count,
                         "examples": examples.get(instrument, [])[:_EXAMPLE_CAP],
+                        # Every id: the examples stop at ten.
+                        "row_ids": _row_ids(listed, AMBIGUOUS_ROW, instrument),
+                        "description": _describe(
+                            f"{count} {_plural(count, 'row', 'rows')} on {instrument} "
+                            f"{_plural(count, 'matches', 'match')} more than one transaction "
+                            "in the books, so none was chosen:\n"
+                            + _row_list(listed, rows, candidates=True),
+                            "Check whether the books hold the same payment twice, and remove "
+                            "the copy if they do.",
+                        ),
                     },
                 )
             )
@@ -263,7 +366,15 @@ def match_findings(run: MatchRun) -> list[dict[str, Any]]:
                 UNSCOPED_INSTRUMENT,
                 instrument,
                 f"No entity declared for {instrument}, so matching pass 2b cannot run",
-                payload={"instrument": instrument},
+                payload={
+                    "instrument": instrument,
+                    "description": _describe(
+                        f"No entity is declared for {instrument}, so matching cannot use the "
+                        "payments that do not say which account paid.",
+                        f"Add the entities {instrument} pays for to its entry in the "
+                        "integration:statement_folders setting.",
+                    ),
+                },
             )
         )
     for currency in run.missing_rates:
@@ -274,7 +385,14 @@ def match_findings(run: MatchRun) -> list[dict[str, Any]]:
                 MISSING_RATE,
                 currency,
                 f"No {currency} rate in prices.journal, so its rows cannot be matched",
-                payload={"currency": currency},
+                payload={
+                    "currency": currency,
+                    "description": _describe(
+                        f"prices.journal has no {currency} rate, so rows charged in {currency} "
+                        "cannot be matched.",
+                        f"Add a {currency} rate to prices.journal in the books.",
+                    ),
+                },
             )
         )
     return out
@@ -308,6 +426,11 @@ def intake_findings(report: IntakeReport) -> list[dict[str, Any]]:
                         "folder": outcome.folder,
                         "file_title": outcome.title,
                         "reason": outcome.reason,
+                        "description": _describe(
+                            f"{name}{where} is locked, and none of the passwords AEGIS tried "
+                            "opened it.",
+                            "Replace it with an unlocked copy.",
+                        ),
                     },
                 )
             )
@@ -323,6 +446,11 @@ def intake_findings(report: IntakeReport) -> list[dict[str, Any]]:
                     "file_title": outcome.title,
                     "status": outcome.status,
                     "reason": outcome.reason,
+                    "description": _describe(
+                        f"{name}{where} did not parse ({outcome.status}): {outcome.reason[:200]}",
+                        "Check it is a statement AEGIS knows how to read. Replace it with a "
+                        "clean copy, or move it out of the folder.",
+                    ),
                 },
             )
         )
@@ -344,7 +472,14 @@ def missing_statement_findings(
             STATEMENT_MISSING,
             instrument,
             f"No statement for {instrument} covering {period}",
-            payload={"period": period, "instrument": instrument},
+            payload={
+                "period": period,
+                "instrument": instrument,
+                "description": _describe(
+                    f"No statement for {instrument} covers {period}.",
+                    f"Drop the {instrument} statement covering {period} into its Drive folder.",
+                ),
+            },
         )
         for instrument in sorted({str(d).strip() for d in declared if str(d).strip()} - have)
     ]
@@ -367,6 +502,83 @@ def _key_for(f: Mapping[str, Any]) -> str:
             klass=str(f.get("klass") or ""),
         )
     )
+
+
+def _items(klass: str, subject: str, payload: Mapping[str, Any]) -> frozenset[str] | None:
+    """What a finding is about, item by item: the rows of a row class, the
+    period of a missing statement, and the subject alone for every other class.
+
+    None when a row class carries no `row_ids` — past `_ROW_ID_CAP`, or an
+    occurrence recorded before the key existed — and when the list is empty or
+    disagrees with the count beside it. An empty list is a subset of anything
+    and a short one hides the rows it left out, while `match_findings` builds
+    both from the same outcomes, so either shape means something upstream went
+    wrong. With nothing trustworthy to compare, such a finding is never taken
+    as acknowledged.
+    """
+    if klass in _ROW_CLASSES:
+        ids = payload.get("row_ids")
+        if not isinstance(ids, list) or not ids or len(ids) != payload.get("rows"):
+            return None
+        return frozenset(str(i) for i in ids)
+    if klass == STATEMENT_MISSING:
+        period = str(payload.get("period") or "")
+        return frozenset({period}) if period else None
+    return frozenset({slug(subject)})
+
+
+async def _acknowledged(pool: asyncpg.Pool, f: Mapping[str, Any]) -> bool:
+    """Whether a person has already dealt with everything this finding says.
+
+    Completing a money task resolved its problem (`hub_project.
+    reconcile_completed_tasks`), and the next statement run found the same
+    rows and reopened the problem and the task — so ticking one off was
+    pointless (prod 2026-09-11). Acknowledged means all three:
+
+    * the newest problem for the finding's key is `resolved` or `closed`. A
+      closed problem keeps its row, so the acknowledgement outlives the
+      seven-day close that frees the key;
+    * its latest resolve was a person's completion, told apart by the source
+      `reconcile_completed_tasks` writes it with
+      (`hub_project.TASK_COMPLETED_SOURCE`) rather than by the reason's
+      wording, which a later edit could change;
+    * every item in the finding was already in the problem's last occurrence
+      before that completion.
+
+    A finding with anything new is not acknowledged, and the hub does what it
+    always did: reopens the problem inside the reopen window, or opens a fresh
+    problem and task after it.
+    """
+    klass = str(f.get("klass") or "")
+    subject = str(f.get("subject") or "")
+    items = _items(klass, subject, f.get("payload") or {})
+    key = _key_for(f)
+    if items is None or not key:
+        return False
+    row = await pool.fetchrow(
+        """
+        WITH p AS (
+            SELECT id, status FROM problems WHERE correlation_key = $1
+            ORDER BY (closed_at IS NULL) DESC, first_seen_at DESC LIMIT 1
+        ), done AS (
+            SELECT e.id, e.source, e.external_id FROM problem_events e JOIN p ON e.problem_id = p.id
+            WHERE e.kind = 'state_change' AND e.payload->>'action' = 'resolve'
+            ORDER BY e.id DESC LIMIT 1
+        )
+        SELECT p.status,
+               done.source = 'hub' AND done.external_id LIKE $2 AS by_person,
+               (SELECT o.payload FROM problem_events o
+                 WHERE o.problem_id = p.id AND o.kind = 'occurrence' AND o.id < done.id
+                 ORDER BY o.id DESC LIMIT 1) AS seen
+        FROM p LEFT JOIN done ON true
+        """,
+        key,
+        f"{hub_project.TASK_COMPLETED_SOURCE}:%",
+    )
+    if row is None or row["status"] not in ("resolved", "closed") or not row["by_person"]:
+        return False
+    seen = _items(klass, subject, row["seen"] or {})
+    return seen is not None and items <= seen
 
 
 async def refresh_titles(
@@ -427,10 +639,15 @@ async def sweep(
     Findings of an arrival-time class are refused rather than quietly dropped:
     they belong to :func:`record_closing_balance`, and sweeping one would
     resolve it on the next tick.
+
+    A finding a person has already acknowledged (:func:`_acknowledged`) is
+    dropped before the hub sees it. Absent, it resolves nothing — its problem
+    already is — and its title is left as the person ticked it off.
     """
     now = now or datetime.now(UTC)
     wanted = tuple(kinds) if kinds else tuple(SWEEP_CLASSES)
     by_kind: dict[str, list[dict[str, Any]]] = {kind: [] for kind in wanted}
+    acknowledged: set[str] = set()
     for f in findings:
         klass = str(f.get("klass") or "")
         if klass in ARRIVAL_CLASSES:
@@ -447,7 +664,12 @@ async def sweep(
                 subject=str(f.get("subject") or "")[:80],
             )
             continue
+        if await _acknowledged(pool, f):
+            acknowledged.add(_key_for(f))
+            continue
         by_kind[kind].append(dict(f))
+    if acknowledged:
+        logger.info("money_findings_acknowledged", count=len(acknowledged))
 
     out: dict[str, dict[str, Any]] = {}
     for kind in wanted:
@@ -464,7 +686,7 @@ async def sweep(
             now=now,
             project=project,
         )
-    await refresh_titles(pool, findings)
+    await refresh_titles(pool, [f for f in findings if _key_for(f) not in acknowledged])
     return out
 
 
@@ -511,6 +733,11 @@ async def record_closing_balance(
                 "statement_id": statement_id,
                 "instrument": instrument,
                 "reason": reason[:1000],
+                # No "ticking this off" line: this class is not swept, and a
+                # reverted statement is posted again, and disagrees again, on
+                # every run until it reconciles.
+                "description": f"{reason[:1000]}\n\n"
+                "This task comes back until the statement reconciles with the books.",
             },
             occurred_at=now,
         ),

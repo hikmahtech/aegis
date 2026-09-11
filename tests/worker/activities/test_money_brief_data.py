@@ -103,8 +103,21 @@ def _repo(
 @pytest_asyncio.fixture(autouse=True, loop_scope="function")
 async def _clean(db_pool):
     await db_pool.execute("DELETE FROM finance.journal_index WHERE mailbox = 'brief-t'")
+    await db_pool.execute("DELETE FROM todoist_tasks WHERE id LIKE 'brief-t-task-%'")
     yield
     await db_pool.execute("DELETE FROM finance.journal_index WHERE mailbox = 'brief-t'")
+    await db_pool.execute("DELETE FROM todoist_tasks WHERE id LIKE 'brief-t-task-%'")
+
+
+async def _task(db_pool, task_id: str, *, completed: bool) -> None:
+    """The Todoist mirror row for a bill's task, as TodoistSyncFlow keeps it."""
+    await db_pool.execute(
+        "INSERT INTO todoist_tasks (id, content, labels, source_tag, is_completed, raw) "
+        "VALUES ($1, 'Pay the bill', ARRAY['#bill'], '#bill', $2, '{}'::jsonb) "
+        "ON CONFLICT (id) DO UPDATE SET is_completed = EXCLUDED.is_completed",
+        task_id,
+        completed,
+    )
 
 
 def _today() -> date:
@@ -438,20 +451,99 @@ async def test_month_close_open_dues_leave_out_a_zero_invoice_but_keep_an_unsize
     last = _prev_month_last()
     base = await ActivityEnvironment().run(act.build_month_close)
 
+    # Each carries a task ref, so the two-week rule for untasked dues cannot
+    # decide this test by the day of the month it runs on.
     await ji.upsert(db_pool, "brief-t/mz", "brief-t",
                     _ev(kind="due", amount=Decimal("0"), due_on=last, occurred_on=None,
-                        payee="Zero invoice", payee_key="zero invoice", channel="bill"))
+                        payee="Zero invoice", payee_key="zero invoice", channel="bill"),
+                    todoist_ref="brief-t-task-mz")
     await ji.upsert(db_pool, "brief-t/mn", "brief-t",
                     _ev(kind="due", amount=None, due_on=last, occurred_on=None,
-                        payee="Unsized bill", payee_key="unsized bill", channel="bill"))
+                        payee="Unsized bill", payee_key="unsized bill", channel="bill"),
+                    todoist_ref="brief-t-task-mn")
     await ji.upsert(db_pool, "brief-t/mr", "brief-t",
                     _ev(kind="due", amount=Decimal("450"), due_on=last, occurred_on=None,
-                        payee="Real bill", payee_key="real bill", channel="bill"))
+                        payee="Real bill", payee_key="real bill", channel="bill"),
+                    todoist_ref="brief-t-task-mr")
 
     close = await ActivityEnvironment().run(act.build_month_close)
 
     assert close["month"] == last.strftime("%Y-%m")
     assert close["dues_open"] == base["dues_open"] + 2
+
+
+@pytest.mark.asyncio
+async def test_month_close_leaves_out_a_bill_the_user_ticked_off(db_pool, tmp_path):
+    """A person completing a bill's task is their word that it is handled; the
+    close must not list it as still open."""
+    act = _act(db_pool, books.BooksConfig(path=tmp_path / "none"))
+    last = _prev_month_last()
+    base = await ActivityEnvironment().run(act.build_month_close)
+
+    await ji.upsert(db_pool, "brief-t/mt", "brief-t",
+                    _ev(kind="due", amount=Decimal("300"), due_on=last, occurred_on=None,
+                        payee="Ticked bill", payee_key="ticked bill", channel="bill"),
+                    todoist_ref="brief-t-task-mt")
+    await _task(db_pool, "brief-t-task-mt", completed=True)
+    await ji.upsert(db_pool, "brief-t/mo", "brief-t",
+                    _ev(kind="due", amount=Decimal("400"), due_on=last, occurred_on=None,
+                        payee="Open bill", payee_key="open bill", channel="bill"),
+                    todoist_ref="brief-t-task-mo")
+    await _task(db_pool, "brief-t-task-mo", completed=False)
+
+    close = await ActivityEnvironment().run(act.build_month_close)
+
+    assert close["dues_open"] == base["dues_open"] + 1
+
+
+@pytest.mark.asyncio
+async def test_the_brief_lists_no_bill_the_user_ticked_off(db_pool, tmp_path):
+    """The brief's dues list takes the ticked-off rule and nothing else from
+    `OPEN_DUE_SQL`: it still lists a ₹0 due in its window, on purpose."""
+    act = _act(db_pool, books.BooksConfig(path=tmp_path / "none"))
+    today = _today()
+    await ji.upsert(db_pool, "brief-t/lt", "brief-t",
+                    _ev(kind="due", due_on=today, occurred_on=None, payee="Ticked",
+                        payee_key="ticked", amount=Decimal("300"), channel="bill"),
+                    todoist_ref="brief-t-task-lt")
+    await _task(db_pool, "brief-t-task-lt", completed=True)
+    await ji.upsert(db_pool, "brief-t/lo", "brief-t",
+                    _ev(kind="due", due_on=today, occurred_on=None, payee="Open",
+                        payee_key="open", amount=Decimal("400"), channel="bill"),
+                    todoist_ref="brief-t-task-lo")
+    await _task(db_pool, "brief-t-task-lo", completed=False)
+    await ji.upsert(db_pool, "brief-t/lz", "brief-t",
+                    _ev(kind="due", due_on=today, occurred_on=None, payee="Zero",
+                        payee_key="zero", amount=Decimal("0"), channel="bill"))
+
+    brief = await ActivityEnvironment().run(act.build_money_brief, 7)
+
+    assert sorted(d["msgid"] for d in _mine(brief["dues"])) == ["brief-t/lo", "brief-t/lz"]
+
+
+@pytest.mark.skipif(not HAS_HLEDGER, reason="hledger/git not installed")
+@pytest.mark.asyncio
+async def test_a_ticked_off_bill_still_strikes_its_forecast_twin(db_pool, tmp_path):
+    """Ticking a bill off takes it out of the dues list, not out of what the
+    books have seen. The forecast warns about money the books have NOT seen
+    (#393), so the ticked-off due still retires the prediction of itself."""
+    today = _today()
+    cfg = _repo(tmp_path, today, recurring=(
+        f"~ monthly from {today.isoformat()}  Airtel Xstream Fiber\n"
+        "    expenses:saas                 ₹5306.46\n    liabilities:card:axis:1313\n"
+    ))
+    await ji.upsert(db_pool, "brief-t/ft", "brief-t",
+                    _ev(kind="due", due_on=today, occurred_on=None, payee="Airtel Xstream Fiber",
+                        payee_key="airtel xstream fiber", amount=Decimal("5306.46"),
+                        channel="bill"),
+                    todoist_ref="brief-t-task-ft")
+    await _task(db_pool, "brief-t-task-ft", completed=True)
+
+    brief = await ActivityEnvironment().run(_act(db_pool, cfg).build_money_brief, 7)
+
+    assert brief["books_ok"] is True
+    assert _mine(brief["dues"]) == []
+    assert brief["forecast"] == []
 
 
 @pytest.mark.asyncio

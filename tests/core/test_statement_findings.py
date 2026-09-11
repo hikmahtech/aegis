@@ -17,9 +17,10 @@ from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 
 import pytest
+import pytest_asyncio
 from aegis.services import hub_project, statements
 from aegis.services import statement_findings as sf
-from aegis.services.hub import get_problem
+from aegis.services.hub import close_problem, get_problem
 from aegis.services.statement_intake import MISFILED, UNREADABLE, FileOutcome, IntakeReport
 from aegis.services.statement_match import Candidate, MatchRun, match_statements
 from aegis.services.statements import PARSED, StatementLocked
@@ -241,6 +242,115 @@ def test_missing_statement_findings_name_only_the_uncovered_accounts():
     assert out[0]["payload"]["period"] == "2026-08"
 
 
+# --- what a money task says (the description) -------------------------------
+
+ACK = (
+    "Ticking this off tells Maou you have dealt with it. "
+    "It stays quiet until something new turns up."
+)
+
+
+def test_an_unmatched_rows_task_lists_the_rows_and_says_what_to_do():
+    """A money task body used to be the status block alone: it never said which
+    rows, or what to do. The run's outcomes carry no amount or narration, so the
+    caller hands the rows over."""
+    inst = _instrument()
+    rows = [make_row(inst, d, f"{d}00.00", narration=f"UPI/PAYEE {d}") for d in range(1, 13)]
+    run = run_match(rows)
+    found = next(
+        f for f in sf.match_findings(run, rows={r.row_id: r for r in rows})
+        if f["klass"] == sf.UNMATCHED_ROWS
+    )
+    text = found["payload"]["description"]
+    assert "2026-07-01 · out · 100.00 · UPI/PAYEE 1\n" in text
+    assert text.count(" · out · ") == 10
+    assert "and 2 more" in text
+    assert text.endswith(ACK)
+    # Every row, not the ten shown: an acknowledgement is checked against all of them.
+    assert sorted(found["payload"]["row_ids"]) == sorted(r.row_id for r in rows)
+    # The title is untouched.
+    assert found["title"] == f"12 unmatched rows on {inst}"
+
+    # Without the rows, a row is still named, by its date and id.
+    bare = next(f for f in sf.match_findings(run) if f["klass"] == sf.UNMATCHED_ROWS)
+    assert f"2026-07-01 · row {rows[0].row_id}" in bare["payload"]["description"]
+
+
+def test_an_ambiguous_row_task_names_each_row_and_its_candidates():
+    """The examples in the payload stop at ten; `row_ids` holds every one."""
+    inst = _instrument()
+    row = make_row(inst, 3, "100.00", narration="CARD PURCHASE")
+    run = run_match(
+        [row], [make_candidate("m1", inst, 3, "100.00"), make_candidate("m2", inst, 4, "100.00")]
+    )
+    found = next(
+        f for f in sf.match_findings(run, rows={row.row_id: row})
+        if f["klass"] == sf.AMBIGUOUS_ROW
+    )
+    assert "2026-07-03 · out · 100.00 · CARD PURCHASE · 2 candidates" in found["payload"]["description"]
+    assert found["payload"]["row_ids"] == [row.row_id]
+
+
+def test_a_missing_statement_task_says_where_the_file_goes():
+    out = sf.missing_statement_findings(["axis-9640"], [], period="2026-08")
+    assert (
+        "Drop the axis-9640 statement covering 2026-08 into its Drive folder."
+        in out[0]["payload"]["description"]
+    )
+
+
+def test_every_swept_finding_says_how_to_make_it_stay_quiet():
+    """Completing any swept money task acknowledges it, so every one says so."""
+    inst = _instrument()
+    run = run_match(
+        [make_row(inst, 3, "100.00"), make_row(inst, 9, "338.00"), make_row(inst, 20, "500.00")],
+        [
+            # No entity declared, so pass 2b cannot look at these: unscoped.
+            make_candidate("m1", None, 3, "100.00"),
+            # A dollar candidate with no rate: missing_rate.
+            make_candidate("m3", inst, 9, "4.00", currency="USD"),
+            # Two candidates for one row: ambiguous.
+            make_candidate("m4", inst, 20, "500.00"),
+            make_candidate("m5", inst, 21, "500.00"),
+        ],
+    )
+    report = IntakeReport(
+        outcomes=[
+            FileOutcome(
+                file_id="f2", title="locked.pdf", folder="axis-9640", status=UNREADABLE,
+                reason=f"{StatementLocked.__name__}: the statement could not be opened",
+            ),
+            FileOutcome(
+                file_id="f3", title="odd.pdf", folder="hdfc-1225", status=UNREADABLE,
+                reason="ValueError: no columns found",
+            ),
+        ]
+    )
+    found = (
+        sf.match_findings(run)
+        + sf.intake_findings(report)
+        + sf.missing_statement_findings([inst], [], period="2026-08")
+    )
+    assert {f["klass"] for f in found} == sf.CLASSES - sf.ARRIVAL_CLASSES
+    for f in found:
+        assert f["payload"]["description"].endswith(ACK), f["klass"]
+
+
+def test_row_ids_are_left_out_over_the_cap(monkeypatch):
+    """Past the cap the list is left out, and the finding is then never taken
+    as acknowledged — it is reported, as before."""
+    monkeypatch.setattr(sf, "_ROW_ID_CAP", 2)
+    inst = _instrument()
+    rows = [make_row(inst, d, "100.00") for d in (3, 4, 5)]
+    found = next(f for f in sf.match_findings(run_match(rows)) if f["klass"] == sf.UNMATCHED_ROWS)
+    assert "row_ids" not in found["payload"]
+    assert found["payload"]["rows"] == 3
+    two = next(
+        f for f in sf.match_findings(run_match(rows[:2])) if f["klass"] == sf.UNMATCHED_ROWS
+    )
+    assert len(two["payload"]["row_ids"]) == 2
+
+
 # --- the sweep, and the two traps -------------------------------------------
 
 
@@ -265,6 +375,15 @@ async def test_a_closing_balance_problem_survives_a_sweep(db_pool):
     problem = await get_problem(db_pool, result.problem_id)
     assert (problem["class"], problem["subject_kind"]) == (sf.CLOSING_BALANCE, sf.STATEMENT)
     assert problem["severity"] == "critical"
+    # Its task says both figures, and that ticking it off will not keep it away.
+    assert await db_pool.fetchval(
+        "SELECT payload->>'description' FROM problem_events "
+        "WHERE problem_id = $1::uuid AND kind = 'occurrence'",
+        result.problem_id,
+    ) == (
+        "the bank moved 100, the books moved 90 — difference -10\n\n"
+        "This task comes back until the statement reconciles with the books."
+    )
 
     # A full sweep tick that produces no closing-balance finding, on both the
     # instrument and the statement kind.
@@ -459,6 +578,245 @@ async def test_a_later_row_joins_the_account_problem_instead_of_opening_one(db_p
     problem = await get_problem(db_pool, pid)
     assert problem["occurrences"] == 2
     assert problem["title"] == f"2 unmatched rows on {inst}"
+
+
+# --- a ticked-off task acknowledges its finding ------------------------------
+
+
+@pytest_asyncio.fixture(loop_scope="function")
+async def ticks(db_pool):
+    yield
+    await db_pool.execute("DELETE FROM todoist_tasks WHERE id LIKE 'zzsf-task-%'")
+
+
+async def _tick_off(pool, problem_id: str, at: datetime) -> None:
+    """The real path: a person completes the problem's task, the sync mirrors
+    it, and the hub sweep reads the completion back as a resolve."""
+    task = f"zzsf-task-{uuid.uuid4().hex[:10]}"
+    await pool.execute(
+        "UPDATE problems SET todoist_task_id = $2 WHERE id = $1::uuid", problem_id, task
+    )
+    await pool.execute(
+        "INSERT INTO todoist_tasks (id, content, labels, source_tag, is_completed, "
+        "completed_at, raw) VALUES ($1, 'money', ARRAY['#money','@maou','@next'], '#money', "
+        "true, $2, '{}'::jsonb)",
+        task,
+        at,
+    )
+    done = await hub_project.reconcile_completed_tasks(pool, now=at)
+    assert problem_id in [d["problem_id"] for d in done if d["action"] == "resolved"]
+
+
+async def _actions(pool, problem_id: str) -> list[str]:
+    return [
+        r["action"]
+        for r in await pool.fetch(
+            "SELECT payload->>'action' AS action FROM problem_events "
+            "WHERE problem_id = $1::uuid AND kind = 'state_change' ORDER BY id",
+            problem_id,
+        )
+    ]
+
+
+def _fresh(out, subject: str, klass: str = sf.UNMATCHED_ROWS) -> str:
+    """The problem a sweep opened for one finding. Filtered by class as well as
+    subject: a match run on an account with no entity scope also finds
+    `unscoped_instrument` on the same subject, and a fresh one of those would
+    otherwise stand in for an unmatched-rows problem that never came back."""
+    found = [
+        f["problem_id"]
+        for f in out[sf.INSTRUMENT]["fresh"]
+        if f["subject"] == subject and f["klass"] == klass
+    ]
+    assert found, f"no fresh {klass} problem for {subject}"
+    return found[0]
+
+
+async def test_a_ticked_off_money_task_stays_quiet_until_a_new_row_turns_up(db_pool, ticks):
+    """The bug itself (prod 2026-09-11). Completing a money task resolved its
+    problem, and the next statement run found the same rows and reopened the
+    problem and the task, so ticking one off was pointless."""
+    inst = _instrument()
+    rows = [make_row(inst, 3, "100.00"), make_row(inst, 4, "200.00")]
+    pid = _fresh(await _sweep(db_pool, sf.match_findings(run_match(rows))), inst)
+    await _tick_off(db_pool, pid, NOW + timedelta(minutes=5))
+
+    # The next run finds the same two rows: nothing new, so nothing happens.
+    await _sweep(db_pool, sf.match_findings(run_match(rows)), now=NOW + timedelta(hours=1))
+    problem = await get_problem(db_pool, pid)
+    assert problem["status"] == "resolved"
+    assert problem["occurrences"] == 1
+    assert "reopen" not in await _actions(db_pool, pid)
+
+    # A third row turns up. That is new, so the problem comes back.
+    rows.append(make_row(inst, 5, "300.00"))
+    await _sweep(db_pool, sf.match_findings(run_match(rows)), now=NOW + timedelta(hours=2))
+    problem = await get_problem(db_pool, pid)
+    assert problem["status"] == "open"
+    assert problem["title"] == f"3 unmatched rows on {inst}"
+    assert "reopen" in await _actions(db_pool, pid)
+
+
+async def test_an_acknowledgement_outlives_the_seven_day_close(db_pool, ticks):
+    """A closed problem keeps its row, so the acknowledgement still holds once
+    the close has freed the key. Only something new opens a fresh problem."""
+    inst = _instrument()
+    rows = [make_row(inst, 3, "100.00")]
+    pid = _fresh(await _sweep(db_pool, sf.match_findings(run_match(rows))), inst)
+    await _tick_off(db_pool, pid, NOW + timedelta(minutes=5))
+    assert await close_problem(db_pool, pid, now=NOW + timedelta(days=8))
+
+    later = NOW + timedelta(days=9)
+    out = await _sweep(db_pool, sf.match_findings(run_match(rows)), now=later)
+    assert not [f for f in out[sf.INSTRUMENT]["fresh"] if f["subject"] == inst]
+    key = sf.match_findings(run_match(rows))[0]
+    count = "SELECT count(*) FROM problems WHERE correlation_key = $1"
+    assert await db_pool.fetchval(count, sf._key_for(key)) == 1
+
+    rows.append(make_row(inst, 6, "400.00"))
+    out = await _sweep(db_pool, sf.match_findings(run_match(rows)), now=later + timedelta(hours=1))
+    assert _fresh(out, inst) != pid
+    assert await db_pool.fetchval(count, sf._key_for(key)) == 2
+
+
+@pytest.mark.parametrize("newer_closed", [False, True])
+async def test_a_newer_problem_the_watchdog_resolved_is_not_acknowledged(
+    db_pool, ticks, newer_closed
+):
+    """Only the NEWEST problem for a key speaks for it. An older problem a
+    person ticked off, and the seven-day close retired, must not cover a newer
+    one the watchdog resolved when its rows matched: a row that comes back
+    after that is news. The newer problem wins whether it is still live or
+    closed too.
+
+    Falsifiable: put closed problems first and the live case drops the row;
+    order by `first_seen_at` ascending and the all-closed case does.
+    """
+    inst = _instrument()
+    a, b = make_row(inst, 3, "100.00"), make_row(inst, 4, "200.00")
+    p1 = _fresh(await _sweep(db_pool, sf.match_findings(run_match([a]))), inst)
+    await _tick_off(db_pool, p1, NOW + timedelta(minutes=5))
+    assert await close_problem(db_pool, p1, now=NOW + timedelta(days=8))
+
+    t = NOW + timedelta(days=9)
+    p2 = _fresh(await _sweep(db_pool, sf.match_findings(run_match([a, b])), now=t), inst)
+    assert p2 != p1
+    # Every row matched: the watchdog resolves P2, not a person.
+    await _sweep(db_pool, [], kinds=(sf.INSTRUMENT,), now=t + timedelta(hours=1))
+    assert (await get_problem(db_pool, p2))["status"] == "resolved"
+    if newer_closed:
+        assert await close_problem(db_pool, p2, now=t + timedelta(days=8))
+
+    # Row A comes back. P1's acknowledgement must not cover it.
+    back = t + timedelta(days=9 if newer_closed else 0, hours=2)
+    out = await _sweep(db_pool, sf.match_findings(run_match([a])), now=back)
+    if newer_closed:
+        assert _fresh(out, inst) not in (p1, p2)
+    else:
+        assert (await get_problem(db_pool, p2))["status"] == "open"
+
+
+async def test_a_watchdog_resolve_after_a_persons_resolve_ends_the_acknowledgement(
+    db_pool, ticks
+):
+    """Only the LATEST resolve speaks for a problem. A person ticked it off, a
+    new row brought it back, then every row matched and the watchdog resolved
+    it. When the first rows return, the person's tick no longer covers them.
+
+    Falsifiable: read the first resolve instead of the last and they are
+    dropped.
+    """
+    inst = _instrument()
+    a, b, c = make_row(inst, 3, "100.00"), make_row(inst, 4, "200.00"), make_row(inst, 5, "300.00")
+    pid = _fresh(await _sweep(db_pool, sf.match_findings(run_match([a, b]))), inst)
+    await _tick_off(db_pool, pid, NOW + timedelta(minutes=5))
+    await _sweep(db_pool, sf.match_findings(run_match([a, b, c])), now=NOW + timedelta(hours=1))
+    assert (await get_problem(db_pool, pid))["status"] == "open"
+    await _sweep(db_pool, [], kinds=(sf.INSTRUMENT,), now=NOW + timedelta(hours=2))
+    assert (await get_problem(db_pool, pid))["status"] == "resolved"
+
+    await _sweep(db_pool, sf.match_findings(run_match([a, b])), now=NOW + timedelta(hours=3))
+    assert (await get_problem(db_pool, pid))["status"] == "open"
+
+
+@pytest.mark.parametrize("shape", ["empty", "shorter-than-its-count"])
+async def test_a_row_list_that_disagrees_with_its_count_is_never_acknowledged(
+    db_pool, ticks, shape
+):
+    """An empty list is a subset of anything, and a short one hides the rows it
+    left out. `match_findings` builds the ids and the count from the same
+    outcomes, so either shape means something upstream went wrong, and the
+    finding is reported rather than guessed quiet.
+
+    Falsifiable: drop the check in `_items` and both are taken as acknowledged.
+    """
+    inst = _instrument()
+    a, b = make_row(inst, 3, "100.00"), make_row(inst, 4, "200.00")
+    pid = _fresh(await _sweep(db_pool, sf.match_findings(run_match([a, b]))), inst)
+    await _tick_off(db_pool, pid, NOW + timedelta(minutes=5))
+    # Both are subsets of what the person ticked off, so only the check stops them.
+    payload = {"rows": 0, "row_ids": []} if shape == "empty" else {"rows": 2, "row_ids": [a.row_id]}
+    odd = sf.finding(sf.UNMATCHED_ROWS, inst, f"unmatched rows on {inst}", payload=payload)
+    await _sweep(db_pool, [odd], now=NOW + timedelta(hours=1))
+    assert (await get_problem(db_pool, pid))["status"] == "open"
+
+
+async def test_a_ticked_off_missing_statement_comes_back_for_the_next_month(db_pool, ticks):
+    """A missing statement is acknowledged for its period, not for good."""
+    inst = _instrument()
+    august = sf.missing_statement_findings([inst], [], period="2026-08")
+    pid = _fresh(await _sweep(db_pool, august), inst, sf.STATEMENT_MISSING)
+    await _tick_off(db_pool, pid, NOW + timedelta(minutes=5))
+
+    await _sweep(db_pool, august, now=NOW + timedelta(hours=1))
+    assert (await get_problem(db_pool, pid))["status"] == "resolved"
+
+    september = sf.missing_statement_findings([inst], [], period="2026-09")
+    await _sweep(db_pool, september, now=NOW + timedelta(hours=2))
+    assert (await get_problem(db_pool, pid))["status"] == "open"
+
+
+async def test_a_ticked_off_subject_finding_stays_quiet(db_pool, ticks):
+    """Every other class is about its subject alone, and the subject is in the
+    key, so the same finding again is nothing new."""
+    inst = _instrument()
+    unscoped = [
+        sf.finding(sf.UNSCOPED_INSTRUMENT, inst, f"No entity declared for {inst}",
+                   payload={"instrument": inst})
+    ]
+    pid = _fresh(await _sweep(db_pool, unscoped), inst, sf.UNSCOPED_INSTRUMENT)
+    await _tick_off(db_pool, pid, NOW + timedelta(minutes=5))
+    await _sweep(db_pool, unscoped, now=NOW + timedelta(hours=1))
+    assert (await get_problem(db_pool, pid))["status"] == "resolved"
+    assert "reopen" not in await _actions(db_pool, pid)
+
+
+async def test_only_a_persons_completion_acknowledges(db_pool):
+    """A problem the sweep resolved because its rows matched, and whose rows
+    then come back, reopens exactly as it always did."""
+    inst = _instrument()
+    rows = [make_row(inst, 3, "100.00")]
+    pid = _fresh(await _sweep(db_pool, sf.match_findings(run_match(rows))), inst)
+    await _sweep(db_pool, [], kinds=(sf.INSTRUMENT,), now=NOW + timedelta(minutes=5))
+    assert (await get_problem(db_pool, pid))["status"] == "resolved"
+
+    await _sweep(db_pool, sf.match_findings(run_match(rows)), now=NOW + timedelta(hours=1))
+    assert (await get_problem(db_pool, pid))["status"] == "open"
+    assert "reopen" in await _actions(db_pool, pid)
+
+
+async def test_a_finding_without_its_row_ids_is_never_taken_as_acknowledged(db_pool, ticks):
+    """Over the cap, or recorded before `row_ids` existed: with no list to
+    compare, the finding is reported as before rather than guessed quiet."""
+    inst = _instrument()
+    capped = [
+        sf.finding(sf.UNMATCHED_ROWS, inst, f"2001 unmatched rows on {inst}",
+                   payload={"rows": 2001})
+    ]
+    pid = _fresh(await _sweep(db_pool, capped), inst)
+    await _tick_off(db_pool, pid, NOW + timedelta(minutes=5))
+    await _sweep(db_pool, capped, now=NOW + timedelta(hours=1))
+    assert (await get_problem(db_pool, pid))["status"] == "open"
 
 
 async def test_the_lane_projects_through_the_hub_projector(db_pool, monkeypatch):

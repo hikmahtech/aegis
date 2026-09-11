@@ -93,6 +93,28 @@ async def _cleanup(pool) -> None:
     await pool.execute(
         "DELETE FROM finance.journal_index WHERE message_id LIKE $1", f"{PREFIX}%"
     )
+    await pool.execute("DELETE FROM todoist_tasks WHERE id LIKE $1", f"{TASK_PREFIX}%")
+
+
+# The Todoist mirror rows this file writes, scoped the same way.
+TASK_PREFIX = "zzt6-money-task-"
+
+
+async def _mirror(pool, task_id: str, *, completed: bool) -> None:
+    """The row TodoistSyncFlow keeps for a bill's task."""
+    await pool.execute(
+        "INSERT INTO todoist_tasks (id, content, labels, source_tag, is_completed, raw) "
+        "VALUES ($1, 'Pay the bill', ARRAY['#bill'], '#bill', $2, '{}'::jsonb) "
+        "ON CONFLICT (id) DO UPDATE SET is_completed = EXCLUDED.is_completed",
+        task_id,
+        completed,
+    )
+
+
+def _in_days(n: int) -> str:
+    """A due date relative to today. A hard-coded one turns a test into a
+    calendar: an untasked due stops counting two weeks after it falls due."""
+    return (date.today() + timedelta(days=n)).isoformat()
 
 
 async def _seed(pool, **over) -> str:
@@ -272,11 +294,11 @@ async def test_money_state_counts_unknowns_and_open_dues(real_client, db_pool):
     # An unknown account on a due, not a transaction: not an unexplained posting.
     await _seed(
         db_pool, suffix="d1", kind="due", account="expenses:unknown",
-        occurred_on=None, due_on="2026-09-20",
+        occurred_on=None, due_on=_in_days(9),
     )
     # A due already matched to its payment is closed, not open.
     await _seed(
-        db_pool, suffix="d2", kind="due", occurred_on=None, due_on="2026-09-10",
+        db_pool, suffix="d2", kind="due", occurred_on=None, due_on=_in_days(-1),
         linked_message_id=f"{PREFIX}unk",
     )
 
@@ -299,9 +321,9 @@ async def test_a_zero_invoice_is_never_an_open_due(real_client, db_pool):
     """
     base = (await real_client.get("/api/admin/money/state")).json()
     await _seed(db_pool, suffix="z0", kind="due", amount="0", occurred_on=None,
-                due_on="2026-09-20")
+                due_on=_in_days(9))
     await _seed(db_pool, suffix="zr", kind="due", amount="500.00", occurred_on=None,
-                due_on="2026-09-21")
+                due_on=_in_days(10))
 
     body = (await real_client.get("/api/admin/money/state")).json()
 
@@ -319,11 +341,100 @@ async def test_a_due_whose_amount_never_parsed_is_still_open(real_client, db_poo
     """
     base = (await real_client.get("/api/admin/money/state")).json()
     await _seed(db_pool, suffix="znull", kind="due", amount=None, occurred_on=None,
-                due_on="2026-09-22")
+                due_on=_in_days(11))
 
     body = (await real_client.get("/api/admin/money/state")).json()
 
     assert body["dues_open"] == base["dues_open"] + 1
+
+
+async def _dues_open(client) -> int:
+    return (await client.get("/api/admin/money/state")).json()["dues_open"]
+
+
+async def test_a_bill_the_user_ticked_off_is_no_longer_open(real_client, db_pool):
+    """Ten live dues counted as open on 2026-09-11 although the user had
+    completed their `#bill` tasks: nothing read a completion as "paid". A
+    person ticking the task off is their word that it is handled.
+
+    The count reads the mirror every time, so un-ticking reopens the due, and
+    a task deleted from Todoist drops out of the mirror and counts as open
+    again — the fail-open direction.
+    """
+    base = await _dues_open(real_client)
+    task = f"{TASK_PREFIX}tick"
+    await _seed(db_pool, suffix="tick", kind="due", occurred_on=None, due_on=_in_days(5),
+                todoist_ref=task)
+    await _mirror(db_pool, task, completed=False)
+    assert await _dues_open(real_client) == base + 1
+
+    await _mirror(db_pool, task, completed=True)
+    assert await _dues_open(real_client) == base
+
+    await _mirror(db_pool, task, completed=False)
+    assert await _dues_open(real_client) == base + 1
+
+    await _mirror(db_pool, task, completed=True)
+    await db_pool.execute("DELETE FROM todoist_tasks WHERE id = $1", task)
+    assert await _dues_open(real_client) == base + 1
+
+
+async def test_a_bill_whose_task_went_through_the_outbox_can_still_be_ticked_off(
+    real_client, db_pool
+):
+    """A capture that met a transient Todoist error stores the outbox temp id
+    (`item-…`) as the due's `todoist_ref`, and nothing rewrites it. The drain
+    records the real id only on the outbox row, so matching the mirror on the
+    ref alone left the bill open for good, however often it was ticked off —
+    the trap the hub projector fixed in #473.
+
+    Falsifiable: match the mirror on `todoist_ref` alone and the count stays up.
+    """
+    base = await _dues_open(real_client)
+    temp, real = "item-zzt6-money-temp", f"{TASK_PREFIX}real"
+    await _seed(db_pool, suffix="outbox", kind="due", occurred_on=None, due_on=_in_days(5),
+                todoist_ref=temp)
+    await db_pool.execute(
+        "INSERT INTO todoist_outbox (temp_id, command, status) VALUES ($1, '{}'::jsonb, 'pending')",
+        temp,
+    )
+    await _mirror(db_pool, real, completed=True)
+    try:
+        # Still queued: there is no real task yet, so the bill is open.
+        assert await _dues_open(real_client) == base + 1
+        await db_pool.execute(
+            "UPDATE todoist_outbox SET status = 'committed', committed_id = $2 WHERE temp_id = $1",
+            temp,
+            real,
+        )
+        assert await _dues_open(real_client) == base
+    finally:
+        await db_pool.execute("DELETE FROM todoist_outbox WHERE temp_id = $1", temp)
+
+
+async def test_a_bill_with_no_due_date_is_never_open(real_client, db_pool):
+    """`find_open_due` keys on a due-date window, so a payment can never close
+    a due with no date, and it can never be overdue either. 17 such rows came
+    from the 2026-09-05 backfill."""
+    base = await _dues_open(real_client)
+    await _seed(db_pool, suffix="nodate", kind="due", occurred_on=None, due_on=None,
+                todoist_ref=f"{TASK_PREFIX}nodate")
+    assert await _dues_open(real_client) == base
+
+
+async def test_an_untasked_due_stops_counting_two_weeks_after_it_fell_due(
+    real_client, db_pool
+):
+    """The autopay notices and twins `capture_due` chose not to task leave
+    nothing for the user to act on, and an autopay almost always went
+    through. A due that still has a task stays open however old it is: the
+    task is still there to act on."""
+    base = await _dues_open(real_client)
+    await _seed(db_pool, suffix="untasked-old", kind="due", occurred_on=None, due_on=_in_days(-20))
+    await _seed(db_pool, suffix="untasked-new", kind="due", occurred_on=None, due_on=_in_days(-10))
+    await _seed(db_pool, suffix="tasked-old", kind="due", occurred_on=None, due_on=_in_days(-20),
+                todoist_ref=f"{TASK_PREFIX}old")
+    assert await _dues_open(real_client) == base + 2
 
 
 async def test_money_state_reports_books_config(real_client, books_dir):

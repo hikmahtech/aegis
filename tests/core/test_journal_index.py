@@ -192,6 +192,37 @@ async def test_find_open_due_tolerance_and_window(db_pool):
 
 
 @pytest.mark.asyncio
+async def test_a_ticked_off_due_still_links_to_a_later_payment(db_pool):
+    """Ticking a bill off takes it out of the count of dues you still owe
+    (`OPEN_DUE_SQL`), not out of the pool a payment settles. The payment for a
+    bill the user paid and ticked off usually arrives after the tick, and it
+    must still close the due rather than stay an unexplained transaction.
+
+    Falsifiable: make `find_open_due` read `OPEN_DUE_SQL` and it finds nothing.
+    """
+    due = MoneyEvent(kind="due", direction="out", amount=Decimal("500.00"), currency="INR",
+                     payee="Biller", payee_key="ji biller", channel="bill",
+                     due_on=date(2026, 9, 7), entity="personal", parser="test_bill",
+                     source_class="bank")
+    await ji.upsert(db_pool, "ji-due/ticked", "arshad-personal", due, todoist_ref="ji-task-ticked")
+    await db_pool.execute(
+        "INSERT INTO todoist_tasks (id, content, labels, source_tag, is_completed, raw) "
+        "VALUES ('ji-task-ticked', 'Pay the bill', ARRAY['#bill'], '#bill', true, '{}'::jsonb) "
+        "ON CONFLICT (id) DO UPDATE SET is_completed = EXCLUDED.is_completed"
+    )
+    try:
+        open_count = await db_pool.fetchval(
+            "SELECT count(*) FROM finance.journal_index WHERE message_id = 'ji-due/ticked' "
+            f"AND kind IN ('due','failed') AND linked_message_id IS NULL AND {ji.OPEN_DUE_SQL}"
+        )
+        assert open_count == 0
+        hit = await ji.find_open_due(db_pool, "ji biller", Decimal("500.00"), "INR", date(2026, 9, 6))
+        assert hit is not None and hit["message_id"] == "ji-due/ticked"
+    finally:
+        await db_pool.execute("DELETE FROM todoist_tasks WHERE id = 'ji-task-ticked'")
+
+
+@pytest.mark.asyncio
 async def test_upsert_stores_the_reference_and_never_nulls_it(db_pool):
     """`ref` is the transaction reference (UPI RRN, IMPS/NEFT/SWIFT), the exact
     key a bank statement's narration carries. It is the one parsed column that

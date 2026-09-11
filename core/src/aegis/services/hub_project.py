@@ -43,6 +43,7 @@ from __future__ import annotations
 
 import hashlib
 import re
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -52,6 +53,7 @@ import structlog
 from aegis.connectors.todoist import TodoistConnector
 from aegis.services import work_sessions
 from aegis.services.agents import resolve_tag
+from aegis.services.books import parse_kv
 from aegis.services.hub import (
     LIVE_STATUSES,
     _active_suppression,
@@ -67,6 +69,9 @@ logger = structlog.get_logger()
 # The literal token clarify's loop guard and `work_sessions.is_user_note` key on.
 FOOTER = "\n\nWorkflow run: problem-hub"
 SOURCE_TAG = "#alert"
+# The tag on a money problem's task (see `_OWNER_BY_SOURCE`). Clarify reads it
+# too: such a task is the user's to act on, never the classifier's.
+MONEY_SOURCE_TAG = "#money"
 COLLAPSE_WINDOW = timedelta(minutes=30)
 # Statuses that earn a task. `suppressed` and `closed` never do.
 PROJECTED_STATUSES = frozenset(
@@ -83,6 +88,45 @@ _FALLBACK_LABEL = "@pandora"
 _DESCRIPTION_CAP = 2000
 # What the timeline says when a completed task resolved its problem.
 TASK_COMPLETED_REASON = "its Todoist task was completed by a person, not by the hub"
+# The `source` that resolve is written with, which starts its `state_change`
+# external id `todoist:`. No ingested event can start that way — `todoist` is
+# not in `hub.SOURCES` — so the prefix tells a person's completion apart from
+# every other resolve without matching on the reason's wording.
+TASK_COMPLETED_SOURCE = "todoist"
+# Where the admin Integrations page stores `books_todoist_projects`
+# (`integrations_config`, prefix `integration:`).
+_BOOKS_PROJECTS_SETTING = "integration:books_todoist_projects"
+
+
+@dataclass(frozen=True)
+class _Owner:
+    """Who a problem's task belongs to, and so how it is tagged and filed."""
+
+    source_tag: str
+    agent_tag: str
+    fallback_label: str
+    # Labels after the assignee's.
+    extra_labels: tuple[str, ...] = ()
+    # The `books_todoist_projects` entry the task is filed in; "" is the Inbox.
+    books_entity: str = ""
+
+
+_INFRA_OWNER = _Owner(SOURCE_TAG, "infra", _FALLBACK_LABEL)
+# Problems another agent owns, by the source of their first occurrence. All 13
+# money problems in prod (2026-09-11) were projected as `#alert @pandora` in the
+# Inbox, and the agent sweep then ran Pandora's infra verb on them and parked
+# them. Money problems are Maou's: Maou raises them and the user acts.
+#
+# * `#money` comes first because the Todoist mirror takes the first `#` label
+#   as the task's source tag (`activities/todoist.py::_pick_source_tag`).
+# * `@next`, because the task lives outside the Inbox, so clarify never gives it
+#   a GTD state label, and every task needs one (#139).
+#
+# The key is spelled here, not imported: `statement_findings.SOURCE` is the
+# same word, but that module imports this one.
+_OWNER_BY_SOURCE = {
+    "money": _Owner(MONEY_SOURCE_TAG, "finance", "@maou", ("@next",), "personal"),
+}
 
 
 def _ts(value: Any) -> str:
@@ -316,19 +360,52 @@ def merge_block(description: str | None, block: str) -> str:
     return (base.rstrip() + "\n\n" + block) if base.strip() else block
 
 
-async def _assignee_label(pool: asyncpg.Pool) -> str:
-    """The label that assigns the task to the `infra` agent — its first mention
-    alias — falling back to the shipped default. Never raises."""
+async def _assignee_label(
+    pool: asyncpg.Pool, tag: str = "infra", fallback: str = _FALLBACK_LABEL
+) -> str:
+    """The label that assigns the task to the agent holding ``tag`` — its first
+    mention alias — falling back to ``fallback``. Never raises."""
     try:
-        agent_id = await resolve_tag(pool, "infra")
+        agent_id = await resolve_tag(pool, tag)
         if not agent_id:
-            return _FALLBACK_LABEL
+            return fallback
         meta = await pool.fetchval("SELECT metadata FROM agents WHERE id = $1", agent_id)
         aliases = (meta or {}).get("mention_aliases") or [agent_id]
         return f"@{str(aliases[0]).lstrip('@')}"
     except Exception as exc:  # noqa: BLE001 — a label lookup must never block a task
-        logger.warning("hub_project_label_failed", error=str(exc)[:200])
-        return _FALLBACK_LABEL
+        logger.warning("hub_project_label_failed", tag=tag, error=str(exc)[:200])
+        return fallback
+
+
+async def _owner(pool: asyncpg.Pool, problem_id: str) -> _Owner:
+    """Who owns the problem: decided by the source of its FIRST occurrence, the
+    producer that raised it."""
+    source = await pool.fetchval(
+        "SELECT source FROM problem_events "
+        "WHERE problem_id = $1::uuid AND kind = 'occurrence' ORDER BY id LIMIT 1",
+        problem_id,
+    )
+    return _OWNER_BY_SOURCE.get(str(source or ""), _INFRA_OWNER)
+
+
+async def _books_project(pool: asyncpg.Pool, entity: str) -> str | None:
+    """The Todoist project `books_todoist_projects` names for ``entity``: the DB
+    row first, then the env, then None — the Inbox. Never raises."""
+    raw = ""
+    try:
+        stored = await pool.fetchval(
+            "SELECT value FROM settings WHERE key = $1", _BOOKS_PROJECTS_SETTING
+        )
+        if isinstance(stored, dict):
+            raw = str(stored.get("val") or "")
+    except Exception as exc:  # noqa: BLE001 — a project lookup must never block a task
+        logger.warning("hub_project_books_projects_failed", error=str(exc)[:200])
+    project = parse_kv(raw).get(entity)
+    if not project:
+        project = parse_kv(str(getattr(_settings(), "books_todoist_projects", "") or "")).get(
+            entity
+        )
+    return project or None
 
 
 def _settings() -> Any:
@@ -530,6 +607,9 @@ async def project(
     latest_event_id = await pool.fetchval(
         "SELECT COALESCE(max(id), 0) FROM problem_events WHERE problem_id = $1::uuid", problem_id
     )
+    # The capture idempotency row is keyed on the tag the task was captured
+    # with, so both the lookup below and the capture use the owner's tag.
+    owner = await _owner(pool, problem_id)
 
     task_id = p["todoist_task_id"]
     if task_id and task_id.startswith("item-"):
@@ -541,7 +621,7 @@ async def project(
         real = await pool.fetchval(
             "SELECT todoist_task_ref FROM todoist_capture_idempotency "
             "WHERE source_tag = $1 AND external_id = $2",
-            SOURCE_TAG,
+            owner.source_tag,
             f"problem-{problem_id}",
         )
         if not real or real.startswith("item-"):
@@ -591,13 +671,23 @@ async def project(
             problem_id,
         )
         description = merge_block((latest or "")[: _DESCRIPTION_CAP - len(block) - 2], block)
+        # ponytail: every money problem goes to the personal project. Routing a
+        # hikmah instrument to the hikmah project needs the chart's
+        # instrument→entity map, which nothing here has yet.
+        project_id = (
+            await _books_project(pool, owner.books_entity) if owner.books_entity else None
+        )
         task_id = await _capture_to_inbox_impl(
             pool,
-            SOURCE_TAG,
+            owner.source_tag,
             f"problem-{problem_id}",
             p["title"][:120],
             description[:_DESCRIPTION_CAP],
-            [await _assignee_label(pool)],
+            [
+                await _assignee_label(pool, owner.agent_tag, owner.fallback_label),
+                *owner.extra_labels,
+            ],
+            project_id=project_id,
         )
         if not task_id:
             return {"problem_id": problem_id, "skipped": "no_task"}
@@ -872,7 +962,12 @@ async def reconcile_completed_tasks(
                 if await _uncomplete_task(pool, r["todoist_task_id"]):
                     out.append({**row, "action": "task_reopened"})
             elif await set_status(
-                pool, r["id"], "resolved", reason=TASK_COMPLETED_REASON, source="todoist", now=now
+                pool,
+                r["id"],
+                "resolved",
+                reason=TASK_COMPLETED_REASON,
+                source=TASK_COMPLETED_SOURCE,
+                now=now,
             ):
                 out.append({**row, "action": "resolved"})
         except Exception as exc:  # noqa: BLE001 — one bad problem must not stop the sweep

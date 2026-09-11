@@ -1055,8 +1055,14 @@ class MoneyActivities:
             "count": int(large["n"] or 0),
             "total": str(large["total"] or 0),
         }
+        # Not `ji.OPEN_DUE_SQL`: this list shows a ₹0 due in its window on
+        # purpose. It takes only the ticked-off rule — a bill the user has
+        # completed the task for is not one they still owe — and takes it in
+        # Python, because a ticked-off due is still an obligation the books
+        # have SEEN, so it must keep striking its forecast twin below (#393).
         dues = await self.db_pool.fetch(
-            "SELECT message_id, payee, payee_key, amount, currency, due_on, kind, todoist_ref "
+            "SELECT message_id, payee, payee_key, amount, currency, due_on, kind, todoist_ref, "
+            f"{ji.TICKED_OFF_SQL} AS ticked_off "
             "FROM finance.journal_index "
             "WHERE kind IN ('due','failed') AND linked_message_id IS NULL "
             "  AND due_on BETWEEN $1 AND $2 ORDER BY due_on",
@@ -1069,6 +1075,7 @@ class MoneyActivities:
                 "todoist_ref": r["todoist_ref"],
             }
             for r in dues
+            if not r["ticked_off"]
         ]
         closed = await self.db_pool.fetch(
             "SELECT message_id, payee, payee_key, amount, currency, due_on "

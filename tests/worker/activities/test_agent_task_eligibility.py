@@ -48,6 +48,27 @@ async def test_excludes_someday_waiting_completed_and_unassigned(db_pool, _seed)
     assert "tt-7" not in ids  # no assignee label
 
 
+async def test_a_money_task_is_never_picked_up(db_pool, _seed):
+    """Maou raises `#money` tasks and the user acts on them. The sweep used to
+    run Pandora's infra verb on all 13 of them in prod (2026-09-11) and park
+    each one; a finance verb could only guess about the user's money."""
+    await db_pool.execute(
+        """
+        INSERT INTO todoist_tasks (id, content, labels, source_tag, assignee_label, is_completed, updated_at)
+        VALUES ('tt-money','214 unmatched rows on axis-cc-1313', ARRAY['#money','@maou','@next'],
+                '#money', '@maou', false, now() - interval '30 days')
+        """
+    )
+    try:
+        act = AgentTaskActivities(db_pool=db_pool)
+        ids = {r["id"] for r in await act.find_actionable_tasks(max_tasks=50)}
+        assert "tt-money" not in ids
+        # Scoped to the label: Maou's other tasks still reach the sweep.
+        assert "tt-3" in ids
+    finally:
+        await db_pool.execute("DELETE FROM todoist_tasks WHERE id = 'tt-money'")
+
+
 async def test_cap_respected(db_pool, _seed):
     act = AgentTaskActivities(db_pool=db_pool)
     assert len(await act.find_actionable_tasks(max_tasks=2)) == 2
