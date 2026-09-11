@@ -379,6 +379,36 @@ async def test_a_kind_this_tick_did_not_evaluate_is_left_alone(db_pool):
     assert (await get_problem(db_pool, pid))["status"] == "open"
 
 
+async def test_a_class_this_tick_did_not_evaluate_is_left_alone(db_pool):
+    """#491, one level down. Coverage shares the instrument kind with the
+    matcher's classes, so a tick that skipped coverage cannot say so by
+    dropping the kind — that would stop `unmatched_rows` resolving too. It
+    names the class instead, and only that class is left alone."""
+    missing, unmatched = _instrument(), _instrument()
+    first = await _sweep(
+        db_pool,
+        [
+            sf.finding(sf.STATEMENT_MISSING, missing, f"No statement for {missing}"),
+            sf.finding(sf.UNMATCHED_ROWS, unmatched, f"3 unmatched rows on {unmatched}"),
+        ],
+    )
+    ids = {f["subject"]: f["problem_id"] for f in first[sf.INSTRUMENT]["fresh"]}
+
+    await _sweep(
+        db_pool,
+        [],
+        kinds=(sf.INSTRUMENT,),
+        unevaluated={sf.STATEMENT_MISSING},
+        now=NOW + timedelta(minutes=5),
+    )
+    assert (await get_problem(db_pool, ids[missing]))["status"] == "open"
+    assert (await get_problem(db_pool, ids[unmatched]))["status"] == "resolved"
+
+    # A tick that did look, and found nothing, ends it.
+    await _sweep(db_pool, [], kinds=(sf.INSTRUMENT,), now=NOW + timedelta(minutes=10))
+    assert (await get_problem(db_pool, ids[missing]))["status"] == "resolved"
+
+
 async def test_the_unmatched_count_falls_and_the_problem_resolves_at_zero(db_pool):
     """The recovery half, driven by real match runs: three rows nothing
     matched, then two rules land, then all three. The count in the title has to

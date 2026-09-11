@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import shutil
 import subprocess
+import uuid
 from datetime import date
 from decimal import Decimal
 from pathlib import Path
@@ -21,6 +22,8 @@ from pathlib import Path
 import pytest
 import pytest_asyncio
 from aegis.services import books, statement_post
+from aegis.services import statement_findings as sf
+from aegis.services.hub import get_problem
 from aegis.services.statements import row_id_for
 from aegis_worker.activities import statements as statements_mod
 from aegis_worker.activities.statements import StatementActivities
@@ -337,17 +340,21 @@ def test_coverage_never_reports_an_account_that_has_never_sent_a_statement():
     assert [f["subject"] for f in out] == ["axis-9640"]
 
 
-def test_coverage_says_nothing_while_the_month_is_still_young():
+def test_coverage_does_not_look_while_the_month_is_still_young():
     """A statement for last month arrives within days of it closing. Asking on
     the 2nd flips every account to missing and resolves it again a week later —
     one Todoist task per account per month, saying only that the calendar
-    turned over."""
+    turned over.
+
+    And it says it did not look — None, not `[]` (#491). An empty list means
+    "looked, found nothing missing", which is what resolves every open
+    `statement_missing` problem."""
     from aegis.services import statement_findings
 
     seen = [_S("axis-9640", date(2026, 6, 1), date(2026, 6, 30))]
     assert statements_mod._coverage_findings(
         seen, statement_findings, today=date(2026, 8, 2)
-    ) == []
+    ) is None
 
 
 async def test_the_digest_is_produced_once_a_month_not_once_a_day(clean):
@@ -539,3 +546,67 @@ async def test_a_row_no_rule_places_is_indexed_on_the_account_its_block_names(cl
     assert await clean.fetchval(
         "SELECT account FROM finance.journal_index WHERE message_id = $1", msgid
     ) == named
+
+
+def _on(monkeypatch, day: date) -> None:
+    """Stand the activity on `day`: its `date.today()` answers `day`. Threading
+    a clock through the activity's arguments would change the schedule's
+    payload for the sake of a test."""
+
+    class _Day(date):
+        @classmethod
+        def today(cls):
+            return day
+
+    monkeypatch.setattr(statements_mod, "date", _Day)
+
+
+async def _open_problems(pool, *klasses: str) -> list[str]:
+    """One live money problem per class, each on an account of its own. ONE
+    sweep opens them all: a second would resolve the first one's problems."""
+    subjects = [f"zzacct-{uuid.uuid4().hex[:8]}" for _ in klasses]
+    out = await sf.sweep(
+        pool,
+        [sf.finding(k, s, f"{k} on {s}") for k, s in zip(klasses, subjects, strict=True)],
+        kinds=(sf.INSTRUMENT,),
+        project=False,
+    )
+    ids = {f["subject"]: f["problem_id"] for f in out[sf.INSTRUMENT]["fresh"]}
+    return [ids[s] for s in subjects]
+
+
+async def test_a_tick_inside_the_grace_window_leaves_statement_missing_open(
+    clean, tmp_path, monkeypatch
+):
+    """#491. Coverage does not look for the first `_COVERAGE_GRACE_DAYS` of a
+    month, and the sweep was told it had: every open "no statement arrived"
+    problem was resolved on the 1st because none was found, and a statement
+    that really was missing got a NEW task on the 9th, every month. The classes
+    that were evaluated on the same tick still recover."""
+    cfg = _repo(tmp_path)
+    missing, unmatched = await _open_problems(clean, sf.STATEMENT_MISSING, sf.UNMATCHED_ROWS)
+    sid = await _statement(clean, "hdfc-1225", "2026-07-01", "2026-07-31", "0", "-500", 1)
+    await _row(clean, "hdfc-1225", "2026-07-10", "out", "500.00", "ATM WITHDRAWAL", sid, "-500")
+    _on(monkeypatch, date(2026, 10, 3))
+
+    await ActivityEnvironment().run(_act(clean, cfg).reconcile_statements, False, "")
+
+    assert (await get_problem(clean, missing))["status"] == "open"
+    assert (await get_problem(clean, unmatched))["status"] == "resolved"
+
+
+async def test_a_tick_past_the_grace_window_resolves_what_coverage_no_longer_finds(
+    clean, tmp_path, monkeypatch
+):
+    """The other half. Once coverage really looks, a `statement_missing` it does
+    not find again is over — which is how the problem closes the day the
+    statement lands."""
+    cfg = _repo(tmp_path)
+    (missing,) = await _open_problems(clean, sf.STATEMENT_MISSING)
+    sid = await _statement(clean, "hdfc-1225", "2026-07-01", "2026-07-31", "0", "-500", 1)
+    await _row(clean, "hdfc-1225", "2026-07-10", "out", "500.00", "ATM WITHDRAWAL", sid, "-500")
+    _on(monkeypatch, date(2026, 10, 12))
+
+    await ActivityEnvironment().run(_act(clean, cfg).reconcile_statements, False, "")
+
+    assert (await get_problem(clean, missing))["status"] == "resolved"

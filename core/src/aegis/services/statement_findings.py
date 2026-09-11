@@ -405,6 +405,7 @@ async def sweep(
     findings: Sequence[Mapping[str, Any]],
     *,
     kinds: Collection[str] = (),
+    unevaluated: Collection[str] = (),
     now: datetime | None = None,
     project: bool = True,
 ) -> dict[str, dict[str, Any]]:
@@ -416,6 +417,12 @@ async def sweep(
     not evaluate arrives as an empty findings list, and an empty findings list
     is what resolves every open problem of that kind — so a matcher-only run
     that forgot to say so would report every locked statement as fixed.
+
+    ``unevaluated`` is the same promise for a CLASS inside an evaluated kind:
+    it is left out of the classes its kind's call may resolve, so its open
+    problems stay as they are. Coverage inside its grace window is the case
+    (#491) — it shares the instrument kind with the matcher's classes, so
+    leaving out the kind would stop those resolving too.
 
     Findings of an arrival-time class are refused rather than quietly dropped:
     they belong to :func:`record_closing_balance`, and sweeping one would
@@ -452,7 +459,7 @@ async def sweep(
             pool,
             source=SOURCE,
             subject_kind=kind,
-            classes=list(classes),
+            classes=[c for c in classes if c not in unevaluated],
             findings=by_kind[kind],
             now=now,
             project=project,

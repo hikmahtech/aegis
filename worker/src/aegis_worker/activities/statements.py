@@ -335,13 +335,19 @@ class StatementActivities:
                 instrument=statement.instrument,
             )
 
-        # Coverage is swept in the SAME call as the rest of the instrument
-        # classes, and it has to be: `statement_missing` is one of them, so a
-        # sweep that produced no coverage findings would resolve every open
-        # "no statement arrived" problem for the reason that it never looked.
-        findings = statement_findings.match_findings(run) + _coverage_findings(
-            statements, statement_findings, today=date.today()
-        )
+        # Coverage rides the SAME call as the matcher's classes, because
+        # `statement_missing` is an instrument class. That alone is not enough:
+        # what decides whether its open problems may be resolved is whether
+        # coverage LOOKED, and inside its grace window it does not (#491).
+        # `reconcile_findings` resolves every open problem of a class it is
+        # handed and did not find, so handing it `statement_missing` on days
+        # 1-8 closed every "no statement arrived" task because nothing was
+        # checked, and a statement really missing came back as a new task on
+        # the 9th, every month. None means coverage did not look, and naming the
+        # class `unevaluated` leaves its problems alone while the rest of the
+        # kind still resolves.
+        coverage = _coverage_findings(statements, statement_findings, today=date.today())
+        findings = statement_findings.match_findings(run) + (coverage or [])
         swept = await statement_findings.sweep(
             self.db_pool,
             findings,
@@ -351,6 +357,7 @@ class StatementActivities:
             # report every locked statement as fixed. The `statement` kind is
             # intake's to sweep, not this activity's.
             kinds=(statement_findings.INSTRUMENT, statement_findings.CURRENCY),
+            unevaluated={statement_findings.STATEMENT_MISSING} if coverage is None else (),
         )
         return {
             "status": "ok",
@@ -427,7 +434,7 @@ _COVERAGE_GRACE_DAYS = 8
 _CYCLE_DAYS = 35
 
 
-def _coverage_findings(statements, findings_mod, *, today: date) -> list[dict]:
+def _coverage_findings(statements, findings_mod, *, today: date) -> list[dict] | None:
     """§15.4's `statement_missing`: which accounts stopped sending.
 
     Two rules, and the first is the one that matters. **An account that has
@@ -440,14 +447,16 @@ def _coverage_findings(statements, findings_mod, *, today: date) -> list[dict]:
 
     Second, wait out `_COVERAGE_GRACE_DAYS` after the month closes before
     asking, so the answer is "it never came" rather than "it is the 2nd".
+    Until then this returns None — "did not look" — never `[]`, which means
+    "looked, and nothing is missing".
     """
     month_start, month_end = _last_month(today)
     first_of_month = today.replace(day=1)
     if (today - first_of_month).days < _COVERAGE_GRACE_DAYS:
-        # Still inside the grace window: say nothing, and — crucially — hand the
-        # sweep no `statement_missing` findings, which resolves any that are
-        # open. That is correct: we are not currently claiming any are missing.
-        return []
+        # Still inside the grace window, so coverage was not evaluated, and None
+        # says so. `[]` here resolved every open `statement_missing` problem on
+        # the 1st of the month for the reason that nothing was checked (#491).
+        return None
     ever = {s.instrument for s in statements}
     # A statement covers a month when its period spans the MIDDLE of it. A
     # bank's billing period is its own business: HDFC bills the 5th to the 4th,
