@@ -189,6 +189,55 @@ async def test_a_fresh_task_still_gets_its_gate_card(db_pool):
     assert (await acts.classify_one(task))["classification"] == "pandora_gate"
 
 
+# --- a money task that falls back to the Inbox --------------------------------
+#
+# A money problem's task lands in the Inbox only when `books_todoist_projects`
+# names no `personal` project. It carries no `@pandora`, so the two ownership
+# checks above never see it, and it used to reach the LLM classifier. A `trash`
+# verdict completes the task, and the hub then reads that completion back as the
+# user acknowledging the finding: the system grading its own work.
+
+_MONEY_LABELS = ("#money", "@maou", "@next")
+
+
+async def test_a_money_task_is_the_hubs_and_never_reaches_the_classifier(db_pool):
+    """Falsifiable: drop the `#money` check and the classifier is called; move
+    it below the content routes and the second task gets a gate card."""
+    acts, connector = _acts(db_pool)
+    task = await _task(
+        db_pool, _tid(), content="3 unmatched rows on axis-cc-1313",
+        labels=_MONEY_LABELS, source_tag="#money",
+    )
+    decision = await acts.classify_one(task)
+    assert decision["classification"] == "hub_owned"
+    # A title the infra route matches still never reaches the route.
+    routed = await _task(
+        db_pool, _tid(), content="Service charge down 2 rows on axis-cc-1313",
+        labels=_MONEY_LABELS, source_tag="#money",
+    )
+    assert (await acts.classify_one(routed))["classification"] == "hub_owned"
+    acts.llm_client.think.assert_not_awaited()
+
+    # It already has its state, so clarify sends nothing: no complete, no move.
+    out = await acts.apply_outcome(task, decision)
+    assert out["applied"] is True and out["commands_sent"] == 0
+    connector.commands.assert_not_awaited()
+
+
+async def test_a_comment_on_a_money_task_still_reaches_maou(db_pool):
+    """The `#money` check sits below the comment short-circuits: a question
+    on the task is still Maou's to answer."""
+    acts, _ = _acts(db_pool)
+    task = await _task(
+        db_pool, _tid(), content="3 unmatched rows on axis-cc-1313",
+        labels=_MONEY_LABELS, source_tag="#money",
+    )
+    task["latest_user_note"] = "the 12 July one was rent, the rest are groceries"
+    decision = await acts.classify_one(task)
+    assert decision["classification"] == "maou_followup"
+    assert decision["assignee"] == "@maou"
+
+
 # --- apply_outcome: hub_owned leaves clarify correctly -------------------------
 
 

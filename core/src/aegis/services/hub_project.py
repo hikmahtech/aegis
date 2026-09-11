@@ -69,6 +69,9 @@ logger = structlog.get_logger()
 # The literal token clarify's loop guard and `work_sessions.is_user_note` key on.
 FOOTER = "\n\nWorkflow run: problem-hub"
 SOURCE_TAG = "#alert"
+# The tag on a money problem's task (see `_OWNER_BY_SOURCE`). Clarify reads it
+# too: such a task is the user's to act on, never the classifier's.
+MONEY_SOURCE_TAG = "#money"
 COLLAPSE_WINDOW = timedelta(minutes=30)
 # Statuses that earn a task. `suppressed` and `closed` never do.
 PROJECTED_STATUSES = frozenset(
@@ -122,7 +125,7 @@ _INFRA_OWNER = _Owner(SOURCE_TAG, "infra", _FALLBACK_LABEL)
 # The key is spelled here, not imported: `statement_findings.SOURCE` is the
 # same word, but that module imports this one.
 _OWNER_BY_SOURCE = {
-    "money": _Owner("#money", "finance", "@maou", ("@next",), "personal"),
+    "money": _Owner(MONEY_SOURCE_TAG, "finance", "@maou", ("@next",), "personal"),
 }
 
 

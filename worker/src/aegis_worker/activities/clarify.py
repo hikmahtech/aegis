@@ -43,7 +43,8 @@ Content-route classifications:
   already handling. The hub decides whether a problem is investigated, so
   this outcome starts nothing and only stamps the GTD state. A user's comment
   on such a task is still `pandora_followup`, investigated on the task's own
-  problem.
+  problem. A `#money` task is `hub_owned` whatever its title: Maou raised it for
+  the user to act on, and the classifier must never trash it.
 
 Any task carrying @me — set on a gate card or by hand — is skipped by
 find_unclassified_items entirely: the user's "hands off, I'm on it" signal.
@@ -77,6 +78,7 @@ from aegis.services.gtd_rules import (
     DEFAULT_SKIP_INBOX,
     get_gtd_rules,
 )
+from aegis.services.hub_project import MONEY_SOURCE_TAG
 from aegis.services.hub_project import SOURCE_TAG as HUB_SOURCE_TAG
 from aegis.services.knowledge import _content_id_for
 
@@ -267,7 +269,8 @@ GTD_STATE_LABELS: tuple[str, ...] = (_LABEL_NEXT, _LABEL_SOMEDAY, _LABEL_WAITING
 # without an entry here fails test_clarify_gtd_state_contract.
 #
 # Two labels in GTD_STATE_LABELS are *park* labels for the agent-task executor
-# (aegis_worker.activities.agent_task.EXCLUDED_LABELS = @someday + @waiting):
+# (aegis_worker.activities.agent_task.EXCLUDED_LABELS = @someday + @waiting,
+# plus the `#money` source tag, which is not a state):
 # reaching either removes an agent-assigned task from find_actionable_tasks'
 # eligible pool. So clarify must never stamp @waiting — an assignee label means
 # "an AEGIS agent should work this", not "blocked on a human". @waiting is
@@ -295,7 +298,8 @@ _GTD_STATE_FOR: dict[str, str | None] = {
     # The hub's own task (#472): an open problem assigned to the infra agent.
     # The projector creates it with `#alert` and the agent label only, so this
     # is the one write clarify owes it. Skipped when the task already has a
-    # state — an investigation that parked it on a card left it `@waiting`.
+    # state — an investigation that parked it on a card left it `@waiting`,
+    # and a `#money` task is created with `@next`.
     "hub_owned": _LABEL_NEXT,
     "pandora_followup": _LABEL_NEXT,
     # -- deliberately parked --------------------------------------------------
@@ -980,6 +984,17 @@ class ClarifyActivities:
                 "reason": "task already labelled @pandora",
                 "llm_model": "rules",
             }
+
+        # A money problem's task (`#money @maou @next`) reaches the Inbox only
+        # when `books_todoist_projects` names no `personal` project. With no
+        # `@pandora` it skips the ownership check above, and the one below runs
+        # only for a title a gated route matches, so it fell through to the
+        # classifier. A `trash` verdict completes the task, and the hub reads a
+        # completion back as the user acknowledging the finding. Maou raised it
+        # and the user acts on it, so nothing below may touch it. A comment on
+        # it has already gone to Maou, above.
+        if (source_tag or "") == MONEY_SOURCE_TAG:
+            return self._hub_owned("a money task the problem hub raised for the user to act on")
 
         # Content-route branch. First encounter (no @pandora label yet — that
         # case returned in the @pandora block above). A `gate: true` route
