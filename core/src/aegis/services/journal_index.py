@@ -213,7 +213,37 @@ async def mark_due_paid(pool: Any, due_msgid: str, payment_msgid: str) -> None:
 # WAS: the index is a record of what arrived, the events table still shows it,
 # and the brief still lists it in its window. Only the count of things you
 # still owe leaves it out.
-OPEN_DUE_SQL = "amount IS DISTINCT FROM 0"
+#
+# `due_on IS NOT NULL`: a bill with no due date can neither be matched by
+# `find_open_due`, which keys on a due-date window, nor be overdue. 17 such rows
+# came from the 2026-09-05 backfill, and each could only ever stay "open".
+#
+# Not ticked off (`TICKED_OFF_SQL`): on 2026-09-11 ten dues counted as open
+# although the user had completed their `#bill` tasks, because nothing read a
+# completion as "paid". A person's completion is their word that it is handled.
+# The clause reads the mirror every time, so un-ticking the task reopens the
+# due. `find_open_due` deliberately does not read it: a payment that arrives
+# after the tick still links to its due.
+#
+# An untasked due stops counting `_UNTASKED_DUE_DAYS` after it falls due. These
+# are the autopay notices and twins `capture_due` chose not to task: with no
+# task there is nothing for the user to act on, and an autopay almost always
+# went through. The row stays indexed.
+#
+# Every reader selects FROM `finance.journal_index` unaliased, which is what
+# the correlated `journal_index.todoist_ref` binds to.
+_UNTASKED_DUE_DAYS = 14
+# ponytail: a task deleted from Todoist drops out of the mirror, and its due
+# counts as open again — the fail-open direction.
+TICKED_OFF_SQL = (
+    "EXISTS (SELECT 1 FROM todoist_tasks tt "
+    "WHERE tt.id = journal_index.todoist_ref AND tt.is_completed)"
+)
+OPEN_DUE_SQL = (
+    "(amount IS DISTINCT FROM 0 AND due_on IS NOT NULL "
+    f"AND NOT {TICKED_OFF_SQL} "
+    f"AND (todoist_ref IS NOT NULL OR due_on >= current_date - {_UNTASKED_DUE_DAYS}))"
+)
 
 
 async def find_open_due(
