@@ -130,7 +130,7 @@ The shipped schedule set (`config/seed/activities.yaml` — all crons UTC):
 |---|---|---|---|---|
 | `infra-heartbeat-2m` | `*/2 * * * *` | `InfraHeartbeatFlow` | Pandora's Actor | Polls swarm nodes + services; spawns an investigation on **state transitions only**, so steady state costs nothing |
 | `todoist-sync-5min` | `*/5 * * * *` | `TodoistSyncFlow` | Sebas | Incremental Todoist Sync API pull + drains the `todoist_outbox` write queue |
-| `hub-sweep-5m` | `3-58/5 * * * *` | `HubSweepFlow` | Pandora's Actor | The problem hub's housekeeping: opens a `suppressed` problem once its deploy or maintenance window passes, resolves a problem whose task you completed, brings every task up to date with its problem, and folds three or more problems of one class into a group when a model call agrees they are one condition |
+| `hub-sweep-5m` | `3-58/5 * * * *` | `HubSweepFlow` | Pandora's Actor | The problem hub's housekeeping: opens a `suppressed` problem once its deploy or maintenance window passes, resolves a problem whose task you completed, settles merged fixes (resolves a `verifying` problem once its alert has stayed clear for `fix_verify_hours`, reopens one it came back to), brings every task up to date with its problem, and folds three or more problems of one class into a group when a model call agrees they are one condition |
 | `social-publish-5min` | `*/5 * * * *` | `SocialPublishFlow` | Sebas | `@publish`-labelled tasks due now → approval card → post. Ships **inert**: `social_publishing_enabled` defaults to false |
 | `gtd-clarify-15min` | `*/15 * * * *` | `ClarifyFlow` | Sebas | Classifies unprocessed Inbox tasks (≤ 20 per tick) |
 | `llm-spend-guard-15min` | `*/15 * * * *` | `LLMSpendGuardFlow` | Pandora's Actor | Rolling-24h token **or dollar** budget → flips the LLM kill switch. **Inert** until one is set (both default to 0) |
@@ -184,7 +184,7 @@ Not in this table because they're **event-driven, not scheduled**:
 `AlertInvestigationFlow` (webhooks + pollers, [§7](#7-the-alert-pipeline)),
 `MoneyProcessFlow` (per-email child: one money email into the books),
 `AgentChatReplyFlow` (Todoist comment replies), `AgentTaskFlow` (per-task child
-of the sweep), and `GitHubAlertFlow` (GitHub PR webhook notifier).
+of the sweep), and `GitHubAlertFlow` (GitHub PR webhook: notifies on opened PRs, and hands a closed one to the hub, which follows a fix PR an investigation opened).
 
 Note the **ship-active-but-inert** pattern: `social-publish-5min`,
 `llm-spend-guard-15min`, `drive-sync-raphael`, `wearable-ingest-6h`,
@@ -474,9 +474,10 @@ regardless of where the alert came from:
 - Hand-captured Todoist tasks routed via a content route with
   `alert_overrides` (e.g. "X is down" → a synthetic `NodeDown`)
 
-(`POST /api/webhooks/github` is separate: `GitHubAlertFlow` only posts PR
-notification cards for repos tracked in `resources` — it does not
-investigate.)
+(`POST /api/webhooks/github` is separate: `GitHubAlertFlow` posts PR
+notification cards for repos tracked in `resources`, and hands a closed PR
+to the hub so a fix PR an investigation opened is followed to a verified
+fix (#502) — it does not investigate.)
 
 ```mermaid
 flowchart TD
@@ -497,12 +498,18 @@ flowchart TD
     FR -- recovered --> X6["exit; the problem resolves"]
     FR -- "did not recover" --> RR
     RS -- "back within the hour<br/>of a restart" --> RR
-    RR --> KC["runbook + prior-incident context"]
+    RR --> KC["runbook + past verdicts<br/>(a taken fix first, discarded ones left out)"]
     KC --> IV["investigate: coding CLI on the repo,<br/>LLM-only fallback"]
     IV --> VE{"anything to decide?"}
     VE -- "no" --> NO["record_investigation:<br/>event on the problem, task comment,<br/>chat ping"]
     VE -- "fix branch / actionable<br/>with commands / escalating /<br/>restart did not stick" --> G2["Gate 2 card: Open PR / Run fix /<br/>Mute 24h / Acknowledge / Discard"]
     G2 --> NO
+    NO --> KG["verdict stored with the outcome<br/>(opened_pr, run_fix, discarded, no_card …)"]
+    G2 -- "Open PR" --> PR["draft PR, linked to the problem;<br/>problem: fixing"]
+    PR -- "merged (GitHub webhook)" --> VF["verifying"]
+    PR -- "closed unmerged" --> WH["waiting_human"]
+    VF -- "clear for 24h<br/>(hub sweep)" --> OK["resolved; task closes"]
+    VF -- "back after the grace" --> RO["open again;<br/>the task says so"]
 ```
 
 The flow no longer decides whether an alert is new — the hub does, before the
@@ -556,8 +563,10 @@ The steps that make it trustworthy:
   doesn't have checked out falls back to LLM-only investigation.
 - **Context.** The alert's runbook, from the `runbooks` table if you wrote
   one (admin **Runbooks** page), else `runbooks/<AlertName>.md` baked into
-  the worker image (`TODO: fill in` stubs are treated as absent), plus
-  prior-incident context from the knowledge store.
+  the worker image (`TODO: fill in` stubs are treated as absent), plus up to
+  three past verdicts on similar alerts from the knowledge store, each with
+  what you did about it: a fix you took comes first, and a fix you discarded
+  never comes back (#502).
 - **Investigation** runs your coding CLI (Claude Code / Kimi) over SSH on the
   registered coding host against the resolved repo, LLM-only as fallback, and
   ends in a structured verdict: `resolved` / `not_actionable` / `actionable` /
@@ -572,6 +581,14 @@ The steps that make it trustworthy:
   run. A verdict with nothing to decide is told, not asked: a comment on the
   task, an event on the timeline and a chat ping. Mute such a problem from the
   admin **Problems** page.
+- **After the decision.** The verdict goes to the knowledge store only once
+  you have answered, tagged with the answer (or `no_card`), so the next
+  investigation learns from what you did rather than from what was proposed.
+  An opened PR is followed (#502): its merge moves the problem to `verifying`,
+  and the hub sweep resolves it once the alert has stayed clear for 24 hours,
+  or reopens it and says so on the task if the alert comes back. A PR closed
+  without merging hands the problem back to you. See
+  [`infrastructure.md`](infrastructure.md#after-open-pr-following-the-fix-to-a-verified-fix).
 
 Everything lands on the problem's timeline (`problem_events`) and, projected
 from it, as a comment trail on a `@pandora`-labelled Todoist task — so the

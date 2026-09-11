@@ -53,6 +53,16 @@ async def _project() -> dict:
     return {"projected": 3, "created": 1, "errors": 0}
 
 
+_verify_args: list[tuple[float, float]] = []
+
+
+@activity.defn(name="verify_fixes")
+async def _verify(window_hours: float, grace_hours: float) -> dict:
+    _calls.append("verify")
+    _verify_args.append((window_hours, grace_hours))
+    return {"resolved": 1, "reopened": 1, "problem_ids": ["d", "e"]}
+
+
 def _judge(agreed: bool):
     @activity.defn(name="judge_group")
     async def judge(candidate: dict) -> dict:
@@ -89,7 +99,12 @@ async def _apply(candidate: dict, verdict: dict) -> dict:
     }
 
 
-async def _run(activities: list, workflows: tuple = (HubSweepFlow,), flow=HubSweepFlow):
+async def _run(
+    activities: list,
+    workflows: tuple = (HubSweepFlow,),
+    flow=HubSweepFlow,
+    config: HubSweepConfig | None = None,
+):
     """Run one sweep; returns `(result, history)`."""
     async with (
         await WorkflowEnvironment.start_time_skipping() as env,
@@ -102,7 +117,7 @@ async def _run(activities: list, workflows: tuple = (HubSweepFlow,), flow=HubSwe
     ):
         handle = await env.client.start_workflow(
             flow.run,
-            HubSweepConfig(agent_id="pandoras-actor"),
+            config or HubSweepConfig(agent_id="pandoras-actor"),
             id=f"hub-{uuid.uuid4()}",
             task_queue=worker.task_queue,
         )
@@ -113,11 +128,16 @@ async def _run(activities: list, workflows: tuple = (HubSweepFlow,), flow=HubSwe
 @pytest.mark.asyncio
 async def test_sweep_promotes_then_projects_and_reports():
     _calls.clear()
-    out, _ = await _run([_promote, _reconcile, _project, _finder([]), _judge(True), _apply])
+    _verify_args.clear()
+    out, _ = await _run(
+        [_promote, _reconcile, _verify, _project, _finder([]), _judge(True), _apply]
+    )
     assert out == {
         "promoted": 2,
         "task_completed": 1,
         "task_reopened": 1,
+        "fix_resolved": 1,
+        "fix_reopened": 1,
         "projected": 3,
         "created": 1,
         "errors": 0,
@@ -126,21 +146,52 @@ async def test_sweep_promotes_then_projects_and_reports():
         "folded": 0,
     }
     # Promotion first, so a just-promoted problem gets its task in the same
-    # tick; completed tasks next, so their resolve is projected in the same
-    # tick too; grouping last, on problems that already have their tasks.
-    assert _calls == ["promote", "reconcile", "project", "find"]
+    # tick; completed tasks and merged fixes next, so what they resolve or
+    # reopen is projected in the same tick too; grouping last, on problems
+    # that already have their tasks.
+    assert _calls == ["promote", "reconcile", "verify", "project", "find"]
+    # The generic defaults when the hub sweep row sets nothing.
+    assert _verify_args == [(24.0, 1.0)]
+
+
+@pytest.mark.asyncio
+async def test_sweep_verifies_fixes_with_the_rows_windows():
+    _calls.clear()
+    _verify_args.clear()
+    await _run(
+        [_promote, _reconcile, _verify, _project, _finder([]), _judge(True), _apply],
+        config=HubSweepConfig(agent_id="pandoras-actor", fix_verify_hours=48.0, fix_grace_hours=6.0),
+    )
+    assert _verify_args == [(48.0, 6.0)]
+
+
+def test_the_fix_windows_are_read_from_activities_config():
+    from aegis_worker.registry import FLOWS
+
+    spec = next(s for s in FLOWS if s.flow is HubSweepFlow)
+    row = {"agent_id": "pandoras-actor", "_settings": {}}
+    cfg = spec.schedule_config({**row, "config": {"fix_verify_hours": 12, "fix_grace_hours": "0.5"}})
+    assert (cfg.fix_verify_hours, cfg.fix_grace_hours) == (12.0, 0.5)
+    # A blank field on the admin page is "not set": the flow's own defaults.
+    default = HubSweepConfig()
+    for config in ({}, {"fix_verify_hours": "", "fix_grace_hours": None}):
+        cfg = spec.schedule_config({**row, "config": config})
+        assert (cfg.fix_verify_hours, cfg.fix_grace_hours) == (
+            default.fix_verify_hours,
+            default.fix_grace_hours,
+        )
 
 
 @pytest.mark.asyncio
 async def test_sweep_groups_a_cluster_the_judge_agrees_on():
     _calls.clear()
     out, _ = await _run(
-        [_promote, _reconcile, _project, _finder([_CANDIDATE]), _judge(True), _apply]
+        [_promote, _reconcile, _verify, _project, _finder([_CANDIDATE]), _judge(True), _apply]
     )
     assert out["grouped"] == 1
     assert out["folded"] == 2
     assert out["group_candidates"] == 1
-    assert _calls == ["promote", "reconcile", "project", "find", "judge", "apply"]
+    assert _calls == ["promote", "reconcile", "verify", "project", "find", "judge", "apply"]
 
 
 @pytest.mark.asyncio
@@ -149,7 +200,7 @@ async def test_sweep_leaves_a_cluster_the_judge_rejects_alone():
     from the judge must not merge anything."""
     _calls.clear()
     out, _ = await _run(
-        [_promote, _reconcile, _project, _finder([_CANDIDATE]), _judge(False), _apply]
+        [_promote, _reconcile, _verify, _project, _finder([_CANDIDATE]), _judge(False), _apply]
     )
     assert out["group_candidates"] == 1
     assert out["grouped"] == 0
@@ -196,6 +247,54 @@ async def test_a_sweep_started_before_the_deploy_replays_on_the_new_worker():
     await Replayer(workflows=[HubSweepFlow]).replay_workflow(history)
 
 
+@workflow.defn(name="HubSweepFlow")
+class _SweepBeforeFixVerification:
+    """HubSweepFlow as it ran before #502: the completed-task step behind its
+    patch, and no `verify_fixes`. Kept so a history it wrote can be replayed
+    against today's flow."""
+
+    @workflow.run
+    async def run(self, config: HubSweepConfig) -> dict:
+        short = timedelta(seconds=30)
+        await workflow.execute_activity(
+            "promote_expired_suppressions", start_to_close_timeout=short
+        )
+        if workflow.patched("hub-sweep-completed-tasks"):
+            await workflow.execute_activity(
+                "reconcile_completed_tasks", start_to_close_timeout=short
+            )
+        await workflow.execute_activity("project_pending", start_to_close_timeout=short)
+        await workflow.execute_activity(
+            "find_group_candidates", args=[0, 0.0], start_to_close_timeout=short
+        )
+        return {}
+
+
+@pytest.mark.asyncio
+async def test_a_sweep_started_before_fix_verification_replays_on_the_new_worker():
+    """#502 put `verify_fixes` between the completed-task step and projection.
+    A sweep in flight across the deploy replays a history without it, so the
+    step is behind `workflow.patched`.
+
+    Falsifiable: call the activity without the guard and this replay raises a
+    nondeterminism error.
+    """
+    _, history = await _run(
+        [_promote, _reconcile, _project, _finder([])],
+        workflows=(_SweepBeforeFixVerification,),
+        flow=_SweepBeforeFixVerification,
+    )
+    await Replayer(workflows=[HubSweepFlow]).replay_workflow(history)
+
+
+@pytest.mark.asyncio
+async def test_the_new_sweep_replays_its_own_history():
+    _, history = await _run(
+        [_promote, _reconcile, _verify, _project, _finder([]), _judge(True), _apply]
+    )
+    await Replayer(workflows=[HubSweepFlow]).replay_workflow(history)
+
+
 @pytest.mark.asyncio
 async def test_the_sweep_resolves_a_problem_whose_task_a_person_completed(db_pool):
     """The whole step on its real path: the flow calls the real activity,
@@ -226,7 +325,7 @@ async def test_the_sweep_resolves_a_problem_whose_task_a_person_completed(db_poo
 
     act = HubActivities(db_pool=db_pool)
     out, _ = await _run(
-        [_promote, act.reconcile_completed_tasks, _project, _finder([]), _judge(True), _apply]
+        [_promote, act.reconcile_completed_tasks, _verify, _project, _finder([]), _judge(True), _apply]
     )
 
     assert out["task_completed"] >= 1

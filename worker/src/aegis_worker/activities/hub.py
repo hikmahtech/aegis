@@ -18,7 +18,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 import asyncpg
-from aegis.services import hub, hub_group, hub_project, hub_watch
+from aegis.services import hub, hub_fix, hub_group, hub_project, hub_watch
 from temporalio import activity
 
 from aegis_worker.activities.delivery import safe_send_message
@@ -239,6 +239,59 @@ class HubActivities:
                 "record_investigation_project_failed problem=%s err=%s", problem_id, str(exc)[:200]
             )
         return {"recorded": True, "status_changed": moved}
+
+    @activity.defn
+    async def follow_fix_pr(self, pr: dict) -> dict:
+        """A pull request closed, merged or not (`GitHubAlertFlow`). When an
+        investigation opened it, the close lands on its problem and the
+        problem moves: `verifying` on a merge, `waiting_human` when it was
+        closed unmerged (`hub_fix.record_pr_closed`). Any other PR is nobody's
+        fix and changes nothing. Then projects, so the task hears it now
+        rather than at the next sweep.
+
+        `pr` is `GitHubAlertFlow._pr_from_payload`: `url`, `merged`,
+        `merged_at`, `closed_at`. Safe to retry: GitHub's timestamp is in the
+        event's id."""
+        if self.db_pool is None:
+            return {"followed": 0, "problems": []}
+        merged = bool(pr.get("merged"))
+        rows = await hub_fix.record_pr_closed(
+            self.db_pool,
+            url=str(pr.get("url") or ""),
+            merged=merged,
+            at=str((pr.get("merged_at") if merged else pr.get("closed_at")) or ""),
+        )
+        for row in rows:
+            try:
+                await hub_project.project(self.db_pool, row["problem_id"])
+            except Exception as exc:  # noqa: BLE001 — the sweep retries projection
+                activity.logger.warning(
+                    "follow_fix_pr_project_failed problem=%s err=%s",
+                    row["problem_id"],
+                    str(exc)[:200],
+                )
+        return {"followed": len(rows), "problems": rows}
+
+    @activity.defn
+    async def verify_fixes(
+        self,
+        window_hours: float = hub_fix.VERIFY_HOURS_DEFAULT,
+        grace_hours: float = hub_fix.GRACE_HOURS_DEFAULT,
+    ) -> dict:
+        """Settle the `verifying` problems (`hub_fix.verify_fixes`): resolve
+        one whose alert stayed clear for `window_hours` after its fix merged,
+        reopen one it came back to. Run by `HubSweepFlow` before projection,
+        which posts what this wrote in the same tick."""
+        if self.db_pool is None:
+            return {"resolved": 0, "reopened": 0, "problem_ids": []}
+        rows = await hub_fix.verify_fixes(
+            self.db_pool, window_hours=window_hours, grace_hours=grace_hours
+        )
+        return {
+            "resolved": sum(1 for r in rows if r["action"] == "resolved"),
+            "reopened": sum(1 for r in rows if r["action"] == "reopened"),
+            "problem_ids": [r["problem_id"] for r in rows],
+        }
 
     @activity.defn
     async def record_plan(self, inp: dict) -> dict:
