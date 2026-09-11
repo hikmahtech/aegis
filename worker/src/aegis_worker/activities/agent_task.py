@@ -25,7 +25,9 @@ ADDRESSABLE_ASSIGNEES = ["@sebas", "@raphael", "@maou", "@pandora"]
 # Reaching either of these removes a task from the eligible pool. Without that,
 # the cooldown becomes an infinite slow loop over the same tasks.
 PARK_LABEL = "@waiting"
-EXCLUDED_LABELS = ["@someday", PARK_LABEL]
+# `#money`: Maou raises these and the user acts on them; no verb could act on one
+# without guessing about the user's money.
+EXCLUDED_LABELS = ["@someday", PARK_LABEL, "#money"]
 
 # Upper bound on the eligible pool we consider per tick. Production's whole
 # agent-assigned backlog is ~80 rows, so this is the pool, not a sample.
