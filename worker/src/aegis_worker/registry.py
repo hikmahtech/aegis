@@ -135,6 +135,19 @@ def _int(config: dict[str, Any], key: str, default: int) -> int:
         return default
 
 
+def _float(config: dict[str, Any], key: str, default: float) -> float:
+    """:func:`_int` for a value that may be fractional, such as a window of
+    half a day. `_int` would refuse "0.5" and fall back to the default."""
+    raw = config.get(key, default)
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        logger.warning(
+            "activity_config_not_a_number", key=key, value=str(raw)[:40], using=default
+        )
+        return default
+
+
 class RegistrationError(RuntimeError):
     """A flow/activity is declared but not fully wired (or vice versa).
 
@@ -238,7 +251,10 @@ FLOWS: tuple[FlowSpec, ...] = (
         CleanupFlow,
         lambda act: CleanupConfig(
             retentions=act["config"].get("retentions") or {},
+            interaction_orphan_days=_int(act["config"], "interaction_orphan_days", 7),
+            dispatch_days=_int(act["config"], "dispatch_days", 30),
             task_session_days=_int(act["config"], "task_session_days", 7),
+            problem_close_days=_float(act["config"], "problem_close_days", 7.0),
         ),
     ),
     FlowSpec(InteractionFlow),

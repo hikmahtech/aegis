@@ -168,12 +168,13 @@ async def reconcile_findings(
 
 
 def mute_hint(problem_ids: list[str]) -> str:
-    """The one-liner a card carries so an operator can silence a problem
-    until the admin Problems page exists."""
-    ids = ", ".join(f"'{p}'" for p in problem_ids if p)
+    """The line a card carries on how to silence what it reports. It points at
+    the Problems page's Mute button, which goes through `hub.mute_problem` and
+    so records the mute on the timeline; the raw SQL it used to carry did not."""
+    ids = [p for p in problem_ids if p]
+    if not ids:
+        return ""
     return (
-        "Silence: UPDATE problems SET muted_until = now() + interval '2 days' "
-        f"WHERE id IN ({ids});"
-        if ids
-        else ""
+        "Silence: admin Problems page → open the problem → Mute 24h "
+        f"(problem{'s' if len(ids) > 1 else ''} {', '.join(ids)})."
     )

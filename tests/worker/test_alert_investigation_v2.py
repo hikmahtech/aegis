@@ -54,12 +54,6 @@ def mock_remote_script():
     return rs
 
 
-# --- check_alert_resolved ---
-
-
-# --- get_verification_delay ---
-
-
 # --- run_investigation ---
 
 

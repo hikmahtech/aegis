@@ -242,7 +242,7 @@ async def test_note_kind_can_find_its_problem_by_key(db_pool):
     note = Event(
         source="chat",
         external_id=f"note-{s}",
-        kind="human_note",
+        kind="session_note",
         title="I restarted it",
         klass="DockerServiceDown",
         subject=s,

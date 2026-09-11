@@ -882,7 +882,7 @@ async def test_the_card_carries_the_mute_hint_and_the_task_side_gets_a_problem(d
     delivery = FakeDelivery()
     act = _acts(db_pool, delivery)
     await env.run(act.report_flow_health, [_finding()], "a")
-    assert "UPDATE problems SET muted_until" in delivery.sent[0]
+    assert "Silence: admin Problems page" in delivery.sent[0]
     async with db_pool.acquire() as conn:
         p = await conn.fetchrow(
             "SELECT class, subject_kind, title FROM problems WHERE subject = $1 AND closed_at IS NULL",

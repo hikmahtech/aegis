@@ -164,6 +164,51 @@ async def test_merge_moves_the_duplicate_and_reports_what_moved(client, db_pool)
     assert bad.status_code == 400 and "must exist" in bad.json()["detail"]
 
 
+async def _task(pool, task_id: str) -> None:
+    await pool.execute(
+        "INSERT INTO todoist_tasks (id, content, labels, is_completed, updated_at) "
+        "VALUES ($1, 'fix it', ARRAY['@pandora'], false, now()) ON CONFLICT (id) DO NOTHING",
+        task_id,
+    )
+
+
+async def test_merge_retires_the_duplicates_task_like_the_chat_tool(client, db_pool, monkeypatch):
+    """A merged problem is closed, and a closed problem is never projected
+    again — so if the merge does not retire its task, nothing ever will. The
+    page and the chat tool are two doors onto one merge (#478)."""
+    from aegis.services.hub_project import link_task
+
+    async def no_key(pool, settings):
+        return ""
+
+    # No Todoist here: the note cannot post, and the completion still queues.
+    monkeypatch.setattr("aegis.services.hub_project.resolve_todoist_api_key", no_key)
+    keep_task, dup_task = f"zzk-{uuid.uuid4().hex[:6]}", f"zzm-{uuid.uuid4().hex[:6]}"
+    await _task(db_pool, keep_task)
+    await _task(db_pool, dup_task)
+    keep = await ingest_event(db_pool, _occ(_subject()), now=NOW)
+    dup = await ingest_event(db_pool, _occ(_subject()), now=NOW)
+    await link_task(db_pool, keep.problem_id, keep_task)
+    await link_task(db_pool, dup.problem_id, dup_task)
+
+    r = await client.post(
+        f"/api/admin/problems/{keep.problem_id}/merge", json={"merge_id": dup.problem_id}
+    )
+    assert r.status_code == 200, r.text
+    assert await db_pool.fetchval(
+        "SELECT is_completed FROM todoist_tasks WHERE id = $1", dup_task
+    ) is True
+    assert await db_pool.fetchval(
+        "SELECT count(*) FROM todoist_outbox WHERE temp_id = $1", f"problem-close-{dup_task}"
+    ) == 1
+    # The kept problem's own task is left alone.
+    assert await db_pool.fetchval(
+        "SELECT is_completed FROM todoist_tasks WHERE id = $1", keep_task
+    ) is False
+    assert r.json()["merged_task_id"] == dup_task
+    assert r.json()["merged_task_retired"] is True
+
+
 async def test_service_state_round_trip(client, db_pool):
     s = _subject()
     put = await client.put(

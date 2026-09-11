@@ -305,7 +305,7 @@ export default function Problems() {
                     <button
                       className="btn btn-sm"
                       disabled={busy !== '' || !mergeInto.trim()}
-                      title="Move that problem's events, links and sessions onto this one and close it, with a link back. Its own task is completed with a note pointing here."
+                      title="Move that problem's events and links onto this one and close it, with a link back. Its own task is completed with a note pointing here."
                       onClick={() => act(async () => {
                         await api.mergeProblems(p.id, mergeInto.trim());
                         setMergeInto('');

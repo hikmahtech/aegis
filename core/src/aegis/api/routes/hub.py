@@ -100,6 +100,14 @@ async def post_event(
     request: Request,
     settings: Settings = Depends(get_settings),
 ) -> dict[str, Any]:
+    """Record one event. It only records: it starts no investigation and
+    projects nothing inline, whatever the hub decides. The decision comes back
+    as `investigate` in the response, and the sweep gives the problem its task
+    within five minutes. The alert webhook is the route that acts on
+    `investigate`; this one stays a plain door for reports, because an event
+    from outside carries no alert dict for an investigation to work from, and
+    a route that is open when the secret is blank must not be able to start a
+    billed investigation."""
     _check_token(request, settings, "event")
     try:
         result = await ingest_event(_pool(request), Event(**body.model_dump(by_alias=False)))

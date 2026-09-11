@@ -67,12 +67,13 @@ TASK_SUBJECT_KIND = "task"
 
 # Closed vocabularies. A producer outside these is a wiring mistake, and the
 # route turns the ValueError into a 400 rather than minting a problem of an
-# unknown origin that no digest query would ever group.
+# unknown origin that no digest query would ever group. Every entry has a
+# producer: add a source with the code that sends it, not before. (Grafana and
+# Prometheus alerts arrive through Alertmanager's webhook as `alertmanager`;
+# the Ansible role and a deploy job write `service_state`, not events.)
 SOURCES = frozenset(
     {
         "alertmanager",
-        "prometheus",
-        "grafana",
         "sentry",
         "heartbeat",
         "flow_health",
@@ -81,8 +82,6 @@ SOURCES = frozenset(
         "expiry",
         "social",
         "llm_governor",
-        "github",
-        "ansible",
         "chat",
         "investigation",
         "session",
@@ -97,9 +96,7 @@ SOURCES = frozenset(
         "hub",  # the hub's own state_change rows
     }
 )
-KINDS = frozenset(
-    {"occurrence", "resolved", "investigation", "plan", "session_note", "human_note"}
-)
+KINDS = frozenset({"occurrence", "resolved", "investigation", "plan", "session_note"})
 SEVERITIES = frozenset({"critical", "error", "warning", "info"})
 # Problem statuses. `suppressed` = seen while its subject was deploying or in
 # maintenance (see `service_state`); it is live, counted, and not projected.
@@ -348,8 +345,8 @@ def decide(
             # problem is still worth keeping as history.
             return Decision("ignore" if current is None else "note")
         return Decision("resolve", "resolved")
-    # investigation / plan / session_note / human_note: history on a problem
-    # the producer named or the key found. Never creates.
+    # investigation / plan / session_note: history on a problem the producer
+    # named or the key found. Never creates.
     if current is None:
         return Decision("ignore")
     return Decision("note")
@@ -461,7 +458,7 @@ async def ingest_event(
 
         suppression = None
         if event.kind == "occurrence":
-            suppression = await _active_suppression(conn, subject_slug, kind_slug, now)
+            suppression = await _suppression_or_none(conn, subject_slug, kind_slug, now)
         d = decide(current, event.kind, now=now, suppressed=suppression is not None)
         if d.action == "ignore":
             return IngestResult(None, "ignored", key)
@@ -624,6 +621,25 @@ async def _active_suppression(
         now,
         sorted(SUPPRESSING_STATES),
     )
+
+
+async def _suppression_or_none(
+    conn: asyncpg.Connection, subject: str, subject_kind: str, now: datetime
+) -> asyncpg.Record | None:
+    """:func:`_active_suppression` for the ingest path, which fails open
+    (spec §10): a window the hub cannot read suppresses nothing, so the alert
+    is still recorded and still raised.
+
+    The savepoint is what makes that true. The lookup runs inside the ingest
+    transaction, and a failed statement aborts a Postgres transaction — caught
+    without one, every later statement in the ingest would fail anyway.
+    """
+    try:
+        async with conn.transaction():
+            return await _active_suppression(conn, subject, subject_kind, now)
+    except Exception as exc:  # noqa: BLE001 — fail open: an alert beats a window
+        logger.warning("hub_service_state_unreadable", subject=subject, error=str(exc)[:200])
+        return None
 
 
 async def set_service_state(
@@ -1055,19 +1071,24 @@ async def add_link(pool: asyncpg.Pool, problem_id: str, link_kind: str, ref: str
 async def merge_problems(
     pool: asyncpg.Pool, keep_id: str, merge_id: str, *, by: str, now: datetime | None = None
 ) -> dict[str, Any]:
-    """Fold ``merge_id`` into ``keep_id``: its events, links and sessions move,
-    its occurrences count on the kept problem, and it closes with a `problem`
-    link back so the history reads both ways.
+    """Fold ``merge_id`` into ``keep_id``: its events and links move, its
+    occurrences count on the kept problem, and it closes with a `problem` link
+    back so the history reads both ways. Its `work_sessions` rows are
+    re-pointed too, but nothing reads `work_sessions.problem_id` — sessions are
+    listed by task, so they stay on the merged problem's task.
 
-    A wrong merge hides an outage, so there are exactly two callers: a person
-    on the admin Problems page, and `hub_group.upgrade`, which folds problems
-    of ONE class and subject kind into a group of that class after an LLM has
-    agreed they are the same condition. The hub still never merges two
-    different failures on a resemblance.
+    A wrong merge hides an outage, so every caller is a deliberate decision:
+    a person on the admin Problems page; a person or agent through the
+    `merge_problems` chat tool (withheld from coding runs); and
+    `hub_group.upgrade`, which folds problems of ONE class and subject kind into
+    a group of that class after an LLM has agreed they are the same condition,
+    or into a group that already stands for the class. The hub still never
+    merges two different failures on a resemblance.
 
     Raises ValueError when either problem is missing, they are the same, or the
     kept one is already closed. The merged problem's own Todoist task is
-    returned so the caller can retire it; the hub never touches Todoist.
+    returned so the caller can retire it (`hub_project.retire_merged_task`);
+    the hub never touches Todoist.
     """
     now = now or _utcnow()
     if keep_id == merge_id:

@@ -42,7 +42,7 @@ def _p(status: str, resolved_ago: timedelta | None = None) -> dict:
         (_p("closed"), "resolved", "note", None),
         # history kinds never create
         (None, "investigation", "ignore", None),
-        (None, "human_note", "ignore", None),
+        (None, "session_note", "ignore", None),
         (_p("open"), "investigation", "note", None),
         (_p("resolved", timedelta(hours=1)), "session_note", "note", None),
         (_p("open"), "plan", "note", None),
@@ -109,7 +109,7 @@ def test_validate_event_rejects(bad):
 
 def test_validate_event_accepts_a_minimal_event():
     validate_event(_ev())
-    validate_event(_ev(problem_id="abc", kind="human_note"))
+    validate_event(_ev(problem_id="abc", kind="session_note"))
 
 
 def test_the_hub_accepts_a_money_finding():

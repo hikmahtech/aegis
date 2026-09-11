@@ -125,8 +125,11 @@ async def test_projection_failure_does_not_break_the_reconcile(db_pool, monkeypa
     assert len(out["fresh"]) == 1
 
 
-def test_mute_hint_names_the_problems():
+def test_mute_hint_points_at_the_problems_page_and_names_the_problems():
+    """The page's Mute button goes through `hub.mute_problem`, which writes the
+    `mute` event. The raw UPDATE the card used to carry skipped it (#478)."""
     assert mute_hint([]) == ""
     hint = mute_hint(["a", "", "b"])
-    assert hint.startswith("Silence: UPDATE problems SET muted_until")
-    assert "('a', 'b')" in hint
+    assert hint.startswith("Silence: admin Problems page")
+    assert "Mute 24h" in hint and "a, b" in hint
+    assert "UPDATE" not in hint

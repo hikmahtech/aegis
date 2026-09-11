@@ -2,7 +2,7 @@
 
 Covers:
 1. is_infra_alert() classification
-2. build_alert_signature() infra storm-collapse (cluster+alertname key)
+2. get_alert_routing_config() activity
 3. resolve_infra_resource() activity
 4. resolve_alert_resource() guard (activity raises → flow continues, no hard failure)
 5. Infra alert → infra-gitops forced, Gate-0 skipped (flow-level)
@@ -131,7 +131,7 @@ def test_is_infra_alert_dagster_pipeline_failure():
 
 
 # ---------------------------------------------------------------------------
-# build_alert_signature — infra storm collapse
+# get_alert_routing_config — activity
 # ---------------------------------------------------------------------------
 
 

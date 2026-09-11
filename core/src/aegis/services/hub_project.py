@@ -73,7 +73,7 @@ PROJECTED_STATUSES = frozenset(
     {"open", "investigating", "waiting_human", "fixing", "verifying", "resolved"}
 )
 _BLOCK_RE = re.compile(r"<!-- aegis:problem [^>]*-->.*?<!-- /aegis:problem -->", re.S)
-_HISTORY_KINDS = frozenset({"investigation", "plan", "session_note", "human_note"})
+_HISTORY_KINDS = frozenset({"investigation", "plan", "session_note"})
 # A plan of one step is a sentence, not a plan; more than this and the
 # subtask list is noise rather than a checklist.
 _MIN_PLAN_STEPS = 2
@@ -430,6 +430,30 @@ async def retire_task(
     return await _complete_task(pool, task_id)
 
 
+async def retire_merged_task(
+    pool: asyncpg.Pool, merge: dict[str, Any], *, settings: Any = None
+) -> bool | None:
+    """Retire the task of a problem `hub.merge_problems` just folded away.
+
+    The merged problem is closed, and a closed problem is never projected
+    again, so its task is retired here or never. One implementation for both
+    doors onto a merge — the chat tool and the admin Problems page — so they
+    cannot drift on what a merge does to Todoist.
+
+    ``merge`` is what `merge_problems` returned. None when there is no task to
+    retire: the merged problem had none, or it shares the kept problem's task.
+    Otherwise whether the completion queued.
+    """
+    task_id = str(merge.get("merged_task_id") or "")
+    keep_id = str(merge.get("keep_id") or "")
+    kept = await get_problem(pool, keep_id) if keep_id else None
+    keep_task = str((kept or {}).get("todoist_task_id") or "")
+    if not task_id or task_id == keep_task:
+        return None
+    note = f"Merged into problem {keep_id}" + (f" (task {keep_task})" if keep_task else "") + "."
+    return await retire_task(pool, task_id, note, settings=settings)
+
+
 async def _set_task(pool: asyncpg.Pool, problem_id: str, task_id: str) -> None:
     await pool.execute(
         "UPDATE problems SET todoist_task_id = $2 WHERE id = $1::uuid", problem_id, task_id
@@ -475,7 +499,6 @@ def _history_text(kind: str, payload: dict[str, Any]) -> str:
         "investigation": "🔍 Investigation",
         "plan": "🗺 Plan",
         "session_note": "💻 Session",
-        "human_note": "🗒 Note",
     }[kind]
     return f"{head}: {text}" if text else head
 
@@ -539,11 +562,7 @@ async def project(
         # marked seen and nothing is created. Creating one moved the
         # watermark past the resolve, and that task never closed (#473). A
         # later occurrence reopens the problem, and THAT projects a task.
-        meta.update(
-            projected_event_id=int(latest_event_id),
-            projected_at=now.isoformat(),
-            pending_occurrences=0,
-        )
+        meta.update(projected_event_id=int(latest_event_id), pending_occurrences=0)
         await _save_meta(pool, problem_id, meta)
         return {"problem_id": problem_id, "skipped": "resolved_without_task"}
 
@@ -587,7 +606,6 @@ async def project(
         # before creation is not replayed as comments.
         meta.update(
             projected_event_id=int(latest_event_id),
-            projected_at=now.isoformat(),
             pending_occurrences=0,
             block_hash=hashlib.sha1(block.encode()).hexdigest(),
             projected_title=p["title"],
@@ -748,7 +766,6 @@ async def project(
 
     meta.update(
         projected_event_id=int(events[-1]["id"]) if events else max(since, 0),
-        projected_at=now.isoformat(),
         pending_occurrences=pending,
     )
     await _save_meta(pool, problem_id, meta)

@@ -565,10 +565,12 @@ UPDATE settings SET value = value - 'stuck_post:post', updated_at = now()
 WHERE key = 'hub_group_verdicts';
 ```
 
-**To stop it grouping one particular cluster**, write the "no" yourself. The
-sweep honours a cached verdict, so a hand-written one keeps it away for 24
-hours at a time, and for good while the member count stays at or below what
-you record:
+**To keep one particular cluster apart for a day**, write the "no" yourself.
+The sweep honours a cached verdict, so a hand-written one keeps it away — but
+only for 24 hours from its `decided_at`, like any other verdict. After that it
+has expired and the sweep asks the judge again; a cluster that grows past the
+`member_count` you record is asked again sooner. There is no permanent opt-out:
+to keep a cluster apart for longer, write the verdict again each day.
 
 ```sql
 UPDATE settings SET value = value || jsonb_build_object(
@@ -837,6 +839,11 @@ Then, in any session: *"what's running on the coding host?"* (`list_coding_sessi
 *"have sebas look at this Todoist task"* (`dispatch_agent_run`), *"stop run
 a1b2c3"* (`stop_agent_run`).
 
+The mount is POST-only. The client also sends a GET to ask for a server
+stream; that answers 405, which is how the MCP transport says "no stream". A
+404 there would mean "your session is gone" — which is what the GET got until
+#476, when it fell through to the admin panel's catch-all.
+
 **This endpoint requires a real API key even when `AEGIS_AUTH_DISABLED=true`**,
 and refuses a run's mount token outright. That asymmetry is the design: the
 credential it needs is never written to the coding host, so a run cannot escalate
@@ -862,9 +869,18 @@ and tells you in Slack that your comment is waiting for you in the session you
 already have open.
 
 That only works if something calls the tool. A tool nobody calls is a tool that
-does not exist, so wire two hooks into your own `~/.claude/settings.json` —
-they live in your dotfiles, not in this repo, because they are about your
-machine:
+does not exist, so wire two hooks into your Claude settings — they live in your
+dotfiles, not in this repo, because they are about your machine.
+
+**Which settings file.** Claude Code reads its settings, and finds its hooks,
+in its config directory: `${CLAUDE_CONFIG_DIR:-$HOME/.claude}`. That is
+`~/.claude` only when `CLAUDE_CONFIG_DIR` is unset. If you run more than one
+login — say `CLAUDE_CONFIG_DIR=~/.claude-personal` for one account and the
+default for another — each directory has its own `settings.json`, and the
+hooks must go into every one you use, or the sessions under the others are
+never recorded. So the file to edit is
+`${CLAUDE_CONFIG_DIR:-$HOME/.claude}/settings.json`, once per config
+directory, and the script goes in that directory's `hooks/`:
 
 ```json
 {
@@ -875,18 +891,17 @@ machine:
         "hooks": [
           {
             "type": "command",
-            "command": "~/.claude/hooks/aegis-session.sh start"
+            "command": "\"${CLAUDE_CONFIG_DIR:-$HOME/.claude}/hooks/aegis-session.sh\" start"
           }
         ]
       }
     ],
-    "Stop": [
+    "SessionEnd": [
       {
-        "matcher": "*",
         "hooks": [
           {
             "type": "command",
-            "command": "~/.claude/hooks/aegis-session.sh stop"
+            "command": "\"${CLAUDE_CONFIG_DIR:-$HOME/.claude}/hooks/aegis-session.sh\" stop"
           }
         ]
       }
@@ -895,21 +910,60 @@ machine:
 }
 ```
 
-The script decides whether the session is on an AEGIS task at all, and says
-nothing when it is not:
+Use `SessionEnd`, not `Stop`, for the second hook. `Stop` fires at the end of
+every reply, so it would mark a session you are still sitting in as `parked`
+after its first answer, and AEGIS would stop keeping out of that task.
+
+**Where the script gets `AEGIS_URL` and `AEGIS_API_KEY`.** A hook sees only
+the environment of the `claude` process that runs it, so both must be set
+there — exported from your shell profile, or from a private file the profile
+sources. Never put them in the repo or in this settings file.
+
+- `AEGIS_URL` is the Core URL you gave `claude mcp add` above, without the
+  `/api/mcp-server/...` path.
+- `AEGIS_API_KEY` is the key in that entry's `X-API-Key` header: Core's API
+  key (`AEGIS_API_KEY` on Core, or the one generated under Integrations →
+  **API Key** in the admin panel). It has to be a real key. The operator mount
+  refuses to run without one even when Core has `AEGIS_AUTH_DISABLED=true`,
+  and refuses a run's mount token outright.
+
+If either is missing the script exits quietly rather than failing your session.
+
+- `AEGIS_ACCOUNT` is the **account name** AEGIS uses for this config
+  directory — the key under `engines.claude.config_dirs` in the coding-host
+  block (for example `personal` for `~/.claude-personal`). It is not the
+  directory's name: AEGIS resumes a session under an account by that key, so
+  sending `.claude-personal` would match nothing. Set it per config directory.
+
+**When it does anything.** The script records a session only when it starts
+inside a task worktree — a directory matching `*-aegis-wt/task-*`, which is
+where AEGIS's own coding sessions run — or when `AEGIS_TASK` is set. Anywhere
+else it says nothing, so an ordinary session in your own checkout never lands
+in the registry. To put one on the record, start it with
+`AEGIS_TASK=<todoist task id> claude`.
 
 ```bash
 #!/usr/bin/env bash
-# ~/.claude/hooks/aegis-session.sh — tell AEGIS which task this session is on.
+# ${CLAUDE_CONFIG_DIR:-$HOME/.claude}/hooks/aegis-session.sh
+# Tell AEGIS which task this session is on.
 set -euo pipefail
+
+# Without a URL and a real key there is nothing to tell; stay out of the way.
+[ -n "${AEGIS_URL:-}" ] && [ -n "${AEGIS_API_KEY:-}" ] || exit 0
+
+# Claude Code hands a hook its session id and working directory as JSON on
+# stdin; there is no CLAUDE_SESSION_ID variable.
+input=$(cat)
+cwd=$(jq -r '.cwd // empty' <<<"$input"); cwd=${cwd:-$PWD}
+sid=$(jq -r '.session_id // empty' <<<"$input")
 
 # A task session runs in `<repo>-aegis-wt/task-<id>`; anything else is not on
 # a task unless AEGIS_TASK says so. Silence is the correct answer for an
 # ordinary session in an ordinary checkout.
 task="${AEGIS_TASK:-}"
 if [ -z "$task" ]; then
-  case "$PWD" in
-    *-aegis-wt/task-*) task="${PWD##*/task-}" ;;
+  case "$cwd" in
+    *-aegis-wt/task-*) task="${cwd##*-aegis-wt/task-}"; task="${task%%/*}" ;;
     *) exit 0 ;;
   esac
 fi
@@ -917,21 +971,26 @@ fi
 case "${1:-start}" in
   start)  status=active; summary="opened a session here" ;;
   stop)   status=parked; summary="stepped away" ;;
+  *)      exit 0 ;;
 esac
 
-curl -fsS -X POST "$AEGIS_URL/api/mcp-server/pandoras-actor/operator" \
-  -H "X-API-Key: $AEGIS_API_KEY" -H "Content-Type: application/json" \
-  -d "$(jq -nc --arg t "$task" --arg s "$summary" --arg st "$status" \
-        --arg sid "${CLAUDE_SESSION_ID:-}" --arg acct "$(basename "${CLAUDE_CONFIG_DIR:-$HOME/.claude}")" \
-        '{jsonrpc:"2.0",id:1,method:"tools/call",params:{name:"report_progress",
-          arguments:{task_id:$t,summary:$s,status:$st,session_id:$sid,account:$acct}}}')" \
-  >/dev/null || true
+body=$(jq -nc --arg t "$task" --arg s "$summary" --arg st "$status" --arg sid "$sid" \
+  --arg acct "${AEGIS_ACCOUNT:-$(basename "${CLAUDE_CONFIG_DIR:-$HOME/.claude}")}" \
+  '{jsonrpc:"2.0",id:1,method:"tools/call",params:{name:"report_progress",
+    arguments:{task_id:$t,summary:$s,status:$st,session_id:$sid,account:$acct}}}')
+
+# The key goes to curl on stdin (-K -), not on the command line, where any
+# local user could read it from the process list.
+printf 'header = "X-API-Key: %s"\n' "$AEGIS_API_KEY" |
+  curl -fsS -m 5 -K - -X POST "$AEGIS_URL/api/mcp-server/pandoras-actor/operator" \
+    -H "Content-Type: application/json" -d "$body" >/dev/null || true
 ```
 
 Three things about it are deliberate. It **fails open** (`|| true`): a hook
 that breaks your session because AEGIS is down is worse than an unrecorded
-session. It sends the **account** (`CLAUDE_CONFIG_DIR`'s basename), which is
-what lets a later AEGIS turn resume under the same login. And `stop` parks
+session. It sends the **account** (`AEGIS_ACCOUNT`, the coding block's name
+for this login), which is what lets a later AEGIS turn resume under the same
+login. And `stop` parks
 rather than finishing: only you know whether the work is done, and
 `report_progress(status='done')` from inside a session is how you say so.
 
@@ -956,7 +1015,10 @@ them code:
 - **`activities.config` for `cleanup-daily`** — `task_session_days` (default
   7). A session whose task is completed or gone, and idle that long, has its
   worktree removed and its row deleted by `CleanupFlow`. The branch stays; it
-  may back an open PR. Set to 0 to disable.
+  may back an open PR. Set to 0 to disable. The same row carries the flow's
+  other windows, each 0 to disable: `problem_close_days` (7, fractions
+  allowed — how long a resolved problem keeps its key before it closes),
+  `interaction_orphan_days` (7) and `dispatch_days` (30).
 
 Optionally grant the `comment_on_task` tool. A turn does **not** need it — a
 turn's own reply is posted by the flow's `comment` activity, and the tool is

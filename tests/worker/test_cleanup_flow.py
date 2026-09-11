@@ -171,6 +171,45 @@ async def test_the_close_sweep_is_off_at_zero():
     assert "problems_closed" not in result
 
 
+def _schedule_config(config: dict) -> CleanupConfig:
+    """The config the schedule hands the flow, built from an `activities` row
+    exactly the way `schedule_sync` builds it."""
+    from aegis_worker.registry import FLOWS
+
+    spec = next(s for s in FLOWS if s.flow is CleanupFlow)
+    return spec.schedule_config({"agent_id": "pandoras-actor", "config": config, "_settings": {}})
+
+
+def test_every_window_is_read_from_activities_config():
+    """The flow has four windows and the registry used to pass only one of
+    them, so `problem_close_days`, `interaction_orphan_days` and
+    `dispatch_days` set on the `cleanup-daily` row did nothing at all (#478)."""
+    cfg = _schedule_config(
+        {
+            "dispatch_days": 14,
+            "interaction_orphan_days": 3,
+            "task_session_days": 5,
+            "problem_close_days": 2.5,
+        }
+    )
+    assert cfg.dispatch_days == 14
+    assert cfg.interaction_orphan_days == 3
+    assert cfg.task_session_days == 5
+    assert cfg.problem_close_days == 2.5
+
+
+def test_an_empty_or_blank_config_keeps_the_flows_own_defaults():
+    """The registry's fallbacks are the dataclass's defaults, not a second copy
+    of them — and a field cleared on the admin page is "not set" (#373)."""
+    default = CleanupConfig()
+    for config in ({}, {"dispatch_days": "", "interaction_orphan_days": None, "problem_close_days": ""}):
+        cfg = _schedule_config(config)
+        assert cfg.dispatch_days == default.dispatch_days
+        assert cfg.interaction_orphan_days == default.interaction_orphan_days
+        assert cfg.task_session_days == default.task_session_days
+        assert cfg.problem_close_days == default.problem_close_days
+
+
 async def test_a_failing_close_sweep_is_reported_not_fatal():
     result = await _run(
         CleanupConfig(retentions={"audit_log": 90}),

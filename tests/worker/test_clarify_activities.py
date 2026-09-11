@@ -2767,7 +2767,7 @@ async def test_classify_one_pandora_owned_when_no_user_comment(db_pool) -> None:
 async def test_apply_outcome_pandora_followup_builds_followup_alert(db_pool) -> None:
     """pandora_followup builds an alert dict with the user's comment
     appended to the description and a unique per-comment fingerprint
-    (so the alert-flow 24h dedup doesn't block re-investigations)."""
+    (so each comment is its own occurrence when the flow ingests it)."""
     await _seed_managed_projects(db_pool)()
     connector = AsyncMock()
     connector.commands = AsyncMock(

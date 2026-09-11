@@ -7,8 +7,10 @@ maintenance windows in force.
 Two rules hold this module together. Every mutation calls the SAME function the
 chat tool and the worker call — closing, muting and merging live in `hub.py`,
 so the page can never drift into a second implementation of a transition. And
-nothing here writes Todoist: the projector owns that, and the sweep re-derives
-the task from the problem within five minutes of any change made here.
+Todoist is written only through the projector (`hub_project`): the sweep
+re-derives a live problem's task within five minutes of any change made here.
+The two routes that end a problem's projection — close and merge — reach the
+projector directly, because a closed problem is never projected again.
 """
 
 from __future__ import annotations
@@ -20,6 +22,8 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
 
 from aegis.api.auth import verify_auth
+from aegis.api.deps import get_settings
+from aegis.config import Settings
 from aegis.observability import log_audit
 from aegis.services import hub_project
 from aegis.services.hub import (
@@ -164,16 +168,23 @@ async def post_close(request: Request, problem_id: str) -> dict[str, Any]:
 
 
 @router.post("/problems/{problem_id}/merge")
-async def post_merge(request: Request, problem_id: str, body: MergeBody) -> dict[str, Any]:
-    """Fold `merge_id` into this problem: its events, links and sessions move
-    and it closes with a link back. The merged problem's own task is left for
-    the operator — the projector never deletes a task it did not create."""
+async def post_merge(
+    request: Request,
+    problem_id: str,
+    body: MergeBody,
+    settings: Settings = Depends(get_settings),
+) -> dict[str, Any]:
+    """Fold `merge_id` into this problem: its events and links move and it
+    closes with a link back. Its task is completed with a note pointing here,
+    the same way the `merge_problems` chat tool does it — a closed problem is
+    never projected again, so no sweep would ever close that task."""
+    pool = _pool(request)
     try:
-        result = await merge_problems(
-            _pool(request), problem_id, body.merge_id, by="admin"
-        )
+        result = await merge_problems(pool, problem_id, body.merge_id, by="admin")
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    retired = await hub_project.retire_merged_task(pool, result, settings=settings)
+    result = {**result, "merged_task_retired": retired}
     await _audit(request, "problems_merged", problem_id, result)
     return result
 

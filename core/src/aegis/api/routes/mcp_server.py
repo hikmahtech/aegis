@@ -1363,6 +1363,18 @@ async def mcp_server_gated_no_stream(agent_id: str) -> Response:
     )
 
 
+@router.get("/{agent_id}/operator")
+async def mcp_server_operator_no_stream(agent_id: str) -> Response:
+    """Parity again. Without this route the probe fell through to the admin
+    SPA's catch-all and got a 404, which the MCP transport reserves for "your
+    session is gone" (#476)."""
+    raise HTTPException(
+        status_code=405,
+        detail="This MCP endpoint is stateless and POST-only; it opens no server-initiated stream.",
+        headers={"Allow": "POST"},
+    )
+
+
 @router.delete("/{agent_id}", status_code=204)
 async def mcp_server_end_session(agent_id: str) -> Response:
     """Session termination. No session is ever issued, so this is a no-op."""

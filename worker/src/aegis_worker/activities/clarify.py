@@ -930,10 +930,9 @@ class ClarifyActivities:
             # this branch the task stays pandora_owned forever — the watermark
             # bumps on the no-op, find_unclassified_items skips it, and only
             # a user comment can trigger a fresh run. Re-route to
-            # pandora_investigation so the spawn fires again; AlertInvestigation
-            # dedup keys on `audit_log.alert_investigated` which is only
-            # written on success, so re-running a failed investigation isn't
-            # blocked.
+            # pandora_investigation so the spawn fires again. The flow keeps no
+            # dedupe of its own any more (the problem hub decides what is
+            # investigated), so nothing blocks re-running a failed one.
             if match_route(content, routes) is not None:
                 # Unless the hub owns the task (#472). Its own `#alert` tasks
                 # carry @pandora and match routes like `infra-incident`, and no
@@ -1629,9 +1628,9 @@ class ClarifyActivities:
             # User commented on an existing @pandora task — fire a fresh
             # investigation that includes the user's comment as context.
             # No label changes (the task already has @pandora). Use a
-            # fingerprint keyed on last_note_at so the alert flow's 24h
-            # dedup doesn't block re-investigations for genuinely new
-            # comments. The latest_user_note is appended to the alert
+            # fingerprint keyed on last_note_at so each comment is its own
+            # occurrence when the flow has to ingest it (a task with no live
+            # problem). The latest_user_note is appended to the alert
             # description so kimi sees the additional context.
             content = task.get("content") or ""
             description = task.get("description") or ""
