@@ -15,7 +15,7 @@ from __future__ import annotations
 import shutil
 import subprocess
 import uuid
-from datetime import date
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 
@@ -546,6 +546,117 @@ async def test_a_row_no_rule_places_is_indexed_on_the_account_its_block_names(cl
     assert await clean.fetchval(
         "SELECT account FROM finance.journal_index WHERE message_id = $1", msgid
     ) == named
+
+
+async def _indexed(pool, msgid, instrument, day, amount, *, direction="out"):
+    """A journal transaction the matcher may offer as a candidate. It names a
+    journal file, which `load_candidates` requires of every candidate."""
+    await pool.execute(
+        "INSERT INTO finance.journal_index (message_id, mailbox, entity, kind, direction, "
+        "amount, currency, payee, payee_key, instrument, occurred_on, parser, source_class, "
+        "journal_file) VALUES ($1,'st-box','personal','transaction',$2,$3,'INR','Shop','shop',"
+        "$4,$5,'bank_alert','bank','personal/2026.journal')",
+        msgid, direction, Decimal(amount), instrument, date.fromisoformat(day),
+    )
+
+
+async def _three_verdicts(pool) -> tuple[str, str, str, str]:
+    """One hdfc-1225 statement holding each of the matcher's verdicts: a row the
+    journal holds once, a row it holds twice (§9.4's ambiguous shape), and a row
+    it does not hold at all."""
+    sid = await _statement(pool, "hdfc-1225", "2026-07-01", "2026-07-31", "0", "-1374.38", 3)
+    await _indexed(pool, "st-one", "hdfc-1225", "2026-07-05", "250.00")
+    await _indexed(pool, "st-amb-1", "hdfc-1225", "2026-07-11", "437.19")
+    await _indexed(pool, "st-amb-2", "hdfc-1225", "2026-07-12", "437.19")
+    matched = await _row(pool, "hdfc-1225", "2026-07-05", "out", "250.00", "UPI SHOP", sid, "-250")
+    ambiguous = await _row(
+        pool, "hdfc-1225", "2026-07-12", "out", "437.19", "UPI OTHER", sid, "-687.19"
+    )
+    unmatched = await _row(
+        pool, "hdfc-1225", "2026-07-20", "out", "687.19", "SOMETHING", sid, "-1374.38"
+    )
+    return sid, matched, ambiguous, unmatched
+
+
+async def test_the_matchers_verdict_is_recorded_on_its_row(clean, tmp_path):
+    """#470. The matcher decided, the activity handed the decision to the poster,
+    and it was gone when the tick ended: `matched_msgid` was NULL on all 2,800
+    rows, so "which email did this bank row match?" had no answer anywhere.
+
+    A daily tick over ~2,800 rows that have not changed must write none of
+    them, so the second identical run leaves every row's `xmin` where it was."""
+    cfg = _repo(tmp_path)
+    _, matched, ambiguous, unmatched = await _three_verdicts(clean)
+    ids = [matched, ambiguous, unmatched]
+    sql = (
+        "SELECT row_id, matched_msgid, candidates, skip_reason, xmin::text AS xmin "
+        "FROM finance.statement_rows WHERE row_id = ANY($1::text[])"
+    )
+
+    await ActivityEnvironment().run(_act(clean, cfg).reconcile_statements, False, "")
+
+    got = {r["row_id"]: r for r in await clean.fetch(sql, ids)}
+    assert got[matched]["matched_msgid"] == "st-one"
+    assert got[matched]["candidates"] is None
+    assert got[ambiguous]["matched_msgid"] is None
+    assert got[ambiguous]["candidates"] == ["st-amb-1", "st-amb-2"]
+    assert got[ambiguous]["skip_reason"] == "ambiguous"
+    assert got[unmatched]["matched_msgid"] is None
+    assert got[unmatched]["candidates"] is None
+
+    await ActivityEnvironment().run(_act(clean, cfg).reconcile_statements, False, "")
+
+    again = {r["row_id"]: r["xmin"] for r in await clean.fetch(sql, ids)}
+    assert again == {k: v["xmin"] for k, v in got.items()}
+
+
+async def test_posted_at_marks_only_the_rows_this_lane_wrote(clean, tmp_path):
+    """`posted_at` says a block was written for this row (032). Not the
+    idempotency ledger — that is the `stmt/<row_id>` msgid inside the block —
+    so it marks exactly the rows the poster wrote: not a row that promoted a
+    block the email lane wrote, and not one stamped before, whose stamp stands."""
+    cfg = _repo(tmp_path)
+    await _indexed(clean, "st-one", "hdfc-1225", "2026-07-05", "250.00")
+    (cfg.path / "personal" / "2026.journal").write_text(
+        "; p\n\n"
+        "2026-07-05 ! Shop\n"
+        "    ; msgid: st-one\n"
+        "    ; channel: upi, instrument: hdfc-1225\n"
+        "    expenses:unknown          ₹250.00\n"
+        "    assets:bank:hdfc:1225    ₹-250.00\n"
+    )
+    subprocess.run(
+        ["git", "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qam", "seed"],
+        cwd=cfg.path, check=True,
+    )
+    sid = await _statement(clean, "hdfc-1225", "2026-07-01", "2026-07-31", "0", "-870", 3)
+    promoted = await _row(
+        clean, "hdfc-1225", "2026-07-05", "out", "250.00", "UPI SHOP", sid, "-250"
+    )
+    posted = await _row(
+        clean, "hdfc-1225", "2026-07-10", "out", "500.00", "ATM WITHDRAWAL", sid, "-750"
+    )
+    stamped = await _row(
+        clean, "hdfc-1225", "2026-07-14", "out", "120.00", "POS CORNER STORE", sid, "-870"
+    )
+    before = datetime(2026, 1, 1, tzinfo=UTC)
+    await clean.execute(
+        "UPDATE finance.statement_rows SET posted_at = $2 WHERE row_id = $1", stamped, before
+    )
+
+    out = await ActivityEnvironment().run(_act(clean, cfg).reconcile_statements, True, "")
+    assert (out["posted"], out["promoted"]) == (2, 1), out
+
+    at = {
+        r["row_id"]: r["posted_at"]
+        for r in await clean.fetch(
+            "SELECT row_id, posted_at FROM finance.statement_rows WHERE row_id = ANY($1::text[])",
+            [promoted, posted, stamped],
+        )
+    }
+    assert at[promoted] is None
+    assert at[posted] is not None and at[posted] > datetime.now(UTC) - timedelta(hours=1)
+    assert at[stamped] == before
 
 
 def _on(monkeypatch, day: date) -> None:

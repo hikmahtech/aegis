@@ -17,7 +17,7 @@ reported failure, never a silent zero.
 from __future__ import annotations
 
 import json
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from datetime import date, timedelta
 from pathlib import Path
@@ -184,6 +184,9 @@ class StatementActivities:
             rates=rates,
         )
         outcomes = {o.row_id: o for o in run.outcomes}
+        # #470: keep the verdict, before anything acts on it. A record only —
+        # `record_outcomes` says why nothing may read it back.
+        await record_outcomes(self.db_pool, outcomes.values())
 
         scope = _Scope(since=date.fromisoformat(since) if since else None)
         done = {
@@ -291,6 +294,17 @@ class StatementActivities:
                     event,
                     journal_file=journal_file,
                     declared=declared,
+                )
+            # `posted_at` marks the rows this post wrote a block for (032) — the
+            # digest's marker, never the idempotency ledger, which is the
+            # `stmt/<row_id>` msgid inside the block and survives a crash
+            # between the journal commit and this stamp. Only where NULL: a
+            # row's first stamp stands.
+            if result.posted:
+                await self.db_pool.execute(
+                    "UPDATE finance.statement_rows SET posted_at = now() "
+                    "WHERE row_id = ANY($1::text[]) AND posted_at IS NULL",
+                    [m.removeprefix(f"{statement_post.MSGID_PREFIX}/") for m in result.posted],
                 )
 
             # Promotion just rewrote every `assets:unknown` posting in these
@@ -418,6 +432,65 @@ async def load_statements(pool: Any) -> list[Any]:
             )
         )
     return out
+
+
+async def record_outcomes(pool: Any, outcomes: Iterable[Any]) -> int:
+    """Store what the matcher decided about each row (#470). Returns rows written.
+
+    `match_statements` returns a verdict per row — the journal transaction it
+    matched, or the candidates it could not choose between — and the tick
+    handed that to the poster and dropped it. `matched_msgid` was NULL on all
+    2,800 rows, so "which email did this bank row match?" had no answer once
+    the run ended, which is the question a person asks when a statement
+    reverts.
+
+    **A record, never an input.** Nothing reads these columns back into a match
+    or a post: every tick re-decides every row from the journal as it stands,
+    and a stored match read back as evidence would outlive the evidence for it.
+    That holds for `skip_reason` too — no loader reads it, so the matcher's
+    `ambiguous` stored there is a record like the rest, not a standing skip. A
+    reader added later would turn it into one.
+
+    Only a row whose verdict CHANGED is written: the tick runs daily over every
+    stored row, and rewriting ~2,800 of them to the values they already hold is
+    table bloat for nothing — the same reasoning as `store_rows`' `WHERE`.
+
+    One statement, carried as one jsonb document rather than `unnest` over
+    arrays: asyncpg reads a list of lists as a multi-dimensional array, and
+    each row's candidates are a list of their own length, so they cannot ride
+    a `jsonb[]` parameter. The pool's codec encodes the document itself — never
+    pre-dump it.
+    """
+    batch = [
+        {
+            "row_id": o.row_id,
+            "matched_msgid": o.msgid if o.matched else None,
+            "candidates": list(o.candidates) or None,
+            "skip_reason": o.skip_reason,
+        }
+        for o in outcomes
+    ]
+    if not batch:
+        return 0
+    result = await pool.execute(
+        """
+        UPDATE finance.statement_rows AS sr
+           SET matched_msgid = v.matched_msgid,
+               candidates    = v.candidates,
+               skip_reason   = v.skip_reason
+          FROM jsonb_to_recordset($1::jsonb)
+               AS v(row_id text, matched_msgid text, candidates jsonb, skip_reason text)
+         WHERE sr.row_id = v.row_id
+           AND (sr.matched_msgid IS DISTINCT FROM v.matched_msgid
+             OR sr.candidates    IS DISTINCT FROM v.candidates
+             OR sr.skip_reason   IS DISTINCT FROM v.skip_reason)
+        """,
+        batch,
+    )
+    written = int(result.split()[-1])
+    if written:
+        logger.info("statement_outcomes_recorded", rows=written)
+    return written
 
 
 #: How long after a month ends before a missing statement is a finding rather
