@@ -461,7 +461,7 @@ async def ingest_event(
 
         suppression = None
         if event.kind == "occurrence":
-            suppression = await _active_suppression(conn, subject_slug, kind_slug, now)
+            suppression = await _suppression_or_none(conn, subject_slug, kind_slug, now)
         d = decide(current, event.kind, now=now, suppressed=suppression is not None)
         if d.action == "ignore":
             return IngestResult(None, "ignored", key)
@@ -624,6 +624,25 @@ async def _active_suppression(
         now,
         sorted(SUPPRESSING_STATES),
     )
+
+
+async def _suppression_or_none(
+    conn: asyncpg.Connection, subject: str, subject_kind: str, now: datetime
+) -> asyncpg.Record | None:
+    """:func:`_active_suppression` for the ingest path, which fails open
+    (spec §10): a window the hub cannot read suppresses nothing, so the alert
+    is still recorded and still raised.
+
+    The savepoint is what makes that true. The lookup runs inside the ingest
+    transaction, and a failed statement aborts a Postgres transaction — caught
+    without one, every later statement in the ingest would fail anyway.
+    """
+    try:
+        async with conn.transaction():
+            return await _active_suppression(conn, subject, subject_kind, now)
+    except Exception as exc:  # noqa: BLE001 — fail open: an alert beats a window
+        logger.warning("hub_service_state_unreadable", subject=subject, error=str(exc)[:200])
+        return None
 
 
 async def set_service_state(

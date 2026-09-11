@@ -111,6 +111,26 @@ async def test_occurrence_during_deploy_creates_a_suppressed_problem(db_pool):
     assert occ["payload"]["suppressed_by"]["note"] == "rel"
 
 
+async def test_an_unreadable_service_state_suppresses_nothing(db_pool, monkeypatch):
+    """Spec §10: `service_state` reads fail open. The lookup runs inside the
+    ingest transaction, and a failed statement aborts a Postgres transaction —
+    so catching the exception is not enough on its own: every later statement
+    in the ingest would fail too, and the alert would not be recorded at all.
+    Here the lookup really does fail in the database, on the ingest's own
+    connection."""
+
+    async def unreadable(conn, subject, subject_kind, now):
+        return await conn.fetchrow("SELECT * FROM service_state_gone_zz")
+
+    monkeypatch.setattr("aegis.services.hub._active_suppression", unreadable)
+    s = _subject()
+    r = await ingest_event(db_pool, _occ(s, 1), now=NOW)
+    assert r.action == "created" and r.suppressed is False
+    assert (await get_problem(db_pool, r.problem_id))["status"] == "open"
+    occ = [e for e in await list_events(db_pool, r.problem_id) if e["kind"] == "occurrence"]
+    assert len(occ) == 1 and "suppressed_by" not in occ[0]["payload"]
+
+
 async def test_occurrence_on_an_open_problem_during_deploy_attaches_quietly(db_pool):
     s = _subject()
     first = await ingest_event(db_pool, _occ(s, 1), now=NOW)
