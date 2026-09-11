@@ -2,12 +2,22 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from typing import Any
 
 from aegis.llm import parse_llm_json
+from aegis.services.content_extract import fetch_and_extract
 from aegis.services.knowledge import _content_id_for
 from temporalio import activity
+
+from aegis_worker.activities.content import _MIN_CONTENT_LENGTH, detect_content_type
+
+# The settings row the `track_topic` chat tool writes (services/chat.py).
+TRACKED_TOPICS_SETTING = "intelligence_topics"
+# A page read in place of a missing snippet is stored in full as raw text, but
+# its summary is cut to about what a snippet would have been.
+_FETCHED_SUMMARY_CHARS = 500
 
 
 @dataclass
@@ -132,6 +142,40 @@ class IntelligenceActivities:
         ]
 
     @activity.defn
+    async def load_tracked_topics(self) -> list[str]:
+        """Search terms for the topics tracked from chat, in the order added.
+
+        `track_topic` writes them to the settings row `intelligence_topics`.
+        Until #508 nothing read that row, so the tool answered "added" and no
+        scan ever changed. A missing or malformed row means no tracked topics;
+        a failed read raises, and the flow falls back to its configured topics.
+        """
+        if not self.db_pool:
+            return []
+        value = await self.db_pool.fetchval(
+            "SELECT value FROM settings WHERE key = $1", TRACKED_TOPICS_SETTING
+        )
+        return tracked_search_terms(value)
+
+    async def _read_page(self, url: str) -> str:
+        """The readable text at `url`, or "" when there is too little to keep.
+
+        The same fetch and extraction an RSS entry gets (`process_content`),
+        minus media and images: this path has no transcription and no OCR.
+        """
+        content_type = detect_content_type(url)
+        if content_type in ("media", "image"):
+            return ""
+        try:
+            text, _title = await fetch_and_extract(url, content_type)
+        except Exception as exc:  # noqa: BLE001 — one unreadable page must not sink the batch
+            activity.logger.warning(
+                "intel_page_read_failed url=%s err=%s", url[:120], str(exc)[:200]
+            )
+            return ""
+        return text if len(text) >= _MIN_CONTENT_LENGTH else ""
+
+    @activity.defn
     async def ingest_intelligence(self, analyses: list[dict]) -> dict:
         """Batch ingest synthesized intelligence into knowledge-service."""
         if not self.knowledge_connector or not analyses:
@@ -142,21 +186,34 @@ class IntelligenceActivities:
         ingested_ok = 0
         ingest_failures = 0
         skipped_no_text = 0
+        fetched = 0
         for a in analyses:
             # The intel-scan pipeline (activities/intel_scan.py::search_source)
             # emits items keyed `snippet`, not `summary` — gating on `summary`
             # alone silently ingested 0 worthy items into KS. Fall back across
             # the fields the various producers use.
             text = a.get("summary") or a.get("snippet") or a.get("body")
+            summary = text
+            url = (a.get("url") or "").strip()
+            if not text and url:
+                # A news result often arrives as a title and a link with an
+                # empty snippet. Those were about half of every news scan's
+                # worthy items (84 of 154 in the 30 days to 2026-09-11), and
+                # every one was dropped here as skipped_no_text (#508). Read
+                # the page instead, the way an RSS entry is read.
+                text = await self._read_page(url)
+                if text:
+                    fetched += 1
+                    summary = text[:_FETCHED_SUMMARY_CHARS]
             if text:
                 try:
                     title = a.get("title") or "intelligence item"
                     raw_text = f"{title}\n\n{text}"
                     await self.knowledge_connector.ingest_content(
-                        url=a.get("url") or f"aegis://intelligence/{a.get('topic', 'item')}",
+                        url=url or f"aegis://intelligence/{a.get('topic', 'item')}",
                         title=title,
                         source_type="intelligence",
-                        summary=text,
+                        summary=summary,
                         raw_text=raw_text,
                         metadata={
                             "topic": a.get("topic", ""),
@@ -168,14 +225,15 @@ class IntelligenceActivities:
                     ingest_failures += 1
                     activity.logger.warning(
                         "intel_ingest_content_failed url=%s err=%s",
-                        (a.get("url") or "")[:120],
+                        url[:120],
                         str(exc)[:200],
                     )
             else:
                 # The third outcome, and until now the invisible one: the item
-                # carried no text at all, so it was never even attempted.
-                # Without its own counter a scored-worthy item that vanishes
-                # here is indistinguishable from one that failed to ingest.
+                # carried no text at all, and its page (if it had one) gave
+                # too little to keep, so it was never even attempted. Without
+                # its own counter a scored-worthy item that vanishes here is
+                # indistinguishable from one that failed to ingest.
                 skipped_no_text += 1
 
         # Observability: a silent 0-ingest despite worthy items is exactly the
@@ -183,7 +241,7 @@ class IntelligenceActivities:
         if analyses and ingested_ok == 0 and ingest_failures == 0:
             activity.logger.warning(
                 "intel_ingest_zero_despite_candidates candidates=%d (no item carried "
-                "summary/snippet/body text?)",
+                "summary/snippet/body text or a readable page?)",
                 len(analyses),
             )
 
@@ -192,4 +250,32 @@ class IntelligenceActivities:
             "failed": ingest_failures,
             "candidates": len(analyses),
             "skipped_no_text": skipped_no_text,
+            "fetched": fetched,
         }
+
+
+def tracked_search_terms(value: Any) -> list[str]:
+    """The search terms in an `intelligence_topics` settings value.
+
+    Each topic gives its queries, or its name when it has none. Lenient on
+    purpose: a hand-edited or half-written row yields what it can and never
+    raises, because a scan must not fail on a config read.
+    """
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except ValueError:
+            return []
+    if not isinstance(value, dict):
+        return []
+    terms: list[str] = []
+    for topic in value.get("topics") or []:
+        if not isinstance(topic, dict):
+            continue
+        raw = topic.get("queries")
+        queries = [q for q in raw if isinstance(q, str)] if isinstance(raw, list) else []
+        name = topic.get("name")
+        for term in queries or ([name] if isinstance(name, str) else []):
+            if term.strip():
+                terms.append(term.strip())
+    return terms

@@ -241,3 +241,53 @@ async def test_research_topic_kg_error_graceful(pool):
     assert "synthesis" in data
     assert data["sources"]["knowledge_graph"] == 0
     assert data["sources"]["web_search"] == 1
+
+
+# --------------------------------------------------------------------------
+# #508 — the call is recorded, and the save is awaited, reported and honest.
+# --------------------------------------------------------------------------
+
+
+async def test_research_topic_records_its_llm_call(pool, ctx_with_connectors):
+    """think() gets a purpose, the agent and the pool, so the call lands in
+    llm_calls. Without them research_topic's spend was invisible."""
+    await _exec_research_topic(pool, {"query": "latest AI"}, ctx_with_connectors)
+    kwargs = ctx_with_connectors.llm_client.think.call_args.kwargs
+    assert kwargs["purpose"] == "research_topic"
+    assert kwargs["agent_id"] == "sebas"
+    assert kwargs["db_pool"] is pool
+
+
+async def test_research_topic_waits_for_its_save(pool, ctx_with_connectors):
+    """The save is awaited before the tool returns. It used to be a bare
+    create_task, which this assertion would catch: a scheduled coroutine has
+    been called but not yet awaited."""
+    data = json.loads(
+        await _exec_research_topic(pool, {"query": "latest AI"}, ctx_with_connectors)
+    )
+    ctx_with_connectors.knowledge_connector.ingest_content.assert_awaited_once()
+    assert data["saved"] is True
+
+
+async def test_research_topic_reports_a_failed_save(pool, ctx_with_connectors):
+    """A failed save is reported, and the answer still goes back."""
+    ctx_with_connectors.knowledge_connector.ingest_content.side_effect = RuntimeError(
+        "store down"
+    )
+    data = json.loads(
+        await _exec_research_topic(pool, {"query": "latest AI"}, ctx_with_connectors)
+    )
+    assert data["saved"] is False
+    assert data["synthesis"] == "AI is advancing rapidly."
+
+
+async def test_research_topic_does_not_save_a_failed_synthesis(pool, ctx_with_connectors):
+    """The "synthesis failed" apology is returned to the chat, never stored as
+    research."""
+    ctx_with_connectors.llm_client.think.side_effect = RuntimeError("model down")
+    data = json.loads(
+        await _exec_research_topic(pool, {"query": "latest AI"}, ctx_with_connectors)
+    )
+    assert "synthesis failed" in data["synthesis"]
+    ctx_with_connectors.knowledge_connector.ingest_content.assert_not_called()
+    assert data["saved"] is False

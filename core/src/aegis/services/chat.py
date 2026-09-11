@@ -2007,19 +2007,35 @@ async def _exec_research_topic(pool: asyncpg.Pool, args: dict, ctx: ToolContext)
     )
 
     synthesis = ""
+    synthesized = False
     try:
-        result = await ctx.llm_client.think(prompt=prompt, model=ctx.model_light, max_tokens=600)
+        # purpose + agent_id + db_pool ⇒ think() records the call in llm_calls.
+        # Without them research_topic was the one chat tool whose model spend
+        # never showed up anywhere (#508).
+        result = await ctx.llm_client.think(
+            prompt=prompt,
+            model=ctx.model_light,
+            max_tokens=600,
+            db_pool=pool,
+            purpose="research_topic",
+            agent_id=ctx.agent_id,
+        )
         synthesis = result.get("response", "")
+        synthesized = bool(synthesis)
     except Exception as exc:
         logger.warning("research_topic_synthesis_error", error=str(exc))
         synthesis = f"Research gathered {len(kg_results)} KG results and {len(web_results)} web results but synthesis failed."
 
-    # Fire-and-forget: ingest synthesis into KG
-    if ctx.knowledge_connector and synthesis:
-        try:
-            import time as _time
+    # Save a real synthesis, and wait for the save (#508). This used to be a
+    # bare asyncio.create_task inside `except: pass`: nothing awaited it or held
+    # it, so a failed save vanished without a log line — and the "synthesis
+    # failed" apology above was saved as if it were research.
+    saved = False
+    if ctx.knowledge_connector and synthesized:
+        import time as _time
 
-            asyncio.create_task(
+        try:
+            await asyncio.wait_for(
                 ctx.knowledge_connector.ingest_content(
                     url=f"aegis://research/{int(_time.time())}",
                     title=f"Research: {query}",
@@ -2027,10 +2043,12 @@ async def _exec_research_topic(pool: asyncpg.Pool, args: dict, ctx: ToolContext)
                     source_type="research",
                     raw_text=synthesis,
                     tags=["research", "chat_tool"],
-                )
+                ),
+                timeout=30,
             )
-        except Exception:
-            pass
+            saved = True
+        except Exception as exc:
+            logger.warning("research_topic_save_failed", error=str(exc)[:200])
 
     top_urls = [r.get("url", "") for r in web_results[:5] if r.get("url")]
 
@@ -2039,6 +2057,7 @@ async def _exec_research_topic(pool: asyncpg.Pool, args: dict, ctx: ToolContext)
             "synthesis": synthesis,
             "sources": {"knowledge_graph": len(kg_results), "web_search": len(web_results)},
             "top_urls": top_urls,
+            "saved": saved,
         },
         default=str,
     )

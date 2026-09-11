@@ -27,6 +27,10 @@ class PollBookmarksInput:
 class PollBookmarksResult:
     bookmarks: list[dict] = field(default_factory=list)
     latest_created: str | None = None
+    # Why a poll came back empty when it is not simply "nothing new":
+    # `not_configured` means the worker has no token. The flow puts it in
+    # result_summary, so a missing token no longer reads as a quiet account.
+    status: str = "ok"
 
 
 @dataclass
@@ -39,7 +43,7 @@ class RaindropActivities:
     async def poll_bookmarks(self, input: PollBookmarksInput) -> PollBookmarksResult:
         if not self.raindrop_api_token:
             logger.warning("raindrop_token_missing")
-            return PollBookmarksResult()
+            return PollBookmarksResult(status="not_configured")
 
         base_params: dict[str, Any] = {"sort": "-created", "perpage": _PERPAGE}
         if input.since_cursor:
