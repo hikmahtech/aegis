@@ -21,10 +21,12 @@ Three rules keep the grouping honest:
   :data:`NON_GROUPABLE_SOURCES`.
 * **A judge, not a rule.** The count alone is a candidate, not a verdict —
   three services crash-looping for three unrelated reasons must stay three
-  problems. :func:`candidates` finds clusters; the caller (the sweep's LLM
-  judge, or a person on the Problems page) says yes or no, and
-  :func:`record_verdict` remembers a "no" so the same cluster is not re-priced
-  every five minutes.
+  problems. :func:`candidates` finds clusters; the sweep's LLM judge says yes
+  or no, and :func:`record_verdict` remembers the answer for
+  :data:`VERDICT_TTL_HOURS` so the same cluster is not re-priced every five
+  minutes. The Problems page has no grouping control: a person folds
+  duplicates one at a time with a merge, or steers the judge through the
+  verdict cache (`docs/infrastructure.md`).
 * **Nothing is destroyed.** Folding is `hub.merge_problems`: the members'
   events, links and sessions move onto the group, their tasks are retired with
   a note pointing at it, and the links read both ways. An operator can see

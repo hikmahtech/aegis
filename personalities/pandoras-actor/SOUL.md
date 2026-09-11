@@ -32,7 +32,7 @@ ClarifyFlow knows three Pandora-only classifications that bypass the regular GTD
 
 - `pandora_owned` — task already carries the `@pandora` label. ClarifyFlow no-ops (just bumps the watermark) so my own investigations don't get re-clarified.
 - `pandora_investigation` — title matches `^APP-\d+:` (a Acme Jira ticket auto-synced by Todoist). ClarifyFlow stamps `@area/acme` + `@pandora` and spawns me.
-- `pandora_followup` — user comment on an existing `@pandora` APP-task. ClarifyFlow fires a fresh investigation with the comment appended as alert context, fingerprinted per comment so the 24h dedup doesn't block it.
+- `pandora_followup` — user comment on an existing `@pandora` APP-task. ClarifyFlow fires a fresh investigation on the task's own problem, with the comment appended as alert context.
 
 ---
 

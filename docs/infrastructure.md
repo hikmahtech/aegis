@@ -565,10 +565,12 @@ UPDATE settings SET value = value - 'stuck_post:post', updated_at = now()
 WHERE key = 'hub_group_verdicts';
 ```
 
-**To stop it grouping one particular cluster**, write the "no" yourself. The
-sweep honours a cached verdict, so a hand-written one keeps it away for 24
-hours at a time, and for good while the member count stays at or below what
-you record:
+**To keep one particular cluster apart for a day**, write the "no" yourself.
+The sweep honours a cached verdict, so a hand-written one keeps it away — but
+only for 24 hours from its `decided_at`, like any other verdict. After that it
+has expired and the sweep asks the judge again; a cluster that grows past the
+`member_count` you record is asked again sooner. There is no permanent opt-out:
+to keep a cluster apart for longer, write the verdict again each day.
 
 ```sql
 UPDATE settings SET value = value || jsonb_build_object(
