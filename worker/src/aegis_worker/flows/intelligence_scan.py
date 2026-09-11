@@ -26,6 +26,23 @@ _ACT_TIMEOUT = timedelta(seconds=60)
 _SCAN_TIMEOUT = timedelta(seconds=120)
 _SCORE_TIMEOUT = timedelta(seconds=180)
 
+# Guards the load_tracked_topics call added by #508, so a scan that started on
+# the old code replays without it. A scan lasts minutes, so this can become
+# `workflow.deprecate_patch` one deploy later.
+_PATCH_TRACKED_TOPICS = "intel-tracked-topics"
+
+
+def merge_topics(configured: list[str], tracked: list[str]) -> list[str]:
+    """Configured topics first, then each tracked one not already there (any case)."""
+    seen = {t.strip().lower() for t in configured}
+    merged = list(configured)
+    for term in tracked:
+        key = term.strip().lower()
+        if key and key not in seen:
+            seen.add(key)
+            merged.append(term.strip())
+    return merged
+
 
 @dataclass
 class IntelligenceScanInput:
@@ -42,16 +59,46 @@ class IntelligenceScanInput:
 class IntelligenceScanFlow:
     @workflow.run
     async def run(self, input: IntelligenceScanInput) -> dict:
-        if not input.topics:
+        # What a run reports beyond its counts — a partial search, a degraded
+        # step, how many tracked topics it added — threaded into every return
+        # below, so a scan that lost something is never indistinguishable from
+        # a quiet one.
+        notes: dict = {}
+        topics = list(input.topics)
+
+        # 0. Topics tracked from chat (#508). `track_topic` wrote them to a
+        # settings row that nothing read, so "added" changed no scan. A failed
+        # read is not a failed scan: it runs on its configured topics and says so.
+        if workflow.patched(_PATCH_TRACKED_TOPICS):
+            try:
+                tracked = await workflow.execute_activity(
+                    "load_tracked_topics",
+                    start_to_close_timeout=_ACT_TIMEOUT,
+                    retry_policy=RETRY_ONCE,
+                )
+            except Exception as exc:
+                workflow.logger.warning(
+                    "intel_tracked_topics_degraded source=%s err=%s",
+                    input.source,
+                    str(exc)[:200],
+                )
+                tracked = []
+                notes["tracked_topics_degraded"] = True
+            merged = merge_topics(topics, list(tracked or []))
+            if len(merged) > len(topics):
+                notes["tracked_topics"] = len(merged) - len(topics)
+            topics = merged
+
+        if not topics:
             workflow.logger.warning("intel_scan_no_topics source=%s", input.source)
-            return {"source": input.source, "raw": 0, "novel": 0, "ingested": 0}
+            return {"source": input.source, "raw": 0, "novel": 0, "ingested": 0, **notes}
 
         # 1. Search
         scan_result: SearchSourceResult = await workflow.execute_activity(
             "search_source",
             SearchSourceInput(
                 source=input.source,
-                topics=input.topics,
+                topics=topics,
                 max_results=input.max_results,
             ),
             result_type=SearchSourceResult,
@@ -60,12 +107,9 @@ class IntelligenceScanFlow:
         )
         items = scan_result.items
         raw_count = len(items)
-        # Partial-search marker, threaded into every return below so a scan
-        # that lost some topics is never indistinguishable from a quiet one.
-        degraded: dict = {}
         if scan_result.failed_topics:
-            degraded["search_degraded"] = True
-            degraded["failed_topics"] = list(scan_result.failed_topics)
+            notes["search_degraded"] = True
+            notes["failed_topics"] = list(scan_result.failed_topics)
 
         if not items:
             return {
@@ -73,7 +117,7 @@ class IntelligenceScanFlow:
                 "raw": 0,
                 "novel": 0,
                 "ingested": 0,
-                **degraded,
+                **notes,
             }
 
         # 2. Dedup against KG — graceful-degrade guard. dedup_items is a
@@ -105,7 +149,7 @@ class IntelligenceScanFlow:
                 str(exc)[:200],
             )
             novel = items
-            degraded["dedup_degraded"] = True
+            notes["dedup_degraded"] = True
         novel_count = len(novel)
 
         if not novel:
@@ -114,7 +158,7 @@ class IntelligenceScanFlow:
                 "raw": raw_count,
                 "novel": 0,
                 "ingested": 0,
-                **degraded,
+                **notes,
             }
 
         # 3. Score — graceful-degrade guard. score_significance runs on
@@ -124,7 +168,7 @@ class IntelligenceScanFlow:
         # (RETRY_ONCE) and degrade to "nothing worthy this run" instead of
         # letting the ActivityError kill the scan — same pattern as
         # alert_investigation's assess guard (PR #282).
-        topics_arg = [{"name": t} for t in input.topics]
+        topics_arg = [{"name": t} for t in topics]
         try:
             scored = await workflow.execute_activity(
                 "score_significance",
@@ -144,7 +188,7 @@ class IntelligenceScanFlow:
                 "raw": raw_count,
                 "novel": novel_count,
                 "ingested": 0,
-                **degraded,
+                **notes,
                 "score_degraded": True,
             }
 
@@ -156,7 +200,7 @@ class IntelligenceScanFlow:
                 "raw": raw_count,
                 "novel": novel_count,
                 "ingested": 0,
-                **degraded,
+                **notes,
             }
 
         # 5. Capture worthy items to Todoist Inbox
@@ -207,10 +251,12 @@ class IntelligenceScanFlow:
         # was dropping them on the floor. Zeros are omitted so a healthy run
         # reads exactly as it did before (`candidates` is skipped entirely —
         # it is just len(worthy), which `scored_worthy` already reports).
+        # `fetched` counts items whose text came from reading the page because
+        # the search result had no snippet (#508).
         ingest_detail = (
             {
                 k: ingest_result[k]
-                for k in ("failed", "skipped_no_text")
+                for k in ("failed", "skipped_no_text", "fetched")
                 if ingest_result.get(k)
             }
             if isinstance(ingest_result, dict)
@@ -224,5 +270,5 @@ class IntelligenceScanFlow:
             "scored_worthy": len(worthy),
             "ingested": ingested,
             **ingest_detail,
-            **degraded,
+            **notes,
         }

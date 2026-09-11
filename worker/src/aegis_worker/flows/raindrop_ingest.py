@@ -60,6 +60,10 @@ class RaindropIngestFlow:
                 "todoist_committed": 0,
                 "outbox_staged": 0,
                 "capture_failed": 0,
+                # Why nothing came back (#508). 360 runs of a bare
+                # `bookmarks: 0` could not tell a missing token from a quiet
+                # account. A failed fetch raises and fails the run instead.
+                "status": "no_new_bookmarks" if result.status == "ok" else result.status,
             }
 
         ingested = 0

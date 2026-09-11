@@ -385,9 +385,12 @@ def test_books_write_flow_is_gated_on_money_hygiene():
         # GitHubAlertFlow step on a closed PR) and `verify_fixes` (a
         # HubSweepFlow step), both on the existing HubActivities. Unflagged,
         # so all three rows move.
-        (True, True, 45, 228),
-        (False, False, 35, 195),
-        (True, False, 39, 211),
+        # Then +1 activity and NO new flow from #508: `load_tracked_topics` on
+        # the existing IntelligenceActivities (the topics `track_topic` saves),
+        # a step of IntelligenceScanFlow. Unflagged, so all three rows move.
+        (True, True, 45, 229),
+        (False, False, 35, 196),
+        (True, False, 39, 212),
     ],
 )
 def test_real_registration_passes_the_boot_check(homelab, money, flows, activities):
