@@ -28,8 +28,8 @@ Three rules keep the grouping honest:
   duplicates one at a time with a merge, or steers the judge through the
   verdict cache (`docs/infrastructure.md`).
 * **Nothing is destroyed.** Folding is `hub.merge_problems`: the members'
-  events, links and sessions move onto the group, their tasks are retired with
-  a note pointing at it, and the links read both ways. An operator can see
+  events and links move onto the group, their tasks are retired with a note
+  pointing at it, and the links read both ways. An operator can see
   every member the group swallowed and unpick it by hand.
 
 One fold needs no judge: a **stray**. `ingest_event` absorbs a new subject
