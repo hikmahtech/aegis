@@ -47,6 +47,32 @@ _KIMI_BRANCH_RE = re.compile(r"^BRANCH:\s*(.+)$", re.MULTILINE)
 # Kimi's prompt + Haiku's verdict mapping both branch on this value.
 _JIRA_SOURCE = "todoist-jira"
 
+# What became of a verdict, as `record_verdict_to_kg` tags it (#502), and how
+# recall names it to the next investigation. The first three are a person
+# taking the fix; `discarded` is a person turning it down; the rest decided
+# nothing about the fix. "" is a verdict stored before outcomes were.
+KG_OUTCOME_LABELS: dict[str, str] = {
+    "opened_pr": "the operator approved it and opened a fix PR",
+    "pr_failed": "the operator approved a fix PR, but it could not be opened",
+    "run_fix": "the operator ran the proposed commands",
+    "acknowledged": "the operator acknowledged it",
+    "muted": "the operator muted it",
+    "self_resolved": "it cleared before anyone decided",
+    "expired": "nobody answered the card",
+    "no_card": "nothing to decide, so no card was sent",
+    "discarded": "the operator discarded the proposed fix",
+    "": "outcome not recorded",
+}
+KG_APPROVED_OUTCOMES = frozenset({"opened_pr", "pr_failed", "run_fix"})
+# Never recalled: a fix a person threw away is not advice for the next one.
+KG_SKIPPED_OUTCOMES = frozenset({"discarded"})
+# Recall: candidates searched, prior incidents shown, the similarity below
+# which a verdict is about something else, and how much of each is shown.
+_RECALL_CANDIDATES = 12
+_RECALL_SHOWN = 3
+_RECALL_MIN_SIMILARITY = 0.3
+_RECALL_SNIPPET_CHARS = 600
+
 
 # Which alertnames are infra, and which repo investigates them, is DB config:
 # the `infra_alert_routing` settings row merged over a generic default
@@ -1057,19 +1083,11 @@ class AlertActivities:
             "yes" in lower.split("automatically")[-1][:50] if "automatically" in lower else False
         )
 
-        # Ingest findings into knowledge service
-        if self.knowledge_connector and investigation:
-            try:
-                await self.knowledge_connector.ingest_content(
-                    url=alert.get("url", f"aegis://alert/{alert.get('fingerprint', 'unknown')}"),
-                    title=f"Alert investigation: {title}",
-                    source_type="alert",
-                    raw_text=investigation,
-                    tags=["alert"],
-                )
-            except Exception as exc:
-                activity.logger.warning("knowledge_ingest_failed: %s", str(exc))
-
+        # Nothing goes to the knowledge store from here (#502). This text is
+        # the flow's `investigation_output` on the LLM path, and
+        # `record_verdict_to_kg` stores it once the operator has decided,
+        # tagged with the decision. Stored here as well, it reached the store
+        # before any card went out and outlived a discard.
         return {
             "investigation": investigation,
             "actionable": actionable,
@@ -1079,11 +1097,11 @@ class AlertActivities:
 
     @activity.defn
     async def gather_alert_knowledge(self, title: str, project: str, alert_name: str = "") -> str:
-        """Return runbook + KG prior-incident context for an alert.
+        """Return runbook + prior-incident context for an alert.
 
         Prepends the per-alert runbook (if one exists: the `runbooks` table,
-        else the file — see `_read_runbook`) before the knowledge-graph answer
-        so the investigation model sees structured checklists before free-form
+        else the file — see `_read_runbook`) before the prior incidents so the
+        investigation model sees structured checklists before free-form
         history.
         """
         parts: list[str] = []
@@ -1094,26 +1112,60 @@ class AlertActivities:
 
         if self.knowledge_connector:
             try:
-                question = f"What do I know about: {title}"
-                if project:
-                    question += f" in {project}"
-                question += "? Include any prior incidents or investigations."
-                result = await self.knowledge_connector.ask(
-                    question=question,
-                    max_sources=5,
-                    min_confidence=0.3,
-                )
-                kg = result.get("answer", "")
-                if kg:
-                    parts.append(f"Prior knowledge:\n{kg}")
+                incidents = await self._prior_incidents(title, project)
+                if incidents:
+                    parts.append(incidents)
             except Exception as exc:
-                # Tier-1 KG cache miss → fall through to slower LLM resolution.
-                # Logging makes the cache-miss visible so degraded KS is
-                # diagnosable from worker_logs rather than from "why is
-                # alert resolution slow?" downstream.
+                # A store that cannot answer costs the investigation its
+                # history, not its run. Logged so a degraded store shows up in
+                # the worker logs rather than as thinner verdicts.
                 activity.logger.warning("gather_alert_knowledge_kg_failed err=%s", str(exc)[:200])
 
         return "\n\n".join(parts)
+
+    async def _prior_incidents(self, title: str, project: str) -> str:
+        """Past verdicts on alerts like this one, as the operator left them
+        (#502): a fix the operator took comes first, a fix they discarded
+        never comes back, and each past alert is one line — its best outcome.
+
+        A search over `alert_investigation` documents, not the RAG `ask()`
+        this replaced: `ask()` read the whole corpus and had a model
+        summarise it, so it could neither rank a verdict by what became of it
+        nor leave one out, and it cost a model call per investigation."""
+        query = f"Alert investigation: {title}" + (f" in {project}" if project else "")
+        hits = await self.knowledge_connector.search(
+            query, limit=_RECALL_CANDIDATES, source_type="alert_investigation"
+        )
+        best: dict[str, dict] = {}
+        for hit in hits:
+            outcome = str((hit.get("metadata") or {}).get("outcome") or "")
+            if outcome in KG_SKIPPED_OUTCOMES:
+                continue
+            if float(hit.get("similarity") or 0.0) < _RECALL_MIN_SIMILARITY:
+                continue
+            # One line per past alert: its verdicts are one document per
+            # outcome, all under the alert's own address.
+            alert_key = str(hit.get("url") or hit.get("id") or "").split("#", 1)[0]
+            rank = (outcome not in KG_APPROVED_OUTCOMES, -float(hit.get("similarity") or 0.0))
+            if alert_key not in best or rank < best[alert_key]["rank"]:
+                best[alert_key] = {**hit, "outcome": outcome, "rank": rank}
+        shown = sorted(best.values(), key=lambda h: h["rank"])[:_RECALL_SHOWN]
+        if not shown:
+            return ""
+        lines = [
+            "Prior incidents (verdicts on similar alerts; a fix the operator took is "
+            "listed first, and discarded fixes are left out):"
+        ]
+        for hit in shown:
+            meta = hit.get("metadata") or {}
+            when = str(hit.get("ingested_at") or "")[:10]
+            label = KG_OUTCOME_LABELS.get(hit["outcome"], hit["outcome"])
+            head = f"- {hit.get('title') or 'Alert investigation'}"
+            head += f" (verdict {meta.get('status') or '?'}; {label}"
+            head += f"; {when})" if when else ")"
+            snippet = " ".join(str(hit.get("content") or hit.get("summary") or "").split())
+            lines.append(f"{head}\n  {snippet[:_RECALL_SNIPPET_CHARS]}")
+        return "\n".join(lines)
 
     @activity.defn
     async def resolve_infra_resource(self, alert: dict) -> dict:
@@ -2307,17 +2359,24 @@ class AlertActivities:
 
     @activity.defn
     async def record_verdict_to_kg(
-        self, alert: dict, verdict: dict, investigation_output: str
+        self, alert: dict, verdict: dict, investigation_output: str, outcome: str = ""
     ) -> dict:
-        """Persist an alert / scoping verdict into the knowledge graph so
+        """Persist an alert / scoping verdict into the knowledge store so
         that the NEXT investigation of a related alert can recall what
-        the prior diagnosis was.
+        the prior diagnosis was — and what became of it.
 
-        Closes the loop the audit on 2026-05-21 surfaced: `investigate()`
-        already ingests its LLM-fallback text (alerts.py:411-422), but
-        the kimi path's assess output never reached the KG. Resource
-        cross-referencing also writes a `relates_to` claim so the next
-        alert against the same resource can find prior incidents.
+        `outcome` is what the operator did with the verdict (#502; the keys of
+        `KG_OUTCOME_LABELS`): the flow calls this once the Gate-2 card is
+        answered, or at once when there is no card. It lands in the
+        document's metadata, as an `outcome:<x>` tag, and in its address: one
+        document per alert AND outcome, so the verdict someone discards
+        today does not overwrite the one they took last week, and a flapping
+        alert's no-card verdicts stay one document. `gather_alert_knowledge`
+        ranks by it and never recalls a discarded fix.
+
+        Without an outcome — a run that started before #502 and replays the
+        old Step 7b, which ran before the card went out — it writes what it
+        always wrote: the alert's own address, untagged.
         """
         if not self.knowledge_connector:
             return {"ingested": False, "reason": "no_connector"}
@@ -2328,10 +2387,19 @@ class AlertActivities:
         confidence = float(verdict.get("confidence") or 0.0)
         url = alert.get("url") or f"aegis://alert/{fingerprint or 'unknown'}"
         tags = ["alert", source] if source else ["alert"]
+        metadata: dict[str, Any] = {
+            "fingerprint": fingerprint,
+            "status": verdict_status,
+            "confidence": confidence,
+        }
+        if outcome:
+            url = f"{url}#{outcome}"
+            tags.append(f"outcome:{outcome}")
+            metadata["outcome"] = outcome
 
         try:
-            # 1) The full investigation transcript (free-text, semantic
-            #    search against this is what gather_alert_knowledge uses).
+            # The full investigation transcript (free-text; semantic search
+            # against this is what gather_alert_knowledge uses).
             if investigation_output:
                 await self.knowledge_connector.ingest_content(
                     url=url,
@@ -2339,15 +2407,14 @@ class AlertActivities:
                     source_type="alert_investigation",
                     raw_text=investigation_output[:8000],
                     tags=tags,
-                    metadata={
-                        "fingerprint": fingerprint,
-                        "status": verdict_status,
-                        "confidence": confidence,
-                    },
+                    metadata=metadata,
                 )
             # ponytail: structured-claim recording dropped (no knowledge graph).
             # The free-text transcript ingested above is the searchable record.
-            return {"ingested": bool(investigation_output)}
+            out: dict[str, Any] = {"ingested": bool(investigation_output)}
+            if outcome:
+                out["outcome"] = outcome
+            return out
         except Exception as exc:
             activity.logger.warning("record_verdict_to_kg_failed: %s", str(exc)[:200])
             return {"ingested": False, "reason": str(exc)[:200]}

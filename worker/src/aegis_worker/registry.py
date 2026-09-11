@@ -462,7 +462,13 @@ FLOWS: tuple[FlowSpec, ...] = (
     # ingests from every producer, not only the swarm ones.
     FlowSpec(
         HubSweepFlow,
-        lambda act: HubSweepConfig(agent_id=act["agent_id"]),
+        lambda act: HubSweepConfig(
+            agent_id=act["agent_id"],
+            fix_verify_hours=_float(
+                act["config"], "fix_verify_hours", HubSweepConfig.fix_verify_hours
+            ),
+            fix_grace_hours=_float(act["config"], "fix_grace_hours", HubSweepConfig.fix_grace_hours),
+        ),
     ),
     FlowSpec(
         FlowHealthWatchdogFlow,

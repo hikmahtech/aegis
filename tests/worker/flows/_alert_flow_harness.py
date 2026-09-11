@@ -6,8 +6,12 @@ shape the real one returns, so the flow cannot tell them apart; each records
 what it was called with in `S`, which a test resets with `reset()`.
 
 `FakeInteractionFlow` stands in for the Gate-2 card: it records the card it
-was asked to post and answers at once with `S.answer`, so a test that expects
-no card can simply check `S.cards` is empty.
+was asked to post and answers at once with `S.answer` (or times out, when
+`S.card_status` is `archived`), so a test that expects no card can simply
+check `S.cards` is empty.
+
+`S.kg` is every knowledge-store write with its outcome and how many cards had
+gone out when it happened (#502: the verdict is stored after the decision).
 """
 
 from __future__ import annotations
@@ -39,6 +43,10 @@ class _State:
     verdict: dict = field(default_factory=dict)
     remediation: dict = field(default_factory=dict)
     restart_history: dict | Exception = field(default_factory=dict)
+    kg: list[dict] = field(default_factory=list)
+    card_status: str = "resolved"
+    pr_url: str = "https://github.com/acme/shop/pull/7"
+    staged: list[Any] = field(default_factory=list)
 
 
 S = _State()
@@ -186,8 +194,18 @@ async def stub_assess_investigation(alert: dict, investigation_output: str) -> d
 
 
 @activity.defn(name="record_verdict_to_kg")
-async def stub_record_verdict_to_kg(alert: dict, verdict: dict, investigation_output: str) -> dict:
-    return {"ingested": False, "reason": "no_connector"}
+async def stub_record_verdict_to_kg(
+    alert: dict, verdict: dict, investigation_output: str, outcome: str = ""
+) -> dict:
+    S.kg.append(
+        {
+            "outcome": outcome,
+            "verdict": verdict.get("status"),
+            "output": investigation_output,
+            "cards_before": len(S.cards),
+        }
+    )
+    return {"ingested": True, **({"outcome": outcome} if outcome else {})}
 
 
 @activity.defn(name="post_task_note")
@@ -243,6 +261,20 @@ async def stub_run_remediation_commands(commands: list[str], host: str = "") -> 
     return {"ran": [], "refused": "no_commands"}
 
 
+@activity.defn(name="stage_pending_pr")
+async def stub_stage_pending_pr(inp: Any) -> str:
+    # The real one returns a PLAIN STRING id, not a dict.
+    S.staged.append(inp)
+    return "pending-pr-1"
+
+
+@activity.defn(name="create_github_pr")
+async def stub_create_github_pr(inp: Any) -> dict:
+    if not S.pr_url:
+        return {"pr_url": "", "status": "failed", "error": "gh pr create failed"}
+    return {"pr_url": S.pr_url, "status": "opened", "error": ""}
+
+
 STUBS = [
     stub_resolve_agents,
     stub_routing,
@@ -266,6 +298,8 @@ STUBS = [
     stub_remediate_infra_service,
     stub_recent_auto_restart,
     stub_run_remediation_commands,
+    stub_stage_pending_pr,
+    stub_create_github_pr,
 ]
 
 
@@ -280,6 +314,8 @@ class FakeInteractionFlow:
     @workflow.run
     async def run(self, input: InteractionFlowInput) -> InteractionResult:
         S.cards.append(input)
+        if S.card_status == "archived":
+            return InteractionResult(interaction_id="ia-1", status="archived", response=None)
         return InteractionResult(interaction_id="ia-1", status="resolved", response=S.answer)
 
 
@@ -315,6 +351,17 @@ def service_down_alert(service: str = "shop_web", **overrides: Any) -> dict:
         "todoist_task_id": "task-1",
         **overrides,
     }
+
+
+def fix_branch() -> None:
+    """The investigation committed a fix to the `shop` checkout, so the card
+    offers Open PR(s) and Discard."""
+    S.run_investigation = {
+        **S.run_investigation,
+        "branch": "aegis-fix/checkout",
+        "branches": {"shop": "aegis-fix/checkout"},
+    }
+    S.verdict = {**S.verdict, "status": "actionable"}
 
 
 def task_queue() -> str:

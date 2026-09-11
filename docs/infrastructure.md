@@ -842,9 +842,10 @@ has the same name in every code location.
 ### The runbook an investigation reads
 
 Every alert investigation starts with the runbook for its alert name, put in
-front of the prompt, followed by what the knowledge store knows about past
-incidents (`AlertActivities.gather_alert_knowledge`). The worker looks for the
-runbook in this order:
+front of the prompt, followed by past verdicts on similar alerts
+(`AlertActivities.gather_alert_knowledge`; see
+[what Pandora remembers](#what-pandora-remembers-from-your-decisions)). The
+worker looks for the runbook in this order:
 
 1. **The `runbooks` table.** Runbooks you write about your own setup: which
    machines share a power supply, which service is pinned to which node, what
@@ -977,6 +978,122 @@ ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now();
 Both changes are behind `workflow.patched` ids, `gate2-only-for-decisions`
 and `auto-restart-once-per-window`, so a run that was waiting on its card
 when the worker was redeployed finishes the way it started.
+
+### After Open PR: following the fix to a verified fix
+
+**Pandora follows the PRs it opens (#502).** When you pick **Open PR(s)** on a
+card, the flow pushes the fix branch, opens a draft PR, links it to the problem
+(`problem_links`, kind `github_pr`) and leaves the problem in `fixing`. The
+task comment says it is being followed. From there:
+
+| What happens | Problem moves to | What the task says |
+|---|---|---|
+| The PR merges | `verifying` | Fix PR merged, and the alert is now being watched |
+| The PR is closed without merging | `waiting_human` | The fix was not taken, so it is back with you |
+| No occurrence for `fix_verify_hours` after the merge | `resolved` (the task closes) | The alert stayed clear for that long |
+| The alert comes back later than `fix_grace_hours` after the merge | `open` | It came back, how long after the merge, and which PR |
+
+- **What is followed.** Only a PR an investigation opened: the problem
+  carries an `investigation` event naming it in `pr_urls`. A PR a coding
+  session links with `report_progress` is not followed — its merge says
+  nothing about whether an alert is fixed, and a `@code` task has no alert to
+  stay clear.
+- **Several PRs.** While any of the problem's fix PRs is open, it stays
+  `fixing`. Once none is, one merge is enough for `verifying`; none merged
+  means `waiting_human`.
+- **The alert cleared first.** A problem the alert already resolved stays
+  resolved (#488's rule: the alert source owns whether a problem is live). The
+  merge is written on its timeline, and a return inside the 24-hour reopen
+  window reopens it the usual way, with a fresh investigation.
+- **The grace.** Right after a merge the old code is usually still running,
+  so an occurrence inside `fix_grace_hours` is put down to it, not to the fix.
+  An occurrence inside a deploy or maintenance window never counts. If your
+  deploys land hours after a merge, raise the grace.
+- **You still decide.** Completing the task resolves the problem at any point,
+  as always.
+
+How it gets there: GitHub's `pull_request` webhook (`/api/webhooks/github`)
+starts `GitHubAlertFlow`, which hands a `closed` PR to
+`HubActivities.follow_fix_pr` (`hub_fix.record_pr_closed`). The problem hub's
+five-minute `HubSweepFlow` settles `verifying` problems
+(`HubActivities.verify_fixes`). The webhook must be set up and reachable
+(it already is if you get PR-opened pings in chat); without it nothing moves
+past `fixing`, which is how it behaved before.
+
+Both windows live on the `hub-sweep-5m` activity row, with generic defaults of
+24 hours and 1 hour. `schedule_sync` picks a change up within five minutes; no
+restart.
+
+```sql
+UPDATE activities
+SET config = config || '{"fix_verify_hours": 24, "fix_grace_hours": 1}'::jsonb
+WHERE workflow_type = 'HubSweepFlow';
+```
+
+To see fixes in flight and how they ended:
+
+```sql
+SELECT p.id, p.status, p.title, l.ref AS pr
+FROM problems p JOIN problem_links l ON l.problem_id = p.id AND l.link_kind = 'github_pr'
+WHERE p.closed_at IS NULL AND p.status IN ('fixing', 'verifying')
+ORDER BY p.last_seen_at DESC;
+
+SELECT e.occurred_at, e.source, e.payload->>'text'
+FROM problem_events e
+WHERE e.problem_id = '<problem id>' AND e.source IN ('github', 'hub') AND e.kind = 'investigation'
+ORDER BY e.id;
+```
+
+`pending_prs` is not part of this. It is the hand-off between the two
+activities that open a PR (`stage_pending_pr` writes the title, body and
+branch; `create_github_pr` reads them back and marks the row `opened` or
+`failed`), written only when someone picks Open PR, and pruned after 30 days
+by `CleanupFlow`. That is why it is usually empty: in prod, Open PR was picked
+twice (2026-07-31 and 2026-08-10), and the one row those left was pruned on
+2026-08-31. A PR can stay open longer than 30 days, so the follow-up reads
+the problem's own link and events instead.
+
+### What Pandora remembers from your decisions
+
+**The verdict is stored after you decide, tagged with what you did (#502).**
+Each investigation's verdict and transcript go to the knowledge store as an
+`alert_investigation` document, so the next investigation of a similar alert
+can read how the last one ended. The document carries an outcome, in its
+metadata and as an `outcome:<x>` tag:
+
+| Outcome | Meaning |
+|---|---|
+| `opened_pr` | you picked Open PR(s) and a PR opened |
+| `pr_failed` | you picked Open PR(s), but none could be opened |
+| `run_fix` | you picked Run fix |
+| `discarded` | you picked Discard |
+| `muted` | you picked Mute 24h |
+| `acknowledged` | you picked Acknowledge |
+| `expired` | nobody answered the card in 48 hours |
+| `self_resolved` | the alert cleared while the card was open |
+| `no_card` | nothing to decide, so no card was sent |
+
+When an investigation starts, `gather_alert_knowledge` searches these
+documents for verdicts on similar alerts and puts the best three in front of
+it, each with its outcome. A fix you took (`opened_pr`, `pr_failed`,
+`run_fix`) comes first. A fix you discarded is never recalled. Each past alert
+is one line: its verdicts are one document per outcome, under the alert's own
+address, so a discard today does not overwrite the fix you took last week.
+Verdicts stored before #502 have no outcome; they are recalled, after the
+taken ones.
+
+Before #502 the verdict was stored before the card went out, so a discarded
+fix was recalled next time exactly like one you acted on. The move is behind
+the `kg-verdict-after-decision` patch id, so a run that was waiting on its card
+across the deploy stores its verdict the old way.
+
+To see what was stored and how it ended:
+
+```sql
+SELECT metadata->>'outcome' AS outcome, count(*)
+FROM knowledge_content WHERE source_type = 'alert_investigation'
+GROUP BY 1 ORDER BY 2 DESC;
+```
 
 ### Session inventory
 
