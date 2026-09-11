@@ -275,27 +275,69 @@ user-authored:
 
 | Selector | Verb | What happens |
 |---|---|---|
-| `source_tag = '#alert'` | infra | Check the service's health *now* (not the alert history) → healthy: comment + complete; unhealthy: logs + a "restart?" card |
+| `source_tag = '#alert'` | infra | Read the problem behind the task, then act by its kind (below). A service the swarm runs: check its health *now* → healthy: comment + complete; unhealthy: logs + a "restart?" card |
 | `source_tag = '#receipt'` | finance | Legacy: `#receipt` tasks are no longer created by `MoneyProcessFlow` (since 2026-09-05); an existing one still gets the merchant-history decision card |
 | `source_tag = '#email'` | email triage | Notification → archive + complete; genuinely needs a reply → comment + `@waiting` (the Gmail scope is `gmail.modify` — AEGIS cannot send mail) |
+| `#chat`, `#research`, `#calendar`, `#manual`, or no tag and no `@code` | ask | Hand the task to the agent it is assigned to, through that agent's own chat path (`AgentChatReplyFlow`, the one clarify uses when you comment on an agent's task) → `@waiting`. The first turn is read-only; your reply on the task is what lets the agent change anything |
 | `source_tag IS NULL` + `@code` | coding | Task session: one persistent Claude Code session per task, one turn per comment → plan → implement on a branch when asked → draft PR when asked → `@waiting` |
-| anything else | — | Comment "no executor for this" + park. Never guessed at |
+| a tag the table maps to `None`, or one no one has decided about | — | Park once, with a comment saying the task is yours and how to route tags like it. Never guessed at. (`#money` maps to `None`, but the sweep never picks those tasks up: `EXCLUDED_LABELS`) |
+
+**The verb table is a setting.** `DEFAULT_VERBS` in
+`worker/src/aegis_worker/activities/agent_task.py` holds the generic defaults,
+with one entry — a verb or an explicit `None` — for every tag AEGIS captures
+under; `test_agent_task_verbs.py` fails when a new tag arrives without one.
+The `agent_task_verbs` settings row is merged over it, so a deployment
+reroutes a tag without a code change. `untagged` is the key for a task with
+no source tag. An entry naming a verb the lane does not have is ignored.
+
+```sql
+-- leave calendar tasks to me; have agents take hand-written ones
+INSERT INTO settings (key, value) VALUES
+  ('agent_task_verbs', '{"#calendar": null, "untagged": "ask"}')
+ON CONFLICT (key) DO UPDATE SET value = excluded.value;
+```
+
+The agent is found through the agent registry — each agent's
+`metadata.mention_aliases`, defaulting to its id — the same lookup clarify's
+comment channel makes. A label no active agent answers to parks the task
+with a comment saying so.
+
+**The infra verb acts by the kind of problem** (`plan_infra_task`). It reads
+the problem from the hub (`find_problem_for_task`), never the title, unless
+the hub has none. Every branch below is read-only:
+
+| The problem is | What happens |
+|---|---|
+| a service the swarm runs | the health check and restart card above |
+| any other `service` subject (e.g. a pipeline tool's alerts, a scrape target) | no `docker service ps` and no restart card; quote the investigation's finding and park |
+| a node | the heartbeat's last sample of it, from its own settings row, and the alert's runbook. No Docker or SSH command against the node |
+| an alert whose `instance` label is a URL | one GET against it, and what it answered |
+| a group (subject `*`) | the members, from the hub's `grouped` events and absorbed occurrences |
+| an error Sentry reported | the investigation's finding; a restart does not fix code or data |
+| a flow, the comms probe, a post, or another kind | the finding and where a person looks next |
+| a money problem | unchanged: Maou owns these |
+
+The investigation is never re-run here: the hub started it when the problem
+appeared. Each report ends with "What to do" and parks the task once.
 
 ```mermaid
 flowchart TD
     S["agent-task-15min<br/>AgentTaskSweepFlow"] --> E["eligible: open, assignee label,<br/>not @someday / @waiting,<br/>no run in the last 6h"]
     E --> P["pick 3, oldest first<br/>(max 1 coding)"]
     P --> C["spawn AgentTaskFlow children<br/>ParentClosePolicy.ABANDON"]
-    C --> V{"verb from source_tag<br/>(@code only when NULL)"}
-    V -- "#alert" --> IN{"service healthy now?"}
+    C --> V{"verb from source_tag<br/>(agent_task_verbs; @code only when NULL)"}
+    V -- "#alert" --> PL{"plan_infra_task:<br/>what is the problem?"}
+    PL -- "a swarm service" --> IN{"service healthy now?"}
     IN -- yes --> D1["comment + complete"]
     IN -- no --> R1["logs + card: restart?"] --> W1["@waiting"]
+    PL -- "node / URL / group / other" --> RP["read-only report<br/>+ what to do"] --> W6["@waiting"]
     V -- "#email" --> EM{"notification?"}
     EM -- yes --> D2["archive + complete"]
     EM -- no --> W2["comment + @waiting"]
     V -- "#receipt" --> F1["merchant history<br/>+ decision card"] --> W3["@waiting"]
+    V -- "ask" --> A1["assigned agent's chat path<br/>(AgentChatReplyFlow)"] --> W7["@waiting"]
     V -- "@code" --> K1["task session: turn per comment<br/>→ plan → implement when asked<br/>→ draft PR when asked"] --> W4["@waiting"]
-    V -- unknown --> W5["comment + @waiting"]
+    V -- "none / unknown" --> W5["comment: yours, and how to route it<br/>+ @waiting"]
 ```
 
 **The safety model:** investigation is free; every write is gated by an
@@ -305,7 +347,11 @@ implementing code, opening a PR, applying a finance decision — card first.
 Restart/finance cards use the fire-and-forget `post_resolve_activity` hook
 (`apply_restart_approval` / `apply_finance_decision`), so the child can park
 the task and exit while the card is still open. The coding verb has no cards
-at all: the task's comment thread is its approval channel (see below).
+at all: the task's comment thread is its approval channel (see below). The
+`ask` verb works the same way: its first turn is told to stay read-only, and a
+change waits for your go-ahead — a reply on the task, which clarify's comment
+channel carries to the same agent while the task is in the Inbox, or a message
+to the agent in its channel.
 
 **Task sessions (the coding verb).** A `@code` task gets one persistent Claude
 Code session, recorded in `work_sessions` (session uuid, per-task worktree
