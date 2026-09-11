@@ -289,7 +289,21 @@ Transitions are a table in `hub.py`, not scattered `UPDATE`s:
   same `@me` guard).
 - `investigation` from `AlertInvestigationFlow` → `waiting_human` when a gate
   card is open, `fixing` when a PR was staged, `resolved` on
-  `auto_remediated`.
+  `auto_remediated`. **The alert source owns whether a problem is live; an
+  investigation only annotates it** (#484, added 2026-09-11). A verdict that
+  lands after the alert has already resolved the problem is recorded as an
+  `investigation` event, and its card still goes out, but the problem stays
+  `resolved`: no `reopen`, and the task stays closed. The next real
+  occurrence goes through the `occurrence` rule above — a reopen inside the
+  window, a new problem after it — so the task follows and a fresh
+  investigation is asked for. Any other caller of `set_status` that moves a
+  problem off `resolved` still reopens it.
+- An occurrence on an existing problem (attach, reopen, promote) raises
+  `severity` to the worse of the stored one and its own (`critical` >
+  `error` > `warning` > `info`, the same order a group uses for its worst
+  member). Nothing lowers it (#486, added 2026-09-11): a problem that was once
+  critical does not read as fine because a later occurrence was milder. Other
+  events — a resolution, an investigation report, a note — never change it.
 - `muted_until` set → `muted`; an occurrence on a muted problem is recorded and
   not projected. This replaces `alert_mutes`; the mute key *is* the correlation
   key, so the four namespaces go.

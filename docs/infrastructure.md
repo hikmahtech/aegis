@@ -426,6 +426,33 @@ SELECT subject, state, until_at, set_by FROM service_state ORDER BY updated_at D
 backfill, which was its last reader. The recurrence history it held is now
 `problems.occurrences` and one `problem_events` row per occurrence.
 
+### What can change a problem's status and severity
+
+- **Only the alert source makes a problem live again.** An investigation
+  adds notes; it does not decide. If the alert clears while an investigation
+  is still running, the verdict and its decision card still arrive and the
+  verdict is on the problem's timeline, but the problem stays `resolved` and
+  its task stays closed. The worker logs `hub_status_held` when this happens.
+  If the thing breaks again within a day, the next occurrence reopens the
+  problem and its task; later than that, it opens a new problem. Either way a
+  fresh investigation starts (#484).
+- **Severity only goes up.** Each occurrence keeps its own severity, and the
+  problem takes the worst one it has seen. That is what the status block on
+  the task shows. A milder occurrence later never lowers it (#486). Hub tasks
+  get no Todoist priority from severity, so nothing else changes on the task.
+
+Before #484 a late verdict reopened the problem. To find any still live from
+that time, run the query below. Resolve each one from the admin **Problems**
+page, unless its timeline shows an occurrence after the reopen.
+
+```sql
+SELECT p.id, p.status, p.class, p.subject, e.occurred_at AS reopened_at
+FROM problem_events e JOIN problems p ON p.id = e.problem_id
+WHERE e.source = 'hub' AND e.kind = 'state_change' AND e.payload->>'action' = 'reopen'
+  AND e.external_id LIKE 'investigation:%'
+  AND p.closed_at IS NULL AND p.status NOT IN ('resolved', 'closed');
+```
+
 ### Groups: one problem for the same failure on many things
 
 Six Postiz posts wedged in the same queue used to be six problems and six

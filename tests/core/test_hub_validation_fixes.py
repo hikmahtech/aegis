@@ -103,15 +103,21 @@ async def test_a_task_whose_problem_closed_gets_a_fresh_one(db_pool):
 
 
 async def test_a_status_move_off_resolved_clears_it_and_reopens_the_task(db_pool):
-    """An investigation reporting `fixing` after the alert already cleared left
-    a stale `resolved_at` behind: `close_resolved` then never retired the
-    problem, and the projector left its task completed while the problem was
-    live, so the next occurrence attached to a closed task in silence."""
+    """A move off `resolved` left a stale `resolved_at` behind: `close_resolved`
+    then never retired the problem, and the projector left its task completed
+    while the problem was live, so the next occurrence attached to a closed
+    task in silence.
+
+    Since #484 only a caller that is NOT an investigation can make this move;
+    an investigation's late verdict leaves the problem resolved instead
+    (`test_hub_problem_state.py`)."""
     r = await ingest_event(db_pool, _occ(_subject()), now=NOW)
     await set_status(db_pool, r.problem_id, "resolved", reason="recovered", now=NOW)
     assert (await get_problem(db_pool, r.problem_id))["resolved_at"] is not None
 
-    assert await set_status(db_pool, r.problem_id, "fixing", reason="not really", now=NOW)
+    assert await set_status(
+        db_pool, r.problem_id, "fixing", reason="not really", source="admin", now=NOW
+    )
 
     p = await get_problem(db_pool, r.problem_id)
     assert p["status"] == "fixing"

@@ -267,7 +267,7 @@ Specialist flows subscribe to tag subsets and run as abandoned children:
 7. **Gate 2** — Open PR(s) / Run fix / Mute 24h (mutes the problem) / Acknowledge / Discard via Slack; escalating alerts race the card against the hub seeing the problem resolve.
 8. Comms notification (Slack) + the full report as a Todoist comment + `record_investigation` on the problem.
 
-Every transition the flow makes (`investigating` → `waiting_human` / `fixing` / `resolved`) is a `state_change` on the problem, so the timeline, the digest and the next session read one record.
+Every transition the flow makes (`investigating` → `waiting_human` / `fixing` / `resolved`) is a `state_change` on the problem, so the timeline, the digest and the next session read one record. The one move it cannot make is back out of `resolved` (#484): the alert source owns whether a problem is live, so a verdict that lands after the alert cleared is recorded as an `investigation` event and the problem stays resolved until a real occurrence reopens it.
 
 When a `todoist_task_id` is on the alert (pandora APP-<n>: clarify path, or the `investigate_resource` chat tool), the hub adopts that task as the problem's; otherwise the projector creates one. Start + final comments are posted via `AlertActivities.post_task_note`.
 

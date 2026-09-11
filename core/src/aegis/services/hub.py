@@ -415,14 +415,14 @@ async def ingest_event(
 
         if event.problem_id:
             current = await conn.fetchrow(
-                "SELECT id::text AS id, status, resolved_at, muted_until, occurrences "
+                "SELECT id::text AS id, status, resolved_at, muted_until, occurrences, severity "
                 "FROM problems WHERE id = $1::uuid FOR UPDATE",
                 event.problem_id,
             )
             current = dict(current) if current else None
         elif key:
             current = await conn.fetchrow(
-                "SELECT id::text AS id, status, resolved_at, muted_until, occurrences "
+                "SELECT id::text AS id, status, resolved_at, muted_until, occurrences, severity "
                 "FROM problems WHERE correlation_key = $1 AND closed_at IS NULL FOR UPDATE",
                 key,
             )
@@ -452,7 +452,7 @@ async def ingest_event(
             if gkey:
                 row = await conn.fetchrow(
                     "SELECT id::text AS id, status, resolved_at, muted_until, occurrences, "
-                    "title, group_key FROM problems "
+                    "severity, title, group_key FROM problems "
                     "WHERE group_key = $1 AND closed_at IS NULL FOR UPDATE",
                     gkey,
                 )
@@ -521,15 +521,25 @@ async def ingest_event(
             muted_until = current.get("muted_until")
             muted = muted_until is not None and _aware(muted_until, now) > now
             if d.action in {"attach", "reopen", "promote"}:
+                # A problem is as bad as its worst occurrence (#486): a cert
+                # that opened at 14 days as `warning` is `critical` once its
+                # daily occurrence is. Raised, never lowered — one milder
+                # occurrence does not make a once-critical problem fine. The
+                # ordering is the one a group uses for its worst member;
+                # imported here because `hub_group` imports this module.
+                from aegis.services.hub_group import worst
+
                 occurrences = await conn.fetchval(
                     "UPDATE problems SET occurrences = occurrences + 1, "
                     "last_seen_at = GREATEST(last_seen_at, $2), "
                     "status = COALESCE($3, status), "
-                    "resolved_at = CASE WHEN $3 IS NULL THEN resolved_at ELSE NULL END "
+                    "resolved_at = CASE WHEN $3 IS NULL THEN resolved_at ELSE NULL END, "
+                    "severity = $4 "
                     "WHERE id = $1::uuid RETURNING occurrences",
                     problem_id,
                     occurred_at,
                     d.status,
+                    worst([current.get("severity") or "", severity]),
                 )
             elif d.action == "resolve":
                 await conn.execute(
@@ -793,8 +803,12 @@ async def set_status(
 ) -> bool:
     """Move a live problem to ``status`` (an investigation's own transitions:
     investigating / waiting_human / fixing / resolved), writing the
-    state_change event. False when the problem is missing, closed, or already
-    there. Never resurrects a closed problem."""
+    state_change event. Never resurrects a closed problem.
+
+    False when nothing moved: the problem is missing, closed or already
+    there — or it is ``resolved`` and ``source`` is an investigation asking
+    for a live status, which is recorded by the caller as history and leaves
+    the problem resolved (see below)."""
     if status not in STATUSES or status == "closed":
         raise ValueError(f"cannot set status {status!r}")
     now = now or _utcnow()
@@ -806,14 +820,37 @@ async def set_status(
         )
         if row is None or row["status"] == status:
             return False
-        # Coming BACK from `resolved` is a reopen: the stale `resolved_at` has
-        # to go, or `close_resolved` never retires the problem and the
-        # projector leaves its task completed while the problem is live again.
-        # The event says `reopen` so the projector uncompletes the task — an
-        # investigation that reports `fixing` after the alert cleared used to
-        # leave a closed task on an open problem, and the next occurrence
-        # attached to it in silence.
         reopening = row["status"] == "resolved" and status in LIVE_STATUSES
+        if reopening and source == "investigation":
+            # The alert source owns whether a problem is live; an
+            # investigation only annotates it. A verdict that lands after the
+            # alert cleared (prod 2140a366: resolved 10:17, "not actionable"
+            # card 10:20) used to reopen the problem and its task for an
+            # incident that was already over, and it stayed live for days.
+            # The verdict is still on the timeline — the caller writes it as
+            # an `investigation` event before calling this — but the status
+            # stays `resolved`.
+            #
+            # This is also what the old reopen here was for, done properly:
+            # an investigation reporting `fixing` after the alert cleared left
+            # a closed task on a live problem, and the next occurrence
+            # ATTACHED to it in silence. With the problem left resolved, the
+            # next occurrence goes through `ingest_event` instead — a reopen
+            # inside REOPEN_WINDOW, a new problem after it — so the task
+            # follows and a fresh investigation is asked for.
+            logger.info(
+                "hub_status_held",
+                problem_id=problem_id,
+                status=status,
+                held="resolved",
+                reason=reason[:80],
+            )
+            return False
+        # Any other caller coming BACK from `resolved` is a reopen: the stale
+        # `resolved_at` has to go, or `close_resolved` never retires the
+        # problem and the projector leaves its task completed while the
+        # problem is live again. The event says `reopen` so the projector
+        # uncompletes the task.
         await conn.execute(
             "UPDATE problems SET status = $2, "
             "resolved_at = CASE WHEN $2 = 'resolved' THEN $3 WHEN $4 THEN NULL "

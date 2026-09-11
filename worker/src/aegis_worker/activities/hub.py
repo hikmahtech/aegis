@@ -187,6 +187,10 @@ class HubActivities:
         `inp["status"]` when given), then project. One dict argument because
         Temporal activities take positional args only.
 
+        A problem the alert already resolved stays resolved: the event is
+        still written, and `status_changed` comes back False (`hub.set_status`,
+        #484).
+
         Keys: `problem_id`, `status`, `text`, `external_id` (idempotency),
         `posted` (True = the flow already put this text on the task, so the
         projector must not repeat it), `payload` (extra; `pr_urls` become
