@@ -853,9 +853,9 @@ runbook in this order:
    generic and host-free. A file that still says `TODO: fill in` is a stub
    and counts as no runbook.
 
-A database error falls through to the file, with a `runbook_db_read_failed`
-warning in the worker log. A runbook is context for an investigation, never a
-gate on it.
+A database error, or a read that takes longer than 5 seconds, falls through
+to the file, with a `runbook_db_read_failed` warning in the worker log. A
+runbook is context for an investigation, never a gate on it.
 
 **Setup-specific runbooks belong in the table, not in `runbooks/`.** This repo
 is public, and a fork should not inherit your machine names or topology. A
