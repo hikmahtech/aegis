@@ -19,6 +19,12 @@ from temporalio import activity
 # Cap on Kimi investigation output kept in the activity return value.
 _INVESTIGATION_OUTPUT_CAP = 8 * 1024
 
+# How long _read_runbook waits for the `runbooks` table before using the file.
+# The pool sets no command timeout, so a hung database would otherwise hold
+# gather_alert_knowledge until its 65s activity timeout, and the investigation
+# would start with no runbook and no prior knowledge at all.
+_RUNBOOK_DB_TIMEOUT_S = 5.0
+
 # Kimi's prompt contract (see run_investigation prompt below) instructs it to
 # end its final assistant turn with exactly one of these tokens. Treating the
 # presence of any of these as "done" prevents the polling activity from
@@ -699,10 +705,40 @@ class AlertActivities:
                 pass
         return self.runbooks_dir
 
-    def _read_runbook(self, alert_name: str, runbooks_dir: str | None = None) -> str:
-        """Return the runbook Markdown for alert_name, or '' if absent/stub."""
-        runbooks_dir = self.runbooks_dir if runbooks_dir is None else runbooks_dir
-        if not runbooks_dir or not alert_name:
+    async def _read_runbook(self, alert_name: str) -> str:
+        """Return the runbook Markdown for alert_name, or '' if there is none.
+
+        Lookup order (#499): the `runbooks` table first, which is where a
+        deployment keeps runbooks about its own setup; then
+        `<runbooks dir>/<alert_name>.md`, the generic ones baked into the image.
+        The table matches any spelling of the name (services/runbooks.py). A
+        stub is no runbook, from either source. A database error or a database
+        slower than `_RUNBOOK_DB_TIMEOUT_S` falls through to the files: a
+        runbook is context for an investigation, never a gate.
+        """
+        if not alert_name:
+            return ""
+        if self.db_pool is not None:
+            from aegis.services import runbooks as runbooks_service
+
+            try:
+                row = await asyncio.wait_for(
+                    runbooks_service.get_runbook(self.db_pool, alert_name),
+                    timeout=_RUNBOOK_DB_TIMEOUT_S,
+                )
+            except Exception as exc:  # noqa: BLE001 — fail open to the files
+                activity.logger.warning(
+                    "runbook_db_read_failed alert=%s err=%s",
+                    alert_name,
+                    f"{type(exc).__name__}: {exc}"[:200],
+                )
+                row = None
+            body = row.get("body") if isinstance(row, dict) else None
+            if isinstance(body, str) and body.strip() and not runbooks_service.is_stub(body):
+                activity.logger.info("runbook_from_db alert=%s", alert_name)
+                return body.strip()
+        runbooks_dir = await self._effective_runbooks_dir()
+        if not runbooks_dir:
             return ""
         base = Path(runbooks_dir)
         # Try exact case first, then lowercase
@@ -966,13 +1002,14 @@ class AlertActivities:
     async def gather_alert_knowledge(self, title: str, project: str, alert_name: str = "") -> str:
         """Return runbook + KG prior-incident context for an alert.
 
-        Prepends the static per-alert runbook (if one exists) before the
-        knowledge-graph answer so the investigation model sees structured
-        checklists before free-form history.
+        Prepends the per-alert runbook (if one exists: the `runbooks` table,
+        else the file — see `_read_runbook`) before the knowledge-graph answer
+        so the investigation model sees structured checklists before free-form
+        history.
         """
         parts: list[str] = []
 
-        runbook = self._read_runbook(alert_name, await self._effective_runbooks_dir())
+        runbook = await self._read_runbook(alert_name)
         if runbook:
             parts.append(f"Runbook:\n{runbook}")
 
