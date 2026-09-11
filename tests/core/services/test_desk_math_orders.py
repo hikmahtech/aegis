@@ -157,3 +157,23 @@ def test_a_sell_of_nothing_held_is_cancelled():
     bars = {"X": [Bar(date(2026, 9, 14), 100.0)]}
     [r] = fill_orders([p("o", "X", "sell", 1)], bars, DAYS, Book(cash=0.0), Rules())
     assert (r.status, r.reason) == ("cancelled", "nothing_held")
+
+
+def test_sells_of_one_name_in_a_batch_share_the_holding():
+    """Each sell is capped by what the earlier ones left, not by the whole holding."""
+    bars = {"X": [Bar(date(2026, 9, 14), 100.0)]}
+    pending = [p("s1", "X", "sell", 4, seq=0), p("s2", "X", "sell", 4, seq=1), p("s3", "X", "sell", 1, seq=2)]
+    res = {r.order_id: r for r in fill_orders(pending, bars, DAYS, held("X", 5, 100.0), Rules())}
+    assert (res["s1"].status, res["s1"].qty) == ("filled", 4)
+    assert (res["s2"].status, res["s2"].qty) == ("filled", 1)
+    assert (res["s3"].status, res["s3"].reason) == ("cancelled", "nothing_held")
+
+
+def test_a_sell_fills_before_a_buy_numbered_ahead_of_it():
+    """The buy only fits on the sell's proceeds, and it fills in full."""
+    book = held("X", 10, 100.0, cash=0.0)
+    bars = {"X": [Bar(date(2026, 9, 14), 100.0)], "Y": [Bar(date(2026, 9, 14), 100.0)]}
+    pending = [p("buy", "Y", "buy", 5, seq=0), p("sell", "X", "sell", 10, seq=1)]
+    res = {r.order_id: r for r in fill_orders(pending, bars, DAYS, book, Rules())}
+    assert (res["sell"].status, res["sell"].qty) == ("filled", 10)
+    assert (res["buy"].status, res["buy"].qty) == ("filled", 5)

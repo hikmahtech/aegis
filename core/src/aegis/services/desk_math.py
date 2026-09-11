@@ -457,15 +457,17 @@ def fill_orders(
     """Fill pending paper orders at the close of their fill day (spec §6).
 
     The fill day is the first market day on or after the day an order was
-    created. ``book`` is the desk before these fills. Orders fill in ``seq``
-    order, sells first; a buy that no longer fits the cash is cut, or cancelled
-    as ``no_cash``. No price ``grace_days`` market days after the fill day cancels the
-    order as ``price_missing``.
+    created. ``book`` is the desk before these fills. Sells fill before buys, and
+    ``seq`` orders each side; a buy that no longer fits the cash is cut, or cancelled
+    as ``no_cash``. Sells of one name share the holding, so each is capped by what
+    the earlier ones left. No price ``grace_days`` market days after the fill day
+    cancels the order as ``price_missing``.
     """
     days = sorted(index_days)
     cash = book.cash
+    sold: dict[str, int] = defaultdict(int)
     results: list[FillResult] = []
-    for o in sorted(pending, key=lambda o: (o.created_day, o.seq)):
+    for o in sorted(pending, key=lambda o: (o.created_day, o.side != "sell", o.seq)):
         fill_day = next((d for d in days if d >= o.created_day), None)
         if fill_day is None:
             results.append(FillResult(o.id, "pending"))
@@ -481,10 +483,11 @@ def fill_orders(
         px = bar.close
         qty = math.floor(o.qty * _split_factor(series, o.data_date, fill_day) + _EPS)
         if o.side == "sell":
-            qty = min(qty, math.floor(book.qty(o.symbol) + _EPS))
+            qty = min(qty, math.floor(book.qty(o.symbol) + _EPS) - sold[o.symbol])
             if qty <= 0:
                 results.append(FillResult(o.id, "cancelled", reason="nothing_held"))
                 continue
+            sold[o.symbol] += qty
             costs = _costs("sell", qty, px, rules)
             cash += qty * px - costs
         else:
