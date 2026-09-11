@@ -128,6 +128,32 @@ activities:
       silent: false
     active: false
 
+  # Maou's paper trading desk (spec 2026-09-12-maou-trading-desk-design.md).
+  # Weekdays 02:30 UTC = 08:00 IST, before the 09:15 open. Ships INACTIVE: it
+  # needs ansaar_url + ansaar_service_secret (admin Integrations page) and a
+  # trading system serving decisions (ansaar-data #30). The activity reads this
+  # config on every run, so an edit here needs no redeploy.
+  - slug: trading-desk-daily
+    workflow_type: TradingDeskFlow
+    agent_id: maou
+    schedule_cron: "30 2 * * 1-5"
+    config:
+      mode: paper
+      capital: 100000
+      asset_classes: [equity, etf]
+      cost_pct_per_side: 0.002
+      sell_charge_inr: 16
+      band_abs: 0.02
+      band_rel: 0.25
+      max_order_pct: 0.25
+      tax_rate: {equity: 0.20, etf: 0.30}
+      ltcg_rate: 0.125
+      ltcg_exemption_inr: 125000
+      benchmark: SHARIABEES.NS
+      context_benchmark: ^NSEI
+      expected_excess_pa: 0.06
+    active: false
+
   # Social publishing — a Todoist task (@publish + platform labels, due time =
   # post time) becomes a post after an approval card. Ships inert: the
   # social_publishing_enabled settings row (migration 005) defaults to false.

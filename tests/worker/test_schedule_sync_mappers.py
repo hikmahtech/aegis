@@ -16,6 +16,7 @@ from aegis_worker.flows.receipt_ingest import (
     ReceiptIngestInput,
 )
 from aegis_worker.flows.service_drift import ServiceDriftConfig, ServiceDriftFlow
+from aegis_worker.flows.trading_desk import TradingDeskConfig, TradingDeskFlow
 from aegis_worker.flows.workspace_repo_sync import WorkspaceRepoSyncFlow, WorkspaceRepoSyncInput
 from aegis_worker.schedule_sync import _ACTIVITY_TYPE_MAP
 
@@ -189,3 +190,11 @@ def test_receipt_ingest_mapper_defaults():
     assert cfg.sender_filter == DEFAULT_SENDER_FILTER
     assert cfg.query_window == "newer_than:14d"
     assert cfg.sweep_limit == 20
+
+
+def test_trading_desk_flow_mapper_resolves():
+    mapper = _ACTIVITY_TYPE_MAP["TradingDeskFlow"]
+    workflow_cls, cfg = mapper(_act("trading-desk-daily", "TradingDeskFlow", {"mode": "paper"}))
+    assert workflow_cls is TradingDeskFlow
+    assert isinstance(cfg, TradingDeskConfig)
+    assert cfg.agent_id == "maou"

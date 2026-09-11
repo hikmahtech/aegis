@@ -355,6 +355,11 @@ class Settings(BaseSettings):
     books_mailbox_entities: str = ""
     books_todoist_projects: str = ""  # "personal=<todoist project id>,hikmah=<id>" for dues
 
+    # Maou's trading desk (spec 2026-09-12-maou-trading-desk-design.md): the
+    # ansaar-data API serving the trading system's decisions. Either empty ⇒ off.
+    ansaar_url: str = ""
+    ansaar_service_secret: str = ""
+
     @model_validator(mode="after")
     def _require_admin_credentials(self) -> "Settings":
         """admin_username/admin_password are required unless auth_disabled."""

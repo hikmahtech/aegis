@@ -100,6 +100,7 @@ from aegis_worker.flows.statement_reconcile import (
     StatementReconcileFlow,
 )
 from aegis_worker.flows.todoist_sync import TodoistSyncConfig, TodoistSyncFlow
+from aegis_worker.flows.trading_desk import TradingDeskConfig, TradingDeskFlow
 from aegis_worker.flows.wearable_ingest import WearableIngestFlow, WearableIngestInput
 from aegis_worker.flows.workspace_repo_sync import WorkspaceRepoSyncFlow, WorkspaceRepoSyncInput
 
@@ -569,6 +570,13 @@ FLOWS: tuple[FlowSpec, ...] = (
         ),
         feature_flag="money_hygiene_enabled",
     ),
+    # Maou's paper trading desk (spec 2026-09-12). Its rules are read from the
+    # activities row by the activity itself, so only agent_id travels here.
+    FlowSpec(
+        TradingDeskFlow,
+        lambda act: TradingDeskConfig(agent_id=act["agent_id"]),
+        feature_flag="money_hygiene_enabled",
+    ),
     # Child of GmailIngestFlow (the `meeting` tag fan-out); never scheduled.
     FlowSpec(MeetingNotesFlow),
     # The read-state-blind safety net for that fan-out. Not feature-flagged: it
@@ -593,6 +601,7 @@ ACTIVITY_CLASS_FLAGS: dict[str, str] = {
     # to the same books through the same flock, and a money-off install must
     # not serve their task queue either.
     "StatementActivities": "money_hygiene_enabled",
+    "TradingDeskActivities": "money_hygiene_enabled",
 }
 
 
