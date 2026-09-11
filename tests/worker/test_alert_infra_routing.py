@@ -400,7 +400,9 @@ async def _stub_upload_kimi_log(output_file: str, filename_hint: str, host: str 
 
 
 @activity.defn(name="record_verdict_to_kg")
-async def _stub_record_verdict_to_kg(alert: dict, verdict: dict, investigation_output: str) -> dict:
+async def _stub_record_verdict_to_kg(
+    alert: dict, verdict: dict, investigation_output: str, outcome: str = ""
+) -> dict:
     return {"ingested": False, "reason": "stub"}
 
 

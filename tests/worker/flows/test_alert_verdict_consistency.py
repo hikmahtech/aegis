@@ -71,7 +71,7 @@ async def stub_assess_investigation_local(alert: dict, investigation_output: str
 
 @activity.defn(name="record_verdict_to_kg")
 async def stub_record_verdict_to_kg(
-    alert: dict, verdict: dict, investigation_output: str
+    alert: dict, verdict: dict, investigation_output: str, outcome: str = ""
 ) -> None:
     return None
 

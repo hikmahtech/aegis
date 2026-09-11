@@ -1,4 +1,16 @@
-"""AlertInvestigationFlow — investigate one problem the hub handed over.
+"""FROZEN COPY for replay tests — do not edit, do not import from app code.
+
+`worker/src/aegis_worker/flows/alert_investigation.py` as it was at 9854b63,
+the commit before #502 moved the verdict's knowledge-store write to after the
+human's decision. Verbatim apart from this header, the class name and the
+`workflow.defn` line, which registers it under the real workflow type so the
+histories it records are the ones a run in flight across the deploy carries.
+`test_alert_kg_after_decision_replay.py` records histories with it and replays
+them through the current flow. Delete this file with that patch guard.
+
+The original docstring follows.
+
+AlertInvestigationFlow — investigate one problem the hub handed over.
 
 Since PR 3b the flow no longer owns an alert's identity: the problem hub
 (`aegis.services.hub`) decides whether a signal is new, a repeat, suppressed
@@ -27,22 +39,20 @@ Pipeline:
      verdict's proposed commands (#518), an escalating alert, or a restart
      that did not stick. Escalating alerts race the card against the hub
      seeing the problem resolve
-7.9. Store the verdict in the knowledge store, tagged with what became of it
-     (#502): opened_pr / pr_failed / run_fix / discarded / muted /
-     acknowledged / expired / self_resolved / no_card. Before #502 this was
-     Step 7b, before the card, so a discarded fix was recalled like a taken one
 8.5. Post the final report on the task via `AlertActivities.post_task_note`
 9.   Notify via chat (links to the Todoist task)
 10.  Record the outcome on the problem (`record_investigation`)
 
 Every transition the flow makes is recorded on the problem
 (investigating → waiting_human / fixing / resolved) so the timeline, the
-digest and the next session read one record. An opened fix PR leaves the
-problem in `fixing`; the GitHub webhook and the hub sweep follow it from there
-(`hub_fix`: `verifying` on merge, resolved once the alert stays clear).
+digest and the next session read one record.
 """
 
 from __future__ import annotations
+
+# The import block is the worker's, sorted by the worker's isort settings;
+# re-sorting it here would stop the copy being verbatim.
+# ruff: noqa: I001
 
 import asyncio
 import re
@@ -95,9 +105,6 @@ _MAX_HINT_ROUNDS = 3
 _PATCH_NO_CARD = "gate2-only-for-decisions"
 # #501: look the problem up before an automatic restart; record every attempt.
 _PATCH_RESTART_ONCE = "auto-restart-once-per-window"
-# #502: the verdict goes to the knowledge store once the operator has decided,
-# tagged with the decision, instead of before the card went out.
-_PATCH_KG_AFTER_DECISION = "kg-verdict-after-decision"
 
 
 def _safe_workflow_id_segment(text: str, max_len: int = 60) -> str:
@@ -286,8 +293,8 @@ def _build_repo_confirm_prompt(
     return "\n".join(lines)
 
 
-@workflow.defn
-class AlertInvestigationFlow:
+@workflow.defn(name="AlertInvestigationFlow", sandboxed=False)
+class AlertInvestigationFlowPre502:
     """Investigate and route production alerts with verification delay."""
 
     async def _safe_event(self, msg: str) -> None:
@@ -404,25 +411,6 @@ class AlertInvestigationFlow:
             workflow.logger.warning(
                 "alert_record_investigation_failed step=%s err=%s", step, str(exc)[:200]
             )
-
-    async def _store_verdict(
-        self, alert: dict, verdict: dict, investigation_output: str, outcome: str
-    ) -> None:
-        """Best-effort: the verdict and transcript go to the knowledge store,
-        tagged with `outcome` — what the operator did with it (#502). Called
-        once per run, where the outcome is known: at the answer on the card,
-        or straight after the verdict when no card goes out. The next
-        investigation of a similar alert recalls it (`gather_alert_knowledge`
-        puts a taken fix first and never recalls a discarded one)."""
-        try:
-            await workflow.execute_activity_method(
-                AlertActivities.record_verdict_to_kg,
-                args=[alert, verdict, investigation_output, outcome],
-                start_to_close_timeout=TIMEOUT_STANDARD,
-                retry_policy=NO_RETRY,
-            )
-        except Exception:
-            workflow.logger.warning("alert_record_verdict_to_kg_failed outcome=%s", outcome)
 
     async def _safe_remediate_infra(
         self,
@@ -1211,22 +1199,20 @@ class AlertInvestigationFlow:
             verdict["status"] = "actionable"
 
         # ── Step 7b: Persist verdict + transcript to the KG ──
-        # Since #502 this happens once the outcome is known (Step 7.9, and
-        # at each answer on the card that ends the run), tagged with it: here,
-        # before the card, a verdict the operator went on to discard was
-        # stored exactly like one they acted on. The old write stays for the
-        # runs that recorded it — a history without the marker replays it.
-        kg_after_decision = workflow.patched(_PATCH_KG_AFTER_DECISION)
-        if not kg_after_decision:
-            try:
-                await workflow.execute_activity_method(
-                    AlertActivities.record_verdict_to_kg,
-                    args=[alert, verdict, investigation_output],
-                    start_to_close_timeout=TIMEOUT_STANDARD,
-                    retry_policy=NO_RETRY,
-                )
-            except Exception:
-                workflow.logger.warning("alert_record_verdict_to_kg_failed")
+        # Closes the cross-recall loop: future investigations of the
+        # same resource / alert family can ask the knowledge graph for
+        # prior diagnoses instead of re-deriving from scratch. Pre-fix,
+        # only the LLM-fallback `investigate()` path ingested; the
+        # kimi path's findings were lost between flows.
+        try:
+            await workflow.execute_activity_method(
+                AlertActivities.record_verdict_to_kg,
+                args=[alert, verdict, investigation_output],
+                start_to_close_timeout=TIMEOUT_STANDARD,
+                retry_policy=NO_RETRY,
+            )
+        except Exception:
+            workflow.logger.warning("alert_record_verdict_to_kg_failed")
 
         # ── Step 7.5: Gate 2 — post-verdict decision gate ──
         # A card only when there is a decision (#500): a fix branch to open,
@@ -1282,10 +1268,6 @@ class AlertInvestigationFlow:
         if no_decision_card:
             gate_skipped = True
             workflow.logger.info("alert_gate2_no_decision_no_card verdict=%s", verdict_status)
-        # What the operator answered on the card ("" when none went out), and
-        # the PRs an "Open PR(s)" answer opened. Step 7.9 and Step 10 read both.
-        v2 = ""
-        opened_pr_urls: list[str] = []
         if not gate_skipped:
             # assess_investigation returns {status, root_cause, suggested_fix,
             # confidence}. The earlier `summary`/`severity`/`title` fallback
@@ -1441,8 +1423,6 @@ class AlertInvestigationFlow:
                     track_task_id or "",
                     "⏭ Gate-2 archived (no decision in 48h). Skipping verdict ping.",
                 )
-                if kg_after_decision:
-                    await self._store_verdict(alert, verdict, investigation_output, "expired")
                 return {
                     "status": "gate2_archived",
                     "task_id": None,
@@ -1453,10 +1433,6 @@ class AlertInvestigationFlow:
                 # The self-resolve race auto-closed the card because the alert
                 # recovered while we awaited the human. Log for dedup and short
                 # out — there's no decision to act on.
-                if kg_after_decision:
-                    await self._store_verdict(
-                        alert, verdict, investigation_output, "self_resolved"
-                    )
                 await self._safe_post_note(
                     track_task_id or "",
                     "✅ Self-resolved while awaiting your decision — card closed automatically.",
@@ -1474,10 +1450,6 @@ class AlertInvestigationFlow:
                     "todoist_task_id": track_task_id,
                 }
             if v2 == "run_fix" and proposed_cmds:
-                # The operator took the fix: that is the outcome, whatever
-                # the commands then do (the problem's timeline has that).
-                if kg_after_decision:
-                    await self._store_verdict(alert, verdict, investigation_output, "run_fix")
                 # A free-text note on the card overrides the parsed commands
                 # (one command per line) — lets the operator correct/replace
                 # what the LLM proposed without re-running the investigation.
@@ -1589,12 +1561,8 @@ class AlertInvestigationFlow:
                     track_task_id or "",
                     voice_line(agent_id, "fix_discarded"),
                 )
-                # Stored, tagged `discarded`, so a discarded fix never comes
-                # back as a "prior diagnosis": recall leaves those out. Until
-                # #502 this comment said the write was skipped, while Step 7b
-                # had already made it, untagged, before the card went out.
-                if kg_after_decision:
-                    await self._store_verdict(alert, verdict, investigation_output, "discarded")
+                # KG persistence is intentionally skipped: a user-discarded
+                # fix shouldn't poison future recall as a "prior diagnosis".
                 await self._record(
                     problem_id, "waiting_human", "Proposed fix discarded.", step="discard"
                 )
@@ -1691,7 +1659,6 @@ class AlertInvestigationFlow:
                         pr_urls.append(pr_url)
 
                 if pr_urls:
-                    opened_pr_urls = pr_urls
                     n = len(pr_urls)
                     links_html = "\n".join(
                         f"  • <a href='{u}'>{_html_escape(u)}</a>" for u in pr_urls
@@ -1712,14 +1679,9 @@ class AlertInvestigationFlow:
                     # spawned the investigation, not only in chat.
                     if track_task_id and not track_task_id.startswith("item-"):
                         links_plain = "\n".join(f"  • {u}" for u in pr_urls)
-                        # The webhook and the hub sweep follow it from here
-                        # (#502, `hub_fix`).
                         await self._safe_post_note(
                             track_task_id,
-                            f"{voice_head}\n\n{links_plain}\n\n"
-                            "I'm following it: when it merges I watch the alert, and I "
-                            "resolve this once the alert stays clear, or reopen it if "
-                            "it comes back. Closed without merging, it comes back to you.",
+                            f"{voice_head}\n\n{links_plain}",
                         )
                     await self._record(
                         problem_id,
@@ -1749,22 +1711,6 @@ class AlertInvestigationFlow:
                             "⚠️ Open-PR was approved but no PR could be opened. "
                             f"Fix branch(es) still exist on the run host: {branch_list}",
                         )
-
-        # ── Step 7.9: Store the verdict with what became of it (#502) ──
-        # Every run that gets here has its outcome: no card went out, or the
-        # operator answered with something that does not end the run. The
-        # answers that do end it (expired, self-resolved, run fix, discard)
-        # stored theirs where they return.
-        if kg_after_decision:
-            if gate_skipped:
-                outcome = "no_card"
-            elif v2 == "open_all_prs":
-                outcome = "opened_pr" if opened_pr_urls else "pr_failed"
-            else:
-                # "ack", or any answer the flow carries on past like one.
-                outcome = "muted" if v2 == "mute_24h" else "acknowledged"
-            await self._store_verdict(alert, verdict, investigation_output, outcome)
-
         # ── Step 8: Compute final status (no task creation in v3) ──
         final_status = "logged"
 
@@ -1919,22 +1865,13 @@ class AlertInvestigationFlow:
             workflow.logger.warning("alert_verdict_voice_failed err=%s", str(exc)[:200])
 
         # ── Step 10: Record the outcome on the problem ──
-        # `resolved` closes the problem; an opened fix PR keeps it `fixing`
-        # (#502: this step used to hand it back to `waiting_human` a moment
-        # after `prs_opened` moved it, so nothing said a fix was on its way,
-        # and the PR's merge is what moves it on now); anything else leaves it
-        # with the human, who has the full report on the task — with no card
-        # too, which is the state an `ack` used to leave it in.
+        # `resolved` closes the problem; anything else leaves it with the
+        # human, who has the full report on the task — with no card too,
+        # which is the state an `ack` used to leave it in.
         decision_card = not gate_skipped
-        if opened_pr_urls:
-            final_problem_status = "fixing"
-        elif final_status == "resolved":
-            final_problem_status = "resolved"
-        else:
-            final_problem_status = "waiting_human"
         await self._record(
             problem_id,
-            final_problem_status,
+            "resolved" if final_status == "resolved" else "waiting_human",
             f"{final_status}: {(verdict.get('root_cause') or '')[:300]}",
             step="final",
             payload={
