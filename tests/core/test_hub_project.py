@@ -191,6 +191,136 @@ async def test_first_projection_creates_the_task_with_block_and_label(db_pool, i
     assert _cmds(todoist, "note_add") == []
 
 
+_BOOKS_PROJECTS = "integration:books_todoist_projects"
+
+
+def _money(subject: str, n: int = 1) -> Event:
+    """A reconciliation finding as `hub_watch.reconcile_findings` ingests it."""
+    return Event(
+        source="money",
+        external_id=f"money:unmatched_rows:{subject}@{n}",
+        kind="occurrence",
+        title=f"3 unmatched rows on {subject}",
+        klass="unmatched_rows",
+        subject=subject,
+        subject_kind="instrument",
+        payload={"rows": 3, "description": "Three rows on this account match nothing."},
+        occurred_at=NOW + timedelta(minutes=n),
+    )
+
+
+@pytest_asyncio.fixture(loop_scope="function")
+async def books_projects(db_pool):
+    """The row the admin Integrations page writes, spelled as loosely as a
+    person types it."""
+    await db_pool.execute(
+        "INSERT INTO settings (key, value) VALUES ($1, $2) "
+        "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+        _BOOKS_PROJECTS,
+        {"val": " personal = P_FINANCE ,hikmah=P_HIKMAH"},
+    )
+    yield
+    await db_pool.execute("DELETE FROM settings WHERE key = $1", _BOOKS_PROJECTS)
+
+
+async def test_a_money_problem_is_maous_task_in_the_personal_books_project(
+    db_pool, inbox, todoist, books_projects
+):
+    """All 13 money problems in prod (2026-09-11) were projected as
+    `#alert @pandora` in the Inbox, and the agent sweep then ran Pandora's
+    infra verb on them. A problem first raised by the money lane belongs to
+    the finance agent; every other source keeps the infra agent and the Inbox.
+
+    Falsifiable: route every problem to the infra owner and the money task is
+    `#alert @pandora` in the Inbox again.
+    """
+    inst = f"zz-acct-{uuid.uuid4().hex[:8]}"
+    r = await ingest_event(db_pool, _money(inst), now=NOW)
+    out = await project(db_pool, r.problem_id, now=NOW)
+    assert out["created"] is True
+
+    args = _cmds(todoist, "item_add")[0]["args"]
+    # `#money` first: the mirror takes the first `#` label as the source tag.
+    assert args["labels"] == ["#money", "@maou", "@next"]
+    assert args["project_id"] == "P_FINANCE"
+    assert "Three rows on this account" in args["description"]
+    assert await db_pool.fetchval(
+        "SELECT todoist_task_ref FROM todoist_capture_idempotency "
+        "WHERE source_tag = '#money' AND external_id = $1",
+        f"problem-{r.problem_id}",
+    ) == out["task_id"]
+
+    # The same setting leaves an alert exactly where it always went.
+    s = _subject()
+    alert = await ingest_event(db_pool, _occ(s, 1), now=NOW)
+    await project(db_pool, alert.problem_id, now=NOW)
+    alert_args = _cmds(todoist, "item_add")[1]["args"]
+    assert alert_args["labels"] == ["#alert", "@pandora"]
+    assert alert_args["project_id"] == "P_INBOX"
+
+
+async def test_a_money_task_follows_the_env_then_the_inbox(db_pool, inbox, todoist, monkeypatch):
+    """No DB row: the env value. Neither: the Inbox, as before."""
+    await db_pool.execute("DELETE FROM settings WHERE key = $1", _BOOKS_PROJECTS)
+    monkeypatch.setattr(
+        "aegis.config.Settings",
+        lambda: SimpleNamespace(secret_key="x", books_todoist_projects="personal=P_ENV"),
+    )
+    first = await ingest_event(db_pool, _money(f"zz-acct-{uuid.uuid4().hex[:8]}"), now=NOW)
+    await project(db_pool, first.problem_id, now=NOW)
+    assert _cmds(todoist, "item_add")[0]["args"]["project_id"] == "P_ENV"
+
+    monkeypatch.setattr("aegis.config.Settings", lambda: SimpleNamespace(secret_key="x"))
+    second = await ingest_event(db_pool, _money(f"zz-acct-{uuid.uuid4().hex[:8]}"), now=NOW)
+    await project(db_pool, second.problem_id, now=NOW)
+    args = _cmds(todoist, "item_add")[1]["args"]
+    assert args["project_id"] == "P_INBOX"
+    assert args["labels"] == ["#money", "@maou", "@next"]
+
+
+async def test_the_money_label_is_the_finance_agents_own_alias(db_pool, inbox, todoist):
+    """The label comes from whoever holds the `finance` tag, not a literal:
+    rename the agent's alias and the task follows it."""
+    agent = await db_pool.fetchval(
+        "SELECT id FROM agents WHERE active AND capabilities ? 'finance' ORDER BY id LIMIT 1"
+    )
+    meta = await db_pool.fetchval("SELECT metadata FROM agents WHERE id = $1", agent)
+    await db_pool.execute(
+        "UPDATE agents SET metadata = $2 WHERE id = $1",
+        agent,
+        {**(meta or {}), "mention_aliases": ["ledgerbot"]},
+    )
+    try:
+        r = await ingest_event(db_pool, _money(f"zz-acct-{uuid.uuid4().hex[:8]}"), now=NOW)
+        await project(db_pool, r.problem_id, now=NOW)
+        assert _cmds(todoist, "item_add")[0]["args"]["labels"] == ["#money", "@ledgerbot", "@next"]
+    finally:
+        await db_pool.execute("UPDATE agents SET metadata = $2 WHERE id = $1", agent, meta or {})
+
+
+async def test_a_money_task_in_the_outbox_is_found_under_its_own_tag(db_pool, inbox, todoist):
+    """The capture idempotency row is keyed on the tag the task was captured
+    with. Looked up under `#alert`, an outbox-created money task would never
+    learn its real id.
+
+    Falsifiable: look the ref up under `SOURCE_TAG` and the projection still
+    says `task_pending_outbox`.
+    """
+    r = await ingest_event(db_pool, _money(f"zz-acct-{uuid.uuid4().hex[:8]}"), now=NOW)
+    await db_pool.execute(
+        "UPDATE problems SET todoist_task_id = 'item-money-temp' WHERE id = $1::uuid", r.problem_id
+    )
+    await db_pool.execute(
+        "INSERT INTO todoist_capture_idempotency (source_tag, external_id, todoist_task_ref) "
+        "VALUES ('#money', $1, 'T_MONEY_REAL') ON CONFLICT (source_tag, external_id) "
+        "DO UPDATE SET todoist_task_ref = EXCLUDED.todoist_task_ref",
+        f"problem-{r.problem_id}",
+    )
+    out = await project(db_pool, r.problem_id, now=NOW)
+    assert out["task_id"] == "T_MONEY_REAL"
+    assert (await get_problem(db_pool, r.problem_id))["todoist_task_id"] == "T_MONEY_REAL"
+
+
 @pytest.mark.parametrize("status", ["suppressed", "closed"])
 async def test_unprojected_statuses_get_no_task(db_pool, inbox, todoist, status):
     s = _subject()

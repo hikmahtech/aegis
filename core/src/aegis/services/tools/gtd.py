@@ -33,6 +33,8 @@ async def _capture_to_inbox_impl(
     title: str,
     description: str | None,
     extra_labels: list[str] | None = None,
+    *,
+    project_id: str | None = None,
 ) -> str | None:
     """Thin wrapper that lets tests monkeypatch the capture core.
 
@@ -44,6 +46,9 @@ async def _capture_to_inbox_impl(
     `extra_labels` are appended to the `[source_tag]` label set (dedup-
     preserving) — used to assign a captured task to an agent (e.g.
     `@pandora`) so it anchors that agent's downstream workflows.
+
+    `project_id` files the task in that project instead of the Inbox — the
+    problem hub's money tasks, which clarify must never see.
     """
     from aegis.connectors.todoist import TodoistConnector
 
@@ -59,7 +64,8 @@ async def _capture_to_inbox_impl(
             "SELECT value FROM settings WHERE key = 'todoist_managed_project_ids'"
         )
         inbox_id = (managed or {}).get("inbox") if isinstance(managed, dict) else None
-        if not inbox_id:
+        target = project_id or inbox_id
+        if not target:
             return None
         inserted = await conn.fetchval(
             "INSERT INTO todoist_capture_idempotency (source_tag, external_id) "
@@ -88,7 +94,7 @@ async def _capture_to_inbox_impl(
         if lbl and lbl not in item_labels:
             item_labels.append(lbl)
     cmd = TodoistConnector.build_create_item_command(
-        project_id=inbox_id,
+        project_id=target,
         content=title[:120],
         description=description,
         labels=item_labels,
