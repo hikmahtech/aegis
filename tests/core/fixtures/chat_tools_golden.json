@@ -273,6 +273,120 @@
   {
     "type": "function",
     "function": {
+      "name": "web_search",
+      "description": "Search the web and return the raw results \u2014 title, url and a snippet for each \u2014 without summarising them. Read a promising result with read_url.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "query": {
+            "type": "string",
+            "description": "What to search for."
+          },
+          "limit": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 20,
+            "description": "How many results (1-20).",
+            "default": 8
+          },
+          "site": {
+            "type": "string",
+            "description": "Only results from this domain, e.g. arxiv.org.",
+            "default": ""
+          }
+        },
+        "required": [
+          "query"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "read_url",
+      "description": "Read one web page and return its readable text. Nothing is saved. Only public http(s) pages can be read.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "url": {
+            "type": "string",
+            "description": "The page to read."
+          },
+          "max_chars": {
+            "type": "integer",
+            "minimum": 500,
+            "maximum": 60000,
+            "description": "The most characters of text to return (500-60000).",
+            "default": 20000
+          }
+        },
+        "required": [
+          "url"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "paper_search",
+      "description": "Find academic papers on arXiv and Semantic Scholar: title, authors, date, abstract, citation count, and an id to pass to paper_read. Nothing is saved.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "query": {
+            "type": "string",
+            "description": "What the papers are about."
+          },
+          "since": {
+            "type": "string",
+            "description": "Only papers published on or after this date: YYYY, YYYY-MM or YYYY-MM-DD.",
+            "default": ""
+          },
+          "limit": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 25,
+            "description": "How many papers (1-25).",
+            "default": 8
+          }
+        },
+        "required": [
+          "query"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "paper_read",
+      "description": "Read a paper's text from its PDF. Nothing is saved.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "paper_id": {
+            "type": "string",
+            "description": "An arXiv id (2401.01234), an id from paper_search (arxiv:\u2026 or s2:\u2026), or a PDF URL."
+          },
+          "max_chars": {
+            "type": "integer",
+            "minimum": 500,
+            "maximum": 60000,
+            "description": "The most characters of text to return (500-60000).",
+            "default": 30000
+          }
+        },
+        "required": [
+          "paper_id"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
       "name": "configure_triage",
       "description": "Read or update triage configuration: ignored Sentry projects, ignored email domains, notification mode, burst threshold.",
       "parameters": {

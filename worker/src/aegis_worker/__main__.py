@@ -51,6 +51,7 @@ from aegis_worker.activities.money import MoneyActivities
 from aegis_worker.activities.people import PeopleActivities
 from aegis_worker.activities.profile import ProfileActivities
 from aegis_worker.activities.raindrop import RaindropActivities
+from aegis_worker.activities.research import ResearchActivities
 from aegis_worker.activities.review import ReviewActivities
 from aegis_worker.activities.rss import RssActivities
 from aegis_worker.activities.runs_v3 import RunRecorderActivities
@@ -388,6 +389,16 @@ async def main():
         raindrop_api_token=getattr(settings, "raindrop_api_token", ""),
         db_pool=deps.pool,
     )
+    # The research lane (#509). Raphael's tier is smart, so the synthesis runs
+    # on the tier-resolved smart model, never the raw settings field.
+    research_act = ResearchActivities(
+        knowledge_connector=connectors.get("knowledge"),
+        search_connector=connectors.get("search"),
+        llm_client=deps.llm,
+        model=deps.model_tiers.get("smart") or settings.model_smart,
+        db_pool=deps.pool,
+        settings=settings,
+    )
     rss_act = RssActivities(db_pool=deps.pool)
     # B7 — wearable vendor poll. An empty token is not an error here: the
     # activity refuses to issue a request and reports `token_missing`, which
@@ -590,6 +601,7 @@ async def main():
         daylog_act,
         raindrop_act,
         rss_act,
+        research_act,
         wearable_act,
         intel_scan_act,
         sentry_ingest_act,

@@ -261,12 +261,19 @@ _READ_ONLY_TOOLS = frozenset(
         "list_next_actions",
         "list_projects",
         "list_social_channels",
+        # The research lane's four reads (#509): a search, a page, a paper
+        # search, a paper — fetched and returned, never stored. Not
+        # `research_topic`: since #509 it starts `ResearchFlow`, which saves
+        # its answer to the knowledge store.
+        "paper_read",
+        "paper_search",
         "query_activities",
         "query_observations",
-        "research_topic",
+        "read_url",
         "search_knowledge",
         "social_timeline",
         "system_status",
+        "web_search",
         "whats_next",
     }
 )

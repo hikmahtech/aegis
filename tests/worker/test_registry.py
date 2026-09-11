@@ -388,9 +388,14 @@ def test_books_write_flow_is_gated_on_money_hygiene():
         # Then +1 activity and NO new flow from #508: `load_tracked_topics` on
         # the existing IntelligenceActivities (the topics `track_topic` saves),
         # a step of IntelligenceScanFlow. Unflagged, so all three rows move.
-        (True, True, 45, 229),
-        (False, False, 35, 196),
-        (True, False, 39, 212),
+        # Then +1 flow and +5 activities from #509: ResearchFlow (started by the
+        # `research_topic` tool and by AgentTaskFlow's `research` verb) and the
+        # new ResearchActivities class — research_gather, research_read,
+        # research_synthesize, research_save, research_task_problem. Unflagged,
+        # so all three rows move.
+        (True, True, 46, 234),
+        (False, False, 36, 201),
+        (True, False, 40, 217),
     ],
 )
 def test_real_registration_passes_the_boot_check(homelab, money, flows, activities):
