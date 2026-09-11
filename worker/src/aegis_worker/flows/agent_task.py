@@ -30,6 +30,7 @@ from temporalio.exceptions import ApplicationError, WorkflowAlreadyStartedError
 
 with workflow.unsafe.imports_passed_through():
     from aegis.connectors.remote_script import _PROMPT_CAP_BYTES
+    from aegis.services.research import task_workflow_id, urls_in
 
     from aegis_worker.activities.agent_run import AgentRunActivities
     from aegis_worker.activities.agent_task import (
@@ -42,6 +43,7 @@ with workflow.unsafe.imports_passed_through():
     from aegis_worker.flows.agent_chat_reply import AgentChatReplyFlow, AgentChatReplyInput
     from aegis_worker.flows.agent_run import poll_until_exit
     from aegis_worker.flows.interaction import InteractionFlow, InteractionFlowInput
+    from aegis_worker.flows.research import ResearchFlow, ResearchInput
     from aegis_worker.shared.retry import (
         ACT_RETRY,
         NO_RETRY,
@@ -541,6 +543,10 @@ class AgentTaskFlow:
                 step = "run_ask"
                 return await self._run_ask(input, task_id)
 
+            if verb == "research":
+                step = "run_research"
+                return await self._run_research(input, task_id)
+
             if verb == "infra":
                 step = "run_infra"
                 return await self._run_infra(input, task_id, context)
@@ -666,6 +672,84 @@ class AgentTaskFlow:
             retry_policy=ACT_RETRY,
         )
         return {"task_id": task_id, "verb": "ask", "status": "asked", "agent": agent}
+
+    async def _run_research(self, input: AgentTaskFlowInput, task_id: str) -> dict:
+        """Research the task's question and post the answer on the task (#509).
+
+        The title is the question; the description is context, and its links
+        are read before any search result. `ResearchFlow` runs as a child this
+        flow waits on — a quick run is under a minute — and the answer lands as
+        ONE task comment with its numbered sources, after which the task parks
+        at `@waiting` for the user to read it. Before #509 a `#research` task
+        went to `ask`, where the agent could only chat about it.
+
+        The hub problem behind the task is minted first
+        (`ensure_problem_for_task`), so the task has a timeline and a session
+        registry like a `@code` task. Best-effort: the answer is the job.
+        """
+        task = input.task or {}
+        title = str(task.get("content") or "").strip()
+        description = str(task.get("description") or "")
+        try:
+            await workflow.execute_activity(
+                "research_task_problem",
+                args=[task_id],
+                start_to_close_timeout=TIMEOUT_STANDARD,
+                retry_policy=ACT_RETRY,
+            )
+        except Exception as exc:  # noqa: BLE001 — the timeline is extra
+            workflow.logger.warning(
+                "research_task_problem_failed task_id=%s err=%s", task_id, str(exc)[:200]
+            )
+        try:
+            result = await workflow.execute_child_workflow(
+                ResearchFlow.run,
+                ResearchInput(
+                    agent_id=input.agent_id or "raphael",
+                    question=title,
+                    context=_cut(description),
+                    seed_urls=urls_in(description, limit=3),
+                ),
+                id=task_workflow_id(task_id),
+            )
+        except WorkflowAlreadyStartedError:
+            await workflow.execute_activity(
+                "park_task",
+                args=[task_id, "research is already running for this task"],
+                start_to_close_timeout=TIMEOUT_FAST,
+                retry_policy=ACT_RETRY,
+            )
+            return {"task_id": task_id, "verb": "research", "status": "parked"}
+        result = result if isinstance(result, dict) else {}
+        found = result.get("status") == "ok"
+        report = str(result.get("report") or "").strip()
+        if not report:
+            report = (
+                "I could not research this one: the task has no title to ask about."
+                if not title
+                else "I could not research this one."
+            )
+        await workflow.execute_activity(
+            "comment",
+            args=[task_id, input.agent_id, report],
+            # TIMEOUT_STANDARD, like every comment here: the connector call is
+            # best-effort inside and needs room to hand back {"ok": False}.
+            start_to_close_timeout=TIMEOUT_STANDARD,
+            retry_policy=NO_RETRY,
+        )
+        await workflow.execute_activity(
+            "park_task",
+            args=[task_id, "research answer posted" if found else "research found no answer"],
+            start_to_close_timeout=TIMEOUT_FAST,
+            retry_policy=ACT_RETRY,
+        )
+        return {
+            "task_id": task_id,
+            "verb": "research",
+            "status": "answered" if found else "no_answer",
+            "sources": len(result.get("sources") or []),
+            "saved": bool(result.get("saved")),
+        }
 
     async def _park_unrouted(
         self, input: AgentTaskFlowInput, task_id: str, task: dict, verb: str

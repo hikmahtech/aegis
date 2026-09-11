@@ -1652,6 +1652,59 @@ the matching `case` branches in `scripts/infra/*.sh` (e.g.
 `infra_list_pods.sh`, `infra_list_argocd_apps.sh`) so the script host actually
 knows how to route that context name.
 
+## The research lane (Raphael)
+
+Raphael researches with five chat tools and one flow (#509).
+
+| Tool | What it does |
+|---|---|
+| `web_search` | SearxNG results — title, url, snippet — returned raw, not summarised |
+| `read_url` | One page's readable text, bounded. Public http(s) hosts only |
+| `paper_search` | arXiv and Semantic Scholar together: title, authors, date, abstract, citation count, and an id for `paper_read`. One engine failing still returns the other's papers |
+| `paper_read` | A paper's text from its PDF, by arXiv id, `s2:<id>` or PDF URL |
+| `research_topic` | Hands the question to `ResearchFlow` and waits up to 45s for the answer |
+
+The four reads fetch and return; nothing is stored. They are on the MCP gated
+endpoint's read-only list. `research_topic` is not, because it starts a flow
+that saves its answer.
+
+**`ResearchFlow`** gathers from the knowledge store, a web search and — when the
+question looks academic — the two paper engines; reads the best pages (a task's
+own links first); asks the smart tier for one answer that cites its numbered
+sources (`llm_calls.purpose = 'research_synthesis'`); and saves that answer to
+the knowledge store under `aegis://research/<hash of the question>`, so asking
+the same question again replaces the old answer. Only a real answer is saved: a
+run whose synthesis failed says so and stores nothing.
+
+- **From chat**, the run's id is `research-<hash of the question>`, so a retried
+  turn re-attaches to the run in flight. Past 45s the tool answers "still
+  researching", and the flow posts the answer to the agent's channel when it
+  lands.
+- **A `#research` task** assigned to an agent goes to the `research` verb
+  (`agent_task_verbs`): the task gets a hub problem (`ensure_problem_for_task`,
+  as a `@code` task does), the answer is posted as one comment with its numbered
+  sources, and the task parks at `@waiting`. To send `#research` back to the old
+  chat path, set `"#research": "ask"` in the `agent_task_verbs` setting.
+
+**Granting the four reads on a running deployment is a DB write** — the seed only
+applies to an agent that has no tool set yet. Tick them on Admin → Agents →
+Raphael → Behavior, or:
+
+```sql
+UPDATE agents
+   SET metadata = jsonb_set(
+         metadata, '{tool_set}',
+         (metadata->'tool_set') || '["web_search","read_url","paper_search","paper_read"]'::jsonb)
+ WHERE id = 'raphael'
+   AND NOT (metadata->'tool_set' ? 'web_search');
+```
+
+`read_url` and `paper_read` refuse a host that resolves to a loopback, private or
+link-local address, so a page the agent has just read cannot steer it at the
+stack's own services. A public page that *redirects* inward is not caught — the
+fetcher follows redirects itself — and whatever comes back goes to the model
+only.
+
 ## Troubleshooting
 
 | Symptom | Cause |

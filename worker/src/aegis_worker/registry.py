@@ -84,6 +84,7 @@ from aegis_worker.flows.receipt_ingest import (
     ReceiptIngestFlow,
     ReceiptIngestInput,
 )
+from aegis_worker.flows.research import ResearchFlow
 from aegis_worker.flows.review import (
     DailyReviewConfig,
     DailyReviewFlow,
@@ -281,6 +282,10 @@ FLOWS: tuple[FlowSpec, ...] = (
         RaindropIngestFlow,
         lambda act: RaindropIngestInput(agent_id=act["agent_id"]),
     ),
+    # Event-driven (#509): started by the `research_topic` chat tool under an id
+    # derived from the question, and as a child of AgentTaskFlow's `research`
+    # verb. No schedule config and no activities.yaml row.
+    FlowSpec(ResearchFlow),
     FlowSpec(
         RssIngestFlow,
         lambda act: RssIngestInput(agent_id=act["agent_id"]),

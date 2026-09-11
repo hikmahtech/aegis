@@ -21,6 +21,7 @@ from aegis.llm import parse_llm_json
 from aegis.llm.tier import resolve_model_for_agent, tier_to_model, tier_to_model_or
 from aegis.mcp_manager import MCPError
 from aegis.observability import log_audit, record_llm_call, record_tool_call
+from aegis.services.research import FETCH_TOOL_TIMEOUT_S, RESEARCH_TOOL_TIMEOUT_S
 from aegis.services.source_types import DEFAULT_DECAY_DAYS, get_decay_days
 from aegis.services.tools.base import (
     _MAX_LISTED_DROPPED_KEYS,  # noqa: F401 — re-export: kept importable from here
@@ -85,6 +86,13 @@ from aegis.services.tools.ledger import (  # noqa: F401 — re-export: imported 
     _exec_ledger_reclassify,
 )
 from aegis.services.tools.registry import TOOL_REGISTRY
+from aegis.services.tools.research import (  # noqa: F401 — re-export: imported from here by tests
+    _exec_paper_read,
+    _exec_paper_search,
+    _exec_read_url,
+    _exec_research_topic,
+    _exec_web_search,
+)
 from aegis.services.tools.vercel import (
     _exec_vercel_get_build_logs,
     _exec_vercel_get_deployment,
@@ -470,6 +478,11 @@ CHAT_TOOLS = [
             },
         },
     },
+    # The research lane's four reads (#509), generated from services/tools/research.py.
+    _registry_schema("web_search"),
+    _registry_schema("read_url"),
+    _registry_schema("paper_search"),
+    _registry_schema("paper_read"),
     {
         "type": "function",
         "function": {
@@ -1411,6 +1424,14 @@ _TOOL_TIMEOUT_OVERRIDES: dict[str, int] = {
     "ledger_post": LEDGER_TOOL_TIMEOUT_S,
     "ledger_reclassify": LEDGER_TOOL_TIMEOUT_S,
     "ledger_add_rule": LEDGER_TOOL_TIMEOUT_S,
+    # `research_topic` hands the research to `ResearchFlow` and waits
+    # `RESEARCH_WAIT_S` for it (#509); this is the floor under that wait. The
+    # three fetch tools read one page or PDF, or query two paper engines, which
+    # the 30s default cannot always fit.
+    "research_topic": RESEARCH_TOOL_TIMEOUT_S,
+    "read_url": FETCH_TOOL_TIMEOUT_S,
+    "paper_search": FETCH_TOOL_TIMEOUT_S,
+    "paper_read": FETCH_TOOL_TIMEOUT_S,
 }
 
 
@@ -1938,129 +1959,6 @@ async def _exec_get_finance_news(pool: asyncpg.Pool, args: dict, ctx: ToolContex
         logger.warning("get_finance_news_failed", error=str(exc))
         return json.dumps({"error": f"news search failed: {str(exc)[:200]}"})
     return json.dumps({"query": query, "results": results})
-
-
-async def _exec_research_topic(pool: asyncpg.Pool, args: dict, ctx: ToolContext) -> str:
-    """Research a topic by combining KG data with fresh web search results."""
-    if not ctx.search_connector or not ctx.llm_client:
-        return json.dumps(
-            {"error": "Search connector and LLM client are required for research_topic"}
-        )
-
-    query = args.get("query", "").strip()
-    depth = args.get("depth", "quick")
-    domains = args.get("domains") or []
-
-    # Build web search query with optional domain restrictions
-    web_query = query
-    if domains:
-        site_terms = " OR ".join(f"site:{d}" for d in domains)
-        web_query = f"{query} ({site_terms})"
-
-    search_limit = 20 if depth == "thorough" else 10
-
-    # Parallel: KG search + web search
-    kg_results: list[dict] = []
-    web_results: list[dict] = []
-
-    try:
-        if ctx.knowledge_connector:
-            kg_results = await ctx.knowledge_connector.search(query, limit=5)
-    except Exception as exc:
-        logger.warning("research_topic_kg_error", error=str(exc))
-
-    try:
-        web_results = await ctx.search_connector.search(web_query, limit=search_limit)
-    except Exception as exc:
-        logger.warning("research_topic_web_error", error=str(exc))
-
-    # Build synthesis prompt
-    kg_section = ""
-    if kg_results:
-        kg_lines = "\n".join(
-            f"- {r.get('title', 'Unknown')}: {(r.get('summary') or r.get('text') or '')[:300]}"
-            for r in kg_results[:5]
-        )
-        kg_section = f"## Knowledge Graph\n{kg_lines}\n\n"
-
-    web_section = ""
-    if web_results:
-        web_lines = "\n".join(
-            f"- {r.get('title', 'Unknown')} ({r.get('url', '')}): {r.get('content', '')[:300]}"
-            for r in web_results[:10]
-        )
-        web_section = f"## Web Search Results\n{web_lines}\n\n"
-
-    if not kg_section and not web_section:
-        return json.dumps(
-            {
-                "synthesis": "No results found.",
-                "sources": {"knowledge_graph": 0, "web_search": 0},
-                "top_urls": [],
-            }
-        )
-
-    prompt = (
-        f"Synthesize the following research on: {query}\n\n"
-        f"{kg_section}{web_section}"
-        "Provide a concise, factual synthesis in 2-4 paragraphs. Focus on key findings, patterns, and actionable insights."
-    )
-
-    synthesis = ""
-    synthesized = False
-    try:
-        # purpose + agent_id + db_pool ⇒ think() records the call in llm_calls.
-        # Without them research_topic was the one chat tool whose model spend
-        # never showed up anywhere (#508).
-        result = await ctx.llm_client.think(
-            prompt=prompt,
-            model=ctx.model_light,
-            max_tokens=600,
-            db_pool=pool,
-            purpose="research_topic",
-            agent_id=ctx.agent_id,
-        )
-        synthesis = result.get("response", "")
-        synthesized = bool(synthesis)
-    except Exception as exc:
-        logger.warning("research_topic_synthesis_error", error=str(exc))
-        synthesis = f"Research gathered {len(kg_results)} KG results and {len(web_results)} web results but synthesis failed."
-
-    # Save a real synthesis, and wait for the save (#508). This used to be a
-    # bare asyncio.create_task inside `except: pass`: nothing awaited it or held
-    # it, so a failed save vanished without a log line — and the "synthesis
-    # failed" apology above was saved as if it were research.
-    saved = False
-    if ctx.knowledge_connector and synthesized:
-        import time as _time
-
-        try:
-            await asyncio.wait_for(
-                ctx.knowledge_connector.ingest_content(
-                    url=f"aegis://research/{int(_time.time())}",
-                    title=f"Research: {query}",
-                    summary=synthesis,
-                    source_type="research",
-                    raw_text=synthesis,
-                    tags=["research", "chat_tool"],
-                ),
-                timeout=30,
-            )
-            saved = True
-        except Exception as exc:
-            logger.warning("research_topic_save_failed", error=str(exc)[:200])
-
-    top_urls = [r.get("url", "") for r in web_results[:5] if r.get("url")]
-
-    return json.dumps(
-        {
-            "synthesis": synthesis,
-            "sources": {"knowledge_graph": len(kg_results), "web_search": len(web_results)},
-            "top_urls": top_urls,
-            "saved": saved,
-        },
-        default=str,
-    )
 
 
 async def _exec_track_topic(pool: asyncpg.Pool, args: dict, ctx: ToolContext) -> str:
@@ -3134,6 +3032,10 @@ TOOL_EXECUTORS: dict[str, Any] = {
     "get_finance_news": _exec_get_finance_news,
     "research_topic": _exec_research_topic,
     "track_topic": _exec_track_topic,
+    "web_search": _exec_web_search,
+    "read_url": _exec_read_url,
+    "paper_search": _exec_paper_search,
+    "paper_read": _exec_paper_read,
     "configure_triage": _exec_configure_triage,
     "update_runbook": _exec_update_runbook,
     "list_nodes": _exec_list_nodes,
@@ -3235,6 +3137,11 @@ AGENT_TOOL_SETS: dict[str, set[str]] = {
         "search_knowledge",
         "ask_knowledge",
         "research_topic",
+        # The research lane's reads (#509): search, a page, papers.
+        "web_search",
+        "read_url",
+        "paper_search",
+        "paper_read",
         "track_topic",
         "remember_this",
         # Problem hub, the session registry: read a task's context, register

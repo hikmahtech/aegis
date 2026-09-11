@@ -33,7 +33,8 @@ from aegis_worker.activities.agent_task import (
         # #344: each of these is a request to the agent the task was given to,
         # so it goes to that agent's own chat path instead of parking unworked.
         ("#chat", ["@pandora"], "ask"),
-        ("#research", ["@raphael"], "ask"),
+        # #509: a research task is researched, not chatted about.
+        ("#research", ["@raphael"], "research"),
         ("#calendar", ["@sebas"], "ask"),
         ("#manual", ["@sebas"], "ask"),
         # A hand-written task with an agent's label and no @code is the same

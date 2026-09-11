@@ -77,13 +77,18 @@ _COMMENT_RETRY_SECONDS = 2
 # four resolved to no verb, got "No executor for this task type" and parked
 # with nothing done (prod: an outage question given to the infra agent, an
 # article given to the research agent).
+#
+# `research` (#509) runs `ResearchFlow` on a `#research` task — knowledge
+# store, web and papers, a cited answer — and posts the answer on the task.
+# Under `ask` the research agent only chatted about the task; the lane had no
+# way to actually look anything up.
 UNTAGGED = "untagged"  # the settings key for a task with no source tag
 DEFAULT_VERBS: dict[str, str | None] = {
     "#alert": "infra",
     "#receipt": "finance",
     "#email": "email",
     "#chat": "ask",
-    "#research": "ask",
+    "#research": "research",
     "#calendar": "ask",
     "#manual": "ask",
     # A hand-written task carrying an agent's label and no `@code`: somebody
@@ -95,7 +100,7 @@ DEFAULT_VERBS: dict[str, str | None] = {
 }
 # The verbs a tag may be routed to. `coding` is not one: it is chosen by the
 # `@code` label on an untagged task, never by a tag.
-VERBS = frozenset({"infra", "email", "finance", "ask"})
+VERBS = frozenset({"infra", "email", "finance", "ask", "research"})
 VERBS_SETTING = "agent_task_verbs"
 
 
