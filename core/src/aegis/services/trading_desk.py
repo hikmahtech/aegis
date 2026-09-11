@@ -8,6 +8,7 @@ model anything.
 
 from __future__ import annotations
 
+from collections import defaultdict
 from datetime import UTC, date, datetime, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -448,3 +449,92 @@ async def _tick(pool: asyncpg.Pool, ansaar: Any, finance: Any, today: date) -> t
                     )
                 )
     return out, findings
+
+
+# --- the monthly close ---------------------------------------------------------
+
+
+async def month_summary(pool: asyncpg.Pool, month_first: date, next_first: date) -> dict | None:
+    """The monthly close's desk section (spec §9), or None before the first fill.
+
+    Every value is JSON-safe: it travels through Temporal to the renderer."""
+    rules = await load_rules(pool)
+    month_end = next_first - timedelta(days=1)
+    fills = [f for f in await _fills(pool) if f.day <= month_end]
+    if not fills:
+        return None
+    start = fills[0].day
+    bars = await _bars(pool, {f.symbol for f in fills} | {INDEX, rules.benchmark, rules.context_benchmark})
+    days = [b.day for b in bars[INDEX] if b.close is not None and start <= b.day <= month_end]
+    if not days:
+        return None
+    desk = dm.desk_values(fills, bars, rules.capital, days)
+    bench = dm.benchmark_values(bars[rules.benchmark], rules.capital, rules.cost_pct_per_side, days)
+    context = dm.benchmark_values(bars[rules.context_benchmark], rules.capital, 0.0, days)
+    book = dm.replay(fills, bars, rules.capital, month_end)
+    end_value = desk[-1][1]
+    st = dm.stats(dm.weekly_excess(desk, bench))
+    held = book.held()
+    worth = {s: q * (dm.close_on(bars[s], month_end) or book.avg_cost(s)) for s, q in held.items()}
+    orders = await pool.fetch(
+        "SELECT status, reason, costs, price_source FROM finance.desk_orders "
+        "WHERE (status = 'filled' AND fill_date BETWEEN $1 AND $2) "
+        "   OR (status = 'cancelled' AND created_day BETWEEN $1 AND $2)",
+        month_first, month_end,
+    )
+    held_back = await pool.fetch(
+        "SELECT outcome, count(*) AS n FROM finance.desk_plans "
+        "WHERE data_date BETWEEN $1 AND $2 AND outcome IN ('held_stale', 'held_suspect') GROUP BY outcome",
+        month_first, month_end,
+    )
+    cancelled: dict[str, int] = defaultdict(int)
+    for r in orders:
+        if r["status"] == "cancelled":
+            cancelled[r["reason"] or "unknown"] += 1
+    return {
+        "since": start.isoformat(),
+        "weeks": st.n,
+        "capital": rules.capital,
+        "value": round(end_value, 2),
+        "after_tax": round(end_value - dm.tax_owed(book.realised, rules), 2),
+        "benchmark": rules.benchmark,
+        "benchmark_value": round(bench[-1][1], 2) if bench else None,
+        "context": rules.context_benchmark,
+        "context_value": round(context[-1][1], 2) if context else None,
+        "mean_gap": st.mean,
+        "t": st.t,
+        "label": dm.label(st),
+        "below_expectation": dm.below_expectation(st, rules.expected_excess_pa),
+        "expected_excess_pa": rules.expected_excess_pa,
+        "holdings": sorted(held, key=lambda s: -worth[s]),
+        "cash_pct": book.cash / end_value if end_value else 0.0,
+        "filled": sum(r["status"] == "filled" for r in orders),
+        "costs": round(sum(float(r["costs"] or 0) for r in orders if r["status"] == "filled"), 2),
+        "cancelled": dict(cancelled),
+        "held_back": {r["outcome"]: r["n"] for r in held_back},
+        "ansaar_prices": sum(r["status"] == "filled" and r["price_source"] == "ansaar" for r in orders),
+        "moves": [
+            {"symbol": s, "day": d.isoformat(), "move": round(m, 4)}
+            for s, d, m in dm.big_moves(bars, set(held), month_first, month_end)
+        ],
+    }
+
+
+async def reconcile_expectation(pool: asyncpg.Pool, summary: dict | None, *, project: bool = True) -> None:
+    """The monthly warning check (spec §8). Only the close reconciles this class,
+    so while it holds it comes back once a month, not every day."""
+    findings: list[dict] = []
+    if summary and summary.get("below_expectation"):
+        findings.append(
+            _finding(
+                "desk_below_expectation", "desk", "Trading desk: live results are worse than the backtest promised",
+                f"Over {summary['weeks']} weeks the desk's weekly gap to {summary['benchmark']} averaged "
+                f"{summary['mean_gap']:+.2%} (t = {summary['t']:.1f}). That is more than two standard "
+                f"errors below the {summary['expected_excess_pa']:.0%} a year the backtest implies. Look "
+                "at the trading system before trusting it with money. This comes back each month while "
+                "it stays true.",
+            )
+        )
+    await hub_watch.reconcile_findings(
+        pool, source=SOURCE, subject_kind=SUBJECT_KIND, classes=MONTHLY_CLASSES, findings=findings, project=project
+    )
