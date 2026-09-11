@@ -692,14 +692,12 @@ async def test_gate2_ack_logs_acknowledgement_without_pr():
 
 
 @pytest.mark.asyncio
-async def test_alertmanager_kimi_no_branches_still_fires_gate2_for_decision():
-    """When Kimi returns empty branches (no code fix), Gate 2 still fires —
-    it just omits the `open_all_prs` option and offers Mute / Acknowledge
-    so the user can dispose of the alert from chat.
-
-    Updated 2026-05-22 — pre-fix the gate skipped this case entirely, which
-    is what triggered the "comments after comments, no chat approval
-    prompt" feedback from the user.
+async def test_alertmanager_kimi_no_branches_sends_no_card():
+    """When Kimi returns empty branches (no code fix) and proposes no
+    commands, the card would offer only Mute / Acknowledge: nothing to
+    decide, so no card (#500). The verdict still reaches chat as the Step-9
+    ping, which is what the 2026-05-22 "comments after comments, nothing in
+    chat" feedback asked for; half the cards it led to were a bare `ack`.
     """
     _reset()
     _state["run_investigation_result"] = {
@@ -738,24 +736,12 @@ async def test_alertmanager_kimi_no_branches_still_fires_gate2_for_decision():
             id=wf_id,
             task_queue="tq-gates",
         )
-
-        # requires_approval=False so Gate-1 is skipped; the FIRST insert_ia
-        # call is Gate-2 directly. Gate-2 child id is built from the alert's
-        # fingerprint, NOT the canned _SAFE_FINGERPRINT.
-        for _ in range(200):
-            await asyncio.sleep(0.05)
-            if _calls.get("insert_ia"):
-                break
-        assert _calls.get("insert_ia"), "Gate 2 child never started"
-
-        safe_fp = re.sub(r"[^a-zA-Z0-9._\-]", "-", alertmanager_alert["fingerprint"])[:60]
-        gate2_id = f"gate2-{safe_fp}-{wf_id}"
-        gate2_handle = env.client.get_workflow_handle(gate2_id)
-        await gate2_handle.signal(InteractionFlow.submit_response, {"value": "ack"})
-
         result = await asyncio.wait_for(handle.result(), timeout=10.0)
 
+    assert not _calls.get("insert_ia"), "no card for a verdict with nothing to decide"
     assert result["status"] == "logged"
+    assert result["decision_card"] is False
+    assert "gate2" not in [r["external_id"].rsplit(":", 1)[-1] for r in _HUB["record"]]
     assert not _calls.get("stage_pending_pr")
     assert not _calls.get("create_github_pr")
 
@@ -812,21 +798,11 @@ async def test_kimi_failure_falls_back_to_llm_investigate():
             id=wf_id,
             task_queue="tq-gates",
         )
-
-        # Post-2026-05-22: Gate 2 fires even without branches (Mute/Ack
-        # options). Signal `ack` to complete the gate and let the flow
-        # finish without taking any action.
-        for _ in range(200):
-            await asyncio.sleep(0.05)
-            if _calls.get("insert_ia"):
-                break
-        assert _calls.get("insert_ia"), "Gate 2 child never started"
-        safe_fp = re.sub(r"[^a-zA-Z0-9._\-]", "-", alertmanager_alert["fingerprint"])[:60]
-        gate2_handle = env.client.get_workflow_handle(f"gate2-{safe_fp}-{wf_id}")
-        await gate2_handle.signal(InteractionFlow.submit_response, {"value": "ack"})
-
+        # No branch, no commands, not escalating: no card (#500), so the
+        # flow finishes without a signal.
         result = await asyncio.wait_for(handle.result(), timeout=10.0)
 
+    assert not _calls.get("insert_ia")
     assert _calls.get("run_investigation_called"), "kimi attempt must have happened"
     assert _calls.get("investigate_called"), "LLM fallback must run when kimi fails"
     # The error string from kimi must not leak into the final summary
@@ -894,21 +870,11 @@ async def test_inconclusive_verdict_sets_inconclusive_status():
             id=wf_id,
             task_queue="tq-gates",
         )
-
-        # Post-2026-05-22: inconclusive verdicts still fire Gate 2 so the
-        # user can Mute/Ack via chat. Send `ack` to let the flow
-        # finish; final_status must remain `inconclusive`.
-        for _ in range(200):
-            await asyncio.sleep(0.05)
-            if _calls.get("insert_ia"):
-                break
-        assert _calls.get("insert_ia"), "Gate 2 child never started"
-        safe_fp = re.sub(r"[^a-zA-Z0-9._\-]", "-", alertmanager_alert["fingerprint"])[:60]
-        gate2_handle = env.client.get_workflow_handle(f"gate2-{safe_fp}-{wf_id}")
-        await gate2_handle.signal(InteractionFlow.submit_response, {"value": "ack"})
-
+        # An inconclusive verdict with nothing to approve sends no card
+        # (#500); final_status must still say `inconclusive`.
         result = await asyncio.wait_for(handle.result(), timeout=10.0)
 
+    assert not _calls.get("insert_ia")
     assert result["status"] == "inconclusive"
     assert not _calls.get("stage_pending_pr")
     assert not _calls.get("create_github_pr")
@@ -924,8 +890,9 @@ async def test_assess_timeout_degrades_to_inconclusive():
     """When assess_investigation raises (the qwen3:14b verdict call hangs past
     its StartToClose ceiling and exhausts retries), the flow must NOT fail the
     whole investigation. It degrades to an `inconclusive` verdict that carries
-    investigate()'s already-successful output, so the user still gets a Gate-2
-    card to act on.
+    investigate()'s already-successful output, so the user still gets the
+    verdict on the task and in chat. With nothing to approve there is no
+    Gate-2 card (#500).
 
     Regression for sentry:7510268390 (root-caused 2026-05-30): assess timed
     out 3× and the workflow failed with a bare "Activity task timed out",
@@ -968,22 +935,12 @@ async def test_assess_timeout_degrades_to_inconclusive():
             id=wf_id,
             task_queue="tq-gates",
         )
-
-        # Gate 2 must still fire on the degraded inconclusive verdict.
-        for _ in range(200):
-            await asyncio.sleep(0.05)
-            if _calls.get("insert_ia"):
-                break
-        assert _calls.get("insert_ia"), "Gate 2 child never started after assess degraded"
-        safe_fp = re.sub(r"[^a-zA-Z0-9._\-]", "-", alertmanager_alert["fingerprint"])[:60]
-        gate2_handle = env.client.get_workflow_handle(f"gate2-{safe_fp}-{wf_id}")
-        await gate2_handle.signal(InteractionFlow.submit_response, {"value": "ack"})
-
         result = await asyncio.wait_for(handle.result(), timeout=10.0)
 
     # The workflow COMPLETED (did not fail with "Activity task timed out") and
     # surfaced an honest inconclusive verdict.
     assert result["status"] == "inconclusive"
+    assert not _calls.get("insert_ia")
     assert _calls.get("assess_called"), "assess_investigation must have been attempted"
     assert not _calls.get("stage_pending_pr")
     assert not _calls.get("create_github_pr")

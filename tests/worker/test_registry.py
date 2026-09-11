@@ -377,9 +377,13 @@ def test_books_write_flow_is_gated_on_money_hygiene():
         # (the `ask` verb's input) and `plan_infra_task` (the infra verb's
         # plan, by the problem behind the task) on the existing
         # AgentTaskActivities, which is unflagged — so all three rows move.
-        (True, True, 45, 225),
-        (False, False, 35, 192),
-        (True, False, 39, 208),
+        # Then +1 activity and NO new flow from #501: `recent_auto_restart` on
+        # the existing AlertActivities (was this problem restarted inside the
+        # window?), a step of AlertInvestigationFlow. Unflagged, so all three
+        # rows move.
+        (True, True, 45, 226),
+        (False, False, 35, 193),
+        (True, False, 39, 209),
     ],
 )
 def test_real_registration_passes_the_boot_check(homelab, money, flows, activities):

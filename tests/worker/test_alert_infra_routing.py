@@ -576,8 +576,9 @@ def _make_app_alert(**overrides) -> dict:
 async def test_infra_alert_routes_to_homelab_gitops_skips_gate0():
     """Infra alert uses resolve_infra_resource (not LLM resolve) and skips Gate-0.
 
-    Under start_time_skipping, Gate-2 archives after 48h immediately →
-    gate2_archived. The key assertions are:
+    The investigation proposes no commands and the alert does not escalate,
+    so the verdict needs no decision and no Gate-2 card goes out (#500): the
+    run ends `logged`. The key assertions are:
     - resolve_infra_resource WAS called
     - resolve_alert_resource (LLM) was NOT called
     - score_resource_relevance (Gate-0) was NOT called
@@ -600,7 +601,7 @@ async def test_infra_alert_routes_to_homelab_gitops_skips_gate0():
             task_queue="test-infra-q",
         )
 
-    assert result["status"] == "gate2_archived"
+    assert result["status"] == "logged"
     assert _flow_state.get("resolve_infra_called") is True
     assert _flow_state.get("resolve_alert_resource_called") is not True
     assert _flow_state.get("score_resource_called") is not True

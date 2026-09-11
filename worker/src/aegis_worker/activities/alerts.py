@@ -7,6 +7,7 @@ import contextlib
 import json
 import re
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -92,6 +93,29 @@ _REMEDIABLE_ALERTNAMES = frozenset({"dockerservicedown", "servicedownprolonged"}
 # Recovery poll budget after the restart: 6 × 5s = 30s of convergence wait.
 _REMEDIATE_POLLS = 6
 _REMEDIATE_POLL_INTERVAL_S = 5
+# How many `docker service ps` rows the restart keeps as its evidence. The
+# newest come first, and the few before the restart are the ones that say why
+# the service went down (a task the scheduler could not place, an OOM kill).
+_DIAGNOSTIC_TASKS = 8
+_DIAGNOSTIC_ERROR_CHARS = 200
+
+# One automatic restart per problem per window (#501). A service that comes
+# back inside the window is not restarted again: the restart did not hold, and
+# the next one will not either. Stored in the `settings` row below as
+# {"repeat_window_minutes": 60}; 0 turns the check off, which restarts every
+# time, as before. Generic on purpose: an hour is what "it broke again right
+# after the restart" means on any cluster.
+ALERT_REMEDIATION_SETTINGS_KEY = "alert_remediation"
+DEFAULT_RESTART_REPEAT_WINDOW_MINUTES = 60
+# How far back through a problem's timeline the lookup reads. A flapping
+# service adds a handful of events an hour, so this covers the window with
+# room to spare.
+_RESTART_LOOKBACK_EVENTS = 200
+# The step the flow records an automatic restart under (`_record(...,
+# step=...)`, so the event's external id ends `:auto_remediated`). Rows written
+# before #501 carry no `remediation` payload, and this is how they are found.
+# Delete it an hour after #501 is deployed, when no such row is in any window.
+_AUTO_RESTART_STEP_SUFFIX = ":auto_remediated"
 # Interval for the background heartbeater during run_remediation_commands: a
 # `docker service update --force` routinely runs >60s, so heartbeats must keep
 # flowing while commands execute or the activity's heartbeat timeout kills it
@@ -133,6 +157,61 @@ def is_infra_alert(
     )
     alertname = (labels.get("alertname") or "").strip().lower()
     return alertname in names
+
+
+def is_remediable_alert(alert: dict) -> bool:
+    """True when the alert's class is one the automatic force-restart covers
+    (`_REMEDIABLE_ALERTNAMES`). Pure, so the flow can ask it too."""
+    labels = alert.get("labels") or {}
+    if not isinstance(labels, dict):
+        return False
+    return (labels.get("alertname") or "").strip().lower() in _REMEDIABLE_ALERTNAMES
+
+
+def remediation_target(alert: dict) -> str:
+    """The swarm service a restart would act on: the `service_name` label
+    (DockerServiceDown), the `service` label (label_replace'd alerts), then
+    the alert's own `service`."""
+    labels = alert.get("labels") or {}
+    if not isinstance(labels, dict):
+        labels = {}
+    return (
+        labels.get("service_name") or labels.get("service") or alert.get("service") or ""
+    ).strip()
+
+
+async def restart_repeat_window_minutes(pool: Any) -> int:
+    """The window from the `alert_remediation` settings row. Read leniently:
+    no pool, no row, a failed read or a value that is not a whole number of
+    minutes all mean the default, because a config mistake must not change
+    what happens to a service that is down. 0 is a real value: off."""
+    if pool is None:
+        return DEFAULT_RESTART_REPEAT_WINDOW_MINUTES
+    try:
+        row = await pool.fetchrow(
+            "SELECT value FROM settings WHERE key = $1", ALERT_REMEDIATION_SETTINGS_KEY
+        )
+    except Exception as exc:  # noqa: BLE001 — a config read is never fatal
+        activity.logger.warning("alert_remediation_settings_read_failed err=%s", str(exc)[:200])
+        return DEFAULT_RESTART_REPEAT_WINDOW_MINUTES
+    value = row["value"] if row else None
+    minutes = value.get("repeat_window_minutes") if isinstance(value, dict) else None
+    if isinstance(minutes, bool) or not isinstance(minutes, int) or minutes < 0:
+        return DEFAULT_RESTART_REPEAT_WINDOW_MINUTES
+    return minutes
+
+
+def _task_row(t: Any) -> dict | None:
+    """One `service_ps` row, cut to what says why a task is not running."""
+    if not isinstance(t, dict):
+        return None
+    return {
+        "task_id": str(t.get("task_id") or ""),
+        "node": str(t.get("node") or ""),
+        "current_state": str(t.get("current_state") or ""),
+        "desired_state": str(t.get("desired_state") or ""),
+        "error": str(t.get("error") or "")[:_DIAGNOSTIC_ERROR_CHARS],
+    }
 
 
 # Caps for the human-approved remediation-command path (Gate 2 "Run fix"):
@@ -1116,10 +1195,14 @@ class AlertActivities:
         alert labels — `service_name` (DockerServiceDown) or `service`
         (label_replace'd alerts) — falling back to the top-level `service`.
 
-        Returns {attempted, recovered, service, command, output, reason}.
-        `attempted=False` means nothing was done and the caller should proceed
-        to the normal investigation. `recovered=True` means the service is back
-        to running >= desired and no investigation is needed.
+        Returns {attempted, recovered, service, command, output, reason,
+        diagnostics}. `attempted=False` means nothing was done and the caller
+        should proceed to the normal investigation. `recovered=True` means the
+        service is back to running >= desired and no investigation is needed.
+        `diagnostics` is `docker service ps` after the restart (newest task
+        first): the evidence the flow records with the attempt, so a service
+        that comes back can be shown what the scheduler said the first time
+        (#501).
         """
         result: dict = {
             "attempted": False,
@@ -1128,20 +1211,14 @@ class AlertActivities:
             "command": "",
             "output": "",
             "reason": "",
+            "diagnostics": [],
         }
-        labels = alert.get("labels") or {}
-        if not isinstance(labels, dict):
-            labels = {}
-        alertname = (labels.get("alertname") or "").strip().lower()
-        if alertname not in _REMEDIABLE_ALERTNAMES:
+        if not is_remediable_alert(alert):
+            labels = alert.get("labels") if isinstance(alert.get("labels"), dict) else {}
+            alertname = (labels.get("alertname") or "").strip().lower()
             result["reason"] = f"not_remediable_class:{alertname or 'unknown'}"
             return result
-        service = (
-            labels.get("service_name")
-            or labels.get("service")
-            or alert.get("service")
-            or ""
-        ).strip()
+        service = remediation_target(alert)
         if not service:
             result["reason"] = "no_service_name"
             return result
@@ -1162,6 +1239,7 @@ class AlertActivities:
                 service,
                 str(env.get("error"))[:200],
             )
+            result["diagnostics"] = await self._service_diagnostics(service)
             return result
 
         # Poll list_services for convergence (running >= desired, desired > 0).
@@ -1184,10 +1262,103 @@ class AlertActivities:
 
         result["recovered"] = recovered
         result["reason"] = "recovered" if recovered else "restart_issued_not_converged"
+        result["diagnostics"] = await self._service_diagnostics(service)
         activity.logger.info(
             "remediate_infra_service service=%s recovered=%s", service, recovered
         )
         return result
+
+    async def _service_diagnostics(self, service: str) -> list[dict]:
+        """`docker service ps` for `service`, newest task first, cut to the
+        rows and fields that say why a task is not running. Best-effort: an
+        empty list when the swarm cannot be asked."""
+        if not self.homelab_connector or not service:
+            return []
+        try:
+            env = await self.homelab_connector.service_ps(service)
+        except Exception as exc:  # noqa: BLE001 — evidence, never a gate
+            activity.logger.warning(
+                "alert_service_diagnostics_failed service=%s err=%s", service, str(exc)[:200]
+            )
+            return []
+        if not isinstance(env, dict) or not env.get("ok") or not isinstance(env.get("data"), list):
+            return []
+        rows = [_task_row(t) for t in env["data"][:_DIAGNOSTIC_TASKS]]
+        return [r for r in rows if r is not None]
+
+    @activity.defn
+    async def recent_auto_restart(self, problem_id: str, alert: dict) -> dict:
+        """Was THIS problem restarted automatically inside the window (#501)?
+
+        The newest `investigation` event on the problem that records an
+        automatic restart — the flow writes one with a `remediation` payload
+        for every attempt, recovered or not, and wrote the `auto_remediated`
+        step without it before #501 — no older than the window in the
+        `alert_remediation` settings row. The problem is the identity; the
+        service only has to match when the event names one, because a group
+        problem holds many services and a restart of one says nothing about
+        another.
+
+        Returns `{repeat: False, window_minutes}` when there is no such
+        restart, and otherwise also: `service`, `restarted_at` (ISO),
+        `minutes_ago`, `command`, `recovered`, `diagnostics_then` (what
+        `docker service ps` said after that restart), `diagnostics_now` (what
+        it says now) and `new_tasks` (the rows of now that were not there
+        then: what changed). Only reads; never restarts anything.
+        """
+        window = await restart_repeat_window_minutes(self.db_pool)
+        nothing = {"repeat": False, "window_minutes": window}
+        if window <= 0 or self.db_pool is None or not problem_id:
+            return nothing
+        from aegis.services import hub
+
+        service = remediation_target(alert)
+        now = datetime.now(UTC)
+        since = now - timedelta(minutes=window)
+        prior: dict | None = None
+        for e in await hub.list_events(self.db_pool, problem_id, limit=_RESTART_LOOKBACK_EVENTS):
+            occurred = e["occurred_at"]
+            if occurred.tzinfo is None:
+                occurred = occurred.replace(tzinfo=UTC)
+            if occurred < since:
+                break  # newest first: everything after this is older still
+            if e["kind"] != "investigation" or e["source"] != "investigation":
+                continue
+            payload = e["payload"] or {}
+            rem = payload.get("remediation")
+            if isinstance(rem, dict):
+                if service and rem.get("service") and rem.get("service") != service:
+                    continue
+            elif str(e["external_id"]).endswith(_AUTO_RESTART_STEP_SUFFIX):
+                rem = {"service": service, "recovered": True, "diagnostics": []}
+            else:
+                continue
+            prior = {**rem, "occurred_at": occurred}
+            break
+        if prior is None:
+            return nothing
+        then = [r for r in (_task_row(t) for t in prior.get("diagnostics") or []) if r]
+        current = await self._service_diagnostics(service or str(prior.get("service") or ""))
+        # With no evidence from then there is nothing to diff against, and
+        # calling every task "new" would say something false.
+        seen = {r["task_id"] for r in then if r["task_id"]}
+        restarted_service = str(prior.get("service") or service)
+        return {
+            "repeat": True,
+            "window_minutes": window,
+            "service": restarted_service,
+            "restarted_at": prior["occurred_at"].isoformat(),
+            "minutes_ago": round((now - prior["occurred_at"]).total_seconds() / 60, 1),
+            "command": str(
+                prior.get("command") or f"docker service update --force {restarted_service}"
+            ),
+            "recovered": bool(prior.get("recovered")),
+            "diagnostics_then": then,
+            "diagnostics_now": current,
+            "new_tasks": (
+                [r for r in current if r["task_id"] and r["task_id"] not in seen] if seen else []
+            ),
+        }
 
     @activity.defn
     async def run_remediation_commands(self, commands: list[str], host: str = "") -> dict:

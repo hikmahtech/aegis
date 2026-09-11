@@ -5,15 +5,15 @@ claude CLI (personal login) as a second activity, before degrading to the
 LLM-only `investigate()` fallback. The flow gates the retry on
 `inv_result["engine"] == "kimi"` so org-routed claude runs are never retried.
 
-Mirrors the WorkflowEnvironment + Worker + gate-2-signal pattern of
-test_alert_verdict_consistency.py (Gate-2 fires for every non-Jira, non-resolved
-investigation, so the flow must be signalled to complete).
+Mirrors the WorkflowEnvironment + Worker pattern of
+test_alert_verdict_consistency.py. The verdicts here carry no fix branch and
+no proposed commands, so there is no Gate-2 card (#500) and the flow runs to
+the end on its own.
 """
 
 from __future__ import annotations
 
 import asyncio
-import re
 
 import pytest
 from temporalio import activity, workflow
@@ -84,7 +84,8 @@ def _alert() -> dict:
 
 
 async def _run_to_completion(wf_id: str, stubs: list | None = None) -> dict:
-    """Start the flow, ack Gate-2 once it opens, return the workflow result."""
+    """Run the flow to its end and return the result. No card is asked for,
+    so none may open."""
     async with (
         await WorkflowEnvironment.start_local() as env,
         Worker(
@@ -97,15 +98,9 @@ async def _run_to_completion(wf_id: str, stubs: list | None = None) -> dict:
         handle = await env.client.start_workflow(
             AlertInvestigationFlow.run, _alert(), id=wf_id, task_queue="tq-claude-fb"
         )
-        for _ in range(200):
-            await asyncio.sleep(0.05)
-            if _calls.get("insert_ia"):
-                break
-        assert _calls.get("insert_ia"), "Gate 2 child never started"
-        safe_fp = re.sub(r"[^a-zA-Z0-9._\-]", "-", _FINGERPRINT)[:60]
-        gate2 = env.client.get_workflow_handle(f"gate2-{safe_fp}-{wf_id}")
-        await gate2.signal(InteractionFlow.submit_response, {"value": "ack"})
-        return await asyncio.wait_for(handle.result(), timeout=15.0)
+        result = await asyncio.wait_for(handle.result(), timeout=15.0)
+    assert not _calls.get("insert_ia"), "a verdict with nothing to decide posted a card"
+    return result
 
 
 @pytest.mark.asyncio

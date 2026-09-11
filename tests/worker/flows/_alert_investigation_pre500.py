@@ -1,4 +1,16 @@
-"""AlertInvestigationFlow — investigate one problem the hub handed over.
+"""FROZEN COPY for replay tests — do not edit, do not import from app code.
+
+`worker/src/aegis_worker/flows/alert_investigation.py` as it was at a6fa47a,
+the commit before #500 and #501 changed what the flow does after a verdict and
+before a restart. Verbatim apart from the class name and the `workflow.defn`
+line, which registers it under the real workflow type so the histories it
+records are the ones a run in flight across the deploy carries.
+`test_alert_investigation_replay.py` records histories with it and replays
+them through the current flow. Delete this file with those patch guards.
+
+The original docstring follows.
+
+AlertInvestigationFlow — investigate one problem the hub handed over.
 
 Since PR 3b the flow no longer owns an alert's identity: the problem hub
 (`aegis.services.hub`) decides whether a signal is new, a repeat, suppressed
@@ -15,18 +27,14 @@ Pipeline:
 3.   Verification delay by class (`hub.verify_seconds`) → `problem_status`
      re-check; a problem the hub already saw resolved ends here
 4.   Resolve alert to resource (repo) via `resolve_alert_resource`;
-     infra alerts try the one-shot auto-restart first — once per problem
-     per window (#501): a problem that is back inside it is not restarted
-     again, and goes to the investigation and to one card instead
+     infra alerts try the one-shot auto-restart first
 5.   Gather knowledge context (runbooks, prior incidents)
 6.   Investigate: coding CLI if `resource_path` available, else LLM fallback
 7.   Assessment → structured verdict (actionable / not_actionable /
      inconclusive / self_resolved)
-7.5. Gate 2 card (Open PR / Run fix / Mute 24h / Acknowledge / Discard),
-     only when there is a decision (#500): a fix branch, an actionable
-     verdict's proposed commands (#518), an escalating alert, or a restart
-     that did not stick. Escalating alerts race the card against the hub
-     seeing the problem resolve
+7.5. Gate 2 card (Open PR / Run fix / Mute 24h / Acknowledge / Discard);
+     escalating alerts race the card against the hub seeing the problem
+     resolve
 8.5. Post the final report on the task via `AlertActivities.post_task_note`
 9.   Notify via chat (links to the Todoist task)
 10.  Record the outcome on the problem (`record_investigation`)
@@ -37,6 +45,10 @@ digest and the next session read one record.
 """
 
 from __future__ import annotations
+
+# The import block is the worker's, sorted by the worker's isort settings;
+# re-sorting it here would stop the copy being verbatim.
+# ruff: noqa: I001
 
 import asyncio
 import re
@@ -59,7 +71,6 @@ with workflow.unsafe.imports_passed_through():
         AlertActivities,
         extract_proposed_commands,
         is_infra_alert,
-        is_remediable_alert,
     )
     from aegis_worker.activities.delivery import DeliveryActivities
     from aegis_worker.activities.hub import HubActivities
@@ -80,137 +91,10 @@ with workflow.unsafe.imports_passed_through():
 # default seeds that resolves to `pandoras-actor`, so behavior is unchanged.
 _MAX_HINT_ROUNDS = 3
 
-# `workflow.patched` ids. A run can wait 48h on its Gate-2 card, so some are
-# always in flight across a deploy and replay their recorded commands through
-# this code; each id keeps the old command sequence for them. Delete a guard
-# (and its old branch) once no run started before it is open.
-#
-# #500: no Gate-2 card for a verdict with nothing to decide.
-_PATCH_NO_CARD = "gate2-only-for-decisions"
-# #501: look the problem up before an automatic restart; record every attempt.
-_PATCH_RESTART_ONCE = "auto-restart-once-per-window"
-
 
 def _safe_workflow_id_segment(text: str, max_len: int = 60) -> str:
     """Replace characters illegal in Temporal workflow IDs with dashes."""
     return re.sub(r"[^a-zA-Z0-9._\-]", "-", text)[:max_len]
-
-
-def gate2_needs_decision(
-    *,
-    branches: dict,
-    proposed_cmds: list[str],
-    escalate: bool,
-    restart_repeat: bool,
-    verdict_status: str,
-) -> bool:
-    """Whether a verdict earns a Gate-2 card (#500). Only when the card itself
-    can do something: open a fix PR, take the ack an escalating alert nags
-    for, hand over a restart that did not stick (#501), or run the proposed
-    commands of an actionable verdict (#518). A card with only Mute and
-    Acknowledge asks nothing: in the two weeks before this rule, 27 of the 38
-    answered verdict cards were a bare `ack`.
-
-    "Actionable" is `verdict_status == "actionable"` as Step 7a leaves it (a
-    fix branch promotes an inconclusive or not_actionable verdict to
-    actionable), which is the status the card's head renders as
-    "Investigation — actionable". The 14-day replay in #516 classified past
-    cards by that head: 36 of 68 would have been sent.
-
-    Commands count only on an actionable verdict. On an `inconclusive` one
-    they are a guess, and on a `not_actionable` one they contradict the
-    verdict; in those two weeks 22 such cards drew 17 bare acks and one Run
-    fix. The flow puts them on the task comment instead, for a person to run
-    by hand. Without commands the status earns nothing: `actionable` with no
-    branch is work for a person, but nothing a card can approve."""
-    return (
-        bool(branches)
-        or escalate
-        or restart_repeat
-        or (bool(proposed_cmds) and verdict_status == "actionable")
-    )
-
-
-def _task_line(t: dict) -> str:
-    """One `docker service ps` row as the operator reads it."""
-    line = f"{t.get('node') or 'no node'} · {t.get('current_state') or '?'}"
-    if t.get("error"):
-        line += f" · {t['error']}"
-    return line
-
-
-def _restart_repeat_lines(rr: dict) -> tuple[str, list[str], list[str]]:
-    """What happened (one sentence), then the evidence from the first
-    restart, then what is different now: the tasks new since, or the current
-    state when nothing is new. Shared by the task comment, the card and the
-    investigation's context so all three say the same thing."""
-    service = rr.get("service") or "the service"
-    at = str(rr.get("restarted_at") or "")[:16].replace("T", " ")
-    outcome = "it recovered" if rr.get("recovered") else "it did not recover"
-    # "Down again", not "came back": of a service, that reads as recovered.
-    # And the minutes are to now, not to when it broke.
-    head = (
-        f"{service} is down again, {rr.get('minutes_ago', '?')} min after the automatic "
-        f"restart at {at} UTC ({rr.get('command') or 'docker service update --force'}; "
-        f"{outcome})."
-    )
-    then = [_task_line(t) for t in rr.get("diagnostics_then") or []]
-    new = rr.get("new_tasks") or []
-    now = [_task_line(t) for t in (new or rr.get("diagnostics_now") or [])]
-    return head, then, now
-
-
-def _restart_repeat_note(rr: dict) -> str:
-    head, then, now = _restart_repeat_lines(rr)
-    lines = [
-        f"🔁 {head} I'm not restarting it again: a restart that doesn't hold "
-        "won't fix it. Investigating; one card will follow with what I find.",
-        "",
-        "What docker service ps said after that restart:"
-        if then
-        else "No evidence was kept from that restart.",
-        *[f"  • {line}" for line in then],
-    ]
-    if now:
-        lines += ["", "New since then:" if rr.get("new_tasks") else "Now:"]
-        lines += [f"  • {line}" for line in now]
-    return "\n".join(lines)
-
-
-def _restart_repeat_card(rr: dict) -> str:
-    head, then, now = _restart_repeat_lines(rr)
-    parts = [
-        f"🔁 <b>The restart did not stick.</b> {_html_escape(head)} "
-        "I did not restart it again."
-    ]
-    if then:
-        parts.append(
-            "<b>After that restart:</b>\n"
-            + "\n".join(f"  • {_html_escape(line)}" for line in then)
-        )
-    if now:
-        label = "New since then" if rr.get("new_tasks") else "Now"
-        parts.append(
-            f"<b>{label}:</b>\n" + "\n".join(f"  • {_html_escape(line)}" for line in now)
-        )
-    return "\n\n".join(parts)
-
-
-def _restart_repeat_context(rr: dict) -> str:
-    """Put in front of the investigation, so it does not propose the restart
-    that already failed."""
-    head, then, now = _restart_repeat_lines(rr)
-    lines = [
-        f"CONTEXT: AEGIS force-restarted this service {rr.get('minutes_ago', '?')} min "
-        f"ago and it is down again. {head} Do not recommend another plain restart; "
-        "find out why it does not stay up (placement constraints, resources, a crash "
-        "on start) and what would fix that.",
-    ]
-    if then:
-        lines += ["docker service ps after that restart:", *[f"- {line}" for line in then]]
-    if now:
-        lines += ["docker service ps now:", *[f"- {line}" for line in now]]
-    return "\n".join(lines)
 
 
 def _build_repo_confirm_prompt(
@@ -277,8 +161,8 @@ def _build_repo_confirm_prompt(
     return "\n".join(lines)
 
 
-@workflow.defn
-class AlertInvestigationFlow:
+@workflow.defn(name="AlertInvestigationFlow", sandboxed=False)
+class AlertInvestigationFlowPre500:
     """Investigate and route production alerts with verification delay."""
 
     async def _safe_event(self, msg: str) -> None:
@@ -397,14 +281,7 @@ class AlertInvestigationFlow:
             )
 
     async def _safe_remediate_infra(
-        self,
-        alert: dict,
-        track_task_id: str,
-        title: str,
-        source: str,
-        problem_id: str,
-        *,
-        record_attempt: bool = False,
+        self, alert: dict, track_task_id: str, title: str, source: str, problem_id: str
     ) -> dict | None:
         """Try a one-shot auto-restart for a remediable swarm-service alert.
 
@@ -413,13 +290,6 @@ class AlertInvestigationFlow:
         None to fall through to the normal investigation — either because the
         alert isn't a remediable class / no service name, or the restart was
         issued but the service didn't converge back to healthy.
-
-        Every attempt lands on the problem with a `remediation` payload (the
-        service, the command, whether it recovered, and what `docker service
-        ps` said), which is what `recent_auto_restart` finds when the problem
-        comes back (#501). A recovered restart always recorded; one that did
-        not recover is recorded only when `record_attempt` — a history from
-        before #501 has no such command to replay.
         """
         try:
             rem = await workflow.execute_activity_method(
@@ -435,13 +305,6 @@ class AlertInvestigationFlow:
         if not rem.get("attempted"):
             return None
         service = rem.get("service") or "service"
-        remediation = {
-            "service": rem.get("service") or "",
-            "command": rem.get("command") or "",
-            "recovered": bool(rem.get("recovered")),
-            "reason": rem.get("reason") or "",
-            "diagnostics": rem.get("diagnostics") or [],
-        }
         if rem.get("recovered"):
             await self._safe_event(
                 f"🔧 Auto-restarted <b>{_html_escape(service)}</b> — it was below desired "
@@ -458,7 +321,6 @@ class AlertInvestigationFlow:
                 "resolved",
                 f"Auto-remediated: docker service update --force {service} and it recovered.",
                 step="auto_remediated",
-                payload={"remediation": remediation},
             )
             return {
                 "status": "auto_remediated",
@@ -475,33 +337,7 @@ class AlertInvestigationFlow:
             f"{_html_escape(service)}</code>) but {_html_escape(service)} didn't "
             f"recover — investigating.",
         )
-        if record_attempt:
-            # Status unchanged: the investigation that follows moves it.
-            await self._record(
-                problem_id,
-                "",
-                f"Tried an auto-restart: docker service update --force {service}, "
-                "and it did not recover.",
-                step="auto_restart_unrecovered",
-                payload={"remediation": remediation},
-            )
         return None
-
-    async def _recent_auto_restart(self, problem_id: str, alert: dict) -> dict | None:
-        """The problem's automatic restart inside the window, or None (#501).
-        A lookup that fails answers None, so the restart goes ahead as it
-        always did: not knowing is no reason to leave a service down."""
-        try:
-            found = await workflow.execute_activity_method(
-                AlertActivities.recent_auto_restart,
-                args=[problem_id, alert],
-                start_to_close_timeout=TIMEOUT_STANDARD,
-                retry_policy=FAST,
-            )
-        except Exception as exc:  # noqa: BLE001
-            workflow.logger.warning("alert_recent_auto_restart_failed err=%s", str(exc)[:200])
-            return None
-        return found if found.get("repeat") else None
 
     @workflow.run
     async def run(self, alert: dict) -> dict:
@@ -682,9 +518,6 @@ class AlertInvestigationFlow:
         # have no application code repo. Resolve them deterministically to
         # infra-gitops, skipping the LLM repo-match entirely.
         _is_infra = is_infra_alert(alert, infra_cluster, infra_alertnames)
-        # The problem's last automatic restart, when it came back inside the
-        # window (#501). Set only on that path; it forces the Gate-2 card.
-        restart_repeat: dict | None = None
         if _is_infra:
             # ── Step 4.0: Auto-remediation (force-restart) ──
             # A swarm service below desired replicas is usually a stuck/unplaced
@@ -692,44 +525,11 @@ class AlertInvestigationFlow:
             # that one safe kick before the expensive agentic investigation; if
             # the service recovers we're done (and never burn the kimi budget).
             # Crash-loops are excluded by the activity — restarting them churns.
-            #
-            # Once per problem per window (#501): a problem that was restarted
-            # automatically a moment ago and is back is not restarted again. The
-            # restart did not hold, so the next one would not either; it goes
-            # to the investigation and to one card, with the first restart's
-            # evidence.
-            record_restart = bool(
-                problem_id
-                and is_remediable_alert(alert)
-                and workflow.patched(_PATCH_RESTART_ONCE)
+            remediation = await self._safe_remediate_infra(
+                alert, track_task_id or "", title, source, problem_id
             )
-            if record_restart:
-                restart_repeat = await self._recent_auto_restart(problem_id, alert)
-            if restart_repeat is not None:
-                await self._safe_event(
-                    f"🔁 {_html_escape(str(restart_repeat.get('service') or title))} is down "
-                    f"again after its automatic restart — not restarting it again."
-                )
-                # Todoist comments are plain text, like the verdict comment.
-                await self._safe_post_note(track_task_id or "", _restart_repeat_note(restart_repeat))
-                await self._record(
-                    problem_id,
-                    "",
-                    _restart_repeat_note(restart_repeat),
-                    step="restart_repeat",
-                    payload={"restart_repeat": restart_repeat},
-                )
-            else:
-                remediation = await self._safe_remediate_infra(
-                    alert,
-                    track_task_id or "",
-                    title,
-                    source,
-                    problem_id,
-                    record_attempt=record_restart,
-                )
-                if remediation is not None:
-                    return remediation
+            if remediation is not None:
+                return remediation
             try:
                 resource = await workflow.execute_activity_method(
                     AlertActivities.resolve_infra_resource,
@@ -974,11 +774,6 @@ class AlertInvestigationFlow:
             if labels_str:
                 infra_hint += f"\nAlert labels: {labels_str}"
             knowledge_context = (infra_hint + "\n\n" + knowledge_context).strip()
-        if restart_repeat is not None:
-            # First thing the investigation reads: the restart already failed.
-            knowledge_context = (
-                _restart_repeat_context(restart_repeat) + "\n\n" + knowledge_context
-            ).strip()
 
         # ── Step 6: Investigate ──
         investigation_output = ""
@@ -1199,17 +994,14 @@ class AlertInvestigationFlow:
             workflow.logger.warning("alert_record_verdict_to_kg_failed")
 
         # ── Step 7.5: Gate 2 — post-verdict decision gate ──
-        # A card only when there is a decision (#500): a fix branch to open,
-        # an actionable verdict's proposed commands to run (#518), an
-        # escalating alert that nags until acked, or a restart that did not
-        # stick (#501). See `gate2_needs_decision`.
-        # Anything else is told rather than asked: the verdict comment on the
-        # task (Step 8.5, with any proposed commands, not run), the problem's
-        # timeline (Step 10) and the chat ping
-        # (Step 9) — what an `ack` used to lead to, without the ack. Before
-        # #500 every non-Jira, non-resolved verdict got a card (2026-05-22,
-        # when chat had no verdict at all), and 27 of 38 answers were a bare
-        # `ack`. "Mute 24h" for such a problem is on the admin Problems page.
+        # Fires for every non-Jira, non-self-resolved investigation, not
+        # just the kimi-with-branches case the gate started life as
+        # (2026-05-01 shape). Once kimi stopped reliably producing branches
+        # — qwen3:14b assess timeouts, conservative grounding rule — the
+        # user got "comments after comments on Todoist" with no chat
+        # prompt to approve action. Bringing the gate back broadly
+        # restores chat as the decision surface; Todoist remains the
+        # record (2026-05-22 user ask).
         #
         # Options vary by context:
         #   • If kimi committed fixes (branches present): "Open PR(s)"
@@ -1232,26 +1024,6 @@ class AlertInvestigationFlow:
         proposed_cmds: list[str] = (
             extract_proposed_commands(investigation_output) if _is_infra else []
         )
-        # Asked only when the answer can change something, so a run that does
-        # carry a decision replays exactly as it did before the patch. #518's
-        # stricter rule (commands only on an actionable verdict) sits under
-        # the same id: it only skips more cards, and the guard is asked
-        # exactly where one is skipped, so a history without the marker still
-        # takes the card path it recorded.
-        no_decision_card = (
-            not gate_skipped
-            and not gate2_needs_decision(
-                branches=branches,
-                proposed_cmds=proposed_cmds,
-                escalate=_escalate,
-                restart_repeat=restart_repeat is not None,
-                verdict_status=verdict_status,
-            )
-            and workflow.patched(_PATCH_NO_CARD)
-        )
-        if no_decision_card:
-            gate_skipped = True
-            workflow.logger.info("alert_gate2_no_decision_no_card verdict=%s", verdict_status)
         if not gate_skipped:
             # assess_investigation returns {status, root_cause, suggested_fix,
             # confidence}. The earlier `summary`/`severity`/`title` fallback
@@ -1290,8 +1062,6 @@ class AlertInvestigationFlow:
                         f"  <code>{_html_escape(c)}</code>" for c in proposed_cmds
                     )
                     prompt += f"\n\nProposed fix commands:\n{cmd_lines}"
-            if restart_repeat is not None:
-                prompt = _restart_repeat_card(restart_repeat) + "\n\n" + prompt
 
             options: dict[str, str] = {}
             if branches:
@@ -1775,19 +1545,6 @@ class AlertInvestigationFlow:
                 )
             if kimi_attachment_name:
                 final_msg = f"{final_msg}\n\n📎 Transcript: {kimi_attachment_name}"
-            if no_decision_card:
-                if proposed_cmds:
-                    # Carded only on an actionable verdict (#518); here they
-                    # are a suggestion, kept where a person can still use it.
-                    cmd_lines = "\n".join(f"  - {c}" for c in proposed_cmds)
-                    final_msg += (
-                        "\n\nThe investigation proposed these commands. I have not "
-                        f"run them; run them by hand if you agree:\n{cmd_lines}"
-                    )
-                final_msg += (
-                    "\n\nNothing here needs your decision, so I sent no card. "
-                    "If it keeps coming back, mute it on the Problems page."
-                )
             await self._safe_post_note(track_task_id, final_msg, file_attachment=kimi_attachment)
 
         # ── Step 9: chat notification ──
@@ -1850,9 +1607,7 @@ class AlertInvestigationFlow:
 
         # ── Step 10: Record the outcome on the problem ──
         # `resolved` closes the problem; anything else leaves it with the
-        # human, who has the full report on the task — with no card too,
-        # which is the state an `ack` used to leave it in.
-        decision_card = not gate_skipped
+        # human, who has the full report on the task.
         await self._record(
             problem_id,
             "resolved" if final_status == "resolved" else "waiting_human",
@@ -1862,17 +1617,13 @@ class AlertInvestigationFlow:
                 "verdict": verdict_status,
                 "resource": resource_title,
                 "investigation_source": investigation_source,
-                "decision_card": decision_card,
             },
         )
 
-        # %-args, not keywords: a stdlib LoggerAdapter raises TypeError on
-        # `status=...` whenever INFO is enabled (test_no_logger_kwargs.py
-        # scans single lines, so this multi-line call slipped past it).
         workflow.logger.info(
-            "alert_investigation_complete status=%s verdict_status=%s",
-            final_status,
-            verdict_status,
+            "alert_investigation_complete",
+            status=final_status,
+            verdict_status=verdict_status,
         )
 
         emoji = {
@@ -1896,9 +1647,4 @@ class AlertInvestigationFlow:
             "investigation_source": investigation_source,
             "kimi_attempted": kimi_attempted,
             "resource_source": resource.get("source"),
-            # Whether a Gate-2 card went out (#500), and whether this run was
-            # a problem back inside its restart window (#501): cards per
-            # investigation, countable in workflow_runs.
-            "decision_card": decision_card,
-            "restart_repeat": restart_repeat is not None,
         }
