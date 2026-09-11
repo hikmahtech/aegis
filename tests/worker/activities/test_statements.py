@@ -14,13 +14,16 @@ from __future__ import annotations
 
 import shutil
 import subprocess
-from datetime import date
+import uuid
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 
 import pytest
 import pytest_asyncio
-from aegis.services import books
+from aegis.services import books, statement_post
+from aegis.services import statement_findings as sf
+from aegis.services.hub import get_problem
 from aegis.services.statements import row_id_for
 from aegis_worker.activities import statements as statements_mod
 from aegis_worker.activities.statements import StatementActivities
@@ -97,7 +100,8 @@ async def _statement(pool, instrument, start, end, opening, closing, rows):
         "opening_balance, closing_balance, file_sha256, rows) VALUES ($1,$2,$3,$4,$5,$6,'t',$7) "
         "ON CONFLICT (statement_id) DO NOTHING",
         sid, instrument, date.fromisoformat(start), date.fromisoformat(end),
-        Decimal(opening), Decimal(closing), rows,
+        # None is a statement that printed no balances, so §9.3 cannot check it.
+        *(Decimal(v) if v is not None else None for v in (opening, closing)), rows,
     )
     return sid
 
@@ -337,17 +341,21 @@ def test_coverage_never_reports_an_account_that_has_never_sent_a_statement():
     assert [f["subject"] for f in out] == ["axis-9640"]
 
 
-def test_coverage_says_nothing_while_the_month_is_still_young():
+def test_coverage_does_not_look_while_the_month_is_still_young():
     """A statement for last month arrives within days of it closing. Asking on
     the 2nd flips every account to missing and resolves it again a week later —
     one Todoist task per account per month, saying only that the calendar
-    turned over."""
+    turned over.
+
+    And it says it did not look — None, not `[]` (#491). An empty list means
+    "looked, found nothing missing", which is what resolves every open
+    `statement_missing` problem."""
     from aegis.services import statement_findings
 
     seen = [_S("axis-9640", date(2026, 6, 1), date(2026, 6, 30))]
     assert statements_mod._coverage_findings(
         seen, statement_findings, today=date(2026, 8, 2)
-    ) == []
+    ) is None
 
 
 async def test_the_digest_is_produced_once_a_month_not_once_a_day(clean):
@@ -512,6 +520,368 @@ async def test_a_promoted_block_tells_the_index_which_account_paid(clean, tmp_pa
     assert await clean.fetchval(
         "SELECT instrument FROM finance.journal_index WHERE message_id = 'st-apple'"
     ) == "axis-9640"
+
+
+async def test_a_row_no_rule_places_is_indexed_on_the_account_its_block_names(clean, tmp_path):
+    """#481. The poster works the counter account out — the event's own, or the
+    rules', or the entity's unknown account — and writes THAT into the block,
+    then indexed the event it started from. For a statement row no rule placed
+    that event carries no account, so 178 of 298 statement-posted index rows
+    said NULL while their blocks said `expenses:unknown`, and every "what is
+    still unclassified?" surface keys on `account LIKE '%:unknown'`: the money
+    brief, month close and `ledger_add_rule`'s sweep could not see them."""
+    cfg = _repo(tmp_path)
+    sid = await _statement(clean, "hdfc-1225", "2026-07-01", "2026-07-31", "0", "-120", 1)
+    rid = await _row(
+        clean, "hdfc-1225", "2026-07-14", "out", "120.00", "POS CORNER STORE", sid, "-120"
+    )
+
+    out = await ActivityEnvironment().run(_act(clean, cfg).reconcile_statements, True, "")
+    assert out["posted"] == 1, out
+
+    msgid = statement_post.msgid_for(rid)
+    text = (cfg.path / "personal" / "2026.journal").read_text()
+    span = books.find_block(text, msgid)
+    named = statement_post._counter_account(text[span[0]:span[1]])
+    assert named == "expenses:unknown", text
+    assert await clean.fetchval(
+        "SELECT account FROM finance.journal_index WHERE message_id = $1", msgid
+    ) == named
+
+
+async def _indexed(pool, msgid, instrument, day, amount, *, direction="out"):
+    """A journal transaction the matcher may offer as a candidate. It names a
+    journal file, which `load_candidates` requires of every candidate."""
+    await pool.execute(
+        "INSERT INTO finance.journal_index (message_id, mailbox, entity, kind, direction, "
+        "amount, currency, payee, payee_key, instrument, occurred_on, parser, source_class, "
+        "journal_file) VALUES ($1,'st-box','personal','transaction',$2,$3,'INR','Shop','shop',"
+        "$4,$5,'bank_alert','bank','personal/2026.journal')",
+        msgid, direction, Decimal(amount), instrument, date.fromisoformat(day),
+    )
+
+
+async def _three_verdicts(pool) -> tuple[str, str, str, str]:
+    """One hdfc-1225 statement holding each of the matcher's verdicts: a row the
+    journal holds once, a row it holds twice (§9.4's ambiguous shape), and a row
+    it does not hold at all."""
+    sid = await _statement(pool, "hdfc-1225", "2026-07-01", "2026-07-31", "0", "-1374.38", 3)
+    await _indexed(pool, "st-one", "hdfc-1225", "2026-07-05", "250.00")
+    await _indexed(pool, "st-amb-1", "hdfc-1225", "2026-07-11", "437.19")
+    await _indexed(pool, "st-amb-2", "hdfc-1225", "2026-07-12", "437.19")
+    matched = await _row(pool, "hdfc-1225", "2026-07-05", "out", "250.00", "UPI SHOP", sid, "-250")
+    ambiguous = await _row(
+        pool, "hdfc-1225", "2026-07-12", "out", "437.19", "UPI OTHER", sid, "-687.19"
+    )
+    unmatched = await _row(
+        pool, "hdfc-1225", "2026-07-20", "out", "687.19", "SOMETHING", sid, "-1374.38"
+    )
+    return sid, matched, ambiguous, unmatched
+
+
+def _spy_on_sweep(monkeypatch) -> list[dict]:
+    """Every finding the activity hands the hub. The real sweep still runs."""
+    real = sf.sweep
+    seen: list[dict] = []
+
+    async def spy(pool, findings, **kw):
+        seen.extend(findings)
+        return await real(pool, findings, **kw)
+
+    monkeypatch.setattr(sf, "sweep", spy)
+    return seen
+
+
+def _row_findings(seen: list[dict], subject: str) -> list[str]:
+    return sorted(
+        f["klass"]
+        for f in seen
+        if f["subject"] == subject and f["klass"] in (sf.UNMATCHED_ROWS, sf.AMBIGUOUS_ROW)
+    )
+
+
+async def test_a_statement_the_lane_will_never_post_raises_no_row_finding(
+    clean, tmp_path, monkeypatch
+):
+    """The lane posts only statements starting on or after `since`, and the
+    findings counted every statement — so the 2,339 unmatched rows on
+    axis-9640's seven pre-July statements were a task no statement could ever
+    close. A row the lane will never post is not work the lane can do."""
+    cfg = _repo(tmp_path)
+    inst = f"zzold-{uuid.uuid4().hex[:8]}"
+    old = await _statement(clean, inst, "2024-05-01", "2024-05-31", "0", "-500", 1)
+    await _row(clean, inst, "2024-05-10", "out", "500.00", "OLD PURCHASE", old, "-500")
+    seen = _spy_on_sweep(monkeypatch)
+
+    out = await ActivityEnvironment().run(
+        _act(clean, cfg).reconcile_statements, True, "2026-07-01"
+    )
+
+    assert [r["status"] for r in out["results"]] == ["out_of_scope"]
+    assert _row_findings(seen, inst) == []
+    # The digest reads the same narrowed run, so the backlog it prints is the
+    # backlog the lane can still work.
+    assert out["digest"] and old not in out["digest"]
+
+
+async def test_a_reconciled_statement_raises_no_row_finding(clean, tmp_path, monkeypatch):
+    """A reconciled statement passed §9.3: the bank's own printed totals agree
+    with the books. An unmatched or ambiguous row left in one is the matcher
+    failing to see its own posted entry, or a transfer indexed under the other
+    account — hdfc-1225's four live rows were ₹1,00,000 in from the Axis
+    account, two ₹1,000 transfers to the kids' accounts and a ₹0.35 SMS fee —
+    not money missing from the books.
+
+    Both ways of being reconciled count: on an earlier tick, and on THIS tick,
+    whose rows the matcher saw as unmatched a moment before they were posted."""
+    cfg = _repo(tmp_path)
+    earlier = f"zzdone-{uuid.uuid4().hex[:8]}"
+    done = await _statement(clean, earlier, "2026-07-01", "2026-07-31", "0", "-1137.19", 2)
+    await clean.execute(
+        "UPDATE finance.statements SET reconciled_at = now() WHERE statement_id = $1", done
+    )
+    await _indexed(clean, "st-amb-1", earlier, "2026-07-11", "437.19")
+    await _indexed(clean, "st-amb-2", earlier, "2026-07-12", "437.19")
+    await _row(clean, earlier, "2026-07-12", "out", "437.19", "UPI OTHER", done, "-437.19")
+    await _row(clean, earlier, "2026-07-20", "out", "700.00", "SOMETHING", done, "-1137.19")
+    now = await _statement(clean, "hdfc-1225", "2026-07-01", "2026-07-31", "0", "-500", 1)
+    await _row(clean, "hdfc-1225", "2026-07-10", "out", "500.00", "ATM WITHDRAWAL", now, "-500")
+    seen = _spy_on_sweep(monkeypatch)
+
+    out = await ActivityEnvironment().run(_act(clean, cfg).reconcile_statements, True, "")
+
+    assert {r["statement"]: r["status"] for r in out["results"]} == {now: "posted"}, out
+    assert _row_findings(seen, earlier) == []
+    assert _row_findings(seen, "hdfc-1225") == []
+    # The goal state, and the digest must read as one: the narrowed run is
+    # empty, so without counts it said it saw no statements at all.
+    assert "2 statements: 2 reconciled, 0 out of scope, 0 open" in out["digest"]
+    assert "all in-scope statements reconcile with the books" in out["digest"]
+
+
+async def test_an_unreconciled_statement_in_scope_keeps_its_row_findings(
+    clean, tmp_path, monkeypatch
+):
+    """The narrowing must not overreach. An in-scope statement that has not
+    reconciled is exactly where the lane's work is, and its unmatched and
+    ambiguous rows are the findings that say so."""
+    cfg = _repo(tmp_path)
+    await _three_verdicts(clean)
+    seen = _spy_on_sweep(monkeypatch)
+
+    await ActivityEnvironment().run(_act(clean, cfg).reconcile_statements, False, "2026-07-01")
+
+    assert _row_findings(seen, "hdfc-1225") == [sf.AMBIGUOUS_ROW, sf.UNMATCHED_ROWS]
+
+
+async def test_a_row_posted_in_a_statement_that_cannot_be_checked_raises_no_finding(
+    clean, tmp_path, monkeypatch
+):
+    """A statement with no printed balances gives §9.3 nothing to check, so it
+    posts its rows and stays open. A row it just posted is in the books all the
+    same. Counted as unmatched, it opened a task that closed the next day, when
+    the row matched its own block."""
+    cfg = _repo(tmp_path)
+    sid = await _statement(clean, "hdfc-1225", "2026-07-01", "2026-07-31", None, None, 1)
+    await _row(clean, "hdfc-1225", "2026-07-14", "out", "120.00", "POS CORNER STORE", sid)
+    seen = _spy_on_sweep(monkeypatch)
+
+    out = await ActivityEnvironment().run(_act(clean, cfg).reconcile_statements, True, "")
+
+    [result] = out["results"]
+    assert (result["status"], result["posted"], result["balance_checked"]) == (
+        "posted", 1, False
+    ), out
+    assert _row_findings(seen, "hdfc-1225") == []
+
+
+async def test_the_matchers_verdict_is_recorded_on_its_row(clean, tmp_path):
+    """#470. The matcher decided, the activity handed the decision to the poster,
+    and it was gone when the tick ended: `matched_msgid` was NULL on all 2,800
+    rows, so "which email did this bank row match?" had no answer anywhere.
+
+    A daily tick over ~2,800 rows that have not changed must write none of
+    them, so the second identical run leaves every row's `xmin` where it was."""
+    cfg = _repo(tmp_path)
+    _, matched, ambiguous, unmatched = await _three_verdicts(clean)
+    ids = [matched, ambiguous, unmatched]
+    sql = (
+        "SELECT row_id, matched_msgid, candidates, skip_reason, xmin::text AS xmin "
+        "FROM finance.statement_rows WHERE row_id = ANY($1::text[])"
+    )
+
+    await ActivityEnvironment().run(_act(clean, cfg).reconcile_statements, False, "")
+
+    got = {r["row_id"]: r for r in await clean.fetch(sql, ids)}
+    assert got[matched]["matched_msgid"] == "st-one"
+    assert got[matched]["candidates"] is None
+    assert got[ambiguous]["matched_msgid"] is None
+    assert got[ambiguous]["candidates"] == ["st-amb-1", "st-amb-2"]
+    # Candidates with no match already say "ambiguous". `skip_reason` is the
+    # poster's column (spec §8.4), and the matcher leaves it alone.
+    assert got[ambiguous]["skip_reason"] is None
+    assert got[unmatched]["matched_msgid"] is None
+    assert got[unmatched]["candidates"] is None
+
+    await ActivityEnvironment().run(_act(clean, cfg).reconcile_statements, False, "")
+
+    again = {r["row_id"]: r["xmin"] for r in await clean.fetch(sql, ids)}
+    assert again == {k: v["xmin"] for k, v in got.items()}
+
+
+async def test_posted_at_marks_only_the_rows_this_lane_wrote(clean, tmp_path):
+    """`posted_at` says a block was written for this row (032). Not the
+    idempotency ledger — that is the `stmt/<row_id>` msgid inside the block —
+    so it marks exactly the rows the poster wrote: not a row that promoted a
+    block the email lane wrote, and not one stamped before, whose stamp stands."""
+    cfg = _repo(tmp_path)
+    await _indexed(clean, "st-one", "hdfc-1225", "2026-07-05", "250.00")
+    (cfg.path / "personal" / "2026.journal").write_text(
+        "; p\n\n"
+        "2026-07-05 ! Shop\n"
+        "    ; msgid: st-one\n"
+        "    ; channel: upi, instrument: hdfc-1225\n"
+        "    expenses:unknown          ₹250.00\n"
+        "    assets:bank:hdfc:1225    ₹-250.00\n"
+    )
+    subprocess.run(
+        ["git", "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qam", "seed"],
+        cwd=cfg.path, check=True,
+    )
+    sid = await _statement(clean, "hdfc-1225", "2026-07-01", "2026-07-31", "0", "-870", 3)
+    promoted = await _row(
+        clean, "hdfc-1225", "2026-07-05", "out", "250.00", "UPI SHOP", sid, "-250"
+    )
+    posted = await _row(
+        clean, "hdfc-1225", "2026-07-10", "out", "500.00", "ATM WITHDRAWAL", sid, "-750"
+    )
+    stamped = await _row(
+        clean, "hdfc-1225", "2026-07-14", "out", "120.00", "POS CORNER STORE", sid, "-870"
+    )
+    before = datetime(2026, 1, 1, tzinfo=UTC)
+    await clean.execute(
+        "UPDATE finance.statement_rows SET posted_at = $2 WHERE row_id = $1", stamped, before
+    )
+
+    out = await ActivityEnvironment().run(_act(clean, cfg).reconcile_statements, True, "")
+    assert (out["posted"], out["promoted"]) == (2, 1), out
+
+    at = {
+        r["row_id"]: r["posted_at"]
+        for r in await clean.fetch(
+            "SELECT row_id, posted_at FROM finance.statement_rows WHERE row_id = ANY($1::text[])",
+            [promoted, posted, stamped],
+        )
+    }
+    assert at[promoted] is None
+    assert at[posted] is not None and at[posted] > datetime.now(UTC) - timedelta(hours=1)
+    assert at[stamped] == before
+
+
+async def test_a_reconciled_statements_record_survives_the_next_tick(clean, tmp_path):
+    """Once a statement reconciles, its record is frozen. The matcher still runs
+    over its rows every tick, and from then on it sees the lane's own `stmt/`
+    blocks as candidates: R1, matched to the email block on the tick that
+    posted, came back the next day ambiguous between that email and R2's own
+    block — the one fact #470 keeps, gone — and R2, which the lane posted, came
+    back with candidates as though nothing had been decided."""
+    cfg = _repo(tmp_path)
+    await _indexed(clean, "st-e", "hdfc-1225", "2026-07-11", "437.19")
+    (cfg.path / "personal" / "2026.journal").write_text(
+        "; p\n\n"
+        "2026-07-11 ! Shop\n"
+        "    ; msgid: st-e\n"
+        "    ; channel: upi, instrument: hdfc-1225\n"
+        "    expenses:unknown          ₹437.19\n"
+        "    assets:bank:hdfc:1225    ₹-437.19\n"
+    )
+    subprocess.run(
+        ["git", "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qam", "seed"],
+        cwd=cfg.path, check=True,
+    )
+    sid = await _statement(clean, "hdfc-1225", "2026-07-01", "2026-07-31", "0", "-874.38", 2)
+    r1 = await _row(clean, "hdfc-1225", "2026-07-12", "out", "437.19", "UPI SHOP", sid, "-437.19")
+    r2 = await _row(
+        clean, "hdfc-1225", "2026-07-13", "out", "437.19", "UPI OTHER", sid, "-874.38"
+    )
+    sql = (
+        "SELECT row_id, matched_msgid, candidates, skip_reason, posted_at "
+        "FROM finance.statement_rows WHERE row_id = ANY($1::text[])"
+    )
+
+    first = await ActivityEnvironment().run(_act(clean, cfg).reconcile_statements, True, "")
+    assert [r["status"] for r in first["results"]] == ["posted"], first
+    tick1 = {r["row_id"]: dict(r) for r in await clean.fetch(sql, [r1, r2])}
+    assert tick1[r1]["matched_msgid"] == "st-e"
+    assert tick1[r2]["posted_at"] is not None
+
+    await ActivityEnvironment().run(_act(clean, cfg).reconcile_statements, True, "")
+
+    assert {r["row_id"]: dict(r) for r in await clean.fetch(sql, [r1, r2])} == tick1
+
+
+def _on(monkeypatch, day: date) -> None:
+    """Stand the activity on `day`: its `date.today()` answers `day`. Threading
+    a clock through the activity's arguments would change the schedule's
+    payload for the sake of a test."""
+
+    class _Day(date):
+        @classmethod
+        def today(cls):
+            return day
+
+    monkeypatch.setattr(statements_mod, "date", _Day)
+
+
+async def _open_problems(pool, *klasses: str) -> list[str]:
+    """One live money problem per class, each on an account of its own. ONE
+    sweep opens them all: a second would resolve the first one's problems."""
+    subjects = [f"zzacct-{uuid.uuid4().hex[:8]}" for _ in klasses]
+    out = await sf.sweep(
+        pool,
+        [sf.finding(k, s, f"{k} on {s}") for k, s in zip(klasses, subjects, strict=True)],
+        kinds=(sf.INSTRUMENT,),
+        project=False,
+    )
+    ids = {f["subject"]: f["problem_id"] for f in out[sf.INSTRUMENT]["fresh"]}
+    return [ids[s] for s in subjects]
+
+
+async def test_a_tick_inside_the_grace_window_leaves_statement_missing_open(
+    clean, tmp_path, monkeypatch
+):
+    """#491. Coverage does not look for the first `_COVERAGE_GRACE_DAYS` of a
+    month, and the sweep was told it had: every open "no statement arrived"
+    problem was resolved on the 1st because none was found, and a statement
+    that really was missing got a NEW task on the 9th, every month. The classes
+    that were evaluated on the same tick still recover."""
+    cfg = _repo(tmp_path)
+    missing, unmatched = await _open_problems(clean, sf.STATEMENT_MISSING, sf.UNMATCHED_ROWS)
+    sid = await _statement(clean, "hdfc-1225", "2026-07-01", "2026-07-31", "0", "-500", 1)
+    await _row(clean, "hdfc-1225", "2026-07-10", "out", "500.00", "ATM WITHDRAWAL", sid, "-500")
+    _on(monkeypatch, date(2026, 10, 3))
+
+    await ActivityEnvironment().run(_act(clean, cfg).reconcile_statements, False, "")
+
+    assert (await get_problem(clean, missing))["status"] == "open"
+    assert (await get_problem(clean, unmatched))["status"] == "resolved"
+
+
+async def test_a_tick_past_the_grace_window_resolves_what_coverage_no_longer_finds(
+    clean, tmp_path, monkeypatch
+):
+    """The other half. Once coverage really looks, a `statement_missing` it does
+    not find again is over — which is how the problem closes the day the
+    statement lands."""
+    cfg = _repo(tmp_path)
+    (missing,) = await _open_problems(clean, sf.STATEMENT_MISSING)
+    sid = await _statement(clean, "hdfc-1225", "2026-07-01", "2026-07-31", "0", "-500", 1)
+    await _row(clean, "hdfc-1225", "2026-07-10", "out", "500.00", "ATM WITHDRAWAL", sid, "-500")
+    _on(monkeypatch, date(2026, 10, 12))
+
+    await ActivityEnvironment().run(_act(clean, cfg).reconcile_statements, False, "")
+
+    assert (await get_problem(clean, missing))["status"] == "resolved"
 
 
 async def test_an_unmatched_row_reaches_its_task_with_its_amount_and_narration(clean, tmp_path):

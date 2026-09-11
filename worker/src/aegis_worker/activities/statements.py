@@ -17,8 +17,8 @@ reported failure, never a silent zero.
 from __future__ import annotations
 
 import json
-from collections.abc import Mapping
-from dataclasses import dataclass
+from collections.abc import Iterable, Mapping
+from dataclasses import dataclass, replace
 from datetime import date, timedelta
 from pathlib import Path
 from typing import Any
@@ -146,9 +146,11 @@ class StatementActivities:
         would also put a few thousand rows and their candidates through the
         workflow history on every hop.
 
-        `post` false is a real run that writes nothing: it matches, it reports
-        findings, and it produces the digest. That is the mode a person reads
-        before letting a schedule touch the books.
+        `post` false is a real run that writes nothing to the books: it matches,
+        it reports findings, and it produces the digest. It still writes outside
+        them — the matcher's record on `statement_rows`, the findings sweep, and
+        the month's digest marker. That is the mode a person reads before
+        letting a schedule touch the books.
         """
         from aegis.services import books, statement_findings, statement_match, statement_post
         from aegis.services import journal_index as ji
@@ -192,8 +194,21 @@ class StatementActivities:
                 "SELECT statement_id FROM finance.statements WHERE reconciled_at IS NOT NULL"
             )
         }
+        # #470: keep the verdict, before anything acts on it — and only for a
+        # statement not yet reconciled. Once one is, its record is frozen: the
+        # matcher then sees the lane's own `stmt/` blocks as candidates, and its
+        # verdict describes that, not the row. A row matched to an email on the
+        # tick that posted came back the next day as ambiguous between that
+        # email and its neighbour's own block. A record only — `record_outcomes`
+        # says why nothing may read it back.
+        await record_outcomes(
+            self.db_pool, (o for o in outcomes.values() if o.statement_id not in done)
+        )
         posted = promoted = 0
         results: list[dict] = []
+        #: Row ids this tick wrote a block for, whether or not their statement
+        #: could then be balance-checked.
+        wrote: set[str] = set()
         for statement in statements:
             if statement.statement_id in done:
                 continue
@@ -292,6 +307,21 @@ class StatementActivities:
                     journal_file=journal_file,
                     declared=declared,
                 )
+            # `posted_at` marks the rows this post wrote a block for (032) — the
+            # digest's marker, never the idempotency ledger, which is the
+            # `stmt/<row_id>` msgid inside the block and survives a crash
+            # between the journal commit and this stamp. Only where NULL: a
+            # row's first stamp stands.
+            rows_written = [
+                m.removeprefix(f"{statement_post.MSGID_PREFIX}/") for m in result.posted
+            ]
+            wrote.update(rows_written)
+            if rows_written:
+                await self.db_pool.execute(
+                    "UPDATE finance.statement_rows SET posted_at = now() "
+                    "WHERE row_id = ANY($1::text[]) AND posted_at IS NULL",
+                    rows_written,
+                )
 
             # Promotion just rewrote every `assets:unknown` posting in these
             # blocks to this statement's account, so the journal now names the
@@ -335,17 +365,71 @@ class StatementActivities:
                 instrument=statement.instrument,
             )
 
-        # Coverage is swept in the SAME call as the rest of the instrument
-        # classes, and it has to be: `statement_missing` is one of them, so a
-        # sweep that produced no coverage findings would resolve every open
-        # "no statement arrived" problem for the reason that it never looked.
+        # Row findings speak only for statements the lane can still act on, and
+        # the digest reads the same run. Two kinds of statement are not that,
+        # and between them they held every row of the lane's open money
+        # problems on 2026-09-11:
+        #
+        # * OUT OF SCOPE — the loop above never posts one, so its rows can never
+        #   close. 2,486 unmatched rows on axis-9640 and axis-cc-1313 sat in
+        #   statements starting before `since`, as tasks nothing could finish.
+        # * RECONCILED — it passed §9.3, so the bank's own printed totals agree
+        #   with the books. An unmatched or ambiguous row left in one is the
+        #   matcher not seeing its own posted entry, or an own-account transfer
+        #   indexed under the other account — not money missing from the books.
+        #
+        # Reconciled is read AFTER the loop, so a statement this tick reconciled
+        # counts: its rows were unmatched a moment before the loop posted them.
+        # So does a row this tick posted in a statement that stays open because
+        # it printed no balances to check: the row is in the books, and counted
+        # as unmatched it opened a task that closed the next day, when it matched
+        # its own block. Only the per-statement parts are narrowed, and the
+        # summaries are rebuilt from the outcomes left; unscoped instruments and
+        # missing rates are about accounts and currencies and stay whole, and
+        # coverage below reads every statement.
+        reconciled = {
+            r["statement_id"]
+            for r in await self.db_pool.fetch(
+                "SELECT statement_id FROM finance.statements WHERE reconciled_at IS NOT NULL"
+            )
+        }
+        open_ids = {
+            s.statement_id
+            for s in statements
+            if scope.covers(s) and s.statement_id not in reconciled
+        }
+        left = tuple(
+            o for o in run.outcomes if o.statement_id in open_ids and o.row_id not in wrote
+        )
+        run = replace(run, outcomes=left, summaries=statement_match.summarise(left))
+        # What the run was narrowed from, for the digest's header: without it
+        # the goal state — everything in scope reconciled — reads as a digest
+        # that saw no statements.
+        tally = {
+            "reconciled": sum(s.statement_id in reconciled for s in statements),
+            "out_of_scope": sum(
+                s.statement_id not in reconciled and not scope.covers(s) for s in statements
+            ),
+            "open": len(open_ids),
+        }
+
+        # Coverage rides the SAME call as the matcher's classes, because
+        # `statement_missing` is an instrument class. That alone is not enough:
+        # what decides whether its open problems may be resolved is whether
+        # coverage LOOKED, and inside its grace window it does not (#491).
+        # `reconcile_findings` resolves every open problem of a class it is
+        # handed and did not find, so handing it `statement_missing` on days
+        # 1-8 closed every "no statement arrived" task because nothing was
+        # checked, and a statement really missing came back as a new task on
+        # the 9th, every month. None means coverage did not look, and naming the
+        # class `unevaluated` leaves its problems alone while the rest of the
+        # kind still resolves.
+        coverage = _coverage_findings(statements, statement_findings, today=date.today())
         findings = statement_findings.match_findings(
             # The rows, so each task can name its rows by date, amount and
             # narration — the outcomes carry only an id and a date.
             run, rows={r.row_id: r for s in statements for r in s.rows}
-        ) + _coverage_findings(
-            statements, statement_findings, today=date.today()
-        )
+        ) + (coverage or [])
         swept = await statement_findings.sweep(
             self.db_pool,
             findings,
@@ -355,6 +439,7 @@ class StatementActivities:
             # report every locked statement as fixed. The `statement` kind is
             # intake's to sweep, not this activity's.
             kinds=(statement_findings.INSTRUMENT, statement_findings.CURRENCY),
+            unevaluated={statement_findings.STATEMENT_MISSING} if coverage is None else (),
         )
         return {
             "status": "ok",
@@ -370,7 +455,7 @@ class StatementActivities:
                 for k, v in swept.items()
             },
             "digest": await _due_digest(
-                self.db_pool, statement_findings, run, today=date.today()
+                self.db_pool, statement_findings, run, today=date.today(), statements=tally
             ),
         }
 
@@ -417,6 +502,65 @@ async def load_statements(pool: Any) -> list[Any]:
     return out
 
 
+async def record_outcomes(pool: Any, outcomes: Iterable[Any]) -> int:
+    """Store what the matcher decided about each row (#470). Returns rows written.
+
+    `match_statements` returns a verdict per row — the journal transaction it
+    matched, or the candidates it could not choose between — and the tick
+    handed that to the poster and dropped it. `matched_msgid` was NULL on all
+    2,800 rows, so "which email did this bank row match?" had no answer once
+    the run ended, which is the question a person asks when a statement
+    reverts.
+
+    **A record, never an input.** Nothing reads these columns back into a match
+    or a post: every tick re-decides every row from the journal as it stands,
+    and a stored match read back as evidence would outlive the evidence for it.
+
+    `skip_reason` is deliberately not written. `candidates` with no
+    `matched_msgid` already records "ambiguous", and spec §8.4 makes the poster
+    the column's owner (`transfer_counterpart`): a matcher writing its own
+    verdict there would wipe the poster's value every tick, through the guard
+    below, the day that writer lands.
+
+    Only a row whose verdict CHANGED is written: the tick runs daily over every
+    stored row, and rewriting ~2,800 of them to the values they already hold is
+    table bloat for nothing — the same reasoning as `store_rows`' `WHERE`.
+
+    One statement, carried as one jsonb document rather than `unnest` over
+    arrays: asyncpg reads a list of lists as a multi-dimensional array, and
+    each row's candidates are a list of their own length, so they cannot ride
+    a `jsonb[]` parameter. The pool's codec encodes the document itself — never
+    pre-dump it.
+    """
+    batch = [
+        {
+            "row_id": o.row_id,
+            "matched_msgid": o.msgid if o.matched else None,
+            "candidates": list(o.candidates) or None,
+        }
+        for o in outcomes
+    ]
+    if not batch:
+        return 0
+    result = await pool.execute(
+        """
+        UPDATE finance.statement_rows AS sr
+           SET matched_msgid = v.matched_msgid,
+               candidates    = v.candidates
+          FROM jsonb_to_recordset($1::jsonb)
+               AS v(row_id text, matched_msgid text, candidates jsonb)
+         WHERE sr.row_id = v.row_id
+           AND (sr.matched_msgid IS DISTINCT FROM v.matched_msgid
+             OR sr.candidates    IS DISTINCT FROM v.candidates)
+        """,
+        batch,
+    )
+    written = int(result.split()[-1])
+    if written:
+        logger.info("statement_outcomes_recorded", rows=written)
+    return written
+
+
 #: How long after a month ends before a missing statement is a finding rather
 #: than a statement that has not arrived yet. Both banks send within days of the
 #: period closing, so asking on the 1st would flip every account to missing and
@@ -431,7 +575,7 @@ _COVERAGE_GRACE_DAYS = 8
 _CYCLE_DAYS = 35
 
 
-def _coverage_findings(statements, findings_mod, *, today: date) -> list[dict]:
+def _coverage_findings(statements, findings_mod, *, today: date) -> list[dict] | None:
     """§15.4's `statement_missing`: which accounts stopped sending.
 
     Two rules, and the first is the one that matters. **An account that has
@@ -444,14 +588,16 @@ def _coverage_findings(statements, findings_mod, *, today: date) -> list[dict]:
 
     Second, wait out `_COVERAGE_GRACE_DAYS` after the month closes before
     asking, so the answer is "it never came" rather than "it is the 2nd".
+    Until then this returns None — "did not look" — never `[]`, which means
+    "looked, and nothing is missing".
     """
     month_start, month_end = _last_month(today)
     first_of_month = today.replace(day=1)
     if (today - first_of_month).days < _COVERAGE_GRACE_DAYS:
-        # Still inside the grace window: say nothing, and — crucially — hand the
-        # sweep no `statement_missing` findings, which resolves any that are
-        # open. That is correct: we are not currently claiming any are missing.
-        return []
+        # Still inside the grace window, so coverage was not evaluated, and None
+        # says so. `[]` here resolved every open `statement_missing` problem on
+        # the 1st of the month for the reason that nothing was checked (#491).
+        return None
     ever = {s.instrument for s in statements}
     # A statement covers a month when its period spans the MIDDLE of it. A
     # bank's billing period is its own business: HDFC bills the 5th to the 4th,
@@ -484,7 +630,9 @@ def _coverage_findings(statements, findings_mod, *, today: date) -> list[dict]:
     )
 
 
-async def _due_digest(pool: Any, findings_mod, run, *, today: date) -> str:
+async def _due_digest(
+    pool: Any, findings_mod, run, *, today: date, statements: Mapping[str, int] | None = None
+) -> str:
     """The digest, at most once a month (#464).
 
     §15.4 keeps `monthly_digest` as the periodic READ on how the lane is doing —
@@ -502,7 +650,7 @@ async def _due_digest(pool: Any, findings_mod, run, *, today: date) -> str:
     month = today.strftime("%Y-%m")
     if await pool.fetchval("SELECT value FROM settings WHERE key = $1", DIGEST_SETTING) == month:
         return ""
-    digest = findings_mod.monthly_digest(run, period=month)
+    digest = findings_mod.monthly_digest(run, period=month, statements=statements)
     await pool.execute(
         "INSERT INTO settings (key, value, updated_at) VALUES ($1, $2, NOW()) "
         "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()",

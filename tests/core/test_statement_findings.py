@@ -22,7 +22,7 @@ from aegis.services import hub_project, statements
 from aegis.services import statement_findings as sf
 from aegis.services.hub import close_problem, get_problem
 from aegis.services.statement_intake import MISFILED, UNREADABLE, FileOutcome, IntakeReport
-from aegis.services.statement_match import Candidate, match_statements
+from aegis.services.statement_match import Candidate, MatchRun, match_statements
 from aegis.services.statements import PARSED, StatementLocked
 
 pytestmark = pytest.mark.asyncio
@@ -498,6 +498,36 @@ async def test_a_kind_this_tick_did_not_evaluate_is_left_alone(db_pool):
     assert (await get_problem(db_pool, pid))["status"] == "open"
 
 
+async def test_a_class_this_tick_did_not_evaluate_is_left_alone(db_pool):
+    """#491, one level down. Coverage shares the instrument kind with the
+    matcher's classes, so a tick that skipped coverage cannot say so by
+    dropping the kind — that would stop `unmatched_rows` resolving too. It
+    names the class instead, and only that class is left alone."""
+    missing, unmatched = _instrument(), _instrument()
+    first = await _sweep(
+        db_pool,
+        [
+            sf.finding(sf.STATEMENT_MISSING, missing, f"No statement for {missing}"),
+            sf.finding(sf.UNMATCHED_ROWS, unmatched, f"3 unmatched rows on {unmatched}"),
+        ],
+    )
+    ids = {f["subject"]: f["problem_id"] for f in first[sf.INSTRUMENT]["fresh"]}
+
+    await _sweep(
+        db_pool,
+        [],
+        kinds=(sf.INSTRUMENT,),
+        unevaluated={sf.STATEMENT_MISSING},
+        now=NOW + timedelta(minutes=5),
+    )
+    assert (await get_problem(db_pool, ids[missing]))["status"] == "open"
+    assert (await get_problem(db_pool, ids[unmatched]))["status"] == "resolved"
+
+    # A tick that did look, and found nothing, ends it.
+    await _sweep(db_pool, [], kinds=(sf.INSTRUMENT,), now=NOW + timedelta(minutes=10))
+    assert (await get_problem(db_pool, ids[missing]))["status"] == "resolved"
+
+
 async def test_the_unmatched_count_falls_and_the_problem_resolves_at_zero(db_pool):
     """The recovery half, driven by real match runs: three rows nothing
     matched, then two rules land, then all three. The count in the title has to
@@ -851,3 +881,26 @@ def test_the_monthly_digest_reports_the_run_without_alerting():
     assert "axis-9640/locked.pdf" in text
     # Pure: same run in, same report out, and no database anywhere near it.
     assert sf.monthly_digest(run, report, period="2026-07") == text
+
+
+def test_the_digest_counts_the_statements_its_run_was_narrowed_from():
+    """The activity hands the digest only the statements the lane can still act
+    on, so in the goal state — everything in scope reconciled — the run is
+    empty, and the digest used to say it saw no statements at all. The counts
+    say what was narrowed away, and the empty state says it is good news."""
+    empty = MatchRun(outcomes=(), summaries=(), claimed={})
+
+    done = sf.monthly_digest(
+        empty, period="2026-10", statements={"reconciled": 11, "out_of_scope": 2, "open": 0}
+    )
+    assert "13 statements: 11 reconciled, 2 out of scope, 0 open" in done
+    assert "all in-scope statements reconcile with the books" in done
+    assert "no statements in this run" not in done
+
+    # An open statement whose every row the tick posted leaves the run empty
+    # too, and it has not reconciled — the digest must not say it has.
+    posted = sf.monthly_digest(
+        empty, period="2026-10", statements={"reconciled": 0, "out_of_scope": 0, "open": 1}
+    )
+    assert "1 statement: 0 reconciled, 0 out of scope, 1 open" in posted
+    assert "reconcile with the books" not in posted
