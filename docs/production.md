@@ -186,8 +186,11 @@ Point your alert sources at Core (all HMAC/secret-verified, auth-exempt):
   node/service transitions (source `aegis-heartbeat`)
 
 All of them feed `AlertInvestigationFlow` / the flows described in
-[`architecture/overview.md`](architecture/overview.md). Per-alert runbooks live in
-`runbooks/<AlertName>.md`, baked into the worker image.
+[`architecture/overview.md`](architecture/overview.md). Per-alert runbooks come
+from the `runbooks` table first (admin **Runbooks** page), then the generic
+`runbooks/<AlertName>.md` baked into the worker image. Write runbooks about your
+own setup into the table; see
+[`infrastructure.md`](infrastructure.md#the-runbook-an-investigation-reads).
 
 ## Life-data push (`POST /api/webhooks/life/{source}`)
 

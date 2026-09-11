@@ -711,8 +711,10 @@ key is pasted.)
      probed before each run and **fails closed** to the base host when
      unreachable. Leave empty to run kimi on the base host.
    - **AEGIS self-repo path** / **Runbooks dir** — used by the
-     `aegis_self_diagnose` chat tool and alert runbooks; usually fine left
-     empty (env/image defaults apply).
+     `aegis_self_diagnose` chat tool and the built-in alert runbook files;
+     usually fine left empty (env/image defaults apply). Runbooks you write
+     yourself go in the database instead: see "The runbook an investigation
+     reads" below.
 3. Save. The entry shows a **coding host** badge; runs pick the config up
    within ~30 s.
 4. **Register the repos the agent works on.** On the **Resources** page add a
@@ -834,6 +836,78 @@ Before the rule exports the location, a repo can claim by job name instead,
 `{"alert_labels": {"pipeline_name": ["etl_daily", "etl_weekly"]}}`. That list
 needs updating as jobs are added, and it cannot claim `__ASSET_JOB`, which
 has the same name in every code location.
+
+### The runbook an investigation reads
+
+Every alert investigation starts with the runbook for its alert name, put in
+front of the prompt, followed by what the knowledge store knows about past
+incidents (`AlertActivities.gather_alert_knowledge`). The worker looks for the
+runbook in this order:
+
+1. **The `runbooks` table.** Runbooks you write about your own setup: which
+   machines share a power supply, which service is pinned to which node, what
+   must never be restarted. Edit them on the admin **Runbooks** page or over
+   the API below.
+2. **`runbooks/<AlertName>.md`** from this repo, baked into the worker image
+   at `/app/runbooks` (or the coding host's **Runbooks dir**). These are
+   generic and host-free. A file that still says `TODO: fill in` is a stub
+   and counts as no runbook.
+
+A database error falls through to the file, with a `runbook_db_read_failed`
+warning in the worker log. A runbook is context for an investigation, never a
+gate on it.
+
+**Setup-specific runbooks belong in the table, not in `runbooks/`.** This repo
+is public, and a fork should not inherit your machine names or topology. A
+stored runbook replaces the file for that alert completely, so copy in any
+generic steps you want to keep.
+
+- **Names.** A runbook is keyed on its alert name with case and punctuation
+  removed, so `NodeDown`, `node-down`, `Node Down` and `node_down` are one
+  runbook. Use the alertname Prometheus sends, or the rule title for a Grafana
+  alert (`Dagster Pipeline Failure`).
+- **Limits.** A save answers 400 when the body is blank, still contains
+  `TODO: fill in`, or is longer than 16,000 characters. Every runbook is
+  prepended to a prompt, so keep it short: what the alert usually means on
+  your setup, the first few read-only checks, what not to do, and when to hand
+  it to a human.
+- **When it applies.** The worker reads the table on every investigation, so
+  a change applies to the next one; no restart. Saves and deletes are in the
+  audit log (`runbook_saved`, `runbook_deleted`).
+
+```bash
+# List them (names and sizes, no bodies)
+curl -sS -H "X-API-Key: $AEGIS_API_KEY" "$AEGIS_URL/api/admin/runbooks"
+
+# Read one. URL-encode the name: "Dagster Pipeline Failure" is Dagster%20Pipeline%20Failure
+curl -sS -H "X-API-Key: $AEGIS_API_KEY" "$AEGIS_URL/api/admin/runbooks/NodeDown"
+
+# Create or replace one from a Markdown file
+jq -Rs '{body: ., updated_by: "me"}' NodeDown.md |
+  curl -sS -X PUT "$AEGIS_URL/api/admin/runbooks/NodeDown" \
+    -H "X-API-Key: $AEGIS_API_KEY" -H 'Content-Type: application/json' --data-binary @-
+
+# Delete one. The built-in file, if there is one, applies again
+curl -sS -X DELETE -H "X-API-Key: $AEGIS_API_KEY" "$AEGIS_URL/api/admin/runbooks/NodeDown"
+```
+
+To load several at once from a file shaped `[{"name": "...", "body": "..."}]`:
+
+```bash
+jq -c '.[]' runbooks.json | while IFS= read -r rb; do
+  name=$(jq -r .name <<<"$rb")
+  code=$(jq '{body, updated_by: "runbooks.json"}' <<<"$rb" |
+    curl -sS -o /tmp/runbook-resp.json -w '%{http_code}' -X PUT \
+      "$AEGIS_URL/api/admin/runbooks/$(jq -rn --arg n "$name" '$n|@uri')" \
+      -H "X-API-Key: $AEGIS_API_KEY" -H 'Content-Type: application/json' --data-binary @-)
+  echo "$code $name"; [ "$code" = 200 ] || cat /tmp/runbook-resp.json
+done
+```
+
+Two things with similar names are not this. The `update_runbook` chat tool
+stores text in the knowledge store, where an investigation may find it through
+the prior-incident search, but it is never the runbook. And resources of kind
+`runbook` are not read by investigations at all.
 
 ### Session inventory
 

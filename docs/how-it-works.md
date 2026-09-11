@@ -495,9 +495,10 @@ The steps that make it trustworthy:
   against the `resources` table — which `workspace-repo-sync-daily` keeps
   mirroring your coding host's actual checkouts. No JIT cloning: a repo AEGIS
   doesn't have checked out falls back to LLM-only investigation.
-- **Context.** `runbooks/<AlertName>.md` (baked into the worker image;
-  `TODO: fill in` stubs are treated as absent) plus prior-incident context
-  from the knowledge store.
+- **Context.** The alert's runbook, from the `runbooks` table if you wrote
+  one (admin **Runbooks** page), else `runbooks/<AlertName>.md` baked into
+  the worker image (`TODO: fill in` stubs are treated as absent), plus
+  prior-incident context from the knowledge store.
 - **Investigation** runs your coding CLI (Claude Code / Kimi) over SSH on the
   registered coding host against the resolved repo, LLM-only as fallback, and
   ends in a structured verdict: `resolved` / `not_actionable` / `actionable` /
