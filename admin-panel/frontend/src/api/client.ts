@@ -119,6 +119,19 @@ export const api = {
   deleteResource: (id: string) =>
     apiFetch<any>(`/api/admin/resources/${id}`, { method: 'DELETE' }),
 
+  // Per-alert runbooks (the `runbooks` table). The worker reads these before
+  // the built-in runbooks/<AlertName>.md files. `name` is an alert name in any
+  // spelling, so it is always URL-encoded ("Dagster Pipeline Failure").
+  listRunbooks: () => apiFetch<any[]>('/api/admin/runbooks'),
+  getRunbook: (name: string) =>
+    apiFetch<any>(`/api/admin/runbooks/${encodeURIComponent(name)}`),
+  putRunbook: (name: string, body: string) =>
+    apiFetch<any>(`/api/admin/runbooks/${encodeURIComponent(name)}`, {
+      method: 'PUT', body: JSON.stringify({ body }),
+    }),
+  deleteRunbook: (name: string) =>
+    apiFetch<void>(`/api/admin/runbooks/${encodeURIComponent(name)}`, { method: 'DELETE' }),
+
   // People registry (life.people — name, aliases, relationship, key dates)
   listPeople: (q?: string) =>
     apiFetch<any[]>(`/api/admin/people${q ? `?q=${encodeURIComponent(q)}` : ''}`),

@@ -39,6 +39,7 @@ export const NAV: NavSection[] = [
       { path: '/channels', label: 'Channels', icon: 'channels' },
       { path: '/slack', label: 'Slack', icon: 'slack' },
       { path: '/resources', label: 'Resources', icon: 'resources' },
+      { path: '/runbooks', label: 'Runbooks', icon: 'alert' },
     ],
   },
   {
