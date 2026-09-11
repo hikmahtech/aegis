@@ -184,9 +184,6 @@ class StatementActivities:
             rates=rates,
         )
         outcomes = {o.row_id: o for o in run.outcomes}
-        # #470: keep the verdict, before anything acts on it. A record only —
-        # `record_outcomes` says why nothing may read it back.
-        await record_outcomes(self.db_pool, outcomes.values())
 
         scope = _Scope(since=date.fromisoformat(since) if since else None)
         done = {
@@ -195,6 +192,16 @@ class StatementActivities:
                 "SELECT statement_id FROM finance.statements WHERE reconciled_at IS NOT NULL"
             )
         }
+        # #470: keep the verdict, before anything acts on it — and only for a
+        # statement not yet reconciled. Once one is, its record is frozen: the
+        # matcher then sees the lane's own `stmt/` blocks as candidates, and its
+        # verdict describes that, not the row. A row matched to an email on the
+        # tick that posted came back the next day as ambiguous between that
+        # email and its neighbour's own block. A record only — `record_outcomes`
+        # says why nothing may read it back.
+        await record_outcomes(
+            self.db_pool, (o for o in outcomes.values() if o.statement_id not in done)
+        )
         posted = promoted = 0
         results: list[dict] = []
         for statement in statements:

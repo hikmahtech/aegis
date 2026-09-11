@@ -750,6 +750,48 @@ async def test_posted_at_marks_only_the_rows_this_lane_wrote(clean, tmp_path):
     assert at[stamped] == before
 
 
+async def test_a_reconciled_statements_record_survives_the_next_tick(clean, tmp_path):
+    """Once a statement reconciles, its record is frozen. The matcher still runs
+    over its rows every tick, and from then on it sees the lane's own `stmt/`
+    blocks as candidates: R1, matched to the email block on the tick that
+    posted, came back the next day ambiguous between that email and R2's own
+    block — the one fact #470 keeps, gone — and R2 read as skipped for
+    ambiguity while also posted."""
+    cfg = _repo(tmp_path)
+    await _indexed(clean, "st-e", "hdfc-1225", "2026-07-11", "437.19")
+    (cfg.path / "personal" / "2026.journal").write_text(
+        "; p\n\n"
+        "2026-07-11 ! Shop\n"
+        "    ; msgid: st-e\n"
+        "    ; channel: upi, instrument: hdfc-1225\n"
+        "    expenses:unknown          ₹437.19\n"
+        "    assets:bank:hdfc:1225    ₹-437.19\n"
+    )
+    subprocess.run(
+        ["git", "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qam", "seed"],
+        cwd=cfg.path, check=True,
+    )
+    sid = await _statement(clean, "hdfc-1225", "2026-07-01", "2026-07-31", "0", "-874.38", 2)
+    r1 = await _row(clean, "hdfc-1225", "2026-07-12", "out", "437.19", "UPI SHOP", sid, "-437.19")
+    r2 = await _row(
+        clean, "hdfc-1225", "2026-07-13", "out", "437.19", "UPI OTHER", sid, "-874.38"
+    )
+    sql = (
+        "SELECT row_id, matched_msgid, candidates, skip_reason, posted_at "
+        "FROM finance.statement_rows WHERE row_id = ANY($1::text[])"
+    )
+
+    first = await ActivityEnvironment().run(_act(clean, cfg).reconcile_statements, True, "")
+    assert [r["status"] for r in first["results"]] == ["posted"], first
+    tick1 = {r["row_id"]: dict(r) for r in await clean.fetch(sql, [r1, r2])}
+    assert tick1[r1]["matched_msgid"] == "st-e"
+    assert tick1[r2]["posted_at"] is not None
+
+    await ActivityEnvironment().run(_act(clean, cfg).reconcile_statements, True, "")
+
+    assert {r["row_id"]: dict(r) for r in await clean.fetch(sql, [r1, r2])} == tick1
+
+
 def _on(monkeypatch, day: date) -> None:
     """Stand the activity on `day`: its `date.today()` answers `day`. Threading
     a clock through the activity's arguments would change the schedule's
