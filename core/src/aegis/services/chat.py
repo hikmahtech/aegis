@@ -1626,6 +1626,20 @@ async def _exec_investigate_resource(pool: asyncpg.Pool, args: dict, ctx: ToolCo
         "requires_approval": False,
         "todoist_task_id": task_id,
     }
+    # The task's own problem, when it has a live one (#472): named, the flow's
+    # step 0 records on it; unnamed, it ingested a fresh event, created a
+    # second problem and linked this task to both. A closed problem is
+    # history, so that task starts fresh. The lookup only enriches the run,
+    # so a failure starts it the old way rather than not at all.
+    try:
+        from aegis.services.hub import find_problem_for_task
+
+        problem = await find_problem_for_task(pool, task_id)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("investigate_resource_problem_lookup_failed", error=str(exc)[:200])
+        problem = None
+    if problem is not None and problem["closed_at"] is None:
+        alert["problem_id"] = problem["id"]
     try:
         await ctx.temporal_client.start_workflow(
             "AlertInvestigationFlow",

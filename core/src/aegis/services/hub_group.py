@@ -29,6 +29,14 @@ Three rules keep the grouping honest:
   events, links and sessions move onto the group, their tasks are retired with
   a note pointing at it, and the links read both ways. An operator can see
   every member the group swallowed and unpick it by hand.
+
+One fold needs no judge: a **stray**. `ingest_event` absorbs a new subject
+into its class's group, but a subject whose own problem still exists — it
+recovered while the group formed, then came back and reopened — keeps that
+problem, and a single stray is never three of a kind again. :func:`candidates`
+folds such strays into their group before it looks for clusters
+(:func:`absorb_strays`). The group already stands for the class, so this is
+the decision `ingest_event` would have made, not a new one.
 """
 
 from __future__ import annotations
@@ -39,9 +47,12 @@ from typing import Any
 import asyncpg
 import structlog
 
+from aegis.connectors.todoist import TodoistConnector
+from aegis.services import hub_project
 from aegis.services.hub import (
     GROUP_SUBJECT,
     LIVE_STATUSES,
+    TASK_SUBJECT_KIND,
     group_correlation_key,
     group_key,
     merge_problems,
@@ -109,6 +120,119 @@ def worst(severities: list[str]) -> str:
     return max(ranked, key=_SEVERITY_ORDER.index)
 
 
+async def absorb_strays(
+    pool: asyncpg.Pool,
+    *,
+    hours: float = WINDOW_HOURS,
+    by: str = "hub-sweep",
+    now: datetime | None = None,
+) -> list[dict[str, Any]]:
+    """Fold every live, ungrouped problem into the live group of its class and
+    subject kind, and retire its task (#474).
+
+    Deterministic, with no judge: the group already stands for the class, and
+    `ingest_event` gives it every NEW subject without asking. A stray is a
+    subject that missed that only because its own problem was live, or came
+    back, when the group formed. Leaving it is two open tasks for one
+    condition.
+
+    The fences are the ones the judge's :func:`candidates` keeps, and one more
+    because nothing reviews this fold:
+
+    * one class and one subject kind, never across either;
+    * never class ``manual`` or kind ``task`` (hand-written tasks and reports
+      about one task — `hub.group_key` refuses both);
+    * never a problem from a :data:`NON_GROUPABLE_SOURCES` source (money);
+    * only a stray seen inside the same window the judge looks at;
+    * only into a group that is itself live and visible — never ``resolved``
+      or ``suppressed``. The merge keeps the group's status, so folding a
+      live stray into either would hide it.
+
+    Returns one entry per group that took strays.
+    """
+    now = now or _utcnow()
+    since = now - timedelta(hours=max(float(hours), 0.0))
+    rows = await pool.fetch(
+        "SELECT g.id::text AS group_id, g.class, g.subject_kind, g.title, "
+        "       COALESCE(g.todoist_task_id, '') AS group_task, "
+        "       array_agg(p.id::text ORDER BY p.first_seen_at) AS member_ids "
+        "FROM problems g JOIN problems p "
+        "  ON p.class = g.class AND p.subject_kind = g.subject_kind AND p.id <> g.id "
+        "WHERE g.group_key IS NOT NULL AND g.closed_at IS NULL AND g.status = ANY($1::text[]) "
+        "  AND p.group_key IS NULL AND p.closed_at IS NULL AND p.status = ANY($2::text[]) "
+        "  AND p.class <> 'manual' AND p.subject_kind <> $3 AND p.subject <> '' "
+        "  AND p.last_seen_at >= $4 "
+        "  AND NOT EXISTS (SELECT 1 FROM problem_events e "
+        "                  WHERE e.problem_id IN (p.id, g.id) AND e.source = ANY($5::text[])) "
+        "GROUP BY 1, 2, 3, 4, 5 ORDER BY 1",
+        sorted(LIVE_STATUSES - {"suppressed"}),
+        sorted(LIVE_STATUSES),
+        TASK_SUBJECT_KIND,
+        since,
+        sorted(NON_GROUPABLE_SOURCES),
+    )
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        try:
+            result = await upgrade(
+                pool,
+                klass=row["class"],
+                subject_kind=row["subject_kind"],
+                # Empty: the group keeps the title somebody already gave it.
+                title="",
+                member_ids=list(row["member_ids"]),
+                by=by,
+                reason="still live when the group formed, so it kept its own problem",
+                now=now,
+            )
+        except ValueError as exc:  # a class the hub will not group: leave it
+            logger.warning(
+                "hub_group_absorb_refused", group_id=row["group_id"], error=str(exc)[:200]
+            )
+            continue
+        # A stray that shares the group's own task (one task linked to two
+        # problems, #472) must not close the task the group still needs.
+        tasks = [
+            m["task_id"] for m in result["merged"] if m["task_id"] not in ("", row["group_task"])
+        ]
+        retired = sum([await _retire(pool, t, row["title"]) for t in tasks])
+        out.append({**result, "tasks_retired": retired})
+        logger.info(
+            "hub_group_strays_absorbed",
+            problem_id=result["problem_id"],
+            group_key=result["group_key"],
+            absorbed=[m["problem_id"] for m in result["merged"]],
+            tasks_retired=retired,
+        )
+    return out
+
+
+async def _retire(pool: asyncpg.Pool, task_id: str, title: str) -> bool:
+    """Retire a folded stray's task: a note saying where the work went, then
+    the completion. True when the completion queued.
+
+    Both go through the outbox rather than a live Todoist call, because this
+    runs inside the sweep's candidate step, which has a 15-second budget and
+    is meant to be a query. The note carries the hub's footer, so clarify's
+    loop guard reads it as the hub talking, not a user. A task still known
+    only by its outbox temp id cannot take a comment yet, so it is left for
+    a person to close.
+    """
+    if task_id.startswith("item-"):
+        logger.warning("hub_group_absorb_task_pending_outbox", task_id=task_id)
+        return False
+    note = (
+        f"Folded into one problem: {title or 'the group for this class'}. Work it there. "
+        "This one was still open when the group formed, so it had kept its own task."
+    )
+    await hub_project._queue(
+        pool,
+        f"problem-fold-{task_id}",
+        TodoistConnector.build_note_add_command(task_id, note + hub_project.FOOTER),
+    )
+    return await hub_project._complete_task(pool, task_id)
+
+
 async def candidates(
     pool: asyncpg.Pool,
     *,
@@ -120,9 +244,13 @@ async def candidates(
     and a subject kind across at least ``min_members`` different subjects.
 
     Each cluster carries its members so a judge can read the titles rather
-    than the count. Never decides anything.
+    than the count. It decides nothing about them — but first it folds the
+    strays of groups that already exist (:func:`absorb_strays`), a decision
+    made when the group formed. That is also why a stray is never counted
+    towards a new cluster of its own class.
     """
     now = now or _utcnow()
+    await absorb_strays(pool, hours=hours, now=now)
     since = now - timedelta(hours=max(float(hours), 0.0))
     floor = max(2, int(min_members))
     rows = await pool.fetch(
@@ -139,6 +267,10 @@ async def candidates(
     )
     out: list[dict[str, Any]] = []
     for row in rows:
+        gkey = group_key(row["class"], row["subject_kind"])
+        if not gkey:
+            # A kind the hub never groups (`task`): no judge should be asked.
+            continue
         members = [
             dict(m)
             for m in await pool.fetch(
@@ -160,7 +292,7 @@ async def candidates(
             {
                 "class": row["class"],
                 "subject_kind": row["subject_kind"],
-                "group_key": group_key(row["class"], row["subject_kind"]),
+                "group_key": gkey,
                 "members": members,
                 "member_count": len(members),
             }
@@ -232,6 +364,7 @@ async def upgrade(
     title: str,
     member_ids: list[str],
     by: str,
+    reason: str = "",
     now: datetime | None = None,
 ) -> dict[str, Any]:
     """Fold ``member_ids`` into one group problem for this class and kind.
@@ -244,7 +377,8 @@ async def upgrade(
 
     Re-runnable: called again with more members it folds them into the group
     that already exists. Raises ValueError when there is nothing to group or
-    the class and kind cannot form a group key.
+    the class and kind cannot form a group key. ``reason``, when given, is
+    written on the `grouped` event beside who did it.
     """
     now = now or _utcnow()
     gkey = group_key(klass, subject_kind)
@@ -331,6 +465,7 @@ async def upgrade(
             "title": title,
             "members": folded[:50],
             "member_count": len(folded),
+            **({"reason": reason[:300]} if reason else {}),
         },
         now,
     )

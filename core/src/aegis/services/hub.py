@@ -61,6 +61,9 @@ REOPEN_WINDOW = timedelta(hours=24)
 # The subject a group problem carries. `_slug` can only produce `[a-z0-9-]`,
 # so no real subject can ever collide with a group's correlation key.
 GROUP_SUBJECT = "*"
+# The subject kind of a report about one Todoist task that names nothing else
+# (`event_from_alert`). Never groupable: each is one person's report.
+TASK_SUBJECT_KIND = "task"
 
 # Closed vocabularies. A producer outside these is a wiring mistake, and the
 # route turns the ValueError into a 400 rather than minting a problem of an
@@ -268,7 +271,7 @@ def group_key(klass: str, subject_kind: str) -> str:
     on what the failure is and what kind of thing it happens to, never on
     which entity it happened to this time.
 
-    ``''`` — not groupable — in three cases, and each one matters:
+    ``''`` — not groupable — in four cases, and each one matters:
 
     * no subject kind: there is no "many entities" to speak of;
     * no class: an event the hub could not classify is the last thing that
@@ -277,11 +280,15 @@ def group_key(klass: str, subject_kind: str) -> str:
       mints for a hand-written task, whose subject is the task itself. Three
       open ``@code`` tasks are three pieces of work, never one condition, and
       folding them would move one task's sessions, PRs and comments onto
-      another.
+      another;
+    * subject kind ``task``: the same thing reached from the other side — a
+      report keyed on the Todoist task it came from (`event_from_alert`).
+      Three people's "noon is down" tasks are three reports, and a group
+      would close two of them and swallow the next one's investigation.
     """
     k = _slug(klass)
     kind = _slug(subject_kind)
-    if not k or k == "manual" or not kind:
+    if not k or k == "manual" or not kind or kind == TASK_SUBJECT_KIND:
         return ""
     return f"{k}:{kind}"
 
@@ -931,6 +938,16 @@ def event_from_alert(
         else:
             subject = str(alert.get("service") or "").strip()
             subject_kind = "service" if subject else ""
+    task_id = str(alert.get("todoist_task_id") or "").strip()
+    if not subject and task_id:
+        # A report about one Todoist task that names nothing else — clarify's
+        # content-route alerts, whose class comes from the route. With no
+        # subject it was keyed `nodedown::`, so every such report attached to
+        # the first one and the hub answered "a repeat, don't investigate"
+        # (#472). The task is the one thing it is certainly about. Only this
+        # shape moves: an alertmanager rule or a Sentry issue with no subject
+        # carries no task and keeps its one key per class.
+        subject, subject_kind = task_id, TASK_SUBJECT_KIND
 
     if source == "sentry":
         # An issue reaches the hub twice — webhook and the 30-min poll — with

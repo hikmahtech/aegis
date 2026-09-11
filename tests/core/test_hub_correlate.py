@@ -185,6 +185,60 @@ def test_alert_with_no_fingerprint_gets_a_title_slug_id():
     assert correlation_key(e) == ""
 
 
+# --- a synthetic alert raised about one Todoist task (#472) --------------------
+
+
+def _route_alert(task_id: str, **over) -> dict:
+    """What clarify's `_pandora_alert_payload` builds for a task matching the
+    prod `infra-incident` content route: the class comes from the route's
+    `alert_overrides`, there is no service, and the alert names its task."""
+    alert = {
+        "title": "Swarm node wow down",
+        "description": "",
+        "source": "todoist-infra",
+        "severity": "normal",
+        "fingerprint": f"route-{task_id}",
+        "labels": {"alertname": "NodeDown"},
+        "requires_approval": False,
+        "todoist_task_id": task_id,
+    }
+    alert.update(over)
+    return alert
+
+
+def test_a_subject_less_alert_about_a_task_is_keyed_on_that_task():
+    e = event_from_alert(_route_alert("6hVCprQ748qX4CHv"), occurred_at=T0)
+    assert (e.subject, e.subject_kind) == ("6hVCprQ748qX4CHv", "task")
+    assert correlation_key(e) == "nodedown:task:6hvcprq748qx4chv"
+
+
+def test_two_tasks_about_different_incidents_do_not_share_a_key():
+    """The prod collision: both of these were keyed `nodedown::`, so the wow
+    node-down attached to the aegis_core problem and nobody saw it."""
+    core = _key(_route_alert("6hRh2fhJQjpFFgCv", title="Service aegis_core down"))
+    wow = _key(_route_alert("6hVCprQ748qX4CHv"))
+    assert core != wow
+    assert "nodedown::" not in (core, wow)
+
+
+def test_a_task_never_replaces_a_real_subject():
+    # A route that names a service, and `investigate_resource`, which names a
+    # repo, keep keying on it: the task is only the subject of last resort.
+    alert = _route_alert(
+        "6hRh2fhJQjpFFgCv", service="acme", labels={"alertname": "NodeDown", "service": "acme"}
+    )
+    e = event_from_alert(alert, occurred_at=T0)
+    assert (e.subject, e.subject_kind) == ("acme", "service")
+
+
+def test_a_subject_less_alert_with_no_task_keeps_one_key_per_class():
+    """A class with genuinely no subject — an aggregate alertmanager rule, a
+    Sentry issue with no project — must keep sharing one key. Giving it the
+    empty key would open a new problem, and a new task, on every firing."""
+    assert _key(_alertmanager("WatchdogAggregate")) == "watchdogaggregate::"
+    assert _key(_sentry("4711", "IncompatiblePeer", slug="")) == "incompatiblepeer::"
+
+
 def test_alert_payload_is_bounded():
     a = _alertmanager("X", service_name="s")
     a["description"] = "d" * 5000

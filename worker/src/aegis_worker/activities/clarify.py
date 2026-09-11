@@ -36,6 +36,15 @@ Content-route classifications:
   only the GTD state stamp below; log_classification still bumps
   last_clarified_at so the task drops out of find_unclassified_items.
 
+- `hub_owned` — a task the problem hub owns (#472) whose title matches a
+  route. The hub projects its `#alert` tasks into the Inbox, and a route like
+  `infra-incident` matches their titles; investigating one again started a
+  second investigation and a second problem for an incident the hub was
+  already handling. The hub decides whether a problem is investigated, so
+  this outcome starts nothing and only stamps the GTD state. A user's comment
+  on such a task is still `pandora_followup`, investigated on the task's own
+  problem.
+
 Any task carrying @me — set on a gate card or by hand — is skipped by
 find_unclassified_items entirely: the user's "hands off, I'm on it" signal.
 
@@ -56,6 +65,7 @@ from datetime import datetime, time
 from zoneinfo import ZoneInfo
 
 from aegis.llm import parse_llm_json
+from aegis.services import hub
 from aegis.services.content_routes import (
     active_patterns,
     match_route,
@@ -67,6 +77,7 @@ from aegis.services.gtd_rules import (
     DEFAULT_SKIP_INBOX,
     get_gtd_rules,
 )
+from aegis.services.hub_project import SOURCE_TAG as HUB_SOURCE_TAG
 from aegis.services.knowledge import _content_id_for
 
 
@@ -281,6 +292,11 @@ _GTD_STATE_FOR: dict[str, str | None] = {
     # Claimed by a prior investigation and still open — the single largest limbo
     # bucket in production (49/66 all-time).
     "pandora_owned": _LABEL_NEXT,
+    # The hub's own task (#472): an open problem assigned to the infra agent.
+    # The projector creates it with `#alert` and the agent label only, so this
+    # is the one write clarify owes it. Skipped when the task already has a
+    # state — an investigation that parked it on a card left it `@waiting`.
+    "hub_owned": _LABEL_NEXT,
     "pandora_followup": _LABEL_NEXT,
     # -- deliberately parked --------------------------------------------------
     "someday": _LABEL_SOMEDAY,
@@ -557,6 +573,20 @@ class ClarifyActivities:
                                 AND wr.status = 'completed'
                                 AND wr.workflow_id LIKE '%' || t.id || '%'
                           )
+                          -- Not a task the problem hub owns (#472). Its
+                          -- investigations are named for the problem, never
+                          -- the task, so the check above never saw one and
+                          -- re-admitted every open hub task each hour — and
+                          -- classify_one would only answer `hub_owned`. Same
+                          -- test as `_hub_owns`: the tag, or a problem.
+                          AND t.source_tag IS DISTINCT FROM $7
+                          AND NOT EXISTS (
+                              SELECT 1 FROM problems p WHERE p.todoist_task_id = t.id
+                          )
+                          AND NOT EXISTS (
+                              SELECT 1 FROM problem_links pl
+                              WHERE pl.link_kind = 'todoist_task' AND pl.ref = t.id
+                          )
                       )
                   )
                   AND (
@@ -647,8 +677,52 @@ class ClarifyActivities:
                 AGENT_REPLY_SQL_LIKE,
                 AGENT_REPLY_ERROR_SQL_LIKE,
                 patterns,
+                HUB_SOURCE_TAG,
             )
         return [dict(r) for r in rows]
+
+    async def _hub_owns(self, task: dict) -> bool:
+        """Whether the problem hub owns this task (#472): the hub projected it
+        (`#alert`), or some problem holds it (`hub.find_problem_for_task`).
+
+        The tag is the cheap signal and also the only one for a task created
+        through the outbox, which is linked by its temp id until the projector
+        swaps in the real one. The problem covers a task the hub adopted — a
+        hand-captured task whose first investigation gave it a problem.
+
+        A lookup error is raised, not guessed: the flow skips the task without
+        moving its watermark and retries it next tick, where guessing "owned"
+        would lose its gate card for good and guessing "not owned" is the bug.
+        """
+        if (task.get("source_tag") or "") == HUB_SOURCE_TAG:
+            return True
+        if self.db_pool is None or not task.get("id"):
+            return False
+        return await hub.find_problem_for_task(self.db_pool, str(task["id"])) is not None
+
+    @staticmethod
+    def _hub_owned(reason: str) -> dict:
+        return {
+            "classification": "hub_owned",
+            "confidence": 1.0,
+            # The hub assigned it when it projected the task; clarify names
+            # nobody.
+            "assignee": None,
+            "contexts": [],
+            "reason": reason,
+            "llm_model": "rules",
+        }
+
+    async def _live_problem_id(self, task_id: str) -> str | None:
+        """The id of the problem a task belongs to, when that problem is not
+        closed. A closed problem is history, so the caller starts fresh — the
+        rule `hub_project.ensure_problem_for_task` keeps."""
+        if self.db_pool is None or not task_id:
+            return None
+        problem = await hub.find_problem_for_task(self.db_pool, task_id)
+        if problem is None or problem["closed_at"] is not None:
+            return None
+        return problem["id"]
 
     async def _has_completed_pandora_investigation(self, task_id: str) -> bool:
         """Return True iff at least one AlertInvestigationFlow run for
@@ -861,6 +935,17 @@ class ClarifyActivities:
             # written on success, so re-running a failed investigation isn't
             # blocked.
             if match_route(content, routes) is not None:
+                # Unless the hub owns the task (#472). Its own `#alert` tasks
+                # carry @pandora and match routes like `infra-incident`, and no
+                # investigation id names the task, so this branch called every
+                # one a crashed investigation and started a second one — with
+                # no problem id, so it ingested a fresh event and minted a
+                # second problem for the same incident. Whether a problem is
+                # investigated is the hub's call, made when the event came in.
+                if await self._hub_owns(task):
+                    return self._hub_owned(
+                        "the problem hub owns this task and decides its investigation"
+                    )
                 investigated = await self._has_completed_pandora_investigation(task["id"])
                 if not investigated:
                     return {
@@ -911,6 +996,14 @@ class ClarifyActivities:
         matched = match_route(content, routes)
         if matched is not None:
             if matched.get("gate", True):
+                # A hub task without @pandora (a fork whose infra agent has
+                # another alias, or a label removed by hand) would get a card
+                # asking whether to investigate an incident the hub is already
+                # investigating — and "yes" leads to the branch above (#472).
+                if await self._hub_owns(task):
+                    return self._hub_owned(
+                        "the problem hub owns this task; no card for its investigation"
+                    )
                 return {
                     "classification": "pandora_gate",
                     "confidence": 1.0,
@@ -1071,12 +1164,15 @@ class ClarifyActivities:
         service: str | None = None,
         resource_tags: list[str] | None = None,
         alert_overrides: dict | None = None,
+        problem_id: str | None = None,
     ) -> dict:
         """Build the AlertInvestigationFlow spawn payload for a content-route
         investigation. Shared by the pandora_investigation and pandora_followup
         branches — they differ only in `description`/`fingerprint`; `service`
         and `resource_tags` come from the matched content route (both optional —
-        omit to let the investigation repo-match unscoped).
+        omit to let the investigation repo-match unscoped). `problem_id` names
+        the problem the task already belongs to, so the flow records on it
+        instead of ingesting a new event.
 
         `source` stays "todoist-jira": AlertInvestigationFlow treats that value
         as a scoping-only contract (investigate + comment, never an autonomous
@@ -1106,6 +1202,8 @@ class ClarifyActivities:
                 labels["alertname"] = v
             elif k in ("source", "severity"):
                 alert[k] = v
+        if problem_id:
+            alert["problem_id"] = problem_id
         return {"spawn_kind": "pandora_investigation", "alert": alert}
 
     def _build_agent_synthetic_input(
@@ -1440,6 +1538,23 @@ class ClarifyActivities:
                 "outbox_queued": 0,
             }
 
+        # The hub's task (#472): start nothing, owe only the GTD state. Unlike
+        # pandora_owned, a state the task already carries is kept — a hub task
+        # an investigation parked on a decision card is @waiting, and @next on
+        # top of it would give it two states. `applied` either way, so the flow
+        # moves the watermark and the task leaves the queue.
+        if classification == "hub_owned":
+            sent = 0
+            if not set(existing_labels) & set(GTD_STATE_LABELS):
+                sent = await self._stamp_gtd_state(item_id, existing_labels, classification)
+            return {
+                "applied": True,
+                "interaction_spawned": False,
+                "interaction_payload": None,
+                "commands_sent": sent,
+                "outbox_queued": 0,
+            }
+
         if classification == "trash":
             commands.append(
                 TodoistConnector.build_item_update_command(
@@ -1542,6 +1657,11 @@ class ClarifyActivities:
                 service=_route.get("service"),
                 resource_tags=_route.get("resource_tags"),
                 alert_overrides=_route.get("alert_overrides"),
+                # The comment is about the problem this task already belongs
+                # to (#472). Named, the investigation's step 0 skips ingest;
+                # unnamed, it ingested a fresh event, minted a second problem
+                # and linked this task to both.
+                problem_id=await self._live_problem_id(item_id),
             )
             interaction_spawned = True
             # No commands to send — labels already include @pandora. We
