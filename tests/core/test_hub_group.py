@@ -133,6 +133,34 @@ async def test_a_no_stands_until_the_cluster_grows(db_pool):
     assert (await recent_verdict(db_pool, gkey, 3, now=NOW + timedelta(days=2))) is None
 
 
+async def test_a_hand_written_verdict_holds_for_a_day_and_a_bad_one_is_ignored(db_pool):
+    """The runbook tells an operator to write a "no" by hand, with SQL that
+    stores `now()::text`. That shape must hold the cluster off — for 24 hours,
+    not for good, whatever `member_count` says — and a verdict nobody can read
+    must mean "ask the judge", never a crashed sweep."""
+
+    async def hand_write(gkey: str, decided_at: str) -> None:
+        await db_pool.execute(
+            "INSERT INTO settings (key, value) VALUES ('hub_group_verdicts', "
+            "jsonb_build_object($1::text, jsonb_build_object('decided_at', $2::text, "
+            "'grouped', false, 'member_count', 999, 'reason', 'operator'))) "
+            "ON CONFLICT (key) DO UPDATE SET value = settings.value || excluded.value",
+            gkey,
+            decided_at,
+        )
+
+    as_postgres_writes_it, naive, garbled = (f"{_klass()}:post" for _ in range(3))
+    await hand_write(as_postgres_writes_it, "2026-09-08 12:00:00.123456+00")
+    await hand_write(naive, "2026-09-08T12:00:00")
+    await hand_write(garbled, "yesterday-ish")
+
+    for gkey in (as_postgres_writes_it, naive):
+        assert (await recent_verdict(db_pool, gkey, 50, now=NOW + timedelta(hours=23))) is not None
+        assert (await recent_verdict(db_pool, gkey, 50, now=NOW + timedelta(hours=25))) is None
+    assert (await recent_verdict(db_pool, garbled, 3, now=NOW)) is None
+    assert (await recent_verdict(db_pool, f"{_klass()}:post", 3, now=NOW)) is None
+
+
 # --- folding ----------------------------------------------------------------
 
 
