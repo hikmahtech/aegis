@@ -21,7 +21,7 @@ import asyncio
 import csv
 import io
 import time
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime, timedelta
 
 import httpx
 import structlog
@@ -199,3 +199,59 @@ class FinanceConnector(HTTPConnector):
         """Quotes for the configured market-overview indices."""
         symbols = [s.strip() for s in self._indices.split(",") if s.strip()]
         return await self.get_quotes(symbols)
+
+    async def daily_bars(self, symbol: str, start: date, end: date) -> list[dict]:
+        """Daily bars from Yahoo, oldest first, for the trading desk.
+
+        Each bar is ``{"day", "close", "split_ratio", "dividend"}``. Yahoo rewrites
+        a past ``close`` after a later split, so a caller that needs the traded
+        price keeps the first value it sees (the desk does). ``[]`` when Yahoo
+        has no data for the symbol; raises on any other HTTP or network error.
+        """
+        client = await self._ensure_client()
+        t0 = time.monotonic()
+        params = {
+            "interval": "1d",
+            "period1": int(datetime.combine(start, datetime.min.time(), UTC).timestamp()),
+            "period2": int(datetime.combine(end + timedelta(days=1), datetime.min.time(), UTC).timestamp()),
+            "events": "div,split",
+        }
+        try:
+            resp = await client.get(_YAHOO_CHART_URL.format(symbol=symbol), params=params)
+            if resp.status_code == 404:
+                await self._record("daily_bars", "ok", int((time.monotonic() - t0) * 1000))
+                return []
+            resp.raise_for_status()
+        except httpx.HTTPError as exc:
+            await self._record("daily_bars", "error", int((time.monotonic() - t0) * 1000), str(exc)[:200])
+            raise
+        await self._record("daily_bars", "ok", int((time.monotonic() - t0) * 1000))
+        result = ((resp.json() or {}).get("chart") or {}).get("result") or []
+        if not result:
+            return []
+        chart = result[0]
+        offset = int((chart.get("meta") or {}).get("gmtoffset") or 0)
+
+        def day_of(ts: object) -> date:
+            return datetime.fromtimestamp(int(ts) + offset, UTC).date()
+
+        closes = (((chart.get("indicators") or {}).get("quote") or [{}])[0]).get("close") or []
+        bars: dict[date, dict] = {}
+        for ts, close in zip(chart.get("timestamp") or [], closes, strict=False):
+            day = day_of(ts)
+            bars[day] = {
+                "day": day,
+                "close": float(close) if close is not None else None,
+                "split_ratio": None,
+                "dividend": None,
+            }
+        events = chart.get("events") or {}
+        for ev in (events.get("splits") or {}).values():
+            day, den = day_of(ev["date"]), float(ev.get("denominator") or 0)
+            if day in bars and den:
+                bars[day]["split_ratio"] = float(ev["numerator"]) / den
+        for ev in (events.get("dividends") or {}).values():
+            day = day_of(ev["date"])
+            if day in bars:
+                bars[day]["dividend"] = float(ev["amount"])
+        return [bars[d] for d in sorted(bars)]
