@@ -518,7 +518,9 @@ activities:
 
   # Pandora — nightly retention prune for unbounded ops tables.
   # Defaults from worker/src/aegis_worker/flows/cleanup.py::_DEFAULT_RETENTIONS.
-  # Override per-table via config.retentions if needed.
+  # Override per-table via config.retentions if needed. The other windows, in
+  # days, 0 = off: dispatch_days (30), interaction_orphan_days (7),
+  # task_session_days (7), problem_close_days (7; fractions allowed).
   - slug: cleanup-daily
     workflow_type: CleanupFlow
     agent_id: pandoras-actor

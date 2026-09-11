@@ -956,7 +956,10 @@ them code:
 - **`activities.config` for `cleanup-daily`** — `task_session_days` (default
   7). A session whose task is completed or gone, and idle that long, has its
   worktree removed and its row deleted by `CleanupFlow`. The branch stays; it
-  may back an open PR. Set to 0 to disable.
+  may back an open PR. Set to 0 to disable. The same row carries the flow's
+  other windows, each 0 to disable: `problem_close_days` (7, fractions
+  allowed — how long a resolved problem keeps its key before it closes),
+  `interaction_orphan_days` (7) and `dispatch_days` (30).
 
 Optionally grant the `comment_on_task` tool. A turn does **not** need it — a
 turn's own reply is posted by the flow's `comment` activity, and the tool is
