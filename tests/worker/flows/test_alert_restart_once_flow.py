@@ -79,7 +79,8 @@ async def test_a_restart_that_did_not_stick_is_not_restarted_again():
     assert repeat["payload"]["restart_repeat"]["diagnostics_then"] == _THEN
     # ...and on the task, with the evidence a person needs.
     note = S.notes[0][1]
-    assert "came back" in note and "not restarting it again" in note
+    assert "is down again, 10.2 min after the automatic restart" in note
+    assert "not restarting it again" in note
     assert "insufficient resources on 3 nodes" in note
     assert "scheduling constraints not satisfied" in note
     # The investigation is told a plain restart has already failed.

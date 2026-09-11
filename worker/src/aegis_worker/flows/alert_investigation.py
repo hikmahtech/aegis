@@ -127,8 +127,10 @@ def _restart_repeat_lines(rr: dict) -> tuple[str, list[str], list[str]]:
     service = rr.get("service") or "the service"
     at = str(rr.get("restarted_at") or "")[:16].replace("T", " ")
     outcome = "it recovered" if rr.get("recovered") else "it did not recover"
+    # "Down again", not "came back": of a service, that reads as recovered.
+    # And the minutes are to now, not to when it broke.
     head = (
-        f"{service} came back {rr.get('minutes_ago', '?')} min after the automatic "
+        f"{service} is down again, {rr.get('minutes_ago', '?')} min after the automatic "
         f"restart at {at} UTC ({rr.get('command') or 'docker service update --force'}; "
         f"{outcome})."
     )
@@ -180,9 +182,9 @@ def _restart_repeat_context(rr: dict) -> str:
     head, then, now = _restart_repeat_lines(rr)
     lines = [
         f"CONTEXT: AEGIS force-restarted this service {rr.get('minutes_ago', '?')} min "
-        f"ago and it came back. {head} Do not recommend another plain restart; find "
-        "out why it does not stay up (placement constraints, resources, a crash on "
-        "start) and what would fix that.",
+        f"ago and it is down again. {head} Do not recommend another plain restart; "
+        "find out why it does not stay up (placement constraints, resources, a crash "
+        "on start) and what would fix that.",
     ]
     if then:
         lines += ["docker service ps after that restart:", *[f"- {line}" for line in then]]
@@ -685,8 +687,8 @@ class AlertInvestigationFlow:
                 restart_repeat = await self._recent_auto_restart(problem_id, alert)
             if restart_repeat is not None:
                 await self._safe_event(
-                    f"🔁 {_html_escape(str(restart_repeat.get('service') or title))} came back "
-                    f"after its automatic restart — not restarting it again."
+                    f"🔁 {_html_escape(str(restart_repeat.get('service') or title))} is down "
+                    f"again after its automatic restart — not restarting it again."
                 )
                 # Todoist comments are plain text, like the verdict comment.
                 await self._safe_post_note(track_task_id or "", _restart_repeat_note(restart_repeat))
