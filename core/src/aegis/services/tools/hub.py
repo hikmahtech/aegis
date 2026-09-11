@@ -351,16 +351,10 @@ async def _exec_merge_problems(
         f"the kept problem is now {kept['status'] if kept else 'unknown'} with "
         f"{kept['occurrences'] if kept else '?'} occurrences."
     ]
-    merged_task = result.get("merged_task_id") or ""
-    keep_task = str((kept or {}).get("todoist_task_id") or "")
-    if merged_task and merged_task != keep_task:
-        retired = await hub_project.retire_task(
-            pool,
-            merged_task,
-            f"Merged into problem {keep}" + (f" (task {keep_task})" if keep_task else "") + ".",
-            settings=ctx.settings,
-        )
+    retired = await hub_project.retire_merged_task(pool, result, settings=ctx.settings)
+    if retired is not None:
         lines.append(
-            f"Task {merged_task} {'completed' if retired else 'could not be completed'} with a note."
+            f"Task {result['merged_task_id']} "
+            f"{'completed' if retired else 'could not be completed'} with a note."
         )
     return "\n".join(lines)

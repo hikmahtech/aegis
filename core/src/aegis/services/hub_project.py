@@ -430,6 +430,30 @@ async def retire_task(
     return await _complete_task(pool, task_id)
 
 
+async def retire_merged_task(
+    pool: asyncpg.Pool, merge: dict[str, Any], *, settings: Any = None
+) -> bool | None:
+    """Retire the task of a problem `hub.merge_problems` just folded away.
+
+    The merged problem is closed, and a closed problem is never projected
+    again, so its task is retired here or never. One implementation for both
+    doors onto a merge — the chat tool and the admin Problems page — so they
+    cannot drift on what a merge does to Todoist.
+
+    ``merge`` is what `merge_problems` returned. None when there is no task to
+    retire: the merged problem had none, or it shares the kept problem's task.
+    Otherwise whether the completion queued.
+    """
+    task_id = str(merge.get("merged_task_id") or "")
+    keep_id = str(merge.get("keep_id") or "")
+    kept = await get_problem(pool, keep_id) if keep_id else None
+    keep_task = str((kept or {}).get("todoist_task_id") or "")
+    if not task_id or task_id == keep_task:
+        return None
+    note = f"Merged into problem {keep_id}" + (f" (task {keep_task})" if keep_task else "") + "."
+    return await retire_task(pool, task_id, note, settings=settings)
+
+
 async def _set_task(pool: asyncpg.Pool, problem_id: str, task_id: str) -> None:
     await pool.execute(
         "UPDATE problems SET todoist_task_id = $2 WHERE id = $1::uuid", problem_id, task_id
