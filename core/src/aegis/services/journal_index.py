@@ -223,7 +223,10 @@ async def mark_due_paid(pool: Any, due_msgid: str, payment_msgid: str) -> None:
 # completion as "paid". A person's completion is their word that it is handled.
 # The clause reads the mirror every time, so un-ticking the task reopens the
 # due. `find_open_due` deliberately does not read it: a payment that arrives
-# after the tick still links to its due.
+# after the tick still links to its due. A task captured through the outbox is
+# stored by its `item-…` temp id, which nothing rewrites, so the real id is
+# looked up where the drain records it (`todoist_outbox.committed_id`) — the
+# same trap the hub projector fell into (#473).
 #
 # An untasked due stops counting `_UNTASKED_DUE_DAYS` after it falls due. These
 # are the autopay notices and twins `capture_due` chose not to task: with no
@@ -233,11 +236,20 @@ async def mark_due_paid(pool: Any, due_msgid: str, payment_msgid: str) -> None:
 # Every reader selects FROM `finance.journal_index` unaliased, which is what
 # the correlated `journal_index.todoist_ref` binds to.
 _UNTASKED_DUE_DAYS = 14
-# ponytail: a task deleted from Todoist drops out of the mirror, and its due
-# counts as open again — the fail-open direction.
+# ponytail: the tick lives only in the mirror. A task deleted from Todoist drops
+# out of it, and so does every completed task on a Todoist FULL sync: the
+# mirror (`aegis_worker/activities/todoist.py`) deletes each id missing from
+# the snapshot, which carries live items only. Either way the due counts as
+# open again — the fail-open direction — and a full sync would reopen every
+# ticked-off bill at once. Production's only full sync so far was the first
+# one, on 2026-07-01 (`todoist_sync_state.last_full_sync_at`). The durable
+# version is a stamp on the index row, written when the sync mirrors a
+# completed bill task.
 TICKED_OFF_SQL = (
-    "EXISTS (SELECT 1 FROM todoist_tasks tt "
-    "WHERE tt.id = journal_index.todoist_ref AND tt.is_completed)"
+    "EXISTS (SELECT 1 FROM todoist_tasks tt WHERE tt.is_completed "
+    "AND tt.id IN (journal_index.todoist_ref, "
+    "(SELECT o.committed_id FROM todoist_outbox o "
+    "WHERE o.temp_id = journal_index.todoist_ref AND o.status = 'committed')))"
 )
 OPEN_DUE_SQL = (
     "(amount IS DISTINCT FROM 0 AND due_on IS NOT NULL "
@@ -252,9 +264,12 @@ async def find_open_due(
     """The open due this payment settles, or None.
 
     Deliberately NOT conditioned on `todoist_ref IS NOT NULL`. Open means
-    unpaid — `linked_message_id IS NULL` — and that is what every "dues open"
-    count reads (`build_money_brief`, `build_month_close`, `/api/money/state`).
-    `capture_due`'s three noise guards (a zero invoice, a twin due under
+    unpaid — `linked_message_id IS NULL`. The "dues open" counts
+    (`build_month_close`, `/api/admin/money/state`) also apply `OPEN_DUE_SQL`,
+    and the brief's dues list `TICKED_OFF_SQL`, so a ₹0, undated, ticked-off or
+    stale untasked due drops out of what you still owe. This lookup ignores
+    all of that on purpose: a payment that arrives after the user ticked a
+    bill off must still link to it. `capture_due`'s three noise guards (a zero invoice, a twin due under
     another payee's name, an autopay notice) all index the due and withhold
     only the Todoist task, so requiring a task ref here made every one of them
     structurally unclosable: nothing else writes `linked_message_id` for a due,

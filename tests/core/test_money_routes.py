@@ -379,6 +379,39 @@ async def test_a_bill_the_user_ticked_off_is_no_longer_open(real_client, db_pool
     assert await _dues_open(real_client) == base + 1
 
 
+async def test_a_bill_whose_task_went_through_the_outbox_can_still_be_ticked_off(
+    real_client, db_pool
+):
+    """A capture that met a transient Todoist error stores the outbox temp id
+    (`item-…`) as the due's `todoist_ref`, and nothing rewrites it. The drain
+    records the real id only on the outbox row, so matching the mirror on the
+    ref alone left the bill open for good, however often it was ticked off —
+    the trap the hub projector fixed in #473.
+
+    Falsifiable: match the mirror on `todoist_ref` alone and the count stays up.
+    """
+    base = await _dues_open(real_client)
+    temp, real = "item-zzt6-money-temp", f"{TASK_PREFIX}real"
+    await _seed(db_pool, suffix="outbox", kind="due", occurred_on=None, due_on=_in_days(5),
+                todoist_ref=temp)
+    await db_pool.execute(
+        "INSERT INTO todoist_outbox (temp_id, command, status) VALUES ($1, '{}'::jsonb, 'pending')",
+        temp,
+    )
+    await _mirror(db_pool, real, completed=True)
+    try:
+        # Still queued: there is no real task yet, so the bill is open.
+        assert await _dues_open(real_client) == base + 1
+        await db_pool.execute(
+            "UPDATE todoist_outbox SET status = 'committed', committed_id = $2 WHERE temp_id = $1",
+            temp,
+            real,
+        )
+        assert await _dues_open(real_client) == base
+    finally:
+        await db_pool.execute("DELETE FROM todoist_outbox WHERE temp_id = $1", temp)
+
+
 async def test_a_bill_with_no_due_date_is_never_open(real_client, db_pool):
     """`find_open_due` keys on a due-date window, so a payment can never close
     a due with no date, and it can never be overdue either. 17 such rows came
