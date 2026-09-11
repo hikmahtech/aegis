@@ -1935,7 +1935,7 @@ async def test_stuck_alert_fires_once_not_on_every_sweep(stuck_env):
         )
         == 1
     )
-    assert "UPDATE problems SET muted_until" in delivery.sent[0]
+    assert "Silence: admin Problems page" in delivery.sent[0]
 
 
 async def test_stuck_alert_card_names_the_post_and_its_state(stuck_env):
