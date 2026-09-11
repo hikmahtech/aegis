@@ -864,6 +864,10 @@ async def test_the_hubs_own_close_from_before_a_return_is_undone_not_resolved(
     the task is reopened, as the projector meant, and the problem stays
     live. A person completing it afterwards still resolves it.
 
+    Since #484 a late verdict no longer reopens a resolved problem, so the
+    return here is what can still bring one back: a real occurrence. The
+    stale mirror races any return the same way.
+
     Falsifiable: treat every completion as a person's and the problem is
     resolved on the hub's own close.
     """
@@ -877,7 +881,8 @@ async def test_the_hubs_own_close_from_before_a_return_is_undone_not_resolved(
     await db_pool.execute("UPDATE todoist_tasks SET is_completed = false WHERE id = $1", task)
     closed_at = await db_pool.fetchval("SELECT clock_timestamp()")  # the drain closes it
 
-    assert await set_status(db_pool, r.problem_id, "waiting_human", reason="card posted")
+    back = await ingest_event(db_pool, _occ(s, 3), now=NOW + timedelta(minutes=3))
+    assert back.action == "reopened", "the return"
     await project(db_pool, r.problem_id, now=NOW + timedelta(minutes=3))
     assert await db_pool.fetchval(
         "SELECT count(*) FROM todoist_outbox WHERE temp_id = $1", f"problem-reopen-{task}"
@@ -891,9 +896,9 @@ async def test_the_hubs_own_close_from_before_a_return_is_undone_not_resolved(
     )
     done = await hub_project.reconcile_completed_tasks(db_pool, now=NOW + timedelta(minutes=5))
 
-    assert {"problem_id": r.problem_id, "task_id": task, "was": "waiting_human",
+    assert {"problem_id": r.problem_id, "task_id": task, "was": "open",
             "action": "task_reopened"} in done
-    assert (await get_problem(db_pool, r.problem_id))["status"] == "waiting_human"
+    assert (await get_problem(db_pool, r.problem_id))["status"] == "open"
     assert not await _is_completed(db_pool, task)
     cmd = await db_pool.fetchval(
         "SELECT command FROM todoist_outbox WHERE temp_id = $1", f"problem-reopen-{task}"
