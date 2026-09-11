@@ -220,7 +220,7 @@ def test_agent_handoff_outcomes_stay_eligible_for_the_executor() -> None:
     pick the task up."""
     from aegis_worker.activities.agent_task import EXCLUDED_LABELS
 
-    for classification in ("route_apply", "pandora_investigation", "pandora_owned"):
+    for classification in ("route_apply", "pandora_investigation", "pandora_owned", "hub_owned"):
         assert gtd_state_label(classification) not in EXCLUDED_LABELS
 
 
@@ -256,6 +256,9 @@ _CASES: dict[str, dict] = {
         "decision": {"assignee": "@pandora", "contexts": ["@code"]},
     },
     "pandora_owned": {"task": {"id": "G_OWNED", "labels": ["@pandora"]}},
+    # The projector creates a hub task with `#alert` and the infra agent's
+    # label only (hub_project.project), so clarify owes it the state.
+    "hub_owned": {"task": {"id": "G_HUB", "labels": ["#alert", "@pandora"]}},
     "pandora_followup": {
         "task": {"id": "G_FOLLOW", "content": "APP-3: broken", "labels": ["@pandora"]},
     },

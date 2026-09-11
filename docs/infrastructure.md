@@ -403,6 +403,17 @@ WHERE t.source_tag = '#alert' AND NOT t.is_completed AND p.id IS NULL;
 SELECT problem_id, count(*) FROM problem_links
 WHERE link_kind = 'todoist_task' GROUP BY 1 HAVING count(*) > 1;
 
+-- 5e. no task should be owned by two live problems (#472). A closed problem
+-- is history, so a task may have one closed problem and one live one.
+SELECT o.task_id, count(*) AS problems,
+       string_agg(p.id::text || ' ' || p.correlation_key || ' ' || p.status, ' ; '
+                  ORDER BY p.first_seen_at) AS which
+FROM (SELECT problem_id, ref AS task_id FROM problem_links WHERE link_kind = 'todoist_task'
+      UNION SELECT id, todoist_task_id FROM problems WHERE todoist_task_id IS NOT NULL) o
+JOIN problems p ON p.id = o.problem_id
+WHERE p.closed_at IS NULL
+GROUP BY 1 HAVING count(*) > 1;
+
 -- 5c. what the hub has seen since the deploy
 SELECT status, count(*), sum(occurrences) FROM problems
 WHERE last_seen_at > now() - interval '24 hours' GROUP BY 1 ORDER BY 2 DESC;
@@ -452,10 +463,33 @@ and its status block gains a `Group:` line and a `problem:` link per member.
 Each swallowed task is completed with a note pointing at the survivor. A card
 goes to the infra agent's channel saying what was grouped and why.
 
+**Strays.** A later post of the same class joins the group as it comes in.
+One whose own problem was still live when the group formed — it recovered
+during the fold, then came back and reopened — used to keep that problem and
+its task for good, because a single stray is never three of a kind again
+(#474). The sweep now folds such a stray into its group before it looks for
+new clusters, with no model call: the group already stands for the class. The
+stray's task is completed through the outbox with a note pointing at the
+group, and the group's timeline gets a `grouped` event whose `reason` says it
+was a stray. It folds only into a group that is live and not suppressed, and
+only a stray seen in the last 72 hours.
+
 **What it will never do**, enforced in code rather than left to the judge:
 group across classes; group the `manual` class (those problems ARE hand-written
 `@code` tasks, and folding two would move one task's sessions and PR links onto
-another); or group on the count alone.
+another); group the `task` subject kind (a report keyed on the Todoist task it
+came from — see below); group a money finding; or group on the count alone.
+
+**Reports keyed on a task.** Clarify's content-route investigations carry a
+class from the route (`alert_overrides`) and often no service. Such an event
+used to be keyed `{class}::`, so every later one of that class attached to the
+first problem and was never investigated (#472). `event_from_alert` now keys
+an alert that names a Todoist task and nothing else on that task:
+`nodedown:task:<task id>`. An alert with no subject and no task — an aggregate
+alertmanager rule, a Sentry issue with no project — keeps its one key per
+class. Clarify also no longer starts an investigation for a task the hub owns
+(`#alert`, or any problem holds it): it records `hub_owned` and stamps `@next`.
+A user's comment on such a task still starts one, on the task's own problem.
 
 **Recovery.** `hub_watch.reconcile_findings` resolves a group only when its
 watchdog stops finding *any* member of the class — a group's `*` subject is
@@ -472,9 +506,20 @@ WHERE payload->>'action' = 'grouped' ORDER BY id DESC LIMIT 5;
 -- clusters the next sweep would consider (mirrors hub_group.candidates)
 SELECT class, subject_kind, count(*) FROM problems
 WHERE closed_at IS NULL AND status NOT IN ('resolved','closed') AND group_key IS NULL
-  AND class <> '' AND class <> 'manual' AND subject <> '' AND subject_kind <> ''
+  AND class <> '' AND class <> 'manual' AND subject <> '' AND subject_kind NOT IN ('', 'task')
   AND last_seen_at >= now() - interval '72 hours'
 GROUP BY 1,2 HAVING count(*) >= 3;
+
+-- strays the next sweep will fold into a group (mirrors hub_group.absorb_strays)
+SELECT g.group_key, p.id, p.subject, p.status, p.todoist_task_id FROM problems g
+JOIN problems p ON p.class = g.class AND p.subject_kind = g.subject_kind AND p.id <> g.id
+WHERE g.group_key IS NOT NULL AND g.closed_at IS NULL
+  AND g.status NOT IN ('resolved', 'closed', 'suppressed')
+  AND p.group_key IS NULL AND p.closed_at IS NULL AND p.status NOT IN ('resolved', 'closed')
+  AND p.class <> 'manual' AND p.subject_kind <> 'task' AND p.subject <> ''
+  AND p.last_seen_at >= now() - interval '72 hours'
+  AND NOT EXISTS (SELECT 1 FROM problem_events e
+                  WHERE e.problem_id IN (p.id, g.id) AND e.source = 'money');
 
 -- what the judge has already decided
 SELECT jsonb_pretty(value) FROM settings WHERE key = 'hub_group_verdicts';

@@ -145,6 +145,93 @@ async def test_resource_lookup_failure_degrades_to_error():
     temporal.start_workflow.assert_not_awaited()
 
 
+def _task_id() -> str:
+    import uuid
+
+    return f"zzir{uuid.uuid4().hex[:10]}"
+
+
+async def _registered_repo(db_pool) -> str:
+    """A real `resources` row the tool's repo check accepts; returns its name."""
+    import uuid
+
+    name = f"zzrepo-{uuid.uuid4().hex[:8]}"
+    await db_pool.execute(
+        "INSERT INTO resources (kind, slug, title, metadata) VALUES ('repository', $1, $1, $2)",
+        name,
+        {"github_repo": f"acme/{name}"},
+    )
+    return name
+
+
+async def _problem_owning(db_pool, task_id: str, *, closed: bool = False) -> str:
+    """A hub problem whose task is `task_id`, made the way the hub makes one."""
+    import uuid
+    from datetime import UTC, datetime
+
+    from aegis.services.hub import Event, ingest_event
+    from aegis.services.hub_project import link_task
+
+    now = datetime.now(UTC)
+    result = await ingest_event(
+        db_pool,
+        Event(
+            source="heartbeat",
+            external_id=f"zz-{uuid.uuid4().hex}",
+            kind="occurrence",
+            title="Service aegis_core down",
+            klass="DockerServiceDown",
+            subject=f"zzsvc_{uuid.uuid4().hex[:8]}",
+            occurred_at=now,
+        ),
+        now=now,
+    )
+    assert await link_task(db_pool, result.problem_id, task_id)
+    if closed:
+        await db_pool.execute(
+            "UPDATE problems SET status = 'closed', closed_at = now() WHERE id = $1::uuid",
+            result.problem_id,
+        )
+    return result.problem_id
+
+
+async def _started_alert(db_pool, task_id: str, repo: str) -> dict:
+    temporal = MagicMock()
+    temporal.start_workflow = AsyncMock(return_value=None)
+    ctx = ToolContext(temporal_client=temporal, task_id=task_id)
+    out = json.loads(
+        await _exec_investigate_resource(db_pool, {"repo": repo, "focus": "why is it down"}, ctx)
+    )
+    assert out["status"] == "investigation_started", out
+    return temporal.start_workflow.await_args.args[1]
+
+
+async def test_a_task_with_a_problem_is_investigated_on_that_problem(db_pool):
+    """#472: without the problem id the flow's step 0 ingests a fresh event,
+    which creates a second problem and links this task to it too."""
+    repo, task_id = await _registered_repo(db_pool), _task_id()
+    problem_id = await _problem_owning(db_pool, task_id)
+    alert = await _started_alert(db_pool, task_id, repo)
+    assert alert["problem_id"] == problem_id
+    assert alert["todoist_task_id"] == task_id
+
+
+async def test_a_task_with_no_problem_still_starts_fresh(db_pool):
+    repo = await _registered_repo(db_pool)
+    alert = await _started_alert(db_pool, _task_id(), repo)
+    assert "problem_id" not in alert
+
+
+async def test_a_task_whose_problem_closed_starts_fresh(db_pool):
+    """A closed problem is history: its projection is over, so the new
+    investigation gets a problem of its own (the `ensure_problem_for_task`
+    rule)."""
+    repo, task_id = await _registered_repo(db_pool), _task_id()
+    await _problem_owning(db_pool, task_id, closed=True)
+    alert = await _started_alert(db_pool, task_id, repo)
+    assert "problem_id" not in alert
+
+
 async def test_investigate_resource_dedups_when_already_running():
     """A duplicate call while the workflow is in-flight returns already_investigating, not an error."""
     pool = _pool_with_resources([{"gh": "acme/bcp", "rp": None}])
