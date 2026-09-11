@@ -260,7 +260,7 @@ Specialist flows subscribe to tag subsets and run as abandoned children:
 
 1. **Hub identity** — a caller that gave no `problem_id` is ingested here and the flow stops when the hub would not have investigated.
 2. **Verification delay** — a flat per-class wait (`hub.verify_seconds`), then `problem_status`: a problem the hub already saw resolve ends here.
-3. **Resource resolution** — deterministic service-match then LLM picks the owning repo from the `resources` table; infra alerts resolve to the gitops repo and try the one-shot auto-restart first.
+3. **Resource resolution** — a repo that claims the alert by label (`resources.metadata.alert_labels`) wins and is investigated as code; otherwise infra alerts (the `infra_alert_routing` settings list) resolve to the configured infra repo and try the one-shot auto-restart first, and the rest go deterministic service-match then LLM over the `resources` table. See `docs/infrastructure.md` → "Which repo an alert is investigated in".
 4. **Knowledge context** — `gather_alert_knowledge` prepends `runbooks/<AlertName>.md` (if present and non-stub), then appends prior-incident context from KS.
 5. **Investigation** — coding-CLI (kimi/claude) via `run_investigation` when a `resource_path` is available; LLM fallback otherwise.
 6. **Assessment** → structured verdict: `resolved` / `not_actionable` / `actionable` / `inconclusive`.

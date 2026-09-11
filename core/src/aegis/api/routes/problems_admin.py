@@ -212,3 +212,31 @@ async def put_service_state(request: Request, body: ServiceStateBody) -> dict[st
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     await _audit(request, "service_state_set", f"{row['subject_kind']}:{row['subject']}", row)
     return row
+
+
+@router.get("/infra-alert-routing")
+async def get_infra_alert_routing_route(request: Request) -> dict[str, Any]:
+    """Which alertnames are infra (the built-in list plus yours) and which repo
+    investigates them (`services/infra_alert_routing.py`)."""
+    from aegis.services.infra_alert_routing import (
+        DEFAULT_INFRA_ALERTNAMES,
+        get_infra_alert_routing,
+    )
+
+    routing = await get_infra_alert_routing(_pool(request), cached=False)
+    return {"default_alertnames": sorted(DEFAULT_INFRA_ALERTNAMES), **routing}
+
+
+@router.put("/infra-alert-routing")
+async def put_infra_alert_routing_route(request: Request, body: dict[str, Any]) -> dict[str, Any]:
+    """Replace your extra infra alertnames and the infra repo. 400 on a bad value."""
+    from aegis.services.infra_alert_routing import (
+        DEFAULT_INFRA_ALERTNAMES,
+        save_infra_alert_routing,
+    )
+
+    try:
+        routing = await save_infra_alert_routing(_pool(request), body)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"default_alertnames": sorted(DEFAULT_INFRA_ALERTNAMES), **routing}
