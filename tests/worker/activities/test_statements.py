@@ -20,7 +20,7 @@ from pathlib import Path
 
 import pytest
 import pytest_asyncio
-from aegis.services import books
+from aegis.services import books, statement_post
 from aegis.services.statements import row_id_for
 from aegis_worker.activities import statements as statements_mod
 from aegis_worker.activities.statements import StatementActivities
@@ -512,3 +512,30 @@ async def test_a_promoted_block_tells_the_index_which_account_paid(clean, tmp_pa
     assert await clean.fetchval(
         "SELECT instrument FROM finance.journal_index WHERE message_id = 'st-apple'"
     ) == "axis-9640"
+
+
+async def test_a_row_no_rule_places_is_indexed_on_the_account_its_block_names(clean, tmp_path):
+    """#481. The poster works the counter account out — the event's own, or the
+    rules', or the entity's unknown account — and writes THAT into the block,
+    then indexed the event it started from. For a statement row no rule placed
+    that event carries no account, so 178 of 298 statement-posted index rows
+    said NULL while their blocks said `expenses:unknown`, and every "what is
+    still unclassified?" surface keys on `account LIKE '%:unknown'`: the money
+    brief, month close and `ledger_add_rule`'s sweep could not see them."""
+    cfg = _repo(tmp_path)
+    sid = await _statement(clean, "hdfc-1225", "2026-07-01", "2026-07-31", "0", "-120", 1)
+    rid = await _row(
+        clean, "hdfc-1225", "2026-07-14", "out", "120.00", "POS CORNER STORE", sid, "-120"
+    )
+
+    out = await ActivityEnvironment().run(_act(clean, cfg).reconcile_statements, True, "")
+    assert out["posted"] == 1, out
+
+    msgid = statement_post.msgid_for(rid)
+    text = (cfg.path / "personal" / "2026.journal").read_text()
+    span = books.find_block(text, msgid)
+    named = statement_post._counter_account(text[span[0]:span[1]])
+    assert named == "expenses:unknown", text
+    assert await clean.fetchval(
+        "SELECT account FROM finance.journal_index WHERE message_id = $1", msgid
+    ) == named

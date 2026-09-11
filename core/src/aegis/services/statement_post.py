@@ -733,7 +733,12 @@ async def post_statement(
                     )
                 )
             result.posted.append(msgid)
-            result.indexed.append((msgid, event, rel))
+            # The account the block names, not the one the event arrived with
+            # (#481). A row no rule placed arrives with none, so indexing the
+            # event as it stood wrote NULL for a block that says
+            # `expenses:unknown` — 178 of 298 live rows — and every "what is
+            # still unclassified?" surface keys on `account LIKE '%:unknown'`.
+            result.indexed.append((msgid, event.model_copy(update={"account": counter}), rel))
 
         # §9.3, inside the envelope so a disagreement reverts the statement.
         if not _checkable(statement):
