@@ -102,7 +102,8 @@ def gate2_needs_decision(
     can do something: open a fix PR, run proposed commands, take the ack an
     escalating alert nags for, or hand over a restart that did not stick
     (#501). A card with only Mute and Acknowledge asks nothing: in the two
-    weeks before this rule, 27 of the 52 answered cards were a bare `ack`.
+    weeks before this rule, 27 of the 38 answered verdict cards were a bare
+    `ack`.
 
     The verdict status is deliberately not an input. `actionable` with no
     branch and no commands is work for a person, but nothing a card can
@@ -1183,7 +1184,7 @@ class AlertInvestigationFlow:
         # task (Step 8.5), the problem's timeline (Step 10) and the chat ping
         # (Step 9) — what an `ack` used to lead to, without the ack. Before
         # #500 every non-Jira, non-resolved verdict got a card (2026-05-22,
-        # when chat had no verdict at all), and half the answers were a bare
+        # when chat had no verdict at all), and 27 of 38 answers were a bare
         # `ack`. "Mute 24h" for such a problem is on the admin Problems page.
         #
         # Options vary by context:

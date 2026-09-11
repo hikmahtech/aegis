@@ -321,11 +321,16 @@ async def test_the_window_is_a_setting(db_pool, window):
         "window_minutes": 5,
     }
 
-    await window({"repeat_window_minutes": 0})  # off: restart every time, as before
+    # Off: restart every time, as before. Off means off even for a restart
+    # stamped a moment "from now" by a worker on a node whose clock runs
+    # ahead, which a zero-minute window alone would still count.
+    await _backdate(db_pool, pid, -1)
+    await window({"repeat_window_minutes": 0})
     assert await ActivityEnvironment().run(act.recent_auto_restart, pid, _alert(svc)) == {
         "repeat": False,
         "window_minutes": 0,
     }
+    await _backdate(db_pool, pid, 10)
 
     await window({"repeat_window_minutes": "soon"})  # unreadable: the default
     out = await ActivityEnvironment().run(act.recent_auto_restart, pid, _alert(svc))

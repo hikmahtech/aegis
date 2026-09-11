@@ -1,7 +1,7 @@
 """A Gate-2 card only when there is a decision to make (#500).
 
-In the two weeks before this change Pandora posted 47 verdict cards and 27 of
-the answered ones were a bare `ack`: the verdict had nothing a person could
+In the two weeks before this change Pandora posted 47 verdict cards, and 27 of
+the 38 answered were a bare `ack`: the card offered nothing a person could
 approve. A card now goes out only when the card itself can do something:
 
 * a fix branch to open as a PR,
