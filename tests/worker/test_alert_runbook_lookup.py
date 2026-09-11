@@ -10,11 +10,13 @@ which fails exactly the way a lost connection does.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 
 import pytest_asyncio
 from aegis.db import create_pool, run_migrations
 from aegis.services import runbooks as rb
+from aegis_worker.activities import alerts as alerts_mod
 from aegis_worker.activities.alerts import AlertActivities
 from temporalio.testing import ActivityEnvironment
 
@@ -62,6 +64,29 @@ async def test_an_unreachable_database_falls_back_to_the_file(test_db_url, tmp_p
 
     with caplog.at_level(logging.WARNING):
         result = await ActivityEnvironment().run(act.gather_alert_knowledge, "node gone", "", ALERT)
+
+    assert result == f"Runbook:\n{FILE_BODY}"
+    assert any("runbook_db_read_failed" in r.getMessage() for r in caplog.records)
+
+
+async def test_a_hung_database_falls_back_to_the_file(test_db_url, tmp_path, monkeypatch, caplog):
+    # The pool has no command timeout. Hold its only connection, so the lookup
+    # waits forever for one: without its own bound it would sit until the
+    # activity's 65s timeout and the investigation would start with nothing.
+    monkeypatch.setattr(alerts_mod, "_RUNBOOK_DB_TIMEOUT_S", 0.3)
+    stuck = await create_pool(test_db_url, min_size=1, max_size=1)
+    held = await stuck.acquire()
+    try:
+        act = AlertActivities(db_pool=stuck, runbooks_dir=_write_file(tmp_path))
+        with caplog.at_level(logging.WARNING):
+            # The outer bound turns a missing inner one into a failure, not a hang.
+            result = await asyncio.wait_for(
+                ActivityEnvironment().run(act.gather_alert_knowledge, "node gone", "", ALERT),
+                timeout=10,
+            )
+    finally:
+        await stuck.release(held)
+        await stuck.close()
 
     assert result == f"Runbook:\n{FILE_BODY}"
     assert any("runbook_db_read_failed" in r.getMessage() for r in caplog.records)
