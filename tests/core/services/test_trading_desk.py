@@ -258,6 +258,18 @@ async def test_a_symbol_yahoo_lacks_is_priced_from_ansaar_and_marked(pool):
     assert await pool.fetchval("SELECT price_source FROM finance.desk_orders WHERE symbol = 'GOLDBEES'") == "ansaar"
 
 
+async def test_a_held_name_with_no_decision_still_gets_a_fresh_price(pool):
+    """The refresh list is built from what the desk holds, so a name that is held
+    but absent from today's decisions, with no pending order, must still be priced."""
+    await filled(pool, THU, "TCS", "buy", 3, 3000.0)
+    finance = market({"TCS.NS": [bar(FRI, 3100.0)], "GOLDBEES.NS": [bar(FRI, 100.0)]})
+    await run(pool, FakeAnsaar({FRI: [row("GOLDBEES", 0.10, cls="etf")]}), finance, MON)
+    stored = await pool.fetchval(
+        "SELECT close FROM finance.desk_prices WHERE symbol = 'TCS.NS' AND date = $1", FRI
+    )
+    assert stored is not None and float(stored) == 3100.0
+
+
 async def test_a_holding_survives_a_split_and_a_trim(pool):
     """Buys minus sells says this position is closed; the split says it is not.
     The desk must load bars for every symbol it has ever filled, replay, and take
