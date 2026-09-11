@@ -166,7 +166,9 @@ response.
     Gold and silver ETF short-term gains are taxed at the slab rate. An equity ETF's are taxed at
     20%, so 30% overstates the tax on those. Conservative on purpose; per-symbol rates can come
     later.
-  - Long-term uses `ltcg_rate` (12.5%) above `ltcg_exemption_inr` (₹1,25,000) a year.
+  - Long-term uses `ltcg_rate` (12.5%). The `ltcg_exemption_inr` (₹1,25,000) a year applies to
+    equity alone: section 112A covers listed shares and equity-oriented units, so a gold or
+    silver ETF gets none of it.
   - `ponytail:` conservative. There's no netting of losses across classes and no loss
     carry-forward, and the exemption counts the desk alone. Both make the desk look slightly worse
     than it would be. Add netting and carry-forward if the gap ever matters to a decision.
@@ -350,10 +352,10 @@ expected_excess_pa: 0.06
 
 | File | What it holds |
 |---|---|
-| `core/src/aegis/connectors/ansaar.py` | `AnsaarClient`: `token()`, `decisions(date) -> (rows, meta)`, `prices(symbol, asset_class, start, end)` |
-| `core/src/aegis/connectors/finance.py` | `yahoo_daily(client, symbol, start, end)`: bars plus split and dividend events, next to the existing quote provider |
+| `core/src/aegis/connectors/ansaar.py` | `AnsaarClient`: `decisions(day) -> (rows, meta)` and `prices(symbol, asset_class, start, end)`, each fetching the client token on first use |
+| `core/src/aegis/connectors/finance.py` | `FinanceConnector.daily_bars(symbol, start, end)`: bars plus split and dividend events, next to the existing quote provider |
 | `core/src/aegis/services/desk_math.py` | Pure functions, no I/O: last trading day, checks, order sizing, split adjustment, FIFO, value history, tax by year, weekly statistics, label, warning check |
-| `core/src/aegis/services/trading_desk.py` | Database reads and writes, `run_tick(pool, settings)`, `summary(pool, month)`, config loading |
+| `core/src/aegis/services/trading_desk.py` | Database reads and writes, `run_tick(pool, *, ansaar, finance, today, project)`, `month_summary(pool, month_first, next_first)`, `reconcile_expectation`, config loading |
 | `worker/src/aegis_worker/activities/trading_desk.py` | `TradingDeskActivities.desk_tick`: one activity (new class, so a constructor in `main()` and an entry in `collect_activities`) |
 | `worker/src/aegis_worker/flows/trading_desk.py` | `TradingDeskFlow`, `TradingDeskConfig(agent_id)` |
 | `worker/src/aegis_worker/registry.py` | One `FlowSpec` |

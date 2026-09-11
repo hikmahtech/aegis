@@ -51,6 +51,15 @@ argues from it.
   `ruff format` on `core/src/aegis/services/chat.py` or `core/src/aegis/services/tools/infra.py`.
 - **Writing.** Commit subjects are single-line semantic, e.g. `feat(desk): ...`. Code comments and
   docstrings are plain English, following the surrounding code's density.
+- **Import order**, which `ruff check` enforces (rule I001): `from __future__ import annotations`,
+  a blank line, the standard library, a blank line, then **one** block holding every other import:
+  the plain `import x` lines first in alphabetical order, then the `from x import y` lines in
+  alphabetical order. `aegis`, `aegis_worker`, `httpx`, `pytest`, `pytest_asyncio`, `respx`,
+  `structlog` and `temporalio` all sit in that one block, with no blank line between them. See
+  `tests/worker/activities/test_statements.py:14-30`. Every import block in this plan is already
+  in that order; keep it when you edit one.
+- **Numbers into `numeric` columns** go through `round(x, 4)`, so the stored figure reads like a
+  price rather than a float's binary expansion.
 - **Timezone.** Every date is an IST calendar date: `ZoneInfo("Asia/Kolkata")`.
 
 **Test command** (substitute the paths; run from the worktree root):
@@ -391,7 +400,6 @@ from __future__ import annotations
 from datetime import date
 
 import pytest
-
 from aegis.services.desk_math import (
     Bar,
     Book,
@@ -525,8 +533,26 @@ def test_tax_does_not_net_across_the_31_march_boundary():
     assert tax_owed(rows, Rules()) == pytest.approx(200.0)
 
 
-def test_long_term_gains_are_taxed_only_above_the_exemption():
+def test_long_term_equity_gains_are_taxed_only_above_the_exemption():
     assert tax_owed([_r(date(2026, 5, 1), 200_000.0, lt=True)], Rules()) == pytest.approx(0.125 * 75_000)
+
+
+def test_a_long_term_etf_gain_gets_no_exemption():
+    """Section 112A's ₹1.25L covers listed equity and equity-oriented units. A
+    gold or silver ETF is neither."""
+    rows = [_r(date(2026, 5, 1), 200_000.0, cls="etf", lt=True)]
+    assert tax_owed(rows, Rules()) == pytest.approx(0.125 * 200_000)
+
+
+def test_a_same_day_sell_and_buy_both_land():
+    fills = [
+        Fill("A", "equity", "buy", 10, 100.0, 0.0, date(2026, 9, 14)),
+        Fill("B", "equity", "buy", 5, 100.0, 0.0, date(2026, 9, 21)),
+        Fill("A", "equity", "sell", 10, 110.0, 0.0, date(2026, 9, 21)),
+    ]
+    book = replay(fills, {}, 1000.0, date(2026, 9, 30))
+    assert book.cash == pytest.approx(1000.0 - 1000.0 + 1100.0 - 500.0)
+    assert book.qty("B") == 5 and "A" not in book.lots
 
 
 def test_a_loss_year_owes_nothing():
@@ -740,14 +766,15 @@ def tax_owed(realised: list[Realised], rules: Rules) -> float:
     total = 0.0
     for rows in years.values():
         short: dict[str, float] = defaultdict(float)
-        long_gain = 0.0
+        long_gain: dict[str, float] = defaultdict(float)
         for r in rows:
-            if r.long_term:
-                long_gain += r.gain
-            else:
-                short[r.asset_class] += r.gain
+            (long_gain if r.long_term else short)[r.asset_class] += r.gain
         total += sum(rules.tax_rate.get(c, worst) * max(0.0, g) for c, g in short.items())
-        total += rules.ltcg_rate * max(0.0, long_gain - rules.ltcg_exemption_inr)
+        for asset_class, gain in long_gain.items():
+            # The ₹1.25L exemption is section 112A: listed equity and
+            # equity-oriented units. A gold or silver ETF gets none of it.
+            free = rules.ltcg_exemption_inr if asset_class == "equity" else 0.0
+            total += rules.ltcg_rate * max(0.0, gain - free)
     return total
 ```
 
@@ -785,7 +812,7 @@ git commit -m "feat(desk): replay fills into a book with splits, dividends, FIFO
     with `status` one of `filled`, `cancelled` or `pending`.
   - `plan_orders(rows: tuple[Decision, ...], book: Book, closes: dict[str, float], rules) -> tuple[list[Order], list[str]]`
     returns the orders in fill order (sells, then buys by rank) and the skips as `"SYMBOL: reason"`.
-  - `fill_orders(pending: list[PendingOrder], bars: dict[str, list[Bar]], index_days: list[date], book: Book, rules) -> list[FillResult]`
+  - `fill_orders(pending: list[PendingOrder], bars: dict[str, list[Bar]], index_days: list[date], book: Book, rules, grace_days: int = 3) -> list[FillResult]`
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -797,7 +824,6 @@ from __future__ import annotations
 from datetime import date
 
 import pytest
-
 from aegis.services.desk_math import (
     Bar,
     Book,
@@ -895,10 +921,16 @@ def test_an_order_created_on_a_holiday_fills_on_the_next_market_day():
 
 
 def test_no_price_yet_stays_pending_then_cancels_after_three_market_days():
+    """Two market days after the fill day it waits; the third cancels it."""
     order = p("o1", "TCS", "buy", 1)
-    [r] = fill_orders([order], {}, DAYS[:2], Book(cash=10_000.0), Rules())
+    [r] = fill_orders([order], {}, DAYS[:3], Book(cash=10_000.0), Rules())
     assert r.status == "pending"
-    [r] = fill_orders([order], {}, DAYS, Book(cash=10_000.0), Rules())
+    [r] = fill_orders([order], {}, DAYS[:4], Book(cash=10_000.0), Rules())
+    assert (r.status, r.reason) == ("cancelled", "price_missing")
+
+
+def test_the_cancel_grace_is_a_parameter():
+    [r] = fill_orders([p("o1", "TCS", "buy", 1)], {}, DAYS[:2], Book(cash=10.0), Rules(), grace_days=1)
     assert (r.status, r.reason) == ("cancelled", "price_missing")
 
 
@@ -1066,13 +1098,14 @@ def fill_orders(
     index_days: list[date],
     book: Book,
     rules: Rules,
+    grace_days: int = 3,
 ) -> list[FillResult]:
     """Fill pending paper orders at the close of their fill day (spec §6).
 
     The fill day is the first market day on or after the day an order was
     created. ``book`` is the desk before these fills. Orders fill in ``seq``
     order, sells first; a buy that no longer fits the cash is cut, or cancelled
-    as ``no_cash``. No price three market days after the fill day cancels the
+    as ``no_cash``. No price ``grace_days`` market days after the fill day cancels the
     order as ``price_missing``.
     """
     days = sorted(index_days)
@@ -1086,7 +1119,7 @@ def fill_orders(
         series = bars.get(o.symbol, [])
         bar = bar_on(series, fill_day)
         if bar is None or bar.close is None:
-            late = sum(1 for d in days if d > fill_day) >= 3
+            late = sum(1 for d in days if d > fill_day) >= grace_days
             results.append(
                 FillResult(o.id, "cancelled", reason="price_missing") if late else FillResult(o.id, "pending")
             )
@@ -1154,7 +1187,6 @@ from __future__ import annotations
 from datetime import date
 
 import pytest
-
 from aegis.services.desk_math import (
     Bar,
     Fill,
@@ -1238,6 +1270,14 @@ def test_below_expectation_fires_only_when_two_standard_errors_short():
     assert below_expectation(Stats(16, -0.002, 0.004, 0.0), 0.06) is True
     assert below_expectation(Stats(16, 0.0, 0.004, 0.0), 0.06) is False
     assert below_expectation(Stats(11, -0.01, 0.004, 0.0), 0.06) is False
+
+
+def test_below_expectation_sits_exactly_on_its_boundary():
+    """Two standard errors here is 2 x 0.004 / 4 = 0.002, so the boundary is the
+    weekly equivalent of the yearly figure, minus that."""
+    weekly = 1.06 ** (1 / 52) - 1
+    assert below_expectation(Stats(16, weekly - 0.002, 0.004, 0.0), 0.06) is False
+    assert below_expectation(Stats(16, weekly - 0.002 - 1e-6, 0.004, 0.0), 0.06) is True
 
 
 def test_big_moves_flag_unexplained_jumps_only():
@@ -1425,7 +1465,6 @@ from datetime import UTC, date, datetime
 import httpx
 import pytest
 import respx
-
 from aegis.connectors.finance import FinanceConnector
 
 CHART = r"https://query1\.finance\.yahoo\.com/v8/finance/chart/"
@@ -1497,7 +1536,6 @@ from datetime import date
 import httpx
 import pytest
 import respx
-
 from aegis.connectors.ansaar import AnsaarClient, AnsaarError
 
 BASE = "http://ansaar.test"
@@ -1856,7 +1894,6 @@ from datetime import date
 import httpx
 import pytest
 import pytest_asyncio
-
 from aegis.connectors.ansaar import AnsaarClient, AnsaarError
 from aegis.connectors.finance import FinanceConnector
 from aegis.services import trading_desk as td
@@ -1965,8 +2002,8 @@ async def open_problems(pool):
     return sorted((r["class"], r["subject"]) for r in rows)
 
 
-async def held_trade(pool, day=THU, symbol="TCS", qty=3, price=3000):
-    """A buy that filled on ``day``, as if an earlier run placed it."""
+async def filled(pool, day, symbol, side, qty, price, costs=18.0, cls="equity", seq=0):
+    """An order that filled on ``day``, as if an earlier run had placed it."""
     await pool.execute(
         "INSERT INTO finance.desk_plans (data_date, mode, outcome) VALUES ($1, 'paper', 'orders') "
         "ON CONFLICT DO NOTHING",
@@ -1975,8 +2012,8 @@ async def held_trade(pool, day=THU, symbol="TCS", qty=3, price=3000):
     await pool.execute(
         "INSERT INTO finance.desk_orders (mode, data_date, seq, created_day, symbol, asset_class, side, "
         "qty, ref_price, status, fill_date, fill_price, costs, price_source) "
-        "VALUES ('paper', $1, 0, $1, $2, 'equity', 'buy', $3, $4, 'filled', $1, $4, 18, 'yahoo')",
-        day, symbol, qty, price,
+        "VALUES ('paper', $1, $2, $1, $3, $4, $5, $6, $7, 'filled', $1, $7, $8, 'yahoo')",
+        day, seq, symbol, cls, side, qty, price, costs,
     )
 
 
@@ -2054,7 +2091,7 @@ async def test_yahoo_down_writes_no_plan_and_raises_a_source_error(pool):
 
 
 async def test_a_vanished_holding_class_holds_the_portfolio(pool):
-    await held_trade(pool)
+    await filled(pool, THU, "TCS", "buy", 3, 3000.0)
     finance = market({"TCS.NS": [bar(THU, 3000.0), bar(FRI, 3000.0)], "GOLDBEES.NS": [bar(FRI, 100.0)]})
     out = await run(pool, FakeAnsaar({FRI: [row("GOLDBEES", 0.10, cls="etf")]}), finance, MON)
     assert out["planned"] == "held_suspect"
@@ -2107,8 +2144,28 @@ async def test_a_symbol_yahoo_lacks_is_priced_from_ansaar_and_marked(pool):
     assert await pool.fetchval("SELECT price_source FROM finance.desk_orders WHERE symbol = 'GOLDBEES'") == "ansaar"
 
 
+async def test_a_holding_survives_a_split_and_a_trim(pool):
+    """Buys minus sells says this position is closed; the split says it is not.
+    The desk must load bars for every symbol it has ever filled, replay, and take
+    what it holds from that."""
+    await filled(pool, THU, "TCS", "buy", 10, 3000.0)
+    await filled(pool, FRI, "TCS", "sell", 12, 1500.0, costs=52.0)
+    await pool.execute(
+        "INSERT INTO finance.desk_prices (symbol, date, close, split_ratio, source) "
+        "VALUES ('TCS.NS', $1, 3000, NULL, 'yahoo'), ('TCS.NS', $2, 1500, 2, 'yahoo')",
+        THU, FRI,
+    )
+    finance = market({"GOLDBEES.NS": [bar(MON, 100.0)]})
+    ansaar = FakeAnsaar({MON: [row("GOLDBEES", 0.10, day=MON, cls="etf")]})
+    out = await run(pool, ansaar, finance, TUE)
+    # 10 bought, doubled by the split, 12 sold: 8 are still held, so equity
+    # vanishing from the decisions is suspect and nothing trades.
+    assert out["planned"] == "held_suspect"
+    assert await pool.fetchval("SELECT count(*) FROM finance.desk_orders WHERE status = 'pending'") == 0
+
+
 async def test_a_holding_with_no_recent_price_raises_price_missing(pool):
-    await held_trade(pool)
+    await filled(pool, THU, "TCS", "buy", 3, 3000.0)
     await pool.execute("INSERT INTO finance.desk_prices (symbol, date, close, source) VALUES ('TCS.NS', $1, 3000, 'yahoo')", THU)
     await run(pool, FakeAnsaar({TUE: [row("TCS", 0.10, day=TUE)]}), market(), WED)
     assert ("desk_price_missing", "tcs") in await open_problems(pool)
@@ -2157,7 +2214,6 @@ from zoneinfo import ZoneInfo
 
 import asyncpg
 import structlog
-
 from aegis.connectors.ansaar import AnsaarError
 from aegis.services import desk_math as dm
 from aegis.services import hub_watch
@@ -2173,7 +2229,11 @@ DAILY_CLASSES = ["desk_decisions_stale", "desk_decisions_suspect", "desk_source_
 MONTHLY_CLASSES = ["desk_below_expectation"]
 FETCH_BACK_DAYS = 30
 REFETCH_OVERLAP_DAYS = 5
-PRICE_GRACE_DAYS = 3
+PRICE_GRACE_DAYS = 3  # market days before an unfillable order is cancelled
+PRICE_STALE_DAYS = 7  # calendar days before a price is too old to size or sell on
+STALE_INDEX_DAYS = 6  # calendar days before the market calendar itself looks wrong;
+# a long weekend plus a holiday is 4 to 5 days, so 6 keeps the alarm honest
+ANSAAR_FALLBACK_DAYS = 7  # how far back the fallback may reach; see _refresh
 
 
 def yahoo_symbol(symbol: str) -> str:
@@ -2194,6 +2254,12 @@ def _finding(klass: str, subject: str, title: str, description: str) -> dict:
 
 def _f(raw: Any) -> float | None:
     return float(raw) if raw is not None else None
+
+
+def _n(raw: float | None) -> float | None:
+    """Round before a numeric column, so the stored figure reads like a price
+    and not a float's binary expansion."""
+    return round(raw, 4) if raw is not None else None
 
 
 def _ts(raw: Any) -> datetime | None:
@@ -2220,7 +2286,7 @@ async def _store_bars(pool: asyncpg.Pool, symbol: str, bars: list[dict], source:
     wins, because Yahoo rewrites past closes after a split, and no bar for today
     or later is kept, because it could be an intraday price (spec §3 step 3)."""
     rows = [
-        (symbol, b["day"], b.get("close"), b.get("split_ratio"), b.get("dividend"), source)
+        (symbol, b["day"], _n(b.get("close")), _n(b.get("split_ratio")), _n(b.get("dividend")), source)
         for b in bars
         if b["day"] < today
     ]
@@ -2268,6 +2334,13 @@ async def _refresh(
         await _store_bars(pool, ysym, bars, "yahoo", today)
         return
     if ansaar is None or asset_class is None:
+        return
+    # ansaar's equity prices are back-adjusted for splits and dividends (its
+    # API.md says so), so only the last few days are safe to keep as traded
+    # prices. A symbol Yahoo does not carry at all therefore starts with a short
+    # history, which is enough to fill and value it from here on.
+    start = max(start, today - timedelta(days=ANSAAR_FALLBACK_DAYS))
+    if start > end:
         return
     try:
         bars = await ansaar.prices(symbol, asset_class, start, end)
@@ -2370,7 +2443,7 @@ async def _apply_fills(pool: asyncpg.Pool, results: list[dm.FillResult]) -> None
                 "UPDATE finance.desk_orders SET status = 'filled', fill_date = $2, fill_price = $3, "
                 "qty = $4, costs = $5, price_source = $6, filled_at = now() "
                 "WHERE id = $1::uuid AND status = 'pending'",
-                r.order_id, r.fill_day, r.price, r.qty, r.costs, r.source,
+                r.order_id, r.fill_day, _n(r.price), r.qty, _n(r.costs), r.source,
             )
         elif r.status == "cancelled":
             await pool.execute(
@@ -2401,7 +2474,10 @@ async def _write_plan(
         await conn.executemany(
             "INSERT INTO finance.desk_orders (mode, data_date, seq, created_day, symbol, asset_class, "
             "side, qty, ref_price) VALUES ('paper', $1, $2, $3, $4, $5, $6, $7, $8)",
-            [(day, i, created_day, o.symbol, o.asset_class, o.side, o.qty, o.ref_price) for i, o in enumerate(orders)],
+            [
+                (day, i, created_day, o.symbol, o.asset_class, o.side, o.qty, _n(o.ref_price))
+                for i, o in enumerate(orders)
+            ],
         )
 
 
@@ -2455,6 +2531,16 @@ async def _tick(pool: asyncpg.Pool, ansaar: Any, finance: Any, today: date) -> t
                 f"Yahoo returned no {INDEX} bars before {today}. Nothing was traded.",
             )
         ]
+    if (today - day).days > STALE_INDEX_DAYS:
+        # Yahoo answers 200 with no data when it rate-limits, which raises
+        # nothing and would leave the desk quietly idle on an old date.
+        return out | {"skipped": "stale_index"}, [
+            _finding(
+                "desk_source_error", "yahoo", "Trading desk: the market calendar is stale",
+                f"The last {INDEX} bar the desk has is {day}, more than {STALE_INDEX_DAYS} days "
+                f"before {today}. Yahoo may be refusing data without saying so. Nothing was traded.",
+            )
+        ]
     out["day"] = day.isoformat()
 
     # 2. Copy.
@@ -2472,26 +2558,27 @@ async def _tick(pool: asyncpg.Pool, ansaar: Any, finance: Any, today: date) -> t
         findings.append(ansaar_failure)
     decisions = await _decisions(pool, day)
 
-    # 3. Prices: held names, decided names, pending orders and both benchmarks.
+    # 3. Prices. What the desk holds comes from a replay, never from counting
+    # buys minus sells: a split leaves more shares than were ever bought, so a
+    # count would call a still-open position closed and lose it. So load the
+    # bars for every symbol ever filled, replay, and refresh from that.
     fills = await _fills(pool)
     pending = await _pending(pool)
-    net: dict[str, float] = defaultdict(float)  # ignores splits: it only chooses what to fetch
-    classes: dict[str, str] = {}
-    for f in fills:
-        net[f.symbol] += f.qty if f.side == "buy" else -f.qty
-        classes[f.symbol] = f.asset_class
-    wanted = {s: classes[s] for s, q in net.items() if q > 0}
+    ever = {f.symbol: f.asset_class for f in fills}
+    holdings = dm.replay(fills, await _bars(pool, set(ever)), rules.capital, today).held()
+    wanted = {s: ever[s] for s in holdings}
     wanted |= {d.symbol: d.asset_class for d in decisions if d.asset_class in rules.asset_classes}
     wanted |= {o.symbol: o.asset_class for o in pending}
     for symbol, asset_class in sorted(wanted.items()):
         await _refresh(pool, finance, ansaar, symbol, asset_class, today)
     for bench in {rules.benchmark, rules.context_benchmark} - {INDEX}:
         await _refresh(pool, finance, None, bench, None, today)
-    bars = await _bars(pool, set(wanted))
+    bars = await _bars(pool, set(wanted) | set(ever))
 
     # 4. Fill.
     if pending:
-        results = dm.fill_orders(pending, bars, index_days, dm.replay(fills, bars, rules.capital, today), rules)
+        book_now = dm.replay(fills, bars, rules.capital, today)
+        results = dm.fill_orders(pending, bars, index_days, book_now, rules, grace_days=PRICE_GRACE_DAYS)
         await _apply_fills(pool, results)
         out["filled"] = sum(r.status == "filled" for r in results)
         fills = await _fills(pool)
@@ -2525,8 +2612,20 @@ async def _tick(pool: asyncpg.Pool, ansaar: Any, finance: Any, today: date) -> t
         orders: list[dm.Order] = []
         skipped: list[str] = []
         if check.outcome == "ok":
-            symbols = {d.symbol for d in check.rows} | set(book.held())
-            closes = {s: px for s in symbols if (px := dm.close_on(bars.get(s, []), day)) is not None}
+            # A name whose price has gone stale is left out of the sizing, so
+            # plan_orders reports it rather than sizing or selling on an old
+            # price. Otherwise a delisted holding would have the same sell
+            # planned and cancelled forever, and nothing else could trade,
+            # because the desk never plans while an order is pending.
+            closes: dict[str, float] = {}
+            for symbol in {d.symbol for d in check.rows} | set(book.held()):
+                series = bars.get(symbol, [])
+                latest = max((b.day for b in series if b.close is not None), default=None)
+                if latest is None or (day - latest).days > PRICE_STALE_DAYS:
+                    continue
+                px = dm.close_on(series, day)
+                if px is not None:
+                    closes[symbol] = px
             orders, skipped = dm.plan_orders(check.rows, book, closes, rules)
         outcome = check.outcome if check.outcome != "ok" else ("orders" if orders else "no_change")
         await _write_plan(pool, day, outcome, plan_findings, skipped, orders, today)
@@ -2560,6 +2659,9 @@ async def _tick(pool: asyncpg.Pool, ansaar: Any, finance: Any, today: date) -> t
      second run. Restore it.
   2. Change the price insert's `COALESCE(finance.desk_prices.close, EXCLUDED.close)` to
      `EXCLUDED.close`. `test_a_stored_close_is_never_rewritten` must fail. Restore it.
+  3. Replace the `holdings = dm.replay(...).held()` line with a buys-minus-sells count
+     (`{s: q for s, q in net.items() if q > 0}`). `test_a_holding_survives_a_split_and_a_trim`
+     must fail, because the desk loses a position that a split enlarged. Restore it.
 
 - [ ] **Step 7: Run the whole core suite once** (`<PATHS>` = `tests/core/`, `<NAME>` = `desk-t6-core`).
   The migration must not break anything else. Then lint and commit:
@@ -2604,7 +2706,6 @@ from datetime import date
 
 import pytest
 import pytest_asyncio
-
 from aegis.services import trading_desk as td
 
 SEP, OCT = date(2026, 9, 1), date(2026, 10, 1)
@@ -2969,7 +3070,6 @@ git commit -m "feat(desk): a trading desk section in the month close, with its m
 from __future__ import annotations
 
 import pytest_asyncio
-
 from aegis.services.integrations_config import read_integration, save_integration
 
 _KEYS = ("integration:ansaar_url", "integration:ansaar_service_secret")
@@ -3004,12 +3104,11 @@ async def test_no_db_row_falls_back_to_settings_then_empty(pool, test_settings):
 from __future__ import annotations
 
 import pytest_asyncio
-from temporalio.testing import ActivityEnvironment
-
 from aegis.connectors.finance import FinanceConnector
 from aegis.services import trading_desk
 from aegis.services.integrations_config import save_integration
 from aegis_worker.activities.trading_desk import TradingDeskActivities
+from temporalio.testing import ActivityEnvironment
 
 _KEYS = ["integration:ansaar_url", "integration:ansaar_service_secret"]
 
@@ -3054,11 +3153,10 @@ from __future__ import annotations
 
 import uuid
 
+from aegis_worker.flows.trading_desk import TradingDeskConfig, TradingDeskFlow
 from temporalio import activity
 from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import Worker
-
-from aegis_worker.flows.trading_desk import TradingDeskConfig, TradingDeskFlow
 
 
 async def test_the_flow_runs_one_desk_tick():
@@ -3158,11 +3256,10 @@ from __future__ import annotations
 from typing import Any
 
 import structlog
-from temporalio import activity
-
 from aegis.connectors.ansaar import AnsaarClient
 from aegis.connectors.finance import FinanceConnector
 from aegis.services import integrations_config, trading_desk
+from temporalio import activity
 
 logger = structlog.get_logger()
 
@@ -3285,9 +3382,9 @@ In `worker/src/aegis_worker/__main__.py`:
 
 - [ ] **Step 3g: Registry counts.** In `tests/worker/test_registry.py`, find the parametrised
   `(homelab, money, flows, activities)` rows. Add one flow and one activity to the row where
-  `money` is `True`, and leave the two money-off rows alone. On 2026-09-12 that row was
-  `(True, True, 45, 226)`, becoming `(True, True, 46, 227)`. If main has moved, add +1/+1 to
-  whatever it says now. Add a comment line above the rows, in the file's style:
+  `money` is `True`, and leave the two money-off rows alone. After the merge of `origin/main`
+  that row reads `(True, True, 45, 229)`, so it becomes `(True, True, 46, 230)`. If main has
+  moved again, add +1/+1 to whatever it says then; never pin a guessed number. Add a comment line above the rows, in the file's style:
 
 ```python
         # Then +1 flow and +1 activity from Maou's paper trading desk:
