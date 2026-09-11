@@ -400,6 +400,16 @@ class StatementActivities:
             o for o in run.outcomes if o.statement_id in open_ids and o.row_id not in wrote
         )
         run = replace(run, outcomes=left, summaries=statement_match.summarise(left))
+        # What the run was narrowed from, for the digest's header: without it
+        # the goal state — everything in scope reconciled — reads as a digest
+        # that saw no statements.
+        tally = {
+            "reconciled": sum(s.statement_id in reconciled for s in statements),
+            "out_of_scope": sum(
+                s.statement_id not in reconciled and not scope.covers(s) for s in statements
+            ),
+            "open": len(open_ids),
+        }
 
         # Coverage rides the SAME call as the matcher's classes, because
         # `statement_missing` is an instrument class. That alone is not enough:
@@ -439,7 +449,7 @@ class StatementActivities:
                 for k, v in swept.items()
             },
             "digest": await _due_digest(
-                self.db_pool, statement_findings, run, today=date.today()
+                self.db_pool, statement_findings, run, today=date.today(), statements=tally
             ),
         }
 
@@ -614,7 +624,9 @@ def _coverage_findings(statements, findings_mod, *, today: date) -> list[dict] |
     )
 
 
-async def _due_digest(pool: Any, findings_mod, run, *, today: date) -> str:
+async def _due_digest(
+    pool: Any, findings_mod, run, *, today: date, statements: Mapping[str, int] | None = None
+) -> str:
     """The digest, at most once a month (#464).
 
     §15.4 keeps `monthly_digest` as the periodic READ on how the lane is doing —
@@ -632,7 +644,7 @@ async def _due_digest(pool: Any, findings_mod, run, *, today: date) -> str:
     month = today.strftime("%Y-%m")
     if await pool.fetchval("SELECT value FROM settings WHERE key = $1", DIGEST_SETTING) == month:
         return ""
-    digest = findings_mod.monthly_digest(run, period=month)
+    digest = findings_mod.monthly_digest(run, period=month, statements=statements)
     await pool.execute(
         "INSERT INTO settings (key, value, updated_at) VALUES ($1, $2, NOW()) "
         "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()",

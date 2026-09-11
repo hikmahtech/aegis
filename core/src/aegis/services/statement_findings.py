@@ -563,7 +563,11 @@ async def clear_closing_balance(
 
 
 def monthly_digest(
-    run: MatchRun, intake: IntakeReport | None = None, *, period: str = ""
+    run: MatchRun,
+    intake: IntakeReport | None = None,
+    *,
+    period: str = "",
+    statements: Mapping[str, int] | None = None,
 ) -> str:
     """The month's reconciliation as a report. Pure, and it alerts nobody.
 
@@ -571,9 +575,22 @@ def monthly_digest(
     is the lane working — which a task per finding answers badly. Match rate
     per bank says whether the rules are improving; the per-account unmatched
     counts say where the work is.
+
+    ``statements`` counts what ``run`` was narrowed FROM — ``reconciled``,
+    ``out_of_scope``, ``open`` — because the reconcile activity hands over only
+    the statements the lane can still act on. Without it the goal state, every
+    statement in scope reconciled, reads as a digest that saw nothing.
     """
     head = f"Reconciliation digest{f' — {period}' if period else ''}"
     lines = [head, "=" * len(head)]
+    if statements is not None:
+        total = sum(statements.values())
+        lines.append(
+            f"{total} {_plural(total, 'statement', 'statements')}: "
+            f"{statements.get('reconciled', 0)} reconciled, "
+            f"{statements.get('out_of_scope', 0)} out of scope, "
+            f"{statements.get('open', 0)} open"
+        )
 
     banks: dict[str, list[int]] = {}
     per_account: list[tuple[str, int, int]] = []
@@ -594,8 +611,14 @@ def monthly_digest(
             matched, rows = banks[bank]
             pct = (matched / rows * 100) if rows else 0.0
             lines.append(f"  {bank}: {matched}/{rows} rows matched ({pct:.1f}%)")
-    else:
+    elif statements is None:
         lines.append("  no statements in this run")
+    elif not statements.get("open"):
+        lines.append("  all in-scope statements reconcile with the books")
+    else:
+        # Open statements, but nothing of theirs left to match: every row was
+        # posted this tick, or there were none. Not reconciled either way.
+        lines.append("  no row of the open statements is left to match")
 
     unmatched = [a for a in per_account if a[2]]
     if unmatched:

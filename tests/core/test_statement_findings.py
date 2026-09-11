@@ -21,7 +21,7 @@ from aegis.services import hub_project, statements
 from aegis.services import statement_findings as sf
 from aegis.services.hub import get_problem
 from aegis.services.statement_intake import MISFILED, UNREADABLE, FileOutcome, IntakeReport
-from aegis.services.statement_match import Candidate, match_statements
+from aegis.services.statement_match import Candidate, MatchRun, match_statements
 from aegis.services.statements import PARSED, StatementLocked
 
 pytestmark = pytest.mark.asyncio
@@ -523,3 +523,26 @@ def test_the_monthly_digest_reports_the_run_without_alerting():
     assert "axis-9640/locked.pdf" in text
     # Pure: same run in, same report out, and no database anywhere near it.
     assert sf.monthly_digest(run, report, period="2026-07") == text
+
+
+def test_the_digest_counts_the_statements_its_run_was_narrowed_from():
+    """The activity hands the digest only the statements the lane can still act
+    on, so in the goal state — everything in scope reconciled — the run is
+    empty, and the digest used to say it saw no statements at all. The counts
+    say what was narrowed away, and the empty state says it is good news."""
+    empty = MatchRun(outcomes=(), summaries=(), claimed={})
+
+    done = sf.monthly_digest(
+        empty, period="2026-10", statements={"reconciled": 11, "out_of_scope": 2, "open": 0}
+    )
+    assert "13 statements: 11 reconciled, 2 out of scope, 0 open" in done
+    assert "all in-scope statements reconcile with the books" in done
+    assert "no statements in this run" not in done
+
+    # An open statement whose every row the tick posted leaves the run empty
+    # too, and it has not reconciled — the digest must not say it has.
+    posted = sf.monthly_digest(
+        empty, period="2026-10", statements={"reconciled": 0, "out_of_scope": 0, "open": 1}
+    )
+    assert "1 statement: 0 reconciled, 0 out of scope, 1 open" in posted
+    assert "reconcile with the books" not in posted

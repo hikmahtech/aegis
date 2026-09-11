@@ -653,6 +653,10 @@ async def test_a_reconciled_statement_raises_no_row_finding(clean, tmp_path, mon
     assert {r["statement"]: r["status"] for r in out["results"]} == {now: "posted"}, out
     assert _row_findings(seen, earlier) == []
     assert _row_findings(seen, "hdfc-1225") == []
+    # The goal state, and the digest must read as one: the narrowed run is
+    # empty, so without counts it said it saw no statements at all.
+    assert "2 statements: 2 reconciled, 0 out of scope, 0 open" in out["digest"]
+    assert "all in-scope statements reconcile with the books" in out["digest"]
 
 
 async def test_an_unreconciled_statement_in_scope_keeps_its_row_findings(
