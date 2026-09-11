@@ -1276,15 +1276,13 @@ class AgentTaskActivities:
         """The runbook for this alert, cut short, when the deployment has one.
 
         Read through AlertActivities, which owns where runbooks live (the
-        infra coding block's `runbooks_dir`, else the image's) and skips a
-        stub. Best-effort: a missing runbook is a shorter comment, not a
-        failure.
+        `runbooks` table first, then the files) and skips a stub.
+        Best-effort: a missing runbook is a shorter comment, not a failure.
         """
         if not alertname or self.alert_act is None:
             return ""
         try:
-            folder = await self.alert_act._effective_runbooks_dir()
-            text = self.alert_act._read_runbook(alertname, folder)
+            text = await self.alert_act._read_runbook(alertname)
         except Exception as exc:  # noqa: BLE001
             activity.logger.warning("agent_task_runbook_read_failed err=%s", str(exc)[:200])
             return ""
