@@ -375,6 +375,15 @@ async def test_a_closing_balance_problem_survives_a_sweep(db_pool):
     problem = await get_problem(db_pool, result.problem_id)
     assert (problem["class"], problem["subject_kind"]) == (sf.CLOSING_BALANCE, sf.STATEMENT)
     assert problem["severity"] == "critical"
+    # Its task says both figures, and that ticking it off will not keep it away.
+    assert await db_pool.fetchval(
+        "SELECT payload->>'description' FROM problem_events "
+        "WHERE problem_id = $1::uuid AND kind = 'occurrence'",
+        result.problem_id,
+    ) == (
+        "the bank moved 100, the books moved 90 — difference -10\n\n"
+        "This task comes back until the statement reconciles with the books."
+    )
 
     # A full sweep tick that produces no closing-balance finding, on both the
     # instrument and the statement kind.
@@ -579,8 +588,18 @@ async def _actions(pool, problem_id: str) -> list[str]:
     ]
 
 
-def _fresh(out, subject: str) -> str:
-    return next(f for f in out[sf.INSTRUMENT]["fresh"] if f["subject"] == subject)["problem_id"]
+def _fresh(out, subject: str, klass: str = sf.UNMATCHED_ROWS) -> str:
+    """The problem a sweep opened for one finding. Filtered by class as well as
+    subject: a match run on an account with no entity scope also finds
+    `unscoped_instrument` on the same subject, and a fresh one of those would
+    otherwise stand in for an unmatched-rows problem that never came back."""
+    found = [
+        f["problem_id"]
+        for f in out[sf.INSTRUMENT]["fresh"]
+        if f["subject"] == subject and f["klass"] == klass
+    ]
+    assert found, f"no fresh {klass} problem for {subject}"
+    return found[0]
 
 
 async def test_a_ticked_off_money_task_stays_quiet_until_a_new_row_turns_up(db_pool, ticks):
@@ -630,11 +649,93 @@ async def test_an_acknowledgement_outlives_the_seven_day_close(db_pool, ticks):
     assert await db_pool.fetchval(count, sf._key_for(key)) == 2
 
 
+@pytest.mark.parametrize("newer_closed", [False, True])
+async def test_a_newer_problem_the_watchdog_resolved_is_not_acknowledged(
+    db_pool, ticks, newer_closed
+):
+    """Only the NEWEST problem for a key speaks for it. An older problem a
+    person ticked off, and the seven-day close retired, must not cover a newer
+    one the watchdog resolved when its rows matched: a row that comes back
+    after that is news. The newer problem wins whether it is still live or
+    closed too.
+
+    Falsifiable: put closed problems first and the live case drops the row;
+    order by `first_seen_at` ascending and the all-closed case does.
+    """
+    inst = _instrument()
+    a, b = make_row(inst, 3, "100.00"), make_row(inst, 4, "200.00")
+    p1 = _fresh(await _sweep(db_pool, sf.match_findings(run_match([a]))), inst)
+    await _tick_off(db_pool, p1, NOW + timedelta(minutes=5))
+    assert await close_problem(db_pool, p1, now=NOW + timedelta(days=8))
+
+    t = NOW + timedelta(days=9)
+    p2 = _fresh(await _sweep(db_pool, sf.match_findings(run_match([a, b])), now=t), inst)
+    assert p2 != p1
+    # Every row matched: the watchdog resolves P2, not a person.
+    await _sweep(db_pool, [], kinds=(sf.INSTRUMENT,), now=t + timedelta(hours=1))
+    assert (await get_problem(db_pool, p2))["status"] == "resolved"
+    if newer_closed:
+        assert await close_problem(db_pool, p2, now=t + timedelta(days=8))
+
+    # Row A comes back. P1's acknowledgement must not cover it.
+    back = t + timedelta(days=9 if newer_closed else 0, hours=2)
+    out = await _sweep(db_pool, sf.match_findings(run_match([a])), now=back)
+    if newer_closed:
+        assert _fresh(out, inst) not in (p1, p2)
+    else:
+        assert (await get_problem(db_pool, p2))["status"] == "open"
+
+
+async def test_a_watchdog_resolve_after_a_persons_resolve_ends_the_acknowledgement(
+    db_pool, ticks
+):
+    """Only the LATEST resolve speaks for a problem. A person ticked it off, a
+    new row brought it back, then every row matched and the watchdog resolved
+    it. When the first rows return, the person's tick no longer covers them.
+
+    Falsifiable: read the first resolve instead of the last and they are
+    dropped.
+    """
+    inst = _instrument()
+    a, b, c = make_row(inst, 3, "100.00"), make_row(inst, 4, "200.00"), make_row(inst, 5, "300.00")
+    pid = _fresh(await _sweep(db_pool, sf.match_findings(run_match([a, b]))), inst)
+    await _tick_off(db_pool, pid, NOW + timedelta(minutes=5))
+    await _sweep(db_pool, sf.match_findings(run_match([a, b, c])), now=NOW + timedelta(hours=1))
+    assert (await get_problem(db_pool, pid))["status"] == "open"
+    await _sweep(db_pool, [], kinds=(sf.INSTRUMENT,), now=NOW + timedelta(hours=2))
+    assert (await get_problem(db_pool, pid))["status"] == "resolved"
+
+    await _sweep(db_pool, sf.match_findings(run_match([a, b])), now=NOW + timedelta(hours=3))
+    assert (await get_problem(db_pool, pid))["status"] == "open"
+
+
+@pytest.mark.parametrize("shape", ["empty", "shorter-than-its-count"])
+async def test_a_row_list_that_disagrees_with_its_count_is_never_acknowledged(
+    db_pool, ticks, shape
+):
+    """An empty list is a subset of anything, and a short one hides the rows it
+    left out. `match_findings` builds the ids and the count from the same
+    outcomes, so either shape means something upstream went wrong, and the
+    finding is reported rather than guessed quiet.
+
+    Falsifiable: drop the check in `_items` and both are taken as acknowledged.
+    """
+    inst = _instrument()
+    a, b = make_row(inst, 3, "100.00"), make_row(inst, 4, "200.00")
+    pid = _fresh(await _sweep(db_pool, sf.match_findings(run_match([a, b]))), inst)
+    await _tick_off(db_pool, pid, NOW + timedelta(minutes=5))
+    # Both are subsets of what the person ticked off, so only the check stops them.
+    payload = {"rows": 0, "row_ids": []} if shape == "empty" else {"rows": 2, "row_ids": [a.row_id]}
+    odd = sf.finding(sf.UNMATCHED_ROWS, inst, f"unmatched rows on {inst}", payload=payload)
+    await _sweep(db_pool, [odd], now=NOW + timedelta(hours=1))
+    assert (await get_problem(db_pool, pid))["status"] == "open"
+
+
 async def test_a_ticked_off_missing_statement_comes_back_for_the_next_month(db_pool, ticks):
     """A missing statement is acknowledged for its period, not for good."""
     inst = _instrument()
     august = sf.missing_statement_findings([inst], [], period="2026-08")
-    pid = _fresh(await _sweep(db_pool, august), inst)
+    pid = _fresh(await _sweep(db_pool, august), inst, sf.STATEMENT_MISSING)
     await _tick_off(db_pool, pid, NOW + timedelta(minutes=5))
 
     await _sweep(db_pool, august, now=NOW + timedelta(hours=1))
@@ -653,7 +754,7 @@ async def test_a_ticked_off_subject_finding_stays_quiet(db_pool, ticks):
         sf.finding(sf.UNSCOPED_INSTRUMENT, inst, f"No entity declared for {inst}",
                    payload={"instrument": inst})
     ]
-    pid = _fresh(await _sweep(db_pool, unscoped), inst)
+    pid = _fresh(await _sweep(db_pool, unscoped), inst, sf.UNSCOPED_INSTRUMENT)
     await _tick_off(db_pool, pid, NOW + timedelta(minutes=5))
     await _sweep(db_pool, unscoped, now=NOW + timedelta(hours=1))
     assert (await get_problem(db_pool, pid))["status"] == "resolved"

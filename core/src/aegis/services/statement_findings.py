@@ -509,12 +509,18 @@ def _items(klass: str, subject: str, payload: Mapping[str, Any]) -> frozenset[st
     period of a missing statement, and the subject alone for every other class.
 
     None when a row class carries no `row_ids` — past `_ROW_ID_CAP`, or an
-    occurrence recorded before the key existed. With nothing to compare, such
-    a finding is never taken as acknowledged.
+    occurrence recorded before the key existed — and when the list is empty or
+    disagrees with the count beside it. An empty list is a subset of anything
+    and a short one hides the rows it left out, while `match_findings` builds
+    both from the same outcomes, so either shape means something upstream went
+    wrong. With nothing trustworthy to compare, such a finding is never taken
+    as acknowledged.
     """
     if klass in _ROW_CLASSES:
         ids = payload.get("row_ids")
-        return frozenset(str(i) for i in ids) if isinstance(ids, list) else None
+        if not isinstance(ids, list) or not ids or len(ids) != payload.get("rows"):
+            return None
+        return frozenset(str(i) for i in ids)
     if klass == STATEMENT_MISSING:
         period = str(payload.get("period") or "")
         return frozenset({period}) if period else None
@@ -720,6 +726,11 @@ async def record_closing_balance(
                 "statement_id": statement_id,
                 "instrument": instrument,
                 "reason": reason[:1000],
+                # No "ticking this off" line: this class is not swept, and a
+                # reverted statement is posted again, and disagrees again, on
+                # every run until it reconciles.
+                "description": f"{reason[:1000]}\n\n"
+                "This task comes back until the statement reconciles with the books.",
             },
             occurred_at=now,
         ),
