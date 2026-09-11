@@ -335,3 +335,164 @@ def tax_owed(realised: list[Realised], rules: Rules) -> float:
             free = rules.ltcg_exemption_inr if asset_class == "equity" else 0.0
             total += rules.ltcg_rate * max(0.0, gain - free)
     return total
+
+
+@dataclass(frozen=True)
+class Order:
+    """A planned order, sized at the decision-date close (spec §4)."""
+
+    symbol: str
+    asset_class: str
+    side: str
+    qty: int
+    ref_price: float
+
+
+@dataclass(frozen=True)
+class PendingOrder:
+    id: str
+    symbol: str
+    asset_class: str
+    side: str
+    qty: int
+    created_day: date
+    data_date: date
+    seq: int
+
+
+@dataclass(frozen=True)
+class FillResult:
+    order_id: str
+    status: str  # "filled" | "cancelled" | "pending"
+    fill_day: date | None = None
+    qty: int = 0
+    price: float | None = None
+    costs: float = 0.0
+    source: str | None = None
+    reason: str = ""
+
+
+def _costs(side: str, qty: int, price: float, rules: Rules) -> float:
+    fee = qty * price * rules.cost_pct_per_side
+    return fee + rules.sell_charge_inr if side == "sell" else fee
+
+
+def plan_orders(
+    rows: tuple[Decision, ...], book: Book, closes: dict[str, float], rules: Rules
+) -> tuple[list[Order], list[str]]:
+    """Orders that move ``book`` toward ``rows``, in the order they must fill (spec §4).
+
+    ``closes`` holds the decision-date close of every held and decided symbol
+    the desk has a price for. Returns the orders and the names skipped, each as
+    ``"SYMBOL: reason"``.
+    """
+    held = book.held()
+    port = book.cash + sum(q * closes.get(s, book.avg_cost(s)) for s, q in held.items())
+    wanted = {r.symbol: r for r in rows}
+    sells: list[Order] = []
+    buys: list[tuple[tuple[int, float, str], Order]] = []
+    skipped: list[str] = []
+    for symbol, qty in held.items():
+        if symbol in wanted:
+            continue
+        px = closes.get(symbol)
+        if not px:
+            skipped.append(f"{symbol}: no_price")
+            continue
+        n = math.floor(qty + _EPS)
+        if n > 0:
+            sells.append(Order(symbol, book.classes[symbol], "sell", n, px))
+    for r in rows:
+        px = closes.get(r.symbol)
+        if not px:
+            skipped.append(f"{r.symbol}: no_price")
+            continue
+        target = r.target_weight * port
+        have = held.get(r.symbol, 0.0)
+        gap = target - have * px
+        if have > _EPS and abs(gap) <= max(rules.band_abs * port, rules.band_rel * target):
+            continue
+        if gap > 0:
+            n = math.floor(gap / px + _EPS)
+            if n == 0:
+                skipped.append(f"{r.symbol}: below_one_share")
+                continue
+            key = (r.selection_rank, -r.target_weight, r.symbol)
+            buys.append((key, Order(r.symbol, r.asset_class, "buy", n, px)))
+        elif gap < 0:
+            n = min(math.floor(have + _EPS), int(-gap / px + 0.5))
+            if n > 0:
+                sells.append(Order(r.symbol, r.asset_class, "sell", n, px))
+    cash = book.cash + sum(o.qty * o.ref_price - _costs("sell", o.qty, o.ref_price, rules) for o in sells)
+    orders = list(sells)
+    for _, o in sorted(buys, key=lambda item: item[0]):
+        unit = o.ref_price * (1 + rules.cost_pct_per_side)
+        n = min(o.qty, math.floor(cash / unit + _EPS)) if cash > 0 else 0
+        if n == 0:
+            skipped.append(f"{o.symbol}: no_cash")
+            continue
+        orders.append(Order(o.symbol, o.asset_class, "buy", n, o.ref_price))
+        cash -= n * unit
+    return orders, skipped
+
+
+def _split_factor(series: list[Bar], after: date, upto: date) -> float:
+    """New shares per old share from splits dated after ``after``, up to ``upto``."""
+    factor = 1.0
+    for b in series:
+        if after < b.day <= upto and b.split_ratio:
+            factor *= b.split_ratio
+    return factor
+
+
+def fill_orders(
+    pending: list[PendingOrder],
+    bars: dict[str, list[Bar]],
+    index_days: list[date],
+    book: Book,
+    rules: Rules,
+    grace_days: int = 3,
+) -> list[FillResult]:
+    """Fill pending paper orders at the close of their fill day (spec §6).
+
+    The fill day is the first market day on or after the day an order was
+    created. ``book`` is the desk before these fills. Orders fill in ``seq``
+    order, sells first; a buy that no longer fits the cash is cut, or cancelled
+    as ``no_cash``. No price ``grace_days`` market days after the fill day cancels the
+    order as ``price_missing``.
+    """
+    days = sorted(index_days)
+    cash = book.cash
+    results: list[FillResult] = []
+    for o in sorted(pending, key=lambda o: (o.created_day, o.seq)):
+        fill_day = next((d for d in days if d >= o.created_day), None)
+        if fill_day is None:
+            results.append(FillResult(o.id, "pending"))
+            continue
+        series = bars.get(o.symbol, [])
+        bar = bar_on(series, fill_day)
+        if bar is None or bar.close is None:
+            late = sum(1 for d in days if d > fill_day) >= grace_days
+            results.append(
+                FillResult(o.id, "cancelled", reason="price_missing") if late else FillResult(o.id, "pending")
+            )
+            continue
+        px = bar.close
+        qty = math.floor(o.qty * _split_factor(series, o.data_date, fill_day) + _EPS)
+        if o.side == "sell":
+            qty = min(qty, math.floor(book.qty(o.symbol) + _EPS))
+            if qty <= 0:
+                results.append(FillResult(o.id, "cancelled", reason="nothing_held"))
+                continue
+            costs = _costs("sell", qty, px, rules)
+            cash += qty * px - costs
+        else:
+            unit = px * (1 + rules.cost_pct_per_side)
+            qty = min(qty, math.floor(cash / unit + _EPS)) if cash > 0 else 0
+            if qty <= 0:
+                results.append(FillResult(o.id, "cancelled", reason="no_cash"))
+                continue
+            costs = _costs("buy", qty, px, rules)
+            cash -= qty * px + costs
+        results.append(FillResult(o.id, "filled", fill_day, qty, px, costs, bar.source))
+    return results
