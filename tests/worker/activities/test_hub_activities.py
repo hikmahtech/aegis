@@ -153,6 +153,42 @@ async def test_record_investigation_moves_status_and_links_prs(db_pool):
     assert again["status_changed"] is False
 
 
+async def test_record_investigation_after_the_alert_cleared_annotates_and_holds(db_pool):
+    """#484, at the seam the flow actually crosses. The alert clears while the
+    investigation is still running; its verdict is then recorded on the
+    timeline, the problem stays `resolved`, and the flow is told the move did
+    not happen (`status_changed: False`).
+
+    Falsifiable: let an investigation reopen a resolved problem and this
+    reports `status_changed: True` with the problem back in `waiting_human`.
+    """
+    env = ActivityEnvironment()
+    act = HubActivities(db_pool=db_pool)
+    s = f"svc_{uuid.uuid4().hex[:8]}"
+    pid = (await env.run(act.ingest_alert, _alert(s), False))["problem_id"]
+    await env.run(act.ingest_alert, _alert(s), True)
+    assert (await env.run(act.problem_status, pid))["resolved"] is True
+
+    out = await env.run(
+        act.record_investigation,
+        {
+            "problem_id": pid,
+            "status": "waiting_human",
+            "text": "Decision card posted: not_actionable.",
+            "external_id": "wf-late:gate2_card",
+            "posted": True,
+        },
+    )
+
+    assert out == {"recorded": True, "status_changed": False}
+    p = await get_problem(db_pool, pid)
+    assert p["status"] == "resolved" and p["resolved_at"] is not None
+    events = await list_events(db_pool, pid)
+    verdict = [e for e in events if e["kind"] == "investigation"]
+    assert verdict and verdict[0]["payload"]["status"] == "waiting_human"
+    assert not [e for e in events if e["payload"].get("action") == "reopen"]
+
+
 async def test_mute_and_verification_delay(db_pool):
     env = ActivityEnvironment()
     act = HubActivities(db_pool=db_pool)
