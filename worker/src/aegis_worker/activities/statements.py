@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Iterable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date, timedelta
 from pathlib import Path
 from typing import Any
@@ -348,6 +348,41 @@ class StatementActivities:
                 statement_id=statement.statement_id,
                 instrument=statement.instrument,
             )
+
+        # Row findings speak only for statements the lane can still act on, and
+        # the digest reads the same run. Two kinds of statement are not that,
+        # and between them they held every row of the lane's open money
+        # problems on 2026-09-11:
+        #
+        # * OUT OF SCOPE — the loop above never posts one, so its rows can never
+        #   close. 2,486 unmatched rows on axis-9640 and axis-cc-1313 sat in
+        #   statements starting before `since`, as tasks nothing could finish.
+        # * RECONCILED — it passed §9.3, so the bank's own printed totals agree
+        #   with the books. An unmatched or ambiguous row left in one is the
+        #   matcher not seeing its own posted entry, or an own-account transfer
+        #   indexed under the other account — not money missing from the books.
+        #
+        # Reconciled is read AFTER the loop, so a statement this tick reconciled
+        # counts: its rows were unmatched a moment before the loop posted them.
+        # Only the per-statement parts are narrowed; unscoped instruments and
+        # missing rates are about accounts and currencies and stay whole, and
+        # coverage below reads every statement.
+        reconciled = {
+            r["statement_id"]
+            for r in await self.db_pool.fetch(
+                "SELECT statement_id FROM finance.statements WHERE reconciled_at IS NOT NULL"
+            )
+        }
+        open_ids = {
+            s.statement_id
+            for s in statements
+            if scope.covers(s) and s.statement_id not in reconciled
+        }
+        run = replace(
+            run,
+            summaries=tuple(s for s in run.summaries if s.statement_id in open_ids),
+            outcomes=tuple(o for o in run.outcomes if o.statement_id in open_ids),
+        )
 
         # Coverage rides the SAME call as the matcher's classes, because
         # `statement_missing` is an instrument class. That alone is not enough:

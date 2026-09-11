@@ -578,6 +578,97 @@ async def _three_verdicts(pool) -> tuple[str, str, str, str]:
     return sid, matched, ambiguous, unmatched
 
 
+def _spy_on_sweep(monkeypatch) -> list[dict]:
+    """Every finding the activity hands the hub. The real sweep still runs."""
+    real = sf.sweep
+    seen: list[dict] = []
+
+    async def spy(pool, findings, **kw):
+        seen.extend(findings)
+        return await real(pool, findings, **kw)
+
+    monkeypatch.setattr(sf, "sweep", spy)
+    return seen
+
+
+def _row_findings(seen: list[dict], subject: str) -> list[str]:
+    return sorted(
+        f["klass"]
+        for f in seen
+        if f["subject"] == subject and f["klass"] in (sf.UNMATCHED_ROWS, sf.AMBIGUOUS_ROW)
+    )
+
+
+async def test_a_statement_the_lane_will_never_post_raises_no_row_finding(
+    clean, tmp_path, monkeypatch
+):
+    """The lane posts only statements starting on or after `since`, and the
+    findings counted every statement — so the 2,339 unmatched rows on
+    axis-9640's seven pre-July statements were a task no statement could ever
+    close. A row the lane will never post is not work the lane can do."""
+    cfg = _repo(tmp_path)
+    inst = f"zzold-{uuid.uuid4().hex[:8]}"
+    old = await _statement(clean, inst, "2024-05-01", "2024-05-31", "0", "-500", 1)
+    await _row(clean, inst, "2024-05-10", "out", "500.00", "OLD PURCHASE", old, "-500")
+    seen = _spy_on_sweep(monkeypatch)
+
+    out = await ActivityEnvironment().run(
+        _act(clean, cfg).reconcile_statements, True, "2026-07-01"
+    )
+
+    assert [r["status"] for r in out["results"]] == ["out_of_scope"]
+    assert _row_findings(seen, inst) == []
+    # The digest reads the same narrowed run, so the backlog it prints is the
+    # backlog the lane can still work.
+    assert out["digest"] and old not in out["digest"]
+
+
+async def test_a_reconciled_statement_raises_no_row_finding(clean, tmp_path, monkeypatch):
+    """A reconciled statement passed §9.3: the bank's own printed totals agree
+    with the books. An unmatched or ambiguous row left in one is the matcher
+    failing to see its own posted entry, or a transfer indexed under the other
+    account — hdfc-1225's four live rows were ₹1,00,000 in from the Axis
+    account, two ₹1,000 transfers to the kids' accounts and a ₹0.35 SMS fee —
+    not money missing from the books.
+
+    Both ways of being reconciled count: on an earlier tick, and on THIS tick,
+    whose rows the matcher saw as unmatched a moment before they were posted."""
+    cfg = _repo(tmp_path)
+    earlier = f"zzdone-{uuid.uuid4().hex[:8]}"
+    done = await _statement(clean, earlier, "2026-07-01", "2026-07-31", "0", "-1137.19", 2)
+    await clean.execute(
+        "UPDATE finance.statements SET reconciled_at = now() WHERE statement_id = $1", done
+    )
+    await _indexed(clean, "st-amb-1", earlier, "2026-07-11", "437.19")
+    await _indexed(clean, "st-amb-2", earlier, "2026-07-12", "437.19")
+    await _row(clean, earlier, "2026-07-12", "out", "437.19", "UPI OTHER", done, "-437.19")
+    await _row(clean, earlier, "2026-07-20", "out", "700.00", "SOMETHING", done, "-1137.19")
+    now = await _statement(clean, "hdfc-1225", "2026-07-01", "2026-07-31", "0", "-500", 1)
+    await _row(clean, "hdfc-1225", "2026-07-10", "out", "500.00", "ATM WITHDRAWAL", now, "-500")
+    seen = _spy_on_sweep(monkeypatch)
+
+    out = await ActivityEnvironment().run(_act(clean, cfg).reconcile_statements, True, "")
+
+    assert {r["statement"]: r["status"] for r in out["results"]} == {now: "posted"}, out
+    assert _row_findings(seen, earlier) == []
+    assert _row_findings(seen, "hdfc-1225") == []
+
+
+async def test_an_unreconciled_statement_in_scope_keeps_its_row_findings(
+    clean, tmp_path, monkeypatch
+):
+    """The narrowing must not overreach. An in-scope statement that has not
+    reconciled is exactly where the lane's work is, and its unmatched and
+    ambiguous rows are the findings that say so."""
+    cfg = _repo(tmp_path)
+    await _three_verdicts(clean)
+    seen = _spy_on_sweep(monkeypatch)
+
+    await ActivityEnvironment().run(_act(clean, cfg).reconcile_statements, False, "2026-07-01")
+
+    assert _row_findings(seen, "hdfc-1225") == [sf.AMBIGUOUS_ROW, sf.UNMATCHED_ROWS]
+
+
 async def test_the_matchers_verdict_is_recorded_on_its_row(clean, tmp_path):
     """#470. The matcher decided, the activity handed the decision to the poster,
     and it was gone when the tick ended: `matched_msgid` was NULL on all 2,800
