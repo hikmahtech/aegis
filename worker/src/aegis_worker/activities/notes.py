@@ -11,20 +11,26 @@ Four jobs:
 * `notes_journal_write` — the daylog's entry into the journal. Never raises:
   anything but `written`/`exists` sends the daylog back to its knowledge row,
   so a vault problem never loses a day.
-* `notes_index_vault` — the incremental index behind `NotesSyncFlow`.
-* `notes_backfill_journal` — the old daylog rows into the journal, once.
+* `notes_index_vault` — the incremental index behind `NotesSyncFlow`. It
+  leaves out `UNINDEXED_PREFIXES`.
+* `notes_backfill_journal` — the daylog's knowledge rows into the journal,
+  for the weekly `NotesBackfillFlow`.
+
+A time written into a note (a new note's template placeholders) is on the
+user's clock (`user_timezone`), not the container's UTC one.
 """
 
 from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date
 from typing import Any
 
 from aegis.services import notes
 from aegis.services import notes_write as nw
 from aegis.services.knowledge import _content_id_for
+from aegis.services.user_time import user_now
 from temporalio import activity
 
 from aegis_worker.activities.daylog import _stitch
@@ -34,7 +40,14 @@ INDEX_STATE_KEY = "notes_index_state"
 DEFAULT_INDEX_BATCH = 300
 # Journal entries per backfill commit.
 BACKFILL_BATCH = 50
+# Notes the index leaves out. `raphael/questions/` holds ResearchFlow's answers,
+# which the flow also keeps in the knowledge store (`aegis://research/<hash>`),
+# so indexing the note put every answer in retrieval twice. A row an earlier
+# run made for one is dropped on the next run.
+UNINDEXED_PREFIXES = (f"{notes.RAPHAEL_DIR}/questions/",)
 
+# Newest first: a weekly run is for the recent days whose vault write failed
+# and fell back to their knowledge row; the old rows went in on the first run.
 _BACKFILL_SQL = """
 SELECT c.source_type, c.metadata,
        array_agg(k.chunk_text ORDER BY k.chunk_index)
@@ -43,7 +56,7 @@ SELECT c.source_type, c.metadata,
   LEFT JOIN knowledge_chunks k ON k.content_id = c.content_id
  WHERE c.source_type IN ('daylog', 'daylog_rollup')
  GROUP BY c.content_id, c.source_type, c.metadata
- ORDER BY COALESCE(c.metadata->>'date', c.metadata->>'start')
+ ORDER BY COALESCE(c.metadata->>'date', c.metadata->>'start') DESC
  LIMIT $1
 """
 
@@ -92,7 +105,7 @@ class NotesActivities:
                 date.fromisoformat(str(entry["day"])),
                 str(entry["label"]),
                 str(entry.get("text") or ""),
-                datetime.now(),
+                await user_now(self.db_pool),
             )
             res = await notes.write(cfg, [ap], f"raphael: journal {entry['label']}")
         except notes.NotesDisabled:
@@ -121,14 +134,29 @@ class NotesActivities:
             state,
         )
 
-    async def _unindex(self, rel: str) -> int:
+    async def _delete(self, content_id: str, what: str) -> int:
         try:
-            return int(
-                bool(await self.knowledge_connector.delete_content(_content_id_for(notes.note_url(rel))))
-            )
+            return int(bool(await self.knowledge_connector.delete_content(content_id)))
         except Exception as exc:  # noqa: BLE001 — a stale row is retried next pass
-            activity.logger.warning("notes_unindex_failed path=%s err=%s", rel, str(exc)[:200])
+            activity.logger.warning("notes_unindex_failed path=%s err=%s", what, str(exc)[:200])
             return 0
+
+    async def _unindex(self, rel: str) -> int:
+        return await self._delete(_content_id_for(notes.note_url(rel)), rel)
+
+    async def _drop_unindexed(self) -> int:
+        """Remove the index rows of notes the index leaves out, which runs
+        before `UNINDEXED_PREFIXES` existed made. One small query a run; after
+        the first run it finds nothing."""
+        rows = await self.db_pool.fetch(
+            "SELECT content_id, url FROM knowledge_content "
+            "WHERE source_type = 'note' AND url LIKE ANY($1::text[])",
+            [notes.note_url(prefix) + "%" for prefix in UNINDEXED_PREFIXES],
+        )
+        removed = 0
+        for r in rows:
+            removed += await self._delete(r["content_id"], r["url"])
+        return removed
 
     @activity.defn
     async def notes_index_vault(self, max_files: int = DEFAULT_INDEX_BATCH) -> dict:
@@ -140,7 +168,8 @@ class NotesActivities:
         so the first pass over ~1,000 notes spreads over a few runs. A note that
         fails to index is retried at the start of the next pass; a deleted or
         emptied note leaves the index. Encrypted blocks are stripped by the
-        read, before anything is embedded.
+        read, before anything is embedded. Notes under `UNINDEXED_PREFIXES` are
+        never indexed.
         """
         cfg = self._cfg()
         if not cfg.configured:
@@ -150,7 +179,7 @@ class NotesActivities:
         batch_size = max(1, int(max_files or DEFAULT_INDEX_BATCH))
         state = await self._state()
 
-        removed = 0
+        removed = await self._drop_unindexed()
         if state.get("target") and isinstance(state.get("todo"), list):
             # A pass in progress is pinned to the commit it started from and
             # finishes even while HEAD moves (the nightly daylog commit, the
@@ -175,9 +204,10 @@ class NotesActivities:
                 removed += await self._unindex(rel)
 
         batch = todo[done : done + batch_size]
-        texts = await asyncio.to_thread(notes.read_many_sync, cfg, batch) if batch else {}
+        wanted = [rel for rel in batch if not rel.startswith(UNINDEXED_PREFIXES)]
+        texts = await asyncio.to_thread(notes.read_many_sync, cfg, wanted) if wanted else {}
         indexed = 0
-        for rel in batch:
+        for rel in wanted:
             text = texts.get(rel)
             if text is None or not text.strip():
                 removed += await self._unindex(rel)
@@ -227,9 +257,10 @@ class NotesActivities:
 
     @activity.defn
     async def notes_backfill_journal(self, limit: int = 1000) -> dict:
-        """Write the daylog's old knowledge rows into the matching journal
-        notes, once. The markers are the ones the live daylog uses, so a day
-        already in the journal is left alone and a second run writes nothing."""
+        """Write the daylog's knowledge rows into the matching journal notes,
+        newest first. The markers are the ones the live daylog uses, so a day
+        already in the journal is left alone and a run with nothing missing
+        writes nothing."""
         cfg = self._cfg()
         if not cfg.configured:
             return {"status": "not_configured"}
@@ -238,7 +269,7 @@ class NotesActivities:
         rows = await self.db_pool.fetch(_BACKFILL_SQL, max(1, int(limit)))
         appends: list[notes.Append] = []
         skipped = 0
-        now = datetime.now()
+        now = await user_now(self.db_pool)
         for r in rows:
             meta = r["metadata"] if isinstance(r["metadata"], dict) else {}
             text = _stitch(list(r["chunks"] or []))

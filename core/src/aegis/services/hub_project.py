@@ -154,14 +154,14 @@ _INFRA_OWNER = _Owner(SOURCE_TAG, "infra", _FALLBACK_LABEL)
 # complete it.
 RESEARCH_SOURCE_TAG = "#research"
 FEEDS_SOURCE_TAG = "#feeds"
+# `SOURCE_TAG` and every owner's tag here are the tags a projected task can
+# carry, so the agent lane needs a verb decision for each
+# (`test_agent_task_verbs` reads them from here).
 _OWNER_BY_SOURCE = {
     "money": _Owner(MONEY_SOURCE_TAG, "finance", "@maou", ("@next",), "personal"),
     "research": _Owner(RESEARCH_SOURCE_TAG, "research", "@raphael", ("@next",)),
     "feeds": _Owner(FEEDS_SOURCE_TAG, "research", "@raphael", ("@next",)),
 }
-# Every tag a projected task can carry. The agent lane needs a verb decision
-# for each (`test_agent_task_verbs`).
-HUB_SOURCE_TAGS = frozenset({SOURCE_TAG, *(o.source_tag for o in _OWNER_BY_SOURCE.values())})
 
 
 def _ts(value: Any) -> str:
@@ -629,16 +629,10 @@ def _history_text(kind: str, payload: dict[str, Any]) -> str:
 async def _topic_digest(pool: asyncpg.Pool, problem_id: str, limit: int = 10) -> str:
     """What a topic's round collected, newest first, as the task's description
     (#513): one line per article, linked."""
-    rows = await pool.fetch(
-        "SELECT payload FROM problem_events "
-        "WHERE problem_id = $1::uuid AND kind = 'occurrence' AND payload->>'item' = 'true' "
-        "ORDER BY occurred_at DESC, id DESC LIMIT $2",
-        problem_id,
-        limit,
-    )
+    from aegis.services.research_topics import round_items
+
     lines = []
-    for r in rows:
-        item = r["payload"] or {}
+    for item in await round_items(pool, problem_id, limit=limit):
         title = str(item.get("title") or item.get("url") or "").strip()[:160]
         url = str(item.get("url") or "").strip()
         lines.append(f"- [{title}]({url})" if url else f"- {title}")

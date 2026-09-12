@@ -51,8 +51,8 @@ Measured on prod, 30 days to 2026-09-11:
   topic task closes its round.
 - `hub_group.py`: `research` in `NON_GROUPABLE_SOURCES`.
 - Worker: `IntelligenceActivities.attach_topic_items`; IntelligenceScanFlow and
-  RssIngestFlow call it behind `workflow.patched("research-hub-513")`; the
-  briefing gathers `topics`; clarify treats `#feeds` and hub-projected
+  RssIngestFlow call it once per run (as built, without a `workflow.patched`
+  marker); the briefing gathers `topics`; clarify treats `#feeds` and hub-projected
   `#research` tasks as hub-owned; the verb table gains `#feeds: None`.
 - Tools: `track_topic` delegates to the service; `untrack_topic` is new.
 

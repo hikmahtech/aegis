@@ -9,8 +9,10 @@ Since #511/#512 each run also:
 * records every entry it stored or failed in `feed_entries`, so a feed's worth
   can be measured, and each fetch's outcome in the channel's config;
 * reports a feed that failed `feeds.FAILING_AFTER` fetches in a row (every
-  run) or published nothing for `stale_after_days` (once a day) to the problem
-  hub as a `feeds` finding, which resolves itself when the feed recovers.
+  run) or stored nothing for `stale_after_days` (once a day) to the problem
+  hub as a `feeds` finding. A failing feed's finding resolves after
+  `feeds.RECOVERED_AFTER` good fetches in a row; a stale one when the feed
+  stores an entry again.
 """
 
 from __future__ import annotations
@@ -36,11 +38,6 @@ _ACT_TIMEOUT = timedelta(seconds=60)
 _FETCH_TIMEOUT = timedelta(seconds=120)
 _HUB_TIMEOUT = timedelta(seconds=120)
 
-# A feed whose last known entry is older than this is almost certainly dead
-# (moved, discontinued, or was never a real feed) rather than just quiet —
-# surface it instead of polling it hourly forever (issue #120).
-_STALE_FEED_DAYS = 90
-
 # Attaching can raise a topic's task, which is a Todoist round trip.
 _TOPICS_TIMEOUT = timedelta(seconds=120)
 # The UTC hour whose run reconciles the stale findings. Staleness is measured
@@ -54,11 +51,6 @@ _STALE_REVIEW_HOUR = 3
 _SETTLED_UNSTORED = frozenset({"empty", "duplicate", "disabled", "refused"})
 
 
-def _newest(*stamps: str | None) -> str | None:
-    present = [s for s in stamps if s]
-    return max(present) if present else None
-
-
 def _parse_stamp(value: str | None) -> datetime | None:
     if not value:
         return None
@@ -70,27 +62,32 @@ def _parse_stamp(value: str | None) -> datetime | None:
 
 
 def _stale_finding(
-    now: datetime, identifier: str, config: dict, label: str, last_entry: str | None
+    now: datetime, identifier: str, config: dict, label: str, run: dict
 ) -> dict | None:
-    """A `feed_stale` finding when the feed's newest entry is older than its limit.
+    """A `feed_stale` finding when the last entry the store kept for the feed
+    is older than its limit.
 
-    A feed that never gave a dated entry (no cursor, or one that is not a
-    timestamp) is measured from when AEGIS began polling it
-    (`config.tracking_since`, set by `record_feed_run`). Before, such a feed
-    could never be reported stale at all."""
-    last = _parse_stamp(last_entry)
-    dated = last is not None
+    Measured from `feed_entries` (`run["last_stored_at"]`, which
+    `record_feed_run` reports), not from the cursor: the cursor also moves past
+    duplicates and entries that settled without being stored, so a feed whose
+    every entry was a duplicate looked alive. A feed that never stored an
+    entry is measured from when AEGIS began tracking it
+    (`run["tracking_since"]`, `feeds.tracking_since`) — the date the feed
+    stats show too."""
+    last_stored = run.get("last_stored_at")
+    last = _parse_stamp(last_stored)
+    stored = last is not None
     if last is None:
-        last = _parse_stamp(config.get("tracking_since"))
+        last = _parse_stamp(run.get("tracking_since"))
     if last is None:
         return None
     limit = feeds.stale_after_days(config)
     if (now - last).days < limit:
         return None
     title = (
-        f"RSS feed {label} has published nothing since {last.date().isoformat()}"
-        if dated
-        else f"RSS feed {label} has given no dated entry since AEGIS began polling it on "
+        f"RSS feed {label} has stored no new entry since {last.date().isoformat()}"
+        if stored
+        else f"RSS feed {label} has stored nothing since AEGIS began polling it on "
         f"{last.date().isoformat()}"
     )
     return {
@@ -100,11 +97,36 @@ def _stale_finding(
         "severity": "info",
         "payload": {
             "url": identifier,
-            "last_entry_at": last_entry,
-            "tracking_since": config.get("tracking_since"),
+            "last_stored_at": last_stored,
+            "tracking_since": run.get("tracking_since"),
             "stale_after_days": limit,
         },
     }
+
+
+def _held(klass: str, identifier: str, label: str) -> dict:
+    """A finding that keeps the feed's open problem of `klass` open and records
+    nothing. It opens nothing on its own (`hub_watch.reconcile_findings`), so
+    it is safe for a feed that has no problem."""
+    return {"klass": klass, "subject": identifier, "title": f"RSS feed {label}", "record": False}
+
+
+def _after_good_fetch(
+    now: datetime, identifier: str, config: dict, label: str, run: dict | None
+) -> tuple[list[dict], dict | None]:
+    """What a fetch that worked leaves: `(held findings, stale finding)`.
+
+    One good fetch does not end a failure: until `feeds.RECOVERED_AFTER` in a
+    row, the feed's `feed_failing` problem is kept open, so a feed that fails
+    every other hour is one problem rather than one opened and resolved all
+    day. And a record that could not be written says nothing about the feed
+    either way, so both its findings are kept as they are."""
+    if run is None:
+        return [_held("feed_failing", identifier, label), _held("feed_stale", identifier, label)], None
+    held = []
+    if int(run.get("fetch_successes") or 0) < feeds.RECOVERED_AFTER:
+        held.append(_held("feed_failing", identifier, label))
+    return held, _stale_finding(now, identifier, config, label, run)
 
 
 @dataclass
@@ -148,6 +170,8 @@ class RssIngestFlow:
         per_feed: list[dict] = []
         failing: list[dict] = []
         stale: list[dict] = []
+        # Findings kept open without a new occurrence (`_held`).
+        held: list[dict] = []
         # Every stored entry, for the tracked-topic match at the end (#513).
         topic_items: list[dict] = []
         now = workflow.now()
@@ -163,23 +187,6 @@ class RssIngestFlow:
             since = config.get("last_cursor")
             label = feeds.feed_label(identifier, config)
             mode = feeds.ingest_mode(config)
-
-            # Once per run: flag feeds that haven't yielded a new entry in a
-            # long time so they surface instead of being polled silently
-            # forever. `since` is the ISO timestamp of the last entry we
-            # ever accepted (or None if the feed has never yielded one).
-            if since:
-                try:
-                    last_entry_at = datetime.fromisoformat(since)
-                    stale_days = (workflow.now() - last_entry_at).days
-                except (ValueError, TypeError):
-                    stale_days = 0
-                if stale_days > _STALE_FEED_DAYS:
-                    workflow.logger.warning(
-                        "rss_feed_stale feed=%s days_since_last_entry=%d",
-                        identifier,
-                        stale_days,
-                    )
 
             fetch_error = ""
             result: FetchFeedResult | None = None
@@ -204,7 +211,14 @@ class RssIngestFlow:
                 )
                 errors += 1
                 per_feed.append({"feed": identifier, "status": "fetch_failed"})
-                failures = await self._record_run(ch, {"ok": False, "error": fetch_error})
+                run = await self._record_run(ch, {"ok": False, "error": fetch_error})
+                if run is None:
+                    # The count is unknown: keep what the hub has open for the
+                    # feed, and open and resolve nothing.
+                    held += [_held("feed_failing", identifier, label),
+                             _held("feed_stale", identifier, label)]
+                    continue
+                failures = int(run.get("fetch_failures") or 0)
                 per_feed[-1]["fetch_failures"] = failures
                 if failures >= feeds.FAILING_AFTER:
                     failing.append(
@@ -226,15 +240,21 @@ class RssIngestFlow:
                             "record": failures == feeds.FAILING_AFTER or review,
                         }
                     )
-                finding = _stale_finding(now, identifier, config, label, since)
+                else:
+                    # Under the threshold a failure opens nothing, but it never
+                    # resolves a failing feed either: that takes good fetches
+                    # (`feeds.RECOVERED_AFTER` in a row).
+                    held.append(_held("feed_failing", identifier, label))
+                finding = _stale_finding(now, identifier, config, label, run)
                 if finding:
                     stale.append(finding)
                 continue
 
             if not result.entries:
                 per_feed.append({"feed": identifier, "entries": 0})
-                await self._record_run(ch, {"ok": True, "backlog": 0})
-                finding = _stale_finding(now, identifier, config, label, since)
+                run = await self._record_run(ch, {"ok": True, "backlog": 0})
+                kept, finding = _after_good_fetch(now, identifier, config, label, run)
+                held += kept
                 if finding:
                     stale.append(finding)
                 continue
@@ -279,9 +299,9 @@ class RssIngestFlow:
             # outcome — either the entry was stored, or it was a known dup
             # (idempotency claim already held). Failed entries DO NOT advance
             # the cursor: leaving them inside the next-tick window gives the
-            # store another shot. Earlier code blindly advanced to
-            # `result.latest_published`, which silently dropped failed
-            # entries on the floor.
+            # store another shot. Earlier code blindly advanced to the feed's
+            # newest entry, which silently dropped failed entries on the
+            # floor.
             #
             # Taking the MAX of resolved entries was not enough, because a
             # batch is not ordered by outcome. If entry A (10:00) fails and
@@ -500,10 +520,11 @@ class RssIngestFlow:
             per_feed.append(entry_summary)
             total_failed += feed_failed
 
-            await self._record_run(ch, {"ok": True, "backlog": available - len(entries)})
-            finding = _stale_finding(
-                now, identifier, config, label, _newest(since, latest_resolved_published)
-            )
+            # After `record_feed_entries`, so this run's stored entries count
+            # towards the feed's last stored one.
+            run = await self._record_run(ch, {"ok": True, "backlog": available - len(entries)})
+            kept, finding = _after_good_fetch(now, identifier, config, label, run)
+            held += kept
             if finding:
                 stale.append(finding)
 
@@ -524,12 +545,16 @@ class RssIngestFlow:
                 workflow.logger.warning("rss_topic_attach_degraded err=%s", str(exc)[:200])
                 notes["topics_degraded"] = True
 
+        held_failing = [h for h in held if h["klass"] == "feed_failing"]
         found: dict = {"failing": len(failing)}
-        if not await self._reconcile(["feed_failing"], failing):
+        if held_failing:
+            found["held"] = len(held_failing)
+        if not await self._reconcile(["feed_failing"], failing + held_failing):
             notes["hub_degraded"] = True
         if review:
             found["stale"] = len(stale)
-            if not await self._reconcile(["feed_stale"], stale):
+            held_stale = [h for h in held if h["klass"] == "feed_stale"]
+            if not await self._reconcile(["feed_stale"], stale + held_stale):
                 notes["hub_degraded"] = True
         notes["findings"] = found
 
@@ -545,8 +570,12 @@ class RssIngestFlow:
         out.update(notes)
         return out
 
-    async def _record_run(self, ch: dict, outcome: dict) -> int:
-        """Record one fetch's outcome; the consecutive failure count, 0 when unknown."""
+    async def _record_run(self, ch: dict, outcome: dict) -> dict | None:
+        """Record one fetch's outcome and return what the feed's record says
+        now: `fetch_failures`, `fetch_successes`, `last_stored_at` and
+        `tracking_since`. None when the record could not be written — the
+        caller then keeps the feed's findings as they are, because a count it
+        does not have must not make a failing feed look healthy."""
         try:
             out = await workflow.execute_activity(
                 "record_feed_run",
@@ -558,8 +587,8 @@ class RssIngestFlow:
             workflow.logger.warning(
                 "rss_record_run_failed feed=%s err=%s", ch.get("identifier"), str(exc)[:200]
             )
-            return 0
-        return int((out or {}).get("fetch_failures") or 0)
+            return None
+        return out if isinstance(out, dict) else {}
 
     async def _reconcile(self, classes: list[str], findings: list[dict]) -> bool:
         """Hand the hub this run's feed findings; False when the hub could not take them."""

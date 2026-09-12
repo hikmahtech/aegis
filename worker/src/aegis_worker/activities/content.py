@@ -25,7 +25,7 @@ from aegis.services.content_extract import (
     fetch_and_extract,
     fetch_youtube_transcript,
 )
-from aegis.services.url_guard import UnsafeURLError
+from aegis.services.url_guard import UnsafeURLError, guarded_hooks
 from temporalio import activity
 
 logger = structlog.get_logger()
@@ -208,8 +208,13 @@ async def _transcribe_media(
 async def _transcribe_via_elevenlabs(
     url: str, api_key: str, stt_model: str = "scribe_v1"
 ) -> ContentResult | None:
-    """Transcribe audio/video via ElevenLabs Scribe (https://api.elevenlabs.io)."""
-    async with httpx.AsyncClient() as client:
+    """Transcribe audio/video via ElevenLabs Scribe (https://api.elevenlabs.io).
+
+    The media URL is a third party's (a feed entry, a bookmark), so the
+    download client carries the `url_guard` hook: the first request and every
+    redirect must stay on the public internet. The upload goes to ElevenLabs'
+    own fixed endpoint."""
+    async with httpx.AsyncClient(event_hooks=guarded_hooks()) as client:
         path = await _download_file(client, url, _MAX_MEDIA_BYTES, ".media")
         if not path:
             return None
@@ -442,7 +447,6 @@ class ContentActivities:
         url: str,
         title: str,
         summary: str,
-        extra_tags: list[str] | None = None,
     ) -> dict:
         """Store an RSS entry as its title and summary only, fetching nothing (#512).
 
@@ -461,7 +465,7 @@ class ContentActivities:
         if len(body) < 20:
             await self._record(url, "abstract", "empty", t0)
             return {"status": "empty"}
-        tags = list(dict.fromkeys(["rss", "abstract", *(t for t in (extra_tags or []) if t)]))
+        tags = ["rss", "abstract"]
         try:
             resp = await self.knowledge_connector.ingest_content(
                 url=url,

@@ -148,6 +148,7 @@ The shipped schedule set (`config/seed/activities.yaml` — all crons UTC):
 | `raindrop-ingest-2h` | `0 */2 * * *` | `RaindropIngestFlow` | Raphael | Raindrop bookmarks → knowledge store |
 | `service-drift-4h` | `0 */4 * * *` | `ServiceDriftFlow` | Pandora's Actor | Secondary swarm drift check (alertmanager is the primary path); one `replicas` / `oom_exit` problem per service on the hub, carded once |
 | `drive-sync-raphael` | `15 */4 * * *` | `DriveSyncFlow` | Raphael | Watched Google Drive folder → knowledge. **No-ops until `folder_id` is set** in its config |
+| `notes-sync-hourly` | `19 * * * *` | `NotesSyncFlow` | Raphael | Pulls the user's Obsidian vault — Raphael's record (#514) — and indexes what changed as `source_type='note'`, encrypted blocks stripped, at most `max_files` (300) a run. Leaves out `raphael/questions/`, whose answers are already in the store. Reports `not_configured` until the vault is |
 | `wearable-ingest-6h` | `50 */6 * * *` | `WearableIngestFlow` | Sebas | Wearable vendor API (Oura today) → `life.observations` (`sleep_score`, `readiness_score`, `activity_score`, `steps`). Needs **both** an `oura_api_token` under Integrations and an active `wearable` row under Channels — until then the run reports `token_missing` / `no_channel` rather than failing. Re-polls an overlapping window on purpose; rows dedup on `(source, metric, external_id)` in the database |
 
 **Daily**
@@ -165,7 +166,8 @@ The shipped schedule set (`config/seed/activities.yaml` — all crons UTC):
 | `expiry-radar-daily` | `25 7 * * *` | `ExpiryRadarFlow` | Sebas | Warns on anything in `life.expiring_items` (passport, visa, licence, insurance, warranty, medication, domain) crossing one of its `lead_days` thresholds. One Acknowledge card per threshold per expiry cycle — renewing an item (moving `expires_on`) re-arms them all. Add rows on the admin **Expiring Items** page; empty registry = silent. The admin **Assets** page feeds it too: an asset with both a service interval and a last-serviced date mirrors itself in as an `asset_service` item |
 | `intel-scan-hn` / `-news` / `-finance` | `0 7` / `30 7` / `0 8 * * *` | `IntelligenceScanFlow` | Raphael | Scores sources against your topics; ingests items ≥ `significance_threshold` |
 | `curiosity-daily` | `30 9 * * *` | `CuriosityCardFlow` | Sebas | At most one `input` card per day asking about a gap in what AEGIS knows (an unexplained recurring charge, a busy project, a recurring meeting face); the answer is banked as durable `agent_memory`. Gates itself on the notification budget, so a quiet day is the normal outcome. **The calendar-attendee lane stays off until you fill in Integrations → Owner (`owner_emails`)** — Google lists you among your own events' attendees, so without it the card could ask you who *you* are |
-| `daylog-nightly` | `0 19 * * *` | `DayLogFlow` | Raphael | Files the day as one dated knowledge entry (`aegis://daylog/<date>`, `source_type='daylog'`) so retrieval has a timeline. 19:00 UTC = 00:30 IST, i.e. just after the IST day closes |
+| `daylog-nightly` | `0 19 * * *` | `DayLogFlow` | Raphael | Writes the day into the vault's journal note as a `#raphael day log` entry (#514); `notes-sync-hourly` then indexes the note as `source_type='note'`, so retrieval has a timeline. Without the vault configured, or when the vault write fails, it files the day as one dated knowledge entry instead (`aegis://daylog/<date>`, `source_type='daylog'`). 19:00 UTC = 00:30 IST, i.e. just after the IST day closes |
+| `calibre-sync-daily` | `41 3 * * *` | `CalibreSyncFlow` | Raphael | One knowledge row per book in the Calibre library (metadata only, never the text), skipping unchanged books by fingerprint (#510). Reports `not_configured` until Integrations has a calibre-web user |
 
 **Weekly / monthly**
 
@@ -176,15 +178,18 @@ The shipped schedule set (`config/seed/activities.yaml` — all crons UTC):
 | `gtd-weekly-review` | `30 3 * * 0` | `WeeklyReviewFlow` | Sebas | Weekly review digest (Sunday) |
 | `money-close-monthly` | `0 4 1 * *` | `MonthCloseFlow` | Maou | The previous calendar month's close — income statement, balance sheet and index counts — sent and filed under `reports/monthly/`. The flow picks the month, so a manual re-run on any day closes the same one. Gated on **Money Hygiene** |
 | `receipt-ingest-weekly` | `0 5 * * 0` | `ReceiptIngestFlow` | Maou | Two jobs. It re-scans 14 days of receipt-shaped mail as a safety net behind the hourly tag fan-out, and it sweeps stored receipts that never reached the journal — every `finance.receipt_email` row below `parsed.version = 2`, oldest first, `sweep_limit` rows (default 20) per run. That sweep is also the backfill vehicle: widen `query_window` and raise `sweep_limit` in the row's config and the backlog drains a batch a run. Gated on **Money Hygiene** |
-| `daylog-weekly` | `20 20 * * 0` | `DayLogFlow` (`mode: weekly`) | Raphael | Condenses the ISO week's day logs into one `aegis://daylog/week/<iso-week>` entry (`source_type='daylog_rollup'`). Sunday, after that day's own 19:00 nightly entry |
-| `daylog-monthly` | `20 21 28-31 * *` | `DayLogFlow` (`mode: monthly`) | Raphael | Same for the calendar month → `aegis://daylog/month/<yyyy-mm>`. Cron has no last-day operator, so it fires on 28-31 and the flow drops every run but the real month end |
+| `daylog-weekly` | `20 20 * * 0` | `DayLogFlow` (`mode: weekly`) | Raphael | Condenses the ISO week's day logs (the journal notes, or the knowledge rows for days without one) into the vault's weekly journal note — or, without the vault, one `aegis://daylog/week/<iso-week>` entry (`source_type='daylog_rollup'`). Sunday, after that day's own 19:00 nightly entry |
+| `daylog-monthly` | `20 21 28-31 * *` | `DayLogFlow` (`mode: monthly`) | Raphael | Same for the calendar month → the month folder's own journal note, or `aegis://daylog/month/<yyyy-mm>` without the vault. Cron has no last-day operator, so it fires on 28-31 and the flow drops every run but the real month end |
+| `notes-backfill-weekly` | `47 4 * * 0` | `NotesBackfillFlow` | Raphael | Puts the daylog's knowledge rows into the vault journal, newest first (#514). With the vault configured the daylog files such a row only when its vault write fails, so this is what files that day where it belongs; a week with nothing missing writes nothing. Inert until the vault is configured |
 
 Not in this table because they're **event-driven, not scheduled**:
 `InteractionFlow` (spawned by any flow needing a decision),
 `AlertInvestigationFlow` (webhooks + pollers, [§7](#7-the-alert-pipeline)),
 `MoneyProcessFlow` (per-email child: one money email into the books),
 `AgentChatReplyFlow` (Todoist comment replies), `AgentTaskFlow` (per-task child
-of the sweep), and `GitHubAlertFlow` (GitHub PR webhook: notifies on opened PRs, and hands a closed one to the hub, which follows a fix PR an investigation opened).
+of the sweep), `ResearchFlow` (one research question, from `research_topic` or
+a `#research` task), `NotesWriteFlow` (one vault write from `note_write` /
+`note_link`), and `GitHubAlertFlow` (GitHub PR webhook: notifies on opened PRs, and hands a closed one to the hub, which follows a fix PR an investigation opened).
 
 Note the **ship-active-but-inert** pattern: `social-publish-5min`,
 `llm-spend-guard-15min`, `drive-sync-raphael`, `wearable-ingest-6h`,

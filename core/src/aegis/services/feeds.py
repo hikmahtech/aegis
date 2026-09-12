@@ -53,6 +53,10 @@ DEFAULT_INGEST_MODE = "full"
 # Fetches that must fail in a row before the feed is a hub finding. The flow
 # runs hourly, so three is three hours — past a blip, well inside a day.
 FAILING_AFTER = 3
+# Good fetches that must follow in a row before a failing feed's finding
+# resolves. One was enough, so a feed that failed every other hour opened and
+# resolved its problem all day.
+RECOVERED_AFTER = 2
 # Days without a new entry before a feed is reported stale; per feed
 # `channels.config.stale_after_days` overrides it.
 DEFAULT_STALE_AFTER_DAYS = 30
@@ -146,6 +150,20 @@ ORDER BY ch.active DESC, ch.identifier
 """
 
 
+def tracking_since(first_entry_at: Any, config: dict | None) -> str | None:
+    """When AEGIS began tracking a feed: the first entry it recorded
+    (`min(feed_entries.seen_at)`), else its first poll (`config.tracking_since`,
+    which `record_feed_run` sets once).
+
+    The one definition. The stale check measures a feed that never stored an
+    entry from it (`RssIngestFlow`, via `record_feed_run`), the feed stats
+    show it, and `unused_feeds` judges a feed's history by it."""
+    if first_entry_at:
+        return _iso(first_entry_at)
+    value = (config or {}).get("tracking_since")
+    return value if isinstance(value, str) and value else None
+
+
 async def feed_stats(pool: asyncpg.Pool) -> list[dict[str, Any]]:
     """Every rss channel with its measured worth. One query; cheap on the full store."""
     out: list[dict[str, Any]] = []
@@ -159,7 +177,7 @@ async def feed_stats(pool: asyncpg.Pool) -> list[dict[str, Any]]:
                 "active": r["active"],
                 "agent_id": config.get("agent_id") or "",
                 "ingest": ingest_mode(config),
-                "tracking_since": _iso(r["tracking_since"]),
+                "tracking_since": tracking_since(r["tracking_since"], config),
                 "entries_30d": _int(r["entries_30d"]),
                 "entries_90d": _int(r["entries_90d"]),
                 "stored_30d": _int(r["stored_30d"]),

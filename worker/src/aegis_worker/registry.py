@@ -78,7 +78,7 @@ from aegis_worker.flows.memory_reflection import MemoryReflectionFlow, MemoryRef
 from aegis_worker.flows.money_brief import MoneyBriefConfig, MoneyBriefFlow
 from aegis_worker.flows.money_process import MoneyProcessFlow
 from aegis_worker.flows.month_close import MonthCloseConfig, MonthCloseFlow
-from aegis_worker.flows.notes_backfill import NotesBackfillFlow
+from aegis_worker.flows.notes_backfill import NotesBackfillConfig, NotesBackfillFlow
 from aegis_worker.flows.notes_sync import NotesSyncConfig, NotesSyncFlow
 from aegis_worker.flows.notes_write import NotesWriteFlow
 from aegis_worker.flows.profile_reflection import ProfileReflectionConfig, ProfileReflectionFlow
@@ -298,7 +298,7 @@ FLOWS: tuple[FlowSpec, ...] = (
         lambda act: CalibreSyncConfig(agent_id=act["agent_id"]),
     ),
     # Raphael's notes (#514): one chat write (started by note_write/note_link),
-    # the hourly vault index, and the hand-started journal backfill. All inert
+    # the hourly vault index, and the weekly journal backfill. All inert
     # until the Integrations page has notes_repo_url + notes_deploy_key.
     FlowSpec(NotesWriteFlow),
     FlowSpec(
@@ -308,7 +308,13 @@ FLOWS: tuple[FlowSpec, ...] = (
             max_files=_int(act["config"], "max_files", NotesSyncConfig.max_files),
         ),
     ),
-    FlowSpec(NotesBackfillFlow),
+    FlowSpec(
+        NotesBackfillFlow,
+        lambda act: NotesBackfillConfig(
+            agent_id=act["agent_id"],
+            limit=_int(act["config"], "limit", NotesBackfillConfig.limit),
+        ),
+    ),
     FlowSpec(
         RssIngestFlow,
         lambda act: RssIngestInput(agent_id=act["agent_id"]),

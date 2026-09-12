@@ -37,10 +37,6 @@ def test_a_bozo_parse_that_is_not_a_feed_is_still_a_failure():
     assert "not well-formed" in _fetch_error(_parse(bozo=1, bozo_exception=exc))
 
 
-def test_an_http_error_is_a_failure_even_for_a_recognised_feed():
-    assert _fetch_error(_parse(status=410, bozo=1, version="rss20")) == "HTTP 410"
-
-
 @pytest_asyncio.fixture(loop_scope="function")
 async def pool(db_pool):
     await db_pool.execute("DELETE FROM channels WHERE identifier = $1", _URL)

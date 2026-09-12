@@ -10,11 +10,11 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
-from datetime import datetime
 from typing import Any
 
 from aegis.services import library, notes
 from aegis.services import research as rs
+from aegis.services.user_time import user_now
 from temporalio import activity
 
 # How many of a topic round's items a topic task's research run is given.
@@ -295,7 +295,9 @@ class ResearchActivities:
         cfg = notes.config_from_settings(self.settings)
         if not cfg.configured:
             return None
-        ap = notes.question_append(question, rs.render_report(answer, sources), datetime.now())
+        # Dated on the user's calendar, not the container's UTC one.
+        asked = await user_now(self.db_pool)
+        ap = notes.question_append(question, rs.render_report(answer, sources), asked)
         try:
             res = await notes.write(cfg, [ap], "raphael: research answer")
         except Exception as exc:  # noqa: BLE001 — the store save stands; the vault is the extra

@@ -64,6 +64,18 @@ _DETECTORS = ("calendar_attendee", "unknown_payee", "todoist_project", "untracke
 _KNOWLEDGE_TOOLS = ("search_knowledge", "ask_knowledge", "find_reference")
 _EMPTY_SEARCH_DAYS = 14
 _MIN_EMPTY_SEARCHES = 2
+# `search_knowledge` always returns the nearest documents, so "nothing on it"
+# is a best hit far below a real match, not an empty list. Picked from prod,
+# read-only, on 2026-09-13: of 17 recorded searches the best hit was the thing
+# asked for in 12 (similarity 0.625-0.781) and an unrelated document in 5
+# (0.625-0.638). The two ranges overlap, so the floor sits under every
+# relevant hit: a search counted here found nothing, at the price of missing
+# some that found only noise — asking wrongly costs the user a card.
+_SEARCH_MISS_BELOW = 0.60
+# `find_reference`'s whole answer when neither of its sources has anything
+# (`services/tools/gtd.py`). It is prose, so the chat loop records it as
+# `{"raw": ...}`.
+_NO_REFERENCE = "No reference matches."
 _SUBJECT_RE = re.compile(r"[^a-z0-9 +#.-]+")
 
 # How far back the unknown-payee detector looks. A payment from last year is
@@ -593,7 +605,7 @@ class CuriosityActivities:
         from aegis.services import research_topics
 
         rows = await self.db_pool.fetch(
-            "SELECT COALESCE(args->>'query', args->>'question', '') AS q, result "
+            "SELECT tool_name, COALESCE(args->>'query', args->>'question', '') AS q, result "
             "FROM chat_tool_calls WHERE tool_name = ANY($1::text[]) AND surface = 'chat' "
             "AND status = 'success' AND created_at > now() - make_interval(days => $2) "
             "ORDER BY created_at DESC LIMIT 500",
@@ -602,7 +614,7 @@ class CuriosityActivities:
         )
         asks: dict[str, int] = {}
         for r in rows:
-            if not self._empty_answer(r["result"]):
+            if not self._empty_answer(r["tool_name"], r["result"]):
                 continue
             subject = self._search_subject(r["q"])
             if subject:
@@ -639,28 +651,46 @@ class CuriosityActivities:
         return out
 
     @staticmethod
-    def _empty_answer(result: Any) -> bool:
-        """Whether a knowledge tool's recorded result found nothing. Every
-        shape the three tools return: a bare list (`search_knowledge`),
-        `{results: []}` (`find_reference`), `{answer, sources: []}`
-        (`ask_knowledge`). An error envelope is not empty — it is an outage."""
+    def _empty_answer(tool: str, result: Any) -> bool:
+        """Whether a knowledge tool's recorded result found nothing, in the
+        shapes the chat loop records (`tools.base.recorded_result`: the tool's
+        JSON, or `{"raw": ...}` when it answered in prose):
+
+        * `search_knowledge`: a list of documents, each with a `similarity` —
+          or, cut to the result budget, `{"total", "results": [...],
+          "truncated"}`. It always returns the nearest documents, so nothing
+          found is a best hit under `_SEARCH_MISS_BELOW` (or no documents).
+        * `ask_knowledge`: `{answer, sources, confidence}`; nothing found is
+          no sources.
+        * `find_reference`: prose; nothing found is `_NO_REFERENCE`.
+
+        An error envelope is never empty — it is an outage."""
         import json
 
         if isinstance(result, str):
             try:
                 result = json.loads(result)
             except ValueError:
-                return False
-        if isinstance(result, list):
-            return not result
-        if isinstance(result, dict):
-            if result.get("error") or result.get("status") == "unavailable":
-                return False
-            if isinstance(result.get("results"), list):
-                return not result["results"]
-            if "sources" in result:
-                return not result.get("sources")
-        return False
+                result = {"raw": result}
+        if isinstance(result, dict) and (
+            result.get("error") or result.get("status") == "unavailable"
+        ):
+            return False
+        if tool == "find_reference":
+            return isinstance(result, dict) and str(result.get("raw") or "").strip() == _NO_REFERENCE
+        if tool == "ask_knowledge":
+            return isinstance(result, dict) and "sources" in result and not result.get("sources")
+        docs = result.get("results") if isinstance(result, dict) else result
+        if not isinstance(docs, list):
+            return False
+        sims = [
+            d["similarity"]
+            for d in docs
+            if isinstance(d, dict) and isinstance(d.get("similarity"), int | float)
+        ]
+        if not docs:
+            return True
+        return bool(sims) and max(sims) < _SEARCH_MISS_BELOW
 
     @staticmethod
     def _search_subject(query: str) -> str:

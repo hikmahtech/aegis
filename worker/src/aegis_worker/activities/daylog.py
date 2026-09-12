@@ -455,8 +455,7 @@ class DayLogActivities:
         The block sits inside the note's `## Journal`, after whatever the user
         wrote there, so clipping the note from the top dropped Raphael's
         narrative whenever the template plus the user's writing ran past the
-        clip. `split_section` finds it by its marker, in the current bullet
-        shape and in the first `## Raphael` one."""
+        clip. `split_section` finds it by its marker."""
         mine, rest = notes.split_section(text, notes.journal_key("daily", day))
         if not mine:
             return text[:_ROLLUP_ENTRY_CLIP]

@@ -180,6 +180,17 @@ def _truncate_text(text: str, max_bytes: int) -> str:
     return text.encode()[:budget].decode(errors="ignore") + _TRUNCATION_MARKER
 
 
+def recorded_result(tool_result: str) -> Any:
+    """A tool's (already truncated) return as `chat_tool_calls.result` stores
+    it: the JSON it holds, or `{"raw": <first 500 characters>}` when it is
+    prose. Readers of that column (the curiosity lane, "which tools are
+    failing?") meet exactly these two shapes."""
+    try:
+        return json.loads(tool_result)
+    except (json.JSONDecodeError, TypeError):
+        return {"raw": tool_result[:500]}
+
+
 def _truncate_result(result_json: str, max_bytes: int = 4096) -> str:
     """Trim a JSON-serialised tool result so it fits within ``max_bytes``.
 

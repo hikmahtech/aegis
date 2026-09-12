@@ -151,8 +151,9 @@ journal:
   card stays last. A note without that section gets `## Journal` /
   `## Review` and the block at its end.
   Readers (`split_section`, the rollups, the backfill) find the block by its
-  marker, look at both the filed note and the root one, and still read the
-  first `## Raphael` shape.
+  marker and look at both the filed note and the root one. The first
+  `## Raphael` shape is no longer read: the layout repair rewrote every note
+  that carried it.
 - **The index follows the record.** With the vault configured, the daylog stops
   writing its own `daylog` / `daylog_rollup` rows; `NotesSyncFlow` indexes the
   journal note like any other note. If the vault write fails, the daylog files
@@ -171,6 +172,12 @@ files are removed from the index, and a rename is both. At most 300 files per
 run; the rest wait for the next run, so the first full pass of 1,023 notes
 takes about four runs.
 
+**Amended 2026-09-13** (audit): the index also skips `raphael/questions/`.
+`ResearchFlow` keeps each answer in the knowledge store too
+(`aegis://research/<hash>`), so indexing the note put every answer in
+retrieval twice. A row an earlier run made for one is removed on the next
+run.
+
 ## 7. Notes rank above raw documents
 
 `SourceTypeInfo` gains `rank_boost` (default 1.0, so every existing type ranks
@@ -186,6 +193,17 @@ gather step also searches notes on their own and puts them first.
 - `note_write`: create or append under `raphael/` only.
 - `note_link`: append a `[[wikilink]]` or URL line to a note under `raphael/`.
 
+Insert-only has a consequence worth stating: a write can never fill in a
+placeholder that is already in a note (an empty `- ` bullet, a template's
+blank field). It inserts one new block; the placeholder stays where the user
+left it. Only a note Raphael creates from a template drops its empty
+placeholders, before anyone has seen it (§5).
+
+Not built: a `raphael/topics/` note per tracked topic and a `raphael/books/`
+note per book. Tracked topics live on the problem hub (#513) and books in
+Calibre (#510). `raphael/topics/` in the `note_write` example is only a folder
+Raphael may choose to write in.
+
 The two writers validate and then hand the write to `NotesWriteFlow` under
 `notes-write-<op>-<sha256 of the content>`, wait `NOTES_WRITE_WAIT_S` and relay
 the answer — the `BooksWriteFlow` seam — so a retried turn re-attaches and a
@@ -198,9 +216,14 @@ same answer is never appended twice and a new answer is a new dated section).
 
 ## 9. Backfill
 
-`NotesBackfillFlow` (started by hand, never scheduled) writes the existing
-`daylog` and `daylog_rollup` rows into the matching journal notes once,
-through the same writer and markers, so it is safe to run twice.
+`NotesBackfillFlow` writes the `daylog` and `daylog_rollup` rows into the
+matching journal notes through the same writer and markers, newest first, so
+running it again writes nothing new.
+
+**Amended 2026-09-13** (audit): it runs weekly (`notes-backfill-weekly`,
+Sunday 04:47 UTC), not only by hand. The first run moved the old rows. With
+the vault configured the daylog files a row only when its vault write fails,
+so a later run is what puts such a day in the journal.
 
 ## 10. Testing
 

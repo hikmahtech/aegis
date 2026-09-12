@@ -49,8 +49,12 @@ def _stubs(
     terms_fail: bool = False,
     content_status: str = "ok",
     failures_before: int = 0,
+    successes_before: int = 0,
+    last_stored_at: str | None = None,
+    tracking_since: str | None = None,
+    record_fails: bool = False,
 ):
-    state = {"failures": failures_before}
+    state = {"failures": failures_before, "successes": successes_before}
 
     @activity.defn(name="list_active_channels")
     async def list_channels(kind: str) -> list[dict]:
@@ -81,7 +85,7 @@ def _stubs(
         return {"status": content_status, "content_id": f"full-{url}"}
 
     @activity.defn(name="store_feed_abstract")
-    async def abstract(url, title, summary, extra_tags=None) -> dict:
+    async def abstract(url, title, summary) -> dict:
         rec.abstract.append(url)
         return {"status": "ok", "content_id": f"abs-{url}"}
 
@@ -93,8 +97,19 @@ def _stubs(
     @activity.defn(name="record_feed_run")
     async def record_run(channel_id: str, outcome: dict) -> dict:
         rec.runs.append(outcome)
-        state["failures"] = 0 if outcome.get("ok") else state["failures"] + 1
-        return {"fetch_failures": state["failures"]}
+        if record_fails:
+            raise RuntimeError("the channels row could not be written")
+        ok = bool(outcome.get("ok"))
+        state["failures"] = 0 if ok else state["failures"] + 1
+        state["successes"] = state["successes"] + 1 if ok else 0
+        # As the real activity reports it: the last entry the store kept, and
+        # when tracking began (the first entry, else the first poll).
+        return {
+            "fetch_failures": state["failures"],
+            "fetch_successes": state["successes"],
+            "last_stored_at": last_stored_at,
+            "tracking_since": tracking_since or config.get("tracking_since"),
+        }
 
     @activity.defn(name="reconcile_findings")
     async def reconcile(inp: dict) -> dict:
@@ -224,19 +239,24 @@ async def test_a_failed_fetch_becomes_a_hub_finding_on_the_third_in_a_row():
 
 @pytest.mark.asyncio
 async def test_a_first_failed_fetch_is_not_yet_a_finding_but_is_still_reconciled():
-    """The failing reconcile runs every time: an empty list is what resolves a
-    feed that recovered."""
+    """The failing reconcile runs every time. A failure under the threshold
+    records nothing and opens nothing, but it is still found: a failure never
+    resolves a failing feed, only good fetches in a row do."""
     rec = Rec()
     await _run(_stubs(rec, config={}, fetch_error="HTTP 503"), "rf-fail-1")
     failing = next(r for r in rec.reconciles if r["classes"] == ["feed_failing"])
-    assert failing["findings"] == []
+    assert [(f["subject"], f["record"]) for f in failing["findings"]] == [(FEED, False)]
 
 
 @pytest.mark.asyncio
 async def test_a_quiet_feed_past_its_limit_is_reported_stale_at_the_review_hour():
     rec = Rec()
-    config = {"label": "Quiet", "last_cursor": "2020-01-01T00:00:00+00:00", "stale_after_days": 30}
-    result = await _run(_stubs(rec, config=config, entries=[]), "rf-stale", stale_review_hour=-1)
+    config = {"label": "Quiet", "stale_after_days": 30}
+    result = await _run(
+        _stubs(rec, config=config, entries=[], last_stored_at="2020-01-01T00:00:00+00:00"),
+        "rf-stale",
+        stale_review_hour=-1,
+    )
     stale = next(r for r in rec.reconciles if r["classes"] == ["feed_stale"])
     assert [f["klass"] for f in stale["findings"]] == ["feed_stale"]
     assert "2020-01-01" in stale["findings"][0]["title"]

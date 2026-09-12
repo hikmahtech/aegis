@@ -49,7 +49,7 @@ def _stubs(cap):
     async def fetch(inp: FetchFeedInput) -> FetchFeedResult:
         # Newest first, as a real feed serves them.
         entries = [_entry(i) for i in range(BURST, 0, -1)]
-        return FetchFeedResult(entries=entries, latest_published=f"2026-04-18T{BURST:02d}:00:00")
+        return FetchFeedResult(entries=entries)
 
     @activity.defn(name="ingest_idempotency_claim")
     async def claim(source_type: str, external_id: str) -> bool:
