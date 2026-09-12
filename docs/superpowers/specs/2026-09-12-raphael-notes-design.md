@@ -62,18 +62,21 @@ indexes; until then:
 - `NotesSyncFlow` reports `not_configured`;
 - `ResearchFlow` saves its answer to the knowledge store only.
 
-## 3. The writer (`services/notes.py`) — append-only
+## 3. The writer (`services/notes.py`) — insert-only
 
 One module writes the vault; nothing else does.
 
 - **Allowed paths:** anything under `raphael/`, and the journal notes the
   daylog owns (§5). A path with `..`, an absolute path, a non-`.md` file or
   anything else is refused before git is touched.
-- **Append-only:** a write creates a file, or appends a section at its end.
-  It never rewrites, reorders or deletes an existing line. Each section starts
-  with a heading and a hidden Obsidian comment marker, `%% aegis:<key> %%`. A
-  write whose marker is already in the file is a no-op, so a re-run or retry
-  never adds a section twice and never changes one.
+- **Insert-only** (amended 2026-09-12, see §5): a write creates a file, or
+  inserts one contiguous block into it — a journal entry at the end of the
+  note's own section, anything else at the end of the note. It never rewrites,
+  reorders or deletes an existing line; `_apply` checks that the new text is
+  the old text with exactly one block inserted. Each block carries a hidden
+  Obsidian comment marker, `%% aegis:<key> %%`. A write whose marker is already
+  in the file is a no-op, so a re-run or retry never adds a block twice and
+  never changes one.
 - **Sequence**, inside the flock: clone if needed → `git pull --rebase` →
   append → commit only the paths written → push.
 - **Conflicts with `obsidian-git`:** the phone and laptop auto-commit, so
@@ -96,29 +99,55 @@ reaches the store.
 
 ## 5. The journal
 
-The vault's periodic-notes settings decide the names:
+**Amended 2026-09-12**, after the user compared the backfilled notes with
+their own. The first version put every note at the `journal/` root, named
+weeks from their Sunday, put the month note loose in the year folder, and
+appended a `## Raphael` section. The vault's real conventions, read from its
+journal:
 
 | Entry | Path | Example |
 |---|---|---|
-| Nightly | `journal/DD MMM YY.md` | `journal/12 Sep 26.md` |
-| Weekly rollup | `journal/[W]ww MMM YY.md` | `journal/W37 Sep 26.md` |
-| Monthly rollup | `journal/<YYYY>/MM. MMM.md` | `journal/2026/09. Sep.md` |
+| Nightly | `journal/<YYYY>/<NN. Mon>/DD MMM YY.md` | `journal/2026/09. Sep/11 Sep 26.md` |
+| Weekly rollup | `journal/<YYYY>/<NN. Mon>/W<ww> MMM YY.md` | `journal/2026/09. Sep/W37 Sep 26.md` |
+| Monthly rollup | `journal/<YYYY>/<NN. Mon>/<NN. Mon>.md` | `journal/2026/08. Aug/08. Aug.md` |
 
-- **Monthly naming.** The vault's monthly format `MM. MMM` has no year, so a
-  note at the journal root would collide every year. The monthly note goes in
-  a year folder instead, which matches how the vault already files old notes
-  (`journal/<year>/<NN. Mon>/`).
-- **Weekly naming.** `ww` is moment's locale week (weeks start on Sunday, week
-  1 holds 1 January), formatted from the week's Sunday. The daylog's weekly
-  rollup covers an ISO week (Monday to Sunday), so it goes to the vault week
-  that holds the rollup's Monday — six of its seven days.
+- **Filed, not at the root.** periodic-notes creates today's note at the
+  `journal/` root and the user files notes into `journal/<YYYY>/<NN. Mon>/`
+  later — all but two of their own journal notes are filed. Raphael writes a
+  day that has passed, so it files straight away; when the user already has
+  that day's (or week's) note open at the root, it writes into that one
+  instead, so a day never gets two notes. The root note is never created.
+- **The month is the folder note** (`2023/08. Aug/08. Aug.md`,
+  `2022/03. Mar/03. Mar.md`), which `folder-note-plugin` shows as the folder.
+  `MM. MMM` has no year, so it only ever lives inside its year.
+- **Weeks start on Monday.** The calendar plugin's `weekStart` is `locale`.
+  The 2022 weekly notes were Sunday-dated; every one since 2023 is
+  Monday-dated with ISO week numbers (`W40 Oct 23` opens `# Oct 02, 2023`, a
+  Monday; `W05 Jan 23` is Mon 30 Jan). A week is named from its Monday and
+  filed in that Monday's month; the daylog's ISO week (Monday to Sunday) is
+  the same week. (The user filed a few weeks that straddle two months by hand
+  in the later month; the Monday's month is the predictable rule.)
 - **Shape.** A new note is rendered from the vault's own template
   (`_templates/{{tp_title_today}}.md`, `weekly-…`, `monthly.md`), read from the
-  checkout at write time, so the user's sections are there to fill in.
-  `{{date:FMT}}`, `{{date}}`, `{{time}}` and `{{title}}` are rendered; a
-  Templater tag (`<% … %>`) is dropped. Raphael's entry follows as
-  `## Raphael`. A note that already exists — the user wrote that day — gets the
-  section appended at the end and nothing else.
+  checkout at write time. `{{date:FMT}}`, `{{date}}`, `{{time}}` and
+  `{{title}}` are rendered; a Templater tag (`<% … %>`) is dropped; open
+  checkboxes and the target section's empty `- ` placeholder are dropped.
+  Raphael's entry goes INTO the note's own section, after whatever is there —
+  daily `Journal`, weekly `Review`, monthly `Review` (else an older note's
+  `Month Review`) — as the user's own bullets are written:
+
+      - #raphael day log %% aegis:daylog:2026-09-11 %%
+      	- first paragraph
+      	- second paragraph
+
+  The section is found by its heading text at any level (the redesigned
+  templates of 2026-09-12 use `##`; older notes `###`) and ends at the next
+  heading, a `---` line or a code fence, so the month note's `ccard` folder
+  card stays last. A note without that section gets `## Journal` /
+  `## Review` and the block at its end.
+  Readers (`split_section`, the rollups, the backfill) find the block by its
+  marker, look at both the filed note and the root one, and still read the
+  first `## Raphael` shape.
 - **The index follows the record.** With the vault configured, the daylog stops
   writing its own `daylog` / `daylog_rollup` rows; `NotesSyncFlow` indexes the
   journal note like any other note. If the vault write fails, the daylog files

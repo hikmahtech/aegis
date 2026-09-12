@@ -100,7 +100,10 @@ class NotesActivities:
         except (notes.NotesError, KeyError, ValueError) as exc:
             activity.logger.warning("notes_journal_write_failed err=%s", str(exc)[:300])
             return {"status": "error", "error": str(exc)[:300]}
-        return {"status": res["status"], "path": ap.rel}
+        # The note it actually went to: the filed path, or the day's live note
+        # at the journal root when the user had one open.
+        outcomes = res.get("outcomes") or [{}]
+        return {"status": res["status"], "path": outcomes[0].get("path") or ap.rel}
 
     # ------------------------------------------------------------- index
 
@@ -260,9 +263,11 @@ class NotesActivities:
         for i in range(0, len(appends), BACKFILL_BATCH):
             chunk = appends[i : i + BACKFILL_BATCH]
             res = await notes.write(cfg, chunk, f"raphael: journal backfill ({len(chunk)})")
-            changed = set(res.get("changed") or [])
-            written += sum(1 for ap in chunk if ap.rel in changed)
-            existed += sum(1 for ap in chunk if ap.rel not in changed)
+            # Per append, not per path: a day may go to its live root note
+            # instead of the filed one, so `ap.rel` is not where it landed.
+            outcomes = res.get("outcomes") or []
+            written += sum(1 for o in outcomes if o.get("changed"))
+            existed += sum(1 for o in outcomes if not o.get("changed"))
         return {
             "status": "ok",
             "entries": len(appends),

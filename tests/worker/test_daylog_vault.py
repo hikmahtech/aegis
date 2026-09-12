@@ -130,8 +130,9 @@ async def test_a_rollup_reads_the_days_from_the_journal(clean_db, tmp_path):
     )
     # The user wrote in the same note on the phone, including an encrypted block.
     git("pull", "-q", cwd=vault["device"])
-    note = vault["device"] / "journal/12 Mar 19.md"
-    device_commit(vault, {"journal/12 Mar 19.md": note.read_text("utf-8") + f"\nmine {CIPHER}\n"})
+    rel = notes.daily_note_path(date(2019, 3, 12))
+    note = vault["device"] / rel
+    device_commit(vault, {rel: note.read_text("utf-8") + f"\nmine {CIPHER}\n"})
     await _add_daylog_entry(clean_db, "2019-03-11", ["Knowledge row for the 11th."])
     await _add_daylog_entry(clean_db, "2019-03-12", ["Old knowledge row for the 12th."])
 

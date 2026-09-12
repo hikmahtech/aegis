@@ -65,7 +65,7 @@ async def test_a_weekly_rollup_goes_to_the_vaults_weekly_note(vault):
     acts = NotesActivities(settings=vault["settings"])
     entry = {"kind": "weekly", "day": "2026-09-07", "label": "2026-W37", "text": "A week."}
     out = await ActivityEnvironment().run(acts.notes_journal_write, entry)
-    assert out == {"status": "written", "path": "journal/W37 Sep 26.md"}
+    assert out == {"status": "written", "path": "journal/2026/09. Sep/W37 Sep 26.md"}
 
 
 async def test_journal_write_when_the_vault_is_off():
@@ -194,7 +194,7 @@ async def test_backfill_writes_old_daylog_rows_into_the_journal_once(vault, dayl
     assert first == {
         "status": "ok", "entries": 2, "written": 2, "already_there": 0, "skipped": 0,
     }
-    day = remote_file(vault, "journal/11 Mar 19.md")
+    day = remote_file(vault, notes.daily_note_path(notes.date(2019, 3, 11)))
     week = remote_file(vault, notes.weekly_note_path(notes.date(2019, 3, 11)))
     assert "Monday: shipped the migration." in day
     assert "The week: one migration." in week

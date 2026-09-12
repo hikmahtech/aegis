@@ -607,7 +607,7 @@
     "type": "function",
     "function": {
       "name": "note_read",
-      "description": "Read one note from the user's Obsidian vault by its path, e.g. journal/12 Sep 26.md. Encrypted blocks are never shown.",
+      "description": "Read one note from the user's Obsidian vault by its path, e.g. journal/2026/09. Sep/12 Sep 26.md. Encrypted blocks are never shown.",
       "parameters": {
         "type": "object",
         "properties": {
