@@ -94,6 +94,22 @@ async def test_held_back_days_are_counted(pool):
     assert (await td.month_summary(pool, SEP, OCT))["held_back"] == {"held_stale": 1}
 
 
+async def test_a_flattened_day_reaches_the_month_section(pool):
+    """The month close has to be able to say the pipeline halted and the desk
+    sold out, and why."""
+    await september(pool)
+    await pool.execute(
+        "INSERT INTO finance.desk_plans (data_date, mode, outcome, note) VALUES ($1, 'paper', 'flattened', $2)",
+        date(2026, 9, 21), "The risk manager halted trading: DAILY_LOSS fired on 2026-09-18.",
+    )
+    s = await td.month_summary(pool, SEP, OCT)
+    assert s["halts"] == [
+        {"day": "2026-09-21", "note": "The risk manager halted trading: DAILY_LOSS fired on 2026-09-18."}
+    ]
+    # A halt is not a day held back: the desk acted on it.
+    assert s["held_back"] == {}
+
+
 async def open_classes(pool):
     rows = await pool.fetch(
         "SELECT class FROM problems WHERE subject_kind = 'trading_desk' AND status NOT IN ('resolved', 'closed')"

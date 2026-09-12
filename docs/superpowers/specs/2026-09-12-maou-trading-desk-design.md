@@ -121,16 +121,37 @@ is the safe default. Dumping a portfolio because of a pipeline glitch is the fai
 
 | Check | Fails when | Outcome | Problem class |
 |---|---|---|---|
-| Fresh | ansaar returns no rows for the last trading day | `held_stale` | `desk_decisions_stale` |
+| Fresh | ansaar returns no rows for the last trading day, and does not say it was halted | `held_stale` | `desk_decisions_stale` |
 | Complete | a class the desk holds now has no rows today, and no row carries a kill condition or a non-`NORMAL` recovery state | `held_suspect` | `desk_decisions_suspect` |
 | Sane | enabled weights sum to more than 1.0 + 1e-6, or any weight is ≤ 0 or above `max_order_pct` | `held_suspect` | `desk_decisions_suspect` |
 | Halal | a row has `halal_status != 'COMPLIANT'` or `direction != 'LONG'` | the row is dropped and never bought; the rest trades | `desk_decisions_suspect` |
 | Reachable | the ansaar token or request fails | `held_stale` | `desk_source_error` |
 
-An empty day is ambiguous: the pipeline writes zero rows both when it fails and when its risk
-manager halts everything (COOLING). The desk cannot tell these apart, so it holds and asks. The owner
-checks `kill_switch_events`. A later change to ansaar-data #30 can put the halt reason in the
-response.
+**A stated halt flattens the book.** The pipeline writes zero rows both when it fails and when its
+risk manager halts everything (COOLING, or a drawdown scalar of zero), and those two need opposite
+answers. On a halt the pipeline is flat, so a desk that holds is fully invested exactly when the
+risk manager has pulled out. On a failure the desk knows nothing, and selling on a glitch is the
+thing §5 exists to rule out.
+
+So ansaar-data says which, in `meta.halted` and `meta.halt` for the date it served (ansaar-data #33),
+read from `kill_switch_events`. When `meta.halted` is true the desk sells its whole book: `check_decisions`
+returns `flatten` with no rows, so `plan_orders` sees every holding as a name with no target and
+sizes each as the full exit it already knows how to size. The plan row's outcome is `flattened`
+and its `note` keeps the reason as served.
+
+**The desk never reads a halt into silence.** `meta.halted` false, a missing field, an older
+ansaar, or a call that failed all mean "no halt is on record" — the day stays `held_stale` and
+raises `desk_decisions_stale`. A drawdown-scalar halt is recorded nowhere in ClickHouse, so it
+reads that way too: the desk holds and asks, as it does today.
+
+A halt raises no problem of its own. The risk manager stopping is it working, not a fault, and the
+month close names each flattened day and why (§9).
+
+**Why `flattened` and not `orders`.** The other outcomes name what the desk did with the day —
+`held_stale` is "held, because stale". `orders` would say the day was a normal rebalance, and the
+one fact worth keeping about it, that the pipeline halted and the desk sold out, would be gone from
+the record: the decisions copy is empty, so nothing else in AEGIS says so. `flattened` also keeps
+the day out of the `held_back` count, which is for days the desk did nothing on.
 
 ## 6. Paper fills and valuation
 
@@ -220,6 +241,7 @@ Weekly gap to SHARIABEES: +0.15% on average, t = 0.8: no evidence yet
 Holding (paper) 9 names, 12% cash: TCS, INFY, HCLTECH, GOLDBEES, ...
 This month: 23 orders, ₹612 in costs.
 Days held back: 2 (1 stale, 1 suspect). Prices from ansaar: 1.
+Risk halt on 22 Nov: the desk sold its whole book. DAILY_LOSS fired on 19 Nov.
 Check: XYZ moved −51% on 3 Nov. Possible missing split.
 ```
 
@@ -266,9 +288,11 @@ CREATE TABLE IF NOT EXISTS finance.desk_decisions (
 CREATE TABLE IF NOT EXISTS finance.desk_plans (
     data_date date PRIMARY KEY,
     mode text NOT NULL,
-    outcome text NOT NULL CHECK (outcome IN ('orders', 'no_change', 'held_stale', 'held_suspect')),
+    -- 'flattened' and `note` were added by migration 047 (§5, the risk halt).
+    outcome text NOT NULL CHECK (outcome IN ('orders', 'no_change', 'held_stale', 'held_suspect', 'flattened')),
     findings jsonb NOT NULL DEFAULT '[]'::jsonb,
     skipped jsonb NOT NULL DEFAULT '[]'::jsonb,
+    note text,
     planned_at timestamptz NOT NULL DEFAULT now()
 );
 
@@ -362,7 +386,7 @@ expected_excess_pa: 0.06
 | `worker/src/aegis_worker/registry.py` | One `FlowSpec` |
 | `config/seed/activities.yaml` | The `trading-desk-daily` row (Maou, inactive) |
 | `worker/src/aegis_worker/activities/money.py`, `money_render.py` | Monthly close: the desk section and the warning check |
-| `migrations/045_trading_desk.sql` | §11 |
+| `migrations/045_trading_desk.sql`, `migrations/047_desk_flatten.sql` | §11 |
 | `core/src/aegis/services/integrations_config.py`, `core/src/aegis/config.py` | §12 connection keys |
 | `CLAUDE.md` | One paragraph in the books section describing the lane |
 

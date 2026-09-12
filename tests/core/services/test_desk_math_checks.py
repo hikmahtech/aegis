@@ -36,6 +36,22 @@ def test_an_empty_day_is_stale():
     assert (c.outcome, c.rows, c.problems) == ("held_stale", (), ())
 
 
+def test_an_empty_day_the_source_calls_halted_is_a_flatten():
+    c = check_decisions([], set(), Rules(), halted=True)
+    assert (c.outcome, c.rows, c.problems) == ("flatten", (), ())
+
+
+def test_an_empty_day_is_only_a_flatten_when_the_source_says_halted():
+    """The default is hold. A pipeline failure and a risk halt both write no
+    rows, and dumping the portfolio over a failure is what §5 rules out."""
+    assert check_decisions([], set(), Rules(), halted=False).outcome == "held_stale"
+
+
+def test_a_day_with_rows_trades_its_rows_whatever_the_halt_flag_says():
+    c = check_decisions([d("TCS", 0.1)], set(), Rules(), halted=True)
+    assert c.outcome == "ok" and [r.symbol for r in c.rows] == ["TCS"]
+
+
 def test_a_clean_day_passes_and_leaves_out_disabled_classes():
     rows = [d("TCS", 0.1), d("GOLDBEES", 0.1, cls="etf"), d("BTCUSDT", 0.1, cls="crypto")]
     c = check_decisions(rows, set(), Rules())

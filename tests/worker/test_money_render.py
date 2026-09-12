@@ -587,6 +587,12 @@ def test_month_close_renders_the_desk_section():
     assert "Check: XYZ moved -51% on 2026-11-03. Possible bad price or missing split." in md
 
 
+def test_month_close_names_the_days_a_risk_halt_sold_the_book():
+    desk = {**_DESK, "halts": [{"day": "2026-09-22", "note": "DAILY_LOSS fired on 2026-09-19."}]}
+    md = render_month_close({"month": "2026-09", "books_ok": False, "desk": desk})["markdown"]
+    assert "Risk halt on 2026-09-22: the desk sold its whole book. DAILY_LOSS fired on 2026-09-19." in md
+
+
 def test_month_close_without_a_desk_has_no_desk_section():
     out = render_month_close({"month": "2026-09", "books_ok": False})
     assert "Trading desk" not in out["markdown"] and "Trading desk" not in out["html"]

@@ -321,6 +321,8 @@ def desk_lines(desk: dict) -> list[str]:
             f"Days held back: {sum(held_back.values())} "
             f"({held_back.get('held_stale', 0)} stale, {held_back.get('held_suspect', 0)} suspect)."
         )
+    for halt in desk.get("halts") or []:
+        lines.append(f"Risk halt on {halt['day']}: the desk sold its whole book. {halt['note']}".strip())
     if desk["ansaar_prices"]:
         lines.append(f"Prices from ansaar: {desk['ansaar_prices']}.")
     lines += [

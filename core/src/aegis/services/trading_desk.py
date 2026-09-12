@@ -54,6 +54,18 @@ def _finding(klass: str, subject: str, title: str, description: str) -> dict:
     }
 
 
+def _halt(meta: Any) -> dict | None:
+    """What ansaar said about a risk halt on the day it served, or None.
+
+    Only an explicit ``halted: true`` counts. A missing field, an older
+    ansaar, or a call that failed all mean the desk knows nothing, and the desk
+    never reads a halt into silence (spec §5)."""
+    if not isinstance(meta, dict) or meta.get("halted") is not True:
+        return None
+    detail = meta.get("halt")
+    return detail if isinstance(detail, dict) else {}
+
+
 def _f(raw: Any) -> float | None:
     return float(raw) if raw is not None else None
 
@@ -291,13 +303,14 @@ async def _write_plan(
     skipped: list[str],
     orders: list[dm.Order],
     created_day: date,
+    note: str | None = None,
 ) -> None:
     """The plan row and its orders in one transaction, so a date is acted on once."""
     async with pool.acquire() as conn, conn.transaction():
         inserted = await conn.fetchval(
-            "INSERT INTO finance.desk_plans (data_date, mode, outcome, findings, skipped) "
-            "VALUES ($1, 'paper', $2, $3, $4) ON CONFLICT (data_date) DO NOTHING RETURNING data_date",
-            day, outcome, findings, skipped,
+            "INSERT INTO finance.desk_plans (data_date, mode, outcome, findings, skipped, note) "
+            "VALUES ($1, 'paper', $2, $3, $4, $5) ON CONFLICT (data_date) DO NOTHING RETURNING data_date",
+            day, outcome, findings, skipped, note,
         )
         if inserted is None:
             return  # another run planned this date first
@@ -382,9 +395,11 @@ async def _tick(pool: asyncpg.Pool, ansaar: Any, finance: Any, today: date) -> t
     # 2. Copy.
     findings: list[dict] = []
     ansaar_failure: dict | None = None
+    halt: dict | None = None
     try:
-        rows, _meta = await ansaar.decisions(day)
+        rows, meta = await ansaar.decisions(day)
         await _store_decisions(pool, day, [r for r in rows if str(r.get("data_date") or "")[:10] == day.isoformat()])
+        halt = _halt(meta)
     except AnsaarError as exc:
         ansaar_failure = _finding(
             "desk_source_error", "ansaar", "Trading desk: can't reach ansaar",
@@ -428,7 +443,7 @@ async def _tick(pool: asyncpg.Pool, ansaar: Any, finance: Any, today: date) -> t
     planned = await pool.fetchval("SELECT 1 FROM finance.desk_plans WHERE data_date = $1", day)
     if not planned:
         book = dm.replay(fills, bars, rules.capital, day)
-        check = dm.check_decisions(decisions, book.held_classes(), rules)
+        check = dm.check_decisions(decisions, book.held_classes(), rules, halted=halt is not None)
         plan_findings: list[dict] = []
         if check.outcome == "held_stale":
             plan_findings.append(
@@ -451,7 +466,7 @@ async def _tick(pool: asyncpg.Pool, ansaar: Any, finance: Any, today: date) -> t
             )
         orders: list[dm.Order] = []
         skipped: list[str] = []
-        if check.outcome == "ok":
+        if check.outcome in ("ok", "flatten"):
             # A name whose price has gone stale is left out of the sizing, so
             # plan_orders reports it rather than sizing or selling on an old
             # price. Otherwise a delisted holding would have the same sell
@@ -476,12 +491,24 @@ async def _tick(pool: asyncpg.Pool, ansaar: Any, finance: Any, today: date) -> t
                 for o in open_orders
                 if o["side"] == "buy"
             )
+            # On a flatten ``check.rows`` is empty, so every holding is a name
+            # with no target: plan_orders sizes each as the full exit it already
+            # knows how to size, and there is nothing left to buy.
             orders, skipped = dm.plan_orders(
                 check.rows, book, closes, rules,
                 frozen=frozenset(o["symbol"] for o in open_orders), cash_reserved=reserved,
             )
-        outcome = check.outcome if check.outcome != "ok" else ("orders" if orders else "no_change")
-        await _write_plan(pool, day, outcome, plan_findings, skipped, orders, today)
+        note = None
+        if check.outcome == "flatten":
+            outcome = "flattened"
+            note = str((halt or {}).get("reason") or "").strip() or (
+                "The trading system said it had halted, and gave no reason."
+            )
+        elif check.outcome == "ok":
+            outcome = "orders" if orders else "no_change"
+        else:
+            outcome = check.outcome
+        await _write_plan(pool, day, outcome, plan_findings, skipped, orders, today, note=note)
         out["planned"] = outcome
     findings += list(await pool.fetchval("SELECT findings FROM finance.desk_plans WHERE data_date = $1", day) or [])
 
@@ -538,6 +565,11 @@ async def month_summary(pool: asyncpg.Pool, month_first: date, next_first: date)
         "WHERE data_date BETWEEN $1 AND $2 AND outcome IN ('held_stale', 'held_suspect') GROUP BY outcome",
         month_first, month_end,
     )
+    halts = await pool.fetch(
+        "SELECT data_date, note FROM finance.desk_plans "
+        "WHERE data_date BETWEEN $1 AND $2 AND outcome = 'flattened' ORDER BY data_date",
+        month_first, month_end,
+    )
     cancelled: dict[str, int] = defaultdict(int)
     for r in orders:
         if r["status"] == "cancelled":
@@ -563,6 +595,7 @@ async def month_summary(pool: asyncpg.Pool, month_first: date, next_first: date)
         "costs": round(sum(float(r["costs"] or 0) for r in orders if r["status"] == "filled"), 2),
         "cancelled": dict(cancelled),
         "held_back": {r["outcome"]: r["n"] for r in held_back},
+        "halts": [{"day": r["data_date"].isoformat(), "note": r["note"] or ""} for r in halts],
         "ansaar_prices": sum(r["status"] == "filled" and r["price_source"] == "ansaar" for r in orders),
         "moves": [
             {"symbol": s, "day": d.isoformat(), "move": round(m, 4)}

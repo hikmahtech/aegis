@@ -87,9 +87,10 @@ class Decision:
 class Check:
     """What the checks before trading decided (spec §5).
 
-    ``outcome`` is ``ok``, ``held_stale`` or ``held_suspect``. ``rows`` is what
-    may trade. ``problems`` are plain-English lines for ``desk_decisions_suspect``,
-    and can be non-empty on an ``ok`` day: a bad row was dropped and the rest traded.
+    ``outcome`` is ``ok``, ``flatten``, ``held_stale`` or ``held_suspect``.
+    ``rows`` is what may trade. ``problems`` are plain-English lines for
+    ``desk_decisions_suspect``, and can be non-empty on an ``ok`` day: a bad row
+    was dropped and the rest traded.
     """
 
     outcome: str
@@ -103,11 +104,25 @@ def last_trading_day(index_days: list[date], today: date) -> date | None:
     return max(before) if before else None
 
 
-def check_decisions(rows: list[Decision], held_classes: set[str], rules: Rules) -> Check:
+def check_decisions(
+    rows: list[Decision], held_classes: set[str], rules: Rules, *, halted: bool = False
+) -> Check:
     """Spec §5. An empty day is stale; odd weights or a held class that vanished
-    for no stated reason hold the whole day; a non-halal or short row is dropped."""
+    for no stated reason hold the whole day; a non-halal or short row is dropped.
+
+    ``halted`` is ansaar saying the pipeline's risk manager stopped trading that
+    day. The pipeline is then flat, so the desk sells its whole book rather than
+    staying fully invested against a risk manager that has pulled out. It is
+    only ever true when the source states it: an empty day with no reason is
+    still ``held_stale``, because a pipeline failure looks exactly the same and
+    dumping a portfolio over a glitch is the failure §5 exists to rule out.
+
+    A day that has rows is traded on its rows, halt or no halt: a halt writes no
+    rows, so rows plus a halt flag would be a contradiction, and the rows are the
+    thing the pipeline actually decided.
+    """
     if not rows:
-        return Check("held_stale", (), ())
+        return Check("flatten", (), ()) if halted else Check("held_stale", (), ())
     problems: list[str] = []
     kept: list[Decision] = []
     for r in rows:
