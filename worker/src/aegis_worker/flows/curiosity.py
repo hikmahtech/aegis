@@ -49,6 +49,8 @@ _GAP_TAG = {
     "unknown_payee": "finance",
     "calendar_attendee": "gtd",
     "todoist_project": "gtd",
+    # "Track this?" (#513) — the research-tagged agent owns tracked topics.
+    "untracked_topic": "research",
 }
 
 # Gap types whose subject cannot be shown to be someone other than the owner

@@ -157,6 +157,19 @@ class IntelligenceActivities:
         )
         return tracked_search_terms(value)
 
+    @activity.defn
+    async def attach_topic_items(self, items: list[dict], origin: str) -> dict:
+        """Attach the items that name a tracked topic to that topic's round in
+        the hub (#513), and raise a task for a round that just crossed its
+        threshold. `origin` says where they came from (`intel:hn`, `rss`).
+        Replaces the per-item `#research` Inbox capture, which made 277 tasks
+        in 30 days that clarify closed on arrival."""
+        if not self.db_pool:
+            return {"topics": 0, "matched": 0, "attached": 0, "tasks": 0}
+        from aegis.services import research_topics
+
+        return await research_topics.attach_items(self.db_pool, list(items or []), origin=origin)
+
     async def _read_page(self, url: str) -> str:
         """The readable text at `url`, or "" when there is too little to keep.
 

@@ -1869,6 +1869,45 @@ bulk text is exactly what not to index.
 Until step 2 the tools answer "not configured" and the flow reports
 `not_configured`; both are the intended inert state.
 
+## Tracked topics (Raphael)
+
+A topic you ask Raphael to track (`track_topic`, or "yes" to a "track this?"
+card) is two things (#513, spec
+`docs/superpowers/specs/2026-09-12-research-hub-design.md`):
+
+- **Its search terms**, in the `intelligence_topics` settings row. The intel
+  scans search them and the RSS gate matches on them.
+- **Its round of news**, a hub problem: class `topic`, source `research`,
+  owned by Raphael. Every intel-scan item or stored feed entry that names one
+  of the terms (whole word, any case) is an occurrence, keyed on the URL, so
+  one story arriving by two paths counts once.
+
+A round stays in the hub and Raphael's briefing ("Your topics") until it
+holds enough items: 2 for a `high` topic, 3 for `medium`, 5 for `low`. Then
+it becomes one `#research @raphael @next` task listing the items; later items
+are collapsed comments. Ticking the task off means "seen": the round resolves
+and closes, and the next matching article opens a fresh one.
+
+Feed findings (`feed_failing`, `feed_stale`) are Raphael's too, as
+`#feeds @raphael @next` tasks. The agent sweep never works them; you fix or
+drop the feed.
+
+Operations:
+
+```sql
+-- What is tracked
+SELECT value FROM settings WHERE key = 'intelligence_topics';
+-- Live rounds, their item counts and whether they earned a task
+SELECT p.metadata->>'topic' AS topic, p.todoist_task_id,
+       count(*) FILTER (WHERE e.payload->>'item' = 'true') AS items
+FROM problems p JOIN problem_events e ON e.problem_id = p.id
+WHERE p.class = 'topic' AND p.closed_at IS NULL GROUP BY p.id;
+```
+
+Stop tracking with `untrack_topic` (it closes the live round and its task).
+The intel scans no longer capture a `#research` Inbox task per worthy item;
+Raindrop bookmarks still do.
+
 ## Troubleshooting
 
 | Symptom | Cause |

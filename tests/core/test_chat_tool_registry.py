@@ -96,6 +96,7 @@ EXPECTED_TOOL_NAMES = [
     "track_topic",
     "trigger_workflow",
     "unsubscribe_feed",
+    "untrack_topic",
     "update_runbook",
     "vercel_get_build_logs",
     "vercel_get_deployment",

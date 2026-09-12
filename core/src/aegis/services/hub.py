@@ -103,9 +103,16 @@ SOURCES = frozenset(
         # a row) or stopped publishing (`feed_stale`): RssIngestFlow's
         # findings (#511). The research agent owns the feed list.
         "feeds",
+        # The research agent's own problems (#513): a tracked topic's round of
+        # news (`services/research_topics.py`) and a `#research` task's
+        # question (`hub_project.ensure_problem_for_task`).
+        "research",
     }
 )
 KINDS = frozenset({"occurrence", "resolved", "investigation", "plan", "session_note"})
+# A tracked topic's round of news (#513). Not an outage: the infra digest leaves
+# it out, and the projector gives it a task only once it earns one.
+TOPIC_CLASS = "topic"
 SEVERITIES = frozenset({"critical", "error", "warning", "info"})
 # Problem statuses. `suppressed` = seen while its subject was deploying or in
 # maintenance (see `service_state`); it is live, counted, and not projected.
@@ -1227,8 +1234,12 @@ async def digest(
         "FROM problems p "
         "WHERE EXISTS (SELECT 1 FROM problem_events e WHERE e.problem_id = p.id "
         "              AND e.occurred_at >= $1) "
+        # A topic's round of news is not a problem the infra digest reports
+        # (#513); Raphael's briefing has its own topics line.
+        "  AND p.class <> $2 "
         "ORDER BY p.last_seen_at DESC",
         since,
+        TOPIC_CLASS,
     )
     problems = [dict(r) for r in rows]
     live = [p for p in problems if p["status"] in LIVE_STATUSES]

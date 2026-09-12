@@ -401,9 +401,13 @@ def test_books_write_flow_is_gated_on_money_hygiene():
         # Then +1 flow and +1 activity from #510: CalibreSyncFlow (daily, the
         # book index) and CalibreActivities.sync_calibre_library, a new class.
         # Unflagged, so all three rows move.
-        (True, True, 47, 240),
-        (False, False, 37, 207),
-        (True, False, 41, 223),
+        # Then +1 activity and NO new flow from #513: `attach_topic_items` on
+        # the existing IntelligenceActivities (tracked topics' rounds in the
+        # hub), a step of IntelligenceScanFlow and RssIngestFlow. Unflagged, so
+        # all three rows move.
+        (True, True, 47, 241),
+        (False, False, 37, 208),
+        (True, False, 41, 224),
     ],
 )
 def test_real_registration_passes_the_boot_check(homelab, money, flows, activities):

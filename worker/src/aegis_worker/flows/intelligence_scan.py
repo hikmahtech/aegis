@@ -30,6 +30,11 @@ _SCORE_TIMEOUT = timedelta(seconds=180)
 # the old code replays without it. A scan lasts minutes, so this can become
 # `workflow.deprecate_patch` one deploy later.
 _PATCH_TRACKED_TOPICS = "intel-tracked-topics"
+# Guards step 5's switch from an Inbox capture per item to the topic hub
+# (#513). Same deprecation note as above.
+_PATCH_TOPICS = "research-hub-513"
+# Attaching can raise a topic's task, which is a Todoist round trip.
+_ATTACH_TIMEOUT = timedelta(seconds=120)
 
 
 def merge_topics(configured: list[str], tracked: list[str]) -> list[str]:
@@ -203,31 +208,53 @@ class IntelligenceScanFlow:
                 **notes,
             }
 
-        # 5. Capture worthy items to Todoist Inbox
-        for item in worthy:
-            url = item.get("url") or item.get("link") or ""
-            if not url:
-                continue
-            ext_id = f"research-{hashlib.sha256(url.encode()).hexdigest()[:16]}"
-            title = item.get("title") or "(untitled research item)"
-            summary = (item.get("summary") or item.get("body") or "")[:200]
-            reason = item.get("significance_reason") or ""
-            description = (
-                f"[Read]({url})\n\n"
-                f"{summary}"
-                + (f"\n\nWhy: {reason}" if reason else "")
-            )
+        # 5. Worthy items attach to the tracked topics they name (#513). This
+        # used to capture every worthy item as a `#research` Inbox task — 277
+        # in 30 days, each closed by clarify on arrival. The hub keeps them
+        # now and a topic raises ONE task when its round earns it; the
+        # knowledge store and the briefing still get every item (step 6).
+        if workflow.patched(_PATCH_TOPICS):
             try:
-                await workflow.execute_activity_method(
-                    CaptureActivities.capture_to_inbox,
-                    args=["#research", ext_id, title[:120], description],
-                    start_to_close_timeout=TIMEOUT_FAST,
-                    retry_policy=NO_RETRY,
+                attached = await workflow.execute_activity(
+                    "attach_topic_items",
+                    args=[worthy, f"intel:{input.source}"],
+                    start_to_close_timeout=_ATTACH_TIMEOUT,
+                    retry_policy=RETRY_ONCE,
                 )
+                if isinstance(attached, dict) and attached.get("attached"):
+                    notes["topic_items"] = attached["attached"]
             except Exception as exc:
                 workflow.logger.warning(
-                    "intel_capture_failed url=%s err=%s", url, str(exc)[:200]
+                    "intel_topic_attach_degraded source=%s err=%s", input.source, str(exc)[:200]
                 )
+                notes["topics_degraded"] = True
+        else:
+            # The pre-#513 capture, kept only so a scan that started on the
+            # old code replays.
+            for item in worthy:
+                url = item.get("url") or item.get("link") or ""
+                if not url:
+                    continue
+                ext_id = f"research-{hashlib.sha256(url.encode()).hexdigest()[:16]}"
+                title = item.get("title") or "(untitled research item)"
+                summary = (item.get("summary") or item.get("body") or "")[:200]
+                reason = item.get("significance_reason") or ""
+                description = (
+                    f"[Read]({url})\n\n"
+                    f"{summary}"
+                    + (f"\n\nWhy: {reason}" if reason else "")
+                )
+                try:
+                    await workflow.execute_activity_method(
+                        CaptureActivities.capture_to_inbox,
+                        args=["#research", ext_id, title[:120], description],
+                        start_to_close_timeout=TIMEOUT_FAST,
+                        retry_policy=NO_RETRY,
+                    )
+                except Exception as exc:
+                    workflow.logger.warning(
+                        "intel_capture_failed url=%s err=%s", url, str(exc)[:200]
+                    )
 
         # 6. Ingest. KS's `/api/content` is wrapped in a 600s server-side
         # httpx ceiling (see knowledge.py:_ensure_client / ingest_content);
