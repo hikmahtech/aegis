@@ -81,6 +81,27 @@ def test_a_held_name_with_no_price_is_kept_and_reported():
     assert plan_orders((), book, {}, Rules()) == ([], ["OLD: no_price"])
 
 
+def test_a_name_with_an_order_still_pending_is_left_alone_and_its_cash_is_reserved():
+    """A second order for a name whose first is still pending would race it, and
+    the money that first order will spend is not available to today's buys."""
+    rows = (d("TCS", 0.20, rank=1), d("INFY", 0.20, rank=2))
+    closes = {"TCS": 1000.0, "INFY": 1000.0}
+    orders, skipped = plan_orders(
+        rows, Book(cash=100_000.0), closes, Rules(), frozen=frozenset({"TCS"}), cash_reserved=90_000.0
+    )
+    # INFY wants 20 shares; only 9 fit in the ₹10,000 the pending buy left.
+    assert [(o.symbol, o.side, o.qty) for o in orders] == [("INFY", "buy", 9)]
+    assert skipped == ["TCS: pending_order"]
+
+
+def test_a_held_name_with_a_pending_sell_is_not_sold_again():
+    book = held("OLD", 5, 100.0, cash=1000.0)
+    assert plan_orders((), book, {"OLD": 100.0}, Rules(), frozen=frozenset({"OLD"})) == (
+        [],
+        ["OLD: pending_order"],
+    )
+
+
 DAYS = [date(2026, 9, 14), date(2026, 9, 15), date(2026, 9, 16), date(2026, 9, 17), date(2026, 9, 18)]
 
 

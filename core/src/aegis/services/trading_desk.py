@@ -107,6 +107,20 @@ async def _store_bars(pool: asyncpg.Pool, symbol: str, bars: list[dict], source:
     )
 
 
+async def _unpriced(pool: asyncpg.Pool, ysym: str, days: list[date]) -> set[date]:
+    """Which of ``days`` still have no close stored for ``ysym``. A row whose
+    close is NULL counts as unpriced: Yahoo answers for a market day with a bar
+    that carries no close, and a NULL is no use for filling or sizing."""
+    if not days:
+        return set()
+    rows = await pool.fetch(
+        "SELECT date FROM finance.desk_prices "
+        "WHERE symbol = $1 AND close IS NOT NULL AND date = ANY($2::date[])",
+        ysym, days,
+    )
+    return set(days) - {r["date"] for r in rows}
+
+
 async def _refresh(
     pool: asyncpg.Pool,
     finance: Any,
@@ -115,10 +129,12 @@ async def _refresh(
     asset_class: str | None,
     today: date,
     *,
+    market_days: list[date] | None = None,
     required: bool = False,
 ) -> None:
-    """Fetch and store ``symbol``'s recent bars: Yahoo first, then ansaar when
-    Yahoo has none. Raises only when ``required`` and Yahoo fails."""
+    """Fetch and store ``symbol``'s recent bars: Yahoo first, then ansaar for
+    each market day Yahoo could not price. Raises only when ``required`` and
+    Yahoo fails."""
     ysym = yahoo_symbol(symbol)
     latest = await pool.fetchval("SELECT max(date) FROM finance.desk_prices WHERE symbol = $1", ysym)
     start = latest - timedelta(days=REFETCH_OVERLAP_DAYS) if latest else today - timedelta(days=FETCH_BACK_DAYS)
@@ -134,22 +150,27 @@ async def _refresh(
         bars = []
     if bars:
         await _store_bars(pool, ysym, bars, "yahoo", today)
-        return
     if ansaar is None or asset_class is None:
         return
-    # ansaar's equity prices are back-adjusted for splits and dividends (its
-    # API.md says so), so only the last few days are safe to keep as traded
-    # prices. A symbol Yahoo does not carry at all therefore starts with a short
-    # history, which is enough to fill and value it from here on.
-    start = max(start, today - timedelta(days=ANSAAR_FALLBACK_DAYS))
-    if start > end:
+    # The fallback is per day, not per window (spec §6). Yahoo often answers
+    # with a bar whose close is None, so "Yahoo returned something" does not
+    # mean every day is priced, and a day left NULL would size and fill on a
+    # stale close. ansaar's prices are back-adjusted for splits and dividends
+    # (its API.md says so), so only the last few days are safe to keep as
+    # traded prices. A symbol Yahoo does not carry at all therefore starts with
+    # a short history, which is enough to fill and value it from here on.
+    window = max(start, today - timedelta(days=ANSAAR_FALLBACK_DAYS))
+    missing = await _unpriced(pool, ysym, [d for d in (market_days or []) if window <= d <= end])
+    if not missing:
         return
     try:
-        bars = await ansaar.prices(symbol, asset_class, start, end)
+        bars = await ansaar.prices(symbol, asset_class, min(missing), max(missing))
     except AnsaarError as exc:
         logger.warning("trading_desk_ansaar_prices_failed", symbol=symbol, error=str(exc)[:200])
         return
-    await _store_bars(pool, ysym, bars, "ansaar", today)
+    # Only the missing days are filled. ansaar is the second source, so it never
+    # adds a day the market calendar has no bar for and the desk never asked about.
+    await _store_bars(pool, ysym, [b for b in bars if b["day"] in missing], "ansaar", today)
 
 
 async def _bars(pool: asyncpg.Pool, symbols: set[str]) -> dict[str, list[dm.Bar]]:
@@ -385,7 +406,7 @@ async def _tick(pool: asyncpg.Pool, ansaar: Any, finance: Any, today: date) -> t
     wanted |= {d.symbol: d.asset_class for d in decisions if d.asset_class in rules.asset_classes}
     wanted |= {o.symbol: o.asset_class for o in pending}
     for symbol, asset_class in sorted(wanted.items()):
-        await _refresh(pool, finance, ansaar, symbol, asset_class, today)
+        await _refresh(pool, finance, ansaar, symbol, asset_class, today, market_days=index_days)
     for bench in {rules.benchmark, rules.context_benchmark} - {INDEX}:
         await _refresh(pool, finance, None, bench, None, today)
     bars = await _bars(pool, set(wanted) | set(ever))
@@ -398,10 +419,14 @@ async def _tick(pool: asyncpg.Pool, ansaar: Any, finance: Any, today: date) -> t
         out["filled"] = sum(r.status == "filled" for r in results)
         fills = await _fills(pool)
 
-    # 5. Plan, once per date and never while an order is pending.
+    # 5. Plan, once per date. A symbol whose order is still pending is left
+    # alone, but the rest of the desk carries on: one order nobody can fill used
+    # to stop every other name trading until it was cancelled, three market days
+    # later. The names held back are named in the plan's `skipped` list, so the
+    # row says which part of the day it did not act on, and their targets are
+    # sized again tomorrow, because the pipeline rebuilds them daily.
     planned = await pool.fetchval("SELECT 1 FROM finance.desk_plans WHERE data_date = $1", day)
-    still_pending = await pool.fetchval("SELECT 1 FROM finance.desk_orders WHERE status = 'pending' LIMIT 1")
-    if not planned and not still_pending:
+    if not planned:
         book = dm.replay(fills, bars, rules.capital, day)
         check = dm.check_decisions(decisions, book.held_classes(), rules)
         plan_findings: list[dict] = []
@@ -430,8 +455,7 @@ async def _tick(pool: asyncpg.Pool, ansaar: Any, finance: Any, today: date) -> t
             # A name whose price has gone stale is left out of the sizing, so
             # plan_orders reports it rather than sizing or selling on an old
             # price. Otherwise a delisted holding would have the same sell
-            # planned and cancelled forever, and nothing else could trade,
-            # because the desk never plans while an order is pending.
+            # planned and cancelled over and over.
             closes: dict[str, float] = {}
             for symbol in {d.symbol for d in check.rows} | set(book.held()):
                 series = bars.get(symbol, [])
@@ -441,7 +465,21 @@ async def _tick(pool: asyncpg.Pool, ansaar: Any, finance: Any, today: date) -> t
                 px = dm.close_on(series, day)
                 if px is not None:
                     closes[symbol] = px
-            orders, skipped = dm.plan_orders(check.rows, book, closes, rules)
+            open_orders = await pool.fetch(
+                "SELECT symbol, side, qty, ref_price FROM finance.desk_orders WHERE status = 'pending'"
+            )
+            # A pending buy's money is spoken for, so today's buys may not spend
+            # it. A pending sell's proceeds are not counted at all: the sale has
+            # not happened yet, and the desk should not spend what it has not sold.
+            reserved = sum(
+                float(o["qty"]) * float(o["ref_price"]) * (1 + rules.cost_pct_per_side)
+                for o in open_orders
+                if o["side"] == "buy"
+            )
+            orders, skipped = dm.plan_orders(
+                check.rows, book, closes, rules,
+                frozen=frozenset(o["symbol"] for o in open_orders), cash_reserved=reserved,
+            )
         outcome = check.outcome if check.outcome != "ok" else ("orders" if orders else "no_change")
         await _write_plan(pool, day, outcome, plan_findings, skipped, orders, today)
         out["planned"] = outcome

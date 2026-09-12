@@ -379,13 +379,25 @@ def _costs(side: str, qty: int, price: float, rules: Rules) -> float:
 
 
 def plan_orders(
-    rows: tuple[Decision, ...], book: Book, closes: dict[str, float], rules: Rules
+    rows: tuple[Decision, ...],
+    book: Book,
+    closes: dict[str, float],
+    rules: Rules,
+    *,
+    frozen: frozenset[str] = frozenset(),
+    cash_reserved: float = 0.0,
 ) -> tuple[list[Order], list[str]]:
     """Orders that move ``book`` toward ``rows``, in the order they must fill (spec §4).
 
     ``closes`` holds the decision-date close of every held and decided symbol
     the desk has a price for. Returns the orders and the names skipped, each as
     ``"SYMBOL: reason"``.
+
+    ``frozen`` names symbols the desk may not trade today, because an order for
+    each is still pending: a second order would race the first. They are skipped
+    as ``pending_order`` and still count toward the portfolio value, because the
+    desk still owns them. ``cash_reserved`` is the money those pending buys will
+    spend, which today's buys therefore may not.
     """
     held = book.held()
     port = book.cash + sum(q * closes.get(s, book.avg_cost(s)) for s, q in held.items())
@@ -396,6 +408,9 @@ def plan_orders(
     for symbol, qty in held.items():
         if symbol in wanted:
             continue
+        if symbol in frozen:
+            skipped.append(f"{symbol}: pending_order")
+            continue
         px = closes.get(symbol)
         if not px:
             skipped.append(f"{symbol}: no_price")
@@ -404,6 +419,9 @@ def plan_orders(
         if n > 0:
             sells.append(Order(symbol, book.classes[symbol], "sell", n, px))
     for r in rows:
+        if r.symbol in frozen:
+            skipped.append(f"{r.symbol}: pending_order")
+            continue
         px = closes.get(r.symbol)
         if not px:
             skipped.append(f"{r.symbol}: no_price")
@@ -424,7 +442,11 @@ def plan_orders(
             n = min(math.floor(have + _EPS), int(-gap / px + 0.5))
             if n > 0:
                 sells.append(Order(r.symbol, r.asset_class, "sell", n, px))
-    cash = book.cash + sum(o.qty * o.ref_price - _costs("sell", o.qty, o.ref_price, rules) for o in sells)
+    cash = (
+        book.cash
+        - cash_reserved
+        + sum(o.qty * o.ref_price - _costs("sell", o.qty, o.ref_price, rules) for o in sells)
+    )
     orders = list(sells)
     for _, o in sorted(buys, key=lambda item: item[0]):
         unit = o.ref_price * (1 + rules.cost_pct_per_side)

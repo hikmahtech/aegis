@@ -74,6 +74,7 @@ class FakeAnsaar:
         self.days = days or {}
         self.fail = fail
         self.price_rows = prices or {}
+        self.price_calls = []
 
     async def decisions(self, day):
         if self.fail:
@@ -81,6 +82,7 @@ class FakeAnsaar:
         return list(self.days.get(day, [])), {"date": day.isoformat()}
 
     async def prices(self, symbol, asset_class, start, end):
+        self.price_calls.append((symbol, start, end))
         return [b for b in self.price_rows.get(symbol, []) if start <= b["day"] <= end]
 
 
@@ -281,6 +283,65 @@ async def test_a_symbol_yahoo_lacks_is_priced_from_ansaar_and_marked(pool):
     await run(pool, ansaar, market(), MON)
     await run(pool, ansaar, market(), TUE)
     assert await pool.fetchval("SELECT price_source FROM finance.desk_orders WHERE symbol = 'GOLDBEES'") == "ansaar"
+
+
+async def test_a_day_yahoo_left_unpriced_is_filled_from_ansaar_and_sized_on_it(pool):
+    """Yahoo answers for a market day with a bar whose close is None. The
+    fallback is per day, so that day is asked of ansaar; without it the desk
+    sizes on the day before's close (spec §6)."""
+    finance = market({"GOLDCASE.NS": [bar(THU, 24.04), bar(FRI, None)]})
+    ansaar = FakeAnsaar(
+        {FRI: [row("GOLDCASE", 0.10, cls="etf")]},
+        prices={"GOLDCASE": [bar(THU, 24.10), bar(FRI, 23.82)]},
+    )
+    await run(pool, ansaar, finance, MON)
+
+    stored = await pool.fetch(
+        "SELECT date, close, source FROM finance.desk_prices WHERE symbol = 'GOLDCASE.NS' ORDER BY date"
+    )
+    assert [(r["date"], r["close"] and float(r["close"]), r["source"]) for r in stored] == [
+        (THU, 24.04, "yahoo"),  # Yahoo had this one, so ansaar never overwrites it
+        (FRI, 23.82, "ansaar"),
+    ]
+    order = await pool.fetchrow("SELECT symbol, qty, ref_price FROM finance.desk_orders")
+    assert (order["symbol"], order["qty"], float(order["ref_price"])) == ("GOLDCASE", 419, 23.82)
+
+
+async def test_ansaar_is_not_asked_when_yahoo_priced_every_market_day(pool):
+    """The fallback is for days that have no close, not for every day."""
+    finance = market({"TCS.NS": [bar(THU, 3000.0), bar(FRI, 3010.0)]})
+    ansaar = FakeAnsaar({FRI: [row("TCS", 0.10)]})
+    await run(pool, ansaar, finance, MON)
+    assert ansaar.price_calls == []
+
+
+async def test_one_unfillable_order_holds_back_its_own_name_only(pool):
+    """A close Yahoo never publishes leaves an order pending for three market
+    days. The rest of the desk must carry on: only that name is held back, and
+    the plan row says so."""
+    finance = market({
+        "GOLDCASE.NS": [bar(THU, 24.0), bar(FRI, 23.8), bar(MON, None)],
+        "TCS.NS": [bar(FRI, 3000.0), bar(MON, 3100.0)],
+    })
+    ansaar = FakeAnsaar({
+        FRI: [row("GOLDCASE", 0.10, cls="etf")],
+        MON: [row("GOLDCASE", 0.10, day=MON, cls="etf"), row("TCS", 0.10, day=MON, rank=2)],
+    })
+
+    await run(pool, ansaar, finance, MON)
+    assert await pool.fetchval("SELECT count(*) FROM finance.desk_orders WHERE status = 'pending'") == 1
+
+    out = await run(pool, ansaar, finance, TUE)
+    assert out["planned"] == "orders"
+    orders = await pool.fetch(
+        "SELECT symbol, qty, status, created_day FROM finance.desk_orders ORDER BY created_day, seq"
+    )
+    assert [(o["symbol"], o["qty"], o["status"], o["created_day"]) for o in orders] == [
+        ("GOLDCASE", 420, "pending", MON),  # still waiting for a close
+        ("TCS", 3, "pending", TUE),  # planned anyway
+    ]
+    skipped = await pool.fetchval("SELECT skipped FROM finance.desk_plans WHERE data_date = $1", MON)
+    assert skipped == ["GOLDCASE: pending_order"]
 
 
 async def test_a_held_name_with_no_decision_still_gets_a_fresh_price(pool):
