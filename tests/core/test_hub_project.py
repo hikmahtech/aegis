@@ -1365,7 +1365,8 @@ async def test_a_blip_earns_no_task_until_it_outlives_its_window(db_pool, inbox,
     assert early["settle_seconds"] == 300
     assert (await get_problem(db_pool, r.problem_id))["todoist_task_id"] is None
     assert not _cmds(todoist, "item_add")
-    # The watermark did not move, so the sweep still holds it.
+    # The sweep still holds it: an open untasked problem is a candidate
+    # outright, whatever its watermark.
     waiting = await project_pending(db_pool, now=NOW + timedelta(minutes=2))
     assert r.problem_id in {x["problem_id"] for x in waiting}
 
@@ -1387,6 +1388,29 @@ async def test_a_blip_that_heals_inside_its_window_never_earns_a_task(db_pool, i
     assert (await project(db_pool, r.problem_id, now=after))["skipped"] == "resolved_without_task"
     assert not _cmds(todoist, "item_add")
     assert r.problem_id not in {x["problem_id"] for x in await project_pending(db_pool, now=after)}
+
+
+async def test_a_recurrence_is_not_held_back(db_pool, inbox, todoist):
+    """A blip that comes back is not a blip. `reopen` leaves `first_seen_at`
+    alone, so the second episode is already past the window and projects at
+    once — deliberately: one 20-second outage is noise, the same one again is
+    a pattern, and the first episode's silence is what makes the second worth
+    saying. It is also the rule the resolved-without-task branch has always
+    stated ("a later occurrence reopens the problem, and THAT projects").
+    """
+    await _settle(db_pool, {})
+    s = _subject()
+    r = await ingest_event(db_pool, _occ(s, 0, occurred_at=NOW), now=NOW)
+    early = await project(db_pool, r.problem_id, now=NOW + timedelta(minutes=1))
+    assert early["skipped"] == "settling"
+    await ingest_event(db_pool, _resolved(s, 2), now=NOW + timedelta(minutes=2))
+    gone = await project(db_pool, r.problem_id, now=NOW + timedelta(minutes=3))
+    assert gone["skipped"] == "resolved_without_task"
+
+    back = NOW + timedelta(hours=2)
+    again = await ingest_event(db_pool, _occ(s, 10, occurred_at=back), now=back)
+    assert again.action == "reopened"
+    assert (await project(db_pool, r.problem_id, now=back))["created"] is True
 
 
 async def test_only_a_signal_that_can_clear_itself_waits(db_pool, inbox, todoist):

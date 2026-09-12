@@ -81,12 +81,17 @@ COLLAPSE_WINDOW = timedelta(minutes=30)
 PROJECTED_STATUSES = frozenset(
     {"open", "investigating", "waiting_human", "fixing", "verifying", "resolved"}
 )
-# Producers whose signals can clear themselves: they send a resolution when the
-# thing recovers, so what they raise may turn out to have been a blip. Only
-# these problems wait out a settle window before earning a task (#537).
-# Everything else on the hub is a considered finding — a money reconciliation,
-# a stale feed, an agent's question, a hand-written task — which no amount of
-# waiting makes truer, so those still project at once.
+# The four alert producers: something outside AEGIS fired, and the same
+# producer sends a resolution when it recovers, so what they raise may turn out
+# to have been a blip. Only these wait out a settle window before earning a
+# task (#537).
+#
+# Every other source projects on sight. Not because none of them can pass on
+# their own — a watchdog finding (`social`, `drift`, `expiry`, `llm_governor`)
+# resolves itself when the next sweep stops finding it — but because those
+# sweeps run on their own cadence and have already decided the thing is worth
+# reporting, and because the money, research and manual sources are judgements
+# that no amount of waiting makes truer.
 _SELF_CLEARING_SOURCES = frozenset({"alertmanager", "heartbeat", "flow_health", "delivery"})
 _BLOCK_RE = re.compile(r"<!-- aegis:problem [^>]*-->.*?<!-- /aegis:problem -->", re.S)
 _HISTORY_KINDS = frozenset({"investigation", "plan", "session_note"})
@@ -726,11 +731,21 @@ async def project(
         # threshold, unbuilt until now, measured in seconds rather than
         # occurrences because a five-minute blip can occur five times.
         #
-        # Nothing here has to come back for it: the sweep re-drives every open
-        # untasked problem every five minutes, and one that resolves inside the
-        # window leaves through the branch above and never earns a task at all.
-        # The watermark is deliberately NOT advanced, so the first occurrence
-        # still describes the task once one is made.
+        # Nothing here has to come back for it: `list_projection_candidates`
+        # selects every open untasked problem outright, whatever its watermark,
+        # and the sweep runs every five minutes — so the task is late, never
+        # missing. One that resolves inside its window leaves through the
+        # branch above and never earns a task at all.
+        #
+        # Returning early writes no metadata at all, which is the point: the
+        # watermark still sits where the last projection left it, so the
+        # occurrence comments this problem has not been told about yet are
+        # still owed when a task finally exists.
+        #
+        # A recurrence is deliberately NOT held back. `reopen` leaves
+        # `first_seen_at` alone, so a problem that blipped, resolved untasked,
+        # and came back is already past its window and projects at once — the
+        # second episode is the evidence the first one lacked.
         #
         # The investigation is untouched — Pandora diagnoses and posts its
         # Slack card immediately. Only the human's chore waits.

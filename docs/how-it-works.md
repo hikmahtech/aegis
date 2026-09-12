@@ -569,8 +569,15 @@ The steps that make it trustworthy:
   ON CONFLICT (key) DO UPDATE SET value = excluded.value;
   ```
 
-  `{"*": 0}` in that row turns the waiting off everywhere and restores the
-  behaviour before #537.
+  **The row is one number with two jobs.** It is the same window the
+  verification delay above uses, on purpose — "long enough to believe this is
+  real" is one question — so shortening it also shortens the wait before AEGIS
+  spends an investigation and takes its one automatic restart. `{"*": 0}` does
+  not restore the pre-#537 behaviour: it gives back the immediate task AND
+  removes every verification delay, so a blip that would have self-healed
+  during the wait now costs a billed investigation and a force-restart. If
+  what you want is only the old task timing, that is not available through
+  this row; say so on #537 and it can have a knob of its own.
 - **One automatic restart per problem per hour.** A swarm service below its
   replicas gets one `docker service update --force` first; that fixes most
   flaps. If the same problem is back within the hour, it is not restarted

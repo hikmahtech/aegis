@@ -376,14 +376,17 @@ class AlertInvestigationFlow:
         *,
         step: str,
         payload: dict | None = None,
-    ) -> None:
+    ) -> str:
         """Best-effort `record_investigation`: the outcome lands on the
         problem's timeline and moves its status; the flow already posted the
-        text on the task itself, so the projector will not repeat it."""
+        text on the task itself, so the projector will not repeat it.
+
+        Returns the problem's Todoist task id as the projection inside that
+        call left it, or "" — the status move may be what minted it (#537)."""
         if not problem_id:
-            return
+            return ""
         try:
-            await workflow.execute_activity_method(
+            recorded = await workflow.execute_activity_method(
                 HubActivities.record_investigation,
                 args=[
                     {
@@ -400,10 +403,12 @@ class AlertInvestigationFlow:
                 start_to_close_timeout=TIMEOUT_STANDARD,
                 retry_policy=NO_RETRY,
             )
+            return str((recorded or {}).get("task_id") or "")
         except Exception as exc:  # noqa: BLE001
             workflow.logger.warning(
                 "alert_record_investigation_failed step=%s err=%s", step, str(exc)[:200]
             )
+        return ""
 
     async def _store_verdict(
         self, alert: dict, verdict: dict, investigation_output: str, outcome: str
@@ -943,12 +948,25 @@ class AlertInvestigationFlow:
                 ]
                 resource_title = chosen_c.get("resource_title")
 
-        await self._record(
+        minted = await self._record(
             problem_id,
             "investigating",
             f"Investigation started against {resource_title or 'no resource'}.",
             step="investigating",
         )
+        # That record is where the task comes from when a settle window held it
+        # back (#537): the problem was `open` and younger than its class's
+        # window at step 0, so the projector deferred and both producers handed
+        # this flow `todoist_task_id=None`. Moving the status to `investigating`
+        # is what lifts the deferral, so the id exists only now. Learn it, or
+        # every comment below posts to an empty id and is dropped — the task
+        # would carry the occurrence text and nothing the investigation found.
+        #
+        # Patched: a history recorded before this fix has no post-task-note
+        # commands on this path (it was holding None), so replaying it with the
+        # id filled in would issue commands its history does not have.
+        if workflow.patched("task-id-from-projection"):
+            track_task_id = track_task_id or minted or None
 
         # ── Step 4.5: Post start-comment on the track-task ──
         # We have the resource picked now, which is the useful piece of

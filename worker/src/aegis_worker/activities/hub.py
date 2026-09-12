@@ -240,13 +240,21 @@ class HubActivities:
             moved = await hub.set_status(
                 self.db_pool, problem_id, status, reason=text[:300], now=now
             )
+        task_id = ""
         try:
-            await hub_project.project(self.db_pool, problem_id, now=now)
+            projected = await hub_project.project(self.db_pool, problem_id, now=now)
+            task_id = str(projected.get("task_id") or "")
         except Exception as exc:  # noqa: BLE001
             activity.logger.warning(
                 "record_investigation_project_failed problem=%s err=%s", problem_id, str(exc)[:200]
             )
-        return {"recorded": True, "status_changed": moved}
+        # `task_id` is reported because THIS projection is what mints the task
+        # when a settle window held it back (#537): the status this call just
+        # moved is what stops the projector deferring. Without it the flow goes
+        # on holding the None it was handed at step 0, and every comment it
+        # posts afterwards — the start note, the restart evidence, the verdict,
+        # the transcript — lands on an empty id and is silently dropped.
+        return {"recorded": True, "status_changed": moved, "task_id": task_id}
 
     @activity.defn
     async def follow_fix_pr(self, pr: dict) -> dict:
