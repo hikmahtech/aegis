@@ -140,6 +140,11 @@ journal:
       	- first paragraph
       	- second paragraph
 
+  One converter, `notes.body_outline`, lays the text out. A prose paragraph
+  is one bullet, its wrapped lines joined. The daylog's fallback format keeps
+  its outline: a `Label:` line with its indented items nested under it, a tab
+  or two spaces a level, at most four deep. `split_section` reads the block
+  back as the same text.
   The section is found by its heading text at any level (the redesigned
   templates of 2026-09-12 use `##`; older notes `###`) and ends at the next
   heading, a `---` line or a code fence, so the month note's `ccard` folder

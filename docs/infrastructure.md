@@ -1968,8 +1968,10 @@ record; the knowledge store is only its index (#514, spec
   `journal/<YYYY>/<NN. Mon>/<NN. Mon>.md`. If the user already has the day's or
   week's note open at the `journal/` root, where periodic-notes creates it,
   Raphael writes into that one instead. The entry is a `- #raphael day log`
-  bullet (`week in review`, `month in review`) with one indented bullet per
-  paragraph, placed at the end of the note's own section: `Journal` for a day,
+  bullet (`week in review`, `month in review`) with the text as an indented
+  outline under it: one bullet per prose paragraph, and in the daylog's
+  fallback format each `Label:` line with its items nested under it. It is
+  placed at the end of the note's own section: `Journal` for a day,
   `Review` for a week or a month (an older month note's `Month Review`),
   found by its heading text at any level. The section ends at the next
   heading, a `---` line or a code fence, so the month note's folder card stays

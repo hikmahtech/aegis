@@ -60,6 +60,110 @@ def test_the_block_is_a_tagged_bullet_with_one_child_per_paragraph():
     )
 
 
+# The daylog's deterministic fallback (`_format_daylog_fallback`): labels with
+# two-space items, and a decision whose prompt is a whole review card, so blank
+# lines and `•` items sit inside it. The shape is the real one; the item text
+# is made up.
+FALLBACK_BODY = (
+    "Day log for 2026-08-01.\n"
+    "Met / attended:\n"
+    "  - Team lunch\n"
+    "  - Standup: morning\n"
+    "Completed:\n"
+    "  - Invoices/Receipts filed\n"
+    "Decided:\n"
+    "  - ☀ <b>Daily review</b> — Sat 01 Aug\n"
+    "\n"
+    "📥 <b>Inbox</b>: 41 open\n"
+    "  • Renew the domain before it lapses\n"
+    "  • Backup job failed\n"
+    "\n"
+    "📅 <b>Today / overdue</b>: 9\n"
+    "  • Ch -> reviewed\n"
+    "Captured / clarified:\n"
+    "  - Invoices/Receipts filed [reference]\n"
+)
+FALLBACK_BLOCK = (
+    "- #raphael day log %% aegis:daylog:2026-08-01 %%\n"
+    "\t- Day log for 2026-08-01.\n"
+    "\t- Met / attended:\n"
+    "\t\t- Team lunch\n"
+    "\t\t- Standup: morning\n"
+    "\t- Completed:\n"
+    "\t\t- Invoices/Receipts filed\n"
+    "\t- Decided:\n"
+    "\t\t- ☀ <b>Daily review</b> — Sat 01 Aug\n"
+    "\t- 📥 <b>Inbox</b>: 41 open\n"
+    "\t\t- Renew the domain before it lapses\n"
+    "\t\t- Backup job failed\n"
+    "\t- 📅 <b>Today / overdue</b>: 9\n"
+    "\t\t- Ch -> reviewed\n"
+    "\t- Captured / clarified:\n"
+    "\t\t- Invoices/Receipts filed [reference]\n"
+)
+
+
+def test_the_fallback_day_log_keeps_its_outline():
+    """Labels at depth 1 with their items under them, the card's lines at depth
+    1 with their `•` items under them, and nothing glued together."""
+    assert notes.journal_block("daylog:2026-08-01", "day log", FALLBACK_BODY) == FALLBACK_BLOCK
+
+
+def test_the_fallback_reads_back_with_its_outline_and_round_trips():
+    key = "daylog:2026-08-01"
+    mine, _ = notes.split_section(f"## Journal\n#journal\n{FALLBACK_BLOCK}\n## Notes\n", key)
+    assert mine == (
+        "Day log for 2026-08-01.\n\n"
+        "Met / attended:\n  - Team lunch\n  - Standup: morning\n\n"
+        "Completed:\n  - Invoices/Receipts filed\n\n"
+        "Decided:\n  - ☀ <b>Daily review</b> — Sat 01 Aug\n\n"
+        "📥 <b>Inbox</b>: 41 open\n  - Renew the domain before it lapses\n  - Backup job failed\n\n"
+        "📅 <b>Today / overdue</b>: 9\n  - Ch -> reviewed\n\n"
+        "Captured / clarified:\n  - Invoices/Receipts filed [reference]"
+    )
+    # What the rollups read back lays out the same way again.
+    assert notes.journal_block(key, "day log", mine) == FALLBACK_BLOCK
+
+
+def test_a_prose_narrative_is_one_child_per_paragraph():
+    body = (
+        "Over the week the owner shipped the migration.\n\n"
+        "Most of Tuesday went on the importer, which\nran out of memory twice.\n\n"
+        "By Friday the open threads were the invoice and the backup."
+    )
+    assert notes.journal_block("daylog:weekly:2026-W37", "week in review", body) == (
+        "- #raphael week in review %% aegis:daylog:weekly:2026-W37 %%\n"
+        "\t- Over the week the owner shipped the migration.\n"
+        "\t- Most of Tuesday went on the importer, which ran out of memory twice.\n"
+        "\t- By Friday the open threads were the invoice and the backup.\n"
+    )
+
+
+def test_a_wrapped_paragraph_joins_and_stops_at_an_item_or_a_label():
+    body = "A wrapped\nparagraph here.\n  - an indented item\nNext:\n  • one\nlast line\ncontinues"
+    assert notes.body_outline(body) == [
+        (1, "A wrapped paragraph here."),
+        (2, "an indented item"),
+        (1, "Next:"),
+        (2, "one"),
+        (1, "last line continues"),
+    ]
+
+
+def test_depth_follows_indentation_and_stops_at_four():
+    body = "Top:\n  - a\n    - b\n\t\t\t- c\n        - d\n          - e\n      - f\n\t- g"
+    assert notes.body_outline(body) == [
+        (1, "Top:"),
+        (2, "a"),
+        (3, "b"),
+        (4, "c"),
+        (4, "d"),
+        (4, "e"),
+        (4, "f"),
+        (2, "g"),
+    ]
+
+
 def test_the_block_cannot_forge_another_marker():
     block = notes.journal_block("daylog:2026-09-11", "day log", "see %% aegis:daylog:x %%")
     assert "%% aegis:daylog:x %%" not in block

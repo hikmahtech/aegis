@@ -188,7 +188,9 @@ def split_section(text: str, key: str) -> tuple[str, str]:
 
     Two shapes. The current one (`journal_block`): a
     `- #raphael … %% aegis:<key> %%` bullet whose indented child bullets are
-    the paragraphs, joined back into paragraphs here. The first one, which
+    the outline. Each depth-1 child comes back as a paragraph, and a deeper
+    one as a `- ` item indented two spaces a level under it, which is the
+    text `body_outline` laid out in the first place. The first one, which
     notes written before the layout fix still carry: `## heading`, the marker
     line, then the body up to the next `## ` heading, the next aegis marker or
     the end of the note."""
@@ -202,17 +204,23 @@ def split_section(text: str, key: str) -> tuple[str, str]:
     line = text[line_start:line_end]
     if line.lstrip().startswith("- "):
         indent = len(line) - len(line.lstrip())
+        base = _indent_levels(line)
         end = line_end
-        children: list[str] = []
+        paras: list[str] = []
         while end < len(text):
             nxt = text.find("\n", end)
             nxt = len(text) if nxt < 0 else nxt + 1
             row = text[end:nxt].rstrip("\n")
             if not row.strip() or len(row) - len(row.lstrip()) <= indent:
                 break
-            children.append(re.sub(r"^[-*+]\s+", "", row.strip()))
+            item = _BULLET_RE.sub("", row.strip(), count=1)
+            depth = max(1, _indent_levels(row) - base)
+            if depth == 1 or not paras:
+                paras.append(item)
+            else:
+                paras[-1] += "\n" + "  " * (depth - 1) + "- " + item
             end = nxt
-        return "\n\n".join(c for c in children if c), (text[:line_start] + text[end:]).strip()
+        return "\n\n".join(p for p in paras if p), (text[:line_start] + text[end:]).strip()
     start = line_start
     if line_start > 0:
         prev_start = text.rfind("\n", 0, line_start - 1) + 1
@@ -500,7 +508,6 @@ JOURNAL_SECTIONS: dict[str, tuple[str, ...]] = {
 }
 JOURNAL_LABELS = {"daily": "day log", "weekly": "week in review", "monthly": "month in review"}
 _HEADING_RE = re.compile(r"^#{1,6} ")
-_LIST_ITEM_RE = re.compile(r"^(?:[-*+]|\d+[.)])\s+")
 
 
 def _is_boundary(line: str) -> bool:
@@ -531,37 +538,77 @@ def _find_section(lines: list[str], names: tuple[str, ...]) -> int | None:
     return None
 
 
+_BULLET_RE = re.compile(r"^[-*+•]\s+")
+_NUMBERED_RE = re.compile(r"^\d+[.)]\s+")
+MAX_OUTLINE_DEPTH = 4
+
+
+def _indent_levels(line: str) -> int:
+    """Leading indentation in outline levels: a tab or two spaces each."""
+    lead = line[: len(line) - len(line.lstrip(" \t"))]
+    return lead.count("\t") + lead.count(" ") // 2
+
+
+def body_outline(body: str) -> list[tuple[int, str]]:
+    """`body` as outline nodes `(depth, text)`, depth 1 sitting directly under
+    the `#raphael` bullet. Both kinds of daylog text go through here:
+
+    * an LLM narrative — prose paragraphs split by blank lines — gives one
+      depth-1 node per paragraph, its wrapped lines joined with a space;
+    * the deterministic fallback (`daylog._format_daylog_fallback`) keeps its
+      outline: a `Label:` line, then its items indented under it.
+
+    Every non-blank line is a node, except that consecutive plain unindented
+    lines join into one; a blank line, a label, a list item or an indented
+    line ends that join. A plain unindented line ending in `:` is a label.
+    Depth is 1 plus the line's indent (a tab or two spaces a level), at most
+    one deeper than the node before and never past `MAX_OUTLINE_DEPTH`. A
+    `-`/`*`/`+`/`•` marker (or a number) is dropped, a heading becomes bold,
+    and the text is otherwise kept as it is."""
+    nodes: list[tuple[int, str]] = []
+    prose: list[str] = []
+
+    def flush() -> None:
+        if prose:
+            nodes.append((1, " ".join(prose)))
+            prose.clear()
+
+    for raw in clean_body(body).splitlines():
+        text = raw.strip()
+        if not text:
+            flush()
+            continue
+        levels = _indent_levels(raw)
+        heading = _HEADING_RE.match(text)
+        bullet = _BULLET_RE.match(text) or _NUMBERED_RE.match(text)
+        if not levels and not heading and not bullet and not text.endswith(":"):
+            prose.append(text)
+            continue
+        flush()
+        if heading:
+            text = f"**{_HEADING_RE.sub('', text).strip()}**"
+        elif bullet:
+            text = text[bullet.end() :]
+        if text:
+            prev = nodes[-1][0] if nodes else 0
+            nodes.append((min(1 + levels, prev + 1, MAX_OUTLINE_DEPTH), text))
+    flush()
+    return nodes
+
+
 def journal_block(key: str, label: str, body: str) -> str:
     """Raphael's entry in the user's own bullet style (they write `- ` bullets
     under `## Journal`, with obsidian-outliner)::
 
         - #raphael day log %% aegis:<key> %%
         <TAB>- <first paragraph, as one line>
-        <TAB>- <second paragraph>
+        <TAB>- Completed:
+        <TAB><TAB>- <an item under that label>
 
-    A list item stays one child bullet each and a heading line becomes bold
-    text. The marker is an Obsidian comment, so reading view shows the tag,
-    the label and the paragraphs."""
+    The body is laid out by :func:`body_outline`. The marker is an Obsidian
+    comment, so reading view shows the tag, the label and the outline."""
     title = " ".join(p for p in ("#raphael", clean_body(label).replace("\n", " ")) if p)
-    children: list[str] = []
-    for para in re.split(r"\n\s*\n", clean_body(body)):
-        prose: list[str] = []
-        for row in (r.strip() for r in para.splitlines()):
-            if not row:
-                continue
-            if _HEADING_RE.match(row) or _LIST_ITEM_RE.match(row):
-                if prose:
-                    children.append(" ".join(prose))
-                    prose = []
-                if _HEADING_RE.match(row):
-                    children.append(f"**{_HEADING_RE.sub('', row).strip()}**")
-                else:
-                    children.append(_LIST_ITEM_RE.sub("", row, count=1))
-            else:
-                prose.append(row)
-        if prose:
-            children.append(" ".join(prose))
-    rows = [f"- {title} {marker(key)}"] + [f"\t- {c}" for c in children if c]
+    rows = [f"- {title} {marker(key)}"] + ["\t" * d + f"- {t}" for d, t in body_outline(body)]
     return "\n".join(rows) + "\n"
 
 
