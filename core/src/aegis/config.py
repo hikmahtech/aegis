@@ -361,6 +361,15 @@ class Settings(BaseSettings):
     books_mailbox_entities: str = ""
     books_todoist_projects: str = ""  # "personal=<todoist project id>,hikmah=<id>" for dues
 
+    # Raphael's notes — the user's Obsidian vault (#514, spec
+    # 2026-09-12-raphael-notes-design.md). The checkout sits beside the books
+    # in the config volume core and worker share. Both keys empty ⇒ the vault
+    # is not configured: nothing writes or indexes it and the daylog keeps
+    # filing knowledge rows.
+    notes_path: str = "/app/config/notes"
+    notes_repo_url: str = ""
+    notes_deploy_key: str = ""  # private ed25519 deploy key, PEM or base64 PEM; never logged
+
     @model_validator(mode="after")
     def _require_admin_credentials(self) -> "Settings":
         """admin_username/admin_password are required unless auth_disabled."""

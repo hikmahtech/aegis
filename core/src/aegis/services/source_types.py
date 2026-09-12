@@ -30,6 +30,9 @@ DEFAULT_DECAY_DAYS = 90
 class SourceTypeInfo:
     description: str
     decay_days: int | None = None
+    # Multiplies a document's ranking score (#514). 1.0 = ranked on similarity
+    # and decay alone, which is every type but the user's own notes.
+    rank_boost: float = 1.0
 
 
 SOURCE_TYPES: dict[str, SourceTypeInfo] = {
@@ -138,6 +141,15 @@ SOURCE_TYPES: dict[str, SourceTypeInfo] = {
         "text — kept in step with the library by CalibreSyncFlow (#510)",
         decay_days=3650,
     ),
+    # The user's Obsidian vault and Raphael's own notes (#514): the record of
+    # what was concluded, so it barely decays and ranks above raw documents.
+    "note": SourceTypeInfo(
+        "A note from the user's Obsidian vault (journal, knowledge, literature, "
+        "reference, and Raphael's own under raphael/), indexed by NotesSyncFlow "
+        "with encrypted blocks stripped. The vault is the record; this is its index.",
+        decay_days=3650,
+        rank_boost=1.25,
+    ),
 }
 
 
@@ -151,6 +163,14 @@ def get_decay_days(source_type: str) -> int:
     if info is not None and info.decay_days is not None:
         return info.decay_days
     return DEFAULT_DECAY_DAYS
+
+
+def get_rank_boost(source_type: str) -> float:
+    """How much `source_type`'s documents are lifted when ranked (#514).
+
+    1.0 for every type but the user's own notes, and for unknown types."""
+    info = SOURCE_TYPES.get(source_type)
+    return info.rank_boost if info is not None else 1.0
 
 
 def warn_if_unknown(source_type: str) -> None:

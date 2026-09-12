@@ -78,6 +78,9 @@ from aegis_worker.flows.memory_reflection import MemoryReflectionFlow, MemoryRef
 from aegis_worker.flows.money_brief import MoneyBriefConfig, MoneyBriefFlow
 from aegis_worker.flows.money_process import MoneyProcessFlow
 from aegis_worker.flows.month_close import MonthCloseConfig, MonthCloseFlow
+from aegis_worker.flows.notes_backfill import NotesBackfillFlow
+from aegis_worker.flows.notes_sync import NotesSyncConfig, NotesSyncFlow
+from aegis_worker.flows.notes_write import NotesWriteFlow
 from aegis_worker.flows.profile_reflection import ProfileReflectionConfig, ProfileReflectionFlow
 from aegis_worker.flows.raindrop_ingest import RaindropIngestFlow, RaindropIngestInput
 from aegis_worker.flows.receipt_ingest import (
@@ -293,6 +296,18 @@ FLOWS: tuple[FlowSpec, ...] = (
         CalibreSyncFlow,
         lambda act: CalibreSyncConfig(agent_id=act["agent_id"]),
     ),
+    # Raphael's notes (#514): one chat write (started by note_write/note_link),
+    # the hourly vault index, and the hand-started journal backfill. All inert
+    # until the Integrations page has notes_repo_url + notes_deploy_key.
+    FlowSpec(NotesWriteFlow),
+    FlowSpec(
+        NotesSyncFlow,
+        lambda act: NotesSyncConfig(
+            agent_id=act["agent_id"],
+            max_files=_int(act["config"], "max_files", NotesSyncConfig.max_files),
+        ),
+    ),
+    FlowSpec(NotesBackfillFlow),
     FlowSpec(
         RssIngestFlow,
         lambda act: RssIngestInput(agent_id=act["agent_id"]),
