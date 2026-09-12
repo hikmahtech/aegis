@@ -73,6 +73,29 @@ async def retention_preview(
     return await feeds.retention_preview(request.app.state.db_pool, older_than_days)
 
 
+@router.get("/feed-items")
+async def feed_items(
+    request: Request,
+    channel_id: UUID | None = None,
+    mode: str | None = Query(None, pattern="^(full|abstract|failed)$"),
+    limit: int = Query(50, ge=1, le=feeds.RECENT_ITEMS_MAX),
+    cursor: str | None = None,
+) -> dict:
+    """The newest entries across the RSS feeds (or one feed), newest first:
+    title, link, feed, when it came in, how it was stored, an excerpt and
+    whether a prompt used it. Page with `next_cursor`. Read-only."""
+    try:
+        return await feeds.recent_items(
+            request.app.state.db_pool,
+            channel_id=channel_id,
+            mode=mode,
+            limit=limit,
+            cursor=cursor,
+        )
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
 @router.post("", status_code=201)
 async def create_channel(request: Request, body: ChannelCreate) -> dict:
     if body.kind not in CHANNEL_KINDS:
