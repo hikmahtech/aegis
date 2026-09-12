@@ -27,6 +27,7 @@ export const NAV: NavSection[] = [
       { path: '/assets', label: 'Assets', icon: 'assets' },
       { path: '/market', label: 'Market', icon: 'market' },
       { path: '/admin/money', label: 'Money', icon: 'money' },
+      { path: '/admin/desk', label: 'Trading desk', icon: 'market' },
     ],
   },
   {
