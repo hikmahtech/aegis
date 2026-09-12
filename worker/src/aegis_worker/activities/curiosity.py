@@ -58,7 +58,13 @@ from aegis_worker.activities.delivery import safe_send_message
 _ATTENDEE_LINE_RE = re.compile(r"^Attendees:\s*(.+)$", re.MULTILINE)
 _EMAIL_RE = re.compile(r"[\w.+-]+@[\w-]+\.[\w.-]+")
 
-_DETECTORS = ("calendar_attendee", "unknown_payee", "todoist_project")
+_DETECTORS = ("calendar_attendee", "unknown_payee", "todoist_project", "untracked_topic")
+# The knowledge tools whose empty answers the `untracked_topic` detector reads
+# (#513), and how often and how recently a subject must come up empty.
+_KNOWLEDGE_TOOLS = ("search_knowledge", "ask_knowledge", "find_reference")
+_EMPTY_SEARCH_DAYS = 14
+_MIN_EMPTY_SEARCHES = 2
+_SUBJECT_RE = re.compile(r"[^a-z0-9 +#.-]+")
 
 # How far back the unknown-payee detector looks. A payment from last year is
 # not worth an interruption; the weekly money brief lists the older backlog.
@@ -572,6 +578,108 @@ class CuriosityActivities:
             )
         return out
 
+    async def _detect_untracked_topic(
+        self, agent_id: str, known: str
+    ) -> list[tuple[float, dict]]:
+        """A subject the owner keeps asking the knowledge store about that it
+        has nothing on (#513). Maou's unknown-payee pattern applied to
+        interests: a gap the data shows, asked once, and a yes becomes config
+        — a tracked topic (`research_topics.track`).
+
+        Chat surface only: the operator's MCP searches are debugging, not
+        interests. An unreachable store is an outage, not an empty answer, so
+        its calls never count.
+        """
+        from aegis.services import research_topics
+
+        rows = await self.db_pool.fetch(
+            "SELECT COALESCE(args->>'query', args->>'question', '') AS q, result "
+            "FROM chat_tool_calls WHERE tool_name = ANY($1::text[]) AND surface = 'chat' "
+            "AND status = 'success' AND created_at > now() - make_interval(days => $2) "
+            "ORDER BY created_at DESC LIMIT 500",
+            list(_KNOWLEDGE_TOOLS),
+            _EMPTY_SEARCH_DAYS,
+        )
+        asks: dict[str, int] = {}
+        for r in rows:
+            if not self._empty_answer(r["result"]):
+                continue
+            subject = self._search_subject(r["q"])
+            if subject:
+                asks[subject] = asks.get(subject, 0) + 1
+        if not asks:
+            return []
+        tracked: set[str] = set()
+        for topic in await research_topics.load_topics(self.db_pool):
+            tracked.add(topic.slug)
+            tracked.update(term.lower() for term in topic.terms)
+        out: list[tuple[float, dict]] = []
+        for subject, n in asks.items():
+            key = research_topics.slug(subject)
+            if n < _MIN_EMPTY_SEARCHES or not key or subject in tracked or key in tracked:
+                continue
+            if subject in known:
+                continue
+            out.append(
+                (
+                    float(n),
+                    {
+                        "gap_type": "untracked_topic",
+                        "subject": subject,
+                        "question": (
+                            f"You've asked me about \"{subject}\" {n} times lately and I had "
+                            "nothing on it. Want me to track it and collect what comes up? "
+                            "(yes/no)"
+                        ),
+                        "evidence": {"empty_searches": n},
+                        "novelty_key": f"track:{key}",
+                    },
+                )
+            )
+        return out
+
+    @staticmethod
+    def _empty_answer(result: Any) -> bool:
+        """Whether a knowledge tool's recorded result found nothing. Every
+        shape the three tools return: a bare list (`search_knowledge`),
+        `{results: []}` (`find_reference`), `{answer, sources: []}`
+        (`ask_knowledge`). An error envelope is not empty — it is an outage."""
+        import json
+
+        if isinstance(result, str):
+            try:
+                result = json.loads(result)
+            except ValueError:
+                return False
+        if isinstance(result, list):
+            return not result
+        if isinstance(result, dict):
+            if result.get("error") or result.get("status") == "unavailable":
+                return False
+            if isinstance(result.get("results"), list):
+                return not result["results"]
+            if "sources" in result:
+                return not result.get("sources")
+        return False
+
+    @staticmethod
+    def _search_subject(query: str) -> str:
+        """A search's subject, normalised so two phrasings of it meet:
+        lowercase, punctuation to spaces, whitespace collapsed. Empty when too
+        short or too long to be a topic."""
+        subject = " ".join(_SUBJECT_RE.sub(" ", (query or "").lower()).split())
+        return subject if 3 <= len(subject) <= 80 else ""
+
+    @staticmethod
+    def _is_yes(answer: str) -> bool:
+        """A free-text answer to "track this?" that means yes. A no, or
+        anything unclear, leaves the topic untracked — asking wrongly costs one
+        card, tracking wrongly costs a feed of noise."""
+        a = (answer or "").strip().lower()
+        if not a or a.startswith(("no", "n ", "nah", "don't", "dont", "stop")) or a == "n":
+            return False
+        return a.startswith(("y", "sure", "ok", "track", "please", "go ahead"))
+
     # ------------------------------------------------------------------ phrasing
 
     async def _phrase(self, agent_id: str, candidates: list[dict]) -> list[dict]:
@@ -753,6 +861,24 @@ class CuriosityActivities:
             subject,
         )
         out = {"recorded": True, "agent_id": agent_id, "subject": subject}
+
+        if meta.get("gap_type") == "untracked_topic":
+            # "Track this?" (#513): a yes becomes a tracked topic, through the
+            # same `track` the chat tool uses. Anything else is a no, and the
+            # novelty key means the question is not asked again.
+            tracked = False
+            if self._is_yes(answer) and subject:
+                try:
+                    from aegis.services import research_topics
+
+                    res = await research_topics.track(self.db_pool, subject, [subject])
+                    tracked = True
+                    out["problem_id"] = res.get("problem_id")
+                except Exception as exc:  # noqa: BLE001 — the memory write stands
+                    activity.logger.warning(
+                        "curiosity_track_failed subject=%s err=%s", subject, str(exc)[:200]
+                    )
+            out["tracked"] = tracked
 
         if meta.get("gap_type") == "unknown_payee" and self.llm_client and self.books_cfg:
             try:

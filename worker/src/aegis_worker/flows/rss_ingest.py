@@ -45,6 +45,10 @@ _STALE_FEED_DAYS = 90
 # code replays without them. A run lasts minutes: `workflow.deprecate_patch`
 # one deploy later.
 _PATCH_FEEDS = "rss-feeds-511"
+# Guards the tracked-topic attach (#513). Same deprecation note.
+_PATCH_TOPICS = "research-hub-513"
+# Attaching can raise a topic's task, which is a Todoist round trip.
+_TOPICS_TIMEOUT = timedelta(seconds=120)
 # The UTC hour whose run reconciles the stale findings. Staleness is measured
 # in days, so once a day is enough, and it keeps the hub from recording 24
 # occurrences a day of a feed that is merely quiet.
@@ -127,6 +131,8 @@ class RssIngestFlow:
         per_feed: list[dict] = []
         failing: list[dict] = []
         stale: list[dict] = []
+        # Every stored entry, for the tracked-topic match at the end (#513).
+        topic_items: list[dict] = []
         now = workflow.now()
 
         for ch in channels:
@@ -355,6 +361,14 @@ class RssIngestFlow:
                                     "published": entry.get("published") or "",
                                 }
                             )
+                            # A stored entry may name a tracked topic (#513).
+                            topic_items.append(
+                                {
+                                    "title": entry.get("title", ""),
+                                    "url": entry.get("link", ""),
+                                    "summary": (entry.get("summary") or "")[:500],
+                                }
+                            )
                     else:
                         feed_failed += 1
                         entry_rows.append(
@@ -467,6 +481,23 @@ class RssIngestFlow:
                 )
                 if finding:
                     stale.append(finding)
+
+        # Stored entries that name a tracked topic join its round in the hub
+        # (#513), so a story from a feed and the same story from an intel scan
+        # are one item there. One call per run, never per entry.
+        if topic_items and workflow.patched(_PATCH_TOPICS):
+            try:
+                attached = await workflow.execute_activity(
+                    "attach_topic_items",
+                    args=[topic_items, "rss"],
+                    start_to_close_timeout=_TOPICS_TIMEOUT,
+                    retry_policy=RETRY_ONCE,
+                )
+                if isinstance(attached, dict) and attached.get("attached"):
+                    notes["topic_items"] = attached["attached"]
+            except Exception as exc:  # noqa: BLE001 — the entries are stored either way
+                workflow.logger.warning("rss_topic_attach_degraded err=%s", str(exc)[:200])
+                notes["topics_degraded"] = True
 
         if v2:
             found: dict = {"failing": len(failing)}

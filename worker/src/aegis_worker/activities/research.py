@@ -226,5 +226,9 @@ class ResearchActivities:
             return {}
         from aegis.services.hub_project import ensure_problem_for_task
 
-        problem = await ensure_problem_for_task(self.db_pool, task_id, settings=self.settings)
+        # Source `research` makes the problem Raphael's (#513); the default,
+        # `session`, is the infra agent's.
+        problem = await ensure_problem_for_task(
+            self.db_pool, task_id, source="research", settings=self.settings
+        )
         return {"problem_id": str(problem["id"])} if problem else {}

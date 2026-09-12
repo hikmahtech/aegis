@@ -383,6 +383,39 @@ class BriefingActivities:
         except Exception as exc:
             activity.logger.warning("briefing_collected_diff_failed err=%s", str(exc)[:200])
 
+        # topics: tracked topics (#513) whose round gained items since the last
+        # briefing. The hub holds these now, where the intel scans used to file
+        # an Inbox task per item; a topic raises its own task only once its
+        # round earns one, so this line is how the rest reach the user.
+        topics_out: list[dict] = []
+        if self.db_pool:
+            try:
+                trows = await self.db_pool.fetch(
+                    "SELECT COALESCE(p.metadata->>'topic', p.subject) AS topic, "
+                    "       p.todoist_task_id IS NOT NULL AS tasked, "
+                    "       count(*) FILTER (WHERE e.occurred_at > $1) AS new_items, "
+                    "       count(*) AS round_items "
+                    "FROM problems p JOIN problem_events e ON e.problem_id = p.id "
+                    "  AND e.kind = 'occurrence' AND e.payload->>'item' = 'true' "
+                    "WHERE p.class = $2 AND p.closed_at IS NULL "
+                    "GROUP BY p.id "
+                    "HAVING count(*) FILTER (WHERE e.occurred_at > $1) > 0 "
+                    "ORDER BY 3 DESC LIMIT 8",
+                    cursor,
+                    "topic",
+                )
+                topics_out = [
+                    {
+                        "topic": r["topic"],
+                        "new_items": int(r["new_items"]),
+                        "round_items": int(r["round_items"]),
+                        "task": bool(r["tasked"]),
+                    }
+                    for r in trows
+                ]
+            except Exception as exc:
+                activity.logger.warning("briefing_topics_failed err=%s", str(exc)[:200])
+
         # inbox: the `important_read` mail AEGIS filed and marked read without
         # ever showing the owner. Same diff-and-dedup shape as `collected`.
         prior_email_ids = list(prior.get("seen_email_ids") or [])
@@ -501,7 +534,13 @@ class BriefingActivities:
         # It is read at render time, inside `frame_briefing`, so that no body
         # data ever enters this bundle.
         quiet = not (
-            intel_out or collected_out or emails_out or failed_runs or new_drift or new_cal_ids
+            intel_out
+            or collected_out
+            or topics_out
+            or emails_out
+            or failed_runs
+            or new_drift
+            or new_cal_ids
         )
         new_state = {
             "last_briefing_at": now.isoformat(),
@@ -516,6 +555,7 @@ class BriefingActivities:
             "quiet": quiet,
             "intel": intel_out,
             "collected": collected_out,
+            "topics": topics_out,
             "emails": emails_out,
             "broke": {"failed_runs": failed_runs, "new_drift": new_drift},
             "calendar": {"today": cal_today, "new_ids": new_cal_ids},
@@ -666,6 +706,15 @@ class BriefingActivities:
             lines.append("<b>Came across your feeds</b>")
             for it in collected:
                 lines.append(f"  • {_esc(str(it.get('title', '')))}")
+        topics = (changes.get("topics") or [])[:8]
+        if topics:
+            lines.append("<b>Your topics</b>")
+            for t in topics:
+                task = " — task raised" if t.get("task") else ""
+                lines.append(
+                    f"  • {_esc(str(t.get('topic', '')))}: {t.get('new_items')} new "
+                    f"({t.get('round_items')} this round){task}"
+                )
         emails = (changes.get("emails") or [])[:8]
         if emails:
             lines.append("<b>Mail worth reading</b>")
@@ -745,6 +794,9 @@ class BriefingActivities:
             "attention. The `collected` list is what AEGIS read/saved from the "
             "user's feeds (raindrop/RSS/email) since yesterday — distil it into one "
             "sentence on the themes worth knowing, don't list every item. "
+            "The `topics` list is news on topics the user asked AEGIS to track: "
+            "say which moved, and name any whose `task` is true, since that one "
+            "became a task. "
             "The `emails` list is mail AEGIS judged worth reading and already "
             "marked read, so the user has NOT seen it — give it its own sentence "
             "on what arrived, and phrase `lane: own` (work) separately from the "

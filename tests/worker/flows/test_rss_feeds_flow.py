@@ -105,9 +105,14 @@ def _stubs(
     async def cursor(kind, identifier, key, value) -> None:
         rec.cursor.append(value)
 
+    @activity.defn(name="attach_topic_items")
+    async def attach(items: list[dict], origin: str) -> dict:
+        rec.__dict__.setdefault("topics", []).append((origin, [it["url"] for it in items]))
+        return {"topics": 1, "matched": len(items), "attached": len(items), "tasks": 0}
+
     return [
         list_channels, fetch, load_terms, claim, release, content, abstract,
-        record_entries, record_run, reconcile, cursor,
+        record_entries, record_run, reconcile, cursor, attach,
     ]
 
 
@@ -244,3 +249,21 @@ async def test_stale_findings_wait_for_the_review_hour():
     config = {"last_cursor": "2020-01-01T00:00:00+00:00"}
     await _run(_stubs(rec, config=config, entries=[]), "rf-stale-wait", stale_review_hour=99)
     assert [r["classes"] for r in rec.reconciles] == [["feed_failing"]]
+
+
+@pytest.mark.asyncio
+async def test_stored_entries_go_to_the_topic_hub_once_per_run():
+    """#513: every stored entry is offered to the tracked-topic match in ONE
+    call per run, never one per entry; a failed entry is not offered."""
+    rec = Rec()
+    entries = [_entry(1, "Stored one", "s1"), _entry(2, "Stored two", "s2")]
+    result = await _run(_stubs(rec, config={"ingest": "full"}, entries=entries), "rf-topics")
+    assert rec.topics == [("rss", [f"{FEED}/1", f"{FEED}/2"])]
+    assert result["topic_items"] == 2
+
+    failed = Rec()
+    await _run(
+        _stubs(failed, config={"ingest": "full"}, entries=entries, content_status="error"),
+        "rf-topics-failed",
+    )
+    assert not getattr(failed, "topics", [])

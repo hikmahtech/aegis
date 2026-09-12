@@ -28,8 +28,10 @@ ADDRESSABLE_ASSIGNEES = ["@sebas", "@raphael", "@maou", "@pandora"]
 # the cooldown becomes an infinite slow loop over the same tasks.
 PARK_LABEL = "@waiting"
 # `#money`: Maou raises these and the user acts on them; no verb could act on one
-# without guessing about the user's money.
-EXCLUDED_LABELS = ["@someday", PARK_LABEL, "#money"]
+# without guessing about the user's money. `#feeds` (#513): a feed that stopped
+# fetching or publishing is the user's to fix or drop, and the research verb on
+# one would research the feed's URL.
+EXCLUDED_LABELS = ["@someday", PARK_LABEL, "#money", "#feeds"]
 
 # Upper bound on the eligible pool we consider per tick. Production's whole
 # agent-assigned backlog is ~80 rows, so this is the pool, not a sample.
@@ -97,6 +99,9 @@ DEFAULT_VERBS: dict[str, str | None] = {
     # Maou raises these and the user acts on them. `EXCLUDED_LABELS` keeps the
     # sweep off them before a verb is ever resolved; this says why.
     "#money": None,
+    # A feed that stopped fetching or publishing (#513): the user fixes or
+    # drops the feed. Kept off the sweep by `EXCLUDED_LABELS` like `#money`.
+    "#feeds": None,
 }
 # The verbs a tag may be routed to. `coding` is not one: it is chosen by the
 # `@code` label on an untagged task, never by a tag.

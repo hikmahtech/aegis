@@ -34,7 +34,7 @@ agents:
       intent_description: Research, knowledge lookups, articles, papers and topic tracking.
       intent_keywords: [research, knowledge, learn, paper, article, summari, remember, recall, explain]
       knowledge_domains: [article, feed, email, research]
-      tool_set: [search_knowledge, ask_knowledge, research_topic, web_search, read_url, paper_search, paper_read, list_feeds, subscribe_feed, unsubscribe_feed, library_search, library_book, library_read, library_suggest, track_topic, remember_this, task_context, report_progress, merge_problems, capture_to_inbox, list_next_actions, list_projects, complete_task, handoff_task, find_reference, youtube_transcript, pdf_to_text]
+      tool_set: [search_knowledge, ask_knowledge, research_topic, web_search, read_url, paper_search, paper_read, list_feeds, subscribe_feed, unsubscribe_feed, library_search, library_book, library_read, library_suggest, track_topic, untrack_topic, remember_this, task_context, report_progress, merge_problems, capture_to_inbox, list_next_actions, list_projects, complete_task, handoff_task, find_reference, youtube_transcript, pdf_to_text]
     active: true
 
   - id: maou

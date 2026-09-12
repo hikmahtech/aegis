@@ -105,6 +105,7 @@ from aegis.services.tools.research import (  # noqa: F401 — re-export: importe
     _exec_research_topic,
     _exec_web_search,
 )
+from aegis.services.tools.topics import _exec_untrack_topic
 from aegis.services.tools.vercel import (
     _exec_vercel_get_build_logs,
     _exec_vercel_get_deployment,
@@ -490,6 +491,8 @@ CHAT_TOOLS = [
             },
         },
     },
+    # Stop tracking one (#513), generated from services/tools/topics.py.
+    _registry_schema("untrack_topic"),
     # The research lane's four reads (#509), generated from services/tools/research.py.
     _registry_schema("web_search"),
     _registry_schema("read_url"),
@@ -1991,52 +1994,22 @@ async def _exec_get_finance_news(pool: asyncpg.Pool, args: dict, ctx: ToolContex
 
 
 async def _exec_track_topic(pool: asyncpg.Pool, args: dict, ctx: ToolContext) -> str:
-    """Subscribe to ongoing intelligence monitoring for a topic."""
-    topic_name = args.get("topic_name", "").strip()
-    queries = args.get("queries", [])
-    priority = args.get("priority", "medium")
+    """Subscribe to ongoing intelligence monitoring for a topic.
 
-    if not topic_name or not queries:
-        return json.dumps({"error": "topic_name and queries are required"})
+    The registry write and the topic's hub round are `research_topics.track`
+    (#513), shared with the curiosity card that asks "track this?"."""
+    from aegis.services import research_topics
 
-    # Load current intelligence_topics from settings
-    row = await pool.fetchrow("SELECT value FROM settings WHERE key = 'intelligence_topics'")
-    existing_data: dict = {}
-    if row and row["value"]:
-        existing_data = row["value"] if isinstance(row["value"], dict) else {}
-
-    topics: list[dict] = existing_data.get("topics", [])
-
-    # Check if topic already exists
-    status = "added"
-    updated_topics = []
-    found = False
-    for t in topics:
-        if t.get("name", "").lower() == topic_name.lower():
-            updated_topics.append({"name": topic_name, "queries": queries, "priority": priority})
-            status = "updated"
-            found = True
-        else:
-            updated_topics.append(t)
-
-    if not found:
-        updated_topics.append({"name": topic_name, "queries": queries, "priority": priority})
-
-    new_value = {"topics": updated_topics}
-    await pool.execute(
-        "INSERT INTO settings (key, value, updated_at) VALUES ('intelligence_topics', $1, NOW()) "
-        "ON CONFLICT (key) DO UPDATE SET value = $1, updated_at = NOW()",
-        new_value,
-    )
-
-    return json.dumps(
-        {
-            "status": status,
-            "topic": topic_name,
-            "query_count": len(queries),
-            "total_topics": len(updated_topics),
-        }
-    )
+    try:
+        out = await research_topics.track(
+            pool,
+            str(args.get("topic_name") or ""),
+            list(args.get("queries") or []),
+            str(args.get("priority") or "medium"),
+        )
+    except ValueError as exc:
+        return json.dumps({"error": str(exc)})
+    return json.dumps(out, default=str)
 
 
 _TRIAGE_SETTING_KEYS = {
@@ -3061,6 +3034,7 @@ TOOL_EXECUTORS: dict[str, Any] = {
     "get_finance_news": _exec_get_finance_news,
     "research_topic": _exec_research_topic,
     "track_topic": _exec_track_topic,
+    "untrack_topic": _exec_untrack_topic,
     "web_search": _exec_web_search,
     "read_url": _exec_read_url,
     "paper_search": _exec_paper_search,
@@ -3188,6 +3162,8 @@ AGENT_TOOL_SETS: dict[str, set[str]] = {
         "library_read",
         "library_suggest",
         "track_topic",
+        # Tracked topics' rounds in the hub (#513): stop tracking one.
+        "untrack_topic",
         "remember_this",
         # Problem hub, the session registry: read a task's context, register
         # a session on it, fold a duplicate problem away.
