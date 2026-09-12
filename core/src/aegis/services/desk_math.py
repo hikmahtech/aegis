@@ -565,12 +565,31 @@ class Stats:
     t: float
 
 
+def desk_series(
+    fills: list[Fill], bars: dict[str, list[Bar]], capital: float, days: list[date]
+) -> list[tuple[date, float, float]]:
+    """Each day's close: the desk's value, and the share of it that is invested.
+
+    The invested share is what the §8 alarm needs. The desk holds roughly the
+    pipeline's own heat and keeps the rest in cash, while the benchmark holds
+    the whole capital, so a gap measured against the full benchmark is mostly
+    that difference in exposure.
+
+    `ponytail:` replays from scratch per day, O(days x fills); fine for years of
+    a daily desk."""
+    out: list[tuple[date, float, float]] = []
+    for d in days:
+        book = replay(fills, bars, capital, d)
+        total = value(book, bars, d)
+        out.append((d, total, (total - book.cash) / total if total else 0.0))
+    return out
+
+
 def desk_values(
     fills: list[Fill], bars: dict[str, list[Bar]], capital: float, days: list[date]
 ) -> list[tuple[date, float]]:
-    """The desk's value at each day's close. `ponytail:` replays from scratch
-    per day, O(days x fills); fine for years of a daily desk."""
-    return [(d, value(replay(fills, bars, capital, d), bars, d)) for d in days]
+    """The desk's value at each day's close."""
+    return [(d, v) for d, v, _ in desk_series(fills, bars, capital, days)]
 
 
 def benchmark_values(
@@ -607,16 +626,66 @@ def _week_ends(values: list[tuple[date, float]]) -> dict[tuple[int, int], float]
     return ends
 
 
-def weekly_excess(desk: list[tuple[date, float]], bench: list[tuple[date, float]]) -> list[float]:
-    """The desk's return minus the benchmark's, one per ISO week, from each
-    week's last value to the next (spec §8)."""
-    a, b = _week_ends(desk), _week_ends(bench)
-    weeks = sorted(set(a) & set(b))
+MIN_INVESTED = 0.01  # a week entered with almost nothing at risk says nothing about the picking
+
+
+def _paired_weeks(
+    a: dict[tuple[int, int], float],
+    b: dict[tuple[int, int], float],
+    s: dict[tuple[int, int], float] | None = None,
+) -> list[tuple[tuple[int, int], tuple[int, int]]]:
+    """Consecutive ISO weeks every series has a value for, as (previous, current).
+
+    With ``s``, a week the desk entered with almost nothing invested is left
+    out: its return per rupee at risk is a tiny number over a tiny number."""
+    weeks = sorted(set(a) & set(b) & (set(a) if s is None else set(s)))
     return [
-        (a[cur] / a[prev] - 1) - (b[cur] / b[prev] - 1)
+        (prev, cur)
         for prev, cur in zip(weeks, weeks[1:], strict=False)
-        if a[prev] and b[prev]
+        if a[prev] and b[prev] and (s is None or s[prev] >= MIN_INVESTED)
     ]
+
+
+def weekly_excess(
+    desk: list[tuple[date, float]],
+    bench: list[tuple[date, float]],
+    shares: list[tuple[date, float]] | None = None,
+) -> list[float]:
+    """The desk's return minus the benchmark's, one per ISO week, from each
+    week's last value to the next (spec §8).
+
+    Without ``shares`` this is the gap to the whole benchmark: what the owner
+    would have earned putting the same money into SHARIABEES instead. That is
+    the honest headline, and it is what the monthly section reports first.
+
+    With ``shares`` — the desk's invested share per day — the gap is measured per
+    rupee the desk actually had at risk: the desk's return over the share it
+    carried into the week, minus the benchmark's. Cash earns nothing, so that
+    ratio is the return on the invested part, and the gap is the stock picking
+    with the cash the pipeline is deliberately not investing taken out.
+
+    That is what the §8 alarm is judged on, for two reasons. Against the full
+    benchmark a roughly a third-invested desk falls behind in any rising market
+    whatever it picks, so the alarm would fire on exposure alone. And
+    ``expected_excess_pa`` comes from a backtest of a fully invested book, so
+    only a per-rupee figure is the same kind of number. Subtracting a scaled
+    benchmark without dividing would be a third of the truth and fail a desk
+    that delivers exactly what the backtest promised."""
+    a, b = _week_ends(desk), _week_ends(bench)
+    s = _week_ends(shares) if shares is not None else None
+    return [
+        (a[cur] / a[prev] - 1) / (1.0 if s is None else s[prev]) - (b[cur] / b[prev] - 1)
+        for prev, cur in _paired_weeks(a, b, s)
+    ]
+
+
+def weekly_shares(
+    desk: list[tuple[date, float]], bench: list[tuple[date, float]], shares: list[tuple[date, float]]
+) -> list[float]:
+    """The invested share the desk carried into each week ``weekly_excess``
+    measures, so the report can say what the scaling was."""
+    a, b, s = _week_ends(desk), _week_ends(bench), _week_ends(shares)
+    return [s[prev] for prev, _ in _paired_weeks(a, b, s)]
 
 
 def stats(xs: list[float]) -> Stats:
@@ -645,7 +714,11 @@ def label(s: Stats) -> str:
 
 def below_expectation(s: Stats, expected_excess_pa: float) -> bool:
     """True when live results are more than two standard errors below the
-    weekly excess the backtest implies (spec §8)."""
+    weekly excess the backtest implies (spec §8).
+
+    Give it the invested-scaled statistics, not the gap to the whole benchmark:
+    the backtest is of a fully invested book, and the desk is not, so the full
+    gap would fail this on cash drag alone."""
     if s.n < MIN_WEEKS:
         return False
     weekly = (1 + expected_excess_pa) ** (1 / 52) - 1

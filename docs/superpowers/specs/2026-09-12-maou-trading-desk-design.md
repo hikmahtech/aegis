@@ -215,9 +215,27 @@ the day out of the `held_back` count, which is for days the desk did nothing on.
   so a value stored in September and one fetched in December are in different scales, and their
   ratio is wrong by the dividend.
 - **Context:** `^NSEI` (Nifty 50) as a price index, shown and never used for a verdict.
-- **Weekly excess:** the desk's weekly return (after costs, before tax) minus SHARIABEES's, measured
-  from the last close of one ISO week to the last close of the next.
-- **Statistics:** `n` weeks, mean, standard deviation, and t = mean / sd × √n.
+- **Weekly excess, two readings of the same weeks.** Both are measured from the last close of one
+  ISO week to the last close of the next, and both are reported.
+  - **The headline: the gap to the whole benchmark.** The desk's weekly return (after costs, before
+    tax) minus SHARIABEES's. This answers the owner's real question — what the same money would
+    have earned just buying SHARIABEES — so it stays the number the section leads with.
+  - **The alarm: the gap per rupee actually at risk.** The desk's weekly return divided by the share
+    of it that was invested entering the week, minus SHARIABEES's. Cash earns nothing, so that
+    ratio is the return on the money the desk actually put to work.
+
+  The second one exists because the desk holds roughly the pipeline's own heat — about a third
+  invested, the rest in cash — while the benchmark holds the whole capital. Judged on the headline
+  gap, `below_expectation` fires at twelve weeks in any rising market whatever the stock picking
+  does, which makes the alarm useless and misleading. Two things follow, and both matter:
+  **subtract the scaled benchmark** (`r_desk − w × r_bench`), and **divide by the share**
+  (`r_desk / w − r_bench`). Subtracting alone removes the market's direction but leaves the figure
+  scaled by exposure — it would be a third of the truth, and `expected_excess_pa` comes from a
+  backtest of a *fully invested* book, so a desk delivering exactly what the backtest promised
+  would still be failed. A week entered with less than 1% invested is left out: a return over a
+  share near zero is noise.
+- **Statistics:** `n` weeks, mean, standard deviation, and t = mean / sd × √n. Computed on both
+  series; the label is shown for each.
 - **Label, in words:**
 
   | Condition | Label |
@@ -232,10 +250,17 @@ the day out of the `held_back` count, which is for days the desk did nothing on.
 - **Warning check** (monthly, at the close): the expected weekly excess is
   `e = (1 + expected_excess_pa)^(1/52) − 1`. The check fires when `n ≥ 12` and
   `mean + 2 × sd/√n < e`, meaning live results are more than two standard errors below what the
-  backtest promised. It raises `desk_below_expectation`. The default for `expected_excess_pa`
-  (0.06) comes from the top-15 backtest (ADR-0062), and `trade_decisions` adds risk overlays on top
-  of that book. So the owner should set this from the trading system's own figure once there is
-  one.
+  backtest promised. **It is judged on the per-rupee-at-risk series, never on the headline gap**,
+  for the reason above: the backtest is of a fully invested book and the desk is not, so the
+  headline gap would fail it on cash drag alone. It raises `desk_below_expectation`, and the
+  problem text quotes the per-rupee figures and the average invested share, so the owner can see
+  the cash was taken out. The default for `expected_excess_pa` (0.06) comes from the top-15
+  backtest (ADR-0062), and `trade_decisions` adds risk overlays on top of that book. So the owner
+  should set this from the trading system's own figure once there is one.
+
+  What this check still cannot separate is the pipeline sizing its book differently from the
+  backtest. A per-rupee measure removes cash drag; it does not remove the risk overlays the
+  pipeline applies to the names it does hold.
 
 ## 9. What the owner sees
 
@@ -245,6 +270,8 @@ A **Trading desk** section in the monthly close. Made-up example:
 Trading desk (paper): 14 weeks since 15 Sep. Capital ₹1,00,000.
 Value ₹1,04,230 (after tax ₹1,03,410)   SHARIABEES ₹1,02,100   Nifty 50 ₹1,01,300
 Weekly gap to SHARIABEES: +0.15% on average, t = 0.8: no evidence yet
+Same gap per rupee invested (32% of the capital on average): +0.04%, t = 0.4: no evidence yet.
+The monthly check reads this one.
 Holding (paper) 9 names, 12% cash: TCS, INFY, HCLTECH, GOLDBEES, ...
 This month: 23 orders, ₹612 in costs.
 Days held back: 2 (1 stale, 1 suspect). Prices from ansaar: 1.
@@ -394,7 +421,7 @@ row** (§16).
 |---|---|
 | `core/src/aegis/connectors/ansaar.py` | `AnsaarClient`: `decisions(day) -> (rows, meta)` and `prices(symbol, asset_class, start, end)`, each fetching the client token on first use |
 | `core/src/aegis/connectors/finance.py` | `FinanceConnector.daily_bars(symbol, start, end)`: bars plus split and dividend events, next to the existing quote provider |
-| `core/src/aegis/services/desk_math.py` | Pure functions, no I/O: last trading day, checks, order sizing, split adjustment, FIFO, value history, tax by year, weekly statistics, label, warning check |
+| `core/src/aegis/services/desk_math.py` | Pure functions, no I/O: last trading day, checks, order sizing, split adjustment, FIFO, value and invested-share history, tax by year, weekly statistics, label, warning check |
 | `core/src/aegis/services/trading_desk.py` | Database reads and writes, `run_tick(pool, *, ansaar, finance, today, project)`, `month_summary(pool, month_first, next_first)`, `reconcile_expectation`, config loading |
 | `worker/src/aegis_worker/activities/trading_desk.py` | `TradingDeskActivities.desk_tick`: one activity (new class, so a constructor in `main()` and an entry in `collect_activities`) |
 | `worker/src/aegis_worker/flows/trading_desk.py` | `TradingDeskFlow`, `TradingDeskConfig(agent_id)` |

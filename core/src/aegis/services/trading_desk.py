@@ -565,12 +565,21 @@ async def month_summary(pool: asyncpg.Pool, month_first: date, next_first: date)
     days = [b.day for b in bars[INDEX] if b.close is not None and start <= b.day <= month_end]
     if not days:
         return None
-    desk = dm.desk_values(fills, bars, rules.capital, days)
+    series = dm.desk_series(fills, bars, rules.capital, days)
+    desk = [(d, v) for d, v, _ in series]
+    shares = [(d, w) for d, _, w in series]
     bench = dm.benchmark_values(bars[rules.benchmark], rules.capital, rules.cost_pct_per_side, days)
     context = dm.benchmark_values(bars[rules.context_benchmark], rules.capital, 0.0, days)
     book = dm.replay(fills, bars, rules.capital, month_end)
     end_value = desk[-1][1]
+    # Two readings of the same weeks. The headline is the gap to the whole
+    # benchmark, because "what would I have earned just buying SHARIABEES with
+    # this money" is the owner's real question. The alarm is judged on the gap
+    # per rupee actually at risk, because the desk holds about the pipeline's
+    # own heat and the benchmark holds everything (spec §8).
     st = dm.stats(dm.weekly_excess(desk, bench))
+    invested = dm.stats(dm.weekly_excess(desk, bench, shares))
+    weights = dm.weekly_shares(desk, bench, shares)
     held = book.held()
     worth = {s: q * (dm.close_on(bars[s], month_end) or book.avg_cost(s)) for s, q in held.items()}
     orders = await pool.fetch(
@@ -606,7 +615,11 @@ async def month_summary(pool: asyncpg.Pool, month_first: date, next_first: date)
         "mean_gap": st.mean,
         "t": st.t,
         "label": dm.label(st),
-        "below_expectation": dm.below_expectation(st, rules.expected_excess_pa),
+        "mean_gap_invested": invested.mean,
+        "t_invested": invested.t,
+        "label_invested": dm.label(invested),
+        "invested_pct": sum(weights) / len(weights) if weights else 0.0,
+        "below_expectation": dm.below_expectation(invested, rules.expected_excess_pa),
         "expected_excess_pa": rules.expected_excess_pa,
         "holdings": sorted(held, key=lambda s: -worth[s]),
         "cash_pct": book.cash / end_value if end_value else 0.0,
@@ -631,11 +644,14 @@ async def reconcile_expectation(pool: asyncpg.Pool, summary: dict | None, *, pro
         findings.append(
             _finding(
                 "desk_below_expectation", "desk", "Trading desk: live results are worse than the backtest promised",
-                f"Over {summary['weeks']} weeks the desk's weekly gap to {summary['benchmark']} averaged "
-                f"{summary['mean_gap']:+.2%} (t = {summary['t']:.1f}). That is more than two standard "
-                f"errors below the {summary['expected_excess_pa']:.0%} a year the backtest implies. Look "
-                "at the trading system before trusting it with money. This comes back each month while "
-                "it stays true.",
+                f"Over {summary['weeks']} weeks, per rupee the desk actually had invested "
+                f"({summary['invested_pct']:.0%} of the capital on average), its weekly gap to "
+                f"{summary['benchmark']} averaged {summary['mean_gap_invested']:+.2%} "
+                f"(t = {summary['t_invested']:.1f}). That is more than two standard errors below the "
+                f"{summary['expected_excess_pa']:.0%} a year the backtest implies. The cash the desk "
+                "holds is taken out of this, so it is the stock picking that is behind, not the "
+                "exposure. Look at the trading system before trusting it with money. This comes back "
+                "each month while it stays true.",
             )
         )
     await hub_watch.reconcile_findings(

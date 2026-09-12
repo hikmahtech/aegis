@@ -568,6 +568,8 @@ _DESK = {
     "since": "2026-09-15", "weeks": 14, "capital": 100000.0, "value": 104230.0, "after_tax": 103410.0,
     "benchmark": "SHARIABEES.NS", "benchmark_value": 102100.0, "context": "^NSEI", "context_value": 101300.0,
     "mean_gap": 0.0015, "t": 0.8, "label": "no evidence yet", "below_expectation": False,
+    "mean_gap_invested": 0.0004, "t_invested": 0.4, "label_invested": "no evidence yet",
+    "invested_pct": 0.32,
     "expected_excess_pa": 0.06, "holdings": ["TCS", "INFY"], "cash_pct": 0.12, "filled": 23, "costs": 612.0,
     "cancelled": {"no_cash": 1}, "held_back": {"held_stale": 1, "held_suspect": 1}, "ansaar_prices": 1,
     "moves": [{"symbol": "XYZ", "day": "2026-11-03", "move": -0.51}],
@@ -581,6 +583,10 @@ def test_month_close_renders_the_desk_section():
     assert "## Trading desk (paper)" in md
     assert "14 weeks since 2026-09-15" in md
     assert "t = 0.8: no evidence yet" in md
+    assert (
+        "Same gap per rupee invested (32% of the capital on average): +0.04%, "
+        "t = 0.4: no evidence yet. The monthly check reads this one." in md
+    )
     assert "Holding 2 names, 12% cash: TCS, INFY" in md
     assert "Days held back: 2 (1 stale, 1 suspect)." in md
     assert "Cancelled: 1 no_cash." in md
