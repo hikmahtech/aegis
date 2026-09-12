@@ -61,6 +61,7 @@ from aegis_worker.activities.sentry_ingest import SentryIngestActivities
 from aegis_worker.activities.social import SocialActivities
 from aegis_worker.activities.statements import StatementActivities
 from aegis_worker.activities.todoist import TodoistActivities
+from aegis_worker.activities.trading_desk import TradingDeskActivities
 from aegis_worker.activities.wearable import WearableActivities
 from aegis_worker.bootstrap import bootstrap
 from aegis_worker.interceptors import WorkflowRunRecorderInterceptor
@@ -282,6 +283,13 @@ async def main():
             books_cfg=config_from_settings(settings),
             statement_account=getattr(settings, "statement_drive_account", "")
             or "arshad-hikmah",
+        )
+
+    # Maou's paper trading desk rides the money flag, like the rest of the lane.
+    desk_act = None
+    if settings.money_hygiene_enabled:
+        desk_act = TradingDeskActivities(
+            db_pool=deps.pool, settings=settings, finance=connectors.get("finance")
         )
 
     channel_act = ChannelActivities(db_pool=deps.pool)
@@ -612,6 +620,7 @@ async def main():
         gmail_act,
         drive_act,
         statement_act,
+        desk_act,
         meeting_act,
         memory_act,
         profile_act,

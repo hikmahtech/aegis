@@ -8,7 +8,7 @@ and its health check only asked whether `/v1/feeds` answered — so it went.)
 Everything here is shared by the admin route, Raphael's chat tools and the
 worker, so there is one answer to "what is this feed worth?":
 
-* :func:`feed_stats` — per feed, measured from `feed_entries` (migration 045):
+* :func:`feed_stats` — per feed, measured from `feed_entries` (migration 046):
   entries seen, stored, stored as an abstract only, documents a prompt used in
   the last 30 and 90 days, the last entry, fetch failures and the backlog.
   "Used" means a document was retrieved into a prompt — a chat turn or a

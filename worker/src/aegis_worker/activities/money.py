@@ -14,7 +14,7 @@ from zoneinfo import ZoneInfo
 
 import structlog
 from aegis.api.models.money import MoneyEvent, payee_key
-from aegis.services import books, ledger_write, reconciled
+from aegis.services import books, ledger_write, reconciled, trading_desk
 from aegis.services import journal_index as ji
 from aegis.services.bank_parsers import has_money_shape, is_autopay, parse_any
 from aegis.services.books import UNKNOWN, account_for, instrument_account
@@ -1228,6 +1228,14 @@ class MoneyActivities:
             f"  AND due_on BETWEEN $1 AND $2 AND {ji.OPEN_DUE_SQL}",
             month_first, last,
         ))
+        # The trading desk's section and its monthly check (desk spec §8-§9).
+        # A desk failure must never break the close.
+        try:
+            close["desk"] = await trading_desk.month_summary(self.db_pool, month_first, this_first)
+            await trading_desk.reconcile_expectation(self.db_pool, close["desk"])
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("month_close_desk_failed", error=str(exc)[:200])
+            close["desk"] = None
         return close
 
     # --------------------------------------------------------- brief output

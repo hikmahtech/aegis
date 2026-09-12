@@ -369,6 +369,10 @@ class Settings(BaseSettings):
     notes_path: str = "/app/config/notes"
     notes_repo_url: str = ""
     notes_deploy_key: str = ""  # private ed25519 deploy key, PEM or base64 PEM; never logged
+    # Maou's trading desk (spec 2026-09-12-maou-trading-desk-design.md): the
+    # ansaar-data API serving the trading system's decisions. Either empty ⇒ off.
+    ansaar_url: str = ""
+    ansaar_service_secret: str = ""
 
     @model_validator(mode="after")
     def _require_admin_credentials(self) -> "Settings":

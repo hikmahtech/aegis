@@ -239,12 +239,40 @@ CONFIG_REGISTRY: list[ConfigKey] = [
         help="Bills and failed payments become dated tasks here, and Maou's money problem "
         "tasks (#money) go to the personal project. Unset = the Inbox.",
     ),
+    ConfigKey(
+        "ansaar_url", "ansaar-data URL", "Trading desk", False,
+        help="Where Maou's trading desk reads the trading system's decisions, e.g. "
+        "http://ansaar-data:3000 on the swarm overlay. Empty = the desk does nothing. "
+        "Applies on the next run.",
+    ),
+    ConfigKey(
+        "ansaar_service_secret", "Client-token service secret", "Trading desk", True,
+        help="ansaar-data's CLIENT_TOKEN_SECRET, exchanged for a 15-minute token on each run. "
+        "Never the admin login.",
+    ),
 ]
 _BY_KEY = {c.key: c for c in CONFIG_REGISTRY}
 
 
 def _skey(field: str) -> str:
     return _PREFIX + field
+
+
+async def read_integration(pool: Any, settings: Any, key: str) -> str:
+    """One integration value, read now: the DB row first (decrypted when it is a
+    secret), then the Settings field. For a caller that must see an admin save
+    without a restart, since the worker applies the overlay only at boot. Never raises."""
+    spec = _BY_KEY[key]
+    try:
+        stored = await pool.fetchval("SELECT value FROM settings WHERE key = $1", _skey(key))
+    except Exception as exc:  # noqa: BLE001 — a config read must never break a run
+        logger.warning("integration_read_failed", key=key, error=str(exc)[:200])
+        stored = None
+    if isinstance(stored, dict):
+        val = _resolve(spec, stored, getattr(settings, "secret_key", ""))
+        if val:
+            return val
+    return str(getattr(settings, key, "") or "")
 
 
 def _resolve(spec: ConfigKey, stored: dict, secret_key: str) -> str:

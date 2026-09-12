@@ -410,7 +410,10 @@ def test_books_write_flow_is_gated_on_money_hygiene():
         # NotesBackfillFlow (hand-started), served by the new NotesActivities
         # class (notes_write, notes_journal_write, notes_index_vault,
         # notes_backfill_journal). All three rows move.
-        (True, True, 50, 245),
+        # Then +1 flow and +1 activity from Maou's paper trading desk:
+        # TradingDeskFlow and TradingDeskActivities.desk_tick, both on the money
+        # flag, so only the money-on row moves.
+        (True, True, 51, 246),
         (False, False, 40, 212),
         (True, False, 44, 228),
     ],

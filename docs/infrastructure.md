@@ -1718,7 +1718,7 @@ on Admin → Channels, or ask Raphael (`subscribe_feed`, `unsubscribe_feed`).
 
 ### What each feed is worth
 
-`feed_entries` (migration 045) records every entry a run stored or failed,
+`feed_entries` (migration 046) records every entry a run stored or failed,
 with the knowledge row it produced. Joining that to
 `knowledge_injection_log.content_ids` tells you which feeds' documents a chat
 prompt actually used. Admin → Channels shows it per feed, and so do
