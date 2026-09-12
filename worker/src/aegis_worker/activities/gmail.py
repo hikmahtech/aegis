@@ -551,12 +551,23 @@ class GmailActivities:
         def _sync() -> str:
             svc = _build_gmail_service(self.gmail_credentials_file, token_path)
             thread = svc.users().threads().get(userId="me", id=thread_id, format="full").execute()
+            messages = (thread.get("messages") or [])[-5:]  # last 5 messages max
+            sep = "\n---\n"
             parts: list[str] = []
-            for msg in (thread.get("messages") or [])[-5:]:  # last 5 messages max
+            used = 0  # chars committed so far, separators included
+            # Newest first: the message that just arrived must survive the
+            # budget — a front-truncated join used to cut exactly that one.
+            for msg in reversed(messages):
                 text = _extract_text_from_part(msg.get("payload") or {})
-                if text.strip():
-                    parts.append(text[:per_message])
-            return "\n---\n".join(parts)[:max_chars]
+                if not text.strip():
+                    continue
+                room = max_chars - used - (len(sep) if parts else 0)
+                if room <= 0:
+                    break
+                piece = text[: min(per_message, room)]
+                parts.append(piece)
+                used += len(piece) + (len(sep) if len(parts) > 1 else 0)
+            return sep.join(reversed(parts))
 
         try:
             return await asyncio.to_thread(_sync)
