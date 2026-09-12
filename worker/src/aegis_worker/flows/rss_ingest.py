@@ -41,13 +41,6 @@ _HUB_TIMEOUT = timedelta(seconds=120)
 # surface it instead of polling it hourly forever (issue #120).
 _STALE_FEED_DAYS = 90
 
-# Deprecated patches (#533): every activity call #511/#512 added, and the
-# tracked-topic attach (#513). Every run that started before them has
-# finished, so only the new path is left. The markers stay one more deploy,
-# so a run started on the patched code still replays; then the calls and
-# these ids go.
-_PATCH_FEEDS = "rss-feeds-511"
-_PATCH_TOPICS = "research-hub-513"
 # Attaching can raise a topic's task, which is a Todoist round trip.
 _TOPICS_TIMEOUT = timedelta(seconds=120)
 # The UTC hour whose run reconciles the stale findings. Staleness is measured
@@ -132,7 +125,6 @@ class RssIngestFlow:
             start_to_close_timeout=_ACT_TIMEOUT,
             retry_policy=ACT_RETRY,
         )
-        workflow.deprecate_patch(_PATCH_FEEDS)
         notes: dict = {}
         pattern = None
         try:
@@ -519,7 +511,6 @@ class RssIngestFlow:
         # (#513), so a story from a feed and the same story from an intel scan
         # are one item there. One call per run, never per entry.
         if topic_items:
-            workflow.deprecate_patch(_PATCH_TOPICS)
             try:
                 attached = await workflow.execute_activity(
                     "attach_topic_items",
