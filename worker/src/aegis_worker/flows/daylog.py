@@ -46,8 +46,9 @@ with workflow.unsafe.imports_passed_through():
         TIMEOUT_STANDARD,
     )
 
-# Guards the journal write added by #514, so a run started on the old code
-# replays without it. Runs last minutes; deprecate the patch one deploy later.
+# Deprecated patch (#533) for the journal write added by #514. Every run that
+# started before it has finished, so only the journal path is left. The
+# marker stays one more deploy, then the calls and this id go.
 _PATCH_VAULT = "daylog-vault-514"
 _JOURNAL_TIMEOUT = timedelta(seconds=NOTES_WRITE_TIMEOUT_S)
 _JOURNALED = ("written", "exists")
@@ -154,20 +155,20 @@ class DayLogFlow:
         # the day, so no knowledge row is filed; anything else falls through to
         # the knowledge store exactly as before.
         vault_error = None
-        if workflow.patched(_PATCH_VAULT):
-            vault = await self._journal("daily", target_date, target_date, narrative)
-            if vault.get("status") in _JOURNALED:
-                path = str(vault.get("path") or "")
-                await self._commit_state(target_date, f"vault://{path}")
-                return {
-                    "status": "journaled",
-                    "date": target_date,
-                    "path": path,
-                    "vault": vault["status"],
-                    "quiet": bool(events.get("quiet")),
-                }
-            if vault.get("status") == "error":
-                vault_error = str(vault.get("error") or "vault write failed")[:200]
+        workflow.deprecate_patch(_PATCH_VAULT)
+        vault = await self._journal("daily", target_date, target_date, narrative)
+        if vault.get("status") in _JOURNALED:
+            path = str(vault.get("path") or "")
+            await self._commit_state(target_date, f"vault://{path}")
+            return {
+                "status": "journaled",
+                "date": target_date,
+                "path": path,
+                "vault": vault["status"],
+                "quiet": bool(events.get("quiet")),
+            }
+        if vault.get("status") == "error":
+            vault_error = str(vault.get("error") or "vault write failed")[:200]
 
         url = f"aegis://daylog/{target_date}"
         try:
@@ -313,19 +314,19 @@ class DayLogFlow:
 
         # The week's or month's journal note first (#514), as for a day.
         vault_error = None
-        if workflow.patched(_PATCH_VAULT):
-            vault = await self._journal(config.mode, start, label, narrative)
-            if vault.get("status") in _JOURNALED:
-                return {
-                    "status": "journaled",
-                    "mode": config.mode,
-                    "label": label,
-                    "path": str(vault.get("path") or ""),
-                    "vault": vault["status"],
-                    "covers": covers,
-                }
-            if vault.get("status") == "error":
-                vault_error = str(vault.get("error") or "vault write failed")[:200]
+        workflow.deprecate_patch(_PATCH_VAULT)
+        vault = await self._journal(config.mode, start, label, narrative)
+        if vault.get("status") in _JOURNALED:
+            return {
+                "status": "journaled",
+                "mode": config.mode,
+                "label": label,
+                "path": str(vault.get("path") or ""),
+                "vault": vault["status"],
+                "covers": covers,
+            }
+        if vault.get("status") == "error":
+            vault_error = str(vault.get("error") or "vault write failed")[:200]
 
         try:
             ingested = await workflow.execute_activity_method(

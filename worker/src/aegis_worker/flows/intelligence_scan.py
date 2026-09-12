@@ -12,26 +12,23 @@ from datetime import timedelta
 from temporalio import workflow
 
 with workflow.unsafe.imports_passed_through():
-    import hashlib
-
-    from aegis_worker.activities.capture import CaptureActivities
     from aegis_worker.activities.intel_scan import (
         SearchSourceInput,
         SearchSourceResult,
     )
-    from aegis_worker.shared.retry import ACT_RETRY, NO_RETRY, RETRY_ONCE, TIMEOUT_FAST
+    from aegis_worker.shared.retry import ACT_RETRY, RETRY_ONCE
 
 
 _ACT_TIMEOUT = timedelta(seconds=60)
 _SCAN_TIMEOUT = timedelta(seconds=120)
 _SCORE_TIMEOUT = timedelta(seconds=180)
 
-# Guards the load_tracked_topics call added by #508, so a scan that started on
-# the old code replays without it. A scan lasts minutes, so this can become
-# `workflow.deprecate_patch` one deploy later.
+# Deprecated patches (#533): the load_tracked_topics call added by #508 and
+# step 5's switch from an Inbox capture per item to the topic hub (#513).
+# Every scan that started before them has finished, so only the new path is
+# left. The markers stay one more deploy, so a scan started on the patched
+# code still replays; then the calls and these ids go.
 _PATCH_TRACKED_TOPICS = "intel-tracked-topics"
-# Guards step 5's switch from an Inbox capture per item to the topic hub
-# (#513). Same deprecation note as above.
 _PATCH_TOPICS = "research-hub-513"
 # Attaching can raise a topic's task, which is a Todoist round trip.
 _ATTACH_TIMEOUT = timedelta(seconds=120)
@@ -74,25 +71,25 @@ class IntelligenceScanFlow:
         # 0. Topics tracked from chat (#508). `track_topic` wrote them to a
         # settings row that nothing read, so "added" changed no scan. A failed
         # read is not a failed scan: it runs on its configured topics and says so.
-        if workflow.patched(_PATCH_TRACKED_TOPICS):
-            try:
-                tracked = await workflow.execute_activity(
-                    "load_tracked_topics",
-                    start_to_close_timeout=_ACT_TIMEOUT,
-                    retry_policy=RETRY_ONCE,
-                )
-            except Exception as exc:
-                workflow.logger.warning(
-                    "intel_tracked_topics_degraded source=%s err=%s",
-                    input.source,
-                    str(exc)[:200],
-                )
-                tracked = []
-                notes["tracked_topics_degraded"] = True
-            merged = merge_topics(topics, list(tracked or []))
-            if len(merged) > len(topics):
-                notes["tracked_topics"] = len(merged) - len(topics)
-            topics = merged
+        workflow.deprecate_patch(_PATCH_TRACKED_TOPICS)
+        try:
+            tracked = await workflow.execute_activity(
+                "load_tracked_topics",
+                start_to_close_timeout=_ACT_TIMEOUT,
+                retry_policy=RETRY_ONCE,
+            )
+        except Exception as exc:
+            workflow.logger.warning(
+                "intel_tracked_topics_degraded source=%s err=%s",
+                input.source,
+                str(exc)[:200],
+            )
+            tracked = []
+            notes["tracked_topics_degraded"] = True
+        merged = merge_topics(topics, list(tracked or []))
+        if len(merged) > len(topics):
+            notes["tracked_topics"] = len(merged) - len(topics)
+        topics = merged
 
         if not topics:
             workflow.logger.warning("intel_scan_no_topics source=%s", input.source)
@@ -213,48 +210,21 @@ class IntelligenceScanFlow:
         # in 30 days, each closed by clarify on arrival. The hub keeps them
         # now and a topic raises ONE task when its round earns it; the
         # knowledge store and the briefing still get every item (step 6).
-        if workflow.patched(_PATCH_TOPICS):
-            try:
-                attached = await workflow.execute_activity(
-                    "attach_topic_items",
-                    args=[worthy, f"intel:{input.source}"],
-                    start_to_close_timeout=_ATTACH_TIMEOUT,
-                    retry_policy=RETRY_ONCE,
-                )
-                if isinstance(attached, dict) and attached.get("attached"):
-                    notes["topic_items"] = attached["attached"]
-            except Exception as exc:
-                workflow.logger.warning(
-                    "intel_topic_attach_degraded source=%s err=%s", input.source, str(exc)[:200]
-                )
-                notes["topics_degraded"] = True
-        else:
-            # The pre-#513 capture, kept only so a scan that started on the
-            # old code replays.
-            for item in worthy:
-                url = item.get("url") or item.get("link") or ""
-                if not url:
-                    continue
-                ext_id = f"research-{hashlib.sha256(url.encode()).hexdigest()[:16]}"
-                title = item.get("title") or "(untitled research item)"
-                summary = (item.get("summary") or item.get("body") or "")[:200]
-                reason = item.get("significance_reason") or ""
-                description = (
-                    f"[Read]({url})\n\n"
-                    f"{summary}"
-                    + (f"\n\nWhy: {reason}" if reason else "")
-                )
-                try:
-                    await workflow.execute_activity_method(
-                        CaptureActivities.capture_to_inbox,
-                        args=["#research", ext_id, title[:120], description],
-                        start_to_close_timeout=TIMEOUT_FAST,
-                        retry_policy=NO_RETRY,
-                    )
-                except Exception as exc:
-                    workflow.logger.warning(
-                        "intel_capture_failed url=%s err=%s", url, str(exc)[:200]
-                    )
+        workflow.deprecate_patch(_PATCH_TOPICS)
+        try:
+            attached = await workflow.execute_activity(
+                "attach_topic_items",
+                args=[worthy, f"intel:{input.source}"],
+                start_to_close_timeout=_ATTACH_TIMEOUT,
+                retry_policy=RETRY_ONCE,
+            )
+            if isinstance(attached, dict) and attached.get("attached"):
+                notes["topic_items"] = attached["attached"]
+        except Exception as exc:
+            workflow.logger.warning(
+                "intel_topic_attach_degraded source=%s err=%s", input.source, str(exc)[:200]
+            )
+            notes["topics_degraded"] = True
 
         # 6. Ingest. KS's `/api/content` is wrapped in a 600s server-side
         # httpx ceiling (see knowledge.py:_ensure_client / ingest_content);
