@@ -80,6 +80,13 @@ def _fetch_error(parsed: Any) -> str:
     except (TypeError, ValueError):
         pass
     if getattr(parsed, "bozo", 0):
+        # feedparser sets `version` ("rss20", "atom10", ...) when it recognised
+        # a feed. A recognised feed that is merely empty, with a benign
+        # complaint such as CharacterEncodingOverride, is a quiet feed, not a
+        # failed fetch; three of those in a row used to raise `feed_failing`.
+        version = getattr(parsed, "version", "")
+        if isinstance(version, str) and version:
+            return ""
         exc = getattr(parsed, "bozo_exception", None)
         return (str(exc) if exc else "the response is not a feed")[:200]
     return ""
@@ -235,11 +242,15 @@ class RssActivities:
             "UPDATE channels SET config = config || jsonb_build_object("
             "  'fetch_failures', CASE WHEN $2 THEN 0 ELSE "
             "    (CASE WHEN config->>'fetch_failures' ~ '^[0-9]+$' "
-            "          THEN (config->>'fetch_failures')::int ELSE 0 END) + 1 END"
+            "          THEN (config->>'fetch_failures')::int ELSE 0 END) + 1 END, "
+            # When AEGIS first polled the feed, set once: what `feed_stale`
+            # measures from for a feed that never gave a dated entry.
+            "  'tracking_since', COALESCE(config->>'tracking_since', $4::text)"
             ") || $3::text::jsonb "
             "WHERE id = $1 RETURNING (config->>'fetch_failures')::int",
             cid,
             ok,
             json.dumps(patch),
+            now,
         )
         return {"fetch_failures": int(failures or 0)}

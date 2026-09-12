@@ -1699,11 +1699,14 @@ UPDATE agents
    AND NOT (metadata->'tool_set' ? 'web_search');
 ```
 
-`read_url` and `paper_read` refuse a host that resolves to a loopback, private or
-link-local address, so a page the agent has just read cannot steer it at the
-stack's own services. A public page that *redirects* inward is not caught — the
-fetcher follows redirects itself — and whatever comes back goes to the model
-only.
+Every fetch of a URL that a model chose, a page named or a feed publishes goes
+through `services/url_guard.py`. The first request and every redirect must
+resolve to a public address, so a page the agent has just read cannot steer it
+at the stack's own services, not even by redirecting inward. The one exception
+is the admin knowledge route, where you seed a URL by hand
+(`allow_private=True`). What is not caught: a host whose DNS answer changes
+between the check and the connect (DNS rebinding). Bodies are read as a stream
+and cut at 10 MB.
 
 ## Feeds (Raphael)
 
@@ -1769,14 +1772,25 @@ WHERE kind = 'rss' AND identifier = 'https://arxiv.org/rss/cs.AI';
 An abstract row is cheap, so on that feed you can also raise
 `max_entries_per_run` (30 today) to clear the arXiv backlog.
 
+Switching a feed from `abstract` to `full` is one-way for entries already seen:
+their claim is kept, so a later `full` run treats them as duplicates and only
+new entries get their full text. To read one of those in full, use `read_url`
+or `paper_read`.
+
 ### When a feed breaks
 
 - **Failing:** three fetches in a row that fail (an HTTP error, or a response
-  that is not a feed) are a `feeds` hub finding of class `feed_failing`. It is
-  checked every run. Before #511, feedparser turned all of these into an empty
-  parse, which looked like a quiet feed.
+  that is not a feed) are a `feeds` hub finding of class `feed_failing`. The
+  finding records an occurrence when the feed crosses that line and once a
+  day at the review hour; the hourly runs in between only keep the problem
+  open, so a dead feed does not post 24 comments a day on its task. Before
+  #511, feedparser turned all of these into an empty parse, which looked like
+  a quiet feed. An empty feed that feedparser still recognised as a feed, with
+  a benign complaint such as an encoding override, is quiet, not failing.
 - **Stale:** no new entry for `channels.config.stale_after_days` days (default
-  30) is a `feed_stale` finding, checked once a day at 03:30 UTC.
+  30) is a `feed_stale` finding, checked once a day at 03:30 UTC. A feed that
+  never gave a dated entry is measured from when AEGIS began polling it
+  (`channels.config.tracking_since`).
 - **Recovery:** both resolve themselves when the feed recovers
   (`hub_watch.reconcile_findings`). The problem's subject is the feed URL, and
   the research agent owns the `feeds` source.
@@ -1907,6 +1921,15 @@ WHERE p.class = 'topic' AND p.closed_at IS NULL GROUP BY p.id;
 Stop tracking with `untrack_topic` (it closes the live round and its task).
 The intel scans no longer capture a `#research` Inbox task per worthy item;
 Raindrop bookmarks still do.
+
+**A fresh deployment tracks nothing.** Prod had no `intelligence_topics` row
+on 2026-09-12, so no round opens until you track a topic or answer "yes" to a
+"track this?" card. Until then the intel items still reach the knowledge store
+and the briefing; only the auto-closed `@reference` tasks are gone. Seeding the
+registry from the intel scans' own topics was considered and deliberately not
+done: those are single broad words (`ai`, `world`, `tech`, `macro`), and as
+whole-word terms they would cross the threshold on every scan and raise a task
+each round — the noise #513 removed.
 
 ## The vault (Raphael)
 

@@ -55,8 +55,9 @@ _TOPICS_TIMEOUT = timedelta(seconds=120)
 _STALE_REVIEW_HOUR = 3
 # Statuses of process_content / store_feed_abstract that settle an entry
 # without storing it: an empty extraction, a URL the store already had, content
-# extraction switched off. Nothing to retry, nothing new stored.
-_SETTLED_UNSTORED = frozenset({"empty", "duplicate", "disabled"})
+# extraction switched off, a link off the public internet (refused for good).
+# Nothing to retry, nothing new stored.
+_SETTLED_UNSTORED = frozenset({"empty", "duplicate", "disabled", "refused"})
 
 
 def _newest(*stamps: str | None) -> str | None:
@@ -64,27 +65,51 @@ def _newest(*stamps: str | None) -> str | None:
     return max(present) if present else None
 
 
+def _parse_stamp(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        stamp = datetime.fromisoformat(value)
+    except (TypeError, ValueError):
+        return None
+    return stamp if stamp.tzinfo else stamp.replace(tzinfo=UTC)
+
+
 def _stale_finding(
     now: datetime, identifier: str, config: dict, label: str, last_entry: str | None
 ) -> dict | None:
-    """A `feed_stale` finding when the feed's newest entry is older than its limit."""
-    if not last_entry:
+    """A `feed_stale` finding when the feed's newest entry is older than its limit.
+
+    A feed that never gave a dated entry (no cursor, or one that is not a
+    timestamp) is measured from when AEGIS began polling it
+    (`config.tracking_since`, set by `record_feed_run`). Before, such a feed
+    could never be reported stale at all."""
+    last = _parse_stamp(last_entry)
+    dated = last is not None
+    if last is None:
+        last = _parse_stamp(config.get("tracking_since"))
+    if last is None:
         return None
-    try:
-        last = datetime.fromisoformat(last_entry)
-    except (TypeError, ValueError):
-        return None
-    if last.tzinfo is None:
-        last = last.replace(tzinfo=UTC)
     limit = feeds.stale_after_days(config)
     if (now - last).days < limit:
         return None
+    title = (
+        f"RSS feed {label} has published nothing since {last.date().isoformat()}"
+        if dated
+        else f"RSS feed {label} has given no dated entry since AEGIS began polling it on "
+        f"{last.date().isoformat()}"
+    )
     return {
         "klass": "feed_stale",
         "subject": identifier,
-        "title": f"RSS feed {label} has published nothing since {last.date().isoformat()}",
+        "title": title,
         "severity": "info",
-        "payload": {"url": identifier, "last_entry_at": last_entry, "stale_after_days": limit},
+        "payload": {
+            "url": identifier,
+            "last_entry_at": last_entry,
+            "tracking_since": config.get("tracking_since"),
+            "stale_after_days": limit,
+        },
     }
 
 
@@ -134,6 +159,11 @@ class RssIngestFlow:
         # Every stored entry, for the tracked-topic match at the end (#513).
         topic_items: list[dict] = []
         now = workflow.now()
+        # The daily review: the run whose hour is `stale_review_hour` (every
+        # run when it is negative — tests and a manual trigger). Stale feeds
+        # are reconciled then, and a feed that is still failing records its
+        # daily occurrence then.
+        review = input.stale_review_hour < 0 or now.hour == input.stale_review_hour
 
         for ch in channels:
             identifier = ch["identifier"]
@@ -197,6 +227,12 @@ class RssIngestFlow:
                                     "error": fetch_error,
                                     "fetch_failures": failures,
                                 },
+                                # An occurrence on crossing the threshold and
+                                # at the daily review; every other hour it only
+                                # keeps the problem open. Hourly occurrences
+                                # posted "N more occurrences" on the task 24
+                                # times a day for one dead feed.
+                                "record": failures == feeds.FAILING_AFTER or review,
                             }
                         )
                     finding = _stale_finding(now, identifier, config, label, since)
@@ -503,7 +539,7 @@ class RssIngestFlow:
             found: dict = {"failing": len(failing)}
             if not await self._reconcile(["feed_failing"], failing):
                 notes["hub_degraded"] = True
-            if input.stale_review_hour < 0 or now.hour == input.stale_review_hour:
+            if review:
                 found["stale"] = len(stale)
                 if not await self._reconcile(["feed_stale"], stale):
                     notes["hub_degraded"] = True

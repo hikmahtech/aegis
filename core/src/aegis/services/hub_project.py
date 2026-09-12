@@ -56,11 +56,11 @@ from aegis.services.agents import resolve_tag
 from aegis.services.books import parse_kv
 from aegis.services.hub import (
     LIVE_STATUSES,
+    QUESTION_CLASS,
     TASK_SUBJECT_KIND,
     TOPIC_CLASS,
     _active_suppression,
     _aware,
-    close_problem,
     get_problem,
     set_status,
 )
@@ -362,7 +362,7 @@ async def ensure_problem_for_task(
                 # `question`, kind `task` — a kind the hub never groups. The
                 # `@code` path keeps `manual` on the repo kind, as before.
                 subject_kind=TASK_SUBJECT_KIND if source == "research" else "repo",
-                klass="question" if source == "research" else "manual",
+                klass=QUESTION_CLASS if source == "research" else "manual",
                 severity="info",
                 payload={"task_id": task_id, "github_repo": subject},
             ),
@@ -1029,6 +1029,22 @@ async def reconcile_completed_tasks(
             if r["came_back_since"]:
                 if await _uncomplete_task(pool, r["todoist_task_id"]):
                     out.append({**row, "action": "task_reopened"})
+            elif r["class"] == TOPIC_CLASS:
+                # A ticked-off topic task means "seen" (#513): the round
+                # resolves AND closes at once, so the next article opens a
+                # fresh one. `close_round` does both under the lock
+                # `ingest_event` takes for the round's key, so an item attached
+                # in between cannot reopen the task the user just dismissed.
+                from aegis.services.research_topics import close_round
+
+                if await close_round(
+                    pool,
+                    r["id"],
+                    reason=TASK_COMPLETED_REASON,
+                    source=TASK_COMPLETED_SOURCE,
+                    now=now,
+                ):
+                    out.append({**row, "action": "resolved"})
             elif await set_status(
                 pool,
                 r["id"],
@@ -1038,12 +1054,6 @@ async def reconcile_completed_tasks(
                 now=now,
             ):
                 out.append({**row, "action": "resolved"})
-                if r["class"] == TOPIC_CLASS:
-                    # A ticked-off topic task means "seen" (#513): the round
-                    # closes at once, so the next article opens a fresh one.
-                    # Left merely resolved, the next day's article would
-                    # reopen the task the user just dismissed.
-                    await close_problem(pool, r["id"], now=now)
         except Exception as exc:  # noqa: BLE001 — one bad problem must not stop the sweep
             logger.warning("hub_task_completion_failed", problem_id=r["id"], error=str(exc)[:200])
     if out:

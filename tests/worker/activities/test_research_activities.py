@@ -225,7 +225,8 @@ async def test_a_research_task_gets_a_problem_linked_to_it(db_pool, research_tas
     linked = await db_pool.fetchval(
         "SELECT id::text FROM problems WHERE todoist_task_id = $1", research_task
     )
-    assert out == {"problem_id": linked}
+    # `class` lets AgentTaskFlow tell a topic's task from a question (#513).
+    assert out == {"problem_id": linked, "class": "question"}
     # Idempotent: the second run finds the same problem.
     again = await ActivityEnvironment().run(act.research_task_problem, research_task)
     assert again == out

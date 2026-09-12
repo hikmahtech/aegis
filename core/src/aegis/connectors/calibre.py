@@ -65,7 +65,9 @@ class CalibreError(Exception):
 
 def refuse_public_host(url: str) -> None:
     """Raise ValueError when `url` points at a host AEGIS must never call."""
-    host = (urlparse(url).hostname or "").lower()
+    # `hostname` is already lower-case; the trailing dot of a fully qualified
+    # name ("calibre.hikmahtech.in.") would otherwise slip past the match.
+    host = (urlparse(url).hostname or "").lower().rstrip(".")
     if host in PUBLIC_HOSTS:
         raise ValueError(
             f"{host} is behind Cloudflare Access and answers every path with a login "
@@ -242,6 +244,28 @@ class CalibreConnector(HTTPConnector):
         resp = await self._get(path, params)
         return parse_feed(resp.text, self._base_url)
 
+    def _next_path(self, href: str) -> str:
+        """The next page's path, only while it stays on calibre-web itself.
+
+        The client carries the library's basic-auth credentials, and httpx
+        sends an absolute URL to that URL's own host, not to `base_url` — so a
+        feed whose `next` link named another host would hand it the password."""
+        parsed = urlparse(href)
+        if not (parsed.scheme or parsed.netloc):
+            return href
+        base = urlparse(self._base_url)
+        same = (
+            parsed.scheme == base.scheme
+            and (parsed.hostname or "").lower() == (base.hostname or "").lower()
+            and parsed.port == base.port
+        )
+        if not same:
+            raise CalibreError(
+                f"calibre-web pointed its next page at another host ({parsed.hostname}); "
+                "not following it with the library's credentials"
+            )
+        return parsed.path + (f"?{parsed.query}" if parsed.query else "")
+
     async def catalog(self, *, use_cache: bool = True) -> list[dict]:
         """Every book in the library, newest first, deduplicated by id."""
         if use_cache and self._catalog and time.monotonic() - self._catalog[0] < CATALOG_TTL_S:
@@ -256,7 +280,7 @@ class CalibreConnector(HTTPConnector):
             for b in new:
                 books[b["id"]] = b
             # A next link that yields nothing new would loop forever.
-            path = next_href if new else None
+            path = self._next_path(next_href) if new and next_href else None
         else:
             logger.warning("calibre_catalog_page_cap", pages=_MAX_PAGES)
         result = list(books.values())

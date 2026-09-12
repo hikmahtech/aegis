@@ -17,6 +17,9 @@ from aegis.services import library, notes
 from aegis.services import research as rs
 from temporalio import activity
 
+# How many of a topic round's items a topic task's research run is given.
+_TOPIC_ITEMS = 10
+
 
 @dataclass
 class ResearchActivities:
@@ -40,6 +43,8 @@ class ResearchActivities:
         domains = rs.clean_domains(request.get("domains"))
         seed = [u for u in (request.get("seed_urls") or []) if isinstance(u, str) and u]
         errors: list[str] = []
+        # Every stored document this run hands the model, for the retrieval log.
+        used: list[str] = []
 
         kg: list[dict] = []
         if self.knowledge_connector is not None:
@@ -53,11 +58,12 @@ class ResearchActivities:
                     }
                     for h in hits or []
                 ]
+                used += [str(h.get("content_id") or "") for h in hits or []]
             except Exception as exc:  # noqa: BLE001 — a slow store costs its part, not the run
                 errors.append(f"knowledge: {str(exc)[:200]}")
-        kg = await self._notes_first(question, kg, errors)
+        kg = await self._notes_first(question, kg, errors, used)
 
-        books = await self._library(question, errors)
+        books = await self._library(question, errors, used)
 
         web: list[dict] = []
         if self.search_connector is None:
@@ -82,6 +88,7 @@ class ResearchActivities:
                 to_read.append(url)
             if len(to_read) >= rs.PAGES_TO_READ[depth]:
                 break
+        await self._log_retrieval(question, used)
         return {
             "kg": kg,
             "books": books,
@@ -91,7 +98,38 @@ class ResearchActivities:
             "errors": errors,
         }
 
-    async def _notes_first(self, question: str, kg: list[dict], errors: list[str]) -> list[dict]:
+    async def _log_retrieval(self, question: str, content_ids: list[str]) -> None:
+        """Record what this run pulled from the knowledge store, as chat does,
+        under `source='research'`.
+
+        `knowledge_injection_log` is what "used in a prompt" is measured from
+        (the feed stats, the monthly "drop it?" line, the retention preview).
+        Only chat used to write it, so a feed ResearchFlow read every day still
+        counted as unused. `workflow_run_id` stays NULL: it references
+        `workflow_runs`, whose row may not exist yet; the workflow id rides in
+        the payload. Best-effort: a failed log never fails the step."""
+        ids = list(dict.fromkeys(c for c in content_ids if c))
+        if not ids or self.db_pool is None:
+            return
+        try:
+            workflow_id = activity.info().workflow_id
+        except RuntimeError:
+            workflow_id = ""
+        try:
+            await self.db_pool.execute(
+                "INSERT INTO knowledge_injection_log "
+                "(agent_id, thread_id, workflow_run_id, source, content_ids, triples_used) "
+                "VALUES ($1, NULL, NULL, 'research', $2, $3)",
+                self.agent_id,
+                ids,
+                {"workflow_id": workflow_id, "question": question[:300]},
+            )
+        except Exception as exc:  # noqa: BLE001 — the log is bookkeeping, not the answer
+            activity.logger.warning("research_retrieval_log_failed err=%s", str(exc)[:200])
+
+    async def _notes_first(
+        self, question: str, kg: list[dict], errors: list[str], used: list[str]
+    ) -> list[dict]:
         """The user's own notes, ahead of everything else the store has (#514).
 
         Only with the vault configured: until then nothing is indexed as a
@@ -103,6 +141,7 @@ class ResearchActivities:
         except Exception as exc:  # noqa: BLE001 — a slow store costs its part, not the run
             errors.append(f"notes: {str(exc)[:200]}")
             return kg
+        used += [str(h.get("content_id") or "") for h in hits or []]
         mine = [
             {
                 "title": str(h.get("title") or ""),
@@ -114,7 +153,7 @@ class ResearchActivities:
         seen = {m["url"] for m in mine}
         return mine + [k for k in kg if k["url"] not in seen]
 
-    async def _library(self, question: str, errors: list[str]) -> list[dict]:
+    async def _library(self, question: str, errors: list[str], used: list[str]) -> list[dict]:
         """Books from the Calibre library index that speak to the question, and
         for the closest one — if it is close enough — the passages that match
         (#510). A library that cannot be read is an `errors` line, never a
@@ -128,6 +167,7 @@ class ResearchActivities:
         except Exception as exc:  # noqa: BLE001 — a slow store costs its part, not the run
             errors.append(f"library: {str(exc)[:200]}")
             return []
+        used += [str(h.get("content_id") or "") for h in hits or []]
         books = [
             {**b, "url": library.book_url(b["id"])}
             for b in (library.book_hit(h) for h in hits or [])
@@ -258,7 +298,10 @@ class ResearchActivities:
         ap = notes.question_append(question, rs.render_report(answer, sources), datetime.now())
         try:
             res = await notes.write(cfg, [ap], "raphael: research answer")
-        except notes.NotesError as exc:
+        except Exception as exc:  # noqa: BLE001 — the store save stands; the vault is the extra
+            # Any failure, not only a NotesError: an unexpected one used to
+            # escape, fail the activity and report `saved: False` for an answer
+            # the knowledge store had already kept.
             activity.logger.warning("research_vault_save_failed err=%s", str(exc)[:200])
             return {"status": "error", "error": str(exc)[:200]}
         return {"status": res["status"], "path": ap.rel}
@@ -267,9 +310,15 @@ class ResearchActivities:
     async def research_task_problem(self, task_id: str) -> dict:
         """The hub problem behind a `#research` task, minted when it has none —
         what gives the task a timeline and a session registry, as it does a
-        `@code` task. Linking never re-tags the task."""
+        `@code` task. Linking never re-tags the task.
+
+        For a topic's task (#513) it also says so — `class: topic`, the topic
+        and the round's items — because that task's title is "<topic>: new
+        items worth a look", which is not a question to research."""
         if self.db_pool is None or not task_id:
             return {}
+        from aegis.services import research_topics
+        from aegis.services.hub import TOPIC_CLASS
         from aegis.services.hub_project import ensure_problem_for_task
 
         # Source `research` makes the problem Raphael's (#513); the default,
@@ -277,4 +326,16 @@ class ResearchActivities:
         problem = await ensure_problem_for_task(
             self.db_pool, task_id, source="research", settings=self.settings
         )
-        return {"problem_id": str(problem["id"])} if problem else {}
+        if not problem:
+            return {}
+        out: dict = {"problem_id": str(problem["id"]), "class": str(problem.get("class") or "")}
+        meta = problem.get("metadata") if isinstance(problem.get("metadata"), dict) else {}
+        if out["class"] == TOPIC_CLASS and meta.get("topic"):
+            items = await research_topics.round_items(
+                self.db_pool, out["problem_id"], limit=_TOPIC_ITEMS
+            )
+            out["topic"] = str(meta["topic"])
+            out["items"] = [
+                {"title": str(i.get("title") or ""), "url": str(i.get("url") or "")} for i in items
+            ]
+        return out

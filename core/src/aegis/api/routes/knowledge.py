@@ -70,7 +70,12 @@ async def ingest(request: Request, body: IngestRequest) -> dict[str, Any]:
     if not raw_text and body.url.startswith(("http://", "https://")):
         from aegis.services.content_extract import fetch_and_extract
 
-        text, extracted_title = await fetch_and_extract(body.url, body.source_type)
+        # The operator seeds this URL by hand from the admin UI, and it may be
+        # an internal page, so this is the one caller the public-internet
+        # guard does not apply to (`services/url_guard.py`).
+        text, extracted_title = await fetch_and_extract(
+            body.url, body.source_type, allow_private=True
+        )
         raw_text = text or None
         title = title or extracted_title
     return await connector.ingest_content(

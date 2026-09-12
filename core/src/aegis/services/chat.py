@@ -2432,11 +2432,15 @@ async def _exec_pdf_to_text(pool: asyncpg.Pool, args: dict, ctx: ToolContext) ->
     from urllib.parse import urlparse
 
     from aegis.services.content_extract import fetch_and_extract
+    from aegis.services.url_guard import UnsafeURLError
 
     url = (args.get("url") or "").strip()
     if not url.startswith(("http://", "https://")):
         return json.dumps({"error": "A full http(s) URL to a PDF is required"})
-    text, _title = await fetch_and_extract(url, max_chars=2_000_000)
+    try:
+        text, _title = await fetch_and_extract(url, max_chars=2_000_000)
+    except UnsafeURLError as exc:
+        return json.dumps({"error": f"That URL cannot be fetched: {exc}"})
     if not text:
         return json.dumps(
             {"error": "Could not extract text (fetch failed, not a PDF, or scanned/image-only)"}

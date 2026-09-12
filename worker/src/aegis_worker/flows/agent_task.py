@@ -690,25 +690,40 @@ class AgentTaskFlow:
         task = input.task or {}
         title = str(task.get("content") or "").strip()
         description = str(task.get("description") or "")
+        problem: dict = {}
         try:
-            await workflow.execute_activity(
+            got = await workflow.execute_activity(
                 "research_task_problem",
                 args=[task_id],
                 start_to_close_timeout=TIMEOUT_STANDARD,
                 retry_policy=ACT_RETRY,
             )
+            problem = got if isinstance(got, dict) else {}
         except Exception as exc:  # noqa: BLE001 — the timeline is extra
             workflow.logger.warning(
                 "research_task_problem_failed task_id=%s err=%s", task_id, str(exc)[:200]
             )
+        question, context, seeds = title, _cut(description), urls_in(description, limit=3)
+        if problem.get("class") == "topic" and problem.get("topic"):
+            # A topic's task (#513) is titled "<topic>: new items worth a
+            # look", which is not a question: researched verbatim it cost a
+            # smart-tier run to answer nothing. Research the topic itself, with
+            # the round's items as the context and their links read first.
+            topic = str(problem["topic"])
+            items = [i for i in problem.get("items") or [] if isinstance(i, dict)]
+            question = f"What is new in {topic}, and what in these items matters?"
+            context = _cut(
+                "\n".join(f"- {i.get('title') or ''} ({i.get('url') or ''})" for i in items)
+            )
+            seeds = [str(i["url"]) for i in items if i.get("url")][:3]
         try:
             result = await workflow.execute_child_workflow(
                 ResearchFlow.run,
                 ResearchInput(
                     agent_id=input.agent_id or "raphael",
-                    question=title,
-                    context=_cut(description),
-                    seed_urls=urls_in(description, limit=3),
+                    question=question,
+                    context=context,
+                    seed_urls=seeds,
                 ),
                 id=task_workflow_id(task_id),
             )

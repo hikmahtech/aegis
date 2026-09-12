@@ -146,14 +146,22 @@ class NotesActivities:
             return {"status": "no_knowledge_store"}
         batch_size = max(1, int(max_files or DEFAULT_INDEX_BATCH))
         state = await self._state()
-        changes = await asyncio.to_thread(notes.vault_changes_sync, cfg, state.get("commit"))
 
         removed = 0
-        if state.get("target") == changes.head and isinstance(state.get("todo"), list):
+        if state.get("target") and isinstance(state.get("todo"), list):
+            # A pass in progress is pinned to the commit it started from and
+            # finishes even while HEAD moves (the nightly daylog commit, the
+            # phone's obsidian-git every few minutes); what changed after it is
+            # the NEXT pass, diffed from `target`. Restarting on every new HEAD
+            # meant a first pass over ~1,000 notes never got past one batch.
+            target = str(state["target"])
+            full = bool(state.get("full"))
             todo = [p for p in state["todo"] if isinstance(p, str)]
             done = int(state.get("done") or 0)
             retry = [p for p in state.get("retry") or [] if isinstance(p, str)]
         else:
+            changes = await asyncio.to_thread(notes.vault_changes_sync, cfg, state.get("commit"))
+            target, full = changes.head, changes.full
             # A new pass: last pass's failures first, then what changed. Deleted
             # notes leave the index now, once per pass.
             prior = [p for p in state.get("retry") or [] if isinstance(p, str)]
@@ -179,7 +187,7 @@ class NotesActivities:
                     summary=text[:500],
                     raw_text=text[: notes.INDEX_MAX_CHARS],
                     tags=["note", notes.top_folder(rel) or "root"],
-                    metadata={"path": rel, "folder": notes.top_folder(rel), "commit": changes.head},
+                    metadata={"path": rel, "folder": notes.top_folder(rel), "commit": target},
                 )
                 indexed += 1
             except Exception as exc:  # noqa: BLE001 — one note must not stop the pass
@@ -189,12 +197,14 @@ class NotesActivities:
         done += len(batch)
         remaining = max(0, len(todo) - done)
         if remaining == 0:
-            await self._save_state({"commit": changes.head, "retry": retry})
+            # The pass is done: the next one diffs from where this one started.
+            await self._save_state({"commit": target, "retry": retry})
         else:
             await self._save_state(
                 {
                     "commit": state.get("commit"),
-                    "target": changes.head,
+                    "target": target,
+                    "full": full,
                     "todo": todo,
                     "done": done,
                     "retry": retry,
@@ -202,8 +212,8 @@ class NotesActivities:
             )
         return {
             "status": "ok",
-            "head": changes.head[:12],
-            "full": changes.full,
+            "head": target[:12],
+            "full": full,
             "indexed": indexed,
             "removed": removed,
             "failed": len(retry),
