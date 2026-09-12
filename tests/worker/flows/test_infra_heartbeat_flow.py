@@ -88,6 +88,12 @@ async def _routing() -> dict:
     return {"infra_cluster": "homelab-swarm"}
 
 
+@activity.defn(name="probe_ingress")
+async def _probe_ingress(url: str) -> dict:
+    _calls.setdefault("probed", []).append(url)
+    return _state.get("probe") or {"url": url, "ok": True, "status": 200, "ms": 5, "error": ""}
+
+
 @activity.defn(name="clear_converged_deploys")
 async def _clear_deploys(stuck: list[str]) -> dict:
     _calls.setdefault("clear_deploys", []).append(stuck)
@@ -102,7 +108,18 @@ class _StubAlertFlow:
         return {"status": "stub"}
 
 
-_ACTS = [_collect, _read, _write, _ingest, _stale, _ping, _routing, _quiet_notify, _clear_deploys]
+_ACTS = [
+    _collect,
+    _read,
+    _write,
+    _ingest,
+    _stale,
+    _ping,
+    _routing,
+    _quiet_notify,
+    _clear_deploys,
+    _probe_ingress,
+]
 
 
 async def _run(config: InfraHeartbeatConfig | None = None) -> dict:
@@ -422,3 +439,95 @@ async def test_firing_transition_the_hub_declines_spawns_nothing():
         )
     assert result["alerts_spawned"] == 0
     assert _calls["spawned"] == []
+
+
+# ── The ingress canary (#492) ────────────────────────────────────────────────
+
+_HEALTHY = {"ok": True, "nodes": {"baa": "Ready"}, "stuck": [], "error": ""}
+_CANARY = InfraHeartbeatConfig(ingress_url="https://aegis.example.com/health")
+
+
+async def test_the_ingress_canary_alerts_when_the_way_in_stops_answering():
+    """A 3.5-hour ingress outage went unnoticed because core's healthcheck runs
+    inside core's own container, so it was green the whole time while every
+    webhook was dropped (#492). The only party that can notice is AEGIS asking
+    for its own URL from outside.
+
+    Falsifiable: drop the canary step and a swarm this healthy spawns nothing.
+    """
+    _reset(_HEALTHY)
+    _state["probe"] = {"url": _CANARY.ingress_url, "ok": False, "status": 504, "ms": 9,
+                       "error": "HTTP 504"}
+
+    result = await _run(_CANARY)
+
+    assert _calls["probed"] == [_CANARY.ingress_url]
+    assert result["alerts_spawned"] == 1
+    alert = _calls["spawned"][0]
+    assert alert["labels"]["alertname"] == "IngressUnreachable"
+    assert alert["fingerprint"] == _hb_fingerprint("IngressUnreachable", "ingress")
+    # Nobody outside can tell AEGIS about this one, so it nags.
+    assert alert["escalate"] is True
+    assert "504" in alert["description"]
+    assert result["ingress_failing"] is True
+    assert _calls["written"][0]["ingress_failing"] is True
+
+
+async def test_a_still_broken_ingress_does_not_alert_again_and_recovery_resolves():
+    """Two ticks: the second failure is the same outage, and the answer coming
+    back closes it."""
+    prior = {"nodes": {"baa": "Ready"}, "stuck": [], "confirmed": [], "fail_count": 0,
+             "ingress_failing": True}
+
+    _reset(_HEALTHY, prior)
+    _state["probe"] = {"url": _CANARY.ingress_url, "ok": False, "status": 0, "ms": 0,
+                       "error": "ConnectTimeout: "}
+    result = await _run(_CANARY)
+    assert result["alerts_spawned"] == 0
+    assert _calls["resolved"] == []
+    assert _calls["written"][0]["ingress_failing"] is True
+
+    _reset(_HEALTHY, prior)
+    _state["probe"] = {"url": _CANARY.ingress_url, "ok": True, "status": 405, "ms": 7, "error": ""}
+    result = await _run(_CANARY)
+    assert _calls["resolved"] == [_hb_fingerprint("IngressUnreachable", "ingress")]
+    assert result["ingress_failing"] is False
+    assert _calls["written"][0]["ingress_failing"] is False
+
+
+async def test_a_healthy_ingress_is_silent():
+    """No alert, and no resolve every two minutes for a problem that never
+    existed — which is the only reason the flow keeps the flag at all."""
+    _reset(_HEALTHY)
+    result = await _run(_CANARY)
+    assert result["alerts_spawned"] == 0
+    assert _calls["resolved"] == []
+    assert result["ingress_failing"] is False
+
+
+async def test_no_ingress_url_means_no_canary():
+    """AEGIS cannot guess the operator's own hostname, so a fresh deployment
+    probes nothing rather than alerting on a guess."""
+    _reset(_HEALTHY)
+    _state["probe"] = {"url": "", "ok": False, "status": 0, "ms": 0, "error": "boom"}
+    result = await _run(InfraHeartbeatConfig())
+    assert _calls.get("probed") is None
+    assert result["alerts_spawned"] == 0
+
+
+async def test_the_canary_still_runs_when_the_swarm_collect_fails():
+    """The way in can be broken while the swarm is fine, and the reverse. The
+    collect-failure path returns early, so the probe runs before it — else the
+    one outage that motivated this would be missed whenever the swarm was also
+    unhappy."""
+    _reset({"ok": False, "nodes": {}, "stuck": [], "error": "ssh: connection refused"})
+    _state["probe"] = {"url": _CANARY.ingress_url, "ok": False, "status": 502, "ms": 3,
+                       "error": "HTTP 502"}
+
+    result = await _run(_CANARY)
+
+    assert result["collect_ok"] is False
+    assert _calls["probed"] == [_CANARY.ingress_url]
+    assert [a["labels"]["alertname"] for a in _calls["spawned"]] == ["IngressUnreachable"]
+    # The early return must carry the flag, or the canary forgets every tick.
+    assert _calls["written"][0]["ingress_failing"] is True

@@ -558,6 +558,7 @@ FLOWS: tuple[FlowSpec, ...] = (
             fail_threshold=_int(act["config"], "fail_threshold", 3),
             quiet_nodes=[str(n) for n in (act["config"].get("quiet_nodes") or [])],
             restuck_hours=_int(act["config"], "restuck_hours", 24),
+            ingress_url=str(act["config"].get("ingress_url") or "").strip(),
         ),
         feature_flag="homelab_enabled",
     ),

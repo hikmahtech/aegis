@@ -413,9 +413,12 @@ def test_books_write_flow_is_gated_on_money_hygiene():
         # Then +1 flow and +1 activity from Maou's paper trading desk:
         # TradingDeskFlow and TradingDeskActivities.desk_tick, both on the money
         # flag, so only the money-on row moves.
-        (True, True, 51, 246),
+        # Then +1 activity and NO new flow from #492: `probe_ingress` on the
+        # existing HomelabActivities, the heartbeat's canary on the way in. On
+        # the homelab flag, so the two homelab-on rows move.
+        (True, True, 51, 247),
         (False, False, 40, 212),
-        (True, False, 44, 228),
+        (True, False, 44, 229),
     ],
 )
 def test_real_registration_passes_the_boot_check(homelab, money, flows, activities):

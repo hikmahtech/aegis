@@ -466,6 +466,13 @@ activities:
   # on state transitions so steady state costs nothing. Complements (does not
   # replace) alertmanager push — a power flap that silences alertmanager is
   # exactly what this catches.
+  #
+  # `ingress_url` (#492) is the canary on the way IN: AEGIS's own public or LAN
+  # URL, which the worker GETs every tick so a proxy that has stopped reaching
+  # core cannot drop every inbound webhook in silence. Any answer under 500
+  # passes, so point it at something an identity proxy will not challenge — a
+  # webhook path that answers 405 to a bare GET is ideal. Empty, the default,
+  # disables it: AEGIS cannot guess your hostname.
   - slug: infra-heartbeat-2m
     workflow_type: InfraHeartbeatFlow
     agent_id: pandoras-actor

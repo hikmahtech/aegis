@@ -8,6 +8,7 @@ in the workflow to avoid a round-trip to an activity executor.
 from __future__ import annotations
 
 import html as _html
+import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
@@ -19,6 +20,11 @@ from temporalio import activity
 from aegis_worker.activities.delivery import safe_send_message
 
 logger = structlog.get_logger()
+
+# The ingress canary's patience. Long enough to clear a slow TLS handshake
+# through a tunnel, short enough that a hung proxy is a failure inside one
+# 2-minute heartbeat tick rather than a timeout on the activity itself.
+_INGRESS_TIMEOUT_S = 10.0
 
 
 def _format_card(title: str, body: str) -> str:
@@ -264,6 +270,52 @@ class HomelabActivities:
         return {
             "services": services,
             "ps_map": ps_map,
+        }
+
+    @activity.defn
+    async def probe_ingress(self, url: str) -> dict:
+        """One GET at `url`, to test the way IN to AEGIS from outside.
+
+        Core's healthcheck runs inside core's own container, so it stays green
+        while the proxy in front of it is a black hole. That is how a 3.5-hour
+        outage went entirely unnoticed on 2026-09-11 (#492): Traefik could not
+        reach `aegis_core`, so no GitHub and no Todoist webhook arrived, and
+        nothing said so. An outside monitor cannot tell AEGIS when the way in
+        is the broken thing — the only party who can notice is AEGIS reaching
+        out, which is this.
+
+        **Any HTTP answer means the path works**, 401/404/405 included: the
+        question is whether bytes reach core, not what core makes of them, and
+        the useful probe targets are the ones an identity proxy does not
+        challenge. A transport error, a timeout, or a 5xx is a fault — a
+        proxy with no healthy backend answers exactly 502 or 504, which is
+        the signature of the outage this watches for.
+        """
+        target = (url or "").strip()
+        if not target:
+            return {"url": "", "ok": True, "status": 0, "ms": 0, "error": "", "configured": False}
+        started = time.monotonic()
+        try:
+            async with httpx.AsyncClient(
+                timeout=_INGRESS_TIMEOUT_S, follow_redirects=True
+            ) as client:
+                response = await client.get(target)
+        except Exception as exc:  # noqa: BLE001 — a failed probe IS the finding
+            return {
+                "url": target,
+                "ok": False,
+                "status": 0,
+                "ms": int((time.monotonic() - started) * 1000),
+                "error": f"{type(exc).__name__}: {str(exc)[:160]}",
+                "configured": True,
+            }
+        return {
+            "url": target,
+            "ok": response.status_code < 500,
+            "status": response.status_code,
+            "ms": int((time.monotonic() - started) * 1000),
+            "error": "" if response.status_code < 500 else f"HTTP {response.status_code}",
+            "configured": True,
         }
 
     _CERT_THRESHOLDS = (14, 7, 0)  # days

@@ -471,7 +471,15 @@ regardless of where the alert came from:
   `sentry-poll-30m` (safety net)
 - `infra-heartbeat-2m` — AEGIS's own 2-minute swarm poll; investigates on
   node/service **state transitions** only, and catches outages that also take
-  your alerting stack down
+  your alerting stack down. It also carries the **ingress canary**: set
+  `ingress_url` on its `activities.config` row and every tick GETs AEGIS's own
+  public URL from inside the worker, raising `IngressUnreachable` when the way
+  in stops answering. Core's healthcheck runs inside core's container, so it
+  stays green while the proxy in front of it drops every webhook — that is how
+  a 3.5-hour outage went unnoticed on 2026-09-11 (#492), and no outside
+  monitor could have told AEGIS, because being told is what was broken. Any
+  answer under 500 counts as reachable, so aim it at a path an identity proxy
+  will not challenge; empty disables it.
 - Hand-captured Todoist tasks routed via a content route with
   `alert_overrides` (e.g. "X is down" → a synthetic `NodeDown`)
 
