@@ -399,6 +399,24 @@ has to come back for it — the sweep re-drives every open untasked problem — 
 one that resolves inside its window is marked seen and never earns a task at
 all.
 
+A recurrence is not held back. `reopen` keeps the original `first_seen_at`, so
+a problem that blipped, resolved untasked and came back is already past its
+window and projects at once: the second episode is the evidence the first one
+lacked. That reasoning is bounded by `REOPEN_WINDOW` (24 hours) and says only
+what it can — a return within a day of the resolve is a pattern. Later than
+that the return is a `rollover`, a fresh problem with a fresh `first_seen_at`,
+and it waits like any first sighting. Measuring age from the current episode
+instead would make a service that flaps every three minutes invisible forever.
+
+The two producers in scope are the ones **outside** AEGIS that send their own
+resolution — a monitoring stack and the swarm heartbeat, both re-checking on a
+scale of seconds. AEGIS's own watchdogs (`flow_health`, `delivery`, `social`,
+`drift`, `expiry`, `llm_governor`) also resolve what they stop finding, and
+were briefly in the same set; that was a mistake of kind rather than degree.
+Their sweeps run every 30 minutes or hourly, so a three-minute window cannot
+observe a blip they would clear — it can only delay the task — and they have
+already judged the thing worth reporting before the hub hears of it.
+
 **Where it goes** depends on `subject_kind`, per the operator's own rule that
 repo-scoped work lives in GitHub Issues:
 

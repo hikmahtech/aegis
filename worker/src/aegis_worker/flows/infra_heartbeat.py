@@ -128,8 +128,11 @@ class InfraHeartbeatConfig:
     # alert escalates; at a 2-minute cadence that is a 4-minute fuse.
     ingress_fail_threshold: int = 2
     # The status the probe must get back, when the status alone says who
-    # answered — 405 for a webhook path, which core gives a bare GET and a
-    # proxy that lost the route does not. 0 accepts anything under 500.
+    # answered. Measure it rather than assume: with the admin SPA bundled its
+    # catch-all claims every unmatched `/api/` GET, so a webhook path answers
+    # 404 to a bare GET (405 only without the SPA). Prefer a route that answers
+    # something a proxy never invents — see `/api/webhooks/ping`, 204. 0 accepts
+    # anything under 500.
     ingress_expect_status: int = 0
     # Hours a service must sit `confirmed`-stuck before the flow re-investigates
     # it (#138), and equally the minimum gap between two re-investigations of
@@ -238,10 +241,15 @@ class InfraHeartbeatFlow:
         # It takes `ingress_fail_threshold` consecutive failures to raise, for
         # the same reason the collect path counts: a rolling update of core
         # drops one request, and this alert escalates and pings Slack the
-        # moment it is raised. A deploy window would not save it either — the
-        # window is keyed on a service name and this problem's subject is the
-        # path, not a service. Two ticks is four minutes, which still finds a
-        # 3.5-hour outage inside the first five minutes.
+        # moment it is raised.
+        #
+        # A deploy window DOES cover an Ansible deploy — this problem's subject
+        # is `ingress`, kind `service`, and the role posts a window for every
+        # name in its deploy-subjects list — but it covers nothing else. A
+        # hand-run `service update --force` of core or of the proxy, which is
+        # the runbook's own remedy, has no window and drops a tick. So the
+        # count stays: two ticks is four minutes, which still finds a 3.5-hour
+        # outage inside the first five minutes.
         #
         # The flag is separate from the count and does two things the count
         # cannot: it stops a second alert while the first is open, and it stops
@@ -263,38 +271,45 @@ class InfraHeartbeatFlow:
                 # matters more than the probe. Its siblings below are wrapped
                 # for the same reason.
                 workflow.logger.warning("heartbeat_ingress_probe_failed err=%s", str(exc)[:200])
-                probe = {"ok": True, "skipped": True}
-            ingress_fails = 0 if probe.get("ok") else ingress_fails + 1
-            if probe.get("skipped"):
-                ingress_fails = int(prior.get("ingress_fails") or 0)
-            if (
-                not probe.get("ok")
-                and not ingress_failing
-                and ingress_fails >= max(1, config.ingress_fail_threshold)
-            ):
-                reached = (
-                    f"answered {probe.get('status')}"
-                    if probe.get("status")
-                    else f"did not answer: {probe.get('error')}"
-                )
-                alert = build_heartbeat_alert(
-                    "IngressUnreachable",
-                    "ingress",
-                    cluster,
-                    "AEGIS cannot be reached from outside",
-                    f"{probe.get('url')} {reached}, {ingress_fails} checks in a row. "
-                    "Every inbound webhook — GitHub, Todoist, Alertmanager — is being "
-                    "dropped for as long as this lasts, and no outside monitor can tell "
-                    "AEGIS about it. Check the proxy in front of core and its route to "
-                    "the core service.",
-                    escalate=True,
-                )
-                if await self._spawn(alert):
-                    spawned += 1
-                ingress_failing = True
-            elif probe.get("ok") and ingress_failing:
-                await self._resolve("IngressUnreachable", "ingress", cluster)
-                ingress_failing = False
+                # Nothing was learned, so nothing changes: the count and the
+                # flag both stand. In particular this is NOT an answer, so it
+                # must not resolve an open problem — the earlier shim said
+                # `ok=True` here and did exactly that, closing an outage nobody
+                # had proved recovered and then re-raising it as brand new on
+                # the next failing tick.
+                probe = None
+            if probe is not None:
+                ingress_fails = 0 if probe.get("ok") else ingress_fails + 1
+                if (
+                    not probe.get("ok")
+                    and not ingress_failing
+                    and ingress_fails >= max(1, config.ingress_fail_threshold)
+                ):
+                    reached = (
+                        f"answered {probe.get('status')}" if probe.get("status") else "did not answer"
+                    )
+                    if probe.get("error"):
+                        # Keep the reason even when a status came back: a
+                        # redirect off the host answers 200 and is still a fault.
+                        reached += f" — {probe['error']}"
+                    alert = build_heartbeat_alert(
+                        "IngressUnreachable",
+                        "ingress",
+                        cluster,
+                        "AEGIS cannot be reached from outside",
+                        f"{probe.get('url')} {reached}, {ingress_fails} checks in a row. "
+                        "Every inbound webhook — GitHub, Todoist, Alertmanager — is being "
+                        "dropped for as long as this lasts, and no outside monitor can tell "
+                        "AEGIS about it. Check the proxy in front of core and its route to "
+                        "the core service.",
+                        escalate=True,
+                    )
+                    if await self._spawn(alert):
+                        spawned += 1
+                    ingress_failing = True
+                elif probe.get("ok") and ingress_failing:
+                    await self._resolve("IngressUnreachable", "ingress", cluster)
+                    ingress_failing = False
 
         # ── Collect failure path ──
         if not current.get("ok"):
