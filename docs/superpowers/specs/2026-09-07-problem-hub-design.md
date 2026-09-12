@@ -376,10 +376,28 @@ idempotent and re-runnable; a projector sweep (`CleanupFlow`, every 15 min)
 re-projects any problem whose `last_seen_at` is newer than its last projection.
 
 **Attention threshold.** A problem projects when it is `open` or later, not
-`suppressed`, not `muted`, and either `severity >= warning` with
-`occurrences >= threshold_for_class` (default 1; `flow_stale` defaults to 2) or
-an `investigation` or `plan` event has arrived. Below the threshold it lives in
-the hub and the digest only.
+`suppressed`, not `muted` — and, if it came from a producer that can clear its
+own signal, once it has outlived its class's verification window.
+
+Built as a window in seconds rather than a count of occurrences (#537): a
+five-minute blip can occur five times, so a count does not tell a flap from an
+outage while a clock does. The window is `hub.verify_seconds` — the same number
+an investigation waits before spending effort, because "long enough to believe
+this is real" is one question — overridable per class in the
+`hub_settle_seconds` settings row, where `{"*": 0}` turns the whole thing off.
+
+Two scopes keep it honest. It applies only to the producers that send their own
+resolution (`alertmanager`, `heartbeat`, `flow_health`, `delivery`); every other
+problem on the hub is a considered finding — a reconciliation, a stale feed, an
+agent's question, a hand-written task — which no amount of waiting makes truer,
+so those project on sight. And it holds back only the Todoist task: the
+investigation still starts on the first occurrence, so the diagnosis and the
+Slack card are as immediate as they ever were.
+
+Below the window the problem lives in the hub, the digest and Slack. Nothing
+has to come back for it — the sweep re-drives every open untasked problem — and
+one that resolves inside its window is marked seen and never earns a task at
+all.
 
 **Where it goes** depends on `subject_kind`, per the operator's own rule that
 repo-scoped work lives in GitHub Issues:
@@ -630,9 +648,9 @@ is the actual failure this section fixes.
 
 | Spec said | Shipped | Why |
 |---|---|---|
-| §6: a problem projects only once it passes an attention `threshold_for_class` (default 1, `flow_stale` 2) | No threshold. Projection gates on status and mute only, so every open problem earns a task on its first occurrence. | The classes that would have used a threshold above 1 got recovery semantics instead (`hub_watch.reconcile_findings` resolves a finding that goes away), which removes the noise the threshold existed to remove. A threshold on top would delay a real outage's task for no gain. |
+| §6: a problem projects only once it passes an attention `threshold_for_class` (default 1, `flow_stale` 2) | **Built 2026-09-12 (#537), as a window in seconds.** Until then there was no threshold at all: projection gated on status and mute only, so every open problem earned a task on its first occurrence. | The original reasoning — that recovery semantics (`hub_watch.reconcile_findings`) remove the noise a threshold existed to remove, and a threshold would only delay a real outage — held for findings and was wrong for alerts. Measured in prod after a month: 15 of the 60 problems that earned a task were over inside 15 minutes, 8 inside five. Each was created, clarified and auto-completed without a human acting on it. So the gate exists, but as a clock rather than a count (a five-minute blip occurs five times), scoped to producers that clear themselves, and it holds back only the task — never the investigation. The "delays a real outage" objection is answered by that scope: the diagnosis and the Slack card still land on the first occurrence. |
 | §3: a `''`-key event gets a balanced-tier "possibly the same as" suggestion, written as a `problem_links(kind='problem')` row | Not built as a suggestion. An uncorrelated event still creates; §14 shipped the LLM judgement in a narrower, acting form instead. | A suggestion is only worth writing if someone reads it. What the operator actually wanted was for the hub to ACT on the pattern — see §14, which restricts the judgement to one class and one subject kind and therefore never has to guess that two different failures are the same one. |
-| Files touched: `collapse_window`, `reopen_window`, per-class `verify_seconds` and thresholds as `activities.config` on the hub sweep row | Python constants (`REOPEN_WINDOW`, `_VERIFY_SECONDS`, `COLLAPSE_WINDOW`) | They describe what an outage is rather than what an operator prefers, and no deployment has wanted a different value. Moving one to config is a two-line change when one does. |
+| Files touched: `collapse_window`, `reopen_window`, per-class `verify_seconds` and thresholds as `activities.config` on the hub sweep row | Python constants (`REOPEN_WINDOW`, `_VERIFY_SECONDS`, `COLLAPSE_WINDOW`) — except `verify_seconds`, which took a DB override in #537 (`hub_settle_seconds`, a `settings` row merged over the code defaults, not `activities.config`). | They describe what an outage is rather than what an operator prefers, so no deployment had wanted a different value. That changed when the same number started deciding whether a Todoist task exists: how long a service takes to prove itself is a fact about the operator's own homelab, and this repo is open source, so it belongs in their database. The other two are unchanged. |
 | §8: `pending_prs` gains a `problem_id` column; `alert_fingerprint` stays one release | Corrected 2026-09-11 (#478): migration 038 added `pending_prs.problem_id` and dropped `alert_fingerprint` in the same release. `stage_pending_pr` writes the column; nothing reads it — the only SELECT fetches title, body and branch by id. | Kept, not dropped: it is the only record of which problem a staged fix is for until the PR is opened, and it costs one nullable column. Once opened, `record_investigation` links the PR to the problem as `problem_links(github_pr)`, which is what everything reads. An earlier version of this row said the table was unchanged; it was not. Checked again 2026-09-12 (#502), after the Pandora review found it empty "in its whole history": it is wired, not dead. A row is written only when someone picks Open PR — twice ever, 2026-07-31 and 2026-08-10 — and `CleanupFlow` prunes it after 30 days (it pruned one row on 2026-08-31; the second answer left no row to prune). Its `status` is written (`opened` / `failed`) and never read. The fix-PR follow-up does not build on it: a PR can outlive the 30 days, and the problem's link and events are the record. |
 | §8: the heartbeat's `escalate` flag becomes `severity='critical'` on the event and the flow reads it from the problem | `escalate` still travels on the alert dict; every heartbeat alert is already `severity='critical'` | Severity and escalation turned out to be different questions — every heartbeat alert is critical, but only some escalate — so collapsing them would have lost the distinction the gate-2 race depends on. |
 | §8: "`ingest_event` starts the flow as an abandoned child" | The producer starts it, on `IngestResult.investigate` | Only a workflow can start a child workflow; `ingest_event` is a service function called from activities and from Core. The hub still DECIDES; it just cannot be the one to start. Recorded in `CLAUDE.md` and §12's PR 3b row from the start, but §8's own text was never corrected. |

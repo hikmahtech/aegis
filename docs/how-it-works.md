@@ -550,6 +550,27 @@ The steps that make it trustworthy:
 - **Verification delay.** A per-class sleep, then the hub is asked whether the
   problem already resolved, before spending any investigation effort —
   self-healing blips cost nothing.
+- **A blip earns no Todoist task.** The same per-class window decides when a
+  problem is worth a chore: an alert younger than it stays in the hub, the
+  digest and Slack, and one that recovers inside it never gets a task at all
+  (#537). A quarter of the hub's first month of tasks were for problems that
+  were already over — created, clarified and auto-completed with nobody acting
+  on them. Only the task waits: the investigation still starts on the first
+  occurrence, so the diagnosis and the card are as quick as ever. Findings that
+  nothing will ever resolve on your behalf — a money reconciliation, a stale
+  feed, an agent's question — are projected on sight. Defaults are 180s, 300s
+  for `NodeDown` / `DockerServiceDown`, and 0 for disk, memory and OOM classes,
+  which are real the moment they fire:
+
+  ```sql
+  -- give a flappy service ten minutes to settle; never wait on a dead node
+  INSERT INTO settings (key, value) VALUES
+    ('hub_settle_seconds', '{"servicecrashlooping": 600, "nodedown": 0}')
+  ON CONFLICT (key) DO UPDATE SET value = excluded.value;
+  ```
+
+  `{"*": 0}` in that row turns the waiting off everywhere and restores the
+  behaviour before #537.
 - **One automatic restart per problem per hour.** A swarm service below its
   replicas gets one `docker service update --force` first; that fixes most
   flaps. If the same problem is back within the hour, it is not restarted

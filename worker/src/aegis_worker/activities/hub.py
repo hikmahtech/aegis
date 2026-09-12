@@ -98,10 +98,18 @@ class HubActivities:
     @activity.defn
     async def verification_delay(self, alert: dict) -> dict:
         """Seconds an investigation waits before spending effort, by the
-        alert's class (`hub.verify_seconds`). An activity rather than a pure
-        call in the flow so a test can shorten it."""
+        alert's class (`hub.verify_seconds`, with the operator's
+        `hub_settle_seconds` overrides). An activity rather than a pure call in
+        the flow so a test can shorten it, and so the override is read live.
+
+        It is the same number the projector waits out before a problem earns a
+        Todoist task (#537) — "long enough to believe this is real" is one
+        question, so it has one answer."""
         labels = alert.get("labels") if isinstance(alert.get("labels"), dict) else {}
-        return {"delay_seconds": hub.verify_seconds(str(labels.get("alertname") or ""))}
+        alertname = str(labels.get("alertname") or "")
+        if self.db_pool is None:
+            return {"delay_seconds": hub.verify_seconds(alertname)}
+        return {"delay_seconds": await hub.verify_seconds_for(self.db_pool, alertname)}
 
     @activity.defn
     async def ingest_finding(self, inp: dict) -> dict:

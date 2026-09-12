@@ -140,6 +140,14 @@ async def inbox(db_pool):
         "INSERT INTO todoist_projects (id, name, is_managed, raw) "
         "VALUES ('P_INBOX','Inbox',true,'{}'::jsonb) ON CONFLICT (id) DO NOTHING"
     )
+    # These tests are about a problem's state, not about whether a blip has
+    # earned a task, and they project seconds-old alerts. So the settle window
+    # is off (#537); `test_hub_project.py` owns that behaviour.
+    await db_pool.execute(
+        "INSERT INTO settings (key, value) VALUES ('hub_settle_seconds', $1) "
+        "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+        {"*": 0},
+    )
 
 
 async def _mirror_task(pool, task_id: str) -> None:

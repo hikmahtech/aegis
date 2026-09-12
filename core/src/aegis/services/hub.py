@@ -161,6 +161,9 @@ _VERIFY_SECONDS = {
 _VERIFY_AT_ONCE = ("disk", "storage", "memory", "oom")
 
 
+SETTLE_SETTINGS_KEY = "hub_settle_seconds"
+
+
 def verify_seconds(klass: str) -> int:
     k = _slug(klass)
     if k in _VERIFY_SECONDS:
@@ -168,6 +171,33 @@ def verify_seconds(klass: str) -> int:
     if any(word in k for word in _VERIFY_AT_ONCE):
         return 0
     return VERIFY_SECONDS_DEFAULT
+
+
+async def verify_seconds_for(pool: asyncpg.Pool, klass: str) -> int:
+    """`verify_seconds` with the operator's overrides on top.
+
+    The `hub_settle_seconds` settings row maps a class to seconds —
+    `{"servicecrashlooping": 600}` — and a class it does not name keeps the
+    code default above. How long a class takes to prove itself is a property
+    of the operator's own homelab, not of AEGIS, so it belongs in the DB
+    (#537); the defaults stay generic. The key `*` stands for every class, so
+    `{"*": 0}` is how an operator who wants no waiting at all turns the whole
+    thing off.
+
+    Read leniently, like every other merged settings row: a malformed value
+    must never stop an alert being handled, so a non-integer is ignored
+    rather than raised.
+    """
+    row = await pool.fetchrow("SELECT value FROM settings WHERE key = $1", SETTLE_SETTINGS_KEY)
+    override = (row["value"] if row else None) or {}
+    if isinstance(override, dict):
+        raw = override.get(_slug(klass), override.get("*"))
+        if raw is not None:
+            try:
+                return max(0, int(raw))
+            except (TypeError, ValueError):
+                logger.warning("hub_settle_seconds_bad_value", klass=klass, value=raw)
+    return verify_seconds(klass)
 
 
 @dataclass(frozen=True)

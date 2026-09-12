@@ -28,6 +28,7 @@ from aegis.services.hub_group import upgrade
 from aegis.services.hub_project import (
     COLLAPSE_WINDOW,
     FOOTER,
+    MONEY_SOURCE_TAG,
     merge_block,
     project,
     project_pending,
@@ -111,6 +112,15 @@ async def inbox(db_pool):
     await db_pool.execute(
         "INSERT INTO todoist_projects (id, name, is_managed, raw) "
         "VALUES ('P_INBOX','Inbox',true,'{}'::jsonb) ON CONFLICT (id) DO NOTHING"
+    )
+    # This file is about what a task looks like, not about whether a blip has
+    # earned one, and every problem here is minted seconds before it is
+    # projected. So the settle window is off (#537); the four tests at the
+    # bottom of the file turn it back on and own that behaviour.
+    await db_pool.execute(
+        "INSERT INTO settings (key, value) VALUES ('hub_settle_seconds', $1) "
+        "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+        {"*": 0},
     )
 
 
@@ -1322,3 +1332,104 @@ async def test_a_problem_that_resolved_before_it_had_a_task_never_gets_one(db_po
     again = await ingest_event(db_pool, _occ(s, 6, occurred_at=back), now=back)
     assert again.action == "reopened"
     assert (await project(db_pool, r.problem_id, now=back))["created"] is True
+
+
+# --- the settle window (#537) -------------------------------------------------
+# These four turn the window back on; the `inbox` fixture switches it off for
+# every other test in this file.
+
+
+async def _settle(db_pool, value: dict) -> None:
+    await db_pool.execute(
+        "INSERT INTO settings (key, value) VALUES ('hub_settle_seconds', $1) "
+        "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+        value,
+    )
+
+
+async def test_a_blip_earns_no_task_until_it_outlives_its_window(db_pool, inbox, todoist):
+    """A crash-loop that heals in five minutes used to earn a task, get
+    clarified and auto-complete — a quarter of the hub's first month of tasks
+    were that. An alert now waits out its class's verification window before it
+    is believed, and the sweep is what comes back for it.
+
+    Falsifiable: drop the settling branch in `project` and the first call
+    creates the task.
+    """
+    await _settle(db_pool, {})  # code defaults: 300s for DockerServiceDown
+    s = _subject()
+    r = await ingest_event(db_pool, _occ(s, 0, occurred_at=NOW), now=NOW)
+
+    early = await project(db_pool, r.problem_id, now=NOW + timedelta(minutes=2))
+    assert early["skipped"] == "settling"
+    assert early["settle_seconds"] == 300
+    assert (await get_problem(db_pool, r.problem_id))["todoist_task_id"] is None
+    assert not _cmds(todoist, "item_add")
+    # The watermark did not move, so the sweep still holds it.
+    waiting = await project_pending(db_pool, now=NOW + timedelta(minutes=2))
+    assert r.problem_id in {x["problem_id"] for x in waiting}
+
+    assert (await project(db_pool, r.problem_id, now=NOW + timedelta(minutes=6)))["created"] is True
+    # The occurrence it sat on is what describes the task.
+    assert f"Heartbeat saw {s}" in _cmds(todoist, "item_add")[0]["args"]["description"]
+
+
+async def test_a_blip_that_heals_inside_its_window_never_earns_a_task(db_pool, inbox, todoist):
+    """The whole point: no task is ever created, not even one born closed."""
+    await _settle(db_pool, {})
+    s = _subject()
+    r = await ingest_event(db_pool, _occ(s, 0, occurred_at=NOW), now=NOW)
+    early = await project(db_pool, r.problem_id, now=NOW + timedelta(minutes=1))
+    assert early["skipped"] == "settling"
+    await ingest_event(db_pool, _resolved(s, 4), now=NOW + timedelta(minutes=4))
+
+    after = NOW + timedelta(minutes=30)
+    assert (await project(db_pool, r.problem_id, now=after))["skipped"] == "resolved_without_task"
+    assert not _cmds(todoist, "item_add")
+    assert r.problem_id not in {x["problem_id"] for x in await project_pending(db_pool, now=after)}
+
+
+async def test_only_a_signal_that_can_clear_itself_waits(db_pool, inbox, todoist):
+    """A money finding is a judgement, not an alert: nothing will send its
+    resolution, and no amount of waiting makes it truer. So the window is
+    scoped to the producers that clear themselves, and a finding still projects
+    on sight.
+
+    Falsifiable: widen `_SELF_CLEARING_SOURCES` to every source and this task
+    is three minutes late.
+    """
+    await _settle(db_pool, {})
+    s = _subject()
+    r = await ingest_event(
+        db_pool,
+        Event(
+            source="money",
+            external_id=f"{s}@stmt",
+            kind="occurrence",
+            title=f"12 rows on {s} match nothing in the books",
+            klass="statement_unmatched",
+            subject=s,
+            subject_kind="account",
+            severity="warning",
+            payload={"description": "Reconciliation found rows with no journal entry."},
+            occurred_at=NOW,
+        ),
+        now=NOW,
+    )
+
+    assert (await project(db_pool, r.problem_id, now=NOW + timedelta(seconds=1)))["created"] is True
+    assert _cmds(todoist, "item_add")[0]["args"]["labels"][0] == MONEY_SOURCE_TAG
+
+
+async def test_the_settle_window_is_db_configurable(db_pool, inbox, todoist):
+    """How long a class takes to prove itself belongs to the operator's homelab,
+    so it is a settings row over generic defaults — and a malformed value must
+    never stop a problem being handled."""
+    await _settle(db_pool, {"dockerservicedown": 0})
+    quick = await ingest_event(db_pool, _occ(_subject(), 0, occurred_at=NOW), now=NOW)
+    out = await project(db_pool, quick.problem_id, now=NOW + timedelta(seconds=1))
+    assert out["created"] is True
+
+    await _settle(db_pool, {"dockerservicedown": "soon"})
+    bad = await ingest_event(db_pool, _occ(_subject(), 0, occurred_at=NOW), now=NOW)
+    assert (await project(db_pool, bad.problem_id, now=NOW))["settle_seconds"] == 300
