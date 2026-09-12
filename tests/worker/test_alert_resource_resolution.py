@@ -307,70 +307,31 @@ async def test_resolve_resource_kg_low_confidence_falls_through():
     assert result["source"] == "llm"
 
 
-async def test_resolve_resource_connector_expands_to_the_configured_infra_repo():
-    """A connector match also investigates the infra repo, because the config
-    that deploys a thing is as likely to be at fault as the thing.
+async def test_the_resolver_returns_only_what_it_matched():
+    """No "phase 2" expansion: what comes back is the LLM's picks and nothing
+    appended.
 
-    The repo is the one `infra_alert_routing.repo` names. It used to be found by
-    path basename `== "infra-gitops"`, so the expansion never fired in any
-    deployment whose infra repo is called something else — including the one it
-    was written for, `homelab-gitops` (#505).
+    There used to be a rule here — a connector or service match also
+    investigates the infra repo — and it could not run. Both candidate queries
+    are gated on `kind = 'repository' AND coding_enabled = 'true'` (the #35
+    allow-list that keeps an unrelated resource out of a live shell-and-PR
+    run), so no connector or service is ever among the rows, and the test that
+    used to cover it passed only because a mocked `fetch` returned a row the
+    real SQL cannot. Deleted in #505 rather than made reachable: an infra alert
+    already investigates the infra repo through `resolve_infra_resource`, and
+    this path runs with `allow_fix=True`, so admitting connectors would put a
+    non-allowlisted repo into a fix-capable coding run.
 
-    Falsifiable: point the routing row at a repo no resource has and the
-    expansion adds nothing.
+    Falsifiable: append anything to `enriched` and the list below grows.
     """
     mock_db = AsyncMock()
-    mock_db.fetch.return_value = SAMPLE_RESOURCES  # includes res-003 = infra-gitops
+    mock_db.fetch.return_value = SAMPLE_RESOURCES
     mock_db.fetchrow = _routing_fetchrow("example/infra-gitops", SAMPLE_RESOURCES[2])
 
-    mock_kg = AsyncMock()
-    mock_kg.search.return_value = []
-    mock_kg.ingest_claims = AsyncMock(return_value={"triples_created": 1})
-
-    mock_llm = AsyncMock()
-    # LLM returns the connector (knowledge-service) as the only match
-    mock_llm.think.return_value = {
-        "response": json.dumps(
-            {
-                "resources": [
-                    {
-                        "resource_id": "res-002",
-                        "resource_title": "knowledge-service",
-                        "confidence": 0.8,
-                    }
-                ]
-            }
-        ),
-        "model": "gemma4:e2b",
-        "prompt_tokens": 100,
-        "completion_tokens": 20,
-    }
-
-    act = AlertActivities(db_pool=mock_db, llm_client=mock_llm, knowledge_connector=mock_kg)
-    env = ActivityEnvironment()
-    result = await env.run(act.resolve_alert_resource, SAMPLE_ALERT)
-
-    # Primary resource is the connector
-    assert result["resource_id"] == "res-002"
-    # Expansion added infra-gitops as second resource
-    resource_ids = [r["resource_id"] for r in result["resources"]]
-    assert "res-003" in resource_ids, f"infra-gitops not expanded in: {resource_ids}"
-    homelab = next(r for r in result["resources"] if r["resource_id"] == "res-003")
-    assert homelab["resource_path"] == "infra-gitops"
-    assert homelab["github_repo"] == "example/infra-gitops"
-
-
-async def test_resolve_resource_expands_to_nothing_when_no_infra_repo_is_configured():
-    """The other half of the same rule: an unset (or wrong) `repo` adds no
-    second resource, rather than guessing at a name."""
-    mock_db = AsyncMock()
-    mock_db.fetch.return_value = SAMPLE_RESOURCES
-    mock_db.fetchrow = _routing_fetchrow("", None)
-
     mock_llm = AsyncMock()
     mock_llm.think.return_value = {
         "response": json.dumps(
-            {"resources": [{"resource_id": "res-002", "resource_title": "knowledge-service",
+            {"resources": [{"resource_id": "res-001", "resource_title": "aegis-core",
                             "confidence": 0.8}]}
         ),
         "model": "gemma4:e2b",
@@ -381,7 +342,9 @@ async def test_resolve_resource_expands_to_nothing_when_no_infra_repo_is_configu
     act = AlertActivities(db_pool=mock_db, llm_client=mock_llm, knowledge_connector=AsyncMock())
     result = await ActivityEnvironment().run(act.resolve_alert_resource, SAMPLE_ALERT)
 
-    assert [r["resource_id"] for r in result["resources"]] == ["res-002"]
+    # The infra repo (res-003) is configured and present in the rows, and is
+    # still not added.
+    assert [r["resource_id"] for r in result["resources"]] == ["res-001"]
 
 
 async def test_resolve_resource_subthreshold_returns_unconfirmed_candidates():

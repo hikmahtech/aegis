@@ -1216,51 +1216,39 @@ class AlertActivities:
         claimed = await self._claimed_resource(alert)
         if claimed is not None:
             return {**claimed, "source": "label_claim", "resources": [claimed]}
-        row = await self._infra_repo_row()
-        if row is None:
+        repo = (await get_infra_alert_routing(self.db_pool))["repo"]
+        if not repo:
+            activity.logger.warning(
+                "resolve_infra_resource_no_repo — set `repo` in the "
+                "infra_alert_routing setting (PUT /api/admin/infra-alert-routing)"
+            )
+            return null_result
+        try:
+            # Prefer the row with a checkout path: without one the coding run
+            # has nowhere to cd and degrades to the LLM-only path.
+            row = await self.db_pool.fetchrow(
+                "SELECT id, title, metadata FROM resources "
+                "WHERE kind = 'repository' AND lower(metadata->>'github_repo') = lower($1) "
+                "ORDER BY (metadata->>'path') IS NULL, slug LIMIT 1",
+                repo,
+            )
+        except Exception as exc:
+            activity.logger.warning(
+                "resolve_infra_resource_db_failed err=%s", str(exc)[:200]
+            )
+            return null_result
+        if not row:
+            activity.logger.warning("resolve_infra_resource_not_found repo=%s", repo)
             return null_result
         meta = _decode_metadata(row)
         matched = {
             "resource_id": str(row["id"]),
             "resource_title": row["title"],
             "resource_path": meta.get("path") or "",
-            "github_repo": meta.get("github_repo") or "",
+            "github_repo": meta.get("github_repo") or repo,
             "confidence": 1.0,
         }
         return {**matched, "source": "infra", "resources": [matched]}
-
-    async def _infra_repo_row(self):
-        """The `resources` row for the infra repo, or None.
-
-        The repo is whichever `github_repo` the `infra_alert_routing.repo`
-        setting names — never a hardcoded name (#505). None means unset,
-        missing or unreadable; every caller degrades to an LLM-only
-        investigation rather than failing.
-        """
-        if not self.db_pool:
-            return None
-        repo = (await get_infra_alert_routing(self.db_pool))["repo"]
-        if not repo:
-            activity.logger.warning(
-                "infra_repo_not_configured — set `repo` in the "
-                "infra_alert_routing setting (PUT /api/admin/infra-alert-routing)"
-            )
-            return None
-        try:
-            # Prefer the row with a checkout path: without one the coding run
-            # has nowhere to cd and degrades to the LLM-only path.
-            row = await self.db_pool.fetchrow(
-                "SELECT id, title, kind, metadata FROM resources "
-                "WHERE kind = 'repository' AND lower(metadata->>'github_repo') = lower($1) "
-                "ORDER BY (metadata->>'path') IS NULL, slug LIMIT 1",
-                repo,
-            )
-        except Exception as exc:
-            activity.logger.warning("infra_repo_lookup_failed err=%s", str(exc)[:200])
-            return None
-        if not row:
-            activity.logger.warning("infra_repo_not_found repo=%s", repo)
-        return row
 
     @activity.defn
     async def remediate_infra_service(self, alert: dict) -> dict:
@@ -1818,31 +1806,27 @@ class AlertActivities:
         if not enriched:
             return null_result
 
-        # Phase 2: rule-based expansion — a connector or service alert also
-        # investigates the infra repo, because the config that deploys the thing
-        # is as likely to be at fault as the thing.
+        # There WAS a "Phase 2" here: when the LLM picked a connector or a
+        # service, the infra repo was appended so the config that deploys a
+        # thing was investigated beside the thing. It is gone (#505), because
+        # it could not run.
         #
-        # The repo is the one `infra_alert_routing.repo` names. It used to be
-        # found by path basename `== "infra-gitops"`, with `example/infra-gitops`
-        # as the fallback repo, so in any deployment whose infra repo is called
-        # something else — including the one this was written for, where it is
-        # `homelab-gitops` — the expansion silently never fired (#505).
-        if {r["kind"] for r in enriched} & {"connector", "service"}:
-            infra_row = await self._infra_repo_row()
-            already = {r["resource_id"] for r in enriched}
-            if infra_row is not None and str(infra_row["id"]) not in already:
-                imeta = _decode_metadata(infra_row)
-                enriched.append(
-                    {
-                        "resource_id": str(infra_row["id"]),
-                        "resource_title": infra_row["title"],
-                        "resource_path": imeta.get("path") or "",
-                        "github_repo": imeta.get("github_repo") or "",
-                        "kind": infra_row["kind"] or "repository",
-                        "confidence": 0.9,
-                    }
-                )
-
+        # Both candidate queries above are gated on
+        # `kind = 'repository' AND coding_enabled = 'true'` — the allow-list
+        # that keeps an unrelated resource out of a live shell-and-PR run, added
+        # in #35. `enriched` is built only from those rows, so every `kind` in
+        # it is `repository` and the connector/service test was unsatisfiable
+        # from the day the allow-list landed. The basename bug #505 reported
+        # (matching `infra-gitops` while this deployment's repo is
+        # `homelab-gitops`) was real, and fixing it changed nothing: the branch
+        # holding it was already unreachable.
+        #
+        # It is not worth making reachable. An infra alert already investigates
+        # the infra repo directly (`resolve_infra_resource`), which is the case
+        # the expansion was for; and this path runs with `allow_fix=True`, so
+        # widening the candidate query to admit connectors would put a
+        # non-allowlisted repo into a fix-capable coding run — the exact thing
+        # the allow-list exists to prevent.
         primary = enriched[0]
         resource_id = primary["resource_id"]
         resource_title = primary["resource_title"]
