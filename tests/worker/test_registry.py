@@ -405,9 +405,14 @@ def test_books_write_flow_is_gated_on_money_hygiene():
         # the existing IntelligenceActivities (tracked topics' rounds in the
         # hub), a step of IntelligenceScanFlow and RssIngestFlow. Unflagged, so
         # all three rows move.
-        (True, True, 47, 241),
-        (False, False, 37, 208),
-        (True, False, 41, 224),
+        # Then +3 flows and +4 activities from #514, all unflagged: NotesWriteFlow
+        # (a chat write), NotesSyncFlow (the hourly vault index, seeded) and
+        # NotesBackfillFlow (hand-started), served by the new NotesActivities
+        # class (notes_write, notes_journal_write, notes_index_vault,
+        # notes_backfill_journal). All three rows move.
+        (True, True, 50, 245),
+        (False, False, 40, 212),
+        (True, False, 44, 228),
     ],
 )
 def test_real_registration_passes_the_boot_check(homelab, money, flows, activities):

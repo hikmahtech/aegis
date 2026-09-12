@@ -362,6 +362,13 @@ class _RecordingKS:
         return {"content_id": f"c-{kwargs['url']}", "status": "ok", "chunks_total": 1}
 
 
+@activity.defn(name="notes_journal_write")
+async def _vault_not_configured(entry: dict) -> dict:
+    """The vault is off in these tests (#514), so the daylog files its
+    knowledge rows exactly as before. `test_daylog_vault.py` covers it on."""
+    return {"status": "not_configured"}
+
+
 async def _run_flow(client, ks, day_acts, task_queue: str, extra_activities=None, config=None):
     content_acts = ContentActivities(knowledge_connector=ks, enabled=True)
     activities = [
@@ -371,6 +378,7 @@ async def _run_flow(client, ks, day_acts, task_queue: str, extra_activities=None
         day_acts.gather_daylogs,
         day_acts.distil_rollup,
         content_acts.ingest_content,
+        _vault_not_configured,
     ]
     if extra_activities:
         # Replace same-named production activities with the supplied stubs.

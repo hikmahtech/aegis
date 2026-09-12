@@ -49,6 +49,7 @@ from aegis_worker.activities.llm_governor import LLMGovernorActivities
 from aegis_worker.activities.meeting import MeetingActivities
 from aegis_worker.activities.memory import MemoryActivities
 from aegis_worker.activities.money import MoneyActivities
+from aegis_worker.activities.notes import NotesActivities
 from aegis_worker.activities.people import PeopleActivities
 from aegis_worker.activities.profile import ProfileActivities
 from aegis_worker.activities.raindrop import RaindropActivities
@@ -332,6 +333,7 @@ async def main():
         db_pool=deps.pool,
         llm_client=deps.llm,
         model=model_balanced,
+        settings=settings,
     )
     # A1 shipped the write substrate; A2 (ProfileReflectionFlow) drives it.
     profile_act = ProfileActivities(
@@ -407,6 +409,14 @@ async def main():
         knowledge_connector=connectors.get("knowledge"),
         db_pool=deps.pool,
         settings=settings,
+    )
+    # Raphael's notes (#514): the Obsidian vault checkout is read from the
+    # Integrations settings on every call, so a key saved in the admin UI
+    # applies after the worker restart the page already asks for.
+    notes_act = NotesActivities(
+        settings=settings,
+        db_pool=deps.pool,
+        knowledge_connector=connectors.get("knowledge"),
     )
     rss_act = RssActivities(db_pool=deps.pool)
     # B7 — wearable vendor poll. An empty token is not an error here: the
@@ -612,6 +622,7 @@ async def main():
         rss_act,
         research_act,
         calibre_act,
+        notes_act,
         wearable_act,
         intel_scan_act,
         sentry_ingest_act,

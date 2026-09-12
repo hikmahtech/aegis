@@ -580,6 +580,121 @@
   {
     "type": "function",
     "function": {
+      "name": "note_search",
+      "description": "Search the user's Obsidian vault \u2014 journal, knowledge, literature and reference notes, and Raphael's own notes \u2014 and return the best-matching notes with their paths. Read one in full with note_read.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "query": {
+            "type": "string",
+            "description": "What to look for."
+          },
+          "limit": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 20,
+            "description": "How many notes (1-20).",
+            "default": 5
+          }
+        },
+        "required": [
+          "query"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "note_read",
+      "description": "Read one note from the user's Obsidian vault by its path, e.g. journal/12 Sep 26.md. Encrypted blocks are never shown.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "The note's path inside the vault."
+          },
+          "max_chars": {
+            "type": "integer",
+            "minimum": 500,
+            "maximum": 60000,
+            "description": "The most characters to return (500-60000).",
+            "default": 20000
+          }
+        },
+        "required": [
+          "path"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "note_write",
+      "description": "Add a section to one of Raphael's notes in the vault, creating the note if it does not exist. Append-only: nothing already in a note is ever changed. Only notes under raphael/ can be written, e.g. raphael/topics/rag.md.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "The note, under raphael/ (the folder and .md are added if left off)."
+          },
+          "text": {
+            "type": "string",
+            "description": "The markdown to add."
+          },
+          "heading": {
+            "type": "string",
+            "description": "The section heading; today's date when empty.",
+            "default": ""
+          },
+          "title": {
+            "type": "string",
+            "description": "The note's title if this creates it.",
+            "default": ""
+          }
+        },
+        "required": [
+          "path",
+          "text"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "note_link",
+      "description": "Link one of Raphael's notes to another note, a book, a paper or a URL by appending one line: a [[wikilink]] for a note or book title, a markdown link for a URL. Append-only, under raphael/ only.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "The note to add the link to, under raphael/."
+          },
+          "target": {
+            "type": "string",
+            "description": "A note or book title (becomes [[target]]) or an http(s) URL."
+          },
+          "label": {
+            "type": "string",
+            "description": "Optional text to show instead of the target.",
+            "default": ""
+          }
+        },
+        "required": [
+          "path",
+          "target"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
       "name": "configure_triage",
       "description": "Read or update triage configuration: ignored Sentry projects, ignored email domains, notification mode, burst threshold.",
       "parameters": {

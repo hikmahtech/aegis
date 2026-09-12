@@ -269,15 +269,23 @@ def config_from_settings(settings) -> BooksConfig:
 def install_deploy_key(settings) -> Path | None:
     """Write `settings.books_deploy_key` (PEM, or base64 of PEM) to
     `<gmail_token_dir>/books_deploy_key` with mode 0600. Never logs the value."""
-    raw = (getattr(settings, "books_deploy_key", "") or "").strip()
+    path = Path(getattr(settings, "gmail_token_dir", "config/")) / "books_deploy_key"
+    return write_deploy_key(getattr(settings, "books_deploy_key", ""), path, "books_deploy_key")
+
+
+def write_deploy_key(raw: str, path: Path, label: str) -> Path | None:
+    """Write one deploy key (PEM, or base64 of PEM) to `path` with mode 0600.
+
+    Shared by the books key and the vault key (`notes.install_deploy_key`,
+    #514), so both land on disk the same way. Never logs the value."""
+    raw = (raw or "").strip()
     if not raw:
         return None
     if "\n" not in raw:
         try:
             raw = base64.b64decode(raw, validate=True).decode("utf-8").strip()
         except Exception as exc:  # noqa: BLE001
-            raise BooksError("books_deploy_key is neither PEM text nor base64 PEM") from exc
-    path = Path(getattr(settings, "gmail_token_dir", "config/")) / "books_deploy_key"
+            raise BooksError(f"{label} is neither PEM text nor base64 PEM") from exc
     path.parent.mkdir(parents=True, exist_ok=True)
     # O_CREAT's mode applies only when the file is NEW, so this closes the window
     # where a fresh key file exists world-readable; the chmod then covers the

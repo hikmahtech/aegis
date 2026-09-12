@@ -298,6 +298,20 @@ activities:
     config: {}
     active: true
 
+  # Raphael — the vault index (#514): pull the user's Obsidian vault and index
+  # what changed since the last pass as source_type='note', encrypted blocks
+  # stripped, at most max_files notes per run. Inert (not_configured) until the
+  # Integrations page has notes_repo_url AND notes_deploy_key. Minute :19 is odd
+  # (the */2 stepper never lands on it), not a multiple of 5 (clear of */5,
+  # */15, */30), not in the 3-58/5 stepper, and used by no other row.
+  # NOTE: `config` is DB-owned — tune max_files on /admin/flows, not here.
+  - slug: notes-sync-hourly
+    workflow_type: NotesSyncFlow
+    agent_id: raphael
+    schedule_cron: "19 * * * *"
+    config: {max_files: 300}
+    active: true
+
   # Phase 4 — nightly per-agent memory consolidation (caps each agent's
   # agent_memory at `keep` rows; the learning loop writes corrections live).
   # consolidate: run the A4 planner first — it PROPOSES ADD/UPDATE/DELETE/NOOP

@@ -23,7 +23,7 @@ from aegis.mcp_manager import MCPError
 from aegis.observability import log_audit, record_llm_call, record_tool_call
 from aegis.services.library import LIBRARY_READ_TIMEOUT_S
 from aegis.services.research import FETCH_TOOL_TIMEOUT_S, RESEARCH_TOOL_TIMEOUT_S
-from aegis.services.source_types import DEFAULT_DECAY_DAYS, get_decay_days
+from aegis.services.source_types import DEFAULT_DECAY_DAYS, get_decay_days, get_rank_boost
 from aegis.services.tools.base import (
     _MAX_LISTED_DROPPED_KEYS,  # noqa: F401 — re-export: kept importable from here
     _SHRINK_PASSES,  # noqa: F401 — re-export: imported from here by tests
@@ -96,6 +96,14 @@ from aegis.services.tools.library import (
     _exec_library_read,
     _exec_library_search,
     _exec_library_suggest,
+)
+from aegis.services.tools.notes import (
+    NOTE_READ_TIMEOUT_S,
+    NOTES_TOOL_TIMEOUT_S,
+    _exec_note_link,
+    _exec_note_read,
+    _exec_note_search,
+    _exec_note_write,
 )
 from aegis.services.tools.registry import TOOL_REGISTRY
 from aegis.services.tools.research import (  # noqa: F401 — re-export: imported from here by tests
@@ -507,6 +515,11 @@ CHAT_TOOLS = [
     _registry_schema("library_book"),
     _registry_schema("library_read"),
     _registry_schema("library_suggest"),
+    # The Obsidian vault (#514), generated from services/tools/notes.py.
+    _registry_schema("note_search"),
+    _registry_schema("note_read"),
+    _registry_schema("note_write"),
+    _registry_schema("note_link"),
     {
         "type": "function",
         "function": {
@@ -1464,6 +1477,11 @@ _TOOL_TIMEOUT_OVERRIDES: dict[str, int] = {
     "library_book": FETCH_TOOL_TIMEOUT_S,
     "library_read": LIBRARY_READ_TIMEOUT_S,
     "library_suggest": FETCH_TOOL_TIMEOUT_S,
+    # The vault (#514): a read may pull first; the two writers wait on
+    # NotesWriteFlow, as the ledger writers wait on BooksWriteFlow.
+    "note_read": NOTE_READ_TIMEOUT_S,
+    "note_write": NOTES_TOOL_TIMEOUT_S,
+    "note_link": NOTES_TOOL_TIMEOUT_S,
 }
 
 
@@ -3046,6 +3064,10 @@ TOOL_EXECUTORS: dict[str, Any] = {
     "library_book": _exec_library_book,
     "library_read": _exec_library_read,
     "library_suggest": _exec_library_suggest,
+    "note_search": _exec_note_search,
+    "note_read": _exec_note_read,
+    "note_write": _exec_note_write,
+    "note_link": _exec_note_link,
     "configure_triage": _exec_configure_triage,
     "update_runbook": _exec_update_runbook,
     "list_nodes": _exec_list_nodes,
@@ -3440,8 +3462,11 @@ def _apply_knowledge_decay(items: list[dict]) -> list[dict]:
         days = item.get("days_since_referenced", 0)
         decay_factor = max(0.1, 1.0 - (days / decay_window))
         # similarity can be None (BM25-only chunks from knowledge-service);
-        # coerce so the multiply doesn't break.
-        item["effective_score"] = (item.get("similarity") or 0) * decay_factor
+        # coerce so the multiply doesn't break. The rank boost is 1.0 for every
+        # type but the user's own notes, which rank above raw documents (#514).
+        item["effective_score"] = (
+            (item.get("similarity") or 0) * decay_factor * get_rank_boost(source_type)
+        )
     return items
 
 

@@ -1908,6 +1908,62 @@ Stop tracking with `untrack_topic` (it closes the live round and its task).
 The intel scans no longer capture a `#research` Inbox task per worthy item;
 Raindrop bookmarks still do.
 
+## The vault (Raphael)
+
+The user's Obsidian vault (`arshadansari27/arshad-workspace`) is Raphael's
+record; the knowledge store is only its index (#514, spec
+`docs/superpowers/specs/2026-09-12-raphael-notes-design.md`).
+
+- **Reads:** `NotesSyncFlow` (`notes-sync-hourly`, minute :19) pulls the vault
+  and indexes every changed `.md` note as `source_type='note'`, skipping
+  `.obsidian/`, `_templates/`, `backups/`, `_attachments/` and `.trash/`, at
+  most `max_files` (300) per run. Encrypted meld-encrypt blocks are stripped
+  before anything is stored. Notes rank above raw documents (`rank_boost`
+  1.25). Progress is `settings.notes_index_state`.
+- **Writes, append-only:** only under `raphael/` (research answers in
+  `raphael/questions/`, and whatever Raphael writes with `note_write` /
+  `note_link`) and the daylog's journal notes. Nothing the user wrote is ever
+  changed; each section carries a hidden `%% aegis:<key> %%` marker, so a
+  re-run adds nothing twice.
+- **The journal:** with the vault configured, the nightly daylog appends to
+  `journal/DD MMM YY.md`, the weekly rollup to `journal/[W]ww MMM YY.md` and
+  the monthly one to `journal/<YYYY>/MM. MMM.md`, each under `## Raphael`. A
+  new note is rendered from the vault's own template. No `daylog` knowledge row
+  is filed then; if the vault write fails the row is filed as before and the
+  run reports `vault_error`.
+- **Conflicts:** `obsidian-git` commits from the phone and laptop. A rejected
+  push or a conflicting rebase drops Raphael's own unpushed commit, pulls fresh
+  and retries once; a second failure is reported and nothing is kept. Raphael
+  never force-pushes.
+
+### Setting it up
+
+1. Make an ed25519 key pair and add the public half to the vault repo as a
+   deploy key **with write access** (GitHub → Settings → Deploy keys). Keep
+   the private half out of chat and out of the repo.
+2. On AEGIS's Integrations page, group **Notes (vault)**: set
+   `notes_repo_url` (`git@github.com:arshadansari27/arshad-workspace.git`) and
+   paste the private key into `notes_deploy_key`. Restart core and the worker
+   (the key is written to disk, mode 0600, at boot). The checkout is
+   `/app/config/notes`, beside the books; no infra change is needed.
+3. Grant Raphael the four tools. The DB `tool_set` wins over the seed:
+
+   ```sql
+   UPDATE agents SET metadata = jsonb_set(metadata, '{tool_set}',
+     (metadata->'tool_set') || '["note_search","note_read","note_write","note_link"]'::jsonb)
+   WHERE id = 'raphael' AND NOT (metadata->'tool_set' ? 'note_search');
+   ```
+4. Build the index without waiting for :19: `temporal schedule trigger
+   --schedule-id notes-sync-hourly`. The first pass over ~1,000 notes takes a
+   few runs (`remaining` in the summary counts down).
+5. Optional, once: write the daylog's existing entries into the journal —
+   `temporal workflow start --type NotesBackfillFlow --task-queue aegis-main
+   --workflow-id notes-backfill-journal --input '{"agent_id": "raphael"}'`.
+   It uses the live markers, so a second run writes nothing.
+
+Until step 2 every part reports `not_configured` and the daylog files its
+knowledge rows exactly as before.
+
 ## Troubleshooting
 
 | Symptom | Cause |

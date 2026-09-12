@@ -270,6 +270,11 @@ _READ_ONLY_TOOLS = frozenset(
         "list_next_actions",
         "list_projects",
         "list_social_channels",
+        # The vault's two reads (#514): a search of the index and one note
+        # from the checkout (a pull of the local copy, never a vault write).
+        # Not note_write / note_link: both start NotesWriteFlow.
+        "note_read",
+        "note_search",
         # The research lane's four reads (#509): a search, a page, a paper
         # search, a paper — fetched and returned, never stored. Not
         # `research_topic`: since #509 it starts `ResearchFlow`, which saves

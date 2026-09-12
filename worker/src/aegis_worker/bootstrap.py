@@ -163,6 +163,15 @@ async def bootstrap(settings: Settings | None = None) -> WorkerDeps:
     except Exception as exc:  # noqa: BLE001 — a bad key must not block boot
         logger.warning("books_deploy_key_install_failed", error=str(exc)[:200])
 
+    # The vault key (#514), the same way, before the daylog or the notes index
+    # first touch the checkout.
+    from aegis.services import notes as notes_service
+
+    try:
+        notes_service.install_deploy_key(settings)
+    except Exception as exc:  # noqa: BLE001 — a bad key must not block boot
+        logger.warning("notes_deploy_key_install_failed", error=str(exc)[:200])
+
     # LLM client + tier map from the configurable backend (DB → env fallback).
     # Cap the fast tier at 2 concurrent calls — it typically shares a GPU with
     # everything else aegis hosts, and bursts serialise through ollama

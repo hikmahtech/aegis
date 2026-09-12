@@ -10,9 +10,10 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any
 
-from aegis.services import library
+from aegis.services import library, notes
 from aegis.services import research as rs
 from temporalio import activity
 
@@ -54,6 +55,7 @@ class ResearchActivities:
                 ]
             except Exception as exc:  # noqa: BLE001 — a slow store costs its part, not the run
                 errors.append(f"knowledge: {str(exc)[:200]}")
+        kg = await self._notes_first(question, kg, errors)
 
         books = await self._library(question, errors)
 
@@ -88,6 +90,29 @@ class ResearchActivities:
             "to_read": to_read,
             "errors": errors,
         }
+
+    async def _notes_first(self, question: str, kg: list[dict], errors: list[str]) -> list[dict]:
+        """The user's own notes, ahead of everything else the store has (#514).
+
+        Only with the vault configured: until then nothing is indexed as a
+        note, and the search would cost an embedding to find nothing."""
+        if self.knowledge_connector is None or not notes.config_from_settings(self.settings).configured:
+            return kg
+        try:
+            hits = await self.knowledge_connector.search(question, limit=3, source_type="note")
+        except Exception as exc:  # noqa: BLE001 — a slow store costs its part, not the run
+            errors.append(f"notes: {str(exc)[:200]}")
+            return kg
+        mine = [
+            {
+                "title": str(h.get("title") or ""),
+                "url": str(h.get("url") or ""),
+                "summary": str(h.get("content") or h.get("summary") or "")[:1500],
+            }
+            for h in hits or []
+        ]
+        seen = {m["url"] for m in mine}
+        return mine + [k for k in kg if k["url"] not in seen]
 
     async def _library(self, question: str, errors: list[str]) -> list[dict]:
         """Books from the Calibre library index that speak to the question, and
@@ -203,19 +228,40 @@ class ResearchActivities:
     @activity.defn
     async def research_save(self, question: str, answer: str, sources: list[dict]) -> dict:
         """Keep a real answer in the knowledge store, keyed on the question so
-        asking again replaces it. Raises on a failed save; the flow reports it."""
+        asking again replaces it. Raises on a failed save; the flow reports it.
+
+        With the vault configured (#514) the answer is also appended to
+        `raphael/questions/<slug>-<hash>.md` — the record, append-only; the
+        outcome of that is `vault`, and a vault problem never fails the save."""
         if self.knowledge_connector is None:
-            return {"saved": False, "reason": "no knowledge store"}
-        await self.knowledge_connector.ingest_content(
-            url=rs.research_content_url(question),
-            title=f"Research: {question}"[:300],
-            source_type="research",
-            summary=answer[:500],
-            raw_text=rs.render_report(answer, sources),
-            tags=["research"],
-            metadata={"sources": len(sources)},
-        )
-        return {"saved": True}
+            out: dict = {"saved": False, "reason": "no knowledge store"}
+        else:
+            await self.knowledge_connector.ingest_content(
+                url=rs.research_content_url(question),
+                title=f"Research: {question}"[:300],
+                source_type="research",
+                summary=answer[:500],
+                raw_text=rs.render_report(answer, sources),
+                tags=["research"],
+                metadata={"sources": len(sources)},
+            )
+            out = {"saved": True}
+        vault = await self._save_to_vault(question, answer, sources)
+        if vault is not None:
+            out["vault"] = vault
+        return out
+
+    async def _save_to_vault(self, question: str, answer: str, sources: list[dict]) -> dict | None:
+        cfg = notes.config_from_settings(self.settings)
+        if not cfg.configured:
+            return None
+        ap = notes.question_append(question, rs.render_report(answer, sources), datetime.now())
+        try:
+            res = await notes.write(cfg, [ap], "raphael: research answer")
+        except notes.NotesError as exc:
+            activity.logger.warning("research_vault_save_failed err=%s", str(exc)[:200])
+            return {"status": "error", "error": str(exc)[:200]}
+        return {"status": res["status"], "path": ap.rel}
 
     @activity.defn
     async def research_task_problem(self, task_id: str) -> dict:

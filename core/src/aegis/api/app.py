@@ -75,6 +75,14 @@ async def lifespan(app: FastAPI):
     except Exception as exc:  # noqa: BLE001 — a bad key must not block boot
         logger.warning("books_deploy_key_install_failed", error=str(exc)[:200])
 
+    # The vault key (#514), the same way.
+    from aegis.services import notes as notes_service
+
+    try:
+        notes_service.install_deploy_key(settings)
+    except Exception as exc:  # noqa: BLE001 — a bad key must not block boot
+        logger.warning("notes_deploy_key_install_failed", error=str(exc)[:200])
+
     from aegis.seed import load_seeds
 
     await load_seeds(pool, settings.seed_dir)
