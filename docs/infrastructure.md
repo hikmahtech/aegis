@@ -2067,12 +2067,16 @@ record; the knowledge store is only its index (#514, spec
    few runs (`remaining` in the summary counts down).
 5. The daylog's knowledge rows reach the journal through `NotesBackfillFlow`,
    which runs weekly (`notes-backfill-weekly`, Sunday 04:47 UTC; the schedule
-   appears on its own through `schedule_sync`). The first run moves the old
-   entries; later runs file any day whose vault write failed and fell back to
-   its row. It uses the live markers, so a week with nothing missing writes
-   nothing. To run it now: `temporal workflow start --type NotesBackfillFlow
-   --task-queue aegis-main --workflow-id notes-backfill-journal --input
-   '{"agent_id": "raphael"}'`.
+   appears on its own through `schedule_sync`). It files any day whose vault
+   write failed and fell back to its knowledge row, and it uses the live
+   markers, so a week with nothing missing writes nothing. The schedule looks
+   only at rows filed in the last `since_days` (14) days: the pre-vault rows
+   are still in the store, and rereading them every week would put back a
+   block you deleted from an old journal note. To move every old row (the
+   first time, or after a vault outage longer than two weeks), start it by
+   hand, where `since_days` defaults to 0 (every row): `temporal workflow
+   start --type NotesBackfillFlow --task-queue aegis-main --workflow-id
+   notes-backfill-journal --input '{"agent_id": "raphael"}'`.
 
 Until step 2 every part reports `not_configured` and the daylog files its
 knowledge rows exactly as before.

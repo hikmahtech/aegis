@@ -347,14 +347,17 @@ activities:
   # into the vault journal, newest first. The daylog files a row only when its
   # vault write fails, so this is what puts such a day in the journal; a week
   # with nothing missing writes nothing (every write is marker-idempotent).
-  # Inert (not_configured) until the vault is configured. Sunday 04:47 UTC:
-  # minute :47 is odd, not a multiple of 5, not in the 3-58/5 stepper, and used
-  # by no other row.
+  # `since_days: 14` looks only at rows filed in the last two weeks (two weekly
+  # chances at each fallback day): the pre-vault rows are still in the store,
+  # and rereading them every week would put back a block the user deleted
+  # from an old journal note. Inert (not_configured) until the vault is
+  # configured. Sunday 04:47 UTC: minute :47 is odd, not a multiple of 5, not
+  # in the 3-58/5 stepper, and used by no other row.
   - slug: notes-backfill-weekly
     workflow_type: NotesBackfillFlow
     agent_id: raphael
     schedule_cron: "47 4 * * 0"
-    config: {limit: 1000}
+    config: {limit: 1000, since_days: 14}
     active: true
 
   # Phase 4 — nightly per-agent memory consolidation (caps each agent's

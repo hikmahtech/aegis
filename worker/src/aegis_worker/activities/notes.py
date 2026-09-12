@@ -48,6 +48,10 @@ UNINDEXED_PREFIXES = (f"{notes.RAPHAEL_DIR}/questions/",)
 
 # Newest first: a weekly run is for the recent days whose vault write failed
 # and fell back to their knowledge row; the old rows went in on the first run.
+# `$2` > 0 keeps only rows filed in the last `$2` days. The scheduled run sets
+# it, so a block the user deleted from an old journal note stays deleted:
+# the pre-vault rows are still in the store, and rereading them every week
+# would put the block back. 0 (a run started by hand) takes every row.
 _BACKFILL_SQL = """
 SELECT c.source_type, c.metadata,
        array_agg(k.chunk_text ORDER BY k.chunk_index)
@@ -55,6 +59,7 @@ SELECT c.source_type, c.metadata,
   FROM knowledge_content c
   LEFT JOIN knowledge_chunks k ON k.content_id = c.content_id
  WHERE c.source_type IN ('daylog', 'daylog_rollup')
+   AND ($2::int <= 0 OR c.ingested_at > now() - make_interval(days => $2::int))
  GROUP BY c.content_id, c.source_type, c.metadata
  ORDER BY COALESCE(c.metadata->>'date', c.metadata->>'start') DESC
  LIMIT $1
@@ -256,17 +261,24 @@ class NotesActivities:
     # ---------------------------------------------------------- backfill
 
     @activity.defn
-    async def notes_backfill_journal(self, limit: int = 1000) -> dict:
+    async def notes_backfill_journal(self, limit: int = 1000, since_days: int = 0) -> dict:
         """Write the daylog's knowledge rows into the matching journal notes,
         newest first. The markers are the ones the live daylog uses, so a day
         already in the journal is left alone and a run with nothing missing
-        writes nothing."""
+        writes nothing.
+
+        `since_days` > 0 looks only at rows filed in the last that many days —
+        the weekly schedule, which must not put back a block the user deleted
+        from an old note. 0 takes every row (a run started by hand, and any
+        call made before the parameter existed)."""
         cfg = self._cfg()
         if not cfg.configured:
             return {"status": "not_configured"}
         if self.db_pool is None:
             return {"status": "no_database"}
-        rows = await self.db_pool.fetch(_BACKFILL_SQL, max(1, int(limit)))
+        rows = await self.db_pool.fetch(
+            _BACKFILL_SQL, max(1, int(limit)), max(0, int(since_days or 0))
+        )
         appends: list[notes.Append] = []
         skipped = 0
         now = await user_now(self.db_pool)

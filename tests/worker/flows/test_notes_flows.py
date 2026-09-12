@@ -74,10 +74,10 @@ async def test_the_sync_flow_passes_its_batch_size():
 
 
 @pytest.mark.asyncio
-async def test_the_backfill_flow_passes_its_limit():
+async def test_the_backfill_flow_passes_its_limit_and_window():
     @activity.defn(name="notes_backfill_journal")
-    async def stub_backfill(limit: int) -> dict:
-        return {"status": "ok", "limit": limit}
+    async def stub_backfill(limit: int, since_days: int = 0) -> dict:
+        return {"status": "ok", "limit": limit, "since_days": since_days}
 
     async with (
         await WorkflowEnvironment.start_time_skipping() as env,
@@ -85,6 +85,11 @@ async def test_the_backfill_flow_passes_its_limit():
                activities=[stub_backfill]),
     ):
         out = await env.client.execute_workflow(
-            NotesBackfillFlow.run, NotesBackfillConfig(limit=7), id="nb-1", task_queue="tq"
+            NotesBackfillFlow.run, NotesBackfillConfig(limit=7, since_days=14), id="nb-1",
+            task_queue="tq",
         )
-    assert out == {"status": "ok", "limit": 7}
+        by_hand = await env.client.execute_workflow(
+            NotesBackfillFlow.run, NotesBackfillConfig(), id="nb-2", task_queue="tq"
+        )
+    assert out == {"status": "ok", "limit": 7, "since_days": 14}
+    assert by_hand["since_days"] == 0, "a run started by hand takes every row"

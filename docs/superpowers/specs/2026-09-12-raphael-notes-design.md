@@ -223,7 +223,11 @@ running it again writes nothing new.
 **Amended 2026-09-13** (audit): it runs weekly (`notes-backfill-weekly`,
 Sunday 04:47 UTC), not only by hand. The first run moved the old rows. With
 the vault configured the daylog files a row only when its vault write fails,
-so a later run is what puts such a day in the journal.
+so a later run is what puts such a day in the journal. The scheduled run
+looks only at rows filed in the last `since_days` (14, two weekly chances):
+the pre-vault rows are still in the store, and rereading them every week
+would put back a block the user deleted from an old journal note. A run
+started by hand defaults to `since_days` 0 and takes every row.
 
 ## 10. Testing
 
