@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from aegis_worker.flows.cert_radar import CertRadarConfig, CertRadarFlow
 from aegis_worker.flows.daily_briefing import DailyBriefingConfig, DailyBriefingFlow
+from aegis_worker.flows.hub_sweep import HubSweepConfig, HubSweepFlow
 from aegis_worker.flows.money_brief import MoneyBriefConfig, MoneyBriefFlow
 from aegis_worker.flows.month_close import MonthCloseConfig, MonthCloseFlow
 from aegis_worker.flows.receipt_ingest import (
@@ -198,3 +199,37 @@ def test_trading_desk_flow_mapper_resolves():
     assert workflow_cls is TradingDeskFlow
     assert isinstance(cfg, TradingDeskConfig)
     assert cfg.agent_id == "maou"
+
+
+def test_hub_sweep_mapper_reads_the_grouping_thresholds():
+    """`HubSweepConfig` carried these two fields and the builder ignored them,
+    so the only way to raise the bar on a noisy class was the verdict cache
+    (#448).
+
+    Falsifiable: drop either field from the builder and the row's value stops
+    arriving.
+    """
+    mapper = _ACTIVITY_TYPE_MAP["HubSweepFlow"]
+    workflow_cls, cfg = mapper(
+        _act(
+            "hub-sweep-5m",
+            "HubSweepFlow",
+            {"group_min_members": 5, "group_window_hours": 24, "fix_grace_hours": 3},
+        )
+    )
+    assert workflow_cls is HubSweepFlow
+    assert isinstance(cfg, HubSweepConfig)
+    assert cfg.group_min_members == 5
+    assert cfg.group_window_hours == 24.0
+    assert cfg.fix_grace_hours == 3.0
+
+
+def test_hub_sweep_mapper_leaves_the_service_defaults_alone():
+    """An empty row means "I have no opinion", and 0 is how the flow says that
+    to `hub_group` — never a literal threshold of zero, which would judge every
+    lone problem."""
+    mapper = _ACTIVITY_TYPE_MAP["HubSweepFlow"]
+    _, cfg = mapper(_act("hub-sweep-5m", "HubSweepFlow", {}))
+    assert cfg.group_min_members == 0
+    assert cfg.group_window_hours == 0.0
+    assert cfg.fix_verify_hours == 24.0

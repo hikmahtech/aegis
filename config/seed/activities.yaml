@@ -498,6 +498,10 @@ activities:
   # alert must stay clear before its problem resolves; `fix_grace_hours` (1) —
   # how long after the merge an occurrence is put down to the old code still
   # running. Raise the grace if your deploys land hours after a merge.
+  # Also (#448): `group_min_members` (3) and `group_window_hours` (72) — how
+  # many live problems of one class and kind make a cluster worth a billed
+  # judgement, and how far back "live" reaches. Raise the bar on a noisy
+  # class; either at 0 keeps the defaults.
   - slug: hub-sweep-5m
     workflow_type: HubSweepFlow
     agent_id: pandoras-actor

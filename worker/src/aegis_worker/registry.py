@@ -492,6 +492,13 @@ FLOWS: tuple[FlowSpec, ...] = (
         HubSweepFlow,
         lambda act: HubSweepConfig(
             agent_id=act["agent_id"],
+            # 0 keeps the `hub_group` service defaults (3 members, 72h).
+            group_min_members=_int(
+                act["config"], "group_min_members", HubSweepConfig.group_min_members
+            ),
+            group_window_hours=_float(
+                act["config"], "group_window_hours", HubSweepConfig.group_window_hours
+            ),
             fix_verify_hours=_float(
                 act["config"], "fix_verify_hours", HubSweepConfig.fix_verify_hours
             ),
