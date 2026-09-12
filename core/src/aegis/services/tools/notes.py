@@ -146,7 +146,7 @@ async def _exec_note_read(
     path: str,
     max_chars: Annotated[int, Field(ge=500, le=60000)] = 20000,
 ) -> str:
-    """Read one note from the user's Obsidian vault by its path, e.g. journal/12 Sep 26.md. Encrypted blocks are never shown.
+    """Read one note from the user's Obsidian vault by its path, e.g. journal/2026/09. Sep/12 Sep 26.md. Encrypted blocks are never shown.
 
     Args:
         path: The note's path inside the vault.

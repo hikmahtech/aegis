@@ -63,9 +63,9 @@ def test_do_inside_a_longer_format():
     assert notes.moment_format("dddd, MMMM Do YYYY", date(2026, 9, 1)) == "Tuesday, September 1st 2026"
 
 
-def test_a_weekly_note_renders_its_template_for_the_weeks_sunday():
-    """The note is named from its Sunday, so its template's dates are too — not
-    the ISO Monday the daylog passes in."""
-    ap = notes.journal_append("weekly", date(2026, 9, 7), "2026-W37", "body", datetime(2026, 9, 13, 21, 0))
-    assert ap.rel == "journal/W37 Sep 26.md"
-    assert ap.when is not None and ap.when.date() == date(2026, 9, 6)
+def test_a_weekly_note_renders_its_template_for_the_weeks_monday():
+    """The vault names and dates a week from its Monday (`W40 Oct 23` opens
+    `# Oct 02, 2023`), which is also the ISO Monday the daylog passes in."""
+    ap = notes.journal_append("weekly", date(2026, 9, 9), "2026-W37", "body", datetime(2026, 9, 13, 21, 0))
+    assert ap.rel == "journal/2026/09. Sep/W37 Sep 26.md"
+    assert ap.when is not None and ap.when.date() == date(2026, 9, 7)

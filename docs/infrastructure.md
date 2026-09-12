@@ -1954,17 +1954,32 @@ record; the knowledge store is only its index (#514, spec
   most `max_files` (300) per run. Encrypted meld-encrypt blocks are stripped
   before anything is stored. Notes rank above raw documents (`rank_boost`
   1.25). Progress is `settings.notes_index_state`.
-- **Writes, append-only:** only under `raphael/` (research answers in
+- **Writes, insert-only:** only under `raphael/` (research answers in
   `raphael/questions/`, and whatever Raphael writes with `note_write` /
-  `note_link`) and the daylog's journal notes. Nothing the user wrote is ever
-  changed; each section carries a hidden `%% aegis:<key> %%` marker, so a
-  re-run adds nothing twice.
-- **The journal:** with the vault configured, the nightly daylog appends to
-  `journal/DD MMM YY.md`, the weekly rollup to `journal/[W]ww MMM YY.md` and
-  the monthly one to `journal/<YYYY>/MM. MMM.md`, each under `## Raphael`. A
-  new note is rendered from the vault's own template. No `daylog` knowledge row
-  is filed then; if the vault write fails the row is filed as before and the
-  run reports `vault_error`.
+  `note_link`) and the daylog's journal notes. A write creates a note or
+  inserts one block into it; nothing the user wrote is ever changed or moved
+  (`is_one_insertion` refuses anything else). Each block carries a hidden
+  `%% aegis:<key> %%` marker, so a re-run adds nothing twice.
+- **The journal:** notes are filed as the vault files its own. With the vault
+  configured, the nightly daylog writes to
+  `journal/<YYYY>/<NN. Mon>/DD MMM YY.md`, the weekly rollup to the week's
+  `W<ww> MMM YY.md` in its Monday's month folder (the vault's weeks start on
+  Monday, with ISO numbers) and the monthly one to the month folder's own note,
+  `journal/<YYYY>/<NN. Mon>/<NN. Mon>.md`. If the user already has the day's or
+  week's note open at the `journal/` root, where periodic-notes creates it,
+  Raphael writes into that one instead. The entry is a `- #raphael day log`
+  bullet (`week in review`, `month in review`) with the text as an indented
+  outline under it: one bullet per prose paragraph, and in the daylog's
+  fallback format each `Label:` line with its items nested under it. It is
+  placed at the end of the note's own section: `Journal` for a day,
+  `Review` for a week or a month (an older month note's `Month Review`),
+  found by its heading text at any level. The section ends at the next
+  heading, a `---` line or a code fence, so the month note's folder card stays
+  last. A note without the section gets `## Journal` / `## Review` and the
+  block at its end. A new note is rendered from the vault's own
+  template, without its open checkboxes and without the empty `- ` placeholder
+  in that section. No `daylog` knowledge row is filed then; if the vault write
+  fails the row is filed as before and the run reports `vault_error`.
 - **Conflicts:** `obsidian-git` commits from the phone and laptop. A rejected
   push or a conflicting rebase drops Raphael's own unpushed commit, pulls fresh
   and retries once; a second failure is reported and nothing is kept. Raphael

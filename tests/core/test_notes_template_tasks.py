@@ -56,7 +56,7 @@ def test_a_new_journal_note_carries_no_open_tasks(tmp_path):
     assert "[ ]" not in text
     assert "### Todo" in text
     assert "- [x] a box the template ships ticked" in text
-    assert "## Raphael" in text and "Raphael's day." in text
+    assert "- #raphael day log" in text and "Raphael's day." in text
 
 
 @needs_git
@@ -72,7 +72,8 @@ def test_the_users_own_open_tasks_survive_an_append(tmp_path):
     ap = notes.journal_append("daily", day, day.isoformat(), "Raphael's day.", datetime(2026, 9, 12, 13, 10))
     notes.write_sync(v["cfg"], [ap], "journal")
 
-    text = remote_file(v, notes.daily_note_path(day))
+    # The user's own note for the day sits at the journal root, so it takes the entry.
+    text = remote_file(v, notes.daily_root_path(day))
     assert text.startswith(user_note), "append-only: the user's text must come first, unchanged"
     assert "- [ ] call the plumber" in text
     assert "Raphael's day." in text

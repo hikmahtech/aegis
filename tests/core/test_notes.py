@@ -26,21 +26,26 @@ from tests.notes_vault import (
 
 
 def test_journal_paths_match_the_vaults_own_notes():
-    # The vault's real last notes (2023-10-25): `25 Oct 23` and `W43 Oct 23`.
-    assert notes.daily_note_path(date(2023, 10, 25)) == "journal/25 Oct 23.md"
-    assert notes.weekly_note_path(date(2023, 10, 25)) == "journal/W43 Oct 23.md"
-    assert notes.daily_note_path(date(2026, 9, 12)) == "journal/12 Sep 26.md"
-    # An ISO week's Monday lands in the Sunday-started week holding it.
-    assert notes.weekly_note_path(date(2026, 9, 7)) == "journal/W37 Sep 26.md"
-    assert notes.monthly_note_path(date(2026, 9, 1)) == "journal/2026/09. Sep.md"
+    # Real notes in the vault: `2023/10. Oct/24 Oct 23`, `2023/10. Oct/W40 Oct 23`
+    # (a Monday-dated week) and the month folder's note `2023/08. Aug/08. Aug`.
+    assert notes.daily_note_path(date(2023, 10, 24)) == "journal/2023/10. Oct/24 Oct 23.md"
+    assert notes.weekly_note_path(date(2023, 10, 5)) == "journal/2023/10. Oct/W40 Oct 23.md"
+    assert notes.monthly_note_path(date(2023, 8, 1)) == "journal/2023/08. Aug/08. Aug.md"
+    assert notes.daily_note_path(date(2026, 9, 12)) == "journal/2026/09. Sep/12 Sep 26.md"
+    assert notes.weekly_note_path(date(2026, 9, 7)) == "journal/2026/09. Sep/W37 Sep 26.md"
+    assert notes.monthly_note_path(date(2026, 9, 1)) == "journal/2026/09. Sep/09. Sep.md"
+    # Where periodic-notes makes the day's (week's) note before the user files it.
+    assert notes.daily_root_path(date(2023, 10, 25)) == "journal/25 Oct 23.md"
+    assert notes.weekly_root_path(date(2023, 10, 25)) == "journal/W43 Oct 23.md"
 
 
-def test_week_one_is_the_week_that_holds_new_year():
-    # Sun 27 Dec 2026 – Sat 2 Jan 2027 holds 1 January, so it is week 1 of 2027,
-    # formatted from its Sunday — exactly what moment's `[W]ww MMM YY` gives.
-    assert notes.locale_week(date(2026, 12, 29)) == 1
-    assert notes.weekly_note_path(date(2026, 12, 29)) == "journal/W01 Dec 26.md"
-    assert notes.locale_week(date(2026, 12, 26)) == 52
+def test_weeks_start_on_monday_with_iso_numbers():
+    # Every weekly note in the vault since 2023 is dated from its Monday.
+    assert notes.week_start(date(2023, 10, 8)) == date(2023, 10, 2)  # a Sunday's week
+    assert notes.locale_week(date(2023, 10, 2)) == 40
+    # Mon 29 Dec 2025 opens ISO week 1 of 2026, and moment names it from that Monday.
+    assert notes.locale_week(date(2025, 12, 29)) == 1
+    assert notes.weekly_note_path(date(2026, 1, 1)) == "journal/2025/12. Dec/W01 Dec 25.md"
 
 
 def test_monthly_notes_do_not_collide_across_years():
@@ -48,10 +53,19 @@ def test_monthly_notes_do_not_collide_across_years():
 
 
 def test_is_journal_path():
-    assert notes.is_journal_path("journal/12 Sep 26.md")
-    assert notes.is_journal_path("journal/W37 Sep 26.md")
-    assert notes.is_journal_path("journal/2026/09. Sep.md")
-    assert not notes.is_journal_path("journal/2014/11. Nov/07 Nov 14.md")
+    assert notes.is_journal_path("journal/2026/09. Sep/12 Sep 26.md")
+    assert notes.is_journal_path("journal/2026/09. Sep/W37 Sep 26.md")
+    assert notes.is_journal_path("journal/2026/09. Sep/09. Sep.md")
+    assert notes.is_journal_path("journal/2014/11. Nov/07 Nov 14.md")
+    # The first layout's month note (loose in the year folder) and a folder note
+    # in the wrong folder are not journal notes.
+    assert not notes.is_journal_path("journal/2026/09. Sep.md")
+    assert not notes.is_journal_path("journal/2026/09. Sep/08. Aug.md")
+    # A root note is appended to when it exists, never created.
+    assert not notes.is_journal_path("journal/12 Sep 26.md")
+    assert notes.is_journal_root_path("journal/12 Sep 26.md")
+    assert notes.is_journal_root_path("journal/W37 Sep 26.md")
+    assert not notes.is_journal_root_path("journal/2026/09. Sep/12 Sep 26.md")
     assert not notes.is_journal_path("knowledge/dev/python.md")
 
 
@@ -104,9 +118,13 @@ def test_raphael_paths_are_writable(rel):
 
 
 def test_journal_paths_only_for_the_journal_writer():
+    filed = "journal/2026/09. Sep/12 Sep 26.md"
     with pytest.raises(notes.NotesPathError):
-        notes.check_path("journal/12 Sep 26.md")
-    assert notes.check_path("journal/12 Sep 26.md", journal=True)
+        notes.check_path(filed)
+    assert notes.check_path(filed, journal=True)
+    # A root note is never a path the writer may create.
+    with pytest.raises(notes.NotesPathError):
+        notes.check_path("journal/12 Sep 26.md", journal=True)
 
 
 @pytest.mark.parametrize(
@@ -227,20 +245,23 @@ def _journal_append(day: date, body: str = "Raphael's day.") -> notes.Append:
 def test_a_new_journal_note_is_rendered_from_the_template_and_pushed(vault):
     res = notes.write_sync(vault["cfg"], [_journal_append(date(2026, 9, 13))], "journal")
     assert res["status"] == "written"
-    text = _remote_file(vault, "journal/13 Sep 26.md")
+    text = _remote_file(vault, "journal/2026/09. Sep/13 Sep 26.md")
     assert text.startswith("---\n") and "# Sep 13, 2026" in text
-    assert "## Raphael" in text and "Raphael's day." in text
+    assert "- #raphael day log" in text and "\t- Raphael's day." in text
     assert notes.marker("daylog:2026-09-13") in text
     assert "{{" not in text
+    assert _remote_file(vault, "journal/13 Sep 26.md") == "", "a root note is never created"
 
 
 @needs_git
-def test_a_note_the_user_wrote_is_appended_to_never_rewritten(vault):
+def test_the_days_live_root_note_takes_the_entry_inside_its_journal(vault):
     before = _remote_file(vault, "journal/12 Sep 26.md")
-    notes.write_sync(vault["cfg"], [_journal_append(date(2026, 9, 12))], "journal")
+    res = notes.write_sync(vault["cfg"], [_journal_append(date(2026, 9, 12))], "journal")
+    assert res["outcomes"] == [{"path": "journal/12 Sep 26.md", "changed": True}]
     after = _remote_file(vault, "journal/12 Sep 26.md")
-    assert after.startswith(before)
-    assert after[len(before):].strip().startswith("## Raphael")
+    assert notes.is_one_insertion(before, after)
+    assert after.index("- the user wrote this") < after.index("- #raphael day log")
+    assert _remote_file(vault, "journal/2026/09. Sep/12 Sep 26.md") == ""
 
 
 @needs_git
@@ -285,7 +306,7 @@ def test_a_push_rejected_by_a_device_commit_is_retried_after_a_fresh_pull(vault,
     assert res["status"] == "written" and res["attempts"] == 2
     text = _remote_file(vault, "journal/12 Sep 26.md")
     assert "- written on the phone" in text
-    assert text.index("- written on the phone") < text.index("## Raphael")
+    assert text.index("- written on the phone") < text.index("- #raphael day log")
 
 
 @needs_git
@@ -301,7 +322,7 @@ def test_two_failed_pushes_report_and_leave_the_checkout_at_upstream(vault, monk
         notes.write_sync(cfg, [_journal_append(date(2026, 9, 14))], "journal")
     assert _remote_head(vault) == head
     assert _git("rev-parse", "HEAD", cwd=cfg.path).strip() == head
-    assert not (cfg.path / "journal/14 Sep 26.md").exists()
+    assert not (cfg.path / notes.daily_note_path(date(2026, 9, 14))).exists()
 
 
 def test_an_unconfigured_vault_refuses_to_write(tmp_path):

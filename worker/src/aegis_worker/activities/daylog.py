@@ -449,12 +449,14 @@ class DayLogActivities:
 
     @staticmethod
     def _journal_entry(day: str, text: str) -> str:
-        """One journal note as a rollup entry: Raphael's own section for the
-        day FIRST, then whatever else the note holds, within the clip.
+        """One journal note as a rollup entry: Raphael's own block for the day
+        FIRST, then whatever else the note holds, within the clip.
 
-        The section is appended at the END of the note, so clipping the note
-        from the top dropped Raphael's narrative whenever the template plus
-        the user's writing ran past the clip."""
+        The block sits inside the note's `## Journal`, after whatever the user
+        wrote there, so clipping the note from the top dropped Raphael's
+        narrative whenever the template plus the user's writing ran past the
+        clip. `split_section` finds it by its marker, in the current bullet
+        shape and in the first `## Raphael` one."""
         mine, rest = notes.split_section(text, notes.journal_key("daily", day))
         if not mine:
             return text[:_ROLLUP_ENTRY_CLIP]
