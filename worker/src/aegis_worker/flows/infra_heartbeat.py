@@ -10,6 +10,8 @@ Emits mostly on state transitions, never on unchanged steady state:
 - confirmed-stuck service converged          → resolved event on the problem
 - collect failed `fail_threshold` in a row   → HeartbeatCollectFailed alert
 - collect recovered                          → its resolved event
+- the ingress stopped answering from outside → IngressUnreachable alert (#492)
+- the ingress answers again                  → its resolved event
 
 Recovery is `_resolve()` → `HubActivities.ingest_alert(resolved=True)`: the
 hub closes the problem and the projector closes its task. The audit-log rows
@@ -115,6 +117,20 @@ class InfraHeartbeatConfig:
     # investigation. Lives in activities.config so schedule_sync propagates
     # edits live (≤5 min) without a redeploy.
     quiet_nodes: list[str] = field(default_factory=list)
+    # The URL the ingress canary gets, from OUTSIDE the container — the public
+    # or LAN route, so the request crosses the proxy a webhook crosses (#492).
+    # Empty disables the canary, which is what a fresh deployment gets: AEGIS
+    # cannot guess the operator's own hostname. Lives in activities.config so
+    # schedule_sync propagates edits live.
+    ingress_url: str = ""
+    # Consecutive failed probes before the alert is raised. Two, because one
+    # dropped request is what a rolling update of core looks like and this
+    # alert escalates; at a 2-minute cadence that is a 4-minute fuse.
+    ingress_fail_threshold: int = 2
+    # The status the probe must get back, when the status alone says who
+    # answered — 405 for a webhook path, which core gives a bare GET and a
+    # proxy that lost the route does not. 0 accepts anything under 500.
+    ingress_expect_status: int = 0
     # Hours a service must sit `confirmed`-stuck before the flow re-investigates
     # it (#138), and equally the minimum gap between two re-investigations of
     # the same service. 24h, matching the fuse an operator would expect for
@@ -214,6 +230,72 @@ class InfraHeartbeatFlow:
         cluster = routing.get("infra_cluster") or ""
         spawned = 0
 
+        # ── Ingress canary (#492) ──
+        # Before the collect branch, because the way in can be broken while the
+        # swarm is perfectly healthy — which is exactly what happened on
+        # 2026-09-11, and why nothing noticed for 3.5 hours.
+        #
+        # It takes `ingress_fail_threshold` consecutive failures to raise, for
+        # the same reason the collect path counts: a rolling update of core
+        # drops one request, and this alert escalates and pings Slack the
+        # moment it is raised. A deploy window would not save it either — the
+        # window is keyed on a service name and this problem's subject is the
+        # path, not a service. Two ticks is four minutes, which still finds a
+        # 3.5-hour outage inside the first five minutes.
+        #
+        # The flag is separate from the count and does two things the count
+        # cannot: it stops a second alert while the first is open, and it stops
+        # a resolve going out every two minutes for a problem that never
+        # existed.
+        ingress_failing = bool(prior.get("ingress_failing"))
+        ingress_fails = int(prior.get("ingress_fails") or 0)
+        if workflow.patched("ingress-canary") and config.ingress_url:
+            try:
+                probe = await workflow.execute_activity_method(
+                    HomelabActivities.probe_ingress,
+                    args=[config.ingress_url, config.ingress_expect_status],
+                    start_to_close_timeout=TIMEOUT_STANDARD,
+                    retry_policy=NO_RETRY,
+                )
+            except Exception as exc:  # noqa: BLE001
+                # A canary that cannot run must not take the swarm poll, the
+                # state write and the dead-man ping down with it — the tick
+                # matters more than the probe. Its siblings below are wrapped
+                # for the same reason.
+                workflow.logger.warning("heartbeat_ingress_probe_failed err=%s", str(exc)[:200])
+                probe = {"ok": True, "skipped": True}
+            ingress_fails = 0 if probe.get("ok") else ingress_fails + 1
+            if probe.get("skipped"):
+                ingress_fails = int(prior.get("ingress_fails") or 0)
+            if (
+                not probe.get("ok")
+                and not ingress_failing
+                and ingress_fails >= max(1, config.ingress_fail_threshold)
+            ):
+                reached = (
+                    f"answered {probe.get('status')}"
+                    if probe.get("status")
+                    else f"did not answer: {probe.get('error')}"
+                )
+                alert = build_heartbeat_alert(
+                    "IngressUnreachable",
+                    "ingress",
+                    cluster,
+                    "AEGIS cannot be reached from outside",
+                    f"{probe.get('url')} {reached}, {ingress_fails} checks in a row. "
+                    "Every inbound webhook — GitHub, Todoist, Alertmanager — is being "
+                    "dropped for as long as this lasts, and no outside monitor can tell "
+                    "AEGIS about it. Check the proxy in front of core and its route to "
+                    "the core service.",
+                    escalate=True,
+                )
+                if await self._spawn(alert):
+                    spawned += 1
+                ingress_failing = True
+            elif probe.get("ok") and ingress_failing:
+                await self._resolve("IngressUnreachable", "ingress", cluster)
+                ingress_failing = False
+
         # ── Collect failure path ──
         if not current.get("ok"):
             fail_count = int(prior.get("fail_count") or 0) + 1
@@ -231,11 +313,24 @@ class InfraHeartbeatFlow:
                     spawned += 1
             await workflow.execute_activity_method(
                 HomelabActivities.write_heartbeat_state,
-                args=[{**prior, "fail_count": fail_count}],
+                args=[
+                    {
+                        **prior,
+                        "fail_count": fail_count,
+                        "ingress_failing": ingress_failing,
+                        "ingress_fails": ingress_fails,
+                    }
+                ],
                 start_to_close_timeout=TIMEOUT_FAST,
                 retry_policy=FAST,
             )
-            return {"collect_ok": False, "alerts_spawned": spawned, "fail_count": fail_count}
+            return {
+                "collect_ok": False,
+                "alerts_spawned": spawned,
+                "fail_count": fail_count,
+                "ingress_failing": ingress_failing,
+                "ingress_fails": ingress_fails,
+            }
 
         # ── Success path: diff transitions ──
         prev_nodes: dict = prior.get("nodes") or {}
@@ -403,6 +498,11 @@ class InfraHeartbeatFlow:
                     "stuck": sorted(cur_stuck),
                     "confirmed": sorted(confirmed_now),
                     "fail_count": 0,
+                    # Written explicitly: this success-path write REPLACES the
+                    # state rather than merging into `prior`, so a key left out
+                    # here is a key the canary forgets every two minutes.
+                    "ingress_failing": ingress_failing,
+                    "ingress_fails": ingress_fails,
                 }
             ],
             start_to_close_timeout=TIMEOUT_FAST,
@@ -416,6 +516,8 @@ class InfraHeartbeatFlow:
         return {
             "collect_ok": True,
             "alerts_spawned": spawned,
+            "ingress_failing": ingress_failing,
+            "ingress_fails": ingress_fails,
             "quiet_notified": quiet_notified,
             "nodes_down": len(nodes_down),
             "nodes_recovered": len(nodes_recovered),

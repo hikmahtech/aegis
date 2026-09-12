@@ -58,6 +58,9 @@ DEFAULT_INFRA_ALERTNAMES: frozenset[str] = frozenset(
         "dockerservicedown",
         "servicedownprolonged",
         "heartbeatcollectfailed",
+        # The way in to AEGIS stopped answering from outside (#492). Infra by
+        # definition: it is the proxy or the route, never application code.
+        "ingressunreachable",
         # The monitoring stack and its database.
         "prometheusdown",
         "alertmanagerdown",

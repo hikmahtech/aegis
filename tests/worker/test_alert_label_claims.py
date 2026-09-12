@@ -140,10 +140,14 @@ def test_moving_names_to_the_db_loses_none_of_them():
     """The old built-in list = the generic defaults + what a deployment writes
     to its row. Writing back exactly the names that left the code restores
     the old classification, so a deploy that does it first changes nothing."""
+    # Alert classes AEGIS itself raises that did not exist at #498. They are
+    # not in the historical list by definition, so they are not evidence that
+    # anything was lost — which is all this test is about.
+    added_since = {"ingressunreachable"}  # #492
     moved = _PRE_498_INFRA_ALERTNAMES - iar.DEFAULT_INFRA_ALERTNAMES
-    assert iar.DEFAULT_INFRA_ALERTNAMES <= _PRE_498_INFRA_ALERTNAMES
+    assert iar.DEFAULT_INFRA_ALERTNAMES - added_since <= _PRE_498_INFRA_ALERTNAMES
     assert set(iar.merge({"extra_alertnames": sorted(moved)})["alertnames"]) == (
-        _PRE_498_INFRA_ALERTNAMES
+        _PRE_498_INFRA_ALERTNAMES | added_since
     )
     assert moved == {
         "dagster pipeline failure",

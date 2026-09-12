@@ -9,6 +9,7 @@ from __future__ import annotations
 from aegis_worker.flows.cert_radar import CertRadarConfig, CertRadarFlow
 from aegis_worker.flows.daily_briefing import DailyBriefingConfig, DailyBriefingFlow
 from aegis_worker.flows.hub_sweep import HubSweepConfig, HubSweepFlow
+from aegis_worker.flows.infra_heartbeat import InfraHeartbeatConfig, InfraHeartbeatFlow
 from aegis_worker.flows.money_brief import MoneyBriefConfig, MoneyBriefFlow
 from aegis_worker.flows.month_close import MonthCloseConfig, MonthCloseFlow
 from aegis_worker.flows.receipt_ingest import (
@@ -199,6 +200,43 @@ def test_trading_desk_flow_mapper_resolves():
     assert workflow_cls is TradingDeskFlow
     assert isinstance(cfg, TradingDeskConfig)
     assert cfg.agent_id == "maou"
+
+
+def test_infra_heartbeat_mapper_reads_the_canary_config():
+    """The canary is off until the row names a URL, so the row→config wiring is
+    the whole feature. Nothing pinned it: a typo in the key (`ingress-url`)
+    would have shipped green and the canary would simply never have run — the
+    passes-forever pattern this repo keeps getting caught by (#492).
+
+    Falsifiable: rename any of the three keys in the builder and this fails.
+    """
+    mapper = _ACTIVITY_TYPE_MAP["InfraHeartbeatFlow"]
+    workflow_cls, cfg = mapper(
+        _act(
+            "infra-heartbeat-2m",
+            "InfraHeartbeatFlow",
+            {
+                "ingress_url": "  https://aegis.example.com/api/webhooks/github  ",
+                "ingress_fail_threshold": 3,
+                "ingress_expect_status": 405,
+            },
+        )
+    )
+    assert workflow_cls is InfraHeartbeatFlow
+    assert isinstance(cfg, InfraHeartbeatConfig)
+    assert cfg.ingress_url == "https://aegis.example.com/api/webhooks/github"
+    assert cfg.ingress_fail_threshold == 3
+    assert cfg.ingress_expect_status == 405
+
+
+def test_infra_heartbeat_mapper_ships_the_canary_off():
+    """A fork cannot be given the operator's hostname, so an empty row means no
+    probe at all — not a probe of something guessed."""
+    mapper = _ACTIVITY_TYPE_MAP["InfraHeartbeatFlow"]
+    _, cfg = mapper(_act("infra-heartbeat-2m", "InfraHeartbeatFlow", {}))
+    assert cfg.ingress_url == ""
+    assert cfg.ingress_fail_threshold == 2
+    assert cfg.ingress_expect_status == 0
 
 
 def test_hub_sweep_mapper_reads_the_grouping_thresholds():
