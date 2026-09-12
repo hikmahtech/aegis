@@ -163,10 +163,7 @@ class DailyBriefingFlow:
 
         # Once a month the research agent's briefing names the feeds no prompt
         # used in 90 days, with the one-line way to drop them (#511). Keyed on
-        # the workflow's own clock, so a replay decides the same. The patch is
-        # deprecated (#533): its marker is still recorded on every run, before
-        # the date check, where `patched` used to be evaluated.
-        workflow.deprecate_patch("briefing-feed-review")
+        # the workflow's own clock, so a replay decides the same.
         if config.feed_review_day in (0, workflow.now().day):
             try:
                 owner = await workflow.execute_activity_method(

@@ -23,13 +23,6 @@ _ACT_TIMEOUT = timedelta(seconds=60)
 _SCAN_TIMEOUT = timedelta(seconds=120)
 _SCORE_TIMEOUT = timedelta(seconds=180)
 
-# Deprecated patches (#533): the load_tracked_topics call added by #508 and
-# step 5's switch from an Inbox capture per item to the topic hub (#513).
-# Every scan that started before them has finished, so only the new path is
-# left. The markers stay one more deploy, so a scan started on the patched
-# code still replays; then the calls and these ids go.
-_PATCH_TRACKED_TOPICS = "intel-tracked-topics"
-_PATCH_TOPICS = "research-hub-513"
 # Attaching can raise a topic's task, which is a Todoist round trip.
 _ATTACH_TIMEOUT = timedelta(seconds=120)
 
@@ -71,7 +64,6 @@ class IntelligenceScanFlow:
         # 0. Topics tracked from chat (#508). `track_topic` wrote them to a
         # settings row that nothing read, so "added" changed no scan. A failed
         # read is not a failed scan: it runs on its configured topics and says so.
-        workflow.deprecate_patch(_PATCH_TRACKED_TOPICS)
         try:
             tracked = await workflow.execute_activity(
                 "load_tracked_topics",
@@ -210,7 +202,6 @@ class IntelligenceScanFlow:
         # in 30 days, each closed by clarify on arrival. The hub keeps them
         # now and a topic raises ONE task when its round earns it; the
         # knowledge store and the briefing still get every item (step 6).
-        workflow.deprecate_patch(_PATCH_TOPICS)
         try:
             attached = await workflow.execute_activity(
                 "attach_topic_items",

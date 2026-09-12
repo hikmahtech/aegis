@@ -46,10 +46,6 @@ with workflow.unsafe.imports_passed_through():
         TIMEOUT_STANDARD,
     )
 
-# Deprecated patch (#533) for the journal write added by #514. Every run that
-# started before it has finished, so only the journal path is left. The
-# marker stays one more deploy, then the calls and this id go.
-_PATCH_VAULT = "daylog-vault-514"
 _JOURNAL_TIMEOUT = timedelta(seconds=NOTES_WRITE_TIMEOUT_S)
 _JOURNALED = ("written", "exists")
 
@@ -155,7 +151,6 @@ class DayLogFlow:
         # the day, so no knowledge row is filed; anything else falls through to
         # the knowledge store exactly as before.
         vault_error = None
-        workflow.deprecate_patch(_PATCH_VAULT)
         vault = await self._journal("daily", target_date, target_date, narrative)
         if vault.get("status") in _JOURNALED:
             path = str(vault.get("path") or "")
@@ -314,7 +309,6 @@ class DayLogFlow:
 
         # The week's or month's journal note first (#514), as for a day.
         vault_error = None
-        workflow.deprecate_patch(_PATCH_VAULT)
         vault = await self._journal(config.mode, start, label, narrative)
         if vault.get("status") in _JOURNALED:
             return {
