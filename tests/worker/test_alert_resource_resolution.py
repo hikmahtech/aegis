@@ -307,25 +307,30 @@ async def test_resolve_resource_kg_low_confidence_falls_through():
     assert result["source"] == "llm"
 
 
-async def test_the_resolver_returns_only_what_it_matched():
-    """No "phase 2" expansion: what comes back is the LLM's picks and nothing
-    appended.
+async def test_only_coding_enabled_repositories_are_ever_candidates():
+    """The gate that made the phase-2 expansion dead code, pinned.
 
-    There used to be a rule here — a connector or service match also
-    investigates the infra repo — and it could not run. Both candidate queries
-    are gated on `kind = 'repository' AND coding_enabled = 'true'` (the #35
-    allow-list that keeps an unrelated resource out of a live shell-and-PR
-    run), so no connector or service is ever among the rows, and the test that
-    used to cover it passed only because a mocked `fetch` returned a row the
-    real SQL cannot. Deleted in #505 rather than made reachable: an infra alert
-    already investigates the infra repo through `resolve_infra_resource`, and
-    this path runs with `allow_fix=True`, so admitting connectors would put a
-    non-allowlisted repo into a fix-capable coding run.
+    `resolve_alert_resource` selects its candidates with
+    `kind = 'repository' AND coding_enabled = 'true'` — the #35 allow-list that
+    keeps an unrelated resource out of a live shell-and-PR run. That is why the
+    deleted expansion could never fire: no connector and no service is ever
+    among the rows, so a branch testing for those kinds was unreachable from the
+    day the allow-list landed (#505).
 
-    Falsifiable: append anything to `enriched` and the list below grows.
+    It is pinned HERE, on the query, rather than by asserting the resolver
+    returns one resource — that assertion passes with the expansion restored,
+    because the LLM stub picks a repository and the old branch would not have
+    fired either. Widening this gate is the only edit that could bring the dead
+    branch back to life, so the gate is what the test has to watch.
     """
+    seen: list[str] = []
+
+    async def _fetch(sql, *args):
+        seen.append(sql)
+        return SAMPLE_RESOURCES
+
     mock_db = AsyncMock()
-    mock_db.fetch.return_value = SAMPLE_RESOURCES
+    mock_db.fetch = _fetch
     mock_db.fetchrow = _routing_fetchrow("example/infra-gitops", SAMPLE_RESOURCES[2])
 
     mock_llm = AsyncMock()
@@ -342,8 +347,14 @@ async def test_the_resolver_returns_only_what_it_matched():
     act = AlertActivities(db_pool=mock_db, llm_client=mock_llm, knowledge_connector=AsyncMock())
     result = await ActivityEnvironment().run(act.resolve_alert_resource, SAMPLE_ALERT)
 
-    # The infra repo (res-003) is configured and present in the rows, and is
-    # still not added.
+    resource_queries = [q for q in seen if "FROM resources" in q]
+    assert resource_queries, "the resolver asked for no candidates at all"
+    for query in resource_queries:
+        assert "kind = 'repository'" in query
+        assert "metadata->>'coding_enabled' = 'true'" in query
+
+    # And nothing is appended to what the LLM picked: the infra repo is
+    # configured and present in the rows, and still does not appear.
     assert [r["resource_id"] for r in result["resources"]] == ["res-001"]
 
 

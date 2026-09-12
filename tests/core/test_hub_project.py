@@ -1413,6 +1413,38 @@ async def test_a_recurrence_is_not_held_back(db_pool, inbox, todoist):
     assert (await project(db_pool, r.problem_id, now=back))["created"] is True
 
 
+async def test_a_watchdog_finding_does_not_wait(db_pool, inbox, todoist):
+    """`flow_health` resolves its own findings, and was in the settle set for
+    that reason — which was wrong. Its sweep runs every 30 minutes, so a
+    three-minute window cannot observe a blip it would clear; the window could
+    only delay the task. The producers that wait are the two outside AEGIS that
+    re-check on a scale of seconds.
+
+    Falsifiable: put `flow_health` back in `_SELF_CLEARING_SOURCES` and this
+    task arrives three minutes late.
+    """
+    await _settle(db_pool, {})
+    s = _subject()
+    r = await ingest_event(
+        db_pool,
+        Event(
+            source="flow_health",
+            external_id=f"{s}@stale",
+            kind="occurrence",
+            title=f"{s} has not succeeded in 3 hours",
+            klass="flow_stale",
+            subject=s,
+            subject_kind="flow",
+            severity="warning",
+            payload={"description": "The watchdog found no successful run."},
+            occurred_at=NOW,
+        ),
+        now=NOW,
+    )
+
+    assert (await project(db_pool, r.problem_id, now=NOW + timedelta(seconds=1)))["created"] is True
+
+
 async def test_only_a_signal_that_can_clear_itself_waits(db_pool, inbox, todoist):
     """A money finding is a judgement, not an alert: nothing will send its
     resolution, and no amount of waiting makes it truer. So the window is

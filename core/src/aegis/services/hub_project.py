@@ -81,18 +81,20 @@ COLLAPSE_WINDOW = timedelta(minutes=30)
 PROJECTED_STATUSES = frozenset(
     {"open", "investigating", "waiting_human", "fixing", "verifying", "resolved"}
 )
-# The four alert producers: something outside AEGIS fired, and the same
-# producer sends a resolution when it recovers, so what they raise may turn out
-# to have been a blip. Only these wait out a settle window before earning a
-# task (#537).
+# The two producers OUTSIDE AEGIS that send their own resolution: a monitoring
+# stack and the swarm heartbeat both re-check on a scale of seconds, so what
+# they raise may turn out to have been a blip, and only these wait out a settle
+# window before earning a task (#537).
 #
-# Every other source projects on sight. Not because none of them can pass on
-# their own — a watchdog finding (`social`, `drift`, `expiry`, `llm_governor`)
-# resolves itself when the next sweep stops finding it — but because those
-# sweeps run on their own cadence and have already decided the thing is worth
-# reporting, and because the money, research and manual sources are judgements
-# that no amount of waiting makes truer.
-_SELF_CLEARING_SOURCES = frozenset({"alertmanager", "heartbeat", "flow_health", "delivery"})
+# Every other source projects on sight, including the watchdogs that also
+# resolve their own findings (`flow_health`, `delivery`, `social`, `drift`,
+# `expiry`, `llm_governor`). They were in this set at first, which was a
+# mistake of kind rather than of degree: those sweeps run every 30 minutes or
+# hourly, so a three-minute window cannot observe a blip they would clear — it
+# can only delay the task. And they have already decided the thing is worth
+# reporting before the hub hears about it at all. The money, research and manual
+# sources are judgements that no amount of waiting makes truer.
+_SELF_CLEARING_SOURCES = frozenset({"alertmanager", "heartbeat"})
 _BLOCK_RE = re.compile(r"<!-- aegis:problem [^>]*-->.*?<!-- /aegis:problem -->", re.S)
 _HISTORY_KINDS = frozenset({"investigation", "plan", "session_note"})
 # A plan of one step is a sentence, not a plan; more than this and the
@@ -746,6 +748,13 @@ async def project(
         # `first_seen_at` alone, so a problem that blipped, resolved untasked,
         # and came back is already past its window and projects at once — the
         # second episode is the evidence the first one lacked.
+        #
+        # That holds within `REOPEN_WINDOW` (24h), which is the whole of what it
+        # claims: a return after that is a `rollover`, a fresh problem with a
+        # fresh `first_seen_at`, so it waits out the window like any first
+        # sighting. "A return within a day of the resolve is a pattern" is the
+        # rule. Measuring age from the CURRENT episode instead would make a
+        # service that flaps every three minutes invisible forever.
         #
         # The investigation is untouched — Pandora diagnoses and posts its
         # Slack card immediately. Only the human's chore waits.

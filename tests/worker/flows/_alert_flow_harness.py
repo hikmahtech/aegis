@@ -138,6 +138,13 @@ async def stub_record_investigation(inp: dict) -> dict:
     return {"recorded": True, "status_changed": True}
 
 
+@activity.defn(name="project_problem")
+async def stub_project_problem(problem_id: str) -> dict:
+    """The flow asks for this once its verification delay is over, to learn a
+    task the settle window deferred (#537). Here the task already exists."""
+    return {"task_id": "task-1", "skipped": ""}
+
+
 @activity.defn(name="mute_problem")
 async def stub_mute_problem(problem_id: str, hours: float, by: str = "gate2") -> dict:
     return {"muted_until": "2026-09-12T12:00:00+00:00"}
@@ -281,6 +288,7 @@ STUBS = [
     stub_ingest_alert,
     stub_problem_status,
     stub_record_investigation,
+    stub_project_problem,
     stub_mute_problem,
     stub_verification_delay,
     stub_resolve_alert_resource,

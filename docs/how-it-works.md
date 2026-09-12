@@ -483,9 +483,12 @@ regardless of where the alert came from:
   A redirect that lands somewhere else fails: an identity proxy would otherwise
   send the probe to its own login page, which answers 200 forever whether or
   not the origin is alive. So aim it at a path that proxy will not challenge —
-  a webhook path is ideal, and `ingress_expect_status: 405` then pins the
-  answer only core gives, which also catches a proxy serving its own 404 for a
-  route it has lost. It takes `ingress_fail_threshold` failures in a row
+  `/api/webhooks/ping` is the one to use: it answers **204**, which no proxy
+  invents on its own, so `ingress_expect_status: 204` catches a proxy serving
+  its own 404 for a route it has lost. (A plain webhook path answers 404 to a
+  bare GET, because the admin SPA's catch-all claims every unmatched `/api/`
+  GET before Starlette can say 405 — and 404 is exactly what a routeless proxy
+  says too, so it asserts less.) It takes `ingress_fail_threshold` failures in a row
   (default 2, so a 4-minute fuse) because one dropped request is what a rolling
   update of core looks like and this alert escalates. Empty `ingress_url`
   disables the whole thing.

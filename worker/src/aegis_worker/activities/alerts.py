@@ -1512,7 +1512,7 @@ class AlertActivities:
 
     @activity.defn
     async def resolve_alert_resource(self, alert: dict) -> dict:
-        """Map an alert to matching resources using KG cache then LLM, with rule-based expansion.
+        """Map an alert to matching resources using the KG cache, then the LLM.
 
         Returns backward-compatible top-level fields plus a 'resources' list for multi-repo
         investigation. source: "label_claim" | "knowledge" | "sentry_project" |

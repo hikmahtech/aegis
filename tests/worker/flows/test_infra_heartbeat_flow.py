@@ -565,7 +565,9 @@ async def test_a_probe_that_cannot_run_does_not_lose_the_tick():
 
     Falsifiable: unwrap the probe call and this whole tick raises.
     """
-    _reset(_HEALTHY)
+    # Prior count is 1, not 0: with 0 the "untouched, not reset" claim below
+    # could not fail, which is how the defect in the next test hid here too.
+    _reset(_HEALTHY, {"nodes": {}, "stuck": [], "confirmed": [], "ingress_fails": 1})
     _state["probe"] = RuntimeError("worker restarted mid-probe")
 
     result = await _run(_CANARY)
@@ -574,7 +576,56 @@ async def test_a_probe_that_cannot_run_does_not_lose_the_tick():
     assert result["alerts_spawned"] == 0
     assert _calls["pinged"] == 1
     # The count is untouched, not reset: nothing was learned either way.
-    assert _calls["written"][0]["ingress_fails"] == 0
+    assert _calls["written"][0]["ingress_fails"] == 1
+
+
+async def test_a_probe_that_cannot_run_never_resolves_an_open_outage():
+    """A failed probe activity is not evidence of recovery.
+
+    The first version of the wrapper synthesised `{"ok": True}` so the tick
+    would survive, and that sailed straight into the recovery branch: the hub
+    resolved a live outage nobody had proved fixed, the projector closed its
+    task, and the next failing tick raised the whole thing again as new — a
+    fresh escalating alert and a fresh Slack ping per worker hiccup.
+
+    Falsifiable: make the exception handler set `{"ok": True}` again and the
+    resolve below reappears.
+    """
+    prior = {
+        "nodes": {},
+        "stuck": [],
+        "confirmed": [],
+        "ingress_failing": True,
+        "ingress_fails": 3,
+    }
+    _reset(_HEALTHY, prior)
+    _state["probe"] = RuntimeError("activity not registered after a deploy")
+
+    result = await _run(_CANARY)
+
+    assert _calls["resolved"] == [], "a probe that never ran closed the outage"
+    assert result["ingress_failing"] is True
+    assert _calls["written"][0]["ingress_fails"] == 3
+    assert result["alerts_spawned"] == 0
+
+
+async def test_the_alert_keeps_the_reason_even_when_a_status_came_back():
+    """A redirect off the host answers 200 and is still a fault, so "answered
+    200" alone would send a human looking for the wrong thing."""
+    _reset(_HEALTHY)
+    _state["probe"] = {
+        "url": _CANARY.ingress_url,
+        "ok": False,
+        "status": 200,
+        "ms": 40,
+        "error": "redirected to login.example.net, not aegis.example.com",
+    }
+
+    await _run(_CANARY)
+
+    body = _calls["spawned"][0]["description"]
+    assert "login.example.net" in body
+    assert "answered 200" in body
 
 
 async def test_the_expected_status_is_passed_to_the_probe():

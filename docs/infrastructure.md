@@ -815,10 +815,10 @@ curl -sS -X PUT "$AEGIS_URL/api/admin/infra-alert-routing" \
   your setup goes here. Names are compared lowercased.
 - `repo` is the `owner/name` (the resource's GitHub repo) that infra alerts
   are investigated in. Unset means infra alerts get an LLM-only investigation.
-  It is also the repo that a connector or service alert expands to, on the
-  grounds that the config which deploys a thing is as likely to be at fault as
-  the thing. Before #505 that expansion looked for a repo whose path ended in
-  `infra-gitops`, so it never fired for anyone who named theirs otherwise.
+  There is no expansion to it from an application alert: the candidate query
+  admits only coding-enabled repositories (#35), so a connector or a service is
+  never among the picks. A rule that claimed otherwise was deleted in #505 —
+  it had been unreachable since that allow-list landed.
 - `platform_hint` is one or two sentences saying what the cluster IS and how to
   read it. The instructions AEGIS puts in front of an infra investigation name
   no orchestrator, because it has no way to know whether you run Swarm, k8s,
