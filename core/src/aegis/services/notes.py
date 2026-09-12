@@ -431,16 +431,32 @@ def append_text(existing: str | None, ap: Append, new_note: str = "") -> str | N
     return base + _section(ap)
 
 
+# An unticked task line: `- [ ] …` (or a `*`/`+` bullet), indented or not.
+_OPEN_TASK_RE = re.compile(r"^[ \t]*[-*+] \[ \][^\n]*(?:\n|$)", re.M)
+
+
+def drop_open_tasks(text: str) -> str:
+    """`text` without its unticked task lines. The vault's templates carry
+    prompts for the person filling the day in ("- [ ] #admin Plan the day").
+    In a note Raphael creates they are to-dos nobody can do: the day has
+    already passed, and obsidian-checklist-plugin lists every open box in the
+    vault, so the 2026-09-12 backfill added 125 of them. Ticked boxes, headings
+    and everything else in the template stay."""
+    return _OPEN_TASK_RE.sub("", text)
+
+
 def _new_note_text(cfg: NotesConfig, ap: Append) -> str:
     """What a note starts with when Raphael creates it: the vault's own
     template for a journal note (read at write time, so edits to the template
-    apply), else a `# title` line."""
+    apply) without its open tasks, else a `# title` line. A note that already
+    exists is never touched here — only the text of a brand-new note."""
     stem = Path(ap.rel).stem
     if ap.template:
         tpl = cfg.path / TEMPLATES[ap.template]
         if tpl.is_file():
             when = ap.when or datetime.now()
-            return render_template(tpl.read_text("utf-8"), title=stem, when=when)
+            rendered = render_template(tpl.read_text("utf-8"), title=stem, when=when)
+            return drop_open_tasks(rendered)
         return f"# {stem}\n"
     title = clean_body(ap.title or stem).replace("\n", " ")
     return f"# {title}\n"
