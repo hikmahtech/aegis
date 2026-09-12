@@ -41,6 +41,9 @@ class DailyBriefingConfig:
     """
 
     agent_id: str = "sebas"
+    # Day of the month the research agent's briefing reviews its feeds
+    # (#511); 0 = every run (tests and a manual trigger).
+    feed_review_day: int = 1
 
 
 @workflow.defn
@@ -157,6 +160,34 @@ class DailyBriefingFlow:
                     workflow.logger.warning("briefing_alert_digest_skipped_no_infra_agent")
         except Exception:
             pass
+
+        # Once a month the research agent's briefing names the feeds no prompt
+        # used in 90 days, with the one-line way to drop them (#511). Keyed on
+        # the workflow's own clock, so a replay decides the same. `patched` is
+        # evaluated first on every run, before the date check.
+        if workflow.patched("briefing-feed-review") and config.feed_review_day in (
+            0,
+            workflow.now().day,
+        ):
+            try:
+                owner = await workflow.execute_activity_method(
+                    AgentRegistryActivities.resolve_agents,
+                    args=[["research"]],
+                    start_to_close_timeout=TIMEOUT_FAST, retry_policy=NO_RETRY,
+                )
+                if owner.get("research") == config.agent_id:
+                    line = await workflow.execute_activity_method(
+                        BriefingActivities.feed_review_line,
+                        start_to_close_timeout=TIMEOUT_FAST, retry_policy=NO_RETRY,
+                    )
+                    if line:
+                        await workflow.execute_activity_method(
+                            DeliveryActivities.send_message,
+                            args=[config.agent_id, line, 0],
+                            start_to_close_timeout=TIMEOUT_FAST, retry_policy=NO_RETRY,
+                        )
+            except Exception:
+                workflow.logger.warning("briefing_feed_review_failed")
 
         target_date = workflow.now().strftime("%Y-%m-%d")
         try:

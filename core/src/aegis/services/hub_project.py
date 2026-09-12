@@ -56,6 +56,9 @@ from aegis.services.agents import resolve_tag
 from aegis.services.books import parse_kv
 from aegis.services.hub import (
     LIVE_STATUSES,
+    QUESTION_CLASS,
+    TASK_SUBJECT_KIND,
+    TOPIC_CLASS,
     _active_suppression,
     _aware,
     get_problem,
@@ -124,9 +127,28 @@ _INFRA_OWNER = _Owner(SOURCE_TAG, "infra", _FALLBACK_LABEL)
 #
 # The key is spelled here, not imported: `statement_findings.SOURCE` is the
 # same word, but that module imports this one.
+#
+# The research agent's two kinds (#513), both in the Inbox, both `@next`:
+#
+# * `#research`: a tracked topic's round that crossed its threshold, or a
+#   `#research` task's question. Raphael can work these, so the agent sweep
+#   may run the `research` verb on them.
+# * `#feeds`: a feed that stopped fetching or publishing. The user fixes or
+#   drops it; `agent_task.EXCLUDED_LABELS` keeps the sweep off it.
+#
+# Clarify treats both as hub-owned (`activities/clarify.py`), or its
+# `#research → reference` rule would file a topic task as a reference and
+# complete it.
+RESEARCH_SOURCE_TAG = "#research"
+FEEDS_SOURCE_TAG = "#feeds"
 _OWNER_BY_SOURCE = {
     "money": _Owner(MONEY_SOURCE_TAG, "finance", "@maou", ("@next",), "personal"),
+    "research": _Owner(RESEARCH_SOURCE_TAG, "research", "@raphael", ("@next",)),
+    "feeds": _Owner(FEEDS_SOURCE_TAG, "research", "@raphael", ("@next",)),
 }
+# Every tag a projected task can carry. The agent lane needs a verb decision
+# for each (`test_agent_task_verbs`).
+HUB_SOURCE_TAGS = frozenset({SOURCE_TAG, *(o.source_tag for o in _OWNER_BY_SOURCE.values())})
 
 
 def _ts(value: Any) -> str:
@@ -336,8 +358,11 @@ async def ensure_problem_for_task(
                 # comments all landed on the first task. The repo is context,
                 # so it rides in the payload.
                 subject=f"task-{task_id}",
-                subject_kind="repo",
-                klass="manual",
+                # A `#research` task (#513) is a question, Raphael's: class
+                # `question`, kind `task` — a kind the hub never groups. The
+                # `@code` path keeps `manual` on the repo kind, as before.
+                subject_kind=TASK_SUBJECT_KIND if source == "research" else "repo",
+                klass=QUESTION_CLASS if source == "research" else "manual",
                 severity="info",
                 payload={"task_id": task_id, "github_repo": subject},
             ),
@@ -580,6 +605,25 @@ def _history_text(kind: str, payload: dict[str, Any]) -> str:
     return f"{head}: {text}" if text else head
 
 
+async def _topic_digest(pool: asyncpg.Pool, problem_id: str, limit: int = 10) -> str:
+    """What a topic's round collected, newest first, as the task's description
+    (#513): one line per article, linked."""
+    rows = await pool.fetch(
+        "SELECT payload FROM problem_events "
+        "WHERE problem_id = $1::uuid AND kind = 'occurrence' AND payload->>'item' = 'true' "
+        "ORDER BY occurred_at DESC, id DESC LIMIT $2",
+        problem_id,
+        limit,
+    )
+    lines = []
+    for r in rows:
+        item = r["payload"] or {}
+        title = str(item.get("title") or item.get("url") or "").strip()[:160]
+        url = str(item.get("url") or "").strip()
+        lines.append(f"- [{title}]({url})" if url else f"- {title}")
+    return "New on this topic:\n" + "\n".join(lines) if lines else ""
+
+
 async def project(
     pool: asyncpg.Pool,
     problem_id: str,
@@ -635,6 +679,16 @@ async def project(
         task_id = real
         await _set_task(pool, problem_id, task_id)
 
+    if not task_id and p["class"] == TOPIC_CLASS and not meta.get("attention"):
+        # A tracked topic's round of news earns a task only once it holds
+        # enough items (`research_topics.ATTENTION_ITEMS`, #513). Until then it
+        # lives in the hub and Raphael's briefing. Its events are marked seen,
+        # so the sweep does not come back for them; the task, when the round
+        # crosses its threshold, lists the round's items itself.
+        meta.update(projected_event_id=int(latest_event_id), pending_occurrences=0)
+        await _save_meta(pool, problem_id, meta)
+        return {"problem_id": problem_id, "skipped": "below_attention"}
+
     if not task_id and p["status"] == "resolved":
         # It came and went before it earned a task: seen only inside a deploy
         # window, or its inline projection failed and it recovered before the
@@ -665,11 +719,16 @@ async def project(
     )
 
     if not task_id:
-        latest = await pool.fetchval(
-            "SELECT payload->>'description' FROM problem_events "
-            "WHERE problem_id = $1::uuid AND kind = 'occurrence' ORDER BY id DESC LIMIT 1",
-            problem_id,
-        )
+        if p["class"] == TOPIC_CLASS:
+            # A topic's task is about its round, not its latest article: list
+            # what the round collected (#513).
+            latest = await _topic_digest(pool, problem_id)
+        else:
+            latest = await pool.fetchval(
+                "SELECT payload->>'description' FROM problem_events "
+                "WHERE problem_id = $1::uuid AND kind = 'occurrence' ORDER BY id DESC LIMIT 1",
+                problem_id,
+            )
         description = merge_block((latest or "")[: _DESCRIPTION_CAP - len(block) - 2], block)
         # ponytail: every money problem goes to the personal project. Routing a
         # hikmah instrument to the hikmah project needs the chart's
@@ -797,7 +856,11 @@ async def project(
     ):
         comments.insert(
             0,
-            f"⚠️ {pending} more occurrence{'s' if pending != 1 else ''} "
+            # A topic's occurrences are articles, not failures (#513).
+            f"📰 {pending} new item{'s' if pending != 1 else ''} on this topic; "
+            f"latest {_ts(p['last_seen_at'])}."
+            if p["class"] == TOPIC_CLASS
+            else f"⚠️ {pending} more occurrence{'s' if pending != 1 else ''} "
             f"({p['occurrences']} in total); last seen {_ts(p['last_seen_at'])}.",
         )
         pending = 0
@@ -880,6 +943,10 @@ async def project_pending(
         "SELECT id::text AS id FROM problems p "
         "WHERE p.closed_at IS NULL AND p.status = ANY($1::text[]) "
         "  AND (p.muted_until IS NULL OR p.muted_until <= $2 OR p.status = 'resolved') "
+        # A topic's round below its threshold has nothing to project (#513):
+        # left in, a busy day's news would crowd real problems out of LIMIT.
+        "  AND NOT (p.class = $4 AND p.todoist_task_id IS NULL "
+        "           AND COALESCE(p.metadata->>'attention', '') <> 'true') "
         "  AND ((p.todoist_task_id IS NULL AND p.status <> 'resolved') "
         "       OR p.todoist_task_id LIKE 'item-%' "
         "       OR COALESCE((p.metadata->>'pending_occurrences')::int, 0) > 0 "
@@ -889,6 +956,7 @@ async def project_pending(
         sorted(PROJECTED_STATUSES),
         now,
         limit,
+        TOPIC_CLASS,
     )
     out = []
     for r in rows:
@@ -939,7 +1007,7 @@ async def reconcile_completed_tasks(
     """
     now = now or datetime.now(UTC)
     rows = await pool.fetch(
-        "SELECT p.id::text AS id, p.status, p.todoist_task_id, "
+        "SELECT p.id::text AS id, p.status, p.todoist_task_id, p.class, "
         "       EXISTS (SELECT 1 FROM problem_events e WHERE e.problem_id = p.id "
         "               AND e.kind = 'state_change' "
         "               AND e.payload->>'action' IN ('reopen', 'promote') "
@@ -961,6 +1029,22 @@ async def reconcile_completed_tasks(
             if r["came_back_since"]:
                 if await _uncomplete_task(pool, r["todoist_task_id"]):
                     out.append({**row, "action": "task_reopened"})
+            elif r["class"] == TOPIC_CLASS:
+                # A ticked-off topic task means "seen" (#513): the round
+                # resolves AND closes at once, so the next article opens a
+                # fresh one. `close_round` does both under the lock
+                # `ingest_event` takes for the round's key, so an item attached
+                # in between cannot reopen the task the user just dismissed.
+                from aegis.services.research_topics import close_round
+
+                if await close_round(
+                    pool,
+                    r["id"],
+                    reason=TASK_COMPLETED_REASON,
+                    source=TASK_COMPLETED_SOURCE,
+                    now=now,
+                ):
+                    out.append({**row, "action": "resolved"})
             elif await set_status(
                 pool,
                 r["id"],

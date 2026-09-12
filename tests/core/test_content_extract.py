@@ -3,8 +3,22 @@
 from __future__ import annotations
 
 import httpx
+import pytest
 import respx
+from aegis.services import url_guard
 from aegis.services.content_extract import extract_bytes, extract_html, fetch_and_extract
+
+
+@pytest.fixture(autouse=True)
+def _public_dns(monkeypatch):
+    """These tests fetch made-up hosts (`http://x/...`). The public-internet
+    guard resolves every hop, so every name gets a public address here;
+    `test_url_guard.py` covers the refusals."""
+
+    async def resolve(host: str, port: int) -> list[str]:
+        return ["93.184.216.34"]
+
+    monkeypatch.setattr(url_guard, "resolve_host", resolve)
 
 _ARTICLE = """
 <html><head><title>The Title</title></head><body>

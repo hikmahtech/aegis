@@ -69,7 +69,21 @@ async def stub_tracked() -> list[str]:
     return []
 
 
-ALL_STUBS = [stub_search, stub_dedup, stub_score, stub_ingest, stub_capture, stub_tracked]
+@activity.defn(name="attach_topic_items")
+async def stub_attach(items: list[dict], origin: str) -> dict:
+    _calls.setdefault("attach", []).append((origin, [it["title"] for it in items]))
+    return {"topics": 1, "matched": len(items), "attached": len(items), "tasks": 0}
+
+
+ALL_STUBS = [
+    stub_search,
+    stub_dedup,
+    stub_score,
+    stub_ingest,
+    stub_capture,
+    stub_tracked,
+    stub_attach,
+]
 
 
 def _reset():
@@ -422,3 +436,16 @@ async def test_scan_reports_items_read_from_their_page():
     assert result["ingested"] == 1
     assert result["fetched"] == 1
     assert "skipped_no_text" not in result  # zeros are omitted
+
+
+@pytest.mark.asyncio
+async def test_worthy_items_attach_to_topics_instead_of_the_inbox():
+    """#513: step 5 hands the worthy items to the topic hub and captures
+    nothing. The Inbox capture made 277 tasks in 30 days that clarify closed on
+    arrival."""
+    _reset()
+    result = await _run_with(ALL_STUBS, IntelligenceScanInput(source="hn", topics=["ai"],
+                             significance_threshold=4), "is-topics")
+    assert _calls["attach"] == [("intel:hn", ["A"])]
+    assert _calls["capture"] == []
+    assert result["topic_items"] == 1

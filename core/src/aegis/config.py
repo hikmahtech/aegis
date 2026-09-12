@@ -103,8 +103,6 @@ class Settings(BaseSettings):
     sentry_token: str = ""
     sentry_org: str = ""
     sentry_projects: str = ""  # comma-separated Sentry project IDs; empty = all
-    miniflux_url: str = ""
-    miniflux_api_key: str = ""
     searxng_url: str = "http://localhost:8888"
     gmail_accounts: str = ""  # "name1:email1,name2:email2"
     gmail_credentials_file: str = "config/google_credentials.json"
@@ -302,6 +300,14 @@ class Settings(BaseSettings):
     content_extraction_enabled: bool = True
     raindrop_api_token: str = ""
 
+    # Calibre library (#510). The internal swarm address by default — never the
+    # public host, which is behind Cloudflare Access (a login redirect on every
+    # path). User and password blank = the library tools say "not configured"
+    # and CalibreSyncFlow reports not_configured. DB-first via Integrations.
+    calibre_url: str = "http://calibre-web_calibre-web:8083"
+    calibre_user: str = ""
+    calibre_password: str = ""
+
     # Jira (JiraSyncFlow). Any of the three blank = the flow reports
     # `not_configured` and issues no request. Basic auth: the Atlassian ACCOUNT
     # EMAIL plus an API token from id.atlassian.com/manage-profile/security/
@@ -355,6 +361,14 @@ class Settings(BaseSettings):
     books_mailbox_entities: str = ""
     books_todoist_projects: str = ""  # "personal=<todoist project id>,hikmah=<id>" for dues
 
+    # Raphael's notes — the user's Obsidian vault (#514, spec
+    # 2026-09-12-raphael-notes-design.md). The checkout sits beside the books
+    # in the config volume core and worker share. Both keys empty ⇒ the vault
+    # is not configured: nothing writes or indexes it and the daylog keeps
+    # filing knowledge rows.
+    notes_path: str = "/app/config/notes"
+    notes_repo_url: str = ""
+    notes_deploy_key: str = ""  # private ed25519 deploy key, PEM or base64 PEM; never logged
     # Maou's trading desk (spec 2026-09-12-maou-trading-desk-design.md): the
     # ansaar-data API serving the trading system's decisions. Either empty ⇒ off.
     ansaar_url: str = ""

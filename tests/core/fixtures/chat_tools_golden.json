@@ -273,6 +273,428 @@
   {
     "type": "function",
     "function": {
+      "name": "untrack_topic",
+      "description": "Stop tracking a topic: the scans and feeds stop collecting for it, and its open round of news closes (its task, if it had one, is closed with a note).",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "topic_name": {
+            "type": "string",
+            "description": "The topic's name, as track_topic was given it."
+          }
+        },
+        "required": [
+          "topic_name"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "web_search",
+      "description": "Search the web and return the raw results \u2014 title, url and a snippet for each \u2014 without summarising them. Read a promising result with read_url.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "query": {
+            "type": "string",
+            "description": "What to search for."
+          },
+          "limit": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 20,
+            "description": "How many results (1-20).",
+            "default": 8
+          },
+          "site": {
+            "type": "string",
+            "description": "Only results from this domain, e.g. arxiv.org.",
+            "default": ""
+          }
+        },
+        "required": [
+          "query"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "read_url",
+      "description": "Read one web page and return its readable text. Nothing is saved. Only public http(s) pages can be read.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "url": {
+            "type": "string",
+            "description": "The page to read."
+          },
+          "max_chars": {
+            "type": "integer",
+            "minimum": 500,
+            "maximum": 60000,
+            "description": "The most characters of text to return (500-60000).",
+            "default": 20000
+          }
+        },
+        "required": [
+          "url"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "paper_search",
+      "description": "Find academic papers on arXiv and Semantic Scholar: title, authors, date, abstract, citation count, and an id to pass to paper_read. Nothing is saved.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "query": {
+            "type": "string",
+            "description": "What the papers are about."
+          },
+          "since": {
+            "type": "string",
+            "description": "Only papers published on or after this date: YYYY, YYYY-MM or YYYY-MM-DD.",
+            "default": ""
+          },
+          "limit": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 25,
+            "description": "How many papers (1-25).",
+            "default": 8
+          }
+        },
+        "required": [
+          "query"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "paper_read",
+      "description": "Read a paper's text from its PDF. Nothing is saved.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "paper_id": {
+            "type": "string",
+            "description": "An arXiv id (2401.01234), an id from paper_search (arxiv:\u2026 or s2:\u2026), or a PDF URL."
+          },
+          "max_chars": {
+            "type": "integer",
+            "minimum": 500,
+            "maximum": 60000,
+            "description": "The most characters of text to return (500-60000).",
+            "default": 30000
+          }
+        },
+        "required": [
+          "paper_id"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "list_feeds",
+      "description": "List the RSS feeds Raphael follows and what each is worth: entries and stored documents in the last 30 days, how many of its documents a prompt used in the last 30 and 90 days, its ingest mode, its last entry and any fetch failures.",
+      "parameters": {
+        "type": "object",
+        "properties": {}
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "subscribe_feed",
+      "description": "Follow an RSS or Atom feed. The URL is fetched first and must be a feed; a web page that advertises a feed returns that feed's URL to try instead.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "url": {
+            "type": "string",
+            "description": "The feed's URL."
+          },
+          "label": {
+            "type": "string",
+            "description": "A short name for the feed. Defaults to the feed's own title.",
+            "default": ""
+          }
+        },
+        "required": [
+          "url"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "unsubscribe_feed",
+      "description": "Stop following an RSS feed. Its history is kept, and following it again resumes it.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "feed": {
+            "type": "string",
+            "description": "The feed's URL or its label, as list_feeds shows it."
+          }
+        },
+        "required": [
+          "feed"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "library_search",
+      "description": "Search the Calibre book library by title, author, tag or subject. Returns each book's id (for library_book and library_read), title, authors, tags, formats and a short description.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "query": {
+            "type": "string",
+            "description": "Words from a title, an author, a tag or the subject. Blank lists the newest books.",
+            "default": ""
+          },
+          "author": {
+            "type": "string",
+            "description": "Only books by an author whose name contains this.",
+            "default": ""
+          },
+          "tag": {
+            "type": "string",
+            "description": "Only books with a tag containing this, e.g. machine-learning.",
+            "default": ""
+          },
+          "limit": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 25,
+            "description": "How many books (1-25).",
+            "default": 10
+          }
+        }
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "library_book",
+      "description": "One book from the Calibre library: its metadata, full description and formats, and for an EPUB its table of contents.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "book_id": {
+            "type": "integer",
+            "description": "The book's id, from library_search or library_suggest."
+          }
+        },
+        "required": [
+          "book_id"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "library_read",
+      "description": "Read from a book in the Calibre library. Give a query to get the passages that best match it, a section (chapter number or title) for an EPUB, or pages (e.g. 12-18) for a PDF; with none of these it returns the opening. Every result names the book and chapter or pages to cite. Nothing is saved.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "book_id": {
+            "type": "integer",
+            "description": "The book's id, from library_search or library_suggest."
+          },
+          "section": {
+            "type": "string",
+            "description": "EPUB only: a chapter number or part of its title.",
+            "default": ""
+          },
+          "pages": {
+            "type": "string",
+            "description": "PDF only: a page or a range, e.g. 12-18 (at most 30 pages).",
+            "default": ""
+          },
+          "query": {
+            "type": "string",
+            "description": "Return the passages that best match this instead of a whole section.",
+            "default": ""
+          },
+          "max_chars": {
+            "type": "integer",
+            "minimum": 1000,
+            "maximum": 40000,
+            "description": "The most characters of text to return (1000-40000).",
+            "default": 12000
+          }
+        },
+        "required": [
+          "book_id"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "library_suggest",
+      "description": "Suggest books from the Calibre library for a topic, best match first.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "topic": {
+            "type": "string",
+            "description": "What the books should be about."
+          },
+          "limit": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 15,
+            "description": "How many books (1-15).",
+            "default": 5
+          }
+        },
+        "required": [
+          "topic"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "note_search",
+      "description": "Search the user's Obsidian vault \u2014 journal, knowledge, literature and reference notes, and Raphael's own notes \u2014 and return the best-matching notes with their paths. Read one in full with note_read.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "query": {
+            "type": "string",
+            "description": "What to look for."
+          },
+          "limit": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 20,
+            "description": "How many notes (1-20).",
+            "default": 5
+          }
+        },
+        "required": [
+          "query"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "note_read",
+      "description": "Read one note from the user's Obsidian vault by its path, e.g. journal/12 Sep 26.md. Encrypted blocks are never shown.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "The note's path inside the vault."
+          },
+          "max_chars": {
+            "type": "integer",
+            "minimum": 500,
+            "maximum": 60000,
+            "description": "The most characters to return (500-60000).",
+            "default": 20000
+          }
+        },
+        "required": [
+          "path"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "note_write",
+      "description": "Add a section to one of Raphael's notes in the vault, creating the note if it does not exist. Append-only: nothing already in a note is ever changed. Only notes under raphael/ can be written, e.g. raphael/topics/rag.md.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "The note, under raphael/ (the folder and .md are added if left off)."
+          },
+          "text": {
+            "type": "string",
+            "description": "The markdown to add."
+          },
+          "heading": {
+            "type": "string",
+            "description": "The section heading; today's date when empty.",
+            "default": ""
+          },
+          "title": {
+            "type": "string",
+            "description": "The note's title if this creates it.",
+            "default": ""
+          }
+        },
+        "required": [
+          "path",
+          "text"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "note_link",
+      "description": "Link one of Raphael's notes to another note, a book, a paper or a URL by appending one line: a [[wikilink]] for a note or book title, a markdown link for a URL. Append-only, under raphael/ only.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "The note to add the link to, under raphael/."
+          },
+          "target": {
+            "type": "string",
+            "description": "A note or book title (becomes [[target]]) or an http(s) URL."
+          },
+          "label": {
+            "type": "string",
+            "description": "Optional text to show instead of the target.",
+            "default": ""
+          }
+        },
+        "required": [
+          "path",
+          "target"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
       "name": "configure_triage",
       "description": "Read or update triage configuration: ignored Sentry projects, ignored email domains, notification mode, burst threshold.",
       "parameters": {

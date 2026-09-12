@@ -21,6 +21,8 @@ from pathlib import PurePosixPath
 import httpx
 import structlog
 
+from aegis.services.url_guard import UnsafeURLError, guarded_hooks
+
 logger = structlog.get_logger()
 
 _MAX_BYTES = 10 * 1024 * 1024  # 10 MB fetch cap
@@ -71,8 +73,33 @@ def extract_bytes(
     return data.decode("utf-8", errors="replace")[:_MAX_TEXT].strip(), None
 
 
+async def _fetch(url: str, *, allow_private: bool) -> tuple[bytes, str]:
+    """The response body, read as a stream and cut at `_MAX_BYTES`, and its
+    Content-Type. Buffering the whole response first let a multi-GB or
+    decompression-bomb URL exhaust the process before the slice ran."""
+    hooks = {} if allow_private else guarded_hooks()
+    chunks: list[bytes] = []
+    total = 0
+    async with (
+        httpx.AsyncClient(timeout=30.0, follow_redirects=True, event_hooks=hooks) as client,
+        client.stream("GET", url) as resp,
+    ):
+        resp.raise_for_status()
+        ct = resp.headers.get("content-type", "").lower()
+        async for chunk in resp.aiter_bytes():
+            chunks.append(chunk[: _MAX_BYTES - total])
+            total += len(chunks[-1])
+            if total >= _MAX_BYTES:
+                break
+    return b"".join(chunks), ct
+
+
 async def fetch_and_extract(
-    url: str, content_type: str | None = None, max_chars: int = _MAX_TEXT
+    url: str,
+    content_type: str | None = None,
+    max_chars: int = _MAX_TEXT,
+    *,
+    allow_private: bool = False,
 ) -> tuple[str, str | None]:
     """GET a URL and extract readable text. Returns (text, title).
 
@@ -80,13 +107,16 @@ async def fetch_and_extract(
     the response's own Content-Type header takes precedence. Images (no OCR)
     and fetch failures return ('', None) so the caller can fall back to a
     summary/title.
+
+    The URL is untrusted by default: every request, redirects included, must
+    stay on the public internet (`services/url_guard.py`), and a refused one
+    raises `UnsafeURLError` instead of reading as an empty page. Only the
+    operator's own ingest route passes `allow_private=True`.
     """
     try:
-        async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
-            resp = await client.get(url)
-            resp.raise_for_status()
-            data = resp.content[:_MAX_BYTES]
-            ct = resp.headers.get("content-type", "").lower()
+        data, ct = await _fetch(url, allow_private=allow_private)
+    except UnsafeURLError:
+        raise
     except Exception as exc:  # noqa: BLE001
         logger.warning("fetch_failed", url=url[:200], error=str(exc)[:200])
         return "", None

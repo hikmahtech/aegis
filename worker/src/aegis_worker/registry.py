@@ -53,6 +53,7 @@ from aegis_worker.flows.agent_task import (
 from aegis_worker.flows.alert_investigation import AlertInvestigationFlow
 from aegis_worker.flows.books_write import BooksWriteFlow
 from aegis_worker.flows.calendar_ingest import CalendarIngestFlow, CalendarIngestInput
+from aegis_worker.flows.calibre_sync import CalibreSyncConfig, CalibreSyncFlow
 from aegis_worker.flows.cert_radar import CertRadarConfig, CertRadarFlow
 from aegis_worker.flows.clarify import ClarifyConfig, ClarifyFlow
 from aegis_worker.flows.cleanup import CleanupConfig, CleanupFlow
@@ -77,6 +78,9 @@ from aegis_worker.flows.memory_reflection import MemoryReflectionFlow, MemoryRef
 from aegis_worker.flows.money_brief import MoneyBriefConfig, MoneyBriefFlow
 from aegis_worker.flows.money_process import MoneyProcessFlow
 from aegis_worker.flows.month_close import MonthCloseConfig, MonthCloseFlow
+from aegis_worker.flows.notes_backfill import NotesBackfillFlow
+from aegis_worker.flows.notes_sync import NotesSyncConfig, NotesSyncFlow
+from aegis_worker.flows.notes_write import NotesWriteFlow
 from aegis_worker.flows.profile_reflection import ProfileReflectionConfig, ProfileReflectionFlow
 from aegis_worker.flows.raindrop_ingest import RaindropIngestFlow, RaindropIngestInput
 from aegis_worker.flows.receipt_ingest import (
@@ -84,6 +88,7 @@ from aegis_worker.flows.receipt_ingest import (
     ReceiptIngestFlow,
     ReceiptIngestInput,
 )
+from aegis_worker.flows.research import ResearchFlow
 from aegis_worker.flows.review import (
     DailyReviewConfig,
     DailyReviewFlow,
@@ -282,6 +287,28 @@ FLOWS: tuple[FlowSpec, ...] = (
         RaindropIngestFlow,
         lambda act: RaindropIngestInput(agent_id=act["agent_id"]),
     ),
+    # Event-driven (#509): started by the `research_topic` chat tool under an id
+    # derived from the question, and as a child of AgentTaskFlow's `research`
+    # verb. No schedule config and no activities.yaml row.
+    FlowSpec(ResearchFlow),
+    # The Calibre library index (#510): one metadata row per book, daily.
+    # Inert (reports not_configured) until Integrations has a calibre-web user.
+    FlowSpec(
+        CalibreSyncFlow,
+        lambda act: CalibreSyncConfig(agent_id=act["agent_id"]),
+    ),
+    # Raphael's notes (#514): one chat write (started by note_write/note_link),
+    # the hourly vault index, and the hand-started journal backfill. All inert
+    # until the Integrations page has notes_repo_url + notes_deploy_key.
+    FlowSpec(NotesWriteFlow),
+    FlowSpec(
+        NotesSyncFlow,
+        lambda act: NotesSyncConfig(
+            agent_id=act["agent_id"],
+            max_files=_int(act["config"], "max_files", NotesSyncConfig.max_files),
+        ),
+    ),
+    FlowSpec(NotesBackfillFlow),
     FlowSpec(
         RssIngestFlow,
         lambda act: RssIngestInput(agent_id=act["agent_id"]),

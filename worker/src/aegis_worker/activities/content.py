@@ -8,6 +8,7 @@ have no local OCR, so an image URL with no caller-supplied excerpt is skipped.
 
 from __future__ import annotations
 
+import html
 import os
 import re
 import tempfile
@@ -24,6 +25,7 @@ from aegis.services.content_extract import (
     fetch_and_extract,
     fetch_youtube_transcript,
 )
+from aegis.services.url_guard import UnsafeURLError
 from temporalio import activity
 
 logger = structlog.get_logger()
@@ -412,6 +414,14 @@ class ContentActivities:
                 "content_id": resp.get("content_id"),
             }
 
+        except UnsafeURLError as exc:
+            # A link that is not on the public internet, or that redirects off
+            # it, is refused for good: retrying it every hour would change
+            # nothing, so the entry settles unstored (RssIngestFlow treats
+            # `refused` like `empty`).
+            logger.warning("process_content_refused", url=url[:200], error=str(exc)[:200])
+            await self._record(url, content_type, "refused", t0)
+            return {"status": "refused"}
         except httpx.HTTPStatusError as exc:
             status = "duplicate" if exc.response.status_code == 409 else "error"
             await self._record(url, content_type, status, t0)
@@ -425,6 +435,48 @@ class ContentActivities:
             )
             await self._record(url, content_type, "error", t0)
             return {"status": "error"}
+
+    @activity.defn
+    async def store_feed_abstract(
+        self,
+        url: str,
+        title: str,
+        summary: str,
+        extra_tags: list[str] | None = None,
+    ) -> dict:
+        """Store an RSS entry as its title and summary only, fetching nothing (#512).
+
+        What a feed in `abstract` mode stores, and what `gate` mode stores for
+        an entry that names no topic: one short, searchable row instead of a
+        whole page or PDF. arXiv's feed carries each paper's abstract, and the
+        paper itself is one `paper_read` away. Same return shape as
+        `process_content`.
+        """
+        if not self.enabled or not self.knowledge_connector:
+            return {"status": "disabled"}
+        t0 = time.monotonic()
+        text = html.unescape(re.sub(r"<[^>]+>", " ", summary or ""))
+        text = re.sub(r"\s+", " ", text).strip()
+        body = f"{(title or '').strip()}\n\n{text}".strip()
+        if len(body) < 20:
+            await self._record(url, "abstract", "empty", t0)
+            return {"status": "empty"}
+        tags = list(dict.fromkeys(["rss", "abstract", *(t for t in (extra_tags or []) if t)]))
+        try:
+            resp = await self.knowledge_connector.ingest_content(
+                url=url,
+                title=title or "",
+                source_type="abstract",
+                summary=text[:1000] or None,
+                raw_text=f"{body}\n\n{url}",
+                tags=tags,
+            )
+        except Exception as exc:
+            logger.warning("store_feed_abstract_failed", url=url[:200], error=str(exc)[:300])
+            await self._record(url, "abstract", "error", t0)
+            return {"status": "error"}
+        await self._record(url, "abstract", "ok", t0)
+        return {"status": "ok", "content_id": resp.get("content_id")}
 
     async def _record(
         self,

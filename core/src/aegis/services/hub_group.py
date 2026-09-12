@@ -90,7 +90,11 @@ MIN_MEMBERS = 3
 # subject is `*` and can never appear among a watchdog's findings, so
 # `hub_watch.reconcile_findings` checks a group's membership by CLASS, not by
 # subject. That rule is unchanged and still correct.
-NON_GROUPABLE_SOURCES = frozenset({"money"})
+#
+# `research` (#513): two tracked topics are two interests by construction, and
+# a `#research` task's question is one person's request. Folding either would
+# merge unrelated news, or one task's answer onto another.
+NON_GROUPABLE_SOURCES = frozenset({"money", "research"})
 # How far back a member may have been last seen and still count towards a
 # cluster. Longer than the daily watchdogs so a once-a-day finding still
 # accumulates; short enough that last month's incident does not.

@@ -78,7 +78,7 @@ from aegis.services.gtd_rules import (
     DEFAULT_SKIP_INBOX,
     get_gtd_rules,
 )
-from aegis.services.hub_project import MONEY_SOURCE_TAG
+from aegis.services.hub_project import FEEDS_SOURCE_TAG, MONEY_SOURCE_TAG, RESEARCH_SOURCE_TAG
 from aegis.services.hub_project import SOURCE_TAG as HUB_SOURCE_TAG
 from aegis.services.knowledge import _content_id_for
 
@@ -995,6 +995,23 @@ class ClarifyActivities:
         # it has already gone to Maou, above.
         if (source_tag or "") == MONEY_SOURCE_TAG:
             return self._hub_owned("a money task the problem hub raised for the user to act on")
+        # The research agent's hub tasks (#513) land in the Inbox too. A feed
+        # finding is the user's to act on, like money. A `#research` task the
+        # hub projected must never reach the `#research → reference` rule
+        # below, which would file it as a reference and complete it — and the
+        # hub reads a completion as "seen", closing the topic's round unread.
+        # The status block is in the description from the moment the task is
+        # created, before the projector can swap an outbox temp id for the
+        # real one, so it is the check that has no race; the problem lookup
+        # covers a task the hub adopted. A Raindrop bookmark (`#research`, no
+        # problem, no block) still takes the rule.
+        if (source_tag or "") == FEEDS_SOURCE_TAG:
+            return self._hub_owned("a feed finding the problem hub raised for the user to act on")
+        if (source_tag or "") == RESEARCH_SOURCE_TAG and (
+            "<!-- aegis:problem " in (task.get("description") or "")
+            or await self._hub_owns(task)
+        ):
+            return self._hub_owned("a research task the problem hub raised for Raphael")
 
         # Content-route branch. First encounter (no @pandora label yet — that
         # case returned in the @pandora block above). A `gate: true` route

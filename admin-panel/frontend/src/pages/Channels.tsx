@@ -22,10 +22,18 @@ const KIND_COLORS: Record<string, string> = {
 
 const KIND_HELP: Record<ChannelKind, string> = {
   email: 'Gmail accounts polled by GmailIngestFlow. The account must be authorized via the Google accounts re-auth flow before ingestion works.',
-  rss: 'Feed URLs polled by RssIngestFlow.',
+  rss: 'Feed URLs polled hourly by RssIngestFlow. AEGIS owns this list (nothing seeds it). "Used" counts documents from the feed that were put into a chat prompt; a feed that fails 3 fetches in a row, or publishes nothing for 30 days, becomes a problem on the hub.',
   raindrop: 'Raindrop.io bookmark collections (the token lives in Integrations).',
   wearable: 'Wearable vendors polled by WearableIngestFlow into life.observations. Identifier is the vendor slug (currently only "oura"); the token lives in Integrations.',
   place: 'Named places (home / office / gym) that POST /api/webhooks/life/location resolves a phone push against. Identifier is the name that gets stored; the centre coordinate below is the ONLY location AEGIS keeps — the pushed lat/lon is used to pick a place and then discarded, never written to the database or a log.',
+};
+
+// `channels.config.ingest` for an rss feed (#512).
+const INGEST_MODES = ['full', 'abstract', 'gate'] as const;
+const INGEST_HELP: Record<string, string> = {
+  full: 'Fetch every new entry\'s page or PDF and store it (the default).',
+  abstract: 'Store only the title and summary the feed carries; fetch nothing. Right for arXiv: the paper is one paper_read away.',
+  gate: 'Fetch the full text when the title or summary names a topic term (intel-scan topics plus tracked topics); otherwise store the abstract.',
 };
 
 // `place` is reference data, not an ingest source, so it is the one kind whose
@@ -43,6 +51,7 @@ interface ChannelForm {
   lat: string;
   lon: string;
   radius_m: string;
+  ingest: string;
   active: boolean;
 }
 
@@ -55,11 +64,15 @@ const emptyForm: ChannelForm = {
   lat: '',
   lon: '',
   radius_m: String(DEFAULT_RADIUS_M),
+  ingest: 'full',
   active: true,
 };
 
+const shortDate = (iso?: string | null) => (iso ? String(iso).slice(0, 10) : '—');
+
 export default function Channels() {
   const [channels, setChannels] = useState<any[]>([]);
+  const [feedStats, setFeedStats] = useState<Record<string, any>>({});
   const [agents, setAgents] = useState<any[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<Error | null>(null);
@@ -74,6 +87,10 @@ export default function Channels() {
     api.listChannels()
       .then(r => { setChannels(r || []); setLoading(false); })
       .catch(e => { setError(e); setLoading(false); });
+    // The numbers are a nicety: a failed stats call leaves the table usable.
+    api.feedStats()
+      .then(rows => setFeedStats(Object.fromEntries((rows || []).map((f: any) => [f.id, f]))))
+      .catch(() => setFeedStats({}));
   };
 
   useEffect(() => {
@@ -104,6 +121,7 @@ export default function Channels() {
       lat: cfg.lat === undefined || cfg.lat === null ? '' : String(cfg.lat),
       lon: cfg.lon === undefined || cfg.lon === null ? '' : String(cfg.lon),
       radius_m: cfg.radius_m === undefined || cfg.radius_m === null ? String(DEFAULT_RADIUS_M) : String(cfg.radius_m),
+      ingest: (INGEST_MODES as readonly string[]).includes(cfg.ingest) ? cfg.ingest : 'full',
       active: !!c.active,
     });
     setFormError('');
@@ -119,6 +137,7 @@ export default function Channels() {
         || `config/credentials/${form.label.trim() || 'primary'}.json`;
     } else if (form.kind === 'rss') {
       base.label = form.label.trim();
+      base.ingest = form.ingest;
       if (base.last_cursor === undefined) base.last_cursor = null;
     } else if (form.kind === 'place') {
       base.label = form.label.trim();
@@ -242,6 +261,17 @@ export default function Channels() {
                   />
                 </div>
               )}
+              {form.kind === 'rss' && (
+                <div className="form-group">
+                  <label>Ingest mode</label>
+                  <select value={form.ingest} onChange={e => setForm({ ...form, ingest: e.target.value })}>
+                    {INGEST_MODES.map(m => <option key={m} value={m}>{m}</option>)}
+                  </select>
+                  <p style={{ fontSize: 12, color: 'var(--text-muted)', margin: '4px 0 0' }}>
+                    {INGEST_HELP[form.ingest]}
+                  </p>
+                </div>
+              )}
               {form.kind === 'email' && (
                 <div className="form-group">
                   <label>Token path</label>
@@ -330,6 +360,7 @@ export default function Channels() {
       ) : (
         CHANNEL_KINDS.map(kind => {
           const items = byKind(kind);
+          const isRss = kind === 'rss';
           return (
             <div key={kind} className="section">
               <div className="page-header-row" style={{ marginBottom: 8 }}>
@@ -350,28 +381,60 @@ export default function Channels() {
                         <th>Identifier</th>
                         <th>Label</th>
                         <th>Agent</th>
+                        {isRss && (
+                          <>
+                            <th title="channels.config.ingest">Ingest</th>
+                            <th title="Entries seen / stored in the last 30 days (abstract-only in brackets)">30d entries</th>
+                            <th title="Documents from this feed put into a chat prompt in the last 30 / 90 days">Used 30d / 90d</th>
+                            <th title="Newest entry accepted">Last entry</th>
+                            <th title="Consecutive failed fetches">Fetch</th>
+                          </>
+                        )}
                         <th>Active</th>
                         <th style={{ width: 90 }} />
                       </tr>
                     </thead>
                     <tbody>
-                      {items.map(c => (
-                        <tr key={c.id}>
-                          <td className="mono" style={{ wordBreak: 'break-all' }}>{c.identifier}</td>
-                          <td>{c.config?.label || '—'}</td>
-                          <td>{c.config?.agent_id ? agentName(c.config.agent_id) : '—'}</td>
-                          <td>
-                            <label className="toggle-switch" title={c.active ? 'Deactivate' : 'Activate'}>
-                              <input type="checkbox" checked={!!c.active} onChange={() => toggleActive(c)} />
-                              <span className="toggle-slider" />
-                            </label>
-                          </td>
-                          <td>
-                            <button className="btn-icon" title="Edit" onClick={() => openEdit(c)}>&#9998;</button>
-                            <button className="btn-icon btn-icon-danger" title="Delete" onClick={() => handleDelete(c)}>&times;</button>
-                          </td>
-                        </tr>
-                      ))}
+                      {items.map(c => {
+                        const f = feedStats[c.id];
+                        return (
+                          <tr key={c.id}>
+                            <td className="mono" style={{ wordBreak: 'break-all' }}>{c.identifier}</td>
+                            <td>{c.config?.label || '—'}</td>
+                            <td>{c.config?.agent_id ? agentName(c.config.agent_id) : '—'}</td>
+                            {isRss && (
+                              <>
+                                <td>{f?.ingest || c.config?.ingest || 'full'}</td>
+                                <td>
+                                  {f ? `${f.entries_30d} / ${f.stored_30d}` : '—'}
+                                  {f?.abstract_30d ? ` (${f.abstract_30d})` : ''}
+                                  {f?.backlog ? <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>backlog {f.backlog}</div> : null}
+                                </td>
+                                <td style={{ color: f && f.used_90d === 0 && f.entries_90d > 0 ? 'var(--warning)' : 'inherit' }}>
+                                  {f ? `${f.used_30d} / ${f.used_90d}` : '—'}
+                                </td>
+                                <td>{shortDate(f?.last_entry_at ?? c.config?.last_cursor)}</td>
+                                <td
+                                  title={f?.last_fetch_error || ''}
+                                  style={{ color: f?.fetch_failures ? 'var(--danger)' : 'inherit' }}
+                                >
+                                  {f ? (f.fetch_failures ? `${f.fetch_failures} failed` : 'ok') : '—'}
+                                </td>
+                              </>
+                            )}
+                            <td>
+                              <label className="toggle-switch" title={c.active ? 'Deactivate' : 'Activate'}>
+                                <input type="checkbox" checked={!!c.active} onChange={() => toggleActive(c)} />
+                                <span className="toggle-slider" />
+                              </label>
+                            </td>
+                            <td>
+                              <button className="btn-icon" title="Edit" onClick={() => openEdit(c)}>&#9998;</button>
+                              <button className="btn-icon btn-icon-danger" title="Delete" onClick={() => handleDelete(c)}>&times;</button>
+                            </td>
+                          </tr>
+                        );
+                      })}
                     </tbody>
                   </table>
                 </div>

@@ -17,6 +17,13 @@ A9 folds the weekly and monthly rollups into this same flow class via
 `DayLogConfig.mode`: the period runs read the already-filed daily entries
 back out and condense them into one `source_type='daylog_rollup'` document,
 so a "last quarter" retrieval reads 3 documents instead of 90.
+
+**Raphael keeps the journal (#514).** When the Obsidian vault is configured,
+the entry is appended to the vault's journal note for the day, week or month
+instead (`notes_journal_write`, append-only) and no knowledge row is filed —
+the vault is the record and `NotesSyncFlow` indexes the note. Unconfigured, or
+when the vault write fails, the flow files the knowledge row exactly as before,
+so no day is ever lost; a failure is reported as `vault_error`.
 """
 
 from __future__ import annotations
@@ -27,6 +34,8 @@ from datetime import datetime, timedelta
 from temporalio import workflow
 
 with workflow.unsafe.imports_passed_through():
+    from aegis.services.notes_write import NOTES_WRITE_TIMEOUT_S
+
     from aegis_worker.activities.content import ContentActivities
     from aegis_worker.activities.daylog import DayLogActivities
     from aegis_worker.shared.retry import (
@@ -36,6 +45,12 @@ with workflow.unsafe.imports_passed_through():
         TIMEOUT_LLM,
         TIMEOUT_STANDARD,
     )
+
+# Guards the journal write added by #514, so a run started on the old code
+# replays without it. Runs last minutes; deprecate the patch one deploy later.
+_PATCH_VAULT = "daylog-vault-514"
+_JOURNAL_TIMEOUT = timedelta(seconds=NOTES_WRITE_TIMEOUT_S)
+_JOURNALED = ("written", "exists")
 
 
 @dataclass
@@ -97,7 +112,7 @@ def rollup_window(mode: str, now: datetime) -> tuple[str, str, str] | None:
 
 @workflow.defn
 class DayLogFlow:
-    """Gather → distil → ingest → commit cursor, for one day (or one period)."""
+    """Gather → distil → journal or ingest → commit cursor, for one day (or one period)."""
 
     @workflow.run
     async def run(self, config: DayLogConfig) -> dict:
@@ -135,6 +150,25 @@ class DayLogFlow:
         if not (narrative or "").strip():
             return {"status": "skipped", "reason": "empty_narrative", "date": target_date}
 
+        # The journal first (#514). Written or already there = the vault holds
+        # the day, so no knowledge row is filed; anything else falls through to
+        # the knowledge store exactly as before.
+        vault_error = None
+        if workflow.patched(_PATCH_VAULT):
+            vault = await self._journal("daily", target_date, target_date, narrative)
+            if vault.get("status") in _JOURNALED:
+                path = str(vault.get("path") or "")
+                await self._commit_state(target_date, f"vault://{path}")
+                return {
+                    "status": "journaled",
+                    "date": target_date,
+                    "path": path,
+                    "vault": vault["status"],
+                    "quiet": bool(events.get("quiet")),
+                }
+            if vault.get("status") == "error":
+                vault_error = str(vault.get("error") or "vault write failed")[:200]
+
         url = f"aegis://daylog/{target_date}"
         try:
             ingested = await workflow.execute_activity_method(
@@ -158,7 +192,12 @@ class DayLogFlow:
             )
         except Exception:
             workflow.logger.warning("daylog_ingest_failed date=%s", target_date)
-            return {"status": "skipped", "reason": "ingest_failed", "date": target_date}
+            return {
+                "status": "skipped",
+                "reason": "ingest_failed",
+                "date": target_date,
+                **_error(vault_error),
+            }
 
         # Allow-list, not a deny-list: ingest_content answers "disabled" with
         # no knowledge connector, "skipped" on a bad item and "empty" when the
@@ -167,9 +206,25 @@ class DayLogFlow:
         status = (ingested or {}).get("status")
         if status != "ok":
             workflow.logger.warning("daylog_not_ingested date=%s status=%s", target_date, status)
-            return {"status": "skipped", "reason": f"ingest_{status or 'no_result'}",
-                    "date": target_date}
+            return {
+                "status": "skipped",
+                "reason": f"ingest_{status or 'no_result'}",
+                "date": target_date,
+                **_error(vault_error),
+            }
 
+        await self._commit_state(target_date, url)
+
+        return {
+            "status": "ingested",
+            "date": target_date,
+            "url": url,
+            "quiet": bool(events.get("quiet")),
+            "content_id": (ingested or {}).get("content_id"),
+            **_error(vault_error),
+        }
+
+    async def _commit_state(self, target_date: str, url: str) -> None:
         try:
             await workflow.execute_activity_method(
                 DayLogActivities.commit_daylog_state,
@@ -180,13 +235,20 @@ class DayLogFlow:
         except Exception:
             workflow.logger.warning("daylog_state_commit_failed date=%s", target_date)
 
-        return {
-            "status": "ingested",
-            "date": target_date,
-            "url": url,
-            "quiet": bool(events.get("quiet")),
-            "content_id": (ingested or {}).get("content_id"),
-        }
+    async def _journal(self, kind: str, day: str, label: str, text: str) -> dict:
+        """Append the entry to the vault's journal note. Never raises: an
+        activity failure is `status: error`, and the caller files the knowledge
+        row instead."""
+        try:
+            return await workflow.execute_activity(
+                "notes_journal_write",
+                {"kind": kind, "day": day, "label": label, "text": text},
+                start_to_close_timeout=_JOURNAL_TIMEOUT,
+                retry_policy=RETRY_ONCE,
+            )
+        except Exception as exc:
+            workflow.logger.warning("daylog_journal_failed label=%s err=%s", label, str(exc)[:200])
+            return {"status": "error", "error": str(exc)[:200]}
 
     # ---------------------------------------------------------------- rollups
 
@@ -200,10 +262,14 @@ class DayLogFlow:
         # `day_offset` shifts the anchor here exactly as it does for a daily
         # run, which is what makes a past period re-runnable at all: the window
         # is derived from the clock, so without it the only rollup you can ever
-        # produce is the one for right now. `day_offset=7` on a Sunday re-files
-        # last week's — the url is `aegis://daylog/<kind>/<label>`, so a re-run
-        # OVERWRITES that period in place rather than filing a second copy.
-        # Used 2026-08-23 to rewrite 2026-W33, which was filed truncated.
+        # produce is the one for right now. With the vault OFF, `day_offset=7`
+        # on a Sunday re-files last week's — the url is
+        # `aegis://daylog/<kind>/<label>`, so a re-run OVERWRITES that period in
+        # place (used 2026-08-23 to rewrite 2026-W33, which was filed
+        # truncated). With the vault ON (#514) a re-run is a no-op for a period
+        # already in the journal: the note carries the period's marker and the
+        # journal is append-only (`vault: exists`). To redo one, delete
+        # Raphael's section from the note by hand, then re-run.
         window = rollup_window(config.mode, workflow.now() - timedelta(days=config.day_offset))
         if window is None:
             workflow.logger.info("daylog_rollup_not_period_end mode=%s", config.mode)
@@ -244,6 +310,23 @@ class DayLogFlow:
             return {"status": "skipped", "reason": "empty_narrative", "label": label}
 
         covers = [e.get("date") for e in entries]
+
+        # The week's or month's journal note first (#514), as for a day.
+        vault_error = None
+        if workflow.patched(_PATCH_VAULT):
+            vault = await self._journal(config.mode, start, label, narrative)
+            if vault.get("status") in _JOURNALED:
+                return {
+                    "status": "journaled",
+                    "mode": config.mode,
+                    "label": label,
+                    "path": str(vault.get("path") or ""),
+                    "vault": vault["status"],
+                    "covers": covers,
+                }
+            if vault.get("status") == "error":
+                vault_error = str(vault.get("error") or "vault write failed")[:200]
+
         try:
             ingested = await workflow.execute_activity_method(
                 ContentActivities.ingest_content,
@@ -268,7 +351,12 @@ class DayLogFlow:
             )
         except Exception:
             workflow.logger.warning("daylog_rollup_ingest_failed label=%s", label)
-            return {"status": "skipped", "reason": "ingest_failed", "label": label}
+            return {
+                "status": "skipped",
+                "reason": "ingest_failed",
+                "label": label,
+                **_error(vault_error),
+            }
 
         status = (ingested or {}).get("status")
         if status != "ok":
@@ -277,6 +365,7 @@ class DayLogFlow:
                 "status": "skipped",
                 "reason": f"ingest_{status or 'no_result'}",
                 "label": label,
+                **_error(vault_error),
             }
 
         return {
@@ -286,4 +375,11 @@ class DayLogFlow:
             "url": url,
             "covers": covers,
             "content_id": (ingested or {}).get("content_id"),
+            **_error(vault_error),
         }
+
+
+def _error(vault_error: str | None) -> dict:
+    """`{"vault_error": ...}` when the journal write failed, else nothing — so
+    an unconfigured vault leaves the run summary exactly as it was."""
+    return {"vault_error": vault_error} if vault_error else {}

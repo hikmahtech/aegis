@@ -11,10 +11,11 @@ from typing import Any
 from uuid import UUID
 
 import asyncpg
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel
 
 from aegis.api.auth import verify_auth
+from aegis.services import feeds
 
 router = APIRouter(prefix="/api/admin/channels", dependencies=[Depends(verify_auth)])
 
@@ -52,6 +53,24 @@ async def list_channels(request: Request, kind: str | None = None) -> list[dict]
     else:
         rows = await pool.fetch(f"SELECT {_COLS} FROM channels ORDER BY kind, identifier")
     return [dict(r) for r in rows]
+
+
+@router.get("/feed-stats")
+async def feed_stats(request: Request) -> list[dict]:
+    """Every rss channel with what it is worth, measured (#511): entries and
+    stored documents in the last 30/90 days, documents a prompt used, the last
+    entry, fetch failures and the backlog. See `services/feeds.py`."""
+    return await feeds.feed_stats(request.app.state.db_pool)
+
+
+@router.get("/retention-preview")
+async def retention_preview(
+    request: Request, older_than_days: int = Query(30, ge=1, le=3650)
+) -> dict:
+    """Dry run of the PDF retention rule (#512): what "a PDF no prompt used,
+    older than N days, keeps only its first chunk" would remove. Counts only —
+    nothing is deleted or changed."""
+    return await feeds.retention_preview(request.app.state.db_pool, older_than_days)
 
 
 @router.post("", status_code=201)

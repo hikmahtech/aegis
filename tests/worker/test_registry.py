@@ -388,12 +388,34 @@ def test_books_write_flow_is_gated_on_money_hygiene():
         # Then +1 activity and NO new flow from #508: `load_tracked_topics` on
         # the existing IntelligenceActivities (the topics `track_topic` saves),
         # a step of IntelligenceScanFlow. Unflagged, so all three rows move.
+        # Then +1 flow and +5 activities from #509: ResearchFlow (started by the
+        # `research_topic` tool and by AgentTaskFlow's `research` verb) and the
+        # new ResearchActivities class — research_gather, research_read,
+        # research_synthesize, research_save, research_task_problem. Unflagged,
+        # so all three rows move.
+        # Then +5 activities and NO new flow from #511/#512: the feed record
+        # (`load_gate_terms`, `record_feed_entries`, `record_feed_run` on
+        # RssActivities), `store_feed_abstract` on ContentActivities and
+        # `feed_review_line` on BriefingActivities. Unflagged, so all three
+        # rows move.
+        # Then +1 flow and +1 activity from #510: CalibreSyncFlow (daily, the
+        # book index) and CalibreActivities.sync_calibre_library, a new class.
+        # Unflagged, so all three rows move.
+        # Then +1 activity and NO new flow from #513: `attach_topic_items` on
+        # the existing IntelligenceActivities (tracked topics' rounds in the
+        # hub), a step of IntelligenceScanFlow and RssIngestFlow. Unflagged, so
+        # all three rows move.
+        # Then +3 flows and +4 activities from #514, all unflagged: NotesWriteFlow
+        # (a chat write), NotesSyncFlow (the hourly vault index, seeded) and
+        # NotesBackfillFlow (hand-started), served by the new NotesActivities
+        # class (notes_write, notes_journal_write, notes_index_vault,
+        # notes_backfill_journal). All three rows move.
         # Then +1 flow and +1 activity from Maou's paper trading desk:
         # TradingDeskFlow and TradingDeskActivities.desk_tick, both on the money
         # flag, so only the money-on row moves.
-        (True, True, 46, 230),
-        (False, False, 35, 196),
-        (True, False, 39, 212),
+        (True, True, 51, 246),
+        (False, False, 40, 212),
+        (True, False, 44, 228),
     ],
 )
 def test_real_registration_passes_the_boot_check(homelab, money, flows, activities):

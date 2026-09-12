@@ -30,6 +30,9 @@ DEFAULT_DECAY_DAYS = 90
 class SourceTypeInfo:
     description: str
     decay_days: int | None = None
+    # Multiplies a document's ranking score (#514). 1.0 = ranked on similarity
+    # and decay alone, which is every type but the user's own notes.
+    rank_boost: float = 1.0
 
 
 SOURCE_TYPES: dict[str, SourceTypeInfo] = {
@@ -79,6 +82,10 @@ SOURCE_TYPES: dict[str, SourceTypeInfo] = {
         "HTML article extracted via content.py's detect_content_type/fetch_and_extract path"
     ),
     "pdf": SourceTypeInfo("PDF extracted via content.py's detect_content_type path"),
+    "abstract": SourceTypeInfo(
+        "An RSS entry stored as its title and summary only, nothing fetched "
+        "(worker content.py store_feed_abstract; feed ingest mode abstract/gate, #512)"
+    ),
     "image": SourceTypeInfo(
         "Image URL detected by content.py's detect_content_type (no OCR; fallback text only)"
     ),
@@ -127,6 +134,22 @@ SOURCE_TYPES: dict[str, SourceTypeInfo] = {
         "one brevity note — written by MeetingNotesFlow from the user's own "
         "transcript lines (worker activities/meeting.py)"
     ),
+    # A book's metadata does not go stale the way news does, and its row is
+    # only rewritten when the book changes — so it barely decays.
+    "book": SourceTypeInfo(
+        "One row per Calibre book — title, authors, tags, description, never the "
+        "text — kept in step with the library by CalibreSyncFlow (#510)",
+        decay_days=3650,
+    ),
+    # The user's Obsidian vault and Raphael's own notes (#514): the record of
+    # what was concluded, so it barely decays and ranks above raw documents.
+    "note": SourceTypeInfo(
+        "A note from the user's Obsidian vault (journal, knowledge, literature, "
+        "reference, and Raphael's own under raphael/), indexed by NotesSyncFlow "
+        "with encrypted blocks stripped. The vault is the record; this is its index.",
+        decay_days=3650,
+        rank_boost=1.25,
+    ),
 }
 
 
@@ -140,6 +163,14 @@ def get_decay_days(source_type: str) -> int:
     if info is not None and info.decay_days is not None:
         return info.decay_days
     return DEFAULT_DECAY_DAYS
+
+
+def get_rank_boost(source_type: str) -> float:
+    """How much `source_type`'s documents are lifted when ranked (#514).
+
+    1.0 for every type but the user's own notes, and for unknown types."""
+    info = SOURCE_TYPES.get(source_type)
+    return info.rank_boost if info is not None else 1.0
 
 
 def warn_if_unknown(source_type: str) -> None:

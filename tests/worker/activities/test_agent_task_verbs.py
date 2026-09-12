@@ -5,8 +5,7 @@ from __future__ import annotations
 import pytest
 import pytest_asyncio
 from aegis.services.gtd_rules import SOURCE_TAGS
-from aegis.services.hub_project import MONEY_SOURCE_TAG
-from aegis.services.hub_project import SOURCE_TAG as HUB_SOURCE_TAG
+from aegis.services.hub_project import HUB_SOURCE_TAGS
 from aegis_worker.activities.agent_task import (
     DEFAULT_VERBS,
     UNTAGGED,
@@ -33,7 +32,8 @@ from aegis_worker.activities.agent_task import (
         # #344: each of these is a request to the agent the task was given to,
         # so it goes to that agent's own chat path instead of parking unworked.
         ("#chat", ["@pandora"], "ask"),
-        ("#research", ["@raphael"], "ask"),
+        # #509: a research task is researched, not chatted about.
+        ("#research", ["@raphael"], "research"),
         ("#calendar", ["@sebas"], "ask"),
         ("#manual", ["@sebas"], "ask"),
         # A hand-written task with an agent's label and no @code is the same
@@ -41,6 +41,8 @@ from aegis_worker.activities.agent_task import (
         (None, ["@pandora"], "ask"),
         # Decided: nothing works these (Maou raises them, the user acts).
         ("#money", ["@maou"], "none"),
+        # #513: a failing feed is the user's to fix; nothing works it.
+        ("#feeds", ["@raphael"], "none"),
         # Nobody decided: a tag outside the table.
         ("#brand-new", ["@sebas"], "unknown"),
     ],
@@ -55,7 +57,7 @@ def test_every_source_tag_has_a_decision():
     table knew three of seven tags, so "nobody wired one up" and "deliberately
     nothing" were the same silent park. A tag added to `SOURCE_TAGS` (or a new
     hub tag) without a decision here fails this test."""
-    tags = {*SOURCE_TAGS, HUB_SOURCE_TAG, MONEY_SOURCE_TAG, UNTAGGED}
+    tags = {*SOURCE_TAGS, *HUB_SOURCE_TAGS, UNTAGGED}
     missing = tags - set(DEFAULT_VERBS)
     assert not missing, f"no verb decision for {sorted(missing)}"
     for tag, verb in DEFAULT_VERBS.items():

@@ -1652,6 +1652,341 @@ the matching `case` branches in `scripts/infra/*.sh` (e.g.
 `infra_list_pods.sh`, `infra_list_argocd_apps.sh`) so the script host actually
 knows how to route that context name.
 
+## The research lane (Raphael)
+
+Raphael researches with five chat tools and one flow (#509).
+
+| Tool | What it does |
+|---|---|
+| `web_search` | SearxNG results — title, url, snippet — returned raw, not summarised |
+| `read_url` | One page's readable text, bounded. Public http(s) hosts only |
+| `paper_search` | arXiv and Semantic Scholar together: title, authors, date, abstract, citation count, and an id for `paper_read`. One engine failing still returns the other's papers |
+| `paper_read` | A paper's text from its PDF, by arXiv id, `s2:<id>` or PDF URL |
+| `research_topic` | Hands the question to `ResearchFlow` and waits up to 45s for the answer |
+
+The four reads fetch and return; nothing is stored. They are on the MCP gated
+endpoint's read-only list. `research_topic` is not, because it starts a flow
+that saves its answer.
+
+**`ResearchFlow`** gathers from the knowledge store, a web search and — when the
+question looks academic — the two paper engines; reads the best pages (a task's
+own links first); asks the smart tier for one answer that cites its numbered
+sources (`llm_calls.purpose = 'research_synthesis'`); and saves that answer to
+the knowledge store under `aegis://research/<hash of the question>`, so asking
+the same question again replaces the old answer. Only a real answer is saved: a
+run whose synthesis failed says so and stores nothing.
+
+- **From chat**, the run's id is `research-<hash of the question>`, so a retried
+  turn re-attaches to the run in flight. Past 45s the tool answers "still
+  researching", and the flow posts the answer to the agent's channel when it
+  lands.
+- **A `#research` task** assigned to an agent goes to the `research` verb
+  (`agent_task_verbs`): the task gets a hub problem (`ensure_problem_for_task`,
+  as a `@code` task does), the answer is posted as one comment with its numbered
+  sources, and the task parks at `@waiting`. To send `#research` back to the old
+  chat path, set `"#research": "ask"` in the `agent_task_verbs` setting.
+
+**Granting the four reads on a running deployment is a DB write** — the seed only
+applies to an agent that has no tool set yet. Tick them on Admin → Agents →
+Raphael → Behavior, or:
+
+```sql
+UPDATE agents
+   SET metadata = jsonb_set(
+         metadata, '{tool_set}',
+         (metadata->'tool_set') || '["web_search","read_url","paper_search","paper_read"]'::jsonb)
+ WHERE id = 'raphael'
+   AND NOT (metadata->'tool_set' ? 'web_search');
+```
+
+Every fetch of a URL that a model chose, a page named or a feed publishes goes
+through `services/url_guard.py`. The first request and every redirect must
+resolve to a public address, so a page the agent has just read cannot steer it
+at the stack's own services, not even by redirecting inward. The one exception
+is the admin knowledge route, where you seed a URL by hand
+(`allow_private=True`). What is not caught: a host whose DNS answer changes
+between the check and the connect (DNS rebinding). Bodies are read as a stream
+and cut at 10 MB.
+
+## Feeds (Raphael)
+
+AEGIS owns the RSS list (#511). `channels(kind='rss')` is what `RssIngestFlow`
+polls every hour at :30, and nothing seeds it: the Miniflux seeder is gone. It
+read Miniflux's feed list once at core startup, Miniflux sat dead from
+2026-03-28 for five and a half months, and nobody noticed. Add and drop feeds
+on Admin → Channels, or ask Raphael (`subscribe_feed`, `unsubscribe_feed`).
+
+### What each feed is worth
+
+`feed_entries` (migration 046) records every entry a run stored or failed,
+with the knowledge row it produced. Joining that to
+`knowledge_injection_log.content_ids` tells you which feeds' documents a chat
+prompt actually used. Admin → Channels shows it per feed, and so do
+`list_feeds` and `GET /api/admin/channels/feed-stats`:
+
+- entries and stored documents in the last 30 days, plus how many were
+  abstract only;
+- documents used in the last 30 and 90 days;
+- the last entry, the backlog and consecutive fetch failures.
+
+Only chat writes the injection log, so "used" is a floor.
+
+On the 1st of each month, Raphael's briefing names the active feeds that have
+90 days of history and no use in that time. The migration backfills history
+by host (an arXiv entry lives on arxiv.org). A feed whose links point
+elsewhere, like Hacker News, starts its history at the deploy.
+
+### Ingest modes (#512)
+
+`channels.config.ingest` is set per feed:
+
+| Mode | What a new entry costs |
+|---|---|
+| `full` (default) | The page or PDF is fetched and stored (`process_content`). |
+| `abstract` | One row from the title and summary the feed already carries. Nothing is fetched. |
+| `gate` | Full text when the title or summary names a topic term, the abstract otherwise. |
+
+The topic terms are every active intel scan's `topics` plus the topics tracked
+from chat (`intelligence_topics`), matched as whole words and case-insensitive.
+No LLM is involved.
+
+`full` is the default because of what the measurements showed, not by
+accident. Over the 30 days to 2026-09-12:
+
+- **arXiv:** 1,889 papers and 89,669 chunks, which is 90% of all RSS chunks.
+  Prompts used 14 of the papers.
+- **The topic gate on arXiv:** it would pass 41% of papers, only about 2.3x
+  fewer chunks.
+- **The topic gate on the other feeds:** it would have kept the full text of
+  only 2 of the 10 documents a prompt used.
+
+So gating is opt-in, and **arXiv is the feed to set to `abstract`**. That is
+one chunk per paper, about 47x fewer chunks, and the full paper stays one
+`paper_read` away.
+
+```sql
+UPDATE channels SET config = config || '{"ingest": "abstract"}'::jsonb
+WHERE kind = 'rss' AND identifier = 'https://arxiv.org/rss/cs.AI';
+```
+
+An abstract row is cheap, so on that feed you can also raise
+`max_entries_per_run` (30 today) to clear the arXiv backlog.
+
+Switching a feed from `abstract` to `full` is one-way for entries already seen:
+their claim is kept, so a later `full` run treats them as duplicates and only
+new entries get their full text. To read one of those in full, use `read_url`
+or `paper_read`.
+
+### When a feed breaks
+
+- **Failing:** three fetches in a row that fail (an HTTP error, or a response
+  that is not a feed) are a `feeds` hub finding of class `feed_failing`. The
+  finding records an occurrence when the feed crosses that line and once a
+  day at the review hour; the hourly runs in between only keep the problem
+  open, so a dead feed does not post 24 comments a day on its task. Before
+  #511, feedparser turned all of these into an empty parse, which looked like
+  a quiet feed. An empty feed that feedparser still recognised as a feed, with
+  a benign complaint such as an encoding override, is quiet, not failing.
+- **Stale:** no new entry for `channels.config.stale_after_days` days (default
+  30) is a `feed_stale` finding, checked once a day at 03:30 UTC. A feed that
+  never gave a dated entry is measured from when AEGIS began polling it
+  (`channels.config.tracking_since`).
+- **Recovery:** both resolve themselves when the feed recovers
+  (`hub_watch.reconcile_findings`). The problem's subject is the feed URL, and
+  the research agent owns the `feeds` source.
+
+A `process_content` that returns `status: error` now counts as a failure. The
+entry's claim is released and the cursor is fenced, so the next run retries it
+instead of counting it as ingested.
+
+### Retention (dry run only)
+
+`GET /api/admin/channels/retention-preview?older_than_days=N` counts what one
+rule would remove, and changes nothing. The rule: a PDF that no prompt used,
+ingested more than N days ago, keeps its first chunk and drops the rest.
+
+On 2026-09-12 with N=30 that is 8,297 PDFs and 362,153 of 500,055 chunks,
+freeing about 530 MB of text and 1 GB of vectors from a 4.8 GB table. Every
+PDF dates from 2026-07-01 or later, so nothing is older than 90 days yet.
+Deleting anything is a separate, explicit decision.
+
+### Setting it up on an existing deployment
+
+1. Grant the three tools. The DB `tool_set` wins over the seed:
+   ```sql
+   UPDATE agents SET metadata = jsonb_set(metadata, '{tool_set}',
+     (metadata->'tool_set') || '["list_feeds","subscribe_feed","unsubscribe_feed"]'::jsonb)
+   WHERE id = 'raphael' AND NOT (metadata->'tool_set' ? 'list_feeds');
+   ```
+2. Set arXiv to `abstract` (the SQL above).
+3. Optional cleanup of the rows the removed Miniflux integration left behind
+   (harmless if kept):
+   ```sql
+   DELETE FROM settings WHERE key IN
+     ('integration:miniflux_url', 'integration:miniflux_api_key', 'connector_health:miniflux');
+   ```
+   Removing the Miniflux stack itself (Portainer, stack `miniflux`) is a
+   separate call.
+
+## The Calibre library (Raphael)
+
+Raphael reads your Calibre library through calibre-web's OPDS catalogue (#510):
+`library_search`, `library_book`, `library_read` and `library_suggest`, and
+`ResearchFlow` quotes a passage from the closest book when one speaks to the
+question. **Calibre is the record; the knowledge store is only an index of it**
+— one `source_type='book'` row per book (title, authors, tags, description),
+never the text. A book's text is read on demand, bounded, cited and not stored:
+arXiv PDFs were 93% of the corpus's chunks and 78 of 10,284 were ever used, so
+bulk text is exactly what not to index.
+
+- **Code:** `connectors/calibre.py` (the OPDS client), `services/library.py`
+  (everything the tools and flows share: EPUB chapters and PDF pages, passage
+  search, the index row), `services/tools/library.py`, and the worker's
+  `CalibreActivities` + `CalibreSyncFlow`.
+- **Never the public host.** `calibre.hikmahtech.in` is behind Cloudflare
+  Access: every path, `/opds` included, 302s to a login page — the trap that
+  broke Miniflux (#70). The connector refuses that host and treats any redirect
+  as an error. Use the internal address `http://calibre-web_calibre-web:8083`:
+  aegis-core and the worker both sit on the `traefik_public` overlay with
+  calibre-web.
+- **Reading:** EPUB is read by chapter (the book's own table of contents names
+  them), PDF by page (at most 30 pages a read; a query scans the first 150, or
+  the first 60 inside research). MOBI and AZW3 cannot be read. Files over 80 MB
+  are refused.
+- **The index:** `CalibreSyncFlow` runs daily at 03:41 UTC (`calibre-sync-daily`).
+  It adds new books, re-embeds a book only when its metadata changed (a
+  fingerprint in the row's metadata), and removes the row of a book that left
+  Calibre, naming it in the run summary — unless the catalogue came back less
+  than half the size of the index, which it refuses to trust
+  (`removal_withheld`).
+
+### Setting it up
+
+1. In calibre-web (Admin → Users → Add new user), create a user for AEGIS:
+   allow **download**; do not allow upload, edit, delete or admin. Basic auth
+   and OPDS are on by default.
+2. On AEGIS's Integrations page, group **Calibre (library)**: set the user and
+   password, and leave the URL at the internal default. Core uses the new
+   values at once; restart the worker for `CalibreSyncFlow`.
+3. Grant Raphael the four tools. The DB `tool_set` wins over the seed:
+
+   ```sql
+   UPDATE agents SET metadata = jsonb_set(metadata, '{tool_set}',
+     (metadata->'tool_set') || '["library_search","library_book","library_read","library_suggest"]'::jsonb)
+   WHERE id = 'raphael' AND NOT (metadata->'tool_set' ? 'library_search');
+   ```
+4. Build the index once without waiting for 03:41: trigger the
+   `calibre-sync-daily` schedule (Temporal UI, or `temporal schedule trigger
+   --schedule-id calibre-sync-daily`). The summary reports `books`, `added`,
+   `updated`, `unchanged` and `failed`.
+
+Until step 2 the tools answer "not configured" and the flow reports
+`not_configured`; both are the intended inert state.
+
+## Tracked topics (Raphael)
+
+A topic you ask Raphael to track (`track_topic`, or "yes" to a "track this?"
+card) is two things (#513, spec
+`docs/superpowers/specs/2026-09-12-research-hub-design.md`):
+
+- **Its search terms**, in the `intelligence_topics` settings row. The intel
+  scans search them and the RSS gate matches on them.
+- **Its round of news**, a hub problem: class `topic`, source `research`,
+  owned by Raphael. Every intel-scan item or stored feed entry that names one
+  of the terms (whole word, any case) is an occurrence, keyed on the URL, so
+  one story arriving by two paths counts once.
+
+A round stays in the hub and Raphael's briefing ("Your topics") until it
+holds enough items: 2 for a `high` topic, 3 for `medium`, 5 for `low`. Then
+it becomes one `#research @raphael @next` task listing the items; later items
+are collapsed comments. Ticking the task off means "seen": the round resolves
+and closes, and the next matching article opens a fresh one.
+
+Feed findings (`feed_failing`, `feed_stale`) are Raphael's too, as
+`#feeds @raphael @next` tasks. The agent sweep never works them; you fix or
+drop the feed.
+
+Operations:
+
+```sql
+-- What is tracked
+SELECT value FROM settings WHERE key = 'intelligence_topics';
+-- Live rounds, their item counts and whether they earned a task
+SELECT p.metadata->>'topic' AS topic, p.todoist_task_id,
+       count(*) FILTER (WHERE e.payload->>'item' = 'true') AS items
+FROM problems p JOIN problem_events e ON e.problem_id = p.id
+WHERE p.class = 'topic' AND p.closed_at IS NULL GROUP BY p.id;
+```
+
+Stop tracking with `untrack_topic` (it closes the live round and its task).
+The intel scans no longer capture a `#research` Inbox task per worthy item;
+Raindrop bookmarks still do.
+
+**A fresh deployment tracks nothing.** Prod had no `intelligence_topics` row
+on 2026-09-12, so no round opens until you track a topic or answer "yes" to a
+"track this?" card. Until then the intel items still reach the knowledge store
+and the briefing; only the auto-closed `@reference` tasks are gone. Seeding the
+registry from the intel scans' own topics was considered and deliberately not
+done: those are single broad words (`ai`, `world`, `tech`, `macro`), and as
+whole-word terms they would cross the threshold on every scan and raise a task
+each round — the noise #513 removed.
+
+## The vault (Raphael)
+
+The user's Obsidian vault (`arshadansari27/arshad-workspace`) is Raphael's
+record; the knowledge store is only its index (#514, spec
+`docs/superpowers/specs/2026-09-12-raphael-notes-design.md`).
+
+- **Reads:** `NotesSyncFlow` (`notes-sync-hourly`, minute :19) pulls the vault
+  and indexes every changed `.md` note as `source_type='note'`, skipping
+  `.obsidian/`, `_templates/`, `backups/`, `_attachments/` and `.trash/`, at
+  most `max_files` (300) per run. Encrypted meld-encrypt blocks are stripped
+  before anything is stored. Notes rank above raw documents (`rank_boost`
+  1.25). Progress is `settings.notes_index_state`.
+- **Writes, append-only:** only under `raphael/` (research answers in
+  `raphael/questions/`, and whatever Raphael writes with `note_write` /
+  `note_link`) and the daylog's journal notes. Nothing the user wrote is ever
+  changed; each section carries a hidden `%% aegis:<key> %%` marker, so a
+  re-run adds nothing twice.
+- **The journal:** with the vault configured, the nightly daylog appends to
+  `journal/DD MMM YY.md`, the weekly rollup to `journal/[W]ww MMM YY.md` and
+  the monthly one to `journal/<YYYY>/MM. MMM.md`, each under `## Raphael`. A
+  new note is rendered from the vault's own template. No `daylog` knowledge row
+  is filed then; if the vault write fails the row is filed as before and the
+  run reports `vault_error`.
+- **Conflicts:** `obsidian-git` commits from the phone and laptop. A rejected
+  push or a conflicting rebase drops Raphael's own unpushed commit, pulls fresh
+  and retries once; a second failure is reported and nothing is kept. Raphael
+  never force-pushes.
+
+### Setting it up
+
+1. Make an ed25519 key pair and add the public half to the vault repo as a
+   deploy key **with write access** (GitHub → Settings → Deploy keys). Keep
+   the private half out of chat and out of the repo.
+2. On AEGIS's Integrations page, group **Notes (vault)**: set
+   `notes_repo_url` (`git@github.com:arshadansari27/arshad-workspace.git`) and
+   paste the private key into `notes_deploy_key`. Restart core and the worker
+   (the key is written to disk, mode 0600, at boot). The checkout is
+   `/app/config/notes`, beside the books; no infra change is needed.
+3. Grant Raphael the four tools. The DB `tool_set` wins over the seed:
+
+   ```sql
+   UPDATE agents SET metadata = jsonb_set(metadata, '{tool_set}',
+     (metadata->'tool_set') || '["note_search","note_read","note_write","note_link"]'::jsonb)
+   WHERE id = 'raphael' AND NOT (metadata->'tool_set' ? 'note_search');
+   ```
+4. Build the index without waiting for :19: `temporal schedule trigger
+   --schedule-id notes-sync-hourly`. The first pass over ~1,000 notes takes a
+   few runs (`remaining` in the summary counts down).
+5. Optional, once: write the daylog's existing entries into the journal —
+   `temporal workflow start --type NotesBackfillFlow --task-queue aegis-main
+   --workflow-id notes-backfill-journal --input '{"agent_id": "raphael"}'`.
+   It uses the live markers, so a second run writes nothing.
+
+Until step 2 every part reports `not_configured` and the daylog files its
+knowledge rows exactly as before.
+
 ## Troubleshooting
 
 | Symptom | Cause |

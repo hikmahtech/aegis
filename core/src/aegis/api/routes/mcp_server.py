@@ -257,16 +257,37 @@ _READ_ONLY_TOOLS = frozenset(
         "get_market_overview",
         "get_quote",
         "last_contact_with_person",
+        # The Calibre library (#510): search, one book, a read, suggestions —
+        # read from calibre-web and returned, never stored.
+        "library_book",
+        "library_read",
+        "library_search",
+        "library_suggest",
+        # The feed list and what each feed is worth (#511). Not the two
+        # feed writers: subscribing and unsubscribing change what is polled.
+        "list_feeds",
         "list_interactions",
         "list_next_actions",
         "list_projects",
         "list_social_channels",
+        # The vault's two reads (#514): a search of the index and one note
+        # from the checkout (a pull of the local copy, never a vault write).
+        # Not note_write / note_link: both start NotesWriteFlow.
+        "note_read",
+        "note_search",
+        # The research lane's four reads (#509): a search, a page, a paper
+        # search, a paper — fetched and returned, never stored. Not
+        # `research_topic`: since #509 it starts `ResearchFlow`, which saves
+        # its answer to the knowledge store.
+        "paper_read",
+        "paper_search",
         "query_activities",
         "query_observations",
-        "research_topic",
+        "read_url",
         "search_knowledge",
         "social_timeline",
         "system_status",
+        "web_search",
         "whats_next",
     }
 )

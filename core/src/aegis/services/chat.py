@@ -21,7 +21,9 @@ from aegis.llm import parse_llm_json
 from aegis.llm.tier import resolve_model_for_agent, tier_to_model, tier_to_model_or
 from aegis.mcp_manager import MCPError
 from aegis.observability import log_audit, record_llm_call, record_tool_call
-from aegis.services.source_types import DEFAULT_DECAY_DAYS, get_decay_days
+from aegis.services.library import LIBRARY_READ_TIMEOUT_S
+from aegis.services.research import FETCH_TOOL_TIMEOUT_S, RESEARCH_TOOL_TIMEOUT_S
+from aegis.services.source_types import DEFAULT_DECAY_DAYS, get_decay_days, get_rank_boost
 from aegis.services.tools.base import (
     _MAX_LISTED_DROPPED_KEYS,  # noqa: F401 — re-export: kept importable from here
     _SHRINK_PASSES,  # noqa: F401 — re-export: imported from here by tests
@@ -33,6 +35,11 @@ from aegis.services.tools.base import (
     _smart_subset,  # noqa: F401 — re-export: imported from here by tests
     _truncate_result,
     _truncate_text,  # noqa: F401 — re-export: routes/mcp_server.py imports it here
+)
+from aegis.services.tools.feeds import (
+    _exec_follow_feed,
+    _exec_list_feeds,
+    _exec_unsubscribe_feed,
 )
 from aegis.services.tools.gtd import (
     _assignee_labels,  # noqa: F401 — re-export: imported from here by tests
@@ -84,7 +91,29 @@ from aegis.services.tools.ledger import (  # noqa: F401 — re-export: imported 
     _exec_ledger_query,
     _exec_ledger_reclassify,
 )
+from aegis.services.tools.library import (
+    _exec_library_book,
+    _exec_library_read,
+    _exec_library_search,
+    _exec_library_suggest,
+)
+from aegis.services.tools.notes import (
+    NOTE_READ_TIMEOUT_S,
+    NOTES_TOOL_TIMEOUT_S,
+    _exec_note_link,
+    _exec_note_read,
+    _exec_note_search,
+    _exec_note_write,
+)
 from aegis.services.tools.registry import TOOL_REGISTRY
+from aegis.services.tools.research import (  # noqa: F401 — re-export: imported from here by tests
+    _exec_paper_read,
+    _exec_paper_search,
+    _exec_read_url,
+    _exec_research_topic,
+    _exec_web_search,
+)
+from aegis.services.tools.topics import _exec_untrack_topic
 from aegis.services.tools.vercel import (
     _exec_vercel_get_build_logs,
     _exec_vercel_get_deployment,
@@ -470,6 +499,27 @@ CHAT_TOOLS = [
             },
         },
     },
+    # Stop tracking one (#513), generated from services/tools/topics.py.
+    _registry_schema("untrack_topic"),
+    # The research lane's four reads (#509), generated from services/tools/research.py.
+    _registry_schema("web_search"),
+    _registry_schema("read_url"),
+    _registry_schema("paper_search"),
+    _registry_schema("paper_read"),
+    # The feed list (#511), generated from services/tools/feeds.py.
+    _registry_schema("list_feeds"),
+    _registry_schema("subscribe_feed"),
+    _registry_schema("unsubscribe_feed"),
+    # The Calibre library (#510), generated from services/tools/library.py.
+    _registry_schema("library_search"),
+    _registry_schema("library_book"),
+    _registry_schema("library_read"),
+    _registry_schema("library_suggest"),
+    # The Obsidian vault (#514), generated from services/tools/notes.py.
+    _registry_schema("note_search"),
+    _registry_schema("note_read"),
+    _registry_schema("note_write"),
+    _registry_schema("note_link"),
     {
         "type": "function",
         "function": {
@@ -1411,6 +1461,27 @@ _TOOL_TIMEOUT_OVERRIDES: dict[str, int] = {
     "ledger_post": LEDGER_TOOL_TIMEOUT_S,
     "ledger_reclassify": LEDGER_TOOL_TIMEOUT_S,
     "ledger_add_rule": LEDGER_TOOL_TIMEOUT_S,
+    # `research_topic` hands the research to `ResearchFlow` and waits
+    # `RESEARCH_WAIT_S` for it (#509); this is the floor under that wait. The
+    # three fetch tools read one page or PDF, or query two paper engines, which
+    # the 30s default cannot always fit.
+    "research_topic": RESEARCH_TOOL_TIMEOUT_S,
+    "read_url": FETCH_TOOL_TIMEOUT_S,
+    "paper_search": FETCH_TOOL_TIMEOUT_S,
+    "paper_read": FETCH_TOOL_TIMEOUT_S,
+    # subscribe_feed fetches the URL to check it is a feed (#511).
+    "subscribe_feed": FETCH_TOOL_TIMEOUT_S,
+    # The library tools reach calibre-web; a read downloads one book and
+    # extracts it, which a long PDF can stretch well past a minute (#510).
+    "library_search": FETCH_TOOL_TIMEOUT_S,
+    "library_book": FETCH_TOOL_TIMEOUT_S,
+    "library_read": LIBRARY_READ_TIMEOUT_S,
+    "library_suggest": FETCH_TOOL_TIMEOUT_S,
+    # The vault (#514): a read may pull first; the two writers wait on
+    # NotesWriteFlow, as the ledger writers wait on BooksWriteFlow.
+    "note_read": NOTE_READ_TIMEOUT_S,
+    "note_write": NOTES_TOOL_TIMEOUT_S,
+    "note_link": NOTES_TOOL_TIMEOUT_S,
 }
 
 
@@ -1940,176 +2011,23 @@ async def _exec_get_finance_news(pool: asyncpg.Pool, args: dict, ctx: ToolContex
     return json.dumps({"query": query, "results": results})
 
 
-async def _exec_research_topic(pool: asyncpg.Pool, args: dict, ctx: ToolContext) -> str:
-    """Research a topic by combining KG data with fresh web search results."""
-    if not ctx.search_connector or not ctx.llm_client:
-        return json.dumps(
-            {"error": "Search connector and LLM client are required for research_topic"}
-        )
-
-    query = args.get("query", "").strip()
-    depth = args.get("depth", "quick")
-    domains = args.get("domains") or []
-
-    # Build web search query with optional domain restrictions
-    web_query = query
-    if domains:
-        site_terms = " OR ".join(f"site:{d}" for d in domains)
-        web_query = f"{query} ({site_terms})"
-
-    search_limit = 20 if depth == "thorough" else 10
-
-    # Parallel: KG search + web search
-    kg_results: list[dict] = []
-    web_results: list[dict] = []
-
-    try:
-        if ctx.knowledge_connector:
-            kg_results = await ctx.knowledge_connector.search(query, limit=5)
-    except Exception as exc:
-        logger.warning("research_topic_kg_error", error=str(exc))
-
-    try:
-        web_results = await ctx.search_connector.search(web_query, limit=search_limit)
-    except Exception as exc:
-        logger.warning("research_topic_web_error", error=str(exc))
-
-    # Build synthesis prompt
-    kg_section = ""
-    if kg_results:
-        kg_lines = "\n".join(
-            f"- {r.get('title', 'Unknown')}: {(r.get('summary') or r.get('text') or '')[:300]}"
-            for r in kg_results[:5]
-        )
-        kg_section = f"## Knowledge Graph\n{kg_lines}\n\n"
-
-    web_section = ""
-    if web_results:
-        web_lines = "\n".join(
-            f"- {r.get('title', 'Unknown')} ({r.get('url', '')}): {r.get('content', '')[:300]}"
-            for r in web_results[:10]
-        )
-        web_section = f"## Web Search Results\n{web_lines}\n\n"
-
-    if not kg_section and not web_section:
-        return json.dumps(
-            {
-                "synthesis": "No results found.",
-                "sources": {"knowledge_graph": 0, "web_search": 0},
-                "top_urls": [],
-            }
-        )
-
-    prompt = (
-        f"Synthesize the following research on: {query}\n\n"
-        f"{kg_section}{web_section}"
-        "Provide a concise, factual synthesis in 2-4 paragraphs. Focus on key findings, patterns, and actionable insights."
-    )
-
-    synthesis = ""
-    synthesized = False
-    try:
-        # purpose + agent_id + db_pool ⇒ think() records the call in llm_calls.
-        # Without them research_topic was the one chat tool whose model spend
-        # never showed up anywhere (#508).
-        result = await ctx.llm_client.think(
-            prompt=prompt,
-            model=ctx.model_light,
-            max_tokens=600,
-            db_pool=pool,
-            purpose="research_topic",
-            agent_id=ctx.agent_id,
-        )
-        synthesis = result.get("response", "")
-        synthesized = bool(synthesis)
-    except Exception as exc:
-        logger.warning("research_topic_synthesis_error", error=str(exc))
-        synthesis = f"Research gathered {len(kg_results)} KG results and {len(web_results)} web results but synthesis failed."
-
-    # Save a real synthesis, and wait for the save (#508). This used to be a
-    # bare asyncio.create_task inside `except: pass`: nothing awaited it or held
-    # it, so a failed save vanished without a log line — and the "synthesis
-    # failed" apology above was saved as if it were research.
-    saved = False
-    if ctx.knowledge_connector and synthesized:
-        import time as _time
-
-        try:
-            await asyncio.wait_for(
-                ctx.knowledge_connector.ingest_content(
-                    url=f"aegis://research/{int(_time.time())}",
-                    title=f"Research: {query}",
-                    summary=synthesis,
-                    source_type="research",
-                    raw_text=synthesis,
-                    tags=["research", "chat_tool"],
-                ),
-                timeout=30,
-            )
-            saved = True
-        except Exception as exc:
-            logger.warning("research_topic_save_failed", error=str(exc)[:200])
-
-    top_urls = [r.get("url", "") for r in web_results[:5] if r.get("url")]
-
-    return json.dumps(
-        {
-            "synthesis": synthesis,
-            "sources": {"knowledge_graph": len(kg_results), "web_search": len(web_results)},
-            "top_urls": top_urls,
-            "saved": saved,
-        },
-        default=str,
-    )
-
-
 async def _exec_track_topic(pool: asyncpg.Pool, args: dict, ctx: ToolContext) -> str:
-    """Subscribe to ongoing intelligence monitoring for a topic."""
-    topic_name = args.get("topic_name", "").strip()
-    queries = args.get("queries", [])
-    priority = args.get("priority", "medium")
+    """Subscribe to ongoing intelligence monitoring for a topic.
 
-    if not topic_name or not queries:
-        return json.dumps({"error": "topic_name and queries are required"})
+    The registry write and the topic's hub round are `research_topics.track`
+    (#513), shared with the curiosity card that asks "track this?"."""
+    from aegis.services import research_topics
 
-    # Load current intelligence_topics from settings
-    row = await pool.fetchrow("SELECT value FROM settings WHERE key = 'intelligence_topics'")
-    existing_data: dict = {}
-    if row and row["value"]:
-        existing_data = row["value"] if isinstance(row["value"], dict) else {}
-
-    topics: list[dict] = existing_data.get("topics", [])
-
-    # Check if topic already exists
-    status = "added"
-    updated_topics = []
-    found = False
-    for t in topics:
-        if t.get("name", "").lower() == topic_name.lower():
-            updated_topics.append({"name": topic_name, "queries": queries, "priority": priority})
-            status = "updated"
-            found = True
-        else:
-            updated_topics.append(t)
-
-    if not found:
-        updated_topics.append({"name": topic_name, "queries": queries, "priority": priority})
-
-    new_value = {"topics": updated_topics}
-    await pool.execute(
-        "INSERT INTO settings (key, value, updated_at) VALUES ('intelligence_topics', $1, NOW()) "
-        "ON CONFLICT (key) DO UPDATE SET value = $1, updated_at = NOW()",
-        new_value,
-    )
-
-    return json.dumps(
-        {
-            "status": status,
-            "topic": topic_name,
-            "query_count": len(queries),
-            "total_topics": len(updated_topics),
-        }
-    )
+    try:
+        out = await research_topics.track(
+            pool,
+            str(args.get("topic_name") or ""),
+            list(args.get("queries") or []),
+            str(args.get("priority") or "medium"),
+        )
+    except ValueError as exc:
+        return json.dumps({"error": str(exc)})
+    return json.dumps(out, default=str)
 
 
 _TRIAGE_SETTING_KEYS = {
@@ -2514,11 +2432,15 @@ async def _exec_pdf_to_text(pool: asyncpg.Pool, args: dict, ctx: ToolContext) ->
     from urllib.parse import urlparse
 
     from aegis.services.content_extract import fetch_and_extract
+    from aegis.services.url_guard import UnsafeURLError
 
     url = (args.get("url") or "").strip()
     if not url.startswith(("http://", "https://")):
         return json.dumps({"error": "A full http(s) URL to a PDF is required"})
-    text, _title = await fetch_and_extract(url, max_chars=2_000_000)
+    try:
+        text, _title = await fetch_and_extract(url, max_chars=2_000_000)
+    except UnsafeURLError as exc:
+        return json.dumps({"error": f"That URL cannot be fetched: {exc}"})
     if not text:
         return json.dumps(
             {"error": "Could not extract text (fetch failed, not a PDF, or scanned/image-only)"}
@@ -3134,6 +3056,22 @@ TOOL_EXECUTORS: dict[str, Any] = {
     "get_finance_news": _exec_get_finance_news,
     "research_topic": _exec_research_topic,
     "track_topic": _exec_track_topic,
+    "untrack_topic": _exec_untrack_topic,
+    "web_search": _exec_web_search,
+    "read_url": _exec_read_url,
+    "paper_search": _exec_paper_search,
+    "paper_read": _exec_paper_read,
+    "list_feeds": _exec_list_feeds,
+    "subscribe_feed": _exec_follow_feed,
+    "unsubscribe_feed": _exec_unsubscribe_feed,
+    "library_search": _exec_library_search,
+    "library_book": _exec_library_book,
+    "library_read": _exec_library_read,
+    "library_suggest": _exec_library_suggest,
+    "note_search": _exec_note_search,
+    "note_read": _exec_note_read,
+    "note_write": _exec_note_write,
+    "note_link": _exec_note_link,
     "configure_triage": _exec_configure_triage,
     "update_runbook": _exec_update_runbook,
     "list_nodes": _exec_list_nodes,
@@ -3235,7 +3173,23 @@ AGENT_TOOL_SETS: dict[str, set[str]] = {
         "search_knowledge",
         "ask_knowledge",
         "research_topic",
+        # The research lane's reads (#509): search, a page, papers.
+        "web_search",
+        "read_url",
+        "paper_search",
+        "paper_read",
+        # The feed list (#511): see it, add a feed, drop one.
+        "list_feeds",
+        "subscribe_feed",
+        "unsubscribe_feed",
+        # The Calibre library (#510): search it, read from it, suggest books.
+        "library_search",
+        "library_book",
+        "library_read",
+        "library_suggest",
         "track_topic",
+        # Tracked topics' rounds in the hub (#513): stop tracking one.
+        "untrack_topic",
         "remember_this",
         # Problem hub, the session registry: read a task's context, register
         # a session on it, fold a duplicate problem away.
@@ -3512,8 +3466,11 @@ def _apply_knowledge_decay(items: list[dict]) -> list[dict]:
         days = item.get("days_since_referenced", 0)
         decay_factor = max(0.1, 1.0 - (days / decay_window))
         # similarity can be None (BM25-only chunks from knowledge-service);
-        # coerce so the multiply doesn't break.
-        item["effective_score"] = (item.get("similarity") or 0) * decay_factor
+        # coerce so the multiply doesn't break. The rank boost is 1.0 for every
+        # type but the user's own notes, which rank above raw documents (#514).
+        item["effective_score"] = (
+            (item.get("similarity") or 0) * decay_factor * get_rank_boost(source_type)
+        )
     return items
 
 

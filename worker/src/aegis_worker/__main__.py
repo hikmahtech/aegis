@@ -22,6 +22,7 @@ from aegis_worker.activities.alert_governance import AlertGovernanceActivities
 from aegis_worker.activities.alerts import AlertActivities
 from aegis_worker.activities.briefing import BriefingActivities
 from aegis_worker.activities.calendar import CalendarActivities
+from aegis_worker.activities.calibre import CalibreActivities
 from aegis_worker.activities.capture import CaptureActivities
 from aegis_worker.activities.channels import ChannelActivities
 from aegis_worker.activities.chat import ChatActivities
@@ -48,9 +49,11 @@ from aegis_worker.activities.llm_governor import LLMGovernorActivities
 from aegis_worker.activities.meeting import MeetingActivities
 from aegis_worker.activities.memory import MemoryActivities
 from aegis_worker.activities.money import MoneyActivities
+from aegis_worker.activities.notes import NotesActivities
 from aegis_worker.activities.people import PeopleActivities
 from aegis_worker.activities.profile import ProfileActivities
 from aegis_worker.activities.raindrop import RaindropActivities
+from aegis_worker.activities.research import ResearchActivities
 from aegis_worker.activities.review import ReviewActivities
 from aegis_worker.activities.rss import RssActivities
 from aegis_worker.activities.runs_v3 import RunRecorderActivities
@@ -338,6 +341,7 @@ async def main():
         db_pool=deps.pool,
         llm_client=deps.llm,
         model=model_balanced,
+        settings=settings,
     )
     # A1 shipped the write substrate; A2 (ProfileReflectionFlow) drives it.
     profile_act = ProfileActivities(
@@ -395,6 +399,32 @@ async def main():
     raindrop_act = RaindropActivities(
         raindrop_api_token=getattr(settings, "raindrop_api_token", ""),
         db_pool=deps.pool,
+    )
+    # The research lane (#509). Raphael's tier is smart, so the synthesis runs
+    # on the tier-resolved smart model, never the raw settings field.
+    research_act = ResearchActivities(
+        knowledge_connector=connectors.get("knowledge"),
+        search_connector=connectors.get("search"),
+        llm_client=deps.llm,
+        model=deps.model_tiers.get("smart") or settings.model_smart,
+        db_pool=deps.pool,
+        settings=settings,
+    )
+    # The Calibre library index (#510). The connector is built from the
+    # Integrations settings on first use, so there is nothing to wire here
+    # but the knowledge store it indexes into.
+    calibre_act = CalibreActivities(
+        knowledge_connector=connectors.get("knowledge"),
+        db_pool=deps.pool,
+        settings=settings,
+    )
+    # Raphael's notes (#514): the Obsidian vault checkout is read from the
+    # Integrations settings on every call, so a key saved in the admin UI
+    # applies after the worker restart the page already asks for.
+    notes_act = NotesActivities(
+        settings=settings,
+        db_pool=deps.pool,
+        knowledge_connector=connectors.get("knowledge"),
     )
     rss_act = RssActivities(db_pool=deps.pool)
     # B7 — wearable vendor poll. An empty token is not an error here: the
@@ -599,6 +629,9 @@ async def main():
         daylog_act,
         raindrop_act,
         rss_act,
+        research_act,
+        calibre_act,
+        notes_act,
         wearable_act,
         intel_scan_act,
         sentry_ingest_act,

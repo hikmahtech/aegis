@@ -61,6 +61,20 @@ CONFIG_REGISTRY: list[ConfigKey] = [
     ConfigKey("elevenlabs_api_key", "API key", "Voice (ElevenLabs)", True),
     ConfigKey("raindrop_api_token", "API token", "Raindrop", True),
     ConfigKey(
+        "calibre_url", "calibre-web URL (internal)", "Calibre (library)", False,
+        help="Default http://calibre-web_calibre-web:8083, the internal swarm address. "
+        "Never the public calibre host: Cloudflare Access answers every path there with "
+        "a login redirect, and AEGIS refuses it. Core applies a change on save; "
+        "CalibreSyncFlow (the worker) on restart.",
+    ),
+    ConfigKey(
+        "calibre_user", "calibre-web user", "Calibre (library)", False,
+        help="A dedicated read-only calibre-web user for AEGIS: download allowed, no "
+        "upload, edit or delete. Blank = the library tools say not configured and "
+        "CalibreSyncFlow reports not_configured.",
+    ),
+    ConfigKey("calibre_password", "calibre-web password", "Calibre (library)", True),
+    ConfigKey(
         "jira_base_url", "Site URL (https://yours.atlassian.net)", "Jira", False,
         help="JiraSyncFlow closes a Todoist task once its issue has a resolution. "
         "It exists because Jira sends NO notification for a transition you make "
@@ -85,8 +99,6 @@ CONFIG_REGISTRY: list[ConfigKey] = [
         "Blank = the flow reports token_missing and never calls the API. "
         "Worker restart required.",
     ),
-    ConfigKey("miniflux_url", "Base URL", "RSS (Miniflux)", False),
-    ConfigKey("miniflux_api_key", "API key", "RSS (Miniflux)", True),
     ConfigKey("searxng_url", "Base URL", "Search (SearXNG)", False),
     ConfigKey("finance_provider", "Provider (yahoo | stooq)", "Finance", False),
     ConfigKey("finance_indices", "Overview indices (comma-sep symbols)", "Finance", False),
@@ -199,6 +211,18 @@ CONFIG_REGISTRY: list[ConfigKey] = [
         "books_deploy_key", "Deploy key (private, ed25519)", "Books", True,
         help="Paste the PEM (multi-line) or its base64. Written to the credentials dir "
         "with mode 0600 at boot; never logged.",
+    ),
+    ConfigKey(
+        "notes_repo_url", "Vault repo URL (git@github.com:you/vault.git)", "Notes (vault)", False,
+        help="The Obsidian vault Raphael reads, indexes and keeps the journal in (#514). "
+        "Append-only: Raphael never changes a line you wrote. Needs the deploy key below "
+        "with WRITE access. Empty = not configured (the daylog keeps filing knowledge rows). "
+        "Core + worker restart required.",
+    ),
+    ConfigKey(
+        "notes_deploy_key", "Vault deploy key (private, ed25519)", "Notes (vault)", True,
+        help="Paste the PEM (multi-line) or its base64. Written to the credentials dir with "
+        "mode 0600 at boot; never logged.",
     ),
     ConfigKey(
         "books_ignored_mailboxes", "Ignored mailboxes (comma-separated labels)", "Books", False,

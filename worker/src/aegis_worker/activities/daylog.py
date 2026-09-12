@@ -30,11 +30,13 @@ already-filed day logs back out and `distil_rollup` condenses them into one
 
 from __future__ import annotations
 
+import asyncio
 import re
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from typing import Any
 
+from aegis.services import notes
 from temporalio import activity
 
 # Ordered so the fallback narrative reads chronologically-ish rather than by
@@ -211,6 +213,9 @@ class DayLogActivities:
     db_pool: Any = None
     llm_client: Any = None
     model: str = "gpt-oss:20b"
+    # Only for the vault (#514): with it configured, a rollup reads the days
+    # from the journal notes. None = the vault is not configured.
+    settings: Any = None
 
     # ------------------------------------------------------------- gathering
 
@@ -438,8 +443,56 @@ class DayLogActivities:
             }
             for r in rows
         ]
+        out = await self._merge_journal(out, start, end)
         activity.logger.info("daylog_rollup_gathered start=%s end=%s n=%d", start, end, len(out))
         return out
+
+    @staticmethod
+    def _journal_entry(day: str, text: str) -> str:
+        """One journal note as a rollup entry: Raphael's own section for the
+        day FIRST, then whatever else the note holds, within the clip.
+
+        The section is appended at the END of the note, so clipping the note
+        from the top dropped Raphael's narrative whenever the template plus
+        the user's writing ran past the clip."""
+        mine, rest = notes.split_section(text, notes.journal_key("daily", day))
+        if not mine:
+            return text[:_ROLLUP_ENTRY_CLIP]
+        out = mine[:_ROLLUP_ENTRY_CLIP]
+        room = _ROLLUP_ENTRY_CLIP - len(out) - len("\n\nAlso in the note:\n")
+        if rest.strip() and room > 0:
+            out += "\n\nAlso in the note:\n" + rest.strip()[:room]
+        return out
+
+    async def _merge_journal(self, out: list[dict], start: str, end: str) -> list[dict]:
+        """With the vault configured (#514), each day's journal note stands in
+        for its knowledge row — the note is the record since Raphael took the
+        journal over, and it also holds whatever the user wrote that day. A day
+        with no note keeps its old knowledge row, so a week spanning the
+        switch-over still rolls up whole. Encrypted blocks are stripped by the
+        read; they never reach the rollup's model."""
+        cfg = notes.config_from_settings(self.settings)
+        if self.settings is None or not cfg.configured:
+            return out
+        try:
+            first, last = date.fromisoformat(start), date.fromisoformat(end)
+        except ValueError:
+            return out
+        days = [first + timedelta(days=i) for i in range(max(0, (last - first).days) + 1)]
+        try:
+            journal = await asyncio.to_thread(notes.read_journal_days_sync, cfg, days)
+        except notes.NotesError as exc:
+            activity.logger.warning("daylog_journal_read_failed err=%s", str(exc)[:200])
+            return out
+        by_date = {e["date"]: e for e in out}
+        for day, text in journal.items():
+            if text.strip():
+                by_date[day] = {
+                    "date": day,
+                    "title": f"Journal {day}",
+                    "text": self._journal_entry(day, text),
+                }
+        return [by_date[k] for k in sorted(by_date)]
 
     @activity.defn
     async def distil_rollup(

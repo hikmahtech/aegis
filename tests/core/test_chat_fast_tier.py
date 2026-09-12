@@ -144,9 +144,9 @@ async def test_intent_routing_falls_back_to_settings_when_no_fast_tier_is_loaded
 
 @pytest.mark.asyncio
 async def test_model_light_is_the_fast_tier_model_not_the_env_field(monkeypatch):
-    """`ToolContext.model_light` is what `_exec_research_topic` synthesises
-    with (`chat.py`, `think(model=ctx.model_light)`) — the same bypass, one
-    layer further in."""
+    """`ToolContext.model_light` is the model chat tools synthesise with — the
+    same bypass, one layer further in. (`research_topic` used it until #509
+    moved its synthesis onto `ResearchFlow` and the smart tier.)"""
     built = _capture_tool_context(monkeypatch)
     await send_message(_chat_pool(), _chat_llm(), "sebas", "hello", settings=_settings())
     assert built, "send_message built no ToolContext"

@@ -1,293 +1,128 @@
-"""Tests for research_topic chat tool."""
+"""research_topic hands the question to ResearchFlow and relays its answer (#509).
 
+The research itself is tested where it now lives: the shared steps in
+`test_research_service.py`, the worker steps in
+`tests/worker/activities/test_research_activities.py`, the flow in
+`tests/worker/flows/test_research_flow.py`. These pin the hand-off — the
+workflow id, the payload, the wait, re-attaching, and every way it can fail
+without raising.
+"""
+
+import asyncio
 import json
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from aegis.services import research as rs
 from aegis.services.chat import ToolContext, _exec_research_topic
+from temporalio.exceptions import WorkflowAlreadyStartedError
+
+_RESULT = {
+    "status": "ok",
+    "answer": "RAG retrieves, then generates [1].",
+    "sources": [
+        {"n": 1, "kind": "web", "title": "A", "url": "https://a.example/1"},
+        {"n": 2, "kind": "knowledge", "title": "Stored", "url": "aegis://research/x"},
+    ],
+    "saved": True,
+}
 
 
-@pytest.fixture
-def pool():
-    return AsyncMock()
+def _client(*, result=None, start_raises=None, result_raises=None, hang=False):
+    handle = MagicMock()
 
+    async def _result():
+        if hang:
+            await asyncio.sleep(3600)
+        if result_raises is not None:
+            raise result_raises
+        return _RESULT if result is None else result
 
-@pytest.fixture
-def ctx_with_connectors():
-    ctx = ToolContext(
-        agent_id="sebas",
-        knowledge_connector=AsyncMock(
-            search=AsyncMock(
-                return_value=[
-                    {
-                        "content": "Previous AI research",
-                        "similarity": 0.7,
-                        "title": "AI Overview",
-                        "summary": "Prior KG data",
-                    }
-                ]
-            ),
-            ingest_content=AsyncMock(return_value={"ok": True}),
-        ),
-        search_connector=AsyncMock(
-            search=AsyncMock(
-                return_value=[
-                    {
-                        "title": "New AI Model",
-                        "url": "https://example.com/ai",
-                        "content": "A new model released...",
-                    },
-                ]
-            ),
-        ),
-        llm_client=AsyncMock(),
+    handle.result = _result
+    client = MagicMock()
+    client.start_workflow = (
+        AsyncMock(side_effect=start_raises) if start_raises else AsyncMock(return_value=handle)
     )
-    ctx.llm_client.think = AsyncMock(return_value={"response": "AI is advancing rapidly."})
-    return ctx
+    client.get_workflow_handle = MagicMock(return_value=handle)
+    return client
 
 
-async def test_research_topic_quick(pool, ctx_with_connectors):
-    result = await _exec_research_topic(
-        pool, {"query": "latest AI", "depth": "quick"}, ctx_with_connectors
+async def _call(args: dict, client=None, agent_id="raphael") -> dict:
+    ctx = ToolContext(agent_id=agent_id, temporal_client=client)
+    return json.loads(await _exec_research_topic(None, args, ctx))
+
+
+async def test_the_question_is_handed_to_the_flow_and_its_answer_relayed():
+    client = _client()
+    data = await _call(
+        {"query": "What is RAG?", "depth": "thorough", "domains": ["arxiv.org"]}, client
     )
-    data = json.loads(result)
-    assert "synthesis" in data
-    assert data["synthesis"] == "AI is advancing rapidly."
-    assert data["sources"]["knowledge_graph"] == 1
-    assert data["sources"]["web_search"] == 1
-    assert len(data["top_urls"]) == 1
-    assert data["top_urls"][0] == "https://example.com/ai"
-
-
-async def test_research_topic_thorough_uses_higher_limit(pool):
-    search_connector = AsyncMock()
-    search_connector.search = AsyncMock(
-        return_value=[
-            {"title": f"Result {i}", "url": f"https://example.com/{i}", "content": "text"}
-            for i in range(5)
-        ]
-    )
-    ctx = ToolContext(
-        agent_id="raphael",
-        search_connector=search_connector,
-        llm_client=AsyncMock(),
-    )
-    ctx.llm_client.think = AsyncMock(return_value={"response": "Thorough synthesis."})
-
-    result = await _exec_research_topic(pool, {"query": "test", "depth": "thorough"}, ctx)
-    data = json.loads(result)
-    assert "synthesis" in data
-
-    # Verify limit=20 was passed for thorough depth
-    call_kwargs = search_connector.search.call_args
-    assert call_kwargs[1].get("limit") == 20 or call_kwargs[0][1] == 20
-
-
-async def test_research_topic_quick_uses_limit_10(pool):
-    search_connector = AsyncMock()
-    search_connector.search = AsyncMock(return_value=[])
-    ctx = ToolContext(
-        agent_id="sebas",
-        search_connector=search_connector,
-        llm_client=AsyncMock(),
-    )
-    ctx.llm_client.think = AsyncMock(return_value={"response": "No results."})
-
-    await _exec_research_topic(pool, {"query": "test", "depth": "quick"}, ctx)
-    call_kwargs = search_connector.search.call_args
-    limit_arg = call_kwargs[1].get("limit") if call_kwargs[1] else call_kwargs[0][1]
-    assert limit_arg == 10
-
-
-async def test_research_topic_domain_filter(pool):
-    search_connector = AsyncMock()
-    search_connector.search = AsyncMock(
-        return_value=[
-            {"title": "arxiv paper", "url": "https://arxiv.org/paper1", "content": "ML research"}
-        ]
-    )
-    ctx = ToolContext(
-        agent_id="raphael",
-        search_connector=search_connector,
-        llm_client=AsyncMock(),
-    )
-    ctx.llm_client.think = AsyncMock(return_value={"response": "Domain-filtered research."})
-
-    result = await _exec_research_topic(
-        pool,
-        {"query": "machine learning", "domains": ["arxiv.org", "scholar.google.com"]},
-        ctx,
-    )
-    data = json.loads(result)
-    assert "synthesis" in data
-
-    # Verify domain terms were included in the query
-    call_args = search_connector.search.call_args
-    query_arg = call_args[0][0] if call_args[0] else call_args[1].get("query", "")
-    assert "site:arxiv.org" in query_arg or "arxiv.org" in query_arg
-
-
-async def test_research_topic_no_connectors(pool):
-    ctx = ToolContext(agent_id="sebas")  # no connectors
-    result = await _exec_research_topic(pool, {"query": "test"}, ctx)
-    data = json.loads(result)
-    assert "error" in data
-
-
-async def test_research_topic_no_search_connector(pool):
-    ctx = ToolContext(
-        agent_id="sebas",
-        knowledge_connector=AsyncMock(),
-        llm_client=AsyncMock(),
-        # search_connector intentionally omitted
-    )
-    result = await _exec_research_topic(pool, {"query": "test"}, ctx)
-    data = json.loads(result)
-    assert "error" in data
-
-
-async def test_research_topic_no_llm_client(pool):
-    ctx = ToolContext(
-        agent_id="sebas",
-        search_connector=AsyncMock(),
-        # llm_client intentionally omitted
-    )
-    result = await _exec_research_topic(pool, {"query": "test"}, ctx)
-    data = json.loads(result)
-    assert "error" in data
-
-
-async def test_research_topic_no_kg_results(pool):
-    """Should still work when KG returns no results."""
-    search_connector = AsyncMock()
-    search_connector.search = AsyncMock(
-        return_value=[
-            {"title": "Web only", "url": "https://example.com", "content": "some content"}
-        ]
-    )
-    ctx = ToolContext(
-        agent_id="sebas",
-        search_connector=search_connector,
-        # No knowledge_connector
-        llm_client=AsyncMock(),
-    )
-    ctx.llm_client.think = AsyncMock(return_value={"response": "Web-only synthesis."})
-
-    result = await _exec_research_topic(pool, {"query": "test"}, ctx)
-    data = json.loads(result)
-    assert "synthesis" in data
-    assert data["sources"]["knowledge_graph"] == 0
-    assert data["sources"]["web_search"] == 1
-
-
-async def test_research_topic_no_results_at_all(pool):
-    """Returns graceful response when both KG and web return empty."""
-    search_connector = AsyncMock()
-    search_connector.search = AsyncMock(return_value=[])
-    knowledge_connector = AsyncMock()
-    knowledge_connector.search = AsyncMock(return_value=[])
-    ctx = ToolContext(
-        agent_id="sebas",
-        search_connector=search_connector,
-        knowledge_connector=knowledge_connector,
-        llm_client=AsyncMock(),
-    )
-
-    result = await _exec_research_topic(pool, {"query": "obscure_topic_xyz"}, ctx)
-    data = json.loads(result)
-    assert "synthesis" in data
-    assert data["sources"]["knowledge_graph"] == 0
-    assert data["sources"]["web_search"] == 0
-
-
-async def test_research_topic_top_urls_capped_at_5(pool):
-    """top_urls in response should be capped at 5."""
-    web_results = [
-        {"title": f"Result {i}", "url": f"https://example.com/{i}", "content": "text"}
-        for i in range(10)
-    ]
-    search_connector = AsyncMock()
-    search_connector.search = AsyncMock(return_value=web_results)
-    ctx = ToolContext(
-        agent_id="sebas",
-        search_connector=search_connector,
-        llm_client=AsyncMock(),
-    )
-    ctx.llm_client.think = AsyncMock(return_value={"response": "Many results."})
-
-    result = await _exec_research_topic(pool, {"query": "popular topic"}, ctx)
-    data = json.loads(result)
-    assert len(data["top_urls"]) <= 5
-
-
-async def test_research_topic_kg_error_graceful(pool):
-    """KG failure should not crash the tool — falls back to web-only."""
-    knowledge_connector = AsyncMock()
-    knowledge_connector.search = AsyncMock(side_effect=Exception("KG down"))
-    search_connector = AsyncMock()
-    search_connector.search = AsyncMock(
-        return_value=[{"title": "Web result", "url": "https://example.com", "content": "content"}]
-    )
-    ctx = ToolContext(
-        agent_id="sebas",
-        knowledge_connector=knowledge_connector,
-        search_connector=search_connector,
-        llm_client=AsyncMock(),
-    )
-    ctx.llm_client.think = AsyncMock(return_value={"response": "Web fallback synthesis."})
-
-    result = await _exec_research_topic(pool, {"query": "test"}, ctx)
-    data = json.loads(result)
-    assert "synthesis" in data
-    assert data["sources"]["knowledge_graph"] == 0
-    assert data["sources"]["web_search"] == 1
-
-
-# --------------------------------------------------------------------------
-# #508 — the call is recorded, and the save is awaited, reported and honest.
-# --------------------------------------------------------------------------
-
-
-async def test_research_topic_records_its_llm_call(pool, ctx_with_connectors):
-    """think() gets a purpose, the agent and the pool, so the call lands in
-    llm_calls. Without them research_topic's spend was invisible."""
-    await _exec_research_topic(pool, {"query": "latest AI"}, ctx_with_connectors)
-    kwargs = ctx_with_connectors.llm_client.think.call_args.kwargs
-    assert kwargs["purpose"] == "research_topic"
-    assert kwargs["agent_id"] == "sebas"
-    assert kwargs["db_pool"] is pool
-
-
-async def test_research_topic_waits_for_its_save(pool, ctx_with_connectors):
-    """The save is awaited before the tool returns. It used to be a bare
-    create_task, which this assertion would catch: a scheduled coroutine has
-    been called but not yet awaited."""
-    data = json.loads(
-        await _exec_research_topic(pool, {"query": "latest AI"}, ctx_with_connectors)
-    )
-    ctx_with_connectors.knowledge_connector.ingest_content.assert_awaited_once()
+    assert data["synthesis"] == "RAG retrieves, then generates [1]."
     assert data["saved"] is True
+    # Only real web links are offered as URLs to follow.
+    assert data["top_urls"] == ["https://a.example/1"]
+    assert data["reattached"] is False
+
+    call = client.start_workflow.await_args
+    assert call.args[0] == "ResearchFlow"
+    assert call.args[1] == {
+        "agent_id": "raphael",
+        "question": "What is RAG?",
+        "depth": "thorough",
+        "domains": ["arxiv.org"],
+        "reply_after_seconds": rs.RESEARCH_WAIT_S,
+    }
+    assert call.kwargs["id"] == rs.research_workflow_id("what is rag", "thorough", ["arxiv.org"])
+    assert call.kwargs["task_queue"] == "aegis-main"
 
 
-async def test_research_topic_reports_a_failed_save(pool, ctx_with_connectors):
-    """A failed save is reported, and the answer still goes back."""
-    ctx_with_connectors.knowledge_connector.ingest_content.side_effect = RuntimeError(
-        "store down"
-    )
-    data = json.loads(
-        await _exec_research_topic(pool, {"query": "latest AI"}, ctx_with_connectors)
-    )
-    assert data["saved"] is False
-    assert data["synthesis"] == "AI is advancing rapidly."
+async def test_a_retried_turn_attaches_to_the_run_in_flight():
+    """The id is the question's hash, so asking again while it runs pays once."""
+    client = _client(start_raises=WorkflowAlreadyStartedError("wid", "ResearchFlow"))
+    data = await _call({"query": "What is RAG?"}, client)
+    client.get_workflow_handle.assert_called_once_with(rs.research_workflow_id("What is RAG?"))
+    assert data["reattached"] is True
+    assert data["synthesis"] == _RESULT["answer"]
 
 
-async def test_research_topic_does_not_save_a_failed_synthesis(pool, ctx_with_connectors):
-    """The "synthesis failed" apology is returned to the chat, never stored as
-    research."""
-    ctx_with_connectors.llm_client.think.side_effect = RuntimeError("model down")
-    data = json.loads(
-        await _exec_research_topic(pool, {"query": "latest AI"}, ctx_with_connectors)
-    )
-    assert "synthesis failed" in data["synthesis"]
-    ctx_with_connectors.knowledge_connector.ingest_content.assert_not_called()
-    assert data["saved"] is False
+async def test_a_long_run_is_reported_as_still_running(monkeypatch):
+    monkeypatch.setattr(rs, "RESEARCH_WAIT_S", 0.05)
+    data = await _call({"query": "slow question"}, _client(hang=True))
+    assert data["status"] == "running"
+    assert data["workflow_id"] == rs.research_workflow_id("slow question")
+    assert "Do not start it again" in data["message"]
+
+
+async def test_no_temporal_means_nothing_ran():
+    data = await _call({"query": "q"}, client=None)
+    assert "Temporal is not reachable" in data["error"]
+
+
+async def test_an_empty_query_is_refused():
+    client = _client()
+    data = await _call({"query": "  "}, client)
+    assert data["error"] == "query is required"
+    client.start_workflow.assert_not_called()
+
+
+async def test_a_dispatch_failure_is_an_answer_not_a_raise():
+    data = await _call({"query": "q"}, _client(start_raises=RuntimeError("frontend down")))
+    assert "could not be started: frontend down" in data["error"]
+
+
+async def test_a_failed_run_is_an_answer_not_a_raise():
+    data = await _call({"query": "q"}, _client(result_raises=RuntimeError("boom")))
+    assert data["error"] == "research failed: boom"
+
+
+@pytest.mark.parametrize("depth", [None, "deep", 3])
+async def test_an_unknown_depth_is_quick(depth):
+    client = _client()
+    await _call({"query": "q", "depth": depth}, client)
+    assert client.start_workflow.await_args.args[1]["depth"] == "quick"
+
+
+async def test_the_agent_defaults_to_raphael():
+    client = _client()
+    await _call({"query": "q"}, client, agent_id=None)
+    assert client.start_workflow.await_args.args[1]["agent_id"] == "raphael"
