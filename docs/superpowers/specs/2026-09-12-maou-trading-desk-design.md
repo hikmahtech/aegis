@@ -121,16 +121,37 @@ is the safe default. Dumping a portfolio because of a pipeline glitch is the fai
 
 | Check | Fails when | Outcome | Problem class |
 |---|---|---|---|
-| Fresh | ansaar returns no rows for the last trading day | `held_stale` | `desk_decisions_stale` |
+| Fresh | ansaar returns no rows for the last trading day, and does not say it was halted | `held_stale` | `desk_decisions_stale` |
 | Complete | a class the desk holds now has no rows today, and no row carries a kill condition or a non-`NORMAL` recovery state | `held_suspect` | `desk_decisions_suspect` |
 | Sane | enabled weights sum to more than 1.0 + 1e-6, or any weight is ≤ 0 or above `max_order_pct` | `held_suspect` | `desk_decisions_suspect` |
 | Halal | a row has `halal_status != 'COMPLIANT'` or `direction != 'LONG'` | the row is dropped and never bought; the rest trades | `desk_decisions_suspect` |
 | Reachable | the ansaar token or request fails | `held_stale` | `desk_source_error` |
 
-An empty day is ambiguous: the pipeline writes zero rows both when it fails and when its risk
-manager halts everything (COOLING). The desk cannot tell these apart, so it holds and asks. The owner
-checks `kill_switch_events`. A later change to ansaar-data #30 can put the halt reason in the
-response.
+**A stated halt flattens the book.** The pipeline writes zero rows both when it fails and when its
+risk manager halts everything (COOLING, or a drawdown scalar of zero), and those two need opposite
+answers. On a halt the pipeline is flat, so a desk that holds is fully invested exactly when the
+risk manager has pulled out. On a failure the desk knows nothing, and selling on a glitch is the
+thing §5 exists to rule out.
+
+So ansaar-data says which, in `meta.halted` and `meta.halt` for the date it served (ansaar-data #33),
+read from `kill_switch_events`. When `meta.halted` is true the desk sells its whole book: `check_decisions`
+returns `flatten` with no rows, so `plan_orders` sees every holding as a name with no target and
+sizes each as the full exit it already knows how to size. The plan row's outcome is `flattened`
+and its `note` keeps the reason as served.
+
+**The desk never reads a halt into silence.** `meta.halted` false, a missing field, an older
+ansaar, or a call that failed all mean "no halt is on record" — the day stays `held_stale` and
+raises `desk_decisions_stale`. A drawdown-scalar halt is recorded nowhere in ClickHouse, so it
+reads that way too: the desk holds and asks, as it does today.
+
+A halt raises no problem of its own. The risk manager stopping is it working, not a fault, and the
+month close names each flattened day and why (§9).
+
+**Why `flattened` and not `orders`.** The other outcomes name what the desk did with the day —
+`held_stale` is "held, because stale". `orders` would say the day was a normal rebalance, and the
+one fact worth keeping about it, that the pipeline halted and the desk sold out, would be gone from
+the record: the decisions copy is empty, so nothing else in AEGIS says so. `flattened` also keeps
+the day out of the `held_back` count, which is for days the desk did nothing on.
 
 ## 6. Paper fills and valuation
 
@@ -183,13 +204,38 @@ response.
   investor. It's bought with the same capital at the start close and pays one buy cost. From then
   on it's held the way the desk holds: its splits adjust the units, and its dividends are paid as
   cash. It trades thinly; a missing close uses the last close on or before that date.
+- **A benchmark gets the same price fallback a holding gets.** It trades thinly enough that Yahoo
+  answers for a market day with a bar carrying no close, and such a day used to stay NULL for ever,
+  so the series the score is measured against quietly grew holes. The fallback needs a mapping,
+  because a benchmark is named in Yahoo's form and ansaar wants the NSE symbol and an asset class:
+  `benchmark_prices` in the rules (§12). An unmapped benchmark gets no fallback, as before. The
+  index is never backfilled — its bars are the market calendar, and the desk takes that from one
+  source only.
 - **No adjusted closes anywhere.** Yahoo rescales its adjusted close after every later dividend,
   so a value stored in September and one fetched in December are in different scales, and their
   ratio is wrong by the dividend.
 - **Context:** `^NSEI` (Nifty 50) as a price index, shown and never used for a verdict.
-- **Weekly excess:** the desk's weekly return (after costs, before tax) minus SHARIABEES's, measured
-  from the last close of one ISO week to the last close of the next.
-- **Statistics:** `n` weeks, mean, standard deviation, and t = mean / sd × √n.
+- **Weekly excess, two readings of the same weeks.** Both are measured from the last close of one
+  ISO week to the last close of the next, and both are reported.
+  - **The headline: the gap to the whole benchmark.** The desk's weekly return (after costs, before
+    tax) minus SHARIABEES's. This answers the owner's real question — what the same money would
+    have earned just buying SHARIABEES — so it stays the number the section leads with.
+  - **The alarm: the gap per rupee actually at risk.** The desk's weekly return divided by the share
+    of it that was invested entering the week, minus SHARIABEES's. Cash earns nothing, so that
+    ratio is the return on the money the desk actually put to work.
+
+  The second one exists because the desk holds roughly the pipeline's own heat — about a third
+  invested, the rest in cash — while the benchmark holds the whole capital. Judged on the headline
+  gap, `below_expectation` fires at twelve weeks in any rising market whatever the stock picking
+  does, which makes the alarm useless and misleading. Two things follow, and both matter:
+  **subtract the scaled benchmark** (`r_desk − w × r_bench`), and **divide by the share**
+  (`r_desk / w − r_bench`). Subtracting alone removes the market's direction but leaves the figure
+  scaled by exposure — it would be a third of the truth, and `expected_excess_pa` comes from a
+  backtest of a *fully invested* book, so a desk delivering exactly what the backtest promised
+  would still be failed. A week entered with less than 1% invested is left out: a return over a
+  share near zero is noise.
+- **Statistics:** `n` weeks, mean, standard deviation, and t = mean / sd × √n. Computed on both
+  series; the label is shown for each.
 - **Label, in words:**
 
   | Condition | Label |
@@ -204,10 +250,17 @@ response.
 - **Warning check** (monthly, at the close): the expected weekly excess is
   `e = (1 + expected_excess_pa)^(1/52) − 1`. The check fires when `n ≥ 12` and
   `mean + 2 × sd/√n < e`, meaning live results are more than two standard errors below what the
-  backtest promised. It raises `desk_below_expectation`. The default for `expected_excess_pa`
-  (0.06) comes from the top-15 backtest (ADR-0062), and `trade_decisions` adds risk overlays on top
-  of that book. So the owner should set this from the trading system's own figure once there is
-  one.
+  backtest promised. **It is judged on the per-rupee-at-risk series, never on the headline gap**,
+  for the reason above: the backtest is of a fully invested book and the desk is not, so the
+  headline gap would fail it on cash drag alone. It raises `desk_below_expectation`, and the
+  problem text quotes the per-rupee figures and the average invested share, so the owner can see
+  the cash was taken out. The default for `expected_excess_pa` (0.06) comes from the top-15
+  backtest (ADR-0062), and `trade_decisions` adds risk overlays on top of that book. So the owner
+  should set this from the trading system's own figure once there is one.
+
+  What this check still cannot separate is the pipeline sizing its book differently from the
+  backtest. A per-rupee measure removes cash drag; it does not remove the risk overlays the
+  pipeline applies to the names it does hold.
 
 ## 9. What the owner sees
 
@@ -217,9 +270,12 @@ A **Trading desk** section in the monthly close. Made-up example:
 Trading desk (paper): 14 weeks since 15 Sep. Capital ₹1,00,000.
 Value ₹1,04,230 (after tax ₹1,03,410)   SHARIABEES ₹1,02,100   Nifty 50 ₹1,01,300
 Weekly gap to SHARIABEES: +0.15% on average, t = 0.8: no evidence yet
+Same gap per rupee invested (32% of the capital on average): +0.04%, t = 0.4: no evidence yet.
+The monthly check reads this one.
 Holding (paper) 9 names, 12% cash: TCS, INFY, HCLTECH, GOLDBEES, ...
 This month: 23 orders, ₹612 in costs.
 Days held back: 2 (1 stale, 1 suspect). Prices from ansaar: 1.
+Risk halt on 22 Nov: the desk sold its whole book. DAILY_LOSS fired on 19 Nov.
 Check: XYZ moved −51% on 3 Nov. Possible missing split.
 ```
 
@@ -266,9 +322,11 @@ CREATE TABLE IF NOT EXISTS finance.desk_decisions (
 CREATE TABLE IF NOT EXISTS finance.desk_plans (
     data_date date PRIMARY KEY,
     mode text NOT NULL,
-    outcome text NOT NULL CHECK (outcome IN ('orders', 'no_change', 'held_stale', 'held_suspect')),
+    -- 'flattened' and `note` were added by migration 047 (§5, the risk halt).
+    outcome text NOT NULL CHECK (outcome IN ('orders', 'no_change', 'held_stale', 'held_suspect', 'flattened')),
     findings jsonb NOT NULL DEFAULT '[]'::jsonb,
     skipped jsonb NOT NULL DEFAULT '[]'::jsonb,
+    note text,
     planned_at timestamptz NOT NULL DEFAULT now()
 );
 
@@ -341,8 +399,16 @@ ltcg_rate: 0.125
 ltcg_exemption_inr: 125000
 benchmark: SHARIABEES.NS
 context_benchmark: ^NSEI
+benchmark_prices:            # where a benchmark's prices can also come from
+  SHARIABEES.NS: {symbol: SHARIABEES, asset_class: etf}
 expected_excess_pa: 0.06
 ```
+
+`benchmark_prices` maps a benchmark's Yahoo name to what ansaar wants. It is empty in the code
+defaults, so a fork ships nobody's tickers, and an entry missing either half is dropped rather than
+half-applied. The seed row carries the mapping for the benchmark it names — but `activities.config`
+is DB-owned after the first insert, so **an existing deployment needs the mapping written to its
+row** (§16).
 
 **Gates:**
 - The seed row ships `active: false`, so a fork never runs it.
@@ -355,14 +421,14 @@ expected_excess_pa: 0.06
 |---|---|
 | `core/src/aegis/connectors/ansaar.py` | `AnsaarClient`: `decisions(day) -> (rows, meta)` and `prices(symbol, asset_class, start, end)`, each fetching the client token on first use |
 | `core/src/aegis/connectors/finance.py` | `FinanceConnector.daily_bars(symbol, start, end)`: bars plus split and dividend events, next to the existing quote provider |
-| `core/src/aegis/services/desk_math.py` | Pure functions, no I/O: last trading day, checks, order sizing, split adjustment, FIFO, value history, tax by year, weekly statistics, label, warning check |
+| `core/src/aegis/services/desk_math.py` | Pure functions, no I/O: last trading day, checks, order sizing, split adjustment, FIFO, value and invested-share history, tax by year, weekly statistics, label, warning check |
 | `core/src/aegis/services/trading_desk.py` | Database reads and writes, `run_tick(pool, *, ansaar, finance, today, project)`, `month_summary(pool, month_first, next_first)`, `reconcile_expectation`, config loading |
 | `worker/src/aegis_worker/activities/trading_desk.py` | `TradingDeskActivities.desk_tick`: one activity (new class, so a constructor in `main()` and an entry in `collect_activities`) |
 | `worker/src/aegis_worker/flows/trading_desk.py` | `TradingDeskFlow`, `TradingDeskConfig(agent_id)` |
 | `worker/src/aegis_worker/registry.py` | One `FlowSpec` |
 | `config/seed/activities.yaml` | The `trading-desk-daily` row (Maou, inactive) |
 | `worker/src/aegis_worker/activities/money.py`, `money_render.py` | Monthly close: the desk section and the warning check |
-| `migrations/045_trading_desk.sql` | §11 |
+| `migrations/045_trading_desk.sql`, `migrations/047_desk_flatten.sql` | §11 |
 | `core/src/aegis/services/integrations_config.py`, `core/src/aegis/config.py` | §12 connection keys |
 | `CLAUDE.md` | One paragraph in the books section describing the lane |
 
@@ -420,7 +486,16 @@ Live mode is not built here. This design keeps the step to live small:
 3. ansaar-data #30 is deployed.
 4. The owner sets `ansaar_url` and pastes `ansaar_service_secret` on the admin Integrations page.
 5. Set `active = true` on `trading-desk-daily` (a DB write; ask first).
-6. Validate on the first run:
+6. On a deployment that already has a `trading-desk-daily` row, add the benchmark price mapping —
+   the seed does not overwrite `config` (a DB write; ask first):
+
+   ```sql
+   UPDATE activities
+      SET config = config || '{"benchmark_prices": {"SHARIABEES.NS": {"symbol": "SHARIABEES", "asset_class": "etf"}}}'::jsonb
+    WHERE slug = 'trading-desk-daily';
+   ```
+
+7. Validate on the first run:
    - it copied the last trading day's decisions, and read those rows: they must include
      equities. Until pipeline #355 is fixed only ETF rows arrive, and nothing holds the desk
      back — the checks pass and it buys ETFs. The missing-equity check cannot catch that on

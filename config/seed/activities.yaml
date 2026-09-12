@@ -151,6 +151,11 @@ activities:
       ltcg_exemption_inr: 125000
       benchmark: SHARIABEES.NS
       context_benchmark: ^NSEI
+      # Where a benchmark's prices can also come from when Yahoo has no close
+      # for a market day: its Yahoo name to the NSE symbol and asset class
+      # ansaar wants. An unmapped benchmark gets no fallback.
+      benchmark_prices:
+        SHARIABEES.NS: {symbol: SHARIABEES, asset_class: etf}
       expected_excess_pa: 0.06
     active: false
 

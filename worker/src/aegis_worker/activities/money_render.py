@@ -309,6 +309,9 @@ def desk_lines(desk: dict) -> list[str]:
         f"{desk['benchmark']} {_money(desk['benchmark_value'])} · {desk['context']} {_money(desk['context_value'])}",
         f"Weekly gap to {desk['benchmark']}: {desk['mean_gap']:+.2%} on average, "
         f"t = {desk['t']:.1f}: {desk['label']}",
+        f"Same gap per rupee invested ({desk['invested_pct']:.0%} of the capital on average): "
+        f"{desk['mean_gap_invested']:+.2%}, t = {desk['t_invested']:.1f}: {desk['label_invested']}. "
+        "The monthly check reads this one.",
         f"Holding {len(desk['holdings'])} names, {desk['cash_pct']:.0%} cash"
         + (f": {', '.join(desk['holdings'][:12])}" if desk["holdings"] else "."),
         f"This month: {desk['filled']} orders filled, {_money(desk['costs'])} in costs.",
@@ -321,6 +324,8 @@ def desk_lines(desk: dict) -> list[str]:
             f"Days held back: {sum(held_back.values())} "
             f"({held_back.get('held_stale', 0)} stale, {held_back.get('held_suspect', 0)} suspect)."
         )
+    for halt in desk.get("halts") or []:
+        lines.append(f"Risk halt on {halt['day']}: the desk sold its whole book. {halt['note']}".strip())
     if desk["ansaar_prices"]:
         lines.append(f"Prices from ansaar: {desk['ansaar_prices']}.")
     lines += [
