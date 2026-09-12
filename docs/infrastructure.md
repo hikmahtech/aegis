@@ -582,11 +582,24 @@ UPDATE settings SET value = value || jsonb_build_object(
 WHERE key = 'hub_group_verdicts';
 ```
 
-There is no threshold knob on the sweep's `activities.config` row yet
-(`HubSweepConfig` carries the fields; the registry does not populate them —
-issue #448). Until it does, the verdict cache above is the control, and
-turning the whole sweep off is not an alternative: it also stops suppression
-promotion and projection.
+**To raise the bar on a noisy class**, set the thresholds on the sweep's
+`activities.config` row (#448). `group_min_members` is how many live problems
+of one class and kind make a cluster worth judging, and `group_window_hours`
+is how far back "live" reaches. Either at `0` keeps the defaults — 3 members,
+seen in the last 72 hours. `schedule_sync` picks the change up within about
+300 seconds, with no redeploy.
+
+```sql
+-- only judge a cluster of five or more, seen in the last day
+UPDATE activities SET config = config || '{"group_min_members": 5, "group_window_hours": 24}'::jsonb,
+  updated_at = now()
+WHERE workflow_type = 'HubSweepFlow';
+```
+
+Raising the bar is not the same control as the verdict cache above: the
+threshold decides what is ever *asked*, the cache decides what the answer was.
+Turning the whole sweep off is not an alternative to either — it also stops
+suppression promotion and projection.
 
 ### A problem and its task stay in step
 

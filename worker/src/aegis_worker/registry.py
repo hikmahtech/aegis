@@ -492,6 +492,17 @@ FLOWS: tuple[FlowSpec, ...] = (
         HubSweepFlow,
         lambda act: HubSweepConfig(
             agent_id=act["agent_id"],
+            # 0 keeps the `hub_group` service defaults (3 members, 72h), and a
+            # negative number is floored to 0 rather than passed on: a window
+            # of -1 hours reaches back from now to an hour ago in the wrong
+            # direction, finds nothing, and turns grouping off in silence.
+            group_min_members=max(
+                0, _int(act["config"], "group_min_members", HubSweepConfig.group_min_members)
+            ),
+            group_window_hours=max(
+                0.0,
+                _float(act["config"], "group_window_hours", HubSweepConfig.group_window_hours),
+            ),
             fix_verify_hours=_float(
                 act["config"], "fix_verify_hours", HubSweepConfig.fix_verify_hours
             ),
