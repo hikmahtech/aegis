@@ -41,11 +41,12 @@ _HUB_TIMEOUT = timedelta(seconds=120)
 # surface it instead of polling it hourly forever (issue #120).
 _STALE_FEED_DAYS = 90
 
-# Guards every activity call #511/#512 added, so a run that started on the old
-# code replays without them. A run lasts minutes: `workflow.deprecate_patch`
-# one deploy later.
+# Deprecated patches (#533): every activity call #511/#512 added, and the
+# tracked-topic attach (#513). Every run that started before them has
+# finished, so only the new path is left. The markers stay one more deploy,
+# so a run started on the patched code still replays; then the calls and
+# these ids go.
 _PATCH_FEEDS = "rss-feeds-511"
-# Guards the tracked-topic attach (#513). Same deprecation note.
 _PATCH_TOPICS = "research-hub-513"
 # Attaching can raise a topic's task, which is a Todoist round trip.
 _TOPICS_TIMEOUT = timedelta(seconds=120)
@@ -131,22 +132,21 @@ class RssIngestFlow:
             start_to_close_timeout=_ACT_TIMEOUT,
             retry_policy=ACT_RETRY,
         )
-        v2 = workflow.patched(_PATCH_FEEDS)
+        workflow.deprecate_patch(_PATCH_FEEDS)
         notes: dict = {}
         pattern = None
-        if v2:
-            try:
-                terms = await workflow.execute_activity(
-                    "load_gate_terms",
-                    start_to_close_timeout=_ACT_TIMEOUT,
-                    retry_policy=RETRY_ONCE,
-                )
-                pattern = gate_pattern(list(terms or []))
-            except Exception as exc:
-                # No terms means the gate lets everything through: a failed
-                # config read costs full fetches, never a lost entry.
-                workflow.logger.warning("rss_gate_terms_degraded err=%s", str(exc)[:200])
-                notes["gate_terms_degraded"] = True
+        try:
+            terms = await workflow.execute_activity(
+                "load_gate_terms",
+                start_to_close_timeout=_ACT_TIMEOUT,
+                retry_policy=RETRY_ONCE,
+            )
+            pattern = gate_pattern(list(terms or []))
+        except Exception as exc:
+            # No terms means the gate lets everything through: a failed
+            # config read costs full fetches, never a lost entry.
+            workflow.logger.warning("rss_gate_terms_degraded err=%s", str(exc)[:200])
+            notes["gate_terms_degraded"] = True
 
         total_entries = 0
         total_ingested = 0
@@ -170,7 +170,7 @@ class RssIngestFlow:
             config = ch.get("config") or {}
             since = config.get("last_cursor")
             label = feeds.feed_label(identifier, config)
-            mode = feeds.ingest_mode(config) if v2 else "full"
+            mode = feeds.ingest_mode(config)
 
             # Once per run: flag feeds that haven't yielded a new entry in a
             # long time so they surface instead of being polled silently
@@ -204,7 +204,7 @@ class RssIngestFlow:
             else:
                 # An empty parse that says why is a failed fetch too. Before
                 # #511 a dead or moved feed read as a quiet one here.
-                if v2 and result.error and not result.entries:
+                if result.error and not result.entries:
                     fetch_error = result.error
             if fetch_error:
                 workflow.logger.warning(
@@ -212,41 +212,39 @@ class RssIngestFlow:
                 )
                 errors += 1
                 per_feed.append({"feed": identifier, "status": "fetch_failed"})
-                if v2:
-                    failures = await self._record_run(ch, {"ok": False, "error": fetch_error})
-                    per_feed[-1]["fetch_failures"] = failures
-                    if failures >= feeds.FAILING_AFTER:
-                        failing.append(
-                            {
-                                "klass": "feed_failing",
-                                "subject": identifier,
-                                "title": f"RSS feed {label} failed {failures} fetches in a row",
-                                "severity": "warning",
-                                "payload": {
-                                    "url": identifier,
-                                    "error": fetch_error,
-                                    "fetch_failures": failures,
-                                },
-                                # An occurrence on crossing the threshold and
-                                # at the daily review; every other hour it only
-                                # keeps the problem open. Hourly occurrences
-                                # posted "N more occurrences" on the task 24
-                                # times a day for one dead feed.
-                                "record": failures == feeds.FAILING_AFTER or review,
-                            }
-                        )
-                    finding = _stale_finding(now, identifier, config, label, since)
-                    if finding:
-                        stale.append(finding)
+                failures = await self._record_run(ch, {"ok": False, "error": fetch_error})
+                per_feed[-1]["fetch_failures"] = failures
+                if failures >= feeds.FAILING_AFTER:
+                    failing.append(
+                        {
+                            "klass": "feed_failing",
+                            "subject": identifier,
+                            "title": f"RSS feed {label} failed {failures} fetches in a row",
+                            "severity": "warning",
+                            "payload": {
+                                "url": identifier,
+                                "error": fetch_error,
+                                "fetch_failures": failures,
+                            },
+                            # An occurrence on crossing the threshold and
+                            # at the daily review; every other hour it only
+                            # keeps the problem open. Hourly occurrences
+                            # posted "N more occurrences" on the task 24
+                            # times a day for one dead feed.
+                            "record": failures == feeds.FAILING_AFTER or review,
+                        }
+                    )
+                finding = _stale_finding(now, identifier, config, label, since)
+                if finding:
+                    stale.append(finding)
                 continue
 
             if not result.entries:
                 per_feed.append({"feed": identifier, "entries": 0})
-                if v2:
-                    await self._record_run(ch, {"ok": True, "backlog": 0})
-                    finding = _stale_finding(now, identifier, config, label, since)
-                    if finding:
-                        stale.append(finding)
+                await self._record_run(ch, {"ok": True, "backlog": 0})
+                finding = _stale_finding(now, identifier, config, label, since)
+                if finding:
+                    stale.append(finding)
                 continue
 
             # Per-feed throttle. arxiv cs.AI publishes its whole day in ONE
@@ -327,8 +325,8 @@ class RssIngestFlow:
                     use_mode = mode
                     if mode == "gate":
                         use_mode = "full" if passes_gate(pattern, entry) else "abstract"
-                    # An exception is a failure. On the new path a returned
-                    # `status: error` is one too: process_content swallows a
+                    # An exception is a failure, and so is a returned
+                    # `status: error`: process_content swallows a
                     # store failure into that status, and counting it as
                     # ingested is how a batch could report everything landed.
                     status = "error"
@@ -369,7 +367,7 @@ class RssIngestFlow:
                                 retry_policy=NO_RETRY,
                             )
                         res = res if isinstance(res, dict) else {}
-                        status = str(res.get("status") or "ok") if v2 else "ok"
+                        status = str(res.get("status") or "ok")
                         content_id = res.get("content_id")
                     except Exception as exc:
                         workflow.logger.warning(
@@ -456,7 +454,7 @@ class RssIngestFlow:
             total_ingested += feed_ingested
             total_abstract += feed_abstract
 
-            if v2 and entry_rows:
+            if entry_rows:
                 try:
                     await workflow.execute_activity(
                         "record_feed_entries",
@@ -510,18 +508,18 @@ class RssIngestFlow:
             per_feed.append(entry_summary)
             total_failed += feed_failed
 
-            if v2:
-                await self._record_run(ch, {"ok": True, "backlog": available - len(entries)})
-                finding = _stale_finding(
-                    now, identifier, config, label, _newest(since, latest_resolved_published)
-                )
-                if finding:
-                    stale.append(finding)
+            await self._record_run(ch, {"ok": True, "backlog": available - len(entries)})
+            finding = _stale_finding(
+                now, identifier, config, label, _newest(since, latest_resolved_published)
+            )
+            if finding:
+                stale.append(finding)
 
         # Stored entries that name a tracked topic join its round in the hub
         # (#513), so a story from a feed and the same story from an intel scan
         # are one item there. One call per run, never per entry.
-        if topic_items and workflow.patched(_PATCH_TOPICS):
+        if topic_items:
+            workflow.deprecate_patch(_PATCH_TOPICS)
             try:
                 attached = await workflow.execute_activity(
                     "attach_topic_items",
@@ -535,15 +533,14 @@ class RssIngestFlow:
                 workflow.logger.warning("rss_topic_attach_degraded err=%s", str(exc)[:200])
                 notes["topics_degraded"] = True
 
-        if v2:
-            found: dict = {"failing": len(failing)}
-            if not await self._reconcile(["feed_failing"], failing):
+        found: dict = {"failing": len(failing)}
+        if not await self._reconcile(["feed_failing"], failing):
+            notes["hub_degraded"] = True
+        if review:
+            found["stale"] = len(stale)
+            if not await self._reconcile(["feed_stale"], stale):
                 notes["hub_degraded"] = True
-            if review:
-                found["stale"] = len(stale)
-                if not await self._reconcile(["feed_stale"], stale):
-                    notes["hub_degraded"] = True
-            notes["findings"] = found
+        notes["findings"] = found
 
         out: dict = {
             "entries": total_entries,
