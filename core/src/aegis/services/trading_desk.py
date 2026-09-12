@@ -54,6 +54,18 @@ def _finding(klass: str, subject: str, title: str, description: str) -> dict:
     }
 
 
+def _halt(meta: Any) -> dict | None:
+    """What ansaar said about a risk halt on the day it served, or None.
+
+    Only an explicit ``halted: true`` counts. A missing field, an older
+    ansaar, or a call that failed all mean the desk knows nothing, and the desk
+    never reads a halt into silence (spec §5)."""
+    if not isinstance(meta, dict) or meta.get("halted") is not True:
+        return None
+    detail = meta.get("halt")
+    return detail if isinstance(detail, dict) else {}
+
+
 def _f(raw: Any) -> float | None:
     return float(raw) if raw is not None else None
 
@@ -131,10 +143,16 @@ async def _refresh(
     *,
     market_days: list[date] | None = None,
     required: bool = False,
+    source_symbol: str | None = None,
 ) -> None:
     """Fetch and store ``symbol``'s recent bars: Yahoo first, then ansaar for
     each market day Yahoo could not price. Raises only when ``required`` and
-    Yahoo fails."""
+    Yahoo fails.
+
+    ``source_symbol`` is the name ansaar knows the instrument by, when that is
+    not ``symbol``: a benchmark is named in Yahoo's form (``SHARIABEES.NS``) and
+    ansaar wants the NSE symbol (``SHARIABEES``). Bars are always stored under
+    ``symbol``'s Yahoo form, whichever source they came from."""
     ysym = yahoo_symbol(symbol)
     latest = await pool.fetchval("SELECT max(date) FROM finance.desk_prices WHERE symbol = $1", ysym)
     start = latest - timedelta(days=REFETCH_OVERLAP_DAYS) if latest else today - timedelta(days=FETCH_BACK_DAYS)
@@ -164,9 +182,11 @@ async def _refresh(
     if not missing:
         return
     try:
-        bars = await ansaar.prices(symbol, asset_class, min(missing), max(missing))
+        bars = await ansaar.prices(source_symbol or symbol, asset_class, min(missing), max(missing))
     except AnsaarError as exc:
-        logger.warning("trading_desk_ansaar_prices_failed", symbol=symbol, error=str(exc)[:200])
+        logger.warning(
+            "trading_desk_ansaar_prices_failed", symbol=source_symbol or symbol, error=str(exc)[:200]
+        )
         return
     # Only the missing days are filled. ansaar is the second source, so it never
     # adds a day the market calendar has no bar for and the desk never asked about.
@@ -291,13 +311,14 @@ async def _write_plan(
     skipped: list[str],
     orders: list[dm.Order],
     created_day: date,
+    note: str | None = None,
 ) -> None:
     """The plan row and its orders in one transaction, so a date is acted on once."""
     async with pool.acquire() as conn, conn.transaction():
         inserted = await conn.fetchval(
-            "INSERT INTO finance.desk_plans (data_date, mode, outcome, findings, skipped) "
-            "VALUES ($1, 'paper', $2, $3, $4) ON CONFLICT (data_date) DO NOTHING RETURNING data_date",
-            day, outcome, findings, skipped,
+            "INSERT INTO finance.desk_plans (data_date, mode, outcome, findings, skipped, note) "
+            "VALUES ($1, 'paper', $2, $3, $4, $5) ON CONFLICT (data_date) DO NOTHING RETURNING data_date",
+            day, outcome, findings, skipped, note,
         )
         if inserted is None:
             return  # another run planned this date first
@@ -382,9 +403,11 @@ async def _tick(pool: asyncpg.Pool, ansaar: Any, finance: Any, today: date) -> t
     # 2. Copy.
     findings: list[dict] = []
     ansaar_failure: dict | None = None
+    halt: dict | None = None
     try:
-        rows, _meta = await ansaar.decisions(day)
+        rows, meta = await ansaar.decisions(day)
         await _store_decisions(pool, day, [r for r in rows if str(r.get("data_date") or "")[:10] == day.isoformat()])
+        halt = _halt(meta)
     except AnsaarError as exc:
         ansaar_failure = _finding(
             "desk_source_error", "ansaar", "Trading desk: can't reach ansaar",
@@ -407,8 +430,19 @@ async def _tick(pool: asyncpg.Pool, ansaar: Any, finance: Any, today: date) -> t
     wanted |= {o.symbol: o.asset_class for o in pending}
     for symbol, asset_class in sorted(wanted.items()):
         await _refresh(pool, finance, ansaar, symbol, asset_class, today, market_days=index_days)
+    # The benchmarks get the same per-day fallback the holdings get, so a day
+    # Yahoo cannot price does not stay NULL for ever and quietly bend the score.
+    # It needs a mapping, because a benchmark is named in Yahoo's form and
+    # ansaar wants the NSE symbol and an asset class; an unmapped benchmark gets
+    # no fallback. The index is never backfilled: its bars are the market
+    # calendar, and the desk takes that from one source only.
     for bench in {rules.benchmark, rules.context_benchmark} - {INDEX}:
-        await _refresh(pool, finance, None, bench, None, today)
+        src = rules.benchmark_prices.get(bench)
+        await _refresh(
+            pool, finance, ansaar if src else None, bench,
+            src["asset_class"] if src else None, today,
+            market_days=index_days, source_symbol=src["symbol"] if src else None,
+        )
     bars = await _bars(pool, set(wanted) | set(ever))
 
     # 4. Fill.
@@ -428,7 +462,7 @@ async def _tick(pool: asyncpg.Pool, ansaar: Any, finance: Any, today: date) -> t
     planned = await pool.fetchval("SELECT 1 FROM finance.desk_plans WHERE data_date = $1", day)
     if not planned:
         book = dm.replay(fills, bars, rules.capital, day)
-        check = dm.check_decisions(decisions, book.held_classes(), rules)
+        check = dm.check_decisions(decisions, book.held_classes(), rules, halted=halt is not None)
         plan_findings: list[dict] = []
         if check.outcome == "held_stale":
             plan_findings.append(
@@ -451,7 +485,7 @@ async def _tick(pool: asyncpg.Pool, ansaar: Any, finance: Any, today: date) -> t
             )
         orders: list[dm.Order] = []
         skipped: list[str] = []
-        if check.outcome == "ok":
+        if check.outcome in ("ok", "flatten"):
             # A name whose price has gone stale is left out of the sizing, so
             # plan_orders reports it rather than sizing or selling on an old
             # price. Otherwise a delisted holding would have the same sell
@@ -476,12 +510,24 @@ async def _tick(pool: asyncpg.Pool, ansaar: Any, finance: Any, today: date) -> t
                 for o in open_orders
                 if o["side"] == "buy"
             )
+            # On a flatten ``check.rows`` is empty, so every holding is a name
+            # with no target: plan_orders sizes each as the full exit it already
+            # knows how to size, and there is nothing left to buy.
             orders, skipped = dm.plan_orders(
                 check.rows, book, closes, rules,
                 frozen=frozenset(o["symbol"] for o in open_orders), cash_reserved=reserved,
             )
-        outcome = check.outcome if check.outcome != "ok" else ("orders" if orders else "no_change")
-        await _write_plan(pool, day, outcome, plan_findings, skipped, orders, today)
+        note = None
+        if check.outcome == "flatten":
+            outcome = "flattened"
+            note = str((halt or {}).get("reason") or "").strip() or (
+                "The trading system said it had halted, and gave no reason."
+            )
+        elif check.outcome == "ok":
+            outcome = "orders" if orders else "no_change"
+        else:
+            outcome = check.outcome
+        await _write_plan(pool, day, outcome, plan_findings, skipped, orders, today, note=note)
         out["planned"] = outcome
     findings += list(await pool.fetchval("SELECT findings FROM finance.desk_plans WHERE data_date = $1", day) or [])
 
@@ -519,12 +565,21 @@ async def month_summary(pool: asyncpg.Pool, month_first: date, next_first: date)
     days = [b.day for b in bars[INDEX] if b.close is not None and start <= b.day <= month_end]
     if not days:
         return None
-    desk = dm.desk_values(fills, bars, rules.capital, days)
+    series = dm.desk_series(fills, bars, rules.capital, days)
+    desk = [(d, v) for d, v, _ in series]
+    shares = [(d, w) for d, _, w in series]
     bench = dm.benchmark_values(bars[rules.benchmark], rules.capital, rules.cost_pct_per_side, days)
     context = dm.benchmark_values(bars[rules.context_benchmark], rules.capital, 0.0, days)
     book = dm.replay(fills, bars, rules.capital, month_end)
     end_value = desk[-1][1]
+    # Two readings of the same weeks. The headline is the gap to the whole
+    # benchmark, because "what would I have earned just buying SHARIABEES with
+    # this money" is the owner's real question. The alarm is judged on the gap
+    # per rupee actually at risk, because the desk holds about the pipeline's
+    # own heat and the benchmark holds everything (spec §8).
     st = dm.stats(dm.weekly_excess(desk, bench))
+    invested = dm.stats(dm.weekly_excess(desk, bench, shares))
+    weights = dm.weekly_shares(desk, bench, shares)
     held = book.held()
     worth = {s: q * (dm.close_on(bars[s], month_end) or book.avg_cost(s)) for s, q in held.items()}
     orders = await pool.fetch(
@@ -536,6 +591,11 @@ async def month_summary(pool: asyncpg.Pool, month_first: date, next_first: date)
     held_back = await pool.fetch(
         "SELECT outcome, count(*) AS n FROM finance.desk_plans "
         "WHERE data_date BETWEEN $1 AND $2 AND outcome IN ('held_stale', 'held_suspect') GROUP BY outcome",
+        month_first, month_end,
+    )
+    halts = await pool.fetch(
+        "SELECT data_date, note FROM finance.desk_plans "
+        "WHERE data_date BETWEEN $1 AND $2 AND outcome = 'flattened' ORDER BY data_date",
         month_first, month_end,
     )
     cancelled: dict[str, int] = defaultdict(int)
@@ -555,7 +615,11 @@ async def month_summary(pool: asyncpg.Pool, month_first: date, next_first: date)
         "mean_gap": st.mean,
         "t": st.t,
         "label": dm.label(st),
-        "below_expectation": dm.below_expectation(st, rules.expected_excess_pa),
+        "mean_gap_invested": invested.mean,
+        "t_invested": invested.t,
+        "label_invested": dm.label(invested),
+        "invested_pct": sum(weights) / len(weights) if weights else 0.0,
+        "below_expectation": dm.below_expectation(invested, rules.expected_excess_pa),
         "expected_excess_pa": rules.expected_excess_pa,
         "holdings": sorted(held, key=lambda s: -worth[s]),
         "cash_pct": book.cash / end_value if end_value else 0.0,
@@ -563,6 +627,7 @@ async def month_summary(pool: asyncpg.Pool, month_first: date, next_first: date)
         "costs": round(sum(float(r["costs"] or 0) for r in orders if r["status"] == "filled"), 2),
         "cancelled": dict(cancelled),
         "held_back": {r["outcome"]: r["n"] for r in held_back},
+        "halts": [{"day": r["data_date"].isoformat(), "note": r["note"] or ""} for r in halts],
         "ansaar_prices": sum(r["status"] == "filled" and r["price_source"] == "ansaar" for r in orders),
         "moves": [
             {"symbol": s, "day": d.isoformat(), "move": round(m, 4)}
@@ -579,11 +644,14 @@ async def reconcile_expectation(pool: asyncpg.Pool, summary: dict | None, *, pro
         findings.append(
             _finding(
                 "desk_below_expectation", "desk", "Trading desk: live results are worse than the backtest promised",
-                f"Over {summary['weeks']} weeks the desk's weekly gap to {summary['benchmark']} averaged "
-                f"{summary['mean_gap']:+.2%} (t = {summary['t']:.1f}). That is more than two standard "
-                f"errors below the {summary['expected_excess_pa']:.0%} a year the backtest implies. Look "
-                "at the trading system before trusting it with money. This comes back each month while "
-                "it stays true.",
+                f"Over {summary['weeks']} weeks, per rupee the desk actually had invested "
+                f"({summary['invested_pct']:.0%} of the capital on average), its weekly gap to "
+                f"{summary['benchmark']} averaged {summary['mean_gap_invested']:+.2%} "
+                f"(t = {summary['t_invested']:.1f}). That is more than two standard errors below the "
+                f"{summary['expected_excess_pa']:.0%} a year the backtest implies. The cash the desk "
+                "holds is taken out of this, so it is the stock picking that is behind, not the "
+                "exposure. Look at the trading system before trusting it with money. This comes back "
+                "each month while it stays true.",
             )
         )
     await hub_watch.reconcile_findings(

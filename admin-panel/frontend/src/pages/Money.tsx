@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 import { api } from '../api/client';
 import ErrorBanner from '../components/ErrorBanner';
+import MoneyAccounting from '../components/MoneyAccounting';
 import { fmtMoney } from '../lib/money';
 
 type MoneyEvent = {
@@ -148,6 +149,8 @@ export default function Money() {
           </p>
         </div>
       )}
+
+      <MoneyAccounting />
 
       <section className="section">
         <div className="section-header-row">

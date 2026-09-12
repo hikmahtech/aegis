@@ -12,10 +12,12 @@ from aegis.services.desk_math import (
     below_expectation,
     benchmark_values,
     big_moves,
+    desk_series,
     desk_values,
     label,
     stats,
     weekly_excess,
+    weekly_shares,
 )
 
 
@@ -51,6 +53,76 @@ def test_weekly_excess_compares_week_end_values():
     desk = [(date(2026, 9, 10), 99.0), (date(2026, 9, 11), 100.0), (date(2026, 9, 18), 102.0), (date(2026, 9, 25), 101.0)]
     bench = [(date(2026, 9, 11), 100.0), (date(2026, 9, 18), 101.0), (date(2026, 9, 25), 101.0)]
     assert weekly_excess(desk, bench) == pytest.approx([0.01, 101 / 102 - 1])
+
+
+# --- the alarm measures selection, not cash drag (spec §8) -------------------
+
+FRI1, FRI2, FRI3 = date(2026, 9, 11), date(2026, 9, 18), date(2026, 9, 25)
+
+
+def test_desk_series_reports_the_invested_share():
+    """5 shares at 1000 out of 10,000 capital is half the book invested; the
+    next day they are worth 1100 each."""
+    bars = {"TCS": [Bar(date(2026, 9, 14), 1000.0), Bar(date(2026, 9, 15), 1100.0)]}
+    fills = [Fill("TCS", "equity", "buy", 5, 1000.0, 10.0, date(2026, 9, 14))]
+    out = desk_series(fills, bars, 10_000.0, [date(2026, 9, 14), date(2026, 9, 15)])
+    assert [v for _, v, _ in out] == pytest.approx([9_990.0, 10_490.0])
+    assert [w for _, _, w in out] == pytest.approx([5_000 / 9_990, 5_500 / 10_490])
+
+
+def test_a_third_invested_desk_tracking_the_market_shows_no_gap_per_rupee():
+    """The killer case. The desk is a third invested and its holdings match the
+    benchmark exactly, so per rupee at risk it is level. Against the whole
+    benchmark it looks two thirds behind every week, which is what made the
+    alarm fire on exposure alone."""
+    bench = [(FRI1, 100.0), (FRI2, 110.0), (FRI3, 121.0)]  # +10% a week
+    step = 1 + 0.10 / 3  # a third invested, so a third of the market's move
+    desk = [(FRI1, 100.0), (FRI2, 100 * step), (FRI3, 100 * step**2)]
+    shares = [(FRI1, 1 / 3), (FRI2, 1 / 3), (FRI3, 1 / 3)]
+
+    assert weekly_excess(desk, bench) == pytest.approx([-0.10 * 2 / 3] * 2)
+    assert weekly_excess(desk, bench, shares) == pytest.approx([0.0, 0.0], abs=1e-12)
+
+
+def test_the_invested_scaling_uses_the_share_carried_into_the_week():
+    """The week's return comes from the exposure the desk started it with, so
+    the share at the previous week's close is the one that scales."""
+    desk = [(FRI1, 100.0), (FRI2, 105.0)]
+    bench = [(FRI1, 100.0), (FRI2, 110.0)]
+    shares = [(FRI1, 0.5), (FRI2, 0.9)]
+
+    # Half invested and up 5%, so the invested half earned 10%: level with the
+    # benchmark. The 0.9 the desk ended the week at does not come into it.
+    assert weekly_excess(desk, bench, shares) == pytest.approx([0.05 / 0.5 - 0.10])
+    assert weekly_shares(desk, bench, shares) == pytest.approx([0.5])
+
+
+def test_selection_still_shows_through_the_scaling():
+    """Same third-invested desk, but its picks beat the benchmark. The gap per
+    rupee invested is positive while the gap to the whole benchmark is not."""
+    bench = [(FRI1, 100.0), (FRI2, 110.0)]
+    desk = [(FRI1, 100.0), (FRI2, 104.0)]  # a third of +12%, not +10%
+    shares = [(FRI1, 1 / 3), (FRI2, 1 / 3)]
+
+    assert weekly_excess(desk, bench)[0] < 0
+    assert weekly_excess(desk, bench, shares) == pytest.approx([0.12 - 0.10])
+
+
+def test_a_week_entered_with_almost_nothing_invested_is_left_out():
+    """A return over a share near zero is noise, not a measurement."""
+    desk = [(FRI1, 100.0), (FRI2, 100.1), (FRI3, 105.0)]
+    bench = [(FRI1, 100.0), (FRI2, 110.0), (FRI3, 120.0)]
+    shares = [(FRI1, 0.001), (FRI2, 0.5), (FRI3, 0.5)]
+
+    assert weekly_excess(desk, bench, shares) == pytest.approx([(105 / 100.1 - 1) / 0.5 - (120 / 110 - 1)])
+    assert weekly_shares(desk, bench, shares) == pytest.approx([0.5])
+
+
+def test_a_week_with_no_invested_share_is_left_out():
+    """Only weeks every series covers are measured."""
+    desk = [(FRI1, 100.0), (FRI2, 105.0), (FRI3, 110.0)]
+    bench = [(FRI1, 100.0), (FRI2, 110.0), (FRI3, 120.0)]
+    assert len(weekly_excess(desk, bench, [(FRI2, 0.5), (FRI3, 0.5)])) == 1
 
 
 def test_stats_on_a_known_series():

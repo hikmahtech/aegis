@@ -70,16 +70,21 @@ class FakeFinance:
 class FakeAnsaar:
     """AnsaarClient.decisions and .prices with canned data; the same parameters as the real ones."""
 
-    def __init__(self, days=None, fail=False, prices=None):
+    def __init__(self, days=None, fail=False, prices=None, halts=None):
         self.days = days or {}
         self.fail = fail
         self.price_rows = prices or {}
         self.price_calls = []
+        # meta.halted / meta.halt per day, as ansaar-data serves them.
+        self.halts = halts or {}
 
     async def decisions(self, day):
         if self.fail:
             raise AnsaarError("/api/execution/trade-decisions: ConnectError")
-        return list(self.days.get(day, [])), {"date": day.isoformat()}
+        meta = {"date": day.isoformat(), "halted": False, "halt": None}
+        if day in self.halts:
+            meta |= {"halted": True, "halt": self.halts[day]}
+        return list(self.days.get(day, [])), meta
 
     async def prices(self, symbol, asset_class, start, end):
         self.price_calls.append((symbol, start, end))
@@ -312,7 +317,7 @@ async def test_ansaar_is_not_asked_when_yahoo_priced_every_market_day(pool):
     finance = market({"TCS.NS": [bar(THU, 3000.0), bar(FRI, 3010.0)]})
     ansaar = FakeAnsaar({FRI: [row("TCS", 0.10)]})
     await run(pool, ansaar, finance, MON)
-    assert ansaar.price_calls == []
+    assert [c for c in ansaar.price_calls if c[0] == "TCS"] == []
 
 
 async def test_one_unfillable_order_holds_back_its_own_name_only(pool):
@@ -400,3 +405,150 @@ def test_yahoo_symbol():
     assert td.yahoo_symbol("TCS") == "TCS.NS"
     assert td.yahoo_symbol("^NSEI") == "^NSEI"
     assert td.yahoo_symbol("SHARIABEES.NS") == "SHARIABEES.NS"
+
+
+# --- a stated risk halt sells the whole book (spec §5) ------------------------
+
+HALT = {
+    "trigger": "DAILY_LOSS",
+    "triggered_on": "2026-09-11",
+    "recovery_state": "COOLING",
+    "resumed_on": None,
+    "reason": "The risk manager halted trading: DAILY_LOSS fired on 2026-09-11 "
+    "and the pipeline has decided nothing since.",
+}
+
+
+async def test_a_stated_halt_sells_the_whole_book(pool):
+    """The pipeline is flat on a halt, so the desk must not stay invested. Every
+    holding gets a full exit, and the plan says the day was flattened."""
+    await filled(pool, THU, "TCS", "buy", 3, 3000.0)
+    await filled(pool, THU, "GOLDBEES", "buy", 100, 100.0, cls="etf", seq=1)
+    finance = market({
+        "TCS.NS": [bar(THU, 3000.0), bar(FRI, 3100.0)],
+        "GOLDBEES.NS": [bar(THU, 100.0), bar(FRI, 101.0)],
+    })
+
+    out = await run(pool, FakeAnsaar({FRI: []}, halts={FRI: HALT}), finance, MON)
+
+    assert out["planned"] == "flattened"
+    orders = await pool.fetch("SELECT symbol, side, qty, ref_price, status FROM finance.desk_orders WHERE created_day = $1 ORDER BY seq", MON)
+    assert [(o["symbol"], o["side"], o["qty"], float(o["ref_price"]), o["status"]) for o in orders] == [
+        ("TCS", "sell", 3, 3100.0, "pending"),
+        ("GOLDBEES", "sell", 100, 101.0, "pending"),
+    ]
+    plan = await pool.fetchrow("SELECT outcome, note FROM finance.desk_plans WHERE data_date = $1", FRI)
+    assert plan["outcome"] == "flattened" and "DAILY_LOSS" in plan["note"]
+    # A halt is the risk manager working, not a fault: no stale problem.
+    assert await open_problems(pool) == []
+
+
+async def test_a_halt_with_nothing_held_is_still_recorded(pool):
+    """Nothing to sell, but the month close still has to be able to say the
+    pipeline halted that day."""
+    out = await run(pool, FakeAnsaar({FRI: []}, halts={FRI: HALT}), market(), MON)
+
+    assert out["planned"] == "flattened"
+    assert await pool.fetchval("SELECT count(*) FROM finance.desk_orders") == 0
+    assert await open_problems(pool) == []
+
+
+async def test_an_empty_day_with_no_halt_stated_still_holds(pool):
+    """Silence is never a halt. ansaar says halted: false, which means no halt is
+    on record — the pipeline may simply have failed — so the desk holds."""
+    await filled(pool, THU, "TCS", "buy", 3, 3000.0)
+    finance = market({"TCS.NS": [bar(THU, 3000.0), bar(FRI, 3100.0)]})
+
+    out = await run(pool, FakeAnsaar({FRI: []}), finance, MON)
+
+    assert out["planned"] == "held_stale"
+    assert await pool.fetchval("SELECT count(*) FROM finance.desk_orders WHERE created_day = $1", MON) == 0
+    assert await open_problems(pool) == [("desk_decisions_stale", "decisions")]
+
+
+async def test_an_ansaar_outage_is_never_read_as_a_halt(pool):
+    """A failed call tells the desk nothing about the pipeline's risk state."""
+    await filled(pool, THU, "TCS", "buy", 3, 3000.0)
+    finance = market({"TCS.NS": [bar(THU, 3000.0), bar(FRI, 3100.0)]})
+
+    out = await run(pool, FakeAnsaar(fail=True), finance, MON)
+
+    assert out["planned"] == "held_stale"
+    assert await pool.fetchval("SELECT count(*) FROM finance.desk_orders WHERE created_day = $1", MON) == 0
+
+
+async def test_a_halt_leaves_a_name_it_cannot_price_alone(pool):
+    """A full exit still needs a price. The unpriced name stays held and the plan
+    says which part of the book it did not sell."""
+    await filled(pool, THU, "TCS", "buy", 3, 3000.0)
+    stale = date(2026, 8, 20)  # the last close anyone has for XYZ, weeks old
+    await filled(pool, stale, "XYZ", "buy", 10, 50.0, seq=1)
+    await pool.execute(
+        "INSERT INTO finance.desk_prices (symbol, date, close, source) VALUES ('XYZ.NS', $1, 50, 'yahoo')", stale
+    )
+    finance = market({"TCS.NS": [bar(THU, 3000.0), bar(FRI, 3100.0)]})
+
+    out = await run(pool, FakeAnsaar({FRI: []}, halts={FRI: HALT}), finance, MON)
+
+    assert out["planned"] == "flattened"
+    orders = await pool.fetch("SELECT symbol FROM finance.desk_orders WHERE created_day = $1", MON)
+    assert [o["symbol"] for o in orders] == ["TCS"]
+    assert await pool.fetchval("SELECT skipped FROM finance.desk_plans WHERE data_date = $1", FRI) == ["XYZ: no_price"]
+
+
+def test_only_an_explicit_halt_counts():
+    """The reader that decides whether the desk flattens. Anything but a stated
+    halted: true means the desk knows nothing."""
+    assert td._halt({"halted": True, "halt": HALT}) == HALT
+    assert td._halt({"halted": True, "halt": None}) == {}
+    assert td._halt({"halted": False, "halt": None}) is None
+    assert td._halt({"date": "2026-09-11"}) is None  # an older ansaar
+    assert td._halt({"halted": "true"}) is None  # a string is not a statement
+    assert td._halt(None) is None
+
+
+# --- the benchmarks get the same price fallback (spec §8) ---------------------
+
+
+async def test_a_benchmark_day_yahoo_leaves_null_is_filled_from_ansaar(pool):
+    """SHARIABEES.NS came back with a bar whose close was None and stayed NULL
+    for ever, while ansaar had the price. The monthly score is measured against
+    this series, so a hole in it bends the number the owner reads."""
+    finance = market({"TCS.NS": [bar(FRI, 3000.0)]})
+    finance.bars["SHARIABEES.NS"] = [bar(THU, 438.57), bar(FRI, None)]
+    ansaar = FakeAnsaar(
+        {FRI: [row("TCS", 0.10)]},
+        prices={"SHARIABEES": [bar(THU, 438.60), bar(FRI, 437.38)]},
+    )
+
+    await run(pool, ansaar, finance, MON)
+
+    stored = await pool.fetch(
+        "SELECT date, close, source FROM finance.desk_prices WHERE symbol = 'SHARIABEES.NS' ORDER BY date"
+    )
+    assert [(r["date"], r["close"] and float(r["close"]), r["source"]) for r in stored] == [
+        (THU, 438.57, "yahoo"),  # Yahoo had this one, so ansaar never overwrites it
+        (FRI, 437.38, "ansaar"),
+    ]
+    # ansaar is asked for the NSE symbol, not the benchmark's Yahoo name.
+    assert "SHARIABEES" in [c[0] for c in ansaar.price_calls]
+    assert "SHARIABEES.NS" not in [c[0] for c in ansaar.price_calls]
+
+
+async def test_an_unmapped_benchmark_gets_no_fallback(pool):
+    """No mapping, no fallback — the same as before this existed. A fork that
+    names its own benchmark is not silently asked about someone else's."""
+    await pool.execute(
+        "UPDATE activities SET config = config - 'benchmark_prices' WHERE slug = $1", td.DESK_SLUG
+    )
+    finance = market({"TCS.NS": [bar(FRI, 3000.0)]})
+    finance.bars["SHARIABEES.NS"] = [bar(THU, 438.57), bar(FRI, None)]
+    ansaar = FakeAnsaar({FRI: [row("TCS", 0.10)]}, prices={"SHARIABEES": [bar(FRI, 437.38)]})
+
+    await run(pool, ansaar, finance, MON)
+
+    assert [c[0] for c in ansaar.price_calls if c[0].startswith("SHARIABEES")] == []
+    close = await pool.fetchval(
+        "SELECT close FROM finance.desk_prices WHERE symbol = 'SHARIABEES.NS' AND date = $1", FRI
+    )
+    assert close is None

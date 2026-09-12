@@ -24,6 +24,32 @@ def test_rules_from_no_config_are_the_defaults():
     assert Rules.from_config({}) == Rules()
 
 
+def test_no_benchmark_price_mapping_by_default():
+    """The repo ships nobody's tickers: without a mapping a benchmark has no
+    fallback, which is how it behaved before the mapping existed."""
+    assert Rules().benchmark_prices == {}
+    assert Rules.from_config({"benchmark": "NIFTYBEES.NS"}).benchmark_prices == {}
+
+
+def test_a_benchmark_price_mapping_is_read_from_config():
+    r = Rules.from_config({"benchmark_prices": {"SHARIABEES.NS": {"symbol": "SHARIABEES", "asset_class": "etf"}}})
+    assert r.benchmark_prices == {"SHARIABEES.NS": {"symbol": "SHARIABEES", "asset_class": "etf"}}
+
+
+def test_half_a_benchmark_mapping_is_dropped():
+    """ansaar needs both the symbol and the asset class to fetch anything, so a
+    half-written mapping leaves the benchmark unmapped rather than half-applied."""
+    cfg = {
+        "benchmark_prices": {
+            "A.NS": {"symbol": "A"},
+            "B.NS": {"asset_class": "etf"},
+            "C.NS": "etf",
+            "D.NS": {"symbol": "D", "asset_class": "equity"},
+        }
+    }
+    assert list(Rules.from_config(cfg).benchmark_prices) == ["D.NS"]
+
+
 def test_last_trading_day_is_strictly_before_today():
     days = [date(2026, 9, 10), date(2026, 9, 11), date(2026, 9, 14)]
     assert last_trading_day(days, date(2026, 9, 14)) == date(2026, 9, 11)
@@ -34,6 +60,22 @@ def test_last_trading_day_is_strictly_before_today():
 def test_an_empty_day_is_stale():
     c = check_decisions([], set(), Rules())
     assert (c.outcome, c.rows, c.problems) == ("held_stale", (), ())
+
+
+def test_an_empty_day_the_source_calls_halted_is_a_flatten():
+    c = check_decisions([], set(), Rules(), halted=True)
+    assert (c.outcome, c.rows, c.problems) == ("flatten", (), ())
+
+
+def test_an_empty_day_is_only_a_flatten_when_the_source_says_halted():
+    """The default is hold. A pipeline failure and a risk halt both write no
+    rows, and dumping the portfolio over a failure is what §5 rules out."""
+    assert check_decisions([], set(), Rules(), halted=False).outcome == "held_stale"
+
+
+def test_a_day_with_rows_trades_its_rows_whatever_the_halt_flag_says():
+    c = check_decisions([d("TCS", 0.1)], set(), Rules(), halted=True)
+    assert c.outcome == "ok" and [r.symbol for r in c.rows] == ["TCS"]
 
 
 def test_a_clean_day_passes_and_leaves_out_disabled_classes():
