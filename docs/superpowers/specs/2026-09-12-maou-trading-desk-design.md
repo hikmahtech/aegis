@@ -204,6 +204,13 @@ the day out of the `held_back` count, which is for days the desk did nothing on.
   investor. It's bought with the same capital at the start close and pays one buy cost. From then
   on it's held the way the desk holds: its splits adjust the units, and its dividends are paid as
   cash. It trades thinly; a missing close uses the last close on or before that date.
+- **A benchmark gets the same price fallback a holding gets.** It trades thinly enough that Yahoo
+  answers for a market day with a bar carrying no close, and such a day used to stay NULL for ever,
+  so the series the score is measured against quietly grew holes. The fallback needs a mapping,
+  because a benchmark is named in Yahoo's form and ansaar wants the NSE symbol and an asset class:
+  `benchmark_prices` in the rules (§12). An unmapped benchmark gets no fallback, as before. The
+  index is never backfilled — its bars are the market calendar, and the desk takes that from one
+  source only.
 - **No adjusted closes anywhere.** Yahoo rescales its adjusted close after every later dividend,
   so a value stored in September and one fetched in December are in different scales, and their
   ratio is wrong by the dividend.
@@ -365,8 +372,16 @@ ltcg_rate: 0.125
 ltcg_exemption_inr: 125000
 benchmark: SHARIABEES.NS
 context_benchmark: ^NSEI
+benchmark_prices:            # where a benchmark's prices can also come from
+  SHARIABEES.NS: {symbol: SHARIABEES, asset_class: etf}
 expected_excess_pa: 0.06
 ```
+
+`benchmark_prices` maps a benchmark's Yahoo name to what ansaar wants. It is empty in the code
+defaults, so a fork ships nobody's tickers, and an entry missing either half is dropped rather than
+half-applied. The seed row carries the mapping for the benchmark it names — but `activities.config`
+is DB-owned after the first insert, so **an existing deployment needs the mapping written to its
+row** (§16).
 
 **Gates:**
 - The seed row ships `active: false`, so a fork never runs it.
@@ -444,7 +459,16 @@ Live mode is not built here. This design keeps the step to live small:
 3. ansaar-data #30 is deployed.
 4. The owner sets `ansaar_url` and pastes `ansaar_service_secret` on the admin Integrations page.
 5. Set `active = true` on `trading-desk-daily` (a DB write; ask first).
-6. Validate on the first run:
+6. On a deployment that already has a `trading-desk-daily` row, add the benchmark price mapping —
+   the seed does not overwrite `config` (a DB write; ask first):
+
+   ```sql
+   UPDATE activities
+      SET config = config || '{"benchmark_prices": {"SHARIABEES.NS": {"symbol": "SHARIABEES", "asset_class": "etf"}}}'::jsonb
+    WHERE slug = 'trading-desk-daily';
+   ```
+
+7. Validate on the first run:
    - it copied the last trading day's decisions, and read those rows: they must include
      equities. Until pipeline #355 is fixed only ETF rows arrive, and nothing holds the desk
      back — the checks pass and it buys ETFs. The missing-equity check cannot catch that on

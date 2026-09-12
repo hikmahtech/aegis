@@ -143,10 +143,16 @@ async def _refresh(
     *,
     market_days: list[date] | None = None,
     required: bool = False,
+    source_symbol: str | None = None,
 ) -> None:
     """Fetch and store ``symbol``'s recent bars: Yahoo first, then ansaar for
     each market day Yahoo could not price. Raises only when ``required`` and
-    Yahoo fails."""
+    Yahoo fails.
+
+    ``source_symbol`` is the name ansaar knows the instrument by, when that is
+    not ``symbol``: a benchmark is named in Yahoo's form (``SHARIABEES.NS``) and
+    ansaar wants the NSE symbol (``SHARIABEES``). Bars are always stored under
+    ``symbol``'s Yahoo form, whichever source they came from."""
     ysym = yahoo_symbol(symbol)
     latest = await pool.fetchval("SELECT max(date) FROM finance.desk_prices WHERE symbol = $1", ysym)
     start = latest - timedelta(days=REFETCH_OVERLAP_DAYS) if latest else today - timedelta(days=FETCH_BACK_DAYS)
@@ -176,9 +182,11 @@ async def _refresh(
     if not missing:
         return
     try:
-        bars = await ansaar.prices(symbol, asset_class, min(missing), max(missing))
+        bars = await ansaar.prices(source_symbol or symbol, asset_class, min(missing), max(missing))
     except AnsaarError as exc:
-        logger.warning("trading_desk_ansaar_prices_failed", symbol=symbol, error=str(exc)[:200])
+        logger.warning(
+            "trading_desk_ansaar_prices_failed", symbol=source_symbol or symbol, error=str(exc)[:200]
+        )
         return
     # Only the missing days are filled. ansaar is the second source, so it never
     # adds a day the market calendar has no bar for and the desk never asked about.
@@ -422,8 +430,19 @@ async def _tick(pool: asyncpg.Pool, ansaar: Any, finance: Any, today: date) -> t
     wanted |= {o.symbol: o.asset_class for o in pending}
     for symbol, asset_class in sorted(wanted.items()):
         await _refresh(pool, finance, ansaar, symbol, asset_class, today, market_days=index_days)
+    # The benchmarks get the same per-day fallback the holdings get, so a day
+    # Yahoo cannot price does not stay NULL for ever and quietly bend the score.
+    # It needs a mapping, because a benchmark is named in Yahoo's form and
+    # ansaar wants the NSE symbol and an asset class; an unmapped benchmark gets
+    # no fallback. The index is never backfilled: its bars are the market
+    # calendar, and the desk takes that from one source only.
     for bench in {rules.benchmark, rules.context_benchmark} - {INDEX}:
-        await _refresh(pool, finance, None, bench, None, today)
+        src = rules.benchmark_prices.get(bench)
+        await _refresh(
+            pool, finance, ansaar if src else None, bench,
+            src["asset_class"] if src else None, today,
+            market_days=index_days, source_symbol=src["symbol"] if src else None,
+        )
     bars = await _bars(pool, set(wanted) | set(ever))
 
     # 4. Fill.

@@ -317,7 +317,7 @@ async def test_ansaar_is_not_asked_when_yahoo_priced_every_market_day(pool):
     finance = market({"TCS.NS": [bar(THU, 3000.0), bar(FRI, 3010.0)]})
     ansaar = FakeAnsaar({FRI: [row("TCS", 0.10)]})
     await run(pool, ansaar, finance, MON)
-    assert ansaar.price_calls == []
+    assert [c for c in ansaar.price_calls if c[0] == "TCS"] == []
 
 
 async def test_one_unfillable_order_holds_back_its_own_name_only(pool):
@@ -505,3 +505,50 @@ def test_only_an_explicit_halt_counts():
     assert td._halt({"date": "2026-09-11"}) is None  # an older ansaar
     assert td._halt({"halted": "true"}) is None  # a string is not a statement
     assert td._halt(None) is None
+
+
+# --- the benchmarks get the same price fallback (spec §8) ---------------------
+
+
+async def test_a_benchmark_day_yahoo_leaves_null_is_filled_from_ansaar(pool):
+    """SHARIABEES.NS came back with a bar whose close was None and stayed NULL
+    for ever, while ansaar had the price. The monthly score is measured against
+    this series, so a hole in it bends the number the owner reads."""
+    finance = market({"TCS.NS": [bar(FRI, 3000.0)]})
+    finance.bars["SHARIABEES.NS"] = [bar(THU, 438.57), bar(FRI, None)]
+    ansaar = FakeAnsaar(
+        {FRI: [row("TCS", 0.10)]},
+        prices={"SHARIABEES": [bar(THU, 438.60), bar(FRI, 437.38)]},
+    )
+
+    await run(pool, ansaar, finance, MON)
+
+    stored = await pool.fetch(
+        "SELECT date, close, source FROM finance.desk_prices WHERE symbol = 'SHARIABEES.NS' ORDER BY date"
+    )
+    assert [(r["date"], r["close"] and float(r["close"]), r["source"]) for r in stored] == [
+        (THU, 438.57, "yahoo"),  # Yahoo had this one, so ansaar never overwrites it
+        (FRI, 437.38, "ansaar"),
+    ]
+    # ansaar is asked for the NSE symbol, not the benchmark's Yahoo name.
+    assert "SHARIABEES" in [c[0] for c in ansaar.price_calls]
+    assert "SHARIABEES.NS" not in [c[0] for c in ansaar.price_calls]
+
+
+async def test_an_unmapped_benchmark_gets_no_fallback(pool):
+    """No mapping, no fallback — the same as before this existed. A fork that
+    names its own benchmark is not silently asked about someone else's."""
+    await pool.execute(
+        "UPDATE activities SET config = config - 'benchmark_prices' WHERE slug = $1", td.DESK_SLUG
+    )
+    finance = market({"TCS.NS": [bar(FRI, 3000.0)]})
+    finance.bars["SHARIABEES.NS"] = [bar(THU, 438.57), bar(FRI, None)]
+    ansaar = FakeAnsaar({FRI: [row("TCS", 0.10)]}, prices={"SHARIABEES": [bar(FRI, 437.38)]})
+
+    await run(pool, ansaar, finance, MON)
+
+    assert [c[0] for c in ansaar.price_calls if c[0].startswith("SHARIABEES")] == []
+    close = await pool.fetchval(
+        "SELECT close FROM finance.desk_prices WHERE symbol = 'SHARIABEES.NS' AND date = $1", FRI
+    )
+    assert close is None

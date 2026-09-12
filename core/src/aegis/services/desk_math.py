@@ -40,6 +40,12 @@ class Rules:
     benchmark: str = "SHARIABEES.NS"
     context_benchmark: str = "^NSEI"
     expected_excess_pa: float = 0.06
+    # Where a benchmark's prices can also come from, when Yahoo has no close for
+    # a market day: benchmark name (Yahoo's form) to the NSE symbol and asset
+    # class ansaar wants, e.g. {"SHARIABEES.NS": {"symbol": "SHARIABEES",
+    # "asset_class": "etf"}}. Empty by default and an unmapped benchmark simply
+    # gets no fallback, so this repo ships nobody's tickers.
+    benchmark_prices: dict[str, dict[str, str]] = field(default_factory=dict)
 
     @classmethod
     def from_config(cls, cfg: dict | None) -> Rules:
@@ -51,6 +57,14 @@ class Rules:
             return float(raw) if raw is not None else float(getattr(base, key))
 
         rates = {k: float(v) for k, v in (cfg.get("tax_rate") or {}).items()}
+        # A mapping needs both halves to be usable, so one missing either is
+        # dropped rather than half-applied: the benchmark then behaves as an
+        # unmapped one, with no fallback.
+        benches = {
+            str(name): {"symbol": str(src["symbol"]), "asset_class": str(src["asset_class"])}
+            for name, src in (cfg.get("benchmark_prices") or {}).items()
+            if isinstance(src, dict) and src.get("symbol") and src.get("asset_class")
+        }
         return cls(
             mode=str(cfg.get("mode") or base.mode),
             capital=num("capital"),
@@ -66,6 +80,7 @@ class Rules:
             benchmark=str(cfg.get("benchmark") or base.benchmark),
             context_benchmark=str(cfg.get("context_benchmark") or base.context_benchmark),
             expected_excess_pa=num("expected_excess_pa"),
+            benchmark_prices=benches,
         )
 
 
