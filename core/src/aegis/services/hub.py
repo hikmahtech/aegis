@@ -1239,6 +1239,12 @@ async def merge_problems(
 # --- digest, close sweep and admin reads (PR 6) -------------------------------
 
 
+# Sources whose problems the infra digest leaves out, told apart by the source
+# of their first occurrence. `feeds` is Raphael's (#511): a broken feed is a
+# `#feeds` task he owns, not an infra incident.
+DIGEST_SKIPPED_SOURCES = ("feeds",)
+
+
 async def digest(
     pool: asyncpg.Pool, *, hours: float = 24.0, now: datetime | None = None
 ) -> dict[str, Any]:
@@ -1270,9 +1276,16 @@ async def digest(
         # task's question — are not problems the infra digest reports (#513);
         # Raphael's briefing has its own topics line.
         "  AND p.class <> ALL($2::text[]) "
+        # Nor is a feed that broke (#511): that is Raphael's `#feeds` task.
+        # Told apart by the source of the first occurrence, the same rule that
+        # picks a task's owner (`hub_project._first_source`).
+        "  AND COALESCE((SELECT e.source FROM problem_events e "
+        "                 WHERE e.problem_id = p.id AND e.kind = 'occurrence' "
+        "                 ORDER BY e.id LIMIT 1), '') <> ALL($3::text[]) "
         "ORDER BY p.last_seen_at DESC",
         since,
         [TOPIC_CLASS, QUESTION_CLASS],
+        list(DIGEST_SKIPPED_SOURCES),
     )
     problems = [dict(r) for r in rows]
     live = [p for p in problems if p["status"] in LIVE_STATUSES]
@@ -1337,7 +1350,11 @@ async def close_resolved(
 
 
 async def close_problem(
-    pool: asyncpg.Pool, problem_id: str, *, now: datetime | None = None
+    pool: asyncpg.Pool,
+    problem_id: str,
+    *,
+    now: datetime | None = None,
+    reason: str = "closed by hand",
 ) -> bool:
     """Close ONE resolved problem. False when it is missing, already closed, or
     not resolved.
@@ -1346,6 +1363,10 @@ async def close_problem(
     which closes every resolved problem in the database — including ones whose
     resolution has not been projected yet, and a closed problem is never
     projected again, so their tasks were left open with no closing comment.
+
+    ``reason`` goes on the close event. The default is the Problems page's
+    Close; an automated caller (a topic's round ending) says why instead, or
+    the timeline credits the user with a close they never made.
     """
     now = now or _utcnow()
     async with pool.acquire() as conn, conn.transaction():
@@ -1366,7 +1387,7 @@ async def close_problem(
             "ON CONFLICT (source, external_id) DO NOTHING",
             problem_id,
             f"close:{problem_id}:{now.isoformat()}",
-            {"action": "close", "reason": "closed by hand"},
+            {"action": "close", "reason": reason},
             now,
         )
     logger.info("hub_problem_closed", problem_id=problem_id)

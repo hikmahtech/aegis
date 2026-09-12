@@ -55,10 +55,7 @@ def _entry(n: int, hour: int) -> dict:
 @activity.defn(name="fetch_feed")
 async def stub_fetch(inp: FetchFeedInput) -> FetchFeedResult:
     # Deliberately NOT outcome-ordered: the older entry is the one that fails.
-    return FetchFeedResult(
-        entries=[_entry(1, 10), _entry(2, 11)],
-        latest_published="2026-04-18T11:00:00",
-    )
+    return FetchFeedResult(entries=[_entry(1, 10), _entry(2, 11)])
 
 
 @activity.defn(name="ingest_idempotency_claim")

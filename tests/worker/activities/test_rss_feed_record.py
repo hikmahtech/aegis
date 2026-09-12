@@ -90,6 +90,6 @@ async def test_record_feed_run_counts_failures_in_a_row_and_a_success_resets(poo
     ok = await env.run(act.record_feed_run, cid, {"ok": True, "backlog": 7})
     config = await pool.fetchval("SELECT config FROM channels WHERE id = $1::uuid", cid)
     assert ok["fetch_failures"] == 0
+    assert ok["fetch_successes"] == 1
     assert config["last_fetch_error"] == ""
     assert config["backlog"] == 7
-    assert config["last_fetch_ok_at"]

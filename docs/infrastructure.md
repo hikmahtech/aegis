@@ -1690,8 +1690,12 @@ Raphael researches with five chat tools and one flow (#509).
 | `research_topic` | Hands the question to `ResearchFlow` and waits up to 45s for the answer |
 
 The four reads fetch and return; nothing is stored. They are on the MCP gated
-endpoint's read-only list. `research_topic` is not, because it starts a flow
-that saves its answer.
+endpoint's read-only list, and they stay there: fetching is not writing.
+`research_topic` is not, because it starts a flow that saves its answer. The
+text `read_url` and `paper_read` return comes labelled as untrusted fetched
+content (an `untrusted` note is the first key), and the synthesis prompt
+labels its numbered sources the same way, so a page cannot pass itself off
+as an instruction.
 
 **`ResearchFlow`** gathers from the knowledge store, a web search and — when the
 question looks academic — the two paper engines; reads the best pages (a task's
@@ -1765,7 +1769,9 @@ prompt actually used. Admin → Channels shows it per feed, and so do
 - documents used in the last 30 and 90 days;
 - the last entry, the backlog and consecutive fetch failures.
 
-Only chat writes the injection log, so "used" is a floor.
+Chat turns and research runs write the injection log (`source` `chat` and
+`research`). A briefing or a rollup does not log what it reads, so "used" is a
+floor.
 
 On the 1st of each month, Raphael's briefing names the active feeds that have
 90 days of history and no use in that time. The migration backfills history
@@ -1815,21 +1821,32 @@ or `paper_read`.
 
 ### When a feed breaks
 
-- **Failing:** three fetches in a row that fail (an HTTP error, or a response
-  that is not a feed) are a `feeds` hub finding of class `feed_failing`. The
-  finding records an occurrence when the feed crosses that line and once a
-  day at the review hour; the hourly runs in between only keep the problem
-  open, so a dead feed does not post 24 comments a day on its task. Before
-  #511, feedparser turned all of these into an empty parse, which looked like
-  a quiet feed. An empty feed that feedparser still recognised as a feed, with
-  a benign complaint such as an encoding override, is quiet, not failing.
-- **Stale:** no new entry for `channels.config.stale_after_days` days (default
-  30) is a `feed_stale` finding, checked once a day at 03:30 UTC. A feed that
-  never gave a dated entry is measured from when AEGIS began polling it
-  (`channels.config.tracking_since`).
-- **Recovery:** both resolve themselves when the feed recovers
-  (`hub_watch.reconcile_findings`). The problem's subject is the feed URL, and
-  the research agent owns the `feeds` source.
+- **Failing:** three fetches in a row that fail (an HTTP error, a response
+  that is not a feed, or a fetch the URL guard refused) are a `feeds` hub
+  finding of class `feed_failing`. The feed itself is fetched through
+  `url_guard` (every redirect checked, 30 s, 20 MB), and only the bytes go to
+  feedparser. The finding records an occurrence when the feed crosses that
+  line and once a day at the review hour; the hourly runs in between only keep
+  the problem open, so a dead feed does not post 24 comments a day on its
+  task. Before #511, feedparser turned all of these into an empty parse, which
+  looked like a quiet feed. An empty feed that feedparser still recognised as
+  a feed, with a benign complaint such as an encoding override, is quiet, not
+  failing.
+- **Stale:** no entry stored for `channels.config.stale_after_days` days
+  (default 30) is a `feed_stale` finding, checked once a day at 03:30 UTC. It
+  is measured from the newest entry the store kept (`feed_entries.seen_at`),
+  not from the cursor, which also moves past duplicates. A feed that never
+  stored an entry is measured from when AEGIS began tracking it: its first
+  recorded entry, else its first poll (`channels.config.tracking_since`).
+  That is `feeds.tracking_since`, the same date the feed stats show.
+- **Recovery:** a stale finding resolves when the feed stores an entry again.
+  A failing one resolves only after two good fetches in a row
+  (`feeds.RECOVERED_AFTER`, counted in `channels.config.fetch_successes`).
+  One good fetch, a failure under the threshold, or a run whose feed record
+  could not be written keeps the problem open without adding an occurrence
+  (`hub_watch.reconcile_findings`, `record: False`). The problem's subject is
+  the feed URL, and the research agent owns the `feeds` source, so these stay
+  out of the infra digest (`hub.DIGEST_SKIPPED_SOURCES`).
 
 A `process_content` that returns `status: error` now counts as a failure. The
 entry's claim is released and the cursor is fenced, so the next run retries it
@@ -1846,6 +1863,10 @@ freeing about 530 MB of text and 1 GB of vectors from a 4.8 GB table. Every
 PDF dates from 2026-07-01 or later, so nothing is older than 90 days yet.
 Deleting anything is a separate, explicit decision.
 
+It is an operator endpoint, kept on purpose: no admin page and no flow calls
+it. Call it with the admin credentials the other `/api/admin` routes take,
+when you want the numbers before deciding on a retention rule.
+
 ### Setting it up on an existing deployment
 
 1. Grant the three tools. The DB `tool_set` wins over the seed:
@@ -1855,14 +1876,14 @@ Deleting anything is a separate, explicit decision.
    WHERE id = 'raphael' AND NOT (metadata->'tool_set' ? 'list_feeds');
    ```
 2. Set arXiv to `abstract` (the SQL above).
-3. Optional cleanup of the rows the removed Miniflux integration left behind
-   (harmless if kept):
+3. The Miniflux cleanup is done on this deployment: the stack was removed on
+   2026-09-12, and none of its settings rows are left (checked 2026-09-13).
+   Another deployment that still has them can keep them, since they are
+   harmless, or remove them:
    ```sql
    DELETE FROM settings WHERE key IN
      ('integration:miniflux_url', 'integration:miniflux_api_key', 'connector_health:miniflux');
    ```
-   Removing the Miniflux stack itself (Portainer, stack `miniflux`) is a
-   separate call.
 
 ## The Calibre library (Raphael)
 
@@ -1978,7 +1999,11 @@ record; the knowledge store is only its index (#514, spec
   `.obsidian/`, `_templates/`, `backups/`, `_attachments/` and `.trash/`, at
   most `max_files` (300) per run. Encrypted meld-encrypt blocks are stripped
   before anything is stored. Notes rank above raw documents (`rank_boost`
-  1.25). Progress is `settings.notes_index_state`.
+  1.25). Progress is `settings.notes_index_state`. `raphael/questions/` is
+  not indexed: `ResearchFlow` already keeps each answer in the store as
+  `aegis://research/<hash>`, and indexing the note too put every answer in
+  retrieval twice. Any row an earlier run made for such a note is removed on
+  the next run.
 - **Writes, insert-only:** only under `raphael/` (research answers in
   `raphael/questions/`, and whatever Raphael writes with `note_write` /
   `note_link`) and the daylog's journal notes. A write creates a note or
@@ -2005,10 +2030,20 @@ record; the knowledge store is only its index (#514, spec
   template, without its open checkboxes and without the empty `- ` placeholder
   in that section. No `daylog` knowledge row is filed then; if the vault write
   fails the row is filed as before and the run reports `vault_error`.
-- **Conflicts:** `obsidian-git` commits from the phone and laptop. A rejected
-  push or a conflicting rebase drops Raphael's own unpushed commit, pulls fresh
-  and retries once; a second failure is reported and nothing is kept. Raphael
-  never force-pushes.
+- **Conflicts:** `obsidian-git` commits from the phone and laptop. A push
+  rejected as not a fast-forward, or a conflicting rebase, drops Raphael's own
+  unpushed commit, pulls fresh and retries once; a second failure is reported
+  and nothing is kept. Raphael never force-pushes. Any other git failure — no
+  network, a refused deploy key, a missing repository — is reported at once
+  without a retry, with a short reason such as "the remote refused the deploy
+  key" and no URL or git output in it.
+- **Dates:** a dated heading (`note_write` with no heading, a research
+  answer's section) and the time on a journal note Raphael creates are on the
+  user's clock, the `user_timezone` settings row, not the container's UTC.
+- **What insert-only rules out:** Raphael cannot fill in a placeholder that
+  is already in a note, such as an empty `- ` bullet the template left. It
+  inserts its own block instead. Only a note Raphael creates from a template
+  loses its empty placeholders.
 
 ### Setting it up
 
@@ -2030,10 +2065,18 @@ record; the knowledge store is only its index (#514, spec
 4. Build the index without waiting for :19: `temporal schedule trigger
    --schedule-id notes-sync-hourly`. The first pass over ~1,000 notes takes a
    few runs (`remaining` in the summary counts down).
-5. Optional, once: write the daylog's existing entries into the journal —
-   `temporal workflow start --type NotesBackfillFlow --task-queue aegis-main
-   --workflow-id notes-backfill-journal --input '{"agent_id": "raphael"}'`.
-   It uses the live markers, so a second run writes nothing.
+5. The daylog's knowledge rows reach the journal through `NotesBackfillFlow`,
+   which runs weekly (`notes-backfill-weekly`, Sunday 04:47 UTC; the schedule
+   appears on its own through `schedule_sync`). It files any day whose vault
+   write failed and fell back to its knowledge row, and it uses the live
+   markers, so a week with nothing missing writes nothing. The schedule looks
+   only at rows filed in the last `since_days` (14) days: the pre-vault rows
+   are still in the store, and rereading them every week would put back a
+   block you deleted from an old journal note. To move every old row (the
+   first time, or after a vault outage longer than two weeks), start it by
+   hand, where `since_days` defaults to 0 (every row): `temporal workflow
+   start --type NotesBackfillFlow --task-queue aegis-main --workflow-id
+   notes-backfill-journal --input '{"agent_id": "raphael"}'`.
 
 Until step 2 every part reports `not_configured` and the daylog files its
 knowledge rows exactly as before.

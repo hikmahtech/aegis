@@ -25,6 +25,7 @@ from aegis.services import notes
 from aegis.services import notes_write as nw
 from aegis.services.tools.base import ToolContext
 from aegis.services.tools.registry import aegis_tool
+from aegis.services.user_time import user_now
 
 logger = structlog.get_logger()
 
@@ -178,8 +179,10 @@ async def _exec_note_write(
     """
     if not notes.config_from_settings(ctx.settings).configured:
         return f"error: {_NOT_CONFIGURED}. Nothing was written."
+    # An empty heading becomes today's date: the user's today (`user_timezone`),
+    # not the container's UTC one.
     payload, problem = nw.normalise("write", {"path": path, "text": text, "heading": heading,
-                                              "title": title})
+                                              "title": title}, await user_now(pool))
     if problem:
         return f"error: {problem}. Nothing was written."
     return await _dispatch_notes_write(ctx, "write", payload)

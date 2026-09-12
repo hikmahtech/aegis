@@ -33,21 +33,17 @@ def test_an_unterminated_bare_block_drops_the_rest():
     assert notes.strip_encrypted("a 🔐β dGFpbA== and more") == f"a {P}"
 
 
-def test_split_section_takes_raphaels_section_and_leaves_the_rest():
-    key = notes.journal_key("daily", "2026-09-12")
-    text = (
-        "# 12 Sep 26\nmy long day\n"
-        f"\n## Raphael\n{notes.marker(key)}\n\nThe narrative.\n"
-        "\n## Later\nmore of mine\n"
-    )
-    mine, rest = notes.split_section(text, key)
-    assert mine == "The narrative."
-    assert "my long day" in rest and "more of mine" in rest
-    assert "narrative" not in rest and "## Raphael" not in rest
-
-
 def test_split_section_without_the_marker_is_the_whole_note():
     assert notes.split_section("just mine", "daylog:2026-09-12") == ("", "just mine")
+
+
+def test_split_section_reads_only_the_bullet_block():
+    """The first `## Raphael` section shape is gone from the vault (the layout
+    repair rewrote every such note), so a marker that is not on a bullet is
+    not a block to read."""
+    key = notes.journal_key("daily", "2026-09-12")
+    text = f"# 12 Sep 26\n## Raphael\n{notes.marker(key)}\n\nThe narrative.\n"
+    assert notes.split_section(text, key) == ("", text)
 
 
 @pytest.mark.parametrize(

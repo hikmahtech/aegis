@@ -5,6 +5,7 @@ from __future__ import annotations
 from unittest.mock import MagicMock, patch
 
 import pytest
+from aegis_worker.activities import rss as rss_mod
 from aegis_worker.activities.rss import (
     FetchFeedInput,
     FetchFeedResult,
@@ -18,6 +19,20 @@ from temporalio.testing import ActivityEnvironment
 @pytest.fixture
 def rss():
     return RssActivities(db_pool=None)
+
+
+@pytest.fixture(autouse=True)
+def downloaded(monkeypatch):
+    """The fetch itself — the guarded client, redirects, the size cap — is
+    `test_fetch_guards.py`'s. Here it hands over a body, and the patched
+    `feedparser.parse` decides what that body holds."""
+    state = {"out": (b"<rss/>", {}, "")}
+
+    async def fake(url: str):
+        return state["out"]
+
+    monkeypatch.setattr(rss_mod, "_download_feed", fake)
+    return state
 
 
 @pytest.mark.asyncio
@@ -50,7 +65,7 @@ async def test_fetch_feed_parses_entries(rss):
     assert isinstance(result, FetchFeedResult)
     assert len(result.entries) == 2
     assert result.entries[0]["title"] == "Post 1"
-    assert result.latest_published.startswith("2026-04-18T11")
+    assert result.entries[1]["published"].startswith("2026-04-18T11")
 
 
 @pytest.mark.asyncio
@@ -86,26 +101,28 @@ async def test_fetch_feed_respects_cursor(rss):
 
 
 # --------------------------------------------------------------------------
-# #511 — a failed fetch says so. feedparser never raises: a dead URL, a 404
-# or an HTML page come back as an empty parse, which used to read as "quiet".
+# #511 — a failed fetch says so. A dead URL, a 404 or an HTML page used to
+# come back as an empty parse, which read as "quiet".
 # --------------------------------------------------------------------------
 
 
 def _empty_parse(**attrs):
     parsed = MagicMock()
     parsed.entries = []
-    parsed.status = attrs.get("status", 200)
     parsed.bozo = attrs.get("bozo", 0)
     parsed.bozo_exception = attrs.get("bozo_exception")
+    parsed.version = attrs.get("version", "")
     return parsed
 
 
 @pytest.mark.asyncio
-async def test_fetch_feed_reports_an_http_error(rss):
-    with patch("feedparser.parse", return_value=_empty_parse(status=404)):
+async def test_fetch_feed_reports_a_failed_download_without_parsing(rss, downloaded):
+    downloaded["out"] = (b"", {}, "HTTP 404")
+    with patch("feedparser.parse") as parse:
         result = await ActivityEnvironment().run(rss.fetch_feed, FetchFeedInput(url="https://x"))
     assert result.entries == []
     assert result.error == "HTTP 404"
+    parse.assert_not_called()
 
 
 @pytest.mark.asyncio

@@ -35,6 +35,7 @@ from aegis.services.tools.base import (
     _smart_subset,  # noqa: F401 — re-export: imported from here by tests
     _truncate_result,
     _truncate_text,  # noqa: F401 — re-export: routes/mcp_server.py imports it here
+    recorded_result,
 )
 from aegis.services.tools.feeds import (
     _exec_follow_feed,
@@ -455,7 +456,7 @@ CHAT_TOOLS = [
         "type": "function",
         "function": {
             "name": "research_topic",
-            "description": "Research a topic by combining knowledge graph data with fresh web search results. Returns a synthesized analysis with sources.",
+            "description": "Research a question: search the knowledge store, the web and (for academic questions) papers, read the best sources, and answer with numbered citations. Runs in the background as a research flow and waits up to 45 seconds; a longer run posts its answer to the channel when it is ready. The answer is saved, replacing any earlier answer to the same question.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -3187,6 +3188,12 @@ AGENT_TOOL_SETS: dict[str, set[str]] = {
         "library_book",
         "library_read",
         "library_suggest",
+        # Raphael's notes (#514): the vault is his record. Search and read
+        # it; write only under raphael/ (through NotesWriteFlow).
+        "note_search",
+        "note_read",
+        "note_write",
+        "note_link",
         "track_topic",
         # Tracked topics' rounds in the hub (#513): stop tracking one.
         "untrack_topic",
@@ -4200,10 +4207,7 @@ async def send_message(
                 messages.append({"role": "tool", "tool_call_id": _tc_id, "content": tool_result})
                 tool_calls_made.append({"name": _tc_name, "args": args})
 
-                try:
-                    result_dict = json.loads(tool_result)
-                except (json.JSONDecodeError, TypeError):
-                    result_dict = {"raw": tool_result[:500]}
+                result_dict = recorded_result(tool_result)
 
                 # An executor reports failure by RETURNING an error envelope, not
                 # by raising: `_exec_infra` turns a non-zero exit into

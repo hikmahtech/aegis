@@ -59,6 +59,9 @@ ATTENTION_ITEMS = {"high": 2, "medium": 3, "low": 5}
 _DIGEST_ITEMS = 10
 # The advisory lock every registry read-modify-write takes.
 _REGISTRY_LOCK = "research_topics:registry"
+# The close event's reason for a round that was resolved (by hand, say) and is
+# closed when the next item arrives.
+RESOLVED_ROUND_CLOSED = "the round was resolved; the next item opens a new one"
 
 
 @dataclass(frozen=True)
@@ -143,8 +146,8 @@ def _event(topic: Topic, **kw: Any) -> Event:
     )
 
 
-async def live_problem(pool: asyncpg.Pool, topic: Topic) -> dict[str, Any] | None:
-    """The topic's current round, if one is open."""
+async def _open_round(pool: asyncpg.Pool, topic: Topic) -> dict[str, Any] | None:
+    """The topic's round that is not closed yet, whatever its status."""
     key = correlation_key(_event(topic, external_id="-", kind="occurrence", title="-"))
     row = await pool.fetchrow(
         "SELECT id::text AS id, status, metadata, todoist_task_id FROM problems "
@@ -154,16 +157,51 @@ async def live_problem(pool: asyncpg.Pool, topic: Topic) -> dict[str, Any] | Non
     return dict(row) if row else None
 
 
+async def live_problem(pool: asyncpg.Pool, topic: Topic) -> dict[str, Any] | None:
+    """The topic's current round, if one is live. A resolved round is over
+    even before it is closed: the next item opens a fresh round rather than
+    reopening it and its task."""
+    row = await _open_round(pool, topic)
+    return row if row is not None and row["status"] != "resolved" else None
+
+
+async def _close_resolved_round(
+    pool: asyncpg.Pool, problem_id: str, *, now: datetime
+) -> bool:
+    """Close a round that is resolved but still open — resolved by hand on the
+    Problems page, or left so by a close that failed after its resolve.
+
+    Projected first, as the Problems page's Close does: a closed problem is
+    never projected again, so closing one whose resolution has not reached
+    its task yet would leave that task open for good."""
+    from aegis.services import hub_project
+    from aegis.services.hub import close_problem
+
+    try:
+        await hub_project.project(pool, problem_id, now=now)
+    except Exception as exc:  # noqa: BLE001 — Todoist being down must not keep the round open
+        logger.warning(
+            "research_round_close_project_failed", problem_id=problem_id, error=str(exc)[:200]
+        )
+    return await close_problem(pool, problem_id, now=now, reason=RESOLVED_ROUND_CLOSED)
+
+
 async def ensure_round(
     pool: asyncpg.Pool, topic: Topic, *, now: datetime | None = None
 ) -> str | None:
     """The live problem for ``topic``, opening a round when there is none. The
     opening occurrence names the round; it is not an item, so it never counts
-    towards the threshold."""
+    towards the threshold.
+
+    A resolved round that is still open is closed first. Otherwise the
+    opening occurrence would land on it, and the hub's reopen window would
+    bring it back — with the task the user had already dealt with."""
     now = now or datetime.now(UTC)
-    current = await live_problem(pool, topic)
-    if current is not None:
+    current = await _open_round(pool, topic)
+    if current is not None and current["status"] != "resolved":
         return current["id"]
+    if current is not None:
+        await _close_resolved_round(pool, current["id"], now=now)
     result = await ingest_event(
         pool,
         _event(
@@ -270,7 +308,8 @@ async def untrack(
         await _save_registry(conn, kept)
     out: dict[str, Any] = {"status": "removed", "topic": name, "total_topics": len(kept)}
     closed = False
-    current = await live_problem(pool, Topic(name.strip(), ()))
+    # Any round still open, resolved or not: untracking ends it either way.
+    current = await _open_round(pool, Topic(name.strip(), ()))
     if current is not None:
         closed = await close_round(
             pool, current["id"], reason="the topic is no longer tracked", now=now
@@ -319,7 +358,7 @@ async def close_round(
         if key:
             await conn.execute("SELECT pg_advisory_xact_lock(hashtext($1))", key)
         await set_status(pool, problem_id, "resolved", reason=reason, source=source, now=now)
-        return await close_problem(pool, problem_id, now=now)
+        return await close_problem(pool, problem_id, now=now, reason=reason)
 
 
 def _item_id(url: str, topic: Topic) -> str:

@@ -184,16 +184,13 @@ def strip_encrypted(text: str) -> str:
 
 def split_section(text: str, key: str) -> tuple[str, str]:
     """What a journal write put under `key`, and the note without it.
-    `("", text)` when the marker is not in the note.
+    `("", text)` when the marker is not in the note, or not on a bullet.
 
-    Two shapes. The current one (`journal_block`): a
-    `- #raphael … %% aegis:<key> %%` bullet whose indented child bullets are
-    the outline. Each depth-1 child comes back as a paragraph, and a deeper
-    one as a `- ` item indented two spaces a level under it, which is the
-    text `body_outline` laid out in the first place. The first one, which
-    notes written before the layout fix still carry: `## heading`, the marker
-    line, then the body up to the next `## ` heading, the next aegis marker or
-    the end of the note."""
+    The block (`journal_block`) is a `- #raphael … %% aegis:<key> %%` bullet
+    whose indented child bullets are the outline. Each depth-1 child comes
+    back as a paragraph, and a deeper one as a `- ` item indented two spaces
+    a level under it, which is the text `body_outline` laid out in the first
+    place."""
     mark = marker(key)
     at = text.find(mark)
     if at < 0:
@@ -202,34 +199,26 @@ def split_section(text: str, key: str) -> tuple[str, str]:
     line_end = text.find("\n", at)
     line_end = len(text) if line_end < 0 else line_end + 1
     line = text[line_start:line_end]
-    if line.lstrip().startswith("- "):
-        indent = len(line) - len(line.lstrip())
-        base = _indent_levels(line)
-        end = line_end
-        paras: list[str] = []
-        while end < len(text):
-            nxt = text.find("\n", end)
-            nxt = len(text) if nxt < 0 else nxt + 1
-            row = text[end:nxt].rstrip("\n")
-            if not row.strip() or len(row) - len(row.lstrip()) <= indent:
-                break
-            item = _BULLET_RE.sub("", row.strip(), count=1)
-            depth = max(1, _indent_levels(row) - base)
-            if depth == 1 or not paras:
-                paras.append(item)
-            else:
-                paras[-1] += "\n" + "  " * (depth - 1) + "- " + item
-            end = nxt
-        return "\n\n".join(p for p in paras if p), (text[:line_start] + text[end:]).strip()
-    start = line_start
-    if line_start > 0:
-        prev_start = text.rfind("\n", 0, line_start - 1) + 1
-        if text[prev_start:line_start].startswith("## "):
-            start = prev_start
-    body_start = at + len(mark)
-    ends = [i for i in (text.find("\n## ", body_start), text.find("%% aegis:", body_start)) if i >= 0]
-    end = min(ends) if ends else len(text)
-    return text[body_start:end].strip(), (text[:start] + text[end:]).strip()
+    if not line.lstrip().startswith("- "):
+        return "", text
+    indent = len(line) - len(line.lstrip())
+    base = _indent_levels(line)
+    end = line_end
+    paras: list[str] = []
+    while end < len(text):
+        nxt = text.find("\n", end)
+        nxt = len(text) if nxt < 0 else nxt + 1
+        row = text[end:nxt].rstrip("\n")
+        if not row.strip() or len(row) - len(row.lstrip()) <= indent:
+            break
+        item = _BULLET_RE.sub("", row.strip(), count=1)
+        depth = max(1, _indent_levels(row) - base)
+        if depth == 1 or not paras:
+            paras.append(item)
+        else:
+            paras[-1] += "\n" + "  " * (depth - 1) + "- " + item
+        end = nxt
+    return "\n\n".join(p for p in paras if p), (text[:line_start] + text[end:]).strip()
 
 
 # ------------------------------------------------------ dates and names
@@ -737,15 +726,60 @@ def _env(cfg: NotesConfig) -> dict[str, str]:
     return env
 
 
+# Credentials in a URL, as git prints them (`https://user:token@host/...`).
+_URL_USERINFO_RE = re.compile(r"(\w+://)[^/\s@]+@")
+# git saying the remote moved on under the write: a push rejected as not a
+# fast-forward, or a rebase that stopped on a conflict. Only these are worth
+# dropping the write, pulling fresh and trying once more.
+_CONFLICT_RE = re.compile(r"\[rejected\]|non-fast-forward|\(fetch first\)|CONFLICT|could not apply")
+_KEY_REFUSED_RE = re.compile(
+    r"Permission denied|publickey|Authentication failed|could not read Username", re.I
+)
+_NOT_FOUND_RE = re.compile(r"does not appear to be a git repository|repository not found", re.I)
+_UNREACHABLE_RE = re.compile(
+    r"Could not resolve host|unable to access|Connection (?:timed out|refused|reset)|"
+    r"Network is unreachable|Could not read from remote repository",
+    re.I,
+)
+
+
+def _scrub(text: str) -> str:
+    """git's stderr without the credentials of any URL in it."""
+    return _URL_USERINFO_RE.sub(r"\1", text or "")
+
+
+def _git_failure(what: str, proc: subprocess.CompletedProcess) -> NotesError:
+    """The error for a failed pull or push.
+
+    A `NotesConflict` only when git says the remote moved on, which the retry
+    can fix. Anything else — no network, a refused key, a missing repository —
+    fails the same way twice, so it is a `NotesError` at once, with a reason
+    that is ours: short, and free of the URL, paths and whatever else git
+    printed. Every failure used to be a conflict, retried and then reported as
+    "the vault changed under the write twice" with git's stderr in it."""
+    err = proc.stderr or ""
+    if _CONFLICT_RE.search(err):
+        return NotesConflict(f"{what}: the vault changed on the remote")
+    if _KEY_REFUSED_RE.search(err):
+        reason = "the remote refused the deploy key"
+    elif _NOT_FOUND_RE.search(err):
+        reason = "the remote repository was not found"
+    elif _UNREACHABLE_RE.search(err):
+        reason = "the remote could not be reached"
+    else:
+        reason = f"git exited {proc.returncode}"
+    return NotesError(f"{what} failed: {reason}")
+
+
 def _run(
     args: list[str], cfg: NotesConfig, *, timeout: int = 60, check: bool = True
 ) -> subprocess.CompletedProcess:
     try:
         proc = books._spawn(args, cwd=str(cfg.path), timeout=timeout, env=_env(cfg))
     except books.BooksError as exc:
-        raise NotesError(str(exc)) from exc
+        raise NotesError(_scrub(str(exc))) from exc
     if check and proc.returncode != 0:
-        raise NotesError(f"{' '.join(args[:2])} failed: {proc.stderr.strip()[:500]}")
+        raise NotesError(f"{' '.join(args[:2])} failed: {_scrub(proc.stderr.strip())[:500]}")
     return proc
 
 
@@ -802,7 +836,7 @@ def _pull(cfg: NotesConfig) -> None:
     proc = _run(["git", "pull", "-q", "--rebase"], cfg, check=False, timeout=120)
     if proc.returncode != 0:
         _run(["git", "rebase", "--abort"], cfg, check=False)
-        raise NotesConflict(f"git pull failed: {proc.stderr.strip()[:300]}")
+        raise _git_failure("git pull", proc)
 
 
 def _target_rel(cfg: NotesConfig, ap: Append) -> str:
@@ -852,7 +886,7 @@ def _push(cfg: NotesConfig) -> None:
         return
     proc = _run(["git", "push", "-q"], cfg, check=False, timeout=120)
     if proc.returncode != 0:
-        raise NotesConflict(f"git push was rejected: {proc.stderr.strip()[:300]}")
+        raise _git_failure("git push", proc)
 
 
 class _Lock:
@@ -985,8 +1019,8 @@ async def read_note(cfg: NotesConfig, rel: str, max_chars: int = READ_MAX_CHARS)
 
 def read_journal_days_sync(cfg: NotesConfig, days: list[date]) -> dict[str, str]:
     """`{YYYY-MM-DD: note text}` for the days that have a journal note: the
-    filed one, the live one at the journal root (which is also where notes
-    written before the layout fix still sit), or both, joined — the day is
+    filed one, the live one at the journal root (where periodic-notes makes
+    today's note before the user files it), or both, joined — the day is
     whatever either holds."""
     by_rel: dict[str, str] = {}
     for d in days:

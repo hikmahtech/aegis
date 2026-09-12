@@ -112,6 +112,6 @@ async def test_infra_cluster_empty_db_value_keeps_env(clean_int):
 async def test_infra_heartbeat_ping_url_is_secret():
     """#258 — the healthchecks.io ping URL is a bearer capability token, so it
     must be registered secret=True (encrypted at rest, masked in the admin UI)
-    same as github_token/miniflux_api_key."""
+    same as github_token."""
     spec = next(c for c in CONFIG_REGISTRY if c.key == "infra_heartbeat_ping_url")
     assert spec.secret is True

@@ -1,6 +1,11 @@
-"""RSS/Atom feed fetch via feedparser, plus the per-feed record (#511, #512).
+"""RSS/Atom feed fetch, plus the per-feed record (#511, #512).
 
-feedparser is sync, so the fetch runs in `asyncio.to_thread`.
+A feed URL is a third party's: the feed is fetched with an httpx client whose
+`url_guard` hook checks the first request and every redirect, bounded in time
+and size, and only the bytes go to feedparser. feedparser used to fetch the URL
+itself, over urllib, following any redirect wherever it led — a public feed
+could bounce the poll onto the overlay network. feedparser is sync, so the
+parse runs in `asyncio.to_thread`.
 
 Besides fetching, this module keeps what `RssIngestFlow` learns about each
 feed: which knowledge row every entry produced (`feed_entries`), whether the
@@ -18,7 +23,10 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
 
+import httpx
 import structlog
+from aegis.services import feeds
+from aegis.services.url_guard import UnsafeURLError, guarded_hooks
 from temporalio import activity
 
 from aegis_worker.activities.channels import _decode_config
@@ -36,13 +44,28 @@ class FetchFeedInput:
 @dataclass
 class FetchFeedResult:
     entries: list[dict] = field(default_factory=list)
-    latest_published: str | None = None
-    # Why a fetch produced nothing, when it did not simply have nothing new.
-    # feedparser never raises: a dead host, a 404 or an HTML page all come
-    # back as an empty parse with `bozo` set, which is how Miniflux's dead
-    # feeds and a moved feed could both read as "quiet" (#511). "" = the fetch
-    # itself worked.
+    # Why a fetch produced nothing, when it did not simply have nothing new: an
+    # HTTP error, a refused or failed request, or a body that is not a feed.
+    # Before #511 all of these came back as an empty parse, which is how
+    # Miniflux's dead feeds and a moved feed could both read as "quiet". ""
+    # = the fetch itself worked.
     error: str = ""
+
+
+# The fetch's bounds. A feed is one document: arXiv's daily burst, the largest
+# the feeds carry, is a few MB, so a body past the cap is not a feed worth
+# parsing.
+_FEED_TIMEOUT = httpx.Timeout(30.0)
+_FEED_MAX_BYTES = 20 * 1024 * 1024
+# The headers feedparser sent when it fetched the feed itself, so a feed that
+# served feedparser still serves this.
+_FEED_HEADERS = {
+    "User-Agent": "feedparser/6.0 +https://github.com/kurtmckee/feedparser/",
+    "Accept": (
+        "application/atom+xml,application/rdf+xml,application/rss+xml,"
+        "application/x-netcdf,application/xml;q=0.9,text/xml;q=0.2,*/*;q=0.1"
+    ),
+}
 
 
 def gate_pattern(terms: list[str]) -> re.Pattern[str] | None:
@@ -69,16 +92,46 @@ def passes_gate(pattern: re.Pattern[str] | None, entry: dict) -> bool:
     return bool(pattern.search(f"{entry.get('title') or ''} {entry.get('summary') or ''}"))
 
 
+async def _download_feed(url: str) -> tuple[bytes, dict[str, str], str]:
+    """`(body, headers for feedparser, error)`: the feed's bytes, or why there
+    are none. Never raises. An HTTP error, a refused hop, a network failure and
+    a body past `_FEED_MAX_BYTES` are all a failed fetch."""
+    try:
+        async with (
+            httpx.AsyncClient(
+                timeout=_FEED_TIMEOUT,
+                follow_redirects=True,
+                event_hooks=guarded_hooks(),
+                headers=_FEED_HEADERS,
+            ) as client,
+            client.stream("GET", url) as resp,
+        ):
+            if resp.status_code >= 400:
+                return b"", {}, f"HTTP {resp.status_code}"
+            body = bytearray()
+            async for chunk in resp.aiter_bytes():
+                body += chunk
+                if len(body) > _FEED_MAX_BYTES:
+                    return b"", {}, f"the response is larger than {_FEED_MAX_BYTES // 2**20} MB"
+            # The final URL after redirects, so relative links resolve against
+            # where the feed actually lives; the content type for the charset.
+            headers = {
+                "content-location": str(resp.url),
+                "content-type": resp.headers.get("content-type", ""),
+            }
+            return bytes(body), headers, ""
+    except UnsafeURLError as exc:
+        return b"", {}, str(exc)[:200]
+    except httpx.HTTPError as exc:
+        return b"", {}, (str(exc) or type(exc).__name__)[:200]
+
+
 def _fetch_error(parsed: Any) -> str:
-    """Why an empty parse is a failed fetch, or "" when it is just empty."""
+    """Why an empty parse of a fetched body is a failed fetch, or "" when the
+    feed is just empty. (An HTTP error never gets this far: `_download_feed`
+    reports it.)"""
     if parsed.entries:
         return ""
-    status = getattr(parsed, "status", None)
-    try:
-        if status is not None and int(status) >= 400:
-            return f"HTTP {int(status)}"
-    except (TypeError, ValueError):
-        pass
     if getattr(parsed, "bozo", 0):
         # feedparser sets `version` ("rss20", "atom10", ...) when it recognised
         # a feed. A recognised feed that is merely empty, with a benign
@@ -105,14 +158,16 @@ class RssActivities:
 
     @activity.defn
     async def fetch_feed(self, input: FetchFeedInput) -> FetchFeedResult:
-        """Parse a feed URL. Entry dicts: {id, title, link, summary, published}."""
+        """Fetch and parse a feed. Entry dicts: {id, title, link, summary, published}."""
+        body, headers, error = await _download_feed(input.url)
+        if error:
+            return FetchFeedResult(error=error)
 
         def _sync() -> FetchFeedResult:
             import feedparser
 
-            parsed = feedparser.parse(input.url)
+            parsed = feedparser.parse(body, response_headers=headers)
             entries: list[dict] = []
-            latest: str | None = None
             for e in parsed.entries:
                 # Prefer published_parsed (9-tuple) -> ISO; fall back to raw
                 # published string. Cursor comparisons elsewhere (Raindrop's
@@ -153,12 +208,8 @@ class RssActivities:
                         "published": published_iso,
                     }
                 )
-                if published_iso and (latest is None or published_iso > latest):
-                    latest = published_iso
 
-            return FetchFeedResult(
-                entries=entries, latest_published=latest, error=_fetch_error(parsed)
-            )
+            return FetchFeedResult(entries=entries, error=_fetch_error(parsed))
 
         return await asyncio.to_thread(_sync)
 
@@ -223,34 +274,62 @@ class RssActivities:
 
     @activity.defn
     async def record_feed_run(self, channel_id: str, outcome: dict) -> dict:
-        """Fold one run's fetch into the channel's config and return the
-        consecutive failure count. `outcome` carries `ok`, `error` and
-        `backlog`. A fetch that works resets the count."""
+        """Fold one run's fetch into the channel's config, and say what the
+        feed's record holds now. `outcome` carries `ok`, `error` and `backlog`.
+
+        * `fetch_failures` / `fetch_successes`: fetches in a row that failed /
+          worked; each resets the other. A failing feed resolves on
+          `feeds.RECOVERED_AFTER` good fetches in a row, not on the first.
+        * `last_stored_at`: the newest entry the store kept for the feed
+          (`feed_entries.seen_at`, failed entries left out) — what staleness is
+          measured from.
+        * `tracking_since`: `feeds.tracking_since`, the one definition the
+          feed stats use too.
+        """
         ok = bool(outcome.get("ok"))
         cid = _as_uuid(channel_id)
         if not self.db_pool or cid is None:
-            return {"fetch_failures": 0 if ok else 1}
+            return {
+                "fetch_failures": 0 if ok else 1,
+                "fetch_successes": 1 if ok else 0,
+                "last_stored_at": None,
+                "tracking_since": None,
+            }
         now = datetime.now(UTC).isoformat()
         patch: dict[str, Any] = {
             "last_fetch_at": now,
             "last_fetch_error": "" if ok else str(outcome.get("error") or "fetch failed")[:300],
             "backlog": int(outcome.get("backlog") or 0),
         }
-        if ok:
-            patch["last_fetch_ok_at"] = now
-        failures = await self.db_pool.fetchval(
+        config = await self.db_pool.fetchval(
             "UPDATE channels SET config = config || jsonb_build_object("
             "  'fetch_failures', CASE WHEN $2 THEN 0 ELSE "
             "    (CASE WHEN config->>'fetch_failures' ~ '^[0-9]+$' "
             "          THEN (config->>'fetch_failures')::int ELSE 0 END) + 1 END, "
-            # When AEGIS first polled the feed, set once: what `feed_stale`
-            # measures from for a feed that never gave a dated entry.
+            "  'fetch_successes', CASE WHEN $2 THEN "
+            "    (CASE WHEN config->>'fetch_successes' ~ '^[0-9]+$' "
+            "          THEN (config->>'fetch_successes')::int ELSE 0 END) + 1 ELSE 0 END, "
+            # When AEGIS first polled the feed, set once: when tracking began
+            # for a feed that has recorded no entry (`feeds.tracking_since`).
             "  'tracking_since', COALESCE(config->>'tracking_since', $4::text)"
             ") || $3::text::jsonb "
-            "WHERE id = $1 RETURNING (config->>'fetch_failures')::int",
+            "WHERE id = $1 RETURNING config",
             cid,
             ok,
             json.dumps(patch),
             now,
         )
-        return {"fetch_failures": int(failures or 0)}
+        config = _decode_config(config) if config is not None else {}
+        seen = await self.db_pool.fetchrow(
+            "SELECT min(seen_at) AS first_seen, "
+            "       max(seen_at) FILTER (WHERE mode <> 'failed') AS last_stored "
+            "FROM feed_entries WHERE channel_id = $1",
+            cid,
+        )
+        last_stored = seen["last_stored"] if seen else None
+        return {
+            "fetch_failures": int(config.get("fetch_failures") or 0),
+            "fetch_successes": int(config.get("fetch_successes") or 0),
+            "last_stored_at": last_stored.isoformat() if last_stored else None,
+            "tracking_since": feeds.tracking_since(seen["first_seen"] if seen else None, config),
+        }

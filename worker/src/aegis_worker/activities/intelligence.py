@@ -2,19 +2,19 @@
 
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass
 from typing import Any
 
 from aegis.llm import parse_llm_json
 from aegis.services.content_extract import fetch_and_extract
 from aegis.services.knowledge import _content_id_for
+from aegis.services.research_topics import TOPICS_SETTING, parse_topics
 from temporalio import activity
 
 from aegis_worker.activities.content import _MIN_CONTENT_LENGTH, detect_content_type
 
-# The settings row the `track_topic` chat tool writes (services/chat.py).
-TRACKED_TOPICS_SETTING = "intelligence_topics"
+# The topic registry: the settings row `track_topic` writes (#513).
+TRACKED_TOPICS_SETTING = TOPICS_SETTING
 # A page read in place of a missing snippet is stored in full as raw text, but
 # its summary is cut to about what a snippet would have been.
 _FETCHED_SUMMARY_CHARS = 500
@@ -268,27 +268,13 @@ class IntelligenceActivities:
 
 
 def tracked_search_terms(value: Any) -> list[str]:
-    """The search terms in an `intelligence_topics` settings value.
+    """The search terms in an `intelligence_topics` settings value: each
+    topic's queries, or its name when it has none.
 
-    Each topic gives its queries, or its name when it has none. Lenient on
-    purpose: a hand-edited or half-written row yields what it can and never
-    raises, because a scan must not fail on a config read.
+    The row has one parser, `research_topics.parse_topics` — the one the
+    hub's rounds read — so the scans, the RSS gate and the rounds agree on
+    what a topic is. Lenient on purpose: a hand-edited or half-written row
+    yields what it can and never raises, because a scan must not fail on a
+    config read.
     """
-    if isinstance(value, str):
-        try:
-            value = json.loads(value)
-        except ValueError:
-            return []
-    if not isinstance(value, dict):
-        return []
-    terms: list[str] = []
-    for topic in value.get("topics") or []:
-        if not isinstance(topic, dict):
-            continue
-        raw = topic.get("queries")
-        queries = [q for q in raw if isinstance(q, str)] if isinstance(raw, list) else []
-        name = topic.get("name")
-        for term in queries or ([name] if isinstance(name, str) else []):
-            if term.strip():
-                terms.append(term.strip())
-    return terms
+    return [term for topic in parse_topics(value) for term in topic.terms]

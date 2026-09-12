@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import logging
-
 import pytest
 from temporalio import activity, workflow
 from temporalio.testing import WorkflowEnvironment
@@ -66,7 +64,6 @@ async def stub_fetch(inp: FetchFeedInput) -> FetchFeedResult:
                 "published": "2026-04-18T11:00:00",
             },
         ],
-        latest_published="2026-04-18T11:00:00",
     )
 
 
@@ -187,7 +184,6 @@ async def test_rss_fetch_failure_skips_feed():
                     "published": "2026-04-18T10:00:00",
                 }
             ],
-            latest_published="2026-04-18T10:00:00",
         )
 
     async with (
@@ -300,80 +296,3 @@ async def test_rss_dedup_skips_ingest():
     # But cursor STILL advances (bookmark is read)
     assert len(_calls["cursor"]) == 2
 
-
-@pytest.mark.asyncio
-async def test_rss_logs_warning_for_stale_feed(caplog):
-    """A feed whose last_cursor is far in the past must log a WARNING so
-    dead feeds surface instead of being polled silently forever (issue #120).
-    """
-    _reset()
-
-    @activity.defn(name="list_active_channels")
-    async def stale_channel(kind: str) -> list[dict]:
-        return [
-            {
-                "id": "ch-1",
-                "kind": "rss",
-                "identifier": "https://dead.example/feed",
-                "config": {
-                    "last_cursor": "2020-01-01T00:00:00+00:00",
-                    "agent_id": "raphael",
-                },
-                "active": True,
-            }
-        ]
-
-    caplog.set_level(logging.WARNING, logger="temporalio.workflow")
-
-    async with (
-        await WorkflowEnvironment.start_time_skipping() as env,
-        Worker(
-            env.client,
-            task_queue="tq",
-            workflows=[RssIngestFlow],
-            activities=[
-                stale_channel,
-                stub_fetch,
-                stub_idem,
-                stub_content,
-                stub_ingest,
-                stub_cursor,
-            ],
-        ),
-    ):
-        await env.client.execute_workflow(
-            RssIngestFlow.run,
-            RssIngestInput(),
-            id="rss-stale",
-            task_queue="tq",
-        )
-
-    assert any(
-        "rss_feed_stale" in rec.getMessage() and "dead.example" in rec.getMessage()
-        for rec in caplog.records
-    )
-
-
-@pytest.mark.asyncio
-async def test_rss_no_warning_for_fresh_feed(caplog):
-    """A feed whose last_cursor is recent must NOT trigger the stale warning."""
-    _reset()
-    caplog.set_level(logging.WARNING, logger="temporalio.workflow")
-
-    async with (
-        await WorkflowEnvironment.start_time_skipping() as env,
-        Worker(
-            env.client,
-            task_queue="tq",
-            workflows=[RssIngestFlow],
-            activities=ALL_STUBS,
-        ),
-    ):
-        await env.client.execute_workflow(
-            RssIngestFlow.run,
-            RssIngestInput(),
-            id="rss-fresh",
-            task_queue="tq",
-        )
-
-    assert not any("rss_feed_stale" in rec.getMessage() for rec in caplog.records)

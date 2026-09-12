@@ -14,7 +14,6 @@ from __future__ import annotations
 
 from datetime import date, datetime
 from typing import Literal
-from zoneinfo import ZoneInfo
 
 import asyncpg
 import structlog
@@ -22,6 +21,7 @@ import structlog
 from aegis.services.todoist_config import resolve_todoist_api_key
 from aegis.services.tools.base import ToolContext
 from aegis.services.tools.registry import aegis_tool
+from aegis.services.user_time import user_zone
 
 logger = structlog.get_logger()
 
@@ -210,21 +210,10 @@ async def _user_today(pool: asyncpg.Pool | None) -> date:
 
     Never raises. A missing pool, a missing row, a non-string value, an unknown
     zone or a failed read all fall back to UTC — a typo'd setting must not take
-    a chat tool down. The pool's jsonb codec (`db/pool.py`) json-decodes the
-    stored scalar for us, so `"Asia/Kolkata"` arrives as the bare zone name.
+    a chat tool down. The one reader of the setting is
+    `services/user_time.user_zone`, which the vault writes use too.
     """
-    tz = ZoneInfo("UTC")
-    if pool is not None:
-        try:
-            row = await pool.fetchrow(
-                "SELECT value FROM settings WHERE key = $1", "user_timezone"
-            )
-            name = row["value"] if row else None
-            if isinstance(name, str) and name.strip():
-                tz = ZoneInfo(name.strip())
-        except Exception as exc:  # noqa: BLE001 — never break the tool on a config read
-            logger.warning("user_timezone_read_failed", error=str(exc)[:200])
-    return datetime.now(tz).date()
+    return datetime.now(await user_zone(pool)).date()
 
 
 @aegis_tool
