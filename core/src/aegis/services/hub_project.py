@@ -63,6 +63,7 @@ from aegis.services.hub import (
     _aware,
     get_problem,
     set_status,
+    verify_seconds_for,
 )
 from aegis.services.todoist_config import resolve_todoist_api_key
 from aegis.services.tools.gtd import _capture_to_inbox_impl
@@ -80,6 +81,18 @@ COLLAPSE_WINDOW = timedelta(minutes=30)
 PROJECTED_STATUSES = frozenset(
     {"open", "investigating", "waiting_human", "fixing", "verifying", "resolved"}
 )
+# The four alert producers: something outside AEGIS fired, and the same
+# producer sends a resolution when it recovers, so what they raise may turn out
+# to have been a blip. Only these wait out a settle window before earning a
+# task (#537).
+#
+# Every other source projects on sight. Not because none of them can pass on
+# their own — a watchdog finding (`social`, `drift`, `expiry`, `llm_governor`)
+# resolves itself when the next sweep stops finding it — but because those
+# sweeps run on their own cadence and have already decided the thing is worth
+# reporting, and because the money, research and manual sources are judgements
+# that no amount of waiting makes truer.
+_SELF_CLEARING_SOURCES = frozenset({"alertmanager", "heartbeat", "flow_health", "delivery"})
 _BLOCK_RE = re.compile(r"<!-- aegis:problem [^>]*-->.*?<!-- /aegis:problem -->", re.S)
 _HISTORY_KINDS = frozenset({"investigation", "plan", "session_note"})
 # A plan of one step is a sentence, not a plan; more than this and the
@@ -402,15 +415,23 @@ async def _assignee_label(
         return fallback
 
 
-async def _owner(pool: asyncpg.Pool, problem_id: str) -> _Owner:
-    """Who owns the problem: decided by the source of its FIRST occurrence, the
-    producer that raised it."""
-    source = await pool.fetchval(
-        "SELECT source FROM problem_events "
-        "WHERE problem_id = $1::uuid AND kind = 'occurrence' ORDER BY id LIMIT 1",
-        problem_id,
+async def _first_source(pool: asyncpg.Pool, problem_id: str) -> str:
+    """The producer that raised the problem: the source of its FIRST
+    occurrence. Who owns the task and whether it may be a blip both follow
+    from it."""
+    return str(
+        await pool.fetchval(
+            "SELECT source FROM problem_events "
+            "WHERE problem_id = $1::uuid AND kind = 'occurrence' ORDER BY id LIMIT 1",
+            problem_id,
+        )
+        or ""
     )
-    return _OWNER_BY_SOURCE.get(str(source or ""), _INFRA_OWNER)
+
+
+async def _owner(pool: asyncpg.Pool, problem_id: str) -> _Owner:
+    """Who owns the problem, by the source that raised it."""
+    return _OWNER_BY_SOURCE.get(await _first_source(pool, problem_id), _INFRA_OWNER)
 
 
 async def _books_project(pool: asyncpg.Pool, entity: str) -> str | None:
@@ -699,6 +720,46 @@ async def project(
         meta.update(projected_event_id=int(latest_event_id), pending_occurrences=0)
         await _save_meta(pool, problem_id, meta)
         return {"problem_id": problem_id, "skipped": "resolved_without_task"}
+
+    if not task_id and p["status"] == "open":
+        # A blip earns no chore (#537). A quarter of every task the hub made in
+        # its first month was for a problem that was already over — a service
+        # that crash-looped for five minutes and came back on its own —
+        # created, clarified and auto-completed without a human ever acting on
+        # it. So a signal that can clear itself waits out its class's
+        # verification window before it is believed. This is the spec's §6
+        # threshold, unbuilt until now, measured in seconds rather than
+        # occurrences because a five-minute blip can occur five times.
+        #
+        # Nothing here has to come back for it: `list_projection_candidates`
+        # selects every open untasked problem outright, whatever its watermark,
+        # and the sweep runs every five minutes — so the task is late, never
+        # missing. One that resolves inside its window leaves through the
+        # branch above and never earns a task at all.
+        #
+        # Returning early writes no metadata at all, which is the point: the
+        # watermark still sits where the last projection left it, so the
+        # occurrence comments this problem has not been told about yet are
+        # still owed when a task finally exists.
+        #
+        # A recurrence is deliberately NOT held back. `reopen` leaves
+        # `first_seen_at` alone, so a problem that blipped, resolved untasked,
+        # and came back is already past its window and projects at once — the
+        # second episode is the evidence the first one lacked.
+        #
+        # The investigation is untouched — Pandora diagnoses and posts its
+        # Slack card immediately. Only the human's chore waits.
+        settle = 0
+        if await _first_source(pool, problem_id) in _SELF_CLEARING_SOURCES:
+            settle = await verify_seconds_for(pool, str(p["class"]))
+        age = (now - _aware(p["first_seen_at"], now)).total_seconds()
+        if settle and age < settle:
+            return {
+                "problem_id": problem_id,
+                "skipped": "settling",
+                "settle_seconds": settle,
+                "age_seconds": int(age),
+            }
 
     async with pool.acquire() as conn:
         window = await _active_suppression(conn, p["subject"], p["subject_kind"], now)

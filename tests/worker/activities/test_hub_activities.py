@@ -148,7 +148,7 @@ async def test_record_investigation_moves_status_and_links_prs(db_pool):
             "payload": {"pr_urls": ["https://github.com/o/r/pull/5"]},
         },
     )
-    assert out == {"recorded": True, "status_changed": True}
+    assert out["recorded"] is True and out["status_changed"] is True
     p = await get_problem(db_pool, pid)
     assert p["status"] == "fixing"
     ev = [e for e in await list_events(db_pool, pid) if e["kind"] == "investigation"][0]
@@ -246,7 +246,7 @@ async def test_record_investigation_after_the_alert_cleared_annotates_and_holds(
         },
     )
 
-    assert out == {"recorded": True, "status_changed": False}
+    assert out["recorded"] is True and out["status_changed"] is False
     p = await get_problem(db_pool, pid)
     assert p["status"] == "resolved" and p["resolved_at"] is not None
     events = await list_events(db_pool, pid)
@@ -266,6 +266,35 @@ async def test_mute_and_verification_delay(db_pool):
     assert await env.run(act.verification_delay, _alert(s)) == {"delay_seconds": 300}
     assert await env.run(act.verification_delay, {"labels": {"alertname": "HeartbeatCollectFailed"}}) == {"delay_seconds": 0}
     assert await env.run(act.verification_delay, {}) == {"delay_seconds": 180}
+
+
+async def test_the_settle_row_moves_the_verification_delay_too(db_pool):
+    """One number with two jobs (#537). The row that decides when a problem
+    earns a Todoist task is the same row that decides how long an
+    investigation waits before spending money — on purpose, because "long
+    enough to believe this is real" is one question. Pinned here so the
+    coupling is a decision and not a surprise: an operator who zeroes this to
+    get their tasks back also gives up every verification delay.
+
+    Falsifiable: point `verification_delay` back at the pure `verify_seconds`
+    and neither override arrives.
+    """
+    env = ActivityEnvironment()
+    act = HubActivities(db_pool=db_pool)
+    await db_pool.execute(
+        "INSERT INTO settings (key, value) VALUES ('hub_settle_seconds', $1) "
+        "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+        {"dockerservicedown": 7, "*": 11},
+    )
+    try:
+        assert await env.run(act.verification_delay, _alert("svc_x")) == {"delay_seconds": 7}
+        # `*` answers for a class the row does not name — including one whose
+        # code default is 0, so the wildcard can lengthen as well as shorten.
+        assert await env.run(
+            act.verification_delay, {"labels": {"alertname": "HeartbeatCollectFailed"}}
+        ) == {"delay_seconds": 11}
+    finally:
+        await db_pool.execute("DELETE FROM settings WHERE key = 'hub_settle_seconds'")
 
 
 async def test_stale_stuck_problems_round_trip(db_pool):

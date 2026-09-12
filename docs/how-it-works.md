@@ -550,6 +550,34 @@ The steps that make it trustworthy:
 - **Verification delay.** A per-class sleep, then the hub is asked whether the
   problem already resolved, before spending any investigation effort —
   self-healing blips cost nothing.
+- **A blip earns no Todoist task.** The same per-class window decides when a
+  problem is worth a chore: an alert younger than it stays in the hub, the
+  digest and Slack, and one that recovers inside it never gets a task at all
+  (#537). A quarter of the hub's first month of tasks were for problems that
+  were already over — created, clarified and auto-completed with nobody acting
+  on them. Only the task waits: the investigation still starts on the first
+  occurrence, so the diagnosis and the card are as quick as ever. Findings that
+  nothing will ever resolve on your behalf — a money reconciliation, a stale
+  feed, an agent's question — are projected on sight. Defaults are 180s, 300s
+  for `NodeDown` / `DockerServiceDown`, and 0 for disk, memory and OOM classes,
+  which are real the moment they fire:
+
+  ```sql
+  -- give a flappy service ten minutes to settle; never wait on a dead node
+  INSERT INTO settings (key, value) VALUES
+    ('hub_settle_seconds', '{"servicecrashlooping": 600, "nodedown": 0}')
+  ON CONFLICT (key) DO UPDATE SET value = excluded.value;
+  ```
+
+  **The row is one number with two jobs.** It is the same window the
+  verification delay above uses, on purpose — "long enough to believe this is
+  real" is one question — so shortening it also shortens the wait before AEGIS
+  spends an investigation and takes its one automatic restart. `{"*": 0}` does
+  not restore the pre-#537 behaviour: it gives back the immediate task AND
+  removes every verification delay, so a blip that would have self-healed
+  during the wait now costs a billed investigation and a force-restart. If
+  what you want is only the old task timing, that is not available through
+  this row; say so on #537 and it can have a knob of its own.
 - **One automatic restart per problem per hour.** A swarm service below its
   replicas gets one `docker service update --force` first; that fixes most
   flaps. If the same problem is back within the hour, it is not restarted
