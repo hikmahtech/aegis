@@ -2,6 +2,8 @@
  * API client for AEGIS v2 Core API.
  */
 
+import type { FeedItemsPage } from '../lib/feedItems';
+
 const API_BASE = import.meta.env.VITE_API_URL || '';
 const AUTH_KEY = 'aegis_auth';
 
@@ -226,6 +228,9 @@ export const api = {
     apiFetch<any>(`/api/admin/channels/${id}`, { method: 'DELETE' }),
   // Per-feed worth, measured (#511): entries, stored, used in prompts, fetch health.
   feedStats: () => apiFetch<any[]>('/api/admin/channels/feed-stats'),
+  // The newest RSS entries across the feeds; `qs` comes from lib/feedItems.feedItemsQuery.
+  feedItems: (qs: string) =>
+    apiFetch<FeedItemsPage>(`/api/admin/channels/feed-items${qs}`),
 
   // Knowledge
   knowledgeAsk: (question: string) =>

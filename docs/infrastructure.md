@@ -1716,6 +1716,17 @@ read Miniflux's feed list once at core startup, Miniflux sat dead from
 2026-03-28 for five and a half months, and nobody noticed. Add and drop feeds
 on Admin → Channels, or ask Raphael (`subscribe_feed`, `unsubscribe_feed`).
 
+The reading list Miniflux used to offer is **Admin → Channels → Recent items**
+(`GET /api/admin/channels/feed-items`, `feeds.recent_items`). It shows the
+newest entries across the feeds, or one feed, newest first: title linking to
+the article, feed, when it came in, how it was stored (`full` / `abstract` /
+`failed`), a short excerpt, and a tick when a chat prompt or a research run
+has used it. It pages by a keyset cursor, so an entry that arrives between
+pages never shifts or repeats one, and it only ever reads. A link that is not
+`http`/`https` is dropped before it reaches the page, because a feed is
+untrusted input. The Miniflux stack itself was removed on 2026-09-12; its
+database on lam and its Portainer definition were kept.
+
 ### What each feed is worth
 
 `feed_entries` (migration 046) records every entry a run stored or failed,

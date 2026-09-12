@@ -15,6 +15,9 @@ worker, so there is one answer to "what is this feed worth?":
   research run (`knowledge_injection_log`, source `chat` or `research`). A
   briefing or a rollup does not log its reads, so it is still a floor.
 * :func:`unused_feeds` — active feeds with 90 days of history and no use.
+* :func:`recent_items` — the newest entries across the feeds, newest first,
+  with an excerpt and whether a prompt used each: the reading list Miniflux
+  used to be (Admin → Channels → Recent items).
 * :func:`subscribe` / :func:`unsubscribe` — add a feed after checking it is
   one; stop one without deleting its history.
 * :func:`retention_preview` — how much a "PDFs nobody used shrink to their
@@ -193,6 +196,126 @@ async def unused_feeds(pool: asyncpg.Pool) -> list[dict[str, Any]]:
             continue
         out.append(f)
     return out
+
+
+# --------------------------------------------------------------------------
+# What came in
+# --------------------------------------------------------------------------
+
+# `feed_entries.mode`: what happened to one entry (migration 046).
+ENTRY_MODES = ("full", "abstract", "failed")
+RECENT_ITEMS_MAX = 200
+_EXCERPT_CHARS = 280
+_WS_RE = re.compile(r"\s+")
+
+# Newest first, keyset-paged on (seen_at, external_id): an entry that arrives
+# between two pages can neither shift the next page nor repeat an item. The
+# excerpt's first chunk is one indexed lookup per row (knowledge_chunks has an
+# index on content_id), and a failed entry has no content row at all.
+_RECENT_SQL = """
+SELECT fe.channel_id::text AS channel_id, ch.identifier, ch.config,
+       fe.external_id, fe.link, fe.mode, fe.published, fe.seen_at,
+       c.title, c.summary,
+       (SELECT left(k.chunk_text, 600) FROM knowledge_chunks k
+         WHERE k.content_id = fe.content_id
+         ORDER BY k.chunk_index LIMIT 1) AS first_chunk,
+       EXISTS (SELECT 1 FROM knowledge_injection_log l
+                WHERE fe.content_id = ANY(l.content_ids)) AS used
+FROM feed_entries fe
+JOIN channels ch ON ch.id = fe.channel_id
+LEFT JOIN knowledge_content c ON c.content_id = fe.content_id
+WHERE ch.kind = 'rss'
+  AND ($1::uuid IS NULL OR fe.channel_id = $1::uuid)
+  AND ($2::text IS NULL OR fe.mode = $2::text)
+  AND ($3::timestamptz IS NULL OR (fe.seen_at, fe.external_id) < ($3::timestamptz, $4::text))
+ORDER BY fe.seen_at DESC, fe.external_id DESC
+LIMIT $5
+"""
+
+
+def _safe_link(link: str) -> str:
+    """The entry's link if it is a web address, else "". A feed is untrusted
+    input, and the admin page turns this into a clickable `href`."""
+    link = (link or "").strip()
+    return link if urlparse(link).scheme in ("http", "https") else ""
+
+
+def _excerpt(summary: str | None, chunk: str | None, title: str) -> str:
+    """A couple of lines to read under the title: the feed's summary, else the
+    start of the stored page. A stored page usually opens with its own title,
+    which says nothing a second time, so that is dropped."""
+    text = _WS_RE.sub(" ", (summary or "").strip() or (chunk or "").strip())
+    if title and text.lower().startswith(title.lower()):
+        text = text[len(title) :].lstrip(" -:|—")
+    if len(text) > _EXCERPT_CHARS:
+        return text[:_EXCERPT_CHARS].rstrip() + "…"
+    return text
+
+
+def _cursor(seen_at: datetime, external_id: str) -> str:
+    return f"{seen_at.isoformat()}|{external_id}"
+
+
+def _parse_cursor(cursor: str) -> tuple[datetime, str]:
+    seen, sep, external_id = (cursor or "").partition("|")
+    try:
+        when = datetime.fromisoformat(seen)
+    except ValueError as exc:
+        raise ValueError(f"bad cursor {cursor!r}") from exc
+    if not sep or when.tzinfo is None:
+        raise ValueError(f"bad cursor {cursor!r}")
+    return when, external_id
+
+
+async def recent_items(
+    pool: asyncpg.Pool,
+    *,
+    channel_id: Any = None,
+    mode: str | None = None,
+    limit: int = 50,
+    cursor: str | None = None,
+) -> dict[str, Any]:
+    """The newest RSS entries across every feed (or one), newest first — the
+    reading list Miniflux used to be. Each item carries its feed, title, link,
+    when it came in, how it was stored (`full` / `abstract` / `failed`), an
+    excerpt and whether a prompt ever used it. Page with `next_cursor`.
+    Read-only."""
+    if mode is not None and mode not in ENTRY_MODES:
+        raise ValueError(f"mode must be one of {ENTRY_MODES}, not {mode!r}")
+    limit = max(1, min(int(limit), RECENT_ITEMS_MAX))
+    after_seen, after_id = _parse_cursor(cursor) if cursor else (None, None)
+    rows = await pool.fetch(
+        _RECENT_SQL,
+        str(channel_id) if channel_id else None,
+        mode,
+        after_seen,
+        after_id,
+        limit + 1,
+    )
+    page = rows[:limit]
+    items = []
+    for r in page:
+        config = r["config"] if isinstance(r["config"], dict) else {}
+        link = _safe_link(r["link"])
+        title = (r["title"] or "").strip() or link or r["external_id"]
+        items.append(
+            {
+                "channel_id": r["channel_id"],
+                "feed": feed_label(r["identifier"], config),
+                "feed_url": r["identifier"],
+                "external_id": r["external_id"],
+                "title": title,
+                "link": link,
+                "mode": r["mode"],
+                "published": r["published"] or None,
+                "seen_at": _iso(r["seen_at"]),
+                "excerpt": _excerpt(r["summary"], r["first_chunk"], title),
+                "used": bool(r["used"]),
+            }
+        )
+    more = len(rows) > limit
+    next_cursor = _cursor(page[-1]["seen_at"], page[-1]["external_id"]) if more else None
+    return {"items": items, "next_cursor": next_cursor}
 
 
 # --------------------------------------------------------------------------

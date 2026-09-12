@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { api } from '../api/client';
 import ErrorBanner from '../components/ErrorBanner';
+import RecentFeedItems from '../components/RecentFeedItems';
 
 // Ingestion channels (email / rss / raindrop / wearable) plus named places
 // (`place`, B5 — reference data, not a source). DB-owned: the seed
@@ -438,6 +439,11 @@ export default function Channels() {
                     </tbody>
                   </table>
                 </div>
+              )}
+              {isRss && items.length > 0 && (
+                <RecentFeedItems
+                  feeds={items.map(c => ({ id: c.id, label: c.config?.label || c.identifier }))}
+                />
               )}
             </div>
           );
