@@ -233,3 +233,12 @@ def test_hub_sweep_mapper_leaves_the_service_defaults_alone():
     assert cfg.group_min_members == 0
     assert cfg.group_window_hours == 0.0
     assert cfg.fix_verify_hours == 24.0
+
+    # A negative number means the same thing, loudly instead of silently: a
+    # window of -1 hours reaches backwards from now, matches nothing, and would
+    # switch grouping off with no warning anywhere.
+    _, floored = mapper(
+        _act("hub-sweep-5m", "HubSweepFlow", {"group_window_hours": -1, "group_min_members": -5})
+    )
+    assert floored.group_window_hours == 0.0
+    assert floored.group_min_members == 0

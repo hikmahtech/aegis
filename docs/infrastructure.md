@@ -593,7 +593,7 @@ seen in the last 72 hours. `schedule_sync` picks the change up within about
 -- only judge a cluster of five or more, seen in the last day
 UPDATE activities SET config = config || '{"group_min_members": 5, "group_window_hours": 24}'::jsonb,
   updated_at = now()
-WHERE activity_type = 'hub_sweep';
+WHERE workflow_type = 'HubSweepFlow';
 ```
 
 Raising the bar is not the same control as the verdict cache above: the
