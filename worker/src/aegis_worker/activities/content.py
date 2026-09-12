@@ -25,6 +25,7 @@ from aegis.services.content_extract import (
     fetch_and_extract,
     fetch_youtube_transcript,
 )
+from aegis.services.url_guard import UnsafeURLError
 from temporalio import activity
 
 logger = structlog.get_logger()
@@ -413,6 +414,14 @@ class ContentActivities:
                 "content_id": resp.get("content_id"),
             }
 
+        except UnsafeURLError as exc:
+            # A link that is not on the public internet, or that redirects off
+            # it, is refused for good: retrying it every hour would change
+            # nothing, so the entry settles unstored (RssIngestFlow treats
+            # `refused` like `empty`).
+            logger.warning("process_content_refused", url=url[:200], error=str(exc)[:200])
+            await self._record(url, content_type, "refused", t0)
+            return {"status": "refused"}
         except httpx.HTTPStatusError as exc:
             status = "duplicate" if exc.response.status_code == 409 else "error"
             await self._record(url, content_type, status, t0)

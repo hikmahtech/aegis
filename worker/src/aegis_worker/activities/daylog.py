@@ -447,6 +447,23 @@ class DayLogActivities:
         activity.logger.info("daylog_rollup_gathered start=%s end=%s n=%d", start, end, len(out))
         return out
 
+    @staticmethod
+    def _journal_entry(day: str, text: str) -> str:
+        """One journal note as a rollup entry: Raphael's own section for the
+        day FIRST, then whatever else the note holds, within the clip.
+
+        The section is appended at the END of the note, so clipping the note
+        from the top dropped Raphael's narrative whenever the template plus
+        the user's writing ran past the clip."""
+        mine, rest = notes.split_section(text, notes.journal_key("daily", day))
+        if not mine:
+            return text[:_ROLLUP_ENTRY_CLIP]
+        out = mine[:_ROLLUP_ENTRY_CLIP]
+        room = _ROLLUP_ENTRY_CLIP - len(out) - len("\n\nAlso in the note:\n")
+        if rest.strip() and room > 0:
+            out += "\n\nAlso in the note:\n" + rest.strip()[:room]
+        return out
+
     async def _merge_journal(self, out: list[dict], start: str, end: str) -> list[dict]:
         """With the vault configured (#514), each day's journal note stands in
         for its knowledge row — the note is the record since Raphael took the
@@ -473,7 +490,7 @@ class DayLogActivities:
                 by_date[day] = {
                     "date": day,
                     "title": f"Journal {day}",
-                    "text": text[:_ROLLUP_ENTRY_CLIP],
+                    "text": self._journal_entry(day, text),
                 }
         return [by_date[k] for k in sorted(by_date)]
 

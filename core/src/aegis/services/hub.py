@@ -113,6 +113,8 @@ KINDS = frozenset({"occurrence", "resolved", "investigation", "plan", "session_n
 # A tracked topic's round of news (#513). Not an outage: the infra digest leaves
 # it out, and the projector gives it a task only once it earns one.
 TOPIC_CLASS = "topic"
+# A `#research` task's own problem (#513): a question Raphael owns.
+QUESTION_CLASS = "question"
 SEVERITIES = frozenset({"critical", "error", "warning", "info"})
 # Problem statuses. `suppressed` = seen while its subject was deploying or in
 # maintenance (see `service_state`); it is live, counted, and not projected.
@@ -1234,12 +1236,13 @@ async def digest(
         "FROM problems p "
         "WHERE EXISTS (SELECT 1 FROM problem_events e WHERE e.problem_id = p.id "
         "              AND e.occurred_at >= $1) "
-        # A topic's round of news is not a problem the infra digest reports
-        # (#513); Raphael's briefing has its own topics line.
-        "  AND p.class <> $2 "
+        # Raphael's research problems — a topic's round of news, a `#research`
+        # task's question — are not problems the infra digest reports (#513);
+        # Raphael's briefing has its own topics line.
+        "  AND p.class <> ALL($2::text[]) "
         "ORDER BY p.last_seen_at DESC",
         since,
-        TOPIC_CLASS,
+        [TOPIC_CLASS, QUESTION_CLASS],
     )
     problems = [dict(r) for r in rows]
     live = [p for p in problems if p["status"] in LIVE_STATUSES]

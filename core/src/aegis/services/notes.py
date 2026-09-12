@@ -64,11 +64,16 @@ _GIT_IDENTITY = {
 }
 _LOCK_NAME = ".aegis.lock"
 
-# meld-encrypt 1.6.2 (the vault's version) writes `%%🔐<ciphertext> 🔐%%`; its
-# later α/β formats keep the same two markers around a longer prefix, so
-# matching the markers alone covers every version.
+# meld-encrypt 1.6.2 (the vault's version) writes `%%🔐<ciphertext> 🔐%%`, and
+# its later α/β formats keep those markers around a longer prefix
+# (`%%🔐α … 🔐%%`, `%%🔐β … 🔐%%`). With "show marker in reading view" on, the
+# later versions drop the `%%` and write `🔐α … 🔐` / `🔐β … 🔐` — the second
+# form below. A lone 🔐 in ordinary text is not a start marker: only one
+# followed by α or β is.
 _ENC_START = "%%🔐"
 _ENC_END = "🔐%%"
+_ENC_BARE_START_RE = re.compile("🔐[αβ]")
+_ENC_BARE_END = "🔐"
 ENCRYPTED_PLACEHOLDER = "[encrypted block]"
 
 
@@ -129,13 +134,16 @@ def install_deploy_key(settings: Any) -> Path | None:
 
 
 def strip_encrypted(text: str) -> str:
-    """`text` with every meld-encrypt block replaced by a placeholder.
+    """`text` with every meld-encrypt block replaced by a placeholder: first the
+    `%%🔐 … 🔐%%` form every version writes, then the bare `🔐α … 🔐` /
+    `🔐β … 🔐` form later versions write when the marker is shown in reading
+    view.
 
     An unterminated start marker drops everything after it: a block whose end
     was lost is still ciphertext, and leaking a tail of it is worse than losing
     the rest of one note from the index.
     """
-    if _ENC_START not in text:
+    if "🔐" not in text:
         return text
     out: list[str] = []
     i = 0
@@ -150,7 +158,44 @@ def strip_encrypted(text: str) -> str:
         if end < 0:
             break
         i = end + len(_ENC_END)
+    text = "".join(out)
+    out = []
+    i = 0
+    while True:
+        bare = _ENC_BARE_START_RE.search(text, i)
+        if bare is None:
+            out.append(text[i:])
+            break
+        out.append(text[i : bare.start()])
+        out.append(ENCRYPTED_PLACEHOLDER)
+        end = text.find(_ENC_BARE_END, bare.end())
+        if end < 0:
+            break
+        i = end + len(_ENC_BARE_END)
     return "".join(out)
+
+
+def split_section(text: str, key: str) -> tuple[str, str]:
+    """The body of the section a write appended under `key`, and the note
+    without that section. `("", text)` when the marker is not in the note.
+
+    A section is `## heading`, the marker line, then its body, up to the next
+    `## ` heading, the next aegis marker, or the end of the note — the shape
+    `_section` writes."""
+    mark = marker(key)
+    at = text.find(mark)
+    if at < 0:
+        return "", text
+    line_start = text.rfind("\n", 0, at) + 1
+    start = line_start
+    if line_start > 0:
+        prev_start = text.rfind("\n", 0, line_start - 1) + 1
+        if text[prev_start:line_start].startswith("## "):
+            start = prev_start
+    body_start = at + len(mark)
+    ends = [i for i in (text.find("\n## ", body_start), text.find("%% aegis:", body_start)) if i >= 0]
+    end = min(ends) if ends else len(text)
+    return text[body_start:end].strip(), (text[:start] + text[end:]).strip()
 
 
 # ------------------------------------------------------ dates and names
@@ -180,9 +225,15 @@ def locale_week(d: date) -> int:
 
 # Longest first, so `MMMM` is never read as `MM` + `MM`.
 _TOKENS = (
-    "YYYY", "MMMM", "dddd", "MMM", "ddd", "YY", "MM", "DD", "HH", "hh", "mm", "ss",
+    "YYYY", "MMMM", "dddd", "MMM", "ddd", "YY", "MM", "DD", "Do", "HH", "hh", "mm", "ss",
     "ww", "M", "D", "H", "h", "w", "A", "a",
 )
+
+
+def _ordinal(n: int) -> str:
+    """moment's `Do`: 1st, 2nd, 3rd, 4th … 11th, 12th, 13th … 21st, 22nd."""
+    suffix = "th" if 11 <= n % 100 <= 13 else {1: "st", 2: "nd", 3: "rd"}.get(n % 10, "th")
+    return f"{n}{suffix}"
 
 
 def moment_format(fmt: str, when: date | datetime) -> str:
@@ -198,6 +249,7 @@ def moment_format(fmt: str, when: date | datetime) -> str:
         "MM": f"{when.month:02d}",
         "M": str(when.month),
         "DD": f"{when.day:02d}",
+        "Do": _ordinal(when.day),
         "D": str(when.day),
         "dddd": _DAYS_LONG[when.weekday()],
         "ddd": _DAYS[when.weekday()],
@@ -722,7 +774,9 @@ def journal_append(kind: str, day: date, label: str, body: str, now: datetime) -
         rel = monthly_note_path(day)
     else:
         raise NotesError(f"unknown journal kind {kind!r}")
-    when = datetime.combine(day, now.time())
+    # A weekly note is named from its week's Sunday, so its template's dates
+    # are that Sunday's too, not the ISO Monday the daylog passes in.
+    when = datetime.combine(week_start(day) if kind == "weekly" else day, now.time())
     return Append(
         rel=rel,
         key=journal_key(kind, label),

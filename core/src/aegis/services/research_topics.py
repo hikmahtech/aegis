@@ -7,7 +7,9 @@ Spec: docs/superpowers/specs/2026-09-12-research-hub-design.md.
 ``{"topics": [{"name", "queries", "priority"}]}``, which `track_topic` has
 always written and which the intel scans (#508) and the RSS gate (#512) read
 for their search terms. It stays the registry because a topic's terms must
-outlive any one problem.
+outlive any one problem. Every change to it is a read-modify-write under one
+advisory lock, so `track_topic` from chat and a curiosity "yes" landing
+together cannot lose one of the two.
 
 **A topic's activity is a hub problem.** Class `topic`, subject the topic's
 slug, kind `topic`, source `research` — so Raphael owns it (`hub_project`).
@@ -18,10 +20,10 @@ holds enough items (`ATTENTION_ITEMS`); until then it lives in the hub and the
 briefing.
 
 **A round ends when the user ticks the task off.** The problem resolves and
-closes at once (`hub_project.reconcile_completed_tasks`), so the next matching
-article opens a fresh round — a new problem, and a new task only when that
-round crosses the threshold again. The hub's usual reopen window would have
-reopened the task on the next day's article.
+closes at once (`hub_project.reconcile_completed_tasks` → :func:`close_round`),
+so the next matching article opens a fresh round — a new problem, and a new
+task only when that round crosses the threshold again. The hub's usual reopen
+window would have reopened the task on the next day's article.
 """
 
 from __future__ import annotations
@@ -55,6 +57,8 @@ PRIORITIES = ("high", "medium", "low")
 ATTENTION_ITEMS = {"high": 2, "medium": 3, "low": 5}
 # What a round's task lists, newest first.
 _DIGEST_ITEMS = 10
+# The advisory lock every registry read-modify-write takes.
+_REGISTRY_LOCK = "research_topics:registry"
 
 
 @dataclass(frozen=True)
@@ -182,8 +186,8 @@ async def ensure_round(
     return result.problem_id
 
 
-async def _save_registry(pool: asyncpg.Pool, topics: list[dict[str, Any]]) -> None:
-    await pool.execute(
+async def _save_registry(db: Any, topics: list[dict[str, Any]]) -> None:
+    await db.execute(
         "INSERT INTO settings (key, value, updated_at) VALUES ($1, $2, NOW()) "
         "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()",
         TOPICS_SETTING,
@@ -191,8 +195,8 @@ async def _save_registry(pool: asyncpg.Pool, topics: list[dict[str, Any]]) -> No
     )
 
 
-async def _raw_registry(pool: asyncpg.Pool) -> list[dict[str, Any]]:
-    value = await pool.fetchval("SELECT value FROM settings WHERE key = $1", TOPICS_SETTING)
+async def _raw_registry(db: Any) -> list[dict[str, Any]]:
+    value = await db.fetchval("SELECT value FROM settings WHERE key = $1", TOPICS_SETTING)
     if isinstance(value, dict) and isinstance(value.get("topics"), list):
         return [t for t in value["topics"] if isinstance(t, dict)]
     return []
@@ -216,19 +220,21 @@ async def track(
     priority = priority if priority in PRIORITIES else "medium"
     entry = {"name": name, "queries": queries, "priority": priority}
 
-    existing = await _raw_registry(pool)
-    status = "added"
-    updated: list[dict[str, Any]] = []
-    for t in existing:
-        if slug(str(t.get("name") or "")) == slug(name):
-            if status == "added":
-                updated.append(entry)
-            status = "updated"
-        else:
-            updated.append(t)
-    if status == "added":
-        updated.append(entry)
-    await _save_registry(pool, updated)
+    async with pool.acquire() as conn, conn.transaction():
+        await conn.execute("SELECT pg_advisory_xact_lock(hashtext($1))", _REGISTRY_LOCK)
+        existing = await _raw_registry(conn)
+        status = "added"
+        updated: list[dict[str, Any]] = []
+        for t in existing:
+            if slug(str(t.get("name") or "")) == slug(name):
+                if status == "added":
+                    updated.append(entry)
+                status = "updated"
+            else:
+                updated.append(t)
+        if status == "added":
+            updated.append(entry)
+        await _save_registry(conn, updated)
 
     problem_id = await ensure_round(pool, Topic(name, tuple(queries), priority), now=now)
     logger.info("research_topic_tracked", topic=name, status=status, problem_id=problem_id)
@@ -246,16 +252,23 @@ async def untrack(
     pool: asyncpg.Pool, name: str, *, now: datetime | None = None
 ) -> dict[str, Any]:
     """Stop tracking a topic: drop it from the registry, so the scans stop
-    searching it, and close its live round (retiring the round's task)."""
+    searching it, and close its live round (retiring the round's task).
+
+    The removal is what the call reports on; retiring the task is a Todoist
+    round trip after it, so a failure there is `task_retired: False`, never an
+    error for a removal that already happened."""
     now = now or datetime.now(UTC)
     target = slug(name or "")
     if not target:
         raise ValueError("topic_name is required")
-    existing = await _raw_registry(pool)
-    kept = [t for t in existing if slug(str(t.get("name") or "")) != target]
-    if len(kept) == len(existing):
-        return {"status": "not_found", "topic": name, "total_topics": len(existing)}
-    await _save_registry(pool, kept)
+    async with pool.acquire() as conn, conn.transaction():
+        await conn.execute("SELECT pg_advisory_xact_lock(hashtext($1))", _REGISTRY_LOCK)
+        existing = await _raw_registry(conn)
+        kept = [t for t in existing if slug(str(t.get("name") or "")) != target]
+        if len(kept) == len(existing):
+            return {"status": "not_found", "topic": name, "total_topics": len(existing)}
+        await _save_registry(conn, kept)
+    out: dict[str, Any] = {"status": "removed", "topic": name, "total_topics": len(kept)}
     closed = False
     current = await live_problem(pool, Topic(name.strip(), ()))
     if current is not None:
@@ -263,13 +276,22 @@ async def untrack(
             pool, current["id"], reason="the topic is no longer tracked", now=now
         )
         if closed and current.get("todoist_task_id"):
-            from aegis.services.hub_project import retire_task
+            from aegis.services import hub_project
 
-            await retire_task(
-                pool, current["todoist_task_id"], f"No longer tracking {name.strip()}."
-            )
+            try:
+                out["task_retired"] = bool(
+                    await hub_project.retire_task(
+                        pool, current["todoist_task_id"], f"No longer tracking {name.strip()}."
+                    )
+                )
+            except Exception as exc:  # noqa: BLE001 — the topic is untracked either way
+                logger.warning(
+                    "research_topic_task_retire_failed", topic=name, error=str(exc)[:200]
+                )
+                out["task_retired"] = False
+    out["round_closed"] = closed
     logger.info("research_topic_untracked", topic=name, round_closed=closed)
-    return {"status": "removed", "topic": name, "total_topics": len(kept), "round_closed": closed}
+    return out
 
 
 async def close_round(
@@ -281,12 +303,23 @@ async def close_round(
     now: datetime | None = None,
 ) -> bool:
     """End a topic's round: resolve it, then close it at once, so the next item
-    opens a fresh round instead of reopening this one. True when it closed."""
+    opens a fresh round instead of reopening this one. True when it closed.
+
+    Both steps run under the advisory lock `ingest_event` takes for the
+    round's correlation key. Without it an item attached between the resolve
+    and the close reopened the round, and with it the task the user had just
+    ticked off."""
     from aegis.services.hub import close_problem
 
     now = now or datetime.now(UTC)
-    await set_status(pool, problem_id, "resolved", reason=reason, source=source, now=now)
-    return await close_problem(pool, problem_id, now=now)
+    async with pool.acquire() as conn, conn.transaction():
+        key = await conn.fetchval(
+            "SELECT correlation_key FROM problems WHERE id = $1::uuid", problem_id
+        )
+        if key:
+            await conn.execute("SELECT pg_advisory_xact_lock(hashtext($1))", key)
+        await set_status(pool, problem_id, "resolved", reason=reason, source=source, now=now)
+        return await close_problem(pool, problem_id, now=now)
 
 
 def _item_id(url: str, topic: Topic) -> str:

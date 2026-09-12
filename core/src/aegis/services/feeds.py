@@ -11,8 +11,9 @@ worker, so there is one answer to "what is this feed worth?":
 * :func:`feed_stats` — per feed, measured from `feed_entries` (migration 045):
   entries seen, stored, stored as an abstract only, documents a prompt used in
   the last 30 and 90 days, the last entry, fetch failures and the backlog.
-  "Used" means a document was injected into a chat prompt
-  (`knowledge_injection_log`); nothing else logs its reads, so it is a floor.
+  "Used" means a document was retrieved into a prompt — a chat turn or a
+  research run (`knowledge_injection_log`, source `chat` or `research`). A
+  briefing or a rollup does not log its reads, so it is still a floor.
 * :func:`unused_feeds` — active feeds with 90 days of history and no use.
 * :func:`subscribe` / :func:`unsubscribe` — add a feed after checking it is
   one; stop one without deleting its history.
@@ -32,7 +33,7 @@ import asyncpg
 import httpx
 import structlog
 
-from aegis.services.research import public_url_problem
+from aegis.services.url_guard import UnsafeURLError, public_url_problem
 
 logger = structlog.get_logger()
 
@@ -214,26 +215,50 @@ async def inspect_feed(url: str) -> dict[str, Any]:
     problem = await public_url_problem(url)
     if problem:
         return {"ok": False, "error": problem}
+
+    async def _public_only(request: httpx.Request) -> None:
+        # Every hop, the redirects included: a public page that redirects
+        # inward would otherwise be fetched from inside the stack. Looked up
+        # at call time, so each hop is checked by the same function the URL was.
+        hop = await public_url_problem(str(request.url))
+        if hop:
+            raise UnsafeURLError(f"refused {request.url.host or request.url}: {hop}")
+
+    body_bytes = bytearray()
     try:
-        async with httpx.AsyncClient(
-            timeout=_FETCH_TIMEOUT, follow_redirects=True, headers={"User-Agent": _USER_AGENT}
-        ) as client:
-            resp = await client.get(url)
+        async with (
+            httpx.AsyncClient(
+                timeout=_FETCH_TIMEOUT,
+                follow_redirects=True,
+                headers={"User-Agent": _USER_AGENT},
+                event_hooks={"request": [_public_only]},
+            ) as client,
+            client.stream("GET", url) as resp,
+        ):
+            status = resp.status_code
+            content_type = resp.headers.get("content-type", "unknown type")
+            final_url = str(resp.url)
+            if status < 400:
+                async for chunk in resp.aiter_bytes():
+                    body_bytes += chunk[: _SNIFF_BYTES - len(body_bytes)]
+                    if len(body_bytes) >= _SNIFF_BYTES:
+                        break
+    except UnsafeURLError as exc:
+        return {"ok": False, "error": str(exc)}
     except Exception as exc:  # noqa: BLE001 — an unreachable URL is an answer
         return {"ok": False, "error": f"could not fetch it: {str(exc)[:200]}"}
-    if resp.status_code >= 400:
-        return {"ok": False, "error": f"the server answered HTTP {resp.status_code}"}
-    body = resp.content[:_SNIFF_BYTES].decode("utf-8", errors="replace")
+    if status >= 400:
+        return {"ok": False, "error": f"the server answered HTTP {status}"}
+    body = bytes(body_bytes).decode("utf-8", errors="replace")
     if not _FEED_ROOT_RE.search(body[:4000]):
         out: dict[str, Any] = {
             "ok": False,
-            "error": "that is not an RSS or Atom feed "
-            f"({resp.headers.get('content-type', 'unknown type')})",
+            "error": f"that is not an RSS or Atom feed ({content_type})",
         }
         link = _ALTERNATE_RE.search(body)
         href = _HREF_RE.search(link.group(0)) if link else None
         if href:
-            out["suggest"] = urljoin(str(resp.url), html.unescape(href.group(1)))
+            out["suggest"] = urljoin(final_url, html.unescape(href.group(1)))
         return out
     title = _TITLE_RE.search(body)
     return {
@@ -374,6 +399,6 @@ async def retention_preview(pool: asyncpg.Pool, older_than_days: int = 30) -> di
         "chunks_removed": removed,
         "text_bytes_freed": max(0, _int(r["text_bytes"]) - _int(r["kept_bytes"])),
         "vector_bytes_freed": removed * _VECTOR_BYTES,
-        "note": "Use is counted from knowledge_injection_log, which only chat writes, "
-        "so a document read by a flow counts as unused.",
+        "note": "Use is counted from knowledge_injection_log, which chat turns and "
+        "research runs write; a document only a briefing or rollup read counts as unused.",
     }

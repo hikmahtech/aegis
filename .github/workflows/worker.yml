@@ -21,6 +21,8 @@ on:
       - "admin-panel/frontend/src/**"
       - "tests/worker/**"
       - "tests/conftest.py"
+      # A shared helper the notes tests import (#514); not under tests/worker/.
+      - "tests/notes_vault.py"
       - "config/**"
       - "migrations/**"
       - "personalities/**"
@@ -34,6 +36,8 @@ on:
       - "admin-panel/frontend/src/**"
       - "tests/worker/**"
       - "tests/conftest.py"
+      # A shared helper the notes tests import (#514); not under tests/worker/.
+      - "tests/notes_vault.py"
       - "config/**"
       - "migrations/**"
       - "personalities/**"
@@ -84,7 +88,7 @@ jobs:
           pip install -e "core[dev]" -e "worker[dev]"
 
       - name: Lint
-        run: ruff check worker/src/ tests/worker/
+        run: ruff check worker/src/ tests/worker/ tests/notes_vault.py
 
       - name: Test
         run: pytest tests/worker/flows -n auto --dist loadfile --timeout=300 -v --tb=short --cov=worker/src/aegis_worker --cov-report=term-missing --cov-report=xml
@@ -120,7 +124,7 @@ jobs:
           pip install -e "core[dev]" -e "worker[dev]"
 
       - name: Lint
-        run: ruff check worker/src/ tests/worker/
+        run: ruff check worker/src/ tests/worker/ tests/notes_vault.py
 
       # The money activities drive the journal writer against a real hledger,
       # and those tests SKIP without the binary — a green run that proved

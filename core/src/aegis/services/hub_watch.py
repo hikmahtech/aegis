@@ -8,6 +8,10 @@ mute table with four key namespaces. :func:`reconcile_findings` is that
 question asked once:
 
 * every finding is an occurrence on its problem (new or attached);
+* a finding marked ``"record": False`` is still *found* — its problem stays
+  live — but adds no occurrence this tick, for a watchdog that looks hourly
+  but should only speak when something changes (a dead feed posted "N more
+  occurrences" on its task 24 times a day). It opens nothing on its own;
 * every live problem of the watchdog's classes that is **not** among the
   findings any more is resolved — except a GROUP problem, which stands for a
   whole class rather than one subject and so recovers only when the watchdog
@@ -47,17 +51,20 @@ async def reconcile_findings(
 ) -> dict[str, Any]:
     """Record ``findings`` and resolve what is no longer found.
 
-    Each finding is ``{"klass", "subject", "title", "severity"?, "payload"?}``.
-    ``classes`` names every class this watchdog can produce, so a problem of
-    one of them with no current finding is what "recovered" means.
+    Each finding is ``{"klass", "subject", "title", "severity"?, "payload"?,
+    "record"?}``. ``classes`` names every class this watchdog can produce, so a
+    problem of one of them with no current finding is what "recovered" means.
+    ``"record": False`` keeps a finding's problem live without adding an
+    occurrence.
 
     Returns ``fresh`` (the findings that earned a card, each with its
-    ``problem_id``), the counts of ``attached`` / ``muted`` / ``suppressed``
-    findings, and ``resolved`` (the subjects that recovered, with their ids).
+    ``problem_id``), the counts of ``attached`` / ``muted`` / ``suppressed`` /
+    ``ongoing`` findings, and ``resolved`` (the subjects that recovered, with
+    their ids).
     """
     now = now or datetime.now(UTC)
     fresh: list[dict[str, Any]] = []
-    attached = muted = suppressed = 0
+    attached = muted = suppressed = ongoing = 0
     seen: set[tuple[str, str]] = set()
     to_project: list[str] = []
 
@@ -65,6 +72,10 @@ async def reconcile_findings(
         klass, subject = slug(str(f.get("klass") or "")), slug(str(f.get("subject") or ""))
         if not klass or not subject:
             logger.warning("hub_watch_finding_skipped", source=source, finding=str(f)[:200])
+            continue
+        if f.get("record") is False:
+            seen.add((klass, subject))
+            ongoing += 1
             continue
         result = await ingest_event(
             pool,
@@ -156,6 +167,7 @@ async def reconcile_findings(
         attached=attached,
         muted=muted,
         suppressed=suppressed,
+        ongoing=ongoing,
         resolved=len(resolved),
     )
     return {
@@ -163,6 +175,7 @@ async def reconcile_findings(
         "attached": attached,
         "muted": muted,
         "suppressed": suppressed,
+        "ongoing": ongoing,
         "resolved": resolved,
     }
 

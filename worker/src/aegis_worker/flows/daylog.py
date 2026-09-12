@@ -262,10 +262,14 @@ class DayLogFlow:
         # `day_offset` shifts the anchor here exactly as it does for a daily
         # run, which is what makes a past period re-runnable at all: the window
         # is derived from the clock, so without it the only rollup you can ever
-        # produce is the one for right now. `day_offset=7` on a Sunday re-files
-        # last week's — the url is `aegis://daylog/<kind>/<label>`, so a re-run
-        # OVERWRITES that period in place rather than filing a second copy.
-        # Used 2026-08-23 to rewrite 2026-W33, which was filed truncated.
+        # produce is the one for right now. With the vault OFF, `day_offset=7`
+        # on a Sunday re-files last week's — the url is
+        # `aegis://daylog/<kind>/<label>`, so a re-run OVERWRITES that period in
+        # place (used 2026-08-23 to rewrite 2026-W33, which was filed
+        # truncated). With the vault ON (#514) a re-run is a no-op for a period
+        # already in the journal: the note carries the period's marker and the
+        # journal is append-only (`vault: exists`). To redo one, delete
+        # Raphael's section from the note by hand, then re-run.
         window = rollup_window(config.mode, workflow.now() - timedelta(days=config.day_offset))
         if window is None:
             workflow.logger.info("daylog_rollup_not_period_end mode=%s", config.mode)

@@ -27,6 +27,8 @@ on:
       - "tests/api/**"
       - "tests/integration/**"
       - "tests/conftest.py"
+      # A shared helper the notes tests import (#514); not under tests/core/.
+      - "tests/notes_vault.py"
       - "config/**"
       - "migrations/**"
       - "personalities/**"
@@ -50,6 +52,8 @@ on:
       - "tests/api/**"
       - "tests/integration/**"
       - "tests/conftest.py"
+      # A shared helper the notes tests import (#514); not under tests/core/.
+      - "tests/notes_vault.py"
       - "config/**"
       - "migrations/**"
       - "personalities/**"
@@ -104,7 +108,7 @@ jobs:
           pip install -e "core[dev,google]"
 
       - name: Lint
-        run: ruff check core/src/ tests/core/ tests/api/ tests/integration/ tests/conftest.py
+        run: ruff check core/src/ tests/core/ tests/api/ tests/integration/ tests/conftest.py tests/notes_vault.py
 
       # tests/core/test_books.py exercises the real journal write protocol —
       # append, `hledger check --strict`, revert-on-failure, commit — against a

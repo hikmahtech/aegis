@@ -16,29 +16,26 @@ Three rules hold for everything below:
 * **Nothing here stores anything.** Reading a page or a paper returns its text;
   keeping an answer is `ResearchFlow`'s decision, made once, on a real answer.
 * **A fetch only goes to the public internet.** The URL a model asks to read
-  can come from a page it just read, so `read_url` and `paper_read` refuse a
-  host that resolves to a loopback, private or link-local address — the stack's
-  own services included. (A public page that REDIRECTS inward is not caught:
-  `fetch_and_extract` follows redirects itself. Its responses go back to the
-  model, not to anyone else.)
+  can come from a page it just read, so every request of every fetch — the
+  first one and each redirect — must resolve to a public address
+  (`services/url_guard.py`). A loopback, private or link-local address, the
+  stack's own services included, is refused at the hop that turns inward.
 """
 
 from __future__ import annotations
 
 import asyncio
 import hashlib
-import ipaddress
 import json
 import re
-import socket
 from typing import Any
-from urllib.parse import urlparse
 from xml.etree import ElementTree
 
 import httpx
 import structlog
 
 from aegis.services.content_extract import fetch_and_extract
+from aegis.services.url_guard import UnsafeURLError, public_url_problem
 
 logger = structlog.get_logger()
 
@@ -192,36 +189,6 @@ async def web_search(
     ]
 
 
-async def public_url_problem(url: str) -> str | None:
-    """None when `url` is http(s) on the public internet, else why it is not."""
-    parsed = urlparse(url or "")
-    if parsed.scheme not in ("http", "https"):
-        return "only http and https URLs can be read"
-    host = (parsed.hostname or "").lower()
-    if not host:
-        return "the URL has no host"
-    if host == "localhost" or host.endswith((".localhost", ".local", ".internal")):
-        return f"{host} is not a public host"
-    try:
-        port = parsed.port or (443 if parsed.scheme == "https" else 80)
-    except ValueError:
-        return "the URL has an invalid port"
-    try:
-        infos = await asyncio.get_running_loop().getaddrinfo(
-            host, port, type=socket.SOCK_STREAM
-        )
-    except OSError as exc:
-        return f"{host} does not resolve ({exc})"
-    for info in infos:
-        try:
-            addr = ipaddress.ip_address(str(info[4][0]).split("%", 1)[0])
-        except ValueError:
-            return f"{host} resolves to an address that cannot be checked"
-        if not addr.is_global:
-            return f"{host} resolves to a non-public address"
-    return None
-
-
 def _clamp(value: Any, default: int) -> int:
     try:
         n = int(value)
@@ -239,6 +206,9 @@ async def read_url(url: str, *, max_chars: int = READ_URL_CHARS) -> dict:
     max_chars = _clamp(max_chars, READ_URL_CHARS)
     try:
         text, title = await fetch_and_extract(url, None, max_chars=max_chars + 1)
+    except UnsafeURLError as exc:
+        # The page redirected off the public internet: say where, plainly.
+        return {"url": url, "error": str(exc)[:300]}
     except Exception as exc:  # noqa: BLE001 — an unreadable page is an answer
         return {"url": url, "error": f"could not read the page: {str(exc)[:200]}"}
     if not text:
