@@ -470,9 +470,14 @@ activities:
   # `ingress_url` (#492) is the canary on the way IN: AEGIS's own public or LAN
   # URL, which the worker GETs every tick so a proxy that has stopped reaching
   # core cannot drop every inbound webhook in silence. Any answer under 500
-  # passes, so point it at something an identity proxy will not challenge — a
-  # webhook path that answers 405 to a bare GET is ideal. Empty, the default,
-  # disables it: AEGIS cannot guess your hostname.
+  # from that same host passes, so point it at something an identity proxy will
+  # not challenge — a webhook path that answers 405 to a bare GET is ideal.
+  # Empty, the default, disables it: AEGIS cannot guess your hostname.
+  # `ingress_fail_threshold` (2) is how many consecutive failures raise the
+  # alert — one dropped request is what a rolling update of core looks like,
+  # and this alert escalates. `ingress_expect_status` (0 = anything under 500)
+  # pins the status only core would give, so a proxy serving its own 404 for a
+  # route it has lost is a fault rather than a pass.
   - slug: infra-heartbeat-2m
     workflow_type: InfraHeartbeatFlow
     agent_id: pandoras-actor

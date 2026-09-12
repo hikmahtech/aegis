@@ -89,8 +89,10 @@ async def _routing() -> dict:
 
 
 @activity.defn(name="probe_ingress")
-async def _probe_ingress(url: str) -> dict:
-    _calls.setdefault("probed", []).append(url)
+async def _probe_ingress(url: str, expect_status: int = 0) -> dict:
+    _calls.setdefault("probed", []).append((url, expect_status))
+    if isinstance(_state.get("probe"), Exception):
+        raise _state["probe"]
     return _state.get("probe") or {"url": url, "ok": True, "status": 200, "ms": 5, "error": ""}
 
 
@@ -444,7 +446,11 @@ async def test_firing_transition_the_hub_declines_spawns_nothing():
 # ── The ingress canary (#492) ────────────────────────────────────────────────
 
 _HEALTHY = {"ok": True, "nodes": {"baa": "Ready"}, "stuck": [], "error": ""}
-_CANARY = InfraHeartbeatConfig(ingress_url="https://aegis.example.com/health")
+# `ingress_fail_threshold=1` in most tests: the two-strike default has its own
+# test below, and every other case is about what happens once it has struck.
+_CANARY = InfraHeartbeatConfig(
+    ingress_url="https://aegis.example.com/health", ingress_fail_threshold=1
+)
 
 
 async def test_the_ingress_canary_alerts_when_the_way_in_stops_answering():
@@ -461,7 +467,7 @@ async def test_the_ingress_canary_alerts_when_the_way_in_stops_answering():
 
     result = await _run(_CANARY)
 
-    assert _calls["probed"] == [_CANARY.ingress_url]
+    assert _calls["probed"] == [(_CANARY.ingress_url, 0)]
     assert result["alerts_spawned"] == 1
     alert = _calls["spawned"][0]
     assert alert["labels"]["alertname"] == "IngressUnreachable"
@@ -515,6 +521,74 @@ async def test_no_ingress_url_means_no_canary():
     assert result["alerts_spawned"] == 0
 
 
+async def test_one_dropped_request_is_not_an_outage():
+    """The default is two strikes, because one dropped request is what a
+    rolling update of core looks like — and this alert escalates and pings
+    Slack the moment it is raised. A deploy window cannot help: it is keyed on
+    a service name, and this problem's subject is the path.
+
+    Falsifiable: drop the threshold comparison and the first tick alerts.
+    """
+    two_strikes = InfraHeartbeatConfig(ingress_url=_CANARY.ingress_url)
+    failed = {"url": _CANARY.ingress_url, "ok": False, "status": 502, "ms": 3, "error": "HTTP 502"}
+
+    _reset(_HEALTHY)
+    _state["probe"] = failed
+    first = await _run(two_strikes)
+    assert first["alerts_spawned"] == 0
+    assert first["ingress_failing"] is False
+    assert _calls["written"][0]["ingress_fails"] == 1
+
+    # Second strike, carrying the count the first tick stored.
+    _reset(_HEALTHY, {**_calls["written"][0]})
+    _state["probe"] = failed
+    second = await _run(two_strikes)
+    assert second["alerts_spawned"] == 1
+    assert second["ingress_failing"] is True
+
+
+async def test_a_recovery_between_strikes_starts_the_count_again():
+    """Two failures an hour apart are two blips, not one outage."""
+    two_strikes = InfraHeartbeatConfig(ingress_url=_CANARY.ingress_url)
+    _reset(_HEALTHY, {"nodes": {}, "stuck": [], "confirmed": [], "ingress_fails": 1})
+    _state["probe"] = {"url": _CANARY.ingress_url, "ok": True, "status": 405, "ms": 4, "error": ""}
+
+    result = await _run(two_strikes)
+
+    assert result["alerts_spawned"] == 0
+    assert _calls["written"][0]["ingress_fails"] == 0
+
+
+async def test_a_probe_that_cannot_run_does_not_lose_the_tick():
+    """The swarm poll, the state write and the dead-man ping matter more than
+    the canary, so a failed probe activity is swallowed like its siblings.
+
+    Falsifiable: unwrap the probe call and this whole tick raises.
+    """
+    _reset(_HEALTHY)
+    _state["probe"] = RuntimeError("worker restarted mid-probe")
+
+    result = await _run(_CANARY)
+
+    assert result["collect_ok"] is True
+    assert result["alerts_spawned"] == 0
+    assert _calls["pinged"] == 1
+    # The count is untouched, not reset: nothing was learned either way.
+    assert _calls["written"][0]["ingress_fails"] == 0
+
+
+async def test_the_expected_status_is_passed_to_the_probe():
+    """`< 500` cannot tell core's answer from the proxy's own 404, so the
+    operator may pin the status that only core gives."""
+    _reset(_HEALTHY)
+    await _run(
+        InfraHeartbeatConfig(
+            ingress_url=_CANARY.ingress_url, ingress_fail_threshold=1, ingress_expect_status=405
+        )
+    )
+    assert _calls["probed"] == [(_CANARY.ingress_url, 405)]
+
+
 async def test_the_canary_still_runs_when_the_swarm_collect_fails():
     """The way in can be broken while the swarm is fine, and the reverse. The
     collect-failure path returns early, so the probe runs before it — else the
@@ -527,7 +601,7 @@ async def test_the_canary_still_runs_when_the_swarm_collect_fails():
     result = await _run(_CANARY)
 
     assert result["collect_ok"] is False
-    assert _calls["probed"] == [_CANARY.ingress_url]
+    assert _calls["probed"] == [(_CANARY.ingress_url, 0)]
     assert [a["labels"]["alertname"] for a in _calls["spawned"]] == ["IngressUnreachable"]
     # The early return must carry the flag, or the canary forgets every tick.
     assert _calls["written"][0]["ingress_failing"] is True

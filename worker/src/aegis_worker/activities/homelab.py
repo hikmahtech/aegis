@@ -273,7 +273,7 @@ class HomelabActivities:
         }
 
     @activity.defn
-    async def probe_ingress(self, url: str) -> dict:
+    async def probe_ingress(self, url: str, expect_status: int = 0) -> dict:
         """One GET at `url`, to test the way IN to AEGIS from outside.
 
         Core's healthcheck runs inside core's own container, so it stays green
@@ -284,39 +284,59 @@ class HomelabActivities:
         is the broken thing — the only party who can notice is AEGIS reaching
         out, which is this.
 
-        **Any HTTP answer means the path works**, 401/404/405 included: the
-        question is whether bytes reach core, not what core makes of them, and
-        the useful probe targets are the ones an identity proxy does not
-        challenge. A transport error, a timeout, or a 5xx is a fault — a
-        proxy with no healthy backend answers exactly 502 or 504, which is
-        the signature of the outage this watches for.
+        **By default any HTTP answer from the right host means the path
+        works**, 401/404/405 included: the question is whether bytes reach
+        core, not what core makes of them, and the useful probe targets are the
+        ones an identity proxy does not challenge. A transport error, a
+        timeout, or a 5xx is a fault — a proxy with no healthy backend answers
+        exactly 502 or 504, which is the signature of the outage this watches
+        for.
+
+        Two things stop that rule passing an answer core never saw:
+
+        * **A redirect off the host is a fault.** An identity proxy in front of
+          the URL sends the probe to its own login page, which cheerfully
+          answers 200 forever whether or not the origin is alive — a green
+          canary watching nothing. Redirects are still followed (a bare `/` to
+          `/docs` is fine); landing on a different host is not.
+        * **`expect_status` asserts which answer**, for the cases where the
+          status alone says who replied. A proxy that lost the route to core
+          serves its own 404 with a 200-shaped conscience; pin 405 (what a
+          webhook path gives a bare GET) and that 404 is a fault.
         """
         target = (url or "").strip()
         if not target:
             return {"url": "", "ok": True, "status": 0, "ms": 0, "error": "", "configured": False}
         started = time.monotonic()
+
+        def _result(ok: bool, status: int, error: str) -> dict:
+            return {
+                "url": target,
+                "ok": ok,
+                "status": status,
+                "ms": int((time.monotonic() - started) * 1000),
+                "error": error,
+                "configured": True,
+            }
+
         try:
             async with httpx.AsyncClient(
                 timeout=_INGRESS_TIMEOUT_S, follow_redirects=True
             ) as client:
                 response = await client.get(target)
         except Exception as exc:  # noqa: BLE001 — a failed probe IS the finding
-            return {
-                "url": target,
-                "ok": False,
-                "status": 0,
-                "ms": int((time.monotonic() - started) * 1000),
-                "error": f"{type(exc).__name__}: {str(exc)[:160]}",
-                "configured": True,
-            }
-        return {
-            "url": target,
-            "ok": response.status_code < 500,
-            "status": response.status_code,
-            "ms": int((time.monotonic() - started) * 1000),
-            "error": "" if response.status_code < 500 else f"HTTP {response.status_code}",
-            "configured": True,
-        }
+            return _result(False, 0, f"{type(exc).__name__}: {str(exc)[:160]}")
+
+        status = response.status_code
+        asked = httpx.URL(target).host
+        answered = response.url.host
+        if answered and asked and answered != asked:
+            return _result(False, status, f"redirected to {answered}, not {asked}")
+        if expect_status and status != int(expect_status):
+            return _result(False, status, f"HTTP {status}, expected {int(expect_status)}")
+        if status >= 500:
+            return _result(False, status, f"HTTP {status}")
+        return _result(True, status, "")
 
     _CERT_THRESHOLDS = (14, 7, 0)  # days
 

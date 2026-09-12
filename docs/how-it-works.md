@@ -477,9 +477,18 @@ regardless of where the alert came from:
   in stops answering. Core's healthcheck runs inside core's container, so it
   stays green while the proxy in front of it drops every webhook — that is how
   a 3.5-hour outage went unnoticed on 2026-09-11 (#492), and no outside
-  monitor could have told AEGIS, because being told is what was broken. Any
-  answer under 500 counts as reachable, so aim it at a path an identity proxy
-  will not challenge; empty disables it.
+  monitor could have told AEGIS, because being told is what was broken.
+
+  What counts as reachable is any answer under 500 **from the host you asked**.
+  A redirect that lands somewhere else fails: an identity proxy would otherwise
+  send the probe to its own login page, which answers 200 forever whether or
+  not the origin is alive. So aim it at a path that proxy will not challenge —
+  a webhook path is ideal, and `ingress_expect_status: 405` then pins the
+  answer only core gives, which also catches a proxy serving its own 404 for a
+  route it has lost. It takes `ingress_fail_threshold` failures in a row
+  (default 2, so a 4-minute fuse) because one dropped request is what a rolling
+  update of core looks like and this alert escalates. Empty `ingress_url`
+  disables the whole thing.
 - Hand-captured Todoist tasks routed via a content route with
   `alert_overrides` (e.g. "X is down" → a synthetic `NodeDown`)
 
