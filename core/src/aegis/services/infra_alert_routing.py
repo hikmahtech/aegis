@@ -8,13 +8,23 @@ repo (the one holding the swarm or ansible config) without staging a fix.
 Stored in the ``settings`` table under ``infra_alert_routing``::
 
     {"extra_alertnames": ["dagster pipeline failure", "clickhousedown"],
-     "repo": "acme/infra-gitops"}
+     "repo": "acme/infra-gitops",
+     "platform_hint": "This cluster is Docker Swarm. Read it with "
+                      "`docker --context swarm node ls` and "
+                      "`docker --context swarm service ps <service>`."}
 
 - ``extra_alertnames`` are ADDED to ``DEFAULT_INFRA_ALERTNAMES``. Alertnames are
   compared stripped and lowercased.
 - ``repo`` is the ``owner/name`` (``resources.metadata.github_repo``) of the
   repository resource infra alerts are investigated in. Empty means none: the
-  flow falls back to an LLM-only investigation.
+  flow falls back to an LLM-only investigation. It is also the repo a connector
+  or service alert expands to, since the config that deploys a thing is as
+  likely to be at fault as the thing (#505).
+- ``platform_hint`` is one or two sentences telling the investigating agent
+  what the cluster IS and how to read it. The generic instructions name no
+  orchestrator, because AEGIS does not know whether you run Swarm, k8s, Nomad
+  or a handful of systemd units — this is where you say (#505). Empty is fine;
+  the agent then works it out from the infra repo.
 
 The defaults are generic: the alerts AEGIS's own heartbeat raises, plus the
 usual host, container and monitoring-stack alerts. Anything that only makes
@@ -68,7 +78,10 @@ DEFAULT_INFRA_ALERTNAMES: frozenset[str] = frozenset(
 # owner/repo — GitHub's own character set for both halves.
 _REPO_RE = re.compile(r"^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$")
 
-_WRITABLE_KEYS = frozenset({"extra_alertnames", "repo"})
+_WRITABLE_KEYS = frozenset({"extra_alertnames", "repo", "platform_hint"})
+# A hint longer than this is a prompt, not a hint: the investigation's context
+# has a budget, and this text goes in front of everything else.
+_HINT_CAP = 1000
 # What GET adds on top of the stored row. Accepted and ignored on PUT so the
 # admin page can send back what it read.
 _COMPUTED_KEYS = frozenset({"alertnames", "default_alertnames"})
@@ -103,7 +116,13 @@ def validate(raw: Any) -> dict:
     repo = str(raw.get("repo") or "").strip()
     if repo and not _REPO_RE.match(repo):
         raise ValueError(f"repo must be 'owner/name', got {repo!r}")
-    return {"extra_alertnames": sorted(names), "repo": repo}
+    hint_raw = raw.get("platform_hint") or ""
+    if not isinstance(hint_raw, str):
+        raise ValueError("platform_hint must be a string")
+    hint = hint_raw.strip()
+    if len(hint) > _HINT_CAP:
+        raise ValueError(f"platform_hint must be at most {_HINT_CAP} characters")
+    return {"extra_alertnames": sorted(names), "repo": repo, "platform_hint": hint}
 
 
 def merge(value: Any) -> dict:
@@ -120,10 +139,13 @@ def merge(value: Any) -> dict:
     repo = repo.strip() if isinstance(repo, str) else ""
     if not _REPO_RE.match(repo):
         repo = ""
+    hint = v.get("platform_hint")
+    hint = hint.strip()[:_HINT_CAP] if isinstance(hint, str) else ""
     return {
         "alertnames": sorted(DEFAULT_INFRA_ALERTNAMES | set(extra)),
         "extra_alertnames": extra,
         "repo": repo,
+        "platform_hint": hint,
     }
 
 

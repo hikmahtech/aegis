@@ -3,8 +3,33 @@
 import json
 from unittest.mock import AsyncMock
 
+import pytest
+from aegis.services import infra_alert_routing
 from aegis_worker.activities.alerts import AlertActivities
 from temporalio.testing import ActivityEnvironment
+
+
+@pytest.fixture(autouse=True)
+def _fresh_routing_cache():
+    """The infra routing read is cached 30s per process; never let one test's
+    row answer another's question."""
+    infra_alert_routing._cache.update(value=None, ts=0.0)
+    yield
+    infra_alert_routing._cache.update(value=None, ts=0.0)
+
+
+def _routing_fetchrow(repo: str, repo_row: dict | None):
+    """`fetchrow` for the two reads the infra-repo lookup makes: the
+    `infra_alert_routing` settings row, then the repository row it names."""
+
+    async def _fetchrow(sql, *args):
+        if "FROM settings" in sql:
+            return {"value": {"repo": repo}}
+        if "FROM resources" in sql:
+            return repo_row
+        return None
+
+    return _fetchrow
 
 # `service` here is deliberately a value that does NOT match any
 # SAMPLE_RESOURCES path/github_repo basename, so these tests exercise the
@@ -282,10 +307,21 @@ async def test_resolve_resource_kg_low_confidence_falls_through():
     assert result["source"] == "llm"
 
 
-async def test_resolve_resource_connector_expands_to_homelab():
-    """When a connector resource is matched, infra-gitops is added via expansion rule."""
+async def test_resolve_resource_connector_expands_to_the_configured_infra_repo():
+    """A connector match also investigates the infra repo, because the config
+    that deploys a thing is as likely to be at fault as the thing.
+
+    The repo is the one `infra_alert_routing.repo` names. It used to be found by
+    path basename `== "infra-gitops"`, so the expansion never fired in any
+    deployment whose infra repo is called something else — including the one it
+    was written for, `homelab-gitops` (#505).
+
+    Falsifiable: point the routing row at a repo no resource has and the
+    expansion adds nothing.
+    """
     mock_db = AsyncMock()
     mock_db.fetch.return_value = SAMPLE_RESOURCES  # includes res-003 = infra-gitops
+    mock_db.fetchrow = _routing_fetchrow("example/infra-gitops", SAMPLE_RESOURCES[2])
 
     mock_kg = AsyncMock()
     mock_kg.search.return_value = []
@@ -322,6 +358,30 @@ async def test_resolve_resource_connector_expands_to_homelab():
     homelab = next(r for r in result["resources"] if r["resource_id"] == "res-003")
     assert homelab["resource_path"] == "infra-gitops"
     assert homelab["github_repo"] == "example/infra-gitops"
+
+
+async def test_resolve_resource_expands_to_nothing_when_no_infra_repo_is_configured():
+    """The other half of the same rule: an unset (or wrong) `repo` adds no
+    second resource, rather than guessing at a name."""
+    mock_db = AsyncMock()
+    mock_db.fetch.return_value = SAMPLE_RESOURCES
+    mock_db.fetchrow = _routing_fetchrow("", None)
+
+    mock_llm = AsyncMock()
+    mock_llm.think.return_value = {
+        "response": json.dumps(
+            {"resources": [{"resource_id": "res-002", "resource_title": "knowledge-service",
+                            "confidence": 0.8}]}
+        ),
+        "model": "gemma4:e2b",
+        "prompt_tokens": 100,
+        "completion_tokens": 20,
+    }
+
+    act = AlertActivities(db_pool=mock_db, llm_client=mock_llm, knowledge_connector=AsyncMock())
+    result = await ActivityEnvironment().run(act.resolve_alert_resource, SAMPLE_ALERT)
+
+    assert [r["resource_id"] for r in result["resources"]] == ["res-002"]
 
 
 async def test_resolve_resource_subthreshold_returns_unconfirmed_candidates():

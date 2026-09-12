@@ -80,7 +80,7 @@ def test_merge_never_raises_and_keeps_what_it_can_read():
 
 def test_validate_normalises_and_dedupes():
     stored = iar.validate({"extra_alertnames": ["A", " a ", "B"], "repo": " acme/infra "})
-    assert stored == {"extra_alertnames": ["a", "b"], "repo": "acme/infra"}
+    assert stored == {"extra_alertnames": ["a", "b"], "repo": "acme/infra", "platform_hint": ""}
 
 
 @pytest.mark.parametrize(
@@ -103,7 +103,31 @@ def test_validate_accepts_its_own_read_back_so_the_ui_can_round_trip():
     """The GET body carries computed keys; PUTting it back must not 400."""
     routing = iar.merge({"extra_alertnames": ["x"], "repo": "acme/infra"})
     body = {**routing, "default_alertnames": sorted(iar.DEFAULT_INFRA_ALERTNAMES)}
-    assert iar.validate(body) == {"extra_alertnames": ["x"], "repo": "acme/infra"}
+    assert iar.validate(body) == {
+        "extra_alertnames": ["x"],
+        "repo": "acme/infra",
+        "platform_hint": "",
+    }
+
+
+def test_the_platform_hint_is_kept_and_bounded():
+    """What the cluster is, in the operator's words, because the generic
+    instructions name no orchestrator (#505)."""
+    hint = "This cluster is Docker Swarm. Read it with `docker --context swarm node ls`."
+    assert iar.validate({"platform_hint": f"  {hint}  "})["platform_hint"] == hint
+    assert iar.merge({"platform_hint": hint})["platform_hint"] == hint
+    # A hint this long is a prompt, and it goes in front of everything else.
+    with pytest.raises(ValueError, match="at most"):
+        iar.validate({"platform_hint": "x" * 1001})
+    with pytest.raises(ValueError, match="must be a string"):
+        iar.validate({"platform_hint": ["swarm"]})
+    # Unreadable is not fatal on the read path: a bad hint loses the hint only.
+    assert iar.merge({"platform_hint": 7, "repo": "acme/infra"}) == {
+        "alertnames": sorted(iar.DEFAULT_INFRA_ALERTNAMES),
+        "extra_alertnames": [],
+        "repo": "acme/infra",
+        "platform_hint": "",
+    }
 
 
 # ── persistence ───────────────────────────────────────────────────────────

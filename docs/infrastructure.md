@@ -790,7 +790,9 @@ the admin API:
 curl -sS -H "X-API-Key: $AEGIS_API_KEY" "$AEGIS_URL/api/admin/infra-alert-routing"
 curl -sS -X PUT "$AEGIS_URL/api/admin/infra-alert-routing" \
   -H "X-API-Key: $AEGIS_API_KEY" -H 'Content-Type: application/json' \
-  -d '{"extra_alertnames": ["Dagster Pipeline Failure", "ClickHouseDown"], "repo": "acme/infra-gitops"}'
+  -d '{"extra_alertnames": ["Dagster Pipeline Failure", "ClickHouseDown"],
+       "repo": "acme/infra-gitops",
+       "platform_hint": "This cluster is Docker Swarm, three managers. Read it with `docker --context swarm node ls` and `docker --context swarm service ps <service>`; a stuck service usually takes `docker --context swarm service update --force <service>`."}'
 ```
 
 - `extra_alertnames` are added to the built-in list, which `GET` returns as
@@ -800,6 +802,16 @@ curl -sS -X PUT "$AEGIS_URL/api/admin/infra-alert-routing" \
   your setup goes here. Names are compared lowercased.
 - `repo` is the `owner/name` (the resource's GitHub repo) that infra alerts
   are investigated in. Unset means infra alerts get an LLM-only investigation.
+  It is also the repo that a connector or service alert expands to, on the
+  grounds that the config which deploys a thing is as likely to be at fault as
+  the thing. Before #505 that expansion looked for a repo whose path ended in
+  `infra-gitops`, so it never fired for anyone who named theirs otherwise.
+- `platform_hint` is one or two sentences saying what the cluster IS and how to
+  read it. The instructions AEGIS puts in front of an infra investigation name
+  no orchestrator, because it has no way to know whether you run Swarm, k8s,
+  Nomad or a few systemd units — this is where you tell it. Up to 1000
+  characters; it goes in front of everything else the agent reads. Leave it
+  empty and the agent works it out from the infra repo.
 - `PUT` replaces the whole row and answers 400 on a bad value. The worker
   picks a change up within 30 seconds; no restart.
 

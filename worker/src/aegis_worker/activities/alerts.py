@@ -579,12 +579,19 @@ _MATCH_TOKEN_RE = re.compile(r"[a-z0-9]+")
 # appears in almost every Dagster alert title AND in a repo literally named
 # "*-pipeline"; matching on it would false-positive. Deliberately small/local
 # to this matcher, not a general stopword list.
+#
+# Every word here is language or alert vocabulary. A PRODUCT name does not
+# belong: `dagster` was in the list, which is one deployment's stack in an
+# open-source repo, and it stopped a fork whose repo is named after its
+# orchestrator from ever token-matching (#505). An alertname shared by every
+# repo is what `metadata.alert_labels` claims are for (#498); that is the
+# designed answer, not a stopword.
 _GENERIC_MATCH_TOKENS = frozenset(
     {
         "the", "a", "an", "is", "of", "to", "in", "on", "for", "and", "or",
         "down", "up", "unreachable", "failed", "failure", "error", "errors",
         "alert", "critical", "warning", "warn", "service", "endpoint", "repo",
-        "pipeline", "job", "run", "dagster", "http", "https", "www",
+        "pipeline", "job", "run", "http", "https", "www",
         "com", "org", "io", "net", "unknown", "none", "true", "false",
         "prod", "production", "staging", "dev", "class", "type", "message",
     }
@@ -599,6 +606,11 @@ _MIN_MATCH_TOKEN_LEN = 4
 # "Dagster Pipeline Failure" fires for every Dagster pipeline in every repo,
 # so including it would make every such alert token-match every repo whose
 # name contains "pipeline".
+#
+# `run_id` stays (#505 asked): the key NAMES an identifier of one run, so it is
+# non-identifying of a repo by construction, whoever emits it — the same reason
+# `job` and `grafana_folder` are here. Unlike a product name, it carries no
+# deployment's vocabulary.
 _NON_IDENTIFYING_LABEL_KEYS = frozenset(
     {"alertname", "severity", "cluster", "environment", "job", "grafana_folder", "run_id"}
 )
@@ -766,12 +778,15 @@ class AlertActivities:
         Settings/DB — mirror of the AgentRegistryActivities pattern).
 
         `infra_alertnames` is the effective infra list from the
-        `infra_alert_routing` settings row (generic defaults when unset)."""
+        `infra_alert_routing` settings row (generic defaults when unset), and
+        `platform_hint` is that row's description of what the cluster is,
+        which the flow puts in front of an infra investigation (#505)."""
         routing = await get_infra_alert_routing(self.db_pool)
         return {
             "infra_cluster": self.infra_cluster,
             "slack_owner_member_id": self.slack_owner_member_id,
             "infra_alertnames": routing["alertnames"],
+            "platform_hint": routing["platform_hint"],
         }
 
     async def _claimed_resource(self, alert: dict) -> dict | None:
@@ -1201,39 +1216,51 @@ class AlertActivities:
         claimed = await self._claimed_resource(alert)
         if claimed is not None:
             return {**claimed, "source": "label_claim", "resources": [claimed]}
-        repo = (await get_infra_alert_routing(self.db_pool))["repo"]
-        if not repo:
-            activity.logger.warning(
-                "resolve_infra_resource_no_repo — set `repo` in the "
-                "infra_alert_routing setting (PUT /api/admin/infra-alert-routing)"
-            )
-            return null_result
-        try:
-            # Prefer the row with a checkout path: without one the coding run
-            # has nowhere to cd and degrades to the LLM-only path.
-            row = await self.db_pool.fetchrow(
-                "SELECT id, title, metadata FROM resources "
-                "WHERE kind = 'repository' AND lower(metadata->>'github_repo') = lower($1) "
-                "ORDER BY (metadata->>'path') IS NULL, slug LIMIT 1",
-                repo,
-            )
-        except Exception as exc:
-            activity.logger.warning(
-                "resolve_infra_resource_db_failed err=%s", str(exc)[:200]
-            )
-            return null_result
-        if not row:
-            activity.logger.warning("resolve_infra_resource_not_found repo=%s", repo)
+        row = await self._infra_repo_row()
+        if row is None:
             return null_result
         meta = _decode_metadata(row)
         matched = {
             "resource_id": str(row["id"]),
             "resource_title": row["title"],
             "resource_path": meta.get("path") or "",
-            "github_repo": meta.get("github_repo") or repo,
+            "github_repo": meta.get("github_repo") or "",
             "confidence": 1.0,
         }
         return {**matched, "source": "infra", "resources": [matched]}
+
+    async def _infra_repo_row(self):
+        """The `resources` row for the infra repo, or None.
+
+        The repo is whichever `github_repo` the `infra_alert_routing.repo`
+        setting names — never a hardcoded name (#505). None means unset,
+        missing or unreadable; every caller degrades to an LLM-only
+        investigation rather than failing.
+        """
+        if not self.db_pool:
+            return None
+        repo = (await get_infra_alert_routing(self.db_pool))["repo"]
+        if not repo:
+            activity.logger.warning(
+                "infra_repo_not_configured — set `repo` in the "
+                "infra_alert_routing setting (PUT /api/admin/infra-alert-routing)"
+            )
+            return None
+        try:
+            # Prefer the row with a checkout path: without one the coding run
+            # has nowhere to cd and degrades to the LLM-only path.
+            row = await self.db_pool.fetchrow(
+                "SELECT id, title, kind, metadata FROM resources "
+                "WHERE kind = 'repository' AND lower(metadata->>'github_repo') = lower($1) "
+                "ORDER BY (metadata->>'path') IS NULL, slug LIMIT 1",
+                repo,
+            )
+        except Exception as exc:
+            activity.logger.warning("infra_repo_lookup_failed err=%s", str(exc)[:200])
+            return None
+        if not row:
+            activity.logger.warning("infra_repo_not_found repo=%s", repo)
+        return row
 
     @activity.defn
     async def remediate_infra_service(self, alert: dict) -> dict:
@@ -1791,36 +1818,30 @@ class AlertActivities:
         if not enriched:
             return null_result
 
-        # Phase 2: rule-based expansion — connector/service → add infra-gitops.
-        # Matched on the path BASENAME: the workspace-relative path is nested
-        # ("infrastructure/infra-gitops").
-        def _is_homelab(path: Any) -> bool:
-            return str(path or "").rstrip("/").rsplit("/", 1)[-1] == "infra-gitops"
-
-        kinds_in_list = {r["kind"] for r in enriched}
-        if kinds_in_list & {"connector", "service"}:
-            homelab_in_list = any(_is_homelab(r["resource_path"]) for r in enriched)
-            if not homelab_in_list:
-                homelab_row = next(
-                    (
-                        row
-                        for row in rows
-                        if _is_homelab((row.get("metadata") or {}).get("path"))
-                    ),
-                    None,
+        # Phase 2: rule-based expansion — a connector or service alert also
+        # investigates the infra repo, because the config that deploys the thing
+        # is as likely to be at fault as the thing.
+        #
+        # The repo is the one `infra_alert_routing.repo` names. It used to be
+        # found by path basename `== "infra-gitops"`, with `example/infra-gitops`
+        # as the fallback repo, so in any deployment whose infra repo is called
+        # something else — including the one this was written for, where it is
+        # `homelab-gitops` — the expansion silently never fired (#505).
+        if {r["kind"] for r in enriched} & {"connector", "service"}:
+            infra_row = await self._infra_repo_row()
+            already = {r["resource_id"] for r in enriched}
+            if infra_row is not None and str(infra_row["id"]) not in already:
+                imeta = _decode_metadata(infra_row)
+                enriched.append(
+                    {
+                        "resource_id": str(infra_row["id"]),
+                        "resource_title": infra_row["title"],
+                        "resource_path": imeta.get("path") or "",
+                        "github_repo": imeta.get("github_repo") or "",
+                        "kind": infra_row["kind"] or "repository",
+                        "confidence": 0.9,
+                    }
                 )
-                if homelab_row:
-                    hmeta = homelab_row.get("metadata") or {}
-                    enriched.append(
-                        {
-                            "resource_id": str(homelab_row["id"]),
-                            "resource_title": homelab_row["title"],
-                            "resource_path": hmeta.get("path", "infra-gitops"),
-                            "github_repo": hmeta.get("github_repo", "example/infra-gitops"),
-                            "kind": homelab_row.get("kind", "repository"),
-                            "confidence": 0.9,
-                        }
-                    )
 
         primary = enriched[0]
         resource_id = primary["resource_id"]
