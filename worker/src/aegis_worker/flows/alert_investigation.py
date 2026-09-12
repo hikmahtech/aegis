@@ -634,6 +634,10 @@ class AlertInvestigationFlow:
         # behavior instead of non-deterministically diverging mid-history.
         infra_cluster = ""
         owner_mention = ""
+        # What the cluster IS, in the operator's words (#505). Read off the
+        # routing result the activity below already returns, so this needs no
+        # patch: an old history replays a dict without the key and gets "".
+        platform_hint = ""
         # None = the pre-#498 built-in infra list, which is what a history
         # recorded before the list moved to the DB must replay against.
         infra_alertnames: list[str] | None = None
@@ -645,6 +649,7 @@ class AlertInvestigationFlow:
             )
             infra_cluster = routing.get("infra_cluster") or ""
             owner_mention = routing.get("slack_owner_member_id") or ""
+            platform_hint = str(routing.get("platform_hint") or "").strip()
             if workflow.patched("infra-alertnames-from-settings"):
                 infra_alertnames = routing.get("infra_alertnames")
 
@@ -994,25 +999,32 @@ class AlertInvestigationFlow:
             pass
 
         # ── Step 5.5: Prepend infra context hint for infra alerts ──
-        # The coding agent investigates infra-gitops (ansible/swarm config).
-        # Give it an explicit framing so it doesn't look for application code.
+        # The coding agent investigates the infra repo's config, not
+        # application code. Say so, or it goes looking for a bug.
+        #
+        # The framing names no orchestrator: AEGIS does not know whether this
+        # deployment runs Swarm, k8s, Nomad or a handful of systemd units, and
+        # telling a k8s operator's agent to run `docker --context swarm` was
+        # one operator's setup baked into a public repo (#505). What the
+        # cluster is, and how to read it, is the `platform_hint` of the
+        # `infra_alert_routing` row.
         if _is_infra:
             labels_str = ""
             _labels = alert.get("labels") or {}
             if isinstance(_labels, dict) and _labels:
                 labels_str = ", ".join(f"{k}={v}" for k, v in _labels.items())
             infra_hint = (
-                "CONTEXT: This is a Docker Swarm / homelab infrastructure alert — "
-                "NOT an application code bug. Investigate cluster and service health "
-                "using the infra-gitops ansible config and swarm state "
-                "(e.g. `docker --context swarm node ls`, "
-                "`docker --context swarm service ps <service>`, "
-                "`docker --context swarm service logs <service>`). "
-                "Do NOT look for application source code — focus on ansible roles, "
-                "docker-compose/stack templates, and swarm service state."
+                "CONTEXT: This is an infrastructure alert — NOT an application "
+                "code bug. Investigate the health of the cluster and of the "
+                "service against the infra repo's own config (its roles, "
+                "manifests, stack and compose templates) and the live state of "
+                "the cluster itself. Do NOT look for application source code."
+            )
+            if platform_hint:
+                infra_hint += f"\nAbout this cluster: {platform_hint}"
+            infra_hint += (
                 " End your report with a PROPOSED_COMMANDS: section — one `- <command>` "
-                "line per safe, idempotent recovery command you recommend (max 5, "
-                "e.g. `- docker --context swarm service update --force <svc>`). "
+                "line per safe, idempotent recovery command you recommend (max 5). "
                 "Propose ONLY read-safe or idempotent commands; omit the section if "
                 "no command is warranted. The commands are NOT run automatically — "
                 "a human approves them."

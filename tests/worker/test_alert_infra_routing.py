@@ -159,6 +159,8 @@ async def test_get_alert_routing_config_activity():
         "slack_owner_member_id": "U042",
         # No pool: the generic defaults, never an empty list.
         "infra_alertnames": sorted(DEFAULT_INFRA_ALERTNAMES),
+        # Nobody's orchestrator by default (#505).
+        "platform_hint": "",
     }
 
 
@@ -412,6 +414,8 @@ async def _stub_get_alert_routing_config() -> dict:
     # Absent unless a test sets it — the shape a pre-#498 history recorded.
     if _flow_state.get("infra_alertnames") is not None:
         routing["infra_alertnames"] = _flow_state["infra_alertnames"]
+    if _flow_state.get("platform_hint") is not None:
+        routing["platform_hint"] = _flow_state["platform_hint"]
     return routing
 
 
@@ -730,8 +734,10 @@ async def test_custom_infra_agent_receives_delivery():
 
 # ── Issue #498: a claimed Dagster failure is investigated as application code ──
 
-# The infra framing the flow prepends to the knowledge context (Step 5.5).
-_INFRA_HINT = "Docker Swarm / homelab infrastructure alert"
+# The infra framing the flow prepends to the knowledge context (Step 5.5). It
+# names no orchestrator (#505): what the cluster is comes from the routing
+# row's `platform_hint`, asserted separately below.
+_INFRA_HINT = "This is an infrastructure alert"
 
 # The shape AlertInvestigationFlow receives for a Dagster run failure in prod.
 _DAGSTER_LABELS = {
@@ -826,6 +832,28 @@ async def test_unclaimed_dagster_failure_keeps_the_infra_investigation():
     assert args["resources"][0]["github_repo"] == "example/infra-gitops"
     assert args["allow_fix"] is False
     assert _INFRA_HINT in args["runbook"]
+    # Nothing claims to know the orchestrator when the row does not say.
+    assert "docker" not in args["runbook"].lower()
+
+
+async def test_the_operator_says_what_the_cluster_is():
+    """The framing names no orchestrator, so telling the agent how to read the
+    cluster is the `platform_hint` of the routing row (#505). Before this, every
+    infra investigation in every fork was told to run `docker --context swarm`.
+
+    Falsifiable: drop `platform_hint` from the activity's result and the hint
+    never reaches the investigation.
+    """
+    _hub_reset()
+    _reset_flow(infra_alertnames=["nodedown", "dagster pipeline failure"])
+    hint = "This cluster is k3s. Read it with `kubectl --context homelab get pods -A`."
+    _flow_state["platform_hint"] = hint
+
+    await _run_dagster_flow("test-dagster-platform-hint")
+
+    runbook = _flow_state["run_investigation_args"]["runbook"]
+    assert f"About this cluster: {hint}" in runbook
+    assert _INFRA_HINT in runbook
 
 
 async def test_the_configured_list_decides_infra_inside_the_flow():

@@ -579,12 +579,19 @@ _MATCH_TOKEN_RE = re.compile(r"[a-z0-9]+")
 # appears in almost every Dagster alert title AND in a repo literally named
 # "*-pipeline"; matching on it would false-positive. Deliberately small/local
 # to this matcher, not a general stopword list.
+#
+# Every word here is language or alert vocabulary. A PRODUCT name does not
+# belong: `dagster` was in the list, which is one deployment's stack in an
+# open-source repo, and it stopped a fork whose repo is named after its
+# orchestrator from ever token-matching (#505). An alertname shared by every
+# repo is what `metadata.alert_labels` claims are for (#498); that is the
+# designed answer, not a stopword.
 _GENERIC_MATCH_TOKENS = frozenset(
     {
         "the", "a", "an", "is", "of", "to", "in", "on", "for", "and", "or",
         "down", "up", "unreachable", "failed", "failure", "error", "errors",
         "alert", "critical", "warning", "warn", "service", "endpoint", "repo",
-        "pipeline", "job", "run", "dagster", "http", "https", "www",
+        "pipeline", "job", "run", "http", "https", "www",
         "com", "org", "io", "net", "unknown", "none", "true", "false",
         "prod", "production", "staging", "dev", "class", "type", "message",
     }
@@ -599,6 +606,11 @@ _MIN_MATCH_TOKEN_LEN = 4
 # "Dagster Pipeline Failure" fires for every Dagster pipeline in every repo,
 # so including it would make every such alert token-match every repo whose
 # name contains "pipeline".
+#
+# `run_id` stays (#505 asked): the key NAMES an identifier of one run, so it is
+# non-identifying of a repo by construction, whoever emits it — the same reason
+# `job` and `grafana_folder` are here. Unlike a product name, it carries no
+# deployment's vocabulary.
 _NON_IDENTIFYING_LABEL_KEYS = frozenset(
     {"alertname", "severity", "cluster", "environment", "job", "grafana_folder", "run_id"}
 )
@@ -766,12 +778,15 @@ class AlertActivities:
         Settings/DB — mirror of the AgentRegistryActivities pattern).
 
         `infra_alertnames` is the effective infra list from the
-        `infra_alert_routing` settings row (generic defaults when unset)."""
+        `infra_alert_routing` settings row (generic defaults when unset), and
+        `platform_hint` is that row's description of what the cluster is,
+        which the flow puts in front of an infra investigation (#505)."""
         routing = await get_infra_alert_routing(self.db_pool)
         return {
             "infra_cluster": self.infra_cluster,
             "slack_owner_member_id": self.slack_owner_member_id,
             "infra_alertnames": routing["alertnames"],
+            "platform_hint": routing["platform_hint"],
         }
 
     async def _claimed_resource(self, alert: dict) -> dict | None:
@@ -1791,37 +1806,27 @@ class AlertActivities:
         if not enriched:
             return null_result
 
-        # Phase 2: rule-based expansion — connector/service → add infra-gitops.
-        # Matched on the path BASENAME: the workspace-relative path is nested
-        # ("infrastructure/infra-gitops").
-        def _is_homelab(path: Any) -> bool:
-            return str(path or "").rstrip("/").rsplit("/", 1)[-1] == "infra-gitops"
-
-        kinds_in_list = {r["kind"] for r in enriched}
-        if kinds_in_list & {"connector", "service"}:
-            homelab_in_list = any(_is_homelab(r["resource_path"]) for r in enriched)
-            if not homelab_in_list:
-                homelab_row = next(
-                    (
-                        row
-                        for row in rows
-                        if _is_homelab((row.get("metadata") or {}).get("path"))
-                    ),
-                    None,
-                )
-                if homelab_row:
-                    hmeta = homelab_row.get("metadata") or {}
-                    enriched.append(
-                        {
-                            "resource_id": str(homelab_row["id"]),
-                            "resource_title": homelab_row["title"],
-                            "resource_path": hmeta.get("path", "infra-gitops"),
-                            "github_repo": hmeta.get("github_repo", "example/infra-gitops"),
-                            "kind": homelab_row.get("kind", "repository"),
-                            "confidence": 0.9,
-                        }
-                    )
-
+        # There WAS a "Phase 2" here: when the LLM picked a connector or a
+        # service, the infra repo was appended so the config that deploys a
+        # thing was investigated beside the thing. It is gone (#505), because
+        # it could not run.
+        #
+        # Both candidate queries above are gated on
+        # `kind = 'repository' AND coding_enabled = 'true'` — the allow-list
+        # that keeps an unrelated resource out of a live shell-and-PR run, added
+        # in #35. `enriched` is built only from those rows, so every `kind` in
+        # it is `repository` and the connector/service test was unsatisfiable
+        # from the day the allow-list landed. The basename bug #505 reported
+        # (matching `infra-gitops` while this deployment's repo is
+        # `homelab-gitops`) was real, and fixing it changed nothing: the branch
+        # holding it was already unreachable.
+        #
+        # It is not worth making reachable. An infra alert already investigates
+        # the infra repo directly (`resolve_infra_resource`), which is the case
+        # the expansion was for; and this path runs with `allow_fix=True`, so
+        # widening the candidate query to admit connectors would put a
+        # non-allowlisted repo into a fix-capable coding run — the exact thing
+        # the allow-list exists to prevent.
         primary = enriched[0]
         resource_id = primary["resource_id"]
         resource_title = primary["resource_title"]
