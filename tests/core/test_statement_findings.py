@@ -92,6 +92,7 @@ def make_candidate(
 
 def run_match(rows, candidates=(), **kw):
     kw.setdefault("declared", ())
+    kw.setdefault("currency", "INR")
     return match_statements(list(rows), list(candidates), **kw)
 
 

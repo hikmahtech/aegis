@@ -1568,7 +1568,7 @@
             "items": {
               "type": "string"
             },
-            "description": "extra hledger arguments, e.g. [\"-X\", \"\u20b9\", \"-p\", \"thismonth\", \"expenses\", \"--depth\", \"2\"]."
+            "description": "extra hledger arguments, e.g. [\"-p\", \"thismonth\", \"expenses\", \"--depth\", \"2\"]."
           },
           "output": {
             "type": "string",
@@ -1612,8 +1612,8 @@
           },
           "entity": {
             "type": "string",
-            "description": "personal or hikmah \u2014 which set of books. Every expense and income account already belongs to one of them (expenses:hikmah:* and income:hikmah:* are hikmah, any other is personal), so the entity has to agree with the accounts posted; asset, liability and equity accounts belong to both and fit either.",
-            "default": "personal"
+            "description": "which set of books to file this in; leave it out for the main one. Each expense and income account already belongs to exactly one set of books, so the entity has to agree with the accounts posted; asset, liability and equity accounts belong to all of them and fit any entity.",
+            "default": ""
           },
           "note": {
             "type": "string",
@@ -1633,7 +1633,7 @@
     "type": "function",
     "function": {
       "name": "ledger_reclassify",
-      "description": "Move a posting to another account (and optionally rename its payee) by its books message id (`<mailbox>/<gmail id>` for a posting from mail, or `manual/<hash>` for one `ledger_post` wrote). The new account must be one the posting's own set of books can use: an expense or income account of that entity, or any asset, liability or equity account, which both sets share.",
+      "description": "Move a posting to another account (and optionally rename its payee) by its books message id (`<mailbox>/<gmail id>` for a posting from mail, or `manual/<hash>` for one `ledger_post` wrote). The new account must be one the posting's own set of books can use: an expense or income account of that entity, or any asset, liability or equity account, which every set of books shares.",
       "parameters": {
         "type": "object",
         "properties": {
@@ -1675,7 +1675,7 @@
           },
           "entity": {
             "type": "string",
-            "description": "personal or hikmah. Optional \u2014 an expense or income account already says which set of books it belongs to, so leaving this out takes the account's own entity (expenses:hikmah:* and income:hikmah:* are hikmah, any other expense or income account is personal). Asset, liability and equity accounts belong to both, and a rule on one gets no entity."
+            "description": "which set of books the rule files into. Optional \u2014 an expense or income account already says which one it belongs to, so leaving this out takes the account's own entity. Asset, liability and equity accounts belong to all of them, and a rule on one gets no entity."
           },
           "direction": {
             "type": "string",

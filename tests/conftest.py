@@ -309,6 +309,15 @@ def test_settings() -> Settings:
     return Settings(**_TEST_REQUIRED_SETTINGS)
 
 
+@pytest.fixture
+def chart():
+    """The chart of accounts the money lane reads in these tests — this
+    deployment's real one, from `tests/books_chart_data.py` (#560)."""
+    from tests.books_chart_data import CHART
+
+    return CHART
+
+
 def _make_pool_acquire(fetchval_return=None):
     """Return a MagicMock for pool.acquire() that supports `async with pool.acquire() as conn`.
 

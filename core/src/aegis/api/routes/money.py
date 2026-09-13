@@ -1,11 +1,12 @@
 """Admin endpoints for Maou's money: the books, the bills, the statements and
 the trading desk.
 
-Everything here reads, apart from the flow trigger and the desk's own market
-settings. The desk holds real paper positions and the journal is the owner's
-real accounting, so the page can show and cannot trade: the one write is
-configuration (which market, which currency, which tax law), checked by
-`desk_rules` before it is stored.
+Everything here reads, apart from the flow trigger, the desk's own market
+settings and the books' chart of accounts. The desk holds real paper positions
+and the journal is the owner's real accounting, so the page can show and cannot
+trade or post: the only writes are configuration — which market, which
+currency, which tax law (`desk_rules`), and which sets of books exist and which
+category posts where (`books_chart`) — each checked before it is stored.
 
 Two rules run through the whole module:
 
@@ -38,7 +39,7 @@ from aegis.api.auth import verify_auth
 from aegis.api.deps import get_settings
 from aegis.api.routes._flow_trigger import require_temporal_client, start_named_workflow
 from aegis.config import Settings
-from aegis.services import books, desk_math, desk_rules, trading_desk
+from aegis.services import books, books_chart, desk_math, desk_rules, trading_desk
 from aegis.services.journal_index import OPEN_DUE_SQL, TICKED_OFF_SQL
 from aegis.services.money_format import currency_symbol
 
@@ -793,6 +794,32 @@ async def desk_history(
             for p in plans
         ],
     }
+
+
+@router.get("/chart")
+async def books_chart_state(request: Request) -> dict:
+    """The chart of accounts, as the money lane itself reads it.
+
+    Through `books_chart.merge`, the same lenient read every post goes through,
+    so the form can never show a second opinion of where a transaction will be
+    filed. `stored` is false while a deployment is still on the code default.
+    """
+    return await books_chart.read(request.app.state.db_pool)
+
+
+@router.put("/chart")
+async def put_books_chart(request: Request, body: dict[str, Any]) -> dict:
+    """Save the chart of accounts. 400 on anything that would not work, rather
+    than a 200 that stores a typo and then misfiles transactions for months.
+
+    A REPLACEMENT, not a merge: an entity or a category the form did not send
+    is one the operator removed. Nothing is written when the check fails, and
+    the money lane re-reads the row on every post, so a save needs no deploy.
+    """
+    try:
+        return await books_chart.save_chart(request.app.state.db_pool, body)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @router.get("/desk/rules")

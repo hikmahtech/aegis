@@ -291,7 +291,7 @@ class MoneyEvent(BaseModel):
     instrument: str | None = None          # hdfc-1225, axis-cc-1313, nkgsb-843
     occurred_on: date | None = None
     due_on: date | None = None
-    entity: Literal["personal", "hikmah", "none"] = "personal"
+    entity: str = "personal"                # an entity id from the chart, or "none" (#560)
     account: str | None = None             # counter account, e.g. expenses:saas
     category: str | None = None            # LLM's closed vocab, mapped to account
     ref: str | None = None                 # UPI/IMPS/SWIFT reference
@@ -351,7 +351,46 @@ for statements-available, KYC and balance notices; `kind: ignore` for
 newsletters and marketing.
 
 `category` is a closed vocabulary mapped to accounts by
-`services/books.py::account_for(category, direction, entity)`:
+`services/books.py::account_for(chart, category, direction, entity)`.
+
+**AMENDED 2026-09-13 (#560): the chart is configuration, not code.** AEGIS is
+forked and configured for someone else's life, so which sets of books exist,
+what they are called, which account-name segment marks each one, and which
+category posts where all live in the `settings` row keyed `books_chart`, read
+on every post. `services/books_chart.py` is the one owner — a lenient `merge`
+(the money lane must never stop posting because a row is odd), a strict
+`validate` (a typo must not save with a 200 and misfile for months), and a
+`Chart` object carrying `resolve` / `unknown` / `account_for` / `entity_of` so
+nothing re-derives "which set of books is this?". `books.UNKNOWN`,
+`books._ACCOUNT_MAP` and `books._INCOME_CATEGORIES` are gone, and
+`books.account_for` / `books.account_entity` take the chart as a REQUIRED
+argument, so a call site that forgets is a test failure rather than a
+transaction quietly filed under the wrong entity. `MoneyEvent.entity` is a
+validated `str` (an entity id or `"none"`), never checked against the chart —
+the worker, the chat tools and the tests all build events with no pool — and an
+unconfigured name resolves to the default entity at posting time, which is
+exactly what anything other than `hikmah` did before.
+
+The `:hikmah:` test in `account_entity` generalises to an entity's `segment`;
+the default entity's segment is empty, so it owns every expense and income
+account no other entity claims. Assets, liabilities and equity stay
+entity-NEUTRAL, which is what four cross-entity guards return early on.
+
+The code default (`books_chart.DEFAULT_CHART`) names nobody: one entity,
+`personal`, no segment, and the generic categories. Migration
+`049_books_chart.sql` seeds a live deployment with exactly the table below, so
+the day after the deploy posts where the day before did. Edited on the admin
+Money page (`GET/PUT /api/admin/money/chart`, `ChartPanel.tsx`).
+
+The books' currency is `settings.home_currency` too, carried on
+`BooksConfig.currency`: the five places that wrote `"INR"` — `render_manual`,
+`cleared_movement_sync`'s `-X`, `ledger_write`'s index row, `event_for`'s
+statement row and `match_statements` — now read it. `bank_parsers.py` keeps its
+`currency="INR"` literals: those are facts about the Indian bank mail those
+parsers read, not configuration, and a fork that gets mail from a different
+bank writes a different parser.
+
+What follows is the SEEDED EXAMPLE, one operator's two sets of books:
 
 | category | personal | hikmah |
 |---|---|---|

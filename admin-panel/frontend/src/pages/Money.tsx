@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 import { api } from '../api/client';
 import ErrorBanner from '../components/ErrorBanner';
+import ChartPanel from '../components/ChartPanel';
 import MoneyAccounting from '../components/MoneyAccounting';
 import { fmtMoney } from '../lib/money';
 
@@ -151,6 +152,8 @@ export default function Money() {
       )}
 
       <MoneyAccounting />
+
+      <ChartPanel />
 
       <section className="section">
         <div className="section-header-row">

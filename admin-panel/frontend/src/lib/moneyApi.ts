@@ -282,6 +282,37 @@ export type DeskRules = {
   retired_keys: string[];
 };
 
+// ------------------------------------------------------- the chart of accounts
+
+/** One set of books. */
+export type ChartEntity = {
+  label: string;
+  /**
+   * The account-name segment that marks an account as this entity's:
+   * `expenses:<segment>:*` and `income:<segment>:*` are its. The DEFAULT
+   * entity's is empty — it owns every expense and income account no other
+   * entity claims.
+   */
+  segment: string;
+  /** Where a posting goes when nothing says where it belongs, per side. */
+  unknown: { in: string; out: string };
+  /** category name → account. */
+  categories: Record<string, string>;
+};
+
+export type BooksChart = {
+  default_entity: string;
+  /** Categories that mean money coming in, whatever direction the mail stated. */
+  income_categories: string[];
+  entities: Record<string, ChartEntity>;
+};
+
+export type BooksChartState = {
+  /** False while the deployment is still on the code default. */
+  stored: boolean;
+  chart: BooksChart;
+};
+
 // ----------------------------------------------------------------- the fetchers
 
 export const moneyApi = {
@@ -299,6 +330,13 @@ export const moneyApi = {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(values),
+    }),
+  chart: () => apiFetch<BooksChartState>('/api/admin/money/chart'),
+  saveChart: (chart: BooksChart) =>
+    apiFetch<BooksChartState>('/api/admin/money/chart', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(chart),
     }),
 };
 

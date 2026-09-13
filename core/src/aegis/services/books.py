@@ -26,6 +26,7 @@ import structlog
 import yaml
 
 from aegis.api.models.money import MoneyEvent
+from aegis.services.books_chart import Chart as BooksChart
 from aegis.services.money_format import fmt_money  # noqa: F401 — re-export (spec §5.1)
 
 logger = structlog.get_logger()
@@ -33,46 +34,13 @@ logger = structlog.get_logger()
 _SYMBOL = {"INR": "₹", "USD": "$", "GBP": "£", "EUR": "€"}
 _CENT = Decimal("0.01")
 
-UNKNOWN = {
-    "personal": {"out": "expenses:unknown", "in": "income:unknown"},
-    "hikmah": {"out": "expenses:hikmah:unknown", "in": "income:hikmah:other"},
-}
 
-# spec §4 — category → account, per entity. Missing key ⇒ the unknown account.
-_ACCOUNT_MAP: dict[str, dict[str, str]] = {
-    "personal": {
-        "saas": "expenses:saas",
-        "media": "expenses:media",
-        "infra": "expenses:saas",
-        "internet": "expenses:utilities:internet",
-        "electricity": "expenses:utilities:electricity",
-        "mobile": "expenses:utilities:mobile",
-        "groceries": "expenses:groceries",
-        "food": "expenses:food",
-        "transport": "expenses:transport",
-        "shopping": "expenses:shopping",
-        "health": "expenses:health",
-        "insurance": "expenses:insurance",
-        "fees": "expenses:fees:bank",
-        "tax": "expenses:tax",
-        "people": "expenses:people",
-        "salary": "income:salary",
-        "interest": "income:interest",
-        "refund": "income:refunds",
-    },
-    "hikmah": {
-        "saas": "expenses:hikmah:saas",
-        "media": "expenses:hikmah:saas",
-        "infra": "expenses:hikmah:infra",
-        "internet": "expenses:hikmah:internet",
-        "fees": "expenses:hikmah:fees:bank",
-        "tax": "expenses:hikmah:tax",
-        "professional": "expenses:hikmah:professional",
-        "ads": "expenses:hikmah:ads",
-    },
-}
-
-_INCOME_CATEGORIES = frozenset({"salary", "interest", "refund"})
+def commodity(currency: str) -> str:
+    """The commodity hledger will have written for a currency: its symbol when
+    there is one, otherwise the ISO code — the same rule `render_amount` uses
+    to put it in the file, so a query can ask for what the blocks say."""
+    code = re.sub(r"[^A-Za-z]", "", currency or "")[:3].upper()
+    return _SYMBOL.get(code) or code
 
 
 def render_amount(amount: Decimal, currency: str, *, negative: bool = False) -> str:
@@ -93,45 +61,23 @@ def render_amount(amount: Decimal, currency: str, *, negative: bool = False) -> 
     return f"{sign}{sym}{q}" if sym else f"{sign}{q} {code}".strip()
 
 
-def account_for(category: str | None, direction: str | None, entity: str) -> str:
-    """Counter account for an event (spec §4). Unknown ⇒ the entity's unknown account."""
-    ent = "hikmah" if entity == "hikmah" else "personal"
-    side = "in" if direction == "in" or (category or "") in _INCOME_CATEGORIES else "out"
-    if side == "in" and ent == "hikmah":
-        return "income:hikmah:other"
-    mapped = _ACCOUNT_MAP[ent].get((category or "").lower())
-    if mapped and (mapped.startswith("income:") == (side == "in")):
-        return mapped
-    return UNKNOWN[ent][side]
+def account_for(
+    chart: BooksChart, category: str | None, direction: str | None, entity: str
+) -> str:
+    """Counter account for an event (spec §4). Unknown ⇒ the entity's unknown account.
 
-
-def account_entity(account: str) -> str | None:
-    """Which set of books an account belongs to, or None when it belongs to
-    both.
-
-    Only the expense and income trees carry an entity — the business side is
-    the `:hikmah:` segment (`_ACCOUNT_MAP`). Assets, liabilities and equity are
-    entity-NEUTRAL by design: `post_event` writes `assets:bank:hdfc:1225` into
-    both sets of books through `instrument_account`, which has no notion of
-    entity at all, and the chart declares `equity:transfers` precisely for a
-    move between one's own accounts. Treating those as personal would refuse a
-    real correction — a hikmah posting moved onto the shared bank account —
-    for no gain, since the hazard the callers guard against (an
-    `expenses:hikmah:*` posting filed in `personal/2026.journal`) lives
-    entirely in the two trees this does cover.
-
-    Four callers rely on it and all four guard the same hazard from a different
-    door: `ledger_post` refuses to write an account into the other set of
-    books, `ledger_reclassify` refuses a cross-entity move, `ledger_add_rule`
-    defaults an omitted `entity` and refuses one that contradicts the account,
-    and the curiosity answer hook stamps the rule it writes with no human in
-    the loop at all. `ledger_post` was the door that stood open: its write
-    balanced and passed `check --strict`, and `ledger_reclassify` then refused
-    to undo it, so the repair path was narrower than the path in.
+    The chart is a required argument, not a default: a call site that forgets
+    it is a test failure rather than a transaction quietly filed under the
+    wrong set of books. `Chart.account_for` holds the rules.
     """
-    if not account.startswith(("expenses:", "income:")):
-        return None
-    return "hikmah" if ":hikmah:" in f"{account}:" else "personal"
+    return chart.account_for(category, direction, entity)
+
+
+def account_entity(chart: BooksChart, account: str) -> str | None:
+    """Which set of books an account belongs to, or None when it belongs to
+    both. `Chart.entity_of` holds the reasoning, which is load-bearing for the
+    four callers that guard a cross-entity write."""
+    return chart.entity_of(account)
 
 
 def _same_tail(a: str, b: str) -> bool:
@@ -255,11 +201,17 @@ class BooksConfig:
     repo_url: str = ""
     deploy_key: Path | None = None
     main: str = "main.journal"
+    #: The currency the books report in — `settings.home_currency`, carried
+    #: here so everything that renders a block or asks hledger to convert one
+    #: takes the same answer. Same default as `Settings.home_currency`; change
+    #: them together.
+    currency: str = "INR"
 
 
 def config_from_settings(settings) -> BooksConfig:
     key = Path(getattr(settings, "gmail_token_dir", "config/")) / "books_deploy_key"
     return BooksConfig(
+        currency=getattr(settings, "home_currency", "INR") or "INR",
         path=Path(getattr(settings, "books_path", "/app/config/books")),
         repo_url=getattr(settings, "books_repo_url", "") or "",
         deploy_key=key if key.exists() else None,
@@ -303,7 +255,7 @@ def parse_csv_set(raw: str) -> frozenset[str]:
 
 
 def parse_kv(raw: str) -> dict[str, str]:
-    """`"personal=6h2f, hikmah = 6h2g"` → `{"personal": "6h2f", ...}`.
+    """`"personal=6h2f, acme = 6h2g"` → `{"personal": "6h2f", "acme": "6h2g"}`.
 
     Lenient by design: a malformed pair is dropped, never raised — these are
     admin-typed strings and a typo must not take a boot path down.
@@ -488,9 +440,16 @@ def render_transaction(
     return "\n".join(lines) + "\n"
 
 
-def render_manual(d: date, payee: str, postings: list[dict], msgid: str, note: str = "") -> str:
+def render_manual(
+    d: date, payee: str, postings: list[dict], msgid: str, note: str = "", *, currency: str
+) -> str:
     """One hand-written block: the same header lines as `render_transaction`,
     then one posting line per entry (`{"account", "amount", "currency"}`).
+
+    `currency` is the books' home currency and is what a posting that names
+    none is rendered in. It has no default because this block's text IS its
+    identity — `ledger_write.manual_msgid` digests it — so a caller that
+    guessed would give the same transaction two ids.
 
     Two differences from `render_transaction`, both deliberate:
 
@@ -517,7 +476,7 @@ def render_manual(d: date, payee: str, postings: list[dict], msgid: str, note: s
             amount = ""
         else:
             value = Decimal(str(raw))
-            amount = render_amount(value, p.get("currency") or "INR", negative=value < 0)
+            amount = render_amount(value, p.get("currency") or currency, negative=value < 0)
         lines.append(_posting(str(p.get("account") or ""), amount))
     return "\n".join(lines) + "\n"
 
@@ -1125,12 +1084,13 @@ def cleared_movement_sync(
     statement reverts, the caller records a finding naming the commodity, and
     the run carries on.
     """
+    home = commodity(cfg.currency)
     proc = _spawn(
         [
             "hledger", "-f", cfg.main, "balance", account,
             "-b", start.isoformat(),
             "-e", (end + timedelta(days=1)).isoformat(),
-            "--cleared", "-X", _SYMBOL["INR"], "--no-total", "--flat", "-O", "csv",
+            "--cleared", "-X", home, "--no-total", "--flat", "-O", "csv",
         ],
         cwd=str(cfg.path),
         timeout=30,
@@ -1146,13 +1106,11 @@ def cleared_movement_sync(
         if not parts or len(parts[0]) < 2:
             continue
         cell = parts[0][1].replace("\u00a0", "").replace("\u202f", "")
-        unpriced = {
-            symbol for symbol in _COMMODITY_RE.findall(cell) if symbol != _SYMBOL["INR"]
-        }
+        unpriced = {symbol for symbol in _COMMODITY_RE.findall(cell) if symbol != home}
         if unpriced:
             raise BooksCheckError(
                 f"cleared movement for {account} {start}..{end} is not all "
-                f"{_SYMBOL['INR']}: no price for {', '.join(sorted(unpriced))} "
+                f"{home}: no price for {', '.join(sorted(unpriced))} "
                 f"on these dates — hledger says {cell}"
             )
         digits = re.sub(r"[^\d.\-]", "", cell)
@@ -1198,7 +1156,7 @@ def _ensure_journal_file(cfg: BooksConfig, rel: str) -> Path:
 
 
 async def post_event(
-    event: MoneyEvent, msgid: str, cfg: BooksConfig, *, status: str = "!"
+    event: MoneyEvent, msgid: str, cfg: BooksConfig, *, chart: BooksChart, status: str = "!"
 ) -> str:
     """Append one transaction block. Idempotent on msgid. Returns the
     journal file's relative path.
@@ -1225,11 +1183,11 @@ async def post_event(
                 posted.append(str(existing.relative_to(cfg.path)))
                 return
         declared = _declared_accounts_sync(cfg)
-        counter = event.account or account_for(event.category, event.direction, event.entity)
+        counter = event.account or chart.account_for(
+            event.category, event.direction, event.entity
+        )
         if declared and counter not in declared:
-            counter = UNKNOWN["hikmah" if event.entity == "hikmah" else "personal"][
-                "in" if event.direction == "in" else "out"
-            ]
+            counter = chart.unknown(event.entity, "in" if event.direction == "in" else "out")
         instrument = instrument_account(event.instrument, declared)
         posted.append(rel)
         path = _ensure_journal_file(cfg, rel)
