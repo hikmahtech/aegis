@@ -298,6 +298,7 @@ def create_app(run_lifespan: bool = True, settings: Settings | None = None) -> F
         people_admin,
         problems_admin,
         references,
+        research_admin,
         resources,
         runbooks_admin,
         settings,
@@ -355,6 +356,7 @@ def create_app(run_lifespan: bool = True, settings: Settings | None = None) -> F
     app.include_router(agents.admin_router)
     app.include_router(gmail_reauth.router)
     app.include_router(email_admin.router)
+    app.include_router(research_admin.router)
     app.include_router(social_auth.router)
     app.include_router(chat.router)
     app.include_router(knowledge.router)

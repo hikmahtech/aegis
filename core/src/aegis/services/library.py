@@ -9,8 +9,11 @@ of 10,284 were ever used — so a book's text is read on demand here, bounded,
 cited, and not stored.
 
 Configuration is the Integrations page (`calibre_url`, `calibre_user`,
-`calibre_password`); a connector is built from those values on first use and
-rebuilt when they change, so core needs no restart after a save.
+`calibre_password`, plus the `calibre_max_book_mb` and `calibre_max_books`
+caps); a connector is built from those values on first use and rebuilt when
+they change, so core needs no restart after a save. The reading limits
+(`read_chars`, passages, research hits…) are the `library_config` settings
+row (`services/library_config.py`); the constants below are its defaults.
 """
 
 from __future__ import annotations
@@ -28,21 +31,30 @@ from xml.etree import ElementTree as ET
 
 import structlog
 
-from aegis.connectors.calibre import DEFAULT_URL, CalibreConnector, CalibreError, html_to_text
+from aegis.connectors.calibre import (
+    MAX_BOOKS,
+    MAX_DOWNLOAD_BYTES,
+    CalibreConnector,
+    CalibreError,
+    html_to_text,
+)
+from aegis.services import library_config as lcfg
 
 logger = structlog.get_logger()
 
 BOOK_SOURCE_TYPE = "book"
-# What a read returns by default, and the most it will ever return.
-READ_CHARS = 12_000
+# What a read returns by default (`library_config.read_chars`), and the most
+# it will ever return — a schema cap, kept in code.
+READ_CHARS = int(lcfg.DEFAULTS["read_chars"])
 MAX_READ_CHARS = 40_000
 # Passage search: this many best windows of about this many characters.
-PASSAGES = 4
-PASSAGE_CHARS = 1_200
+PASSAGES = int(lcfg.DEFAULTS["passages"])
+PASSAGE_CHARS = int(lcfg.DEFAULTS["passage_chars"])
 # A PDF read with no pages, section or query returns the opening pages.
-PDF_DEFAULT_PAGES = 5
-# The most pages one read returns, and the most a query scans. pdfminer is
-# slow on a long textbook, and the chat tool's budget is LIBRARY_READ_TIMEOUT_S.
+PDF_DEFAULT_PAGES = int(lcfg.DEFAULTS["pdf_default_pages"])
+# The most pages one read returns (a schema cap), and the most a query scans.
+# pdfminer is slow on a long textbook, and the chat tool's budget is
+# LIBRARY_READ_TIMEOUT_S.
 PDF_MAX_SPAN = 30
 PDF_QUERY_SCAN_PAGES = 150
 # The formats that can be read. MOBI/AZW3 would need Calibre's own converter.
@@ -51,21 +63,21 @@ READABLE_FORMATS = ("EPUB", "PDF")
 LIBRARY_READ_TIMEOUT_S = 150
 # Research (ResearchFlow's gather step): how many books to consider, and how
 # close the best one must be before a passage is read from it.
-RESEARCH_BOOK_HITS = 3
-RESEARCH_PASSAGE_MIN_SIMILARITY = 0.5
-RESEARCH_PASSAGE_CHARS = 3_000
+RESEARCH_BOOK_HITS = int(lcfg.DEFAULTS["research_book_hits"])
+RESEARCH_PASSAGE_MIN_SIMILARITY = float(lcfg.DEFAULTS["research_passage_min_similarity"])
+RESEARCH_PASSAGE_CHARS = int(lcfg.DEFAULTS["research_passage_chars"])
 # Research reads under ResearchFlow's gather budget, so it scans fewer PDF
 # pages than a chat read and gives up on the passage after this long.
-RESEARCH_PDF_SCAN_PAGES = 60
+RESEARCH_PDF_SCAN_PAGES = int(lcfg.DEFAULTS["research_pdf_scan_pages"])
 RESEARCH_LIBRARY_READ_S = 60
 
 NOT_CONFIGURED = (
-    "The Calibre library is not configured: set the calibre-web user and password "
-    "under Integrations → Calibre (library)."
+    "The Calibre library is not configured: set the calibre-web URL, user and "
+    "password under Integrations → Calibre (library)."
 )
 
 # One live connector, keyed on the config it was built from.
-_connectors: dict[tuple[str, str, str], CalibreConnector] = {}
+_connectors: dict[tuple, CalibreConnector] = {}
 
 
 # --------------------------------------------------------------------------
@@ -74,29 +86,54 @@ _connectors: dict[tuple[str, str, str], CalibreConnector] = {}
 
 
 def calibre_settings(settings: Any) -> tuple[str, str, str]:
-    """(url, user, password) from the Settings overlay, the URL defaulting to
-    the internal swarm address."""
-    url = (getattr(settings, "calibre_url", "") or "").strip() or DEFAULT_URL
+    """(url, user, password) from the Settings overlay. No default URL: a
+    blank one is "not configured"."""
+    url = (getattr(settings, "calibre_url", "") or "").strip()
     return url, getattr(settings, "calibre_user", "") or "", getattr(settings, "calibre_password", "") or ""
 
 
+def _int_setting(settings: Any, field: str, default: int) -> int:
+    """An Integrations number: the overlay stores what the page saved, which
+    is a string, so it is coerced here and a bad value keeps the default."""
+    try:
+        n = int(str(getattr(settings, field, "") or "").strip() or default)
+    except (TypeError, ValueError):
+        return default
+    return n if n > 0 else default
+
+
+def calibre_limits(settings: Any) -> tuple[int, int]:
+    """(max download bytes, max books) from `calibre_max_book_mb` and
+    `calibre_max_books`, the code defaults when unset."""
+    mb = _int_setting(settings, "calibre_max_book_mb", MAX_DOWNLOAD_BYTES // (1024 * 1024))
+    return mb * 1024 * 1024, _int_setting(settings, "calibre_max_books", MAX_BOOKS)
+
+
 def connector_or_reason(settings: Any) -> tuple[CalibreConnector | None, str]:
-    """The connector, or (None, why): `not_configured`, or `refused: …` for a
-    URL on the public host."""
+    """The connector, or (None, why): `not_configured` when the URL, user or
+    password is blank, or `refused: …` for a URL that is not an http(s) address."""
     url, user, password = calibre_settings(settings)
-    if not (user and password):
+    if not (url and user and password):
         return None, "not_configured"
-    key = (url, user, hashlib.sha256(password.encode()).hexdigest())
+    max_bytes, max_books = calibre_limits(settings)
+    key = (url, user, hashlib.sha256(password.encode()).hexdigest(), max_bytes, max_books)
     conn = _connectors.get(key)
     if conn is None:
         try:
-            conn = CalibreConnector(url, user, password)
+            conn = CalibreConnector(
+                url, user, password, max_download_bytes=max_bytes, max_books=max_books
+            )
         except ValueError as exc:
             return None, f"refused: {exc}"
         # One config at a time: a changed password drops the old client.
         _connectors.clear()
         _connectors[key] = conn
     return conn, ""
+
+
+def limits_from(config: dict | None) -> dict:
+    """A merged `library_config` row, or the defaults when the caller has none."""
+    return dict(config) if isinstance(config, dict) and config else lcfg.merge(None)
 
 
 # --------------------------------------------------------------------------
@@ -324,20 +361,13 @@ def parse_pages(pages: str, count: int) -> tuple[int, int]:
 # --------------------------------------------------------------------------
 
 _WORD_RE = re.compile(r"[a-z0-9]{3,}")
-_STOP = frozenset(
-    {
-        "the", "and", "for", "with", "that", "this", "from", "are", "was", "were", "what",
-        "which", "when", "how", "why", "who", "whom", "into", "about", "have", "has", "had",
-        "not", "but", "you", "your", "our", "their", "its", "can", "will", "would", "could",
-        "should", "than", "then", "them", "they", "there", "these", "those", "also", "more",
-        "most", "such", "does", "did", "doing", "been", "being", "over", "under", "between",
-        "book", "books", "chapter",
-    }
-)
+# The default stopwords; `library_config.stopwords` is the live list.
+_STOP = frozenset(lcfg.DEFAULT_STOPWORDS)
 
 
-def query_terms(query: str) -> set[str]:
-    return {w for w in _WORD_RE.findall((query or "").lower()) if w not in _STOP}
+def query_terms(query: str, stopwords: Any = None) -> set[str]:
+    stop = frozenset(stopwords) if stopwords is not None else _STOP
+    return {w for w in _WORD_RE.findall((query or "").lower()) if w not in stop}
 
 
 def _windows(text: str, size: int) -> list[str]:
@@ -365,14 +395,19 @@ def _windows(text: str, size: int) -> list[str]:
 
 
 def best_passages(
-    parts: list[tuple[str, str]], query: str, *, k: int = PASSAGES, size: int = PASSAGE_CHARS
+    parts: list[tuple[str, str]],
+    query: str,
+    *,
+    k: int = PASSAGES,
+    size: int = PASSAGE_CHARS,
+    stopwords: Any = None,
 ) -> list[dict]:
     """The `k` windows that best match `query`, each with where it came from.
 
     Scored on distinct query terms first (a window that mentions three of the
     question's words beats one that repeats a single word), then on total hits.
     """
-    terms = query_terms(query)
+    terms = query_terms(query, stopwords)
     if not terms:
         return []
     scored: list[tuple[int, int, str, str]] = []
@@ -454,14 +489,21 @@ async def read_book(
     section: str = "",
     pages: str = "",
     query: str = "",
-    max_chars: int = READ_CHARS,
+    max_chars: int | None = None,
     pdf_scan_pages: int = PDF_QUERY_SCAN_PAGES,
+    limits: dict | None = None,
 ) -> dict:
     """Read from one book. `query` → the best-matching passages; `section`
     (EPUB) → one chapter; `pages` (PDF) → a page range; none → the opening.
     Every result carries a `cite`. Raises CalibreError when the library cannot
-    be read; returns {"error": …} for a request that cannot be met."""
-    max_chars = max(500, min(int(max_chars or READ_CHARS), MAX_READ_CHARS))
+    be read; returns {"error": …} for a request that cannot be met.
+
+    `limits` is a merged `library_config` row (the defaults when None):
+    `read_chars` when `max_chars` is not given, `passages`, `passage_chars`,
+    `pdf_default_pages` and `stopwords`."""
+    lim = limits_from(limits)
+    max_chars = max(500, min(int(max_chars or lim["read_chars"]), MAX_READ_CHARS))
+    passage_kw = {"k": int(lim["passages"]), "size": int(lim["passage_chars"]), "stopwords": lim["stopwords"]}
     book = await conn.get_book(book_id)
     if book is None:
         return {"error": f"there is no book {book_id} in the library"}
@@ -483,7 +525,9 @@ async def read_book(
         toc = [{"n": s["n"], "title": s["title"]} for s in sections][:80]
         if query:
             found = best_passages(
-                [(f"chapter {s['n']} ({s['title']})", s["text"]) for s in sections], query
+                [(f"chapter {s['n']} ({s['title']})", s["text"]) for s in sections],
+                query,
+                **passage_kw,
             )
             return {
                 "book": brief,
@@ -515,7 +559,9 @@ async def read_book(
     if query:
         last = min(count, max(1, int(pdf_scan_pages)))
         texts = await asyncio.to_thread(pdf_pages, data, 1, last)
-        found = best_passages([(f"p. {i + 1}", t) for i, t in enumerate(texts)], query)
+        found = best_passages(
+            [(f"p. {i + 1}", t) for i, t in enumerate(texts)], query, **passage_kw
+        )
         return {
             "book": brief,
             "format": fmt,
@@ -525,7 +571,9 @@ async def read_book(
             "pages_scanned": last,
         }
     try:
-        first, last = parse_pages(pages, count) if pages else (1, min(count, PDF_DEFAULT_PAGES))
+        first, last = (
+            parse_pages(pages, count) if pages else (1, min(count, int(lim["pdf_default_pages"])))
+        )
     except ValueError as exc:
         return {"error": str(exc), "book": brief, "page_count": count}
     texts = await asyncio.to_thread(pdf_pages, data, first, last)
