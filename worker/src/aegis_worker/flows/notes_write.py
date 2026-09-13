@@ -50,7 +50,7 @@ class NotesWriteFlow:
         try:
             result = await workflow.execute_activity(
                 "notes_write",
-                args=[inp.op, inp.payload],
+                args=[inp.op, inp.payload, inp.agent_id],
                 start_to_close_timeout=_WRITE_TIMEOUT,
                 retry_policy=_WRITE_RETRY,
             )

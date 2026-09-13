@@ -195,10 +195,12 @@ activities:
     config: {}
     active: true
 
-  # Raphael — nightly episodic diary (A8). One dated knowledge entry per day
-  # so retrieval has a timeline, not just topics. Cron 19:00 UTC = 00:30 IST,
-  # i.e. just after the IST day closes — the run's own UTC date IS the day
-  # being logged, so day_offset stays 0.
+  # Raphael — nightly episodic diary (A8). One dated entry per day so
+  # retrieval has a timeline, not just topics. The day is bounded in your
+  # `user_timezone` setting (Vault page), so the cron should fire just after
+  # midnight IN THAT TIMEZONE — then the run's own date IS the day being
+  # logged and day_offset stays 0. The seed's 19:00 UTC is just after midnight
+  # for a UTC+5:30 user; set yours on /admin/flows (crons are DB-owned).
   - slug: daylog-nightly
     workflow_type: DayLogFlow
     agent_id: raphael
@@ -207,10 +209,12 @@ activities:
     active: true
 
   # Raphael — weekly rollup (A9), same flow class with mode=weekly. Sunday
-  # 20:20 UTC: after the 19:00 UTC nightly entry for that same Sunday lands,
-  # so the ISO week (Mon-Sun) it summarises is complete. Minute :20 on
-  # purpose — minute :00 is the busiest slot in this file (two hourly flows
-  # plus every */N schedule land there), and :30 is the next busiest.
+  # 20:20 UTC: after the nightly entry for that same Sunday lands (the seed's
+  # 19:00), so the week it summarises — the vault layout's week, ISO Mon-Sun
+  # by default — is complete. Move it with the nightly cron if you change
+  # your timezone. Minute :20 on purpose — minute :00 is the busiest slot in
+  # this file (two hourly flows plus every */N schedule land there), and :30
+  # is the next busiest.
   - slug: daylog-weekly
     workflow_type: DayLogFlow
     agent_id: raphael
@@ -222,8 +226,9 @@ activities:
   # Raphael — monthly rollup (A9), mode=monthly. Cron has no last-day-of-month
   # operator, so this fires on days 28-31 and DayLogFlow's own guard drops
   # every run except the real month end (correct for February, 30- and
-  # 31-day months alike). 21:20 UTC on that day, i.e. after both the 19:00
-  # nightly entry and any 20:20 weekly run for the same date.
+  # 31-day months alike). 21:20 UTC on that day, i.e. after both the seed's
+  # 19:00 nightly entry and any 20:20 weekly run for the same date; keep that
+  # order if you move the nightly cron to your own timezone.
   - slug: daylog-monthly
     workflow_type: DayLogFlow
     agent_id: raphael
@@ -335,12 +340,16 @@ activities:
   # Integrations page has notes_repo_url AND notes_deploy_key. Minute :19 is odd
   # (the */2 stepper never lands on it), not a multiple of 5 (clear of */5,
   # */15, */30), not in the 3-58/5 stepper, and used by no other row.
-  # NOTE: `config` is DB-owned — tune max_files on /admin/flows, not here.
+  # `index_max_chars`: one note is indexed whole up to this many characters
+  # (a longer one is cut — that long, it is a paste, not a note). Where the
+  # notes live and what the index skips is the vault layout (Vault page).
+  # NOTE: `config` is DB-owned — tune max_files / index_max_chars on
+  # /admin/flows, not here.
   - slug: notes-sync-hourly
     workflow_type: NotesSyncFlow
     agent_id: raphael
     schedule_cron: "19 * * * *"
-    config: {max_files: 300}
+    config: {max_files: 300, index_max_chars: 100000}
     active: true
 
   # Raphael — the journal backfill (#514), weekly: the daylog's knowledge rows
@@ -350,14 +359,15 @@ activities:
   # `since_days: 14` looks only at rows filed in the last two weeks (two weekly
   # chances at each fallback day): the pre-vault rows are still in the store,
   # and rereading them every week would put back a block the user deleted
-  # from an old journal note. Inert (not_configured) until the vault is
-  # configured. Sunday 04:47 UTC: minute :47 is odd, not a multiple of 5, not
-  # in the 3-58/5 stepper, and used by no other row.
+  # from an old journal note. `batch` is entries per commit. Inert
+  # (not_configured) until the vault is configured. Sunday 04:47 UTC: minute
+  # :47 is odd, not a multiple of 5, not in the 3-58/5 stepper, and used by
+  # no other row. NOTE: `config` is DB-owned — tune it on /admin/flows.
   - slug: notes-backfill-weekly
     workflow_type: NotesBackfillFlow
     agent_id: raphael
     schedule_cron: "47 4 * * 0"
-    config: {limit: 1000, since_days: 14}
+    config: {limit: 1000, since_days: 14, batch: 50}
     active: true
 
   # Phase 4 — nightly per-agent memory consolidation (caps each agent's

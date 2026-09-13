@@ -1,4 +1,4 @@
-"""NotesActivities — Raphael's Obsidian vault, on the worker (#514).
+"""NotesActivities — the user's Obsidian vault, on the worker (#514).
 
 Every write goes through `aegis.services.notes`, the only module that touches
 the vault (append-only, pushed or reported, never force-pushed); the chat
@@ -12,12 +12,16 @@ Four jobs:
   anything but `written`/`exists` sends the daylog back to its knowledge row,
   so a vault problem never loses a day.
 * `notes_index_vault` — the incremental index behind `NotesSyncFlow`. It
-  leaves out `UNINDEXED_PREFIXES`.
+  leaves out the layout's `index_skip_prefixes` and its `questions_dir`.
 * `notes_backfill_journal` — the daylog's knowledge rows into the journal,
   for the weekly `NotesBackfillFlow`.
 
-A time written into a note (a new note's template placeholders) is on the
-user's clock (`user_timezone`), not the container's UTC one.
+Where the notes go is the vault layout (`vault_layout` settings row), read
+from the pool on every call so a change on the admin page applies without a
+restart. A time written into a note (a new note's template placeholders) is
+on the user's clock (`user_timezone`), not the container's UTC one. A commit
+is authored by the owning agent — the one the flow ran for, else the holder
+of the `research` capability — under its `agents.name`.
 """
 
 from __future__ import annotations
@@ -29,8 +33,10 @@ from typing import Any
 
 from aegis.services import notes
 from aegis.services import notes_write as nw
+from aegis.services.agents import resolve_tag
 from aegis.services.knowledge import _content_id_for
 from aegis.services.user_time import user_now
+from aegis.services.vault_layout import Layout, get_layout
 from temporalio import activity
 
 from aegis_worker.activities.daylog import _stitch
@@ -38,13 +44,10 @@ from aegis_worker.activities.daylog import _stitch
 INDEX_STATE_KEY = "notes_index_state"
 # Files per indexing run; the rest wait for the next run.
 DEFAULT_INDEX_BATCH = 300
-# Journal entries per backfill commit.
+# Journal entries per backfill commit (`notes-backfill-weekly`'s `batch`).
 BACKFILL_BATCH = 50
-# Notes the index leaves out. `raphael/questions/` holds ResearchFlow's answers,
-# which the flow also keeps in the knowledge store (`aegis://research/<hash>`),
-# so indexing the note put every answer in retrieval twice. A row an earlier
-# run made for one is dropped on the next run.
-UNINDEXED_PREFIXES = (f"{notes.RAPHAEL_DIR}/questions/",)
+# The capability whose holder owns a write no agent was named for.
+_OWNER_TAG = "research"
 
 # Newest first: a weekly run is for the recent days whose vault write failed
 # and fell back to their knowledge row; the old rows went in on the first run.
@@ -66,6 +69,15 @@ SELECT c.source_type, c.metadata,
 """
 
 
+def unindexed_prefixes(layout: Layout) -> tuple[str, ...]:
+    """Notes the index leaves out. The questions folder holds ResearchFlow's
+    answers, which the flow also keeps in the knowledge store
+    (`aegis://research/<hash>`), so indexing the note put every answer in
+    retrieval twice. A row an earlier run made for one is dropped on the next
+    run."""
+    return (f"{layout.questions_dir.strip('/')}/",)
+
+
 @dataclass
 class NotesActivities:
     settings: Any = None
@@ -75,10 +87,30 @@ class NotesActivities:
     def _cfg(self) -> notes.NotesConfig:
         return notes.config_from_settings(self.settings)
 
+    async def _layout(self) -> Layout:
+        return await get_layout(self.db_pool)
+
+    async def _author(self, agent_id: str | None) -> notes.Author:
+        """The commit's author: the agent named, else the `research` holder,
+        under its `agents.name`. Never raises — a failed lookup is AEGIS's
+        own identity, not a lost write."""
+        if self.db_pool is None:
+            return notes.author_for(agent_id)
+        try:
+            if not agent_id:
+                agent_id = await resolve_tag(self.db_pool, _OWNER_TAG)
+            if not agent_id:
+                return notes.DEFAULT_AUTHOR
+            name = await self.db_pool.fetchval("SELECT name FROM agents WHERE id = $1", agent_id)
+            return notes.author_for(agent_id, name)
+        except Exception as exc:  # noqa: BLE001 — identity is a nicety
+            activity.logger.warning("notes_author_lookup_failed err=%s", str(exc)[:200])
+            return notes.author_for(agent_id)
+
     # ------------------------------------------------------------ writes
 
     @activity.defn
-    async def notes_write(self, op: str, payload: dict) -> dict:
+    async def notes_write(self, op: str, payload: dict, agent_id: str = "") -> dict:
         """One vault write on behalf of a chat tool. `{"ok", "message"}`; a
         refusal comes back as `ok: False`, never as a raise, because a raise
         here is a Temporal retry of a write that was deliberately turned down."""
@@ -89,21 +121,26 @@ class NotesActivities:
                 "message": "error: the vault is not configured on the worker, so the write "
                 "could not run. Nothing was written.",
             }
-        return await nw.perform_write(op, payload, cfg)
+        return await nw.perform_write(
+            op, payload, cfg, layout=await self._layout(), author=await self._author(agent_id)
+        )
 
     @activity.defn
     async def notes_journal_write(self, entry: dict) -> dict:
         """The daylog's entry for one day, week or month, appended to the
-        journal note. `{"status": written | exists | not_configured | error,
-        "path", "error"}`.
+        journal note. `{"status": written | exists | not_configured |
+        disabled | error, "path", "error"}` — `disabled` when the layout has
+        that kind of journal note switched off.
 
-        `entry`: `kind` (daily / weekly / monthly), `day` (the day; the ISO
-        week's Monday; the month's first day), `label` (the daylog's own label)
-        and `text`.
+        `entry`: `kind` (daily / weekly / monthly), `day` (the day; the
+        week's first day; the month's first day), `label` (the daylog's own
+        label), `text` and, optionally, `agent_id` (the flow's owner).
         """
         cfg = self._cfg()
         if not cfg.configured:
             return {"status": "not_configured"}
+        layout = await self._layout()
+        author = await self._author(str(entry.get("agent_id") or ""))
         try:
             ap = notes.journal_append(
                 str(entry["kind"]),
@@ -111,10 +148,15 @@ class NotesActivities:
                 str(entry["label"]),
                 str(entry.get("text") or ""),
                 await user_now(self.db_pool),
+                layout,
             )
-            res = await notes.write(cfg, [ap], f"raphael: journal {entry['label']}")
+            res = await notes.write(
+                cfg, [ap], f"{author.prefix}: journal {entry['label']}", author=author
+            )
         except notes.NotesDisabled:
             return {"status": "not_configured"}
+        except notes.JournalKindDisabled:
+            return {"status": "disabled"}
         except (notes.NotesError, KeyError, ValueError) as exc:
             activity.logger.warning("notes_journal_write_failed err=%s", str(exc)[:300])
             return {"status": "error", "error": str(exc)[:300]}
@@ -149,14 +191,14 @@ class NotesActivities:
     async def _unindex(self, rel: str) -> int:
         return await self._delete(_content_id_for(notes.note_url(rel)), rel)
 
-    async def _drop_unindexed(self) -> int:
+    async def _drop_unindexed(self, prefixes: tuple[str, ...]) -> int:
         """Remove the index rows of notes the index leaves out, which runs
-        before `UNINDEXED_PREFIXES` existed made. One small query a run; after
-        the first run it finds nothing."""
+        before the skip existed made. One small query a run; after the first
+        run it finds nothing."""
         rows = await self.db_pool.fetch(
             "SELECT content_id, url FROM knowledge_content "
             "WHERE source_type = 'note' AND url LIKE ANY($1::text[])",
-            [notes.note_url(prefix) + "%" for prefix in UNINDEXED_PREFIXES],
+            [notes.note_url(prefix) + "%" for prefix in prefixes],
         )
         removed = 0
         for r in rows:
@@ -164,7 +206,9 @@ class NotesActivities:
         return removed
 
     @activity.defn
-    async def notes_index_vault(self, max_files: int = DEFAULT_INDEX_BATCH) -> dict:
+    async def notes_index_vault(
+        self, max_files: int = DEFAULT_INDEX_BATCH, index_max_chars: int = notes.INDEX_MAX_CHARS
+    ) -> dict:
         """Index what changed in the vault since the last full pass.
 
         A pass is the list of notes changed between the last indexed commit and
@@ -173,8 +217,9 @@ class NotesActivities:
         so the first pass over ~1,000 notes spreads over a few runs. A note that
         fails to index is retried at the start of the next pass; a deleted or
         emptied note leaves the index. Encrypted blocks are stripped by the
-        read, before anything is embedded. Notes under `UNINDEXED_PREFIXES` are
-        never indexed.
+        read, before anything is embedded. Notes under the layout's skip
+        prefixes and its questions folder are never indexed; one note is cut
+        at `index_max_chars`.
         """
         cfg = self._cfg()
         if not cfg.configured:
@@ -182,9 +227,12 @@ class NotesActivities:
         if self.knowledge_connector is None or self.db_pool is None:
             return {"status": "no_knowledge_store"}
         batch_size = max(1, int(max_files or DEFAULT_INDEX_BATCH))
+        max_chars = max(1000, int(index_max_chars or notes.INDEX_MAX_CHARS))
+        layout = await self._layout()
+        skip = unindexed_prefixes(layout)
         state = await self._state()
 
-        removed = await self._drop_unindexed()
+        removed = await self._drop_unindexed(skip)
         if state.get("target") and isinstance(state.get("todo"), list):
             # A pass in progress is pinned to the commit it started from and
             # finishes even while HEAD moves (the nightly daylog commit, the
@@ -197,7 +245,9 @@ class NotesActivities:
             done = int(state.get("done") or 0)
             retry = [p for p in state.get("retry") or [] if isinstance(p, str)]
         else:
-            changes = await asyncio.to_thread(notes.vault_changes_sync, cfg, state.get("commit"))
+            changes = await asyncio.to_thread(
+                notes.vault_changes_sync, cfg, state.get("commit"), layout
+            )
             target, full = changes.head, changes.full
             # A new pass: last pass's failures first, then what changed. Deleted
             # notes leave the index now, once per pass.
@@ -209,7 +259,7 @@ class NotesActivities:
                 removed += await self._unindex(rel)
 
         batch = todo[done : done + batch_size]
-        wanted = [rel for rel in batch if not rel.startswith(UNINDEXED_PREFIXES)]
+        wanted = [rel for rel in batch if not rel.startswith(skip)]
         texts = await asyncio.to_thread(notes.read_many_sync, cfg, wanted) if wanted else {}
         indexed = 0
         for rel in wanted:
@@ -223,7 +273,7 @@ class NotesActivities:
                     title=notes.note_title(rel),
                     source_type="note",
                     summary=text[:500],
-                    raw_text=text[: notes.INDEX_MAX_CHARS],
+                    raw_text=text[:max_chars],
                     tags=["note", notes.top_folder(rel) or "root"],
                     metadata={"path": rel, "folder": notes.top_folder(rel), "commit": target},
                 )
@@ -261,7 +311,13 @@ class NotesActivities:
     # ---------------------------------------------------------- backfill
 
     @activity.defn
-    async def notes_backfill_journal(self, limit: int = 1000, since_days: int = 0) -> dict:
+    async def notes_backfill_journal(
+        self,
+        limit: int = 1000,
+        since_days: int = 0,
+        batch: int = BACKFILL_BATCH,
+        agent_id: str = "",
+    ) -> dict:
         """Write the daylog's knowledge rows into the matching journal notes,
         newest first. The markers are the ones the live daylog uses, so a day
         already in the journal is left alone and a run with nothing missing
@@ -270,7 +326,8 @@ class NotesActivities:
         `since_days` > 0 looks only at rows filed in the last that many days —
         the weekly schedule, which must not put back a block the user deleted
         from an old note. 0 takes every row (a run started by hand, and any
-        call made before the parameter existed)."""
+        call made before the parameter existed). `batch` is entries per
+        commit."""
         cfg = self._cfg()
         if not cfg.configured:
             return {"status": "not_configured"}
@@ -279,6 +336,8 @@ class NotesActivities:
         rows = await self.db_pool.fetch(
             _BACKFILL_SQL, max(1, int(limit)), max(0, int(since_days or 0))
         )
+        layout = await self._layout()
+        author = await self._author(agent_id)
         appends: list[notes.Append] = []
         skipped = 0
         now = await user_now(self.db_pool)
@@ -289,23 +348,28 @@ class NotesActivities:
                 if r["source_type"] == "daylog":
                     label = str(meta["date"])
                     appends.append(
-                        notes.journal_append("daily", date.fromisoformat(label), label, text, now)
+                        notes.journal_append(
+                            "daily", date.fromisoformat(label), label, text, now, layout
+                        )
                     )
                 else:
                     kind = str(meta.get("period") or "")
                     appends.append(
                         notes.journal_append(
                             kind, date.fromisoformat(str(meta["start"])), str(meta["label"]),
-                            text, now,
+                            text, now, layout,
                         )
                     )
             except (KeyError, ValueError, notes.NotesError):
                 skipped += 1
         written = 0
         existed = 0
-        for i in range(0, len(appends), BACKFILL_BATCH):
-            chunk = appends[i : i + BACKFILL_BATCH]
-            res = await notes.write(cfg, chunk, f"raphael: journal backfill ({len(chunk)})")
+        step = max(1, int(batch or BACKFILL_BATCH))
+        for i in range(0, len(appends), step):
+            chunk = appends[i : i + step]
+            res = await notes.write(
+                cfg, chunk, f"{author.prefix}: journal backfill ({len(chunk)})", author=author
+            )
             # Per append, not per path: a day may go to its live root note
             # instead of the filed one, so `ap.rel` is not where it landed.
             outcomes = res.get("outcomes") or []

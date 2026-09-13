@@ -1,6 +1,6 @@
 """Nightly episodic diary — what actually happened on one calendar day.
 
-`gather_day_events` reads a single UTC calendar date out of the tables that
+`gather_day_events` reads a single calendar date out of the tables that
 already record the day (Todoist completions, ingested calendar events,
 resolved interactions, GTD clarify decisions, ingested email, workflow
 failures). `distil_daylog` turns that into a short narrative, and
@@ -19,8 +19,15 @@ matching `calendar_events_%` that `BriefingActivities.gather_calendar_events`
 reads are legacy n8n leftovers with NO writer anywhere in this repo, so they
 are deliberately NOT a source here.
 
-Day boundaries are UTC. The nightly cron fires at 19:00 UTC = 00:30 IST, so
-the run's own UTC date is the IST day that just closed.
+Day boundaries are the user's (`user_timezone`, `services/user_time.py`;
+UTC when unset). The date itself comes from the flow's clock, so the nightly
+cron should fire just after midnight in that timezone — then the run's own
+date is the day that just closed and `day_offset` stays 0.
+
+The wording of the deterministic entry (the labels, the quiet-day line, the
+rollup header) and the language the model is asked to write in come from the
+vault layout's `language` table, read on every run; English adds nothing to
+the prompts, so a deployment with no row behaves as before.
 
 A9 adds the period rollups on top: `gather_daylogs` reads a date RANGE of
 already-filed day logs back out and `distil_rollup` condenses them into one
@@ -33,10 +40,12 @@ from __future__ import annotations
 import asyncio
 import re
 from dataclasses import dataclass
-from datetime import UTC, date, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta, tzinfo
 from typing import Any
 
 from aegis.services import notes
+from aegis.services.user_time import user_zone
+from aegis.services.vault_layout import DEFAULT_LANGUAGE, DEFAULT_LAYOUT, Layout, get_layout
 from temporalio import activity
 
 # Ordered so the fallback narrative reads chronologically-ish rather than by
@@ -47,10 +56,22 @@ _SOURCES = ("meetings", "tasks", "decisions", "captures", "email", "failures")
 _LIMIT = 40
 
 
-def _day_bounds(date: str) -> tuple[datetime, datetime]:
-    """[start, end) UTC timestamps for a `YYYY-MM-DD` date."""
-    start = datetime.strptime(date, "%Y-%m-%d").replace(tzinfo=UTC)
+def _day_bounds(date: str, tz: tzinfo = UTC) -> tuple[datetime, datetime]:
+    """[start, end) timestamps for a `YYYY-MM-DD` date, on the clock `tz`."""
+    start = datetime.strptime(date, "%Y-%m-%d").replace(tzinfo=tz)
     return start, start + timedelta(days=1)
+
+
+def _words(layout: Layout | None) -> dict[str, str]:
+    return layout.words if layout is not None else dict(DEFAULT_LANGUAGE)
+
+
+def _language_ask(layout: Layout | None) -> str:
+    """` Write in <language>.` for the prompts, or nothing for English — the
+    shipped prompts are already English, and asking again would change a
+    prompt that nothing else about the default deployment changes."""
+    name = (_words(layout).get("name") or "").strip()
+    return f" Write in {name}." if name and name.casefold() != "english" else ""
 
 
 def _clip(value: Any, limit: int) -> str:
@@ -67,14 +88,17 @@ def _bullets(items: list[dict], heading: str, fmt, limit: int = 12) -> list[str]
     return [heading, *lines] if lines else []
 
 
-def _format_daylog_fallback(events: dict, date: str) -> str:
-    """Deterministic rendering — always computed, used whenever the LLM isn't."""
+def _format_daylog_fallback(events: dict, date: str, words: dict[str, str] | None = None) -> str:
+    """Deterministic rendering — always computed, used whenever the LLM isn't.
+    The labels are the layout's `language` table (`words`); the shipped ones
+    are English."""
+    w = {**DEFAULT_LANGUAGE, **(words or {})}
     lines: list[str] = []
-    lines += _bullets(events.get("meetings"), "Met / attended:", lambda i: _clip(i.get("title"), 200))
-    lines += _bullets(events.get("tasks"), "Completed:", lambda i: _clip(i.get("content"), 200))
+    lines += _bullets(events.get("meetings"), w["meetings"], lambda i: _clip(i.get("title"), 200))
+    lines += _bullets(events.get("tasks"), w["tasks"], lambda i: _clip(i.get("content"), 200))
     lines += _bullets(
         events.get("decisions"),
-        "Decided:",
+        w["decisions"],
         lambda i: (
             f"{_clip(i.get('prompt'), 200)}"
             + (f" -> {_clip(i.get('answer'), 120)}" if i.get("answer") else "")
@@ -82,21 +106,22 @@ def _format_daylog_fallback(events: dict, date: str) -> str:
     )
     lines += _bullets(
         events.get("captures"),
-        "Captured / clarified:",
+        w["captures"],
         lambda i: (
             f"{_clip(i.get('content') or i.get('task_id'), 160)}"
             f" [{_clip(i.get('classification'), 40)}]"
         ),
     )
-    lines += _bullets(events.get("email"), "Email filed:", lambda i: _clip(i.get("title"), 200))
+    lines += _bullets(events.get("email"), w["email"], lambda i: _clip(i.get("title"), 200))
     lines += _bullets(
         events.get("failures"),
-        "Broke:",
+        w["failures"],
         lambda i: f"{_clip(i.get('workflow_type'), 80)}: {_clip(i.get('error'), 160)}",
     )
+    title = w["daylog_title"].format(date=date)
     if not lines:
-        return f"Day log for {date}. Quiet day — nothing was recorded."
-    return f"Day log for {date}.\n" + "\n".join(lines)
+        return f"{title} {w['quiet_day']}"
+    return f"{title}\n" + "\n".join(lines)
 
 
 # --- A9 rollups ---------------------------------------------------------
@@ -145,9 +170,12 @@ def _stitch(chunks: list[str]) -> str:
     return out
 
 
-def _format_rollup_fallback(entries: list[dict], period: str, label: str) -> str:
+def _format_rollup_fallback(
+    entries: list[dict], period: str, label: str, words: dict[str, str] | None = None
+) -> str:
     """Deterministic concatenation — always computed, used when the LLM isn't."""
-    header = f"{period.capitalize()} log {label} — {len(entries)} day(s) recorded."
+    w = {**DEFAULT_LANGUAGE, **(words or {})}
+    header = w["rollup_header"].format(period=period.capitalize(), label=label, n=len(entries))
     blocks = [
         f"{e.get('date') or '?'}\n{(e.get('text') or '').strip()}"
         for e in entries
@@ -219,14 +247,26 @@ class DayLogActivities:
 
     # ------------------------------------------------------------- gathering
 
+    async def _layout(self) -> Layout:
+        return await get_layout(self.db_pool)
+
+    @activity.defn
+    async def vault_week_rule(self) -> dict:
+        """The vault layout's week rule, for the flow's rollup window: the
+        rollup's week and the weekly note's name must be the same week, and
+        a workflow cannot read the row itself."""
+        layout = await self._layout()
+        return {"week_start": layout.week_start, "week_numbering": layout.week_numbering}
+
     @activity.defn
     async def gather_day_events(self, date: str) -> dict:
-        """Everything recorded on the UTC calendar day `date`, bucketed by kind.
+        """Everything recorded on the calendar day `date` — bounded on the
+        user's clock (`user_timezone`), UTC when unset — bucketed by kind.
 
         Never raises for a data reason: a failing source degrades to an empty
         bucket and the rest of the day still gets logged.
         """
-        start, end = _day_bounds(date)
+        start, end = _day_bounds(date, await user_zone(self.db_pool))
         out: dict[str, Any] = {"date": date}
         for name in _SOURCES:
             if self.db_pool is None:
@@ -366,7 +406,7 @@ class DayLogActivities:
     # ------------------------------------------------------------- distilling
 
     @activity.defn
-    async def distil_daylog(self, events: dict, date: str, agent_id: str = "raphael") -> str:
+    async def distil_daylog(self, events: dict, date: str, agent_id: str = "") -> str:
         """One short narrative for the day. Never raises, never returns "".
 
         The deterministic rendering is built first and is the floor: an
@@ -375,7 +415,8 @@ class DayLogActivities:
         """
         import json
 
-        fallback = _format_daylog_fallback(events, date)
+        layout = await self._layout()
+        fallback = _format_daylog_fallback(events, date, layout.words)
         if not self.llm_client:
             return fallback
 
@@ -386,11 +427,11 @@ class DayLogActivities:
             result = await self.llm_client.think(
                 prompt=json.dumps(payload, default=str)[:6000],
                 model=self.model,
-                system_prompt=_SYSTEM_PROMPT,
+                system_prompt=_SYSTEM_PROMPT + _language_ask(layout),
                 max_tokens=_DISTIL_MAX_TOKENS,
                 db_pool=self.db_pool,
                 purpose="daylog_narrative",
-                agent_id=agent_id,
+                agent_id=agent_id or None,
             )
         except Exception as exc:  # noqa: BLE001 — degrade to the bullets, never fail the day
             activity.logger.warning("daylog_distil_llm_failed date=%s err=%s", date, str(exc)[:200])
@@ -448,28 +489,32 @@ class DayLogActivities:
         return out
 
     @staticmethod
-    def _journal_entry(day: str, text: str) -> str:
-        """One journal note as a rollup entry: Raphael's own block for the day
-        FIRST, then whatever else the note holds, within the clip.
+    def _journal_entry(day: str, text: str, layout: Layout = DEFAULT_LAYOUT) -> str:
+        """One journal note as a rollup entry: the agent's own block for the
+        day FIRST, then whatever else the note holds, within the clip.
 
-        The block sits inside the note's `## Journal`, after whatever the user
-        wrote there, so clipping the note from the top dropped Raphael's
+        The block sits inside the note's journal section, after whatever the
+        user wrote there, so clipping the note from the top dropped the
         narrative whenever the template plus the user's writing ran past the
-        clip. `split_section` finds it by its marker."""
-        mine, rest = notes.split_section(text, notes.journal_key("daily", day))
+        clip. `split_section` finds it by its marker and reads it back with
+        the layout's indent."""
+        mine, rest = notes.split_section(
+            text, notes.journal_key("daily", day), indent_width=layout.indent_width
+        )
         if not mine:
             return text[:_ROLLUP_ENTRY_CLIP]
         out = mine[:_ROLLUP_ENTRY_CLIP]
-        room = _ROLLUP_ENTRY_CLIP - len(out) - len("\n\nAlso in the note:\n")
+        also = f"\n\n{layout.word('also_in_note')}\n"
+        room = _ROLLUP_ENTRY_CLIP - len(out) - len(also)
         if rest.strip() and room > 0:
-            out += "\n\nAlso in the note:\n" + rest.strip()[:room]
+            out += also + rest.strip()[:room]
         return out
 
     async def _merge_journal(self, out: list[dict], start: str, end: str) -> list[dict]:
         """With the vault configured (#514), each day's journal note stands in
-        for its knowledge row — the note is the record since Raphael took the
-        journal over, and it also holds whatever the user wrote that day. A day
-        with no note keeps its old knowledge row, so a week spanning the
+        for its knowledge row — the note is the record since the agent took
+        the journal over, and it also holds whatever the user wrote that day.
+        A day with no note keeps its old knowledge row, so a week spanning the
         switch-over still rolls up whole. Encrypted blocks are stripped by the
         read; they never reach the rollup's model."""
         cfg = notes.config_from_settings(self.settings)
@@ -480,8 +525,9 @@ class DayLogActivities:
         except ValueError:
             return out
         days = [first + timedelta(days=i) for i in range(max(0, (last - first).days) + 1)]
+        layout = await self._layout()
         try:
-            journal = await asyncio.to_thread(notes.read_journal_days_sync, cfg, days)
+            journal = await asyncio.to_thread(notes.read_journal_days_sync, cfg, days, layout)
         except notes.NotesError as exc:
             activity.logger.warning("daylog_journal_read_failed err=%s", str(exc)[:200])
             return out
@@ -490,8 +536,8 @@ class DayLogActivities:
             if text.strip():
                 by_date[day] = {
                     "date": day,
-                    "title": f"Journal {day}",
-                    "text": self._journal_entry(day, text),
+                    "title": layout.word("journal_title").format(day=day),
+                    "text": self._journal_entry(day, text, layout),
                 }
         return [by_date[k] for k in sorted(by_date)]
 
@@ -501,7 +547,7 @@ class DayLogActivities:
         entries: list[dict],
         period: str,
         label: str,
-        agent_id: str = "raphael",
+        agent_id: str = "",
     ) -> str:
         """One narrative for the whole period. Never raises, never returns "".
 
@@ -511,7 +557,8 @@ class DayLogActivities:
         """
         import json
 
-        fallback = _format_rollup_fallback(entries, period, label)
+        layout = await self._layout()
+        fallback = _format_rollup_fallback(entries, period, label, layout.words)
         if not self.llm_client:
             return fallback
 
@@ -520,11 +567,11 @@ class DayLogActivities:
             result = await self.llm_client.think(
                 prompt=json.dumps(entries, default=str)[:_ROLLUP_PROMPT_CLIP],
                 model=self.model,
-                system_prompt=_ROLLUP_SYSTEM_PROMPT,
+                system_prompt=_ROLLUP_SYSTEM_PROMPT + _language_ask(layout),
                 max_tokens=_DISTIL_MAX_TOKENS,
                 db_pool=self.db_pool,
                 purpose="daylog_rollup",
-                agent_id=agent_id,
+                agent_id=agent_id or None,
             )
         except Exception as exc:  # noqa: BLE001 — degrade to the concatenation
             activity.logger.warning(
