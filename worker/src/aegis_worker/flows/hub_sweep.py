@@ -184,6 +184,12 @@ class HubSweepFlow:
             "fix_reopened": int(verified.get("reopened") or 0),
             "alertmanager_resolved": int(reconciled.get("resolved") or 0),
             "alertmanager_skipped": str(reconciled.get("skipped") or ""),
+            # -1 = the step did not run at all (no URL, or the patch is off in a
+            # replayed history). 0 or more = it ran and this many problems were
+            # in scope. Without the sentinel, "resolved 0, skipped nothing"
+            # reads identically whether it found nothing or never happened —
+            # which is the same trap as a canary whose pass looks like no probe.
+            "alertmanager_checked": int(reconciled.get("checked", -1)),
             "projected": int(projected.get("projected") or 0),
             "created": int(projected.get("created") or 0),
             "errors": int(projected.get("errors") or 0),

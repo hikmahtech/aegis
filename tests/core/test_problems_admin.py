@@ -269,3 +269,70 @@ async def test_resolving_a_closed_problem_is_a_404(client, db_pool):
     assert (
         await client.post(f"/api/admin/problems/{r.problem_id}/mute", json={"hours": 1})
     ).status_code == 404
+
+
+async def test_the_settle_windows_round_trip_through_the_admin_api(client, db_pool):
+    """#556: the hub's settle windows were DB-backed and reachable only by raw
+    SQL. An operator now edits them like every other config family.
+
+    Falsifiable: drop the PUT route and this 405s; drop the validation and the
+    bad value below saves a 200 that does nothing.
+    """
+    await db_pool.execute("DELETE FROM settings WHERE key = 'hub_settle_seconds'")
+    try:
+        before = await client.get("/api/admin/hub-settle-seconds")
+        assert before.status_code == 200
+        assert before.json()["overrides"] == {}
+        # The defaults come back too, so a blank field can be shown as what it
+        # means rather than as zero.
+        assert before.json()["defaults"]["nodedown"] == 300
+
+        saved = await client.put(
+            "/api/admin/hub-settle-seconds",
+            json={"overrides": {"Docker Service Down": 45, "*": 0}},
+        )
+        assert saved.status_code == 200
+        assert saved.json()["overrides"] == {"docker-service-down": 45, "*": 0}
+
+        # Strict on write: a typo is a 400, never a quiet no-op.
+        bad = await client.put(
+            "/api/admin/hub-settle-seconds", json={"overrides": {"nodedown": "soon"}}
+        )
+        assert bad.status_code == 400
+        assert "whole number" in bad.json()["detail"]
+        # ...and the rejected write changed nothing.
+        assert (await client.get("/api/admin/hub-settle-seconds")).json()["overrides"] == {
+            "docker-service-down": 45,
+            "*": 0,
+        }
+
+        cleared = await client.put("/api/admin/hub-settle-seconds", json={"overrides": {}})
+        assert cleared.json()["overrides"] == {}
+    finally:
+        await db_pool.execute("DELETE FROM settings WHERE key = 'hub_settle_seconds'")
+
+
+async def test_the_platform_hint_round_trips_through_the_admin_api(client, db_pool):
+    """The routing row has had an API since #503 and no UI at all, so the
+    `platform_hint` added in #505 was raw-SQL-only in practice. The UI now reads
+    and writes it through here."""
+    await db_pool.execute("DELETE FROM settings WHERE key = 'infra_alert_routing'")
+    try:
+        hint = "This cluster is k3s. Read it with `kubectl get pods -A`."
+        saved = await client.put(
+            "/api/admin/infra-alert-routing",
+            json={
+                "repo": "acme/infra",
+                "platform_hint": hint,
+                "extra_alertnames": ["ClickHouseDown"],
+            },
+        )
+        assert saved.status_code == 200
+        assert saved.json()["platform_hint"] == hint
+        assert "clickhousedown" in saved.json()["alertnames"]
+
+        read_back = await client.get("/api/admin/infra-alert-routing")
+        assert read_back.json()["platform_hint"] == hint
+        assert read_back.json()["repo"] == "acme/infra"
+    finally:
+        await db_pool.execute("DELETE FROM settings WHERE key = 'infra_alert_routing'")

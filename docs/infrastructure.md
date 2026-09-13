@@ -846,8 +846,10 @@ key is pasted.)
 
 #### The infra list and the infra repo
 
-Both live in the `infra_alert_routing` settings row. Read and replace it over
-the admin API:
+Both live in the `infra_alert_routing` settings row, editable on the admin
+**Problems** page under *Hub configuration* — the infra repo, the extra
+alertnames, and what to tell an investigation about this cluster. The same row
+over the admin API, for a script:
 
 ```bash
 curl -sS -H "X-API-Key: $AEGIS_API_KEY" "$AEGIS_URL/api/admin/infra-alert-routing"
