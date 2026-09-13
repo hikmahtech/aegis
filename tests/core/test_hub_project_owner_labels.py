@@ -29,11 +29,11 @@ def _question() -> Event:
 
 @pytest_asyncio.fixture(loop_scope="function")
 async def capture_on(db_pool):
-    """The capture kill switch (`todoist_capture_enabled`) is a settings row
-    another file in the same test database may have left off
-    (`db/test_migration_011_todoist_capture.py` ends on `false`); the task
-    must be created here for the labels to be seen at all. Left at `true`
-    afterwards, which is the migration's own default."""
+    """The capture kill switch (`todoist_capture_enabled`) must be on for the
+    task to be created, and the labels to be seen at all. Every file now starts
+    from the seeded settings (#569), so this only states the precondition
+    rather than repairing another file's leftovers. Left at `true` afterwards,
+    which is the migration's own default."""
     await db_pool.execute(
         "INSERT INTO settings (key, value) VALUES ('todoist_capture_enabled', 'true'::jsonb) "
         "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value"

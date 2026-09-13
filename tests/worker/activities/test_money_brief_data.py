@@ -644,7 +644,7 @@ async def test_build_money_brief_without_books_still_reports_index(db_pool, tmp_
     # `large_unexplained` is a table-wide aggregate with nothing to scope it
     # by, so it is a delta like every other count in this file. Asserted flat
     # it passes sequentially and fails the moment a sibling suite leaves an
-    # unexplained row in the shared `aegis_test_gwN` database.
+    # unexplained row in the worker's shared test database.
     baseline = await ActivityEnvironment().run(act.build_money_brief, 7)
     await ji.upsert(db_pool, "brief-t/z", "brief-t",
                     _ev(kind="due", due_on=_today(), payee="X", payee_key="x"),

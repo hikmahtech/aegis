@@ -21,6 +21,8 @@ on:
       - "admin-panel/frontend/src/**"
       - "tests/worker/**"
       - "tests/conftest.py"
+      # Test-database names and clean-up; tests/conftest.py imports it (#325).
+      - "tests/pg_test_db.py"
       # A shared helper the notes tests import (#514); not under tests/worker/.
       - "tests/notes_vault.py"
       # The chart of accounts the books tests post against (#560); same reason.
@@ -38,6 +40,8 @@ on:
       - "admin-panel/frontend/src/**"
       - "tests/worker/**"
       - "tests/conftest.py"
+      # Test-database names and clean-up; tests/conftest.py imports it (#325).
+      - "tests/pg_test_db.py"
       # A shared helper the notes tests import (#514); not under tests/worker/.
       - "tests/notes_vault.py"
       # The chart of accounts the books tests post against (#560); same reason.
