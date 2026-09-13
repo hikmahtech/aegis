@@ -601,6 +601,56 @@ threshold decides what is ever *asked*, the cache decides what the answer was.
 Turning the whole sweep off is not an alternative to either — it also stops
 suppression promotion and projection.
 
+### When a resolve never arrives
+
+Every producer on the hub has a way back except one, and the exception cost a
+problem 15 hours and a chore that could never end (#551).
+
+Alertmanager resolves a problem **only** when its `resolved` webhook arrives,
+and it keeps its firing alerts in memory. So a restart — a monitoring redeploy,
+a config reload, an OOM, a node move — makes it forget every alert it was
+holding, and those webhooks are never sent. The same hole swallows a resolve
+sent during an ingress outage, which is the outage the ingress canary above
+exists to catch. Every other lane recovers on its own: the heartbeat re-checks
+the swarm each tick, and the watchdogs resolve what they stop finding.
+
+`HubSweepFlow` now asks alertmanager what it is still holding and resolves the
+live problems it no longer lists. Set the internal address on the sweep's
+`activities.config` row — the public host is behind an identity proxy:
+
+```sql
+UPDATE activities SET config = config || '{"alertmanager_url": "http://alertmanager:9093"}'::jsonb,
+  updated_at = now()
+WHERE workflow_type = 'HubSweepFlow';
+```
+
+Empty, the default, disables it; a fork ships nobody's monitoring host.
+
+**Every part of it fails closed**, because the cost of getting this wrong is
+resolving a live estate in one tick:
+
+- unreachable, timed out, or a non-200 → nothing is resolved, because a
+  monitoring stack that cannot answer must never read as "everything
+  recovered";
+- **alertmanager up for less than `alertmanager_min_uptime_seconds` (900) →
+  nothing is resolved.** This is the guard the original defect taught: a
+  freshly restarted alertmanager holds no alerts at all until Prometheus
+  re-sends them, so reconciling against that empty set would close every open
+  problem. Prometheus re-sends on the order of a minute, so the default leaves
+  a wide margin;
+- a problem younger than ten minutes is left alone, so one raised seconds ago
+  is never resolved before alertmanager has grouped its alert;
+- a **group** problem is left alone: its subject is `*`, it stands for a class
+  rather than one alert, and no single fingerprint speaks for it.
+
+A silenced or inhibited alert counts as still firing — someone has only asked
+not to be told — so its problem stays live.
+
+The timeline says what is actually known: *alertmanager no longer lists this
+alert*. Not that the alert cleared. Only the first of those is evidenced, and
+a hub that overstates its evidence is how you end up trusting a closed problem
+that is still broken.
+
 ### A problem and its task stay in step
 
 The task is a view of the problem, and four rules keep the two agreeing

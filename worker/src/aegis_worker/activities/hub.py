@@ -14,10 +14,11 @@ start a child workflow.
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import asyncpg
+import httpx
 from aegis.services import hub, hub_fix, hub_group, hub_project, hub_watch
 from temporalio import activity
 
@@ -28,6 +29,31 @@ _DIGEST_LIST_CAP = 12
 # How many members a grouping judge is shown. Enough to see a pattern; a
 # hundred stuck posts do not read differently from twelve.
 _GROUP_PROMPT_CAP = 12
+# Two small reads of alertmanager, on the LAN. Short: the sweep runs every five
+# minutes and a monitoring stack that cannot answer in this long is one the
+# reconciliation must decline to act on anyway.
+_ALERTMANAGER_TIMEOUT_S = 8.0
+
+
+def _uptime_since(raw: str, now: datetime) -> timedelta | None:
+    """How long alertmanager has been up, from its `/api/v2/status` `uptime`.
+
+    That field is a START TIMESTAMP in RFC 3339 (`2026-09-12T21:04:27.879Z`),
+    not a duration — measured against the live instance, not assumed. `None`
+    when it cannot be read, which the caller treats as "do not reconcile":
+    without a trustworthy uptime there is no way to tell a healthy empty alert
+    set from one a restart has just emptied.
+    """
+    text = (raw or "").strip()
+    if not text:
+        return None
+    try:
+        started = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if started.tzinfo is None:
+        started = started.replace(tzinfo=UTC)
+    return now - started
 
 
 class HubActivities:
@@ -710,4 +736,82 @@ class HubActivities:
             "title": title,
             "folded": len(result["merged"]),
             "tasks_retired": retired,
+        }
+
+    @activity.defn
+    async def reconcile_alertmanager(self, url: str, min_uptime_seconds: int = 900) -> dict:
+        """Resolve live alertmanager problems whose alerts it no longer lists.
+
+        The alertmanager lane was the only producer on the hub with no
+        reconciliation: it resolves a problem solely on the `resolved` webhook,
+        and alertmanager keeps its alerts in memory, so a restart means that
+        webhook is never sent and the problem plus its Todoist task are stranded
+        for good (#551). Every other lane already recovers — the heartbeat
+        re-checks, the watchdogs run `reconcile_findings`.
+
+        **Everything here fails closed**, because the failure mode of getting
+        this wrong is mass-resolving a live estate:
+
+        * no URL configured → do nothing (a fork ships nobody's monitoring host);
+        * the status or alerts read fails, times out, or answers non-200 → do
+          nothing, because an unreachable monitoring stack must never read as
+          "everything recovered";
+        * **alertmanager itself started less than `min_uptime_seconds` ago → do
+          nothing.** This is the guard the bug taught: a freshly restarted
+          alertmanager holds an empty set until Prometheus re-sends, and
+          reconciling against that would resolve every open problem at once.
+          Prometheus re-sends on the order of a minute, so the default leaves a
+          wide margin.
+
+        A `suppressed` alert (silenced or inhibited) counts as ACTIVE: it is
+        still firing, someone has merely asked not to be told.
+        """
+        target = (url or "").strip().rstrip("/")
+        if not target:
+            return {"skipped": "not_configured", "resolved": 0}
+        if self.db_pool is None:
+            return {"skipped": "no_pool", "resolved": 0}
+        try:
+            async with httpx.AsyncClient(timeout=_ALERTMANAGER_TIMEOUT_S) as client:
+                status = await client.get(f"{target}/api/v2/status")
+                status.raise_for_status()
+                uptime_raw = str((status.json() or {}).get("uptime") or "")
+                alerts = await client.get(f"{target}/api/v2/alerts")
+                alerts.raise_for_status()
+                payload = alerts.json()
+        except Exception as exc:  # noqa: BLE001 — fail closed, never resolve on doubt
+            activity.logger.warning(
+                "hub_alertmanager_read_failed url=%s err=%s", target, str(exc)[:200]
+            )
+            return {"skipped": "unreachable", "resolved": 0}
+
+        now = datetime.now(UTC)
+        uptime = _uptime_since(uptime_raw, now)
+        if uptime is None:
+            return {"skipped": "uptime_unreadable", "resolved": 0}
+        if uptime < timedelta(seconds=max(0, min_uptime_seconds)):
+            # It has forgotten what it was holding and has not been told again.
+            return {
+                "skipped": "alertmanager_just_started",
+                "uptime_seconds": int(uptime.total_seconds()),
+                "resolved": 0,
+            }
+
+        if not isinstance(payload, list):
+            return {"skipped": "unexpected_payload", "resolved": 0}
+        active = {
+            str(a.get("fingerprint") or "")
+            for a in payload
+            if isinstance(a, dict) and str((a.get("status") or {}).get("state") or "") != "unprocessed"
+        }
+        active.discard("")
+
+        out = await hub_watch.reconcile_alertmanager(
+            self.db_pool, active_fingerprints=active, now=now
+        )
+        return {
+            "checked": out["checked"],
+            "resolved": len(out["resolved"]),
+            "problems": [r["problem_id"] for r in out["resolved"]],
+            "active_alerts": len(active),
         }
