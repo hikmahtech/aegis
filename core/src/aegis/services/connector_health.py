@@ -49,6 +49,22 @@ _SUBJECT_KIND = "integration"
 _DOWN_CLASS = "connectordown"
 # Only used to read a row written before `down` existed (#571).
 _LEGACY_THRESHOLD = 3
+# How long the system-event POST may take. Comms posts the event to Slack and
+# logs the dispatch before it answers, so this uses the worker's own delivery
+# client's bounds (`activities/delivery.py`): 30 s in all, 5 s to connect. The
+# 10 s it used to allow can run out on a slow Slack round-trip, and the timeout
+# httpx raises then carries no message (#573).
+_SEND_TIMEOUT_S = 30.0
+_SEND_CONNECT_TIMEOUT_S = 5.0
+
+
+def _error_text(exc: BaseException) -> str:
+    """What went wrong, bounded and never empty: the exception's type, then its
+    message when it has one. An httpx timeout is raised with no message at all,
+    so logging `str(exc)` alone gave `error=` and named nothing (#573)."""
+    message = str(exc).strip()
+    name = type(exc).__name__
+    return (f"{name}: {message}" if message else name)[:200]
 
 
 async def record_connector_health(
@@ -65,7 +81,7 @@ async def record_connector_health(
         await _record(pool, settings, connector, ok=ok, error=error, threshold=threshold)
     except Exception as exc:  # noqa: BLE001 — health tracking must never break the caller
         logger.warning(
-            "connector_health_record_failed", connector=connector, error=str(exc)[:200]
+            "connector_health_record_failed", connector=connector, error=_error_text(exc)
         )
 
 
@@ -117,7 +133,7 @@ async def _record(
     try:
         await _reconcile(pool)
     except Exception as exc:  # noqa: BLE001 — the next record retries the sweep
-        logger.warning("connector_health_reconcile_failed", error=str(exc)[:200])
+        logger.warning("connector_health_reconcile_failed", error=_error_text(exc))
 
 
 def _is_down(state: dict) -> bool:
@@ -168,7 +184,12 @@ async def _reconcile(pool: Any) -> None:
 
 
 async def _send_system_event(settings: Any, text: str) -> bool:
-    """POST a system event to the comms delivery server. False on any failure."""
+    """POST a system event to the comms delivery server. False on any failure.
+
+    Every failure is logged with what it was: an exception (by type, since a
+    timeout has no message), a reply that is not 200 (a refused API key is a
+    401 and used to fail in silence), and a 200 that says `ok: false` (Slack
+    refused the post)."""
     comms_url = (getattr(settings, "comms_url", "") or "").rstrip("/")
     if not comms_url:
         logger.warning("connector_health_no_comms_url", detail="system event not sent")
@@ -177,13 +198,33 @@ async def _send_system_event(settings: Any, text: str) -> bool:
 
     api_key = getattr(settings, "api_key", "") or ""
     try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(_SEND_TIMEOUT_S, connect=_SEND_CONNECT_TIMEOUT_S)
+        ) as client:
             resp = await client.post(
                 f"{comms_url}/api/deliver/message",
                 json={"text": text, "system_event": True},
                 headers={"X-API-Key": api_key} if api_key else {},
             )
-            return resp.status_code == 200 and bool(resp.json().get("ok"))
     except Exception as exc:  # noqa: BLE001 — alerting must never break the caller
-        logger.warning("connector_health_event_send_failed", error=str(exc)[:200])
+        logger.warning("connector_health_event_send_failed", error=_error_text(exc))
         return False
+    if resp.status_code != 200:
+        logger.warning(
+            "connector_health_event_send_failed",
+            error=f"comms answered HTTP {resp.status_code}",
+            body=resp.text[:200],
+        )
+        return False
+    try:
+        ok = bool(resp.json().get("ok"))
+    except Exception as exc:  # noqa: BLE001 — an unreadable reply is a failed send
+        logger.warning("connector_health_event_send_failed", error=_error_text(exc))
+        return False
+    if not ok:
+        logger.warning(
+            "connector_health_event_send_failed",
+            error="comms answered ok=false",
+            body=resp.text[:200],
+        )
+    return ok
