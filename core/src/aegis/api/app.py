@@ -293,9 +293,11 @@ def create_app(run_lifespan: bool = True, settings: Settings | None = None) -> F
         mcp,
         mcp_server,
         money,
+        notes_admin,
         observability,
         overview,
         people_admin,
+        preferences,
         problems_admin,
         references,
         research_admin,
@@ -393,6 +395,8 @@ def create_app(run_lifespan: bool = True, settings: Settings | None = None) -> F
     app.include_router(runbooks_admin.router)
     app.include_router(todoist.router)
     app.include_router(task_sessions.router)
+    app.include_router(notes_admin.router)
+    app.include_router(preferences.router)
 
     # Serve admin panel SPA (static files from built frontend)
     # Try multiple locations: env override, Docker (/app/admin-panel/...) and local dev.

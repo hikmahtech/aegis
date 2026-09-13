@@ -2216,60 +2216,139 @@ each round — the noise #513 removed.
 
 ## The vault (Raphael)
 
-The user's Obsidian vault (`arshadansari27/arshad-workspace`) is Raphael's
-record; the knowledge store is only its index (#514, spec
-`docs/superpowers/specs/2026-09-12-raphael-notes-design.md`).
+The user's Obsidian vault (`you/your-vault`) is the research agent's record;
+the knowledge store is only its index (#514, spec
+`docs/superpowers/specs/2026-09-12-raphael-notes-design.md`). "Raphael" below
+is the example agent that holds the `research` capability; nothing in the
+lane names it — a run with no agent resolves that capability's holder.
+
+Where the notes go and what an entry looks like is the **vault layout**, a
+settings row (`vault_layout`) edited on the admin **Vault** page. The shipped
+defaults are one vault's conventions (the ones the lane was written against),
+so a deployment with no row behaves exactly as before. The paths below are
+those defaults.
 
 - **Reads:** `NotesSyncFlow` (`notes-sync-hourly`, minute :19) pulls the vault
-  and indexes every changed `.md` note as `source_type='note'`, skipping
-  `.obsidian/`, `_templates/`, `backups/`, `_attachments/` and `.trash/`, at
-  most `max_files` (300) per run. Encrypted meld-encrypt blocks are stripped
-  before anything is stored. Notes rank above raw documents (`rank_boost`
-  1.25). Progress is `settings.notes_index_state`. `raphael/questions/` is
-  not indexed: `ResearchFlow` already keeps each answer in the store as
-  `aegis://research/<hash>`, and indexing the note too put every answer in
-  retrieval twice. Any row an earlier run made for such a note is removed on
-  the next run.
-- **Writes, insert-only:** only under `raphael/` (research answers in
-  `raphael/questions/`, and whatever Raphael writes with `note_write` /
-  `note_link`) and the daylog's journal notes. A write creates a note or
-  inserts one block into it; nothing the user wrote is ever changed or moved
-  (`is_one_insertion` refuses anything else). Each block carries a hidden
-  `%% aegis:<key> %%` marker, so a re-run adds nothing twice.
-- **The journal:** notes are filed as the vault files its own. With the vault
-  configured, the nightly daylog writes to
-  `journal/<YYYY>/<NN. Mon>/DD MMM YY.md`, the weekly rollup to the week's
-  `W<ww> MMM YY.md` in its Monday's month folder (the vault's weeks start on
-  Monday, with ISO numbers) and the monthly one to the month folder's own note,
-  `journal/<YYYY>/<NN. Mon>/<NN. Mon>.md`. If the user already has the day's or
-  week's note open at the `journal/` root, where periodic-notes creates it,
-  Raphael writes into that one instead. The entry is a `- #raphael day log`
-  bullet (`week in review`, `month in review`) with the text as an indented
-  outline under it: one bullet per prose paragraph, and in the daylog's
-  fallback format each `Label:` line with its items nested under it. It is
-  placed at the end of the note's own section: `Journal` for a day,
-  `Review` for a week or a month (an older month note's `Month Review`),
-  found by its heading text at any level. The section ends at the next
-  heading, a `---` line or a code fence, so the month note's folder card stays
-  last. A note without the section gets `## Journal` / `## Review` and the
-  block at its end. A new note is rendered from the vault's own
-  template, without its open checkboxes and without the empty `- ` placeholder
-  in that section. No `daylog` knowledge row is filed then; if the vault write
-  fails the row is filed as before and the run reports `vault_error`.
+  and indexes every changed `.md` note as `source_type='note'`, skipping the
+  layout's `index_skip_prefixes` (`.obsidian/`, `_templates/`, `backups/`,
+  `_attachments/`, `.trash/`), at most `max_files` (300) per run, one note cut
+  at the row's `index_max_chars` (100,000). Encrypted meld-encrypt blocks are
+  stripped before anything is stored. Notes rank above raw documents
+  (`rank_boost` 1.25). Progress is `settings.notes_index_state`. The layout's
+  `questions_dir` (`raphael/questions/`) is not indexed: `ResearchFlow` already
+  keeps each answer in the store as `aegis://research/<hash>`, and indexing
+  the note too put every answer in retrieval twice. Any row an earlier run
+  made for such a note is removed on the next run.
+- **Writes, insert-only:** only under the layout's `agent_dir` (`raphael/`:
+  research answers in `questions_dir`, and whatever the agent writes with
+  `note_write` / `note_link`) and the daylog's journal notes. A write creates
+  a note or inserts one block into it; nothing the user wrote is ever changed
+  or moved (`is_one_insertion` refuses anything else). Each block carries a
+  hidden `%% aegis:<key> %%` marker, so a re-run adds nothing twice. A commit
+  is authored by the owning agent under its `agents.name`
+  (`<id>@aegis.local`), with the id as the message prefix (`raphael: journal
+  2026-09-12`); with no agent it is `AEGIS <aegis@aegis.local>`.
+- **The journal:** notes are filed as the layout says. With the defaults the
+  nightly daylog writes to `journal/<YYYY>/<NN. Mon>/DD MMM YY.md`, the weekly
+  rollup to the week's `W<ww> MMM YY.md` in its first day's month folder
+  (weeks start on Monday, ISO numbers) and the monthly one to the month
+  folder's own note, `journal/<YYYY>/<NN. Mon>/<NN. Mon>.md`. If the user
+  already has the day's or week's note open in the layout's `live_folder`
+  (`journal/`, where periodic-notes creates it), the agent writes into that
+  one instead. The entry is a `- #raphael day log` bullet (`week in review`,
+  `month in review`; the tag and labels are the layout's) with the text as an
+  indented outline under it (the layout's indent — a tab by default): one
+  bullet per prose paragraph, and in the daylog's fallback format each
+  `Label:` line with its items nested under it. It is placed at the end of
+  the note's own section — the layout's `sections` for the kind: `Journal`
+  for a day, `Review` for a week or a month (an older month note's `Month
+  Review`) — found by its heading text at any level. The section ends at the
+  next heading and, unless the layout says otherwise, a `---` line or a code
+  fence, so the month note's folder card stays last. A note without the
+  section gets `## <first section>` and the block at its end. A new note is
+  rendered from the layout's template for the kind, without its open
+  checkboxes and without the empty `- ` placeholder in that section (both
+  switchable). No `daylog` knowledge row is filed then; if the vault write
+  fails the row is filed as before and the run reports `vault_error`. A kind
+  switched off in the layout files its knowledge row too.
 - **Conflicts:** `obsidian-git` commits from the phone and laptop. A push
-  rejected as not a fast-forward, or a conflicting rebase, drops Raphael's own
-  unpushed commit, pulls fresh and retries once; a second failure is reported
-  and nothing is kept. Raphael never force-pushes. Any other git failure — no
-  network, a refused deploy key, a missing repository — is reported at once
-  without a retry, with a short reason such as "the remote refused the deploy
-  key" and no URL or git output in it.
+  rejected as not a fast-forward, or a conflicting rebase, drops the agent's
+  own unpushed commit, pulls fresh and retries once; a second failure is
+  reported and nothing is kept. It never force-pushes. Any other git failure
+  — no network, a refused deploy key, a missing repository — is reported at
+  once without a retry, with a short reason such as "the remote refused the
+  deploy key" and no URL or git output in it.
 - **Dates:** a dated heading (`note_write` with no heading, a research
-  answer's section) and the time on a journal note Raphael creates are on the
-  user's clock, the `user_timezone` settings row, not the container's UTC.
-- **What insert-only rules out:** Raphael cannot fill in a placeholder that
+  answer's section — the layout's `date_heading_format`), the time on a
+  journal note the agent creates and the day the daylog logs are on the
+  user's clock, the `user_timezone` settings row (Vault page, "Your clock"),
+  not the container's UTC. The nightly run logs the last complete local day
+  (the local date of its clock, minus one) and bounds it on that clock, and
+  the weekly and monthly rollups anchor on the same day; so the crons can sit
+  at any time after local midnight, east or west of UTC. `day_offset` walks
+  further back from there.
+- **What insert-only rules out:** the agent cannot fill in a placeholder that
   is already in a note, such as an empty `- ` bullet the template left. It
-  inserts its own block instead. Only a note Raphael creates from a template
-  loses its empty placeholders.
+  inserts its own block instead. Only a note it creates from a template loses
+  its empty placeholders.
+
+### The layout (Vault page)
+
+`GET/PUT /api/admin/notes/layout` (`services/vault_layout.py`). The read path
+is lenient — a bad key in the row reads as its default, with a warning — and
+the write path is strict: the PUT returns 400 naming the first bad key, so a
+typo cannot quietly move the journal. `GET /api/admin/notes/layout/preview?date=`
+renders the saved layout for a date, and `POST …/preview` a candidate, with
+the same code that writes the notes; the page shows that preview live.
+
+| Key | Default | What it does |
+|---|---|---|
+| `agent_dir` | `raphael` | The one folder the agent may write its own notes in. One folder name. |
+| `questions_dir` | `raphael/questions` | Where research answers are filed; inside `agent_dir`; never indexed. |
+| `locale` | `en` | Month and day names for `MMM`/`MMMM`/`ddd`/`dddd` (the `LOCALES` table is the extension point). |
+| `week_start` | `monday` | `monday` or `sunday`: the rollup's week and the weekly note's first day. |
+| `week_numbering` | `iso` | `iso` (week 1 holds January 4th) or `locale_us` (week 1 holds January 1st): what `ww` renders and the rollup's `YYYY-Www` label. |
+| `date_heading_format` | `YYYY-MM-DD` | The heading a dated section gets. |
+| `index_skip_prefixes` | `.obsidian/`, `_templates/`, `backups/`, `_attachments/`, `.trash/` | Path prefixes the index leaves out. |
+| `entry.tag` | `#raphael` | The tag on the agent's bullet; empty for none. |
+| `entry.indent` | `tab` | `tab`, `two_spaces` or `four_spaces`: the outline's indent (the rollup reads it back with the same). |
+| `entry.max_outline_depth` | `4` | How deep the outline may nest. |
+| `new_note.drop_open_tasks` | `true` | A note the agent creates loses the template's unticked checkboxes. |
+| `new_note.drop_empty_bullets_in_section` | `true` | …and the empty `- ` placeholders in the target section. |
+| `section_ends_at_rule_or_fence` | `true` | A section ends at a `---` rule or a code fence, not only at the next heading. |
+| `language.*` | English | `name` (the language the day log and rollups are written in — English adds nothing to the prompts), and the fixed words of a day log written without a model: `daylog_title`, `quiet_day`, the six labels, `rollup_header`, `journal_title`, `also_in_note`. |
+| `daily` / `weekly` / `monthly` | see below | One block per kind: `enabled`, `folder`, `format`, `live_folder`, `template`, `sections`, `label`. |
+
+Per kind, the defaults: daily `folder "[journal/]YYYY/MM[. ]MMM"`, `format
+"DD MMM YY"`, `live_folder "journal"`, `template
+"_templates/{{tp_title_today}}.md"`, `sections ["Journal"]`, `label "day
+log"`; weekly `format "[W]ww MMM YY"`, `template
+"_templates/weekly-{{tp_title_today}}.md"`, `sections ["Review"]`, `label
+"week in review"` (folder and name rendered for the week's first day);
+monthly `format "MM[. ]MMM"`, `live_folder ""`, `template
+"_templates/monthly.md"`, `sections ["Review", "Month Review"]`, `label "month
+in review"` (rendered for the 1st). Folders and formats are moment.js
+formats; bracket every literal (`[journal/]`), because a bare letter is a
+token. The rules the PUT enforces: a format renders to a non-empty name with
+no slash; a folder is relative with no `..` or dot segment; a day's format
+needs a day token and a month or year token, a week's a week or day token,
+and the month's name must differ from the day's; `agent_dir` is one plain
+segment and `questions_dir` is inside it; `sections` is non-empty; a tag is
+empty or `#` plus one word; a template is a plain relative `.md` path; the
+vocabularies are closed. The journal-path regexes the write gate uses are
+generated from the layout — there is no second copy of the paths in code.
+
+**Changing the layout later.** The PUT keeps the layout in force before the
+change as `previous`. The writer treats a day's paths under the previous
+layout as "already written" too, so a re-run or a backfill after a change
+never writes a day twice, and the rollups still read a day filed under the
+old layout. Nothing is ever moved: existing notes stay where they are.
+
+What stays in code, on purpose: insert-only and `is_one_insertion`, the
+marker format and the forged-marker guard, the path safety refusals,
+pushed-only / never force-push, the flock, the encrypted-block stripping, the
+scrubbing of git output, never running a Templater tag, and the tools' size
+caps.
 
 ### Setting it up
 
@@ -2277,32 +2356,36 @@ record; the knowledge store is only its index (#514, spec
    deploy key **with write access** (GitHub → Settings → Deploy keys). Keep
    the private half out of chat and out of the repo.
 2. On AEGIS's Integrations page, group **Notes (vault)**: set
-   `notes_repo_url` (`git@github.com:arshadansari27/arshad-workspace.git`) and
-   paste the private key into `notes_deploy_key`. Restart core and the worker
-   (the key is written to disk, mode 0600, at boot). The checkout is
+   `notes_repo_url` (`git@github.com:you/your-vault.git`) and paste the
+   private key into `notes_deploy_key`. Restart core and the worker (the key
+   is written to disk, mode 0600, at boot). The checkout is
    `/app/config/notes`, beside the books; no infra change is needed.
-3. Grant Raphael the four tools. The DB `tool_set` wins over the seed:
+3. On the Vault page, set your timezone and — if your vault files its journal
+   differently from the defaults — the layout. Check the preview.
+4. Grant your research agent the four tools. The DB `tool_set` wins over the
+   seed:
 
    ```sql
    UPDATE agents SET metadata = jsonb_set(metadata, '{tool_set}',
      (metadata->'tool_set') || '["note_search","note_read","note_write","note_link"]'::jsonb)
-   WHERE id = 'raphael' AND NOT (metadata->'tool_set' ? 'note_search');
+   WHERE id = '<your research agent id>' AND NOT (metadata->'tool_set' ? 'note_search');
    ```
-4. Build the index without waiting for :19: `temporal schedule trigger
+5. Build the index without waiting for :19: `temporal schedule trigger
    --schedule-id notes-sync-hourly`. The first pass over ~1,000 notes takes a
    few runs (`remaining` in the summary counts down).
-5. The daylog's knowledge rows reach the journal through `NotesBackfillFlow`,
+6. The daylog's knowledge rows reach the journal through `NotesBackfillFlow`,
    which runs weekly (`notes-backfill-weekly`, Sunday 04:47 UTC; the schedule
    appears on its own through `schedule_sync`). It files any day whose vault
    write failed and fell back to its knowledge row, and it uses the live
    markers, so a week with nothing missing writes nothing. The schedule looks
-   only at rows filed in the last `since_days` (14) days: the pre-vault rows
-   are still in the store, and rereading them every week would put back a
-   block you deleted from an old journal note. To move every old row (the
-   first time, or after a vault outage longer than two weeks), start it by
-   hand, where `since_days` defaults to 0 (every row): `temporal workflow
-   start --type NotesBackfillFlow --task-queue aegis-main --workflow-id
-   notes-backfill-journal --input '{"agent_id": "raphael"}'`.
+   only at rows filed in the last `since_days` (14) days, `batch` (50)
+   entries per commit: the pre-vault rows are still in the store, and
+   rereading them every week would put back a block you deleted from an old
+   journal note. To move every old row (the first time, or after a vault
+   outage longer than two weeks), start it by hand, where `since_days`
+   defaults to 0 (every row) and the `research` holder signs the commits:
+   `temporal workflow start --type NotesBackfillFlow --task-queue aegis-main
+   --workflow-id notes-backfill-journal --input '{}'`.
 
 Until step 2 every part reports `not_configured` and the daylog files its
 knowledge rows exactly as before.

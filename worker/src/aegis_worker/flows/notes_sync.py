@@ -17,6 +17,8 @@ from datetime import timedelta
 from temporalio import workflow
 
 with workflow.unsafe.imports_passed_through():
+    from aegis.services.notes import INDEX_MAX_CHARS
+
     from aegis_worker.activities.notes import DEFAULT_INDEX_BATCH
     from aegis_worker.shared.retry import RETRY_ONCE
 
@@ -27,8 +29,12 @@ _INDEX_TIMEOUT = timedelta(minutes=30)
 
 @dataclass
 class NotesSyncConfig:
-    agent_id: str = "raphael"
+    # The activities row's agent; nothing in the flow depends on it.
+    agent_id: str = ""
     max_files: int = DEFAULT_INDEX_BATCH
+    # One note is indexed whole up to this many characters (the row's
+    # `index_max_chars`); a longer one is cut.
+    index_max_chars: int = INDEX_MAX_CHARS
 
 
 @workflow.defn(name="NotesSyncFlow")
@@ -37,7 +43,7 @@ class NotesSyncFlow:
     async def run(self, config: NotesSyncConfig) -> dict:
         return await workflow.execute_activity(
             "notes_index_vault",
-            config.max_files,
+            args=[config.max_files, config.index_max_chars],
             start_to_close_timeout=_INDEX_TIMEOUT,
             retry_policy=RETRY_ONCE,
         )

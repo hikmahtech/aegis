@@ -17,7 +17,8 @@ Three rules, as for the books:
   re-attaches instead of writing twice.
 * **A refusal is a returned sentence, not a raise** — `perform_write` turns
   every `NotesError` into `error: …`.
-* **Only under `raphael/`.** `notes.check_path` enforces it again in the writer.
+* **Only under the agent's own folder** (the layout's `agent_dir`).
+  `notes.check_path` enforces it again in the writer.
 """
 
 from __future__ import annotations
@@ -28,6 +29,7 @@ from datetime import datetime
 from typing import Any
 
 from aegis.services import books, notes
+from aegis.services.vault_layout import DEFAULT_LAYOUT, Layout
 
 # The writer's worst case: clone (first write only) + two attempts of pull,
 # commit and push. The activity's budget, not a chat tool's.
@@ -41,25 +43,27 @@ OPS = ("write", "link")
 _URL_RE = re.compile(r"^https?://\S+$")
 
 
-def normalise_path(path: str) -> str:
-    """`topics/rag` → `raphael/topics/rag.md`. The model may leave off the
+def normalise_path(path: str, layout: Layout = DEFAULT_LAYOUT) -> str:
+    """`topics/rag` → `<agent_dir>/topics/rag.md`. The model may leave off the
     folder or the extension; nothing else is rewritten, so a path that tries to
-    leave `raphael/` is still refused by `notes.check_path`."""
+    leave the agent's folder is still refused by `notes.check_path`."""
     rel = (path or "").strip().strip("/")
-    if rel and not rel.startswith(f"{notes.RAPHAEL_DIR}/"):
-        rel = f"{notes.RAPHAEL_DIR}/{rel}"
+    if rel and not rel.startswith(f"{layout.agent_dir}/"):
+        rel = f"{layout.agent_dir}/{rel}"
     if rel and not rel.endswith(".md"):
         rel += ".md"
     return rel
 
 
-def normalise(op: str, payload: dict, now: datetime | None = None) -> tuple[dict, str | None]:
+def normalise(
+    op: str, payload: dict, now: datetime | None = None, layout: Layout = DEFAULT_LAYOUT
+) -> tuple[dict, str | None]:
     """The payload the write will be built from, or a problem sentence."""
     if op not in OPS:
         return payload, f"unknown notes write {op!r}"
-    path = normalise_path(str(payload.get("path") or ""))
+    path = normalise_path(str(payload.get("path") or ""), layout)
     try:
-        notes.check_path(path)
+        notes.check_path(path, layout=layout)
     except notes.NotesPathError as exc:
         return payload, str(exc)
     if op == "write":
@@ -70,7 +74,7 @@ def normalise(op: str, payload: dict, now: datetime | None = None) -> tuple[dict
             return payload, f"text is longer than {NOTE_TEXT_MAX} characters"
         heading = " ".join(str(payload.get("heading") or "").split())[:HEADING_MAX]
         if not heading:
-            heading = (now or datetime.now()).strftime("%Y-%m-%d")
+            heading = layout.render(layout.date_heading_format, now or datetime.now())
         title = " ".join(str(payload.get("title") or "").split())[:200]
         return {"path": path, "text": text, "heading": heading, "title": title}, None
     target = " ".join(str(payload.get("target") or "").split())
@@ -98,7 +102,7 @@ def write_workflow_id(op: str, payload: dict) -> str:
     return f"notes-write-{op}-{_content_digest(op, payload)}"
 
 
-def build_append(op: str, payload: dict) -> notes.Append:
+def build_append(op: str, payload: dict, layout: Layout = DEFAULT_LAYOUT) -> notes.Append:
     digest = _content_digest(op, payload)
     if op == "write":
         return notes.Append(
@@ -107,23 +111,32 @@ def build_append(op: str, payload: dict) -> notes.Append:
             body=payload["text"],
             heading=payload["heading"],
             title=payload.get("title") or "",
+            layout=layout,
         )
     target, label = payload["target"], payload.get("label") or ""
     if _URL_RE.match(target):
         line = f"- [{label or target}]({target})"
     else:
         line = f"- [[{target}|{label}]]" if label else f"- [[{target}]]"
-    return notes.Append(rel=payload["path"], key=f"link:{digest}", body=line)
+    return notes.Append(rel=payload["path"], key=f"link:{digest}", body=line, layout=layout)
 
 
-async def perform_write(op: str, payload: dict, cfg: notes.NotesConfig) -> dict:
+async def perform_write(
+    op: str,
+    payload: dict,
+    cfg: notes.NotesConfig,
+    *,
+    layout: Layout = DEFAULT_LAYOUT,
+    author: notes.Author | None = None,
+) -> dict:
     """Run one vault write. `{"ok": bool, "message": str}`; never raises for a
     notes-level refusal."""
     if op not in OPS:
         return {"ok": False, "message": f"error: unknown notes write {op!r}"}
+    prefix = (author or cfg.author).prefix
     try:
-        ap = build_append(op, payload)
-        res = await notes.write(cfg, [ap], f"raphael: {op} {payload['path']}")
+        ap = build_append(op, payload, layout)
+        res = await notes.write(cfg, [ap], f"{prefix}: {op} {payload['path']}", author=author)
     except notes.NotesDisabled:
         return {
             "ok": False,

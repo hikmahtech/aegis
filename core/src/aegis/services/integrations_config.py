@@ -241,10 +241,10 @@ CONFIG_REGISTRY: list[ConfigKey] = [
     ),
     ConfigKey(
         "notes_repo_url", "Vault repo URL (git@github.com:you/vault.git)", "Notes (vault)", False,
-        help="The Obsidian vault Raphael reads, indexes and keeps the journal in (#514). "
-        "Append-only: Raphael never changes a line you wrote. Needs the deploy key below "
+        help="The Obsidian vault your research agent reads, indexes and keeps the journal in "
+        "(#514). Append-only: it never changes a line you wrote. Needs the deploy key below "
         "with WRITE access. Empty = not configured (the daylog keeps filing knowledge rows). "
-        "Core + worker restart required.",
+        "Where the notes go is the Vault page. Core + worker restart required.",
     ),
     ConfigKey(
         "notes_deploy_key", "Vault deploy key (private, ed25519)", "Notes (vault)", True,

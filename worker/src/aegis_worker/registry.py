@@ -311,6 +311,9 @@ FLOWS: tuple[FlowSpec, ...] = (
         lambda act: NotesSyncConfig(
             agent_id=act["agent_id"],
             max_files=_int(act["config"], "max_files", NotesSyncConfig.max_files),
+            index_max_chars=_int(
+                act["config"], "index_max_chars", NotesSyncConfig.index_max_chars
+            ),
         ),
     ),
     FlowSpec(
@@ -319,6 +322,7 @@ FLOWS: tuple[FlowSpec, ...] = (
             agent_id=act["agent_id"],
             limit=_int(act["config"], "limit", NotesBackfillConfig.limit),
             since_days=_int(act["config"], "since_days", NotesBackfillConfig.since_days),
+            batch=_int(act["config"], "batch", NotesBackfillConfig.batch),
         ),
     ),
     FlowSpec(

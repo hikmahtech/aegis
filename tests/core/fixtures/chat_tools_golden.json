@@ -580,7 +580,7 @@
     "type": "function",
     "function": {
       "name": "note_search",
-      "description": "Search the user's Obsidian vault \u2014 journal, knowledge, literature and reference notes, and Raphael's own notes \u2014 and return the best-matching notes with their paths. Read one in full with note_read.",
+      "description": "Search the user's Obsidian vault \u2014 every indexed note, this agent's own included \u2014 and return the best-matching notes with their paths. Read one in full with note_read.",
       "parameters": {
         "type": "object",
         "properties": {
@@ -606,7 +606,7 @@
     "type": "function",
     "function": {
       "name": "note_read",
-      "description": "Read one note from the user's Obsidian vault by its path, e.g. journal/2026/09. Sep/12 Sep 26.md. Encrypted blocks are never shown.",
+      "description": "Read one note from the user's Obsidian vault by its path inside the vault, as note_search returns it. Encrypted blocks are never shown.",
       "parameters": {
         "type": "object",
         "properties": {
@@ -632,13 +632,13 @@
     "type": "function",
     "function": {
       "name": "note_write",
-      "description": "Add a section to one of Raphael's notes in the vault, creating the note if it does not exist. Append-only: nothing already in a note is ever changed. Only notes under raphael/ can be written, e.g. raphael/topics/rag.md.",
+      "description": "Add a section to one of this agent's own notes in the user's vault, creating the note if it does not exist. Append-only: nothing already in a note is ever changed. Only notes in this agent's own folder can be written; give the path inside that folder, e.g. topics/rag.",
       "parameters": {
         "type": "object",
         "properties": {
           "path": {
             "type": "string",
-            "description": "The note, under raphael/ (the folder and .md are added if left off)."
+            "description": "The note, inside this agent's folder (the folder and .md are added if left off)."
           },
           "text": {
             "type": "string",
@@ -666,13 +666,13 @@
     "type": "function",
     "function": {
       "name": "note_link",
-      "description": "Link one of Raphael's notes to another note, a book, a paper or a URL by appending one line: a [[wikilink]] for a note or book title, a markdown link for a URL. Append-only, under raphael/ only.",
+      "description": "Link one of this agent's own notes to another note, a book, a paper or a URL by appending one line: a [[wikilink]] for a note or book title, a markdown link for a URL. Append-only, inside this agent's folder only.",
       "parameters": {
         "type": "object",
         "properties": {
           "path": {
             "type": "string",
-            "description": "The note to add the link to, under raphael/."
+            "description": "The note to add the link to, inside this agent's folder."
           },
           "target": {
             "type": "string",
