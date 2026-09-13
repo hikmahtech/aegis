@@ -237,6 +237,11 @@ FLOWS: tuple[FlowSpec, ...] = (
         DailyBriefingFlow,
         lambda act: DailyBriefingConfig(
             agent_id=act["agent_id"],
+            # The day of the month the research agent's briefing reviews the
+            # feeds (#511); 0 = every run.
+            feed_review_day=_int(
+                act["config"] or {}, "feed_review_day", DailyBriefingConfig.feed_review_day
+            ),
         ),
     ),
     # day_offset 0 = the date the run starts on. At the 19:00 UTC cron that is
@@ -378,6 +383,9 @@ FLOWS: tuple[FlowSpec, ...] = (
             topics=list(act["config"].get("topics") or []),
             max_results=_int(act["config"], "max_results", 20),
             significance_threshold=_int(act["config"], "significance_threshold", 4),
+            # The searxng query per topic; blank = the source's built-in one
+            # (`intel_scan.DEFAULT_QUERY_TEMPLATES`).
+            query_template=str(act["config"].get("query_template") or ""),
         ),
     ),
     FlowSpec(
@@ -463,6 +471,23 @@ FLOWS: tuple[FlowSpec, ...] = (
             limit=_int(act["config"], "limit", 5),
             timeout_seconds=_int(act["config"], "timeout_seconds", 2 * 86400),
             aegis_ui_url=act["_settings"].get("aegis_ui_url", ""),
+            # The detectors' thresholds (#513): what "recurring", "frequently
+            # hit" and "searched and found nothing" mean, per deployment.
+            min_attendee_events=_int(
+                act["config"], "min_attendee_events", CuriosityConfig.min_attendee_events
+            ),
+            min_project_tasks=_int(
+                act["config"], "min_project_tasks", CuriosityConfig.min_project_tasks
+            ),
+            empty_search_days=_int(
+                act["config"], "empty_search_days", CuriosityConfig.empty_search_days
+            ),
+            min_empty_searches=_int(
+                act["config"], "min_empty_searches", CuriosityConfig.min_empty_searches
+            ),
+            search_miss_below=_float(
+                act["config"], "search_miss_below", CuriosityConfig.search_miss_below
+            ),
         ),
     ),
     # A2 — weekly proposed edit to the agent's own `user` persona doc, delivered

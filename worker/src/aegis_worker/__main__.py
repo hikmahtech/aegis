@@ -10,7 +10,9 @@ import asyncio
 import os
 
 import structlog
+from aegis.services.agents import resolve_tag
 from aegis.services.books import config_from_settings, parse_csv_set, parse_kv
+from aegis.services.user_agent import bot_user_agent
 from temporalio.client import Client
 from temporalio.contrib.opentelemetry import TracingInterceptor
 from temporalio.worker import Worker
@@ -150,6 +152,15 @@ async def main():
 
     # Create activity instances with real dependencies + connectors
     connectors = deps.connectors
+    # The research lane's agent: whoever holds the `research` capability tag,
+    # never a literal id (issue #36). "" when no active agent does; the lane
+    # then stamps its llm_calls rows with no agent and says so once here.
+    research_agent = await resolve_tag(deps.pool, "research") or ""
+    if not research_agent:
+        logger.warning("research_agent_unresolved", tag="research")
+    # The one User-Agent AEGIS's fetches send, naming this deployment's
+    # contact URL (Integrations → bot_contact_url, else the admin UI's URL).
+    user_agent = bot_user_agent(settings)
 
     hub_act = HubActivities(
         db_pool=deps.pool,
@@ -226,12 +237,14 @@ async def main():
         elevenlabs_api_key=getattr(settings, "elevenlabs_api_key", ""),
         elevenlabs_stt_model=getattr(settings, "elevenlabs_stt_model", "scribe_v1"),
         raindrop_api_token=getattr(settings, "raindrop_api_token", ""),
+        user_agent=user_agent,
     )
     intel_act = IntelligenceActivities(
         knowledge_connector=connectors.get("knowledge"),
         llm_client=deps.llm,
         model_light=model_balanced,
         db_pool=deps.pool,
+        agent_id=research_agent,
     )
     cleanup_act = CleanupActivities(
         db_pool=deps.pool,
@@ -400,8 +413,9 @@ async def main():
         raindrop_api_token=getattr(settings, "raindrop_api_token", ""),
         db_pool=deps.pool,
     )
-    # The research lane (#509). Raphael's tier is smart, so the synthesis runs
-    # on the tier-resolved smart model, never the raw settings field.
+    # The research lane (#509). The research agent's tier is smart, so the
+    # synthesis runs on the tier-resolved smart model, never the raw settings
+    # field.
     research_act = ResearchActivities(
         knowledge_connector=connectors.get("knowledge"),
         search_connector=connectors.get("search"),
@@ -409,6 +423,7 @@ async def main():
         model=deps.model_tiers.get("smart") or settings.model_smart,
         db_pool=deps.pool,
         settings=settings,
+        agent_id=research_agent,
     )
     # The Calibre library index (#510). The connector is built from the
     # Integrations settings on first use, so there is nothing to wire here
@@ -418,7 +433,7 @@ async def main():
         db_pool=deps.pool,
         settings=settings,
     )
-    # Raphael's notes (#514): the Obsidian vault checkout is read from the
+    # The research agent's notes (#514): the Obsidian vault checkout is read from the
     # Integrations settings on every call, so a key saved in the admin UI
     # applies after the worker restart the page already asks for.
     notes_act = NotesActivities(
@@ -426,7 +441,7 @@ async def main():
         db_pool=deps.pool,
         knowledge_connector=connectors.get("knowledge"),
     )
-    rss_act = RssActivities(db_pool=deps.pool)
+    rss_act = RssActivities(db_pool=deps.pool, user_agent=user_agent)
     # B7 — wearable vendor poll. An empty token is not an error here: the
     # activity refuses to issue a request and reports `token_missing`, which
     # the flow surfaces in result_summary.

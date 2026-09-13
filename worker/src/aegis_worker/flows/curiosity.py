@@ -38,7 +38,7 @@ from temporalio.exceptions import ApplicationError, WorkflowAlreadyStartedError
 
 with workflow.unsafe.imports_passed_through():
     from aegis_worker.activities.agent_registry import AgentRegistryActivities
-    from aegis_worker.activities.curiosity import CuriosityActivities
+    from aegis_worker.activities.curiosity import TRACK_CHOICES, CuriosityActivities
     from aegis_worker.flows.interaction import InteractionFlow, InteractionFlowInput
     from aegis_worker.shared.retry import NO_RETRY, TIMEOUT_FAST, TIMEOUT_LLM
 
@@ -85,6 +85,22 @@ class CuriosityConfig:
     # "Open in admin" deep link (cards.py renders no button for `input`
     # without it). Empty = section-only card, still resolvable in the admin.
     aegis_ui_url: str = ""
+    # The detectors' thresholds, from the row's `activities.config` (the
+    # registry builder); the defaults are `CuriosityActivities`' own.
+    min_attendee_events: int = 3
+    min_project_tasks: int = 5
+    empty_search_days: int = 14
+    min_empty_searches: int = 2
+    search_miss_below: float = 0.60
+
+    def thresholds(self) -> dict:
+        return {
+            "min_attendee_events": self.min_attendee_events,
+            "min_project_tasks": self.min_project_tasks,
+            "empty_search_days": self.empty_search_days,
+            "min_empty_searches": self.min_empty_searches,
+            "search_miss_below": self.search_miss_below,
+        }
 
 
 @workflow.defn(name="CuriosityCardFlow")
@@ -111,7 +127,7 @@ class CuriosityCardFlow:
             try:
                 candidates = await workflow.execute_activity_method(
                     CuriosityActivities.find_curiosity_gaps,
-                    args=[config.agent_id, config.limit],
+                    args=[config.agent_id, config.limit, config.thresholds()],
                     # The detector's optional phrasing pass is an LLM call.
                     start_to_close_timeout=TIMEOUT_LLM,
                     retry_policy=NO_RETRY,
@@ -152,7 +168,16 @@ class CuriosityCardFlow:
             step = "spawn_card"
             novelty_key = str(top.get("novelty_key") or "")
             child_id = f"curiosity-{_ID_SAFE.sub('_', novelty_key)[:180]}"
-            options = {"aegis_ui_url": config.aegis_ui_url} if config.aegis_ui_url else None
+            # Most gaps ask an open question (`input`: a deep link in Slack, a
+            # textarea in the admin), because we do not know the answer's
+            # shape. "Track this?" (#513) has exactly two answers, so it is a
+            # `choice` with two buttons, and the hook reads the button value
+            # rather than parsing English.
+            if top.get("gap_type") == "untracked_topic":
+                kind, options = "choice", dict(TRACK_CHOICES)
+            else:
+                kind = "input"
+                options = {"aegis_ui_url": config.aegis_ui_url} if config.aegis_ui_url else None
             metadata = {
                 "novelty_key": novelty_key,
                 "gap_type": top.get("gap_type"),
@@ -182,10 +207,7 @@ class CuriosityCardFlow:
                     InteractionFlow.run,
                     InteractionFlowInput(
                         agent_id=target,
-                        # `input` = free-text answer: a deep link in Slack, a
-                        # textarea in the admin. Not `choice` — the whole point
-                        # is that we do not know the answer's shape.
-                        kind="input",
+                        kind=kind,
                         origin="curiosity",
                         prompt=str(top.get("question") or ""),
                         options=options,

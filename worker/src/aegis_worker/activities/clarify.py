@@ -1011,7 +1011,7 @@ class ClarifyActivities:
             "<!-- aegis:problem " in (task.get("description") or "")
             or await self._hub_owns(task)
         ):
-            return self._hub_owned("a research task the problem hub raised for Raphael")
+            return self._hub_owned("a research task the problem hub raised for the research agent")
 
         # Content-route branch. First encounter (no @pandora label yet — that
         # case returned in the @pandora block above). A `gate: true` route

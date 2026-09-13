@@ -12,13 +12,10 @@ import asyncio
 from dataclasses import dataclass
 from typing import Any
 
-from aegis.services import library, notes
+from aegis.services import library, library_config, notes, research_config, topics_config
 from aegis.services import research as rs
 from aegis.services.user_time import user_now
 from temporalio import activity
-
-# How many of a topic round's items a topic task's research run is given.
-_TOPIC_ITEMS = 10
 
 
 @dataclass
@@ -26,13 +23,32 @@ class ResearchActivities:
     knowledge_connector: Any = None
     search_connector: Any = None
     llm_client: Any = None
-    # The smart tier, resolved in `__main__` — Raphael's tier. Changing this
-    # default does nothing in a real worker.
+    # The smart tier, resolved in `__main__` — the research agent's tier.
+    # Changing this default does nothing in a real worker.
     model: str = ""
     db_pool: Any = None
     settings: Any = None
-    # Stamped on every llm_calls row this lane writes.
-    agent_id: str = "raphael"
+    # Stamped on every llm_calls row this lane writes: the agent holding the
+    # `research` tag, resolved in `__main__` at boot. "" = no such agent; the
+    # rows are then written with no agent (NULL), never a made-up id.
+    agent_id: str = ""
+
+    async def _config(self) -> dict:
+        return await research_config.get_research_config(self.db_pool)
+
+    async def _agent_name(self) -> str:
+        """The owning agent's `agents.name`, for the synthesis prompt; "" when
+        there is no agent or the lookup fails."""
+        if not self.agent_id or self.db_pool is None:
+            return ""
+        try:
+            return str(
+                await self.db_pool.fetchval("SELECT name FROM agents WHERE id = $1", self.agent_id)
+                or ""
+            )
+        except Exception as exc:  # noqa: BLE001 — a name is a nicety
+            activity.logger.warning("research_agent_name_failed err=%s", str(exc)[:200])
+            return ""
 
     @activity.defn
     async def research_gather(self, request: dict) -> dict:
@@ -45,11 +61,15 @@ class ResearchActivities:
         errors: list[str] = []
         # Every stored document this run hands the model, for the retrieval log.
         used: list[str] = []
+        cfg = await self._config()
+        limits = rs.depth_limits(cfg, depth)
 
         kg: list[dict] = []
-        if self.knowledge_connector is not None:
+        if self.knowledge_connector is not None and int(cfg["knowledge_hits"]) > 0:
             try:
-                hits = await self.knowledge_connector.search(question, limit=5)
+                hits = await self.knowledge_connector.search(
+                    question, limit=int(cfg["knowledge_hits"])
+                )
                 kg = [
                     {
                         "title": str(h.get("title") or ""),
@@ -61,33 +81,42 @@ class ResearchActivities:
                 used += [str(h.get("content_id") or "") for h in hits or []]
             except Exception as exc:  # noqa: BLE001 — a slow store costs its part, not the run
                 errors.append(f"knowledge: {str(exc)[:200]}")
-        kg = await self._notes_first(question, kg, errors, used)
+        kg = await self._notes_first(question, kg, errors, used, int(cfg["note_hits"]))
 
         books = await self._library(question, errors, used)
 
         web: list[dict] = []
         if self.search_connector is None:
             errors.append("web: search is not configured")
-        else:
+        elif int(limits["web_results"]) > 0:
             try:
                 web = await rs.web_search(
-                    self.search_connector, question, limit=rs.WEB_RESULTS[depth], domains=domains
+                    self.search_connector,
+                    question,
+                    limit=int(limits["web_results"]),
+                    domains=domains,
                 )
             except Exception as exc:  # noqa: BLE001
                 errors.append(f"web: {str(exc)[:200]}")
 
         papers: list[dict] = []
-        if rs.looks_academic(question, domains):
-            found = await rs.paper_search(question, limit=rs.PAPER_RESULTS[depth])
+        if int(limits["papers"]) > 0 and rs.looks_academic(
+            question, domains, cfg.get("academic_terms")
+        ):
+            found = await rs.paper_search(
+                question,
+                limit=int(limits["papers"]),
+                api_key=str(getattr(self.settings, "semantic_scholar_api_key", "") or ""),
+            )
             papers = list(found.get("papers") or [])
             errors += [f"papers: {e}" for e in found.get("errors") or []]
 
         to_read: list[str] = []
         for url in [*seed, *(r["url"] for r in web)]:
+            if len(to_read) >= int(limits["pages"]):
+                break
             if url not in to_read:
                 to_read.append(url)
-            if len(to_read) >= rs.PAGES_TO_READ[depth]:
-                break
         await self._log_retrieval(question, used)
         return {
             "kg": kg,
@@ -111,6 +140,12 @@ class ResearchActivities:
         ids = list(dict.fromkeys(c for c in content_ids if c))
         if not ids or self.db_pool is None:
             return
+        if not self.agent_id:
+            # The log's `agent_id` is NOT NULL: with no research agent there
+            # is nobody to file the read under, so the feed stats miss this
+            # run's use. Said once per run rather than failing the step.
+            activity.logger.warning("research_retrieval_log_skipped reason=no_research_agent")
+            return
         try:
             workflow_id = activity.info().workflow_id
         except RuntimeError:
@@ -128,16 +163,20 @@ class ResearchActivities:
             activity.logger.warning("research_retrieval_log_failed err=%s", str(exc)[:200])
 
     async def _notes_first(
-        self, question: str, kg: list[dict], errors: list[str], used: list[str]
+        self, question: str, kg: list[dict], errors: list[str], used: list[str], limit: int = 3
     ) -> list[dict]:
         """The user's own notes, ahead of everything else the store has (#514).
 
         Only with the vault configured: until then nothing is indexed as a
         note, and the search would cost an embedding to find nothing."""
-        if self.knowledge_connector is None or not notes.config_from_settings(self.settings).configured:
+        if (
+            self.knowledge_connector is None
+            or limit <= 0
+            or not notes.config_from_settings(self.settings).configured
+        ):
             return kg
         try:
-            hits = await self.knowledge_connector.search(question, limit=3, source_type="note")
+            hits = await self.knowledge_connector.search(question, limit=limit, source_type="note")
         except Exception as exc:  # noqa: BLE001 — a slow store costs its part, not the run
             errors.append(f"notes: {str(exc)[:200]}")
             return kg
@@ -160,9 +199,14 @@ class ResearchActivities:
         failed step."""
         if self.knowledge_connector is None:
             return []
+        lim = await library_config.get_library_config(self.db_pool)
+        if int(lim["research_book_hits"]) <= 0:
+            return []
         try:
             hits = await self.knowledge_connector.search(
-                question, limit=library.RESEARCH_BOOK_HITS, source_type=library.BOOK_SOURCE_TYPE
+                question,
+                limit=int(lim["research_book_hits"]),
+                source_type=library.BOOK_SOURCE_TYPE,
             )
         except Exception as exc:  # noqa: BLE001 — a slow store costs its part, not the run
             errors.append(f"library: {str(exc)[:200]}")
@@ -173,7 +217,7 @@ class ResearchActivities:
             for b in (library.book_hit(h) for h in hits or [])
             if b["id"] is not None
         ]
-        if not books or books[0]["similarity"] < library.RESEARCH_PASSAGE_MIN_SIMILARITY:
+        if not books or books[0]["similarity"] < float(lim["research_passage_min_similarity"]):
             return books
         conn, _reason = library.connector_or_reason(self.settings)
         if conn is None:
@@ -184,7 +228,8 @@ class ResearchActivities:
                     conn,
                     books[0]["id"],
                     query=question,
-                    pdf_scan_pages=library.RESEARCH_PDF_SCAN_PAGES,
+                    pdf_scan_pages=int(lim["research_pdf_scan_pages"]),
+                    limits=lim,
                 ),
                 timeout=library.RESEARCH_LIBRARY_READ_S,
             )
@@ -196,7 +241,7 @@ class ResearchActivities:
             books[0]["cite"] = passages[0]["cite"]
             books[0]["passage"] = "\n\n".join(
                 f"({p['cite']}) {p['text']}" for p in passages
-            )[: library.RESEARCH_PASSAGE_CHARS]
+            )[: int(lim["research_passage_chars"])]
         elif read.get("error"):
             errors.append(f"library: {read['error']}")
         return books
@@ -205,8 +250,9 @@ class ResearchActivities:
     async def research_read(self, urls: list[str]) -> dict:
         """The chosen pages' text, read together. A page that will not read is
         an `errors` line, not a failed step."""
+        page_chars = int((await self._config())["page_chars"])
         results = await asyncio.gather(
-            *(rs.read_url(u, max_chars=rs.PAGE_CHARS) for u in urls or [])
+            *(rs.read_url(u, max_chars=page_chars) for u in urls or [])
         )
         pages = [r for r in results if not r.get("error")]
         errors = [f"{str(r.get('url') or '')[:120]}: {r['error']}" for r in results if r.get("error")]
@@ -221,12 +267,14 @@ class ResearchActivities:
         `synthesized` is False for every answer that is not the model's own —
         nothing found, no model, a failed call — and the flow saves only a True
         one, so an apology is never stored as research (#508)."""
+        cfg = await self._config()
         sources = rs.build_sources(
             pages,
             gathered.get("papers") or [],
             gathered.get("web") or [],
             gathered.get("kg") or [],
             books=gathered.get("books") or [],
+            page_chars=int(cfg["page_chars"]),
         )
         public = rs.public_sources(sources)
         if not sources:
@@ -248,11 +296,13 @@ class ResearchActivities:
             result = await self.llm_client.think(
                 prompt=rs.synthesis_prompt(question, context, sources),
                 model=self.model,
-                system_prompt=rs.SYNTHESIS_SYSTEM,
+                # The owning agent's name, read at synthesis time, so a
+                # renamed agent is what the model is told it is.
+                system_prompt=rs.synthesis_system(await self._agent_name()),
                 max_tokens=2500,
                 db_pool=self.db_pool,
                 purpose="research_synthesis",
-                agent_id=self.agent_id,
+                agent_id=self.agent_id or None,
             )
             answer = str(result.get("response") or "").strip()
         except Exception as exc:  # noqa: BLE001 — the run still answers, saying it failed
@@ -263,7 +313,14 @@ class ResearchActivities:
                 "synthesized": False,
                 "sources": public,
             }
-        return {"answer": answer, "synthesized": True, "sources": public}
+        return {
+            "answer": answer,
+            "synthesized": True,
+            "sources": public,
+            # Rendered here, where the `report_chars` limit can be read; the
+            # flow posts this and falls back to its own rendering without it.
+            "report": rs.render_report(answer, public, limit_chars=int(cfg["report_chars"])),
+        }
 
     @activity.defn
     async def research_save(self, question: str, answer: str, sources: list[dict]) -> dict:
@@ -273,6 +330,8 @@ class ResearchActivities:
         With the vault configured (#514) the answer is also appended to
         `raphael/questions/<slug>-<hash>.md` — the record, append-only; the
         outcome of that is `vault`, and a vault problem never fails the save."""
+        report_chars = int((await self._config())["report_chars"])
+        report = rs.render_report(answer, sources, limit_chars=report_chars)
         if self.knowledge_connector is None:
             out: dict = {"saved": False, "reason": "no knowledge store"}
         else:
@@ -281,23 +340,25 @@ class ResearchActivities:
                 title=f"Research: {question}"[:300],
                 source_type="research",
                 summary=answer[:500],
-                raw_text=rs.render_report(answer, sources),
+                raw_text=report,
                 tags=["research"],
                 metadata={"sources": len(sources)},
             )
             out = {"saved": True}
-        vault = await self._save_to_vault(question, answer, sources)
+        vault = await self._save_to_vault(question, answer, sources, report=report)
         if vault is not None:
             out["vault"] = vault
         return out
 
-    async def _save_to_vault(self, question: str, answer: str, sources: list[dict]) -> dict | None:
+    async def _save_to_vault(
+        self, question: str, answer: str, sources: list[dict], *, report: str | None = None
+    ) -> dict | None:
         cfg = notes.config_from_settings(self.settings)
         if not cfg.configured:
             return None
         # Dated on the user's calendar, not the container's UTC one.
         asked = await user_now(self.db_pool)
-        ap = notes.question_append(question, rs.render_report(answer, sources), asked)
+        ap = notes.question_append(question, report or rs.render_report(answer, sources), asked)
         try:
             res = await notes.write(cfg, [ap], "raphael: research answer")
         except Exception as exc:  # noqa: BLE001 — the store save stands; the vault is the extra
@@ -323,8 +384,8 @@ class ResearchActivities:
         from aegis.services.hub import TOPIC_CLASS
         from aegis.services.hub_project import ensure_problem_for_task
 
-        # Source `research` makes the problem Raphael's (#513); the default,
-        # `session`, is the infra agent's.
+        # Source `research` makes the problem the research agent's (#513); the
+        # default, `session`, is the infra agent's.
         problem = await ensure_problem_for_task(
             self.db_pool, task_id, source="research", settings=self.settings
         )
@@ -333,8 +394,11 @@ class ResearchActivities:
         out: dict = {"problem_id": str(problem["id"]), "class": str(problem.get("class") or "")}
         meta = problem.get("metadata") if isinstance(problem.get("metadata"), dict) else {}
         if out["class"] == TOPIC_CLASS and meta.get("topic"):
+            # As many of the round's items as its digest lists
+            # (`research_topics_config.digest_items`).
+            digest = int((await topics_config.get_topics_config(self.db_pool))["digest_items"])
             items = await research_topics.round_items(
-                self.db_pool, out["problem_id"], limit=_TOPIC_ITEMS
+                self.db_pool, out["problem_id"], limit=digest
             )
             out["topic"] = str(meta["topic"])
             out["items"] = [
