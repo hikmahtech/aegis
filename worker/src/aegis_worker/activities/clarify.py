@@ -233,6 +233,16 @@ def _addressable_agents(reg: dict[str, dict]) -> list[tuple[str, str]]:
     return out
 
 
+def _label_owner(reg: dict[str, dict], label: str) -> str | None:
+    """The agent (first by id) whose aliases include `label`, e.g. "@pandora"."""
+    return next((aid for aid in sorted(reg) if label in reg[aid]["aliases"]), None)
+
+
+def _cap_holder(reg: dict[str, dict], cap: str) -> str | None:
+    """The agent (first by id) holding behavior tag `cap`."""
+    return next((aid for aid in sorted(reg) if cap in reg[aid]["caps"]), None)
+
+
 def _assignee_labels(reg: dict[str, dict]) -> list[str]:
     """Valid classifier assignee labels: @me plus every agent alias."""
     labels = ["@me"]
@@ -1703,11 +1713,18 @@ class ClarifyActivities:
             # commands are sent here — the spawned workflow does all
             # writes (chat + Todoist comment).
             #
-            # Agent id mapping is mostly classification.replace("_followup", "")
-            # except for pandora — the personality directory + agents.id
-            # is "pandoras-actor", not "pandora".
+            # "<id>_followup" names its agent. pandora_chat_followup names a
+            # label, not an id: the agent is whoever lists @pandora in its
+            # mention_aliases, else the `infra` holder — never an example id
+            # (#579). With neither, nobody can reply, so the task stays
+            # unclarified and is looked at again once one is configured.
             if classification == "pandora_chat_followup":
-                target_agent = "pandoras-actor"
+                target_agent = _label_owner(reg, "@pandora") or _cap_holder(reg, "infra")
+                if not target_agent:
+                    activity.logger.warning(
+                        "clarify_pandora_followup_no_agent task=%s", item_id
+                    )
+                    return {"applied": False, "commands_sent": 0, "outbox_queued": 0}
             else:
                 target_agent = classification.replace("_followup", "")
             # Fetch the recent comment thread so the agent sees its own
@@ -2701,11 +2718,25 @@ class ClarifyActivities:
         )
         await safe_send_message(
             delivery,
-            agent_id="raphael",
+            agent_id=await self._agent_holding("research"),
             message=message,
             log_event="reference_filed_notify_failed",
         )
         return True
+
+    async def _agent_holding(self, tag: str) -> str:
+        """The active agent holding behavior tag `tag` — who speaks for the
+        library notices, never an example id (#579). "" when nobody does (or
+        there is no pool): comms then posts from its default."""
+        if self.db_pool is None:
+            return ""
+        from aegis.services.agents import resolve_tag
+
+        try:
+            return await resolve_tag(self.db_pool, tag) or ""
+        except Exception as exc:  # noqa: BLE001 — a notice never fails on its speaker
+            activity.logger.warning("clarify_agent_lookup_failed error=%s", error_text(exc))
+            return ""
 
     async def _notify_reference_demoted(self, title: str, reason: str) -> bool:
         """Send a raphael-voiced chat message that a reference couldn't be filed.
@@ -2730,7 +2761,7 @@ class ClarifyActivities:
         )
         await safe_send_message(
             delivery,
-            agent_id="raphael",
+            agent_id=await self._agent_holding("research"),
             message=message,
             log_event="reference_demoted_notify_failed",
         )

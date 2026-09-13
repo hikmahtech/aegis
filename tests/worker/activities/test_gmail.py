@@ -598,8 +598,8 @@ async def test_classify_email_records_agent_id_on_llm_call(tmp_path, db_pool):
     """gmail_classification is the highest-volume worker-side LLM call
     (hourly triage across every account) and was one of the call sites
     contributing to the 95% of llm_calls rows with NULL agent_id — this guards
-    that the row carries GmailActivities.agent_id (default 'sebas', matching
-    GmailIngestFlow's config default).
+    that the row carries GmailActivities.agent_id (the `gtd` holder, which
+    `__main__` resolves at boot and passes in — #579).
 
     Real pool, row read back: `record_llm_call` swallows its own errors, so an
     `execute` mock asserts against a write that may never have landed. Real
@@ -617,6 +617,7 @@ async def test_classify_email_records_agent_id_on_llm_call(tmp_path, db_pool):
     )
     acts = _make_gmail_with_llm(tmp_path, llm)
     acts.db_pool = db_pool
+    acts.agent_id = "sebas"
     msg = {
         "id": "msg-agent",
         "sender": "zz106-digest@example.com",

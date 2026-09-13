@@ -475,8 +475,9 @@ async def test_apply_review_acknowledgement_snoozes_on_need_time(
         "temporalio.client.Client", _StubClient
     )
 
+    # The owner `__main__` resolves from the `gtd` tag and passes in (#579).
     acts = ReviewActivities(
-        db_pool=db_pool, temporal_host="aegis_temporal:7233"
+        db_pool=db_pool, temporal_host="aegis_temporal:7233", agent_id="sebas"
     )
     # Seed paired interaction + digest row so the UPDATE actually finds it
     flow_run_id = "gtd-review-daily-test-snooze"
@@ -493,6 +494,8 @@ async def test_apply_review_acknowledgement_snoozes_on_need_time(
     assert out["snoozed"] is True
     # start_workflow was called with DailyReviewFlow + start_delay=1h
     assert started["args"][0] == "DailyReviewFlow"
+    # The re-fire runs as the review's owner, never a literal id (#579).
+    assert started["args"][1]["agent_id"] == "sebas"
     kw = started["kwargs"]
     assert kw.get("task_queue") == "aegis-main"
     from datetime import timedelta as _td

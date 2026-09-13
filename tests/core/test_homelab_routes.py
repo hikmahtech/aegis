@@ -104,7 +104,7 @@ def test_homelab_trigger_run_queues_workflow(app, client, monkeypatch):
     """POST /{flow}/run delegates to _start_workflow and returns the workflow id."""
     calls = []
 
-    async def fake_start(flow, cfg, temporal_client):
+    async def fake_start(flow, cfg, temporal_client, pool=None):
         calls.append((flow, cfg))
         handle = MagicMock()
         handle.id = "wf-1"
@@ -126,7 +126,7 @@ def test_cert_radar_trigger_uses_settings_domains(app, client, monkeypatch):
     """Manual cert_radar trigger with no body pulls domains from settings."""
     calls = []
 
-    async def fake_start(flow, cfg, temporal_client):
+    async def fake_start(flow, cfg, temporal_client, pool=None):
         calls.append((flow, cfg))
         handle = MagicMock()
         handle.id = "wf-cr-1"
@@ -145,7 +145,7 @@ def test_cert_radar_trigger_body_overrides_defaults(app, client, monkeypatch):
     """Explicit body domains override the settings fallback."""
     calls = []
 
-    async def fake_start(flow, cfg, temporal_client):
+    async def fake_start(flow, cfg, temporal_client, pool=None):
         calls.append((flow, cfg))
         handle = MagicMock()
         handle.id = "wf-cr-2"

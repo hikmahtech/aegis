@@ -52,10 +52,10 @@ class BriefingActivities:
     core_api_url: str = ""
     api_key: str = ""
     frame_model: str = "gpt-oss:20b"
-    # Owning agent — matches DailyBriefingFlow's config default. Threaded into
-    # the `llm_calls` row for `frame_briefing` so the briefing's LLM spend is
-    # attributable rather than NULL (same pattern as IntelligenceActivities).
-    agent_id: str = "sebas"
+    # Owning agent — the `gtd` holder, resolved at boot in `__main__` (#579).
+    # Threaded into the `llm_calls` row for `frame_briefing` so the briefing's
+    # LLM spend is attributable; "" (nobody holds the tag) records no agent.
+    agent_id: str = ""
     # DeliveryActivities, wired in `__main__.py` after it is constructed (the
     # same pattern HomelabActivities/MoneyActivities use). Needed because the
     # health block is rendered and sent inside ONE activity — see
@@ -628,7 +628,7 @@ class BriefingActivities:
                     model=self.frame_model,
                     db_pool=self.db_pool,
                     purpose="briefing_frame",
-                    agent_id=self.agent_id,
+                    agent_id=self.agent_id or None,
                 )
                 raw = result.get("response", "") if isinstance(result, dict) else (result or "")
                 narrative = (raw or "").strip() or fallback

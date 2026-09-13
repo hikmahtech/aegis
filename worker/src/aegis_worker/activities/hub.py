@@ -73,6 +73,19 @@ class HubActivities:
         self.model = model
         self.delivery = delivery
 
+    async def _infra_agent(self) -> str:
+        """The `infra` holder, who judges and announces a group — never an
+        example id (#579). "" when nobody holds the tag or there is no pool."""
+        if self.db_pool is None:
+            return ""
+        from aegis.services.agents import resolve_tag
+
+        try:
+            return await resolve_tag(self.db_pool, "infra") or ""
+        except Exception as exc:  # noqa: BLE001 — an owner lookup never breaks the sweep
+            activity.logger.warning("hub_infra_agent_lookup_failed error=%s", error_text(exc))
+            return ""
+
     @activity.defn
     async def ingest_alert(self, alert: dict, resolved: bool = False) -> dict:
         """Record an alert dict (the shape every producer builds) as a problem
@@ -633,7 +646,7 @@ class HubActivities:
                 ),
                 db_pool=self.db_pool,
                 purpose="hub_group_judge",
-                agent_id="pandoras-actor",
+                agent_id=await self._infra_agent() or None,
             )
         except Exception as exc:  # noqa: BLE001 — a judge that will not answer says no
             activity.logger.warning("hub_group_judge_failed error=%s", error_text(exc))
@@ -726,7 +739,7 @@ class HubActivities:
         )
         await safe_send_message(
             self.delivery,
-            agent_id="pandoras-actor",
+            agent_id=await self._infra_agent(),
             message=f"[PROBLEM GROUPED] {title}\n\n{body}",
             log_event="hub_group_notify_failed",
         )

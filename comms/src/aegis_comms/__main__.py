@@ -108,7 +108,8 @@ async def _log_dispatch(
     # {adapter,channel,ts} (the core 5a route stores it).
     ref = send_result.get("delivery_ref") or {}
     payload = {
-        "agent_id": agent_id,
+        # "" = posted as AEGIS in the general channel, as system events are (#579).
+        "agent_id": agent_id or "system",
         "topic_id": ref.get("topic_id", send_result.get("topic_id")),
         "chat_id": ref.get("chat_id", send_result.get("chat_id")),
         "message_id": ref.get("message_id", send_result.get("message_id")),
@@ -140,7 +141,8 @@ class DeliveryRequest(BaseModel):
     """
 
     text: str
-    agent_id: str = "sebas"
+    # "" = the gtd holder, looked up in core (`SlackAdapter.resolve_agent_id`, #579).
+    agent_id: str = ""
     system_event: bool = False  # If true, send to General topic instead of agent topic
     # An existing thread ROOT — `{"channel": ..., "ts": ...}` — to reply under,
     # so a task's turns all land in one thread. None = post to the channel.
@@ -164,7 +166,8 @@ class DocumentDeliveryRequest(BaseModel):
 
     documents: list[DocumentAttachment]
     caption: str = ""
-    agent_id: str = "sebas"
+    # "" = the gtd holder, looked up in core (`SlackAdapter.resolve_agent_id`, #579).
+    agent_id: str = ""
     # Optional explicit destination ({"channel": ...}); None = agent's bound channel.
     target: dict | None = None
 
@@ -178,7 +181,8 @@ class VoiceDeliveryRequest(BaseModel):
     """
 
     text: str
-    agent_id: str = "sebas"
+    # "" = the gtd holder, looked up in core (`SlackAdapter.resolve_agent_id`, #579).
+    agent_id: str = ""
 
 
 class CardDeliveryRequest(BaseModel):
@@ -189,7 +193,8 @@ class CardDeliveryRequest(BaseModel):
     """
 
     interaction_id: str
-    agent_id: str = "sebas"
+    # "" = the gtd holder, looked up in core (`SlackAdapter.resolve_agent_id`, #579).
+    agent_id: str = ""
     kind: str
     prompt: str = ""
     options: dict | None = None
@@ -271,6 +276,8 @@ def create_delivery_app(adapter: SlackAdapter, settings: CommsSettings) -> FastA
             )
             return {"ok": result.get("ok", False), "type": "system_event", **result}
 
+        # No agent named: the gtd holder, else the general channel as AEGIS (#579).
+        agent_id = req.agent_id or await adapter.resolve_agent_id("")
         # A malformed thread_ref degrades to a plain channel post rather than a
         # 500 — losing the threading is recoverable, losing the message is not.
         target: dict[str, Any] | None = (
@@ -286,17 +293,17 @@ def create_delivery_app(adapter: SlackAdapter, settings: CommsSettings) -> FastA
             # exactly as it does for a plain send.
             target = {**(target or {}), "thread_overflow": True}
         send_result = await adapter.send_message(
-            agent_id=req.agent_id, text=req.text, target=target
+            agent_id=agent_id, text=req.text, target=target
         )
         result = send_result.to_response()
         await _log_dispatch(
             settings,
-            agent_id=req.agent_id,
+            agent_id=agent_id,
             content=req.text,
             send_result=result,
             kind="deliver",
         )
-        return {"ok": result.get("ok", False), "agent_id": req.agent_id, **result}
+        return {"ok": result.get("ok", False), "agent_id": agent_id, **result}
 
     @router.post("/api/deliver/document")
     async def deliver_document(
@@ -307,9 +314,10 @@ def create_delivery_app(adapter: SlackAdapter, settings: CommsSettings) -> FastA
         if settings.api_key and (not x_api_key or x_api_key != settings.api_key):
             raise HTTPException(401, "Invalid API key")
 
+        agent_id = req.agent_id or await adapter.resolve_agent_id("")
         docs = [d.model_dump() for d in req.documents]
         send_result = await adapter.send_document(
-            agent_id=req.agent_id,
+            agent_id=agent_id,
             documents=docs,
             caption=req.caption,
             target=req.target,
@@ -318,12 +326,12 @@ def create_delivery_app(adapter: SlackAdapter, settings: CommsSettings) -> FastA
         if ok and req.caption:
             await _log_dispatch(
                 settings,
-                agent_id=req.agent_id,
+                agent_id=agent_id,
                 content=req.caption,
                 send_result=send_result.to_response(),
                 kind="document",
             )
-        return {"ok": ok, "agent_id": req.agent_id, "count": len(docs)}
+        return {"ok": ok, "agent_id": agent_id, "count": len(docs)}
 
     @router.post("/api/deliver/voice")
     async def deliver_voice(
@@ -337,9 +345,10 @@ def create_delivery_app(adapter: SlackAdapter, settings: CommsSettings) -> FastA
         """
         if settings.api_key and (not x_api_key or x_api_key != settings.api_key):
             raise HTTPException(401, "Invalid API key")
-        send_result = await adapter.send_voice(agent_id=req.agent_id, text=req.text)
+        agent_id = req.agent_id or await adapter.resolve_agent_id("")
+        send_result = await adapter.send_voice(agent_id=agent_id, text=req.text)
         result = send_result.to_response()
-        return {"ok": result.get("ok", False), "agent_id": req.agent_id, **result}
+        return {"ok": result.get("ok", False), "agent_id": agent_id, **result}
 
     @router.post("/api/ingest/voice")
     async def ingest_voice(
@@ -417,9 +426,10 @@ def create_delivery_app(adapter: SlackAdapter, settings: CommsSettings) -> FastA
         if settings.api_key and (not x_api_key or x_api_key != settings.api_key):
             raise HTTPException(401, "Invalid API key")
 
+        agent_id = req.agent_id or await adapter.resolve_agent_id("")
         spec = CardSpec(
             interaction_id=req.interaction_id,
-            agent_id=req.agent_id,
+            agent_id=agent_id,
             kind=req.kind,
             prompt=req.prompt,
             options=req.options,
@@ -429,12 +439,12 @@ def create_delivery_app(adapter: SlackAdapter, settings: CommsSettings) -> FastA
         result = send_result.to_response()
         await _log_dispatch(
             settings,
-            agent_id=req.agent_id,
+            agent_id=agent_id,
             content=req.prompt,
             send_result=result,
             kind="interaction_card",
         )
-        return {"ok": result.get("ok", False), "agent_id": req.agent_id, **result}
+        return {"ok": result.get("ok", False), "agent_id": agent_id, **result}
 
     @router.post("/api/comms/delete")
     async def delete_dispatch(

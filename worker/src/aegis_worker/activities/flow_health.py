@@ -472,7 +472,7 @@ class FlowHealthActivities:
     # -- alerting ----------------------------------------------------------
 
     @activity.defn
-    async def report_flow_health(self, findings: list[dict], agent_id: str = "pandoras-actor") -> dict:
+    async def report_flow_health(self, findings: list[dict], agent_id: str = "") -> dict:
         """Notify about NEW unhealthy flows and about flows that recovered.
 
         The problem hub decides what is new: every finding is an occurrence on

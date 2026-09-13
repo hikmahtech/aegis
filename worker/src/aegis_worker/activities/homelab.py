@@ -42,7 +42,9 @@ class HomelabActivities:
     db_pool: Any
     homelab: Any  # HomelabConnector
     delivery: Any  # DeliveryActivities
-    agent_id: str = "pandoras-actor"
+    # The `infra` holder, resolved at boot in `__main__` (#579). "" sends the
+    # cards to comms' default rather than to an example agent's channel.
+    agent_id: str = ""
     heartbeat_ping_url: str = ""  # healthchecks.io dead-man URL; "" = disabled
     infra_cluster: str = ""       # Prometheus cluster label for synthetic alerts
 

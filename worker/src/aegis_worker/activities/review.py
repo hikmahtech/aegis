@@ -105,10 +105,10 @@ class ReviewActivities:
     llm_client: object | None = None
     frame_model: str = "gpt-oss:20b"
     todoist_connector: object | None = None
-    # Owning agent — matches the review flows' config default. Threaded into
-    # the `llm_calls` row for `frame_review` so the weekly review's LLM spend is
-    # attributable rather than NULL (same pattern as IntelligenceActivities).
-    agent_id: str = "sebas"
+    # Owning agent — the `gtd` holder, resolved at boot in `__main__` (#579).
+    # Threaded into the `llm_calls` row for `frame_review` so the weekly
+    # review's LLM spend is attributable; "" records no agent.
+    agent_id: str = ""
 
     @activity.defn
     async def gather_daily_digest(self) -> dict:
@@ -614,7 +614,7 @@ class ReviewActivities:
                 model=self.frame_model,
                 db_pool=self.db_pool,
                 purpose="review_frame",
-                agent_id=self.agent_id,
+                agent_id=self.agent_id or None,
             )
             raw = result.get("response", "") if isinstance(result, dict) else (result or "")
             parsed = parse_llm_json(raw) or {}
@@ -966,7 +966,9 @@ class ReviewActivities:
         # We schedule a delayed re-fire via the Temporal client. Best-effort:
         # failure logs but does not unfresh the acknowledgement.
         snoozed = False
-        if kind == "daily" and choice == "need_time" and self.temporal_host:
+        # The re-fire runs as this class's owner (the `gtd` holder), never an
+        # example id (#579); with no owner there is nobody to run it as.
+        if kind == "daily" and choice == "need_time" and self.temporal_host and self.agent_id:
             try:
                 import uuid as _uuid
                 from datetime import timedelta as _td
@@ -978,7 +980,7 @@ class ReviewActivities:
                 # scheduled one. Tagged 'snooze' so prod logs make sense.
                 await client.start_workflow(
                     "DailyReviewFlow",
-                    {"agent_id": "sebas", "activity_name": "gtd-daily-review-snoozed"},
+                    {"agent_id": self.agent_id, "activity_name": "gtd-daily-review-snoozed"},
                     id=f"daily-review-snooze-{_uuid.uuid4()}",
                     task_queue=self.task_queue,
                     start_delay=_td(hours=1),

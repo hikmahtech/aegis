@@ -279,6 +279,26 @@ export const api = {
   feedItems: (qs: string) =>
     apiFetch<FeedItemsPage>(`/api/admin/channels/feed-items${qs}`),
 
+  // How a chat turn ranks what the knowledge store finds (`knowledge_ranking`, #579).
+  getKnowledgeRanking: () =>
+    apiFetch<{
+      domain_boost: number;
+      source_types: Record<string, { rank_boost?: number; decay_days?: number | null }>;
+      defaults: { domain_boost: number; decay_days: number };
+      limits: { domain_boost: number; rank_boost: number; decay_days: number };
+      registry: Record<string, { rank_boost: number; decay_days: number | null; description: string }>;
+    }>('/api/admin/knowledge/ranking'),
+  saveKnowledgeRanking: (body: {
+    domain_boost: number;
+    source_types: Record<string, { rank_boost?: number; decay_days?: number | null }>;
+  }) =>
+    apiFetch<{
+      domain_boost: number;
+      source_types: Record<string, { rank_boost?: number; decay_days?: number | null }>;
+      defaults: { domain_boost: number; decay_days: number };
+      limits: { domain_boost: number; rank_boost: number; decay_days: number };
+      registry: Record<string, { rank_boost: number; decay_days: number | null; description: string }>;
+    }>('/api/admin/knowledge/ranking', { method: 'PUT', body: JSON.stringify(body) }),
   // Knowledge
   knowledgeAsk: (question: string) =>
     apiFetch<{ answer: string; sources: any[] }>('/api/knowledge/ask', {

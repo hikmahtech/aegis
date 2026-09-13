@@ -449,10 +449,10 @@ class GmailActivities:
     llm_client: Any = None
     model_balanced: str = "qwen3:14b"
     db_pool: Any = None
-    # Owning agent for triage — matches GmailIngestFlow's config default.
-    # Threaded into llm_calls rows so gmail_classification stops recording
-    # NULL agent_id (see MoneyActivities.agent_id for the same pattern).
-    agent_id: str = "sebas"
+    # Owning agent for triage — the `gtd` holder, resolved at boot in
+    # `__main__` (#579). Threaded into llm_calls rows so gmail_classification
+    # is attributable; "" (nobody holds the tag) records no agent.
+    agent_id: str = ""
     # Wired post-construction in worker/__main__ so important emails
     # land in the knowledge graph and become searchable later via
     # Raphael's `search_knowledge` / `ask_knowledge` tools.
@@ -766,7 +766,7 @@ class GmailActivities:
                 max_tokens=2048,
                 db_pool=self.db_pool,
                 purpose="gmail_classification",
-                agent_id=self.agent_id,
+                agent_id=self.agent_id or None,
             )
             # think() returns {"response": str, "model": str, ...}
             text = (raw.get("response") or "").strip()

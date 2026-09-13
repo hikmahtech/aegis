@@ -245,7 +245,9 @@ class MoneyActivities:
     db_pool: Any
     llm: Any  # LLMClient (for Haiku batch extraction)
     delivery: Any  # DeliveryActivities
-    agent_id: str = "maou"
+    # The `finance` holder, resolved at boot in `__main__` (#579); "" = no
+    # persona, no llm_calls agent, and comms' default channel.
+    agent_id: str = ""
     home_currency: str = "INR"
     # Receipt extraction needs reliable structured JSON. The local fast model
     # (gemma4:e2b) parse-failed ~81% of receipt-shaped mail in prod — wire the

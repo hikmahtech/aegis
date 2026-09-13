@@ -31,9 +31,10 @@ def _default_cfg(flow: str, settings: Settings) -> dict:
     return {}
 
 
-async def _start_workflow(flow: str, cfg: dict, temporal_client: TemporalClient):
-    # Both Config dataclasses have full defaults — passing {} is safe.
-    return await start_named_workflow(flow, cfg, temporal_client, _FLOW_NAMES)
+async def _start_workflow(flow: str, cfg: dict, temporal_client: TemporalClient, pool=None):
+    # Both Config dataclasses have full defaults — passing {} is safe. With a
+    # pool, the run's agent is the flow's activities-row owner (#579).
+    return await start_named_workflow(flow, cfg, temporal_client, _FLOW_NAMES, pool=pool)
 
 
 @router.get("/state")
@@ -86,5 +87,5 @@ async def trigger_flow(
         body = {}
     cfg = _default_cfg(flow, settings)
     cfg.update(body or {})
-    handle = await _start_workflow(flow, cfg, client)
+    handle = await _start_workflow(flow, cfg, client, pool=request.app.state.db_pool)
     return {"ok": True, "workflow_id": handle.id}

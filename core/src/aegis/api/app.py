@@ -363,6 +363,7 @@ def create_app(run_lifespan: bool = True, settings: Settings | None = None) -> F
     app.include_router(social_auth.router)
     app.include_router(chat.router)
     app.include_router(knowledge.router)
+    app.include_router(knowledge.admin_router)
     app.include_router(references.router)
     app.include_router(observability.router)
     app.include_router(audit.router)

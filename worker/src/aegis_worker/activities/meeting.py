@@ -361,7 +361,8 @@ class MeetingActivities:
     db_pool: Any = None
     llm_client: Any = None
     model_balanced: str = "gemma4:e2b"
-    agent_id: str = "sebas"
+    # The `gtd` holder, resolved at boot in `__main__` (#579); "" = no agent.
+    agent_id: str = ""
 
     @activity.defn
     async def fetch_meeting_document(self, account_label: str, msg: dict) -> dict:
@@ -459,7 +460,7 @@ class MeetingActivities:
             max_tokens=_REVIEW_MAX_TOKENS,
             db_pool=self.db_pool,
             purpose="meeting_review",
-            agent_id=agent_id or self.agent_id,
+            agent_id=agent_id or self.agent_id or None,
         )
         return parse_llm_json((raw.get("response") or "").strip())
 

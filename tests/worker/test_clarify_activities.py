@@ -2839,8 +2839,9 @@ async def test_complete_reference_task_issues_complete_and_skips_notify_for_auto
 
 
 @pytest.mark.asyncio
-async def test_complete_reference_task_sends_notify_for_user_initiated() -> None:
-    """User-initiated source (#chat) → per-message confirmation from raphael."""
+async def test_complete_reference_task_sends_notify_for_user_initiated(db_pool) -> None:
+    """User-initiated source (#chat) → per-message confirmation from the
+    `research` tag holder (the seeded raphael), never a literal id (#579)."""
     connector = AsyncMock()
     connector.commands = AsyncMock(
         return_value={"ok": True, "data": {"sync_status": {}, "temp_id_mapping": {}}}
@@ -2849,7 +2850,7 @@ async def test_complete_reference_task_sends_notify_for_user_initiated() -> None
     delivery.channel = "slack"
     delivery.send_message = AsyncMock(return_value={"ok": True})
     acts = ClarifyActivities(
-        db_pool=None,
+        db_pool=db_pool,
         todoist_connector=connector,
         llm_client=AsyncMock(),
         delivery_connector=delivery,

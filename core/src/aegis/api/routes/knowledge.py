@@ -12,8 +12,57 @@ from aegis.api.auth import verify_auth
 from aegis.api.deps import get_knowledge_connector as _get_connector
 from aegis.api.deps import get_settings
 from aegis.config import Settings
+from aegis.observability import log_audit
+from aegis.services import knowledge_ranking
 
 router = APIRouter(prefix="/api/knowledge", dependencies=[Depends(verify_auth)])
+# How a chat turn ranks what the store finds (`knowledge_ranking`, #579).
+admin_router = APIRouter(prefix="/api/admin/knowledge", dependencies=[Depends(verify_auth)])
+
+
+def _ranking_view(cfg: dict[str, Any]) -> dict[str, Any]:
+    """The row as the admin page edits it, beside the shipped values it overrides."""
+    return {
+        **cfg,
+        "defaults": {
+            "domain_boost": knowledge_ranking.DEFAULT_DOMAIN_BOOST,
+            "decay_days": knowledge_ranking.DEFAULT_DECAY_DAYS,
+        },
+        "limits": {
+            "domain_boost": knowledge_ranking.MAX_DOMAIN_BOOST,
+            "rank_boost": knowledge_ranking.MAX_RANK_BOOST,
+            "decay_days": knowledge_ranking.MAX_DECAY_DAYS,
+        },
+        "registry": knowledge_ranking.registry_view(),
+    }
+
+
+@admin_router.get("/ranking")
+async def get_knowledge_ranking(request: Request) -> dict[str, Any]:
+    """The effective `knowledge_ranking` row and the registry it overrides."""
+    return _ranking_view(
+        await knowledge_ranking.get_ranking_config(request.app.state.db_pool)
+    )
+
+
+@admin_router.put("/ranking")
+async def put_knowledge_ranking(request: Request, body: dict[str, Any]) -> dict[str, Any]:
+    """Replace the row. 400 (not a silent drop) on a bad type name, a negative
+    or non-finite boost, or decay days under one."""
+    pool = request.app.state.db_pool
+    try:
+        cfg = await knowledge_ranking.save_ranking_config(pool, body)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    await log_audit(
+        pool,
+        actor="admin",
+        action="knowledge_ranking_saved",
+        target_type="settings",
+        target_id=knowledge_ranking.SETTINGS_KEY,
+        details=cfg,
+    )
+    return _ranking_view(cfg)
 
 # Extensions the folder/upload seeders will try to extract.
 _TEXT_EXTS = {".txt", ".md", ".markdown", ".html", ".htm", ".pdf", ".json", ".csv", ".rst"}
