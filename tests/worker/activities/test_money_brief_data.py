@@ -140,18 +140,17 @@ def _today() -> date:
 
     NOT `date.today()`, which is the RUNNER's timezone. Every window in this
     file (`as_of`, the 7-day brief, the 14-day forecast, the month the close
-    covers, the `P <date>` price lines) is derived by the activity from
-    `datetime.now(ZoneInfo(self.home_tz))`, so a test that builds the same
-    window from the runner's clock agrees only while the runner is in IST.
-    CI is UTC: for the 5.5 hours a day the two disagree on the date, the
-    activity says the 6th and the runner says the 5th, and every dated
-    assertion here fails at once. Measured on PR #397, job at 19:40 UTC.
+    covers, the `P <date>` price lines) is derived by the activity from the
+    user's clock, so a test that builds the same window from the runner's clock
+    agrees only while the runner is in that zone. CI is UTC: for the 5.5 hours
+    a day the two disagree on the date, the activity says the 6th and the
+    runner says the 5th, and every dated assertion here fails at once.
+    Measured on PR #397, job at 19:40 UTC.
 
-    Read off the class rather than an instance because `_repo(tmp_path, …)`
-    anchors the journal before any activity exists, and `_act` never overrides
-    the field — the same clock has to build the fixture and read the result.
-    (`tests/worker/activities/test_capture_due.py::_today` is the same fix on
-    the same trap, one file over.)
+    A constant rather than a DB read because `_repo(tmp_path, …)` anchors the
+    journal before any activity exists — the same clock has to build the
+    fixture and read the result. (`tests/worker/activities/test_capture_due.py
+    ::_today` is the same fix on the same trap, one file over.)
     """
     return datetime.now(ZoneInfo(_USER_TZ)).date()
 
