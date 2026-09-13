@@ -107,6 +107,12 @@ SOURCES = frozenset(
         # news (`services/research_topics.py`) and a `#research` task's
         # question (`hub_project.ensure_problem_for_task`).
         "research",
+        # An integration that has failed its consecutive-failure threshold
+        # (`services/connector_health.py`, #571). That tracker predates the hub
+        # and its one Slack ping was the only notice a dead connector ever
+        # produced — Calibre was down for two days with `alerted: true` and no
+        # problem behind it.
+        "connector",
     }
 )
 KINDS = frozenset({"occurrence", "resolved", "investigation", "plan", "session_note"})

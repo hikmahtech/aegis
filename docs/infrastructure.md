@@ -2082,6 +2082,86 @@ bulk text is exactly what not to index.
 Until step 2 the tools answer "not configured" and the flow reports
 `not_configured`; both are the intended inert state.
 
+### When calibre-web answers 500: SQLite over NFS
+
+A `disk I/O error` from calibre-web is almost never a broken database. It is
+what SQLite reports when a read on an open file handle fails, and on an NFS
+mount the usual reason is **ESTALE** — the server restarted, the client's state
+recovery failed, and every long-held handle is dead for good.
+
+That is how Calibre was down for two days (2026-09-13). calibre-web's `/config`
+is an NFS mount from the TrueNAS box, which sits on the homelab's failing power
+domain (`homelab-gitops/docs/infrastructure/power-domains-and-outages.md`). The
+server went away at 06:24:43 and the kernel said so:
+
+```
+NFSv4: state recovery failed for open file config/app.db, error = -116   (×11)
+```
+
+SQLAlchemy's connection pool held eleven handles on `app.db` and never
+revalidates one, so every request that drew a stale connection returned 500 for
+ever. Nothing restarts the process on its own.
+
+How to tell it apart from a corrupt database, in the order that settles it
+fastest — a fresh process opens the file by name and gets the *current* inode,
+so the first two steps succeed on a stale-handle fault and fail on a real one:
+
+```bash
+# 1. Does a fresh process read it? (`.tables` as the app's user, on the node)
+docker exec <cid> s6-setuidgid abc sqlite3 file:/config/app.db?mode=ro .tables
+# 2. Can a fresh process write? (begin immediate takes the lock, rollback undoes it)
+docker exec <cid> s6-setuidgid abc sqlite3 /config/app.db 'begin immediate; rollback;'
+# 3. Then the deciding one: what do the RUNNING process's handles point at?
+sudo ls -l /proc/$(docker inspect -f '{{.State.Pid}}' <cid>)/fd | grep app.db
+#    `/config/app.db (deleted)` and `stat: Stale file handle` = ESTALE, not corruption
+sudo dmesg -T | grep 'state recovery failed'
+```
+
+The fix is to restart the service so it reopens the file
+(`docker service update --force calibre-web_calibre-web`); no data is lost,
+because nothing was ever wrong with the file. The durable fix is to stop putting
+a SQLite database on NFS — `/config` is calibre-web's private state and belongs
+on a local volume, which is a homelab-gitops change. `/books` holds the library
+itself and can stay where it is.
+
+AEGIS's own part of this was the silence, not the outage: the connector failed
+its threshold, posted one Slack line and then said nothing for two days. That is
+fixed (#571) — see below.
+
+## A dead connector is a hub problem
+
+`services/connector_health.py` counts consecutive failures per connector in a
+`settings` row keyed `connector_health:<name>`, and a connector at or past its
+threshold (3 fetches; 1 for a boot-time caller, whose next retry is a whole
+restart away) becomes a `connectordown` problem on the hub, source `connector`,
+subject the connector's name. It gets a task, an owner and a timeline like any
+other operational signal, and **recovery resolves it by itself** through
+`hub_watch.reconcile_findings`.
+
+That last part is the whole point of #571. The tracker used to do one thing:
+post a Slack system event when the count crossed the threshold, then set
+`alerted: true` so it would not speak again until the connector came back. One
+notification per outage, for the entire outage — and no record behind it. Calibre
+sat at `{"alerted": true, "consecutive_failures": 3}` for two days with no
+problem, no task and nothing in any digest. A flag also cannot tell "recovered"
+from "nobody looked"; the absence of a finding can. So `alerted` still suppresses
+repeat *pings* and no longer decides whether the failure is visible.
+
+Two details worth knowing before you add a connector to it:
+
+- **The sweep reads every `connector_health:*` row, not the one being recorded.**
+  `reconcile_findings` resolves any problem of its classes that is absent from
+  the findings it is handed, so handing it one connector's state would resolve
+  every other connector's live problem — a healthy Calibre would close a dead
+  Miniflux.
+- **The row stores `down`, and the sweep reads that rather than the count.** The
+  threshold is a per-call argument, so a bare `consecutive_failures` says nothing
+  about whether some *other* connector is past its own. A row written before
+  `down` existed falls back to the default threshold.
+
+There is no settle window on these problems, and they need none: the
+consecutive-failure threshold already is one.
+
 ## Tracked topics (Raphael)
 
 A topic you ask Raphael to track (`track_topic`, or "yes" to a "track this?"

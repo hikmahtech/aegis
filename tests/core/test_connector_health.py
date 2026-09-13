@@ -85,7 +85,9 @@ async def test_recovery_sends_event_and_resets(db_pool):
     body = json.loads(deliver.calls.last.request.content)
     assert "recovered" in body["text"]
     state = await _state(db_pool)
-    assert state == {"consecutive_failures": 0, "alerted": False}
+    # `down` is what the hub sweep reads (#571) — the threshold is a per-call
+    # argument, so a bare count cannot say whether a connector is past its own.
+    assert state == {"consecutive_failures": 0, "alerted": False, "down": False}
 
 
 @pytest.mark.asyncio
