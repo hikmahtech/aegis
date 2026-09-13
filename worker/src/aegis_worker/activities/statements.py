@@ -152,13 +152,23 @@ class StatementActivities:
         the month's digest marker. That is the mode a person reads before
         letting a schedule touch the books.
         """
-        from aegis.services import books, statement_findings, statement_match, statement_post
+        from aegis.services import (
+            books,
+            books_chart,
+            statement_findings,
+            statement_match,
+            statement_post,
+        )
         from aegis.services import journal_index as ji
         from aegis.services.reconciled import mark_reconciled
 
         accounts = await _folder_config(self.db_pool)
         if not accounts or self.books_cfg is None:
             return {"status": "skipped", "reason": "not_configured", "statements": 0}
+
+        # Read once for the whole run and passed down. A chart read inside the
+        # posting closure would be a DB call under the books flock.
+        chart = await books_chart.get_chart(self.db_pool)
 
         statements = await load_statements(self.db_pool)
         rows = [r for s in statements for r in s.rows]
@@ -184,6 +194,7 @@ class StatementActivities:
             declared=declared,
             entity_for_instrument=_entity_map(accounts),
             rates=rates,
+            currency=self.books_cfg.currency,
         )
         outcomes = {o.row_id: o for o in run.outcomes}
 
@@ -230,7 +241,8 @@ class StatementActivities:
                     # over the full dict.
                     outcomes,
                     self.books_cfg,
-                    entity=account.get("post_entity") or "personal",
+                    entity=account.get("post_entity") or chart.default_entity,
+                    chart=chart,
                     rules=rules,
                     # Every row of every OTHER account, so §8.4 can see both
                     # sides of a transfer. Passing this statement's own rows

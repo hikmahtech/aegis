@@ -252,19 +252,26 @@ CONFIG_REGISTRY: list[ConfigKey] = [
         "mode 0600 at boot; never logged.",
     ),
     ConfigKey(
+        "home_currency", "Home currency (ISO code)", "Books", False,
+        help="The currency the books report in — INR, USD, GBP, EUR, … It is what hledger "
+        "converts to for every balance and check, and what a posting that names no "
+        "currency is written in. Core + worker restart required.",
+    ),
+    ConfigKey(
         "books_ignored_mailboxes", "Ignored mailboxes (comma-separated labels)", "Books", False,
         help="Money mail in these mailboxes is not yours (e.g. an employer's account).",
     ),
     ConfigKey(
         "books_mailbox_entities",
-        "Mailbox → entity (label=personal|hikmah, comma-separated)", "Books", False,
-        help="Which set of books a mailbox's money belongs to. Unlisted = personal.",
+        "Mailbox → entity (label=<entity>, comma-separated)", "Books", False,
+        help="Which set of books a mailbox's money belongs to, naming an entity from the "
+        "chart of accounts (Money → Its entities). Unlisted = the default entity.",
     ),
     ConfigKey(
-        "books_todoist_projects", "Todoist projects for dues (personal=<id>,hikmah=<id>)",
+        "books_todoist_projects", "Todoist projects for dues (<entity>=<id>, comma-separated)",
         "Books", False,
         help="Bills and failed payments become dated tasks here, and Maou's money problem "
-        "tasks (#money) go to the personal project. Unset = the Inbox.",
+        "tasks (#money) go to the default entity's project. Unset = the Inbox.",
     ),
     ConfigKey(
         "ansaar_url", "ansaar-data URL", "Trading desk", False,

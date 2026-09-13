@@ -10,6 +10,9 @@ from typing import Literal
 from pydantic import BaseModel, field_validator
 
 _KEY_RE = re.compile(r"[^a-z0-9]+")
+# An entity id, the same shape `books_chart` validates one to. Kept here
+# rather than imported so the model stays free of service imports.
+_ENTITY_RE = re.compile(r"^[a-z0-9_-]{1,32}$")
 # Journal syntax plus every C0 control and DEL — mirrors `books._CONTROL_RE`
 # (a NUL crashes subprocess, a tab and a newline break a posting line).
 _JOURNAL_UNSAFE = re.compile(r"[\x00-\x1f\x7f;,]+")
@@ -37,7 +40,14 @@ class MoneyEvent(BaseModel):
     instrument: str | None = None
     occurred_on: date | None = None
     due_on: date | None = None
-    entity: Literal["personal", "hikmah", "none"] = "personal"
+    # Which set of books this belongs to, or the literal "none" for an event
+    # that posts nothing. NOT checked against the configured chart: this model
+    # is built in the worker, in the chat tools and in every test, none of
+    # which has a pool to read the chart with, and a shape check is the part
+    # that can be made here. An entity that is valid-shaped but unconfigured
+    # resolves to the chart's default entity at posting time
+    # (`books_chart.Chart.resolve`).
+    entity: str = "personal"
     account: str | None = None
     category: str | None = None
     ref: str | None = None
@@ -69,6 +79,22 @@ class MoneyEvent(BaseModel):
         too. Defence in depth only — `books.sanitize_tag` is the gate that has
         to hold, because a value can reach the writer without passing here."""
         return re.sub(r"\s+", " ", _JOURNAL_UNSAFE.sub(" ", v)).strip() if v else v
+
+    @field_validator("entity", mode="after")
+    @classmethod
+    def _entity_shape(cls, v: str) -> str:
+        """An entity id, or "none". It names a journal DIRECTORY, so it is held
+        to the same characters `books_chart` allows an entity id — and unlike
+        `currency` above this RAISES rather than coercing, because there is no
+        safe value to fall back to: a silently blanked entity would file the
+        block in a directory named by nothing."""
+        name = (v or "").strip().lower()
+        if name != "none" and not _ENTITY_RE.match(name):
+            raise ValueError(
+                f"entity must be 'none' or up to 32 lowercase letters, digits, "
+                f"hyphens or underscores, got {v!r}"
+            )
+        return name
 
     @field_validator("currency", mode="after")
     @classmethod

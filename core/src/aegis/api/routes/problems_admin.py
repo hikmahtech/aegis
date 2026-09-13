@@ -240,3 +240,34 @@ async def put_infra_alert_routing_route(request: Request, body: dict[str, Any]) 
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return {"default_alertnames": sorted(DEFAULT_INFRA_ALERTNAMES), **routing}
+
+
+@router.get("/hub-settle-seconds")
+async def get_hub_settle_seconds_route(request: Request) -> dict[str, Any]:
+    """How long each class of problem must persist before it earns a task, and
+    before an investigation spends effort on it (`services/hub_settle.py`).
+
+    Returns the operator's overrides and the code defaults underneath them, so
+    a blank field can be shown as what it actually means rather than as zero.
+    """
+    from aegis.services.hub_settle import get_settle_seconds
+
+    return await get_settle_seconds(_pool(request))
+
+
+@router.put("/hub-settle-seconds")
+async def put_hub_settle_seconds_route(request: Request, body: dict[str, Any]) -> dict[str, Any]:
+    """Replace the settle windows. 400 on a bad value rather than a quiet no-op.
+
+    `{}` removes every override and returns the class to its code default. The
+    key `*` sets a window for every class at once — and note it also shortens
+    the matching verification delay, because both read one number.
+    """
+    from aegis.services.hub_settle import save_settle_seconds
+
+    try:
+        out = await save_settle_seconds(_pool(request), body.get("overrides", body))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    await _audit(request, "hub_settle_seconds_saved", "", {"overrides": out["overrides"]})
+    return out

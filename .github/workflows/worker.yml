@@ -23,6 +23,8 @@ on:
       - "tests/conftest.py"
       # A shared helper the notes tests import (#514); not under tests/worker/.
       - "tests/notes_vault.py"
+      # The chart of accounts the books tests post against (#560); same reason.
+      - "tests/books_chart_data.py"
       - "config/**"
       - "migrations/**"
       - "personalities/**"
@@ -38,6 +40,8 @@ on:
       - "tests/conftest.py"
       # A shared helper the notes tests import (#514); not under tests/worker/.
       - "tests/notes_vault.py"
+      # The chart of accounts the books tests post against (#560); same reason.
+      - "tests/books_chart_data.py"
       - "config/**"
       - "migrations/**"
       - "personalities/**"

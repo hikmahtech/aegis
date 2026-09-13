@@ -638,8 +638,17 @@ resolving a live estate in one tick:
   re-sends them, so reconciling against that empty set would close every open
   problem. Prometheus re-sends on the order of a minute, so the default leaves
   a wide margin;
-- a problem younger than ten minutes is left alone, so one raised seconds ago
-  is never resolved before alertmanager has grouped its alert;
+- a problem whose **last** occurrence is younger than ten minutes is left
+  alone: an alert that just fired is firing now, whatever alertmanager has
+  managed to group. (Bounding the FIRST occurrence instead, as the first version
+  did, let a four-day-old problem that fired thirty seconds ago straight
+  through — #561.);
+- a problem is judged on **every fingerprint it has ever had**, and resolved
+  only if alertmanager lists none of them. A fingerprint hashes the label set,
+  so a recurring fault arrives under a new one each time — one problem here had
+  26 across 27 occurrences — and judging on the first meant comparing against a
+  hash that could never be active again, which closed a live problem within a
+  minute of every legitimate reopen;
 - a **group** problem is left alone: its subject is `*`, it stands for a class
   rather than one alert, and no single fingerprint speaks for it.
 
@@ -846,8 +855,10 @@ key is pasted.)
 
 #### The infra list and the infra repo
 
-Both live in the `infra_alert_routing` settings row. Read and replace it over
-the admin API:
+Both live in the `infra_alert_routing` settings row, editable on the admin
+**Problems** page under *Hub configuration* — the infra repo, the extra
+alertnames, and what to tell an investigation about this cluster. The same row
+over the admin API, for a script:
 
 ```bash
 curl -sS -H "X-API-Key: $AEGIS_API_KEY" "$AEGIS_URL/api/admin/infra-alert-routing"
@@ -1514,9 +1525,46 @@ it is env-only (`AEGIS_BOOKS_PATH`), because it is a container path, not a choic
 |---|---|
 | `books_repo_url` | The books repo, SSH form (`git@github.com:<org>/books.git`). Empty = posting disabled: money mail is still parsed and indexed, never written to a journal |
 | `books_deploy_key` | The private half of an ed25519 deploy key with write access on that repo. Paste the PEM or its base64 |
+| `home_currency` | The ISO code the books report in. hledger converts every balance and check to it, and a posting naming no currency is written in it |
 | `books_ignored_mailboxes` | Comma-separated mailbox labels whose money is not yours (an employer's account, say). Their mail is classified `ignore` |
-| `books_mailbox_entities` | `label=entity,...` where entity is `personal` or `hikmah` — which set of books a mailbox's money belongs to. An unlisted mailbox is `personal` |
-| `books_todoist_projects` | `personal=<project id>,hikmah=<project id>` — where dated dues are captured. Unset = the Inbox |
+| `books_mailbox_entities` | `label=entity,...` — which set of books a mailbox's money belongs to, naming an entity from the chart below. An unlisted mailbox belongs to the default entity |
+| `books_todoist_projects` | `<entity>=<project id>,...` — where dated dues are captured. Unset = the Inbox |
+
+### The chart of accounts
+
+Which sets of books exist, and which category posts to which account, are
+configuration too (#561) — the `settings` row keyed `books_chart`, read on every
+post, so a change needs no restart. Edit it on the admin **Money** page, under
+*Its entities* (`GET/PUT /api/admin/money/chart`); `services/books_chart.py` is
+the only reader and the only writer.
+
+An **entity** is one set of books: an id (which names its journal directory), a
+label, an account-name **segment**, its two **unknown** accounts and its
+category → account map. The segment is what tells an account's entity from its
+name: with a segment of `acme`, `expenses:acme:rent` and `income:acme:fees`
+belong to `acme`. The **default entity** has an empty segment and owns every
+expense and income account no other entity claims. Assets, liabilities and
+equity are entity-neutral by design — every set of books shares the bank
+accounts — which is what lets a cross-entity correction happen at all.
+
+Reading is lenient and writing is strict, deliberately: a malformed row must
+never stop money being posted, but a typo saved with a 200 would misfile
+transactions for months. The PUT 400s on an entity id that is not
+`[a-z0-9_-]{1,32}`, a default entity that is not one of the entities, an account
+name that is not colon-separated lowercase segments, an unknown-IN account
+outside `income:` or an unknown-OUT outside `expenses:`, two entities claiming
+one segment, and a non-default entity with no segment (nothing in an account
+name could point at it). A refused save writes nothing.
+
+Nothing here creates an account. hledger's own `account` declarations are still
+the chart, and `check --strict` refuses a block naming anything they do not
+declare — a category pointed at an undeclared account falls back to the
+entity's unknown account rather than writing it.
+
+A fresh deployment starts on the code default: one entity, `personal`, no
+segment, generic categories. Migration `049_books_chart.sql` seeds an existing
+one with the chart the code used to carry, so the day after the deploy posts
+where the day before did.
 
 The whole money lane, books included, is gated on **Money Hygiene**
 (`money_hygiene_enabled` / `AEGIS_MONEY_HYGIENE_ENABLED`). With that off no money

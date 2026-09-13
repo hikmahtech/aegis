@@ -21,6 +21,7 @@ from aegis.api.app import create_app
 from aegis.api.deps import get_settings
 from aegis.api.routes import money as money_routes
 from aegis.config import Settings
+from aegis.services import books_chart
 from aegis.services import trading_desk as td
 from httpx import ASGITransport, AsyncClient
 
@@ -515,6 +516,156 @@ async def test_desk_history_pairs_each_day_with_its_orders_and_its_reasons(clien
     assert days[traded.isoformat()]["orders"][0]["status"] == "filled"
     # Newest first, so the page opens on what just happened.
     assert body["days"][0]["data_date"] == traded.isoformat()
+
+
+# ------------------------------------------------- the desk's market settings
+
+
+@pytest_asyncio.fixture(loop_scope="function")
+async def desk_config(pool):
+    """Restores the desk's own config row, which these tests write."""
+    original = await pool.fetchval("SELECT config FROM activities WHERE slug = $1", td.DESK_SLUG)
+    yield pool
+    await pool.execute("UPDATE activities SET config = $2 WHERE slug = $1", td.DESK_SLUG, original)
+
+
+async def test_the_settings_page_reads_what_the_desk_itself_reads(client, desk_config):
+    """The form shows `desk_math.Rules`, the same merge the daily run uses. A
+    second opinion of what the desk believes would be worse than no form."""
+    body = (await client.get("/api/admin/money/desk/rules")).json()
+    rules = await td.load_rules(desk_config)
+
+    assert body["configured"] is True
+    assert body["values"]["calendar_symbol"] == rules.calendar_symbol
+    assert body["values"]["market_tz"] == rules.market_tz
+    assert body["values"]["tax_rate"] == rules.tax_rate
+    assert body["retired_keys"] == []
+
+
+async def test_saving_a_setting_changes_what_the_desk_reads(client, desk_config):
+    current = (await client.get("/api/admin/money/desk/rules")).json()["values"]
+
+    res = await client.put(
+        "/api/admin/money/desk/rules", json=current | {"market_tz": "America/New_York"}
+    )
+
+    assert res.status_code == 200
+    assert (await td.load_rules(desk_config)).market_tz == "America/New_York"
+
+
+async def test_a_timezone_that_is_not_a_timezone_is_refused_loudly(client, desk_config):
+    """400, not a 200 that stores a typo and quietly falls back to UTC for
+    months. The read path is forgiving precisely so the write path can be strict."""
+    before = (await client.get("/api/admin/money/desk/rules")).json()["values"]
+
+    res = await client.put("/api/admin/money/desk/rules", json=before | {"market_tz": "Asia/Kolkatta"})
+
+    assert res.status_code == 400
+    assert "timezone" in res.json()["detail"]
+    assert (await client.get("/api/admin/money/desk/rules")).json()["values"] == before
+
+
+async def test_clearing_the_calendar_symbol_turns_the_desk_off(client, desk_config):
+    """A real answer, so it saves: the page then says the desk is not configured
+    and the daily run does nothing."""
+    current = (await client.get("/api/admin/money/desk/rules")).json()["values"]
+
+    res = await client.put("/api/admin/money/desk/rules", json=current | {"calendar_symbol": ""})
+
+    assert res.status_code == 200 and res.json()["configured"] is False
+    assert (await client.get("/api/admin/money/desk")).json()["configured"] is False
+
+
+# ------------------------------------------------------- the chart of accounts
+
+
+@pytest_asyncio.fixture(loop_scope="function")
+async def chart_row(pool):
+    """Restores `settings.books_chart`, which these tests write."""
+    original = await pool.fetchval("SELECT value FROM settings WHERE key = 'books_chart'")
+    yield pool
+    await pool.execute(
+        "INSERT INTO settings (key, value, updated_at) VALUES ('books_chart', $1, NOW()) "
+        "ON CONFLICT (key) DO UPDATE SET value = $1, updated_at = NOW()",
+        original,
+    )
+
+
+async def test_the_chart_page_reads_what_the_money_lane_reads(client, chart_row):
+    """Through `books_chart.merge`, the same lenient read every post goes
+    through. A second opinion of where a transaction will be filed would be
+    worse than no form."""
+    body = (await client.get("/api/admin/money/chart")).json()
+    live = await books_chart.get_chart(chart_row)
+
+    assert body["stored"] is True
+    assert body["chart"] == live.as_dict()
+
+
+async def test_saving_a_chart_changes_where_the_money_lane_files(client, chart_row):
+    current = (await client.get("/api/admin/money/chart")).json()["chart"]
+    entities = {
+        **current["entities"],
+        "acme": {
+            "label": "Acme Ltd",
+            "segment": "acme",
+            "unknown": {"in": "income:acme:other", "out": "expenses:acme:unknown"},
+            "categories": {"rent": "expenses:acme:rent"},
+        },
+    }
+
+    res = await client.put(
+        "/api/admin/money/chart", json=current | {"entities": entities}
+    )
+
+    assert res.status_code == 200
+    live = await books_chart.get_chart(chart_row)
+    assert live.account_for("rent", "out", "acme") == "expenses:acme:rent"
+    assert live.entity_of("expenses:acme:rent") == "acme"
+
+
+async def test_two_entities_sharing_a_segment_are_refused_and_nothing_is_stored(
+    client, chart_row
+):
+    """400, not a 200 that stores a chart under which an account name cannot
+    say which set of books it belongs to. The read path is forgiving precisely
+    so the write path can be strict — and the refusal must write NOTHING, or
+    the books would file against a chart the operator was told was rejected."""
+    before = (await client.get("/api/admin/money/chart")).json()["chart"]
+    entities = {
+        **before["entities"],
+        "acme": {
+            "label": "Acme Ltd",
+            # The segment the seeded business entity already claims.
+            "segment": before["entities"]["hikmah"]["segment"],
+            "unknown": {"in": "income:acme:other", "out": "expenses:acme:unknown"},
+            "categories": {},
+        },
+    }
+
+    res = await client.put("/api/admin/money/chart", json=before | {"entities": entities})
+
+    assert res.status_code == 400
+    assert "both claim the segment" in res.json()["detail"]
+    assert (await client.get("/api/admin/money/chart")).json()["chart"] == before
+
+
+async def test_an_unknown_account_in_the_wrong_tree_is_refused(client, chart_row):
+    """An unknown-IN in the expense tree would file every unrecognised credit
+    as spending, for ever, with nothing saying so."""
+    before = (await client.get("/api/admin/money/chart")).json()["chart"]
+    entities = {
+        **before["entities"],
+        "personal": {
+            **before["entities"]["personal"],
+            "unknown": {"in": "expenses:oops", "out": "expenses:unknown"},
+        },
+    }
+
+    res = await client.put("/api/admin/money/chart", json=before | {"entities": entities})
+
+    assert res.status_code == 400 and "unknown-IN" in res.json()["detail"]
+    assert (await client.get("/api/admin/money/chart")).json()["chart"] == before
 
 
 def test_hledger_is_reachable_when_the_suite_claims_it_is():

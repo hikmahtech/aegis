@@ -47,14 +47,13 @@ from typing import Literal
 import asyncpg
 import structlog
 
-from aegis.services import books
+from aegis.services import books, books_chart
 from aegis.services import ledger_write as lw
 from aegis.services.tools.base import ToolContext
 from aegis.services.tools.registry import aegis_tool
 
 logger = structlog.get_logger()
 
-_ENTITIES = ("personal", "hikmah")
 
 # How long the tool waits on the write's workflow before it answers "still
 # running". Sized from the measured fast path, not from a round number: two
@@ -286,7 +285,9 @@ def _regex_too_slow(pattern: str, kill_after: float = _REGEX_KILL_S) -> str | No
     return f"could not be measured safely (the check exited {code})"
 
 
-async def _dispatch_books_write(ctx: ToolContext, op: str, payload: dict) -> str:
+async def _dispatch_books_write(
+    ctx: ToolContext, op: str, payload: dict, cfg: books.BooksConfig
+) -> str:
     """Hand a validated write to `BooksWriteFlow` and wait a short while for it.
 
     Returns the sentence the model relays, and never raises. Three outcomes:
@@ -312,7 +313,7 @@ async def _dispatch_books_write(ctx: ToolContext, op: str, payload: dict) -> str
             "error: the books write could not be queued — Temporal is not reachable. "
             "Nothing was written; try again once it is back."
         )
-    workflow_id = lw.write_workflow_id(op, payload)
+    workflow_id = lw.write_workflow_id(op, payload, cfg.currency)
     reattached = False
     try:
         handle = await client.start_workflow(
@@ -371,7 +372,7 @@ async def _exec_ledger_query(
 
     Args:
         command: hledger subcommand: bal, reg, is, bs, cf, print, accounts, payees, tags, stats, activity, aregister.
-        args: extra hledger arguments, e.g. ["-X", "₹", "-p", "thismonth", "expenses", "--depth", "2"].
+        args: extra hledger arguments, e.g. ["-p", "thismonth", "expenses", "--depth", "2"].
         output: text (default), json or csv.
     """
     cfg = books.config_from_settings(ctx.settings)
@@ -389,7 +390,7 @@ async def _exec_ledger_post(
     date: str,
     payee: str,
     postings: list[dict],
-    entity: str = "personal",
+    entity: str = "",
     note: str = "",
 ) -> str:
     """Record a transaction in the books by hand. Each posting is {"account": ..., "amount": ..., "currency": ...}; at most one posting may omit the amount. Re-posting the same date, payee, postings and note is treated as a retry of the first call, not a second transaction — give the second one a note to record a genuine duplicate.
@@ -398,12 +399,18 @@ async def _exec_ledger_post(
         date: YYYY-MM-DD.
         payee: who was paid or who paid.
         postings: two or more postings; amounts in major units. A negative amount is money coming in.
-        entity: personal or hikmah — which set of books. Every expense and income account already belongs to one of them (expenses:hikmah:* and income:hikmah:* are hikmah, any other is personal), so the entity has to agree with the accounts posted; asset, liability and equity accounts belong to both and fit either.
+        entity: which set of books to file this in; leave it out for the main one. Each expense and income account already belongs to exactly one set of books, so the entity has to agree with the accounts posted; asset, liability and equity accounts belong to all of them and fit any entity.
         note: optional free text stored as a `note:` tag.
     """
     cfg = books.config_from_settings(ctx.settings)
-    if entity not in _ENTITIES:
-        return f"error: entity must be one of {', '.join(_ENTITIES)}, got {entity!r}"
+    chart = await books_chart.get_chart(pool)
+    # An omitted entity is the default set of books, which is where an account
+    # no other entity's segment claims already lives. Named here rather than in
+    # the signature: the schema the model sees must not carry one operator's
+    # entity id as a default.
+    entity = entity or chart.default_entity
+    if entity not in chart.ids:
+        return f"error: entity must be one of {', '.join(chart.ids)}, got {entity!r}"
     try:
         occurred_on = date_type.fromisoformat(date)
     except (TypeError, ValueError):
@@ -429,26 +436,29 @@ async def _exec_ledger_post(
     if missing:
         return _undeclared(", ".join(missing))
     # The THIRD door onto the entity split, and the one that was open. The
-    # chart check above says the account exists; it says nothing about which
-    # set of books owns it, so `entity="hikmah"` with `expenses:groceries`
-    # balanced, passed `check --strict` and wrote a personal account into
-    # `hikmah/2026.journal` — where `ledger_reclassify` then REFUSES to correct
-    # it, because its own cross-entity guard blocks the move. The repair path
-    # was narrower than the path that made the mess.
+    # declared-accounts check above says the account exists; it says nothing
+    # about which set of books owns it, so a business entity named with a
+    # personal expense account balanced, passed `check --strict` and wrote the
+    # personal account into the business journal — where `ledger_reclassify`
+    # then REFUSES to correct it, because its own cross-entity guard blocks the
+    # move. The repair path was narrower than the path that made the mess.
     #
     # `account_entity` returns None for the asset, liability and equity trees,
-    # which both sets of books share by design (`post_event` writes
-    # `assets:bank:*` into either through `instrument_account`), so those go on
-    # working under any entity — the hazard lives entirely in the two trees
-    # that carry an entity.
-    misfiled = sorted({a for a in accounts if (books.account_entity(a) or entity) != entity})
+    # which every set of books shares by design (`post_event` writes
+    # `assets:bank:*` into any of them through `instrument_account`), so those
+    # go on working under any entity — the hazard lives entirely in the two
+    # trees that carry an entity.
+    misfiled = sorted(
+        {a for a in accounts if (books.account_entity(chart, a) or entity) != entity}
+    )
     if misfiled:
-        other = "hikmah" if entity == "personal" else "personal"
+        others = sorted({books.account_entity(chart, a) or entity for a in misfiled})
         return (
             f"error: {', '.join(misfiled)} {'belongs' if len(misfiled) == 1 else 'belong'} "
-            f"to the {other} books, and this transaction is being filed under {entity}. "
-            f"Post it under {other}, or pick a {entity} expense or income account — "
-            "asset, liability and equity accounts belong to both."
+            f"to the {' / '.join(others)} books, and this transaction is being filed "
+            f"under {entity}. Post it under {' or '.join(others)}, or pick a {entity} "
+            "expense or income account — asset, liability and equity accounts belong "
+            f"to all of them ({', '.join(chart.ids)})."
         )
 
     return await _dispatch_books_write(
@@ -463,6 +473,7 @@ async def _exec_ledger_post(
             "postings": postings,
             "note": note,
         },
+        cfg,
     )
 
 
@@ -470,7 +481,7 @@ async def _exec_ledger_post(
 async def _exec_ledger_reclassify(
     pool: asyncpg.Pool, ctx: ToolContext, *, message_id: str, account: str, payee: str | None = None
 ) -> str:
-    """Move a posting to another account (and optionally rename its payee) by its books message id (`<mailbox>/<gmail id>` for a posting from mail, or `manual/<hash>` for one `ledger_post` wrote). The new account must be one the posting's own set of books can use: an expense or income account of that entity, or any asset, liability or equity account, which both sets share.
+    """Move a posting to another account (and optionally rename its payee) by its books message id (`<mailbox>/<gmail id>` for a posting from mail, or `manual/<hash>` for one `ledger_post` wrote). The new account must be one the posting's own set of books can use: an expense or income account of that entity, or any asset, liability or equity account, which every set of books shares.
 
     Args:
         message_id: the msgid tag of the transaction.
@@ -478,6 +489,7 @@ async def _exec_ledger_reclassify(
         payee: new display name, optional.
     """
     cfg = books.config_from_settings(ctx.settings)
+    chart = await books_chart.get_chart(pool)
     try:
         declared = await books.declared_accounts(cfg)
     except books.BooksError as exc:
@@ -485,11 +497,11 @@ async def _exec_ledger_reclassify(
     if account not in declared:
         return _undeclared(account)
     # The same hazard the apply sweep guards, reachable here in ONE call: an
-    # `expenses:hikmah:*` account is declared and the block still balances, so
-    # neither the chart check nor `check --strict` objects — and the posting
-    # ends up in the wrong entity's journal file, counted in the wrong books.
-    # Read from the journal, not the index: the index does not cover a
-    # hand-written block, and the journal is the record.
+    # account belonging to another set of books is declared and the block still
+    # balances, so neither the declared-accounts check nor `check --strict`
+    # objects — and the posting ends up in the wrong entity's journal file,
+    # counted in the wrong books. Read from the journal, not the index: the
+    # index does not cover a hand-written block, and the journal is the record.
     try:
         located = await books.locate_event(message_id, cfg)
     except books.BooksError as exc:
@@ -497,7 +509,7 @@ async def _exec_ledger_reclassify(
     if located is None:
         return f"error: no journal block carries msgid {message_id}"
     filed_in = located.split("/")[0]
-    belongs_to = books.account_entity(account)
+    belongs_to = books.account_entity(chart, account)
     if belongs_to is not None and belongs_to != filed_in:
         return (
             f"error: {account} belongs to the {belongs_to} books but "
@@ -505,7 +517,7 @@ async def _exec_ledger_reclassify(
             "entities means moving the block, which this tool does not do."
         )
     return await _dispatch_books_write(
-        ctx, "reclassify", {"message_id": message_id, "account": account, "payee": payee}
+        ctx, "reclassify", {"message_id": message_id, "account": account, "payee": payee}, cfg
     )
 
 
@@ -526,12 +538,13 @@ async def _exec_ledger_add_rule(
     Args:
         match: case-insensitive regex tested against "<sender> | <payee>".
         account: a declared account.
-        entity: personal or hikmah. Optional — an expense or income account already says which set of books it belongs to, so leaving this out takes the account's own entity (expenses:hikmah:* and income:hikmah:* are hikmah, any other expense or income account is personal). Asset, liability and equity accounts belong to both, and a rule on one gets no entity.
+        entity: which set of books the rule files into. Optional — an expense or income account already says which one it belongs to, so leaving this out takes the account's own entity. Asset, liability and equity accounts belong to all of them, and a rule on one gets no entity.
         direction: in or out. Optional, and NOT inferred from the account — leaving it out means the rule files this payee whichever way the money moves, which is what every rule written before this field existed does. Give it when the same name moves money both ways and the two belong in different accounts (a person you both pay and are paid by), so a payment is not filed to the income account you picked for a credit.
         payee: canonical display name, optional.
         apply: also reclassify existing postings in an unknown account that match (default true). They are matched exactly as future mail will be, against "<sender> | <payee>", so the count is the rule's real reach over the backlog; the reply says how many matched only because of the sender.
     """
     cfg = books.config_from_settings(ctx.settings)
+    chart = await books_chart.get_chart(pool)
     # This pattern is persisted, and the worker then runs it against every
     # incoming money event in another process, forever. `re` has no timeout and
     # matching happens on the event loop, so a catastrophic pattern is a durable
@@ -548,8 +561,8 @@ async def _exec_ledger_add_rule(
             f"error: match {too_slow}. A payee can be 80 characters, and this rule runs "
             "against every money event from now on, so it has to be quick."
         )
-    if entity is not None and entity not in _ENTITIES:
-        return f"error: entity must be one of {', '.join(_ENTITIES)}, got {entity!r}"
+    if entity is not None and entity not in chart.ids:
+        return f"error: entity must be one of {', '.join(chart.ids)}, got {entity!r}"
     # Refused here rather than written and then skipped by `load_rules`, which
     # is what an unusable direction earns on the way back in (issue #396).
     if direction is not None and direction not in books.RULE_DIRECTIONS:
@@ -563,13 +576,13 @@ async def _exec_ledger_add_rule(
         return f"error: {exc}"
     if account not in declared:
         return _undeclared(account)
-    # An omitted entity is not "both books" — it is an unstated one, and the
-    # account itself states it. Without this default a caller can persist an
-    # `expenses:hikmah:*` rule with no entity, and every future mail from that
-    # payee then gets the hikmah account written into whichever journal the
-    # MAILBOX chose: `post_event` files by `event.entity`, which the rule never
-    # corrected. Same permanent drift `ledger_reclassify` refuses above, one
-    # door along.
+    # An omitted entity is not "every set of books" — it is an unstated one,
+    # and the account itself states it. Without this default a caller can
+    # persist a rule pointing at another entity's account with no entity, and
+    # every future mail from that payee then gets that account written into
+    # whichever journal the MAILBOX chose: `post_event` files by `event.entity`,
+    # which the rule never corrected. Same permanent drift `ledger_reclassify`
+    # refuses above, one door along.
     #
     # An explicit entity that CONTRADICTS the account is refused rather than
     # honoured. It used to win, on the reasoning that the caller might be
@@ -582,7 +595,7 @@ async def _exec_ledger_add_rule(
     # in the wrong journal and the sweep below rewrites the backlog to match.
     # An explicit entity that AGREES is still accepted, and so is any entity on
     # an entity-neutral account.
-    belongs_to = books.account_entity(account)
+    belongs_to = books.account_entity(chart, account)
     if entity is None:
         entity = belongs_to
     elif belongs_to is not None and belongs_to != entity:
@@ -590,7 +603,7 @@ async def _exec_ledger_add_rule(
             f"error: {account} belongs to the {belongs_to} books, but this rule says "
             f"entity {entity}. Leave the entity out and the account's own is used, or "
             f"name a {entity} account — asset, liability and equity accounts belong "
-            "to both."
+            f"to all of them ({', '.join(chart.ids)})."
         )
 
     # Sanitized once, as in `ledger_post`: this name is written to the journal
@@ -601,8 +614,8 @@ async def _exec_ledger_add_rule(
     if entity:
         rule["entity"] = entity
     # Never derived from the account, unlike `entity` above. An entity is a
-    # property of the ACCOUNT — `expenses:hikmah:*` IS hikmah — so deriving it
-    # states a fact the account already carries. A direction is not: an account
+    # property of the ACCOUNT — an account under an entity's segment IS that
+    # entity's — so deriving it states a fact the account already carries. A direction is not: an account
     # says what a posting is FOR, never which way the money went.
     #
     # The chart says so itself. `equity:transfers` is declared "between own
@@ -618,4 +631,4 @@ async def _exec_ledger_add_rule(
         rule["direction"] = direction
     if payee:
         rule["payee"] = payee
-    return await _dispatch_books_write(ctx, "add_rule", {"rule": rule, "apply": apply})
+    return await _dispatch_books_write(ctx, "add_rule", {"rule": rule, "apply": apply}, cfg)

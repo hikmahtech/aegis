@@ -10,6 +10,7 @@ import pytest
 import pytest_asyncio
 from aegis.connectors.ansaar import AnsaarClient, AnsaarError
 from aegis.connectors.finance import FinanceConnector
+from aegis.services import desk_math as dm
 from aegis.services import trading_desk as td
 
 THU, FRI, MON, TUE, WED = (date(2026, 9, d) for d in (10, 11, 14, 15, 16))
@@ -275,7 +276,7 @@ async def test_two_desk_names_for_one_yahoo_symbol_both_get_the_bars(pool):
     """The desk holds this ETF under its NSE name and names the benchmark in
     Yahoo's form. Both ask for SHARIABEES.NS, so both must come back with its bars."""
     await td._store_bars(pool, "SHARIABEES.NS", [bar(FRI, 400.0), bar(MON, 402.0)], "yahoo", TUE)
-    bars = await td._bars(pool, {"SHARIABEES", "SHARIABEES.NS"})
+    bars = await td._bars(pool, await td.load_rules(pool), {"SHARIABEES", "SHARIABEES.NS"})
     assert [b.day for b in bars["SHARIABEES"]] == [FRI, MON]
     assert bars["SHARIABEES"] == bars["SHARIABEES.NS"]
 
@@ -401,10 +402,17 @@ async def test_live_mode_is_refused(pool):
     assert await open_problems(pool) == [("desk_source_error", "config")]
 
 
-def test_yahoo_symbol():
-    assert td.yahoo_symbol("TCS") == "TCS.NS"
-    assert td.yahoo_symbol("^NSEI") == "^NSEI"
-    assert td.yahoo_symbol("SHARIABEES.NS") == "SHARIABEES.NS"
+def test_the_price_source_symbol_comes_from_the_configured_suffix(seeded_desk_rules):
+    """The suffix is the operator's exchange, not a literal in the code. An
+    index and a symbol that already names its exchange are left alone."""
+    assert seeded_desk_rules.price_symbol("TCS") == "TCS.NS"
+    assert seeded_desk_rules.price_symbol("^NSEI") == "^NSEI"
+    assert seeded_desk_rules.price_symbol("SHARIABEES.NS") == "SHARIABEES.NS"
+
+
+def test_with_no_suffix_configured_a_symbol_is_left_alone():
+    """A US desk needs no suffix, which is why the default is none."""
+    assert dm.Rules().price_symbol("AAPL") == "AAPL"
 
 
 # --- a stated risk halt sells the whole book (spec §5) ------------------------

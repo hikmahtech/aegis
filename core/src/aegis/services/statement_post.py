@@ -41,6 +41,7 @@ import structlog
 
 from aegis.api.models.money import MoneyEvent, payee_key
 from aegis.services import books, statement_transfers
+from aegis.services.books_chart import Chart as BooksChart
 from aegis.services.statement_match import AMBIGUOUS, RowOutcome
 from aegis.services.statement_transfers import REVERSAL, TRANSFER, PairedRow
 from aegis.services.statements import ParsedStatement, StatementRow
@@ -135,6 +136,7 @@ def plan(
     outcomes: dict[str, RowOutcome],
     *,
     entity: str,
+    chart: BooksChart,
     declared: Collection[str] = (),
     peer_rows: Sequence[StatementRow] = (),
 ) -> PostPlan:
@@ -154,7 +156,11 @@ def plan(
     the far account it proves is what the promotion rewrites `equity:transfers`
     to (§8.4's last sentence).
     """
-    paired = dict(statement_transfers.find_reversals(statement.rows, declared, entity=entity))
+    paired = dict(
+        statement_transfers.find_reversals(
+            statement.rows, declared, entity=entity, chart=chart
+        )
+    )
     for row_id, leg in statement_transfers.find_transfers(
         statement.rows, peer_rows, declared
     ).items():
@@ -197,6 +203,8 @@ def event_for(
     entity: str,
     rules: list[dict[str, Any]],
     *,
+    chart: BooksChart,
+    currency: str,
     declared: Collection[str] = (),
     account: str | None = None,
 ) -> MoneyEvent:
@@ -227,10 +235,10 @@ def event_for(
     """
     event = MoneyEvent(
         kind="transaction",
-        entity=entity,  # type: ignore[arg-type]
+        entity=entity,
         direction=row.direction,  # type: ignore[arg-type]
         amount=row.amount,
-        currency="INR",
+        currency=currency,
         payee=row.narration,
         channel="statement",
         instrument=row.instrument,
@@ -257,7 +265,7 @@ def event_for(
             event.payee_key = payee_key(event.payee)
         if rule.get("account"):
             event.account = str(rule["account"])
-        if rule.get("entity") in ("personal", "hikmah"):
+        if rule.get("entity") in chart.ids:
             event.entity = rule["entity"]
     return event
 
@@ -487,6 +495,7 @@ async def post_statement(
     cfg: books.BooksConfig,
     *,
     entity: str,
+    chart: BooksChart,
     rules: list[dict[str, Any]] | None = None,
     liability: bool = False,
     dry_run: bool = False,
@@ -515,7 +524,12 @@ async def post_statement(
     """
     declared = _declared_before_write(cfg)
     plan_ = plan(
-        statement, outcomes, entity=entity, declared=declared, peer_rows=peer_rows
+        statement,
+        outcomes,
+        entity=entity,
+        chart=chart,
+        declared=declared,
+        peer_rows=peer_rows,
     )
     result = PostResult(
         statement_id=plan_.statement_id, skipped=list(plan_.skipped)
@@ -685,6 +699,8 @@ async def post_statement(
                 row,
                 entity,
                 rules,
+                chart=chart,
+                currency=cfg.currency,
                 declared=declared,
                 account=leg.account if leg is not None else None,
             )
@@ -698,13 +714,13 @@ async def post_statement(
             if already:
                 result.skipped.append((row.row_id, ALREADY_POSTED))
                 continue
-            counter = event.account or books.account_for(
+            counter = event.account or chart.account_for(
                 event.category, event.direction, event.entity
             )
             if declared and counter not in declared:
-                counter = books.UNKNOWN[
-                    "hikmah" if event.entity == "hikmah" else "personal"
-                ]["in" if event.direction == "in" else "out"]
+                counter = chart.unknown(
+                    event.entity, "in" if event.direction == "in" else "out"
+                )
             if rel not in touched:
                 touched.append(rel)
             path = books._ensure_journal_file(cfg, rel)

@@ -70,8 +70,10 @@ def test_fmt_money_is_reexported():
         (None, None, "personal", "expenses:unknown"),
     ],
 )
-def test_account_for(category, direction, entity, expected):
-    assert account_for(category, direction, entity) == expected
+def test_account_for(category, direction, entity, expected, chart):
+    """The table is unchanged from when this map was Python (#560) — it is now
+    evidence that migration 049's chart posts where the constants did."""
+    assert account_for(chart, category, direction, entity) == expected
 
 
 def test_instrument_account():

@@ -37,6 +37,8 @@ from aegis.services.chat import (
 from aegis.services.tools.base import ToolContext
 from aegis.services.tools.ledger import LEDGER_WRITE_WAIT_S
 
+from tests.books_chart_data import CHART
+
 HAS_HLEDGER = shutil.which("hledger") is not None and shutil.which("git") is not None
 # "no argument given", as distinct from an explicit `temporal=None` (the client
 # is unreachable), which several tests below need to pass on purpose.
@@ -692,9 +694,9 @@ def test_the_workflow_id_survives_the_model_retyping_the_amount():
         "note": "",
     }
     retyped = {**base, "postings": [{**base["postings"][0], "amount": 245.5}, base["postings"][1]]}
-    assert lw.write_workflow_id("post", base) == lw.write_workflow_id("post", retyped)
+    assert lw.write_workflow_id("post", base, "INR") == lw.write_workflow_id("post", retyped, "INR")
     other = {**base, "payee": f"Other {TOKEN}"}
-    assert lw.write_workflow_id("post", base) != lw.write_workflow_id("post", other)
+    assert lw.write_workflow_id("post", base, "INR") != lw.write_workflow_id("post", other, "INR")
 
 
 @pytest.mark.asyncio
@@ -1003,7 +1005,7 @@ async def test_add_rule_applies_to_unknown_postings(db_pool, tmp_path):
     cfg = _repo(tmp_path)
     ctx = _ctx(cfg, db_pool)
     ev = _unknown_event()
-    await books.post_event(ev, "tool-t/a", cfg)
+    await books.post_event(ev, "tool-t/a", cfg, chart=CHART)
     await ji.upsert(db_pool, "tool-t/a", "tool-t", ev, journal_file="personal/2026.journal")
     out = await _exec_ledger_add_rule(
         db_pool,
@@ -1045,7 +1047,7 @@ async def test_add_rule_sweeps_the_backlog_in_one_commit(db_pool, tmp_path):
     ctx = _ctx(cfg, db_pool)
     for n in ("d", "e"):
         ev = _unknown_event()
-        await books.post_event(ev, f"tool-t/{n}", cfg)
+        await books.post_event(ev, f"tool-t/{n}", cfg, chart=CHART)
         await ji.upsert(db_pool, f"tool-t/{n}", "tool-t", ev, journal_file="personal/2026.journal")
     before = _commits(cfg)
     out = await _exec_ledger_add_rule(
@@ -1246,7 +1248,7 @@ async def test_add_rule_without_apply_leaves_postings_alone(db_pool, tmp_path):
     cfg = _repo(tmp_path)
     ctx = _ctx(cfg, db_pool)
     ev = _unknown_event()
-    await books.post_event(ev, "tool-t/b", cfg)
+    await books.post_event(ev, "tool-t/b", cfg, chart=CHART)
     await ji.upsert(db_pool, "tool-t/b", "tool-t", ev, journal_file="personal/2026.journal")
     out = await _exec_ledger_add_rule(
         db_pool,
@@ -1272,7 +1274,7 @@ async def test_add_rule_skips_a_posting_in_the_other_entity(db_pool, tmp_path):
     cfg = _repo(tmp_path)
     ctx = _ctx(cfg, db_pool)
     ev = _unknown_event()
-    await books.post_event(ev, "tool-t/c", cfg)
+    await books.post_event(ev, "tool-t/c", cfg, chart=CHART)
     await ji.upsert(db_pool, "tool-t/c", "tool-t", ev, journal_file="personal/2026.journal")
     out = await _exec_ledger_add_rule(
         db_pool,
@@ -1296,13 +1298,13 @@ async def test_add_rule_sweeps_only_unexplained_postings(db_pool, tmp_path):
     cfg = _repo(tmp_path)
     ctx = _ctx(cfg, db_pool)
     unknown = _unknown_event()
-    await books.post_event(unknown, "tool-t/u", cfg)
+    await books.post_event(unknown, "tool-t/u", cfg, chart=CHART)
     await ji.upsert(db_pool, "tool-t/u", "tool-t", unknown, journal_file="personal/2026.journal")
     # The same payee, already filed. `post_event` writes the account off the
     # event, so this block is in `expenses:saas` from the start.
     settled = _unknown_event()
     settled.account = "expenses:saas"
-    await books.post_event(settled, "tool-t/s", cfg)
+    await books.post_event(settled, "tool-t/s", cfg, chart=CHART)
     await ji.upsert(db_pool, "tool-t/s", "tool-t", settled, journal_file="personal/2026.journal")
     assert (await ji.get(db_pool, "tool-t/s"))["account"] == "expenses:saas"
 
@@ -1336,10 +1338,10 @@ async def test_add_rule_sweeps_with_the_sender_the_worker_will_use(db_pool, tmp_
     # Two unexplained postings from the same biller: one whose payee names it,
     # one where only the From header does — the Google-Pay-mirror shape.
     named = _unknown_event(payee=f"Zzt4pay Bills {TOKEN}")
-    await books.post_event(named, "tool-t/zzt4n", cfg)
+    await books.post_event(named, "tool-t/zzt4n", cfg, chart=CHART)
     await ji.upsert(db_pool, "tool-t/zzt4n", "tool-t", named, journal_file="personal/2026.journal")
     mirrored = _unknown_event(payee=f"Electricity board {TOKEN}")
-    await books.post_event(mirrored, "tool-t/zzt4m", cfg)
+    await books.post_event(mirrored, "tool-t/zzt4m", cfg, chart=CHART)
     await ji.upsert(db_pool, "tool-t/zzt4m", "tool-t", mirrored, journal_file="personal/2026.journal")
     # Upserted, like every other write in this file: the test databases are
     # keyed on the xdist worker alone, so a row left behind by a crashed run in
@@ -1378,7 +1380,7 @@ async def test_add_rule_defaults_the_entity_from_the_account(db_pool, tmp_path):
     cfg = _repo(tmp_path)
     ctx = _ctx(cfg, db_pool)
     ev = _unknown_event()  # entity=personal
-    await books.post_event(ev, "tool-t/g", cfg)
+    await books.post_event(ev, "tool-t/g", cfg, chart=CHART)
     await ji.upsert(db_pool, "tool-t/g", "tool-t", ev, journal_file="personal/2026.journal")
 
     out = await _exec_ledger_add_rule(
@@ -1489,7 +1491,7 @@ async def test_add_rule_never_infers_a_direction_from_the_account(db_pool, tmp_p
         ctx,
     )
     rules = books.load_rules(cfg.path / "rules" / "accounts.yaml")
-    assert "direction" not in rules[-1] and books.account_entity("assets:unknown") is None
+    assert "direction" not in rules[-1] and books.account_entity(CHART, "assets:unknown") is None
     for way in ("out", "in"):
         assert books.apply_rules(
             [rules[-1]], "", f"Neutral {TOKEN}", direction=way
@@ -1540,8 +1542,8 @@ async def test_add_rule_sweeps_only_its_own_direction(db_pool, tmp_path):
     got = _unknown_event()
     got.direction = "in"
     got.account = "income:unknown"
-    await books.post_event(paid, "tool-t/dirout", cfg)
-    await books.post_event(got, "tool-t/dirin", cfg)
+    await books.post_event(paid, "tool-t/dirout", cfg, chart=CHART)
+    await books.post_event(got, "tool-t/dirin", cfg, chart=CHART)
     await ji.upsert(db_pool, "tool-t/dirout", "tool-t", paid, journal_file="personal/2026.journal")
     await ji.upsert(db_pool, "tool-t/dirin", "tool-t", got, journal_file="personal/2026.journal")
 
@@ -1564,7 +1566,7 @@ async def test_add_rule_index_payee_matches_the_journal(db_pool, tmp_path):
     cfg = _repo(tmp_path)
     ctx = _ctx(cfg, db_pool)
     ev = _unknown_event()
-    await books.post_event(ev, "tool-t/f", cfg)
+    await books.post_event(ev, "tool-t/f", cfg, chart=CHART)
     await ji.upsert(db_pool, "tool-t/f", "tool-t", ev, journal_file="personal/2026.journal")
     await _exec_ledger_add_rule(
         db_pool,

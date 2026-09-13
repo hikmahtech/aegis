@@ -166,6 +166,7 @@ export type DeskScore = {
   since: string;
   weeks: number;
   capital: number;
+  currency: string;
   value: number;
   after_tax: number;
   benchmark: string;
@@ -205,9 +206,15 @@ export type DeskProblem = {
 export type DeskState = {
   as_of: string;
   mode: string;
+  /** False when no trading calendar is set: the desk runs nothing at all. */
+  configured: boolean;
   capital: number;
+  /** The desk's own ISO currency code, or '' when none is configured. */
+  currency: string;
   benchmark: string;
   context_benchmark: string;
+  /** False when no tax rate is configured, so a zero is not read as a result. */
+  taxed: boolean;
   value: number | null;
   cash: number | null;
   cash_pct: number | null;
@@ -244,6 +251,68 @@ export type DeskHistory = {
   days: (DeskPlan & { orders: DeskOrder[] })[];
 };
 
+/**
+ * The desk's market and tax settings — what a fork must tell it before it can
+ * trade anything. The server sends the EFFECTIVE values (`desk_math.Rules`),
+ * so the form is never a second opinion of what the desk believes.
+ */
+export type DeskRuleValues = {
+  calendar_symbol: string;
+  market_tz: string;
+  symbol_suffix: string;
+  currency: string;
+  fy_start_month: number;
+  stale_calendar_days: number;
+  stale_price_days: number;
+  capital: number;
+  sell_charge: number;
+  tax_rate: Record<string, number>;
+  long_term_rate: number;
+  long_term_exemption: number;
+  long_term_exemption_classes: string[];
+  benchmark: string;
+  context_benchmark: string;
+  expected_excess_pa: number;
+};
+
+export type DeskRules = {
+  configured: boolean;
+  values: DeskRuleValues;
+  /** Settings still stored under a key name that was retired. */
+  retired_keys: string[];
+};
+
+// ------------------------------------------------------- the chart of accounts
+
+/** One set of books. */
+export type ChartEntity = {
+  label: string;
+  /**
+   * The account-name segment that marks an account as this entity's:
+   * `expenses:<segment>:*` and `income:<segment>:*` are its. The DEFAULT
+   * entity's is empty — it owns every expense and income account no other
+   * entity claims.
+   */
+  segment: string;
+  /** Where a posting goes when nothing says where it belongs, per side. */
+  unknown: { in: string; out: string };
+  /** category name → account. */
+  categories: Record<string, string>;
+};
+
+export type BooksChart = {
+  default_entity: string;
+  /** Categories that mean money coming in, whatever direction the mail stated. */
+  income_categories: string[];
+  entities: Record<string, ChartEntity>;
+};
+
+export type BooksChartState = {
+  /** False while the deployment is still on the code default. */
+  stored: boolean;
+  chart: BooksChart;
+};
+
 // ----------------------------------------------------------------- the fetchers
 
 export const moneyApi = {
@@ -255,6 +324,20 @@ export const moneyApi = {
   desk: () => apiFetch<DeskState>('/api/admin/money/desk'),
   deskHistory: (limit?: number) =>
     apiFetch<DeskHistory>(`/api/admin/money/desk/history${limit ? `?limit=${limit}` : ''}`),
+  deskRules: () => apiFetch<DeskRules>('/api/admin/money/desk/rules'),
+  saveDeskRules: (values: DeskRuleValues) =>
+    apiFetch<DeskRules>('/api/admin/money/desk/rules', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(values),
+    }),
+  chart: () => apiFetch<BooksChartState>('/api/admin/money/chart'),
+  saveChart: (chart: BooksChart) =>
+    apiFetch<BooksChartState>('/api/admin/money/chart', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(chart),
+    }),
 };
 
 // --------------------------------------------------------------- the formatters
@@ -264,7 +347,7 @@ export const moneyApi = {
  * sends, so this only hands the digits to `fmtMoney`, which groups them. It is
  * not a second rounding authority.
  */
-export function fmtAmount(value: number | null | undefined, currency = 'INR'): string {
+export function fmtAmount(value: number | null | undefined, currency = ''): string {
   if (value === null || value === undefined || !Number.isFinite(value)) return '—';
   return fmtMoney(value.toFixed(2), currency);
 }

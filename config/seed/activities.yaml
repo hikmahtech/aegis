@@ -137,18 +137,45 @@ activities:
     workflow_type: TradingDeskFlow
     agent_id: maou
     schedule_cron: "30 2 * * 1-5"
+    # An EXAMPLE setup, not a default. The code names no market, no currency
+    # and no tax law, because AEGIS is forked and configured; what follows is
+    # one operator's desk (India, the NSE, rupees) so a reader can see the
+    # shape of an answer. Replace it with your own, or leave
+    # `calendar_symbol` empty and the desk does nothing at all.
     config:
       mode: paper
+      # --- the market ---
+      # Whose bars ARE the trading calendar, in Yahoo's naming.
+      calendar_symbol: ^NSEI
+      # The clock "today" is read from.
+      market_tz: Asia/Kolkata
+      # What Yahoo appends to say which exchange: .NS is the NSE. US listings
+      # need none.
+      symbol_suffix: .NS
+      currency: INR
+      # India's financial year runs April to March.
+      fy_start_month: 4
+      # Calendar days before the market calendar itself looks wrong (a long
+      # weekend plus a holiday is 4 to 5), and before a price is too old to
+      # size or sell on.
+      stale_calendar_days: 6
+      stale_price_days: 7
+      # --- the money ---
       capital: 100000
       asset_classes: [equity, etf]
       cost_pct_per_side: 0.002
-      sell_charge_inr: 16
+      sell_charge: 16
       band_abs: 0.02
       band_rel: 0.25
       max_order_pct: 0.25
+      # --- the tax model ---
       tax_rate: {equity: 0.20, etf: 0.30}
-      ltcg_rate: 0.125
-      ltcg_exemption_inr: 125000
+      long_term_rate: 0.125
+      # Section 112A's ₹1.25L covers listed equity and equity-oriented units,
+      # so a gold or silver ETF gets none of it.
+      long_term_exemption: 125000
+      long_term_exemption_classes: [equity]
+      # --- the score ---
       benchmark: SHARIABEES.NS
       context_benchmark: ^NSEI
       # Where a benchmark's prices can also come from when Yahoo has no close
