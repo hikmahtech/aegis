@@ -140,8 +140,12 @@ def test_an_agent_without_the_tool_never_sees_it():
     tools = _get_agent_tools("zzb9-nobody", metadata={"tool_set": ["search_knowledge"]})
     names = {t["function"]["name"] for t in tools}
     assert names == {"search_knowledge"}
-    # Not vacuous: the same helper does surface it for an agent that holds it.
-    assert "call_mcp_tool" in {t["function"]["name"] for t in _get_agent_tools("pandoras-actor")}
+    # Not vacuous: the same helper does surface it for an agent that holds it
+    # (the example infra grant, passed as its metadata.tool_set, #579).
+    grant = {"tool_set": sorted(AGENT_TOOL_SETS["pandoras-actor"])}
+    assert "call_mcp_tool" in {
+        t["function"]["name"] for t in _get_agent_tools("pandoras-actor", grant)
+    }
 
 
 # --- gate 1: the per-agent grant ------------------------------------------

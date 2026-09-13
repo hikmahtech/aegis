@@ -159,6 +159,18 @@ async def main():
     research_agent = await resolve_tag(deps.pool, "research") or ""
     if not research_agent:
         logger.warning("research_agent_unresolved", tag="research")
+    # The same for the GTD, infra and finance owners (#579): the agent each
+    # activity class below stamps on its llm_calls rows and speaks as — never
+    # a dataclass default naming an example agent. "" when nobody holds the
+    # tag: the rows record no agent and a message goes to comms' default.
+    # Resolved at boot like the research lane, so a changed tag applies on the
+    # next worker restart.
+    gtd_agent = await resolve_tag(deps.pool, "gtd") or ""
+    infra_agent = await resolve_tag(deps.pool, "infra") or ""
+    finance_agent = await resolve_tag(deps.pool, "finance") or ""
+    for tag, holder in (("gtd", gtd_agent), ("infra", infra_agent), ("finance", finance_agent)):
+        if not holder:
+            logger.warning("agent_tag_unresolved_at_boot", tag=tag)
     # The one User-Agent AEGIS's fetches send, naming this deployment's
     # contact URL (Integrations → bot_contact_url, else the admin UI's URL).
     user_agent = bot_user_agent(settings)
@@ -206,6 +218,7 @@ async def main():
         # through the tier map, and this one call site inherited the new model
         # alone and truncated on 100% of calls into a fallback nobody saw.
         frame_model=model_balanced,
+        agent_id=gtd_agent,
     )
     # Effective channel: an explicit AEGIS_CHANNEL wins; otherwise infer from
     # whether comms is wired (prod sets the comms URL but not AEGIS_CHANNEL on
@@ -269,6 +282,7 @@ async def main():
             delivery=delivery_act,
             heartbeat_ping_url=getattr(settings, "infra_heartbeat_ping_url", "") or "",
             infra_cluster=getattr(settings, "infra_cluster", "") or "",
+            agent_id=infra_agent,
         )
 
     money_act = None
@@ -284,6 +298,7 @@ async def main():
             ignored_mailboxes=parse_csv_set(getattr(settings, "books_ignored_mailboxes", "")),
             mailbox_entities=parse_kv(getattr(settings, "books_mailbox_entities", "")),
             finance=connectors.get("finance"),
+            agent_id=finance_agent,
         )
 
     # The statement lane rides the same flag as the rest of the money lane: it
@@ -327,6 +342,7 @@ async def main():
         # model_balanced="qwen3:14b" and ignores AEGIS_MODEL_BALANCED — email
         # triage was running entirely on the retired qwen3 model.
         model_balanced=model_balanced,
+        agent_id=gtd_agent,
     )
     drive_act = DriveActivities(
         gmail_token_dir=getattr(settings, "gmail_token_dir", "config/"),
@@ -342,6 +358,7 @@ async def main():
         llm_client=deps.llm,
         # Tier-resolved, same reason as GmailActivities above.
         model_balanced=model_balanced,
+        agent_id=gtd_agent,
     )
     # apply_enabled is the environment half of A4's two-key gate: without it,
     # `dry_run: false` on /admin/flows plans and logs but never writes.
@@ -598,6 +615,7 @@ async def main():
         todoist_connector=todoist_connector,
         # Tier-resolved, same reason as BriefingActivities above.
         frame_model=model_balanced,
+        agent_id=gtd_agent,
     )
     chat_act = ChatActivities(
         client=CoreClient(

@@ -77,7 +77,8 @@ async def test_frame_review_records_the_llm_call(db_pool):
     llm = StubbedLLMClient(
         db_pool=db_pool, content='{"narrative":"Focus week.","order":["slipping:T_S"]}'
     )
-    acts = ReviewActivities(db_pool=db_pool, llm_client=llm)
+    # The owner `__main__` resolves from the `gtd` tag and passes in (#579).
+    acts = ReviewActivities(db_pool=db_pool, llm_client=llm, agent_id="sebas")
     try:
         out = await acts.frame_review(SNAP)
         assert out["narrative"] == "Focus week."
@@ -99,7 +100,8 @@ async def test_frame_review_records_a_failed_llm_call(db_pool):
     """The deterministic fallback must not hide the failure too."""
     await db_pool.execute("DELETE FROM llm_calls WHERE purpose = 'review_frame'")
     llm = StubbedLLMClient(db_pool=db_pool, raises=RuntimeError("proxy timeout"))
-    acts = ReviewActivities(db_pool=db_pool, llm_client=llm)
+    # The owner `__main__` resolves from the `gtd` tag and passes in (#579).
+    acts = ReviewActivities(db_pool=db_pool, llm_client=llm, agent_id="sebas")
     try:
         out = await acts.frame_review(SNAP)
         assert "Weekly review" in out["narrative"]

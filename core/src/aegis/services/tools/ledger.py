@@ -287,7 +287,7 @@ def _regex_too_slow(pattern: str, kill_after: float = _REGEX_KILL_S) -> str | No
 
 
 async def _dispatch_books_write(
-    ctx: ToolContext, op: str, payload: dict, cfg: books.BooksConfig
+    ctx: ToolContext, op: str, payload: dict, cfg: books.BooksConfig, pool=None
 ) -> str:
     """Hand a validated write to `BooksWriteFlow` and wait a short while for it.
 
@@ -314,13 +314,20 @@ async def _dispatch_books_write(
             "error: the books write could not be queued — Temporal is not reachable. "
             "Nothing was written; try again once it is back."
         )
+    # No calling agent: the books' owner, the `finance` holder — never an
+    # example id (#579). "" when nobody holds it (the run records no agent).
+    agent_id = ctx.agent_id
+    if not agent_id and pool is not None:
+        from aegis.services.agents import resolve_tag
+
+        agent_id = await resolve_tag(pool, "finance")
     workflow_id = lw.write_workflow_id(op, payload, cfg.currency)
     reattached = False
     try:
         handle = await client.start_workflow(
             _BOOKS_WRITE_FLOW,
             {
-                "agent_id": ctx.agent_id or "maou",
+                "agent_id": agent_id or "",
                 "op": op,
                 "payload": payload,
                 "reply_after_seconds": LEDGER_WRITE_WAIT_S,
@@ -475,6 +482,7 @@ async def _exec_ledger_post(
             "note": note,
         },
         cfg,
+        pool=pool,
     )
 
 
@@ -518,7 +526,11 @@ async def _exec_ledger_reclassify(
             "entities means moving the block, which this tool does not do."
         )
     return await _dispatch_books_write(
-        ctx, "reclassify", {"message_id": message_id, "account": account, "payee": payee}, cfg
+        ctx,
+        "reclassify",
+        {"message_id": message_id, "account": account, "payee": payee},
+        cfg,
+        pool=pool,
     )
 
 
@@ -632,4 +644,6 @@ async def _exec_ledger_add_rule(
         rule["direction"] = direction
     if payee:
         rule["payee"] = payee
-    return await _dispatch_books_write(ctx, "add_rule", {"rule": rule, "apply": apply}, cfg)
+    return await _dispatch_books_write(
+        ctx, "add_rule", {"rule": rule, "apply": apply}, cfg, pool=pool
+    )

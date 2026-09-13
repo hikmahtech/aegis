@@ -11,7 +11,12 @@ Routing:
       mention stripped before the LLM sees it;
   (b) the bot itself @app_mention'd → async to the channel's agent;
   (c) the channel maps to pandora → async (kimi tools run minutes);
-  (d) otherwise → sync `/api/chat` with the channel's agent (default sebas).
+  (d) otherwise → sync `/api/chat` with the channel's agent; an unbound
+      channel asks core's front door (POST /api/chat/route) who it is for.
+
+Every agent-specific input — aliases, async dispatch, the default agent — is
+read from the active agents' rows (GET /api/agents), never from a list of
+example ids (#579).
 
 A reply inside a thread is checked against the task sessions first (GET
 /api/admin/task-sessions/by-thread): a task's thread is its conversation, so
@@ -29,6 +34,7 @@ from __future__ import annotations
 import hashlib
 import re
 import time
+from dataclasses import dataclass, field
 from typing import Any
 from urllib.parse import quote, urlencode
 
@@ -39,9 +45,6 @@ from aegis_comms.adapters.base import DeliveryRef
 from aegis_comms.errors import error_text
 
 logger = structlog.get_logger()
-
-# Default agent when a channel has no mapping (mirrors bot.py's "sebas").
-_DEFAULT_AGENT = "sebas"
 
 # Slack voice clips / audio uploads. mimetype starts with "audio/" or the name
 # carries one of these extensions (Slack voice messages are typically mp4/m4a).
@@ -113,27 +116,34 @@ def capture_ack(result: dict | None) -> str:
 # ponytail: fixed 30-min TTL; per-user tuning only if it ever matters.
 _STICKY_TTL_SECONDS = 1800.0
 
-# How long the derived (mention_map, async_agents) routing config is cached
-# before re-fetching GET /api/agents. Short so admin Behavior-tab edits apply
-# within a minute without a comms restart.
+# How long the routing config derived from GET /api/agents is cached before
+# re-fetching. Short so admin Behavior-tab edits apply within a minute without
+# a comms restart.
 _ROUTING_CFG_TTL_SECONDS = 60.0
 
-# Slack-label → downstream agent-id. Fallback only — the live map is derived
-# per-request from each active agent's `metadata.mention_aliases` (default
-# `[agent.id]`) via `_derive_mention_map`. This hardcoded copy is used when the
-# `GET /api/agents` fetch fails, so an inbound message never crashes. The label
-# `pandora` maps to agent id `pandoras-actor` (its seed mention_aliases).
-_AGENT_MENTION_MAP = {
-    "pandora": "pandoras-actor",
-    "pandoras-actor": "pandoras-actor",
-    "sebas": "sebas",
-    "raphael": "raphael",
-    "maou": "maou",
-}
+# The behavior tag whose holder takes a message nobody claims — the same
+# generalist core's front door falls back to (`chat.GENERALIST_TAG`).
+_GENERALIST_TAG = "gtd"
 
-# Fallback set of agent ids dispatched async (kimi tools run minutes). Live set
-# is derived from `metadata.async_dispatch` via `_derive_async_agents`.
-_ASYNC_AGENTS = frozenset({"pandoras-actor"})
+
+@dataclass(frozen=True)
+class RoutingConfig:
+    """What inbound routing knows about the agents, from GET /api/agents.
+
+    All of it comes from the active agents' rows (#579): the `@alias` → id map
+    from `metadata.mention_aliases`, the agents dispatched async from
+    `metadata.async_dispatch`, and the default agent from the `gtd` capability
+    tag. Nothing is keyed on an example id, so a fork that renames its agents
+    routes the same way.
+
+    The empty config is what comms has before core has ever answered: no alias
+    is recognised, nothing dispatches async and there is no default, so a
+    message goes to its channel's agent, or to core's front door to pick one.
+    """
+
+    mention_map: dict[str, str] = field(default_factory=dict)
+    async_agents: frozenset[str] = frozenset()
+    default_agent: str = ""
 
 
 def _build_mention_re(mention_map: dict[str, str]) -> re.Pattern[str]:
@@ -146,15 +156,11 @@ def _build_mention_re(mention_map: dict[str, str]) -> re.Pattern[str]:
     )
 
 
-_AGENT_MENTION_RE = _build_mention_re(_AGENT_MENTION_MAP)
-
-
 def _derive_mention_map(agents: list[dict] | None) -> dict[str, str]:
     """Build the Slack-label → agent-id map from active agents' metadata.
 
     Each agent contributes its `metadata.mention_aliases` (default `[agent.id]`)
-    plus its own id, all lowercased. Returns {} when there's no usable data so
-    the caller can fall back to `_AGENT_MENTION_MAP`.
+    plus its own id, all lowercased. {} when there are no agents.
     """
     out: dict[str, str] = {}
     for a in agents or []:
@@ -178,6 +184,17 @@ def _derive_async_agents(agents: list[dict] | None) -> set[str]:
     }
 
 
+def _derive_default_agent(agents: list[dict] | None) -> str:
+    """Who takes a message nobody claims: the first active agent, by id,
+    holding the `gtd` tag. "" when none does — never an example id."""
+    holders = sorted(
+        str(a["id"])
+        for a in (agents or [])
+        if a.get("id") and _GENERALIST_TAG in (a.get("capabilities") or [])
+    )
+    return holders[0] if holders else ""
+
+
 def _parse_agent_mention(
     text: str, mention_map: dict[str, str] | None = None
 ) -> tuple[str | None, str]:
@@ -186,15 +203,12 @@ def _parse_agent_mention(
     Returns `(target_agent, stripped_text)` when a known agent is mentioned;
     the mention is removed and surrounding whitespace collapsed so the LLM
     doesn't see a self-reference. First-found wins; `info@mail.com` does not
-    false-positive (word-boundary match). `mention_map` defaults to the shipped
-    `_AGENT_MENTION_MAP`; callers pass the DB-derived map to reach custom agents.
+    false-positive (word-boundary match). `mention_map` is the DB-derived
+    alias map; with none, no mention is recognised.
     """
-    if not text:
+    if not text or not mention_map:
         return None, text
-    if mention_map is None:
-        mention_map, mention_re = _AGENT_MENTION_MAP, _AGENT_MENTION_RE
-    else:
-        mention_re = _build_mention_re(mention_map)
+    mention_re = _build_mention_re(mention_map)
     match = mention_re.search(text)
     if match is None:
         return None, text
@@ -235,11 +249,11 @@ def route_message(
       - bound channel otherwise → ("sync", channel's agent, text).
 
     `mention_map` (Slack-label → agent-id) and `async_agents` (ids that dispatch
-    async) default to the shipped constants; callers pass the DB-derived values
-    so custom/renamed agents route correctly.
+    async) are the DB-derived values (`RoutingConfig`); left out, no mention is
+    recognised and nothing dispatches async.
     """
     if async_agents is None:
-        async_agents = _ASYNC_AGENTS
+        async_agents = frozenset()
     mentioned_agent, stripped = _parse_agent_mention(text, mention_map)
     if mentioned_agent is not None:
         return "async", mentioned_agent, stripped
@@ -392,11 +406,16 @@ class SlackCoreClient:
         return result
 
     async def route_intent(self, *, message: str) -> dict:
-        """POST /api/chat/route → {agent_id, method}. Safe-degrades to sebas/default."""
+        """POST /api/chat/route → {agent_id, method}.
+
+        On failure, or when core has nobody to route to, `agent_id` is "" —
+        never an example id (#579). The caller then uses its own copy of the
+        `gtd` holder, or sends the message with no agent for core to route.
+        """
         result = await self._post("/api/chat/route", {"message": message}, timeout=30)
         if isinstance(result, dict) and result.get("agent_id"):
             return {"agent_id": result["agent_id"], "method": result.get("method", "llm")}
-        return {"agent_id": _DEFAULT_AGENT, "method": "default"}
+        return {"agent_id": "", "method": "default"}
 
     async def agent_reply_trigger(
         self, *, target_agent: str, message: str, thread_id: str, reply_chat_id: int
@@ -569,14 +588,18 @@ class SlackInbound:
         self._note_to_self_channel = (note_to_self_channel or "").strip()
         # channel_id -> (agent_id, monotonic_ts); ephemeral conversation context.
         self._sticky: dict[str, tuple[str, float]] = {}
-        # Cached (mention_map, async_agents) derived from GET /api/agents.
-        self._routing_cfg: tuple[dict[str, str], set[str]] | None = None
+        # The routing config derived from GET /api/agents (last good read).
+        self._routing_cfg: RoutingConfig | None = None
         self._routing_cfg_ts: float = 0.0
 
-    async def _routing_config(self) -> tuple[dict[str, str], set[str]]:
-        """(_mention_map, async_agents) derived from active agents' metadata,
-        cached for `_ROUTING_CFG_TTL_SECONDS`. Degrades to the shipped constants
-        if `GET /api/agents` fails, so routing never crashes."""
+    async def _routing_config(self) -> RoutingConfig:
+        """The routing config derived from the active agents' rows, cached for
+        `_ROUTING_CFG_TTL_SECONDS`.
+
+        When GET /api/agents fails, the last config core gave is kept and the
+        next message asks again; before core has ever answered it is the empty
+        `RoutingConfig`. Routing never crashes, and never falls back to a list
+        of example ids (#579)."""
         now = time.monotonic()
         if self._routing_cfg is not None and now - self._routing_cfg_ts < _ROUTING_CFG_TTL_SECONDS:
             return self._routing_cfg
@@ -585,12 +608,13 @@ class SlackInbound:
         except Exception as exc:  # noqa: BLE001 — routing must never break inbound
             logger.warning("slack_routing_config_fetch_failed", error=error_text(exc))
             agents = None
-        if isinstance(agents, list) and agents:
-            mention_map = _derive_mention_map(agents) or dict(_AGENT_MENTION_MAP)
-            async_agents = _derive_async_agents(agents)
-        else:
-            mention_map, async_agents = dict(_AGENT_MENTION_MAP), set(_ASYNC_AGENTS)
-        self._routing_cfg = (mention_map, async_agents)
+        if not isinstance(agents, list):
+            return self._routing_cfg or RoutingConfig()
+        self._routing_cfg = RoutingConfig(
+            mention_map=_derive_mention_map(agents),
+            async_agents=frozenset(_derive_async_agents(agents)),
+            default_agent=_derive_default_agent(agents),
+        )
         self._routing_cfg_ts = now
         return self._routing_cfg
 
@@ -611,11 +635,14 @@ class SlackInbound:
 
     async def _sync_chat(
         self, *, agent_id: str, clean_text: str, thread_id: str, channel_id: str
-    ) -> None:
+    ) -> str:
         """Sync chat: POST /api/chat → post reply → attach delivery-ref.
 
         Shared by the sync branch and the async-trigger-failed fallback
         (mirrors bot.py::_send_chat + the two-step delivery-ref attach).
+
+        `agent_id` may be "": core's front door then picks the agent and its
+        answer names it (#579). Returns the agent that answered ("" if none).
         """
         result = await self._core.chat(
             agent_id=agent_id,
@@ -625,9 +652,10 @@ class SlackInbound:
         )
         reply_text = result.get("response", "No response from agent.")
         assistant_message_id = result.get("assistant_message_id")
+        answered_by = result.get("agent_id") or agent_id
 
         send_result = await self._adapter.send_message(
-            agent_id=agent_id,
+            agent_id=answered_by,
             text=reply_text,
             target={"channel": channel_id},
         )
@@ -637,6 +665,7 @@ class SlackInbound:
                 message_id=assistant_message_id,
                 delivery_ref=send_result.ref.to_dict(),
             )
+        return answered_by
 
     async def on_message(
         self,
@@ -860,30 +889,33 @@ class SlackInbound:
         exactly like a typed message: @mention parsing, sticky-agent, and the
         sync/async split all apply identically.
         """
-        mention_map, async_agents = await self._routing_config()
+        cfg = await self._routing_config()
         mode, agent_id, clean_text = route_message(
             channel_id,
             text,
             self._channel_agent_map,
             self._bot_user_id,
-            mention_map=mention_map,
-            async_agents=async_agents,
+            mention_map=cfg.mention_map,
+            async_agents=cfg.async_agents,
         )
         now = time.monotonic()
 
         if mode == "route":
             routed = await self._core.route_intent(message=clean_text)
-            routed_agent = routed.get("agent_id", _DEFAULT_AGENT)
+            # "" when the route call failed or core had nobody: comms' own copy
+            # of the gtd holder, else no agent at all and core picks (#579).
+            routed_agent = routed.get("agent_id") or cfg.default_agent
             method = routed.get("method", "default")
             sticky = self._sticky_get(channel_id, now)
             # Clear keyword → route by content. Ambiguous (llm/default) + a fresh
             # sticky agent → stay with the conversation's agent.
             agent_id = sticky if (method != "keyword" and sticky is not None) else routed_agent
-            mode = "async" if agent_id in async_agents else "sync"
+            mode = "async" if agent_id in cfg.async_agents else "sync"
 
         # Remember the resolved agent as this channel's conversation context so the
         # next ambiguous follow-up sticks (including after an explicit @mention).
-        self._sticky_set(channel_id, agent_id, now)
+        if agent_id:
+            self._sticky_set(channel_id, agent_id, now)
 
         thread_id = f"slack-{channel_id}-{agent_id}"
 
@@ -912,12 +944,15 @@ class SlackInbound:
             )
 
         # Sync path: chat, post the reply, then attach the delivery-ref.
-        await self._sync_chat(
+        answered_by = await self._sync_chat(
             agent_id=agent_id,
             clean_text=clean_text,
             thread_id=thread_id,
             channel_id=channel_id,
         )
+        if answered_by and not agent_id:
+            # Core picked the agent: it is now this conversation's.
+            self._sticky_set(channel_id, answered_by, now)
 
     async def on_action(
         self, *, value: str, channel_id: str, message_ts: str, note: str = ""
@@ -1120,7 +1155,12 @@ class SlackInbound:
         agent. `client` is the bolt AsyncWebClient (for files_info); the private
         download uses the bot token bearer auth.
         """
-        agent_id = self._channel_agent_map.get(channel_id, _DEFAULT_AGENT)
+        # The channel's agent; elsewhere the gtd holder, or "" — core's front
+        # door then picks one and says who (#579).
+        agent_id = (
+            self._channel_agent_map.get(channel_id)
+            or (await self._routing_config()).default_agent
+        )
         info = await client.files_info(file=file_id)
         finfo = info.get("file") or {}
         name = finfo.get("name") or "document"
@@ -1163,7 +1203,7 @@ class SlackInbound:
             url=f"slack://document/{name}",
             title=name,
             raw_text=extracted,
-            tags=[agent_id],
+            tags=[agent_id] if agent_id else [],
         )
         id_tag = f" (content_id: {content_id})" if content_id else ""
         excerpt = extracted[:8000]
@@ -1190,7 +1230,9 @@ class SlackInbound:
         )
         reply = result.get("response", "No response from agent.")
         await self._adapter.send_message(
-            agent_id=agent_id, text=reply, target={"channel": channel_id}
+            agent_id=result.get("agent_id") or agent_id,
+            text=reply,
+            target={"channel": channel_id},
         )
 
     async def _handle_audio_file(

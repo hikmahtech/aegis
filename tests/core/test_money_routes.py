@@ -565,7 +565,7 @@ def test_money_trigger_run_dispatches_workflow(app, client, monkeypatch, flow):
     """POST /{flow}/run delegates to _start_workflow for each known flow."""
     calls = []
 
-    async def fake_start(flow_name, cfg, temporal_client):
+    async def fake_start(flow_name, cfg, temporal_client, pool=None):
         calls.append((flow_name, cfg))
         handle = MagicMock()
         handle.id = f"wf-{flow_name}-1"

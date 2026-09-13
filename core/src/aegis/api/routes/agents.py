@@ -320,17 +320,16 @@ async def draft_persona(agent_id: str, request: Request, body: dict[str, Any]) -
 async def get_agent_tools(agent_id: str, request: Request) -> list[dict[str, str]]:
     """Return the tool set this agent has access to, joined with tool descriptions.
 
-    Prefers the agent's DB metadata.tool_set (so UI-created agents work), falling
-    back to the hardcoded AGENT_TOOL_SETS — mirrors chat.py's _get_agent_tools.
+    The agent's `metadata.tool_set`, or the small `_FALLBACK_TOOL_SET` when it
+    has none — exactly what chat.py's `_get_agent_tools` gives it. Never a set
+    keyed on the agent's id (#579).
     """
-    from aegis.services.chat import AGENT_TOOL_SETS, CHAT_TOOLS
+    from aegis.services.chat import _FALLBACK_TOOL_SET, CHAT_TOOLS
 
     agent = await _get_agent(request.app.state.db_pool, agent_id)
     if agent is None:
         raise HTTPException(status_code=404, detail=f"Agent '{agent_id}' not found")
-    tool_names = (
-        (agent.get("metadata") or {}).get("tool_set") or AGENT_TOOL_SETS.get(agent_id) or []
-    )
+    tool_names = (agent.get("metadata") or {}).get("tool_set") or _FALLBACK_TOOL_SET
 
     descriptions: dict[str, str] = {}
     for spec in CHAT_TOOLS:

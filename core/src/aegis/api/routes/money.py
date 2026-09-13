@@ -75,8 +75,9 @@ _EVENT_COLUMNS = (
 )
 
 
-async def _start_workflow(flow: str, cfg: dict, temporal_client: TemporalClient):
-    return await start_named_workflow(flow, cfg, temporal_client, _FLOW_NAMES)
+async def _start_workflow(flow: str, cfg: dict, temporal_client: TemporalClient, pool=None):
+    # With a pool, the run's agent is the flow's activities-row owner (#579).
+    return await start_named_workflow(flow, cfg, temporal_client, _FLOW_NAMES, pool=pool)
 
 
 def _event(row) -> dict:
@@ -194,7 +195,7 @@ async def trigger_flow(
         body = await request.json()
     except Exception:
         body = {}
-    handle = await _start_workflow(flow, body or {}, client)
+    handle = await _start_workflow(flow, body or {}, client, pool=request.app.state.db_pool)
     return {"ok": True, "workflow_id": handle.id}
 
 

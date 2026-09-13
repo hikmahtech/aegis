@@ -1002,7 +1002,7 @@ class SocialActivities:
         return out
 
     @activity.defn
-    async def report_stuck_posts(self, findings: list[dict], agent_id: str = "sebas") -> dict:
+    async def report_stuck_posts(self, findings: list[dict], agent_id: str = "") -> dict:
         """Notify about NEW stuck posts, and about posts that finally published.
 
         The problem hub decides what is new: each stuck post is an occurrence

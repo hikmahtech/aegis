@@ -22,9 +22,11 @@ from aegis.llm import parse_llm_json
 from aegis.llm.tier import resolve_model_for_agent, tier_to_model, tier_to_model_or
 from aegis.mcp_manager import MCPError
 from aegis.observability import log_audit, record_llm_call, record_tool_call
+from aegis.services.agents import resolve_tag
+from aegis.services.knowledge_ranking import DEFAULT_RANKING, Ranking, get_ranking
 from aegis.services.library import LIBRARY_READ_TIMEOUT_S
 from aegis.services.research import FETCH_TOOL_TIMEOUT_S, RESEARCH_TOOL_TIMEOUT_S
-from aegis.services.source_types import DEFAULT_DECAY_DAYS, get_decay_days, get_rank_boost
+from aegis.services.source_types import DEFAULT_DECAY_DAYS
 from aegis.services.tools.base import (
     _MAX_LISTED_DROPPED_KEYS,  # noqa: F401 — re-export: kept importable from here
     _SHRINK_PASSES,  # noqa: F401 — re-export: imported from here by tests
@@ -1854,7 +1856,10 @@ async def _exec_dispatch_agent_run(pool: asyncpg.Pool, args: dict, ctx: ToolCont
     engine = (args.get("engine") or "").strip().lower()
     if engine and engine not in ("claude", "kimi"):
         return f"Can't dispatch: unknown engine '{engine}' — use 'claude' or 'kimi', or omit it."
-    agent_id = ctx.agent_id or "sebas"
+    # No calling agent: the generalist runs it, never an example id (#579).
+    agent_id = ctx.agent_id or await resolve_tag(pool, GENERALIST_TAG)
+    if not agent_id:
+        return "Can't dispatch: no agent to run it as — no active agent holds the gtd tag."
     gated = bool(args.get("gated"))
     # A run tied to a Todoist task gets a DETERMINISTIC workflow id, so asking
     # twice for the same task is refused by Temporal instead of starting a
@@ -1945,7 +1950,10 @@ async def _exec_create_schedule(pool: asyncpg.Pool, args: dict, ctx: ToolContext
     slug = (args.get("slug") or "").strip() or f"nl-{workflow_type.lower()}-{uuid4().hex[:4]}"
     config = dict(args.get("config") or {})
     config["created_by"] = "chat"
-    agent_id = ctx.agent_id or "sebas"
+    # No calling agent: the generalist owns it, never an example id (#579).
+    agent_id = ctx.agent_id or await resolve_tag(pool, GENERALIST_TAG)
+    if not agent_id:
+        return json.dumps({"error": "no agent to own the schedule — no active agent holds the gtd tag"})
     try:
         row = await pool.fetchrow(
             "INSERT INTO activities (slug, workflow_type, agent_id, schedule_cron, config, active) "
@@ -2390,7 +2398,8 @@ async def _deliver_documents(ctx: ToolContext, documents: list[dict], caption: s
     body = {
         "documents": documents,
         "caption": caption,
-        "agent_id": ctx.agent_id or "sebas",
+        # "" lets comms pick its default (the gtd holder), never an example id (#579).
+        "agent_id": ctx.agent_id or "",
         "target": {"channel": ref["channel"]} if ref.get("channel") else None,
     }
     try:
@@ -3138,9 +3147,14 @@ TOOL_EXECUTORS: dict[str, Any] = {
     "call_mcp_tool": _exec_call_mcp_tool,
 }
 
-# --- Per-agent tool sets ---
-# Each agent only sees tools relevant to their domain.
-# Unknown agents fall back to Sebas (coordinator = catch-all).
+# --- The example agents' tool sets ---
+# The four example agents' tool sets as code. Nothing reads it at runtime
+# (#579): an agent's tools are its `metadata.tool_set`, and an agent without
+# one gets `_FALLBACK_TOOL_SET` whatever its id. It is not what a fresh install
+# gets either — config/seed/agents.yaml seeds `metadata.tool_set` — and it has
+# drifted from that file (it grants a few tools the yaml does not). It stays
+# for `_validate_agent_tool_sets` (a grant naming a tool with no executor
+# refuses to boot) and for the tests that pin the example grants.
 
 AGENT_TOOL_SETS: dict[str, set[str]] = {
     "sebas": {
@@ -3333,14 +3347,12 @@ _FALLBACK_TOOL_SET: frozenset[str] = frozenset(
 def _get_agent_tools(agent_id: str, metadata: dict | None = None) -> list[dict]:
     """Return CHAT_TOOLS filtered to the agent's allowed tool set.
 
-    Tool set is data-driven from agents.metadata.tool_set when present, falling
-    back to the shipped AGENT_TOOL_SETS for the seed agents, then to a tiny safe
-    default (_FALLBACK_TOOL_SET) for anyone unconfigured — never Sebas's full set.
+    The set is the agent's `metadata.tool_set` (admin Agents → Behavior). An
+    agent without one gets the tiny safe `_FALLBACK_TOOL_SET` whatever its id:
+    `AGENT_TOOL_SETS` is not read here, because an example id is not a grant
+    (#579). `agent_id` is kept for the callers; it decides nothing.
     """
-    allowed = (metadata or {}).get("tool_set")
-    if not allowed:
-        allowed = AGENT_TOOL_SETS.get(agent_id) or _FALLBACK_TOOL_SET
-    allowed = set(allowed)
+    allowed = set((metadata or {}).get("tool_set") or _FALLBACK_TOOL_SET)
     return [t for t in CHAT_TOOLS if t["function"]["name"] in allowed]
 
 
@@ -3465,24 +3477,28 @@ def _extract_query_entities(message: str, agent_ids=()) -> list[str]:
 DEFAULT_DECAY_WINDOW = DEFAULT_DECAY_DAYS
 
 
-def _apply_knowledge_decay(items: list[dict]) -> list[dict]:
+def _apply_knowledge_decay(items: list[dict], ranking: Ranking | None = None) -> list[dict]:
     """Apply time-based decay to knowledge items based on source type.
 
     When days_since_referenced is unknown, assume item is fresh (0 days).
     Decay is only meaningful when age data is available from the knowledge store.
+    `ranking` carries the per-type decay window and rank boost — the
+    `knowledge_ranking` row over the registry; None is the registry alone.
     """
+    ranking = ranking or DEFAULT_RANKING
     for item in items:
         source_type = item.get("source_type", "unknown")
-        decay_window = get_decay_days(source_type)
+        decay_window = ranking.decay_days(source_type)
         # Default to 0 (fresh) when age is unknown — don't penalize items without age data
         days = item.get("days_since_referenced", 0)
         decay_factor = max(0.1, 1.0 - (days / decay_window))
-        # similarity can be None (BM25-only chunks from knowledge-service);
-        # coerce so the multiply doesn't break. The rank boost is 1.0 for every
-        # type but the user's own notes, which rank above raw documents (#514).
-        item["effective_score"] = (
-            (item.get("similarity") or 0) * decay_factor * get_rank_boost(source_type)
-        )
+        # Start from the domain-boosted `_score` when the caller set one, so
+        # the boost reaches the threshold and the order (#579); else from
+        # similarity, which can be None (BM25-only chunks) and is coerced. The
+        # rank boost is 1.0 for every type but the user's own notes, which rank
+        # above raw documents (#514), unless the row says otherwise.
+        base = item["_score"] if item.get("_score") is not None else (item.get("similarity") or 0)
+        item["effective_score"] = base * decay_factor * ranking.rank_boost(source_type)
     return items
 
 
@@ -3725,11 +3741,16 @@ async def _gather_knowledge_context(
     max_results: int = 5,
     max_chars: int = 2000,
     timeout: float = 5.0,
+    ranking: Ranking | None = None,
 ) -> tuple[str | None, list[dict]]:
     """Search knowledge base for context relevant to the user's message.
 
     Semantic chunk search only (no knowledge graph). Never raises.
     Returns (formatted_context_string, injected_items_metadata).
+
+    A result's score is `(similarity + domain boost) * decay * rank boost`;
+    the threshold and the order both read it. `ranking` is the turn's
+    `knowledge_ranking` (the caller reads the row once); None is the defaults.
     """
     if knowledge_connector is None:
         return (None, [])
@@ -3744,31 +3765,23 @@ async def _gather_knowledge_context(
         if not results:
             return (None, [])
 
-        # Agent-scoped boosting
-        domains = knowledge_domains or []
+        ranking = ranking or DEFAULT_RANKING
+        # Agent-scoped boosting: the agent's own domains get `domain_boost`.
+        domains = set(knowledge_domains or [])
         for r in results:
-            boost = 0.2 if r.get("source_type") in domains else 0.0
+            boost = ranking.domain_boost if r.get("source_type") in domains else 0.0
             r["_score"] = (r.get("similarity") or 0) + boost
 
-        # Apply time-based decay (sets effective_score)
-        results = _apply_knowledge_decay(results)
-
-        # Filter by score threshold.
-        filtered = []
-        for r in results:
-            score = r.get("effective_score") or r.get("_score") or r.get("similarity") or 0
-            if score >= score_threshold:
-                filtered.append(r)
-        results = filtered
+        # Decay starts from `_score`, so `effective_score` carries the boost
+        # into the threshold and the sort (#579) — before, it restarted from
+        # raw similarity and the boost changed nothing a prompt saw.
+        results = _apply_knowledge_decay(results, ranking)
+        results = [r for r in results if r["effective_score"] >= score_threshold]
 
         if not results:
             return (None, [])
 
-        # Sort by effective_score for final ranking
-        results.sort(
-            key=lambda r: r.get("effective_score") or r.get("_score") or 0,
-            reverse=True,
-        )
+        results.sort(key=lambda r: r["effective_score"], reverse=True)
 
         # Format + build injection metadata
         lines: list[str] = []
@@ -3996,6 +4009,8 @@ async def send_message(
             max_results=getattr(settings, "knowledge_context_max_results", 5),
             max_chars=getattr(settings, "knowledge_context_max_chars", 2000),
             timeout=getattr(settings, "knowledge_context_timeout_seconds", 5.0),
+            # Read once per turn (30s cache); the per-result math is sync.
+            ranking=await get_ranking(pool),
         )
         if knowledge_context:
             system_prompt = system_prompt + "\n\n## Relevant Knowledge\n" + knowledge_context
