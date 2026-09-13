@@ -11,7 +11,6 @@ from __future__ import annotations
 from collections import defaultdict
 from datetime import UTC, date, datetime, timedelta
 from typing import Any
-from zoneinfo import ZoneInfo
 
 import asyncpg
 import structlog
@@ -22,26 +21,23 @@ from aegis.services import hub_watch
 
 logger = structlog.get_logger()
 
-MARKET_TZ = ZoneInfo("Asia/Kolkata")
 DESK_SLUG = "trading-desk-daily"
-INDEX = "^NSEI"  # the trading calendar: its bars are the market days
 SOURCE = "money"
 SUBJECT_KIND = "trading_desk"
 DAILY_CLASSES = ["desk_decisions_stale", "desk_decisions_suspect", "desk_source_error", "desk_price_missing"]
 MONTHLY_CLASSES = ["desk_below_expectation"]
+# Which market, which currency and which tax law are NOT here: they are the
+# desk's own config (`desk_math.Rules`), because this repo is forked and
+# configured. What is left is operational — how far back to fetch, how long to
+# wait — and reads the same in any market.
 FETCH_BACK_DAYS = 30
 REFETCH_OVERLAP_DAYS = 5
 PRICE_GRACE_DAYS = 3  # market days before an unfillable order is cancelled
-PRICE_STALE_DAYS = 7  # calendar days before a price is too old to size or sell on
-STALE_INDEX_DAYS = 6  # calendar days before the market calendar itself looks wrong;
-# a long weekend plus a holiday is 4 to 5 days, so 6 keeps the alarm honest
 ANSAAR_FALLBACK_DAYS = 7  # how far back the fallback may reach; see _refresh
 
-
-def yahoo_symbol(symbol: str) -> str:
-    """NSE symbol to Yahoo's (``TCS`` to ``TCS.NS``). An index, or a symbol that
-    already names its exchange, is left alone."""
-    return symbol if symbol.startswith("^") or "." in symbol else f"{symbol}.NS"
+# Old config key names this process has already warned about, so a deprecation
+# that is read on every run is said once rather than several times a day.
+_WARNED_LEGACY: set[str] = set()
 
 
 def _finding(klass: str, subject: str, title: str, description: str) -> dict:
@@ -87,9 +83,20 @@ def _ts(raw: Any) -> datetime | None:
 
 async def load_rules(pool: asyncpg.Pool) -> dm.Rules:
     """The desk's rules from its activities row, read on every run so an edit
-    needs no redeploy (spec §12). No row means the defaults."""
+    needs no redeploy (spec §12). No row means the defaults, and the defaults
+    name no market, so a desk nobody has configured does nothing.
+
+    Three keys were renamed to drop a currency from their names. A row still
+    holding an old one is read and logged, not ignored: `schedule_sync` re-reads
+    this row every few minutes, so no ordering of the deploy and the config
+    write would have closed the gap."""
     cfg = await pool.fetchval("SELECT config FROM activities WHERE slug = $1", DESK_SLUG)
-    return dm.Rules.from_config(cfg if isinstance(cfg, dict) else None)
+    cfg = cfg if isinstance(cfg, dict) else None
+    legacy = dm.legacy_keys(cfg)
+    if legacy and not set(legacy) <= _WARNED_LEGACY:
+        _WARNED_LEGACY.update(legacy)
+        logger.warning("trading_desk_legacy_config_keys", keys=legacy, slug=DESK_SLUG)
+    return dm.Rules.from_config(cfg)
 
 
 # --- prices ------------------------------------------------------------------
@@ -137,6 +144,7 @@ async def _refresh(
     pool: asyncpg.Pool,
     finance: Any,
     ansaar: Any,
+    rules: dm.Rules,
     symbol: str,
     asset_class: str | None,
     today: date,
@@ -153,7 +161,7 @@ async def _refresh(
     not ``symbol``: a benchmark is named in Yahoo's form (``SHARIABEES.NS``) and
     ansaar wants the NSE symbol (``SHARIABEES``). Bars are always stored under
     ``symbol``'s Yahoo form, whichever source they came from."""
-    ysym = yahoo_symbol(symbol)
+    ysym = rules.price_symbol(symbol)
     latest = await pool.fetchval("SELECT max(date) FROM finance.desk_prices WHERE symbol = $1", ysym)
     start = latest - timedelta(days=REFETCH_OVERLAP_DAYS) if latest else today - timedelta(days=FETCH_BACK_DAYS)
     end = today - timedelta(days=1)
@@ -193,9 +201,9 @@ async def _refresh(
     await _store_bars(pool, ysym, [b for b in bars if b["day"] in missing], "ansaar", today)
 
 
-async def _bars(pool: asyncpg.Pool, symbols: set[str]) -> dict[str, list[dm.Bar]]:
-    """Stored bars keyed by the desk's symbol: NSE form for instruments, and the
-    benchmarks as named. Each list is sorted by day.
+async def _bars(pool: asyncpg.Pool, rules: dm.Rules, symbols: set[str]) -> dict[str, list[dm.Bar]]:
+    """Stored bars keyed by the desk's symbol: the plain form for instruments,
+    and the benchmarks as named. Each list is sorted by day.
 
     Two desk names can share one Yahoo symbol: the desk holds SHARIABEES and
     names its benchmark SHARIABEES.NS, and both are SHARIABEES.NS to Yahoo. So
@@ -203,7 +211,7 @@ async def _bars(pool: asyncpg.Pool, symbols: set[str]) -> dict[str, list[dm.Bar]
     all of them."""
     by_yahoo: dict[str, list[str]] = defaultdict(list)
     for s in symbols:
-        by_yahoo[yahoo_symbol(s)].append(s)
+        by_yahoo[rules.price_symbol(s)].append(s)
     rows = await pool.fetch(
         "SELECT symbol, date, close, split_ratio, dividend, source FROM finance.desk_prices "
         "WHERE symbol = ANY($1::text[]) ORDER BY symbol, date",
@@ -339,9 +347,14 @@ async def run_tick(
     pool: asyncpg.Pool, *, ansaar: Any, finance: Any, today: date | None = None, project: bool = True
 ) -> dict:
     """One morning's run (spec §3). Idempotent: a second run on the same day
-    changes nothing and raises the same problems."""
-    today = today or datetime.now(MARKET_TZ).date()
-    out, findings, checked = await _tick(pool, ansaar, finance, today)
+    changes nothing and raises the same problems.
+
+    Which day it is is read off the market's own clock, so a run scheduled for
+    the morning does not roll over a day early or late in a deployment whose
+    server sits in another timezone."""
+    rules = await load_rules(pool)
+    today = today or datetime.now(rules.tz()).date()
+    out, findings, checked = await _tick(pool, ansaar, finance, today, rules)
     unique = list({(f["klass"], f["subject"]): f for f in findings}.values())
     # Resolve only inside the classes this run checked. A run that stopped early
     # looked at nothing else, so resolving one of those problems would complete
@@ -353,11 +366,12 @@ async def run_tick(
     return out
 
 
-async def _tick(pool: asyncpg.Pool, ansaar: Any, finance: Any, today: date) -> tuple[dict, list[dict], list[str]]:
+async def _tick(
+    pool: asyncpg.Pool, ansaar: Any, finance: Any, today: date, rules: dm.Rules
+) -> tuple[dict, list[dict], list[str]]:
     """The run's outcome, its findings, and the classes it actually checked. A
     run that stops early checked only the thing that stopped it, so it names no
     class and nothing of its own is resolved."""
-    rules = await load_rules(pool)
     out: dict[str, Any] = {"today": today.isoformat()}
     if rules.mode != "paper":
         return out | {"skipped": "mode"}, [
@@ -368,34 +382,42 @@ async def _tick(pool: asyncpg.Pool, ansaar: Any, finance: Any, today: date) -> t
             )
         ], []
 
-    # 1. Find the day.
+    # 1. Find the day. A desk with no trading calendar cannot, so it stops here
+    # and says nothing — the same silence an empty `ansaar_url` gets. A finding
+    # would raise a Todoist task on a fork that simply does not use the desk,
+    # and a fallback market would place paper orders on someone else's holidays.
+    index = rules.calendar_symbol
+    if not index:
+        logger.info("trading_desk_unconfigured", reason="no_calendar_symbol", slug=DESK_SLUG)
+        return out | {"skipped": "unconfigured"}, [], []
     try:
-        await _refresh(pool, finance, None, INDEX, None, today, required=True)
+        await _refresh(pool, finance, None, rules, index, None, today, required=True)
     except Exception as exc:  # noqa: BLE001 — Yahoo's outage is a finding, not a crash
         return out | {"skipped": "yahoo"}, [
             _finding(
                 "desk_source_error", "yahoo", "Trading desk: can't reach Yahoo",
-                f"Fetching {INDEX} failed ({type(exc).__name__}), so the desk couldn't tell which "
+                f"Fetching {index} failed ({type(exc).__name__}), so the desk couldn't tell which "
                 "day to trade. Nothing was traded.",
             )
         ], []
-    index_days = [b.day for b in (await _bars(pool, {INDEX}))[INDEX] if b.close is not None]
+    index_days = [b.day for b in (await _bars(pool, rules, {index}))[index] if b.close is not None]
     day = dm.last_trading_day(index_days, today)
     if day is None:
         return out | {"skipped": "no_market_day"}, [
             _finding(
                 "desk_source_error", "yahoo", "Trading desk: no market days from Yahoo",
-                f"Yahoo returned no {INDEX} bars before {today}. Nothing was traded.",
+                f"Yahoo returned no {index} bars before {today}. Nothing was traded.",
             )
         ], []
-    if (today - day).days > STALE_INDEX_DAYS:
+    if (today - day).days > rules.stale_calendar_days:
         # Yahoo answers 200 with no data when it rate-limits, which raises
         # nothing and would leave the desk quietly idle on an old date.
         return out | {"skipped": "stale_index"}, [
             _finding(
                 "desk_source_error", "yahoo", "Trading desk: the market calendar is stale",
-                f"The last {INDEX} bar the desk has is {day}, more than {STALE_INDEX_DAYS} days "
-                f"before {today}. Yahoo may be refusing data without saying so. Nothing was traded.",
+                f"The last {index} bar the desk has is {day}, more than {rules.stale_calendar_days} "
+                f"days before {today}. Yahoo may be refusing data without saying so, or this "
+                "market's normal closures are longer than the desk expects. Nothing was traded.",
             )
         ], []
     out["day"] = day.isoformat()
@@ -424,26 +446,26 @@ async def _tick(pool: asyncpg.Pool, ansaar: Any, finance: Any, today: date) -> t
     fills = await _fills(pool)
     pending = await _pending(pool)
     ever = {f.symbol: f.asset_class for f in fills}
-    holdings = dm.replay(fills, await _bars(pool, set(ever)), rules.capital, today).held()
+    holdings = dm.replay(fills, await _bars(pool, rules, set(ever)), rules.capital, today).held()
     wanted = {s: ever[s] for s in holdings}
     wanted |= {d.symbol: d.asset_class for d in decisions if d.asset_class in rules.asset_classes}
     wanted |= {o.symbol: o.asset_class for o in pending}
     for symbol, asset_class in sorted(wanted.items()):
-        await _refresh(pool, finance, ansaar, symbol, asset_class, today, market_days=index_days)
+        await _refresh(pool, finance, ansaar, rules, symbol, asset_class, today, market_days=index_days)
     # The benchmarks get the same per-day fallback the holdings get, so a day
     # Yahoo cannot price does not stay NULL for ever and quietly bend the score.
     # It needs a mapping, because a benchmark is named in Yahoo's form and
     # ansaar wants the NSE symbol and an asset class; an unmapped benchmark gets
     # no fallback. The index is never backfilled: its bars are the market
     # calendar, and the desk takes that from one source only.
-    for bench in {rules.benchmark, rules.context_benchmark} - {INDEX}:
+    for bench in {rules.benchmark, rules.context_benchmark} - {index, ""}:
         src = rules.benchmark_prices.get(bench)
         await _refresh(
-            pool, finance, ansaar if src else None, bench,
+            pool, finance, ansaar if src else None, rules, bench,
             src["asset_class"] if src else None, today,
             market_days=index_days, source_symbol=src["symbol"] if src else None,
         )
-    bars = await _bars(pool, set(wanted) | set(ever))
+    bars = await _bars(pool, rules, set(wanted) | set(ever))
 
     # 4. Fill.
     if pending:
@@ -494,7 +516,7 @@ async def _tick(pool: asyncpg.Pool, ansaar: Any, finance: Any, today: date) -> t
             for symbol in {d.symbol for d in check.rows} | set(book.held()):
                 series = bars.get(symbol, [])
                 latest = max((b.day for b in series if b.close is not None), default=None)
-                if latest is None or (day - latest).days > PRICE_STALE_DAYS:
+                if latest is None or (day - latest).days > rules.stale_price_days:
                     continue
                 px = dm.close_on(series, day)
                 if px is not None:
@@ -558,18 +580,30 @@ async def month_summary(pool: asyncpg.Pool, month_first: date, next_first: date)
     rules = await load_rules(pool)
     month_end = next_first - timedelta(days=1)
     fills = [f for f in await _fills(pool) if f.day <= month_end]
-    if not fills:
+    # With no trading calendar there are no market days to score over, so there
+    # is no month to report. A benchmark is optional in a way the calendar is
+    # not: without one the desk still says what it is worth, and only the
+    # comparison goes missing.
+    if not fills or not rules.configured():
         return None
     start = fills[0].day
-    bars = await _bars(pool, {f.symbol for f in fills} | {INDEX, rules.benchmark, rules.context_benchmark})
-    days = [b.day for b in bars[INDEX] if b.close is not None and start <= b.day <= month_end]
+    index = rules.calendar_symbol
+    benchmarks = {s for s in (rules.benchmark, rules.context_benchmark) if s}
+    bars = await _bars(pool, rules, {f.symbol for f in fills} | {index} | benchmarks)
+    days = [b.day for b in bars[index] if b.close is not None and start <= b.day <= month_end]
     if not days:
         return None
     series = dm.desk_series(fills, bars, rules.capital, days)
     desk = [(d, v) for d, v, _ in series]
     shares = [(d, w) for d, _, w in series]
-    bench = dm.benchmark_values(bars[rules.benchmark], rules.capital, rules.cost_pct_per_side, days)
-    context = dm.benchmark_values(bars[rules.context_benchmark], rules.capital, 0.0, days)
+    bench = (
+        dm.benchmark_values(bars[rules.benchmark], rules.capital, rules.cost_pct_per_side, days)
+        if rules.benchmark else []
+    )
+    context = (
+        dm.benchmark_values(bars[rules.context_benchmark], rules.capital, 0.0, days)
+        if rules.context_benchmark else []
+    )
     book = dm.replay(fills, bars, rules.capital, month_end)
     end_value = desk[-1][1]
     # Two readings of the same weeks. The headline is the gap to the whole
@@ -606,6 +640,9 @@ async def month_summary(pool: asyncpg.Pool, month_first: date, next_first: date)
         "since": start.isoformat(),
         "weeks": st.n,
         "capital": rules.capital,
+        # The desk's own currency travels with its figures, so a reader never
+        # has to assume one and the page does not have to guess.
+        "currency": rules.currency,
         "value": round(end_value, 2),
         "after_tax": round(end_value - dm.tax_owed(book.realised, rules), 2),
         "benchmark": rules.benchmark,
