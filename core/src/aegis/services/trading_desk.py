@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from datetime import UTC, date, datetime, timedelta
+from decimal import Decimal
 from typing import Any
 
 import asyncpg
@@ -66,10 +67,16 @@ def _f(raw: Any) -> float | None:
     return float(raw) if raw is not None else None
 
 
-def _n(raw: float | None) -> float | None:
-    """Round before a numeric column, so the stored figure reads like a price
-    and not a float's binary expansion."""
-    return round(raw, 4) if raw is not None else None
+def _n(raw: float | None) -> Decimal | None:
+    """A number on its way into a `numeric` column, as the decimal it reads as.
+
+    Rounding is not enough: `round(x, 4)` returns the nearest float, and 24.04
+    is not one, so asyncpg encoded a ₹24.04 close into `numeric` as
+    24.039999999999999147… — right to about 1e-15 and unreadable to anyone
+    checking the desk by hand in SQL (#540). `Decimal(str(...))` takes the
+    shortest decimal that round-trips the rounded float instead. The arithmetic
+    stays in floats; only the column write changes."""
+    return Decimal(str(round(raw, 4))) if raw is not None else None
 
 
 def _ts(raw: Any) -> datetime | None:
@@ -458,16 +465,24 @@ async def _tick(
     # ansaar wants the NSE symbol and an asset class; an unmapped benchmark gets
     # no fallback. The index is never backfilled: its bars are the market
     # calendar, and the desk takes that from one source only.
-    for bench in {rules.benchmark, rules.context_benchmark} - {index, ""}:
+    benchmarks = {rules.benchmark, rules.context_benchmark} - {index, ""}
+    for bench in benchmarks:
         src = rules.benchmark_prices.get(bench)
         await _refresh(
             pool, finance, ansaar if src else None, rules, bench,
             src["asset_class"] if src else None, today,
             market_days=index_days, source_symbol=src["symbol"] if src else None,
         )
-    bars = await _bars(pool, rules, set(wanted) | set(ever))
+    # The benchmarks' bars come back too: a benchmark with no recent close is a
+    # finding of its own below, and it cannot be one if its bars were never read.
+    bars = await _bars(pool, rules, set(wanted) | set(ever) | benchmarks)
 
-    # 4. Fill.
+    # 4. Fill. Both numbers are reported on every path that gets here, because
+    # "there was nothing to fill" and "five were pending and none could fill"
+    # are different statements and a missing key reads as "the step never ran"
+    # (#565). A run that stopped before this step says so in `skipped` instead.
+    out["pending_checked"] = len(pending)
+    out["filled"] = 0
     if pending:
         book_now = dm.replay(fills, bars, rules.capital, today)
         results = dm.fill_orders(pending, bars, index_days, book_now, rules, grace_days=PRICE_GRACE_DAYS)
@@ -482,6 +497,25 @@ async def _tick(
     # row says which part of the day it did not act on, and their targets are
     # sized again tomorrow, because the pipeline rebuilds them daily.
     planned = await pool.fetchval("SELECT 1 FROM finance.desk_plans WHERE data_date = $1", day)
+    # A morning the desk had nothing new to act on. It happens when the newest
+    # day the calendar has is one the desk has already planned AND the market's
+    # last expected trading day has no bar — Yahoo drops a day, or sends one
+    # whose close is null, and `last_trading_day` then falls back to a date the
+    # desk acted on yesterday. The run is then indistinguishable from a quiet
+    # morning while yesterday's decisions are never acted on, and the
+    # stale-calendar alarm waits `stale_calendar_days` (#525). One of these is
+    # normal — a market holiday reads exactly the same — so it raises no
+    # problem and no task; the six-day alarm is still what escalates. A rerun
+    # on the same day is not idle: yesterday's bar is there.
+    expected = dm.last_expected_day(today, dm.trading_week(index_days))
+    out["idle_weekday"] = int(bool(planned) and expected is not None and expected not in set(index_days))
+    if out["idle_weekday"]:
+        logger.info(
+            "trading_desk_idle_weekday",
+            slug=DESK_SLUG,
+            expected=expected.isoformat() if expected else None,
+            last_market_day=day.isoformat(),
+        )
     if not planned:
         book = dm.replay(fills, bars, rules.capital, day)
         check = dm.check_decisions(decisions, book.held_classes(), rules, halted=halt is not None)
@@ -553,31 +587,58 @@ async def _tick(
         out["planned"] = outcome
     findings += list(await pool.fetchval("SELECT findings FROM finance.desk_plans WHERE data_date = $1", day) or [])
 
-    # A holding with no close for the last few market days.
+    # A holding — or a benchmark — with no close for the last few market days.
+    # A benchmark that goes dark is the quieter of the two: `benchmark_values`
+    # returns an empty series, the weekly gap has nothing to compare, the label
+    # reads "too early" for ever and the rendered figure is blank, so the score
+    # stops meaning anything without saying so (#524). Same class and same
+    # subject shape as a holding, so `reconcile_findings` clears either one on
+    # the first run that prices it again.
     days = sorted(index_days)
     if len(days) >= PRICE_GRACE_DAYS:
         cutoff = days[-PRICE_GRACE_DAYS]
-        for symbol in sorted(dm.replay(fills, bars, rules.capital, today).held()):
+        held = sorted(dm.replay(fills, bars, rules.capital, today).held())
+        # The index is left out: its own staleness is already a
+        # `desk_source_error`, raised above before anything else runs.
+        watched = [(s, False) for s in held]
+        watched += [(s, True) for s in sorted(benchmarks)]
+        for symbol, is_benchmark in watched:
             latest = max((b.day for b in bars.get(symbol, []) if b.close is not None), default=None)
-            if latest is None or latest < cutoff:
-                findings.append(
-                    _finding(
-                        "desk_price_missing", symbol, f"Trading desk: no price for {symbol}",
-                        f"Neither Yahoo nor ansaar has a close for {symbol} since "
-                        f"{latest or 'the desk bought it'}. The desk values it at cost until one arrives.",
-                    )
+            if latest is not None and latest >= cutoff:
+                continue
+            since = latest or ("the desk started" if is_benchmark else "the desk bought it")
+            tail = (
+                "The desk scores itself against it, so until one arrives the monthly gap has "
+                "nothing to compare and its label stays at 'too early'."
+                if is_benchmark
+                else "The desk keeps valuing it at that close, however old, so its value is as "
+                "stale as the price."
+            )
+            findings.append(
+                _finding(
+                    "desk_price_missing", symbol, f"Trading desk: no price for {symbol}",
+                    f"Neither Yahoo nor ansaar has a close for {symbol} since {since}. {tail}",
                 )
+            )
     return out, findings, DAILY_CLASSES
 
 
 # --- the monthly close ---------------------------------------------------------
 
 
-async def month_summary(pool: asyncpg.Pool, month_first: date, next_first: date) -> dict | None:
+async def month_summary(
+    pool: asyncpg.Pool, month_first: date, next_first: date, *, today: date | None = None
+) -> dict | None:
     """The monthly close's desk section (spec §9), or None before the first fill.
 
-    Every value is JSON-safe: it travels through Temporal to the renderer."""
+    Every value is JSON-safe: it travels through Temporal to the renderer.
+
+    ``today`` is read off the market's own clock when it is not given. It bounds
+    the idle-weekday count only: this is asked for the current month from the
+    admin page, and a day that has not happened yet is not a day the desk sat out.
+    """
     rules = await load_rules(pool)
+    today = today or datetime.now(rules.tz()).date()
     month_end = next_first - timedelta(days=1)
     fills = [f for f in await _fills(pool) if f.day <= month_end]
     # With no trading calendar there are no market days to score over, so there
@@ -636,6 +697,13 @@ async def month_summary(pool: asyncpg.Pool, month_first: date, next_first: date)
     for r in orders:
         if r["status"] == "cancelled":
             cancelled[r["reason"] or "unknown"] += 1
+    # Days the desk had nothing new to act on, so a run of them is visible here
+    # rather than only after the six-day stale-calendar alarm (#525). Counted to
+    # the last day the calendar could have had a bar for by now, not to the end
+    # of the month: this is asked for the current month on the admin page, and
+    # days that have not happened yet are not idle.
+    scored = min(month_end, today - timedelta(days=1))
+    idle = dm.idle_days({b.day for b in bars[index] if b.close is not None}, max(start, month_first), scored)
     return {
         "since": start.isoformat(),
         "weeks": st.n,
@@ -664,6 +732,9 @@ async def month_summary(pool: asyncpg.Pool, month_first: date, next_first: date)
         "costs": round(sum(float(r["costs"] or 0) for r in orders if r["status"] == "filled"), 2),
         "cancelled": dict(cancelled),
         "held_back": {r["outcome"]: r["n"] for r in held_back},
+        # A market holiday counts here too — the desk cannot tell one from a
+        # bar the price source did not serve — so one is normal and a run is not.
+        "idle_weekdays": len(idle),
         "halts": [{"day": r["data_date"].isoformat(), "note": r["note"] or ""} for r in halts],
         "ansaar_prices": sum(r["status"] == "filled" and r["price_source"] == "ansaar" for r in orders),
         "moves": [

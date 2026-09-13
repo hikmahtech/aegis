@@ -629,6 +629,19 @@ def test_month_close_names_the_days_a_risk_halt_sold_the_book():
     assert "Risk halt on 2026-09-22: the desk sold its whole book. DAILY_LOSS fired on 2026-09-19." in md
 
 
+def test_month_close_counts_the_weekdays_the_desk_sat_out():
+    """A run of these is the signal — one is a market holiday. Without the line
+    the six-day stale-calendar alarm is the first thing that says anything."""
+    desk = {**_DESK, "idle_weekdays": 4}
+    md = render_month_close({"month": "2026-09", "books_ok": False, "desk": desk})["markdown"]
+    assert "Idle weekdays: 4 — no new market day to act on" in md
+
+
+def test_month_close_says_nothing_about_idle_weekdays_when_there_were_none():
+    md = render_month_close({"month": "2026-09", "books_ok": False, "desk": {**_DESK, "idle_weekdays": 0}})
+    assert "Idle weekdays" not in md["markdown"]
+
+
 def test_month_close_without_a_desk_has_no_desk_section():
     out = render_month_close({"month": "2026-09", "books_ok": False})
     assert "Trading desk" not in out["markdown"] and "Trading desk" not in out["html"]

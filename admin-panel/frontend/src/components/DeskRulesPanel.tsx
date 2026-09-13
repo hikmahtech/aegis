@@ -220,9 +220,16 @@ export default function DeskRulesPanel({ onSaved }: { onSaved?: () => void }) {
 
             <div className="card">
               <h3>The money</h3>
-              <Field label="Capital" hint="What the desk started with. Everything it holds is sized against this.">
+              <Field
+                label="Capital"
+                hint={
+                  rules.capital_locked
+                    ? 'What the desk started with. Fixed now: orders have filled, and the book is replayed from this number, so changing it would restate every past day.'
+                    : 'What the desk started with. Everything it holds is sized against this. It stops being editable once the first order fills.'
+                }
+              >
                 <input
-                  type="number" style={BOX} min={0} step="any"
+                  type="number" style={BOX} min={0} step="any" disabled={rules.capital_locked}
                   value={values.capital} onChange={e => num('capital')(e.target.value)}
                 />
               </Field>
