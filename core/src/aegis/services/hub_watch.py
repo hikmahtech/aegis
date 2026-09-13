@@ -223,35 +223,58 @@ async def reconcile_alertmanager(
     listing the alert, not that the alert cleared, because only the first of
     those is evidenced here.
 
-    Two carve-outs. A problem younger than ``grace_minutes`` is left alone, so
-    one raised seconds ago is never resolved before alertmanager has grouped it.
-    A GROUP problem is left alone too: its subject is ``*``, it stands for a
-    whole class rather than one alert, and no single fingerprint speaks for it —
-    the same reason :func:`reconcile_findings` treats groups separately.
+    **A problem is judged on EVERY fingerprint it has ever had, and resolved
+    only when alertmanager lists none of them.** An alertmanager fingerprint is
+    a hash of the label set, so the same recurring fault arrives under a new one
+    each time — one prod problem had 26 distinct fingerprints across 27
+    occurrences. Judging it on the first occurrence's fingerprint, as this
+    function first did, compares against a hash that can never be active again:
+    the problem was resolved within a minute of every legitimate reopen, for
+    ever (#561). Judging on the latest alone would be nearly as bad, because a
+    reopen can arrive under an older label set.
+
+    Two carve-outs. A problem whose LAST occurrence is newer than
+    ``grace_minutes`` is left alone — the alert is firing right now, whatever
+    alertmanager has managed to group. (The first version bounded
+    ``first_seen_at`` instead, which let a four-day-old problem with an
+    occurrence thirty seconds ago sail straight through.) A GROUP problem is
+    left alone too: its subject is ``*``, it stands for a whole class rather
+    than one alert, and no single fingerprint speaks for it — the same reason
+    :func:`reconcile_findings` treats groups separately.
     """
     now = now or datetime.now(UTC)
+    cutoff = now - timedelta(minutes=max(0.0, grace_minutes))
     rows = await pool.fetch(
-        "SELECT p.id::text AS id, p.class, p.subject, p.subject_kind, p.title, f.external_id "
+        # `f.source` is the FIRST occurrence's, which is what makes the problem
+        # alertmanager's; `f.fingerprints` is EVERY fingerprint it has had, which
+        # is what decides whether alertmanager still lists it. `external_id` is
+        # `<fingerprint>@<startsAt>`, and a synthesised fingerprint
+        # (`alertmanager:<alertname>:<instance>`) carries colons but never an @.
+        "SELECT p.id::text AS id, p.class, p.subject, p.subject_kind, p.title, "
+        "       f.source, f.fingerprints "
         "FROM problems p JOIN LATERAL ("
-        "  SELECT e.external_id, e.source FROM problem_events e"
-        "  WHERE e.problem_id = p.id AND e.kind = 'occurrence' ORDER BY e.id LIMIT 1"
+        "  SELECT (array_agg(e.source ORDER BY e.id))[1] AS source,"
+        "         array_agg(DISTINCT split_part(e.external_id, '@', 1)) AS fingerprints"
+        "  FROM problem_events e"
+        "  WHERE e.problem_id = p.id AND e.kind = 'occurrence'"
         ") f ON TRUE "
         "WHERE p.closed_at IS NULL AND p.status = ANY($1::text[]) "
         "  AND p.group_key IS NULL "
         "  AND f.source = $2 "
-        "  AND p.first_seen_at < $3 "
-        "ORDER BY p.first_seen_at",
+        # The LAST occurrence, not the first: a long-lived problem that fired
+        # again seconds ago is firing now.
+        "  AND p.last_seen_at < $3 "
+        "ORDER BY p.last_seen_at",
         sorted(LIVE_STATUSES),
         _ALERTMANAGER_SOURCE,
-        now - timedelta(minutes=max(0.0, grace_minutes)),
+        cutoff,
     )
     resolved: list[dict[str, Any]] = []
     for row in rows:
-        # `external_id` is `<fingerprint>@<startsAt>`; a synthesised fingerprint
-        # (`alertmanager:<alertname>:<instance>`) carries colons but never an @.
-        fingerprint = str(row["external_id"] or "").split("@", 1)[0]
-        if not fingerprint or fingerprint in active_fingerprints:
+        fingerprints = {str(f) for f in (row["fingerprints"] or []) if str(f).strip()}
+        if not fingerprints or fingerprints & active_fingerprints:
             continue
+        fingerprint = sorted(fingerprints)[0] if len(fingerprints) == 1 else ""
         result = await ingest_event(
             pool,
             Event(
@@ -270,6 +293,7 @@ async def reconcile_alertmanager(
                         "keeps its alerts in memory, so a restart loses them (#551)."
                     ),
                     "fingerprint": fingerprint,
+                    "fingerprints_checked": len(fingerprints),
                 },
                 occurred_at=now,
             ),
@@ -281,7 +305,7 @@ async def reconcile_alertmanager(
                     "problem_id": row["id"],
                     "klass": row["class"],
                     "subject": row["subject"],
-                    "fingerprint": fingerprint,
+                    "fingerprints_checked": len(fingerprints),
                 }
             )
     if resolved:

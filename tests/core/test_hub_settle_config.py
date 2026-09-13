@@ -1,4 +1,4 @@
-"""The hub's settle windows as operator-editable config (#556).
+"""The hub's settle windows as operator-editable config (PR #559).
 
 #537 put the numbers in the database and then left `psql` as the only way to
 set them — which is not "configurable" in a system built to be forked. Read is

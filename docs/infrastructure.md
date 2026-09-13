@@ -638,8 +638,17 @@ resolving a live estate in one tick:
   re-sends them, so reconciling against that empty set would close every open
   problem. Prometheus re-sends on the order of a minute, so the default leaves
   a wide margin;
-- a problem younger than ten minutes is left alone, so one raised seconds ago
-  is never resolved before alertmanager has grouped its alert;
+- a problem whose **last** occurrence is younger than ten minutes is left
+  alone: an alert that just fired is firing now, whatever alertmanager has
+  managed to group. (Bounding the FIRST occurrence instead, as the first version
+  did, let a four-day-old problem that fired thirty seconds ago straight
+  through — #561.);
+- a problem is judged on **every fingerprint it has ever had**, and resolved
+  only if alertmanager lists none of them. A fingerprint hashes the label set,
+  so a recurring fault arrives under a new one each time — one problem here had
+  26 across 27 occurrences — and judging on the first meant comparing against a
+  hash that could never be active again, which closed a live problem within a
+  minute of every legitimate reopen;
 - a **group** problem is left alone: its subject is `*`, it stands for a class
   rather than one alert, and no single fingerprint speaks for it.
 
@@ -1524,7 +1533,7 @@ it is env-only (`AEGIS_BOOKS_PATH`), because it is a container path, not a choic
 ### The chart of accounts
 
 Which sets of books exist, and which category posts to which account, are
-configuration too (#560) — the `settings` row keyed `books_chart`, read on every
+configuration too (#561) — the `settings` row keyed `books_chart`, read on every
 post, so a change needs no restart. Edit it on the admin **Money** page, under
 *Its entities* (`GET/PUT /api/admin/money/chart`); `services/books_chart.py` is
 the only reader and the only writer.
