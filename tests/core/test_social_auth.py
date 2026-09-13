@@ -67,6 +67,28 @@ async def test_connect_redirects_with_pkce(client):
     assert q["redirect_uri"] == ["https://aegis.example.com/api/admin/social/x/callback"]
 
 
+async def test_the_callback_host_is_the_public_url_when_links_go_to_a_lan_host(db_pool):
+    """Links may point at a VPN-only host; the OAuth redirect must stay on the
+    host the provider has registered."""
+    from aegis.api.app import create_app
+
+    settings = Settings(
+        **_TEST_REQUIRED_SETTINGS,
+        **{"AEGIS_UI_URL": "https://aegis-lan.example", "AEGIS_PUBLIC_URL": "https://aegis.example.com"},
+        x_client_id="x-cid",
+        x_client_secret="x-cs",
+        secret_key="test-secret-key",
+    )
+    app = create_app(run_lifespan=False)
+    app.state.db_pool = db_pool
+    app.dependency_overrides[get_settings] = lambda: settings
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as c:
+        resp = await c.get("/api/admin/social/x/connect?label=work", headers={"X-API-Key": "k"})
+    assert resp.status_code == 302
+    q = parse_qs(urlparse(resp.headers["location"]).query)
+    assert q["redirect_uri"] == ["https://aegis.example.com/api/admin/social/x/callback"]
+
+
 async def test_connect_unknown_platform_404(client):
     resp = await client.get("/api/admin/social/mastodon/connect", headers={"X-API-Key": "k"})
     assert resp.status_code == 404

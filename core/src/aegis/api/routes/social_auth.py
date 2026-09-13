@@ -56,7 +56,7 @@ def _require_x(platform: str) -> None:
 
 
 def _redirect_uri(settings: Settings) -> str:
-    base = (settings.aegis_ui_url or "").rstrip("/")
+    base = (settings.aegis_public_url or settings.aegis_ui_url or "").rstrip("/")
     return f"{base}/api/admin/social/x/callback"
 
 

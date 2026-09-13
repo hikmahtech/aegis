@@ -1029,11 +1029,39 @@ async def project_pending(
     out = []
     for r in rows:
         try:
-            out.append(await project(pool, r["id"], settings=settings, now=now))
+            result = await project(pool, r["id"], settings=settings, now=now)
+            await _note_projection(pool, r["id"], result, now)
+            out.append(result)
         except Exception as exc:  # noqa: BLE001 — one bad problem must not stop the sweep
             logger.warning("hub_project_failed", problem_id=r["id"], error=str(exc)[:200])
             out.append({"problem_id": r["id"], "error": str(exc)[:200]})
     return out
+
+
+async def _note_projection(
+    pool: asyncpg.Pool, problem_id: str, result: dict[str, Any], now: datetime
+) -> None:
+    """Leave the sweep's verdict on the problem, so the admin page can say WHY
+    a problem has no task yet (settling, waiting on the outbox, resolved before
+    it earned one) instead of showing a blank. `metadata.projection` is written
+    when the reason changes and dropped once the task exists; `at` is when the
+    current reason was first seen. Nothing reads it back but the page."""
+    skipped = result.get("skipped")
+    if skipped:
+        note = {k: v for k, v in result.items() if k != "problem_id"} | {"at": now.isoformat()}
+        await pool.execute(
+            "UPDATE problems SET metadata = metadata || jsonb_build_object('projection', $2::jsonb) "
+            "WHERE id = $1::uuid AND COALESCE(metadata->'projection'->>'skipped', '') <> $3",
+            problem_id,
+            note,
+            skipped,
+        )
+    elif result.get("task_id"):
+        await pool.execute(
+            "UPDATE problems SET metadata = metadata - 'projection' "
+            "WHERE id = $1::uuid AND metadata ? 'projection'",
+            problem_id,
+        )
 
 
 async def reconcile_completed_tasks(

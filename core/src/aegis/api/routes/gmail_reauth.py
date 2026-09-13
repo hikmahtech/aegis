@@ -48,7 +48,7 @@ _SCOPES = [
 
 
 def _redirect_uri(settings: Settings, label: str) -> str:
-    base = (settings.aegis_ui_url or "").rstrip("/")
+    base = (settings.aegis_public_url or settings.aegis_ui_url or "").rstrip("/")
     return f"{base}/api/admin/gmail/reauth/{label}/callback"
 
 

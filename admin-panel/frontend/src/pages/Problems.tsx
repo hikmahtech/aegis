@@ -39,6 +39,39 @@ const eventLabel = (e: any): string => {
   return String(e.kind || '');
 };
 
+// Why a problem has no task yet, in the sweep's own words (`metadata.projection`,
+// written by `hub_project._note_projection`). One task per problem is the rule;
+// this is what stands in for it until the task exists.
+const NO_TASK_REASON: Record<string, string> = {
+  settling: 'settling — waits out its class\'s verification window before it earns a task',
+  task_pending_outbox: 'task queued in the Todoist outbox',
+  resolved_without_task: 'resolved before it earned a task',
+  below_attention: 'below the topic\'s attention threshold',
+  muted: 'muted — nothing projected until the mute lapses',
+  no_task: 'capture failed — the sweep retries',
+};
+
+// The one place the page says what a problem's task is: a real id links to it,
+// an outbox temp id is "pending", and nothing at all gets the sweep's reason.
+function TaskState({ p }: { p: any }) {
+  const id: string | null = p.todoist_task_id;
+  if (id && !id.startsWith('item-')) {
+    return (
+      <a href={`https://app.todoist.com/app/task/${id}`} target="_blank" rel="noreferrer" onClick={e => e.stopPropagation()}>
+        task ↗
+      </a>
+    );
+  }
+  const proj = p.projection || {};
+  const key = id ? 'task_pending_outbox' : proj.skipped;
+  if (!key) return <span title="The five-minute sweep has not judged this one yet.">no task yet</span>;
+  const why = NO_TASK_REASON[key] || `no task (${key})`;
+  const detail = key === 'settling' && proj.settle_seconds
+    ? ` (${Math.round(proj.settle_seconds / 60)} min, ${Math.round((proj.age_seconds || 0) / 60)} in)`
+    : '';
+  return <span title={proj.at ? `since ${ts(proj.at)}` : undefined}>{why}{detail}</span>;
+}
+
 const eventText = (e: any): string => {
   const p = e.payload || {};
   if (p.action === 'grouped') {
@@ -428,6 +461,7 @@ export default function Problems() {
                   : `${p.subject || '—'} (${p.subject_kind || '—'}) · class ${p.class}`} ·{' '}
                 seen {p.occurrences}× · last {ago(p.last_seen_at)}
                 {p.muted_until && new Date(p.muted_until) > new Date() ? ` · muted until ${ts(p.muted_until)}` : ''}
+                {' · '}<TaskState p={p} />
               </div>
             </div>
             <span className="meta">{openId === p.id ? '▾' : '▸'}</span>
