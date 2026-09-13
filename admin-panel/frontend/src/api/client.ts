@@ -191,7 +191,7 @@ export const api = {
   }) => apiFetch<any>('/api/admin/service-state', { method: 'PUT', body: JSON.stringify(body) }),
 
   // The hub's own configuration. Both rows were DB-backed but reachable only by
-  // raw SQL, which is not "configurable" in a system meant to be forked (#556).
+  // raw SQL, which is not "configurable" in a system meant to be forked (PR #559).
   getHubSettleSeconds: () =>
     apiFetch<{
       overrides: Record<string, number>;

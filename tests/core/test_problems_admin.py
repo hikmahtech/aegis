@@ -272,7 +272,7 @@ async def test_resolving_a_closed_problem_is_a_404(client, db_pool):
 
 
 async def test_the_settle_windows_round_trip_through_the_admin_api(client, db_pool):
-    """#556: the hub's settle windows were DB-backed and reachable only by raw
+    """#559: the hub's settle windows were DB-backed and reachable only by raw
     SQL. An operator now edits them like every other config family.
 
     Falsifiable: drop the PUT route and this 405s; drop the validation and the

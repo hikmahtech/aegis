@@ -53,7 +53,7 @@ const eventText = (e: any): string => {
 // Both of these are setup-specific by nature — how long YOUR services take to
 // prove themselves, what YOUR cluster is and which repo holds its config — so
 // they belong in the database rather than in code, and a database row nobody
-// can edit without psql is only half the job (#556).
+// can edit without psql is only half the job (PR #559).
 function HubConfig({ onError }: { onError: (msg: string) => void }) {
   const [settle, setSettle] = useState<any>(null);
   const [rows, setRows] = useState<Array<[string, string]>>([]);
