@@ -416,9 +416,13 @@ def test_books_write_flow_is_gated_on_money_hygiene():
         # Then +1 activity and NO new flow from #492: `probe_ingress` on the
         # existing HomelabActivities, the heartbeat's canary on the way in. On
         # the homelab flag, so the two homelab-on rows move.
-        (True, True, 51, 247),
-        (False, False, 40, 212),
-        (True, False, 44, 229),
+        # Then +1 activity and NO new flow from the #537 follow-up:
+        # `project_problem` on the existing HubActivities, how the investigation
+        # learns a task the settle window deferred. Unflagged, so all three
+        # rows move.
+        (True, True, 51, 248),
+        (False, False, 40, 213),
+        (True, False, 44, 230),
     ],
 )
 def test_real_registration_passes_the_boot_check(homelab, money, flows, activities):

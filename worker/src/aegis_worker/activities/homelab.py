@@ -285,7 +285,7 @@ class HomelabActivities:
         out, which is this.
 
         **By default any HTTP answer from the right host means the path
-        works**, 401/404/405 included: the question is whether bytes reach
+        works**, 401/404 included: the question is whether bytes reach
         core, not what core makes of them, and the useful probe targets are the
         ones an identity proxy does not challenge. A transport error, a
         timeout, or a 5xx is a fault — a proxy with no healthy backend answers
@@ -301,8 +301,11 @@ class HomelabActivities:
           `/docs` is fine); landing on a different host is not.
         * **`expect_status` asserts which answer**, for the cases where the
           status alone says who replied. A proxy that lost the route to core
-          serves its own 404 with a 200-shaped conscience; pin 405 (what a
-          webhook path gives a bare GET) and that 404 is a fault.
+          serves its own 404 with a 200-shaped conscience, and a bare GET on
+          a webhook path also answers 404 (the admin SPA's catch-all claims
+          every unmatched `/api/` GET before Starlette can say 405). Pin a
+          status only core invents — `/api/webhooks/ping` answers 204 — and
+          that 404 becomes a fault.
         """
         target = (url or "").strip()
         if not target:

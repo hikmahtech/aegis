@@ -715,6 +715,36 @@ class AlertInvestigationFlow:
                     "investigation": "",
                 }
 
+            # ── Step 3.5: learn the task, now the window is out (#537) ──
+            # The delay above IS the settle window — same number, same class —
+            # so a problem still open here has earned its task, and projecting
+            # mints it. Learn the id NOW rather than at step 4, because every
+            # note in between posts to an empty id and is silently dropped: the
+            # restart-repeat evidence, the "tried a restart and it did not
+            # recover" note, the repo-unconfirmed note. Worse, the `_record`
+            # calls on that path mint the task themselves and move its
+            # watermark past the very events they just wrote, which are marked
+            # `posted` — so the projector never replays them either, and the
+            # task a human opens says nothing about the restart already tried.
+            #
+            # The `item-` clause also upgrades an outbox temp id to the real one
+            # once the drain has committed it; `project()` resolves those.
+            if workflow.patched("task-id-after-delay") and (
+                not track_task_id or track_task_id.startswith("item-")
+            ):
+                try:
+                    projected = await workflow.execute_activity_method(
+                        HubActivities.project_problem,
+                        args=[problem_id],
+                        start_to_close_timeout=TIMEOUT_STANDARD,
+                        retry_policy=NO_RETRY,
+                    )
+                    track_task_id = projected.get("task_id") or track_task_id or None
+                except Exception as exc:  # noqa: BLE001
+                    workflow.logger.warning(
+                        "alert_project_after_delay_failed err=%s", str(exc)[:200]
+                    )
+
         # ── Step 4: Resolve to resource ──
         # Infra/swarm alerts (NodeDown, DockerServiceDown, cluster=homelab-swarm, ...)
         # have no application code repo. Resolve them deterministically to

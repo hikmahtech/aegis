@@ -17,9 +17,10 @@ Stored in the ``settings`` table under ``infra_alert_routing``::
   compared stripped and lowercased.
 - ``repo`` is the ``owner/name`` (``resources.metadata.github_repo``) of the
   repository resource infra alerts are investigated in. Empty means none: the
-  flow falls back to an LLM-only investigation. It is also the repo a connector
-  or service alert expands to, since the config that deploys a thing is as
-  likely to be at fault as the thing (#505).
+  flow falls back to an LLM-only investigation. Nothing expands to it from an
+  application alert: the candidate query admits only coding-enabled
+  repositories (#35), so a connector or a service is never among the picks, and
+  the rule that used to say otherwise was deleted as unreachable (#505).
 - ``platform_hint`` is one or two sentences telling the investigating agent
   what the cluster IS and how to read it. The generic instructions name no
   orchestrator, because AEGIS does not know whether you run Swarm, k8s, Nomad

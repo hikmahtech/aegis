@@ -190,6 +190,27 @@ class HubActivities:
         }
 
     @activity.defn
+    async def project_problem(self, problem_id: str) -> dict:
+        """Bring the problem's task up to date and report the task's id.
+
+        How the investigation flow learns a task the settle window deferred
+        (#537): it asks for this once its verification delay is over, which is
+        the same window, so the projection mints the task and hands back the id
+        the flow needs for every comment it is about to post. Idempotent — the
+        projector is re-runnable by design — and quiet about a problem that has
+        nothing to project.
+        """
+        if self.db_pool is None or not problem_id:
+            return {"task_id": "", "skipped": "no_pool"}
+        projected = await hub_project.project(
+            self.db_pool, problem_id, now=datetime.now(UTC)
+        )
+        return {
+            "task_id": str(projected.get("task_id") or ""),
+            "skipped": str(projected.get("skipped") or ""),
+        }
+
+    @activity.defn
     async def record_investigation(self, inp: dict) -> dict:
         """Write an `investigation` event (and move the problem to
         `inp["status"]` when given), then project. One dict argument because

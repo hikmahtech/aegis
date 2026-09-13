@@ -402,6 +402,27 @@ async def life_webhook(
     return {"accepted": True, "external_id": external_id, "workflow_id": handle.id}
 
 
+@router.get("/ping", status_code=204)
+async def ping() -> None:
+    """The ingress canary's target: proof that a request reached core (#548).
+
+    The heartbeat GETs this from outside the cluster every couple of minutes, so
+    a proxy that has stopped reaching core cannot drop every inbound webhook in
+    silence (#492). It lives under `/api/webhooks/` deliberately — that prefix
+    is the one an identity proxy is configured to let through, because real
+    webhooks arrive on it — and it answers **204**, which is a status no proxy
+    invents on its own. That is the whole point: a proxy with no route to core
+    answers 404, and a webhook path answers 404 as well (the admin SPA's
+    catch-all claims every unmatched `/api/` GET), so 404 cannot tell the two
+    apart while 204 can.
+
+    It says nothing. No version, no hostname, no build, no body — anything more
+    would be a fact about the deployment handed to an unauthenticated caller,
+    and the canary only needs to know that core answered.
+    """
+    return None
+
+
 @router.post("/github")
 async def github_webhook(
     request: Request,
