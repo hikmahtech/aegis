@@ -424,9 +424,13 @@ def test_books_write_flow_is_gated_on_money_hygiene():
         # on the existing HubActivities, a HubSweepFlow step that resolves a
         # problem whose alert alertmanager no longer lists. Unflagged, so all
         # three rows move.
-        (True, True, 51, 249),
-        (False, False, 40, 214),
-        (True, False, 44, 231),
+        # Then +1 activity and NO new flow from the research-lane config work:
+        # `load_feeds_config` on the existing RssActivities (the `feeds_config`
+        # row, read for RssIngestFlow because a workflow cannot hit the DB).
+        # Unflagged, so all three rows move.
+        (True, True, 51, 250),
+        (False, False, 40, 215),
+        (True, False, 44, 232),
     ],
 )
 def test_real_registration_passes_the_boot_check(homelab, money, flows, activities):

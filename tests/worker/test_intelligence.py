@@ -136,10 +136,9 @@ async def test_score_significance_uses_light_model_with_headroom(mock_kc):
     the model returns EMPTY content below ~900 tokens for this task, so a tight
     cap yields LLMTruncationError instead of a scored array.
 
-    NOTE the scope of the model assertion: it pins the dataclass DEFAULT, which
-    is what direct construction gets. A real worker overrides it —
-    __main__.py passes `model_light=model_balanced` — so this does NOT show
-    that production scoring runs on the fast tier. It does not."""
+    The model is whatever the instance was built with — __main__.py passes
+    `model_light=model_balanced`, and the dataclass default is deliberately
+    blank so no decommissioned model name can become the live one (#137)."""
     captured: dict = {}
 
     async def fake_think(**kwargs):
@@ -148,10 +147,12 @@ async def test_score_significance_uses_light_model_with_headroom(mock_kc):
 
     llm = MagicMock()
     llm.think = fake_think
-    act = IntelligenceActivities(knowledge_connector=mock_kc, llm_client=llm)
+    assert IntelligenceActivities.model_light == "" and IntelligenceActivities.agent_id == ""
+    act = IntelligenceActivities(knowledge_connector=mock_kc, llm_client=llm, model_light="gemma4:e2b")
     env = ActivityEnvironment()
     await env.run(act.score_significance, [{"title": "x", "snippet": "y"}], [{"name": "ai"}])
-    assert captured["model"] == "gemma4:e2b"  # the dataclass default, not prod's tier
+    assert captured["model"] == "gemma4:e2b"
+    assert captured["agent_id"] is None, "no agent means NULL on the row, never a made-up id"
     assert captured["max_tokens"] >= 900  # headroom so the model doesn't return empty
 
 
@@ -232,6 +233,7 @@ def _act(llm, pool, mock_kc):
     return IntelligenceActivities(
         knowledge_connector=mock_kc,
         llm_client=llm,
+        model_light="gemma4:e2b",
         db_pool=pool,
         agent_id=_AGENT,
     )

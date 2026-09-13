@@ -59,12 +59,31 @@ CONFIG_REGISTRY: list[ConfigKey] = [
     ConfigKey("vercel_token", "API token", "Vercel", True),
     ConfigKey("vercel_team_id", "Team id", "Vercel", False),
     ConfigKey("elevenlabs_api_key", "API key", "Voice (ElevenLabs)", True),
+    ConfigKey(
+        "elevenlabs_stt_model", "Speech-to-text model", "Voice (ElevenLabs)", False,
+        help="The ElevenLabs Scribe model media transcription uses (default scribe_v1). "
+        "Worker restart required.",
+    ),
     ConfigKey("raindrop_api_token", "API token", "Raindrop", True),
     ConfigKey(
-        "calibre_url", "calibre-web URL (internal)", "Calibre (library)", False,
-        help="Default http://calibre-web_calibre-web:8083, the internal swarm address. "
-        "Never the public calibre host: Cloudflare Access answers every path there with "
-        "a login redirect, and AEGIS refuses it. Core applies a change on save; "
+        "semantic_scholar_api_key", "Semantic Scholar API key", "Research", True,
+        help="Sent as x-api-key on paper_search and paper_read. Blank = the public, "
+        "rate-limited tier. Core applies a change on save; the worker (ResearchFlow) "
+        "on restart.",
+    ),
+    ConfigKey(
+        "bot_contact_url", "Bot contact URL (User-Agent)", "Research", False,
+        help="Named in the User-Agent AEGIS sends when it fetches pages and feeds "
+        "(AegisBot/2.0 (+<url>)), so a site can see who is reading it. Blank = the "
+        "admin UI URL, else no contact. Core applies a change on save; the worker on "
+        "restart.",
+    ),
+    ConfigKey(
+        "calibre_url", "calibre-web URL", "Calibre (library)", False,
+        help="The address the stack reaches calibre-web at directly, e.g. "
+        "http://calibre-web:8083 on the same Docker network. Never a host behind an "
+        "SSO login page: it answers every path with a redirect, which AEGIS treats as "
+        "an error. Blank = not configured. Core applies a change on save; "
         "CalibreSyncFlow (the worker) on restart.",
     ),
     ConfigKey(
@@ -74,6 +93,14 @@ CONFIG_REGISTRY: list[ConfigKey] = [
         "CalibreSyncFlow reports not_configured.",
     ),
     ConfigKey("calibre_password", "calibre-web password", "Calibre (library)", True),
+    ConfigKey(
+        "calibre_max_book_mb", "Largest book file read (MB)", "Calibre (library)", False,
+        help="A book file over this size is not downloaded (default 80).",
+    ),
+    ConfigKey(
+        "calibre_max_books", "Most books in the catalogue", "Calibre (library)", False,
+        help="The paging cap when the catalogue is read (default 3000).",
+    ),
     ConfigKey(
         "jira_base_url", "Site URL (https://yours.atlassian.net)", "Jira", False,
         help="JiraSyncFlow closes a Todoist task once its issue has a resolution. "

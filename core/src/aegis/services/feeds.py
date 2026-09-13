@@ -10,11 +10,13 @@ worker, so there is one answer to "what is this feed worth?":
 
 * :func:`feed_stats` — per feed, measured from `feed_entries` (migration 046):
   entries seen, stored, stored as an abstract only, documents a prompt used in
-  the last 30 and 90 days, the last entry, fetch failures and the backlog.
+  the last 30 days and over `feeds_config.unused_after_days` (90 by default;
+  the fields keep their `_90d` names), the last entry, fetch failures and the
+  backlog.
   "Used" means a document was retrieved into a prompt — a chat turn or a
   research run (`knowledge_injection_log`, source `chat` or `research`). A
   briefing or a rollup does not log its reads, so it is still a floor.
-* :func:`unused_feeds` — active feeds with 90 days of history and no use.
+* :func:`unused_feeds` — active feeds with `unused_after_days` of history and no use.
 * :func:`recent_items` — the newest entries across the feeds, newest first,
   with an excerpt and whether a prompt used each: the reading list Miniflux
   used to be (Admin → Channels → Recent items).
@@ -36,7 +38,9 @@ import asyncpg
 import httpx
 import structlog
 
+from aegis.services import feeds_config
 from aegis.services.url_guard import UnsafeURLError, public_url_problem
+from aegis.services.user_agent import bot_user_agent
 
 logger = structlog.get_logger()
 
@@ -44,30 +48,26 @@ logger = structlog.get_logger()
 # PDF) and stores it; `abstract` stores the title and summary the feed already
 # carries and fetches nothing; `gate` does `full` for an entry that matches a
 # topic term and `abstract` for one that does not.
-INGEST_MODES = ("full", "abstract", "gate")
+INGEST_MODES = feeds_config.INGEST_MODES
 # `full` is today's behaviour. Measured on 2026-09-12 against the last 30 days,
 # the topic gate would have kept the full text of only 2 of the 10 non-arXiv
 # documents a prompt actually used, so gating is opt-in per feed. arXiv is the
 # feed to set to `abstract` (90% of all RSS chunks, 14 of 1,889 papers used).
-DEFAULT_INGEST_MODE = "full"
-# Fetches that must fail in a row before the feed is a hub finding. The flow
-# runs hourly, so three is three hours — past a blip, well inside a day.
-FAILING_AFTER = 3
-# Good fetches that must follow in a row before a failing feed's finding
-# resolves. One was enough, so a feed that failed every other hour opened and
-# resolved its problem all day.
-RECOVERED_AFTER = 2
-# Days without a new entry before a feed is reported stale; per feed
-# `channels.config.stale_after_days` overrides it.
-DEFAULT_STALE_AFTER_DAYS = 30
-# A feed needs this much history before it can be called unused.
-UNUSED_AFTER_DAYS = 90
-# `knowledge_chunks.embedding` is vector(768) of float4.
-_VECTOR_BYTES = 768 * 4
+# The `feeds_config` row's `default_ingest` overrides this for a feed that sets
+# no mode of its own.
+DEFAULT_INGEST_MODE = feeds_config.DEFAULTS["default_ingest"]
+# Days without a new entry before a feed is reported stale. The `feeds_config`
+# row sets the deployment's value; per feed `channels.config.stale_after_days`
+# overrides that. (How many failed fetches make a finding, how many good ones
+# resolve it, and the history a feed needs before it is called unused, are
+# `feeds_config` too: `failing_after`, `recovered_after`, `unused_after_days`.)
+DEFAULT_STALE_AFTER_DAYS = feeds_config.DEFAULTS["stale_after_days"]
+# `knowledge_chunks.embedding` is a pgvector column of float4; its dimension is
+# read from the column (`vector_bytes`), with this as the fallback.
+_DEFAULT_VECTOR_DIM = 768
 # How much of a response a feed check reads.
 _SNIFF_BYTES = 2_000_000
 _FETCH_TIMEOUT = httpx.Timeout(15.0, connect=5.0)
-_USER_AGENT = "Mozilla/5.0 (compatible; AegisBot/2.0; feed check)"
 
 _FEED_ROOT_RE = re.compile(r"<(rss|feed|rdf:rdf)[\s>]", re.IGNORECASE)
 _ITEM_RE = re.compile(r"<(item|entry)[\s>]", re.IGNORECASE)
@@ -79,18 +79,23 @@ _HREF_RE = re.compile(r"href=[\"']([^\"']+)[\"']", re.IGNORECASE)
 _CDATA_RE = re.compile(r"<!\[CDATA\[(.*?)\]\]>", re.DOTALL)
 
 
-def ingest_mode(config: dict | None) -> str:
-    """The feed's ingest mode; anything unrecognised is the default."""
+def ingest_mode(config: dict | None, default: str | None = None) -> str:
+    """The feed's ingest mode; anything unrecognised is the default — the
+    `feeds_config` row's `default_ingest` when the caller passes it."""
+    fallback = default if default in INGEST_MODES else DEFAULT_INGEST_MODE
     mode = str((config or {}).get("ingest") or "").strip().lower()
-    return mode if mode in INGEST_MODES else DEFAULT_INGEST_MODE
+    return mode if mode in INGEST_MODES else fallback
 
 
-def stale_after_days(config: dict | None) -> int:
+def stale_after_days(config: dict | None, default: int | None = None) -> int:
+    """The feed's own `stale_after_days`, else `default` (the `feeds_config`
+    row's, when the caller passes it), else the code default."""
+    fallback = default if isinstance(default, int) and default > 0 else DEFAULT_STALE_AFTER_DAYS
     try:
-        days = int((config or {}).get("stale_after_days") or DEFAULT_STALE_AFTER_DAYS)
+        days = int((config or {}).get("stale_after_days") or fallback)
     except (TypeError, ValueError):
-        return DEFAULT_STALE_AFTER_DAYS
-    return days if days > 0 else DEFAULT_STALE_AFTER_DAYS
+        return fallback
+    return days if days > 0 else fallback
 
 
 def feed_label(identifier: str, config: dict | None) -> str:
@@ -114,21 +119,24 @@ def _int(value: Any) -> int:
 # What each feed is worth
 # --------------------------------------------------------------------------
 
+# The long window (`$1` days) is the `feeds_config` row's `unused_after_days`;
+# the columns keep their `_90d` names because the tool and the admin page read
+# them by name. The short 30-day window is fixed.
 _STATS_SQL = """
 WITH used AS (
     SELECT u.cid, max(l.created_at) AS last_used
     FROM knowledge_injection_log l, unnest(l.content_ids) AS u(cid)
-    WHERE l.created_at > now() - interval '90 days'
+    WHERE l.created_at > now() - make_interval(days => $1)
     GROUP BY u.cid
 ),
 per AS (
     SELECT fe.channel_id,
            min(fe.seen_at) AS tracking_since,
            count(*) FILTER (WHERE fe.seen_at > now() - interval '30 days') AS entries_30d,
-           count(*) FILTER (WHERE fe.seen_at > now() - interval '90 days') AS entries_90d,
+           count(*) FILTER (WHERE fe.seen_at > now() - make_interval(days => $1)) AS entries_90d,
            count(*) FILTER (WHERE fe.seen_at > now() - interval '30 days'
                               AND fe.mode <> 'failed') AS stored_30d,
-           count(*) FILTER (WHERE fe.seen_at > now() - interval '90 days'
+           count(*) FILTER (WHERE fe.seen_at > now() - make_interval(days => $1)
                               AND fe.mode <> 'failed') AS stored_90d,
            count(*) FILTER (WHERE fe.seen_at > now() - interval '30 days'
                               AND fe.mode = 'abstract') AS abstract_30d,
@@ -166,8 +174,9 @@ def tracking_since(first_entry_at: Any, config: dict | None) -> str | None:
 
 async def feed_stats(pool: asyncpg.Pool) -> list[dict[str, Any]]:
     """Every rss channel with its measured worth. One query; cheap on the full store."""
+    cfg = await feeds_config.get_feeds_config(pool)
     out: list[dict[str, Any]] = []
-    for r in await pool.fetch(_STATS_SQL):
+    for r in await pool.fetch(_STATS_SQL, int(cfg["unused_after_days"])):
         config = r["config"] if isinstance(r["config"], dict) else {}
         out.append(
             {
@@ -175,8 +184,8 @@ async def feed_stats(pool: asyncpg.Pool) -> list[dict[str, Any]]:
                 "identifier": r["identifier"],
                 "label": feed_label(r["identifier"], config),
                 "active": r["active"],
-                "agent_id": config.get("agent_id") or "",
-                "ingest": ingest_mode(config),
+                "ingest": ingest_mode(config, cfg["default_ingest"]),
+                "stale_after_days": stale_after_days(config, cfg["stale_after_days"]),
                 "tracking_since": tracking_since(r["tracking_since"], config),
                 "entries_30d": _int(r["entries_30d"]),
                 "entries_90d": _int(r["entries_90d"]),
@@ -197,11 +206,13 @@ async def feed_stats(pool: asyncpg.Pool) -> list[dict[str, Any]]:
 
 
 async def unused_feeds(pool: asyncpg.Pool) -> list[dict[str, Any]]:
-    """Active feeds with at least 90 days of history that no prompt used in 90 days.
+    """Active feeds with at least `unused_after_days` (90 by default) of history
+    that no prompt used in that time.
 
     A feed younger than that is not judged: "nothing used yet" from a feed
     added last week is not evidence.
     """
+    cfg = await feeds_config.get_feeds_config(pool)
     now = datetime.now().astimezone()
     out = []
     for f in await feed_stats(pool):
@@ -210,10 +221,26 @@ async def unused_feeds(pool: asyncpg.Pool) -> list[dict[str, Any]]:
         since = f["tracking_since"]
         if not since:
             continue
-        if (now - datetime.fromisoformat(since)).days < UNUSED_AFTER_DAYS:
+        if (now - datetime.fromisoformat(since)).days < int(cfg["unused_after_days"]):
             continue
         out.append(f)
     return out
+
+
+async def vector_bytes(pool: asyncpg.Pool) -> int:
+    """Bytes one `knowledge_chunks.embedding` row holds: the column's pgvector
+    dimension (its type modifier) times four, falling back to 768 dimensions."""
+    dim = _DEFAULT_VECTOR_DIM
+    try:
+        typmod = await pool.fetchval(
+            "SELECT atttypmod FROM pg_attribute "
+            "WHERE attrelid = 'knowledge_chunks'::regclass AND attname = 'embedding'"
+        )
+        if isinstance(typmod, int) and typmod > 0:
+            dim = typmod
+    except Exception as exc:  # noqa: BLE001 — a preview is not worth a failed request
+        logger.warning("vector_dim_unreadable", error=str(exc)[:200])
+    return dim * 4
 
 
 # --------------------------------------------------------------------------
@@ -346,13 +373,14 @@ def _clean_title(raw: str) -> str:
     return html.unescape(re.sub(r"<[^>]+>", " ", raw)).strip()[:120]
 
 
-async def inspect_feed(url: str) -> dict[str, Any]:
+async def inspect_feed(url: str, *, user_agent: str | None = None) -> dict[str, Any]:
     """Fetch `url` and say whether it is an RSS or Atom feed.
 
     Returns ``{"ok": True, "title", "entries"}`` or ``{"ok": False, "error"}``.
     An HTML page that advertises a feed says where (``"suggest"``), because
     "follow simonwillison.net" usually means the site, not its feed URL.
     """
+    user_agent = user_agent or bot_user_agent()
     problem = await public_url_problem(url)
     if problem:
         return {"ok": False, "error": problem}
@@ -371,7 +399,7 @@ async def inspect_feed(url: str) -> dict[str, Any]:
             httpx.AsyncClient(
                 timeout=_FETCH_TIMEOUT,
                 follow_redirects=True,
-                headers={"User-Agent": _USER_AGENT},
+                headers={"User-Agent": user_agent},
                 event_hooks={"request": [_public_only]},
             ) as client,
             client.stream("GET", url) as resp,
@@ -410,9 +438,11 @@ async def inspect_feed(url: str) -> dict[str, Any]:
 
 
 async def subscribe(
-    pool: asyncpg.Pool, url: str, *, label: str = "", agent_id: str | None = None
+    pool: asyncpg.Pool, url: str, *, label: str = "", user_agent: str | None = None
 ) -> dict[str, Any]:
-    """Follow a feed: check it parses as one, then add (or re-activate) its channel."""
+    """Follow a feed: check it parses as one, then add (or re-activate) its
+    channel. The feed belongs to no one agent: the research-tagged agent owns
+    every feed (`hub_project`), so nothing per feed records who added it."""
     url = (url or "").strip()
     if not url:
         return {"error": "url is required"}
@@ -426,7 +456,7 @@ async def subscribe(
             "id": existing["id"],
             "label": feed_label(url, existing["config"]),
         }
-    check = await inspect_feed(url)
+    check = await inspect_feed(url, user_agent=user_agent)
     if not check["ok"]:
         return {"error": check["error"], **({"suggest": check["suggest"]} if "suggest" in check else {})}
     if existing:
@@ -437,13 +467,12 @@ async def subscribe(
             "label": feed_label(url, existing["config"]),
             "entries_in_feed": check["entries"],
         }
+    cfg = await feeds_config.get_feeds_config(pool)
     config: dict[str, Any] = {
         "label": (label or "").strip() or check["title"] or feed_label(url, None),
         "last_cursor": None,
-        "ingest": DEFAULT_INGEST_MODE,
+        "ingest": cfg["default_ingest"],
     }
-    if agent_id:
-        config["agent_id"] = agent_id
     try:
         row = await pool.fetchrow(
             "INSERT INTO channels (kind, identifier, config, active) "
@@ -528,6 +557,7 @@ async def retention_preview(pool: asyncpg.Pool, older_than_days: int = 30) -> di
     chunk" would remove. Counts only — nothing is deleted or changed."""
     days = max(1, int(older_than_days))
     r = await pool.fetchrow(_RETENTION_SQL, days)
+    per_vector = await vector_bytes(pool)
     documents, chunks = _int(r["documents"]), _int(r["chunks"])
     removed = max(0, chunks - documents)
     return {
@@ -539,7 +569,7 @@ async def retention_preview(pool: asyncpg.Pool, older_than_days: int = 30) -> di
         "chunks": chunks,
         "chunks_removed": removed,
         "text_bytes_freed": max(0, _int(r["text_bytes"]) - _int(r["kept_bytes"])),
-        "vector_bytes_freed": removed * _VECTOR_BYTES,
+        "vector_bytes_freed": removed * per_vector,
         "note": "Use is counted from knowledge_injection_log, which chat turns and "
         "research runs write; a document only a briefing or rollup read counts as unused.",
     }

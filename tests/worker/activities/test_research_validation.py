@@ -22,7 +22,9 @@ async def test_gather_logs_what_it_retrieved_so_feed_use_counts_research(db_pool
     )
     sc = AsyncMock()
     sc.search = AsyncMock(return_value=[])
-    act = ResearchActivities(knowledge_connector=kc, search_connector=sc, db_pool=db_pool)
+    act = ResearchActivities(
+        knowledge_connector=kc, search_connector=sc, db_pool=db_pool, agent_id="raphael"
+    )
     try:
         await ActivityEnvironment().run(
             act.research_gather, {"question": "what do the feeds say", "depth": "quick"}

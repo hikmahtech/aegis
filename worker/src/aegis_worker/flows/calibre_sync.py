@@ -23,7 +23,8 @@ _SYNC_TIMEOUT = timedelta(minutes=15)
 
 @dataclass
 class CalibreSyncConfig:
-    agent_id: str = "raphael"
+    # The scheduled row's agent; "" (a hand-started run) records no agent.
+    agent_id: str = ""
 
 
 @workflow.defn(name="CalibreSyncFlow")

@@ -26,20 +26,20 @@ class IntelligenceActivities:
 
     knowledge_connector: Any = None
     llm_client: Any = None
-    # Scoring model. NOTE: this default is only used by direct construction —
-    # __main__.py passes `model_light=model_balanced`, so in a real worker the
-    # significance score runs on whatever the BALANCED tier resolves to, not on
-    # gemma4:e2b. An earlier comment here claimed the fast tier; it was never
-    # wired that way, and that mismatch is what made issue #137 read the
-    # 2026-07-22 balanced-tier remap (gemma4:e2b/gpt-oss:20b -> kimi-k2.5) as
-    # "fast-tier calls went invisible". Change the wiring in __main__.py if you
-    # want a different tier — changing this default alone does nothing.
-    model_light: str = "gemma4:e2b"
+    # Scoring model. __main__.py passes `model_light=model_balanced`, so in a
+    # real worker the significance score runs on whatever the BALANCED tier
+    # resolves to. The default is blank on purpose: a model name here would be
+    # dead config right up until a wiring gap made it the live model (#137),
+    # and `think()` on a blank name fails loudly rather than scoring on a
+    # decommissioned model. Change the wiring in __main__.py for a different
+    # tier — changing this default alone does nothing.
+    model_light: str = ""
     db_pool: Any = None
-    # Owning agent — matches IntelligenceScanFlow's config default. Threaded
-    # into llm_calls rows so intel_score_significance stops recording NULL
-    # agent_id (same pattern as MoneyActivities.agent_id).
-    agent_id: str = "raphael"
+    # Owning agent: the holder of the `research` tag, resolved in __main__ at
+    # boot. Threaded into llm_calls rows so intel_score_significance records
+    # who asked (same pattern as MoneyActivities.agent_id); "" = no agent, and
+    # the row is written with NULL rather than a made-up id.
+    agent_id: str = ""
 
     @activity.defn
     async def dedup_items(self, items: list[dict]) -> list[dict]:
@@ -120,7 +120,7 @@ class IntelligenceActivities:
             max_tokens=1500,
             db_pool=self.db_pool,
             purpose="intel_score_significance",
-            agent_id=self.agent_id,
+            agent_id=self.agent_id or None,
         )
         scores = parse_llm_json(result["response"])
         try:

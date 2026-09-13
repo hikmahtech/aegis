@@ -300,13 +300,23 @@ class Settings(BaseSettings):
     content_extraction_enabled: bool = True
     raindrop_api_token: str = ""
 
-    # Calibre library (#510). The internal swarm address by default — never the
-    # public host, which is behind Cloudflare Access (a login redirect on every
-    # path). User and password blank = the library tools say "not configured"
-    # and CalibreSyncFlow reports not_configured. DB-first via Integrations.
-    calibre_url: str = "http://calibre-web_calibre-web:8083"
+    # Calibre library (#510). No default address: the URL, user and password
+    # come from the Integrations page (DB-first), and any of them blank = the
+    # library tools say "not configured" and CalibreSyncFlow reports
+    # not_configured. The URL must reach calibre-web directly, never a host
+    # behind an SSO login page (every redirect is an error). The two caps are
+    # numbers the page stores as strings; `library.calibre_limits` coerces.
+    calibre_url: str = ""
     calibre_user: str = ""
     calibre_password: str = ""
+    calibre_max_book_mb: str = ""  # blank = 80
+    calibre_max_books: str = ""  # blank = 3000
+
+    # The research lane (#509). A Semantic Scholar key lifts paper_search off
+    # the public rate limit; the contact URL goes into the bot User-Agent
+    # (`services/user_agent.py`), falling back to aegis_ui_url. Both DB-first.
+    semantic_scholar_api_key: str = ""
+    bot_contact_url: str = ""
 
     # Jira (JiraSyncFlow). Any of the three blank = the flow reports
     # `not_configured` and issues no request. Basic auth: the Atlassian ACCOUNT

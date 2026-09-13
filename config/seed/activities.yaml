@@ -214,7 +214,10 @@ activities:
   # #research / #email reference closure per the references-as-knowledge
   # spec; per-message chat notifications only fire for user-initiated #chat / #manual
   # sources, so this digest is the only signal the user gets for automated
-  # ingest closure). Cron 04:30 UTC = 10:00 IST.
+  # ingest closure). Cron 04:30 UTC = 10:00 IST. `feed_review_day` (default
+  # 1, the first of the month; 0 = every run) is the day this briefing names
+  # the feeds no prompt has used (#511) — config is DB-owned, tune it on
+  # /admin/flows.
   - slug: daily-briefing-raphael
     workflow_type: DailyBriefingFlow
     agent_id: raphael
@@ -265,7 +268,10 @@ activities:
   # slots that the ingest flows own. The flow gates itself on the notification
   # budget, so this cron is an upper bound, not a promise of a daily card.
   # NOTE: `config` is DB-owned (seed.py only refreshes workflow_type/agent_id) —
-  # on an existing deploy tune max_per_day on /admin/flows, not here.
+  # on an existing deploy tune max_per_day on /admin/flows, not here. The
+  # detector thresholds are config too (their defaults, when unset):
+  # min_attendee_events 3, min_project_tasks 5, empty_search_days 14,
+  # min_empty_searches 2, search_miss_below 0.60.
   - slug: curiosity-daily
     workflow_type: CuriosityCardFlow
     agent_id: sebas
@@ -431,6 +437,13 @@ activities:
   # could only ever describe yesterday's scan. 01:00/01:30/02:00 leaves a >2h
   # margin for the */15 ClarifyFlow tick that turns the #research captures into
   # `source_type='reference'` rows, which the briefing also reads.
+  #
+  # `topics` are EXAMPLES: broad single words that seed a first boot. The
+  # row is DB-owned after that, so set your own on /admin/flows. Tracked
+  # topics (`track_topic`) are searched too, without being listed here.
+  # `query_template` is the searxng query per topic (`{topic}` = the term);
+  # these are the built-in queries spelled out, and a blank one falls back to
+  # them (`intel_scan.DEFAULT_QUERY_TEMPLATES`).
   - slug: intel-scan-hn
     workflow_type: IntelligenceScanFlow
     agent_id: raphael
@@ -439,6 +452,7 @@ activities:
       source: hn
       topics: [ai, systems, startups]
       significance_threshold: 4
+      query_template: "site:news.ycombinator.com {topic}"
     active: true
 
   - slug: intel-scan-news
@@ -449,6 +463,7 @@ activities:
       source: news
       topics: [world, tech]
       significance_threshold: 4
+      query_template: "{topic}"
     active: true
 
   - slug: intel-scan-finance
@@ -459,6 +474,7 @@ activities:
       source: finance
       topics: [equities, macro, crypto]
       significance_threshold: 4
+      query_template: "{topic} site:ft.com OR site:reuters.com OR site:bloomberg.com"
     active: true
 
   # Sebas — close Todoist tasks whose Jira issue already has a resolution.

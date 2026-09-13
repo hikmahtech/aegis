@@ -1,4 +1,4 @@
-"""Raphael's library tools (#510): the Calibre book library, read-only.
+"""The research agent's library tools (#510): the Calibre book library, read-only.
 
 Four tools over `services/library.py`, the implementation `ResearchFlow` and
 `CalibreSyncFlow` share. None of them stores anything: a book's text is read
@@ -18,6 +18,7 @@ from pydantic import Field
 from aegis.connectors.calibre import CalibreError
 from aegis.services import library
 from aegis.services.connector_health import record_connector_health
+from aegis.services.library_config import get_library_config
 from aegis.services.tools.base import ToolContext
 from aegis.services.tools.registry import aegis_tool
 
@@ -92,7 +93,7 @@ async def _exec_library_read(
     section: str = "",
     pages: str = "",
     query: str = "",
-    max_chars: Annotated[int, Field(ge=1000, le=40000)] = library.READ_CHARS,
+    max_chars: Annotated[int | None, Field(ge=1000, le=40000)] = None,
 ) -> str:
     """Read from a book in the Calibre library. Give a query to get the passages that best match it, a section (chapter number or title) for an EPUB, or pages (e.g. 12-18) for a PDF; with none of these it returns the opening. Every result names the book and chapter or pages to cite. Nothing is saved.
 
@@ -101,14 +102,20 @@ async def _exec_library_read(
         section: EPUB only: a chapter number or part of its title.
         pages: PDF only: a page or a range, e.g. 12-18 (at most 30 pages).
         query: Return the passages that best match this instead of a whole section.
-        max_chars: The most characters of text to return (1000-40000).
+        max_chars: The most characters of text to return (1000-40000); omit for the configured default.
     """
     conn, reason = library.connector_or_reason(ctx.settings)
     if conn is None:
         return _unavailable(reason)
     try:
         result = await library.read_book(
-            conn, book_id, section=section, pages=pages, query=query, max_chars=max_chars
+            conn,
+            book_id,
+            section=section,
+            pages=pages,
+            query=query,
+            max_chars=max_chars or None,
+            limits=await get_library_config(pool),
         )
     except CalibreError as exc:
         return await _failed(pool, ctx, exc)

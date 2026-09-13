@@ -57,7 +57,12 @@ def _stubs(calls: list, *, synth=None, read_raises=False, save_raises=False, sle
         calls.append(("send", agent_id, message))
         return {"ok": True}
 
-    return [gather, read, synthesize, save, send]
+    @activity.defn(name="resolve_agents")
+    async def resolve(tags: list[str]) -> dict:
+        calls.append(("resolve", list(tags)))
+        return {t: ("zz-researcher" if t == "research" else None) for t in tags}
+
+    return [gather, read, synthesize, save, send, resolve]
 
 
 async def _run(inp: ResearchInput, activities: list) -> dict:
@@ -129,6 +134,34 @@ async def test_a_late_answer_is_sent_to_the_channel():
     assert "Slow one?" in sends[0][2]
     assert "It works [1]." in sends[0][2]
     assert out["notified"] is True
+
+
+async def test_with_no_agent_named_the_research_tag_holder_gets_the_late_answer():
+    """A blank `agent_id` (a hand-started run, a fork with renamed agents)
+    is resolved by capability tag, never a literal id (issue #36)."""
+    calls: list = []
+    out = await _run(
+        ResearchInput(question="Who?", reply_after_seconds=1), _stubs(calls, sleep=2.5)
+    )
+    assert ("resolve", ["research"]) in calls
+    sends = [c for c in calls if c[0] == "send"]
+    assert [s[1] for s in sends] == ["zz-researcher"]
+    assert out["notified"] is True
+
+
+async def test_with_no_research_agent_the_answer_is_still_made_and_nobody_is_messaged():
+    calls: list = []
+    stubs = _stubs(calls, sleep=2.5)
+
+    @activity.defn(name="resolve_agents")
+    async def nobody(tags: list[str]) -> dict:
+        return dict.fromkeys(tags)
+
+    stubs = [s for s in stubs if s.__name__ != "resolve"] + [nobody]
+    out = await _run(ResearchInput(question="Who?", reply_after_seconds=1), stubs)
+    assert out["status"] == "ok" and out["no_research_agent"] is True
+    assert out["notified"] is False
+    assert not [c for c in calls if c[0] == "send"]
 
 
 async def test_an_empty_question_runs_nothing():

@@ -9,7 +9,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 from aegis.connectors.calibre import CalibreError
-from aegis.services import library
+from aegis.services import library, library_config
 from aegis.services.chat import TOOL_EXECUTORS, ToolContext
 from aegis.services.tools import library as tools_library
 
@@ -91,7 +91,14 @@ async def test_read_passes_its_arguments_through(conn, health, monkeypatch):
     out = await _call("library_read", {"book_id": 12, "pages": "3-5", "max_chars": 2000})
     assert out["cite"] == "Hands-On Machine Learning, pp. 3-5"
     assert read.await_args.args[1] == 12
-    assert read.await_args.kwargs == {"section": "", "pages": "3-5", "query": "", "max_chars": 2000}
+    kwargs = dict(read.await_args.kwargs)
+    # The `library_config` row (its defaults here) rides along for the limits
+    # the caller did not name.
+    assert kwargs.pop("limits") == library_config.merge(None)
+    assert kwargs == {"section": "", "pages": "3-5", "query": "", "max_chars": 2000}
+    # No `max_chars` at all means "the configured default", not the schema's.
+    out = await _call("library_read", {"book_id": 12, "pages": "3-5"})
+    assert read.await_args.kwargs["max_chars"] is None
 
 
 @pytest.mark.asyncio

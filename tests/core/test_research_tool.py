@@ -122,7 +122,46 @@ async def test_an_unknown_depth_is_quick(depth):
     assert client.start_workflow.await_args.args[1]["depth"] == "quick"
 
 
-async def test_the_agent_defaults_to_raphael():
+async def test_the_agent_is_the_research_tag_holder_when_the_context_names_none(monkeypatch):
+    """Never a literal id (issue #36): with no calling agent, the run belongs
+    to whoever holds the `research` capability tag — and to nobody when no
+    active agent does, which still starts the research."""
+    from aegis.services.tools import research as tool_mod
+
+    seen: list[tuple] = []
+
+    async def fake_resolve(pool, tag):
+        seen.append((pool, tag))
+        return "zz-researcher" if pool == "pool-with-holder" else None
+
+    monkeypatch.setattr(tool_mod, "resolve_tag", fake_resolve)
     client = _client()
-    await _call({"query": "q"}, client, agent_id=None)
-    assert client.start_workflow.await_args.args[1]["agent_id"] == "raphael"
+    ctx = ToolContext(agent_id=None, temporal_client=client)
+    await _exec_research_topic("pool-with-holder", {"query": "q"}, ctx)
+    assert client.start_workflow.await_args.args[1]["agent_id"] == "zz-researcher"
+
+    client = _client()
+    await _exec_research_topic("pool-without", {"query": "q"}, ToolContext(temporal_client=client))
+    assert client.start_workflow.await_args.args[1]["agent_id"] == ""
+    assert seen == [("pool-with-holder", "research"), ("pool-without", "research")]
+
+    # A calling agent is never overridden by the lookup.
+    client = _client()
+    await _call({"query": "q"}, client, agent_id="sebas")
+    assert client.start_workflow.await_args.args[1]["agent_id"] == "sebas"
+    assert len(seen) == 2
+
+
+async def test_the_wait_comes_from_the_research_config_row(monkeypatch):
+    """`research_config.wait_seconds` is what the flow is told to reply
+    after and what the tool waits; the code default only when there is no
+    row (and no pool at all)."""
+    from aegis.services import research_config
+
+    research_config.ROW.clear_cache()
+    monkeypatch.setattr(
+        research_config.ROW, "get", AsyncMock(return_value={**research_config.DEFAULTS, "wait_seconds": 7})
+    )
+    client = _client()
+    await _call({"query": "q"}, client)
+    assert client.start_workflow.await_args.args[1]["reply_after_seconds"] == 7
