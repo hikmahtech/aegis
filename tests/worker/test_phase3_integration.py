@@ -219,8 +219,9 @@ class TestScribeHTTPClient:
 
         assert result is not None
         assert result.extraction_method == "elevenlabs"
+        # The fourth argument is the bot User-Agent, blank on direct construction.
         mock_stt.assert_called_once_with(
-            "https://example.com/podcast.mp3", "el-key", "scribe_v1"
+            "https://example.com/podcast.mp3", "el-key", "scribe_v1", ""
         )
 
 
@@ -353,6 +354,7 @@ class TestProcessContentMediaPipeline:
             "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
             "custom-key",
             "scribe_v1",
+            "",  # the bot User-Agent, blank on direct construction
         )
 
 

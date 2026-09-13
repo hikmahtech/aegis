@@ -10,6 +10,7 @@ import pytest
 import pytest_asyncio
 from aegis.connectors.ansaar import AnsaarClient, AnsaarError
 from aegis.connectors.finance import FinanceConnector
+from aegis.services import desk_math as dm
 from aegis.services import trading_desk as td
 
 THU, FRI, MON, TUE, WED = (date(2026, 9, d) for d in (10, 11, 14, 15, 16))
@@ -275,7 +276,7 @@ async def test_two_desk_names_for_one_yahoo_symbol_both_get_the_bars(pool):
     """The desk holds this ETF under its NSE name and names the benchmark in
     Yahoo's form. Both ask for SHARIABEES.NS, so both must come back with its bars."""
     await td._store_bars(pool, "SHARIABEES.NS", [bar(FRI, 400.0), bar(MON, 402.0)], "yahoo", TUE)
-    bars = await td._bars(pool, {"SHARIABEES", "SHARIABEES.NS"})
+    bars = await td._bars(pool, await td.load_rules(pool), {"SHARIABEES", "SHARIABEES.NS"})
     assert [b.day for b in bars["SHARIABEES"]] == [FRI, MON]
     assert bars["SHARIABEES"] == bars["SHARIABEES.NS"]
 
@@ -401,10 +402,17 @@ async def test_live_mode_is_refused(pool):
     assert await open_problems(pool) == [("desk_source_error", "config")]
 
 
-def test_yahoo_symbol():
-    assert td.yahoo_symbol("TCS") == "TCS.NS"
-    assert td.yahoo_symbol("^NSEI") == "^NSEI"
-    assert td.yahoo_symbol("SHARIABEES.NS") == "SHARIABEES.NS"
+def test_the_price_source_symbol_comes_from_the_configured_suffix(seeded_desk_rules):
+    """The suffix is the operator's exchange, not a literal in the code. An
+    index and a symbol that already names its exchange are left alone."""
+    assert seeded_desk_rules.price_symbol("TCS") == "TCS.NS"
+    assert seeded_desk_rules.price_symbol("^NSEI") == "^NSEI"
+    assert seeded_desk_rules.price_symbol("SHARIABEES.NS") == "SHARIABEES.NS"
+
+
+def test_with_no_suffix_configured_a_symbol_is_left_alone():
+    """A US desk needs no suffix, which is why the default is none."""
+    assert dm.Rules().price_symbol("AAPL") == "AAPL"
 
 
 # --- a stated risk halt sells the whole book (spec §5) ------------------------
@@ -552,3 +560,185 @@ async def test_an_unmapped_benchmark_gets_no_fallback(pool):
         "SELECT close FROM finance.desk_prices WHERE symbol = 'SHARIABEES.NS' AND date = $1", FRI
     )
     assert close is None
+
+
+# --- what the desk says about itself (#540, #565, #525, #524) -----------------
+
+
+def _places(text: str) -> int:
+    """How many decimal places a numeric column came back with."""
+    return len(text.split(".")[1]) if "." in text else 0
+
+
+async def test_money_columns_store_as_the_decimals_they_read_as(pool):
+    """`round(x, 4)` returns the nearest float, and 24.04 is not one, so the
+    first live plan stored a ₹24.04 close as
+    24.039999999999999147… — right to about 1e-15 and unreadable to anyone
+    checking the desk by hand in SQL (#540).
+
+    Two names and all three write sites, because one column passing proves
+    nothing about the other two."""
+    finance = market({
+        "GOLDCASE.NS": [bar(FRI, 24.04), bar(MON, 24.07)],
+        "SILVERCASE.NS": [bar(FRI, 1.15), bar(MON, 1.16)],
+    })
+    ansaar = FakeAnsaar({
+        FRI: [row("GOLDCASE", 0.10, cls="etf"), row("SILVERCASE", 0.10, cls="etf", rank=2)],
+        MON: [row("GOLDCASE", 0.10, day=MON, cls="etf"), row("SILVERCASE", 0.10, day=MON, cls="etf", rank=2)],
+    })
+
+    await run(pool, ansaar, finance, MON)  # _store_bars, then _write_plan
+    await run(pool, ansaar, finance, TUE)  # _apply_fills
+
+    closes = await pool.fetch(
+        "SELECT symbol, close::text AS close FROM finance.desk_prices "
+        "WHERE symbol IN ('GOLDCASE.NS', 'SILVERCASE.NS') ORDER BY symbol, date"
+    )
+    assert [(c["symbol"], c["close"]) for c in closes] == [
+        ("GOLDCASE.NS", "24.04"), ("GOLDCASE.NS", "24.07"),
+        ("SILVERCASE.NS", "1.15"), ("SILVERCASE.NS", "1.16"),
+    ]
+    orders = await pool.fetch(
+        "SELECT symbol, ref_price::text AS ref, fill_price::text AS fill, costs::text AS costs "
+        "FROM finance.desk_orders WHERE created_day = $1 ORDER BY seq",
+        MON,
+    )
+    assert [(o["symbol"], o["ref"], o["fill"]) for o in orders] == [
+        ("GOLDCASE", "24.04", "24.07"),
+        ("SILVERCASE", "1.15", "1.16"),
+    ]
+    # The charges are computed, not quoted, so they are the column most likely
+    # to keep carrying a float's tail.
+    assert [_places(o["costs"]) for o in orders] == [4, 4]
+
+
+async def test_a_run_with_nothing_to_fill_says_so_rather_than_leaving_the_key_out(pool):
+    """A missing key reads as "the step never ran", which is a different
+    statement from "there was nothing to fill" (#565)."""
+    finance = market({"TCS.NS": [bar(FRI, 3000.0)], "GOLDBEES.NS": [bar(FRI, 100.0)]})
+    ansaar = FakeAnsaar({FRI: [row("TCS", 0.10), row("GOLDBEES", 0.10, cls="etf", rank=2)]})
+
+    out = await run(pool, ansaar, finance, MON)
+
+    assert out["pending_checked"] == 0 and out["filled"] == 0
+    assert await pool.fetchval("SELECT count(*) FROM finance.desk_orders WHERE status = 'pending'") == 2
+
+
+async def test_a_run_that_could_fill_nothing_says_how_many_it_tried(pool):
+    """Two orders waiting on a close Yahoo never published. `filled: 0` alone
+    cannot tell that from a morning with no orders at all (#565)."""
+    finance = market({
+        "TCS.NS": [bar(FRI, 3000.0), bar(MON, None)],
+        "GOLDBEES.NS": [bar(FRI, 100.0), bar(MON, None)],
+    })
+    ansaar = FakeAnsaar({FRI: [row("TCS", 0.10), row("GOLDBEES", 0.10, cls="etf", rank=2)]})
+    await run(pool, ansaar, finance, MON)
+
+    out = await run(pool, ansaar, finance, TUE)
+
+    assert out["pending_checked"] == 2 and out["filled"] == 0
+    assert await pool.fetchval("SELECT count(*) FROM finance.desk_orders WHERE status = 'pending'") == 2
+
+
+# A full trading week, because the desk reads its own week off these bars: a
+# two-bar calendar would say this market trades on Thursdays and Fridays.
+WEEK = [date(2026, 9, d) for d in (7, 8, 9, 10, 11, 14)]
+
+
+async def test_a_weekday_the_calendar_never_gave_is_counted_not_silently_skipped(pool):
+    """Yahoo drops a day, or serves one whose close is null, so the newest
+    market day is one the desk planned yesterday. The run then does nothing at
+    all and reads exactly like a quiet morning, while yesterday's decisions are
+    never acted on and the stale-calendar alarm waits six days (#525)."""
+    finance = FakeFinance({
+        "^NSEI": [bar(d, 25_000.0) for d in WEEK],  # nothing for Tuesday the 15th
+        "SHARIABEES.NS": [bar(FRI, 400.0)],
+        "TCS.NS": [bar(d, 3000.0) for d in WEEK],
+    })
+    ansaar = FakeAnsaar({MON: [row("TCS", 0.10, day=MON)]})
+
+    planning = await run(pool, ansaar, finance, TUE)
+    assert (planning["day"], planning["idle_weekday"]) == (MON.isoformat(), 0)
+
+    # A second run the same morning is not an idle day: yesterday's bar is there.
+    assert (await run(pool, ansaar, finance, TUE))["idle_weekday"] == 0
+
+    idle = await run(pool, ansaar, finance, WED)
+    assert (idle["day"], idle["idle_weekday"]) == (MON.isoformat(), 1)
+    assert "planned" not in idle  # the day was already planned, so nothing new happened
+    # One missing bar overnight is normal, and a market holiday reads the same,
+    # so it earns no problem and no task. The six-day alarm still escalates.
+    assert await open_problems(pool) == []
+
+
+# Three mornings of decisions, so a run on Wednesday is never held for stale
+# input while the benchmark is what the test is about.
+DECISIONS = FakeAnsaar({
+    FRI: [row("TCS", 0.10)],
+    MON: [row("TCS", 0.10, day=MON)],
+    TUE: [row("TCS", 0.10, day=TUE)],
+})
+
+
+def dark_benchmarks():
+    """A priced holding, a benchmark last seen on Thursday, and one never served
+    at all. Two benchmarks, because one passes for the wrong reason."""
+    finance = market({"TCS.NS": [bar(FRI, 3000.0), bar(MON, 3100.0), bar(TUE, 3050.0)]})
+    finance.bars["SHARIABEES.NS"] = [bar(THU, 400.0)]
+    finance.bars["NIFTYCASE.NS"] = []
+    return finance
+
+
+async def test_a_benchmark_that_stops_being_priced_is_a_finding(pool):
+    """A holding going dark is loud; a benchmark going dark is silent.
+    `benchmark_values` returns nothing, the weekly gap has nothing to compare,
+    the label reads "too early" for ever and the rendered figure is blank, so
+    the score stops meaning anything without saying so (#524)."""
+    await pool.execute(
+        "UPDATE activities SET config = config || $2::jsonb WHERE slug = $1",
+        td.DESK_SLUG, {"context_benchmark": "NIFTYCASE.NS"},
+    )
+    finance = dark_benchmarks()
+    await run(pool, DECISIONS, finance, MON)
+    await run(pool, DECISIONS, finance, TUE)
+
+    await run(pool, DECISIONS, finance, WED)
+
+    # Both benchmarks, and not the holding, which Yahoo is still pricing.
+    assert await open_problems(pool) == [
+        ("desk_price_missing", "niftycase.ns"),
+        ("desk_price_missing", "shariabees.ns"),
+    ]
+    said = await pool.fetchval(
+        "SELECT payload->>'description' FROM problem_events e JOIN problems p ON p.id = e.problem_id "
+        "WHERE p.subject = 'shariabees.ns' ORDER BY e.created_at LIMIT 1"
+    )
+    assert "scores itself against it" in said
+
+
+async def test_a_benchmark_priced_this_week_raises_nothing(pool):
+    """The half that matters: a finding raised unconditionally would look
+    identical on the day it is written and tell the owner nothing ever after."""
+    finance = market({"TCS.NS": [bar(FRI, 3000.0), bar(MON, 3100.0), bar(TUE, 3050.0)]})
+    finance.bars["SHARIABEES.NS"] = [bar(FRI, 400.0), bar(MON, 402.0), bar(TUE, 401.0)]
+    await run(pool, DECISIONS, finance, MON)
+    await run(pool, DECISIONS, finance, TUE)
+
+    await run(pool, DECISIONS, finance, WED)
+
+    assert await open_problems(pool) == []
+
+
+async def test_a_dark_benchmark_clears_when_its_price_comes_back(pool):
+    """Same class and same subject shape as a holding's, so the daily run's own
+    reconcile resolves it rather than leaving a task open for ever."""
+    finance = dark_benchmarks()
+    del finance.bars["NIFTYCASE.NS"]
+    for day in (MON, TUE, WED):
+        await run(pool, DECISIONS, finance, day)
+    assert await open_problems(pool) == [("desk_price_missing", "shariabees.ns")]
+
+    finance.bars["SHARIABEES.NS"] = [bar(THU, 400.0), bar(TUE, 402.0)]
+    await run(pool, DECISIONS, finance, WED)
+
+    assert await open_problems(pool) == []

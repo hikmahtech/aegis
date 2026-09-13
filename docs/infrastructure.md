@@ -638,8 +638,17 @@ resolving a live estate in one tick:
   re-sends them, so reconciling against that empty set would close every open
   problem. Prometheus re-sends on the order of a minute, so the default leaves
   a wide margin;
-- a problem younger than ten minutes is left alone, so one raised seconds ago
-  is never resolved before alertmanager has grouped its alert;
+- a problem whose **last** occurrence is younger than ten minutes is left
+  alone: an alert that just fired is firing now, whatever alertmanager has
+  managed to group. (Bounding the FIRST occurrence instead, as the first version
+  did, let a four-day-old problem that fired thirty seconds ago straight
+  through — #561.);
+- a problem is judged on **every fingerprint it has ever had**, and resolved
+  only if alertmanager lists none of them. A fingerprint hashes the label set,
+  so a recurring fault arrives under a new one each time — one problem here had
+  26 across 27 occurrences — and judging on the first meant comparing against a
+  hash that could never be active again, which closed a live problem within a
+  minute of every legitimate reopen;
 - a **group** problem is left alone: its subject is `*`, it stands for a class
   rather than one alert, and no single fingerprint speaks for it.
 
@@ -846,8 +855,10 @@ key is pasted.)
 
 #### The infra list and the infra repo
 
-Both live in the `infra_alert_routing` settings row. Read and replace it over
-the admin API:
+Both live in the `infra_alert_routing` settings row, editable on the admin
+**Problems** page under *Hub configuration* — the infra repo, the extra
+alertnames, and what to tell an investigation about this cluster. The same row
+over the admin API, for a script:
 
 ```bash
 curl -sS -H "X-API-Key: $AEGIS_API_KEY" "$AEGIS_URL/api/admin/infra-alert-routing"
@@ -1514,9 +1525,46 @@ it is env-only (`AEGIS_BOOKS_PATH`), because it is a container path, not a choic
 |---|---|
 | `books_repo_url` | The books repo, SSH form (`git@github.com:<org>/books.git`). Empty = posting disabled: money mail is still parsed and indexed, never written to a journal |
 | `books_deploy_key` | The private half of an ed25519 deploy key with write access on that repo. Paste the PEM or its base64 |
+| `home_currency` | The ISO code the books report in. hledger converts every balance and check to it, and a posting naming no currency is written in it |
 | `books_ignored_mailboxes` | Comma-separated mailbox labels whose money is not yours (an employer's account, say). Their mail is classified `ignore` |
-| `books_mailbox_entities` | `label=entity,...` where entity is `personal` or `hikmah` — which set of books a mailbox's money belongs to. An unlisted mailbox is `personal` |
-| `books_todoist_projects` | `personal=<project id>,hikmah=<project id>` — where dated dues are captured. Unset = the Inbox |
+| `books_mailbox_entities` | `label=entity,...` — which set of books a mailbox's money belongs to, naming an entity from the chart below. An unlisted mailbox belongs to the default entity |
+| `books_todoist_projects` | `<entity>=<project id>,...` — where dated dues are captured. Unset = the Inbox |
+
+### The chart of accounts
+
+Which sets of books exist, and which category posts to which account, are
+configuration too (#561) — the `settings` row keyed `books_chart`, read on every
+post, so a change needs no restart. Edit it on the admin **Money** page, under
+*Its entities* (`GET/PUT /api/admin/money/chart`); `services/books_chart.py` is
+the only reader and the only writer.
+
+An **entity** is one set of books: an id (which names its journal directory), a
+label, an account-name **segment**, its two **unknown** accounts and its
+category → account map. The segment is what tells an account's entity from its
+name: with a segment of `acme`, `expenses:acme:rent` and `income:acme:fees`
+belong to `acme`. The **default entity** has an empty segment and owns every
+expense and income account no other entity claims. Assets, liabilities and
+equity are entity-neutral by design — every set of books shares the bank
+accounts — which is what lets a cross-entity correction happen at all.
+
+Reading is lenient and writing is strict, deliberately: a malformed row must
+never stop money being posted, but a typo saved with a 200 would misfile
+transactions for months. The PUT 400s on an entity id that is not
+`[a-z0-9_-]{1,32}`, a default entity that is not one of the entities, an account
+name that is not colon-separated lowercase segments, an unknown-IN account
+outside `income:` or an unknown-OUT outside `expenses:`, two entities claiming
+one segment, and a non-default entity with no segment (nothing in an account
+name could point at it). A refused save writes nothing.
+
+Nothing here creates an account. hledger's own `account` declarations are still
+the chart, and `check --strict` refuses a block naming anything they do not
+declare — a category pointed at an undeclared account falls back to the
+entity's unknown account rather than writing it.
+
+A fresh deployment starts on the code default: one entity, `personal`, no
+segment, generic categories. Migration `049_books_chart.sql` seeds an existing
+one with the chart the code used to carry, so the day after the deploy posts
+where the day before did.
 
 The whole money lane, books included, is gated on **Money Hygiene**
 (`money_hygiene_enabled` / `AEGIS_MONEY_HYGIENE_ENABLED`). With that off no money
@@ -1737,7 +1785,7 @@ Raphael researches with five chat tools and one flow (#509).
 | `read_url` | One page's readable text, bounded. Public http(s) hosts only |
 | `paper_search` | arXiv and Semantic Scholar together: title, authors, date, abstract, citation count, and an id for `paper_read`. One engine failing still returns the other's papers |
 | `paper_read` | A paper's text from its PDF, by arXiv id, `s2:<id>` or PDF URL |
-| `research_topic` | Hands the question to `ResearchFlow` and waits up to 45s for the answer |
+| `research_topic` | Hands the question to `ResearchFlow` and waits `wait_seconds` (45 by default) for the answer |
 
 The four reads fetch and return; nothing is stored. They are on the MCP gated
 endpoint's read-only list, and they stay there: fetching is not writing.
@@ -1756,9 +1804,11 @@ the same question again replaces the old answer. Only a real answer is saved: a
 run whose synthesis failed says so and stores nothing.
 
 - **From chat**, the run's id is `research-<hash of the question>`, so a retried
-  turn re-attaches to the run in flight. Past 45s the tool answers "still
-  researching", and the flow posts the answer to the agent's channel when it
-  lands.
+  turn re-attaches to the run in flight. Past `wait_seconds` the tool answers
+  "still researching", and the flow posts the answer to the agent's channel
+  when it lands. The run belongs to the calling agent, else to whoever holds
+  the `research` capability tag; with no such agent the answer is still made
+  and nobody's channel gets the late copy.
 - **A `#research` task** assigned to an agent goes to the `research` verb
   (`agent_task_verbs`): the task gets a hub problem (`ensure_problem_for_task`,
   as a `@code` task does), the answer is posted as one comment with its numbered
@@ -1777,6 +1827,39 @@ UPDATE agents
  WHERE id = 'raphael'
    AND NOT (metadata->'tool_set' ? 'web_search');
 ```
+
+### Configuring the lane (Admin → Research)
+
+Nothing about one person or one installation is in the code: the lane's
+knobs are `settings` rows, each merged over code defaults that equal the old
+constants, edited on **Admin → Research** (`routes/research_admin.py`,
+`GET/PUT /api/admin/research/*`). Every PUT validates and answers 400 with a
+reason; the generic `/api/settings` editor validates nothing, so use the page.
+
+| Row | Page card | What it holds | Defaults |
+|---|---|---|---|
+| `intelligence_topics` | Tracked topics | The registry the scans and the feed gate read, edited whole under the same advisory lock `track_topic` takes; each topic may carry its own `threshold` | (empty) |
+| `research_topics_config` | Topic thresholds | `attention` per priority, `digest_items` | high 2, medium 3, low 5; 10 |
+| `feeds_config` | Feed health | `failing_after`, `recovered_after`, `stale_after_days`, `unused_after_days`, `stale_review_hour`, `default_ingest` | 3, 2, 30, 90, 3, `full` |
+| `research_config` | Research limits | `wait_seconds`, per-depth `pages`/`web_results`/`papers`, `page_chars`, `report_chars`, `knowledge_hits`, `note_hits`, `academic_terms` | 45; quick 3/8/5, thorough 6/15/10; 6000; 8000; 5; 3; the paper words |
+| `library_config` | Library limits | `read_chars`, `passages`, `passage_chars`, `pdf_default_pages`, `research_book_hits`, `research_passage_min_similarity`, `research_passage_chars`, `research_pdf_scan_pages`, `stopwords` | 12000, 4, 1200, 5, 3, 0.5, 3000, 60, the list |
+
+Core sees a save within 30 s (`services/config_rows.py` caches each row that
+long); the worker reads `feeds_config` through the `load_feeds_config`
+activity at the start of every `RssIngestFlow` run and the others on each
+activity call. Three more things moved to the Integrations page:
+`semantic_scholar_api_key` (sent as `x-api-key`; blank is the public tier),
+`bot_contact_url` (named in the `AegisBot/2.0 (+url)` User-Agent every fetch
+sends; blank falls back to `aegis_ui_url`) and `elevenlabs_stt_model`. The
+intel scans' searxng query per topic is `query_template` on each scan row's
+`activities.config` (`{topic}` = the term); the seed rows carry the built-in
+queries. The curiosity detectors' thresholds are on the `curiosity-daily` row
+(`min_attendee_events`, `min_project_tasks`, `empty_search_days`,
+`min_empty_searches`, `search_miss_below`). What stays in code, on purpose:
+`url_guard.py`, the fetch size and time caps, the untrusted-text framing, the
+tool schema caps (`_MAX_CHARS_CAP`, 40,000 characters and 30 pages a book
+read), the Calibre read-only and no-redirect rules, and the `#research` /
+`#feeds` tag vocabulary.
 
 Every fetch of a URL that a model chose, a page named or a feed publishes goes
 through `services/url_guard.py`. The first request and every redirect must
@@ -1816,15 +1899,17 @@ prompt actually used. Admin → Channels shows it per feed, and so do
 
 - entries and stored documents in the last 30 days, plus how many were
   abstract only;
-- documents used in the last 30 and 90 days;
+- documents used in the last 30 days and over `unused_after_days` (90 by
+  default; the columns keep their `_90d` names);
 - the last entry, the backlog and consecutive fetch failures.
 
 Chat turns and research runs write the injection log (`source` `chat` and
 `research`). A briefing or a rollup does not log what it reads, so "used" is a
 floor.
 
-On the 1st of each month, Raphael's briefing names the active feeds that have
-90 days of history and no use in that time. The migration backfills history
+On the 1st of each month (`feed_review_day` on the briefing row; 0 = every
+run), Raphael's briefing names the active feeds that have `unused_after_days`
+of history and no use in that time. The migration backfills history
 by host (an arXiv entry lives on arxiv.org). A feed whose links point
 elsewhere, like Hacker News, starts its history at the deploy.
 
@@ -1871,9 +1956,11 @@ or `paper_read`.
 
 ### When a feed breaks
 
-- **Failing:** three fetches in a row that fail (an HTTP error, a response
-  that is not a feed, or a fetch the URL guard refused) are a `feeds` hub
-  finding of class `feed_failing`. The feed itself is fetched through
+- **Failing:** `failing_after` fetches in a row that fail (three by default;
+  an HTTP error, a response that is not a feed, or a fetch the URL guard
+  refused) are a `feeds` hub finding of class `feed_failing`. The numbers in
+  this section are the `feeds_config` row (Admin → Research → Feed health);
+  `stale_after_days` alone can also be set per feed. The feed itself is fetched through
   `url_guard` (every redirect checked, 30 s, 20 MB), and only the bytes go to
   feedparser. The finding records an occurrence when the feed crosses that
   line and once a day at the review hour; the hourly runs in between only keep
@@ -1890,8 +1977,8 @@ or `paper_read`.
   recorded entry, else its first poll (`channels.config.tracking_since`).
   That is `feeds.tracking_since`, the same date the feed stats show.
 - **Recovery:** a stale finding resolves when the feed stores an entry again.
-  A failing one resolves only after two good fetches in a row
-  (`feeds.RECOVERED_AFTER`, counted in `channels.config.fetch_successes`).
+  A failing one resolves only after `recovered_after` good fetches in a row
+  (two by default, counted in `channels.config.fetch_successes`).
   One good fetch, a failure under the threshold, or a run whose feed record
   could not be written keeps the problem open without adding an occurrence
   (`hub_watch.reconcile_findings`, `record: False`). The problem's subject is
@@ -1950,12 +2037,15 @@ bulk text is exactly what not to index.
   (everything the tools and flows share: EPUB chapters and PDF pages, passage
   search, the index row), `services/tools/library.py`, and the worker's
   `CalibreActivities` + `CalibreSyncFlow`.
-- **Never the public host.** `calibre.hikmahtech.in` is behind Cloudflare
-  Access: every path, `/opds` included, 302s to a login page — the trap that
-  broke Miniflux (#70). The connector refuses that host and treats any redirect
-  as an error. Use the internal address `http://calibre-web_calibre-web:8083`:
-  aegis-core and the worker both sit on the `traefik_public` overlay with
-  calibre-web.
+- **Never a host behind an SSO login page.** A calibre-web fronted by an
+  identity proxy (Cloudflare Access, Authelia, oauth2-proxy) answers every
+  path, `/opds` included, with a 302 to its login page — the trap that broke
+  Miniflux (#70). No host is named in code: the connector follows no redirect
+  at all, so any 3xx is an error, never a login page parsed as "no books".
+  Point `calibre_url` at the address the stack reaches calibre-web directly
+  (on this deployment `http://calibre-web_calibre-web:8083`, the
+  `traefik_public` overlay both aegis-core and the worker share). There is no
+  default URL: blank means not configured.
 - **Reading:** EPUB is read by chapter (the book's own table of contents names
   them), PDF by page (at most 30 pages a read; a query scans the first 150, or
   the first 60 inside research). MOBI and AZW3 cannot be read. Files over 80 MB
@@ -1972,9 +2062,11 @@ bulk text is exactly what not to index.
 1. In calibre-web (Admin → Users → Add new user), create a user for AEGIS:
    allow **download**; do not allow upload, edit, delete or admin. Basic auth
    and OPDS are on by default.
-2. On AEGIS's Integrations page, group **Calibre (library)**: set the user and
-   password, and leave the URL at the internal default. Core uses the new
-   values at once; restart the worker for `CalibreSyncFlow`.
+2. On AEGIS's Integrations page, group **Calibre (library)**: set the URL
+   (the internal address — there is no default), the user and the password.
+   `calibre_max_book_mb` (80) and `calibre_max_books` (3000) are the caps on
+   a book file and on the catalogue. Core uses the new values at once; restart
+   the worker for `CalibreSyncFlow`.
 3. Grant Raphael the four tools. The DB `tool_set` wins over the seed:
 
    ```sql
@@ -2004,10 +2096,14 @@ card) is two things (#513, spec
   one story arriving by two paths counts once.
 
 A round stays in the hub and Raphael's briefing ("Your topics") until it
-holds enough items: 2 for a `high` topic, 3 for `medium`, 5 for `low`. Then
-it becomes one `#research @raphael @next` task listing the items; later items
-are collapsed comments. Ticking the task off means "seen": the round resolves
-and closes, and the next matching article opens a fresh one.
+holds enough items: the topic's own `threshold`, else its priority's number
+in `research_topics_config` (2 for `high`, 3 for `medium`, 5 for `low` by
+default — Admin → Research → Topic thresholds). Then it becomes one
+`#research @raphael @next` task listing the items (`digest_items`, 10); later
+items are collapsed comments. Ticking the task off means "seen": the round
+resolves and closes, and the next matching article opens a fresh one. The
+whole registry can be edited on Admin → Research → Tracked topics, which
+writes under the same lock `track_topic` takes.
 
 Feed findings (`feed_failing`, `feed_stale`) are Raphael's too, as
 `#feeds @raphael @next` tasks. The agent sweep never works them; you fix or

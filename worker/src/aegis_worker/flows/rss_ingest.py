@@ -8,11 +8,15 @@ Since #511/#512 each run also:
   names a topic term, abstract otherwise);
 * records every entry it stored or failed in `feed_entries`, so a feed's worth
   can be measured, and each fetch's outcome in the channel's config;
-* reports a feed that failed `feeds.FAILING_AFTER` fetches in a row (every
-  run) or stored nothing for `stale_after_days` (once a day) to the problem
-  hub as a `feeds` finding. A failing feed's finding resolves after
-  `feeds.RECOVERED_AFTER` good fetches in a row; a stale one when the feed
-  stores an entry again.
+* reports a feed that failed `failing_after` fetches in a row (every run) or
+  stored nothing for `stale_after_days` (once a day) to the problem hub as a
+  `feeds` finding. A failing feed's finding resolves after `recovered_after`
+  good fetches in a row; a stale one when the feed stores an entry again.
+
+The thresholds are the `feeds_config` settings row (`services/feeds_config.py`,
+Admin → Research → Feed health), read through the `load_feeds_config`
+activity at the start of every run; a failed read runs on the code defaults
+and says so.
 """
 
 from __future__ import annotations
@@ -23,7 +27,7 @@ from datetime import UTC, datetime, timedelta
 from temporalio import workflow
 
 with workflow.unsafe.imports_passed_through():
-    from aegis.services import feeds
+    from aegis.services import feeds, feeds_config
 
     from aegis_worker.activities.rss import (
         FetchFeedInput,
@@ -40,10 +44,6 @@ _HUB_TIMEOUT = timedelta(seconds=120)
 
 # Attaching can raise a topic's task, which is a Todoist round trip.
 _TOPICS_TIMEOUT = timedelta(seconds=120)
-# The UTC hour whose run reconciles the stale findings. Staleness is measured
-# in days, so once a day is enough, and it keeps the hub from recording 24
-# occurrences a day of a feed that is merely quiet.
-_STALE_REVIEW_HOUR = 3
 # Statuses of process_content / store_feed_abstract that settle an entry
 # without storing it: an empty extraction, a URL the store already had, content
 # extraction switched off, a link off the public internet (refused for good).
@@ -62,7 +62,12 @@ def _parse_stamp(value: str | None) -> datetime | None:
 
 
 def _stale_finding(
-    now: datetime, identifier: str, config: dict, label: str, run: dict
+    now: datetime,
+    identifier: str,
+    config: dict,
+    label: str,
+    run: dict,
+    default_days: int | None = None,
 ) -> dict | None:
     """A `feed_stale` finding when the last entry the store kept for the feed
     is older than its limit.
@@ -81,7 +86,7 @@ def _stale_finding(
         last = _parse_stamp(run.get("tracking_since"))
     if last is None:
         return None
-    limit = feeds.stale_after_days(config)
+    limit = feeds.stale_after_days(config, default_days)
     if (now - last).days < limit:
         return None
     title = (
@@ -112,29 +117,39 @@ def _held(klass: str, identifier: str, label: str) -> dict:
 
 
 def _after_good_fetch(
-    now: datetime, identifier: str, config: dict, label: str, run: dict | None
+    now: datetime,
+    identifier: str,
+    config: dict,
+    label: str,
+    run: dict | None,
+    cfg: dict | None = None,
 ) -> tuple[list[dict], dict | None]:
     """What a fetch that worked leaves: `(held findings, stale finding)`.
 
-    One good fetch does not end a failure: until `feeds.RECOVERED_AFTER` in a
-    row, the feed's `feed_failing` problem is kept open, so a feed that fails
-    every other hour is one problem rather than one opened and resolved all
-    day. And a record that could not be written says nothing about the feed
-    either way, so both its findings are kept as they are."""
+    One good fetch does not end a failure: until `recovered_after` in a row
+    (`feeds_config`), the feed's `feed_failing` problem is kept open, so a feed
+    that fails every other hour is one problem rather than one opened and
+    resolved all day. And a record that could not be written says nothing
+    about the feed either way, so both its findings are kept as they are."""
+    cfg = cfg or feeds_config.merge(None)
     if run is None:
         return [_held("feed_failing", identifier, label), _held("feed_stale", identifier, label)], None
     held = []
-    if int(run.get("fetch_successes") or 0) < feeds.RECOVERED_AFTER:
+    if int(run.get("fetch_successes") or 0) < int(cfg["recovered_after"]):
         held.append(_held("feed_failing", identifier, label))
-    return held, _stale_finding(now, identifier, config, label, run)
+    return held, _stale_finding(now, identifier, config, label, run, int(cfg["stale_after_days"]))
 
 
 @dataclass
 class RssIngestInput:
-    agent_id: str = "raphael"
+    # The scheduled row's agent; "" (a hand-started run) records no agent.
+    agent_id: str = ""
     # The UTC hour whose run reconciles the stale findings; negative = every
-    # run (tests and a manual trigger). Scheduled runs use the default.
-    stale_review_hour: int = _STALE_REVIEW_HOUR
+    # run (tests and a manual trigger); None = the `feeds_config` row's
+    # `stale_review_hour`. Staleness is measured in days, so once a day is
+    # enough, and it keeps the hub from recording 24 occurrences a day of a
+    # feed that is merely quiet.
+    stale_review_hour: int | None = None
 
 
 @workflow.defn(name="RssIngestFlow")
@@ -148,6 +163,19 @@ class RssIngestFlow:
             retry_policy=ACT_RETRY,
         )
         notes: dict = {}
+        # The deployment's thresholds (`feeds_config`). A failed read runs on
+        # the code defaults, which are what the row's defaults are too.
+        cfg = feeds_config.merge(None)
+        try:
+            loaded = await workflow.execute_activity(
+                "load_feeds_config",
+                start_to_close_timeout=_ACT_TIMEOUT,
+                retry_policy=RETRY_ONCE,
+            )
+            cfg = feeds_config.merge(loaded)
+        except Exception as exc:
+            workflow.logger.warning("rss_feeds_config_degraded err=%s", str(exc)[:200])
+            notes["feeds_config_degraded"] = True
         pattern = None
         try:
             terms = await workflow.execute_activity(
@@ -179,14 +207,20 @@ class RssIngestFlow:
         # run when it is negative — tests and a manual trigger). Stale feeds
         # are reconciled then, and a feed that is still failing records its
         # daily occurrence then.
-        review = input.stale_review_hour < 0 or now.hour == input.stale_review_hour
+        review_hour = (
+            input.stale_review_hour
+            if input.stale_review_hour is not None
+            else int(cfg["stale_review_hour"])
+        )
+        review = review_hour < 0 or now.hour == review_hour
+        failing_after = int(cfg["failing_after"])
 
         for ch in channels:
             identifier = ch["identifier"]
             config = ch.get("config") or {}
             since = config.get("last_cursor")
             label = feeds.feed_label(identifier, config)
-            mode = feeds.ingest_mode(config)
+            mode = feeds.ingest_mode(config, cfg["default_ingest"])
 
             fetch_error = ""
             result: FetchFeedResult | None = None
@@ -220,7 +254,7 @@ class RssIngestFlow:
                     continue
                 failures = int(run.get("fetch_failures") or 0)
                 per_feed[-1]["fetch_failures"] = failures
-                if failures >= feeds.FAILING_AFTER:
+                if failures >= failing_after:
                     failing.append(
                         {
                             "klass": "feed_failing",
@@ -237,15 +271,17 @@ class RssIngestFlow:
                             # keeps the problem open. Hourly occurrences
                             # posted "N more occurrences" on the task 24
                             # times a day for one dead feed.
-                            "record": failures == feeds.FAILING_AFTER or review,
+                            "record": failures == failing_after or review,
                         }
                     )
                 else:
                     # Under the threshold a failure opens nothing, but it never
                     # resolves a failing feed either: that takes good fetches
-                    # (`feeds.RECOVERED_AFTER` in a row).
+                    # (`recovered_after` in a row).
                     held.append(_held("feed_failing", identifier, label))
-                finding = _stale_finding(now, identifier, config, label, run)
+                finding = _stale_finding(
+                    now, identifier, config, label, run, int(cfg["stale_after_days"])
+                )
                 if finding:
                     stale.append(finding)
                 continue
@@ -253,7 +289,7 @@ class RssIngestFlow:
             if not result.entries:
                 per_feed.append({"feed": identifier, "entries": 0})
                 run = await self._record_run(ch, {"ok": True, "backlog": 0})
-                kept, finding = _after_good_fetch(now, identifier, config, label, run)
+                kept, finding = _after_good_fetch(now, identifier, config, label, run, cfg)
                 held += kept
                 if finding:
                     stale.append(finding)
@@ -523,7 +559,7 @@ class RssIngestFlow:
             # After `record_feed_entries`, so this run's stored entries count
             # towards the feed's last stored one.
             run = await self._record_run(ch, {"ok": True, "backlog": available - len(entries)})
-            kept, finding = _after_good_fetch(now, identifier, config, label, run)
+            kept, finding = _after_good_fetch(now, identifier, config, label, run, cfg)
             held += kept
             if finding:
                 stale.append(finding)

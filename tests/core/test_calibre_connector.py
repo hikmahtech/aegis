@@ -111,9 +111,38 @@ def test_a_login_page_is_not_a_feed():
         parse_feed("not xml at all")
 
 
-def test_the_public_host_is_refused():
-    with pytest.raises(ValueError, match="Cloudflare Access"):
-        CalibreConnector("https://calibre.hikmahtech.in", "u", "p")
+def test_a_url_that_is_not_an_http_address_is_refused():
+    """No host list any more: any host is allowed, and an SSO-fronted one is
+    caught by the no-redirect rule below. What the constructor refuses is a
+    URL it could not call at all — blank, or not http(s)."""
+    for bad in ("", "calibre-web:8083", "ftp://calibre-web:8083"):
+        with pytest.raises(ValueError, match="http"):
+            CalibreConnector(bad, "u", "p")
+    assert CalibreConnector("https://calibre.public.example/", "u", "p").base_url == (
+        "https://calibre.public.example"
+    )
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_an_sso_login_redirect_on_any_host_is_an_error_not_a_login_page_parsed():
+    """The trap #70 fell into, with no host named in code: a proxy such as
+    Cloudflare Access answers `/opds/new` with a 302 to its login page. It is
+    reported, never followed — so the login page is never parsed as "no
+    books" — for whatever host the URL names."""
+    respx.get("https://calibre.sso.example/opds/new").mock(
+        return_value=httpx.Response(
+            302, headers={"location": "https://sso.example/cdn-cgi/access/login/calibre"}
+        )
+    )
+    login = respx.get(url__startswith="https://sso.example").mock(
+        return_value=httpx.Response(200, text="<html>Sign in</html>")
+    )
+    conn = CalibreConnector("https://calibre.sso.example", "u", "p")
+    with pytest.raises(CalibreError, match="SSO login page"):
+        await conn.catalog()
+    assert not login.called
+    await conn.close()
 
 
 @pytest.mark.asyncio
@@ -193,9 +222,10 @@ async def test_download_returns_the_file_and_respects_the_cap(monkeypatch):
     with pytest.raises(CalibreError, match="no MOBI"):
         await conn.download(books[0], "mobi")
 
-    import aegis.connectors.calibre as mod
-
-    monkeypatch.setattr(mod, "MAX_DOWNLOAD_BYTES", 10)
+    await conn.close()
+    # The cap is per connector (`calibre_max_book_mb` on Integrations).
+    conn = _conn(max_download_bytes=10)
     with pytest.raises(CalibreError, match="read limit"):
         await conn.download(books[0], "epub")  # the length attribute (1000) is already over
+    await conn.close()
     await conn.close()

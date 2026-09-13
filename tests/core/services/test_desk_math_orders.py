@@ -141,11 +141,13 @@ def test_no_market_day_yet_stays_pending():
     assert r.status == "pending"
 
 
-def test_sells_fill_first_and_a_buy_is_cut_to_the_cash_left():
+def test_sells_fill_first_and_a_buy_is_cut_to_the_cash_left(seeded_desk_rules):
+    """The seeded example's flat sell charge is part of this: 10 x 100 x 0.2%
+    plus 16 is 18, and that is what the buy then cannot spend."""
     book = held("X", 10, 100.0, cash=1000.0)
     bars = {"X": [Bar(date(2026, 9, 14), 100.0)], "Y": [Bar(date(2026, 9, 14), 100.0)]}
     pending = [p("buy", "Y", "buy", 20, seq=1), p("sell", "X", "sell", 10, seq=0)]
-    res = {r.order_id: r for r in fill_orders(pending, bars, DAYS, book, Rules())}
+    res = {r.order_id: r for r in fill_orders(pending, bars, DAYS, book, seeded_desk_rules)}
     assert res["sell"].costs == pytest.approx(18.0)
     assert (res["buy"].status, res["buy"].qty) == ("filled", 19)
 

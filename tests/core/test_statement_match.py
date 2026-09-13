@@ -103,8 +103,14 @@ def make_candidate(
     )
 
 
+#: The books' home currency. `match_statements` takes it as a required argument
+#: (the statements in scope print it), so the tests name it once here.
+HOME_CURRENCY = "INR"
+
+
 def run(rows, candidates, **kw):
     kw.setdefault("declared", DECLARED)
+    kw.setdefault("currency", HOME_CURRENCY)
     return match_statements(rows, candidates, **kw)
 
 
@@ -208,7 +214,7 @@ def test_instruments_are_compared_through_canonical_instrument_on_both_sides():
     assert only(run([row], [candidate])).matched_pass == PASS_WINDOW
     # …and it is the chart that says so. With no chart to hand, the two
     # spellings are two different accounts and must not be merged.
-    assert only(match_statements([row], [candidate], declared=())).matched_pass is None
+    assert only(match_statements([row], [candidate], declared=(), currency=HOME_CURRENCY)).matched_pass is None
 
 
 @pytest.mark.parametrize(

@@ -191,3 +191,52 @@ async def test_the_daily_run_never_resolves_the_monthly_problem(pool):
 
     await td.run_tick(pool, ansaar=None, finance=YahooDown(), today=date(2026, 9, 14), project=False)
     assert "desk_below_expectation" in await open_classes(pool)
+
+
+# --- idle weekdays (#525) ----------------------------------------------------
+
+# 2026-09-04 (Friday) and 2026-09-10 (Thursday) are the two weekdays the
+# calendar never gave. Two, not one: a month with a single gap passes for the
+# wrong reason.
+SEPT_DAYS = [date(2026, 9, d) for d in (1, 2, 3, 7, 8, 9, 11, 14)]
+
+
+async def a_month_of(pool, days):
+    for day in days:
+        await price(pool, "^NSEI", day, 25_000.0)
+        await price(pool, "SHARIABEES.NS", day, 400.0)
+        await price(pool, "TCS.NS", day, 1000.0)
+    await fill(pool, min(days), "buy", 10, 1000.0, 20.0)
+
+
+async def test_idle_weekdays_are_counted_so_a_run_of_them_is_visible(pool):
+    """A weekday the market's own calendar has no bar for. The desk cannot tell
+    a holiday from a day the price source dropped, so it counts both — one is
+    normal, and a run of them means the desk has been quietly doing nothing
+    while the six-day stale alarm says nothing for a week (#525)."""
+    await a_month_of(pool, SEPT_DAYS)
+
+    s = await td.month_summary(pool, SEP, OCT, today=date(2026, 9, 15))
+
+    assert s["idle_weekdays"] == 2
+
+
+async def test_a_calendar_with_no_gaps_counts_none(pool):
+    """The half that matters: a count that always fired would say nothing."""
+    await a_month_of(pool, [*SEPT_DAYS, date(2026, 9, 4), date(2026, 9, 10)])
+
+    s = await td.month_summary(pool, SEP, OCT, today=date(2026, 9, 15))
+
+    assert s["idle_weekdays"] == 0
+
+
+async def test_days_that_have_not_happened_yet_are_not_idle(pool):
+    """The admin page asks for the month that is still running, so the count
+    stops at yesterday rather than calling the rest of the month idle."""
+    await a_month_of(pool, SEPT_DAYS)
+
+    mid_month = await td.month_summary(pool, SEP, OCT, today=date(2026, 9, 15))
+    after = await td.month_summary(pool, SEP, OCT, today=date(2026, 10, 1))
+
+    assert mid_month["idle_weekdays"] == 2
+    assert after["idle_weekdays"] > mid_month["idle_weekdays"]

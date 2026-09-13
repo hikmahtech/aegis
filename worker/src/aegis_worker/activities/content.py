@@ -26,6 +26,7 @@ from aegis.services.content_extract import (
     fetch_youtube_transcript,
 )
 from aegis.services.url_guard import UnsafeURLError, guarded_hooks
+from aegis.services.user_agent import bot_user_agent
 from temporalio import activity
 
 logger = structlog.get_logger()
@@ -105,7 +106,11 @@ def detect_content_type(url: str) -> str:
 # --- Constants ---
 
 _MIN_CONTENT_LENGTH = 200
-_USER_AGENT = "Mozilla/5.0 (compatible; AegisBot/2.0; +https://aegis.example.com)"
+# The User-Agent media downloads send. `ContentActivities.user_agent` (set in
+# __main__ from `services/user_agent.bot_user_agent`, which names the
+# deployment's own contact URL) is what a real worker uses; this is the
+# contact-less fallback for direct construction.
+_USER_AGENT = bot_user_agent()
 
 
 @dataclass
@@ -146,10 +151,11 @@ async def _download_file(
     max_bytes: int,
     suffix: str,
     extra_headers: dict[str, str] | None = None,
+    user_agent: str = "",
 ) -> str | None:
     """Download URL to temp file. Returns temp path or None on failure."""
     try:
-        headers = {"User-Agent": _USER_AGENT}
+        headers = {"User-Agent": user_agent or _USER_AGENT}
         if extra_headers:
             headers.update(extra_headers)
         async with client.stream(
@@ -184,7 +190,7 @@ _ELEVENLABS_STT_URL = "https://api.elevenlabs.io/v1/speech-to-text"
 
 
 async def _transcribe_media(
-    url: str, elevenlabs_api_key: str = "", stt_model: str = "scribe_v1"
+    url: str, elevenlabs_api_key: str = "", stt_model: str = "scribe_v1", user_agent: str = ""
 ) -> ContentResult | None:
     """Transcribe media. YouTube captions first, then ElevenLabs Scribe fallback."""
     if extract_youtube_id(url):
@@ -200,13 +206,13 @@ async def _transcribe_media(
 
     # ElevenLabs Scribe fallback (empty key = kill switch)
     if elevenlabs_api_key:
-        return await _transcribe_via_elevenlabs(url, elevenlabs_api_key, stt_model)
+        return await _transcribe_via_elevenlabs(url, elevenlabs_api_key, stt_model, user_agent)
 
     return None
 
 
 async def _transcribe_via_elevenlabs(
-    url: str, api_key: str, stt_model: str = "scribe_v1"
+    url: str, api_key: str, stt_model: str = "scribe_v1", user_agent: str = ""
 ) -> ContentResult | None:
     """Transcribe audio/video via ElevenLabs Scribe (https://api.elevenlabs.io).
 
@@ -215,7 +221,9 @@ async def _transcribe_via_elevenlabs(
     redirect must stay on the public internet. The upload goes to ElevenLabs'
     own fixed endpoint."""
     async with httpx.AsyncClient(event_hooks=guarded_hooks()) as client:
-        path = await _download_file(client, url, _MAX_MEDIA_BYTES, ".media")
+        path = await _download_file(
+            client, url, _MAX_MEDIA_BYTES, ".media", user_agent=user_agent
+        )
         if not path:
             return None
 
@@ -275,6 +283,9 @@ class ContentActivities:
     elevenlabs_api_key: str = ""
     elevenlabs_stt_model: str = "scribe_v1"
     raindrop_api_token: str = ""
+    # The User-Agent media downloads send; __main__ builds it with the
+    # deployment's contact URL (`bot_user_agent(settings)`).
+    user_agent: str = ""
 
     def _auth_headers_for(self, url: str) -> dict[str, str]:
         """Return extra auth headers needed to download from this URL."""
@@ -367,7 +378,7 @@ class ContentActivities:
         try:
             if content_type == "media":
                 result = await _transcribe_media(
-                    url, self.elevenlabs_api_key, self.elevenlabs_stt_model
+                    url, self.elevenlabs_api_key, self.elevenlabs_stt_model, self.user_agent
                 )
                 if not result or len(result.text) < _MIN_CONTENT_LENGTH:
                     await self._record(url, content_type, "empty", t0)

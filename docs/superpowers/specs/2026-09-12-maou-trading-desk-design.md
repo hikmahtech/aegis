@@ -199,7 +199,10 @@ the day out of the `held_back` count, which is for days the desk did nothing on.
 
 ## 8. The score
 
-- **Start:** the first fill date. Paper capital is `capital` (default ₹1,00,000).
+- **Start:** the first fill date. Paper capital is `capital` (default ₹1,00,000), and it is fixed
+  from the first fill: `replay` starts the book from it on every past day, so an edit afterwards
+  would restate the whole history. `desk_rules.save` refuses one, with a reason. A deposits
+  table, where a change is an event, is the proper answer and is the live spec's job (#526).
 - **Benchmark:** `SHARIABEES.NS` (the Nifty 50 Shariah ETF), the fair comparison for a halal
   investor. It's bought with the same capital at the start close and pays one buy cost. From then
   on it's held the way the desk holds: its splits adjust the units, and its dividends are paid as
@@ -211,6 +214,12 @@ the day out of the `held_back` count, which is for days the desk did nothing on.
   `benchmark_prices` in the rules (§12). An unmapped benchmark gets no fallback, as before. The
   index is never backfilled — its bars are the market calendar, and the desk takes that from one
   source only.
+- **A benchmark that stops being priced is a finding, not a silence.** No close for
+  `PRICE_GRACE_DAYS` market days raises `desk_price_missing` for it, exactly as it does for a
+  holding, same class and same subject shape so the daily run's own reconcile clears it when the
+  price comes back. Without it `benchmark_values` returns an empty series, the weekly gap has
+  nothing to compare, the label reads "too early" for ever and the rendered figure is blank: the
+  score quietly stops meaning anything (#524).
 - **No adjusted closes anywhere.** Yahoo rescales its adjusted close after every later dividend,
   so a value stored in September and one fetched in December are in different scales, and their
   ratio is wrong by the dividend.
@@ -275,6 +284,7 @@ The monthly check reads this one.
 Holding (paper) 9 names, 12% cash: TCS, INFY, HCLTECH, GOLDBEES, ...
 This month: 23 orders, ₹612 in costs.
 Days held back: 2 (1 stale, 1 suspect). Prices from ansaar: 1.
+Idle weekdays: 3 — no new market day to act on (a market holiday, or a day the price source did not serve).
 Risk halt on 22 Nov: the desk sold its whole book. DAILY_LOSS fired on 19 Nov.
 Check: XYZ moved −51% on 3 Nov. Possible missing split.
 ```
@@ -293,7 +303,7 @@ map in `hub_project`). A problem resolves itself on the first run that no longer
 | `desk_decisions_stale` | `decisions` | the daily run |
 | `desk_decisions_suspect` | `decisions` | the daily run |
 | `desk_source_error` | `ansaar` or `yahoo` | the daily run |
-| `desk_price_missing` | the symbol | the daily run |
+| `desk_price_missing` | the symbol, of a holding **or a benchmark** | the daily run |
 | `desk_below_expectation` | `desk` | the monthly close only, so while it holds it comes back once a month, not every day |
 
 ## 11. Data
@@ -385,18 +395,36 @@ Integrations page, with matching `Settings` fields defaulting to empty:
 activity and by the monthly close. It is not passed through the workflow input, because
 `trigger_workflow` ignores activity config.
 
+**The code names no market.** AEGIS is forked and configured for someone else's life, so the
+exchange calendar, the clock, the ticker shape, the currency, the financial year and the tax rates
+are all settings, exactly as `email_triage_rules` and `project_repo_map` ship empty rather than
+carrying one operator's senders and repos. `desk_math.Rules`'s defaults are neutral; what follows
+is the SEEDED EXAMPLE (`config/seed/activities.yaml`), one operator's desk on the NSE.
+
 ```yaml
 mode: paper               # 'live' is refused until the live spec lands
+# the market -- what only the operator can know
+calendar_symbol: ^NSEI    # whose bars ARE the trading calendar; REQUIRED
+market_tz: Asia/Kolkata   # the clock "today" is read from
+symbol_suffix: .NS        # what the price source appends per exchange; US listings need none
+currency: INR             # the ISO code every figure on this desk is in
+fy_start_month: 4         # 1 is the calendar year; 4 is April-to-March
+stale_calendar_days: 6    # days before the trading calendar itself looks wrong
+stale_price_days: 7       # days before a price is too old to size or sell on
+# the money
 capital: 100000
 asset_classes: [equity, etf]
 cost_pct_per_side: 0.002
-sell_charge_inr: 16
+sell_charge: 16           # was sell_charge_inr
 band_abs: 0.02
 band_rel: 0.25
 max_order_pct: 0.25
+# the tax model
 tax_rate: {equity: 0.20, etf: 0.30}
-ltcg_rate: 0.125
-ltcg_exemption_inr: 125000
+long_term_rate: 0.125                   # was ltcg_rate
+long_term_exemption: 125000             # was ltcg_exemption_inr
+long_term_exemption_classes: [equity]   # was `asset_class == "equity"` in the code
+# the score
 benchmark: SHARIABEES.NS
 context_benchmark: ^NSEI
 benchmark_prices:            # where a benchmark's prices can also come from
@@ -404,16 +432,46 @@ benchmark_prices:            # where a benchmark's prices can also come from
 expected_excess_pa: 0.06
 ```
 
+| Code default | Why it is neutral |
+|---|---|
+| `calendar_symbol: ""` | The desk cannot tell a market day from a holiday without it, so it does nothing. |
+| `market_tz: UTC` | An unknown zone name falls back to UTC at read time; the write path 400s on it. |
+| `symbol_suffix: ""` | The symbol is already in the price source's form — which is true for US listings. |
+| `currency: ""` | `fmt_money` prints grouped digits with no symbol. |
+| `fy_start_month: 1` | The calendar year, which is most countries'. |
+| `tax_rate: {}`, `long_term_*: 0` | No tax model stated means no tax deducted, and the page labels that rather than showing a zero that reads like a result. |
+| `capital: 0`, `expected_excess_pa: 0` | No money and no claim about the backtest. |
+| `benchmark: ""`, `context_benchmark: ""` | The desk still says what it is worth; only the comparison goes missing. |
+| `stale_calendar_days: 6`, `stale_price_days: 7` | Not one market's numbers — a long weekend plus a holiday in any Mon-Fri market. A market with longer normal closures raises the first. |
+
 `benchmark_prices` maps a benchmark's Yahoo name to what ansaar wants. It is empty in the code
 defaults, so a fork ships nobody's tickers, and an entry missing either half is dropped rather than
 half-applied. The seed row carries the mapping for the benchmark it names — but `activities.config`
 is DB-owned after the first insert, so **an existing deployment needs the mapping written to its
 row** (§16).
 
+**Three keys were renamed** to drop a currency from their names: `sell_charge_inr` →`sell_charge`,
+`ltcg_rate` → `long_term_rate`, `ltcg_exemption_inr` → `long_term_exemption`. `Rules.from_config`
+reads BOTH names, newest first, because `schedule_sync` re-reads this row every few minutes and no
+ordering of the deploy and the config write would close the gap. `desk_math.legacy_keys` names what
+is still stored under an old key, which the daily run logs once and the admin page shows. Migration
+048 rewrites a live row: it renames the three keys and fills in the market keys with exactly the
+values the code used to hardcode, so the day after the deploy is arithmetically the same as the day
+before.
+
+**Where it is set:** the admin Trading desk page (`/admin/desk`) has a settings panel over
+`GET/PUT /api/admin/money/desk/rules` (`services/desk_rules.py`) covering the market, the money, the
+tax model and the benchmarks. It is a MERGE, not a replacement: the knobs it does not show keep
+their stored values, and the Flows page still edits the whole row as raw JSON. Reading is lenient
+and writing is strict — a bad timezone or a rate outside 0 to 1 is a 400, because the read path's
+forgiveness is exactly what would hide a typo for months.
+
 **Gates:**
 - The seed row ships `active: false`, so a fork never runs it.
 - The FlowSpec uses `feature_flag="money_hygiene_enabled"`.
 - With `ansaar_url` empty, the activity logs `trading_desk_unconfigured` and does nothing.
+- With `calendar_symbol` empty, `run_tick` logs `trading_desk_unconfigured`, returns
+  `skipped: unconfigured` and does nothing — no finding, no Todoist task, and no fallback market.
 
 ## 13. Code layout
 

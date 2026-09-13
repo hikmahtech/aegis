@@ -1,7 +1,7 @@
-"""Raphael's feed tools (#511): see the feeds, add one, drop one.
+"""The research agent's feed tools (#511): see the feeds, add one, drop one.
 
-The feed list is `channels(kind='rss')` and AEGIS owns it, so "Raphael, stop
-following X" is a chat request rather than an admin-page errand. The logic is
+The feed list is `channels(kind='rss')` and AEGIS owns it, so "stop following
+X" is a chat request rather than an admin-page errand. The logic is
 `services/feeds.py`, shared with the admin route and the worker.
 """
 
@@ -14,6 +14,7 @@ import asyncpg
 from aegis.services import feeds
 from aegis.services.tools.base import ToolContext
 from aegis.services.tools.registry import aegis_tool
+from aegis.services.user_agent import bot_user_agent
 
 # What `list_feeds` shows per feed. The admin page shows the rest.
 _LIST_KEYS = (
@@ -35,7 +36,7 @@ _LIST_KEYS = (
 
 @aegis_tool
 async def _exec_list_feeds(pool: asyncpg.Pool, ctx: ToolContext) -> str:
-    """List the RSS feeds Raphael follows and what each is worth: entries and stored documents in the last 30 days, how many of its documents a prompt used in the last 30 and 90 days, its ingest mode, its last entry and any fetch failures."""
+    """List the RSS feeds the research agent follows and what each is worth: entries and stored documents in the last 30 days, how many of its documents a prompt used in the last 30 and 90 days, its ingest mode, its last entry and any fetch failures."""
     rows = await feeds.feed_stats(pool)
     return json.dumps(
         {
@@ -60,7 +61,7 @@ async def _exec_follow_feed(
         label: A short name for the feed. Defaults to the feed's own title.
     """
     return json.dumps(
-        await feeds.subscribe(pool, url, label=label, agent_id=ctx.agent_id or None)
+        await feeds.subscribe(pool, url, label=label, user_agent=bot_user_agent(ctx.settings))
     )
 
 

@@ -41,13 +41,17 @@ def merge_topics(configured: list[str], tracked: list[str]) -> list[str]:
 
 @dataclass
 class IntelligenceScanInput:
-    agent_id: str = "raphael"
+    # The scheduled row's agent; "" (a hand-started run) records no agent.
+    agent_id: str = ""
     source: str = "hn"  # hn | news | finance
     topics: list[str] = field(default_factory=list)
     max_results: int = 20
     # schedule_sync always passes config's threshold; this default is the
     # fallback for direct/admin-trigger construction.
     significance_threshold: int = 5
+    # The searxng query per topic (`{topic}` is the term), from the row's
+    # `activities.config.query_template`; "" = the source's built-in query.
+    query_template: str = ""
 
 
 @workflow.defn(name="IntelligenceScanFlow")
@@ -94,6 +98,7 @@ class IntelligenceScanFlow:
                 source=input.source,
                 topics=topics,
                 max_results=input.max_results,
+                query_template=input.query_template,
             ),
             result_type=SearchSourceResult,
             start_to_close_timeout=_SCAN_TIMEOUT,

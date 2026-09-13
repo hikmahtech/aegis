@@ -424,15 +424,19 @@ def test_books_write_flow_is_gated_on_money_hygiene():
         # on the existing HubActivities, a HubSweepFlow step that resolves a
         # problem whose alert alertmanager no longer lists. Unflagged, so all
         # three rows move.
+        # Then +1 activity and NO new flow from the research-lane config work:
+        # `load_feeds_config` on the existing RssActivities (the `feeds_config`
+        # row, read for RssIngestFlow because a workflow cannot hit the DB).
+        # Unflagged, so all three rows move.
         # Then +2 activities and NO new flow from the vault-layout audit:
         # `vault_week_rule` on the existing DayLogActivities, the week rule the
         # weekly rollup reads so its window and the weekly note agree, and
         # `daylog_local_day`, the run's clock on the user's timezone (the day
         # logged is the last complete local one). Unflagged, so all three
         # rows move.
-        (True, True, 51, 251),
-        (False, False, 40, 216),
-        (True, False, 44, 233),
+        (True, True, 51, 252),
+        (False, False, 40, 217),
+        (True, False, 44, 234),
     ],
 )
 def test_real_registration_passes_the_boot_check(homelab, money, flows, activities):

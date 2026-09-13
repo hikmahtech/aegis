@@ -139,3 +139,104 @@ async def test_a_problem_a_person_is_working_is_still_resolved(db_pool):
 
     assert pid in [r["problem_id"] for r in out["resolved"]]
     assert (await get_problem(db_pool, pid))["status"] == "resolved"
+
+
+async def test_a_recurring_alert_gets_a_new_fingerprint_and_is_not_resolved(db_pool):
+    """The defect that reached production (#561).
+
+    An alertmanager fingerprint is a hash of the label set, so the same
+    recurring fault arrives under a NEW fingerprint each time — one prod problem
+    had 26 distinct fingerprints across 27 occurrences. Judging the problem on
+    its FIRST occurrence compares against a hash that can never be active again,
+    so the problem was resolved within a minute of every legitimate reopen, for
+    ever. The Dagster pipeline failure this was found on was closed twice in 35
+    minutes, the second time one minute after a real new failure reopened it.
+
+    Falsifiable: go back to the first occurrence's fingerprint and this resolves
+    a problem whose alert alertmanager is actively listing.
+    """
+    old_fp, new_fp = _fp(), _fp()
+    subject = f"host_{uuid.uuid4().hex[:8]}"
+    first = NOW - timedelta(days=4)
+    # Same problem, two episodes, different label sets.
+    for fingerprint, at in ((old_fp, first), (new_fp, NOW - timedelta(hours=1))):
+        result = await ingest_event(
+            db_pool,
+            Event(
+                source="alertmanager",
+                external_id=f"{fingerprint}@{at.isoformat()}",
+                kind="occurrence",
+                title=f"dagster-pipeline-failure on {subject}",
+                klass="dagster-pipeline-failure",
+                subject=subject,
+                subject_kind="service",
+                severity="critical",
+                occurred_at=at,
+            ),
+            now=at,
+        )
+    pid = result.problem_id
+
+    # Alertmanager lists the CURRENT alert. The stale one is long gone.
+    out = await reconcile_alertmanager(
+        db_pool, active_fingerprints={new_fp}, now=NOW
+    )
+
+    assert pid not in [r["problem_id"] for r in out["resolved"]], (
+        "a problem whose current alert is firing was resolved on a stale fingerprint"
+    )
+    assert (await get_problem(db_pool, pid))["status"] == "open"
+
+    # And when alertmanager lists neither, it does resolve — on the evidence of
+    # every fingerprint, not one of them.
+    out = await reconcile_alertmanager(db_pool, active_fingerprints=set(), now=NOW)
+    resolved = [r for r in out["resolved"] if r["problem_id"] == pid]
+    assert resolved and resolved[0]["fingerprints_checked"] == 2
+
+
+async def test_a_problem_that_fired_seconds_ago_is_not_resolved(db_pool):
+    """The second half of the same defect: the grace period bounded
+    `first_seen_at`, so a four-day-old problem with an occurrence thirty seconds
+    ago sailed straight through it. What matters is the LAST occurrence — an
+    alert that just fired is firing now, whatever alertmanager has grouped.
+
+    Falsifiable: bound `first_seen_at` again and this resolves.
+    """
+    subject = f"host_{uuid.uuid4().hex[:8]}"
+    old = NOW - timedelta(days=4)
+    await ingest_event(
+        db_pool,
+        Event(
+            source="alertmanager",
+            external_id=f"{_fp()}@{old.isoformat()}",
+            kind="occurrence",
+            title=f"clickhousedown on {subject}",
+            klass="clickhousedown",
+            subject=subject,
+            subject_kind="service",
+            severity="critical",
+            occurred_at=old,
+        ),
+        now=old,
+    )
+    just_now = NOW - timedelta(seconds=30)
+    result = await ingest_event(
+        db_pool,
+        Event(
+            source="alertmanager",
+            external_id=f"{_fp()}@{just_now.isoformat()}",
+            kind="occurrence",
+            title=f"clickhousedown on {subject}",
+            klass="clickhousedown",
+            subject=subject,
+            subject_kind="service",
+            severity="critical",
+            occurred_at=just_now,
+        ),
+        now=just_now,
+    )
+
+    out = await reconcile_alertmanager(db_pool, active_fingerprints=set(), now=NOW)
+
+    assert result.problem_id not in [r["problem_id"] for r in out["resolved"]]
+    assert (await get_problem(db_pool, result.problem_id))["status"] == "open"

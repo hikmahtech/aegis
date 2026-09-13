@@ -128,7 +128,7 @@ async def test_track_writes_the_registry_and_opens_a_round_raphael_owns(world):
     assert problem["class"] == "topic" and problem["subject_kind"] == "topic"
     assert problem["metadata"]["topic"] == name
     owner = await hub_project._owner(world, out["problem_id"])
-    assert (owner.source_tag, owner.fallback_label) == ("#research", "@raphael")
+    assert (owner.source_tag, owner.agent_tag) == ("#research", "research")
 
     again = await research_topics.track(world, name.upper(), ["gamma"], now=NOW)
     assert again["status"] == "updated" and again["problem_id"] == out["problem_id"]

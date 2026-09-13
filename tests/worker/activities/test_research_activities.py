@@ -118,7 +118,7 @@ async def test_synthesis_is_recorded_in_llm_calls(db_pool):
     assertion would pass against a row that never landed (#137)."""
     await db_pool.execute("DELETE FROM llm_calls WHERE purpose = 'research_synthesis'")
     llm = StubbedLLMClient(db_pool=db_pool, content="RAG retrieves, then generates [1].")
-    act = ResearchActivities(llm_client=llm, model="stub-model", db_pool=db_pool)
+    act = ResearchActivities(llm_client=llm, model="stub-model", db_pool=db_pool, agent_id="raphael")
     try:
         out = await ActivityEnvironment().run(
             act.research_synthesize, "what is rag", "", _GATHERED, []

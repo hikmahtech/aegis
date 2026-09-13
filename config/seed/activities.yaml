@@ -137,18 +137,45 @@ activities:
     workflow_type: TradingDeskFlow
     agent_id: maou
     schedule_cron: "30 2 * * 1-5"
+    # An EXAMPLE setup, not a default. The code names no market, no currency
+    # and no tax law, because AEGIS is forked and configured; what follows is
+    # one operator's desk (India, the NSE, rupees) so a reader can see the
+    # shape of an answer. Replace it with your own, or leave
+    # `calendar_symbol` empty and the desk does nothing at all.
     config:
       mode: paper
+      # --- the market ---
+      # Whose bars ARE the trading calendar, in Yahoo's naming.
+      calendar_symbol: ^NSEI
+      # The clock "today" is read from.
+      market_tz: Asia/Kolkata
+      # What Yahoo appends to say which exchange: .NS is the NSE. US listings
+      # need none.
+      symbol_suffix: .NS
+      currency: INR
+      # India's financial year runs April to March.
+      fy_start_month: 4
+      # Calendar days before the market calendar itself looks wrong (a long
+      # weekend plus a holiday is 4 to 5), and before a price is too old to
+      # size or sell on.
+      stale_calendar_days: 6
+      stale_price_days: 7
+      # --- the money ---
       capital: 100000
       asset_classes: [equity, etf]
       cost_pct_per_side: 0.002
-      sell_charge_inr: 16
+      sell_charge: 16
       band_abs: 0.02
       band_rel: 0.25
       max_order_pct: 0.25
+      # --- the tax model ---
       tax_rate: {equity: 0.20, etf: 0.30}
-      ltcg_rate: 0.125
-      ltcg_exemption_inr: 125000
+      long_term_rate: 0.125
+      # Section 112A's ₹1.25L covers listed equity and equity-oriented units,
+      # so a gold or silver ETF gets none of it.
+      long_term_exemption: 125000
+      long_term_exemption_classes: [equity]
+      # --- the score ---
       benchmark: SHARIABEES.NS
       context_benchmark: ^NSEI
       # Where a benchmark's prices can also come from when Yahoo has no close
@@ -187,7 +214,10 @@ activities:
   # #research / #email reference closure per the references-as-knowledge
   # spec; per-message chat notifications only fire for user-initiated #chat / #manual
   # sources, so this digest is the only signal the user gets for automated
-  # ingest closure). Cron 04:30 UTC = 10:00 IST.
+  # ingest closure). Cron 04:30 UTC = 10:00 IST. `feed_review_day` (default
+  # 1, the first of the month; 0 = every run) is the day this briefing names
+  # the feeds no prompt has used (#511) — config is DB-owned, tune it on
+  # /admin/flows.
   - slug: daily-briefing-raphael
     workflow_type: DailyBriefingFlow
     agent_id: raphael
@@ -246,7 +276,10 @@ activities:
   # slots that the ingest flows own. The flow gates itself on the notification
   # budget, so this cron is an upper bound, not a promise of a daily card.
   # NOTE: `config` is DB-owned (seed.py only refreshes workflow_type/agent_id) —
-  # on an existing deploy tune max_per_day on /admin/flows, not here.
+  # on an existing deploy tune max_per_day on /admin/flows, not here. The
+  # detector thresholds are config too (their defaults, when unset):
+  # min_attendee_events 3, min_project_tasks 5, empty_search_days 14,
+  # min_empty_searches 2, search_miss_below 0.60.
   - slug: curiosity-daily
     workflow_type: CuriosityCardFlow
     agent_id: sebas
@@ -417,6 +450,13 @@ activities:
   # could only ever describe yesterday's scan. 01:00/01:30/02:00 leaves a >2h
   # margin for the */15 ClarifyFlow tick that turns the #research captures into
   # `source_type='reference'` rows, which the briefing also reads.
+  #
+  # `topics` are EXAMPLES: broad single words that seed a first boot. The
+  # row is DB-owned after that, so set your own on /admin/flows. Tracked
+  # topics (`track_topic`) are searched too, without being listed here.
+  # `query_template` is the searxng query per topic (`{topic}` = the term);
+  # these are the built-in queries spelled out, and a blank one falls back to
+  # them (`intel_scan.DEFAULT_QUERY_TEMPLATES`).
   - slug: intel-scan-hn
     workflow_type: IntelligenceScanFlow
     agent_id: raphael
@@ -425,6 +465,7 @@ activities:
       source: hn
       topics: [ai, systems, startups]
       significance_threshold: 4
+      query_template: "site:news.ycombinator.com {topic}"
     active: true
 
   - slug: intel-scan-news
@@ -435,6 +476,7 @@ activities:
       source: news
       topics: [world, tech]
       significance_threshold: 4
+      query_template: "{topic}"
     active: true
 
   - slug: intel-scan-finance
@@ -445,6 +487,7 @@ activities:
       source: finance
       topics: [equities, macro, crypto]
       significance_threshold: 4
+      query_template: "{topic} site:ft.com OR site:reuters.com OR site:bloomberg.com"
     active: true
 
   # Sebas — close Todoist tasks whose Jira issue already has a resolution.

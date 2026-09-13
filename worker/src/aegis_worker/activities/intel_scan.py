@@ -11,11 +11,33 @@ from temporalio import activity
 logger = structlog.get_logger()
 
 
+# The built-in query per source, `{topic}` standing for the term. A scan row
+# carries its own in `activities.config.query_template` (the seed rows spell
+# these out); these are the fallback for a row that sets none.
+DEFAULT_QUERY_TEMPLATES: dict[str, str] = {
+    "hn": "site:news.ycombinator.com {topic}",
+    "news": "{topic}",
+    "finance": "{topic} site:ft.com OR site:reuters.com OR site:bloomberg.com",
+}
+
+
+def render_query(template: str, source: str, topic: str) -> str:
+    """The searxng query for `topic`: `template` with `{topic}` filled in, the
+    source's built-in query when the template is blank, and the bare topic
+    when the template names no `{topic}` at all (a template that could never
+    vary by topic would search the same thing N times)."""
+    tpl = (template or "").strip() or DEFAULT_QUERY_TEMPLATES.get(source, "{topic}")
+    if "{topic}" not in tpl:
+        return f"{tpl} {topic}".strip()
+    return tpl.replace("{topic}", topic)
+
+
 @dataclass
 class SearchSourceInput:
     source: str  # 'hn' | 'news' | 'finance'
     topics: list[str] = field(default_factory=list)
     max_results: int = 20
+    query_template: str = ""
 
 
 @dataclass
@@ -33,18 +55,14 @@ class IntelScanActivities:
     searxng_url: str
     http_client: httpx.AsyncClient | None = None
 
-    def _build_query(self, source: str, topic: str) -> dict[str, str]:
+    def _build_query(self, source: str, topic: str, template: str = "") -> dict[str, str]:
         """Return query params dict for a given source + topic."""
-        if source == "hn":
-            return {"q": f"site:news.ycombinator.com {topic}", "format": "json"}
-        if source == "finance":
-            return {
-                "q": f"{topic} site:ft.com OR site:reuters.com OR site:bloomberg.com",
-                "categories": "news",
-                "format": "json",
-            }
-        # default: news
-        return {"q": topic, "categories": "news", "format": "json"}
+        params = {"q": render_query(template, source, topic), "format": "json"}
+        # HN is a site search across every category; news and finance ask
+        # searxng's news engines.
+        if source != "hn":
+            params["categories"] = "news"
+        return params
 
     @activity.defn
     async def search_source(self, input: SearchSourceInput) -> SearchSourceResult:
@@ -59,7 +77,7 @@ class IntelScanActivities:
 
         try:
             for topic in input.topics:
-                params = self._build_query(input.source, topic)
+                params = self._build_query(input.source, topic, input.query_template)
                 try:
                     resp = await client.get(f"{self.searxng_url}/search", params=params)
                     resp.raise_for_status()

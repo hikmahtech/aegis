@@ -65,6 +65,7 @@ from dataclasses import dataclass
 from decimal import Decimal
 
 from aegis.services import books, journal_index
+from aegis.services.books_chart import Chart as BooksChart
 from aegis.services.statements import StatementRow, normalise_narration
 
 #: `skip_reason` for the side of a transfer that does not write the block: the
@@ -356,17 +357,24 @@ def find_transfers(
     return paired
 
 
-def reversal_account(declared: Collection[str], entity: str) -> str:
-    """Where both legs of a reversal post. `equity:transfers` when the chart
+def reversal_account(declared: Collection[str], entity: str, chart: BooksChart) -> str:
+    """Where both legs of a reversal post. `equity:transfers` when the journal
     declares it, otherwise the entity's unknown-OUT account — used for both
-    legs, so the pair still nets to zero and stays visible in the digest."""
+    legs, so the pair still nets to zero and stays visible in the digest.
+
+    `declared` is what hledger says exists; `chart` is the configured chart of
+    accounts, which is what knows the entity's own unknown account."""
     if not declared or CLEARING_ACCOUNT in declared:
         return CLEARING_ACCOUNT
-    return books.UNKNOWN["hikmah" if entity == "hikmah" else "personal"]["out"]
+    return chart.unknown(entity, "out")
 
 
 def find_reversals(
-    rows: Sequence[StatementRow], declared: Collection[str], *, entity: str
+    rows: Sequence[StatementRow],
+    declared: Collection[str],
+    *,
+    entity: str,
+    chart: BooksChart,
 ) -> dict[str, PairedRow]:
     """§8.5's failed payments: a debit and its same-day re-credit.
 
@@ -387,7 +395,7 @@ def find_reversals(
     identical failed payments on one day are indistinguishable, and either
     pairing nets to the same zero.
     """
-    account = reversal_account(declared, entity)
+    account = reversal_account(declared, entity, chart)
     groups: dict[tuple[str, object, Decimal], list[StatementRow]] = {}
     for row in sorted(rows, key=lambda r: r.row_id):
         groups.setdefault((row.instrument, row.occurred_on, row.amount), []).append(row)

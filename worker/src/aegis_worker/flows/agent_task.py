@@ -720,7 +720,8 @@ class AgentTaskFlow:
             result = await workflow.execute_child_workflow(
                 ResearchFlow.run,
                 ResearchInput(
-                    agent_id=input.agent_id or "raphael",
+                    # "" lets the child resolve the `research` tag holder.
+                    agent_id=input.agent_id or "",
                     question=question,
                     context=context,
                     seed_urls=seeds,

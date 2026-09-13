@@ -102,7 +102,6 @@ _HISTORY_KINDS = frozenset({"investigation", "plan", "session_note"})
 _MIN_PLAN_STEPS = 2
 _MAX_PLAN_STEPS = 12
 _STEP_CAP = 200
-_FALLBACK_LABEL = "@pandora"
 _DESCRIPTION_CAP = 2000
 # What the timeline says when a completed task resolved its problem.
 TASK_COMPLETED_REASON = "its Todoist task was completed by a person, not by the hub"
@@ -118,18 +117,23 @@ _BOOKS_PROJECTS_SETTING = "integration:books_todoist_projects"
 
 @dataclass(frozen=True)
 class _Owner:
-    """Who a problem's task belongs to, and so how it is tagged and filed."""
+    """Who a problem's task belongs to, and so how it is tagged and filed.
+
+    The assignee label is resolved from the agent holding `agent_tag`
+    (`_assignee_label`) — never a literal id, so a fork that renames its
+    agents changes nothing here. No holder means no assignee label; the task
+    still carries `extra_labels` (a GTD state), so it is never invisible (#139).
+    """
 
     source_tag: str
     agent_tag: str
-    fallback_label: str
     # Labels after the assignee's.
     extra_labels: tuple[str, ...] = ()
     # The `books_todoist_projects` entry the task is filed in; "" is the Inbox.
     books_entity: str = ""
 
 
-_INFRA_OWNER = _Owner(SOURCE_TAG, "infra", _FALLBACK_LABEL)
+_INFRA_OWNER = _Owner(SOURCE_TAG, "infra")
 # Problems another agent owns, by the source of their first occurrence. All 13
 # money problems in prod (2026-09-11) were projected as `#alert @pandora` in the
 # Inbox, and the agent sweep then ran Pandora's infra verb on them and parked
@@ -146,8 +150,8 @@ _INFRA_OWNER = _Owner(SOURCE_TAG, "infra", _FALLBACK_LABEL)
 # The research agent's two kinds (#513), both in the Inbox, both `@next`:
 #
 # * `#research`: a tracked topic's round that crossed its threshold, or a
-#   `#research` task's question. Raphael can work these, so the agent sweep
-#   may run the `research` verb on them.
+#   `#research` task's question. The research agent can work these, so the
+#   agent sweep may run the `research` verb on them.
 # * `#feeds`: a feed that stopped fetching or publishing. The user fixes or
 #   drops it; `agent_task.EXCLUDED_LABELS` keeps the sweep off it.
 #
@@ -160,9 +164,9 @@ FEEDS_SOURCE_TAG = "#feeds"
 # carry, so the agent lane needs a verb decision for each
 # (`test_agent_task_verbs` reads them from here).
 _OWNER_BY_SOURCE = {
-    "money": _Owner(MONEY_SOURCE_TAG, "finance", "@maou", ("@next",), "personal"),
-    "research": _Owner(RESEARCH_SOURCE_TAG, "research", "@raphael", ("@next",)),
-    "feeds": _Owner(FEEDS_SOURCE_TAG, "research", "@raphael", ("@next",)),
+    "money": _Owner(MONEY_SOURCE_TAG, "finance", ("@next",), "personal"),
+    "research": _Owner(RESEARCH_SOURCE_TAG, "research", ("@next",)),
+    "feeds": _Owner(FEEDS_SOURCE_TAG, "research", ("@next",)),
 }
 
 
@@ -400,21 +404,22 @@ def merge_block(description: str | None, block: str) -> str:
     return (base.rstrip() + "\n\n" + block) if base.strip() else block
 
 
-async def _assignee_label(
-    pool: asyncpg.Pool, tag: str = "infra", fallback: str = _FALLBACK_LABEL
-) -> str:
+async def _assignee_label(pool: asyncpg.Pool, tag: str = "infra") -> str:
     """The label that assigns the task to the agent holding ``tag`` — its first
-    mention alias — falling back to ``fallback``. Never raises."""
+    mention alias — or "" when no active agent holds it (logged: the task is
+    then created with no assignee, and its GTD state label alone). Never
+    raises."""
     try:
         agent_id = await resolve_tag(pool, tag)
         if not agent_id:
-            return fallback
+            logger.warning("hub_project_owner_unresolved", tag=tag)
+            return ""
         meta = await pool.fetchval("SELECT metadata FROM agents WHERE id = $1", agent_id)
         aliases = (meta or {}).get("mention_aliases") or [agent_id]
         return f"@{str(aliases[0]).lstrip('@')}"
     except Exception as exc:  # noqa: BLE001 — a label lookup must never block a task
         logger.warning("hub_project_label_failed", tag=tag, error=str(exc)[:200])
-        return fallback
+        return ""
 
 
 async def _first_source(pool: asyncpg.Pool, problem_id: str) -> str:
@@ -628,9 +633,10 @@ def _history_text(kind: str, payload: dict[str, Any]) -> str:
     return f"{head}: {text}" if text else head
 
 
-async def _topic_digest(pool: asyncpg.Pool, problem_id: str, limit: int = 10) -> str:
+async def _topic_digest(pool: asyncpg.Pool, problem_id: str, limit: int | None = None) -> str:
     """What a topic's round collected, newest first, as the task's description
-    (#513): one line per article, linked."""
+    (#513): one line per article, linked. At most `limit`, or the
+    `research_topics_config` row's `digest_items`."""
     from aegis.services.research_topics import round_items
 
     lines = []
@@ -698,7 +704,7 @@ async def project(
 
     if not task_id and p["class"] == TOPIC_CLASS and not meta.get("attention"):
         # A tracked topic's round of news earns a task only once it holds
-        # enough items (`research_topics.ATTENTION_ITEMS`, #513). Until then it
+        # enough items (`Topic.threshold_for`, #513). Until then it
         # lives in the hub and Raphael's briefing. Its events are marked seen,
         # so the sweep does not come back for them; the task, when the round
         # crosses its threshold, lists the round's items itself.
@@ -800,16 +806,14 @@ async def project(
         project_id = (
             await _books_project(pool, owner.books_entity) if owner.books_entity else None
         )
+        assignee = await _assignee_label(pool, owner.agent_tag)
         task_id = await _capture_to_inbox_impl(
             pool,
             owner.source_tag,
             f"problem-{problem_id}",
             p["title"][:120],
             description[:_DESCRIPTION_CAP],
-            [
-                await _assignee_label(pool, owner.agent_tag, owner.fallback_label),
-                *owner.extra_labels,
-            ],
+            [label for label in (assignee, *owner.extra_labels) if label],
             project_id=project_id,
         )
         if not task_id:

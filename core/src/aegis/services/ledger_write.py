@@ -129,7 +129,7 @@ def parse_amounts(postings: list[dict]) -> tuple[list[Decimal | None], str | Non
 
 
 def manual_msgid(
-    entity: str, d: date_type, payee: str, postings: list[dict], note: str
+    entity: str, d: date_type, payee: str, postings: list[dict], note: str, currency: str
 ) -> str:
     """A msgid derived from the transaction itself, so a re-post is a RETRY.
 
@@ -151,20 +151,26 @@ def manual_msgid(
     `entity` is digested alongside it because it picks the FILE, and the same
     block in the two sets of books is two different transactions.
 
+    `currency` is the books' home currency, which is what a posting naming none
+    is rendered in — part of the block, so part of the id. It is passed in
+    rather than read here because both sides of the write have to agree: the
+    tool names the workflow from it and the writer names the block from it.
+
     The trade is that two genuinely identical transactions on the same day
     collapse into one; the tool says so in its description, and a distinguishing
     `note` (which is part of the block) records the second.
     """
-    body = books.render_manual(d, payee, postings, _MSGID_SEED, note)
+    body = books.render_manual(d, payee, postings, _MSGID_SEED, note, currency=currency)
     return f"manual/{hashlib.sha256(f'{entity}\n{body}'.encode()).hexdigest()[:16]}"
 
 
-def post_msgid(payload: dict) -> str:
+def post_msgid(payload: dict, currency: str) -> str:
     """The msgid a `post` payload will be written under.
 
     Called twice per write — once by the tool, to name the workflow, and once
     by the writer itself — and it must give the same answer both times, so the
-    payee is sanitized here rather than by either caller.
+    payee is sanitized here rather than by either caller, and both callers take
+    `currency` from the same `BooksConfig` field.
     """
     return manual_msgid(
         payload["entity"],
@@ -172,10 +178,11 @@ def post_msgid(payload: dict) -> str:
         books.sanitize_payee(payload["payee"]),
         payload["postings"],
         payload.get("note", "") or "",
+        currency,
     )
 
 
-def write_workflow_id(op: str, payload: dict) -> str:
+def write_workflow_id(op: str, payload: dict, currency: str) -> str:
     """A deterministic workflow id for one write, derived from its own content.
 
     The point is re-attachment, not naming: a chat turn that is retried (or a
@@ -187,7 +194,7 @@ def write_workflow_id(op: str, payload: dict) -> str:
     timestamp, which would make every retry a second write.
     """
     if op == "post":
-        digest = post_msgid(payload).split("/", 1)[1]
+        digest = post_msgid(payload, currency).split("/", 1)[1]
     elif op == "reclassify":
         digest = _digest(
             f"{payload['message_id']}\n{payload['account']}\n{payload.get('payee') or ''}"
@@ -239,8 +246,8 @@ async def _write_post(pool: Any, cfg: books.BooksConfig, payload: dict) -> str:
     amounts, problem = parse_amounts(postings)
     if problem:  # pragma: no cover — the tool refuses these before dispatching
         return f"error: {problem}"
-    msgid = post_msgid(payload)
-    block = books.render_manual(occurred_on, payee, postings, msgid, note)
+    msgid = post_msgid(payload, cfg.currency)
+    block = books.render_manual(occurred_on, payee, postings, msgid, note, currency=cfg.currency)
     rel, created = await books.post_block(block, entity, occurred_on, msgid, cfg)
 
     # The index keys on the first amount-bearing posting: it is the one the
@@ -251,7 +258,7 @@ async def _write_post(pool: Any, cfg: books.BooksConfig, payload: dict) -> str:
         kind="transaction",
         direction="in" if signed < 0 else "out",
         amount=abs(signed),
-        currency=str(postings[lead].get("currency") or "INR"),
+        currency=str(postings[lead].get("currency") or cfg.currency),
         payee=payee,
         payee_key=payee_key(payee),
         channel="manual",

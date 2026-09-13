@@ -456,7 +456,7 @@ CHAT_TOOLS = [
         "type": "function",
         "function": {
             "name": "research_topic",
-            "description": "Research a question: search the knowledge store, the web and (for academic questions) papers, read the best sources, and answer with numbered citations. Runs in the background as a research flow and waits up to 45 seconds; a longer run posts its answer to the channel when it is ready. The answer is saved, replacing any earlier answer to the same question.",
+            "description": "Research a question: search the knowledge store, the web and (for academic questions) papers, read the best sources, and answer with numbered citations. Runs in the background as a research flow and waits a short while for it; a longer run posts its answer to the channel when it is ready. The answer is saved, replacing any earlier answer to the same question.",
             "parameters": {
                 "type": "object",
                 "properties": {
