@@ -148,6 +148,9 @@ async def test_sweep_promotes_then_projects_and_reports():
         # step declines to act and says why (#551).
         "alertmanager_resolved": 0,
         "alertmanager_skipped": "",
+        # -1 says the step did not run, which is a different fact from "ran and
+        # found nothing" — the two used to be indistinguishable here.
+        "alertmanager_checked": -1,
     }
     # Promotion first, so a just-promoted problem gets its task in the same
     # tick; completed tasks and merged fixes next, so what they resolve or

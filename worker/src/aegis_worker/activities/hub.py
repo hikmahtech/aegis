@@ -768,9 +768,9 @@ class HubActivities:
         """
         target = (url or "").strip().rstrip("/")
         if not target:
-            return {"skipped": "not_configured", "resolved": 0}
+            return {"skipped": "not_configured", "resolved": 0, "checked": 0}
         if self.db_pool is None:
-            return {"skipped": "no_pool", "resolved": 0}
+            return {"skipped": "no_pool", "resolved": 0, "checked": 0}
         try:
             async with httpx.AsyncClient(timeout=_ALERTMANAGER_TIMEOUT_S) as client:
                 status = await client.get(f"{target}/api/v2/status")
@@ -783,22 +783,23 @@ class HubActivities:
             activity.logger.warning(
                 "hub_alertmanager_read_failed url=%s err=%s", target, str(exc)[:200]
             )
-            return {"skipped": "unreachable", "resolved": 0}
+            return {"skipped": "unreachable", "resolved": 0, "checked": 0}
 
         now = datetime.now(UTC)
         uptime = _uptime_since(uptime_raw, now)
         if uptime is None:
-            return {"skipped": "uptime_unreadable", "resolved": 0}
+            return {"skipped": "uptime_unreadable", "resolved": 0, "checked": 0}
         if uptime < timedelta(seconds=max(0, min_uptime_seconds)):
             # It has forgotten what it was holding and has not been told again.
             return {
                 "skipped": "alertmanager_just_started",
                 "uptime_seconds": int(uptime.total_seconds()),
                 "resolved": 0,
+                "checked": 0,
             }
 
         if not isinstance(payload, list):
-            return {"skipped": "unexpected_payload", "resolved": 0}
+            return {"skipped": "unexpected_payload", "resolved": 0, "checked": 0}
         active = {
             str(a.get("fingerprint") or "")
             for a in payload

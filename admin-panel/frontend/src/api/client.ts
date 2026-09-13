@@ -190,6 +190,39 @@ export const api = {
     note?: string;
   }) => apiFetch<any>('/api/admin/service-state', { method: 'PUT', body: JSON.stringify(body) }),
 
+  // The hub's own configuration. Both rows were DB-backed but reachable only by
+  // raw SQL, which is not "configurable" in a system meant to be forked (#556).
+  getHubSettleSeconds: () =>
+    apiFetch<{
+      overrides: Record<string, number>;
+      defaults: Record<string, number>;
+      default_seconds: number;
+      max_seconds: number;
+      wildcard: string;
+    }>('/api/admin/hub-settle-seconds'),
+  saveHubSettleSeconds: (overrides: Record<string, number>) =>
+    apiFetch<any>('/api/admin/hub-settle-seconds', {
+      method: 'PUT',
+      body: JSON.stringify({ overrides }),
+    }),
+  getInfraAlertRouting: () =>
+    apiFetch<{
+      alertnames: string[];
+      default_alertnames: string[];
+      extra_alertnames: string[];
+      repo: string;
+      platform_hint: string;
+    }>('/api/admin/infra-alert-routing'),
+  saveInfraAlertRouting: (body: {
+    extra_alertnames: string[];
+    repo: string;
+    platform_hint: string;
+  }) =>
+    apiFetch<any>('/api/admin/infra-alert-routing', {
+      method: 'PUT',
+      body: JSON.stringify(body),
+    }),
+
   // Expiry radar registry (life.expiring_items — passports, policies, warranties)
   listExpiringItems: (params?: { kind?: string; dueWithin?: number }) => {
     const q = new URLSearchParams();

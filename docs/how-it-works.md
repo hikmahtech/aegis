@@ -587,6 +587,11 @@ The steps that make it trustworthy:
   for `NodeDown` / `DockerServiceDown`, and 0 for disk, memory and OOM classes,
   which are real the moment they fire:
 
+  Edit them on the admin **Problems** page, under *Hub configuration* — one row
+  per class, with the built-in defaults shown beside them so a blank field reads
+  as what it means. A bad value is refused with a reason rather than saved and
+  quietly ignored. The equivalent by hand, if you prefer:
+
   ```sql
   -- give a flappy service ten minutes to settle; never wait on a dead node
   INSERT INTO settings (key, value) VALUES
