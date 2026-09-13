@@ -423,10 +423,10 @@ export default function MoneyAccounting() {
                           {s.period_start} → {s.period_end}
                         </td>
                         <td className="mono" style={{ textAlign: 'right' }}>
-                          {fmtMoney(s.opening_balance, 'INR') || '—'}
+                          {fmtMoney(s.opening_balance, balances?.home_currency) || '—'}
                         </td>
                         <td className="mono" style={{ textAlign: 'right' }}>
-                          {fmtMoney(s.closing_balance, 'INR') || '—'}
+                          {fmtMoney(s.closing_balance, balances?.home_currency) || '—'}
                         </td>
                         <td className="mono" style={{ textAlign: 'right' }}>{s.rows}</td>
                         <td className="mono" style={{ textAlign: 'right' }}>{s.unmatched || '—'}</td>

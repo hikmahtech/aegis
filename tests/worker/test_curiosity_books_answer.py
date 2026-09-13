@@ -31,6 +31,8 @@ from aegis_worker.activities.curiosity import CuriosityActivities
 from aegis_worker.activities.delivery import DeliveryActivities
 from temporalio.testing import ActivityEnvironment
 
+from tests.books_chart_data import CHART
+
 HAS_HLEDGER = shutil.which("hledger") is not None and shutil.which("git") is not None
 pytestmark = pytest.mark.skipif(not HAS_HLEDGER, reason="hledger/git not installed")
 
@@ -179,7 +181,7 @@ async def _post(pool, cfg: books.BooksConfig, payee: str = PAYEE, day: int = 2) 
     """One real posting in the journal AND its index row."""
     ev = _event(payee, day)
     msgid = ji.msgid_for(MAILBOX, uuid4().hex)
-    rel = await books.post_event(ev, msgid, cfg)
+    rel = await books.post_event(ev, msgid, cfg, chart=CHART)
     await ji.upsert(pool, msgid, MAILBOX, ev, journal_file=rel)
     return msgid
 
@@ -190,7 +192,7 @@ async def _post_hikmah(pool, cfg: books.BooksConfig, day: int = 2) -> str:
     ev.entity = "hikmah"
     ev.account = "expenses:hikmah:unknown"
     msgid = ji.msgid_for(MAILBOX, uuid4().hex)
-    rel = await books.post_event(ev, msgid, cfg)
+    rel = await books.post_event(ev, msgid, cfg, chart=CHART)
     assert rel.startswith("hikmah/"), rel
     await ji.upsert(pool, msgid, MAILBOX, ev, journal_file=rel)
     return msgid

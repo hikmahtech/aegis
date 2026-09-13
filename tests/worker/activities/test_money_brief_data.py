@@ -27,6 +27,8 @@ from aegis_worker.activities.money import (
 )
 from temporalio.testing import ActivityEnvironment
 
+from tests.books_chart_data import CHART
+
 HAS_HLEDGER = shutil.which("hledger") is not None and shutil.which("git") is not None
 
 # £ and € are declared because `refresh_fx_prices` writes a P line for each
@@ -244,13 +246,13 @@ async def test_build_money_brief_reads_books_and_index(db_pool, tmp_path):
     # able to fail this one for an unrelated reason.
     baseline = await ActivityEnvironment().run(act.build_money_brief, 7)
     await books.post_event(
-        _ev(amount=Decimal("6000"), payee="Unknown Big", payee_key="unknown big"), "brief-t/a", cfg)
+        _ev(amount=Decimal("6000"), payee="Unknown Big", payee_key="unknown big"), "brief-t/a", cfg, chart=CHART)
     await books.post_event(
         _ev(amount=Decimal("250"), payee="Grocer", payee_key="grocer",
-            account="expenses:groceries"), "brief-t/b", cfg)
+            account="expenses:groceries"), "brief-t/b", cfg, chart=CHART)
     await books.post_event(
         _ev(amount=Decimal("1000"), direction="in", payee="Stockopedia", payee_key="stockopedia",
-            entity="hikmah", account="income:hikmah:stockopedia", instrument=None), "brief-t/c", cfg)
+            entity="hikmah", account="income:hikmah:stockopedia", instrument=None), "brief-t/c", cfg, chart=CHART)
     await ji.upsert(db_pool, "brief-t/a", "brief-t",
                     _ev(amount=Decimal("6000"), payee="Unknown Big", payee_key="unknown big"),
                     journal_file="x")
@@ -289,6 +291,9 @@ async def test_build_money_brief_reads_books_and_index(db_pool, tmp_path):
     assert Decimal(brief["entities"]["personal"]["income"]) == Decimal("0")
     assert Decimal(brief["entities"]["hikmah"]["income"]) == Decimal("-1000.00")
     assert Decimal(brief["entities"]["hikmah"]["expenses"]) == Decimal("0")
+    # One bucket per CONFIGURED set of books, with the name the renderer will
+    # print (#560) — it knows no entity of its own.
+    assert brief["entity_labels"] == {"personal": "Personal", "hikmah": "Hikmah"}
     assert brief["fx_stale"] is False and brief["fx_unconverted"] == []
     assert [r["account"] for r in brief["by_account"]] == [
         "expenses:unknown", "expenses:groceries", "income:hikmah"]
@@ -332,10 +337,10 @@ async def test_money_brief_says_so_when_a_rate_is_missing_instead_of_lying(db_po
     cfg = _repo(tmp_path, today, prices="")
     await books.post_event(
         _ev(amount=Decimal("300"), account="expenses:saas", payee="Shop", payee_key="shop"),
-        "brief-t/r", cfg)
+        "brief-t/r", cfg, chart=CHART)
     await books.post_event(
         _ev(amount=Decimal("50"), currency="USD", account="expenses:saas", payee="Vendor",
-            payee_key="vendor"), "brief-t/s", cfg)
+            payee_key="vendor"), "brief-t/s", cfg, chart=CHART)
 
     brief = await ActivityEnvironment().run(_act(db_pool, cfg).build_money_brief, 7)
 
@@ -356,10 +361,10 @@ async def test_month_close_says_so_when_a_rate_is_missing(db_pool, tmp_path):
     cfg = _repo(tmp_path, prev_last, prices="")
     await books.post_event(
         _ev(amount=Decimal("300"), occurred_on=prev_last, account="expenses:saas", payee="Shop",
-            payee_key="shop"), "brief-t/t", cfg)
+            payee_key="shop"), "brief-t/t", cfg, chart=CHART)
     await books.post_event(
         _ev(amount=Decimal("50"), currency="USD", occurred_on=prev_last, account="expenses:saas",
-            payee="Vendor", payee_key="vendor"), "brief-t/u", cfg)
+            payee="Vendor", payee_key="vendor"), "brief-t/u", cfg, chart=CHART)
 
     close = await ActivityEnvironment().run(_act(db_pool, cfg).build_month_close)
 
@@ -930,7 +935,7 @@ async def test_build_month_close(db_pool, tmp_path):
     baseline = await ActivityEnvironment().run(act.build_month_close)
     await books.post_event(
         _ev(amount=Decimal("300"), occurred_on=prev_last, account="expenses:saas", payee="Saas",
-            payee_key="saas"), "brief-t/m", cfg)
+            payee_key="saas"), "brief-t/m", cfg, chart=CHART)
     await ji.upsert(db_pool, "brief-t/m", "brief-t",
                     _ev(amount=Decimal("300"), occurred_on=prev_last, account="expenses:saas",
                         payee="Saas", payee_key="saas"), journal_file="x")

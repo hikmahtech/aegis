@@ -357,9 +357,10 @@ class Settings(BaseSettings):
     books_repo_url: str = ""
     books_deploy_key: str = ""  # private ed25519 deploy key, PEM or base64 PEM; never logged
     books_ignored_mailboxes: str = ""  # comma-separated mailbox labels whose money is not ours
-    # "label=entity,..." — mailbox → personal|hikmah; an unlisted mailbox is personal.
+    # "label=entity,..." — mailbox → an entity from `settings.books_chart`; an
+    # unlisted mailbox belongs to the chart's default entity.
     books_mailbox_entities: str = ""
-    books_todoist_projects: str = ""  # "personal=<todoist project id>,hikmah=<id>" for dues
+    books_todoist_projects: str = ""  # "<entity>=<todoist project id>,..." for dues
 
     # Raphael's notes — the user's Obsidian vault (#514, spec
     # 2026-09-12-raphael-notes-design.md). The checkout sits beside the books

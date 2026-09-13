@@ -951,9 +951,10 @@ class CuriosityActivities:
         """
         from aegis.api.models.money import payee_key as payee_key_of
         from aegis.llm import parse_llm_json
-        from aegis.services import books
+        from aegis.services import books, books_chart
 
         cfg = self.books_cfg
+        chart = await books_chart.get_chart(self.db_pool)
         # Which half of the books the card asked about. A card raised before
         # the inbound lane shipped carries no direction and was outbound by
         # construction, and anything unrecognised is treated the same way —
@@ -1030,16 +1031,16 @@ class CuriosityActivities:
 
         # Which books the answer names. Both ledger tools already refuse the
         # cross-entity move this would otherwise make unattended: an AWS bill
-        # arrives in the personal mailbox, the owner says "that is the Hikmah
-        # infra bill", and `expenses:hikmah:infra` is declared and balances —
-        # so `check --strict` passes and nothing reverts, while the block sits
-        # in `personal/2026.journal` and the entity-less rule repeats it for
+        # arrives in the personal mailbox, the owner says "that is the company
+        # infra bill", and the company's infra account is declared and balances
+        # — so `check --strict` passes and nothing reverts, while the block
+        # sits in the personal journal and the entity-less rule repeats it for
         # every future AWS mail (`post_event` files by `event.entity`, which
         # the rule never corrected). `ledger_reclassify` then REFUSES to move
         # it back, so the repair path is narrower than the path that made it.
         # None means an entity-neutral account (assets, liabilities, equity),
-        # which belongs to both sets of books — no stamp and no filter.
-        entity = books.account_entity(account)
+        # which belongs to every set of books — no stamp and no filter.
+        entity = books.account_entity(chart, account)
 
         match = rule_match_for(key)
         if match:

@@ -21,6 +21,8 @@ from aegis.services.statement_match import AMBIGUOUS, PASS_WINDOW, RowOutcome
 from aegis.services.statement_transfers import REVERSAL, TRANSFER
 from aegis.services.statements import ParsedStatement, StatementRow, row_id_for
 
+from tests.books_chart_data import CHART
+
 HAS_HLEDGER = shutil.which("hledger") is not None and shutil.which("git") is not None
 pytestmark = pytest.mark.skipif(not HAS_HLEDGER, reason="hledger/git not installed")
 
@@ -108,7 +110,7 @@ def test_the_plan_sorts_every_row_into_post_promote_or_skip():
             occurred_on=date(2026, 7, 4), skip_reason=AMBIGUOUS, candidates=("m/a", "m/b"),
         ),
     }
-    p = statement_post.plan(_statement(rows, "0"), outcomes, entity="personal")
+    p = statement_post.plan(_statement(rows, "0"), outcomes, entity="personal", chart=CHART)
     assert [r.row_id for r in p.posts] == [rows[0].row_id]
     assert [m for m, _ in p.promotions] == ["m/1"]
     assert p.skipped == ((rows[2].row_id, AMBIGUOUS),)
@@ -119,7 +121,7 @@ def test_a_row_the_matcher_never_reached_is_posted_not_dropped():
     Dropping it would leave the closing balance short by exactly that amount,
     with nothing anywhere saying which row went missing."""
     rows = [_row(2, "100.00")]
-    p = statement_post.plan(_statement(rows, "0"), {}, entity="personal")
+    p = statement_post.plan(_statement(rows, "0"), {}, entity="personal", chart=CHART)
     assert [r.row_id for r in p.posts] == [rows[0].row_id] and p.skipped == ()
 
 
@@ -131,7 +133,7 @@ def test_an_ambiguous_row_is_never_posted():
         row_id=rows[0].row_id, statement_id="s", instrument="hdfc-1225",
         occurred_on=date(2026, 7, 2), skip_reason=AMBIGUOUS, candidates=("m/a", "m/b"),
     )}
-    p = statement_post.plan(_statement(rows, "0"), outcomes, entity="personal")
+    p = statement_post.plan(_statement(rows, "0"), outcomes, entity="personal", chart=CHART)
     assert p.posts == () and p.promotions == () and p.writes == 0
 
 
@@ -149,7 +151,7 @@ async def test_unmatched_rows_post_cleared_and_the_balance_agrees(tmp_path):
         _row(5, "300.00", narration="ATM WDL", balance="700.00"),
     ]
     result = await statement_post.post_statement(
-        _statement(rows, "700.00"), {}, cfg, entity="personal",
+        _statement(rows, "700.00"), {}, cfg, entity="personal", chart=CHART,
         rules=books.load_rules_sync(cfg) if hasattr(books, "load_rules_sync") else [],
     )
     assert len(result.posted) == 2 and result.promoted == []
@@ -177,7 +179,7 @@ async def test_a_movement_that_disagrees_reverts_the_whole_statement(tmp_path):
 
     with pytest.raises(books.BooksCheckError, match="the books disagree with"):
         await statement_post.post_statement(
-            _statement(rows, "999.00"), {}, cfg, entity="personal",
+            _statement(rows, "999.00"), {}, cfg, entity="personal", chart=CHART,
         )
 
     assert (cfg.path / "personal" / "2026.journal").read_text() == before
@@ -199,7 +201,7 @@ async def test_one_bad_row_undoes_the_good_ones_in_the_same_statement(tmp_path):
     ]
     with pytest.raises(books.BooksCheckError):
         await statement_post.post_statement(
-            _statement(rows, "12345.00"), {}, cfg, entity="personal",
+            _statement(rows, "12345.00"), {}, cfg, entity="personal", chart=CHART,
         )
     text = (cfg.path / "personal" / "2026.journal").read_text()
     assert "SALARY" not in text and "SHOP" not in text
@@ -223,7 +225,7 @@ async def test_promotion_takes_the_bank_s_date_so_the_check_can_pass(tmp_path):
         occurred_on=date(2026, 6, 30), entity="personal", account="expenses:groceries",
         source_class="bank",
     )
-    await books.post_event(event, "mail/1", cfg)
+    await books.post_event(event, "mail/1", cfg, chart=CHART)
     assert "2026-06-30 ! Corner Store" in (cfg.path / "personal" / "2026.journal").read_text()
 
     row = _row(1, "300.00", narration="CORNER STORE", balance="-300.00")
@@ -232,7 +234,7 @@ async def test_promotion_takes_the_bank_s_date_so_the_check_can_pass(tmp_path):
         occurred_on=date(2026, 7, 1), matched_pass=PASS_WINDOW, msgid="mail/1", delta_days=1,
     )}
     result = await statement_post.post_statement(
-        _statement([row], "-300.00"), outcomes, cfg, entity="personal",
+        _statement([row], "-300.00"), outcomes, cfg, entity="personal", chart=CHART,
     )
 
     assert result.promoted == ["mail/1"] and result.posted == []
@@ -251,8 +253,8 @@ async def test_the_same_statement_twice_writes_nothing_the_second_time(tmp_path)
     cfg = _repo(tmp_path)
     rows = [_row(2, "1000.00", direction="in", narration="SALARY", balance="1000.00")]
     stmt = _statement(rows, "1000.00")
-    first = await statement_post.post_statement(stmt, {}, cfg, entity="personal")
-    second = await statement_post.post_statement(stmt, {}, cfg, entity="personal")
+    first = await statement_post.post_statement(stmt, {}, cfg, entity="personal", chart=CHART)
+    second = await statement_post.post_statement(stmt, {}, cfg, entity="personal", chart=CHART)
 
     assert len(first.posted) == 1
     assert second.posted == [] and second.skipped == [(rows[0].row_id, "already_posted")]
@@ -269,7 +271,7 @@ async def test_a_card_statement_has_no_balance_to_check_and_says_so(tmp_path):
     cfg = _repo(tmp_path)
     rows = [_row(2, "500.00", narration="AMAZON", instrument="axis-cc-1313")]
     result = await statement_post.post_statement(
-        _statement(rows, None, instrument="axis-cc-1313"), {}, cfg, entity="personal",
+        _statement(rows, None, instrument="axis-cc-1313"), {}, cfg, entity="personal", chart=CHART,
     )
     assert len(result.posted) == 1
     assert result.balance_checked is False
@@ -282,7 +284,7 @@ async def test_a_dry_run_opens_nothing(tmp_path):
     before = (cfg.path / "personal" / "2026.journal").read_text()
     rows = [_row(2, "1000.00", direction="in", narration="SALARY")]
     result = await statement_post.post_statement(
-        _statement(rows, "1000.00"), {}, cfg, entity="personal", dry_run=True,
+        _statement(rows, "1000.00"), {}, cfg, entity="personal", chart=CHART, dry_run=True,
     )
     assert len(result.posted) == 1 and result.balance_checked is False
     assert (cfg.path / "personal" / "2026.journal").read_text() == before
@@ -313,11 +315,11 @@ async def test_a_pending_block_dated_into_this_period_cannot_break_it(tmp_path):
         occurred_on=date(2026, 7, 31), entity="personal", account="expenses:unknown",
         source_class="bank",
     )
-    await books.post_event(early, "mail/aug", cfg)
+    await books.post_event(early, "mail/aug", cfg, chart=CHART)
 
     rows = [_row(2, "1000.00", direction="in", narration="SALARY", balance="1000.00")]
     result = await statement_post.post_statement(
-        _statement(rows, "1000.00"), {}, cfg, entity="personal",
+        _statement(rows, "1000.00"), {}, cfg, entity="personal", chart=CHART,
     )
 
     assert result.balance_checked is True and result.balance_reason == ""
@@ -348,7 +350,7 @@ async def test_an_ambiguous_row_does_not_fail_the_statement_it_sits_in(tmp_path)
         occurred_on=date(2026, 7, 3), skip_reason=AMBIGUOUS, candidates=("m/a", "m/b"),
     )}
     result = await statement_post.post_statement(
-        _statement(rows, "750.00"), outcomes, cfg, entity="personal",
+        _statement(rows, "750.00"), outcomes, cfg, entity="personal", chart=CHART,
     )
 
     assert len(result.posted) == 1
@@ -375,7 +377,7 @@ async def test_the_check_is_movement_so_the_first_statement_of_an_account_passes
             rows=tuple(rows), statement_id="hdfc-1225/2026-07-01..2026-07-31",
             file_sha256="fixture",
         ),
-        {}, cfg, entity="personal",
+        {}, cfg, entity="personal", chart=CHART,
     )
     assert result.balance_checked is True and result.balance_reason == ""
 
@@ -396,7 +398,7 @@ async def test_a_transaction_on_the_closing_day_is_inside_the_period(tmp_path):
         _row(31, "150.00", narration="MONTH END FEE", balance="850.00"),
     ]
     result = await statement_post.post_statement(
-        _statement(rows, "850.00"), {}, cfg, entity="personal",
+        _statement(rows, "850.00"), {}, cfg, entity="personal", chart=CHART,
     )
     assert len(result.posted) == 2
     assert result.balance_checked is True and result.balance_reason == ""
@@ -439,7 +441,7 @@ async def test_a_creditcard_payment_row_credits_the_card_not_expenses_unknown(tm
     cfg = _repo(tmp_path)
     rows = [_row(3, "2500.00", narration="CREDITCARD PAYMENT XXXX 1313", balance="-2500.00")]
     result = await statement_post.post_statement(
-        _statement(rows, "-2500.00"), {}, cfg, entity="personal",
+        _statement(rows, "-2500.00"), {}, cfg, entity="personal", chart=CHART,
     )
     assert len(result.posted) == 1
     assert result.balance_checked is True and result.balance_reason == ""
@@ -457,10 +459,10 @@ async def test_the_bank_row_posts_the_transfer_and_the_card_row_skips(tmp_path):
     bank, card = _card_pair()
 
     first = await statement_post.post_statement(
-        bank, {}, cfg, entity="personal", peer_rows=card.rows,
+        bank, {}, cfg, entity="personal", chart=CHART, peer_rows=card.rows,
     )
     second = await statement_post.post_statement(
-        card, {}, cfg, entity="personal", liability=True, peer_rows=bank.rows,
+        card, {}, cfg, entity="personal", chart=CHART, liability=True, peer_rows=bank.rows,
     )
 
     assert len(first.posted) == 1
@@ -486,10 +488,10 @@ async def test_the_card_statement_first_still_posts_the_transfer_once(tmp_path):
     bank, card = _card_pair()
 
     first = await statement_post.post_statement(
-        card, {}, cfg, entity="personal", liability=True, peer_rows=bank.rows,
+        card, {}, cfg, entity="personal", chart=CHART, liability=True, peer_rows=bank.rows,
     )
     second = await statement_post.post_statement(
-        bank, {}, cfg, entity="personal", peer_rows=card.rows,
+        bank, {}, cfg, entity="personal", chart=CHART, peer_rows=card.rows,
     )
 
     assert (card.rows[0].row_id, TRANSFER) in first.skipped
@@ -535,10 +537,10 @@ async def test_the_balance_check_passes_on_a_statement_holding_a_counterpart(tmp
     axis, hdfc = _imps_pair()
 
     first = await statement_post.post_statement(
-        axis, {}, cfg, entity="personal", peer_rows=hdfc.rows,
+        axis, {}, cfg, entity="personal", chart=CHART, peer_rows=hdfc.rows,
     )
     second = await statement_post.post_statement(
-        hdfc, {}, cfg, entity="personal", peer_rows=axis.rows,
+        hdfc, {}, cfg, entity="personal", chart=CHART, peer_rows=axis.rows,
     )
 
     assert len(first.posted) == 1 and first.balance_reason == ""
@@ -580,10 +582,10 @@ async def test_a_statement_of_nothing_but_counterparts_is_still_balance_checked(
     hdfc = _statement([hdfc_row], "100000.00")
 
     await statement_post.post_statement(
-        axis, {}, cfg, entity="personal", peer_rows=hdfc.rows,
+        axis, {}, cfg, entity="personal", chart=CHART, peer_rows=hdfc.rows,
     )
     result = await statement_post.post_statement(
-        hdfc, {}, cfg, entity="personal", peer_rows=axis.rows,
+        hdfc, {}, cfg, entity="personal", chart=CHART, peer_rows=axis.rows,
     )
 
     assert result.posted == [] and result.promoted == []
@@ -617,11 +619,11 @@ async def test_the_counterpart_only_check_can_actually_fail(tmp_path):
     wrong = _statement([hdfc_row], "110000.00")
 
     await statement_post.post_statement(
-        axis, {}, cfg, entity="personal", peer_rows=[hdfc_row],
+        axis, {}, cfg, entity="personal", chart=CHART, peer_rows=[hdfc_row],
     )
     with pytest.raises(books.BooksCheckError):
         await statement_post.post_statement(
-            wrong, {}, cfg, entity="personal", peer_rows=axis.rows,
+            wrong, {}, cfg, entity="personal", chart=CHART, peer_rows=axis.rows,
         )
 
 
@@ -636,14 +638,14 @@ async def test_adding_a_counterpart_back_would_revert_a_correct_statement(tmp_pa
     """
     cfg = _repo(tmp_path)
     axis, hdfc = _imps_pair()
-    await statement_post.post_statement(axis, {}, cfg, entity="personal", peer_rows=hdfc.rows)
+    await statement_post.post_statement(axis, {}, cfg, entity="personal", chart=CHART, peer_rows=hdfc.rows)
 
     monkeypatch.setattr(
         statement_post, "_NEVER_WRITTEN", statement_post._NEVER_WRITTEN | {TRANSFER}
     )
     with pytest.raises(books.BooksCheckError, match="difference 100000"):
         await statement_post.post_statement(
-            hdfc, {}, cfg, entity="personal", peer_rows=axis.rows,
+            hdfc, {}, cfg, entity="personal", chart=CHART, peer_rows=axis.rows,
         )
 
 
@@ -662,7 +664,7 @@ async def test_a_reversal_pair_nets_to_zero_and_leaves_the_balance_intact(tmp_pa
     spend = _row(5, "100.00", narration="SHOP", balance="-100.00")
 
     result = await statement_post.post_statement(
-        _statement([debit, credit, spend], "-100.00"), {}, cfg, entity="personal",
+        _statement([debit, credit, spend], "-100.00"), {}, cfg, entity="personal", chart=CHART,
     )
 
     assert len(result.posted) == 3, "both legs post; a reversal hides nothing"
@@ -692,7 +694,7 @@ async def test_promotion_moves_an_equity_transfers_block_to_the_card(tmp_path):
             occurred_on=date(2026, 7, 2), entity="personal", account="equity:transfers",
             source_class="bank",
         ),
-        "mail/card", cfg,
+        "mail/card", cfg, chart=CHART,
     )
     bank_row = _row(3, "2500.00", narration="CREDITCARD PAYMENT XXXX 1313", balance="-2500.00")
     card_row = _row(4, "2500.00", direction="in", instrument="axis-cc-1313",
@@ -704,7 +706,7 @@ async def test_promotion_moves_an_equity_transfers_block_to_the_card(tmp_path):
 
     result = await statement_post.post_statement(
         _statement([bank_row], "-2500.00"), outcomes, cfg,
-        entity="personal", peer_rows=[card_row],
+        entity="personal", chart=CHART, peer_rows=[card_row],
     )
 
     assert result.promoted == ["mail/card"] and result.posted == []
@@ -730,7 +732,7 @@ async def test_a_promoted_block_is_what_the_far_statement_sees(tmp_path):
             occurred_on=date(2026, 7, 3), entity="personal", account="equity:transfers",
             source_class="bank",
         ),
-        "mail/imps", cfg,
+        "mail/imps", cfg, chart=CHART,
     )
     axis, hdfc = _imps_pair()
     outcomes = {axis.rows[0].row_id: RowOutcome(
@@ -739,10 +741,10 @@ async def test_a_promoted_block_is_what_the_far_statement_sees(tmp_path):
     )}
 
     first = await statement_post.post_statement(
-        axis, outcomes, cfg, entity="personal", peer_rows=hdfc.rows,
+        axis, outcomes, cfg, entity="personal", chart=CHART, peer_rows=hdfc.rows,
     )
     second = await statement_post.post_statement(
-        hdfc, outcomes, cfg, entity="personal", peer_rows=axis.rows,
+        hdfc, outcomes, cfg, entity="personal", chart=CHART, peer_rows=axis.rows,
     )
 
     assert first.promoted == ["mail/imps"] and first.posted == []
@@ -770,7 +772,7 @@ async def test_a_third_party_row_carrying_a_declared_tail_still_goes_to_the_rule
     rows = [_row(4, "1200.00", balance="-1200.00",
                  narration="NEFT/AXISP00123456/INVOICE 1234196405 SPECIMEN SUPPLIES")]
     result = await statement_post.post_statement(
-        _statement(rows, "-1200.00"), {}, cfg, entity="personal",
+        _statement(rows, "-1200.00"), {}, cfg, entity="personal", chart=CHART,
     )
     assert len(result.posted) == 1
     text = (cfg.path / "personal" / "2026.journal").read_text()
@@ -791,12 +793,12 @@ async def test_a_far_statement_arriving_later_does_not_post_the_money_twice(tmp_
     cfg = _repo(tmp_path)
     axis, hdfc = _imps_pair()
 
-    blind = await statement_post.post_statement(hdfc, {}, cfg, entity="personal")
+    blind = await statement_post.post_statement(hdfc, {}, cfg, entity="personal", chart=CHART)
     assert len(blind.posted) == 2, "no peers, no pair — the credit posts on its own"
     assert blind.balance_checked is True and blind.balance_reason == ""
 
     later = await statement_post.post_statement(
-        axis, {}, cfg, entity="personal", peer_rows=hdfc.rows,
+        axis, {}, cfg, entity="personal", chart=CHART, peer_rows=hdfc.rows,
     )
     assert later.posted == []
     assert (axis.rows[0].row_id, TRANSFER) in later.skipped
@@ -825,7 +827,7 @@ async def test_promotion_leaves_an_account_that_is_not_the_clearing_one_alone(tm
             occurred_on=date(2026, 7, 2), entity="personal", account="expenses:groceries",
             source_class="bank",
         ),
-        "mail/card", cfg,
+        "mail/card", cfg, chart=CHART,
     )
     bank_row = _row(3, "2500.00", narration="CREDITCARD PAYMENT XXXX 1313", balance="-2500.00")
     card_row = _row(4, "2500.00", direction="in", instrument="axis-cc-1313",
@@ -837,7 +839,7 @@ async def test_promotion_leaves_an_account_that_is_not_the_clearing_one_alone(tm
 
     result = await statement_post.post_statement(
         _statement([bank_row], "-2500.00"), outcomes, cfg,
-        entity="personal", peer_rows=[card_row],
+        entity="personal", chart=CHART, peer_rows=[card_row],
     )
 
     assert result.promoted == ["mail/card"]
@@ -893,10 +895,10 @@ async def test_a_transfer_straddling_a_month_boundary_does_not_break_either_chec
     )
 
     first = await statement_post.post_statement(
-        july, {}, cfg, entity="personal", peer_rows=august.rows,
+        july, {}, cfg, entity="personal", chart=CHART, peer_rows=august.rows,
     )
     second = await statement_post.post_statement(
-        august, {}, cfg, entity="personal", peer_rows=july.rows,
+        august, {}, cfg, entity="personal", chart=CHART, peer_rows=july.rows,
     )
 
     assert len(first.posted) == 1 and first.balance_reason == ""
@@ -1012,7 +1014,7 @@ async def test_a_card_statement_with_printed_balances_passes_the_check(tmp_path)
         _dated_row("axis-cc-1313", date(2026, 7, 6), "50.00"),
     ]
     result = await statement_post.post_statement(
-        _card_statement(rows, "0", "150.00"), {}, cfg, entity="personal", liability=True,
+        _card_statement(rows, "0", "150.00"), {}, cfg, entity="personal", chart=CHART, liability=True,
     )
 
     assert len(result.posted) == 2
@@ -1043,7 +1045,7 @@ async def test_a_skipped_row_on_a_card_is_added_back_in_the_card_s_own_sign(tmp_
 
     result = await statement_post.post_statement(
         _card_statement(rows, "0", "150.00"), outcomes, cfg,
-        entity="personal", liability=True,
+        entity="personal", chart=CHART, liability=True,
     )
 
     assert result.skipped == [(rows[0].row_id, AMBIGUOUS)]
@@ -1071,7 +1073,7 @@ async def test_a_card_running_before_its_bank_statement_still_checks_out(tmp_pat
 
     result = await statement_post.post_statement(
         _card_statement([payment, purchase], "2500.00", "900.00"), {}, cfg,
-        entity="personal", liability=True, peer_rows=[bank_row],
+        entity="personal", chart=CHART, liability=True, peer_rows=[bank_row],
     )
 
     assert (payment.row_id, TRANSFER) in result.skipped
@@ -1111,10 +1113,10 @@ async def test_consecutive_card_statements_both_check_out_in_order(tmp_path):
     may, june = _may_and_june_cards()
 
     first = await statement_post.post_statement(
-        may, {}, cfg, entity="personal", liability=True,
+        may, {}, cfg, entity="personal", chart=CHART, liability=True,
     )
     second = await statement_post.post_statement(
-        june, {}, cfg, entity="personal", liability=True,
+        june, {}, cfg, entity="personal", chart=CHART, liability=True,
     )
 
     assert first.balance_checked is True and first.balance_reason == ""
@@ -1135,10 +1137,10 @@ async def test_an_older_statement_posted_later_does_not_count_the_newer_one(tmp_
     may, june = _may_and_june_cards()
 
     first = await statement_post.post_statement(
-        june, {}, cfg, entity="personal", liability=True,
+        june, {}, cfg, entity="personal", chart=CHART, liability=True,
     )
     second = await statement_post.post_statement(
-        may, {}, cfg, entity="personal", liability=True,
+        may, {}, cfg, entity="personal", chart=CHART, liability=True,
     )
 
     assert first.balance_checked is True and first.balance_reason == ""
@@ -1171,10 +1173,10 @@ async def test_a_counterpart_inside_the_rows_but_outside_the_printed_period(tmp_
     )
 
     first = await statement_post.post_statement(
-        bank, {}, cfg, entity="personal", peer_rows=card.rows,
+        bank, {}, cfg, entity="personal", chart=CHART, peer_rows=card.rows,
     )
     second = await statement_post.post_statement(
-        card, {}, cfg, entity="personal", liability=True, peer_rows=bank.rows,
+        card, {}, cfg, entity="personal", chart=CHART, liability=True, peer_rows=bank.rows,
     )
 
     assert first.balance_reason == ""
@@ -1220,7 +1222,7 @@ async def test_a_foreign_block_promoted_with_its_cost_lets_the_check_run(tmp_pat
     )
 
     result = await statement_post.post_statement(
-        stmt, {row.row_id: outcome}, cfg, entity="personal", liability=True
+        stmt, {row.row_id: outcome}, cfg, entity="personal", chart=CHART, liability=True
     )
 
     assert result.promoted == ["mail/anthropic"], result
@@ -1270,7 +1272,7 @@ async def test_promotion_moves_an_unplaceable_block_onto_the_account_it_proves(t
     )
 
     result = await statement_post.post_statement(
-        stmt, {row.row_id: outcome}, cfg, entity="personal", liability=True
+        stmt, {row.row_id: outcome}, cfg, entity="personal", chart=CHART, liability=True
     )
 
     assert result.promoted == ["mail/godaddy"], result
@@ -1312,7 +1314,7 @@ async def test_promotion_leaves_a_real_instrument_account_alone(tmp_path):
         delta_days=0,
     )
     result = await statement_post.post_statement(
-        stmt, {row.row_id: outcome}, cfg, entity="personal", liability=True
+        stmt, {row.row_id: outcome}, cfg, entity="personal", chart=CHART, liability=True
     )
     assert result.promoted == ["mail/godaddy"], result
     text = (cfg.path / "personal" / "2026.journal").read_text()

@@ -14,10 +14,10 @@ from zoneinfo import ZoneInfo
 
 import structlog
 from aegis.api.models.money import MoneyEvent, payee_key
-from aegis.services import books, ledger_write, reconciled, trading_desk
+from aegis.services import books, books_chart, ledger_write, reconciled, trading_desk
 from aegis.services import journal_index as ji
 from aegis.services.bank_parsers import has_money_shape, is_autopay, parse_any
-from aegis.services.books import UNKNOWN, account_for, instrument_account
+from aegis.services.books import instrument_account
 from temporalio import activity
 
 from aegis_worker.activities import money_render
@@ -395,6 +395,7 @@ class MoneyActivities:
         """One MoneyEvent for one stored email (spec §2 step 3): deterministic
         parsers, else the LLM on the full body; then mailbox entity, rules,
         account fallback, date fallback."""
+        chart = await books_chart.get_chart(self.db_pool)
         mailbox = receipt.get("account", "")
         if mailbox in self.ignored_mailboxes:
             return MoneyEvent(kind="ignore", entity="none", parser="mailbox").model_dump(
@@ -443,14 +444,18 @@ class MoneyActivities:
         # business instrument — that is stronger evidence than which inbox the
         # mail happened to land in.
         #
-        # SECURITY: only a deterministic parser may reach the `hikmah` branch.
+        # SECURITY: only a deterministic parser may name a non-default entity.
         # That holds because `_LLM_EVENT_FIELDS` in `aegis/llm/__init__.py`
         # does NOT include `entity`, so an extraction can never carry one. If
         # that allowlist ever gains `entity`, this guard stops being a guard
-        # and mail whose body says "this is a Hikmah invoice" routes itself
-        # into the business books.
-        if ev.entity != "hikmah":
-            ev.entity = self.mailbox_entities.get(mailbox, "personal")  # type: ignore[assignment]
+        # and mail whose body claims to be a company invoice routes itself into
+        # that company's books.
+        #
+        # `resolve`, not a bare comparison: an entity the chart does not
+        # configure IS the default one, so a name nothing defines must not beat
+        # the mailbox's answer.
+        if chart.resolve(ev.entity) == chart.default_entity:
+            ev.entity = self.mailbox_entities.get(mailbox, chart.default_entity)
         # `ev.direction`, because a rule may name one (issue #396): a rule from
         # an inbound answer must not file this payee's next PAYMENT into an
         # income account. `ev.direction` is nullable and that is passed through
@@ -461,7 +466,7 @@ class MoneyActivities:
                 ev.kind, ev.entity, ev.parser = "ignore", "none", f"{ev.parser}+rule"
                 ev.payee_key = payee_key(ev.payee)
                 return ev.model_dump(mode="json")
-            if rule.get("entity") in ("personal", "hikmah"):
+            if rule.get("entity") in chart.ids:
                 ev.entity = rule["entity"]
             if rule.get("payee"):
                 ev.payee = str(rule["payee"])
@@ -497,9 +502,9 @@ class MoneyActivities:
             # where nobody reviews it. The unknown account is the review queue.
             low = ev.parser == "llm" and ev.confidence < 0.8
             ev.account = (
-                UNKNOWN["hikmah" if ev.entity == "hikmah" else "personal"][side]
+                chart.unknown(ev.entity, side)
                 if low
-                else account_for(ev.category, ev.direction, ev.entity)
+                else chart.account_for(ev.category, ev.direction, ev.entity)
             )
         if ev.occurred_on is None and ev.kind == "transaction" and receipt.get("received_at"):
             received = datetime.fromisoformat(receipt["received_at"])
@@ -586,6 +591,7 @@ class MoneyActivities:
         """Route one event (spec §2 step 4, §5.4, §7.1). Transactions are
         posted or linked; everything else is indexed only."""
         ev = MoneyEvent(**{k: v for k, v in event.items() if not k.startswith("_")})
+        chart = await books_chart.get_chart(self.db_pool)
         msgid = ji.msgid_for(mailbox, message_id)
         # Only read the chart when there is an instrument to canonicalise --
         # most events have none (199 of 245 live rows), and each read spawns
@@ -737,7 +743,7 @@ class MoneyActivities:
                     return result
                 # Either way the index records what actually happened —
                 # `posted`, with the block it wrote.
-                rel = await books.post_event(ev, msgid, cfg)
+                rel = await books.post_event(ev, msgid, cfg, chart=chart)
                 await ji.upsert(
                     self.db_pool, msgid, mailbox, ev, journal_file=rel, declared=declared
                 )
@@ -922,6 +928,7 @@ class MoneyActivities:
         brief still ships the index half rather than nothing, which is what
         keeps an unconfigured or mid-clone checkout from silencing the lane.
         """
+        chart = await books_chart.get_chart(self.db_pool)
         today = datetime.now(ZoneInfo(self.home_tz)).date()
         since = today - timedelta(days=days)
         end = (today + timedelta(days=1)).isoformat()
@@ -929,10 +936,11 @@ class MoneyActivities:
             "as_of": today.isoformat(),
             "since": since.isoformat(),
             "books_ok": True,
-            "entities": {
-                "personal": {"income": "0", "expenses": "0"},
-                "hikmah": {"income": "0", "expenses": "0"},
-            },
+            # One bucket per configured set of books, in the chart's own order,
+            # and their labels beside them — the renderer names them from this
+            # rather than knowing any of them.
+            "entities": {e: {"income": "0", "expenses": "0"} for e in chart.ids},
+            "entity_labels": {e: chart.label(e) for e in chart.ids},
             "by_account": [],
             "top_payees": [],
             "forecast": [],
@@ -958,11 +966,12 @@ class MoneyActivities:
                     continue
                 account, balance = row[0], row[1]
                 unconverted.update(unconverted_commodities(balance))
-                ent = (
-                    "hikmah"
-                    if account.startswith(("expenses:hikmah", "income:hikmah"))
-                    else "personal"
-                )
+                # The chart decides which set of books an account belongs to —
+                # the same call `post_event` files it by, so the brief's split
+                # and the journal's can never disagree. An entity-neutral
+                # account cannot appear here (the query asks for `income` and
+                # `expenses` only), but the default is the honest fallback.
+                ent = chart.entity_of(account) or chart.default_entity
                 side = "income" if account.startswith("income") else "expenses"
                 brief["entities"][ent][side] = str(
                     Decimal(brief["entities"][ent][side]) + amount_from_cell(balance)
