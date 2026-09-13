@@ -196,11 +196,11 @@ activities:
     active: true
 
   # Raphael — nightly episodic diary (A8). One dated entry per day so
-  # retrieval has a timeline, not just topics. The day is bounded in your
-  # `user_timezone` setting (Vault page), so the cron should fire just after
-  # midnight IN THAT TIMEZONE — then the run's own date IS the day being
-  # logged and day_offset stays 0. The seed's 19:00 UTC is just after midnight
-  # for a UTC+5:30 user; set yours on /admin/flows (crons are DB-owned).
+  # retrieval has a timeline, not just topics. The run logs the LAST COMPLETE
+  # DAY on your clock (`user_timezone`, Vault page) and bounds it there, so
+  # the cron can fire at any time after midnight in that timezone, east or
+  # west of UTC; day_offset stays 0. The seed's 19:00 UTC is 00:30 for a
+  # UTC+5:30 user; set yours on /admin/flows (crons are DB-owned).
   - slug: daylog-nightly
     workflow_type: DayLogFlow
     agent_id: raphael
@@ -211,8 +211,10 @@ activities:
   # Raphael — weekly rollup (A9), same flow class with mode=weekly. Sunday
   # 20:20 UTC: after the nightly entry for that same Sunday lands (the seed's
   # 19:00), so the week it summarises — the vault layout's week, ISO Mon-Sun
-  # by default — is complete. Move it with the nightly cron if you change
-  # your timezone. Minute :20 on purpose — minute :00 is the busiest slot in
+  # by default, anchored on the last complete local day like the nightly —
+  # is complete. Move it with the nightly cron if you change your timezone
+  # (any time after local midnight on the day after the week's last day).
+  # Minute :20 on purpose — minute :00 is the busiest slot in
   # this file (two hourly flows plus every */N schedule land there), and :30
   # is the next busiest.
   - slug: daylog-weekly
@@ -227,8 +229,9 @@ activities:
   # operator, so this fires on days 28-31 and DayLogFlow's own guard drops
   # every run except the real month end (correct for February, 30- and
   # 31-day months alike). 21:20 UTC on that day, i.e. after both the seed's
-  # 19:00 nightly entry and any 20:20 weekly run for the same date; keep that
-  # order if you move the nightly cron to your own timezone.
+  # 19:00 nightly entry and any 20:20 weekly run for the same date; the
+  # guard tests the last complete local day, so keep the run after local
+  # midnight and after the nightly if you move the crons to your own zone.
   - slug: daylog-monthly
     workflow_type: DayLogFlow
     agent_id: raphael

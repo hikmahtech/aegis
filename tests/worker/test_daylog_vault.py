@@ -23,6 +23,7 @@ from tests.worker.test_daylog import (
     _add_completed_task,
     _add_daylog_entry,
     _iso_week_dates,
+    _logged,
     _RecordingKS,
     _run_flow,
     _wipe,
@@ -54,8 +55,9 @@ async def test_a_journaled_day_files_no_knowledge_row(clean_db):
     async with await WorkflowEnvironment.start_time_skipping() as env:
         with env.auto_time_skipping_disabled():
             now = await env.get_current_time()
-            await _add_completed_task(clean_db, "Ship the pgvector migration", now)
-            path = notes.daily_note_path(now.date())
+            logged = _logged(now)
+            await _add_completed_task(clean_db, "Ship the pgvector migration", logged)
+            path = notes.daily_note_path(logged.date())
             result = await _run_flow(
                 env.client,
                 ks,
@@ -63,7 +65,7 @@ async def test_a_journaled_day_files_no_knowledge_row(clean_db):
                 "daylog-vault-1",
                 extra_activities=[_journal_stub({"status": "written", "path": path}, seen)],
             )
-    day = now.strftime("%Y-%m-%d")
+    day = logged.strftime("%Y-%m-%d")
     assert result["status"] == "journaled"
     assert result["path"] == path and result["vault"] == "written"
     assert ks.calls == [], "the vault holds the day, so no knowledge row may be filed"
@@ -97,7 +99,7 @@ async def test_a_weekly_rollup_goes_to_the_journal(clean_db):
     async with await WorkflowEnvironment.start_time_skipping() as env:
         with env.auto_time_skipping_disabled():
             now = await env.get_current_time()
-            dates = _iso_week_dates(now)
+            dates = _iso_week_dates(_logged(now))
             for i, d in enumerate(dates):
                 await _add_daylog_entry(clean_db, d, [f"Day {i}: marker-{i}."])
             result = await _run_flow(

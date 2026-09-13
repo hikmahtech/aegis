@@ -10,10 +10,13 @@ natural key, so a re-run of the same date updates rather than duplicates
 A quiet day is still filed (`metadata.quiet = true`): "nothing happened" is
 data, and A9's rollups need every date present to reason about a week.
 
-Scheduled nightly, just after midnight in the user's timezone (the
-`user_timezone` setting; the seed's cron is one such time) — after the day
-closes, so the run's own date IS the day being logged and its events are
-bounded on the user's clock.
+Scheduled nightly, any time after midnight in the user's timezone (the
+`user_timezone` setting; the seed's cron is one such time). The run logs the
+most recent COMPLETE local day — the local date of the run's clock, minus
+one (`logged_day`) — and bounds its events on the same clock. The clock is
+converted by an activity (`daylog_local_day`), because a workflow cannot read
+the row; the old rule (the run's own UTC date) gave the day that had just
+STARTED for anyone west of UTC.
 
 A9 folds the weekly and monthly rollups into this same flow class via
 `DayLogConfig.mode`: the period runs read the already-filed daily entries
@@ -37,7 +40,7 @@ literal id.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 
 from temporalio import workflow
 
@@ -67,10 +70,10 @@ class DayLogConfig:
 
     NOTE (deviation from the A8 sketch, which proposed `lookback_hours: int
     = 24`): the entry's identity is a calendar DATE, not a rolling window, so
-    an hours knob can only ever be converted back into a date — and at a
-    just-after-midnight cron a literal 24h lookback lands on the PREVIOUS
-    date, i.e. the wrong day. `day_offset` says the same thing without the
-    off-by-one: 0 = the date the run starts on (the day that just closed).
+    an hours knob can only ever be converted back into a date. `day_offset`
+    says it without the off-by-one: 0 = the most recent complete day on the
+    user's clock (yesterday, local time, at any time after local midnight),
+    1 = the day before that.
 
     In a rollup mode `day_offset` shifts the same anchor, so the window is the
     period that date falls in: `day_offset=7` on a Sunday re-files the previous
@@ -89,6 +92,17 @@ class DayLogConfig:
 
 
 _ROLLUP_MODES = ("weekly", "monthly")
+# The change of rule: a run started before it replays the UTC date it used.
+_LOCAL_DATE_PATCH = "daylog-local-date"
+
+
+def logged_day(local_today: date, day_offset: int = 0) -> date:
+    """The day a run logs: the most recent complete day on the user's clock
+    (`local_today` minus one), `day_offset` days further back. With the
+    shipped cron (19:00 UTC = 00:30 IST) this is the date the old UTC rule
+    gave, so a deployment east of UTC sees no change; west of UTC it is now
+    the day that closed rather than the one that just began."""
+    return local_today - timedelta(days=1 + day_offset)
 
 
 def rollup_window(
@@ -129,7 +143,7 @@ class DayLogFlow:
         if config.mode != "daily":
             return await self._run_rollup(config, agent_id)
 
-        target_date = (workflow.now() - timedelta(days=config.day_offset)).strftime("%Y-%m-%d")
+        target_date = (await self._anchor(config.day_offset)).isoformat()
         workflow.logger.info("daylog_starting date=%s", target_date)
 
         try:
@@ -280,6 +294,28 @@ class DayLogFlow:
             workflow.logger.warning("daylog_journal_failed label=%s err=%s", label, str(exc)[:200])
             return {"status": "error", "error": str(exc)[:200]}
 
+    async def _anchor(self, day_offset: int) -> date:
+        """The day this run is about, on the user's clock: the most recent
+        complete local day, `day_offset` days back (`logged_day`). A run that
+        started under the old rule replays the UTC date it used (the patch);
+        a failed clock lookup falls back to that rule too, so a day is still
+        logged."""
+        now = workflow.now()
+        if not workflow.patched(_LOCAL_DATE_PATCH):
+            return (now - timedelta(days=day_offset)).date()
+        try:
+            clock = await workflow.execute_activity_method(
+                DayLogActivities.daylog_local_day,
+                args=[now.isoformat()],
+                start_to_close_timeout=TIMEOUT_FAST,
+                retry_policy=RETRY_ONCE,
+            )
+            local_today = date.fromisoformat(str((clock or {}).get("date") or ""))
+        except Exception as exc:  # noqa: BLE001 — a day is still logged, on UTC
+            workflow.logger.warning("daylog_local_day_failed err=%s", str(exc)[:200])
+            return (now - timedelta(days=day_offset)).date()
+        return logged_day(local_today, day_offset)
+
     async def _week_rule(self) -> dict:
         """The vault layout's week rule. On a failure the shipped rule (ISO
         weeks) — a rollup must run even if the row cannot be read."""
@@ -314,10 +350,12 @@ class DayLogFlow:
         # already in the journal: the note carries the period's marker and the
         # journal is append-only (`vault: exists`). To redo one, delete
         # the agent's section from the note by hand, then re-run.
+        # The anchor is the same "last complete local day" the daily run
+        # uses, so the period's label — the entry's marker key — is the one
+        # the daily entries in it carry.
         rule = await self._week_rule() if config.mode == "weekly" else {}
-        window = rollup_window(
-            config.mode, workflow.now() - timedelta(days=config.day_offset), **rule
-        )
+        anchor = await self._anchor(config.day_offset)
+        window = rollup_window(config.mode, datetime.combine(anchor, datetime.min.time()), **rule)
         if window is None:
             workflow.logger.info("daylog_rollup_not_period_end mode=%s", config.mode)
             return {"status": "skipped", "reason": "not_period_end", "mode": config.mode}

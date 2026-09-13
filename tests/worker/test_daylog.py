@@ -378,6 +378,7 @@ async def _run_flow(client, ks, day_acts, task_queue: str, extra_activities=None
         day_acts.gather_daylogs,
         day_acts.distil_rollup,
         day_acts.vault_week_rule,
+        day_acts.daylog_local_day,
         content_acts.ingest_content,
         _vault_not_configured,
     ]
@@ -409,17 +410,18 @@ async def test_flow_files_one_entry_whose_text_reflects_the_day(clean_db):
         # between an idle moment and the next run.
         with env.auto_time_skipping_disabled():
             now = await env.get_current_time()
-            await _add_completed_task(clean_db, "Ship the pgvector migration", now)
+            logged = _logged(now)
+            await _add_completed_task(clean_db, "Ship the pgvector migration", logged)
             await _add_calendar_event(
-                clean_db, "Standup with Zara", now.strftime("%Y-%m-%dT09:00:00")
+                clean_db, "Standup with Zara", logged.strftime("%Y-%m-%dT09:00:00")
             )
-            await _add_resolved_interaction(clean_db, "Renew the domain?", "yes", now)
+            await _add_resolved_interaction(clean_db, "Renew the domain?", "yes", logged)
 
             result = await _run_flow(
                 env.client, ks, DayLogActivities(db_pool=clean_db, llm_client=None), "daylog-t1"
             )
 
-    expected_date = now.strftime("%Y-%m-%d")
+    expected_date = logged.strftime("%Y-%m-%d")
     assert result["status"] == "ingested"
     assert result["date"] == expected_date
     assert len(ks.calls) == 1
@@ -444,7 +446,7 @@ async def test_flow_rerun_for_the_same_date_updates_the_same_entry(clean_db):
     async with await WorkflowEnvironment.start_time_skipping() as env:
         with env.auto_time_skipping_disabled():
             now = await env.get_current_time()
-            await _add_completed_task(clean_db, "Ship the pgvector migration", now)
+            await _add_completed_task(clean_db, "Ship the pgvector migration", _logged(now))
             acts = DayLogActivities(db_pool=clean_db, llm_client=None)
             first = await _run_flow(env.client, ks, acts, "daylog-t2")
             state_after_first = await clean_db.fetchval(
@@ -537,6 +539,12 @@ async def _add_daylog_entry(pool, date: str, chunks: list[str]):
             i,
             text,
         )
+
+
+def _logged(now: datetime) -> datetime:
+    """The day a run at `now` logs: the last complete day on the user's clock
+    (UTC in these tests, no `user_timezone` row), i.e. yesterday."""
+    return now - timedelta(days=1)
 
 
 def _iso_week_dates(now: datetime) -> list[str]:
@@ -785,7 +793,7 @@ async def test_weekly_rollup_files_one_entry_covering_every_day_of_the_week(clea
         # YEARS between runs, and every assertion here is date-sensitive.
         with env.auto_time_skipping_disabled():
             now = await env.get_current_time()
-            dates = _iso_week_dates(now)
+            dates = _iso_week_dates(_logged(now))
             for i, d in enumerate(dates):
                 await _add_daylog_entry(clean_db, d, [f"Day {i}: worked on marker-{i}."])
             result = await _run_flow(
@@ -796,7 +804,7 @@ async def test_weekly_rollup_files_one_entry_covering_every_day_of_the_week(clea
                 config=DayLogConfig(agent_id="raphael", mode="weekly"),
             )
 
-    iso = now.isocalendar()
+    iso = _logged(now).isocalendar()
     label = f"{iso[0]}-W{iso[1]:02d}"
     assert result["status"] == "ingested"
     assert result["label"] == label
@@ -824,8 +832,8 @@ async def test_day_offset_rolls_up_a_past_week_in_place(clean_db):
     async with await WorkflowEnvironment.start_time_skipping() as env:
         with env.auto_time_skipping_disabled():
             now = await env.get_current_time()
-            this_week = _iso_week_dates(now)
-            last_week = _iso_week_dates(now - timedelta(days=7))
+            this_week = _iso_week_dates(_logged(now))
+            last_week = _iso_week_dates(_logged(now) - timedelta(days=7))
             for d in [*last_week, *this_week]:
                 await _add_daylog_entry(clean_db, d, [f"Entry for {d}."])
             result = await _run_flow(
@@ -837,7 +845,7 @@ async def test_day_offset_rolls_up_a_past_week_in_place(clean_db):
             )
 
     assert result["status"] == "ingested"
-    expected = (now - timedelta(days=7)).isocalendar()
+    expected = (_logged(now) - timedelta(days=7)).isocalendar()
     label = f"{expected[0]}-W{expected[1]:02d}"
     assert result["label"] == label, f"rolled up {result['label']}, wanted {label}"
     assert len(ks.calls) == 1
@@ -856,7 +864,9 @@ async def test_rollup_with_fewer_than_two_entries_writes_nothing(clean_db):
     async with await WorkflowEnvironment.start_time_skipping() as env:
         with env.auto_time_skipping_disabled():
             now = await env.get_current_time()
-            await _add_daylog_entry(clean_db, _iso_week_dates(now)[0], ["Only one day recorded."])
+            await _add_daylog_entry(
+                clean_db, _iso_week_dates(_logged(now))[0], ["Only one day recorded."]
+            )
             result = await _run_flow(
                 env.client,
                 ks,
@@ -880,7 +890,9 @@ async def _run_monthly_at(clean_db, ks, day_in_month, task_queue: str):
     what date the suite happens to run.
 
     `day_in_month` picks a day of the month AFTER the environment's start
-    month (a whole clean month, fully seedable): an int, or "last".
+    month (a whole clean month, fully seedable): an int, or "last". The run
+    itself happens at 00:20 the NEXT day — the flow logs the last complete
+    day on the user's clock, so that is when a run "for" `day_in_month` fires.
     """
     async with await WorkflowEnvironment.start_time_skipping() as env:
         with env.auto_time_skipping_disabled():
@@ -888,7 +900,9 @@ async def _run_monthly_at(clean_db, ks, day_in_month, task_queue: str):
         month = _first_of_next_month(start)
         end_of_month = _first_of_next_month(month) - timedelta(days=1)
         day = end_of_month.day if day_in_month == "last" else day_in_month
-        target = month.replace(day=day, hour=21, minute=20, second=0, microsecond=0)
+        target = month.replace(day=day, hour=0, minute=20, second=0, microsecond=0) + timedelta(
+            days=1
+        )
         await env.sleep(target - start)
 
         with env.auto_time_skipping_disabled():
@@ -945,7 +959,7 @@ async def test_daily_mode_is_unchanged_by_the_rollup_branch(clean_db):
     async with await WorkflowEnvironment.start_time_skipping() as env:
         with env.auto_time_skipping_disabled():
             now = await env.get_current_time()
-            await _add_completed_task(clean_db, "Ship the pgvector migration", now)
+            await _add_completed_task(clean_db, "Ship the pgvector migration", _logged(now))
             result = await _run_flow(
                 env.client,
                 ks,
@@ -954,7 +968,7 @@ async def test_daily_mode_is_unchanged_by_the_rollup_branch(clean_db):
                 config=DayLogConfig(agent_id="raphael", mode="daily"),
             )
 
-    expected_date = now.strftime("%Y-%m-%d")
+    expected_date = _logged(now).strftime("%Y-%m-%d")
     assert result["status"] == "ingested"
     assert result["date"] == expected_date
     assert len(ks.calls) == 1

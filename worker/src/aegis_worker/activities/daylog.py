@@ -20,9 +20,9 @@ reads are legacy n8n leftovers with NO writer anywhere in this repo, so they
 are deliberately NOT a source here.
 
 Day boundaries are the user's (`user_timezone`, `services/user_time.py`;
-UTC when unset). The date itself comes from the flow's clock, so the nightly
-cron should fire just after midnight in that timezone — then the run's own
-date is the day that just closed and `day_offset` stays 0.
+UTC when unset), and so is the date: the flow logs the last complete local
+day (`daylog_local_day` converts its clock), so the nightly cron can fire at
+any time after midnight in that timezone and `day_offset` stays 0.
 
 The wording of the deterministic entry (the labels, the quiet-day line, the
 rollup header) and the language the model is asked to write in come from the
@@ -249,6 +249,20 @@ class DayLogActivities:
 
     async def _layout(self) -> Layout:
         return await get_layout(self.db_pool)
+
+    @activity.defn
+    async def daylog_local_day(self, now_iso: str) -> dict:
+        """The workflow's clock on the user's (`user_timezone`): `{"timezone",
+        "date"}`, the local calendar date of `now_iso`. The flow logs the day
+        BEFORE it — the most recent complete local day — so the nightly cron
+        can sit at any time after local midnight, east or west of UTC. A
+        workflow cannot read the row itself, and the result is recorded in
+        its history, so a replay sees the same date."""
+        tz = await user_zone(self.db_pool)
+        now = datetime.fromisoformat(now_iso)
+        if now.tzinfo is None:
+            now = now.replace(tzinfo=UTC)
+        return {"timezone": tz.key, "date": now.astimezone(tz).date().isoformat()}
 
     @activity.defn
     async def vault_week_rule(self) -> dict:

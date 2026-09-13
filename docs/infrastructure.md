@@ -2104,10 +2104,13 @@ those defaults.
   deploy key" and no URL or git output in it.
 - **Dates:** a dated heading (`note_write` with no heading, a research
   answer's section — the layout's `date_heading_format`), the time on a
-  journal note the agent creates and the day the daylog gathers are on the
+  journal note the agent creates and the day the daylog logs are on the
   user's clock, the `user_timezone` settings row (Vault page, "Your clock"),
-  not the container's UTC. Set the nightly cron to just after midnight in
-  that zone.
+  not the container's UTC. The nightly run logs the last complete local day
+  (the local date of its clock, minus one) and bounds it on that clock, and
+  the weekly and monthly rollups anchor on the same day; so the crons can sit
+  at any time after local midnight, east or west of UTC. `day_offset` walks
+  further back from there.
 - **What insert-only rules out:** the agent cannot fill in a placeholder that
   is already in a note, such as an empty `- ` bullet the template left. It
   inserts its own block instead. Only a note it creates from a template loses
