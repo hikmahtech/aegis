@@ -16,6 +16,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 import httpx
+from aegis.errors import error_text
 from aegis.services import hub, work_sessions
 from aegis.services.agent_task_verbs import (
     DEFAULT_VERBS,
@@ -85,7 +86,7 @@ async def load_verbs(pool: Any) -> dict[str, str | None]:
     try:
         value = await pool.fetchval("SELECT value FROM settings WHERE key = $1", VERBS_SETTING)
     except Exception as exc:  # noqa: BLE001 — routing must never break on a config read
-        activity.logger.warning("agent_task_verbs_read_failed err=%s", str(exc)[:200])
+        activity.logger.warning("agent_task_verbs_read_failed err=%s", error_text(exc))
         return dict(DEFAULT_VERBS)
     return merge_verbs(value)
 
@@ -357,7 +358,7 @@ async def _probe(url: str) -> dict:
             response = await client.get(url)
     except Exception as exc:  # noqa: BLE001 — a failed probe IS the finding
         return {"ok": False, "status": 0, "ms": 0,
-                "error": f"{type(exc).__name__}: {str(exc)[:160]}"}
+                "error": error_text(exc)}
     return {
         "ok": response.status_code < 400,
         "status": response.status_code,
@@ -561,7 +562,7 @@ class AgentTaskActivities:
             await work_sessions.set_state(self.db_pool, task_id, status="parked", summary=reason)
         except Exception as exc:  # noqa: BLE001 — the park itself must still land
             activity.logger.warning(
-                "task_park_state_not_recorded task_id=%s err=%s", task_id, str(exc)[:200]
+                "task_park_state_not_recorded task_id=%s err=%s", task_id, error_text(exc)
             )
         if PARK_LABEL in labels:
             return {"parked": True}
@@ -634,7 +635,7 @@ class AgentTaskActivities:
                 result = await self.todoist_connector.commands([cmd])
                 status = TodoistConnector.check_sync_status(result, [cmd["uuid"]])
             except Exception as exc:  # noqa: BLE001 — comments are best-effort
-                last_error = str(exc)[:200]
+                last_error = error_text(exc)
                 activity.logger.warning(
                     "agent_task_comment_failed task_id=%s attempt=%s err=%s",
                     task_id,
@@ -1245,7 +1246,7 @@ class AgentTaskActivities:
         try:
             text = await self.alert_act._read_runbook(alertname)
         except Exception as exc:  # noqa: BLE001
-            activity.logger.warning("agent_task_runbook_read_failed err=%s", str(exc)[:200])
+            activity.logger.warning("agent_task_runbook_read_failed err=%s", error_text(exc))
             return ""
         return f"Runbook ({alertname}):\n{_cut(text, _RUNBOOK_CAP)}" if text else ""
 
@@ -1313,7 +1314,7 @@ class AgentTaskActivities:
         try:
             resolved = await self.alert_act.resolve_alert_resource(synthetic_alert)
         except Exception as exc:  # noqa: BLE001 — tier 2 is best-effort; never guess on error
-            activity.logger.warning("agent_task_repo_tier2_failed err=%s", str(exc)[:200])
+            activity.logger.warning("agent_task_repo_tier2_failed err=%s", error_text(exc))
             return empty
 
         # Candidate shape matches what _build_repo_confirm_prompt expects
@@ -1540,7 +1541,7 @@ class AgentTaskActivities:
                     )
                 except Exception as exc:  # noqa: BLE001 — unknown is "not running"
                     activity.logger.warning(
-                        "task_turn_probe_failed task_id=%s err=%s", task_id, str(exc)[:200]
+                        "task_turn_probe_failed task_id=%s err=%s", task_id, error_text(exc)
                     )
                     alive = False
                 if alive:
@@ -1574,9 +1575,9 @@ class AgentTaskActivities:
             return proceed
         except Exception as exc:  # noqa: BLE001 — see the docstring: fails open
             activity.logger.warning(
-                "task_collision_check_failed task_id=%s err=%s", task_id, str(exc)[:200]
+                "task_collision_check_failed task_id=%s err=%s", task_id, error_text(exc)
             )
-            return {**proceed, "reason": f"check failed: {str(exc)[:200]}"}
+            return {**proceed, "reason": f"check failed: {error_text(exc)}"}
 
     @activity.defn
     async def reconcile_work_sessions(self) -> dict:
@@ -1605,7 +1606,7 @@ class AgentTaskActivities:
                         if s.get("session_id")
                     ]
             except Exception as exc:  # noqa: BLE001
-                activity.logger.warning("work_sessions_inventory_failed err=%s", str(exc)[:200])
+                activity.logger.warning("work_sessions_inventory_failed err=%s", error_text(exc))
         if status != "ok":
             return {"refreshed": 0, "parked": 0, "inventory": status}
         result = await work_sessions.reconcile_operator_sessions(self.db_pool, live)
@@ -1700,7 +1701,7 @@ class AgentTaskActivities:
                 )
             except Exception as exc:  # noqa: BLE001
                 activity.logger.warning(
-                    "task_last_run_not_recorded task_id=%s err=%s", task_id, str(exc)[:200]
+                    "task_last_run_not_recorded task_id=%s err=%s", task_id, error_text(exc)
                 )
         return {
             "status": "running",

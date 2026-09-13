@@ -36,6 +36,7 @@ import datetime as dt
 from dataclasses import dataclass
 from typing import Any
 
+from aegis.errors import error_text
 from temporalio import activity
 
 
@@ -80,7 +81,7 @@ class PeopleActivities:
             activity.logger.warning(
                 "enrich_people_from_email_failed msg_id=%s err=%s",
                 msg.get("id", ""),
-                str(exc)[:200],
+                error_text(exc),
             )
             return {"outcome": "error"}
 
@@ -132,7 +133,7 @@ class PeopleActivities:
                     )
                 except Exception as exc:  # noqa: BLE001 — one bad attendee, not the run
                     activity.logger.warning(
-                        "enrich_people_from_events_attendee_failed err=%s", str(exc)[:200]
+                        "enrich_people_from_events_attendee_failed err=%s", error_text(exc)
                     )
                     outcome = "error"
                 tally[outcome] = tally.get(outcome, 0) + 1

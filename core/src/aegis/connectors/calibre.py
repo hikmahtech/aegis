@@ -34,6 +34,7 @@ import httpx
 import structlog
 
 from aegis.connectors._base import HTTPConnector
+from aegis.errors import error_text
 
 logger = structlog.get_logger()
 
@@ -220,7 +221,7 @@ class CalibreConnector(HTTPConnector):
         try:
             resp = await client.get(path, params=params)
         except httpx.HTTPError as exc:
-            await self._record("get", "error", int((time.monotonic() - started) * 1000), str(exc))
+            await self._record("get", "error", int((time.monotonic() - started) * 1000), error_text(exc, 500))
             raise CalibreError(f"calibre-web is unreachable at {self._base_url}: {exc}") from exc
         latency = int((time.monotonic() - started) * 1000)
         if resp.status_code in _REDIRECTS:

@@ -55,6 +55,8 @@ from datetime import timedelta
 from temporalio import workflow
 
 with workflow.unsafe.imports_passed_through():
+    from aegis.errors import error_text
+
     from aegis_worker.activities.inventory import WorkspaceReposInput
     from aegis_worker.shared.retry import NO_RETRY, RETRY_ONCE
 
@@ -124,7 +126,7 @@ class WorkspaceRepoSyncFlow:
                     webhook_check.get("missing_webhooks_count"),
                 )
         except Exception as exc:
-            workflow.logger.error("github_webhook_check_failed error=%s", str(exc)[:200])
+            workflow.logger.error("github_webhook_check_failed error=%s", error_text(exc))
             # status='failed' keeps this empty set from becoming the next run's
             # baseline, which would flag the whole backlog as newly missing.
             webhook_check = {

@@ -18,6 +18,7 @@ from typing import Literal
 import asyncpg
 import structlog
 
+from aegis.errors import error_text
 from aegis.services.todoist_config import resolve_todoist_api_key
 from aegis.services.tools.base import ToolContext
 from aegis.services.tools.registry import aegis_tool
@@ -194,7 +195,7 @@ async def _assignee_labels(pool: asyncpg.Pool | None) -> list[str]:
             labels.extend(f"@{str(a).lstrip('@')}" for a in aliases)
         return labels or fallback
     except Exception as exc:  # noqa: BLE001 — never break the tool on a config read
-        logger.warning("handoff_assignee_labels_failed", error=str(exc)[:200])
+        logger.warning("handoff_assignee_labels_failed", error=error_text(exc))
         return fallback
 
 
@@ -759,7 +760,7 @@ async def _exec_find_reference(
                     cid = item.get("content_id") or item.get("id") or ""
                     out.append(f"- [{cid}] {title} (score={score:.2f})")
         except Exception as exc:  # noqa: BLE001
-            logger.warning("find_reference_ks_failed", error=str(exc)[:200])
+            logger.warning("find_reference_ks_failed", error=error_text(exc))
     if not out:
         return "No reference matches."
     return "\n".join(out)

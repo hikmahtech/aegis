@@ -31,6 +31,7 @@ from dataclasses import dataclass
 from datetime import date
 from typing import Any
 
+from aegis.errors import error_text
 from aegis.services import notes
 from aegis.services import notes_write as nw
 from aegis.services.agents import resolve_tag
@@ -104,7 +105,7 @@ class NotesActivities:
             name = await self.db_pool.fetchval("SELECT name FROM agents WHERE id = $1", agent_id)
             return notes.author_for(agent_id, name)
         except Exception as exc:  # noqa: BLE001 — identity is a nicety
-            activity.logger.warning("notes_author_lookup_failed err=%s", str(exc)[:200])
+            activity.logger.warning("notes_author_lookup_failed err=%s", error_text(exc))
             return notes.author_for(agent_id)
 
     # ------------------------------------------------------------ writes
@@ -158,8 +159,8 @@ class NotesActivities:
         except notes.JournalKindDisabled:
             return {"status": "disabled"}
         except (notes.NotesError, KeyError, ValueError) as exc:
-            activity.logger.warning("notes_journal_write_failed err=%s", str(exc)[:300])
-            return {"status": "error", "error": str(exc)[:300]}
+            activity.logger.warning("notes_journal_write_failed err=%s", error_text(exc, 300))
+            return {"status": "error", "error": error_text(exc, 300)}
         # The note it actually went to: the filed path, or the day's live note
         # at the journal root when the user had one open.
         outcomes = res.get("outcomes") or [{}]
@@ -185,7 +186,7 @@ class NotesActivities:
         try:
             return int(bool(await self.knowledge_connector.delete_content(content_id)))
         except Exception as exc:  # noqa: BLE001 — a stale row is retried next pass
-            activity.logger.warning("notes_unindex_failed path=%s err=%s", what, str(exc)[:200])
+            activity.logger.warning("notes_unindex_failed path=%s err=%s", what, error_text(exc))
             return 0
 
     async def _unindex(self, rel: str) -> int:
@@ -280,7 +281,7 @@ class NotesActivities:
                 indexed += 1
             except Exception as exc:  # noqa: BLE001 — one note must not stop the pass
                 retry.append(rel)
-                activity.logger.warning("notes_index_failed path=%s err=%s", rel, str(exc)[:200])
+                activity.logger.warning("notes_index_failed path=%s err=%s", rel, error_text(exc))
 
         done += len(batch)
         remaining = max(0, len(todo) - done)

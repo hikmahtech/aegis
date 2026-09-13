@@ -30,6 +30,7 @@ from temporalio.exceptions import ApplicationError, WorkflowAlreadyStartedError
 
 with workflow.unsafe.imports_passed_through():
     from aegis.connectors.remote_script import _PROMPT_CAP_BYTES
+    from aegis.errors import error_text
     from aegis.services.research import task_workflow_id, urls_in
 
     from aegis_worker.activities.agent_run import AgentRunActivities
@@ -371,7 +372,7 @@ class AgentTaskSweepFlow:
                     workflow.logger.warning(
                         "agent_task_spawn_failed task_id=%s err=%s",
                         task["id"],
-                        str(exc)[:200],
+                        error_text(exc),
                     )
 
             # The fallback for a missed Todoist webhook, and the only path that
@@ -406,7 +407,7 @@ class AgentTaskSweepFlow:
                 retry_policy=NO_RETRY,
             )
         except Exception as exc:  # noqa: BLE001
-            workflow.logger.warning("work_sessions_reconcile_failed err=%s", str(exc)[:200])
+            workflow.logger.warning("work_sessions_reconcile_failed err=%s", error_text(exc))
 
     async def _due_turns(self, limit: int) -> list:
         """Tasks whose newest user comment is newer than their last turn.
@@ -424,7 +425,7 @@ class AgentTaskSweepFlow:
                 retry_policy=ACT_RETRY,
             )
         except Exception as exc:  # noqa: BLE001
-            workflow.logger.warning("agent_task_sweep_due_fetch_failed err=%s", str(exc)[:200])
+            workflow.logger.warning("agent_task_sweep_due_fetch_failed err=%s", error_text(exc))
             return []
 
     async def _dispatch_turn(self, row: dict, config: AgentTaskSweepConfig) -> int:
@@ -459,7 +460,7 @@ class AgentTaskSweepFlow:
             pass
         except Exception as exc:  # noqa: BLE001
             workflow.logger.warning(
-                "agent_task_turn_start_failed task_id=%s err=%s", task_id, str(exc)[:200]
+                "agent_task_turn_start_failed task_id=%s err=%s", task_id, error_text(exc)
             )
             return 0
         try:
@@ -470,7 +471,7 @@ class AgentTaskSweepFlow:
             # comment is still unconsumed, so the next tick starts a fresh
             # workflow for it — 15 minutes later, not never.
             workflow.logger.warning(
-                "agent_task_turn_signal_failed task_id=%s err=%s", task_id, str(exc)[:200]
+                "agent_task_turn_signal_failed task_id=%s err=%s", task_id, error_text(exc)
             )
             return 0
 
@@ -701,7 +702,7 @@ class AgentTaskFlow:
             problem = got if isinstance(got, dict) else {}
         except Exception as exc:  # noqa: BLE001 — the timeline is extra
             workflow.logger.warning(
-                "research_task_problem_failed task_id=%s err=%s", task_id, str(exc)[:200]
+                "research_task_problem_failed task_id=%s err=%s", task_id, error_text(exc)
             )
         question, context, seeds = title, _cut(description), urls_in(description, limit=3)
         if problem.get("class") == "topic" and problem.get("topic"):
@@ -1192,7 +1193,7 @@ class AgentTaskFlow:
             )
         except Exception as exc:  # noqa: BLE001
             workflow.logger.warning(
-                "task_turn_not_counted task_id=%s err=%s", task_id, str(exc)[:200]
+                "task_turn_not_counted task_id=%s err=%s", task_id, error_text(exc)
             )
 
     async def _deliver(
@@ -1222,7 +1223,7 @@ class AgentTaskFlow:
             )
         except Exception as exc:  # noqa: BLE001
             workflow.logger.warning(
-                "agent_task_delivery_failed agent=%s err=%s", agent_id, str(exc)[:200]
+                "agent_task_delivery_failed agent=%s err=%s", agent_id, error_text(exc)
             )
             return None
 
@@ -1264,7 +1265,7 @@ class AgentTaskFlow:
             )
         except Exception as exc:  # noqa: BLE001
             workflow.logger.warning(
-                "task_slack_ref_not_stored task_id=%s err=%s", task_id, str(exc)[:200]
+                "task_slack_ref_not_stored task_id=%s err=%s", task_id, error_text(exc)
             )
 
     async def _run_coding(self, input: AgentTaskFlowInput, task_id: str, task: dict) -> dict:
@@ -1576,7 +1577,7 @@ class AgentTaskFlow:
             )
         except Exception as exc:  # noqa: BLE001
             workflow.logger.warning(
-                "task_plan_not_recorded task_id=%s err=%s", task_id, str(exc)[:200]
+                "task_plan_not_recorded task_id=%s err=%s", task_id, error_text(exc)
             )
 
     async def _kill_turn(self, output_file: str, host: str) -> None:
@@ -1596,7 +1597,7 @@ class AgentTaskFlow:
             )
         except Exception as exc:  # noqa: BLE001
             workflow.logger.warning(
-                "agent_task_kill_failed output_file=%s err=%s", output_file, str(exc)[:200]
+                "agent_task_kill_failed output_file=%s err=%s", output_file, error_text(exc)
             )
 
     async def _fetch_tail(self, output_file: str, host: str) -> str:
@@ -1619,7 +1620,7 @@ class AgentTaskFlow:
             )
         except Exception as exc:  # noqa: BLE001
             workflow.logger.warning(
-                "agent_task_tail_fetch_failed output_file=%s err=%s", output_file, str(exc)[:200]
+                "agent_task_tail_fetch_failed output_file=%s err=%s", output_file, error_text(exc)
             )
             return ""
         return str(check.get("output") or "")

@@ -37,6 +37,8 @@ from typing import Any
 
 import structlog
 
+from aegis.errors import error_text
+
 logger = structlog.get_logger()
 
 GOVERNOR_KEY = "llm_governor"
@@ -67,7 +69,7 @@ async def get_governor_config(pool: Any) -> dict[str, Any]:
     try:
         row = await pool.fetchrow("SELECT value FROM settings WHERE key = $1", GOVERNOR_KEY)
     except Exception as exc:  # noqa: BLE001 — a settings read must not break the flow
-        logger.warning("llm_governor_config_read_failed", error=str(exc)[:200])
+        logger.warning("llm_governor_config_read_failed", error=error_text(exc))
         return cfg
     value = row["value"] if row else None
     if isinstance(value, dict):
@@ -91,7 +93,7 @@ async def get_kill_switch(pool: Any, *, use_cache: bool = True) -> dict[str, Any
     try:
         row = await pool.fetchrow("SELECT value FROM settings WHERE key = $1", KILL_KEY)
     except Exception as exc:  # noqa: BLE001 — fail open, see docstring
-        logger.warning("llm_kill_switch_read_failed", error=str(exc)[:200])
+        logger.warning("llm_kill_switch_read_failed", error=error_text(exc))
         return dict(_INACTIVE)
 
     value = row["value"] if row else None

@@ -9,6 +9,7 @@ import structlog
 from aegis.config import Settings
 from aegis.connectors.search import SearchConnector
 from aegis.db import create_pool, wait_for_migrations
+from aegis.errors import error_text
 from aegis.llm import LLMClient
 
 logger = structlog.get_logger()
@@ -161,7 +162,7 @@ async def bootstrap(settings: Settings | None = None) -> WorkerDeps:
     try:
         install_deploy_key(settings)
     except Exception as exc:  # noqa: BLE001 — a bad key must not block boot
-        logger.warning("books_deploy_key_install_failed", error=str(exc)[:200])
+        logger.warning("books_deploy_key_install_failed", error=error_text(exc))
 
     # The vault key (#514), the same way, before the daylog or the notes index
     # first touch the checkout.
@@ -170,7 +171,7 @@ async def bootstrap(settings: Settings | None = None) -> WorkerDeps:
     try:
         notes_service.install_deploy_key(settings)
     except Exception as exc:  # noqa: BLE001 — a bad key must not block boot
-        logger.warning("notes_deploy_key_install_failed", error=str(exc)[:200])
+        logger.warning("notes_deploy_key_install_failed", error=error_text(exc))
 
     # LLM client + tier map from the configurable backend (DB → env fallback).
     # Cap the fast tier at 2 concurrent calls — it typically shares a GPU with
@@ -190,7 +191,7 @@ async def bootstrap(settings: Settings | None = None) -> WorkerDeps:
         )
     except Exception as exc:  # noqa: BLE001 — a bad routing table must not block boot
         set_routes(None)
-        logger.warning("llm_routes_invalid", error=str(exc)[:200])
+        logger.warning("llm_routes_invalid", error=error_text(exc))
     llm = LLMClient(
         base_url=backend["base_url"],
         api_key=backend["api_key"],

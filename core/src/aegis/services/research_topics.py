@@ -43,6 +43,7 @@ from typing import Any
 import asyncpg
 import structlog
 
+from aegis.errors import error_text
 from aegis.services import topics_config
 from aegis.services.hub import (
     TOPIC_CLASS,
@@ -251,7 +252,7 @@ async def _close_resolved_round(
         await hub_project.project(pool, problem_id, now=now)
     except Exception as exc:  # noqa: BLE001 — Todoist being down must not keep the round open
         logger.warning(
-            "research_round_close_project_failed", problem_id=problem_id, error=str(exc)[:200]
+            "research_round_close_project_failed", problem_id=problem_id, error=error_text(exc)
         )
     return await close_problem(pool, problem_id, now=now, reason=RESOLVED_ROUND_CLOSED)
 
@@ -447,7 +448,7 @@ async def untrack(
                 )
             except Exception as exc:  # noqa: BLE001 — the topic is untracked either way
                 logger.warning(
-                    "research_topic_task_retire_failed", topic=name, error=str(exc)[:200]
+                    "research_topic_task_retire_failed", topic=name, error=error_text(exc)
                 )
                 out["task_retired"] = False
     out["round_closed"] = closed
@@ -605,7 +606,7 @@ async def attach_items(
                 try:
                     await project_problem(pool, pid, now=now)
                 except Exception as exc:  # noqa: BLE001 — the hub sweep retries projection
-                    logger.warning("research_topic_project_failed", problem_id=pid, error=str(exc)[:200])
+                    logger.warning("research_topic_project_failed", problem_id=pid, error=error_text(exc))
     logger.info(
         "research_topic_items_attached",
         origin=origin,

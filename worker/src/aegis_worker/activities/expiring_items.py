@@ -30,6 +30,7 @@ from dataclasses import dataclass
 from typing import Any
 
 import structlog
+from aegis.errors import error_text
 from temporalio import activity
 
 _logger = structlog.get_logger()
@@ -156,4 +157,4 @@ class ExpiringItemsActivities:
             for _ in range(max(0, int(failed))):
                 await record_notification(self.db_pool, agent_id, "expiry_card", sent=False)
         except Exception as exc:  # noqa: BLE001 — accounting is best-effort
-            _logger.warning("expiry_card_accounting_failed", error=str(exc)[:200])
+            _logger.warning("expiry_card_accounting_failed", error=error_text(exc))

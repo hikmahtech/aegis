@@ -13,6 +13,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+from aegis.errors import error_text
 from aegis.services import library
 from aegis.services.connector_health import record_connector_health
 from aegis.services.knowledge import _content_id_for
@@ -49,7 +50,7 @@ class CalibreActivities:
             books = await conn.catalog(use_cache=False)
         except Exception as exc:
             await record_connector_health(
-                self.db_pool, self.settings, "calibre", ok=False, error=str(exc)
+                self.db_pool, self.settings, "calibre", ok=False, error=error_text(exc, 500)
             )
             raise
         await record_connector_health(self.db_pool, self.settings, "calibre", ok=True)
@@ -84,7 +85,7 @@ class CalibreActivities:
             except Exception as exc:  # noqa: BLE001 — one book must not cost the rest
                 failed += 1
                 activity.logger.warning(
-                    "calibre_book_index_failed id=%s err=%s", book.get("id"), str(exc)[:200]
+                    "calibre_book_index_failed id=%s err=%s", book.get("id"), error_text(exc)
                 )
                 continue
             if existing is None:

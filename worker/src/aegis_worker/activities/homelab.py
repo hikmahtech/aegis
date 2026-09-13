@@ -15,6 +15,7 @@ from typing import Any
 
 import httpx
 import structlog
+from aegis.errors import error_text
 from temporalio import activity
 
 from aegis_worker.activities.delivery import safe_send_message
@@ -239,7 +240,7 @@ class HomelabActivities:
                 body = resp.json()
         except Exception as exc:
             activity.logger.warning(
-                "check_comms_inbound_health_request_failed error=%s", str(exc)[:200]
+                "check_comms_inbound_health_request_failed error=%s", error_text(exc)
             )
             return {"status": "unknown"}
 
@@ -328,7 +329,7 @@ class HomelabActivities:
             ) as client:
                 response = await client.get(target)
         except Exception as exc:  # noqa: BLE001 — a failed probe IS the finding
-            return _result(False, 0, f"{type(exc).__name__}: {str(exc)[:160]}")
+            return _result(False, 0, error_text(exc))
 
         status = response.status_code
         asked = httpx.URL(target).host
@@ -463,7 +464,7 @@ class HomelabActivities:
                 "notify_cert_alert_delivery_failed domain=%s threshold=%s err=%s",
                 alert.get("domain"),
                 alert.get("threshold"),
-                str(exc)[:200],
+                error_text(exc),
             )
             return
         if isinstance(result, dict) and not result.get("ok"):
@@ -549,7 +550,7 @@ class HomelabActivities:
                 await client.get(self.heartbeat_ping_url)
             return {"pinged": True}
         except Exception as exc:  # noqa: BLE001 — dead-man ping is never fatal
-            activity.logger.warning("heartbeat_deadman_ping_failed err=%s", str(exc)[:200])
+            activity.logger.warning("heartbeat_deadman_ping_failed err=%s", error_text(exc))
             return {"pinged": False}
 
     @activity.defn

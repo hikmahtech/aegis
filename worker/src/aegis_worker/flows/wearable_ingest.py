@@ -27,6 +27,8 @@ from datetime import timedelta
 from temporalio import workflow
 
 with workflow.unsafe.imports_passed_through():
+    from aegis.errors import error_text
+
     from aegis_worker.activities.wearable import (
         PollWearableInput,
         PollWearableResult,
@@ -98,7 +100,7 @@ class WearableIngestFlow:
                 )
             except Exception as exc:
                 workflow.logger.warning(
-                    "wearable_poll_failed vendor=%s err=%s", vendor, str(exc)[:200]
+                    "wearable_poll_failed vendor=%s err=%s", vendor, error_text(exc)
                 )
                 skipped += 1
                 per_vendor.append({"vendor": vendor, "status": "poll_failed"})

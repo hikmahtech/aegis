@@ -17,6 +17,7 @@ from pydantic import ValidationError
 from aegis.api.deps import get_settings
 from aegis.config import Settings
 from aegis.db import create_pool, run_migrations
+from aegis.errors import error_text
 from aegis.llm import LLMClient, set_model_tiers, set_routes
 from aegis.services.chat import _validate_agent_tool_sets
 
@@ -73,7 +74,7 @@ async def lifespan(app: FastAPI):
     try:
         install_deploy_key(settings)
     except Exception as exc:  # noqa: BLE001 — a bad key must not block boot
-        logger.warning("books_deploy_key_install_failed", error=str(exc)[:200])
+        logger.warning("books_deploy_key_install_failed", error=error_text(exc))
 
     # The vault key (#514), the same way.
     from aegis.services import notes as notes_service
@@ -81,7 +82,7 @@ async def lifespan(app: FastAPI):
     try:
         notes_service.install_deploy_key(settings)
     except Exception as exc:  # noqa: BLE001 — a bad key must not block boot
-        logger.warning("notes_deploy_key_install_failed", error=str(exc)[:200])
+        logger.warning("notes_deploy_key_install_failed", error=error_text(exc))
 
     from aegis.seed import load_seeds
 
@@ -110,7 +111,7 @@ async def lifespan(app: FastAPI):
         )
     except Exception as exc:  # noqa: BLE001 — a bad routing table must not block boot
         set_routes(None)
-        logger.warning("llm_routes_invalid", error=str(exc)[:200])
+        logger.warning("llm_routes_invalid", error=error_text(exc))
     app.state.llm_backend = backend
     llm = LLMClient(
         base_url=backend["base_url"],
@@ -203,7 +204,7 @@ async def lifespan(app: FastAPI):
         temporal_client = await TemporalClient.connect(settings.temporal_host)
         logger.info("temporal_client_connected", host=settings.temporal_host)
     except Exception as exc:
-        logger.warning("temporal_client_unavailable", host=settings.temporal_host, error=str(exc))
+        logger.warning("temporal_client_unavailable", host=settings.temporal_host, error=error_text(exc, 500))
     app.state.temporal_client = temporal_client
 
     logger.info("aegis_v2_ready")

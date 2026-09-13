@@ -58,6 +58,7 @@ import logging
 import re
 from typing import Any
 
+from aegis.errors import error_text
 from aegis.services.content_routes import compile_pattern
 
 logger = logging.getLogger(__name__)
@@ -176,7 +177,7 @@ async def get_email_task_links(pool: Any) -> list[dict]:
     try:
         row = await pool.fetchrow("SELECT value FROM settings WHERE key = $1", SETTINGS_KEY)
     except Exception as exc:
-        logger.warning("email_task_links: read failed (%s) — no rules applied", str(exc)[:200])
+        logger.warning("email_task_links: read failed (%s) — no rules applied", error_text(exc))
         return []
     if not row or not row["value"]:
         return []

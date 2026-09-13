@@ -39,6 +39,8 @@ import logging
 import re
 import time
 
+from aegis.errors import error_text
+
 logger = logging.getLogger(__name__)
 
 # `claude agents --json` pretty-prints, so the array opens a line. Matching at
@@ -197,7 +199,7 @@ async def busy_human_sessions(remote_script: object, repo: str) -> list[dict]:
     try:
         inventory = await remote_script.list_coding_sessions()
     except Exception as exc:  # noqa: BLE001 — the coding lane must not break on this
-        logger.warning("coding_inventory_failed: %s", str(exc)[:200])
+        logger.warning("coding_inventory_failed: %s", error_text(exc))
         return []
     if (inventory or {}).get("status") != "ok":
         return []

@@ -10,6 +10,7 @@ import asyncio
 import os
 
 import structlog
+from aegis.errors import error_text
 from aegis.services.agents import resolve_tag
 from aegis.services.books import config_from_settings, parse_csv_set, parse_kv
 from aegis.services.user_agent import bot_user_agent
@@ -123,7 +124,7 @@ async def run_periodic_schedule_sync(
         try:
             await fn(client, pool, task_queue, settings=settings)
         except Exception as exc:
-            logger.warning("periodic_schedule_sync_failed", error=str(exc))
+            logger.warning("periodic_schedule_sync_failed", error=error_text(exc, 500))
         try:
             await asyncio.sleep(interval_seconds)
         except asyncio.CancelledError:
@@ -687,7 +688,7 @@ async def main():
         sync_count = await sync_schedules(client, deps.pool, TASK_QUEUE, settings=settings)
         logger.info("schedules_synced", count=sync_count)
     except Exception as exc:
-        logger.warning("schedule_sync_failed", error=str(exc))
+        logger.warning("schedule_sync_failed", error=error_text(exc, 500))
 
     # Background periodic schedule_sync — kills cold-boot race per cmemory lesson 096fe6e2
     asyncio.create_task(

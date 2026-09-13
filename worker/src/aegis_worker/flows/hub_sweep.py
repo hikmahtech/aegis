@@ -34,6 +34,8 @@ from dataclasses import dataclass
 from temporalio import workflow
 
 with workflow.unsafe.imports_passed_through():
+    from aegis.errors import error_text
+
     from aegis_worker.activities.hub import HubActivities
     from aegis_worker.shared.retry import (
         FAST,
@@ -109,7 +111,7 @@ class HubSweepFlow:
                     retry_policy=FAST,
                 )
             except Exception as exc:  # noqa: BLE001
-                workflow.logger.warning("hub_sweep_verify_fixes_failed err=%s", str(exc)[:200])
+                workflow.logger.warning("hub_sweep_verify_fixes_failed err=%s", error_text(exc))
         # Then ask alertmanager what it is still holding, and resolve the live
         # problems it no longer lists (#551). Alertmanager keeps its alerts in
         # memory, so a restart loses every `resolved` webhook it owed — and that
@@ -131,7 +133,7 @@ class HubSweepFlow:
                 )
             except Exception as exc:  # noqa: BLE001
                 workflow.logger.warning(
-                    "hub_sweep_alertmanager_reconcile_failed err=%s", str(exc)[:200]
+                    "hub_sweep_alertmanager_reconcile_failed err=%s", error_text(exc)
                 )
         # Then project: a problem promoted a moment ago gets its task in the
         # same tick, and any comment a producer's inline projection could not

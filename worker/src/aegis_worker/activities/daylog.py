@@ -43,6 +43,7 @@ from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta, tzinfo
 from typing import Any
 
+from aegis.errors import error_text
 from aegis.services import notes
 from aegis.services.user_time import user_zone
 from aegis.services.vault_layout import DEFAULT_LANGUAGE, DEFAULT_LAYOUT, Layout, get_layout
@@ -290,7 +291,7 @@ class DayLogActivities:
                 out[name] = await getattr(self, f"_source_{name}")(start, end)
             except Exception as exc:  # noqa: BLE001 — one bad source must not kill the day
                 activity.logger.warning(
-                    "daylog_source_failed source=%s date=%s err=%s", name, date, str(exc)[:200]
+                    "daylog_source_failed source=%s date=%s err=%s", name, date, error_text(exc)
                 )
                 out[name] = []
         out["counts"] = {name: len(out[name]) for name in _SOURCES}
@@ -448,7 +449,7 @@ class DayLogActivities:
                 agent_id=agent_id or None,
             )
         except Exception as exc:  # noqa: BLE001 — degrade to the bullets, never fail the day
-            activity.logger.warning("daylog_distil_llm_failed date=%s err=%s", date, str(exc)[:200])
+            activity.logger.warning("daylog_distil_llm_failed date=%s err=%s", date, error_text(exc))
             return fallback
 
         return (result.get("response") or "").strip() or fallback
@@ -543,7 +544,7 @@ class DayLogActivities:
         try:
             journal = await asyncio.to_thread(notes.read_journal_days_sync, cfg, days, layout)
         except notes.NotesError as exc:
-            activity.logger.warning("daylog_journal_read_failed err=%s", str(exc)[:200])
+            activity.logger.warning("daylog_journal_read_failed err=%s", error_text(exc))
             return out
         by_date = {e["date"]: e for e in out}
         for day, text in journal.items():
@@ -589,7 +590,7 @@ class DayLogActivities:
             )
         except Exception as exc:  # noqa: BLE001 — degrade to the concatenation
             activity.logger.warning(
-                "daylog_rollup_llm_failed label=%s err=%s", label, str(exc)[:200]
+                "daylog_rollup_llm_failed label=%s err=%s", label, error_text(exc)
             )
             return fallback
 

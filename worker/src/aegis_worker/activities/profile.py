@@ -41,6 +41,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
+from aegis.errors import error_text
 from aegis.services.personalities import doc_fingerprint as _doc_fingerprint
 from temporalio import activity
 
@@ -323,7 +324,7 @@ class ProfileActivities:
                 evidence[name] = await gather(agent_id, days)
             except Exception as exc:  # noqa: BLE001 — one dead source is not a dead run
                 activity.logger.warning(
-                    "profile_evidence_source_failed source=%s err=%s", name, str(exc)[:200]
+                    "profile_evidence_source_failed source=%s err=%s", name, error_text(exc)
                 )
                 evidence[name] = []
                 failed.append(name)
@@ -579,11 +580,11 @@ class ProfileActivities:
                 agent_id=agent_id,
             )
         except LLMTruncationError as exc:
-            activity.logger.warning("profile_generalize_truncated err=%s", str(exc)[:200])
+            activity.logger.warning("profile_generalize_truncated err=%s", error_text(exc))
             return {**base, "status": "skipped", "reason": "truncated"}
         except Exception as exc:  # noqa: BLE001 — no claims beats a failed run
             activity.logger.warning(
-                "profile_generalize_failed err=%s type=%s", str(exc)[:200], type(exc).__name__
+                "profile_generalize_failed err=%s type=%s", error_text(exc), type(exc).__name__
             )
             return {**base, "status": "skipped", "reason": "llm_failed"}
 
@@ -668,12 +669,12 @@ class ProfileActivities:
                 agent_id=agent_id,
             )
         except LLMTruncationError as exc:
-            activity.logger.warning("profile_propose_truncated err=%s", str(exc)[:200])
+            activity.logger.warning("profile_propose_truncated err=%s", error_text(exc))
             return {}
         except Exception as exc:  # noqa: BLE001 — a quiet week beats a failed run
             # The kill-switch path raises before any row — nothing was spent.
             activity.logger.warning(
-                "profile_propose_failed err=%s type=%s", str(exc)[:200], type(exc).__name__
+                "profile_propose_failed err=%s type=%s", error_text(exc), type(exc).__name__
             )
             return {}
 
@@ -897,9 +898,9 @@ class ProfileActivities:
                 "profile_reflection_refused interaction=%s agent=%s err=%s",
                 interaction_id,
                 agent_id,
-                str(exc)[:300],
+                error_text(exc, 300),
             )
-            return {"applied": False, "status": "refused", "reason": str(exc)[:300]}
+            return {"applied": False, "status": "refused", "reason": error_text(exc, 300)}
 
         # A5: which memories this approval graduated. Deliberately NOT written
         # back to `agent_memory` — the card's own metadata plus the revision row

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncpg
 import structlog
+from aegis.errors import error_text
 from temporalio.client import (
     Client,
     Schedule,
@@ -202,7 +203,7 @@ async def sync_schedules(
                 await client.create_schedule(schedule_id, schedule)
                 logger.info("schedule_created", schedule_id=schedule_id, cron=cron)
             except Exception as e:
-                logger.warning("schedule_create_failed", schedule_id=schedule_id, error=str(e))
+                logger.warning("schedule_create_failed", schedule_id=schedule_id, error=error_text(e, 500))
                 continue
 
         registered += 1
@@ -219,10 +220,10 @@ async def sync_schedules(
                     logger.warning(
                         "schedule_delete_orphan_failed",
                         schedule_id=sched.id,
-                        error=str(exc),
+                        error=error_text(exc, 500),
                     )
     except Exception as exc:
-        logger.warning("schedule_prune_failed", error=str(exc))
+        logger.warning("schedule_prune_failed", error=error_text(exc, 500))
 
     logger.info("schedule_sync_complete", registered=registered, total_activities=len(rows))
     return registered

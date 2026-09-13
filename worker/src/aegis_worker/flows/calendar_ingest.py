@@ -22,6 +22,8 @@ from html import escape as _esc
 from temporalio import workflow
 
 with workflow.unsafe.imports_passed_through():
+    from aegis.errors import error_text
+
     from aegis_worker.activities.calendar import FetchEventsInput, FetchEventsResult
     from aegis_worker.activities.capture import CaptureActivities
     from aegis_worker.flows.interaction import InteractionFlow, InteractionFlowInput
@@ -107,7 +109,7 @@ class CalendarIngestFlow:
                     workflow.logger.warning(
                         "calendar_capture_failed event_id=%s err=%s",
                         event_id,
-                        str(exc)[:200],
+                        error_text(exc),
                     )
 
             # C2: attendees of small upcoming meetings become life.people rows.
@@ -123,7 +125,7 @@ class CalendarIngestFlow:
                 )
             except Exception as exc:
                 workflow.logger.warning(
-                    "calendar_people_enrichment_failed label=%s err=%s", label, str(exc)[:200]
+                    "calendar_people_enrichment_failed label=%s err=%s", label, error_text(exc)
                 )
 
             content_items = await workflow.execute_activity(
@@ -147,7 +149,7 @@ class CalendarIngestFlow:
                             total_ingested += 1
                     except Exception as exc:
                         workflow.logger.warning(
-                            "calendar_ingest_content_failed err=%s", str(exc)[:200]
+                            "calendar_ingest_content_failed err=%s", error_text(exc)
                         )
 
             if result.latest_updated_ts:
@@ -198,7 +200,7 @@ class CalendarIngestFlow:
             if not is_auth_expired(exc):
                 # Network / quota / other transient — log and skip account.
                 workflow.logger.warning(
-                    "calendar_fetch_failed label=%s err=%s", label, str(exc)[:200]
+                    "calendar_fetch_failed label=%s err=%s", label, error_text(exc)
                 )
                 return None
 

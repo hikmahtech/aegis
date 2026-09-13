@@ -65,6 +65,7 @@ from dataclasses import dataclass
 from datetime import datetime, time
 from zoneinfo import ZoneInfo
 
+from aegis.errors import error_text
 from aegis.llm import parse_llm_json
 from aegis.services import hub
 from aegis.services.content_routes import (
@@ -214,7 +215,7 @@ async def get_agent_registry(pool) -> dict[str, dict]:
             aliases = [f"@{str(a).lstrip('@')}" for a in raw_aliases]
             reg[r["id"]] = {"aliases": aliases, "caps": caps}
     except Exception as exc:  # noqa: BLE001 — never let a config read break classification
-        activity.logger.warning("clarify_agent_registry_read_failed err=%s", str(exc)[:200])
+        activity.logger.warning("clarify_agent_registry_read_failed err=%s", error_text(exc))
         return _agent_reg_cache["reg"] or {}
     _agent_reg_cache.update(reg=reg, ts=now)
     return reg
@@ -1326,7 +1327,7 @@ class ClarifyActivities:
             activity.logger.warning(
                 "agent_chat_recent_notes_fetch_failed task_id=%s err=%s",
                 task_id,
-                str(exc)[:200],
+                error_text(exc),
             )
             return []
 
@@ -1345,7 +1346,7 @@ class ClarifyActivities:
             activity.logger.warning(
                 "agent_chat_ks_prefetch_failed task_id=%s err=%s",
                 task.get("id"),
-                str(exc)[:200],
+                error_text(exc),
             )
             return synthetic_input
         if not results:
@@ -1383,7 +1384,7 @@ class ClarifyActivities:
             activity.logger.warning(
                 "agent_chat_tx_prefetch_failed task_id=%s err=%s",
                 task.get("id"),
-                str(exc)[:200],
+                error_text(exc),
             )
             return synthetic_input
         if not rows:
@@ -2262,7 +2263,7 @@ class ClarifyActivities:
         try:
             import httpx
         except ImportError:  # pragma: no cover
-            return ("transient", str(exc)[:200])
+            return ("transient", error_text(exc))
         if isinstance(exc, httpx.HTTPStatusError):
             code = exc.response.status_code
             if 400 <= code < 500:
@@ -2279,7 +2280,7 @@ class ClarifyActivities:
             return ("transient", f"http_{code}")
         if isinstance(exc, (httpx.ConnectError, httpx.TimeoutException, httpx.NetworkError)):
             return ("transient", type(exc).__name__)
-        return ("transient", str(exc)[:200])
+        return ("transient", error_text(exc))
 
     @activity.defn
     async def ingest_reference_to_ks(

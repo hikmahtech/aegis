@@ -65,6 +65,8 @@ from dataclasses import dataclass, field
 from temporalio import workflow
 
 with workflow.unsafe.imports_passed_through():
+    from aegis.errors import error_text
+
     from aegis_worker.activities.homelab import HomelabActivities
     from aegis_worker.activities.hub import HubActivities
     from aegis_worker.flows.alert_investigation import AlertInvestigationFlow
@@ -156,7 +158,7 @@ class InfraHeartbeatFlow:
             )
         except Exception as exc:  # noqa: BLE001
             workflow.logger.warning(
-                "heartbeat_hub_ingest_failed fp=%s err=%s", alert.get("fingerprint"), str(exc)[:200]
+                "heartbeat_hub_ingest_failed fp=%s err=%s", alert.get("fingerprint"), error_text(exc)
             )
             return {"problem_id": None, "investigate": False, "action": "error"}
 
@@ -209,7 +211,7 @@ class InfraHeartbeatFlow:
             return True
         except Exception as exc:  # noqa: BLE001 — already-started dedup is benign
             workflow.logger.warning(
-                "heartbeat_spawn_skipped id=%s err=%s", child_id, str(exc)[:200]
+                "heartbeat_spawn_skipped id=%s err=%s", child_id, error_text(exc)
             )
             return False
 
@@ -270,7 +272,7 @@ class InfraHeartbeatFlow:
                 # state write and the dead-man ping down with it — the tick
                 # matters more than the probe. Its siblings below are wrapped
                 # for the same reason.
-                workflow.logger.warning("heartbeat_ingress_probe_failed err=%s", str(exc)[:200])
+                workflow.logger.warning("heartbeat_ingress_probe_failed err=%s", error_text(exc))
                 # Nothing was learned, so nothing changes: the count and the
                 # flag both stand. In particular this is NOT an answer, so it
                 # must not resolve an open problem — the earlier shim said
@@ -368,7 +370,7 @@ class InfraHeartbeatFlow:
             )
             deploys_cleared = len(cleared.get("cleared") or [])
         except Exception as exc:  # noqa: BLE001 — housekeeping, never the tick
-            workflow.logger.warning("heartbeat_clear_deploys_failed err=%s", str(exc)[:200])
+            workflow.logger.warning("heartbeat_clear_deploys_failed err=%s", error_text(exc))
 
         nodes_down, nodes_recovered = [], []
         for name, status in cur_nodes.items():
@@ -422,7 +424,7 @@ class InfraHeartbeatFlow:
                     retry_policy=FAST,
                 )
             except Exception as exc:  # noqa: BLE001
-                workflow.logger.warning("heartbeat_stale_lookup_failed err=%s", str(exc)[:200])
+                workflow.logger.warning("heartbeat_stale_lookup_failed err=%s", error_text(exc))
 
         quiet = set(config.quiet_nodes or [])
         quiet_notified = 0

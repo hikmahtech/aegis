@@ -19,6 +19,7 @@ from urllib.parse import urlparse
 
 import httpx
 import structlog
+from aegis.errors import error_text
 from aegis.services.content_extract import (
     extract_html,
     extract_youtube_id,
@@ -178,7 +179,7 @@ async def _download_file(
                 raise
             return path
     except Exception as exc:
-        logger.warning("download_failed", url=url, error=str(exc))
+        logger.warning("download_failed", url=url, error=error_text(exc, 500))
         return None
 
 
@@ -259,7 +260,7 @@ async def _transcribe_via_elevenlabs(
             metadata={"language_code": data.get("language_code")},
         )
     except Exception as exc:
-        logger.warning("elevenlabs_transcription_failed", url=url, error=str(exc))
+        logger.warning("elevenlabs_transcription_failed", url=url, error=error_text(exc, 500))
         return None
     finally:
         if os.path.exists(path):
@@ -435,7 +436,7 @@ class ContentActivities:
             # it, is refused for good: retrying it every hour would change
             # nothing, so the entry settles unstored (RssIngestFlow treats
             # `refused` like `empty`).
-            logger.warning("process_content_refused", url=url[:200], error=str(exc)[:200])
+            logger.warning("process_content_refused", url=url[:200], error=error_text(exc))
             await self._record(url, content_type, "refused", t0)
             return {"status": "refused"}
         except httpx.HTTPStatusError as exc:
@@ -447,7 +448,7 @@ class ContentActivities:
                 "process_content_ingest_failed",
                 url=url[:200],
                 content_type=content_type,
-                error=str(exc)[:300],
+                error=error_text(exc, 300),
             )
             await self._record(url, content_type, "error", t0)
             return {"status": "error"}
@@ -487,7 +488,7 @@ class ContentActivities:
                 tags=tags,
             )
         except Exception as exc:
-            logger.warning("store_feed_abstract_failed", url=url[:200], error=str(exc)[:300])
+            logger.warning("store_feed_abstract_failed", url=url[:200], error=error_text(exc, 300))
             await self._record(url, "abstract", "error", t0)
             return {"status": "error"}
         await self._record(url, "abstract", "ok", t0)

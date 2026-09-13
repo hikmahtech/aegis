@@ -22,6 +22,7 @@ from slack_sdk.web.async_client import AsyncWebClient
 
 from aegis_comms.adapters.base import CardSpec, DeliveryRef, SendResult
 from aegis_comms.cards import render_slack_blocks
+from aegis_comms.errors import error_text
 from aegis_comms.format import html_to_mrkdwn
 
 _logger = structlog.get_logger()
@@ -84,7 +85,7 @@ async def handle_hint_open(client, body) -> None:
             view=build_hint_modal(interaction_id, title),
         )
     except Exception as exc:  # noqa: BLE001 — original card stays usable
-        _logger.warning("slack_views_open_failed", error=str(exc))
+        _logger.warning("slack_views_open_failed", error=error_text(exc, 500))
 
 
 async def handle_hint_submit(core, body) -> None:
@@ -180,14 +181,14 @@ class SlackAdapter:
             if aliases:
                 stem = str(aliases[0])
         except Exception as exc:  # noqa: BLE001 — best-effort; fall back to name lookup
-            _logger.warning("slack_agent_lookup_failed", agent_id=agent_id, error=str(exc))
+            _logger.warning("slack_agent_lookup_failed", agent_id=agent_id, error=error_text(exc, 500))
 
         if not channel:
             try:
                 channel = await self._resolve_channel_by_name(f"aegis-{stem}")
             except SlackApiError as exc:
                 _logger.warning(
-                    "slack_channel_name_lookup_failed", agent_id=agent_id, error=str(exc)
+                    "slack_channel_name_lookup_failed", agent_id=agent_id, error=error_text(exc, 500)
                 )
 
         result = (channel, username, icon, voice_id)
@@ -249,7 +250,7 @@ class SlackAdapter:
                 if first_ref is None:
                     first_ref = DeliveryRef("slack", {"channel": resp["channel"], "ts": resp["ts"]})
         except SlackApiError as exc:
-            return SendResult(ok=False, used_html=False, error=str(exc))
+            return SendResult(ok=False, used_html=False, error=error_text(exc, 500))
         return SendResult(ok=True, ref=first_ref, used_html=False)
 
     async def send_system_event(self, *, text: str) -> SendResult:
@@ -258,7 +259,7 @@ class SlackAdapter:
             try:
                 channel = await self._resolve_channel_by_name("aegis-general")
             except SlackApiError as exc:
-                _logger.warning("slack_general_lookup_failed", error=str(exc))
+                _logger.warning("slack_general_lookup_failed", error=error_text(exc, 500))
         body = html_to_mrkdwn(text)
         try:
             resp = await self._client.chat_postMessage(
@@ -269,7 +270,7 @@ class SlackAdapter:
                 icon_emoji=":gear:",
             )
         except SlackApiError as exc:
-            return SendResult(ok=False, used_html=False, error=str(exc))
+            return SendResult(ok=False, used_html=False, error=error_text(exc, 500))
         return SendResult(
             ok=True,
             ref=DeliveryRef("slack", {"channel": resp["channel"], "ts": resp["ts"]}),
@@ -303,7 +304,7 @@ class SlackAdapter:
                         data["ts"] = ts
                     first_ref = DeliveryRef("slack", data)
         except SlackApiError as exc:
-            return SendResult(ok=False, used_html=False, error=str(exc))
+            return SendResult(ok=False, used_html=False, error=error_text(exc, 500))
         return SendResult(ok=True, ref=first_ref, used_html=False)
 
     async def send_voice(
@@ -342,7 +343,7 @@ class SlackAdapter:
                 filename=f"{_short_agent(agent_id)}.mp3",
             )
         except SlackApiError as exc:
-            return SendResult(ok=False, used_html=False, error=str(exc))
+            return SendResult(ok=False, used_html=False, error=error_text(exc, 500))
         files = resp.get("files") or []
         ts = files[0].get("ts") if files else None
         data: dict[str, str] = {"channel": channel}
@@ -362,7 +363,7 @@ class SlackAdapter:
                 icon_emoji=icon,
             )
         except SlackApiError as exc:
-            return SendResult(ok=False, used_html=False, error=str(exc))
+            return SendResult(ok=False, used_html=False, error=error_text(exc, 500))
         return SendResult(
             ok=True,
             ref=DeliveryRef("slack", {"channel": resp["channel"], "ts": resp["ts"]}),
@@ -399,7 +400,7 @@ class SlackAdapter:
         except SlackApiError as exc:
             if (exc.response or {}).get("error") == "message_not_found":
                 return True
-            _logger.warning("slack_delete_failed", error=str(exc))
+            _logger.warning("slack_delete_failed", error=error_text(exc, 500))
             return False
 
     async def _build_channel_agent_map(self) -> dict[str, str]:
@@ -412,7 +413,7 @@ class SlackAdapter:
             resp.raise_for_status()
             agents = resp.json()
         except Exception as exc:  # noqa: BLE001 — empty map is a safe degrade
-            _logger.warning("slack_channel_map_fetch_failed", error=str(exc))
+            _logger.warning("slack_channel_map_fetch_failed", error=error_text(exc, 500))
             return {}
         out: dict[str, str] = {}
         for agent in agents or []:
@@ -445,7 +446,7 @@ class SlackAdapter:
             auth = await self._client.auth_test()
             bot_user_id = auth.get("user_id")
         except SlackApiError as exc:
-            _logger.warning("slack_auth_test_failed", error=str(exc))
+            _logger.warning("slack_auth_test_failed", error=error_text(exc, 500))
 
         channel_agent_map = await self._build_channel_agent_map()
         core = SlackCoreClient(self._settings)

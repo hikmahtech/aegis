@@ -51,6 +51,7 @@ import asyncpg
 import structlog
 
 from aegis.connectors.todoist import TodoistConnector
+from aegis.errors import error_text
 from aegis.services import work_sessions
 from aegis.services.agents import resolve_tag
 from aegis.services.books import parse_kv
@@ -285,7 +286,7 @@ async def _create_plan_steps(
             return 0
         mapping = ((result or {}).get("data") or {}).get("temp_id_mapping") or {}
     except Exception as exc:  # noqa: BLE001 — a plan is worth a comment even with no subtasks
-        logger.warning("hub_project_steps_failed", task_id=task_id, error=str(exc)[:200])
+        logger.warning("hub_project_steps_failed", task_id=task_id, error=error_text(exc))
         return 0
     made = 0
     for index, cmd in enumerate(cmds, start=1):
@@ -387,7 +388,7 @@ async def ensure_problem_for_task(
             ),
         )
     except ValueError as exc:
-        logger.warning("hub_problem_for_task_refused", task_id=task_id, error=str(exc)[:200])
+        logger.warning("hub_problem_for_task_refused", task_id=task_id, error=error_text(exc))
         return None
     if not result.problem_id:
         return None
@@ -418,7 +419,7 @@ async def _assignee_label(pool: asyncpg.Pool, tag: str = "infra") -> str:
         aliases = (meta or {}).get("mention_aliases") or [agent_id]
         return f"@{str(aliases[0]).lstrip('@')}"
     except Exception as exc:  # noqa: BLE001 — a label lookup must never block a task
-        logger.warning("hub_project_label_failed", tag=tag, error=str(exc)[:200])
+        logger.warning("hub_project_label_failed", tag=tag, error=error_text(exc))
         return ""
 
 
@@ -452,7 +453,7 @@ async def _books_project(pool: asyncpg.Pool, entity: str) -> str | None:
         if isinstance(stored, dict):
             raw = str(stored.get("val") or "")
     except Exception as exc:  # noqa: BLE001 — a project lookup must never block a task
-        logger.warning("hub_project_books_projects_failed", error=str(exc)[:200])
+        logger.warning("hub_project_books_projects_failed", error=error_text(exc))
     project = parse_kv(raw).get(entity)
     if not project:
         project = parse_kv(str(getattr(_settings(), "books_todoist_projects", "") or "")).get(
@@ -489,7 +490,7 @@ async def _post_note(pool: asyncpg.Pool, settings: Any, task_id: str, text: str)
             logger.warning("hub_project_note_failed", task_id=task_id, status=status)
         return bool(status["ok"])
     except Exception as exc:  # noqa: BLE001
-        logger.warning("hub_project_note_failed", task_id=task_id, error=str(exc)[:200])
+        logger.warning("hub_project_note_failed", task_id=task_id, error=error_text(exc))
         return False
 
 
@@ -1033,8 +1034,8 @@ async def project_pending(
             await _note_projection(pool, r["id"], result, now)
             out.append(result)
         except Exception as exc:  # noqa: BLE001 — one bad problem must not stop the sweep
-            logger.warning("hub_project_failed", problem_id=r["id"], error=str(exc)[:200])
-            out.append({"problem_id": r["id"], "error": str(exc)[:200]})
+            logger.warning("hub_project_failed", problem_id=r["id"], error=error_text(exc))
+            out.append({"problem_id": r["id"], "error": error_text(exc)})
     return out
 
 
@@ -1151,7 +1152,7 @@ async def reconcile_completed_tasks(
             ):
                 out.append({**row, "action": "resolved"})
         except Exception as exc:  # noqa: BLE001 — one bad problem must not stop the sweep
-            logger.warning("hub_task_completion_failed", problem_id=r["id"], error=str(exc)[:200])
+            logger.warning("hub_task_completion_failed", problem_id=r["id"], error=error_text(exc))
     if out:
         logger.info(
             "hub_task_completions_reconciled",

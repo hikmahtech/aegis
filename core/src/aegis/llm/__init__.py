@@ -15,6 +15,8 @@ import structlog
 from openai import AsyncOpenAI
 from opentelemetry import trace
 
+from aegis.errors import error_text
+
 logger = structlog.get_logger()
 _tracer = trace.get_tracer(__name__)
 
@@ -566,7 +568,7 @@ class LLMClient:
                     agent_id,
                     _t0,
                     status=_classify_llm_error(exc),
-                    error=str(exc)[:500],
+                    error=error_text(exc, 500),
                 )
                 raise
 
@@ -807,7 +809,7 @@ class LLMClient:
                     agent_id,
                     _t0,
                     status=_classify_llm_error(exc),
-                    error=str(exc)[:500],
+                    error=error_text(exc, 500),
                 )
                 raise
 
@@ -916,14 +918,14 @@ class LLMClient:
         except LLMTruncationError as exc:
             logger.warning(
                 "extract_money_batch_truncated",
-                error=str(exc)[:200],
+                error=error_text(exc),
                 count=len(receipts),
             )
             return [dict(stub) for _ in receipts]
         except Exception as exc:
             logger.warning(
                 "extract_money_batch_failed",
-                error=str(exc)[:200],
+                error=error_text(exc),
                 count=len(receipts),
             )
             raise

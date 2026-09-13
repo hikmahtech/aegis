@@ -23,6 +23,7 @@ from typing import Any
 import structlog
 
 from aegis.crypto import decrypt_secret, encrypt_secret
+from aegis.errors import error_text
 
 logger = structlog.get_logger()
 
@@ -51,7 +52,7 @@ async def resolve_api_key(pool: Any, settings: Any, *, use_cache: bool = True) -
         if row and row["value"]:
             key = decrypt_secret(row["value"].get("key_enc"), settings.secret_key)
     except Exception as exc:  # noqa: BLE001 — auth must not 500 on a settings read
-        logger.warning("api_key_read_failed", error=str(exc)[:200])
+        logger.warning("api_key_read_failed", error=error_text(exc))
         return ""
     _cache.update(key=key, ts=now)
     return key

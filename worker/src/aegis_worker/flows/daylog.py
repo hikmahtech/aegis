@@ -45,6 +45,7 @@ from datetime import date, datetime, timedelta
 from temporalio import workflow
 
 with workflow.unsafe.imports_passed_through():
+    from aegis.errors import error_text
     from aegis.services.notes_write import NOTES_WRITE_TIMEOUT_S
     from aegis.services.vault_layout import week_bounds
 
@@ -270,7 +271,7 @@ class DayLogFlow:
                 retry_policy=NO_RETRY,
             )
         except Exception as exc:  # noqa: BLE001 — the owner is a nicety
-            workflow.logger.warning("daylog_owner_resolve_failed err=%s", str(exc)[:200])
+            workflow.logger.warning("daylog_owner_resolve_failed err=%s", error_text(exc))
             return ""
         owner = str((resolved or {}).get(_OWNER_TAG) or "")
         if not owner:
@@ -291,8 +292,8 @@ class DayLogFlow:
                 retry_policy=RETRY_ONCE,
             )
         except Exception as exc:
-            workflow.logger.warning("daylog_journal_failed label=%s err=%s", label, str(exc)[:200])
-            return {"status": "error", "error": str(exc)[:200]}
+            workflow.logger.warning("daylog_journal_failed label=%s err=%s", label, error_text(exc))
+            return {"status": "error", "error": error_text(exc)}
 
     async def _anchor(self, day_offset: int) -> date:
         """The day this run is about, on the user's clock: the most recent
@@ -312,7 +313,7 @@ class DayLogFlow:
             )
             local_today = date.fromisoformat(str((clock or {}).get("date") or ""))
         except Exception as exc:  # noqa: BLE001 — a day is still logged, on UTC
-            workflow.logger.warning("daylog_local_day_failed err=%s", str(exc)[:200])
+            workflow.logger.warning("daylog_local_day_failed err=%s", error_text(exc))
             return (now - timedelta(days=day_offset)).date()
         return logged_day(local_today, day_offset)
 
@@ -326,7 +327,7 @@ class DayLogFlow:
                 retry_policy=RETRY_ONCE,
             )
         except Exception as exc:  # noqa: BLE001 — the default rule is the fallback
-            workflow.logger.warning("daylog_week_rule_failed err=%s", str(exc)[:200])
+            workflow.logger.warning("daylog_week_rule_failed err=%s", error_text(exc))
             return {}
         return {k: str(v) for k, v in (rule or {}).items() if k in ("week_start", "week_numbering")}
 

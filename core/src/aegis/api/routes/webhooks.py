@@ -30,6 +30,7 @@ from aegis.api.deps import get_settings
 from aegis.api.routes.interactions import get_workflow_client
 from aegis.clarify_note import AGENT_REPLY_PREFIX, CLARIFY_NOTE_PREFIX
 from aegis.config import Settings
+from aegis.errors import error_text
 from aegis.observability import log_audit
 from aegis.services import hub_project
 from aegis.services.agents import resolve_tag
@@ -665,7 +666,7 @@ async def alert_webhook(
             )
         except Exception as exc:  # noqa: BLE001 — never 500 the sender; alertmanager retries
             logger.warning(
-                "alert_webhook_ingest_failed", fingerprint=fingerprint, error=str(exc)[:200]
+                "alert_webhook_ingest_failed", fingerprint=fingerprint, error=error_text(exc)
             )
             skipped += 1
             continue
@@ -679,7 +680,7 @@ async def alert_webhook(
                 task_id = projected.get("task_id")
             except Exception as exc:  # noqa: BLE001
                 logger.warning(
-                    "alert_webhook_project_failed", problem_id=result.problem_id, error=str(exc)[:200]
+                    "alert_webhook_project_failed", problem_id=result.problem_id, error=error_text(exc)
                 )
         if status == "resolved" or not result.investigate:
             skipped += 1
@@ -770,7 +771,7 @@ async def todoist_webhook(
             except Exception as exc:
                 logger.warning(
                     "todoist_webhook_note_bump_failed",
-                    error=str(exc)[:200],
+                    error=error_text(exc),
                 )
             # Task-session fast path: a @code task owns a work_sessions row and
             # every user comment on it is one turn of that task's AgentTaskFlow.
@@ -810,7 +811,7 @@ async def todoist_webhook(
                 except Exception as exc:  # noqa: BLE001 — the sweep re-picks a missed turn
                     logger.warning(
                         "todoist_webhook_task_turn_failed",
-                        error=str(exc)[:200],
+                        error=error_text(exc),
                     )
             # Best-effort: kick ClarifyFlow now. Idempotent — flow query
             # respects last_clarified_at vs last_note_at; if no tasks need
@@ -840,7 +841,7 @@ async def todoist_webhook(
                 except Exception as exc:
                     logger.warning(
                         "todoist_webhook_clarify_trigger_failed",
-                        error=str(exc)[:200],
+                        error=error_text(exc),
                     )
 
     logger.info("todoist_webhook_received", event_name=event_name)

@@ -38,6 +38,7 @@ from aegis.connectors.calibre import (
     CalibreError,
     html_to_text,
 )
+from aegis.errors import error_text
 from aegis.services import library_config as lcfg
 
 logger = structlog.get_logger()
@@ -276,7 +277,7 @@ def _toc_titles(z: zipfile.ZipFile, opf: ET.Element, manifest: dict, opf_dir: st
                     if target and label:
                         titles.setdefault(target, label)
     except (KeyError, ET.ParseError) as exc:
-        logger.info("epub_toc_unreadable", error=str(exc)[:200])
+        logger.info("epub_toc_unreadable", error=error_text(exc))
     return titles
 
 

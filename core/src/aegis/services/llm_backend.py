@@ -21,6 +21,7 @@ import structlog
 import yaml
 
 from aegis.crypto import decrypt_secret, encrypt_secret
+from aegis.errors import error_text
 from aegis.llm.routes import merge_routes
 
 logger = structlog.get_logger()
@@ -98,7 +99,7 @@ async def _db_routes(pool: Any) -> dict[str, Any] | None:
             if isinstance(value, dict):
                 return value
     except Exception as exc:  # noqa: BLE001 — never break boot on a config read
-        logger.warning("llm_routes_read_failed", error=str(exc)[:200])
+        logger.warning("llm_routes_read_failed", error=error_text(exc))
     return None
 
 
@@ -132,7 +133,7 @@ async def get_llm_backend(pool: Any, settings: Any, *, use_cache: bool = True) -
                 "source": "db",
             }
     except Exception as exc:  # noqa: BLE001 — never break boot on a config read
-        logger.warning("llm_backend_read_failed", error=str(exc)[:200])
+        logger.warning("llm_backend_read_failed", error=error_text(exc))
     if data is None:
         data = _env_backend(settings)
     # Routing is independent of which backend won: the yaml block is the base

@@ -35,6 +35,8 @@ from typing import Any
 
 import structlog
 
+from aegis.errors import error_text
+
 logger = structlog.get_logger()
 
 SETTINGS_KEY = "vault_layout"
@@ -842,7 +844,7 @@ async def get_layout(pool: Any) -> Layout:
     try:
         layout = layout_from(await get_layout_value(pool))
     except Exception as exc:  # noqa: BLE001 — never break a caller on a config read
-        logger.warning("vault_layout_read_failed", error=str(exc)[:200])
+        logger.warning("vault_layout_read_failed", error=error_text(exc))
         return DEFAULT_LAYOUT
     _cache.update(layout=layout, ts=now)
     return layout

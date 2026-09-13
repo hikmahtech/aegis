@@ -17,6 +17,7 @@ from aegis.api.auth import verify_auth
 from aegis.api.deps import get_settings
 from aegis.api.sql_filters import build_where
 from aegis.config import Settings
+from aegis.errors import error_text
 from aegis.observability import log_audit
 
 router = APIRouter(
@@ -220,7 +221,7 @@ async def suggest_content_route(request: Request, body: dict[str, Any]) -> dict[
             purpose="content_route_suggest",
         )
     except Exception as exc:  # noqa: BLE001 — convenience endpoint, never 500
-        return {"pattern": None, "error": f"LLM error: {str(exc)[:200]}"}
+        return {"pattern": None, "error": f"LLM error: {error_text(exc)}"}
     raw = result.get("response", "") if isinstance(result, dict) else str(result)
     pattern = str((parse_llm_json(raw) or {}).get("pattern") or "").strip()
     if not pattern:

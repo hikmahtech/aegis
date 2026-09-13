@@ -56,6 +56,7 @@ from typing import Any
 
 import structlog
 
+from aegis.errors import error_text
 from aegis.services import books
 from aegis.services import vault_layout as vl
 from aegis.services.vault_layout import DEFAULT_LAYOUT, KINDS, Layout, moment_format
@@ -775,7 +776,7 @@ def _ensure_checkout(cfg: NotesConfig) -> None:
             exclude.write_text(current + ("" if current.endswith("\n") or not current else "\n")
                                + _LOCK_NAME + "\n", "utf-8")
     except OSError as exc:  # pragma: no cover — cosmetic only
-        logger.warning("notes_exclude_write_failed", error=str(exc)[:200])
+        logger.warning("notes_exclude_write_failed", error=error_text(exc))
 
 
 def _drop_local(cfg: NotesConfig, paths: list[str]) -> None:
@@ -788,7 +789,7 @@ def _drop_local(cfg: NotesConfig, paths: list[str]) -> None:
     try:
         books._revert_sync(cfg, paths)  # type: ignore[arg-type]
     except books.BooksError as exc:  # pragma: no cover — best effort
-        logger.warning("notes_revert_failed", error=str(exc)[:200])
+        logger.warning("notes_revert_failed", error=error_text(exc))
 
 
 def _pull(cfg: NotesConfig) -> None:
@@ -953,7 +954,7 @@ def _pull_quietly(cfg: NotesConfig) -> None:
     try:
         _pull(cfg)
     except NotesError as exc:
-        logger.warning("notes_pull_failed", error=str(exc)[:200])
+        logger.warning("notes_pull_failed", error=error_text(exc))
 
 
 def read_many_sync(cfg: NotesConfig, rels: list[str], *, pull: bool = False) -> dict[str, str]:
@@ -971,7 +972,7 @@ def read_many_sync(cfg: NotesConfig, rels: list[str], *, pull: bool = False) -> 
                 try:
                     out[rel] = strip_encrypted(path.read_text("utf-8", errors="replace"))
                 except OSError as exc:  # pragma: no cover
-                    logger.warning("notes_read_failed", path=rel, error=str(exc)[:200])
+                    logger.warning("notes_read_failed", path=rel, error=error_text(exc))
     return out
 
 

@@ -12,6 +12,8 @@ from datetime import timedelta
 from temporalio import workflow
 
 with workflow.unsafe.imports_passed_through():
+    from aegis.errors import error_text
+
     from aegis_worker.activities.intel_scan import (
         SearchSourceInput,
         SearchSourceResult,
@@ -78,7 +80,7 @@ class IntelligenceScanFlow:
             workflow.logger.warning(
                 "intel_tracked_topics_degraded source=%s err=%s",
                 input.source,
-                str(exc)[:200],
+                error_text(exc),
             )
             tracked = []
             notes["tracked_topics_degraded"] = True
@@ -145,7 +147,7 @@ class IntelligenceScanFlow:
                 "intel_dedup_degraded source=%s raw=%d err=%s",
                 input.source,
                 raw_count,
-                str(exc)[:200],
+                error_text(exc),
             )
             novel = items
             notes["dedup_degraded"] = True
@@ -180,7 +182,7 @@ class IntelligenceScanFlow:
                 "intel_score_degraded source=%s novel=%d err=%s",
                 input.source,
                 novel_count,
-                str(exc)[:200],
+                error_text(exc),
             )
             return {
                 "source": input.source,
@@ -218,7 +220,7 @@ class IntelligenceScanFlow:
                 notes["topic_items"] = attached["attached"]
         except Exception as exc:
             workflow.logger.warning(
-                "intel_topic_attach_degraded source=%s err=%s", input.source, str(exc)[:200]
+                "intel_topic_attach_degraded source=%s err=%s", input.source, error_text(exc)
             )
             notes["topics_degraded"] = True
 

@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+from aegis.errors import error_text
 from aegis.llm import parse_llm_json
 from aegis.services.content_extract import fetch_and_extract
 from aegis.services.knowledge import _content_id_for
@@ -84,7 +85,7 @@ class IntelligenceActivities:
                 activity.logger.warning(
                     "intel_dedup_lookup_failed url=%s err=%s",
                     url[:120],
-                    str(exc)[:200],
+                    error_text(exc),
                 )
             novel.append(item)
         return novel
@@ -183,7 +184,7 @@ class IntelligenceActivities:
             text, _title = await fetch_and_extract(url, content_type)
         except Exception as exc:  # noqa: BLE001 — one unreadable page must not sink the batch
             activity.logger.warning(
-                "intel_page_read_failed url=%s err=%s", url[:120], str(exc)[:200]
+                "intel_page_read_failed url=%s err=%s", url[:120], error_text(exc)
             )
             return ""
         return text if len(text) >= _MIN_CONTENT_LENGTH else ""
@@ -239,7 +240,7 @@ class IntelligenceActivities:
                     activity.logger.warning(
                         "intel_ingest_content_failed url=%s err=%s",
                         url[:120],
-                        str(exc)[:200],
+                        error_text(exc),
                     )
             else:
                 # The third outcome, and until now the invisible one: the item

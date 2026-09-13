@@ -27,6 +27,7 @@ import httpx
 import structlog
 
 from aegis.connectors._base import HTTPConnector
+from aegis.errors import error_text
 
 logger = structlog.get_logger()
 
@@ -191,9 +192,9 @@ class FinanceConnector(HTTPConnector):
                 "finance_quote_failed",
                 provider=self._provider,
                 symbol=symbol,
-                error=str(exc)[:200],
+                error=error_text(exc),
             )
-            return {"symbol": symbol, "error": str(exc)[:200]}
+            return {"symbol": symbol, "error": error_text(exc)}
 
     async def get_overview(self) -> list[dict]:
         """Quotes for the configured market-overview indices."""
@@ -223,7 +224,7 @@ class FinanceConnector(HTTPConnector):
                 return []
             resp.raise_for_status()
         except httpx.HTTPError as exc:
-            await self._record("daily_bars", "error", int((time.monotonic() - t0) * 1000), str(exc)[:200])
+            await self._record("daily_bars", "error", int((time.monotonic() - t0) * 1000), error_text(exc))
             raise
         await self._record("daily_bars", "ok", int((time.monotonic() - t0) * 1000))
         result = ((resp.json() or {}).get("chart") or {}).get("result") or []

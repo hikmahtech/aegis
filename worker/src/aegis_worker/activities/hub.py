@@ -19,6 +19,7 @@ from typing import Any
 
 import asyncpg
 import httpx
+from aegis.errors import error_text
 from aegis.services import hub, hub_fix, hub_group, hub_project, hub_watch
 from temporalio import activity
 
@@ -114,7 +115,7 @@ class HubActivities:
                 activity.logger.warning(
                     "ingest_alert_project_failed problem=%s err=%s",
                     result.problem_id,
-                    str(exc)[:200],
+                    error_text(exc),
                 )
         return {
             **result.to_dict(),
@@ -172,7 +173,7 @@ class HubActivities:
                 activity.logger.warning(
                     "ingest_finding_project_failed problem=%s err=%s",
                     result.problem_id,
-                    str(exc)[:200],
+                    error_text(exc),
                 )
         return result.to_dict()
 
@@ -293,7 +294,7 @@ class HubActivities:
             task_id = str(projected.get("task_id") or "")
         except Exception as exc:  # noqa: BLE001
             activity.logger.warning(
-                "record_investigation_project_failed problem=%s err=%s", problem_id, str(exc)[:200]
+                "record_investigation_project_failed problem=%s err=%s", problem_id, error_text(exc)
             )
         # `task_id` is reported because THIS projection is what mints the task
         # when a settle window held it back (#537): the status this call just
@@ -331,7 +332,7 @@ class HubActivities:
                 activity.logger.warning(
                     "follow_fix_pr_project_failed problem=%s err=%s",
                     row["problem_id"],
-                    str(exc)[:200],
+                    error_text(exc),
                 )
         return {"followed": len(rows), "problems": rows}
 
@@ -400,7 +401,7 @@ class HubActivities:
             await hub_project.project(self.db_pool, problem["id"], now=now)
         except Exception as exc:  # noqa: BLE001 — the turn's own output is what matters
             activity.logger.warning(
-                "record_plan_failed task_id=%s err=%s", task_id, str(exc)[:200]
+                "record_plan_failed task_id=%s err=%s", task_id, error_text(exc)
             )
             return {"recorded": False, "steps": len(steps)}
         return {"recorded": True, "steps": len(steps), "problem_id": problem["id"]}
@@ -635,8 +636,8 @@ class HubActivities:
                 agent_id="pandoras-actor",
             )
         except Exception as exc:  # noqa: BLE001 — a judge that will not answer says no
-            activity.logger.warning("hub_group_judge_failed error=%s", str(exc)[:200])
-            return {**no, "reason": f"judge failed: {str(exc)[:120]}"}
+            activity.logger.warning("hub_group_judge_failed error=%s", error_text(exc))
+            return {**no, "reason": f"judge failed: {error_text(exc, 120)}"}
 
         from aegis.llm import parse_llm_json
 
@@ -686,8 +687,8 @@ class HubActivities:
                 by="hub-sweep",
             )
         except ValueError as exc:
-            activity.logger.warning("hub_group_upgrade_refused error=%s", str(exc)[:200])
-            return {"grouped": False, "reason": str(exc)[:200]}
+            activity.logger.warning("hub_group_upgrade_refused error=%s", error_text(exc))
+            return {"grouped": False, "reason": error_text(exc)}
 
         # Retire the tasks the folded problems owned: leaving them open is the
         # very thing grouping exists to stop.
@@ -705,12 +706,12 @@ class HubActivities:
                     retired += 1
             except Exception as exc:  # noqa: BLE001 — the group still stands
                 activity.logger.warning(
-                    "hub_group_retire_failed task_id=%s error=%s", task_id, str(exc)[:200]
+                    "hub_group_retire_failed task_id=%s error=%s", task_id, error_text(exc)
                 )
         try:
             await hub_project.project(self.db_pool, result["problem_id"])
         except Exception as exc:  # noqa: BLE001 — the sweep re-projects
-            activity.logger.warning("hub_group_project_failed error=%s", str(exc)[:200])
+            activity.logger.warning("hub_group_project_failed error=%s", error_text(exc))
 
         subjects = [s for s in result["subjects"] if s]
         body = (
@@ -781,7 +782,7 @@ class HubActivities:
                 payload = alerts.json()
         except Exception as exc:  # noqa: BLE001 — fail closed, never resolve on doubt
             activity.logger.warning(
-                "hub_alertmanager_read_failed url=%s err=%s", target, str(exc)[:200]
+                "hub_alertmanager_read_failed url=%s err=%s", target, error_text(exc)
             )
             return {"skipped": "unreachable", "resolved": 0, "checked": 0}
 

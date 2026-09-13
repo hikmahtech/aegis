@@ -34,6 +34,7 @@ from typing import Any
 
 import structlog
 
+from aegis.errors import error_text
 from aegis.services.hub_watch import reconcile_findings
 
 logger = structlog.get_logger()
@@ -58,15 +59,6 @@ _SEND_TIMEOUT_S = 30.0
 _SEND_CONNECT_TIMEOUT_S = 5.0
 
 
-def _error_text(exc: BaseException) -> str:
-    """What went wrong, bounded and never empty: the exception's type, then its
-    message when it has one. An httpx timeout is raised with no message at all,
-    so logging `str(exc)` alone gave `error=` and named nothing (#573)."""
-    message = str(exc).strip()
-    name = type(exc).__name__
-    return (f"{name}: {message}" if message else name)[:200]
-
-
 async def record_connector_health(
     pool: Any,
     settings: Any,
@@ -81,7 +73,7 @@ async def record_connector_health(
         await _record(pool, settings, connector, ok=ok, error=error, threshold=threshold)
     except Exception as exc:  # noqa: BLE001 — health tracking must never break the caller
         logger.warning(
-            "connector_health_record_failed", connector=connector, error=_error_text(exc)
+            "connector_health_record_failed", connector=connector, error=error_text(exc)
         )
 
 
@@ -133,7 +125,7 @@ async def _record(
     try:
         await _reconcile(pool)
     except Exception as exc:  # noqa: BLE001 — the next record retries the sweep
-        logger.warning("connector_health_reconcile_failed", error=_error_text(exc))
+        logger.warning("connector_health_reconcile_failed", error=error_text(exc))
 
 
 def _is_down(state: dict) -> bool:
@@ -207,7 +199,7 @@ async def _send_system_event(settings: Any, text: str) -> bool:
                 headers={"X-API-Key": api_key} if api_key else {},
             )
     except Exception as exc:  # noqa: BLE001 — alerting must never break the caller
-        logger.warning("connector_health_event_send_failed", error=_error_text(exc))
+        logger.warning("connector_health_event_send_failed", error=error_text(exc))
         return False
     if resp.status_code != 200:
         logger.warning(
@@ -219,7 +211,7 @@ async def _send_system_event(settings: Any, text: str) -> bool:
     try:
         ok = bool(resp.json().get("ok"))
     except Exception as exc:  # noqa: BLE001 — an unreadable reply is a failed send
-        logger.warning("connector_health_event_send_failed", error=_error_text(exc))
+        logger.warning("connector_health_event_send_failed", error=error_text(exc))
         return False
     if not ok:
         logger.warning(

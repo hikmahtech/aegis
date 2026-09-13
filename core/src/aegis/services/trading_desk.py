@@ -17,6 +17,7 @@ import asyncpg
 import structlog
 
 from aegis.connectors.ansaar import AnsaarError
+from aegis.errors import error_text
 from aegis.services import desk_math as dm
 from aegis.services import hub_watch
 
@@ -179,7 +180,7 @@ async def _refresh(
     except Exception as exc:  # noqa: BLE001 — one symbol's outage must not sink the run
         if required:
             raise
-        logger.warning("trading_desk_yahoo_failed", symbol=ysym, error=str(exc)[:200])
+        logger.warning("trading_desk_yahoo_failed", symbol=ysym, error=error_text(exc))
         bars = []
     if bars:
         await _store_bars(pool, ysym, bars, "yahoo", today)
@@ -200,7 +201,7 @@ async def _refresh(
         bars = await ansaar.prices(source_symbol or symbol, asset_class, min(missing), max(missing))
     except AnsaarError as exc:
         logger.warning(
-            "trading_desk_ansaar_prices_failed", symbol=source_symbol or symbol, error=str(exc)[:200]
+            "trading_desk_ansaar_prices_failed", symbol=source_symbol or symbol, error=error_text(exc)
         )
         return
     # Only the missing days are filled. ansaar is the second source, so it never

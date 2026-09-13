@@ -1021,7 +1021,7 @@ async def test_refresh_fx_prices_never_raises_when_the_provider_fails(db_pool, t
     finance = AsyncMock()
     finance.get_quotes = AsyncMock(side_effect=RuntimeError("upstream 503"))
     out = await ActivityEnvironment().run(_act(db_pool, cfg, finance=finance).refresh_fx_prices)
-    assert out["written"] == 0 and out["errors"] == ["quotes: upstream 503"]
+    assert out["written"] == 0 and out["errors"] == ["quotes: RuntimeError: upstream 503"]
     assert (cfg.path / "prices.journal").read_text() == "P 2026-09-01 $ ₹84.00\n"
 
 
@@ -1059,5 +1059,5 @@ async def test_refresh_fx_prices_survives_a_books_error_it_was_not_told_about(
     )
     out = await ActivityEnvironment().run(_act(db_pool, cfg, finance=finance).refresh_fx_prices)
     assert out["written"] == 0
-    assert out["errors"] == ["books: [Errno 13] .aegis.lock"]
+    assert out["errors"] == ["books: PermissionError: [Errno 13] .aegis.lock"]
     assert (cfg.path / "prices.journal").read_text() == "P 2026-09-01 $ ₹84.00\n"

@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 
 import httpx
 import structlog
+from aegis.errors import error_text
 from temporalio import activity
 
 logger = structlog.get_logger()
@@ -93,7 +94,7 @@ class IntelScanActivities:
                         "intel_scan_topic_failed",
                         source=input.source,
                         topic=topic,
-                        error=str(exc)[:200],
+                        error=error_text(exc),
                     )
                     continue
                 for r in data.get("results", []):

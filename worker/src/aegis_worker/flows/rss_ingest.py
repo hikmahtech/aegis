@@ -27,6 +27,7 @@ from datetime import UTC, datetime, timedelta
 from temporalio import workflow
 
 with workflow.unsafe.imports_passed_through():
+    from aegis.errors import error_text
     from aegis.services import feeds, feeds_config
 
     from aegis_worker.activities.rss import (
@@ -174,7 +175,7 @@ class RssIngestFlow:
             )
             cfg = feeds_config.merge(loaded)
         except Exception as exc:
-            workflow.logger.warning("rss_feeds_config_degraded err=%s", str(exc)[:200])
+            workflow.logger.warning("rss_feeds_config_degraded err=%s", error_text(exc))
             notes["feeds_config_degraded"] = True
         pattern = None
         try:
@@ -187,7 +188,7 @@ class RssIngestFlow:
         except Exception as exc:
             # No terms means the gate lets everything through: a failed
             # config read costs full fetches, never a lost entry.
-            workflow.logger.warning("rss_gate_terms_degraded err=%s", str(exc)[:200])
+            workflow.logger.warning("rss_gate_terms_degraded err=%s", error_text(exc))
             notes["gate_terms_degraded"] = True
 
         total_entries = 0
@@ -233,7 +234,7 @@ class RssIngestFlow:
                     retry_policy=NO_RETRY,
                 )
             except Exception as exc:
-                fetch_error = str(exc)[:200] or "fetch failed"
+                fetch_error = error_text(exc)
             else:
                 # An empty parse that says why is a failed fetch too. Before
                 # #511 a dead or moved feed read as a quiet one here.
@@ -421,7 +422,7 @@ class RssIngestFlow:
                         workflow.logger.warning(
                             "rss_process_content_failed url=%s err=%s",
                             entry.get("link", ""),
-                            str(exc)[:200],
+                            error_text(exc),
                         )
 
                     entry_ok = status == "ok" or status in _SETTLED_UNSTORED
@@ -513,7 +514,7 @@ class RssIngestFlow:
                 except Exception as exc:
                     # The stats lose a run; the entries themselves are stored.
                     workflow.logger.warning(
-                        "rss_record_entries_failed feed=%s err=%s", identifier, str(exc)[:200]
+                        "rss_record_entries_failed feed=%s err=%s", identifier, error_text(exc)
                     )
 
             # Cursor advances only past entries with a DEFINITE outcome
@@ -578,7 +579,7 @@ class RssIngestFlow:
                 if isinstance(attached, dict) and attached.get("attached"):
                     notes["topic_items"] = attached["attached"]
             except Exception as exc:  # noqa: BLE001 — the entries are stored either way
-                workflow.logger.warning("rss_topic_attach_degraded err=%s", str(exc)[:200])
+                workflow.logger.warning("rss_topic_attach_degraded err=%s", error_text(exc))
                 notes["topics_degraded"] = True
 
         held_failing = [h for h in held if h["klass"] == "feed_failing"]
@@ -621,7 +622,7 @@ class RssIngestFlow:
             )
         except Exception as exc:
             workflow.logger.warning(
-                "rss_record_run_failed feed=%s err=%s", ch.get("identifier"), str(exc)[:200]
+                "rss_record_run_failed feed=%s err=%s", ch.get("identifier"), error_text(exc)
             )
             return None
         return out if isinstance(out, dict) else {}
@@ -643,6 +644,6 @@ class RssIngestFlow:
                 retry_policy=NO_RETRY,
             )
         except Exception as exc:  # noqa: BLE001 — the feeds were polled either way
-            workflow.logger.warning("rss_hub_reconcile_failed err=%s", str(exc)[:200])
+            workflow.logger.warning("rss_hub_reconcile_failed err=%s", error_text(exc))
             return False
         return True

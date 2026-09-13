@@ -17,6 +17,7 @@ import structlog
 from jsonschema import Draft202012Validator
 from jsonschema.exceptions import ValidationError as JSONSchemaValidationError
 
+from aegis.errors import error_text
 from aegis.llm import parse_llm_json
 from aegis.llm.tier import resolve_model_for_agent, tier_to_model, tier_to_model_or
 from aegis.mcp_manager import MCPError
@@ -199,7 +200,7 @@ async def _routing_agents(pool) -> list[dict]:
             "SELECT id, capabilities, metadata FROM agents WHERE active = TRUE ORDER BY id"
         )
     except Exception as exc:  # noqa: BLE001 — routing must never break the front door
-        logger.warning("agent_routing_read_failed", error=str(exc)[:200])
+        logger.warning("agent_routing_read_failed", error=error_text(exc))
         return []
     return [
         {"id": r["id"], "capabilities": r["capabilities"] or [], "metadata": r["metadata"] or {}}
@@ -301,7 +302,7 @@ async def classify_intent(message: str, llm, settings, pool=None) -> dict:
         if agent in routable:
             return {"agent_id": agent, "reason": str(parsed.get("reason", ""))[:200], "method": "llm"}
     except Exception as exc:  # noqa: BLE001 — routing must never break the front door
-        logger.warning("intent_route_llm_failed", error=str(exc)[:200])
+        logger.warning("intent_route_llm_failed", error=error_text(exc))
     return {"agent_id": default, "reason": "default", "method": "default"}
 
 
@@ -1592,8 +1593,8 @@ async def _exec_aegis_self_diagnose(pool: asyncpg.Pool, args: dict, ctx: ToolCon
             repo, prompt, kimi_binary=kimi_binary
         )
     except Exception as exc:  # noqa: BLE001
-        logger.warning("aegis_self_diagnose_start_failed", error=str(exc))
-        return json.dumps({"error": f"kimi launch failed: {str(exc)[:200]}"})
+        logger.warning("aegis_self_diagnose_start_failed", error=error_text(exc, 500))
+        return json.dumps({"error": f"kimi launch failed: {error_text(exc)}"})
 
     if run_result.get("status") == "failed":
         return json.dumps({"error": run_result.get("error", "kimi launch failed")})
@@ -1615,7 +1616,7 @@ async def _exec_aegis_self_diagnose(pool: asyncpg.Pool, args: dict, ctx: ToolCon
                 timeout=_AEGIS_SELF_DIAGNOSE_FETCH_TIMEOUT,
             )
         except Exception as exc:  # noqa: BLE001 — a probe failure is a skipped poll, not a tool timeout
-            logger.warning("aegis_self_diagnose_fetch_failed", run_id=run_id, error=str(exc))
+            logger.warning("aegis_self_diagnose_fetch_failed", run_id=run_id, error=error_text(exc, 500))
             raw = None
         if raw:
             latest_raw = raw
@@ -1674,8 +1675,8 @@ async def _exec_investigate_resource(pool: asyncpg.Pool, args: dict, ctx: ToolCo
             "SELECT metadata->>'github_repo' AS gh, metadata->>'path' AS rp FROM resources"
         )
     except Exception as exc:  # noqa: BLE001
-        logger.warning("investigate_resource_lookup_failed", error=str(exc)[:200])
-        return json.dumps({"error": f"resource lookup failed: {str(exc)[:200]}"})
+        logger.warning("investigate_resource_lookup_failed", error=error_text(exc))
+        return json.dumps({"error": f"resource lookup failed: {error_text(exc)}"})
     target = repo.lower()
     matched = False
     available: set[str] = set()
@@ -1719,7 +1720,7 @@ async def _exec_investigate_resource(pool: asyncpg.Pool, args: dict, ctx: ToolCo
 
         problem = await find_problem_for_task(pool, task_id)
     except Exception as exc:  # noqa: BLE001
-        logger.warning("investigate_resource_problem_lookup_failed", error=str(exc)[:200])
+        logger.warning("investigate_resource_problem_lookup_failed", error=error_text(exc))
         problem = None
     if problem is not None and problem["closed_at"] is None:
         alert["problem_id"] = problem["id"]
@@ -1733,8 +1734,8 @@ async def _exec_investigate_resource(pool: asyncpg.Pool, args: dict, ctx: ToolCo
     except WorkflowAlreadyStartedError:
         return json.dumps({"status": "already_investigating", "workflow_id": workflow_id, "repo": repo})
     except Exception as exc:  # noqa: BLE001
-        logger.warning("investigate_resource_spawn_failed", repo=repo, error=str(exc)[:200])
-        return json.dumps({"error": f"failed to start investigation: {str(exc)[:200]}"})
+        logger.warning("investigate_resource_spawn_failed", repo=repo, error=error_text(exc))
+        return json.dumps({"error": f"failed to start investigation: {error_text(exc)}"})
     return json.dumps({"status": "investigation_started", "workflow_id": workflow_id, "repo": repo})
 
 
@@ -1882,8 +1883,8 @@ async def _exec_dispatch_agent_run(pool: asyncpg.Pool, args: dict, ctx: ToolCont
             "Stop it with stop_agent_run if you want to start over."
         )
     except Exception as exc:  # noqa: BLE001 — a dispatch failure is a chat answer, not a crash
-        logger.warning("dispatch_agent_run_failed", workflow_id=workflow_id, error=str(exc)[:200])
-        return f"Couldn't dispatch the agent run: {str(exc)[:200]}"
+        logger.warning("dispatch_agent_run_failed", workflow_id=workflow_id, error=error_text(exc))
+        return f"Couldn't dispatch the agent run: {error_text(exc)}"
     logger.info("dispatch_agent_run_started", workflow_id=workflow_id, agent_id=agent_id)
     return (
         f"Dispatched agent run {workflow_id} ({engine or 'auto'}) — "
@@ -1988,8 +1989,8 @@ async def _exec_get_quote(pool: asyncpg.Pool, args: dict, ctx: ToolContext) -> s
     try:
         quotes = await ctx.finance_connector.get_quotes(symbols)
     except Exception as exc:
-        logger.warning("get_quote_failed", error=str(exc))
-        return json.dumps({"error": f"quote lookup failed: {str(exc)[:200]}"})
+        logger.warning("get_quote_failed", error=error_text(exc, 500))
+        return json.dumps({"error": f"quote lookup failed: {error_text(exc)}"})
     return json.dumps(quotes, default=str)
 
 
@@ -1999,8 +2000,8 @@ async def _exec_get_market_overview(pool: asyncpg.Pool, args: dict, ctx: ToolCon
     try:
         quotes = await ctx.finance_connector.get_overview()
     except Exception as exc:
-        logger.warning("get_market_overview_failed", error=str(exc))
-        return json.dumps({"error": f"market overview failed: {str(exc)[:200]}"})
+        logger.warning("get_market_overview_failed", error=error_text(exc, 500))
+        return json.dumps({"error": f"market overview failed: {error_text(exc)}"})
     return json.dumps(quotes, default=str)
 
 
@@ -2018,8 +2019,8 @@ async def _exec_get_finance_news(pool: asyncpg.Pool, args: dict, ctx: ToolContex
             f"{query} stock market finance", categories="news", limit=limit
         )
     except Exception as exc:
-        logger.warning("get_finance_news_failed", error=str(exc))
-        return json.dumps({"error": f"news search failed: {str(exc)[:200]}"})
+        logger.warning("get_finance_news_failed", error=error_text(exc, 500))
+        return json.dumps({"error": f"news search failed: {error_text(exc)}"})
     return json.dumps({"query": query, "results": results})
 
 
@@ -2122,8 +2123,8 @@ async def _exec_update_runbook(pool: asyncpg.Pool, args: dict, ctx: ToolContext)
         )
         return json.dumps({"ok": True, "target": target})
     except Exception as exc:
-        logger.warning("update_runbook_failed", error=str(exc))
-        return json.dumps({"ok": False, "error": str(exc)})
+        logger.warning("update_runbook_failed", error=error_text(exc, 500))
+        return json.dumps({"ok": False, "error": error_text(exc, 500)})
 
 
 async def _exec_last_contact_with_person(pool: asyncpg.Pool, args: dict, ctx: ToolContext) -> str:
@@ -2401,7 +2402,7 @@ async def _deliver_documents(ctx: ToolContext, documents: list[dict], caption: s
             return {"ok": True}
         return {"ok": False, "error": f"comms status {resp.status_code}"}
     except Exception as exc:  # noqa: BLE001
-        return {"ok": False, "error": str(exc)[:200]}
+        return {"ok": False, "error": error_text(exc)}
 
 
 async def _exec_youtube_transcript(pool: asyncpg.Pool, args: dict, ctx: ToolContext) -> str:
@@ -2575,7 +2576,7 @@ async def _exec_social_timeline(pool: asyncpg.Pool, args: dict, ctx: ToolContext
             (now + timedelta(days=days_ahead)).isoformat(),
         )
     except Exception as exc:  # noqa: BLE001 — surface as a tool result, not a chat crash
-        return json.dumps({"error": str(exc)[:300]})
+        return json.dumps({"error": error_text(exc, 300)})
     finally:
         await connector.close()
 
@@ -3809,7 +3810,7 @@ async def _gather_knowledge_context(
         logger.warning("knowledge_context_timeout", message_len=len(message))
         return (None, [])
     except Exception as exc:
-        logger.warning("knowledge_context_error", error=str(exc))
+        logger.warning("knowledge_context_error", error=error_text(exc, 500))
         return (None, [])
 
 
@@ -4196,7 +4197,7 @@ async def send_message(
                     )
                     tool_status = "timeout"
                 except Exception as exc:
-                    tool_result = json.dumps({"error": str(exc)})
+                    tool_result = json.dumps({"error": error_text(exc, 500)})
                     tool_status = "error"
 
                 tool_latency = int((time.monotonic() - tool_start) * 1000)
@@ -4264,7 +4265,7 @@ async def send_message(
                 final = await llm_client.chat(messages=messages, model=model, tools=None)
                 response = (final.get("response") or "").strip()
             except Exception as exc:
-                logger.warning("chat_final_no_tools_failed", error=str(exc))
+                logger.warning("chat_final_no_tools_failed", error=error_text(exc, 500))
                 response = ""
             if not response:
                 response = (
@@ -4273,8 +4274,8 @@ async def send_message(
                 )
 
     except Exception as exc:
-        logger.error("chat_llm_failed", error=str(exc))
-        return {"error": str(exc), "response": ""}
+        logger.error("chat_llm_failed", error=error_text(exc, 500))
+        return {"error": error_text(exc, 500), "response": ""}
 
     # Save to history. User row may carry the incoming message ref
     # via `user_metadata` so the cleanup activity can channel-delete it later.
@@ -4316,7 +4317,7 @@ async def send_message(
         except Exception as exc:
             logger.warning(
                 "knowledge_injection_log_failed",
-                error=str(exc),
+                error=error_text(exc, 500),
                 agent_id=agent_id,
                 thread_id=thread_id,
             )

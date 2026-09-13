@@ -22,6 +22,7 @@ from pydantic import BaseModel
 from aegis_comms.adapters.base import CardSpec, DeliveryRef
 from aegis_comms.adapters.slack import SlackAdapter
 from aegis_comms.config import CommsSettings
+from aegis_comms.errors import error_text
 
 logger = structlog.get_logger()
 
@@ -61,7 +62,7 @@ async def _slack_socket_probe_once(adapter) -> None:
     try:
         connected = await adapter.is_connected()
     except Exception as exc:  # noqa: BLE001 — probe is best-effort
-        _slack_socket_state.last_error = str(exc)[:200]
+        _slack_socket_state.last_error = error_text(exc)
         logger.warning("slack_socket_probe_failed", error=_slack_socket_state.last_error)
         return
     if connected is True:
@@ -128,7 +129,7 @@ async def _log_dispatch(
                 else None,
             )
     except Exception as exc:
-        logger.warning("dispatch_log_failed", error=str(exc)[:200], kind=kind, agent=agent_id)
+        logger.warning("dispatch_log_failed", error=error_text(exc), kind=kind, agent=agent_id)
 
 
 class DeliveryRequest(BaseModel):
@@ -446,7 +447,7 @@ def create_delivery_app(adapter: SlackAdapter, settings: CommsSettings) -> FastA
             ref = DeliveryRef.from_dict(req.delivery_ref)
             ok = await adapter.delete_message(ref=ref)
         except Exception as exc:
-            logger.warning("delete_dispatch_error", error=str(exc)[:200])
+            logger.warning("delete_dispatch_error", error=error_text(exc))
             ok = False
         return {"ok": bool(ok)}
 
@@ -488,7 +489,7 @@ async def _fetch_resolved_slack_config(settings: CommsSettings) -> dict[str, Any
             resp.raise_for_status()
             return resp.json()
     except Exception as exc:  # noqa: BLE001 — fall back to env config on any error
-        logger.warning("slack_config_fetch_failed", error=str(exc)[:200])
+        logger.warning("slack_config_fetch_failed", error=error_text(exc))
         return None
 
 

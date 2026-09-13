@@ -26,6 +26,7 @@ import httpx
 import structlog
 
 from aegis.connectors._base import HTTPConnector
+from aegis.errors import error_text
 
 logger = structlog.get_logger()
 
@@ -99,7 +100,7 @@ class VercelConnector(HTTPConnector):
             )
         except httpx.HTTPError as exc:
             await self._record(
-                "get_project", "error", int((time.monotonic() - start) * 1000), str(exc)
+                "get_project", "error", int((time.monotonic() - start) * 1000), error_text(exc, 500)
             )
             return {"error": f"http_error: {exc!s}"}
         latency_ms = int((time.monotonic() - start) * 1000)
@@ -155,7 +156,7 @@ class VercelConnector(HTTPConnector):
                 "list_deployments",
                 "error",
                 int((time.monotonic() - start) * 1000),
-                str(exc),
+                error_text(exc, 500),
             )
             return {"error": f"http_error: {exc!s}"}
         latency_ms = int((time.monotonic() - start) * 1000)
@@ -203,7 +204,7 @@ class VercelConnector(HTTPConnector):
                 "get_deployment",
                 "error",
                 int((time.monotonic() - start) * 1000),
-                str(exc),
+                error_text(exc, 500),
             )
             return {"error": f"http_error: {exc!s}"}
         latency_ms = int((time.monotonic() - start) * 1000)
@@ -271,7 +272,7 @@ class VercelConnector(HTTPConnector):
                 "get_build_logs",
                 "error",
                 int((time.monotonic() - start) * 1000),
-                str(exc),
+                error_text(exc, 500),
             )
             return {"error": f"http_error: {exc!s}"}
         latency_ms = int((time.monotonic() - start) * 1000)

@@ -16,6 +16,8 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+from aegis.errors import error_text
+
 logger = logging.getLogger(__name__)
 
 
@@ -35,8 +37,8 @@ async def submit_or_queue(pool: Any, connector: Any, cmds: list[dict], context: 
         status = TodoistConnector.check_sync_status(result, [c["uuid"] for c in cmds])
     except Exception as exc:  # network/transport — treat as retryable
         await _queue(pool, cmds)
-        logger.warning("todoist_write_transport_failed ctx=%s err=%s", context, str(exc)[:200])
-        return {"ok": False, "queued": True, "error": str(exc)[:200]}
+        logger.warning("todoist_write_transport_failed ctx=%s err=%s", context, error_text(exc))
+        return {"ok": False, "queued": True, "error": error_text(exc)}
 
     if status["ok"]:
         return {"ok": True, "queued": False, "error": None}
@@ -70,4 +72,4 @@ async def _queue(pool: Any, cmds: list[dict]) -> None:
                     cmd,
                 )
     except Exception as exc:
-        logger.warning("todoist_write_queue_failed err=%s", str(exc)[:200])
+        logger.warning("todoist_write_queue_failed err=%s", error_text(exc))

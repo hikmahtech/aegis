@@ -24,6 +24,7 @@ import asyncpg
 import structlog
 from pydantic import Field
 
+from aegis.errors import error_text
 from aegis.services import research as rs
 from aegis.services import research_config
 from aegis.services.agents import resolve_tag
@@ -63,8 +64,8 @@ async def _exec_web_search(
             ctx.search_connector, query, limit=max(1, min(int(limit), 20)), site=site
         )
     except Exception as exc:  # noqa: BLE001 — a failed search is an answer, not a crash
-        logger.warning("web_search_failed", error=str(exc)[:200])
-        return json.dumps({"error": f"web search failed: {str(exc)[:200]}"})
+        logger.warning("web_search_failed", error=error_text(exc))
+        return json.dumps({"error": f"web search failed: {error_text(exc)}"})
     return json.dumps({"query": query, "results": results})
 
 
@@ -172,8 +173,8 @@ async def _exec_research_topic(pool: asyncpg.Pool, args: dict, ctx: ToolContext)
         reattached = True
         handle = client.get_workflow_handle(workflow_id)
     except Exception as exc:  # noqa: BLE001 — a dispatch failure is an answer, not a crash
-        logger.warning("research_dispatch_failed", error=str(exc)[:200])
-        return json.dumps({"error": f"research could not be started: {str(exc)[:200]}"})
+        logger.warning("research_dispatch_failed", error=error_text(exc))
+        return json.dumps({"error": f"research could not be started: {error_text(exc)}"})
     try:
         result = await asyncio.wait_for(handle.result(), timeout=wait_s)
     except TimeoutError:
@@ -189,9 +190,9 @@ async def _exec_research_topic(pool: asyncpg.Pool, args: dict, ctx: ToolContext)
             }
         )
     except Exception as exc:  # noqa: BLE001 — the run failed; say so, don't raise
-        logger.warning("research_failed", workflow_id=workflow_id, error=str(exc)[:200])
+        logger.warning("research_failed", workflow_id=workflow_id, error=error_text(exc))
         return json.dumps(
-            {"error": f"research failed: {str(exc)[:200]}", "workflow_id": workflow_id}
+            {"error": f"research failed: {error_text(exc)}", "workflow_id": workflow_id}
         )
     result = result if isinstance(result, dict) else {}
     sources = [s for s in (result.get("sources") or []) if isinstance(s, dict)]

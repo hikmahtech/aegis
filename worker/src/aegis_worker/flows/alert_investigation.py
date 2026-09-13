@@ -53,6 +53,7 @@ from temporalio import workflow
 with workflow.unsafe.imports_passed_through():
     from html import escape as _html_escape
 
+    from aegis.errors import error_text
     from aegis.personalities import voice_line
 
     from aegis_worker.activities.agent_registry import AgentRegistryActivities
@@ -322,7 +323,7 @@ class AlertInvestigationFlow:
                 retry_policy=NO_RETRY,
             )
         except Exception as exc:
-            workflow.logger.warning("%s err=%s reason=raised", log_event, str(exc)[:200])
+            workflow.logger.warning("%s err=%s reason=raised", log_event, error_text(exc))
             return
         if isinstance(result, dict) and not result.get("ok"):
             workflow.logger.warning(
@@ -406,7 +407,7 @@ class AlertInvestigationFlow:
             return str((recorded or {}).get("task_id") or "")
         except Exception as exc:  # noqa: BLE001
             workflow.logger.warning(
-                "alert_record_investigation_failed step=%s err=%s", step, str(exc)[:200]
+                "alert_record_investigation_failed step=%s err=%s", step, error_text(exc)
             )
         return ""
 
@@ -463,7 +464,7 @@ class AlertInvestigationFlow:
                 retry_policy=NO_RETRY,
             )
         except Exception as exc:
-            workflow.logger.warning("alert_remediate_infra_failed err=%s", str(exc)[:200])
+            workflow.logger.warning("alert_remediate_infra_failed err=%s", error_text(exc))
             return None
         if not rem.get("attempted"):
             return None
@@ -532,7 +533,7 @@ class AlertInvestigationFlow:
                 retry_policy=FAST,
             )
         except Exception as exc:  # noqa: BLE001
-            workflow.logger.warning("alert_recent_auto_restart_failed err=%s", str(exc)[:200])
+            workflow.logger.warning("alert_recent_auto_restart_failed err=%s", error_text(exc))
             return None
         return found if found.get("repeat") else None
 
@@ -687,7 +688,7 @@ class AlertInvestigationFlow:
                 workflow.logger.warning(
                     "alert_verification_status_failed problem_id=%s err=%s",
                     problem_id,
-                    str(exc)[:200],
+                    error_text(exc),
                 )
                 resolved_check = {"resolved": False}
             if resolved_check.get("resolved"):
@@ -742,7 +743,7 @@ class AlertInvestigationFlow:
                     track_task_id = projected.get("task_id") or track_task_id or None
                 except Exception as exc:  # noqa: BLE001
                     workflow.logger.warning(
-                        "alert_project_after_delay_failed err=%s", str(exc)[:200]
+                        "alert_project_after_delay_failed err=%s", error_text(exc)
                     )
 
         # ── Step 4: Resolve to resource ──
@@ -807,7 +808,7 @@ class AlertInvestigationFlow:
                 )
             except Exception as exc:
                 workflow.logger.warning(
-                    "alert_resolve_infra_resource_failed err=%s", str(exc)[:200]
+                    "alert_resolve_infra_resource_failed err=%s", error_text(exc)
                 )
                 resource = {
                     "resource_id": None,
@@ -838,7 +839,7 @@ class AlertInvestigationFlow:
                 # LLM-only investigate() path instead of dying here.
                 workflow.logger.warning(
                     "alert_resolve_alert_resource_failed_fallback_to_null err=%s",
-                    str(exc)[:200],
+                    error_text(exc),
                 )
                 resource = {
                     "resource_id": None,
@@ -1093,7 +1094,7 @@ class AlertInvestigationFlow:
                 workflow.logger.warning(
                     "alert_run_investigation_raised title=%s exc=%s",
                     title,
-                    str(exc)[:200],
+                    error_text(exc),
                 )
                 inv_result = {
                     "status": "timed_out",
@@ -1130,7 +1131,7 @@ class AlertInvestigationFlow:
                     workflow.logger.warning(
                         "alert_claude_fallback_raised title=%s exc=%s",
                         title,
-                        str(exc)[:200],
+                        error_text(exc),
                     )
 
             inv_status = inv_result.get("status")
@@ -1477,7 +1478,7 @@ class AlertInvestigationFlow:
                         workflow.logger.warning(
                             "alert_gate2_recheck_failed_keep_waiting fingerprint=%s err=%s",
                             fingerprint,
-                            str(exc)[:200],
+                            error_text(exc),
                         )
                         continue
                     if recheck.get("resolved"):
@@ -1569,7 +1570,7 @@ class AlertInvestigationFlow:
                     # The activity timed out or raised (NO_RETRY). Don't strand
                     # the human-approved run silently — post an explicit manual-
                     # verify note to task + chat and return a distinct status.
-                    err = str(exc)[:200]
+                    err = error_text(exc)
                     workflow.logger.warning(
                         "alert_remediation_activity_failed title=%s err=%s", title, err
                     )
@@ -1880,7 +1881,7 @@ class AlertInvestigationFlow:
                         str(upload_res.get("error"))[:200],
                     )
             except Exception as exc:
-                workflow.logger.warning("alert_kimi_log_upload_raised exc=%s", str(exc)[:200])
+                workflow.logger.warning("alert_kimi_log_upload_raised exc=%s", error_text(exc))
 
         if track_task_id and not track_task_id.startswith("item-"):
             root_cause_full = (verdict.get("root_cause") or "").strip()
@@ -1976,7 +1977,7 @@ class AlertInvestigationFlow:
                 retry_policy=NO_RETRY,
             )
         except Exception as exc:
-            workflow.logger.warning("alert_verdict_voice_failed err=%s", str(exc)[:200])
+            workflow.logger.warning("alert_verdict_voice_failed err=%s", error_text(exc))
 
         # ── Step 10: Record the outcome on the problem ──
         # `resolved` closes the problem; an opened fix PR keeps it `fixing`

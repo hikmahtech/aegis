@@ -11,6 +11,8 @@ from typing import Any
 import asyncpg
 import structlog
 
+from aegis.errors import error_text
+
 logger = structlog.get_logger()
 
 
@@ -218,5 +220,5 @@ async def check_health(pool: asyncpg.Pool) -> dict[str, Any]:
         return {"status": "ok" if result == 1 else "error", "latency_ms": latency_ms}
     except Exception as e:
         latency_ms = round((time.monotonic() - t0) * 1000, 1)
-        logger.warning("db_health_check_failed", error=str(e))
+        logger.warning("db_health_check_failed", error=error_text(e, 500))
         return {"status": "error", "latency_ms": latency_ms}

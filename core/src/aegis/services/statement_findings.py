@@ -51,6 +51,7 @@ from typing import Any
 import asyncpg
 import structlog
 
+from aegis.errors import error_text
 from aegis.services import hub_project
 from aegis.services.hub import Event, IngestResult, correlation_key, ingest_event, slug
 from aegis.services.hub_watch import reconcile_findings
@@ -699,7 +700,7 @@ async def _project_quietly(pool: asyncpg.Pool, problem_id: str, now: datetime) -
     try:
         await hub_project.project(pool, problem_id, now=now)
     except Exception as exc:  # noqa: BLE001 — the hub sweep retries projection
-        logger.warning("money_project_failed", problem_id=problem_id, error=str(exc)[:200])
+        logger.warning("money_project_failed", problem_id=problem_id, error=error_text(exc))
 
 
 async def record_closing_balance(

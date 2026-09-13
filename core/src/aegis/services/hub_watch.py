@@ -33,6 +33,7 @@ from typing import Any
 import asyncpg
 import structlog
 
+from aegis.errors import error_text
 from aegis.services import hub_project
 from aegis.services.hub import LIVE_STATUSES, Event, ingest_event, slug
 
@@ -158,7 +159,7 @@ async def reconcile_findings(
             try:
                 await hub_project.project(pool, pid, now=now)
             except Exception as exc:  # noqa: BLE001 — the sweep retries projection
-                logger.warning("hub_watch_project_failed", problem_id=pid, error=str(exc)[:200])
+                logger.warning("hub_watch_project_failed", problem_id=pid, error=error_text(exc))
 
     logger.info(
         "hub_watch_reconciled",

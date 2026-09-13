@@ -11,6 +11,8 @@ from datetime import timedelta
 from temporalio import workflow
 
 with workflow.unsafe.imports_passed_through():
+    from aegis.errors import error_text
+
     from aegis_worker.activities.capture import CaptureActivities
     from aegis_worker.activities.raindrop import (
         PollBookmarksInput,
@@ -107,7 +109,7 @@ class RaindropIngestFlow:
                 workflow.logger.warning(
                     "raindrop_content_failed url=%s err=%s",
                     bm["link"],
-                    str(exc)[:200],
+                    error_text(exc),
                 )
 
             # Phase 5: capture every new Raindrop to Inbox tagged #research
@@ -139,7 +141,7 @@ class RaindropIngestFlow:
                 workflow.logger.warning(
                     "raindrop_capture_failed url=%s err=%s",
                     bm.get("link", ""),
-                    str(exc)[:200],
+                    error_text(exc),
                 )
 
             if ref is None:

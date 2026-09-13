@@ -23,6 +23,7 @@ import asyncpg
 import structlog
 from pydantic import Field
 
+from aegis.errors import error_text
 from aegis.services import notes
 from aegis.services import notes_write as nw
 from aegis.services.agents import resolve_tag
@@ -63,7 +64,7 @@ async def _owner(pool: asyncpg.Pool | None, ctx: ToolContext) -> str | None:
     try:
         return await resolve_tag(pool, _OWNER_TAG)
     except Exception as exc:  # noqa: BLE001 — a failed lookup is a refusal, not a crash
-        logger.warning("notes_owner_resolve_failed", error=str(exc)[:200])
+        logger.warning("notes_owner_resolve_failed", error=error_text(exc))
         return None
 
 
@@ -102,8 +103,8 @@ async def _dispatch_notes_write(
         reattached = True
         handle = client.get_workflow_handle(workflow_id)
     except Exception as exc:  # noqa: BLE001 — a dispatch failure is an answer, not a crash
-        logger.warning("notes_write_dispatch_failed", op=op, error=str(exc)[:200])
-        return f"error: the vault write could not be queued: {str(exc)[:200]}. Nothing was written."
+        logger.warning("notes_write_dispatch_failed", op=op, error=error_text(exc))
+        return f"error: the vault write could not be queued: {error_text(exc)}. Nothing was written."
     try:
         result = await asyncio.wait_for(handle.result(), timeout=NOTES_WRITE_WAIT_S)
     except TimeoutError:
@@ -116,8 +117,8 @@ async def _dispatch_notes_write(
             "here. Do not run it again."
         )
     except Exception as exc:  # noqa: BLE001 — the workflow failed; say so, don't raise
-        logger.warning("notes_write_failed", op=op, workflow_id=workflow_id, error=str(exc)[:200])
-        return f"error: the vault write failed: {str(exc)[:200]}"
+        logger.warning("notes_write_failed", op=op, workflow_id=workflow_id, error=error_text(exc))
+        return f"error: the vault write failed: {error_text(exc)}"
     return nw.describe_result(result)
 
 
@@ -145,8 +146,8 @@ async def _exec_note_search(
             query, limit=max(1, min(int(limit), 20)), source_type="note"
         )
     except Exception as exc:  # noqa: BLE001 — a failed search is an answer, not a crash
-        logger.warning("note_search_failed", error=str(exc)[:200])
-        return json.dumps({"error": f"note search failed: {str(exc)[:200]}"})
+        logger.warning("note_search_failed", error=error_text(exc))
+        return json.dumps({"error": f"note search failed: {error_text(exc)}"})
     notes_found = [
         {
             "path": notes.note_path_from_url(str(h.get("url") or "")),

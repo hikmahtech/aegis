@@ -13,6 +13,8 @@ from __future__ import annotations
 import httpx
 import structlog
 
+from aegis.errors import error_text
+
 logger = structlog.get_logger()
 
 
@@ -64,5 +66,5 @@ class HTTPConnector:
                 connector=self.connector_name,
                 action=action,
                 status=status,
-                error=str(exc)[:200],
+                error=error_text(exc),
             )

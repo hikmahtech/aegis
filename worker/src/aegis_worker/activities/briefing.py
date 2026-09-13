@@ -8,6 +8,7 @@ from html import escape as _esc
 from typing import Any
 
 import httpx
+from aegis.errors import error_text
 from aegis.services.health import HEALTH_SOURCE
 from temporalio import activity
 
@@ -83,7 +84,7 @@ class BriefingActivities:
                 except (json.JSONDecodeError, TypeError):
                     pass
         except Exception as exc:
-            activity.logger.warning("gather_calendar_failed error=%s", str(exc)[:200])
+            activity.logger.warning("gather_calendar_failed error=%s", error_text(exc))
 
         activity.logger.info("calendar_events_gathered count=%d", len(events))
         return {"events": events, "count": len(events)}
@@ -100,7 +101,7 @@ class BriefingActivities:
                 resp.raise_for_status()
                 return resp.json()
         except Exception as exc:
-            activity.logger.warning("gather_market_data_failed error=%s", str(exc)[:200])
+            activity.logger.warning("gather_market_data_failed error=%s", error_text(exc))
             return {"available": False}
 
     @activity.defn
@@ -144,7 +145,7 @@ class BriefingActivities:
                 source_type="intelligence",
             )
         except Exception as exc:
-            activity.logger.warning("recent_intelligence_query_failed: %s", str(exc)[:200])
+            activity.logger.warning("recent_intelligence_query_failed: %s", error_text(exc))
             return []
 
         from datetime import timedelta
@@ -196,7 +197,7 @@ class BriefingActivities:
                 activity.logger.warning(
                     "references_filed_query_failed source_type=%s err=%s",
                     st,
-                    str(exc)[:200],
+                    error_text(exc),
                 )
                 continue
             for it in items or []:
@@ -251,7 +252,7 @@ class BriefingActivities:
                 limit=200, source_type="email"
             )
         except Exception as exc:
-            activity.logger.warning("email_digest_query_failed err=%s", str(exc)[:200])
+            activity.logger.warning("email_digest_query_failed err=%s", error_text(exc))
             return []
 
         from datetime import timedelta
@@ -299,7 +300,7 @@ class BriefingActivities:
                         else row["value"]
                     )
             except Exception as exc:
-                activity.logger.warning("briefing_state_read_failed err=%s", str(exc)[:200])
+                activity.logger.warning("briefing_state_read_failed err=%s", error_text(exc))
 
         now = datetime.now(UTC)
         last_raw = prior.get("last_briefing_at")
@@ -340,7 +341,7 @@ class BriefingActivities:
                     "url": r.get("url") or r.get("source_url") or "",
                 })
         except Exception as exc:
-            activity.logger.warning("briefing_intel_diff_failed err=%s", str(exc)[:200])
+            activity.logger.warning("briefing_intel_diff_failed err=%s", error_text(exc))
 
         # collected: references filed (raindrop / RSS / email / chat) since the
         # last briefing — the "what I learned from what I collected" digest. The
@@ -381,7 +382,7 @@ class BriefingActivities:
                 if len(collected_out) >= 12:
                     break
         except Exception as exc:
-            activity.logger.warning("briefing_collected_diff_failed err=%s", str(exc)[:200])
+            activity.logger.warning("briefing_collected_diff_failed err=%s", error_text(exc))
 
         # topics: tracked topics (#513) whose round gained items since the last
         # briefing. The hub holds these now, where the intel scans used to file
@@ -414,7 +415,7 @@ class BriefingActivities:
                     for r in trows
                 ]
             except Exception as exc:
-                activity.logger.warning("briefing_topics_failed err=%s", str(exc)[:200])
+                activity.logger.warning("briefing_topics_failed err=%s", error_text(exc))
 
         # inbox: the `important_read` mail AEGIS filed and marked read without
         # ever showing the owner. Same diff-and-dedup shape as `collected`.
@@ -440,7 +441,7 @@ class BriefingActivities:
                 if len(emails_out) >= 12:
                     break
         except Exception as exc:
-            activity.logger.warning("briefing_email_diff_failed err=%s", str(exc)[:200])
+            activity.logger.warning("briefing_email_diff_failed err=%s", error_text(exc))
 
         # what broke: failed runs + new open drift since cursor
         failed_runs: list[dict] = []
@@ -474,7 +475,7 @@ class BriefingActivities:
                         "completed_at": r["completed_at"].isoformat() if r["completed_at"] else None,
                     })
             except Exception as exc:
-                activity.logger.warning("briefing_failed_runs_failed err=%s", str(exc)[:200])
+                activity.logger.warning("briefing_failed_runs_failed err=%s", error_text(exc))
             try:
                 drows = await self.db_pool.fetch(
                     "SELECT service_name, severity FROM pandoras_actor.homelab_drift "
@@ -484,7 +485,7 @@ class BriefingActivities:
                 )
                 new_drift = [{"service": r["service_name"], "severity": r["severity"]} for r in drows]
             except Exception as exc:
-                activity.logger.warning("briefing_drift_failed err=%s", str(exc)[:200])
+                activity.logger.warning("briefing_drift_failed err=%s", error_text(exc))
 
         # calendar: today's events, flag ids not seen before
         cal_today: list[dict] = []
@@ -502,7 +503,7 @@ class BriefingActivities:
                 if eid not in seen_cal:
                     new_cal_ids.append(eid)
         except Exception as exc:
-            activity.logger.warning("briefing_calendar_diff_failed err=%s", str(exc)[:200])
+            activity.logger.warning("briefing_calendar_diff_failed err=%s", error_text(exc))
 
         # location: where the owner currently is, as a LABEL (B5). The KV holds
         # {"place": "home", "at": iso} — never a coordinate — and a pointer
@@ -528,7 +529,7 @@ class BriefingActivities:
                 if name and now - seen_at <= timedelta(hours=_PLACE_STALE_HOURS):
                     place = {"place": name, "at": seen_at.isoformat()}
             except Exception as exc:
-                activity.logger.warning("briefing_place_failed err=%s", str(exc)[:200])
+                activity.logger.warning("briefing_place_failed err=%s", error_text(exc))
 
         # Health (B6) is deliberately NOT gathered here — see `_recent_health`.
         # It is read at render time, inside `frame_briefing`, so that no body
@@ -596,7 +597,7 @@ class BriefingActivities:
             )
             return {r["metric"]: r["value"] for r in rows if r["value"] is not None}
         except Exception as exc:
-            activity.logger.warning("briefing_health_failed err=%s", str(exc)[:200])
+            activity.logger.warning("briefing_health_failed err=%s", error_text(exc))
             return {}
 
     @activity.defn
@@ -632,7 +633,7 @@ class BriefingActivities:
                 raw = result.get("response", "") if isinstance(result, dict) else (result or "")
                 narrative = (raw or "").strip() or fallback
             except Exception as exc:  # noqa: BLE001
-                activity.logger.warning("frame_briefing_llm_failed err=%s", str(exc)[:200])
+                activity.logger.warning("frame_briefing_llm_failed err=%s", error_text(exc))
                 # Keep shipping the briefing — "you always get one" is the point
                 # of the fallback — but SAY that it is the degraded one. This
                 # ran silently for six days: the flow reported `delivered`, the
@@ -834,5 +835,5 @@ class BriefingActivities:
             )
             return True
         except Exception as exc:
-            activity.logger.warning("briefing_ingest_failed: %s", str(exc))
+            activity.logger.warning("briefing_ingest_failed: %s", error_text(exc, 500))
             return False

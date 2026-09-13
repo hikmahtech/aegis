@@ -39,6 +39,7 @@ from aegis.api.auth import verify_auth
 from aegis.api.deps import get_settings
 from aegis.api.routes._flow_trigger import require_temporal_client, start_named_workflow
 from aegis.config import Settings
+from aegis.errors import error_text
 from aegis.services import books, books_chart, desk_math, desk_rules, trading_desk
 from aegis.services.journal_index import OPEN_DUE_SQL, TICKED_OFF_SQL
 from aegis.services.money_format import currency_symbol
@@ -124,7 +125,7 @@ async def money_state(request: Request, settings: Settings = Depends(get_setting
     except Exception as exc:  # noqa: BLE001 — a missing/degraded checkout is a
         # counter of 0, not a 500: everything else on this page comes from
         # Postgres and is still worth rendering.
-        logger.warning("money_unpushed_commits_failed error=%s", str(exc)[:200])
+        logger.warning("money_unpushed_commits_failed error=%s", error_text(exc))
         unpushed = 0
     return {
         "events": [_event(r) for r in events],
@@ -151,7 +152,7 @@ def _latest_close_sync(base: Path) -> dict | None:
         # Everything else — a permissions error, an I/O error, a half-finished
         # clone — renders identically to "no close filed yet". Say so in the
         # log, or the page quietly reports an empty month forever.
-        logger.warning("money_digest_list_failed dir=%s error=%s", base, str(exc)[:200])
+        logger.warning("money_digest_list_failed dir=%s error=%s", base, error_text(exc))
         return None
     if not names:
         return None
@@ -159,7 +160,7 @@ def _latest_close_sync(base: Path) -> dict | None:
     try:
         text = (base / newest).read_text(encoding="utf-8", errors="replace")
     except OSError as exc:
-        logger.warning("money_digest_read_failed file=%s error=%s", newest, str(exc)[:200])
+        logger.warning("money_digest_read_failed file=%s error=%s", newest, error_text(exc))
         return None
     return {"path": f"{_REPORTS_REL}/{newest}", "markdown": text}
 
@@ -305,8 +306,8 @@ async def money_balances(
         # Not a 500: the books are a git checkout that can be absent,
         # mid-clone or unreadable, and none of that is a reason for the page
         # to lose its bills, statements and desk as well.
-        logger.warning("money_balances_unavailable error=%s", str(exc)[:200])
-        return out | {"books_ok": False, "error": str(exc)[:300]}
+        logger.warning("money_balances_unavailable error=%s", error_text(exc))
+        return out | {"books_ok": False, "error": error_text(exc, 300)}
     return out | {"standing": _balance_report(standing), "month": _balance_report(month)}
 
 

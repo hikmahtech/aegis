@@ -28,6 +28,8 @@ from typing import Any
 
 import structlog
 
+from aegis.errors import error_text
+
 logger = structlog.get_logger()
 
 Merge = Callable[[Any], dict]
@@ -55,7 +57,7 @@ class SettingsRow:
             try:
                 value = await pool.fetchval("SELECT value FROM settings WHERE key = $1", self.key)
             except Exception as exc:  # noqa: BLE001 — a config read must never break a run
-                logger.warning("config_row_read_failed", key=self.key, error=str(exc)[:200])
+                logger.warning("config_row_read_failed", key=self.key, error=error_text(exc))
         merged = self.merge(value)
         self._cached = (now, dict(merged))
         return merged

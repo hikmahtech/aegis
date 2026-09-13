@@ -49,6 +49,8 @@ from typing import Any
 import asyncpg
 import structlog
 
+from aegis.errors import error_text
+
 logger = structlog.get_logger()
 
 # An occurrence within this long after a problem resolved reopens it; one
@@ -692,7 +694,7 @@ async def _suppression_or_none(
         async with conn.transaction():
             return await _active_suppression(conn, subject, subject_kind, now)
     except Exception as exc:  # noqa: BLE001 — fail open: an alert beats a window
-        logger.warning("hub_service_state_unreadable", subject=subject, error=str(exc)[:200])
+        logger.warning("hub_service_state_unreadable", subject=subject, error=error_text(exc))
         return None
 
 

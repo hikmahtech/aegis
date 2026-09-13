@@ -38,6 +38,8 @@ from urllib.parse import urlparse
 import httpx
 import structlog
 
+from aegis.errors import error_text
+
 logger = structlog.get_logger()
 
 # MCP revision we advertise. Servers negotiate down; we do not require a match.
@@ -427,7 +429,7 @@ class MCPManager:
                 self._configs[name] = parse_server_config(str(name), raw)
             except MCPConfigError as exc:
                 self._errors[str(name)] = str(exc)
-                logger.error("mcp_server_config_rejected", server=str(name), error=str(exc))
+                logger.error("mcp_server_config_rejected", server=str(name), error=error_text(exc, 500))
 
         if not self._enabled:
             logger.info(

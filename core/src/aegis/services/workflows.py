@@ -7,6 +7,8 @@ from uuid import uuid4
 
 import structlog
 
+from aegis.errors import error_text
+
 logger = structlog.get_logger()
 
 # Worker polls "aegis-main" (see worker/src/aegis_worker/__main__.py:TASK_QUEUE).
@@ -43,5 +45,5 @@ async def trigger_workflow(
         )
         return {"workflow_id": handle.id, "workflow_type": workflow_type, "status": "started"}
     except Exception as exc:
-        logger.error("workflow_trigger_failed", workflow_type=workflow_type, error=str(exc))
-        return {"error": f"Failed to start {workflow_type}: {str(exc)}"}
+        logger.error("workflow_trigger_failed", workflow_type=workflow_type, error=error_text(exc, 500))
+        return {"error": f"Failed to start {workflow_type}: {error_text(exc, 500)}"}

@@ -53,6 +53,8 @@ from temporalio import workflow
 from temporalio.exceptions import ApplicationError, WorkflowAlreadyStartedError
 
 with workflow.unsafe.imports_passed_through():
+    from aegis.errors import error_text
+
     from aegis_worker.activities.profile import ProfileActivities
     from aegis_worker.flows.interaction import InteractionFlow, InteractionFlowInput
     from aegis_worker.shared.retry import NO_RETRY, TIMEOUT_FAST, TIMEOUT_LLM
@@ -147,7 +149,7 @@ class ProfileReflectionFlow:
                     retry_policy=NO_RETRY,
                 )
             except Exception as exc:  # noqa: BLE001 — a quiet week beats a failed run
-                workflow.logger.warning("profile_evidence_failed err=%s", str(exc)[:200])
+                workflow.logger.warning("profile_evidence_failed err=%s", error_text(exc))
                 return {"status": "skipped", "carded": 0, "reason": "evidence_failed"}
 
             evidence = evidence or {}
@@ -169,7 +171,7 @@ class ProfileReflectionFlow:
                 )
             except Exception as exc:  # noqa: BLE001
                 workflow.logger.warning(
-                    "profile_generalizations_failed err=%s", str(exc)[:200]
+                    "profile_generalizations_failed err=%s", error_text(exc)
                 )
                 gen = {}
             generalizations = [
@@ -195,7 +197,7 @@ class ProfileReflectionFlow:
                     retry_policy=NO_RETRY,
                 )
             except Exception as exc:  # noqa: BLE001
-                workflow.logger.warning("profile_proposal_failed err=%s", str(exc)[:200])
+                workflow.logger.warning("profile_proposal_failed err=%s", error_text(exc))
                 return {"status": "skipped", "carded": 0, "reason": "llm_failed"}
 
             proposal = proposal or {}

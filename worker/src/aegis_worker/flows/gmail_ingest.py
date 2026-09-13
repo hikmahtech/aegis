@@ -20,6 +20,8 @@ from temporalio.common import RetryPolicy
 from temporalio.workflow import ParentClosePolicy
 
 with workflow.unsafe.imports_passed_through():
+    from aegis.errors import error_text
+
     from aegis_worker.activities.agent_registry import AgentRegistryActivities
     from aegis_worker.activities.capture import CaptureActivities
     from aegis_worker.activities.delivery import DeliveryActivities
@@ -197,7 +199,7 @@ class GmailIngestFlow:
                         workflow.logger.warning(
                             "money_fanout_start_failed msg=%s err=%s",
                             msg.get("id", ""),
-                            str(exc)[:200],
+                            error_text(exc),
                         )
 
                 # `meeting` — set by a sender-override rule on the Email triage
@@ -220,7 +222,7 @@ class GmailIngestFlow:
                         workflow.logger.warning(
                             "meeting_fanout_start_failed msg=%s err=%s",
                             msg.get("id", ""),
-                            str(exc)[:200],
+                            error_text(exc),
                         )
 
                 processed_here += 1
@@ -288,7 +290,7 @@ class GmailIngestFlow:
             )
         except Exception as exc:
             workflow.logger.warning(
-                "email_task_link_failed msg_id=%s err=%s", msg.get("id", ""), str(exc)[:200]
+                "email_task_link_failed msg_id=%s err=%s", msg.get("id", ""), error_text(exc)
             )
             return {"applied": False, "reason": "activity_failed"}
 
@@ -408,7 +410,7 @@ class GmailIngestFlow:
             workflow.logger.warning(
                 "gmail_people_enrichment_failed msg_id=%s err=%s",
                 msg.get("id", ""),
-                str(exc)[:200],
+                error_text(exc),
             )
 
         # Email → EXISTING task (`email_task_links`). Runs before the category
@@ -448,7 +450,7 @@ class GmailIngestFlow:
                 workflow.logger.warning(
                     "gmail_ingest_to_kg_failed msg_id=%s err=%s",
                     msg.get("id", ""),
-                    str(exc)[:200],
+                    error_text(exc),
                 )
 
         if category == "important_action":
@@ -479,7 +481,7 @@ class GmailIngestFlow:
                 )
             except Exception as exc:
                 workflow.logger.warning(
-                    "gmail_unread_check_failed msg_id=%s err=%s", msg_id, str(exc)[:200]
+                    "gmail_unread_check_failed msg_id=%s err=%s", msg_id, error_text(exc)
                 )
                 still_unread = True
             if not still_unread:
@@ -527,7 +529,7 @@ class GmailIngestFlow:
                 )
             except Exception as exc:
                 workflow.logger.warning(
-                    "gmail_email_context_failed msg_id=%s err=%s", msg_id, str(exc)[:200]
+                    "gmail_email_context_failed msg_id=%s err=%s", msg_id, error_text(exc)
                 )
                 related = ""
             if related:
@@ -550,7 +552,7 @@ class GmailIngestFlow:
                 workflow.logger.warning(
                     "gmail_capture_failed msg_id=%s err=%s",
                     msg_id,
-                    str(exc)[:200],
+                    error_text(exc),
                 )
             # `capture_to_inbox` returns None on kill-switch / no-inbox /
             # permanent rejection.
@@ -573,7 +575,7 @@ class GmailIngestFlow:
                     workflow.logger.warning(
                         "gmail_escalate_failed msg_id=%s err=%s",
                         msg_id,
-                        str(exc)[:200],
+                        error_text(exc),
                     )
             # Surface in Gmail too: apply the IMPORTANT label, keep unread.
             # Best-effort — the Todoist capture above is the durable record.
@@ -586,7 +588,7 @@ class GmailIngestFlow:
                 )
             except Exception as exc:
                 workflow.logger.warning(
-                    "gmail_label_important_failed msg_id=%s err=%s", msg_id, str(exc)[:200]
+                    "gmail_label_important_failed msg_id=%s err=%s", msg_id, error_text(exc)
                 )
             return "captured_to_inbox"
 

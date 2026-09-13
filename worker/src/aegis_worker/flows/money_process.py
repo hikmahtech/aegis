@@ -35,6 +35,8 @@ from datetime import timedelta
 from temporalio import workflow
 
 with workflow.unsafe.imports_passed_through():
+    from aegis.errors import error_text
+
     from aegis_worker.shared.retry import ACT_RETRY
 
 _ACT_TIMEOUT = timedelta(seconds=60)
@@ -98,7 +100,7 @@ class MoneyProcessFlow:
             workflow.logger.warning(
                 "money_body_fetch_failed receipt_id=%s err=%s",
                 receipt_id,
-                str(exc)[:200],
+                error_text(exc),
             )
 
         receipts = await workflow.execute_activity(
@@ -123,7 +125,7 @@ class MoneyProcessFlow:
             workflow.logger.warning(
                 "money_extract_failed receipt_id=%s err=%s",
                 receipt_id,
-                str(exc)[:200],
+                error_text(exc),
             )
             return {**out, "status": "extract_failed"}
 
@@ -153,7 +155,7 @@ class MoneyProcessFlow:
                 workflow.logger.warning(
                     "money_capture_due_failed receipt_id=%s err=%s",
                     receipt_id,
-                    str(exc)[:200],
+                    error_text(exc),
                 )
 
         posted = await workflow.execute_activity(

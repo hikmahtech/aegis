@@ -27,6 +27,8 @@ from temporalio import workflow
 from temporalio.exceptions import ApplicationError
 
 with workflow.unsafe.imports_passed_through():
+    from aegis.errors import error_text
+
     from aegis_worker.activities.expiring_items import ExpiringItemsActivities
     from aegis_worker.flows.interaction import InteractionFlow, InteractionFlowInput
     from aegis_worker.shared.retry import NO_RETRY, TIMEOUT_FAST
@@ -80,7 +82,7 @@ async def _spawn_expiry_card(agent_id: str, alert: dict) -> bool:
         return True
     except Exception as exc:  # noqa: BLE001 — one bad card must not kill the sweep
         workflow.logger.warning(
-            "expiry_card_spawn_failed item=%s err=%s", alert.get("item_id"), str(exc)[:200]
+            "expiry_card_spawn_failed item=%s err=%s", alert.get("item_id"), error_text(exc)
         )
         return False
 

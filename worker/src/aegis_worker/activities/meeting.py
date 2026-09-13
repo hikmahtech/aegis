@@ -18,6 +18,7 @@ from itertools import islice
 from pathlib import Path
 from typing import Any
 
+from aegis.errors import error_text
 from aegis.llm import LLMTruncationError, parse_llm_json
 from aegis.services.email_rules import get_email_rules
 from aegis.services.meeting_rules import get_meeting_rules, is_self
@@ -424,7 +425,7 @@ class MeetingActivities:
             result = await asyncio.to_thread(_sync)
         except Exception as exc:  # noqa: BLE001 — the Gmail read itself failed
             activity.logger.warning(
-                "meeting_fetch_failed msg_id=%s err=%s", message_id, str(exc)[:200]
+                "meeting_fetch_failed msg_id=%s err=%s", message_id, error_text(exc)
             )
             return {
                 **base,
@@ -446,7 +447,7 @@ class MeetingActivities:
         try:
             return await get_meeting_rules(self.db_pool)
         except Exception as exc:  # noqa: BLE001 — a config read must not stop the flow
-            activity.logger.warning("meeting_rules_read_failed err=%s", str(exc)[:200])
+            activity.logger.warning("meeting_rules_read_failed err=%s", error_text(exc))
             return merge_meeting_rules(None)
 
     async def _review_once(self, prompt: str, agent_id: str) -> Any:
@@ -532,10 +533,10 @@ class MeetingActivities:
             if not isinstance(parsed, dict):
                 raise ValueError("unparseable meeting review")
         except LLMTruncationError as exc:
-            activity.logger.warning("meeting_review_truncated: %s", str(exc)[:200])
+            activity.logger.warning("meeting_review_truncated: %s", error_text(exc))
             return {"skipped": "llm_failed", "stats": stats, "observations": observations}
         except Exception as exc:  # noqa: BLE001
-            activity.logger.warning("meeting_review_llm_failed: %s", str(exc)[:200])
+            activity.logger.warning("meeting_review_llm_failed: %s", error_text(exc))
             return {"skipped": "llm_failed", "stats": stats, "observations": observations}
 
         review = {
@@ -583,7 +584,7 @@ class MeetingActivities:
                 )
         except Exception as exc:  # noqa: BLE001 — best-effort, see the docstring
             activity.logger.warning(
-                "meeting_outcome_failed content_id=%s err=%s", content_id, str(exc)[:200]
+                "meeting_outcome_failed content_id=%s err=%s", content_id, error_text(exc)
             )
             return {"recorded": False}
         if updated is None:
@@ -609,7 +610,7 @@ class MeetingActivities:
         try:
             rules = await get_email_rules(self.db_pool)
         except Exception as exc:  # noqa: BLE001 — see the docstring
-            activity.logger.warning("meeting_senders_load_failed err=%s", str(exc)[:200])
+            activity.logger.warning("meeting_senders_load_failed err=%s", error_text(exc))
             return []
         addrs = {
             key.lstrip("@")
@@ -651,7 +652,7 @@ class MeetingActivities:
                     ids,
                 )
         except Exception as exc:  # noqa: BLE001 — see the docstring
-            activity.logger.warning("meeting_unstored_failed err=%s", str(exc)[:200])
+            activity.logger.warning("meeting_unstored_failed err=%s", error_text(exc))
             return []
         stored = {r["message_id"] for r in rows}
         return [mid for mid in ids if mid not in stored]
@@ -680,7 +681,7 @@ class MeetingActivities:
                 )
             except Exception as exc:  # noqa: BLE001
                 activity.logger.warning(
-                    "meeting_observation_failed metric=%s err=%s", metric, str(exc)[:200]
+                    "meeting_observation_failed metric=%s err=%s", metric, error_text(exc)
                 )
                 continue
             if row is not None:
