@@ -11,6 +11,21 @@ connector comes back.
 Boot-time callers should pass ``threshold=1`` — the next retry is a whole
 restart away. The persisted ``alerted`` flag keeps repeated boots (or runs)
 from re-alerting until the connector recovers.
+
+**The Slack ping is the notification; the problem hub is the record** (#571).
+The one ping is all this mechanism used to do, and ``alerted`` then silenced it
+for the rest of the outage — so a dead integration produced exactly one
+notification in its entire lifetime, with no problem, no task, no owner and no
+timeline. Calibre was down for two days that way. So every record also runs the
+connector set through :func:`hub_watch.reconcile_findings`: a connector at or
+past its threshold is a ``connectordown`` finding, and one that recovers has its
+problem resolved by the watchdog seam rather than by a flag. ``alerted`` goes on
+suppressing repeat *pings*; it no longer decides whether the failure is visible.
+
+The reconcile sweeps **every** ``connector_health:*`` row, not just the one being
+recorded, because ``reconcile_findings`` resolves any problem of its classes that
+is absent from the findings it is handed — passing one connector's state would
+resolve every other connector's live problem.
 """
 
 from __future__ import annotations
@@ -19,9 +34,21 @@ from typing import Any
 
 import structlog
 
+from aegis.services.hub_watch import reconcile_findings
+
 logger = structlog.get_logger()
 
 _KEY_PREFIX = "connector_health:"
+# The hub identity of a dead connector. `source` is not in
+# `hub_project._OWNER_BY_SOURCE`, so the task falls to the infra owner, which is
+# who fixes an integration; and it is not in `hub_project._SELF_CLEARING_SOURCES`,
+# so there is no settle delay — the consecutive-failure threshold already IS the
+# settle window.
+_SOURCE = "connector"
+_SUBJECT_KIND = "integration"
+_DOWN_CLASS = "connectordown"
+# Only used to read a row written before `down` existed (#571).
+_LEGACY_THRESHOLD = 3
 
 
 async def record_connector_health(
@@ -56,13 +83,21 @@ async def _record(
             return  # steady state — no write per healthy run
         if alerted:
             await _send_system_event(settings, f"✅ Connector `{connector}` recovered.")
-        state = {"consecutive_failures": 0, "alerted": False}
+        state = {"consecutive_failures": 0, "alerted": False, "down": False}
     else:
         failures += 1
         logger.warning(
             "connector_health_failure", connector=connector, consecutive=failures, error=error[:300]
         )
-        state = {"consecutive_failures": failures, "alerted": alerted, "last_error": error[:300]}
+        state = {
+            "consecutive_failures": failures,
+            "alerted": alerted,
+            "last_error": error[:300],
+            # Stored rather than re-derived: the threshold is a per-call argument
+            # (a boot-time caller passes 1), so the sweep below cannot work out
+            # from a bare count whether some other connector is past its own.
+            "down": failures >= threshold,
+        }
         if failures >= threshold and not alerted:
             # Only latch `alerted` when the event actually went out, so a
             # comms outage retries the alert on the next failure.
@@ -77,6 +112,58 @@ async def _record(
         "ON CONFLICT (key) DO UPDATE SET value = $2, updated_at = NOW()",
         key,
         state,
+    )
+    # Its own guard: a hub failure must not be reported as a failure to record.
+    try:
+        await _reconcile(pool)
+    except Exception as exc:  # noqa: BLE001 — the next record retries the sweep
+        logger.warning("connector_health_reconcile_failed", error=str(exc)[:200])
+
+
+def _is_down(state: dict) -> bool:
+    """Whether a stored row says its connector is at or past its threshold."""
+    if "down" in state:
+        return bool(state["down"])
+    # A row written before `down` existed. Its threshold is not recorded, so the
+    # default is the only one available; the next record of that connector
+    # replaces the guess with the real answer.
+    return int(state.get("consecutive_failures") or 0) >= _LEGACY_THRESHOLD
+
+
+async def _reconcile(pool: Any) -> None:
+    """Turn the whole connector set into hub findings, and resolve what recovered."""
+    rows = await pool.fetch(
+        "SELECT key, value FROM settings WHERE key LIKE $1", _KEY_PREFIX + "%"
+    )
+    findings = []
+    for row in rows:
+        state = dict(row["value"] or {})
+        if not _is_down(state):
+            continue
+        name = str(row["key"])[len(_KEY_PREFIX) :]
+        if not name:
+            continue
+        findings.append(
+            {
+                "klass": _DOWN_CLASS,
+                "subject": name,
+                # No count in the title: a title is set once, when the problem
+                # opens, and would then freeze at whatever the count was then.
+                "title": f"Connector {name} is failing",
+                "severity": "warning",
+                "payload": {
+                    "connector": name,
+                    "consecutive_failures": int(state.get("consecutive_failures") or 0),
+                    "last_error": str(state.get("last_error") or "")[:300],
+                },
+            }
+        )
+    await reconcile_findings(
+        pool,
+        source=_SOURCE,
+        subject_kind=_SUBJECT_KIND,
+        classes=[_DOWN_CLASS],
+        findings=findings,
     )
 
 
