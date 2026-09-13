@@ -420,9 +420,13 @@ def test_books_write_flow_is_gated_on_money_hygiene():
         # `project_problem` on the existing HubActivities, how the investigation
         # learns a task the settle window deferred. Unflagged, so all three
         # rows move.
-        (True, True, 51, 248),
-        (False, False, 40, 213),
-        (True, False, 44, 230),
+        # Then +1 activity and NO new flow from #551: `reconcile_alertmanager`
+        # on the existing HubActivities, a HubSweepFlow step that resolves a
+        # problem whose alert alertmanager no longer lists. Unflagged, so all
+        # three rows move.
+        (True, True, 51, 249),
+        (False, False, 40, 214),
+        (True, False, 44, 231),
     ],
 )
 def test_real_registration_passes_the_boot_check(homelab, money, flows, activities):

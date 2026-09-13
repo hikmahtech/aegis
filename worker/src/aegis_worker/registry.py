@@ -514,6 +514,13 @@ FLOWS: tuple[FlowSpec, ...] = (
                 act["config"], "fix_verify_hours", HubSweepConfig.fix_verify_hours
             ),
             fix_grace_hours=_float(act["config"], "fix_grace_hours", HubSweepConfig.fix_grace_hours),
+            # Empty disables the alertmanager reconciliation entirely (#551).
+            alertmanager_url=str(act["config"].get("alertmanager_url") or "").strip(),
+            alertmanager_min_uptime_seconds=_int(
+                act["config"],
+                "alertmanager_min_uptime_seconds",
+                HubSweepConfig.alertmanager_min_uptime_seconds,
+            ),
         ),
     ),
     FlowSpec(

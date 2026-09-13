@@ -144,6 +144,10 @@ async def test_sweep_promotes_then_projects_and_reports():
         "group_candidates": 0,
         "grouped": 0,
         "folded": 0,
+        # No alertmanager configured in this fixture, so the reconciliation
+        # step declines to act and says why (#551).
+        "alertmanager_resolved": 0,
+        "alertmanager_skipped": "",
     }
     # Promotion first, so a just-promoted problem gets its task in the same
     # tick; completed tasks and merged fixes next, so what they resolve or
@@ -330,3 +334,48 @@ async def test_the_sweep_resolves_a_problem_whose_task_a_person_completed(db_poo
 
     assert out["task_completed"] >= 1
     assert (await get_problem(db_pool, r.problem_id))["status"] == "resolved"
+
+
+@activity.defn(name="reconcile_alertmanager")
+async def _reconcile_am(url: str, min_uptime_seconds: int = 900) -> dict:
+    _calls.append(f"reconcile_alertmanager:{url}:{min_uptime_seconds}")
+    return {"checked": 4, "resolved": 2, "problems": ["p-1", "p-2"], "active_alerts": 7}
+
+
+@pytest.mark.asyncio
+async def test_the_sweep_reconciles_alertmanager_before_it_projects():
+    """A problem whose alert alertmanager forgot is resolved in the same tick it
+    is projected, so the resolve reaches the Todoist task now rather than in
+    five minutes (#551).
+
+    Falsifiable: drop the step and `reconcile_alertmanager` never appears; move
+    it after `project_pending` and the order assertion fails.
+    """
+    _calls.clear()
+    _verify_args.clear()
+    out, _ = await _run(
+        [_promote, _reconcile, _verify, _project, _reconcile_am, _finder([]), _judge(True), _apply],
+        config=HubSweepConfig(
+            agent_id="pandoras-actor",
+            alertmanager_url="http://alertmanager:9093",
+            alertmanager_min_uptime_seconds=1200,
+        ),
+    )
+
+    assert out["alertmanager_resolved"] == 2
+    assert "reconcile_alertmanager:http://alertmanager:9093:1200" in _calls
+    assert _calls.index("reconcile_alertmanager:http://alertmanager:9093:1200") < _calls.index(
+        "project"
+    )
+
+
+@pytest.mark.asyncio
+async def test_the_sweep_does_not_ask_an_alertmanager_it_has_no_address_for():
+    """Unset means off: a fork must not probe a guessed monitoring host."""
+    _calls.clear()
+    _verify_args.clear()
+    out, _ = await _run(
+        [_promote, _reconcile, _verify, _project, _reconcile_am, _finder([]), _judge(True), _apply]
+    )
+    assert out["alertmanager_resolved"] == 0
+    assert not [c for c in _calls if c.startswith("reconcile_alertmanager")]

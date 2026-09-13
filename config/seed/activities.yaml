@@ -535,6 +535,17 @@ activities:
   # alert must stay clear before its problem resolves; `fix_grace_hours` (1) —
   # how long after the merge an occurrence is put down to the old code still
   # running. Raise the grace if your deploys land hours after a merge.
+  # `alertmanager_url` (#551) turns on the reconciliation that closes a problem
+  # whose alert alertmanager no longer lists. Alertmanager keeps its alerts in
+  # memory, so a restart loses every `resolved` webhook it owed, and that lane
+  # is the only one with no other way back — the problem and its Todoist task
+  # were stranded for good. Use the INTERNAL address (the public host is behind
+  # an identity proxy); empty, the default, disables it. The step fails closed:
+  # unreachable, non-200, or an alertmanager up for less than
+  # `alertmanager_min_uptime_seconds` (900) resolves nothing, because a
+  # just-restarted alertmanager holds no alerts until Prometheus re-sends and
+  # reconciling against that empty set would resolve the whole estate.
+  #
   # Also (#448): `group_min_members` (3) and `group_window_hours` (72) — how
   # many live problems of one class and kind make a cluster worth a billed
   # judgement, and how far back "live" reaches. Raise the bar on a noisy
