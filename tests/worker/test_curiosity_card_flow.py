@@ -678,3 +678,77 @@ def test_curiosity_seed_row_exists():
     # Must not land on a slot another activity already owns.
     others = [r["schedule_cron"] for r in rows if r["slug"] != "curiosity-daily"]
     assert row["schedule_cron"] not in others
+
+
+# ----------------------------------------------- whose question it is (#556)
+
+
+def test_the_config_names_no_agent_by_default():
+    assert CuriosityConfig().agent_id == ""
+
+
+@pytest.mark.asyncio
+async def test_a_run_with_no_agent_asks_as_the_gtd_agent(clean_db):
+    """No agent on the config: the flow resolves the `gtd` tag FIRST, and asks
+    as whoever holds it — never a literal id."""
+    tags: list = []
+    async with await WorkflowEnvironment.start_time_skipping() as env:
+        with env.auto_time_skipping_disabled():
+            async with _flow_worker(
+                env.client, clean_db, resolve=_stub_resolve(tags, {"gtd": AGENT})
+            ) as run:
+                result = await run(CuriosityConfig())
+    assert tags and tags[0] == ["gtd"]
+    assert result.get("reason") != "no_gtd_agent"
+
+
+@pytest.mark.asyncio
+async def test_a_run_with_no_agent_and_no_gtd_holder_skips(clean_db):
+    """Zero holders: skip and say why. No budget read, no card."""
+    tags: list = []
+    async with await WorkflowEnvironment.start_time_skipping() as env:
+        with env.auto_time_skipping_disabled():
+            async with _flow_worker(
+                env.client, clean_db, resolve=_stub_resolve(tags, {})
+            ) as run:
+                result = await run(CuriosityConfig())
+    assert result == {"status": "skipped", "carded": 0, "reason": "no_gtd_agent"}
+    assert tags == [["gtd"]]
+    assert await _cards_count(clean_db) == 0
+
+
+@pytest.mark.asyncio
+async def test_a_run_that_names_its_agent_does_not_resolve_one(clean_db):
+    """The scheduled row passes its own agent_id, so the owner step is skipped
+    and a run started before #556 replays unchanged."""
+    tags: list = []
+    async with await WorkflowEnvironment.start_time_skipping() as env:
+        with env.auto_time_skipping_disabled():
+            async with _flow_worker(
+                env.client, clean_db, resolve=_stub_resolve(tags, {})
+            ) as run:
+                await run(CuriosityConfig(agent_id=AGENT))
+    assert ["gtd"] not in tags[:1]
+
+
+@pytest.mark.asyncio
+async def test_an_answer_with_no_agent_is_the_gtd_agents(clean_db):
+    acts = CuriosityActivities(db_pool=clean_db, llm_client=None)
+    out = await ActivityEnvironment().run(
+        acts.apply_curiosity_answer, str(uuid4()), {"value": "It is Bob"}, {"question": "Who?"}
+    )
+    # `sebas` holds `gtd` in the seeded agents.
+    assert out["recorded"] is True and out["agent_id"] == "sebas"
+
+
+@pytest.mark.asyncio
+async def test_an_answer_with_no_agent_and_no_gtd_holder_is_not_recorded(clean_db):
+    await clean_db.execute("UPDATE agents SET active = FALSE WHERE id = 'sebas'")
+    try:
+        acts = CuriosityActivities(db_pool=clean_db, llm_client=None)
+        out = await ActivityEnvironment().run(
+            acts.apply_curiosity_answer, str(uuid4()), {"value": "It is Bob"}, {"question": "Who?"}
+        )
+    finally:
+        await clean_db.execute("UPDATE agents SET active = TRUE WHERE id = 'sebas'")
+    assert out == {"recorded": False, "reason": "no_gtd_agent"}

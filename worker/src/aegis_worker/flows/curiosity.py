@@ -52,6 +52,8 @@ _GAP_TAG = {
     # "Track this?" (#513) — the research-tagged agent owns tracked topics.
     "untracked_topic": "research",
 }
+# Who asks when the run names nobody: the GTD agent.
+_OWNER_TAG = "gtd"
 
 # Gap types whose subject cannot be shown to be someone other than the owner
 # while `owner_emails` is unconfigured.
@@ -74,7 +76,10 @@ _ANSWER_TIMEOUT_S = 240
 
 @dataclass
 class CuriosityConfig:
-    agent_id: str = "sebas"
+    # Whose question it is. Empty = the holder of the `gtd` behavior tag,
+    # resolved at run time; no holder = the run skips (#556). The scheduled
+    # row passes its own `agent_id`.
+    agent_id: str = ""
     max_per_day: int = 1
     limit: int = 5
     # Two days: long enough that a card sent on a busy Friday survives the
@@ -107,11 +112,28 @@ class CuriosityConfig:
 class CuriosityCardFlow:
     @workflow.run
     async def run(self, config: CuriosityConfig) -> dict:
-        step = "check_curiosity_budget"
+        step = "resolve_owner"
         try:
+            owner = config.agent_id
+            if not owner:
+                # No agent named: the question is the GTD agent's (#556).
+                # Only a run with no agent_id takes this step, so a run
+                # started with one replays unchanged.
+                resolved = await workflow.execute_activity_method(
+                    AgentRegistryActivities.resolve_agents,
+                    args=[[_OWNER_TAG]],
+                    start_to_close_timeout=TIMEOUT_FAST,
+                    retry_policy=NO_RETRY,
+                )
+                owner = (resolved or {}).get(_OWNER_TAG) or ""
+                if not owner:
+                    workflow.logger.warning("curiosity_skipped reason=no_gtd_agent")
+                    return {"status": "skipped", "carded": 0, "reason": "no_gtd_agent"}
+
+            step = "check_curiosity_budget"
             gate = await workflow.execute_activity_method(
                 CuriosityActivities.check_curiosity_budget,
-                args=[config.agent_id, config.max_per_day],
+                args=[owner, config.max_per_day],
                 start_to_close_timeout=TIMEOUT_FAST,
                 retry_policy=NO_RETRY,
             )
@@ -127,7 +149,7 @@ class CuriosityCardFlow:
             try:
                 candidates = await workflow.execute_activity_method(
                     CuriosityActivities.find_curiosity_gaps,
-                    args=[config.agent_id, config.limit, config.thresholds()],
+                    args=[owner, config.limit, config.thresholds()],
                     # The detector's optional phrasing pass is an LLM call.
                     start_to_close_timeout=TIMEOUT_LLM,
                     retry_policy=NO_RETRY,
@@ -153,7 +175,7 @@ class CuriosityCardFlow:
 
             step = "resolve_agents"
             tag = _GAP_TAG.get(str(top.get("gap_type") or ""), "gtd")
-            target = config.agent_id
+            target = owner
             try:
                 resolved = await workflow.execute_activity_method(
                     AgentRegistryActivities.resolve_agents,
@@ -161,7 +183,7 @@ class CuriosityCardFlow:
                     start_to_close_timeout=TIMEOUT_FAST,
                     retry_policy=NO_RETRY,
                 )
-                target = (resolved or {}).get(tag) or config.agent_id
+                target = (resolved or {}).get(tag) or owner
             except Exception as exc:  # noqa: BLE001 — routing is a nicety
                 workflow.logger.warning("curiosity_agent_resolve_failed err=%s", str(exc)[:200])
 

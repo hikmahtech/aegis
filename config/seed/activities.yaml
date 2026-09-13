@@ -1,4 +1,10 @@
 # v3 activities seed. Loader upserts by slug.
+#
+# Every schedule_cron is UTC. Pick each one so it lands at the right local time
+# on YOUR clock — the `user_timezone` settings row (admin Vault page). Where a
+# comment below gives a local time, it is for a UTC+5:30 user, the example this
+# seed was written for; shift the crons by your own offset. Crons are DB-owned
+# once seeded: change them on /admin/flows, not here.
 
 activities:
   # Sebas — email & calendar ingestion
@@ -50,9 +56,9 @@ activities:
       max_items: 20
     active: true
 
-  # GTD layer — Phase 5 (Reviews). Crons in UTC; IST = UTC+5:30.
-  #   daily : 02:30 UTC = 08:00 IST every day
-  #   weekly: 03:30 UTC Sunday = 09:00 IST Sunday
+  # GTD layer — Phase 5 (Reviews). Crons in UTC.
+  #   daily : 02:30 UTC every day (08:00 at UTC+5:30)
+  #   weekly: 03:30 UTC Sunday (09:00 Sunday at UTC+5:30)
   - slug: gtd-daily-review
     workflow_type: DailyReviewFlow
     agent_id: sebas
@@ -82,8 +88,8 @@ activities:
       query_window: "newer_than:14d"
     active: true
 
-  # The weekly money brief, read off the books (spec §7.2). Sunday 03:00 UTC =
-  # 08:30 IST, an hour ahead of receipt-ingest-weekly so the brief covers the
+  # The weekly money brief, read off the books (spec §7.2). Sunday 03:00 UTC
+  # (08:30 at UTC+5:30), an hour ahead of receipt-ingest-weekly so the brief covers the
   # week the safety-net scan has already drained into the journal.
   - slug: money-brief-weekly
     workflow_type: MoneyBriefFlow
@@ -94,7 +100,7 @@ activities:
     active: true
 
   # The previous calendar month's close (spec §7.3). 1st of the month, 04:00
-  # UTC = 09:30 IST. `build_month_close` picks the month, so the cron only
+  # UTC (09:30 at UTC+5:30). `build_month_close` picks the month, so the cron only
   # decides when — a manual run closes the same month on any day.
   - slug: money-close-monthly
     workflow_type: MonthCloseFlow
@@ -103,7 +109,7 @@ activities:
     config: {}
     active: true
 
-  # The statement lane (spec §14 step 7). Daily at 05:30 UTC = 11:00 IST —
+  # The statement lane (spec §14 step 7). Daily at 05:30 UTC (11:00 at UTC+5:30) —
   # statements arrive monthly, but intake is idempotent on `row_id`, so a daily
   # tick costs a Drive listing and finds a statement the day it lands rather
   # than up to a month later.
@@ -129,7 +135,7 @@ activities:
     active: false
 
   # Maou's paper trading desk (spec 2026-09-12-maou-trading-desk-design.md).
-  # Weekdays 02:30 UTC = 08:00 IST, before the 09:15 open. Ships INACTIVE: it
+  # Weekdays 02:30 UTC (08:00 at UTC+5:30), before the example market's 09:15 open. Ships INACTIVE: it
   # needs ansaar_url + ansaar_service_secret (admin Integrations page) and a
   # trading system serving decisions (ansaar-data #30). The activity reads this
   # config on every run, so an edit here needs no redeploy.
@@ -214,7 +220,7 @@ activities:
   # #research / #email reference closure per the references-as-knowledge
   # spec; per-message chat notifications only fire for user-initiated #chat / #manual
   # sources, so this digest is the only signal the user gets for automated
-  # ingest closure). Cron 04:30 UTC = 10:00 IST. `feed_review_day` (default
+  # ingest closure). Cron 04:30 UTC (10:00 at UTC+5:30). `feed_review_day` (default
   # 1, the first of the month; 0 = every run) is the day this briefing names
   # the feeds no prompt has used (#511) — config is DB-owned, tune it on
   # /admin/flows.
@@ -270,7 +276,7 @@ activities:
       mode: monthly
     active: true
 
-  # Sebas — A7, one curiosity question per day (at most). 09:30 UTC = 15:00 IST:
+  # Sebas — A7, one curiosity question per day (at most). 09:30 UTC (15:00 at UTC+5:30):
   # a mid-afternoon question, deliberately away from both the 04:30 briefing and
   # the 09:00 money-hygiene run, and off the crowded :00 / :30-of-every-hour
   # slots that the ingest flows own. The flow gates itself on the notification
@@ -289,7 +295,7 @@ activities:
 
   # Sebas — A2, one proposed edit to his own `user` persona doc per week,
   # delivered as a draft_review card that a human must approve before anything
-  # is written. 02:23 UTC Sunday = 07:53 IST.
+  # is written. 02:23 UTC Sunday (07:53 at UTC+5:30).
   #
   # The minute matters more than the hour here. The spec proposed "0 2 * * 0",
   # but minute :00 of EVERY hour is the busiest slot in this file — two hourly

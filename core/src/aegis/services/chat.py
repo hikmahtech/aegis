@@ -150,107 +150,102 @@ def _registry_schema(name: str) -> dict:
 # (zero LLM cost); the LLM (fast tier) only resolves the keyword-less tail.
 # ponytail: substring match — good enough; @mention override + persona icon
 # make any mis-route visible and correctable.
-_INTENT_KEYWORDS: dict[str, list[str]] = {
-    "maou": ["money", "bill", "invoice", "subscription", "payment", "receipt",
-             "spend", "cost", "budget", "renew", "charge", "refund", "expense",
-             "price", "market", "stock", "crypto", "portfolio"],
-    "pandoras-actor": ["server", "docker", "swarm", "k8s", "kubernetes", "deploy",
-                       "infra", "drift", "backup", "cert", "argocd", "pod",
-                       "container", "node", "homelab", "restart", "logs",
-                       "grafana", "prometheus"],
-    "raphael": ["research", "knowledge", "learn", "paper", "article", "summari",
-                "remember", "recall", "explain"],
-    "sebas": ["task", "todo", "inbox", "remind", "defer", "project",
-              "next action", "calendar", "email", "waiting", "schedule",
-              "follow up"],
-}
-# Tie-break: specific domains before the generalist. Shipped ordering for the
-# seed agents; any other active agent tie-breaks after these, in id order
-# (deterministic — see `_keyword_route`). Not a closed list.
-_INTENT_PRECEDENCE = ["maou", "pandoras-actor", "raphael", "sebas"]
-
-# One-line intent descriptions shown to the LLM router (`_build_intent_prompt`).
-# Shipped fallback for the seed agents; the live prompt is built from each
-# active agent's metadata.intent_description (data-driven) so a renamed/added
-# agent is reachable via LLM routing, not just keyword/@mention.
-_INTENT_DESCRIPTIONS: dict[str, str] = {
-    "maou": "finance, money, subscriptions, receipts, market",
-    "pandoras-actor": "infrastructure, servers, deploys, homelab, logs",
-    "raphael": "research, knowledge, learning, summarizing",
-    "sebas": "tasks, GTD, calendar, email, general (the default)",
-}
+#
+# Every input here is read from the active agents' rows (#556): the keywords
+# from metadata.intent_keywords, the LLM router's one-liners from
+# metadata.intent_description, and the generalist — who tie-breaks last and
+# takes whatever nobody else claims — from the `gtd` behavior tag. The example
+# agents' values live in config/seed/agents.yaml, not here, so a fork that
+# renames its agents keeps every routing behaviour.
+GENERALIST_TAG = "gtd"
 
 
-def _keyword_route(message: str, keyword_map: dict[str, list[str]] | None = None) -> str | None:
+def _route_order(agent_ids, generalists=frozenset()) -> list[str]:
+    """Tie-break order: specific domains before the generalist. Agents holding
+    the `gtd` tag go last; within each group, by id (deterministic)."""
+    return sorted(agent_ids, key=lambda a: (a in generalists, a))
+
+
+def _keyword_route(
+    message: str,
+    keyword_map: dict[str, list[str]] | None = None,
+    generalists: frozenset[str] | set[str] = frozenset(),
+) -> str | None:
     """Pick an agent by keyword hit-count; None when no keyword matches.
 
-    `keyword_map` is per-agent intent keywords (from agents.metadata, falling
-    back to the shipped _INTENT_KEYWORDS defaults). Tie-break favours the known
-    precedence, then any other agents.
+    `keyword_map` is per-agent intent keywords (agents.metadata). A tie goes to
+    a specific agent over a `gtd` generalist, then to the lower id.
     """
-    if keyword_map is None:
-        keyword_map = _INTENT_KEYWORDS
     low = (message or "").lower()
-    scores = {a: sum(1 for kw in kws if kw in low) for a, kws in keyword_map.items()}
+    scores = {a: sum(1 for kw in kws if kw in low) for a, kws in (keyword_map or {}).items()}
     if not scores:
         return None
     best = max(scores.values())
     if best == 0:
         return None
-    order = _INTENT_PRECEDENCE + sorted(a for a in keyword_map if a not in _INTENT_PRECEDENCE)
-    for agent in order:
-        if scores.get(agent) == best:
+    for agent in _route_order(scores, generalists):
+        if scores[agent] == best:
             return agent
     return None
 
 
-async def _agent_keyword_map(pool) -> dict[str, list[str]]:
-    """Build per-agent intent keywords from agents.metadata (data-driven), with
-    the shipped _INTENT_KEYWORDS as fallback. Never raises."""
+async def _routing_agents(pool) -> list[dict]:
+    """Active agents as `{id, capabilities, metadata}`, by id. Empty without a
+    pool or on a failed read — routing must never break the front door."""
     if pool is None:
-        return dict(_INTENT_KEYWORDS)
+        return []
     try:
-        rows = await pool.fetch("SELECT id, metadata FROM agents WHERE active = TRUE")
-        out: dict[str, list[str]] = {}
-        for r in rows:
-            kws = (r["metadata"] or {}).get("intent_keywords") or _INTENT_KEYWORDS.get(r["id"])
-            if kws:
-                out[r["id"]] = kws
-        return out or dict(_INTENT_KEYWORDS)
+        rows = await pool.fetch(
+            "SELECT id, capabilities, metadata FROM agents WHERE active = TRUE ORDER BY id"
+        )
     except Exception as exc:  # noqa: BLE001 — routing must never break the front door
-        logger.warning("agent_keyword_map_failed", error=str(exc)[:200])
-        return dict(_INTENT_KEYWORDS)
+        logger.warning("agent_routing_read_failed", error=str(exc)[:200])
+        return []
+    return [
+        {"id": r["id"], "capabilities": r["capabilities"] or [], "metadata": r["metadata"] or {}}
+        for r in rows
+    ]
+
+
+def _keywords_of(agents: list[dict]) -> dict[str, list[str]]:
+    return {a["id"]: list(kws) for a in agents if (kws := a["metadata"].get("intent_keywords"))}
+
+
+def _descriptions_of(agents: list[dict]) -> dict[str, str]:
+    # An agent with no description (the virtual `system` agent) is never offered.
+    return {
+        a["id"]: str(desc) for a in agents if (desc := a["metadata"].get("intent_description"))
+    }
+
+
+def _generalists_of(agents: list[dict]) -> set[str]:
+    return {a["id"] for a in agents if GENERALIST_TAG in (a["capabilities"] or [])}
+
+
+async def _agent_keyword_map(pool) -> dict[str, list[str]]:
+    """Per-agent intent keywords from agents.metadata. Never raises."""
+    return _keywords_of(await _routing_agents(pool))
 
 
 async def _agent_intent_descriptions(pool) -> dict[str, str]:
     """Per-agent one-line intent descriptions for the LLM router prompt, from
-    agents.metadata.intent_description (data-driven), shipped _INTENT_DESCRIPTIONS
-    as fallback. Agents with neither are omitted (e.g. the virtual `system`
-    agent), so they never become a routing target. Never raises."""
-    if pool is None:
-        return dict(_INTENT_DESCRIPTIONS)
-    try:
-        rows = await pool.fetch("SELECT id, metadata FROM agents WHERE active = TRUE")
-        out: dict[str, str] = {}
-        for r in rows:
-            desc = (r["metadata"] or {}).get("intent_description") or _INTENT_DESCRIPTIONS.get(
-                r["id"]
-            )
-            if desc:
-                out[r["id"]] = desc
-        return out or dict(_INTENT_DESCRIPTIONS)
-    except Exception as exc:  # noqa: BLE001 — routing must never break the front door
-        logger.warning("agent_intent_descriptions_failed", error=str(exc)[:200])
-        return dict(_INTENT_DESCRIPTIONS)
+    agents.metadata.intent_description. Agents without one are omitted (e.g.
+    the virtual `system` agent), so they never become a routing target."""
+    return _descriptions_of(await _routing_agents(pool))
 
 
-def _build_intent_prompt(message: str, descriptions: dict[str, str] | None = None) -> str:
+def _build_intent_prompt(
+    message: str,
+    descriptions: dict[str, str] | None = None,
+    generalists: frozenset[str] | set[str] = frozenset(),
+) -> str:
     """Prompt the fast LLM to pick the best agent. The agent list is built from
-    `descriptions` (per-agent intent_description) — ordered by _INTENT_PRECEDENCE
-    then remaining ids sorted — so custom/renamed agents are offered too."""
-    descriptions = descriptions or dict(_INTENT_DESCRIPTIONS)
-    order = _INTENT_PRECEDENCE + sorted(a for a in descriptions if a not in _INTENT_PRECEDENCE)
-    lines = "\n".join(f"- {aid}: {descriptions[aid]}" for aid in order if aid in descriptions)
+    `descriptions` (per-agent intent_description), specific agents first and
+    the `gtd` generalist last, so custom/renamed agents are offered too."""
+    descriptions = descriptions or {}
+    lines = "\n".join(
+        f"- {aid}: {descriptions[aid]}" for aid in _route_order(descriptions, generalists)
+    )
     return (
         "Route this message to the single best AEGIS agent. Reply with STRICT "
         'JSON {"agent_id": "<id>", "reason": "<short>"}. Agents:\n'
@@ -259,30 +254,46 @@ def _build_intent_prompt(message: str, descriptions: dict[str, str] | None = Non
     )
 
 
-async def classify_intent(message: str, llm, settings, pool=None) -> dict:
-    """Front-door intent routing: keyword map → fast-LLM fallback → default sebas.
+def _default_agent(agents: list[dict], generalists: set[str]) -> str:
+    """Who gets a message nobody claims: the `gtd` generalist (first by id).
+    With no holder there is no default — "" makes the caller fall back to its
+    own (comms: the channel's agent) rather than to an id a fork may not have."""
+    for a in agents:
+        if a["id"] in generalists:
+            return a["id"]
+    if agents:
+        logger.warning("intent_route_no_generalist", tag=GENERALIST_TAG)
+    return ""
 
-    Keyword map is data-driven from agents.metadata (pool); never raises — on
-    any ambiguity/failure returns sebas (the generalist).
+
+async def classify_intent(message: str, llm, settings, pool=None) -> dict:
+    """Front-door intent routing: keyword map → fast-LLM fallback → the generalist.
+
+    Keyword map, descriptions and the default are data-driven from the active
+    agents' rows (pool); never raises — on any ambiguity/failure returns the
+    holder of the `gtd` tag.
     """
-    keyword_map = await _agent_keyword_map(pool)
-    kw = _keyword_route(message, keyword_map)
+    agents = await _routing_agents(pool)
+    keyword_map = _keywords_of(agents)
+    generalists = _generalists_of(agents)
+    kw = _keyword_route(message, keyword_map, generalists)
     if kw:
         return {"agent_id": kw, "reason": "keyword", "method": "keyword"}
+    default = _default_agent(agents, generalists)
     if llm is None:
-        return {"agent_id": "sebas", "reason": "no_llm", "method": "default"}
+        return {"agent_id": default, "reason": "no_llm", "method": "default"}
     # The tier map, not the raw env field it falls back to (#414).
     stale = getattr(settings, "model_fast", "gemma4:e2b") if settings else "gemma4:e2b"
     model = tier_to_model_or("fast", stale)
-    descriptions = await _agent_intent_descriptions(pool)
+    descriptions = _descriptions_of(agents)
     # Accept any routable active agent the LLM names — keyword map OR intent
     # description — so a custom agent reachable only via intent_description isn't
     # silently rejected.
     routable = set(keyword_map) | set(descriptions)
     try:
         result = await llm.think(
-            _build_intent_prompt(message, descriptions), model=model, max_tokens=300,
-            purpose="intent_route",
+            _build_intent_prompt(message, descriptions, generalists), model=model,
+            max_tokens=300, purpose="intent_route",
         )
         raw = result.get("response", "") if isinstance(result, dict) else (result or "")
         parsed = parse_llm_json(raw) or {}
@@ -291,7 +302,7 @@ async def classify_intent(message: str, llm, settings, pool=None) -> dict:
             return {"agent_id": agent, "reason": str(parsed.get("reason", ""))[:200], "method": "llm"}
     except Exception as exc:  # noqa: BLE001 — routing must never break the front door
         logger.warning("intent_route_llm_failed", error=str(exc)[:200])
-    return {"agent_id": "sebas", "reason": "default", "method": "default"}
+    return {"agent_id": default, "reason": "default", "method": "default"}
 
 
 # Two very different things share the "claude-" name in the LiteLLM config
@@ -3414,23 +3425,16 @@ async def _execute_tool(
 
 
 
-# Seed-agent hints for the lightweight `_extract_query_entities` heuristic below.
-# The LIVE knowledge-boost path is already data-driven — `_gather_knowledge_context`
-# receives `agent_meta.knowledge_domains` from the DB (see the caller), and
-# AGENT_KNOWLEDGE_DOMAINS is only its fallback for the seed agents. A custom
-# agent that sets metadata.knowledge_domains is boosted; one that doesn't simply
-# gets no boost (graceful) rather than a wrong one.
-_KNOWN_AGENT_IDS = {"sebas", "raphael", "pandoras-actor", "maou"}
+# The knowledge boost is data-driven: `_gather_knowledge_context` receives
+# `agent_meta.knowledge_domains` from the DB (see the caller). An agent that
+# sets metadata.knowledge_domains (admin Agents → Behavior; the example
+# agents' lists are in config/seed/agents.yaml) is boosted; one that doesn't
+# simply gets no boost rather than one keyed on its id (#556).
 
-AGENT_KNOWLEDGE_DOMAINS: dict[str, list[str]] = {
-    "sebas": ["task", "decision", "briefing", "digest", "calendar", "task_outcome"],
-    "raphael": ["article", "feed", "email", "research"],
-    "pandoras-actor": ["alert", "sentry", "github", "task_outcome"],
-    "maou": ["market", "finance", "trade"],
-}
+def _extract_query_entities(message: str, agent_ids=()) -> list[str]:
+    """Extract likely entity terms from a message. Lightweight, no NLP.
 
-def _extract_query_entities(message: str) -> list[str]:
-    """Extract likely entity terms from a message. Lightweight, no NLP."""
+    `agent_ids` are the ids worth spotting by name (the active agents)."""
     import re
 
     entities: list[str] = []
@@ -3442,8 +3446,8 @@ def _extract_query_entities(message: str) -> list[str]:
 
     # Known agent IDs
     lower = message.lower()
-    for aid in _KNOWN_AGENT_IDS:
-        if aid in lower:
+    for aid in agent_ids:
+        if aid and aid.lower() in lower:
             entities.append(aid)
 
     # Capitalized multi-word phrases (2+ words starting with uppercase)
@@ -3740,11 +3744,7 @@ async def _gather_knowledge_context(
             return (None, [])
 
         # Agent-scoped boosting
-        domains = (
-            knowledge_domains
-            if knowledge_domains is not None
-            else AGENT_KNOWLEDGE_DOMAINS.get(agent_id or "", [])
-        )
+        domains = knowledge_domains or []
         for r in results:
             boost = 0.2 if r.get("source_type") in domains else 0.0
             r["_score"] = (r.get("similarity") or 0) + boost

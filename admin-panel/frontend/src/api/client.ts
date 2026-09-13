@@ -222,6 +222,20 @@ export const api = {
       method: 'PUT',
       body: JSON.stringify(body),
     }),
+  // The automatic restart's repeat window (`alert_remediation`, #501/#558).
+  getAlertRemediation: () =>
+    apiFetch<{
+      repeat_window_minutes: number;
+      defaults: { repeat_window_minutes: number };
+      max_minutes: number;
+      stored: boolean;
+    }>('/api/admin/alert-remediation'),
+  // `null` for a blank field: the server refuses it rather than reading 0.
+  saveAlertRemediation: (repeat_window_minutes: number | null) =>
+    apiFetch<any>('/api/admin/alert-remediation', {
+      method: 'PUT',
+      body: JSON.stringify({ repeat_window_minutes }),
+    }),
 
   // Expiry radar registry (life.expiring_items — passports, policies, warranties)
   listExpiringItems: (params?: { kind?: string; dueWithin?: number }) => {
@@ -453,6 +467,12 @@ export const api = {
     sender_overrides: Record<string, { category: string; tags: string[] }>;
     extra_notification_markers: string[];
   }) => apiFetch<any>('/api/admin/email/triage-rules', { method: 'PUT', body: JSON.stringify(body) }),
+  // Who "you" are in a meeting transcript (`meeting_rules`, #558).
+  getMeetingRules: () => apiFetch<{ self_names: string[] }>('/api/admin/email/meeting-rules'),
+  saveMeetingRules: (body: { self_names: string[] }) =>
+    apiFetch<{ self_names: string[] }>('/api/admin/email/meeting-rules', {
+      method: 'PUT', body: JSON.stringify(body),
+    }),
 
   // The vault layout (where the journal goes, what an entry looks like) and
   // the user's clock. Previews are rendered on the server by the real code.
@@ -484,6 +504,26 @@ export const api = {
     apiFetch<any>('/api/admin/todoist/content-routes/preview', { method: 'POST', body: JSON.stringify(body) }),
   suggestContentRoute: (body: { examples: string[] }) =>
     apiFetch<any>('/api/admin/todoist/content-routes/suggest', { method: 'POST', body: JSON.stringify(body) }),
+  // Todoist project → repo (the coding lane's first guess) and source tag →
+  // agent-task verb. Both were settings rows with no field anywhere (#558).
+  getProjectRepoMap: () =>
+    apiFetch<{ project_repo_map: Record<string, string> }>('/api/admin/todoist/project-repo-map'),
+  saveProjectRepoMap: (project_repo_map: Record<string, string>) =>
+    apiFetch<{ project_repo_map: Record<string, string> }>('/api/admin/todoist/project-repo-map', {
+      method: 'PUT', body: JSON.stringify({ project_repo_map }),
+    }),
+  getAgentTaskVerbs: () =>
+    apiFetch<{
+      overrides: Record<string, string | null>;
+      effective: Record<string, string | null>;
+      defaults: Record<string, string | null>;
+      verbs: string[];
+      untagged: string;
+    }>('/api/admin/todoist/agent-task-verbs'),
+  saveAgentTaskVerbs: (overrides: Record<string, string | null>) =>
+    apiFetch<any>('/api/admin/todoist/agent-task-verbs', {
+      method: 'PUT', body: JSON.stringify({ overrides }),
+    }),
   // Workbench: tasks, project picker, and clarify-decision visibility
   todoistTasks: (params?: { project_id?: string; status?: string; assignee?: string; limit?: number }) => {
     const q = new URLSearchParams();

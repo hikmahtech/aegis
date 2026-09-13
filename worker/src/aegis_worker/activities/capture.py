@@ -33,10 +33,9 @@ class CaptureActivities:
     connector: Any  # TodoistConnector at runtime; Any for unit tests
     # entity -> Todoist project id for books dues (spec §10). Empty = the Inbox.
     todoist_projects: dict[str, str] = field(default_factory=dict)
-    # "Is this bill overdue?" is a question about the user's day, not UTC's.
-    # Matches MoneyActivities.home_tz; both default rather than reading a
-    # setting, so change them together.
-    home_tz: str = "Asia/Kolkata"
+    # "Is this bill overdue?" is a question about the user's day, not UTC's:
+    # "today" is read from the `user_timezone` settings row through
+    # `services/user_time.py` (UTC when unset), as MoneyActivities does.
 
     async def _capture(
         self,
@@ -234,11 +233,11 @@ class CaptureActivities:
         stacking `@next` on a dated item is exactly the drift the Next Actions
         filter exists to catch.
         """
-        from datetime import datetime, timedelta
-        from zoneinfo import ZoneInfo
+        from datetime import timedelta
 
         from aegis.api.models.money import MoneyEvent
         from aegis.services.money_format import fmt_money
+        from aegis.services.user_time import user_now
 
         ev = MoneyEvent(**{k: v for k, v in event.items() if not k.startswith("_")})
         if ev.kind not in ("due", "failed") or ev.due_on is None or ev.amount is None:
@@ -296,7 +295,7 @@ class CaptureActivities:
                 )
                 return None
 
-        today = datetime.now(ZoneInfo(self.home_tz)).date()
+        today = (await user_now(self.db_pool)).date()
         # A day of warning, but never a task that is born overdue.
         due = max(ev.due_on - timedelta(days=1), today)
         prefix = "Fix payment:" if ev.kind == "failed" else "Pay"

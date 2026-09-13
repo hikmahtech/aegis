@@ -109,7 +109,45 @@ async def put_project_repo_map_route(request: Request, body: dict[str, Any]) -> 
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    await log_audit(
+        request.app.state.db_pool,
+        actor="admin",
+        action="project_repo_map_saved",
+        target_type="settings",
+        target_id="project_repo_map",
+        details={"project_repo_map": mapping},
+    )
     return {"project_repo_map": mapping}
+
+
+@router.get("/agent-task-verbs")
+async def get_agent_task_verbs_route(request: Request) -> dict[str, Any]:
+    """Source tag → the agent-task lane's verb (`services/agent_task_verbs.py`):
+    your overrides, the effective table, the defaults under it and the verbs."""
+    from aegis.services.agent_task_verbs import get_agent_task_verbs
+
+    return await get_agent_task_verbs(request.app.state.db_pool)
+
+
+@router.put("/agent-task-verbs")
+async def put_agent_task_verbs_route(request: Request, body: dict[str, Any]) -> dict[str, Any]:
+    """Replace the overrides. 400 on a bad tag or an unknown verb; `null` leaves
+    a tag's tasks to you; `{}` returns every tag to its default."""
+    from aegis.services.agent_task_verbs import save_agent_task_verbs
+
+    try:
+        out = await save_agent_task_verbs(request.app.state.db_pool, body.get("overrides", body))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    await log_audit(
+        request.app.state.db_pool,
+        actor="admin",
+        action="agent_task_verbs_saved",
+        target_type="settings",
+        target_id="agent_task_verbs",
+        details={"overrides": out["overrides"]},
+    )
+    return out
 
 
 @router.post("/content-routes/preview")

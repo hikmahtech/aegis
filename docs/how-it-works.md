@@ -289,19 +289,16 @@ user-authored:
 | a tag the table maps to `None`, or one no one has decided about | — | Park once, with a comment saying the task is yours and how to route tags like it. Never guessed at. (`#money` maps to `None`, but the sweep never picks those tasks up: `EXCLUDED_LABELS`) |
 
 **The verb table is a setting.** `DEFAULT_VERBS` in
-`worker/src/aegis_worker/activities/agent_task.py` holds the generic defaults,
+`core/src/aegis/services/agent_task_verbs.py` holds the generic defaults,
 with one entry — a verb or an explicit `None` — for every tag AEGIS captures
 under; `test_agent_task_verbs.py` fails when a new tag arrives without one.
 The `agent_task_verbs` settings row is merged over it, so a deployment
 reroutes a tag without a code change. `untagged` is the key for a task with
-no source tag. An entry naming a verb the lane does not have is ignored.
-
-```sql
--- leave calendar tasks to me; have agents take hand-written ones
-INSERT INTO settings (key, value) VALUES
-  ('agent_task_verbs', '{"#calendar": null, "untagged": "ask"}')
-ON CONFLICT (key) DO UPDATE SET value = excluded.value;
-```
+no source tag. Change it on the admin **Todoist** page → *Agent task verbs*:
+pick a verb per tag, or "left to you" (stored as `null`), and only the tags
+you change are saved. The page's `PUT /api/admin/todoist/agent-task-verbs`
+refuses an unknown verb or a malformed tag with a 400; the worker's read
+stays lenient and ignores an entry naming a verb the lane does not have.
 
 The agent is found through the agent registry — each agent's
 `metadata.mention_aliases`, defaulting to its id — the same lookup clarify's

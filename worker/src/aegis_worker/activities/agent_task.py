@@ -17,6 +17,13 @@ from typing import Any
 
 import httpx
 from aegis.services import hub, work_sessions
+from aegis.services.agent_task_verbs import (
+    DEFAULT_VERBS,
+    UNTAGGED,
+    VERBS,  # noqa: F401 — re-export: tests import it here
+)
+from aegis.services.agent_task_verbs import SETTINGS_KEY as VERBS_SETTING
+from aegis.services.agent_task_verbs import merge as merge_verbs
 from aegis.services.project_repo_map import get_project_repo_map, lookup
 from temporalio import activity
 
@@ -63,67 +70,11 @@ _COMMENT_RETRY_SECONDS = 2
 # @code label on a real #email task in prod, and treating that as "run a
 # coding agent on this email" would be nonsense.
 #
-# EVERY tag AEGIS captures under has an entry: a verb, or an explicit None
-# meaning "decided: nothing here works these". That is the `_GTD_STATE_FOR`
-# contract from clarify (#139), and test_agent_task_verbs.py derives the tag
-# vocabulary from `gtd_rules.SOURCE_TAGS` and the hub's tags, so a new tag
-# added without a decision fails CI instead of silently parking (#344).
-#
-# These are generic defaults. A deployment changes any of them with the
-# `agent_task_verbs` settings row, merged over this table by `merge_verbs`.
-#
-# `ask` hands the task to the agent it is assigned to, through that agent's
-# own chat path — `AgentChatReplyFlow`, the executor clarify already uses when
-# you comment on an agent's task. A `#chat`, `#research`, `#calendar` or
-# `#manual` task given to an agent is a request to that agent; before #344 all
-# four resolved to no verb, got "No executor for this task type" and parked
-# with nothing done (prod: an outage question given to the infra agent, an
-# article given to the research agent).
-#
-# `research` (#509) runs `ResearchFlow` on a `#research` task — knowledge
-# store, web and papers, a cited answer — and posts the answer on the task.
-# Under `ask` the research agent only chatted about the task; the lane had no
-# way to actually look anything up.
-UNTAGGED = "untagged"  # the settings key for a task with no source tag
-DEFAULT_VERBS: dict[str, str | None] = {
-    "#alert": "infra",
-    "#receipt": "finance",
-    "#email": "email",
-    "#chat": "ask",
-    "#research": "research",
-    "#calendar": "ask",
-    "#manual": "ask",
-    # A hand-written task carrying an agent's label and no `@code`: somebody
-    # gave it to that agent, which is the same request a `#manual` task is.
-    UNTAGGED: "ask",
-    # Maou raises these and the user acts on them. `EXCLUDED_LABELS` keeps the
-    # sweep off them before a verb is ever resolved; this says why.
-    "#money": None,
-    # A feed that stopped fetching or publishing (#513): the user fixes or
-    # drops the feed. Kept off the sweep by `EXCLUDED_LABELS` like `#money`.
-    "#feeds": None,
-}
-# The verbs a tag may be routed to. `coding` is not one: it is chosen by the
-# `@code` label on an untagged task, never by a tag.
-VERBS = frozenset({"infra", "email", "finance", "ask", "research"})
-VERBS_SETTING = "agent_task_verbs"
-
-
-def merge_verbs(value: Any) -> dict[str, str | None]:
-    """`DEFAULT_VERBS` with the `agent_task_verbs` settings row merged over it.
-
-    Lenient on read, like every settings merge in AEGIS: an entry that names a
-    verb this lane does not have is ignored, so a typo in the row cannot turn
-    a tag that works into one that parks. None is honoured — it is how a
-    deployment says "leave these tasks to me".
-    """
-    merged = dict(DEFAULT_VERBS)
-    if not isinstance(value, dict):
-        return merged
-    for tag, verb in value.items():
-        if verb is None or verb in VERBS:
-            merged[str(tag)] = verb
-    return merged
+# The table itself — every tag AEGIS captures under, with a verb or an explicit
+# None — is `DEFAULT_VERBS` in `aegis.services.agent_task_verbs`, with the
+# lenient `merge` this lane reads the `agent_task_verbs` settings row through
+# and the strict `validate` the admin Todoist page writes it through (#558).
+# The names are re-exported here because this lane and its tests use them.
 
 
 async def load_verbs(pool: Any) -> dict[str, str | None]:

@@ -2,6 +2,7 @@
 
 from unittest.mock import AsyncMock
 
+import pytest
 from aegis.services.chat import _extract_query_entities, _gather_knowledge_context
 
 
@@ -16,8 +17,35 @@ def test_extract_entities_quoted():
 
 
 def test_extract_entities_agent_names():
-    entities = _extract_query_entities("What did sebas do today?")
-    assert "sebas" in entities
+    entities = _extract_query_entities("What did sebas do today?", agent_ids=["sebas", "maou"])
+    assert entities == ["sebas"]
+
+
+def test_extract_entities_knows_no_agent_by_default():
+    """Agent names come from the caller (the active agents), not a list of
+    example ids — a lowercase name nobody passed is not spotted (#556)."""
+    assert _extract_query_entities("What did sebas do today?") == []
+
+
+async def test_the_knowledge_boost_is_the_agents_metadata_never_its_id():
+    """An example agent with no `knowledge_domains` in its row gets no boost:
+    there is no id-keyed list behind the metadata any more (#556). The boost is
+    written onto each result as `_score`."""
+
+    def _hit():
+        return [{"title": "Sentry Issue", "similarity": 0.7, "source_type": "sentry",
+                 "summary": "Error 500", "url": "aegis://sentry/1"}]
+
+    kc = AsyncMock()
+    kc.search.return_value = _hit()
+    await _gather_knowledge_context(kc, "the 500s", agent_id="pandoras-actor")
+    assert kc.search.return_value[0]["_score"] == pytest.approx(0.7)
+
+    kc.search.return_value = _hit()
+    await _gather_knowledge_context(
+        kc, "the 500s", agent_id="pandoras-actor", knowledge_domains=["sentry"]
+    )
+    assert kc.search.return_value[0]["_score"] == pytest.approx(0.9)
 
 
 def test_extract_entities_empty():

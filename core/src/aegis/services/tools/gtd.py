@@ -180,9 +180,10 @@ async def _stage_chat_tool_outbox(
 
 async def _assignee_labels(pool: asyncpg.Pool | None) -> list[str]:
     """Valid handoff assignee labels: @me plus every active agent's mention
-    aliases (metadata.mention_aliases, default [id]) — issue #36. Falls back to
-    the shipped 4-agent set without a pool or on read failure."""
-    fallback = ["@me", "@sebas", "@raphael", "@maou", "@pandora"]
+    aliases (metadata.mention_aliases, default [id]) — issue #36. Without a
+    pool or on a failed read only `@me` is valid: no agent is known, and a list
+    of the example agents' labels would name agents a fork may not have (#556)."""
+    fallback = ["@me"]
     if pool is None:
         return fallback
     try:

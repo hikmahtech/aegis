@@ -1,6 +1,8 @@
 import { Fragment, useEffect, useState } from 'react';
 import { api } from '../api/client';
+import AgentTaskVerbsPanel from '../components/AgentTaskVerbsPanel';
 import ErrorBanner from '../components/ErrorBanner';
+import ProjectRepoMapPanel from '../components/ProjectRepoMapPanel';
 import { toast } from '../components/Toast';
 
 type TodoistState = {
@@ -567,6 +569,9 @@ export default function Todoist() {
           {savingRoutes ? 'Saving…' : 'Save content routes'}
         </button>
       </div>
+
+      <ProjectRepoMapPanel projectNames={allProjects.map(p => p.name)} />
+      <AgentTaskVerbsPanel />
 
       {/* Tasks workbench */}
       <section style={{ marginTop: 24 }}>

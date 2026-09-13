@@ -26,6 +26,7 @@ export default function AgentDetail() {
   const [beh, setBeh] = useState({
     capabilities: [] as string[], tool_set: [] as string[],
     intent_keywords: '', mention_aliases: '', intent_description: '', async_dispatch: false,
+    knowledge_domains: '', slack_icon: '',
   });
   const [savingB, setSavingB] = useState(false);
   const [bmsg, setBmsg] = useState('');
@@ -62,6 +63,8 @@ export default function AgentDetail() {
         mention_aliases: (md.mention_aliases || []).join(', '),
         intent_description: md.intent_description || '',
         async_dispatch: !!md.async_dispatch,
+        knowledge_domains: (md.knowledge_domains || []).join(', '),
+        slack_icon: md.slack_icon || '',
       });
       setKinds({
         soul: pk.soul || '', agents: pk.agents || '', user: pk.user || '', memory: pk.memory || '',
@@ -94,6 +97,8 @@ export default function AgentDetail() {
           mention_aliases: csv(beh.mention_aliases),
           intent_description: beh.intent_description,
           async_dispatch: beh.async_dispatch,
+          knowledge_domains: csv(beh.knowledge_domains),
+          slack_icon: beh.slack_icon.trim(),
         },
       });
       setBmsg('Saved.'); await load();
@@ -247,6 +252,14 @@ export default function AgentDetail() {
                 onChange={e => setBeh({ ...beh, async_dispatch: e.target.checked })} />
               {' '}async dispatch
             </label>
+          </div>
+          <div className="cfg-row" style={{ marginBottom: 8 }}>
+            <input value={beh.knowledge_domains}
+              placeholder="knowledge domains — source types to boost (comma-separated)"
+              title={`Known source types: ${(options.source_types || []).join(', ')}`}
+              onChange={e => setBeh({ ...beh, knowledge_domains: e.target.value })} />
+            <input value={beh.slack_icon} placeholder="Slack icon, e.g. :books: (blank = :robot_face:)"
+              onChange={e => setBeh({ ...beh, slack_icon: e.target.value })} />
           </div>
           <button className="btn btn-primary" disabled={savingB} onClick={saveBehavior}>
             {savingB ? 'Saving…' : 'Save behavior'}
