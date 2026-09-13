@@ -6,7 +6,7 @@ from __future__ import annotations
 import httpx
 import pytest
 import respx
-from aegis.connectors.calibre import CalibreConnector, CalibreError, refuse_public_host
+from aegis.connectors.calibre import CalibreConnector, CalibreError
 
 from tests.core.test_calibre_connector import BASE, _entry
 
@@ -63,7 +63,27 @@ async def test_an_absolute_next_link_on_calibre_web_itself_is_followed():
     await conn.close()
 
 
-def test_the_public_host_is_refused_with_a_trailing_dot_or_capitals():
-    for url in ("https://calibre.hikmahtech.in./opds", "https://CALIBRE.hikmahtech.in/opds"):
-        with pytest.raises(ValueError):
-            refuse_public_host(url)
+@pytest.mark.asyncio
+@respx.mock
+async def test_a_download_link_to_another_host_is_refused_too():
+    """The same rule as the `next` link: a book whose acquisition link names
+    another host is not fetched with the library's credentials."""
+    book = {
+        "id": 1,
+        "title": "T",
+        "formats": [{"format": "EPUB", "href": "http://evil.test/opds/download/1/epub/"}],
+    }
+    evil = respx.get(url__startswith="http://evil.test").mock(return_value=httpx.Response(200))
+    conn = CalibreConnector(BASE, "aegis", "secret")
+    with pytest.raises(CalibreError, match="another host"):
+        await conn.download(book, "epub")
+    assert not evil.called
+    await conn.close()
+
+
+def test_the_page_cap_follows_the_book_cap():
+    """`calibre_max_books` is the Integrations key; the connector turns it
+    into pages at calibre-web's 60 a page (3,000 → 50, the old `_MAX_PAGES`)."""
+    assert CalibreConnector(BASE, "u", "p").max_pages == 50
+    assert CalibreConnector(BASE, "u", "p", max_books=61).max_pages == 2
+    assert CalibreConnector(BASE, "u", "p", max_books=0).max_pages == 50

@@ -23,7 +23,7 @@ const KIND_COLORS: Record<string, string> = {
 
 const KIND_HELP: Record<ChannelKind, string> = {
   email: 'Gmail accounts polled by GmailIngestFlow. The account must be authorized via the Google accounts re-auth flow before ingestion works.',
-  rss: 'Feed URLs polled hourly by RssIngestFlow. AEGIS owns this list (nothing seeds it). "Used" counts documents from the feed that were put into a chat prompt; a feed that fails 3 fetches in a row, or publishes nothing for 30 days, becomes a problem on the hub.',
+  rss: 'Feed URLs polled hourly by RssIngestFlow. AEGIS owns this list (nothing seeds it). "Used" counts documents from the feed that were put into a chat prompt; a feed that fails too many fetches in a row, or stores nothing for too long, becomes a problem on the hub — the numbers are on the Research page (Feed health), and a feed can set its own stale limit below. Feeds belong to the research-tagged agent, not to one agent each.',
   raindrop: 'Raindrop.io bookmark collections (the token lives in Integrations).',
   wearable: 'Wearable vendors polled by WearableIngestFlow into life.observations. Identifier is the vendor slug (currently only "oura"); the token lives in Integrations.',
   place: 'Named places (home / office / gym) that POST /api/webhooks/life/location resolves a phone push against. Identifier is the name that gets stored; the centre coordinate below is the ONLY location AEGIS keeps — the pushed lat/lon is used to pick a place and then discarded, never written to the database or a log.',
@@ -53,6 +53,9 @@ interface ChannelForm {
   lon: string;
   radius_m: string;
   ingest: string;
+  // rss only; blank = the Research page's default / unlimited.
+  stale_after_days: string;
+  max_entries_per_run: string;
   active: boolean;
 }
 
@@ -66,8 +69,12 @@ const emptyForm: ChannelForm = {
   lon: '',
   radius_m: String(DEFAULT_RADIUS_M),
   ingest: 'full',
+  stale_after_days: '',
+  max_entries_per_run: '',
   active: true,
 };
+
+const numOrBlank = (v: unknown) => (v === undefined || v === null || v === '' ? '' : String(v));
 
 const shortDate = (iso?: string | null) => (iso ? String(iso).slice(0, 10) : '—');
 
@@ -123,6 +130,8 @@ export default function Channels() {
       lon: cfg.lon === undefined || cfg.lon === null ? '' : String(cfg.lon),
       radius_m: cfg.radius_m === undefined || cfg.radius_m === null ? String(DEFAULT_RADIUS_M) : String(cfg.radius_m),
       ingest: (INGEST_MODES as readonly string[]).includes(cfg.ingest) ? cfg.ingest : 'full',
+      stale_after_days: numOrBlank(cfg.stale_after_days),
+      max_entries_per_run: numOrBlank(cfg.max_entries_per_run),
       active: !!c.active,
     });
     setFormError('');
@@ -140,6 +149,15 @@ export default function Channels() {
       base.label = form.label.trim();
       base.ingest = form.ingest;
       if (base.last_cursor === undefined) base.last_cursor = null;
+      // Blank = the deployment default (Research → Feed health) / unlimited.
+      for (const k of ['stale_after_days', 'max_entries_per_run'] as const) {
+        const v = form[k].trim();
+        if (v) base[k] = Number(v);
+        else delete base[k];
+      }
+      // No per-feed agent: every feed is the research-tagged agent's
+      // (`hub_project`), and nothing read this key. Drop a stale one.
+      delete base.agent_id;
     } else if (form.kind === 'place') {
       base.label = form.label.trim();
       base.lat = Number(form.lat);
@@ -148,8 +166,10 @@ export default function Channels() {
     } else {
       if (base.last_cursor === undefined) base.last_cursor = null;
     }
-    if (form.agent_id) base.agent_id = form.agent_id;
-    else delete base.agent_id;
+    if (form.kind !== 'rss') {
+      if (form.agent_id) base.agent_id = form.agent_id;
+      else delete base.agent_id;
+    }
     return base;
   };
 
@@ -169,6 +189,15 @@ export default function Channels() {
       if (!(Number(form.radius_m) > 0)) {
         setFormError('Radius must be a positive number of metres');
         return;
+      }
+    }
+    if (form.kind === 'rss') {
+      for (const [k, label] of [['stale_after_days', 'Stale after (days)'], ['max_entries_per_run', 'Entries per run']] as const) {
+        const v = form[k].trim();
+        if (v && !(Number.isInteger(Number(v)) && Number(v) >= 0)) {
+          setFormError(`${label} must be a whole number (blank for the default)`);
+          return;
+        }
       }
     }
     setSaving(true);
@@ -273,6 +302,36 @@ export default function Channels() {
                   </p>
                 </div>
               )}
+              {form.kind === 'rss' && (
+                <>
+                  <div className="form-group">
+                    <label>Stale after (days)</label>
+                    <input
+                      value={form.stale_after_days}
+                      onChange={e => setForm({ ...form, stale_after_days: e.target.value })}
+                      placeholder="default from Research → Feed health"
+                      className="mono"
+                    />
+                    <p style={{ fontSize: 12, color: 'var(--text-muted)', margin: '4px 0 0' }}>
+                      Days without a stored entry before this feed is reported stale. Blank uses the
+                      deployment default.
+                    </p>
+                  </div>
+                  <div className="form-group">
+                    <label>Entries per run</label>
+                    <input
+                      value={form.max_entries_per_run}
+                      onChange={e => setForm({ ...form, max_entries_per_run: e.target.value })}
+                      placeholder="unlimited"
+                      className="mono"
+                    />
+                    <p style={{ fontSize: 12, color: 'var(--text-muted)', margin: '4px 0 0' }}>
+                      The most entries one hourly run ingests, oldest first; the rest wait for the
+                      next run. Blank or 0 = unlimited. Right for a feed that publishes in bursts (arXiv).
+                    </p>
+                  </div>
+                </>
+              )}
               {form.kind === 'email' && (
                 <div className="form-group">
                   <label>Token path</label>
@@ -325,15 +384,17 @@ export default function Channels() {
                   </div>
                 </>
               )}
-              <div className="form-group">
-                <label>Agent</label>
-                <select value={form.agent_id} onChange={e => setForm({ ...form, agent_id: e.target.value })}>
-                  <option value="">— none —</option>
-                  {agents.filter(a => a.id !== 'system').map(a => (
-                    <option key={a.id} value={a.id}>{a.name} ({a.id})</option>
-                  ))}
-                </select>
-              </div>
+              {form.kind !== 'rss' && (
+                <div className="form-group">
+                  <label>Agent</label>
+                  <select value={form.agent_id} onChange={e => setForm({ ...form, agent_id: e.target.value })}>
+                    <option value="">— none —</option>
+                    {agents.filter(a => a.id !== 'system').map(a => (
+                      <option key={a.id} value={a.id}>{a.name} ({a.id})</option>
+                    ))}
+                  </select>
+                </div>
+              )}
               <div className="form-group">
                 <label style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
                   <input
@@ -381,10 +442,11 @@ export default function Channels() {
                       <tr>
                         <th>Identifier</th>
                         <th>Label</th>
-                        <th>Agent</th>
+                        {!isRss && <th>Agent</th>}
                         {isRss && (
                           <>
                             <th title="channels.config.ingest">Ingest</th>
+                            <th title="channels.config.stale_after_days, else the Research page default">Stale after</th>
                             <th title="Entries seen / stored in the last 30 days (abstract-only in brackets)">30d entries</th>
                             <th title="Documents from this feed put into a chat prompt in the last 30 / 90 days">Used 30d / 90d</th>
                             <th title="Newest entry accepted">Last entry</th>
@@ -402,10 +464,11 @@ export default function Channels() {
                           <tr key={c.id}>
                             <td className="mono" style={{ wordBreak: 'break-all' }}>{c.identifier}</td>
                             <td>{c.config?.label || '—'}</td>
-                            <td>{c.config?.agent_id ? agentName(c.config.agent_id) : '—'}</td>
+                            {!isRss && <td>{c.config?.agent_id ? agentName(c.config.agent_id) : '—'}</td>}
                             {isRss && (
                               <>
                                 <td>{f?.ingest || c.config?.ingest || 'full'}</td>
+                                <td>{f?.stale_after_days ?? c.config?.stale_after_days ?? '—'}d</td>
                                 <td>
                                   {f ? `${f.entries_30d} / ${f.stored_30d}` : '—'}
                                   {f?.abstract_30d ? ` (${f.abstract_30d})` : ''}

@@ -204,7 +204,7 @@
     "type": "function",
     "function": {
       "name": "research_topic",
-      "description": "Research a question: search the knowledge store, the web and (for academic questions) papers, read the best sources, and answer with numbered citations. Runs in the background as a research flow and waits up to 45 seconds; a longer run posts its answer to the channel when it is ready. The answer is saved, replacing any earlier answer to the same question.",
+      "description": "Research a question: search the knowledge store, the web and (for academic questions) papers, read the best sources, and answer with numbered citations. Runs in the background as a research flow and waits a short while for it; a longer run posts its answer to the channel when it is ready. The answer is saved, replacing any earlier answer to the same question.",
       "parameters": {
         "type": "object",
         "properties": {
@@ -407,7 +407,7 @@
     "type": "function",
     "function": {
       "name": "list_feeds",
-      "description": "List the RSS feeds Raphael follows and what each is worth: entries and stored documents in the last 30 days, how many of its documents a prompt used in the last 30 and 90 days, its ingest mode, its last entry and any fetch failures.",
+      "description": "List the RSS feeds the research agent follows and what each is worth: entries and stored documents in the last 30 days, how many of its documents a prompt used in the last 30 and 90 days, its ingest mode, its last entry and any fetch failures.",
       "parameters": {
         "type": "object",
         "properties": {}
@@ -541,8 +541,7 @@
             "type": "integer",
             "minimum": 1000,
             "maximum": 40000,
-            "description": "The most characters of text to return (1000-40000).",
-            "default": 12000
+            "description": "The most characters of text to return (1000-40000); omit for the configured default."
           }
         },
         "required": [

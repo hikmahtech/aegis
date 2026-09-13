@@ -28,7 +28,7 @@ def downloaded(monkeypatch):
     `feedparser.parse` decides what that body holds."""
     state = {"out": (b"<rss/>", {}, "")}
 
-    async def fake(url: str):
+    async def fake(url: str, user_agent: str = ""):
         return state["out"]
 
     monkeypatch.setattr(rss_mod, "_download_feed", fake)

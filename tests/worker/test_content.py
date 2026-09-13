@@ -289,8 +289,9 @@ class TestProcessContent:
             )
 
         assert result["status"] == "ok"
+        # The fourth argument is the bot User-Agent, blank on direct construction.
         mock_transcribe.assert_called_once_with(
-            "https://www.youtube.com/watch?v=dQw4w9WgXcQ", "el-key", "scribe_v1"
+            "https://www.youtube.com/watch?v=dQw4w9WgXcQ", "el-key", "scribe_v1", ""
         )
         mock_knowledge.ingest_content.assert_called_once()
 
@@ -522,7 +523,7 @@ class TestTranscribeMedia:
         assert result is not None
         assert result.extraction_method == "elevenlabs"
         mock_stt.assert_called_once_with(
-            "https://www.youtube.com/watch?v=xNoCapsHere", "el-key", "scribe_v1"
+            "https://www.youtube.com/watch?v=xNoCapsHere", "el-key", "scribe_v1", ""
         )
 
     async def test_non_youtube_uses_scribe_directly(self):

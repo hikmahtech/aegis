@@ -66,14 +66,22 @@ def test_the_feed_tools_are_registered_and_dispatched():
     assert TOOL_REGISTRY["unsubscribe_feed"].parameters["required"] == ["feed"]
 
 
-async def test_subscribe_feed_files_the_feed_under_the_calling_agent(db_pool):
+async def test_subscribe_feed_passes_the_url_label_and_bot_user_agent(db_pool):
+    """No per-feed agent: the research-tagged agent owns every feed. The
+    fetch that checks the URL identifies AEGIS with the deployment's contact."""
+    from types import SimpleNamespace
+
     fake = AsyncMock(return_value={"status": "subscribed", "label": "X"})
     with patch.object(feeds, "subscribe", fake):
         out = await TOOL_EXECUTORS["subscribe_feed"](
-            db_pool, {"url": "https://x.test/feed", "label": "X"}, ToolContext(agent_id="raphael")
+            db_pool,
+            {"url": "https://x.test/feed", "label": "X"},
+            ToolContext(agent_id="raphael", settings=SimpleNamespace(aegis_ui_url="https://a.test")),
         )
     assert json.loads(out)["status"] == "subscribed"
-    fake.assert_awaited_once_with(db_pool, "https://x.test/feed", label="X", agent_id="raphael")
+    fake.assert_awaited_once_with(
+        db_pool, "https://x.test/feed", label="X", user_agent="AegisBot/2.0 (+https://a.test)"
+    )
 
 
 async def test_unsubscribe_feed_passes_the_name_through(db_pool):

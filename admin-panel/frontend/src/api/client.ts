@@ -398,6 +398,23 @@ export const api = {
     apiFetch<any>('/api/admin/slack-config', { method: 'PUT', body: JSON.stringify(body) }),
 
   // Email triage rules (user-owned sender verdicts + notification phrases)
+  // Research (the research agent's DB-owned config rows)
+  getResearchTopics: () => apiFetch<any>('/api/admin/research/topics'),
+  saveResearchTopics: (body: { topics: any[] }) =>
+    apiFetch<any>('/api/admin/research/topics', { method: 'PUT', body: JSON.stringify(body) }),
+  getResearchTopicsConfig: () => apiFetch<any>('/api/admin/research/topics-config'),
+  saveResearchTopicsConfig: (body: any) =>
+    apiFetch<any>('/api/admin/research/topics-config', { method: 'PUT', body: JSON.stringify(body) }),
+  getFeedsConfig: () => apiFetch<any>('/api/admin/research/feeds-config'),
+  saveFeedsConfig: (body: any) =>
+    apiFetch<any>('/api/admin/research/feeds-config', { method: 'PUT', body: JSON.stringify(body) }),
+  getResearchConfig: () => apiFetch<any>('/api/admin/research/config'),
+  saveResearchConfig: (body: any) =>
+    apiFetch<any>('/api/admin/research/config', { method: 'PUT', body: JSON.stringify(body) }),
+  getLibraryConfig: () => apiFetch<any>('/api/admin/research/library-config'),
+  saveLibraryConfig: (body: any) =>
+    apiFetch<any>('/api/admin/research/library-config', { method: 'PUT', body: JSON.stringify(body) }),
+
   getEmailTriageRules: () => apiFetch<any>('/api/admin/email/triage-rules'),
   saveEmailTriageRules: (body: {
     sender_overrides: Record<string, { category: string; tags: string[] }>;

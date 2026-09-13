@@ -258,18 +258,28 @@ async def test_an_unreadable_format_is_an_answer_not_a_crash():
 def test_connector_or_reason():
     library._connectors.clear()
     assert library.connector_or_reason(SimpleNamespace())[1] == "not_configured"
-    public = SimpleNamespace(
-        calibre_url="https://calibre.hikmahtech.in", calibre_user="u", calibre_password="p"
-    )
-    conn, reason = library.connector_or_reason(public)
+    # No default address: a blank URL is "not configured", like a blank user.
+    blank = SimpleNamespace(calibre_url="", calibre_user="u", calibre_password="p")
+    assert library.connector_or_reason(blank) == (None, "not_configured")
+    bad = SimpleNamespace(calibre_url="calibre-web:8083", calibre_user="u", calibre_password="p")
+    conn, reason = library.connector_or_reason(bad)
     assert conn is None and reason.startswith("refused")
 
-    s = SimpleNamespace(calibre_url="", calibre_user="u", calibre_password="p")
+    s = SimpleNamespace(
+        calibre_url="http://calibre-web:8083/", calibre_user="u", calibre_password="p"
+    )
     first, _ = library.connector_or_reason(s)
-    assert first is not None and first.base_url == "http://calibre-web_calibre-web:8083"
+    assert first is not None and first.base_url == "http://calibre-web:8083"
+    assert first.max_download_bytes == 80 * 1024 * 1024 and first.max_pages == 50
     assert library.connector_or_reason(s)[0] is first, "the same config reuses the connector"
     s.calibre_password = "changed"
     assert library.connector_or_reason(s)[0] is not first, "a new password builds a new one"
+    # The two caps are Integrations values, stored as the page saved them.
+    s.calibre_max_book_mb, s.calibre_max_books = "5", "120"
+    capped, _ = library.connector_or_reason(s)
+    assert capped.max_download_bytes == 5 * 1024 * 1024 and capped.max_pages == 2
+    s.calibre_max_book_mb = "lots"
+    assert library.connector_or_reason(s)[0].max_download_bytes == 80 * 1024 * 1024
     library._connectors.clear()
 
 
