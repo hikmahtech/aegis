@@ -1737,7 +1737,7 @@ Raphael researches with five chat tools and one flow (#509).
 | `read_url` | One page's readable text, bounded. Public http(s) hosts only |
 | `paper_search` | arXiv and Semantic Scholar together: title, authors, date, abstract, citation count, and an id for `paper_read`. One engine failing still returns the other's papers |
 | `paper_read` | A paper's text from its PDF, by arXiv id, `s2:<id>` or PDF URL |
-| `research_topic` | Hands the question to `ResearchFlow` and waits up to 45s for the answer |
+| `research_topic` | Hands the question to `ResearchFlow` and waits `wait_seconds` (45 by default) for the answer |
 
 The four reads fetch and return; nothing is stored. They are on the MCP gated
 endpoint's read-only list, and they stay there: fetching is not writing.
@@ -1756,9 +1756,11 @@ the same question again replaces the old answer. Only a real answer is saved: a
 run whose synthesis failed says so and stores nothing.
 
 - **From chat**, the run's id is `research-<hash of the question>`, so a retried
-  turn re-attaches to the run in flight. Past 45s the tool answers "still
-  researching", and the flow posts the answer to the agent's channel when it
-  lands.
+  turn re-attaches to the run in flight. Past `wait_seconds` the tool answers
+  "still researching", and the flow posts the answer to the agent's channel
+  when it lands. The run belongs to the calling agent, else to whoever holds
+  the `research` capability tag; with no such agent the answer is still made
+  and nobody's channel gets the late copy.
 - **A `#research` task** assigned to an agent goes to the `research` verb
   (`agent_task_verbs`): the task gets a hub problem (`ensure_problem_for_task`,
   as a `@code` task does), the answer is posted as one comment with its numbered
@@ -1777,6 +1779,39 @@ UPDATE agents
  WHERE id = 'raphael'
    AND NOT (metadata->'tool_set' ? 'web_search');
 ```
+
+### Configuring the lane (Admin → Research)
+
+Nothing about one person or one installation is in the code: the lane's
+knobs are `settings` rows, each merged over code defaults that equal the old
+constants, edited on **Admin → Research** (`routes/research_admin.py`,
+`GET/PUT /api/admin/research/*`). Every PUT validates and answers 400 with a
+reason; the generic `/api/settings` editor validates nothing, so use the page.
+
+| Row | Page card | What it holds | Defaults |
+|---|---|---|---|
+| `intelligence_topics` | Tracked topics | The registry the scans and the feed gate read, edited whole under the same advisory lock `track_topic` takes; each topic may carry its own `threshold` | (empty) |
+| `research_topics_config` | Topic thresholds | `attention` per priority, `digest_items` | high 2, medium 3, low 5; 10 |
+| `feeds_config` | Feed health | `failing_after`, `recovered_after`, `stale_after_days`, `unused_after_days`, `stale_review_hour`, `default_ingest` | 3, 2, 30, 90, 3, `full` |
+| `research_config` | Research limits | `wait_seconds`, per-depth `pages`/`web_results`/`papers`, `page_chars`, `report_chars`, `knowledge_hits`, `note_hits`, `academic_terms` | 45; quick 3/8/5, thorough 6/15/10; 6000; 8000; 5; 3; the paper words |
+| `library_config` | Library limits | `read_chars`, `passages`, `passage_chars`, `pdf_default_pages`, `research_book_hits`, `research_passage_min_similarity`, `research_passage_chars`, `research_pdf_scan_pages`, `stopwords` | 12000, 4, 1200, 5, 3, 0.5, 3000, 60, the list |
+
+Core sees a save within 30 s (`services/config_rows.py` caches each row that
+long); the worker reads `feeds_config` through the `load_feeds_config`
+activity at the start of every `RssIngestFlow` run and the others on each
+activity call. Three more things moved to the Integrations page:
+`semantic_scholar_api_key` (sent as `x-api-key`; blank is the public tier),
+`bot_contact_url` (named in the `AegisBot/2.0 (+url)` User-Agent every fetch
+sends; blank falls back to `aegis_ui_url`) and `elevenlabs_stt_model`. The
+intel scans' searxng query per topic is `query_template` on each scan row's
+`activities.config` (`{topic}` = the term); the seed rows carry the built-in
+queries. The curiosity detectors' thresholds are on the `curiosity-daily` row
+(`min_attendee_events`, `min_project_tasks`, `empty_search_days`,
+`min_empty_searches`, `search_miss_below`). What stays in code, on purpose:
+`url_guard.py`, the fetch size and time caps, the untrusted-text framing, the
+tool schema caps (`_MAX_CHARS_CAP`, 40,000 characters and 30 pages a book
+read), the Calibre read-only and no-redirect rules, and the `#research` /
+`#feeds` tag vocabulary.
 
 Every fetch of a URL that a model chose, a page named or a feed publishes goes
 through `services/url_guard.py`. The first request and every redirect must
@@ -1816,15 +1851,17 @@ prompt actually used. Admin → Channels shows it per feed, and so do
 
 - entries and stored documents in the last 30 days, plus how many were
   abstract only;
-- documents used in the last 30 and 90 days;
+- documents used in the last 30 days and over `unused_after_days` (90 by
+  default; the columns keep their `_90d` names);
 - the last entry, the backlog and consecutive fetch failures.
 
 Chat turns and research runs write the injection log (`source` `chat` and
 `research`). A briefing or a rollup does not log what it reads, so "used" is a
 floor.
 
-On the 1st of each month, Raphael's briefing names the active feeds that have
-90 days of history and no use in that time. The migration backfills history
+On the 1st of each month (`feed_review_day` on the briefing row; 0 = every
+run), Raphael's briefing names the active feeds that have `unused_after_days`
+of history and no use in that time. The migration backfills history
 by host (an arXiv entry lives on arxiv.org). A feed whose links point
 elsewhere, like Hacker News, starts its history at the deploy.
 
@@ -1871,9 +1908,11 @@ or `paper_read`.
 
 ### When a feed breaks
 
-- **Failing:** three fetches in a row that fail (an HTTP error, a response
-  that is not a feed, or a fetch the URL guard refused) are a `feeds` hub
-  finding of class `feed_failing`. The feed itself is fetched through
+- **Failing:** `failing_after` fetches in a row that fail (three by default;
+  an HTTP error, a response that is not a feed, or a fetch the URL guard
+  refused) are a `feeds` hub finding of class `feed_failing`. The numbers in
+  this section are the `feeds_config` row (Admin → Research → Feed health);
+  `stale_after_days` alone can also be set per feed. The feed itself is fetched through
   `url_guard` (every redirect checked, 30 s, 20 MB), and only the bytes go to
   feedparser. The finding records an occurrence when the feed crosses that
   line and once a day at the review hour; the hourly runs in between only keep
@@ -1890,8 +1929,8 @@ or `paper_read`.
   recorded entry, else its first poll (`channels.config.tracking_since`).
   That is `feeds.tracking_since`, the same date the feed stats show.
 - **Recovery:** a stale finding resolves when the feed stores an entry again.
-  A failing one resolves only after two good fetches in a row
-  (`feeds.RECOVERED_AFTER`, counted in `channels.config.fetch_successes`).
+  A failing one resolves only after `recovered_after` good fetches in a row
+  (two by default, counted in `channels.config.fetch_successes`).
   One good fetch, a failure under the threshold, or a run whose feed record
   could not be written keeps the problem open without adding an occurrence
   (`hub_watch.reconcile_findings`, `record: False`). The problem's subject is
@@ -1950,12 +1989,15 @@ bulk text is exactly what not to index.
   (everything the tools and flows share: EPUB chapters and PDF pages, passage
   search, the index row), `services/tools/library.py`, and the worker's
   `CalibreActivities` + `CalibreSyncFlow`.
-- **Never the public host.** `calibre.hikmahtech.in` is behind Cloudflare
-  Access: every path, `/opds` included, 302s to a login page — the trap that
-  broke Miniflux (#70). The connector refuses that host and treats any redirect
-  as an error. Use the internal address `http://calibre-web_calibre-web:8083`:
-  aegis-core and the worker both sit on the `traefik_public` overlay with
-  calibre-web.
+- **Never a host behind an SSO login page.** A calibre-web fronted by an
+  identity proxy (Cloudflare Access, Authelia, oauth2-proxy) answers every
+  path, `/opds` included, with a 302 to its login page — the trap that broke
+  Miniflux (#70). No host is named in code: the connector follows no redirect
+  at all, so any 3xx is an error, never a login page parsed as "no books".
+  Point `calibre_url` at the address the stack reaches calibre-web directly
+  (on this deployment `http://calibre-web_calibre-web:8083`, the
+  `traefik_public` overlay both aegis-core and the worker share). There is no
+  default URL: blank means not configured.
 - **Reading:** EPUB is read by chapter (the book's own table of contents names
   them), PDF by page (at most 30 pages a read; a query scans the first 150, or
   the first 60 inside research). MOBI and AZW3 cannot be read. Files over 80 MB
@@ -1972,9 +2014,11 @@ bulk text is exactly what not to index.
 1. In calibre-web (Admin → Users → Add new user), create a user for AEGIS:
    allow **download**; do not allow upload, edit, delete or admin. Basic auth
    and OPDS are on by default.
-2. On AEGIS's Integrations page, group **Calibre (library)**: set the user and
-   password, and leave the URL at the internal default. Core uses the new
-   values at once; restart the worker for `CalibreSyncFlow`.
+2. On AEGIS's Integrations page, group **Calibre (library)**: set the URL
+   (the internal address — there is no default), the user and the password.
+   `calibre_max_book_mb` (80) and `calibre_max_books` (3000) are the caps on
+   a book file and on the catalogue. Core uses the new values at once; restart
+   the worker for `CalibreSyncFlow`.
 3. Grant Raphael the four tools. The DB `tool_set` wins over the seed:
 
    ```sql
@@ -2004,10 +2048,14 @@ card) is two things (#513, spec
   one story arriving by two paths counts once.
 
 A round stays in the hub and Raphael's briefing ("Your topics") until it
-holds enough items: 2 for a `high` topic, 3 for `medium`, 5 for `low`. Then
-it becomes one `#research @raphael @next` task listing the items; later items
-are collapsed comments. Ticking the task off means "seen": the round resolves
-and closes, and the next matching article opens a fresh one.
+holds enough items: the topic's own `threshold`, else its priority's number
+in `research_topics_config` (2 for `high`, 3 for `medium`, 5 for `low` by
+default — Admin → Research → Topic thresholds). Then it becomes one
+`#research @raphael @next` task listing the items (`digest_items`, 10); later
+items are collapsed comments. Ticking the task off means "seen": the round
+resolves and closes, and the next matching article opens a fresh one. The
+whole registry can be edited on Admin → Research → Tracked topics, which
+writes under the same lock `track_topic` takes.
 
 Feed findings (`feed_failing`, `feed_stale`) are Raphael's too, as
 `#feeds @raphael @next` tasks. The agent sweep never works them; you fix or
